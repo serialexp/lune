@@ -21,9 +21,13 @@ _(nothing yet — design only)_
 - [ ] **Collector choice (v1).** A deliberately boring **non-moving** collector
       (stable object addresses) — e.g. non-moving mark-sweep. Decide the exact
       algorithm and the generational-upgrade path.
-- [ ] **Object header.** Type, GC mark/age, shape pointer for table-likes;
-      64-bit fields. Settled in Phase 1 (it leaks into value layout, trace
-      encoding, FFI ABI, debugger display).
+- [x] **Object header.** ✅ Shape settled in Phase 1 (`src/object.zig`):
+      16-byte `GcHeader` = `ObjectType` + `GcColor` (white/gray/black, ready for
+      mark-sweep) + `GcFlags` (pinned/remembered) + intrusive `next` for the
+      sweep list. Embedded as the first field of every concrete object; a
+      `Value.heap_ref` is a `*GcHeader`. The shape/hidden-class pointer lives in
+      the table object, *not* this universal header (no string bloat).
+      Collector *behaviour* (the bullets around this one) is still outstanding.
 - [ ] **Moving vs non-moving commitment.** Non-moving means traces may hold raw
       object pointers. If moving/compaction is ever wanted, design
       handles / relocation-safe refs from day one. (Default: non-moving v1.)
@@ -37,13 +41,17 @@ _(nothing yet — design only)_
 - [ ] **Trace-constant rooting + invalidation.** Traces embed object refs
       (constants, shape pointers) → GC roots; collecting a referenced prototype
       invalidates dependent traces (ties to `01-trace-lifecycle.md`).
-- [ ] **Typed-array payload storage.** Off-heap / non-moving, with a GC'd header
-      referencing a stable payload. Alignment + endianness guarantees (for GPU
-      upload).
-- [ ] **Buffer ownership model.** Explicit owner enum: `vm_owned`,
-      `external_borrowed`, `external_owned_with_finalizer`, `pinned_export`.
-      A zero-copy export returns a **lease** (lifetime + mutability rules), never
-      a raw interior pointer.
+- [~] **Typed-array payload storage.** Descriptor settled in Phase 1
+      (`src/object.zig` `TypedArray`: `GcHeader` + `ElementType` + len/cap +
+      off-heap `data` pointer + `BufferOwner`). Still outstanding: actually
+      allocating the off-heap/non-moving payload, alignment to
+      `ElementType.alignBytes()`, and endianness guarantees for GPU upload —
+      Phase 9b.
+- [~] **Buffer ownership model.** Enum settled in Phase 1 (`src/object.zig`
+      `BufferOwner`: `vm_owned`, `external_borrowed`,
+      `external_owned_with_finalizer`, `pinned_export`). Still outstanding: the
+      **lease** mechanism itself (lifetime + mutability rules; never a raw
+      interior pointer) — implemented with the typed-array container in Phase 9b.
 - [ ] **Allocation under tier-0.** A bump allocator alone makes "tier-0 always
       correct" false under memory pressure — need at least the non-moving
       collector by Phase 3/4.

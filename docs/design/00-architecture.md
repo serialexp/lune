@@ -39,11 +39,17 @@ _(nothing yet — design only)_
       dispatch smoke test (2M tail calls in constant stack). **Finding:** the
       now-default self-hosted `stage2_x86_64` backend rejects guaranteed tail
       calls; the build forces `use_llvm = true` (principle #4). Done.
-- [ ] **Phase 1 — Value representation & object model.** 16-byte tagged value
-      (tag + 8-byte payload) with first-class `i64` *and* `f64`; GC object
-      header; nil/bool/heap-ref. Also settle here (not later): integer
-      overflow / mixed-arithmetic semantics (they fix the guard set), the
-      typed-array storage model, and the GC-root/header shape (`03-gc-memory.md`).
+- [x] **Phase 1 — Value representation & object model.** Done.
+      16-byte tagged `Value` (tag at offset 0 + 8-byte payload, comptime-asserted)
+      with first-class `i64` *and* `f64` (`src/value.zig`); 16-byte `GcHeader`
+      (type/color/flags/intrusive-next) with the embedding convention and
+      `ObjectType` (`src/object.zig`); nil/bool/heap-ref. Numeric semantics are
+      settled and tested (`src/arith.zig`): **`i64` overflow wraps**, mixed
+      `i64`/`f64` promotes to `f64`, `/` is always float, `//` is integer
+      floor-division (errors on integer zero divisor), `%` is floored modulo;
+      cross-type numeric compare is **exact** (no `f64`-rounding collisions). The
+      typed-array storage model (`ElementType` `u8`…`f64`, off-heap `TypedArray`
+      descriptor + `BufferOwner`) is fixed; allocation/leases land in Phase 9b.
 - [ ] **Phase 2 — Front end.** Lexer → parser → AST for the Lua-shaped surface
       syntax (leave syntactic room for optional type annotations).
 - [ ] **Phase 3 — Bytecode compiler + tier-0 interpreter.** Register-based
@@ -94,14 +100,19 @@ _(nothing yet — design only)_
       forever); suspension is host-mediated. See Non-goals + `02-determinism.md`.
 - [x] **FFI vs embedding.** ✅ Decided — first-class embedding API in; general
       script-level C FFI out. See §Embedding API.
-- [ ] **Numeric semantics.** `i64` overflow (wrap / error / promote?), mixed
-      `i64`/`f64`, division. Fixes the guard set — decide with the tag encoding,
-      before Phase 1.
+- [x] **Numeric semantics.** ✅ Decided + implemented (`src/arith.zig`):
+      `i64` overflow **wraps** (two's complement — branchless, deterministic,
+      trace-stable; the op never traps or changes type, so arithmetic needs only
+      operand type guards); mixed `i64`/`f64` promotes to `f64`; `/` is always
+      float division; `//` is integer floor-division (errors on an integer zero
+      divisor, `minInt // -1` wraps); `%` is floored modulo (divisor's sign);
+      cross-type compare is exact. Trap and promote-to-float were rejected.
 - [ ] **Table / shape model.** Hidden-class shapes, freezable. Basic tables in
       Phase 3; shapes in Phase 9; the *header* decision touches Phase 1.
-- [ ] **Typed-array element widths.** Which narrow element types are
-      first-class (`u8`…`f64`)? Drives GPU-upload-ready storage. Sketch with
-      the shape model.
+- [x] **Typed-array element widths.** ✅ Decided — first-class `ElementType`:
+      `u8`/`u16`/`u32`/`u64`, `i8`/`i16`/`i32`/`i64`, `f32`/`f64` (element width
+      == alignment). Off-heap `TypedArray` descriptor + `BufferOwner` shape fixed
+      in `src/object.zig`; storage/lease behaviour is Phase 9b.
 - [ ] **GC algorithm.** Non-moving first (decided direction); pick the concrete
       collector and the generational-upgrade path. See `03-gc-memory.md`.
 - [ ] **Type-annotation scope.** How much gradual typing, and does any of it
@@ -280,9 +291,14 @@ This keys off the shape/hidden-class model (§Language surface) and is why the
 tagged-slot footprint cost is acceptable: it only lands on scattered,
 heterogeneous values where 16-vs-8 bytes barely matters.
 
-GC heap objects carry a common header (type, GC mark/age, shape pointer for
-table-likes). 64-bit fields throughout. **Open: finalize the exact tag encoding
-and header before Phase 1.**
+GC heap objects carry a common 16-byte header (`GcHeader`: `ObjectType`, GC
+color, flags, intrusive next-pointer). Concrete objects embed it as their first
+field; a `Value.heap_ref` payload *is* a `*GcHeader`. The shape/hidden-class
+pointer lives in the table object, not the universal header (it would bloat every
+string), per `03-gc-memory.md`. **Resolved in Phase 1** (`src/value.zig`,
+`src/object.zig`): the tag is coarse — `nil`/`boolean`/`int`/`float`/`heap_ref`
+— with the concrete heap kind in the header (one source of truth); promoting hot
+heap kinds to value-level tags is a later optimisation, like NaN-boxing.
 
 ## Observability — deterministic replay
 
