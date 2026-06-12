@@ -1,0 +1,28 @@
+.{
+    // Package identity. The name is a Zig enum literal (no leading "zig").
+    .name = .lune,
+
+    // Semantic version of the project itself.
+    .version = "0.0.0",
+
+    // Globally unique, generated once and never changed. Regenerated for lune
+    // (this is a fresh project, not a fork). See `zig build` if it ever needs
+    // to be re-derived.
+    .fingerprint = 0xc428eee2feabed4a, // Changing this has security and trust implications.
+
+    // The exact toolchain we pin to. `.zig-version` mirrors this for the
+    // version-manager / CI guard in build.zig. Keep the two in sync.
+    .minimum_zig_version = "0.17.0-dev.813+2153f8143",
+
+    // No third-party dependencies yet. A VM core deliberately writes its own
+    // allocator and data structures (architecture principle #4).
+    .dependencies = .{},
+
+    // Files that constitute the package hash.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}

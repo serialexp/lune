@@ -33,9 +33,12 @@ _(nothing yet — design only)_
 
 **Build phases.**
 
-- [ ] **Phase 0 — Project scaffold.** `build.zig`, module layout, **vendored +
-      pinned** Zig toolchain, a test harness that runs from `zig build test`;
-      smoke-test `@call(.always_tail)` in Debug builds. Risk-free; can start now.
+- [x] **Phase 0 — Project scaffold.** `build.zig`, module layout, pinned Zig
+      toolchain (`.zig-version` + `-Denforce-zig-version` guard), a test harness
+      that runs from `zig build test`, and an `@call(.always_tail)` threaded-
+      dispatch smoke test (2M tail calls in constant stack). **Finding:** the
+      now-default self-hosted `stage2_x86_64` backend rejects guaranteed tail
+      calls; the build forces `use_llvm = true` (principle #4). Done.
 - [ ] **Phase 1 — Value representation & object model.** 16-byte tagged value
       (tag + 8-byte payload) with first-class `i64` *and* `f64`; GC object
       header; nil/bool/heap-ref. Also settle here (not later): integer
@@ -184,6 +187,13 @@ retrofitting it later means redoing the hardest part of the system.
    the churning frontier (async/`std.Io`, bleeding-edge stdlib). A VM core barely
    touches stdlib — we write our own allocator and data structures — which
    naturally insulates us from where Zig churns most.
+   **Verified (Phase 0):** on the pinned toolchain, guaranteed tail calls are an
+   *LLVM-backend-only* feature — the now-default self-hosted `stage2_x86_64`
+   backend errors with "does not support tail calls on target architecture
+   x86_64". The build therefore sets `use_llvm = true` on every artifact that
+   uses threaded dispatch. This is a real constraint, not a footnote: dropping
+   to the self-hosted backend (faster Debug builds) is blocked until it learns
+   tail calls. Re-check on each toolchain bump.
 5. **Keep a clean C-ABI escape hatch.** Zig is pre-1.0 and we're pinning a
    `-dev` build. The hedge: Zig speaks and compiles C natively, so a clean
    C-ABI surface means worst-case we retreat toward C incrementally rather than
