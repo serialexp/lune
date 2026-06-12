@@ -44,6 +44,18 @@ Every phase lands behind `zig build test`. Pure logic (numeric semantics, the
 value model, lexer/parser rules) gets its shape pinned with tests. Don't proclaim
 success while anything is red (global Rule #3).
 
+### Rule Z-4: Inject allocators; account at the boundary.
+
+Allocation is the runtime's main enemy. Every subsystem takes an
+`std.mem.Allocator` parameter — never reach for a global heap (the only
+deliberate exception is the diagnostic stdout path in `src/io.zig`, which is not
+VM data). Tests run on `std.testing.allocator`, which leak-checks; a `defer
+…deinit()` for every owning structure is mandatory, not optional. For runtime /
+embedding memory introspection, wrap the backing allocator once in
+`mem.TrackingAllocator` (live/peak/total bytes, outstanding-allocation count,
+`assertNoLeaks()`) and feed every subsystem from it. Prefer arenas for
+parse-once/free-all lifetimes (the AST already does this).
+
 ## Build
 
 - `zig build` — build the CLI.

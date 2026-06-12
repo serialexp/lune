@@ -18,6 +18,9 @@ pub const object = @import("object.zig");
 pub const value = @import("value.zig");
 pub const arith = @import("arith.zig");
 
+/// Memory accounting — the `TrackingAllocator` wrapper + allocation discipline.
+pub const mem = @import("mem.zig");
+
 /// Diagnostic / CLI I/O — the single wrapper around the churny `std.Io` writer
 /// API and `Value` text rendering.
 pub const io = @import("io.zig");
@@ -39,6 +42,7 @@ test {
     _ = object;
     _ = value;
     _ = arith;
+    _ = mem;
     _ = io;
     _ = diag;
     _ = token;
