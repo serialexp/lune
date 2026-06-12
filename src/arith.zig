@@ -104,6 +104,80 @@ pub fn mod(a: Value, b: Value) Error!Value {
     return Value.float(x - @floor(x / y) * y);
 }
 
+/// `a ^ b` — exponentiation, **always float** (Lua-shaped). `2 ^ 2` is `4.0`.
+pub fn pow(a: Value, b: Value) Error!Value {
+    try requireNumbers(a, b);
+    return Value.float(std.math.pow(f64, a.toFloat(), b.toFloat()));
+}
+
+// ---- bitwise ----
+//
+// Bitwise operators act on the 64-bit two's-complement pattern of integer
+// operands. v1 requires **integer** operands (a float with an integral value is
+// not yet coerced — that convenience is deferred); non-integers error with
+// `TypeError`. Shifts are *logical* (zero-filled) and Lua-style: a shift count
+// outside [-63, 63] shifts every bit out and yields 0; a negative count shifts
+// the other direction.
+
+inline fn requireInts(a: Value, b: Value) Error!void {
+    if (!a.isInt() or !b.isInt()) return Error.TypeError;
+}
+
+/// `a & b` (bitwise and).
+pub fn band(a: Value, b: Value) Error!Value {
+    try requireInts(a, b);
+    return Value.int(a.asInt() & b.asInt());
+}
+
+/// `a | b` (bitwise or).
+pub fn bor(a: Value, b: Value) Error!Value {
+    try requireInts(a, b);
+    return Value.int(a.asInt() | b.asInt());
+}
+
+/// `a ~ b` (bitwise xor) — binary `~`.
+pub fn bxor(a: Value, b: Value) Error!Value {
+    try requireInts(a, b);
+    return Value.int(a.asInt() ^ b.asInt());
+}
+
+/// `~a` (bitwise not) — unary `~`.
+pub fn bnot(a: Value) Error!Value {
+    if (!a.isInt()) return Error.TypeError;
+    return Value.int(~a.asInt());
+}
+
+/// Logical left shift of the 64-bit pattern `x` by `n` bits, Lua-style: `n < 0`
+/// shifts right, `|n| >= 64` yields 0.
+fn shiftLeft(x: i64, n: i64) i64 {
+    if (n <= -64 or n >= 64) return 0;
+    const ux: u64 = @bitCast(x);
+    if (n >= 0) return @bitCast(ux << @intCast(n));
+    return @bitCast(ux >> @intCast(-n));
+}
+
+/// Logical right shift of the 64-bit pattern `x` by `n` bits, Lua-style: `n < 0`
+/// shifts left, `|n| >= 64` yields 0. Written directly (not via `-n`) so a
+/// `minInt` count cannot overflow the negation.
+fn shiftRight(x: i64, n: i64) i64 {
+    if (n <= -64 or n >= 64) return 0;
+    const ux: u64 = @bitCast(x);
+    if (n >= 0) return @bitCast(ux >> @intCast(n));
+    return @bitCast(ux << @intCast(-n));
+}
+
+/// `a << b` (logical left shift, Lua semantics).
+pub fn shl(a: Value, b: Value) Error!Value {
+    try requireInts(a, b);
+    return Value.int(shiftLeft(a.asInt(), b.asInt()));
+}
+
+/// `a >> b` (logical right shift, Lua semantics).
+pub fn shr(a: Value, b: Value) Error!Value {
+    try requireInts(a, b);
+    return Value.int(shiftRight(a.asInt(), b.asInt()));
+}
+
 // ---- comparisons ----
 
 /// `a < b` for numbers. A `NaN` operand makes this false. Non-numbers error
@@ -204,6 +278,36 @@ test "mod: floored modulo takes divisor sign" {
 test "mod: float modulo follows Lua a - floor(a/b)*b" {
     const r = try mod(Value.float(5.5), Value.float(2.0));
     try expectEqual(@as(f64, 1.5), r.asFloat());
+}
+
+test "pow is always float exponentiation" {
+    const r = try pow(Value.int(2), Value.int(10));
+    try expect(r.isFloat());
+    try expectEqual(@as(f64, 1024.0), r.asFloat());
+    const h = try pow(Value.int(2), Value.float(-1.0));
+    try expectEqual(@as(f64, 0.5), h.asFloat());
+}
+
+test "bitwise and/or/xor/not on integers" {
+    try expectEqual(@as(i64, 0b1000), (try band(Value.int(0b1100), Value.int(0b1010))).asInt());
+    try expectEqual(@as(i64, 0b1110), (try bor(Value.int(0b1100), Value.int(0b1010))).asInt());
+    try expectEqual(@as(i64, 0b0110), (try bxor(Value.int(0b1100), Value.int(0b1010))).asInt());
+    try expectEqual(@as(i64, -1), (try bnot(Value.int(0))).asInt());
+    try expectError(Error.TypeError, band(Value.int(1), Value.float(2.0)));
+    try expectError(Error.TypeError, bnot(Value.float(1.0)));
+}
+
+test "shifts are logical and Lua-style (negative count, overshift to zero)" {
+    try expectEqual(@as(i64, 0b100000), (try shl(Value.int(0b1), Value.int(5))).asInt());
+    // negative count on shl shifts right
+    try expectEqual(@as(i64, 0b1), (try shl(Value.int(0b100000), Value.int(-5))).asInt());
+    // logical right shift fills with zero (not arithmetic): -1 >> 63 == 1
+    try expectEqual(@as(i64, 1), (try shr(Value.int(-1), Value.int(63))).asInt());
+    // overshift in either direction yields 0
+    try expectEqual(@as(i64, 0), (try shl(Value.int(-1), Value.int(64))).asInt());
+    try expectEqual(@as(i64, 0), (try shr(Value.int(-1), Value.int(100))).asInt());
+    // a minInt shift count must not overflow when shifting the other way
+    try expectEqual(@as(i64, 0), (try shr(Value.int(1), Value.int(std.math.minInt(i64)))).asInt());
 }
 
 test "type errors on non-numbers" {

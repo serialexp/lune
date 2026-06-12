@@ -32,6 +32,10 @@ pub const lexer = @import("lexer.zig");
 pub const ast = @import("ast.zig");
 pub const parser = @import("parser.zig");
 
+/// Phase 3 — bytecode ISA + tier-0 interpreter.
+pub const bytecode = @import("bytecode.zig");
+pub const interp = @import("interp.zig");
+
 /// Re-exports for ergonomic access.
 pub const Value = value.Value;
 pub const GcHeader = object.GcHeader;
@@ -49,4 +53,6 @@ test {
     _ = lexer;
     _ = ast;
     _ = parser;
+    _ = bytecode;
+    _ = interp;
 }
