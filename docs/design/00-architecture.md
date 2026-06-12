@@ -197,7 +197,10 @@ retrofitting it later means redoing the hardest part of the system.
    (`@call(.always_tail, …)` for threaded dispatch), inline asm, C ABI. Avoid
    the churning frontier (async/`std.Io`, bleeding-edge stdlib). A VM core barely
    touches stdlib — we write our own allocator and data structures — which
-   naturally insulates us from where Zig churns most.
+   naturally insulates us from where Zig churns most. Where we *do* need a churny
+   surface (e.g. stdout for the CLI/diagnostics needs `std.Io`'s writer), it is
+   confined to a single wrapper (`src/io.zig`) so a toolchain bump is a one-file
+   fix, not a sweep — the VM core and `Value` stay free of the dependency.
    **Verified (Phase 0):** on the pinned toolchain, guaranteed tail calls are an
    *LLVM-backend-only* feature — the now-default self-hosted `stage2_x86_64`
    backend errors with "does not support tail calls on target architecture

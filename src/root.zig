@@ -18,6 +18,10 @@ pub const object = @import("object.zig");
 pub const value = @import("value.zig");
 pub const arith = @import("arith.zig");
 
+/// Diagnostic / CLI I/O — the single wrapper around the churny `std.Io` writer
+/// API and `Value` text rendering.
+pub const io = @import("io.zig");
+
 /// Re-exports for ergonomic access.
 pub const Value = value.Value;
 pub const GcHeader = object.GcHeader;
@@ -28,4 +32,5 @@ test {
     _ = object;
     _ = value;
     _ = arith;
+    _ = io;
 }

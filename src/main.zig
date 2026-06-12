@@ -12,7 +12,7 @@ pub fn main() void {
     const iterations: u64 = 1_000_000;
     const acc = lune.dispatch.run(iterations);
 
-    std.debug.print(
+    lune.io.print(
         "lune {s} — scaffold.\n" ++
             "threaded-dispatch smoke test: {d} tail-call steps, acc={d} (constant stack).\n",
         .{ lune.version, iterations, acc },
