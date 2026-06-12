@@ -50,8 +50,16 @@ _(nothing yet — design only)_
       cross-type numeric compare is **exact** (no `f64`-rounding collisions). The
       typed-array storage model (`ElementType` `u8`…`f64`, off-heap `TypedArray`
       descriptor + `BufferOwner`) is fixed; allocation/leases land in Phase 9b.
-- [ ] **Phase 2 — Front end.** Lexer → parser → AST for the Lua-shaped surface
-      syntax (leave syntactic room for optional type annotations).
+- [x] **Phase 2 — Front end.** Done.
+      Hand-written scanner (`src/lexer.zig` + `src/token.zig`) with an
+      `int_literal`/`float_literal` lexical split; shared diagnostics sink
+      (`src/diag.zig`) with byte-span + line and error recovery; arena-owned
+      pointer-based AST with per-node spans (`src/ast.zig`); recursive-descent
+      statements + Pratt expressions with full Lua precedence and right-assoc
+      `..`/`^` (`src/parser.zig`). Optional **type annotations are parsed and
+      retained** (unchecked, per the language-surface sketch). Deferred and noted
+      in source: long-bracket string literals, hex floats, call sugar
+      (`f"s"`/`f{…}`), `repeat`/`until`, `goto`/labels. 55 tests pass.
 - [ ] **Phase 3 — Bytecode compiler + tier-0 interpreter.** Register-based
       bytecode; a plain interpreter. Includes **basic tables, string interning,
       write-barrier call sites (no-op at first), and the host-effect boundary**

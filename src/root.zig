@@ -22,10 +22,12 @@ pub const arith = @import("arith.zig");
 /// API and `Value` text rendering.
 pub const io = @import("io.zig");
 
-/// Phase 2 — front end (lexer for now; parser/AST next).
+/// Phase 2 — front end: lexer, AST, parser.
 pub const diag = @import("diag.zig");
 pub const token = @import("token.zig");
 pub const lexer = @import("lexer.zig");
+pub const ast = @import("ast.zig");
+pub const parser = @import("parser.zig");
 
 /// Re-exports for ergonomic access.
 pub const Value = value.Value;
@@ -41,4 +43,6 @@ test {
     _ = diag;
     _ = token;
     _ = lexer;
+    _ = ast;
+    _ = parser;
 }
