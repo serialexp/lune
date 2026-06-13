@@ -85,6 +85,16 @@ pub const Vm = struct {
     stack: []Value,
     /// Current native-recursion depth (guarded by `max_call_depth`).
     depth: u32 = 0,
+    /// High-water mark of live register slots across all active frames:
+    /// `stack[0 .. stack_top]` is exactly the live window the collector scans.
+    /// Saved and restored per `execClosure`, so it always reflects the deepest
+    /// active frame (frame windows stack contiguously upward).
+    stack_top: usize = 0,
+    /// The closure executing in each active frame, indexed by `depth`. These live
+    /// only on the host call stack — invisible to a heap scan — so the collector
+    /// roots them from here; this is what keeps each frame's prototype constants
+    /// alive. Sized to the recursion bound, so it never allocates.
+    frame_closures: [max_call_depth]*const Closure = undefined,
     /// Open upvalues, keyed by absolute stack index. Searched on capture (to
     /// share a cell) and on scope/frame exit (to close cells over dying slots).
     open_upvalues: std.ArrayList(OpenUpvalue) = .empty,
@@ -140,18 +150,63 @@ pub const Vm = struct {
         return if (fr.count >= 1) self.stack[fr.reg] else Value.nil();
     }
 
+    /// Run one stop-the-world collection. Invoked only at the dispatch-loop
+    /// safepoint. The VM supplies the root set — everything a running program can
+    /// still reach — and the heap owns the mark/sweep mechanism (`gc.zig`).
+    ///
+    /// Marking cannot fail once `beginCollect` reserves the worklist, so on the
+    /// rare reservation OOM we skip the cycle: nothing has been coloured, the heap
+    /// is untouched, and the program continues (the triggering allocation may
+    /// still OOM on its own, which is reported normally).
+    fn collect(self: *Vm) void {
+        self.heap.beginCollect() catch return;
+
+        // Roots:
+        //  1. globals — user globals and the installed natives (e.g. `print`),
+        //     plus their interned name keys.
+        self.heap.markHeader(&self.globals.header);
+        //  2. live registers across every active frame.
+        for (self.stack[0..self.stack_top]) |v| self.heap.markValue(v);
+        //  3. the closures executing in each active frame (host-stack-only —
+        //     keeps their proto constants reachable).
+        for (self.frame_closures[0..self.depth]) |cl| {
+            self.heap.markHeader(@constCast(&cl.header));
+        }
+        //  4. open upvalue cells (live by construction — about to be closed).
+        for (self.open_upvalues.items) |ou| self.heap.markHeader(&ou.cell.header);
+
+        self.heap.traceAll();
+        self.heap.sweep();
+    }
+
     /// Run one activation: interpret `closure.proto.code` over the register
     /// window at `stack[base ..]`. Returns where the frame's results live.
     fn execClosure(self: *Vm, closure: *const Closure, base: usize) Error!FrameResult {
         if (self.depth >= max_call_depth) return Error.StackOverflow;
+        // Record this frame's closure as a GC root before recursing (index by the
+        // pre-increment depth), then bump the depth.
+        self.frame_closures[self.depth] = closure;
         self.depth += 1;
         defer self.depth -= 1;
 
         const proto = closure.proto;
         const code = proto.code;
         const regs = self.stack[base .. base + proto.num_registers];
+
+        // Extend the live-register high-water to cover this frame's window for the
+        // duration of the frame; restore it on return so a sibling call that
+        // reuses these slots is scanned with the correct bound.
+        const prev_top = self.stack_top;
+        self.stack_top = base + proto.num_registers;
+        defer self.stack_top = prev_top;
+
         var pc: usize = 0;
         while (true) {
+            // GC safepoint. Here every live value is reachable from a root (all
+            // registers are settled, no half-built object is exposed), so a
+            // stop-the-world collection is safe. Non-moving, so surviving
+            // pointers in `regs` stay valid.
+            if (self.heap.shouldCollect()) self.collect();
             const instr = code[pc];
             pc += 1;
             const a: usize = instr.a;
@@ -257,7 +312,10 @@ pub const Vm = struct {
                     regs[a] = Value.heap(&cl.header);
                 },
                 .get_upval => regs[a] = closure.upvalues[instr.b].get(),
-                .set_upval => closure.upvalues[instr.b].set(regs[a]),
+                .set_upval => {
+                    closure.upvalues[instr.b].set(regs[a]);
+                    self.heap.writeBarrier(&closure.upvalues[instr.b].header, regs[a]); // no-op until generational
+                },
                 .close_upvalues => self.closeUpvaluesFrom(base + a),
                 .call => try self.doCall(base, proto.num_registers, regs, instr),
 
@@ -386,7 +444,11 @@ pub const Vm = struct {
                 }
                 const fr = try self.execClosure(cl, callee_base);
                 // Copy results back into the caller's window (no overlap: the
-                // callee window is strictly above the caller window).
+                // callee window is strictly above the caller window). The callee's
+                // `stack_top` is already restored, so its result slots are now
+                // *above* the scanned region — but this copy is straight-line with
+                // no intervening safepoint, so no collection can free a result
+                // before it lands in the caller's (scanned) registers.
                 var k: usize = 0;
                 while (k < nwanted) : (k += 1) {
                     regs[a + k] = if (k < fr.count)
@@ -724,7 +786,8 @@ test "concat joins strings and coerces numbers; result is interned" {
 // ---------------------------------------------------------------------------
 
 /// Run `source` to completion, capturing everything `print` emits into `sink`.
-fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer) !void {
+/// With `stress`, the collector runs at *every* safepoint — the GC torture test.
+fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, stress: bool) !void {
     const parser = @import("parser.zig");
     const compiler = @import("compiler.zig");
     const diag = @import("diag.zig");
@@ -739,6 +802,7 @@ fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer) !
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     vm.out = sink;
+    vm.heap.gc_stress = stress;
 
     var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
@@ -747,10 +811,21 @@ fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer) !
     _ = try vm.run(chunk.proto);
 }
 
+/// Run `source` under **both** GC disciplines — the normal threshold and stress
+/// (collect at every safepoint) — and assert it prints exactly `expected` each
+/// time. The stress pass is the decisive GC correctness check: if a collection
+/// frees a still-reachable object, the output diverges or the VM faults.
+fn expectProgram(source: [:0]const u8, expected: []const u8) !void {
+    inline for (.{ false, true }) |stress| {
+        var buf: [256]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        try runCaptured(testing.allocator, source, &sink, stress);
+        try testing.expectEqualStrings(expected, sink.buffered());
+    }
+}
+
 test "e2e: recursion, loop, locals — fib and a summing loop" {
-    var buf: [128]u8 = undefined;
-    var sink = io.Writer.fixed(&buf);
-    try runCaptured(testing.allocator,
+    try expectProgram(
         \\local function fib(n)
         \\  if n < 2 then return n end
         \\  return fib(n - 1) + fib(n - 2)
@@ -758,43 +833,32 @@ test "e2e: recursion, loop, locals — fib and a summing loop" {
         \\local total = 0
         \\for i = 1, 10 do total = total + i end
         \\print(fib(10), total)
-    , &sink);
-    // fib(10) == 55, sum 1..10 == 55
-    try testing.expectEqualStrings("55\t55\n", sink.buffered());
+    , "55\t55\n"); // fib(10) == 55, sum 1..10 == 55
 }
 
 test "e2e: tables and string concat" {
-    var buf: [128]u8 = undefined;
-    var sink = io.Writer.fixed(&buf);
-    try runCaptured(testing.allocator,
+    try expectProgram(
         \\local t = {}
         \\t.name = "lune"
         \\t.answer = 40 + 2
         \\print("hello, " .. t.name)
         \\print("answer=" .. t.answer)
-    , &sink);
-    try testing.expectEqualStrings("hello, lune\nanswer=42\n", sink.buffered());
+    , "hello, lune\nanswer=42\n");
 }
 
 test "e2e: closures capture per-iteration bindings; higher-order print" {
-    var buf: [128]u8 = undefined;
-    var sink = io.Writer.fixed(&buf);
-    try runCaptured(testing.allocator,
+    try expectProgram(
         \\local function adder(x)
         \\  return function(y) return x + y end
         \\end
         \\local add10 = adder(10)
         \\local add20 = adder(20)
         \\print(add10(1), add20(1), add10(add20(0)))
-    , &sink);
-    // 11, 21, add10(20) == 30
-    try testing.expectEqualStrings("11\t21\t30\n", sink.buffered());
+    , "11\t21\t30\n"); // 11, 21, add10(20) == 30
 }
 
 test "e2e: while loop with a table accumulator" {
-    var buf: [128]u8 = undefined;
-    var sink = io.Writer.fixed(&buf);
-    try runCaptured(testing.allocator,
+    try expectProgram(
         \\local t = {}
         \\local i = 1
         \\while i <= 3 do
@@ -802,6 +866,67 @@ test "e2e: while loop with a table accumulator" {
         \\  i = i + 1
         \\end
         \\print(t[1], t[2], t[3], #t)
-    , &sink);
-    try testing.expectEqualStrings("1\t4\t9\t3\n", sink.buffered());
+    , "1\t4\t9\t3\n");
+}
+
+// ---------------------------------------------------------------------------
+// GC-specific behaviour (Phase 4). The stress mode above already proves
+// behaviour-invariance for the realistic programs; these target the two
+// failure modes that only a collector can have: a wrongly-freed constant, and
+// a failure to reclaim at all.
+// ---------------------------------------------------------------------------
+
+test "gc: a constant printed only after a GC-heavy loop still survives" {
+    // Under stress, GC runs at every safepoint in the loop — long before the
+    // "survivor" literal is ever loaded into a register. It lives only in the
+    // chunk's constant pool until then, so it survives iff proto-constant marking
+    // works (the dangling-constant hazard).
+    try expectProgram(
+        \\local x = 0
+        \\for i = 1, 8 do x = x + i end
+        \\print("survivor", x)
+    , "survivor\t36\n"); // sum 1..8 == 36
+}
+
+test "gc: per-iteration garbage is reclaimed (heap stays bounded)" {
+    const parser = @import("parser.zig");
+    const compiler = @import("compiler.zig");
+    const diag = @import("diag.zig");
+    const gpa = testing.allocator;
+
+    // Each iteration builds a fresh table that becomes unreachable on the next
+    // iteration. Without a collector the heap would hold ~200 tables; with one
+    // (stress mode) at most a couple are live at any safepoint.
+    const source =
+        \\local last = 0
+        \\for i = 1, 200 do
+        \\  local t = {}
+        \\  t[1] = i
+        \\  last = t[1]
+        \\end
+        \\print(last)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var buf: [32]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.out = &sink;
+    vm.heap.gc_stress = true;
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("200\n", sink.buffered());
+
+    // The decisive assertion: the live set is bounded, *not* proportional to the
+    // 200 iterations. (globals, the main closure, "last"/literals, and a handful
+    // of still-rooted tables — comfortably under 32.)
+    try testing.expect(vm.heap.object_count < 32);
 }
