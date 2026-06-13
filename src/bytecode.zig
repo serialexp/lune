@@ -112,6 +112,11 @@ pub const OpCode = enum(u8) {
     get_upval,
     /// `a, b`      upvalue[b] = R[a]
     set_upval,
+    /// `a`         close every open upvalue whose register is `>= a` (the
+    ///             leaving scope's first register): snapshot the captured value
+    ///             into the cell so it outlives the registers about to be freed.
+    ///             Emitted at block/loop-scope exit and `break`.
+    close_upvalues,
     /// `a, b, c`   call R[a] with `b` args in R[a+1..a+1+b], want `c` results
     ///             written back starting at R[a]. `c == max_results` means "all".
     call,
@@ -222,7 +227,7 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
     switch (instr.op) {
         .halt => {},
         .jmp => try w.print(" {d:>4}", .{instr.aux}),
-        .load_nil, .new_table => try w.print(" r{d}", .{instr.a}),
+        .load_nil, .new_table, .close_upvalues => try w.print(" r{d}", .{instr.a}),
         .load_int => try w.print(" r{d}  {d}", .{ instr.a, instr.aux }),
         .jmp_if_false, .jmp_if_true, .for_prep, .for_loop => try w.print(" r{d}  {d:>4}", .{ instr.a, instr.aux }),
         .load_bool,

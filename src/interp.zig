@@ -64,6 +64,11 @@ const max_call_depth: u32 = 200;
 /// `regs[reg .. reg + count]` of that frame's window (i.e. `stack[base + reg]`).
 const FrameResult = struct { reg: u16, count: u16 };
 
+/// An open upvalue: a cell still pointing at the live stack slot `index`. Tracked
+/// so that two closures capturing the same variable share one cell, and so the
+/// cell can be *closed* (detached) when its slot is about to be freed.
+const OpenUpvalue = struct { index: usize, cell: *function.Upvalue };
+
 /// The tier-0 virtual machine. Owns the resources a running program needs that
 /// outlive a single frame: the object heap, the global table, and the shared
 /// register/call stack.
@@ -80,6 +85,9 @@ pub const Vm = struct {
     stack: []Value,
     /// Current native-recursion depth (guarded by `max_call_depth`).
     depth: u32 = 0,
+    /// Open upvalues, keyed by absolute stack index. Searched on capture (to
+    /// share a cell) and on scope/frame exit (to close cells over dying slots).
+    open_upvalues: std.ArrayList(OpenUpvalue) = .empty,
     /// Where the `print` host-effect writes. `null` means the process's buffered
     /// stdout (`io.zig`); a test (or a future effect recorder) can point this at
     /// an in-memory writer to capture output without touching the real stdout.
@@ -102,6 +110,7 @@ pub const Vm = struct {
     /// register stack. Any `Value` returned by `run` that is a heap reference
     /// dangles after this — inspect results first.
     pub fn deinit(self: *Vm) void {
+        self.open_upvalues.deinit(self.gpa);
         self.heap.deinit();
         self.gpa.free(self.stack);
     }
@@ -249,13 +258,21 @@ pub const Vm = struct {
                 },
                 .get_upval => regs[a] = closure.upvalues[instr.b].get(),
                 .set_upval => closure.upvalues[instr.b].set(regs[a]),
+                .close_upvalues => self.closeUpvaluesFrom(base + a),
                 .call => try self.doCall(base, proto.num_registers, regs, instr),
 
                 // ---- returns ----
                 // Results stay in this frame's window; the caller copies them out
-                // before this window is reused. `b` values from R[a..a+b].
-                .ret => return .{ .reg = @intCast(a), .count = instr.b },
-                .halt => return .{ .reg = 0, .count = 0 },
+                // before this window is reused. `b` values from R[a..a+b]. Close
+                // any upvalues still open over this frame's slots first.
+                .ret => {
+                    self.closeUpvaluesFrom(base);
+                    return .{ .reg = @intCast(a), .count = instr.b };
+                },
+                .halt => {
+                    self.closeUpvaluesFrom(base);
+                    return .{ .reg = 0, .count = 0 };
+                },
             }
         }
     }
@@ -297,15 +314,46 @@ pub const Vm = struct {
         return Error.TypeError;
     }
 
-    /// Instantiate a closure for `child_proto`, capturing its upvalues from the
-    /// enclosing frame (`parent`'s upvalues, or the frame window at `base`).
+    /// Instantiate a closure for `child_proto`, filling each upvalue cell per the
+    /// proto's capture plan: either capture a local of the *enclosing* frame (an
+    /// open cell pointing into `stack[base + index]`) or inherit one of the
+    /// enclosing closure's own upvalues.
     fn makeClosure(self: *Vm, parent: *const Closure, child_proto: *const Proto, base: usize) Error!*Closure {
-        // D1: capture is not wired yet — the compiler never emits a `closure`
-        // for a proto with upvalues. D2 fills the cells from `parent`/`base`.
-        std.debug.assert(child_proto.upvalues.len == 0);
-        _ = parent;
-        _ = base;
-        return self.heap.newClosure(child_proto, 0);
+        const cl = try self.heap.newClosure(child_proto, child_proto.upvalues.len);
+        for (child_proto.upvalues, 0..) |desc, i| {
+            cl.upvalues[i] = if (desc.in_stack)
+                try self.captureUpvalue(base + desc.index)
+            else
+                parent.upvalues[desc.index];
+        }
+        return cl;
+    }
+
+    /// Find-or-create the open upvalue for stack slot `index`. Two closures
+    /// capturing the same live variable thereby share one cell (so a write
+    /// through one is seen through the other).
+    fn captureUpvalue(self: *Vm, index: usize) Error!*function.Upvalue {
+        for (self.open_upvalues.items) |ou| {
+            if (ou.index == index) return ou.cell;
+        }
+        const cell = try self.heap.newUpvalue(&self.stack[index]);
+        try self.open_upvalues.append(self.gpa, .{ .index = index, .cell = cell });
+        return cell;
+    }
+
+    /// Close (detach) every open upvalue whose slot index is `>= from`: snapshot
+    /// the live value into the cell and drop it from the open list. Called when a
+    /// scope's registers (or a whole frame) are about to be freed.
+    fn closeUpvaluesFrom(self: *Vm, from: usize) void {
+        var i = self.open_upvalues.items.len;
+        while (i > 0) {
+            i -= 1;
+            const ou = self.open_upvalues.items[i];
+            if (ou.index >= from) {
+                ou.cell.close();
+                _ = self.open_upvalues.swapRemove(i);
+            }
+        }
     }
 
     /// Execute a `call` instruction. `regs`/`base` describe the *caller* frame;

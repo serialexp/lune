@@ -12,10 +12,16 @@
 //! `for_prep`/`for_loop` pair for numeric `for`. Short-circuit `and`/`or` lower
 //! to a value-carrying conditional jump.
 //!
-//! Scope of this increment (Phase 3c): expressions, locals, assignment, tables,
-//! indexing, `if`/`while`/numeric-`for`/`do`/`break`/`return`, and global
-//! read/write for free names. Functions, calls, methods, varargs, and generic
-//! `for` are diagnosed as unsupported and land in Phase 3d.
+//! Nested functions compile through a child `Compiler` linked to its parent;
+//! free names resolve local → upvalue → global, and captured locals are closed
+//! at scope exit (so each loop iteration yields a distinct binding). `closure`
+//! instructions carry the capture plan in `Proto.upvalues`.
+//!
+//! Supported: expressions, locals, assignment, tables, indexing,
+//! `if`/`while`/numeric-`for`/`do`/`break`/`return`, globals, function
+//! literals/declarations/`local function`, calls and method calls, and upvalue
+//! closures. Not yet: multi-value spread from a call, varargs, and generic
+//! `for ... in` (diagnosed as unsupported).
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -27,6 +33,7 @@ const diag = @import("diag.zig");
 const Instr = bytecode.Instr;
 const OpCode = bytecode.OpCode;
 const Proto = bytecode.Proto;
+const UpvalDesc = bytecode.UpvalDesc;
 const Value = value.Value;
 const Diagnostics = diag.Diagnostics;
 
@@ -86,11 +93,19 @@ const Local = struct {
     name: []const u8,
     reg: u16,
     depth: u32,
+    /// Set when an inner function captures this local as an upvalue: its cell
+    /// must be *closed* when the scope exits (so the captured value outlives the
+    /// register).
+    captured: bool = false,
 };
 
 const Loop = struct {
     /// Code indices of `break` jumps to patch to the loop's exit.
     breaks: std.ArrayList(usize) = .empty,
+    /// First register of the loop's body scope. `break` closes any upvalues at
+    /// or above this before jumping out (the natural scope-exit close on the
+    /// fall-through path does not run on a `break`).
+    scope_base: u16 = 0,
 };
 
 const Compiler = struct {
@@ -114,6 +129,8 @@ const Compiler = struct {
     /// Nested function prototypes compiled within this function (arena-owned),
     /// referenced by the `closure` instructions this function emits.
     protos: std.ArrayList(*Proto) = .empty,
+    /// This function's upvalue capture plan (arena-owned) → `Proto.upvalues`.
+    upvalues: std.ArrayList(UpvalDesc) = .empty,
 
     /// Fixed parameter count of the function being compiled.
     num_params: u8 = 0,
@@ -207,14 +224,19 @@ const Compiler = struct {
         self.scope_depth += 1;
     }
 
-    fn endScope(self: *Compiler) void {
+    fn endScope(self: *Compiler) Error!void {
         self.scope_depth -= 1;
         var n = self.locals.items.len;
+        var any_captured = false;
         while (n > 0 and self.locals.items[n - 1].depth > self.scope_depth) {
             n -= 1;
+            if (self.locals.items[n].captured) any_captured = true;
             self.next_reg -= 1; // local registers are contiguous at the top
         }
         self.locals.items.len = n;
+        // If a closing local was captured, snapshot its cell before the register
+        // is reused (so each loop iteration / block gets a distinct binding).
+        if (any_captured) _ = try self.emit(Instr.opA(.close_upvalues, self.next_reg));
     }
 
     fn declareLocal(self: *Compiler, name: []const u8, reg: u16) Error!void {
@@ -230,37 +252,70 @@ const Compiler = struct {
         return null;
     }
 
-    /// Does `name` resolve to a local of some *enclosing* function? Such a
-    /// reference is an upvalue capture, which Phase 3d1 diagnoses rather than
-    /// compiles (so a free name is never silently miscompiled to a global).
-    fn isEnclosingLocal(self: *Compiler, name: []const u8) bool {
-        var p = self.parent;
-        while (p) |pc| {
-            if (pc.resolveLocal(name) != null) return true;
-            p = pc.parent;
+    /// Index of the innermost local named `name`, if any (the slot, not the
+    /// register — so the caller can mark it captured).
+    fn resolveLocalSlot(self: *Compiler, name: []const u8) ?usize {
+        var i = self.locals.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.locals.items[i].name, name)) return i;
         }
-        return false;
+        return null;
     }
 
-    /// Load the value of `name` into `dest`: a local move, or a global read.
-    /// A reference to an enclosing function's local is rejected (Phase 3d2).
+    /// Resolve `name` to an upvalue index of *this* function, threading the
+    /// capture down the enclosing-function chain (Lua's `singlevaraux`): a local
+    /// of the immediate parent becomes a direct (`in_stack`) capture and marks
+    /// that local for closing; a parent upvalue is inherited. Returns null if the
+    /// name is not visible in any enclosing function (→ a global).
+    fn resolveUpvalue(self: *Compiler, name: []const u8) Error!?u16 {
+        const parent = self.parent orelse return null;
+        if (parent.resolveLocalSlot(name)) |slot| {
+            parent.locals.items[slot].captured = true;
+            return try self.addUpvalue(.{ .in_stack = true, .index = parent.locals.items[slot].reg });
+        }
+        if (try parent.resolveUpvalue(name)) |up| {
+            return try self.addUpvalue(.{ .in_stack = false, .index = up });
+        }
+        return null;
+    }
+
+    /// Append a capture descriptor (deduplicated) and return its upvalue index.
+    fn addUpvalue(self: *Compiler, desc: UpvalDesc) Error!u16 {
+        for (self.upvalues.items, 0..) |u, i| {
+            if (u.in_stack == desc.in_stack and u.index == desc.index) return @intCast(i);
+        }
+        const idx = self.upvalues.items.len;
+        if (idx > std.math.maxInt(u16)) {
+            self.diags.err("function needs too many upvalues", 0, 0, 0);
+            return Error.CompileError;
+        }
+        try self.upvalues.append(self.arena, desc);
+        return @intCast(idx);
+    }
+
+    /// Load the value of `name` into `dest`: a local move, an upvalue read, or a
+    /// global read (resolution order is local → upvalue → global).
     fn loadName(self: *Compiler, name: []const u8, dest: u16, span: ast.Span) Error!void {
+        _ = span;
         if (self.resolveLocal(name)) |r| {
             if (r != dest) _ = try self.emit(Instr.opAB(.move, dest, r));
-        } else if (self.isEnclosingLocal(name)) {
-            return self.fail(span, "captures an enclosing local; closures are not supported yet (Phase 3d2)");
+        } else if (try self.resolveUpvalue(name)) |up| {
+            _ = try self.emit(Instr.opAB(.get_upval, dest, up));
         } else {
             const k = try self.stringConstant(name);
             _ = try self.emit(Instr.opAB(.get_global, dest, k));
         }
     }
 
-    /// Store register `src` into `name`: a local move, or a global write.
+    /// Store register `src` into `name`: a local move, an upvalue write, or a
+    /// global write.
     fn storeName(self: *Compiler, name: []const u8, src: u16, span: ast.Span) Error!void {
+        _ = span;
         if (self.resolveLocal(name)) |r| {
             if (r != src) _ = try self.emit(Instr.opAB(.move, r, src));
-        } else if (self.isEnclosingLocal(name)) {
-            return self.fail(span, "assigns an enclosing local; closures are not supported yet (Phase 3d2)");
+        } else if (try self.resolveUpvalue(name)) |up| {
+            _ = try self.emit(Instr.opAB(.set_upval, src, up));
         } else {
             const k = try self.stringConstant(name);
             _ = try self.emit(Instr.opAB(.set_global, src, k));
@@ -280,7 +335,7 @@ const Compiler = struct {
             .do => |body| {
                 self.beginScope();
                 try self.compileBlock(body);
-                self.endScope();
+                try self.endScope();
             },
             .while_ => |w| try self.compileWhile(w),
             .if_ => |f| try self.compileIf(f),
@@ -289,10 +344,10 @@ const Compiler = struct {
             .break_ => try self.compileBreak(s.span),
             .call => |call_expr| try self.compileCallStmt(call_expr),
             .function_decl => |fd| try self.compileFunctionDecl(fd),
+            .local_function => |lf| try self.compileLocalFunction(lf),
 
-            // Phase 3d2 / later.
+            // Later phases.
             .generic_for => return self.fail(s.span, "generic for is not supported yet"),
-            .local_function => return self.fail(s.span, "local functions are not supported yet (Phase 3d2)"),
         }
     }
 
@@ -404,7 +459,7 @@ const Compiler = struct {
 
             self.beginScope();
             try self.compileBlock(br.body);
-            self.endScope();
+            try self.endScope();
 
             try end_jumps.append(self.scratch, try self.emitJump(.jmp, 0));
             self.patchToHere(skip); // false → fall to the next branch / else
@@ -413,7 +468,7 @@ const Compiler = struct {
         if (f.else_body) |eb| {
             self.beginScope();
             try self.compileBlock(eb);
-            self.endScope();
+            try self.endScope();
         }
 
         for (end_jumps.items) |j| self.patchToHere(j);
@@ -428,12 +483,12 @@ const Compiler = struct {
         const exit = try self.emitJump(.jmp_if_false, cr);
         self.freeTo(mark);
 
-        try self.loops.append(self.scratch, .{});
+        try self.loops.append(self.scratch, .{ .scope_base = self.next_reg });
         const loop_idx = self.loops.items.len - 1;
 
         self.beginScope();
         try self.compileBlock(w.body);
-        self.endScope();
+        try self.endScope();
 
         try self.emitJumpTo(.jmp, 0, loop_top);
 
@@ -459,13 +514,15 @@ const Compiler = struct {
         const prep = try self.emit(.{ .op = .for_prep, .a = base, .aux = 0 });
         const body_start = self.code.items.len;
 
-        try self.loops.append(self.scratch, .{});
+        // The loop variable (base+3) is the lowest capturable register in the
+        // loop scope, so `break` must close from there.
+        try self.loops.append(self.scratch, .{ .scope_base = @intCast(base + 3) });
         const loop_idx = self.loops.items.len - 1;
 
         self.beginScope();
         try self.declareLocal(nf.name, @intCast(base + 3));
         try self.compileBlock(nf.body);
-        self.endScope();
+        try self.endScope();
 
         // for_loop tests + back-edges to the body; for_prep jumps here.
         try self.emitJumpTo(.for_loop, base, body_start);
@@ -481,8 +538,13 @@ const Compiler = struct {
 
     fn compileBreak(self: *Compiler, span: ast.Span) Error!void {
         if (self.loops.items.len == 0) return self.fail(span, "break outside a loop");
+        const loop_idx = self.loops.items.len - 1;
+        // The fall-through scope-exit close does not run on the break path, so
+        // close the loop scope's upvalues here before jumping out. (A no-op at
+        // runtime if nothing in the loop was captured.)
+        _ = try self.emit(Instr.opA(.close_upvalues, self.loops.items[loop_idx].scope_base));
         const j = try self.emitJump(.jmp, 0);
-        try self.loops.items[self.loops.items.len - 1].breaks.append(self.scratch, j);
+        try self.loops.items[loop_idx].breaks.append(self.scratch, j);
     }
 
     /// Patch all of a loop's `break`s to the current point and pop it.
@@ -659,6 +721,7 @@ const Compiler = struct {
             .num_params = child.num_params,
             .is_vararg = child.is_vararg,
             .protos = child.protos.items,
+            .upvalues = child.upvalues.items,
             .name = name,
         };
 
@@ -666,6 +729,15 @@ const Compiler = struct {
         const idx: u16 = @intCast(self.protos.items.len);
         try self.protos.append(self.arena, proto);
         _ = try self.emit(Instr.opAB(.closure, dest, idx));
+    }
+
+    /// `local function f() … end` — sugar for `local f; f = function … end`,
+    /// except `f` is declared *before* the body is compiled so the body can
+    /// refer to `f` (recursion), capturing it as an upvalue.
+    fn compileLocalFunction(self: *Compiler, lf: anytype) Error!void {
+        const r = try self.alloc1();
+        try self.declareLocal(lf.name, r); // visible inside its own body
+        try self.compileFunction(lf.body, lf.name, r);
     }
 
     /// A call used as a statement: evaluate for effects, discard results.
@@ -1161,26 +1233,90 @@ test "call statement runs for its side effect" {
     )).asInt());
 }
 
-test "capturing an enclosing local is diagnosed (closures are Phase 3d2)" {
-    var diags = Diagnostics.init(testing.allocator);
-    defer diags.deinit();
-    const src =
+test "closure reads an enclosing local (upvalue capture)" {
+    try testing.expectEqual(@as(i64, 5), (try runScalar(
         \\local x = 5
         \\local f = function() return x end
         \\return f()
-    ;
-    var tree = try parser.parse(testing.allocator, src, &diags);
-    defer tree.deinit();
+    )).asInt());
+}
 
-    var vm = try interp.Vm.init(testing.allocator);
-    defer vm.deinit();
-    try testing.expectError(Error.CompileError, compile(testing.allocator, &vm.heap, src, tree.root, &diags));
-    try testing.expect(diags.hasErrors());
+test "closure mutates a shared upvalue: a counter" {
+    // Each call advances the captured `n`; the cell persists across calls.
+    try testing.expectEqual(@as(i64, 3), (try runScalar(
+        \\local function counter()
+        \\  local n = 0
+        \\  return function() n = n + 1; return n end
+        \\end
+        \\local c = counter()
+        \\c(); c()
+        \\return c()
+    )).asInt());
+}
+
+test "two closures share one upvalue cell" {
+    // `get` and `add` both capture `n`; at runtime they share one cell, so a
+    // write through `add` is visible through `get`.
+    try testing.expectEqual(@as(i64, 30), (try runScalar(
+        \\local function make()
+        \\  local n = 10
+        \\  local t = {}
+        \\  t.get = function() return n end
+        \\  t.add = function(d) n = n + d end
+        \\  return t
+        \\end
+        \\local t = make()
+        \\t.add(20)
+        \\return t.get()
+    )).asInt());
+}
+
+test "local function recurses through its own upvalue" {
+    try testing.expectEqual(@as(i64, 120), (try runScalar(
+        \\local function fact(n)
+        \\  if n <= 1 then return 1 end
+        \\  return n * fact(n - 1)
+        \\end
+        \\return fact(5)
+    )).asInt());
+}
+
+test "each loop iteration captures a distinct binding" {
+    // Classic closure-in-loop test: without per-iteration closing, every
+    // closure would see the final value. With it, fns[k] returns k.
+    try testing.expectEqual(@as(i64, 2), (try runScalar(
+        \\local fns = {}
+        \\for i = 1, 3 do
+        \\  local x = i
+        \\  fns[i] = function() return x end
+        \\end
+        \\return fns[2]()
+    )).asInt());
+
+    try testing.expectEqual(@as(i64, 1), (try runScalar(
+        \\local fns = {}
+        \\for i = 1, 3 do
+        \\  local x = i
+        \\  fns[i] = function() return x end
+        \\end
+        \\return fns[1]()
+    )).asInt());
+}
+
+test "nested closures capture across two levels" {
+    try testing.expectEqual(@as(i64, 6), (try runScalar(
+        \\local function outer(a)
+        \\  return function(b)
+        \\    return function(c) return a + b + c end
+        \\  end
+        \\end
+        \\return outer(1)(2)(3)
+    )).asInt());
 }
 
 test "unsupported construct produces a diagnostic, not a crash" {
-    // `local function` (self-capturing recursion) is deferred to Phase 3d2.
-    const src = "local function f() return f() end";
+    // Generic `for ... in` is not supported yet.
+    const src = "for x in y do end";
     var diags = Diagnostics.init(testing.allocator);
     defer diags.deinit();
     var tree = try parser.parse(testing.allocator, src, &diags);
