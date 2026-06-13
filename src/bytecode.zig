@@ -81,6 +81,15 @@ pub const OpCode = enum(u8) {
     jmp_if_false,
     /// `a, aux`    if  truthy(R[a]) pc += aux
     jmp_if_true,
+    /// `a, aux`    numeric-for setup. R[a..a+3) = (idx, limit, step); validates
+    ///             they are numbers, pre-subtracts step from idx, then `pc += aux`
+    ///             to the matching `for_loop`.
+    for_prep,
+    /// `a, aux`    numeric-for step+test. idx (R[a]) += step (R[a+2]); if still
+    ///             within limit (R[a+1], direction from step's sign), copy idx to
+    ///             the loop variable R[a+3] and `pc += aux` (back-edge to the
+    ///             body). Otherwise fall through (loop done).
+    for_loop,
 
     // ---- tables   (Increment B/E) ----
     /// `a`         R[a] = {}   (new empty table)
@@ -201,7 +210,7 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
         .jmp => try w.print(" {d:>4}", .{instr.aux}),
         .load_nil, .new_table => try w.print(" r{d}", .{instr.a}),
         .load_int => try w.print(" r{d}  {d}", .{ instr.a, instr.aux }),
-        .jmp_if_false, .jmp_if_true => try w.print(" r{d}  {d:>4}", .{ instr.a, instr.aux }),
+        .jmp_if_false, .jmp_if_true, .for_prep, .for_loop => try w.print(" r{d}  {d:>4}", .{ instr.a, instr.aux }),
         .load_bool,
         .load_const,
         .move,

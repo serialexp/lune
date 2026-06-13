@@ -37,6 +37,7 @@ pub const string = @import("string.zig");
 pub const table = @import("table.zig");
 pub const gc = @import("gc.zig");
 pub const bytecode = @import("bytecode.zig");
+pub const compiler = @import("compiler.zig");
 pub const interp = @import("interp.zig");
 
 /// Re-exports for ergonomic access.
@@ -60,5 +61,6 @@ test {
     _ = table;
     _ = gc;
     _ = bytecode;
+    _ = compiler;
     _ = interp;
 }

@@ -48,13 +48,20 @@ pub const Vm = struct {
     /// The object heap (strings, tables). Owns every heap value a running
     /// program produces; freed wholesale by `deinit`.
     heap: gc.Heap,
+    /// The global environment: a table keyed by interned name strings. Free
+    /// (non-local) names read and write here.
+    globals: *table.Table,
 
-    pub fn init(gpa: std.mem.Allocator) Vm {
-        return .{ .gpa = gpa, .heap = gc.Heap.init(gpa) };
+    pub fn init(gpa: std.mem.Allocator) Error!Vm {
+        var heap = gc.Heap.init(gpa);
+        // The globals table lives on the heap like any other table.
+        const globals = try heap.newTable();
+        return .{ .gpa = gpa, .heap = heap, .globals = globals };
     }
 
-    /// Frees the heap and every object on it. Any `Value` returned by `run` that
-    /// is a heap reference dangles after this — inspect results first.
+    /// Frees the heap and every object on it (including globals). Any `Value`
+    /// returned by `run` that is a heap reference dangles after this — inspect
+    /// results first.
     pub fn deinit(self: *Vm) void {
         self.heap.deinit();
     }
@@ -128,6 +135,35 @@ pub const Vm = struct {
                     pc = applyJump(pc, instr.aux);
                 },
 
+                // ---- numeric for ----
+                // R[a..a+3) = (idx, limit, step). Validate numbers, pre-subtract
+                // step from idx (so the first for_loop re-adds it), then jump to
+                // the matching for_loop test.
+                .for_prep => {
+                    if (!regs[a].isNumber() or !regs[a + 1].isNumber() or !regs[a + 2].isNumber()) {
+                        return Error.TypeError;
+                    }
+                    regs[a] = try arith.sub(regs[a], regs[a + 2]);
+                    pc = applyJump(pc, instr.aux);
+                },
+                // idx += step; if still within limit (direction by step sign),
+                // publish idx to the loop var R[a+3] and take the back-edge.
+                .for_loop => {
+                    regs[a] = try arith.add(regs[a], regs[a + 2]);
+                    const idx = regs[a];
+                    const limit = regs[a + 1];
+                    const step = regs[a + 2];
+                    const ascending = !(try arith.lt(step, Value.int(0)));
+                    const within = if (ascending)
+                        try arith.le(idx, limit)
+                    else
+                        try arith.le(limit, idx);
+                    if (within) {
+                        regs[a + 3] = idx;
+                        pc = applyJump(pc, instr.aux);
+                    }
+                },
+
                 // ---- tables ----
                 .new_table => {
                     const t = try self.heap.newTable();
@@ -136,9 +172,14 @@ pub const Vm = struct {
                 .get_index => regs[a] = try indexGet(regs[instr.b], regs[instr.c]),
                 .set_index => try self.indexSet(regs[a], regs[instr.b], regs[instr.c]),
 
-                // ---- globals / functions (later increments) ----
-                .get_global,
-                .set_global,
+                // ---- globals ----
+                .get_global => regs[a] = self.globals.get(proto.constants[instr.b]),
+                .set_global => {
+                    try self.globals.set(self.gpa, proto.constants[instr.b], regs[a]);
+                    self.heap.writeBarrier(&self.globals.header, regs[a]); // no-op until Phase 4
+                },
+
+                // ---- functions (Increment D) ----
                 .closure,
                 .get_upval,
                 .set_upval,
@@ -237,7 +278,7 @@ fn runCode(code: []const Instr, constants: []const Value, num_registers: u16) Er
         .num_registers = num_registers,
         .name = "test",
     };
-    var vm = Vm.init(testing.allocator);
+    var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
     return vm.run(&proto);
 }
@@ -321,6 +362,21 @@ test "conditional jump + back-edge: sum 1..5 == 15" {
     try testing.expectEqual(@as(i64, 15), r.asInt());
 }
 
+test "numeric for: sum i=1..5 == 15 via for_prep/for_loop" {
+    // r0=acc, r1=idx, r2=limit, r3=step, r4=loop var
+    const code = [_]Instr{
+        Instr.opAx(.load_int, 0, 0), // 0: acc = 0
+        Instr.opAx(.load_int, 1, 1), // 1: idx = 1
+        Instr.opAx(.load_int, 2, 5), // 2: limit = 5
+        Instr.opAx(.load_int, 3, 1), // 3: step = 1
+        Instr.opAx(.for_prep, 1, 1), // 4: prep, jump to for_loop (pc 6)
+        Instr.opABC(.add, 0, 0, 4), // 5: body: acc += i
+        Instr.opAx(.for_loop, 1, -2), // 6: step+test, back-edge to body (pc 5)
+        Instr.opAB(.ret, 0, 1), // 7: return acc
+    };
+    try testing.expectEqual(@as(i64, 15), (try runCode(&code, &.{}, 5)).asInt());
+}
+
 test "type error propagates from a bad operand" {
     const code = [_]Instr{
         Instr.opA(.load_nil, 0),
@@ -376,7 +432,7 @@ test "indexing a non-table is a type error" {
 }
 
 test "concat joins strings and coerces numbers; result is interned" {
-    var vm = Vm.init(testing.allocator);
+    var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
     // "x=" .. 42  ->  "x=42"
     const consts = [_]Value{try vm.heap.internValue("x=")};
