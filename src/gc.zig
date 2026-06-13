@@ -62,6 +62,13 @@ pub const Heap = struct {
     objects: ?*GcHeader = null,
     /// Number of live objects. Drives the collection trigger.
     object_count: usize = 0,
+    /// Monotonic allocation counter — the next `GcHeader.id` to hand out. Never
+    /// reset (not even by a collection), so every object allocated in a run has a
+    /// unique, stable id, and the id *sequence* is reproducible because allocation
+    /// order follows the deterministic execution. This is the identity used for
+    /// observable rendering (`io.writeValue`) and, later, keyframe heap graphs —
+    /// addresses are deliberately never observed (docs/design/02-determinism.md).
+    next_obj_id: u32 = 0,
     /// Interning table: content bytes → the unique `String`. Keys are the
     /// interned strings' own bytes (stable for the object's lifetime). A swept
     /// string is removed here so interning stays collectible.
@@ -97,6 +104,10 @@ pub const Heap = struct {
     }
 
     fn link(self: *Heap, h: *GcHeader) void {
+        // Stamp a stable, deterministic identity before threading the object in.
+        // This is the single allocation chokepoint, so every heap object gets one.
+        h.id = self.next_obj_id;
+        self.next_obj_id += 1;
         h.next = self.objects;
         self.objects = h;
         self.object_count += 1;

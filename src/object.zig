@@ -60,7 +60,14 @@ pub const GcHeader = extern struct {
     color: GcColor = .white,
     flags: GcFlags = .{},
     _pad: u8 = 0,
-    _pad2: u32 = 0,
+    /// Stable, monotonic per-object identity assigned by the heap at allocation
+    /// (`gc.Heap.link`). Unlike the object's address it is **deterministic** and
+    /// reproducible run-to-run, so it is what observable rendering uses (`print`
+    /// of a table/function — see `io.writeValue`) instead of `@intFromPtr`, which
+    /// would leak ASLR into program output and break deterministic replay
+    /// (docs/design/02-determinism.md). It is also the identity a future
+    /// keyframe's heap graph keys on (docs/design/01, 04). 0 until linked.
+    id: u32 = 0,
     /// Intrusive next-pointer for the collector's allocation list (sweep walk).
     /// Null until an allocator threads the object in (Phase 4).
     next: ?*GcHeader = null,

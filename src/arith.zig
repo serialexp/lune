@@ -12,6 +12,15 @@
 //!     float `floor(a/b)` otherwise. Integer `//` (and `%`) by zero errors.
 //!   * **`%` is floored modulo** (result takes the divisor's sign), Lua-style.
 //!
+//! **Floating-point determinism (docs/design/02-determinism.md §FP).** Every
+//! function that does float math pins `@setFloatMode(.strict)`. Zig's default is
+//! already strict (it does *not* enable fast-math under `ReleaseFast`), so this
+//! is a deliberate, self-documenting guard: it forbids contraction/reassociation
+//! (e.g. FMA) regardless of build mode, keeping results bit-stable so a trace,
+//! the IR-interpreter, and a future replay all compute byte-identical floats.
+//! Cross-platform bit-identity is a separate, still-open question (doc 02);
+//! this only pins same-target determinism.
+//!
 //! These functions operate on dynamically-typed `Value`s and return
 //! `error.TypeError` for non-numeric operands (string/table operators come with
 //! those types later). They are pure — no allocation, no VM state — which is why
@@ -38,6 +47,7 @@ inline fn requireNumbers(a: Value, b: Value) Error!void {
 
 /// `a + b`. Integer add wraps; mixed/float add is IEEE.
 pub fn add(a: Value, b: Value) Error!Value {
+    @setFloatMode(.strict);
     try requireNumbers(a, b);
     if (bothInt(a, b)) return Value.int(a.asInt() +% b.asInt());
     return Value.float(a.toFloat() + b.toFloat());
@@ -45,6 +55,7 @@ pub fn add(a: Value, b: Value) Error!Value {
 
 /// `a - b`. Integer subtract wraps.
 pub fn sub(a: Value, b: Value) Error!Value {
+    @setFloatMode(.strict);
     try requireNumbers(a, b);
     if (bothInt(a, b)) return Value.int(a.asInt() -% b.asInt());
     return Value.float(a.toFloat() - b.toFloat());
@@ -52,6 +63,7 @@ pub fn sub(a: Value, b: Value) Error!Value {
 
 /// `a * b`. Integer multiply wraps.
 pub fn mul(a: Value, b: Value) Error!Value {
+    @setFloatMode(.strict);
     try requireNumbers(a, b);
     if (bothInt(a, b)) return Value.int(a.asInt() *% b.asInt());
     return Value.float(a.toFloat() * b.toFloat());
@@ -59,6 +71,7 @@ pub fn mul(a: Value, b: Value) Error!Value {
 
 /// `-a`. Integer negate wraps (`-minInt == minInt`).
 pub fn neg(a: Value) Error!Value {
+    @setFloatMode(.strict);
     return switch (a.tag) {
         .int => Value.int(0 -% a.asInt()),
         .float => Value.float(-a.asFloat()),
@@ -69,6 +82,7 @@ pub fn neg(a: Value) Error!Value {
 /// `a / b` — **always float division**. `int / int` yields `f64`; division by
 /// zero follows IEEE (`±inf` / `nan`), it does not error.
 pub fn div(a: Value, b: Value) Error!Value {
+    @setFloatMode(.strict);
     try requireNumbers(a, b);
     return Value.float(a.toFloat() / b.toFloat());
 }
@@ -76,6 +90,7 @@ pub fn div(a: Value, b: Value) Error!Value {
 /// `a // b` — floor division. Integer result when both are integers (errors on
 /// a zero divisor); otherwise `floor(a/b)` as a float.
 pub fn floorDiv(a: Value, b: Value) Error!Value {
+    @setFloatMode(.strict);
     try requireNumbers(a, b);
     if (bothInt(a, b)) {
         const x = a.asInt();
@@ -91,6 +106,7 @@ pub fn floorDiv(a: Value, b: Value) Error!Value {
 /// `a % b` — floored modulo (result takes the sign of `b`), Lua-style. Integer
 /// modulo by zero errors; float modulo by zero yields `nan` (no error).
 pub fn mod(a: Value, b: Value) Error!Value {
+    @setFloatMode(.strict);
     try requireNumbers(a, b);
     if (bothInt(a, b)) {
         const y = b.asInt();
@@ -106,6 +122,7 @@ pub fn mod(a: Value, b: Value) Error!Value {
 
 /// `a ^ b` — exponentiation, **always float** (Lua-shaped). `2 ^ 2` is `4.0`.
 pub fn pow(a: Value, b: Value) Error!Value {
+    @setFloatMode(.strict);
     try requireNumbers(a, b);
     return Value.float(std.math.pow(f64, a.toFloat(), b.toFloat()));
 }

@@ -899,6 +899,102 @@ fn expectProgram(source: [:0]const u8, expected: []const u8) !void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Determinism self-check — the regression spine for deterministic replay
+// (docs/design/02-determinism.md §Replay verification). Replay reconstructs any
+// past moment by restoring a keyframe and re-executing forward; that is only
+// *sound* if an identical program run is bit-reproducible. The VM has no
+// nondeterministic inputs (only `print`, an output) and no keyframes yet, so the
+// honest current form of "record-then-replay equivalence" is run-twice
+// equivalence: two *independent* VM instances running the same source must agree
+// on every observable — printed output AND the serialized trace cache. Any
+// address leaking into either (the old `@intFromPtr` render, or an
+// address-keyed structure) breaks it. This is the spine effect-logging and
+// keyframes plug into later, when "replay" becomes literal.
+// ---------------------------------------------------------------------------
+
+/// Run `source` with recording enabled (low hot threshold so test loops go hot),
+/// capturing `print` output into `sink`, and return the **serialized trace
+/// cache** wire bytes (owned by `gpa`, freed by the caller). Mirrors
+/// `runCaptured`, but encodes the cache before the VM is destroyed so two
+/// independent runs can be compared byte-for-byte.
+fn recordRun(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer) ![]u8 {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const traceser = @import("traceser.zig");
+
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.out = sink;
+    vm.trace.config.enabled = true;
+    vm.trace.config.hotloop = 4;
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    _ = try vm.run(chunk.proto);
+    // Self-contained wire bytes (copied out of the cache), safe past `vm.deinit`.
+    return traceser.encodeFile(gpa, vm.trace.cache.items);
+}
+
+test "determinism: print of a heap object renders a stable id, not its address" {
+    // The address-leak canary. A real pointer on a 64-bit target is enormous
+    // (≥ ~0x550000000000); the heap-assigned identity is tiny and monotonic. We
+    // assert the rendered hex is small, which distinguishes an id from an address
+    // without coupling the test to the VM's exact init allocation order.
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    try runCaptured(testing.allocator, "print({})", &sink, false, .off);
+    const out = sink.buffered();
+    try testing.expect(std.mem.startsWith(u8, out, "table: 0x"));
+    var hex = out["table: 0x".len..];
+    if (hex.len > 0 and hex[hex.len - 1] == '\n') hex = hex[0 .. hex.len - 1];
+    const id = try std.fmt.parseInt(u64, hex, 16);
+    try testing.expect(id < 0x1000); // an id, never an ASLR address
+}
+
+test "determinism: two independent runs agree on output and serialized traces" {
+    const programs = [_][:0]const u8{
+        // A long hot integer loop — records and (had we executed) runs a trace.
+        \\local s = 0
+        \\for i = 1, 200 do s = s + i end
+        \\print(s)
+        ,
+        // Tables + a hot summing loop over heap-stored values.
+        \\local t = {}
+        \\for i = 1, 50 do t[i] = i * i end
+        \\local s = 0
+        \\for i = 1, 50 do s = s + t[i] end
+        \\print(s)
+        ,
+        // Prints a heap object's identity — would diverge if it were an address.
+        \\local t = {}
+        \\print(t)
+        ,
+    };
+    inline for (programs) |src| {
+        var buf_a: [256]u8 = undefined;
+        var buf_b: [256]u8 = undefined;
+        var sink_a = io.Writer.fixed(&buf_a);
+        var sink_b = io.Writer.fixed(&buf_b);
+        const traces_a = try recordRun(testing.allocator, src, &sink_a);
+        defer testing.allocator.free(traces_a);
+        const traces_b = try recordRun(testing.allocator, src, &sink_b);
+        defer testing.allocator.free(traces_b);
+        // Observable output is identical across independent runs...
+        try testing.expectEqualStrings(sink_a.buffered(), sink_b.buffered());
+        // ...and so is the serialized trace cache (no address-dependent bytes).
+        try testing.expectEqualSlices(u8, traces_a, traces_b);
+    }
+}
+
 test "e2e: recursion, loop, locals — fib and a summing loop" {
     try expectProgram(
         \\local function fib(n)

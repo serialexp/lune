@@ -129,10 +129,13 @@ pub fn writeValue(w: *Writer, v: Value) Writer.Error!void {
         .heap_ref => switch (v.heapType()) {
             // Strings print as their raw bytes (Lua `print`/`tostring` style).
             .string => try w.writeAll(string.String.fromHeader(v.asHeap()).bytes()),
-            // Other objects: kind + identity (e.g. "table: 0x55f…").
+            // Other objects: kind + identity (e.g. "table: 0x3"). The identity is
+            // the object's stable, heap-assigned `id` — NOT its address — so the
+            // output is deterministic and reproducible run-to-run, never leaking
+            // ASLR into a program's observable behaviour (docs/design/02).
             else => try w.print("{s}: 0x{x}", .{
                 @tagName(v.heapType()),
-                @intFromPtr(v.asHeap()),
+                v.asHeap().id,
             }),
         },
     }

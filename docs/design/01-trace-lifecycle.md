@@ -224,7 +224,9 @@ is **not** just value registers. The minimum (to be finalized):
 - VM call frames, bytecode PC, return PC, varargs, temporaries, live
   closures/upvalues.
 - Heap object **identities** (the debugger needs object continuity across time,
-  not just values).
+  not just values). *The identity primitive now exists: every heap object carries
+  a stable, deterministic `GcHeader.id` assigned at allocation (`src/gc.zig`) —
+  this is what a snapshot/keyframe heap graph keys on, instead of an address.*
 - Sunk / scalar-replaced allocations + their rematerialisation recipes.
 - Pending stores and store ordering.
 - Error / protected-call / unwind state.

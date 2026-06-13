@@ -110,7 +110,12 @@ Discriminated union over record kinds (binschema's core feature):
 - `SideExit{ trace, exit, target }`, `TraceEvent{ ... }`, `GCEvent{ ... }`,
   `HeapWrite{ obj, slot, value }`, `Alloc{ id, shape }` — as capture mode dictates.
 
-Values serialise straight from the self-describing tagged slot.
+Values serialise straight from the self-describing tagged slot. Heap objects in a
+keyframe / `HeapWrite` / `Alloc` reference each other by the stable, deterministic
+`GcHeader.id` (assigned at allocation, `src/gc.zig`) — **never** an address — so a
+keyframe's object graph is reproducible and replay-stable. (That identity is
+already live: it is what `print` of a heap object renders, see
+`02-determinism.md`.)
 
 ## Open questions
 

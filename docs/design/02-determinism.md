@@ -72,12 +72,28 @@ that for a time-travel debugger it *is* the architecture.
 - [ ] **Effect record format** — inputs + outputs sufficient to replay without
       re-executing the effect. Lives in the trace schema
       (`04-snapshot-replay-schema.md`).
-- [ ] **Hash seed policy.** Fixed per recording, stored in the trace header.
+- [x] **Hash seed fixed.** String/table hashing uses Wyhash with a **fixed seed
+      0** (`src/string.zig`, `src/table.zig` `ValueContext`), not a per-run random
+      seed — so hashing is already reproducible run-to-run. (A trace *header*
+      recording the seed is moot until a seed is ever randomised; revisit if that
+      changes.)
+- [x] **Heap-object identity is deterministic.** Every heap object carries a
+      stable, monotonic `GcHeader.id` stamped at allocation by the heap's single
+      link-in chokepoint (`src/gc.zig` `link`), and observable rendering
+      (`io.writeValue` for `print` of a table/function) shows that id, **never**
+      `@intFromPtr`. So no ASLR address leaks into a program's output. This id is
+      also the identity a future keyframe's heap graph keys on
+      (`01-trace-lifecycle.md`, `04-snapshot-replay-schema.md`).
 - [ ] **Table iteration order.** Address-independent and deterministic
-      (constrains the table/shape model).
-- [ ] **Floating-point determinism.** Pin FP mode; define NaN payload
-      canonicalisation, signed zero, and a fixed math-library policy across
-      platforms.
+      (constrains the table/shape model). *Not yet actionable: there is no
+      `pairs`/`next` iterator, so iteration order is not observable to a program
+      yet. Lands with the iterator.*
+- [~] **Floating-point determinism.** FP **mode is pinned**: every float-producing
+      function in `src/arith.zig` sets `@setFloatMode(.strict)`, forbidding
+      contraction/reassociation regardless of build mode (Zig's default is already
+      strict; this guards it explicitly). Still open: NaN payload canonicalisation,
+      signed-zero policy, and **cross-platform** bit-identity (same-machine only
+      for now — see Open questions).
 - [x] **GC observability.** ✅ Decided + implemented (Phase 4). The v1 collector
       (stop-the-world mark-sweep, `03-gc-memory.md`) has **no finalizers, weak
       refs, or ephemerons** — nothing a program can observe to react to collection
@@ -88,12 +104,23 @@ that for a time-travel debugger it *is* the architecture.
       upgrade later adds GC timing that a trace could observe, it must be scheduled
       deterministically and recorded.)
 - [ ] **Time / randomness / environment** routed through the effect boundary
-      (no raw access).
+      (no raw access). *Not yet actionable: none of these inputs exist in the
+      language — `print` is the only host function, and it is output-only. The
+      effect-record format (above) is deliberately deferred until the first such
+      input lands, so it is designed against a genuine input+output pair rather
+      than output-only `print`.*
 - [ ] **Host-mediated suspension hook.** Reserve "a host effect may suspend its
       caller" so generators / await / tasks can be added later without new
       machinery.
-- [ ] **Replay verification.** Record-then-replay self-check asserting identical
-      observable behavior (ties to the testing strategy).
+- [~] **Replay verification.** Record-then-replay self-check asserting identical
+      observable behaviour. **Landed in its honest current form** (`src/interp.zig`
+      "determinism" tests): the VM has no nondeterministic inputs and no keyframes
+      yet, so "replay" reduces to a second independent run — and the harness
+      asserts two independent VM instances of the same source agree on **both** the
+      printed output and the **serialized trace cache** (`traceser.encodeFile`),
+      plus an address-leak canary (`print` of a heap object renders a small stable
+      id, never an ASLR address). This is the regression spine that generalises to
+      true keyframe+effect replay once those exist.
 
 ## Why this exists
 

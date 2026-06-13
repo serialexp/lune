@@ -214,10 +214,18 @@ _(nothing yet — design only)_
       `src/traceser.zig` and mirrored in `viz/src/enums.ts`. A committed
       cross-language fixture (`viz/fixtures/counting-loop.lunetrace`, Zig-encoded)
       is decoded + asserted by `bun test`, proving Zig-encode ↔ TS-decode agree.
-      `?src=<url>` deep-links a trace. **Still to come:** time-stepping /
-      iteration animation — needs a recorded execution log (effect records /
-      keyframes, doc 04 Outstanding), which we don't capture yet; v1 is
-      deliberately a *structural* inspector, not yet temporal.
+      `?src=<url>` deep-links a trace. **v2 begun — the determinism bedrock:**
+      time-stepping needs deterministic record-and-replay (restore a keyframe,
+      re-execute forward feeding recorded effects back), which is only sound if an
+      identical run is bit-reproducible. The first v2 increment makes that real and
+      guards it: a stable deterministic **`GcHeader.id`** replaces the `@intFromPtr`
+      address `print` used to leak (so output no longer depends on ASLR), FP mode
+      is pinned `.strict` in `arith.zig`, and a **determinism self-check** asserts
+      two independent runs of a program agree on output *and* serialized traces
+      (doc 02 §Replay verification). **Still to come:** effect-log + keyframes (the
+      actual recorded execution log), then the visualiser's iteration animation —
+      effect-logging waits on the first nondeterministic *input* existing, and
+      keyframes build on this deterministic base + the new object ids.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
       first. A performance step — but *not* mechanical: regalloc across side
       exits, GC stackmaps/safepoints, and machine-state snapshot-restore are
