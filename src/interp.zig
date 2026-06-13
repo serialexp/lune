@@ -25,6 +25,7 @@ const string = @import("string.zig");
 const table = @import("table.zig");
 const function = @import("function.zig");
 const trace = @import("trace.zig");
+const compiler = @import("compiler.zig");
 const io = @import("io.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
@@ -187,6 +188,16 @@ pub const Vm = struct {
         }
         //  4. open upvalue cells (live by construction — about to be closed).
         for (self.open_upvalues.items) |ou| self.heap.markHeader(&ou.cell.header);
+        //  5. trace constants — a cached trace (or the in-progress recording) may
+        //     hold heap values in its const pool (e.g. a string `load_const`).
+        //     A cached trace can outlive its proto's reachability, so its consts
+        //     must be roots in their own right (docs/design/03-gc-memory.md).
+        for (self.trace.cache.items) |t| {
+            for (t.consts) |v| self.heap.markValue(v);
+        }
+        if (self.trace.isRecording()) {
+            for (self.trace.rec.consts.items) |v| self.heap.markValue(v);
+        }
 
         self.heap.traceAll();
         self.heap.sweep();
@@ -223,6 +234,11 @@ pub const Vm = struct {
             const cur_pc = pc;
             const instr = code[pc];
             pc += 1;
+            // Phase 5 recording hook: while a trace is being recorded, mirror this
+            // instruction (and its observed operand types) into the trace IR
+            // *before* tier-0 executes it. Recording is transparent — tier-0 still
+            // performs the operation below.
+            if (self.trace.isRecording()) self.trace.recordInstr(instr, regs, proto);
             const a: usize = instr.a;
             switch (instr.op) {
                 // ---- loads & moves ----
@@ -352,7 +368,7 @@ pub const Vm = struct {
             // header (anchor). Count it (and, once recording lands, arm/close a
             // trace). Gated on `enabled`, so it is inert until `--trace`.
             if (self.trace.config.enabled and pc <= cur_pc) {
-                self.trace.onBackEdge(proto, @intCast(pc));
+                self.trace.onBackEdge(proto, @intCast(pc), regs);
             }
         }
     }
@@ -809,9 +825,11 @@ test "concat joins strings and coerces numbers; result is interned" {
 
 /// Run `source` to completion, capturing everything `print` emits into `sink`.
 /// With `stress`, the collector runs at *every* safepoint — the GC torture test.
-fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, stress: bool) !void {
+/// With `tracing`, the recorder rides along with a low hotness threshold so even
+/// short loops record — exercising the recorder while asserting it stays
+/// transparent (output must not change).
+fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, stress: bool, tracing: bool) !void {
     const parser = @import("parser.zig");
-    const compiler = @import("compiler.zig");
     const diag = @import("diag.zig");
 
     var diags = diag.Diagnostics.init(gpa);
@@ -825,6 +843,8 @@ fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, s
     defer vm.deinit();
     vm.out = sink;
     vm.heap.gc_stress = stress;
+    vm.trace.config.enabled = tracing;
+    vm.trace.config.hotloop = 4; // record short test loops
 
     var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
@@ -833,16 +853,21 @@ fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, s
     _ = try vm.run(chunk.proto);
 }
 
-/// Run `source` under **both** GC disciplines — the normal threshold and stress
-/// (collect at every safepoint) — and assert it prints exactly `expected` each
-/// time. The stress pass is the decisive GC correctness check: if a collection
-/// frees a still-reachable object, the output diverges or the VM faults.
+/// Run `source` across the full matrix of GC discipline × recorder state and
+/// assert it prints exactly `expected` every time. Two invariants ride on this:
+///  * **GC**: the stress pass frees aggressively — a wrongly-collected live
+///    object diverges or faults.
+///  * **Tracing transparency**: the recorder must not perturb tier-0 — output
+///    with the recorder on must equal output with it off (and survive GC stress
+///    at the same time).
 fn expectProgram(source: [:0]const u8, expected: []const u8) !void {
     inline for (.{ false, true }) |stress| {
-        var buf: [256]u8 = undefined;
-        var sink = io.Writer.fixed(&buf);
-        try runCaptured(testing.allocator, source, &sink, stress);
-        try testing.expectEqualStrings(expected, sink.buffered());
+        inline for (.{ false, true }) |tracing| {
+            var buf: [256]u8 = undefined;
+            var sink = io.Writer.fixed(&buf);
+            try runCaptured(testing.allocator, source, &sink, stress, tracing);
+            try testing.expectEqualStrings(expected, sink.buffered());
+        }
     }
 }
 
@@ -912,7 +937,6 @@ test "gc: a constant printed only after a GC-heavy loop still survives" {
 
 test "gc: per-iteration garbage is reclaimed (heap stays bounded)" {
     const parser = @import("parser.zig");
-    const compiler = @import("compiler.zig");
     const diag = @import("diag.zig");
     const gpa = testing.allocator;
 
@@ -960,9 +984,11 @@ test "gc: per-iteration garbage is reclaimed (heap stays bounded)" {
 // ---------------------------------------------------------------------------
 
 /// Compile+run `source` with the recorder `enabled`, leaving `vm` inspectable.
-fn runForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, enabled: bool) !void {
+/// Returns the compiled `Chunk` — the caller **must** `deinit` it, but only after
+/// inspecting any cached traces: a `Trace`'s `anchor.proto` points into the
+/// chunk's arena, so freeing the chunk first would dangle it.
+fn runForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, enabled: bool) !compiler.Chunk {
     const parser = @import("parser.zig");
-    const compiler = @import("compiler.zig");
     const diag = @import("diag.zig");
 
     var diags = diag.Diagnostics.init(gpa);
@@ -971,14 +997,16 @@ fn runForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, enabled: b
     defer tree.deinit();
 
     vm.trace.config.enabled = enabled;
+    vm.trace.config.hotloop = 4; // record short test loops
     var buf: [256]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
 
     var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
-    defer chunk.deinit();
+    errdefer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
+    return chunk;
 }
 
 test "trace toggle gates back-edge counting" {
@@ -992,19 +1020,125 @@ test "trace toggle gates back-edge counting" {
     {
         var vm = try Vm.init(gpa);
         defer vm.deinit();
-        try runForTrace(&vm, gpa, source, false);
+        var chunk = try runForTrace(&vm, gpa, source, false);
+        defer chunk.deinit();
         try testing.expectEqual(@as(usize, 0), vm.trace.counters.count());
     }
-    // Enabled: the loop's back-edge anchor is counted ~100 times.
+    // Enabled: the loop's anchor goes hot and a trace is recorded.
     {
         var vm = try Vm.init(gpa);
         defer vm.deinit();
-        try runForTrace(&vm, gpa, source, true);
+        var chunk = try runForTrace(&vm, gpa, source, true);
+        defer chunk.deinit();
         try testing.expect(vm.trace.counters.count() >= 1);
-        // The hottest anchor saw one back-edge per loop iteration (100).
+        // The hottest anchor crossed the hotness threshold (one back-edge per
+        // iteration; one is consumed by trace close, so it lands just under 100).
         var it = vm.trace.counters.valueIterator();
         var max: u32 = 0;
         while (it.next()) |v| max = @max(max, v.*);
-        try testing.expectEqual(@as(u32, 100), max);
+        try testing.expect(max >= vm.trace.config.hotloop);
+        try testing.expect(max <= 100);
+        // The simple counting loop is fully recordable → exactly one cached trace.
+        try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
     }
+}
+
+/// Disassemble a `vm`'s sole cached trace into `buf` for shape assertions. `buf`
+/// is sized comfortably above any test trace. The caller must keep the trace's
+/// `anchor.proto` alive (see `runForTrace`) — `writeTrace` prints `proto.name`.
+fn dumpTrace(buf: []u8, vm: *Vm) ![]const u8 {
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    var w = io.Writer.fixed(buf);
+    try trace.writeTrace(&w, vm.trace.cache.items[0]);
+    return w.buffered();
+}
+
+test "recorder: a numeric-for loop records guards + arithmetic + a loop close" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local acc = 0
+        \\for i = 1, 50 do acc = acc + i end
+        \\print(acc)
+    , true);
+    defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
+
+    var buf: [8192]u8 = undefined;
+    const text = try dumpTrace(&buf, &vm);
+    // Inputs are read as slot_loads; integer operands are pinned with guard_int;
+    // the body `acc + i` and the for-loop increment are `add`; the iteration is
+    // closed by `loop`.
+    try testing.expect(std.mem.indexOf(u8, text, "slot_load") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "guard_int") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "add") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "guard_true") != null); // for-loop continuation
+    try testing.expect(std.mem.indexOf(u8, text, "loop") != null);
+
+    const t = vm.trace.cache.items[0];
+    // acc and the loop index are loop-carried, so they surface in the exit snapshot.
+    try testing.expect(t.exit_stores.len >= 1);
+    try testing.expect(t.entry_slots.len >= 1);
+    // No host/cross-frame op was hit, so nothing was blacklisted.
+    try testing.expectEqual(@as(usize, 0), vm.trace.blacklist.count());
+}
+
+test "recorder: a while loop records a truthiness guard on its condition" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local i = 1
+        \\local acc = 0
+        \\while i <= 50 do acc = acc + i; i = i + 1 end
+        \\print(acc)
+    , true);
+    defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
+
+    var buf: [8192]u8 = undefined;
+    const text = try dumpTrace(&buf, &vm);
+    // The `i <= 50` test compiles to `le` + a conditional jump; tier-0 takes the
+    // loop body, so the recorder pins the condition true (guard_true).
+    try testing.expect(std.mem.indexOf(u8, text, "le") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "guard_true") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "add") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "loop") != null);
+}
+
+test "recorder: a call in the loop body aborts cleanly and blacklists the anchor" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function id(x) return x end
+        \\local acc = 0
+        \\for i = 1, 50 do acc = acc + id(i) end
+        \\print(acc)
+    , true);
+    defer chunk.deinit();
+
+    // The body's `call` is cross-frame, so the recording aborts — no trace is
+    // cached and the loop anchor is blacklisted so it is not re-recorded.
+    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expect(vm.trace.blacklist.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder: maxrecord bounds trace length (overlong traces abort)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // A body that emits more than two IR instructions per iteration; with a tiny
+    // budget the recording trips `too_long` and is discarded.
+    vm.trace.config.maxrecord = 2;
+    var chunk = try runForTrace(&vm, gpa,
+        \\local acc = 0
+        \\for i = 1, 50 do acc = acc + i + i + i end
+        \\print(acc)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expect(vm.trace.blacklist.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
 }

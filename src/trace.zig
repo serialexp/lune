@@ -120,6 +120,14 @@ pub const SlotStore = struct { slot: u16, ref: Ref };
 /// Identifies a trace anchor: a loop header at byte-`pc` within a `Proto`. Loop
 /// headers are the only root-trace anchors in Phase 5a (hot side exits seed side
 /// traces later).
+///
+/// The `proto` pointer is *borrowed*, not owned: a cached `Trace` keeps it live
+/// only by assumption. In the VM that holds — a hot proto is reachable from a
+/// live closure for as long as code can branch to its loop, so it outlives any
+/// trace anchored in it. Tests that free the compiled chunk must therefore do so
+/// *after* inspecting the cache (see `interp.zig`'s `runForTrace`). When cache
+/// invalidation lands (a later phase) this is where proto liveness gets pinned
+/// down properly.
 pub const AnchorKey = struct { proto: *const Proto, pc: u32 };
 
 /// A completed, cached trace: the recorded IR plus the entry/exit snapshots that
@@ -166,6 +174,8 @@ pub const AbortReason = enum {
     too_long,
     /// An operand had a type the recorder cannot guard/model here.
     bad_type,
+    /// Allocation failed while building the trace.
+    alloc,
 };
 
 /// Tunables for the recorder. Defaults track LuaJIT's where sensible; all are
@@ -191,6 +201,12 @@ pub const TraceState = struct {
     /// Committed traces. A linear scan is fine — the cache is small in Phase 5a
     /// and never invalidated.
     cache: std.ArrayListUnmanaged(*Trace) = .empty,
+    /// Anchors that have been permanently abandoned (a recording aborted, or a
+    /// commit failed). Phase 5a uses a *permanent* blacklist — it prevents
+    /// re-record thrash with no machinery. Doubling-with-jitter penalty backoff
+    /// (so a temporarily-unstable loop can succeed later) is a later increment;
+    /// see docs/design/01-trace-lifecycle.md.
+    blacklist: std.AutoHashMapUnmanaged(AnchorKey, void) = .empty,
     /// The in-progress recording (at most one at a time in Phase 5a).
     rec: Recorder = .{},
 
@@ -200,6 +216,7 @@ pub const TraceState = struct {
 
     pub fn deinit(self: *TraceState) void {
         self.counters.deinit(self.gpa);
+        self.blacklist.deinit(self.gpa);
         for (self.cache.items) |t| t.destroy(self.gpa);
         self.cache.deinit(self.gpa);
         self.rec.deinit(self.gpa);
@@ -219,15 +236,8 @@ pub const TraceState = struct {
         return self.rec.active;
     }
 
-    /// Called by the interpreter whenever a back-edge fires (a backward/self
-    /// jump). Increment A: count back-edges per anchor — that count *is* the
-    /// hotness signal. Arming the recorder on the threshold, and closing/aborting
-    /// an in-flight recording, land in Increment B.
-    pub fn onBackEdge(self: *TraceState, proto: *const Proto, target_pc: u32) void {
-        const key = AnchorKey{ .proto = proto, .pc = target_pc };
-        const gop = self.counters.getOrPut(self.gpa, key) catch return;
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* +|= 1;
+    fn isBlacklisted(self: *const TraceState, anchor: AnchorKey) bool {
+        return self.blacklist.contains(anchor);
     }
 
     /// Back-edge count recorded for an anchor (0 if never seen). A loop is "hot"
@@ -235,12 +245,366 @@ pub const TraceState = struct {
     pub fn backEdgeCount(self: *const TraceState, anchor: AnchorKey) u32 {
         return self.counters.get(anchor) orelse 0;
     }
+
+    // --- state machine -----------------------------------------------------
+
+    /// Called by the interpreter whenever a back-edge fires (a backward/self jump
+    /// to `target_pc`). Drives the trace lifecycle:
+    ///  * **recording, this anchor** → the iteration closed cleanly: commit.
+    ///  * **recording, another anchor** → an inner-loop back-edge: keep going
+    ///    (the `maxrecord` budget bounds inner-loop unrolling).
+    ///  * **not recording** → count this back-edge; on *crossing* `hotloop` (and
+    ///    if the anchor is neither already traced nor blacklisted), arm a fresh
+    ///    recording that begins on the next loop iteration (at the anchor).
+    pub fn onBackEdge(self: *TraceState, proto: *const Proto, target_pc: u32, regs: []const Value) void {
+        if (self.rec.active) {
+            if (self.rec.anchor.proto == proto and self.rec.anchor.pc == target_pc) {
+                self.closeTrace(regs);
+            }
+            return;
+        }
+        const key = AnchorKey{ .proto = proto, .pc = target_pc };
+        const gop = self.counters.getOrPut(self.gpa, key) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* +|= 1;
+        // `==` arms exactly once, at the moment the threshold is crossed — no
+        // re-arm attempts on every later iteration.
+        if (gop.value_ptr.* == self.config.hotloop and
+            !self.hasTrace(key) and !self.isBlacklisted(key))
+        {
+            self.arm(proto, target_pc);
+        }
+    }
+
+    /// Begin recording at `target_pc`. Sizes the recorder's register map to the
+    /// frame; recording proper begins at the next dispatch-loop iteration (which
+    /// is the anchor instruction). On OOM we simply don't arm.
+    fn arm(self: *TraceState, proto: *const Proto, target_pc: u32) void {
+        self.rec.reset(self.gpa, .{ .proto = proto, .pc = target_pc }, proto.num_registers) catch return;
+    }
+
+    /// Abandon the in-flight recording: deactivate, remember why, and blacklist
+    /// the anchor so it is not retried (no backoff in Phase 5a). Tier-0 is
+    /// untouched — nothing was ever executed from the trace.
+    fn abort(self: *TraceState, reason: AbortReason) void {
+        self.rec.abort_reason = reason;
+        self.rec.active = false;
+        self.blacklist.put(self.gpa, self.rec.anchor, {}) catch {};
+    }
+
+    /// Finalise a cleanly-closed recording into a cached `Trace`. A build failure
+    /// is treated like an abort (discard + blacklist) so we never thrash.
+    fn closeTrace(self: *TraceState, regs: []const Value) void {
+        _ = regs; // reserved: a richer exit snapshot will read live values here.
+        self.commit() catch {
+            self.blacklist.put(self.gpa, self.rec.anchor, {}) catch {};
+        };
+        self.rec.active = false;
+    }
+
+    /// Copy the in-progress recording into an owned, cached `Trace`. The exit
+    /// snapshot is every register the trace *defined* (its loop-carried writes).
+    fn commit(self: *TraceState) !void {
+        try self.rec.instrs.append(self.gpa, .{ .op = .loop });
+
+        const instrs = try self.gpa.dupe(IrInstr, self.rec.instrs.items);
+        errdefer self.gpa.free(instrs);
+        const consts = try self.gpa.dupe(Value, self.rec.consts.items);
+        errdefer self.gpa.free(consts);
+        const entry = try self.gpa.dupe(u16, self.rec.entry_slots.items);
+        errdefer self.gpa.free(entry);
+
+        var stores: std.ArrayListUnmanaged(SlotStore) = .empty;
+        errdefer stores.deinit(self.gpa);
+        for (self.rec.reg_map, 0..) |s, slot| {
+            if (s.state == .def) try stores.append(self.gpa, .{ .slot = @intCast(slot), .ref = s.ref });
+        }
+        const exit = try stores.toOwnedSlice(self.gpa);
+        errdefer self.gpa.free(exit);
+
+        const t = try self.gpa.create(Trace);
+        errdefer self.gpa.destroy(t);
+        t.* = .{
+            .anchor = self.rec.anchor,
+            .instrs = instrs,
+            .consts = consts,
+            .entry_slots = entry,
+            .exit_stores = exit,
+        };
+        try self.cache.append(self.gpa, t);
+    }
+
+    // --- per-instruction recording ----------------------------------------
+
+    /// Mirror one executed tier-0 instruction into the trace IR, reading
+    /// *pre-execution* operand values from `regs` to choose type guards. Tier-0
+    /// still executes the instruction itself (next, in the dispatch loop) — this
+    /// only records. Unsupported opcodes / types abort the recording.
+    pub fn recordInstr(self: *TraceState, instr: Instr, regs: []const Value, proto: *const Proto) void {
+        if (self.rec.instrs.items.len >= self.config.maxrecord) return self.abort(.too_long);
+        self.recordOne(instr, regs, proto) catch self.abort(.alloc);
+    }
+
+    fn recordOne(self: *TraceState, instr: Instr, regs: []const Value, proto: *const Proto) error{OutOfMemory}!void {
+        switch (instr.op) {
+            // loads & moves — define the destination, no guards.
+            .load_nil => self.setReg(instr.a, try self.konst(Value.nil())),
+            .load_bool => self.setReg(instr.a, try self.konst(Value.boolean(instr.b != 0))),
+            .load_int => self.setReg(instr.a, try self.konst(Value.int(instr.aux))),
+            .load_const => self.setReg(instr.a, try self.konst(proto.constants[instr.b])),
+            .move => self.setReg(instr.a, try self.refOf(instr.b)),
+
+            // arithmetic / bitwise / unary.
+            .add => try self.recArith(.add, instr, regs),
+            .sub => try self.recArith(.sub, instr, regs),
+            .mul => try self.recArith(.mul, instr, regs),
+            .div => try self.recArith(.div, instr, regs),
+            .idiv => try self.recArith(.idiv, instr, regs),
+            .mod => try self.recArith(.mod, instr, regs),
+            .pow => try self.recArith(.pow, instr, regs),
+            .band => try self.recBitwise(.band, instr, regs),
+            .bor => try self.recBitwise(.bor, instr, regs),
+            .bxor => try self.recBitwise(.bxor, instr, regs),
+            .shl => try self.recBitwise(.shl, instr, regs),
+            .shr => try self.recBitwise(.shr, instr, regs),
+            .neg => try self.recNeg(instr, regs),
+            .not => try self.recNot(instr),
+            .bnot => try self.recBnot(instr, regs),
+
+            // comparisons (gt/ge normalise to lt/le with swapped operands).
+            .eq => try self.recEq(.eq, instr, regs),
+            .ne => try self.recEq(.ne, instr, regs),
+            .lt => try self.recCompare(.lt, false, instr, regs),
+            .le => try self.recCompare(.le, false, instr, regs),
+            .gt => try self.recCompare(.lt, true, instr, regs),
+            .ge => try self.recCompare(.le, true, instr, regs),
+
+            // control flow.
+            .jmp => {}, // straight-line trace: control flow is implicit.
+            .jmp_if_false, .jmp_if_true => try self.recBranch(instr, regs),
+            .for_loop => try self.recForLoop(instr, regs),
+
+            // a host call is a trace barrier; a Lua call/return is cross-frame.
+            .call => {
+                const callee = regs[instr.a];
+                if (callee.isHeap() and callee.heapType() == .native)
+                    self.abort(.host_barrier)
+                else
+                    self.abort(.cross_frame);
+            },
+            .ret, .halt => self.abort(.cross_frame),
+
+            // tables, globals, upvalues, closures, concat, for_prep, len, …:
+            // each pulls in heap-effect / cross-frame / invalidation machinery
+            // that is later work. Abort cleanly.
+            else => self.abort(.nyi_opcode),
+        }
+    }
+
+    // --- recording helpers -------------------------------------------------
+
+    /// Append an IR instruction, returning its SSA ref (its index).
+    fn emit(self: *TraceState, ins: IrInstr) !Ref {
+        const ref: Ref = @intCast(self.rec.instrs.items.len);
+        try self.rec.instrs.append(self.gpa, ins);
+        return ref;
+    }
+
+    /// Intern a constant into the trace's pool and emit a `konst` for it.
+    fn konst(self: *TraceState, v: Value) !Ref {
+        const idx: i32 = @intCast(self.rec.consts.items.len);
+        try self.rec.consts.append(self.gpa, v);
+        return self.emit(.{ .op = .konst, .aux = idx, .ty = obsTypeOf(v) });
+    }
+
+    /// The SSA ref currently held by tier-0 register `slot`. The first read of a
+    /// register emits a `slot_load` (a trace input) and records it in the entry
+    /// snapshot.
+    fn refOf(self: *TraceState, slot: u16) !Ref {
+        const s = &self.rec.reg_map[slot];
+        if (s.state != .undef) return s.ref;
+        const ref = try self.emit(.{ .op = .slot_load, .aux = slot, .ty = .unknown });
+        try self.rec.entry_slots.append(self.gpa, slot);
+        s.* = .{ .ref = ref, .state = .input };
+        return ref;
+    }
+
+    /// Record that tier-0 register `slot` now holds the value produced by `ref`
+    /// (a loop-carried write — surfaces in the exit snapshot).
+    fn setReg(self: *TraceState, slot: u16, ref: Ref) void {
+        self.rec.reg_map[slot] = .{ .ref = ref, .state = .def };
+    }
+
+    /// Emit a type guard for `ref` (deduplicated — an SSA value has one type).
+    fn guard(self: *TraceState, ref: Ref, op: IrOp) !void {
+        if (self.rec.guarded_refs.contains(ref)) return;
+        try self.rec.guarded_refs.put(self.gpa, ref, {});
+        _ = try self.emit(.{ .op = op, .a = ref });
+    }
+
+    fn guardInt(self: *TraceState, ref: Ref) !void {
+        try self.guard(ref, .guard_int);
+    }
+
+    fn guardNum(self: *TraceState, ref: Ref, v: Value) !void {
+        try self.guard(ref, if (v.isInt()) IrOp.guard_int else IrOp.guard_float);
+    }
+
+    fn recArith(self: *TraceState, op: IrOp, instr: Instr, regs: []const Value) !void {
+        const vb = regs[instr.b];
+        const vc = regs[instr.c];
+        if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
+        const rb = try self.refOf(instr.b);
+        const rc = try self.refOf(instr.c);
+        try self.guardNum(rb, vb);
+        try self.guardNum(rc, vc);
+        const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = arithResultType(op, vb, vc) });
+        self.setReg(instr.a, r);
+    }
+
+    fn recBitwise(self: *TraceState, op: IrOp, instr: Instr, regs: []const Value) !void {
+        const vb = regs[instr.b];
+        const vc = regs[instr.c];
+        if (!vb.isInt() or !vc.isInt()) return self.abort(.bad_type);
+        const rb = try self.refOf(instr.b);
+        const rc = try self.refOf(instr.c);
+        try self.guardInt(rb);
+        try self.guardInt(rc);
+        const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .int });
+        self.setReg(instr.a, r);
+    }
+
+    fn recNeg(self: *TraceState, instr: Instr, regs: []const Value) !void {
+        const vb = regs[instr.b];
+        if (!vb.isNumber()) return self.abort(.bad_type);
+        const rb = try self.refOf(instr.b);
+        try self.guardNum(rb, vb);
+        const r = try self.emit(.{ .op = .neg, .a = rb, .ty = if (vb.isInt()) .int else .float });
+        self.setReg(instr.a, r);
+    }
+
+    /// `not` works on any value via Lua truthiness, so it needs no type guard —
+    /// the IR `not` is defined over truthiness, like tier-0.
+    fn recNot(self: *TraceState, instr: Instr) !void {
+        const rb = try self.refOf(instr.b);
+        const r = try self.emit(.{ .op = .not, .a = rb, .ty = .boolean });
+        self.setReg(instr.a, r);
+    }
+
+    fn recBnot(self: *TraceState, instr: Instr, regs: []const Value) !void {
+        const vb = regs[instr.b];
+        if (!vb.isInt()) return self.abort(.bad_type);
+        const rb = try self.refOf(instr.b);
+        try self.guardInt(rb);
+        const r = try self.emit(.{ .op = .bnot, .a = rb, .ty = .int });
+        self.setReg(instr.a, r);
+    }
+
+    fn recCompare(self: *TraceState, op: IrOp, swap: bool, instr: Instr, regs: []const Value) !void {
+        const vb = regs[instr.b];
+        const vc = regs[instr.c];
+        if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
+        var rb = try self.refOf(instr.b);
+        var rc = try self.refOf(instr.c);
+        try self.guardNum(rb, vb);
+        try self.guardNum(rc, vc);
+        if (swap) {
+            const t = rb;
+            rb = rc;
+            rc = t;
+        }
+        const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
+        self.setReg(instr.a, r);
+    }
+
+    /// `eq`/`ne`. First cut: numeric operands only (the common loop-condition
+    /// case); other types abort.
+    fn recEq(self: *TraceState, op: IrOp, instr: Instr, regs: []const Value) !void {
+        const vb = regs[instr.b];
+        const vc = regs[instr.c];
+        if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
+        const rb = try self.refOf(instr.b);
+        const rc = try self.refOf(instr.c);
+        try self.guardNum(rb, vb);
+        try self.guardNum(rc, vc);
+        const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
+        self.setReg(instr.a, r);
+    }
+
+    /// `jmp_if_false`/`jmp_if_true`: pin the *observed* truthiness of the tested
+    /// register. Which path the trace records is whatever tier-0 took; the guard
+    /// is what keeps the straight-line trace valid.
+    fn recBranch(self: *TraceState, instr: Instr, regs: []const Value) !void {
+        const ra = try self.refOf(instr.a);
+        const op: IrOp = if (regs[instr.a].isTruthy()) .guard_true else .guard_false;
+        _ = try self.emit(.{ .op = op, .a = ra });
+    }
+
+    /// `for_loop` (numeric-for back-edge): record the increment and the
+    /// loop-continuation guard, mirroring the opcode. The actual back-edge / close
+    /// is handled by `onBackEdge`.
+    fn recForLoop(self: *TraceState, instr: Instr, regs: []const Value) !void {
+        const a = instr.a;
+        const vidx = regs[a];
+        const vlimit = regs[a + 1];
+        const vstep = regs[a + 2];
+        if (!vidx.isNumber() or !vlimit.isNumber() or !vstep.isNumber()) return self.abort(.bad_type);
+        const ridx = try self.refOf(a);
+        const rlimit = try self.refOf(a + 1);
+        const rstep = try self.refOf(a + 2);
+        try self.guardNum(ridx, vidx);
+        try self.guardNum(rlimit, vlimit);
+        try self.guardNum(rstep, vstep);
+
+        // idx_next = idx + step
+        const all_int = vidx.isInt() and vstep.isInt();
+        const rnext = try self.emit(.{ .op = .add, .a = ridx, .b = rstep, .ty = if (all_int) .int else .float });
+
+        // loop continues while (ascending) idx_next <= limit, else limit <= idx_next.
+        const ascending = vstep.toFloat() >= 0;
+        const cmp = if (ascending)
+            try self.emit(.{ .op = .le, .a = rnext, .b = rlimit, .ty = .boolean })
+        else
+            try self.emit(.{ .op = .le, .a = rlimit, .b = rnext, .ty = .boolean });
+        _ = try self.emit(.{ .op = .guard_true, .a = cmp });
+
+        // publish the stepped index and the loop variable (R[a+3]).
+        self.setReg(a, rnext);
+        self.setReg(a + 3, rnext);
+    }
 };
 
-/// The in-progress recording buffer. Increment A defines its storage + cleanup
-/// so `TraceState` owns it cleanly; the emission logic (`recordInstr`, `refOf`,
-/// the per-opcode translation) lands in Increment B. While `active` is false the
-/// interpreter never calls into it.
+/// Result type of a recorded arithmetic op given its observed operands. Mirrors
+/// `arith.zig`: `/` and `^` are always float; otherwise int iff both operands are
+/// int (matching tier-0's int/float promotion).
+fn arithResultType(op: IrOp, vb: Value, vc: Value) ObsType {
+    if (op == .div or op == .pow) return .float;
+    return if (vb.isInt() and vc.isInt()) .int else .float;
+}
+
+fn obsTypeOf(v: Value) ObsType {
+    return switch (v.tag) {
+        .nil => .nil,
+        .boolean => .boolean,
+        .int => .int,
+        .float => .float,
+        .heap_ref => .heap,
+    };
+}
+
+/// State of a tier-0 register within the recording: `undef` (never touched →
+/// next read emits a `slot_load`), `input` (holds a `slot_load` ref — read but
+/// not written, loop-invariant), or `def` (holds a computed ref — a loop-carried
+/// write that surfaces in the exit snapshot).
+const SlotState = enum { undef, input, def };
+
+/// The SSA ref currently held by a tier-0 register, with how it got there.
+const RegSlot = struct { ref: Ref = 0, state: SlotState = .undef };
+
+/// The in-progress recording buffer. `TraceState` owns it and drives every
+/// mutation through its own methods (`emit`/`refOf`/`recordInstr`/…); this struct
+/// is just storage + cleanup. While `active` is false the interpreter never calls
+/// into it.
 pub const Recorder = struct {
     active: bool = false,
     anchor: AnchorKey = .{ .proto = undefined, .pc = 0 },
@@ -248,16 +612,36 @@ pub const Recorder = struct {
     instrs: std.ArrayListUnmanaged(IrInstr) = .empty,
     consts: std.ArrayListUnmanaged(Value) = .empty,
     entry_slots: std.ArrayListUnmanaged(u16) = .empty,
-    /// Current SSA ref held by each tier-0 register; `null` = not yet defined in
-    /// this trace (the next read emits a `slot_load`). Sized to the recording
+    /// Refs already covered by a type guard, so we emit each at most once.
+    guarded_refs: std.AutoHashMapUnmanaged(Ref, void) = .empty,
+    /// Current SSA ref + state for each tier-0 register, sized to the recording
     /// frame's `num_registers`.
-    reg_map: []?Ref = &.{},
+    reg_map: []RegSlot = &.{},
 
     pub fn deinit(self: *Recorder, gpa: std.mem.Allocator) void {
         self.instrs.deinit(gpa);
         self.consts.deinit(gpa);
         self.entry_slots.deinit(gpa);
+        self.guarded_refs.deinit(gpa);
         if (self.reg_map.len != 0) gpa.free(self.reg_map);
+    }
+
+    /// Clear the buffer and arm a fresh recording for `anchor` over a frame with
+    /// `num_registers` registers. Reuses retained capacity; only (re)allocates
+    /// `reg_map` when the register count changes.
+    pub fn reset(self: *Recorder, gpa: std.mem.Allocator, anchor: AnchorKey, num_registers: u16) !void {
+        self.instrs.clearRetainingCapacity();
+        self.consts.clearRetainingCapacity();
+        self.entry_slots.clearRetainingCapacity();
+        self.guarded_refs.clearRetainingCapacity();
+        if (self.reg_map.len != num_registers) {
+            if (self.reg_map.len != 0) gpa.free(self.reg_map);
+            self.reg_map = try gpa.alloc(RegSlot, num_registers);
+        }
+        @memset(self.reg_map, .{});
+        self.anchor = anchor;
+        self.abort_reason = null;
+        self.active = true;
     }
 };
 
@@ -358,21 +742,35 @@ test "writeTrace renders a hand-built counting-loop trace" {
     try testing.expect(std.mem.indexOf(u8, text, "exit: r0<-%4 r1<-%1") != null);
 }
 
-test "onBackEdge counts per anchor; threshold is the hotness signal" {
+test "onBackEdge counts back-edges per anchor" {
     var state = TraceState.init(testing.allocator);
     defer state.deinit();
-    state.config.hotloop = 8;
+    state.config.hotloop = 1000; // high enough that nothing arms — pure counting
 
     const proto = Proto{ .code = &.{}, .name = "t" };
     const hot = AnchorKey{ .proto = &proto, .pc = 3 };
     const cold = AnchorKey{ .proto = &proto, .pc = 99 };
 
     var i: u32 = 0;
-    while (i < 10) : (i += 1) state.onBackEdge(&proto, 3);
-    state.onBackEdge(&proto, 99); // a single, cold back-edge elsewhere
+    while (i < 10) : (i += 1) state.onBackEdge(&proto, 3, &.{});
+    state.onBackEdge(&proto, 99, &.{}); // a single, cold back-edge elsewhere
 
     try testing.expectEqual(@as(u32, 10), state.backEdgeCount(hot));
-    try testing.expect(state.backEdgeCount(hot) >= state.config.hotloop); // hot
     try testing.expectEqual(@as(u32, 1), state.backEdgeCount(cold));
-    try testing.expect(state.backEdgeCount(cold) < state.config.hotloop); // cold
+    try testing.expectEqual(@as(usize, 0), state.cache.items.len); // never armed
+}
+
+test "crossing the hotness threshold arms a recording" {
+    var state = TraceState.init(testing.allocator);
+    defer state.deinit();
+    state.config.hotloop = 3;
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
+    try testing.expect(!state.isRecording());
+    state.onBackEdge(&proto, 7, &.{}); // 1
+    state.onBackEdge(&proto, 7, &.{}); // 2 — not yet hot
+    try testing.expect(!state.isRecording());
+    state.onBackEdge(&proto, 7, &.{}); // 3 == hotloop → arm
+    try testing.expect(state.isRecording());
+    try testing.expectEqual(@as(u32, 7), state.rec.anchor.pc);
 }
