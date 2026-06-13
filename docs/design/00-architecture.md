@@ -119,11 +119,24 @@ _(nothing yet — design only)_
       `SnapIdx` placeholder and the entry/exit slot maps the restore will need);
       penalty/blacklist backoff, side traces & linking, cache invalidation, and
       counter decay → later.
-- [ ] **Phase 5b — Trace serialization format.** Define it as a binschema
-      schema (canonical `binschema` dir); generate the TypeScript decoder;
-      hand-write the Zig writer; validate the two against each other with
-      binschema's cross-language fixtures. See §Trace serialization and
-      `04-snapshot-replay-schema.md`.
+- [~] **Phase 5b — Trace serialization format.** **Done (Zig round-trip):** the
+      committed trace cache now serializes to a versioned, on-disk wire format.
+      The format is defined declaratively in `schema/trace.json` (binschema); the
+      Zig encoder/decoder is **generated** from it (`tools/regen-trace-schema.sh`)
+      and **vendored** under `src/gen/` — so lune builds with no dependency on the
+      binschema repo (the generated runtime is committed). `src/traceser.zig` maps
+      a `trace.Trace` onto the schema structs; `--emit-traces <file>` drops the
+      cache after a run. The in-memory `*const Proto` anchor pointer is replaced by
+      a stable, compile-time `Proto.id` (a pointer is meaningless on disk; the
+      visualiser uses the id as a correlation key). Round-trip is proven
+      byte/struct-exact for real recorded traces (numeric + a string const) and a
+      hand-built edge corpus (`INT64_MIN/MAX`, FP specials, NUL-bearing strings).
+      **Deferred → Phase 7 (the visualiser hosts them):** the **TypeScript
+      decoder** + binschema **cross-language fixtures** (no TS consumer exists
+      yet). **Deferred → later:** reload-into-VM (id→`*Proto` rebind + proto-hash
+      validation), and the richer recording header / effect log / keyframes (the
+      rest of `04-snapshot-replay-schema.md`, gated on the host-effect boundary).
+      See §Trace serialization and `04-snapshot-replay-schema.md`.
 - [~] **Phase 6 — IR-interpreter (tier 1a) + deopt.** **Done (Phase 6a):** the
       tier-1a executor (`src/irinterp.zig` + the back-edge seam in `src/interp.zig`)
       *runs* recorded traces — no native code. `execute` walks the linear SSA IR
@@ -506,17 +519,21 @@ records** — a tag plus a variant payload — which is exactly a *discriminated
 union*, binschema's core feature. Bit-level fields, computed lengths, and
 cross-language conformance testing come along for free.
 
-Bring-up plan (don't block lune on tooling):
+Bring-up plan (don't block lune on tooling) — **updated now that binschema has a
+Zig backend** (it did not when this section was first written, which is why it
+once planned a hand-written Zig writer; that's superseded):
 
 - **Schema is the source of truth** for the wire format — versioned, documented.
-- **TypeScript decoder: generated** from the schema. The visualiser does zero
-  hand-written parsing.
-- **Zig writer: hand-written** — binschema has no Zig generator yet (its
-  backends are TS/Python/Rust/Go). Validated against the generated TS decoder by
-  binschema's cross-language JSON fixtures, so the format stays the single source
-  of truth even though the encoder is hand-maintained. (If a Zig backend ever
-  lands in binschema that's orthogonal, separate work — nothing here depends on
-  it, and the writer can be swapped for generated code if it shows up.)
+  Lives in the lune repo at `schema/trace.json` (revisit moving it into the
+  canonical `binschema` dir if other projects ever need it).
+- **Zig encoder/decoder: generated** from the schema by binschema's Zig backend
+  (`tools/regen-trace-schema.sh`) and **vendored** under `src/gen/` — committed,
+  so the build needs no binschema checkout. lune never hand-writes encode/decode;
+  it only *maps* `trace.Trace` ↔ the generated structs (`src/traceser.zig`).
+- **TypeScript decoder: generated** from the same schema — **deferred to Phase 7**
+  (the visualiser), when there's a consumer to host it. At that point the TS
+  decoder and Zig encoder are validated against each other with binschema's
+  cross-language JSON fixtures, keeping the schema the single source of truth.
 
 JSON is fine for early bring-up; expect to lean on binschema's compact binary
 encoding once traces get long (full-fidelity recordings grow fast).

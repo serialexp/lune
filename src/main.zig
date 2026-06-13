@@ -45,6 +45,8 @@ const usage =
     \\                       with --dump-traces to see unoptimized IR.
     \\  --dump-traces        imply --trace and print every recorded trace's IR to
     \\                       stderr after the run.
+    \\  --emit-traces <file> imply --trace and serialize the recorded trace cache
+    \\                       to <file> (binschema wire format) after the run.
     \\  -h, --help           show this help
     \\
 ;
@@ -52,7 +54,14 @@ const usage =
 /// Tracing-JIT options parsed from the command line (default: off). When
 /// `enabled`, `execute` decides tier-1a participation: true ⇒ run cached traces
 /// (`--trace`), false ⇒ record only, tier-0 executes (`--trace-record-only`).
-const TraceOpts = struct { enabled: bool = false, execute: bool = true, optimize: bool = true, dump: bool = false };
+const TraceOpts = struct {
+    enabled: bool = false,
+    execute: bool = true,
+    optimize: bool = true,
+    dump: bool = false,
+    /// `--emit-traces <file>`: serialize the trace cache here after the run.
+    emit_path: ?[]const u8 = null,
+};
 
 pub fn main(init: std.process.Init) u8 {
     const gpa = init.gpa;
@@ -79,6 +88,12 @@ pub fn main(init: std.process.Init) u8 {
         } else if (std.mem.eql(u8, arg, "--dump-traces")) {
             topts.enabled = true;
             topts.dump = true;
+        } else if (std.mem.eql(u8, arg, "--emit-traces")) {
+            topts.enabled = true;
+            topts.emit_path = it.next() orelse {
+                lune.io.eprint("lune: error: --emit-traces requires a <file> argument\n", .{});
+                return 2;
+            };
         } else break arg;
     } else {
         lune.io.eprint("{s}", .{usage});
@@ -91,7 +106,7 @@ pub fn main(init: std.process.Init) u8 {
             lune.io.eprint("lune: error: -e requires a chunk argument\n", .{});
             return 2;
         };
-        return runSource(gpa, "=(command line)", chunk, topts);
+        return runSource(gpa, init.io, "=(command line)", chunk, topts);
     }
 
     // Otherwise the first non-option argument is a script path.
@@ -100,13 +115,13 @@ pub fn main(init: std.process.Init) u8 {
         return 1;
     };
     defer gpa.free(source);
-    return runSource(gpa, first, source, topts);
+    return runSource(gpa, init.io, first, source, topts);
 }
 
 /// Parse, compile, and run one source chunk. Returns the process exit code.
 /// `name` labels the chunk in diagnostics (a file path or a synthetic name).
 /// `topts` controls the tracing-JIT recorder (off by default).
-fn runSource(gpa: std.mem.Allocator, name: []const u8, source: [:0]const u8, topts: TraceOpts) u8 {
+fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [:0]const u8, topts: TraceOpts) u8 {
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
 
@@ -158,7 +173,24 @@ fn runSource(gpa: std.mem.Allocator, name: []const u8, source: [:0]const u8, top
     // interleave with the program's stdout. The chunk is still alive here (its
     // `deinit` is deferred), so each trace's `anchor.proto` is valid.
     if (topts.dump) dumpTraces(&vm);
+
+    // --- emit serialized traces (--emit-traces <file>) --- the chunk is still
+    // alive, so every trace's `anchor.proto` (and its `id`) is valid.
+    if (topts.emit_path) |path| {
+        emitTraces(gpa, io, path, &vm) catch |err| {
+            lune.io.eprint("lune: error: --emit-traces '{s}': {s}\n", .{ path, @errorName(err) });
+            return 1;
+        };
+    }
     return 0;
+}
+
+/// Serialize the recorded trace cache to `path` (binschema wire format).
+fn emitTraces(gpa: std.mem.Allocator, io: lune.io.Io, path: []const u8, vm: *lune.interp.Vm) !void {
+    const bytes = try lune.traceser.encodeFile(gpa, vm.trace.cache.items);
+    defer gpa.free(bytes);
+    try lune.io.writeFile(io, path, bytes);
+    lune.io.eprint("lune: wrote {d} trace(s), {d} bytes → {s}\n", .{ vm.trace.cache.items.len, bytes.len, path });
 }
 
 /// Disassemble every cached trace to stderr (for `--dump-traces`).

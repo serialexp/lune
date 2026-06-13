@@ -15,7 +15,30 @@ schema follows; this is that schema's home.
 
 ### Done
 
-_(nothing yet — design only)_
+- [x] **Trace artifact wire format (Phase 5b — Zig round-trip).** The committed
+      trace cache serializes to a versioned, on-disk binary form. The format is
+      defined declaratively in **`schema/trace.json`** (binschema); the Zig
+      encoder/decoder is **generated** from it by binschema's Zig backend
+      (`tools/regen-trace-schema.sh`) and **vendored** under `src/gen/` — committed
+      output, so lune builds with no dependency on the binschema repo.
+      `src/traceser.zig` maps a `trace.Trace` onto the schema structs and writes a
+      `TraceFile { version, traces[] }`; the CLI's `--emit-traces <file>` drops it
+      after a run. Schema shape: `Trace { anchor_proto_id, anchor_pc, instrs[],
+      consts[], entry_slots[], exit_stores[] }`; `ConstValue` is a discriminated
+      union tagged on lune's `Value.Tag` (nil/boolean/int/float + a `ConstString`
+      variant for the only heap const a trace can hold). **Decisions made here:**
+      (a) the in-memory `*const Proto` anchor pointer is replaced by a stable,
+      compile-time **`Proto.id`** — a pointer is meaningless on disk, and the
+      visualiser uses the id only as a correlation key (trace → proto →
+      disassembly), never rebinding a live pointer; (b) a minimal **`version`**
+      word heads the file; the richer recording header (hash seed, FP mode, env
+      snapshot) belongs with effect-recording and is deferred. Round-trip is proven
+      byte/struct-exact for real recorded traces (numeric + a string const) and a
+      hand-built edge corpus (`INT64_MIN/MAX`, i32-aux extremes, FP specials,
+      NUL-bearing strings). **Deferred → Phase 7:** the generated **TypeScript
+      decoder** + binschema **cross-language fixtures** (no TS consumer until the
+      visualiser exists). **Deferred → later:** reload-into-VM (id→`*Proto` rebind
+      + proto-hash validation, string interning, live `Value` reconstruction).
 
 ### Outstanding
 
@@ -38,9 +61,12 @@ _(nothing yet — design only)_
       truncated** (no silent caps).
 - [ ] **File layout.** Chunked / mmap-friendly with a seek index; string / value
       interning; trace header (hash seed, FP mode, env snapshot, schema version).
-- [ ] **binschema schema** in the canonical `binschema` repo; **generate the TS
-      decoder**; **hand-write the Zig writer**; validate via cross-language
-      fixtures.
+- [~] **binschema schema + generated codec.** Done for the **trace artifact**:
+      `schema/trace.json` (in the lune repo) + a **generated, vendored** Zig
+      encoder/decoder (binschema gained a Zig backend, so the writer is generated,
+      not hand-written — see Done above). Still outstanding: the **generated TS
+      decoder** + cross-language fixtures (→ Phase 7), and extending the schema to
+      the full event model below (effects / keyframes / guard-snapshots).
 - [ ] **Versioning / compat policy.** The schema will churn during Phases 5–7.
       State the policy (likely: visualiser reads traces only from the same VM
       commit) so version skew is handled, not surprising.

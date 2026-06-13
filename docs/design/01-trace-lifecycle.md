@@ -22,7 +22,13 @@ architecture." This doc is where that policy lives.
       ⇔ a backward/self jump), gated on `config.enabled`. _Call/entry counters and
       counter decay are still outstanding (below)._
 - [x] **Trace anchors (root, loop headers).** A hot loop header `(proto, pc)` is
-      the only anchor in 5a. _Hot side exits → side traces are outstanding._
+      the only anchor in 5a. In memory the anchor keys on the borrowed `*const
+      Proto` pointer (fast identity for "do I have a trace for this exact loop
+      header?"). **On disk (Phase 5b) the pointer becomes a stable, compile-time
+      `Proto.id`** — a pointer is meaningless once serialized; the visualiser uses
+      the id as a correlation key, never rebinding a live pointer (see
+      `04-snapshot-replay-schema.md`). _Hot side exits → side traces are
+      outstanding._
 - [x] **Trace lifecycle state machine (recording slice).** `interpreting →
       recording → (loop-back) committed→cached | aborted→blacklisted`. The
       `executing_ir → side_exit` half is now Phase 6a (below); `linked` (side

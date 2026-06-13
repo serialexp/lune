@@ -110,6 +110,13 @@ pub fn readFileZ(gpa: std.mem.Allocator, io: Io, path: []const u8) ![:0]u8 {
     );
 }
 
+/// Write `data` to `path`, creating/truncating it. The symmetric counterpart of
+/// `readFileZ`; funnels the churny `std.Io` file-write surface through this one
+/// module. Used by the CLI's `--emit-traces` to drop a serialized trace cache.
+pub fn writeFile(io: Io, path: []const u8, data: []const u8) !void {
+    return std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+}
+
 /// Render a `Value` to `w` in a human-readable, debugger-friendly form. The
 /// canonical text form of a value lives here (one place), separate from the
 /// `Value` type itself so the type stays free of the churny writer dependency.
