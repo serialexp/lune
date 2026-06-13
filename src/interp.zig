@@ -1172,3 +1172,175 @@ test "recorder: maxrecord bounds trace length (overlong traces abort)" {
     try testing.expect(vm.trace.blacklist.count() >= 1);
     try testing.expect(!vm.trace.isRecording());
 }
+
+// ---------------------------------------------------------------------------
+// Tier-1a executor shape + deopt (Phase 6). The `expectProgram` matrix above
+// already proves output transparency across {off, record_only, record_execute}
+// × gc_stress; these target the executor-specific behaviours that the matrix
+// can't *observe*: that a cached trace genuinely runs (back-edge counts collapse
+// once it takes over), that a guard/arith failure side-exits and tier-0 resumes
+// byte-identically, and that the re-entry brake blacklists a thrashing anchor.
+// ---------------------------------------------------------------------------
+
+/// Like `runForTrace` but with tier-1a execution ON, capturing `print` output
+/// into `sink`. Leaves `vm` inspectable (cache / penalty / blacklist / back-edge
+/// counters). The caller must `deinit` the returned chunk only *after* inspecting
+/// traces (an anchor points into the chunk arena — see `runForTrace`).
+fn runExecForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer) !compiler.Chunk {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.hotloop = 4;
+    vm.out = sink;
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    errdefer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    return chunk;
+}
+
+/// Assert `source` prints byte-identically in tier-0 and in record+execute — the
+/// equivalence check for deopt-heavy programs whose output (e.g. a float) is
+/// tedious to spell but must match tier-0 regardless of how the trace side-exits.
+fn expectTier0Equiv(source: [:0]const u8) !void {
+    var buf0: [256]u8 = undefined;
+    var s0 = io.Writer.fixed(&buf0);
+    try runCaptured(testing.allocator, source, &s0, false, .off);
+    var buf1: [256]u8 = undefined;
+    var s1 = io.Writer.fixed(&buf1);
+    try runCaptured(testing.allocator, source, &s1, false, .record_execute);
+    try testing.expectEqualStrings(s0.buffered(), s1.buffered());
+}
+
+test "executor: a hot numeric-for sum runs via the IR-interpreter (back-edges collapse)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runExecForTrace(&vm, gpa,
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + i end
+        \\print(acc)
+    , &sink);
+    defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
+
+    // Correct result (sum 1..100).
+    try testing.expectEqualStrings("5050\n", sink.buffered());
+
+    // One clean trace, never blacklisted, penalty cleared by the big yield.
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.blacklist.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.penalty.count());
+
+    // The decisive "it actually executed" signal: tier-0 saw back-edges only
+    // until the trace was cached (== hotloop). The remaining ~95 iterations ran
+    // inside the IR-interpreter, so the anchor's counter never climbed toward 100.
+    const t = vm.trace.cache.items[0];
+    try testing.expectEqual(vm.trace.config.hotloop, vm.trace.backEdgeCount(t.anchor));
+}
+
+test "executor: integer //-by-zero inside a hot loop side-exits; tier-0 re-raises identically" {
+    const source =
+        \\local x = 0
+        \\for i = 1, 100 do x = x + (100 // (50 - i)) end
+        \\print(x)
+    ;
+    // The divisor `50 - i` is 0 at i == 50 — long after the loop has gone hot and
+    // is running through the executor. `arith.floorDiv` returns `DivisionByZero`,
+    // the executor side-exits, and tier-0 re-runs the partial iteration and raises
+    // the *same* error. Tier-0 (execute off) raises it identically — same error,
+    // same place — which is the whole point of re-running rather than reconstructing.
+    inline for (.{ TraceMode.off, TraceMode.record_execute }) |mode| {
+        const gpa = testing.allocator;
+        const parser = @import("parser.zig");
+        const diag = @import("diag.zig");
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.out = &sink;
+        vm.trace.config.enabled = mode != .off;
+        vm.trace.config.execute = mode == .record_execute;
+        vm.trace.config.hotloop = 4;
+        var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        try testing.expectError(Error.DivisionByZero, vm.run(chunk.proto));
+    }
+}
+
+test "executor: a variable that flips int->float mid-loop deopts, blacklists, and still matches tier-0" {
+    // Recorded as an integer loop (the `i == 20` branch is not taken when it goes
+    // hot). At i == 20 tier-0 takes the branch and `x` becomes a float; every later
+    // re-entry then fails its `guard_int` on `x` (zero-yield), so the re-entry
+    // penalty climbs to `max_penalty` and the anchor is blacklisted — tier-0 owns
+    // the tail. The result must still equal tier-0's to the last decimal.
+    const source =
+        \\local x = 0
+        \\for i = 1, 200 do
+        \\  if i == 20 then x = x + 0.5 end
+        \\  x = x + 1
+        \\end
+        \\print(x)
+    ;
+    try expectTier0Equiv(source);
+
+    // Introspect the brake: the type flip thrashes the trace until it blacklists.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runExecForTrace(&vm, gpa, source, &sink);
+    defer chunk.deinit();
+    try testing.expect(vm.trace.blacklist.count() >= 1);
+}
+
+test "executor: a branchy low-yield loop blacklists the thrashing anchor yet prints correctly" {
+    // The trace records one parity of `if i % 2 == 0`; the opposite parity fails
+    // its branch guard after ~1 committed iteration *every* entry. `completed > 0`
+    // looks productive but never reaches `min_useful`, so the penalty accrues and
+    // the anchor blacklists — the case both plan reviewers flagged. Output stays
+    // exact (100 evens × 1 + 100 odds × 2 == 300).
+    const source =
+        \\local s = 0
+        \\for i = 1, 200 do
+        \\  if i % 2 == 0 then s = s + 1 else s = s + 2 end
+        \\end
+        \\print(s)
+    ;
+    try expectTier0Equiv(source);
+
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runExecForTrace(&vm, gpa, source, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("300\n", sink.buffered());
+    try testing.expect(vm.trace.blacklist.count() >= 1);
+}
+
+test "e2e (executor): a long hot loop stays correct across every trace + gc mode" {
+    // Long enough to record, execute, side-exit at the loop close, and clear its
+    // penalty — run under gc_stress too (record_execute × stress is in the matrix).
+    try expectProgram(
+        \\local acc = 0
+        \\for i = 1, 64 do acc = acc + i end
+        \\print(acc)
+    , "2080\n"); // sum 1..64 == 2080
+}
