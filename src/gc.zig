@@ -106,11 +106,31 @@ pub const Heap = struct {
     fn link(self: *Heap, h: *GcHeader) void {
         // Stamp a stable, deterministic identity before threading the object in.
         // This is the single allocation chokepoint, so every heap object gets one.
-        h.id = self.next_obj_id;
+        self.linkRestored(h, self.next_obj_id);
         self.next_obj_id += 1;
+    }
+
+    /// Restore-only: thread `h` onto the sweep list with an **explicit** id taken
+    /// from a snapshot, instead of the monotonic counter. The keyframe restorer
+    /// (`keyframeser.zig`) uses this to reproduce a snapshot's exact id space —
+    /// which matters because `table.ValueContext` hashes heap keys by id, so a
+    /// restored table only lays out (and re-serializes) identically when its keys
+    /// keep their original ids. Never call this during normal execution: it does
+    /// **not** touch `next_obj_id`, so the caller must follow a batch of restores
+    /// with `adoptNextId(max_id + 1)` to keep future ids collision-free. The
+    /// snapshot guarantees distinct ids, so no two restored objects collide.
+    pub fn linkRestored(self: *Heap, h: *GcHeader, id: u32) void {
+        h.id = id;
         h.next = self.objects;
         self.objects = h;
         self.object_count += 1;
+    }
+
+    /// Advance the monotonic id counter to at least `next`, so allocations after a
+    /// restore cannot reuse an id that a restored object already holds. Idempotent
+    /// and monotonic (never lowers the counter).
+    pub fn adoptNextId(self: *Heap, next: u32) void {
+        self.next_obj_id = @max(self.next_obj_id, next);
     }
 
     /// Allocate a fresh empty table and register it with the heap.

@@ -1,6 +1,6 @@
 # lune — Snapshot & Replay Schema
 
-Status: draft — trace artifact + keyframe serializer (F2a) landed; replay outstanding
+Status: draft — trace artifact + keyframe capture/restore (F2a+F2b) landed; replay outstanding
 Owner: Bart
 Last updated: 2026-06-13
 
@@ -74,31 +74,56 @@ schema follows; this is that schema's home.
       determinism bug: `table.ValueContext.hash` hashed a heap key by its
       *address*, so hash-part iteration order (hence serialized `entries` order)
       varied run-to-run; it now hashes by stable `GcHeader.id` (see
-      `02-determinism.md` §"Table iteration order"). **Deferred → F2b:**
-      restore-into-live-VM (id→`*GcHeader` rebind, re-interning, Proto-by-id /
-      Native-by-name rebind, stack + open-upvalue reconstruction) and
-      mid-execution capture at a safepoint (non-empty stack + OPEN upvalues).
+      `02-determinism.md` §"Table iteration order").
+
+- [x] **Keyframe snapshot RESTORE (Phase 7 v2 / F2b — round-trip into a live VM).**
+      `keyframeser.restore`/`restoreSnapshot` decode a `SnapshotFile` and rebuild
+      the heap graph into a fresh, **bare** VM (`Vm.initBare` — an empty heap, no
+      auto-seeded globals/natives, so restore owns every id). Reconstruction is
+      two-pass: pass 1 creates each object shell (string ⇒ re-intern; table; closure
+      with its `proto` resolved by walking the program's prototype tree, since
+      `Proto.id` has no runtime registry; upvalue; native rebound by name through
+      the shared `interp.base_natives` registry) and records `id → *GcHeader`; pass
+      2 wires every edge (table array + hash, closure upvalues, upvalue values) so
+      cycles and forward refs resolve; then globals + stack + frames + open upvalues
+      are rebound. **Ids are preserved exactly** via a restore-only `gc.Heap`
+      seam (`linkRestored` + `adoptNextId`): because table hash-iteration order is
+      keyed on `GcHeader.id`, re-stamping the original ids makes a restored VM
+      re-serialize **byte-for-byte identical** to the snapshot it came from — the
+      verification headline (`encodeSnapshot ∘ restore == identity`, proven over the
+      VM-driven corpus + the run-twice determinism programs). Plus restore-specific
+      structural assertions, a full restore of the hand-built edge corpus (cycles,
+      open+closed upvalues, 0/N-upvalue closures, non-empty stack/frames/open
+      upvalues), and failure-mode tests (`UnresolvedHeapRef` / `UnknownProto` /
+      `UnknownNative` / `GlobalsNotATable` / `DuplicateId` / `UnsupportedVersion`).
+      A restore-only `Table.restoreEntry` populates the hash part without triggering
+      array migration, preserving the captured array/hash split. **Deferred → later:**
+      mid-execution capture at a GC safepoint (non-empty stack + OPEN upvalues — the
+      restore code already handles these roots, but producing such a snapshot needs
+      the safepoint hook) and snapshot→restore→re-execute equivalence (meaningful
+      only once a live stack is captured).
 
 ### Outstanding
 
 - [~] **Two artifacts, one substrate.** Define **optimizer guard-snapshots**
       (for deopt) and **debugger keyframes + effect log** (for replay) as
       distinct record types that share encoding — *not* one fused artifact. The
-      keyframe half exists as a serializer (F2a, above): `SnapshotFile` is a
-      distinct record family with its own version word, sharing the trace
-      artifact's generated codec. Guard-snapshots and the effect log are still
-      outstanding.
+      keyframe half exists end-to-end (F2a serializer + F2b restore, above):
+      `SnapshotFile` is a distinct record family with its own version word, sharing
+      the trace artifact's generated codec, and round-trips losslessly through a
+      live VM. Guard-snapshots and the effect log are still outstanding.
 - [ ] **Event model.** Minimum event set: event id, bytecode PC, frame id,
       register writes, heap writes, allocation ids, guard snapshots, side exits,
       host/external calls, nondeterministic inputs (effect records), GC events,
       checkpoint/keyframe indexes.
 - [ ] **Effect record format** — inputs + outputs sufficient to replay without
       re-running the effect (shared with `02-determinism.md`).
-- [~] **Keyframe format** — VM-state snapshot for replay restore (shares code
-      with guard snapshots, `01-trace-lifecycle.md`). The **capture** half is done
-      (F2a `SnapshotFile`, above): the reachable heap graph + roots serialize
-      losslessly and deterministically. The **restore** half (decode back into a
-      live VM) is F2b.
+- [x] **Keyframe format** — VM-state snapshot for replay restore (shares code
+      with guard snapshots, `01-trace-lifecycle.md`). Both halves are done: capture
+      (F2a `SnapshotFile`) and restore into a live VM (F2b `keyframeser.restore`),
+      proven inverse by a byte-identical re-snapshot. What remains for *replay* is
+      not the keyframe itself but the effect log it interleaves with (below) and a
+      mid-execution capture point (a non-empty stack to re-execute forward from).
 - [ ] **Recording modes.** Full-replay, bounded ring-buffer window, keyframe-only,
       off. Define defaults and per-mode capture filters (bytecode events / heap
       writes / host calls / allocations / source lines).

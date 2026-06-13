@@ -64,14 +64,29 @@ const stack_slots: usize = 1 << 16;
 /// the JIT tiers use an explicit frame stack with no such limit.
 const max_call_depth: u32 = 200;
 
+/// One built-in native: the global name it installs under and its function.
+pub const BaseNative = struct { name: []const u8, func: function.NativeFn };
+
+/// The single source of truth for built-in natives. `installBaseLib` installs
+/// every entry into a fresh VM's globals, and the keyframe restorer
+/// (`keyframeser.zig`) looks a serialized native up here by name to rebind it —
+/// so a native added here is automatically both installable and restorable, and
+/// the two paths can never diverge. The serialized form of a `Native` is just its
+/// name (`keyframeser.toSchemaHeapObject`), which is meaningful only against this
+/// registry. Currently just `print`; `tostring`, `type`, … attach here.
+pub const base_natives = [_]BaseNative{
+    .{ .name = "print", .func = &nativePrint },
+};
+
 /// Result of running one frame: the `count` return values live at
 /// `regs[reg .. reg + count]` of that frame's window (i.e. `stack[base + reg]`).
 const FrameResult = struct { reg: u16, count: u16 };
 
 /// An open upvalue: a cell still pointing at the live stack slot `index`. Tracked
 /// so that two closures capturing the same variable share one cell, and so the
-/// cell can be *closed* (detached) when its slot is about to be freed.
-const OpenUpvalue = struct { index: usize, cell: *function.Upvalue };
+/// cell can be *closed* (detached) when its slot is about to be freed. Public so
+/// the keyframe restorer (`keyframeser.zig`) can rebuild the open-upvalue list.
+pub const OpenUpvalue = struct { index: usize, cell: *function.Upvalue };
 
 /// The tier-0 virtual machine. Owns the resources a running program needs that
 /// outlive a single frame: the object heap, the global table, and the shared
@@ -113,22 +128,36 @@ pub const Vm = struct {
     trace: trace.TraceState,
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
-        const heap = gc.Heap.init(gpa);
+        var vm = try initBare(gpa);
+        errdefer gpa.free(vm.stack);
+        errdefer vm.heap.deinit();
+        // The globals table lives on the heap like any other table (id 0), then
+        // the base library installs (the `print` native + its interned name).
+        vm.globals = try vm.heap.newTable();
+        try vm.installBaseLib();
+        return vm;
+    }
+
+    /// Build a VM with **no seeded heap**: an empty heap (`next_obj_id == 0`, no
+    /// globals, no natives, empty interned map), an allocated register stack, and
+    /// trace state — but `globals` left `undefined`. This is the substrate the
+    /// keyframe restorer (`keyframeser.restoreSnapshot`) builds on: it rebuilds
+    /// the globals table and the natives from the snapshot with their *original*
+    /// ids, which a normally-seeded `init` would pre-occupy. `init` is exactly
+    /// `initBare` + globals + base lib, so its observable behaviour (ids 0/1/2 for
+    /// globals / `print` native / `"print"` string) is unchanged. The caller MUST
+    /// assign `globals` before using the VM. Only fails on allocation (the stack),
+    /// so the narrow error set lets the keyframe restorer keep a tight `RestoreError`.
+    pub fn initBare(gpa: std.mem.Allocator) std.mem.Allocator.Error!Vm {
         const stack = try gpa.alloc(Value, stack_slots);
         errdefer gpa.free(stack);
-
-        var vm = Vm{
+        return Vm{
             .gpa = gpa,
-            .heap = heap,
+            .heap = gc.Heap.init(gpa),
             .globals = undefined,
             .stack = stack,
             .trace = trace.TraceState.init(gpa),
         };
-        errdefer vm.heap.deinit();
-        // The globals table lives on the heap like any other table.
-        vm.globals = try vm.heap.newTable();
-        try vm.installBaseLib();
-        return vm;
     }
 
     /// Frees the heap (and every object on it, including globals) and the
@@ -141,10 +170,11 @@ pub const Vm = struct {
         self.gpa.free(self.stack);
     }
 
-    /// Install the built-in globals (the host-effect boundary). Currently just
-    /// `print`; `tostring`, `type`, … attach here as they land.
+    /// Install the built-in globals (the host-effect boundary) from the single
+    /// `base_natives` registry — the same table the keyframe restorer reads to
+    /// rebind a serialized native by name, so install and restore can never drift.
     fn installBaseLib(self: *Vm) Error!void {
-        try self.defineNative("print", &nativePrint);
+        for (base_natives) |bn| try self.defineNative(bn.name, bn.func);
     }
 
     fn defineNative(self: *Vm, name: []const u8, func: function.NativeFn) Error!void {

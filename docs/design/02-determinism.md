@@ -132,8 +132,14 @@ that for a time-travel debugger it *is* the architecture.
       assertion is the strongest of the three: it serializes the entire heap graph,
       so any address leaking into object identity, edge order, or table iteration
       order diverges the bytes — it is what caught the address-dependent table-key
-      hashing above. This is the regression spine that generalises to true
-      keyframe+effect replay once restore (F2b) exists.
+      hashing above. **Restore (F2b) closes the loop**: a snapshot now decodes back
+      into a fresh VM (`keyframeser.restore`) and re-serializes **byte-for-byte
+      identical** to the original (`encodeSnapshot ∘ restore == identity`, asserted
+      over the corpus). Because the restorer re-stamps each object's *original* id,
+      the restored VM reproduces the exact table iteration order — so the
+      round-trip is a second, independent guard on the id-keyed hashing above. This
+      is the regression spine that generalises to true keyframe+effect replay once a
+      mid-execution capture point and the effect log exist.
 
 ## Why this exists
 

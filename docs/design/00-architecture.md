@@ -231,11 +231,17 @@ _(nothing yet — design only)_
       `Vm.forEachRootHeader` helper, no drift); `--emit-keyframe <file>` drops a
       snapshot after a run. The run-twice harness now also asserts byte-identical
       **snapshot** bytes — which caught a real determinism bug (table keys hashed
-      by address, now by stable id; doc 02 §Table iteration order). **Still to
-      come:** F2b — restore a keyframe back into a live VM (id→pointer rebind,
-      re-interning, Proto/Native rebind, stack + open-upvalue reconstruction) —
-      then the effect-log (waits on the first nondeterministic *input* existing)
-      and the visualiser's iteration animation.
+      by address, now by stable id; doc 02 §Table iteration order). **F2b (keyframe
+      restore) landed:** a snapshot decodes back into a fresh, bare VM
+      (`keyframeser.restore`) — two-pass heap-graph rebuild (id→pointer rebind,
+      string re-interning, Proto-by-id / Native-by-name rebind, stack + frame +
+      open-upvalue reconstruction). Ids are re-stamped to their *originals* via a
+      restore-only `gc.Heap` seam, so a restored VM re-serializes **byte-for-byte
+      identical** to its snapshot (`encodeSnapshot ∘ restore == identity`) — capture
+      and restore proven exact inverses. **Still to come:** a mid-execution capture
+      point (a non-empty stack to re-execute forward from), the effect-log (waits on
+      the first nondeterministic *input* existing), then the visualiser's iteration
+      animation.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
       first. A performance step — but *not* mechanical: regalloc across side
       exits, GC stackmaps/safepoints, and machine-state snapshot-restore are

@@ -214,6 +214,237 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Restore (F2b) — rebuild a live VM from a decoded snapshot.
+//
+// The inverse of the encoder above. Restoring re-stamps each object with its
+// ORIGINAL id (`gc.Heap.linkRestored`), because a table's hash-iteration order is
+// keyed on `GcHeader.id` — preserving ids is what lets a restored VM re-serialize
+// to the identical bytes. Reconstruction is two-pass: pass 1 creates every object
+// shell and records id→header, pass 2 wires the inter-object edges (so cycles and
+// forward references resolve). Roots (globals, stack, frames, open upvalues) are
+// rebound last. The VM is heap-allocated and returned by pointer: open upvalue
+// cells point at `&vm.stack[i]`, so the VM's address must stay fixed.
+// ---------------------------------------------------------------------------
+
+const RestoreError = error{
+    UnsupportedVersion, // SnapshotFile.version != snapshot_format_version
+    HeapNotEmpty, // restoring into a non-bare VM would collide ids/interning
+    DuplicateId, // two HeapObjects share an id (corrupt snapshot)
+    UnresolvedHeapRef, // a HeapRef / root id has no matching object
+    UnknownProto, // a HeapClosure.proto_id is not in the program's proto tree
+    UnknownNative, // a HeapNative.name is not in the native registry
+    GlobalsNotATable, // globals_id resolves to a non-table object
+    FrameNotAClosure, // a frame's closure_id resolves to a non-closure
+    UpvalueNotAnUpvalue, // a closure/open-upvalue id resolves to a non-upvalue
+    StackTooLarge, // the snapshot stack exceeds the VM's register window
+    TooManyFrames, // the snapshot frame count exceeds max_call_depth
+    StackIndexOutOfRange, // an open upvalue points past the live stack window
+} || std.mem.Allocator.Error || SchemaDecodeError // + the codec's own decode errors
+    || table.Table.Error; // a corrupt snapshot could carry a nil/NaN table key
+
+/// The generated codec's `decode` error set, lifted straight from its signature
+/// so `restore` (which decodes) can propagate a malformed-bytes failure without
+/// re-listing binschema's internal error names (which it does not re-export).
+const SchemaDecodeError = blk: {
+    const ret = @typeInfo(@TypeOf(schema.SnapshotFile.decode)).@"fn".return_type.?;
+    break :blk @typeInfo(ret).error_union.error_set;
+};
+
+/// Maps a snapshot's stable id to the freshly-restored object. Built in pass 1,
+/// read in pass 2 + the root rebind.
+const IdMap = std.AutoHashMap(u32, *GcHeader);
+
+/// Resolves a serialized native (by name) back to its function. Backed by the
+/// single `interp.base_natives` table, so install and restore share one truth.
+pub const NativeRegistry = struct {
+    entries: []const interp.BaseNative,
+
+    /// The default registry — every built-in the VM installs at `init`.
+    pub fn base() NativeRegistry {
+        return .{ .entries = &interp.base_natives };
+    }
+
+    pub fn lookup(self: NativeRegistry, name: []const u8) ?interp.BaseNative {
+        for (self.entries) |e| if (std.mem.eql(u8, e.name, name)) return e;
+        return null;
+    }
+};
+
+/// Inverse of `toSchemaValue`: a scalar maps back directly; a `HeapRef` resolves
+/// through the id map to a live `Value.heap`. Switching on the decoded union (not
+/// the raw tag) keeps the value consistent with what the codec discriminated.
+fn fromSchemaValue(sv: schema.SnapValue, idmap: *const IdMap) RestoreError!Value {
+    return switch (sv.body) {
+        .ConstNil => Value.nil(),
+        .ConstBool => |b| Value.boolean(b.v != 0),
+        .ConstInt => |x| Value.int(x.v),
+        .ConstFloat => |x| Value.float(x.v),
+        .HeapRef => |r| Value.heap(idmap.get(r.id) orelse return error.UnresolvedHeapRef),
+    };
+}
+
+/// Resolve a `proto_id` by walking the program's prototype tree (pre-order, the
+/// same order the compiler assigns ids). There is no runtime proto-by-id registry
+/// — protos are arena-owned compile-time entities — so a closure rebinds against
+/// the program image the snapshot was taken from.
+fn findProto(root: *const Proto, id: u32) ?*const Proto {
+    if (root.id == id) return root;
+    for (root.protos) |child| if (findProto(child, id)) |p| return p;
+    return null;
+}
+
+/// Decode `bytes` and restore them into a fresh VM (see `restoreSnapshot`).
+pub fn restore(
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    root: *const Proto,
+    natives: NativeRegistry,
+) RestoreError!*Vm {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit(); // decoded structs are consumed during restore (bytes copied)
+    const snapshot = try schema.SnapshotFile.decode(arena.allocator(), bytes);
+    return restoreSnapshot(gpa, snapshot, root, natives);
+}
+
+/// Rebuild a live VM from a decoded keyframe. `root` is the program's root
+/// prototype (resolves `HeapClosure.proto_id`); `natives` rebinds serialized
+/// natives by name. The returned VM is owned by the caller (`vm.deinit()` then
+/// `gpa.destroy(vm)`); on any error nothing is leaked.
+pub fn restoreSnapshot(
+    gpa: std.mem.Allocator,
+    snapshot: schema.SnapshotFile,
+    root: *const Proto,
+    natives: NativeRegistry,
+) RestoreError!*Vm {
+    if (snapshot.version != snapshot_format_version) return error.UnsupportedVersion;
+    const kf = snapshot.keyframe;
+
+    const vm = try gpa.create(Vm);
+    errdefer gpa.destroy(vm);
+    vm.* = try Vm.initBare(gpa);
+    errdefer vm.deinit();
+
+    // A bare VM is the contract: an empty heap means restored ids and interned
+    // bytes cannot collide with pre-seeded state.
+    if (vm.heap.object_count != 0 or vm.heap.next_obj_id != 0 or vm.heap.interned.count() != 0)
+        return error.HeapNotEmpty;
+
+    var idmap = IdMap.init(gpa);
+    defer idmap.deinit();
+    try idmap.ensureTotalCapacity(@intCast(kf.objects.len));
+
+    // --- Pass 1: create every object shell, stamped with its original id. ---
+    var max_id: u32 = 0;
+    for (kf.objects) |o| {
+        if (idmap.contains(o.id)) return error.DuplicateId;
+        const header: *GcHeader = switch (o.body) {
+            .HeapString => |hs| blk: {
+                // Re-intern: allocate the bytes and register them so later program
+                // interning of the same bytes resolves to this object, and sweep
+                // can de-intern it. NOT `heap.intern` — that auto-links a counter id.
+                const s = try string.String.create(gpa, hs.bytes);
+                errdefer s.destroy(gpa);
+                try vm.heap.interned.put(gpa, s.bytes(), s);
+                vm.heap.linkRestored(&s.header, o.id);
+                break :blk &s.header;
+            },
+            .HeapTable => blk: {
+                const t = try table.Table.create(gpa);
+                vm.heap.linkRestored(&t.header, o.id);
+                break :blk &t.header;
+            },
+            .HeapClosure => |hc| blk: {
+                const proto = findProto(root, hc.proto_id) orelse return error.UnknownProto;
+                const cl = try function.Closure.create(gpa, proto, hc.upvalue_ids.len);
+                vm.heap.linkRestored(&cl.header, o.id);
+                break :blk &cl.header;
+            },
+            .HeapUpvalue => blk: {
+                // Born closed-and-self-pointing so `ptr` is never dangling; pass 2
+                // sets the value, and the root rebind repoints open cells at a slot.
+                const u = try function.Upvalue.create(gpa, undefined);
+                u.closed = Value.nil();
+                u.ptr = &u.closed;
+                vm.heap.linkRestored(&u.header, o.id);
+                break :blk &u.header;
+            },
+            .HeapNative => |hn| blk: {
+                const entry = natives.lookup(hn.name) orelse return error.UnknownNative;
+                // Use the registry's static name (outlives the decode arena).
+                const n = try function.Native.create(gpa, entry.func, entry.name);
+                vm.heap.linkRestored(&n.header, o.id);
+                break :blk &n.header;
+            },
+        };
+        idmap.putAssumeCapacityNoClobber(o.id, header);
+        max_id = @max(max_id, o.id);
+    }
+    // Future allocations must not reuse a restored id.
+    vm.heap.adoptNextId(max_id +| 1);
+
+    // --- Pass 2: wire inter-object edges (all shells now exist). ---
+    for (kf.objects) |o| {
+        const h = idmap.get(o.id).?;
+        switch (o.body) {
+            .HeapString, .HeapNative => {},
+            .HeapTable => |ht| {
+                const t = table.Table.fromHeader(h);
+                // Array part: append in order (faithfully round-trips nil holes).
+                for (ht.array) |sv| try t.array.append(gpa, try fromSchemaValue(sv, &idmap));
+                // Hash part: straight into the hash, preserving the recorded split.
+                for (ht.entries) |e| {
+                    const k = try fromSchemaValue(e.key, &idmap);
+                    const v = try fromSchemaValue(e.val, &idmap);
+                    try t.restoreEntry(gpa, k, v);
+                }
+            },
+            .HeapClosure => |hc| {
+                const cl = function.Closure.fromHeader(h);
+                for (hc.upvalue_ids, 0..) |uid, i| {
+                    const uh = idmap.get(uid) orelse return error.UnresolvedHeapRef;
+                    if (uh.type != .upvalue) return error.UpvalueNotAnUpvalue;
+                    cl.upvalues[i] = function.Upvalue.fromHeader(uh);
+                }
+            },
+            .HeapUpvalue => |hu| {
+                const u = function.Upvalue.fromHeader(h);
+                u.closed = try fromSchemaValue(hu.value, &idmap);
+                u.ptr = &u.closed; // open cells are repointed in the root rebind
+            },
+        }
+    }
+
+    // --- Roots ---
+    const gh = idmap.get(kf.globals_id) orelse return error.UnresolvedHeapRef;
+    if (gh.type != .table) return error.GlobalsNotATable;
+    vm.globals = table.Table.fromHeader(gh);
+
+    if (kf.stack.len > vm.stack.len) return error.StackTooLarge;
+    for (kf.stack, 0..) |sv, i| vm.stack[i] = try fromSchemaValue(sv, &idmap);
+    vm.stack_top = kf.stack.len;
+
+    if (kf.frames.len > vm.frame_closures.len) return error.TooManyFrames;
+    for (kf.frames, 0..) |fr, i| {
+        const fh = idmap.get(fr.closure_id) orelse return error.UnresolvedHeapRef;
+        if (fh.type != .function) return error.FrameNotAClosure;
+        vm.frame_closures[i] = function.Closure.fromHeader(fh);
+    }
+    vm.depth = @intCast(kf.frames.len);
+
+    for (kf.open_upvalues) |ou| {
+        const uh = idmap.get(ou.upvalue_id) orelse return error.UnresolvedHeapRef;
+        if (uh.type != .upvalue) return error.UpvalueNotAnUpvalue;
+        if (ou.stack_index >= vm.stack_top) return error.StackIndexOutOfRange;
+        const cell = function.Upvalue.fromHeader(uh);
+        // Repoint the open cell from its closed-self placeholder at the live slot.
+        cell.ptr = &vm.stack[ou.stack_index];
+        try vm.open_upvalues.append(gpa, .{ .index = ou.stack_index, .cell = cell });
+    }
+
+    return vm;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -439,4 +670,305 @@ test "snapshot wire enum ordinals (HeapObject.obj_type) are a pinned contract" {
     try testing.expectEqual(@as(u8, 4), @intFromEnum(ObjectType.upvalue));
     try testing.expectEqual(@as(u8, 5), @intFromEnum(ObjectType.typed_array));
     try testing.expectEqual(@as(u8, 6), @intFromEnum(ObjectType.host));
+}
+
+// ---------------------------------------------------------------------------
+// Restore (F2b) tests
+// ---------------------------------------------------------------------------
+
+/// Compile + run `source`, snapshot the final VM (`b0`), restore into a fresh VM,
+/// re-snapshot it (`b1`), and assert `b0 == b1` byte-for-byte — the headline
+/// guarantee that restore is the exact inverse of capture. The chunk is kept
+/// alive across the restore (restored closures borrow its `*const Proto`s).
+/// Returns the decoded object count so callers can add structural assertions.
+fn expectRoundTrip(source: [:0]const u8) !void {
+    const gpa = testing.allocator;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    const b0 = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(b0);
+
+    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    defer {
+        vm2.deinit();
+        gpa.destroy(vm2);
+    }
+
+    const b1 = try encodeSnapshot(gpa, vm2);
+    defer gpa.free(b1);
+
+    try testing.expectEqualSlices(u8, b0, b1);
+}
+
+test "restore is the exact inverse of capture (byte-identical re-snapshot)" {
+    // Each program leaves a different heap shape reachable from globals:
+    // closures+upvalues, nested + string-keyed tables, a self-referential cycle,
+    // multiple globals. A correct id-preserving restore must reproduce every one
+    // byte-for-byte.
+    try expectRoundTrip(
+        \\local function adder(x) return function(y) return x + y end end
+        \\g = {}
+        \\g.add = adder(10)
+        \\g[1] = 100
+        \\g[2] = 200
+        \\g.name = "lune"
+        \\g.self = g
+    );
+    try expectRoundTrip(
+        \\config = { width = 640, height = 480, name = "lune" }
+        \\alpha = "a"; beta = "b"; gamma = "g"
+    );
+    try expectRoundTrip(
+        \\local t = {}
+        \\for i = 1, 8 do t[i] = i * i end
+        \\t.tag = "squares"
+        \\result = t
+    );
+    try expectRoundTrip(
+        \\local function counter()
+        \\  local n = 0
+        \\  return function() n = n + 1; return n end
+        \\end
+        \\c = counter()
+        \\first = c()
+    );
+}
+
+test "restore rebuilds globals, ids, and a reachable value graph" {
+    const gpa = testing.allocator;
+    const source =
+        \\local function adder(x) return function(y) return x + y end end
+        \\g = {}
+        \\g.add = adder(10)
+        \\g.name = "lune"
+        \\g.self = g
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    _ = try vm.run(chunk.proto);
+
+    const b0 = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(b0);
+
+    // Decode the original to learn the object count + globals id for assertions.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const decoded = try schema.SnapshotFile.decode(arena.allocator(), b0);
+    var max_id: u32 = 0;
+    for (decoded.keyframe.objects) |o| max_id = @max(max_id, o.id);
+
+    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    defer {
+        vm2.deinit();
+        gpa.destroy(vm2);
+    }
+
+    // Id space is reproduced exactly; the counter is parked past the max.
+    try testing.expectEqual(@as(usize, decoded.keyframe.objects.len), vm2.heap.object_count);
+    try testing.expectEqual(max_id + 1, vm2.heap.next_obj_id);
+    try testing.expectEqual(decoded.keyframe.globals_id, vm2.globals.header.id);
+
+    // Walk globals → g → name == "lune"; interning an already-present key resolves
+    // to the restored object (no new allocation).
+    const g_val = vm2.globals.get(try vm2.heap.internValue("g"));
+    try testing.expect(g_val.isHeap() and g_val.heapType() == .table);
+    const g_tbl = table.Table.fromHeader(g_val.asHeap());
+
+    const name_val = g_tbl.get(try vm2.heap.internValue("name"));
+    try testing.expect(name_val.isHeap() and name_val.heapType() == .string);
+    try testing.expectEqualStrings("lune", string.String.fromHeader(name_val.asHeap()).bytes());
+
+    // g.self is the same restored table object (cycle preserved).
+    const self_val = g_tbl.get(try vm2.heap.internValue("self"));
+    try testing.expect(self_val.isHeap() and self_val.asHeap() == &g_tbl.header);
+
+    // g.add is a closure whose captured upvalue holds 10.
+    const add_val = g_tbl.get(try vm2.heap.internValue("add"));
+    try testing.expect(add_val.isHeap() and add_val.heapType() == .function);
+    const add_cl = function.Closure.fromHeader(add_val.asHeap());
+    try testing.expectEqual(@as(usize, 1), add_cl.upvalues.len);
+    try testing.expectEqual(@as(i64, 10), add_cl.upvalues[0].get().asInt());
+
+    // print is still a native bound under its name.
+    const print_val = vm2.globals.get(try vm2.heap.internValue("print"));
+    try testing.expect(print_val.isHeap() and print_val.heapType() == .native);
+    try testing.expectEqualStrings("print", function.Native.fromHeader(print_val.asHeap()).name);
+}
+
+test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)" {
+    const gpa = testing.allocator;
+
+    // A stub proto tree carrying the ids the corpus closures reference (1 and 42),
+    // so `findProto` resolves them. Restore borrows these `*const Proto`s.
+    var p1 = Proto{ .code = &.{}, .name = "p1", .id = 1 };
+    var p42 = Proto{ .code = &.{}, .name = "p42", .id = 42 };
+    var rootp = Proto{ .code = &.{}, .name = "root", .id = 0, .protos = &.{ &p1, &p42 } };
+
+    const file: schema.SnapshotFile = .{
+        .version = snapshot_format_version,
+        .keyframe = .{
+            .globals_id = 2,
+            .objects = &.{
+                .{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a\x00b\xff\xfe" } } },
+                .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "" } } },
+                .{ .id = 2, .obj_type = 1, .body = .{ .HeapTable = .{
+                    .array = &.{ sInt(10), sFloat(2.5), sBool(true) },
+                    .entries = &.{
+                        .{ .key = sRef(0), .val = sRef(3) },
+                        .{ .key = sInt(7), .val = sRef(2) }, // self-ref
+                    },
+                } } },
+                .{ .id = 3, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 42, .upvalue_ids = &.{ 4, 5 } } } },
+                .{ .id = 6, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 1, .upvalue_ids = &.{} } } },
+                .{ .id = 4, .obj_type = 4, .body = .{ .HeapUpvalue = .{ .closed = 1, .value = sInt(99) } } },
+                .{ .id = 5, .obj_type = 4, .body = .{ .HeapUpvalue = .{ .closed = 0, .value = sRef(2) } } },
+                .{ .id = 7, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "print" } } },
+            },
+            .stack = &.{ sRef(2), sInt(-1) },
+            .frames = &.{ .{ .closure_id = 3 }, .{ .closure_id = 6 } },
+            .open_upvalues = &.{.{ .stack_index = 0, .upvalue_id = 5 }},
+        },
+    };
+
+    const vm = try restoreSnapshot(gpa, file, &rootp, NativeRegistry.base());
+    defer {
+        vm.deinit();
+        gpa.destroy(vm);
+    }
+
+    // 8 objects restored with their exact ids; counter parked past id 7.
+    try testing.expectEqual(@as(usize, 8), vm.heap.object_count);
+    try testing.expectEqual(@as(u32, 8), vm.heap.next_obj_id);
+
+    // globals is the table id 2; its self-ref entry (key 7) points back at it.
+    try testing.expectEqual(@as(u32, 2), vm.globals.header.id);
+    const self_ref = vm.globals.get(Value.int(7));
+    try testing.expect(self_ref.isHeap() and self_ref.asHeap() == &vm.globals.header);
+    // Array part round-tripped (key 1 == 10, key 2 == 2.5, key 3 == true).
+    try testing.expectEqual(@as(i64, 10), vm.globals.get(Value.int(1)).asInt());
+    try testing.expectEqual(@as(f64, 2.5), vm.globals.get(Value.int(2)).asFloat());
+
+    // Frames rebound (depth 2; frame 0 = closure 3, frame 1 = closure 6, which
+    // has zero upvalues — exercising both the N- and 0-upvalue closure shapes).
+    try testing.expectEqual(@as(u32, 2), vm.depth);
+    try testing.expectEqual(@as(u32, 3), vm.frame_closures[0].header.id);
+    try testing.expectEqual(@as(u32, 6), vm.frame_closures[1].header.id);
+    try testing.expectEqual(@as(usize, 2), vm.frame_closures[0].upvalues.len);
+    try testing.expectEqual(@as(usize, 0), vm.frame_closures[1].upvalues.len);
+    // The two-upvalue closure's closed cell (id 4) holds 99.
+    try testing.expectEqual(@as(i64, 99), vm.frame_closures[0].upvalues[0].get().asInt());
+
+    // Closed upvalue id 4 holds 99; open upvalue id 5 was repointed at stack[0]
+    // and therefore reads the table ref now living there.
+    try testing.expectEqual(@as(usize, 1), vm.open_upvalues.items.len);
+    const open_cell = vm.open_upvalues.items[0].cell;
+    try testing.expectEqual(@as(u32, 5), open_cell.header.id);
+    try testing.expectEqual(&vm.stack[0], open_cell.ptr);
+    try testing.expect(open_cell.get().isHeap() and open_cell.get().asHeap() == &vm.globals.header);
+
+    // Stack window restored.
+    try testing.expectEqual(@as(usize, 2), vm.stack_top);
+    try testing.expectEqual(@as(i64, -1), vm.stack[1].asInt());
+}
+
+/// Restore the given file and assert it fails with exactly `want`.
+fn expectRestoreError(file: schema.SnapshotFile, root: *const Proto, want: RestoreError) !void {
+    const gpa = testing.allocator;
+    if (restoreSnapshot(gpa, file, root, NativeRegistry.base())) |vm| {
+        vm.deinit();
+        gpa.destroy(vm);
+        return error.TestUnexpectedSuccess;
+    } else |err| {
+        try testing.expectEqual(want, err);
+    }
+}
+
+test "restore surfaces specific errors for malformed snapshots" {
+    var rootp = Proto{ .code = &.{}, .name = "root", .id = 0 };
+
+    // A dangling HeapRef in a table value.
+    try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
+        .globals_id = 0,
+        .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
+            .array = &.{},
+            .entries = &.{.{ .key = sInt(1), .val = sRef(77) }},
+        } } }},
+        .stack = &.{},
+        .frames = &.{},
+        .open_upvalues = &.{},
+    } }, &rootp, error.UnresolvedHeapRef);
+
+    // A closure naming a proto id the program image does not contain.
+    try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
+        .globals_id = 0,
+        .objects = &.{.{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 99, .upvalue_ids = &.{} } } }},
+        .stack = &.{},
+        .frames = &.{},
+        .open_upvalues = &.{},
+    } }, &rootp, error.UnknownProto);
+
+    // A native whose name is not in the registry.
+    try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
+        .globals_id = 0,
+        .objects = &.{.{ .id = 0, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "nope" } } }},
+        .stack = &.{},
+        .frames = &.{},
+        .open_upvalues = &.{},
+    } }, &rootp, error.UnknownNative);
+
+    // globals_id resolves to a string, not a table.
+    try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
+        .globals_id = 0,
+        .objects = &.{.{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "x" } } }},
+        .stack = &.{},
+        .frames = &.{},
+        .open_upvalues = &.{},
+    } }, &rootp, error.GlobalsNotATable);
+
+    // Two objects sharing an id.
+    try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
+        .globals_id = 5,
+        .objects = &.{
+            .{ .id = 5, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a" } } },
+            .{ .id = 5, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "b" } } },
+        },
+        .stack = &.{},
+        .frames = &.{},
+        .open_upvalues = &.{},
+    } }, &rootp, error.DuplicateId);
+
+    // A wrong-version file is rejected outright.
+    try expectRestoreError(.{ .version = snapshot_format_version + 1, .keyframe = .{
+        .globals_id = 0,
+        .objects = &.{},
+        .stack = &.{},
+        .frames = &.{},
+        .open_upvalues = &.{},
+    } }, &rootp, error.UnsupportedVersion);
 }

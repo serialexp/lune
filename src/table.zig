@@ -105,6 +105,21 @@ pub const Table = struct {
         }
     }
 
+    /// Restore-only: insert a key/value straight into the **hash part**, bypassing
+    /// `set`'s array-migration logic. The keyframe restorer (`keyframeser.zig`)
+    /// uses this to reproduce a snapshot's *exact* array/hash split: a serialized
+    /// hash-part entry whose key is an integer that happens to be contiguous with
+    /// the already-rebuilt array part must NOT migrate into the array (or the
+    /// restored table would re-serialize differently than it was captured). The
+    /// array part is restored separately by appending into `array` directly, so
+    /// this only ever handles genuine hash-part keys. The key is normalised (so
+    /// `2.0` and `2` still collapse), and `nil`/`NaN` keys are rejected as in `set`.
+    pub fn restoreEntry(self: *Table, gpa: std.mem.Allocator, key: Value, val: Value) Error!void {
+        if (key.isNil()) return Error.TypeError;
+        if (key.isFloat() and std.math.isNan(key.asFloat())) return Error.TypeError;
+        try self.hash.put(gpa, normalizeKey(key), val);
+    }
+
     /// After extending the array part, absorb any now-contiguous successor keys
     /// that were sitting in the hash part.
     fn migrateFromHash(self: *Table, gpa: std.mem.Allocator) Error!void {
