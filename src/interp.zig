@@ -21,6 +21,7 @@ const bytecode = @import("bytecode.zig");
 const arith = @import("arith.zig");
 const value = @import("value.zig");
 const gc = @import("gc.zig");
+const object = @import("object.zig");
 const string = @import("string.zig");
 const table = @import("table.zig");
 const function = @import("function.zig");
@@ -175,33 +176,47 @@ pub const Vm = struct {
     /// still OOM on its own, which is reported normally).
     fn collect(self: *Vm) void {
         self.heap.beginCollect() catch return;
-
-        // Roots:
-        //  1. globals — user globals and the installed natives (e.g. `print`),
-        //     plus their interned name keys.
-        self.heap.markHeader(&self.globals.header);
-        //  2. live registers across every active frame.
-        for (self.stack[0..self.stack_top]) |v| self.heap.markValue(v);
-        //  3. the closures executing in each active frame (host-stack-only —
-        //     keeps their proto constants reachable).
-        for (self.frame_closures[0..self.depth]) |cl| {
-            self.heap.markHeader(@constCast(&cl.header));
-        }
-        //  4. open upvalue cells (live by construction — about to be closed).
-        for (self.open_upvalues.items) |ou| self.heap.markHeader(&ou.cell.header);
-        //  5. trace constants — a cached trace (or the in-progress recording) may
-        //     hold heap values in its const pool (e.g. a string `load_const`).
-        //     A cached trace can outlive its proto's reachability, so its consts
-        //     must be roots in their own right (docs/design/03-gc-memory.md).
-        for (self.trace.cache.items) |t| {
-            for (t.consts) |v| self.heap.markValue(v);
-        }
-        if (self.trace.isRecording()) {
-            for (self.trace.rec.consts.items) |v| self.heap.markValue(v);
-        }
-
+        // The root set is defined once in `forEachRootHeader`; marking is just
+        // "call `markHeader` on each root".
+        self.forEachRootHeader(&self.heap, gc.Heap.markHeader);
         self.heap.traceAll();
         self.heap.sweep();
+    }
+
+    /// Visit every GC root that is a heap object, invoking `cb(ctx, header)` once
+    /// per root edge. This is the **single source of truth** for "what is live
+    /// from outside the heap." Both consumers drive it, so they can never drift:
+    /// the collector (`collect`, with `cb = markHeader`) and the keyframe
+    /// serializer (`keyframeser.encodeSnapshot`, which seeds its reachable-set
+    /// walk). A non-heap root `Value` (a scalar register/const) is skipped here —
+    /// `cb` only ever sees heap headers.
+    ///
+    /// Roots, in a fixed order (so a snapshot's object ordering is deterministic):
+    ///   1. globals — user globals and the installed natives (e.g. `print`),
+    ///      plus their interned name keys.
+    ///   2. live registers across every active frame.
+    ///   3. the closures executing in each active frame (host-stack-only — keeps
+    ///      their proto constants reachable).
+    ///   4. open upvalue cells (live by construction — about to be closed).
+    ///   5. trace constants — a cached trace (or the in-progress recording) may
+    ///      hold heap values in its const pool (e.g. a string `load_const`). A
+    ///      cached trace can outlive its proto's reachability, so its consts must
+    ///      be roots in their own right (docs/design/03-gc-memory.md).
+    pub fn forEachRootHeader(
+        self: *Vm,
+        ctx: anytype,
+        comptime cb: fn (@TypeOf(ctx), *object.GcHeader) void,
+    ) void {
+        cb(ctx, &self.globals.header);
+        for (self.stack[0..self.stack_top]) |v| if (v.isHeap()) cb(ctx, v.asHeap());
+        for (self.frame_closures[0..self.depth]) |cl| cb(ctx, @constCast(&cl.header));
+        for (self.open_upvalues.items) |ou| cb(ctx, &ou.cell.header);
+        for (self.trace.cache.items) |t| {
+            for (t.consts) |v| if (v.isHeap()) cb(ctx, v.asHeap());
+        }
+        if (self.trace.isRecording()) {
+            for (self.trace.rec.consts.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
+        }
     }
 
     /// Run one activation: interpret `closure.proto.code` over the register
@@ -944,6 +959,38 @@ fn recordRun(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer) ![]
     return traceser.encodeFile(gpa, vm.trace.cache.items);
 }
 
+/// Run `source` (no tracing — a keyframe is a heap artifact, independent of the
+/// JIT), then serialize a whole-VM keyframe snapshot and return its wire bytes
+/// (owned by `gpa`, freed by the caller). The keyframe analogue of `recordRun`:
+/// two independent runs must produce a byte-identical snapshot, which is only
+/// true if the heap graph is fully id-keyed (no address leaks into the bytes,
+/// including hash-map iteration order — see `table.ValueContext.hash`).
+fn snapshotRun(gpa: std.mem.Allocator, source: [:0]const u8) ![]u8 {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const keyframeser = @import("keyframeser.zig");
+
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    _ = try vm.run(chunk.proto);
+    // Self-contained wire bytes, safe past `vm.deinit`.
+    return keyframeser.encodeSnapshot(gpa, &vm);
+}
+
 test "determinism: print of a heap object renders a stable id, not its address" {
     // The address-leak canary. A real pointer on a 64-bit target is enormous
     // (≥ ~0x550000000000); the heap-assigned identity is tiny and monotonic. We
@@ -960,7 +1007,7 @@ test "determinism: print of a heap object renders a stable id, not its address" 
     try testing.expect(id < 0x1000); // an id, never an ASLR address
 }
 
-test "determinism: two independent runs agree on output and serialized traces" {
+test "determinism: two independent runs agree on output, traces, and snapshots" {
     const programs = [_][:0]const u8{
         // A long hot integer loop — records and (had we executed) runs a trace.
         \\local s = 0
@@ -978,6 +1025,21 @@ test "determinism: two independent runs agree on output and serialized traces" {
         \\local t = {}
         \\print(t)
         ,
+        // Multiple top-level globals + a string-keyed table, all reachable from
+        // `globals` at end-of-run. The globals table's hash part holds several
+        // string keys; the snapshot serializes them in hash-iteration order, which
+        // is deterministic ONLY if heap keys hash by their stable id, not their
+        // address (table.ValueContext.hash). Reverting that fix diverges the
+        // snapshot bytes here even though the printed output stays identical.
+        \\config = {}
+        \\config.width = 64
+        \\config.height = 48
+        \\config.name = "lune"
+        \\alpha = 1
+        \\beta = 2
+        \\gamma = 3
+        \\print(config.name)
+        ,
     };
     inline for (programs) |src| {
         var buf_a: [256]u8 = undefined;
@@ -990,8 +1052,14 @@ test "determinism: two independent runs agree on output and serialized traces" {
         defer testing.allocator.free(traces_b);
         // Observable output is identical across independent runs...
         try testing.expectEqualStrings(sink_a.buffered(), sink_b.buffered());
-        // ...and so is the serialized trace cache (no address-dependent bytes).
+        // ...and so is the serialized trace cache (no address-dependent bytes)...
         try testing.expectEqualSlices(u8, traces_a, traces_b);
+        // ...and so is a whole-VM keyframe snapshot of the final heap state.
+        const snap_a = try snapshotRun(testing.allocator, src);
+        defer testing.allocator.free(snap_a);
+        const snap_b = try snapshotRun(testing.allocator, src);
+        defer testing.allocator.free(snap_b);
+        try testing.expectEqualSlices(u8, snap_a, snap_b);
     }
 }
 

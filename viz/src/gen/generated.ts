@@ -1211,3 +1211,1851 @@ export class TraceFileDecoder extends SeekableBitStreamDecoder {
   }
 }
 
+/**
+ * A reference to a heap object by its stable GcHeader.id (src/gc.zig). Every inter-object edge in a snapshot is one of these — never a pointer (an address would leak ASLR and break deterministic replay; docs/design/02-determinism.md).
+ */
+export interface HeapRefInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  id: number;
+}
+
+/**
+ * A reference to a heap object by its stable GcHeader.id (src/gc.zig). Every inter-object edge in a snapshot is one of these — never a pointer (an address would leak ASLR and break deterministic replay; docs/design/02-determinism.md).
+ */
+export interface HeapRefOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  id: number;
+}
+
+export type HeapRef = HeapRefOutput;
+
+export class HeapRefEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: HeapRefInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.id, "little_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a HeapRef value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: HeapRef): number {
+    let size = 0;
+    size += 4; // id
+    return size;
+  }
+}
+
+export class HeapRefDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): HeapRefOutput {
+    const value: any = {};
+
+    value.id = this.readUint32("little_endian");
+    return value;
+  }
+}
+
+/**
+ * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+ */
+export interface SnapValueInput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: field 'tag'
+   * Variants: 5
+   * - ConstNil (when value === 0)
+   * - ConstBool (when value === 1)
+   * - ConstInt (when value === 2)
+   * - ConstFloat (when value === 3)
+   * - HeapRef (when value === 4)
+   */
+  body: { type: 'ConstNil'; value: ConstNilInput } | { type: 'ConstBool'; value: ConstBoolInput } | { type: 'ConstInt'; value: ConstIntInput } | { type: 'ConstFloat'; value: ConstFloatInput } | { type: 'HeapRef'; value: HeapRefInput };
+}
+
+/**
+ * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+ */
+export interface SnapValueOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: field 'tag'
+   * Variants: 5
+   * - ConstNil (when value === 0)
+   * - ConstBool (when value === 1)
+   * - ConstInt (when value === 2)
+   * - ConstFloat (when value === 3)
+   * - HeapRef (when value === 4)
+   */
+  body: { type: 'ConstNil'; value: ConstNilOutput } | { type: 'ConstBool'; value: ConstBoolOutput } | { type: 'ConstInt'; value: ConstIntOutput } | { type: 'ConstFloat'; value: ConstFloatOutput } | { type: 'HeapRef'; value: HeapRefOutput };
+}
+
+export type SnapValue = SnapValueOutput;
+
+/**
+ * Variant tags for SnapValue.body
+ */
+export const enum SnapValueBodyVariant {
+  ConstNil = 'ConstNil',
+  ConstBool = 'ConstBool',
+  ConstInt = 'ConstInt',
+  ConstFloat = 'ConstFloat',
+  HeapRef = 'HeapRef',
+}
+
+export class SnapValueEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: SnapValueInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(value.tag);
+    if (value.body.type === 'ConstNil') {
+      const encoder_value = new ConstNilEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'ConstBool') {
+      const encoder_value = new ConstBoolEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'ConstInt') {
+      const encoder_value = new ConstIntEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'ConstFloat') {
+      const encoder_value = new ConstFloatEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'HeapRef') {
+      const encoder_value = new HeapRefEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type: ${(value.body as any).type}`);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a SnapValue value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: SnapValue): number {
+    let size = 0;
+    size += 1; // tag
+    if (value.body.type === 'ConstNil') {
+      const _enc = new ConstNilEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'ConstBool') {
+      const _enc = new ConstBoolEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'ConstInt') {
+      const _enc = new ConstIntEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'ConstFloat') {
+      const _enc = new ConstFloatEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'HeapRef') {
+      const _enc = new HeapRefEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for body: ${(value.body as any).type}`);
+    }
+    return size;
+  }
+}
+
+export class SnapValueDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): SnapValueOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    if (value.tag === 0) {
+      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'ConstNil', value: payload };
+    }
+    else if (value.tag === 1) {
+      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'ConstBool', value: payload };
+    }
+    else if (value.tag === 2) {
+      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'ConstInt', value: payload };
+    }
+    else if (value.tag === 3) {
+      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'ConstFloat', value: payload };
+    }
+    else if (value.tag === 4) {
+      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'HeapRef', value: payload };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.tag}`);
+    }
+    return value;
+  }
+}
+
+/**
+ * One key/value pair from a table's hash part. Array-part entries are stored positionally in HeapTable.array; everything else lands here.
+ */
+export interface TableEntryInput {
+  /**
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   */
+  key: SnapValueInput;
+  /**
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   */
+  val: SnapValueInput;
+}
+
+/**
+ * One key/value pair from a table's hash part. Array-part entries are stored positionally in HeapTable.array; everything else lands here.
+ */
+export interface TableEntryOutput {
+  /**
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   */
+  key: SnapValueOutput;
+  /**
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   */
+  val: SnapValueOutput;
+}
+
+export type TableEntry = TableEntryOutput;
+
+export class TableEntryEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: TableEntryInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    const encoder_key = new SnapValueEncoder();
+    const encoded_key = encoder_key.encode(value.key);
+    for (const byte of encoded_key) {
+      this.writeUint8(byte);
+    }
+    const encoder_val = new SnapValueEncoder();
+    const encoded_val = encoder_val.encode(value.val);
+    for (const byte of encoded_val) {
+      this.writeUint8(byte);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a TableEntry value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: TableEntry): number {
+    let size = 0;
+    // key: custom type (SnapValue)
+    const key_encoder = new SnapValueEncoder();
+    size += key_encoder.calculateSize(value.key);
+    // val: custom type (SnapValue)
+    const val_encoder = new SnapValueEncoder();
+    size += val_encoder.calculateSize(value.val);
+    return size;
+  }
+}
+
+export class TableEntryDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): TableEntryOutput {
+    const value: any = {};
+
+    value.key = {};
+    value.key.tag = this.readUint8();
+    if (value.tag === 0) {
+      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.key.body = { type: 'ConstNil', value: payload };
+    }
+    else if (value.tag === 1) {
+      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.key.body = { type: 'ConstBool', value: payload };
+    }
+    else if (value.tag === 2) {
+      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.key.body = { type: 'ConstInt', value: payload };
+    }
+    else if (value.tag === 3) {
+      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.key.body = { type: 'ConstFloat', value: payload };
+    }
+    else if (value.tag === 4) {
+      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.key.body = { type: 'HeapRef', value: payload };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.tag}`);
+    }
+    value.val = {};
+    value.val.tag = this.readUint8();
+    if (value.tag === 0) {
+      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.val.body = { type: 'ConstNil', value: payload };
+    }
+    else if (value.tag === 1) {
+      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.val.body = { type: 'ConstBool', value: payload };
+    }
+    else if (value.tag === 2) {
+      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.val.body = { type: 'ConstInt', value: payload };
+    }
+    else if (value.tag === 3) {
+      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.val.body = { type: 'ConstFloat', value: payload };
+    }
+    else if (value.tag === 4) {
+      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.val.body = { type: 'HeapRef', value: payload };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.tag}`);
+    }
+    return value;
+  }
+}
+
+/**
+ * A heap string object's raw bytes (lune strings are byte strings, not necessarily UTF-8). Interned at restore.
+ */
+export interface HeapStringInput {
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  bytes: number[];
+}
+
+/**
+ * A heap string object's raw bytes (lune strings are byte strings, not necessarily UTF-8). Interned at restore.
+ */
+export interface HeapStringOutput {
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  bytes: number[];
+}
+
+export type HeapString = HeapStringOutput;
+
+export class HeapStringEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: HeapStringInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.bytes.length, "little_endian");
+    for (let value_bytes__iter_index = 0; value_bytes__iter_index < value.bytes.length; value_bytes__iter_index++) {
+      const value_bytes__iter = value.bytes[value_bytes__iter_index];
+      this.writeUint8(value_bytes__iter);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a HeapString value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: HeapString): number {
+    let size = 0;
+    // bytes: bytes (kind: length_prefixed)
+    size += value.bytes.length;
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class HeapStringDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): HeapStringOutput {
+    const value: any = {};
+
+    value.bytes = [];
+    const bytes_length = this.readUint32("little_endian");
+    for (let i = 0; i < bytes_length; i++) {
+      let bytes__iter: any;
+      bytes__iter = this.readUint8();
+      value.bytes.push(bytes__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * A table object: the dense array part (keys 1..n, positionally) plus the hash part (every other key). Edges are SnapValue heap_refs.
+ */
+export interface HeapTableInput {
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  array: SnapValueInput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  entries: TableEntryInput[];
+}
+
+/**
+ * A table object: the dense array part (keys 1..n, positionally) plus the hash part (every other key). Edges are SnapValue heap_refs.
+ */
+export interface HeapTableOutput {
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  array: SnapValueOutput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  entries: TableEntryOutput[];
+}
+
+export type HeapTable = HeapTableOutput;
+
+export class HeapTableEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: HeapTableInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.array.length, "little_endian");
+    for (let value_array__iter_index = 0; value_array__iter_index < value.array.length; value_array__iter_index++) {
+      const value_array__iter = value.array[value_array__iter_index];
+      const encoder_value_array__iter = new SnapValueEncoder();
+      const encoded_value_array__iter = encoder_value_array__iter.encode(value_array__iter);
+      for (const byte of encoded_value_array__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint32(value.entries.length, "little_endian");
+    for (let value_entries__iter_index = 0; value_entries__iter_index < value.entries.length; value_entries__iter_index++) {
+      const value_entries__iter = value.entries[value_entries__iter_index];
+      const encoder_value_entries__iter = new TableEntryEncoder();
+      const encoded_value_entries__iter = encoder_value_entries__iter.encode(value_entries__iter);
+      for (const byte of encoded_value_entries__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a HeapTable value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: HeapTable): number {
+    let size = 0;
+    // array: array (kind: length_prefixed)
+    for (const item of value.array) {
+      const array_itemEncoder = new SnapValueEncoder();
+      size += array_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    // entries: array (kind: length_prefixed)
+    for (const item of value.entries) {
+      const entries_itemEncoder = new TableEntryEncoder();
+      size += entries_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class HeapTableDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): HeapTableOutput {
+    const value: any = {};
+
+    value.array = [];
+    const array_length = this.readUint32("little_endian");
+    for (let i = 0; i < array_length; i++) {
+      let array__iter: any;
+      array__iter = {};
+      array__iter.tag = this.readUint8();
+      if (array__iter.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), array__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        array__iter.body = { type: 'ConstNil', value: payload };
+      }
+      else if (array__iter.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), array__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        array__iter.body = { type: 'ConstBool', value: payload };
+      }
+      else if (array__iter.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), array__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        array__iter.body = { type: 'ConstInt', value: payload };
+      }
+      else if (array__iter.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), array__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        array__iter.body = { type: 'ConstFloat', value: payload };
+      }
+      else if (array__iter.tag === 4) {
+        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), array__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        array__iter.body = { type: 'HeapRef', value: payload };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${array__iter.tag}`);
+      }
+      value.array.push(array__iter);
+    }
+    value.entries = [];
+    const entries_length = this.readUint32("little_endian");
+    for (let i = 0; i < entries_length; i++) {
+      let entries__iter: any;
+      entries__iter = {};
+      entries__iter.key = {};
+      entries__iter.key.tag = this.readUint8();
+      if (entries__iter.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        entries__iter.key.body = { type: 'ConstNil', value: payload };
+      }
+      else if (entries__iter.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        entries__iter.key.body = { type: 'ConstBool', value: payload };
+      }
+      else if (entries__iter.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        entries__iter.key.body = { type: 'ConstInt', value: payload };
+      }
+      else if (entries__iter.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        entries__iter.key.body = { type: 'ConstFloat', value: payload };
+      }
+      else if (entries__iter.tag === 4) {
+        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        entries__iter.key.body = { type: 'HeapRef', value: payload };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${entries__iter.tag}`);
+      }
+      entries__iter.val = {};
+      entries__iter.val.tag = this.readUint8();
+      if (entries__iter.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        entries__iter.val.body = { type: 'ConstNil', value: payload };
+      }
+      else if (entries__iter.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        entries__iter.val.body = { type: 'ConstBool', value: payload };
+      }
+      else if (entries__iter.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        entries__iter.val.body = { type: 'ConstInt', value: payload };
+      }
+      else if (entries__iter.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        entries__iter.val.body = { type: 'ConstFloat', value: payload };
+      }
+      else if (entries__iter.tag === 4) {
+        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        entries__iter.val.body = { type: 'HeapRef', value: payload };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${entries__iter.tag}`);
+      }
+      value.entries.push(entries__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * A closure: a stable proto id (rebound from the program image at restore, never serialized inline — same stance as a trace anchor) plus the ids of its captured upvalue cells.
+ */
+export interface HeapClosureInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  proto_id: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  upvalue_ids: number[];
+}
+
+/**
+ * A closure: a stable proto id (rebound from the program image at restore, never serialized inline — same stance as a trace anchor) plus the ids of its captured upvalue cells.
+ */
+export interface HeapClosureOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  proto_id: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  upvalue_ids: number[];
+}
+
+export type HeapClosure = HeapClosureOutput;
+
+export class HeapClosureEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: HeapClosureInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.proto_id, "little_endian");
+    this.writeUint16(value.upvalue_ids.length, "little_endian");
+    for (let value_upvalue_ids__iter_index = 0; value_upvalue_ids__iter_index < value.upvalue_ids.length; value_upvalue_ids__iter_index++) {
+      const value_upvalue_ids__iter = value.upvalue_ids[value_upvalue_ids__iter_index];
+      this.writeUint32(value_upvalue_ids__iter, "little_endian");
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a HeapClosure value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: HeapClosure): number {
+    let size = 0;
+    size += 4; // proto_id
+    // upvalue_ids: array (kind: length_prefixed)
+    for (const item of value.upvalue_ids) {
+      size += 4;
+    }
+    size += 2; // length prefix (uint16)
+    return size;
+  }
+}
+
+export class HeapClosureDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): HeapClosureOutput {
+    const value: any = {};
+
+    value.proto_id = this.readUint32("little_endian");
+    value.upvalue_ids = [];
+    const upvalue_ids_length = this.readUint16("little_endian");
+    for (let i = 0; i < upvalue_ids_length; i++) {
+      let upvalue_ids__iter: any;
+      upvalue_ids__iter = this.readUint32("little_endian");
+      value.upvalue_ids.push(upvalue_ids__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * A captured-variable cell. closed=1: `value` is the held value. closed=0 (open): `value` is the CURRENT contents of the stack slot at capture; restore re-derives the live slot from the saved stack window + Keyframe.open_upvalues (F2b).
+ */
+export interface HeapUpvalueInput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  closed: number;
+  /**
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   */
+  value: SnapValueInput;
+}
+
+/**
+ * A captured-variable cell. closed=1: `value` is the held value. closed=0 (open): `value` is the CURRENT contents of the stack slot at capture; restore re-derives the live slot from the saved stack window + Keyframe.open_upvalues (F2b).
+ */
+export interface HeapUpvalueOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  closed: number;
+  /**
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   */
+  value: SnapValueOutput;
+}
+
+export type HeapUpvalue = HeapUpvalueOutput;
+
+export class HeapUpvalueEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: HeapUpvalueInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(value.closed);
+    const encoder_value = new SnapValueEncoder();
+    const encoded_value = encoder_value.encode(value.value);
+    for (const byte of encoded_value) {
+      this.writeUint8(byte);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a HeapUpvalue value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: HeapUpvalue): number {
+    let size = 0;
+    size += 1; // closed
+    // value: custom type (SnapValue)
+    const value_encoder = new SnapValueEncoder();
+    size += value_encoder.calculateSize(value.value);
+    return size;
+  }
+}
+
+export class HeapUpvalueDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): HeapUpvalueOutput {
+    const value: any = {};
+
+    value.closed = this.readUint8();
+    value.value = {};
+    value.value.tag = this.readUint8();
+    if (value.tag === 0) {
+      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value.body = { type: 'ConstNil', value: payload };
+    }
+    else if (value.tag === 1) {
+      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value.body = { type: 'ConstBool', value: payload };
+    }
+    else if (value.tag === 2) {
+      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value.body = { type: 'ConstInt', value: payload };
+    }
+    else if (value.tag === 3) {
+      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value.body = { type: 'ConstFloat', value: payload };
+    }
+    else if (value.tag === 4) {
+      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value.body = { type: 'HeapRef', value: payload };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.tag}`);
+    }
+    return value;
+  }
+}
+
+/**
+ * A native (host/builtin) function, identified by name. Rebound to the installed base library by name at restore (the function pointer is meaningless on disk), so only the name is serialized.
+ */
+export interface HeapNativeInput {
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  name: number[];
+}
+
+/**
+ * A native (host/builtin) function, identified by name. Rebound to the installed base library by name at restore (the function pointer is meaningless on disk), so only the name is serialized.
+ */
+export interface HeapNativeOutput {
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  name: number[];
+}
+
+export type HeapNative = HeapNativeOutput;
+
+export class HeapNativeEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: HeapNativeInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.name.length, "little_endian");
+    for (let value_name__iter_index = 0; value_name__iter_index < value.name.length; value_name__iter_index++) {
+      const value_name__iter = value.name[value_name__iter_index];
+      this.writeUint8(value_name__iter);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a HeapNative value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: HeapNative): number {
+    let size = 0;
+    // name: bytes (kind: length_prefixed)
+    size += value.name.length;
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class HeapNativeDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): HeapNativeOutput {
+    const value: any = {};
+
+    value.name = [];
+    const name_length = this.readUint32("little_endian");
+    for (let i = 0; i < name_length; i++) {
+      let name__iter: any;
+      name__iter = this.readUint8();
+      value.name.push(name__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.
+ */
+export interface HeapObjectInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  id: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  obj_type: number;
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: field 'obj_type'
+   * Variants: 5
+   * - HeapString (when value === 0)
+   * - HeapTable (when value === 1)
+   * - HeapClosure (when value === 2)
+   * - HeapNative (when value === 3)
+   * - HeapUpvalue (when value === 4)
+   */
+  body: { type: 'HeapString'; value: HeapStringInput } | { type: 'HeapTable'; value: HeapTableInput } | { type: 'HeapClosure'; value: HeapClosureInput } | { type: 'HeapNative'; value: HeapNativeInput } | { type: 'HeapUpvalue'; value: HeapUpvalueInput };
+}
+
+/**
+ * One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.
+ */
+export interface HeapObjectOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  id: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  obj_type: number;
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: field 'obj_type'
+   * Variants: 5
+   * - HeapString (when value === 0)
+   * - HeapTable (when value === 1)
+   * - HeapClosure (when value === 2)
+   * - HeapNative (when value === 3)
+   * - HeapUpvalue (when value === 4)
+   */
+  body: { type: 'HeapString'; value: HeapStringOutput } | { type: 'HeapTable'; value: HeapTableOutput } | { type: 'HeapClosure'; value: HeapClosureOutput } | { type: 'HeapNative'; value: HeapNativeOutput } | { type: 'HeapUpvalue'; value: HeapUpvalueOutput };
+}
+
+export type HeapObject = HeapObjectOutput;
+
+/**
+ * Variant tags for HeapObject.body
+ */
+export const enum HeapObjectBodyVariant {
+  HeapString = 'HeapString',
+  HeapTable = 'HeapTable',
+  HeapClosure = 'HeapClosure',
+  HeapNative = 'HeapNative',
+  HeapUpvalue = 'HeapUpvalue',
+}
+
+export class HeapObjectEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: HeapObjectInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.id, "little_endian");
+    this.writeUint8(value.obj_type);
+    if (value.body.type === 'HeapString') {
+      const encoder_value = new HeapStringEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'HeapTable') {
+      const encoder_value = new HeapTableEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'HeapClosure') {
+      const encoder_value = new HeapClosureEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'HeapNative') {
+      const encoder_value = new HeapNativeEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'HeapUpvalue') {
+      const encoder_value = new HeapUpvalueEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type: ${(value.body as any).type}`);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a HeapObject value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: HeapObject): number {
+    let size = 0;
+    size += 4; // id
+    size += 1; // obj_type
+    if (value.body.type === 'HeapString') {
+      const _enc = new HeapStringEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'HeapTable') {
+      const _enc = new HeapTableEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'HeapClosure') {
+      const _enc = new HeapClosureEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'HeapNative') {
+      const _enc = new HeapNativeEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'HeapUpvalue') {
+      const _enc = new HeapUpvalueEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for body: ${(value.body as any).type}`);
+    }
+    return size;
+  }
+}
+
+export class HeapObjectDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): HeapObjectOutput {
+    const value: any = {};
+
+    value.id = this.readUint32("little_endian");
+    value.obj_type = this.readUint8();
+    if (value.obj_type === 0) {
+      const decoder = new HeapStringDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'HeapString', value: payload };
+    }
+    else if (value.obj_type === 1) {
+      const decoder = new HeapTableDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'HeapTable', value: payload };
+    }
+    else if (value.obj_type === 2) {
+      const decoder = new HeapClosureDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'HeapClosure', value: payload };
+    }
+    else if (value.obj_type === 3) {
+      const decoder = new HeapNativeDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'HeapNative', value: payload };
+    }
+    else if (value.obj_type === 4) {
+      const decoder = new HeapUpvalueDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'HeapUpvalue', value: payload };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.obj_type}`);
+    }
+    return value;
+  }
+}
+
+/**
+ * An open upvalue's binding: the absolute stack index its cell points at, and the cell's object id. Lets restore re-point the cell into the rebuilt stack window. F2a (final-state capture) emits none; load-bearing in F2b.
+ */
+export interface OpenUpvalueRefInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  stack_index: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  upvalue_id: number;
+}
+
+/**
+ * An open upvalue's binding: the absolute stack index its cell points at, and the cell's object id. Lets restore re-point the cell into the rebuilt stack window. F2a (final-state capture) emits none; load-bearing in F2b.
+ */
+export interface OpenUpvalueRefOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  stack_index: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  upvalue_id: number;
+}
+
+export type OpenUpvalueRef = OpenUpvalueRefOutput;
+
+export class OpenUpvalueRefEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: OpenUpvalueRefInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.stack_index, "little_endian");
+    this.writeUint32(value.upvalue_id, "little_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a OpenUpvalueRef value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: OpenUpvalueRef): number {
+    let size = 0;
+    size += 4; // stack_index
+    size += 4; // upvalue_id
+    return size;
+  }
+}
+
+export class OpenUpvalueRefDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): OpenUpvalueRefOutput {
+    const value: any = {};
+
+    value.stack_index = this.readUint32("little_endian");
+    value.upvalue_id = this.readUint32("little_endian");
+    return value;
+  }
+}
+
+/**
+ * One active call frame: the id of the closure executing in it.
+ */
+export interface FrameRefInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  closure_id: number;
+}
+
+/**
+ * One active call frame: the id of the closure executing in it.
+ */
+export interface FrameRefOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  closure_id: number;
+}
+
+export type FrameRef = FrameRefOutput;
+
+export class FrameRefEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: FrameRefInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.closure_id, "little_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a FrameRef value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: FrameRef): number {
+    let size = 0;
+    size += 4; // closure_id
+    return size;
+  }
+}
+
+export class FrameRefDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): FrameRefOutput {
+    const value: any = {};
+
+    value.closure_id = this.readUint32("little_endian");
+    return value;
+  }
+}
+
+/**
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
+ */
+export interface KeyframeInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  globals_id: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  objects: HeapObjectInput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  stack: SnapValueInput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  frames: FrameRefInput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  open_upvalues: OpenUpvalueRefInput[];
+}
+
+/**
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
+ */
+export interface KeyframeOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  globals_id: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  objects: HeapObjectOutput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  stack: SnapValueOutput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  frames: FrameRefOutput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint16
+   */
+  open_upvalues: OpenUpvalueRefOutput[];
+}
+
+export type Keyframe = KeyframeOutput;
+
+export class KeyframeEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: KeyframeInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.globals_id, "little_endian");
+    this.writeUint32(value.objects.length, "little_endian");
+    for (let value_objects__iter_index = 0; value_objects__iter_index < value.objects.length; value_objects__iter_index++) {
+      const value_objects__iter = value.objects[value_objects__iter_index];
+      const encoder_value_objects__iter = new HeapObjectEncoder();
+      const encoded_value_objects__iter = encoder_value_objects__iter.encode(value_objects__iter);
+      for (const byte of encoded_value_objects__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint32(value.stack.length, "little_endian");
+    for (let value_stack__iter_index = 0; value_stack__iter_index < value.stack.length; value_stack__iter_index++) {
+      const value_stack__iter = value.stack[value_stack__iter_index];
+      const encoder_value_stack__iter = new SnapValueEncoder();
+      const encoded_value_stack__iter = encoder_value_stack__iter.encode(value_stack__iter);
+      for (const byte of encoded_value_stack__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint16(value.frames.length, "little_endian");
+    for (let value_frames__iter_index = 0; value_frames__iter_index < value.frames.length; value_frames__iter_index++) {
+      const value_frames__iter = value.frames[value_frames__iter_index];
+      const encoder_value_frames__iter = new FrameRefEncoder();
+      const encoded_value_frames__iter = encoder_value_frames__iter.encode(value_frames__iter);
+      for (const byte of encoded_value_frames__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    this.writeUint16(value.open_upvalues.length, "little_endian");
+    for (let value_open_upvalues__iter_index = 0; value_open_upvalues__iter_index < value.open_upvalues.length; value_open_upvalues__iter_index++) {
+      const value_open_upvalues__iter = value.open_upvalues[value_open_upvalues__iter_index];
+      const encoder_value_open_upvalues__iter = new OpenUpvalueRefEncoder();
+      const encoded_value_open_upvalues__iter = encoder_value_open_upvalues__iter.encode(value_open_upvalues__iter);
+      for (const byte of encoded_value_open_upvalues__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a Keyframe value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: Keyframe): number {
+    let size = 0;
+    size += 4; // globals_id
+    // objects: array (kind: length_prefixed)
+    for (const item of value.objects) {
+      const objects_itemEncoder = new HeapObjectEncoder();
+      size += objects_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    // stack: array (kind: length_prefixed)
+    for (const item of value.stack) {
+      const stack_itemEncoder = new SnapValueEncoder();
+      size += stack_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    // frames: array (kind: length_prefixed)
+    for (const item of value.frames) {
+      const frames_itemEncoder = new FrameRefEncoder();
+      size += frames_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    // open_upvalues: array (kind: length_prefixed)
+    for (const item of value.open_upvalues) {
+      const open_upvalues_itemEncoder = new OpenUpvalueRefEncoder();
+      size += open_upvalues_itemEncoder.calculateSize(item);
+    }
+    size += 2; // length prefix (uint16)
+    return size;
+  }
+}
+
+export class KeyframeDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): KeyframeOutput {
+    const value: any = {};
+
+    value.globals_id = this.readUint32("little_endian");
+    value.objects = [];
+    const objects_length = this.readUint32("little_endian");
+    for (let i = 0; i < objects_length; i++) {
+      let objects__iter: any;
+      objects__iter = {};
+      objects__iter.id = this.readUint32("little_endian");
+      objects__iter.obj_type = this.readUint8();
+      if (objects__iter.obj_type === 0) {
+        const decoder = new HeapStringDecoder(this.bytes.slice(this.byteOffset), objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        objects__iter.body = { type: 'HeapString', value: payload };
+      }
+      else if (objects__iter.obj_type === 1) {
+        const decoder = new HeapTableDecoder(this.bytes.slice(this.byteOffset), objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        objects__iter.body = { type: 'HeapTable', value: payload };
+      }
+      else if (objects__iter.obj_type === 2) {
+        const decoder = new HeapClosureDecoder(this.bytes.slice(this.byteOffset), objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        objects__iter.body = { type: 'HeapClosure', value: payload };
+      }
+      else if (objects__iter.obj_type === 3) {
+        const decoder = new HeapNativeDecoder(this.bytes.slice(this.byteOffset), objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        objects__iter.body = { type: 'HeapNative', value: payload };
+      }
+      else if (objects__iter.obj_type === 4) {
+        const decoder = new HeapUpvalueDecoder(this.bytes.slice(this.byteOffset), objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        objects__iter.body = { type: 'HeapUpvalue', value: payload };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${objects__iter.obj_type}`);
+      }
+      value.objects.push(objects__iter);
+    }
+    value.stack = [];
+    const stack_length = this.readUint32("little_endian");
+    for (let i = 0; i < stack_length; i++) {
+      let stack__iter: any;
+      stack__iter = {};
+      stack__iter.tag = this.readUint8();
+      if (stack__iter.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        stack__iter.body = { type: 'ConstNil', value: payload };
+      }
+      else if (stack__iter.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        stack__iter.body = { type: 'ConstBool', value: payload };
+      }
+      else if (stack__iter.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        stack__iter.body = { type: 'ConstInt', value: payload };
+      }
+      else if (stack__iter.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        stack__iter.body = { type: 'ConstFloat', value: payload };
+      }
+      else if (stack__iter.tag === 4) {
+        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        stack__iter.body = { type: 'HeapRef', value: payload };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${stack__iter.tag}`);
+      }
+      value.stack.push(stack__iter);
+    }
+    value.frames = [];
+    const frames_length = this.readUint16("little_endian");
+    for (let i = 0; i < frames_length; i++) {
+      let frames__iter: any;
+      frames__iter = {};
+      frames__iter.closure_id = this.readUint32("little_endian");
+      value.frames.push(frames__iter);
+    }
+    value.open_upvalues = [];
+    const open_upvalues_length = this.readUint16("little_endian");
+    for (let i = 0; i < open_upvalues_length; i++) {
+      let open_upvalues__iter: any;
+      open_upvalues__iter = {};
+      open_upvalues__iter.stack_index = this.readUint32("little_endian");
+      open_upvalues__iter.upvalue_id = this.readUint32("little_endian");
+      value.open_upvalues.push(open_upvalues__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * The top-level keyframe artifact. Versioned independently of TraceFile (its own `version` word) — a distinct record family sharing the same binschema encoding, NOT fused with the trace artifact (docs/design/04: 'two artifacts, one substrate').
+ */
+export interface SnapshotFileInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  version: number;
+  /**
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
+   */
+  keyframe: KeyframeInput;
+}
+
+/**
+ * The top-level keyframe artifact. Versioned independently of TraceFile (its own `version` word) — a distinct record family sharing the same binschema encoding, NOT fused with the trace artifact (docs/design/04: 'two artifacts, one substrate').
+ */
+export interface SnapshotFileOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  version: number;
+  /**
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
+   */
+  keyframe: KeyframeOutput;
+}
+
+export type SnapshotFile = SnapshotFileOutput;
+
+export class SnapshotFileEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: SnapshotFileInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.version, "little_endian");
+    const encoder_keyframe = new KeyframeEncoder();
+    const encoded_keyframe = encoder_keyframe.encode(value.keyframe);
+    for (const byte of encoded_keyframe) {
+      this.writeUint8(byte);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a SnapshotFile value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: SnapshotFile): number {
+    let size = 0;
+    size += 4; // version
+    // keyframe: custom type (Keyframe)
+    const keyframe_encoder = new KeyframeEncoder();
+    size += keyframe_encoder.calculateSize(value.keyframe);
+    return size;
+  }
+}
+
+export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): SnapshotFileOutput {
+    const value: any = {};
+
+    value.version = this.readUint32("little_endian");
+    value.keyframe = {};
+    value.keyframe.globals_id = this.readUint32("little_endian");
+    value.keyframe.objects = [];
+    const keyframe_objects_length = this.readUint32("little_endian");
+    for (let i = 0; i < keyframe_objects_length; i++) {
+      let keyframe_objects__iter: any;
+      keyframe_objects__iter = {};
+      keyframe_objects__iter.id = this.readUint32("little_endian");
+      keyframe_objects__iter.obj_type = this.readUint8();
+      if (keyframe_objects__iter.obj_type === 0) {
+        const decoder = new HeapStringDecoder(this.bytes.slice(this.byteOffset), keyframe_objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_objects__iter.body = { type: 'HeapString', value: payload };
+      }
+      else if (keyframe_objects__iter.obj_type === 1) {
+        const decoder = new HeapTableDecoder(this.bytes.slice(this.byteOffset), keyframe_objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_objects__iter.body = { type: 'HeapTable', value: payload };
+      }
+      else if (keyframe_objects__iter.obj_type === 2) {
+        const decoder = new HeapClosureDecoder(this.bytes.slice(this.byteOffset), keyframe_objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_objects__iter.body = { type: 'HeapClosure', value: payload };
+      }
+      else if (keyframe_objects__iter.obj_type === 3) {
+        const decoder = new HeapNativeDecoder(this.bytes.slice(this.byteOffset), keyframe_objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_objects__iter.body = { type: 'HeapNative', value: payload };
+      }
+      else if (keyframe_objects__iter.obj_type === 4) {
+        const decoder = new HeapUpvalueDecoder(this.bytes.slice(this.byteOffset), keyframe_objects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_objects__iter.body = { type: 'HeapUpvalue', value: payload };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${keyframe_objects__iter.obj_type}`);
+      }
+      value.keyframe.objects.push(keyframe_objects__iter);
+    }
+    value.keyframe.stack = [];
+    const keyframe_stack_length = this.readUint32("little_endian");
+    for (let i = 0; i < keyframe_stack_length; i++) {
+      let keyframe_stack__iter: any;
+      keyframe_stack__iter = {};
+      keyframe_stack__iter.tag = this.readUint8();
+      if (keyframe_stack__iter.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), keyframe_stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_stack__iter.body = { type: 'ConstNil', value: payload };
+      }
+      else if (keyframe_stack__iter.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), keyframe_stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_stack__iter.body = { type: 'ConstBool', value: payload };
+      }
+      else if (keyframe_stack__iter.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), keyframe_stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_stack__iter.body = { type: 'ConstInt', value: payload };
+      }
+      else if (keyframe_stack__iter.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), keyframe_stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_stack__iter.body = { type: 'ConstFloat', value: payload };
+      }
+      else if (keyframe_stack__iter.tag === 4) {
+        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), keyframe_stack__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        keyframe_stack__iter.body = { type: 'HeapRef', value: payload };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${keyframe_stack__iter.tag}`);
+      }
+      value.keyframe.stack.push(keyframe_stack__iter);
+    }
+    value.keyframe.frames = [];
+    const keyframe_frames_length = this.readUint16("little_endian");
+    for (let i = 0; i < keyframe_frames_length; i++) {
+      let keyframe_frames__iter: any;
+      keyframe_frames__iter = {};
+      keyframe_frames__iter.closure_id = this.readUint32("little_endian");
+      value.keyframe.frames.push(keyframe_frames__iter);
+    }
+    value.keyframe.open_upvalues = [];
+    const keyframe_open_upvalues_length = this.readUint16("little_endian");
+    for (let i = 0; i < keyframe_open_upvalues_length; i++) {
+      let keyframe_open_upvalues__iter: any;
+      keyframe_open_upvalues__iter = {};
+      keyframe_open_upvalues__iter.stack_index = this.readUint32("little_endian");
+      keyframe_open_upvalues__iter.upvalue_id = this.readUint32("little_endian");
+      value.keyframe.open_upvalues.push(keyframe_open_upvalues__iter);
+    }
+    return value;
+  }
+}
+

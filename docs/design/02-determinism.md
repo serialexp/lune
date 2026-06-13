@@ -2,7 +2,7 @@
 
 Status: draft, not yet implemented — stub capturing required decisions
 Owner: Bart
-Last updated: 2026-06-12
+Last updated: 2026-06-13
 
 Prerequisite for **Phase 3** (the host-effect boundary must exist in the calling
 convention) and **Phase 5** (replay) in `00-architecture.md`. Deterministic
@@ -84,10 +84,18 @@ that for a time-travel debugger it *is* the architecture.
       `@intFromPtr`. So no ASLR address leaks into a program's output. This id is
       also the identity a future keyframe's heap graph keys on
       (`01-trace-lifecycle.md`, `04-snapshot-replay-schema.md`).
-- [ ] **Table iteration order.** Address-independent and deterministic
-      (constrains the table/shape model). *Not yet actionable: there is no
-      `pairs`/`next` iterator, so iteration order is not observable to a program
-      yet. Lands with the iterator.*
+- [~] **Table iteration order.** Address-independent and deterministic
+      (constrains the table/shape model). **The address dependency is now fixed:**
+      `table.ValueContext.hash` hashes a heap key by its stable `GcHeader.id`, not
+      its `payload.bits` (the ASLR-dependent address). Previously the hash-part's
+      slot layout — hence its iteration order — varied run-to-run; that divergence
+      was invisible to a program (no `pairs`/`next`) but became observable the
+      moment iteration order was *serialized*, which is exactly what a keyframe
+      snapshot does. The keyframe serializer (F2a) surfaced it, and the run-twice
+      harness now guards it (byte-identical snapshot bytes — see Replay
+      verification). Still not actionable at the *program* level until a
+      `pairs`/`next` iterator exists; the deterministic ordering rule lands fully
+      with that iterator.
 - [~] **Floating-point determinism.** FP **mode is pinned**: every float-producing
       function in `src/arith.zig` sets `@setFloatMode(.strict)`, forbidding
       contraction/reassociation regardless of build mode (Zig's default is already
@@ -116,11 +124,16 @@ that for a time-travel debugger it *is* the architecture.
       observable behaviour. **Landed in its honest current form** (`src/interp.zig`
       "determinism" tests): the VM has no nondeterministic inputs and no keyframes
       yet, so "replay" reduces to a second independent run — and the harness
-      asserts two independent VM instances of the same source agree on **both** the
-      printed output and the **serialized trace cache** (`traceser.encodeFile`),
-      plus an address-leak canary (`print` of a heap object renders a small stable
-      id, never an ASLR address). This is the regression spine that generalises to
-      true keyframe+effect replay once those exist.
+      asserts two independent VM instances of the same source agree on the printed
+      output, the **serialized trace cache** (`traceser.encodeFile`), **and the
+      serialized keyframe snapshot** (`keyframeser.encodeSnapshot` — the full
+      reachable heap graph + roots), plus an address-leak canary (`print` of a heap
+      object renders a small stable id, never an ASLR address). The snapshot
+      assertion is the strongest of the three: it serializes the entire heap graph,
+      so any address leaking into object identity, edge order, or table iteration
+      order diverges the bytes — it is what caught the address-dependent table-key
+      hashing above. This is the regression spine that generalises to true
+      keyframe+effect replay once restore (F2b) exists.
 
 ## Why this exists
 

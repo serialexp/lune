@@ -1,8 +1,8 @@
 # lune — Snapshot & Replay Schema
 
-Status: draft, not yet implemented — stub capturing required decisions
+Status: draft — trace artifact + keyframe serializer (F2a) landed; replay outstanding
 Owner: Bart
-Last updated: 2026-06-12
+Last updated: 2026-06-13
 
 Prerequisite for **Phase 5b** (trace serialization format) and **Phase 7** (the
 visualiser). This doc owns the *concrete wire format* — the binschema schema that
@@ -42,19 +42,63 @@ schema follows; this is that schema's home.
       reload-into-VM (id→`*Proto` rebind
       + proto-hash validation, string interning, live `Value` reconstruction).
 
+- [x] **Keyframe snapshot SERIALIZER (Phase 7 v2 / F2a — Zig round-trip +
+      run-twice determinism).** A whole-VM keyframe — the full reachable heap
+      graph + VM roots at a moment — serializes to a versioned, on-disk binary
+      form, sharing the same generated binschema codec as the trace artifact. The
+      schema (`schema/trace.json`) gains an **additive** record family alongside
+      the `Trace*`/`Const*` types, headed by its **own** version word so the trace
+      format (`traceser.format_version` = 1) is untouched: `SnapshotFile { version,
+      keyframe }`; `Keyframe { globals_id, objects[], stack[], frames[],
+      open_upvalues[] }`; `HeapObject { id, obj_type, body }` — a flat array keyed
+      by `GcHeader.id`, `body` a discriminated union on `obj_type` (mirroring the
+      `ObjectType` ordinals: `HeapString`=0 / `HeapTable`=1 / `HeapClosure`=2 /
+      `HeapNative`=3 / `HeapUpvalue`=4; `typed_array`/`host` have no variant yet and
+      the serializer errors `UnsupportedObject`). Every inter-object edge is a
+      `u32` id, never a pointer: `SnapValue { tag, body }` reuses the `Const*`
+      variants and adds `HeapRef { id }` for `heap_ref` (tag 4); `HeapClosure`
+      carries `proto_id` + `upvalue_ids[]` (the proto's constants are reached as
+      their own `HeapObject`s, never inlined); `HeapUpvalue` carries
+      `closed` + the captured `SnapValue`. `src/keyframeser.zig` maps a live VM
+      onto these structs (its object-dispatch mirrors `gc.blacken` exactly, so it
+      is provably complete against the GC's own edge set) and the reachable-set
+      walk is seeded from the **same** roots `Vm.collect` marks — both drive one
+      `Vm.forEachRootHeader` helper, so capture and GC can never drift. The CLI's
+      `--emit-keyframe <file>` drops a snapshot after a run (independent of
+      tracing). Round-trip is proven byte/struct-exact for a hand-built edge corpus
+      (empty + array/hash tables, NUL/high-byte strings, 0- and N-upvalue closures,
+      open vs closed upvalue, a self-referential table) and structurally for a
+      VM-driven program (globals/closures/upvalues/cycle), and the run-twice
+      determinism harness now asserts the **snapshot bytes** are byte-identical
+      across two independent VMs. Surfacing this latent property fixed a real
+      determinism bug: `table.ValueContext.hash` hashed a heap key by its
+      *address*, so hash-part iteration order (hence serialized `entries` order)
+      varied run-to-run; it now hashes by stable `GcHeader.id` (see
+      `02-determinism.md` §"Table iteration order"). **Deferred → F2b:**
+      restore-into-live-VM (id→`*GcHeader` rebind, re-interning, Proto-by-id /
+      Native-by-name rebind, stack + open-upvalue reconstruction) and
+      mid-execution capture at a safepoint (non-empty stack + OPEN upvalues).
+
 ### Outstanding
 
-- [ ] **Two artifacts, one substrate.** Define **optimizer guard-snapshots**
+- [~] **Two artifacts, one substrate.** Define **optimizer guard-snapshots**
       (for deopt) and **debugger keyframes + effect log** (for replay) as
-      distinct record types that share encoding — *not* one fused artifact.
+      distinct record types that share encoding — *not* one fused artifact. The
+      keyframe half exists as a serializer (F2a, above): `SnapshotFile` is a
+      distinct record family with its own version word, sharing the trace
+      artifact's generated codec. Guard-snapshots and the effect log are still
+      outstanding.
 - [ ] **Event model.** Minimum event set: event id, bytecode PC, frame id,
       register writes, heap writes, allocation ids, guard snapshots, side exits,
       host/external calls, nondeterministic inputs (effect records), GC events,
       checkpoint/keyframe indexes.
 - [ ] **Effect record format** — inputs + outputs sufficient to replay without
       re-running the effect (shared with `02-determinism.md`).
-- [ ] **Keyframe format** — VM-state snapshot for replay restore (shares code
-      with guard snapshots, `01-trace-lifecycle.md`).
+- [~] **Keyframe format** — VM-state snapshot for replay restore (shares code
+      with guard snapshots, `01-trace-lifecycle.md`). The **capture** half is done
+      (F2a `SnapshotFile`, above): the reachable heap graph + roots serialize
+      losslessly and deterministically. The **restore** half (decode back into a
+      live VM) is F2b.
 - [ ] **Recording modes.** Full-replay, bounded ring-buffer window, keyframe-only,
       off. Define defaults and per-mode capture filters (bytecode events / heap
       writes / host calls / allocations / source lines).
@@ -68,9 +112,11 @@ schema follows; this is that schema's home.
       **both** targets — Zig encoder/decoder under `src/gen/` and the TS decoder
       under `viz/src/gen/`, emitted from the one schema by
       `tools/regen-trace-schema.sh`. Cross-language agreement is proven by a
-      committed fixture decoded under `viz` `bun test`. Still outstanding:
-      extending the schema to the full event model below (effects / keyframes /
-      guard-snapshots).
+      committed fixture decoded under `viz` `bun test`. The schema now also covers
+      the **keyframe** record family (F2a `SnapshotFile`, above) — the Zig codec is
+      regenerated and vendored, and the TS codec under `viz/src/gen/` is too (a
+      cross-language snapshot fixture trails F2a). Still outstanding: extending the
+      schema to the rest of the event model below (effects / guard-snapshots).
 - [ ] **Versioning / compat policy.** The schema will churn during Phases 5–7.
       State the policy (likely: visualiser reads traces only from the same VM
       commit) so version skew is handled, not surprising.

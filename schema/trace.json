@@ -72,6 +72,124 @@
         { "name": "version", "type": "uint32" },
         { "name": "traces",  "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "Trace" } }
       ]
+    },
+
+    "HeapRef": {
+      "description": "A reference to a heap object by its stable GcHeader.id (src/gc.zig). Every inter-object edge in a snapshot is one of these — never a pointer (an address would leak ASLR and break deterministic replay; docs/design/02-determinism.md).",
+      "sequence": [ { "name": "id", "type": "uint32" } ]
+    },
+
+    "SnapValue": {
+      "description": "A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).",
+      "sequence": [
+        { "name": "tag", "type": "uint8" },
+        {
+          "name": "body",
+          "type": "discriminated_union",
+          "discriminator": { "field": "tag" },
+          "variants": [
+            { "type": "ConstNil",   "when": "value === 0" },
+            { "type": "ConstBool",  "when": "value === 1" },
+            { "type": "ConstInt",   "when": "value === 2" },
+            { "type": "ConstFloat", "when": "value === 3" },
+            { "type": "HeapRef",    "when": "value === 4" }
+          ]
+        }
+      ]
+    },
+
+    "TableEntry": {
+      "description": "One key/value pair from a table's hash part. Array-part entries are stored positionally in HeapTable.array; everything else lands here.",
+      "sequence": [
+        { "name": "key", "type": "SnapValue" },
+        { "name": "val", "type": "SnapValue" }
+      ]
+    },
+
+    "HeapString": {
+      "description": "A heap string object's raw bytes (lune strings are byte strings, not necessarily UTF-8). Interned at restore.",
+      "sequence": [ { "name": "bytes", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" } ]
+    },
+
+    "HeapTable": {
+      "description": "A table object: the dense array part (keys 1..n, positionally) plus the hash part (every other key). Edges are SnapValue heap_refs.",
+      "sequence": [
+        { "name": "array",   "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "SnapValue" } },
+        { "name": "entries", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "TableEntry" } }
+      ]
+    },
+
+    "HeapClosure": {
+      "description": "A closure: a stable proto id (rebound from the program image at restore, never serialized inline — same stance as a trace anchor) plus the ids of its captured upvalue cells.",
+      "sequence": [
+        { "name": "proto_id",    "type": "uint32" },
+        { "name": "upvalue_ids", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "uint32" } }
+      ]
+    },
+
+    "HeapUpvalue": {
+      "description": "A captured-variable cell. closed=1: `value` is the held value. closed=0 (open): `value` is the CURRENT contents of the stack slot at capture; restore re-derives the live slot from the saved stack window + Keyframe.open_upvalues (F2b).",
+      "sequence": [
+        { "name": "closed", "type": "uint8" },
+        { "name": "value",  "type": "SnapValue" }
+      ]
+    },
+
+    "HeapNative": {
+      "description": "A native (host/builtin) function, identified by name. Rebound to the installed base library by name at restore (the function pointer is meaningless on disk), so only the name is serialized.",
+      "sequence": [ { "name": "name", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" } ]
+    },
+
+    "HeapObject": {
+      "description": "One heap object in a snapshot, tagged by `obj_type` (mirrors object.ObjectType: string=0, table=1, function=2, native=3, upvalue=4). `id` is the object's stable GcHeader.id and the key every HeapRef points at. typed_array(5)/host(6) have no variant yet — emitting one is a serializer bug (UnsupportedObject), not a silent drop.",
+      "sequence": [
+        { "name": "id",       "type": "uint32" },
+        { "name": "obj_type", "type": "uint8" },
+        {
+          "name": "body",
+          "type": "discriminated_union",
+          "discriminator": { "field": "obj_type" },
+          "variants": [
+            { "type": "HeapString",  "when": "value === 0" },
+            { "type": "HeapTable",   "when": "value === 1" },
+            { "type": "HeapClosure", "when": "value === 2" },
+            { "type": "HeapNative",  "when": "value === 3" },
+            { "type": "HeapUpvalue", "when": "value === 4" }
+          ]
+        }
+      ]
+    },
+
+    "OpenUpvalueRef": {
+      "description": "An open upvalue's binding: the absolute stack index its cell points at, and the cell's object id. Lets restore re-point the cell into the rebuilt stack window. F2a (final-state capture) emits none; load-bearing in F2b.",
+      "sequence": [
+        { "name": "stack_index", "type": "uint32" },
+        { "name": "upvalue_id",  "type": "uint32" }
+      ]
+    },
+
+    "FrameRef": {
+      "description": "One active call frame: the id of the closure executing in it.",
+      "sequence": [ { "name": "closure_id", "type": "uint32" } ]
+    },
+
+    "Keyframe": {
+      "description": "A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.",
+      "sequence": [
+        { "name": "globals_id",    "type": "uint32" },
+        { "name": "objects",       "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "HeapObject" } },
+        { "name": "stack",         "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "SnapValue" } },
+        { "name": "frames",        "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "FrameRef" } },
+        { "name": "open_upvalues", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "OpenUpvalueRef" } }
+      ]
+    },
+
+    "SnapshotFile": {
+      "description": "The top-level keyframe artifact. Versioned independently of TraceFile (its own `version` word) — a distinct record family sharing the same binschema encoding, NOT fused with the trace artifact (docs/design/04: 'two artifacts, one substrate').",
+      "sequence": [
+        { "name": "version",  "type": "uint32" },
+        { "name": "keyframe", "type": "Keyframe" }
+      ]
     }
   }
 }

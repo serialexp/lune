@@ -2,7 +2,7 @@
 
 Status: draft, not yet implemented — architecture firm; companion docs 01–04 stubbed
 Owner: Bart
-Last updated: 2026-06-12
+Last updated: 2026-06-13
 
 > Working codename **lune** (Lua means "moon" in Portuguese; *lune* is French
 > for moon). Not Lua, doesn't aim to be — see Goals. Rename at will.
@@ -222,10 +222,20 @@ _(nothing yet — design only)_
       address `print` used to leak (so output no longer depends on ASLR), FP mode
       is pinned `.strict` in `arith.zig`, and a **determinism self-check** asserts
       two independent runs of a program agree on output *and* serialized traces
-      (doc 02 §Replay verification). **Still to come:** effect-log + keyframes (the
-      actual recorded execution log), then the visualiser's iteration animation —
-      effect-logging waits on the first nondeterministic *input* existing, and
-      keyframes build on this deterministic base + the new object ids.
+      (doc 02 §Replay verification). **F2a (keyframe serializer) landed:** a
+      whole-VM keyframe — the full reachable heap graph + roots, keyed on
+      `GcHeader.id`, every edge a `u32` id — serializes to a versioned wire record
+      (`SnapshotFile`, an additive record family sharing the trace artifact's
+      generated codec; doc 04). `src/keyframeser.zig` mirrors `gc.blacken`'s edge
+      set and is seeded from the same roots `Vm.collect` marks (one
+      `Vm.forEachRootHeader` helper, no drift); `--emit-keyframe <file>` drops a
+      snapshot after a run. The run-twice harness now also asserts byte-identical
+      **snapshot** bytes — which caught a real determinism bug (table keys hashed
+      by address, now by stable id; doc 02 §Table iteration order). **Still to
+      come:** F2b — restore a keyframe back into a live VM (id→pointer rebind,
+      re-interning, Proto/Native rebind, stack + open-upvalue reconstruction) —
+      then the effect-log (waits on the first nondeterministic *input* existing)
+      and the visualiser's iteration animation.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
       first. A performance step — but *not* mechanical: regalloc across side
       exits, GC stackmaps/safepoints, and machine-state snapshot-restore are

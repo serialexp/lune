@@ -3,6 +3,8 @@ const std = @import("std");
 const binschema = @import("binschema");
 
 pub const BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_ConstString = union(enum) { ConstNil: ConstNil, ConstBool: ConstBool, ConstInt: ConstInt, ConstFloat: ConstFloat, ConstString: ConstString };
+pub const BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_HeapRef = union(enum) { ConstNil: ConstNil, ConstBool: ConstBool, ConstInt: ConstInt, ConstFloat: ConstFloat, HeapRef: HeapRef };
+pub const BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue = union(enum) { HeapString: HeapString, HeapTable: HeapTable, HeapClosure: HeapClosure, HeapNative: HeapNative, HeapUpvalue: HeapUpvalue };
 
 pub const ConstInt = struct {
     v: i64,
@@ -405,6 +407,532 @@ pub const TraceFile = struct {
             _buf_5[_i_2] = try Trace.decodeWith(allocator, dec, root);
         }
         result.traces = _buf_5;
+        return result;
+    }
+};
+
+pub const HeapRef = struct {
+    id: u32,
+
+    pub fn encode(self: HeapRef, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: HeapRef, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        _ = ctx;
+        try enc.writeUint32(self.id, .little_endian);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HeapRef {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!HeapRef {
+        _ = allocator;
+        _ = root;
+        var result: HeapRef = undefined;
+        result.id = try dec.readUint32(.little_endian);
+        return result;
+    }
+};
+
+pub const SnapValue = struct {
+    tag: u8,
+    body: BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_HeapRef,
+
+    pub fn encode(self: SnapValue, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: SnapValue, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint8(self.tag);
+        switch (self.body) {
+            .ConstNil => |_uv_0| try _uv_0.encodeInto(enc, ctx),
+            .ConstBool => |_uv_1| try _uv_1.encodeInto(enc, ctx),
+            .ConstInt => |_uv_2| try _uv_2.encodeInto(enc, ctx),
+            .ConstFloat => |_uv_3| try _uv_3.encodeInto(enc, ctx),
+            .HeapRef => |_uv_4| try _uv_4.encodeInto(enc, ctx),
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!SnapValue {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!SnapValue {
+        var result: SnapValue = undefined;
+        result.tag = try dec.readUint8();
+        if (result.tag == 0) {
+            result.body = .{ .ConstNil = try ConstNil.decodeWith(allocator, dec, root) };
+        }
+        else if (result.tag == 1) {
+            result.body = .{ .ConstBool = try ConstBool.decodeWith(allocator, dec, root) };
+        }
+        else if (result.tag == 2) {
+            result.body = .{ .ConstInt = try ConstInt.decodeWith(allocator, dec, root) };
+        }
+        else if (result.tag == 3) {
+            result.body = .{ .ConstFloat = try ConstFloat.decodeWith(allocator, dec, root) };
+        }
+        else if (result.tag == 4) {
+            result.body = .{ .HeapRef = try HeapRef.decodeWith(allocator, dec, root) };
+        }
+        else {
+            return error.InvalidVariant;
+        }
+        return result;
+    }
+};
+
+pub const TableEntry = struct {
+    key: SnapValue,
+    val: SnapValue,
+
+    pub fn encode(self: TableEntry, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: TableEntry, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try self.key.encodeInto(enc, ctx);
+        try self.val.encodeInto(enc, ctx);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!TableEntry {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!TableEntry {
+        var result: TableEntry = undefined;
+        result.key = try SnapValue.decodeWith(allocator, dec, root);
+        result.val = try SnapValue.decodeWith(allocator, dec, root);
+        return result;
+    }
+};
+
+pub const HeapString = struct {
+    bytes: []const u8,
+
+    pub fn encode(self: HeapString, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: HeapString, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        _ = ctx;
+        try enc.writeUint32(@intCast(self.bytes.len), .little_endian);
+        try enc.writeBytes(self.bytes);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HeapString {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!HeapString {
+        _ = allocator;
+        _ = root;
+        var result: HeapString = undefined;
+        const _len_0 = try dec.readUint32(.little_endian);
+        result.bytes = try dec.readBytesSlice(_len_0);
+        return result;
+    }
+};
+
+pub const HeapTable = struct {
+    array: []const SnapValue,
+    entries: []const TableEntry,
+
+    pub fn encode(self: HeapTable, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: HeapTable, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint32(@intCast(self.array.len), .little_endian);
+        for (self.array) |_item_0| {
+            try _item_0.encodeInto(enc, ctx);
+        }
+        try enc.writeUint32(@intCast(self.entries.len), .little_endian);
+        for (self.entries) |_item_1| {
+            try _item_1.encodeInto(enc, ctx);
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HeapTable {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!HeapTable {
+        var result: HeapTable = undefined;
+        const _len_5 = try dec.readUint32(.little_endian);
+        const _buf_6 = try allocator.alloc(SnapValue, @as(usize, _len_5));
+        for (0.._buf_6.len) |_i_3| {
+            _buf_6[_i_3] = try SnapValue.decodeWith(allocator, dec, root);
+        }
+        result.array = _buf_6;
+        const _len_10 = try dec.readUint32(.little_endian);
+        const _buf_11 = try allocator.alloc(TableEntry, @as(usize, _len_10));
+        for (0.._buf_11.len) |_i_8| {
+            _buf_11[_i_8] = try TableEntry.decodeWith(allocator, dec, root);
+        }
+        result.entries = _buf_11;
+        return result;
+    }
+};
+
+pub const HeapClosure = struct {
+    proto_id: u32,
+    upvalue_ids: []const u32,
+
+    pub fn encode(self: HeapClosure, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: HeapClosure, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        _ = ctx;
+        try enc.writeUint32(self.proto_id, .little_endian);
+        try enc.writeUint16(@intCast(self.upvalue_ids.len), .little_endian);
+        for (self.upvalue_ids) |_item_0| {
+            try enc.writeUint32(_item_0, .little_endian);
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HeapClosure {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!HeapClosure {
+        _ = root;
+        var result: HeapClosure = undefined;
+        result.proto_id = try dec.readUint32(.little_endian);
+        const _len_4 = try dec.readUint16(.little_endian);
+        const _buf_5 = try allocator.alloc(u32, @as(usize, _len_4));
+        for (0.._buf_5.len) |_i_2| {
+            _buf_5[_i_2] = try dec.readUint32(.little_endian);
+        }
+        result.upvalue_ids = _buf_5;
+        return result;
+    }
+};
+
+pub const HeapUpvalue = struct {
+    closed: u8,
+    value: SnapValue,
+
+    pub fn encode(self: HeapUpvalue, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: HeapUpvalue, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint8(self.closed);
+        try self.value.encodeInto(enc, ctx);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HeapUpvalue {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!HeapUpvalue {
+        var result: HeapUpvalue = undefined;
+        result.closed = try dec.readUint8();
+        result.value = try SnapValue.decodeWith(allocator, dec, root);
+        return result;
+    }
+};
+
+pub const HeapNative = struct {
+    name: []const u8,
+
+    pub fn encode(self: HeapNative, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: HeapNative, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        _ = ctx;
+        try enc.writeUint32(@intCast(self.name.len), .little_endian);
+        try enc.writeBytes(self.name);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HeapNative {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!HeapNative {
+        _ = allocator;
+        _ = root;
+        var result: HeapNative = undefined;
+        const _len_0 = try dec.readUint32(.little_endian);
+        result.name = try dec.readBytesSlice(_len_0);
+        return result;
+    }
+};
+
+pub const HeapObject = struct {
+    id: u32,
+    obj_type: u8,
+    body: BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue,
+
+    pub fn encode(self: HeapObject, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: HeapObject, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint32(self.id, .little_endian);
+        try enc.writeUint8(self.obj_type);
+        switch (self.body) {
+            .HeapString => |_uv_0| try _uv_0.encodeInto(enc, ctx),
+            .HeapTable => |_uv_1| try _uv_1.encodeInto(enc, ctx),
+            .HeapClosure => |_uv_2| try _uv_2.encodeInto(enc, ctx),
+            .HeapNative => |_uv_3| try _uv_3.encodeInto(enc, ctx),
+            .HeapUpvalue => |_uv_4| try _uv_4.encodeInto(enc, ctx),
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HeapObject {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!HeapObject {
+        var result: HeapObject = undefined;
+        result.id = try dec.readUint32(.little_endian);
+        result.obj_type = try dec.readUint8();
+        if (result.obj_type == 0) {
+            result.body = .{ .HeapString = try HeapString.decodeWith(allocator, dec, root) };
+        }
+        else if (result.obj_type == 1) {
+            result.body = .{ .HeapTable = try HeapTable.decodeWith(allocator, dec, root) };
+        }
+        else if (result.obj_type == 2) {
+            result.body = .{ .HeapClosure = try HeapClosure.decodeWith(allocator, dec, root) };
+        }
+        else if (result.obj_type == 3) {
+            result.body = .{ .HeapNative = try HeapNative.decodeWith(allocator, dec, root) };
+        }
+        else if (result.obj_type == 4) {
+            result.body = .{ .HeapUpvalue = try HeapUpvalue.decodeWith(allocator, dec, root) };
+        }
+        else {
+            return error.InvalidVariant;
+        }
+        return result;
+    }
+};
+
+pub const OpenUpvalueRef = struct {
+    stack_index: u32,
+    upvalue_id: u32,
+
+    pub fn encode(self: OpenUpvalueRef, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: OpenUpvalueRef, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        _ = ctx;
+        try enc.writeUint32(self.stack_index, .little_endian);
+        try enc.writeUint32(self.upvalue_id, .little_endian);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!OpenUpvalueRef {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!OpenUpvalueRef {
+        _ = allocator;
+        _ = root;
+        var result: OpenUpvalueRef = undefined;
+        result.stack_index = try dec.readUint32(.little_endian);
+        result.upvalue_id = try dec.readUint32(.little_endian);
+        return result;
+    }
+};
+
+pub const FrameRef = struct {
+    closure_id: u32,
+
+    pub fn encode(self: FrameRef, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: FrameRef, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        _ = ctx;
+        try enc.writeUint32(self.closure_id, .little_endian);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!FrameRef {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!FrameRef {
+        _ = allocator;
+        _ = root;
+        var result: FrameRef = undefined;
+        result.closure_id = try dec.readUint32(.little_endian);
+        return result;
+    }
+};
+
+pub const Keyframe = struct {
+    globals_id: u32,
+    objects: []const HeapObject,
+    stack: []const SnapValue,
+    frames: []const FrameRef,
+    open_upvalues: []const OpenUpvalueRef,
+
+    pub fn encode(self: Keyframe, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: Keyframe, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint32(self.globals_id, .little_endian);
+        try enc.writeUint32(@intCast(self.objects.len), .little_endian);
+        for (self.objects) |_item_0| {
+            try _item_0.encodeInto(enc, ctx);
+        }
+        try enc.writeUint32(@intCast(self.stack.len), .little_endian);
+        for (self.stack) |_item_1| {
+            try _item_1.encodeInto(enc, ctx);
+        }
+        try enc.writeUint16(@intCast(self.frames.len), .little_endian);
+        for (self.frames) |_item_2| {
+            try _item_2.encodeInto(enc, ctx);
+        }
+        try enc.writeUint16(@intCast(self.open_upvalues.len), .little_endian);
+        for (self.open_upvalues) |_item_3| {
+            try _item_3.encodeInto(enc, ctx);
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!Keyframe {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!Keyframe {
+        var result: Keyframe = undefined;
+        result.globals_id = try dec.readUint32(.little_endian);
+        const _len_7 = try dec.readUint32(.little_endian);
+        const _buf_8 = try allocator.alloc(HeapObject, @as(usize, _len_7));
+        for (0.._buf_8.len) |_i_5| {
+            _buf_8[_i_5] = try HeapObject.decodeWith(allocator, dec, root);
+        }
+        result.objects = _buf_8;
+        const _len_12 = try dec.readUint32(.little_endian);
+        const _buf_13 = try allocator.alloc(SnapValue, @as(usize, _len_12));
+        for (0.._buf_13.len) |_i_10| {
+            _buf_13[_i_10] = try SnapValue.decodeWith(allocator, dec, root);
+        }
+        result.stack = _buf_13;
+        const _len_17 = try dec.readUint16(.little_endian);
+        const _buf_18 = try allocator.alloc(FrameRef, @as(usize, _len_17));
+        for (0.._buf_18.len) |_i_15| {
+            _buf_18[_i_15] = try FrameRef.decodeWith(allocator, dec, root);
+        }
+        result.frames = _buf_18;
+        const _len_22 = try dec.readUint16(.little_endian);
+        const _buf_23 = try allocator.alloc(OpenUpvalueRef, @as(usize, _len_22));
+        for (0.._buf_23.len) |_i_20| {
+            _buf_23[_i_20] = try OpenUpvalueRef.decodeWith(allocator, dec, root);
+        }
+        result.open_upvalues = _buf_23;
+        return result;
+    }
+};
+
+pub const SnapshotFile = struct {
+    version: u32,
+    keyframe: Keyframe,
+
+    pub fn encode(self: SnapshotFile, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: SnapshotFile, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint32(self.version, .little_endian);
+        try self.keyframe.encodeInto(enc, ctx);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!SnapshotFile {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!SnapshotFile {
+        var result: SnapshotFile = undefined;
+        result.version = try dec.readUint32(.little_endian);
+        result.keyframe = try Keyframe.decodeWith(allocator, dec, root);
         return result;
     }
 };

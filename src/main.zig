@@ -47,6 +47,10 @@ const usage =
     \\                       stderr after the run.
     \\  --emit-traces <file> imply --trace and serialize the recorded trace cache
     \\                       to <file> (binschema wire format) after the run.
+    \\  --emit-keyframe <file>
+    \\                       serialize a whole-VM keyframe snapshot (the reachable
+    \\                       heap graph + roots, binschema wire format) to <file>
+    \\                       after the run. Independent of tracing.
     \\  -h, --help           show this help
     \\
 ;
@@ -61,6 +65,9 @@ const TraceOpts = struct {
     dump: bool = false,
     /// `--emit-traces <file>`: serialize the trace cache here after the run.
     emit_path: ?[]const u8 = null,
+    /// `--emit-keyframe <file>`: serialize a whole-VM keyframe snapshot here after
+    /// the run. Independent of tracing (a heap snapshot, not a trace artifact).
+    keyframe_path: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) u8 {
@@ -92,6 +99,11 @@ pub fn main(init: std.process.Init) u8 {
             topts.enabled = true;
             topts.emit_path = it.next() orelse {
                 lune.io.eprint("lune: error: --emit-traces requires a <file> argument\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--emit-keyframe")) {
+            topts.keyframe_path = it.next() orelse {
+                lune.io.eprint("lune: error: --emit-keyframe requires a <file> argument\n", .{});
                 return 2;
             };
         } else break arg;
@@ -182,7 +194,25 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
             return 1;
         };
     }
+
+    // --- emit a keyframe snapshot (--emit-keyframe <file>) --- the VM is still
+    // alive, so the reachable heap graph (and the live string bytes it borrows)
+    // is valid. Independent of tracing.
+    if (topts.keyframe_path) |path| {
+        emitKeyframe(gpa, io, path, &vm) catch |err| {
+            lune.io.eprint("lune: error: --emit-keyframe '{s}': {s}\n", .{ path, @errorName(err) });
+            return 1;
+        };
+    }
     return 0;
+}
+
+/// Serialize a whole-VM keyframe snapshot to `path` (binschema wire format).
+fn emitKeyframe(gpa: std.mem.Allocator, io: lune.io.Io, path: []const u8, vm: *lune.interp.Vm) !void {
+    const bytes = try lune.keyframeser.encodeSnapshot(gpa, vm);
+    defer gpa.free(bytes);
+    try lune.io.writeFile(io, path, bytes);
+    lune.io.eprint("lune: wrote keyframe snapshot, {d} bytes → {s}\n", .{ bytes.len, path });
 }
 
 /// Serialize the recorded trace cache to `path` (binschema wire format).

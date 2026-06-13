@@ -174,7 +174,22 @@ pub const ValueContext = struct {
         var h = std.hash.Wyhash.init(0);
         const tag_byte: u8 = @intFromEnum(v.tag);
         h.update(&.{tag_byte});
-        h.update(std.mem.asBytes(&v.payload.bits));
+        if (v.isHeap()) {
+            // Hash a heap key by its stable, deterministic object id — NOT
+            // `payload.bits`, which is the object's *address*. An address is
+            // ASLR-dependent, so hashing it makes the hash-map's slot layout (and
+            // therefore its iteration order) vary run-to-run. That divergence is
+            // invisible to a program today (no `pairs`/`next`), but it is real and
+            // it surfaces the moment iteration order is observed — e.g. a keyframe
+            // snapshot serializing the hash part (`keyframeser.zig`). Hashing by
+            // `id` is consistent with `eql` (equal heap keys are the same interned
+            // object, hence the same id) and is reproducible. See
+            // docs/design/02-determinism.md §"Table iteration order".
+            const id = v.asHeap().id;
+            h.update(std.mem.asBytes(&id));
+        } else {
+            h.update(std.mem.asBytes(&v.payload.bits));
+        }
         return h.final();
     }
     pub fn eql(_: ValueContext, a: Value, b: Value) bool {

@@ -56,6 +56,11 @@ pub const tropt = @import("tropt.zig");
 /// on-disk wire form via the vendored, generated binschema codec.
 pub const traceser = @import("traceser.zig");
 
+/// Phase 7 v2 (F2a) — keyframe snapshot serialization: maps a live VM's
+/// reachable heap graph + roots to its on-disk snapshot form (shares the
+/// generated binschema codec with `traceser`).
+pub const keyframeser = @import("keyframeser.zig");
+
 /// Re-exports for ergonomic access.
 pub const Value = value.Value;
 pub const GcHeader = object.GcHeader;
@@ -84,4 +89,5 @@ test {
     _ = irinterp;
     _ = tropt;
     _ = traceser;
+    _ = keyframeser;
 }
