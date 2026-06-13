@@ -69,32 +69,14 @@ pub fn execute(t: *const Trace, regs: []Value, values: []Value) usize {
                 .slot_load => values[i] = regs[@intCast(ins.aux)],
                 .konst => values[i] = t.consts[@intCast(ins.aux)],
 
-                // ---- arithmetic (same arith.zig as tier-0; error => side-exit) ----
-                .add => values[i] = arith.add(values[ins.a], values[ins.b]) catch return completed,
-                .sub => values[i] = arith.sub(values[ins.a], values[ins.b]) catch return completed,
-                .mul => values[i] = arith.mul(values[ins.a], values[ins.b]) catch return completed,
-                .div => values[i] = arith.div(values[ins.a], values[ins.b]) catch return completed,
-                .idiv => values[i] = arith.floorDiv(values[ins.a], values[ins.b]) catch return completed,
-                .mod => values[i] = arith.mod(values[ins.a], values[ins.b]) catch return completed,
-                .pow => values[i] = arith.pow(values[ins.a], values[ins.b]) catch return completed,
+                // ---- arithmetic / bitwise / comparisons → the shared evaluator
+                //      (`evalBinary`, the *same* code the optimizer folds with).
+                //      Any error (only integer //- or %-by-zero is reachable; see
+                //      arith.zig) side-exits to tier-0, which re-raises it. ----
+                .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .eq, .ne, .lt, .le => values[i] = evalBinary(ins.op, values[ins.a], values[ins.b]) catch return completed,
 
-                // ---- bitwise ----
-                .band => values[i] = arith.band(values[ins.a], values[ins.b]) catch return completed,
-                .bor => values[i] = arith.bor(values[ins.a], values[ins.b]) catch return completed,
-                .bxor => values[i] = arith.bxor(values[ins.a], values[ins.b]) catch return completed,
-                .shl => values[i] = arith.shl(values[ins.a], values[ins.b]) catch return completed,
-                .shr => values[i] = arith.shr(values[ins.a], values[ins.b]) catch return completed,
-
-                // ---- unary ----
-                .neg => values[i] = arith.neg(values[ins.a]) catch return completed,
-                .not => values[i] = Value.boolean(!values[ins.a].isTruthy()),
-                .bnot => values[i] = arith.bnot(values[ins.a]) catch return completed,
-
-                // ---- comparisons → boolean (mirror tier-0 exactly) ----
-                .eq => values[i] = Value.boolean(arith.eq(values[ins.a], values[ins.b])),
-                .ne => values[i] = Value.boolean(!arith.eq(values[ins.a], values[ins.b])),
-                .lt => values[i] = Value.boolean(arith.lt(values[ins.a], values[ins.b]) catch return completed),
-                .le => values[i] = Value.boolean(arith.le(values[ins.a], values[ins.b]) catch return completed),
+                // ---- unary (shared evaluator too) ----
+                .neg, .not, .bnot => values[i] = evalUnary(ins.op, values[ins.a]) catch return completed,
 
                 // ---- guards: a mismatch side-exits to tier-0 ----
                 .guard_int => if (!values[ins.a].isInt()) return completed,
@@ -116,4 +98,47 @@ pub fn execute(t: *const Trace, regs: []Value, values: []Value) usize {
         // than spin — `regs` is whatever the last commit left, which is coherent.
         return completed;
     }
+}
+
+/// Evaluate a binary IR op (arithmetic / bitwise / comparison) over two values,
+/// using the *exact* `arith.zig` functions tier-0 uses. This is the single
+/// evaluator shared by the executor (above) and the trace optimizer's constant
+/// folder (`tropt.zig`) — so a folded constant has byte-identical bits to what
+/// the executor would compute at runtime, by construction. It is **total**: it
+/// only ever returns `arith.Error` (`TypeError` / `DivisionByZero`), never traps
+/// (arith.zig wraps integer ops and masks shift counts), so the folder can call
+/// it on any constants and merely refuse to fold on error. `op` must be one of
+/// the binary ops in the `execute` switch above (else unreachable).
+pub fn evalBinary(op: trace.IrOp, a: Value, b: Value) arith.Error!Value {
+    return switch (op) {
+        .add => arith.add(a, b),
+        .sub => arith.sub(a, b),
+        .mul => arith.mul(a, b),
+        .div => arith.div(a, b),
+        .idiv => arith.floorDiv(a, b),
+        .mod => arith.mod(a, b),
+        .pow => arith.pow(a, b),
+        .band => arith.band(a, b),
+        .bor => arith.bor(a, b),
+        .bxor => arith.bxor(a, b),
+        .shl => arith.shl(a, b),
+        .shr => arith.shr(a, b),
+        .eq => Value.boolean(arith.eq(a, b)),
+        .ne => Value.boolean(!arith.eq(a, b)),
+        .lt => Value.boolean(try arith.lt(a, b)),
+        .le => Value.boolean(try arith.le(a, b)),
+        else => unreachable,
+    };
+}
+
+/// Evaluate a unary IR op (`neg`/`not`/`bnot`). Shared by the executor and the
+/// folder, same contract as `evalBinary`. `not` is defined over Lua truthiness
+/// (no type guard, like tier-0). `op` must be a unary op (else unreachable).
+pub fn evalUnary(op: trace.IrOp, a: Value) arith.Error!Value {
+    return switch (op) {
+        .neg => arith.neg(a),
+        .not => Value.boolean(!a.isTruthy()),
+        .bnot => arith.bnot(a),
+        else => unreachable,
+    };
 }

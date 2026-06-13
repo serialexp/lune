@@ -26,6 +26,7 @@ const std = @import("std");
 const bytecode = @import("bytecode.zig");
 const value = @import("value.zig");
 const io = @import("io.zig");
+const tropt = @import("tropt.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -190,6 +191,11 @@ pub const TraceConfig = struct {
     /// Phase-5a behaviour (record only, tier-0 executes everything) and isolate
     /// recorder bugs from executor bugs.
     execute: bool = true,
+    /// Whether the trace optimizer (`tropt.zig`) rewrites a trace at commit time
+    /// (constant folding, CSE, dead-code elimination). On by default; independent
+    /// of `execute` (an unexecuted trace can still be optimized for inspection).
+    /// Tests set it false to compare optimized vs raw IR and prove transparency.
+    optimize: bool = true,
     /// Back-edge count at which a loop header becomes a trace anchor.
     hotloop: u32 = 56,
     /// Maximum IR instructions in one trace before aborting (`too_long`).
@@ -363,34 +369,48 @@ pub const TraceState = struct {
 
     /// Copy the in-progress recording into an owned, cached `Trace`. The exit
     /// snapshot is every register the trace *defined* (its loop-carried writes).
+    /// When `config.optimize`, the trace optimizer (`tropt.zig`) rewrites the IR
+    /// first; an optimizer OOM falls back to caching the *unoptimized* trace
+    /// (correct, just slower) rather than failing the commit.
     fn commit(self: *TraceState) !void {
         try self.rec.instrs.append(self.gpa, .{ .op = .loop });
 
-        const instrs = try self.gpa.dupe(IrInstr, self.rec.instrs.items);
-        errdefer self.gpa.free(instrs);
-        const consts = try self.gpa.dupe(Value, self.rec.consts.items);
-        errdefer self.gpa.free(consts);
-        const entry = try self.gpa.dupe(u16, self.rec.entry_slots.items);
-        errdefer self.gpa.free(entry);
-
+        // The exit snapshot: every register the trace defined (loop-carried).
         var stores: std.ArrayListUnmanaged(SlotStore) = .empty;
-        errdefer stores.deinit(self.gpa);
+        defer stores.deinit(self.gpa);
         for (self.rec.reg_map, 0..) |s, slot| {
             if (s.state == .def) try stores.append(self.gpa, .{ .slot = @intCast(slot), .ref = s.ref });
         }
-        const exit = try stores.toOwnedSlice(self.gpa);
-        errdefer self.gpa.free(exit);
 
-        assertWellFormed(instrs, consts.len, exit, self.rec.reg_map.len);
+        const instrs = self.rec.instrs.items;
+        const consts = self.rec.consts.items;
+        const entry = self.rec.entry_slots.items;
+
+        const fields: tropt.Optimized = if (self.config.optimize)
+            tropt.optimize(self.gpa, instrs, consts, stores.items) catch |e| switch (e) {
+                // Never fail a commit (or thrash the anchor) over an optimizer
+                // allocation failure: cache the unoptimized trace instead.
+                error.OutOfMemory => try tropt.dupe(self.gpa, instrs, consts, entry, stores.items),
+            }
+        else
+            try tropt.dupe(self.gpa, instrs, consts, entry, stores.items);
+        errdefer {
+            self.gpa.free(fields.instrs);
+            self.gpa.free(fields.consts);
+            self.gpa.free(fields.entry_slots);
+            self.gpa.free(fields.exit_stores);
+        }
+
+        assertWellFormed(fields.instrs, fields.consts.len, fields.exit_stores, self.rec.reg_map.len);
 
         const t = try self.gpa.create(Trace);
         errdefer self.gpa.destroy(t);
         t.* = .{
             .anchor = self.rec.anchor,
-            .instrs = instrs,
-            .consts = consts,
-            .entry_slots = entry,
-            .exit_stores = exit,
+            .instrs = fields.instrs,
+            .consts = fields.consts,
+            .entry_slots = fields.entry_slots,
+            .exit_stores = fields.exit_stores,
         };
         try self.cache.append(self.gpa, t);
     }

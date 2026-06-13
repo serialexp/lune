@@ -843,9 +843,10 @@ test "concat joins strings and coerces numbers; result is interned" {
 
 /// How the trace machinery participates in a `runCaptured` pass:
 ///  * `off`            — Phase-0 behaviour: no counting, recording, or execution.
-///  * `record_only`    — Phase-5a: record hot loops but tier-0 still executes all.
-///  * `record_execute` — Phase-6: also run cached traces in the IR-interpreter.
-const TraceMode = enum { off, record_only, record_execute };
+///  * `record_only`         — Phase-5a: record hot loops but tier-0 executes all.
+///  * `record_execute_noopt`— Phase-6a: run cached *unoptimized* traces.
+///  * `record_execute`      — Phase-6b: run cached traces through the optimizer.
+const TraceMode = enum { off, record_only, record_execute_noopt, record_execute };
 
 /// Run `source` to completion, capturing everything `print` emits into `sink`.
 /// With `stress`, the collector runs at *every* safepoint — the GC torture test.
@@ -868,7 +869,8 @@ fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, s
     vm.out = sink;
     vm.heap.gc_stress = stress;
     vm.trace.config.enabled = mode != .off;
-    vm.trace.config.execute = mode == .record_execute;
+    vm.trace.config.execute = mode == .record_execute or mode == .record_execute_noopt;
+    vm.trace.config.optimize = mode == .record_execute;
     vm.trace.config.hotloop = 4; // record short test loops
 
     var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
@@ -888,7 +890,7 @@ fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, s
 ///    mapping, a bad guard, a deopt mistake, or an exit-store error all diverge here.
 fn expectProgram(source: [:0]const u8, expected: []const u8) !void {
     inline for (.{ false, true }) |stress| {
-        inline for (.{ .off, .record_only, .record_execute }) |mode| {
+        inline for (.{ .off, .record_only, .record_execute_noopt, .record_execute }) |mode| {
             var buf: [256]u8 = undefined;
             var sink = io.Writer.fixed(&buf);
             try runCaptured(testing.allocator, source, &sink, stress, mode);
@@ -1025,8 +1027,11 @@ fn runForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, enabled: b
     vm.trace.config.enabled = enabled;
     // This harness inspects *recording* in isolation (Phase 5a). Keep tier-1a
     // execution off so back-edge counts / cache shape reflect pure recording;
-    // Phase-6 execution is exercised by `expectProgram` and its own tests.
+    // Phase-6 execution is exercised by `expectProgram` and its own tests. Keep
+    // the optimizer off too, so `dumpTrace` shape assertions see the *raw*
+    // recorded IR (folding/CSE/DCE are exercised by the `tropt` tests).
     vm.trace.config.execute = false;
+    vm.trace.config.optimize = false;
     vm.trace.config.hotloop = 4; // record short test loops
     var buf: [256]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
@@ -1343,4 +1348,66 @@ test "e2e (executor): a long hot loop stays correct across every trace + gc mode
         \\for i = 1, 64 do acc = acc + i end
         \\print(acc)
     , "2080\n"); // sum 1..64 == 2080
+}
+
+test "tropt: every loop-carried variable survives DCE (exit-store observability)" {
+    // Three chained loop-carried variables, all read after the loop. The optimizer
+    // must root *every* exit_store during dead-code elimination — drop any one and
+    // tier-0 would resume with a stale register and the printed value would differ.
+    // The 8-way matrix proves opt == noopt == tier-0 for all three.
+    try expectProgram(
+        \\local a = 0
+        \\local b = 1
+        \\local c = 2
+        \\for i = 1, 50 do
+        \\  a = a + i
+        \\  b = b + a
+        \\  c = c + b
+        \\end
+        \\print(a)
+        \\print(b)
+        \\print(c)
+    , "1275\n22101\n292877\n");
+}
+
+test "tropt: seeded differential fuzz — tier-0 == execute-noopt == execute-opt" {
+    // A fixed-seed PRNG generates small all-integer arithmetic loops. For each, the
+    // three modes (tier-0, record+execute unoptimized, record+execute optimized)
+    // must print byte-identically — the optimizer is output-invariant. Operands are
+    // kept non-zero (b ∈ [1,9], the loop index i ∈ [1,k]) so `//`/`%` never divide
+    // by zero; everything stays int so there are no type errors, only wrapping.
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xA11CE);
+    const rnd = prng.random();
+    const ops = [_][]const u8{ "+", "-", "*", "//", "%", "&", "|" };
+
+    var iter: usize = 0;
+    while (iter < 64) : (iter += 1) {
+        const a0 = rnd.intRangeAtMost(i64, -20, 20);
+        const b0 = rnd.intRangeAtMost(i64, 1, 9); // non-zero divisor
+        const k = rnd.intRangeAtMost(i64, 5, 40);
+        const op1 = ops[rnd.uintLessThan(usize, ops.len)];
+        const op2 = ops[rnd.uintLessThan(usize, ops.len)];
+
+        var src_buf: [256]u8 = undefined;
+        const source = try std.fmt.bufPrintSentinel(&src_buf,
+            \\local a = {d}
+            \\local b = {d}
+            \\for i = 1, {d} do a = (a {s} b) {s} i end
+            \\print(a)
+        , .{ a0, b0, k, op1, op2 }, 0);
+
+        var b_off: [64]u8 = undefined;
+        var s_off = io.Writer.fixed(&b_off);
+        try runCaptured(gpa, source, &s_off, false, .off);
+        var b_no: [64]u8 = undefined;
+        var s_no = io.Writer.fixed(&b_no);
+        try runCaptured(gpa, source, &s_no, false, .record_execute_noopt);
+        var b_op: [64]u8 = undefined;
+        var s_op = io.Writer.fixed(&b_op);
+        try runCaptured(gpa, source, &s_op, false, .record_execute);
+
+        try testing.expectEqualStrings(s_off.buffered(), s_no.buffered());
+        try testing.expectEqualStrings(s_off.buffered(), s_op.buffered());
+    }
 }

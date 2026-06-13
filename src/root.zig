@@ -48,6 +48,10 @@ pub const trace = @import("trace.zig");
 /// tier-0 on a guard failure).
 pub const irinterp = @import("irinterp.zig");
 
+/// Phase 6b — trace optimizer (constant folding / CSE / dead-code elimination;
+/// rewrite passes run once at commit time).
+pub const tropt = @import("tropt.zig");
+
 /// Re-exports for ergonomic access.
 pub const Value = value.Value;
 pub const GcHeader = object.GcHeader;
@@ -74,4 +78,5 @@ test {
     _ = interp;
     _ = trace;
     _ = irinterp;
+    _ = tropt;
 }
