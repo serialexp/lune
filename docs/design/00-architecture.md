@@ -131,9 +131,10 @@ _(nothing yet — design only)_
       visualiser uses the id as a correlation key). Round-trip is proven
       byte/struct-exact for real recorded traces (numeric + a string const) and a
       hand-built edge corpus (`INT64_MIN/MAX`, FP specials, NUL-bearing strings).
-      **Deferred → Phase 7 (the visualiser hosts them):** the **TypeScript
-      decoder** + binschema **cross-language fixtures** (no TS consumer exists
-      yet). **Deferred → later:** reload-into-VM (id→`*Proto` rebind + proto-hash
+      **Landed in Phase 7 (the visualiser hosts them):** the **TypeScript
+      decoder** (generated + vendored under `viz/src/gen/`) and the binschema
+      **cross-language fixture** (`viz/fixtures/counting-loop.lunetrace`, decoded
+      + asserted by `bun test`). **Deferred → later:** reload-into-VM (id→`*Proto` rebind + proto-hash
       validation), and the richer recording header / effect log / keyframes (the
       rest of `04-snapshot-replay-schema.md`, gated on the host-effect boundary).
       See §Trace serialization and `04-snapshot-replay-schema.md`.
@@ -200,10 +201,23 @@ _(nothing yet — design only)_
       subexpressions share operand refs and CSE now fires on real traces — e.g.
       the two `i+7` in `(i+7)*(i+7)` collapse to one `add`; see `src/trace.zig`
       `konst`, tests in `src/interp.zig`).
-- [ ] **Phase 7 — Time-travel debugger / trace visualizer.** SolidJS app that
+- [~] **Phase 7 — Time-travel debugger / trace visualizer.** SolidJS app that
       reads the trace file via the generated TS decoder. Starts with bounded
       recordings, not "complete history" by default. **Milestone: the feature
       this project is for.**
+      **Landed (v1 — static trace inspector, `viz/`):** Bun + Vite + SolidJS app
+      that loads a `.lunetrace` and renders each trace's IR exactly as
+      `--dump-traces` does (header, numbered instrs, consts pool, exit stores),
+      driven by the **generated** TS decoder vendored under `viz/src/gen/` (one
+      schema → both Zig and TS codecs via `tools/regen-trace-schema.sh`). The
+      `IrOp`/`ObsType`/`Tag` wire ordinals are pinned by a guard test in
+      `src/traceser.zig` and mirrored in `viz/src/enums.ts`. A committed
+      cross-language fixture (`viz/fixtures/counting-loop.lunetrace`, Zig-encoded)
+      is decoded + asserted by `bun test`, proving Zig-encode ↔ TS-decode agree.
+      `?src=<url>` deep-links a trace. **Still to come:** time-stepping /
+      iteration animation — needs a recorded execution log (effect records /
+      keyframes, doc 04 Outstanding), which we don't capture yet; v1 is
+      deliberately a *structural* inspector, not yet temporal.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
       first. A performance step — but *not* mechanical: regalloc across side
       exits, GC stackmaps/safepoints, and machine-state snapshot-restore are
@@ -533,10 +547,14 @@ once planned a hand-written Zig writer; that's superseded):
   (`tools/regen-trace-schema.sh`) and **vendored** under `src/gen/` — committed,
   so the build needs no binschema checkout. lune never hand-writes encode/decode;
   it only *maps* `trace.Trace` ↔ the generated structs (`src/traceser.zig`).
-- **TypeScript decoder: generated** from the same schema — **deferred to Phase 7**
-  (the visualiser), when there's a consumer to host it. At that point the TS
-  decoder and Zig encoder are validated against each other with binschema's
-  cross-language JSON fixtures, keeping the schema the single source of truth.
+- **TypeScript decoder: generated** from the same schema and **vendored** under
+  `viz/src/gen/` (the same `tools/regen-trace-schema.sh` emits both Zig and TS
+  from `schema/trace.json`) — **landed in Phase 7** with the visualiser. The TS
+  decoder and Zig encoder are validated against each other via a committed
+  cross-language fixture: `viz/fixtures/counting-loop.lunetrace` is Zig-encoded by
+  `lune --emit-traces`, then decoded and asserted by `viz` `bun test` (including a
+  `traceToText` rendering that matches `--dump-traces`), keeping the schema the
+  single source of truth.
 
 JSON is fine for early bring-up; expect to lean on binschema's compact binary
 encoding once traces get long (full-fidelity recordings grow fast).

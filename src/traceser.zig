@@ -294,3 +294,62 @@ test "hand-built schema edge corpus round-trips byte-exact" {
     try testing.expectEqual(@as(u8, 99), t1.instrs[0].op);
     try testing.expectEqual(@as(usize, 0), t1.consts.len);
 }
+
+test "wire enum ordinals are a pinned contract (mirrored by viz/src/enums.ts)" {
+    // The wire stores `op`, `ty`, and `tag` as raw u8 ordinals; the visualiser
+    // (viz/src/enums.ts) maps them back to names by *position*. The round-trip
+    // tests above only check ordinals survive encode→decode (relative), so they
+    // would NOT catch a reordering of these enums — which would silently desync
+    // the TS name tables. This test pins the absolute ordinals: reorder/insert an
+    // enum member and this fails, signalling that viz/src/enums.ts must change in
+    // lockstep. (If you add a member at the end, extend both this test and
+    // enums.ts.) See docs/design/04-snapshot-replay-schema.md.
+    const IrOp = trace.IrOp;
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(IrOp.slot_load));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(IrOp.konst));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(IrOp.add));
+    try testing.expectEqual(@as(u8, 3), @intFromEnum(IrOp.sub));
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(IrOp.mul));
+    try testing.expectEqual(@as(u8, 5), @intFromEnum(IrOp.div));
+    try testing.expectEqual(@as(u8, 6), @intFromEnum(IrOp.idiv));
+    try testing.expectEqual(@as(u8, 7), @intFromEnum(IrOp.mod));
+    try testing.expectEqual(@as(u8, 8), @intFromEnum(IrOp.pow));
+    try testing.expectEqual(@as(u8, 9), @intFromEnum(IrOp.band));
+    try testing.expectEqual(@as(u8, 10), @intFromEnum(IrOp.bor));
+    try testing.expectEqual(@as(u8, 11), @intFromEnum(IrOp.bxor));
+    try testing.expectEqual(@as(u8, 12), @intFromEnum(IrOp.shl));
+    try testing.expectEqual(@as(u8, 13), @intFromEnum(IrOp.shr));
+    try testing.expectEqual(@as(u8, 14), @intFromEnum(IrOp.neg));
+    try testing.expectEqual(@as(u8, 15), @intFromEnum(IrOp.not));
+    try testing.expectEqual(@as(u8, 16), @intFromEnum(IrOp.bnot));
+    try testing.expectEqual(@as(u8, 17), @intFromEnum(IrOp.eq));
+    try testing.expectEqual(@as(u8, 18), @intFromEnum(IrOp.ne));
+    try testing.expectEqual(@as(u8, 19), @intFromEnum(IrOp.lt));
+    try testing.expectEqual(@as(u8, 20), @intFromEnum(IrOp.le));
+    try testing.expectEqual(@as(u8, 21), @intFromEnum(IrOp.guard_int));
+    try testing.expectEqual(@as(u8, 22), @intFromEnum(IrOp.guard_float));
+    try testing.expectEqual(@as(u8, 23), @intFromEnum(IrOp.guard_number));
+    try testing.expectEqual(@as(u8, 24), @intFromEnum(IrOp.guard_true));
+    try testing.expectEqual(@as(u8, 25), @intFromEnum(IrOp.guard_false));
+    try testing.expectEqual(@as(u8, 26), @intFromEnum(IrOp.loop));
+    // Exhaustiveness: if a member is added/removed, this count changes and forces
+    // both this test and enums.ts to be revisited.
+    try testing.expectEqual(@as(usize, 27), @typeInfo(IrOp).@"enum".field_names.len);
+
+    const ObsType = trace.ObsType;
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(ObsType.unknown));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(ObsType.int));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(ObsType.float));
+    try testing.expectEqual(@as(u8, 3), @intFromEnum(ObsType.boolean));
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(ObsType.nil));
+    try testing.expectEqual(@as(u8, 5), @intFromEnum(ObsType.heap));
+    try testing.expectEqual(@as(usize, 6), @typeInfo(ObsType).@"enum".field_names.len);
+
+    const Tag = value.Tag;
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(Tag.nil));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(Tag.boolean));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(Tag.int));
+    try testing.expectEqual(@as(u8, 3), @intFromEnum(Tag.float));
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(Tag.heap_ref));
+    try testing.expectEqual(@as(usize, 5), @typeInfo(Tag).@"enum".field_names.len);
+}

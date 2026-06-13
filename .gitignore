@@ -1,3 +1,7 @@
 # Zig build artifacts
 .zig-cache/
 zig-out/
+
+# viz (Phase 7 visualiser) — Bun + Vite + SolidJS
+viz/node_modules/
+viz/dist/

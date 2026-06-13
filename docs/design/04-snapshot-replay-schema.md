@@ -35,9 +35,11 @@ schema follows; this is that schema's home.
       snapshot) belongs with effect-recording and is deferred. Round-trip is proven
       byte/struct-exact for real recorded traces (numeric + a string const) and a
       hand-built edge corpus (`INT64_MIN/MAX`, i32-aux extremes, FP specials,
-      NUL-bearing strings). **Deferred → Phase 7:** the generated **TypeScript
-      decoder** + binschema **cross-language fixtures** (no TS consumer until the
-      visualiser exists). **Deferred → later:** reload-into-VM (id→`*Proto` rebind
+      NUL-bearing strings). **Landed in Phase 7:** the generated **TypeScript
+      decoder** (vendored under `viz/src/gen/`, same regen script) + a binschema
+      **cross-language fixture** (`viz/fixtures/counting-loop.lunetrace`,
+      Zig-encoded, decoded + asserted by `viz` `bun test`). **Deferred → later:**
+      reload-into-VM (id→`*Proto` rebind
       + proto-hash validation, string interning, live `Value` reconstruction).
 
 ### Outstanding
@@ -62,11 +64,13 @@ schema follows; this is that schema's home.
 - [ ] **File layout.** Chunked / mmap-friendly with a seek index; string / value
       interning; trace header (hash seed, FP mode, env snapshot, schema version).
 - [~] **binschema schema + generated codec.** Done for the **trace artifact**:
-      `schema/trace.json` (in the lune repo) + a **generated, vendored** Zig
-      encoder/decoder (binschema gained a Zig backend, so the writer is generated,
-      not hand-written — see Done above). Still outstanding: the **generated TS
-      decoder** + cross-language fixtures (→ Phase 7), and extending the schema to
-      the full event model below (effects / keyframes / guard-snapshots).
+      `schema/trace.json` (in the lune repo) + **generated, vendored** codecs for
+      **both** targets — Zig encoder/decoder under `src/gen/` and the TS decoder
+      under `viz/src/gen/`, emitted from the one schema by
+      `tools/regen-trace-schema.sh`. Cross-language agreement is proven by a
+      committed fixture decoded under `viz` `bun test`. Still outstanding:
+      extending the schema to the full event model below (effects / keyframes /
+      guard-snapshots).
 - [ ] **Versioning / compat policy.** The schema will churn during Phases 5–7.
       State the policy (likely: visualiser reads traces only from the same VM
       commit) so version skew is handled, not surprising.
