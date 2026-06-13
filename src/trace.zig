@@ -182,13 +182,28 @@ pub const AbortReason = enum {
 /// overridable (tests use tiny thresholds, the CLI flips `enabled`).
 pub const TraceConfig = struct {
     /// Master switch. Off by default: with this false the VM behaves exactly as
-    /// it did before Phase 5 (no counting, no recording). The CLI `--trace` /
-    /// `--dump-traces` flags and tests flip it on.
+    /// it did before Phase 5 (no counting, no recording, no trace execution). The
+    /// CLI `--trace` / `--dump-traces` flags and tests flip it on.
     enabled: bool = false,
+    /// Whether cached traces are *executed* by the tier-1a IR-interpreter
+    /// (`irinterp.zig`). On by default once `enabled`; tests set it false to get
+    /// Phase-5a behaviour (record only, tier-0 executes everything) and isolate
+    /// recorder bugs from executor bugs.
+    execute: bool = true,
     /// Back-edge count at which a loop header becomes a trace anchor.
     hotloop: u32 = 56,
     /// Maximum IR instructions in one trace before aborting (`too_long`).
     maxrecord: u32 = 2000,
+    /// A trace entry that commits at least this many iterations is "doing real
+    /// work" and clears the anchor's re-entry penalty. Loops shorter than this per
+    /// entry are exactly where a tracing JIT wins nothing, so retiring them to
+    /// tier-0 (below) costs ~nothing.
+    min_useful: u32 = 8,
+    /// After this many *low-yield* trace entries (each committing fewer than
+    /// `min_useful` iterations) an anchor is blacklisted so tier-0 owns the loop —
+    /// the minimal brake against re-entry thrash on type-unstable / branchy loops.
+    /// The real fix (side traces) is deferred; see docs/design/01-trace-lifecycle.md.
+    max_penalty: u32 = 8,
 };
 
 /// All recorder state owned by a `Vm`: the hotness counters, the cache of
@@ -207,8 +222,16 @@ pub const TraceState = struct {
     /// (so a temporarily-unstable loop can succeed later) is a later increment;
     /// see docs/design/01-trace-lifecycle.md.
     blacklist: std.AutoHashMapUnmanaged(AnchorKey, void) = .empty,
+    /// Re-entry penalty per anchor: a low-yield trace entry bumps it, a useful one
+    /// clears it; at `config.max_penalty` the anchor is blacklisted (`onSideExit`).
+    penalty: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
     /// The in-progress recording (at most one at a time in Phase 5a).
     rec: Recorder = .{},
+    /// Reusable SSA-value scratch for the tier-1a executor (`irinterp.execute`),
+    /// indexed by `Ref`. Grown to the longest trace executed and reused across
+    /// every entry — never allocated per-iteration or per-entry. Not a GC root
+    /// (the executor runs no safepoint; see `irinterp.zig`).
+    values_scratch: std.ArrayListUnmanaged(Value) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) TraceState {
         return .{ .gpa = gpa };
@@ -217,17 +240,53 @@ pub const TraceState = struct {
     pub fn deinit(self: *TraceState) void {
         self.counters.deinit(self.gpa);
         self.blacklist.deinit(self.gpa);
+        self.penalty.deinit(self.gpa);
+        self.values_scratch.deinit(self.gpa);
         for (self.cache.items) |t| t.destroy(self.gpa);
         self.cache.deinit(self.gpa);
         self.rec.deinit(self.gpa);
     }
 
+    /// The trace cached for `(proto, pc)`, or null. Linear scan — the cache is
+    /// small in Phase 5/6 and never invalidated.
+    pub fn findTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
+        for (self.cache.items) |t| {
+            if (t.anchor.proto == proto and t.anchor.pc == pc) return t;
+        }
+        return null;
+    }
+
     /// Is a trace already cached for this anchor? (Prevents re-arming.)
     pub fn hasTrace(self: *const TraceState, anchor: AnchorKey) bool {
-        for (self.cache.items) |t| {
-            if (t.anchor.proto == anchor.proto and t.anchor.pc == anchor.pc) return true;
+        return self.findTrace(anchor.proto, anchor.pc) != null;
+    }
+
+    /// A reusable scratch slice of at least `n` `Value`s for the executor. Grows
+    /// the backing buffer to the high-water mark and reuses it; never shrinks.
+    pub fn valuesScratch(self: *TraceState, n: usize) ![]Value {
+        if (self.values_scratch.items.len < n) {
+            try self.values_scratch.resize(self.gpa, n);
         }
-        return false;
+        return self.values_scratch.items[0..n];
+    }
+
+    /// Account for a trace entry that side-exited after committing `completed`
+    /// iterations. A useful entry (>= `min_useful`) clears the anchor's penalty;
+    /// a low-yield one bumps it, and at `max_penalty` the anchor is blacklisted so
+    /// tier-0 takes the loop. Bounds re-entry thrash on type-unstable / branchy
+    /// loops (the real fix, side traces, is deferred — 01-trace-lifecycle.md).
+    pub fn onSideExit(self: *TraceState, t: *const Trace, completed: usize) void {
+        const key = t.anchor;
+        if (completed >= self.config.min_useful) {
+            _ = self.penalty.remove(key);
+            return;
+        }
+        const gop = self.penalty.getOrPut(self.gpa, key) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* +|= 1;
+        if (gop.value_ptr.* >= self.config.max_penalty) {
+            self.blacklist.put(self.gpa, key, {}) catch {};
+        }
     }
 
     /// True while a recording is in flight (the interpreter's recording hook
@@ -322,6 +381,8 @@ pub const TraceState = struct {
         const exit = try stores.toOwnedSlice(self.gpa);
         errdefer self.gpa.free(exit);
 
+        assertWellFormed(instrs, consts.len, exit, self.rec.reg_map.len);
+
         const t = try self.gpa.create(Trace);
         errdefer self.gpa.destroy(t);
         t.* = .{
@@ -332,6 +393,38 @@ pub const TraceState = struct {
             .exit_stores = exit,
         };
         try self.cache.append(self.gpa, t);
+    }
+
+    /// Debug-only structural verifier for the invariants the tier-1a executor
+    /// (`irinterp.zig`) relies on, so a recorder bug can never become a wild read
+    /// at execution time. Compiled out in release builds (`std.debug.assert`).
+    ///   * the trace is non-empty and terminates in exactly one `loop`;
+    ///   * every operand `Ref` is defined earlier (linear SSA: ref < its index);
+    ///   * `slot_load`/`konst` `aux` is in register / const-pool bounds;
+    ///   * every `exit_store` ref precedes the `loop` and its slot is a register.
+    fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, exit: []const SlotStore, num_registers: usize) void {
+        std.debug.assert(instrs.len >= 1);
+        const last = instrs.len - 1;
+        std.debug.assert(instrs[last].op == .loop);
+        for (instrs, 0..) |ins, i| {
+            switch (ins.op) {
+                .slot_load => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < num_registers),
+                .konst => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len),
+                .loop => std.debug.assert(i == last), // the only loop, and it is terminal
+                // binary ops read both `a` and `b`.
+                .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .eq, .ne, .lt, .le => {
+                    std.debug.assert(ins.a < i and ins.b < i);
+                },
+                // unary ops and guards read `a` only.
+                .neg, .not, .bnot, .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => {
+                    std.debug.assert(ins.a < i);
+                },
+            }
+        }
+        for (exit) |st| {
+            std.debug.assert(st.ref < last);
+            std.debug.assert(st.slot < num_registers);
+        }
     }
 
     // --- per-instruction recording ----------------------------------------

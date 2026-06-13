@@ -25,6 +25,7 @@ const string = @import("string.zig");
 const table = @import("table.zig");
 const function = @import("function.zig");
 const trace = @import("trace.zig");
+const irinterp = @import("irinterp.zig");
 const compiler = @import("compiler.zig");
 const io = @import("io.zig");
 const Value = value.Value;
@@ -365,10 +366,27 @@ pub const Vm = struct {
 
             // Phase 5 hotness seam: a backward (or self) jump just took us to
             // `pc <= cur_pc` — a loop back-edge whose target `pc` is the loop
-            // header (anchor). Count it (and, once recording lands, arm/close a
-            // trace). Gated on `enabled`, so it is inert until `--trace`.
+            // header (anchor). Count it, and arm/close a recording. Gated on
+            // `enabled`, so it is inert until `--trace`.
             if (self.trace.config.enabled and pc <= cur_pc) {
                 self.trace.onBackEdge(proto, @intCast(pc), regs);
+
+                // Phase 6 tier-1a entry: if a trace is cached for this loop header
+                // and we're not mid-recording, execute it. `irinterp.execute`
+                // returns with `regs` coherent for the header — it side-exits
+                // *before* committing a partial iteration — so we `continue`
+                // **without** advancing `pc`: tier-0 then re-runs the loop header
+                // to redo the (pure, side-effect-free) deopt iteration. A trace is
+                // only ever entered at exactly its anchor pc, so re-entry is sound.
+                if (self.trace.config.execute and !self.trace.isRecording()) {
+                    if (self.trace.findTrace(proto, @intCast(pc))) |t| {
+                        if (self.trace.valuesScratch(t.instrs.len)) |buf| {
+                            const completed = irinterp.execute(t, regs, buf);
+                            self.trace.onSideExit(t, completed);
+                            continue;
+                        } else |_| {} // OOM growing scratch: let tier-0 run the loop
+                    }
+                }
             }
         }
     }
@@ -823,12 +841,18 @@ test "concat joins strings and coerces numbers; result is interned" {
 // dependency on the parser/compiler — only this test path does.
 // ---------------------------------------------------------------------------
 
+/// How the trace machinery participates in a `runCaptured` pass:
+///  * `off`            — Phase-0 behaviour: no counting, recording, or execution.
+///  * `record_only`    — Phase-5a: record hot loops but tier-0 still executes all.
+///  * `record_execute` — Phase-6: also run cached traces in the IR-interpreter.
+const TraceMode = enum { off, record_only, record_execute };
+
 /// Run `source` to completion, capturing everything `print` emits into `sink`.
 /// With `stress`, the collector runs at *every* safepoint — the GC torture test.
-/// With `tracing`, the recorder rides along with a low hotness threshold so even
-/// short loops record — exercising the recorder while asserting it stays
-/// transparent (output must not change).
-fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, stress: bool, tracing: bool) !void {
+/// `mode` selects how the tracing JIT participates (with a low hotness threshold
+/// so even short test loops go hot) — used to assert the JIT stays transparent:
+/// recording, and now *executing* traces, must not change a program's output.
+fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, stress: bool, mode: TraceMode) !void {
     const parser = @import("parser.zig");
     const diag = @import("diag.zig");
 
@@ -843,7 +867,8 @@ fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, s
     defer vm.deinit();
     vm.out = sink;
     vm.heap.gc_stress = stress;
-    vm.trace.config.enabled = tracing;
+    vm.trace.config.enabled = mode != .off;
+    vm.trace.config.execute = mode == .record_execute;
     vm.trace.config.hotloop = 4; // record short test loops
 
     var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
@@ -853,19 +878,20 @@ fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, s
     _ = try vm.run(chunk.proto);
 }
 
-/// Run `source` across the full matrix of GC discipline × recorder state and
-/// assert it prints exactly `expected` every time. Two invariants ride on this:
+/// Run `source` across the full matrix of GC discipline × trace mode and assert
+/// it prints exactly `expected` every time. Three invariants ride on this:
 ///  * **GC**: the stress pass frees aggressively — a wrongly-collected live
 ///    object diverges or faults.
-///  * **Tracing transparency**: the recorder must not perturb tier-0 — output
-///    with the recorder on must equal output with it off (and survive GC stress
-///    at the same time).
+///  * **Recording transparency**: the recorder must not perturb tier-0.
+///  * **Execution transparency (Phase 6)**: a trace executed by the tier-1a
+///    IR-interpreter must produce byte-identical output to tier-0 — a wrong arith
+///    mapping, a bad guard, a deopt mistake, or an exit-store error all diverge here.
 fn expectProgram(source: [:0]const u8, expected: []const u8) !void {
     inline for (.{ false, true }) |stress| {
-        inline for (.{ false, true }) |tracing| {
+        inline for (.{ .off, .record_only, .record_execute }) |mode| {
             var buf: [256]u8 = undefined;
             var sink = io.Writer.fixed(&buf);
-            try runCaptured(testing.allocator, source, &sink, stress, tracing);
+            try runCaptured(testing.allocator, source, &sink, stress, mode);
             try testing.expectEqualStrings(expected, sink.buffered());
         }
     }
@@ -997,6 +1023,10 @@ fn runForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, enabled: b
     defer tree.deinit();
 
     vm.trace.config.enabled = enabled;
+    // This harness inspects *recording* in isolation (Phase 5a). Keep tier-1a
+    // execution off so back-edge counts / cache shape reflect pure recording;
+    // Phase-6 execution is exercised by `expectProgram` and its own tests.
+    vm.trace.config.execute = false;
     vm.trace.config.hotloop = 4; // record short test loops
     var buf: [256]u8 = undefined;
     var sink = io.Writer.fixed(&buf);

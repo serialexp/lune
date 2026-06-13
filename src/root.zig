@@ -44,6 +44,10 @@ pub const interp = @import("interp.zig");
 /// Phase 5 — hot-path detection + trace recorder (records IR; tier-0 executes).
 pub const trace = @import("trace.zig");
 
+/// Phase 6 — tier-1a trace IR-interpreter (executes recorded traces; deopts to
+/// tier-0 on a guard failure).
+pub const irinterp = @import("irinterp.zig");
+
 /// Re-exports for ergonomic access.
 pub const Value = value.Value;
 pub const GcHeader = object.GcHeader;
@@ -69,4 +73,5 @@ test {
     _ = compiler;
     _ = interp;
     _ = trace;
+    _ = irinterp;
 }
