@@ -60,11 +60,26 @@ _(nothing yet — design only)_
       retained** (unchecked, per the language-surface sketch). Deferred and noted
       in source: long-bracket string literals, hex floats, call sugar
       (`f"s"`/`f{…}`), `repeat`/`until`, `goto`/labels. 55 tests pass.
-- [ ] **Phase 3 — Bytecode compiler + tier-0 interpreter.** Register-based
-      bytecode; a plain interpreter. Includes **basic tables, string interning,
-      write-barrier call sites (no-op at first), and the host-effect boundary**
-      — real programs and the determinism story need them this early.
-      **Milestone: runs real programs.**
+- [x] **Phase 3 — Bytecode compiler + tier-0 interpreter.** Done.
+      Register-based 12-byte bytecode ISA (`src/bytecode.zig`) with a total
+      disassembler; a single-pass compiler (`src/compiler.zig`) with
+      stack-discipline register allocation, back-patched control flow, and
+      local→upvalue→global name resolution; a recursive switch-dispatch tier-0
+      interpreter (`src/interp.zig`) over a fixed, never-reallocated register/call
+      stack (the **correctness oracle**, not a hot tier). Runtime heap
+      (`src/gc.zig` + `src/string.zig`/`src/table.zig`/`src/function.zig`): an
+      intrusive object list, **interned strings** (content→unique object, so
+      equality/keys are pointer compares), **basic tables**, and closures with
+      classic **open/closed upvalues**. Functions, calls (register-window call
+      convention), `local function` recursion, and globals all land here. The
+      **host-effect boundary** is a type-erased `Native` (`print`) writing through
+      an injectable `Vm.out` sink — output never touches real stdout in tests.
+      **Write-barrier call sites are deferred to Phase 4** (the collector that
+      needs them): the tier-0 mutator allocates through the heap and links every
+      object onto the sweep list, so the seam is the heap allocator itself. A real
+      CLI (`src/main.zig`) runs a `.lua` file or `-e` chunk through
+      parse→compile→run. **Milestone met: runs real programs.** 128 tests pass,
+      including end-to-end source→output integration tests.
 - [ ] **Phase 4 — Garbage collector.** A deliberately boring **non-moving**
       collector first (stable object addresses), heap laid out for a later
       generational upgrade; typed-array payloads off-heap / pinnable.

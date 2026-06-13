@@ -20,6 +20,11 @@ const Value = value.Value;
 /// directly — if the path changes, it changes here.
 pub const Writer = std.Io.Writer;
 
+/// The async/blocking I/O context type (vtable + userdata). Re-exported for the
+/// same reason as `Writer`: callers (the CLI driver) hold one without naming
+/// `std.Io` themselves.
+pub const Io = std.Io;
+
 const buffer_len = 4096;
 
 // Process-global, lazily initialised stdout plumbing. A global (stable address)
@@ -36,6 +41,19 @@ fn ensureInit() void {
     threaded = .init(std.heap.page_allocator, .{});
     file_writer = std.Io.File.stdout().writer(threaded.io(), &stdout_buffer);
     initialized = true;
+}
+
+// Lazily-initialised stderr plumbing, mirroring stdout. Shares the one
+// `std.Io.Threaded` context (created by `ensureInit`).
+var stderr_writer: std.Io.File.Writer = undefined;
+var stderr_buffer: [buffer_len]u8 = undefined;
+var stderr_initialized = false;
+
+fn ensureStderr() void {
+    if (stderr_initialized) return;
+    ensureInit(); // shares the threaded io context
+    stderr_writer = std.Io.File.stderr().writer(threaded.io(), &stderr_buffer);
+    stderr_initialized = true;
 }
 
 /// The buffered stdout writer. Output is not guaranteed visible until `flush()`
@@ -58,6 +76,38 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
     const w = stdout();
     w.print(fmt, args) catch {};
     flush();
+}
+
+/// The buffered stderr writer. Diagnostics and CLI error messages go here so
+/// they don't interleave with a program's stdout.
+pub fn stderrWriter() *Writer {
+    ensureStderr();
+    return &stderr_writer.interface;
+}
+
+/// printf-style line to stderr, flushed immediately. Swallows I/O errors.
+pub fn eprint(comptime fmt: []const u8, args: anytype) void {
+    const w = stderrWriter();
+    w.print(fmt, args) catch {};
+    w.flush() catch {};
+}
+
+/// Largest source file the CLI will load (a sanity bound, not a language limit).
+pub const max_source_bytes: usize = 64 * 1024 * 1024;
+
+/// Read an entire source file into a NUL-terminated buffer — the `[:0]const u8`
+/// form the lexer wants. File access is churny `std.Io` surface, funnelled here
+/// with the rest of this module. Caller owns the returned buffer (free with
+/// `gpa`). Reads larger than `max_source_bytes` fail with `error.StreamTooLong`.
+pub fn readFileZ(gpa: std.mem.Allocator, io: Io, path: []const u8) ![:0]u8 {
+    return std.Io.Dir.cwd().readFileAllocOptions(
+        io,
+        path,
+        gpa,
+        Io.Limit.limited(max_source_bytes),
+        .of(u8),
+        0,
+    );
 }
 
 /// Render a `Value` to `w` in a human-readable, debugger-friendly form. The

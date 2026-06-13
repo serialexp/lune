@@ -14,16 +14,27 @@ that for a time-travel debugger it *is* the architecture.
 
 ### Done
 
-_(nothing yet — design only)_
+- [x] **Host-effect boundary — structural seam** (Phase 3). Every external
+      interaction is a host function (`Native`, `src/function.zig`): a
+      type-erased `*const fn(ctx, args) -> Value` installed as a global. The first
+      one is `print`. Crucially, its output does not go to the OS directly — it
+      goes through a single injectable redirection point, `Vm.out: ?*io.Writer`
+      (`src/interp.zig`): `null` means the process's stdout, but a test (and,
+      later, the effect recorder/replayer) points it at an in-memory writer and
+      observes the effect without it ever reaching the real world. That one field
+      is the proof-of-concept that *all* I/O can be diverted from one place. The
+      taxonomy, the effect-record format, and routing time/randomness through this
+      seam are still outstanding (below).
 
 ### Outstanding
 
 - [ ] **Effect taxonomy.** Enumerate every nondeterministic source and assign
       each a policy: *forbid in deterministic mode*, *virtualise*, or *log
       inputs/outputs*.
-- [ ] **Host-effect boundary in the calling convention** (Phase 3) — the single
-      point all external interaction flows through; every call is an effect
-      record + trace barrier.
+- [ ] **Host-effect *recording*** — the seam exists (Phase 3, above); what's left
+      is making each host call emit an effect record (inputs + outputs) and act as
+      a trace barrier, so replay can feed the outputs back without re-executing the
+      effect.
 - [ ] **Effect record format** — inputs + outputs sufficient to replay without
       re-executing the effect. Lives in the trace schema
       (`04-snapshot-replay-schema.md`).

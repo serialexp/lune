@@ -712,3 +712,96 @@ test "concat joins strings and coerces numbers; result is interned" {
     try testing.expect(r.isHeap());
     try testing.expectEqualStrings("x=42", string.String.fromHeader(r.asHeap()).bytes());
 }
+
+// ---------------------------------------------------------------------------
+// End-to-end integration — source text → parse → compile → run.
+//
+// The hand-assembled tests above pin individual opcodes; these drive the whole
+// Phase 3 pipeline (front end + compiler + tier-0 interpreter + heap) the way
+// the CLI runs a real program, and assert on the captured `print` output. The
+// front-end imports are function-local so the production interpreter keeps no
+// dependency on the parser/compiler — only this test path does.
+// ---------------------------------------------------------------------------
+
+/// Run `source` to completion, capturing everything `print` emits into `sink`.
+fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer) !void {
+    const parser = @import("parser.zig");
+    const compiler = @import("compiler.zig");
+    const diag = @import("diag.zig");
+
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.out = sink;
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    _ = try vm.run(chunk.proto);
+}
+
+test "e2e: recursion, loop, locals — fib and a summing loop" {
+    var buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    try runCaptured(testing.allocator,
+        \\local function fib(n)
+        \\  if n < 2 then return n end
+        \\  return fib(n - 1) + fib(n - 2)
+        \\end
+        \\local total = 0
+        \\for i = 1, 10 do total = total + i end
+        \\print(fib(10), total)
+    , &sink);
+    // fib(10) == 55, sum 1..10 == 55
+    try testing.expectEqualStrings("55\t55\n", sink.buffered());
+}
+
+test "e2e: tables and string concat" {
+    var buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    try runCaptured(testing.allocator,
+        \\local t = {}
+        \\t.name = "lune"
+        \\t.answer = 40 + 2
+        \\print("hello, " .. t.name)
+        \\print("answer=" .. t.answer)
+    , &sink);
+    try testing.expectEqualStrings("hello, lune\nanswer=42\n", sink.buffered());
+}
+
+test "e2e: closures capture per-iteration bindings; higher-order print" {
+    var buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    try runCaptured(testing.allocator,
+        \\local function adder(x)
+        \\  return function(y) return x + y end
+        \\end
+        \\local add10 = adder(10)
+        \\local add20 = adder(20)
+        \\print(add10(1), add20(1), add10(add20(0)))
+    , &sink);
+    // 11, 21, add10(20) == 30
+    try testing.expectEqualStrings("11\t21\t30\n", sink.buffered());
+}
+
+test "e2e: while loop with a table accumulator" {
+    var buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    try runCaptured(testing.allocator,
+        \\local t = {}
+        \\local i = 1
+        \\while i <= 3 do
+        \\  t[i] = i * i
+        \\  i = i + 1
+        \\end
+        \\print(t[1], t[2], t[3], #t)
+    , &sink);
+    try testing.expectEqualStrings("1\t4\t9\t3\n", sink.buffered());
+}

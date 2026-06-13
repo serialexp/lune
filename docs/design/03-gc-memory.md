@@ -14,7 +14,17 @@ ownership, write barriers, and trace rooting.
 
 ### Done
 
-_(nothing yet — design only)_
+- [x] **Heap object lifecycle — allocate-and-link** (Phase 3, `src/gc.zig`).
+      Every heap object (string, table, closure, upvalue, native) is allocated
+      through `gc.Heap` and prepended to a single **intrusive sweep list** via the
+      `GcHeader.next` field settled in Phase 1; `Heap.deinit` walks that list and
+      frees everything wholesale. This is the allocate-only precursor to the
+      collector: tier-0 never frees an individual object, so object addresses are
+      trivially stable and the sweep list is already the exact structure a
+      mark-sweep will traverse. **String interning** lives here too (a content→
+      object map, so equal strings are one object and key/equality become pointer
+      compares — also the canonicalisation a deterministic table-iteration order
+      will rely on).
 
 ### Outstanding
 
@@ -31,10 +41,15 @@ _(nothing yet — design only)_
 - [ ] **Moving vs non-moving commitment.** Non-moving means traces may hold raw
       object pointers. If moving/compaction is ever wanted, design
       handles / relocation-safe refs from day one. (Default: non-moving v1.)
-- [ ] **Write barriers from Phase 3.** Barrier *call sites* on table/array/object
-      stores must exist from the interpreter onward (no-op until generational),
-      including stores emitted by IR (Phase 6) and native code (Phase 8).
-      Barriers must be *recorded into traces*.
+- [~] **Write barriers from Phase 3.** The mutating stores all exist and are
+      centralised: `set_index` (table store), `set_global`, and `set_upval` each
+      go through one code path in the tier-0 interpreter (`src/interp.zig`) /
+      `table.set` (`src/table.zig`) — so the barrier has exactly one attach point
+      per store kind rather than scattered call sites. The barrier *body* is still
+      a deliberate no-op: there is no generational collector yet to remember
+      old→young edges, so emitting a stub now would be untested dead code. Phase 4
+      adds the real barrier at these existing seams (and the IR/native executors,
+      Phases 6/8, must mirror it); barriers must also be *recorded into traces*.
 - [ ] **GC root maps** for every executor: interpreter, recorder, IR-interpreter,
       native codegen. Snapshot metadata must coordinate with liveness.
 - [ ] **Safepoints in long-running traces** so a hot loop can't block collection.
