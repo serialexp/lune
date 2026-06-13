@@ -73,6 +73,7 @@ pub fn compile(
         .code = c.code.items,
         .constants = c.constants.items,
         .num_registers = c.max_reg,
+        .protos = c.protos.items,
         .name = "main",
     };
     // Moving `arena` is safe: code/constants/proto live in arena *heap* buffers,
@@ -101,10 +102,22 @@ const Compiler = struct {
     source: [:0]const u8,
     diags: *Diagnostics,
 
+    /// The lexically-enclosing function being compiled, if this is a nested
+    /// function body. Used to detect references to an outer function's locals
+    /// (upvalue captures, which Phase 3d1 diagnoses rather than supports).
+    parent: ?*Compiler = null,
+
     code: std.ArrayList(Instr) = .empty,
     constants: std.ArrayList(Value) = .empty,
     locals: std.ArrayList(Local) = .empty,
     loops: std.ArrayList(Loop) = .empty,
+    /// Nested function prototypes compiled within this function (arena-owned),
+    /// referenced by the `closure` instructions this function emits.
+    protos: std.ArrayList(*Proto) = .empty,
+
+    /// Fixed parameter count of the function being compiled.
+    num_params: u8 = 0,
+    is_vararg: bool = false,
 
     scope_depth: u32 = 0,
     /// Next free register (also == live-local count at statement boundaries).
@@ -217,6 +230,43 @@ const Compiler = struct {
         return null;
     }
 
+    /// Does `name` resolve to a local of some *enclosing* function? Such a
+    /// reference is an upvalue capture, which Phase 3d1 diagnoses rather than
+    /// compiles (so a free name is never silently miscompiled to a global).
+    fn isEnclosingLocal(self: *Compiler, name: []const u8) bool {
+        var p = self.parent;
+        while (p) |pc| {
+            if (pc.resolveLocal(name) != null) return true;
+            p = pc.parent;
+        }
+        return false;
+    }
+
+    /// Load the value of `name` into `dest`: a local move, or a global read.
+    /// A reference to an enclosing function's local is rejected (Phase 3d2).
+    fn loadName(self: *Compiler, name: []const u8, dest: u16, span: ast.Span) Error!void {
+        if (self.resolveLocal(name)) |r| {
+            if (r != dest) _ = try self.emit(Instr.opAB(.move, dest, r));
+        } else if (self.isEnclosingLocal(name)) {
+            return self.fail(span, "captures an enclosing local; closures are not supported yet (Phase 3d2)");
+        } else {
+            const k = try self.stringConstant(name);
+            _ = try self.emit(Instr.opAB(.get_global, dest, k));
+        }
+    }
+
+    /// Store register `src` into `name`: a local move, or a global write.
+    fn storeName(self: *Compiler, name: []const u8, src: u16, span: ast.Span) Error!void {
+        if (self.resolveLocal(name)) |r| {
+            if (r != src) _ = try self.emit(Instr.opAB(.move, r, src));
+        } else if (self.isEnclosingLocal(name)) {
+            return self.fail(span, "assigns an enclosing local; closures are not supported yet (Phase 3d2)");
+        } else {
+            const k = try self.stringConstant(name);
+            _ = try self.emit(Instr.opAB(.set_global, src, k));
+        }
+    }
+
     // ---- statements ----
 
     fn compileBlock(self: *Compiler, block: ast.Block) Error!void {
@@ -237,12 +287,12 @@ const Compiler = struct {
             .numeric_for => |nf| try self.compileNumericFor(nf),
             .return_ => |exprs| try self.compileReturn(exprs),
             .break_ => try self.compileBreak(s.span),
+            .call => |call_expr| try self.compileCallStmt(call_expr),
+            .function_decl => |fd| try self.compileFunctionDecl(fd),
 
-            // Phase 3d.
-            .call => return self.fail(s.span, "call statements are not supported yet"),
+            // Phase 3d2 / later.
             .generic_for => return self.fail(s.span, "generic for is not supported yet"),
-            .function_decl => return self.fail(s.span, "function declarations are not supported yet"),
-            .local_function => return self.fail(s.span, "local functions are not supported yet"),
+            .local_function => return self.fail(s.span, "local functions are not supported yet (Phase 3d2)"),
         }
     }
 
@@ -302,14 +352,7 @@ const Compiler = struct {
     /// Emit a store of register `src` into the assignable target `tgt`.
     fn compileStore(self: *Compiler, tgt: *const ast.Expr, src: u16) Error!void {
         switch (tgt.data) {
-            .name => |nm| {
-                if (self.resolveLocal(nm)) |r| {
-                    if (r != src) _ = try self.emit(Instr.opAB(.move, r, src));
-                } else {
-                    const k = try self.stringConstant(nm);
-                    _ = try self.emit(Instr.opAB(.set_global, src, k));
-                }
-            },
+            .name => |nm| try self.storeName(nm, src, tgt.span),
             .field => |f| {
                 const m = self.next_reg;
                 const obj = try self.alloc1();
@@ -474,14 +517,7 @@ const Compiler = struct {
                 const k = try self.stringConstant(bytes);
                 _ = try self.emit(Instr.opAB(.load_const, dest, k));
             },
-            .name => |nm| {
-                if (self.resolveLocal(nm)) |r| {
-                    if (r != dest) _ = try self.emit(Instr.opAB(.move, dest, r));
-                } else {
-                    const k = try self.stringConstant(nm);
-                    _ = try self.emit(Instr.opAB(.get_global, dest, k));
-                }
-            },
+            .name => |nm| try self.loadName(nm, dest, e.span),
             .paren => |inner| try self.compileExprTo(inner, dest),
             .unary => |u| try self.compileUnary(u.op, u.operand, dest),
             .binary => |b| try self.compileBinary(b.op, b.lhs, b.rhs, dest),
@@ -505,11 +541,12 @@ const Compiler = struct {
                 self.freeTo(m);
             },
             .table => |fields| try self.compileTable(fields, dest),
+            .call => |c| try self.compileCall(c.callee, c.args, dest, 1),
+            .method_call => |mc| try self.compileMethodCall(mc.obj, mc.name, mc.args, dest, 1),
+            .function => |body| try self.compileFunction(body, "anonymous", dest),
 
-            // Phase 3d.
-            .vararg => return self.fail(e.span, "vararg is not supported yet"),
-            .call, .method_call => return self.fail(e.span, "calls are not supported yet"),
-            .function => return self.fail(e.span, "function expressions are not supported yet"),
+            // Phase 3d2.
+            .vararg => return self.fail(e.span, "vararg is not supported yet (Phase 3d2)"),
         }
     }
 
@@ -582,6 +619,151 @@ const Compiler = struct {
             _ = try self.emit(Instr.opABC(.set_index, dest, key, val));
             self.freeTo(m);
         }
+    }
+
+    // ---- functions & calls ----
+
+    /// Compile a function body into a nested `Proto`, register it among this
+    /// function's `protos`, and emit a `closure` into `dest`. `name` is for
+    /// disassembly only.
+    fn compileFunction(self: *Compiler, body: *const ast.FunctionBody, name: []const u8, dest: u16) Error!void {
+        if (body.params.len > std.math.maxInt(u8)) return self.fail(body.span, "too many parameters");
+
+        var child = Compiler{
+            .arena = self.arena,
+            .scratch = self.scratch,
+            .heap = self.heap,
+            .source = self.source,
+            .diags = self.diags,
+            .parent = self,
+        };
+        defer child.deinitScratch();
+
+        // Parameters occupy the first registers, in order.
+        for (body.params, 0..) |p, i| {
+            _ = try child.alloc1();
+            try child.declareLocal(p.name, @intCast(i));
+        }
+        child.num_params = @intCast(body.params.len);
+        child.is_vararg = body.is_vararg;
+
+        try child.compileBlock(body.body);
+        // Implicit `return` (no values) if control reaches the end.
+        _ = try child.emit(Instr.opAB(.ret, 0, 0));
+
+        const proto = try self.arena.create(Proto);
+        proto.* = .{
+            .code = child.code.items,
+            .constants = child.constants.items,
+            .num_registers = child.max_reg,
+            .num_params = child.num_params,
+            .is_vararg = child.is_vararg,
+            .protos = child.protos.items,
+            .name = name,
+        };
+
+        if (self.protos.items.len > std.math.maxInt(u16)) return self.fail(body.span, "too many nested functions");
+        const idx: u16 = @intCast(self.protos.items.len);
+        try self.protos.append(self.arena, proto);
+        _ = try self.emit(Instr.opAB(.closure, dest, idx));
+    }
+
+    /// A call used as a statement: evaluate for effects, discard results.
+    fn compileCallStmt(self: *Compiler, e: *const ast.Expr) Error!void {
+        switch (e.data) {
+            .call => |c| try self.compileCall(c.callee, c.args, 0, 0),
+            .method_call => |mc| try self.compileMethodCall(mc.obj, mc.name, mc.args, 0, 0),
+            else => unreachable, // parser guarantees a call statement is a call
+        }
+    }
+
+    /// `callee(args)` wanting `nwanted` results, delivered into `dest` (the
+    /// first result) when `nwanted >= 1`. The callee and its arguments are laid
+    /// out in a fresh contiguous temp window: `[fn, arg0, arg1, …]`.
+    fn compileCall(self: *Compiler, callee: *const ast.Expr, args: []const *ast.Expr, dest: u16, nwanted: u16) Error!void {
+        const mark = self.next_reg;
+        const base = try self.alloc1(); // function slot; results land here
+        try self.compileExprTo(callee, base);
+        for (args) |arg| {
+            const r = try self.alloc1();
+            try self.compileExprTo(arg, r);
+        }
+        if (args.len > std.math.maxInt(u16)) return self.fail(callee.span, "too many arguments");
+        _ = try self.emit(Instr.opABC(.call, base, @intCast(args.len), nwanted));
+        if (nwanted >= 1 and dest != base) _ = try self.emit(Instr.opAB(.move, dest, base));
+        self.freeTo(mark);
+    }
+
+    /// `obj:name(args)` — method-call sugar for `obj.name(obj, args)`: `obj` is
+    /// evaluated once and passed as the implicit first argument (`self`).
+    fn compileMethodCall(self: *Compiler, obj: *const ast.Expr, name: []const u8, args: []const *ast.Expr, dest: u16, nwanted: u16) Error!void {
+        const mark = self.next_reg;
+        const base = try self.alloc1(); // function slot
+        const self_reg = try self.alloc1(); // base+1 = self (first argument)
+        try self.compileExprTo(obj, self_reg);
+
+        // fn = self[name]
+        const km = self.next_reg;
+        const key = try self.alloc1();
+        const k = try self.stringConstant(name);
+        _ = try self.emit(Instr.opAB(.load_const, key, k));
+        _ = try self.emit(Instr.opABC(.get_index, base, self_reg, key));
+        self.freeTo(km); // free the key temp; fn + self stay
+
+        for (args) |arg| {
+            const r = try self.alloc1();
+            try self.compileExprTo(arg, r);
+        }
+        const total = args.len + 1; // implicit self
+        if (total > std.math.maxInt(u16)) return self.fail(obj.span, "too many arguments");
+        _ = try self.emit(Instr.opABC(.call, base, @intCast(total), nwanted));
+        if (nwanted >= 1 and dest != base) _ = try self.emit(Instr.opAB(.move, dest, base));
+        self.freeTo(mark);
+    }
+
+    /// `function a.b:m(...) ... end` — sugar for assigning a function literal to
+    /// the named target. A bare `function f` assigns the name `f` (local or
+    /// global); a dotted/method target navigates to the container and sets the
+    /// final field. (`self` for a method is already prepended by the parser.)
+    fn compileFunctionDecl(self: *Compiler, fd: anytype) Error!void {
+        const path = fd.name.path;
+        const method = fd.name.method;
+
+        // Simple `function f()` — assign to the (local-or-global) name `f`.
+        if (path.len == 1 and method == null) {
+            const mark = self.next_reg;
+            const fnr = try self.alloc1();
+            try self.compileFunction(fd.body, path[0], fnr);
+            try self.storeName(path[0], fnr, fd.body.span);
+            self.freeTo(mark);
+            return;
+        }
+
+        // Dotted / method target: load the base, walk to the container, then
+        // `set_index` the final key.
+        const mark = self.next_reg;
+        const objr = try self.alloc1();
+        try self.loadName(path[0], objr, fd.body.span);
+
+        const final_count = if (method != null) path.len else path.len - 1;
+        var i: usize = 1;
+        while (i < final_count) : (i += 1) {
+            const m2 = self.next_reg;
+            const key = try self.alloc1();
+            const k = try self.stringConstant(path[i]);
+            _ = try self.emit(Instr.opAB(.load_const, key, k));
+            _ = try self.emit(Instr.opABC(.get_index, objr, objr, key));
+            self.freeTo(m2);
+        }
+
+        const final_key = method orelse path[path.len - 1];
+        const keyr = try self.alloc1();
+        const kk = try self.stringConstant(final_key);
+        _ = try self.emit(Instr.opAB(.load_const, keyr, kk));
+        const fnr = try self.alloc1();
+        try self.compileFunction(fd.body, final_key, fnr);
+        _ = try self.emit(Instr.opABC(.set_index, objr, keyr, fnr));
+        self.freeTo(mark);
     }
 
     // ---- helpers ----
@@ -900,14 +1082,112 @@ test "string length via #" {
     )).asInt());
 }
 
-test "unsupported construct produces a diagnostic, not a crash" {
+test "function literal: call an anonymous function" {
+    try testing.expectEqual(@as(i64, 42), (try runScalar(
+        \\local double = function(x) return x * 2 end
+        \\return double(21)
+    )).asInt());
+}
+
+test "global function declaration and call" {
+    try testing.expectEqual(@as(i64, 7), (try runScalar(
+        \\function add(a, b) return a + b end
+        \\return add(3, 4)
+    )).asInt());
+}
+
+test "recursion through a global name: fib(10) == 55" {
+    try testing.expectEqual(@as(i64, 55), (try runScalar(
+        \\function fib(n)
+        \\  if n < 2 then return n end
+        \\  return fib(n - 1) + fib(n - 2)
+        \\end
+        \\return fib(10)
+    )).asInt());
+}
+
+test "higher-order: pass a function as an argument" {
+    try testing.expectEqual(@as(i64, 42), (try runScalar(
+        \\function apply(f, x) return f(x) end
+        \\function inc(n) return n + 1 end
+        \\return apply(inc, 41)
+    )).asInt());
+}
+
+test "missing arguments bind to nil; extra arguments are dropped" {
+    // one declared param, called with none → n is nil → `n or 0` yields 0
+    try testing.expectEqual(@as(i64, 0), (try runScalar(
+        \\function f(n) return n or 0 end
+        \\return f()
+    )).asInt());
+    // two declared params, called with three → third is dropped
+    try testing.expectEqual(@as(i64, 5), (try runScalar(
+        \\function g(a, b) return a + b end
+        \\return g(2, 3, 99)
+    )).asInt());
+}
+
+test "a function with no explicit return yields nil" {
+    try testing.expect((try runScalar(
+        \\function noop() end
+        \\return noop()
+    )).isNil());
+}
+
+test "function stored on a table field, called via the field" {
+    try testing.expectEqual(@as(i64, 30), (try runScalar(
+        \\local t = {}
+        \\function t.add(a, b) return a + b end
+        \\return t.add(10, 20)
+    )).asInt());
+}
+
+test "method declaration and method call pass self implicitly" {
+    try testing.expectEqual(@as(i64, 7), (try runScalar(
+        \\local obj = { value = 7 }
+        \\function obj:get() return self.value end
+        \\return obj:get()
+    )).asInt());
+}
+
+test "call statement runs for its side effect" {
+    // A call used as a statement (result discarded): `fill()` mutates a global,
+    // observed afterwards. Exercises the statement-call path end to end.
+    try testing.expectEqual(@as(i64, 42), (try runScalar(
+        \\g = {}
+        \\function fill() g[1] = 42 end
+        \\fill()
+        \\return g[1]
+    )).asInt());
+}
+
+test "capturing an enclosing local is diagnosed (closures are Phase 3d2)" {
     var diags = Diagnostics.init(testing.allocator);
     defer diags.deinit();
-    var tree = try parser.parse(testing.allocator, "return foo()", &diags);
+    const src =
+        \\local x = 5
+        \\local f = function() return x end
+        \\return f()
+    ;
+    var tree = try parser.parse(testing.allocator, src, &diags);
     defer tree.deinit();
 
     var vm = try interp.Vm.init(testing.allocator);
     defer vm.deinit();
-    try testing.expectError(Error.CompileError, compile(testing.allocator, &vm.heap, "return foo()", tree.root, &diags));
+    try testing.expectError(Error.CompileError, compile(testing.allocator, &vm.heap, src, tree.root, &diags));
+    try testing.expect(diags.hasErrors());
+}
+
+test "unsupported construct produces a diagnostic, not a crash" {
+    // `local function` (self-capturing recursion) is deferred to Phase 3d2.
+    const src = "local function f() return f() end";
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parser.parse(testing.allocator, src, &diags);
+    defer tree.deinit();
+
+    var vm = try interp.Vm.init(testing.allocator);
+    defer vm.deinit();
+    try testing.expectError(Error.CompileError, compile(testing.allocator, &vm.heap, src, tree.root, &diags));
     try testing.expect(diags.hasErrors());
 }

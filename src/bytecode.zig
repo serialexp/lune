@@ -172,6 +172,17 @@ pub const Instr = struct {
     }
 };
 
+/// How a closure obtains one of its upvalues when it is created. Either it
+/// captures a local register of the *enclosing* frame (`in_stack`), or it
+/// inherits one of the enclosing closure's own upvalues. Mirrors Lua's
+/// `Upvaldesc`.
+pub const UpvalDesc = struct {
+    /// `true`: capture the enclosing frame's local register `index`.
+    /// `false`: reuse the enclosing closure's upvalue `index`.
+    in_stack: bool,
+    index: u16,
+};
+
 /// A function prototype: the immutable compiled form of one function body (the
 /// main chunk is just the top-level prototype). A runtime *closure* (Increment D)
 /// pairs a `Proto` with captured upvalues; the `Proto` itself is shared and
@@ -191,6 +202,9 @@ pub const Proto = struct {
     is_vararg: bool = false,
     /// Nested function prototypes, referenced by `closure` (Increment D).
     protos: []const *const Proto = &.{},
+    /// Upvalue capture plan: how a `closure` of this proto fills its cells from
+    /// the enclosing frame. Empty for functions that capture nothing.
+    upvalues: []const UpvalDesc = &.{},
     /// Debug name for disassembly / diagnostics (not semantically meaningful).
     name: []const u8 = "?",
 };

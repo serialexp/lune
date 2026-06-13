@@ -16,7 +16,12 @@ const std = @import("std");
 pub const ObjectType = enum(u8) {
     string,
     table,
+    /// A Lua closure: a prototype paired with captured upvalues.
     function,
+    /// A native (host/builtin) function exposed through the embedding boundary.
+    native,
+    /// A captured-variable cell (open or closed upvalue).
+    upvalue,
     typed_array,
     /// Opaque host-owned object exposed through the embedding API.
     host,

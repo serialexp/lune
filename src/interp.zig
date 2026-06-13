@@ -23,9 +23,12 @@ const value = @import("value.zig");
 const gc = @import("gc.zig");
 const string = @import("string.zig");
 const table = @import("table.zig");
+const function = @import("function.zig");
+const io = @import("io.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
+const Closure = function.Closure;
 
 /// Runtime errors surfaced to the host. A superset of `arith.Error` so pure
 /// numeric ops coerce in with a bare `try`.
@@ -36,49 +39,108 @@ pub const Error = error{
     DivisionByZero,
     /// An opcode whose runtime support has not been implemented yet.
     Unimplemented,
+    /// Call/register stack exhausted, or tier-0's native-recursion guard tripped.
+    StackOverflow,
+    /// A native (host) function failed with an error outside the known set.
+    HostError,
     /// Allocation failure (register stack, future heap).
     OutOfMemory,
 };
 
+/// Fixed VM register/call stack: every frame's register window is a slice of
+/// this one buffer. It is allocated once and **never reallocated**, so a slice
+/// handed to one frame stays valid while a nested call runs above it. 64Ki
+/// `Value` slots = 1 MiB.
+const stack_slots: usize = 1 << 16;
+
+/// Maximum native-recursion depth for the tier-0 interpreter. `execClosure`
+/// recurses on the host stack per Lua call, so this bounds how deep a Lua
+/// program may recurse before we report `StackOverflow` rather than smashing the
+/// host stack. Tier-0 is the correctness oracle, not the deep-recursion tier;
+/// the JIT tiers use an explicit frame stack with no such limit.
+const max_call_depth: u32 = 200;
+
+/// Result of running one frame: the `count` return values live at
+/// `regs[reg .. reg + count]` of that frame's window (i.e. `stack[base + reg]`).
+const FrameResult = struct { reg: u16, count: u16 };
+
 /// The tier-0 virtual machine. Owns the resources a running program needs that
-/// outlive a single frame; for Increment A that is just the allocator (the heap,
-/// globals, and a shared register stack arrive in later increments).
+/// outlive a single frame: the object heap, the global table, and the shared
+/// register/call stack.
 pub const Vm = struct {
     gpa: std.mem.Allocator,
-    /// The object heap (strings, tables). Owns every heap value a running
-    /// program produces; freed wholesale by `deinit`.
+    /// The object heap (strings, tables, closures, …). Owns every heap value a
+    /// running program produces; freed wholesale by `deinit`.
     heap: gc.Heap,
     /// The global environment: a table keyed by interned name strings. Free
-    /// (non-local) names read and write here.
+    /// (non-local) names read and write here; the base library installs here.
     globals: *table.Table,
+    /// Shared register/call stack. Fixed-size and never reallocated (see
+    /// `stack_slots`), so frame windows stay valid across nested calls.
+    stack: []Value,
+    /// Current native-recursion depth (guarded by `max_call_depth`).
+    depth: u32 = 0,
+    /// Where the `print` host-effect writes. `null` means the process's buffered
+    /// stdout (`io.zig`); a test (or a future effect recorder) can point this at
+    /// an in-memory writer to capture output without touching the real stdout.
+    out: ?*io.Writer = null,
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
-        var heap = gc.Heap.init(gpa);
+        const heap = gc.Heap.init(gpa);
+        const stack = try gpa.alloc(Value, stack_slots);
+        errdefer gpa.free(stack);
+
+        var vm = Vm{ .gpa = gpa, .heap = heap, .globals = undefined, .stack = stack };
+        errdefer vm.heap.deinit();
         // The globals table lives on the heap like any other table.
-        const globals = try heap.newTable();
-        return .{ .gpa = gpa, .heap = heap, .globals = globals };
+        vm.globals = try vm.heap.newTable();
+        try vm.installBaseLib();
+        return vm;
     }
 
-    /// Frees the heap and every object on it (including globals). Any `Value`
-    /// returned by `run` that is a heap reference dangles after this — inspect
-    /// results first.
+    /// Frees the heap (and every object on it, including globals) and the
+    /// register stack. Any `Value` returned by `run` that is a heap reference
+    /// dangles after this — inspect results first.
     pub fn deinit(self: *Vm) void {
         self.heap.deinit();
+        self.gpa.free(self.stack);
+    }
+
+    /// Install the built-in globals (the host-effect boundary). Currently just
+    /// `print`; `tostring`, `type`, … attach here as they land.
+    fn installBaseLib(self: *Vm) Error!void {
+        try self.defineNative("print", &nativePrint);
+    }
+
+    fn defineNative(self: *Vm, name: []const u8, func: function.NativeFn) Error!void {
+        const native = try self.heap.newNative(func, name);
+        const key = try self.heap.internValue(name);
+        try self.globals.set(self.gpa, key, Value.heap(&native.header));
     }
 
     /// Execute a top-level chunk and return its first returned value (`nil` if it
     /// returns nothing or falls off the end via `halt`).
     pub fn run(self: *Vm, proto: *const Proto) Error!Value {
-        const regs = try self.gpa.alloc(Value, proto.num_registers);
-        defer self.gpa.free(regs);
-        @memset(regs, Value.nil());
-        return self.execFrame(proto, regs);
+        if (proto.num_registers > self.stack.len) return Error.StackOverflow;
+        @memset(self.stack[0..proto.num_registers], Value.nil());
+        // The main chunk runs as a closure with no upvalues. It is GC-linked and
+        // freed at `deinit`; its `proto` pointer is only dereferenced during this
+        // call, so a stack-local test `Proto` is fine.
+        const top = try self.heap.newClosure(proto, 0);
+        const fr = try self.execClosure(top, 0);
+        return if (fr.count >= 1) self.stack[fr.reg] else Value.nil();
     }
 
-    /// Run one activation: interpret `proto.code` over the register window
-    /// `regs`. Returns the frame's first returned value.
-    fn execFrame(self: *Vm, proto: *const Proto, regs: []Value) Error!Value {
+    /// Run one activation: interpret `closure.proto.code` over the register
+    /// window at `stack[base ..]`. Returns where the frame's results live.
+    fn execClosure(self: *Vm, closure: *const Closure, base: usize) Error!FrameResult {
+        if (self.depth >= max_call_depth) return Error.StackOverflow;
+        self.depth += 1;
+        defer self.depth -= 1;
+
+        const proto = closure.proto;
         const code = proto.code;
+        const regs = self.stack[base .. base + proto.num_registers];
         var pc: usize = 0;
         while (true) {
             const instr = code[pc];
@@ -179,16 +241,21 @@ pub const Vm = struct {
                     self.heap.writeBarrier(&self.globals.header, regs[a]); // no-op until Phase 4
                 },
 
-                // ---- functions (Increment D) ----
-                .closure,
-                .get_upval,
-                .set_upval,
-                .call,
-                => return Error.Unimplemented,
+                // ---- functions ----
+                .closure => {
+                    const child = proto.protos[instr.b];
+                    const cl = try self.makeClosure(closure, child, base);
+                    regs[a] = Value.heap(&cl.header);
+                },
+                .get_upval => regs[a] = closure.upvalues[instr.b].get(),
+                .set_upval => closure.upvalues[instr.b].set(regs[a]),
+                .call => try self.doCall(base, proto.num_registers, regs, instr),
 
                 // ---- returns ----
-                .ret => return if (instr.b >= 1) regs[a] else Value.nil(),
-                .halt => return Value.nil(),
+                // Results stay in this frame's window; the caller copies them out
+                // before this window is reused. `b` values from R[a..a+b].
+                .ret => return .{ .reg = @intCast(a), .count = instr.b },
+                .halt => return .{ .reg = 0, .count = 0 },
             }
         }
     }
@@ -229,7 +296,102 @@ pub const Vm = struct {
         }
         return Error.TypeError;
     }
+
+    /// Instantiate a closure for `child_proto`, capturing its upvalues from the
+    /// enclosing frame (`parent`'s upvalues, or the frame window at `base`).
+    fn makeClosure(self: *Vm, parent: *const Closure, child_proto: *const Proto, base: usize) Error!*Closure {
+        // D1: capture is not wired yet — the compiler never emits a `closure`
+        // for a proto with upvalues. D2 fills the cells from `parent`/`base`.
+        std.debug.assert(child_proto.upvalues.len == 0);
+        _ = parent;
+        _ = base;
+        return self.heap.newClosure(child_proto, 0);
+    }
+
+    /// Execute a `call` instruction. `regs`/`base` describe the *caller* frame;
+    /// the callee's window is carved immediately above it on the shared stack.
+    ///
+    /// Convention: `R[a]` is the callee, args are `R[a+1 .. a+1+b]`, and `c`
+    /// results are written back starting at `R[a]` (nil-filled if the callee
+    /// produced fewer).
+    fn doCall(self: *Vm, base: usize, caller_nreg: u16, regs: []Value, instr: Instr) Error!void {
+        const a: usize = instr.a;
+        const callee = regs[a];
+        const nargs: usize = instr.b;
+        const nwanted: usize = instr.c;
+        if (!callee.isHeap()) return Error.TypeError;
+        switch (callee.heapType()) {
+            .function => {
+                const cl = Closure.fromHeader(callee.asHeap());
+                const cp = cl.proto;
+                const callee_base = base + caller_nreg;
+                if (callee_base + cp.num_registers > self.stack.len) return Error.StackOverflow;
+                // Lay out the callee window: bind fixed params (nil-filling any
+                // not supplied), then nil the remaining registers. Extra args
+                // beyond the fixed params are dropped (vararg is Phase 3d2).
+                var i: usize = 0;
+                while (i < cp.num_registers) : (i += 1) {
+                    self.stack[callee_base + i] = if (i < cp.num_params and i < nargs)
+                        self.stack[base + a + 1 + i]
+                    else
+                        Value.nil();
+                }
+                const fr = try self.execClosure(cl, callee_base);
+                // Copy results back into the caller's window (no overlap: the
+                // callee window is strictly above the caller window).
+                var k: usize = 0;
+                while (k < nwanted) : (k += 1) {
+                    regs[a + k] = if (k < fr.count)
+                        self.stack[callee_base + fr.reg + k]
+                    else
+                        Value.nil();
+                }
+            },
+            .native => {
+                const nat = function.Native.fromHeader(callee.asHeap());
+                const args = self.stack[base + a + 1 .. base + a + 1 + nargs];
+                const result = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
+                // Natives return a single value (multi-return is Phase 3d2+).
+                var k: usize = 0;
+                while (k < nwanted) : (k += 1) {
+                    regs[a + k] = if (k == 0) result else Value.nil();
+                }
+            },
+            else => return Error.TypeError,
+        }
+    }
 };
+
+/// Narrow a native's `anyerror` back into the interpreter's error set. Known
+/// runtime errors map across; anything else is surfaced as a `HostError`.
+fn narrowError(e: anyerror) Error {
+    return switch (e) {
+        error.OutOfMemory => Error.OutOfMemory,
+        error.TypeError => Error.TypeError,
+        error.DivisionByZero => Error.DivisionByZero,
+        error.StackOverflow => Error.StackOverflow,
+        error.Unimplemented => Error.Unimplemented,
+        else => Error.HostError,
+    };
+}
+
+/// The `print` built-in — the canonical host-effect at the embedding boundary.
+/// Writes its arguments tab-separated, newline-terminated, to stdout (`io.zig`,
+/// the one churny-writer wrapper) and returns `nil`. In a later phase this is
+/// where an effect is *recorded* for deterministic replay
+/// (docs/design/02-determinism.md); for now it just performs it.
+fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    const to_stdout = vm.out == null;
+    const w = vm.out orelse io.stdout();
+    for (args, 0..) |arg, i| {
+        if (i != 0) try w.writeAll("\t");
+        try io.writeValue(w, arg);
+    }
+    try w.writeAll("\n");
+    if (to_stdout) io.flush();
+    return Value.nil();
+}
 
 /// Coerce a concat operand to bytes: a string's own bytes, or a number formatted
 /// into `buf`. Returns a slice valid until `buf` is reused.
@@ -429,6 +591,61 @@ test "indexing a non-table is a type error" {
         Instr.opAB(.ret, 0, 1),
     };
     try testing.expectError(Error.TypeError, runCode(&code, &.{}, 2));
+}
+
+test "call a closure: double(21) == 42 via the call convention" {
+    // child: double(x) -> x * 2
+    const child_code = [_]Instr{
+        Instr.opAx(.load_int, 1, 2), // R1 = 2
+        Instr.opABC(.mul, 1, 0, 1), // R1 = x * 2
+        Instr.opAB(.ret, 1, 1), // return R1
+    };
+    var child = Proto{ .code = &child_code, .num_registers = 2, .num_params = 1, .name = "double" };
+    const protos = [_]*const Proto{&child};
+    // main: f = closure(double); return f(21)
+    const main_code = [_]Instr{
+        Instr.opAB(.closure, 0, 0), // R0 = closure(double)
+        Instr.opAx(.load_int, 1, 21), // R1 = 21 (arg)
+        Instr.opABC(.call, 0, 1, 1), // call R0 with 1 arg, want 1 result → R0
+        Instr.opAB(.ret, 0, 1),
+    };
+    const main = Proto{ .code = &main_code, .num_registers = 2, .protos = &protos, .name = "main" };
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    try testing.expectEqual(@as(i64, 42), (try vm.run(&main)).asInt());
+}
+
+test "calling a non-function is a type error" {
+    const code = [_]Instr{
+        Instr.opAx(.load_int, 0, 5),
+        Instr.opABC(.call, 0, 0, 1),
+        Instr.opAB(.ret, 0, 1),
+    };
+    try testing.expectError(Error.TypeError, runCode(&code, &.{}, 2));
+}
+
+test "print is installed as a native global; output goes through the sink" {
+    // Exercises the host-effect seam end to end, capturing output in a buffer
+    // (never the real stdout — the test runner owns fd 1).
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+
+    const consts = [_]Value{
+        try vm.heap.internValue("print"),
+        try vm.heap.internValue("ok"),
+    };
+    const code = [_]Instr{
+        Instr.opAB(.get_global, 0, 0), // R0 = print
+        Instr.opAB(.load_const, 1, 1), // R1 = "ok"
+        Instr.opABC(.call, 0, 1, 1), // print("ok") → R0  (R0=fn, 1 arg in R1)
+        Instr.opAB(.ret, 0, 1),
+    };
+    const proto = Proto{ .code = &code, .constants = &consts, .num_registers = 2, .name = "t" };
+    try testing.expect((try vm.run(&proto)).isNil());
+    try testing.expectEqualStrings("ok\n", sink.buffered());
 }
 
 test "concat joins strings and coerces numbers; result is interned" {

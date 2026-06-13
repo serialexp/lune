@@ -23,10 +23,16 @@ const object = @import("object.zig");
 const string = @import("string.zig");
 const table = @import("table.zig");
 const value = @import("value.zig");
+const function = @import("function.zig");
+const bytecode = @import("bytecode.zig");
 const GcHeader = object.GcHeader;
 const String = string.String;
 const Table = table.Table;
 const Value = value.Value;
+const Closure = function.Closure;
+const Native = function.Native;
+const Upvalue = function.Upvalue;
+const Proto = bytecode.Proto;
 
 pub const Heap = struct {
     gpa: std.mem.Allocator,
@@ -86,6 +92,29 @@ pub const Heap = struct {
         return Value.heap(&s.header);
     }
 
+    /// Allocate a closure over `proto` with `n_upvalues` (uninitialised) cells,
+    /// and register it with the heap. The caller fills `closure.upvalues[i]`.
+    pub fn newClosure(self: *Heap, proto: *const Proto, n_upvalues: usize) std.mem.Allocator.Error!*Closure {
+        const cl = try Closure.create(self.gpa, proto, n_upvalues);
+        self.link(&cl.header);
+        return cl;
+    }
+
+    /// Allocate a native function object and register it with the heap.
+    pub fn newNative(self: *Heap, func: function.NativeFn, name: []const u8) std.mem.Allocator.Error!*Native {
+        const n = try Native.create(self.gpa, func, name);
+        self.link(&n.header);
+        return n;
+    }
+
+    /// Allocate an *open* upvalue pointing at `slot`, and register it with the
+    /// heap. Closing/repointing is the interpreter's job.
+    pub fn newUpvalue(self: *Heap, slot: *Value) std.mem.Allocator.Error!*Upvalue {
+        const u = try Upvalue.create(self.gpa, slot);
+        self.link(&u.header);
+        return u;
+    }
+
     /// Write barrier — invoked whenever a heap `Value` is stored into a heap
     /// `container`. A deliberate **no-op** in Phase 3; Phase 4's generational /
     /// incremental collector fills in the body (remember-set insert, card mark,
@@ -103,8 +132,11 @@ fn destroyObject(gpa: std.mem.Allocator, h: *GcHeader) void {
     switch (h.type) {
         .string => String.fromHeader(h).destroy(gpa),
         .table => Table.fromHeader(h).destroy(gpa),
-        // typed_array (Phase 9b), function (Increment D), host (embedding) are
-        // not heap-allocated here yet.
+        .function => Closure.fromHeader(h).destroy(gpa),
+        .native => Native.fromHeader(h).destroy(gpa),
+        .upvalue => Upvalue.fromHeader(h).destroy(gpa),
+        // typed_array (Phase 9b) and host (embedding) are not heap-allocated
+        // here yet.
         else => @panic("gc: unknown object type during sweep"),
     }
 }
