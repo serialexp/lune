@@ -523,11 +523,20 @@ pub const TraceState = struct {
         return ref;
     }
 
-    /// Intern a constant into the trace's pool and emit a `konst` for it.
+    /// Intern a constant into the trace's pool and emit a `konst` for it. A
+    /// value seen before reuses its existing `konst` ref (and pool slot) — a
+    /// `konst` is pure and operand-free, so sharing its ref is sound. This is
+    /// what lets identical subexpressions (e.g. the two `i + 7` in
+    /// `(i + 7) * (i + 7)`) end up with identical operand refs, so the
+    /// optimizer's CSE can collapse them (see docs / TODO.md).
     fn konst(self: *TraceState, v: Value) !Ref {
+        const key = konstKey(v);
+        if (self.rec.konst_map.get(key)) |existing| return existing;
         const idx: i32 = @intCast(self.rec.consts.items.len);
         try self.rec.consts.append(self.gpa, v);
-        return self.emit(.{ .op = .konst, .aux = idx, .ty = obsTypeOf(v) });
+        const ref = try self.emit(.{ .op = .konst, .aux = idx, .ty = obsTypeOf(v) });
+        try self.rec.konst_map.put(self.gpa, key, ref);
+        return ref;
     }
 
     /// The SSA ref currently held by tier-0 register `slot`. The first read of a
@@ -714,6 +723,28 @@ const SlotState = enum { undef, input, def };
 /// The SSA ref currently held by a tier-0 register, with how it got there.
 const RegSlot = struct { ref: Ref = 0, state: SlotState = .undef };
 
+/// Key for interning constants in the recorder's const pool. Built from the tag
+/// plus the meaningful payload bits — NOT the raw 16-byte `Value`, which has
+/// uninitialised padding between `tag` and `payload`. Immediates compare by
+/// value; a `heap_ref` const (always a string literal) compares by object
+/// identity, which is conservative and sufficient: the same pooled literal is the
+/// same heap object, and consts are GC roots for the recording's lifetime, so no
+/// address is reused mid-recording.
+const KonstKey = struct { tag: u8, bits: u64 };
+
+fn konstKey(v: Value) KonstKey {
+    return .{
+        .tag = @intFromEnum(v.tag),
+        .bits = switch (v.tag) {
+            .nil => 0,
+            .boolean => @as(u64, @intFromBool(v.asBool())),
+            .int => @bitCast(v.asInt()),
+            .float => @bitCast(v.asFloat()),
+            .heap_ref => @intFromPtr(v.asHeap()),
+        },
+    };
+}
+
 /// The in-progress recording buffer. `TraceState` owns it and drives every
 /// mutation through its own methods (`emit`/`refOf`/`recordInstr`/…); this struct
 /// is just storage + cleanup. While `active` is false the interpreter never calls
@@ -727,6 +758,11 @@ pub const Recorder = struct {
     entry_slots: std.ArrayListUnmanaged(u16) = .empty,
     /// Refs already covered by a type guard, so we emit each at most once.
     guarded_refs: std.AutoHashMapUnmanaged(Ref, void) = .empty,
+    /// Interns constants: a recurring literal reuses its `konst` instruction's
+    /// ref (and pool slot) instead of emitting a fresh one, so identical
+    /// subexpressions get identical operand refs and the optimizer's CSE can
+    /// merge them. See `TraceState.konst`.
+    konst_map: std.AutoHashMapUnmanaged(KonstKey, Ref) = .empty,
     /// Current SSA ref + state for each tier-0 register, sized to the recording
     /// frame's `num_registers`.
     reg_map: []RegSlot = &.{},
@@ -736,6 +772,7 @@ pub const Recorder = struct {
         self.consts.deinit(gpa);
         self.entry_slots.deinit(gpa);
         self.guarded_refs.deinit(gpa);
+        self.konst_map.deinit(gpa);
         if (self.reg_map.len != 0) gpa.free(self.reg_map);
     }
 
@@ -747,6 +784,7 @@ pub const Recorder = struct {
         self.consts.clearRetainingCapacity();
         self.entry_slots.clearRetainingCapacity();
         self.guarded_refs.clearRetainingCapacity();
+        self.konst_map.clearRetainingCapacity();
         if (self.reg_map.len != num_registers) {
             if (self.reg_map.len != 0) gpa.free(self.reg_map);
             self.reg_map = try gpa.alloc(RegSlot, num_registers);

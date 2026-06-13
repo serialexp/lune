@@ -195,8 +195,11 @@ _(nothing yet — design only)_
       no-executor-change line):** type **narrowing/unboxing** (typed `add_i64`… +
       unboxed scratch + load-bearing guards — the big arithmetic win, payoff in
       Phase 8) and **LICM** (a once-only trace preheader in the executor); plus
-      algebraic identities, const-pool pruning, and record-time **konst interning**
-      (would let CSE fire on real traces — see TODO.md).
+      algebraic identities and const-pool pruning. **Landed since:** record-time
+      **konst interning** (the recorder dedups constants, so identical
+      subexpressions share operand refs and CSE now fires on real traces — e.g.
+      the two `i+7` in `(i+7)*(i+7)` collapse to one `add`; see `src/trace.zig`
+      `konst`, tests in `src/interp.zig`).
 - [ ] **Phase 7 — Time-travel debugger / trace visualizer.** SolidJS app that
       reads the trace file via the generated TS decoder. Starts with bounded
       recordings, not "complete history" by default. **Milestone: the feature

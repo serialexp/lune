@@ -1140,6 +1140,73 @@ test "recorder: a while loop records a truthiness guard on its condition" {
     try testing.expect(std.mem.indexOf(u8, text, "loop") != null);
 }
 
+test "recorder: a recurring literal is interned to one const-pool entry" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `i * 7` appears twice; before konst interning that recorded two separate
+    // `7` constants. runForTrace keeps the optimizer OFF, so the const pool here
+    // reflects pure recording — the literal must appear exactly once.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local acc = 0
+        \\for i = 1, 50 do acc = acc + i * 7 + i * 7 end
+        \\print(acc)
+    , true);
+    defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    const t = vm.trace.cache.items[0];
+    var sevens: usize = 0;
+    for (t.consts) |c| {
+        if (c.isInt() and c.asInt() == 7) sevens += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), sevens);
+}
+
+test "konst interning lets CSE collapse a repeated subexpression end-to-end" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+
+    const source =
+        \\local acc = 0
+        \\for i = 1, 50 do acc = acc + i * 7 + i * 7 end
+        \\print(acc)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    // Record AND run the optimizer at commit (execute stays on tier-0 — we only
+    // inspect the committed, optimized trace, not tier-1a output).
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = false;
+    vm.trace.config.optimize = true;
+    vm.trace.config.hotloop = 4;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    const t = vm.trace.cache.items[0];
+    // The two `i * 7` subexpressions are now identical (same slot_load ref + same
+    // interned konst ref), so CSE collapses them to a single `mul`. Before konst
+    // interning, CSE could not fire here and both muls survived.
+    var muls: usize = 0;
+    for (t.instrs) |ins| {
+        if (ins.op == .mul) muls += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), muls);
+}
+
 test "recorder: a call in the loop body aborts cleanly and blacklists the anchor" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);

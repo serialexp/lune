@@ -2,19 +2,22 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
-## Recorder: intern duplicate konsts / subexpressions at record time
+## ~~Recorder: intern duplicate konsts at record time~~ — DONE
 
-The trace recorder emits a **separate** `konst` instruction for every literal it
-sees, even when the same constant recurs in the loop body. Example: `acc +
-(i + 7) * (i + 7)` records `k0 = 7` and `k1 = 7` as distinct instrs, so the two
-`i + 7` adds have different operand refs `(slot, k0)` vs `(slot, k1)` — and the
-optimizer's CSE (operand-ref-sensitive) cannot merge them. CSE therefore rarely
-fires on real traces today (the `tropt` CSE pass is correct and unit-tested; it
-just isn't reached). Const-guard elimination *does* fire on those duplicate-konst
-guards, so the loops still shrink.
+**Resolved.** The recorder now interns constants: `TraceState.konst` keys a
+`AutoHashMap(KonstKey → Ref)` on the value's tag + payload bits and reuses an
+existing `konst` instruction's ref (and pool slot) for a recurring literal
+(`src/trace.zig`). Slot reads were already cached by `refOf`, so with konsts
+deduped, identical subexpressions get identical operand refs and the optimizer's
+CSE collapses them. Verified end-to-end: for `acc + (i + 7) * (i + 7)`, the two
+`i + 7` adds merge to a single ref and the multiply becomes `mul %4 %4` (see the
+`--dump-traces` opt-vs-no-opt contrast and the tests in `src/interp.zig`:
+"recorder: a recurring literal is interned…" and "konst interning lets CSE
+collapse a repeated subexpression end-to-end").
 
-**Fix:** dedup constants in the recorder's const pool (a small
-`AutoHashMap(value-bits → ref)`), and optionally hash-cons pure subexpressions as
-they're recorded. Then identical subexpressions share refs and CSE collapses
-them. Out of scope for Phase 6b (optimizer-only); revisit when touching the
-recorder. — noted during Phase 6b Increment C.
+### Optional follow-on (not needed for the common case)
+General hash-consing of *arbitrary* pure subexpressions at record time (beyond
+konsts + the existing slot-read cache) would let CSE merge structurally-identical
+expressions that don't share operand refs by construction. Low priority — konst
+interning + slot caching already cover the common recurring-subexpression
+patterns. Revisit only if a real trace shows un-merged duplicates.
