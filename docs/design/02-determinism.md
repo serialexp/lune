@@ -44,8 +44,15 @@ that for a time-travel debugger it *is* the architecture.
 - [ ] **Floating-point determinism.** Pin FP mode; define NaN payload
       canonicalisation, signed zero, and a fixed math-library policy across
       platforms.
-- [ ] **GC observability.** No finalizers / weak refs / ephemerons in v1, *or*
-      GC scheduled at recorded safepoints so timing is reproducible. Decide.
+- [x] **GC observability.** ✅ Decided + implemented (Phase 4). The v1 collector
+      (stop-the-world mark-sweep, `03-gc-memory.md`) has **no finalizers, weak
+      refs, or ephemerons** — nothing a program can observe to react to collection
+      — and runs only at fixed safepoints (the interpreter's dispatch-loop top).
+      So *when* a collection happens cannot change a program's result; it is
+      invisible. The Phase 3 programs run identically with the collector forced at
+      every safepoint (`gc_stress`), which is the evidence. (If a generational
+      upgrade later adds GC timing that a trace could observe, it must be scheduled
+      deterministically and recorded.)
 - [ ] **Time / randomness / environment** routed through the effect boundary
       (no raw access).
 - [ ] **Host-mediated suspension hook.** Reserve "a host effect may suspend its

@@ -25,12 +25,28 @@ ownership, write barriers, and trace rooting.
       object map, so equal strings are one object and key/equality become pointer
       compares — also the canonicalisation a deterministic table-iteration order
       will rely on).
+- [x] **Collector v1 — stop-the-world tri-colour mark-sweep** (Phase 4,
+      `src/gc.zig` + `src/interp.zig`). Non-moving (stable addresses), no
+      compaction / finalizers / weak refs / concurrency. Split by ownership: the
+      **heap** owns the mechanism — a gray worklist, `markValue`/`markHeader`,
+      `traceAll` (blacken + grey children, type-dispatched), and `sweep` (free
+      white-and-unpinned, de-intern freed strings, reset survivors to white). The
+      worklist is **pre-sized** to the live count before marking, so marking
+      itself never allocates; a reserve-OOM just skips the cycle with nothing
+      coloured. The **VM** owns the **root set** and runs collection at exactly
+      one **safepoint — the top of the dispatch loop** — where every register is
+      settled and no half-built object is exposed. Roots: `globals`; live
+      registers `stack[0..stack_top]` (a per-frame high-water); the **active-frame
+      closures** (host-stack-only, so tracked in `frame_closures[depth]` — this is
+      what keeps a frame's `proto.constants` alive); and open upvalue cells.
+      Blackening a closure walks `proto.constants` recursively through
+      `proto.protos`, so a string constant survives even before its function is
+      instantiated. **Interned strings are collectible** (swept → de-interned).
+      Trigger: live × 2, floored at an initial threshold, with a `gc_stress` knob
+      that collects at every safepoint (the torture test). Generational/incremental
+      upgrade is future work (the barrier seams below are already in place).
 
 ### Outstanding
-
-- [ ] **Collector choice (v1).** A deliberately boring **non-moving** collector
-      (stable object addresses) — e.g. non-moving mark-sweep. Decide the exact
-      algorithm and the generational-upgrade path.
 - [x] **Object header.** ✅ Shape settled in Phase 1 (`src/object.zig`):
       16-byte `GcHeader` = `ObjectType` + `GcColor` (white/gray/black, ready for
       mark-sweep) + `GcFlags` (pinned/remembered) + intrusive `next` for the
@@ -38,20 +54,24 @@ ownership, write barriers, and trace rooting.
       `Value.heap_ref` is a `*GcHeader`. The shape/hidden-class pointer lives in
       the table object, *not* this universal header (no string bloat).
       Collector *behaviour* (the bullets around this one) is still outstanding.
-- [ ] **Moving vs non-moving commitment.** Non-moving means traces may hold raw
-      object pointers. If moving/compaction is ever wanted, design
-      handles / relocation-safe refs from day one. (Default: non-moving v1.)
-- [~] **Write barriers from Phase 3.** The mutating stores all exist and are
-      centralised: `set_index` (table store), `set_global`, and `set_upval` each
-      go through one code path in the tier-0 interpreter (`src/interp.zig`) /
-      `table.set` (`src/table.zig`) — so the barrier has exactly one attach point
-      per store kind rather than scattered call sites. The barrier *body* is still
-      a deliberate no-op: there is no generational collector yet to remember
-      old→young edges, so emitting a stub now would be untested dead code. Phase 4
-      adds the real barrier at these existing seams (and the IR/native executors,
-      Phases 6/8, must mirror it); barriers must also be *recorded into traces*.
-- [ ] **GC root maps** for every executor: interpreter, recorder, IR-interpreter,
-      native codegen. Snapshot metadata must coordinate with liveness.
+- [x] **Moving vs non-moving commitment.** ✅ Committed to **non-moving** for v1
+      (the mark-sweep above never relocates), so traces and the host/GPU lease
+      path may hold raw object pointers. If compaction is ever wanted, it must
+      introduce handles / relocation-safe refs at that point.
+- [~] **Write barriers.** All three mutating stores have a single centralised
+      call site each — `set_index` (table store), `set_global`, and `set_upval`
+      in the tier-0 interpreter (`src/interp.zig`) — so every "store a heap value
+      into a heap object" point calls `Heap.writeBarrier`. The body is a
+      **deliberate no-op, and correct as such**: a stop-the-world mark-sweep sees
+      the final heap at mark time and needs no barrier. The seams exist so the
+      *generational/incremental* upgrade is a body to fill in (remember-set /
+      card mark / grey-stack push); the IR and native executors (Phases 6/8) must
+      mirror the call sites, and barriers must then be *recorded into traces*.
+- [~] **GC root maps.** The tier-0 interpreter's root map is implemented (the
+      `Vm.collect` root set: globals, `stack[0..stack_top]`, active-frame
+      closures, open upvalues). Still outstanding for the later executors —
+      recorder, IR-interpreter, native codegen — where snapshot metadata must
+      coordinate with liveness.
 - [ ] **Safepoints in long-running traces** so a hot loop can't block collection.
 - [ ] **Trace-constant rooting + invalidation.** Traces embed object refs
       (constants, shape pointers) → GC roots; collecting a referenced prototype
@@ -67,9 +87,11 @@ ownership, write barriers, and trace rooting.
       `external_owned_with_finalizer`, `pinned_export`). Still outstanding: the
       **lease** mechanism itself (lifetime + mutability rules; never a raw
       interior pointer) — implemented with the typed-array container in Phase 9b.
-- [ ] **Allocation under tier-0.** A bump allocator alone makes "tier-0 always
-      correct" false under memory pressure — need at least the non-moving
-      collector by Phase 3/4.
+- [x] **Allocation under tier-0.** ✅ Resolved by the Phase 4 collector above:
+      tier-0 allocates through `gc.Heap` and reclaims at the dispatch-loop
+      safepoint, so a long-running tier-0 program stays bounded (a 1,000,000-
+      iteration allocating loop runs in ~6 MB). "Tier-0 is always correct" now
+      holds under memory pressure.
 
 ## Why this exists
 

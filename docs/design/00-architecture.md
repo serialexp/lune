@@ -80,10 +80,23 @@ _(nothing yet — design only)_
       CLI (`src/main.zig`) runs a `.lua` file or `-e` chunk through
       parse→compile→run. **Milestone met: runs real programs.** 128 tests pass,
       including end-to-end source→output integration tests.
-- [ ] **Phase 4 — Garbage collector.** A deliberately boring **non-moving**
-      collector first (stable object addresses), heap laid out for a later
-      generational upgrade; typed-array payloads off-heap / pinnable.
-      See `03-gc-memory.md`.
+- [x] **Phase 4 — Garbage collector.** Done.
+      A deliberately boring **stop-the-world, non-moving, tri-colour mark-sweep**
+      (`src/gc.zig` + `src/interp.zig`): stable object addresses (later trace
+      tiers may hold raw pointers), no compaction, no finalizers/weak refs, no
+      concurrency. The heap owns the mechanism — gray worklist, `markValue`/
+      `traceAll`/`sweep`, pre-sized so marking can't allocate; the VM owns the
+      **root set** (globals, live registers via a `stack_top` high-water, the
+      active-frame closures, open upvalue cells) and runs collection at a single
+      **safepoint at the top of the dispatch loop**, where no half-built object is
+      exposed. Blackening a closure walks its `proto.constants` recursively
+      through `proto.protos`, so every string constant stays alive even before its
+      function is instantiated. **Interned strings are collectible** (a swept
+      string is de-interned). Trigger is live×2 (floored), with a `gc_stress`
+      knob. The write barrier stays a no-op (correct for stop-the-world; the seams
+      remain for a generational upgrade). Verified by running the Phase 3 programs
+      under GC-at-every-safepoint and a 1,000,000-iteration allocating loop in
+      bounded (~6 MB) memory. 135 tests pass. See `03-gc-memory.md`.
 - [ ] **Phase 5 — Hot-path detection + trace recorder.** Per
       `01-trace-lifecycle.md` and the deterministic-replay model (§Observability).
       The load-bearing subsystem; includes snapshots and deopt/side-exit restore.
