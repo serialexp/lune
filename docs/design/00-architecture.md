@@ -124,10 +124,31 @@ _(nothing yet — design only)_
       hand-write the Zig writer; validate the two against each other with
       binschema's cross-language fixtures. See §Trace serialization and
       `04-snapshot-replay-schema.md`.
-- [ ] **Phase 6 — Trace IR + optimizer + IR-interpreter (tier 1a).** Optimize
-      recorded traces and *interpret the IR* — no native code yet. IR carries
-      deopt + GC + future-lowering constraints even without codegen.
-      **Milestone: traced execution end-to-end, fully correct, zero codegen.**
+- [~] **Phase 6 — IR-interpreter (tier 1a) + deopt.** **Done (Phase 6a):** the
+      tier-1a executor (`src/irinterp.zig` + the back-edge seam in `src/interp.zig`)
+      *runs* recorded traces — no native code. `execute` walks the linear SSA IR
+      into a private, reused `values[]` scratch, calling the **same `arith.zig`**
+      tier-0 does (byte-identical results), and writes the tier-0 register file
+      **only** at a clean `loop` close (applying `exit_stores`). **Deopt is
+      loop-header re-entry:** because `regs` is coherent for the loop header at
+      every iteration boundary, any guard failure / arithmetic error mid-iteration
+      just *side-exits* (returns with `regs` untouched) and tier-0 re-runs the
+      partial iteration from `anchor.pc` — **no per-guard snapshot needed**, sound
+      because a committed trace has no side effects (host calls / tables / globals
+      abort recording). A **re-entry brake** (`onSideExit`: per-anchor `penalty`,
+      `min_useful`/`max_penalty`) blacklists type-unstable / branchy loops that
+      thrash. **Execution is transparent**: the `expectProgram` matrix now runs
+      every e2e program under {gc_stress} × {off, record-only, **record+execute**}
+      and asserts byte-identical output; a debug-only commit-time structural
+      verifier (`assertWellFormed`) guards the executor's IR invariants. `--trace`
+      now records **and** executes; `--trace-record-only` is Phase 5a behaviour.
+      **Milestone met: traced execution end-to-end, fully correct, zero codegen.**
+      **Deferred → Phase 6b / later:** the trace **optimizer** (constant-fold /
+      DCE / narrowing, each with its deopt-reconstruction rule); full **per-guard
+      snapshots** + general side-exit restore (needed only once we mutate `regs`
+      mid-trace or trace across calls); **side traces & linking** (the real fix for
+      branchy hot loops, vs. the blacklist brake); penalty **backoff** & counter
+      decay; cache **invalidation**.
 - [ ] **Phase 7 — Time-travel debugger / trace visualizer.** SolidJS app that
       reads the trace file via the generated TS decoder. Starts with bounded
       recordings, not "complete history" by default. **Milestone: the feature

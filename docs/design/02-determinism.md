@@ -28,15 +28,22 @@ that for a time-travel debugger it *is* the architecture.
 - [x] **Transparent trace recording** (Phase 5a, `src/trace.zig`). The recorder
       observes tier-0 — it reads pre-execution operands and emits trace IR — but
       tier-0 still executes every instruction, so recording **cannot change a
-      program's result**: it is invisible the same way GC is. This is the
-      "run with or without for comparison" property, and it is what makes the
-      recorder safe to ship ahead of any IR execution. The evidence is the
-      `expectProgram` matrix in `src/interp.zig`: every end-to-end program runs in
-      all four {`gc_stress` off/on} × {recorder off/on} combinations and must print
-      **byte-identical** output. A host (`native`) call is already treated as a
-      **trace barrier** (the recorder aborts with `host_barrier`), matching the
-      effect-boundary policy above — when host-effect recording lands, that abort
-      becomes the point an effect record is emitted.
+      program's result**: it is invisible the same way GC is. A host (`native`)
+      call is already treated as a **trace barrier** (the recorder aborts with
+      `host_barrier`), matching the effect-boundary policy above — when host-effect
+      recording lands, that abort becomes the point an effect record is emitted.
+- [x] **Transparent trace *execution*** (Phase 6a, `src/irinterp.zig`). The
+      tier-1a IR-interpreter now *runs* hot traces, but it remains output-invariant:
+      it calls the **same `arith.zig`** as tier-0 (byte-identical numerics) and
+      deopts to tier-0 on any guard miss, re-running the partial iteration (sound
+      because committed traces have no side effects). So a program prints the same
+      bytes whether a loop runs in tier-0 or tier-1a — the same "run with or without
+      for comparison" property, now extended past recording to execution. The
+      evidence is the **extended** `expectProgram` matrix in `src/interp.zig`: every
+      end-to-end program runs in all six {`gc_stress` off/on} × {off, record-only,
+      **record+execute**} combinations and must print **byte-identical** output. An
+      executor divergence (wrong arith, missed guard, bad deopt, exit-store error)
+      surfaces as a mismatch there.
 
 ### Outstanding
 

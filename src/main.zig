@@ -11,10 +11,14 @@
 //! errors go to stderr. Exit code is 0 on success, 1 on an I/O / syntax /
 //! compile / runtime error, 2 on a usage error.
 //!
-//! The tracing-JIT recorder (Phase 5) is opt-in via `--trace` / `--dump-traces`,
-//! default off — without a flag the driver is byte-for-byte its pre-Phase-5 self.
-//! Recording is transparent (tier-0 executes everything regardless), so the flags
-//! only add trace *observation*, never change a program's output.
+//! The tracing JIT (Phases 5–6) is opt-in via `--trace` / `--trace-record-only`
+//! / `--dump-traces`, default off — without a flag the driver is byte-for-byte
+//! its pre-Phase-5 self. `--trace` records hot loops *and* runs them through the
+//! tier-1a IR-interpreter (Phase 6); `--trace-record-only` records but lets tier-0
+//! execute everything (Phase 5a, for inspecting IR in isolation). Both are
+//! output-transparent: an executed trace produces byte-identical output to tier-0
+//! (it deopts to tier-0 on any guard failure), so the flags never change a
+//! program's output — only whether, and how, hot loops are traced.
 
 const std = @import("std");
 const lune = @import("lune");
@@ -29,17 +33,22 @@ const usage =
     \\  lune [options] -e <chunk>     run a chunk given inline
     \\
     \\options:
-    \\  --trace         enable the tracing-JIT recorder: detect hot loops and
-    \\                  record them to trace IR. Tier-0 still executes everything,
-    \\                  so program output is unchanged.
-    \\  --dump-traces   imply --trace and print every recorded trace's IR to stderr
-    \\                  after the run.
-    \\  -h, --help      show this help
+    \\  --trace              enable the tracing JIT: detect hot loops, record them
+    \\                       to trace IR, and execute them in the tier-1a
+    \\                       IR-interpreter (deopting to tier-0 on a guard miss).
+    \\                       Output is identical to a plain run.
+    \\  --trace-record-only  record hot loops but let tier-0 execute everything
+    \\                       (Phase 5a) — for inspecting trace IR in isolation.
+    \\  --dump-traces        imply --trace and print every recorded trace's IR to
+    \\                       stderr after the run.
+    \\  -h, --help           show this help
     \\
 ;
 
-/// Recorder options parsed from the command line (default: off).
-const TraceOpts = struct { enabled: bool = false, dump: bool = false };
+/// Tracing-JIT options parsed from the command line (default: off). When
+/// `enabled`, `execute` decides tier-1a participation: true ⇒ run cached traces
+/// (`--trace`), false ⇒ record only, tier-0 executes (`--trace-record-only`).
+const TraceOpts = struct { enabled: bool = false, execute: bool = true, dump: bool = false };
 
 pub fn main(init: std.process.Init) u8 {
     const gpa = init.gpa;
@@ -57,6 +66,9 @@ pub fn main(init: std.process.Init) u8 {
             return 0;
         } else if (std.mem.eql(u8, arg, "--trace")) {
             topts.enabled = true;
+        } else if (std.mem.eql(u8, arg, "--trace-record-only")) {
+            topts.enabled = true;
+            topts.execute = false;
         } else if (std.mem.eql(u8, arg, "--dump-traces")) {
             topts.enabled = true;
             topts.dump = true;
@@ -110,9 +122,11 @@ fn runSource(gpa: std.mem.Allocator, name: []const u8, source: [:0]const u8, top
         return 1;
     };
     defer vm.deinit();
-    // Opt into the recorder before running. Off by default ⇒ identical to the
-    // pre-Phase-5 path; on ⇒ hot loops are recorded but tier-0 still executes.
+    // Opt into the tracing JIT before running. Off by default ⇒ identical to the
+    // pre-Phase-5 path; `--trace` ⇒ record *and* execute hot loops via tier-1a;
+    // `--trace-record-only` ⇒ record but tier-0 executes everything.
     vm.trace.config.enabled = topts.enabled;
+    vm.trace.config.execute = topts.execute;
 
     // --- compile ---
     var chunk = lune.compiler.compile(gpa, &vm.heap, source, tree.root, &diags) catch |err| {

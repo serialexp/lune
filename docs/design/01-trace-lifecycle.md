@@ -1,6 +1,7 @@
 # lune — Trace Lifecycle
 
-Status: Phase 5a (recorder) implemented; execution/deopt policy still design-only
+Status: Phase 5a (recorder) + Phase 6a (IR-interpreter + loop-header deopt)
+implemented; full per-guard snapshots / side-exit restore still design-only
 Owner: Bart
 Last updated: 2026-06-13
 
@@ -24,7 +25,8 @@ architecture." This doc is where that policy lives.
       the only anchor in 5a. _Hot side exits → side traces are outstanding._
 - [x] **Trace lifecycle state machine (recording slice).** `interpreting →
       recording → (loop-back) committed→cached | aborted→blacklisted`. The
-      `executing_ir → side_exit → linked` half is Phase 6 (no IR execution yet).
+      `executing_ir → side_exit` half is now Phase 6a (below); `linked` (side
+      traces) is still outstanding.
 - [x] **Recording termination (clean).** Loop-back to the anchor closes the
       trace: append `loop`, snapshot the loop-carried register→ref writes
       (`exit_stores`), dupe into an owned `Trace`, append to the cache. _Linking
@@ -39,9 +41,47 @@ architecture." This doc is where that policy lives.
       pre-execution operands and emits IR, but tier-0 still executes every
       instruction. Enforced by the `expectProgram` matrix ({gc_stress} ×
       {recorder}, identical output) and noted in `02-determinism.md`.
-- [x] **CLI opt-in.** `--trace` enables the recorder; `--dump-traces` also prints
-      each cached trace's IR (disassembler) to stderr. Default off ⇒ identical to
-      the pre-Phase-5 driver.
+- [x] **CLI opt-in.** `--trace` now records **and** executes hot loops (Phase 6a);
+      `--trace-record-only` records but lets tier-0 execute (Phase 5a, IR
+      inspection); `--dump-traces` also prints each cached trace's IR
+      (disassembler) to stderr. Default off ⇒ identical to the pre-Phase-5 driver.
+
+### Done (Phase 6a — the IR-interpreter + loop-header deopt, `src/irinterp.zig`)
+
+- [x] **Executing IR (tier-1a).** `execute(t, regs, values)` walks a cached
+      trace's linear SSA body, computing into a private, **reused** `values[]`
+      scratch (grown to the high-water trace length on `TraceState`, never
+      per-iteration), calling the **same `arith.zig`** functions tier-0 uses — that
+      shared implementation *is* the byte-identical guarantee. Entered at the
+      back-edge seam in `src/interp.zig` immediately after `onBackEdge`, so a trace
+      is only ever run at exactly `anchor.pc`.
+- [x] **Loop-header re-entry deopt.** `execute` writes the tier-0 register file
+      **only** at a clean `loop` close (applying `exit_stores`). So `regs` is a
+      coherent loop-header state at every iteration boundary, and any guard failure
+      / arithmetic error mid-iteration simply *side-exits* — returns with `regs`
+      untouched since the iteration start — and tier-0 re-runs that one partial
+      iteration from `anchor.pc`. **No per-guard snapshot is consulted.** Sound
+      because a committed trace has **no side effects** (host calls / tables /
+      globals / cross-frame all abort recording), so re-executing the partial
+      iteration recomputes only pure register values — never a doubled effect.
+      Integer `//`/`%`-by-zero is the only mid-trace error possible (i64 ops wrap,
+      never trap); it side-exits and tier-0 re-raises the identical `DivisionByZero`.
+- [x] **No GC safepoint inside `execute`.** A committed trace allocates nothing, so
+      no collection is ever needed mid-trace — which is what makes the unrooted
+      `values[]` scratch safe: any live heap value in it is also reachable via
+      `regs` or the GC-rooted const pool, and a stale ref after a side-exit is never
+      dereferenced (linear SSA: recomputed before use on the next entry).
+- [x] **Re-entry brake.** `onSideExit(t, completed)` keeps a per-anchor `penalty`:
+      an entry yielding `>= min_useful` iterations clears it; a low-yield one bumps
+      it; at `max_penalty` the anchor is **blacklisted** so tier-0 owns the loop.
+      Bounds both *zero-yield* (types no longer match) and *low-yield* (branchy,
+      e.g. `if i%2==0`) thrash — the real fix (side traces) is deferred.
+- [x] **Execution transparency.** The `expectProgram` matrix runs every e2e
+      program under {gc_stress} × {off, record-only, **record+execute**}, all
+      byte-identical — a wrong arith mapping, missed guard, bad deopt, or exit-store
+      mistake diverges here. A debug-only commit-time structural verifier
+      (`assertWellFormed`) checks the IR invariants `execute` relies on (terminal
+      `loop`, operand refs < index, exit refs < `loop`, in-bounds `aux`).
 
 ### Outstanding
 
@@ -68,11 +108,14 @@ architecture." This doc is where that policy lives.
       outstanding (see §Snapshots & deopt) — the single hardest piece: frames, PC,
       upvalues, heap object *identities*, sunk allocations, pending stores,
       error/unwind state, iterator state, GC roots.
-- [ ] **Deopt / side-exit restore.** Map IR refs → bytecode frame slots;
-      **rematerialise sunk allocations**; hand control back to tier-0. Required
-      for tier-1a too — the IR-interpreter does not let us skip this. _Phase 6:
-      there is no IR execution yet to deopt from, so 5a records the slot maps but
-      builds no restore._
+- [~] **Deopt / side-exit restore.** _Phase 6a ships the **loop-header re-entry**
+      deopt (above): because tier-1a never mutates `regs` mid-iteration, a
+      side-exit needs no restore at all — tier-0 just re-runs the partial iteration
+      from `anchor.pc`._ The **general** restore — mapping IR refs → frame slots at
+      an *arbitrary* guard, **rematerialising sunk allocations**, restoring PC /
+      upvalues / iterator state — is still outstanding, and is only *needed* once an
+      optimization (6b) sinks state or we mutate `regs` mid-trace / trace across
+      calls. Until then the minimal `entry_slots`/`exit_stores` maps suffice.
 - [ ] **Standing design rule.** Every optimization that removes/reorders state
       ships its deopt reconstruction rule *before* it lands (DCE, CSE,
       allocation-sinking, numeric narrowing, bounds-check elimination,
