@@ -20,10 +20,22 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
     checkZigVersion(enforce_zig_version);
 
+    // The vendored binschema runtime (src/gen/binschema/). The generated trace
+    // serializer (src/gen/trace_schema.zig) imports this as the "binschema"
+    // module; the lune module re-exports the import so any src/ file can reach
+    // it. Regenerate both with tools/regen-trace-schema.sh — never hand-edit.
+    const binschema_mod = b.createModule(.{
+        .root_source_file = b.path("src/gen/binschema/binschema.zig"),
+        .target = target,
+    });
+
     // The library module: the VM core, importable by consumers and by tests.
     const mod = b.addModule("lune", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "binschema", .module = binschema_mod },
+        },
     });
 
     // The CLI executable. Thin shell over the library module for now.

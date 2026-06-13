@@ -52,6 +52,10 @@ pub const irinterp = @import("irinterp.zig");
 /// rewrite passes run once at commit time).
 pub const tropt = @import("tropt.zig");
 
+/// Phase 5b — trace serialization: maps a committed `trace.Trace` to/from its
+/// on-disk wire form via the vendored, generated binschema codec.
+pub const traceser = @import("traceser.zig");
+
 /// Re-exports for ergonomic access.
 pub const Value = value.Value;
 pub const GcHeader = object.GcHeader;
@@ -79,4 +83,5 @@ test {
     _ = trace;
     _ = irinterp;
     _ = tropt;
+    _ = traceser;
 }

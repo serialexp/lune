@@ -83,10 +83,27 @@ pub fn compile(
         .protos = c.protos.items,
         .name = "main",
     };
+    // Assign every proto a stable, unique id (pre-order over the proto tree,
+    // root = 0). This is the proto's serialization identity — a trace's anchor
+    // is stored on disk as `proto.id`, not as the in-memory pointer. Order is
+    // irrelevant; only uniqueness and stability-within-a-compile matter.
+    var next_id: u32 = 0;
+    assignProtoIds(proto, &next_id);
+
     // Moving `arena` is safe: code/constants/proto live in arena *heap* buffers,
     // not in the struct, so the pointers stay valid; only the `c.arena` handle
     // goes stale and we no longer use it.
     return .{ .arena = arena, .proto = proto };
+}
+
+/// Pre-order walk assigning each proto a unique id. `@constCast` is sound: the
+/// children were created as mutable `*Proto` in the compile arena (see
+/// `compileFunction`); the `[]const *const Proto` field type is only a
+/// downstream immutability contract, not the original allocation's constness.
+fn assignProtoIds(proto: *Proto, next: *u32) void {
+    proto.id = next.*;
+    next.* += 1;
+    for (proto.protos) |child| assignProtoIds(@constCast(child), next);
 }
 
 const Local = struct {

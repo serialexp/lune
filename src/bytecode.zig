@@ -212,6 +212,13 @@ pub const Proto = struct {
     upvalues: []const UpvalDesc = &.{},
     /// Debug name for disassembly / diagnostics (not semantically meaningful).
     name: []const u8 = "?",
+    /// Stable, unique id assigned at compile time (pre-order over the proto
+    /// tree, root = 0). This — not the in-memory `*const Proto` address — is how
+    /// a serialized trace names its anchor (`src/traceser.zig`): a pointer is
+    /// meaningless on disk, so the wire form stores this id and the visualiser
+    /// uses it to correlate a trace with its proto's disassembly. Defaults to 0
+    /// so hand-built test protos compile; the compiler overwrites it.
+    id: u32 = 0,
 };
 
 // ---------------------------------------------------------------------------

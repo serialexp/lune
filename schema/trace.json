@@ -1,0 +1,77 @@
+{
+  "meta": {
+    "title": "lune trace",
+    "description": "lune tier-1a trace IR wire format (Phase 5b). The on-disk form of a committed, cached Trace (src/trace.zig). Canonical source; the Zig encoder/decoder under src/gen/ is generated from this by tools/regen-trace-schema.sh and vendored. Consumer: the time-travel visualiser (Phase 7).",
+    "version": "0.1"
+  },
+  "config": { "endianness": "little_endian", "bit_order": "lsb_first" },
+  "types": {
+    "ConstInt":    { "sequence": [ { "name": "v", "type": "int64" } ] },
+    "ConstFloat":  { "sequence": [ { "name": "v", "type": "float64" } ] },
+    "ConstBool":   { "sequence": [ { "name": "v", "type": "uint8" } ] },
+    "ConstNil":    { "sequence": [ { "name": "pad", "type": "uint8" } ] },
+    "ConstString": {
+      "description": "A heap string constant: the raw bytes (lune strings are byte strings, not necessarily UTF-8).",
+      "sequence": [ { "name": "v", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" } ]
+    },
+
+    "ConstValue": {
+      "description": "A trace constant. `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4). A heap_ref const is always a string (tables/closures are never compile-time constants).",
+      "sequence": [
+        { "name": "tag", "type": "uint8" },
+        {
+          "name": "body",
+          "type": "discriminated_union",
+          "discriminator": { "field": "tag" },
+          "variants": [
+            { "type": "ConstNil",    "when": "value === 0" },
+            { "type": "ConstBool",   "when": "value === 1" },
+            { "type": "ConstInt",    "when": "value === 2" },
+            { "type": "ConstFloat",  "when": "value === 3" },
+            { "type": "ConstString", "when": "value === 4" }
+          ]
+        }
+      ]
+    },
+
+    "IrInstr": {
+      "description": "One SSA instruction: op, two operand refs, aux immediate, observed type, snapshot index.",
+      "sequence": [
+        { "name": "op",   "type": "uint8" },
+        { "name": "a",    "type": "uint16" },
+        { "name": "b",    "type": "uint16" },
+        { "name": "aux",  "type": "int32" },
+        { "name": "ty",   "type": "uint8" },
+        { "name": "snap", "type": "uint32" }
+      ]
+    },
+
+    "SlotStore": {
+      "description": "A loop-carried writeback: tier-0 register `slot` <- IR value `ref` at the back-edge.",
+      "sequence": [
+        { "name": "slot", "type": "uint16" },
+        { "name": "ref",  "type": "uint16" }
+      ]
+    },
+
+    "Trace": {
+      "description": "A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized.",
+      "sequence": [
+        { "name": "anchor_proto_id", "type": "uint32" },
+        { "name": "anchor_pc",       "type": "uint32" },
+        { "name": "instrs",      "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "IrInstr" } },
+        { "name": "consts",      "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "ConstValue" } },
+        { "name": "entry_slots", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "uint16" } },
+        { "name": "exit_stores", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "SlotStore" } }
+      ]
+    },
+
+    "TraceFile": {
+      "description": "The top-level artifact: a version word followed by the whole trace cache. The richer recording header (hash seed, FP mode, env snapshot) belongs with effect-recording and is deferred to a later phase.",
+      "sequence": [
+        { "name": "version", "type": "uint32" },
+        { "name": "traces",  "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "Trace" } }
+      ]
+    }
+  }
+}
