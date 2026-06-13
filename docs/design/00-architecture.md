@@ -97,9 +97,28 @@ _(nothing yet — design only)_
       remain for a generational upgrade). Verified by running the Phase 3 programs
       under GC-at-every-safepoint and a 1,000,000-iteration allocating loop in
       bounded (~6 MB) memory. 135 tests pass. See `03-gc-memory.md`.
-- [ ] **Phase 5 — Hot-path detection + trace recorder.** Per
-      `01-trace-lifecycle.md` and the deterministic-replay model (§Observability).
-      The load-bearing subsystem; includes snapshots and deopt/side-exit restore.
+- [~] **Phase 5 — Hot-path detection + trace recorder.** **Done (Phase 5a):**
+      the recorder (`src/trace.zig` + `src/interp.zig` wiring). Back-edge counters
+      keyed by `(proto, target-pc)` with a `hotloop` threshold arm a recording at
+      a hot loop header; the recorder mirrors each executed instruction into a
+      **linear SSA trace IR** (`slot_load`/`konst` inputs, the arithmetic/compare
+      subset, **type guards** synthesised from observed operand types, a `loop`
+      close), reading **pre-execution** operands so guards pin the types tier-0
+      actually saw. It closes cleanly on loop-back to the anchor (building the
+      exit slot-store snapshot) and **aborts** with explicit reasons (cross-frame
+      `call`/`ret`, host barrier, NYI opcode, bad type, `maxrecord`, alloc),
+      discarding the partial trace and blacklisting the anchor (permanent in 5a —
+      backoff is later). Traces are cached on the VM and their **constants are GC
+      roots**. Crucially the recorder is **transparent**: tier-0 still executes
+      everything, so output is byte-identical with the recorder on or off — the
+      `expectProgram` matrix runs every e2e program under {gc_stress} × {recorder}
+      and asserts identical output. Opt-in via `--trace` / `--dump-traces`, default
+      off. Per `01-trace-lifecycle.md` and the deterministic-replay model
+      (§Observability). **Deferred:** *executing* traces, the optimizer, and
+      deopt/side-exit **restore** → Phase 6 (each guard already carries a
+      `SnapIdx` placeholder and the entry/exit slot maps the restore will need);
+      penalty/blacklist backoff, side traces & linking, cache invalidation, and
+      counter decay → later.
 - [ ] **Phase 5b — Trace serialization format.** Define it as a binschema
       schema (canonical `binschema` dir); generate the TypeScript decoder;
       hand-write the Zig writer; validate the two against each other with

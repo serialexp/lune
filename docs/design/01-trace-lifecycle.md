@@ -1,8 +1,8 @@
 # lune — Trace Lifecycle
 
-Status: draft, not yet implemented — stub capturing required decisions
+Status: Phase 5a (recorder) implemented; execution/deopt policy still design-only
 Owner: Bart
-Last updated: 2026-06-12
+Last updated: 2026-06-13
 
 Prerequisite for **Phase 5** (hot-path detection + trace recorder) in
 `00-architecture.md`. Both external reviewers independently flagged that the
@@ -12,28 +12,46 @@ architecture." This doc is where that policy lives.
 
 ## Implementation status
 
-### Done
+### Done (Phase 5a — the recorder, `src/trace.zig` + `src/interp.zig`)
 
-_(nothing yet — design only)_
+- [x] **Hotness policy (recording slice).** Back-edge counters keyed by
+      `(proto, target-pc)`, saturating; `hotloop` threshold (default 56, LuaJIT's)
+      arms a recording **once**, at the moment the count crosses it (`==`, so no
+      re-arm churn). Detected at a single seam in the dispatch loop (`pc <= cur_pc`
+      ⇔ a backward/self jump), gated on `config.enabled`. _Call/entry counters and
+      counter decay are still outstanding (below)._
+- [x] **Trace anchors (root, loop headers).** A hot loop header `(proto, pc)` is
+      the only anchor in 5a. _Hot side exits → side traces are outstanding._
+- [x] **Trace lifecycle state machine (recording slice).** `interpreting →
+      recording → (loop-back) committed→cached | aborted→blacklisted`. The
+      `executing_ir → side_exit → linked` half is Phase 6 (no IR execution yet).
+- [x] **Recording termination (clean).** Loop-back to the anchor closes the
+      trace: append `loop`, snapshot the loop-carried register→ref writes
+      (`exit_stores`), dupe into an owned `Trace`, append to the cache. _Linking
+      to an existing trace / returning below the anchor are Phase 6._
+- [x] **Abort policy (first cut).** Explicit reasons: `maxrecord` length cap,
+      `nyi_opcode` (tables/globals/upvalues/concat/…), `host_barrier` (native
+      call), `cross_frame` (Lua `call`/`ret`/`halt`), `bad_type` (non-numeric
+      operand to an arithmetic/compare op), `alloc`. An abort discards the partial
+      trace, leaves tier-0 untouched, and blacklists the anchor. _Excessive-side-
+      exit and recursion/unroll caps are outstanding._
+- [x] **Transparency invariant.** Recording never perturbs tier-0: it reads
+      pre-execution operands and emits IR, but tier-0 still executes every
+      instruction. Enforced by the `expectProgram` matrix ({gc_stress} ×
+      {recorder}, identical output) and noted in `02-determinism.md`.
+- [x] **CLI opt-in.** `--trace` enables the recorder; `--dump-traces` also prints
+      each cached trace's IR (disassembler) to stderr. Default off ⇒ identical to
+      the pre-Phase-5 driver.
 
 ### Outstanding
 
-- [ ] **Hotness policy.** Back-edge counters, call/entry counters, thresholds
-      (LuaJIT defaults: `hotloop`=56, `hotexit`=10 — pick ours), counter decay.
-      Affects bytecode + interpreter dispatch (Phase 3), not only Phase 5.
-- [ ] **Trace anchors.** What may start a trace: loop headers, hot side exits.
-      Root vs side traces.
-- [ ] **Trace lifecycle state machine.** `interpreting → recording →
-      aborted | compiled_ir → executing_ir → side_exit → linked | blacklisted |
-      interpreter`. Define states + transitions explicitly.
-- [ ] **Recording termination (clean).** Loop-back close; link to existing
-      trace; return below anchor.
-- [ ] **Abort policy.** Max IR length (`maxrecord`), unsupported/NYI bytecodes,
-      host-call barriers, unstable types, allocation pressure, excessive side
-      exits, recursion/unroll caps.
-- [ ] **Blacklist + penalty backoff.** Penalty key (bytecode PC? loop header?
-      side exit? shape transition?); doubling-with-jitter backoff; permanent
-      blacklist threshold → patch hot-counter bytecode back to plain form.
+- [ ] **Hotness policy (rest).** Call/entry counters, a `hotexit` threshold,
+      counter decay.
+- [ ] **Blacklist + penalty backoff.** 5a uses a **permanent** blacklist (no
+      machinery, prevents re-record thrash). Still to do: penalty key choice
+      (PC? loop header? side exit? shape transition?), doubling-with-jitter
+      backoff so a temporarily-unstable loop can succeed later, and a permanent-
+      blacklist threshold that patches the hot-counter bytecode back to plain form.
 - [ ] **Side traces & linking.** When a hot side exit spawns a side trace; when
       to direct-link vs return to interpreter; side-trace budget per root.
 - [ ] **Trace explosion controls.** Polymorphic/megamorphic dispatch, shape
@@ -43,12 +61,18 @@ _(nothing yet — design only)_
 - [ ] **Invalidation / dependency tracking.** Shape mutation / unfreeze, global
       mutation, function replacement must invalidate dependent traces. Who
       records which traces guard on which shapes?
-- [ ] **Snapshot contents.** The full list (see §Snapshots & deopt) — the single
-      hardest piece. Frames, PC, upvalues, heap object *identities*, sunk
-      allocations, pending stores, error/unwind state, iterator state, GC roots.
+- [ ] **Snapshot contents.** _Phase 5a records the **minimal** snapshot the
+      future restore needs — `entry_slots` (registers read as `slot_load` inputs)
+      and `exit_stores` (loop-carried register→ref writes at close) — and every
+      guard carries a `SnapIdx` placeholder._ The full per-guard snapshot is still
+      outstanding (see §Snapshots & deopt) — the single hardest piece: frames, PC,
+      upvalues, heap object *identities*, sunk allocations, pending stores,
+      error/unwind state, iterator state, GC roots.
 - [ ] **Deopt / side-exit restore.** Map IR refs → bytecode frame slots;
       **rematerialise sunk allocations**; hand control back to tier-0. Required
-      for tier-1a too — the IR-interpreter does not let us skip this.
+      for tier-1a too — the IR-interpreter does not let us skip this. _Phase 6:
+      there is no IR execution yet to deopt from, so 5a records the slot maps but
+      builds no restore._
 - [ ] **Standing design rule.** Every optimization that removes/reorders state
       ships its deopt reconstruction rule *before* it lands (DCE, CSE,
       allocation-sinking, numeric narrowing, bounds-check elimination,

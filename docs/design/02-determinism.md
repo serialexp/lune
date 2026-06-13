@@ -25,6 +25,18 @@ that for a time-travel debugger it *is* the architecture.
       is the proof-of-concept that *all* I/O can be diverted from one place. The
       taxonomy, the effect-record format, and routing time/randomness through this
       seam are still outstanding (below).
+- [x] **Transparent trace recording** (Phase 5a, `src/trace.zig`). The recorder
+      observes tier-0 — it reads pre-execution operands and emits trace IR — but
+      tier-0 still executes every instruction, so recording **cannot change a
+      program's result**: it is invisible the same way GC is. This is the
+      "run with or without for comparison" property, and it is what makes the
+      recorder safe to ship ahead of any IR execution. The evidence is the
+      `expectProgram` matrix in `src/interp.zig`: every end-to-end program runs in
+      all four {`gc_stress` off/on} × {recorder off/on} combinations and must print
+      **byte-identical** output. A host (`native`) call is already treated as a
+      **trace barrier** (the recorder aborts with `host_barrier`), matching the
+      effect-boundary policy above — when host-effect recording lands, that abort
+      becomes the point an effect record is emitted.
 
 ### Outstanding
 
