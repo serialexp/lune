@@ -66,6 +66,25 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // `zig build bench` — the Phase 6b trace-optimizer benchmark. Always
+    // ReleaseFast (a Debug bench would be dominated by safety checks and tell us
+    // nothing about the optimizer); informational, not a test.
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lune", .module = mod },
+            },
+        }),
+    });
+    bench_exe.use_llvm = true; // tail-call dispatch needs LLVM (see above)
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run the trace-optimizer benchmark (ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
 }
 
 /// Compare the compiler driving this build script against the pinned toolchain.

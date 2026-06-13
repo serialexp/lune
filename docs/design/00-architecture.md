@@ -149,6 +149,41 @@ _(nothing yet — design only)_
       mid-trace or trace across calls); **side traces & linking** (the real fix for
       branchy hot loops, vs. the blacklist brake); penalty **backoff** & counter
       decay; cache **invalidation**.
+- [x] **Phase 6b — Trace optimizer (rewrite passes).** **Done.** `src/tropt.zig`
+      rewrites a freshly-recorded trace **once at commit time** (never in the
+      executor hot loop) into a smaller, output-identical body: **constant
+      folding**, **CSE**, and **dead-code elimination**, sharing one forward
+      fold/CSE stage + backward liveness + compaction (the compaction *is* the
+      ref-remap, since refs are instruction indices). **Why the sound set is so
+      small:** under loop-header re-entry deopt the executor writes `regs` only at
+      the `loop` close and any side-exit re-runs the whole partial iteration, so
+      deopt reconstruction is *independent of the optimized body*. A rewrite is
+      sound iff (a) completed iterations produce byte-identical `exit_store` values
+      and (b) it never drops a **load-bearing** guard. Because the executor has
+      **no type-specialized fast paths** (every op re-dispatches through
+      `arith.zig`), the only guards droppable are ones that **provably always
+      pass** (on a value the optimizer proved constant) or **exact duplicates**;
+      an always-*fail* guard is kept. Constant folding calls the **same**
+      `irinterp.evalBinary`/`evalUnary` the executor uses, so a folded constant is
+      byte-identical to the runtime computation by construction; a fold that would
+      *error* (integer `//`/`%`-by-zero) is **left as a runtime op** so it
+      side-exits and tier-0 re-raises — never deleted. **Transparency** is the
+      8-way `expectProgram` matrix ({gc_stress} × {off, record-only,
+      record+execute-noopt, record+execute-opt}) plus a seeded differential fuzz;
+      the optimizer-does-work proof is deterministic `instrs.len`-reduction unit
+      tests. `TraceConfig.optimize` (default on) gates it; an optimizer OOM falls
+      back to caching the unoptimized trace. `--trace-no-opt` records & executes
+      raw IR; `zig build bench` (ReleaseFast) reports per-loop raw/opt instruction
+      counts + wall-time. **Note (honest):** the tier-1a IR-interpreter is a
+      *boxed SSA walk* (one switch dispatch + guard checks per IR instr per
+      iteration), so today it is **slower than tier-0** on these loops — the
+      optimizer shrinks the body and is never slower than no-opt, but the real
+      speed win waits on typed fast paths / native codegen. **Deferred (cross the
+      no-executor-change line):** type **narrowing/unboxing** (typed `add_i64`… +
+      unboxed scratch + load-bearing guards — the big arithmetic win, payoff in
+      Phase 8) and **LICM** (a once-only trace preheader in the executor); plus
+      algebraic identities, const-pool pruning, and record-time **konst interning**
+      (would let CSE fire on real traces — see TODO.md).
 - [ ] **Phase 7 — Time-travel debugger / trace visualizer.** SolidJS app that
       reads the trace file via the generated TS decoder. Starts with bounded
       recordings, not "complete history" by default. **Milestone: the feature

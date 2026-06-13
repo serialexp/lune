@@ -83,6 +83,55 @@ architecture." This doc is where that policy lives.
       (`assertWellFormed`) checks the IR invariants `execute` relies on (terminal
       `loop`, operand refs < index, exit refs < `loop`, in-bounds `aux`).
 
+### Done (Phase 6b — the trace optimizer, `src/tropt.zig`)
+
+The optimizer runs **once at commit time** (`commit()` → `tropt.optimize`,
+gated by `TraceConfig.optimize`, default on; an OOM falls back to the
+unoptimized trace) and rewrites the recorded SSA into a smaller, output-identical
+body the executor walks every iteration. Three passes share one forward
+fold/CSE stage, one backward liveness stage, and one compaction (the compaction
+*is* the ref-remap — refs are instruction indices, so any removal/replacement
+renumbers).
+
+**The per-pass deopt-reconstruction rule (the standing design rule, discharged).**
+Under loop-header re-entry deopt, reconstruction is "tier-0 reruns the
+iteration," independent of the optimized body. So each pass's obligation reduces
+to: *preserve every completed iteration's `exit_store` values, and never drop a
+load-bearing guard.* Concretely:
+
+- [x] **Constant folding.** Folds a pure op whose operands are all constant by
+      calling the **same** `irinterp.evalBinary`/`evalUnary` the executor uses —
+      so the folded constant is byte-identical to the runtime result, and
+      `exit_store` values are preserved by construction. *Reconstruction rule:* a
+      fold that would **error** (integer `//`/`%`-by-zero) is **not** performed —
+      the op stays in the trace so it side-exits at runtime and tier-0 re-raises
+      the identical error. Folds never delete an erroring op.
+- [x] **Guard elimination.** Drops a guard **only** when it provably always
+      passes (its operand folded to a constant of the guarded type) or is an
+      **exact duplicate** of an earlier guard on the same ref (the earlier
+      dominates in linear SSA). *Reconstruction rule:* an always-**fail** guard is
+      **kept** (never silently remove a deopt that should fire); since the
+      executor has no type-specialized fast paths, no *runtime-reachable* guard is
+      ever dropped, so the optimized trace never deopts **later** than the raw one
+      would. (Deopting earlier is always safe — tier-0 reruns.)
+- [x] **CSE.** Redirects a later pure op identical to an earlier one (same
+      `{op, operand-refs, aux, ty}`, operand-order-sensitive — no commutative
+      canonicalization) to the earlier canonical ref. *Reconstruction rule:* none
+      beyond the above — a merged value is bit-identical, and the canonical
+      survivor keeps all guards the duplicate's operands carried.
+- [x] **Dead-code elimination.** Backward liveness from explicit roots — the
+      `loop` terminator, every **kept guard** (side-effecting), and `canon[ref]`
+      for **every `exit_store`** — removes pure values nothing observes.
+      *Reconstruction rule:* rooting **every** `exit_store` is load-bearing —
+      forgetting one would strip the loop-carried computation and tier-0 would
+      resume with a stale register. Guards are never DCE'd (only the two
+      provably-redundant cases above remove a guard).
+
+These hold only while the executor has **no type-specialized semantics**, every
+side exit resumes at the **loop header**, and the shared evaluator stays
+**total** — the five preconditions are stated as a comment block atop
+`tropt.zig`; Phase 6c (typed fast paths / richer side exits) must re-derive them.
+
 ### Outstanding
 
 - [ ] **Hotness policy (rest).** Call/entry counters, a `hotexit` threshold,
@@ -116,10 +165,13 @@ architecture." This doc is where that policy lives.
       upvalues / iterator state — is still outstanding, and is only *needed* once an
       optimization (6b) sinks state or we mutate `regs` mid-trace / trace across
       calls. Until then the minimal `entry_slots`/`exit_stores` maps suffice.
-- [ ] **Standing design rule.** Every optimization that removes/reorders state
-      ships its deopt reconstruction rule *before* it lands (DCE, CSE,
-      allocation-sinking, numeric narrowing, bounds-check elimination,
-      shape specialization).
+- [~] **Standing design rule.** Every optimization that removes/reorders state
+      ships its deopt reconstruction rule *before* it lands. **Discharged for
+      Phase 6b** — constant folding, guard elimination, CSE, DCE (see the Phase 6b
+      block above, each with its rule). **Still owed by** allocation-sinking,
+      numeric narrowing, bounds-check elimination, shape specialization, LICM —
+      several of which also invalidate the loop-header-deopt preconditions and so
+      need general per-guard snapshot restore first.
 
 ## Why this exists
 

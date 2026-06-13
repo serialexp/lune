@@ -40,10 +40,25 @@ that for a time-travel debugger it *is* the architecture.
       bytes whether a loop runs in tier-0 or tier-1a — the same "run with or without
       for comparison" property, now extended past recording to execution. The
       evidence is the **extended** `expectProgram` matrix in `src/interp.zig`: every
-      end-to-end program runs in all six {`gc_stress` off/on} × {off, record-only,
-      **record+execute**} combinations and must print **byte-identical** output. An
-      executor divergence (wrong arith, missed guard, bad deopt, exit-store error)
-      surfaces as a mismatch there.
+      end-to-end program runs in every {`gc_stress` off/on} × {off, record-only,
+      **record+execute**} combination (8-way once Phase 6b adds the optimizer axis —
+      see below) and must print **byte-identical** output. An executor divergence
+      (wrong arith, missed guard, bad deopt, exit-store error) surfaces as a
+      mismatch there.
+- [x] **Optimized traces are output-invariant too (Phase 6b).** The trace
+      optimizer (`src/tropt.zig`: constant folding, CSE, dead-code elimination,
+      run once at commit) rewrites a trace's IR but **cannot change what it
+      prints**. Folding computes with the *same* `arith.zig` evaluator the
+      executor uses (byte-identical bits, by construction), and a fold that would
+      error is left as a runtime op so tier-0 still re-raises it; only
+      always-pass and exact-duplicate guards are dropped, so the optimized trace
+      never deopts later than the raw one. The evidence is that the
+      `expectProgram` matrix is now **8-way** — {`gc_stress` off/on} × {off,
+      record-only, record+execute-**noopt**, record+execute-**opt**} — so
+      *optimized output == unoptimized output == tier-0* for every e2e program; a
+      seeded differential fuzz (`src/interp.zig`) adds 64 random integer loops
+      under the same three execution modes. The optimizer is a transparent
+      rewrite, exactly like recording and execution before it.
 
 ### Outstanding
 

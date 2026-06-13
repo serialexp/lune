@@ -15,7 +15,8 @@
 //! / `--dump-traces`, default off — without a flag the driver is byte-for-byte
 //! its pre-Phase-5 self. `--trace` records hot loops *and* runs them through the
 //! tier-1a IR-interpreter (Phase 6); `--trace-record-only` records but lets tier-0
-//! execute everything (Phase 5a, for inspecting IR in isolation). Both are
+//! execute everything (Phase 5a, for inspecting IR in isolation); `--trace-no-opt`
+//! records & executes but skips the trace optimizer (Phase 6b — raw IR). All are
 //! output-transparent: an executed trace produces byte-identical output to tier-0
 //! (it deopts to tier-0 on any guard failure), so the flags never change a
 //! program's output — only whether, and how, hot loops are traced.
@@ -39,6 +40,9 @@ const usage =
     \\                       Output is identical to a plain run.
     \\  --trace-record-only  record hot loops but let tier-0 execute everything
     \\                       (Phase 5a) — for inspecting trace IR in isolation.
+    \\  --trace-no-opt       skip the trace optimizer (constant folding / CSE /
+    \\                       dead-code elimination); record & execute raw IR. Useful
+    \\                       with --dump-traces to see unoptimized IR.
     \\  --dump-traces        imply --trace and print every recorded trace's IR to
     \\                       stderr after the run.
     \\  -h, --help           show this help
@@ -48,7 +52,7 @@ const usage =
 /// Tracing-JIT options parsed from the command line (default: off). When
 /// `enabled`, `execute` decides tier-1a participation: true ⇒ run cached traces
 /// (`--trace`), false ⇒ record only, tier-0 executes (`--trace-record-only`).
-const TraceOpts = struct { enabled: bool = false, execute: bool = true, dump: bool = false };
+const TraceOpts = struct { enabled: bool = false, execute: bool = true, optimize: bool = true, dump: bool = false };
 
 pub fn main(init: std.process.Init) u8 {
     const gpa = init.gpa;
@@ -69,6 +73,9 @@ pub fn main(init: std.process.Init) u8 {
         } else if (std.mem.eql(u8, arg, "--trace-record-only")) {
             topts.enabled = true;
             topts.execute = false;
+        } else if (std.mem.eql(u8, arg, "--trace-no-opt")) {
+            topts.enabled = true;
+            topts.optimize = false;
         } else if (std.mem.eql(u8, arg, "--dump-traces")) {
             topts.enabled = true;
             topts.dump = true;
@@ -127,6 +134,7 @@ fn runSource(gpa: std.mem.Allocator, name: []const u8, source: [:0]const u8, top
     // `--trace-record-only` ⇒ record but tier-0 executes everything.
     vm.trace.config.enabled = topts.enabled;
     vm.trace.config.execute = topts.execute;
+    vm.trace.config.optimize = topts.optimize;
 
     // --- compile ---
     var chunk = lune.compiler.compile(gpa, &vm.heap, source, tree.root, &diags) catch |err| {
