@@ -20,6 +20,9 @@ const std = @import("std");
 const bytecode = @import("bytecode.zig");
 const arith = @import("arith.zig");
 const value = @import("value.zig");
+const gc = @import("gc.zig");
+const string = @import("string.zig");
+const table = @import("table.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -42,13 +45,18 @@ pub const Error = error{
 /// globals, and a shared register stack arrive in later increments).
 pub const Vm = struct {
     gpa: std.mem.Allocator,
+    /// The object heap (strings, tables). Owns every heap value a running
+    /// program produces; freed wholesale by `deinit`.
+    heap: gc.Heap,
 
     pub fn init(gpa: std.mem.Allocator) Vm {
-        return .{ .gpa = gpa };
+        return .{ .gpa = gpa, .heap = gc.Heap.init(gpa) };
     }
 
+    /// Frees the heap and every object on it. Any `Value` returned by `run` that
+    /// is a heap reference dangles after this — inspect results first.
     pub fn deinit(self: *Vm) void {
-        _ = self;
+        self.heap.deinit();
     }
 
     /// Execute a top-level chunk and return its first returned value (`nil` if it
@@ -63,7 +71,6 @@ pub const Vm = struct {
     /// Run one activation: interpret `proto.code` over the register window
     /// `regs`. Returns the frame's first returned value.
     fn execFrame(self: *Vm, proto: *const Proto, regs: []Value) Error!Value {
-        _ = self;
         const code = proto.code;
         var pc: usize = 0;
         while (true) {
@@ -98,10 +105,10 @@ pub const Vm = struct {
                 .neg => regs[a] = try arith.neg(regs[instr.b]),
                 .not => regs[a] = Value.boolean(!regs[instr.b].isTruthy()),
                 .bnot => regs[a] = try arith.bnot(regs[instr.b]),
-                .len => return Error.Unimplemented, // strings/tables: Increment B/E
+                .len => regs[a] = try lenOf(regs[instr.b]),
 
-                // ---- concat (needs strings) ----
-                .concat => return Error.Unimplemented, // Increment B/E
+                // ---- concat ----
+                .concat => regs[a] = try self.concat(regs[instr.b], regs[instr.c]),
 
                 // ---- comparisons → boolean register ----
                 // `gt`/`ge` reuse `lt`/`le` with operands swapped (a>b ≡ b<a).
@@ -121,10 +128,15 @@ pub const Vm = struct {
                     pc = applyJump(pc, instr.aux);
                 },
 
-                // ---- tables / globals / functions (later increments) ----
-                .new_table,
-                .get_index,
-                .set_index,
+                // ---- tables ----
+                .new_table => {
+                    const t = try self.heap.newTable();
+                    regs[a] = Value.heap(&t.header);
+                },
+                .get_index => regs[a] = try indexGet(regs[instr.b], regs[instr.c]),
+                .set_index => try self.indexSet(regs[a], regs[instr.b], regs[instr.c]),
+
+                // ---- globals / functions (later increments) ----
                 .get_global,
                 .set_global,
                 .closure,
@@ -139,7 +151,70 @@ pub const Vm = struct {
             }
         }
     }
+
+    /// `R[b] .. R[c]` — string concatenation. Strings concatenate directly;
+    /// numbers coerce to their text form (Lua-shaped). Anything else errors.
+    /// The result is interned.
+    fn concat(self: *Vm, a: Value, b: Value) Error!Value {
+        var buf_a: [64]u8 = undefined;
+        var buf_b: [64]u8 = undefined;
+        const sa = try coerceConcat(a, &buf_a);
+        const sb = try coerceConcat(b, &buf_b);
+
+        const tmp = try self.gpa.alloc(u8, sa.len + sb.len);
+        defer self.gpa.free(tmp);
+        @memcpy(tmp[0..sa.len], sa);
+        @memcpy(tmp[sa.len..], sb);
+        return self.heap.internValue(tmp);
+    }
+
+    /// `container[key]`. Only tables are indexable in v1 (no string indexing /
+    /// metatables yet).
+    fn indexGet(container: Value, key: Value) Error!Value {
+        if (container.isHeap() and container.heapType() == .table) {
+            return table.Table.fromHeader(container.asHeap()).get(key);
+        }
+        return Error.TypeError;
+    }
+
+    /// `container[key] = val`. The write-barrier seam fires here: a value stored
+    /// into a heap container.
+    fn indexSet(self: *Vm, container: Value, key: Value, val: Value) Error!void {
+        if (container.isHeap() and container.heapType() == .table) {
+            const t = table.Table.fromHeader(container.asHeap());
+            try t.set(self.gpa, key, val);
+            self.heap.writeBarrier(&t.header, val); // no-op until Phase 4
+            return;
+        }
+        return Error.TypeError;
+    }
 };
+
+/// Coerce a concat operand to bytes: a string's own bytes, or a number formatted
+/// into `buf`. Returns a slice valid until `buf` is reused.
+fn coerceConcat(v: Value, buf: []u8) Error![]const u8 {
+    return switch (v.tag) {
+        .heap_ref => if (v.heapType() == .string)
+            string.String.fromHeader(v.asHeap()).bytes()
+        else
+            Error.TypeError,
+        .int => std.fmt.bufPrint(buf, "{d}", .{v.asInt()}) catch unreachable,
+        .float => std.fmt.bufPrint(buf, "{d}", .{v.asFloat()}) catch unreachable,
+        else => Error.TypeError,
+    };
+}
+
+/// `#v` — length of a string (bytes) or table (border). Other types error.
+fn lenOf(v: Value) Error!Value {
+    if (v.isHeap()) {
+        return switch (v.heapType()) {
+            .string => Value.int(@intCast(string.String.fromHeader(v.asHeap()).len)),
+            .table => Value.int(table.Table.fromHeader(v.asHeap()).length()),
+            else => Error.TypeError,
+        };
+    }
+    return Error.TypeError;
+}
 
 /// Apply a relative jump. `pc` has already advanced past the jump instruction,
 /// so the offset is measured from the *next* instruction (offset 0 = no-op).
@@ -261,4 +336,58 @@ test "ret with no values yields nil; halt yields nil" {
     try testing.expect(r0.isNil());
     const r1 = try runCode(&[_]Instr{Instr.op0(.halt)}, &.{}, 1);
     try testing.expect(r1.isNil());
+}
+
+test "new_table + set_index + get_index round-trips a value" {
+    // local t = {}; t[1] = 42; return t[1]
+    const code = [_]Instr{
+        Instr.opA(.new_table, 0),
+        Instr.opAx(.load_int, 1, 1), // key
+        Instr.opAx(.load_int, 2, 42), // value
+        Instr.opABC(.set_index, 0, 1, 2),
+        Instr.opABC(.get_index, 1, 0, 1),
+        Instr.opAB(.ret, 1, 1),
+    };
+    // Result is a scalar int, so the deinit-after-return helper is safe here.
+    try testing.expectEqual(@as(i64, 42), (try runCode(&code, &.{}, 3)).asInt());
+}
+
+test "#t counts the sequence border" {
+    // t = {10, 20, 30}; return #t
+    const code = [_]Instr{
+        Instr.opA(.new_table, 0),
+        Instr.opAx(.load_int, 1, 1), Instr.opAx(.load_int, 2, 10), Instr.opABC(.set_index, 0, 1, 2),
+        Instr.opAx(.load_int, 1, 2), Instr.opAx(.load_int, 2, 20), Instr.opABC(.set_index, 0, 1, 2),
+        Instr.opAx(.load_int, 1, 3), Instr.opAx(.load_int, 2, 30), Instr.opABC(.set_index, 0, 1, 2),
+        Instr.opAB(.len, 1, 0),
+        Instr.opAB(.ret, 1, 1),
+    };
+    try testing.expectEqual(@as(i64, 3), (try runCode(&code, &.{}, 3)).asInt());
+}
+
+test "indexing a non-table is a type error" {
+    const code = [_]Instr{
+        Instr.opAx(.load_int, 0, 5),
+        Instr.opAx(.load_int, 1, 1),
+        Instr.opABC(.get_index, 0, 0, 1),
+        Instr.opAB(.ret, 0, 1),
+    };
+    try testing.expectError(Error.TypeError, runCode(&code, &.{}, 2));
+}
+
+test "concat joins strings and coerces numbers; result is interned" {
+    var vm = Vm.init(testing.allocator);
+    defer vm.deinit();
+    // "x=" .. 42  ->  "x=42"
+    const consts = [_]Value{try vm.heap.internValue("x=")};
+    const code = [_]Instr{
+        Instr.opAB(.load_const, 0, 0),
+        Instr.opAx(.load_int, 1, 42),
+        Instr.opABC(.concat, 0, 0, 1),
+        Instr.opAB(.ret, 0, 1),
+    };
+    const proto = Proto{ .code = &code, .constants = &consts, .num_registers = 2, .name = "t" };
+    const r = try vm.run(&proto); // inspect before deinit (heap result)
+    try testing.expect(r.isHeap());
+    try testing.expectEqualStrings("x=42", string.String.fromHeader(r.asHeap()).bytes());
 }

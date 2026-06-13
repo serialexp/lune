@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const value = @import("value.zig");
+const string = @import("string.zig");
 const Value = value.Value;
 
 /// Generic byte-sink writer type. Re-exported so callers never name `std.Io`
@@ -68,10 +69,15 @@ pub fn writeValue(w: *Writer, v: Value) Writer.Error!void {
         .boolean => try w.writeAll(if (v.asBool()) "true" else "false"),
         .int => try w.print("{d}", .{v.asInt()}),
         .float => try w.print("{d}", .{v.asFloat()}),
-        .heap_ref => try w.print("<{s}@{x}>", .{
-            @tagName(v.heapType()),
-            @intFromPtr(v.asHeap()),
-        }),
+        .heap_ref => switch (v.heapType()) {
+            // Strings print as their raw bytes (Lua `print`/`tostring` style).
+            .string => try w.writeAll(string.String.fromHeader(v.asHeap()).bytes()),
+            // Other objects: kind + identity (e.g. "table: 0x55f…").
+            else => try w.print("{s}: 0x{x}", .{
+                @tagName(v.heapType()),
+                @intFromPtr(v.asHeap()),
+            }),
+        },
     }
 }
 
@@ -103,12 +109,18 @@ test "writeValue renders scalars" {
     try std.testing.expectEqualStrings("3.5", renderValue(&buf, Value.float(3.5)));
 }
 
-test "writeValue renders a heap ref with its object kind" {
+test "writeValue prints a real string's bytes" {
+    const str = try string.String.create(std.testing.allocator, "hello");
+    defer str.destroy(std.testing.allocator);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("hello", renderValue(&buf, Value.heap(&str.header)));
+}
+
+test "writeValue renders other heap kinds with kind + identity" {
     const object = @import("object.zig");
-    var hdr = object.GcHeader.init(.string);
+    var hdr = object.GcHeader.init(.table);
     var buf: [64]u8 = undefined;
     const s = renderValue(&buf, Value.heap(&hdr));
-    // e.g. "<string@7ffd...>" — assert the stable prefix/suffix.
-    try std.testing.expect(std.mem.startsWith(u8, s, "<string@"));
-    try std.testing.expect(std.mem.endsWith(u8, s, ">"));
+    // e.g. "table: 0x7ffd…"
+    try std.testing.expect(std.mem.startsWith(u8, s, "table: 0x"));
 }

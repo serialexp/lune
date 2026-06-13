@@ -32,7 +32,10 @@ pub const lexer = @import("lexer.zig");
 pub const ast = @import("ast.zig");
 pub const parser = @import("parser.zig");
 
-/// Phase 3 — bytecode ISA + tier-0 interpreter.
+/// Phase 3 — runtime heap objects + bytecode ISA + tier-0 interpreter.
+pub const string = @import("string.zig");
+pub const table = @import("table.zig");
+pub const gc = @import("gc.zig");
 pub const bytecode = @import("bytecode.zig");
 pub const interp = @import("interp.zig");
 
@@ -53,6 +56,9 @@ test {
     _ = lexer;
     _ = ast;
     _ = parser;
+    _ = string;
+    _ = table;
+    _ = gc;
     _ = bytecode;
     _ = interp;
 }
