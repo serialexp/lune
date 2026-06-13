@@ -24,6 +24,7 @@ const gc = @import("gc.zig");
 const string = @import("string.zig");
 const table = @import("table.zig");
 const function = @import("function.zig");
+const trace = @import("trace.zig");
 const io = @import("io.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
@@ -102,13 +103,24 @@ pub const Vm = struct {
     /// stdout (`io.zig`); a test (or a future effect recorder) can point this at
     /// an in-memory writer to capture output without touching the real stdout.
     out: ?*io.Writer = null,
+    /// Trace recorder state: hotness counters, the trace cache, and the
+    /// in-progress recording. Disabled by default (`trace.config.enabled`), so
+    /// the VM behaves exactly as before Phase 5 until `--trace` flips it on.
+    /// Recording is transparent — tier-0 still executes everything.
+    trace: trace.TraceState,
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
         const heap = gc.Heap.init(gpa);
         const stack = try gpa.alloc(Value, stack_slots);
         errdefer gpa.free(stack);
 
-        var vm = Vm{ .gpa = gpa, .heap = heap, .globals = undefined, .stack = stack };
+        var vm = Vm{
+            .gpa = gpa,
+            .heap = heap,
+            .globals = undefined,
+            .stack = stack,
+            .trace = trace.TraceState.init(gpa),
+        };
         errdefer vm.heap.deinit();
         // The globals table lives on the heap like any other table.
         vm.globals = try vm.heap.newTable();
@@ -120,6 +132,7 @@ pub const Vm = struct {
     /// register stack. Any `Value` returned by `run` that is a heap reference
     /// dangles after this — inspect results first.
     pub fn deinit(self: *Vm) void {
+        self.trace.deinit();
         self.open_upvalues.deinit(self.gpa);
         self.heap.deinit();
         self.gpa.free(self.stack);
@@ -207,6 +220,7 @@ pub const Vm = struct {
             // stop-the-world collection is safe. Non-moving, so surviving
             // pointers in `regs` stay valid.
             if (self.heap.shouldCollect()) self.collect();
+            const cur_pc = pc;
             const instr = code[pc];
             pc += 1;
             const a: usize = instr.a;
@@ -331,6 +345,14 @@ pub const Vm = struct {
                     self.closeUpvaluesFrom(base);
                     return .{ .reg = 0, .count = 0 };
                 },
+            }
+
+            // Phase 5 hotness seam: a backward (or self) jump just took us to
+            // `pc <= cur_pc` — a loop back-edge whose target `pc` is the loop
+            // header (anchor). Count it (and, once recording lands, arm/close a
+            // trace). Gated on `enabled`, so it is inert until `--trace`.
+            if (self.trace.config.enabled and pc <= cur_pc) {
+                self.trace.onBackEdge(proto, @intCast(pc));
             }
         }
     }
@@ -929,4 +951,60 @@ test "gc: per-iteration garbage is reclaimed (heap stays bounded)" {
     // 200 iterations. (globals, the main closure, "last"/literals, and a handful
     // of still-rooted tables — comfortably under 32.)
     try testing.expect(vm.heap.object_count < 32);
+}
+
+// ---------------------------------------------------------------------------
+// Trace recorder wiring (Phase 5). The IR + counting unit tests live in
+// `trace.zig`; these prove the interpreter actually drives the recorder — the
+// `enabled` toggle gates counting, and a hot loop registers a back-edge anchor.
+// ---------------------------------------------------------------------------
+
+/// Compile+run `source` with the recorder `enabled`, leaving `vm` inspectable.
+fn runForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, enabled: bool) !void {
+    const parser = @import("parser.zig");
+    const compiler = @import("compiler.zig");
+    const diag = @import("diag.zig");
+
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    vm.trace.config.enabled = enabled;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+}
+
+test "trace toggle gates back-edge counting" {
+    const gpa = testing.allocator;
+    const source =
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + i end
+        \\print(acc)
+    ;
+    // Disabled: the hotness seam is inert — no counters touched.
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        try runForTrace(&vm, gpa, source, false);
+        try testing.expectEqual(@as(usize, 0), vm.trace.counters.count());
+    }
+    // Enabled: the loop's back-edge anchor is counted ~100 times.
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        try runForTrace(&vm, gpa, source, true);
+        try testing.expect(vm.trace.counters.count() >= 1);
+        // The hottest anchor saw one back-edge per loop iteration (100).
+        var it = vm.trace.counters.valueIterator();
+        var max: u32 = 0;
+        while (it.next()) |v| max = @max(max, v.*);
+        try testing.expectEqual(@as(u32, 100), max);
+    }
 }

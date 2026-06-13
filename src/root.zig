@@ -41,6 +41,9 @@ pub const bytecode = @import("bytecode.zig");
 pub const compiler = @import("compiler.zig");
 pub const interp = @import("interp.zig");
 
+/// Phase 5 — hot-path detection + trace recorder (records IR; tier-0 executes).
+pub const trace = @import("trace.zig");
+
 /// Re-exports for ergonomic access.
 pub const Value = value.Value;
 pub const GcHeader = object.GcHeader;
@@ -65,4 +68,5 @@ test {
     _ = bytecode;
     _ = compiler;
     _ = interp;
+    _ = trace;
 }
