@@ -78,7 +78,7 @@ function constToRow(index: number, body: ConstBody): ConstRow {
   }
 }
 
-function floatToDisplay(v: number): string {
+export function floatToDisplay(v: number): string {
   if (Number.isNaN(v)) return "nan";
   if (v === Infinity) return "inf";
   if (v === -Infinity) return "-inf";

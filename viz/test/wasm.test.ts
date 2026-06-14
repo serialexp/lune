@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { instantiateLuneFromBytes, type LuneModule } from "../src/wasm/lune";
 import { decodeTraceFile } from "../src/decode";
 import { viewsOf } from "../src/disasm";
+import { decodeSnapshot } from "../src/snapshot";
 
 const wasmPath = fileURLToPath(new URL("../../zig-out/bin/lune.wasm", import.meta.url));
 
@@ -107,6 +108,47 @@ test("a clean run reports no runtime-error location", () => {
   expect(result.status).toBe(0);
   expect(result.errorLine).toBe(0);
   expect(result.backtrace.length).toBe(0);
+});
+
+test("replay: stepping advances the line and grows stdout; the full replay matches the run", () => {
+  const src = "local s = 0\nfor i = 1, 3 do\n  s = s + i\n  print(s)\nend\nprint(\"done\")\n";
+  const run = mod.runSource(src);
+  expect(run.status).toBe(0);
+  // The record run reports a positive step count and a matching line index.
+  expect(run.safepointCount).toBeGreaterThan(0);
+  expect(run.safepointLines.length).toBe(run.safepointCount);
+  expect(run.safepointCapped).toBe(false);
+
+  // Replaying to the same step twice is byte-identical (deterministic replay).
+  const a = mod.replay(src, run.effects, 5);
+  const b = mod.replay(src, run.effects, 5);
+  expect(a.status).toBe(0);
+  expect(a.currentLine).toBe(b.currentLine);
+  expect(a.stdout).toBe(b.stdout);
+  expect(a.finished).toBe(false);
+  // A suspended step reports an in-range pending line (the source is 6 lines).
+  expect(a.currentLine).toBeGreaterThanOrEqual(1);
+  expect(a.currentLine).toBeLessThanOrEqual(6);
+
+  // stdout-so-far never shrinks as the step index advances.
+  let prevLen = 0;
+  for (let k = 1; k <= run.safepointCount; k++) {
+    const step = mod.replay(src, run.effects, k);
+    expect(step.stdout.length).toBeGreaterThanOrEqual(prevLen);
+    prevLen = step.stdout.length;
+  }
+
+  // Replaying past the last safepoint reproduces the uninterrupted run exactly.
+  const whole = mod.replay(src, run.effects, run.safepointCount + 1);
+  expect(whole.finished).toBe(true);
+  expect(whole.stdout).toBe(run.stdout);
+
+  // The mid-run keyframe decodes into a state view: `s` lives in a local and the
+  // built-in `print` shows up among the globals.
+  const view = decodeSnapshot(a.keyframe);
+  expect(view).not.toBeNull();
+  expect(view!.locals.length).toBeGreaterThan(0);
+  expect(view!.globals.some((g) => g.label === "print")).toBe(true);
 });
 
 test("keyframe + effects are produced for a deterministic program", () => {

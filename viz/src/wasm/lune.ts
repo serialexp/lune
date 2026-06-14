@@ -16,6 +16,8 @@ interface LuneExports {
   lune_free_result(resPtr: number): void;
   lune_check(srcPtr: number, srcLen: number): number;
   lune_free_check_result(resPtr: number): void;
+  lune_replay(srcPtr: number, srcLen: number, effPtr: number, effLen: number, stopAfter: number): number;
+  lune_free_replay_result(resPtr: number): void;
   lune_dispatch_smoke(iterations: number): number;
 }
 
@@ -52,6 +54,40 @@ export interface LuneRunResult {
   /** Total wall-clock for the whole `lune_run` wasm call in milliseconds
    *  (parse + compile + execute + artifact serialization), measured in JS. */
   totalMs: number;
+  /** Total instruction-boundary safepoint count of a pure tier-0 replay of this
+   *  run — the step-debugger's step count. 0 ⇒ no replay available (e.g. the run
+   *  failed). */
+  safepointCount: number;
+  /** True if the replay index hit the safepoint cap before the program finished
+   *  (stepping is bounded to `safepointCount` steps — surfaced, never silent). */
+  safepointCapped: boolean;
+  /** Line-per-safepoint index: entry k is the 1-based source line of the
+   *  instruction pending at safepoint k+1. Length == `safepointCount`. Drives
+   *  line-grain stepping (slider over the indices where the line changes). */
+  safepointLines: Uint32Array;
+}
+
+/** The VM state at one replay step (see `LuneModule.replay`). */
+export interface LuneReplayResult {
+  /** 0 = ok (suspended at the step, or finished), 1 = error (see `diagnostics`). */
+  status: number;
+  /** Program output accumulated up to this step. */
+  stdout: string;
+  /** Error text, empty unless `status === 1`. */
+  diagnostics: string;
+  /** Whole-VM keyframe snapshot AT this step (decode with `decodeSnapshot`). */
+  keyframe: Uint8Array;
+  /** 1-based source line of the instruction pending at this step (0 when finished). */
+  currentLine: number;
+  /** UTF-8 byte span [start,end) of that pending instruction (editor highlight). */
+  currentStart: number;
+  currentEnd: number;
+  /** Live call depth at this step. */
+  depth: number;
+  /** True if the program completed before reaching the requested step. */
+  finished: boolean;
+  /** Deepest-first call chain at this step (empty when finished). */
+  backtrace: BacktraceFrame[];
 }
 
 /** One row of a runtime-error backtrace. `start`/`end` are UTF-8 byte offsets. */
@@ -85,6 +121,11 @@ export interface LuneModule {
   /** Parse + compile a source chunk and return its diagnostics WITHOUT running
    *  it — the editor's live linter. An empty array means a clean compile. */
   check(src: string): LuneDiagnostic[];
+  /** Replay `src` forward to instruction-boundary safepoint `stopAfter`, feeding
+   *  the recorded `effects` blob (from a prior `runSource`) back deterministically,
+   *  and return the VM state there. Re-running to the same `stopAfter` yields
+   *  identical state every time (the deterministic-replay payoff). */
+  replay(src: string, effects: Uint8Array, stopAfter: number): LuneReplayResult;
   /** The guaranteed-tail-call capability gate: run `iterations` `.always_tail`
    *  hops and return the accumulator (== `iterations` iff frames were reused). */
   dispatchSmoke(iterations: number): number;
@@ -94,8 +135,16 @@ export interface LuneModule {
 //   u32 status; then 5 × { u32 ptr; u32 len } for stdout/keyframe/effects/trace/diag;
 //   then 3 × u32 error_line/error_start/error_end (runtime-error location);
 //   then { u32 ptr; u32 len } backtrace (structured call-chain blob, at offset 56);
-//   then u64 exec_ns (VM-execute-only nanoseconds, at offset 64).
-const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8 + 8;
+//   then u64 exec_ns (VM-execute-only nanoseconds, at offset 64);
+//   then u32 safepoint_count (@72), u32 safepoint_capped (@76);
+//   then { u32 ptr; u32 len } safepoint_lines (line-per-safepoint blob, @80).
+const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8 + 8 + 4 + 4 + 8;
+
+// ReplayResult struct layout (extern struct), little-endian:
+//   u32 status; { u32 ptr; u32 len } stdout/keyframe/diag; u32 current_line (@28),
+//   current_start (@32), current_end (@36), depth (@40), finished (@44);
+//   { u32 ptr; u32 len } backtrace (@48). Total 56 bytes.
+const REPLAY_RESULT_BYTES = 4 + 3 * 8 + 5 * 4 + 8;
 
 // CheckResult layout: u32 status; { u32 ptr; u32 len } diags (len = record count).
 const CHECK_RESULT_BYTES = 4 + 8;
@@ -130,6 +179,15 @@ function readBuf(memory: WebAssembly.Memory, dv: DataView, off: number): Uint8Ar
   const len = dv.getUint32(off + 4, true);
   if (ptr === 0 || len === 0) return new Uint8Array(0);
   return new Uint8Array(memory.buffer, ptr, len).slice();
+}
+
+/** Reinterpret a `{ptr,len}` byte blob of little-endian u32s as a `Uint32Array`.
+ *  `readBuf` already copied the bytes into a fresh, zero-offset ArrayBuffer, so
+ *  the view is safe and independent of wasm memory. Assumes a little-endian host
+ *  (every browser/wasm target is). Empty blob → empty array. */
+function readU32Array(blob: Uint8Array): Uint32Array {
+  if (blob.length === 0) return new Uint32Array(0);
+  return new Uint32Array(blob.buffer, blob.byteOffset, blob.length >>> 2);
 }
 
 /** Decode the structured backtrace blob (see `encodeBacktrace` in
@@ -185,6 +243,9 @@ function wrap(exports: LuneExports): LuneModule {
     const errorEnd = dv.getUint32(52, true);
     const backtrace = decodeBacktrace(readBuf(exports.memory, dv, 56));
     const execMs = Number(dv.getBigUint64(64, true)) / 1e6;
+    const safepointCount = dv.getUint32(72, true);
+    const safepointCapped = dv.getUint32(76, true) !== 0;
+    const safepointLines = readU32Array(readBuf(exports.memory, dv, 80));
 
     exports.lune_free_result(resPtr);
 
@@ -201,6 +262,57 @@ function wrap(exports: LuneExports): LuneModule {
       backtrace,
       execMs,
       totalMs,
+      safepointCount,
+      safepointCapped,
+      safepointLines,
+    };
+  };
+
+  const replay = (src: string, effects: Uint8Array, stopAfter: number): LuneReplayResult => {
+    const srcBytes = encoder.encode(src);
+    const srcPtr = srcBytes.length === 0 ? 0 : exports.lune_alloc(srcBytes.length);
+    if (srcBytes.length !== 0) {
+      new Uint8Array(exports.memory.buffer, srcPtr, srcBytes.length).set(srcBytes);
+    }
+    // Allocate the effect blob AFTER the source (a grow here detaches the source
+    // view, but we've already written it; pointers stay valid as offsets).
+    const effPtr = effects.length === 0 ? 0 : exports.lune_alloc(effects.length);
+    if (effects.length !== 0) {
+      new Uint8Array(exports.memory.buffer, effPtr, effects.length).set(effects);
+    }
+
+    const resPtr = exports.lune_replay(srcPtr, srcBytes.length, effPtr, effects.length, stopAfter);
+    if (srcPtr !== 0) exports.lune_free(srcPtr, srcBytes.length);
+    if (effPtr !== 0) exports.lune_free(effPtr, effects.length);
+    if (resPtr === 0) {
+      throw new Error("lune_replay returned null (wasm allocation failure)");
+    }
+
+    const dv = new DataView(exports.memory.buffer, resPtr, REPLAY_RESULT_BYTES);
+    const status = dv.getUint32(0, true);
+    const stdout = readBuf(exports.memory, dv, 4);
+    const keyframe = readBuf(exports.memory, dv, 12);
+    const diag = readBuf(exports.memory, dv, 20);
+    const currentLine = dv.getUint32(28, true);
+    const currentStart = dv.getUint32(32, true);
+    const currentEnd = dv.getUint32(36, true);
+    const depth = dv.getUint32(40, true);
+    const finished = dv.getUint32(44, true) !== 0;
+    const backtrace = decodeBacktrace(readBuf(exports.memory, dv, 48));
+
+    exports.lune_free_replay_result(resPtr);
+
+    return {
+      status,
+      stdout: decoder.decode(stdout),
+      diagnostics: decoder.decode(diag),
+      keyframe,
+      currentLine,
+      currentStart,
+      currentEnd,
+      depth,
+      finished,
+      backtrace,
     };
   };
 
@@ -247,6 +359,7 @@ function wrap(exports: LuneExports): LuneModule {
   return {
     runSource,
     check,
+    replay,
     dispatchSmoke: (iterations: number) => exports.lune_dispatch_smoke(iterations),
   };
 }
