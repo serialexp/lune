@@ -295,6 +295,20 @@ pub const Vm = struct {
     /// the draw stream is a stable part of the language: a given seed reproduces
     /// the same sequence across runs and across the native/wasm engines.
     rng: ?std.Random.Xoshiro256 = null,
+    /// Source text, set only when `record_safepoint_lines` is on (the replay
+    /// driver needs it to map each safepoint's pending instruction span to a
+    /// 1-based line). Empty otherwise; the hot path never reads it unless
+    /// recording is enabled.
+    source: []const u8 = "",
+    /// When true, append the 1-based source line of each safepoint's pending
+    /// instruction to `safepoint_lines` (the replay driver's line-grain index).
+    /// Off by default so tier-0 pays nothing — the normal run path is untouched.
+    record_safepoint_lines: bool = false,
+    /// Line-per-safepoint index built when `record_safepoint_lines` is on:
+    /// `safepoint_lines[k-1]` is the source line of the instruction pending at
+    /// safepoint k (1-based, matching `safepoint_seq`). Owned by the VM; lets the
+    /// replay UI offer line-grain stepping with no extra wasm round-trips.
+    safepoint_lines: std.ArrayList(u32) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
         var vm = try initBare(gpa);
@@ -336,6 +350,7 @@ pub const Vm = struct {
         self.trace.deinit();
         self.open_upvalues.deinit(self.gpa);
         self.effect_log.deinit(self.gpa);
+        self.safepoint_lines.deinit(self.gpa);
         self.heap.deinit();
         self.gpa.free(self.stack);
     }
@@ -426,11 +441,19 @@ pub const Vm = struct {
             },
         };
 
-        // Build the full call chain, deepest-first. `exec` does not unwind
-        // `self.frames` on error, so every live frame is intact. The leaf's pc is
-        // the faulting instruction; a parent's pc is the *resume cursor* — one
-        // past its outgoing `call` (set at the call site before pushing the
-        // child) — so its call-site instruction is `pc -| 1`.
+        const frames = try self.backtraceFrames(source, arena);
+        return .{ .message = message, .line = line, .start = span.start, .end = span.end, .frames = frames };
+    }
+
+    /// Walk the live call stack into `FaultFrame` rows, **deepest-first** (leaf at
+    /// index 0). `exec` does not unwind `self.frames` on error or suspend, so every
+    /// live frame is intact when this is called. The leaf's pc is its pending /
+    /// faulting instruction; a parent's pc is the *resume cursor* — one past its
+    /// outgoing `call` (set at the call site before pushing the child) — so its
+    /// call-site instruction is `pc -| 1`. Shared by `describeFault` (runtime
+    /// errors) and the replay driver (per-step backtrace), so the leaf-vs-call-site
+    /// logic can never drift. `arena` owns the returned slice.
+    pub fn backtraceFrames(self: *Vm, source: []const u8, arena: std.mem.Allocator) std.mem.Allocator.Error![]FaultFrame {
         const frames = try arena.alloc(FaultFrame, self.depth);
         var i: usize = self.depth;
         while (i > 0) {
@@ -446,8 +469,7 @@ pub const Vm = struct {
                 .end = fspan.end,
             };
         }
-
-        return .{ .message = message, .line = line, .start = span.start, .end = span.end, .frames = frames };
+        return frames;
     }
 
     /// Push a new activation onto the explicit call stack and make it the top
@@ -560,6 +582,19 @@ pub const Vm = struct {
             // (extra safepoints from the explicit-stack pop are harmless: a
             // collection is invisible, and the counter only drives this test hook).
             self.safepoint_seq += 1;
+            // Replay line-index recorder (off by default — the wasm record run
+            // and the replay tests turn it on). Append the 1-based source line of
+            // the instruction *about to run* at this safepoint, so the UI can map
+            // safepoint k → its line for line-grain stepping. One branch + one
+            // append per safepoint; tier-0's correctness oracle pays nothing when
+            // off.
+            if (self.record_safepoint_lines) {
+                const sp_line: u32 = if (pc < proto.spans.len)
+                    compiler.lineFromOffset(self.source, proto.spans[pc].start)
+                else
+                    0;
+                try self.safepoint_lines.append(self.gpa, sp_line);
+            }
             if (self.suspend_ctl) |sc| {
                 if (self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth) {
                     frame.pc = pc;
@@ -1861,6 +1896,233 @@ test "F2e: draws lie in [0,1)" {
     const run = try effectRun(gpa, source, .record, &.{}, null, &sd);
     defer run.deinit(gpa);
     try testing.expectEqualStrings("true\n", run.out);
+}
+
+// ---------------------------------------------------------------------------
+// v8 — replay-to-k core: the safepoint-line recorder + the stateless
+// "replay to safepoint k" model the in-browser step-debugger drives.
+//
+// The browser never holds a live VM: to show the program at step k it
+// re-compiles and re-runs forward to the k-th instruction-boundary safepoint
+// (suspend_ctl.after_safepoints = k), then snapshots. These tests prove the two
+// properties that make that sound and useful: (1) re-running to the same k is
+// *consistent* (same pending line + same stdout-so-far every time — the
+// determinism payoff), and (2) running past the last safepoint reproduces the
+// uninterrupted full run exactly (no off-by-one swallows or duplicates the tail).
+// The line index `safepoint_lines` underpins the UI's line-grain stepping.
+// ---------------------------------------------------------------------------
+
+/// The state observed at a single replay stop: the pending source line, a copy
+/// of stdout-so-far, the live call depth, and whether the program had already
+/// finished before reaching `stop_after`.
+const ReplayProbe = struct {
+    line: u32,
+    stdout: []u8,
+    depth: u32,
+    finished: bool,
+    fn deinit(self: ReplayProbe, gpa: std.mem.Allocator) void {
+        gpa.free(self.stdout);
+    }
+};
+
+/// Compile `source` and run it forward to safepoint `stop_after`, returning the
+/// pending line + stdout-so-far + depth at that point (or the final state, with
+/// `finished = true`, if the program completed first). A fresh VM each call —
+/// exactly the stateless "replay to k" the browser driver performs.
+fn replayProbe(gpa: std.mem.Allocator, source: [:0]const u8, stop_after: u64) !ReplayProbe {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [1024]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.suspend_ctl = .{ .after_safepoints = stop_after };
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    const outcome = try vm.start(chunk.proto);
+    var line: u32 = 0;
+    var finished = false;
+    switch (outcome) {
+        .suspended => {
+            const frame = &vm.frames[vm.depth - 1];
+            const proto = frame.closure.proto;
+            if (frame.pc < proto.spans.len) {
+                line = compiler.lineFromOffset(source, proto.spans[frame.pc].start);
+            }
+        },
+        .finished => finished = true,
+    }
+    return .{
+        .line = line,
+        .stdout = try gpa.dupe(u8, sink.buffered()),
+        .depth = vm.depth,
+        .finished = finished,
+    };
+}
+
+/// Run `source` to completion with the safepoint-line recorder on, returning the
+/// per-safepoint line index (owned). Its length is the total safepoint count.
+fn recordSafepointLines(gpa: std.mem.Allocator, source: [:0]const u8) ![]u32 {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [1024]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.source = source;
+    vm.record_safepoint_lines = true;
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    _ = try vm.run(chunk.proto);
+    return gpa.dupe(u32, vm.safepoint_lines.items);
+}
+
+test "replay: re-running to the same safepoint k is consistent (line + stdout-so-far)" {
+    const gpa = testing.allocator;
+    const source: [:0]const u8 =
+        \\local s = 0
+        \\for i = 1, 5 do
+        \\  s = s + i
+        \\  print(s)
+        \\end
+        \\print("done")
+    ;
+    // Probe every k from 1 up to a generous bound and assert a second probe to
+    // the same k reproduces the identical (line, stdout-so-far, depth) tuple.
+    var k: u64 = 1;
+    while (k <= 80) : (k += 1) {
+        const a = try replayProbe(gpa, source, k);
+        defer a.deinit(gpa);
+        const b = try replayProbe(gpa, source, k);
+        defer b.deinit(gpa);
+        try testing.expectEqual(a.line, b.line);
+        try testing.expectEqual(a.depth, b.depth);
+        try testing.expectEqual(a.finished, b.finished);
+        try testing.expectEqualStrings(a.stdout, b.stdout);
+    }
+}
+
+test "replay: stdout-so-far grows monotonically and the pending line stays in range" {
+    const gpa = testing.allocator;
+    const source: [:0]const u8 =
+        \\local s = 0
+        \\for i = 1, 3 do
+        \\  s = s + i
+        \\  print(s)
+        \\end
+    ;
+    var prev_len: usize = 0;
+    var k: u64 = 1;
+    while (k <= 60) : (k += 1) {
+        const p = try replayProbe(gpa, source, k);
+        defer p.deinit(gpa);
+        // stdout-so-far is a prefix-growing log: it never shrinks as k advances.
+        try testing.expect(p.stdout.len >= prev_len);
+        prev_len = p.stdout.len;
+        // A pending line (when suspended) lies within the 4-line source.
+        if (!p.finished) try testing.expect(p.line >= 1 and p.line <= 4);
+    }
+}
+
+test "replay: running past the last safepoint reproduces the uninterrupted full run" {
+    const gpa = testing.allocator;
+    const programs = [_][:0]const u8{
+        \\local s = 0
+        \\for i = 1, 10 do s = s + i end
+        \\print(s)
+        ,
+        \\local function f(x) return x * 2 end
+        \\for i = 1, 4 do print(f(i)) end
+        ,
+    };
+    inline for (programs) |source| {
+        const lines = try recordSafepointLines(gpa, source);
+        defer gpa.free(lines);
+        const total: u64 = lines.len;
+        try testing.expect(total > 0);
+        // Every recorded line is a real, in-range source line (1-based).
+        for (lines) |ln| try testing.expect(ln >= 1);
+
+        // Replaying to total+1 never trips the suspend (max safepoint_seq == total),
+        // so it runs to completion — byte-identical stdout to the full run.
+        const replayed = try replayProbe(gpa, source, total + 1);
+        defer replayed.deinit(gpa);
+        try testing.expect(replayed.finished);
+
+        // And a separate uninterrupted run prints the same thing.
+        var ref_buf: [1024]u8 = undefined;
+        var ref_sink = io.Writer.fixed(&ref_buf);
+        try runCaptured(gpa, source, &ref_sink, false, .off);
+        try testing.expectEqualStrings(ref_sink.buffered(), replayed.stdout);
+    }
+}
+
+test "replay: backtraceFrames reports a deepest-first chain at a suspend inside a call" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source: [:0]const u8 =
+        \\local function inner(x)
+        \\  local y = x + 1
+        \\  return y
+        \\end
+        \\local function outer(n)
+        \\  return inner(n)
+        \\end
+        \\print(outer(7))
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    // Suspend the first time we are at least 3 frames deep (main → outer → inner).
+    vm.suspend_ctl = .{ .min_depth = 3, .after_safepoints = 0 };
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    const outcome = try vm.start(chunk.proto);
+    try testing.expect(outcome == .suspended);
+    try testing.expectEqual(@as(u32, 3), vm.depth);
+
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const frames = try vm.backtraceFrames(source, arena_inst.allocator());
+    // Deepest-first: inner (leaf), outer, main.
+    try testing.expectEqual(@as(usize, 3), frames.len);
+    try testing.expectEqualStrings("inner", frames[0].name);
+    try testing.expectEqualStrings("outer", frames[1].name);
+    try testing.expectEqualStrings("main", frames[2].name);
 }
 
 test "e2e: recursion, loop, locals — fib and a summing loop" {
