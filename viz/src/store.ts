@@ -41,6 +41,10 @@ interface VizState {
   lastRun: LuneRunResult | null;
   /** The last dual-execution diff (wasm vs native), null until "Run both". */
   diff: DiffReport | null;
+  /** Execution timing from the last wasm run: `totalMs` is the whole wasm call
+   *  (compile+execute+serialize); `execMs` the VM-execute-only subset. Null until
+   *  the first run. */
+  timing: { execMs: number; totalMs: number } | null;
 }
 
 const DEFAULT_SOURCE = `-- Edit and run in-browser (wasm). A hot loop records a trace.
@@ -65,6 +69,7 @@ const [state, setState] = createStore<VizState>({
   runBacktrace: null,
   lastRun: null,
   diff: null,
+  timing: null,
 });
 
 export { state };
@@ -128,6 +133,7 @@ function applyWasmResult(result: LuneRunResult, fileName: string): void {
     // clean run or an unlocatable fault.
     runBacktrace: result.status !== 0 && result.backtrace.length > 0 ? result.backtrace : null,
     lastRun: result,
+    timing: { execMs: result.execMs, totalMs: result.totalMs },
   });
 }
 

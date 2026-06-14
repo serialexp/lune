@@ -46,6 +46,12 @@ export interface LuneRunResult {
    *  the run succeeded or the error had no locatable frame. `[0]` mirrors
    *  `errorLine`/`errorStart`/`errorEnd`. */
   backtrace: BacktraceFrame[];
+  /** VM-execute-only time in milliseconds (the `vm.run` call alone, measured
+   *  inside wasm via the host clock — excludes parse/compile + serialization). */
+  execMs: number;
+  /** Total wall-clock for the whole `lune_run` wasm call in milliseconds
+   *  (parse + compile + execute + artifact serialization), measured in JS. */
+  totalMs: number;
 }
 
 /** One row of a runtime-error backtrace. `start`/`end` are UTF-8 byte offsets. */
@@ -87,8 +93,9 @@ export interface LuneModule {
 // Result struct layout (extern struct in wasm_entry.zig), little-endian:
 //   u32 status; then 5 × { u32 ptr; u32 len } for stdout/keyframe/effects/trace/diag;
 //   then 3 × u32 error_line/error_start/error_end (runtime-error location);
-//   then { u32 ptr; u32 len } backtrace (structured call-chain blob, at offset 56).
-const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8;
+//   then { u32 ptr; u32 len } backtrace (structured call-chain blob, at offset 56);
+//   then u64 exec_ns (VM-execute-only nanoseconds, at offset 64).
+const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8 + 8;
 
 // CheckResult layout: u32 status; { u32 ptr; u32 len } diags (len = record count).
 const CHECK_RESULT_BYTES = 4 + 8;
@@ -155,7 +162,11 @@ function wrap(exports: LuneExports): LuneModule {
       new Uint8Array(exports.memory.buffer, srcPtr, bytes.length).set(bytes);
     }
 
+    // Total wall-clock brackets the whole wasm call (parse + compile + execute +
+    // artifact serialization). The execute-only subset comes back as `exec_ns`.
+    const t0 = performance.now();
     const resPtr = exports.lune_run(srcPtr, bytes.length);
+    const totalMs = performance.now() - t0;
     if (srcPtr !== 0) exports.lune_free(srcPtr, bytes.length);
     if (resPtr === 0) {
       throw new Error("lune_run returned null (wasm allocation failure)");
@@ -173,6 +184,7 @@ function wrap(exports: LuneExports): LuneModule {
     const errorStart = dv.getUint32(48, true);
     const errorEnd = dv.getUint32(52, true);
     const backtrace = decodeBacktrace(readBuf(exports.memory, dv, 56));
+    const execMs = Number(dv.getBigUint64(64, true)) / 1e6;
 
     exports.lune_free_result(resPtr);
 
@@ -187,6 +199,8 @@ function wrap(exports: LuneExports): LuneModule {
       errorStart,
       errorEnd,
       backtrace,
+      execMs,
+      totalMs,
     };
   };
 

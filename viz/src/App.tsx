@@ -75,6 +75,13 @@ export default function App() {
         <LuneEditor />
         <Show when={state.stdout !== null || state.runError !== null}>
           <div class="run-output">
+            <Show when={state.timing}>
+              {(t) => (
+                <span class="run-timing">
+                  ran in {t().totalMs.toFixed(2)} ms <span class="muted">(execute {t().execMs.toFixed(2)} ms)</span>
+                </span>
+              )}
+            </Show>
             <Show when={state.runError}>
               <pre class="run-error">
                 {state.runErrorSpan ? `line ${state.runErrorSpan.line}: ${state.runError}` : state.runError}

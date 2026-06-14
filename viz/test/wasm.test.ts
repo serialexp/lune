@@ -50,6 +50,17 @@ test("records a decodable trace for a hot loop", () => {
   expect(views.length).toBeGreaterThan(0);
 });
 
+test("a successful run reports execute-only and total timing", () => {
+  const result = mod.runSource("local s = 0\nfor i = 1, 1000 do s = s + i end\nprint(s)\n");
+  expect(result.status).toBe(0);
+  // Both are finite, non-negative wall-clocks. execMs is measured inside wasm
+  // (the vm.run call alone); totalMs in JS around the whole lune_run call.
+  expect(Number.isFinite(result.execMs)).toBe(true);
+  expect(Number.isFinite(result.totalMs)).toBe(true);
+  expect(result.execMs).toBeGreaterThanOrEqual(0);
+  expect(result.totalMs).toBeGreaterThanOrEqual(0);
+});
+
 test("a syntax error is reported, not thrown", () => {
   const result = mod.runSource("local = = =\n");
   expect(result.status).toBe(1);

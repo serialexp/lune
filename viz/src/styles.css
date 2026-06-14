@@ -252,6 +252,12 @@ table.ir tr.guard .op {
   gap: 0.35rem;
 }
 
+/* Execution-time readout above the run output: total wall-clock + the
+   VM-execute-only subset. Small so it never competes with stdout/errors. */
+.run-timing {
+  font-size: 0.8rem;
+}
+
 .run-output pre {
   margin: 0;
   padding: 0.4rem 0.6rem;

@@ -108,6 +108,11 @@ const Result = extern struct {
     /// Structured backtrace blob (see `encodeBacktrace`); empty unless a located
     /// runtime error. Appended last so existing JS field offsets stay stable.
     backtrace: Buf = .{},
+    /// VM-execute-only wall time in nanoseconds (the `vm.run` call alone — excludes
+    /// parse/compile and artifact serialization), measured via the host clock
+    /// import. Set on both the success and run-error paths. Appended last so prior
+    /// JS field offsets stay stable.
+    exec_ns: u64 = 0,
 };
 
 /// One compile diagnostic, flattened for JS (24 bytes; see file header). `start`/
@@ -308,8 +313,14 @@ fn run(res: *Result, source: []const u8) !void {
         return;
     }
 
-    // --- run ---
-    _ = vm.run(chunk.proto) catch |err| {
+    // --- run --- (bracket the VM execution alone with the host clock for an
+    // execute-only timing; parse/compile above and serialization below are
+    // excluded. The same `host_now_ns` import backs `clock()`, but these reads are
+    // pure measurement — not recorded as effects.)
+    const exec_t0 = host_now_ns();
+    const run_outcome = vm.run(chunk.proto);
+    res.exec_ns = @intCast(host_now_ns() - exec_t0);
+    _ = run_outcome catch |err| {
         res.status = 1;
         // Located, Lua-style message from the un-popped faulting frame. The
         // message is freshly `gpa`-allocated by `describeFault`, so hand its

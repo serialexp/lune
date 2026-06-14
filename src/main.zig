@@ -55,6 +55,8 @@ const usage =
     \\                       record the run's nondeterministic-input effect log
     \\                       (e.g. clock() results) and serialize it to <file>
     \\                       (binschema wire format) after the run.
+    \\  --time               print VM execute-only wall time to stderr after the
+    \\                       run (the run alone, excluding parse/compile/emit).
     \\  -h, --help           show this help
     \\
 ;
@@ -75,6 +77,9 @@ const TraceOpts = struct {
     /// `--emit-effects <file>`: record the nondeterministic-input effect log and
     /// serialize it here after the run (puts the VM in effect `record` mode).
     effects_path: ?[]const u8 = null,
+    /// `--time`: print the VM execute-only wall time (the `vm.run` call alone) to
+    /// stderr after the run. Mirrors the browser's execute-only timing readout.
+    time: bool = false,
 };
 
 pub fn main(init: std.process.Init) u8 {
@@ -118,6 +123,8 @@ pub fn main(init: std.process.Init) u8 {
                 lune.io.eprint("lune: error: --emit-effects requires a <file> argument\n", .{});
                 return 2;
             };
+        } else if (std.mem.eql(u8, arg, "--time")) {
+            topts.time = true;
         } else break arg;
     } else {
         lune.io.eprint("{s}", .{usage});
@@ -206,7 +213,12 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     if (diags.count() > 0) reportDiagnostics(name, &diags);
 
     // --- run --- (a program's `print` output reaches stdout via Vm.out == null)
-    _ = vm.run(chunk.proto) catch |err| {
+    // Bracket the VM execution alone with the monotonic clock for `--time`;
+    // parse/compile above and emit below are excluded.
+    const exec_t0 = nativeClockNs(&clock_ctx);
+    const run_outcome = vm.run(chunk.proto);
+    const exec_ns: u64 = @intCast(nativeClockNs(&clock_ctx) - exec_t0);
+    _ = run_outcome catch |err| {
         // Located, Lua-style message + call chain from the un-popped frame stack.
         var fault_arena = std.heap.ArenaAllocator.init(gpa);
         defer fault_arena.deinit();
@@ -224,6 +236,11 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
         }
         return 1;
     };
+
+    // --- execute-only timing (--time) --- to stderr, never interleaving stdout.
+    if (topts.time) {
+        lune.io.eprint("lune: executed in {d} ns ({d:.3} ms)\n", .{ exec_ns, @as(f64, @floatFromInt(exec_ns)) / 1e6 });
+    }
 
     // --- dump recorded traces (--dump-traces) --- to stderr, so they never
     // interleave with the program's stdout. The chunk is still alive here (its
