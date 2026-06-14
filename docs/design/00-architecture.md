@@ -348,9 +348,19 @@ _(nothing yet — design only)_
       from the keyframe, and highlights the current source line in the editor (its
       own decoration channel, alongside the lint and runtime-error channels).
       A generous safepoint cap bounds pathological loops and is surfaced, never
-      silent. **Still to come:** environment/args (needs the effect log to carry
-      inline string results — a wire-format extension), then the visualiser's
-      JIT-trace iteration animation.
+      silent. **Environment/args landed:** three flat builtins — `getenv(name)`
+      (`EffectKind.getenv`=2), `argc()` (=3), `argv(i)` (=4) — extend the effect
+      spine to the last common nondeterministic input. The crux was that `getenv`/
+      `argv` return **heap strings** while a standalone effect log has no heap graph,
+      so the wire result type became a dedicated `EffectResult` union (own tag space,
+      inline length-prefixed string bytes, *not* a `SnapValue` heap-ref) re-interned
+      into the replaying heap on decode (`effect_format_version` 1→2), and
+      `forEachRootHeader` now roots `effect_log` string results so a mid-run
+      collection can't free one in flight. The host seam mirrors clock/random (native
+      CLI reads real `std.process` env + captured argv; wasm injects a null source →
+      nil/0/nil); a Lua-style `arg` *table* is deferred to stdlib (it would need a
+      heap table on the wire). **Still to come:** the visualiser's JIT-trace
+      iteration animation.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
       first. A performance step — but *not* mechanical: regalloc across side
       exits, GC stackmaps/safepoints, and machine-state snapshot-restore are

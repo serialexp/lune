@@ -283,10 +283,19 @@ debug-recorder bandwidth.
 Discriminated union over record kinds (binschema's core feature):
 
 - `Effect{ kind, result }` — a recorded nondeterministic input (F2d, **landed**:
-  `kind` is a stable `EffectKind` ordinal — `clock`=0 (F2d), `random_seed`=1 (F2e) —
-  `result` a `SnapValue`; effect *inputs* are added when the first effect that takes
-  them lands — neither `clock()` nor `random()` has any). Note `random_seed` is
-  logged **once per run** (the PRNG seed), not per `random()` call.
+  `kind` is a stable `EffectKind` ordinal — `clock`=0 (F2d), `random_seed`=1 (F2e),
+  `getenv`=2, `argc`=3, `argv`=4 (env/args). `result` is an **`EffectResult`** —
+  *not* a `SnapValue`. `EffectResult` is a discriminated union over its **own** tag
+  space (nil=0/bool=1/int=2/float=3/string=4) reusing the `Const*` leaves, where the
+  `string` arm carries **inline length-prefixed bytes**. It is deliberately separate
+  from `SnapValue` (whose tag mirrors `Value.Tag`, so a string there is a `heap_ref`
+  resolved against a keyframe's idmap): a standalone effect log has no heap graph, so
+  `getenv`/`argv` string results must travel inline and are re-interned into the
+  replaying VM's heap on decode. effect *inputs* are added when the first effect that
+  takes them lands — none of these has any). Note `random_seed` is logged **once per
+  run** (the PRNG seed), not per `random()` call; the env/args effects log **once per
+  call** like `clock`. The effect-log wire format is at **version 2** (v1 was
+  scalars-only, before the inline-string `EffectResult`).
 - `Keyframe{ index, vm_state_ref }` — periodic full-ish snapshot for replay.
 - `GuardSnapshot{ trace, exit, ir_to_slot_map, sunk_allocs }` — deopt restore.
 - `SideExit{ trace, exit, target }`, `TraceEvent{ ... }`, `GCEvent{ ... }`,

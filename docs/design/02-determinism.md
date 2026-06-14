@@ -162,7 +162,7 @@ that for a time-travel debugger it *is* the architecture.
       every safepoint (`gc_stress`), which is the evidence. (If a generational
       upgrade later adds GC timing that a trace could observe, it must be scheduled
       deterministically and recorded.)
-- [~] **Time / randomness / environment** routed through the effect boundary
+- [x] **Time / randomness / environment** routed through the effect boundary
       (no raw access). **Time is** (F2d): `clock()` reads the host monotonic
       clock and is recorded in `record` mode, fed back in `replay`, never reaching a
       script as raw access. **Randomness is** (F2e): `random()` returns a float in
@@ -179,11 +179,30 @@ that for a time-travel debugger it *is* the architecture.
       differential validator gets randomness for free, and two *fresh* record runs
       differ (different seeds) — that divergence being exactly the nondeterminism
       captured, labelled expected just as `clock()`'s is.
-      **Environment/args remain deferred**: `getenv()` returns a *string* (a heap
-      value), and the effect log carries only **non-heap** results today
-      (`UnsupportedEffectResult`) — a standalone log has no heap graph to resolve ids
-      against. Env therefore needs the effect log to carry inline string bytes (a
-      wire-format extension + codec regen) and is its own increment.
+      **Environment/args are** (this increment): three flat builtins ride the same
+      boundary — `getenv(name)`→`string|nil` (`EffectKind.getenv`=2), `argc()`→`int`
+      (`argc`=3), and `argv(i)`→`string|nil` (`argv`=4). Like `clock()` they log a
+      value *per call*; unlike it, two of them return **heap strings**, which forced
+      two design choices. (1) The standalone effect log has no heap graph, so a string
+      result is carried **inline** (length-prefixed bytes) and re-interned into the
+      caller's heap on decode (`effectser.decodeFile` now takes a `*Heap`). The wire
+      result type is a dedicated `EffectResult` union with its **own** tag space
+      (nil/bool/int/float/**string**), deliberately *not* a `SnapValue` (whose tag
+      mirrors `Value.Tag`, where a string is a `heap_ref`); keeping them separate
+      makes the effect log's law — "scalars + inline strings, never heap refs" —
+      explicit and avoids a dead inline-string branch in the keyframe path. This bumps
+      `effect_format_version` 1→2. (2) A string result parked in the `effect_log`
+      between the native returning it and serialization (record) or feed-back (replay)
+      is otherwise unreferenced, so `forEachRootHeader` now roots `effect_log` heap
+      results — without it a safepoint collection mid-run would de-intern and free the
+      string. Empty-vs-unset is preserved: a set-but-empty var returns `""` (a real
+      heap string), a missing one returns `nil`. The host seam mirrors clock/random —
+      a `HostEnv` source injected in the **record** path only (native CLI: real
+      `std.process` env + captured argv; wasm: a **null** source — browser has no env,
+      so `getenv`→nil, `argc`→0, `argv`→nil); replay reads the log and injects no
+      source. An `arg` convenience *table* (Lua-style) is left to stdlib — it would
+      need a heap table on the wire, whereas these scalars/strings ride the log
+      directly.
       The format was deliberately deferred until the first genuine input+output pair
       (vs. output-only `print`) so it was designed against a real effect, not guessed.
 - [~] **Host-mediated suspension hook.** Reserve "a host effect may suspend its

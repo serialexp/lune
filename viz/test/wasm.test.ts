@@ -17,6 +17,7 @@ import { instantiateLuneFromBytes, type LuneModule } from "../src/wasm/lune";
 import { decodeTraceFile } from "../src/decode";
 import { viewsOf } from "../src/disasm";
 import { decodeSnapshot } from "../src/snapshot";
+import { diffRuns } from "../src/diff";
 
 const wasmPath = fileURLToPath(new URL("../../zig-out/bin/lune.wasm", import.meta.url));
 
@@ -180,4 +181,46 @@ test("keyframe + effects are produced for a deterministic program", () => {
   expect(result.status).toBe(0);
   expect(result.stdout).toBe("3\n");
   expect(result.keyframe.length).toBeGreaterThan(0); // reachable heap graph
+});
+
+test("env/args builtins read the wasm null host: getenv→nil, argc→0, argv→nil", () => {
+  // The browser has no process environment or command-line args, so the wasm
+  // host injects a *null* HostEnv: every getenv misses (nil), argc is 0, and any
+  // argv index is out of range (nil). These are still recorded effects — the call
+  // site is a nondeterministic-input boundary — but their values are fixed here.
+  const result = mod.runSource(
+    'print(getenv("HOME"))\nprint(argc())\nprint(argv(0))\n',
+  );
+  expect(result.status).toBe(0);
+  expect(result.stdout).toBe("nil\n0\nnil\n");
+  // Three effect natives fired (getenv, argc, argv) → three logged effects, read
+  // from the EffectFile length prefix the diff view uses (decode-free).
+  const dv = new DataView(
+    result.effects.buffer,
+    result.effects.byteOffset,
+    result.effects.byteLength,
+  );
+  expect(dv.getUint32(4, true)).toBe(3);
+});
+
+test("env/args reads diff as expected nondeterministic divergence, not a real mismatch", () => {
+  // A program that reads env/args records effects, so it is NOT in the strong
+  // (zero-effect) determinism regime. diffRuns must treat an effects/keyframe/
+  // stdout divergence as *expected* (like clock()/random()), the same way the
+  // EffectFile length prefix the diff reads is unchanged by the v2 result format.
+  const reader = mod.runSource('print(getenv("PATH"))\n');
+  expect(reader.status).toBe(0);
+  // Fabricate a second engine's artifacts that differ only in the recorded input
+  // (one effect each, distinct bytes) — the env-reading program is nondeterministic.
+  const other = mod.runSource('print(getenv("PATH"))\n');
+  const report = diffRuns(
+    { keyframe: reader.keyframe, effects: reader.effects, trace: reader.trace, stdout: reader.stdout, status: reader.status },
+    { keyframe: other.keyframe, effects: other.effects, trace: other.trace, stdout: other.stdout, status: other.status },
+  );
+  // One effect recorded on each side → not the strong-claim regime.
+  expect(report.deterministic).toBe(false);
+  expect(report.wasmEffects).toBe(1);
+  expect(report.nativeEffects).toBe(1);
+  // Whatever differs is excused: no unexplained artifact mismatch survives.
+  expect(report.ok).toBe(true);
 });
