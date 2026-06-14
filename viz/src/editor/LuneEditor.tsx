@@ -4,14 +4,40 @@
 // `source` with a guard so the view<->store sync never loops.
 
 import { onMount, onCleanup, createEffect } from "solid-js";
-import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection } from "@codemirror/view";
-import { EditorState } from "@codemirror/state";
+import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter, drawSelection, Decoration, type DecorationSet } from "@codemirror/view";
+import { EditorState, StateField, StateEffect } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { indentOnInput, bracketMatching } from "@codemirror/language";
 import { lintGutter, lintKeymap } from "@codemirror/lint";
 import { state, setSource, checkSource } from "../store";
 import { luneLanguage, luneHighlighting } from "./luneLanguage";
-import { luneLinter } from "./luneLinter";
+import { luneLinter, byteToUtf16 } from "./luneLinter";
+
+// Runtime-error squiggle — a channel separate from the compile linter. Compile
+// diagnostics (`luneLinter` → wasm `check`) fire as you type; a *runtime* error
+// is only known after a Run, so it lives in its own decoration field rather than
+// the lint state (the two would otherwise overwrite each other). The mark gets a
+// `title` attribute for a native hover tooltip carrying the lune message.
+const setRuntimeError = StateEffect.define<{ from: number; to: number; message: string } | null>();
+
+const runtimeErrorField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(deco, tr) {
+    for (const e of tr.effects) {
+      if (e.is(setRuntimeError)) {
+        return e.value
+          ? Decoration.set([
+              Decoration.mark({ class: "cm-runtime-error", attributes: { title: e.value.message } }).range(e.value.from, e.value.to),
+            ])
+          : Decoration.none;
+      }
+    }
+    // Any edit invalidates the last run's error — clear the squiggle.
+    if (tr.docChanged) return Decoration.none;
+    return deco;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
 
 /** Editor chrome theme matching the dark viz palette. Token colors live in the
  *  HighlightStyle (luneHighlighting); this is gutter/cursor/selection only. */
@@ -50,6 +76,7 @@ export default function LuneEditor() {
           luneLanguage(),
           luneHighlighting,
           luneLinter(checkSource),
+          runtimeErrorField,
           lintGutter(),
           luneTheme,
           EditorView.updateListener.of((u) => {
@@ -70,6 +97,28 @@ export default function LuneEditor() {
     if (view && src !== view.state.doc.toString()) {
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: src } });
     }
+  });
+
+  // Mirror the last run's located runtime error into the editor as a squiggle.
+  // Reactive on both `runErrorSpan` (the byte span) and `runError` (the message
+  // shown in the tooltip). lune spans are UTF-8 byte offsets → map to UTF-16.
+  createEffect(() => {
+    const span = state.runErrorSpan;
+    const message = state.runError ?? "runtime error";
+    if (!view) return;
+    if (!span) {
+      view.dispatch({ effects: setRuntimeError.of(null) });
+      return;
+    }
+    const docLen = view.state.doc.length;
+    const map = byteToUtf16(view.state.doc.toString());
+    const at = (b: number): number => {
+      const i = Math.max(0, Math.min(b, map.length - 1));
+      return Math.max(0, Math.min(map[i] ?? docLen, docLen));
+    };
+    const from = at(span.start);
+    const to = Math.max(from, at(span.end));
+    view.dispatch({ effects: setRuntimeError.of({ from, to, message }) });
   });
 
   onCleanup(() => view?.destroy());

@@ -274,6 +274,14 @@ table.ir tr.guard .op {
   color: #f7768e;
 }
 
+/* Runtime-error squiggle in the editor (a channel separate from compile lint).
+   Wavy red underline under the faulting span; native title tooltip shows the
+   lune message. */
+.cm-runtime-error {
+  text-decoration: underline wavy #f7768e;
+  text-decoration-skip-ink: none;
+}
+
 /* --- dual-execution differential validator (Phase 7 v3) --- */
 .editor-actions {
   display: flex;

@@ -76,7 +76,9 @@ export default function App() {
         <Show when={state.stdout !== null || state.runError !== null}>
           <div class="run-output">
             <Show when={state.runError}>
-              <pre class="run-error">{state.runError}</pre>
+              <pre class="run-error">
+                {state.runErrorSpan ? `line ${state.runErrorSpan.line}: ${state.runError}` : state.runError}
+              </pre>
             </Show>
             <Show when={state.stdout}>
               <pre class="run-stdout">{state.stdout}</pre>

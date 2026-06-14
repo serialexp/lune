@@ -28,6 +28,10 @@ interface VizState {
   stdout: string | null;
   /** Diagnostics / runtime-error text from the last wasm run, if it failed. */
   runError: string | null;
+  /** Located runtime error from the last wasm run (for the editor squiggle):
+   *  1-based `line` + UTF-8 byte span `[start,end)`. Null unless the last run
+   *  faulted with a locatable instruction. */
+  runErrorSpan: { line: number; start: number; end: number } | null;
   /** The full artifact bundle from the last wasm run (kept for the differential
    *  validator in Commit 3). */
   lastRun: LuneRunResult | null;
@@ -53,6 +57,7 @@ const [state, setState] = createStore<VizState>({
   running: false,
   stdout: null,
   runError: null,
+  runErrorSpan: null,
   lastRun: null,
   diff: null,
 });
@@ -109,6 +114,11 @@ function applyWasmResult(result: LuneRunResult, fileName: string): void {
     error: null,
     stdout: result.stdout,
     runError: result.status === 0 ? null : result.diagnostics || "run failed",
+    // A located runtime error (errorLine > 0) drives the editor squiggle. Parse/
+    // compile errors carry no run-time span here (errorLine stays 0).
+    runErrorSpan: result.status !== 0 && result.errorLine > 0
+      ? { line: result.errorLine, start: result.errorStart, end: result.errorEnd }
+      : null,
     lastRun: result,
   });
 }
@@ -119,7 +129,7 @@ function applyWasmResult(result: LuneRunResult, fileName: string): void {
  * views). Errors are captured into the store, never thrown.
  */
 export async function runWasm(): Promise<void> {
-  setState({ running: true, runError: null, diff: null });
+  setState({ running: true, runError: null, runErrorSpan: null, diff: null });
   try {
     const mod = await lune();
     const result = mod.runSource(state.source);
@@ -141,7 +151,7 @@ export async function runWasm(): Promise<void> {
  * run also populates the trace views as usual.
  */
 export async function runBoth(): Promise<void> {
-  setState({ running: true, runError: null, diff: null });
+  setState({ running: true, runError: null, runErrorSpan: null, diff: null });
   try {
     const mod = await lune();
     const [wasm, native] = await Promise.all([

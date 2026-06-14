@@ -34,6 +34,14 @@ export interface LuneRunResult {
   effects: Uint8Array;
   /** binschema trace cache (recorded hot loops). */
   trace: Uint8Array;
+  /** 1-based source line of a runtime error (0 = no located runtime error).
+   *  Set only on a run failure with a faulting frame; parse/compile errors
+   *  leave it 0 (their spans come through `check`). */
+  errorLine: number;
+  /** UTF-8 byte offsets [start,end) of the faulting span, for an editor
+   *  squiggle. Both 0 when there's no located runtime error. */
+  errorStart: number;
+  errorEnd: number;
 }
 
 /** One compile diagnostic from `check` (parse/compile only — no execution). The
@@ -63,8 +71,9 @@ export interface LuneModule {
 }
 
 // Result struct layout (extern struct in wasm_entry.zig), little-endian:
-//   u32 status; then 5 × { u32 ptr; u32 len } for stdout/keyframe/effects/trace/diag.
-const RESULT_BYTES = 4 + 5 * 8;
+//   u32 status; then 5 × { u32 ptr; u32 len } for stdout/keyframe/effects/trace/diag;
+//   then 3 × u32 error_line/error_start/error_end (runtime-error location).
+const RESULT_BYTES = 4 + 5 * 8 + 3 * 4;
 
 // CheckResult layout: u32 status; { u32 ptr; u32 len } diags (len = record count).
 const CHECK_RESULT_BYTES = 4 + 8;
@@ -117,6 +126,9 @@ function wrap(exports: LuneExports): LuneModule {
     const effects = readBuf(exports.memory, dv, 20);
     const trace = readBuf(exports.memory, dv, 28);
     const diag = readBuf(exports.memory, dv, 36);
+    const errorLine = dv.getUint32(44, true);
+    const errorStart = dv.getUint32(48, true);
+    const errorEnd = dv.getUint32(52, true);
 
     exports.lune_free_result(resPtr);
 
@@ -127,6 +139,9 @@ function wrap(exports: LuneExports): LuneModule {
       keyframe,
       effects,
       trace,
+      errorLine,
+      errorStart,
+      errorEnd,
     };
   };
 

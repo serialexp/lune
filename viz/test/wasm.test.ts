@@ -56,6 +56,31 @@ test("a syntax error is reported, not thrown", () => {
   expect(result.diagnostics.length).toBeGreaterThan(0);
 });
 
+test("a runtime error carries a located, Lua-style message", () => {
+  // `d` is an unassigned global (reads nil) → nil arithmetic on line 2.
+  const src = "local s = 0\ns = s + d\n";
+  const result = mod.runSource(src);
+  expect(result.status).toBe(1);
+  expect(result.errorLine).toBe(2);
+  expect(result.diagnostics).toContain("arithmetic");
+  expect(result.diagnostics).toContain("nil");
+  // The byte span brackets the faulting `s + d` operation.
+  expect(src.slice(result.errorStart, result.errorEnd)).toBe("s + d");
+});
+
+test("calling a nil value is a located runtime error", () => {
+  const result = mod.runSource("local f\nf()\n");
+  expect(result.status).toBe(1);
+  expect(result.errorLine).toBe(2);
+  expect(result.diagnostics).toContain("call");
+});
+
+test("a clean run reports no runtime-error location", () => {
+  const result = mod.runSource("print(1 + 2)\n");
+  expect(result.status).toBe(0);
+  expect(result.errorLine).toBe(0);
+});
+
 test("keyframe + effects are produced for a deterministic program", () => {
   const result = mod.runSource("local t = {a = 1, b = 2}\nprint(t.a + t.b)\n");
   expect(result.status).toBe(0);
