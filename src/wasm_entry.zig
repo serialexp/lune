@@ -21,6 +21,8 @@
 //!   export  lune_free(ptr, len)            — free a prior `lune_alloc`
 //!   export  lune_run(src_ptr, src_len) -> *Result
 //!   export  lune_free_result(*Result)      — free a Result and all its buffers
+//!   export  lune_check(src_ptr, src_len) -> *CheckResult
+//!   export  lune_free_check_result(*CheckResult)
 //!
 //! Result layout (extern struct, read by JS via DataView):
 //!   u32 status        0 = ok, 1 = error (see `diag` for the message)
@@ -30,8 +32,19 @@
 //!   {u32 ptr,u32 len} trace      binschema trace cache
 //!   {u32 ptr,u32 len} diag       human-readable diagnostics / error text (utf8)
 //!
+//! CheckResult layout (compile-only validation; for the in-browser editor's live
+//! linter — parse + compile WITHOUT running the program, so there are no side
+//! effects and no risk of an infinite loop hanging the tab):
+//!   u32 status        0 = no errors, 1 = at least one error diagnostic
+//!   {u32 ptr,u32 len} diags      ptr → array of `Diag`; len is the *record count*
+//!                                (NOT a byte length). JS strides @sizeof(Diag).
+//! Diag (extern struct, 24 bytes): { u32 severity (0=error,1=warning), u32 start,
+//!   u32 end, u32 line (1-based), {u32 ptr,u32 len} msg (owned utf8) }. `start`/
+//!   `end` are byte offsets [start,end) into the source the editor passed in.
+//!
 //! Each non-empty buffer is an independent `wasm_allocator` allocation; the
-//! Result struct is one too. `lune_free_result` frees them all.
+//! Result/CheckResult struct is one too. `lune_free_result` /
+//! `lune_free_check_result` free them all.
 
 const std = @import("std");
 const lune = @import("lune");
@@ -67,6 +80,23 @@ const Result = extern struct {
     effects: Buf = .{},
     trace: Buf = .{},
     diag: Buf = .{},
+};
+
+/// One compile diagnostic, flattened for JS (24 bytes; see file header). `start`/
+/// `end` are byte offsets into the source; `msg` is an owned utf8 buffer.
+const Diag = extern struct {
+    severity: u32 = 0,
+    start: u32 = 0,
+    end: u32 = 0,
+    line: u32 = 0,
+    msg: Buf = .{},
+};
+
+/// The result of `lune_check`: a flat array of `Diag` (or null when clean). Note
+/// `diags.len` is the *record count*, not a byte length.
+const CheckResult = extern struct {
+    status: u32 = 0,
+    diags: Buf = .{},
 };
 
 /// Wrap an owned byte slice as a `Buf` (transfers ownership to JS; freed by
@@ -154,6 +184,41 @@ export fn lune_free_result(res: ?*Result) void {
     gpa.destroy(r);
 }
 
+/// Parse + compile a source chunk and return its diagnostics — *without running
+/// it*. This is the editor's live-validation entry: it stops after the frontend,
+/// so there are no side effects and a user's infinite loop can never hang the
+/// tab. Returns 0 only on a catastrophic allocation failure before a CheckResult
+/// exists. The source bytes are read but not freed (JS still owns them).
+export fn lune_check(src_ptr: u32, src_len: u32) ?*CheckResult {
+    const res = gpa.create(CheckResult) catch return null;
+    res.* = .{};
+
+    const src: []const u8 = blk: {
+        if (src_len == 0) break :blk &[_]u8{};
+        const p: [*]const u8 = @ptrFromInt(@as(usize, src_ptr));
+        break :blk p[0..@as(usize, src_len)];
+    };
+
+    check(res, src) catch {
+        // An allocation failure while gathering diagnostics: report the failure
+        // via status but hand back whatever (possibly empty) array we have.
+        res.status = 1;
+    };
+    return res;
+}
+
+/// Free a `CheckResult`, every `Diag.msg`, and the `Diag` array itself.
+export fn lune_free_check_result(res: ?*CheckResult) void {
+    const r = res orelse return;
+    if (r.diags.len != 0) {
+        const base: [*]Diag = @ptrFromInt(@as(usize, r.diags.ptr));
+        const diags = base[0..@as(usize, r.diags.len)];
+        for (diags) |d| freeBuf(d.msg);
+        gpa.free(diags);
+    }
+    gpa.destroy(r);
+}
+
 // --- the run path (mirrors main.zig runSource, host-free) ------------------
 
 fn run(res: *Result, source: []const u8) !void {
@@ -225,6 +290,67 @@ fn run(res: *Result, source: []const u8) !void {
     res.effects = bufFromSlice(try lune.effectser.encodeFile(gpa, vm.effect_log.items));
     res.trace = bufFromSlice(try lune.traceser.encodeFile(gpa, vm.trace.cache.items));
     res.status = 0;
+}
+
+/// Parse + compile only (no execution), collecting every diagnostic — errors and
+/// warnings alike — into `res.diags`. Mirrors `run()`'s parse→Vm.init→compile
+/// prefix; it deliberately stops before `vm.run`. A parse/compile *failure*
+/// (returned error from the frontend) is not itself a diagnostic source here —
+/// the frontend records the reason into `diags` first, which we then surface.
+fn check(res: *CheckResult, source: []const u8) !void {
+    const src0 = try gpa.allocSentinel(u8, source.len, 0);
+    defer gpa.free(src0);
+    @memcpy(src0, source);
+
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+
+    // Parse. On a hard parse error the tree is unusable, but the diagnostics are
+    // already recorded — fall through to emit them.
+    var tree_opt: ?lune.ast.Ast = lune.parser.parse(gpa, src0, &diags) catch null;
+    defer if (tree_opt) |*t| t.deinit();
+
+    // Only attempt compilation if parsing produced a usable tree with no errors;
+    // the compiler needs a heap to intern string constants into.
+    if (tree_opt) |tree| {
+        if (!diags.hasErrors()) {
+            var vm = try lune.interp.Vm.init(gpa);
+            defer vm.deinit();
+            var chunk_opt: ?lune.compiler.Chunk = lune.compiler.compile(gpa, &vm.heap, src0, tree.root, &diags) catch null;
+            if (chunk_opt) |*c| c.deinit();
+        }
+    }
+
+    res.diags = try collectDiags(&diags);
+    res.status = if (diags.hasErrors()) 1 else 0;
+}
+
+/// Flatten a `Diagnostics` list into an owned `[]Diag` (each `msg` duped). The
+/// returned `Buf.len` is the record *count*. On any allocation failure, frees
+/// what was built so far and propagates the error.
+fn collectDiags(diags: *const Diagnostics) !Buf {
+    const items = diags.list.items;
+    if (items.len == 0) return .{};
+
+    const out = try gpa.alloc(Diag, items.len);
+    errdefer gpa.free(out);
+
+    var filled: usize = 0;
+    errdefer for (out[0..filled]) |d| freeBuf(d.msg);
+
+    for (items, 0..) |d, i| {
+        const msg = try gpa.dupe(u8, d.message);
+        out[i] = .{
+            .severity = @intFromEnum(d.severity),
+            .start = d.start,
+            .end = d.end,
+            .line = d.line,
+            .msg = bufFromSlice(msg),
+        };
+        filled = i + 1;
+    }
+
+    return .{ .ptr = @intCast(@intFromPtr(out.ptr)), .len = @intCast(out.len) };
 }
 
 /// Render every recorded diagnostic into one owned utf8 buffer (one per line,

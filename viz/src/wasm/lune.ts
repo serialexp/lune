@@ -14,6 +14,8 @@ interface LuneExports {
   lune_free(ptr: number, len: number): void;
   lune_run(srcPtr: number, srcLen: number): number;
   lune_free_result(resPtr: number): void;
+  lune_check(srcPtr: number, srcLen: number): number;
+  lune_free_check_result(resPtr: number): void;
   lune_dispatch_smoke(iterations: number): number;
 }
 
@@ -34,10 +36,27 @@ export interface LuneRunResult {
   trace: Uint8Array;
 }
 
+/** One compile diagnostic from `check` (parse/compile only — no execution). The
+ *  `start`/`end` are UTF-8 *byte* offsets into the source (the lune frontend's
+ *  native unit); callers targeting a UTF-16 editor must convert. */
+export interface LuneDiagnostic {
+  severity: "error" | "warning";
+  /** Byte offset of the span start (inclusive). */
+  start: number;
+  /** Byte offset of the span end (exclusive). */
+  end: number;
+  /** 1-based line of `start`. */
+  line: number;
+  message: string;
+}
+
 /** A ready-to-use VM instance. */
 export interface LuneModule {
   /** Parse, compile, and run a source chunk; returns its artifacts. */
   runSource(src: string): LuneRunResult;
+  /** Parse + compile a source chunk and return its diagnostics WITHOUT running
+   *  it — the editor's live linter. An empty array means a clean compile. */
+  check(src: string): LuneDiagnostic[];
   /** The guaranteed-tail-call capability gate: run `iterations` `.always_tail`
    *  hops and return the accumulator (== `iterations` iff frames were reused). */
   dispatchSmoke(iterations: number): number;
@@ -46,6 +65,11 @@ export interface LuneModule {
 // Result struct layout (extern struct in wasm_entry.zig), little-endian:
 //   u32 status; then 5 × { u32 ptr; u32 len } for stdout/keyframe/effects/trace/diag.
 const RESULT_BYTES = 4 + 5 * 8;
+
+// CheckResult layout: u32 status; { u32 ptr; u32 len } diags (len = record count).
+const CHECK_RESULT_BYTES = 4 + 8;
+// Diag record layout: u32 severity, start, end, line; { u32 ptr; u32 len } msg.
+const DIAG_BYTES = 4 * 4 + 8;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -106,8 +130,49 @@ function wrap(exports: LuneExports): LuneModule {
     };
   };
 
+  const check = (src: string): LuneDiagnostic[] => {
+    const bytes = encoder.encode(src);
+    const srcPtr = bytes.length === 0 ? 0 : exports.lune_alloc(bytes.length);
+    if (bytes.length !== 0) {
+      new Uint8Array(exports.memory.buffer, srcPtr, bytes.length).set(bytes);
+    }
+
+    const resPtr = exports.lune_check(srcPtr, bytes.length);
+    if (srcPtr !== 0) exports.lune_free(srcPtr, bytes.length);
+    if (resPtr === 0) {
+      throw new Error("lune_check returned null (wasm allocation failure)");
+    }
+
+    // Re-acquire views after the call — memory may have grown.
+    const head = new DataView(exports.memory.buffer, resPtr, CHECK_RESULT_BYTES);
+    const diagsPtr = head.getUint32(4, true);
+    const count = head.getUint32(8, true);
+
+    const out: LuneDiagnostic[] = [];
+    for (let i = 0; i < count; i++) {
+      const off = diagsPtr + i * DIAG_BYTES;
+      const dv = new DataView(exports.memory.buffer, off, DIAG_BYTES);
+      const severity = dv.getUint32(0, true);
+      const start = dv.getUint32(4, true);
+      const end = dv.getUint32(8, true);
+      const line = dv.getUint32(12, true);
+      const msg = readBuf(exports.memory, dv, 16);
+      out.push({
+        severity: severity === 0 ? "error" : "warning",
+        start,
+        end,
+        line,
+        message: decoder.decode(msg),
+      });
+    }
+
+    exports.lune_free_check_result(resPtr);
+    return out;
+  };
+
   return {
     runSource,
+    check,
     dispatchSmoke: (iterations: number) => exports.lune_dispatch_smoke(iterations),
   };
 }
