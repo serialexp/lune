@@ -181,6 +181,96 @@ table.ir tr.guard .op {
   color: var(--guard);
 }
 
+/* --- JIT-trace iteration animation (transport + row highlight) --- */
+.ir-anim {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-bottom: 0.75rem;
+}
+
+.ir-transport {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.ir-transport button {
+  padding: 0.15rem 0.5rem;
+}
+
+.ir-transport button:disabled {
+  opacity: 0.4;
+  cursor: default;
+  border-color: var(--border);
+}
+
+.ir-slider {
+  flex: 1;
+  accent-color: var(--accent);
+}
+
+.ir-pos {
+  font-size: 0.8rem;
+  min-width: 4.5rem;
+  text-align: right;
+}
+
+.ir-readout {
+  font-size: 0.85rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+
+.ir-readout-text {
+  color: var(--accent);
+  font-family: var(--mono, monospace);
+}
+
+.ir-readout-exit .ir-readout-text {
+  color: var(--guard);
+}
+
+.ir-readout-meta {
+  font-size: 0.8rem;
+}
+
+.ir-capped {
+  color: var(--guard);
+}
+
+.ir-no-anim {
+  margin-bottom: 0.75rem;
+}
+
+/* The SSA instruction the current event lands on — mirrors the bytecode
+   step-replay's current-row highlight so the two views read alike. */
+table.ir tr.ir-current td {
+  background: #7aa2f72a;
+}
+
+table.ir tr.ir-current .idx {
+  color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* The side-exit ("exit ramp") — the dramatic deopt back to tier-0, in the
+   guard amber/red register. */
+table.ir tr.ir-exit td {
+  background: color-mix(in srgb, var(--guard) 18%, transparent);
+}
+
+table.ir tr.ir-exit .idx {
+  color: var(--guard);
+  box-shadow: inset 2px 0 0 var(--guard);
+}
+
+table.ir tr.ir-exit .op {
+  color: var(--guard);
+}
+
 .idx {
   color: var(--muted);
 }
