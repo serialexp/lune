@@ -231,6 +231,43 @@
         { "name": "version", "type": "uint32" },
         { "name": "effects", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "Effect" } }
       ]
+    },
+
+    "ExecEvent": {
+      "description": "One event in a trace entry's execution stream (the viz iteration animation). `kind`: value=0 (a non-guard IR instruction produced `value`; `ref` = its SSA index), guard_pass=1 (a guard survived; `value` = the checked operand), commit=2 (a loop back-edge closed; `ref`/`value` unused), exit=3 (the entry side-exited at IR `ref`; terminal; `value` = the failing guard's operand or nil for an arith error). `value` reuses EffectResult — trace values are scalars at this phase (no heap/table IR ops; those abort tracing), so the self-contained scalar-or-inline-string encoding fits exactly.",
+      "sequence": [
+        { "name": "kind",  "type": "uint8" },
+        { "name": "ref",   "type": "uint32" },
+        { "name": "value", "type": "EffectResult" }
+      ]
+    },
+
+    "TraceEntry": {
+      "description": "One trace entry = one IR-interpreter execute() call (an 'exit ramp'): the iterations it spun and the side-exit that ended it. `iterations` is the executor's yield (accurate even when `capped`). `exit_ref` = the faulting IR instruction; `exit_kind`: guard=0 / arith=1 / clean=2. `capped` = the per-entry `events` detail was truncated at the iteration cap (the terminal `exit` event is still present).",
+      "sequence": [
+        { "name": "iterations", "type": "uint32" },
+        { "name": "exit_ref",   "type": "uint32" },
+        { "name": "exit_kind",  "type": "uint8" },
+        { "name": "capped",     "type": "uint8" },
+        { "name": "events", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "ExecEvent" } }
+      ]
+    },
+
+    "TraceExecLog": {
+      "description": "All recorded entries (exit ramps) for one cached trace, keyed by `trace_id` — the trace's index in the cache, which is also the viz's trace-selection key. `entries_capped` = the entry cap was hit and further entries were not recorded.",
+      "sequence": [
+        { "name": "trace_id",       "type": "uint32" },
+        { "name": "entries_capped", "type": "uint8" },
+        { "name": "entries", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "TraceEntry" } }
+      ]
+    },
+
+    "ExecLogFile": {
+      "description": "The top-level trace execution-log artifact (the JIT-trace iteration animation): per-trace execution logs for one run. Its own `version` word — a FOURTH record family sharing the binschema encoding with the trace/keyframe/effect artifacts, never fused (docs/design/04 'two artifacts, one substrate', now four). Unlike the effect log it is an *observation* log, not a replay input — nothing feeds it back; the visualizer animates it.",
+      "sequence": [
+        { "name": "version", "type": "uint32" },
+        { "name": "logs", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "TraceExecLog" } }
+      ]
     }
   }
 }

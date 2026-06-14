@@ -1072,3 +1072,166 @@ pub const EffectFile = struct {
         return result;
     }
 };
+
+pub const ExecEvent = struct {
+    kind: u8,
+    ref: u32,
+    value: EffectResult,
+
+    pub fn encode(self: ExecEvent, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: ExecEvent, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint8(self.kind);
+        try enc.writeUint32(self.ref, .little_endian);
+        try self.value.encodeInto(enc, ctx);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!ExecEvent {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!ExecEvent {
+        var result: ExecEvent = undefined;
+        result.kind = try dec.readUint8();
+        result.ref = try dec.readUint32(.little_endian);
+        result.value = try EffectResult.decodeWith(allocator, dec, root);
+        return result;
+    }
+};
+
+pub const TraceEntry = struct {
+    iterations: u32,
+    exit_ref: u32,
+    exit_kind: u8,
+    capped: u8,
+    events: []const ExecEvent,
+
+    pub fn encode(self: TraceEntry, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: TraceEntry, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint32(self.iterations, .little_endian);
+        try enc.writeUint32(self.exit_ref, .little_endian);
+        try enc.writeUint8(self.exit_kind);
+        try enc.writeUint8(self.capped);
+        try enc.writeUint32(@intCast(self.events.len), .little_endian);
+        for (self.events) |_item_0| {
+            try _item_0.encodeInto(enc, ctx);
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!TraceEntry {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!TraceEntry {
+        var result: TraceEntry = undefined;
+        result.iterations = try dec.readUint32(.little_endian);
+        result.exit_ref = try dec.readUint32(.little_endian);
+        result.exit_kind = try dec.readUint8();
+        result.capped = try dec.readUint8();
+        const _len_4 = try dec.readUint32(.little_endian);
+        const _buf_5 = try allocator.alloc(ExecEvent, @as(usize, _len_4));
+        for (0.._buf_5.len) |_i_2| {
+            _buf_5[_i_2] = try ExecEvent.decodeWith(allocator, dec, root);
+        }
+        result.events = _buf_5;
+        return result;
+    }
+};
+
+pub const TraceExecLog = struct {
+    trace_id: u32,
+    entries_capped: u8,
+    entries: []const TraceEntry,
+
+    pub fn encode(self: TraceExecLog, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: TraceExecLog, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint32(self.trace_id, .little_endian);
+        try enc.writeUint8(self.entries_capped);
+        try enc.writeUint32(@intCast(self.entries.len), .little_endian);
+        for (self.entries) |_item_0| {
+            try _item_0.encodeInto(enc, ctx);
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!TraceExecLog {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!TraceExecLog {
+        var result: TraceExecLog = undefined;
+        result.trace_id = try dec.readUint32(.little_endian);
+        result.entries_capped = try dec.readUint8();
+        const _len_4 = try dec.readUint32(.little_endian);
+        const _buf_5 = try allocator.alloc(TraceEntry, @as(usize, _len_4));
+        for (0.._buf_5.len) |_i_2| {
+            _buf_5[_i_2] = try TraceEntry.decodeWith(allocator, dec, root);
+        }
+        result.entries = _buf_5;
+        return result;
+    }
+};
+
+pub const ExecLogFile = struct {
+    version: u32,
+    logs: []const TraceExecLog,
+
+    pub fn encode(self: ExecLogFile, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: ExecLogFile, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint32(self.version, .little_endian);
+        try enc.writeUint32(@intCast(self.logs.len), .little_endian);
+        for (self.logs) |_item_0| {
+            try _item_0.encodeInto(enc, ctx);
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!ExecLogFile {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!ExecLogFile {
+        var result: ExecLogFile = undefined;
+        result.version = try dec.readUint32(.little_endian);
+        const _len_4 = try dec.readUint32(.little_endian);
+        const _buf_5 = try allocator.alloc(TraceExecLog, @as(usize, _len_4));
+        for (0.._buf_5.len) |_i_2| {
+            _buf_5[_i_2] = try TraceExecLog.decodeWith(allocator, dec, root);
+        }
+        result.logs = _buf_5;
+        return result;
+    }
+};

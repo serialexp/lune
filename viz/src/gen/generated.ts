@@ -3503,3 +3503,634 @@ export class EffectFileDecoder extends SeekableBitStreamDecoder {
   }
 }
 
+/**
+ * One event in a trace entry's execution stream (the viz iteration animation). `kind`: value=0 (a non-guard IR instruction produced `value`; `ref` = its SSA index), guard_pass=1 (a guard survived; `value` = the checked operand), commit=2 (a loop back-edge closed; `ref`/`value` unused), exit=3 (the entry side-exited at IR `ref`; terminal; `value` = the failing guard's operand or nil for an arith error). `value` reuses EffectResult — trace values are scalars at this phase (no heap/table IR ops; those abort tracing), so the self-contained scalar-or-inline-string encoding fits exactly.
+ */
+export interface ExecEventInput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  kind: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  ref: number;
+  /**
+   * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.
+   */
+  value: EffectResultInput;
+}
+
+/**
+ * One event in a trace entry's execution stream (the viz iteration animation). `kind`: value=0 (a non-guard IR instruction produced `value`; `ref` = its SSA index), guard_pass=1 (a guard survived; `value` = the checked operand), commit=2 (a loop back-edge closed; `ref`/`value` unused), exit=3 (the entry side-exited at IR `ref`; terminal; `value` = the failing guard's operand or nil for an arith error). `value` reuses EffectResult — trace values are scalars at this phase (no heap/table IR ops; those abort tracing), so the self-contained scalar-or-inline-string encoding fits exactly.
+ */
+export interface ExecEventOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  kind: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  ref: number;
+  /**
+   * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.
+   */
+  value: EffectResultOutput;
+}
+
+export type ExecEvent = ExecEventOutput;
+
+export class ExecEventEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: ExecEventInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(value.kind);
+    this.writeUint32(value.ref, "little_endian");
+    const encoder_value = new EffectResultEncoder();
+    const encoded_value = encoder_value.encode(value.value);
+    for (const byte of encoded_value) {
+      this.writeUint8(byte);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a ExecEvent value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: ExecEvent): number {
+    let size = 0;
+    size += 5; // kind + ref
+    // value: custom type (EffectResult)
+    const value_encoder = new EffectResultEncoder();
+    size += value_encoder.calculateSize(value.value);
+    return size;
+  }
+}
+
+export class ExecEventDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): ExecEventOutput {
+    const value: any = {};
+
+    value.kind = this.readUint8();
+    value.ref = this.readUint32("little_endian");
+    value.value = {};
+    value.value.tag = this.readUint8();
+    if (value.value.tag === 0) {
+      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value.value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value.body = { type: 'ConstNil', value: payload };
+    }
+    else if (value.value.tag === 1) {
+      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value.value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value.body = { type: 'ConstBool', value: payload };
+    }
+    else if (value.value.tag === 2) {
+      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value.value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value.body = { type: 'ConstInt', value: payload };
+    }
+    else if (value.value.tag === 3) {
+      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value.value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value.body = { type: 'ConstFloat', value: payload };
+    }
+    else if (value.value.tag === 4) {
+      const decoder = new ConstStringDecoder(this.bytes.slice(this.byteOffset), value.value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.value.body = { type: 'ConstString', value: payload };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.value.tag}`);
+    }
+    return value;
+  }
+}
+
+/**
+ * One trace entry = one IR-interpreter execute() call (an 'exit ramp'): the iterations it spun and the side-exit that ended it. `iterations` is the executor's yield (accurate even when `capped`). `exit_ref` = the faulting IR instruction; `exit_kind`: guard=0 / arith=1 / clean=2. `capped` = the per-entry `events` detail was truncated at the iteration cap (the terminal `exit` event is still present).
+ */
+export interface TraceEntryInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  iterations: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  exit_ref: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  exit_kind: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  capped: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  events: ExecEventInput[];
+}
+
+/**
+ * One trace entry = one IR-interpreter execute() call (an 'exit ramp'): the iterations it spun and the side-exit that ended it. `iterations` is the executor's yield (accurate even when `capped`). `exit_ref` = the faulting IR instruction; `exit_kind`: guard=0 / arith=1 / clean=2. `capped` = the per-entry `events` detail was truncated at the iteration cap (the terminal `exit` event is still present).
+ */
+export interface TraceEntryOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  iterations: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  exit_ref: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  exit_kind: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  capped: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  events: ExecEventOutput[];
+}
+
+export type TraceEntry = TraceEntryOutput;
+
+export class TraceEntryEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: TraceEntryInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.iterations, "little_endian");
+    this.writeUint32(value.exit_ref, "little_endian");
+    this.writeUint8(value.exit_kind);
+    this.writeUint8(value.capped);
+    this.writeUint32(value.events.length, "little_endian");
+    for (let value_events__iter_index = 0; value_events__iter_index < value.events.length; value_events__iter_index++) {
+      const value_events__iter = value.events[value_events__iter_index];
+      const encoder_value_events__iter = new ExecEventEncoder();
+      const encoded_value_events__iter = encoder_value_events__iter.encode(value_events__iter);
+      for (const byte of encoded_value_events__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a TraceEntry value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: TraceEntry): number {
+    let size = 0;
+    size += 10; // iterations + exit_ref + exit_kind + capped
+    // events: array (kind: length_prefixed)
+    for (const item of value.events) {
+      const events_itemEncoder = new ExecEventEncoder();
+      size += events_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class TraceEntryDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): TraceEntryOutput {
+    const value: any = {};
+
+    value.iterations = this.readUint32("little_endian");
+    value.exit_ref = this.readUint32("little_endian");
+    value.exit_kind = this.readUint8();
+    value.capped = this.readUint8();
+    value.events = [];
+    const events_length = this.readUint32("little_endian");
+    for (let i = 0; i < events_length; i++) {
+      let events__iter: any;
+      events__iter = {};
+      events__iter.kind = this.readUint8();
+      events__iter.ref = this.readUint32("little_endian");
+      events__iter.value = {};
+      events__iter.value.tag = this.readUint8();
+      if (events__iter.value.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), events__iter.value);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        events__iter.value.body = { type: 'ConstNil', value: payload };
+      }
+      else if (events__iter.value.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), events__iter.value);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        events__iter.value.body = { type: 'ConstBool', value: payload };
+      }
+      else if (events__iter.value.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), events__iter.value);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        events__iter.value.body = { type: 'ConstInt', value: payload };
+      }
+      else if (events__iter.value.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), events__iter.value);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        events__iter.value.body = { type: 'ConstFloat', value: payload };
+      }
+      else if (events__iter.value.tag === 4) {
+        const decoder = new ConstStringDecoder(this.bytes.slice(this.byteOffset), events__iter.value);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        events__iter.value.body = { type: 'ConstString', value: payload };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${events__iter.value.tag}`);
+      }
+      value.events.push(events__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * All recorded entries (exit ramps) for one cached trace, keyed by `trace_id` — the trace's index in the cache, which is also the viz's trace-selection key. `entries_capped` = the entry cap was hit and further entries were not recorded.
+ */
+export interface TraceExecLogInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  trace_id: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  entries_capped: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  entries: TraceEntryInput[];
+}
+
+/**
+ * All recorded entries (exit ramps) for one cached trace, keyed by `trace_id` — the trace's index in the cache, which is also the viz's trace-selection key. `entries_capped` = the entry cap was hit and further entries were not recorded.
+ */
+export interface TraceExecLogOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  trace_id: number;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  entries_capped: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  entries: TraceEntryOutput[];
+}
+
+export type TraceExecLog = TraceExecLogOutput;
+
+export class TraceExecLogEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: TraceExecLogInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.trace_id, "little_endian");
+    this.writeUint8(value.entries_capped);
+    this.writeUint32(value.entries.length, "little_endian");
+    for (let value_entries__iter_index = 0; value_entries__iter_index < value.entries.length; value_entries__iter_index++) {
+      const value_entries__iter = value.entries[value_entries__iter_index];
+      const encoder_value_entries__iter = new TraceEntryEncoder();
+      const encoded_value_entries__iter = encoder_value_entries__iter.encode(value_entries__iter);
+      for (const byte of encoded_value_entries__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a TraceExecLog value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: TraceExecLog): number {
+    let size = 0;
+    size += 5; // trace_id + entries_capped
+    // entries: array (kind: length_prefixed)
+    for (const item of value.entries) {
+      const entries_itemEncoder = new TraceEntryEncoder();
+      size += entries_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class TraceExecLogDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): TraceExecLogOutput {
+    const value: any = {};
+
+    value.trace_id = this.readUint32("little_endian");
+    value.entries_capped = this.readUint8();
+    value.entries = [];
+    const entries_length = this.readUint32("little_endian");
+    for (let i = 0; i < entries_length; i++) {
+      let entries__iter: any;
+      entries__iter = {};
+      entries__iter.iterations = this.readUint32("little_endian");
+      entries__iter.exit_ref = this.readUint32("little_endian");
+      entries__iter.exit_kind = this.readUint8();
+      entries__iter.capped = this.readUint8();
+      entries__iter.events = [];
+      const entries__iter_events_length = this.readUint32("little_endian");
+      for (let i = 0; i < entries__iter_events_length; i++) {
+        let entries__iter_events__iter: any;
+        entries__iter_events__iter = {};
+        entries__iter_events__iter.kind = this.readUint8();
+        entries__iter_events__iter.ref = this.readUint32("little_endian");
+        entries__iter_events__iter.value = {};
+        entries__iter_events__iter.value.tag = this.readUint8();
+        if (entries__iter_events__iter.value.tag === 0) {
+          const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), entries__iter_events__iter.value);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          entries__iter_events__iter.value.body = { type: 'ConstNil', value: payload };
+        }
+        else if (entries__iter_events__iter.value.tag === 1) {
+          const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), entries__iter_events__iter.value);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          entries__iter_events__iter.value.body = { type: 'ConstBool', value: payload };
+        }
+        else if (entries__iter_events__iter.value.tag === 2) {
+          const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), entries__iter_events__iter.value);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          entries__iter_events__iter.value.body = { type: 'ConstInt', value: payload };
+        }
+        else if (entries__iter_events__iter.value.tag === 3) {
+          const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), entries__iter_events__iter.value);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          entries__iter_events__iter.value.body = { type: 'ConstFloat', value: payload };
+        }
+        else if (entries__iter_events__iter.value.tag === 4) {
+          const decoder = new ConstStringDecoder(this.bytes.slice(this.byteOffset), entries__iter_events__iter.value);
+          const payload = decoder.decode();
+          this.byteOffset += decoder.byteOffset;
+          entries__iter_events__iter.value.body = { type: 'ConstString', value: payload };
+        } else {
+          throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${entries__iter_events__iter.value.tag}`);
+        }
+        entries__iter.events.push(entries__iter_events__iter);
+      }
+      value.entries.push(entries__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * The top-level trace execution-log artifact (the JIT-trace iteration animation): per-trace execution logs for one run. Its own `version` word — a FOURTH record family sharing the binschema encoding with the trace/keyframe/effect artifacts, never fused (docs/design/04 'two artifacts, one substrate', now four). Unlike the effect log it is an *observation* log, not a replay input — nothing feeds it back; the visualizer animates it.
+ */
+export interface ExecLogFileInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  version: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  logs: TraceExecLogInput[];
+}
+
+/**
+ * The top-level trace execution-log artifact (the JIT-trace iteration animation): per-trace execution logs for one run. Its own `version` word — a FOURTH record family sharing the binschema encoding with the trace/keyframe/effect artifacts, never fused (docs/design/04 'two artifacts, one substrate', now four). Unlike the effect log it is an *observation* log, not a replay input — nothing feeds it back; the visualizer animates it.
+ */
+export interface ExecLogFileOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  version: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  logs: TraceExecLogOutput[];
+}
+
+export type ExecLogFile = ExecLogFileOutput;
+
+export class ExecLogFileEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: ExecLogFileInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.version, "little_endian");
+    this.writeUint32(value.logs.length, "little_endian");
+    for (let value_logs__iter_index = 0; value_logs__iter_index < value.logs.length; value_logs__iter_index++) {
+      const value_logs__iter = value.logs[value_logs__iter_index];
+      const encoder_value_logs__iter = new TraceExecLogEncoder();
+      const encoded_value_logs__iter = encoder_value_logs__iter.encode(value_logs__iter);
+      for (const byte of encoded_value_logs__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a ExecLogFile value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: ExecLogFile): number {
+    let size = 0;
+    size += 4; // version
+    // logs: array (kind: length_prefixed)
+    for (const item of value.logs) {
+      const logs_itemEncoder = new TraceExecLogEncoder();
+      size += logs_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class ExecLogFileDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): ExecLogFileOutput {
+    const value: any = {};
+
+    value.version = this.readUint32("little_endian");
+    value.logs = [];
+    const logs_length = this.readUint32("little_endian");
+    for (let i = 0; i < logs_length; i++) {
+      let logs__iter: any;
+      logs__iter = {};
+      logs__iter.trace_id = this.readUint32("little_endian");
+      logs__iter.entries_capped = this.readUint8();
+      logs__iter.entries = [];
+      const logs__iter_entries_length = this.readUint32("little_endian");
+      for (let i = 0; i < logs__iter_entries_length; i++) {
+        let logs__iter_entries__iter: any;
+        logs__iter_entries__iter = {};
+        logs__iter_entries__iter.iterations = this.readUint32("little_endian");
+        logs__iter_entries__iter.exit_ref = this.readUint32("little_endian");
+        logs__iter_entries__iter.exit_kind = this.readUint8();
+        logs__iter_entries__iter.capped = this.readUint8();
+        logs__iter_entries__iter.events = [];
+        const logs__iter_entries__iter_events_length = this.readUint32("little_endian");
+        for (let i = 0; i < logs__iter_entries__iter_events_length; i++) {
+          let logs__iter_entries__iter_events__iter: any;
+          logs__iter_entries__iter_events__iter = {};
+          logs__iter_entries__iter_events__iter.kind = this.readUint8();
+          logs__iter_entries__iter_events__iter.ref = this.readUint32("little_endian");
+          logs__iter_entries__iter_events__iter.value = {};
+          logs__iter_entries__iter_events__iter.value.tag = this.readUint8();
+          if (logs__iter_entries__iter_events__iter.value.tag === 0) {
+            const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), logs__iter_entries__iter_events__iter.value);
+            const payload = decoder.decode();
+            this.byteOffset += decoder.byteOffset;
+            logs__iter_entries__iter_events__iter.value.body = { type: 'ConstNil', value: payload };
+          }
+          else if (logs__iter_entries__iter_events__iter.value.tag === 1) {
+            const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), logs__iter_entries__iter_events__iter.value);
+            const payload = decoder.decode();
+            this.byteOffset += decoder.byteOffset;
+            logs__iter_entries__iter_events__iter.value.body = { type: 'ConstBool', value: payload };
+          }
+          else if (logs__iter_entries__iter_events__iter.value.tag === 2) {
+            const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), logs__iter_entries__iter_events__iter.value);
+            const payload = decoder.decode();
+            this.byteOffset += decoder.byteOffset;
+            logs__iter_entries__iter_events__iter.value.body = { type: 'ConstInt', value: payload };
+          }
+          else if (logs__iter_entries__iter_events__iter.value.tag === 3) {
+            const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), logs__iter_entries__iter_events__iter.value);
+            const payload = decoder.decode();
+            this.byteOffset += decoder.byteOffset;
+            logs__iter_entries__iter_events__iter.value.body = { type: 'ConstFloat', value: payload };
+          }
+          else if (logs__iter_entries__iter_events__iter.value.tag === 4) {
+            const decoder = new ConstStringDecoder(this.bytes.slice(this.byteOffset), logs__iter_entries__iter_events__iter.value);
+            const payload = decoder.decode();
+            this.byteOffset += decoder.byteOffset;
+            logs__iter_entries__iter_events__iter.value.body = { type: 'ConstString', value: payload };
+          } else {
+            throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${logs__iter_entries__iter_events__iter.value.tag}`);
+          }
+          logs__iter_entries__iter.events.push(logs__iter_entries__iter_events__iter);
+        }
+        logs__iter.entries.push(logs__iter_entries__iter);
+      }
+      value.logs.push(logs__iter);
+    }
+    return value;
+  }
+}
+

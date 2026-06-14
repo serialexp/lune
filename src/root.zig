@@ -71,6 +71,11 @@ pub const keyframeser = @import("keyframeser.zig");
 /// the generated binschema codec with `traceser`/`keyframeser`).
 pub const effectser = @import("effectser.zig");
 
+/// Phase 7 (trace-iteration animation) — execution-log serialization: maps the
+/// IR-interpreter's per-trace execution logs (`execlog.TraceExecLog`) to/from their
+/// on-disk form (fourth record family; shares the generated binschema codec).
+pub const execlogser = @import("execlogser.zig");
+
 /// Re-exports for ergonomic access.
 pub const Value = value.Value;
 pub const GcHeader = object.GcHeader;
@@ -102,4 +107,5 @@ test {
     _ = traceser;
     _ = keyframeser;
     _ = effectser;
+    _ = execlogser;
 }

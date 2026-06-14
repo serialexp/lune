@@ -88,8 +88,10 @@ pub fn decodeFile(gpa: std.mem.Allocator, heap: *gc.Heap, bytes: []const u8) Dec
 
 /// Map a `Value` to its wire `EffectResult`: scalars directly, a heap string as
 /// inline bytes. A non-string heap value can never be an effect result (effects
-/// return scalars or strings), so it is a serializer-side bug.
-fn toEffectResult(v: Value) DecodeError!schema.EffectResult {
+/// return scalars or strings), so it is a serializer-side bug. Shared with
+/// `execlogser` (the trace-execution log reuses `EffectResult` for its scalar
+/// trace values).
+pub fn toEffectResult(v: Value) DecodeError!schema.EffectResult {
     return switch (v.tag) {
         .nil => .{ .tag = 0, .body = .{ .ConstNil = .{ .pad = 0 } } },
         .boolean => .{ .tag = 1, .body = .{ .ConstBool = .{ .v = @intFromBool(v.asBool()) } } },
@@ -104,8 +106,8 @@ fn toEffectResult(v: Value) DecodeError!schema.EffectResult {
 
 /// Inverse of `toEffectResult`: a scalar maps back directly; an inline string is
 /// re-interned into `heap` (so the result is a live heap string the VM can feed
-/// back to the program on replay).
-fn fromEffectResult(heap: *gc.Heap, er: schema.EffectResult) DecodeError!Value {
+/// back to the program on replay). Shared with `execlogser`.
+pub fn fromEffectResult(heap: *gc.Heap, er: schema.EffectResult) DecodeError!Value {
     return switch (er.body) {
         .ConstNil => Value.nil(),
         .ConstBool => |b| Value.boolean(b.v != 0),
