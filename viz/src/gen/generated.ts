@@ -5,43 +5,6 @@ import { crc32 } from "./crc32.js";
 import { evaluateExpression } from "./expression-evaluator.js";
 import { BinSchemaError, ErrorCode } from "./errors.js";
 
-function __bs_get<T>(expr: () => T): T | undefined {
-  try {
-    return expr();
-  } catch {
-    return undefined;
-  }
-}
-
-function __bs_numeric(value: any): any {
-  if (typeof value === "bigint") {
-    return value;
-  }
-  if (typeof value === "number" && Number.isInteger(value)) {
-    return BigInt(value);
-  }
-  return value;
-}
-
-function __bs_literal(value: number): number | bigint {
-  if (Number.isInteger(value)) {
-    return BigInt(value);
-  }
-  return value;
-}
-
-function __bs_checkCondition(expr: () => any): boolean {
-  try {
-    const result = expr();
-    if (typeof result === "bigint") {
-      return result !== 0n;
-    }
-    return !!result;
-  } catch {
-    return false;
-  }
-}
-
 export interface ConstIntInput {
   /**
    * 64-bit Signed Integer
@@ -80,9 +43,7 @@ export class ConstIntEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: ConstInt): number {
-    let size = 0;
-    size += 8; // v
-    return size;
+    return 8; // v
   }
 }
 
@@ -138,9 +99,7 @@ export class ConstFloatEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: ConstFloat): number {
-    let size = 0;
-    size += 8; // v
-    return size;
+    return 8; // v
   }
 }
 
@@ -196,9 +155,7 @@ export class ConstBoolEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: ConstBool): number {
-    let size = 0;
-    size += 1; // v
-    return size;
+    return 1; // v
   }
 }
 
@@ -254,9 +211,7 @@ export class ConstNilEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: ConstNil): number {
-    let size = 0;
-    size += 1; // pad
-    return size;
+    return 1; // pad
   }
 }
 
@@ -646,14 +601,7 @@ export class IrInstrEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: IrInstr): number {
-    let size = 0;
-    size += 1; // op
-    size += 2; // a
-    size += 2; // b
-    size += 4; // aux
-    size += 1; // ty
-    size += 4; // snap
-    return size;
+    return 14; // op + a + b + aux + ty + snap
   }
 }
 
@@ -731,10 +679,7 @@ export class SlotStoreEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: SlotStore): number {
-    let size = 0;
-    size += 2; // slot
-    size += 2; // ref
-    return size;
+    return 4; // slot + ref
   }
 }
 
@@ -921,8 +866,7 @@ export class TraceEncoder extends BitStreamEncoder {
    */
   calculateSize(value: Trace): number {
     let size = 0;
-    size += 4; // anchor_proto_id
-    size += 4; // anchor_pc
+    size += 8; // anchor_proto_id + anchor_pc
     // instrs: array (kind: length_prefixed)
     for (const item of value.instrs) {
       const instrs_itemEncoder = new IrInstrEncoder();
@@ -1255,9 +1199,7 @@ export class HeapRefEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: HeapRef): number {
-    let size = 0;
-    size += 4; // id
-    return size;
+    return 4; // id
   }
 }
 
@@ -1553,71 +1495,71 @@ export class TableEntryDecoder extends SeekableBitStreamDecoder {
 
     value.key = {};
     value.key.tag = this.readUint8();
-    if (value.tag === 0) {
-      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value);
+    if (value.key.tag === 0) {
+      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value.key);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.key.body = { type: 'ConstNil', value: payload };
     }
-    else if (value.tag === 1) {
-      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.key.tag === 1) {
+      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value.key);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.key.body = { type: 'ConstBool', value: payload };
     }
-    else if (value.tag === 2) {
-      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.key.tag === 2) {
+      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value.key);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.key.body = { type: 'ConstInt', value: payload };
     }
-    else if (value.tag === 3) {
-      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.key.tag === 3) {
+      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value.key);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.key.body = { type: 'ConstFloat', value: payload };
     }
-    else if (value.tag === 4) {
-      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.key.tag === 4) {
+      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value.key);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.key.body = { type: 'HeapRef', value: payload };
     } else {
-      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.tag}`);
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.key.tag}`);
     }
     value.val = {};
     value.val.tag = this.readUint8();
-    if (value.tag === 0) {
-      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value);
+    if (value.val.tag === 0) {
+      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value.val);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.val.body = { type: 'ConstNil', value: payload };
     }
-    else if (value.tag === 1) {
-      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.val.tag === 1) {
+      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value.val);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.val.body = { type: 'ConstBool', value: payload };
     }
-    else if (value.tag === 2) {
-      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.val.tag === 2) {
+      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value.val);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.val.body = { type: 'ConstInt', value: payload };
     }
-    else if (value.tag === 3) {
-      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.val.tag === 3) {
+      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value.val);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.val.body = { type: 'ConstFloat', value: payload };
     }
-    else if (value.tag === 4) {
-      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.val.tag === 4) {
+      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value.val);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.val.body = { type: 'HeapRef', value: payload };
     } else {
-      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.tag}`);
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.val.tag}`);
     }
     return value;
   }
@@ -1863,71 +1805,71 @@ export class HeapTableDecoder extends SeekableBitStreamDecoder {
       entries__iter = {};
       entries__iter.key = {};
       entries__iter.key.tag = this.readUint8();
-      if (entries__iter.tag === 0) {
-        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+      if (entries__iter.key.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), entries__iter.key);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         entries__iter.key.body = { type: 'ConstNil', value: payload };
       }
-      else if (entries__iter.tag === 1) {
-        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+      else if (entries__iter.key.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), entries__iter.key);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         entries__iter.key.body = { type: 'ConstBool', value: payload };
       }
-      else if (entries__iter.tag === 2) {
-        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+      else if (entries__iter.key.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), entries__iter.key);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         entries__iter.key.body = { type: 'ConstInt', value: payload };
       }
-      else if (entries__iter.tag === 3) {
-        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+      else if (entries__iter.key.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), entries__iter.key);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         entries__iter.key.body = { type: 'ConstFloat', value: payload };
       }
-      else if (entries__iter.tag === 4) {
-        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+      else if (entries__iter.key.tag === 4) {
+        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), entries__iter.key);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         entries__iter.key.body = { type: 'HeapRef', value: payload };
       } else {
-        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${entries__iter.tag}`);
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${entries__iter.key.tag}`);
       }
       entries__iter.val = {};
       entries__iter.val.tag = this.readUint8();
-      if (entries__iter.tag === 0) {
-        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+      if (entries__iter.val.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), entries__iter.val);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         entries__iter.val.body = { type: 'ConstNil', value: payload };
       }
-      else if (entries__iter.tag === 1) {
-        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+      else if (entries__iter.val.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), entries__iter.val);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         entries__iter.val.body = { type: 'ConstBool', value: payload };
       }
-      else if (entries__iter.tag === 2) {
-        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+      else if (entries__iter.val.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), entries__iter.val);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         entries__iter.val.body = { type: 'ConstInt', value: payload };
       }
-      else if (entries__iter.tag === 3) {
-        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+      else if (entries__iter.val.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), entries__iter.val);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         entries__iter.val.body = { type: 'ConstFloat', value: payload };
       }
-      else if (entries__iter.tag === 4) {
-        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), entries__iter);
+      else if (entries__iter.val.tag === 4) {
+        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), entries__iter.val);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         entries__iter.val.body = { type: 'HeapRef', value: payload };
       } else {
-        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${entries__iter.tag}`);
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${entries__iter.val.tag}`);
       }
       value.entries.push(entries__iter);
     }
@@ -2114,37 +2056,37 @@ export class HeapUpvalueDecoder extends SeekableBitStreamDecoder {
     value.closed = this.readUint8();
     value.value = {};
     value.value.tag = this.readUint8();
-    if (value.tag === 0) {
-      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value);
+    if (value.value.tag === 0) {
+      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value.value);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.value.body = { type: 'ConstNil', value: payload };
     }
-    else if (value.tag === 1) {
-      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.value.tag === 1) {
+      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value.value);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.value.body = { type: 'ConstBool', value: payload };
     }
-    else if (value.tag === 2) {
-      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.value.tag === 2) {
+      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value.value);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.value.body = { type: 'ConstInt', value: payload };
     }
-    else if (value.tag === 3) {
-      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.value.tag === 3) {
+      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value.value);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.value.body = { type: 'ConstFloat', value: payload };
     }
-    else if (value.tag === 4) {
-      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.value.tag === 4) {
+      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value.value);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.value.body = { type: 'HeapRef', value: payload };
     } else {
-      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.tag}`);
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.value.tag}`);
     }
     return value;
   }
@@ -2360,8 +2302,7 @@ export class HeapObjectEncoder extends BitStreamEncoder {
    */
   calculateSize(value: HeapObject): number {
     let size = 0;
-    size += 4; // id
-    size += 1; // obj_type
+    size += 5; // id + obj_type
     if (value.body.type === 'HeapString') {
       const _enc = new HeapStringEncoder();
       size += _enc.calculateSize(value.body.value);
@@ -2491,10 +2432,7 @@ export class OpenUpvalueRefEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: OpenUpvalueRef): number {
-    let size = 0;
-    size += 4; // stack_index
-    size += 4; // upvalue_id
-    return size;
+    return 8; // stack_index + upvalue_id
   }
 }
 
@@ -2601,13 +2539,7 @@ export class FrameRefEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: FrameRef): number {
-    let size = 0;
-    size += 4; // closure_id
-    size += 4; // pc
-    size += 4; // base
-    size += 2; // ret_dest
-    size += 2; // ret_count
-    return size;
+    return 16; // closure_id + pc + base + ret_dest + ret_count
   }
 }
 
@@ -3197,37 +3129,37 @@ export class EffectDecoder extends SeekableBitStreamDecoder {
     value.kind = this.readUint8();
     value.result = {};
     value.result.tag = this.readUint8();
-    if (value.tag === 0) {
-      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value);
+    if (value.result.tag === 0) {
+      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value.result);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.result.body = { type: 'ConstNil', value: payload };
     }
-    else if (value.tag === 1) {
-      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.result.tag === 1) {
+      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value.result);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.result.body = { type: 'ConstBool', value: payload };
     }
-    else if (value.tag === 2) {
-      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.result.tag === 2) {
+      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value.result);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.result.body = { type: 'ConstInt', value: payload };
     }
-    else if (value.tag === 3) {
-      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.result.tag === 3) {
+      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value.result);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.result.body = { type: 'ConstFloat', value: payload };
     }
-    else if (value.tag === 4) {
-      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value);
+    else if (value.result.tag === 4) {
+      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value.result);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
       value.result.body = { type: 'HeapRef', value: payload };
     } else {
-      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.tag}`);
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.result.tag}`);
     }
     return value;
   }
@@ -3336,37 +3268,37 @@ export class EffectFileDecoder extends SeekableBitStreamDecoder {
       effects__iter.kind = this.readUint8();
       effects__iter.result = {};
       effects__iter.result.tag = this.readUint8();
-      if (effects__iter.tag === 0) {
-        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), effects__iter);
+      if (effects__iter.result.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), effects__iter.result);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         effects__iter.result.body = { type: 'ConstNil', value: payload };
       }
-      else if (effects__iter.tag === 1) {
-        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), effects__iter);
+      else if (effects__iter.result.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), effects__iter.result);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         effects__iter.result.body = { type: 'ConstBool', value: payload };
       }
-      else if (effects__iter.tag === 2) {
-        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), effects__iter);
+      else if (effects__iter.result.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), effects__iter.result);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         effects__iter.result.body = { type: 'ConstInt', value: payload };
       }
-      else if (effects__iter.tag === 3) {
-        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), effects__iter);
+      else if (effects__iter.result.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), effects__iter.result);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         effects__iter.result.body = { type: 'ConstFloat', value: payload };
       }
-      else if (effects__iter.tag === 4) {
-        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), effects__iter);
+      else if (effects__iter.result.tag === 4) {
+        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), effects__iter.result);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
         effects__iter.result.body = { type: 'HeapRef', value: payload };
       } else {
-        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${effects__iter.tag}`);
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${effects__iter.result.tag}`);
       }
       value.effects.push(effects__iter);
     }
