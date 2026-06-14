@@ -5,6 +5,12 @@ import TraceList from "./components/TraceList";
 import TraceView from "./components/TraceView";
 import ReplayPanel from "./components/ReplayPanel";
 
+/** Format a byte count for the run readout: plain bytes under 1 KiB, else KiB. */
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  return `${(n / 1024).toFixed(1)} KiB`;
+}
+
 /** Read a picked/dropped File into the store. */
 async function ingest(file: File) {
   const buf = new Uint8Array(await file.arrayBuffer());
@@ -92,6 +98,13 @@ export default function App() {
               {(t) => (
                 <span class="run-timing">
                   ran in {t().totalMs.toFixed(2)} ms <span class="muted">(execute {t().execMs.toFixed(2)} ms)</span>
+                </span>
+              )}
+            </Show>
+            <Show when={state.lastRun}>
+              {(r) => (
+                <span class="run-timing muted">
+                  trace {fmtBytes(r().trace.length)} · keyframe {fmtBytes(r().keyframe.length)} · effects {fmtBytes(r().effects.length)}
                 </span>
               )}
             </Show>
