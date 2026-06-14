@@ -548,8 +548,8 @@ table.replay-vars td {
 .replay-var-name {
   color: var(--accent);
   white-space: nowrap;
-  /* Size to the label content and never let the value column squash it. */
-  width: 1%;
+  /* Fixed name column: values line up across rows, labels never get squashed. */
+  width: 15%;
   padding-right: 0.6rem;
 }
 
