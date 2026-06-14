@@ -162,6 +162,11 @@ const Result = extern struct {
     /// when the disassembly couldn't be built. Appended last so prior JS field
     /// offsets stay stable.
     disasm: Buf = .{},
+    /// Per-trace **execution log** (`execlogser.ExecLogFile`) for the JIT-trace
+    /// iteration animation: for every cached trace, the recorded entries/exit-ramps
+    /// and their per-iteration events. Empty when no trace executed (no hot loop).
+    /// Appended last so prior JS field offsets stay stable.
+    exec_log: Buf = .{},
 };
 
 /// One compile diagnostic, flattened for JS (24 bytes; see file header). `start`/
@@ -301,6 +306,7 @@ export fn lune_free_result(res: ?*Result) void {
     freeBuf(r.backtrace);
     freeBuf(r.safepoint_lines);
     freeBuf(r.disasm);
+    freeBuf(r.exec_log);
     gpa.destroy(r);
 }
 
@@ -531,6 +537,10 @@ fn run(res: *Result, source: []const u8) !void {
     vm.trace.config.enabled = true;
     vm.trace.config.execute = true;
     vm.trace.config.optimize = true;
+    // Record a per-trace execution log for the visualizer's iteration animation
+    // (every entry/exit-ramp, capped detail). Off the JIT fast path; this is the
+    // instrumented playground run.
+    vm.trace.config.record_exec_log = true;
     vm.effect_mode = .record;
     vm.clock_source = .{ .ctx = &clock_ctx, .nowNs = &wasmClockNs };
     vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &wasmRandomSeed };
@@ -586,6 +596,7 @@ fn run(res: *Result, source: []const u8) !void {
     res.keyframe = bufFromSlice(try lune.keyframeser.encodeSnapshot(gpa, &vm));
     res.effects = bufFromSlice(try lune.effectser.encodeFile(gpa, vm.effect_log.items));
     res.trace = bufFromSlice(try lune.traceser.encodeFile(gpa, vm.trace.cache.items));
+    res.exec_log = bufFromSlice(try lune.execlogser.encodeFile(gpa, vm.trace.exec_logs.items));
     res.status = 0;
 
     // Build the step-debugger index from the just-recorded effect log. This is a
