@@ -270,3 +270,86 @@ table.ir tr.guard .op {
   border: 1px solid #6b3a4f;
   color: #f7768e;
 }
+
+/* --- dual-execution differential validator (Phase 7 v3) --- */
+.editor-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+button.secondary {
+  background: transparent;
+}
+
+.diff {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.6rem;
+  background: var(--panel2);
+}
+
+.diff-ok {
+  border-color: #2f6b4f;
+}
+
+.diff-bad {
+  border-color: #6b3a4f;
+}
+
+.diff-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  margin-bottom: 0.4rem;
+}
+
+.diff-verdict {
+  font-weight: 600;
+}
+
+.diff-ok .diff-verdict {
+  color: #73daca;
+}
+
+.diff-bad .diff-verdict {
+  color: #f7768e;
+}
+
+.diff-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+}
+
+.diff-list li {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.diff-name {
+  display: inline-block;
+  min-width: 5rem;
+  color: var(--muted);
+}
+
+.diff-match .diff-detail {
+  color: #73daca;
+}
+
+.diff-expected .diff-detail {
+  color: #e0af68;
+}
+
+.diff-mismatch .diff-detail {
+  color: #f7768e;
+}
+
+.diff-note {
+  color: var(--muted);
+  font-style: italic;
+}

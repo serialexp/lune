@@ -270,8 +270,27 @@ _(nothing yet — design only)_
       F2c+F2d together: restore a mid-run keyframe of a clock()-using program **and**
       replay its effect log from the cut cursor → identical forward output, even
       though a fresh record run differs (the captured nondeterminism). `--emit-effects`
-      writes the log. **Still to come:** more effect kinds (randomness, env), a
-      user-facing replay/step CLI, then the visualiser's iteration animation.
+      writes the log. **F2-recap → Phase 7 v3 (run lune *in the browser*):** the VM
+      core compiles to **wasm32-freestanding** (`src/wasm_entry.zig`, `zig build
+      wasm`) and runs **in the page** — the viz app now authors, executes, *and*
+      inspects in one place ("Run (wasm)"). wasm forced a clean determinism seam:
+      with no clock syscall, `clock()` had to route through an injected
+      `ClockSource` (a JS `host_now_ns` import; the native CLI injects the Linux
+      monotonic clock — the interpreter holds no platform clock of its own). The
+      guaranteed-tail-call pillar (#4) holds on wasm too: the artifact exports the
+      `dispatch.zig` smoke test (compile-time gate — `@call(.always_tail)` would
+      fail the build if wasm couldn't emit `return_call`) and a `bun` test runs 2M
+      hops in O(1) stack (runtime gate). The payoff is the **dual-execution
+      differential validator** ("Run both + diff", `viz/src/diff.ts`): the same
+      source runs through the wasm VM *and* the native binary (a dev-server `POST
+      /run` subprocess) and every artifact is compared byte-for-byte. Two different
+      engines agreeing is the strongest determinism evidence yet — for a
+      deterministic program, keyframe + effects + trace + stdout are byte-identical
+      across wasm and x86-64 (incl. basic float ops); a `clock()` program's
+      divergence appears only in the effect log, labelled expected (doc 02
+      §cross-engine differential validation). **Still to come:** more effect kinds
+      (randomness, env), a user-facing replay/step CLI, then the visualiser's
+      iteration animation.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
       first. A performance step — but *not* mechanical: regalloc across side
       exits, GC stackmaps/safepoints, and machine-state snapshot-restore are
@@ -648,8 +667,12 @@ tier-0, tier-1a (IR-interpreter), and later tier-1b (native) must agree on every
 program. Differential fuzzing across tiers is the primary correctness mechanism
 behind the Goal of "automated tests across the tiers" — divergence is a bug in
 the faster tier. Replay determinism is itself testable: record once, replay,
-assert identical observable behavior. binschema's cross-language fixtures police
-the trace writer / decoder pair.
+assert identical observable behavior. The same idea extends *across engines*: the
+VM compiled to wasm and the native binary must produce byte-identical
+keyframe/effect/trace output for any deterministic program — two independent
+codegen backends agreeing is a stronger determinism check than two native runs
+(see `02-determinism.md`'s cross-engine differential validator). binschema's
+cross-language fixtures police the trace writer / decoder pair.
 
 ## References
 

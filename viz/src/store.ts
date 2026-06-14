@@ -6,6 +6,8 @@ import { createStore } from "solid-js/store";
 import { decodeTraceFile } from "./decode";
 import { viewsOf, type TraceView } from "./disasm";
 import { loadLune, type LuneModule, type LuneRunResult } from "./wasm/lune";
+import { runNative } from "./native";
+import { diffRuns, type DiffReport } from "./diff";
 
 interface VizState {
   fileName: string | null;
@@ -29,6 +31,8 @@ interface VizState {
   /** The full artifact bundle from the last wasm run (kept for the differential
    *  validator in Commit 3). */
   lastRun: LuneRunResult | null;
+  /** The last dual-execution diff (wasm vs native), null until "Run both". */
+  diff: DiffReport | null;
 }
 
 const DEFAULT_SOURCE = `-- Edit and run in-browser (wasm). A hot loop records a trace.
@@ -50,6 +54,7 @@ const [state, setState] = createStore<VizState>({
   stdout: null,
   runError: null,
   lastRun: null,
+  diff: null,
 });
 
 export { state };
@@ -70,35 +75,65 @@ export function setSource(src: string): void {
   setState("source", src);
 }
 
+/** Decode a wasm run's recorded trace and push it + stdout into the store. The
+ *  trace flows into the existing views exactly as a loaded .lunetrace would. */
+function applyWasmResult(result: LuneRunResult, fileName: string): void {
+  let traces: TraceView[] = [];
+  let version: number | null = null;
+  if (result.trace.length > 0) {
+    const file = decodeTraceFile(result.trace);
+    version = file.version;
+    traces = viewsOf(file);
+  }
+  setState({
+    fileName,
+    version,
+    traces,
+    selected: traces.length > 0 ? 0 : -1,
+    error: null,
+    stdout: result.stdout,
+    runError: result.status === 0 ? null : result.diagnostics || "run failed",
+    lastRun: result,
+  });
+}
+
 /**
  * Run `state.source` through the in-browser wasm VM and surface its artifacts:
  * stdout, diagnostics, and the recorded trace (decoded into the existing trace
  * views). Errors are captured into the store, never thrown.
  */
 export async function runWasm(): Promise<void> {
-  setState({ running: true, runError: null });
+  setState({ running: true, runError: null, diff: null });
   try {
     const mod = await lune();
     const result = mod.runSource(state.source);
-    // Decode the recorded trace cache with the existing pipeline.
-    let traces: TraceView[] = [];
-    let version: number | null = null;
-    if (result.trace.length > 0) {
-      const file = decodeTraceFile(result.trace);
-      version = file.version;
-      traces = viewsOf(file);
-    }
+    applyWasmResult(result, "(wasm run)");
+    setState({ running: false });
+  } catch (e) {
     setState({
-      fileName: "(wasm run)",
-      version,
-      traces,
-      selected: traces.length > 0 ? 0 : -1,
-      error: null,
-      stdout: result.stdout,
-      runError: result.status === 0 ? null : result.diagnostics || "run failed",
-      lastRun: result,
       running: false,
+      runError: e instanceof Error ? e.message : String(e),
     });
+  }
+}
+
+/**
+ * The dual-execution differential validator: run `state.source` through BOTH the
+ * in-browser wasm VM and the native binary (via the dev-server `POST /run`), and
+ * compare their artifacts byte-for-byte. Two different engines agreeing is the
+ * strongest determinism check we have (docs/design/02-determinism.md). The wasm
+ * run also populates the trace views as usual.
+ */
+export async function runBoth(): Promise<void> {
+  setState({ running: true, runError: null, diff: null });
+  try {
+    const mod = await lune();
+    const [wasm, native] = await Promise.all([
+      Promise.resolve(mod.runSource(state.source)),
+      runNative(state.source),
+    ]);
+    applyWasmResult(wasm, "(wasm + native diff)");
+    setState({ diff: diffRuns(wasm, native), running: false });
   } catch (e) {
     setState({
       running: false,

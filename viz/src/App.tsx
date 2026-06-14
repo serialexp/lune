@@ -1,5 +1,5 @@
-import { Show, onMount } from "solid-js";
-import { state, loadBytes, loadFromUrl, setSource, runWasm } from "./store";
+import { For, Show, onMount } from "solid-js";
+import { state, loadBytes, loadFromUrl, setSource, runWasm, runBoth } from "./store";
 import TraceList from "./components/TraceList";
 import TraceView from "./components/TraceView";
 
@@ -56,9 +56,20 @@ export default function App() {
       <section class="editor">
         <div class="editor-head">
           <span class="muted">Author &amp; run in-browser (wasm)</span>
-          <button type="button" disabled={state.running} onClick={() => void runWasm()}>
-            {state.running ? "Running…" : "Run (wasm)"}
-          </button>
+          <div class="editor-actions">
+            <button type="button" disabled={state.running} onClick={() => void runWasm()}>
+              {state.running ? "Running…" : "Run (wasm)"}
+            </button>
+            <button
+              type="button"
+              class="secondary"
+              disabled={state.running}
+              title="Run through both the wasm VM and the native binary, then compare every artifact byte-for-byte"
+              onClick={() => void runBoth()}
+            >
+              Run both + diff
+            </button>
+          </div>
         </div>
         <textarea
           class="source"
@@ -75,6 +86,54 @@ export default function App() {
               <pre class="run-stdout">{state.stdout}</pre>
             </Show>
           </div>
+        </Show>
+
+        <Show when={state.diff} keyed>
+          {(diff) => (
+            <div class="diff" classList={{ "diff-ok": diff.ok, "diff-bad": !diff.ok }}>
+              <div class="diff-head">
+                <span class="diff-verdict">
+                  {diff.ok ? "✓ wasm ≡ native" : "✗ unexplained divergence"}
+                </span>
+                <span class="muted">
+                  {diff.deterministic
+                    ? "deterministic (byte-identity required)"
+                    : `nondeterministic: ${diff.wasmEffects}/${diff.nativeEffects} effect(s) recorded`}
+                </span>
+              </div>
+              <ul class="diff-list">
+                <For each={diff.artifacts}>
+                  {(a) => (
+                    <li classList={{ "diff-match": a.match, "diff-expected": !a.match && a.expectedNote !== null, "diff-mismatch": !a.match && a.expectedNote === null }}>
+                      <span class="diff-name">{a.name}</span>
+                      <Show
+                        when={a.match}
+                        fallback={
+                          <span class="diff-detail">
+                            differ @ byte {a.firstDiffByte} (wasm {a.wasmLen}B / native {a.nativeLen}B)
+                            <Show when={a.expectedNote}>
+                              {" "}— <span class="diff-note">{a.expectedNote}</span>
+                            </Show>
+                          </span>
+                        }
+                      >
+                        <span class="diff-detail">identical ({a.wasmLen}B)</span>
+                      </Show>
+                    </li>
+                  )}
+                </For>
+                <li classList={{ "diff-match": diff.stdoutMatch, "diff-expected": !diff.stdoutMatch && diff.stdoutNote !== null, "diff-mismatch": !diff.stdoutMatch && diff.stdoutNote === null }}>
+                  <span class="diff-name">stdout</span>
+                  <span class="diff-detail">
+                    {diff.stdoutMatch ? "identical" : "differ"}
+                    <Show when={!diff.stdoutMatch && diff.stdoutNote}>
+                      {" "}— <span class="diff-note">{diff.stdoutNote}</span>
+                    </Show>
+                  </span>
+                </li>
+              </ul>
+            </div>
+          )}
         </Show>
       </section>
 

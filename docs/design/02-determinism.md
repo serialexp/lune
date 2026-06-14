@@ -59,6 +59,29 @@ that for a time-travel debugger it *is* the architecture.
       seeded differential fuzz (`src/interp.zig`) adds 64 random integer loops
       under the same three execution modes. The optimizer is a transparent
       rewrite, exactly like recording and execution before it.
+- [x] **Cross-engine differential validation (Phase 7 v3).** The strongest
+      determinism check we have: the *same* source runs through two **different
+      engines** — the in-browser **wasm32** VM (`src/wasm_entry.zig`) and the
+      **native** binary — and their artifacts are compared **byte-for-byte**
+      (`viz/src/diff.ts`, driven from the viz UI's "Run both + diff"; the native
+      side is a dev-server `POST /run` subprocess). Two independently-built engines
+      agreeing is far stronger evidence than two native runs agreeing: it would
+      catch any place where output secretly depended on pointer width, endianness,
+      struct layout, or an unlogged ambient input, because those differ between
+      wasm and x86-64. **Empirical result:** for a program with *zero recorded
+      effects*, the keyframe, effect log, trace, and stdout are **byte-identical**
+      across both engines — including basic IEEE-754 float arithmetic (`+`, `-`,
+      `*`, `/`), which is deterministic across the two targets. This is also the
+      first end-to-end proof that the **clock-as-injected-effect** refactor works
+      as intended: wasm has *no* clock syscall, so `clock()` is forced through the
+      injected `ClockSource` (a JS `host_now_ns` import); the two engines' clock
+      reads differ, and that divergence appears **only** in the effect log (and
+      heap state derived from it), labelled *expected*, never in the trace IR or in
+      clock-independent output. The validator's byte-identity assertion is scoped
+      to deterministic programs; a program that records an effect is verified by
+      *replay*, not by this record-vs-record comparison. The current
+      implementation is byte-level (decode-free); a *structural* divergence view is
+      deferred behind a generated-codec bug (see `TODO.md`).
 
 ### Outstanding
 
@@ -241,7 +264,14 @@ effect.
 
 - [ ] Finalizers/weak refs: ban for v1, or deterministic GC scheduling?
 - [ ] Cross-platform FP: do we guarantee bit-identical replay across machines, or
-      only same-machine? (Same-machine is far cheaper.)
+      only same-machine? (Same-machine is far cheaper.) **Partial data point
+      (Phase 7 v3):** the wasm-vs-native differential validator shows *basic*
+      IEEE-754 ops (`+`, `-`, `*`, `/`) are already bit-identical across wasm32 and
+      x86-64 — those are the deterministic core of the standard. The open risk is
+      narrowed to **transcendentals** (`sin`/`exp`/… via libm) and **NaN payload**
+      bits, which are not yet exercised (we bundle no libm) and would surface in
+      the validator as a flagged divergence. Bit-identical guarantees there would
+      need a single software libm bundled into both engines + NaN canonicalisation.
 - [ ] Effect-log compaction / interning for high-frequency host calls.
 
 ## References
