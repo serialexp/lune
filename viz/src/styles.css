@@ -548,11 +548,13 @@ table.replay-vars td {
 .replay-var-name {
   color: var(--accent);
   white-space: nowrap;
+  /* Size to the label content and never let the value column squash it. */
+  width: 1%;
+  padding-right: 0.6rem;
 }
 
 .replay-var-val {
   color: var(--fg);
-  width: 100%;
 }
 
 /* Current-line highlight while step-replay is paused (its own decoration
