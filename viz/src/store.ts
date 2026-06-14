@@ -5,7 +5,7 @@
 import { createStore } from "solid-js/store";
 import { decodeTraceFile } from "./decode";
 import { viewsOf, type TraceView } from "./disasm";
-import { loadLune, type LuneModule, type LuneRunResult } from "./wasm/lune";
+import { loadLune, type LuneModule, type LuneRunResult, type LuneDiagnostic } from "./wasm/lune";
 import { runNative } from "./native";
 import { diffRuns, type DiffReport } from "./diff";
 
@@ -73,6 +73,22 @@ function lune(): Promise<LuneModule> {
 /** Update the editable source (does not run). */
 export function setSource(src: string): void {
   setState("source", src);
+}
+
+/**
+ * Compile-only validation: parse + compile `src` through the in-browser lune
+ * frontend (the wasm `check` entry — it does NOT run the program) and return its
+ * diagnostics. Drives the editor's live linter. A transient wasm error yields no
+ * diagnostics rather than spamming squiggles. Wasm access stays funnelled through
+ * the store (the editor never touches the module directly — Rule #9).
+ */
+export async function checkSource(src: string): Promise<LuneDiagnostic[]> {
+  try {
+    const mod = await lune();
+    return mod.check(src);
+  } catch {
+    return [];
+  }
 }
 
 /** Decode a wasm run's recorded trace and push it + stdout into the store. The

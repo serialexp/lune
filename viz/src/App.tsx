@@ -1,5 +1,6 @@
 import { For, Show, onMount } from "solid-js";
-import { state, loadBytes, loadFromUrl, setSource, runWasm, runBoth } from "./store";
+import { state, loadBytes, loadFromUrl, runWasm, runBoth } from "./store";
+import LuneEditor from "./editor/LuneEditor";
 import TraceList from "./components/TraceList";
 import TraceView from "./components/TraceView";
 
@@ -71,12 +72,7 @@ export default function App() {
             </button>
           </div>
         </div>
-        <textarea
-          class="source"
-          spellcheck={false}
-          value={state.source}
-          onInput={(e) => setSource(e.currentTarget.value)}
-        />
+        <LuneEditor />
         <Show when={state.stdout !== null || state.runError !== null}>
           <div class="run-output">
             <Show when={state.runError}>

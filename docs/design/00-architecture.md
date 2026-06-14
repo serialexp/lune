@@ -288,7 +288,14 @@ _(nothing yet — design only)_
       deterministic program, keyframe + effects + trace + stdout are byte-identical
       across wasm and x86-64 (incl. basic float ops); a `clock()` program's
       divergence appears only in the effect log, labelled expected (doc 02
-      §cross-engine differential validation). **Still to come:** more effect kinds
+      §cross-engine differential validation). **Phase 7 v4 (in-browser editor):**
+      the authoring textarea became a CodeMirror 6 editor with lune syntax
+      highlighting (a small mode keyed to the real lexer/token set, not a borrowed
+      Lua grammar) and **live validation**: as you type, the editor runs the source
+      through a compile-only wasm entry (`lune_check` — parse + compile, no
+      execution, so an infinite loop can't hang the tab) and underlines errors with
+      the *same diagnostics the native compiler emits*. Validation against the real
+      frontend can't drift from the language. **Still to come:** more effect kinds
       (randomness, env), a user-facing replay/step CLI, then the visualiser's
       iteration animation.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
