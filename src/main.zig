@@ -203,10 +203,18 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
 
     // --- run --- (a program's `print` output reaches stdout via Vm.out == null)
     _ = vm.run(chunk.proto) catch |err| {
-        // Located, Lua-style message from the un-popped faulting frame.
-        if (vm.describeFault(source, err, gpa)) |fault| {
-            defer gpa.free(fault.message);
+        // Located, Lua-style message + call chain from the un-popped frame stack.
+        var fault_arena = std.heap.ArenaAllocator.init(gpa);
+        defer fault_arena.deinit();
+        if (vm.describeFault(source, err, fault_arena.allocator())) |fault| {
             lune.io.eprint("lune: runtime error: {s} at {s}:{d}\n", .{ fault.message, name, fault.line });
+            // A traceback only adds signal when control crossed a call boundary.
+            if (fault.frames.len > 1) {
+                lune.io.eprint("stack traceback:\n", .{});
+                for (fault.frames) |f| {
+                    lune.io.eprint("    {s}:{d}\n", .{ f.name, f.line });
+                }
+            }
         } else |_| {
             lune.io.eprint("lune: runtime error: {s}\n", .{@errorName(err)});
         }

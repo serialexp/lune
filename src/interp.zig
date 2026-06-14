@@ -174,14 +174,27 @@ pub const CallFrame = struct {
 /// `suspend_ctl` is armed (a test / future debugger hook); `run` leaves it null.
 pub const ExecOutcome = union(enum) { finished: FrameResult, suspended };
 
+/// One row of a runtime-error backtrace: a function name plus the source span of
+/// the active instruction in that frame (the faulting instruction for the leaf;
+/// the outgoing call site for every parent). `line` is 1-based.
+pub const FaultFrame = struct {
+    name: []const u8,
+    line: u32 = 0,
+    start: u32 = 0,
+    end: u32 = 0,
+};
+
 /// A located, human-readable description of a runtime error — what
 /// `describeFault` synthesizes from the faulting frame. `start`/`end` are byte
 /// offsets into the source (the faulting instruction's span); `line` is 1-based.
+/// `frames` is the full call chain, **deepest-first** (leaf at index 0); the
+/// top-level `message`/`line`/`start`/`end` describe that leaf frame.
 pub const Fault = struct {
     message: []const u8,
     line: u32 = 0,
     start: u32 = 0,
     end: u32 = 0,
+    frames: []const FaultFrame = &.{},
 };
 
 /// Mid-execution suspend trigger (test / debugger hook; null = never suspend, the
@@ -385,7 +398,29 @@ pub const Vm = struct {
                 else => try arena.dupe(u8, @errorName(err)),
             },
         };
-        return .{ .message = message, .line = line, .start = span.start, .end = span.end };
+
+        // Build the full call chain, deepest-first. `exec` does not unwind
+        // `self.frames` on error, so every live frame is intact. The leaf's pc is
+        // the faulting instruction; a parent's pc is the *resume cursor* — one
+        // past its outgoing `call` (set at the call site before pushing the
+        // child) — so its call-site instruction is `pc -| 1`.
+        const frames = try arena.alloc(FaultFrame, self.depth);
+        var i: usize = self.depth;
+        while (i > 0) {
+            i -= 1;
+            const f = &self.frames[i];
+            const fp = f.closure.proto;
+            const fpc: usize = if (i == self.depth - 1) f.pc else f.pc -| 1;
+            const fspan: bytecode.Span = if (fpc < fp.spans.len) fp.spans[fpc] else .{};
+            frames[self.depth - 1 - i] = .{
+                .name = fp.name,
+                .line = compiler.lineFromOffset(source, fspan.start),
+                .start = fspan.start,
+                .end = fspan.end,
+            };
+        }
+
+        return .{ .message = message, .line = line, .start = span.start, .end = span.end, .frames = frames };
     }
 
     /// Push a new activation onto the explicit call stack and make it the top
@@ -1056,6 +1091,44 @@ test "describeFault: calling a nil value names the call and the type" {
     try testing.expectEqual(@as(u32, 2), fault.line);
     try testing.expect(std.mem.indexOf(u8, fault.message, "call") != null);
     try testing.expect(std.mem.indexOf(u8, fault.message, "nil") != null);
+}
+
+test "describeFault: a nested fault yields a deepest-first backtrace (leaf + call site)" {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    // `f` faults on line 2 (nil arithmetic); it is called from `main` on line 5.
+    const src =
+        \\function f(x)
+        \\  return x + nope
+        \\end
+        \\local s = 0
+        \\s = f(1)
+    ;
+    var diags = diag.Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parser.parse(testing.allocator, src, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    var chunk = try compiler.compile(testing.allocator, &vm.heap, src, tree.root, &diags);
+    defer chunk.deinit();
+
+    try testing.expectError(Error.TypeError, vm.run(chunk.proto));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fault = try vm.describeFault(src, Error.TypeError, arena.allocator());
+
+    // Two live frames at the fault: f (leaf) called from main.
+    try testing.expectEqual(@as(usize, 2), fault.frames.len);
+    // Leaf = f, faulting on line 2; top-level fields mirror the leaf.
+    try testing.expectEqualStrings("f", fault.frames[0].name);
+    try testing.expectEqual(@as(u32, 2), fault.frames[0].line);
+    try testing.expectEqual(@as(u32, 2), fault.line);
+    try testing.expect(std.mem.indexOf(u8, fault.message, "arithmetic") != null);
+    // Parent = main, located at the call site `f(1)` on line 5 (pc -| 1).
+    try testing.expectEqualStrings("main", fault.frames[1].name);
+    try testing.expectEqual(@as(u32, 5), fault.frames[1].line);
 }
 
 test "load_const pulls float literals from the pool" {
