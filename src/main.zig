@@ -137,7 +137,12 @@ pub fn main(init: std.process.Init) u8 {
             lune.io.eprint("lune: error: -e requires a chunk argument\n", .{});
             return 2;
         };
-        return runSource(gpa, init.io, "=(command line)", chunk, topts);
+        // Program argv for `-e`: argv(0) = "-e", then any trailing user args.
+        var prog_argv: std.ArrayList([]const u8) = .empty;
+        defer prog_argv.deinit(gpa);
+        prog_argv.append(gpa, "-e") catch return 1;
+        while (it.next()) |a| prog_argv.append(gpa, a) catch return 1;
+        return runSource(gpa, init.io, "=(command line)", chunk, topts, init.environ_map, prog_argv.items);
     }
 
     // Otherwise the first non-option argument is a script path.
@@ -146,13 +151,18 @@ pub fn main(init: std.process.Init) u8 {
         return 1;
     };
     defer gpa.free(source);
-    return runSource(gpa, init.io, first, source, topts);
+    // Program argv for a script: argv(0) = the script path, then trailing user args.
+    var prog_argv: std.ArrayList([]const u8) = .empty;
+    defer prog_argv.deinit(gpa);
+    prog_argv.append(gpa, first) catch return 1;
+    while (it.next()) |a| prog_argv.append(gpa, a) catch return 1;
+    return runSource(gpa, init.io, first, source, topts, init.environ_map, prog_argv.items);
 }
 
 /// Parse, compile, and run one source chunk. Returns the process exit code.
 /// `name` labels the chunk in diagnostics (a file path or a synthetic name).
 /// `topts` controls the tracing-JIT recorder (off by default).
-fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [:0]const u8, topts: TraceOpts) u8 {
+fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [:0]const u8, topts: TraceOpts, env_map: *std.process.Environ.Map, argv: []const []const u8) u8 {
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
 
@@ -190,6 +200,11 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // supplies only the one nondeterministic seed (OS entropy here). `random()` is
     // `RandomUnavailable` without it.
     vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &nativeRandomSeed };
+    // Inject the native env/args window for `getenv`/`argc`/`argv`. `env_ctx` is a
+    // stack local that outlives `vm.run` below; the env is read from the OS, argv
+    // is the program's command line. `getenv`/`argv` are `EnvUnavailable` without it.
+    var env_ctx = EnvCtx{ .env = env_map, .argv = argv };
+    vm.host_env = .{ .ctx = &env_ctx, .getenv = &hostGetenv, .argCount = &hostArgCount, .arg = &hostArg };
     // `--emit-effects` records the nondeterministic-input log during the run.
     if (topts.effects_path != null) vm.effect_mode = .record;
 
@@ -301,6 +316,30 @@ fn nativeRandomSeed(_: *anyopaque) u64 {
     // read of 8 bytes of kernel entropy; flags = 0.
     _ = std.os.linux.getrandom(&bytes, bytes.len, 0);
     return std.mem.readInt(u64, &bytes, .little);
+}
+
+/// Backing state for the native `getenv`/`argc`/`argv` effects: the process
+/// environment map and the program's command-line argv (both owned by the
+/// process `Init`, valid for the whole run). Injected as `Vm.host_env`.
+const EnvCtx = struct {
+    env: *std.process.Environ.Map,
+    argv: []const []const u8,
+};
+
+fn hostGetenv(ctx: *anyopaque, name: []const u8) ?[]const u8 {
+    const self: *EnvCtx = @ptrCast(@alignCast(ctx));
+    return self.env.get(name);
+}
+
+fn hostArgCount(ctx: *anyopaque) i64 {
+    const self: *EnvCtx = @ptrCast(@alignCast(ctx));
+    return @intCast(self.argv.len);
+}
+
+fn hostArg(ctx: *anyopaque, i: i64) ?[]const u8 {
+    const self: *EnvCtx = @ptrCast(@alignCast(ctx));
+    if (i < 0 or i >= self.argv.len) return null;
+    return self.argv[@intCast(i)];
 }
 
 /// Serialize a whole-VM keyframe snapshot to `path` (binschema wire format).
