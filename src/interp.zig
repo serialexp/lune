@@ -174,6 +174,16 @@ pub const CallFrame = struct {
 /// `suspend_ctl` is armed (a test / future debugger hook); `run` leaves it null.
 pub const ExecOutcome = union(enum) { finished: FrameResult, suspended };
 
+/// A located, human-readable description of a runtime error — what
+/// `describeFault` synthesizes from the faulting frame. `start`/`end` are byte
+/// offsets into the source (the faulting instruction's span); `line` is 1-based.
+pub const Fault = struct {
+    message: []const u8,
+    line: u32 = 0,
+    start: u32 = 0,
+    end: u32 = 0,
+};
+
 /// Mid-execution suspend trigger (test / debugger hook; null = never suspend, the
 /// normal `run` path). At each dispatch-loop safepoint, `exec` suspends the first
 /// time both conditions hold: at least `after_safepoints` safepoints have elapsed
@@ -333,6 +343,51 @@ pub const Vm = struct {
         return self.exec();
     }
 
+    /// Build a located, human-readable description of a runtime error, read from
+    /// the un-popped top frame (`exec` does not unwind `self.frames` on error —
+    /// see the `frame.pc = cur_pc` sync in `exec`). The faulting instruction's
+    /// opcode and live operand *values* tell us the operation and the offending
+    /// type; its `Proto.spans[pc]` gives the source range and line.
+    ///
+    /// Call only immediately after `run`/`exec` returned `err`: it inspects live
+    /// registers, so nothing must have executed since. `arena` owns the returned
+    /// message.
+    pub fn describeFault(self: *Vm, source: []const u8, err: Error, arena: std.mem.Allocator) std.mem.Allocator.Error!Fault {
+        // No frame (e.g. main chunk too big for the stack) → just the error name.
+        if (self.depth == 0) return .{ .message = try arena.dupe(u8, @errorName(err)) };
+
+        const frame = &self.frames[self.depth - 1];
+        const proto = frame.closure.proto;
+        const pc = frame.pc;
+        if (pc >= proto.code.len) return .{ .message = try arena.dupe(u8, @errorName(err)) };
+
+        const instr = proto.code[pc];
+        const regs = self.stack[frame.base .. frame.base + proto.num_registers];
+        const span: bytecode.Span = if (pc < proto.spans.len) proto.spans[pc] else .{};
+        const line = compiler.lineFromOffset(source, span.start);
+
+        const message: []const u8 = switch (err) {
+            Error.StackOverflow => try arena.dupe(u8, "stack overflow"),
+            Error.DivisionByZero => try arena.dupe(u8, "attempt to perform integer division or modulo by zero"),
+            else => switch (instr.op) {
+                .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr => try std.fmt.allocPrint(
+                    arena,
+                    "attempt to perform arithmetic on a {s} value",
+                    .{firstNonNumber(regs[instr.b], regs[instr.c]).typeName()},
+                ),
+                .neg, .bnot => try std.fmt.allocPrint(arena, "attempt to perform arithmetic on a {s} value", .{regs[instr.b].typeName()}),
+                .len => try std.fmt.allocPrint(arena, "attempt to get length of a {s} value", .{regs[instr.b].typeName()}),
+                .concat => try std.fmt.allocPrint(arena, "attempt to concatenate a {s} value", .{firstNonConcatable(regs[instr.b], regs[instr.c]).typeName()}),
+                .lt, .le, .gt, .ge => try std.fmt.allocPrint(arena, "attempt to compare {s} with {s}", .{ regs[instr.b].typeName(), regs[instr.c].typeName() }),
+                .get_index => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs[instr.b].typeName()}),
+                .set_index => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs[instr.a].typeName()}),
+                .call => try std.fmt.allocPrint(arena, "attempt to call a {s} value", .{regs[instr.a].typeName()}),
+                else => try arena.dupe(u8, @errorName(err)),
+            },
+        };
+        return .{ .message = message, .line = line, .start = span.start, .end = span.end };
+    }
+
     /// Push a new activation onto the explicit call stack and make it the top
     /// frame. The single chokepoint for both the main chunk (`run`) and nested
     /// `call`s, so the depth/stack bounds and the `stack_top` raise are enforced
@@ -451,6 +506,12 @@ pub const Vm = struct {
             }
 
             const cur_pc = pc;
+            // Keep the faulting location recoverable: on a runtime error a `try`
+            // below propagates straight out of `exec` (the explicit frame stack
+            // is *not* unwound), so the top frame's `pc` is what `describeFault`
+            // reads. One store/iteration; tier-0 is the correctness oracle, not a
+            // hot tier (the JIT is the speed story).
+            frame.pc = cur_pc;
             const instr = code[pc];
             pc += 1;
             // Phase 5 recording hook: while a trace is being recorded, mirror this
@@ -800,6 +861,23 @@ fn narrowError(e: anyerror) Error {
     };
 }
 
+/// For an arithmetic fault on `x op y`, the operand that wasn't a number (the
+/// one to blame). Falls back to `x` if both are numbers (shouldn't happen — the
+/// op only faults when one isn't).
+fn firstNonNumber(x: Value, y: Value) Value {
+    return if (!x.isNumber()) x else y;
+}
+
+/// For a concatenation fault, the operand lune's `concat` couldn't coerce —
+/// anything that is neither a number nor a string.
+fn firstNonConcatable(x: Value, y: Value) Value {
+    return if (!concatable(x)) x else y;
+}
+
+fn concatable(v: Value) bool {
+    return v.isNumber() or (v.isHeap() and v.heapType() == .string);
+}
+
 /// The `print` built-in — the canonical host-effect at the embedding boundary.
 /// Writes its arguments tab-separated, newline-terminated, to stdout (`io.zig`,
 /// the one churny-writer wrapper) and returns `nil`. In a later phase this is
@@ -924,6 +1002,60 @@ test "arithmetic: (2 + 3) * 4 == 20" {
     const r = try runCode(&code, &.{}, 2);
     try testing.expect(r.isInt());
     try testing.expectEqual(@as(i64, 20), r.asInt());
+}
+
+test "describeFault: arithmetic on a nil value names the op, type, line, and span" {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const src =
+        \\local s = 0
+        \\s = s + d
+    ;
+    var diags = diag.Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parser.parse(testing.allocator, src, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    var chunk = try compiler.compile(testing.allocator, &vm.heap, src, tree.root, &diags);
+    defer chunk.deinit();
+
+    try testing.expectError(Error.TypeError, vm.run(chunk.proto));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fault = try vm.describeFault(src, Error.TypeError, arena.allocator());
+    try testing.expectEqual(@as(u32, 2), fault.line);
+    try testing.expect(std.mem.indexOf(u8, fault.message, "arithmetic") != null);
+    try testing.expect(std.mem.indexOf(u8, fault.message, "nil") != null);
+    // The faulting span underlines the whole `s + d` operation on line 2.
+    try testing.expectEqualStrings("s + d", src[fault.start..fault.end]);
+}
+
+test "describeFault: calling a nil value names the call and the type" {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const src =
+        \\local f
+        \\f()
+    ;
+    var diags = diag.Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parser.parse(testing.allocator, src, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    var chunk = try compiler.compile(testing.allocator, &vm.heap, src, tree.root, &diags);
+    defer chunk.deinit();
+
+    try testing.expectError(Error.TypeError, vm.run(chunk.proto));
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fault = try vm.describeFault(src, Error.TypeError, arena.allocator());
+    try testing.expectEqual(@as(u32, 2), fault.line);
+    try testing.expect(std.mem.indexOf(u8, fault.message, "call") != null);
+    try testing.expect(std.mem.indexOf(u8, fault.message, "nil") != null);
 }
 
 test "load_const pulls float literals from the pool" {

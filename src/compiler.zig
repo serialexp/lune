@@ -33,6 +33,7 @@ const diag = @import("diag.zig");
 const Instr = bytecode.Instr;
 const OpCode = bytecode.OpCode;
 const Proto = bytecode.Proto;
+const Span = bytecode.Span;
 const UpvalDesc = bytecode.UpvalDesc;
 const Value = value.Value;
 const Diagnostics = diag.Diagnostics;
@@ -111,6 +112,7 @@ pub fn compileWithOptions(
     const proto = try c.arena.create(Proto);
     proto.* = .{
         .code = c.code.items,
+        .spans = c.spans.items,
         .constants = c.constants.items,
         .num_registers = c.max_reg,
         .protos = c.protos.items,
@@ -133,6 +135,18 @@ pub fn compileWithOptions(
 /// children were created as mutable `*Proto` in the compile arena (see
 /// `compileFunction`); the `[]const *const Proto` field type is only a
 /// downstream immutability contract, not the original allocation's constness.
+/// 1-based source line containing byte `offset` (counts newlines before it).
+/// Shared by the compiler's diagnostics and the runtime-error path in `interp`.
+pub fn lineFromOffset(source: []const u8, offset: u32) u32 {
+    var line: u32 = 1;
+    var i: usize = 0;
+    const end = @min(offset, source.len);
+    while (i < end) : (i += 1) {
+        if (source[i] == '\n') line += 1;
+    }
+    return line;
+}
+
 fn assignProtoIds(proto: *Proto, next: *u32) void {
     proto.id = next.*;
     next.* += 1;
@@ -213,6 +227,15 @@ const Compiler = struct {
     parent: ?*Compiler = null,
 
     code: std.ArrayList(Instr) = .empty,
+    /// Source span per emitted instruction, parallel to `code` (→ `Proto.spans`).
+    /// `emit` stamps each instruction with `cur_span`, so the runtime-error path
+    /// can map a faulting `pc` back to source. Kept in lockstep: every `emit`
+    /// appends to both.
+    spans: std.ArrayList(Span) = .empty,
+    /// The source span currently being compiled, set at statement/expression
+    /// boundaries (`compileStmt`/`compileExprTo`). Whatever `emit` runs under
+    /// gets stamped with this. Defaults to the start of source.
+    cur_span: ast.Span = .{ .start = 0, .end = 0 },
     constants: std.ArrayList(Value) = .empty,
     locals: std.ArrayList(Local) = .empty,
     loops: std.ArrayList(Loop) = .empty,
@@ -242,6 +265,7 @@ const Compiler = struct {
 
     fn emit(self: *Compiler, instr: Instr) Error!usize {
         try self.code.append(self.arena, instr);
+        try self.spans.append(self.arena, .{ .start = self.cur_span.start, .end = self.cur_span.end });
         return self.code.items.len - 1;
     }
 
@@ -446,6 +470,7 @@ const Compiler = struct {
     }
 
     fn compileStmt(self: *Compiler, s: *const ast.Stmt) Error!void {
+        self.cur_span = s.span;
         switch (s.data) {
             .local => |l| try self.compileLocal(l),
             .assign => |a| try self.compileAssign(a),
@@ -676,6 +701,7 @@ const Compiler = struct {
 
     /// Emit code so that `R[dest]` holds the value of `e`.
     fn compileExprTo(self: *Compiler, e: *const ast.Expr, dest: u16) Error!void {
+        self.cur_span = e.span;
         switch (e.data) {
             .nil => _ = try self.emit(Instr.opA(.load_nil, dest)),
             .bool => |b| _ = try self.emit(Instr.opAB(.load_bool, dest, @intFromBool(b))),
@@ -768,6 +794,10 @@ const Compiler = struct {
         try self.compileExprTo(lhs, t1);
         const t2 = try self.alloc1();
         try self.compileExprTo(rhs, t2);
+        // Compiling the operands reset `cur_span`; re-stamp the binop with the
+        // whole `lhs op rhs` span so a runtime fault here underlines the
+        // operation (which always contains the offending operand).
+        self.cur_span = .{ .start = lhs.span.start, .end = rhs.span.end };
         _ = try self.emit(Instr.opABC(binOpCode(op), dest, t1, t2));
         self.freeTo(m);
     }
@@ -834,6 +864,7 @@ const Compiler = struct {
         const proto = try self.arena.create(Proto);
         proto.* = .{
             .code = child.code.items,
+            .spans = child.spans.items,
             .constants = child.constants.items,
             .num_registers = child.max_reg,
             .num_params = child.num_params,
@@ -1016,13 +1047,7 @@ const Compiler = struct {
     }
 
     fn lineOf(self: *const Compiler, offset: u32) u32 {
-        var line: u32 = 1;
-        var i: usize = 0;
-        const end = @min(offset, self.source.len);
-        while (i < end) : (i += 1) {
-            if (self.source[i] == '\n') line += 1;
-        }
-        return line;
+        return lineFromOffset(self.source, offset);
     }
 
     fn fail(self: *Compiler, span: ast.Span, comptime message: []const u8) Error {
@@ -1444,6 +1469,35 @@ test "unsupported construct produces a diagnostic, not a crash" {
     defer vm.deinit();
     try testing.expectError(Error.CompileError, compile(testing.allocator, &vm.heap, src, tree.root, &diags));
     try testing.expect(diags.hasErrors());
+}
+
+test "per-instruction spans: parallel to code and map to source lines" {
+    const src =
+        \\local a = 1
+        \\local b = 2
+        \\return a + b
+    ;
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parser.parse(testing.allocator, src, &diags);
+    defer tree.deinit();
+    var vm = try interp.Vm.init(testing.allocator);
+    defer vm.deinit();
+    var chunk = try compile(testing.allocator, &vm.heap, src, tree.root, &diags);
+    defer chunk.deinit();
+
+    const proto = chunk.proto;
+    // Every instruction carries a span (the two arrays stay in lockstep).
+    try testing.expectEqual(proto.code.len, proto.spans.len);
+    // The `add` emitted for `a + b` is stamped with line 3.
+    var saw_add = false;
+    for (proto.code, proto.spans) |instr, span| {
+        if (instr.op == .add) {
+            saw_add = true;
+            try testing.expectEqual(@as(u32, 3), lineFromOffset(src, span.start));
+        }
+    }
+    try testing.expect(saw_add);
 }
 
 /// Compile `src` with an explicit known-globals set and run `check` against the

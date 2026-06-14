@@ -192,9 +192,19 @@ pub const UpvalDesc = struct {
 /// main chunk is just the top-level prototype). A runtime *closure* (Increment D)
 /// pairs a `Proto` with captured upvalues; the `Proto` itself is shared and
 /// constant.
+/// A half-open `[start, end)` byte range into the original source. Mirrors
+/// `ast.Span`'s shape, redeclared here so bytecode does not depend on `ast`.
+pub const Span = struct { start: u32 = 0, end: u32 = 0 };
+
 pub const Proto = struct {
     /// Instruction stream.
     code: []const Instr,
+    /// Source span per instruction, parallel to `code` (same index = same
+    /// instruction). Used only on the cold paths — runtime-error location and
+    /// disassembly — never in the hot dispatch loop. Defaults empty so
+    /// hand-built protos (tests, IR paths) need not supply it; consumers must
+    /// bounds-check `pc < spans.len` before indexing.
+    spans: []const Span = &.{},
     /// Constant pool: literals too large for an immediate (big ints, all floats
     /// and strings, global names). Indexed by `load_const`/`get_global` etc.
     constants: []const Value = &.{},

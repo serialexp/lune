@@ -203,7 +203,13 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
 
     // --- run --- (a program's `print` output reaches stdout via Vm.out == null)
     _ = vm.run(chunk.proto) catch |err| {
-        lune.io.eprint("lune: error: runtime: {s}\n", .{@errorName(err)});
+        // Located, Lua-style message from the un-popped faulting frame.
+        if (vm.describeFault(source, err, gpa)) |fault| {
+            defer gpa.free(fault.message);
+            lune.io.eprint("lune: runtime error: {s} at {s}:{d}\n", .{ fault.message, name, fault.line });
+        } else |_| {
+            lune.io.eprint("lune: runtime error: {s}\n", .{@errorName(err)});
+        }
         return 1;
     };
 

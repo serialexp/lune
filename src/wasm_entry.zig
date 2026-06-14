@@ -31,6 +31,9 @@
 //!   {u32 ptr,u32 len} effects    binschema effect log
 //!   {u32 ptr,u32 len} trace      binschema trace cache
 //!   {u32 ptr,u32 len} diag       human-readable diagnostics / error text (utf8)
+//!   u32 error_line    1-based source line of a runtime error (0 = none)
+//!   u32 error_start   byte offset [start,end) of the faulting span (for a squiggle)
+//!   u32 error_end
 //!
 //! CheckResult layout (compile-only validation; for the in-browser editor's live
 //! linter — parse + compile WITHOUT running the program, so there are no side
@@ -80,6 +83,11 @@ const Result = extern struct {
     effects: Buf = .{},
     trace: Buf = .{},
     diag: Buf = .{},
+    /// Runtime-error location, set only on a *run* failure (status 1 with a
+    /// faulting frame). `error_line == 0` ⇒ no located runtime error.
+    error_line: u32 = 0,
+    error_start: u32 = 0,
+    error_end: u32 = 0,
 };
 
 /// One compile diagnostic, flattened for JS (24 bytes; see file header). `start`/
@@ -281,7 +289,14 @@ fn run(res: *Result, source: []const u8) !void {
     // --- run ---
     _ = vm.run(chunk.proto) catch |err| {
         res.status = 1;
-        res.diag = bufFromSlice(try gpa.dupe(u8, @errorName(err)));
+        // Located, Lua-style message from the un-popped faulting frame. The
+        // message is freshly `gpa`-allocated by `describeFault`, so hand its
+        // ownership straight to the Result (freed by `lune_free_result`).
+        const fault = try vm.describeFault(src0, err, gpa);
+        res.diag = bufFromSlice(@constCast(fault.message));
+        res.error_line = fault.line;
+        res.error_start = fault.start;
+        res.error_end = fault.end;
         // Still hand back whatever was printed before the fault.
         res.stdout = bufFromSlice(try gpa.dupe(u8, sink.buffered()));
         return;

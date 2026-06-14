@@ -141,6 +141,25 @@ pub const Value = extern struct {
         return self.asHeap().type;
     }
 
+    /// Lua-style type name, for diagnostics (e.g. runtime-error messages:
+    /// "attempt to perform arithmetic on a nil value"). Both closures and native
+    /// functions report as "function"; tables and typed arrays as "table".
+    pub fn typeName(self: Value) []const u8 {
+        return switch (self.tag) {
+            .nil => "nil",
+            .boolean => "boolean",
+            .int, .float => "number",
+            .heap_ref => switch (self.heapType()) {
+                .string => "string",
+                .table, .typed_array => "table",
+                .function, .native => "function",
+                .upvalue => "upvalue",
+                .host => "userdata",
+                _ => "value",
+            },
+        };
+    }
+
     // ---- equality ----
 
     /// `==` semantics. Numbers compare by mathematical value across the
