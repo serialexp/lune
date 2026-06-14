@@ -75,10 +75,27 @@ test("calling a nil value is a located runtime error", () => {
   expect(result.diagnostics).toContain("call");
 });
 
+test("a nested fault carries a deepest-first backtrace", () => {
+  // `f` faults on line 2 (nil arithmetic); it is called from main on line 5.
+  const src = "function f(x)\n  return x + nope\nend\nlocal s = 0\ns = f(1)\n";
+  const result = mod.runSource(src);
+  expect(result.status).toBe(1);
+  expect(result.backtrace.length).toBe(2);
+  // Leaf first: f at line 2; then its caller main at the call site, line 5.
+  expect(result.backtrace[0]).toMatchObject({ name: "f", line: 2 });
+  expect(result.backtrace[1]).toMatchObject({ name: "main", line: 5 });
+  // The leaf mirrors the flat error location used by the editor squiggle.
+  expect(result.errorLine).toBe(result.backtrace[0].line);
+  // Flattened the way the UI renders it.
+  const traceback = result.backtrace.map((f) => `${f.name}:${f.line}`).join(" → ");
+  expect(traceback).toBe("f:2 → main:5");
+});
+
 test("a clean run reports no runtime-error location", () => {
   const result = mod.runSource("print(1 + 2)\n");
   expect(result.status).toBe(0);
   expect(result.errorLine).toBe(0);
+  expect(result.backtrace.length).toBe(0);
 });
 
 test("keyframe + effects are produced for a deterministic program", () => {

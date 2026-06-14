@@ -78,6 +78,11 @@ export default function App() {
             <Show when={state.runError}>
               <pre class="run-error">
                 {state.runErrorSpan ? `line ${state.runErrorSpan.line}: ${state.runError}` : state.runError}
+                <Show when={state.runBacktrace && state.runBacktrace.length > 1}>
+                  {"\n"}<span class="run-traceback">
+                    {state.runBacktrace!.map((f) => `${f.name}:${f.line}`).join(" → ")}
+                  </span>
+                </Show>
               </pre>
             </Show>
             <Show when={state.stdout}>

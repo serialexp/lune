@@ -5,7 +5,7 @@
 import { createStore } from "solid-js/store";
 import { decodeTraceFile } from "./decode";
 import { viewsOf, type TraceView } from "./disasm";
-import { loadLune, type LuneModule, type LuneRunResult, type LuneDiagnostic } from "./wasm/lune";
+import { loadLune, type LuneModule, type LuneRunResult, type LuneDiagnostic, type BacktraceFrame } from "./wasm/lune";
 import { runNative } from "./native";
 import { diffRuns, type DiffReport } from "./diff";
 
@@ -32,6 +32,10 @@ interface VizState {
    *  1-based `line` + UTF-8 byte span `[start,end)`. Null unless the last run
    *  faulted with a locatable instruction. */
   runErrorSpan: { line: number; start: number; end: number } | null;
+  /** The last runtime error's call chain, deepest-first. Null on a clean run or
+   *  an error with no locatable frame. The UI flattens it to a one-line
+   *  traceback; the editor squiggle still uses `runErrorSpan` (the leaf only). */
+  runBacktrace: BacktraceFrame[] | null;
   /** The full artifact bundle from the last wasm run (kept for the differential
    *  validator in Commit 3). */
   lastRun: LuneRunResult | null;
@@ -58,6 +62,7 @@ const [state, setState] = createStore<VizState>({
   stdout: null,
   runError: null,
   runErrorSpan: null,
+  runBacktrace: null,
   lastRun: null,
   diff: null,
 });
@@ -119,6 +124,9 @@ function applyWasmResult(result: LuneRunResult, fileName: string): void {
     runErrorSpan: result.status !== 0 && result.errorLine > 0
       ? { line: result.errorLine, start: result.errorStart, end: result.errorEnd }
       : null,
+    // The full call chain (deepest-first) for the traceback line; null on a
+    // clean run or an unlocatable fault.
+    runBacktrace: result.status !== 0 && result.backtrace.length > 0 ? result.backtrace : null,
     lastRun: result,
   });
 }
@@ -129,7 +137,7 @@ function applyWasmResult(result: LuneRunResult, fileName: string): void {
  * views). Errors are captured into the store, never thrown.
  */
 export async function runWasm(): Promise<void> {
-  setState({ running: true, runError: null, runErrorSpan: null, diff: null });
+  setState({ running: true, runError: null, runErrorSpan: null, runBacktrace: null, diff: null });
   try {
     const mod = await lune();
     const result = mod.runSource(state.source);
@@ -151,7 +159,7 @@ export async function runWasm(): Promise<void> {
  * run also populates the trace views as usual.
  */
 export async function runBoth(): Promise<void> {
-  setState({ running: true, runError: null, runErrorSpan: null, diff: null });
+  setState({ running: true, runError: null, runErrorSpan: null, runBacktrace: null, diff: null });
   try {
     const mod = await lune();
     const [wasm, native] = await Promise.all([

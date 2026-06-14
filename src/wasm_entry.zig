@@ -34,6 +34,10 @@
 //!   u32 error_line    1-based source line of a runtime error (0 = none)
 //!   u32 error_start   byte offset [start,end) of the faulting span (for a squiggle)
 //!   u32 error_end
+//!   {u32 ptr,u32 len} backtrace  structured call chain blob (see encodeBacktrace;
+//!                                empty when there's no located runtime error):
+//!                                u32 frame_count, then per frame deepest-first
+//!                                { u32 line, start, end, name_len, [name_len]u8 }
 //!
 //! CheckResult layout (compile-only validation; for the in-browser editor's live
 //! linter — parse + compile WITHOUT running the program, so there are no side
@@ -88,6 +92,9 @@ const Result = extern struct {
     error_line: u32 = 0,
     error_start: u32 = 0,
     error_end: u32 = 0,
+    /// Structured backtrace blob (see `encodeBacktrace`); empty unless a located
+    /// runtime error. Appended last so existing JS field offsets stay stable.
+    backtrace: Buf = .{},
 };
 
 /// One compile diagnostic, flattened for JS (24 bytes; see file header). `start`/
@@ -189,6 +196,7 @@ export fn lune_free_result(res: ?*Result) void {
     freeBuf(r.effects);
     freeBuf(r.trace);
     freeBuf(r.diag);
+    freeBuf(r.backtrace);
     gpa.destroy(r);
 }
 
@@ -297,6 +305,11 @@ fn run(res: *Result, source: []const u8) !void {
         res.error_line = fault.line;
         res.error_start = fault.start;
         res.error_end = fault.end;
+        // Serialize the full call chain (including a lone frame) into an owned
+        // blob; the FaultFrame slice is gpa-owned scratch (names point into the
+        // proto, not gpa) — free it once copied. The UI decides when to show it.
+        res.backtrace = bufFromSlice(try encodeBacktrace(fault.frames));
+        gpa.free(fault.frames);
         // Still hand back whatever was printed before the fault.
         res.stdout = bufFromSlice(try gpa.dupe(u8, sink.buffered()));
         return;
@@ -393,4 +406,29 @@ fn renderDiagnostics(diags: *const Diagnostics) ![]u8 {
         try buf.appendSlice(gpa, line);
     }
     return buf.toOwnedSlice(gpa);
+}
+
+/// Serialize a runtime-error backtrace into a self-describing little-endian blob
+/// for JS: `u32 frame_count`, then per frame (deepest-first)
+/// `{ u32 line, u32 start, u32 end, u32 name_len, [name_len]u8 name }`. Empty
+/// chain → empty slice (a null `Buf`).
+fn encodeBacktrace(frames: []const lune.interp.FaultFrame) ![]u8 {
+    if (frames.len == 0) return &[_]u8{};
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try appendU32(&buf, @intCast(frames.len));
+    for (frames) |f| {
+        try appendU32(&buf, f.line);
+        try appendU32(&buf, f.start);
+        try appendU32(&buf, f.end);
+        try appendU32(&buf, @intCast(f.name.len));
+        try buf.appendSlice(gpa, f.name);
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+fn appendU32(buf: *std.ArrayList(u8), v: u32) !void {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .little);
+    try buf.appendSlice(gpa, &b);
 }

@@ -42,6 +42,20 @@ export interface LuneRunResult {
    *  squiggle. Both 0 when there's no located runtime error. */
   errorStart: number;
   errorEnd: number;
+  /** The runtime-error call chain, deepest-first (leaf at index 0). Empty when
+   *  the run succeeded or the error had no locatable frame. `[0]` mirrors
+   *  `errorLine`/`errorStart`/`errorEnd`. */
+  backtrace: BacktraceFrame[];
+}
+
+/** One row of a runtime-error backtrace. `start`/`end` are UTF-8 byte offsets. */
+export interface BacktraceFrame {
+  /** Function name (`"main"` for the top-level chunk). */
+  name: string;
+  /** 1-based source line of this frame's active instruction. */
+  line: number;
+  start: number;
+  end: number;
 }
 
 /** One compile diagnostic from `check` (parse/compile only — no execution). The
@@ -72,8 +86,9 @@ export interface LuneModule {
 
 // Result struct layout (extern struct in wasm_entry.zig), little-endian:
 //   u32 status; then 5 × { u32 ptr; u32 len } for stdout/keyframe/effects/trace/diag;
-//   then 3 × u32 error_line/error_start/error_end (runtime-error location).
-const RESULT_BYTES = 4 + 5 * 8 + 3 * 4;
+//   then 3 × u32 error_line/error_start/error_end (runtime-error location);
+//   then { u32 ptr; u32 len } backtrace (structured call-chain blob, at offset 56).
+const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8;
 
 // CheckResult layout: u32 status; { u32 ptr; u32 len } diags (len = record count).
 const CHECK_RESULT_BYTES = 4 + 8;
@@ -104,6 +119,28 @@ function readBuf(memory: WebAssembly.Memory, dv: DataView, off: number): Uint8Ar
   return new Uint8Array(memory.buffer, ptr, len).slice();
 }
 
+/** Decode the structured backtrace blob (see `encodeBacktrace` in
+ *  wasm_entry.zig): `u32 frame_count`, then per frame (deepest-first)
+ *  `{ u32 line, start, end, name_len, [name_len]u8 name }`. Empty → []. */
+function decodeBacktrace(blob: Uint8Array): BacktraceFrame[] {
+  if (blob.length < 4) return [];
+  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const count = dv.getUint32(0, true);
+  const frames: BacktraceFrame[] = [];
+  let off = 4;
+  for (let i = 0; i < count; i++) {
+    const line = dv.getUint32(off, true);
+    const start = dv.getUint32(off + 4, true);
+    const end = dv.getUint32(off + 8, true);
+    const nameLen = dv.getUint32(off + 12, true);
+    off += 16;
+    const name = decoder.decode(blob.subarray(off, off + nameLen));
+    off += nameLen;
+    frames.push({ name, line, start, end });
+  }
+  return frames;
+}
+
 function wrap(exports: LuneExports): LuneModule {
   const runSource = (src: string): LuneRunResult => {
     const bytes = encoder.encode(src);
@@ -129,6 +166,7 @@ function wrap(exports: LuneExports): LuneModule {
     const errorLine = dv.getUint32(44, true);
     const errorStart = dv.getUint32(48, true);
     const errorEnd = dv.getUint32(52, true);
+    const backtrace = decodeBacktrace(readBuf(exports.memory, dv, 56));
 
     exports.lune_free_result(resPtr);
 
@@ -142,6 +180,7 @@ function wrap(exports: LuneExports): LuneModule {
       errorLine,
       errorStart,
       errorEnd,
+      backtrace,
     };
   };
 
