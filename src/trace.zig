@@ -27,6 +27,7 @@ const bytecode = @import("bytecode.zig");
 const value = @import("value.zig");
 const io = @import("io.zig");
 const tropt = @import("tropt.zig");
+const execlog = @import("execlog.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -210,6 +211,18 @@ pub const TraceConfig = struct {
     /// the minimal brake against re-entry thrash on type-unstable / branchy loops.
     /// The real fix (side traces) is deferred; see docs/design/01-trace-lifecycle.md.
     max_penalty: u32 = 8,
+    /// Record a per-trace **execution log** (`execlog.zig`) for the visualizer's
+    /// iteration animation. Off by default (zero cost on the JIT path — the executor
+    /// is comptime-specialized); the wasm playground flips it on. Independent of
+    /// `execute` (it observes the same executor run).
+    record_exec_log: bool = false,
+    /// Exec-log detail cap: per trace entry, stop recording per-iteration events once
+    /// this many iterations have committed (the side-exit is still recorded; the
+    /// entry's `iterations` stays accurate). Bounds the spinning detail.
+    exec_log_max_iters: u32 = 16,
+    /// Exec-log entry cap: stop recording new entries (exit ramps) for a trace beyond
+    /// this many. Bounds total volume for an oft-entered trace.
+    exec_log_max_entries: u32 = 64,
 };
 
 /// All recorder state owned by a `Vm`: the hotness counters, the cache of
@@ -238,6 +251,13 @@ pub const TraceState = struct {
     /// every entry — never allocated per-iteration or per-entry. Not a GC root
     /// (the executor runs no safepoint; see `irinterp.zig`).
     values_scratch: std.ArrayListUnmanaged(Value) = .empty,
+    /// Per-trace execution logs for the visualizer (`execlog.zig`), populated only
+    /// when `config.record_exec_log`. Keyed by `trace_id` (cache index). Empty and
+    /// untouched on the normal JIT path.
+    exec_logs: std.ArrayListUnmanaged(execlog.TraceExecLog) = .empty,
+    /// The recorder driving `exec_logs`, lazily created on first use so the off path
+    /// allocates nothing. Reused (per-entry scratch retained) across every entry.
+    exec_recorder: ?execlog.ExecLogRecorder = null,
 
     pub fn init(gpa: std.mem.Allocator) TraceState {
         return .{ .gpa = gpa };
@@ -248,9 +268,36 @@ pub const TraceState = struct {
         self.blacklist.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
         self.values_scratch.deinit(self.gpa);
+        for (self.exec_logs.items) |*l| l.deinit(self.gpa);
+        self.exec_logs.deinit(self.gpa);
+        if (self.exec_recorder) |*r| r.deinit();
         for (self.cache.items) |t| t.destroy(self.gpa);
         self.cache.deinit(self.gpa);
         self.rec.deinit(self.gpa);
+    }
+
+    /// The `ExecLogRecorder` re-targeted at the execution log for `trace_id` (the
+    /// trace's cache index), creating the recorder (lazily) and the per-trace log on
+    /// first use. Returns null on OOM (the caller then runs the uninstrumented
+    /// `execute`). Only called when `config.record_exec_log`.
+    pub fn execRecorderFor(self: *TraceState, trace_id: u32) ?*execlog.ExecLogRecorder {
+        if (self.exec_recorder == null) {
+            self.exec_recorder = execlog.ExecLogRecorder.init(self.gpa, self.config.exec_log_max_iters, self.config.exec_log_max_entries);
+        }
+        const log = self.execLogFor(trace_id) catch return null;
+        const rec = &self.exec_recorder.?;
+        rec.retarget(log);
+        return rec;
+    }
+
+    /// Find-or-create the `TraceExecLog` for `trace_id`. Linear scan — the cache is
+    /// small and so is the set of executed traces.
+    fn execLogFor(self: *TraceState, trace_id: u32) !*execlog.TraceExecLog {
+        for (self.exec_logs.items) |*l| {
+            if (l.trace_id == trace_id) return l;
+        }
+        try self.exec_logs.append(self.gpa, .{ .trace_id = trace_id });
+        return &self.exec_logs.items[self.exec_logs.items.len - 1];
     }
 
     /// The trace cached for `(proto, pc)`, or null. Linear scan — the cache is
@@ -265,6 +312,16 @@ pub const TraceState = struct {
     /// Is a trace already cached for this anchor? (Prevents re-arming.)
     pub fn hasTrace(self: *const TraceState, anchor: AnchorKey) bool {
         return self.findTrace(anchor.proto, anchor.pc) != null;
+    }
+
+    /// The cache index (`trace_id`) of a cached trace, or null if not present. This
+    /// id is the exec-log key and the viz's trace-selection key. Linear scan (the
+    /// cache is small; only the instrumented path calls this).
+    pub fn traceIndex(self: *const TraceState, t: *const Trace) ?u32 {
+        for (self.cache.items, 0..) |c, i| {
+            if (c == t) return @intCast(i);
+        }
+        return null;
     }
 
     /// A reusable scratch slice of at least `n` `Value`s for the executor. Grows

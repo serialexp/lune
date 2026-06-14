@@ -46,6 +46,7 @@ const std = @import("std");
 const trace = @import("trace.zig");
 const arith = @import("arith.zig");
 const value = @import("value.zig");
+const execlog = @import("execlog.zig");
 const Value = value.Value;
 const Trace = trace.Trace;
 
@@ -60,35 +61,99 @@ const Trace = trace.Trace;
 ///     longer matches the observed types) — the caller uses this for the
 ///     re-entry penalty.
 pub fn execute(t: *const Trace, regs: []Value, values: []Value) usize {
+    return executeImpl(false, {}, t, regs, values);
+}
+
+/// Instrumented twin of `execute`: identical semantics, but drives `rec`
+/// (an `*execlog.ExecLogRecorder`) to record this entry's per-iteration events and
+/// its exit ramp for the visualizer. `rec` must already be `begin`-ready (targeted
+/// at the trace's log); this calls `begin`/`end` around the run. Used only on the
+/// instrumented (viz/CLI) path — `execute` above is the untouched JIT fast path.
+pub fn executeTraced(rec: *execlog.ExecLogRecorder, t: *const Trace, regs: []Value, values: []Value) usize {
+    return executeImpl(true, rec, t, regs, values);
+}
+
+/// The single executor body, `comptime`-specialized over `record`. With
+/// `record == false` the `rec` calls are not analyzed (Zig folds the comptime `if`),
+/// so `execute` compiles exactly as before — no recorder overhead on the JIT path.
+/// With `record == true`, `rec` observes every value, guard outcome, commit, and the
+/// terminal side-exit. Recording is observation-only: `regs`/`completed` are
+/// byte-identical to the uninstrumented run (the parity canary test asserts this).
+fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Value, values: []Value) usize {
     std.debug.assert(values.len >= t.instrs.len);
+    if (record) rec.begin();
     var completed: usize = 0;
-    iter: while (true) {
+    const completed_out = iter: while (true) {
         for (t.instrs, 0..) |ins, i| {
             switch (ins.op) {
                 // ---- inputs ----
-                .slot_load => values[i] = regs[@intCast(ins.aux)],
-                .konst => values[i] = t.consts[@intCast(ins.aux)],
+                .slot_load => {
+                    values[i] = regs[@intCast(ins.aux)];
+                    if (record) rec.value(i, values[i]);
+                },
+                .konst => {
+                    values[i] = t.consts[@intCast(ins.aux)];
+                    if (record) rec.value(i, values[i]);
+                },
 
                 // ---- arithmetic / bitwise / comparisons → the shared evaluator
                 //      (`evalBinary`, the *same* code the optimizer folds with).
                 //      Any error (only integer //- or %-by-zero is reachable; see
                 //      arith.zig) side-exits to tier-0, which re-raises it. ----
-                .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .eq, .ne, .lt, .le => values[i] = evalBinary(ins.op, values[ins.a], values[ins.b]) catch return completed,
+                .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .eq, .ne, .lt, .le => {
+                    values[i] = evalBinary(ins.op, values[ins.a], values[ins.b]) catch {
+                        if (record) rec.exit(i, .arith, Value.nil());
+                        break :iter completed;
+                    };
+                    if (record) rec.value(i, values[i]);
+                },
 
                 // ---- unary (shared evaluator too) ----
-                .neg, .not, .bnot => values[i] = evalUnary(ins.op, values[ins.a]) catch return completed,
+                .neg, .not, .bnot => {
+                    values[i] = evalUnary(ins.op, values[ins.a]) catch {
+                        if (record) rec.exit(i, .arith, Value.nil());
+                        break :iter completed;
+                    };
+                    if (record) rec.value(i, values[i]);
+                },
 
                 // ---- guards: a mismatch side-exits to tier-0 ----
-                .guard_int => if (!values[ins.a].isInt()) return completed,
-                .guard_float => if (!values[ins.a].isFloat()) return completed,
-                .guard_number => if (!values[ins.a].isNumber()) return completed,
-                .guard_true => if (!values[ins.a].isTruthy()) return completed,
-                .guard_false => if (values[ins.a].isTruthy()) return completed,
+                .guard_int => if (values[ins.a].isInt()) {
+                    if (record) rec.guardPass(i, values[ins.a]);
+                } else {
+                    if (record) rec.exit(i, .guard, values[ins.a]);
+                    break :iter completed;
+                },
+                .guard_float => if (values[ins.a].isFloat()) {
+                    if (record) rec.guardPass(i, values[ins.a]);
+                } else {
+                    if (record) rec.exit(i, .guard, values[ins.a]);
+                    break :iter completed;
+                },
+                .guard_number => if (values[ins.a].isNumber()) {
+                    if (record) rec.guardPass(i, values[ins.a]);
+                } else {
+                    if (record) rec.exit(i, .guard, values[ins.a]);
+                    break :iter completed;
+                },
+                .guard_true => if (values[ins.a].isTruthy()) {
+                    if (record) rec.guardPass(i, values[ins.a]);
+                } else {
+                    if (record) rec.exit(i, .guard, values[ins.a]);
+                    break :iter completed;
+                },
+                .guard_false => if (!values[ins.a].isTruthy()) {
+                    if (record) rec.guardPass(i, values[ins.a]);
+                } else {
+                    if (record) rec.exit(i, .guard, values[ins.a]);
+                    break :iter completed;
+                },
 
                 // ---- close: commit the loop-carried writes, then iterate ----
                 .loop => {
                     for (t.exit_stores) |st| regs[st.slot] = values[st.ref];
                     completed += 1;
+                    if (record) rec.commit();
                     continue :iter;
                 },
             }
@@ -96,8 +161,10 @@ pub fn execute(t: *const Trace, regs: []Value, values: []Value) usize {
         // A well-formed trace always terminates in `loop` (checked by the
         // commit-time verifier in trace.zig). If one somehow didn't, stop rather
         // than spin — `regs` is whatever the last commit left, which is coherent.
-        return completed;
-    }
+        break :iter completed;
+    };
+    if (record) rec.end(completed_out);
+    return completed_out;
 }
 
 /// Evaluate a binary IR op (arithmetic / bitwise / comparison) over two values,

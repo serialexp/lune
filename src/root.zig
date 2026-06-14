@@ -48,6 +48,11 @@ pub const trace = @import("trace.zig");
 /// tier-0 on a guard failure).
 pub const irinterp = @import("irinterp.zig");
 
+/// Phase 7 (trace-iteration animation) — in-memory trace **execution log**: per
+/// entry/exit-ramp events the IR-interpreter emits for the visualizer. Off the JIT
+/// path (the executor is comptime-specialized).
+pub const execlog = @import("execlog.zig");
+
 /// Phase 6b — trace optimizer (constant folding / CSE / dead-code elimination;
 /// rewrite passes run once at commit time).
 pub const tropt = @import("tropt.zig");
@@ -92,6 +97,7 @@ test {
     _ = interp;
     _ = trace;
     _ = irinterp;
+    _ = execlog;
     _ = tropt;
     _ = traceser;
     _ = keyframeser;

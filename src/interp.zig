@@ -27,6 +27,7 @@ const table = @import("table.zig");
 const function = @import("function.zig");
 const trace = @import("trace.zig");
 const irinterp = @import("irinterp.zig");
+const execlog = @import("execlog.zig");
 const compiler = @import("compiler.zig");
 const io = @import("io.zig");
 const Value = value.Value;
@@ -894,7 +895,18 @@ pub const Vm = struct {
                 if (self.trace.config.execute and !self.trace.isRecording()) {
                     if (self.trace.findTrace(proto, @intCast(pc))) |t| {
                         if (self.trace.valuesScratch(t.instrs.len)) |buf| {
-                            const completed = irinterp.execute(t, regs, buf);
+                            // Instrumented path (viz): record this entry's per-iteration
+                            // events + exit ramp into the trace's exec log. Falls back
+                            // to the uninstrumented executor if the recorder can't be
+                            // set up. Observation-only — same `completed`/`regs`.
+                            const completed = if (self.trace.config.record_exec_log)
+                                blk: {
+                                    const tid = self.trace.traceIndex(t) orelse break :blk irinterp.execute(t, regs, buf);
+                                    const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(t, regs, buf);
+                                    break :blk irinterp.executeTraced(rec, t, regs, buf);
+                                }
+                            else
+                                irinterp.execute(t, regs, buf);
                             self.trace.onSideExit(t, completed);
                             continue;
                         } else |_| {} // OOM growing scratch: let tier-0 run the loop
@@ -2530,6 +2542,157 @@ test "trace toggle gates back-edge counting" {
         // The simple counting loop is fully recordable → exactly one cached trace.
         try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
     }
+}
+
+/// Run `source` with tier-1a execution **and** exec-log recording on (small
+/// `hotloop` so test loops go hot), capturing `print` output into `sink`. Returns
+/// the compiled chunk so the caller can inspect `vm.trace.exec_logs` while the
+/// anchor proto stays alive (free the chunk after asserting). `record` selects the
+/// instrumented executor — pass false to exercise the uninstrumented path with an
+/// otherwise identical config (the parity canary).
+fn runForExecLog(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, record: bool) !compiler.Chunk {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    vm.out = sink;
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.record_exec_log = record;
+    vm.trace.config.hotloop = 4; // record short test loops
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    errdefer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    return chunk;
+}
+
+test "exec log captures a hot loop's iterations and its exit ramp" {
+    const gpa = testing.allocator;
+    const source =
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + i end
+        \\print(acc)
+    ;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runForExecLog(&vm, gpa, source, &sink, true);
+    defer chunk.deinit();
+
+    // One cached trace → one exec log keyed by its cache index (0).
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.trace.exec_logs.items.len);
+    const log = vm.trace.exec_logs.items[0];
+    try testing.expectEqual(@as(u32, 0), log.trace_id);
+    try testing.expect(!log.entries_capped);
+    try testing.expect(log.entries.items.len >= 1);
+
+    const entry = log.entries.items[0];
+    // The trace spun real iterations before deopting.
+    try testing.expect(entry.iterations > 0);
+    // The event stream carries values, at least one surviving guard, commits, and a
+    // terminal side-exit (the loop-bound guard failing is the exit ramp).
+    var values: usize = 0;
+    var guards: usize = 0;
+    var commits: usize = 0;
+    for (entry.events) |e| switch (e.kind) {
+        .value => values += 1,
+        .guard_pass => guards += 1,
+        .commit => commits += 1,
+        .exit => {},
+    };
+    try testing.expect(values > 0);
+    try testing.expect(guards > 0);
+    try testing.expect(commits > 0);
+    // The last event is the exit ramp, and it names a real IR instruction.
+    const last = entry.events[entry.events.len - 1];
+    try testing.expectEqual(execlog.ExecEventKind.exit, last.kind);
+    try testing.expect(last.ref < vm.trace.cache.items[0].instrs.len);
+    try testing.expectEqual(execlog.ExitKind.guard, entry.exit_kind);
+    try testing.expectEqual(@as(u32, last.ref), entry.exit_ref);
+}
+
+test "exec-log detail cap truncates iterations but keeps the count and exit" {
+    const gpa = testing.allocator;
+    const source =
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + i end
+        \\print(acc)
+    ;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.exec_log_max_iters = 2; // cap the spinning detail hard
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runForExecLog(&vm, gpa, source, &sink, true);
+    defer chunk.deinit();
+
+    const entry = vm.trace.exec_logs.items[0].entries.items[0];
+    try testing.expect(entry.capped); // detail truncated
+    // Detail truncated to <= 2 committed iterations of events…
+    var commits: usize = 0;
+    for (entry.events) |e| {
+        if (e.kind == .commit) commits += 1;
+    }
+    try testing.expect(commits <= 2);
+    // …but the real yield is still recorded, and the exit ramp survives the cap.
+    try testing.expect(entry.iterations > 2);
+    try testing.expectEqual(execlog.ExecEventKind.exit, entry.events[entry.events.len - 1].kind);
+}
+
+test "exec-log entry cap stops recording further entries" {
+    const gpa = testing.allocator;
+    const source =
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + i end
+        \\print(acc)
+    ;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.exec_log_max_entries = 0; // record nothing, just flag it
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runForExecLog(&vm, gpa, source, &sink, true);
+    defer chunk.deinit();
+
+    const log = vm.trace.exec_logs.items[0];
+    try testing.expect(log.entries_capped);
+    try testing.expectEqual(@as(usize, 0), log.entries.items.len);
+}
+
+test "exec-log recording is observation-only (record on/off agree)" {
+    const gpa = testing.allocator;
+    const source =
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + i end
+        \\print(acc)
+    ;
+    var off_buf: [64]u8 = undefined;
+    var off_sink = io.Writer.fixed(&off_buf);
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var chunk = try runForExecLog(&vm, gpa, source, &off_sink, false);
+        defer chunk.deinit();
+        try testing.expectEqual(@as(usize, 0), vm.trace.exec_logs.items.len);
+    }
+    var on_buf: [64]u8 = undefined;
+    var on_sink = io.Writer.fixed(&on_buf);
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var chunk = try runForExecLog(&vm, gpa, source, &on_sink, true);
+        defer chunk.deinit();
+    }
+    // Instrumentation must not perturb the program's observable output.
+    try testing.expectEqualStrings(off_sink.buffered(), on_sink.buffered());
 }
 
 /// Disassemble a `vm`'s sole cached trace into `buf` for shape assertions. `buf`
