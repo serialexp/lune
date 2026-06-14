@@ -151,6 +151,30 @@ test("replay: stepping advances the line and grows stdout; the full replay match
   expect(view!.globals.some((g) => g.label === "print")).toBe(true);
 });
 
+test("a run disassembles the proto tree and the replay cursor indexes it", () => {
+  const src = "local s = 0\nfor i = 1, 3 do\n  s = s + i\n  print(s)\nend\nprint(\"done\")\n";
+  const run = mod.runSource(src);
+  expect(run.status).toBe(0);
+
+  // The disassembly is non-empty and includes the top-level `main` proto with a
+  // non-empty instruction listing.
+  expect(run.disasm.length).toBeGreaterThan(0);
+  const main = run.disasm.find((p) => p.name === "main");
+  expect(main).toBeDefined();
+  expect(main!.instrs.length).toBeGreaterThan(0);
+  // Every instruction carries rendered text (op + operands).
+  expect(main!.instrs.every((ins) => ins.text.length > 0)).toBe(true);
+
+  // A mid-run step reports a cursor that lands on a real instruction whose
+  // annotated line matches the step's reported current line.
+  const step = mod.replay(src, run.effects, 5);
+  expect(step.finished).toBe(false);
+  const proto = run.disasm.find((p) => p.id === step.protoId);
+  expect(proto).toBeDefined();
+  expect(step.pc).toBeLessThan(proto!.instrs.length);
+  expect(proto!.instrs[step.pc].line).toBe(step.currentLine);
+});
+
 test("keyframe + effects are produced for a deterministic program", () => {
   const result = mod.runSource("local t = {a = 1, b = 2}\nprint(t.a + t.b)\n");
   expect(result.status).toBe(0);

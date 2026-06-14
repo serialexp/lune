@@ -65,6 +65,32 @@ export interface LuneRunResult {
    *  instruction pending at safepoint k+1. Length == `safepointCount`. Drives
    *  line-grain stepping (slider over the indices where the line changes). */
   safepointLines: Uint32Array;
+  /** Static disassembly of every proto in the program, indexed by `id` (use the
+   *  replay cursor's `protoId`). Empty when the disassembly couldn't be built.
+   *  Drives the step-replay panel's bytecode view. */
+  disasm: ProtoDisasm[];
+}
+
+/** The disassembly of one function prototype (a node in the proto tree). */
+export interface ProtoDisasm {
+  /** Stable compile-time id; matches `LuneReplayResult.protoId`. */
+  id: number;
+  /** Debug name (`"main"` for the top-level chunk). */
+  name: string;
+  /** Declared fixed parameter count. */
+  numParams: number;
+  /** Register slots the frame reserves. */
+  numRegisters: number;
+  /** One row per instruction, in `pc` order. */
+  instrs: DisasmInstr[];
+}
+
+/** One disassembled instruction row. */
+export interface DisasmInstr {
+  /** 1-based source line of this instruction (0 if no span). */
+  line: number;
+  /** Rendered columnar text (op + operands), from `bytecode.writeInstr`. */
+  text: string;
 }
 
 /** The VM state at one replay step (see `LuneModule.replay`). */
@@ -88,6 +114,12 @@ export interface LuneReplayResult {
   finished: boolean;
   /** Deepest-first call chain at this step (empty when finished). */
   backtrace: BacktraceFrame[];
+  /** Replay cursor: the `Proto.id` of the innermost live frame (index into
+   *  `LuneRunResult.disasm` by `id`). 0 when finished/unavailable. */
+  protoId: number;
+  /** Index of the pending instruction within that proto's `instrs`. 0 when
+   *  finished/unavailable. */
+  pc: number;
 }
 
 /** One row of a runtime-error backtrace. `start`/`end` are UTF-8 byte offsets. */
@@ -137,14 +169,16 @@ export interface LuneModule {
 //   then { u32 ptr; u32 len } backtrace (structured call-chain blob, at offset 56);
 //   then u64 exec_ns (VM-execute-only nanoseconds, at offset 64);
 //   then u32 safepoint_count (@72), u32 safepoint_capped (@76);
-//   then { u32 ptr; u32 len } safepoint_lines (line-per-safepoint blob, @80).
-const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8 + 8 + 4 + 4 + 8;
+//   then { u32 ptr; u32 len } safepoint_lines (line-per-safepoint blob, @80);
+//   then { u32 ptr; u32 len } disasm (static bytecode blob, @88). Total 96 bytes.
+const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8 + 8 + 4 + 4 + 8 + 8;
 
 // ReplayResult struct layout (extern struct), little-endian:
 //   u32 status; { u32 ptr; u32 len } stdout/keyframe/diag; u32 current_line (@28),
 //   current_start (@32), current_end (@36), depth (@40), finished (@44);
-//   { u32 ptr; u32 len } backtrace (@48). Total 56 bytes.
-const REPLAY_RESULT_BYTES = 4 + 3 * 8 + 5 * 4 + 8;
+//   { u32 ptr; u32 len } backtrace (@48); u32 proto_id (@56), u32 pc (@60).
+//   Total 64 bytes.
+const REPLAY_RESULT_BYTES = 4 + 3 * 8 + 5 * 4 + 8 + 4 + 4;
 
 // CheckResult layout: u32 status; { u32 ptr; u32 len } diags (len = record count).
 const CHECK_RESULT_BYTES = 4 + 8;
@@ -212,6 +246,40 @@ function decodeBacktrace(blob: Uint8Array): BacktraceFrame[] {
   return frames;
 }
 
+/** Decode the static disassembly blob (see `buildDisasmBlob` in wasm_entry.zig):
+ *  `u32 proto_count`, then per proto `{ u32 id, u32 name_len, [name_len]u8 name,
+ *  u16 num_params, u16 num_registers, u32 instr_count }`, then per instruction
+ *  `{ u32 line, u32 text_len, [text_len]u8 text }`. Empty → []. */
+function decodeDisasm(blob: Uint8Array): ProtoDisasm[] {
+  if (blob.length < 4) return [];
+  const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const protoCount = dv.getUint32(0, true);
+  const protos: ProtoDisasm[] = [];
+  let off = 4;
+  for (let p = 0; p < protoCount; p++) {
+    const id = dv.getUint32(off, true);
+    const nameLen = dv.getUint32(off + 4, true);
+    off += 8;
+    const name = decoder.decode(blob.subarray(off, off + nameLen));
+    off += nameLen;
+    const numParams = dv.getUint16(off, true);
+    const numRegisters = dv.getUint16(off + 2, true);
+    const instrCount = dv.getUint32(off + 4, true);
+    off += 8;
+    const instrs: DisasmInstr[] = [];
+    for (let i = 0; i < instrCount; i++) {
+      const line = dv.getUint32(off, true);
+      const textLen = dv.getUint32(off + 4, true);
+      off += 8;
+      const text = decoder.decode(blob.subarray(off, off + textLen));
+      off += textLen;
+      instrs.push({ line, text });
+    }
+    protos.push({ id, name, numParams, numRegisters, instrs });
+  }
+  return protos;
+}
+
 function wrap(exports: LuneExports): LuneModule {
   const runSource = (src: string): LuneRunResult => {
     const bytes = encoder.encode(src);
@@ -246,6 +314,7 @@ function wrap(exports: LuneExports): LuneModule {
     const safepointCount = dv.getUint32(72, true);
     const safepointCapped = dv.getUint32(76, true) !== 0;
     const safepointLines = readU32Array(readBuf(exports.memory, dv, 80));
+    const disasm = decodeDisasm(readBuf(exports.memory, dv, 88));
 
     exports.lune_free_result(resPtr);
 
@@ -265,6 +334,7 @@ function wrap(exports: LuneExports): LuneModule {
       safepointCount,
       safepointCapped,
       safepointLines,
+      disasm,
     };
   };
 
@@ -299,6 +369,8 @@ function wrap(exports: LuneExports): LuneModule {
     const depth = dv.getUint32(40, true);
     const finished = dv.getUint32(44, true) !== 0;
     const backtrace = decodeBacktrace(readBuf(exports.memory, dv, 48));
+    const protoId = dv.getUint32(56, true);
+    const pc = dv.getUint32(60, true);
 
     exports.lune_free_replay_result(resPtr);
 
@@ -313,6 +385,8 @@ function wrap(exports: LuneExports): LuneModule {
       depth,
       finished,
       backtrace,
+      protoId,
+      pc,
     };
   };
 
