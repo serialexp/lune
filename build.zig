@@ -97,6 +97,68 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run the trace-optimizer benchmark (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
+
+    // --- wasm32-freestanding browser target ---------------------------------
+    //
+    // `zig build wasm` compiles the VM core to a reactor-style wasm module that
+    // the viz/ app loads and runs in-browser (src/wasm_entry.zig — a host-free
+    // C-ABI surface over the library `run` path). The clock and program output
+    // cross the boundary as imports/exports, never as syscalls, so the artifact
+    // carries zero host I/O. See docs/design/00-architecture.md (Phase 7 v3).
+    //
+    // Guaranteed tail calls are a portable architectural pillar (#4), NOT a
+    // native-only convenience: the wasm target enables the `tail_call` CPU
+    // feature so `@call(.always_tail)` keeps its compile-time guarantee here too
+    // (`return_call` ships on-by-default in every major browser since Safari
+    // 18.2). The dispatch smoke test must stay green on wasm — see the wasm test
+    // step below. wasm compiles via LLVM, so `use_llvm = true` mirrors native.
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+        .cpu_features_add = std.Target.wasm.featureSet(&.{.tail_call}),
+    });
+
+    const wasm_binschema_mod = b.createModule(.{
+        .root_source_file = b.path("src/gen/binschema/binschema.zig"),
+        .target = wasm_target,
+    });
+    const wasm_lune_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = wasm_target,
+        .imports = &.{
+            .{ .name = "binschema", .module = wasm_binschema_mod },
+        },
+    });
+    const wasm_exe = b.addExecutable(.{
+        .name = "lune",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm_entry.zig"),
+            .target = wasm_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lune", .module = wasm_lune_mod },
+            },
+        }),
+    });
+    wasm_exe.use_llvm = true; // guaranteed tail calls need LLVM, on wasm too
+    wasm_exe.entry = .disabled; // reactor module: exported functions, no `_start`
+    wasm_exe.rdynamic = true; // keep the `export fn`s in the dynamic symbol table
+    const install_wasm = b.addInstallArtifact(wasm_exe, .{});
+    const wasm_step = b.step("wasm", "Build the wasm32 browser VM (src/wasm_entry.zig)");
+    wasm_step.dependOn(&install_wasm.step);
+
+    // Tail-call capability gate on wasm — note the two halves:
+    //   1. COMPILE-TIME: `wasm_entry.zig` exports `lune_dispatch_smoke`, which
+    //      pulls `dispatch.zig`'s `@call(.always_tail)` into this artifact. That
+    //      call is a *guarantee*: if `wasm32 + tail_call` couldn't emit a real
+    //      tail call, `zig build wasm` would fail right here. So a green wasm
+    //      build already proves the capability survives on the browser target.
+    //   2. RUNTIME: a `bun` test (viz/test/) instantiates the module and runs
+    //      `lune_dispatch_smoke(2_000_000)`, proving the engine reuses frames in
+    //      practice (no stack overflow). We run it under bun rather than a Zig
+    //      `addTest` because Zig's test runner needs host I/O to report results,
+    //      which `wasm32-freestanding` lacks — there is no in-`zig build` way to
+    //      execute freestanding-wasm tests without a WASI shim + runtime.
 }
 
 /// Compare the compiler driving this build script against the pinned toolchain.

@@ -57,7 +57,9 @@ pub const Table = struct {
 
     /// Recover the concrete table from its embedded header (layout-independent).
     pub fn fromHeader(h: *GcHeader) *Table {
-        return @fieldParentPtr("header", h);
+        // `@alignCast`: no-op on native, required wasm32 alignment assertion (see
+        // `String.fromHeader`). The object is allocated at `@alignOf(Table)`.
+        return @alignCast(@fieldParentPtr("header", h));
     }
 
     /// `t[key]`. Returns `nil` for an absent or `nil`/`NaN` key (reads never

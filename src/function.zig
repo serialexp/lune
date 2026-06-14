@@ -47,7 +47,10 @@ pub const Upvalue = struct {
     }
 
     pub fn fromHeader(h: *GcHeader) *Upvalue {
-        return @fieldParentPtr("header", h);
+        // See `String.fromHeader`: `@alignCast` is a no-op on native and the
+        // required alignment assertion on wasm32 (the object is allocated at
+        // `@alignOf(Upvalue)`, so the cast always holds at runtime).
+        return @alignCast(@fieldParentPtr("header", h));
     }
 
     pub fn get(self: *const Upvalue) Value {
@@ -99,7 +102,9 @@ pub const Closure = struct {
     }
 
     pub fn fromHeader(h: *GcHeader) *Closure {
-        return @fieldParentPtr("header", h);
+        // `@alignCast`: no-op on native, required wasm32 alignment assertion (see
+        // `String.fromHeader`). The object is allocated at `@alignOf(Closure)`.
+        return @alignCast(@fieldParentPtr("header", h));
     }
 
     pub fn destroy(self: *Closure, gpa: std.mem.Allocator) void {
@@ -149,7 +154,9 @@ pub const Native = struct {
     }
 
     pub fn fromHeader(h: *GcHeader) *Native {
-        return @fieldParentPtr("header", h);
+        // `@alignCast`: no-op on native, required wasm32 alignment assertion (see
+        // `String.fromHeader`). The object is allocated at `@alignOf(Native)`.
+        return @alignCast(@fieldParentPtr("header", h));
     }
 
     pub fn destroy(self: *Native, gpa: std.mem.Allocator) void {

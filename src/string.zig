@@ -54,7 +54,11 @@ pub const String = extern struct {
     /// Recover the concrete string from its embedded header (the header is at
     /// offset 0, but `@fieldParentPtr` is layout-independent regardless).
     pub fn fromHeader(h: *GcHeader) *String {
-        return @fieldParentPtr("header", h);
+        // `@alignCast` is a no-op on native (GcHeader is already 8-aligned there)
+        // but required on wasm32, where a bare `*GcHeader` is 4-aligned while
+        // `String` (an inline `u64` hash) demands 8. The object really is
+        // 8-aligned at runtime — every `String` is allocated at `@alignOf(String)`.
+        return @alignCast(@fieldParentPtr("header", h));
     }
 
     /// Free a `String` allocated by `create` (reconstructs the inline block).

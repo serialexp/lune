@@ -25,6 +25,28 @@ pub const Writer = std.Io.Writer;
 /// `std.Io` themselves.
 pub const Io = std.Io;
 
+/// On `wasm32-freestanding` (the browser VM, src/wasm_entry.zig) there is no
+/// host stdout/stderr — and `std.Io.Threaded` doesn't even compile there
+/// (no `getrandom`/`IOV_MAX`). The VM's print seam (`vm.out`) is always set on
+/// that target, so the host-stdout fallback is never *called*; it only has to
+/// *compile*. We give it a `Discarding` sink and prune the `std.Io.Threaded`
+/// machinery out of the artifact via the comptime branches below.
+const is_freestanding = @import("builtin").target.os.tag == .freestanding;
+
+// A lazily-initialised discarding writer for the freestanding fallback. The
+// small buffer is drain scratch; nothing is ever read back from it.
+var fs_discarding: Writer.Discarding = undefined;
+var fs_discard_buf: [64]u8 = undefined;
+var fs_initialized = false;
+
+fn fsWriter() *Writer {
+    if (!fs_initialized) {
+        fs_discarding = Writer.Discarding.init(&fs_discard_buf);
+        fs_initialized = true;
+    }
+    return &fs_discarding.writer;
+}
+
 const buffer_len = 4096;
 
 // Process-global, lazily initialised stdout plumbing. A global (stable address)
@@ -59,14 +81,22 @@ fn ensureStderr() void {
 /// The buffered stdout writer. Output is not guaranteed visible until `flush()`
 /// (or use `print`, which flushes for you).
 pub fn stdout() *Writer {
-    ensureInit();
-    return &file_writer.interface;
+    if (is_freestanding) {
+        return fsWriter();
+    } else {
+        ensureInit();
+        return &file_writer.interface;
+    }
 }
 
 /// Flush buffered stdout. No-op if nothing was ever written.
 pub fn flush() void {
-    if (!initialized) return;
-    file_writer.interface.flush() catch {};
+    if (is_freestanding) {
+        return;
+    } else {
+        if (!initialized) return;
+        file_writer.interface.flush() catch {};
+    }
 }
 
 /// printf-style line to stdout, flushed immediately. Swallows I/O errors —
@@ -81,8 +111,12 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
 /// The buffered stderr writer. Diagnostics and CLI error messages go here so
 /// they don't interleave with a program's stdout.
 pub fn stderrWriter() *Writer {
-    ensureStderr();
-    return &stderr_writer.interface;
+    if (is_freestanding) {
+        return fsWriter();
+    } else {
+        ensureStderr();
+        return &stderr_writer.interface;
+    }
 }
 
 /// printf-style line to stderr, flushed immediately. Swallows I/O errors.

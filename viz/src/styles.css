@@ -204,3 +204,69 @@ table.ir tr.guard .op {
   border-radius: 3px;
   padding: 0.1rem 0.4rem;
 }
+
+/* --- authoring + in-browser run (Phase 7 v3) --- */
+.editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.source {
+  width: 100%;
+  min-height: 9rem;
+  resize: vertical;
+  box-sizing: border-box;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  line-height: 1.45;
+  color: var(--fg);
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.6rem;
+  tab-size: 2;
+}
+
+.source:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.run-output {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.run-output pre {
+  margin: 0;
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.run-stdout {
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+}
+
+.run-error {
+  background: #2d1f2a;
+  border: 1px solid #6b3a4f;
+  color: #f7768e;
+}
