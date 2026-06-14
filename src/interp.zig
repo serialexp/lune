@@ -62,6 +62,11 @@ pub const Error = error{
     /// `random_seed_source` was injected. Mirrors `ClockUnavailable`: the VM holds
     /// no entropy source of its own. Replay needs none (the seed is in the log).
     RandomUnavailable,
+    /// A `getenv`/`argc`/`argv` effect ran (in `off`/`record` mode) but no
+    /// `host_env` source was injected. Mirrors `ClockUnavailable`: the VM holds no
+    /// platform environment/args of its own. Replay needs none (the results are in
+    /// the log). One error covers all three — they share the single `HostEnv` seam.
+    EnvUnavailable,
     /// Allocation failure (register stack, future heap).
     OutOfMemory,
 };
@@ -86,8 +91,9 @@ pub const EffectKind = function.EffectKind;
 
 /// One recorded nondeterministic input: the effect that produced it and the
 /// `Value` it returned. The `effect_log` is an **ordered** list consumed in call
-/// order on replay (`clock()` has no inputs, so the kind + result fully describe
-/// it). Heap results are out of scope for now — `clock` returns an int.
+/// order on replay (the kind + result fully describe it). `result` may be a heap
+/// **string** (`getenv`/`argv`); such results are GC roots while parked in the log
+/// (see `forEachRootHeader`) and serialize as inline bytes (`effectser`).
 pub const Effect = struct { kind: EffectKind, result: Value };
 
 /// Record / replay / off — the effect-log mode. `off` (default) is the
@@ -117,6 +123,26 @@ pub const RandomSeedSource = struct {
     seed: *const fn (ctx: *anyopaque) u64,
 };
 
+/// An embedder-supplied window onto the process environment and command-line
+/// args, backing the `getenv`/`argc`/`argv` effects. One combined source (not
+/// three) because they are the same host facility — the VM holds no platform
+/// access of its own (so it still compiles to `wasm32-freestanding`, where the
+/// browser host injects a null source). Consulted in `off`/`record`; `replay`
+/// reads results from the log. With no source set, those effects fail with
+/// `EnvUnavailable`. Returned byte slices are **borrowed** — valid only for the
+/// duration of the call — so the native interns them into the heap immediately.
+pub const HostEnv = struct {
+    ctx: *anyopaque,
+    /// Look up an environment variable by name. Null ⇒ unset (distinct from a
+    /// set-but-empty `""`, which returns a zero-length slice).
+    getenv: *const fn (ctx: *anyopaque, name: []const u8) ?[]const u8,
+    /// The number of command-line arguments visible to the program.
+    argCount: *const fn (ctx: *anyopaque) i64,
+    /// The i-th command-line argument. Null ⇒ index out of range (the source owns
+    /// the bounds check, so any out-of-range `i` — including negative — is null).
+    arg: *const fn (ctx: *anyopaque, i: i64) ?[]const u8,
+};
+
 /// One built-in native: the global name it installs under, its function, and
 /// whether it is a nondeterministic-input effect (null = pure host call).
 pub const BaseNative = struct {
@@ -141,6 +167,11 @@ pub const base_natives = [_]BaseNative{
     // *seed* is (acquired once, inside `nativeRandom`, as `.random_seed`). So the
     // dispatch calls it directly; the seed goes through record/replay internally.
     .{ .name = "random", .func = &nativeRandom },
+    // env/args inputs — `clock`-style (the call site is the boundary). `getenv`
+    // and `argv` return heap strings, so the effect log carries inline bytes.
+    .{ .name = "getenv", .func = &nativeGetenv, .effect = .getenv },
+    .{ .name = "argc", .func = &nativeArgc, .effect = .argc },
+    .{ .name = "argv", .func = &nativeArgv, .effect = .argv },
 };
 
 /// The names `installBaseLib` seeds into the globals table, derived from the
@@ -290,6 +321,11 @@ pub const Vm = struct {
     /// Read once, lazily, on the first `random()` in `off`/`record`; `replay`
     /// reads the seed from the log instead. No source set ⇒ `RandomUnavailable`.
     random_seed_source: ?RandomSeedSource = null,
+    /// Embedder-supplied env/args window for `getenv`/`argc`/`argv` (null = none).
+    /// Read in `off`/`record` (`main.zig` native = real process env + argv, the
+    /// wasm host = a null source); `replay` feeds results from the log. No source
+    /// set ⇒ `EnvUnavailable`.
+    host_env: ?HostEnv = null,
     /// The VM's PRNG, seeded lazily from the first `random()` call's seed (an
     /// effect). `std.Random.Xoshiro256` is pinned *by name* (not `DefaultPrng`) so
     /// the draw stream is a stable part of the language: a given seed reproduces
@@ -530,6 +566,10 @@ pub const Vm = struct {
     ///      hold heap values in its const pool (e.g. a string `load_const`). A
     ///      cached trace can outlive its proto's reachability, so its consts must
     ///      be roots in their own right (docs/design/03-gc-memory.md).
+    ///   6. effect-log heap results — a string-valued effect (`getenv`/`argv`)
+    ///      parked in `effect_log` must outlive collection until it is serialized
+    ///      (record) or fed back to the program (replay). Without this root, the
+    ///      sweep would de-intern and free an otherwise-unreferenced result string.
     pub fn forEachRootHeader(
         self: *Vm,
         ctx: anytype,
@@ -545,6 +585,7 @@ pub const Vm = struct {
         if (self.trace.isRecording()) {
             for (self.trace.rec.consts.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
         }
+        for (self.effect_log.items) |e| if (e.result.isHeap()) cb(ctx, e.result.asHeap());
     }
 
     /// The tier-0 dispatch loop over the **explicit** call stack. Runs the top
@@ -958,6 +999,9 @@ fn narrowError(e: anyerror) Error {
         // seed, not the call, is the boundary), so these surface through here —
         // unlike `clock`, which goes via `performEffect` and never narrows.
         error.RandomUnavailable => Error.RandomUnavailable,
+        // `getenv`/`argc`/`argv` go through `performEffect`, which narrows their
+        // native errors — so the missing-source signal must survive the round-trip.
+        error.EnvUnavailable => Error.EnvUnavailable,
         error.EffectLogExhausted => Error.EffectLogExhausted,
         error.EffectKindMismatch => Error.EffectKindMismatch,
         else => Error.HostError,
@@ -1072,6 +1116,48 @@ fn nativeRandom(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm: *Vm = @ptrCast(@alignCast(ctx));
     if (vm.rng == null) vm.rng = std.Random.Xoshiro256.init(try obtainRandomSeed(vm));
     return Value.float(vm.rng.?.random().float(f64));
+}
+
+/// `getenv(name)` — read an environment variable. A nondeterministic input (the
+/// `.getenv` effect): the host environment differs between machines/runs, so it
+/// is recorded and replayed. Reads through the embedder-injected `Vm.host_env`
+/// (the VM holds no platform env of its own). Returns the value as an interned
+/// heap string, or `nil` if unset — note a *set-but-empty* var returns an empty
+/// string, distinct from `nil`. The `replay` path never reaches here (the logged
+/// result is fed back in `performEffect`).
+fn nativeGetenv(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    if (args.len < 1 or !args[0].isHeap() or args[0].heapType() != .string)
+        return Error.TypeError;
+    const name = string.String.fromHeader(args[0].asHeap()).bytes();
+    const env = vm.host_env orelse return Error.EnvUnavailable;
+    if (env.getenv(env.ctx, name)) |val| {
+        return vm.heap.internValue(val);
+    }
+    return Value.nil();
+}
+
+/// `argc()` — the number of command-line arguments. A nondeterministic input
+/// (the `.argc` effect). Ignores its arguments; reads through `Vm.host_env`.
+fn nativeArgc(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    _ = args;
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    const env = vm.host_env orelse return Error.EnvUnavailable;
+    return Value.int(env.argCount(env.ctx));
+}
+
+/// `argv(i)` — the i-th command-line argument as an interned heap string, or
+/// `nil` if the index is out of range (the host source owns the bounds check, so
+/// negative and oversized indices both yield `nil`). A nondeterministic input
+/// (the `.argv` effect); reads through `Vm.host_env`.
+fn nativeArgv(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    if (args.len < 1 or args[0].tag != .int) return Error.TypeError;
+    const env = vm.host_env orelse return Error.EnvUnavailable;
+    if (env.arg(env.ctx, args[0].asInt())) |s| {
+        return vm.heap.internValue(s);
+    }
+    return Value.nil();
 }
 
 fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
@@ -1720,6 +1806,57 @@ const FixedSeed = struct {
     }
 };
 
+/// A deterministic test env/args source for `getenv`/`argc`/`argv`. Holds a tiny
+/// fixed environment + argv so tests don't depend on the real process. `HOME` is
+/// set, `EMPTY` is set-but-empty (to exercise the ""-vs-unset distinction), and
+/// every other name is unset (→ nil).
+const FakeEnv = struct {
+    home: []const u8 = "/home/bart",
+    args: []const []const u8 = &.{ "prog", "alpha", "beta" },
+    fn getenvFn(ctx: *anyopaque, name: []const u8) ?[]const u8 {
+        const self: *FakeEnv = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, name, "HOME")) return self.home;
+        if (std.mem.eql(u8, name, "EMPTY")) return ""; // set, but empty — not nil
+        return null;
+    }
+    fn argCountFn(ctx: *anyopaque) i64 {
+        const self: *FakeEnv = @ptrCast(@alignCast(ctx));
+        return @intCast(self.args.len);
+    }
+    fn argFn(ctx: *anyopaque, i: i64) ?[]const u8 {
+        const self: *FakeEnv = @ptrCast(@alignCast(ctx));
+        if (i < 0 or i >= self.args.len) return null;
+        return self.args[@intCast(i)];
+    }
+    fn source(self: *FakeEnv) HostEnv {
+        return .{
+            .ctx = self,
+            .getenv = &FakeEnv.getenvFn,
+            .argCount = &FakeEnv.argCountFn,
+            .arg = &FakeEnv.argFn,
+        };
+    }
+};
+
+/// Compile + run `source` on an already-configured `vm` (out sink, effect mode,
+/// and any injected sources set by the caller). Kept separate from `effectRun` so
+/// env tests can inspect `vm.effect_log` (whose string results live in `vm.heap`)
+/// while the VM is still alive — `effectRun` dupes the log across `vm.deinit`,
+/// which would dangle a heap-string result.
+fn compileRun(gpa: std.mem.Allocator, vm: *Vm, source: [:0]const u8) !void {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+}
+
 /// Compile + run `source` with the given effect mode. `preload` (replay only)
 /// seeds the effect log fed back in call order. `clock` (record/off only) is the
 /// injected deterministic clock; replay needs none (it feeds the log back).
@@ -1896,6 +2033,97 @@ test "F2e: draws lie in [0,1)" {
     const run = try effectRun(gpa, source, .record, &.{}, null, &sd);
     defer run.deinit(gpa);
     try testing.expectEqualStrings("true\n", run.out);
+}
+
+// ---------------------------------------------------------------------------
+// env/args effects — `getenv`/`argc`/`argv` as nondeterministic inputs. These
+// are the first effects whose result is a heap *string*, so they exercise (a)
+// the value semantics (set vs unset vs empty, argv bounds), (b) the replay
+// feed-back of a string result, and (c) the GC-root that keeps a parked string
+// result alive across a collection. The cross-run *byte* equivalence (serialize
+// → replay) is proven in `effectser`'s round-trip test, where a standalone
+// effect-log blob sidesteps cross-heap string lifetimes.
+// ---------------------------------------------------------------------------
+
+test "env: getenv reads set/unset/empty; argc/argv read the args (record)" {
+    const gpa = testing.allocator;
+    var fenv = FakeEnv{};
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [512]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.effect_mode = .record;
+    vm.host_env = fenv.source();
+
+    try compileRun(gpa, &vm,
+        \\print(getenv("HOME"))
+        \\print(getenv("MISSING"))
+        \\print(getenv("EMPTY") == "")
+        \\print(argc())
+        \\print(argv(0)); print(argv(2))
+        \\print(argv(5))
+    );
+    // HOME set; MISSING → nil; EMPTY is set-but-empty (== "" is true, not nil);
+    // argc = 3; argv(0)/argv(2) in range; argv(5) out of range → nil.
+    try testing.expectEqualStrings(
+        "/home/bart\nnil\ntrue\n3\nprog\nbeta\nnil\n",
+        sink.buffered(),
+    );
+    // One effect logged per effect call: 3 getenv + 1 argc + 3 argv = 7.
+    try testing.expectEqual(@as(usize, 7), vm.effect_log.items.len);
+    try testing.expectEqual(EffectKind.getenv, vm.effect_log.items[0].kind);
+    try testing.expectEqual(EffectKind.argc, vm.effect_log.items[3].kind);
+    try testing.expectEqual(EffectKind.argv, vm.effect_log.items[4].kind);
+}
+
+test "env: getenv/argc/argv with no host_env injected is EnvUnavailable" {
+    const gpa = testing.allocator;
+    inline for (.{ "print(getenv(\"X\"))", "print(argc())", "print(argv(0))" }) |src| {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.effect_mode = .record; // no host_env set
+        try testing.expectError(error.EnvUnavailable, compileRun(gpa, &vm, src));
+    }
+}
+
+test "env: a recorded string result survives a GC collection while parked in the log" {
+    const gpa = testing.allocator;
+    var fenv = FakeEnv{};
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.effect_mode = .record;
+    vm.host_env = fenv.source();
+
+    // Read HOME but discard the result — nothing references the string except the
+    // effect log. A collection would de-intern + free it without the new root.
+    try compileRun(gpa, &vm, "getenv(\"HOME\")");
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+
+    vm.collect(); // force a stop-the-world sweep
+
+    // The logged result must still be a live string reading "/home/bart".
+    const res = vm.effect_log.items[0].result;
+    try testing.expect(res.isHeap() and res.heapType() == .string);
+    try testing.expectEqualStrings("/home/bart", string.String.fromHeader(res.asHeap()).bytes());
+}
+
+test "env: replay feeds back a logged string result without calling the native" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+
+    // Preload a getenv result interned into *this* VM's heap, then replay with no
+    // host_env injected: getenv is not called — the logged string is fed back.
+    const logged = try vm.heap.internValue("REPLAYED");
+    try vm.effect_log.append(gpa, .{ .kind = .getenv, .result = logged });
+    vm.effect_mode = .replay;
+
+    try compileRun(gpa, &vm, "print(getenv(\"IGNORED\"))");
+    try testing.expectEqualStrings("REPLAYED\n", sink.buffered());
 }
 
 // ---------------------------------------------------------------------------

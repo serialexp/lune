@@ -134,6 +134,16 @@ pub const EffectKind = enum(u8) {
     /// first `random()` call and recorded once; the VM's PRNG reproduces the whole
     /// draw stream from it on replay (so `random()` itself logs nothing per call).
     random_seed = 1,
+    /// `getenv(name)` — an environment-variable read. `clock`-style (the call
+    /// site is the boundary): its result is logged per call. The result is a
+    /// **heap string** (or nil if unset), so the effect log carries inline string
+    /// bytes for this kind (see `effectser.EffectResult`).
+    getenv = 2,
+    /// `argc()` — the command-line argument count. `clock`-style; int result.
+    argc = 3,
+    /// `argv(i)` — the i-th command-line argument (heap string, or nil if the
+    /// index is out of range). `clock`-style; carries inline string bytes.
+    argv = 4,
 };
 
 pub const Native = struct {
