@@ -14,7 +14,8 @@ import { test, expect, beforeAll } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { instantiateLuneFromBytes, type LuneModule } from "../src/wasm/lune";
-import { decodeTraceFile } from "../src/decode";
+import { decodeTraceFile, decodeExecLogFile } from "../src/decode";
+import { ExecEventKind } from "../src/exec";
 import { viewsOf } from "../src/disasm";
 import { decodeSnapshot } from "../src/snapshot";
 import { diffRuns } from "../src/diff";
@@ -50,6 +51,45 @@ test("records a decodable trace for a hot loop", () => {
   const file = decodeTraceFile(result.trace);
   const views = viewsOf(file);
   expect(views.length).toBeGreaterThan(0);
+});
+
+test("records a decodable execution log (the JIT-trace animation feed)", () => {
+  // A loop hot enough to execute the recorded trace, so the IR-interpreter emits
+  // an exec log: per entry/exit-ramp the spinning iterations + the terminal exit.
+  const result = mod.runSource("local s = 0\nfor i = 1, 1000 do s = s + i end\nprint(s)\n");
+  expect(result.status).toBe(0);
+  expect(result.stdout).toBe("500500\n");
+
+  // The blob decodes with the same pipeline the animation uses.
+  expect(result.executionLog.length).toBeGreaterThan(0);
+  const logs = decodeExecLogFile(result.executionLog).logs;
+  expect(logs.length).toBeGreaterThan(0);
+
+  // The first trace's log has at least one entry (exit ramp). Every entry counts
+  // a positive iteration count and ends in a terminal `exit` event.
+  const log = logs[0];
+  expect(log.entries.length).toBeGreaterThan(0);
+  const entry = log.entries[0];
+  expect(entry.iterations).toBeGreaterThan(0);
+  expect(entry.events.length).toBeGreaterThan(0);
+  const last = entry.events[entry.events.length - 1];
+  expect(last.kind).toBe(ExecEventKind.Exit);
+
+  // The spinning detail covers the live event kinds: a value lands, a guard
+  // passes, and an iteration commits before the exit.
+  const kinds = new Set(entry.events.map((e) => e.kind));
+  expect(kinds.has(ExecEventKind.Value)).toBe(true);
+  expect(kinds.has(ExecEventKind.GuardPass)).toBe(true);
+  expect(kinds.has(ExecEventKind.Commit)).toBe(true);
+});
+
+test("a non-looping program records an empty execution log", () => {
+  // No hot loop → no trace executes → the exec-log file carries zero logs (its
+  // version header still serializes, so the blob is non-empty but decodes empty).
+  const result = mod.runSource("print(1 + 2)\n");
+  expect(result.status).toBe(0);
+  const logs = decodeExecLogFile(result.executionLog).logs;
+  expect(logs.length).toBe(0);
 });
 
 test("a successful run reports execute-only and total timing", () => {

@@ -1,6 +1,6 @@
 # lune — Architecture
 
-Status: partial — Phases 0–6b landed; Phase 7 through v8 (in-browser deterministic replay + timing); Phases 8–9 outstanding
+Status: partial — Phases 0–7 landed (Phase 7 through the JIT-trace iteration animation: in-browser deterministic replay + timing + env/args effects + trace-execution animation); Phases 8–9 outstanding
 Owner: Bart
 Last updated: 2026-06-15
 
@@ -210,7 +210,7 @@ _(nothing yet — design only)_
       subexpressions share operand refs and CSE now fires on real traces — e.g.
       the two `i+7` in `(i+7)*(i+7)` collapse to one `add`; see `src/trace.zig`
       `konst`, tests in `src/interp.zig`).
-- [~] **Phase 7 — Time-travel debugger / trace visualizer.** SolidJS app that
+- [x] **Phase 7 — Time-travel debugger / trace visualizer.** SolidJS app that
       reads the trace file via the generated TS decoder. Starts with bounded
       recordings, not "complete history" by default. **Milestone: the feature
       this project is for.**
@@ -359,8 +359,23 @@ _(nothing yet — design only)_
       collection can't free one in flight. The host seam mirrors clock/random (native
       CLI reads real `std.process` env + captured argv; wasm injects a null source →
       nil/0/nil); a Lua-style `arg` *table* is deferred to stdlib (it would need a
-      heap table on the wire). **Still to come:** the visualiser's JIT-trace
-      iteration animation.
+      heap table on the wire). **JIT-trace iteration animation landed:** the
+      IR-interpreter (`irinterp.zig`) is now comptime-specialized into
+      `executeImpl(comptime record, …)` — `execute` (record=false) compiles
+      byte-identical to before (the JIT fast path is untouched) while
+      `executeTraced` drives an `ExecLogRecorder`. The recorder captures, for **every
+      trace entry / exit ramp** (one per `execute` call), the per-iteration events
+      (value lands / guard passes / iteration commits) and the terminal side-exit,
+      with the per-entry spinning detail capped (default 16 iterations, exit always
+      kept) and the entries-per-trace count capped (default 64) — both surfaced as
+      `capped` flags, never silent. This is a **fourth record family**
+      (`execlog.zig` → `execlogser.zig` → `ExecLogFile`, own version word) — an
+      *observation* log (nothing replays it), reusing `EffectResult` for its scalar
+      values (trace IR produces no heap/table ops at this phase). It rides Zig → wasm
+      (`exec_log` Buf, appended at the Result tail) → TS exactly like its three
+      siblings, and the visualiser's `TraceView` animates it: a transport scrubs the
+      flattened event stream, the current SSA row lights up, and the exit ramp flares
+      in the guard register.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
       first. A performance step — but *not* mechanical: regalloc across side
       exits, GC stackmaps/safepoints, and machine-state snapshot-restore are

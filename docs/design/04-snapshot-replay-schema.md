@@ -199,6 +199,41 @@ schema follows; this is that schema's home.
       the safepoint cap (bounded, never silent). The line index is **in-memory /
       ABI-only**: it rides the hand-rolled wasm `Result`/`ReplayResult` extern
       structs, not the binschema wire format, so no schema change was needed.
+- [x] **Trace execution log (Phase 7) — the fourth record family, and the first
+      pure *observation* log.** The JIT-trace iteration animation needed a record of
+      how a cached trace actually *ran* — which the tier-1a executor
+      (`irinterp.execute`) discarded, returning only a `completed` count. So
+      `irinterp.zig` is comptime-specialized into
+      `executeImpl(comptime record: bool, …)`: `execute` (record=false) compiles
+      byte-identical to before (the JIT fast path pays nothing), while
+      `executeTraced` drives an `ExecLogRecorder` (`src/execlog.zig`). For **every
+      trace entry / exit ramp** (one `TraceEntry` per `execute` call) it records the
+      per-iteration `ExecEvent` stream — `value` (an SSA result landed), `guard_pass`,
+      `commit` (an iteration looped) — terminated by an `exit` event naming the
+      faulting ref and the `ExitKind` (guard / arith / clean). The per-entry detail is
+      capped (`exec_log_max_iters`, default 16 — the exit is always kept and
+      `iterations` stays exact) and entries-per-trace are capped
+      (`exec_log_max_entries`, default 64); both surface `capped`/`entries_capped`
+      flags, never silent. The wire format is the **fourth record family**:
+      `ExecEvent { kind: uint8, ref: uint32, value: EffectResult }` →
+      `TraceEntry { iterations, exit_ref, exit_kind, capped, events[] }` →
+      `TraceExecLog { trace_id, entries_capped, entries[] }` → `ExecLogFile { version,
+      logs[] }`, serialized by `src/execlogser.zig` (mirroring the three siblings) at
+      `exec_log_format_version` 1. It **reuses `EffectResult`** for event values — trace
+      IR produces only scalars at this phase (no heap/table ops; those abort tracing),
+      so the same scalar+inline-string union the effect log uses fits exactly, sharing
+      `effectser.toEffectResult`/`fromEffectResult`. Unlike its siblings it is an
+      **observation** log — nothing replays it back; `trace_id` is the trace-cache
+      index, which is also the visualiser's trace-selection key, so the selected trace
+      maps straight to its log. It rides Zig → wasm (`exec_log` Buf appended at the
+      `Result` tail, offsets stable) → TS like the others, and the visualiser's
+      `TraceView` animates the flattened event stream over the IR table. Proven by:
+      an `execlogser` round-trip corpus (every event kind, both exit kinds, the cap
+      flags; empty; wrong-version; unknown-event-kind), four `interp`-level recorder
+      tests (hot-loop capture, detail cap, entry cap, observation-only parity:
+      record=on/off agree on `regs`/`completed`), and viz `bun test` end-to-end (the
+      default hot loop yields a decodable log with value/guard/commit + a terminal
+      exit; a non-looping program yields zero logs).
 
 ### Outstanding
 
@@ -209,8 +244,9 @@ schema follows; this is that schema's home.
       `SnapshotFile` is a distinct record family with its own version word, sharing
       the trace artifact's generated codec, and round-trips losslessly through a
       live VM. **The effect log is now a third such family** (F2d `EffectFile`, its
-      own version word, same shared encoding). Only optimizer guard-snapshots remain
-      outstanding.
+      own version word, same shared encoding), and the **trace execution log a
+      fourth** (Phase 7 `ExecLogFile` — the first pure *observation* log, above).
+      Only optimizer guard-snapshots remain outstanding.
 - [ ] **Event model.** Minimum event set: event id, bytecode PC, frame id,
       register writes, heap writes, allocation ids, guard snapshots, side exits,
       host/external calls, nondeterministic inputs (effect records), GC events,
@@ -248,7 +284,11 @@ schema follows; this is that schema's home.
       regenerated and vendored, and the TS codec under `viz/src/gen/` is too (a
       cross-language snapshot fixture trails F2a). It now also covers the **effect**
       record family (F2d `Effect`/`EffectFile`), Zig + TS codecs regenerated and
-      vendored. Still outstanding: extending the schema to optimizer guard-snapshots.
+      vendored. It now also covers the **trace execution-log** record family
+      (Phase 7 `ExecEvent`/`TraceEntry`/`TraceExecLog`/`ExecLogFile`, reusing
+      `EffectResult` — two array-nesting levels deep, logs→entries→events), Zig + TS
+      codecs regenerated and vendored. Still outstanding: extending the schema to
+      optimizer guard-snapshots.
 - [ ] **Versioning / compat policy.** The schema will churn during Phases 5–7.
       State the policy (likely: visualiser reads traces only from the same VM
       commit) so version skew is handled, not surprising.
@@ -265,9 +305,10 @@ debug-recorder bandwidth.
 
 ## Goals
 
-- One binschema schema, two record families (guard-snapshots, keyframes+effects),
-  shared primitives (the self-describing 16-byte tagged value → discriminated
-  union).
+- One binschema schema, multiple record families (guard-snapshots, keyframes,
+  effects, and the trace execution log), shared primitives (the self-describing
+  16-byte tagged value → discriminated union; the scalar `EffectResult` reused by
+  the effect and execution logs).
 - Bounded, seekable, interned trace files; megabyte-scale recordings via
   effects + keyframes (not gigabyte step logs).
 - A generated TS decoder so the SolidJS visualiser does zero hand-parsing.

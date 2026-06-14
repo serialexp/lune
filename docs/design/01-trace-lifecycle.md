@@ -1,9 +1,10 @@
 # lune — Trace Lifecycle
 
-Status: Phase 5a (recorder) + Phase 6a (IR-interpreter + loop-header deopt)
+Status: Phase 5a (recorder) + Phase 6a (IR-interpreter + loop-header deopt) +
+Phase 6b (optimizer) + Phase 7 (trace execution log for the visualiser animation)
 implemented; full per-guard snapshots / side-exit restore still design-only
 Owner: Bart
-Last updated: 2026-06-13
+Last updated: 2026-06-15
 
 Prerequisite for **Phase 5** (hot-path detection + trace recorder) in
 `00-architecture.md`. Both external reviewers independently flagged that the
@@ -88,6 +89,43 @@ architecture." This doc is where that policy lives.
       mistake diverges here. A debug-only commit-time structural verifier
       (`assertWellFormed`) checks the IR invariants `execute` relies on (terminal
       `loop`, operand refs < index, exit refs < `loop`, in-bounds `aux`).
+
+### Done (Phase 7 — the trace execution log, `src/execlog.zig`)
+
+- [x] **Recording how a trace *ran* (for the visualiser animation).** The executor
+      above discards everything but the `completed` count, so the visualiser had no
+      way to *animate* a trace spinning. The fix is a per-trace **execution log** — a
+      fourth record family (`04-snapshot-replay-schema.md`), and the first pure
+      **observation** log: nothing replays it back. `irinterp.zig` is
+      comptime-specialized into `executeImpl(comptime record: bool, rec, …)`;
+      `execute` (record=false) compiles **byte-identical** to the Phase 6a executor
+      (the JIT fast path pays nothing — the branches fold away), while
+      `executeTraced(rec, …)` (record=true) drives an `ExecLogRecorder`. One body, no
+      drift in the tier-0-parity-critical evaluator.
+- [x] **One entry per exit ramp; capped spinning detail.** Each `execute` call
+      produces one `TraceEntry` (every entry / **exit ramp** taken). Within it the
+      recorder appends an `ExecEvent` per step — `value` (an SSA result landed),
+      `guard_pass` (a guard survived), `commit` (an iteration closed and looped) —
+      ending in a terminal `exit` event that names the faulting ref and the
+      `ExitKind`: `guard` (a guard failed), `arith` (integer `//`/`%`-by-zero
+      side-exit), or `clean` (the trace stopped without faulting). The per-entry
+      detail is capped at `exec_log_max_iters` (default 16) — past the cap the
+      iteration *count* still advances and the exit is **always** recorded, so only
+      the middle spinning detail is elided — and entries-per-trace at
+      `exec_log_max_entries` (default 64). Both are surfaced as `capped` /
+      `entries_capped` flags, never silent. Off by default
+      (`TraceConfig.record_exec_log`); the recorder reuses a per-entry scratch buffer
+      (no per-event heap traffic).
+- [x] **Scalar values, reusing `EffectResult`.** A trace at this phase computes only
+      scalars — `slot_load`/`konst`/arith/compare/guards/`loop`, no table or heap IR
+      (those abort recording) — so an event value reuses the **`EffectResult`** union
+      the effect log already uses (scalars + an inline string for a `konst`), not a
+      heap-ref that could dangle after a side-exit. Serialized by `src/execlogser.zig`
+      sharing `effectser`'s value mapping. The `trace_id` is the trace-cache index —
+      also the visualiser's selection key — so the selected trace maps straight to its
+      log. Proven by recorder tests (hot-loop capture, the detail and entry caps, and
+      an **observation-only parity** canary: record on/off agree on `regs`/`completed`)
+      plus the `execlogser` round-trip corpus and viz end-to-end `bun test`.
 
 ### Done (Phase 6b — the trace optimizer, `src/tropt.zig`)
 
