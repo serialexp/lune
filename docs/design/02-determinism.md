@@ -62,16 +62,31 @@ that for a time-travel debugger it *is* the architecture.
 
 ### Outstanding
 
-- [ ] **Effect taxonomy.** Enumerate every nondeterministic source and assign
+- [~] **Effect taxonomy.** Enumerate every nondeterministic source and assign
       each a policy: *forbid in deterministic mode*, *virtualise*, or *log
-      inputs/outputs*.
-- [ ] **Host-effect *recording*** — the seam exists (Phase 3, above); what's left
-      is making each host call emit an effect record (inputs + outputs) and act as
-      a trace barrier, so replay can feed the outputs back without re-executing the
-      effect.
-- [ ] **Effect record format** — inputs + outputs sufficient to replay without
-      re-executing the effect. Lives in the trace schema
-      (`04-snapshot-replay-schema.md`).
+      inputs/outputs*. **The first input now exists** (F2d): `clock()` — the host
+      monotonic clock — is the canonical *log-outputs* effect, carried as a stable
+      wire enum `interp.EffectKind` (clock=0). The table below is the full plan;
+      `clock` is the first row made real.
+- [~] **Host-effect *recording*** — the seam exists (Phase 3, above). **F2d makes
+      it real for the first input.** A native may now carry an `effect: ?EffectKind`
+      (null = pure host call like `print`; non-null = a nondeterministic input). The
+      VM has an `effect_mode ∈ {off, record, replay}`: `record` calls the effect and
+      appends `{kind, result}` to an ordered `effect_log`; `replay` does **not** call
+      it — it feeds back the next logged result in call order (`EffectLogExhausted`
+      past the end, `EffectKindMismatch` if the log disagrees with the call site);
+      `off` (default) calls normally, so every pre-F2d test is unaffected. A host
+      call was already a trace barrier (a native aborts recording), so the effect
+      seam never touches the JIT.
+- [x] **Effect record format** — inputs + outputs sufficient to replay without
+      re-executing the effect. Landed (F2d) as a third record family in the trace
+      schema (`04-snapshot-replay-schema.md`): `Effect { kind, result }` +
+      `EffectFile { version, effects[] }`, with its own version word, serialized by
+      `src/effectser.zig` (mirroring `traceser`/`keyframeser`). `clock()` has no
+      inputs, so kind + result fully describe it; effect *args* are a later
+      increment. `result` reuses `SnapValue` but is **non-heap** today (clock returns
+      an int) — a standalone effect log carries no heap graph, so a heap result has
+      no id to resolve against (`UnsupportedEffectResult`).
 - [x] **Hash seed fixed.** String/table hashing uses Wyhash with a **fixed seed
       0** (`src/string.zig`, `src/table.zig` `ValueContext`), not a per-run random
       seed — so hashing is already reproducible run-to-run. (A trace *header*
@@ -121,12 +136,14 @@ that for a time-travel debugger it *is* the architecture.
       every safepoint (`gc_stress`), which is the evidence. (If a generational
       upgrade later adds GC timing that a trace could observe, it must be scheduled
       deterministically and recorded.)
-- [ ] **Time / randomness / environment** routed through the effect boundary
-      (no raw access). *Not yet actionable: none of these inputs exist in the
-      language — `print` is the only host function, and it is output-only. The
-      effect-record format (above) is deliberately deferred until the first such
-      input lands, so it is designed against a genuine input+output pair rather
-      than output-only `print`.*
+- [~] **Time / randomness / environment** routed through the effect boundary
+      (no raw access). **Time now is** (F2d): `clock()` reads the host monotonic
+      clock and is the first input routed through the effect boundary — recorded in
+      `record` mode, fed back in `replay`, never reaching a script as raw access.
+      Randomness and environment/args follow the same `EffectKind` pattern when they
+      land (each a new ordinal, each `log`/`seed` per the taxonomy). The format was
+      deliberately deferred until this first genuine input+output pair (vs.
+      output-only `print`) so it was designed against a real effect, not guessed.
 - [~] **Host-mediated suspension hook.** Reserve "a host effect may suspend its
       caller" so generators / await / tasks can be added later without new
       machinery. **The substrate now exists** (F2c): the interpreter runs on an
@@ -159,9 +176,18 @@ that for a time-travel debugger it *is* the architecture.
       it into a fresh VM, and **re-execute forward** — `out_before ++ out_after`
       equals the uninterrupted output and the resumed final snapshot is byte-equal
       to the reference. Independent VMs cut at the same safepoint produce
-      byte-identical mid keyframes (the determinism property, mid-flight). What
-      remains for *true* keyframe+effect replay is the **effect log** (the first
-      nondeterministic input), so re-execution past an effect is reproducible.
+      byte-identical mid keyframes (the determinism property, mid-flight).
+      **The effect log (F2d) closes it into *true* keyframe+effect replay**: with a
+      nondeterministic input (`clock()`) in hand, a `record` run logs the inputs and
+      a `replay` run feeds them back instead of re-calling the clock — so a
+      clock()-using program replays to byte-identical output even though a third
+      *fresh record* run differs (that difference being exactly the nondeterminism
+      now captured). The headline test ties both halves together: restore a *mid-run*
+      keyframe of a clock()-using program **and** replay its effect log from the cut
+      cursor → `out_before ++ out_after` equals the uninterrupted output. The
+      keyframe deliberately does **not** carry the effect log/cursor — that is
+      replay-driver state marshalled *alongside* the snapshot (the keyframe is heap +
+      stack + frames; the cursor is where in the log the cut fell).
 
 ## Why this exists
 
@@ -191,7 +217,7 @@ accounting that makes "deterministic" true rather than aspirational.
 | Source | Policy (forbid / virtualise / log) | Notes |
 |---|---|---|
 | Host function calls | log inputs+outputs | the primary boundary |
-| Time / clock | log | via host effect |
+| Time / clock | log | **landed (F2d)**: `clock()` host effect, `EffectKind.clock`=0 |
 | Randomness | log or seed | seed stored in trace header |
 | File / network / stdin | log results | host effect |
 | Environment / args | log at startup | snapshot in header |

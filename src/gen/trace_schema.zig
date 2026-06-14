@@ -948,3 +948,73 @@ pub const SnapshotFile = struct {
         return result;
     }
 };
+
+pub const Effect = struct {
+    kind: u8,
+    result: SnapValue,
+
+    pub fn encode(self: Effect, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: Effect, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint8(self.kind);
+        try self.result.encodeInto(enc, ctx);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!Effect {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!Effect {
+        var result: Effect = undefined;
+        result.kind = try dec.readUint8();
+        result.result = try SnapValue.decodeWith(allocator, dec, root);
+        return result;
+    }
+};
+
+pub const EffectFile = struct {
+    version: u32,
+    effects: []const Effect,
+
+    pub fn encode(self: EffectFile, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: EffectFile, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint32(self.version, .little_endian);
+        try enc.writeUint32(@intCast(self.effects.len), .little_endian);
+        for (self.effects) |_item_0| {
+            try _item_0.encodeInto(enc, ctx);
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!EffectFile {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!EffectFile {
+        var result: EffectFile = undefined;
+        result.version = try dec.readUint32(.little_endian);
+        const _len_4 = try dec.readUint32(.little_endian);
+        const _buf_5 = try allocator.alloc(Effect, @as(usize, _len_4));
+        for (0.._buf_5.len) |_i_2| {
+            _buf_5[_i_2] = try Effect.decodeWith(allocator, dec, root);
+        }
+        result.effects = _buf_5;
+        return result;
+    }
+};

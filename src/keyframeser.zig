@@ -385,6 +385,7 @@ pub fn restoreSnapshot(
                 const entry = natives.lookup(hn.name) orelse return error.UnknownNative;
                 // Use the registry's static name (outlives the decode arena).
                 const n = try function.Native.create(gpa, entry.func, entry.name);
+                n.effect = entry.effect; // an effect native stays an effect on replay
                 vm.heap.linkRestored(&n.header, o.id);
                 break :blk &n.header;
             },
@@ -1229,4 +1230,120 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
         .open_upvalues = &.{},
     } };
     try expectRestoreError(bad, &rootp, error.FrameWindowMismatch);
+}
+
+// ---------------------------------------------------------------------------
+// F2d — combined keyframe + effect replay (the real demo)
+//
+// F2c proved a mid-execution keyframe re-executes forward to the same result —
+// but only for a *deterministic* program. The moment a run reads a
+// nondeterministic input (`clock()`), re-execution diverges unless the recorded
+// inputs are fed back. This test ties the two halves of the substrate together:
+// restore a mid-run keyframe AND replay its effect log from the cut, and the
+// forward output matches the uninterrupted run byte-for-byte.
+//
+// The seam the keyframe does NOT carry is the effect cursor: the keyframe is the
+// heap/stack/frames, the effect log + cursor are replay-driver state supplied
+// alongside it. So restore() rebuilds the VM, then the driver sets
+// effect_mode/effect_log/effect_cursor before resuming — exactly what a real
+// replay harness would marshal next to the snapshot.
+// ---------------------------------------------------------------------------
+
+// A clock()-using program with a loop inside a nested call: each cut lands with
+// live frames AND a partially-consumed effect log, so both halves are exercised.
+const f2d_combined_source =
+    \\local function ticks(n)
+    \\  local s = 0
+    \\  for i = 1, n do s = s + clock() end
+    \\  return s
+    \\end
+    \\print(ticks(3))
+    \\print(ticks(3))
+;
+
+test "F2d: restore a mid-run keyframe + replay its effect log → identical forward output" {
+    const gpa = testing.allocator;
+    const source = f2d_combined_source;
+
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    // --- Run 1 (record): full uninterrupted run → reference output F + effect log L.
+    const ref = blk: {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [512]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+
+        vm.effect_mode = .record;
+        _ = try vm.run(chunk.proto);
+
+        break :blk .{
+            .out = try gpa.dupe(u8, sink.buffered()),
+            .log = try gpa.dupe(interp.Effect, vm.effect_log.items),
+            .safepoints = vm.safepoint_seq,
+        };
+    };
+    defer gpa.free(ref.out);
+    defer gpa.free(ref.log);
+    try testing.expectEqual(@as(usize, 6), ref.log.len); // 3 + 3 clock() calls
+    try testing.expect(ref.safepoints > 4);
+
+    // --- Run 2 (replay + suspend): re-run feeding L back, cut mid-execution. Replay
+    // (not a fresh record) so the clock values match L exactly — the pre-cut output
+    // is then a true prefix of F, and the cursor names how much of L was consumed.
+    // The suspend VM owns the heap the program image interns into; it must outlive
+    // the restored VM that borrows `chunk.proto`.
+    var vm2 = try Vm.init(gpa);
+    defer vm2.deinit();
+    var buf2: [512]u8 = undefined;
+    var sink2 = io.Writer.fixed(&buf2);
+    vm2.out = &sink2;
+    var chunk2 = try lune_compiler.compile(gpa, &vm2.heap, source, tree.root, &diags);
+    defer chunk2.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    vm2.effect_mode = .replay;
+    try vm2.effect_log.appendSlice(gpa, ref.log);
+    vm2.suspend_ctl = .{ .min_depth = 2, .after_safepoints = ref.safepoints / 2 };
+    try testing.expect((try vm2.start(chunk2.proto)) == .suspended);
+
+    const out_before = try gpa.dupe(u8, sink2.buffered());
+    defer gpa.free(out_before);
+    const cursor_at_cut = vm2.effect_cursor; // replay-driver state the keyframe omits
+    try testing.expect(cursor_at_cut > 0 and cursor_at_cut < ref.log.len); // genuinely mid-log
+
+    const mid = try encodeSnapshot(gpa, &vm2);
+    defer gpa.free(mid);
+
+    // --- Restore + replay-from-cursor: rebuild the VM from the keyframe, then the
+    // driver re-attaches the effect log and cursor (the seam the keyframe omits).
+    const vm_r = try restore(gpa, mid, chunk2.proto, NativeRegistry.base());
+    defer {
+        vm_r.deinit();
+        gpa.destroy(vm_r);
+    }
+    var buf_r: [512]u8 = undefined;
+    var sink_r = io.Writer.fixed(&buf_r);
+    vm_r.out = &sink_r;
+    vm_r.effect_mode = .replay;
+    try vm_r.effect_log.appendSlice(gpa, ref.log);
+    vm_r.effect_cursor = cursor_at_cut;
+    vm_r.suspend_ctl = null;
+    try testing.expect((try vm_r.exec()) == .finished);
+
+    // out_before ++ out_after == F: the restored run consumed the tail of L from the
+    // cursor and reproduced the rest of the output exactly.
+    var combined: [1024]u8 = undefined;
+    @memcpy(combined[0..out_before.len], out_before);
+    @memcpy(combined[out_before.len..][0..sink_r.buffered().len], sink_r.buffered());
+    try testing.expectEqualStrings(ref.out, combined[0 .. out_before.len + sink_r.buffered().len]);
+    // The whole log was consumed exactly once across the cut (no effect lost or replayed twice).
+    try testing.expectEqual(ref.log.len, vm_r.effect_cursor);
 }

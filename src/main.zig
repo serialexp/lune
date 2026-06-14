@@ -51,6 +51,10 @@ const usage =
     \\                       serialize a whole-VM keyframe snapshot (the reachable
     \\                       heap graph + roots, binschema wire format) to <file>
     \\                       after the run. Independent of tracing.
+    \\  --emit-effects <file>
+    \\                       record the run's nondeterministic-input effect log
+    \\                       (e.g. clock() results) and serialize it to <file>
+    \\                       (binschema wire format) after the run.
     \\  -h, --help           show this help
     \\
 ;
@@ -68,6 +72,9 @@ const TraceOpts = struct {
     /// `--emit-keyframe <file>`: serialize a whole-VM keyframe snapshot here after
     /// the run. Independent of tracing (a heap snapshot, not a trace artifact).
     keyframe_path: ?[]const u8 = null,
+    /// `--emit-effects <file>`: record the nondeterministic-input effect log and
+    /// serialize it here after the run (puts the VM in effect `record` mode).
+    effects_path: ?[]const u8 = null,
 };
 
 pub fn main(init: std.process.Init) u8 {
@@ -104,6 +111,11 @@ pub fn main(init: std.process.Init) u8 {
         } else if (std.mem.eql(u8, arg, "--emit-keyframe")) {
             topts.keyframe_path = it.next() orelse {
                 lune.io.eprint("lune: error: --emit-keyframe requires a <file> argument\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--emit-effects")) {
+            topts.effects_path = it.next() orelse {
+                lune.io.eprint("lune: error: --emit-effects requires a <file> argument\n", .{});
                 return 2;
             };
         } else break arg;
@@ -162,6 +174,8 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     vm.trace.config.enabled = topts.enabled;
     vm.trace.config.execute = topts.execute;
     vm.trace.config.optimize = topts.optimize;
+    // `--emit-effects` records the nondeterministic-input log during the run.
+    if (topts.effects_path != null) vm.effect_mode = .record;
 
     // --- compile ---
     var chunk = lune.compiler.compile(gpa, &vm.heap, source, tree.root, &diags) catch |err| {
@@ -204,6 +218,15 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
             return 1;
         };
     }
+
+    // --- emit the recorded effect log (--emit-effects <file>) --- the VM ran in
+    // `record` mode, so `effect_log` holds every nondeterministic input in order.
+    if (topts.effects_path) |path| {
+        emitEffects(gpa, io, path, &vm) catch |err| {
+            lune.io.eprint("lune: error: --emit-effects '{s}': {s}\n", .{ path, @errorName(err) });
+            return 1;
+        };
+    }
     return 0;
 }
 
@@ -213,6 +236,15 @@ fn emitKeyframe(gpa: std.mem.Allocator, io: lune.io.Io, path: []const u8, vm: *l
     defer gpa.free(bytes);
     try lune.io.writeFile(io, path, bytes);
     lune.io.eprint("lune: wrote keyframe snapshot, {d} bytes → {s}\n", .{ bytes.len, path });
+}
+
+/// Serialize the recorded nondeterministic-input effect log to `path` (binschema
+/// wire format). Mirrors `emitKeyframe`; the VM must have run in `record` mode.
+fn emitEffects(gpa: std.mem.Allocator, io: lune.io.Io, path: []const u8, vm: *lune.interp.Vm) !void {
+    const bytes = try lune.effectser.encodeFile(gpa, vm.effect_log.items);
+    defer gpa.free(bytes);
+    try lune.io.writeFile(io, path, bytes);
+    lune.io.eprint("lune: wrote effect log, {d} effect(s), {d} bytes → {s}\n", .{ vm.effect_log.items.len, bytes.len, path });
 }
 
 /// Serialize the recorded trace cache to `path` (binschema wire format).

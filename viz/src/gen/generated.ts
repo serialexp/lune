@@ -3119,3 +3119,258 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
   }
 }
 
+/**
+ * One recorded nondeterministic INPUT (F2d): the host effect that produced it and the Value it returned. `kind` mirrors lune's interp.EffectKind enum (clock=0). The log is consumed in call order on replay; `clock()` has no inputs, so kind + result fully describe it (effect args/inputs are a later increment). `result` reuses SnapValue but is non-heap today (clock returns an int) — a heap result has no idmap to resolve against in a standalone effect log.
+ */
+export interface EffectInput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  kind: number;
+  /**
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   */
+  result: SnapValueInput;
+}
+
+/**
+ * One recorded nondeterministic INPUT (F2d): the host effect that produced it and the Value it returned. `kind` mirrors lune's interp.EffectKind enum (clock=0). The log is consumed in call order on replay; `clock()` has no inputs, so kind + result fully describe it (effect args/inputs are a later increment). `result` reuses SnapValue but is non-heap today (clock returns an int) — a heap result has no idmap to resolve against in a standalone effect log.
+ */
+export interface EffectOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  kind: number;
+  /**
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   */
+  result: SnapValueOutput;
+}
+
+export type Effect = EffectOutput;
+
+export class EffectEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: EffectInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(value.kind);
+    const encoder_result = new SnapValueEncoder();
+    const encoded_result = encoder_result.encode(value.result);
+    for (const byte of encoded_result) {
+      this.writeUint8(byte);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a Effect value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: Effect): number {
+    let size = 0;
+    size += 1; // kind
+    // result: custom type (SnapValue)
+    const result_encoder = new SnapValueEncoder();
+    size += result_encoder.calculateSize(value.result);
+    return size;
+  }
+}
+
+export class EffectDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): EffectOutput {
+    const value: any = {};
+
+    value.kind = this.readUint8();
+    value.result = {};
+    value.result.tag = this.readUint8();
+    if (value.tag === 0) {
+      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.result.body = { type: 'ConstNil', value: payload };
+    }
+    else if (value.tag === 1) {
+      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.result.body = { type: 'ConstBool', value: payload };
+    }
+    else if (value.tag === 2) {
+      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.result.body = { type: 'ConstInt', value: payload };
+    }
+    else if (value.tag === 3) {
+      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.result.body = { type: 'ConstFloat', value: payload };
+    }
+    else if (value.tag === 4) {
+      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.result.body = { type: 'HeapRef', value: payload };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.tag}`);
+    }
+    return value;
+  }
+}
+
+/**
+ * The top-level effect-log artifact (F2d): the ordered list of recorded nondeterministic inputs for one run. Its own `version` word — a third record family sharing the binschema encoding with the trace and keyframe artifacts, never fused (docs/design/04 'two artifacts, one substrate'). Replay restores a keyframe and feeds these back in order so re-execution past an effect is reproducible.
+ */
+export interface EffectFileInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  version: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  effects: EffectInput[];
+}
+
+/**
+ * The top-level effect-log artifact (F2d): the ordered list of recorded nondeterministic inputs for one run. Its own `version` word — a third record family sharing the binschema encoding with the trace and keyframe artifacts, never fused (docs/design/04 'two artifacts, one substrate'). Replay restores a keyframe and feeds these back in order so re-execution past an effect is reproducible.
+ */
+export interface EffectFileOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  version: number;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  effects: EffectOutput[];
+}
+
+export type EffectFile = EffectFileOutput;
+
+export class EffectFileEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: EffectFileInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.version, "little_endian");
+    this.writeUint32(value.effects.length, "little_endian");
+    for (let value_effects__iter_index = 0; value_effects__iter_index < value.effects.length; value_effects__iter_index++) {
+      const value_effects__iter = value.effects[value_effects__iter_index];
+      const encoder_value_effects__iter = new EffectEncoder();
+      const encoded_value_effects__iter = encoder_value_effects__iter.encode(value_effects__iter);
+      for (const byte of encoded_value_effects__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a EffectFile value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: EffectFile): number {
+    let size = 0;
+    size += 4; // version
+    // effects: array (kind: length_prefixed)
+    for (const item of value.effects) {
+      const effects_itemEncoder = new EffectEncoder();
+      size += effects_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class EffectFileDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): EffectFileOutput {
+    const value: any = {};
+
+    value.version = this.readUint32("little_endian");
+    value.effects = [];
+    const effects_length = this.readUint32("little_endian");
+    for (let i = 0; i < effects_length; i++) {
+      let effects__iter: any;
+      effects__iter = {};
+      effects__iter.kind = this.readUint8();
+      effects__iter.result = {};
+      effects__iter.result.tag = this.readUint8();
+      if (effects__iter.tag === 0) {
+        const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), effects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        effects__iter.result.body = { type: 'ConstNil', value: payload };
+      }
+      else if (effects__iter.tag === 1) {
+        const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), effects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        effects__iter.result.body = { type: 'ConstBool', value: payload };
+      }
+      else if (effects__iter.tag === 2) {
+        const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), effects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        effects__iter.result.body = { type: 'ConstInt', value: payload };
+      }
+      else if (effects__iter.tag === 3) {
+        const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), effects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        effects__iter.result.body = { type: 'ConstFloat', value: payload };
+      }
+      else if (effects__iter.tag === 4) {
+        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), effects__iter);
+        const payload = decoder.decode();
+        this.byteOffset += decoder.byteOffset;
+        effects__iter.result.body = { type: 'HeapRef', value: payload };
+      } else {
+        throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${effects__iter.tag}`);
+      }
+      value.effects.push(effects__iter);
+    }
+    return value;
+  }
+}
+

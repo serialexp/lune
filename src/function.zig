@@ -114,11 +114,29 @@ pub const Closure = struct {
 /// coerce back through the boundary.
 pub const NativeFn = *const fn (ctx: *anyopaque, args: []const Value) anyerror!Value;
 
+/// Which **nondeterministic input** a native represents, if any. A native with a
+/// non-null `EffectKind` is a record/replay boundary: in `record` mode its result
+/// is logged, in `replay` mode it is *not called* and the logged result is fed
+/// back (`interp.Vm.performEffect`). The ordinals are a stable wire enum — they
+/// are what `schema.Effect.kind` carries — so existing values must never be
+/// renumbered. `print` is pure-output, so it has *no* `EffectKind` (null).
+/// Lives here because `Native` is the carrier and this module is dependency-light
+/// (no import cycle with `interp`).
+pub const EffectKind = enum(u8) {
+    /// `clock()` — the host wall/monotonic clock. The canonical first effect.
+    clock = 0,
+};
+
 pub const Native = struct {
     header: GcHeader,
     func: NativeFn,
     /// Debug/identity name (e.g. "print"). Not semantically meaningful.
     name: []const u8 = "?",
+    /// Non-null ⇒ this native is a nondeterministic-input effect of the given
+    /// kind (record/replay boundary). Null ⇒ a pure host call (e.g. `print`).
+    /// Set from the `interp.base_natives` registry at install and at restore, so
+    /// install and replay can never disagree about what is an effect.
+    effect: ?EffectKind = null,
 
     pub fn create(
         gpa: std.mem.Allocator,

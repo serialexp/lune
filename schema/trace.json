@@ -196,6 +196,22 @@
         { "name": "version",  "type": "uint32" },
         { "name": "keyframe", "type": "Keyframe" }
       ]
+    },
+
+    "Effect": {
+      "description": "One recorded nondeterministic INPUT (F2d): the host effect that produced it and the Value it returned. `kind` mirrors lune's interp.EffectKind enum (clock=0). The log is consumed in call order on replay; `clock()` has no inputs, so kind + result fully describe it (effect args/inputs are a later increment). `result` reuses SnapValue but is non-heap today (clock returns an int) — a heap result has no idmap to resolve against in a standalone effect log.",
+      "sequence": [
+        { "name": "kind",   "type": "uint8" },
+        { "name": "result", "type": "SnapValue" }
+      ]
+    },
+
+    "EffectFile": {
+      "description": "The top-level effect-log artifact (F2d): the ordered list of recorded nondeterministic inputs for one run. Its own `version` word — a third record family sharing the binschema encoding with the trace and keyframe artifacts, never fused (docs/design/04 'two artifacts, one substrate'). Replay restores a keyframe and feeds these back in order so re-execution past an effect is reproducible.",
+      "sequence": [
+        { "name": "version", "type": "uint32" },
+        { "name": "effects", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "Effect" } }
+      ]
     }
   }
 }

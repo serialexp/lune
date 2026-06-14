@@ -61,6 +61,11 @@ pub const traceser = @import("traceser.zig");
 /// generated binschema codec with `traceser`).
 pub const keyframeser = @import("keyframeser.zig");
 
+/// Phase 7 v2 (F2d) — effect-log serialization: maps a VM's recorded
+/// nondeterministic inputs (`interp.Effect`) to/from their on-disk form (shares
+/// the generated binschema codec with `traceser`/`keyframeser`).
+pub const effectser = @import("effectser.zig");
+
 /// Re-exports for ergonomic access.
 pub const Value = value.Value;
 pub const GcHeader = object.GcHeader;
@@ -90,4 +95,5 @@ test {
     _ = tropt;
     _ = traceser;
     _ = keyframeser;
+    _ = effectser;
 }

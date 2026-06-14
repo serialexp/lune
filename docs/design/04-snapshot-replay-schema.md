@@ -1,6 +1,6 @@
 # lune — Snapshot & Replay Schema
 
-Status: draft — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) landed; effect log outstanding
+Status: draft — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d) landed; guard-snapshots outstanding
 Owner: Bart
 Last updated: 2026-06-14
 
@@ -131,6 +131,36 @@ schema follows; this is that schema's home.
       effect log (F2d) — re-executing *past a nondeterministic input* needs the
       recorded effect fed back.
 
+- [x] **Effect log (Phase 7 v2 / F2d) — the first nondeterministic input.** A
+      native can now carry an `effect: ?EffectKind` (null = pure host call like
+      `print`; non-null = a nondeterministic input), and the first one — `clock()`,
+      the host monotonic clock — lands as `EffectKind.clock`=0, a **stable wire
+      enum** whose ordinals must never be renumbered. The VM gained an
+      `effect_mode ∈ {off, record, replay}` plus an ordered `effect_log` and a
+      `effect_cursor`: `record` calls the effect and appends `{kind, result}`;
+      `replay` does **not** call it, feeding back the next logged result in call
+      order (`EffectLogExhausted` past the end, `EffectKindMismatch` on a log/site
+      disagreement); `off` (default) is the pre-F2d behaviour. The wire format is a
+      **third record family** with its own version word, sharing the binschema
+      encoding: `Effect { kind: uint8, result: SnapValue }` + `EffectFile { version,
+      effects[] }`, serialized by `src/effectser.zig` (mirroring
+      `traceser`/`keyframeser`). `result` reuses `SnapValue` but is **non-heap**
+      today — `clock` returns an int, and a standalone effect log carries no heap
+      graph, so a heap result has no id to resolve against (rejected as
+      `UnsupportedEffectResult`). Proven by: an `effectser` round-trip corpus
+      (empty/single/multi, int+float, stable-bytes, wrong-version, unknown-kind,
+      heap-ref-rejected); an in-VM record→replay headline (replay reproduces the
+      recorded output byte-for-byte while a *fresh record* differs — the captured
+      nondeterminism); the `EffectLogExhausted` short-log failure mode; and the
+      **combined demo** that ties F2c+F2d together — restore a *mid-run* keyframe of
+      a clock()-using program **and** replay its effect log from the cut cursor →
+      `out_before ++ out_after` equals the uninterrupted output. The keyframe
+      deliberately does **not** carry the log/cursor: that is replay-driver state
+      marshalled alongside the snapshot (keyframe = heap+stack+frames; cursor = where
+      in the log the cut fell). CLI: `--emit-effects <file>` writes the log after a
+      run (mirrors `--emit-keyframe`); a user-facing replay driver trails the
+      visualiser work.
+
 ### Outstanding
 
 - [~] **Two artifacts, one substrate.** Define **optimizer guard-snapshots**
@@ -139,21 +169,28 @@ schema follows; this is that schema's home.
       keyframe half exists end-to-end (F2a serializer + F2b restore, above):
       `SnapshotFile` is a distinct record family with its own version word, sharing
       the trace artifact's generated codec, and round-trips losslessly through a
-      live VM. Guard-snapshots and the effect log are still outstanding.
+      live VM. **The effect log is now a third such family** (F2d `EffectFile`, its
+      own version word, same shared encoding). Only optimizer guard-snapshots remain
+      outstanding.
 - [ ] **Event model.** Minimum event set: event id, bytecode PC, frame id,
       register writes, heap writes, allocation ids, guard snapshots, side exits,
       host/external calls, nondeterministic inputs (effect records), GC events,
       checkpoint/keyframe indexes.
-- [ ] **Effect record format** — inputs + outputs sufficient to replay without
-      re-running the effect (shared with `02-determinism.md`).
+- [x] **Effect record format** — inputs + outputs sufficient to replay without
+      re-running the effect (shared with `02-determinism.md`). Landed (F2d):
+      `Effect { kind, result }` + `EffectFile { version, effects[] }`, consumed in
+      call order on replay. `clock()` has no inputs, so kind + result suffice;
+      effect *args* (inputs) are a later increment when an effect that takes them
+      lands.
 - [x] **Keyframe format** — VM-state snapshot for replay restore (shares code
       with guard snapshots, `01-trace-lifecycle.md`). All three halves are done:
       capture (F2a `SnapshotFile`), restore into a live VM (F2b
       `keyframeser.restore`), and **mid-execution capture + resume-to-equivalence**
       (F2c — a non-empty live stack/frames are captured at a safepoint and
-      re-executed forward to the same output and final state). What remains for
-      *replay* is not the keyframe itself but the **effect log** it interleaves with
-      (below), so re-execution past a nondeterministic input is reproducible.
+      re-executed forward to the same output and final state). The **effect log**
+      it interleaves with also landed (F2d, above), so re-execution past a
+      nondeterministic input (`clock()`) is now reproducible — the combined
+      keyframe+effect replay demo closes the loop.
 - [ ] **Recording modes.** Full-replay, bounded ring-buffer window, keyframe-only,
       off. Define defaults and per-mode capture filters (bytecode events / heap
       writes / host calls / allocations / source lines).
@@ -170,8 +207,9 @@ schema follows; this is that schema's home.
       committed fixture decoded under `viz` `bun test`. The schema now also covers
       the **keyframe** record family (F2a `SnapshotFile`, above) — the Zig codec is
       regenerated and vendored, and the TS codec under `viz/src/gen/` is too (a
-      cross-language snapshot fixture trails F2a). Still outstanding: extending the
-      schema to the rest of the event model below (effects / guard-snapshots).
+      cross-language snapshot fixture trails F2a). It now also covers the **effect**
+      record family (F2d `Effect`/`EffectFile`), Zig + TS codecs regenerated and
+      vendored. Still outstanding: extending the schema to optimizer guard-snapshots.
 - [ ] **Versioning / compat policy.** The schema will churn during Phases 5–7.
       State the policy (likely: visualiser reads traces only from the same VM
       commit) so version skew is handled, not surprising.
@@ -205,7 +243,9 @@ debug-recorder bandwidth.
 
 Discriminated union over record kinds (binschema's core feature):
 
-- `Effect{ id, kind, inputs, outputs }` — a recorded nondeterministic input.
+- `Effect{ kind, result }` — a recorded nondeterministic input (F2d, **landed**:
+  `kind` is a stable `EffectKind` ordinal, `result` a `SnapValue`; effect *inputs*
+  are added when the first effect that takes them lands — `clock()` has none).
 - `Keyframe{ index, vm_state_ref }` — periodic full-ish snapshot for replay.
 - `GuardSnapshot{ trace, exit, ir_to_slot_map, sunk_allocs }` — deopt restore.
 - `SideExit{ trace, exit, target }`, `TraceEvent{ ... }`, `GCEvent{ ... }`,

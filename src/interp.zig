@@ -47,6 +47,12 @@ pub const Error = error{
     StackOverflow,
     /// A native (host) function failed with an error outside the known set.
     HostError,
+    /// Replay consumed the whole effect log but the program asked for another
+    /// effect — the log is too short for this run (it diverged, or is truncated).
+    EffectLogExhausted,
+    /// Replay's next logged effect is a different kind than the program just
+    /// requested — the recording doesn't match this program/run.
+    EffectKindMismatch,
     /// Allocation failure (register stack, future heap).
     OutOfMemory,
 };
@@ -64,8 +70,28 @@ const stack_slots: usize = 1 << 16;
 /// oracle, not the deep-recursion tier.
 const max_call_depth: u32 = 200;
 
-/// One built-in native: the global name it installs under and its function.
-pub const BaseNative = struct { name: []const u8, func: function.NativeFn };
+/// Which nondeterministic input a native represents (record/replay boundary), or
+/// null for a pure host call. Defined on `function` (the `Native` carrier) to keep
+/// it cycle-free; re-exported here because effects are an interpreter concept.
+pub const EffectKind = function.EffectKind;
+
+/// One recorded nondeterministic input: the effect that produced it and the
+/// `Value` it returned. The `effect_log` is an **ordered** list consumed in call
+/// order on replay (`clock()` has no inputs, so the kind + result fully describe
+/// it). Heap results are out of scope for now — `clock` returns an int.
+pub const Effect = struct { kind: EffectKind, result: Value };
+
+/// Record / replay / off — the effect-log mode. `off` (default) is the
+/// pre-F2d behaviour: every native runs normally and nothing is logged.
+pub const EffectMode = enum { off, record, replay };
+
+/// One built-in native: the global name it installs under, its function, and
+/// whether it is a nondeterministic-input effect (null = pure host call).
+pub const BaseNative = struct {
+    name: []const u8,
+    func: function.NativeFn,
+    effect: ?EffectKind = null,
+};
 
 /// The single source of truth for built-in natives. `installBaseLib` installs
 /// every entry into a fresh VM's globals, and the keyframe restorer
@@ -73,9 +99,12 @@ pub const BaseNative = struct { name: []const u8, func: function.NativeFn };
 /// so a native added here is automatically both installable and restorable, and
 /// the two paths can never diverge. The serialized form of a `Native` is just its
 /// name (`keyframeser.toSchemaHeapObject`), which is meaningful only against this
-/// registry. Currently just `print`; `tostring`, `type`, … attach here.
+/// registry. The `effect` tag is likewise sourced here (install + restore both
+/// read it), so what counts as an effect is defined in exactly one place.
+/// `print` is pure output; `clock` is the first nondeterministic input.
 pub const base_natives = [_]BaseNative{
     .{ .name = "print", .func = &nativePrint },
+    .{ .name = "clock", .func = &nativeClock, .effect = .clock },
 };
 
 /// Result of running one frame: the `count` return values live at
@@ -173,6 +202,15 @@ pub const Vm = struct {
     /// Mid-execution suspend trigger, or null (never suspend — the normal path).
     /// Armed by a test / future debugger to capture a resumable keyframe.
     suspend_ctl: ?SuspendCtl = null,
+    /// Effect-log mode (F2d): `off` (default — natives run normally, nothing
+    /// logged), `record` (run effects + append each result to `effect_log`), or
+    /// `replay` (do NOT call effects — feed back the logged result in call order).
+    effect_mode: EffectMode = .off,
+    /// The ordered nondeterministic-input log. In `record` it grows; in `replay`
+    /// it is consumed front-to-back via `effect_cursor`. Owned by the VM.
+    effect_log: std.ArrayList(Effect) = .empty,
+    /// Replay read position into `effect_log` (next effect to feed back).
+    effect_cursor: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
         var vm = try initBare(gpa);
@@ -213,6 +251,7 @@ pub const Vm = struct {
     pub fn deinit(self: *Vm) void {
         self.trace.deinit();
         self.open_upvalues.deinit(self.gpa);
+        self.effect_log.deinit(self.gpa);
         self.heap.deinit();
         self.gpa.free(self.stack);
     }
@@ -221,12 +260,13 @@ pub const Vm = struct {
     /// `base_natives` registry — the same table the keyframe restorer reads to
     /// rebind a serialized native by name, so install and restore can never drift.
     fn installBaseLib(self: *Vm) Error!void {
-        for (base_natives) |bn| try self.defineNative(bn.name, bn.func);
+        for (base_natives) |bn| try self.defineNative(bn);
     }
 
-    fn defineNative(self: *Vm, name: []const u8, func: function.NativeFn) Error!void {
-        const native = try self.heap.newNative(func, name);
-        const key = try self.heap.internValue(name);
+    fn defineNative(self: *Vm, bn: BaseNative) Error!void {
+        const native = try self.heap.newNative(bn.func, bn.name);
+        native.effect = bn.effect; // null for pure host calls (e.g. print)
+        const key = try self.heap.internValue(bn.name);
         try self.globals.set(self.gpa, key, Value.heap(&native.header));
     }
 
@@ -536,7 +576,14 @@ pub const Vm = struct {
                             const nargs: usize = instr.b;
                             const nwanted: usize = instr.c;
                             const args = self.stack[base + a + 1 .. base + a + 1 + nargs];
-                            const result = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
+                            // An effect native (clock) goes through the record/replay
+                            // boundary; a pure host call (print) runs directly. A
+                            // native call is already a trace barrier (recording
+                            // aborts at it), so this seam doesn't touch the JIT.
+                            const result = if (nat.effect) |kind|
+                                try performEffect(self, kind, nat, args)
+                            else
+                                nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
                             // Natives return a single value (multi-return is later).
                             var k: usize = 0;
                             while (k < nwanted) : (k += 1) {
@@ -723,6 +770,48 @@ fn narrowError(e: anyerror) Error {
 /// the one churny-writer wrapper) and returns `nil`. In a later phase this is
 /// where an effect is *recorded* for deterministic replay
 /// (docs/design/02-determinism.md); for now it just performs it.
+/// Run a nondeterministic-input effect through the record/replay boundary.
+///   - `off`    — call it normally (default; no log touched).
+///   - `record` — call it, append `{kind, result}` to the ordered `effect_log`.
+///   - `replay` — do NOT call it (the host clock would differ); feed back the
+///                next logged result in call order. A mismatch in length or kind
+///                means the recording doesn't match this run.
+/// The log is consumed strictly in call order — `clock()` has no inputs, so the
+/// instruction stream re-executed on replay requests effects in the same order
+/// they were recorded.
+fn performEffect(self: *Vm, kind: EffectKind, nat: *const function.Native, args: []const Value) Error!Value {
+    switch (self.effect_mode) {
+        .off => return nat.func(@ptrCast(self), args) catch |e| return narrowError(e),
+        .record => {
+            const result = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
+            try self.effect_log.append(self.gpa, .{ .kind = kind, .result = result });
+            return result;
+        },
+        .replay => {
+            if (self.effect_cursor >= self.effect_log.items.len) return Error.EffectLogExhausted;
+            const e = self.effect_log.items[self.effect_cursor];
+            self.effect_cursor += 1;
+            if (e.kind != kind) return Error.EffectKindMismatch;
+            return e.result;
+        },
+    }
+}
+
+/// `clock()` — the canonical first nondeterministic *input* (doc 02). Returns the
+/// host monotonic clock as integer nanoseconds. Pure-nondeterministic: two calls
+/// differ, which is exactly why it must be recorded to replay deterministically.
+/// Ignores its arguments. Reads the clock via the raw Linux syscall so it needs no
+/// `std.Io` handle threaded through the native boundary (the repo is Linux-pinned;
+/// the record/replay machinery above is platform-independent regardless).
+fn nativeClock(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    _ = ctx;
+    _ = args;
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    const ns = @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
+    return Value.int(ns);
+}
+
 fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm: *Vm = @ptrCast(@alignCast(ctx));
     const to_stdout = vm.out == null;
@@ -1223,6 +1312,105 @@ test "determinism: two independent runs agree on output, traces, and snapshots" 
         defer testing.allocator.free(snap_b);
         try testing.expectEqualSlices(u8, snap_a, snap_b);
     }
+}
+
+// ---------------------------------------------------------------------------
+// F2d — effect record / replay
+//
+// `clock()` is the first nondeterministic *input*: two calls differ, so two
+// independent runs of a clock()-using program print different output. Recording
+// the effect log and replaying it makes re-execution reproducible — the
+// foundation deterministic replay (restore a keyframe, feed effects back) stands
+// on. These tests prove (1) replay reproduces the recorded output exactly, (2)
+// two fresh records genuinely differ (the nondeterminism is real), and (3) a
+// short / exhausted log is reported, not silently wrong.
+// ---------------------------------------------------------------------------
+
+const EffectRun = struct {
+    out: []u8,
+    log: []Effect,
+    fn deinit(self: EffectRun, gpa: std.mem.Allocator) void {
+        gpa.free(self.out);
+        gpa.free(self.log);
+    }
+};
+
+/// Compile + run `source` with the given effect mode. `preload` (replay only)
+/// seeds the effect log fed back in call order. Returns owned copies of the
+/// printed output and the resulting effect log (`clock` results are ints, so the
+/// log is self-contained — safe past `vm.deinit`).
+fn effectRun(gpa: std.mem.Allocator, source: [:0]const u8, mode: EffectMode, preload: []const Effect) !EffectRun {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [512]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.effect_mode = mode;
+    if (preload.len > 0) try vm.effect_log.appendSlice(gpa, preload);
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    _ = try vm.run(chunk.proto);
+    return .{
+        .out = try gpa.dupe(u8, sink.buffered()),
+        .log = try gpa.dupe(Effect, vm.effect_log.items),
+    };
+}
+
+test "F2d: replaying a recorded effect log reproduces the recorded output" {
+    const gpa = testing.allocator;
+    // Output that *depends on* the clock values, so replay fidelity is observable.
+    const source =
+        \\for i = 1, 4 do print(clock()) end
+    ;
+
+    // Record a run: the printed clock values land in `out`, the effects in `log`.
+    const rec = try effectRun(gpa, source, .record, &.{});
+    defer rec.deinit(gpa);
+    try testing.expectEqual(@as(usize, 4), rec.log.len);
+
+    // Replay the SAME log into a fresh VM: clock() is not called — the logged
+    // values are fed back — so the output is byte-identical to the record run.
+    const rep = try effectRun(gpa, source, .replay, rec.log);
+    defer rep.deinit(gpa);
+    try testing.expectEqualStrings(rec.out, rep.out);
+    // Replay re-emits the same effects into its own log (every clock() consumed one).
+    try testing.expectEqual(rec.log.len, rep.log.len);
+
+    // A second *fresh record* genuinely differs — the monotonic clock has advanced,
+    // so the nondeterminism being captured is real (not an artifact of the test).
+    const rec2 = try effectRun(gpa, source, .record, &.{});
+    defer rec2.deinit(gpa);
+    try testing.expect(!std.mem.eql(u8, rec.out, rec2.out));
+}
+
+test "F2d: replay with a too-short log reports EffectLogExhausted (no silent divergence)" {
+    const gpa = testing.allocator;
+    const source =
+        \\print(clock()); print(clock())
+    ;
+    // A one-entry log for a program that asks for two effects.
+    const short = [_]Effect{.{ .kind = .clock, .result = Value.int(123) }};
+    try testing.expectError(error.EffectLogExhausted, effectRun(gpa, source, .replay, &short));
+}
+
+test "F2d: off mode logs nothing and calls effects normally (default behaviour)" {
+    const gpa = testing.allocator;
+    const run = try effectRun(gpa, "print(clock() > 0)", .off, &.{});
+    defer run.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), run.log.len);
+    try testing.expectEqualStrings("true\n", run.out);
 }
 
 test "e2e: recursion, loop, locals — fib and a summing loop" {

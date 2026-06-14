@@ -251,9 +251,18 @@ _(nothing yet — design only)_
       image whose constants live in a *different* heap (same id, different address);
       address equality silently broke resume (`print` → `nil`). The recursion→loop
       refactor is behaviourally invisible (the 8-way `expectProgram` matrix stays
-      byte-identical). **Still to come:** the effect-log (F2d — waits on the first
-      nondeterministic *input* existing, a `clock()` host effect), then the
-      visualiser's iteration animation.
+      byte-identical). **F2d (effect log) landed:** the first nondeterministic
+      *input* now exists — `clock()`, the host monotonic clock, carried as a stable
+      `EffectKind` enum. A native may flag itself an effect; the VM runs in
+      `off`/`record`/`replay` modes with an ordered `effect_log` — `record` logs each
+      effect result, `replay` feeds the logged results back instead of re-calling the
+      effect. The log is a **third record family** (`EffectFile`, own version word,
+      shared binschema encoding; `src/effectser.zig`), and the combined demo ties
+      F2c+F2d together: restore a mid-run keyframe of a clock()-using program **and**
+      replay its effect log from the cut cursor → identical forward output, even
+      though a fresh record run differs (the captured nondeterminism). `--emit-effects`
+      writes the log. **Still to come:** more effect kinds (randomness, env), a
+      user-facing replay/step CLI, then the visualiser's iteration animation.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
       first. A performance step — but *not* mechanical: regalloc across side
       exits, GC stackmaps/safepoints, and machine-state snapshot-restore are
