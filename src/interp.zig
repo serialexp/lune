@@ -125,6 +125,16 @@ pub const base_natives = [_]BaseNative{
     .{ .name = "clock", .func = &nativeClock, .effect = .clock },
 };
 
+/// The names `installBaseLib` seeds into the globals table, derived from the
+/// single `base_natives` registry. The compiler's unknown-global lint treats
+/// these as defined so it never warns about `print`/`clock`. Deriving from
+/// `base_natives` keeps the two in lockstep — add a native and it's known here.
+pub const builtin_global_names = blk: {
+    var names: [base_natives.len][]const u8 = undefined;
+    for (base_natives, 0..) |bn, i| names[i] = bn.name;
+    break :blk names;
+};
+
 /// Result of running one frame: the `count` return values live at
 /// `regs[reg .. reg + count]` of that frame's window (i.e. `stack[base + reg]`).
 const FrameResult = struct { reg: u16, count: u16 };

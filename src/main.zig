@@ -182,8 +182,11 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // `--emit-effects` records the nondeterministic-input log during the run.
     if (topts.effects_path != null) vm.effect_mode = .record;
 
-    // --- compile ---
-    var chunk = lune.compiler.compile(gpa, &vm.heap, source, tree.root, &diags) catch |err| {
+    // --- compile --- (pass the builtin globals so the unknown-global lint
+    // doesn't flag `print`/`clock`).
+    var chunk = lune.compiler.compileWithOptions(gpa, &vm.heap, source, tree.root, &diags, .{
+        .known_globals = &lune.interp.builtin_global_names,
+    }) catch |err| {
         reportDiagnostics(name, &diags);
         lune.io.eprint("lune: error: compile failed: {s}\n", .{@errorName(err)});
         return 1;
@@ -193,6 +196,10 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
         reportDiagnostics(name, &diags);
         return 1;
     }
+    // Surface warnings (e.g. undefined globals) but keep running — advice, not a
+    // failure. The chunk is alive (deferred deinit), so arena-owned messages are
+    // valid here.
+    if (diags.count() > 0) reportDiagnostics(name, &diags);
 
     // --- run --- (a program's `print` output reaches stdout via Vm.out == null)
     _ = vm.run(chunk.proto) catch |err| {

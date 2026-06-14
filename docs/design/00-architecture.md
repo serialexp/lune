@@ -295,7 +295,12 @@ _(nothing yet — design only)_
       through a compile-only wasm entry (`lune_check` — parse + compile, no
       execution, so an infinite loop can't hang the tab) and underlines errors with
       the *same diagnostics the native compiler emits*. Validation against the real
-      frontend can't drift from the language. **Still to come:** more effect kinds
+      frontend can't drift from the language. The compiler also gained a Luau-style
+      **unknown-global warning** (deferred two-phase: collect every global read +
+      write across the chunk, then warn on a read whose name is never assigned and
+      isn't a builtin — so forward references to later `function f()` declarations
+      stay quiet); it surfaces as a yellow squiggle in the editor and a warning line
+      on the native CLI. **Still to come:** more effect kinds
       (randomness, env), a user-facing replay/step CLI, then the visualiser's
       iteration animation.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64

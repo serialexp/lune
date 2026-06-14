@@ -262,8 +262,11 @@ fn run(res: *Result, source: []const u8) !void {
     vm.effect_mode = .record;
     vm.clock_source = .{ .ctx = &clock_ctx, .nowNs = &wasmClockNs };
 
-    // --- compile ---
-    var chunk = lune.compiler.compile(gpa, &vm.heap, src0, tree.root, &diags) catch {
+    // --- compile --- (pass builtin globals so the unknown-global lint doesn't
+    // flag `print`/`clock`).
+    var chunk = lune.compiler.compileWithOptions(gpa, &vm.heap, src0, tree.root, &diags, .{
+        .known_globals = &lune.interp.builtin_global_names,
+    }) catch {
         res.status = 1;
         res.diag = bufFromSlice(try renderDiagnostics(&diags));
         return;
@@ -312,12 +315,22 @@ fn check(res: *CheckResult, source: []const u8) !void {
 
     // Only attempt compilation if parsing produced a usable tree with no errors;
     // the compiler needs a heap to intern string constants into.
+    //
+    // The chunk is kept alive until after `collectDiags` (deferred deinit): the
+    // unknown-global lint allocates its messages in the chunk arena, and
+    // `collectDiags` dupes them out — freeing the chunk first would be a
+    // use-after-free.
+    var vm_opt: ?lune.interp.Vm = null;
+    defer if (vm_opt) |*vm| vm.deinit();
+    var chunk_opt: ?lune.compiler.Chunk = null;
+    defer if (chunk_opt) |*c| c.deinit();
+
     if (tree_opt) |tree| {
         if (!diags.hasErrors()) {
-            var vm = try lune.interp.Vm.init(gpa);
-            defer vm.deinit();
-            var chunk_opt: ?lune.compiler.Chunk = lune.compiler.compile(gpa, &vm.heap, src0, tree.root, &diags) catch null;
-            if (chunk_opt) |*c| c.deinit();
+            vm_opt = try lune.interp.Vm.init(gpa);
+            chunk_opt = lune.compiler.compileWithOptions(gpa, &vm_opt.?.heap, src0, tree.root, &diags, .{
+                .known_globals = &lune.interp.builtin_global_names,
+            }) catch null;
         }
     }
 

@@ -51,6 +51,14 @@ pub const Chunk = struct {
     }
 };
 
+/// Compile-time configuration. Currently just the set of globals the host
+/// installs before the chunk runs (e.g. `print`, `clock`), which the
+/// unknown-global lint treats as defined. Default empty: callers that don't care
+/// about the lint (most tests) use `compile`, which passes `.{}`.
+pub const Options = struct {
+    known_globals: []const []const u8 = &.{},
+};
+
 /// Compile a parsed chunk. String literals/names are interned into `heap`.
 pub fn compile(
     gpa: std.mem.Allocator,
@@ -59,8 +67,25 @@ pub fn compile(
     root: ast.Block,
     diags: *Diagnostics,
 ) Error!Chunk {
+    return compileWithOptions(gpa, heap, source, root, diags, .{});
+}
+
+/// Compile a parsed chunk with explicit `Options` (see `compile`). The real entry
+/// points (CLI, wasm) pass the host's builtin global names so the unknown-global
+/// lint doesn't flag `print`/`clock`.
+pub fn compileWithOptions(
+    gpa: std.mem.Allocator,
+    heap: *gc.Heap,
+    source: [:0]const u8,
+    root: ast.Block,
+    diags: *Diagnostics,
+    opts: Options,
+) Error!Chunk {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
+
+    var usage = GlobalUsage{ .writes = std.StringHashMap(void).init(gpa), .known = opts.known_globals };
+    defer usage.deinit(gpa);
 
     var c = Compiler{
         .arena = arena.allocator(),
@@ -68,12 +93,20 @@ pub fn compile(
         .heap = heap,
         .source = source,
         .diags = diags,
+        .globals_usage = &usage,
     };
     defer c.deinitScratch();
 
     try c.compileBlock(root);
     // Implicit `return` (no values) at the end of the chunk.
     _ = try c.emit(Instr.opAB(.ret, 0, 0));
+
+    // Post-pass: warn about reads of a global that is never assigned anywhere in
+    // the chunk and isn't a builtin. Skipped when the compile already has errors
+    // (the usage tables would be incomplete → noisy false positives). Deferred to
+    // here so forward references (read above a later `function f()`/assignment)
+    // don't warn.
+    if (!diags.hasErrors()) try c.warnUnknownGlobals();
 
     const proto = try c.arena.create(Proto);
     proto.* = .{
@@ -106,6 +139,42 @@ fn assignProtoIds(proto: *Proto, next: *u32) void {
     for (proto.protos) |child| assignProtoIds(@constCast(child), next);
 }
 
+/// One `get_global` site recorded during compilation, for the unknown-global
+/// post-pass. `name`/spans borrow the source buffer (which outlives compilation).
+const GlobalRead = struct {
+    name: []const u8,
+    start: u32,
+    end: u32,
+};
+
+/// Chunk-wide global-name bookkeeping, shared by the root compiler and every
+/// nested function compiler — so a read inside an inner function still sees a
+/// top-level write, and vice-versa. Reads and writes are collected during the
+/// walk; the unknown-global lint consults all three sets at the end.
+const GlobalUsage = struct {
+    /// Every `get_global` site, in source order.
+    reads: std.ArrayList(GlobalRead) = .empty,
+    /// Names `set_global`'d somewhere in the chunk (assignment or `function f()`
+    /// declaration). Membership ⇒ "this global is defined here." Keys borrow the
+    /// source buffer. Managed (owns its allocator).
+    writes: std.StringHashMap(void),
+    /// Builtin globals the host installs before the chunk runs (e.g. `print`,
+    /// `clock`); treated as defined. Empty unless the caller supplies them.
+    known: []const []const u8 = &.{},
+
+    fn deinit(self: *GlobalUsage, gpa: std.mem.Allocator) void {
+        self.reads.deinit(gpa);
+        self.writes.deinit();
+    }
+
+    fn isKnown(self: *const GlobalUsage, name: []const u8) bool {
+        for (self.known) |k| {
+            if (std.mem.eql(u8, k, name)) return true;
+        }
+        return false;
+    }
+};
+
 const Local = struct {
     name: []const u8,
     reg: u16,
@@ -133,6 +202,10 @@ const Compiler = struct {
     heap: *gc.Heap,
     source: [:0]const u8,
     diags: *Diagnostics,
+    /// Chunk-wide global bookkeeping for the unknown-global lint. Shared: the
+    /// root owns it (in `compileWithOptions`); nested functions inherit the same
+    /// pointer (see `compileFunction`).
+    globals_usage: *GlobalUsage,
 
     /// The lexically-enclosing function being compiled, if this is a nested
     /// function body. Used to detect references to an outer function's locals
@@ -314,7 +387,6 @@ const Compiler = struct {
     /// Load the value of `name` into `dest`: a local move, an upvalue read, or a
     /// global read (resolution order is local → upvalue → global).
     fn loadName(self: *Compiler, name: []const u8, dest: u16, span: ast.Span) Error!void {
-        _ = span;
         if (self.resolveLocal(name)) |r| {
             if (r != dest) _ = try self.emit(Instr.opAB(.move, dest, r));
         } else if (try self.resolveUpvalue(name)) |up| {
@@ -322,6 +394,8 @@ const Compiler = struct {
         } else {
             const k = try self.stringConstant(name);
             _ = try self.emit(Instr.opAB(.get_global, dest, k));
+            // Record the read site for the unknown-global post-pass.
+            try self.globals_usage.reads.append(self.scratch, .{ .name = name, .start = span.start, .end = span.end });
         }
     }
 
@@ -336,6 +410,32 @@ const Compiler = struct {
         } else {
             const k = try self.stringConstant(name);
             _ = try self.emit(Instr.opAB(.set_global, src, k));
+            // Mark this global as defined-in-chunk so reads of it don't warn.
+            try self.globals_usage.writes.put(name, {});
+        }
+    }
+
+    /// Emit a warning for every global *read* of a name that is never assigned
+    /// anywhere in the chunk and isn't a host builtin. In lune (Lua/Luau
+    /// semantics) such a name is a `nil`-valued global, so it compiles fine and
+    /// only errors at runtime when used — most often it's a typo for a local.
+    /// This is a warning, not an error: a global may legitimately be defined by
+    /// another chunk or the host. Messages are allocated in the compile arena, so
+    /// they live as long as the returned `Chunk` (callers consume `diags` before
+    /// the chunk is freed).
+    fn warnUnknownGlobals(self: *Compiler) Error!void {
+        const u = self.globals_usage;
+        for (u.reads.items) |r| {
+            if (u.writes.contains(r.name)) continue;
+            if (u.isKnown(r.name)) continue;
+            const msg = try std.fmt.allocPrint(self.arena, "undefined global '{s}' (never assigned; reads as nil)", .{r.name});
+            self.diags.add(.{
+                .severity = .warning,
+                .message = msg,
+                .start = r.start,
+                .end = r.end,
+                .line = self.lineOf(r.start),
+            });
         }
     }
 
@@ -714,6 +814,7 @@ const Compiler = struct {
             .heap = self.heap,
             .source = self.source,
             .diags = self.diags,
+            .globals_usage = self.globals_usage,
             .parent = self,
         };
         defer child.deinitScratch();
@@ -1343,4 +1444,90 @@ test "unsupported construct produces a diagnostic, not a crash" {
     defer vm.deinit();
     try testing.expectError(Error.CompileError, compile(testing.allocator, &vm.heap, src, tree.root, &diags));
     try testing.expect(diags.hasErrors());
+}
+
+/// Compile `src` with an explicit known-globals set and run `check` against the
+/// resulting diagnostics while the chunk (and its arena-allocated warning
+/// messages) is still alive.
+fn checkGlobals(
+    src: [:0]const u8,
+    known: []const []const u8,
+    check: *const fn (diags: *const Diagnostics) anyerror!void,
+) !void {
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parser.parse(testing.allocator, src, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try interp.Vm.init(testing.allocator);
+    defer vm.deinit();
+    var chunk = try compileWithOptions(testing.allocator, &vm.heap, src, tree.root, &diags, .{
+        .known_globals = known,
+    });
+    defer chunk.deinit();
+
+    try check(&diags);
+}
+
+test "unknown global: a read that is never assigned warns" {
+    const Probe = struct {
+        fn check(diags: *const Diagnostics) anyerror!void {
+            // `d` is read but never written and is not a builtin → one warning.
+            try testing.expectEqual(@as(usize, 1), diags.count());
+            try testing.expect(!diags.hasErrors());
+            const d = diags.list.items[0];
+            try testing.expectEqual(diag.Severity.warning, d.severity);
+            // Span covers exactly the single-character `d` read.
+            try testing.expectEqual(@as(u32, 1), d.end - d.start);
+            try testing.expect(std.mem.indexOf(u8, d.message, "undefined global") != null);
+            try testing.expect(std.mem.indexOf(u8, d.message, "'d'") != null);
+        }
+    };
+    try checkGlobals(
+        \\local sum = 0
+        \\sum = sum + d
+        \\
+    , &.{}, Probe.check);
+}
+
+test "unknown global: a builtin read does NOT warn" {
+    const Probe = struct {
+        fn check(diags: *const Diagnostics) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), diags.count());
+        }
+    };
+    try checkGlobals("print(1)\n", &.{"print"}, Probe.check);
+}
+
+test "unknown global: a global assigned elsewhere does NOT warn" {
+    const Probe = struct {
+        fn check(diags: *const Diagnostics) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), diags.count());
+        }
+    };
+    try checkGlobals(
+        \\g = 1
+        \\print_unused = g
+        \\
+    , &.{}, Probe.check);
+}
+
+test "unknown global: a forward reference to a later global function does NOT warn" {
+    const Probe = struct {
+        fn check(diags: *const Diagnostics) anyerror!void {
+            // `helper` is read before its `function helper()` declaration; the
+            // deferred two-phase check sees the write and stays quiet.
+            try testing.expectEqual(@as(usize, 0), diags.count());
+        }
+    };
+    try checkGlobals(
+        \\local function main()
+        \\  return helper()
+        \\end
+        \\function helper()
+        \\  return 1
+        \\end
+        \\
+    , &.{}, Probe.check);
 }

@@ -54,3 +54,30 @@ test("a second check on the same module instance still works (no leaked state)",
   expect(mod.check("local y =\n").length).toBeGreaterThan(0);
   expect(mod.check("print(2)\n")).toEqual([]);
 });
+
+test("an unknown global read produces a warning with a span on the name", () => {
+  // `d` is read but never assigned and is not a builtin → Luau-style warning.
+  const src = "local sum = 0\nsum = sum + d\n";
+  const diags = mod.check(src);
+
+  expect(diags.length).toBe(1);
+  const d = diags[0]!;
+  expect(d.severity).toBe("warning");
+  expect(d.message).toContain("undefined global");
+  expect(d.message).toContain("'d'");
+  // Span underlines exactly the one-character `d`.
+  expect(src.slice(d.start, d.end)).toBe("d");
+});
+
+test("a global assigned elsewhere does not warn", () => {
+  expect(mod.check("g = 1\nlocal x = g\nprint(x)\n")).toEqual([]);
+});
+
+test("reading a builtin global does not warn", () => {
+  expect(mod.check("print(clock())\n")).toEqual([]);
+});
+
+test("a forward reference to a later global function does not warn", () => {
+  const src = "local function main() return helper() end\nfunction helper() return 1 end\n";
+  expect(mod.check(src)).toEqual([]);
+});
