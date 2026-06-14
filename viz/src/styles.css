@@ -142,6 +142,12 @@ code {
   font-weight: normal;
 }
 
+.trace-note {
+  margin: 0 0 0.5rem;
+  font-size: 0.8rem;
+  max-width: 48rem;
+}
+
 .accent {
   color: var(--accent);
 }
@@ -554,4 +560,61 @@ table.replay-vars td {
 .cm-replay-line {
   background: #7aa2f72a;
   box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* --- step-replay bytecode listing (Phase 7 v9) --- */
+.bc-panel {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  padding: 0.4rem 0.5rem;
+}
+
+.bc-scroll {
+  max-height: 14rem;
+  overflow: auto;
+}
+
+table.bc-list {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.82rem;
+}
+
+table.bc-list td {
+  padding: 0.05rem 0.5rem;
+  white-space: pre;
+  vertical-align: top;
+}
+
+.bc-pc {
+  color: var(--muted);
+  text-align: right;
+  width: 2.5rem;
+}
+
+.bc-text {
+  color: var(--fg);
+  width: 100%;
+}
+
+.bc-line {
+  color: var(--muted);
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* The instruction the VM is paused on. Mirrors the editor's current-line
+   highlight tokens so the two views read as the same step. */
+tr.bc-current td {
+  background: #7aa2f72a;
+}
+
+tr.bc-current .bc-pc {
+  color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+tr.bc-current .bc-text {
+  color: var(--accent);
 }

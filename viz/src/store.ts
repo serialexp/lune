@@ -5,7 +5,7 @@
 import { createStore } from "solid-js/store";
 import { decodeTraceFile } from "./decode";
 import { viewsOf, type TraceView } from "./disasm";
-import { loadLune, type LuneModule, type LuneRunResult, type LuneReplayResult, type LuneDiagnostic, type BacktraceFrame } from "./wasm/lune";
+import { loadLune, type LuneModule, type LuneRunResult, type LuneReplayResult, type LuneDiagnostic, type BacktraceFrame, type ProtoDisasm } from "./wasm/lune";
 import { runNative } from "./native";
 import { diffRuns, type DiffReport } from "./diff";
 import { decodeSnapshot, type SnapshotView } from "./snapshot";
@@ -77,6 +77,9 @@ interface VizState {
   replayState: LuneReplayResult | null;
   /** The decoded globals + locals view of `replayState.keyframe`, or null. */
   replayView: SnapshotView | null;
+  /** Static disassembly of the captured run's proto tree, indexed by `id` (the
+   *  replay cursor's `protoId`). Frozen with the run; drives the bytecode view. */
+  disasm: ProtoDisasm[];
 }
 
 /** The safepoint indices the slider steps through for a grain. `instr` is every
@@ -136,6 +139,7 @@ const [state, setState] = createStore<VizState>({
   replayPos: 0,
   replayState: null,
   replayView: null,
+  disasm: [],
 });
 
 export { state };
@@ -212,6 +216,7 @@ function applyWasmResult(result: LuneRunResult, fileName: string, source: string
     replayPos: 0,
     replayState: null,
     replayView: null,
+    disasm: result.disasm,
   });
 }
 
@@ -378,4 +383,16 @@ export function selectTrace(index: number): void {
 /** The currently-selected trace view, or null. */
 export function selectedTrace(): TraceView | null {
   return state.selected >= 0 ? state.traces[state.selected] ?? null : null;
+}
+
+/** The bytecode view at the current replay step: the disassembly of the proto
+ *  the cursor is in (`replayState.protoId`) plus the pending `pc`. Null when no
+ *  step is loaded, the program has finished (no live frame), or the disasm is
+ *  unavailable. Drives the step-replay panel's bytecode listing. */
+export function replayDisasm(): { proto: ProtoDisasm; pc: number } | null {
+  const rs = state.replayState;
+  if (rs === null || rs.finished || rs.status !== 0) return null;
+  const proto = state.disasm.find((p) => p.id === rs.protoId);
+  if (proto === undefined) return null;
+  return { proto, pc: rs.pc };
 }

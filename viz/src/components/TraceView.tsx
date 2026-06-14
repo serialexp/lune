@@ -10,8 +10,12 @@ export default function TraceView() {
         <section class="trace-view">
           <header class="trace-header">
             <h2>
-              trace <span class="accent">{t().anchorProtoId}:{t().anchorPc}</span>
+              JIT trace IR <span class="accent">{t().anchorProtoId}:{t().anchorPc}</span>
             </h2>
+            <p class="trace-note muted">
+              Optimized SSA recorded for this hot loop — not the tier-0 bytecode
+              the step-replay panel above executes.
+            </p>
             <div class="entry">
               entry = [
               <For each={t().entrySlots}>{(s, i) => <span> {i() > 0 ? " " : ""}r{s}</span>}</For>

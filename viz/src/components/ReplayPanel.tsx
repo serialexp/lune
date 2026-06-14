@@ -7,7 +7,7 @@
 // component is pure presentation + the play timer (Rule #9).
 
 import { For, Show, createSignal, createEffect, onCleanup } from "solid-js";
-import { state, setGrain, setReplayPos, stepReplay, closeReplay } from "../store";
+import { state, setGrain, setReplayPos, stepReplay, closeReplay, replayDisasm } from "../store";
 
 /** Milliseconds between auto-advance steps while playing. */
 const PLAY_INTERVAL_MS = 220;
@@ -37,6 +37,21 @@ export default function ReplayPanel() {
     if (atEnd()) setReplayPos(0); // replay from the top if parked at the end
     setPlaying((p) => !p);
   };
+
+  // The bytecode listing at the current step (the proto the cursor is in + pc),
+  // or null when the program has finished (no live frame) or disasm is absent.
+  const bytecode = () => replayDisasm();
+
+  // Keep the highlighted pc row in view as stepping moves it. The ref is rebound
+  // each render of the current row; the effect tracks the pc so it scrolls on
+  // every step (including grain changes and slider scrubs).
+  let currentRow: HTMLTableRowElement | undefined;
+  createEffect(() => {
+    const bc = bytecode();
+    if (!bc) return;
+    void bc.pc; // track
+    currentRow?.scrollIntoView({ block: "nearest" });
+  });
 
   return (
     <div class="replay">
@@ -117,6 +132,39 @@ export default function ReplayPanel() {
         <div class="replay-frames">
           {state.replayState!.backtrace.map((f) => `${f.name}:${f.line}`).join(" → ")}
         </div>
+      </Show>
+
+      {/* Bytecode listing of the proto the cursor is in: the current `pc` row is
+          highlighted and the row's source line annotated. This is the pure
+          tier-0 bytecode the stepper actually executes — distinct from the JIT
+          trace IR shown in the panes below. Hidden once the program finishes
+          (no live frame to point at). */}
+      <Show when={bytecode()}>
+        {(bc) => (
+          <div class="replay-col bc-panel">
+            <div class="replay-col-title">
+              bytecode <span class="muted">· proto {bc().proto.name} · regs {bc().proto.numRegisters} · params {bc().proto.numParams}</span>
+            </div>
+            <div class="bc-scroll">
+              <table class="bc-list">
+                <tbody>
+                  <For each={bc().proto.instrs}>
+                    {(ins, i) => (
+                      <tr
+                        classList={{ "bc-current": i() === bc().pc }}
+                        ref={(el) => { if (i() === bc().pc) currentRow = el; }}
+                      >
+                        <td class="bc-pc">{i()}</td>
+                        <td class="bc-text">{ins.text}</td>
+                        <td class="bc-line">{ins.line > 0 ? `; line ${ins.line}` : ""}</td>
+                      </tr>
+                    )}
+                  </For>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
       </Show>
 
       <div class="replay-panels">
