@@ -7,15 +7,17 @@
 //!
 //! Like its siblings it maps the in-memory form (`interp.Effect`) to the generated
 //! binschema structs (`schema.Effect` / `schema.EffectFile`) and back — never
-//! hand-rolls bytes. It shares the schema's `SnapValue` for an effect result, but
-//! only **non-heap** results round-trip: a standalone effect log carries no heap
-//! graph, so a heap result (a string/table) has no id to resolve against. `clock`
-//! returns an int, so this covers every effect that exists.
+//! hand-rolls bytes. An effect result is a `schema.EffectResult`: a small tag
+//! space of its own (NOT a `Value.Tag` mirror) carrying scalars (clock/argc/
+//! random_seed) plus **inline string bytes** (getenv/argv), never a heap ref. A
+//! standalone effect log has no heap graph, so a string result is carried inline
+//! (length-prefixed) and re-interned into the caller's heap on decode.
 
 const std = @import("std");
 const value = @import("value.zig");
 const interp = @import("interp.zig");
-const keyframeser = @import("keyframeser.zig");
+const gc = @import("gc.zig");
+const string = @import("string.zig");
 
 const Value = value.Value;
 const Effect = interp.Effect;
@@ -28,17 +30,18 @@ pub const schema = @import("gen/trace_schema.zig");
 /// Effect-log wire-format version, written into every `EffectFile`. Independent of
 /// the trace and keyframe versions — a distinct record family sharing only the
 /// binschema *encoding* (docs/design/04 "two artifacts, one substrate"; this is a
-/// third). v1: a flat ordered list of `{kind, result}`, consumed in call order.
-pub const effect_format_version: u32 = 1;
+/// third). v2: results are `EffectResult` (scalars + inline string bytes), so the
+/// log can carry `getenv`/`argv` string results (v1 was scalars only).
+pub const effect_format_version: u32 = 2;
 
-/// Errors from decoding an effect log back into in-memory `Effect`s.
+/// Errors from encoding/decoding an effect log.
 pub const DecodeError = error{
     /// `EffectFile.version` != `effect_format_version`.
     UnsupportedVersion,
     /// `Effect.kind` is not a known `interp.EffectKind` ordinal.
     UnknownEffectKind,
-    /// An effect result was a heap reference — unsupported in a standalone effect
-    /// log (no heap graph to resolve the id against; only `clock`'s int exists).
+    /// An effect result was a heap value that isn't a string (a table/closure).
+    /// Effects only ever return scalars or strings, so this is a serializer bug.
     UnsupportedEffectResult,
     /// binschema decode failure (truncated / malformed bytes).
     Malformed,
@@ -46,8 +49,9 @@ pub const DecodeError = error{
 };
 
 /// Serialize an ordered effect log to bytes (binschema wire format). The result
-/// is owned by the caller (`gpa.free`). `clock` results are ints, so this never
-/// touches the heap.
+/// is owned by the caller (`gpa.free`). String results (`getenv`/`argv`) are
+/// written inline; the borrowed bytes are valid only while the source VM is alive
+/// (true during encode).
 pub fn encodeFile(gpa: std.mem.Allocator, effects: []const Effect) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -56,7 +60,7 @@ pub fn encodeFile(gpa: std.mem.Allocator, effects: []const Effect) ![]u8 {
     const wire = try a.alloc(schema.Effect, effects.len);
     for (effects, 0..) |e, i| wire[i] = .{
         .kind = @intFromEnum(e.kind),
-        .result = keyframeser.toSchemaValue(e.result),
+        .result = try toEffectResult(e.result),
     };
 
     const file: schema.EffectFile = .{ .version = effect_format_version, .effects = wire };
@@ -64,11 +68,12 @@ pub fn encodeFile(gpa: std.mem.Allocator, effects: []const Effect) ![]u8 {
 }
 
 /// Decode an effect log from bytes into an owned `[]Effect` (caller frees with
-/// `gpa.free`). Validates the version and every effect kind; rejects a heap
-/// result (unsupported in a standalone log).
-pub fn decodeFile(gpa: std.mem.Allocator, bytes: []const u8) DecodeError![]Effect {
+/// `gpa.free`). Validates the version and every effect kind. A string result is
+/// re-interned into `heap` (so the decoded `Value` is a live heap string in the
+/// VM about to replay it); scalars are copied by value.
+pub fn decodeFile(gpa: std.mem.Allocator, heap: *gc.Heap, bytes: []const u8) DecodeError![]Effect {
     var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit(); // decoded structs consumed here (results copied out by value)
+    defer arena.deinit(); // decoded structs consumed here (scalars by value; string bytes copied by intern)
     const file = schema.EffectFile.decode(arena.allocator(), bytes) catch return error.Malformed;
     if (file.version != effect_format_version) return error.UnsupportedVersion;
 
@@ -76,20 +81,37 @@ pub fn decodeFile(gpa: std.mem.Allocator, bytes: []const u8) DecodeError![]Effec
     errdefer gpa.free(out);
     for (file.effects, 0..) |we, i| {
         const kind = std.enums.fromInt(EffectKind, we.kind) orelse return error.UnknownEffectKind;
-        out[i] = .{ .kind = kind, .result = try fromSchemaNonHeap(we.result) };
+        out[i] = .{ .kind = kind, .result = try fromEffectResult(heap, we.result) };
     }
     return out;
 }
 
-/// Map a `SnapValue` back to a `Value`, rejecting heap refs (a standalone effect
-/// log has no idmap). Mirrors `keyframeser.fromSchemaValue` minus the heap case.
-fn fromSchemaNonHeap(sv: schema.SnapValue) DecodeError!Value {
-    return switch (sv.body) {
+/// Map a `Value` to its wire `EffectResult`: scalars directly, a heap string as
+/// inline bytes. A non-string heap value can never be an effect result (effects
+/// return scalars or strings), so it is a serializer-side bug.
+fn toEffectResult(v: Value) DecodeError!schema.EffectResult {
+    return switch (v.tag) {
+        .nil => .{ .tag = 0, .body = .{ .ConstNil = .{ .pad = 0 } } },
+        .boolean => .{ .tag = 1, .body = .{ .ConstBool = .{ .v = @intFromBool(v.asBool()) } } },
+        .int => .{ .tag = 2, .body = .{ .ConstInt = .{ .v = v.asInt() } } },
+        .float => .{ .tag = 3, .body = .{ .ConstFloat = .{ .v = v.asFloat() } } },
+        .heap_ref => if (v.heapType() == .string)
+            .{ .tag = 4, .body = .{ .ConstString = .{ .v = string.String.fromHeader(v.asHeap()).bytes() } } }
+        else
+            error.UnsupportedEffectResult,
+    };
+}
+
+/// Inverse of `toEffectResult`: a scalar maps back directly; an inline string is
+/// re-interned into `heap` (so the result is a live heap string the VM can feed
+/// back to the program on replay).
+fn fromEffectResult(heap: *gc.Heap, er: schema.EffectResult) DecodeError!Value {
+    return switch (er.body) {
         .ConstNil => Value.nil(),
         .ConstBool => |b| Value.boolean(b.v != 0),
         .ConstInt => |x| Value.int(x.v),
         .ConstFloat => |x| Value.float(x.v),
-        .HeapRef => error.UnsupportedEffectResult,
+        .ConstString => |s| try heap.internValue(s.v),
     };
 }
 
@@ -99,11 +121,16 @@ fn fromSchemaNonHeap(sv: schema.SnapValue) DecodeError!Value {
 
 const testing = std.testing;
 
+/// Round-trip an all-scalar log: encode, decode into a throwaway heap, compare
+/// kind + result. (Strings need the same heap on both sides — see the dedicated
+/// string test — so this helper is for scalar effects.)
 fn expectLogRoundTrips(effects: []const Effect) !void {
     const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
     const bytes = try encodeFile(gpa, effects);
     defer gpa.free(bytes);
-    const back = try decodeFile(gpa, bytes);
+    const back = try decodeFile(gpa, &heap, bytes);
     defer gpa.free(back);
     try testing.expectEqual(effects.len, back.len);
     for (effects, back) |want, got| {
@@ -122,23 +149,58 @@ test "effect log round-trips byte/struct-exact (empty, single, multi; int + floa
         .{ .kind = .clock, .result = Value.int(9223372036854775807) },
     });
     // F2e: the random_seed ordinal carries a u64 seed as a (bit-cast) non-heap int,
-    // so it round-trips through the same int path — no wire change. Exercise it
-    // here (including a seed whose top bit is set, i.e. a negative i64 after cast).
+    // so it round-trips through the int path. Exercise it here (including a seed
+    // whose top bit is set, i.e. a negative i64 after cast).
     try expectLogRoundTrips(&.{
         .{ .kind = .random_seed, .result = Value.int(@bitCast(@as(u64, 0xC0FFEE))) },
         .{ .kind = .random_seed, .result = Value.int(@bitCast(@as(u64, 0xFFFF_FFFF_FFFF_FFFF))) },
     });
+    // argc is an int result like clock; nil is a valid result (getenv/argv miss).
+    try expectLogRoundTrips(&.{
+        .{ .kind = .argc, .result = Value.int(3) },
+        .{ .kind = .getenv, .result = Value.nil() },
+        .{ .kind = .argv, .result = Value.nil() },
+    });
+}
+
+test "a string effect result round-trips as inline bytes (getenv/argv)" {
+    const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    // Intern the inputs into `heap`, encode, then decode back into the SAME heap:
+    // identical bytes intern to the identical object, so `eql` (pointer identity)
+    // holds — and an empty string is distinct from a nil result.
+    const log = [_]Effect{
+        .{ .kind = .getenv, .result = try heap.internValue("/home/bart") },
+        .{ .kind = .argv, .result = try heap.internValue("alpha") },
+        .{ .kind = .getenv, .result = try heap.internValue("") }, // set-but-empty
+        .{ .kind = .getenv, .result = Value.nil() }, // unset
+    };
+    const bytes = try encodeFile(gpa, &log);
+    defer gpa.free(bytes);
+    const back = try decodeFile(gpa, &heap, bytes);
+    defer gpa.free(back);
+    try testing.expectEqual(log.len, back.len);
+    for (log, back) |want, got| {
+        try testing.expectEqual(want.kind, got.kind);
+        try testing.expect(want.result.eql(got.result));
+    }
+    // The empty-string result decoded to a (non-nil) heap string, not nil.
+    try testing.expect(back[2].result.isHeap() and back[2].result.heapType() == .string);
+    try testing.expect(back[3].result.tag == .nil);
 }
 
 test "encode then decode reproduces the same bytes (stable)" {
     const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
     const log = [_]Effect{
         .{ .kind = .clock, .result = Value.int(100) },
-        .{ .kind = .clock, .result = Value.int(200) },
+        .{ .kind = .getenv, .result = try heap.internValue("X=1") },
     };
     const b0 = try encodeFile(gpa, &log);
     defer gpa.free(b0);
-    const back = try decodeFile(gpa, b0);
+    const back = try decodeFile(gpa, &heap, b0);
     defer gpa.free(back);
     const b1 = try encodeFile(gpa, back);
     defer gpa.free(b1);
@@ -147,28 +209,32 @@ test "encode then decode reproduces the same bytes (stable)" {
 
 test "a wrong-version effect file is rejected" {
     const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
     const file: schema.EffectFile = .{ .version = effect_format_version + 1, .effects = &.{} };
     const bytes = try file.encode(gpa);
     defer gpa.free(bytes);
-    try testing.expectError(error.UnsupportedVersion, decodeFile(gpa, bytes));
+    try testing.expectError(error.UnsupportedVersion, decodeFile(gpa, &heap, bytes));
 }
 
 test "an unknown effect kind is rejected" {
     const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
     const file: schema.EffectFile = .{ .version = effect_format_version, .effects = &.{
-        .{ .kind = 250, .result = keyframeser.toSchemaValue(Value.int(1)) },
+        .{ .kind = 250, .result = .{ .tag = 2, .body = .{ .ConstInt = .{ .v = 1 } } } },
     } };
     const bytes = try file.encode(gpa);
     defer gpa.free(bytes);
-    try testing.expectError(error.UnknownEffectKind, decodeFile(gpa, bytes));
+    try testing.expectError(error.UnknownEffectKind, decodeFile(gpa, &heap, bytes));
 }
 
-test "a heap-ref effect result is rejected (no idmap in a standalone log)" {
+test "a non-string heap effect result is a serializer-side error" {
     const gpa = testing.allocator;
-    const file: schema.EffectFile = .{ .version = effect_format_version, .effects = &.{
-        .{ .kind = 0, .result = .{ .tag = 4, .body = .{ .HeapRef = .{ .id = 7 } } } },
-    } };
-    const bytes = try file.encode(gpa);
-    defer gpa.free(bytes);
-    try testing.expectError(error.UnsupportedEffectResult, decodeFile(gpa, bytes));
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    // A table can never be an effect result; encoding one is a serializer bug.
+    const t = try heap.newTable();
+    const log = [_]Effect{.{ .kind = .getenv, .result = Value.heap(&t.header) }};
+    try testing.expectError(error.UnsupportedEffectResult, encodeFile(gpa, &log));
 }

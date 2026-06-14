@@ -949,9 +949,63 @@ pub const SnapshotFile = struct {
     }
 };
 
+pub const EffectResult = struct {
+    tag: u8,
+    body: BsUnion_ConstNil_ConstBool_ConstInt_ConstFloat_ConstString,
+
+    pub fn encode(self: EffectResult, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: EffectResult, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint8(self.tag);
+        switch (self.body) {
+            .ConstNil => |_uv_0| try _uv_0.encodeInto(enc, ctx),
+            .ConstBool => |_uv_1| try _uv_1.encodeInto(enc, ctx),
+            .ConstInt => |_uv_2| try _uv_2.encodeInto(enc, ctx),
+            .ConstFloat => |_uv_3| try _uv_3.encodeInto(enc, ctx),
+            .ConstString => |_uv_4| try _uv_4.encodeInto(enc, ctx),
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!EffectResult {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!EffectResult {
+        var result: EffectResult = undefined;
+        result.tag = try dec.readUint8();
+        if (result.tag == 0) {
+            result.body = .{ .ConstNil = try ConstNil.decodeWith(allocator, dec, root) };
+        }
+        else if (result.tag == 1) {
+            result.body = .{ .ConstBool = try ConstBool.decodeWith(allocator, dec, root) };
+        }
+        else if (result.tag == 2) {
+            result.body = .{ .ConstInt = try ConstInt.decodeWith(allocator, dec, root) };
+        }
+        else if (result.tag == 3) {
+            result.body = .{ .ConstFloat = try ConstFloat.decodeWith(allocator, dec, root) };
+        }
+        else if (result.tag == 4) {
+            result.body = .{ .ConstString = try ConstString.decodeWith(allocator, dec, root) };
+        }
+        else {
+            return error.InvalidVariant;
+        }
+        return result;
+    }
+};
+
 pub const Effect = struct {
     kind: u8,
-    result: SnapValue,
+    result: EffectResult,
 
     pub fn encode(self: Effect, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -975,7 +1029,7 @@ pub const Effect = struct {
     pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!Effect {
         var result: Effect = undefined;
         result.kind = try dec.readUint8();
-        result.result = try SnapValue.decodeWith(allocator, dec, root);
+        result.result = try EffectResult.decodeWith(allocator, dec, root);
         return result;
     }
 };

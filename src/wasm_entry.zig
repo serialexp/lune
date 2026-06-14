@@ -392,7 +392,9 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
     // clock/seed source is injected: `.replay` reads the log, never the host.
     vm.effect_mode = .replay;
     if (eff_bytes.len > 0) {
-        const effects = try lune.effectser.decodeFile(gpa, eff_bytes);
+        // String results (getenv/argv) are re-interned into `vm.heap`; the
+        // effect-log GC root keeps them alive while the cursor feeds them back.
+        const effects = try lune.effectser.decodeFile(gpa, &vm.heap, eff_bytes);
         defer gpa.free(effects);
         try vm.effect_log.appendSlice(gpa, effects);
     }

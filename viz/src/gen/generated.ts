@@ -3052,7 +3052,204 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * One recorded nondeterministic INPUT (F2d): the host effect that produced it and the Value it returned. `kind` mirrors lune's interp.EffectKind enum (clock=0). The log is consumed in call order on replay; `clock()` has no inputs, so kind + result fully describe it (effect args/inputs are a later increment). `result` reuses SnapValue but is non-heap today (clock returns an int) — a heap result has no idmap to resolve against in a standalone effect log.
+ * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.
+ */
+export interface EffectResultInput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: field 'tag'
+   * Variants: 5
+   * - ConstNil (when value === 0)
+   * - ConstBool (when value === 1)
+   * - ConstInt (when value === 2)
+   * - ConstFloat (when value === 3)
+   * - ConstString (when value === 4)
+   */
+  body: { type: 'ConstNil'; value: ConstNilInput } | { type: 'ConstBool'; value: ConstBoolInput } | { type: 'ConstInt'; value: ConstIntInput } | { type: 'ConstFloat'; value: ConstFloatInput } | { type: 'ConstString'; value: ConstStringInput };
+}
+
+/**
+ * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.
+ */
+export interface EffectResultOutput {
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  tag: number;
+  /**
+   * Discriminated Union
+   * Type that can be one of several variants, chosen based on a discriminator value. Supports peek-based (read ahead) or field-based (reference earlier field) discrimination.
+   *
+   * @remarks
+   *
+   * Discriminator: field 'tag'
+   * Variants: 5
+   * - ConstNil (when value === 0)
+   * - ConstBool (when value === 1)
+   * - ConstInt (when value === 2)
+   * - ConstFloat (when value === 3)
+   * - ConstString (when value === 4)
+   */
+  body: { type: 'ConstNil'; value: ConstNilOutput } | { type: 'ConstBool'; value: ConstBoolOutput } | { type: 'ConstInt'; value: ConstIntOutput } | { type: 'ConstFloat'; value: ConstFloatOutput } | { type: 'ConstString'; value: ConstStringOutput };
+}
+
+export type EffectResult = EffectResultOutput;
+
+/**
+ * Variant tags for EffectResult.body
+ */
+export const enum EffectResultBodyVariant {
+  ConstNil = 'ConstNil',
+  ConstBool = 'ConstBool',
+  ConstInt = 'ConstInt',
+  ConstFloat = 'ConstFloat',
+  ConstString = 'ConstString',
+}
+
+export class EffectResultEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: EffectResultInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint8(value.tag);
+    if (value.body.type === 'ConstNil') {
+      const encoder_value = new ConstNilEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'ConstBool') {
+      const encoder_value = new ConstBoolEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'ConstInt') {
+      const encoder_value = new ConstIntEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'ConstFloat') {
+      const encoder_value = new ConstFloatEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    }
+    else if (value.body.type === 'ConstString') {
+      const encoder_value = new ConstStringEncoder();
+      const encoded_value = encoder_value.encode(value.body.value);
+      for (const byte of encoded_value) {
+        this.writeUint8(byte);
+      }
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type: ${(value.body as any).type}`);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a EffectResult value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: EffectResult): number {
+    let size = 0;
+    size += 1; // tag
+    if (value.body.type === 'ConstNil') {
+      const _enc = new ConstNilEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'ConstBool') {
+      const _enc = new ConstBoolEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'ConstInt') {
+      const _enc = new ConstIntEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'ConstFloat') {
+      const _enc = new ConstFloatEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else if (value.body.type === 'ConstString') {
+      const _enc = new ConstStringEncoder();
+      size += _enc.calculateSize(value.body.value);
+    }
+    else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown variant type for body: ${(value.body as any).type}`);
+    }
+    return size;
+  }
+}
+
+export class EffectResultDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): EffectResultOutput {
+    const value: any = {};
+
+    value.tag = this.readUint8();
+    if (value.tag === 0) {
+      const decoder = new ConstNilDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'ConstNil', value: payload };
+    }
+    else if (value.tag === 1) {
+      const decoder = new ConstBoolDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'ConstBool', value: payload };
+    }
+    else if (value.tag === 2) {
+      const decoder = new ConstIntDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'ConstInt', value: payload };
+    }
+    else if (value.tag === 3) {
+      const decoder = new ConstFloatDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'ConstFloat', value: payload };
+    }
+    else if (value.tag === 4) {
+      const decoder = new ConstStringDecoder(this.bytes.slice(this.byteOffset), value);
+      const payload = decoder.decode();
+      this.byteOffset += decoder.byteOffset;
+      value.body = { type: 'ConstString', value: payload };
+    } else {
+      throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.tag}`);
+    }
+    return value;
+  }
+}
+
+/**
+ * One recorded nondeterministic INPUT: the host effect that produced it and the Value it returned. `kind` mirrors lune's interp.EffectKind enum (clock=0, random_seed=1, getenv=2, argc=3, argv=4). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars (clock/argc/random_seed) plus inline string bytes (getenv/argv), never a heap_ref.
  */
 export interface EffectInput {
   /**
@@ -3061,13 +3258,13 @@ export interface EffectInput {
    */
   kind: number;
   /**
-   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.
    */
-  result: SnapValueInput;
+  result: EffectResultInput;
 }
 
 /**
- * One recorded nondeterministic INPUT (F2d): the host effect that produced it and the Value it returned. `kind` mirrors lune's interp.EffectKind enum (clock=0). The log is consumed in call order on replay; `clock()` has no inputs, so kind + result fully describe it (effect args/inputs are a later increment). `result` reuses SnapValue but is non-heap today (clock returns an int) — a heap result has no idmap to resolve against in a standalone effect log.
+ * One recorded nondeterministic INPUT: the host effect that produced it and the Value it returned. `kind` mirrors lune's interp.EffectKind enum (clock=0, random_seed=1, getenv=2, argc=3, argv=4). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars (clock/argc/random_seed) plus inline string bytes (getenv/argv), never a heap_ref.
  */
 export interface EffectOutput {
   /**
@@ -3076,9 +3273,9 @@ export interface EffectOutput {
    */
   kind: number;
   /**
-   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   * An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.
    */
-  result: SnapValueOutput;
+  result: EffectResultOutput;
 }
 
 export type Effect = EffectOutput;
@@ -3095,7 +3292,7 @@ export class EffectEncoder extends BitStreamEncoder {
     this.compressionDict.clear();
 
     this.writeUint8(value.kind);
-    const encoder_result = new SnapValueEncoder();
+    const encoder_result = new EffectResultEncoder();
     const encoded_result = encoder_result.encode(value.result);
     for (const byte of encoded_result) {
       this.writeUint8(byte);
@@ -3110,8 +3307,8 @@ export class EffectEncoder extends BitStreamEncoder {
   calculateSize(value: Effect): number {
     let size = 0;
     size += 1; // kind
-    // result: custom type (SnapValue)
-    const result_encoder = new SnapValueEncoder();
+    // result: custom type (EffectResult)
+    const result_encoder = new EffectResultEncoder();
     size += result_encoder.calculateSize(value.result);
     return size;
   }
@@ -3154,10 +3351,10 @@ export class EffectDecoder extends SeekableBitStreamDecoder {
       value.result.body = { type: 'ConstFloat', value: payload };
     }
     else if (value.result.tag === 4) {
-      const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), value.result);
+      const decoder = new ConstStringDecoder(this.bytes.slice(this.byteOffset), value.result);
       const payload = decoder.decode();
       this.byteOffset += decoder.byteOffset;
-      value.result.body = { type: 'HeapRef', value: payload };
+      value.result.body = { type: 'ConstString', value: payload };
     } else {
       throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${value.result.tag}`);
     }
@@ -3293,10 +3490,10 @@ export class EffectFileDecoder extends SeekableBitStreamDecoder {
         effects__iter.result.body = { type: 'ConstFloat', value: payload };
       }
       else if (effects__iter.result.tag === 4) {
-        const decoder = new HeapRefDecoder(this.bytes.slice(this.byteOffset), effects__iter.result);
+        const decoder = new ConstStringDecoder(this.bytes.slice(this.byteOffset), effects__iter.result);
         const payload = decoder.decode();
         this.byteOffset += decoder.byteOffset;
-        effects__iter.result.body = { type: 'HeapRef', value: payload };
+        effects__iter.result.body = { type: 'ConstString', value: payload };
       } else {
         throw new BinSchemaError(ErrorCode.INVALID_VARIANT, `Unknown discriminator value: ${effects__iter.result.tag}`);
       }

@@ -198,11 +198,30 @@
       ]
     },
 
+    "EffectResult": {
+      "description": "An effect's recorded result. Its OWN tag space (deliberately NOT a Value.Tag mirror like SnapValue): scalars plus an inline string, never a heap_ref. A standalone effect log has no idmap, so a string result (getenv/argv) is carried as inline length-prefixed bytes (ConstString) and re-interned on replay; tables/closures are never effect results. tag: nil=0, bool=1, int=2, float=3, string=4.",
+      "sequence": [
+        { "name": "tag", "type": "uint8" },
+        {
+          "name": "body",
+          "type": "discriminated_union",
+          "discriminator": { "field": "tag" },
+          "variants": [
+            { "type": "ConstNil",    "when": "value === 0" },
+            { "type": "ConstBool",   "when": "value === 1" },
+            { "type": "ConstInt",    "when": "value === 2" },
+            { "type": "ConstFloat",  "when": "value === 3" },
+            { "type": "ConstString", "when": "value === 4" }
+          ]
+        }
+      ]
+    },
+
     "Effect": {
-      "description": "One recorded nondeterministic INPUT (F2d): the host effect that produced it and the Value it returned. `kind` mirrors lune's interp.EffectKind enum (clock=0). The log is consumed in call order on replay; `clock()` has no inputs, so kind + result fully describe it (effect args/inputs are a later increment). `result` reuses SnapValue but is non-heap today (clock returns an int) — a heap result has no idmap to resolve against in a standalone effect log.",
+      "description": "One recorded nondeterministic INPUT: the host effect that produced it and the Value it returned. `kind` mirrors lune's interp.EffectKind enum (clock=0, random_seed=1, getenv=2, argc=3, argv=4). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars (clock/argc/random_seed) plus inline string bytes (getenv/argv), never a heap_ref.",
       "sequence": [
         { "name": "kind",   "type": "uint8" },
-        { "name": "result", "type": "SnapValue" }
+        { "name": "result", "type": "EffectResult" }
       ]
     },
 
