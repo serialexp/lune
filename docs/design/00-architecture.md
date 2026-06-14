@@ -300,7 +300,26 @@ _(nothing yet — design only)_
       write across the chunk, then warn on a read whose name is never assigned and
       isn't a builtin — so forward references to later `function f()` declarations
       stay quiet); it surfaces as a yellow squiggle in the editor and a warning line
-      on the native CLI. **Still to come:** more effect kinds
+      on the native CLI. **Phase 7 v5 (located runtime errors):** the VM used to
+      raise a bare Zig error (`@errorName` → the single word "TypeError"); now the
+      compiler emits a per-instruction `Proto.spans` array (parallel to `code`,
+      in-memory only — no wire-format change) and, at the error boundary,
+      `Vm.describeFault` reads the **un-popped** faulting frame to synthesize a
+      Lua-style message naming the operation and the offending operand type
+      ("attempt to perform arithmetic on a nil value") plus a 1-based line and a
+      byte span. The hot loop pays only a one-store-per-iteration `frame.pc` sync
+      (tier-0 is the correctness oracle, not the speed tier); everything else is a
+      cold path. The editor underlines the faulting span with a wavy squiggle in a
+      decoration channel *separate* from the compile linter (the two would
+      otherwise overwrite each other). **Phase 7 v6 (multi-frame backtrace):**
+      because `exec` does not unwind `Vm.frames` on error, the entire live call
+      stack survives; `describeFault` now walks it into a deepest-first
+      `FaultFrame` chain (each frame's function name + the source line/span of its
+      active instruction — the faulting pc for the leaf, the call-site `pc-1` for
+      each parent). The native CLI prints a Lua-style `stack traceback:`; the wasm
+      `Result` carries a structured backtrace blob that the viz flattens to a
+      one-line "`foo:5 → bar:12 → main:3`" traceback under the error (the editor
+      squiggle stays on the leaf). **Still to come:** more effect kinds
       (randomness, env), a user-facing replay/step CLI, then the visualiser's
       iteration animation.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
