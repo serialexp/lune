@@ -92,6 +92,30 @@ fn wasmRandomSeed(_: *anyopaque) u64 {
 /// `RandomSeedSource.ctx` is unused (the import needs no state) — point it anywhere.
 var rng_ctx: u8 = 0;
 
+/// A null env/args source for the browser playground: there is no process
+/// environment or command line, so `getenv` always returns nil, `argc` is 0, and
+/// `argv` is always nil. Injected (in `record`) so `getenv`/`argc`/`argv` are
+/// *available* (they cleanly return empty) rather than `EnvUnavailable`. A
+/// JS-supplied env/argv map could replace this later; for now the playground has
+/// none. `ctx` is unused — point it at the shared throwaway byte.
+fn nullEnvGetenv(_: *anyopaque, _: []const u8) ?[]const u8 {
+    return null;
+}
+fn nullEnvArgCount(_: *anyopaque) i64 {
+    return 0;
+}
+fn nullEnvArg(_: *anyopaque, _: i64) ?[]const u8 {
+    return null;
+}
+fn nullHostEnv() lune.interp.HostEnv {
+    return .{
+        .ctx = &clock_ctx,
+        .getenv = &nullEnvGetenv,
+        .argCount = &nullEnvArgCount,
+        .arg = &nullEnvArg,
+    };
+}
+
 /// A (pointer, length) pair into linear memory, as two u32s for JS DataView.
 const Buf = extern struct {
     ptr: u32 = 0,
@@ -510,6 +534,9 @@ fn run(res: *Result, source: []const u8) !void {
     vm.effect_mode = .record;
     vm.clock_source = .{ .ctx = &clock_ctx, .nowNs = &wasmClockNs };
     vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &wasmRandomSeed };
+    // The browser has no process env/args — inject a null source so getenv→nil,
+    // argc→0, argv→nil (available, not EnvUnavailable).
+    vm.host_env = nullHostEnv();
 
     // --- compile --- (pass builtin globals so the unknown-global lint doesn't
     // flag `print`/`clock`).
