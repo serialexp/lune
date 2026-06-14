@@ -3,8 +3,9 @@
 // the actions here.
 
 import { createStore } from "solid-js/store";
-import { decodeTraceFile } from "./decode";
+import { decodeTraceFile, decodeExecLogFile, type TraceExecLogOutput } from "./decode";
 import { viewsOf, type TraceView } from "./disasm";
+import { flattenExec, type ExecStep } from "./exec";
 import { loadLune, type LuneModule, type LuneRunResult, type LuneReplayResult, type LuneDiagnostic, type BacktraceFrame, type ProtoDisasm } from "./wasm/lune";
 import { runNative } from "./native";
 import { diffRuns, type DiffReport } from "./diff";
@@ -80,6 +81,15 @@ interface VizState {
   /** Static disassembly of the captured run's proto tree, indexed by `id` (the
    *  replay cursor's `protoId`). Frozen with the run; drives the bytecode view. */
   disasm: ProtoDisasm[];
+
+  // --- JIT-trace iteration animation (fourth record family) ---
+  /** Decoded per-trace execution logs from the last wasm run, in cache order.
+   *  Each `trace_id` is the index into `traces` (the trace-cache index), so the
+   *  selected trace maps to its log directly. Empty when nothing ran hot. */
+  execLogs: TraceExecLogOutput[];
+  /** Animation slider position: an index into the selected trace's flattened
+   *  event stream (`traceExecSteps()`). Reset to 0 on run / trace change. */
+  traceExecPos: number;
 }
 
 /** The safepoint indices the slider steps through for a grain. `instr` is every
@@ -140,6 +150,8 @@ const [state, setState] = createStore<VizState>({
   replayState: null,
   replayView: null,
   disasm: [],
+  execLogs: [],
+  traceExecPos: 0,
 });
 
 export { state };
@@ -186,6 +198,17 @@ function applyWasmResult(result: LuneRunResult, fileName: string, source: string
     version = file.version;
     traces = viewsOf(file);
   }
+  // The trace execution log (fourth record family) — what the IR-interpreter
+  // actually did per hot iteration / exit ramp. A decode failure degrades to no
+  // animation (the static IR table still renders), never throws the run away.
+  let execLogs: TraceExecLogOutput[] = [];
+  if (result.executionLog.length > 0) {
+    try {
+      execLogs = decodeExecLogFile(result.executionLog).logs;
+    } catch {
+      execLogs = [];
+    }
+  }
   setState({
     fileName,
     version,
@@ -217,6 +240,8 @@ function applyWasmResult(result: LuneRunResult, fileName: string, source: string
     replayState: null,
     replayView: null,
     disasm: result.disasm,
+    execLogs,
+    traceExecPos: 0,
   });
 }
 
@@ -377,12 +402,43 @@ export async function loadFromUrl(url: string): Promise<void> {
 }
 
 export function selectTrace(index: number): void {
-  setState("selected", index);
+  // A new selection resets the animation to the start of that trace's stream.
+  setState({ selected: index, traceExecPos: 0 });
 }
 
 /** The currently-selected trace view, or null. */
 export function selectedTrace(): TraceView | null {
   return state.selected >= 0 ? state.traces[state.selected] ?? null : null;
+}
+
+/** The execution log for the currently-selected trace, or null. `trace_id` is
+ *  the trace-cache index, which equals `state.selected` (both index the cache in
+ *  order). Null when the selected trace never executed (not hot enough). */
+export function selectedTraceExec(): TraceExecLogOutput | null {
+  if (state.selected < 0) return null;
+  return state.execLogs.find((l) => l.trace_id === state.selected) ?? null;
+}
+
+/** The selected trace's exec log flattened into one linear event stream the
+ *  animation slider scrubs. Empty when there's no log for the selection. */
+export function traceExecSteps(): ExecStep[] {
+  const log = selectedTraceExec();
+  return log ? flattenExec(log) : [];
+}
+
+/** Move the animation slider to `pos` (clamped into the flattened stream). */
+export function setTraceExecPos(pos: number): void {
+  const n = traceExecSteps().length;
+  if (n === 0) {
+    setState("traceExecPos", 0);
+    return;
+  }
+  setState("traceExecPos", Math.max(0, Math.min(pos, n - 1)));
+}
+
+/** Step the animation one event backward / forward (no wrap). */
+export function stepTraceExec(delta: number): void {
+  setTraceExecPos(state.traceExecPos + delta);
 }
 
 /** The bytecode view at the current replay step: the disassembly of the proto

@@ -69,6 +69,10 @@ export interface LuneRunResult {
    *  replay cursor's `protoId`). Empty when the disassembly couldn't be built.
    *  Drives the step-replay panel's bytecode view. */
   disasm: ProtoDisasm[];
+  /** binschema trace execution log (per cached trace: the recorded entries /
+   *  exit-ramps and their per-iteration events). Empty when no trace executed.
+   *  Drives the JIT-trace iteration animation in the trace view. */
+  executionLog: Uint8Array;
 }
 
 /** The disassembly of one function prototype (a node in the proto tree). */
@@ -170,8 +174,9 @@ export interface LuneModule {
 //   then u64 exec_ns (VM-execute-only nanoseconds, at offset 64);
 //   then u32 safepoint_count (@72), u32 safepoint_capped (@76);
 //   then { u32 ptr; u32 len } safepoint_lines (line-per-safepoint blob, @80);
-//   then { u32 ptr; u32 len } disasm (static bytecode blob, @88). Total 96 bytes.
-const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8 + 8 + 4 + 4 + 8 + 8;
+//   then { u32 ptr; u32 len } disasm (static bytecode blob, @88);
+//   then { u32 ptr; u32 len } exec_log (trace execution-log blob, @96). Total 104 bytes.
+const RESULT_BYTES = 4 + 5 * 8 + 3 * 4 + 8 + 8 + 4 + 4 + 8 + 8 + 8;
 
 // ReplayResult struct layout (extern struct), little-endian:
 //   u32 status; { u32 ptr; u32 len } stdout/keyframe/diag; u32 current_line (@28),
@@ -315,6 +320,7 @@ function wrap(exports: LuneExports): LuneModule {
     const safepointCapped = dv.getUint32(76, true) !== 0;
     const safepointLines = readU32Array(readBuf(exports.memory, dv, 80));
     const disasm = decodeDisasm(readBuf(exports.memory, dv, 88));
+    const executionLog = readBuf(exports.memory, dv, 96);
 
     exports.lune_free_result(resPtr);
 
@@ -335,6 +341,7 @@ function wrap(exports: LuneExports): LuneModule {
       safepointCapped,
       safepointLines,
       disasm,
+      executionLog,
     };
   };
 
