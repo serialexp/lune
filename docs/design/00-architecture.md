@@ -1,8 +1,8 @@
 # lune — Architecture
 
-Status: draft, not yet implemented — architecture firm; companion docs 01–04 stubbed
+Status: partial — Phases 0–6b landed; Phase 7 through v8 (in-browser deterministic replay + timing); Phases 8–9 outstanding
 Owner: Bart
-Last updated: 2026-06-13
+Last updated: 2026-06-15
 
 > Working codename **lune** (Lua means "moon" in Portuguese; *lune* is French
 > for moon). Not Lua, doesn't aim to be — see Goals. Rename at will.
@@ -328,9 +328,29 @@ _(nothing yet — design only)_
       a new effect kind cost zero wire/codec change. A given seed yields the same
       stream on native and wasm, so the differential validator labels a `random()`
       program's one-effect divergence *expected*, exactly as for `clock()`.
-      **Still to come:** environment/args (needs the effect log to carry inline
-      string results — a wire-format extension), a user-facing replay/step CLI, then
-      the visualiser's iteration animation.
+      **Phase 7 v8 (in-browser deterministic replay + timing) landed:** the
+      visualiser now *drives* the replay spine. Two parts. (1) An execution-time
+      readout — the wasm `Result` carries an `exec_ns` measured around `vm.start`
+      alone, and the viz shows `ran in T ms (execute E ms)` (total wall-clock vs.
+      VM-execute-only). (2) A user-facing step debugger built on a **stateless
+      "replay to k"** model: the initial run records the effect log once and
+      reports a total safepoint count plus a per-safepoint source-line index; to
+      show the program at step *k* the viz calls `lune_replay(src, effects, k)`,
+      which re-compiles, replays the recorded effects with
+      `suspend_ctl.after_safepoints = k` (a separate *pure tier-0* pass so every
+      loop iteration is its own step), and snapshots the keyframe + stdout-so-far
+      + current line/span + backtrace. Scrubbing the slider re-runs from scratch
+      each time — O(k) per step, trivially fast at visualiser scale, and a direct
+      demonstration that replay to the same k yields *identical* state every time.
+      The panel offers both **instruction** grain (one stop per safepoint) and
+      **line** grain (stops where the source line changes, derived from the index
+      with no extra round-trips), shows locals + globals + the call chain decoded
+      from the keyframe, and highlights the current source line in the editor (its
+      own decoration channel, alongside the lint and runtime-error channels).
+      A generous safepoint cap bounds pathological loops and is surfaced, never
+      silent. **Still to come:** environment/args (needs the effect log to carry
+      inline string results — a wire-format extension), then the visualiser's
+      JIT-trace iteration animation.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
       first. A performance step — but *not* mechanical: regalloc across side
       exits, GC stackmaps/safepoints, and machine-state snapshot-restore are

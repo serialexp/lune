@@ -1,8 +1,8 @@
 # lune — Snapshot & Replay Schema
 
-Status: draft — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) landed; guard-snapshots outstanding
+Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; guard-snapshots outstanding
 Owner: Bart
-Last updated: 2026-06-14
+Last updated: 2026-06-15
 
 Prerequisite for **Phase 5b** (trace serialization format) and **Phase 7** (the
 visualiser). This doc owns the *concrete wire format* — the binschema schema that
@@ -178,6 +178,27 @@ schema follows; this is that schema's home.
       native and wasm share the stdlib PRNG, so a given seed yields the identical
       stream on both — the differential validator labels a `random()` program's
       one-effect divergence *expected*, exactly as for `clock()`.
+- [x] **In-browser replay driver (Phase 7 v8) — the user-facing replay surface.**
+      The replay driver that "trails the visualiser work" in the F2d note now
+      exists, in the browser, as a **stateless replay-to-k** model rather than a
+      restore-from-keyframe one. The record run reports a total safepoint count
+      and a **safepoint-line index** — a `u32`-per-safepoint array
+      (`safepoint_lines[k-1]` = the source line of the instruction pending at
+      safepoint *k*), recorded only under a gated `Vm.record_safepoint_lines`
+      flag so tier-0 pays nothing by default. To show step *k*, the wasm export
+      `lune_replay(src, effects, k)` re-compiles, sets `effect_mode = .replay`
+      with the decoded effect blob, runs a **pure tier-0** pass (trace disabled,
+      so each loop iteration is its own safepoint) with
+      `suspend_ctl.after_safepoints = k`, and on suspend returns the keyframe
+      (decoded by the same generated `SnapshotFileDecoder` the inspector uses) +
+      stdout-so-far + the pending line/span + a deepest-first backtrace (the
+      `Vm.describeFault` frame-walk was factored into a reusable
+      `backtraceFrames`). Re-execution *is* the reconstruction — no keyframe is
+      restored — so the keyframe still carries no log/cursor, consistent with the
+      "two artifacts" split. A `safepoint_count`/`safepoint_capped` pair surfaces
+      the safepoint cap (bounded, never silent). The line index is **in-memory /
+      ABI-only**: it rides the hand-rolled wasm `Result`/`ReplayResult` extern
+      structs, not the binschema wire format, so no schema change was needed.
 
 ### Outstanding
 

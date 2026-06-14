@@ -1,8 +1,8 @@
 # lune — Determinism & the Host-Effect Boundary
 
-Status: draft, not yet implemented — stub capturing required decisions
+Status: partial — host-effect boundary + record/replay (clock F2d, random F2e) + keyframe capture/restore/resume landed; record-once/replay-to-k driver now in the browser (Phase 7 v8); cross-platform-FP guarantee + guard-snapshots outstanding
 Owner: Bart
-Last updated: 2026-06-13
+Last updated: 2026-06-15
 
 Prerequisite for **Phase 3** (the host-effect boundary must exist in the calling
 convention) and **Phase 5** (replay) in `00-architecture.md`. Deterministic
@@ -230,6 +230,21 @@ that for a time-travel debugger it *is* the architecture.
       keyframe deliberately does **not** carry the effect log/cursor — that is
       replay-driver state marshalled *alongside* the snapshot (the keyframe is heap +
       stack + frames; the cursor is where in the log the cut fell).
+      **Phase 7 v8 puts a record-once / replay-to-k driver in the browser**, the
+      first *user-facing* consumer of this spine. The initial run records the
+      effect log once; to show the program at step *k* the visualiser re-runs from
+      scratch with the suspend control set to the k-th instruction-boundary
+      safepoint (`lune_replay`), restoring nothing — re-execution *is* the
+      reconstruction, and feeding the recorded effects back makes it reproducible.
+      This makes the determinism property directly observable: replay to the same
+      *k* yields byte-identical state every scrub, and a `clock()`/`random()`
+      program shows the *same* values at the same index every time (a `wasm.test.ts`
+      test asserts replay-to-k is deterministic and that replaying past the last
+      safepoint reproduces the uninterrupted run). The replay pass runs *pure
+      tier-0* (trace execution disabled) so each loop iteration is its own
+      safepoint/step — the hot-traced main run would batch iterations and skip
+      steps. The step↔line mapping rides a per-safepoint source-line index built
+      during the record run, not the keyframe.
 
 ## Why this exists
 
