@@ -179,6 +179,10 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // here, the CLI — supplies one. This is the single place the OS clock syscall
     // lives now. `clock()` is `ClockUnavailable` without it.
     vm.clock_source = .{ .ctx = &clock_ctx, .nowNs = &nativeClockNs };
+    // Inject the native seed source for `random()`. The VM owns the PRNG; the host
+    // supplies only the one nondeterministic seed (OS entropy here). `random()` is
+    // `RandomUnavailable` without it.
+    vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &nativeRandomSeed };
     // `--emit-effects` records the nondeterministic-input log during the run.
     if (topts.effects_path != null) vm.effect_mode = .record;
 
@@ -266,6 +270,20 @@ fn nativeClockNs(_: *anyopaque) i64 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
     return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
+}
+
+/// The native seed source backing `random()`, injected as `Vm.random_seed_source`.
+/// The VM owns the PRNG; the host supplies only the single nondeterministic seed —
+/// here, 8 bytes of OS entropy. `ctx` is unused (no state), so it points at a
+/// throwaway byte, mirroring `clock_ctx`.
+var rng_ctx: u8 = 0;
+
+fn nativeRandomSeed(_: *anyopaque) u64 {
+    var bytes: [8]u8 = undefined;
+    // Linux `getrandom(2)` — matches the Linux-only `clock_gettime` above. Blocking
+    // read of 8 bytes of kernel entropy; flags = 0.
+    _ = std.os.linux.getrandom(&bytes, bytes.len, 0);
+    return std.mem.readInt(u64, &bytes, .little);
 }
 
 /// Serialize a whole-VM keyframe snapshot to `path` (binschema wire format).

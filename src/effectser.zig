@@ -121,6 +121,13 @@ test "effect log round-trips byte/struct-exact (empty, single, multi; int + floa
         .{ .kind = .clock, .result = Value.float(2.5) },
         .{ .kind = .clock, .result = Value.int(9223372036854775807) },
     });
+    // F2e: the random_seed ordinal carries a u64 seed as a (bit-cast) non-heap int,
+    // so it round-trips through the same int path — no wire change. Exercise it
+    // here (including a seed whose top bit is set, i.e. a negative i64 after cast).
+    try expectLogRoundTrips(&.{
+        .{ .kind = .random_seed, .result = Value.int(@bitCast(@as(u64, 0xC0FFEE))) },
+        .{ .kind = .random_seed, .result = Value.int(@bitCast(@as(u64, 0xFFFF_FFFF_FFFF_FFFF))) },
+    });
 }
 
 test "encode then decode reproduces the same bytes (stable)" {

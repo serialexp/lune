@@ -73,6 +73,19 @@ fn wasmClockNs(_: *anyopaque) i64 {
 /// `ClockSource.ctx` is unused (the import needs no state) — point it anywhere.
 var clock_ctx: u8 = 0;
 
+/// The host seed import for `random()`. JS supplies one nondeterministic 64-bit
+/// seed (e.g. from `crypto.getRandomValues`); the VM owns the PRNG and reproduces
+/// the whole draw stream from it. In `record` mode the seed is logged once; in
+/// `replay` mode the log is fed back and this is never consulted.
+extern "env" fn host_random_seed() i64;
+
+fn wasmRandomSeed(_: *anyopaque) u64 {
+    return @bitCast(host_random_seed());
+}
+
+/// `RandomSeedSource.ctx` is unused (the import needs no state) — point it anywhere.
+var rng_ctx: u8 = 0;
+
 /// A (pointer, length) pair into linear memory, as two u32s for JS DataView.
 const Buf = extern struct {
     ptr: u32 = 0,
@@ -277,6 +290,7 @@ fn run(res: *Result, source: []const u8) !void {
     vm.trace.config.optimize = true;
     vm.effect_mode = .record;
     vm.clock_source = .{ .ctx = &clock_ctx, .nowNs = &wasmClockNs };
+    vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &wasmRandomSeed };
 
     // --- compile --- (pass builtin globals so the unknown-global lint doesn't
     // flag `print`/`clock`).

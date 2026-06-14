@@ -58,6 +58,10 @@ pub const Error = error{
     /// its own — the host that constructs the VM must supply one (`main.zig` on
     /// native, the JS host on wasm, a fake in tests). Replay needs none.
     ClockUnavailable,
+    /// `random()` needed its seed (in `off`/`record` mode) but no
+    /// `random_seed_source` was injected. Mirrors `ClockUnavailable`: the VM holds
+    /// no entropy source of its own. Replay needs none (the seed is in the log).
+    RandomUnavailable,
     /// Allocation failure (register stack, future heap).
     OutOfMemory,
 };
@@ -103,6 +107,16 @@ pub const ClockSource = struct {
     nowNs: *const fn (ctx: *anyopaque) i64,
 };
 
+/// An embedder-supplied source of one nondeterministic seed for `random()`.
+/// Mirrors `ClockSource`: the VM holds no entropy of its own, so the host injects
+/// one (`main.zig` reads OS entropy, the wasm host imports `crypto.getRandomValues`,
+/// tests supply a fixed seed). Consulted once per run — lazily, on the first
+/// `random()` call — in `off`/`record`; `replay` reads the seed from the log.
+pub const RandomSeedSource = struct {
+    ctx: *anyopaque,
+    seed: *const fn (ctx: *anyopaque) u64,
+};
+
 /// One built-in native: the global name it installs under, its function, and
 /// whether it is a nondeterministic-input effect (null = pure host call).
 pub const BaseNative = struct {
@@ -123,6 +137,10 @@ pub const BaseNative = struct {
 pub const base_natives = [_]BaseNative{
     .{ .name = "print", .func = &nativePrint },
     .{ .name = "clock", .func = &nativeClock, .effect = .clock },
+    // `random` carries no `effect`: the call itself isn't the boundary — its
+    // *seed* is (acquired once, inside `nativeRandom`, as `.random_seed`). So the
+    // dispatch calls it directly; the seed goes through record/replay internally.
+    .{ .name = "random", .func = &nativeRandom },
 };
 
 /// The names `installBaseLib` seeds into the globals table, derived from the
@@ -268,6 +286,15 @@ pub const Vm = struct {
     /// `off`/`record` mode with no source set fails with `ClockUnavailable`;
     /// `replay` never reads it.
     clock_source: ?ClockSource = null,
+    /// Embedder-supplied entropy for `random()`'s seed (null = none injected).
+    /// Read once, lazily, on the first `random()` in `off`/`record`; `replay`
+    /// reads the seed from the log instead. No source set ⇒ `RandomUnavailable`.
+    random_seed_source: ?RandomSeedSource = null,
+    /// The VM's PRNG, seeded lazily from the first `random()` call's seed (an
+    /// effect). `std.Random.Xoshiro256` is pinned *by name* (not `DefaultPrng`) so
+    /// the draw stream is a stable part of the language: a given seed reproduces
+    /// the same sequence across runs and across the native/wasm engines.
+    rng: ?std.Random.Xoshiro256 = null,
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
         var vm = try initBare(gpa);
@@ -892,6 +919,12 @@ fn narrowError(e: anyerror) Error {
         error.StackOverflow => Error.StackOverflow,
         error.Unimplemented => Error.Unimplemented,
         error.ClockUnavailable => Error.ClockUnavailable,
+        // `random()` reaches the effect machinery from *inside* its native (the
+        // seed, not the call, is the boundary), so these surface through here —
+        // unlike `clock`, which goes via `performEffect` and never narrows.
+        error.RandomUnavailable => Error.RandomUnavailable,
+        error.EffectLogExhausted => Error.EffectLogExhausted,
+        error.EffectKindMismatch => Error.EffectKindMismatch,
         else => Error.HostError,
     };
 }
@@ -932,15 +965,47 @@ fn performEffect(self: *Vm, kind: EffectKind, nat: *const function.Native, args:
         .off => return nat.func(@ptrCast(self), args) catch |e| return narrowError(e),
         .record => {
             const result = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
-            try self.effect_log.append(self.gpa, .{ .kind = kind, .result = result });
+            try logEffect(self, kind, result);
             return result;
         },
+        .replay => return nextLoggedEffect(self, kind),
+    }
+}
+
+/// Append one effect result to the ordered log (record mode). Shared by
+/// `performEffect` (native-backed effects like `clock`) and the seed path.
+fn logEffect(self: *Vm, kind: EffectKind, result: Value) Error!void {
+    try self.effect_log.append(self.gpa, .{ .kind = kind, .result = result });
+}
+
+/// Consume the next logged effect in call order (replay mode), checking the run
+/// hasn't outgrown or diverged from the recording. Shared by `performEffect` and
+/// the seed path so both enforce the same `EffectLogExhausted`/`EffectKindMismatch`
+/// guarantees.
+fn nextLoggedEffect(self: *Vm, kind: EffectKind) Error!Value {
+    if (self.effect_cursor >= self.effect_log.items.len) return Error.EffectLogExhausted;
+    const e = self.effect_log.items[self.effect_cursor];
+    self.effect_cursor += 1;
+    if (e.kind != kind) return Error.EffectKindMismatch;
+    return e.result;
+}
+
+/// Obtain `random()`'s one seed through the record/replay boundary. In
+/// `off`/`record` it reads the injected entropy source (else `RandomUnavailable`)
+/// and, in `record`, logs it once as `.random_seed` (a non-heap int — no schema
+/// change). In `replay` it reads the seed back from the log. Called lazily by
+/// `nativeRandom` the first time `random()` runs; subsequent draws need no effect.
+fn obtainRandomSeed(self: *Vm) Error!u64 {
+    switch (self.effect_mode) {
+        .off, .record => {
+            const src = self.random_seed_source orelse return Error.RandomUnavailable;
+            const seed = src.seed(src.ctx);
+            if (self.effect_mode == .record) try logEffect(self, .random_seed, Value.int(@bitCast(seed)));
+            return seed;
+        },
         .replay => {
-            if (self.effect_cursor >= self.effect_log.items.len) return Error.EffectLogExhausted;
-            const e = self.effect_log.items[self.effect_cursor];
-            self.effect_cursor += 1;
-            if (e.kind != kind) return Error.EffectKindMismatch;
-            return e.result;
+            const v = try nextLoggedEffect(self, .random_seed);
+            return @bitCast(v.asInt());
         },
     }
 }
@@ -958,6 +1023,20 @@ fn nativeClock(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm: *Vm = @ptrCast(@alignCast(ctx));
     const src = vm.clock_source orelse return Error.ClockUnavailable;
     return Value.int(src.nowNs(src.ctx));
+}
+
+/// `random()` — a float in `[0,1)`, drawn from the VM's own PRNG. The
+/// nondeterministic *input* is a single seed (the `.random_seed` effect), obtained
+/// lazily on the first call and recorded once; every draw after that is pure VM
+/// state, so replay reproduces the whole stream from that one logged seed. The
+/// PRNG is `std.Random.Xoshiro256` (pinned by name — see `Vm.rng`), so a given
+/// seed yields the same sequence across runs and across the native/wasm engines.
+/// Ignores its arguments for now (ranges are pure computation atop this — later).
+fn nativeRandom(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    _ = args;
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    if (vm.rng == null) vm.rng = std.Random.Xoshiro256.init(try obtainRandomSeed(vm));
+    return Value.float(vm.rng.?.random().float(f64));
 }
 
 fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
@@ -1592,12 +1671,26 @@ const CounterClock = struct {
     }
 };
 
+/// A deterministic test seed source: always hands back the same `value`. Injected
+/// as a `RandomSeedSource` so `random()` tests don't depend on OS entropy. Two
+/// distinct fixed seeds model the nondeterminism a real seed has between runs.
+const FixedSeed = struct {
+    value: u64,
+    fn seed(ctx: *anyopaque) u64 {
+        const self: *FixedSeed = @ptrCast(@alignCast(ctx));
+        return self.value;
+    }
+    fn source(self: *FixedSeed) RandomSeedSource {
+        return .{ .ctx = self, .seed = &FixedSeed.seed };
+    }
+};
+
 /// Compile + run `source` with the given effect mode. `preload` (replay only)
 /// seeds the effect log fed back in call order. `clock` (record/off only) is the
 /// injected deterministic clock; replay needs none (it feeds the log back).
 /// Returns owned copies of the printed output and the resulting effect log
 /// (`clock` results are ints, so the log is self-contained — safe past `vm.deinit`).
-fn effectRun(gpa: std.mem.Allocator, source: [:0]const u8, mode: EffectMode, preload: []const Effect, clock: ?*CounterClock) !EffectRun {
+fn effectRun(gpa: std.mem.Allocator, source: [:0]const u8, mode: EffectMode, preload: []const Effect, clock: ?*CounterClock, seed: ?*FixedSeed) !EffectRun {
     const parser = @import("parser.zig");
     const diag = @import("diag.zig");
 
@@ -1614,6 +1707,7 @@ fn effectRun(gpa: std.mem.Allocator, source: [:0]const u8, mode: EffectMode, pre
     vm.out = &sink;
     vm.effect_mode = mode;
     if (clock) |c| vm.clock_source = c.source();
+    if (seed) |s| vm.random_seed_source = s.source();
     if (preload.len > 0) try vm.effect_log.appendSlice(gpa, preload);
 
     var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
@@ -1637,13 +1731,13 @@ test "F2d: replaying a recorded effect log reproduces the recorded output" {
     // Record a run against a known clock sequence (1000, 1001, …): the printed
     // values land in `out`, the effects in `log`.
     var clk = CounterClock{ .next = 1000 };
-    const rec = try effectRun(gpa, source, .record, &.{}, &clk);
+    const rec = try effectRun(gpa, source, .record, &.{}, &clk, null);
     defer rec.deinit(gpa);
     try testing.expectEqual(@as(usize, 4), rec.log.len);
 
     // Replay the SAME log into a fresh VM with NO clock injected: clock() is not
     // called — the logged values are fed back — so output is byte-identical.
-    const rep = try effectRun(gpa, source, .replay, rec.log, null);
+    const rep = try effectRun(gpa, source, .replay, rec.log, null, null);
     defer rep.deinit(gpa);
     try testing.expectEqualStrings(rec.out, rep.out);
     // Replay re-emits the same effects into its own log (every clock() consumed one).
@@ -1654,7 +1748,7 @@ test "F2d: replaying a recorded effect log reproduces the recorded output" {
     // exactly what the log captures. (With injection the clock is deterministic, so
     // we vary it explicitly rather than leaning on wall-clock advance.)
     var clk2 = CounterClock{ .next = 9000 };
-    const rec2 = try effectRun(gpa, source, .record, &.{}, &clk2);
+    const rec2 = try effectRun(gpa, source, .record, &.{}, &clk2, null);
     defer rec2.deinit(gpa);
     try testing.expect(!std.mem.eql(u8, rec.out, rec2.out));
 }
@@ -1667,14 +1761,14 @@ test "F2d: replay with a too-short log reports EffectLogExhausted (no silent div
     // A one-entry log for a program that asks for two effects. Replay feeds the
     // log back (no clock needed) and runs out on the second call.
     const short = [_]Effect{.{ .kind = .clock, .result = Value.int(123) }};
-    try testing.expectError(error.EffectLogExhausted, effectRun(gpa, source, .replay, &short, null));
+    try testing.expectError(error.EffectLogExhausted, effectRun(gpa, source, .replay, &short, null, null));
 }
 
 test "F2d: off mode logs nothing and calls effects normally (default behaviour)" {
     const gpa = testing.allocator;
     // Off mode calls the injected clock directly and logs nothing.
     var clk = CounterClock{ .next = 1 };
-    const run = try effectRun(gpa, "print(clock() > 0)", .off, &.{}, &clk);
+    const run = try effectRun(gpa, "print(clock() > 0)", .off, &.{}, &clk, null);
     defer run.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), run.log.len);
     try testing.expectEqualStrings("true\n", run.out);
@@ -1684,7 +1778,89 @@ test "F2d: clock() with no injected source is ClockUnavailable" {
     const gpa = testing.allocator;
     // The interpreter holds no clock of its own; record/off with no source set
     // surfaces a clear error rather than reaching for a platform clock.
-    try testing.expectError(error.ClockUnavailable, effectRun(gpa, "print(clock())", .record, &.{}, null));
+    try testing.expectError(error.ClockUnavailable, effectRun(gpa, "print(clock())", .record, &.{}, null, null));
+}
+
+// ---------------------------------------------------------------------------
+// F2e — seed-based randomness
+//
+// `random()` is a nondeterministic *input* like `clock()`, but seed-based: the
+// single recorded effect is one `random_seed`, acquired lazily on the first call,
+// from which a VM-internal PRNG reproduces the entire draw stream on replay. So a
+// multi-draw program records exactly ONE effect, and replaying that one seed
+// reproduces every draw byte-identically. These tests prove (1) record→replay
+// fidelity with a single logged seed, (2) different seeds yield different streams
+// (the PRNG genuinely varies), (3) a missing seed in the log is reported, (4) no
+// injected source is a clear error, and (5) draws lie in [0,1).
+// ---------------------------------------------------------------------------
+
+test "F2e: replaying the recorded seed reproduces the whole draw stream" {
+    const gpa = testing.allocator;
+    // Three draws — proving the single seed drives the entire stream, not one call.
+    const source =
+        \\print(random()); print(random()); print(random())
+    ;
+
+    var sd = FixedSeed{ .value = 0xC0FFEE };
+    const rec = try effectRun(gpa, source, .record, &.{}, null, &sd);
+    defer rec.deinit(gpa);
+    // Exactly one effect logged regardless of draw count: the seed, acquired once.
+    try testing.expectEqual(@as(usize, 1), rec.log.len);
+    try testing.expectEqual(EffectKind.random_seed, rec.log[0].kind);
+
+    // Replay the one-entry log into a fresh VM with NO seed source: random() is
+    // still called (it is a pure native), but the seed comes from the log, so the
+    // PRNG reproduces the identical stream and output is byte-identical.
+    const rep = try effectRun(gpa, source, .replay, rec.log, null, null);
+    defer rep.deinit(gpa);
+    try testing.expectEqualStrings(rec.out, rep.out);
+    try testing.expectEqual(rec.log.len, rep.log.len);
+}
+
+test "F2e: different seeds yield different draw streams" {
+    const gpa = testing.allocator;
+    const source =
+        \\print(random()); print(random())
+    ;
+    var sd_a = FixedSeed{ .value = 1 };
+    var sd_b = FixedSeed{ .value = 2 };
+    const a = try effectRun(gpa, source, .record, &.{}, null, &sd_a);
+    defer a.deinit(gpa);
+    const b = try effectRun(gpa, source, .record, &.{}, null, &sd_b);
+    defer b.deinit(gpa);
+    // Same seed would mean same stream; two distinct seeds must differ (this is
+    // the nondeterminism the log captures — two fresh records use fresh seeds).
+    try testing.expect(!std.mem.eql(u8, a.out, b.out));
+}
+
+test "F2e: replay with no seed in the log reports EffectLogExhausted" {
+    const gpa = testing.allocator;
+    // An empty log for a program that needs the seed: replay runs out immediately.
+    try testing.expectError(error.EffectLogExhausted, effectRun(gpa, "print(random())", .replay, &.{}, null, null));
+}
+
+test "F2e: random() with no injected source is RandomUnavailable" {
+    const gpa = testing.allocator;
+    // The VM owns the PRNG but not the seed; record/off with no source set
+    // surfaces a clear error rather than reaching for OS entropy itself.
+    try testing.expectError(error.RandomUnavailable, effectRun(gpa, "print(random())", .record, &.{}, null, null));
+}
+
+test "F2e: draws lie in [0,1)" {
+    const gpa = testing.allocator;
+    // `r < 1 and r >= 0` over several draws — the float() contract.
+    const source =
+        \\local ok = true
+        \\for i = 1, 50 do
+        \\  local r = random()
+        \\  if r < 0 or r >= 1 then ok = false end
+        \\end
+        \\print(ok)
+    ;
+    var sd = FixedSeed{ .value = 42 };
+    const run = try effectRun(gpa, source, .record, &.{}, null, &sd);
+    defer run.deinit(gpa);
+    try testing.expectEqualStrings("true\n", run.out);
 }
 
 test "e2e: recursion, loop, locals — fib and a summing loop" {

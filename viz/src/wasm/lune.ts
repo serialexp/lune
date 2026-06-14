@@ -98,13 +98,19 @@ const DIAG_BYTES = 4 * 4 + 8;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-/** Build the import object the module needs. `host_now_ns` is the injected
- *  clock — the only nondeterministic input that can cross into the VM. */
+/** Build the import object the module needs. `host_now_ns` and `host_random_seed`
+ *  are the injected nondeterministic inputs that can cross into the VM. */
 function imports(): WebAssembly.Imports {
   return {
     env: {
       // i64 result ⇒ JS must return a BigInt. Monotonic-ish nanoseconds.
       host_now_ns: (): bigint => BigInt(Math.round(performance.now() * 1e6)),
+      // One nondeterministic 64-bit seed for the VM-owned PRNG. Two CSPRNG words
+      // packed into an i64 (returned as a BigInt; the VM @bitCasts it to u64).
+      host_random_seed: (): bigint => {
+        const w = crypto.getRandomValues(new Uint32Array(2));
+        return BigInt.asIntN(64, (BigInt(w[1]) << 32n) | BigInt(w[0]));
+      },
     },
   };
 }

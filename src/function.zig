@@ -130,6 +130,10 @@ pub const NativeFn = *const fn (ctx: *anyopaque, args: []const Value) anyerror!V
 pub const EffectKind = enum(u8) {
     /// `clock()` — the host wall/monotonic clock. The canonical first effect.
     clock = 0,
+    /// The one nondeterministic seed behind `random()`. Acquired lazily on the
+    /// first `random()` call and recorded once; the VM's PRNG reproduces the whole
+    /// draw stream from it on replay (so `random()` itself logs nothing per call).
+    random_seed = 1,
 };
 
 pub const Native = struct {
