@@ -174,6 +174,11 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     vm.trace.config.enabled = topts.enabled;
     vm.trace.config.execute = topts.execute;
     vm.trace.config.optimize = topts.optimize;
+    // Inject the native clock. The interpreter holds no platform clock of its own
+    // (so the VM core stays portable, incl. wasm); the host that builds the VM —
+    // here, the CLI — supplies one. This is the single place the OS clock syscall
+    // lives now. `clock()` is `ClockUnavailable` without it.
+    vm.clock_source = .{ .ctx = &clock_ctx, .nowNs = &nativeClockNs };
     // `--emit-effects` records the nondeterministic-input log during the run.
     if (topts.effects_path != null) vm.effect_mode = .record;
 
@@ -228,6 +233,18 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
         };
     }
     return 0;
+}
+
+/// The native monotonic clock backing `clock()`, injected as `Vm.clock_source`.
+/// Linux-only, which is fine here: this is the CLI, the one place a host clock is
+/// chosen. The VM core stays platform-agnostic (it only sees the function pointer).
+/// `ctx` is unused — the OS clock needs no state — so it points at a throwaway byte.
+var clock_ctx: u8 = 0;
+
+fn nativeClockNs(_: *anyopaque) i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 
 /// Serialize a whole-VM keyframe snapshot to `path` (binschema wire format).

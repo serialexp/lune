@@ -1249,6 +1249,22 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
 // replay harness would marshal next to the snapshot.
 // ---------------------------------------------------------------------------
 
+// A deterministic test clock injected as a `ClockSource` (the interpreter holds
+// no platform clock of its own). Returns next, next+1, next+2, … so the recorded
+// effect log is reproducible.
+const TestClock = struct {
+    next: i64,
+    fn nowNs(ctx: *anyopaque) i64 {
+        const self: *TestClock = @ptrCast(@alignCast(ctx));
+        const v = self.next;
+        self.next += 1;
+        return v;
+    }
+    fn source(self: *TestClock) interp.ClockSource {
+        return .{ .ctx = self, .nowNs = &TestClock.nowNs };
+    }
+};
+
 // A clock()-using program with a loop inside a nested call: each cut lands with
 // live frames AND a partially-consumed effect log, so both halves are exercised.
 const f2d_combined_source =
@@ -1281,6 +1297,10 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
         defer chunk.deinit();
         try testing.expect(!diags.hasErrors());
 
+        // Inject a deterministic clock so the recorded log is reproducible (the
+        // record VM is the only one that calls clock(); the replay VMs feed L back).
+        var clk = TestClock{ .next = 1000 };
+        vm.clock_source = clk.source();
         vm.effect_mode = .record;
         _ = try vm.run(chunk.proto);
 

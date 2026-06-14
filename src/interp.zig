@@ -53,6 +53,11 @@ pub const Error = error{
     /// Replay's next logged effect is a different kind than the program just
     /// requested — the recording doesn't match this program/run.
     EffectKindMismatch,
+    /// A `clock`-kind effect ran (in `off`/`record` mode) but no `clock_source`
+    /// was injected by the embedder. The interpreter holds no platform clock of
+    /// its own — the host that constructs the VM must supply one (`main.zig` on
+    /// native, the JS host on wasm, a fake in tests). Replay needs none.
+    ClockUnavailable,
     /// Allocation failure (register stack, future heap).
     OutOfMemory,
 };
@@ -84,6 +89,19 @@ pub const Effect = struct { kind: EffectKind, result: Value };
 /// Record / replay / off — the effect-log mode. `off` (default) is the
 /// pre-F2d behaviour: every native runs normally and nothing is logged.
 pub const EffectMode = enum { off, record, replay };
+
+/// An embedder-supplied wall/monotonic clock. The interpreter carries **no**
+/// platform clock of its own — `clock()` reads its value through here, so the
+/// VM core stays free of any host/OS dependency (this is what lets it compile to
+/// `wasm32-freestanding`, where there is no clock syscall). The host that
+/// constructs the VM injects one: `main.zig` supplies the Linux monotonic clock,
+/// the wasm host imports `performance.now()`, tests supply a deterministic
+/// counter. `record`/`off` call `nowNs`; `replay` never does (it feeds the log
+/// back). `ctx` is an opaque pointer to whatever state the source needs.
+pub const ClockSource = struct {
+    ctx: *anyopaque,
+    nowNs: *const fn (ctx: *anyopaque) i64,
+};
 
 /// One built-in native: the global name it installs under, its function, and
 /// whether it is a nondeterministic-input effect (null = pure host call).
@@ -211,6 +229,12 @@ pub const Vm = struct {
     effect_log: std.ArrayList(Effect) = .empty,
     /// Replay read position into `effect_log` (next effect to feed back).
     effect_cursor: usize = 0,
+    /// Embedder-supplied clock for `clock()` (null = none injected). The
+    /// interpreter holds no platform clock; the host that builds the VM sets this
+    /// (`main.zig` native, the JS host on wasm, a fake in tests). A `clock()` in
+    /// `off`/`record` mode with no source set fails with `ClockUnavailable`;
+    /// `replay` never reads it.
+    clock_source: ?ClockSource = null,
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
         var vm = try initBare(gpa);
@@ -761,6 +785,7 @@ fn narrowError(e: anyerror) Error {
         error.DivisionByZero => Error.DivisionByZero,
         error.StackOverflow => Error.StackOverflow,
         error.Unimplemented => Error.Unimplemented,
+        error.ClockUnavailable => Error.ClockUnavailable,
         else => Error.HostError,
     };
 }
@@ -800,16 +825,16 @@ fn performEffect(self: *Vm, kind: EffectKind, nat: *const function.Native, args:
 /// `clock()` — the canonical first nondeterministic *input* (doc 02). Returns the
 /// host monotonic clock as integer nanoseconds. Pure-nondeterministic: two calls
 /// differ, which is exactly why it must be recorded to replay deterministically.
-/// Ignores its arguments. Reads the clock via the raw Linux syscall so it needs no
-/// `std.Io` handle threaded through the native boundary (the repo is Linux-pinned;
-/// the record/replay machinery above is platform-independent regardless).
+/// Ignores its arguments. Reads the value through the embedder-injected
+/// `Vm.clock_source` — the interpreter holds no platform clock of its own, so the
+/// VM core compiles to any target (including `wasm32-freestanding`, which has no
+/// clock syscall). With no source injected this is `ClockUnavailable`; the
+/// `replay` path never reaches here (it feeds the log back in `performEffect`).
 fn nativeClock(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    _ = ctx;
     _ = args;
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    const ns = @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
-    return Value.int(ns);
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    const src = vm.clock_source orelse return Error.ClockUnavailable;
+    return Value.int(src.nowNs(src.ctx));
 }
 
 fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
@@ -1335,11 +1360,29 @@ const EffectRun = struct {
     }
 };
 
+/// A deterministic test clock: returns `next`, `next+step`, `next+2*step`, …
+/// Injected as a `ClockSource` so tests don't depend on the wall clock. Two
+/// distinct counters model the nondeterminism a real clock has between runs.
+const CounterClock = struct {
+    next: i64,
+    step: i64 = 1,
+    fn nowNs(ctx: *anyopaque) i64 {
+        const self: *CounterClock = @ptrCast(@alignCast(ctx));
+        const v = self.next;
+        self.next += self.step;
+        return v;
+    }
+    fn source(self: *CounterClock) ClockSource {
+        return .{ .ctx = self, .nowNs = &CounterClock.nowNs };
+    }
+};
+
 /// Compile + run `source` with the given effect mode. `preload` (replay only)
-/// seeds the effect log fed back in call order. Returns owned copies of the
-/// printed output and the resulting effect log (`clock` results are ints, so the
-/// log is self-contained — safe past `vm.deinit`).
-fn effectRun(gpa: std.mem.Allocator, source: [:0]const u8, mode: EffectMode, preload: []const Effect) !EffectRun {
+/// seeds the effect log fed back in call order. `clock` (record/off only) is the
+/// injected deterministic clock; replay needs none (it feeds the log back).
+/// Returns owned copies of the printed output and the resulting effect log
+/// (`clock` results are ints, so the log is self-contained — safe past `vm.deinit`).
+fn effectRun(gpa: std.mem.Allocator, source: [:0]const u8, mode: EffectMode, preload: []const Effect, clock: ?*CounterClock) !EffectRun {
     const parser = @import("parser.zig");
     const diag = @import("diag.zig");
 
@@ -1355,6 +1398,7 @@ fn effectRun(gpa: std.mem.Allocator, source: [:0]const u8, mode: EffectMode, pre
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
     vm.effect_mode = mode;
+    if (clock) |c| vm.clock_source = c.source();
     if (preload.len > 0) try vm.effect_log.appendSlice(gpa, preload);
 
     var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
@@ -1375,22 +1419,27 @@ test "F2d: replaying a recorded effect log reproduces the recorded output" {
         \\for i = 1, 4 do print(clock()) end
     ;
 
-    // Record a run: the printed clock values land in `out`, the effects in `log`.
-    const rec = try effectRun(gpa, source, .record, &.{});
+    // Record a run against a known clock sequence (1000, 1001, …): the printed
+    // values land in `out`, the effects in `log`.
+    var clk = CounterClock{ .next = 1000 };
+    const rec = try effectRun(gpa, source, .record, &.{}, &clk);
     defer rec.deinit(gpa);
     try testing.expectEqual(@as(usize, 4), rec.log.len);
 
-    // Replay the SAME log into a fresh VM: clock() is not called — the logged
-    // values are fed back — so the output is byte-identical to the record run.
-    const rep = try effectRun(gpa, source, .replay, rec.log);
+    // Replay the SAME log into a fresh VM with NO clock injected: clock() is not
+    // called — the logged values are fed back — so output is byte-identical.
+    const rep = try effectRun(gpa, source, .replay, rec.log, null);
     defer rep.deinit(gpa);
     try testing.expectEqualStrings(rec.out, rep.out);
     // Replay re-emits the same effects into its own log (every clock() consumed one).
     try testing.expectEqual(rec.log.len, rep.log.len);
 
-    // A second *fresh record* genuinely differs — the monotonic clock has advanced,
-    // so the nondeterminism being captured is real (not an artifact of the test).
-    const rec2 = try effectRun(gpa, source, .record, &.{});
+    // A second record against a DIFFERENT clock sequence (9000, 9001, …) genuinely
+    // differs — modelling the nondeterminism a real clock has between runs, which is
+    // exactly what the log captures. (With injection the clock is deterministic, so
+    // we vary it explicitly rather than leaning on wall-clock advance.)
+    var clk2 = CounterClock{ .next = 9000 };
+    const rec2 = try effectRun(gpa, source, .record, &.{}, &clk2);
     defer rec2.deinit(gpa);
     try testing.expect(!std.mem.eql(u8, rec.out, rec2.out));
 }
@@ -1400,17 +1449,27 @@ test "F2d: replay with a too-short log reports EffectLogExhausted (no silent div
     const source =
         \\print(clock()); print(clock())
     ;
-    // A one-entry log for a program that asks for two effects.
+    // A one-entry log for a program that asks for two effects. Replay feeds the
+    // log back (no clock needed) and runs out on the second call.
     const short = [_]Effect{.{ .kind = .clock, .result = Value.int(123) }};
-    try testing.expectError(error.EffectLogExhausted, effectRun(gpa, source, .replay, &short));
+    try testing.expectError(error.EffectLogExhausted, effectRun(gpa, source, .replay, &short, null));
 }
 
 test "F2d: off mode logs nothing and calls effects normally (default behaviour)" {
     const gpa = testing.allocator;
-    const run = try effectRun(gpa, "print(clock() > 0)", .off, &.{});
+    // Off mode calls the injected clock directly and logs nothing.
+    var clk = CounterClock{ .next = 1 };
+    const run = try effectRun(gpa, "print(clock() > 0)", .off, &.{}, &clk);
     defer run.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), run.log.len);
     try testing.expectEqualStrings("true\n", run.out);
+}
+
+test "F2d: clock() with no injected source is ClockUnavailable" {
+    const gpa = testing.allocator;
+    // The interpreter holds no clock of its own; record/off with no source set
+    // surfaces a clear error rather than reaching for a platform clock.
+    try testing.expectError(error.ClockUnavailable, effectRun(gpa, "print(clock())", .record, &.{}, null));
 }
 
 test "e2e: recursion, loop, locals — fib and a summing loop" {

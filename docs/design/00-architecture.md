@@ -39,6 +39,15 @@ _(nothing yet — design only)_
       dispatch smoke test (2M tail calls in constant stack). **Finding:** the
       now-default self-hosted `stage2_x86_64` backend rejects guaranteed tail
       calls; the build forces `use_llvm = true` (principle #4). Done.
+      **The smoke test (`src/dispatch.zig`) is a permanent capability gate, not
+      disposable code** — its *toy loop* is throwaway, but guaranteed tail calls
+      are pillar #4 and the test is what keeps them verified on every target. The
+      current tier-0 (`interp.zig`, Phase 3) is intentionally a `while/switch`
+      correctness oracle that does **not** thread its dispatch yet; threaded
+      dispatch is a reserved fast-path technique. Any new target (e.g. wasm32) must
+      **keep this test green** (enable the target's tail-call feature, mirroring
+      `use_llvm = true` on native) — a target that can't emit guaranteed tail calls
+      must fail here loudly, never be silently gated out.
 - [x] **Phase 1 — Value representation & object model.** Done.
       16-byte tagged `Value` (tag at offset 0 + 8-byte payload, comptime-asserted)
       with first-class `i64` *and* `f64` (`src/value.zig`); 16-byte `GcHeader`

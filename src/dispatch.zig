@@ -14,8 +14,17 @@
 //! frames were *not* being reused, that depth would overflow the stack long
 //! before completion. Reaching the assertion means the chain ran in O(1) stack.
 //!
-//! This is throwaway scaffolding — the real interpreter (Phase 3) replaces it.
-//! It exists only to de-risk the dispatch strategy before we bet on it.
+//! Scope of "throwaway": only this *toy 2-opcode loop* is temporary — the real
+//! interpreter (Phase 3) replaces the code, NOT the capability. Guaranteed tail
+//! calls are a permanent architectural pillar (`docs/design/00-architecture.md`
+//! principle #4: "Stay on Zig's bedrock"); verifying them here is *the* reason
+//! the build forces `use_llvm = true` on every artifact that uses threaded
+//! dispatch. The current tier-0 (`interp.zig`) is deliberately a `while/switch`
+//! correctness oracle and does not yet thread its dispatch — threaded dispatch is
+//! a reserved fast-path technique, and this test is the permanent **capability
+//! gate** that keeps it available. Do NOT delete or skip it (e.g. when porting to
+//! a new target like wasm32): if a target can't emit guaranteed tail calls, that
+//! must surface as a loud failure here, not be quietly gated away.
 
 const std = @import("std");
 
