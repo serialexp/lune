@@ -40,6 +40,10 @@
 //!                                empty when there's no located runtime error):
 //!                                u32 frame_count, then per frame deepest-first
 //!                                { u32 line, start, end, name_len, [name_len]u8 }
+//!   (further fields are appended after `backtrace` — exec timing, the step-replay
+//!    index `safepoint_*`/`safepoint_lines`, and the bytecode-view `disasm` blob;
+//!    each is documented at its field in the `Result` struct below. New fields are
+//!    always appended last so existing JS DataView offsets stay stable.)
 //!
 //! CheckResult layout (compile-only validation; for the in-browser editor's live
 //! linter — parse + compile WITHOUT running the program, so there are no side
@@ -128,6 +132,12 @@ const Result = extern struct {
     /// little-endian `u32`s, where entry k is the 1-based source line of the
     /// instruction pending at safepoint k+1. Empty when `safepoint_count == 0`.
     safepoint_lines: Buf = .{},
+    /// Static disassembly of every proto in this program (the bytecode view the
+    /// step-replay panel renders, indexed by the replay cursor's `proto_id`). A
+    /// self-describing little-endian blob; see `buildDisasm` for the layout. Empty
+    /// when the disassembly couldn't be built. Appended last so prior JS field
+    /// offsets stay stable.
+    disasm: Buf = .{},
 };
 
 /// One compile diagnostic, flattened for JS (24 bytes; see file header). `start`/
@@ -174,6 +184,12 @@ const ReplayResult = extern struct {
     /// Structured call-chain blob at this step (deepest-first; same format as
     /// `Result.backtrace`, see `encodeBacktrace`). Empty when finished.
     backtrace: Buf = .{},
+    /// Replay cursor at this step: the `Proto.id` of the live (innermost) frame
+    /// and its `pc` — i.e. the index of the pending instruction within that
+    /// proto's disassembly (`Result.disasm`). Both 0 when finished/unavailable.
+    /// Appended last so prior JS field offsets stay stable.
+    proto_id: u32 = 0,
+    pc: u32 = 0,
 };
 
 /// Wrap an owned byte slice as a `Buf` (transfers ownership to JS; freed by
@@ -260,6 +276,7 @@ export fn lune_free_result(res: ?*Result) void {
     freeBuf(r.diag);
     freeBuf(r.backtrace);
     freeBuf(r.safepoint_lines);
+    freeBuf(r.disasm);
     gpa.destroy(r);
 }
 
@@ -420,6 +437,8 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
             res.depth = vm.depth;
             const frame = &vm.frames[vm.depth - 1];
             const proto = frame.closure.proto;
+            res.proto_id = proto.id;
+            res.pc = @intCast(frame.pc);
             if (frame.pc < proto.spans.len) {
                 const span = proto.spans[frame.pc];
                 res.current_line = lune.compiler.lineFromOffset(src0, span.start);
@@ -548,6 +567,12 @@ fn run(res: *Result, source: []const u8) !void {
     // run itself already succeeded. The proto is immutable, so re-running it on a
     // fresh VM is sound; `vm` is still alive (its `effect_log` is the input).
     buildReplayIndex(res, chunk.proto, src0, vm.effect_log.items);
+
+    // Disassemble every proto once for the step-replay bytecode view. The proto
+    // tree is static and its ids are stable across compiles (deterministic
+    // `assignProtoIds`), so the disassembly the record run emits here aligns with
+    // the cursor (`proto_id`/`pc`) a replay step reports. Best-effort.
+    buildDisasm(res, chunk.proto, src0);
 }
 
 /// The maximum number of safepoints the replay index records (and the ceiling
@@ -597,6 +622,67 @@ fn encodeU32Array(values: []const u32) ![]u8 {
     errdefer buf.deinit(gpa);
     for (values) |v| try appendU32(&buf, v);
     return buf.toOwnedSlice(gpa);
+}
+
+/// Populate `res.disasm` with a static disassembly of the whole proto tree (the
+/// bytecode the step-replay panel renders). Best-effort — swallows errors (the
+/// bytecode view is simply absent on failure; the run already succeeded).
+fn buildDisasm(res: *Result, root: *const lune.bytecode.Proto, src0: [:0]const u8) void {
+    res.disasm = bufFromSlice(buildDisasmBlob(root, src0) catch return);
+}
+
+/// Encode the proto tree as a self-describing little-endian blob:
+///   u32 proto_count
+///   per proto:
+///     u32 id
+///     u32 name_len, [name_len]u8 name
+///     u16 num_params, u16 num_registers
+///     u32 instr_count
+///     per instruction:
+///       u32 line          1-based source line (0 if no span)
+///       u32 text_len, [text_len]u8 text   (rendered via bytecode.writeInstr)
+/// Protos are emitted in pre-order (root first, then children), matching the id
+/// assignment order — but consumers index by `id`, not position.
+fn buildDisasmBlob(root: *const lune.bytecode.Proto, src0: [:0]const u8) ![]u8 {
+    var protos: std.ArrayList(*const lune.bytecode.Proto) = .empty;
+    defer protos.deinit(gpa);
+    try collectProtos(&protos, root);
+
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+
+    try appendU32(&buf, @intCast(protos.items.len));
+    for (protos.items) |proto| {
+        try appendU32(&buf, proto.id);
+        try appendU32(&buf, @intCast(proto.name.len));
+        try buf.appendSlice(gpa, proto.name);
+        try appendU16(&buf, proto.num_params);
+        try appendU16(&buf, proto.num_registers);
+        try appendU32(&buf, @intCast(proto.code.len));
+        for (proto.code, 0..) |instr, i| {
+            const line: u32 = if (i < proto.spans.len)
+                lune.compiler.lineFromOffset(src0, proto.spans[i].start)
+            else
+                0;
+            try appendU32(&buf, line);
+
+            // Render this one instruction into a scratch buffer (instructions are
+            // short and fixed-width; 128 bytes is comfortably enough).
+            var instr_buf: [128]u8 = undefined;
+            var w = lune.io.Writer.fixed(&instr_buf);
+            try lune.bytecode.writeInstr(&w, instr);
+            const text = w.buffered();
+            try appendU32(&buf, @intCast(text.len));
+            try buf.appendSlice(gpa, text);
+        }
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+/// Pre-order collect a proto and all its nested protos into `out`.
+fn collectProtos(out: *std.ArrayList(*const lune.bytecode.Proto), proto: *const lune.bytecode.Proto) !void {
+    try out.append(gpa, proto);
+    for (proto.protos) |child| try collectProtos(out, child);
 }
 
 /// Parse + compile only (no execution), collecting every diagnostic — errors and
@@ -706,5 +792,11 @@ fn encodeBacktrace(frames: []const lune.interp.FaultFrame) ![]u8 {
 fn appendU32(buf: *std.ArrayList(u8), v: u32) !void {
     var b: [4]u8 = undefined;
     std.mem.writeInt(u32, &b, v, .little);
+    try buf.appendSlice(gpa, &b);
+}
+
+fn appendU16(buf: *std.ArrayList(u8), v: u16) !void {
+    var b: [2]u8 = undefined;
+    std.mem.writeInt(u16, &b, v, .little);
     try buf.appendSlice(gpa, &b);
 }
