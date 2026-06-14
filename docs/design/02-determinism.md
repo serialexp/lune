@@ -109,7 +109,10 @@ that for a time-travel debugger it *is* the architecture.
       inputs, so kind + result fully describe it; effect *args* are a later
       increment. `result` reuses `SnapValue` but is **non-heap** today (clock returns
       an int) — a standalone effect log carries no heap graph, so a heap result has
-      no id to resolve against (`UnsupportedEffectResult`).
+      no id to resolve against (`UnsupportedEffectResult`). F2e's `random_seed` rides
+      the same non-heap path: the `u64` seed is carried as `Value.int(@bitCast(seed))`,
+      so a new effect kind cost **zero** wire/codec change (the kind is a `uint8`
+      ordinal; the result is an int the log already serializes).
 - [x] **Hash seed fixed.** String/table hashing uses Wyhash with a **fixed seed
       0** (`src/string.zig`, `src/table.zig` `ValueContext`), not a per-run random
       seed — so hashing is already reproducible run-to-run. (A trace *header*
@@ -160,13 +163,29 @@ that for a time-travel debugger it *is* the architecture.
       upgrade later adds GC timing that a trace could observe, it must be scheduled
       deterministically and recorded.)
 - [~] **Time / randomness / environment** routed through the effect boundary
-      (no raw access). **Time now is** (F2d): `clock()` reads the host monotonic
-      clock and is the first input routed through the effect boundary — recorded in
-      `record` mode, fed back in `replay`, never reaching a script as raw access.
-      Randomness and environment/args follow the same `EffectKind` pattern when they
-      land (each a new ordinal, each `log`/`seed` per the taxonomy). The format was
-      deliberately deferred until this first genuine input+output pair (vs.
-      output-only `print`) so it was designed against a real effect, not guessed.
+      (no raw access). **Time is** (F2d): `clock()` reads the host monotonic
+      clock and is recorded in `record` mode, fed back in `replay`, never reaching a
+      script as raw access. **Randomness is** (F2e): `random()` returns a float in
+      `[0,1)` drawn from a PRNG that lives *inside* the VM (`Vm.rng`). Unlike the
+      clock — which logs a value *per call* — randomness is **seed-based**: the one
+      nondeterministic input is a single `u64` seed, acquired lazily on the first
+      `random()` call and recorded **once** as `EffectKind.random_seed`=1; the PRNG
+      reproduces the entire draw stream from it on replay, so the effect log holds
+      exactly one entry regardless of how many draws a run makes. This pins
+      **`std.Random.Xoshiro256` seeded by `.init(seed)`, drawn via `float(f64)`** as
+      a spec commitment (the algorithm is referenced by concrete name, not
+      `DefaultPrng`, so a future stdlib swap can't silently change the stream); a
+      given seed yields an identical stream on native and wasm, so the cross-engine
+      differential validator gets randomness for free, and two *fresh* record runs
+      differ (different seeds) — that divergence being exactly the nondeterminism
+      captured, labelled expected just as `clock()`'s is.
+      **Environment/args remain deferred**: `getenv()` returns a *string* (a heap
+      value), and the effect log carries only **non-heap** results today
+      (`UnsupportedEffectResult`) — a standalone log has no heap graph to resolve ids
+      against. Env therefore needs the effect log to carry inline string bytes (a
+      wire-format extension + codec regen) and is its own increment.
+      The format was deliberately deferred until the first genuine input+output pair
+      (vs. output-only `print`) so it was designed against a real effect, not guessed.
 - [~] **Host-mediated suspension hook.** Reserve "a host effect may suspend its
       caller" so generators / await / tasks can be added later without new
       machinery. **The substrate now exists** (F2c): the interpreter runs on an
@@ -241,7 +260,7 @@ accounting that makes "deterministic" true rather than aspirational.
 |---|---|---|
 | Host function calls | log inputs+outputs | the primary boundary |
 | Time / clock | log | **landed (F2d)**: `clock()` host effect, `EffectKind.clock`=0 |
-| Randomness | log or seed | seed stored in trace header |
+| Randomness | seed | **landed (F2e)**: `random()` draws from a VM-owned PRNG; the one recorded effect is the seed, `EffectKind.random_seed`=1 |
 | File / network / stdin | log results | host effect |
 | Environment / args | log at startup | snapshot in header |
 | Hash seed | fix per recording | header |

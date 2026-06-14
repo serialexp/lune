@@ -1,6 +1,6 @@
 # lune — Snapshot & Replay Schema
 
-Status: draft — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d) landed; guard-snapshots outstanding
+Status: draft — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) landed; guard-snapshots outstanding
 Owner: Bart
 Last updated: 2026-06-14
 
@@ -160,6 +160,24 @@ schema follows; this is that schema's home.
       in the log the cut fell). CLI: `--emit-effects <file>` writes the log after a
       run (mirrors `--emit-keyframe`); a user-facing replay driver trails the
       visualiser work.
+- [x] **Seed-based randomness (Phase 7 v2 / F2e) — the second input.** `random()`
+      adds `EffectKind.random_seed`=1 (a new wire ordinal — append-only, the `uint8`
+      `kind` needs no schema/codec change). It is **seed-based**, not per-call: the
+      PRNG (`std.Random.Xoshiro256`) lives inside the VM (`Vm.rng`), and the single
+      recorded effect is a `u64` **seed**, acquired lazily on the first `random()`
+      call and logged **once**, from which the whole draw stream reproduces on
+      replay. So `random()` registers as a *pure* native (`effect = null` — dispatch
+      calls it directly); only the seed crosses the record/replay boundary, *inside*
+      `nativeRandom`. The seed rides the existing **non-heap** result path unchanged:
+      it is carried as `Value.int(@bitCast(seed))` — an int the log already encodes —
+      so a multi-draw program logs exactly one `Effect`. Proven by: an `effectser`
+      round-trip case for the new ordinal; an in-VM record→replay headline (one
+      logged seed reproduces a three-draw stream byte-for-byte while two distinct
+      seeds differ); the `EffectLogExhausted` empty-log failure mode; a
+      `RandomUnavailable` no-source case; and a `[0,1)` range check. Cross-engine:
+      native and wasm share the stdlib PRNG, so a given seed yields the identical
+      stream on both — the differential validator labels a `random()` program's
+      one-effect divergence *expected*, exactly as for `clock()`.
 
 ### Outstanding
 
@@ -244,8 +262,10 @@ debug-recorder bandwidth.
 Discriminated union over record kinds (binschema's core feature):
 
 - `Effect{ kind, result }` — a recorded nondeterministic input (F2d, **landed**:
-  `kind` is a stable `EffectKind` ordinal, `result` a `SnapValue`; effect *inputs*
-  are added when the first effect that takes them lands — `clock()` has none).
+  `kind` is a stable `EffectKind` ordinal — `clock`=0 (F2d), `random_seed`=1 (F2e) —
+  `result` a `SnapValue`; effect *inputs* are added when the first effect that takes
+  them lands — neither `clock()` nor `random()` has any). Note `random_seed` is
+  logged **once per run** (the PRNG seed), not per `random()` call.
 - `Keyframe{ index, vm_state_ref }` — periodic full-ish snapshot for replay.
 - `GuardSnapshot{ trace, exit, ir_to_slot_map, sunk_allocs }` — deopt restore.
 - `SideExit{ trace, exit, target }`, `TraceEvent{ ... }`, `GCEvent{ ... }`,

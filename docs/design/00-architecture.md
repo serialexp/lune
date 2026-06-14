@@ -319,9 +319,18 @@ _(nothing yet — design only)_
       each parent). The native CLI prints a Lua-style `stack traceback:`; the wasm
       `Result` carries a structured backtrace blob that the viz flattens to a
       one-line "`foo:5 → bar:12 → main:3`" traceback under the error (the editor
-      squiggle stays on the leaf). **Still to come:** more effect kinds
-      (randomness, env), a user-facing replay/step CLI, then the visualiser's
-      iteration animation.
+      squiggle stays on the leaf). **F2e (seed-based randomness) landed:** `random()`
+      is the second nondeterministic input (`EffectKind.random_seed`=1), but
+      seed-based rather than per-call — the PRNG (`std.Random.Xoshiro256`, pinned by
+      name as a spec commitment) lives inside the VM, and the *one* recorded effect
+      is a `u64` seed acquired lazily on the first draw, from which the whole stream
+      reproduces on replay. The seed rides the existing non-heap int result path, so
+      a new effect kind cost zero wire/codec change. A given seed yields the same
+      stream on native and wasm, so the differential validator labels a `random()`
+      program's one-effect divergence *expected*, exactly as for `clock()`.
+      **Still to come:** environment/args (needs the effect log to carry inline
+      string results — a wire-format extension), a user-facing replay/step CLI, then
+      the visualiser's iteration animation.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
       first. A performance step — but *not* mechanical: regalloc across side
       exits, GC stackmaps/safepoints, and machine-state snapshot-restore are
