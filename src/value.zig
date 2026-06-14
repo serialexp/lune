@@ -145,8 +145,18 @@ pub const Value = extern struct {
 
     /// `==` semantics. Numbers compare by mathematical value across the
     /// int/float boundary (`1 == 1.0`), exactly (no lossy `f64` conversion).
-    /// Heap objects compare by identity for now; string *value* equality
-    /// arrives with interning in Phase 3, table equality with the table model.
+    /// Heap objects compare by their stable `GcHeader.id`, NOT by address.
+    ///
+    /// Within a single heap these are equivalent: every live object has a unique,
+    /// never-reused id, and string interning means equal *content* is the same
+    /// object (hence the same id). But identity-by-id is the load-bearing
+    /// definition for deterministic replay (docs/design/02): after restoring a
+    /// keyframe, the program image's proto constants still point into the heap
+    /// they were compiled against, while their restored twins live in the new
+    /// heap with a *different address but the same preserved id*. Address equality
+    /// would make a resumed `get_global`/table lookup miss its own restored key;
+    /// id equality resolves it. This also makes `eql` consistent with the
+    /// id-based `table.ValueContext.hash` (an address would leak ASLR anyway).
     pub fn eql(self: Value, other: Value) bool {
         if (self.isNumber() and other.isNumber()) {
             return compareNumeric(self, other) == .eq;
@@ -155,7 +165,7 @@ pub const Value = extern struct {
         return switch (self.tag) {
             .nil => true,
             .boolean => self.asBool() == other.asBool(),
-            .heap_ref => self.payload.ptr == other.payload.ptr,
+            .heap_ref => self.asHeap().id == other.asHeap().id,
             // numbers handled above
             .int, .float => unreachable,
         };

@@ -1,8 +1,8 @@
 # lune — Snapshot & Replay Schema
 
-Status: draft — trace artifact + keyframe capture/restore (F2a+F2b) landed; replay outstanding
+Status: draft — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) landed; effect log outstanding
 Owner: Bart
-Last updated: 2026-06-13
+Last updated: 2026-06-14
 
 Prerequisite for **Phase 5b** (trace serialization format) and **Phase 7** (the
 visualiser). This doc owns the *concrete wire format* — the binschema schema that
@@ -97,11 +97,39 @@ schema follows; this is that schema's home.
       upvalues), and failure-mode tests (`UnresolvedHeapRef` / `UnknownProto` /
       `UnknownNative` / `GlobalsNotATable` / `DuplicateId` / `UnsupportedVersion`).
       A restore-only `Table.restoreEntry` populates the hash part without triggering
-      array migration, preserving the captured array/hash split. **Deferred → later:**
-      mid-execution capture at a GC safepoint (non-empty stack + OPEN upvalues — the
-      restore code already handles these roots, but producing such a snapshot needs
-      the safepoint hook) and snapshot→restore→re-execute equivalence (meaningful
-      only once a live stack is captured).
+      array migration, preserving the captured array/hash split. F2b proved the
+      inverse property only for a **final-state** snapshot (empty stack/frames); the
+      mid-execution case is F2c, below.
+
+- [x] **Mid-execution capture + RESUME (Phase 7 v2 / F2c).** The interpreter's
+      host-stack recursion (`execClosure`→`doCall`→`execClosure`) became an explicit
+      **call-stack array** (`Vm.frames: [N]CallFrame`) driven by one iterative loop
+      (`Vm.exec`), so a frame's whole cursor — executing closure, `pc`, register-window
+      `base`, and return-wiring (`ret_dest`/`ret_count`) — is reified data, not host
+      locals. A loop-top **safepoint** (instruction boundary, never mid-opcode/native)
+      can now park `pc` into the top frame and return `.suspended` (`Vm.suspend_ctl`
+      gates on a free-running `safepoint_seq` and a minimum depth, so a test/debugger
+      can cut mid-loop *or* inside a nested call). The keyframe `FrameRef` carries the
+      cursor (`pc/base/ret_dest/ret_count`); capture emits `frames[0..depth]`, and
+      restore rebuilds them with a **contiguity guard** (`base[i+1] == base[i] +
+      num_registers`, `base[0] == 0`) → `FrameWindowMismatch` on a torn window.
+      **Resume re-executes forward from the restored cut**, and `out_before ++
+      out_after` equals the uninterrupted output `F`, with the resumed final-state
+      snapshot byte-identical to the reference `Sf`. The subtle enabler: a restored
+      VM borrows the original program image (`chunk.proto`), whose string constants
+      live in the *compile-time* heap — a **different heap** than the restored one.
+      That resolves only because heap identity is by stable `GcHeader.id` (not by
+      address): `value.zig` `eql` now compares heap refs by `id`, matching the
+      already-id-based table hash, so a borrowed proto constant and its restored twin
+      (same id, different address) compare equal and a resumed `get_global`/table
+      lookup hits. Before this fix, resume failed with `TypeError` (`print` resolved
+      to `nil`). Verified by a corpus (nested calls + loops + closure/open-upvalue +
+      3-deep stack) replayed at two cuts each, an independent-VM determinism check
+      (same cut ⇒ byte-identical mid keyframes), and the `FrameWindowMismatch` failure
+      mode. The 8-way `expectProgram` matrix stays byte-identical — the recursion→loop
+      refactor is behaviourally invisible. **Still outstanding for replay:** the
+      effect log (F2d) — re-executing *past a nondeterministic input* needs the
+      recorded effect fed back.
 
 ### Outstanding
 
@@ -119,11 +147,13 @@ schema follows; this is that schema's home.
 - [ ] **Effect record format** — inputs + outputs sufficient to replay without
       re-running the effect (shared with `02-determinism.md`).
 - [x] **Keyframe format** — VM-state snapshot for replay restore (shares code
-      with guard snapshots, `01-trace-lifecycle.md`). Both halves are done: capture
-      (F2a `SnapshotFile`) and restore into a live VM (F2b `keyframeser.restore`),
-      proven inverse by a byte-identical re-snapshot. What remains for *replay* is
-      not the keyframe itself but the effect log it interleaves with (below) and a
-      mid-execution capture point (a non-empty stack to re-execute forward from).
+      with guard snapshots, `01-trace-lifecycle.md`). All three halves are done:
+      capture (F2a `SnapshotFile`), restore into a live VM (F2b
+      `keyframeser.restore`), and **mid-execution capture + resume-to-equivalence**
+      (F2c — a non-empty live stack/frames are captured at a safepoint and
+      re-executed forward to the same output and final state). What remains for
+      *replay* is not the keyframe itself but the **effect log** it interleaves with
+      (below), so re-execution past a nondeterministic input is reproducible.
 - [ ] **Recording modes.** Full-replay, bounded ring-buffer window, keyframe-only,
       off. Define defaults and per-mode capture filters (bytecode events / heap
       writes / host calls / allocations / source lines).

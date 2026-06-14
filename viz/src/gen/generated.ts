@@ -2514,7 +2514,7 @@ export class OpenUpvalueRefDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * One active call frame: the id of the closure executing in it.
+ * One active call frame, with the execution cursor needed to RESUME it mid-execution (F2c): the executing closure's id, the resumable program counter, the register-window base on the shared stack, and the return-wiring (where this frame's results land in its parent, and how many the parent wants). Windows stack contiguously: frames[i+1].base == frames[i].base + frames[i].closure.proto.num_registers. The bottom (main) frame leaves ret_dest/ret_count unused.
  */
 export interface FrameRefInput {
   /**
@@ -2522,10 +2522,30 @@ export interface FrameRefInput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   closure_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  pc: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  base: number;
+  /**
+   * 16-bit Unsigned Integer
+   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
+   */
+  ret_dest: number;
+  /**
+   * 16-bit Unsigned Integer
+   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
+   */
+  ret_count: number;
 }
 
 /**
- * One active call frame: the id of the closure executing in it.
+ * One active call frame, with the execution cursor needed to RESUME it mid-execution (F2c): the executing closure's id, the resumable program counter, the register-window base on the shared stack, and the return-wiring (where this frame's results land in its parent, and how many the parent wants). Windows stack contiguously: frames[i+1].base == frames[i].base + frames[i].closure.proto.num_registers. The bottom (main) frame leaves ret_dest/ret_count unused.
  */
 export interface FrameRefOutput {
   /**
@@ -2533,6 +2553,26 @@ export interface FrameRefOutput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   closure_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  pc: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  base: number;
+  /**
+   * 16-bit Unsigned Integer
+   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
+   */
+  ret_dest: number;
+  /**
+   * 16-bit Unsigned Integer
+   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
+   */
+  ret_count: number;
 }
 
 export type FrameRef = FrameRefOutput;
@@ -2549,6 +2589,10 @@ export class FrameRefEncoder extends BitStreamEncoder {
     this.compressionDict.clear();
 
     this.writeUint32(value.closure_id, "little_endian");
+    this.writeUint32(value.pc, "little_endian");
+    this.writeUint32(value.base, "little_endian");
+    this.writeUint16(value.ret_dest, "little_endian");
+    this.writeUint16(value.ret_count, "little_endian");
     return this.finish();
   }
 
@@ -2559,6 +2603,10 @@ export class FrameRefEncoder extends BitStreamEncoder {
   calculateSize(value: FrameRef): number {
     let size = 0;
     size += 4; // closure_id
+    size += 4; // pc
+    size += 4; // base
+    size += 2; // ret_dest
+    size += 2; // ret_count
     return size;
   }
 }
@@ -2573,6 +2621,10 @@ export class FrameRefDecoder extends SeekableBitStreamDecoder {
     const value: any = {};
 
     value.closure_id = this.readUint32("little_endian");
+    value.pc = this.readUint32("little_endian");
+    value.base = this.readUint32("little_endian");
+    value.ret_dest = this.readUint16("little_endian");
+    value.ret_count = this.readUint16("little_endian");
     return value;
   }
 }
@@ -2864,6 +2916,10 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
       let frames__iter: any;
       frames__iter = {};
       frames__iter.closure_id = this.readUint32("little_endian");
+      frames__iter.pc = this.readUint32("little_endian");
+      frames__iter.base = this.readUint32("little_endian");
+      frames__iter.ret_dest = this.readUint16("little_endian");
+      frames__iter.ret_count = this.readUint16("little_endian");
       value.frames.push(frames__iter);
     }
     value.open_upvalues = [];
@@ -3044,6 +3100,10 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
       let keyframe_frames__iter: any;
       keyframe_frames__iter = {};
       keyframe_frames__iter.closure_id = this.readUint32("little_endian");
+      keyframe_frames__iter.pc = this.readUint32("little_endian");
+      keyframe_frames__iter.base = this.readUint32("little_endian");
+      keyframe_frames__iter.ret_dest = this.readUint16("little_endian");
+      keyframe_frames__iter.ret_count = this.readUint16("little_endian");
       value.keyframe.frames.push(keyframe_frames__iter);
     }
     value.keyframe.open_upvalues = [];

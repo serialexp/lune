@@ -805,6 +805,10 @@ pub const OpenUpvalueRef = struct {
 
 pub const FrameRef = struct {
     closure_id: u32,
+    pc: u32,
+    base: u32,
+    ret_dest: u16,
+    ret_count: u16,
 
     pub fn encode(self: FrameRef, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -818,6 +822,10 @@ pub const FrameRef = struct {
     pub fn encodeInto(self: FrameRef, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
         _ = ctx;
         try enc.writeUint32(self.closure_id, .little_endian);
+        try enc.writeUint32(self.pc, .little_endian);
+        try enc.writeUint32(self.base, .little_endian);
+        try enc.writeUint16(self.ret_dest, .little_endian);
+        try enc.writeUint16(self.ret_count, .little_endian);
     }
 
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!FrameRef {
@@ -830,6 +838,10 @@ pub const FrameRef = struct {
         _ = root;
         var result: FrameRef = undefined;
         result.closure_id = try dec.readUint32(.little_endian);
+        result.pc = try dec.readUint32(.little_endian);
+        result.base = try dec.readUint32(.little_endian);
+        result.ret_dest = try dec.readUint16(.little_endian);
+        result.ret_count = try dec.readUint16(.little_endian);
         return result;
     }
 };

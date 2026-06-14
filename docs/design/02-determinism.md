@@ -82,8 +82,18 @@ that for a time-travel debugger it *is* the architecture.
       link-in chokepoint (`src/gc.zig` `link`), and observable rendering
       (`io.writeValue` for `print` of a table/function) shows that id, **never**
       `@intFromPtr`. So no ASLR address leaks into a program's output. This id is
-      also the identity a future keyframe's heap graph keys on
-      (`01-trace-lifecycle.md`, `04-snapshot-replay-schema.md`).
+      also the identity a keyframe's heap graph keys on
+      (`01-trace-lifecycle.md`, `04-snapshot-replay-schema.md`). **Identity by id
+      is now total**, not just for rendering/hashing: `value.zig` `eql` compares
+      two heap refs by `GcHeader.id` rather than address (F2c). Within one heap
+      this is equivalent — interning makes equal content the same object, and ids
+      are unique and never reused — but it is **load-bearing across heaps for
+      replay**: a restored keyframe re-executes against the original program image,
+      whose proto string constants live in the compile-time heap while their
+      restored twins live in the new heap (same preserved id, different address).
+      Address equality would make a resumed `get_global`/table lookup miss its own
+      restored key; id equality resolves it, and it aligns `eql` with the
+      already-id-based `table.ValueContext.hash`.
 - [~] **Table iteration order.** Address-independent and deterministic
       (constrains the table/shape model). **The address dependency is now fixed:**
       `table.ValueContext.hash` hashes a heap key by its stable `GcHeader.id`, not
@@ -117,9 +127,14 @@ that for a time-travel debugger it *is* the architecture.
       effect-record format (above) is deliberately deferred until the first such
       input lands, so it is designed against a genuine input+output pair rather
       than output-only `print`.*
-- [ ] **Host-mediated suspension hook.** Reserve "a host effect may suspend its
+- [~] **Host-mediated suspension hook.** Reserve "a host effect may suspend its
       caller" so generators / await / tasks can be added later without new
-      machinery.
+      machinery. **The substrate now exists** (F2c): the interpreter runs on an
+      explicit `Vm.frames` call-stack with an iterative `exec` loop, so suspension
+      is no longer blocked on host-stack recursion — a safepoint can already park
+      the cursor and return `.suspended` (`Vm.suspend_ctl`). What's reserved-but-not-
+      built is exposing that to a *host effect* (vs. the current test/debugger cut)
+      and the re-entrant resume surface.
 - [~] **Replay verification.** Record-then-replay self-check asserting identical
       observable behaviour. **Landed in its honest current form** (`src/interp.zig`
       "determinism" tests): the VM has no nondeterministic inputs and no keyframes
@@ -137,9 +152,16 @@ that for a time-travel debugger it *is* the architecture.
       identical** to the original (`encodeSnapshot ∘ restore == identity`, asserted
       over the corpus). Because the restorer re-stamps each object's *original* id,
       the restored VM reproduces the exact table iteration order — so the
-      round-trip is a second, independent guard on the id-keyed hashing above. This
-      is the regression spine that generalises to true keyframe+effect replay once a
-      mid-execution capture point and the effect log exist.
+      round-trip is a second, independent guard on the id-keyed hashing above.
+      **Mid-execution capture + resume (F2c) extends the spine off the final
+      state**: the interpreter now runs on an explicit call-stack array, so a
+      safepoint can suspend with a live stack/frames, capture a keyframe, restore
+      it into a fresh VM, and **re-execute forward** — `out_before ++ out_after`
+      equals the uninterrupted output and the resumed final snapshot is byte-equal
+      to the reference. Independent VMs cut at the same safepoint produce
+      byte-identical mid keyframes (the determinism property, mid-flight). What
+      remains for *true* keyframe+effect replay is the **effect log** (the first
+      nondeterministic input), so re-execution past an effect is reproducible.
 
 ## Why this exists
 

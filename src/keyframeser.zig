@@ -43,7 +43,9 @@ pub const schema = @import("gen/trace_schema.zig");
 /// independently of `traceser.format_version` — a keyframe is a distinct record
 /// family that shares the binschema *encoding*, not a fused artifact
 /// (docs/design/04-snapshot-replay-schema.md "two artifacts, one substrate").
-pub const snapshot_format_version: u32 = 1;
+/// v2 (F2c): `FrameRef` gained the per-frame execution cursor (pc/base/
+/// return-wiring) for mid-execution capture + resume. (v1 was final-state only.)
+pub const snapshot_format_version: u32 = 2;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -191,8 +193,18 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     const stack = try a.alloc(schema.SnapValue, vm.stack_top);
     for (vm.stack[0..vm.stack_top], 0..) |v, idx| stack[idx] = toSchemaValue(v);
 
+    // Capture each frame's resumable cursor (pc/base/return-wiring), not just the
+    // closure id — this is what makes a mid-execution snapshot re-executable (F2c).
+    // At final-state capture `vm.depth == 0`, so this is empty and the bytes match
+    // the v1 layout for those programs save the version word.
     const frames = try a.alloc(schema.FrameRef, vm.depth);
-    for (vm.frame_closures[0..vm.depth], 0..) |cl, idx| frames[idx] = .{ .closure_id = cl.header.id };
+    for (vm.frames[0..vm.depth], 0..) |f, idx| frames[idx] = .{
+        .closure_id = f.closure.header.id,
+        .pc = @intCast(f.pc),
+        .base = @intCast(f.base),
+        .ret_dest = f.ret_dest,
+        .ret_count = f.ret_count,
+    };
 
     const open = try a.alloc(schema.OpenUpvalueRef, vm.open_upvalues.items.len);
     for (vm.open_upvalues.items, 0..) |ou, idx| open[idx] = .{
@@ -235,6 +247,7 @@ const RestoreError = error{
     UnknownNative, // a HeapNative.name is not in the native registry
     GlobalsNotATable, // globals_id resolves to a non-table object
     FrameNotAClosure, // a frame's closure_id resolves to a non-closure
+    FrameWindowMismatch, // a frame's base != the running sum of prior register windows
     UpvalueNotAnUpvalue, // a closure/open-upvalue id resolves to a non-upvalue
     StackTooLarge, // the snapshot stack exceeds the VM's register window
     TooManyFrames, // the snapshot frame count exceeds max_call_depth
@@ -423,11 +436,24 @@ pub fn restoreSnapshot(
     for (kf.stack, 0..) |sv, i| vm.stack[i] = try fromSchemaValue(sv, &idmap);
     vm.stack_top = kf.stack.len;
 
-    if (kf.frames.len > vm.frame_closures.len) return error.TooManyFrames;
+    if (kf.frames.len > vm.frames.len) return error.TooManyFrames;
+    var expected_base: usize = 0;
     for (kf.frames, 0..) |fr, i| {
         const fh = idmap.get(fr.closure_id) orelse return error.UnresolvedHeapRef;
         if (fh.type != .function) return error.FrameNotAClosure;
-        vm.frame_closures[i] = function.Closure.fromHeader(fh);
+        const cl = function.Closure.fromHeader(fh);
+        // Frame windows stack contiguously from 0; a base that doesn't match the
+        // running sum of prior frames' register counts is a corrupt/incompatible
+        // snapshot (and would make resume read the wrong registers).
+        if (fr.base != expected_base) return error.FrameWindowMismatch;
+        vm.frames[i] = .{
+            .closure = cl,
+            .base = fr.base,
+            .pc = fr.pc,
+            .ret_dest = fr.ret_dest,
+            .ret_count = fr.ret_count,
+        };
+        expected_base += cl.proto.num_registers;
     }
     vm.depth = @intCast(kf.frames.len);
 
@@ -506,7 +532,10 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
                 .{ .id = 7, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "print" } } },
             },
             .stack = &.{ sRef(2), sInt(-1) },
-            .frames = &.{ .{ .closure_id = 3 }, .{ .closure_id = 6 } },
+            .frames = &.{
+                .{ .closure_id = 3, .pc = 7, .base = 0, .ret_dest = 0, .ret_count = 0 },
+                .{ .closure_id = 6, .pc = 2, .base = 5, .ret_dest = 1, .ret_count = 1 },
+            },
             .open_upvalues = &.{.{ .stack_index = 0, .upvalue_id = 5 }},
         },
     };
@@ -551,6 +580,10 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
     try testing.expectEqual(@as(u32, 2), kf.stack[0].body.HeapRef.id);
     try testing.expectEqual(@as(usize, 2), kf.frames.len);
     try testing.expectEqual(@as(u32, 6), kf.frames[1].closure_id);
+    try testing.expectEqual(@as(u32, 2), kf.frames[1].pc);
+    try testing.expectEqual(@as(u32, 5), kf.frames[1].base);
+    try testing.expectEqual(@as(u16, 1), kf.frames[1].ret_dest);
+    try testing.expectEqual(@as(u16, 1), kf.frames[1].ret_count);
     try testing.expectEqual(@as(usize, 1), kf.open_upvalues.len);
     try testing.expectEqual(@as(u32, 5), kf.open_upvalues[0].upvalue_id);
 }
@@ -851,7 +884,12 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
                 .{ .id = 7, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "print" } } },
             },
             .stack = &.{ sRef(2), sInt(-1) },
-            .frames = &.{ .{ .closure_id = 3 }, .{ .closure_id = 6 } },
+            // Both stub protos have num_registers == 0, so contiguity wants base 0
+            // for both frames (this corpus exercises structural restore, not resume).
+            .frames = &.{
+                .{ .closure_id = 3, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0 },
+                .{ .closure_id = 6, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0 },
+            },
             .open_upvalues = &.{.{ .stack_index = 0, .upvalue_id = 5 }},
         },
     };
@@ -877,12 +915,12 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
     // Frames rebound (depth 2; frame 0 = closure 3, frame 1 = closure 6, which
     // has zero upvalues — exercising both the N- and 0-upvalue closure shapes).
     try testing.expectEqual(@as(u32, 2), vm.depth);
-    try testing.expectEqual(@as(u32, 3), vm.frame_closures[0].header.id);
-    try testing.expectEqual(@as(u32, 6), vm.frame_closures[1].header.id);
-    try testing.expectEqual(@as(usize, 2), vm.frame_closures[0].upvalues.len);
-    try testing.expectEqual(@as(usize, 0), vm.frame_closures[1].upvalues.len);
+    try testing.expectEqual(@as(u32, 3), vm.frames[0].closure.header.id);
+    try testing.expectEqual(@as(u32, 6), vm.frames[1].closure.header.id);
+    try testing.expectEqual(@as(usize, 2), vm.frames[0].closure.upvalues.len);
+    try testing.expectEqual(@as(usize, 0), vm.frames[1].closure.upvalues.len);
     // The two-upvalue closure's closed cell (id 4) holds 99.
-    try testing.expectEqual(@as(i64, 99), vm.frame_closures[0].upvalues[0].get().asInt());
+    try testing.expectEqual(@as(i64, 99), vm.frames[0].closure.upvalues[0].get().asInt());
 
     // Closed upvalue id 4 holds 99; open upvalue id 5 was repointed at stack[0]
     // and therefore reads the table ref now living there.
@@ -971,4 +1009,224 @@ test "restore surfaces specific errors for malformed snapshots" {
         .frames = &.{},
         .open_upvalues = &.{},
     } }, &rootp, error.UnsupportedVersion);
+}
+
+// ---------------------------------------------------------------------------
+// F2c — mid-execution capture + resume
+// ---------------------------------------------------------------------------
+//
+// The F2b headline (`encodeSnapshot ∘ restore == identity`) was only ever proven
+// for a *final-state* snapshot (empty stack/frames). F2c suspends execution at a
+// mid-loop / mid-call safepoint, captures the live stack + frame cursors, restores
+// into a fresh VM, and **re-executes forward** to the same result. The resumed VM
+// borrows the original program image (`chunk.proto`), whose string constants live
+// in the *compile-time* heap — a different heap than the restored one. That works
+// only because heap identity is by stable `GcHeader.id` (value.zig `eql`), not by
+// address: a borrowed proto constant and its restored twin share an id, so a
+// resumed `get_global`/table lookup resolves. (Before the id-based `eql` fix this
+// test failed with `TypeError`: `print` resolved to `nil`.)
+
+const SuspendCtl = interp.SuspendCtl;
+
+/// A reference (uninterrupted) run of `source`: its full output `F`, its
+/// final-state snapshot `Sf`, and the total safepoint count (to place a mid-run
+/// suspend). Owns the two byte buffers.
+const RefRun = struct {
+    full_out: []u8,
+    final_snap: []u8,
+    total_safepoints: u64,
+
+    fn deinit(self: RefRun, gpa: std.mem.Allocator) void {
+        gpa.free(self.full_out);
+        gpa.free(self.final_snap);
+    }
+};
+
+fn referenceRun(gpa: std.mem.Allocator, source: [:0]const u8) !RefRun {
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [512]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    _ = try vm.run(chunk.proto);
+
+    return .{
+        .full_out = try gpa.dupe(u8, sink.buffered()),
+        .final_snap = try encodeSnapshot(gpa, &vm),
+        .total_safepoints = vm.safepoint_seq,
+    };
+}
+
+/// Suspend `source` at `ctl`, snapshot mid-execution, restore into a fresh VM,
+/// resume to completion, and assert full equivalence to `ref`:
+///   (a) the program actually suspended (didn't run straight through);
+///   (b) F2b byte-identity holds mid-execution: `encodeSnapshot(restore(mid)) == mid`;
+///   (c) `out_before ++ out_after == F`  (output equivalence — the headline);
+///   (d) the resumed final-state snapshot `== Sf`  (state equivalence).
+/// Returns the mid snapshot bytes (caller owns) so determinism can be cross-checked.
+fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, ref: RefRun) ![]u8 {
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    // The suspend VM owns the heap the program image's constants are interned
+    // into; it must outlive the restored VM that borrows `chunk.proto`.
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [512]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    vm.suspend_ctl = ctl;
+    try testing.expect((try vm.start(chunk.proto)) == .suspended); // (a)
+    const out_before = try gpa.dupe(u8, sink.buffered());
+    defer gpa.free(out_before);
+
+    const mid = try encodeSnapshot(gpa, &vm);
+    errdefer gpa.free(mid);
+
+    // (b) F2b property holds mid-execution.
+    const vm_r = try restore(gpa, mid, chunk.proto, NativeRegistry.base());
+    defer {
+        vm_r.deinit();
+        gpa.destroy(vm_r);
+    }
+    {
+        const mid2 = try encodeSnapshot(gpa, vm_r);
+        defer gpa.free(mid2);
+        try testing.expectEqualSlices(u8, mid, mid2);
+    }
+
+    // Resume the restored VM to completion.
+    var buf_r: [512]u8 = undefined;
+    var sink_r = io.Writer.fixed(&buf_r);
+    vm_r.out = &sink_r;
+    vm_r.suspend_ctl = null;
+    try testing.expect((try vm_r.exec()) == .finished);
+
+    // (c) output equivalence: out_before ++ out_after == F.
+    var combined: [1024]u8 = undefined;
+    @memcpy(combined[0..out_before.len], out_before);
+    @memcpy(combined[out_before.len..][0..sink_r.buffered().len], sink_r.buffered());
+    try testing.expectEqualStrings(ref.full_out, combined[0 .. out_before.len + sink_r.buffered().len]);
+
+    // (d) state equivalence: the resumed VM's final snapshot matches the
+    // uninterrupted run's. Identical because ids are assigned deterministically
+    // and these corpus programs leak no pre-suspend garbage (no heap object is
+    // created then dropped before the cut), so the restored id counter resumes
+    // exactly where the reference run's did.
+    const final_snap_r = try encodeSnapshot(gpa, vm_r);
+    defer gpa.free(final_snap_r);
+    try testing.expectEqualSlices(u8, ref.final_snap, final_snap_r);
+
+    return mid;
+}
+
+// Corpus: nested calls + loops + closures/upvalues + tables. Each is replayed at
+// two cuts — one anywhere mid-run (depth gate off), one forced *inside a call*.
+const f2c_corpus = [_][:0]const u8{
+    // Loop inside a call, two host calls after it returns.
+    \\local function sum(n)
+    \\  local s = 0
+    \\  for i = 1, n do s = s + i end
+    \\  return s
+    \\end
+    \\print(sum(5))
+    \\print("done")
+    ,
+    // A counter closure: an OPEN upvalue is live on the stack at a mid-call cut.
+    \\local function counter()
+    \\  local n = 0
+    \\  return function() n = n + 1; return n end
+    \\end
+    \\local c = counter()
+    \\print(c()); print(c()); print(c())
+    ,
+    // Three-deep call stack (main → outer → inner) feeding a table.
+    \\local function inner(x) return x * 2 end
+    \\local function outer(a, b) return inner(a) + inner(b) end
+    \\local t = {}
+    \\t.r = outer(3, 4)
+    \\print(t.r)
+    ,
+};
+
+test "F2c: resume from a mid-execution keyframe reproduces output and final state" {
+    const gpa = testing.allocator;
+    for (f2c_corpus) |source| {
+        const ref = try referenceRun(gpa, source);
+        defer ref.deinit(gpa);
+        try testing.expect(ref.total_safepoints > 4);
+
+        // Cut 1: anywhere ~half-way through (depth gate off — often mid-loop / mid-call).
+        gpa.free(try expectResume(gpa, source, .{
+            .min_depth = 1,
+            .after_safepoints = ref.total_safepoints / 2,
+        }, ref));
+
+        // Cut 2: the first safepoint *inside* a nested call (depth >= 2).
+        gpa.free(try expectResume(gpa, source, .{
+            .min_depth = 2,
+            .after_safepoints = 1,
+        }, ref));
+    }
+}
+
+test "F2c: independent VMs suspended at the same cut produce byte-identical keyframes" {
+    const gpa = testing.allocator;
+    for (f2c_corpus) |source| {
+        const ref = try referenceRun(gpa, source);
+        defer ref.deinit(gpa);
+        const ctl: SuspendCtl = .{ .min_depth = 2, .after_safepoints = 1 };
+        const mid_a = try expectResume(gpa, source, ctl, ref);
+        defer gpa.free(mid_a);
+        const mid_b = try expectResume(gpa, source, ctl, ref);
+        defer gpa.free(mid_b);
+        // Two independent runs cut at the same safepoint snapshot identically —
+        // the mid-execution extension of the run-twice determinism property.
+        try testing.expectEqualSlices(u8, mid_a, mid_b);
+    }
+}
+
+test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMismatch)" {
+    // Two single-register closures sharing a proto. A faithful capture tiles the
+    // windows 0,1; a base of 2 for the second frame leaves a one-slot gap → the
+    // restore contiguity guard must reject it rather than read the wrong registers.
+    const code = [_]bytecode.Instr{bytecode.Instr.opAB(.halt, 0, 0)};
+    const consts = [_]value.Value{};
+    const rootp = Proto{
+        .code = &code,
+        .constants = &consts,
+        .num_registers = 1,
+        .name = "f",
+    };
+    const bad: schema.SnapshotFile = .{ .version = snapshot_format_version, .keyframe = .{
+        .globals_id = 9,
+        .objects = &.{
+            .{ .id = 9, .obj_type = 1, .body = .{ .HeapTable = .{ .array = &.{}, .entries = &.{} } } },
+            .{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = rootp.id, .upvalue_ids = &.{} } } },
+            .{ .id = 1, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = rootp.id, .upvalue_ids = &.{} } } },
+        },
+        .stack = &.{ sNil(), sNil(), sNil() },
+        .frames = &.{
+            .{ .closure_id = 0, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0 },
+            .{ .closure_id = 1, .pc = 0, .base = 2, .ret_dest = 0, .ret_count = 0 }, // gap: expected base 1
+        },
+        .open_upvalues = &.{},
+    } };
+    try expectRestoreError(bad, &rootp, error.FrameWindowMismatch);
 }

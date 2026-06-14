@@ -238,10 +238,22 @@ _(nothing yet — design only)_
       open-upvalue reconstruction). Ids are re-stamped to their *originals* via a
       restore-only `gc.Heap` seam, so a restored VM re-serializes **byte-for-byte
       identical** to its snapshot (`encodeSnapshot ∘ restore == identity`) — capture
-      and restore proven exact inverses. **Still to come:** a mid-execution capture
-      point (a non-empty stack to re-execute forward from), the effect-log (waits on
-      the first nondeterministic *input* existing), then the visualiser's iteration
-      animation.
+      and restore proven exact inverses, for a *final-state* snapshot. **F2c
+      (mid-execution capture + resume) landed:** the interpreter's host-stack
+      recursion became an explicit `Vm.frames` call-stack driven by one iterative
+      `exec` loop, so a frame's full cursor (closure, `pc`, window `base`,
+      return-wiring) is reified data and a safepoint can suspend with a live stack.
+      A keyframe captured mid-loop / inside a nested call restores into a fresh VM
+      and **re-executes forward** to the same output (`out_before ++ out_after == F`)
+      and the same byte-identical final snapshot. The enabler: heap identity is now
+      total by stable `GcHeader.id` — `value.zig` `eql` compares heap refs by id, not
+      address — so a restored VM resolves globals/keys against the borrowed program
+      image whose constants live in a *different* heap (same id, different address);
+      address equality silently broke resume (`print` → `nil`). The recursion→loop
+      refactor is behaviourally invisible (the 8-way `expectProgram` matrix stays
+      byte-identical). **Still to come:** the effect-log (F2d — waits on the first
+      nondeterministic *input* existing, a `clock()` host effect), then the
+      visualiser's iteration animation.
 - [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
       first. A performance step — but *not* mechanical: regalloc across side
       exits, GC stackmaps/safepoints, and machine-state snapshot-restore are

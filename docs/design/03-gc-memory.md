@@ -37,8 +37,9 @@ ownership, write barriers, and trace rooting.
       one **safepoint — the top of the dispatch loop** — where every register is
       settled and no half-built object is exposed. Roots: `globals`; live
       registers `stack[0..stack_top]` (a per-frame high-water); the **active-frame
-      closures** (host-stack-only, so tracked in `frame_closures[depth]` — this is
-      what keeps a frame's `proto.constants` alive); and open upvalue cells.
+      closures** (the explicit call stack `frames[0..depth]`, each frame's
+      `.closure` — this is what keeps a frame's `proto.constants` alive); and open
+      upvalue cells.
       Blackening a closure walks `proto.constants` recursively through
       `proto.protos`, so a string constant survives even before its function is
       instantiated. **Interned strings are collectible** (swept → de-interned).

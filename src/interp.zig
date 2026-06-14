@@ -57,11 +57,11 @@ pub const Error = error{
 /// `Value` slots = 1 MiB.
 const stack_slots: usize = 1 << 16;
 
-/// Maximum native-recursion depth for the tier-0 interpreter. `execClosure`
-/// recurses on the host stack per Lua call, so this bounds how deep a Lua
-/// program may recurse before we report `StackOverflow` rather than smashing the
-/// host stack. Tier-0 is the correctness oracle, not the deep-recursion tier;
-/// the JIT tiers use an explicit frame stack with no such limit.
+/// Maximum call depth for the tier-0 interpreter. `exec` runs on an explicit
+/// `Vm.frames` call-stack array of this fixed size (no host-stack recursion per
+/// Lua call), so this bounds how deep a Lua program may recurse before we report
+/// `StackOverflow` — `pushFrame` is the single guard. Tier-0 is the correctness
+/// oracle, not the deep-recursion tier.
 const max_call_depth: u32 = 200;
 
 /// One built-in native: the global name it installs under and its function.
@@ -88,6 +88,43 @@ const FrameResult = struct { reg: u16, count: u16 };
 /// the keyframe restorer (`keyframeser.zig`) can rebuild the open-upvalue list.
 pub const OpenUpvalue = struct { index: usize, cell: *function.Upvalue };
 
+/// One active call frame in the **explicit** VM call stack. Tier-0 no longer
+/// recurses on the host stack; instead `exec` runs an iterative loop over a
+/// `frames[0..depth]` array, each entry carrying everything needed to (a) run the
+/// frame, (b) return its results into its parent, and (c) be **captured and
+/// resumed mid-execution** (the keyframe records `pc`/`base`/return-wiring per
+/// frame). Windows stack contiguously upward: `frames[i+1].base == frames[i].base
+/// + frames[i].closure.proto.num_registers`.
+pub const CallFrame = struct {
+    /// The closure executing in this frame (its proto = code/constants/upvalues).
+    closure: *const Closure,
+    /// Register-window start: this frame's registers are `stack[base .. base+nreg]`.
+    base: usize,
+    /// Resumable cursor: index of the next instruction in `closure.proto.code`.
+    pc: usize = 0,
+    /// Where this frame's results land in its **parent's** window, as a
+    /// caller-relative register (the call instruction's `a`). Unused for the
+    /// bottom frame (no parent — `run` consumes its `FrameResult` directly).
+    ret_dest: u16 = 0,
+    /// How many results the parent wants (the call instruction's `c`). Unused for
+    /// the bottom frame.
+    ret_count: u16 = 0,
+};
+
+/// The outcome of an `exec` run: either the bottom frame returned (carrying the
+/// top-level `FrameResult`), or a mid-execution suspend point was hit (all VM
+/// state left intact and capturable). `suspended` is only ever returned when
+/// `suspend_ctl` is armed (a test / future debugger hook); `run` leaves it null.
+pub const ExecOutcome = union(enum) { finished: FrameResult, suspended };
+
+/// Mid-execution suspend trigger (test / debugger hook; null = never suspend, the
+/// normal `run` path). At each dispatch-loop safepoint, `exec` suspends the first
+/// time both conditions hold: at least `after_safepoints` safepoints have elapsed
+/// **and** the live call depth is `>= min_depth`. The depth gate lets a test
+/// capture *inside a nested call* (`min_depth = 2`) rather than at an arbitrary
+/// point; the safepoint count lets it capture mid-loop in a single frame.
+pub const SuspendCtl = struct { min_depth: u32 = 0, after_safepoints: u64 = 0 };
+
 /// The tier-0 virtual machine. Owns the resources a running program needs that
 /// outlive a single frame: the object heap, the global table, and the shared
 /// register/call stack.
@@ -102,18 +139,21 @@ pub const Vm = struct {
     /// Shared register/call stack. Fixed-size and never reallocated (see
     /// `stack_slots`), so frame windows stay valid across nested calls.
     stack: []Value,
-    /// Current native-recursion depth (guarded by `max_call_depth`).
+    /// Current call depth (number of active frames; guarded by `max_call_depth`).
     depth: u32 = 0,
     /// High-water mark of live register slots across all active frames:
     /// `stack[0 .. stack_top]` is exactly the live window the collector scans.
-    /// Saved and restored per `execClosure`, so it always reflects the deepest
-    /// active frame (frame windows stack contiguously upward).
+    /// Raised atomically with each `pushFrame` and recomputed on every pop, so it
+    /// always reflects the deepest active frame (frame windows stack contiguously
+    /// upward).
     stack_top: usize = 0,
-    /// The closure executing in each active frame, indexed by `depth`. These live
-    /// only on the host call stack — invisible to a heap scan — so the collector
-    /// roots them from here; this is what keeps each frame's prototype constants
-    /// alive. Sized to the recursion bound, so it never allocates.
-    frame_closures: [max_call_depth]*const Closure = undefined,
+    /// The **explicit** call stack: `frames[0..depth]` are the active frames,
+    /// bottom (main) at index 0. Replaces host-stack recursion — `exec` loops over
+    /// this array, so each frame's cursor (`pc`/`base`/return-wiring) is first-class
+    /// state that the collector roots (via `forEachRootHeader`, keeping every
+    /// frame's prototype constants alive) and the keyframe serializer captures for
+    /// mid-execution resume. Sized to the call-depth bound, so it never allocates.
+    frames: [max_call_depth]CallFrame = undefined,
     /// Open upvalues, keyed by absolute stack index. Searched on capture (to
     /// share a cell) and on scope/frame exit (to close cells over dying slots).
     open_upvalues: std.ArrayList(OpenUpvalue) = .empty,
@@ -126,6 +166,13 @@ pub const Vm = struct {
     /// the VM behaves exactly as before Phase 5 until `--trace` flips it on.
     /// Recording is transparent — tier-0 still executes everything.
     trace: trace.TraceState,
+    /// Monotonic count of dispatch-loop safepoints reached (one per instruction
+    /// boundary, before dispatch). Drives the `suspend_ctl` trigger. Free-running;
+    /// GC frequency is independent of it (a collection is invisible).
+    safepoint_seq: u64 = 0,
+    /// Mid-execution suspend trigger, or null (never suspend — the normal path).
+    /// Armed by a test / future debugger to capture a resumable keyframe.
+    suspend_ctl: ?SuspendCtl = null,
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
         var vm = try initBare(gpa);
@@ -192,8 +239,46 @@ pub const Vm = struct {
         // freed at `deinit`; its `proto` pointer is only dereferenced during this
         // call, so a stack-local test `Proto` is fine.
         const top = try self.heap.newClosure(proto, 0);
-        const fr = try self.execClosure(top, 0);
-        return if (fr.count >= 1) self.stack[fr.reg] else Value.nil();
+        try self.pushFrame(top, 0, 0, 0);
+        // `run` never arms `suspend_ctl`, so `exec` always finishes here.
+        switch (try self.exec()) {
+            .finished => |fr| return if (fr.count >= 1) self.stack[fr.reg] else Value.nil(),
+            .suspended => unreachable,
+        }
+    }
+
+    /// Like `run`, but returns the raw `ExecOutcome` so a caller that armed
+    /// `suspend_ctl` can observe a mid-execution `.suspended`. Sets up the main
+    /// chunk's frame exactly as `run` does. Resume after a `.suspended` by
+    /// calling `exec()` again (the cursor is parked in `frames[depth-1]`).
+    pub fn start(self: *Vm, proto: *const Proto) Error!ExecOutcome {
+        if (proto.num_registers > self.stack.len) return Error.StackOverflow;
+        @memset(self.stack[0..proto.num_registers], Value.nil());
+        const top = try self.heap.newClosure(proto, 0);
+        try self.pushFrame(top, 0, 0, 0);
+        return self.exec();
+    }
+
+    /// Push a new activation onto the explicit call stack and make it the top
+    /// frame. The single chokepoint for both the main chunk (`run`) and nested
+    /// `call`s, so the depth/stack bounds and the `stack_top` raise are enforced
+    /// in one place. **Raises `stack_top` to cover the new window atomically with
+    /// the push**, so the very next safepoint scans the callee's registers — the
+    /// caller must therefore have already written any argument values into that
+    /// window (a straight-line, allocation-free stretch) before calling this.
+    pub fn pushFrame(self: *Vm, closure: *const Closure, base: usize, ret_dest: u16, ret_count: u16) Error!void {
+        if (self.depth >= max_call_depth) return Error.StackOverflow;
+        const nreg = closure.proto.num_registers;
+        if (base + nreg > self.stack.len) return Error.StackOverflow;
+        self.frames[self.depth] = .{
+            .closure = closure,
+            .base = base,
+            .pc = 0,
+            .ret_dest = ret_dest,
+            .ret_count = ret_count,
+        };
+        self.depth += 1;
+        self.stack_top = base + nreg;
     }
 
     /// Run one stop-the-world collection. Invoked only at the dispatch-loop
@@ -225,8 +310,8 @@ pub const Vm = struct {
     ///   1. globals — user globals and the installed natives (e.g. `print`),
     ///      plus their interned name keys.
     ///   2. live registers across every active frame.
-    ///   3. the closures executing in each active frame (host-stack-only — keeps
-    ///      their proto constants reachable).
+    ///   3. the closures executing in each active frame (`frames[0..depth]` —
+    ///      keeps their proto constants reachable).
     ///   4. open upvalue cells (live by construction — about to be closed).
     ///   5. trace constants — a cached trace (or the in-progress recording) may
     ///      hold heap values in its const pool (e.g. a string `load_const`). A
@@ -239,7 +324,7 @@ pub const Vm = struct {
     ) void {
         cb(ctx, &self.globals.header);
         for (self.stack[0..self.stack_top]) |v| if (v.isHeap()) cb(ctx, v.asHeap());
-        for (self.frame_closures[0..self.depth]) |cl| cb(ctx, @constCast(&cl.header));
+        for (self.frames[0..self.depth]) |f| cb(ctx, @constCast(&f.closure.header));
         for (self.open_upvalues.items) |ou| cb(ctx, &ou.cell.header);
         for (self.trace.cache.items) |t| {
             for (t.consts) |v| if (v.isHeap()) cb(ctx, v.asHeap());
@@ -249,34 +334,48 @@ pub const Vm = struct {
         }
     }
 
-    /// Run one activation: interpret `closure.proto.code` over the register
-    /// window at `stack[base ..]`. Returns where the frame's results live.
-    fn execClosure(self: *Vm, closure: *const Closure, base: usize) Error!FrameResult {
-        if (self.depth >= max_call_depth) return Error.StackOverflow;
-        // Record this frame's closure as a GC root before recursing (index by the
-        // pre-increment depth), then bump the depth.
-        self.frame_closures[self.depth] = closure;
-        self.depth += 1;
-        defer self.depth -= 1;
+    /// The tier-0 dispatch loop over the **explicit** call stack. Runs the top
+    /// frame (`frames[depth-1]`), pushing a frame on a Lua `call` and popping on
+    /// `ret`/`halt` — no host-stack recursion — so execution can be **suspended at
+    /// a safepoint and resumed**, which is the basis for mid-execution keyframe
+    /// capture. The hot per-frame state (`proto`/`code`/`regs`/`base`/`pc`) is
+    /// cached in locals and reloaded from the top frame after every push/pop.
+    ///
+    /// Returns `.finished` when the bottom (main) frame returns — carrying its
+    /// `FrameResult` for `run` — or `.suspended` when `suspend_ctl` fires at a
+    /// safepoint (all VM state left intact and capturable). `exec` may be called
+    /// again to resume: it simply re-reads the top frame's cursor, so a freshly
+    /// **restored** VM resumes by calling `exec` with no special entry point.
+    pub fn exec(self: *Vm) Error!ExecOutcome {
+        // Hot top-frame state, reloaded from `frames[depth-1]` after every push/pop.
+        var frame: *CallFrame = &self.frames[self.depth - 1];
+        var closure = frame.closure;
+        var proto = closure.proto;
+        var code = proto.code;
+        var base = frame.base;
+        var regs = self.stack[base .. base + proto.num_registers];
+        var pc = frame.pc;
 
-        const proto = closure.proto;
-        const code = proto.code;
-        const regs = self.stack[base .. base + proto.num_registers];
-
-        // Extend the live-register high-water to cover this frame's window for the
-        // duration of the frame; restore it on return so a sibling call that
-        // reuses these slots is scanned with the correct bound.
-        const prev_top = self.stack_top;
-        self.stack_top = base + proto.num_registers;
-        defer self.stack_top = prev_top;
-
-        var pc: usize = 0;
         while (true) {
             // GC safepoint. Here every live value is reachable from a root (all
             // registers are settled, no half-built object is exposed), so a
             // stop-the-world collection is safe. Non-moving, so surviving
             // pointers in `regs` stay valid.
             if (self.heap.shouldCollect()) self.collect();
+
+            // Mid-execution suspend point — an instruction boundary, never
+            // mid-opcode or mid-native. Sync `pc` into the top frame first so the
+            // captured cursor resumes exactly here. `safepoint_seq` is free-running
+            // (extra safepoints from the explicit-stack pop are harmless: a
+            // collection is invisible, and the counter only drives this test hook).
+            self.safepoint_seq += 1;
+            if (self.suspend_ctl) |sc| {
+                if (self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth) {
+                    frame.pc = pc;
+                    return .suspended;
+                }
+            }
+
             const cur_pc = pc;
             const instr = code[pc];
             pc += 1;
@@ -393,19 +492,108 @@ pub const Vm = struct {
                     self.heap.writeBarrier(&closure.upvalues[instr.b].header, regs[a]); // no-op until generational
                 },
                 .close_upvalues => self.closeUpvaluesFrom(base + a),
-                .call => try self.doCall(base, proto.num_registers, regs, instr),
 
-                // ---- returns ----
-                // Results stay in this frame's window; the caller copies them out
-                // before this window is reused. `b` values from R[a..a+b]. Close
-                // any upvalues still open over this frame's slots first.
-                .ret => {
-                    self.closeUpvaluesFrom(base);
-                    return .{ .reg = @intCast(a), .count = instr.b };
+                // ---- calls ---- a Lua call pushes a frame and reloads onto it; a
+                // native runs inline (no frame) as the current frame's top activity.
+                .call => {
+                    const callee = regs[a];
+                    if (!callee.isHeap()) return Error.TypeError;
+                    switch (callee.heapType()) {
+                        .function => {
+                            const cl = Closure.fromHeader(callee.asHeap());
+                            const cp = cl.proto;
+                            const callee_base = base + proto.num_registers;
+                            const nargs: usize = instr.b;
+                            if (self.depth >= max_call_depth) return Error.StackOverflow;
+                            if (callee_base + cp.num_registers > self.stack.len) return Error.StackOverflow;
+                            // Lay out the callee window: bind fixed params (nil-fill
+                            // any not supplied), nil the rest. Straight-line and
+                            // allocation-free — these slots sit above the current
+                            // `stack_top` until `pushFrame` raises it, so no safepoint
+                            // may intervene here (none does).
+                            var i: usize = 0;
+                            while (i < cp.num_registers) : (i += 1) {
+                                self.stack[callee_base + i] = if (i < cp.num_params and i < nargs)
+                                    self.stack[base + a + 1 + i]
+                                else
+                                    Value.nil();
+                            }
+                            // Freeze the caller's resume cursor (already one past this
+                            // call), push the callee, and reload locals onto it.
+                            frame.pc = pc;
+                            try self.pushFrame(cl, callee_base, instr.a, instr.c);
+                            frame = &self.frames[self.depth - 1];
+                            closure = frame.closure;
+                            proto = closure.proto;
+                            code = proto.code;
+                            base = frame.base;
+                            regs = self.stack[base .. base + proto.num_registers];
+                            pc = frame.pc;
+                            continue;
+                        },
+                        .native => {
+                            const nat = function.Native.fromHeader(callee.asHeap());
+                            const nargs: usize = instr.b;
+                            const nwanted: usize = instr.c;
+                            const args = self.stack[base + a + 1 .. base + a + 1 + nargs];
+                            const result = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
+                            // Natives return a single value (multi-return is later).
+                            var k: usize = 0;
+                            while (k < nwanted) : (k += 1) {
+                                regs[a + k] = if (k == 0) result else Value.nil();
+                            }
+                        },
+                        else => return Error.TypeError,
+                    }
                 },
-                .halt => {
+
+                // ---- returns ---- pop this frame; copy results into the parent's
+                // window (or, for the bottom frame, hand the `FrameResult` to
+                // `run`/`exec`'s caller). Close any upvalues over this frame first.
+                .ret, .halt => {
                     self.closeUpvaluesFrom(base);
-                    return .{ .reg = 0, .count = 0 };
+                    const result: FrameResult = if (instr.op == .ret)
+                        .{ .reg = @intCast(a), .count = instr.b }
+                    else
+                        .{ .reg = 0, .count = 0 };
+                    if (self.depth == 1) {
+                        self.depth = 0;
+                        return .{ .finished = result };
+                    }
+                    // Copy results into the parent *while* `stack_top` still covers
+                    // this (callee) window — no allocation or safepoint between here
+                    // and the `stack_top` shrink below, so a result can't be
+                    // collected before it lands in the parent's (scanned) registers.
+                    // `want` uses the stored return-wiring, never a re-decode of the
+                    // caller's call instruction. (`all_results` is dead today — the
+                    // compiler emits c∈{0,1} — but clamp it so a stray sentinel
+                    // can't smash the stack; see docs/design note in the plan.)
+                    const parent = &self.frames[self.depth - 2];
+                    const want: usize = if (frame.ret_count == bytecode.all_results)
+                        result.count
+                    else
+                        frame.ret_count;
+                    const dst = parent.base + frame.ret_dest;
+                    const src = base + result.reg;
+                    var k: usize = 0;
+                    while (k < want) : (k += 1) {
+                        self.stack[dst + k] = if (k < result.count)
+                            self.stack[src + k]
+                        else
+                            Value.nil();
+                    }
+                    // Pop and reload locals onto the parent (its `pc` is already past
+                    // the call), shrinking `stack_top` to the parent's window.
+                    self.depth -= 1;
+                    frame = &self.frames[self.depth - 1];
+                    closure = frame.closure;
+                    proto = closure.proto;
+                    code = proto.code;
+                    base = frame.base;
+                    regs = self.stack[base .. base + proto.num_registers];
+                    pc = frame.pc;
+                    self.stack_top = base + proto.num_registers;
+                    continue;
                 },
             }
 
@@ -515,62 +703,6 @@ pub const Vm = struct {
         }
     }
 
-    /// Execute a `call` instruction. `regs`/`base` describe the *caller* frame;
-    /// the callee's window is carved immediately above it on the shared stack.
-    ///
-    /// Convention: `R[a]` is the callee, args are `R[a+1 .. a+1+b]`, and `c`
-    /// results are written back starting at `R[a]` (nil-filled if the callee
-    /// produced fewer).
-    fn doCall(self: *Vm, base: usize, caller_nreg: u16, regs: []Value, instr: Instr) Error!void {
-        const a: usize = instr.a;
-        const callee = regs[a];
-        const nargs: usize = instr.b;
-        const nwanted: usize = instr.c;
-        if (!callee.isHeap()) return Error.TypeError;
-        switch (callee.heapType()) {
-            .function => {
-                const cl = Closure.fromHeader(callee.asHeap());
-                const cp = cl.proto;
-                const callee_base = base + caller_nreg;
-                if (callee_base + cp.num_registers > self.stack.len) return Error.StackOverflow;
-                // Lay out the callee window: bind fixed params (nil-filling any
-                // not supplied), then nil the remaining registers. Extra args
-                // beyond the fixed params are dropped (vararg is Phase 3d2).
-                var i: usize = 0;
-                while (i < cp.num_registers) : (i += 1) {
-                    self.stack[callee_base + i] = if (i < cp.num_params and i < nargs)
-                        self.stack[base + a + 1 + i]
-                    else
-                        Value.nil();
-                }
-                const fr = try self.execClosure(cl, callee_base);
-                // Copy results back into the caller's window (no overlap: the
-                // callee window is strictly above the caller window). The callee's
-                // `stack_top` is already restored, so its result slots are now
-                // *above* the scanned region — but this copy is straight-line with
-                // no intervening safepoint, so no collection can free a result
-                // before it lands in the caller's (scanned) registers.
-                var k: usize = 0;
-                while (k < nwanted) : (k += 1) {
-                    regs[a + k] = if (k < fr.count)
-                        self.stack[callee_base + fr.reg + k]
-                    else
-                        Value.nil();
-                }
-            },
-            .native => {
-                const nat = function.Native.fromHeader(callee.asHeap());
-                const args = self.stack[base + a + 1 .. base + a + 1 + nargs];
-                const result = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
-                // Natives return a single value (multi-return is Phase 3d2+).
-                var k: usize = 0;
-                while (k < nwanted) : (k += 1) {
-                    regs[a + k] = if (k == 0) result else Value.nil();
-                }
-            },
-            else => return Error.TypeError,
-        }
-    }
 };
 
 /// Narrow a native's `anyerror` back into the interpreter's error set. Known
