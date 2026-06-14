@@ -39,6 +39,30 @@ const runtimeErrorField = StateField.define<DecorationSet>({
   provide: (f) => EditorView.decorations.from(f),
 });
 
+// Step-replay current-line highlight — its own channel, independent of the
+// compile linter and the runtime-error squiggle (all three can be live at once).
+// A line decoration shades the whole line the replay is paused on.
+const setReplayLine = StateEffect.define<number | null>();
+
+const replayLineField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(deco, tr) {
+    for (const e of tr.effects) {
+      if (e.is(setReplayLine)) {
+        if (e.value === null) return Decoration.none;
+        const lineNo = e.value;
+        if (lineNo < 1 || lineNo > tr.state.doc.lines) return Decoration.none;
+        const from = tr.state.doc.line(lineNo).from;
+        return Decoration.set([
+          Decoration.line({ class: "cm-replay-line" }).range(from),
+        ]);
+      }
+    }
+    return deco;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
+
 /** Editor chrome theme matching the dark viz palette. Token colors live in the
  *  HighlightStyle (luneHighlighting); this is gutter/cursor/selection only. */
 const luneTheme = EditorView.theme(
@@ -77,6 +101,7 @@ export default function LuneEditor() {
           luneHighlighting,
           luneLinter(checkSource),
           runtimeErrorField,
+          replayLineField,
           lintGutter(),
           luneTheme,
           EditorView.updateListener.of((u) => {
@@ -119,6 +144,17 @@ export default function LuneEditor() {
     const from = at(span.start);
     const to = Math.max(from, at(span.end));
     view.dispatch({ effects: setRuntimeError.of({ from, to, message }) });
+  });
+
+  // Mirror the step-replay current line into the editor. Only highlights while
+  // replay is open and paused on a suspended (not finished) step; cleared
+  // otherwise. `currentLine` is already 1-based, the unit CodeMirror lines use.
+  createEffect(() => {
+    if (!view) return;
+    const active = state.replayActive;
+    const rs = state.replayState;
+    const line = active && rs && !rs.finished && rs.currentLine > 0 ? rs.currentLine : null;
+    view.dispatch({ effects: setReplayLine.of(line) });
   });
 
   onCleanup(() => view?.destroy());

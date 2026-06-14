@@ -1,8 +1,9 @@
 import { For, Show, onMount } from "solid-js";
-import { state, loadBytes, loadFromUrl, runWasm, runBoth } from "./store";
+import { state, loadBytes, loadFromUrl, runWasm, runBoth, canReplay, openReplay } from "./store";
 import LuneEditor from "./editor/LuneEditor";
 import TraceList from "./components/TraceList";
 import TraceView from "./components/TraceView";
+import ReplayPanel from "./components/ReplayPanel";
 
 /** Read a picked/dropped File into the store. */
 async function ingest(file: File) {
@@ -70,9 +71,21 @@ export default function App() {
             >
               Run both + diff
             </button>
+            <button
+              type="button"
+              class="secondary"
+              disabled={state.running || !canReplay()}
+              title="Step through the last run's execution: scrub the timeline and watch VM state evolve (deterministic replay)"
+              onClick={openReplay}
+            >
+              Replay
+            </button>
           </div>
         </div>
         <LuneEditor />
+        <Show when={state.replayActive}>
+          <ReplayPanel />
+        </Show>
         <Show when={state.stdout !== null || state.runError !== null}>
           <div class="run-output">
             <Show when={state.timing}>
