@@ -28,6 +28,7 @@ const value = @import("value.zig");
 const io = @import("io.zig");
 const tropt = @import("tropt.zig");
 const execlog = @import("execlog.zig");
+const nativegen = @import("nativegen.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -146,9 +147,15 @@ pub const Trace = struct {
     entry_slots: []u16,
     /// Loop-carried register writebacks at the back-edge (the exit snapshot).
     exit_stores: []SlotStore,
+    /// Tier-1b native-codegen cache (Phase 8): lazily compiled machine code for
+    /// this trace, or a terminal `unsupported` verdict. `unattempted` until the
+    /// first native dispatch (`TraceState.nativeFor`). Runtime-only — not part of
+    /// the serialized trace; the page is freed in `destroy`.
+    native: nativegen.NativeState = .unattempted,
 
     /// Free a heap-allocated trace and its arrays.
     pub fn destroy(self: *Trace, gpa: std.mem.Allocator) void {
+        self.native.deinit();
         gpa.free(self.instrs);
         gpa.free(self.consts);
         gpa.free(self.entry_slots);
@@ -223,6 +230,12 @@ pub const TraceConfig = struct {
     /// Exec-log entry cap: stop recording new entries (exit ramps) for a trace beyond
     /// this many. Bounds total volume for an oft-entered trace.
     exec_log_max_entries: u32 = 64,
+    /// Tier-1b: compile a hot trace to native x86-64 machine code (`nativegen.zig`)
+    /// and run that instead of the tier-1a IR-interpreter. Off by default; the CLI
+    /// `--jit-native` flips it on. x86-64/Linux only — elsewhere (incl. wasm) the
+    /// compiler bails and the trace silently stays on tier-1a. Mutually exclusive
+    /// with `record_exec_log` (the viz instrumentation observes the interpreter).
+    native_codegen: bool = false,
 };
 
 /// All recorder state owned by a `Vm`: the hotness counters, the cache of
@@ -349,6 +362,26 @@ pub const TraceState = struct {
         gop.value_ptr.* +|= 1;
         if (gop.value_ptr.* >= self.config.max_penalty) {
             self.blacklist.put(self.gpa, key, {}) catch {};
+        }
+    }
+
+    /// Resolve (and memoize) the tier-1b native compilation of `t`. Returns a
+    /// runnable `CompiledTrace` to take the native path, or `null` to fall back to
+    /// the tier-1a IR-interpreter. The first call compiles lazily; the verdict
+    /// (`.compiled` page / `.unsupported`) is cached on the trace and never
+    /// recomputed. Off-target builds (e.g. wasm) always memoize `.unsupported`.
+    pub fn nativeFor(self: *TraceState, t: *Trace) ?*const nativegen.CompiledTrace {
+        switch (t.native) {
+            .compiled => return &t.native.compiled,
+            .unsupported => return null,
+            .unattempted => {
+                if (nativegen.compile(self.gpa, t)) |ct| {
+                    t.native = .{ .compiled = ct };
+                    return &t.native.compiled;
+                }
+                t.native = .unsupported;
+                return null;
+            },
         }
     }
 

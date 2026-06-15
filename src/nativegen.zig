@@ -123,6 +123,29 @@ pub const CompiledTrace = struct {
     }
 };
 
+/// Per-trace memoized native-codegen status (a tri-state, so "not yet attempted"
+/// never aliases "known unsupported"). Lives on the cached `Trace`; lazily resolved
+/// on the first native dispatch and then terminal — a `.compiled` page runs forever,
+/// an `.unsupported` trace stays on tier-1a forever. Runtime-only (not serialized).
+pub const NativeState = union(enum) {
+    /// Native compilation has not been attempted yet.
+    unattempted,
+    /// The trace is outside the proven-int/bool subset (or this is an off-target
+    /// build): it runs on the tier-1a IR-interpreter. Never retried.
+    unsupported,
+    /// Successfully lowered to an executable page.
+    compiled: CompiledTrace,
+
+    /// Free any owned executable page and reset to `unattempted`.
+    pub fn deinit(self: *NativeState) void {
+        switch (self.*) {
+            .compiled => |*c| c.deinit(),
+            .unattempted, .unsupported => {},
+        }
+        self.* = .unattempted;
+    }
+};
+
 /// Try to compile `t` to native code. Returns `null` to **bail** — for any reason:
 /// an off-target build, a value/op outside the proven-int/bool subset, malformed
 /// IR, or an assembly/mapping failure. A `null` is never fatal: the caller falls

@@ -905,6 +905,15 @@ pub const Vm = struct {
                                     const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(t, regs, buf);
                                     break :blk irinterp.executeTraced(rec, t, regs, buf);
                                 }
+                            else if (self.trace.config.native_codegen)
+                                // Tier-1b: run compiled machine code if this trace is
+                                // in the proven-int/bool subset; otherwise fall back to
+                                // tier-1a. Mutually exclusive with the exec-log path
+                                // above (the viz instrumentation observes the executor).
+                                blk: {
+                                    if (self.trace.nativeFor(t)) |ct| break :blk ct.run(regs);
+                                    break :blk irinterp.execute(t, regs, buf);
+                                }
                             else
                                 irinterp.execute(t, regs, buf);
                             self.trace.onSideExit(t, completed);
@@ -1564,7 +1573,9 @@ test "concat joins strings and coerces numbers; result is interned" {
 ///  * `record_only`         — Phase-5a: record hot loops but tier-0 executes all.
 ///  * `record_execute_noopt`— Phase-6a: run cached *unoptimized* traces.
 ///  * `record_execute`      — Phase-6b: run cached traces through the optimizer.
-const TraceMode = enum { off, record_only, record_execute_noopt, record_execute };
+///  * `record_execute_native`— Phase-8: run cached traces as native machine code
+///    where they fall in the proven-int/bool subset (silent tier-1a fallback else).
+const TraceMode = enum { off, record_only, record_execute_noopt, record_execute, record_execute_native };
 
 /// Run `source` to completion, capturing everything `print` emits into `sink`.
 /// With `stress`, the collector runs at *every* safepoint — the GC torture test.
@@ -1587,8 +1598,9 @@ fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, s
     vm.out = sink;
     vm.heap.gc_stress = stress;
     vm.trace.config.enabled = mode != .off;
-    vm.trace.config.execute = mode == .record_execute or mode == .record_execute_noopt;
-    vm.trace.config.optimize = mode == .record_execute;
+    vm.trace.config.execute = mode == .record_execute or mode == .record_execute_noopt or mode == .record_execute_native;
+    vm.trace.config.optimize = mode == .record_execute or mode == .record_execute_native;
+    vm.trace.config.native_codegen = mode == .record_execute_native;
     vm.trace.config.hotloop = 4; // record short test loops
 
     var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
@@ -1608,7 +1620,7 @@ fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, s
 ///    mapping, a bad guard, a deopt mistake, or an exit-store error all diverge here.
 fn expectProgram(source: [:0]const u8, expected: []const u8) !void {
     inline for (.{ false, true }) |stress| {
-        inline for (.{ .off, .record_only, .record_execute_noopt, .record_execute }) |mode| {
+        inline for (.{ .off, .record_only, .record_execute_noopt, .record_execute, .record_execute_native }) |mode| {
             var buf: [256]u8 = undefined;
             var sink = io.Writer.fixed(&buf);
             try runCaptured(testing.allocator, source, &sink, stress, mode);
@@ -2935,6 +2947,119 @@ test "executor: a hot numeric-for sum runs via the IR-interpreter (back-edges co
     // inside the IR-interpreter, so the anchor's counter never climbed toward 100.
     const t = vm.trace.cache.items[0];
     try testing.expectEqual(vm.trace.config.hotloop, vm.trace.backEdgeCount(t.anchor));
+}
+
+// ---------------------------------------------------------------------------
+// Tier-1b (native codegen) integration — the compiled trace must be *invisible*:
+// identical output to tier-0 / tier-1a, plus the same deopt behaviour. The broad
+// `expectProgram` matrix already exercises `.record_execute_native` across every
+// program test (silent tier-1a fallback where a trace leaves the int/bool subset);
+// these focused tests assert the decisive internal signal — that a supported loop
+// was *actually lowered to machine code* (`.compiled`), and an unsupported one is
+// terminally `.unsupported`.
+// ---------------------------------------------------------------------------
+
+/// `runExecForTrace` with native codegen on: a hot trace in the proven-int/bool
+/// subset runs as machine code; anything else silently falls back to tier-1a.
+fn runNativeForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer) !compiler.Chunk {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    vm.out = sink;
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    errdefer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    return chunk;
+}
+
+test "native: a hot integer for-loop is lowered to machine code and matches tier-0" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runNativeForTrace(&vm, gpa,
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + i end
+        \\print(acc)
+    , &sink);
+    defer chunk.deinit();
+
+    // Same result tier-0 produces — and the decisive signal that it ran natively.
+    try testing.expectEqualStrings("5050\n", sink.buffered());
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expect(vm.trace.cache.items[0].native == .compiled);
+}
+
+test "native: a float loop is terminally unsupported and falls back to tier-1a" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const source =
+        \\local acc = 0.0
+        \\for i = 1, 100 do acc = acc + 1.5 end
+        \\print(acc)
+    ;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var nbuf: [64]u8 = undefined;
+    var nsink = io.Writer.fixed(&nbuf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &nsink);
+    defer chunk.deinit();
+
+    // A trace was recorded, but the float add put it outside the int/bool subset:
+    // the native compiler bailed and memoized `.unsupported` (tier-1a runs it).
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expect(vm.trace.cache.items[0].native == .unsupported);
+
+    // Output is still byte-identical to a plain tier-0 run.
+    var obuf: [64]u8 = undefined;
+    var osink = io.Writer.fixed(&obuf);
+    try runCaptured(gpa, source, &osink, false, .off);
+    try testing.expectEqualStrings(osink.buffered(), nsink.buffered());
+}
+
+test "native: a compiled int loop that flips to float mid-run deopts and matches tier-0" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // Recorded all-int (the `i == 50` branch isn't taken when it goes hot), so it
+    // compiles to native code. At runtime the branch *is* taken: the native trace's
+    // `guard_false` on `i == 50` fires, side-exits, and tier-0 turns `acc` into a
+    // float — every later re-entry then fails `guard_int` on `acc`. The result must
+    // still match tier-0 to the last decimal, proving native deopt is sound.
+    const source =
+        \\local acc = 0
+        \\for i = 1, 100 do
+        \\  if i == 50 then acc = acc + 0.5 end
+        \\  acc = acc + i
+        \\end
+        \\print(acc)
+    ;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var nbuf: [64]u8 = undefined;
+    var nsink = io.Writer.fixed(&nbuf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &nsink);
+    defer chunk.deinit();
+
+    // The pre-flip trace did compile to machine code...
+    try testing.expect(vm.trace.cache.items[0].native == .compiled);
+    // ...and the native run's output equals a plain tier-0 run, deopt and all.
+    var obuf: [64]u8 = undefined;
+    var osink = io.Writer.fixed(&obuf);
+    try runCaptured(gpa, source, &osink, false, .off);
+    try testing.expectEqualStrings(osink.buffered(), nsink.buffered());
 }
 
 test "executor: integer //-by-zero inside a hot loop side-exits; tier-0 re-raises identically" {
