@@ -264,11 +264,6 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     return true;
 }
 
-/// Stack-slot displacement for SSA ref `r`: each ref owns one 8-byte frame slot.
-fn spill(r: usize) i32 {
-    return @intCast(r * 8);
-}
-
 // ---------------------------------------------------------------------------
 // cut-2: register allocation + single-snapshot deopt — the analysis half
 //
@@ -570,21 +565,24 @@ const Place = union(enum) {
     }
 };
 
-/// The home of a carried/invariant slot: its assigned register, or — when spilled —
-/// the slot_load ref's own frame slot (which nothing else uses).
-fn slotHomePlace(s: SlotInfo) Place {
-    return switch (s.home) {
+/// Map an allocation `Loc` to a `Place`: a register stays a register; a spill slot
+/// becomes a frame displacement `[rsp + idx*8]`.
+fn locToPlace(l: Loc) Place {
+    return switch (l) {
         .reg => |r| .{ .reg = r },
-        .spill => .{ .mem = s.load_ref * 8 },
+        .spill => |idx| .{ .mem = @as(i32, @intCast(idx)) * 8 },
     };
 }
 
-/// Where ref `r`'s value lives: a slot_load resolves to its slot home; everything else
-/// is a transient at `[rsp + r*8]` (commit B).
+/// The home of a carried/invariant slot: its assigned register or spill slot.
+fn slotHomePlace(s: SlotInfo) Place {
+    return locToPlace(s.home);
+}
+
+/// Where ref `r`'s value lives — its linear-scan-assigned register or frame slot.
+/// A `slot_load` ref resolves to its slot home (its `loc` was set to that home).
 fn placeOfRef(alloc: *const Alloc, r: usize) Place {
-    const sid = alloc.slot_id_of_ref[r];
-    if (sid >= 0) return slotHomePlace(alloc.slots[@intCast(sid)]);
-    return .{ .mem = @as(i32, @intCast(r)) * 8 };
+    return locToPlace(alloc.loc[r]);
 }
 
 fn placeToReg(a: *x64.Assembler, dst: Reg, src: Place) !void {
@@ -692,19 +690,24 @@ fn emitTeardown(a: *x64.Assembler, frame: i32, callee: []const Reg) !void {
 /// iterations (loaded + type-guarded once in the prologue); `regs[]` is written only on
 /// a side-exit (the single snapshot) or for write-only slots at the back-edge.
 fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler) !void {
-    const n = t.instrs.len;
-    const frame: i32 = @intCast(std.mem.alignForward(usize, n * 8, 16));
-
-    // Callee-saved registers used as homes — preserve across the call.
+    // Callee-saved registers we clobber — as a home OR as a transient — must be
+    // preserved across the call. `used_callee_saved` already ORs both; iterate a fixed
+    // order so push/pop pair up. (Homing only the slot homes here was a latent bug: a
+    // linear-scan transient landing in rbp/r12–r15 was clobbered unsaved → SEGV on
+    // return once the host actually relied on that register.)
     var callee: [ALLOC_ORDER.len]Reg = undefined;
     var callee_len: usize = 0;
-    for (alloc.slots) |s| {
-        if (s.class == .write_only) continue;
-        if (s.home == .reg and (regBit(s.home.reg) & CALLEE_SAVED_MASK) != 0) {
-            callee[callee_len] = s.home.reg;
+    for (ALLOC_ORDER) |r| {
+        if ((regBit(r) & CALLEE_SAVED_MASK) != 0 and (alloc.used_callee_saved & regBit(r)) != 0) {
+            callee[callee_len] = r;
             callee_len += 1;
         }
     }
+
+    // Frame = compacted spill area (homes + transients that missed a register), padded so
+    // the total below-entry delta (rbx + callee pushes + frame) stays 16-byte aligned [RV-6].
+    const pushes = 1 + callee_len; // rbx + callee-saved homes
+    const frame: i32 = @intCast(std.mem.alignForward(usize, pushes * 8 + alloc.spill_count * 8, 16) - pushes * 8);
 
     // Prologue: save rbx + callee-saved homes, completed = 0, reserve the frame.
     try a.push(.rbx);
@@ -743,7 +746,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             .konst => {
                 const bits = t.consts[@intCast(ins.aux)].payload.bits;
                 try a.movRegImm64(.rax, @bitCast(bits));
-                try a.movMemReg(.rsp, spill(i), .rax);
+                try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
             .add, .sub, .mul, .band, .bor, .bxor => {
                 try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
@@ -757,12 +760,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     .bxor => try a.xorRegReg(.rax, .rcx),
                     else => unreachable,
                 }
-                try a.movMemReg(.rsp, spill(i), .rax);
+                try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
             .neg, .bnot => {
                 try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
                 if (ins.op == .neg) try a.negReg(.rax) else try a.notReg(.rax);
-                try a.movMemReg(.rsp, spill(i), .rax);
+                try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
             .eq, .ne, .lt, .le => {
                 try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
@@ -777,12 +780,15 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 };
                 try a.setcc(cc, .rax);
                 try a.movzxRegReg8(.rax, .rax); // zero-extend the 0/1 (setcc is 8-bit)
-                try a.movMemReg(.rsp, spill(i), .rax);
+                try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
             .guard_true => switch (kinds[ins.a]) {
                 .int => {}, // every int is truthy → guard always passes (no-op)
                 .bool => {
-                    try a.cmpQwordMemImm8(.rsp, spill(ins.a), 0);
+                    switch (placeOfRef(alloc, ins.a)) {
+                        .reg => |r| try a.cmpRegImm32(r, 0),
+                        .mem => |d| try a.cmpQwordMemImm8(.rsp, d, 0),
+                    }
                     try a.jcc(.e, deopt_exit); // false (0) → side-exit
                 },
                 .none => unreachable,
@@ -790,7 +796,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             .guard_false => switch (kinds[ins.a]) {
                 .int => try a.jmp(deopt_exit), // an int is never falsy → always side-exit
                 .bool => {
-                    try a.cmpQwordMemImm8(.rsp, spill(ins.a), 0);
+                    switch (placeOfRef(alloc, ins.a)) {
+                        .reg => |r| try a.cmpRegImm32(r, 0),
+                        .mem => |d| try a.cmpQwordMemImm8(.rsp, d, 0),
+                    }
                     try a.jcc(.ne, deopt_exit); // true (≠0) → side-exit
                 },
                 .none => unreachable,
