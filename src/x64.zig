@@ -254,6 +254,72 @@ pub const Assembler = struct {
         try self.modrmReg(dst.lo(), src.lo());
     }
 
+    // ---- integer ALU (reg, mem) / (mem, reg) ------------------------------------
+
+    /// `op dst, [base + disp]` — the **load form** `op r64, r/m64`: reg = dst,
+    /// rm = mem → dst = dst op [mem]. `opcode` is the load-direction opcode (add 03,
+    /// sub 2B, and 23, or 0B, xor 33, cmp 3B — the reg-reg opcode | 0x02).
+    fn aluRegMem(self: *Assembler, opcode: u8, dst: Reg, base: Reg, disp: i32) !void {
+        try self.rex(true, dst.hi(), false, base.hi());
+        try self.b(opcode);
+        try self.modrmMem(dst.lo(), base, disp);
+    }
+
+    pub fn addRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.aluRegMem(0x03, dst, base, disp);
+    }
+    pub fn subRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.aluRegMem(0x2B, dst, base, disp);
+    }
+    pub fn andRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.aluRegMem(0x23, dst, base, disp);
+    }
+    pub fn orRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.aluRegMem(0x0B, dst, base, disp);
+    }
+    pub fn xorRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.aluRegMem(0x33, dst, base, disp);
+    }
+    /// `cmp dst, [base + disp]` — 3B /r: flags from `dst - [mem]` (operands kept).
+    pub fn cmpRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.aluRegMem(0x3B, dst, base, disp);
+    }
+
+    /// `imul dst, [base + disp]` — REX.W 0F AF /r with rm = mem → dst *= [mem]. imul
+    /// has only this load form (no `imul [mem], reg`).
+    pub fn imulRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.rex(true, dst.hi(), false, base.hi());
+        try self.b(0x0F);
+        try self.b(0xAF);
+        try self.modrmMem(dst.lo(), base, disp);
+    }
+
+    /// `op [base + disp], src` — the **store form** `op r/m64, r64`: reg = src,
+    /// rm = mem → [mem] = [mem] op src. `opcode` is the same reg-reg opcode
+    /// `aluRegReg` uses (add 01, sub 29, and 21, or 09, xor 31). Used for an
+    /// in-place update of a *spilled* home. (No imul store form exists.)
+    fn aluMemReg(self: *Assembler, opcode: u8, base: Reg, disp: i32, src: Reg) !void {
+        try self.rex(true, src.hi(), false, base.hi());
+        try self.b(opcode);
+        try self.modrmMem(src.lo(), base, disp);
+    }
+
+    pub fn addMemReg(self: *Assembler, base: Reg, disp: i32, src: Reg) !void {
+        try self.aluMemReg(0x01, base, disp, src);
+    }
+    pub fn subMemReg(self: *Assembler, base: Reg, disp: i32, src: Reg) !void {
+        try self.aluMemReg(0x29, base, disp, src);
+    }
+    pub fn andMemReg(self: *Assembler, base: Reg, disp: i32, src: Reg) !void {
+        try self.aluMemReg(0x21, base, disp, src);
+    }
+    pub fn orMemReg(self: *Assembler, base: Reg, disp: i32, src: Reg) !void {
+        try self.aluMemReg(0x09, base, disp, src);
+    }
+    pub fn xorMemReg(self: *Assembler, base: Reg, disp: i32, src: Reg) !void {
+        try self.aluMemReg(0x31, base, disp, src);
+    }
+
     /// `neg reg` — REX.W F7 /3 (0 -% reg, wrapping; matches arith.neg).
     pub fn negReg(self: *Assembler, reg: Reg) !void {
         try self.rex(true, false, false, reg.hi());
@@ -522,6 +588,96 @@ test "enc: imul / neg / not / inc" {
     try expectEnc(&.{ 0x48, 0xFF, 0xC3 }, struct { // inc rbx
         fn f(a: *Assembler) !void {
             try a.incReg(.rbx);
+        }
+    }.f);
+}
+
+test "enc: ALU reg, [mem] (load form)" {
+    try expectEnc(&.{ 0x48, 0x03, 0x47, 0x08 }, struct { // add rax, [rdi+8]
+        fn f(a: *Assembler) !void {
+            try a.addRegMem(.rax, .rdi, 8);
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0x2B, 0x0A }, struct { // sub rcx, [rdx]
+        fn f(a: *Assembler) !void {
+            try a.subRegMem(.rcx, .rdx, 0);
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0x23, 0x47, 0x08 }, struct { // and rax, [rdi+8]
+        fn f(a: *Assembler) !void {
+            try a.andRegMem(.rax, .rdi, 8);
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0x0B, 0x47, 0x08 }, struct { // or rax, [rdi+8]
+        fn f(a: *Assembler) !void {
+            try a.orRegMem(.rax, .rdi, 8);
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0x33, 0x47, 0x08 }, struct { // xor rax, [rdi+8]
+        fn f(a: *Assembler) !void {
+            try a.xorRegMem(.rax, .rdi, 8);
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0x3B, 0x47, 0x08 }, struct { // cmp rax, [rdi+8]
+        fn f(a: *Assembler) !void {
+            try a.cmpRegMem(.rax, .rdi, 8);
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0x0F, 0xAF, 0x07 }, struct { // imul rax, [rdi]
+        fn f(a: *Assembler) !void {
+            try a.imulRegMem(.rax, .rdi, 0);
+        }
+    }.f);
+    // r8–r15: REX.R (dst r8) + REX.B (base r9).
+    try expectEnc(&.{ 0x4D, 0x03, 0x41, 0x10 }, struct { // add r8, [r9+16]
+        fn f(a: *Assembler) !void {
+            try a.addRegMem(.r8, .r9, 16);
+        }
+    }.f);
+    // rsp base → SIB byte.
+    try expectEnc(&.{ 0x48, 0x03, 0x44, 0x24, 0x10 }, struct { // add rax, [rsp+16]
+        fn f(a: *Assembler) !void {
+            try a.addRegMem(.rax, .rsp, 16);
+        }
+    }.f);
+    // rbp base, disp 0 → forced disp8.
+    try expectEnc(&.{ 0x48, 0x03, 0x45, 0x00 }, struct { // add rax, [rbp]
+        fn f(a: *Assembler) !void {
+            try a.addRegMem(.rax, .rbp, 0);
+        }
+    }.f);
+}
+
+test "enc: ALU [mem], reg (store form)" {
+    try expectEnc(&.{ 0x48, 0x01, 0x4F, 0x08 }, struct { // add [rdi+8], rcx
+        fn f(a: *Assembler) !void {
+            try a.addMemReg(.rdi, 8, .rcx);
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0x29, 0x44, 0x24, 0x10 }, struct { // sub [rsp+16], rax
+        fn f(a: *Assembler) !void {
+            try a.subMemReg(.rsp, 16, .rax);
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0x21, 0x4F, 0x08 }, struct { // and [rdi+8], rcx
+        fn f(a: *Assembler) !void {
+            try a.andMemReg(.rdi, 8, .rcx);
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0x09, 0x4F, 0x08 }, struct { // or [rdi+8], rcx
+        fn f(a: *Assembler) !void {
+            try a.orMemReg(.rdi, 8, .rcx);
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0x31, 0x4F, 0x08 }, struct { // xor [rdi+8], rcx
+        fn f(a: *Assembler) !void {
+            try a.xorMemReg(.rdi, 8, .rcx);
+        }
+    }.f);
+    // r8–r15 store: REX.R (src r10) + REX.B (base r11).
+    try expectEnc(&.{ 0x4D, 0x01, 0x53, 0x18 }, struct { // add [r11+24], r10
+        fn f(a: *Assembler) !void {
+            try a.addMemReg(.r11, 24, .r10);
         }
     }.f);
 }
