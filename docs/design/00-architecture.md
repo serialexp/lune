@@ -398,13 +398,16 @@ _(nothing yet — design only)_
       the back-edge shuffle elides. Win-1 took the `acc=acc+i` loop to ~46× over tier-1a
       (**~1.10× off LuaJIT**, cut 1's stack-slot codegen was ~4×); win-2 is sound but
       inert on the counted loop (its loop-exit guard is recorded last, so the predicate
-      declines — see 05). See **05-native-codegen.md**. **Deferred (later cuts):**
-      float/xmm + tag dispatch; `div`/`mod`/`pow`/shifts; relaxing `guard_int` onto
-      proven-int *derived* values (we only prove a `slot_load`, so loops with a guarded
-      intermediate — e.g. `(i+7)*(i+7)` — conservatively fall back); sinking accumulator
-      updates below the loop-exit guard (unlocks win-2 on counted loops); GC
-      stackmaps/safepoints; per-exit side traces. Those are native-only; the
-      IR-interpreter is the oracle for IR *semantics*, not for them.
+      declines — see 05). **Coverage #1** then relaxed `guard_int` onto proven-`Int`
+      *derived* values (an `Int`-op-of-`Int`s is closed over `Int`, so the guard is
+      statically redundant → lowers to nothing): loops with a guarded intermediate —
+      e.g. `(i+7)*(i+7)` and the two-accumulator loop — now compile (they land ~2.5×
+      off LuaJIT; the richer shapes still have headroom the single-accumulator loop
+      hid). See **05-native-codegen.md**. **Deferred (later cuts):** float/xmm + tag
+      dispatch; `div`/`mod`/`pow`/shifts; sinking accumulator updates below the
+      loop-exit guard (unlocks win-2 on counted loops); GC stackmaps/safepoints;
+      per-exit side traces. Those are native-only; the IR-interpreter is the oracle
+      for IR *semantics*, not for them.
 - [ ] **Phase 9 — Language surface.** Hidden-class **shapes + freezing** (basic
       tables already exist from Phase 3), optional type annotations, stdlib.
       Table-access guards must be designed shape-ready back in Phase 5.

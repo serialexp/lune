@@ -10,8 +10,11 @@ prologue, and writes `regs[]` only on a side-exit; cut 3 reads ALU operands stra
 from their homes (load-form `op r,[mem]`), coalesces a result onto a dying operand's
 register, and — behind a single-snapshot safety predicate — updates a carried slot's
 home **in place** so the back-edge shuffle elides. This put `acc=acc+i` at ~1.10× off
-LuaJIT. Float/heap/mixed traces, deferred ops, derived-value guards, accumulator
-sinking, and per-exit side traces are later cuts (see §Out of scope).
+LuaJIT. Coverage #1 then relaxed `guard_int` onto proven-`Int` *derived* values
+(`Int`-op-of-`Int`s), landing op-chain and multi-accumulator loops on the native
+path (~2.5× off LuaJIT — the richer shapes still have headroom). Float/heap/mixed
+traces, deferred ops, accumulator sinking, and per-exit side traces are later cuts
+(see §Out of scope).
 Owner: Bart
 Last updated: 2026-06-15
 
@@ -61,9 +64,13 @@ Linear SSA means every operand's kind is known before its use. Two passes:
     `guard_true` — so a slot can only ever be proven `Int`). Unguarded → **bail**.
   - `add sub mul band bor bxor neg bnot` → `Int` iff all operands are `Int`.
   - `eq ne lt le` → `Bool`; operands must both be `Int`.
-  - `guard_int a` → requires `a` is a `slot_load` (cut 1); lowers to a tag re-check
-    on `regs[slot]` + side-exit. `guard_float` / `guard_number` → **always bail**
-    (a float passes `guard_number`, so neither proves `Int`).
+  - `guard_int a` → passes iff `a` is already proven `Int`. If `a` is a `slot_load`
+    it marks that load *guarded* (Pass A) and lowers to one hoisted tag re-check on
+    `regs[slot]`. If `a` is a **derived** value (an `Int`-typed ALU result) the guard
+    is statically redundant — `Int`-op-of-`Int`s is closed over `Int` — and lowers to
+    **nothing** (the #1 relaxation; before, a derived guard bailed the whole trace).
+    A `guard_int` on a `Bool` → **bail**. `guard_float` / `guard_number` → **always
+    bail** (a float passes `guard_number`, so neither proves `Int`).
   - `guard_true a` / `guard_false a` → operand kind decides the lowering (below).
   - `loop` → terminal; each `exit_store{slot, ref}` is boxed by `ref`'s proven kind.
 
@@ -323,12 +330,22 @@ predicate (no side-exit may follow an in-place home update — see §Cut 3) decl
 Win 2 fires for traces whose accumulation follows the last guard; making it fire on
 the counted loop needs an update-sinking schedule pass (see §Out of scope).
 
-Loops that leave the proven subset show ≈ 1.0× — they fall back to tier-1a
-transparently. The classic example is `(i+7)*(i+7)`: the recorder emits a
-`guard_int` on the *derived* `i+7` value, and we only prove a `guard_int` on a
-`slot_load`, so the whole trace bails (this is `proveKinds`, unchanged by cut 2).
-Relaxing that (a `guard_int` on a statically-proven-`Int` derived value is a no-op)
-is the highest-value coverage increment.
+**Coverage #1 (derived `guard_int`) — landed.** Loops with `guard_int`s on derived
+values used to fall back to tier-1a; now they compile. This more than doubled the
+benches reaching native and gave us *multi-op* shapes to measure (4M iters, best of
+5, `Vm.run` only; LuaJIT via `os.clock`):
+
+| program | tier-1b native | LuaJIT | off LuaJIT |
+|---------|----------------|--------|-----------|
+| `acc = acc + i` (1 accumulator) | 2.32 ms | ~2.07 ms | ~1.10× |
+| `acc = acc + (i+7)*(i+7)` (op chain) | 5.40 ms | ~2.19 ms | ~2.5× |
+| `a += (i-1)²; b += (i-1)` (2 accumulators) | 5.86 ms | ~2.20 ms | ~2.7× |
+
+The richer shapes sit ~2.5× off LuaJIT, versus ~1.10× on the single-accumulator
+loop — the single loop was overfit-favorable. Closing that gap is future work
+(win-2 update-sinking, better operand scheduling/spill avoidance on longer chains).
+Loops still outside the proven int/bool subset (floats, heap) fall back to tier-1a
+transparently (≈ 1.0×).
 
 ---
 
@@ -337,8 +354,10 @@ is the highest-value coverage increment.
 - **Float / mixed / heap traces** — xmm registers, tag dispatch, libm `call`-outs.
 - **Deferred ops** — `div`/`idiv`/`mod`/`pow` (floored-div/mod correction),
   `shl`/`shr` (Lua masked shift counts), `not` (logical, not bitwise).
-- **Relax `guard_int` onto proven-`Int` derived values** (lower to a no-op) — lifts
-  the `(i+7)*(i+7)`-style fallback; the single biggest coverage win.
+- ~~**Relax `guard_int` onto proven-`Int` derived values**~~ — **done (#1):** a
+  `guard_int` on a statically-`Int` derived value (an `Int`-op-of-`Int`s) lowers to
+  nothing; `proveKinds` validates it against the computed kind instead of bailing.
+  Landed `(i+7)*(i+7)` and the two-accumulator loop on the native path.
 - ~~**Linear-scan register allocation**~~ — **done (cut 2):** carried/invariant slots
   are register-homed across iterations, `regs[]` written only on a side-exit.
 - ~~**Two-operand in-place arithmetic**~~ — **done (cut 3):** win 1 (operands read in

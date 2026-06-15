@@ -189,9 +189,13 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     @memset(kinds, .none);
     @memset(slot_of, -1);
 
-    // Pass A: record each slot_load's register slot, and the set of refs a
-    // `guard_int` covers. A guard_int must target a slot_load (its lowering reads
-    // the tag straight from `regs[slot]`); anything else bails.
+    // Pass A: record each slot_load's register slot, and which slot_loads a
+    // `guard_int` covers. A guard on a *slot_load* is the type check we hoist to a
+    // single tag-check in the prologue (lowering reads the tag straight from
+    // `regs[slot]`), so mark it. A guard on a *derived* value (e.g. an `add`/`mul`
+    // result) is not hoisted: it is validated in Pass B against the value's
+    // already-proven kind and lowered to nothing — a derived int (int-op-of-ints)
+    // can never fail the guard. So we no longer bail on a non-slot_load operand.
     const guarded = gpa.alloc(bool, n) catch return false;
     defer gpa.free(guarded);
     @memset(guarded, false);
@@ -205,8 +209,7 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .guard_int => {
                 const r = ins.a;
                 if (r >= i) return false; // not linear SSA → malformed
-                if (t.instrs[r].op != .slot_load) return false; // unsupported guard shape
-                guarded[r] = true;
+                if (t.instrs[r].op == .slot_load) guarded[r] = true;
             },
             else => {},
         }
@@ -239,7 +242,14 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (kinds[ins.a] != .int or kinds[ins.b] != .int) return false;
                 kinds[i] = .bool;
             },
-            .guard_int => kinds[i] = .none, // operand validated in pass A
+            .guard_int => {
+                // Passes trivially iff the operand is already proven int — a guarded
+                // slot_load (set .int above) or a derived int (int-op-of-ints). Then
+                // it is redundant and lowers to nothing. A guard on a .bool (e.g. a
+                // compare result) or any unproven value can't be discharged → bail.
+                if (kinds[ins.a] != .int) return false;
+                kinds[i] = .none;
+            },
             .guard_true, .guard_false => {
                 const k = kinds[ins.a];
                 if (k != .int and k != .bool) return false;
@@ -971,7 +981,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
 
     for (t.instrs, 0..) |ins, i| {
         switch (ins.op) {
-            .slot_load, .guard_int => {}, // hoisted to the prologue (loop-invariant)
+            // slot_load: hoisted to the prologue (loop-invariant). guard_int: either
+            // hoisted (slot_load operand → one prologue tag-check) or a proven-int
+            // derived guard that's statically redundant — both emit nothing here.
+            .slot_load, .guard_int => {},
             .konst => {
                 const bits = t.consts[@intCast(ins.aux)].payload.bits;
                 switch (placeOfRef(alloc, i)) {
@@ -1251,6 +1264,41 @@ test "nativegen: guard_false on an integer side-exits immediately" {
     try expectMatch(&t, &.{Value.int(5)}); // completed==0, regs unchanged
 }
 
+test "nativegen: derived guard_int on int arithmetic compiles and matches (#1)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // acc = acc + (i+7)*(i+7); i += 1; while i < limit — the `CSE-able body` shape.
+    // The recorder guards the *derived* (i+7) and (i+7)*(i+7); both are statically
+    // int (int-op-of-ints), so the guards must lower to nothing and the trace must
+    // compile. regs: r0=i, r1=limit, r2=acc.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2: slot_load guard (hoisted)
+        .{ .op = .guard_int, .a = 1 }, // 3: slot_load guard (hoisted)
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4: i < limit
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: acc
+        .{ .op = .guard_int, .a = 6 }, // 7: slot_load guard (hoisted)
+        .{ .op = .konst, .aux = 0 }, // 8: 7
+        .{ .op = .add, .a = 0, .b = 8 }, // 9: i + 7   (derived)
+        .{ .op = .guard_int, .a = 9 }, // 10: DERIVED guard on the add → no-op
+        .{ .op = .mul, .a = 9, .b = 9 }, // 11: (i+7)*(i+7)   (derived)
+        .{ .op = .guard_int, .a = 11 }, // 12: DERIVED guard on the mul → no-op
+        .{ .op = .add, .a = 6, .b = 11 }, // 13: acc + (i+7)^2
+        .{ .op = .konst, .aux = 1 }, // 14: 1
+        .{ .op = .add, .a = 0, .b = 14 }, // 15: i + 1
+        .{ .op = .loop }, // 16
+    };
+    var consts = [_]Value{ Value.int(7), Value.int(1) };
+    var exits = [_]S{ .{ .slot = 2, .ref = 13 }, .{ .slot = 0, .ref = 15 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    // i=1,2,3 commit: acc = 8^2+9^2+10^2 = 245; exits at i==4.
+    try expectMatch(&t, &.{ Value.int(1), Value.int(4), Value.int(0) });
+    // 0 commits (i already == limit): regs unchanged.
+    try expectMatch(&t, &.{ Value.int(10), Value.int(10), Value.int(99) });
+}
+
 test "nativegen: bails on unsupported traces" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     var es = [_]u16{};
@@ -1304,6 +1352,22 @@ test "nativegen: bails on unsupported traces" {
             .{ .op = .loop },
         };
         var consts = [_]Value{Value.int(2)};
+        var exits = [_]S{.{ .slot = 0, .ref = 0 }};
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+        try expectBail(&t);
+    }
+    // (e) [#1] a guard_int on a *bool* (a compare result) is not discharge-able →
+    // must still bail (only proven-int operands are accepted by the relaxed guard).
+    {
+        var instrs = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: i
+            .{ .op = .guard_int, .a = 0 }, // 1
+            .{ .op = .konst, .aux = 0 }, // 2: 5
+            .{ .op = .lt, .a = 0, .b = 2 }, // 3: i < 5  → bool
+            .{ .op = .guard_int, .a = 3 }, // 4: guard_int on a bool → bail
+            .{ .op = .loop }, // 5
+        };
+        var consts = [_]Value{Value.int(5)};
         var exits = [_]S{.{ .slot = 0, .ref = 0 }};
         const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
         try expectBail(&t);
