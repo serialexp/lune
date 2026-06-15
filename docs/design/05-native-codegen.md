@@ -1,9 +1,13 @@
 # lune — Native Codegen (tier 1b)
 
-Status: Phase 8 cut 1 implemented — a hand-rolled x86-64 encoder + a
-prove-typed-or-bail integer/boolean trace compiler, wired behind `--jit-native`.
-Float/heap/mixed traces, deferred ops, derived-value guards, register allocation
-across side exits, and per-exit side traces are later cuts (see §Out of scope).
+Status: Phase 8 **cut 2** implemented — a hand-rolled x86-64 encoder + a
+prove-typed-or-bail integer/boolean trace compiler with **register allocation +
+single-snapshot deopt**, wired behind `--jit-native`. Cut 1 was a stack-slot
+allocator (every SSA ref round-tripped through the frame); cut 2 keeps loop-carried
+and loop-invariant slots in CPU **registers** across iterations, hoists the
+per-iteration type guards/loads to a once-only prologue, and writes `regs[]` only on
+a side-exit. Float/heap/mixed traces, deferred ops, derived-value guards, two-operand
+in-place arithmetic, and per-exit side traces are later cuts (see §Out of scope).
 Owner: Bart
 Last updated: 2026-06-15
 
@@ -106,55 +110,92 @@ Signature: `fn(regs: [*]Value) callconv(.c) usize` — mirrors
 + a stack frame instead). Register roles:
 
 - `rdi` = `regs` base, held for the whole body.
-- `rbx` = `completed` (callee-saved; pushed in the prologue, popped in the epilogue
-  — kept out of the scratch pool so arithmetic can't clobber the counter, and it
-  survives once we add `call`-outs for `pow`/`div`).
-- `rax`/`rcx` = transient scratch.
-- Each SSA ref gets an 8-byte **stack spill slot** `[rsp + ref*8]` (cut 1 is a
-  stack-slot allocator: load operands → scratch → compute → store back; obviously
-  correct, trivially matches SSA, already far faster than the interpreter).
+- `rbx` = `completed` (kept out of the scratch pool so arithmetic can't clobber the
+  counter, and it survives once we add `call`-outs for `pow`/`div`).
+- `rax`/`rcx` = reserved scratch (operand staging + the parallel-move cycle temp).
+- 11 allocatable GPRs (`rdx rsi r8 r9 r10 r11 rbp r12 r13 r14 r15`), caller-saved
+  preferred; any callee-saved one we actually use (`rbp`,`r12`–`r15`) is push/pop'd
+  in the prologue/epilogue — **whether it's a slot home *or* a transient**.
 
-Lowering sketch (one trace = one function):
+### Cut 2: slot classification + homes (`analyze` in `nativegen.zig`)
 
-- **Prologue:** `push rbx; xor rbx,rbx; sub rsp, frame` (frame 16-aligned).
-- **`slot_load slot`:** `mov rax, [rdi + slot*16 + 8]` (payload) → spill.
-- **`guard_int` on `slot_load(slot)`:** `cmp byte [rdi + slot*16], 2` (`Tag.int`)
-  `; jne EXIT`.
-- **`konst`:** `mov rax, imm64` (the const's payload bits, read at compile time) →
-  spill.
-- **arith / bitwise / `neg` / `bnot`:** load operand spills → scratch → native op
-  (`add`/`sub`/`imul`/`and`/`or`/`xor`/`neg`/`not`) → spill. Wrapping `i64`
-  `add/sub/mul` map directly to `add`/`sub`/`imul` (`0F AF /r` is exact low-64
-  two's-complement wrap).
-- **compare (`eq ne lt le`):** `cmp` operands; `setcc al`; **`movzx rax, al`**
-  (setcc writes only the low byte — the zero-extend is load-bearing); → spill.
-- **`guard_true a`:** if `a` is `Bool`, `cmp qword [spill_a], 0; je EXIT`; if `Int`,
-  **no-op** (every int is truthy). **`guard_false a`:** if `Bool`,
-  `cmp qword [spill_a], 0; jne EXIT`; if `Int`, **unconditional `jmp EXIT`** (an int
-  is never falsy). This is Lua truthiness, in machine code.
-- **`loop`:** for each `exit_store{slot, ref}`, box by `ref`'s proven kind —
-  `mov qword [rdi+slot*16], TAG` (`2` for `Int`, `1` for `Bool`; the qword store
-  zeroes the 7 padding bytes harmlessly) then `mov rax,[spill_ref]; mov
-  [rdi+slot*16+8], rax`. Then `inc rbx; jmp LOOP_TOP`.
-- **EXIT** (a *single* shared epilogue — every guard jumps here):
-  `mov rax, rbx; add rsp, frame; pop rbx; ret`.
+Allocation is a forward two-phase pass (analysis fills `Loc`s; lowering consumes
+them), separated because our IR is already linear (unlike LuaJIT's backwards
+emission). Each tier-0 slot the trace touches is classified — total and disjoint:
 
-### Why the single-exit deopt is sound
+- **carried** = `slot_load`ed **and** in `exit_stores` (read+write, loop-carried;
+  always `Int`). Gets a **home** (a register, or a frame slot when the 11-reg pool is
+  exhausted), loaded once in the prologue, reassigned only at the back-edge.
+- **invariant** = `slot_load`ed, not in `exit_stores` (read-only `Int`). Homed once;
+  never written back (untouched ⇒ stays coherent).
+- **write-only** = in `exit_stores`, not `slot_load`ed (e.g. `flag = i<limit`). Keeps
+  cut-1 behaviour: committed to `regs[]` at the back-edge, never touched at a deopt.
 
-`exit_stores` are written to `regs` **only at each `loop` commit** — mirroring
-`irinterp.zig` exactly (`trace.commit` records every register the trace *defined*,
-no more, no fewer). So at the *start* of every iteration `regs` is already a
-coherent tier-0 loop-header state. A mid-iteration guard fail returns `completed`
-with the last commit intact, and tier-0 re-runs the **pure, side-effect-free**
-partial iteration from `anchor.pc`. No per-guard snapshot is needed — exactly the
-tier-1a deopt model, now in machine code. A committed trace contains no side
-effects (host calls / tables / globals all abort recording), so re-execution never
-doubles an effect.
+**Type-stability rejection:** a carried slot whose `store_ref`'s proven kind differs
+from its load kind (loaded `Int`, stored `Bool`, or vice-versa) **bails the whole
+trace** — otherwise native would loop forever where the oracle deopts on the next
+iteration's `guard_int`.
 
-A subtle but important consequence: even when an unboxed int *use* precedes its
-`guard_int` in the instruction stream, any divergent intermediate value is
-discarded at the side-exit (nothing is committed), so the observable result
-(`regs` + `completed`) stays identical to the interpreter.
+Transients (ALU/compare/konst results) get registers via a forward **linear scan**
+(expire by last-use, spill to a compacted frame slot when the pool empties). Homes
+are pinned out of the pool for the whole body, so no transient ever aliases a home.
+
+### Loop-invariant hoisting
+
+The proven trace is pure-`Int` and never re-reads memory inside the loop, so **every
+`slot_load` and every `guard_int` is loop-invariant** → hoisted to the prologue (run
+once, not per iteration). `guard_true`/`guard_false` target *derived* comparison
+results that change each iteration, so they **stay in the body**.
+
+### Lowering sketch (one trace = one function)
+
+- **Prologue:** `push rbx`; push each callee-saved home/transient reg; `xor rbx,rbx`;
+  `sub rsp, frame` (frame = compacted spill slots, 16-aligned accounting for push
+  parity). Then **all** hoisted `guard_int`s first — `cmp byte [rdi+slot*16], 2; jne
+  PROLOGUE_FAIL` (no home live yet if one fails) — **then** all hoisted loads `mov
+  home, [rdi+slot*16+8]`.
+- **body `slot_load` / `guard_int`:** nothing — a `slot_load` ref *is* its home; the
+  guard already fired in the prologue.
+- **`konst`:** `mov rax, imm64` → its `Loc` (reg or spill).
+- **arith / bitwise / `neg` / `bnot`:** operands → `rax`/`rcx` → native op
+  (`add`/`sub`/`imul`/`and`/`or`/`xor`/`neg`/`not`) → result `Loc`. Wrapping `i64`
+  maps directly (`0F AF /r` is exact low-64 two's-complement wrap).
+- **compare (`eq ne lt le`):** `cmp`; `setcc al`; **`movzx rax, al`** (the
+  zero-extend is load-bearing) → result `Loc`.
+- **`guard_true a`/`guard_false a`:** `Int` operand → no-op / unconditional `jmp
+  DEOPT_EXIT` (Lua truthiness: every int is truthy); `Bool` operand → `cmp` its
+  `Loc` against 0 + `je`/`jne DEOPT_EXIT`.
+- **`loop` (back-edge), in order:** (1) commit **write-only** slots to `regs[]`
+  *first*; (2) the **PHI shuffle** — a parallel move `home(slot) ← loc(store_ref)`
+  for every carried slot, acyclic moves first (Kahn), each remaining disjoint cycle
+  broken with `rcx`, mem↔mem routed through `rax`; (3) `inc rbx; jmp LOOP_TOP`.
+- **DEOPT_EXIT** (every body guard jumps here — the *single snapshot* flush): for each
+  **carried** slot, `mov qword [rdi+slot*16], 2` (Int tag) + store its home payload
+  (invariant + write-only slots are already coherent). Then `mov rax, rbx` → teardown
+  (`add rsp,frame`; pop callee-saved reverse; `pop rbx`; `ret`).
+- **PROLOGUE_FAIL** (a hoisted `guard_int` failed before any commit): `xor rax,rax`
+  (rbx still 0) → same teardown, **without** the flush. A *distinct* label from
+  DEOPT_EXIT — flushing half-initialised homes here would corrupt `regs[]`.
+
+### Why one snapshot is valid at every guard
+
+LuaJIT snapshots before *every* guard because it mutates in place. Lune doesn't need
+to: `irinterp.zig` writes `regs[]` **only at the `loop` commit**, and on *any*
+mid-iteration guard fail returns with `regs[]` untouched since the iteration began
+(tier-0 re-runs the **pure, side-effect-free** partial iteration from `anchor.pc`).
+So every native side-exit must restore `regs[]` to the *same* state — the last
+loop-header commit, which is exactly the trace-wide `exit_stores`. **One snapshot,
+valid at every guard.** Soundness: carried homes are loaded once in the prologue and
+reassigned only at the back-edge shuffle (which runs *after* every body guard), so at
+any body guard `home(slot) == regs[slot]` as of loop entry → the DEOPT_EXIT flush is
+byte-equivalent to "untouched." The prologue guard is the one exception, handled by
+the separate no-flush PROLOGUE_FAIL exit.
+
+A committed trace contains no side effects (host calls / tables / globals all abort
+recording), so re-execution never doubles an effect. And even when an unboxed int
+*use* precedes its (now hoisted) guard, any divergent intermediate is discarded at
+the side-exit (nothing committed), so `regs` + `completed` stay identical to the
+interpreter.
 
 ---
 
@@ -185,7 +226,12 @@ The IR-interpreter is the source of truth for IR *semantics*. Native code must b
   non-semantic and left undefined by `Value.int`). Cases: a clean counting loop; a
   `guard_int` side-exit; a **loop-carried bool** (proves tag=1 boxing); `guard_true`
   on `int 0` (must pass — truthy); `guard_false` on an int (immediate exit); and
-  the bails (float const, unguarded `slot_load`, `guard_number`, `div`).
+  the bails (float const, unguarded `slot_load`, `guard_number`, `div`). Cut-2 adds
+  the allocator-stress cases: `analyze` classification + disjoint home pinning; a
+  type-unstable carried slot (loaded `Int`, stored `Bool`) is rejected; a **swap
+  loop** (`a,b = b,a`) exercising a register home cycle in the parallel move; and a
+  loop with **more carried+invariant slots than registers** forcing spilled homes
+  (and, with the pool exhausted, spilled transients too).
 - **Integration (`interp.zig`):** a `record_execute_native` mode joins the
   `expectProgram` GC × trace-mode matrix, so **every** program test also runs
   through native codegen (falling back where a trace leaves the subset) and must
@@ -203,15 +249,31 @@ The IR-interpreter is the source of truth for IR *semantics*. Native code must b
 
 ## Measured (informational)
 
-`zig build bench` (ReleaseFast) now reports a tier-1b native column. On a
-~2–4M-iteration integer accumulator loop, tier-1b runs **~12–60× faster** than
-tier-1a (the exact ratio depends on the loop and the machine; the dispatch loop is
-simply gone). Loops that leave the proven subset show ≈ 1.0× — they fall back to
-tier-1a transparently, which is the honest, expected behaviour for cut 1. The
-classic example is `(i+7)*(i+7)`: the recorder emits a `guard_int` on the *derived*
-`i+7` value, and cut 1 only proves a `guard_int` on a `slot_load`, so the whole
-trace bails. Relaxing that (a `guard_int` on a statically-proven-`Int` derived
-value is a no-op) is the highest-value next increment.
+`zig build bench` (ReleaseFast) reports a tier-1b native column. On the
+`acc = acc + i` numeric-for loop (4M iterations, best of 5, `Vm.run` only):
+
+| tier | time | vs tier-1a |
+|------|------|-----------|
+| tier-0 bytecode | ~48 ms | — |
+| tier-1a (optimized IR interp) | ~105 ms¹ | 1.0× |
+| tier-1b native, **cut 1** (stack-slot) | ~9.3 ms² | ~11× |
+| tier-1b native, **cut 2** (register homes) | **3.74 ms** | **~28×** |
+| LuaJIT (`os.clock` around the loop) | ~2.0 ms | — |
+
+¹ tier-1a is slower than tier-0 here only because the optimizer/IR-interp path adds
+fixed overhead the dispatch-bound microloop doesn't amortize; it's the *baseline the
+native column is measured against*, not a regression. ² cut-1 figure scaled from its
+2M measurement. Cut 2 closed the gap to LuaJIT from ~4× to **~1.9×** — the remaining
+gap is mostly the rax/rcx operand staging (cut 2 still does `mov rax,a; mov rcx,b;
+op; mov dst,rax` where LuaJIT emits a single two-operand `op dst,b`); see §Out of
+scope "two-operand in-place arithmetic".
+
+Loops that leave the proven subset show ≈ 1.0× — they fall back to tier-1a
+transparently. The classic example is `(i+7)*(i+7)`: the recorder emits a
+`guard_int` on the *derived* `i+7` value, and we only prove a `guard_int` on a
+`slot_load`, so the whole trace bails (this is `proveKinds`, unchanged by cut 2).
+Relaxing that (a `guard_int` on a statically-proven-`Int` derived value is a no-op)
+is the highest-value coverage increment.
 
 ---
 
@@ -222,10 +284,14 @@ value is a no-op) is the highest-value next increment.
   `shl`/`shr` (Lua masked shift counts), `not` (logical, not bitwise).
 - **Relax `guard_int` onto proven-`Int` derived values** (lower to a no-op) — lifts
   the `(i+7)*(i+7)`-style fallback; the single biggest coverage win.
-- **Linear-scan register allocation** — keep loop-carried values in CPU registers
-  across iterations instead of spilling every ref (cut 1 is stack-slot; correctness
-  first).
-- **Per-exit identity / side traces** — cut 1 has a single shared exit epilogue.
+- ~~**Linear-scan register allocation**~~ — **done (cut 2):** carried/invariant slots
+  are register-homed across iterations, `regs[]` written only on a side-exit.
+- **Two-operand in-place arithmetic** — cut 2 still stages every ALU op through
+  rax/rcx; coalescing the result home onto a dying operand register would emit a
+  single `op dst, b` and close most of the remaining gap to LuaJIT.
+- **Encoder size-opts** (`test r,r` for bool guards, `xchg` for 2-cycle swaps) —
+  semantically identical, smaller; currently uses `cmp r,0` / mov-through-`rcx`.
+- **Per-exit identity / side traces** — cut 1/2 have a single shared deopt epilogue.
 - **Proto-id stale-cache hardening** — `AnchorKey` borrows a raw `*const Proto` and
   the cache is never invalidated; a freed-then-reallocated `Proto` at the same
   address could hit a stale trace (and now stale machine code). Pre-existing in
