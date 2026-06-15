@@ -1,13 +1,17 @@
 # lune — Native Codegen (tier 1b)
 
-Status: Phase 8 **cut 2** implemented — a hand-rolled x86-64 encoder + a
+Status: Phase 8 **cut 3** implemented — a hand-rolled x86-64 encoder + a
 prove-typed-or-bail integer/boolean trace compiler with **register allocation +
-single-snapshot deopt**, wired behind `--jit-native`. Cut 1 was a stack-slot
-allocator (every SSA ref round-tripped through the frame); cut 2 keeps loop-carried
-and loop-invariant slots in CPU **registers** across iterations, hoists the
-per-iteration type guards/loads to a once-only prologue, and writes `regs[]` only on
-a side-exit. Float/heap/mixed traces, deferred ops, derived-value guards, two-operand
-in-place arithmetic, and per-exit side traces are later cuts (see §Out of scope).
+single-snapshot deopt + two-operand in-place arithmetic**, wired behind
+`--jit-native`. Cut 1 was a stack-slot allocator (every SSA ref round-tripped through
+the frame); cut 2 keeps loop-carried and loop-invariant slots in CPU **registers**
+across iterations, hoists the per-iteration type guards/loads to a once-only
+prologue, and writes `regs[]` only on a side-exit; cut 3 reads ALU operands straight
+from their homes (load-form `op r,[mem]`), coalesces a result onto a dying operand's
+register, and — behind a single-snapshot safety predicate — updates a carried slot's
+home **in place** so the back-edge shuffle elides. This put `acc=acc+i` at ~1.10× off
+LuaJIT. Float/heap/mixed traces, deferred ops, derived-value guards, accumulator
+sinking, and per-exit side traces are later cuts (see §Out of scope).
 Owner: Bart
 Last updated: 2026-06-15
 
@@ -197,6 +201,50 @@ recording), so re-execution never doubles an effect. And even when an unboxed in
 the side-exit (nothing committed), so `regs` + `completed` stay identical to the
 interpreter.
 
+### Cut 3: two-operand in-place arithmetic
+
+Cut 2 still computed every ALU op through the rax/rcx scratch pair. Cut 3 closes the
+LuaJIT gap with two wins, both judged bit-for-bit by the oracle.
+
+**Win 1 — operands in place + operand coalescing (always sound).** `emitBinAlu`/
+`emitCompare` read each operand straight from its `Place`: a register operand uses
+`op reg,reg`, a spilled operand uses the load form `op reg,[rsp+disp]` (the cut-3
+`aluRegMem` encodings) — no more staging both through rax/rcx. The allocator's linear
+scan adds *operand coalescing*: when a transient result's operand dies exactly at the
+def (`last_use == def`) and lives in a **non-home** register, the result reuses that
+register, so `acc=acc+i` lowers to `mov T,acc; add T,i` (+ the back-edge `mov acc,T`).
+The non-home test is location-based (`loc ∈ home_reg_mask`), never `slot_id<0`, so it
+stays correct once win 2 puts a transient into a home. This alone took the loop to
+~1.10× off LuaJIT.
+
+**Win 2 — in-place home coalescing (guarded).** When a carried slot S's sole
+`store_ref` is an arithmetic/unary op at index `j`, the allocator may pin that result
+*into* `home(S)` (set before the linear scan, which then leaves it fixed). The op
+becomes `add home(S), other` and the back-edge shuffle move for S self-elides (S is
+dropped from `moves[]`). Because this writes a carried home *mid-body* — violating
+cut 2's "homes written only at the back-edge" invariant — it is gated on a predicate:
+
+1. **`j` is after the last body guard** (`guard_true`/`guard_false`; `guard_int` is
+   hoisted). A side-exit after the in-place write would flush the *new* value where
+   the oracle's re-run model expects the loop-header value. The trace is straight-line,
+   so trace-index order is dominance — the index test is exact.
+2. **S's old value is dead by `j`** — no `slot_load(S)` ref has `last_use > j` (the
+   in-place write clobbers the home holding the old value).
+3. **`home(S)` holds an operand** — the left operand (any op), or a commutative op's
+   right operand; a unary's sole operand must be `home(S)`. (Plus: a spilled-home
+   `mul` falls back — `imul` has no `[mem],reg` store form.)
+
+The coalesced transient is pinned (`last_use → loop marker`) and excluded from win-1
+scavenging, so a later consumer of the new value never steals the home.
+
+**Measured caveat (the perf cliff).** The recorded counted loop emits its loop-exit
+`guard_true` as the *last* body instruction, with every accumulator update before it,
+so predicate (1) declines and win 2 is **inert on `acc=acc+i`** — the win-1 form
+stands. Win 2 fires for traces whose accumulation follows the last guard (loops with
+internal branches). Making it fire on the counted loop needs a schedule pass that
+sinks pure carried-`exit_store` producers below the last guard; that is a named
+follow-up, sound under the same re-run deopt model but out of scope for cut 3.
+
 ---
 
 ## Tier integration
@@ -257,16 +305,23 @@ The IR-interpreter is the source of truth for IR *semantics*. Native code must b
 | tier-0 bytecode | ~48 ms | — |
 | tier-1a (optimized IR interp) | ~105 ms¹ | 1.0× |
 | tier-1b native, **cut 1** (stack-slot) | ~9.3 ms² | ~11× |
-| tier-1b native, **cut 2** (register homes) | **3.74 ms** | **~28×** |
-| LuaJIT (`os.clock` around the loop) | ~2.0 ms | — |
+| tier-1b native, **cut 2** (register homes) | 3.74 ms | ~28× |
+| tier-1b native, **cut 3** (operands in place) | **2.27 ms** | **~46×** |
+| LuaJIT (`os.clock` around the loop) | ~2.07 ms | — |
 
 ¹ tier-1a is slower than tier-0 here only because the optimizer/IR-interp path adds
 fixed overhead the dispatch-bound microloop doesn't amortize; it's the *baseline the
 native column is measured against*, not a regression. ² cut-1 figure scaled from its
-2M measurement. Cut 2 closed the gap to LuaJIT from ~4× to **~1.9×** — the remaining
-gap is mostly the rax/rcx operand staging (cut 2 still does `mov rax,a; mov rcx,b;
-op; mov dst,rax` where LuaJIT emits a single two-operand `op dst,b`); see §Out of
-scope "two-operand in-place arithmetic".
+2M measurement. Cut 3's **win 1** (read ALU operands straight from their register/
+spill home + reuse a dying operand's register for the result, replacing cut 2's
+`mov rax,a; mov rcx,b; op; mov dst,rax` staging) took the loop from 3.74 ms to
+**2.27 ms — ~1.10× off LuaJIT** (cut 2 was ~1.81× off). Cut 3's **win 2** (in-place
+home coalescing, `add acc,i` with the back-edge move elided) is implemented and
+sound but **inert on this loop**: the recorded counted loop places its loop-exit
+`guard_true` *last*, with every accumulator update before it, so the win-2 safety
+predicate (no side-exit may follow an in-place home update — see §Cut 3) declines.
+Win 2 fires for traces whose accumulation follows the last guard; making it fire on
+the counted loop needs an update-sinking schedule pass (see §Out of scope).
 
 Loops that leave the proven subset show ≈ 1.0× — they fall back to tier-1a
 transparently. The classic example is `(i+7)*(i+7)`: the recorder emits a
@@ -286,9 +341,17 @@ is the highest-value coverage increment.
   the `(i+7)*(i+7)`-style fallback; the single biggest coverage win.
 - ~~**Linear-scan register allocation**~~ — **done (cut 2):** carried/invariant slots
   are register-homed across iterations, `regs[]` written only on a side-exit.
-- **Two-operand in-place arithmetic** — cut 2 still stages every ALU op through
-  rax/rcx; coalescing the result home onto a dying operand register would emit a
-  single `op dst, b` and close most of the remaining gap to LuaJIT.
+- ~~**Two-operand in-place arithmetic**~~ — **done (cut 3):** win 1 (operands read in
+  place + result coalesced onto a dying operand register) closed the LuaJIT gap to
+  ~1.10×; win 2 (in-place home coalescing) is implemented behind a single-snapshot
+  safety predicate.
+- **Sink accumulator updates below the loop-exit guard** — the recorded counted loop
+  emits its back-edge `guard_true` last, so win 2 (which requires no side-exit after
+  an in-place home update) never fires on it. A schedule pass that sinks pure ops
+  feeding carried `exit_store`s past the last guard would unlock win 2 there (sound
+  under cut-2's re-run-from-loop-header deopt model: a sunk op simply isn't computed
+  on a guard-fail, and tier-0 recomputes it). Marginal here (~10% over win 1) but the
+  enabler for `add acc,i`-with-no-shuffle on the canonical loop.
 - **Encoder size-opts** (`test r,r` for bool guards, `xchg` for 2-cycle swaps) —
   semantically identical, smaller; currently uses `cmp r,0` / mov-through-`rcx`.
 - **Per-exit identity / side traces** — cut 1/2 have a single shared deopt epilogue.

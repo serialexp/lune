@@ -201,9 +201,10 @@ _(nothing yet — design only)_
       the tier-1a IR-interpreter is a *boxed SSA walk* (one switch dispatch + guard
       checks per IR instr per iteration), so on these loops it is **slower than
       tier-0**; the optimizer shrinks the body and is never slower than no-opt, but
-      the real speed win is **tier-1b native codegen** (Phase 8, cuts 1+2 landed) —
+      the real speed win is **tier-1b native codegen** (Phase 8, cuts 1+2+3 landed) —
       a proven int accumulator loop drops the dispatch loop entirely and, with cut-2
-      register allocation, runs ~28× faster than tier-1a (~1.9× off LuaJIT). Loops
+      register allocation + cut-3 in-place operands, runs ~46× faster than tier-1a
+      (**~1.10× off LuaJIT**, down from cut-2's ~1.8×). Loops
       that leave the proven int/bool subset fall back to tier-1a transparently. **Deferred (cross the
       no-executor-change line):** type **narrowing/unboxing** (typed `add_i64`… +
       unboxed scratch + load-bearing guards — the big arithmetic win, payoff in
@@ -379,7 +380,7 @@ _(nothing yet — design only)_
       siblings, and the visualiser's `TraceView` animates it: a transport scrubs the
       flattened event stream, the current SSA row lights up, and the exit ramp flares
       in the guard register.
-- [~] **Phase 8 — Native codegen (tier 1b).** **Done (cuts 1 + 2):** a hand-rolled
+- [~] **Phase 8 — Native codegen (tier 1b).** **Done (cuts 1 + 2 + 3):** a hand-rolled
       x86-64 encoder (`src/x64.zig`) + a **prove-typed-or-bail** trace compiler
       (`src/nativegen.zig`) that lowers a hot trace to real machine code on an
       `mmap`'d executable page when a static forward pass can prove every value is
@@ -390,15 +391,20 @@ _(nothing yet — design only)_
       `regs`). **Cut 2** added **register allocation + single-snapshot deopt**:
       loop-carried/invariant slots live in CPU registers across iterations, the
       per-iteration type guards/loads hoist to a once-only prologue, and `regs[]` is
-      written only on a side-exit — the `acc=acc+i` loop is now ~28× over tier-1a and
-      ~1.9× off LuaJIT (cut 1's stack-slot codegen was ~4×). See
-      **05-native-codegen.md**. **Deferred (later cuts):** float/xmm + tag dispatch;
-      `div`/`mod`/`pow`/shifts; relaxing `guard_int` onto proven-int *derived* values
-      (we only prove a `slot_load`, so loops with a guarded intermediate — e.g.
-      `(i+7)*(i+7)` — conservatively fall back); two-operand in-place arithmetic (cut
-      2 still stages ALU ops through scratch); GC stackmaps/safepoints; per-exit side
-      traces. Those are native-only; the IR-interpreter is the oracle for IR
-      *semantics*, not for them.
+      written only on a side-exit. **Cut 3** added **two-operand in-place arithmetic**:
+      ALU operands are read straight from their register/spill home (load-form
+      `op r,[mem]`), a result is coalesced onto a dying operand's register, and — behind
+      a single-snapshot safety predicate — a carried slot's home is updated in place so
+      the back-edge shuffle elides. Win-1 took the `acc=acc+i` loop to ~46× over tier-1a
+      (**~1.10× off LuaJIT**, cut 1's stack-slot codegen was ~4×); win-2 is sound but
+      inert on the counted loop (its loop-exit guard is recorded last, so the predicate
+      declines — see 05). See **05-native-codegen.md**. **Deferred (later cuts):**
+      float/xmm + tag dispatch; `div`/`mod`/`pow`/shifts; relaxing `guard_int` onto
+      proven-int *derived* values (we only prove a `slot_load`, so loops with a guarded
+      intermediate — e.g. `(i+7)*(i+7)` — conservatively fall back); sinking accumulator
+      updates below the loop-exit guard (unlocks win-2 on counted loops); GC
+      stackmaps/safepoints; per-exit side traces. Those are native-only; the
+      IR-interpreter is the oracle for IR *semantics*, not for them.
 - [ ] **Phase 9 — Language surface.** Hidden-class **shapes + freezing** (basic
       tables already exist from Phase 3), optional type annotations, stdlib.
       Table-access guards must be designed shape-ready back in Phase 5.
