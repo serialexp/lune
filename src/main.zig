@@ -43,6 +43,13 @@ const usage =
     \\  --trace-no-opt       skip the trace optimizer (constant folding / CSE /
     \\                       dead-code elimination); record & execute raw IR. Useful
     \\                       with --dump-traces to see unoptimized IR.
+    \\  --jit-native         imply --trace and run hot traces as native x86-64
+    \\                       machine code (tier-1b) when they fall in the proven
+    \\                       integer/boolean subset; others stay on tier-1a. Output
+    \\                       is identical to a plain run. x86-64/Linux only (a no-op
+    \\                       fallback elsewhere).
+    \\  --dump-native        imply --jit-native and print each trace's compiled
+    \\                       machine code (or "unsupported") to stderr after the run.
     \\  --dump-traces        imply --trace and print every recorded trace's IR to
     \\                       stderr after the run.
     \\  --emit-traces <file> imply --trace and serialize the recorded trace cache
@@ -69,6 +76,12 @@ const TraceOpts = struct {
     execute: bool = true,
     optimize: bool = true,
     dump: bool = false,
+    /// `--jit-native`: run hot traces as native machine code (tier-1b) where they
+    /// fall in the proven int/bool subset; others stay on the tier-1a interpreter.
+    native_codegen: bool = false,
+    /// `--dump-native`: print each cached trace's compiled machine code (or its
+    /// `unsupported` verdict) to stderr after the run.
+    dump_native: bool = false,
     /// `--emit-traces <file>`: serialize the trace cache here after the run.
     emit_path: ?[]const u8 = null,
     /// `--emit-keyframe <file>`: serialize a whole-VM keyframe snapshot here after
@@ -104,6 +117,15 @@ pub fn main(init: std.process.Init) u8 {
         } else if (std.mem.eql(u8, arg, "--trace-no-opt")) {
             topts.enabled = true;
             topts.optimize = false;
+        } else if (std.mem.eql(u8, arg, "--jit-native")) {
+            topts.enabled = true;
+            topts.execute = true;
+            topts.native_codegen = true;
+        } else if (std.mem.eql(u8, arg, "--dump-native")) {
+            topts.enabled = true;
+            topts.execute = true;
+            topts.native_codegen = true;
+            topts.dump_native = true;
         } else if (std.mem.eql(u8, arg, "--dump-traces")) {
             topts.enabled = true;
             topts.dump = true;
@@ -191,6 +213,7 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     vm.trace.config.enabled = topts.enabled;
     vm.trace.config.execute = topts.execute;
     vm.trace.config.optimize = topts.optimize;
+    vm.trace.config.native_codegen = topts.native_codegen;
     // Inject the native clock. The interpreter holds no platform clock of its own
     // (so the VM core stays portable, incl. wasm); the host that builds the VM —
     // here, the CLI — supplies one. This is the single place the OS clock syscall
@@ -261,6 +284,12 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // interleave with the program's stdout. The chunk is still alive here (its
     // `deinit` is deferred), so each trace's `anchor.proto` is valid.
     if (topts.dump) dumpTraces(&vm);
+
+    // --- dump compiled machine code (--dump-native) --- to stderr. Resolves each
+    // trace's native compilation (forcing any not yet attempted), then hexdumps the
+    // emitted bytes or reports the `unsupported` verdict. The chunk is still alive,
+    // so each trace (and its anchor proto) is valid.
+    if (topts.dump_native) dumpNative(&vm);
 
     // --- emit serialized traces (--emit-traces <file>) --- the chunk is still
     // alive, so every trace's `anchor.proto` (and its `id`) is valid.
@@ -376,6 +405,37 @@ fn dumpTraces(vm: *lune.interp.Vm) void {
         w.print("lune: {d} trace(s) recorded\n", .{vm.trace.cache.items.len}) catch {};
         for (vm.trace.cache.items) |t| {
             lune.trace.writeTrace(w, t) catch {};
+        }
+    }
+    w.flush() catch {};
+}
+
+/// Dump every cached trace's tier-1b native compilation to stderr (for
+/// `--dump-native`). Resolves each trace's `NativeState` (compiling any not yet
+/// attempted), then hexdumps the emitted machine code or reports that the trace
+/// fell outside the proven int/bool subset and runs on tier-1a.
+fn dumpNative(vm: *lune.interp.Vm) void {
+    const w = lune.io.stderrWriter();
+    const items = vm.trace.cache.items;
+    if (items.len == 0) {
+        w.print("lune: no traces recorded\n", .{}) catch {};
+        w.flush() catch {};
+        return;
+    }
+    w.print("lune: native codegen for {d} trace(s)\n", .{items.len}) catch {};
+    for (items, 0..) |t, i| {
+        if (vm.trace.nativeFor(t)) |ct| {
+            const code = ct.page.mem[0..ct.page.len];
+            w.print("trace #{d}: compiled, {d} bytes of x86-64\n", .{ i, code.len }) catch {};
+            var off: usize = 0;
+            while (off < code.len) : (off += 16) {
+                w.print("  {x:0>4}: ", .{off}) catch {};
+                const end = @min(off + 16, code.len);
+                for (code[off..end]) |b| w.print("{x:0>2} ", .{b}) catch {};
+                w.print("\n", .{}) catch {};
+            }
+        } else {
+            w.print("trace #{d}: unsupported — runs on the tier-1a interpreter\n", .{i}) catch {};
         }
     }
     w.flush() catch {};
