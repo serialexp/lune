@@ -348,6 +348,16 @@ fn isTransient(op: trace.IrOp) bool {
     };
 }
 
+/// True iff the op's two operands may be swapped without changing the result. Used
+/// both for operand coalescing (either operand's dying register may be reused) and to
+/// let the ALU emitter avoid a staging move when the in-register operand is `b`.
+fn isCommutative(op: trace.IrOp) bool {
+    return switch (op) {
+        .add, .mul, .band, .bor, .bxor, .eq, .ne => true,
+        else => false, // sub, lt, le are order-sensitive
+    };
+}
+
 /// The operand refs an instruction reads (matching `proveKinds`/`lower` exactly).
 fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
     return switch (ins.op) {
@@ -489,7 +499,39 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             }
         }
         active_len = w;
-        if (pickReg(&free)) |r| {
+
+        // --- operand coalescing (win 1): reuse a *dying* operand's register for the
+        // result, emitting an in-place `op dst, b` instead of staging through rax.
+        // The operand must (a) live in a register, (b) NOT be a slot home — reusing a
+        // home would clobber a loop-carried value mid-iteration [RV: location-based,
+        // not slot_id<0, so it stays correct once win-2 puts transients in homes] —
+        // and (c) die exactly here (last_use == i). For commutative ops either operand
+        // qualifies; otherwise only `a` (the destructive-write target).
+        const rd = operandReads(ins);
+        var coalesced: ?Reg = null;
+        const cands = [2]struct { ref: usize, ok: bool }{
+            .{ .ref = ins.a, .ok = rd.a },
+            .{ .ref = ins.b, .ok = rd.b and isCommutative(ins.op) },
+        };
+        for (cands) |c| {
+            if (!c.ok) continue;
+            if (loc[c.ref] != .reg) continue;
+            const r = loc[c.ref].reg;
+            if (home_reg_mask & regBit(r) != 0) continue;
+            if (last_use[c.ref] != i) continue;
+            // Repurpose the operand's active entry for the result's live range.
+            for (active[0..active_len]) |*e| {
+                if (e.reg == r) {
+                    e.last = last_use[i];
+                    coalesced = r;
+                    break;
+                }
+            }
+            if (coalesced != null) break;
+        }
+        if (coalesced) |r| {
+            loc[i] = .{ .reg = r };
+        } else if (pickReg(&free)) |r| {
             loc[i] = .{ .reg = r };
             used_callee |= regBit(r) & CALLEE_SAVED_MASK;
             active[active_len] = .{ .reg = r, .last = last_use[i] };
@@ -596,6 +638,117 @@ fn regToPlace(a: *x64.Assembler, dst: Place, src: Reg) !void {
     switch (dst) {
         .reg => |r| if (r != src) try a.movRegReg(r, src),
         .mem => |d| try a.movMemReg(.rsp, d, src),
+    }
+}
+
+/// Emit `dst <op> src` where `dst` is a register and `src` is a Place — reg→reg ALU
+/// or the load-form `op r64, [mem]` when the operand is spilled (avoids staging it
+/// through scratch). Only binary arithmetic/bitwise ops reach here.
+fn emitAluRegPlace(a: *x64.Assembler, op: trace.IrOp, dst: Reg, src: Place) !void {
+    switch (src) {
+        .reg => |r| switch (op) {
+            .add => try a.addRegReg(dst, r),
+            .sub => try a.subRegReg(dst, r),
+            .mul => try a.imulRegReg(dst, r),
+            .band => try a.andRegReg(dst, r),
+            .bor => try a.orRegReg(dst, r),
+            .bxor => try a.xorRegReg(dst, r),
+            else => unreachable,
+        },
+        .mem => |d| switch (op) {
+            .add => try a.addRegMem(dst, .rsp, d),
+            .sub => try a.subRegMem(dst, .rsp, d),
+            .mul => try a.imulRegMem(dst, .rsp, d),
+            .band => try a.andRegMem(dst, .rsp, d),
+            .bor => try a.orRegMem(dst, .rsp, d),
+            .bxor => try a.xorRegMem(dst, .rsp, d),
+            else => unreachable,
+        },
+    }
+}
+
+/// Lower a binary ALU op `dst = pa <op> pb` reading operands in place.
+///   - register dst: keep `pa` in dst (elided when operand/home-coalesced so `pa==dst`)
+///     then `op dst, pb`; a commutative op may instead keep the in-register `pb`.
+///   - spilled dst: in-place store form `op [dst], pb_reg` when `pa==dst` (the win-2
+///     coalesced home), else stage `a` in rax and write back. imul has no store form,
+///     so a spilled in-place `mul` is never produced (analyze keeps such homes in regs).
+fn emitBinAlu(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Place) !void {
+    switch (dst) {
+        .reg => |R| {
+            if (pa == .reg and pa.reg == R) {
+                try emitAluRegPlace(a, op, R, pb);
+            } else if (isCommutative(op) and pb == .reg and pb.reg == R) {
+                try emitAluRegPlace(a, op, R, pa);
+            } else {
+                // R holds neither operand: materialize `a`, then `op R, b`. For
+                // non-commutative ops `pb.reg == R` is impossible (a still-live operand
+                // keeps its register), so the staging move never clobbers `b`.
+                try placeToReg(a, R, pa);
+                try emitAluRegPlace(a, op, R, pb);
+            }
+        },
+        .mem => |D| {
+            if (Place.eql(pa, dst)) {
+                // In-place spilled home (win 2): `op [dst], b`. Load b to rcx if spilled.
+                std.debug.assert(op != .mul); // no imul store form
+                const src_reg: Reg = switch (pb) {
+                    .reg => |r| r,
+                    .mem => |bd| blk: {
+                        try a.movRegMem(.rcx, .rsp, bd);
+                        break :blk .rcx;
+                    },
+                };
+                switch (op) {
+                    .add => try a.addMemReg(.rsp, D, src_reg),
+                    .sub => try a.subMemReg(.rsp, D, src_reg),
+                    .band => try a.andMemReg(.rsp, D, src_reg),
+                    .bor => try a.orMemReg(.rsp, D, src_reg),
+                    .bxor => try a.xorMemReg(.rsp, D, src_reg),
+                    else => unreachable,
+                }
+            } else {
+                // General spilled dst: compute in rax, write back.
+                try placeToReg(a, .rax, pa);
+                try emitAluRegPlace(a, op, .rax, pb);
+                try a.movMemReg(.rsp, D, .rax);
+            }
+        },
+    }
+}
+
+/// Lower a comparison `dst = pa <cc> pb` reading operands in place. Needs a register
+/// on the left of `cmp`; stages `a` through rax only when it is spilled. The Bool
+/// result lands in `dst` via setcc+movzx.
+fn emitCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Place) !void {
+    const lhs: Reg = switch (pa) {
+        .reg => |r| r,
+        .mem => |d| blk: {
+            try a.movRegMem(.rax, .rsp, d);
+            break :blk .rax;
+        },
+    };
+    switch (pb) {
+        .reg => |r| try a.cmpRegReg(lhs, r),
+        .mem => |d| try a.cmpRegMem(lhs, .rsp, d),
+    }
+    const cc: x64.Cond = switch (op) {
+        .eq => .e,
+        .ne => .ne,
+        .lt => .l,
+        .le => .le,
+        else => unreachable,
+    };
+    switch (dst) {
+        .reg => |R| {
+            try a.setcc(cc, R);
+            try a.movzxRegReg8(R, R); // zero-extend the 0/1 byte to the full register
+        },
+        .mem => |D| {
+            try a.setcc(cc, .rax);
+            try a.movzxRegReg8(.rax, .rax);
+            try a.movMemReg(.rsp, D, .rax);
+        },
     }
 }
 
@@ -745,42 +898,42 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             .slot_load, .guard_int => {}, // hoisted to the prologue (loop-invariant)
             .konst => {
                 const bits = t.consts[@intCast(ins.aux)].payload.bits;
-                try a.movRegImm64(.rax, @bitCast(bits));
-                try regToPlace(a, placeOfRef(alloc, i), .rax);
+                switch (placeOfRef(alloc, i)) {
+                    .reg => |r| try a.movRegImm64(r, @bitCast(bits)),
+                    .mem => |d| {
+                        try a.movRegImm64(.rax, @bitCast(bits));
+                        try a.movMemReg(.rsp, d, .rax);
+                    },
+                }
             },
             .add, .sub, .mul, .band, .bor, .bxor => {
-                try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
-                try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
-                switch (ins.op) {
-                    .add => try a.addRegReg(.rax, .rcx),
-                    .sub => try a.subRegReg(.rax, .rcx),
-                    .mul => try a.imulRegReg(.rax, .rcx),
-                    .band => try a.andRegReg(.rax, .rcx),
-                    .bor => try a.orRegReg(.rax, .rcx),
-                    .bxor => try a.xorRegReg(.rax, .rcx),
-                    else => unreachable,
-                }
-                try regToPlace(a, placeOfRef(alloc, i), .rax);
+                try emitBinAlu(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
             },
             .neg, .bnot => {
-                try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
-                if (ins.op == .neg) try a.negReg(.rax) else try a.notReg(.rax);
-                try regToPlace(a, placeOfRef(alloc, i), .rax);
+                const dst = placeOfRef(alloc, i);
+                const pa = placeOfRef(alloc, ins.a);
+                switch (dst) {
+                    .reg => |R| {
+                        if (!(pa == .reg and pa.reg == R)) try placeToReg(a, R, pa);
+                        if (ins.op == .neg) try a.negReg(R) else try a.notReg(R);
+                    },
+                    .mem => |D| {
+                        if (Place.eql(pa, dst)) {
+                            // In-place spilled home (win 2): neg/not via rcx round-trip
+                            // (F7 has no [mem] form in this encoder).
+                            try a.movRegMem(.rcx, .rsp, D);
+                            if (ins.op == .neg) try a.negReg(.rcx) else try a.notReg(.rcx);
+                            try a.movMemReg(.rsp, D, .rcx);
+                        } else {
+                            try placeToReg(a, .rax, pa);
+                            if (ins.op == .neg) try a.negReg(.rax) else try a.notReg(.rax);
+                            try a.movMemReg(.rsp, D, .rax);
+                        }
+                    },
+                }
             },
             .eq, .ne, .lt, .le => {
-                try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
-                try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
-                try a.cmpRegReg(.rax, .rcx);
-                const cc: x64.Cond = switch (ins.op) {
-                    .eq => .e,
-                    .ne => .ne,
-                    .lt => .l,
-                    .le => .le,
-                    else => unreachable,
-                };
-                try a.setcc(cc, .rax);
-                try a.movzxRegReg8(.rax, .rax); // zero-extend the 0/1 (setcc is 8-bit)
-                try regToPlace(a, placeOfRef(alloc, i), .rax);
+                try emitCompare(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
             },
             .guard_true => switch (kinds[ins.a]) {
                 .int => {}, // every int is truthy → guard always passes (no-op)
@@ -1108,6 +1261,37 @@ test "nativegen: a swap loop exercises a register home cycle" {
     try expectMatch(&t, &.{ Value.int(10), Value.int(20), Value.int(0), Value.int(3) });
     // limit=0: zero iterations, no swap.
     try expectMatch(&t, &.{ Value.int(10), Value.int(20), Value.int(0), Value.int(0) });
+}
+
+test "nativegen: operand-chain reuses one register across a left-folded sum" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // acc = ((((acc + i) + k1) + k2) + k3); i += 1.  Each intermediate dies at the next
+    // add (last_use == def+1), so operand coalescing folds the whole chain onto one
+    // register (win 1). The oracle judges; this just exercises the coalescing path.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .guard_int, .a = 0 }, // 1
+        .{ .op = .slot_load, .aux = 1 }, // 2: limit
+        .{ .op = .guard_int, .a = 2 }, // 3
+        .{ .op = .lt, .a = 0, .b = 2 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: acc
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .add, .a = 6, .b = 0 }, // 8: acc + i        (transient t8)
+        .{ .op = .konst, .aux = 0 }, // 9: 10
+        .{ .op = .add, .a = 8, .b = 9 }, // 10: t8 + 10        (reuses t8's reg)
+        .{ .op = .konst, .aux = 1 }, // 11: 100
+        .{ .op = .add, .a = 10, .b = 11 }, // 12: t10 + 100    (reuses again)
+        .{ .op = .konst, .aux = 2 }, // 13: 1
+        .{ .op = .add, .a = 0, .b = 13 }, // 14: i + 1
+        .{ .op = .loop }, // 15
+    };
+    var consts = [_]Value{ Value.int(10), Value.int(100), Value.int(1) };
+    var exits = [_]S{ .{ .slot = 2, .ref = 12 }, .{ .slot = 0, .ref = 14 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try expectMatch(&t, &.{ Value.int(0), Value.int(4), Value.int(0) });
+    try expectMatch(&t, &.{ Value.int(2), Value.int(2), Value.int(7) }); // zero iters
 }
 
 test "nativegen: more carried+invariant slots than registers forces spilled homes" {
