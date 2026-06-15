@@ -197,11 +197,14 @@ _(nothing yet — design only)_
       tests. `TraceConfig.optimize` (default on) gates it; an optimizer OOM falls
       back to caching the unoptimized trace. `--trace-no-opt` records & executes
       raw IR; `zig build bench` (ReleaseFast) reports per-loop raw/opt instruction
-      counts + wall-time. **Note (honest):** the tier-1a IR-interpreter is a
-      *boxed SSA walk* (one switch dispatch + guard checks per IR instr per
-      iteration), so today it is **slower than tier-0** on these loops — the
-      optimizer shrinks the body and is never slower than no-opt, but the real
-      speed win waits on typed fast paths / native codegen. **Deferred (cross the
+      counts + wall-time (now incl. a **tier-1b native** column). **Note (honest):**
+      the tier-1a IR-interpreter is a *boxed SSA walk* (one switch dispatch + guard
+      checks per IR instr per iteration), so on these loops it is **slower than
+      tier-0**; the optimizer shrinks the body and is never slower than no-opt, but
+      the real speed win is **tier-1b native codegen** (Phase 8, landed) — a proven
+      int accumulator loop drops the dispatch loop entirely and runs ~12–60×
+      faster than tier-1a. Loops that leave the proven int/bool subset fall back to
+      tier-1a transparently. **Deferred (cross the
       no-executor-change line):** type **narrowing/unboxing** (typed `add_i64`… +
       unboxed scratch + load-bearing guards — the big arithmetic win, payoff in
       Phase 8) and **LICM** (a once-only trace preheader in the executor); plus
@@ -376,10 +379,22 @@ _(nothing yet — design only)_
       siblings, and the visualiser's `TraceView` animates it: a transport scrubs the
       flattened event stream, the current SSA row lights up, and the exit ramp flares
       in the guard register.
-- [ ] **Phase 8 — Native codegen (tier 1b).** Bespoke fast backend, x86-64
-      first. A performance step — but *not* mechanical: regalloc across side
-      exits, GC stackmaps/safepoints, and machine-state snapshot-restore are
-      native-only. The IR-interpreter is the oracle for IR *semantics*, not these.
+- [~] **Phase 8 — Native codegen (tier 1b).** **Done (cut 1):** a hand-rolled
+      x86-64 encoder (`src/x64.zig`) + a **prove-typed-or-bail** trace compiler
+      (`src/nativegen.zig`) that lowers a hot trace to real machine code on an
+      `mmap`'d executable page when a static forward pass can prove every value is
+      an unboxed `i64`/`bool` over a supported op subset; anything else (float /
+      heap / mixed, or an unsupported op) silently stays on the tier-1a executor.
+      `--jit-native` / `--dump-native` drive it from the CLI; the IR-interpreter is
+      the **differential oracle** (native output is bit-identical: `completed` +
+      `regs`). A clean integer accumulator loop runs ~12–60× faster than tier-1a.
+      See **05-native-codegen.md**. **Deferred (later cuts):** float/xmm + tag
+      dispatch; `div`/`mod`/`pow`/shifts; relaxing `guard_int` onto proven-int
+      *derived* values (cut 1 only proves a `slot_load`, so loops with a guarded
+      intermediate — e.g. `(i+7)*(i+7)` — conservatively fall back); linear-scan
+      regalloc across side exits; GC stackmaps/safepoints; per-exit side traces.
+      Those are native-only; the IR-interpreter is the oracle for IR *semantics*,
+      not for them.
 - [ ] **Phase 9 — Language surface.** Hidden-class **shapes + freezing** (basic
       tables already exist from Phase 3), optional type annotations, stdlib.
       Table-access guards must be designed shape-ready back in Phase 5.
