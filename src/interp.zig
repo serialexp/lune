@@ -657,7 +657,7 @@ pub const Vm = struct {
             // instruction (and its observed operand types) into the trace IR
             // *before* tier-0 executes it. Recording is transparent — tier-0 still
             // performs the operation below.
-            if (self.trace.isRecording()) self.trace.recordInstr(instr, regs, proto);
+            if (self.trace.isRecording()) self.trace.recordInstr(instr, regs, proto, @intCast(pc));
             const a: usize = instr.a;
             switch (instr.op) {
                 // ---- loads & moves ----
@@ -2769,6 +2769,79 @@ test "recorder: a while loop records a truthiness guard on its condition" {
     try testing.expect(std.mem.indexOf(u8, text, "loop") != null);
 }
 
+test "recorder: dead expression temporaries are dropped from the exit snapshot (task A)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `(i + 7) * (i + 7)` computes through expression-stack temporaries at slots
+    // >= base+4. They are written and re-read within the iteration (never
+    // slot_loaded → write-only), and dead at the loop header / after the loop, so
+    // the recorder's watermark filter drops them from the exit snapshot.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local acc = 0
+        \\for i = 1, 50 do acc = acc + (i + 7) * (i + 7) end
+        \\print(acc)
+    , true);
+    defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    const t = vm.trace.cache.items[0];
+
+    // Recover the numeric-for base from the bytecode so the assertion does not
+    // hard-code the compiler's register allocation. Control regs are base..base+3;
+    // base+4 is the first temporary slot (the watermark).
+    var base: ?u16 = null;
+    for (chunk.proto.code) |ins| {
+        if (ins.op == .for_loop) {
+            base = ins.a;
+            break;
+        }
+    }
+    const watermark: usize = @as(usize, base.?) + 4;
+
+    // Every surviving exit-store is either below the watermark (a real local /
+    // loop control) or a slot the trace actually read — never a dead temporary.
+    var saw_acc = false;
+    for (t.exit_stores) |st| {
+        const was_read = std.mem.indexOfScalar(u16, t.entry_slots, st.slot) != null;
+        try testing.expect(@as(usize, st.slot) < watermark or was_read);
+        if (st.slot == 0) saw_acc = true; // `acc` is the first local → slot 0
+    }
+    // The loop-carried accumulator is still committed.
+    try testing.expect(saw_acc);
+    // And no high write-only temporary leaked through.
+    for (t.exit_stores) |st| {
+        if (@as(usize, st.slot) >= watermark)
+            try testing.expect(std.mem.indexOfScalar(u16, t.entry_slots, st.slot) != null);
+    }
+}
+
+test "recorder: a while loop keeps its write-only temporaries (no for_loop watermark)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // A while loop has no `for_loop`, so the watermark stays at its `maxInt`
+    // sentinel and nothing is filtered. The `i <= 50` condition computes into a
+    // write-only temporary (defined, never slot_loaded), which must survive in the
+    // exit snapshot — proving the filter is inert without an anchoring for_loop.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local i = 1
+        \\local acc = 0
+        \\while i <= 50 do acc = acc + i; i = i + 1 end
+        \\print(acc)
+    , true);
+    defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
+
+    const t = vm.trace.cache.items[0];
+    // There must be at least one defined-but-never-read (write-only) slot still in
+    // the snapshot — exactly what the for-loop filter would have removed.
+    var saw_write_only = false;
+    for (t.exit_stores) |st| {
+        if (std.mem.indexOfScalar(u16, t.entry_slots, st.slot) == null) saw_write_only = true;
+    }
+    try testing.expect(saw_write_only);
+}
+
 test "recorder: a recurring literal is interned to one const-pool entry" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
@@ -2999,6 +3072,30 @@ test "native: a hot integer for-loop is lowered to machine code and matches tier
 
     // Same result tier-0 produces — and the decisive signal that it ran natively.
     try testing.expectEqualStrings("5050\n", sink.buffered());
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expect(vm.trace.cache.items[0].native == .compiled);
+}
+
+test "native: a multi-op for-loop with dropped temporaries lowers and matches tier-0 (task A)" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    // The body computes `(i + 7) * (i + 7)` through write-only expression
+    // temporaries that the recorder now drops from the exit snapshot. The trace
+    // must still lower to machine code, and — the decisive soundness check — its
+    // result must be bit-identical to the tier-0 oracle (413950). If dropping a
+    // live value were unsound, native and tier-0 would diverge here.
+    var chunk = try runNativeForTrace(&vm, gpa,
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + (i + 7) * (i + 7) end
+        \\print(acc)
+    , &sink);
+    defer chunk.deinit();
+
+    try testing.expectEqualStrings("413950\n", sink.buffered());
     try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
     try testing.expect(vm.trace.cache.items[0].native == .compiled);
 }

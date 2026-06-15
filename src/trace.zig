@@ -465,11 +465,22 @@ pub const TraceState = struct {
     fn commit(self: *TraceState) !void {
         try self.rec.instrs.append(self.gpa, .{ .op = .loop });
 
-        // The exit snapshot: every register the trace defined (loop-carried).
+        // The exit snapshot: every register the trace defined (loop-carried),
+        // minus *dead temporaries*. A slot at/above `locals_watermark` is a
+        // compiler expression temporary (set only by the anchoring numeric-`for`'s
+        // `for_loop`; see `recForLoop`/`Recorder.locals_watermark`): dead at the
+        // loop-header resume point on every path and after the loop, so tier-0
+        // recomputes it on deopt and post-loop code never reads it — writing it
+        // back is pure waste. The `entry_slots` (`readSlot`) guard is a safety net:
+        // a slot the trace actually read is never dropped (it is `< watermark`
+        // anyway). When the watermark is the `maxInt` sentinel (while / generic-
+        // `for` / passed-through `for`), nothing is filtered.
         var stores: std.ArrayListUnmanaged(SlotStore) = .empty;
         defer stores.deinit(self.gpa);
         for (self.rec.reg_map, 0..) |s, slot| {
-            if (s.state == .def) try stores.append(self.gpa, .{ .slot = @intCast(slot), .ref = s.ref });
+            if (s.state != .def) continue;
+            if (slot >= self.rec.locals_watermark and !self.readSlot(@intCast(slot))) continue;
+            try stores.append(self.gpa, .{ .slot = @intCast(slot), .ref = s.ref });
         }
 
         const instrs = self.rec.instrs.items;
@@ -543,12 +554,15 @@ pub const TraceState = struct {
     /// *pre-execution* operand values from `regs` to choose type guards. Tier-0
     /// still executes the instruction itself (next, in the dispatch loop) — this
     /// only records. Unsupported opcodes / types abort the recording.
-    pub fn recordInstr(self: *TraceState, instr: Instr, regs: []const Value, proto: *const Proto) void {
+    /// `pc` is the *post-increment* program counter (already advanced past
+    /// `instr`), matching what `applyJump(pc, aux)` expects — `recForLoop` uses it
+    /// to resolve the `for_loop` back-edge target against the trace anchor.
+    pub fn recordInstr(self: *TraceState, instr: Instr, regs: []const Value, proto: *const Proto, pc: u32) void {
         if (self.rec.instrs.items.len >= self.config.maxrecord) return self.abort(.too_long);
-        self.recordOne(instr, regs, proto) catch self.abort(.alloc);
+        self.recordOne(instr, regs, proto, pc) catch self.abort(.alloc);
     }
 
-    fn recordOne(self: *TraceState, instr: Instr, regs: []const Value, proto: *const Proto) error{OutOfMemory}!void {
+    fn recordOne(self: *TraceState, instr: Instr, regs: []const Value, proto: *const Proto, pc: u32) error{OutOfMemory}!void {
         switch (instr.op) {
             // loads & moves — define the destination, no guards.
             .load_nil => self.setReg(instr.a, try self.konst(Value.nil())),
@@ -585,7 +599,7 @@ pub const TraceState = struct {
             // control flow.
             .jmp => {}, // straight-line trace: control flow is implicit.
             .jmp_if_false, .jmp_if_true => try self.recBranch(instr, regs),
-            .for_loop => try self.recForLoop(instr, regs),
+            .for_loop => try self.recForLoop(instr, regs, pc),
 
             // a host call is a trace barrier; a Lua call/return is cross-frame.
             .call => {
@@ -645,6 +659,13 @@ pub const TraceState = struct {
     /// (a loop-carried write — surfaces in the exit snapshot).
     fn setReg(self: *TraceState, slot: u16, ref: Ref) void {
         self.rec.reg_map[slot] = .{ .ref = ref, .state = .def };
+    }
+
+    /// Whether tier-0 register `slot` was *read* during this recording (i.e. it is
+    /// in the entry snapshot). Used by `commit()` as a safety net so the dead-
+    /// temporary filter never drops a slot the trace actually consumed.
+    fn readSlot(self: *const TraceState, slot: u16) bool {
+        return std.mem.indexOfScalar(u16, self.rec.entry_slots.items, slot) != null;
     }
 
     /// Emit a type guard for `ref` (deduplicated — an SSA value has one type).
@@ -755,8 +776,19 @@ pub const TraceState = struct {
     /// `for_loop` (numeric-for back-edge): record the increment and the
     /// loop-continuation guard, mirroring the opcode. The actual back-edge / close
     /// is handled by `onBackEdge`.
-    fn recForLoop(self: *TraceState, instr: Instr, regs: []const Value) !void {
+    fn recForLoop(self: *TraceState, instr: Instr, regs: []const Value, pc: u32) !void {
         const a = instr.a;
+
+        // If *this* `for_loop` is the one whose back-edge defines the trace
+        // anchor (its target == anchor.pc, computed exactly as the interpreter's
+        // `applyJump`), then the trace re-enters / resumes at this numeric-`for`'s
+        // body start. Its four control regs occupy `a..a+3` (idx, limit, step,
+        // var), so every slot `>= a+4` is a compiler temporary — dead at the body
+        // start on every resume path and after the loop. Record the watermark so
+        // `commit()` can drop those slots from the exit snapshot. A `for_loop` the
+        // trace merely passes through (different target) is ignored.
+        const target: u32 = @intCast(@as(i64, pc) + instr.aux);
+        if (target == self.rec.anchor.pc) self.rec.locals_watermark = @as(u32, a) + 4;
         const vidx = regs[a];
         const vlimit = regs[a + 1];
         const vstep = regs[a + 2];
@@ -856,6 +888,17 @@ pub const Recorder = struct {
     /// Current SSA ref + state for each tier-0 register, sized to the recording
     /// frame's `num_registers`.
     reg_map: []RegSlot = &.{},
+    /// Lowest register slot that is a *compiler temporary* at this trace's loop
+    /// header — the live-locals watermark. Set only by the `for_loop` whose
+    /// back-edge targets this trace's anchor (so it describes the loop the trace
+    /// actually re-enters): for a numeric-`for` the control regs occupy
+    /// `base..base+3`, so every slot `>= base+4` is an expression temporary, dead
+    /// at every statement boundary (`compiler.zig:8-9`) and after the loop
+    /// (`freeTo(base)`). `commit()` drops such slots from the exit snapshot — they
+    /// are recomputed by tier-0 on deopt and never read post-loop. The `maxInt`
+    /// sentinel means "unknown" (while / generic-`for` / a passed-through `for`),
+    /// so nothing is filtered and behavior is unchanged.
+    locals_watermark: u32 = std.math.maxInt(u32),
 
     pub fn deinit(self: *Recorder, gpa: std.mem.Allocator) void {
         self.instrs.deinit(gpa);
@@ -882,6 +925,7 @@ pub const Recorder = struct {
         @memset(self.reg_map, .{});
         self.anchor = anchor;
         self.abort_reason = null;
+        self.locals_watermark = std.math.maxInt(u32);
         self.active = true;
     }
 };

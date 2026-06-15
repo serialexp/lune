@@ -141,6 +141,13 @@ emission). Each tier-0 slot the trace touches is classified — total and disjoi
   never written back (untouched ⇒ stays coherent).
 - **write-only** = in `exit_stores`, not `slot_load`ed (e.g. `flag = i<limit`). Keeps
   cut-1 behaviour: committed to `regs[]` at the back-edge, never touched at a deopt.
+  Note the recorder pre-filters this set: for a numeric-`for`, a write-only slot
+  that is a *compiler temporary* (above the live-locals watermark `base+4`, set
+  only by the anchoring loop's `for_loop`) is dropped from `exit_stores` at
+  `commit()` — it's dead at the loop header (tier-0 recomputes it on deopt) and
+  after the loop, so its per-iteration commit was pure waste. So the write-only
+  slots that reach here are genuine live-out locals (or any slot in a non-`for`-
+  anchored trace, which is never filtered).
 
 **Type-stability rejection:** a carried slot whose `store_ref`'s proven kind differs
 from its load kind (loaded `Int`, stored `Bool`, or vice-versa) **bails the whole
