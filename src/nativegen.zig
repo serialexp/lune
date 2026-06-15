@@ -166,16 +166,15 @@ pub fn compile(gpa: std.mem.Allocator, t: *const Trace) ?CompiledTrace {
 
     if (!proveKinds(gpa, t, kinds, slot_of)) return null;
 
-    // cut-2 commit A: run the allocator for its invariant assertions, but `lower` does
-    // not consume it yet (the cut-1 stack-slot path is still emitted). A `null` here is
-    // *not* a bail in this commit — the old path handles every proveKinds-accepted
-    // trace. The result is consumed in commit B/C.
-    var alloc_opt = analyze(gpa, t, kinds, slot_of);
-    defer if (alloc_opt) |*al| al.deinit(gpa);
+    // cut-2: the register allocator + single-snapshot deopt. A `null` is a bail (the
+    // trace runs on tier-1a) — e.g. a type-unstable carried slot the hoisted guard
+    // can't catch.
+    var alloc = analyze(gpa, t, kinds, slot_of) orelse return null;
+    defer alloc.deinit(gpa);
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    lower(t, kinds, slot_of, &asm_buf) catch return null;
+    lower(gpa, t, kinds, &alloc, &asm_buf) catch return null;
     asm_buf.resolve();
 
     const page = mapExecutable(asm_buf.code.items) catch return null;
@@ -552,37 +551,203 @@ fn pickReg(free: *u16) ?Reg {
     return null;
 }
 
-/// Lower a proven trace to machine code. ABI: rdi = regs base (held throughout),
-/// rbx = committed counter, rax/rcx = transient scratch. Each SSA ref lives in a
-/// stack slot `[rsp + r*8]`; the body re-runs from `loop_top` every iteration.
-fn lower(t: *const Trace, kinds: []const Kind, slot_of: []const i32, a: *x64.Assembler) !void {
+// ---------------------------------------------------------------------------
+// cut-2: lowering helpers — a `Place` is where a value sits (a register or a frame
+// slot at an rsp displacement). The body keeps slot homes in registers and transients
+// in frame slots (commit B); commit C moves transients to registers too.
+// ---------------------------------------------------------------------------
+
+const Place = union(enum) {
+    reg: Reg,
+    mem: i32, // rsp-relative byte displacement
+
+    fn eql(x: Place, y: Place) bool {
+        if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
+        return switch (x) {
+            .reg => x.reg == y.reg,
+            .mem => x.mem == y.mem,
+        };
+    }
+};
+
+/// The home of a carried/invariant slot: its assigned register, or — when spilled —
+/// the slot_load ref's own frame slot (which nothing else uses).
+fn slotHomePlace(s: SlotInfo) Place {
+    return switch (s.home) {
+        .reg => |r| .{ .reg = r },
+        .spill => .{ .mem = s.load_ref * 8 },
+    };
+}
+
+/// Where ref `r`'s value lives: a slot_load resolves to its slot home; everything else
+/// is a transient at `[rsp + r*8]` (commit B).
+fn placeOfRef(alloc: *const Alloc, r: usize) Place {
+    const sid = alloc.slot_id_of_ref[r];
+    if (sid >= 0) return slotHomePlace(alloc.slots[@intCast(sid)]);
+    return .{ .mem = @as(i32, @intCast(r)) * 8 };
+}
+
+fn placeToReg(a: *x64.Assembler, dst: Reg, src: Place) !void {
+    switch (src) {
+        .reg => |r| if (r != dst) try a.movRegReg(dst, r),
+        .mem => |d| try a.movRegMem(dst, .rsp, d),
+    }
+}
+
+fn regToPlace(a: *x64.Assembler, dst: Place, src: Reg) !void {
+    switch (dst) {
+        .reg => |r| if (r != src) try a.movRegReg(r, src),
+        .mem => |d| try a.movMemReg(.rsp, d, src),
+    }
+}
+
+/// `dst <- src` between two Places. A mem→mem move routes through rax.
+fn movePlace(a: *x64.Assembler, dst: Place, src: Place) !void {
+    if (Place.eql(dst, src)) return;
+    switch (dst) {
+        .reg => |r| try placeToReg(a, r, src),
+        .mem => |d| switch (src) {
+            .reg => |sr| try a.movMemReg(.rsp, d, sr),
+            .mem => |sd| {
+                try a.movRegMem(.rax, .rsp, sd);
+                try a.movMemReg(.rsp, d, .rax);
+            },
+        },
+    }
+}
+
+const Move = struct { dst: Place, src: Place };
+
+/// Emit a parallel move (the back-edge PHI shuffle): all `dst <- src` happen as if
+/// simultaneously. Acyclic moves go first (Kahn); each remaining disjoint cycle is
+/// broken with rcx (saving the cycle's start value), fully, before the next. rax is
+/// the mem↔mem scratch inside `movePlace`; the two never collide.
+fn emitParallelMove(a: *x64.Assembler, moves: []Move, done: []bool) !void {
+    @memset(done, false);
+    var left = moves.len;
+
+    var progress = true;
+    while (progress and left > 0) {
+        progress = false;
+        for (moves, 0..) |m, i| {
+            if (done[i]) continue;
+            var blocked = false;
+            for (moves, 0..) |o, j| {
+                if (done[j] or j == i) continue;
+                if (Place.eql(o.src, m.dst)) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if (blocked) continue;
+            try movePlace(a, m.dst, m.src);
+            done[i] = true;
+            left -= 1;
+            progress = true;
+        }
+    }
+
+    for (moves, 0..) |_, start| {
+        if (done[start]) continue;
+        try placeToReg(a, .rcx, moves[start].dst); // save the cycle's start value
+        var cur = start;
+        while (true) {
+            const m = moves[cur];
+            done[cur] = true;
+            left -= 1;
+            var nxt: ?usize = null;
+            for (moves, 0..) |o, j| {
+                if (done[j]) continue;
+                if (Place.eql(o.dst, m.src)) {
+                    nxt = j;
+                    break;
+                }
+            }
+            if (nxt) |j| {
+                try movePlace(a, m.dst, m.src);
+                cur = j;
+            } else {
+                try regToPlace(a, m.dst, .rcx); // m.src is the saved cycle start
+                break;
+            }
+        }
+    }
+    std.debug.assert(left == 0);
+}
+
+/// Restore the stack/callee-saved state and return. Shared by both epilogues.
+fn emitTeardown(a: *x64.Assembler, frame: i32, callee: []const Reg) !void {
+    if (frame > 0) try a.addRegImm32(.rsp, frame);
+    var k = callee.len;
+    while (k > 0) {
+        k -= 1;
+        try a.pop(callee[k]);
+    }
+    try a.pop(.rbx);
+    try a.ret();
+}
+
+/// Lower a proven trace to machine code (cut-2). ABI: rdi = regs base, rbx = committed
+/// counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers across
+/// iterations (loaded + type-guarded once in the prologue); `regs[]` is written only on
+/// a side-exit (the single snapshot) or for write-only slots at the back-edge.
+fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler) !void {
     const n = t.instrs.len;
     const frame: i32 = @intCast(std.mem.alignForward(usize, n * 8, 16));
 
-    // Prologue: save rbx, completed = 0, reserve the spill frame.
+    // Callee-saved registers used as homes — preserve across the call.
+    var callee: [ALLOC_ORDER.len]Reg = undefined;
+    var callee_len: usize = 0;
+    for (alloc.slots) |s| {
+        if (s.class == .write_only) continue;
+        if (s.home == .reg and (regBit(s.home.reg) & CALLEE_SAVED_MASK) != 0) {
+            callee[callee_len] = s.home.reg;
+            callee_len += 1;
+        }
+    }
+
+    // Prologue: save rbx + callee-saved homes, completed = 0, reserve the frame.
     try a.push(.rbx);
+    for (callee[0..callee_len]) |r| try a.push(r);
     try a.xorRegReg(.rbx, .rbx);
     if (frame > 0) try a.subRegImm32(.rsp, frame);
 
     const loop_top = try a.label();
-    const exit = try a.label();
+    const deopt_exit = try a.label();
+    const prologue_fail = try a.label();
+
+    // [RV-1] Hoisted type guards (all first → no home is live if one fails), then the
+    // hoisted slot loads. A guard failure here returns 0 without touching regs[].
+    for (alloc.slots) |s| {
+        if (s.class == .write_only) continue;
+        try a.cmpByteMemImm(.rdi, @as(i32, s.slot) * 16, TAG_INT);
+        try a.jcc(.ne, prologue_fail);
+    }
+    for (alloc.slots) |s| {
+        if (s.class == .write_only) continue;
+        const off: i32 = @as(i32, s.slot) * 16 + 8;
+        switch (slotHomePlace(s)) {
+            .reg => |r| try a.movRegMem(r, .rdi, off),
+            .mem => |d| {
+                try a.movRegMem(.rax, .rdi, off);
+                try a.movMemReg(.rsp, d, .rax);
+            },
+        }
+    }
+
     a.bind(loop_top);
 
     for (t.instrs, 0..) |ins, i| {
         switch (ins.op) {
-            .slot_load => {
-                // rax = regs[slot].payload.int  (offset slot*16 + 8)
-                try a.movRegMem(.rax, .rdi, slot_of[i] * 16 + 8);
-                try a.movMemReg(.rsp, spill(i), .rax);
-            },
+            .slot_load, .guard_int => {}, // hoisted to the prologue (loop-invariant)
             .konst => {
                 const bits = t.consts[@intCast(ins.aux)].payload.bits;
                 try a.movRegImm64(.rax, @bitCast(bits));
                 try a.movMemReg(.rsp, spill(i), .rax);
             },
             .add, .sub, .mul, .band, .bor, .bxor => {
-                try a.movRegMem(.rax, .rsp, spill(ins.a));
-                try a.movRegMem(.rcx, .rsp, spill(ins.b));
+                try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
+                try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
                 switch (ins.op) {
                     .add => try a.addRegReg(.rax, .rcx),
                     .sub => try a.subRegReg(.rax, .rcx),
@@ -595,13 +760,13 @@ fn lower(t: *const Trace, kinds: []const Kind, slot_of: []const i32, a: *x64.Ass
                 try a.movMemReg(.rsp, spill(i), .rax);
             },
             .neg, .bnot => {
-                try a.movRegMem(.rax, .rsp, spill(ins.a));
+                try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
                 if (ins.op == .neg) try a.negReg(.rax) else try a.notReg(.rax);
                 try a.movMemReg(.rsp, spill(i), .rax);
             },
             .eq, .ne, .lt, .le => {
-                try a.movRegMem(.rax, .rsp, spill(ins.a));
-                try a.movRegMem(.rcx, .rsp, spill(ins.b));
+                try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
+                try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
                 try a.cmpRegReg(.rax, .rcx);
                 const cc: x64.Cond = switch (ins.op) {
                     .eq => .e,
@@ -614,36 +779,49 @@ fn lower(t: *const Trace, kinds: []const Kind, slot_of: []const i32, a: *x64.Ass
                 try a.movzxRegReg8(.rax, .rax); // zero-extend the 0/1 (setcc is 8-bit)
                 try a.movMemReg(.rsp, spill(i), .rax);
             },
-            .guard_int => {
-                // cmp byte [regs[slot].tag], int ; jne EXIT
-                try a.cmpByteMemImm(.rdi, slot_of[ins.a] * 16, TAG_INT);
-                try a.jcc(.ne, exit);
-            },
             .guard_true => switch (kinds[ins.a]) {
                 .int => {}, // every int is truthy → guard always passes (no-op)
                 .bool => {
                     try a.cmpQwordMemImm8(.rsp, spill(ins.a), 0);
-                    try a.jcc(.e, exit); // false (0) → side-exit
+                    try a.jcc(.e, deopt_exit); // false (0) → side-exit
                 },
                 .none => unreachable,
             },
             .guard_false => switch (kinds[ins.a]) {
-                .int => try a.jmp(exit), // an int is never falsy → always side-exit
+                .int => try a.jmp(deopt_exit), // an int is never falsy → always side-exit
                 .bool => {
                     try a.cmpQwordMemImm8(.rsp, spill(ins.a), 0);
-                    try a.jcc(.ne, exit); // true (≠0) → side-exit
+                    try a.jcc(.ne, deopt_exit); // true (≠0) → side-exit
                 },
                 .none => unreachable,
             },
             .loop => {
-                // Commit: box each loop-carried writeback into regs, then iterate.
-                for (t.exit_stores) |st| {
-                    const tag: i32 = if (kinds[st.ref] == .bool) TAG_BOOL else TAG_INT;
-                    const base: i32 = @as(i32, st.slot) * 16;
-                    try a.movMemImm32(.rdi, base, tag); // tag word (zeroes padding)
-                    try a.movRegMem(.rax, .rsp, spill(st.ref));
-                    try a.movMemReg(.rdi, base + 8, .rax); // payload word
+                // [RV-2] write-only slots commit to regs[] BEFORE the shuffle, so the
+                // shuffle can't clobber a write-only source that aliases a carried home.
+                for (alloc.slots) |s| {
+                    if (s.class != .write_only) continue;
+                    const base: i32 = @as(i32, s.slot) * 16;
+                    const tag: i32 = if (s.kind == .bool) TAG_BOOL else TAG_INT;
+                    try placeToReg(a, .rax, placeOfRef(alloc, @intCast(s.store_ref)));
+                    try a.movMemImm32(.rdi, base, tag);
+                    try a.movMemReg(.rdi, base + 8, .rax);
                 }
+                // PHI shuffle: carried home(slot) <- store_ref location.
+                var nmoves: usize = 0;
+                for (alloc.slots) |s| {
+                    if (s.class == .carried) nmoves += 1;
+                }
+                const moves = try gpa.alloc(Move, nmoves);
+                defer gpa.free(moves);
+                const done = try gpa.alloc(bool, nmoves);
+                defer gpa.free(done);
+                var mi: usize = 0;
+                for (alloc.slots) |s| {
+                    if (s.class != .carried) continue;
+                    moves[mi] = .{ .dst = slotHomePlace(s), .src = placeOfRef(alloc, @intCast(s.store_ref)) };
+                    mi += 1;
+                }
+                try emitParallelMove(a, moves, done);
                 try a.incReg(.rbx);
                 try a.jmp(loop_top);
             },
@@ -651,12 +829,30 @@ fn lower(t: *const Trace, kinds: []const Kind, slot_of: []const i32, a: *x64.Ass
         }
     }
 
-    // Shared side-exit epilogue: return completed, restore the stack and rbx.
-    a.bind(exit);
+    // DEOPT_EXIT: the single snapshot flush. Write each carried home back to regs[]
+    // (always int-tagged) — invariant + write-only slots are already coherent. Then
+    // return `completed`.
+    a.bind(deopt_exit);
+    for (alloc.slots) |s| {
+        if (s.class != .carried) continue;
+        const base: i32 = @as(i32, s.slot) * 16;
+        try a.movMemImm32(.rdi, base, TAG_INT);
+        switch (slotHomePlace(s)) {
+            .reg => |r| try a.movMemReg(.rdi, base + 8, r),
+            .mem => |d| {
+                try a.movRegMem(.rax, .rsp, d);
+                try a.movMemReg(.rdi, base + 8, .rax);
+            },
+        }
+    }
     try a.movRegReg(.rax, .rbx);
-    if (frame > 0) try a.addRegImm32(.rsp, frame);
-    try a.pop(.rbx);
-    try a.ret();
+    try emitTeardown(a, frame, callee[0..callee_len]);
+
+    // PROLOGUE_FAIL: a hoisted type guard failed before any commit. Return 0 with
+    // regs[] untouched (the cut-1 EXIT would have flushed half-initialized homes).
+    a.bind(prologue_fail);
+    try a.xorRegReg(.rax, .rax);
+    try emitTeardown(a, frame, callee[0..callee_len]);
 }
 
 // ---------------------------------------------------------------------------
@@ -872,6 +1068,100 @@ test "nativegen: bails on unsupported traces" {
         const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
         try expectBail(&t);
     }
+}
+
+test "nativegen: a swap loop exercises a register home cycle" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // for i=0..limit { a, b = b, a }  — slot0=a, slot1=b, slot2=i, slot3=limit.
+    // a's writeback is b's loaded value and vice-versa ⇒ home(a)<-home(b), home(b)<-home(a):
+    // a 2-cycle the parallel-move must break with the scratch.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 2 }, // 0: i
+        .{ .op = .guard_int, .a = 0 }, // 1
+        .{ .op = .slot_load, .aux = 3 }, // 2: limit
+        .{ .op = .guard_int, .a = 2 }, // 3
+        .{ .op = .lt, .a = 0, .b = 2 }, // 4: i < limit
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 0 }, // 6: a
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .slot_load, .aux = 1 }, // 8: b
+        .{ .op = .guard_int, .a = 8 }, // 9
+        .{ .op = .konst, .aux = 0 }, // 10: 1
+        .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1
+        .{ .op = .loop }, // 12
+    };
+    var consts = [_]Value{Value.int(1)};
+    // a<-b(ref8), b<-a(ref6), i<-i+1(ref11)
+    var exits = [_]S{ .{ .slot = 0, .ref = 8 }, .{ .slot = 1, .ref = 6 }, .{ .slot = 2, .ref = 11 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    // a=10, b=20, i=0, limit=3: three swaps ⇒ a=20, b=10. The oracle is the judge.
+    try expectMatch(&t, &.{ Value.int(10), Value.int(20), Value.int(0), Value.int(3) });
+    // limit=0: zero iterations, no swap.
+    try expectMatch(&t, &.{ Value.int(10), Value.int(20), Value.int(0), Value.int(0) });
+}
+
+test "nativegen: more carried+invariant slots than registers forces spilled homes" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // acc = acc + i + (x0..x9), with 10 invariant slots → 13 homes > 11 GPRs ⇒ spills.
+    var ins: std.ArrayListUnmanaged(I) = .empty;
+    defer ins.deinit(gpa);
+    var exits: std.ArrayListUnmanaged(S) = .empty;
+    defer exits.deinit(gpa);
+
+    const r_i: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .slot_load, .aux = 0 });
+    try ins.append(gpa, .{ .op = .guard_int, .a = r_i });
+    const r_lim: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .slot_load, .aux = 1 });
+    try ins.append(gpa, .{ .op = .guard_int, .a = r_lim });
+    const r_lt: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .lt, .a = r_i, .b = r_lim });
+    try ins.append(gpa, .{ .op = .guard_true, .a = r_lt });
+    const r_acc: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .slot_load, .aux = 2 });
+    try ins.append(gpa, .{ .op = .guard_int, .a = r_acc });
+
+    var xrefs: [10]u16 = undefined;
+    var k: usize = 0;
+    while (k < 10) : (k += 1) {
+        const r: u16 = @intCast(ins.items.len);
+        try ins.append(gpa, .{ .op = .slot_load, .aux = @intCast(3 + k) });
+        try ins.append(gpa, .{ .op = .guard_int, .a = r });
+        xrefs[k] = r;
+    }
+    var sum: u16 = r_acc;
+    for (xrefs) |xr| {
+        const r: u16 = @intCast(ins.items.len);
+        try ins.append(gpa, .{ .op = .add, .a = sum, .b = xr });
+        sum = r;
+    }
+    {
+        const r: u16 = @intCast(ins.items.len);
+        try ins.append(gpa, .{ .op = .add, .a = sum, .b = r_i });
+        sum = r;
+    }
+    const r_one: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .konst, .aux = 0 });
+    const r_inc: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .add, .a = r_i, .b = r_one });
+    try ins.append(gpa, .{ .op = .loop });
+
+    try exits.append(gpa, .{ .slot = 2, .ref = sum }); // acc
+    try exits.append(gpa, .{ .slot = 0, .ref = r_inc }); // i
+
+    var consts = [_]Value{Value.int(1)};
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = ins.items, .consts = &consts, .entry_slots = &es, .exit_stores = exits.items };
+
+    var regs: [13]Value = undefined;
+    regs[0] = Value.int(0); // i
+    regs[1] = Value.int(4); // limit
+    regs[2] = Value.int(0); // acc
+    var j: usize = 0;
+    while (j < 10) : (j += 1) regs[3 + j] = Value.int(@intCast(j + 1)); // x0..x9 = 1..10
+    try expectMatch(&t, &regs);
 }
 
 test "nativegen: analyze classifies slots and pins disjoint homes" {
