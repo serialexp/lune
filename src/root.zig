@@ -49,8 +49,10 @@ pub const trace = @import("trace.zig");
 pub const irinterp = @import("irinterp.zig");
 
 /// Phase 8 — tier-1b native codegen: a hand-rolled x86-64 encoder (`x64`) and the
-/// integer-trace machine-code compiler (`nativegen`). CLI/native-only.
+/// integer-trace machine-code compiler (`nativegen`). CLI/native-only — its
+/// OS-specific bits are comptime-gated to x86-64 Linux (inert elsewhere, incl. wasm).
 pub const x64 = @import("x64.zig");
+pub const nativegen = @import("nativegen.zig");
 
 /// Phase 7 (trace-iteration animation) — in-memory trace **execution log**: per
 /// entry/exit-ramp events the IR-interpreter emits for the visualizer. Off the JIT
@@ -107,6 +109,7 @@ test {
     _ = trace;
     _ = irinterp;
     _ = x64;
+    _ = nativegen;
     _ = execlog;
     _ = tropt;
     _ = traceser;

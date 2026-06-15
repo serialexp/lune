@@ -290,6 +290,14 @@ pub const Assembler = struct {
         try self.imm32(v);
     }
 
+    /// `cmp reg, imm32` — REX.W 81 /7 id (imm sign-extended to 64).
+    pub fn cmpRegImm32(self: *Assembler, reg: Reg, v: i32) !void {
+        try self.rex(true, false, false, reg.hi());
+        try self.b(0x81);
+        try self.modrmReg(7, reg.lo());
+        try self.imm32(v);
+    }
+
     /// `cmp byte [base + disp], imm8` — 80 /7 ib (8-bit; REX only if base ≥ r8).
     /// The guard_int tag check: `cmp byte [rdi + slot*16], Tag.int`.
     pub fn cmpByteMemImm(self: *Assembler, base: Reg, disp: i32, v: u8) !void {
@@ -527,6 +535,11 @@ test "enc: add/sub reg, imm32" {
     try expectEnc(&.{ 0x48, 0x81, 0xC4, 0x80, 0, 0, 0 }, struct { // add rsp, 128
         fn f(a: *Assembler) !void {
             try a.addRegImm32(.rsp, 128);
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0x81, 0xFF, 0, 0, 0, 0 }, struct { // cmp rdi, 0
+        fn f(a: *Assembler) !void {
+            try a.cmpRegImm32(.rdi, 0);
         }
     }.f);
 }
