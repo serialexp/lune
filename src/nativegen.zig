@@ -166,6 +166,13 @@ pub fn compile(gpa: std.mem.Allocator, t: *const Trace) ?CompiledTrace {
 
     if (!proveKinds(gpa, t, kinds, slot_of)) return null;
 
+    // cut-2 commit A: run the allocator for its invariant assertions, but `lower` does
+    // not consume it yet (the cut-1 stack-slot path is still emitted). A `null` here is
+    // *not* a bail in this commit — the old path handles every proveKinds-accepted
+    // trace. The result is consumed in commit B/C.
+    var alloc_opt = analyze(gpa, t, kinds, slot_of);
+    defer if (alloc_opt) |*al| al.deinit(gpa);
+
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
     lower(t, kinds, slot_of, &asm_buf) catch return null;
@@ -261,6 +268,288 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
 /// Stack-slot displacement for SSA ref `r`: each ref owns one 8-byte frame slot.
 fn spill(r: usize) i32 {
     return @intCast(r * 8);
+}
+
+// ---------------------------------------------------------------------------
+// cut-2: register allocation + single-snapshot deopt — the analysis half
+//
+// `analyze` is a forward linear-scan over the linear SSA that (a) classifies each
+// tier-0 slot the trace touches, (b) computes per-ref liveness, and (c) assigns
+// every value a `Loc` (a CPU register or a frame spill slot). It is *pure analysis*:
+// `lower` consumes its output in later commits. Landed first as a measured no-op so
+// the risky logic rides under the existing differential oracle.
+// ---------------------------------------------------------------------------
+
+/// Where a value lives during the loop body.
+const Loc = union(enum) {
+    reg: Reg,
+    spill: u32, // frame slot index; byte displacement = index * 8
+};
+
+/// How a slot participates in the loop, deciding its prologue/back-edge/EXIT handling.
+const SlotClass = enum {
+    /// slot_loaded AND in exit_stores: read+write loop-carried. Gets a home; flushed
+    /// to regs[] on a side-exit; reassigned at the back-edge shuffle.
+    carried,
+    /// slot_loaded, NOT in exit_stores: read-only, loop-invariant. Loaded once into a
+    /// home; never written back (untouched ⇒ coherent).
+    invariant,
+    /// in exit_stores, NOT slot_loaded (e.g. `flag = i<limit`). No home; committed to
+    /// regs[] at the back-edge (cut-1 style); never touched at EXIT.
+    write_only,
+};
+
+/// Compile-time facts about one tier-0 slot.
+const SlotInfo = struct {
+    slot: u16,
+    class: SlotClass,
+    kind: Kind, // box tag at commit/flush (int for carried/invariant; store_ref's for write_only)
+    home: Loc, // valid for carried/invariant
+    load_ref: i32, // the slot_load ref, or -1
+    store_ref: i32, // the exit_store ref feeding it, or -1
+};
+
+/// The allocator's output — the sole input `lower` needs (later commits).
+const Alloc = struct {
+    loc: []Loc, // [n] location of each ref's value (slot_load refs resolve to their home)
+    last_use: []u32, // [n] index of the last instruction reading each ref
+    slot_id_of_ref: []i32, // [n] slots[] index for a slot_load ref, else -1
+    slots: []SlotInfo,
+    spill_count: u32, // frame slots used (homes + transients); frame = spill_count*8
+    used_callee_saved: u16, // bitmask of callee-saved GPRs used (must be push/pop'd)
+
+    fn deinit(self: *Alloc, gpa: std.mem.Allocator) void {
+        gpa.free(self.loc);
+        gpa.free(self.last_use);
+        gpa.free(self.slot_id_of_ref);
+        gpa.free(self.slots);
+        self.* = undefined;
+    }
+};
+
+/// 1<<reg as a 16-bit register-set bit.
+fn regBit(r: Reg) u16 {
+    return @as(u16, 1) << @intFromEnum(r);
+}
+
+/// Allocatable GPRs, in preference order: caller-saved first (no prologue save), then
+/// callee-saved (push/pop'd). Excludes rax/rcx (scratch), rbx (completed), rsp, rdi
+/// (regs base).
+const ALLOC_ORDER = [_]Reg{ .rdx, .rsi, .r8, .r9, .r10, .r11, .rbp, .r12, .r13, .r14, .r15 };
+const CALLEE_SAVED_MASK: u16 = regBit(.rbp) | regBit(.r12) | regBit(.r13) | regBit(.r14) | regBit(.r15);
+
+const AnalyzeError = std.mem.Allocator.Error || error{
+    /// cut-2 cannot represent this trace (type-instability, etc.). The caller bails;
+    /// the cut-1 stack-slot path (or tier-1a) handles it correctly.
+    Bail,
+};
+
+/// True iff `op` produces a register-resident value that gets its own location (i.e. a
+/// transient: konst / arithmetic / compare). slot_loads resolve to a slot home; guards
+/// and the loop marker produce no value.
+fn isTransient(op: trace.IrOp) bool {
+    return switch (op) {
+        .konst, .add, .sub, .mul, .band, .bor, .bxor, .neg, .bnot, .eq, .ne, .lt, .le => true,
+        else => false,
+    };
+}
+
+/// The operand refs an instruction reads (matching `proveKinds`/`lower` exactly).
+fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
+    return switch (ins.op) {
+        .add, .sub, .mul, .band, .bor, .bxor, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
+        .neg, .bnot, .guard_int, .guard_true, .guard_false => .{ .a = true, .b = false },
+        else => .{ .a = false, .b = false },
+    };
+}
+
+/// Find a slot in the list or append a fresh (unclassified) entry; returns its index.
+fn findOrAddSlot(slots: *std.ArrayListUnmanaged(SlotInfo), gpa: std.mem.Allocator, slot: u16) !usize {
+    for (slots.items, 0..) |s, id| {
+        if (s.slot == slot) return id;
+    }
+    try slots.append(gpa, .{
+        .slot = slot,
+        .class = undefined,
+        .kind = .none,
+        .home = undefined,
+        .load_ref = -1,
+        .store_ref = -1,
+    });
+    return slots.items.len - 1;
+}
+
+/// See module header. Returns `null` to bail (cut-2 cannot compile this trace); the
+/// caller falls back. Runs only on a `proveKinds`-accepted trace, so every op is in the
+/// supported subset and `kinds`/`slot_of` are filled.
+fn analyze(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, slot_of: []const i32) ?Alloc {
+    return analyzeInner(gpa, t, kinds, slot_of) catch |e| switch (e) {
+        error.Bail, error.OutOfMemory => null,
+    };
+}
+
+fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, slot_of: []const i32) AnalyzeError!Alloc {
+    const n = t.instrs.len;
+
+    var slots: std.ArrayListUnmanaged(SlotInfo) = .empty;
+    errdefer slots.deinit(gpa);
+
+    const slot_id_of_ref = try gpa.alloc(i32, n);
+    errdefer gpa.free(slot_id_of_ref);
+    @memset(slot_id_of_ref, -1);
+
+    // --- classification: gather slot_loads, then exit_stores ---
+    for (t.instrs, 0..) |ins, i| {
+        if (ins.op != .slot_load) continue;
+        const slot: u16 = @intCast(slot_of[i]); // validated >= 0 in proveKinds
+        const id = try findOrAddSlot(&slots, gpa, slot);
+        slots.items[id].load_ref = @intCast(i);
+        slot_id_of_ref[i] = @intCast(id);
+    }
+    for (t.exit_stores) |st| {
+        const id = try findOrAddSlot(&slots, gpa, st.slot);
+        slots.items[id].store_ref = st.ref;
+    }
+    for (slots.items) |*s| {
+        const loaded = s.load_ref >= 0;
+        const stored = s.store_ref >= 0;
+        if (loaded and stored) {
+            s.class = .carried;
+            s.kind = .int; // the load is guarded int
+            // [RV-3] type-stability: a carried slot stored as non-int would pass our
+            // hoisted (once) guard_int forever while the oracle re-checks every
+            // iteration and deopts. Reject so the trace stays on tier-1a.
+            if (kinds[@intCast(s.store_ref)] != .int) return error.Bail;
+        } else if (loaded) {
+            s.class = .invariant;
+            s.kind = .int;
+        } else {
+            s.class = .write_only;
+            s.kind = kinds[@intCast(s.store_ref)];
+        }
+    }
+
+    // --- liveness: last_use, single backward pass; carried/write store_refs live to the marker ---
+    const last_use = try gpa.alloc(u32, n);
+    errdefer gpa.free(last_use);
+    for (last_use, 0..) |*lu, i| lu.* = @intCast(i); // live at least at its own def
+    {
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            const ins = t.instrs[i];
+            const rd = operandReads(ins);
+            if (rd.a and last_use[ins.a] < i) last_use[ins.a] = @intCast(i);
+            if (rd.b and last_use[ins.b] < i) last_use[ins.b] = @intCast(i);
+        }
+    }
+    // The value feeding any exit_store must survive to the back-edge shuffle/commit.
+    for (t.exit_stores) |st| {
+        if (last_use[st.ref] < n - 1) last_use[st.ref] = @intCast(n - 1);
+    }
+
+    // --- allocation: pin slot homes, then linear-scan the transients ---
+    const loc = try gpa.alloc(Loc, n);
+    errdefer gpa.free(loc);
+    for (loc) |*l| l.* = .{ .spill = 0 }; // placeholder for value-less refs (guards/loop)
+
+    var free: u16 = comptime blk: {
+        var m: u16 = 0;
+        for (ALLOC_ORDER) |r| m |= regBit(r);
+        break :blk m;
+    };
+    var spill_count: u32 = 0;
+    var used_callee: u16 = 0;
+    var home_reg_mask: u16 = 0;
+
+    for (slots.items) |*s| {
+        if (s.class == .write_only) continue;
+        if (pickReg(&free)) |r| {
+            s.home = .{ .reg = r };
+            home_reg_mask |= regBit(r);
+            used_callee |= regBit(r) & CALLEE_SAVED_MASK;
+        } else {
+            s.home = .{ .spill = spill_count };
+            spill_count += 1;
+        }
+    }
+    // Resolve slot_load refs to their slot home.
+    for (t.instrs, 0..) |ins, i| {
+        if (ins.op != .slot_load) continue;
+        loc[i] = slots.items[@intCast(slot_id_of_ref[i])].home;
+    }
+
+    // Linear scan over transient defs in index order; active set ≤ pool size.
+    var active: [ALLOC_ORDER.len]struct { reg: Reg, last: u32 } = undefined;
+    var active_len: usize = 0;
+    for (t.instrs, 0..) |ins, i| {
+        if (!isTransient(ins.op)) continue;
+        // expire transients whose last use precedes i
+        var w: usize = 0;
+        for (active[0..active_len]) |e| {
+            if (e.last < i) {
+                free |= regBit(e.reg);
+            } else {
+                active[w] = e;
+                w += 1;
+            }
+        }
+        active_len = w;
+        if (pickReg(&free)) |r| {
+            loc[i] = .{ .reg = r };
+            used_callee |= regBit(r) & CALLEE_SAVED_MASK;
+            active[active_len] = .{ .reg = r, .last = last_use[i] };
+            active_len += 1;
+        } else {
+            loc[i] = .{ .spill = spill_count };
+            spill_count += 1;
+        }
+    }
+
+    // --- invariant assertions (compiled out in release; the structural guardrail) ---
+    if (std.debug.runtime_safety) {
+        // homes are register-disjoint
+        var seen: u16 = 0;
+        for (slots.items) |s| {
+            if (s.class == .write_only) continue;
+            if (s.home == .reg) {
+                const b = regBit(s.home.reg);
+                std.debug.assert(seen & b == 0);
+                seen |= b;
+            }
+        }
+        // no transient register aliases a home register
+        for (t.instrs, 0..) |ins, i| {
+            if (!isTransient(ins.op)) continue;
+            if (loc[i] == .reg) std.debug.assert(home_reg_mask & regBit(loc[i].reg) == 0);
+        }
+        // every exit_store ref has a concrete location (it always does)
+        for (t.exit_stores) |st| {
+            const l = loc[st.ref];
+            std.debug.assert(l == .reg or l == .spill);
+        }
+    }
+
+    return .{
+        .loc = loc,
+        .last_use = last_use,
+        .slot_id_of_ref = slot_id_of_ref,
+        .slots = try slots.toOwnedSlice(gpa),
+        .spill_count = spill_count,
+        .used_callee_saved = used_callee,
+    };
+}
+
+/// Pop the first free register in `ALLOC_ORDER` preference, clearing its bit. Null if none.
+fn pickReg(free: *u16) ?Reg {
+    for (ALLOC_ORDER) |r| {
+        const b = regBit(r);
+        if (free.* & b != 0) {
+            free.* &= ~b;
+            return r;
+        }
+    }
+    return null;
 }
 
 /// Lower a proven trace to machine code. ABI: rdi = regs base (held throughout),
@@ -583,6 +872,87 @@ test "nativegen: bails on unsupported traces" {
         const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
         try expectBail(&t);
     }
+}
+
+test "nativegen: analyze classifies slots and pins disjoint homes" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // Same clean counting loop: r0=i (carried), r1=limit (invariant), r2=acc (carried).
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4: i < limit
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: acc
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .add, .a = 6, .b = 0 }, // 8: acc + i
+        .{ .op = .konst, .aux = 0 }, // 9: 1
+        .{ .op = .add, .a = 0, .b = 9 }, // 10: i + 1
+        .{ .op = .loop }, // 11
+    };
+    var consts = [_]Value{Value.int(1)};
+    var exits = [_]S{ .{ .slot = 2, .ref = 8 }, .{ .slot = 0, .ref = 10 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+
+    const kinds = try testing.allocator.alloc(Kind, instrs.len);
+    defer testing.allocator.free(kinds);
+    const slot_of = try testing.allocator.alloc(i32, instrs.len);
+    defer testing.allocator.free(slot_of);
+    try testing.expect(proveKinds(testing.allocator, &t, kinds, slot_of));
+
+    var al = analyze(testing.allocator, &t, kinds, slot_of) orelse return error.AnalyzeBailed;
+    defer al.deinit(testing.allocator);
+
+    // Three distinct slots, classified.
+    try testing.expectEqual(@as(usize, 3), al.slots.len);
+    for (al.slots) |s| {
+        switch (s.slot) {
+            0 => try testing.expectEqual(SlotClass.carried, s.class), // i: read+write
+            1 => try testing.expectEqual(SlotClass.invariant, s.class), // limit: read-only
+            2 => try testing.expectEqual(SlotClass.carried, s.class), // acc: read+write
+            else => return error.UnexpectedSlot,
+        }
+        try testing.expectEqual(Kind.int, s.kind);
+    }
+    // Carried/invariant homes are register-disjoint (small trace ⇒ all in regs).
+    var seen: u16 = 0;
+    for (al.slots) |s| {
+        try testing.expect(s.home == .reg);
+        try testing.expect(seen & regBit(s.home.reg) == 0);
+        seen |= regBit(s.home.reg);
+    }
+    // slot_load refs resolve to their slot home (no own register).
+    try testing.expectEqual(al.slots[0].home, al.loc[0]); // ref 0 ↔ slot 0
+    // Each exit_store's producer is live through to the loop marker (the back-edge).
+    try testing.expectEqual(@as(u32, instrs.len - 1), al.last_use[8]); // acc+i
+    try testing.expectEqual(@as(u32, instrs.len - 1), al.last_use[10]); // i+1
+}
+
+test "nativegen: analyze rejects a type-unstable carried slot" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // slot 0 is loaded as int (guarded) but stored as a bool (a comparison result) —
+    // the oracle would deopt next iteration; cut-2 must refuse to compile it.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i (int)
+        .{ .op = .guard_int, .a = 0 }, // 1
+        .{ .op = .konst, .aux = 0 }, // 2: 3
+        .{ .op = .lt, .a = 0, .b = 2 }, // 3: i < 3 (BOOL)
+        .{ .op = .loop }, // 4
+    };
+    var consts = [_]Value{Value.int(3)};
+    var exits = [_]S{.{ .slot = 0, .ref = 3 }}; // slot 0 stored as the bool
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+
+    const kinds = try testing.allocator.alloc(Kind, instrs.len);
+    defer testing.allocator.free(kinds);
+    const slot_of = try testing.allocator.alloc(i32, instrs.len);
+    defer testing.allocator.free(slot_of);
+    try testing.expect(proveKinds(testing.allocator, &t, kinds, slot_of));
+
+    try testing.expect(analyze(testing.allocator, &t, kinds, slot_of) == null);
 }
 
 test "exec memory: assemble, map, and call a native fn(i64)->i64" {
