@@ -301,6 +301,10 @@ const SlotInfo = struct {
     home: Loc, // valid for carried/invariant
     load_ref: i32, // the slot_load ref, or -1
     store_ref: i32, // the exit_store ref feeding it, or -1
+    /// win 2: the store_ref transient was allocated *into* home, so the op updates the
+    /// home in place and the back-edge shuffle move for this slot self-elides. Only set
+    /// for `carried` slots passing the safety predicate (see `analyzeInner`).
+    coalesced: bool,
 };
 
 /// The allocator's output — the sole input `lower` needs (later commits).
@@ -367,6 +371,21 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
     };
 }
 
+/// Whether two `Loc`s name the same physical home (register or spill slot).
+fn locEql(x: Loc, y: Loc) bool {
+    return Place.eql(locToPlace(x), locToPlace(y));
+}
+
+/// Ops whose result can be computed *into* a destination home in place (win 2). A
+/// compare result is Bool, never carried (type-stability bails), and konst has no
+/// operand to anchor the home — so only arithmetic/bitwise + unary qualify.
+fn isCoalescibleOp(op: trace.IrOp) bool {
+    return switch (op) {
+        .add, .sub, .mul, .band, .bor, .bxor, .neg, .bnot => true,
+        else => false,
+    };
+}
+
 /// Find a slot in the list or append a fresh (unclassified) entry; returns its index.
 fn findOrAddSlot(slots: *std.ArrayListUnmanaged(SlotInfo), gpa: std.mem.Allocator, slot: u16) !usize {
     for (slots.items, 0..) |s, id| {
@@ -379,6 +398,7 @@ fn findOrAddSlot(slots: *std.ArrayListUnmanaged(SlotInfo), gpa: std.mem.Allocato
         .home = undefined,
         .load_ref = -1,
         .store_ref = -1,
+        .coalesced = false,
     });
     return slots.items.len - 1;
 }
@@ -483,6 +503,57 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         loc[i] = slots.items[@intCast(slot_id_of_ref[i])].home;
     }
 
+    // --- home coalescing (win 2): allocate a carried slot's store_ref transient INTO
+    // the slot's home, so the op updates the home in place AND the back-edge shuffle
+    // self-elides. Gated by a safety predicate (cuts-2's single-snapshot model assumes
+    // homes are written only at the back-edge; an in-place update breaks that unless no
+    // side-exit follows it). Must run BEFORE the linear scan so it sees loc[j] fixed.
+    const is_coalesced_home = try gpa.alloc(bool, n);
+    defer gpa.free(is_coalesced_home);
+    @memset(is_coalesced_home, false);
+    {
+        // The last side-exiting instruction. In this IR the only mid-iteration exits are
+        // guard_true/guard_false (guard_int is hoisted to the prologue). Trace order is
+        // straight-line, so index order == dominance: "after" == strictly greater index.
+        var last_body_guard: i64 = -1;
+        for (t.instrs, 0..) |ins, idx| {
+            if (ins.op == .guard_true or ins.op == .guard_false) last_body_guard = @intCast(idx);
+        }
+        for (slots.items, 0..) |*s, sid| {
+            if (s.class != .carried) continue;
+            const j: usize = @intCast(s.store_ref);
+            const def = t.instrs[j];
+            if (!isCoalescibleOp(def.op)) continue;
+            // (1) no side-exit follows the in-place update.
+            if (@as(i64, @intCast(j)) <= last_body_guard) continue;
+            // [RV] imul has no [mem],reg store form → a spilled-home mul can't go in place.
+            if (def.op == .mul and s.home != .reg) continue;
+            // (2) S's OLD value is fully dead by j: no slot_load(S) ref is read after j.
+            // (The operand read at j itself has last_use == j ≤ j, which is fine.)
+            var old_live = false;
+            for (0..n) |r2| {
+                if (slot_id_of_ref[r2] == @as(i32, @intCast(sid)) and last_use[r2] > j) {
+                    old_live = true;
+                    break;
+                }
+            }
+            if (old_live) continue;
+            // (3) home(S) holds an operand at the op: left operand is home (any op), or a
+            // commutative op's right operand is home. Unary requires its sole operand.
+            const a_home = operandReads(def).a and locEql(loc[def.a], s.home);
+            const b_home = operandReads(def).b and locEql(loc[def.b], s.home);
+            const op_ok = a_home or (b_home and isCommutative(def.op));
+            if (!op_ok) continue;
+            // Coalesce: pin the transient into the home, mark the slot, and extend the
+            // transient's live range to the loop marker so the scan never frees the home
+            // [RV: the coalesced value IS snapshot state from j onward].
+            loc[j] = s.home;
+            s.coalesced = true;
+            is_coalesced_home[j] = true;
+            if (last_use[j] < n - 1) last_use[j] = @intCast(n - 1);
+        }
+    }
+
     // Linear scan over transient defs in index order; active set ≤ pool size.
     var active: [ALLOC_ORDER.len]struct { reg: Reg, last: u32 } = undefined;
     var active_len: usize = 0;
@@ -499,6 +570,9 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             }
         }
         active_len = w;
+
+        // A win-2 transient is already pinned to its slot home — never reallocate it.
+        if (is_coalesced_home[i]) continue;
 
         // --- operand coalescing (win 1): reuse a *dying* operand's register for the
         // result, emitting an in-place `op dst, b` instead of staging through rax.
@@ -554,9 +628,11 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                 seen |= b;
             }
         }
-        // no transient register aliases a home register
+        // no transient register aliases a home register — except a win-2 transient,
+        // which is deliberately pinned INTO its slot's home.
         for (t.instrs, 0..) |ins, i| {
             if (!isTransient(ins.op)) continue;
+            if (is_coalesced_home[i]) continue;
             if (loc[i] == .reg) std.debug.assert(home_reg_mask & regBit(loc[i].reg) == 0);
         }
         // every exit_store ref has a concrete location (it always does)
@@ -968,10 +1044,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     try a.movMemImm32(.rdi, base, tag);
                     try a.movMemReg(.rdi, base + 8, .rax);
                 }
-                // PHI shuffle: carried home(slot) <- store_ref location.
+                // PHI shuffle: carried home(slot) <- store_ref location. A win-2
+                // coalesced slot already updated its home in place (the move would be a
+                // self-move), so it is dropped from the parallel move entirely.
                 var nmoves: usize = 0;
                 for (alloc.slots) |s| {
-                    if (s.class == .carried) nmoves += 1;
+                    if (s.class == .carried and !s.coalesced) nmoves += 1;
                 }
                 const moves = try gpa.alloc(Move, nmoves);
                 defer gpa.free(moves);
@@ -979,7 +1057,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 defer gpa.free(done);
                 var mi: usize = 0;
                 for (alloc.slots) |s| {
-                    if (s.class != .carried) continue;
+                    if (s.class != .carried or s.coalesced) continue;
                     moves[mi] = .{ .dst = slotHomePlace(s), .src = placeOfRef(alloc, @intCast(s.store_ref)) };
                     mi += 1;
                 }
@@ -1230,6 +1308,241 @@ test "nativegen: bails on unsupported traces" {
         const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
         try expectBail(&t);
     }
+}
+
+/// Helper: run proveKinds + analyze and return whether the carried slot `slot`
+/// coalesced its store into its home (win 2). Caller frees nothing; this owns it.
+fn slotCoalesced(t: *const Trace, slot: u16) !bool {
+    const kinds = try testing.allocator.alloc(Kind, t.instrs.len);
+    defer testing.allocator.free(kinds);
+    const slot_of = try testing.allocator.alloc(i32, t.instrs.len);
+    defer testing.allocator.free(slot_of);
+    if (!proveKinds(testing.allocator, t, kinds, slot_of)) return error.ProveFailed;
+    var al = analyze(testing.allocator, t, kinds, slot_of) orelse return error.AnalyzeBailed;
+    defer al.deinit(testing.allocator);
+    for (al.slots) |s| {
+        if (s.slot == slot) return s.coalesced;
+    }
+    return error.NoSuchSlot;
+}
+
+test "nativegen win2: accumulator coalesces when no guard follows the update" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // guard_true is at index 5 (before the acc update at 8) → cond 1 holds → coalesce.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5  ← last body guard
+        .{ .op = .slot_load, .aux = 2 }, // 6: acc
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .add, .a = 6, .b = 0 }, // 8: acc + i   (after the guard → coalesces)
+        .{ .op = .konst, .aux = 0 }, // 9: 1
+        .{ .op = .add, .a = 0, .b = 9 }, // 10: i + 1    (after the guard → coalesces)
+        .{ .op = .loop }, // 11
+    };
+    var consts = [_]Value{Value.int(1)};
+    var exits = [_]S{ .{ .slot = 2, .ref = 8 }, .{ .slot = 0, .ref = 10 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try testing.expect(try slotCoalesced(&t, 2)); // acc, left-operand home
+    try testing.expect(try slotCoalesced(&t, 0)); // i,  left-operand home
+    try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.int(0) });
+    try expectMatch(&t, &.{ Value.int(7), Value.int(3), Value.int(100) });
+}
+
+test "nativegen win2: a guard AFTER the accumulation blocks coalescing (cond 1)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // acc update at 8, then a guard_true at 10 reading a body bool: cond 1 fails for acc.
+    // On that guard's failure the snapshot must restore the loop-header acc, NOT acc+i.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .slot_load, .aux = 2 }, // 4: acc
+        .{ .op = .guard_int, .a = 4 }, // 5
+        .{ .op = .konst, .aux = 0 }, // 6: 1
+        .{ .op = .add, .a = 0, .b = 6 }, // 7: i + 1
+        .{ .op = .add, .a = 4, .b = 0 }, // 8: acc + i    (precedes a later guard)
+        .{ .op = .lt, .a = 7, .b = 1 }, // 9: (i+1) < limit
+        .{ .op = .guard_true, .a = 9 }, // 10 ← guard AFTER the acc update
+        .{ .op = .loop }, // 11
+    };
+    var consts = [_]Value{Value.int(1)};
+    var exits = [_]S{ .{ .slot = 2, .ref = 8 }, .{ .slot = 0, .ref = 7 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try testing.expect(!(try slotCoalesced(&t, 2))); // acc must NOT coalesce
+    try testing.expect(!(try slotCoalesced(&t, 0))); // i  must NOT coalesce
+    // i=1,limit=5 → exits at the guard when i+1==5<5 false; acc/i restored to header.
+    try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.int(0) });
+    try expectMatch(&t, &.{ Value.int(1), Value.int(2), Value.int(50) }); // exits 2nd iter
+}
+
+test "nativegen win2: old value still live blocks coalescing (cond 2)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // tmp = acc (slot3 write-only); acc = acc + i. acc's old slot_load is read by the
+    // tmp store, which is live to the back-edge → cond 2 fails → no coalesce.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: acc
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .add, .a = 6, .b = 0 }, // 8: acc + i
+        .{ .op = .konst, .aux = 0 }, // 9: 1
+        .{ .op = .add, .a = 0, .b = 9 }, // 10: i + 1
+        .{ .op = .loop }, // 11
+    };
+    var consts = [_]Value{Value.int(1)};
+    // slot3 := acc_old (%6), still reading the old acc at the back-edge.
+    var exits = [_]S{ .{ .slot = 2, .ref = 8 }, .{ .slot = 0, .ref = 10 }, .{ .slot = 3, .ref = 6 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try testing.expect(!(try slotCoalesced(&t, 2))); // acc's old value is still live
+    try expectMatch(&t, &.{ Value.int(1), Value.int(4), Value.int(0), Value.int(-1) });
+}
+
+test "nativegen win2: commutative-right home coalesces; non-commutative-right does not" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // acc = i + acc  (commutative, home is the RIGHT operand) → coalesces.
+    var add_instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: acc
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .add, .a = 0, .b = 6 }, // 8: i + acc   (home = b, commutative)
+        .{ .op = .konst, .aux = 0 }, // 9
+        .{ .op = .add, .a = 0, .b = 9 }, // 10: i + 1
+        .{ .op = .loop }, // 11
+    };
+    var consts = [_]Value{Value.int(1)};
+    var add_exits = [_]S{ .{ .slot = 2, .ref = 8 }, .{ .slot = 0, .ref = 10 } };
+    var es = [_]u16{};
+    const ta = Trace{ .anchor = undefined, .instrs = &add_instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &add_exits };
+    try testing.expect(try slotCoalesced(&ta, 2));
+    try expectMatch(&ta, &.{ Value.int(1), Value.int(5), Value.int(0) });
+
+    // acc = k - acc  (non-commutative, home is the RIGHT operand) → must NOT coalesce
+    // (sub home, k would compute acc-k, not k-acc).
+    var sub_instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: acc
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .konst, .aux = 1 }, // 8: 100
+        .{ .op = .sub, .a = 8, .b = 6 }, // 9: 100 - acc   (home = b, NON-commutative)
+        .{ .op = .konst, .aux = 0 }, // 10: 1
+        .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1
+        .{ .op = .loop }, // 12
+    };
+    var consts2 = [_]Value{ Value.int(1), Value.int(100) };
+    var sub_exits = [_]S{ .{ .slot = 2, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
+    const ts = Trace{ .anchor = undefined, .instrs = &sub_instrs, .consts = &consts2, .entry_slots = &es, .exit_stores = &sub_exits };
+    try testing.expect(!(try slotCoalesced(&ts, 2)));
+    try expectMatch(&ts, &.{ Value.int(1), Value.int(4), Value.int(0) });
+}
+
+test "nativegen win2: unary into a carried slot whose operand is NOT its home" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // x = neg y, stored to slot x.  home(x) holds the OLD x, not y, so `neg home(x)`
+    // would compute -x_old, not -y.  cond 3 (operand must be home(S)) blocks it.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: x (carried, but unused as operand)
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .slot_load, .aux = 3 }, // 8: y
+        .{ .op = .guard_int, .a = 8 }, // 9
+        .{ .op = .neg, .a = 8 }, // 10: -y  (stored into x; operand is y, not x)
+        .{ .op = .konst, .aux = 0 }, // 11: 1
+        .{ .op = .add, .a = 0, .b = 11 }, // 12: i + 1
+        .{ .op = .loop }, // 13
+    };
+    var consts = [_]Value{Value.int(1)};
+    var exits = [_]S{ .{ .slot = 2, .ref = 10 }, .{ .slot = 0, .ref = 12 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try testing.expect(!(try slotCoalesced(&t, 2))); // x = -y must NOT coalesce into home(x)
+    try expectMatch(&t, &.{ Value.int(0), Value.int(3), Value.int(0), Value.int(7) });
+}
+
+test "nativegen win2: a coalesced result consumed by a later op is not scavenged" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // acc = acc + 1 (coalesces into home(acc)); u = acc_new band 7 (write-only slot).
+    // win 1 must NOT reuse home(acc) for u (it is snapshot state), and the loop must
+    // carry acc_new.  The guard is early so both are post-guard.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: acc
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .konst, .aux = 0 }, // 8: 1
+        .{ .op = .add, .a = 6, .b = 8 }, // 9: acc + 1  (coalesces into home(acc))
+        .{ .op = .konst, .aux = 1 }, // 10: 7
+        .{ .op = .band, .a = 9, .b = 10 }, // 11: acc_new band 7  (reads the coalesced value)
+        .{ .op = .add, .a = 0, .b = 8 }, // 12: i + 1
+        .{ .op = .loop }, // 13
+    };
+    var consts = [_]Value{ Value.int(1), Value.int(7) };
+    // slot3 := acc_new band 7 (write-only); acc := acc+1; i := i+1.
+    var exits = [_]S{ .{ .slot = 2, .ref = 9 }, .{ .slot = 3, .ref = 11 }, .{ .slot = 0, .ref = 12 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try testing.expect(try slotCoalesced(&t, 2)); // acc coalesces
+    try expectMatch(&t, &.{ Value.int(0), Value.int(5), Value.int(0), Value.int(0) });
+}
+
+test "nativegen win2: chained accumulators both coalesce (b reads new a)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // a = a + 1; b = b + a_new.  Both coalesce into their homes; b's in-place add reads
+    // home(a) as a pure source (already updated to a_new this iteration).
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: a
+        .{ .op = .guard_int, .a = 6 }, // 7
+        .{ .op = .slot_load, .aux = 3 }, // 8: b
+        .{ .op = .guard_int, .a = 8 }, // 9
+        .{ .op = .konst, .aux = 0 }, // 10: 1
+        .{ .op = .add, .a = 6, .b = 10 }, // 11: a + 1   (→ home(a))
+        .{ .op = .add, .a = 8, .b = 11 }, // 12: b + a_new (→ home(b), reads home(a))
+        .{ .op = .add, .a = 0, .b = 10 }, // 13: i + 1
+        .{ .op = .loop }, // 14
+    };
+    var consts = [_]Value{Value.int(1)};
+    var exits = [_]S{ .{ .slot = 2, .ref = 11 }, .{ .slot = 3, .ref = 12 }, .{ .slot = 0, .ref = 13 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try testing.expect(try slotCoalesced(&t, 2)); // a
+    try testing.expect(try slotCoalesced(&t, 3)); // b
+    try expectMatch(&t, &.{ Value.int(0), Value.int(4), Value.int(10), Value.int(100) });
 }
 
 test "nativegen: a swap loop exercises a register home cycle" {
