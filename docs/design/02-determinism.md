@@ -162,9 +162,21 @@ that for a time-travel debugger it *is* the architecture.
 - [~] **Floating-point determinism.** FP **mode is pinned**: every float-producing
       function in `src/arith.zig` sets `@setFloatMode(.strict)`, forbidding
       contraction/reassociation regardless of build mode (Zig's default is already
-      strict; this guards it explicitly). Still open: NaN payload canonicalisation,
-      signed-zero policy, and **cross-platform** bit-identity (same-machine only
-      for now — see Open questions).
+      strict; this guards it explicitly). **Tier-1b (native x86-64) preserves this
+      bit-for-bit** (Phase D): float `add`/`sub`/`mul`/`div` lower to scalar SSE2
+      (`addsd`/`subsd`/`mulsd`/`divsd`) — the *same* instructions Zig's strict mode
+      emits, with no x87 80-bit intermediates and no FMA contraction (both
+      structurally absent), so the JIT's result equals the tier-1a oracle's to the
+      last bit, including ±inf and the `0.0/0.0` quiet-NaN payload. Int→float
+      promotion uses `cvtsi2sd` (round-to-nearest, ties-to-even), which matches
+      `@floatFromInt` exactly. Float comparisons use `ucomisd` with NaN-aware flag
+      combining that mirrors `value.compareNumeric` (NaN ⇒ lt/le/eq false, ne true);
+      *mixed* int/float compares deliberately stay on tier-1a, where the oracle
+      compares them exactly (`compareIntFloat`) rather than through a lossy
+      cvtsi2sd. Verified by the differential oracle (`expectMatch`, exact payload
+      bits) and end-to-end against LuaJIT (`bench/pi_leibniz.lua`). Still open: NaN
+      payload canonicalisation, signed-zero policy, and **cross-platform**
+      bit-identity (same-machine only for now — see Open questions).
 - [x] **GC observability.** ✅ Decided + implemented (Phase 4). The v1 collector
       (stop-the-world mark-sweep, `03-gc-memory.md`) has **no finalizers, weak
       refs, or ephemerons** — nothing a program can observe to react to collection

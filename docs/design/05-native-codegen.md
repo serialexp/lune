@@ -14,8 +14,10 @@ LuaJIT. Coverage #1 then relaxed `guard_int` onto proven-`Int` *derived* values
 (`Int`-op-of-`Int`s), landing op-chain and multi-accumulator loops on the native
 path (~2.5× off LuaJIT — the richer shapes still have headroom). **Phase B** then
 added a lane-aware **array load/store** path (`t[k]` against the packed `ArrayPart`)
-— see §Phase B below. Float/heap (non-array)/mixed traces, deferred ops, accumulator
-sinking, and per-exit side traces are later cuts (see §Out of scope).
+— see §Phase B below. **Phase D** then added a **float/XMM** path (float
+`add`/`sub`/`mul`/`div` + comparisons, int→float promotion) — see §Phase D below.
+Heap (non-array)/mixed traces, the deferred numeric ops, accumulator sinking, and
+per-exit side traces are later cuts (see §Out of scope).
 Owner: Bart
 Last updated: 2026-06-16
 
@@ -84,6 +86,13 @@ is what lets the body run unboxed; the dynamic guard is what keeps it honest.
 `guard_false`, `loop`. **Bail:** `div`, `idiv`, `mod`, `pow`, `shl`, `shr`, `not`
 (Lua truthiness ≠ bitwise-not), `guard_float`, `guard_number`, and every
 float / mixed / heap / nil trace.
+
+> The cut-1 lattice above is **int/bool-only** and is the historical baseline.
+> **Phase D (below)** extends it with `Kind.float`: a `slot_load` covered by a
+> `guard_float` proves `.float`, `guard_float` discharges (lowers to a `tag==3`
+> prologue check), float-result `add`/`sub`/`mul` and *all* `div` lower to SSE2, and
+> `eq`/`ne`/`lt`/`le` on two floats lower to `ucomisd`. `guard_number`, `pow`, `mod`,
+> `idiv`-on-floats, and float `neg` still bail. See §Phase D for the full rules.
 
 ---
 
@@ -289,7 +298,8 @@ The IR-interpreter is the source of truth for IR *semantics*. Native code must b
   non-semantic and left undefined by `Value.int`). Cases: a clean counting loop; a
   `guard_int` side-exit; a **loop-carried bool** (proves tag=1 boxing); `guard_true`
   on `int 0` (must pass — truthy); `guard_false` on an int (immediate exit); and
-  the bails (float const, unguarded `slot_load`, `guard_number`, `div`). Cut-2 adds
+  the bails (unguarded `slot_load`, `guard_number`, `mod` — `div` and float consts
+  now compile, see Phase D). Cut-2 adds
   the allocator-stress cases: `analyze` classification + disjoint home pinning; a
   type-unstable carried slot (loaded `Int`, stored `Bool`) is rejected; a **swap
   loop** (`a,b = b,a`) exercising a register home cycle in the parallel move; and a
@@ -299,9 +309,9 @@ The IR-interpreter is the source of truth for IR *semantics*. Native code must b
   `expectProgram` GC × trace-mode matrix, so **every** program test also runs
   through native codegen (falling back where a trace leaves the subset) and must
   print byte-identically. Focused tests assert the decisive internal signal — a hot
-  integer for-loop is `.compiled`; a float loop is terminally `.unsupported` yet
-  matches tier-0; an int loop that flips to float mid-run deopts out of native code
-  and still matches tier-0 to the last decimal.
+  integer for-loop is `.compiled`; a **float-accumulate loop is `.compiled`** too
+  (Phase D / the XMM path) and matches tier-0 bit-for-bit; an int loop that flips to
+  float mid-run deopts out of native code and still matches tier-0 to the last decimal.
 - **Self-validation (release-safe):** `assertWellFormed` is compiled out in
   release, so `compile` **re-validates** its input and bails on anything it can't
   faithfully encode (out-of-range `aux`/`exit_store.ref`, a malformed/non-`loop`-
@@ -352,7 +362,9 @@ benches reaching native and gave us *multi-op* shapes to measure (4M iters, best
 The richer shapes sit ~2.5× off LuaJIT, versus ~1.10× on the single-accumulator
 loop — the single loop was overfit-favorable. Closing that gap is future work
 (win-2 update-sinking, better operand scheduling/spill avoidance on longer chains).
-Loops still outside the proven int/bool subset (floats, heap) fall back to tier-1a
+Float loops now compile too (Phase D — float `add`/`sub`/`mul`/`div` + compares on
+the XMM path; ≈7.8× over tier-0 on `bench/pi_leibniz.lua`). Loops still outside the
+proven subset (heap/mixed traces, the deferred numeric ops) fall back to tier-1a
 transparently (≈ 1.0×).
 
 ---
@@ -449,15 +461,73 @@ tests the in-band byte ≠ 0 instead of `bt`-ing the bitmap. Cost: ~4× the bool
 presence bitmap — every int/float bit pattern is a valid value, so they can't fold
 absence in-band.
 
+## Phase D — float / XMM native path (tier-1b)
+
+Phase D lifts the int/bool-only restriction: **float numeric loops now compile to native
+x86-64**. The backend gained a second register class (`Kind.float`, homed in xmm2–15 with
+xmm0/xmm1 reserved as scratch — the analogue of rax/rcx), a shared 8-byte spill pool
+(`kinds[]` picks `movsd` vs `mov`), and SSE2 emitters in `x64.zig` (`movsd`, `addsd`/
+`subsd`/`mulsd`/`divsd`, `ucomisd`, `cvtsi2sd`, `movq`). Because the target is
+`fn([*]Value) callconv(.c)` and **all** of xmm0–15 are caller-saved under SysV, the trace
+owns every XMM register — there is no prologue/epilogue XMM save (the GP push machinery is
+untouched, and no XMM bit ever enters `CALLEE_SAVED_MASK`).
+
+What compiles: float `add`/`sub`/`mul`/`div` and float comparisons (`eq`/`ne`/`lt`/`le`),
+with int→float promotion via `cvtsi2sd` at the use site so mixed arithmetic (`acc + i`)
+and integer `div` (`7/2 == 3.5`, always float in Lua) work. Kinds stay **fully static** —
+the recorder guards each operand `guard_int`/`guard_float` and stamps `ins.ty`, so native
+needs no runtime int-vs-float dispatch; every value's class is pinned by a dominating
+guard, its konst tag, or `ins.ty`.
+
+- **Strict-FP bit-exactness.** The tier-1a oracle runs `arith.zig` under
+  `@setFloatMode(.strict)` (scalar SSE2 — no x87, no FMA), so the same `divsd`/`addsd`
+  native emits produces identical bits, including ±inf and the `0.0/0.0` quiet-NaN
+  payload. `cvtsi2sd` (round-to-nearest, ties-to-even) matches `@floatFromInt` exactly,
+  even for `|i| > 2^53` and the i64 extremes. Operand order is preserved (xmm0=lhs op
+  xmm1=rhs) for the non-commutative `sub`/`div`. `div` is *always* float — proveKinds
+  gives it `.float` with **no "≥1 float operand" gate** (unlike `add`/`sub`/`mul`, where
+  int+int is an integer-wrapping op stamped `.int`); int operands are `cvtsi2sd`'d, which
+  is the oracle's own `toFloat()` path.
+- **NaN-aware compares.** `ucomisd` sets only ZF/PF/CF (PF=1 ⇔ unordered). `lt`/`le` use a
+  *swapped* `ucomisd rhs,lhs` + `seta`/`setae` (unsigned conds; a NaN's CF=1 makes them
+  false for free); `eq` = `sete AND setnp` (ordered ∧ equal), `ne` = `setne OR setp`
+  (unordered ∨ not-equal). This mirrors `compareNumeric` for two f64s: a NaN makes
+  lt/le/eq false and ne true. **Mixed int/float compares deliberately bail** — the oracle
+  compares them *exactly* (`compareIntFloat`, no rounding), which a cvtsi2sd-then-ucomisd
+  lowering cannot reproduce for large ints. (Mixed *arithmetic* is fine: there the oracle
+  promotes via `toFloat`, which cvtsi2sd matches.)
+- **Float deopt flush.** A carried float slot is flushed to `regs[slot]` as the tag byte
+  `TAG_FLOAT` (a 4-byte imm whose top 3 bytes overwrite non-semantic `Value` padding) then
+  the payload via `movsd [rdi+slot*16+8], xmm` (a register-homed float can't use the GP
+  `movMemReg`); a spilled float copies its 8 bytes raw through rax. The prologue mirrors
+  this: a float slot's hoisted type-guard checks `tag == 3` and loads with `movsd`.
+
+**Benchmark (`bench/pi_leibniz.lua`).** A pure-float hot loop (Leibniz series for π:
+carried float accumulator + sign-flip `mulsd`, a `cvtsi2sd`'d int counter, and a `divsd`)
+compiles to one 443-byte native function. Output is bit-identical across all four tiers
+**and to LuaJIT** (`leibniz(2e6) == 3.141592153589724`, `0x1.921fb11284dfap+1`). Timings
+(best-of-3, N=50 M): tier-0 **3.06 s**, tier-1a **3.36 s**, **tier-1b 0.39 s** (≈7.8× over
+tier-0), LuaJIT **0.03 s**. The LuaJIT gap is wider than on the int loops — it hoists the
+loop-invariant reciprocal and strength-reduces the `2k+1`, neither of which lune's
+single-block trace does yet.
+
+> **Deferred (still bail to tier-1a):** `pow` (libm), `mod`/`idiv` on floats
+> (floored-div correction / no float remainder native), float `neg` (xorpd sign-mask),
+> and `guard_number` (a float passes it, so it can't prove a single pinned kind). Float
+> coalescing (win-1/win-2) is also off in this first cut — SSE has no `op [mem],xmm`
+> store-form, so float ops always materialize into xmm0/xmm1 then write the home.
+> The canonical `bench/nsieve.lua` uses `pow` only *once, outside* the hot loop, so its
+> loops compile under Phase D (the `2^x` limit is float, but the loop variable is the
+> int `i`); only programs whose hot loop hits a deferred op stay interpreted.
+
 ## Out of scope (named follow-ups)
 
-- **Float / mixed / heap traces** — xmm registers, tag dispatch, libm `call`-outs.
-  This is the gap that keeps the **canonical `bench/nsieve.lua`** hot loop on tier-1a
-  (its `2^x`-derived limit makes the loop variable a float → `guard_float` bail);
-  landing float support is what turns the byte-identical-but-interpreted nsieve into a
-  natively-JIT'd one. The non-float **array** read/write path itself is done (Phase B).
-- **Deferred ops** — `div`/`idiv`/`mod`/`pow` (floored-div/mod correction),
-  `shl`/`shr` (Lua masked shift counts), `not` (logical, not bitwise).
+- **Mixed / heap (non-array) traces** — heap-value tag dispatch, nil handling, and
+  metatable-free table-field access outside the dense array part. Float arithmetic and
+  comparisons are **done (Phase D)**; what remains is the non-numeric polymorphic shapes.
+- **Deferred numeric ops** — `idiv`/`mod`/`pow` (floored-div/mod correction, libm),
+  float `neg` (xorpd sign-mask), `shl`/`shr` (Lua masked shift counts), `not` (logical,
+  not bitwise). `div` is **done (Phase D / F3)** — `divsd`, always float.
 - ~~**Relax `guard_int` onto proven-`Int` derived values**~~ — **done (#1):** a
   `guard_int` on a statically-`Int` derived value (an `Int`-op-of-`Int`s) lowers to
   nothing; `proveKinds` validates it against the computed kind instead of bailing.
