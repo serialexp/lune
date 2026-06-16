@@ -128,6 +128,7 @@ const Reg = x64.Reg;
 const object = @import("object.zig");
 const TAG_INT: u8 = @intFromEnum(value.Tag.int);
 const TAG_BOOL: u8 = @intFromEnum(value.Tag.boolean);
+const TAG_FLOAT: u8 = @intFromEnum(value.Tag.float);
 const TAG_HEAP: u8 = @intFromEnum(value.Tag.heap_ref);
 /// `ObjectType.table` ordinal — the byte at `GcHeader.type` for a table.
 const TABLE_TYPE: u8 = @intFromEnum(object.ObjectType.table);
@@ -172,14 +173,19 @@ fn laneConsistent(trace_lane: *?i32, aux: i32) bool {
 /// The proven kind of each SSA ref.
 ///   - `none`  — produces no usable value (a guard / the `loop` marker);
 ///               referencing it as an operand is a bail.
-///   - `int` / `bool` — a boxed scalar that may be carried, flushed, or stored.
+///   - `int` / `bool` — a boxed scalar (GP register) that may be carried, flushed,
+///               or stored.
+///   - `float` — a boxed f64 (Phase D). Lives in an XMM register / a shared 8-byte
+///               spill cell; carried & flushed (TAG_FLOAT + `movsd`) like an int but
+///               in the disjoint XMM pool. `div`/`pow` results and any arithmetic
+///               with a float operand are `.float`.
 ///   - `ptr`   — a raw `*GcHeader` (a `guard_table`-covered table `slot_load`).
 ///               Classified `invariant`, loaded once; **must never** reach
 ///               `exit_stores` (the deopt flush boxes as TAG_INT — C2).
 ///   - `aref`  — the paired `(table, index)` addressing token produced by `aref`
 ///               (its register holds `idx0 = index-1`). A distinct kind so it can
 ///               neither feed arithmetic nor be flushed to a slot.
-const Kind = enum { none, int, bool, ptr, aref };
+const Kind = enum { none, int, bool, ptr, aref, float };
 
 /// A compiled trace: an executable page whose entry is
 /// `fn(regs: [*]Value) callconv(.c) usize` — `regs` base in rdi, the cleanly
@@ -278,6 +284,14 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     const guarded = gpa.alloc(bool, n) catch return false;
     defer gpa.free(guarded);
     @memset(guarded, false);
+    // Parallel to `guarded`, but for `guard_float` (Phase D): a slot_load it covers
+    // is a float input → classified `.float`, hoisted to a single TAG_FLOAT prologue
+    // check + a `movsd` slot load. A guard_float on a *derived* float (an arith
+    // result) is validated in Pass B against the already-proven kind and lowers to
+    // nothing — exactly like the derived guard_int relaxation.
+    const float_guarded = gpa.alloc(bool, n) catch return false;
+    defer gpa.free(float_guarded);
+    @memset(float_guarded, false);
     // Parallel to `guarded`, but for `guard_table`: a slot_load it covers is the
     // table value → classified `.ptr` (invariant, loaded once).
     const table_guarded = gpa.alloc(bool, n) catch return false;
@@ -313,6 +327,11 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (r >= i) return false; // not linear SSA → malformed
                 if (t.instrs[r].op == .slot_load) guarded[r] = true;
             },
+            .guard_float => {
+                const r = ins.a;
+                if (r >= i) return false; // not linear SSA → malformed
+                if (t.instrs[r].op == .slot_load) float_guarded[r] = true;
+            },
             .guard_table => {
                 const r = ins.a;
                 if (r >= i) return false; // not linear SSA → malformed
@@ -335,6 +354,8 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .slot_load => {
                 if (guarded[i]) {
                     kinds[i] = .int;
+                } else if (float_guarded[i]) {
+                    kinds[i] = .float; // guard_float-covered → float input
                 } else if (table_guarded[i]) {
                     kinds[i] = .ptr; // guard_table-covered → invariant table pointer
                 } else {
@@ -346,10 +367,34 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 kinds[i] = switch (t.consts[@intCast(ins.aux)].tag) {
                     .int => .int,
                     .boolean => .bool,
-                    else => return false, // float / nil / heap const → bail
+                    .float => .float, // Phase D: a float constant materializes via movq
+                    else => return false, // nil / heap const → bail
                 };
             },
-            .add, .sub, .mul, .band, .bor, .bxor => {
+            // Arithmetic: the recorder stamps the *result* type in `ins.ty`
+            // (`arithResultType`: float iff div/pow or any operand float). Trust it
+            // for the result kind and validate the operands are the matching class.
+            //   - int result  → both operands proven int (the existing path).
+            //   - float result → each operand int OR float; an int operand is
+            //     promoted with `cvtsi2sd` at its use site. (band/bor/bxor are
+            //     always int — they never carry `ins.ty == .float`.)
+            .add, .sub, .mul => {
+                if (ins.ty == .float) {
+                    if (!isNumKind(kinds[ins.a]) or !isNumKind(kinds[ins.b])) return false;
+                    // [review] Don't trust `ins.ty == .float` blindly: the oracle
+                    // (arith.zig) computes int+int as a wrapping INTEGER and boxes
+                    // TAG_INT, while a float lowering would cvtsi2sd both and box
+                    // TAG_FLOAT — a divergence on side-exit. A genuine float result
+                    // requires at least one float operand; a malformed/deserialized
+                    // trace claiming otherwise bails to tier-1a.
+                    if (kinds[ins.a] != .float and kinds[ins.b] != .float) return false;
+                    kinds[i] = .float;
+                } else {
+                    if (kinds[ins.a] != .int or kinds[ins.b] != .int) return false;
+                    kinds[i] = .int;
+                }
+            },
+            .band, .bor, .bxor => {
                 if (kinds[ins.a] != .int or kinds[ins.b] != .int) return false;
                 kinds[i] = .int;
             },
@@ -367,6 +412,14 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 // it is redundant and lowers to nothing. A guard on a .bool (e.g. a
                 // compare result) or any unproven value can't be discharged → bail.
                 if (kinds[ins.a] != .int) return false;
+                kinds[i] = .none;
+            },
+            .guard_float => {
+                // Passes iff the operand is already proven float — a guard_float-
+                // covered slot_load (set .float above) or a derived float (an arith
+                // result with `ins.ty == .float`). Redundant then, lowers to nothing.
+                // A guard_float on an int/bool/unproven value can't be discharged → bail.
+                if (kinds[ins.a] != .float) return false;
                 kinds[i] = .none;
             },
             .guard_true, .guard_false => {
@@ -485,8 +538,8 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (i != n - 1) return false; // loop must be terminal
                 kinds[i] = .none;
             },
-            // Everything else (div/idiv/mod/pow/shl/shr/not/guard_float/
-            // guard_number) is deferred — bail to tier-1a.
+            // Everything else (div/idiv/mod/pow/shl/shr/guard_number/float-neg) is
+            // deferred — bail to tier-1a. (guard_float is handled above as of Phase D.)
             else => return false,
         }
     }
@@ -497,9 +550,16 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     // corrupt the slot — reject both here, not just `.none`.
     for (t.exit_stores) |st| {
         if (st.ref >= n) return false;
-        if (kinds[st.ref] != .int and kinds[st.ref] != .bool) return false;
+        const k = kinds[st.ref];
+        if (k != .int and k != .bool and k != .float) return false;
     }
     return true;
+}
+
+/// True iff `k` is a numeric scalar (int or float) — i.e. a valid operand to a
+/// float arithmetic op (an int is `cvtsi2sd`'d at its use site).
+fn isNumKind(k: Kind) bool {
+    return k == .int or k == .float;
 }
 
 // ---------------------------------------------------------------------------
@@ -514,8 +574,9 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
 
 /// Where a value lives during the loop body.
 const Loc = union(enum) {
-    reg: Reg,
-    spill: u32, // frame slot index; byte displacement = index * 8
+    reg: Reg, // a general-purpose register (int/bool/ptr/aref)
+    xmm: Reg, // an XMM register (float) — same 0..15 index space, disjoint pool
+    spill: u32, // frame slot index; byte displacement = index * 8 (kind-agnostic 8-B cell)
 };
 
 /// How a slot participates in the loop, deciding its prologue/back-edge/EXIT handling.
@@ -576,6 +637,22 @@ fn regBit(r: Reg) u16 {
 /// (regs base).
 const ALLOC_ORDER = [_]Reg{ .rdx, .rsi, .r8, .r9, .r10, .r11, .rbp, .r12, .r13, .r14, .r15 };
 const CALLEE_SAVED_MASK: u16 = regBit(.rbp) | regBit(.r12) | regBit(.r13) | regBit(.r14) | regBit(.r15);
+
+/// Allocatable XMM registers (Phase D float homes/transients). xmm0/xmm1 are the
+/// float scratch pair (the SSE analogue of rax/rcx) — never allocated; xmm2..xmm15
+/// are the pool. On the SysV/Linux ABI every XMM is *caller-saved*, so a float home
+/// needs no prologue save (the `fn([*]Value) callconv(.c)` target owns them all) —
+/// hence no XMM analogue of `CALLEE_SAVED_MASK`. The `Reg` indices are reused for
+/// XMM (same 0..15 ModRM/REX bits); a `Loc.xmm`/`Place.xmm` tag keeps them disjoint
+/// from the identically-indexed GP registers.
+const XMM_ALLOC_ORDER = [_]Reg{
+    x64.xmm2,  x64.xmm3,  x64.xmm4,  x64.xmm5,  x64.xmm6,  x64.xmm7,
+    x64.xmm8,  x64.xmm9,  x64.xmm10, x64.xmm11, x64.xmm12, x64.xmm13,
+    x64.xmm14, x64.xmm15,
+};
+/// The float scratch pair (analogue of rax/rcx), reserved out of the pool above.
+const XMM_SCRATCH0: Reg = x64.xmm0;
+const XMM_SCRATCH1: Reg = x64.xmm1;
 
 const AnalyzeError = std.mem.Allocator.Error || error{
     /// cut-2 cannot represent this trace (type-instability, etc.). The caller bails;
@@ -690,18 +767,23 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         const stored = s.store_ref >= 0;
         if (loaded and stored) {
             s.class = .carried;
-            s.kind = .int; // the load is guarded int
-            // [RV-3] type-stability: a carried slot stored as non-int would pass our
-            // hoisted (once) guard_int forever while the oracle re-checks every
-            // iteration and deopts. Reject so the trace stays on tier-1a.
-            if (kinds[@intCast(s.store_ref)] != .int) return error.Bail;
-            // [RV-4 / review P0] A carried slot is treated as int end-to-end: the
-            // prologue tag-checks TAG_INT and the deopt flush boxes TAG_INT. If the
-            // *load* proved `.ptr` (a guard_table-covered table) the table/lane
-            // prologue checks would be skipped and the int payload dereferenced as a
-            // `*GcHeader` → type confusion. A `.ptr` slot must be read-only
-            // (`invariant`); a carried one bails to tier-1a.
-            if (kinds[@intCast(s.load_ref)] != .int) return error.Bail;
+            // A carried slot is treated as ONE boxable scalar kind end-to-end: the
+            // prologue tag-checks it, the body keeps it in a same-class home, and the
+            // deopt flush re-boxes it with that tag. Phase D widens the admissible set
+            // from int to {int, float}; bool/ptr/aref carried still bail.
+            const lk = kinds[@intCast(s.load_ref)];
+            const sk = kinds[@intCast(s.store_ref)];
+            // [RV-4 / review P0] The *load* class fixes the prologue tag-check and the
+            // home's register class. A `.ptr` load (guard_table-covered table) carried
+            // would skip the table/lane checks and reinterpret an int/float payload as a
+            // `*GcHeader` → type confusion; only a boxable scalar may be carried.
+            if (lk != .int and lk != .float) return error.Bail;
+            // [RV-3] type-stability: the store class must match the load class. A slot
+            // loaded int but stored float (or vice versa) would pass our once-hoisted
+            // prologue guard forever while the oracle re-checks every iteration and
+            // deopts — and the home's register class (GP vs XMM) would be wrong. Bail.
+            if (sk != lk) return error.Bail;
+            s.kind = lk;
         } else if (loaded) {
             s.class = .invariant;
             // int OR ptr (a guard_table-covered table slot, read-only loop-invariant).
@@ -758,13 +840,30 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         for (ALLOC_ORDER) |r| m |= regBit(r);
         break :blk m;
     };
+    // The disjoint XMM pool (Phase D). Bits are the same 0..15 index space; a float
+    // home/transient draws from here, an int/bool/ptr from `free`.
+    var free_xmm: u16 = comptime blk: {
+        var m: u16 = 0;
+        for (XMM_ALLOC_ORDER) |r| m |= regBit(r);
+        break :blk m;
+    };
     var spill_count: u32 = 0;
     var used_callee: u16 = 0;
     var home_reg_mask: u16 = 0;
+    var home_xmm_mask: u16 = 0;
 
     for (slots.items) |*s| {
         if (s.class == .write_only) continue;
-        if (pickReg(&free)) |r| {
+        if (s.kind == .float) {
+            // Float home: draw from the XMM pool, else a shared 8-byte spill cell.
+            if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER)) |r| {
+                s.home = .{ .xmm = r };
+                home_xmm_mask |= regBit(r);
+            } else {
+                s.home = .{ .spill = spill_count };
+                spill_count += 1;
+            }
+        } else if (pickReg(&free)) |r| {
             s.home = .{ .reg = r };
             home_reg_mask |= regBit(r);
             used_callee |= regBit(r) & CALLEE_SAVED_MASK;
@@ -804,6 +903,11 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         }
         for (slots.items, 0..) |*s, sid| {
             if (s.class != .carried) continue;
+            // [Phase D] Float coalescing is disabled in the first cut: SSE has no
+            // `op [mem],xmm` store form and a float op always materializes into a
+            // scratch XMM before writing its home, so there is no in-place win to
+            // capture. Skip — the back-edge shuffle handles the float carry.
+            if (s.kind == .float) continue;
             const j: usize = @intCast(s.store_ref);
             const def = t.instrs[j];
             if (!isCoalescibleOp(def.op)) continue;
@@ -837,12 +941,16 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         }
     }
 
-    // Linear scan over transient defs in index order; active set ≤ pool size.
+    // Linear scan over transient defs in index order; active set ≤ pool size. A
+    // second, parallel active set tracks the XMM pool (float transients) — the two
+    // register files expire independently into `free` / `free_xmm`.
     var active: [ALLOC_ORDER.len]struct { reg: Reg, last: u32 } = undefined;
     var active_len: usize = 0;
+    var active_xmm: [XMM_ALLOC_ORDER.len]struct { reg: Reg, last: u32 } = undefined;
+    var active_xmm_len: usize = 0;
     for (t.instrs, 0..) |ins, i| {
         if (!isTransient(ins.op)) continue;
-        // expire transients whose last use precedes i
+        // expire GP transients whose last use precedes i
         var w: usize = 0;
         for (active[0..active_len]) |e| {
             if (e.last < i) {
@@ -853,9 +961,35 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             }
         }
         active_len = w;
+        // expire XMM transients likewise
+        var wx: usize = 0;
+        for (active_xmm[0..active_xmm_len]) |e| {
+            if (e.last < i) {
+                free_xmm |= regBit(e.reg);
+            } else {
+                active_xmm[wx] = e;
+                wx += 1;
+            }
+        }
+        active_xmm_len = wx;
 
         // A win-2 transient is already pinned to its slot home — never reallocate it.
         if (is_coalesced_home[i]) continue;
+
+        // [Phase D] A float transient draws from the XMM pool. Operand coalescing
+        // (win 1) is disabled for floats (the value always lands in a scratch XMM
+        // first — see the win-2 skip above), so allocate a fresh XMM or a spill cell.
+        if (kinds[i] == .float) {
+            if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER)) |r| {
+                loc[i] = .{ .xmm = r };
+                active_xmm[active_xmm_len] = .{ .reg = r, .last = last_use[i] };
+                active_xmm_len += 1;
+            } else {
+                loc[i] = .{ .spill = spill_count };
+                spill_count += 1;
+            }
+            continue;
+        }
 
         // --- operand coalescing (win 1): reuse a *dying* operand's register for the
         // result, emitting an in-place `op dst, b` instead of staging through rax.
@@ -901,27 +1035,41 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
 
     // --- invariant assertions (compiled out in release; the structural guardrail) ---
     if (std.debug.runtime_safety) {
-        // homes are register-disjoint
+        // homes are register-disjoint, tracked per register file (a GP reg and the
+        // XMM of the same 0..15 index are physically distinct → never alias).
         var seen: u16 = 0;
+        var seen_xmm: u16 = 0;
         for (slots.items) |s| {
             if (s.class == .write_only) continue;
-            if (s.home == .reg) {
-                const b = regBit(s.home.reg);
-                std.debug.assert(seen & b == 0);
-                seen |= b;
+            switch (s.home) {
+                .reg => |r| {
+                    const b = regBit(r);
+                    std.debug.assert(seen & b == 0);
+                    seen |= b;
+                },
+                .xmm => |r| {
+                    const b = regBit(r);
+                    std.debug.assert(seen_xmm & b == 0);
+                    seen_xmm |= b;
+                },
+                .spill => {},
             }
         }
-        // no transient register aliases a home register — except a win-2 transient,
-        // which is deliberately pinned INTO its slot's home.
+        // no transient register aliases a home register (per file) — except a win-2
+        // transient, which is deliberately pinned INTO its slot's home.
         for (t.instrs, 0..) |ins, i| {
             if (!isTransient(ins.op)) continue;
             if (is_coalesced_home[i]) continue;
-            if (loc[i] == .reg) std.debug.assert(home_reg_mask & regBit(loc[i].reg) == 0);
+            switch (loc[i]) {
+                .reg => |r| std.debug.assert(home_reg_mask & regBit(r) == 0),
+                .xmm => |r| std.debug.assert(home_xmm_mask & regBit(r) == 0),
+                .spill => {},
+            }
         }
         // every exit_store ref has a concrete location (it always does)
         for (t.exit_stores) |st| {
             const l = loc[st.ref];
-            std.debug.assert(l == .reg or l == .spill);
+            std.debug.assert(l == .reg or l == .xmm or l == .spill);
         }
     }
 
@@ -937,7 +1085,13 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
 
 /// Pop the first free register in `ALLOC_ORDER` preference, clearing its bit. Null if none.
 fn pickReg(free: *u16) ?Reg {
-    for (ALLOC_ORDER) |r| {
+    return pickRegFrom(free, &ALLOC_ORDER);
+}
+
+/// Pop the first free register in the given preference order, clearing its bit. Null
+/// if none. Shared by the GP pool (`ALLOC_ORDER`) and the XMM pool (`XMM_ALLOC_ORDER`).
+fn pickRegFrom(free: *u16, order: []const Reg) ?Reg {
+    for (order) |r| {
         const b = regBit(r);
         if (free.* & b != 0) {
             free.* &= ~b;
@@ -954,13 +1108,16 @@ fn pickReg(free: *u16) ?Reg {
 // ---------------------------------------------------------------------------
 
 const Place = union(enum) {
-    reg: Reg,
-    mem: i32, // rsp-relative byte displacement
+    reg: Reg, // a general-purpose register
+    xmm: Reg, // an XMM register (float). Distinct tag → a GP reg and the XMM of the
+    // same 0..15 index never compare equal (they are physically distinct registers).
+    mem: i32, // rsp-relative byte displacement (kind-agnostic 8-B cell)
 
     fn eql(x: Place, y: Place) bool {
         if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
         return switch (x) {
             .reg => x.reg == y.reg,
+            .xmm => x.xmm == y.xmm,
             .mem => x.mem == y.mem,
         };
     }
@@ -971,6 +1128,7 @@ const Place = union(enum) {
 fn locToPlace(l: Loc) Place {
     return switch (l) {
         .reg => |r| .{ .reg = r },
+        .xmm => |r| .{ .xmm = r },
         .spill => |idx| .{ .mem = @as(i32, @intCast(idx)) * 8 },
     };
 }
@@ -990,6 +1148,7 @@ fn placeToReg(a: *x64.Assembler, dst: Reg, src: Place) !void {
     switch (src) {
         .reg => |r| if (r != dst) try a.movRegReg(dst, r),
         .mem => |d| try a.movRegMem(dst, .rsp, d),
+        .xmm => unreachable, // a GP destination never receives a float source
     }
 }
 
@@ -997,6 +1156,7 @@ fn regToPlace(a: *x64.Assembler, dst: Place, src: Reg) !void {
     switch (dst) {
         .reg => |r| if (r != src) try a.movRegReg(r, src),
         .mem => |d| try a.movMemReg(.rsp, d, src),
+        .xmm => unreachable, // a GP source never targets a float home
     }
 }
 
@@ -1010,6 +1170,7 @@ fn refBaseReg(a: *x64.Assembler, alloc: *const Alloc, ref: usize, scratch: Reg) 
             try a.movRegMem(scratch, .rsp, d);
             return scratch;
         },
+        .xmm => unreachable, // array-path operands are int/ptr, never float
     }
 }
 
@@ -1022,6 +1183,7 @@ fn refHomeBaseReg(a: *x64.Assembler, s: SlotInfo, scratch: Reg) !Reg {
             try a.movRegMem(scratch, .rsp, d);
             return scratch;
         },
+        .xmm => unreachable, // only `.ptr` table slots reach here, never float
     }
 }
 
@@ -1048,6 +1210,7 @@ fn emitAluRegPlace(a: *x64.Assembler, op: trace.IrOp, dst: Reg, src: Place) !voi
             .bxor => try a.xorRegMem(dst, .rsp, d),
             else => unreachable,
         },
+        .xmm => unreachable, // integer ALU never reads a float operand
     }
 }
 
@@ -1082,6 +1245,7 @@ fn emitBinAlu(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Plac
                         try a.movRegMem(.rcx, .rsp, bd);
                         break :blk .rcx;
                     },
+                    .xmm => unreachable,
                 };
                 switch (op) {
                     .add => try a.addMemReg(.rsp, D, src_reg),
@@ -1098,6 +1262,7 @@ fn emitBinAlu(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Plac
                 try a.movMemReg(.rsp, D, .rax);
             }
         },
+        .xmm => unreachable, // integer ALU never writes a float home (see emitFloatBinOp)
     }
 }
 
@@ -1111,10 +1276,12 @@ fn emitCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Pla
             try a.movRegMem(.rax, .rsp, d);
             break :blk .rax;
         },
+        .xmm => unreachable, // F1 admits only int compare operands (float compare is F2)
     };
     switch (pb) {
         .reg => |r| try a.cmpRegReg(lhs, r),
         .mem => |d| try a.cmpRegMem(lhs, .rsp, d),
+        .xmm => unreachable, // F1 admits only int compare operands (float compare is F2)
     }
     const cc: x64.Cond = switch (op) {
         .eq => .e,
@@ -1133,16 +1300,90 @@ fn emitCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Pla
             try a.movzxRegReg8(.rax, .rax);
             try a.movMemReg(.rsp, D, .rax);
         },
+        .xmm => unreachable, // a comparison result is a bool, never homed in an XMM
     }
 }
 
-/// `dst <- src` between two Places. A mem→mem move routes through rax.
+/// Materialize a numeric operand into a scratch XMM (`dst_xmm`). A `.float` operand is
+/// moved with `movsd`; an `.int` operand is promoted with `cvtsi2sd` (round-to-nearest,
+/// bit-matching `@floatFromInt` in the strict-FP oracle). Operand homes are XMM/spill
+/// (float) or GP/spill (int) — never the cross combination.
+fn floatOperandToXmm(a: *x64.Assembler, dst_xmm: Reg, place: Place, kind: Kind) !void {
+    switch (kind) {
+        .float => switch (place) {
+            .xmm => |x| try a.movsdRegReg(dst_xmm, x),
+            .mem => |d| try a.movsdRegMem(dst_xmm, .rsp, d),
+            .reg => unreachable, // a float never lives in a GP register
+        },
+        .int => switch (place) {
+            .reg => |r| try a.cvtsi2sdRegReg(dst_xmm, r),
+            .mem => |d| try a.cvtsi2sdRegMem(dst_xmm, .rsp, d),
+            .xmm => unreachable, // an int never lives in an XMM register
+        },
+        else => unreachable, // proveKinds admits only int/float operands to a float op
+    }
+}
+
+/// Lower a float binary op `dst = pa <op> pb`. Both operands are staged into the reserved
+/// scratch XMMs (xmm0 = lhs, xmm1 = rhs; an int operand is `cvtsi2sd`-promoted), the SSE
+/// op runs in xmm0 preserving operand order (matters for sub/div), then the result moves
+/// to the home. Float coalescing is disabled in the first cut, so `dst` is xmm2..15 or a
+/// spill cell — never a scratch XMM — and staging through xmm0/xmm1 cannot clobber it
+/// before both operands are read (so `x*x` and reused-register dsts are safe).
+fn emitFloatBinOp(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, ka: Kind, pb: Place, kb: Kind) !void {
+    try floatOperandToXmm(a, XMM_SCRATCH0, pa, ka);
+    try floatOperandToXmm(a, XMM_SCRATCH1, pb, kb);
+    switch (op) {
+        .add => try a.addsdRegReg(XMM_SCRATCH0, XMM_SCRATCH1),
+        .sub => try a.subsdRegReg(XMM_SCRATCH0, XMM_SCRATCH1),
+        .mul => try a.mulsdRegReg(XMM_SCRATCH0, XMM_SCRATCH1),
+        .div => try a.divsdRegReg(XMM_SCRATCH0, XMM_SCRATCH1),
+        else => unreachable,
+    }
+    switch (dst) {
+        .xmm => |x| if (x != XMM_SCRATCH0) try a.movsdRegReg(x, XMM_SCRATCH0),
+        .mem => |d| try a.movsdMemReg(.rsp, d, XMM_SCRATCH0),
+        .reg => unreachable, // a float result never homes in a GP register
+    }
+}
+
+/// Flush one slot's `Value` into `regs[slot]`: the tag byte (4-byte imm; bytes 1..3 are
+/// non-semantic padding) then the 8 payload bytes. The payload source is a `Place`:
+/// a GP reg / spill cell raw-copies the 8 bytes (int/bool); an XMM home stores the
+/// double with `movsd` (float). rax is the scratch for a spilled payload.
+fn flushSlot(a: *x64.Assembler, base: i32, kind: Kind, payload: Place) !void {
+    const tag: i32 = switch (kind) {
+        .bool => TAG_BOOL,
+        .float => TAG_FLOAT,
+        else => TAG_INT,
+    };
+    try a.movMemImm32(.rdi, base, tag);
+    switch (payload) {
+        .reg => |r| try a.movMemReg(.rdi, base + 8, r),
+        .xmm => |x| try a.movsdMemReg(.rdi, base + 8, x),
+        .mem => |d| {
+            try a.movRegMem(.rax, .rsp, d);
+            try a.movMemReg(.rdi, base + 8, .rax);
+        },
+    }
+}
+
+/// `dst <- src` between two Places. A mem→mem move routes through rax (raw 8 bytes —
+/// kind-agnostic, so it serves int and float spill cells alike). A parallel-move cycle is
+/// always single-class (a move connects xmm↔xmm/mem or reg↔reg/mem, never xmm↔reg — see
+/// `analyze`), so the float/int endpoint combinations below are the only ones that occur.
 fn movePlace(a: *x64.Assembler, dst: Place, src: Place) !void {
     if (Place.eql(dst, src)) return;
     switch (dst) {
         .reg => |r| try placeToReg(a, r, src),
+        .xmm => |dx| switch (src) {
+            .xmm => |sx| try a.movsdRegReg(dx, sx),
+            .mem => |sd| try a.movsdRegMem(dx, .rsp, sd),
+            .reg => unreachable, // a float src never lives in a GP register
+        },
         .mem => |d| switch (src) {
             .reg => |sr| try a.movMemReg(.rsp, d, sr),
+            .xmm => |sx| try a.movsdMemReg(.rsp, d, sx),
             .mem => |sd| {
                 try a.movRegMem(.rax, .rsp, sd);
                 try a.movMemReg(.rsp, d, .rax);
@@ -1151,7 +1392,10 @@ fn movePlace(a: *x64.Assembler, dst: Place, src: Place) !void {
     }
 }
 
-const Move = struct { dst: Place, src: Place };
+/// One PHI back-edge move. `is_float` records the carried slot's class so the cycle
+/// breaker picks the matching scratch (xmm1 for float, rcx for int) — needed because a
+/// `.mem` (spill) endpoint alone does not reveal the value's class.
+const Move = struct { dst: Place, src: Place, is_float: bool = false };
 
 /// Emit a parallel move (the back-edge PHI shuffle): all `dst <- src` happen as if
 /// simultaneously. Acyclic moves go first (Kahn); each remaining disjoint cycle is
@@ -1184,7 +1428,19 @@ fn emitParallelMove(a: *x64.Assembler, moves: []Move, done: []bool) !void {
 
     for (moves, 0..) |_, start| {
         if (done[start]) continue;
-        try placeToReg(a, .rcx, moves[start].dst); // save the cycle's start value
+        // Save the cycle's start value in a scratch matching the cycle's class (a cycle
+        // is wholly int or wholly float). float → xmm1 (movsd), int → rcx (raw bytes,
+        // works for both reg and spill endpoints).
+        const fcycle = moves[start].is_float;
+        if (fcycle) {
+            switch (moves[start].dst) {
+                .xmm => |x| try a.movsdRegReg(XMM_SCRATCH1, x),
+                .mem => |d| try a.movsdRegMem(XMM_SCRATCH1, .rsp, d),
+                .reg => unreachable,
+            }
+        } else {
+            try placeToReg(a, .rcx, moves[start].dst);
+        }
         var cur = start;
         while (true) {
             const m = moves[cur];
@@ -1202,7 +1458,16 @@ fn emitParallelMove(a: *x64.Assembler, moves: []Move, done: []bool) !void {
                 try movePlace(a, m.dst, m.src);
                 cur = j;
             } else {
-                try regToPlace(a, m.dst, .rcx); // m.src is the saved cycle start
+                // m.src is the (clobbered) cycle start; restore from the saved scratch.
+                if (fcycle) {
+                    switch (m.dst) {
+                        .xmm => |x| try a.movsdRegReg(x, XMM_SCRATCH1),
+                        .mem => |d| try a.movsdMemReg(.rsp, d, XMM_SCRATCH1),
+                        .reg => unreachable,
+                    }
+                } else {
+                    try regToPlace(a, m.dst, .rcx);
+                }
                 break;
             }
         }
@@ -1262,7 +1527,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     // table-type + lane are verified below, after the pointer is loaded).
     for (alloc.slots) |s| {
         if (s.class == .write_only) continue;
-        const tag: u8 = if (s.kind == .ptr) TAG_HEAP else TAG_INT;
+        const tag: u8 = switch (s.kind) {
+            .ptr => TAG_HEAP,
+            .float => TAG_FLOAT,
+            else => TAG_INT,
+        };
         try a.cmpByteMemImm(.rdi, @as(i32, s.slot) * 16, tag);
         try a.jcc(.ne, prologue_fail);
     }
@@ -1271,7 +1540,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         const off: i32 = @as(i32, s.slot) * 16 + 8;
         switch (slotHomePlace(s)) {
             .reg => |r| try a.movRegMem(r, .rdi, off),
+            .xmm => |x| try a.movsdRegMem(x, .rdi, off), // float slot: load the double
             .mem => |d| {
+                // GP/spill raw 8-byte load (int/bool/ptr, and a spilled float — bits
+                // are bits, so a spilled float reuses the raw round-trip).
                 try a.movRegMem(.rax, .rdi, off);
                 try a.movMemReg(.rsp, d, .rax);
             },
@@ -1299,19 +1571,34 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // derived guard that's statically redundant — both emit nothing here.
             // guard_table/guard_lane: hoisted to the prologue table checks (the lane
             // never changes within a native run) — nothing here either.
-            .slot_load, .guard_int, .guard_table, .guard_lane => {},
+            // guard_float joins the hoisted/redundant no-ops: a guard on a slot_load is
+            // the prologue TAG_FLOAT tag-check; a guard on a derived float is statically
+            // discharged (proveKinds proved the kind) — both emit nothing here.
+            .slot_load, .guard_int, .guard_float, .guard_table, .guard_lane => {},
             .konst => {
                 const bits = t.consts[@intCast(ins.aux)].payload.bits;
                 switch (placeOfRef(alloc, i)) {
                     .reg => |r| try a.movRegImm64(r, @bitCast(bits)),
+                    // float konst: stage the raw bits in rax, then movq into the XMM home.
+                    .xmm => |x| {
+                        try a.movRegImm64(.rax, @bitCast(bits));
+                        try a.movqXmmReg(x, .rax);
+                    },
                     .mem => |d| {
+                        // int or spilled-float konst: raw 8-byte store (bits are bits).
                         try a.movRegImm64(.rax, @bitCast(bits));
                         try a.movMemReg(.rsp, d, .rax);
                     },
                 }
             },
             .add, .sub, .mul, .band, .bor, .bxor => {
-                try emitBinAlu(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
+                if (kinds[i] == .float) {
+                    // float add/sub/mul: SSE2 path with cvtsi2sd-promoted int operands.
+                    // (band/bor/bxor are always int → never reach this branch.)
+                    try emitFloatBinOp(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), kinds[ins.a], placeOfRef(alloc, ins.b), kinds[ins.b]);
+                } else {
+                    try emitBinAlu(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
+                }
             },
             .neg, .bnot => {
                 const dst = placeOfRef(alloc, i);
@@ -1334,6 +1621,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                             try a.movMemReg(.rsp, D, .rax);
                         }
                     },
+                    .xmm => unreachable, // int neg/bnot only (float-neg is deferred)
                 }
             },
             .eq, .ne, .lt, .le => {
@@ -1357,6 +1645,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                         try a.subRegImm32(.rax, 1);
                         try a.movMemReg(.rsp, D, .rax);
                     },
+                    .xmm => unreachable, // idx0 is an int (aref kind), never an XMM home
                 }
             },
             // guard_bounds: idx0 <u len, else side-exit. [I3] the single idx0 from aref
@@ -1500,10 +1789,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     switch (placeOfRef(alloc, ins.a)) {
                         .reg => |r| try a.cmpRegImm32(r, 0),
                         .mem => |d| try a.cmpQwordMemImm8(.rsp, d, 0),
+                        .xmm => unreachable, // a bool is never homed in an XMM
                     }
                     try a.jcc(.e, deopt_exit); // false (0) → side-exit
                 },
-                .none, .ptr, .aref => unreachable, // proveKinds restricts to int/bool
+                .none, .ptr, .aref, .float => unreachable, // proveKinds restricts to int/bool
             },
             .guard_false => switch (kinds[ins.a]) {
                 .int => try a.jmp(deopt_exit), // an int is never falsy → always side-exit
@@ -1511,10 +1801,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     switch (placeOfRef(alloc, ins.a)) {
                         .reg => |r| try a.cmpRegImm32(r, 0),
                         .mem => |d| try a.cmpQwordMemImm8(.rsp, d, 0),
+                        .xmm => unreachable, // a bool is never homed in an XMM
                     }
                     try a.jcc(.ne, deopt_exit); // true (≠0) → side-exit
                 },
-                .none, .ptr, .aref => unreachable, // proveKinds restricts to int/bool
+                .none, .ptr, .aref, .float => unreachable, // proveKinds restricts to int/bool
             },
             .loop => {
                 // [RV-2] write-only slots commit to regs[] BEFORE the shuffle, so the
@@ -1522,10 +1813,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 for (alloc.slots) |s| {
                     if (s.class != .write_only) continue;
                     const base: i32 = @as(i32, s.slot) * 16;
-                    const tag: i32 = if (s.kind == .bool) TAG_BOOL else TAG_INT;
-                    try placeToReg(a, .rax, placeOfRef(alloc, @intCast(s.store_ref)));
-                    try a.movMemImm32(.rdi, base, tag);
-                    try a.movMemReg(.rdi, base + 8, .rax);
+                    // Commit the value at its store_ref location (the slot has no home).
+                    // flushSlot tags by kind (TAG_FLOAT + movsd for a float store).
+                    try flushSlot(a, base, s.kind, placeOfRef(alloc, @intCast(s.store_ref)));
                 }
                 // PHI shuffle: carried home(slot) <- store_ref location. A win-2
                 // coalesced slot already updated its home in place (the move would be a
@@ -1541,7 +1831,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 var mi: usize = 0;
                 for (alloc.slots) |s| {
                     if (s.class != .carried or s.coalesced) continue;
-                    moves[mi] = .{ .dst = slotHomePlace(s), .src = placeOfRef(alloc, @intCast(s.store_ref)) };
+                    moves[mi] = .{
+                        .dst = slotHomePlace(s),
+                        .src = placeOfRef(alloc, @intCast(s.store_ref)),
+                        .is_float = s.kind == .float,
+                    };
                     mi += 1;
                 }
                 try emitParallelMove(a, moves, done);
@@ -1559,14 +1853,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     for (alloc.slots) |s| {
         if (s.class != .carried) continue;
         const base: i32 = @as(i32, s.slot) * 16;
-        try a.movMemImm32(.rdi, base, TAG_INT);
-        switch (slotHomePlace(s)) {
-            .reg => |r| try a.movMemReg(.rdi, base + 8, r),
-            .mem => |d| {
-                try a.movRegMem(.rax, .rsp, d);
-                try a.movMemReg(.rdi, base + 8, .rax);
-            },
-        }
+        // Re-box the carried home with its kind's tag: int homes write TAG_INT from a
+        // GP reg / spill cell; a float home writes TAG_FLOAT + `movsd` from its XMM
+        // (a register-homed float can't go through `movMemReg`). flushSlot dispatches.
+        try flushSlot(a, base, s.kind, slotHomePlace(s));
     }
     try a.movRegReg(.rax, .rbx);
     try emitTeardown(a, frame, callee[0..callee_len]);
@@ -1732,6 +2022,147 @@ test "nativegen: guard_false on an integer side-exits immediately" {
     var es = [_]u16{};
     const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
     try expectMatch(&t, &.{Value.int(5)}); // completed==0, regs unchanged
+}
+
+// --- Phase D / F1: float add/sub/mul native path -----------------------------
+
+test "nativegen(F1): float-accumulate loop matches the strict-FP oracle (movq const + addsd + XMM carry + float flush)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // int-controlled loop, float body: while (i < limit) { acc += 0.1; i += 1 }
+    // r0=i (int), r1=limit (int), r2=acc (float). The loop condition stays int
+    // (float compares are F2), so the only float work is the carried accumulator.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4: i < limit
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: acc (float)
+        .{ .op = .guard_float, .a = 6 }, // 7
+        .{ .op = .konst, .aux = 0 }, // 8: 0.1 (float)
+        .{ .op = .add, .a = 6, .b = 8, .ty = .float }, // 9: acc + 0.1 → float
+        .{ .op = .konst, .aux = 1 }, // 10: 1 (int)
+        .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1 (int)
+        .{ .op = .loop }, // 12
+    };
+    var consts = [_]Value{ Value.float(0.1), Value.int(1) };
+    var exits = [_]S{ .{ .slot = 2, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    // 0.1 is not exactly representable: native must accumulate it bit-identically to
+    // the oracle's strict-FP addsd (the classic 0.1-drift). 10 iterations.
+    try expectMatch(&t, &.{ Value.int(0), Value.int(10), Value.float(0.0) });
+    // 0 iterations: acc stays exactly 0.0, flushed as a float (tag must be 3).
+    try expectMatch(&t, &.{ Value.int(7), Value.int(3), Value.float(0.0) });
+}
+
+test "nativegen(F1): mixed int+float add promotes the int operand via cvtsi2sd" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // while (i < limit) { acc += i; i += 1 }  — acc is float, i is int → the float
+    // add reads an int operand, which must be cvtsi2sd-promoted at the use site.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: acc (float)
+        .{ .op = .guard_float, .a = 6 }, // 7
+        .{ .op = .add, .a = 6, .b = 0, .ty = .float }, // 8: acc + i (int promoted)
+        .{ .op = .konst, .aux = 0 }, // 9: 1
+        .{ .op = .add, .a = 0, .b = 9 }, // 10: i + 1
+        .{ .op = .loop }, // 11
+    };
+    var consts = [_]Value{Value.int(1)};
+    var exits = [_]S{ .{ .slot = 2, .ref = 8 }, .{ .slot = 0, .ref = 10 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    // i=1..4 → acc = 1+2+3+4 = 10.0 (exact). cvtsi2sd round-to-nearest matches @floatFromInt.
+    try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.float(0.0) });
+    // A larger run whose partial sums are non-exact once divided would also match,
+    // but addition of small ints stays exact; verify a longer carry too.
+    try expectMatch(&t, &.{ Value.int(1), Value.int(20), Value.float(100.0) });
+}
+
+test "nativegen(F1): float sub and mul preserve operand order, bit-exact" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // while (i < limit) { acc = acc * 1.5; acc = acc - 0.25; i += 1 }
+    // Exercises mulsd then subsd (order matters: acc-0.25, not 0.25-acc).
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: acc (float)
+        .{ .op = .guard_float, .a = 6 }, // 7
+        .{ .op = .konst, .aux = 0 }, // 8: 1.5
+        .{ .op = .mul, .a = 6, .b = 8, .ty = .float }, // 9: acc * 1.5
+        .{ .op = .konst, .aux = 1 }, // 10: 0.25
+        .{ .op = .sub, .a = 9, .b = 10, .ty = .float }, // 11: (acc*1.5) - 0.25
+        .{ .op = .konst, .aux = 2 }, // 12: 1 (int)
+        .{ .op = .add, .a = 0, .b = 12 }, // 13: i + 1
+        .{ .op = .loop }, // 14
+    };
+    var consts = [_]Value{ Value.float(1.5), Value.float(0.25), Value.int(1) };
+    var exits = [_]S{ .{ .slot = 2, .ref = 11 }, .{ .slot = 0, .ref = 13 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try expectMatch(&t, &.{ Value.int(0), Value.int(6), Value.float(1.0) });
+    try expectMatch(&t, &.{ Value.int(0), Value.int(3), Value.float(-2.0) });
+}
+
+test "nativegen(F1): a carried slot loaded float but stored int bails (lk != sk)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // Slot 2 is loaded via guard_float (.float) but its exit_store references an int
+    // value — the load/store classes disagree, so analyze must bail (RV-3) and the
+    // whole trace falls back to tier-1a rather than miscompiling the home class.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: loaded as float...
+        .{ .op = .guard_float, .a = 6 }, // 7
+        .{ .op = .konst, .aux = 0 }, // 8: 1 (int)
+        .{ .op = .add, .a = 0, .b = 8 }, // 9: i + 1 (int)
+        .{ .op = .loop }, // 10
+    };
+    var consts = [_]Value{Value.int(1)};
+    // slot 2 carried: load=float(ref6), store=int(ref9) → mismatch.
+    var exits = [_]S{ .{ .slot = 0, .ref = 9 }, .{ .slot = 2, .ref = 9 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try expectBail(&t);
+}
+
+test "nativegen(F1): a malformed int+int add stamped ty=.float bails (no float/int divergence)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // [review] Defensive: a hand-built/deserialized trace whose add has BOTH operands
+    // int but ty=.float must NOT lower as a float op — the oracle (arith.zig) computes
+    // int-wrap + TAG_INT, so a float lowering would diverge on side-exit. proveKinds
+    // bails to tier-1a (it never trusts ins.ty alone). The recorder never emits this.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .konst, .aux = 0 }, // 6: 1 (int)
+        .{ .op = .add, .a = 0, .b = 6, .ty = .float }, // 7: int+int but LIES ty=.float
+        .{ .op = .loop }, // 8
+    };
+    var consts = [_]Value{Value.int(1)};
+    var exits = [_]S{.{ .slot = 0, .ref = 7 }};
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try expectBail(&t);
 }
 
 test "nativegen: derived guard_int on int arithmetic compiles and matches (#1)" {
