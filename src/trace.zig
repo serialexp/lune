@@ -906,17 +906,19 @@ pub const TraceState = struct {
         try self.guardInt(rkey);
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         _ = try self.emit(.{ .op = .guard_bounds, .a = ref });
-        // For an int lane, guard at runtime that the value is an int still in the
-        // lane's range: a later iteration storing an out-of-range (or non-int)
-        // value would force tier-0 to WIDEN the lane (alloc + relayout), which the
-        // native store can't do mid-run, and which would make the tier-1a oracle's
-        // in-place encode diverge — so it side-exits instead. The bool lane needs no
-        // such guard: its `astore` value is always a statically-typed bool (a konst
-        // or a compare result), never a free variable.
-        switch (lane) {
-            .i8, .i16, .i32, .i64 => _ = try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord }),
-            else => {},
-        }
+        // Guard at runtime that the value still fits the recorded narrow lane: a
+        // later iteration storing an out-of-lane value (an out-of-range/non-int int
+        // into an int lane, a non-bool into the bool lane, a non-float into f64)
+        // would force tier-0 to WIDEN the lane (alloc + relayout), which the native
+        // store can't do mid-run and which would trip the tier-1a oracle's in-place
+        // `setInLane` encode (`assert(fits(val))`) — so `guard_fits` side-exits
+        // instead and lets tier-0 re-run + widen. Every narrow lane needs this: the
+        // `astore` value can be a free variable (a loop-carried slot), not just a
+        // constant, so the recorder cannot assume it stays in-lane. (`.value` aborts
+        // above, so `lane` here is always narrow.) For the bool lane native lowers
+        // this to nothing — the value is already proven `.bool` at analysis time —
+        // but the oracle, which runs the raw trace, still needs the runtime check.
+        _ = try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord });
         // No `guard_present`: `astore` *creates* presence (the slot is in-bounds by
         // `guard_bounds`; storing a non-nil value sets the presence bit). The store
         // is effectful and not register-defining, so nothing is `setReg`'d.
@@ -1363,8 +1365,10 @@ test "recArraySet: t[k]=false on a bool lane records the full guarded write sequ
     const ops = state.rec.instrs.items;
     // value resolved first (for the C1 taint scan): slot_load(value), then
     // slot_load(table), guard_table, guard_lane, slot_load(key), guard_int, aref,
-    // guard_bounds, astore. No guard_present — astore creates presence.
-    try testing.expectEqual(@as(usize, 9), ops.len);
+    // guard_bounds, guard_fits, astore. No guard_present — astore creates presence.
+    // guard_fits is now emitted for the bool lane too (value-stability: a non-bool
+    // free-variable store side-exits to tier-0 instead of tripping the oracle).
+    try testing.expectEqual(@as(usize, 10), ops.len);
     try testing.expectEqual(IrOp.slot_load, ops[0].op); // value (r0)
     try testing.expectEqual(IrOp.slot_load, ops[1].op); // table (r1)
     try testing.expectEqual(IrOp.guard_table, ops[2].op);
@@ -1377,10 +1381,13 @@ test "recArraySet: t[k]=false on a bool lane records the full guarded write sequ
     try testing.expectEqual(@as(Ref, 4), ops[6].b); // key ref
     try testing.expectEqual(IrOp.guard_bounds, ops[7].op);
     try testing.expectEqual(@as(Ref, 6), ops[7].a); // guards the aref
-    try testing.expectEqual(IrOp.astore, ops[8].op);
-    try testing.expectEqual(@as(Ref, 6), ops[8].a); // stores through the aref
-    try testing.expectEqual(@as(Ref, 0), ops[8].b); // value = the false slot_load
+    try testing.expectEqual(IrOp.guard_fits, ops[8].op);
+    try testing.expectEqual(@as(Ref, 0), ops[8].a); // range-checks the false slot_load
     try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[8].aux);
+    try testing.expectEqual(IrOp.astore, ops[9].op);
+    try testing.expectEqual(@as(Ref, 6), ops[9].a); // stores through the aref
+    try testing.expectEqual(@as(Ref, 0), ops[9].b); // value = the false slot_load
+    try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[9].aux);
 }
 
 test "recArraySet aborts: non-table, non-int key, OOB, out-of-lane value, .value lane" {

@@ -428,18 +428,29 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (!bounds_ok[ins.a]) return false; // [I4] bounds must dominate
                 kinds[i] = lk; // bool lane → .bool; i8…i64 → .int (sign-extended)
             },
-            // guard_fits (B4b): the int value (`a`) fits the narrow int lane's
-            // signed range. Marks the value so a following int-lane astore may
+            // guard_fits: the value (`a`) still fits the recorded narrow lane.
+            // For an int lane it marks the value so a following int-lane astore may
             // store it without widening; lowers to a range compare (i8/i16/i32) or
-            // nothing (i64 — every i64 fits). Only int lanes use it (the bool lane
-            // stores a boolean, the .value/f64 lanes bail at proveKinds).
+            // nothing (i64 — every i64 fits). For the bool lane it is a tier-1a-only
+            // soundness guard (a free-variable non-bool store side-exits there);
+            // native already proves the value is `.bool`, so it lowers to nothing.
+            // The .value / f64 lanes bail at proveKinds (laneKind → null).
             .guard_fits => {
                 if (ins.a >= i) return false;
-                if (kinds[ins.a] != .int) return false; // only int values are range-guarded
-                const lk = laneKind(ins.aux) orelse return false;
-                if (lk != .int) return false; // guard_fits is meaningless off an int lane
+                const lk = laneKind(ins.aux) orelse return false; // .value / f64 → tier-1a
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
-                fits_ok[ins.a] = true;
+                switch (lk) {
+                    .int => {
+                        if (kinds[ins.a] != .int) return false; // only int values are range-guarded
+                        fits_ok[ins.a] = true;
+                    },
+                    // The bool lane's guard_fits exists only for the tier-1a oracle
+                    // (it side-exits a free-variable non-bool store). Native already
+                    // requires the astore value to be a proven `.bool`, so this guard
+                    // lowers to nothing — just type-check it and drop it.
+                    .bool => if (kinds[ins.a] != .bool) return false,
+                    else => return false,
+                }
                 kinds[i] = .none;
             },
             // astore encodes the value (`b`) into the lane slot addressed by the
@@ -1410,25 +1421,31 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // that no longer fits must drop back to tier-1a (which then widens). i64
             // holds every int → no check. The compare clobbers only rax (scratch).
             .guard_fits => {
-                const w = intLaneWidth(ins.aux);
-                if (w < 8) {
-                    const lo: i32 = switch (w) {
-                        1 => std.math.minInt(i8),
-                        2 => std.math.minInt(i16),
-                        4 => std.math.minInt(i32),
-                        else => unreachable,
-                    };
-                    const hi: i32 = switch (w) {
-                        1 => std.math.maxInt(i8),
-                        2 => std.math.maxInt(i16),
-                        4 => std.math.maxInt(i32),
-                        else => unreachable,
-                    };
-                    try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
-                    try a.cmpRegImm32(.rax, lo);
-                    try a.jcc(.l, deopt_exit); // value < lane min → side-exit (signed)
-                    try a.cmpRegImm32(.rax, hi);
-                    try a.jcc(.g, deopt_exit); // value > lane max → side-exit (signed)
+                if (ins.aux == BOOL_LANE) {
+                    // Bool-lane guard_fits is a tier-1a-only soundness guard; the
+                    // value is already proven `.bool` in proveKinds, so there is
+                    // nothing to range-check here.
+                } else {
+                    const w = intLaneWidth(ins.aux);
+                    if (w < 8) {
+                        const lo: i32 = switch (w) {
+                            1 => std.math.minInt(i8),
+                            2 => std.math.minInt(i16),
+                            4 => std.math.minInt(i32),
+                            else => unreachable,
+                        };
+                        const hi: i32 = switch (w) {
+                            1 => std.math.maxInt(i8),
+                            2 => std.math.maxInt(i16),
+                            4 => std.math.maxInt(i32),
+                            else => unreachable,
+                        };
+                        try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
+                        try a.cmpRegImm32(.rax, lo);
+                        try a.jcc(.l, deopt_exit); // value < lane min → side-exit (signed)
+                        try a.cmpRegImm32(.rax, hi);
+                        try a.jcc(.g, deopt_exit); // value > lane max → side-exit (signed)
+                    }
                 }
             },
             // --- lane-aware array write path (B3 bool / B4b int) -----------------

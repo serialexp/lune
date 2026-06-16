@@ -41,6 +41,7 @@ const std = @import("std");
 const trace = @import("trace.zig");
 const value = @import("value.zig");
 const irinterp = @import("irinterp.zig");
+const arr = @import("array.zig");
 
 const Value = value.Value;
 const IrInstr = trace.IrInstr;
@@ -80,16 +81,25 @@ fn kindOf(op: IrOp) OpKind {
     };
 }
 
-/// Does constant `v` satisfy guard `op`? (Used to drop always-pass guards. An
-/// always-*fail* guard returns false and is kept — never silently removed.)
-fn guardSatisfied(op: IrOp, v: Value) bool {
-    return switch (op) {
+/// Does the guard `ins` provably pass when its operand is the constant `v`?
+/// (Used to drop always-pass guards. An always-*fail* guard returns false and is
+/// kept — never silently removed.) `guard_fits` is lane-dependent, so it reads
+/// `ins.aux` (the recorded lane ordinal). The remaining array-access guards
+/// (`guard_table`/`guard_lane`/`guard_bounds`/`guard_present`) only ever guard a
+/// table value or an `aref` — never a constant — so a constant operand can't
+/// reach them in an honest trace; we conservatively return `false` (keep the
+/// guard) rather than reasoning about it.
+fn guardConstPasses(ins: IrInstr, v: Value) bool {
+    return switch (ins.op) {
         .guard_int => v.isInt(),
         .guard_float => v.isFloat(),
         .guard_number => v.isNumber(),
         .guard_true => v.isTruthy(),
         .guard_false => !v.isTruthy(),
-        else => unreachable,
+        // The value still fits the recorded narrow lane (a const value here is
+        // the bool lane's `astore` constant, e.g. `false`). Lane from `aux`.
+        .guard_fits => arr.ArrayPart.laneFits(@enumFromInt(ins.aux), v),
+        else => false,
     };
 }
 
@@ -197,7 +207,7 @@ pub fn optimize(
             .guard => {
                 const a2 = canon[ins.a];
                 if (const_val[a2]) |cv| {
-                    if (guardSatisfied(ins.op, cv)) {
+                    if (guardConstPasses(ins, cv)) {
                         dead[i] = true; // always-passes on a constant → drop
                         continue;
                     }
@@ -395,6 +405,48 @@ test "tropt: an exact-duplicate guard is dropped (the earlier copy dominates)" {
 
     try testing.expectEqual(@as(usize, 4), opt.instrs.len);
     try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .guard_int));
+}
+
+test "tropt: a guard_fits on a constant value uses laneFits (never the type-guard table)" {
+    // Regression: the bool-lane `astore` value is the *constant* `false`, so its
+    // `guard_fits` is the first guard whose operand is constant. The forward pass
+    // must evaluate it via `laneFits(lane, v)` — routing it through the type-guard
+    // `guardSatisfied` table (guard_int/…) hit `else => unreachable` and crashed
+    // the optimizer at commit time. A fitting const drops the guard; a non-fitting
+    // one is kept (always-fail, defensively retained).
+    const gpa = testing.allocator;
+    const bool_lane: i32 = @intFromEnum(arr.Lane.boolean);
+
+    // false fits the bool lane → guard_fits is proven-pass → dropped.
+    {
+        const instrs = [_]IrInstr{
+            .{ .op = .konst, .aux = 0 }, // %0 = false
+            .{ .op = .guard_fits, .a = 0, .aux = bool_lane }, // %1 — always passes → drop
+            .{ .op = .slot_load, .aux = 0 }, // %2 = r0 (keep something live)
+            .{ .op = .loop }, // %3
+        };
+        const consts = [_]Value{Value.boolean(false)};
+        const exit = [_]SlotStore{.{ .slot = 0, .ref = 2 }};
+        var opt = try optimize(gpa, &instrs, &consts, &exit);
+        defer freeOpt(gpa, &opt);
+        try testing.expectEqual(@as(usize, 0), countOp(opt.instrs, .guard_fits));
+    }
+
+    // An int into the bool lane does NOT fit → guard_fits is kept (it would
+    // side-exit at runtime; honest recording never emits this, but the optimizer
+    // must not silently drop a possibly-failing guard).
+    {
+        const instrs = [_]IrInstr{
+            .{ .op = .konst, .aux = 0 }, // %0 = 5
+            .{ .op = .guard_fits, .a = 0, .aux = bool_lane }, // %1 — always fails → keep
+            .{ .op = .loop }, // %2
+        };
+        const consts = [_]Value{Value.int(5)};
+        const exit = [_]SlotStore{.{ .slot = 0, .ref = 0 }};
+        var opt = try optimize(gpa, &instrs, &consts, &exit);
+        defer freeOpt(gpa, &opt);
+        try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .guard_fits));
+    }
 }
 
 test "tropt: a repeated subexpression is CSE'd to a single instruction" {

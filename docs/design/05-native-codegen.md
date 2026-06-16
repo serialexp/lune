@@ -380,13 +380,19 @@ OOB, holes, and the `.value`/`.f64` lanes all guard-bail to tier-1a.
   recorded lane — both hoisted to the prologue), `guard_bounds` (`idx0 <u len`),
   `guard_present` (a hole would read as `nil`: bool lane tests the in-band byte ≠ 0;
   int/float lanes `bt` the presence bitmap).
-- `guard_fits` (`a`=value, `aux`=lane) — **the int-store soundness guard.** A value
-  that no longer fits a narrow int lane would force tier-0 to WIDEN the array
-  (allocate + relayout), which the native store cannot do mid-run. The recorder
-  emits `guard_fits` before every int-lane `astore`; the tier-1a oracle side-exits
-  via `ArrayPart.laneFits` identically, and native lowers it to a signed range
-  compare (i8/i16/i32; i64 fits everything → no check). The bool lane needs none
-  (its store value is a statically-typed bool).
+- `guard_fits` (`a`=value, `aux`=lane) — **the narrow-lane store soundness guard.** A
+  value that no longer fits the recorded lane would force tier-0 to WIDEN the array
+  (allocate + relayout), which the native store cannot do mid-run. The recorder emits
+  `guard_fits` before **every** narrow-lane `astore` (the store value can be a
+  free-variable loop-carried slot, not just a constant, so the recorder cannot assume
+  it stays in-lane); the tier-1a oracle side-exits via `ArrayPart.laneFits` identically.
+  Native lowers it per lane: an int lane → a signed range compare (i8/i16/i32; i64 fits
+  everything → no check); the **bool** lane → *nothing* (proveKinds already requires the
+  store value to be a proven `.bool`, so the guard is a runtime no-op there) — but the
+  oracle, which runs the raw trace, still needs it so a non-bool free-variable store
+  side-exits instead of tripping `ArrayPart.setInLane`'s in-lane assert. When the store
+  value is a *constant* (e.g. the bool sieve's `t[k]=false`), the optimizer folds the
+  guard away entirely (`tropt` evaluates it via `laneFits` at commit time).
 
 **Soundness invariants enforced:**
 - **C1** — a write whose value/control depends on a prior packed read is
