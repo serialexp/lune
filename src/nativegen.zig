@@ -398,6 +398,16 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (kinds[ins.a] != .int or kinds[ins.b] != .int) return false;
                 kinds[i] = .int;
             },
+            // div is ALWAYS float (arithResultType stamps ins.ty == .float), even on
+            // two int operands (3/2 == 1.5). The oracle computes a.toFloat()/b.toFloat()
+            // under strict FP, where toFloat(int) == @floatFromInt == cvtsi2sd — so the
+            // int/int case is bit-exact too (unlike a compare, this conversion is the
+            // oracle's own path). No "≥1 float operand" gate: int/int div is genuinely
+            // float here. NaN/inf (x/0.0, 0.0/0.0) fall out of IEEE divsd identically.
+            .div => {
+                if (!isNumKind(kinds[ins.a]) or !isNumKind(kinds[ins.b])) return false;
+                kinds[i] = .float;
+            },
             .neg, .bnot => {
                 if (kinds[ins.a] != .int) return false;
                 kinds[i] = .int;
@@ -673,7 +683,7 @@ const AnalyzeError = std.mem.Allocator.Error || error{
 /// and the loop marker produce no value.
 fn isTransient(op: trace.IrOp) bool {
     return switch (op) {
-        .konst, .add, .sub, .mul, .band, .bor, .bxor, .neg, .bnot, .eq, .ne, .lt, .le => true,
+        .konst, .add, .sub, .mul, .div, .band, .bor, .bxor, .neg, .bnot, .eq, .ne, .lt, .le => true,
         // aref materializes idx0 in a register; aload materializes the decoded bool.
         .aref, .aload => true,
         else => false,
@@ -693,7 +703,7 @@ fn isCommutative(op: trace.IrOp) bool {
 /// The operand refs an instruction reads (matching `proveKinds`/`lower` exactly).
 fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
     return switch (ins.op) {
-        .add, .sub, .mul, .band, .bor, .bxor, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
+        .add, .sub, .mul, .div, .band, .bor, .bxor, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
         .neg, .bnot, .guard_int, .guard_true, .guard_false => .{ .a = true, .b = false },
         // aref reads table (a, an invariant home) + index (b). aload/guards reach the
         // table through aref.a, so they read only the aref token (a). astore reads
@@ -1318,6 +1328,14 @@ fn emitCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Pla
 /// `dst`. `ucomisd` sets only ZF/PF/CF (PF=1 ⇔ unordered/NaN); SF/OF are untouched, so
 /// the unsigned-style conds (a/ae) + p/np are the correct readouts. Semantics mirror
 /// `value.compareNumeric` for two f64s: a NaN operand makes lt/le/eq false and ne true.
+///
+/// [review] `ucomisd` (not `comisd`) is deliberate: it raises the invalid-operand flag
+/// only for a *signaling* NaN, never a quiet one. The oracle short-circuits
+/// `isNan(x) or isNan(y)`, so a qNaN lhs + sNaN rhs makes native touch the sNaN (setting
+/// MXCSR.IE) where the oracle would not. This never diverges the boolean *result* — and
+/// it is unobservable in lune anyway: FP exceptions are masked (SysV default), there is
+/// no MXCSR/feenableexcept seam, and a signaling NaN is unreachable from Lua source
+/// (0.0/0.0 yields a quiet NaN; there is no sNaN literal).
 fn emitFloatCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Place) !void {
     try floatOperandToXmm(a, XMM_SCRATCH0, pa, .float); // lhs
     try floatOperandToXmm(a, XMM_SCRATCH1, pb, .float); // rhs
@@ -1645,10 +1663,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     },
                 }
             },
-            .add, .sub, .mul, .band, .bor, .bxor => {
+            .add, .sub, .mul, .div, .band, .bor, .bxor => {
                 if (kinds[i] == .float) {
-                    // float add/sub/mul: SSE2 path with cvtsi2sd-promoted int operands.
-                    // (band/bor/bxor are always int → never reach this branch.)
+                    // float add/sub/mul/div: SSE2 path with cvtsi2sd-promoted int operands.
+                    // (div is ALWAYS float here; band/bor/bxor are always int → int branch.)
                     try emitFloatBinOp(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), kinds[ins.a], placeOfRef(alloc, ins.b), kinds[ins.b]);
                 } else {
                     try emitBinAlu(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
@@ -2348,6 +2366,108 @@ test "nativegen(F2): a mixed int/float compare bails (oracle compares exactly, n
     try expectBail(&t);
 }
 
+// --- Phase D / F3: div (always float; divsd, cvtsi2sd int operands) ----------
+
+/// Run a single float division `x / y` through both tiers and assert the result
+/// matches bit-for-bit. The trace: an int counter drives exactly one iteration; the
+/// body loads two float slots (x, y), computes `x / y` into a write-only float slot
+/// (slot 3), then bumps the counter. expectMatch compares regs[] via exact payload
+/// bits, so +inf / nan results are checked bit-exactly against arith.zig's strict-FP
+/// divsd (which is the same scalar SSE2 op native emits).
+fn expectFloatDiv(x: f64, y: f64) !void {
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i (int counter)
+        .{ .op = .guard_int, .a = 0 }, // 1
+        .{ .op = .konst, .aux = 0 }, // 2: 1 (int limit)
+        .{ .op = .lt, .a = 0, .b = 2 }, // 3: i < 1 (int loop control)
+        .{ .op = .guard_true, .a = 3 }, // 4
+        .{ .op = .slot_load, .aux = 1 }, // 5: x (float)
+        .{ .op = .guard_float, .a = 5 }, // 6
+        .{ .op = .slot_load, .aux = 2 }, // 7: y (float)
+        .{ .op = .guard_float, .a = 7 }, // 8
+        .{ .op = .div, .a = 5, .b = 7, .ty = .float }, // 9: x / y → float (divsd)
+        .{ .op = .konst, .aux = 1 }, // 10: 1
+        .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1
+        .{ .op = .loop }, // 12
+    };
+    var consts = [_]Value{ Value.int(1), Value.int(1) };
+    // slot 3 is write-only float (the quotient); slot 0 is the int counter.
+    var exits = [_]S{ .{ .slot = 3, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    // regs: i=0, x, y, slot3=placeholder (overwritten by the quotient each iteration).
+    try expectMatch(&t, &.{ Value.int(0), Value.float(x), Value.float(y), Value.float(0.0) });
+}
+
+test "nativegen(F3): float division is bit-exact vs the strict-FP oracle, incl. inf/nan" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    try expectFloatDiv(1.0, 3.0); // 0.333… — non-terminating binary, the bit-exactness probe
+    try expectFloatDiv(10.0, 4.0); // 2.5 — exact
+    try expectFloatDiv(-7.0, 2.0); // -3.5 — sign + order preserved (x/y, not y/x)
+    try expectFloatDiv(1.0, 0.0); // +inf
+    try expectFloatDiv(-1.0, 0.0); // -inf
+    try expectFloatDiv(0.0, 0.0); // nan — exact payload bits must match divsd's QNaN
+}
+
+test "nativegen(F3): a float-accumulate loop dividing by a constant matches (carried divsd)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // while (i < limit) { acc = acc / 3.0; i += 1 }  — acc carried in an XMM home,
+    // divided by a non-exact-reciprocal constant each iteration. The classic drift
+    // (1/3, 1/9, 1/27, …) must accumulate bit-identically to the oracle's divsd.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .slot_load, .aux = 2 }, // 6: acc (float)
+        .{ .op = .guard_float, .a = 6 }, // 7
+        .{ .op = .konst, .aux = 0 }, // 8: 3.0
+        .{ .op = .div, .a = 6, .b = 8, .ty = .float }, // 9: acc / 3.0
+        .{ .op = .konst, .aux = 1 }, // 10: 1 (int)
+        .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1
+        .{ .op = .loop }, // 12
+    };
+    var consts = [_]Value{ Value.float(3.0), Value.int(1) };
+    var exits = [_]S{ .{ .slot = 2, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try expectMatch(&t, &.{ Value.int(0), Value.int(8), Value.float(1.0) });
+    try expectMatch(&t, &.{ Value.int(3), Value.int(3), Value.float(1.0) }); // 0 iters, acc flushed unchanged
+}
+
+test "nativegen(F3): int/int division yields a float via cvtsi2sd on both operands" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // c = x / y where BOTH x and y are guard_int (int) — Lua's `/` is always float,
+    // even on integers (7/2 == 3.5). proveKinds gives div .float regardless, so native
+    // cvtsi2sd-promotes both operands then divsd. The oracle computes
+    // x.toFloat()/y.toFloat() (== @floatFromInt == cvtsi2sd) → bit-exact, incl. int/0.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i (counter)
+        .{ .op = .guard_int, .a = 0 }, // 1
+        .{ .op = .konst, .aux = 0 }, // 2: 1 (int limit)
+        .{ .op = .lt, .a = 0, .b = 2 }, // 3
+        .{ .op = .guard_true, .a = 3 }, // 4
+        .{ .op = .slot_load, .aux = 1 }, // 5: x (int)
+        .{ .op = .guard_int, .a = 5 }, // 6
+        .{ .op = .slot_load, .aux = 2 }, // 7: y (int)
+        .{ .op = .guard_int, .a = 7 }, // 8
+        .{ .op = .div, .a = 5, .b = 7, .ty = .float }, // 9: x / y → float
+        .{ .op = .konst, .aux = 1 }, // 10: 1
+        .{ .op = .add, .a = 0, .b = 10 }, // 11
+        .{ .op = .loop }, // 12
+    };
+    var consts = [_]Value{ Value.int(1), Value.int(1) };
+    var exits = [_]S{ .{ .slot = 3, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try expectMatch(&t, &.{ Value.int(0), Value.int(7), Value.int(2), Value.float(0.0) }); // 7/2 = 3.5
+    try expectMatch(&t, &.{ Value.int(0), Value.int(6), Value.int(3), Value.float(0.0) }); // 6/3 = 2.0 (exact)
+    try expectMatch(&t, &.{ Value.int(0), Value.int(1), Value.int(0), Value.float(0.0) }); // 1/0 = +inf
+    try expectMatch(&t, &.{ Value.int(0), Value.int(0), Value.int(0), Value.float(0.0) }); // 0/0 = nan
+}
+
 test "nativegen: derived guard_int on int arithmetic compiles and matches (#1)" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     // acc = acc + (i+7)*(i+7); i += 1; while i < limit — the `CSE-able body` shape.
@@ -2426,13 +2546,14 @@ test "nativegen: bails on unsupported traces" {
         const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
         try expectBail(&t);
     }
-    // (d) a deferred op (div).
+    // (d) a deferred op (mod — div now compiles via the XMM path, F3; mod still
+    // bails: it needs a libm-free integer/float remainder native doesn't emit).
     {
         var instrs = [_]I{
             .{ .op = .slot_load, .aux = 0 },
             .{ .op = .guard_int, .a = 0 },
             .{ .op = .konst, .aux = 0 },
-            .{ .op = .div, .a = 0, .b = 2 },
+            .{ .op = .mod, .a = 0, .b = 2 },
             .{ .op = .loop },
         };
         var consts = [_]Value{Value.int(2)};
