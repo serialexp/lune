@@ -47,6 +47,7 @@ pub const interp = @import("interp.zig");
 /// concatenates, so library code stays out of the interpreter core. Re-exported
 /// here so `zig build test` analyses and runs each library's unit tests.
 pub const stdlib_math = @import("stdlib/math.zig");
+pub const stdlib_table = @import("stdlib/table.zig");
 
 /// Phase 5 — hot-path detection + trace recorder (records IR; tier-0 executes).
 pub const trace = @import("trace.zig");

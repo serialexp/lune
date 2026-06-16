@@ -119,6 +119,21 @@ pub const Closure = struct {
 /// coerce back through the boundary.
 pub const NativeFn = *const fn (ctx: *anyopaque, args: []const Value) anyerror!Value;
 
+/// A **multi-result** native. Writes up to `out.len` results into `out` (in
+/// order) and returns the count actually produced (`<= out.len`); the VM nil-pads
+/// `out[count..]`. The VM only takes this path when the caller wants ≥2 results —
+/// for 0 or 1 wanted results a multi native is called through its single-result
+/// `NativeFn` projection (the *primary* value), so this fn never has to special-
+/// case the truncating cases.
+///
+/// IMPORTANT — aliasing contract: `out` is a slice **into the caller's
+/// registers**, beginning at the callee slot, and `args` begins one slot later;
+/// the two therefore *overlap* (`out[1..]` covers `args[0..]`). A multi native
+/// MUST read everything it needs from `args` **before** writing any of `out`.
+/// This is allocation-free by design (results land straight in the destination,
+/// mirroring Lua's stack), so it must not be made to copy.
+pub const NativeMultiFn = *const fn (ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize;
+
 /// Which **nondeterministic input** a native represents, if any. A native with a
 /// non-null `EffectKind` is a record/replay boundary: in `record` mode its result
 /// is logged, in `replay` mode it is *not called* and the logged result is fed
@@ -156,6 +171,11 @@ pub const Native = struct {
     /// Set from the `interp.base_natives` registry at install and at restore, so
     /// install and replay can never disagree about what is an effect.
     effect: ?EffectKind = null,
+    /// Non-null ⇒ this native can also produce **multiple** results; the VM calls
+    /// it through this fn when ≥2 results are wanted (otherwise it uses `func`, the
+    /// primary-value projection). Set from the registry like `effect`. A native is
+    /// never both an effect and multi-result (effects log a single value).
+    multi: ?NativeMultiFn = null,
 
     pub fn create(
         gpa: std.mem.Allocator,
@@ -176,6 +196,50 @@ pub const Native = struct {
     pub fn destroy(self: *Native, gpa: std.mem.Allocator) void {
         gpa.destroy(self);
     }
+};
+
+/// One built-in native, as a *registry descriptor* (distinct from the heap
+/// `Native` object above). `name` is the native's **serialized identity** — the
+/// key the keyframe restorer (`keyframeser.zig`) looks up to rebind it — so it
+/// must be unique across the registry; for a module function it is qualified
+/// (`"string.format"`). When `module` is set the native is installed as a field
+/// of that module's global table (under `field`) instead of as a bare global; a
+/// plain entry (`module == null`) installs under `name`. `effect` null = pure
+/// host call.
+///
+/// Lives here (not in `interp.zig`) so a dependency-light stdlib module —
+/// e.g. `src/stdlib/math.zig` — can declare its own `[]const BaseNative` slice
+/// by importing only `function`/`value`, never `interp`. `interp.base_natives`
+/// is then just the comptime concatenation of those per-library slices, and the
+/// library *code* never piles into the interpreter core.
+pub const BaseNative = struct {
+    name: []const u8,
+    func: NativeFn,
+    effect: ?EffectKind = null,
+    /// Optional multi-result implementation (see `NativeMultiFn`). When set, `func`
+    /// is the single-result *primary projection* the VM uses for 0/1 wanted
+    /// results, and this is used when ≥2 are wanted.
+    multi: ?NativeMultiFn = null,
+    /// If set, install into this module table (a global table) rather than as a
+    /// top-level global. The unknown-global lint then knows `module` (not `name`).
+    module: ?[]const u8 = null,
+    /// Key within the module table (required iff `module` is set), e.g. `"format"`.
+    field: ?[]const u8 = null,
+};
+
+/// A built-in **constant** installed as a field of a module table — e.g.
+/// `math.pi`, `math.maxinteger`. Constants are non-heap `Value`s (numbers), so
+/// they are expressible as comptime literals and a stdlib module can declare its
+/// own `[]const ModuleConst` slice the same way it declares natives. Installed by
+/// `interp.Vm.installBaseLib` alongside the natives.
+pub const ModuleConst = struct {
+    /// Module table to install into (e.g. `"math"`). Created on first use.
+    module: []const u8,
+    /// Key within the module table (e.g. `"pi"`).
+    field: []const u8,
+    /// The constant's value. Must be a non-heap `Value` (number/bool/nil) so it is
+    /// a valid comptime literal with no heap dependency.
+    value: Value,
 };
 
 // ---------------------------------------------------------------------------

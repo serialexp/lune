@@ -30,6 +30,8 @@ const irinterp = @import("irinterp.zig");
 const execlog = @import("execlog.zig");
 const compiler = @import("compiler.zig");
 const io = @import("io.zig");
+const stdmath = @import("stdlib/math.zig");
+const stdtable = @import("stdlib/table.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -144,22 +146,13 @@ pub const HostEnv = struct {
     arg: *const fn (ctx: *anyopaque, i: i64) ?[]const u8,
 };
 
-/// One built-in native. `name` is the native's **serialized identity** — the key
-/// the keyframe restorer (`keyframeser.zig`) looks up to rebind it — so it must be
-/// unique across the registry; for a module function it is qualified
-/// (`"string.format"`). When `module` is set the native is installed as a field of
-/// that module's global table (under `field`) instead of as a bare global; a plain
-/// entry (`module == null`) installs under `name`. `effect` null = pure host call.
-pub const BaseNative = struct {
-    name: []const u8,
-    func: function.NativeFn,
-    effect: ?EffectKind = null,
-    /// If set, install into this module table (a global table) rather than as a
-    /// top-level global. The unknown-global lint then knows `module` (not `name`).
-    module: ?[]const u8 = null,
-    /// Key within the module table (required iff `module` is set), e.g. `"format"`.
-    field: ?[]const u8 = null,
-};
+/// The built-in-native registry descriptor and the module-constant descriptor now
+/// live in `function.zig` (the dependency-light home alongside `NativeFn`/
+/// `EffectKind`), so a stdlib module can declare its own slices without importing
+/// `interp`. Re-exported here because `base_natives`, `defineNative`, and the
+/// keyframe restorer (`keyframeser.interp.BaseNative`) reference them by this name.
+pub const BaseNative = function.BaseNative;
+pub const ModuleConst = function.ModuleConst;
 
 /// The single source of truth for built-in natives. `installBaseLib` installs
 /// every entry into a fresh VM's globals, and the keyframe restorer
@@ -169,8 +162,17 @@ pub const BaseNative = struct {
 /// name (`keyframeser.toSchemaHeapObject`), which is meaningful only against this
 /// registry. The `effect` tag is likewise sourced here (install + restore both
 /// read it), so what counts as an effect is defined in exactly one place.
-/// `print` is pure output; `clock` is the first nondeterministic input.
-pub const base_natives = [_]BaseNative{
+///
+/// The interpreter owns only `core_natives` (host effects + the minimal bench
+/// stdlib); each standalone stdlib **library** declares its own slice and is
+/// concatenated in here, so library code never piles into the interpreter core.
+/// To add a library: append `<lib>.natives` below (and `<lib>.constants` to
+/// `base_constants`).
+pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives;
+
+/// The interpreter's own natives. `print` is pure output; `clock` is the first
+/// nondeterministic input.
+const core_natives = [_]BaseNative{
     .{ .name = "print", .func = &nativePrint },
     .{ .name = "clock", .func = &nativeClock, .effect = .clock },
     // `random` carries no `effect`: the call itself isn't the boundary — its
@@ -189,6 +191,10 @@ pub const base_natives = [_]BaseNative{
     .{ .name = "string.format", .func = &nativeStringFormat, .module = "string", .field = "format" },
     .{ .name = "io.write", .func = &nativeIoWrite, .module = "io", .field = "write" },
 };
+
+/// Built-in module constants (non-heap `Value` fields like `math.pi`). Like
+/// `base_natives`, each library contributes its own `constants` slice.
+pub const base_constants = stdmath.constants;
 
 /// The top-level global names `installBaseLib` seeds, derived from the single
 /// `base_natives` registry plus the host-populated `arg` table. The compiler's
@@ -310,6 +316,18 @@ pub const Vm = struct {
     /// always reflects the deepest active frame (frame windows stack contiguously
     /// upward).
     stack_top: usize = 0,
+    /// Dynamic multi-return "top": the absolute end of the live results a multret
+    /// producer (`call`/`ret`/native with `c == all_results`) just wrote. Valid
+    /// **only** for the single instruction that immediately follows the producer —
+    /// its designated consumer (an outer call's argument list, or a `ret`). The
+    /// compiler emits producer and consumer adjacently, and `reg_top_pending`
+    /// makes that one-instruction gap atomic w.r.t. the GC/suspend safepoint, so
+    /// `reg_top` never has to be GC-rooted or serialized: no collection or
+    /// snapshot can land between the two.
+    reg_top: usize = 0,
+    /// Set by a multret producer, cleared by its consumer. Gates the safepoint
+    /// (`exec` loop) so a producer→consumer pair is indivisible — see `reg_top`.
+    reg_top_pending: bool = false,
     /// The **explicit** call stack: `frames[0..depth]` are the active frames,
     /// bottom (main) at index 0. Replaces host-stack recursion — `exec` loops over
     /// this array, so each frame's cursor (`pc`/`base`/return-wiring) is first-class
@@ -430,6 +448,7 @@ pub const Vm = struct {
     /// rebind a serialized native by name, so install and restore can never drift.
     fn installBaseLib(self: *Vm) Error!void {
         for (base_natives) |bn| try self.defineNative(bn);
+        for (base_constants) |c| try self.defineConstant(c);
         // `arg` is a real (initially empty) table so the lint, tests, the wasm
         // host, and keyframe restore all see a table; `arg[i]` is nil until the
         // CLI host fills it from process args (`main.zig`, at the host boundary).
@@ -440,6 +459,7 @@ pub const Vm = struct {
     fn defineNative(self: *Vm, bn: BaseNative) Error!void {
         const native = try self.heap.newNative(bn.func, bn.name);
         native.effect = bn.effect; // null for pure host calls (e.g. print)
+        native.multi = bn.multi; // null unless the native can return ≥2 results
         if (bn.module) |mod| {
             const tbl = try self.getOrCreateModuleTable(mod);
             const fkey = try self.heap.internValue(bn.field.?);
@@ -464,6 +484,15 @@ pub const Vm = struct {
         for (argv, 0..) |a, idx| {
             try tbl.set(self.gpa, Value.int(@intCast(idx)), try self.heap.internValue(a));
         }
+    }
+
+    /// Install a module constant (e.g. `math.pi`) as a field of its module table.
+    /// The value is a non-heap `Value` literal from the registry, so there is no
+    /// allocation beyond the (interned) key and the on-demand module table.
+    fn defineConstant(self: *Vm, c: ModuleConst) Error!void {
+        const tbl = try self.getOrCreateModuleTable(c.module);
+        const fkey = try self.heap.internValue(c.field);
+        try tbl.set(self.gpa, fkey, c.value);
     }
 
     /// Fetch the global module table `name`, creating and binding it on first use.
@@ -690,7 +719,15 @@ pub const Vm = struct {
             // registers are settled, no half-built object is exposed), so a
             // stop-the-world collection is safe. Non-moving, so surviving
             // pointers in `regs` stay valid.
-            if (self.heap.shouldCollect()) self.collect();
+            //
+            // Suppressed while a multret result set is pending (`reg_top_pending`):
+            // a producer (e.g. `table.unpack` with `c == all_results`) may have
+            // written results *above* this frame's `num_registers`, which the root
+            // walk (bounded by `stack_top`) would not scan. Producer and consumer
+            // are adjacent instructions and neither allocates in the gap, so
+            // skipping exactly this one safepoint is sound — and it keeps `reg_top`
+            // out of both the GC root set and any keyframe snapshot.
+            if (!self.reg_top_pending and self.heap.shouldCollect()) self.collect();
 
             // Mid-execution suspend point — an instruction boundary, never
             // mid-opcode or mid-native. Sync `pc` into the top frame first so the
@@ -712,7 +749,9 @@ pub const Vm = struct {
                 try self.safepoint_lines.append(self.gpa, sp_line);
             }
             if (self.suspend_ctl) |sc| {
-                if (self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth) {
+                // Never suspend mid-multret (see the GC note above): `reg_top` is
+                // transient and unserialized, so a snapshot here could not resume.
+                if (!self.reg_top_pending and self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth) {
                     frame.pc = pc;
                     return .suspended;
                 }
@@ -846,12 +885,19 @@ pub const Vm = struct {
                 .call => {
                     const callee = regs[a];
                     if (!callee.isHeap()) return Error.TypeError;
+                    // Resolve the argument count. `all_results` (the consumer half
+                    // of dynamic multret, e.g. the outer `print` in
+                    // `print(unpack(t))`) takes every value the immediately-preceding
+                    // producer left, from the first argument slot up to `reg_top`.
+                    const nargs: usize = if (instr.b == bytecode.all_results) blk: {
+                        self.reg_top_pending = false;
+                        break :blk self.reg_top - (base + a + 1);
+                    } else instr.b;
                     switch (callee.heapType()) {
                         .function => {
                             const cl = Closure.fromHeader(callee.asHeap());
                             const cp = cl.proto;
                             const callee_base = base + proto.num_registers;
-                            const nargs: usize = instr.b;
                             if (self.depth >= max_call_depth) return Error.StackOverflow;
                             if (callee_base + cp.num_registers > self.stack.len) return Error.StackOverflow;
                             // Lay out the callee window: bind fixed params (nil-fill
@@ -881,21 +927,44 @@ pub const Vm = struct {
                         },
                         .native => {
                             const nat = function.Native.fromHeader(callee.asHeap());
-                            const nargs: usize = instr.b;
                             const nwanted: usize = instr.c;
                             const args = self.stack[base + a + 1 .. base + a + 1 + nargs];
-                            // An effect native (clock) goes through the record/replay
-                            // boundary; a pure host call (print) runs directly. A
-                            // native call is already a trace barrier (recording
-                            // aborts at it), so this seam doesn't touch the JIT.
-                            const result = if (nat.effect) |kind|
-                                try performEffect(self, kind, nat, args)
-                            else
-                                nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
-                            // Natives return a single value (multi-return is later).
-                            var k: usize = 0;
-                            while (k < nwanted) : (k += 1) {
-                                regs[a + k] = if (k == 0) result else Value.nil();
+                            // `all` = the caller wants *every* result (dynamic count,
+                            // the producer half of `print(unpack(t))` / `return f()`):
+                            // results land starting at `regs[a]` and `reg_top` records
+                            // their end for the adjacent consumer. Otherwise a concrete
+                            // `nwanted` is written and the tail nil-padded.
+                            //
+                            // Three native shapes, in priority order:
+                            //  1. effect native (clock/getenv/…): one result through the
+                            //     record/replay boundary — effects are inherently single.
+                            //  2. multi-result native: write straight into the destination
+                            //     slots. `out` aliases `args` (see NativeMultiFn), which is
+                            //     why the native reads its args first. For `all`, `out`
+                            //     spans to the end of the register stack (bounded → no OOB;
+                            //     the native caps at `out.len`).
+                            //  3. otherwise (pure single, or a multi native with 0/1 wanted):
+                            //     call `func` (the primary-value projection) and write one.
+                            // A native call is a trace barrier (recording aborts at it), so
+                            // none of this touches the JIT.
+                            const all = nwanted == bytecode.all_results;
+                            if (nat.effect) |kind| {
+                                const result = try performEffect(self, kind, nat, args);
+                                if (all) self.stampSingleResult(base, a, result) else writeSingleResult(regs, a, nwanted, result);
+                            } else if (nat.multi != null and (all or nwanted >= 2)) {
+                                const out = if (all) self.stack[base + a ..] else regs[a .. a + nwanted];
+                                const produced = nat.multi.?(@ptrCast(self), args, out) catch |e| return narrowError(e);
+                                if (all) {
+                                    std.debug.assert(!self.reg_top_pending);
+                                    self.reg_top = base + a + produced;
+                                    self.reg_top_pending = true;
+                                } else {
+                                    var k: usize = produced;
+                                    while (k < nwanted) : (k += 1) regs[a + k] = Value.nil();
+                                }
+                            } else {
+                                const result = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
+                                if (all) self.stampSingleResult(base, a, result) else writeSingleResult(regs, a, nwanted, result);
                             }
                         },
                         else => return Error.TypeError,
@@ -907,10 +976,15 @@ pub const Vm = struct {
                 // `run`/`exec`'s caller). Close any upvalues over this frame first.
                 .ret, .halt => {
                     self.closeUpvaluesFrom(base);
-                    const result: FrameResult = if (instr.op == .ret)
-                        .{ .reg = @intCast(a), .count = instr.b }
-                    else
-                        .{ .reg = 0, .count = 0 };
+                    // Resolve how many values this frame returns. `ret a all_results`
+                    // (the producer half of `return f()` / `return unpack(t)`) returns
+                    // everything the immediately-preceding multret call left, from
+                    // `a` up to `reg_top`.
+                    const ret_count: u16 = if (instr.op == .ret and instr.b == bytecode.all_results) blk: {
+                        self.reg_top_pending = false;
+                        break :blk @intCast(self.reg_top - (base + @as(usize, a)));
+                    } else if (instr.op == .ret) instr.b else 0;
+                    const result: FrameResult = .{ .reg = @intCast(a), .count = ret_count };
                     if (self.depth == 1) {
                         self.depth = 0;
                         return .{ .finished = result };
@@ -920,14 +994,13 @@ pub const Vm = struct {
                     // and the `stack_top` shrink below, so a result can't be
                     // collected before it lands in the parent's (scanned) registers.
                     // `want` uses the stored return-wiring, never a re-decode of the
-                    // caller's call instruction. (`all_results` is dead today — the
-                    // compiler emits c∈{0,1} — but clamp it so a stray sentinel
-                    // can't smash the stack; see docs/design note in the plan.)
+                    // caller's call instruction. When the caller wanted *all* results
+                    // (`call … c=all_results`, e.g. `print(g())`), take everything the
+                    // callee produced and stamp `reg_top` so the parent's adjacent
+                    // consumer instruction can expand them.
                     const parent = &self.frames[self.depth - 2];
-                    const want: usize = if (frame.ret_count == bytecode.all_results)
-                        result.count
-                    else
-                        frame.ret_count;
+                    const wants_all = frame.ret_count == bytecode.all_results;
+                    const want: usize = if (wants_all) result.count else frame.ret_count;
                     const dst = parent.base + frame.ret_dest;
                     const src = base + result.reg;
                     var k: usize = 0;
@@ -936,6 +1009,11 @@ pub const Vm = struct {
                             self.stack[src + k]
                         else
                             Value.nil();
+                    }
+                    if (wants_all) {
+                        std.debug.assert(!self.reg_top_pending);
+                        self.reg_top = dst + want;
+                        self.reg_top_pending = true;
                     }
                     // Pop and reload locals onto the parent (its `pc` is already past
                     // the call), shrinking `stack_top` to the parent's window.
@@ -1078,7 +1156,26 @@ pub const Vm = struct {
         }
     }
 
+    /// Place a single native result at `regs[a]` (absolute `stack[base + a]`) and
+    /// record `reg_top` for the adjacent consumer — the `all_results` path for an
+    /// effect or pure-single native (e.g. `print(clock())`). One result, so the
+    /// live top is just past it.
+    fn stampSingleResult(self: *Vm, base: usize, a: usize, result: Value) void {
+        std.debug.assert(!self.reg_top_pending); // exactly one producer pending at a time
+        self.stack[base + a] = result;
+        self.reg_top = base + a + 1;
+        self.reg_top_pending = true;
+    }
+
 };
+
+/// Place a single native result into the caller's window: the value into the
+/// first wanted slot, `nil` into the rest. Shared by the effect and pure-single
+/// native paths. `nwanted == 0` discards the result (statement-context call).
+fn writeSingleResult(regs: []Value, a: usize, nwanted: usize, result: Value) void {
+    var k: usize = 0;
+    while (k < nwanted) : (k += 1) regs[a + k] = if (k == 0) result else Value.nil();
+}
 
 /// Narrow a native's `anyerror` back into the interpreter's error set. Known
 /// runtime errors map across; anything else is surfaced as a `HostError`.
@@ -1602,7 +1699,7 @@ fn formatNonStr(out: *std.ArrayList(u8), gpa: std.mem.Allocator, v: Value, spec:
 
 /// Coerce a concat operand to bytes: a string's own bytes, or a number formatted
 /// into `buf`. Returns a slice valid until `buf` is reused.
-fn coerceConcat(v: Value, buf: []u8) Error![]const u8 {
+pub fn coerceConcat(v: Value, buf: []u8) Error![]const u8 {
     return switch (v.tag) {
         .heap_ref => if (v.heapType() == .string)
             string.String.fromHeader(v.asHeap()).bytes()
@@ -2284,6 +2381,18 @@ test "determinism: two independent runs agree on output, traces, and snapshots" 
         \\gamma = 3
         \\print(config.name)
         ,
+        // Dynamic multret (`all_results`) inside a hot loop. The `reg_top`
+        // producer→consumer pair brackets a safepoint, so this run diverges in
+        // trace/snapshot bytes if `reg_top` ever leaked into capturable state
+        // (it must not — the safepoint is suppressed while a multret is pending).
+        \\local function pair(i) return i, i * i end
+        \\local s = 0
+        \\for i = 1, 100 do
+        \\  local a, b = pair(i)
+        \\  s = s + a + b
+        \\end
+        \\print(s, pair(7))
+        ,
     };
     inline for (programs) |src| {
         var buf_a: [256]u8 = undefined;
@@ -2918,6 +3027,86 @@ test "e2e: recursion, loop, locals — fib and a summing loop" {
     , "55\t55\n"); // fib(10) == 55, sum 1..10 == 55
 }
 
+test "e2e: multi-return — native (math.modf) and closure, with adjustment rules" {
+    try expectProgram(
+        \\local i, f = math.modf(3.5)
+        \\print(i, f)                  -- 3  0.5
+        \\local x = math.modf(3.5)
+        \\print(x)                     -- 3   (nwanted=1 truncates the second result)
+        \\local a, b, c = math.modf(3.5)
+        \\print(a, b, c)               -- 3  0.5  nil   (extra target nil-padded)
+        \\local p, q = math.modf(3.5), 9
+        \\print(p, q)                  -- 3  9   (call not in last position ⇒ no expand)
+        \\local g, h = 0, 0
+        \\g, h = math.modf(-3.25)
+        \\print(g, h)                  -- -3  -0.25 (multi-target assignment)
+        \\local m, n = (function() return 11, 22 end)()
+        \\print(m, n)                  -- 11  22  (closure multret via the same ABI)
+        \\local r, s, t = (function() return 1, 2 end)()
+        \\print(r, s, t)               -- 1  2  nil
+    ,
+        "3\t0.5\n3\n3\t0.5\tnil\n3\t9\n-3\t-0.25\n11\t22\n1\t2\tnil\n",
+    );
+}
+
+test "e2e: dynamic multret — call-arg and return position expand (all_results)" {
+    // Exercises the `all_results` sentinel through `expectProgram`, which runs all
+    // five modes *and* stress GC (collect at every safepoint). The safepoint
+    // between a multret producer and its consumer is gated by `reg_top_pending`,
+    // so stress mode here is the real test that transient results above
+    // `num_registers` are never collected and `reg_top` never leaks into a
+    // snapshot.
+    try expectProgram(
+        \\local function f() return 1, 2, 3 end
+        \\print(f())                              -- call-arg expands: 1 2 3
+        \\print(0, f())                           -- last arg expands, earlier kept: 0 1 2 3
+        \\print(f(), 9)                           -- non-last call truncates to 1: 1 9
+        \\local g = function() return f() end      -- `return f()` forwards all
+        \\print(g())                              -- 1 2 3
+        \\print((function() return f() end)())     -- nested forward: 1 2 3
+        \\print(f(f()))                           -- inner f feeds outer f: 1 2 3
+        \\local function h() return end            -- zero results
+        \\print("x", h())                         -- zero-expand: x
+        \\local o = { go = function(self, n) return n, n + 1 end }
+        \\print(o:go(10))                         -- method-call expand: 10 11
+        \\print(o:go(f()))                        -- method + multret last arg: self,1 → 1 2
+    ,
+        "1\t2\t3\n0\t1\t2\t3\n1\t9\n1\t2\t3\n1\t2\t3\n1\t2\t3\nx\n10\t11\n1\t2\n",
+    );
+}
+
+test "e2e: table library — unpack/pack/insert/remove/concat/move" {
+    // Drives `stdlib/table.zig` through all five modes + stress GC. `unpack` is a
+    // multi native, so `print(table.unpack(t))` also re-exercises the `all_results`
+    // path end-to-end via the library (not just the closure/`math.modf` cases).
+    try expectProgram(
+        \\local function f() return 1, 2, 3 end
+        \\print(table.unpack({10, 20, 30}))            -- multret call-arg: 10 20 30
+        \\print(table.unpack({10, 20, 30, 40}, 2, 3))  -- sub-range: 20 30
+        \\local a, b = table.unpack({7, 8, 9})         -- fixed truncation: 7 8
+        \\print(a, b)
+        \\local p = table.pack(f())                    -- pack multret: n=3
+        \\print(p.n, p[1], p[2], p[3])
+        \\print(table.pack().n)                        -- empty pack: 0
+        \\local t = {1, 2, 3}
+        \\table.insert(t, 4)                           -- append
+        \\table.insert(t, 1, 0)                        -- positional insert
+        \\print(table.concat(t, ","))                  -- 0,1,2,3,4
+        \\local r1 = table.remove(t)                   -- remove tail → 4
+        \\local r2 = table.remove(t, 1)                -- remove head → 0
+        \\print(r1, r2, table.concat(t, ","))          -- 4 0 1,2,3
+        \\print(table.concat({9, 8, 7, 6}, "-", 2, 3)) -- ranged concat: 8-7
+        \\local m = {1, 2, 3, 4, 5}
+        \\table.move(m, 1, 3, 3)                        -- overlap-up copy
+        \\print(table.concat(m, ","))                  -- 1,2,1,2,3
+        \\local dst = {0, 0, 0, 0, 0}
+        \\table.move({1, 2, 3}, 1, 3, 2, dst)          -- copy into another table
+        \\print(table.concat(dst, ","))                -- 0,1,2,3,0
+    ,
+        "10\t20\t30\n20\t30\n7\t8\n3\t1\t2\t3\n0\n0,1,2,3,4\n4\t0\t1,2,3\n8-7\n1,2,1,2,3\n0,1,2,3,0\n",
+    );
+}
+
 test "e2e: tables and string concat" {
     try expectProgram(
         \\local t = {}
@@ -2997,6 +3186,11 @@ test "gc: per-iteration garbage is reclaimed (heap stays bounded)" {
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     vm.out = &sink;
+    // Baseline = the permanent base-library footprint (every installed native +
+    // its module tables + the `arg` table), captured right after init. Measuring
+    // against this keeps the bound robust as the stdlib grows instead of baking a
+    // magic total that breaks each time a library lands.
+    const base_objects = vm.heap.object_count;
     vm.heap.gc_stress = true;
 
     var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
@@ -3007,9 +3201,10 @@ test "gc: per-iteration garbage is reclaimed (heap stays bounded)" {
     try testing.expectEqualStrings("200\n", sink.buffered());
 
     // The decisive assertion: the live set is bounded, *not* proportional to the
-    // 200 iterations. (globals, the main closure, "last"/literals, and a handful
-    // of still-rooted tables — comfortably under 32.)
-    try testing.expect(vm.heap.object_count < 32);
+    // 200 iterations. Beyond the permanent base set, only a handful survive (the
+    // main closure, "last"/literals, and a couple of still-rooted tables) — far
+    // below the ~200 a missing collector would leave.
+    try testing.expect(vm.heap.object_count < base_objects + 24);
 }
 
 // ---------------------------------------------------------------------------

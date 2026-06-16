@@ -495,24 +495,8 @@ const Compiler = struct {
 
     fn compileLocal(self: *Compiler, l: anytype) Error!void {
         const start = self.next_reg;
-        const n_names = l.names.len;
-
-        var i: usize = 0;
-        while (i < n_names) : (i += 1) {
-            const r = try self.alloc1();
-            if (i < l.values.len) {
-                try self.compileExprTo(l.values[i], r);
-            } else {
-                _ = try self.emit(Instr.opA(.load_nil, r));
-            }
-        }
-        // Evaluate any surplus RHS expressions for their side effects, then drop.
-        while (i < l.values.len) : (i += 1) {
-            const mark = self.next_reg;
-            const r = try self.alloc1();
-            try self.compileExprTo(l.values[i], r);
-            self.freeTo(mark);
-        }
+        const n_names: u16 = @intCast(l.names.len);
+        try self.compileValuesInto(l.values, start, n_names);
         // Declare names only after the RHS is evaluated (Lua scoping: `local x = x`
         // reads the outer `x`).
         for (l.names, 0..) |nm, j| {
@@ -523,27 +507,118 @@ const Compiler = struct {
     fn compileAssign(self: *Compiler, a: anytype) Error!void {
         const mark = self.next_reg;
         const val_base = self.next_reg;
-        const n_targets = a.targets.len;
-
-        var i: usize = 0;
-        while (i < n_targets) : (i += 1) {
-            const r = try self.alloc1();
-            if (i < a.values.len) {
-                try self.compileExprTo(a.values[i], r);
-            } else {
-                _ = try self.emit(Instr.opA(.load_nil, r));
-            }
-        }
-        while (i < a.values.len) : (i += 1) {
-            const m = self.next_reg;
-            const r = try self.alloc1();
-            try self.compileExprTo(a.values[i], r);
-            self.freeTo(m);
-        }
+        const n_targets: u16 = @intCast(a.targets.len);
+        try self.compileValuesInto(a.values, val_base, n_targets);
         for (a.targets, 0..) |tgt, j| {
             try self.compileStore(tgt, @intCast(val_base + j));
         }
         self.freeTo(mark);
+    }
+
+    /// Fill registers `[base, base + want)` with the values of `exprs`, applying
+    /// Lua's adjustment rules used by multi-assignment and `local`:
+    ///   - too few values → nil-pad the remaining slots;
+    ///   - a **call** in the *last* position expands to fill the remaining slots
+    ///     (multi-return), so `local a, b = f()` binds both of `f`'s results;
+    ///   - surplus values are evaluated (side effects) and discarded.
+    /// Precondition: `next_reg == base`. Postcondition: `next_reg == base + want`
+    /// and the window holds the adjusted values.
+    fn compileValuesInto(self: *Compiler, exprs: []const *ast.Expr, base: u16, want: u16) Error!void {
+        std.debug.assert(self.next_reg == base); // window is allocated by this helper
+        const n = exprs.len;
+        if (n == 0) {
+            var p: u16 = 0;
+            while (p < want) : (p += 1) {
+                const r = try self.alloc1();
+                _ = try self.emit(Instr.opA(.load_nil, r));
+            }
+            return;
+        }
+        if (n >= want) {
+            // Enough (or surplus) values: each slot gets its own expr (the last is
+            // truncated to one result like any other), then surplus is discarded.
+            var p: usize = 0;
+            while (p < want) : (p += 1) {
+                const r = try self.alloc1();
+                try self.compileExprTo(exprs[p], r);
+            }
+            while (p < n) : (p += 1) {
+                const m = self.next_reg;
+                const r = try self.alloc1();
+                try self.compileExprTo(exprs[p], r);
+                self.freeTo(m);
+            }
+            return;
+        }
+        // n < want: leading exprs are one-per-slot; the last expr either expands
+        // (call → multi-return filling the remaining slots) or nil-pads.
+        var p: usize = 0;
+        while (p < n - 1) : (p += 1) {
+            const r = try self.alloc1();
+            try self.compileExprTo(exprs[p], r);
+        }
+        const last = exprs[n - 1];
+        const remaining: u16 = want - @as(u16, @intCast(n - 1)); // >= 2 here
+        if (last.isCall()) {
+            // next_reg == base + (n-1): the call's results land in place, filling
+            // [base + (n-1), base + want).
+            try self.compileCallInPlace(last, remaining);
+        } else {
+            const r = try self.alloc1();
+            try self.compileExprTo(last, r);
+            var q: u16 = @intCast(n);
+            while (q < want) : (q += 1) {
+                const rr = try self.alloc1();
+                _ = try self.emit(Instr.opA(.load_nil, rr));
+            }
+        }
+    }
+
+    /// Emit a call (`.call` or `.method_call`) whose function slot sits at the
+    /// current `next_reg`, requesting `nwanted` results and leaving them live in
+    /// `[base, base + nwanted)` with no result `move`. Used for multi-return in
+    /// the last value position. Postcondition: `next_reg == base + nwanted`
+    /// (argument temporaries above the result window are freed).
+    fn compileCallInPlace(self: *Compiler, expr: *const ast.Expr, nwanted: u16) Error!void {
+        const base = self.next_reg;
+        switch (expr.data) {
+            .call => |c| {
+                _ = try self.alloc1(); // function slot at base; results land here
+                try self.compileExprTo(c.callee, base);
+                for (c.args) |arg| {
+                    const r = try self.alloc1();
+                    try self.compileExprTo(arg, r);
+                }
+                if (c.args.len > std.math.maxInt(u16)) return self.fail(expr.span, "too many arguments");
+                _ = try self.emit(Instr.opABC(.call, base, @intCast(c.args.len), nwanted));
+            },
+            .method_call => |mc| {
+                _ = try self.alloc1(); // function slot at base
+                const self_reg = try self.alloc1(); // base+1 = self (first argument)
+                try self.compileExprTo(mc.obj, self_reg);
+                const km = self.next_reg;
+                const key = try self.alloc1();
+                const k = try self.stringConstant(mc.name);
+                _ = try self.emit(Instr.opAB(.load_const, key, k));
+                _ = try self.emit(Instr.opABC(.get_index, base, self_reg, key));
+                self.freeTo(km); // free the key temp; fn + self stay
+                for (mc.args) |arg| {
+                    const r = try self.alloc1();
+                    try self.compileExprTo(arg, r);
+                }
+                const total = mc.args.len + 1; // implicit self
+                if (total > std.math.maxInt(u16)) return self.fail(expr.span, "too many arguments");
+                _ = try self.emit(Instr.opABC(.call, base, @intCast(total), nwanted));
+            },
+            else => unreachable, // guarded by isCall()
+        }
+        // Leave the result window live; free any argument temporaries above it.
+        // A dynamic (`all_results`) call has an unknown result count, so collapse
+        // back to the result base — the caller emits the consuming `call`/`ret`
+        // immediately after, before allocating anything else. (`max_reg` already
+        // covers the function + argument temporaries from the alloc1s above.)
+        self.next_reg = if (nwanted == bytecode.all_results) base else base + nwanted;
+        if (self.next_reg > self.max_reg) self.max_reg = self.next_reg;
     }
 
     /// Emit a store of register `src` into the assignable target `tgt`.
@@ -580,11 +655,24 @@ const Compiler = struct {
         }
         const mark = self.next_reg;
         const base = self.next_reg;
-        for (exprs) |e| {
-            const r = try self.alloc1();
-            try self.compileExprTo(e, r);
+        const n = exprs.len;
+        // If the last value is a call, expand it: `return f()` / `return a, f()`
+        // forwards *all* of `f`'s results. Earlier values (and any non-call last
+        // value) are one register each.
+        if (exprs[n - 1].isCall()) {
+            for (exprs[0 .. n - 1]) |e| {
+                const r = try self.alloc1();
+                try self.compileExprTo(e, r);
+            }
+            try self.compileCallInPlace(exprs[n - 1], bytecode.all_results);
+            _ = try self.emit(Instr.opAB(.ret, base, bytecode.all_results));
+        } else {
+            for (exprs) |e| {
+                const r = try self.alloc1();
+                try self.compileExprTo(e, r);
+            }
+            _ = try self.emit(Instr.opAB(.ret, base, @intCast(n)));
         }
-        _ = try self.emit(Instr.opAB(.ret, base, @intCast(exprs.len)));
         self.freeTo(mark);
     }
 
@@ -905,14 +993,34 @@ const Compiler = struct {
         const mark = self.next_reg;
         const base = try self.alloc1(); // function slot; results land here
         try self.compileExprTo(callee, base);
-        for (args) |arg| {
-            const r = try self.alloc1();
-            try self.compileExprTo(arg, r);
-        }
-        if (args.len > std.math.maxInt(u16)) return self.fail(callee.span, "too many arguments");
-        _ = try self.emit(Instr.opABC(.call, base, @intCast(args.len), nwanted));
+        try self.compileArgList(args, base, callee.span, nwanted);
         if (nwanted >= 1 and dest != base) _ = try self.emit(Instr.opAB(.move, dest, base));
         self.freeTo(mark);
+    }
+
+    /// Lay out a call's arguments above its function slot at `base` and emit the
+    /// `call`. If the last argument is itself a call, it expands (`all_results`):
+    /// `print(f())` forwards every result of `f`. Each earlier argument (and a
+    /// non-call last argument) is one register, truncated to a single value — so
+    /// only the tail position is variadic, which keeps at most one dynamic-`reg_top`
+    /// producer pending at a time. `base + 1` is the first argument slot.
+    fn compileArgList(self: *Compiler, args: []const *ast.Expr, base: u16, span: ast.Span, nwanted: u16) Error!void {
+        const n = args.len;
+        if (n >= 1 and args[n - 1].isCall()) {
+            for (args[0 .. n - 1]) |arg| {
+                const r = try self.alloc1();
+                try self.compileExprTo(arg, r);
+            }
+            try self.compileCallInPlace(args[n - 1], bytecode.all_results);
+            _ = try self.emit(Instr.opABC(.call, base, bytecode.all_results, nwanted));
+        } else {
+            for (args) |arg| {
+                const r = try self.alloc1();
+                try self.compileExprTo(arg, r);
+            }
+            if (n > std.math.maxInt(u16)) return self.fail(span, "too many arguments");
+            _ = try self.emit(Instr.opABC(.call, base, @intCast(n), nwanted));
+        }
     }
 
     /// `obj:name(args)` — method-call sugar for `obj.name(obj, args)`: `obj` is
@@ -931,13 +1039,25 @@ const Compiler = struct {
         _ = try self.emit(Instr.opABC(.get_index, base, self_reg, key));
         self.freeTo(km); // free the key temp; fn + self stay
 
-        for (args) |arg| {
-            const r = try self.alloc1();
-            try self.compileExprTo(arg, r);
+        // `self` is already at base+1; lay out the explicit arguments after it.
+        // As with `compileArgList`, a trailing call expands (`all_results`).
+        const n = args.len;
+        if (n >= 1 and args[n - 1].isCall()) {
+            for (args[0 .. n - 1]) |arg| {
+                const r = try self.alloc1();
+                try self.compileExprTo(arg, r);
+            }
+            try self.compileCallInPlace(args[n - 1], bytecode.all_results);
+            _ = try self.emit(Instr.opABC(.call, base, bytecode.all_results, nwanted));
+        } else {
+            for (args) |arg| {
+                const r = try self.alloc1();
+                try self.compileExprTo(arg, r);
+            }
+            const total = n + 1; // implicit self
+            if (total > std.math.maxInt(u16)) return self.fail(obj.span, "too many arguments");
+            _ = try self.emit(Instr.opABC(.call, base, @intCast(total), nwanted));
         }
-        const total = args.len + 1; // implicit self
-        if (total > std.math.maxInt(u16)) return self.fail(obj.span, "too many arguments");
-        _ = try self.emit(Instr.opABC(.call, base, @intCast(total), nwanted));
         if (nwanted >= 1 and dest != base) _ = try self.emit(Instr.opAB(.move, dest, base));
         self.freeTo(mark);
     }
