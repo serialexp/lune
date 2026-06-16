@@ -68,11 +68,36 @@ pub const Cond = enum(u8) {
     ae = 0x3, // CF=0           — unsigned ≥  (above-or-equal / not-carry)
     e = 0x4, // ZF=1            — equal / zero
     ne = 0x5, // ZF=0           — not-equal / not-zero
+    be = 0x6, // CF=1 or ZF=1   — unsigned ≤  (below-or-equal)
+    a = 0x7, // CF=0 and ZF=0  — unsigned >  (above)
+    p = 0xA, // PF=1            — parity (unordered, after ucomisd compare)
+    np = 0xB, // PF=0           — no-parity (ordered)
     l = 0xC, // SF≠OF          — signed <
     ge = 0xD, // SF=OF          — signed ≥
     le = 0xE, // ZF=1 or SF≠OF  — signed ≤
     g = 0xF, // ZF=0 and SF=OF — signed >
 };
+
+/// XMM register aliases. SSE encodes an XMM operand by the same 0..15 index
+/// (ModRM.reg/.rm + the REX.R/.B extension bit) as a GP register, so the JIT
+/// reuses `Reg` directly for XMM operands; these names exist only so call sites
+/// read `xmm0` rather than the GP spelling of the same index.
+pub const xmm0: Reg = @enumFromInt(0);
+pub const xmm1: Reg = @enumFromInt(1);
+pub const xmm2: Reg = @enumFromInt(2);
+pub const xmm3: Reg = @enumFromInt(3);
+pub const xmm4: Reg = @enumFromInt(4);
+pub const xmm5: Reg = @enumFromInt(5);
+pub const xmm6: Reg = @enumFromInt(6);
+pub const xmm7: Reg = @enumFromInt(7);
+pub const xmm8: Reg = @enumFromInt(8);
+pub const xmm9: Reg = @enumFromInt(9);
+pub const xmm10: Reg = @enumFromInt(10);
+pub const xmm11: Reg = @enumFromInt(11);
+pub const xmm12: Reg = @enumFromInt(12);
+pub const xmm13: Reg = @enumFromInt(13);
+pub const xmm14: Reg = @enumFromInt(14);
+pub const xmm15: Reg = @enumFromInt(15);
 
 /// A forward- or backward-reference target. Created unbound (`label`), positioned
 /// later (`bind`); every `jmp`/`jcc` to it records a fixup that `resolve` patches.
@@ -578,6 +603,120 @@ pub const Assembler = struct {
         try self.modrmReg(0, reg.lo());
     }
 
+    // ---- scalar SSE2 (double-precision float) — Phase D -------------------------
+    //
+    // Float traces live in XMM registers. Every form here is a scalar-double op:
+    // a mandatory legacy prefix (0xF2 for scalar-double, 0x66 for the integer /
+    // move / compare forms), then the *optional* REX (W for the 64-bit GP↔XMM
+    // moves and cvtsi2sd, R/B for xmm8–15), then the two-byte 0F opcode and ModRM.
+    // The one ordering subtlety vs the integer forms: the mandatory prefix is
+    // emitted *before* REX (legacy prefixes always precede REX), which is why
+    // these don't go through the plain `rex` entry points directly.
+
+    /// Reg-reg scalar-SSE form: `<prefix> [REX] 0F <opcode> /r`, ModRM mod=11.
+    /// `reg` is the ModRM.reg operand (REX.R), `rm` the ModRM.rm operand (REX.B).
+    fn sseRR(self: *Assembler, prefix: u8, w: bool, opcode: u8, reg: Reg, rm: Reg) !void {
+        try self.b(prefix);
+        try self.rex(w, reg.hi(), false, rm.hi());
+        try self.b(0x0F);
+        try self.b(opcode);
+        try self.modrmReg(reg.lo(), rm.lo());
+    }
+
+    /// Reg-mem scalar-SSE form: `<prefix> [REX] 0F <opcode> /r`, `[base+disp]`.
+    /// `reg` is the ModRM.reg operand (the XMM register); the memory operand is rm.
+    fn sseRM(self: *Assembler, prefix: u8, w: bool, opcode: u8, reg: Reg, base: Reg, disp: i32) !void {
+        try self.b(prefix);
+        try self.rex(w, reg.hi(), false, base.hi());
+        try self.b(0x0F);
+        try self.b(opcode);
+        try self.modrmMem(reg.lo(), base, disp);
+    }
+
+    /// `movsd dst, src` — F2 0F 10 /r: copy a scalar double between XMM regs.
+    pub fn movsdRegReg(self: *Assembler, dst: Reg, src: Reg) !void {
+        try self.sseRR(0xF2, false, 0x10, dst, src);
+    }
+    /// `movsd dst, [base+disp]` — F2 0F 10 /r: load a double into an XMM reg.
+    pub fn movsdRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.sseRM(0xF2, false, 0x10, dst, base, disp);
+    }
+    /// `movsd [base+disp], src` — F2 0F 11 /r: store an XMM double to memory
+    /// (reg field = the source XMM).
+    pub fn movsdMemReg(self: *Assembler, base: Reg, disp: i32, src: Reg) !void {
+        try self.sseRM(0xF2, false, 0x11, src, base, disp);
+    }
+
+    /// `addsd dst, src` — F2 0F 58 /r.
+    pub fn addsdRegReg(self: *Assembler, dst: Reg, src: Reg) !void {
+        try self.sseRR(0xF2, false, 0x58, dst, src);
+    }
+    /// `addsd dst, [base+disp]` — F2 0F 58 /r.
+    pub fn addsdRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.sseRM(0xF2, false, 0x58, dst, base, disp);
+    }
+    /// `subsd dst, src` — F2 0F 5C /r (dst = dst - src; operand order matters).
+    pub fn subsdRegReg(self: *Assembler, dst: Reg, src: Reg) !void {
+        try self.sseRR(0xF2, false, 0x5C, dst, src);
+    }
+    /// `subsd dst, [base+disp]` — F2 0F 5C /r.
+    pub fn subsdRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.sseRM(0xF2, false, 0x5C, dst, base, disp);
+    }
+    /// `mulsd dst, src` — F2 0F 59 /r.
+    pub fn mulsdRegReg(self: *Assembler, dst: Reg, src: Reg) !void {
+        try self.sseRR(0xF2, false, 0x59, dst, src);
+    }
+    /// `mulsd dst, [base+disp]` — F2 0F 59 /r.
+    pub fn mulsdRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.sseRM(0xF2, false, 0x59, dst, base, disp);
+    }
+    /// `divsd dst, src` — F2 0F 5E /r (dst = dst / src; operand order matters).
+    pub fn divsdRegReg(self: *Assembler, dst: Reg, src: Reg) !void {
+        try self.sseRR(0xF2, false, 0x5E, dst, src);
+    }
+    /// `divsd dst, [base+disp]` — F2 0F 5E /r.
+    pub fn divsdRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.sseRM(0xF2, false, 0x5E, dst, base, disp);
+    }
+
+    /// `ucomisd a, b` — 66 0F 2E /r: unordered compare two doubles, set ZF/PF/CF.
+    /// (Unordered ⇒ ZF=PF=CF=1; the NaN-aware setcc combine reads PF.)
+    pub fn ucomisdRegReg(self: *Assembler, lhs: Reg, rhs: Reg) !void {
+        try self.sseRR(0x66, false, 0x2E, lhs, rhs);
+    }
+    /// `ucomisd lhs, [base+disp]` — 66 0F 2E /r.
+    pub fn ucomisdRegMem(self: *Assembler, lhs: Reg, base: Reg, disp: i32) !void {
+        try self.sseRM(0x66, false, 0x2E, lhs, base, disp);
+    }
+
+    /// `cvtsi2sd dst_xmm, src_gp` — F2 REX.W 0F 2A /r: convert a signed 64-bit
+    /// integer to a double (round-to-nearest, matching `@floatFromInt`).
+    pub fn cvtsi2sdRegReg(self: *Assembler, dst_xmm: Reg, src_gp: Reg) !void {
+        try self.sseRR(0xF2, true, 0x2A, dst_xmm, src_gp);
+    }
+    /// `cvtsi2sd dst_xmm, qword [base+disp]` — F2 REX.W 0F 2A /r.
+    pub fn cvtsi2sdRegMem(self: *Assembler, dst_xmm: Reg, base: Reg, disp: i32) !void {
+        try self.sseRM(0xF2, true, 0x2A, dst_xmm, base, disp);
+    }
+
+    /// `movq dst_xmm, src_gp` — 66 REX.W 0F 6E /r: move 64 raw bits GP→XMM
+    /// (materialize a float constant whose bits are in a GP register).
+    pub fn movqXmmReg(self: *Assembler, dst_xmm: Reg, src_gp: Reg) !void {
+        try self.sseRR(0x66, true, 0x6E, dst_xmm, src_gp);
+    }
+    /// `movq dst_gp, src_xmm` — 66 REX.W 0F 7E /r: move 64 raw bits XMM→GP
+    /// (reg field = the source XMM, rm = the destination GP).
+    pub fn movqRegXmm(self: *Assembler, dst_gp: Reg, src_xmm: Reg) !void {
+        try self.sseRR(0x66, true, 0x7E, src_xmm, dst_gp);
+    }
+
+    /// `xorpd dst, src` — 66 0F 57 /r: bitwise-xor two doubles (the sign-flip
+    /// mask for the deferred float-`neg`).
+    pub fn xorpdRegReg(self: *Assembler, dst: Reg, src: Reg) !void {
+        try self.sseRR(0x66, false, 0x57, dst, src);
+    }
+
     // ---- stack / control flow ---------------------------------------------------
 
     /// `push reg` — 50+rd (REX.B if reg ≥ r8; no REX.W).
@@ -907,6 +1046,162 @@ test "enc: bt / bts / btr [mem], reg" {
     }.f);
 }
 
+test "enc: SSE2 scalar-double arith (reg, reg)" {
+    // movsd xmm0, xmm1 — F2 0F 10 /r
+    try expectEnc(&.{ 0xF2, 0x0F, 0x10, 0xC1 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movsdRegReg(xmm0, xmm1);
+        }
+    }.f);
+    // movsd xmm1, xmm0
+    try expectEnc(&.{ 0xF2, 0x0F, 0x10, 0xC8 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movsdRegReg(xmm1, xmm0);
+        }
+    }.f);
+    // addsd xmm0, xmm1 — F2 0F 58
+    try expectEnc(&.{ 0xF2, 0x0F, 0x58, 0xC1 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.addsdRegReg(xmm0, xmm1);
+        }
+    }.f);
+    // subsd xmm0, xmm1 — F2 0F 5C
+    try expectEnc(&.{ 0xF2, 0x0F, 0x5C, 0xC1 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.subsdRegReg(xmm0, xmm1);
+        }
+    }.f);
+    // mulsd xmm0, xmm1 — F2 0F 59
+    try expectEnc(&.{ 0xF2, 0x0F, 0x59, 0xC1 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.mulsdRegReg(xmm0, xmm1);
+        }
+    }.f);
+    // divsd xmm0, xmm1 — F2 0F 5E
+    try expectEnc(&.{ 0xF2, 0x0F, 0x5E, 0xC1 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.divsdRegReg(xmm0, xmm1);
+        }
+    }.f);
+    // ucomisd xmm0, xmm1 — 66 0F 2E
+    try expectEnc(&.{ 0x66, 0x0F, 0x2E, 0xC1 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.ucomisdRegReg(xmm0, xmm1);
+        }
+    }.f);
+    // xorpd xmm0, xmm0 — 66 0F 57
+    try expectEnc(&.{ 0x66, 0x0F, 0x57, 0xC0 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.xorpdRegReg(xmm0, xmm0);
+        }
+    }.f);
+}
+
+test "enc: SSE2 scalar-double mem forms" {
+    // movsd xmm0, [rdi+8] — F2 0F 10 /r, [rdi+disp8]
+    try expectEnc(&.{ 0xF2, 0x0F, 0x10, 0x47, 0x08 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movsdRegMem(xmm0, .rdi, 8);
+        }
+    }.f);
+    // movsd [rdi+8], xmm0 — F2 0F 11 /r (reg field = source xmm)
+    try expectEnc(&.{ 0xF2, 0x0F, 0x11, 0x47, 0x08 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movsdMemReg(.rdi, 8, xmm0);
+        }
+    }.f);
+    // movsd [rdi], xmm0 — disp0, no SIB (rdi base)
+    try expectEnc(&.{ 0xF2, 0x0F, 0x11, 0x07 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movsdMemReg(.rdi, 0, xmm0);
+        }
+    }.f);
+    // addsd xmm0, [rsp+16] — F2 0F 58, [rsp] base needs SIB
+    try expectEnc(&.{ 0xF2, 0x0F, 0x58, 0x44, 0x24, 0x10 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.addsdRegMem(xmm0, .rsp, 16);
+        }
+    }.f);
+    // ucomisd xmm0, [rdi] — 66 0F 2E
+    try expectEnc(&.{ 0x66, 0x0F, 0x2E, 0x07 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.ucomisdRegMem(xmm0, .rdi, 0);
+        }
+    }.f);
+}
+
+test "enc: SSE2 GP<->XMM moves + cvtsi2sd" {
+    // cvtsi2sd xmm0, rax — F2 REX.W 0F 2A /r
+    try expectEnc(&.{ 0xF2, 0x48, 0x0F, 0x2A, 0xC0 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.cvtsi2sdRegReg(xmm0, .rax);
+        }
+    }.f);
+    // cvtsi2sd xmm0, rcx
+    try expectEnc(&.{ 0xF2, 0x48, 0x0F, 0x2A, 0xC1 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.cvtsi2sdRegReg(xmm0, .rcx);
+        }
+    }.f);
+    // cvtsi2sd xmm0, qword [rdi+8]
+    try expectEnc(&.{ 0xF2, 0x48, 0x0F, 0x2A, 0x47, 0x08 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.cvtsi2sdRegMem(xmm0, .rdi, 8);
+        }
+    }.f);
+    // movq xmm0, rax — 66 REX.W 0F 6E /r
+    try expectEnc(&.{ 0x66, 0x48, 0x0F, 0x6E, 0xC0 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movqXmmReg(xmm0, .rax);
+        }
+    }.f);
+    // movq rax, xmm0 — 66 REX.W 0F 7E /r (reg field = source xmm)
+    try expectEnc(&.{ 0x66, 0x48, 0x0F, 0x7E, 0xC0 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movqRegXmm(.rax, xmm0);
+        }
+    }.f);
+    // movq rcx, xmm0 — rm = rcx (dst gp)
+    try expectEnc(&.{ 0x66, 0x48, 0x0F, 0x7E, 0xC1 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movqRegXmm(.rcx, xmm0);
+        }
+    }.f);
+}
+
+test "enc: SSE2 high registers (xmm8-15 + r8-15)" {
+    // movsd xmm8, xmm15 — REX.R (reg=xmm8) + REX.B (rm=xmm15) = 0x45
+    try expectEnc(&.{ 0xF2, 0x45, 0x0F, 0x10, 0xC7 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movsdRegReg(xmm8, xmm15);
+        }
+    }.f);
+    // addsd xmm15, xmm8 — REX.R (xmm15) + REX.B (xmm8) = 0x45, modrm reg=7 rm=0
+    try expectEnc(&.{ 0xF2, 0x45, 0x0F, 0x58, 0xF8 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.addsdRegReg(xmm15, xmm8);
+        }
+    }.f);
+    // cvtsi2sd xmm8, r15 — F2 REX.W.R.B 0F 2A, reg=0 rm=7
+    try expectEnc(&.{ 0xF2, 0x4D, 0x0F, 0x2A, 0xC7 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.cvtsi2sdRegReg(xmm8, .r15);
+        }
+    }.f);
+    // movq xmm8, r15 — 66 REX.W.R.B 0F 6E
+    try expectEnc(&.{ 0x66, 0x4D, 0x0F, 0x6E, 0xC7 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movqXmmReg(xmm8, .r15);
+        }
+    }.f);
+    // movsd xmm8, [r9+8] — REX.R (xmm8) + REX.B (r9) = 0x45
+    try expectEnc(&.{ 0xF2, 0x45, 0x0F, 0x10, 0x41, 0x08 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.movsdRegMem(xmm8, .r9, 8);
+        }
+    }.f);
+}
+
 test "enc: setcc unsigned (b / ae)" {
     try expectEnc(&.{ 0x0F, 0x92, 0xC0 }, struct { // setb al
         fn f(a: *Assembler) !void {
@@ -927,6 +1222,29 @@ test "enc: setcc unsigned (b / ae)" {
     try expectEnc(&.{ 0x41, 0x0F, 0x92, 0xC0 }, struct { // setb r8b
         fn f(a: *Assembler) !void {
             try a.setcc(.b, .r8);
+        }
+    }.f);
+}
+
+test "enc: setcc parity / above / below-or-equal (NaN-aware float compares)" {
+    try expectEnc(&.{ 0x0F, 0x96, 0xC0 }, struct { // setbe al
+        fn f(a: *Assembler) !void {
+            try a.setcc(.be, .rax);
+        }
+    }.f);
+    try expectEnc(&.{ 0x0F, 0x97, 0xC0 }, struct { // seta al
+        fn f(a: *Assembler) !void {
+            try a.setcc(.a, .rax);
+        }
+    }.f);
+    try expectEnc(&.{ 0x0F, 0x9A, 0xC0 }, struct { // setp al
+        fn f(a: *Assembler) !void {
+            try a.setcc(.p, .rax);
+        }
+    }.f);
+    try expectEnc(&.{ 0x0F, 0x9B, 0xC0 }, struct { // setnp al
+        fn f(a: *Assembler) !void {
+            try a.setcc(.np, .rax);
         }
     }.f);
 }
