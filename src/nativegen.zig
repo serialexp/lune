@@ -403,7 +403,15 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 kinds[i] = .int;
             },
             .eq, .ne, .lt, .le => {
-                if (kinds[ins.a] != .int or kinds[ins.b] != .int) return false;
+                // Two int operands → int compare (existing path). Two float operands →
+                // float compare (F2, ucomisd). A MIXED int/float compare bails: the
+                // oracle (value.compareNumeric) compares the int against the float
+                // EXACTLY (compareIntFloat, no rounding), so a cvtsi2sd-then-ucomisd
+                // lowering would diverge for ints not representable as f64. (Unlike F1
+                // arith, where the oracle promotes via toFloat — there cvtsi2sd matches.)
+                const ka = kinds[ins.a];
+                const kb = kinds[ins.b];
+                if (!((ka == .int and kb == .int) or (ka == .float and kb == .float))) return false;
                 kinds[i] = .bool;
             },
             .guard_int => {
@@ -1304,6 +1312,52 @@ fn emitCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Pla
     }
 }
 
+/// Lower a float comparison `dst = pa <cc> pb` (both operands proven `.float`; mixed
+/// int/float compares bail in proveKinds). Stages operands into xmm0/xmm1, runs
+/// `ucomisd`, and combines the NaN-aware flags into a clean 0/1 bool in rax, then to
+/// `dst`. `ucomisd` sets only ZF/PF/CF (PF=1 ⇔ unordered/NaN); SF/OF are untouched, so
+/// the unsigned-style conds (a/ae) + p/np are the correct readouts. Semantics mirror
+/// `value.compareNumeric` for two f64s: a NaN operand makes lt/le/eq false and ne true.
+fn emitFloatCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Place) !void {
+    try floatOperandToXmm(a, XMM_SCRATCH0, pa, .float); // lhs
+    try floatOperandToXmm(a, XMM_SCRATCH1, pb, .float); // rhs
+    switch (op) {
+        // a < b: compare (rhs ? lhs); `seta` = CF==0 && ZF==0 = rhs>lhs = a<b. A NaN
+        // sets CF=1 → seta=0 (false), as required.
+        .lt => {
+            try a.ucomisdRegReg(XMM_SCRATCH1, XMM_SCRATCH0);
+            try a.setcc(.a, .rax);
+            try a.movzxRegReg8(.rax, .rax);
+        },
+        // a <= b: `setae` = CF==0 = rhs>=lhs = a<=b. NaN sets CF=1 → 0 (false).
+        .le => {
+            try a.ucomisdRegReg(XMM_SCRATCH1, XMM_SCRATCH0);
+            try a.setcc(.ae, .rax);
+            try a.movzxRegReg8(.rax, .rax);
+        },
+        // a == b, NaN→false: ordered (np) AND equal (ZF). On NaN, ZF=1 but PF=1 → np=0.
+        .eq => {
+            try a.ucomisdRegReg(XMM_SCRATCH0, XMM_SCRATCH1);
+            try a.setcc(.e, .rax); // ZF: equal OR unordered
+            try a.setcc(.np, .rcx); // ordered (not-parity)
+            try a.movzxRegReg8(.rax, .rax);
+            try a.movzxRegReg8(.rcx, .rcx);
+            try a.andRegReg(.rax, .rcx);
+        },
+        // a != b, NaN→true: unordered (p) OR not-equal (!ZF). On NaN, ZF=1 → setne=0 but PF=1 → p=1.
+        .ne => {
+            try a.ucomisdRegReg(XMM_SCRATCH0, XMM_SCRATCH1);
+            try a.setcc(.ne, .rax); // !ZF
+            try a.setcc(.p, .rcx); // unordered (parity)
+            try a.movzxRegReg8(.rax, .rax);
+            try a.movzxRegReg8(.rcx, .rcx);
+            try a.orRegReg(.rax, .rcx);
+        },
+        else => unreachable,
+    }
+    try regToPlace(a, dst, .rax);
+}
+
 /// Materialize a numeric operand into a scratch XMM (`dst_xmm`). A `.float` operand is
 /// moved with `movsd`; an `.int` operand is promoted with `cvtsi2sd` (round-to-nearest,
 /// bit-matching `@floatFromInt` in the strict-FP oracle). Operand homes are XMM/spill
@@ -1625,7 +1679,13 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 }
             },
             .eq, .ne, .lt, .le => {
-                try emitCompare(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
+                // proveKinds pins the operand pair to both-int or both-float; check one
+                // operand to pick the path (float compare via ucomisd, int via cmp).
+                if (kinds[ins.a] == .float) {
+                    try emitFloatCompare(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
+                } else {
+                    try emitCompare(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
+                }
             },
             // --- lane-aware array read path (B2, bool lane) ----------------------
             // aref: materialize idx0 = index - 1 (the 0-based packed index) into the
@@ -2160,6 +2220,129 @@ test "nativegen(F1): a malformed int+int add stamped ty=.float bails (no float/i
     };
     var consts = [_]Value{Value.int(1)};
     var exits = [_]S{.{ .slot = 0, .ref = 7 }};
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try expectBail(&t);
+}
+
+// --- Phase D / F2: float comparisons (ucomisd + NaN-aware combine) ------------
+
+/// Run a single float comparison `x <op> y` through both tiers and assert the boolean
+/// result matches bit-for-bit. The trace: an int counter drives exactly one iteration;
+/// the body loads two float slots (x, y), computes `x <op> y` into a write-only bool
+/// slot, then bumps the counter. expectMatch compares regs[], so the committed bool
+/// (slot 3) is checked against the arith.zig oracle — including its NaN semantics.
+fn expectFloatCmp(op: trace.IrOp, x: f64, y: f64) !void {
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i (int counter)
+        .{ .op = .guard_int, .a = 0 }, // 1
+        .{ .op = .konst, .aux = 0 }, // 2: 1 (int limit)
+        .{ .op = .lt, .a = 0, .b = 2 }, // 3: i < 1 (int compare — loop control)
+        .{ .op = .guard_true, .a = 3 }, // 4
+        .{ .op = .slot_load, .aux = 1 }, // 5: x (float)
+        .{ .op = .guard_float, .a = 5 }, // 6
+        .{ .op = .slot_load, .aux = 2 }, // 7: y (float)
+        .{ .op = .guard_float, .a = 7 }, // 8
+        .{ .op = op, .a = 5, .b = 7 }, // 9: x <op> y → bool (the float compare)
+        .{ .op = .konst, .aux = 1 }, // 10: 1
+        .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1
+        .{ .op = .loop }, // 12
+    };
+    var consts = [_]Value{ Value.int(1), Value.int(1) };
+    // slot 3 = the bool result (write-only); slot 0 = the counter (carried).
+    var exits = [_]S{ .{ .slot = 3, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try expectMatch(&t, &.{ Value.int(0), Value.float(x), Value.float(y), Value.nil() });
+}
+
+test "nativegen(F2): float lt/le/eq/ne match the oracle on finite, equal, and ±inf operands" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const inf = std.math.inf(f64);
+    const cases = [_]struct { x: f64, y: f64 }{
+        .{ .x = 1.5, .y = 2.5 }, // x < y
+        .{ .x = 2.5, .y = 1.5 }, // x > y
+        .{ .x = 3.0, .y = 3.0 }, // x == y
+        .{ .x = -0.0, .y = 0.0 }, // signed zeros compare equal
+        .{ .x = inf, .y = 1.0 }, // +inf > finite
+        .{ .x = -inf, .y = inf }, // -inf < +inf
+        .{ .x = inf, .y = inf }, // +inf == +inf
+    };
+    for (cases) |c| {
+        try expectFloatCmp(.lt, c.x, c.y);
+        try expectFloatCmp(.le, c.x, c.y);
+        try expectFloatCmp(.eq, c.x, c.y);
+        try expectFloatCmp(.ne, c.x, c.y);
+    }
+}
+
+test "nativegen(F2): NaN in either operand → lt/le/eq false, ne true (ucomisd unordered)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const nan = std.math.nan(f64);
+    const inf = std.math.inf(f64);
+    const others = [_]f64{ 0.0, 1.5, -1.5, inf, -inf, nan };
+    for (others) |o| {
+        // NaN on the left.
+        try expectFloatCmp(.lt, nan, o);
+        try expectFloatCmp(.le, nan, o);
+        try expectFloatCmp(.eq, nan, o);
+        try expectFloatCmp(.ne, nan, o);
+        // NaN on the right.
+        try expectFloatCmp(.lt, o, nan);
+        try expectFloatCmp(.le, o, nan);
+        try expectFloatCmp(.eq, o, nan);
+        try expectFloatCmp(.ne, o, nan);
+    }
+}
+
+test "nativegen(F2): a float-controlled while loop compiles (ucomisd drives guard_true)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // while (x < limit) { x = x + 1.5 }  — the loop condition is a FLOAT compare whose
+    // bool feeds guard_true; x is a carried float. Exercises the compare in the hot
+    // position (not just a stored result).
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: x (float)
+        .{ .op = .guard_float, .a = 0 }, // 1
+        .{ .op = .slot_load, .aux = 1 }, // 2: limit (float)
+        .{ .op = .guard_float, .a = 2 }, // 3
+        .{ .op = .lt, .a = 0, .b = 2 }, // 4: x < limit (FLOAT compare)
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .konst, .aux = 0 }, // 6: 1.5
+        .{ .op = .add, .a = 0, .b = 6, .ty = .float }, // 7: x + 1.5
+        .{ .op = .loop }, // 8
+    };
+    var consts = [_]Value{Value.float(1.5)};
+    var exits = [_]S{.{ .slot = 0, .ref = 7 }};
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    // x: 0.0, 1.5, 3.0, 4.5 (<5), then 6.0 (>=5) → 4 commits.
+    try expectMatch(&t, &.{ Value.float(0.0), Value.float(5.0) });
+    // Already past the limit → 0 commits, x flushed unchanged as a float.
+    try expectMatch(&t, &.{ Value.float(9.0), Value.float(5.0) });
+}
+
+test "nativegen(F2): a mixed int/float compare bails (oracle compares exactly, not via cvtsi2sd)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // x is float, y is int → value.compareNumeric uses an EXACT int-vs-float compare,
+    // which a cvtsi2sd-then-ucomisd lowering cannot reproduce for large ints. proveKinds
+    // must bail the whole trace to tier-1a rather than risk a divergence.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i (counter)
+        .{ .op = .guard_int, .a = 0 }, // 1
+        .{ .op = .konst, .aux = 0 }, // 2: 1
+        .{ .op = .lt, .a = 0, .b = 2 }, // 3: i < 1
+        .{ .op = .guard_true, .a = 3 }, // 4
+        .{ .op = .slot_load, .aux = 1 }, // 5: x (float)
+        .{ .op = .guard_float, .a = 5 }, // 6
+        .{ .op = .slot_load, .aux = 2 }, // 7: y (int)
+        .{ .op = .guard_int, .a = 7 }, // 8
+        .{ .op = .lt, .a = 5, .b = 7 }, // 9: float < int — MIXED → bail
+        .{ .op = .konst, .aux = 1 }, // 10: 1
+        .{ .op = .add, .a = 0, .b = 10 }, // 11
+        .{ .op = .loop }, // 12
+    };
+    var consts = [_]Value{ Value.int(1), Value.int(1) };
+    var exits = [_]S{ .{ .slot = 3, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
     var es = [_]u16{};
     const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
     try expectBail(&t);
