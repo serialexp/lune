@@ -167,6 +167,23 @@ pub const IrOp = enum(u8) {
     /// + its `slot_load` is what an `exit_store`/`slot_load` pair was). Appended at
     /// the enum's end so `loop`'s ordinal stays stable for the wire format.
     phi,
+
+    // ---- loop region boundary (Phase E1: LICM) ----
+    /// Marks the end of the **preheader** region. Every instruction *before* this
+    /// marker runs exactly **once** (on loop entry); every instruction *after* it
+    /// (up to and including `loop`) runs **every iteration**. Carries no operands
+    /// and produces no value — a pure structural boundary, the run-once analogue of
+    /// the terminal `loop` marker. Synthesized only by the LICM pass (`tropt.zig`):
+    /// a freshly-recorded trace has none, so its absence is the common case and the
+    /// executor's `body_start == 0` fast path is byte-identical to pre-E1 behaviour.
+    ///
+    /// Linear SSA already guarantees a preheader instruction (index < marker) can
+    /// only reference earlier instructions (all in the preheader) — the hoisted
+    /// region is self-contained by construction. A `phi` never sits in the
+    /// preheader (loop-carried values run every iteration); `assertWellFormed`
+    /// enforces both that and the at-most-one-marker rule. Appended last so every
+    /// prior ordinal (incl. `loop`/`phi`) stays stable for the wire format.
+    preheader,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -631,7 +648,24 @@ pub const TraceState = struct {
                     std.debug.assert(ins.aux == PHI_INTERNAL or
                         (ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < num_registers));
                 },
+                // Preheader region boundary (Phase E1): a pure marker, no operands.
+                // Structural invariants (at most one; before any φ) are asserted in
+                // the global pass below.
+                .preheader => {},
             }
+        }
+        // Preheader structural rules (Phase E1 / LICM): at most one marker, and no
+        // `phi` may precede it (loop-carried values must run every iteration, but a
+        // φ before the marker would be skipped on iterations 2+).
+        var preheader_idx: ?usize = null;
+        for (instrs, 0..) |ins, i| {
+            if (ins.op == .preheader) {
+                std.debug.assert(preheader_idx == null); // at most one
+                preheader_idx = i;
+            }
+        }
+        if (preheader_idx) |ph| {
+            for (instrs[0..ph]) |ins| std.debug.assert(ins.op != .phi);
         }
     }
 
@@ -1183,7 +1217,7 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_present,
         .guard_fits,
         => try w.print("%{d}", .{ins.a}),
-        .loop => {},
+        .loop, .preheader => {},
         // φ: a slot-bound φ prints `update=%b → r{slot}` (init is implicit
         // `regs[slot]`); an internal φ prints `init=%a update=%b → internal`.
         .phi => {

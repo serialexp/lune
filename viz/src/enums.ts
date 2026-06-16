@@ -9,7 +9,7 @@
 // (Future hardening: generate this file from Zig @typeInfo reflection so it
 // cannot drift at all — see docs/design/04-snapshot-replay-schema.md.)
 
-/** IR opcodes, indexed by wire ordinal (mirrors trace.IrOp, 0..35). */
+/** IR opcodes, indexed by wire ordinal (mirrors trace.IrOp, 0..36). */
 export const IR_OP_NAMES = [
   "slot_load", // 0
   "konst", // 1
@@ -47,6 +47,7 @@ export const IR_OP_NAMES = [
   "guard_fits", // 33
   "loop", // 34
   "phi", // 35
+  "preheader", // 36
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -74,8 +75,9 @@ export const VALUE_TAG_NAMES = [
 
 export type ValueTagName = (typeof VALUE_TAG_NAMES)[number];
 
-/** Opcodes that take no operand columns (the loop back-edge terminator). */
-export const NO_OPERAND_OPS: ReadonlySet<IrOpName> = new Set(["loop"]);
+/** Opcodes that take no operand columns (the loop back-edge terminator and the
+ * preheader region boundary — both pure structural markers). */
+export const NO_OPERAND_OPS: ReadonlySet<IrOpName> = new Set(["loop", "preheader"]);
 
 /** Unary ops + guards: render a single operand `%a`. (`aref` is two-operand and
  * falls through to the default `%a, %b` rendering.) */

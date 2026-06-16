@@ -274,6 +274,12 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     @memset(kinds, .none);
     @memset(slot_of, -1);
 
+    // Phase E1a: a LICM-hoisted trace carries a `preheader` marker + a run-once
+    // region. The native backend's run-once "computed home" lands in E1b; until
+    // then, bail the whole trace to tier-1a (which executes the preheader
+    // correctly), so a hoisted trace is still run, just not natively.
+    for (t.instrs) |ins| if (ins.op == .preheader) return false;
+
     // Pass A: record each slot_load's register slot, and which slot_loads a
     // `guard_int` covers. A guard on a *slot_load* is the type check we hoist to a
     // single tag-check in the prologue (lowering reads the tag straight from

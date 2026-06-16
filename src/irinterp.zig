@@ -85,8 +85,23 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
     std.debug.assert(values.len >= t.instrs.len);
     if (record) rec.begin();
     var completed: usize = 0;
+    // Phase E1 (LICM): instructions before the `preheader` marker run **once**
+    // (on the first pass); their `values[]` persist and are reused every later
+    // iteration. `body_start` is the first per-iteration instruction (0 when there
+    // is no preheader — the pre-E1 common case, byte-identical to before).
+    var body_start: usize = 0;
+    for (t.instrs, 0..) |ins, i| {
+        if (ins.op == .preheader) {
+            body_start = i + 1;
+            break;
+        }
+    }
     const completed_out = iter: while (true) {
         for (t.instrs, 0..) |ins, i| {
+            // Skip the run-once preheader region on every iteration after the
+            // first: its hoisted values are loop-invariant, so the first pass's
+            // `values[]` stay valid (LICM only hoists pure, invariant instrs).
+            if (completed > 0 and i < body_start) continue;
             switch (ins.op) {
                 // ---- inputs ----
                 .slot_load => {
@@ -284,6 +299,11 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                     if (record) rec.commit();
                     continue :iter;
                 },
+
+                // Preheader region boundary (Phase E1): a pure marker. On the first
+                // pass it falls through as a no-op; on later iterations it (and the
+                // whole region before it) is skipped by the `body_start` guard above.
+                .preheader => {},
             }
         }
         // A well-formed trace always terminates in `loop` (checked by the

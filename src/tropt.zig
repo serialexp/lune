@@ -60,7 +60,7 @@ pub const Optimized = struct {
     entry_slots: []u16,
 };
 
-const OpKind = enum { konst, slot_load, binary, unary, guard, aref, aload, astore, loop, phi };
+const OpKind = enum { konst, slot_load, binary, unary, guard, aref, aload, astore, loop, phi, preheader };
 
 fn kindOf(op: IrOp) OpKind {
     return switch (op) {
@@ -83,6 +83,10 @@ fn kindOf(op: IrOp) OpKind {
         // folded/CSE'd). Keeps both operands live; `b` is a forward (back-edge)
         // ref, remapped by a fixup after compaction.
         .phi => .phi,
+        // Preheader marker (Phase E1): a structural boundary. Never present in a
+        // freshly-recorded trace (the recorder emits none); the LICM pass below
+        // *synthesizes* it during compaction. Mapped for switch-exhaustiveness.
+        .preheader => .preheader,
     };
 }
 
@@ -230,6 +234,8 @@ pub fn optimize(
             .loop => {},
             // φ is a loop-carried root: canonical to itself, never folded/CSE'd.
             .phi => {},
+            // Never present in the recorder's input (synthesized at compaction).
+            .preheader => {},
         }
     }
 
@@ -285,7 +291,96 @@ pub fn optimize(
                     live[canon[ins.b]] = true;
                     if (ins.aux == trace.PHI_INTERNAL) live[canon[ins.a]] = true;
                 },
-                .konst, .slot_load, .loop => {},
+                .konst, .slot_load, .loop, .preheader => {},
+            }
+        }
+    }
+
+    // --- LICM (Phase E1): mark the loop-invariant computation to hoist ---
+    //
+    // A tier-0 slot is *carried* iff some φ flushes to it (`aux >= 0`): its
+    // register changes across iterations, so its `slot_load` is loop-variant.
+    // Every *other* slot_load reads a value fixed for the whole loop. A value is
+    // **invariant** iff it is a `konst`, an invariant `slot_load`, a folded
+    // constant, or a pure op (binary/unary) over invariant operands. An invariant
+    // *computed* op (`hoist[i]`) is worth moving into a run-once preheader region;
+    // its invariant operand cone moves with it. Guards/memory/φ are never hoisted
+    // in this first cut (a guard on an invariant value is cheap and re-checking it
+    // each iteration is harmless; hoisting it is a later refinement).
+    //
+    // Soundness: a preheader value is computed once and reused. Because it is pure
+    // and depends only on invariants, the iteration-1 value is bit-identical to
+    // what re-evaluating it each iteration would yield. A preheader op that would
+    // *error* (e.g. a type mismatch the body's guard catches) is evaluated before
+    // that guard, but the executor side-exits on the error with the SAME
+    // `completed` count tier-0 reaches, and tier-0 re-runs the partial iteration —
+    // so the observable result is unchanged (see `irinterp.zig`'s deopt contract).
+    var carried_slots: std.AutoHashMapUnmanaged(i32, void) = .empty;
+    defer carried_slots.deinit(gpa);
+    for (instrs) |ins| {
+        if (ins.op == .phi and ins.aux >= 0) try carried_slots.put(gpa, ins.aux, {});
+    }
+
+    const inv = try gpa.alloc(bool, n);
+    defer gpa.free(inv);
+    @memset(inv, false);
+    const hoist = try gpa.alloc(bool, n);
+    defer gpa.free(hoist);
+    @memset(hoist, false);
+    for (instrs, 0..) |ins, i| {
+        if (canon[i] != i or dead[i]) continue; // only canonical survivors carry inv
+        if (fold_aux[i] != null) {
+            inv[i] = true; // folded → becomes a konst → invariant (not a hoist target)
+            continue;
+        }
+        switch (kindOf(ins.op)) {
+            .konst => inv[i] = true,
+            .slot_load => inv[i] = !carried_slots.contains(ins.aux),
+            .binary => {
+                // `idiv`/`mod` can raise DivisionByZero mid-iteration. Treat them
+                // (and therefore anything that consumes them) as NON-invariant, so
+                // they stay in the body and side-exit at the exact point tier-0
+                // re-raises — never hoisted into the run-once preheader. (Mirrors
+                // the folder's "evalBinary error → leave as a runtime op" rule.)
+                // Every other binary op is total (wraps/masks) or only TypeErrors
+                // on a wrong-typed operand the body's guard catches first, so
+                // hoisting it preserves the deopt outcome.
+                if (ins.op == .idiv or ins.op == .mod) {
+                    inv[i] = false;
+                } else {
+                    inv[i] = inv[canon[ins.a]] and inv[canon[ins.b]];
+                    hoist[i] = inv[i];
+                }
+            },
+            .unary => {
+                inv[i] = inv[canon[ins.a]];
+                hoist[i] = inv[i];
+            },
+            // Guards, memory ops, the loop terminator, φ: not invariant-hoistable.
+            .guard, .aref, .aload, .astore, .loop, .phi, .preheader => {},
+        }
+    }
+
+    // Preheader membership = every `hoist` op plus its transitive invariant operand
+    // cone. One backward pass suffices (operands precede their use): seed `hoist`,
+    // then pull each preheader op's operands (all invariant by construction) in.
+    const in_pre = try gpa.alloc(bool, n);
+    defer gpa.free(in_pre);
+    @memset(in_pre, false);
+    {
+        var i = n;
+        while (i > 0) {
+            i -= 1;
+            if (canon[i] != i or dead[i] or !live[i]) continue;
+            if (hoist[i]) in_pre[i] = true;
+            if (!in_pre[i]) continue;
+            switch (kindOf(instrs[i].op)) {
+                .binary => {
+                    in_pre[canon[instrs[i].a]] = true;
+                    in_pre[canon[instrs[i].b]] = true;
+                },
+                .unary => in_pre[canon[instrs[i].a]] = true,
+                else => {}, // konst / invariant slot_load: leaf of the cone
             }
         }
     }
@@ -304,10 +399,36 @@ pub fn optimize(
     var phi_fixups: std.ArrayListUnmanaged(struct { pos: usize, b: Ref }) = .empty;
     defer phi_fixups.deinit(gpa);
 
-    for (instrs, 0..) |ins, i| {
-        if (canon[i] != i) continue; // CSE-redirected → not emitted
-        if (dead[i]) continue; // dropped guard → not emitted
-        if (!live[i]) continue; // dead value → not emitted (loop & kept guards are live)
+    // Emit order: every preheader survivor first (in index order, so SSA holds
+    // within the region), then the synthesized `preheader` marker, then the body.
+    // A body op may reference a preheader op (assigned a lower `new_index` in the
+    // first pass) or an earlier body op — both are emitted before it, so the
+    // ref-remap stays valid. The marker is emitted only when the preheader is
+    // non-empty, keeping a no-invariant trace byte-identical to pre-E1.
+    const MARKER = std.math.maxInt(usize);
+    var order: std.ArrayListUnmanaged(usize) = .empty;
+    defer order.deinit(gpa);
+    var n_pre: usize = 0;
+    for (0..n) |i| {
+        if (canon[i] != i or dead[i] or !live[i]) continue;
+        if (in_pre[i]) {
+            try order.append(gpa, i);
+            n_pre += 1;
+        }
+    }
+    if (n_pre > 0) try order.append(gpa, MARKER);
+    for (0..n) |i| {
+        if (canon[i] != i or dead[i] or !live[i]) continue;
+        if (!in_pre[i]) try order.append(gpa, i);
+    }
+
+    for (order.items) |entry| {
+        if (entry == MARKER) {
+            try out_instrs.append(gpa, .{ .op = .preheader });
+            continue;
+        }
+        const i = entry;
+        const ins = instrs[i];
         new_index[i] = @intCast(out_instrs.items.len);
         var out = ins;
         if (fold_aux[i]) |aux| {
@@ -330,7 +451,9 @@ pub fn optimize(
                 try phi_fixups.append(gpa, .{ .pos = out_instrs.items.len, .b = canon[ins.b] });
             },
             .slot_load => try out_entry.append(gpa, @intCast(ins.aux)),
-            .konst, .loop => {},
+            // `.preheader` is never an input op (the MARKER sentinel emits the
+            // marker above); kept for switch-exhaustiveness.
+            .konst, .loop, .preheader => {},
         }
         try out_instrs.append(gpa, out);
     }
@@ -612,4 +735,89 @@ test "tropt: folding poison constants matches the shared evaluator and never tra
         const want = try irinterp.evalBinary(.idiv, lo, Value.int(-1));
         try testing.expect(got.eql(want));
     }
+}
+
+// ---------------------------------------------------------------------------
+// E1 — preheader region + LICM. The structural test pins the rewrite (an
+// invariant subexpression moves before a `preheader` marker); the differential
+// test is the *behavioural* gate (optimized vs unoptimized execute byte-
+// identically over a bounded loop). The end-to-end tier-0-vs-optimized gate
+// lives in interp.zig's `expectProgram` matrix; this is the committable,
+// compiler-independent IR-level proof that hoisting is value-preserving.
+// ---------------------------------------------------------------------------
+
+/// `acc = acc + a*b; counter -= 1` with `a`(r0), `b`(r1) invariant; `acc`(r2),
+/// `counter`(r3) carried; `1 // counter` (r4 = junk) side-exits via DivByZero
+/// when the counter reaches 0, giving a bounded loop. The `a*b` (`mul`) is the
+/// sole loop invariant — LICM must hoist it into a preheader. Returns the
+/// `withPhis`-shaped *unoptimized* IR plus its const pool.
+fn licmInvariantMulTrace() struct { instrs: [13]IrInstr, consts: [1]Value } {
+    return .{
+        .instrs = trace.withPhis(&[_]IrInstr{
+            .{ .op = .slot_load, .aux = 0, .ty = .int }, // %0 = r0 (a)   invariant
+            .{ .op = .slot_load, .aux = 1, .ty = .int }, // %1 = r1 (b)   invariant
+            .{ .op = .slot_load, .aux = 2, .ty = .int }, // %2 = r2 (acc) carried
+            .{ .op = .slot_load, .aux = 3, .ty = .int }, // %3 = r3 (cnt) carried
+            .{ .op = .konst, .aux = 0, .ty = .int }, // %4 = 1
+            .{ .op = .mul, .a = 0, .b = 1, .ty = .int }, // %5 = a*b   INVARIANT → hoist
+            .{ .op = .idiv, .a = 4, .b = 3, .ty = .int }, // %6 = 1 // cnt (exits at cnt==0)
+            .{ .op = .add, .a = 2, .b = 5, .ty = .int }, // %7 = acc + a*b
+            .{ .op = .sub, .a = 3, .b = 4, .ty = .int }, // %8 = cnt - 1
+            .{ .op = .loop }, // %9
+        }, &[_]SlotStore{
+            .{ .slot = 2, .ref = 7 }, // acc   ← %7
+            .{ .slot = 3, .ref = 8 }, // cnt   ← %8
+            .{ .slot = 4, .ref = 6 }, // r4    ← %6 (keeps the idiv live)
+        }),
+        .consts = [_]Value{Value.int(1)},
+    };
+}
+
+test "tropt E1: a loop-invariant subexpression is hoisted before a preheader marker" {
+    const gpa = testing.allocator;
+    var t = licmInvariantMulTrace();
+    var opt = try optimize(gpa, &t.instrs, &t.consts);
+    defer freeOpt(gpa, &opt);
+
+    // Exactly one preheader marker and one `mul`, and the `mul` precedes the
+    // marker — i.e. it now runs once in the preheader region, not per-iteration.
+    try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .preheader));
+    try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .mul));
+    var marker: ?usize = null;
+    var mul_idx: ?usize = null;
+    for (opt.instrs, 0..) |ins, i| {
+        if (ins.op == .preheader) marker = i;
+        if (ins.op == .mul) mul_idx = i;
+    }
+    try testing.expect(mul_idx.? < marker.?);
+    // Nothing was deleted — LICM is pure motion, so the only structural change
+    // vs the unoptimized trace is the added marker (one extra instruction).
+    try testing.expectEqual(t.instrs.len + 1, opt.instrs.len);
+}
+
+test "tropt E1: hoisting preserves behaviour (optimized ≡ unoptimized over a bounded loop)" {
+    const gpa = testing.allocator;
+    var t = licmInvariantMulTrace();
+    var opt = try optimize(gpa, &t.instrs, &t.consts);
+    defer freeOpt(gpa, &opt);
+
+    // Drive both traces from the same entry state. a=3, b=4, acc=0, cnt=5, r4=0.
+    // Each clean iteration: acc += 12, cnt -= 1; the 6th reads cnt==0 → DivByZero
+    // side-exit. Expect 5 commits, acc=60, cnt=0 in BOTH the unoptimized and the
+    // LICM-optimized run — a divergence would mean the hoist changed a value.
+    const unopt = trace.Trace{ .anchor = undefined, .instrs = &t.instrs, .consts = &t.consts, .entry_slots = &.{} };
+    const opted = trace.Trace{ .anchor = undefined, .instrs = opt.instrs, .consts = opt.consts, .entry_slots = opt.entry_slots };
+
+    var regs_u = [5]Value{ Value.int(3), Value.int(4), Value.int(0), Value.int(5), Value.int(0) };
+    var regs_o = regs_u;
+    var vals_u: [16]Value = undefined;
+    var vals_o: [16]Value = undefined;
+    const done_u = irinterp.execute(&unopt, &regs_u, &vals_u);
+    const done_o = irinterp.execute(&opted, &regs_o, &vals_o);
+
+    try testing.expectEqual(@as(usize, 5), done_u);
+    try testing.expectEqual(done_u, done_o);
+    try testing.expectEqual(@as(i64, 60), regs_u[2].asInt());
+    try testing.expectEqual(@as(i64, 0), regs_u[3].asInt());
+    for (regs_u, regs_o) |u, o| try testing.expect(u.eql(o));
 }
