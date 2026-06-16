@@ -144,9 +144,18 @@ that for a time-travel debugger it *is* the architecture.
       moment iteration order was *serialized*, which is exactly what a keyframe
       snapshot does. The keyframe serializer (F2a) surfaced it, and the run-twice
       harness now guards it (byte-identical snapshot bytes — see Replay
-      verification). Still not actionable at the *program* level until a
-      `pairs`/`next` iterator exists; the deterministic ordering rule lands fully
-      with that iterator.
+      verification). A follow-on hazard at the *serialization* layer was also
+      closed: id-keyed hashing fixes which keys collide, but `std.HashMap`'s raw
+      slot order under a collision still depends on **insertion order**, so a
+      restored table (rebuilt by one-by-one re-insertion) could serialize in a
+      different order than its original. The keyframe serializer now emits a
+      table's hash part in a **canonical key order** (`keyframeser`
+      `sortedHashEntries`/`keyLessThan`: heap keys by id, others by tag+payload
+      bits — a strict total order over normalized keys) at both serialization
+      sites, so snapshot bytes are a function of the key *set* and ids alone, never
+      of insertion history or `std.HashMap`'s layout. Still not actionable at the
+      *program* level until a `pairs`/`next` iterator exists; the deterministic
+      ordering rule lands fully with that iterator.
 - [~] **Floating-point determinism.** FP **mode is pinned**: every float-producing
       function in `src/arith.zig` sets `@setFloatMode(.strict)`, forbidding
       contraction/reassociation regardless of build mode (Zig's default is already

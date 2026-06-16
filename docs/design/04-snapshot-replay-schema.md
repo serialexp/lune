@@ -74,7 +74,17 @@ schema follows; this is that schema's home.
       determinism bug: `table.ValueContext.hash` hashed a heap key by its
       *address*, so hash-part iteration order (hence serialized `entries` order)
       varied run-to-run; it now hashes by stable `GcHeader.id` (see
-      `02-determinism.md` §"Table iteration order").
+      `02-determinism.md` §"Table iteration order"). A second, subtler hazard was
+      later closed: even with id-keyed *hashes*, `std.HashMap`'s internal **slot
+      layout is insertion-order-sensitive** under a probe collision, so a restored
+      table (rebuilt by re-inserting entries one-by-one) could iterate in a
+      different raw order than the original — making `encodeSnapshot ∘ restore`
+      not byte-identical. The serializer now emits a table's hash part in a
+      **canonical key order** (`keyframeser.sortedHashEntries`: heap keys by id,
+      others by tag+payload bits — a strict total order over normalized keys),
+      applied to BOTH the `entries` array and the BFS child-discovery walk. This
+      makes the snapshot bytes a function of the key *set* and ids alone, never of
+      insertion history or `std.HashMap`'s implementation across Zig versions.
 
 - [x] **Keyframe snapshot RESTORE (Phase 7 v2 / F2b — round-trip into a live VM).**
       `keyframeser.restore`/`restoreSnapshot` decode a `SnapshotFile` and rebuild

@@ -60,6 +60,45 @@ pub fn toSchemaValue(v: Value) schema.SnapValue {
     };
 }
 
+/// A table hash-part (key, value) pair, used to serialize in a canonical order.
+const HashKV = struct {
+    key: Value,
+    val: Value,
+    fn lessThan(_: void, x: HashKV, y: HashKV) bool {
+        return keyLessThan(x.key, y.key);
+    }
+};
+
+/// A total order on *distinct* table keys, deterministic across runs. Heap keys
+/// order by their stable object id (interning makes equal keys the same object);
+/// non-heap keys (int/float/bool) order by tag then raw payload bits. Distinct
+/// keys never tie, so this is a strict total order.
+fn keyLessThan(a: Value, b: Value) bool {
+    const ta = @intFromEnum(a.tag);
+    const tb = @intFromEnum(b.tag);
+    if (ta != tb) return ta < tb;
+    if (a.isHeap()) return a.asHeap().id < b.asHeap().id;
+    return a.payload.bits < b.payload.bits;
+}
+
+/// Collect a table's hash-part entries into `a`-owned scratch, sorted by
+/// `keyLessThan`. Serializing the hash part in this **canonical** order (rather
+/// than `std.HashMap`'s internal slot order) makes the snapshot byte layout a
+/// function of the key *set* and their ids alone — never of insertion history.
+/// This is what keeps capture→restore→recapture byte-identical: a restored table,
+/// rebuilt by re-inserting entries one by one, can land collided keys in a
+/// different probe slot than the original (so its raw iteration order differs),
+/// but the canonical sort erases that difference. It also decouples the wire
+/// format from `std.HashMap`'s implementation details across Zig versions.
+fn sortedHashEntries(a: std.mem.Allocator, t: *const table.Table) ![]HashKV {
+    const kvs = try a.alloc(HashKV, t.hash.count());
+    var it = t.hash.iterator();
+    var i: usize = 0;
+    while (it.next()) |e| : (i += 1) kvs[i] = .{ .key = e.key_ptr.*, .val = e.value_ptr.* };
+    std.mem.sort(HashKV, kvs, {}, HashKV.lessThan);
+    return kvs;
+}
+
 /// Map one heap object to its `HeapObject` schema struct, switching on its type.
 /// The per-type child set mirrors `gc.blacken` exactly, so the serialized edges
 /// match the GC's own notion of reachability. Allocates mapped arrays from `a`
@@ -76,11 +115,10 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, h: *GcHeader) !schema.HeapObject
             const t = table.Table.fromHeader(h);
             const array = try a.alloc(schema.SnapValue, t.array.items.len);
             for (t.array.items, 0..) |v, i| array[i] = toSchemaValue(v);
-            const entries = try a.alloc(schema.TableEntry, t.hash.count());
-            var it = t.hash.iterator();
-            var i: usize = 0;
-            while (it.next()) |e| : (i += 1) {
-                entries[i] = .{ .key = toSchemaValue(e.key_ptr.*), .val = toSchemaValue(e.value_ptr.*) };
+            const kvs = try sortedHashEntries(a, t);
+            const entries = try a.alloc(schema.TableEntry, kvs.len);
+            for (kvs, 0..) |kv, i| {
+                entries[i] = .{ .key = toSchemaValue(kv.key), .val = toSchemaValue(kv.val) };
             }
             break :blk .{ .HeapTable = .{ .array = array, .entries = entries } };
         },
@@ -148,10 +186,16 @@ const Walk = struct {
             .table => {
                 const t = table.Table.fromHeader(h);
                 for (t.array.items) |v| self.pushValue(v);
-                var it = t.hash.iterator();
-                while (it.next()) |e| {
-                    self.pushValue(e.key_ptr.*);
-                    self.pushValue(e.value_ptr.*);
+                // Enumerate hash children in the same canonical key order the
+                // serializer uses, so BFS object-discovery order (and thus the
+                // `objects[]` array layout) is insertion-order-independent too.
+                const kvs = sortedHashEntries(self.a, t) catch |e| {
+                    self.err = e;
+                    return;
+                };
+                for (kvs) |kv| {
+                    self.pushValue(kv.key);
+                    self.pushValue(kv.val);
                 }
             },
             .upvalue => self.pushValue(function.Upvalue.fromHeader(h).ptr.*),
@@ -780,6 +824,15 @@ test "restore is the exact inverse of capture (byte-identical re-snapshot)" {
         \\end
         \\c = counter()
         \\first = c()
+    );
+    // The stdlib module tables (`string`, `io`) and `tonumber` are now in every
+    // VM's globals as real heap tables/natives. Round-tripping a program that
+    // references them confirms the module-table natives restore by their
+    // qualified names without `UnknownNative`, and that the larger globals table
+    // (which exposed the hash-layout fragility above) re-snapshots byte-identically.
+    try expectRoundTrip(
+        \\local s = string.format("%d-%s", 7, "x")
+        \\result = { s = s, n = tonumber("42") }
     );
 }
 

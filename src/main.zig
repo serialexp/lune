@@ -228,6 +228,12 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // is the program's command line. `getenv`/`argv` are `EnvUnavailable` without it.
     var env_ctx = EnvCtx{ .env = env_map, .argv = argv };
     vm.host_env = .{ .ctx = &env_ctx, .getenv = &hostGetenv, .argCount = &hostArgCount, .arg = &hostArg };
+    // Fill the global `arg` table from the program's command line (load-time host
+    // input; keeps the exec core deterministic). `arg[0]` = script path.
+    vm.populateArgs(argv) catch |err| {
+        lune.io.eprint("lune: error: populating arg table failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
     // `--emit-effects` records the nondeterministic-input log during the run.
     if (topts.effects_path != null) vm.effect_mode = .record;
 

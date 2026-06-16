@@ -144,12 +144,21 @@ pub const HostEnv = struct {
     arg: *const fn (ctx: *anyopaque, i: i64) ?[]const u8,
 };
 
-/// One built-in native: the global name it installs under, its function, and
-/// whether it is a nondeterministic-input effect (null = pure host call).
+/// One built-in native. `name` is the native's **serialized identity** — the key
+/// the keyframe restorer (`keyframeser.zig`) looks up to rebind it — so it must be
+/// unique across the registry; for a module function it is qualified
+/// (`"string.format"`). When `module` is set the native is installed as a field of
+/// that module's global table (under `field`) instead of as a bare global; a plain
+/// entry (`module == null`) installs under `name`. `effect` null = pure host call.
 pub const BaseNative = struct {
     name: []const u8,
     func: function.NativeFn,
     effect: ?EffectKind = null,
+    /// If set, install into this module table (a global table) rather than as a
+    /// top-level global. The unknown-global lint then knows `module` (not `name`).
+    module: ?[]const u8 = null,
+    /// Key within the module table (required iff `module` is set), e.g. `"format"`.
+    field: ?[]const u8 = null,
 };
 
 /// The single source of truth for built-in natives. `installBaseLib` installs
@@ -173,15 +182,39 @@ pub const base_natives = [_]BaseNative{
     .{ .name = "getenv", .func = &nativeGetenv, .effect = .getenv },
     .{ .name = "argc", .func = &nativeArgc, .effect = .argc },
     .{ .name = "argv", .func = &nativeArgv, .effect = .argv },
+    // Minimal host stdlib for benchmark harnesses (pure host calls — no effects).
+    // `tonumber` is a bare global; `string.format`/`io.write` install into their
+    // module tables. Qualified names keep the serialized identity unique.
+    .{ .name = "tonumber", .func = &nativeTonumber },
+    .{ .name = "string.format", .func = &nativeStringFormat, .module = "string", .field = "format" },
+    .{ .name = "io.write", .func = &nativeIoWrite, .module = "io", .field = "write" },
 };
 
-/// The names `installBaseLib` seeds into the globals table, derived from the
-/// single `base_natives` registry. The compiler's unknown-global lint treats
-/// these as defined so it never warns about `print`/`clock`. Deriving from
-/// `base_natives` keeps the two in lockstep — add a native and it's known here.
+/// The top-level global names `installBaseLib` seeds, derived from the single
+/// `base_natives` registry plus the host-populated `arg` table. The compiler's
+/// unknown-global lint treats these as defined so it never warns about
+/// `print`/`string`/`io`. A module native contributes its *module* name (the bare
+/// global a program references — `string`, not `string.format`); duplicates from
+/// sibling module fields are collapsed. Deriving from `base_natives` keeps the two
+/// in lockstep — add a native and its top-level name is known here.
 pub const builtin_global_names = blk: {
-    var names: [base_natives.len][]const u8 = undefined;
-    for (base_natives, 0..) |bn, i| names[i] = bn.name;
+    @setEvalBranchQuota(10_000);
+    var tmp: [base_natives.len + 1][]const u8 = undefined;
+    var n: usize = 0;
+    outer: for (base_natives) |bn| {
+        const top = bn.module orelse bn.name;
+        for (tmp[0..n]) |existing| {
+            if (std.mem.eql(u8, existing, top)) continue :outer;
+        }
+        tmp[n] = top;
+        n += 1;
+    }
+    // `arg` is a host-populated table (the CLI fills it from process args), not a
+    // native — but programs reference it, so the lint must know it.
+    tmp[n] = "arg";
+    n += 1;
+    var names: [n][]const u8 = undefined;
+    for (&names, 0..) |*slot, i| slot.* = tmp[i];
     break :blk names;
 };
 
@@ -397,13 +430,54 @@ pub const Vm = struct {
     /// rebind a serialized native by name, so install and restore can never drift.
     fn installBaseLib(self: *Vm) Error!void {
         for (base_natives) |bn| try self.defineNative(bn);
+        // `arg` is a real (initially empty) table so the lint, tests, the wasm
+        // host, and keyframe restore all see a table; `arg[i]` is nil until the
+        // CLI host fills it from process args (`main.zig`, at the host boundary).
+        const arg_table = try self.heap.newTable();
+        try self.globals.set(self.gpa, try self.heap.internValue("arg"), Value.heap(&arg_table.header));
     }
 
     fn defineNative(self: *Vm, bn: BaseNative) Error!void {
         const native = try self.heap.newNative(bn.func, bn.name);
         native.effect = bn.effect; // null for pure host calls (e.g. print)
-        const key = try self.heap.internValue(bn.name);
-        try self.globals.set(self.gpa, key, Value.heap(&native.header));
+        if (bn.module) |mod| {
+            const tbl = try self.getOrCreateModuleTable(mod);
+            const fkey = try self.heap.internValue(bn.field.?);
+            try tbl.set(self.gpa, fkey, Value.heap(&native.header));
+        } else {
+            const key = try self.heap.internValue(bn.name);
+            try self.globals.set(self.gpa, key, Value.heap(&native.header));
+        }
+    }
+
+    /// Fill the global `arg` table from host program arguments: `arg[0]` is the
+    /// script path (`argv[0]`), `arg[i]` the i-th argument — the Lua convention.
+    /// This is a **load-time host input**, set once at the host boundary
+    /// (`main.zig`), so the interpreter exec core never reads argv mid-run and
+    /// stays deterministic. The table is a normal heap table → serializes through
+    /// the keyframe path. (The dynamic `argv()`/`argc()` effect natives are
+    /// unaffected — they remain the per-call nondeterministic-input boundary.)
+    pub fn populateArgs(self: *Vm, argv: []const []const u8) Error!void {
+        const v = self.globals.get(try self.heap.internValue("arg"));
+        if (!(v.isHeap() and v.heapType() == .table)) return; // installBaseLib guarantees a table
+        const tbl = table.Table.fromHeader(v.asHeap());
+        for (argv, 0..) |a, idx| {
+            try tbl.set(self.gpa, Value.int(@intCast(idx)), try self.heap.internValue(a));
+        }
+    }
+
+    /// Fetch the global module table `name`, creating and binding it on first use.
+    /// Module tables are ordinary heap tables reachable from `globals`, so they
+    /// capture/restore through the keyframe path with no special-casing.
+    fn getOrCreateModuleTable(self: *Vm, name: []const u8) Error!*table.Table {
+        const key = try self.heap.internValue(name);
+        const existing = self.globals.get(key);
+        if (existing.isHeap() and existing.heapType() == .table) {
+            return table.Table.fromHeader(existing.asHeap());
+        }
+        const tbl = try self.heap.newTable();
+        try self.globals.set(self.gpa, key, Value.heap(&tbl.header));
+        return tbl;
     }
 
     /// Execute a top-level chunk and return its first returned value (`nil` if it
@@ -1194,6 +1268,338 @@ fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
     return Value.nil();
 }
 
+// ---------------------------------------------------------------------------
+// Minimal host stdlib (benchmark harness): tonumber, string.format, io.write.
+// All pure host calls (no effects). See `base_natives`.
+// ---------------------------------------------------------------------------
+
+/// The bytes of `v` if it is a heap string, else null.
+fn strBytes(v: Value) ?[]const u8 {
+    if (v.isHeap() and v.heapType() == .string) return string.String.fromHeader(v.asHeap()).bytes();
+    return null;
+}
+
+/// `tonumber(v [, base])`. Numbers pass through. A string is trimmed and parsed:
+/// with an explicit `base` as an integer in that base; otherwise auto (int first —
+/// honoring a `0x` prefix — then float). Anything unparseable / non-numeric → nil.
+fn nativeTonumber(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    _ = ctx;
+    if (args.len == 0) return Value.nil();
+    const v = args[0];
+
+    // Explicit base form: `tonumber(s, base)` — string interpreted as an integer.
+    if (args.len >= 2 and args[1].isNumber()) {
+        const base_i = args[1].toFloat();
+        if (base_i < 2 or base_i > 36) return Value.nil();
+        const base: u8 = @intFromFloat(base_i);
+        const s = strBytes(v) orelse return Value.nil();
+        const t = std.mem.trim(u8, s, " \t\n\r");
+        if (t.len == 0) return Value.nil();
+        const parsed = std.fmt.parseInt(i64, t, base) catch return Value.nil();
+        return Value.int(parsed);
+    }
+
+    switch (v.tag) {
+        .int, .float => return v,
+        else => {},
+    }
+    const s = strBytes(v) orelse return Value.nil();
+    const t = std.mem.trim(u8, s, " \t\n\r");
+    if (t.len == 0) return Value.nil();
+    if (std.fmt.parseInt(i64, t, 0)) |iv| {
+        return Value.int(iv);
+    } else |_| {}
+    if (std.fmt.parseFloat(f64, t)) |fv| {
+        return Value.float(fv);
+    } else |_| {}
+    return Value.nil();
+}
+
+/// `io.write(...)`: write each argument's bytes to the VM's output with no
+/// separators and no trailing newline (contrast `print`). Strings write their
+/// bytes; numbers format like concat (`coerceConcat`). Non-string/number → error.
+fn nativeIoWrite(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    const to_stdout = vm.out == null;
+    const w = vm.out orelse io.stdout();
+    var buf: [64]u8 = undefined;
+    for (args) |a| {
+        const bytes = try coerceConcat(a, &buf);
+        try w.writeAll(bytes);
+    }
+    if (to_stdout) io.flush();
+    return Value.nil();
+}
+
+/// A parsed `%`-conversion specifier: `%[-+ 0#][width][.prec]<conv>`.
+const FormatSpec = struct {
+    minus: bool = false, // '-' left-justify
+    zero: bool = false, // '0' zero-pad
+    plus: bool = false, // '+' force sign on positives
+    space: bool = false, // ' ' leading space on positives
+    hash: bool = false, // '#' alternate form (o/x/X)
+    width: usize = 0,
+    precision: ?usize = null,
+    conv: u8 = 0,
+};
+
+fn appendN(out: *std.ArrayList(u8), gpa: std.mem.Allocator, byte: u8, n: usize) !void {
+    var k: usize = 0;
+    while (k < n) : (k += 1) try out.append(gpa, byte);
+}
+
+/// Emit a numeric field: optional `prefix` (sign and/or `0x`), then `digits`,
+/// applying integer `precision` (minimum digit count → zero-extend) and field
+/// `width` with the `-`/`0` flags. Used by both integer and float conversions
+/// (floats pass `precision == null`, having already rendered their fraction).
+fn emitNumeric(
+    out: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    prefix: []const u8,
+    digits: []const u8,
+    spec: FormatSpec,
+) !void {
+    var zext: usize = 0; // precision-driven zero extension of the digits
+    if (spec.precision) |p| {
+        if (digits.len < p) zext = p - digits.len;
+    }
+    const body_len = prefix.len + zext + digits.len;
+    const pad: usize = if (spec.width > body_len) spec.width - body_len else 0;
+    // C/Lua: the `0` flag is ignored when an explicit precision is given for ints.
+    const zero_pad = spec.zero and !spec.minus and spec.precision == null;
+
+    if (spec.minus) {
+        try out.appendSlice(gpa, prefix);
+        try appendN(out, gpa, '0', zext);
+        try out.appendSlice(gpa, digits);
+        try appendN(out, gpa, ' ', pad);
+    } else if (zero_pad) {
+        try out.appendSlice(gpa, prefix);
+        try appendN(out, gpa, '0', pad);
+        try appendN(out, gpa, '0', zext);
+        try out.appendSlice(gpa, digits);
+    } else {
+        try appendN(out, gpa, ' ', pad);
+        try out.appendSlice(gpa, prefix);
+        try appendN(out, gpa, '0', zext);
+        try out.appendSlice(gpa, digits);
+    }
+}
+
+/// Coerce a `string.format` numeric argument to a signed integer, truncating a
+/// float toward zero. Errors on a non-number or an out-of-range / non-finite float.
+fn argToInt(v: Value) Error!i64 {
+    switch (v.tag) {
+        .int => return v.asInt(),
+        .float => {
+            const f = v.asFloat();
+            if (!std.math.isFinite(f) or f >= 9.223372036854776e18 or f < -9.223372036854776e18) {
+                return Error.TypeError;
+            }
+            return @intFromFloat(@trunc(f));
+        },
+        else => return Error.TypeError,
+    }
+}
+
+fn signPrefix(neg: bool, spec: FormatSpec) []const u8 {
+    if (neg) return "-";
+    if (spec.plus) return "+";
+    if (spec.space) return " ";
+    return "";
+}
+
+/// `string.format(fmt, ...)` — a focused C-`printf` supporting Lua's conversions:
+/// `d i u o x X c` (integers), `f F e E g G` (floats), `s` (strings, precision =
+/// max length), `q` (Lua-quoted), and `%%`. Honors the `- + space 0 #` flags,
+/// width, and precision.
+fn nativeStringFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    if (args.len < 1) return Error.TypeError;
+    const fmt = strBytes(args[0]) orelse return Error.TypeError;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(vm.gpa);
+    const gpa = vm.gpa;
+
+    var argi: usize = 1;
+    var i: usize = 0;
+    while (i < fmt.len) {
+        const c = fmt[i];
+        if (c != '%') {
+            try out.append(gpa, c);
+            i += 1;
+            continue;
+        }
+        i += 1; // consume '%'
+        if (i >= fmt.len) return Error.TypeError;
+        if (fmt[i] == '%') {
+            try out.append(gpa, '%');
+            i += 1;
+            continue;
+        }
+
+        var spec: FormatSpec = .{};
+        // flags
+        flags: while (i < fmt.len) : (i += 1) {
+            switch (fmt[i]) {
+                '-' => spec.minus = true,
+                '0' => spec.zero = true,
+                '+' => spec.plus = true,
+                ' ' => spec.space = true,
+                '#' => spec.hash = true,
+                else => break :flags,
+            }
+        }
+        // width
+        while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {
+            spec.width = spec.width * 10 + (fmt[i] - '0');
+        }
+        // precision
+        if (i < fmt.len and fmt[i] == '.') {
+            i += 1;
+            var p: usize = 0;
+            while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {
+                p = p * 10 + (fmt[i] - '0');
+            }
+            spec.precision = p;
+        }
+        if (i >= fmt.len) return Error.TypeError;
+        spec.conv = fmt[i];
+        i += 1;
+
+        // `%%` already handled; every remaining conversion consumes one argument.
+        if (argi >= args.len) return Error.TypeError;
+        const arg = args[argi];
+        argi += 1;
+
+        var nbuf: [512]u8 = undefined;
+        switch (spec.conv) {
+            'd', 'i' => {
+                const n = try argToInt(arg);
+                const neg = n < 0;
+                const un: u64 = @bitCast(n);
+                const mag: u64 = if (neg) (~un +% 1) else un; // |n| in two's complement (safe at minInt)
+                const digits = std.fmt.bufPrint(&nbuf, "{d}", .{mag}) catch unreachable;
+                try emitNumeric(&out, gpa, signPrefix(neg, spec), digits, spec);
+            },
+            'u' => {
+                const n = try argToInt(arg);
+                const digits = std.fmt.bufPrint(&nbuf, "{d}", .{@as(u64, @bitCast(n))}) catch unreachable;
+                try emitNumeric(&out, gpa, "", digits, spec);
+            },
+            'o' => {
+                const n = try argToInt(arg);
+                const digits = std.fmt.bufPrint(&nbuf, "{o}", .{@as(u64, @bitCast(n))}) catch unreachable;
+                const prefix: []const u8 = if (spec.hash and !(digits.len == 1 and digits[0] == '0')) "0" else "";
+                try emitNumeric(&out, gpa, prefix, digits, spec);
+            },
+            'x', 'X' => {
+                const n = try argToInt(arg);
+                const u: u64 = @bitCast(n);
+                const digits = if (spec.conv == 'x')
+                    std.fmt.bufPrint(&nbuf, "{x}", .{u}) catch unreachable
+                else
+                    std.fmt.bufPrint(&nbuf, "{X}", .{u}) catch unreachable;
+                const prefix: []const u8 = if (spec.hash and u != 0)
+                    (if (spec.conv == 'x') "0x" else "0X")
+                else
+                    "";
+                try emitNumeric(&out, gpa, prefix, digits, spec);
+            },
+            'c' => {
+                const n = try argToInt(arg);
+                const ch: u8 = @truncate(@as(u64, @bitCast(n)));
+                try emitNumeric(&out, gpa, "", &[_]u8{ch}, .{ .minus = spec.minus, .width = spec.width });
+            },
+            'f', 'F', 'e', 'E', 'g', 'G' => {
+                if (!arg.isNumber()) return Error.TypeError;
+                const f = arg.toFloat();
+                const neg = std.math.signbit(f) and !std.math.isNan(f);
+                const mag = if (neg) -f else f;
+                const lower = spec.conv == 'f' or spec.conv == 'e' or spec.conv == 'g';
+                const mode: std.fmt.float.Mode = switch (spec.conv) {
+                    'e', 'E' => .scientific,
+                    else => .decimal,
+                };
+                // `%f/%e` default to 6 fractional digits; `%g` defaults to shortest.
+                const prec: ?usize = spec.precision orelse switch (spec.conv) {
+                    'g', 'G' => null,
+                    else => 6,
+                };
+                var rbuf: [512]u8 = undefined;
+                const rendered = std.fmt.float.render(&rbuf, mag, .{ .mode = mode, .precision = prec }) catch
+                    return Error.TypeError;
+                // `render` lower-cases the exponent 'e'; upper-case for E/G.
+                var body = rendered;
+                if (!lower) {
+                    for (rbuf[0..rendered.len], 0..) |rc, k| {
+                        if (rc == 'e') rbuf[k] = 'E';
+                    }
+                    body = rbuf[0..rendered.len];
+                }
+                // Float precision is already applied: pass precision=null to emit.
+                var fspec = spec;
+                fspec.precision = null;
+                try emitNumeric(&out, gpa, signPrefix(neg, spec), body, fspec);
+            },
+            's' => {
+                if (strBytes(arg)) |full| {
+                    const body = if (spec.precision) |p| full[0..@min(p, full.len)] else full;
+                    try emitString(&out, gpa, body, spec);
+                } else if (arg.isNumber()) {
+                    var sbuf: [64]u8 = undefined;
+                    const full = try coerceConcat(arg, &sbuf);
+                    const body = if (spec.precision) |p| full[0..@min(p, full.len)] else full;
+                    try emitString(&out, gpa, body, spec);
+                } else {
+                    try formatNonStr(&out, gpa, arg, spec);
+                }
+            },
+            'q' => {
+                const s = strBytes(arg) orelse return Error.TypeError;
+                try out.append(gpa, '"');
+                for (s) |qc| switch (qc) {
+                    '"' => try out.appendSlice(gpa, "\\\""),
+                    '\\' => try out.appendSlice(gpa, "\\\\"),
+                    '\n' => try out.appendSlice(gpa, "\\n"),
+                    '\r' => try out.appendSlice(gpa, "\\r"),
+                    0 => try out.appendSlice(gpa, "\\0"),
+                    else => try out.append(gpa, qc),
+                };
+                try out.append(gpa, '"');
+            },
+            else => return Error.TypeError, // unknown conversion
+        }
+    }
+
+    return vm.heap.internValue(out.items);
+}
+
+/// Emit a string field with width + `-` justification (the `0` flag is ignored
+/// for `%s`, matching C/Lua).
+fn emitString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, body: []const u8, spec: FormatSpec) !void {
+    const pad: usize = if (spec.width > body.len) spec.width - body.len else 0;
+    if (spec.minus) {
+        try out.appendSlice(gpa, body);
+        try appendN(out, gpa, ' ', pad);
+    } else {
+        try appendN(out, gpa, ' ', pad);
+        try out.appendSlice(gpa, body);
+    }
+}
+
+/// `%s` fallback for nil/boolean (Lua applies `tostring`).
+fn formatNonStr(out: *std.ArrayList(u8), gpa: std.mem.Allocator, v: Value, spec: FormatSpec) !void {
+    const body: []const u8 = switch (v.tag) {
+        .nil => "nil",
+        .boolean => if (v.asBool()) "true" else "false",
+        else => return Error.TypeError,
+    };
+    const trimmed = if (spec.precision) |p| body[0..@min(p, body.len)] else body;
+    try emitString(out, gpa, trimmed, spec);
+}
+
 /// Coerce a concat operand to bytes: a string's own bytes, or a number formatted
 /// into `buf`. Returns a slice valid until `buf` is reused.
 fn coerceConcat(v: Value, buf: []u8) Error![]const u8 {
@@ -1556,6 +1962,129 @@ test "concat joins strings and coerces numbers; result is interned" {
     const r = try vm.run(&proto); // inspect before deinit (heap result)
     try testing.expect(r.isHeap());
     try testing.expectEqualStrings("x=42", string.String.fromHeader(r.asHeap()).bytes());
+}
+
+// ---------------------------------------------------------------------------
+// Minimal host stdlib — tonumber / string.format / io.write / arg.
+// Driven through the full front end so the module-table dispatch
+// (get_global → get_index → call) and the lint-known globals are exercised.
+// ---------------------------------------------------------------------------
+
+/// Run `source` (tier-0, no GC stress) and return the captured output bytes in
+/// `sink` for assertion.
+fn runOut(source: [:0]const u8, sink: *io.Writer) !void {
+    try runCaptured(testing.allocator, source, sink, false, .off);
+}
+
+test "stdlib: tonumber parses ints, floats, hex, explicit base; passes numbers; nil otherwise" {
+    var buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    try runOut(
+        \\print(tonumber("42"))
+        \\print(tonumber("  3.5 "))
+        \\print(tonumber("0x1F"))
+        \\print(tonumber("777", 8))
+        \\print(tonumber(123))
+        \\print(tonumber("abc"))
+        \\print(tonumber(nil))
+    , &sink);
+    try testing.expectEqualStrings("42\n3.5\n31\n511\n123\nnil\nnil\n", sink.buffered());
+}
+
+test "stdlib: string.format covers d/width/justify/zero, float, hex, string precision, q, %%" {
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    try runOut(
+        \\print(string.format("%d", 42))
+        \\print(string.format("[%8d]", 40000))
+        \\print(string.format("[%-8d]", 42))
+        \\print(string.format("[%08d]", 42))
+        \\print(string.format("%d", 3.0))
+        \\print(string.format("[%5.2f]", 3.14159))
+        \\print(string.format("%x/%X", 255, 255))
+        \\print(string.format("[%.3s]", "hello"))
+        \\print(string.format("%q", "a\"b"))
+        \\print(string.format("100%%"))
+    , &sink);
+    try testing.expectEqualStrings(
+        "42\n" ++
+            "[   40000]\n" ++
+            "[42      ]\n" ++
+            "[00000042]\n" ++
+            "3\n" ++
+            "[ 3.14]\n" ++
+            "ff/FF\n" ++
+            "[hel]\n" ++
+            "\"a\\\"b\"\n" ++
+            "100%\n",
+        sink.buffered(),
+    );
+}
+
+test "stdlib: io.write emits args with no separators and no trailing newline" {
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    try runOut(
+        \\io.write("a", 1, "b")
+        \\io.write("!")
+    , &sink);
+    try testing.expectEqualStrings("a1b!", sink.buffered());
+}
+
+test "stdlib: the exact nsieve format line matches LuaJIT byte-for-byte" {
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    try runOut(
+        \\io.write(string.format("Primes up to %8d %8d\n", 40000, 4203))
+    , &sink);
+    try testing.expectEqualStrings("Primes up to    40000     4203\n", sink.buffered());
+}
+
+test "stdlib: arg is an empty table by default (no host args)" {
+    var buf: [32]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    try runOut(
+        \\print(arg[1])
+        \\print(tonumber(arg and arg[1]) or 7)
+    , &sink);
+    // `arg` exists (a table) so `arg and arg[1]` is nil → tonumber(nil) → nil → 7.
+    try testing.expectEqualStrings("nil\n7\n", sink.buffered());
+}
+
+test "stdlib: nsieve runs end-to-end and matches LuaJIT (correctness milestone)" {
+    // Full program from `~/Projects/LuaJIT/bench/nsieve.lua`. No host args, so
+    // `N` defaults to 1 → clamped to 2 → primes up to 40000/20000/10000.
+    const nsieve =
+        \\local function nsieve(p, m)
+        \\  for i=2,m do p[i] = true end
+        \\  local count = 0
+        \\  for i=2,m do
+        \\    if p[i] then
+        \\      for k=i+i,m,i do p[k] = false end
+        \\      count = count + 1
+        \\    end
+        \\  end
+        \\  return count
+        \\end
+        \\
+        \\local N = tonumber(arg and arg[1]) or 1
+        \\if N < 2 then N = 2 end
+        \\local primes = {}
+        \\
+        \\for i=0,2 do
+        \\  local m = (2^(N-i))*10000
+        \\  io.write(string.format("Primes up to %8d %8d\n", m, nsieve(primes, m)))
+        \\end
+    ;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    try runOut(nsieve, &sink);
+    try testing.expectEqualStrings(
+        "Primes up to    40000     4203\n" ++
+            "Primes up to    20000     2262\n" ++
+            "Primes up to    10000     1229\n",
+        sink.buffered(),
+    );
 }
 
 // ---------------------------------------------------------------------------
