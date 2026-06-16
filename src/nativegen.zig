@@ -133,10 +133,41 @@ const TAG_HEAP: u8 = @intFromEnum(value.Tag.heap_ref);
 const TABLE_TYPE: u8 = @intFromEnum(object.ObjectType.table);
 /// Offset of `GcHeader.type` (the first header byte) from a `*GcHeader`.
 const HEADER_TYPE_OFF: i32 = @offsetOf(object.GcHeader, "type");
-/// The only narrow lane the native array path lowers in Phase B2/B3 (bool sieve).
-/// Every other lane (`.value`, i8…f64) bails to tier-1a here — `proveKinds`
-/// rejects an `aref`/`aload`/`guard_lane` whose `aux` is not this.
+/// Packed-lane ordinals the native array path can lower. The bool lane (B2/B3,
+/// the nsieve sieve) is bit-packed; the int lanes (B4) are byte-packed and
+/// SIB-indexed. `.value` (16-B unpacked, heap-bearing) and `f64` (no float
+/// registers in this backend) always bail to tier-1a — `laneKind` returns null.
 const BOOL_LANE: i32 = @intFromEnum(arr.Lane.boolean);
+const I8_LANE: i32 = @intFromEnum(arr.Lane.i8);
+const I16_LANE: i32 = @intFromEnum(arr.Lane.i16);
+const I32_LANE: i32 = @intFromEnum(arr.Lane.i32);
+const I64_LANE: i32 = @intFromEnum(arr.Lane.i64);
+
+/// The native scalar `Kind` a packed lane decodes to, or `null` when the native
+/// array path does not lower this lane (`.value` / `f64` → tier-1a). The bool
+/// lane yields a 0/1 boolean; the i8…i64 lanes yield a sign-extended int.
+fn laneKind(aux: i32) ?Kind {
+    if (aux == BOOL_LANE) return .bool;
+    if (aux == I8_LANE or aux == I16_LANE or aux == I32_LANE or aux == I64_LANE) return .int;
+    return null;
+}
+
+/// Packed-element width in bytes for an int lane (1/2/4/8 → the SIB scale).
+/// Asserts an int lane (`laneKind(aux) == .int`); the bit-packed bool lane uses
+/// `bt`/`bts`/`btr` instead and never calls this.
+fn intLaneWidth(aux: i32) u8 {
+    return if (aux == I8_LANE) 1 else if (aux == I16_LANE) 2 else if (aux == I32_LANE) 4 else if (aux == I64_LANE) 8 else unreachable;
+}
+
+/// Enforce that every lane-bearing op in a trace (`guard_lane`/`aref`/`aload`/
+/// `astore`) names the SAME lane. The prologue checks the runtime array lane
+/// once against the `guard_lane` ordinal; tying the per-op `aux` to that single
+/// lane guarantees each aload/astore uses the width the prologue verified.
+fn laneConsistent(trace_lane: *?i32, aux: i32) bool {
+    if (trace_lane.*) |l| return l == aux;
+    trace_lane.* = aux;
+    return true;
+}
 
 /// The proven kind of each SSA ref.
 ///   - `none`  — produces no usable value (a guard / the `loop` marker);
@@ -285,6 +316,10 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
         }
     }
 
+    // The single packed lane this trace's array ops touch (set by the first
+    // lane-bearing op; every later one must match — see `laneConsistent`).
+    var trace_lane: ?i32 = null;
+
     // Pass B: assign kinds, validating operands and constants as we go.
     for (t.instrs, 0..) |ins, i| {
         switch (ins.op) {
@@ -342,7 +377,8 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .guard_lane => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .ptr) return false;
-                if (ins.aux != BOOL_LANE) return false; // non-bool lane → tier-1a
+                if (laneKind(ins.aux) == null) return false; // .value / f64 → tier-1a
+                if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 kinds[i] = .none;
             },
             // aref pairs (table, index); its register carries idx0 = index-1. A
@@ -350,7 +386,8 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .aref => {
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .ptr or kinds[ins.b] != .int) return false;
-                if (ins.aux != BOOL_LANE) return false;
+                if (laneKind(ins.aux) == null) return false;
+                if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 kinds[i] = .aref;
             },
             // guard_bounds (idx0 <u len): the bounds proof for this aref. Marks the
@@ -375,9 +412,10 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .aload => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
-                if (ins.aux != BOOL_LANE) return false;
+                const lk = laneKind(ins.aux) orelse return false; // .value / f64 → tier-1a
+                if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 if (!bounds_ok[ins.a]) return false; // [I4] bounds must dominate
-                kinds[i] = .bool;
+                kinds[i] = lk; // bool lane → .bool; i8…i64 → .int (sign-extended)
             },
             // astore encodes a boolean into the bool-lane slot addressed by the
             // aref (`a`); `b` is the value. Like aload, the data write is indexed by
@@ -389,8 +427,12 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .astore => {
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
-                if (kinds[ins.b] != .bool) return false; // bool lane stores a boolean
+                // B4a lowers only the bool-lane store natively; an int-lane store
+                // (B4b) needs a runtime value-fits-lane guard the recorder has not
+                // emitted yet, so a non-bool astore bails the whole trace to tier-1a.
                 if (ins.aux != BOOL_LANE) return false;
+                if (kinds[ins.b] != .bool) return false; // bool lane stores a boolean
+                if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 if (!bounds_ok[ins.a]) return false; // [I1/P1] bounds must dominate
                 kinds[i] = .none;
             },
@@ -1289,19 +1331,30 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try a.btMemReg(.rax, 0, ireg);
                 try a.jcc(.ae, deopt_exit); // CF==0 → hole → side-exit
             },
-            // aload (bool lane): value bit = `bt [data], idx0`; materialize CF as a
-            // clean 0/1 boolean into the aload's location (setcc + movzx).
+            // aload: decode the packed slot the aref addresses into the aload's home.
+            // Both lanes reach the table through `aref.a` (the invariant table home)
+            // and use rax for the data pointer + rcx for idx0 — exactly the two
+            // scratch registers, no third needed (the int load's dst reuses rax).
             .aload => {
                 const aref_ins = t.instrs[ins.a];
                 const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
                 try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
                 const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                try a.btMemReg(.rax, 0, ireg);
-                // Materialize CF as a clean 0/1 in `al` (reg 0 — always REX-safe), then
-                // movzx to a full register and home it. Going through al avoids `setcc`
-                // on a high-encoding dst (sil/dil/bpl), which the encoder can't address.
-                try a.setcc(.b, .rax);
-                try a.movzxRegReg8(.rax, .rax);
+                if (ins.aux == BOOL_LANE) {
+                    // bool lane: value bit = `bt [data], idx0`; materialize CF as a
+                    // clean 0/1 in `al` (reg 0 — always REX-safe), then movzx + home.
+                    // Going through al avoids `setcc` on a high-encoding dst
+                    // (sil/dil/bpl), which the encoder can't address.
+                    try a.btMemReg(.rax, 0, ireg);
+                    try a.setcc(.b, .rax);
+                    try a.movzxRegReg8(.rax, .rax);
+                } else {
+                    // int lane (i8…i64): sign-extend the width-byte element at
+                    // `[data + idx0*w]` into a full 64-bit int. dst = rax = the same
+                    // register that held the data pointer (consumed by the load).
+                    const w = intLaneWidth(ins.aux);
+                    try a.loadRegMemSib(.rax, .rax, ireg, w, true, 0);
+                }
                 try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
             // --- lane-aware array write path (B3, bool lane) ---------------------
@@ -2242,6 +2295,62 @@ test "nativegen: bool-lane t[k] read scan matches the interpreter" {
     try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(40), Value.nil() });
 }
 
+test "nativegen: int-lane t[k] read scan matches the interpreter (i8/i16/i32/i64)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const K: i64 = 48;
+
+    const Cfg = struct { lane: arr.Lane, bump: i64 };
+    // `bump` is a value past the previous lane's max, so the (monotonic) rehash
+    // widening lands the array on exactly `lane`. Negative slot values exercise
+    // the load's SIGN extension (movsx/movsxd), not just zero-extension.
+    const cfgs = [_]Cfg{
+        .{ .lane = .i8, .bump = 100 }, // all |v| <= 127
+        .{ .lane = .i16, .bump = 1000 }, // exceeds i8
+        .{ .lane = .i32, .bump = 100_000 }, // exceeds i16
+        .{ .lane = .i64, .bump = 5_000_000_000 }, // exceeds i32
+    };
+
+    for (cfgs) |cfg| {
+        const t = try table.Table.create(gpa);
+        defer t.destroy(gpa);
+        var i: i64 = 2;
+        while (i <= K) : (i += 1) {
+            const v: i64 = if (@rem(i, 2) == 0) i else -i; // alternate sign
+            try t.set(gpa, Value.int(i), Value.int(v));
+        }
+        try t.set(gpa, Value.int(K), Value.int(cfg.bump)); // pin the widest value
+        try testing.expectEqual(cfg.lane, t.array.lane);
+
+        const lane: i32 = @intFromEnum(cfg.lane);
+        var consts = [_]Value{Value.int(1)};
+        // r0=table, r1=index, r2=last load. Same scan shape as the bool test, but
+        // the aload decodes a sign-extended int (carried as TAG_INT at exit).
+        var full = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: table
+            .{ .op = .guard_table, .a = 0 }, // 1
+            .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+            .{ .op = .slot_load, .aux = 1 }, // 3: index
+            .{ .op = .guard_int, .a = 3 }, // 4
+            .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+            .{ .op = .guard_bounds, .a = 5 }, // 6
+            .{ .op = .guard_present, .a = 5 }, // 7
+            .{ .op = .aload, .a = 5, .aux = lane }, // 8: v = t[index]
+            .{ .op = .konst, .aux = 0 }, // 9: 1
+            .{ .op = .add, .a = 3, .b = 9 }, // 10: index + 1
+            .{ .op = .loop }, // 11
+        };
+        var exits = [_]S{ .{ .slot = 1, .ref = 10 }, .{ .slot = 2, .ref = 8 } };
+        var es = [_]u16{};
+        const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+
+        try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(2), Value.nil() }); // full scan
+        try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(1), Value.nil() }); // hole at key 1
+        try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(K + 3), Value.nil() }); // OOB
+        try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(K), Value.nil() }); // last present (=bump)
+    }
+}
+
 test "nativegen: guard_table failure side-exits natively with completed==0" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -2275,11 +2384,12 @@ test "nativegen: guard_table failure side-exits natively with completed==0" {
     try expectMatch(&tr, &.{ Value.int(99), Value.int(2), Value.nil() });
 }
 
-test "nativegen: a non-bool array lane bails to tier-1a" {
+test "nativegen: an f64 array lane bails to tier-1a" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
-    // An i16-lane scan (aux != bool ordinal) must be rejected by proveKinds so the
-    // trace stays on the IR-interpreter (B2c lowers the bool lane only).
-    const lane: i32 = @intFromEnum(arr.Lane.i16);
+    // The bool + i8…i64 lanes lower natively (B2c/B3/B4); the f64 lane has no
+    // float-register support in this backend and `.value` is heap-bearing, so
+    // both must be rejected by proveKinds and stay on the IR-interpreter.
+    const lane: i32 = @intFromEnum(arr.Lane.f64);
     var full = [_]I{
         .{ .op = .slot_load, .aux = 0 },
         .{ .op = .guard_table, .a = 0 },
