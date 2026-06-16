@@ -29,6 +29,14 @@ pub const Table = struct {
     array: std.ArrayListUnmanaged(Value) = .empty,
     /// Hash part: every key not in the array part.
     hash: Map = .empty,
+    /// Amortised rehash trigger. lune's hash part (`std.HashMapUnmanaged`)
+    /// self-grows, so we can't use Lua's "hash full" hook to drive a rehash —
+    /// instead we recompute the array/hash split when the hash-part population
+    /// crosses this threshold, doubling it each time (`rehash`). This keeps the
+    /// O(n) rehash work amortised O(1) per insert. Default-initialised, so
+    /// `create`/`initBare`/restore need no extra wiring; it only gates an
+    /// optimisation, never correctness.
+    rehash_threshold: usize = 4,
 
     pub const Map = std.HashMapUnmanaged(
         Value,
@@ -97,6 +105,35 @@ pub const Table = struct {
                 try self.migrateFromHash(gpa);
                 return;
             }
+            // A non-contiguous integer key would land in the hash part. If this
+            // is a *new* key (not already hash-resident) and the hash population
+            // has crossed the rehash threshold, recompute the optimal array/hash
+            // split (Lua's `rehash`): a dense run of integer keys (e.g. nsieve's
+            // `t[2..m]`, which never sets `t[1]`) migrates into the array part
+            // instead of bloating the hash. Then retry the array fast paths *once*
+            // — after a grow, `i` may now be in range or be the contiguous
+            // successor. A sparse key (the array did not grow to cover it) simply
+            // falls through to the hash put below. The retry is non-recursive, so
+            // this cannot loop. We require the key be new so a pure value-update
+            // of an existing hash key neither double-counts it in the histogram
+            // nor changes the table's storage shape (Lua's `rehash` likewise only
+            // runs for a key not yet in the table).
+            if (!val.isNil() and
+                self.hash.count() + 1 >= self.rehash_threshold and
+                !self.hash.contains(nk))
+            {
+                try self.rehash(gpa, i);
+                const n2: i64 = @intCast(self.array.items.len);
+                if (i >= 1 and i <= n2) {
+                    self.array.items[@intCast(i - 1)] = val;
+                    return;
+                }
+                if (i == n2 + 1) {
+                    try self.array.append(gpa, val);
+                    try self.migrateFromHash(gpa);
+                    return;
+                }
+            }
             // otherwise falls through to the hash part
         }
 
@@ -132,6 +169,119 @@ pub const Table = struct {
             try self.array.append(gpa, v);
             _ = self.hash.remove(next);
         }
+    }
+
+    /// Largest integer key (bits) the array part is allowed to index. Lua bounds
+    /// this by `int`'s width; we cap well below `i64` so the histogram, the
+    /// `1 << bucket` math, and the array allocation can never overflow. Keys past
+    /// this stay in the hash part regardless of density (they'd never be dense
+    /// enough to migrate anyway). 2^48 slots is far beyond any feasible array.
+    const MAXABITS: u6 = 48;
+    /// Histogram length: one bucket per `ceil(log2)` value in `[0, MAXABITS]`.
+    const NBUCKETS: usize = @as(usize, MAXABITS) + 1;
+
+    /// `ceil(log2(k))` for `k >= 1` — the histogram bucket a positive key lands
+    /// in (bucket `b` covers keys in `(2^(b-1), 2^b]`; key 1 → bucket 0).
+    fn ceillog2(k: u64) u6 {
+        if (k <= 1) return 0;
+        return @intCast(64 - @clz(k - 1));
+    }
+
+    /// Tally one integer key into the power-of-two histogram. Returns true iff
+    /// `k` is a valid *array index* (`1 <= k <= 2^MAXABITS`) — i.e. a candidate
+    /// for the array part. Mirrors Lua's `countint`/`arrayindex`.
+    fn countKey(k: i64, nums: *[NBUCKETS]u32) bool {
+        if (k < 1) return false;
+        const uk: u64 = @intCast(k);
+        if (uk > (@as(u64, 1) << MAXABITS)) return false;
+        nums[ceillog2(uk)] += 1;
+        return true;
+    }
+
+    /// Lua's `computesizes`: pick the optimal power-of-two array size given the
+    /// key histogram and the total number of array-index keys. The array grows to
+    /// the largest `2^i` for which it gains keys (`nums[i] > 0`) while staying
+    /// "cheaper than the hash" under `arrayXhash(na, nh) := na <= nh*3` (an array
+    /// slot costs ~⅓ of a hash node). Returns the chosen size (0 = keep hashing).
+    /// Arithmetic is in `u64` (not `usize`) on purpose: `twotoi` ranges up to
+    /// `2^MAXABITS`, which overflows a 32-bit `usize` on the wasm target. The
+    /// returned size is bounded by `na_total*3` (the density gate) — i.e. by the
+    /// live key count, hence by addressable memory — so it always fits `usize`.
+    fn computeArraySize(nums: *const [NBUCKETS]u32, na_total: u64) u64 {
+        var a: u64 = 0; // keys seen so far (< twotoi)
+        var optimal: u64 = 0;
+        var i: usize = 0;
+        var twotoi: u64 = 1; // 2^i
+        // Stop once an array of `twotoi` slots could no longer be justified by the
+        // total array-index count (`arrayXhash(twotoi, na_total)`), or the bucket
+        // index runs off the histogram.
+        while (i <= MAXABITS and twotoi <= na_total *| 3) : ({
+            i += 1;
+            twotoi <<= 1;
+        }) {
+            a += nums[i];
+            if (nums[i] > 0 and twotoi <= a *| 3) { // arrayXhash(twotoi, a)
+                optimal = twotoi;
+            }
+        }
+        return optimal;
+    }
+
+    /// Recompute the array/hash split (Lua's `rehash`). Counts every integer key
+    /// — the pending `extra_key`, the hash part, and the existing array part —
+    /// into a power-of-two histogram, asks `computeArraySize` for the optimal
+    /// array size, and if that grows the array, migrates the now-covered dense
+    /// integer keys out of the hash into their array slots. Grow-only: a rehash
+    /// is always insert-driven, so the array never needs to shrink here.
+    ///
+    /// Determinism: this is a pure function of the table's current contents (no
+    /// addresses, no iteration-order dependence), and it runs *only* from `set`,
+    /// never on the keyframe-restore path — so snapshot capture/restore stays
+    /// byte-identical (the restorer reproduces a captured split verbatim via
+    /// `restoreEntry` + direct array append).
+    fn rehash(self: *Table, gpa: std.mem.Allocator, extra_key: i64) Error!void {
+        var nums: [NBUCKETS]u32 = @splat(0);
+        var na_total: usize = 0;
+
+        if (countKey(extra_key, &nums)) na_total += 1;
+
+        var it = self.hash.iterator();
+        while (it.next()) |e| {
+            if (e.key_ptr.isInt() and countKey(e.key_ptr.asInt(), &nums)) na_total += 1;
+        }
+
+        for (self.array.items, 0..) |v, idx| {
+            if (!v.isNil() and countKey(@intCast(idx + 1), &nums)) na_total += 1;
+        }
+
+        // `asize` is bounded by `na_total*3` (density gate), hence by the live key
+        // count, so it always fits `usize` on every target.
+        const asize: usize = @intCast(computeArraySize(&nums, na_total));
+        const old_len = self.array.items.len;
+
+        // Grow-only: a rehash is insert-driven, so the array never shrinks. When
+        // the density test declines to grow (`asize <= old_len`) there is nothing
+        // to migrate — but we still bump the threshold below so that repeated
+        // sparse inserts don't re-run this O(n) histogram on every one of them.
+        if (asize > old_len) {
+            try self.array.resize(gpa, asize);
+            for (self.array.items[old_len..]) |*slot| slot.* = Value.nil();
+
+            // Drain dense integer keys now covered by the array out of the hash.
+            // Keys in `[1, old_len]` are already array-resident (set() keeps them
+            // there), so only `[old_len+1, asize]` can still be in the hash.
+            var k: usize = old_len + 1;
+            while (k <= asize) : (k += 1) {
+                if (self.hash.fetchRemove(Value.int(@intCast(k)))) |removed| {
+                    self.array.items[k - 1] = removed.value;
+                }
+            }
+        }
+
+        // Amortise: don't rehash again until the hash population roughly doubles.
+        // (`hash.count()` here excludes the still-pending `extra_key`, which the
+        // caller stores after we return.)
+        self.rehash_threshold = @max(self.hash.count() * 2, 4);
     }
 
     /// A *border* `n` such that `t[n] ~= nil` and `t[n+1] == nil` (or `0`). Like
@@ -300,4 +450,93 @@ test "boolean and (interned-style) pointer keys live in the hash part" {
     try t.set(gpa, Value.boolean(false), Value.int(2));
     try testing.expectEqual(@as(i64, 1), t.get(Value.boolean(true)).asInt());
     try testing.expectEqual(@as(i64, 2), t.get(Value.boolean(false)).asInt());
+}
+
+test "rehash: a dense run from 2 (the nsieve pattern) packs into the array part" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    // `p[2..K]` with no `p[1]` — exactly nsieve's sieve fill. Without rehash this
+    // piles every key into the hash; with it, the dense run migrates into the
+    // array part. Store distinct values so migration correctness is also checked.
+    const K: i64 = 64;
+    var i: i64 = 2;
+    while (i <= K) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i * 10));
+
+    // Every key reads back its value; key 1 was never set.
+    try testing.expect(t.get(Value.int(1)).isNil());
+    i = 2;
+    while (i <= K) : (i += 1) {
+        try testing.expectEqual(i * 10, t.get(Value.int(i)).asInt());
+    }
+
+    // The regression guard: the keys live in the array part now, not the hash.
+    try testing.expect(t.array.items.len >= @as(usize, @intCast(K)));
+    try testing.expectEqual(@as(usize, 0), t.hash.count());
+    try testing.expect(t.array.items[0].isNil()); // slot for key 1 is a nil hole
+}
+
+test "rehash: sparse integer keys stay in the hash part (density gate)" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    try t.set(gpa, Value.int(1), Value.int(1)); // array len 1
+    // Four widely-spaced keys: enough inserts to trip the rehash trigger, but the
+    // density test must decline to grow the array for them.
+    const sparse = [_]i64{ 1_000_000, 2_000_000, 3_000_000, 4_000_000 };
+    for (sparse) |k| try t.set(gpa, Value.int(k), Value.int(k));
+
+    try testing.expectEqual(@as(usize, 1), t.array.items.len); // array did NOT bloat
+    try testing.expectEqual(@as(usize, sparse.len), t.hash.count());
+    for (sparse) |k| try testing.expectEqual(k, t.get(Value.int(k)).asInt());
+    try testing.expectEqual(@as(i64, 1), t.get(Value.int(1)).asInt());
+}
+
+test "rehash: float-normalized and non-integer keys survive the migration" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    // Build a dense run that will rehash, mixing in a float-spelled key.
+    var i: i64 = 2;
+    while (i <= 40) : (i += 1) {
+        if (i == 7) {
+            try t.set(gpa, Value.float(7.0), Value.int(700)); // float key → int 7
+        } else {
+            try t.set(gpa, Value.int(i), Value.int(i * 10));
+        }
+    }
+    // A boolean key inserted before and read after the rehash stays in the hash.
+    try t.set(gpa, Value.boolean(true), Value.int(-1));
+
+    // Float/int spellings alias the same (now array-resident) slot.
+    try testing.expectEqual(@as(i64, 700), t.get(Value.int(7)).asInt());
+    try testing.expectEqual(@as(i64, 700), t.get(Value.float(7.0)).asInt());
+    // The non-integer key is untouched by array migration.
+    try testing.expectEqual(@as(i64, -1), t.get(Value.boolean(true)).asInt());
+    try testing.expect(t.get(Value.int(7)).isInt()); // not lost/overwritten
+}
+
+test "rehash: updating an existing hash key never reshapes the table" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    // Many distinct sparse keys → hash-resident, array stays small. Inserting
+    // these crosses the rehash trigger repeatedly (each declines to grow).
+    var j: i64 = 1;
+    while (j <= 20) : (j += 1) try t.set(gpa, Value.int(j * 1000), Value.int(j));
+    const len_before = t.array.items.len;
+
+    // Re-setting keys that already live in the hash must NOT trigger a reshape
+    // (no phantom histogram double-count) — it is a plain in-place value update.
+    j = 1;
+    while (j <= 20) : (j += 1) try t.set(gpa, Value.int(j * 1000), Value.int(j * 7));
+    try testing.expectEqual(len_before, t.array.items.len); // shape unchanged
+    j = 1;
+    while (j <= 20) : (j += 1) {
+        try testing.expectEqual(j * 7, t.get(Value.int(j * 1000)).asInt());
+    }
 }

@@ -834,6 +834,17 @@ test "restore is the exact inverse of capture (byte-identical re-snapshot)" {
         \\local s = string.format("%d-%s", 7, "x")
         \\result = { s = s, n = tonumber("42") }
     );
+    // A table filled `t[2..K]` with no `t[1]` (the nsieve pattern) now triggers a
+    // rehash that migrates the dense run into the array part, leaving a nil hole
+    // at slot 1. Capture must serialize that array/hash split (holes included) and
+    // restore must reproduce it verbatim — the rehash never runs on the restore
+    // path, so a captured split round-trips byte-identically.
+    try expectRoundTrip(
+        \\local t = {}
+        \\for i = 2, 40 do t[i] = i * 3 end
+        \\t.tag = "sieve-shaped"
+        \\result = t
+    );
 }
 
 test "restore rebuilds globals, ids, and a reachable value graph" {

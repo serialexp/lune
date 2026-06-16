@@ -107,9 +107,15 @@ schema follows; this is that schema's home.
       upvalues), and failure-mode tests (`UnresolvedHeapRef` / `UnknownProto` /
       `UnknownNative` / `GlobalsNotATable` / `DuplicateId` / `UnsupportedVersion`).
       A restore-only `Table.restoreEntry` populates the hash part without triggering
-      array migration, preserving the captured array/hash split. F2b proved the
-      inverse property only for a **final-state** snapshot (empty stack/frames); the
-      mid-execution case is F2c, below.
+      array migration, preserving the captured array/hash split. This stays correct
+      now that `Table.set` runs a Lua-style **rehash** (array-part sizing — a dense
+      run of integer keys like nsieve's `t[2..m]` migrates out of the hash into the
+      contiguous array part): the rehash fires **only from `set`**, never on the
+      restore path, so a captured split — array holes included — is still reproduced
+      verbatim by `restoreEntry` + direct array append, and `encodeSnapshot ∘ restore`
+      remains byte-identical (the round-trip corpus includes a sieve-shaped table).
+      F2b proved the inverse property only for a **final-state** snapshot (empty
+      stack/frames); the mid-execution case is F2c, below.
 
 - [x] **Mid-execution capture + RESUME (Phase 7 v2 / F2c).** The interpreter's
       host-stack recursion (`execClosure`→`doCall`→`execClosure`) became an explicit
