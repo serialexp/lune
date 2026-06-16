@@ -247,7 +247,13 @@ pub const Heap = struct {
             .string, .native => {},
             .table => {
                 const t = Table.fromHeader(h);
-                for (t.array.items) |v| self.markValue(v);
+                // Narrow lanes (bool/int/float) hold no heap pointers — the array
+                // part is a GC leaf and is skipped entirely. Only the `.value`
+                // lane can carry heap references. The hash part is always marked.
+                if (!t.array.isLeaf()) {
+                    var i: usize = 0;
+                    while (i < t.array.len) : (i += 1) self.markValue(t.array.get(i + 1));
+                }
                 var it = t.hash.iterator();
                 while (it.next()) |entry| {
                     self.markValue(entry.key_ptr.*);
@@ -419,6 +425,59 @@ test "marking a table keeps its keys and values alive" {
     // Table + its reachable key/value survive; the loose string is gone.
     try testing.expectEqual(@as(usize, 3), heap.object_count);
     try testing.expectEqualStrings("v", string.String.fromHeader(t.get(try heap.internValue("k")).asHeap()).bytes());
+}
+
+test "a narrow-lane (leaf) array survives GC with its values intact" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    const t = try heap.newTable();
+    // nsieve's bool pattern (hole at 1) → packs into the boolean lane, a GC leaf.
+    const K: i64 = 80;
+    var i: i64 = 2;
+    while (i <= K) : (i += 1) try t.set(heap.gpa, Value.int(i), Value.boolean(true));
+    try testing.expect(t.array.isLeaf()); // blacken must skip the array entirely
+
+    // A loose unrooted string that should not survive.
+    _ = try heap.intern("garbage");
+
+    try collectWithRoots(&heap, &.{&t.header});
+
+    // The table survived; the narrow-lane values are all intact post-sweep.
+    i = 2;
+    while (i <= K) : (i += 1) {
+        try testing.expectEqual(true, t.get(Value.int(i)).asBool());
+    }
+    try testing.expect(t.get(Value.int(1)).isNil());
+    try testing.expect(t.array.isLeaf()); // lane unchanged by collection
+}
+
+test "a value-lane array still marks its nested-table children" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    const outer = try heap.newTable();
+    const inner = try heap.newTable();
+    try inner.set(heap.gpa, try heap.internValue("k"), try heap.internValue("v"));
+
+    // Put the inner table in the outer's array part. A heap value keeps the array
+    // in the `.value` lane (not a leaf), so blacken must walk it.
+    try outer.set(heap.gpa, Value.int(1), Value.heap(&inner.header));
+    try testing.expect(!outer.array.isLeaf());
+
+    // Objects: outer, inner, "k", "v" = 4. Plus a loose string that must die.
+    _ = try heap.intern("garbage");
+
+    try collectWithRoots(&heap, &.{&outer.header});
+
+    // outer + inner + "k" + "v" survive (the loose string is swept).
+    try testing.expectEqual(@as(usize, 4), heap.object_count);
+    const got = outer.get(Value.int(1));
+    try testing.expect(got.isHeap());
+    try testing.expectEqualStrings(
+        "v",
+        string.String.fromHeader(inner.get(try heap.internValue("k")).asHeap()).bytes(),
+    );
 }
 
 test "collecting with no roots frees everything" {

@@ -113,8 +113,12 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, h: *GcHeader) !schema.HeapObject
         .string => .{ .HeapString = .{ .bytes = string.String.fromHeader(h).bytes() } },
         .table => blk: {
             const t = table.Table.fromHeader(h);
-            const array = try a.alloc(schema.SnapValue, t.array.items.len);
-            for (t.array.items, 0..) |v, i| array[i] = toSchemaValue(v);
+            const array = try a.alloc(schema.SnapValue, t.array.len);
+            // Capture emits *logical* Values via `array.get`, so the snapshot bytes
+            // are independent of the in-memory lane (a packed bool/int array and an
+            // unpacked `.value` array with the same logical contents serialize
+            // identically). `get` is 1-based.
+            for (0..t.array.len) |i| array[i] = toSchemaValue(t.array.get(i + 1));
             const kvs = try sortedHashEntries(a, t);
             const entries = try a.alloc(schema.TableEntry, kvs.len);
             for (kvs, 0..) |kv, i| {
@@ -185,7 +189,7 @@ const Walk = struct {
             .string, .native => {},
             .table => {
                 const t = table.Table.fromHeader(h);
-                for (t.array.items) |v| self.pushValue(v);
+                for (0..t.array.len) |i| self.pushValue(t.array.get(i + 1));
                 // Enumerate hash children in the same canonical key order the
                 // serializer uses, so BFS object-discovery order (and thus the
                 // `objects[]` array layout) is insertion-order-independent too.
@@ -430,6 +434,7 @@ pub fn restoreSnapshot(
                 // Use the registry's static name (outlives the decode arena).
                 const n = try function.Native.create(gpa, entry.func, entry.name);
                 n.effect = entry.effect; // an effect native stays an effect on replay
+                n.multi = entry.multi; // …and keeps its multi-result projection
                 vm.heap.linkRestored(&n.header, o.id);
                 break :blk &n.header;
             },
@@ -845,6 +850,18 @@ test "restore is the exact inverse of capture (byte-identical re-snapshot)" {
         \\t.tag = "sieve-shaped"
         \\result = t
     );
+    // The literal nsieve fill: `t[2..K] = true`, all booleans, hole at 1. In memory
+    // this packs into the *boolean* lane (~2 bits/slot), but capture emits logical
+    // Values via `array.get`, so the snapshot bytes are independent of the lane — a
+    // packed bool array and an unpacked `.value` array serialize identically. The
+    // restored VM rebuilds the array in the `.value` lane (restore only appends,
+    // never rehashes), and its re-capture is byte-identical to the original.
+    try expectRoundTrip(
+        \\local t = {}
+        \\for i = 2, 64 do t[i] = true end
+        \\t.tag = "bool-lane"
+        \\result = t
+    );
 }
 
 test "restore rebuilds globals, ids, and a reachable value graph" {
@@ -917,6 +934,63 @@ test "restore rebuilds globals, ids, and a reachable value graph" {
     const print_val = vm2.globals.get(try vm2.heap.internValue("print"));
     try testing.expect(print_val.isHeap() and print_val.heapType() == .native);
     try testing.expectEqualStrings("print", function.Native.fromHeader(print_val.asHeap()).name);
+}
+
+test "restore preserves a multi-result native's projection and multi fn" {
+    // A multi-return native (`math.modf`) serializes by name only (`HeapNative`),
+    // so the restore path must reattach BOTH its single-result `func` projection
+    // and its `multi` fn from the registry entry — otherwise a snapshot taken
+    // mid-program would come back single-return and `local i, f = math.modf(x)`
+    // would silently lose its second result after replay.
+    const gpa = testing.allocator;
+    const source = "m = math.modf"; // make the native reachable from a global
+
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    _ = try vm.run(chunk.proto);
+
+    const b0 = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(b0);
+
+    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    defer {
+        vm2.deinit();
+        gpa.destroy(vm2);
+    }
+
+    // Walk both routes to the restored native: the direct global `m`, and the
+    // `math` table's `modf` field — both must resolve to a `math.modf` native.
+    const via_global = vm2.globals.get(try vm2.heap.internValue("m"));
+    const math_tbl_val = vm2.globals.get(try vm2.heap.internValue("math"));
+    try testing.expect(math_tbl_val.isHeap() and math_tbl_val.heapType() == .table);
+    const via_field = table.Table.fromHeader(math_tbl_val.asHeap()).get(try vm2.heap.internValue("modf"));
+
+    for ([_]Value{ via_global, via_field }) |nv| {
+        try testing.expect(nv.isHeap() and nv.heapType() == .native);
+        const n = function.Native.fromHeader(nv.asHeap());
+        try testing.expectEqualStrings("math.modf", n.name);
+        try testing.expect(n.effect == null); // modf is pure, not an effect native
+        try testing.expect(n.multi != null); // …and its multi projection survived
+
+        // The single-result projection still yields the integral part…
+        const ip = try n.func(undefined, &.{Value.float(3.5)});
+        try testing.expect(ip.isFloat() and ip.asFloat() == 3.0);
+
+        // …and the multi fn still writes both integral + fractional parts.
+        var out: [2]Value = .{ Value.nil(), Value.nil() };
+        const produced = try n.multi.?(undefined, &.{Value.float(3.5)}, &out);
+        try testing.expectEqual(@as(usize, 2), produced);
+        try testing.expect(out[0].asFloat() == 3.0);
+        try testing.expect(out[1].asFloat() == 0.5);
+    }
 }
 
 test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)" {

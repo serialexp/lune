@@ -34,12 +34,19 @@ pub const parser = @import("parser.zig");
 
 /// Phase 3 — runtime heap objects + bytecode ISA + tier-0 interpreter.
 pub const string = @import("string.zig");
+pub const array = @import("array.zig");
 pub const table = @import("table.zig");
 pub const function = @import("function.zig");
 pub const gc = @import("gc.zig");
 pub const bytecode = @import("bytecode.zig");
 pub const compiler = @import("compiler.zig");
 pub const interp = @import("interp.zig");
+
+/// Standard library — one module per Lua-shaped library. Each owns its native fn
+/// bodies plus a `natives`/`constants` registry slice that `interp.base_natives`
+/// concatenates, so library code stays out of the interpreter core. Re-exported
+/// here so `zig build test` analyses and runs each library's unit tests.
+pub const stdlib_math = @import("stdlib/math.zig");
 
 /// Phase 5 — hot-path detection + trace recorder (records IR; tier-0 executes).
 pub const trace = @import("trace.zig");
@@ -100,6 +107,7 @@ test {
     _ = ast;
     _ = parser;
     _ = string;
+    _ = array;
     _ = table;
     _ = function;
     _ = gc;

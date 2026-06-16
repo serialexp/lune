@@ -16,8 +16,10 @@
 const std = @import("std");
 const object = @import("object.zig");
 const value = @import("value.zig");
+const arr = @import("array.zig");
 const GcHeader = object.GcHeader;
 const Value = value.Value;
+const ArrayPart = arr.ArrayPart;
 
 /// 2^63 as f64 — the first power of two beyond `i64`'s range, used to bound the
 /// float→int key normalisation.
@@ -25,8 +27,12 @@ const two_pow_63: f64 = 9223372036854775808.0;
 
 pub const Table = struct {
     header: GcHeader,
-    /// Dense array part: `array.items[i]` holds key `i + 1`.
-    array: std.ArrayListUnmanaged(Value) = .empty,
+    /// Dense array part for the contiguous key run `1..len`, stored in the
+    /// narrowest **lane** the contents fit (a boolean bitmap, packed ints, packed
+    /// floats, or full `Value`s) — see `array.zig`. The lane is an in-memory
+    /// optimisation only: every reader goes through `array.get`/`set` and sees
+    /// logical `Value`s, and the lane is never serialised.
+    array: ArrayPart = .empty,
     /// Hash part: every key not in the array part.
     hash: Map = .empty,
     /// Amortised rehash trigger. lune's hash part (`std.HashMapUnmanaged`)
@@ -81,8 +87,8 @@ pub const Table = struct {
 
     /// `t[i]` for an integer key (array part fast path).
     pub fn getInt(self: *const Table, i: i64) Value {
-        if (i >= 1 and i <= @as(i64, @intCast(self.array.items.len))) {
-            return self.array.items[@intCast(i - 1)];
+        if (i >= 1 and i <= @as(i64, @intCast(self.array.len))) {
+            return self.array.get(@intCast(i));
         }
         return self.hash.get(Value.int(i)) orelse Value.nil();
     }
@@ -95,9 +101,9 @@ pub const Table = struct {
         const nk = normalizeKey(key);
         if (nk.isInt()) {
             const i = nk.asInt();
-            const n: i64 = @intCast(self.array.items.len);
+            const n: i64 = @intCast(self.array.len);
             if (i >= 1 and i <= n) {
-                self.array.items[@intCast(i - 1)] = val;
+                try self.array.setInPlace(gpa, @intCast(i), val);
                 return;
             }
             if (i == n + 1 and !val.isNil()) {
@@ -123,9 +129,9 @@ pub const Table = struct {
                 !self.hash.contains(nk))
             {
                 try self.rehash(gpa, i);
-                const n2: i64 = @intCast(self.array.items.len);
+                const n2: i64 = @intCast(self.array.len);
                 if (i >= 1 and i <= n2) {
-                    self.array.items[@intCast(i - 1)] = val;
+                    try self.array.setInPlace(gpa, @intCast(i), val);
                     return;
                 }
                 if (i == n2 + 1) {
@@ -163,7 +169,7 @@ pub const Table = struct {
     /// that were sitting in the hash part.
     fn migrateFromHash(self: *Table, gpa: std.mem.Allocator) Error!void {
         while (true) {
-            const next = Value.int(@as(i64, @intCast(self.array.items.len)) + 1);
+            const next = Value.int(@as(i64, @intCast(self.array.len)) + 1);
             const v = self.hash.get(next) orelse break;
             if (v.isNil()) break;
             try self.array.append(gpa, v);
@@ -250,33 +256,46 @@ pub const Table = struct {
             if (e.key_ptr.isInt() and countKey(e.key_ptr.asInt(), &nums)) na_total += 1;
         }
 
-        for (self.array.items, 0..) |v, idx| {
-            if (!v.isNil() and countKey(@intCast(idx + 1), &nums)) na_total += 1;
+        var idx: usize = 0;
+        while (idx < self.array.len) : (idx += 1) {
+            if (!self.array.get(idx + 1).isNil() and countKey(@intCast(idx + 1), &nums)) na_total += 1;
         }
 
         // `asize` is bounded by `na_total*3` (density gate), hence by the live key
         // count, so it always fits `usize` on every target.
         const asize: usize = @intCast(computeArraySize(&nums, na_total));
-        const old_len = self.array.items.len;
+        const old_len = self.array.len;
 
         // Grow-only: a rehash is insert-driven, so the array never shrinks. When
         // the density test declines to grow (`asize <= old_len`) there is nothing
         // to migrate — but we still bump the threshold below so that repeated
         // sparse inserts don't re-run this O(n) histogram on every one of them.
         if (asize > old_len) {
+            // `resize` fills the new slots `[old_len, asize)` with holes for us.
             try self.array.resize(gpa, asize);
-            for (self.array.items[old_len..]) |*slot| slot.* = Value.nil();
 
             // Drain dense integer keys now covered by the array out of the hash.
             // Keys in `[1, old_len]` are already array-resident (set() keeps them
             // there), so only `[old_len+1, asize]` can still be in the hash.
             var k: usize = old_len + 1;
             while (k <= asize) : (k += 1) {
-                if (self.hash.fetchRemove(Value.int(@intCast(k)))) |removed| {
-                    self.array.items[k - 1] = removed.value;
+                const key = Value.int(@intCast(k));
+                if (self.hash.get(key)) |val| {
+                    // Write into the array part *before* evicting from the hash: a
+                    // narrow→`.value` widening inside `setInPlace` can OOM, and a
+                    // `fetchRemove`-first ordering would drop the entry on failure.
+                    try self.array.setInPlace(gpa, k, val);
+                    _ = self.hash.remove(key);
                 }
             }
         }
+
+        // Re-pick the array part's storage lane now that its contents are settled.
+        // The rehash already walked every element above, and this pass folds the
+        // array into the narrowest lane it fits (e.g. nsieve's all-boolean sieve
+        // → a 1-bit boolean lane), recovering most of the per-slot `Value` width.
+        // A pure in-memory change — invisible to `get`/keyframes (see `array.zig`).
+        try self.array.repack(gpa, self.array.optimalLane());
 
         // Amortise: don't rehash again until the hash population roughly doubles.
         // (`hash.count()` here excludes the still-pending `extra_key`, which the
@@ -287,11 +306,11 @@ pub const Table = struct {
     /// A *border* `n` such that `t[n] ~= nil` and `t[n+1] == nil` (or `0`). Like
     /// Lua, with holes any valid border may be returned; this is `#t`.
     pub fn length(self: *const Table) i64 {
-        var n: usize = self.array.items.len;
+        var n: usize = self.array.len;
         // Trim trailing nils: if the array part ends in a nil, the border is the
         // last non-nil prefix and cannot extend past it.
-        while (n > 0 and self.array.items[n - 1].isNil()) n -= 1;
-        if (n < self.array.items.len) return @intCast(n);
+        while (n > 0 and self.array.get(n).isNil()) n -= 1;
+        if (n < self.array.len) return @intCast(n);
 
         // Array part is non-nil through its end; the border may continue into the
         // hash part. Unbound-then-binary search, as luaH_getn does.
@@ -472,9 +491,9 @@ test "rehash: a dense run from 2 (the nsieve pattern) packs into the array part"
     }
 
     // The regression guard: the keys live in the array part now, not the hash.
-    try testing.expect(t.array.items.len >= @as(usize, @intCast(K)));
+    try testing.expect(t.array.len >= @as(usize, @intCast(K)));
     try testing.expectEqual(@as(usize, 0), t.hash.count());
-    try testing.expect(t.array.items[0].isNil()); // slot for key 1 is a nil hole
+    try testing.expect(t.array.get(1).isNil()); // slot for key 1 is a nil hole
 }
 
 test "rehash: sparse integer keys stay in the hash part (density gate)" {
@@ -488,7 +507,7 @@ test "rehash: sparse integer keys stay in the hash part (density gate)" {
     const sparse = [_]i64{ 1_000_000, 2_000_000, 3_000_000, 4_000_000 };
     for (sparse) |k| try t.set(gpa, Value.int(k), Value.int(k));
 
-    try testing.expectEqual(@as(usize, 1), t.array.items.len); // array did NOT bloat
+    try testing.expectEqual(@as(usize, 1), t.array.len); // array did NOT bloat
     try testing.expectEqual(@as(usize, sparse.len), t.hash.count());
     for (sparse) |k| try testing.expectEqual(k, t.get(Value.int(k)).asInt());
     try testing.expectEqual(@as(i64, 1), t.get(Value.int(1)).asInt());
@@ -528,15 +547,158 @@ test "rehash: updating an existing hash key never reshapes the table" {
     // these crosses the rehash trigger repeatedly (each declines to grow).
     var j: i64 = 1;
     while (j <= 20) : (j += 1) try t.set(gpa, Value.int(j * 1000), Value.int(j));
-    const len_before = t.array.items.len;
+    const len_before = t.array.len;
 
     // Re-setting keys that already live in the hash must NOT trigger a reshape
     // (no phantom histogram double-count) — it is a plain in-place value update.
     j = 1;
     while (j <= 20) : (j += 1) try t.set(gpa, Value.int(j * 1000), Value.int(j * 7));
-    try testing.expectEqual(len_before, t.array.items.len); // shape unchanged
+    try testing.expectEqual(len_before, t.array.len); // shape unchanged
     j = 1;
     while (j <= 20) : (j += 1) {
         try testing.expectEqual(j * 7, t.get(Value.int(j * 1000)).asInt());
+    }
+}
+
+test "lane: the nsieve bool pattern packs into a boolean lane (hole at 1)" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    // `p[2..K] = true` — nsieve's sieve, all booleans, no p[1].
+    const K: i64 = 80;
+    var i: i64 = 2;
+    while (i <= K) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    // After rehash+repack the array part is a narrow boolean lane.
+    try testing.expectEqual(arr.Lane.boolean, t.array.lane);
+    try testing.expect(t.array.isLeaf()); // no heap pointers → GC can skip it
+
+    // Every value reads back; key 1 is a hole (nil), not `false`.
+    try testing.expect(t.get(Value.int(1)).isNil());
+    i = 2;
+    while (i <= K) : (i += 1) {
+        const v = t.get(Value.int(i));
+        try testing.expect(v.isBool());
+        try testing.expectEqual(true, v.asBool());
+    }
+    // `#t` is unchanged by the packing: the trailing-nil trim lands on the last
+    // contiguous non-nil slot, so the border is K regardless of the hole at 1.
+    try testing.expectEqual(K, t.length());
+}
+
+test "lane: a small-int run packs into a narrow int lane (16-bit example)" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    // Dense 2..N (hole at 1, so the first inserts route through the hash part and
+    // trip a rehash + repack — lane selection is rehash-only, never on the append
+    // fast path). Values stay within [-32768, 32767] so they fit an i16 lane the
+    // whole way (a value escaping the lane mid-append would widen to `.value`,
+    // since the append fast path never re-narrows). The array.zig unit tests cover
+    // i32 selection directly.
+    const N: i64 = 64;
+    var i: i64 = 2;
+    while (i <= N) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i * 100)); // max 6400
+
+    try testing.expectEqual(arr.Lane.i16, t.array.lane);
+    try testing.expect(t.array.isLeaf());
+    i = 2;
+    while (i <= N) : (i += 1) {
+        try testing.expectEqual(i * 100, t.get(Value.int(i)).asInt());
+    }
+    try testing.expect(t.get(Value.int(1)).isNil());
+    try testing.expectEqual(N, t.length());
+}
+
+test "lane: tiny-int run picks i8" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    // Dense run (hole at 1 to force a rehash), all values within [-128, 127].
+    const N: i64 = 40;
+    var i: i64 = 2;
+    while (i <= N) : (i += 1) try t.set(gpa, Value.int(i), Value.int(@mod(i, 100) - 50));
+
+    try testing.expectEqual(arr.Lane.i8, t.array.lane);
+    i = 2;
+    while (i <= N) : (i += 1) {
+        try testing.expectEqual(@mod(i, 100) - 50, t.get(Value.int(i)).asInt());
+    }
+}
+
+test "lane: an all-float run packs into the f64 lane" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    const N: i64 = 48;
+    var i: i64 = 2; // hole at 1 forces a rehash so the lane gets selected
+    while (i <= N) : (i += 1) try t.set(gpa, Value.int(i), Value.float(@as(f64, @floatFromInt(i)) + 0.5));
+
+    try testing.expectEqual(arr.Lane.f64, t.array.lane);
+    try testing.expect(t.array.isLeaf());
+    i = 2;
+    while (i <= N) : (i += 1) {
+        try testing.expectEqual(@as(f64, @floatFromInt(i)) + 0.5, t.get(Value.int(i)).asFloat());
+    }
+}
+
+test "lane: a heterogeneous/heap-bearing array stays in the value lane" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    // Build a dense run that rehashes, but mix value types — including a heap
+    // string — so no narrow lane can cover it.
+    const s = try @import("string.zig").String.create(gpa, "hello");
+    defer s.destroy(gpa);
+
+    const N: i64 = 40;
+    var i: i64 = 1;
+    while (i <= N) : (i += 1) {
+        const v: Value = if (i == 5)
+            Value.heap(&s.header)
+        else if (@mod(i, 2) == 0)
+            Value.int(i)
+        else
+            Value.float(@as(f64, @floatFromInt(i)));
+        try t.set(gpa, Value.int(i), v);
+    }
+
+    try testing.expectEqual(arr.Lane.value, t.array.lane);
+    try testing.expect(!t.array.isLeaf()); // holds a heap pointer → must be marked
+
+    // Every value, including the heap string, reads back intact.
+    try testing.expectEqual(@as(i64, 4), t.get(Value.int(4)).asInt());
+    try testing.expect(t.get(Value.int(5)).isHeap());
+    try testing.expectEqual(@as(f64, 3.0), t.get(Value.int(3)).asFloat());
+}
+
+test "lane: value identity is preserved across a widening store" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    // Pack into a narrow int lane first (hole at 1 forces the rehash).
+    const N: i64 = 40;
+    var i: i64 = 2;
+    while (i <= N) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i));
+    try testing.expect(t.array.lane != .value);
+
+    // Store a float into the int lane — out of lane → widens to .value in place.
+    try t.set(gpa, Value.int(10), Value.float(3.5));
+    try testing.expectEqual(arr.Lane.value, t.array.lane);
+
+    // All prior values survive the widening; the new one is present.
+    i = 2;
+    while (i <= N) : (i += 1) {
+        if (i == 10) {
+            try testing.expectEqual(@as(f64, 3.5), t.get(Value.int(i)).asFloat());
+        } else {
+            try testing.expectEqual(i, t.get(Value.int(i)).asInt());
+        }
     }
 }
