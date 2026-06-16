@@ -407,17 +407,19 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 bounds_ok[ins.a] = true;
                 kinds[i] = .none;
             },
-            // guard_present (bt the bitmap): only safe behind a dominating bounds
-            // check on the same aref (else `present` may be null / idx0 OOB).
+            // guard_present (bool: in-band byte ≠ 0; int/float: bt the presence
+            // bitmap): only safe behind a dominating bounds check on the same aref
+            // (else the data/presence load may be null / idx0 OOB).
             .guard_present => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
                 if (!bounds_ok[ins.a]) return false; // [I4] bounds must dominate
                 kinds[i] = .none;
             },
-            // aload decodes the bool-lane slot to a boolean (movzx of the value bit).
-            // Likewise gated on a dominating bounds check (the data load is indexed
-            // by idx0, which must be proven in range).
+            // aload decodes the slot to a boolean (bool lane: movzx the in-band byte
+            // then sub 1) or a sign-extended int (i8…i64). Likewise gated on a
+            // dominating bounds check (the data load is indexed by idx0, which must
+            // be proven in range).
             .aload => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
@@ -1355,15 +1357,27 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.len);
                 try a.jcc(.ae, deopt_exit); // idx0 >=u len (covers negative/zero key too)
             },
-            // guard_present: the slot's presence bit must be set; a hole would read as
-            // nil, which the bool kind can't hold. `bt [present], idx0` → CF=bit.
+            // guard_present: the slot must hold a value; a hole would read as nil,
+            // which the int/bool kind can't hold. The hole test is lane-specific:
+            //   - boolean lane: presence is in-band — the data byte is 0 for an
+            //     absent slot, so `movzx rax, byte [data+idx0]; cmp; je` bails.
+            //   - int/float lanes: a separate presence bitmap — `bt [present], idx0`.
             .guard_present => {
                 const aref_ins = t.instrs[ins.a];
-                const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
-                try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.present);
-                const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                try a.btMemReg(.rax, 0, ireg);
-                try a.jcc(.ae, deopt_exit); // CF==0 → hole → side-exit
+                if (aref_ins.aux == BOOL_LANE) {
+                    const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                    try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
+                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.loadRegMemSib(.rax, .rax, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
+                    try a.cmpRegImm32(.rax, 0);
+                    try a.jcc(.e, deopt_exit); // byte==0 → hole → side-exit
+                } else {
+                    const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                    try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.present);
+                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.btMemReg(.rax, 0, ireg);
+                    try a.jcc(.ae, deopt_exit); // CF==0 → hole → side-exit
+                }
             },
             // aload: decode the packed slot the aref addresses into the aload's home.
             // Both lanes reach the table through `aref.a` (the invariant table home)
@@ -1375,13 +1389,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
                 const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
                 if (ins.aux == BOOL_LANE) {
-                    // bool lane: value bit = `bt [data], idx0`; materialize CF as a
-                    // clean 0/1 in `al` (reg 0 — always REX-safe), then movzx + home.
-                    // Going through al avoids `setcc` on a high-encoding dst
-                    // (sil/dil/bpl), which the encoder can't address.
-                    try a.btMemReg(.rax, 0, ireg);
-                    try a.setcc(.b, .rax);
-                    try a.movzxRegReg8(.rax, .rax);
+                    // bool lane: load the in-band byte (1=false, 2=true) and decode
+                    // to a clean 0/1 boolean with `byte - 1`. The dominating
+                    // guard_present already proved the byte is non-zero (a hole
+                    // would be 0), so the result is exactly 0 or 1.
+                    try a.loadRegMemSib(.rax, .rax, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
+                    try a.subRegImm32(.rax, 1); // 1→0 (false), 2→1 (true)
                 } else {
                     // int lane (i8…i64): sign-extend the width-byte element at
                     // `[data + idx0*w]` into a full 64-bit int. dst = rax = the same
@@ -1419,40 +1432,24 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 }
             },
             // --- lane-aware array write path (B3 bool / B4b int) -----------------
-            // astore: write the value into the slot the aref addresses, then set the
-            // presence bit at `[present], idx0` LAST (I5 — the commit point for an
-            // absent→present transition; for an already-present overwrite the value
-            // is the visible change and the store is idempotent under C1).
+            // astore: write the value into the slot the aref addresses.
             // `idx0` (from the aref) is shared with the dominating guard_bounds [I3].
             .astore => {
                 const aref_ins = t.instrs[ins.a];
                 if (ins.aux == BOOL_LANE) {
-                    // bool lane: rcx holds idx0 across the whole sequence; rax is the
-                    // reload scratch for the table-derived data/present pointers, so
-                    // the table base may be spilled. The value lives in `b` (a 0/1
-                    // boolean) — branch on it to pick `bts` (set) vs `btr` (clear),
-                    // since there is no "write CF to a dynamic memory bit" instruction.
+                    // bool lane: presence is in-band, so a single byte store commits
+                    // both value and presence atomically — `1=false, 2=true` (the
+                    // 0/1 value reg + 1). No separate presence write, no branch, one
+                    // cacheline (I5 holds trivially: the byte store IS the commit).
+                    // Fold idx0 into the address with `lea` (freeing the index reg),
+                    // exactly like the int path, so data-ptr + value fit in rax/rcx.
+                    const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                    try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
                     const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try placeToReg(a, .rax, placeOfRef(alloc, ins.b));
-                    try a.cmpRegImm32(.rax, 0);
-                    const clear_lbl = try a.label();
-                    const after_val_lbl = try a.label();
-                    try a.jcc(.e, clear_lbl); // value == 0 → clear the value bit
-                    {
-                        // set path: data ptr → rax, bts [data], idx0.
-                        const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
-                        try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
-                        try a.btsMemReg(.rax, 0, ireg);
-                        try a.jmp(after_val_lbl);
-                    }
-                    a.bind(clear_lbl);
-                    {
-                        // clear path: data ptr → rax, btr [data], idx0.
-                        const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
-                        try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
-                        try a.btrMemReg(.rax, 0, ireg);
-                    }
-                    a.bind(after_val_lbl);
+                    try a.leaRegMemSib(.rax, .rax, ireg, 1, 0); // rax = &data[idx0]
+                    try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // value 0/1 → rcx
+                    try a.incReg(.rcx); // 0→1 (false), 1→2 (true)
+                    try a.storeMemReg(.rax, 1, 0, .rcx); // mov byte [rax], cl
                 } else {
                     // int lane (i8…i64): write the low `w` bytes of the value at
                     // `[data + idx0*w]`. guard_fits already proved the value fits the
@@ -1468,14 +1465,17 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     try a.leaRegMemSib(.rax, .rax, ireg, w, 0); // rax = &data[idx0]
                     try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
                     try a.storeMemReg(.rax, w, 0, .rcx); // [rax] = (lane-width) value
+
+                    // presence bit LAST: present ptr → rax, bts [present], idx0. [I5]
+                    // the commit point for an absent→present transition. Storing a
+                    // non-nil value always marks the slot present (recArraySet refuses
+                    // nil / out-of-lane stores, so this never *clears* presence). The
+                    // bool lane skips this — its byte store already carries presence.
+                    const pbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                    try a.movRegMem(.rax, pbreg, ArrLayout.array_base + ArrLayout.present);
+                    const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.btsMemReg(.rax, 0, pireg);
                 }
-                // presence bit LAST: present ptr → rax, bts [present], idx0. Storing a
-                // non-nil value always marks the slot present (recArraySet refuses nil
-                // / out-of-lane stores, so this never needs to *clear* presence).
-                const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
-                try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.present);
-                const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                try a.btsMemReg(.rax, 0, ireg);
             },
             .guard_true => switch (kinds[ins.a]) {
                 .int => {}, // every int is truthy → guard always passes (no-op)

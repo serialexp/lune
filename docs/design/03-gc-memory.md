@@ -50,9 +50,15 @@ ownership, write barriers, and trace rooting.
       (`src/array.zig`, `src/table.zig`, `src/gc.zig`). A table's dense array run
       (keys `1..n`) is stored in the narrowest **lane** its contents fit: `.value`
       (today's 16 B tagged `Value`, `nil` in-band — the heterogeneous/heap-bearing
-      fallback) or a narrow lane (`boolean` ≈ 2 bits/slot, `i8/i16/i32/i64`, `f64`)
-      of packed elements plus a 1-bit/slot **presence bitmap** (a narrow lane has
-      no bit pattern for a hole). The lane is committed **once**, at the first
+      fallback) or a narrow lane (`boolean` 1 byte/slot, `i8/i16/i32/i64`, `f64`)
+      of packed elements. The fixed-width int/float lanes carry a separate 1-bit/
+      slot **presence bitmap** (every int/float bit pattern is a valid value, so a
+      hole needs an out-of-band marker); the `boolean` lane encodes all three states
+      **in-band** in its byte (`0 = absent, 1 = false, 2 = true`) so a slot is a
+      single non-RMW `mov byte`/`movzx` — the byte is x86's smallest unit reachable
+      with one instruction, and sub-byte packing would force `bt`/`bts`/`btr`
+      read-modify-write ops across two cachelines (the prior 2-bit packing did, at
+      4× less memory but ~2× the per-write cost). The lane is committed **once**, at the first
       `rehash` that finds a homogeneous run (`ArrayPart.frozen`), and is thereafter
       **monotonic**: an out-of-lane store widens *up* the lattice
       (`boolean`/`i8`→`i16`→`i32`→`i64`→`value`, `f64`→`value`) via `widenFor`, and
@@ -61,8 +67,10 @@ ownership, write barriers, and trace rooting.
       could otherwise be milked for — each fresh table resets the rehash threshold,
       defeating the doubling amortisation (`bench/repack_adversarial.lua` "storm"
       mode: ~12.3 s pre-monotonic → 0.27 s after, at C=8/M=2000/K=2000, vs ~0.06 s
-      in stock LuaJIT). nsieve's all-boolean sieve drops from ~320 MB (16 B/slot)
-      to ~11 MB — *below* LuaJIT's 264 MB — with byte-identical output.
+      in stock LuaJIT). An all-boolean sieve of ~20 M slots
+      (`bench/sieve_int.lua 20000000`) drops from ~320 MB (16 B/slot) to ~51 MB
+      resident (1 byte/slot in-band + the int `primes` array) — *below* LuaJIT's
+      ~264 MB — with byte-identical output.
       **GC tie-in:** a narrow lane holds no heap pointers, so `blacken` skips the
       array-marking loop entirely (`ArrayPart.isLeaf()`); only the `.value` lane
       and the hash part are traced. The field layout is a frozen `@offsetOf`

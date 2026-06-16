@@ -367,14 +367,19 @@ OOB, holes, and the `.value`/`.f64` lanes all guard-bail to tier-1a.
 **IR (recorder → oracle → native), `IrInstr` stays 16 B via the aref-pairing trick:**
 - `aref` (`a`=table, `b`=index, `aux`=lane) → addressing token carrying `idx0 = k-1`.
   Loop-variant (never hoisted). New native `Kind.aref`.
-- `aload` (`a`=aref, `aux`=lane) → decode the slot to a `Value` (bool lane: `bt` the
-  value bit + `movzx`; int lanes i8/i16/i32/i64: `movsx`/`movsxd`/`mov` per width).
-- `astore` (`a`=aref, `b`=value, `aux`=lane) → encode the value (bool: `bts`/`btr`
-  the value bit; int: width-truncating `mov [data+idx0*w]`), then set the presence
-  bit **LAST** (I5 — the commit point for an absent→present transition).
+- `aload` (`a`=aref, `aux`=lane) → decode the slot to a `Value` (bool lane: `movzx`
+  the in-band byte + `sub 1` → 0/1; int lanes i8/i16/i32/i64: `movsx`/`movsxd`/`mov`
+  per width).
+- `astore` (`a`=aref, `b`=value, `aux`=lane) → encode the value. The **bool lane** is
+  byte-granular with presence in-band (`0=absent,1=false,2=true`): a single
+  `mov byte [data+idx0], value+1` carries value and presence together — one
+  non-RMW store, one cacheline, the atomic commit (I5 trivial). The **int lanes**
+  write a width-truncating `mov [data+idx0*w]` then set the presence bitmap bit
+  **LAST** (I5 — the commit point for an absent→present transition).
 - read/write guards: `guard_table` (slot is a `table`), `guard_lane` (array lane ==
   recorded lane — both hoisted to the prologue), `guard_bounds` (`idx0 <u len`),
-  `guard_present` (`bt` the presence bitmap; a hole would read as `nil`).
+  `guard_present` (a hole would read as `nil`: bool lane tests the in-band byte ≠ 0;
+  int/float lanes `bt` the presence bitmap).
 - `guard_fits` (`a`=value, `aux`=lane) — **the int-store soundness guard.** A value
   that no longer fits a narrow int lane would force tier-0 to WIDEN the array
   (allocate + relayout), which the native store cannot do mid-run. The recorder
@@ -402,17 +407,18 @@ OOB, holes, and the `.value`/`.f64` lanes all guard-bail to tier-1a.
 **B5 — nsieve end-to-end + measurement.** The array path compiles end-to-end: an
 integer-limit sieve (`bench/sieve_int.lua`) records both hot loops — the read
 (`if p[i]`) and the bool-lane write (`for k=i+i,m,i do p[k]=false end`) — and both
-`.compiled` to native x86-64 (272 + 238 bytes). Output is byte-identical to LuaJIT.
+`.compiled` to native x86-64 (243 + 247 bytes). Output is byte-identical to LuaJIT.
 
 | int-sieve, N=4 000 000, best-of-3 | time | vs tier-0 |
 |---|---|---|
-| tier-0 (bytecode interp) | 0.37 s | 1.0× |
-| tier-1a (IR interp) | 0.55 s | 0.67× |
-| **tier-1b (native, array path)** | **0.15 s** | **2.5×** |
-| LuaJIT | 0.04 s | 9.3× |
+| tier-0 (bytecode interp) | 0.36 s | 1.0× |
+| tier-1a (IR interp) | 0.55 s | 0.65× |
+| **tier-1b (native, array path)** | **0.13 s** | **2.8×** |
+| LuaJIT | 0.04 s | 9.0× |
 
-The native array path is **2.5× faster than tier-0 and 3.7× faster than tier-1a**,
-~3.75× off LuaJIT.
+The native array path is **2.8× faster than tier-0 and 4.2× faster than tier-1a**,
+~3.25× off LuaJIT. (The bool-lane write shed a branch and a second bit-op once the
+lane went byte-granular — see Phase C below — improving native 0.15 s → 0.13 s.)
 
 > **Caveat — canonical `bench/nsieve.lua` does NOT JIT its hot loop yet.** Its limit
 > `m = (2^(N-i))*10000` comes from a float `pow`, so the numeric-for loop variable and
@@ -422,6 +428,20 @@ The native array path is **2.5× faster than tier-0 and 3.7× faster than tier-1
 > Canonical nsieve still runs **byte-identical to LuaJIT under `--jit-native`** for
 > N∈{1,4,6,9,11} (it transparently executes on tier-1a). `bench/sieve_int.lua` is the
 > int-keyed variant that actually JITs, kept as the reproducible array-path benchmark.
+
+**Phase C — byte-granular bool lane.** The bool lane was originally bit-packed (1 value
+bit + a separate presence bitmap), so each `p[k]=false` lowered to a branch on the value
+plus `bts`/`btr [data],idx0` and a second `bts [present],idx0` — two `bt`-family
+read-modify-write ops on two cachelines. x86's smallest single-instruction unit is the
+byte, so sub-byte storage *forces* those RMW ops. Phase C made the bool lane one byte per
+slot with presence folded **in-band** (`0=absent, 1=false, 2=true`, see `03-gc-memory.md`):
+the store is a single `mov byte [data+idx0], value+1` (one cacheline, no RMW, atomic
+commit — no separate presence write), and the load a `movzx` + `sub 1`. `guard_present`
+tests the in-band byte ≠ 0 instead of `bt`-ing the bitmap. Cost: ~4× the bool-lane bytes
+(still ~5× under LuaJIT at 20 M slots), bought a measurable write-path speedup (0.15 →
+0.13 s) and a structurally simpler lane (no second allocation). Int/float lanes keep the
+presence bitmap — every int/float bit pattern is a valid value, so they can't fold
+absence in-band.
 
 ## Out of scope (named follow-ups)
 

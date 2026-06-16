@@ -21,16 +21,21 @@
 //!   each, `nil` represented **in-band** (a `nil`-tagged `Value`), no presence
 //!   bitmap. This is the correctness fallback: a fresh, heterogeneous, or
 //!   heap-bearing array lives here.
-//! - `.boolean` — `data` is a **value bitmap** (1 bit/slot: the boolean), plus a
-//!   separate **presence bitmap** (a narrow lane has no bit pattern for a hole).
-//!   ~2 bits/slot.
+//! - `.boolean` — `data` is **one byte per slot**, encoding all three states
+//!   in-band: `0 = absent (hole)`, `1 = false`, `2 = true`. No presence bitmap.
+//!   The byte is the smallest unit x86 can touch with a single non-RMW
+//!   instruction, so a store is one `mov byte` and a load one `movzx` (vs. the
+//!   `bt`/`bts`/`btr` read-modify-write a sub-byte bit-packing would force). ~1
+//!   byte/slot — 4× a 2-bit packing, still far under a 16 B `Value`.
 //! - `.i8/.i16/.i32/.i64` — `data` is packed integers at lane width; `present` is
-//!   the presence bitmap.
+//!   a separate 1-bit/slot presence bitmap (every int bit pattern is a valid
+//!   value, so a hole needs the out-of-band bit).
 //! - `.f64` — `data` is packed doubles; `present` is the presence bitmap.
 //!
-//! Every narrow lane carries the presence bitmap so a hole (`t[1]` unset while
-//! `t[2..]` are) round-trips as `nil`. `get`/`set` translate between the packed
-//! lane and a logical `Value`; the rest of the VM only ever sees `Value`s.
+//! Holes round-trip as `nil`: the `.value` and `.boolean` lanes encode absence
+//! in-band; the fixed-width int/float lanes carry the presence bitmap
+//! (`Lane.usesPresenceBitmap`). `get`/`set` translate between the packed lane and
+//! a logical `Value`; the rest of the VM only ever sees `Value`s.
 //!
 //! ### Determinism / phase-B contract
 //! The lane is a pure in-memory optimisation: it is **never** serialised. Keyframe
@@ -50,7 +55,7 @@ const Value = value.Value;
 pub const Lane = enum(u8) {
     /// Full 16-byte `Value`s, `nil` in-band. The fallback / heterogeneous case.
     value,
-    /// 1-bit booleans + a presence bitmap.
+    /// One byte per slot: `0 = absent, 1 = false, 2 = true` (presence in-band).
     boolean,
     i8,
     i16,
@@ -59,10 +64,23 @@ pub const Lane = enum(u8) {
     f64,
 
     /// True for every lane except `.value` — i.e. lanes that hold no heap
-    /// pointers (so the GC can skip marking the array part) and that need a
-    /// presence bitmap for holes.
+    /// pointers (so the GC can skip marking the array part and the native store
+    /// needs no write barrier).
     pub fn isNarrow(self: Lane) bool {
         return self != .value;
+    }
+
+    /// True for lanes that track holes with a *separate* 1-bit/slot presence
+    /// bitmap. The `.value` lane encodes `nil` in-band (a `nil`-tagged `Value`);
+    /// the `.boolean` lane likewise encodes absence in-band (its data byte is
+    /// `0 = absent, 1 = false, 2 = true`, so a single byte holds all three
+    /// states — no bitmap, one non-RMW store/load per slot). Only the fixed-width
+    /// `i8…f64` lanes, whose every bit pattern is a valid value, need the bitmap.
+    pub fn usesPresenceBitmap(self: Lane) bool {
+        return switch (self) {
+            .value, .boolean => false,
+            .i8, .i16, .i32, .i64, .f64 => true,
+        };
     }
 };
 
@@ -169,18 +187,22 @@ pub const ArrayPart = extern struct {
     pub fn resize(self: *ArrayPart, gpa: std.mem.Allocator, n: usize) std.mem.Allocator.Error!void {
         if (n > self.cap) try self.ensureCapacity(gpa, n);
         if (n > self.len) {
-            // New slots are holes: for narrow lanes the presence bits in
-            // `[len, n)` were already zeroed by the growth path; for `.value`
-            // write explicit `nil`s (no presence bitmap to lean on).
+            // New slots are holes. The int/float lanes lean on the presence
+            // bitmap (zeroed by the growth path); the boolean lane leans on its
+            // in-band data bytes (zeroed by `allocData`, and re-zeroed on shrink
+            // below) — both already read `[len, n)` as absent. Only `.value`, with
+            // no out-of-band hole marker, must write explicit `nil`s.
             if (self.lane == .value) {
                 var k = self.len;
                 while (k < n) : (k += 1) self.encode(k, Value.nil());
             }
         } else if (n < self.len and self.lane.isNarrow()) {
-            // Shrinking: clear presence for the dropped tail so a later regrow
-            // doesn't resurrect stale values as "present".
+            // Shrinking: punch the dropped tail back to holes so a later regrow
+            // doesn't resurrect stale values as "present". `encode(nil)` does the
+            // right thing per lane — clears the presence bit for the bitmap lanes,
+            // zeroes the in-band byte for the boolean lane.
             var k = n;
-            while (k < self.len) : (k += 1) self.clearPresent(k);
+            while (k < self.len) : (k += 1) self.encode(k, Value.nil());
         }
         self.len = n;
     }
@@ -260,7 +282,7 @@ pub const ArrayPart = extern struct {
     fn dataBytes(lane: Lane, cap: usize) usize {
         return switch (lane) {
             .value => cap * @sizeOf(Value),
-            .boolean => bitmapBytes(cap),
+            .boolean => cap, // one byte/slot (0=absent, 1=false, 2=true), in-band presence
             .i8 => cap,
             .i16 => cap * 2,
             .i32 => cap * 4,
@@ -339,12 +361,17 @@ pub const ArrayPart = extern struct {
     fn decode(self: *const ArrayPart, idx: usize) Value {
         switch (self.lane) {
             .value => return self.valueSlot(idx).*,
+            // Boolean: one in-band byte. 0 ⇒ absent (hole); 1 ⇒ false, 2 ⇒ true.
+            .boolean => {
+                const b = self.data.?[idx];
+                if (b == 0) return Value.nil();
+                return Value.boolean(b == 2);
+            },
             else => {
                 if (!self.isPresent(idx)) return Value.nil();
                 const d = self.data.?;
                 return switch (self.lane) {
-                    .value => unreachable,
-                    .boolean => Value.boolean(getBit(d, idx)),
+                    .value, .boolean => unreachable,
                     .i8 => Value.int(@as(i8, @bitCast(d[idx]))),
                     .i16 => Value.int(readInt(i16, d, idx)),
                     .i32 => Value.int(readInt(i32, d, idx)),
@@ -360,6 +387,11 @@ pub const ArrayPart = extern struct {
     fn encode(self: *ArrayPart, idx: usize, val: Value) void {
         switch (self.lane) {
             .value => self.valueSlot(idx).* = val,
+            // Boolean: one in-band byte. nil ⇒ 0 (hole); false ⇒ 1, true ⇒ 2
+            // (`1 + @intFromBool`). This single byte store carries both presence
+            // and value — the native astore's atomic commit point (no separate
+            // presence write).
+            .boolean => self.data.?[idx] = if (val.isNil()) 0 else 1 + @as(u8, @intFromBool(val.asBool())),
             else => {
                 if (val.isNil()) {
                     self.clearPresent(idx);
@@ -367,8 +399,7 @@ pub const ArrayPart = extern struct {
                 }
                 const d = self.data.?;
                 switch (self.lane) {
-                    .value => unreachable,
-                    .boolean => setBit(d, idx, val.asBool()),
+                    .value, .boolean => unreachable,
                     .i8 => d[idx] = @bitCast(@as(i8, @intCast(val.asInt()))),
                     .i16 => writeInt(i16, d, idx, @intCast(val.asInt())),
                     .i32 => writeInt(i32, d, idx, @intCast(val.asInt())),
@@ -399,6 +430,11 @@ pub const ArrayPart = extern struct {
         const nbytes = dataBytes(lane, cap);
         if (nbytes == 0) return null;
         const slice = try gpa.alignedAlloc(u8, std.mem.Alignment.of(Value), nbytes);
+        // The boolean lane encodes absence in-band (byte 0), so freshly allocated
+        // slots must read as holes — zero them, mirroring how `allocPresence`
+        // zeroes the bitmap that the int/float lanes lean on. Other lanes write
+        // every live slot before reading it, so they need no zeroing.
+        if (lane == .boolean) @memset(slice, 0);
         return slice.ptr;
     }
 
@@ -431,7 +467,7 @@ pub const ArrayPart = extern struct {
         errdefer if (new_data) |nd| gpa.free(nd[0..dataBytes(self.lane, new_cap)]);
 
         var new_present: ?[*]u8 = null;
-        if (self.lane.isNarrow()) new_present = try allocPresence(gpa, new_cap);
+        if (self.lane.usesPresenceBitmap()) new_present = try allocPresence(gpa, new_cap);
 
         // Both allocations succeeded — now it is safe to copy, free, and commit.
         if (self.data) |old| {
@@ -463,7 +499,7 @@ pub const ArrayPart = extern struct {
 
         const new_data = try allocData(gpa, target, cap);
         errdefer if (new_data) |nd| gpa.free(nd[0..dataBytes(target, cap)]);
-        const new_present: ?[*]u8 = if (target.isNarrow()) try allocPresence(gpa, cap) else null;
+        const new_present: ?[*]u8 = if (target.usesPresenceBitmap()) try allocPresence(gpa, cap) else null;
 
         // Build a temporary view of the destination to encode into, then commit.
         // `frozen` carries through unchanged: a monotonic widen on the store path
@@ -542,7 +578,7 @@ test "value lane: round-trips every value kind incl. nil holes" {
     try testing.expectEqual(true, a.get(4).asBool());
 }
 
-test "boolean lane: repack packs true/false/hole at ~2 bits/slot" {
+test "boolean lane: repack packs true/false/hole at one byte/slot, presence in-band" {
     const gpa = testing.allocator;
     var a: ArrayPart = .empty;
     defer a.deinit(gpa);
@@ -554,6 +590,13 @@ test "boolean lane: repack packs true/false/hole at ~2 bits/slot" {
 
     try a.repack(gpa, a.optimalLane());
     try testing.expectEqual(Lane.boolean, a.lane);
+
+    // Byte-granular, in-band presence: no separate presence bitmap, and the data
+    // payload is exactly one byte per slot (0=absent, 1=false, 2=true).
+    try testing.expect(a.present == null);
+    try testing.expect(!Lane.boolean.usesPresenceBitmap());
+    try testing.expectEqual(a.cap, ArrayPart.dataBytes(.boolean, a.cap));
+
     try testing.expect(a.get(1).isNil());
     i = 2;
     while (i <= 65) : (i += 1) {
