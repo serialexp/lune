@@ -64,6 +64,8 @@ pub const Reg = enum(u4) {
 /// Condition codes — the low nibble shared by `setcc` (0x90|cc) and the near
 /// `jcc` (0x0F 0x80|cc). Only the codes the trace compiler emits are listed.
 pub const Cond = enum(u8) {
+    b = 0x2, // CF=1            — unsigned <  (below)
+    ae = 0x3, // CF=0           — unsigned ≥  (above-or-equal / not-carry)
     e = 0x4, // ZF=1            — equal / zero
     ne = 0x5, // ZF=0           — not-equal / not-zero
     l = 0xC, // SF≠OF          — signed <
@@ -125,12 +127,20 @@ pub const Assembler = struct {
     /// `force` for 8-bit forms that must have REX to reach spl/bpl/sil/dil (we don't,
     /// but the parameter keeps the intent explicit).
     fn rex(self: *Assembler, w: bool, r: bool, x: bool, bb: bool) !void {
+        try self.rexF(w, r, x, bb, false);
+    }
+
+    /// `rex` with an explicit `force`: emit the prefix even when it would be the
+    /// bare 0x40. Needed by 8-bit stores (`88 /r`) whose source is `rsi/rdi/rbp/
+    /// rsp` — without a REX prefix those `reg` encodings mean `ah/ch/dh/bh`, so
+    /// REX must be present to select `sil/dil/bpl/spl`.
+    fn rexF(self: *Assembler, w: bool, r: bool, x: bool, bb: bool, force: bool) !void {
         const byte: u8 = 0x40 |
             (@as(u8, @intFromBool(w)) << 3) |
             (@as(u8, @intFromBool(r)) << 2) |
             (@as(u8, @intFromBool(x)) << 1) |
             @as(u8, @intFromBool(bb));
-        if (byte != 0x40) try self.b(byte);
+        if (force or byte != 0x40) try self.b(byte);
     }
 
     /// ModRM for a register-direct operand (mod = 11).
@@ -159,6 +169,43 @@ pub const Assembler = struct {
             // scale=00, index=100 (none), base=base_lo. REX.B already extends base.
             try self.b((0b00 << 6) | (0b100 << 3) | @as(u8, base_lo));
         }
+        switch (mod) {
+            0b00 => {},
+            0b01 => try self.b(@bitCast(@as(i8, @intCast(disp)))),
+            0b10 => try self.imm32(disp),
+            else => unreachable,
+        }
+    }
+
+    /// SIB scale bits (00/01/10/11) for an element width of 1/2/4/8 bytes.
+    fn sibScale(width: u8) u2 {
+        return switch (width) {
+            1 => 0b00,
+            2 => 0b01,
+            4 => 0b10,
+            8 => 0b11,
+            else => unreachable,
+        };
+    }
+
+    /// ModRM + SIB + displacement for a `[base + index*scale + disp]` operand
+    /// (the lane-aware packed-array element address). `reg` is the opcode's
+    /// register field. `scale` is the encoded SIB scale (use `sibScale`). The
+    /// index register must not be `rsp` — index field `0b100` is the SIB
+    /// "no-index" escape, so `rsp` cannot be an index (REX.X disambiguates r12).
+    fn modrmMemSib(self: *Assembler, reg: u3, base: Reg, index: Reg, scale: u2, disp: i32) !void {
+        std.debug.assert(index != .rsp);
+        const base_lo = base.lo();
+        // Same mod rule as `modrmMem`: base rbp/r13 (lo=5) at disp 0 collides with
+        // the SIB "no base, disp32" form, so force disp8.
+        const mod: u2 = if (disp == 0 and base_lo != 5)
+            0b00
+        else if (disp >= -128 and disp <= 127)
+            0b01
+        else
+            0b10;
+        try self.b((@as(u8, mod) << 6) | (@as(u8, reg) << 3) | 0b100); // rm=100 → SIB
+        try self.b((@as(u8, scale) << 6) | (@as(u8, index.lo()) << 3) | @as(u8, base_lo));
         switch (mod) {
             0b00 => {},
             0b01 => try self.b(@bitCast(@as(i8, @intCast(disp)))),
@@ -214,6 +261,105 @@ pub const Assembler = struct {
         try self.b(0x0F);
         try self.b(0xB6);
         try self.modrmReg(dst.lo(), src.lo());
+    }
+
+    // ---- lane-aware packed-array load / store (Phase B) -------------------------
+    //
+    // These reach a packed element at `[base + index*lane_width + disp]` (the SIB
+    // form) and decode/encode the narrow lane's width to/from a full 64-bit GP
+    // register. `lane_width` is the element byte width (1/2/4/8) and doubles as
+    // the SIB scale. Sub-byte (boolean) lanes use the `bt`/`bts`/`btr` bit ops
+    // below instead.
+
+    /// `mov/movsx/movzx/movsxd dst, <width> [base + index*width + disp]` —
+    /// load one packed element, extending `width` bytes to the full 64-bit `dst`.
+    /// `signed` selects sign- vs zero-extension (narrow int lanes are signed;
+    /// the f64/i64 8-byte path ignores it). Forms:
+    ///   1: REX.W 0F BE (movsx) / 0F B6 (movzx)
+    ///   2: REX.W 0F BF (movsx) / 0F B7 (movzx)
+    ///   4: REX.W 63 (movsxd, signed) / 8B with REX.W=0 (mov r32, zero-extends)
+    ///   8: REX.W 8B (mov r64)
+    pub fn loadRegMemSib(self: *Assembler, dst: Reg, base: Reg, index: Reg, lane_width: u8, signed: bool, disp: i32) !void {
+        switch (lane_width) {
+            1 => {
+                try self.rex(true, dst.hi(), index.hi(), base.hi());
+                try self.b(0x0F);
+                try self.b(if (signed) 0xBE else 0xB6);
+            },
+            2 => {
+                try self.rex(true, dst.hi(), index.hi(), base.hi());
+                try self.b(0x0F);
+                try self.b(if (signed) 0xBF else 0xB7);
+            },
+            4 => {
+                if (signed) {
+                    try self.rex(true, dst.hi(), index.hi(), base.hi());
+                    try self.b(0x63); // movsxd r64, r/m32
+                } else {
+                    try self.rex(false, dst.hi(), index.hi(), base.hi());
+                    try self.b(0x8B); // mov r32, r/m32 (zero-extends to r64)
+                }
+            },
+            8 => {
+                try self.rex(true, dst.hi(), index.hi(), base.hi());
+                try self.b(0x8B);
+            },
+            else => unreachable,
+        }
+        try self.modrmMemSib(dst.lo(), base, index, sibScale(lane_width), disp);
+    }
+
+    /// `mov <width> [base + index*width + disp], src` — store the low `width`
+    /// bytes of `src` into a packed element. Forms:
+    ///   1: 88 /r (REX forced when src ∈ rsi/rdi/rbp/rsp so it isn't ah/ch/dh/bh)
+    ///   2: 66 + 89 /r (16-bit operand-size prefix)
+    ///   4: 89 /r (REX.W=0)
+    ///   8: REX.W 89 /r
+    pub fn storeMemSibReg(self: *Assembler, base: Reg, index: Reg, lane_width: u8, disp: i32, src: Reg) !void {
+        switch (lane_width) {
+            1 => {
+                try self.rexF(false, src.hi(), index.hi(), base.hi(), src.lo() >= 4);
+                try self.b(0x88);
+            },
+            2 => {
+                try self.b(0x66);
+                try self.rex(false, src.hi(), index.hi(), base.hi());
+                try self.b(0x89);
+            },
+            4 => {
+                try self.rex(false, src.hi(), index.hi(), base.hi());
+                try self.b(0x89);
+            },
+            8 => {
+                try self.rex(true, src.hi(), index.hi(), base.hi());
+                try self.b(0x89);
+            },
+            else => unreachable,
+        }
+        try self.modrmMemSib(src.lo(), base, index, sibScale(lane_width), disp);
+    }
+
+    /// Bit-string op against memory with the bit index in a register:
+    /// `bt/bts/btr [base + disp], idx` — 0F A3 / 0F AB / 0F B3 /r, REX.W. The
+    /// `idx` register is a full 64-bit bit offset into the byte string at
+    /// `[base+disp]` (the CPU resolves byte = base + idx/8, bit = idx%8), so the
+    /// boolean lane's value/presence bitmaps index directly by slot with no
+    /// per-element address math. `bt` sets CF from the bit (read); `bts` sets it
+    /// to 1; `btr` clears it to 0.
+    fn btGroup(self: *Assembler, op2: u8, base: Reg, disp: i32, idx: Reg) !void {
+        try self.rex(true, idx.hi(), false, base.hi());
+        try self.b(0x0F);
+        try self.b(op2);
+        try self.modrmMem(idx.lo(), base, disp);
+    }
+    pub fn btMemReg(self: *Assembler, base: Reg, disp: i32, idx: Reg) !void {
+        try self.btGroup(0xA3, base, disp, idx);
+    }
+    pub fn btsMemReg(self: *Assembler, base: Reg, disp: i32, idx: Reg) !void {
+        try self.btGroup(0xAB, base, disp, idx);
+    }
+    pub fn btrMemReg(self: *Assembler, base: Reg, disp: i32, idx: Reg) !void {
+        try self.btGroup(0xB3, base, disp, idx);
     }
 
     // ---- integer ALU (reg, reg) -------------------------------------------------
@@ -532,6 +678,136 @@ test "enc: movzx reg, reg8" {
     try expectEnc(&.{ 0x48, 0x0F, 0xB6, 0xC0 }, struct { // movzx rax, al
         fn f(a: *Assembler) !void {
             try a.movzxRegReg8(.rax, .rax);
+        }
+    }.f);
+}
+
+test "enc: SIB load (movsx/movsxd/mov, scale 1/2/4/8)" {
+    // movsx rax, byte [rdi + rcx*1]   — REX.W 0F BE, SIB scale0 idx=rcx base=rdi
+    try expectEnc(&.{ 0x48, 0x0F, 0xBE, 0x04, 0x0F }, struct {
+        fn f(a: *Assembler) !void {
+            try a.loadRegMemSib(.rax, .rdi, .rcx, 1, true, 0);
+        }
+    }.f);
+    // movzx rax, byte [rdi + rcx*1]   — REX.W 0F B6
+    try expectEnc(&.{ 0x48, 0x0F, 0xB6, 0x04, 0x0F }, struct {
+        fn f(a: *Assembler) !void {
+            try a.loadRegMemSib(.rax, .rdi, .rcx, 1, false, 0);
+        }
+    }.f);
+    // movsx rax, word [rdi + rcx*2]   — REX.W 0F BF, scale1
+    try expectEnc(&.{ 0x48, 0x0F, 0xBF, 0x04, 0x4F }, struct {
+        fn f(a: *Assembler) !void {
+            try a.loadRegMemSib(.rax, .rdi, .rcx, 2, true, 0);
+        }
+    }.f);
+    // movsxd rax, dword [rdi + rcx*4] — REX.W 63, scale2
+    try expectEnc(&.{ 0x48, 0x63, 0x04, 0x8F }, struct {
+        fn f(a: *Assembler) !void {
+            try a.loadRegMemSib(.rax, .rdi, .rcx, 4, true, 0);
+        }
+    }.f);
+    // mov eax, dword [rdi + rcx*4]    — 8B with REX.W=0 (zero-extends); no REX byte
+    try expectEnc(&.{ 0x8B, 0x04, 0x8F }, struct {
+        fn f(a: *Assembler) !void {
+            try a.loadRegMemSib(.rax, .rdi, .rcx, 4, false, 0);
+        }
+    }.f);
+    // mov rax, qword [rdi + rcx*8]    — REX.W 8B, scale3
+    try expectEnc(&.{ 0x48, 0x8B, 0x04, 0xCF }, struct {
+        fn f(a: *Assembler) !void {
+            try a.loadRegMemSib(.rax, .rdi, .rcx, 8, false, 0);
+        }
+    }.f);
+    // mov rax, qword [rdi + rcx*8 + 16] — disp8 form
+    try expectEnc(&.{ 0x48, 0x8B, 0x44, 0xCF, 0x10 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.loadRegMemSib(.rax, .rdi, .rcx, 8, false, 16);
+        }
+    }.f);
+    // rbp base, disp 0 → forced disp8: mov rax, qword [rbp + rcx*8]
+    try expectEnc(&.{ 0x48, 0x8B, 0x44, 0xCD, 0x00 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.loadRegMemSib(.rax, .rbp, .rcx, 8, false, 0);
+        }
+    }.f);
+}
+
+test "enc: SIB store (byte/word/dword/qword)" {
+    // mov byte [rdi + rcx*1], al — 88 /r, src rax (lo0 <4) → no REX byte
+    try expectEnc(&.{ 0x88, 0x04, 0x0F }, struct {
+        fn f(a: *Assembler) !void {
+            try a.storeMemSibReg(.rdi, .rcx, 1, 0, .rax);
+        }
+    }.f);
+    // mov byte [rdi + rcx*1], sil — src rsi (lo6 ≥4) forces REX 0x40 → sil not dh
+    try expectEnc(&.{ 0x40, 0x88, 0x34, 0x0F }, struct {
+        fn f(a: *Assembler) !void {
+            try a.storeMemSibReg(.rdi, .rcx, 1, 0, .rsi);
+        }
+    }.f);
+    // mov word [rdi + rcx*2], ax — 66 prefix + 89
+    try expectEnc(&.{ 0x66, 0x89, 0x04, 0x4F }, struct {
+        fn f(a: *Assembler) !void {
+            try a.storeMemSibReg(.rdi, .rcx, 2, 0, .rax);
+        }
+    }.f);
+    // mov dword [rdi + rcx*4], eax — 89 with REX.W=0; no REX byte
+    try expectEnc(&.{ 0x89, 0x04, 0x8F }, struct {
+        fn f(a: *Assembler) !void {
+            try a.storeMemSibReg(.rdi, .rcx, 4, 0, .rax);
+        }
+    }.f);
+    // mov qword [rdi + rcx*8], rax — REX.W 89
+    try expectEnc(&.{ 0x48, 0x89, 0x04, 0xCF }, struct {
+        fn f(a: *Assembler) !void {
+            try a.storeMemSibReg(.rdi, .rcx, 8, 0, .rax);
+        }
+    }.f);
+    // r8–r15 index/base: mov qword [r9 + r10*8], rax — REX.WXB
+    try expectEnc(&.{ 0x4B, 0x89, 0x04, 0xD1 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.storeMemSibReg(.r9, .r10, 8, 0, .rax);
+        }
+    }.f);
+}
+
+test "enc: bt / bts / btr [mem], reg" {
+    // bt [rdi], rcx — REX.W 0F A3, reg=rcx rm=rdi
+    try expectEnc(&.{ 0x48, 0x0F, 0xA3, 0x0F }, struct {
+        fn f(a: *Assembler) !void {
+            try a.btMemReg(.rdi, 0, .rcx);
+        }
+    }.f);
+    // bts [rdi], rcx — 0F AB
+    try expectEnc(&.{ 0x48, 0x0F, 0xAB, 0x0F }, struct {
+        fn f(a: *Assembler) !void {
+            try a.btsMemReg(.rdi, 0, .rcx);
+        }
+    }.f);
+    // btr [rdi], rcx — 0F B3
+    try expectEnc(&.{ 0x48, 0x0F, 0xB3, 0x0F }, struct {
+        fn f(a: *Assembler) !void {
+            try a.btrMemReg(.rdi, 0, .rcx);
+        }
+    }.f);
+    // bt [r8], r9 — REX.W + REX.R (r9 reg) + REX.B (r8 base)
+    try expectEnc(&.{ 0x4D, 0x0F, 0xA3, 0x08 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.btMemReg(.r8, 0, .r9);
+        }
+    }.f);
+}
+
+test "enc: setcc unsigned (b / ae)" {
+    try expectEnc(&.{ 0x0F, 0x92, 0xC0 }, struct { // setb al
+        fn f(a: *Assembler) !void {
+            try a.setcc(.b, .rax);
+        }
+    }.f);
+    try expectEnc(&.{ 0x0F, 0x93, 0xC0 }, struct { // setae al
+        fn f(a: *Assembler) !void {
+            try a.setcc(.ae, .rax);
         }
     }.f);
 }
