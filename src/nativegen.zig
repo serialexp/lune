@@ -379,6 +379,21 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (!bounds_ok[ins.a]) return false; // [I4] bounds must dominate
                 kinds[i] = .bool;
             },
+            // astore encodes a boolean into the bool-lane slot addressed by the
+            // aref (`a`); `b` is the value. Like aload, the data write is indexed by
+            // idx0, so it requires a dominating bounds check on the same aref [I1/P1]
+            // (else it could write out of bounds). C1 — that the stored value not
+            // depend on any prior `aload` — is enforced at record time (`recArraySet`
+            // aborts), so by here the value is a guarded slot input or constant; we
+            // only require it to be a representable bool. astore produces no value.
+            .astore => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (kinds[ins.a] != .aref) return false;
+                if (kinds[ins.b] != .bool) return false; // bool lane stores a boolean
+                if (ins.aux != BOOL_LANE) return false;
+                if (!bounds_ok[ins.a]) return false; // [I1/P1] bounds must dominate
+                kinds[i] = .none;
+            },
             .loop => {
                 if (i != n - 1) return false; // loop must be terminal
                 kinds[i] = .none;
@@ -509,8 +524,9 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
         .add, .sub, .mul, .band, .bor, .bxor, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
         .neg, .bnot, .guard_int, .guard_true, .guard_false => .{ .a = true, .b = false },
         // aref reads table (a, an invariant home) + index (b). aload/guards reach the
-        // table through aref.a, so they read only the aref token (a).
-        .aref => .{ .a = true, .b = true },
+        // table through aref.a, so they read only the aref token (a). astore reads
+        // the aref token (a) plus the value to write (b).
+        .aref, .astore => .{ .a = true, .b = true },
         .aload, .guard_bounds, .guard_present, .guard_table, .guard_lane => .{ .a = true, .b = false },
         else => .{ .a = false, .b = false },
     };
@@ -1287,6 +1303,50 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try a.setcc(.b, .rax);
                 try a.movzxRegReg8(.rax, .rax);
                 try regToPlace(a, placeOfRef(alloc, i), .rax);
+            },
+            // --- lane-aware array write path (B3, bool lane) ---------------------
+            // astore (bool lane): write the value bit at `[data], idx0`, then set the
+            // presence bit at `[present], idx0` LAST (I5 — the commit point for an
+            // absent→present transition; for an already-present overwrite the value
+            // bit is the visible change and the store is idempotent under C1).
+            // `idx0` (from the aref) is shared with the dominating guard_bounds [I3].
+            // rcx holds idx0 across the whole sequence; rax is the reload scratch for
+            // the table-derived data/present pointers, so the table base may be
+            // spilled. The value lives in `b` (a 0/1 boolean) — branch on it to pick
+            // `bts` (set) vs `btr` (clear), since there is no "write CF to a dynamic
+            // memory bit" instruction.
+            .astore => {
+                const aref_ins = t.instrs[ins.a];
+                // idx0 into a stable register (rcx scratch, or its home reg). It must
+                // survive the rax reloads below; rax-based pointer loads never touch it.
+                const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                // Decide set vs clear from the boolean value (0 = false → clear).
+                try placeToReg(a, .rax, placeOfRef(alloc, ins.b));
+                try a.cmpRegImm32(.rax, 0);
+                const clear_lbl = try a.label();
+                const after_val_lbl = try a.label();
+                try a.jcc(.e, clear_lbl); // value == 0 → clear the value bit
+                {
+                    // set path: data ptr → rax, bts [data], idx0.
+                    const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                    try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
+                    try a.btsMemReg(.rax, 0, ireg);
+                    try a.jmp(after_val_lbl);
+                }
+                a.bind(clear_lbl);
+                {
+                    // clear path: data ptr → rax, btr [data], idx0.
+                    const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                    try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
+                    try a.btrMemReg(.rax, 0, ireg);
+                }
+                a.bind(after_val_lbl);
+                // presence bit LAST: present ptr → rax, bts [present], idx0. Storing a
+                // non-nil value always marks the slot present (recArraySet refuses nil
+                // / out-of-lane stores, so this never needs to *clear* presence).
+                const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.present);
+                try a.btsMemReg(.rax, 0, ireg);
             },
             .guard_true => switch (kinds[ins.a]) {
                 .int => {}, // every int is truthy → guard always passes (no-op)
@@ -2294,4 +2354,129 @@ test "nativegen: guard_present/aload without a dominating guard_bounds bails" {
     var es = [_]u16{};
     const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
     try expectBail(&tr);
+}
+
+// --- B3 write-path helpers + tests -------------------------------------------
+
+/// Build nsieve's sieve shape: a bool-lane table with `p[2..K] = true` (key 1 a
+/// hole). Caller owns the returned table.
+fn buildBoolTable(gpa: std.mem.Allocator, K: i64) !*table.Table {
+    const t = try table.Table.create(gpa);
+    var i: i64 = 2;
+    while (i <= K) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+    std.debug.assert(t.array.lane == arr.Lane.boolean);
+    return t;
+}
+
+/// Assert two tables hold the same logical value at every dense key `1..len`.
+fn expectTablesEqual(ta: *table.Table, tb: *table.Table, len: i64) !void {
+    var k: i64 = 1;
+    while (k <= len) : (k += 1) {
+        const va = ta.getInt(k);
+        const vb = tb.getInt(k);
+        try testing.expectEqual(@intFromEnum(va.tag), @intFromEnum(vb.tag));
+        try testing.expectEqual(va.payload.bits, vb.payload.bits);
+    }
+}
+
+/// The shared write trace: `while (k in array) { t[k] = false; k += 1 }` over a
+/// bool lane. r0 = table (invariant .ptr), r1 = index (carried int). This is
+/// exactly nsieve's sieve-clearing inner loop — a pure write of a constant, so
+/// there is no `aload` and the C1 rule is trivially satisfied.
+fn boolWriteTrace(full: *[12]I, consts: *[2]Value, exits: *[1]S, es: *[0]u16) Trace {
+    const lane: i32 = @intFromEnum(arr.Lane.boolean);
+    consts.* = .{ Value.boolean(false), Value.int(1) };
+    full.* = .{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .konst, .aux = 0 }, // 7: false
+        .{ .op = .astore, .a = 5, .b = 7, .aux = lane }, // 8: t[index] = false
+        .{ .op = .konst, .aux = 1 }, // 9: 1
+        .{ .op = .add, .a = 3, .b = 9 }, // 10: index + 1
+        .{ .op = .loop }, // 11
+    };
+    exits.* = .{.{ .slot = 1, .ref = 10 }};
+    return Trace{ .anchor = undefined, .instrs = full, .consts = consts, .entry_slots = es, .exit_stores = exits };
+}
+
+test "nativegen: bool-lane t[k]=false write matches the interpreter (heap + regs)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const K: i64 = 48;
+    var full: [12]I = undefined;
+    var consts: [2]Value = undefined;
+    var exits: [1]S = undefined;
+    var es: [0]u16 = undefined;
+    const tr = boolWriteTrace(&full, &consts, &exits, &es);
+
+    // Oracle (tier-1a) and native run on SEPARATE tables — the trace mutates the
+    // heap, so a shared table would double-apply. The final heaps must match.
+    const t_o = try buildBoolTable(gpa, K);
+    defer t_o.destroy(gpa);
+    var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
+    const ovals = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(ovals);
+    const ocomp = irinterp.execute(&tr, &oregs, ovals);
+
+    const t_n = try buildBoolTable(gpa, K);
+    defer t_n.destroy(gpa);
+    var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
+    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    const ncomp = ct.run(&nregs);
+
+    try testing.expectEqual(ocomp, ncomp);
+    // Only the carried index slot (r1) is comparable — r0 holds each run's distinct
+    // table pointer (an invariant slot, never flushed), so it differs by construction.
+    try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
+    try expectTablesEqual(t_o, t_n, K);
+    // Sanity: the sieve really was cleared (every present slot now reads false).
+    var k: i64 = 2;
+    while (k <= K) : (k += 1) try testing.expect(!t_n.getInt(k).asBool());
+}
+
+test "nativegen: astore deopt-replay leaves a deterministic heap (idempotent re-run)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // The real C1 oracle: not native-vs-tier1a (they leave the SAME partial heap on
+    // a side-exit, so that comparison can't catch a double-apply), but heap
+    // determinism under replay. Model a native run whose iteration is later
+    // re-executed by tier-0 against the already-mutated heap: apply the native
+    // trace, then apply the oracle trace AGAIN from the same start, on the SAME
+    // table. The result must equal a single clean run on a DISTINCT table object.
+    const gpa = testing.allocator;
+    const K: i64 = 40;
+    var full: [12]I = undefined;
+    var consts: [2]Value = undefined;
+    var exits: [1]S = undefined;
+    var es: [0]u16 = undefined;
+    const tr = boolWriteTrace(&full, &consts, &exits, &es);
+
+    // t_replay: native pass, then a full oracle re-run over the same heap.
+    const t_replay = try buildBoolTable(gpa, K);
+    defer t_replay.destroy(gpa);
+    var r_native = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
+    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    _ = ct.run(&r_native);
+    var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
+    const vals = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(vals);
+    _ = irinterp.execute(&tr, &r_replay, vals);
+
+    // t_once: a single clean oracle pass on a fresh, unrelated table.
+    const t_once = try buildBoolTable(gpa, K);
+    defer t_once.destroy(gpa);
+    var r_once = [_]Value{ Value.heap(&t_once.header), Value.int(2) };
+    const vals2 = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(vals2);
+    _ = irinterp.execute(&tr, &r_once, vals2);
+
+    // Double-apply (native then tier-0 replay) == single-apply: the write is
+    // idempotent, so re-running an iteration after a deopt reproduces the heap.
+    try expectTablesEqual(t_replay, t_once, K);
 }

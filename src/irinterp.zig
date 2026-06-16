@@ -170,6 +170,20 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                     values[i] = tbl.getInt(values[ar.b].asInt());
                     if (record) rec.value(i, values[i]);
                 },
+                // `astore` — the FIRST mid-iteration heap mutation in the system
+                // (see docs/design/02-determinism.md). Encode `b` into the packed
+                // slot addressed by the `aref` in `a`. By the time we run, the
+                // store has been recorded only for an in-bounds (`guard_bounds`)
+                // in-lane (`guard_lane`) value, so the in-place encode neither
+                // grows nor widens nor allocates. `astore` produces no value; store
+                // nil so the SSA slot is defined but it is never read as a value.
+                .astore => {
+                    const ar = t.instrs[ins.a];
+                    const tbl = table.Table.fromHeader(values[ar.a].asHeap());
+                    tbl.array.setInLane(@intCast(values[ar.b].asInt()), values[ins.b]);
+                    values[i] = Value.nil();
+                    if (record) rec.value(i, values[i]);
+                },
                 // The slot holds a heap table.
                 .guard_table => if (values[ins.a].isHeap() and values[ins.a].heapType() == .table) {
                     if (record) rec.guardPass(i, values[ins.a]);

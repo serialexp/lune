@@ -143,6 +143,18 @@ pub const ArrayPart = extern struct {
         self.encode(i - 1, val);
     }
 
+    /// `t[i] = val` for `1 <= i <= len`, where `val` is **already known to fit**
+    /// the current lane (the caller has guarded it) — so no allocation, no widen,
+    /// no `gpa`. This is the JIT oracle's in-lane store (`astore`): the recorder
+    /// only emits an `astore` for an in-bounds, in-lane value, so `irinterp` can
+    /// reproduce the native store byte-for-byte without an allocator. Asserts the
+    /// fit so a recorder bug trips in debug rather than silently truncating.
+    pub fn setInLane(self: *ArrayPart, i: usize, val: Value) void {
+        std.debug.assert(i >= 1 and i <= self.len);
+        std.debug.assert(self.fits(val));
+        self.encode(i - 1, val);
+    }
+
     /// Append `val` as the new key `len+1`, growing the storage. Widens the lane
     /// monotonically (see `setInPlace`) if `val` does not fit the current lane.
     pub fn append(self: *ArrayPart, gpa: std.mem.Allocator, val: Value) std.mem.Allocator.Error!void {
@@ -266,8 +278,10 @@ pub const ArrayPart = extern struct {
     }
 
     /// Does `val` fit the current lane without widening? `nil` always fits (it is
-    /// a hole). For `.value` everything fits.
-    fn fits(self: *const ArrayPart, val: Value) bool {
+    /// a hole). For `.value` everything fits. Public so the JIT recorder can refuse
+    /// to record an out-of-lane `astore` (which would widen — a shape change the
+    /// native store ABI can't perform).
+    pub fn fits(self: *const ArrayPart, val: Value) bool {
         if (self.lane == .value or val.isNil()) return true;
         return switch (self.lane) {
             .value => true,

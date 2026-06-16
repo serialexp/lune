@@ -58,7 +58,7 @@ pub const Optimized = struct {
     exit_stores: []SlotStore,
 };
 
-const OpKind = enum { konst, slot_load, binary, unary, guard, aref, aload, loop };
+const OpKind = enum { konst, slot_load, binary, unary, guard, aref, aload, astore, loop };
 
 fn kindOf(op: IrOp) OpKind {
     return switch (op) {
@@ -75,6 +75,7 @@ fn kindOf(op: IrOp) OpKind {
         // reordered past them. DCE'd if not reachable from a live root.
         .aref => .aref,
         .aload => .aload,
+        .astore => .astore,
         .loop => .loop,
     };
 }
@@ -208,9 +209,13 @@ pub fn optimize(
                     dead[i] = true; // exact-duplicate guard, earlier copy dominates
                 } else try guards.put(gpa, gk, {});
             },
-            // Memory ops are left verbatim: canonical to themselves, no fold/CSE
-            // (so a future `astore` cannot be reordered across an `aload`).
-            .aref, .aload => {},
+            // Memory ops are left verbatim: canonical to themselves, no fold/CSE.
+            // `aload` is never CSE'd (each is its own canonical ref), so an
+            // `astore` between two reads of the same slot cannot let the later
+            // read reuse the earlier (pre-store) value — the alias-barrier
+            // property holds for free. `astore` is effectful: never folded, never
+            // CSE'd, kept as a root by the liveness pass below (I1).
+            .aref, .aload, .astore => {},
             .loop => {},
         }
     }
@@ -224,7 +229,10 @@ pub fn optimize(
     @memset(live, false);
     live[n - 1] = true; // loop
     for (instrs, 0..) |ins, i| {
-        if (kindOf(ins.op) == .guard and !dead[i]) live[i] = true;
+        const k = kindOf(ins.op);
+        // Kept guards and every `astore` are side-effecting roots (I1: an
+        // `astore` and its feeding `aref` must never be DCE'd).
+        if ((k == .guard and !dead[i]) or k == .astore) live[i] = true;
     }
     for (exit) |st| live[canon[st.ref]] = true;
     {
@@ -242,7 +250,9 @@ pub fn optimize(
                     live[canon[ins.b]] = true;
                 },
                 .unary, .guard, .aload => live[canon[ins.a]] = true,
-                .aref => {
+                // `aref` (table+index) and `astore` (aref+value) both keep two
+                // operands alive.
+                .aref, .astore => {
                     live[canon[ins.a]] = true;
                     live[canon[ins.b]] = true;
                 },
@@ -274,7 +284,7 @@ pub fn optimize(
                 out.b = new_index[canon[ins.b]];
             },
             .unary, .guard, .aload => out.a = new_index[canon[ins.a]],
-            .aref => {
+            .aref, .astore => {
                 out.a = new_index[canon[ins.a]];
                 out.b = new_index[canon[ins.b]];
             },

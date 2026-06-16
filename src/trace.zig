@@ -113,6 +113,13 @@ pub const IrOp = enum(u8) {
     aref,
     /// `a`=`aref` ref → decode the packed slot to a `Value` (int/boolean per lane).
     aload,
+    /// `a`=`aref` ref, `b`=value ref → encode `b` into the packed slot (the FIRST
+    /// mid-iteration heap mutation; see `02-determinism.md`). Effectful: never DCE'd
+    /// and a CSE/alias barrier for later `aload`s. The recorder only emits it when
+    /// the store is in-lane + in-bounds and its value does NOT depend on any prior
+    /// `aload` (C1 deopt-replay idempotence), so re-running the iteration on a
+    /// side-exit reproduces the same heap.
+    astore,
 
     // ---- array-access guards (check via the referenced node; side-exit on miss) ----
     /// `a`=table value ref → the value is a heap table.
@@ -569,8 +576,9 @@ pub const TraceState = struct {
                 .neg, .not, .bnot, .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => {
                     std.debug.assert(ins.a < i);
                 },
-                // `aref` pairs (table, index) into an address descriptor.
-                .aref => std.debug.assert(ins.a < i and ins.b < i),
+                // `aref` pairs (table, index) into an address descriptor;
+                // `astore` reads the `aref` (`a`) and the value to write (`b`).
+                .aref, .astore => std.debug.assert(ins.a < i and ins.b < i),
                 // `aload` and the array-access guards read one prior node
                 // (the table value, or the `aref`).
                 .aload, .guard_table, .guard_lane, .guard_bounds, .guard_present => {
@@ -650,6 +658,12 @@ pub const TraceState = struct {
             // lane-aware packed-array read (Phase B): `t[k]` for an in-bounds
             // dense narrow-lane slot compiles; everything else aborts cleanly.
             .get_index => try self.recArrayGet(instr, regs),
+
+            // lane-aware packed-array write (Phase B): `t[k]=v` for an in-bounds
+            // in-lane dense slot whose stored value does not depend on any prior
+            // packed-array read (the conservative C1 deopt-replay rule). Everything
+            // else aborts cleanly.
+            .set_index => try self.recArraySet(instr, regs),
 
             // tables, globals, upvalues, closures, concat, for_prep, len, …:
             // each pulls in heap-effect / cross-frame / invalidation machinery
@@ -826,6 +840,85 @@ pub const TraceState = struct {
         _ = try self.emit(.{ .op = .guard_present, .a = ref });
         const rload = try self.emit(.{ .op = .aload, .a = ref, .aux = lane_ord, .ty = obsTypeOf(loaded) });
         self.setReg(instr.a, rload);
+    }
+
+    /// Record `t[k]=v` (`set_index`, `a=table b=key c=value`) as a lane-aware
+    /// packed-array write. Emits, in order: `guard_table` + `guard_lane` on the
+    /// table ref, `guard_int` on the key, then `aref` + `guard_bounds` + `astore`
+    /// — the FIRST mid-iteration heap mutation in the system. Aborts (leaving
+    /// tier-0 untouched) unless the store is a *present, in-bounds, in-lane*
+    /// slot whose value is deopt-replay-safe:
+    ///   * non-table container or non-int key → `.bad_type` (hash-part / metatable
+    ///     territory, out of scope);
+    ///   * `.value`-lane array → `.nyi_opcode` (unpacked 16-B path is deferred —
+    ///     and a heap value would need a write barrier the native ABI lacks);
+    ///   * out-of-bounds (`k>len` would *grow*, `k<1` is the hash part) → `.bad_type`;
+    ///   * `nil` value → `.bad_type` (a hole-punch / delete, not a normal store; B3
+    ///     models presence-creating writes only — keeps `astore creates presence`);
+    ///   * out-of-lane value (a value the current narrow lane can't hold would
+    ///     *widen* — a shape change / allocation the native store can't do) →
+    ///     `.bad_type`;
+    ///   * **C1 (deopt-replay idempotence):** *any* packed-array read (`aload`)
+    ///     recorded earlier in this trace → `.bad_type`. On a side-exit, tier-0
+    ///     re-runs the aborted iteration against the *already-mutated* heap, so a
+    ///     write whose value — OR whose very occurrence (control flow) — was decided
+    ///     by a read could double-apply. A *data*-only check is unsound: a guard on a
+    ///     read picks the branch, so `if t[i] then t[i]=false else t[i]=true end`
+    ///     stores a constant yet replays differently. In a straight-line trace every
+    ///     prior guard dominates this store, and every read-derived decision flows
+    ///     through a guard, so "no earlier `aload` at all" covers both the data and
+    ///     control channels with one obviously-sound rule. nsieve's sieve-clearing
+    ///     loop is a pure write of `false` (no `aload`), so the rule costs it nothing.
+    fn recArraySet(self: *TraceState, instr: Instr, regs: []const Value) !void {
+        const vtab = regs[instr.a];
+        const vkey = regs[instr.b];
+        const vval = regs[instr.c];
+        if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
+        if (!vkey.isInt()) return self.abort(.bad_type);
+        if (vval.isNil()) return self.abort(.bad_type); // hole-punch — out of scope
+        const tbl = table_mod.Table.fromHeader(vtab.asHeap());
+        const lane = tbl.array.lane;
+        if (lane == .value) return self.abort(.nyi_opcode); // unpacked path deferred
+        const idx = vkey.asInt();
+        if (idx < 1 or idx > @as(i64, @intCast(tbl.array.len))) return self.abort(.bad_type);
+        // The value must fit the current lane unchanged — an out-of-lane store
+        // would widen the array (shape change / allocation) which the native ABI
+        // cannot perform; the prologue `guard_lane` then stays sufficient.
+        if (!tbl.array.fits(vval)) return self.abort(.bad_type);
+
+        // C1: refuse to record a write into a trace that has already read the packed
+        // array — the read could have steered this write's value or its control flow,
+        // and deopt-replay against the mutated heap would then diverge.
+        if (self.traceHasArrayLoad()) return self.abort(.bad_type);
+        const rval = try self.refOf(instr.c);
+
+        const lane_ord: i32 = @intFromEnum(lane);
+        const rtab = try self.refOf(instr.a);
+        _ = try self.emit(.{ .op = .guard_table, .a = rtab });
+        _ = try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord });
+        const rkey = try self.refOf(instr.b);
+        try self.guardInt(rkey);
+        const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
+        _ = try self.emit(.{ .op = .guard_bounds, .a = ref });
+        // No `guard_present`: `astore` *creates* presence (the slot is in-bounds by
+        // `guard_bounds`; storing a non-nil value sets the presence bit). The store
+        // is effectful and not register-defining, so nothing is `setReg`'d.
+        _ = try self.emit(.{ .op = .astore, .a = ref, .b = rval, .aux = lane_ord });
+    }
+
+    /// C1 support: has *any* `aload` (packed-array read) been recorded so far in this
+    /// trace? Used by `recArraySet` to refuse a write that follows a read. This is
+    /// the conservative-sound C1 rule: in a straight-line trace any earlier read can
+    /// influence a later write through its value (data) or through a guard that
+    /// selected the path (control), and a side-exit replays the iteration against the
+    /// already-mutated heap. Rejecting on the mere presence of an earlier read covers
+    /// both channels without per-value taint reasoning. nsieve's write loop has no
+    /// `aload`, so it is unaffected.
+    fn traceHasArrayLoad(self: *const TraceState) bool {
+        for (self.rec.instrs.items) |ins| {
+            if (ins.op == .aload) return true;
+        }
+        return false;
     }
 
     /// `eq`/`ne`. First cut: numeric operands only (the common loop-condition
@@ -1229,4 +1322,142 @@ test "recArrayGet aborts on a .value-lane (unpacked) array — deferred scope cu
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.nyi_opcode, state.rec.abort_reason.?);
+}
+
+test "recArraySet: t[k]=false on a bool lane records the full guarded write sequence" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 2;
+    while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+    try testing.expectEqual(arr.Lane.boolean, t.array.lane);
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // r1 = table, r2 = key (3), r0 = value (false); `set_index a=1 b=2 c=0` → t[3]=false.
+    var regs = [_]Value{ Value.boolean(false), Value.heap(&t.header), Value.int(3) };
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), &regs, &proto, 0);
+
+    try testing.expect(state.isRecording()); // clean record — no abort
+    const ops = state.rec.instrs.items;
+    // value resolved first (for the C1 taint scan): slot_load(value), then
+    // slot_load(table), guard_table, guard_lane, slot_load(key), guard_int, aref,
+    // guard_bounds, astore. No guard_present — astore creates presence.
+    try testing.expectEqual(@as(usize, 9), ops.len);
+    try testing.expectEqual(IrOp.slot_load, ops[0].op); // value (r0)
+    try testing.expectEqual(IrOp.slot_load, ops[1].op); // table (r1)
+    try testing.expectEqual(IrOp.guard_table, ops[2].op);
+    try testing.expectEqual(IrOp.guard_lane, ops[3].op);
+    try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[3].aux);
+    try testing.expectEqual(IrOp.slot_load, ops[4].op); // key (r2)
+    try testing.expectEqual(IrOp.guard_int, ops[5].op);
+    try testing.expectEqual(IrOp.aref, ops[6].op);
+    try testing.expectEqual(@as(Ref, 1), ops[6].a); // table ref
+    try testing.expectEqual(@as(Ref, 4), ops[6].b); // key ref
+    try testing.expectEqual(IrOp.guard_bounds, ops[7].op);
+    try testing.expectEqual(@as(Ref, 6), ops[7].a); // guards the aref
+    try testing.expectEqual(IrOp.astore, ops[8].op);
+    try testing.expectEqual(@as(Ref, 6), ops[8].a); // stores through the aref
+    try testing.expectEqual(@as(Ref, 0), ops[8].b); // value = the false slot_load
+    try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[8].aux);
+}
+
+test "recArraySet aborts: non-table, non-int key, OOB, out-of-lane value, .value lane" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 2;
+    while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+    try testing.expectEqual(arr.Lane.boolean, t.array.lane);
+
+    // A separate .value-lane table (small, never rehashed to a narrow lane).
+    const tv = try table_mod.Table.create(gpa);
+    defer tv.destroy(gpa);
+    try tv.set(gpa, Value.int(1), Value.int(10));
+    try testing.expectEqual(arr.Lane.value, tv.array.lane);
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    const Case = struct { tab: Value, key: Value, val: Value, why: AbortReason };
+    const cases = [_]Case{
+        // not a table container.
+        .{ .tab = Value.int(7), .key = Value.int(3), .val = Value.boolean(false), .why = .bad_type },
+        // non-int key (hash-part territory).
+        .{ .tab = Value.heap(&t.header), .key = Value.boolean(true), .val = Value.boolean(false), .why = .bad_type },
+        // out of bounds (k > len would grow the array).
+        .{ .tab = Value.heap(&t.header), .key = Value.int(9999), .val = Value.boolean(false), .why = .bad_type },
+        // out-of-lane value (an int into a bool lane would widen → shape change).
+        .{ .tab = Value.heap(&t.header), .key = Value.int(3), .val = Value.int(5), .why = .bad_type },
+        // nil value — a hole-punch / delete, out of B3 scope.
+        .{ .tab = Value.heap(&t.header), .key = Value.int(3), .val = Value.nil(), .why = .bad_type },
+        // .value-lane array — deferred scope cut.
+        .{ .tab = Value.heap(&tv.header), .key = Value.int(1), .val = Value.int(20), .why = .nyi_opcode },
+    };
+    for (cases) |c| {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ c.val, c.tab, c.key };
+        state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), &regs, &proto, 0);
+        try testing.expect(!state.isRecording());
+        try testing.expectEqual(c.why, state.rec.abort_reason.?);
+    }
+}
+
+test "recArraySet aborts (C1): a store whose value derives from a packed read" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 2;
+    while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+    try testing.expectEqual(arr.Lane.boolean, t.array.lane);
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // r1 = table, r2 = key. First: r0 = t[r2] (a packed read → aload). The recorder's
+    // get_index executes against the live table; r0 then logically holds t[3] = true.
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.nil() };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+    try testing.expect(state.isRecording()); // the read records cleanly
+
+    // Now t[k] = (the value just read). Its value ref is the aload result → C1 must
+    // abort the whole trace (over-conservative: any aload-derived store value).
+    regs[0] = Value.boolean(true); // r0 = t[3], a boolean
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), &regs, &proto, 0);
+    try testing.expect(!state.isRecording());
+    try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
+}
+
+test "recArraySet aborts (C1 control channel): a const store after any packed read" {
+    // The data-only C1 rule was unsound: a guard on a read selects the branch, so a
+    // store of a *constant* can still replay differently after a deopt (e.g.
+    // `if t[i] then t[i]=false else t[i]=true end`). The fix rejects a write whenever
+    // ANY earlier aload exists — even when the stored value is a fresh constant with
+    // no data dependence on the read.
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 2;
+    while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // r1 = table, r2 = key. r0 = t[r2] (a packed read).
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.boolean(false) };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+    try testing.expect(state.isRecording());
+    // Branch on the read (a guard), then store a *constant* false (r3) — no data
+    // dependence on the read, but the read still dominates the store via control.
+    state.recordInstr(Instr.opABC(.jmp_if_true, 0, 0, 0), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), &regs, &proto, 0);
+    try testing.expect(!state.isRecording());
+    try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
 }
