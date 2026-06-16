@@ -14,14 +14,14 @@ test("loadBytes populates the store and auto-selects the first trace", () => {
   loadBytes("counting-loop.lunetrace", bytes);
   expect(state.error).toBeNull();
   expect(state.fileName).toBe("counting-loop.lunetrace");
-  expect(state.version).toBe(1);
+  expect(state.version).toBe(2); // v2: loop-carry moved into the instr stream as φ nodes
   expect(state.traces.length).toBe(1);
   expect(state.selected).toBe(0);
 
   const t = selectedTrace();
   expect(t).not.toBeNull();
   expect(t!.anchorPc).toBe(5);
-  expect(t!.instrs.length).toBe(18);
+  expect(t!.instrs.length).toBe(21);
 });
 
 test("loadBytes on garbage records an error, not a crash", () => {

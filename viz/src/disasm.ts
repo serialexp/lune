@@ -38,14 +38,22 @@ export interface TraceView {
   entrySlots: number[];
   instrs: InstrRow[];
   consts: ConstRow[];
-  /** Loop-carried writebacks `rSlot<-%ref`. */
-  exitStores: { slot: number; ref: number }[];
 }
+
+/** Sentinel `phi.aux` for an internal (slot-less) φ — mirrors `trace.PHI_INTERNAL`. */
+const PHI_INTERNAL = -1;
 
 /** Render one instruction's operand column, exactly as `writeIrInstr` does. */
 function operandsOf(opName: string, a: number, b: number, aux: number): string {
   if (opName === "slot_load") return `r${aux}`;
   if (opName === "konst") return `k${aux}`;
+  // φ: slot-bound prints `update=%b -> r{slot}`; internal prints
+  // `init=%a update=%b -> internal` (the loop-carried writeback rides the stream).
+  if (opName === "phi") {
+    return aux === PHI_INTERNAL
+      ? `init=%${a} update=%${b} -> internal`
+      : `update=%${b} -> r${aux}`;
+  }
   if (NO_OPERAND_OPS.has(opName as never)) return "";
   if (UNARY_OR_GUARD_OPS.has(opName as never)) return `%${a}`;
   return `%${a}  %${b}`;
@@ -109,7 +117,6 @@ export function traceToView(t: TraceOutput): TraceView {
     entrySlots: t.entry_slots,
     instrs,
     consts,
-    exitStores: t.exit_stores.map((s) => ({ slot: s.slot, ref: s.ref })),
   };
 }
 
@@ -120,7 +127,8 @@ export function viewsOf(file: TraceFileOutput): TraceView[] {
 /**
  * Reproduce `lune --dump-traces` body text for one trace (header uses the proto
  * *id*, since the artifact has no proto name). Columns match `writeTrace`:
- * `  %NNN  <op padded to 13><operands>` and `  exit: rS<-%R …`.
+ * `  %NNN  <op padded to 13><operands>`. Loop-carried writebacks now ride the
+ * instruction stream as slot-bound `phi` rows (no separate `exit:` line).
  */
 export function traceToText(t: TraceOutput): string {
   const v = traceToView(t);
@@ -128,9 +136,6 @@ export function traceToText(t: TraceOutput): string {
   lines.push(`trace ${v.anchorProtoId}:${v.anchorPc}  entry=[${v.entrySlots.map((s) => `r${s}`).join(" ")}]`);
   for (const row of v.instrs) {
     lines.push(`  %${row.index}  ${row.op.padEnd(13)}${row.operands}`);
-  }
-  if (v.exitStores.length > 0) {
-    lines.push("  exit:" + v.exitStores.map((s) => ` r${s.slot}<-%${s.ref}`).join(""));
   }
   return lines.join("\n") + "\n";
 }

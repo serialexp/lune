@@ -226,21 +226,6 @@ export default function TraceView() {
               </table>
             </div>
           </Show>
-
-          <Show when={t().exitStores.length > 0}>
-            <div class="subsection">
-              <div class="pane-title">exit stores</div>
-              <div class="exits">
-                <For each={t().exitStores}>
-                  {(s) => (
-                    <span class="exit">
-                      r{s.slot}&lt;-%{s.ref}
-                    </span>
-                  )}
-                </For>
-              </div>
-            </div>
-          </Show>
         </section>
       )}
     </Show>

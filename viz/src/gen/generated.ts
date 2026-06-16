@@ -625,80 +625,6 @@ export class IrInstrDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A loop-carried writeback: tier-0 register `slot` <- IR value `ref` at the back-edge.
- */
-export interface SlotStoreInput {
-  /**
-   * 16-bit Unsigned Integer
-   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
-   */
-  slot: number;
-  /**
-   * 16-bit Unsigned Integer
-   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
-   */
-  ref: number;
-}
-
-/**
- * A loop-carried writeback: tier-0 register `slot` <- IR value `ref` at the back-edge.
- */
-export interface SlotStoreOutput {
-  /**
-   * 16-bit Unsigned Integer
-   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
-   */
-  slot: number;
-  /**
-   * 16-bit Unsigned Integer
-   * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
-   */
-  ref: number;
-}
-
-export type SlotStore = SlotStoreOutput;
-
-export class SlotStoreEncoder extends BitStreamEncoder {
-  private compressionDict: Map<string, number> = new Map();
-
-  constructor() {
-    super("lsb_first");
-  }
-
-  encode(value: SlotStoreInput): Uint8Array {
-    // Reset compression dictionary for each encode
-    this.compressionDict.clear();
-
-    this.writeUint16(value.slot, "little_endian");
-    this.writeUint16(value.ref, "little_endian");
-    return this.finish();
-  }
-
-  /**
-   * Calculate the encoded size of a SlotStore value.
-   * Used for from_after_field computed lengths and buffer pre-allocation.
-   */
-  calculateSize(value: SlotStore): number {
-    return 4; // slot + ref
-  }
-}
-
-export class SlotStoreDecoder extends SeekableBitStreamDecoder {
-  constructor(input: Uint8Array | number[] | string, private context?: any) {
-    const reader = createReader(input);
-    super(reader, "lsb_first");
-  }
-
-  decode(): SlotStoreOutput {
-    const value: any = {};
-
-    value.slot = this.readUint16("little_endian");
-    value.ref = this.readUint16("little_endian");
-    return value;
-  }
-}
-
-/**
  * A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized.
  */
 export interface TraceInput {
@@ -742,16 +668,6 @@ export interface TraceInput {
    * Length prefix type: uint16
    */
   entry_slots: number[];
-  /**
-   * Array
-   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
-   *
-   * @remarks
-   *
-   * Array kind: length_prefixed
-   * Length prefix type: uint16
-   */
-  exit_stores: SlotStoreInput[];
 }
 
 /**
@@ -798,16 +714,6 @@ export interface TraceOutput {
    * Length prefix type: uint16
    */
   entry_slots: number[];
-  /**
-   * Array
-   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
-   *
-   * @remarks
-   *
-   * Array kind: length_prefixed
-   * Length prefix type: uint16
-   */
-  exit_stores: SlotStoreOutput[];
 }
 
 export type Trace = TraceOutput;
@@ -848,15 +754,6 @@ export class TraceEncoder extends BitStreamEncoder {
       const value_entry_slots__iter = value.entry_slots[value_entry_slots__iter_index];
       this.writeUint16(value_entry_slots__iter, "little_endian");
     }
-    this.writeUint16(value.exit_stores.length, "little_endian");
-    for (let value_exit_stores__iter_index = 0; value_exit_stores__iter_index < value.exit_stores.length; value_exit_stores__iter_index++) {
-      const value_exit_stores__iter = value.exit_stores[value_exit_stores__iter_index];
-      const encoder_value_exit_stores__iter = new SlotStoreEncoder();
-      const encoded_value_exit_stores__iter = encoder_value_exit_stores__iter.encode(value_exit_stores__iter);
-      for (const byte of encoded_value_exit_stores__iter) {
-        this.writeUint8(byte);
-      }
-    }
     return this.finish();
   }
 
@@ -882,12 +779,6 @@ export class TraceEncoder extends BitStreamEncoder {
     // entry_slots: array (kind: length_prefixed)
     for (const item of value.entry_slots) {
       size += 2;
-    }
-    size += 2; // length prefix (uint16)
-    // exit_stores: array (kind: length_prefixed)
-    for (const item of value.exit_stores) {
-      const exit_stores_itemEncoder = new SlotStoreEncoder();
-      size += exit_stores_itemEncoder.calculateSize(item);
     }
     size += 2; // length prefix (uint16)
     return size;
@@ -964,15 +855,6 @@ export class TraceDecoder extends SeekableBitStreamDecoder {
       let entry_slots__iter: any;
       entry_slots__iter = this.readUint16("little_endian");
       value.entry_slots.push(entry_slots__iter);
-    }
-    value.exit_stores = [];
-    const exit_stores_length = this.readUint16("little_endian");
-    for (let i = 0; i < exit_stores_length; i++) {
-      let exit_stores__iter: any;
-      exit_stores__iter = {};
-      exit_stores__iter.slot = this.readUint16("little_endian");
-      exit_stores__iter.ref = this.readUint16("little_endian");
-      value.exit_stores.push(exit_stores__iter);
     }
     return value;
   }
@@ -1139,15 +1021,6 @@ export class TraceFileDecoder extends SeekableBitStreamDecoder {
         let traces__iter_entry_slots__iter: any;
         traces__iter_entry_slots__iter = this.readUint16("little_endian");
         traces__iter.entry_slots.push(traces__iter_entry_slots__iter);
-      }
-      traces__iter.exit_stores = [];
-      const traces__iter_exit_stores_length = this.readUint16("little_endian");
-      for (let i = 0; i < traces__iter_exit_stores_length; i++) {
-        let traces__iter_exit_stores__iter: any;
-        traces__iter_exit_stores__iter = {};
-        traces__iter_exit_stores__iter.slot = this.readUint16("little_endian");
-        traces__iter_exit_stores__iter.ref = this.readUint16("little_endian");
-        traces__iter.exit_stores.push(traces__iter_exit_stores__iter);
       }
       value.traces.push(traces__iter);
     }

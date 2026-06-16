@@ -51,15 +51,16 @@ const ObsType = trace.ObsType;
 const SlotStore = trace.SlotStore;
 
 /// The owned, rewritten trace arrays the optimizer (or `dupe`) hands back to
-/// `trace.zig`'s `commit`, which stores them in the cached `Trace`.
+/// `trace.zig`'s `commit`, which stores them in the cached `Trace`. The
+/// loop-carried writebacks live in the instruction stream as slot-bound `phi`
+/// nodes (they used to be a separate `exit_stores` list).
 pub const Optimized = struct {
     instrs: []IrInstr,
     consts: []Value,
     entry_slots: []u16,
-    exit_stores: []SlotStore,
 };
 
-const OpKind = enum { konst, slot_load, binary, unary, guard, aref, aload, astore, loop };
+const OpKind = enum { konst, slot_load, binary, unary, guard, aref, aload, astore, loop, phi };
 
 fn kindOf(op: IrOp) OpKind {
     return switch (op) {
@@ -78,6 +79,10 @@ fn kindOf(op: IrOp) OpKind {
         .aload => .aload,
         .astore => .astore,
         .loop => .loop,
+        // Loop-carried value: a root (the carry); canonical to itself (never
+        // folded/CSE'd). Keeps both operands live; `b` is a forward (back-edge)
+        // ref, remapped by a fixup after compaction.
+        .phi => .phi,
     };
 }
 
@@ -116,16 +121,13 @@ pub fn dupe(
     instrs: []const IrInstr,
     consts: []const Value,
     entry_slots: []const u16,
-    exit: []const SlotStore,
 ) !Optimized {
     const out_instrs = try gpa.dupe(IrInstr, instrs);
     errdefer gpa.free(out_instrs);
     const out_consts = try gpa.dupe(Value, consts);
     errdefer gpa.free(out_consts);
     const out_entry = try gpa.dupe(u16, entry_slots);
-    errdefer gpa.free(out_entry);
-    const out_exit = try gpa.dupe(SlotStore, exit);
-    return .{ .instrs = out_instrs, .consts = out_consts, .entry_slots = out_entry, .exit_stores = out_exit };
+    return .{ .instrs = out_instrs, .consts = out_consts, .entry_slots = out_entry };
 }
 
 /// Rewrite a freshly-recorded trace body (terminated by `loop`) into a smaller,
@@ -137,7 +139,6 @@ pub fn optimize(
     gpa: std.mem.Allocator,
     instrs: []const IrInstr,
     consts: []const Value,
-    exit: []const SlotStore,
 ) !Optimized {
     const n = instrs.len;
     std.debug.assert(n >= 1 and instrs[n - 1].op == .loop);
@@ -227,12 +228,14 @@ pub fn optimize(
             // CSE'd, kept as a root by the liveness pass below (I1).
             .aref, .aload, .astore => {},
             .loop => {},
+            // φ is a loop-carried root: canonical to itself, never folded/CSE'd.
+            .phi => {},
         }
     }
 
     // --- backward liveness from explicit roots ---
-    // Roots: the `loop` terminator, every kept guard (side-effecting), and the
-    // canonical ref behind every exit_store (forgetting these would strip the
+    // Roots: the `loop` terminator, every kept guard (side-effecting), and every
+    // `phi` (the loop carry / deopt writeback — forgetting one would strip the
     // loop-carried computation and resume tier-0 with stale registers).
     const live = try gpa.alloc(bool, n);
     defer gpa.free(live);
@@ -241,10 +244,19 @@ pub fn optimize(
     for (instrs, 0..) |ins, i| {
         const k = kindOf(ins.op);
         // Kept guards and every `astore` are side-effecting roots (I1: an
-        // `astore` and its feeding `aref` must never be DCE'd).
-        if ((k == .guard and !dead[i]) or k == .astore) live[i] = true;
+        // `astore` and its feeding `aref` must never be DCE'd). Every φ is a root:
+        // it is the loop carry / the deopt writeback, never dead.
+        if ((k == .guard and !dead[i]) or k == .astore or k == .phi) live[i] = true;
+        // A φ's back-edge update `b` may be a FORWARD ref (`b > i`) —
+        // `assertWellFormed` permits it (only φ.b may point past its own index),
+        // and an internal SR φ's `update = add(φ, Δ)` necessarily does. The single
+        // backward propagation pass below sweeps high→low, so it would pass `b`
+        // *before* the φ marks it live and never revisit `b`'s operands, dropping
+        // them as dead → wild refs after compaction. Pre-mark every φ.b live here
+        // (canon is final) so the backward pass propagates `b`'s operands when it
+        // reaches `b`. For a backward `b` (every E0 φ) this is a redundant no-op.
+        if (ins.op == .phi) live[canon[ins.b]] = true;
     }
-    for (exit) |st| live[canon[st.ref]] = true;
     {
         var i = n;
         while (i > 0) {
@@ -266,6 +278,13 @@ pub fn optimize(
                     live[canon[ins.a]] = true;
                     live[canon[ins.b]] = true;
                 },
+                // φ always keeps its back-edge update `b` alive. The init `a` is a
+                // real ref only for an *internal* φ (the preheader value); a
+                // slot-bound φ's init is implicit (`regs[slot]`), so `a` is 0/unused.
+                .phi => {
+                    live[canon[ins.b]] = true;
+                    if (ins.aux == trace.PHI_INTERNAL) live[canon[ins.a]] = true;
+                },
                 .konst, .slot_load, .loop => {},
             }
         }
@@ -279,6 +298,11 @@ pub fn optimize(
     defer out_instrs.deinit(gpa);
     var out_entry: std.ArrayListUnmanaged(u16) = .empty;
     defer out_entry.deinit(gpa);
+    // φ `b` is a back-edge (forward) ref: its target's `new_index` is not yet known
+    // when the φ is emitted. Record (emitted-position, old-canonical-b) pairs and
+    // patch them once every `new_index` is assigned.
+    var phi_fixups: std.ArrayListUnmanaged(struct { pos: usize, b: Ref }) = .empty;
+    defer phi_fixups.deinit(gpa);
 
     for (instrs, 0..) |ins, i| {
         if (canon[i] != i) continue; // CSE-redirected → not emitted
@@ -298,15 +322,20 @@ pub fn optimize(
                 out.a = new_index[canon[ins.a]];
                 out.b = new_index[canon[ins.b]];
             },
+            .phi => {
+                // init `a` is a real backward ref only for an internal φ (remap
+                // now); a slot-bound φ's `a` is unused (kept 0). Update `b` is the
+                // forward back-edge → defer to the fixup pass below.
+                out.a = if (ins.aux == trace.PHI_INTERNAL) new_index[canon[ins.a]] else 0;
+                try phi_fixups.append(gpa, .{ .pos = out_instrs.items.len, .b = canon[ins.b] });
+            },
             .slot_load => try out_entry.append(gpa, @intCast(ins.aux)),
             .konst, .loop => {},
         }
         try out_instrs.append(gpa, out);
     }
-
-    var out_exit: std.ArrayListUnmanaged(SlotStore) = .empty;
-    defer out_exit.deinit(gpa);
-    for (exit) |st| try out_exit.append(gpa, .{ .slot = st.slot, .ref = new_index[canon[st.ref]] });
+    // Patch each φ's back-edge ref now that every survivor has a `new_index`.
+    for (phi_fixups.items) |f| out_instrs.items[f.pos].b = new_index[f.b];
 
     // Transfer ownership; errdefer frees the already-owned slices if a later
     // toOwnedSlice OOMs, so we never leak on the failure path.
@@ -315,9 +344,7 @@ pub fn optimize(
     const final_consts = try out_consts.toOwnedSlice(gpa);
     errdefer gpa.free(final_consts);
     const final_entry = try out_entry.toOwnedSlice(gpa);
-    errdefer gpa.free(final_entry);
-    const final_exit = try out_exit.toOwnedSlice(gpa);
-    return .{ .instrs = final_instrs, .consts = final_consts, .entry_slots = final_entry, .exit_stores = final_exit };
+    return .{ .instrs = final_instrs, .consts = final_consts, .entry_slots = final_entry };
 }
 
 // ---------------------------------------------------------------------------
@@ -335,7 +362,6 @@ fn freeOpt(gpa: std.mem.Allocator, o: *Optimized) void {
     gpa.free(o.instrs);
     gpa.free(o.consts);
     gpa.free(o.entry_slots);
-    gpa.free(o.exit_stores);
 }
 
 fn countOp(instrs: []const IrInstr, op: IrOp) usize {
@@ -348,62 +374,101 @@ fn countOp(instrs: []const IrInstr, op: IrOp) usize {
 
 test "tropt: a constant subexpression folds to one konst and its operands die" {
     const gpa = testing.allocator;
-    const instrs = [_]IrInstr{
+    const instrs = trace.withPhis(&[_]IrInstr{
         .{ .op = .konst, .aux = 0 }, // %0 = 2
         .{ .op = .konst, .aux = 1 }, // %1 = 3
         .{ .op = .add, .a = 0, .b = 1 }, // %2 = 2 + 3  → folds to 5
         .{ .op = .slot_load, .aux = 0 }, // %3 = r0      (loop-variant input)
         .{ .op = .add, .a = 3, .b = 2 }, // %4 = r0 + 5
         .{ .op = .loop }, // %5
-    };
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 4 }});
     const consts = [_]Value{ Value.int(2), Value.int(3) };
-    const exit = [_]SlotStore{.{ .slot = 0, .ref = 4 }};
-    var opt = try optimize(gpa, &instrs, &consts, &exit);
+    var opt = try optimize(gpa, &instrs, &consts);
     defer freeOpt(gpa, &opt);
 
     // %2 folded to a konst; %0 and %1 fed only the fold, so DCE drops them.
-    // Survivors: konst(5), slot_load r0, add, loop.
-    try testing.expectEqual(@as(usize, 4), opt.instrs.len);
+    // Survivors: konst(5), slot_load r0, add, φ(r0), loop.
+    try testing.expectEqual(@as(usize, 5), opt.instrs.len);
     try testing.expectEqual(IrOp.konst, opt.instrs[0].op);
     try testing.expectEqual(@as(i64, 5), opt.consts[@intCast(opt.instrs[0].aux)].asInt());
-    try testing.expectEqual(IrOp.loop, opt.instrs[3].op);
-    // The loop-carried writeback still tracks the live `add`.
-    try testing.expectEqual(@as(Ref, 2), opt.exit_stores[0].ref);
+    try testing.expectEqual(IrOp.loop, opt.instrs[4].op);
+    // The loop-carried writeback (slot-bound φ) still tracks the live `add` (now %2).
+    try testing.expectEqual(IrOp.phi, opt.instrs[3].op);
+    try testing.expectEqual(@as(Ref, 2), opt.instrs[3].b);
+}
+
+test "tropt: a φ with a FORWARD back-edge update keeps the update's operands live" {
+    // Regression (E0 review, Codex+Antigravity): an internal φ placed *before* its
+    // `update = add(φ, Δ)` has a forward `b` (`b > i`), which `assertWellFormed`
+    // permits. The single backward liveness pass must not sweep past the update and
+    // drop its operands. Here `konst 2` (%3) feeds ONLY the internal φ's update
+    // (%5); with the bug it is dropped and %5.b points at a wild ref.
+    const gpa = testing.allocator;
+    const instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0 = r0 (basic IV input)
+        .{ .op = .phi, .a = 0, .b = 5, .aux = trace.PHI_INTERNAL, .ty = .int }, // %1 internal φ, FORWARD b=%5
+        .{ .op = .konst, .aux = 0 }, // %2 = 1  (feeds the r0 carry)
+        .{ .op = .konst, .aux = 1 }, // %3 = 2  (feeds ONLY the internal φ update)
+        .{ .op = .add, .a = 0, .b = 2 }, // %4 = r0 + 1   (slot-bound carry update)
+        .{ .op = .add, .a = 1, .b = 3 }, // %5 = φ  + 2   (internal φ update; %1.b target)
+        .{ .op = .phi, .a = 0, .b = 4, .aux = 0, .ty = .int }, // %6 slot-bound φ → r0
+        .{ .op = .loop }, // %7
+    };
+    const consts = [_]Value{ Value.int(1), Value.int(2) };
+    var opt = try optimize(gpa, &instrs, &consts);
+    defer freeOpt(gpa, &opt);
+
+    // Both konsts survive (the bug would drop konst 2), both adds survive, both φs.
+    try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .konst));
+    try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .add));
+    try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .phi));
+    // The internal φ's forward update `b` resolves to a live `add` whose operands
+    // are both in range (no wild ref from a dropped operand).
+    for (opt.instrs, 0..) |ins, i| {
+        if (ins.op != .phi or ins.aux != trace.PHI_INTERNAL) continue;
+        try testing.expect(ins.b < opt.instrs.len - 1); // forward, < loop
+        const upd = opt.instrs[ins.b];
+        try testing.expectEqual(IrOp.add, upd.op);
+        try testing.expect(upd.a < ins.b and upd.b < ins.b); // operands backward & valid
+        try testing.expectEqual(IrOp.konst, opt.instrs[upd.b].op); // konst 2 alive
+        try testing.expectEqual(@as(i64, 2), opt.consts[@intCast(opt.instrs[upd.b].aux)].asInt());
+        _ = i;
+    }
 }
 
 test "tropt: a guard on a proven-constant value is dropped; a guard on a live value is kept" {
     const gpa = testing.allocator;
-    const instrs = [_]IrInstr{
+    const instrs = trace.withPhis(&[_]IrInstr{
         .{ .op = .konst, .aux = 0 }, // %0 = 5 (int)
         .{ .op = .guard_int, .a = 0 }, // %1 — always passes on a const int → drop
         .{ .op = .slot_load, .aux = 0 }, // %2 = r0
         .{ .op = .guard_int, .a = 2 }, // %3 — guards a runtime value → keep
         .{ .op = .add, .a = 0, .b = 2 }, // %4
         .{ .op = .loop }, // %5
-    };
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 4 }});
     const consts = [_]Value{Value.int(5)};
-    const exit = [_]SlotStore{.{ .slot = 0, .ref = 4 }};
-    var opt = try optimize(gpa, &instrs, &consts, &exit);
+    var opt = try optimize(gpa, &instrs, &consts);
     defer freeOpt(gpa, &opt);
 
-    try testing.expectEqual(@as(usize, 5), opt.instrs.len);
+    // Survivors: konst(5), slot_load r0, guard_int, add, φ(r0), loop.
+    try testing.expectEqual(@as(usize, 6), opt.instrs.len);
     try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .guard_int));
 }
 
 test "tropt: an exact-duplicate guard is dropped (the earlier copy dominates)" {
     const gpa = testing.allocator;
-    const instrs = [_]IrInstr{
+    const instrs = trace.withPhis(&[_]IrInstr{
         .{ .op = .slot_load, .aux = 0 }, // %0 = r0
         .{ .op = .guard_int, .a = 0 }, // %1
         .{ .op = .guard_int, .a = 0 }, // %2 — duplicate → drop
         .{ .op = .add, .a = 0, .b = 0 }, // %3
         .{ .op = .loop }, // %4
-    };
-    const exit = [_]SlotStore{.{ .slot = 0, .ref = 3 }};
-    var opt = try optimize(gpa, &instrs, &.{}, &exit);
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 3 }});
+    var opt = try optimize(gpa, &instrs, &.{});
     defer freeOpt(gpa, &opt);
 
-    try testing.expectEqual(@as(usize, 4), opt.instrs.len);
+    // Survivors: slot_load r0, guard_int, add, φ(r0), loop.
+    try testing.expectEqual(@as(usize, 5), opt.instrs.len);
     try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .guard_int));
 }
 
@@ -419,15 +484,14 @@ test "tropt: a guard_fits on a constant value uses laneFits (never the type-guar
 
     // false fits the bool lane → guard_fits is proven-pass → dropped.
     {
-        const instrs = [_]IrInstr{
+        const instrs = trace.withPhis(&[_]IrInstr{
             .{ .op = .konst, .aux = 0 }, // %0 = false
             .{ .op = .guard_fits, .a = 0, .aux = bool_lane }, // %1 — always passes → drop
             .{ .op = .slot_load, .aux = 0 }, // %2 = r0 (keep something live)
             .{ .op = .loop }, // %3
-        };
+        }, &[_]SlotStore{.{ .slot = 0, .ref = 2 }});
         const consts = [_]Value{Value.boolean(false)};
-        const exit = [_]SlotStore{.{ .slot = 0, .ref = 2 }};
-        var opt = try optimize(gpa, &instrs, &consts, &exit);
+        var opt = try optimize(gpa, &instrs, &consts);
         defer freeOpt(gpa, &opt);
         try testing.expectEqual(@as(usize, 0), countOp(opt.instrs, .guard_fits));
     }
@@ -436,14 +500,13 @@ test "tropt: a guard_fits on a constant value uses laneFits (never the type-guar
     // side-exit at runtime; honest recording never emits this, but the optimizer
     // must not silently drop a possibly-failing guard).
     {
-        const instrs = [_]IrInstr{
+        const instrs = trace.withPhis(&[_]IrInstr{
             .{ .op = .konst, .aux = 0 }, // %0 = 5
             .{ .op = .guard_fits, .a = 0, .aux = bool_lane }, // %1 — always fails → keep
             .{ .op = .loop }, // %2
-        };
+        }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
         const consts = [_]Value{Value.int(5)};
-        const exit = [_]SlotStore{.{ .slot = 0, .ref = 0 }};
-        var opt = try optimize(gpa, &instrs, &consts, &exit);
+        var opt = try optimize(gpa, &instrs, &consts);
         defer freeOpt(gpa, &opt);
         try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .guard_fits));
     }
@@ -451,20 +514,20 @@ test "tropt: a guard_fits on a constant value uses laneFits (never the type-guar
 
 test "tropt: a repeated subexpression is CSE'd to a single instruction" {
     const gpa = testing.allocator;
-    const instrs = [_]IrInstr{
+    const instrs = trace.withPhis(&[_]IrInstr{
         .{ .op = .slot_load, .aux = 0 }, // %0 = r0
         .{ .op = .slot_load, .aux = 1 }, // %1 = r1
         .{ .op = .add, .a = 0, .b = 1 }, // %2 = r0 + r1
         .{ .op = .add, .a = 0, .b = 1 }, // %3 = r0 + r1  → canon to %2
         .{ .op = .add, .a = 2, .b = 3 }, // %4 = %2 + %3
         .{ .op = .loop }, // %5
-    };
-    const exit = [_]SlotStore{.{ .slot = 0, .ref = 4 }};
-    var opt = try optimize(gpa, &instrs, &.{}, &exit);
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 4 }});
+    var opt = try optimize(gpa, &instrs, &.{});
     defer freeOpt(gpa, &opt);
 
     // %3 vanishes; %4's two operands now both resolve to the surviving add.
-    try testing.expectEqual(@as(usize, 5), opt.instrs.len);
+    // Survivors: slot_load r0, slot_load r1, add, add, φ(r0), loop.
+    try testing.expectEqual(@as(usize, 6), opt.instrs.len);
     try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .add));
     const last_add = opt.instrs[3];
     try testing.expectEqual(IrOp.add, last_add.op);
@@ -473,40 +536,38 @@ test "tropt: a repeated subexpression is CSE'd to a single instruction" {
 
 test "tropt: a dead computation (and its now-unused input) is eliminated" {
     const gpa = testing.allocator;
-    const instrs = [_]IrInstr{
+    const instrs = trace.withPhis(&[_]IrInstr{
         .{ .op = .slot_load, .aux = 0 }, // %0 = r0
         .{ .op = .slot_load, .aux = 1 }, // %1 = r1  (feeds only the dead add)
         .{ .op = .add, .a = 0, .b = 1 }, // %2 — result never used → dead
         .{ .op = .mul, .a = 0, .b = 0 }, // %3 = r0 * r0  (the live result)
         .{ .op = .loop }, // %4
-    };
-    const exit = [_]SlotStore{.{ .slot = 0, .ref = 3 }};
-    var opt = try optimize(gpa, &instrs, &.{}, &exit);
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 3 }});
+    var opt = try optimize(gpa, &instrs, &.{});
     defer freeOpt(gpa, &opt);
 
-    // Survivors: slot_load r0, mul, loop. r1's slot_load dies with the dead add,
-    // so the rebuilt entry snapshot loses it too.
-    try testing.expectEqual(@as(usize, 3), opt.instrs.len);
+    // Survivors: slot_load r0, mul, φ(r0), loop. r1's slot_load dies with the dead
+    // add, so the rebuilt entry snapshot loses it too.
+    try testing.expectEqual(@as(usize, 4), opt.instrs.len);
     try testing.expectEqual(@as(usize, 1), opt.entry_slots.len);
     try testing.expectEqual(@as(u16, 0), opt.entry_slots[0]);
 }
 
 test "tropt: a fold that would error (int //-by-zero) is left as a runtime op, never deleted" {
     const gpa = testing.allocator;
-    const instrs = [_]IrInstr{
+    const instrs = trace.withPhis(&[_]IrInstr{
         .{ .op = .konst, .aux = 0 }, // %0 = 1
         .{ .op = .konst, .aux = 1 }, // %1 = 0
         .{ .op = .idiv, .a = 0, .b = 1 }, // %2 = 1 // 0  → DivisionByZero, NOT folded
         .{ .op = .loop }, // %3
-    };
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 2 }});
     const consts = [_]Value{ Value.int(1), Value.int(0) };
-    const exit = [_]SlotStore{.{ .slot = 0, .ref = 2 }};
-    var opt = try optimize(gpa, &instrs, &consts, &exit);
+    var opt = try optimize(gpa, &instrs, &consts);
     defer freeOpt(gpa, &opt);
 
     // The idiv stays (so it side-exits at runtime and tier-0 re-raises); its const
-    // operands stay live to feed it.
-    try testing.expectEqual(@as(usize, 4), opt.instrs.len);
+    // operands stay live to feed it. Survivors: konst, konst, idiv, φ(r0), loop.
+    try testing.expectEqual(@as(usize, 5), opt.instrs.len);
     try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .idiv));
     try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .konst));
 }
@@ -514,17 +575,16 @@ test "tropt: a fold that would error (int //-by-zero) is left as a runtime op, n
 /// Build `konst a; konst b; <op> 0 1; loop` (exit r0 ← the op) and return the
 /// folded constant. Asserts the op folded to exactly one konst.
 fn foldBinaryConst(gpa: std.mem.Allocator, op: IrOp, a: Value, b: Value) !Value {
-    const instrs = [_]IrInstr{
+    const instrs = trace.withPhis(&[_]IrInstr{
         .{ .op = .konst, .aux = 0 },
         .{ .op = .konst, .aux = 1 },
         .{ .op = op, .a = 0, .b = 1 },
         .{ .op = .loop },
-    };
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 2 }});
     const consts = [_]Value{ a, b };
-    const exit = [_]SlotStore{.{ .slot = 0, .ref = 2 }};
-    var opt = try optimize(gpa, &instrs, &consts, &exit);
+    var opt = try optimize(gpa, &instrs, &consts);
     defer freeOpt(gpa, &opt);
-    try testing.expectEqual(@as(usize, 2), opt.instrs.len); // konst + loop
+    try testing.expectEqual(@as(usize, 3), opt.instrs.len); // konst + φ + loop
     try testing.expectEqual(IrOp.konst, opt.instrs[0].op);
     return opt.consts[@intCast(opt.instrs[0].aux)];
 }

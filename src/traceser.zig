@@ -28,7 +28,12 @@ pub const schema = @import("gen/trace_schema.zig");
 /// Wire-format version, written into every `TraceFile`. Bump on any
 /// schema-incompatible change. The compat policy (visualiser reads only its own
 /// VM commit's traces) lives in `docs/design/04-snapshot-replay-schema.md`.
-pub const format_version: u32 = 1;
+///
+/// v2 (Phase E0): loop-carried writebacks moved from a separate `exit_stores`
+/// list into the instruction stream as slot-bound `phi` nodes; `exit_stores` and
+/// the `SlotStore` type were dropped from the schema. A v1 trace's trailing
+/// `exit_stores` bytes are wire-incompatible with the v2 layout.
+pub const format_version: u32 = 2;
 
 /// Map one trace constant. A `heap_ref` const is always a string — the only
 /// heap value a trace constant can be (tables/closures are never compile-time
@@ -70,9 +75,6 @@ pub fn toSchemaTrace(a: std.mem.Allocator, t: *const trace.Trace) !schema.Trace 
     const consts = try a.alloc(schema.ConstValue, t.consts.len);
     for (t.consts, 0..) |c, i| consts[i] = try toSchemaConst(c);
 
-    const exit_stores = try a.alloc(schema.SlotStore, t.exit_stores.len);
-    for (t.exit_stores, 0..) |st, i| exit_stores[i] = .{ .slot = st.slot, .ref = st.ref };
-
     return .{
         .anchor_proto_id = t.anchor.proto.id,
         .anchor_pc = t.anchor.pc,
@@ -80,7 +82,6 @@ pub fn toSchemaTrace(a: std.mem.Allocator, t: *const trace.Trace) !schema.Trace 
         .consts = consts,
         // `[]u16` coerces directly to the schema's `[]const u16` — no remap.
         .entry_slots = t.entry_slots,
-        .exit_stores = exit_stores,
     };
 }
 
@@ -160,7 +161,8 @@ test "real recorded numeric loop round-trips struct-exact (incl. proto id)" {
             try testing.expectEqual(orig.instrs.len, dec.instrs.len);
             try testing.expectEqual(orig.consts.len, dec.consts.len);
             try testing.expectEqual(orig.entry_slots.len, dec.entry_slots.len);
-            try testing.expectEqual(orig.exit_stores.len, dec.exit_stores.len);
+            // Loop-carried writebacks are now slot-bound `phi` instrs in the stream,
+            // so the instruction-field comparison below covers them too.
             for (orig.instrs, dec.instrs) |o, d| {
                 try testing.expectEqual(@intFromEnum(o.op), d.op);
                 try testing.expectEqual(o.a, d.a);
@@ -170,10 +172,6 @@ test "real recorded numeric loop round-trips struct-exact (incl. proto id)" {
                 try testing.expectEqual(o.snap, d.snap);
             }
             for (orig.entry_slots, dec.entry_slots) |o, d| try testing.expectEqual(o, d);
-            for (orig.exit_stores, dec.exit_stores) |o, d| {
-                try testing.expectEqual(o.slot, d.slot);
-                try testing.expectEqual(o.ref, d.ref);
-            }
         }
     };
     try withRecordedVm(
@@ -240,6 +238,9 @@ test "hand-built schema edge corpus round-trips byte-exact" {
                     .{ .op = 0, .a = 0, .b = 0, .aux = std.math.minInt(i32), .ty = 0, .snap = 0 },
                     .{ .op = 1, .a = 65535, .b = 65535, .aux = std.math.maxInt(i32), .ty = 5, .snap = 4294967295 },
                     .{ .op = 250, .a = 1, .b = 2, .aux = -1, .ty = 3, .snap = 7 },
+                    // a slot-bound φ (op 35) — the loop-carried writeback now rides the
+                    // instr stream instead of a separate exit_stores array.
+                    .{ .op = 35, .a = 0, .b = 1, .aux = 3, .ty = 1, .snap = 0 },
                 },
                 .consts = &.{
                     .{ .tag = 0, .body = .{ .ConstNil = .{ .pad = 0 } } },
@@ -253,7 +254,6 @@ test "hand-built schema edge corpus round-trips byte-exact" {
                     .{ .tag = 4, .body = .{ .ConstString = .{ .v = "" } } },
                 },
                 .entry_slots = &.{ 0, 1, 2, 3 },
-                .exit_stores = &.{ .{ .slot = 0, .ref = 1 }, .{ .slot = 3, .ref = 2 } },
             },
             .{
                 .anchor_proto_id = 1,
@@ -261,7 +261,6 @@ test "hand-built schema edge corpus round-trips byte-exact" {
                 .instrs = &.{.{ .op = 99, .a = 0, .b = 0, .aux = 0, .ty = 0, .snap = 0 }},
                 .consts = &.{},
                 .entry_slots = &.{},
-                .exit_stores = &.{},
             },
         },
     };
@@ -287,7 +286,9 @@ test "hand-built schema edge corpus round-trips byte-exact" {
     try testing.expectEqualStrings("a\x00b\xff\xfe", t0.consts[7].body.ConstString.v);
     try testing.expectEqualStrings("", t0.consts[8].body.ConstString.v);
     try testing.expectEqual(@as(usize, 4), t0.entry_slots.len);
-    try testing.expectEqual(@as(u16, 2), t0.exit_stores[1].ref);
+    // the slot-bound φ rode the instr stream (op 35, carries slot 3 via aux)
+    try testing.expectEqual(@as(u8, 35), t0.instrs[3].op);
+    try testing.expectEqual(@as(i32, 3), t0.instrs[3].aux);
 
     const t1 = got.traces[1];
     try testing.expectEqual(@as(u32, 12345), t1.anchor_pc);
@@ -340,9 +341,10 @@ test "wire enum ordinals are a pinned contract (mirrored by viz/src/enums.ts)" {
     try testing.expectEqual(@as(u8, 32), @intFromEnum(IrOp.guard_present));
     try testing.expectEqual(@as(u8, 33), @intFromEnum(IrOp.guard_fits));
     try testing.expectEqual(@as(u8, 34), @intFromEnum(IrOp.loop));
+    try testing.expectEqual(@as(u8, 35), @intFromEnum(IrOp.phi));
     // Exhaustiveness: if a member is added/removed, this count changes and forces
     // both this test and enums.ts to be revisited.
-    try testing.expectEqual(@as(usize, 35), @typeInfo(IrOp).@"enum".field_names.len);
+    try testing.expectEqual(@as(usize, 36), @typeInfo(IrOp).@"enum".field_names.len);
 
     const ObsType = trace.ObsType;
     try testing.expectEqual(@as(u8, 0), @intFromEnum(ObsType.unknown));

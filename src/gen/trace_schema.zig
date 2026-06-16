@@ -263,47 +263,12 @@ pub const IrInstr = struct {
     }
 };
 
-pub const SlotStore = struct {
-    slot: u16,
-    ref: u16,
-
-    pub fn encode(self: SlotStore, allocator: std.mem.Allocator) binschema.Error![]u8 {
-        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
-        errdefer enc.deinit();
-        var ctx = binschema.EncodeContext.init(allocator);
-        defer ctx.deinit();
-        try self.encodeInto(&enc, &ctx);
-        return enc.finish();
-    }
-
-    pub fn encodeInto(self: SlotStore, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
-        _ = ctx;
-        try enc.writeUint16(self.slot, .little_endian);
-        try enc.writeUint16(self.ref, .little_endian);
-    }
-
-    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!SlotStore {
-        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
-        return decodeWith(allocator, &dec, null);
-    }
-
-    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!SlotStore {
-        _ = allocator;
-        _ = root;
-        var result: SlotStore = undefined;
-        result.slot = try dec.readUint16(.little_endian);
-        result.ref = try dec.readUint16(.little_endian);
-        return result;
-    }
-};
-
 pub const Trace = struct {
     anchor_proto_id: u32,
     anchor_pc: u32,
     instrs: []const IrInstr,
     consts: []const ConstValue,
     entry_slots: []const u16,
-    exit_stores: []const SlotStore,
 
     pub fn encode(self: Trace, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -329,10 +294,6 @@ pub const Trace = struct {
         for (self.entry_slots) |_item_2| {
             try enc.writeUint16(_item_2, .little_endian);
         }
-        try enc.writeUint16(@intCast(self.exit_stores.len), .little_endian);
-        for (self.exit_stores) |_item_3| {
-            try _item_3.encodeInto(enc, ctx);
-        }
     }
 
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!Trace {
@@ -344,30 +305,24 @@ pub const Trace = struct {
         var result: Trace = undefined;
         result.anchor_proto_id = try dec.readUint32(.little_endian);
         result.anchor_pc = try dec.readUint32(.little_endian);
-        const _len_7 = try dec.readUint16(.little_endian);
-        const _buf_8 = try allocator.alloc(IrInstr, @as(usize, _len_7));
-        for (0.._buf_8.len) |_i_5| {
-            _buf_8[_i_5] = try IrInstr.decodeWith(allocator, dec, root);
+        const _len_6 = try dec.readUint16(.little_endian);
+        const _buf_7 = try allocator.alloc(IrInstr, @as(usize, _len_6));
+        for (0.._buf_7.len) |_i_4| {
+            _buf_7[_i_4] = try IrInstr.decodeWith(allocator, dec, root);
         }
-        result.instrs = _buf_8;
-        const _len_12 = try dec.readUint16(.little_endian);
-        const _buf_13 = try allocator.alloc(ConstValue, @as(usize, _len_12));
-        for (0.._buf_13.len) |_i_10| {
-            _buf_13[_i_10] = try ConstValue.decodeWith(allocator, dec, root);
+        result.instrs = _buf_7;
+        const _len_11 = try dec.readUint16(.little_endian);
+        const _buf_12 = try allocator.alloc(ConstValue, @as(usize, _len_11));
+        for (0.._buf_12.len) |_i_9| {
+            _buf_12[_i_9] = try ConstValue.decodeWith(allocator, dec, root);
         }
-        result.consts = _buf_13;
-        const _len_17 = try dec.readUint16(.little_endian);
-        const _buf_18 = try allocator.alloc(u16, @as(usize, _len_17));
-        for (0.._buf_18.len) |_i_15| {
-            _buf_18[_i_15] = try dec.readUint16(.little_endian);
+        result.consts = _buf_12;
+        const _len_16 = try dec.readUint16(.little_endian);
+        const _buf_17 = try allocator.alloc(u16, @as(usize, _len_16));
+        for (0.._buf_17.len) |_i_14| {
+            _buf_17[_i_14] = try dec.readUint16(.little_endian);
         }
-        result.entry_slots = _buf_18;
-        const _len_22 = try dec.readUint16(.little_endian);
-        const _buf_23 = try allocator.alloc(SlotStore, @as(usize, _len_22));
-        for (0.._buf_23.len) |_i_20| {
-            _buf_23[_i_20] = try SlotStore.decodeWith(allocator, dec, root);
-        }
-        result.exit_stores = _buf_23;
+        result.entry_slots = _buf_17;
         return result;
     }
 };

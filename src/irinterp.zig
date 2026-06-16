@@ -12,7 +12,7 @@
 //! ## Why this deopt is sound (loop-header re-entry)
 //!
 //! The recorder writes loop-carried registers only at the atomic loop close
-//! (`trace.zig`'s `commit` fills `exit_stores` from every register the trace
+//! (`trace.zig`'s `commit` emits a slot-bound `phi` for every register the trace
 //! *defined*). This executor mirrors that: `regs` is mutated only at the `loop`
 //! marker. So at the *start* of every iteration the register file is already a
 //! coherent tier-0 state for the loop header. A side-exit mid-iteration therefore
@@ -96,6 +96,32 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                 .konst => {
                     values[i] = t.consts[@intCast(ins.aux)];
                     if (record) rec.value(i, values[i]);
+                },
+
+                // ---- loop-carried value (φ) ----
+                // A slot-bound φ reads its register every iteration — identical to
+                // the `slot_load` it replaces, because the carry round-trips through
+                // `regs[slot]` (tier-0 seeds it on entry; the `.loop` flush updates it
+                // thereafter). An *internal* φ (no backing register) takes its init on
+                // the first iteration and keeps the value the back-edge carried into it
+                // on every subsequent one.
+                .phi => {
+                    if (ins.aux == trace.PHI_INTERNAL) {
+                        if (completed == 0) values[i] = values[@intCast(ins.a)];
+                        // else: retain the value the previous `.loop` carried in.
+                        // An internal φ is a real computed scalar the body consumes
+                        // (e.g. SR's `denom`); log it like any other value.
+                        if (record) rec.value(i, values[i]);
+                    } else {
+                        // A slot-bound φ is loop-carry bookkeeping — exactly what the
+                        // old `exit_stores` list was. The body reads the register via
+                        // its `slot_load`, never this φ node, so the φ value is dead
+                        // except as the back-edge writeback. Emit NO exec-log value
+                        // event (the old exit_store produced none): keeping no-op
+                        // parity AND ensuring a carried *heap* slot never feeds the
+                        // scalar-only exec-log encoder (`UnsupportedEffectResult`).
+                        values[i] = regs[@intCast(ins.aux)];
+                    }
                 },
 
                 // ---- arithmetic / bitwise / comparisons → the shared evaluator
@@ -243,7 +269,17 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
 
                 // ---- close: commit the loop-carried writes, then iterate ----
                 .loop => {
-                    for (t.exit_stores) |st| regs[st.slot] = values[st.ref];
+                    // φ writeback: a slot-bound φ flushes its update to the register
+                    // (the carry tier-0 resumes from); an internal φ refreshes its own
+                    // carried scratch so the next iteration retains it.
+                    for (t.instrs, 0..) |p, pi| {
+                        if (p.op != .phi) continue;
+                        if (p.aux == trace.PHI_INTERNAL) {
+                            values[pi] = values[@intCast(p.b)];
+                        } else {
+                            regs[@intCast(p.aux)] = values[@intCast(p.b)];
+                        }
+                    }
                     completed += 1;
                     if (record) rec.commit();
                     continue :iter;
@@ -316,7 +352,6 @@ pub fn evalUnary(op: trace.IrOp, a: Value) arith.Error!Value {
 const testing = std.testing;
 const IrInstr = trace.IrInstr;
 const IrOp = trace.IrOp;
-const SlotStore = trace.SlotStore;
 const Table = table.Table;
 
 /// Build a single-anchor trace that scans `t[r1], t[r1+1], …` accumulating into
@@ -328,7 +363,7 @@ const Table = table.Table;
 /// A side-exit (bounds/present miss) leaves `regs` at the last clean commit — so
 /// `completed` is the number of present in-bounds slots scanned, exactly what a
 /// tier-0 re-run would reproduce.
-fn scanTrace(lane_ord: i32) [11]IrInstr {
+fn scanTrace(lane_ord: i32) [13]IrInstr {
     return .{
         .{ .op = .slot_load, .aux = 0 }, // %0 = r0 (table)
         .{ .op = .guard_table, .a = 0 }, // %1 = guard %0 is a table
@@ -340,16 +375,15 @@ fn scanTrace(lane_ord: i32) [11]IrInstr {
         .{ .op = .aload, .a = 4, .aux = lane_ord }, // %7 = t[index]
         .{ .op = .konst, .aux = 0 }, // %8 = 1
         .{ .op = .add, .a = 3, .b = 8 }, // %9 = index + 1
-        .{ .op = .loop }, // %10
+        // Loop-carried writebacks as slot-bound φ: advance r1 (index+1) and stash
+        // r2 (the loaded value). These subsume what `exit_stores` listed.
+        .{ .op = .phi, .a = 0, .b = 9, .aux = 1 }, // %10: r1 ← %9
+        .{ .op = .phi, .a = 0, .b = 7, .aux = 2 }, // %11: r2 ← %7
+        .{ .op = .loop }, // %12
     };
 }
 
 const scan_consts = [_]Value{Value.int(1)};
-// Advance the index (r1 ← index+1) and stash the loaded value (r2 ← t[index]).
-const scan_exit = [_]SlotStore{
-    .{ .slot = 1, .ref = 9 },
-    .{ .slot = 2, .ref = 7 },
-};
 
 fn runScan(t: *Table, start: i64) struct { completed: usize, regs: [3]Value } {
     var instrs = scanTrace(@intFromEnum(t.array.lane));
@@ -358,10 +392,9 @@ fn runScan(t: *Table, start: i64) struct { completed: usize, regs: [3]Value } {
         .instrs = &instrs,
         .consts = @constCast(scan_consts[0..]),
         .entry_slots = &[_]u16{},
-        .exit_stores = @constCast(scan_exit[0..]),
     };
     var regs = [3]Value{ Value.heap(&t.header), Value.int(start), Value.nil() };
-    var values: [11]Value = undefined;
+    var values: [13]Value = undefined;
     const completed = execute(&tr, &regs, &values);
     return .{ .completed = completed, .regs = regs };
 }
@@ -401,6 +434,51 @@ test "B2 read path: scan a bool lane matches tier-0 getInt, hole/bounds side-exi
     try testing.expectEqual(@as(usize, 0), fromHi.completed);
 }
 
+test "E0 review: a slot-bound φ carrying a HEAP value emits no exec-log value event" {
+    // Regression (E0 review, Antigravity P0): a slot-bound φ executes mid-trace and
+    // reads its register. The old `exit_stores` carry emitted NO exec-log value
+    // event; the φ must match that — otherwise a loop-carried *heap* slot would feed
+    // the scalar-only exec-log encoder a heap Value (`UnsupportedEffectResult`).
+    const gpa = testing.allocator;
+    const t = try Table.create(gpa);
+    defer t.destroy(gpa);
+
+    // r0 = a heap table (write-only: overwritten with int 5 each iteration).
+    // r2 = a guard counter (1 → 0) so iteration 2's `5 // r2` divides by zero and
+    // side-exits, after exactly one clean commit in which the φ carried the table.
+    var instrs = [_]IrInstr{
+        .{ .op = .konst, .aux = 0 }, // %0 = 5      (the new r0 value)
+        .{ .op = .slot_load, .aux = 2 }, // %1 = r2  (counter)
+        .{ .op = .konst, .aux = 1 }, // %2 = 1
+        .{ .op = .idiv, .a = 0, .b = 1 }, // %3 = 5 // r2 → DivByZero on iter 2 (exit)
+        .{ .op = .sub, .a = 1, .b = 2 }, // %4 = r2 - 1
+        .{ .op = .phi, .a = 0, .b = 0, .aux = 0, .ty = .heap }, // %5: r0 ← %0 (carries HEAP iter 1)
+        .{ .op = .phi, .a = 0, .b = 4, .aux = 2, .ty = .int }, // %6: r2 ← %4
+        .{ .op = .loop }, // %7
+    };
+    const consts = [_]Value{ Value.int(5), Value.int(1) };
+    const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = @constCast(consts[0..]), .entry_slots = &[_]u16{} };
+
+    var rec = execlog.ExecLogRecorder.init(gpa, 64, 8);
+    defer rec.deinit();
+    var log = execlog.TraceExecLog{ .trace_id = 0 };
+    defer log.deinit(gpa);
+    rec.retarget(&log);
+
+    var regs = [3]Value{ Value.heap(&t.header), Value.nil(), Value.int(1) };
+    var values: [8]Value = undefined;
+    const completed = executeTraced(&rec, &tr, &regs, &values);
+
+    // Exactly one clean commit (iter 1), then the divide-by-zero side-exit on iter 2.
+    try testing.expectEqual(@as(usize, 1), completed);
+    try testing.expectEqual(@as(i64, 5), regs[0].asInt()); // carry flushed r0 ← 5
+
+    // The crux: NO recorded event carries a heap value, so serialization can't hit
+    // `UnsupportedEffectResult`. (The φ at %5 read the heap table but logged nothing.)
+    try testing.expectEqual(@as(usize, 1), log.entries.items.len);
+    for (log.entries.items[0].events) |ev| try testing.expect(!ev.value.isHeap());
+}
+
 test "B2 read path: guard_table side-exits when the slot is not a table" {
     const gpa = testing.allocator;
     const t = try Table.create(gpa);
@@ -414,11 +492,10 @@ test "B2 read path: guard_table side-exits when the slot is not a table" {
         .instrs = &instrs,
         .consts = @constCast(scan_consts[0..]),
         .entry_slots = &[_]u16{},
-        .exit_stores = @constCast(scan_exit[0..]),
     };
     // r0 is an int, not a table → guard_table fails on the first iteration.
     var regs = [3]Value{ Value.int(99), Value.int(1), Value.nil() };
-    var values: [11]Value = undefined;
+    var values: [13]Value = undefined;
     try testing.expectEqual(@as(usize, 0), execute(&tr, &regs, &values));
     try testing.expect(regs[0].asInt() == 99); // untouched
 }

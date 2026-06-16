@@ -556,19 +556,45 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (i != n - 1) return false; // loop must be terminal
                 kinds[i] = .none;
             },
+            // A loop-carried φ. `b` (the back-edge update) is the one operand allowed
+            // to reference a *later* node, so it is only range-checked here (< n) and
+            // kind-checked in the post-pass below (it may not be assigned yet on the
+            // forward scan). A *slot-bound* φ (aux >= 0) records a writeback to
+            // regs[aux]; the body reads the slot through its `slot_load`, never the φ
+            // node, so the φ itself is value-less (.none) — exactly what the old
+            // exit_store was. An *internal* φ (aux == PHI_INTERNAL) backs no register:
+            // its init `a` is a real preheader ref (a < i) and its value carries the
+            // recorded scalar type, since body uses reference the φ directly.
+            .phi => {
+                if (ins.b >= n) return false;
+                if (ins.aux == trace.PHI_INTERNAL) {
+                    if (ins.a >= i) return false; // init must precede the φ
+                    kinds[i] = switch (ins.ty) {
+                        .int => .int,
+                        .float => .float,
+                        .boolean => .bool,
+                        else => return false,
+                    };
+                } else {
+                    if (ins.aux < 0 or ins.aux > 0xFFFF) return false;
+                    kinds[i] = .none;
+                }
+            },
             // Everything else (div/idiv/mod/pow/shl/shr/guard_number/float-neg) is
             // deferred — bail to tier-1a. (guard_float is handled above as of Phase D.)
             else => return false,
         }
     }
 
-    // Every loop-carried writeback must reference a *boxable scalar* (int/bool) so
-    // the deopt flush knows its tag. [C2] A `.ptr` (raw table pointer) or `.aref`
-    // (addressing token) in `exit_stores` would be flushed as a bogus TAG_INT and
-    // corrupt the slot — reject both here, not just `.none`.
-    for (t.exit_stores) |st| {
-        if (st.ref >= n) return false;
-        const k = kinds[st.ref];
+    // Every loop-carried writeback must reference a *boxable scalar* (int/bool/float)
+    // so the deopt flush knows its tag. [C2] A `.ptr` (raw table pointer) or `.aref`
+    // (addressing token) carried as a φ's back-edge update would be flushed as a
+    // bogus TAG_INT and corrupt the slot — reject both here, not just `.none`. This
+    // runs after Pass B so a φ's forward-referencing `b` has its kind assigned.
+    for (t.instrs) |p| {
+        if (p.op != .phi) continue;
+        if (p.b >= n) return false;
+        const k = kinds[p.b];
         if (k != .int and k != .bool and k != .float) return false;
     }
     return true;
@@ -768,7 +794,7 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
     errdefer gpa.free(slot_id_of_ref);
     @memset(slot_id_of_ref, -1);
 
-    // --- classification: gather slot_loads, then exit_stores ---
+    // --- classification: gather slot_loads, then slot-bound φ writebacks ---
     for (t.instrs, 0..) |ins, i| {
         if (ins.op != .slot_load) continue;
         const slot: u16 = @intCast(slot_of[i]); // validated >= 0 in proveKinds
@@ -776,9 +802,14 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         slots.items[id].load_ref = @intCast(i);
         slot_id_of_ref[i] = @intCast(id);
     }
-    for (t.exit_stores) |st| {
-        const id = try findOrAddSlot(&slots, gpa, st.slot);
-        slots.items[id].store_ref = st.ref;
+    // A slot-bound φ (aux >= 0) is the loop-carried writeback the old exit_store was:
+    // `aux` is the tier-0 slot, `b` is the body value carried to the next iteration.
+    // Internal φs (aux == PHI_INTERNAL) back no slot — they get a computed home in a
+    // later phase, not a slot class here.
+    for (t.instrs) |ins| {
+        if (ins.op != .phi or ins.aux < 0) continue;
+        const id = try findOrAddSlot(&slots, gpa, @intCast(ins.aux));
+        slots.items[id].store_ref = ins.b;
     }
     for (slots.items) |*s| {
         const loaded = s.load_ref >= 0;
@@ -843,9 +874,12 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             if (rd.b and last_use[ins.b] < i) last_use[ins.b] = @intCast(i);
         }
     }
-    // The value feeding any exit_store must survive to the back-edge shuffle/commit.
-    for (t.exit_stores) |st| {
-        if (last_use[st.ref] < n - 1) last_use[st.ref] = @intCast(n - 1);
+    // The value feeding any slot-bound φ's back-edge update must survive to the
+    // shuffle/commit at the terminal `loop` (operandReads does not count φ.b, so this
+    // explicit extension is its only liveness — exactly as the old exit_store had).
+    for (t.instrs) |ins| {
+        if (ins.op != .phi or ins.aux < 0) continue;
+        if (last_use[ins.b] < n - 1) last_use[ins.b] = @intCast(n - 1);
     }
 
     // --- allocation: pin slot homes, then linear-scan the transients ---
@@ -1084,9 +1118,10 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                 .spill => {},
             }
         }
-        // every exit_store ref has a concrete location (it always does)
-        for (t.exit_stores) |st| {
-            const l = loc[st.ref];
+        // every slot-bound φ's back-edge update ref has a concrete location (always does)
+        for (t.instrs) |ins| {
+            if (ins.op != .phi or ins.aux < 0) continue;
+            const l = loc[ins.b];
             std.debug.assert(l == .reg or l == .xmm or l == .spill);
         }
     }
@@ -1920,6 +1955,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try a.incReg(.rbx);
                 try a.jmp(loop_top);
             },
+            // A φ emits no code in the body: a slot-bound φ's writeback is driven by
+            // its slot's `.carried`/`.write_only` class above (the back-edge shuffle /
+            // deopt flush read `store_ref`, which was set from this φ's `b` in
+            // `analyzeInner`). An internal φ (computed home) is wired in a later phase.
+            .phi => {},
             else => unreachable, // proveKinds rejected everything else
         }
     }
@@ -2011,12 +2051,13 @@ test "nativegen: clean integer counting loop matches the interpreter" {
         .{ .op = .add, .a = 6, .b = 0 }, // 8: acc + i
         .{ .op = .konst, .aux = 0 }, // 9: 1
         .{ .op = .add, .a = 0, .b = 9 }, // 10: i + 1
+        .{ .op = .phi, .b = 8, .aux = 2 },
+        .{ .op = .phi, .b = 10, .aux = 0 },
         .{ .op = .loop }, // 11
     };
     var consts = [_]Value{Value.int(1)};
-    var exits = [_]S{ .{ .slot = 2, .ref = 8 }, .{ .slot = 0, .ref = 10 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
 
     // i=1..5: commits 4 iterations (1+2+3+4=10), exits when i==5 (5<5 false).
     try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.int(0) });
@@ -2035,12 +2076,12 @@ test "nativegen: a guard_int failure side-exits with completed==0" {
         .{ .op = .guard_true, .a = 4 }, // 5
         .{ .op = .konst, .aux = 0 }, // 6: 1
         .{ .op = .add, .a = 0, .b = 6 }, // 7: i+1
+        .{ .op = .phi, .b = 7, .aux = 0 },
         .{ .op = .loop }, // 8
     };
     var consts = [_]Value{Value.int(1)};
-    var exits = [_]S{.{ .slot = 0, .ref = 7 }};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     // limit is a float → guard_int #3 fails on the very first iteration.
     try expectMatch(&t, &.{ Value.int(0), Value.float(5.0) });
 }
@@ -2056,12 +2097,13 @@ test "nativegen: a loop-carried boolean is boxed with the boolean tag" {
         .{ .op = .konst, .aux = 1 }, // 4: 1
         .{ .op = .add, .a = 0, .b = 4 }, // 5: i + 1
         .{ .op = .guard_true, .a = 3 }, // 6
+        .{ .op = .phi, .b = 5, .aux = 0 },
+        .{ .op = .phi, .b = 3, .aux = 1 },
         .{ .op = .loop }, // 7
     };
     var consts = [_]Value{ Value.int(10), Value.int(1) };
-    var exits = [_]S{ .{ .slot = 0, .ref = 5 }, .{ .slot = 1, .ref = 3 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     // r1 must end as boolean(true) (tag=1), NOT int(1) (tag=2) — the oracle catches it.
     try expectMatch(&t, &.{ Value.int(0), Value.nil() });
 }
@@ -2077,12 +2119,12 @@ test "nativegen: guard_true on an integer always passes (int 0 is truthy)" {
         .{ .op = .guard_true, .a = 4 }, // 5
         .{ .op = .konst, .aux = 1 }, // 6: 1
         .{ .op = .add, .a = 0, .b = 6 }, // 7: i+1
+        .{ .op = .phi, .b = 7, .aux = 0 },
         .{ .op = .loop }, // 8
     };
     var consts = [_]Value{ Value.int(3), Value.int(1) };
-    var exits = [_]S{.{ .slot = 0, .ref = 7 }};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     // i=0,1,2 commit (guard_true on int 0 must NOT exit); exits at i=3. completed==3.
     try expectMatch(&t, &.{Value.int(0)});
 }
@@ -2093,12 +2135,12 @@ test "nativegen: guard_false on an integer side-exits immediately" {
         .{ .op = .slot_load, .aux = 0 }, // 0
         .{ .op = .guard_int, .a = 0 }, // 1
         .{ .op = .guard_false, .a = 0 }, // 2: int is truthy → guard_false fails
+        .{ .op = .phi, .b = 0, .aux = 0 },
         .{ .op = .loop }, // 3
     };
     var consts = [_]Value{};
-    var exits = [_]S{.{ .slot = 0, .ref = 0 }};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try expectMatch(&t, &.{Value.int(5)}); // completed==0, regs unchanged
 }
 
@@ -2122,12 +2164,13 @@ test "nativegen(F1): float-accumulate loop matches the strict-FP oracle (movq co
         .{ .op = .add, .a = 6, .b = 8, .ty = .float }, // 9: acc + 0.1 → float
         .{ .op = .konst, .aux = 1 }, // 10: 1 (int)
         .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1 (int)
+        .{ .op = .phi, .b = 9, .aux = 2 },
+        .{ .op = .phi, .b = 11, .aux = 0 },
         .{ .op = .loop }, // 12
     };
     var consts = [_]Value{ Value.float(0.1), Value.int(1) };
-    var exits = [_]S{ .{ .slot = 2, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     // 0.1 is not exactly representable: native must accumulate it bit-identically to
     // the oracle's strict-FP addsd (the classic 0.1-drift). 10 iterations.
     try expectMatch(&t, &.{ Value.int(0), Value.int(10), Value.float(0.0) });
@@ -2151,12 +2194,13 @@ test "nativegen(F1): mixed int+float add promotes the int operand via cvtsi2sd" 
         .{ .op = .add, .a = 6, .b = 0, .ty = .float }, // 8: acc + i (int promoted)
         .{ .op = .konst, .aux = 0 }, // 9: 1
         .{ .op = .add, .a = 0, .b = 9 }, // 10: i + 1
+        .{ .op = .phi, .b = 8, .aux = 2 },
+        .{ .op = .phi, .b = 10, .aux = 0 },
         .{ .op = .loop }, // 11
     };
     var consts = [_]Value{Value.int(1)};
-    var exits = [_]S{ .{ .slot = 2, .ref = 8 }, .{ .slot = 0, .ref = 10 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     // i=1..4 → acc = 1+2+3+4 = 10.0 (exact). cvtsi2sd round-to-nearest matches @floatFromInt.
     try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.float(0.0) });
     // A larger run whose partial sums are non-exact once divided would also match,
@@ -2183,12 +2227,13 @@ test "nativegen(F1): float sub and mul preserve operand order, bit-exact" {
         .{ .op = .sub, .a = 9, .b = 10, .ty = .float }, // 11: (acc*1.5) - 0.25
         .{ .op = .konst, .aux = 2 }, // 12: 1 (int)
         .{ .op = .add, .a = 0, .b = 12 }, // 13: i + 1
+        .{ .op = .phi, .b = 11, .aux = 2 },
+        .{ .op = .phi, .b = 13, .aux = 0 },
         .{ .op = .loop }, // 14
     };
     var consts = [_]Value{ Value.float(1.5), Value.float(0.25), Value.int(1) };
-    var exits = [_]S{ .{ .slot = 2, .ref = 11 }, .{ .slot = 0, .ref = 13 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try expectMatch(&t, &.{ Value.int(0), Value.int(6), Value.float(1.0) });
     try expectMatch(&t, &.{ Value.int(0), Value.int(3), Value.float(-2.0) });
 }
@@ -2209,13 +2254,14 @@ test "nativegen(F1): a carried slot loaded float but stored int bails (lk != sk)
         .{ .op = .guard_float, .a = 6 }, // 7
         .{ .op = .konst, .aux = 0 }, // 8: 1 (int)
         .{ .op = .add, .a = 0, .b = 8 }, // 9: i + 1 (int)
+        .{ .op = .phi, .b = 9, .aux = 0 },
+        .{ .op = .phi, .b = 9, .aux = 2 },
         .{ .op = .loop }, // 10
     };
     var consts = [_]Value{Value.int(1)};
     // slot 2 carried: load=float(ref6), store=int(ref9) → mismatch.
-    var exits = [_]S{ .{ .slot = 0, .ref = 9 }, .{ .slot = 2, .ref = 9 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try expectBail(&t);
 }
 
@@ -2234,12 +2280,12 @@ test "nativegen(F1): a malformed int+int add stamped ty=.float bails (no float/i
         .{ .op = .guard_true, .a = 4 }, // 5
         .{ .op = .konst, .aux = 0 }, // 6: 1 (int)
         .{ .op = .add, .a = 0, .b = 6, .ty = .float }, // 7: int+int but LIES ty=.float
+        .{ .op = .phi, .b = 7, .aux = 0 },
         .{ .op = .loop }, // 8
     };
     var consts = [_]Value{Value.int(1)};
-    var exits = [_]S{.{ .slot = 0, .ref = 7 }};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try expectBail(&t);
 }
 
@@ -2264,13 +2310,14 @@ fn expectFloatCmp(op: trace.IrOp, x: f64, y: f64) !void {
         .{ .op = op, .a = 5, .b = 7 }, // 9: x <op> y → bool (the float compare)
         .{ .op = .konst, .aux = 1 }, // 10: 1
         .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1
+        .{ .op = .phi, .b = 9, .aux = 3 },
+        .{ .op = .phi, .b = 11, .aux = 0 },
         .{ .op = .loop }, // 12
     };
     var consts = [_]Value{ Value.int(1), Value.int(1) };
     // slot 3 = the bool result (write-only); slot 0 = the counter (carried).
-    var exits = [_]S{ .{ .slot = 3, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try expectMatch(&t, &.{ Value.int(0), Value.float(x), Value.float(y), Value.nil() });
 }
 
@@ -2327,12 +2374,12 @@ test "nativegen(F2): a float-controlled while loop compiles (ucomisd drives guar
         .{ .op = .guard_true, .a = 4 }, // 5
         .{ .op = .konst, .aux = 0 }, // 6: 1.5
         .{ .op = .add, .a = 0, .b = 6, .ty = .float }, // 7: x + 1.5
+        .{ .op = .phi, .b = 7, .aux = 0 },
         .{ .op = .loop }, // 8
     };
     var consts = [_]Value{Value.float(1.5)};
-    var exits = [_]S{.{ .slot = 0, .ref = 7 }};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     // x: 0.0, 1.5, 3.0, 4.5 (<5), then 6.0 (>=5) → 4 commits.
     try expectMatch(&t, &.{ Value.float(0.0), Value.float(5.0) });
     // Already past the limit → 0 commits, x flushed unchanged as a float.
@@ -2357,12 +2404,13 @@ test "nativegen(F2): a mixed int/float compare bails (oracle compares exactly, n
         .{ .op = .lt, .a = 5, .b = 7 }, // 9: float < int — MIXED → bail
         .{ .op = .konst, .aux = 1 }, // 10: 1
         .{ .op = .add, .a = 0, .b = 10 }, // 11
+        .{ .op = .phi, .b = 9, .aux = 3 },
+        .{ .op = .phi, .b = 11, .aux = 0 },
         .{ .op = .loop }, // 12
     };
     var consts = [_]Value{ Value.int(1), Value.int(1) };
-    var exits = [_]S{ .{ .slot = 3, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try expectBail(&t);
 }
 
@@ -2388,13 +2436,14 @@ fn expectFloatDiv(x: f64, y: f64) !void {
         .{ .op = .div, .a = 5, .b = 7, .ty = .float }, // 9: x / y → float (divsd)
         .{ .op = .konst, .aux = 1 }, // 10: 1
         .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1
+        .{ .op = .phi, .b = 9, .aux = 3 },
+        .{ .op = .phi, .b = 11, .aux = 0 },
         .{ .op = .loop }, // 12
     };
     var consts = [_]Value{ Value.int(1), Value.int(1) };
     // slot 3 is write-only float (the quotient); slot 0 is the int counter.
-    var exits = [_]S{ .{ .slot = 3, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     // regs: i=0, x, y, slot3=placeholder (overwritten by the quotient each iteration).
     try expectMatch(&t, &.{ Value.int(0), Value.float(x), Value.float(y), Value.float(0.0) });
 }
@@ -2427,12 +2476,13 @@ test "nativegen(F3): a float-accumulate loop dividing by a constant matches (car
         .{ .op = .div, .a = 6, .b = 8, .ty = .float }, // 9: acc / 3.0
         .{ .op = .konst, .aux = 1 }, // 10: 1 (int)
         .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1
+        .{ .op = .phi, .b = 9, .aux = 2 },
+        .{ .op = .phi, .b = 11, .aux = 0 },
         .{ .op = .loop }, // 12
     };
     var consts = [_]Value{ Value.float(3.0), Value.int(1) };
-    var exits = [_]S{ .{ .slot = 2, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try expectMatch(&t, &.{ Value.int(0), Value.int(8), Value.float(1.0) });
     try expectMatch(&t, &.{ Value.int(3), Value.int(3), Value.float(1.0) }); // 0 iters, acc flushed unchanged
 }
@@ -2456,12 +2506,13 @@ test "nativegen(F3): int/int division yields a float via cvtsi2sd on both operan
         .{ .op = .div, .a = 5, .b = 7, .ty = .float }, // 9: x / y → float
         .{ .op = .konst, .aux = 1 }, // 10: 1
         .{ .op = .add, .a = 0, .b = 10 }, // 11
+        .{ .op = .phi, .b = 9, .aux = 3 },
+        .{ .op = .phi, .b = 11, .aux = 0 },
         .{ .op = .loop }, // 12
     };
     var consts = [_]Value{ Value.int(1), Value.int(1) };
-    var exits = [_]S{ .{ .slot = 3, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try expectMatch(&t, &.{ Value.int(0), Value.int(7), Value.int(2), Value.float(0.0) }); // 7/2 = 3.5
     try expectMatch(&t, &.{ Value.int(0), Value.int(6), Value.int(3), Value.float(0.0) }); // 6/3 = 2.0 (exact)
     try expectMatch(&t, &.{ Value.int(0), Value.int(1), Value.int(0), Value.float(0.0) }); // 1/0 = +inf
@@ -2491,12 +2542,13 @@ test "nativegen: derived guard_int on int arithmetic compiles and matches (#1)" 
         .{ .op = .add, .a = 6, .b = 11 }, // 13: acc + (i+7)^2
         .{ .op = .konst, .aux = 1 }, // 14: 1
         .{ .op = .add, .a = 0, .b = 14 }, // 15: i + 1
+        .{ .op = .phi, .b = 13, .aux = 2 },
+        .{ .op = .phi, .b = 15, .aux = 0 },
         .{ .op = .loop }, // 16
     };
     var consts = [_]Value{ Value.int(7), Value.int(1) };
-    var exits = [_]S{ .{ .slot = 2, .ref = 13 }, .{ .slot = 0, .ref = 15 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     // i=1,2,3 commit: acc = 8^2+9^2+10^2 = 245; exits at i==4.
     try expectMatch(&t, &.{ Value.int(1), Value.int(4), Value.int(0) });
     // 0 commits (i already == limit): regs unchanged.
@@ -2514,11 +2566,11 @@ test "nativegen: bails on unsupported traces" {
             .{ .op = .guard_int, .a = 0 },
             .{ .op = .konst, .aux = 0 },
             .{ .op = .add, .a = 0, .b = 2 },
+            .{ .op = .phi, .b = 3, .aux = 0 },
             .{ .op = .loop },
         };
         var consts = [_]Value{Value.float(1.5)};
-        var exits = [_]S{.{ .slot = 0, .ref = 3 }};
-        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
         try expectBail(&t);
     }
     // (b) a slot_load with no covering guard_int.
@@ -2527,11 +2579,11 @@ test "nativegen: bails on unsupported traces" {
             .{ .op = .slot_load, .aux = 0 },
             .{ .op = .konst, .aux = 0 },
             .{ .op = .add, .a = 0, .b = 1 },
+            .{ .op = .phi, .b = 2, .aux = 0 },
             .{ .op = .loop },
         };
         var consts = [_]Value{Value.int(1)};
-        var exits = [_]S{.{ .slot = 0, .ref = 2 }};
-        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
         try expectBail(&t);
     }
     // (c) guard_number (a float passes it → can't prove int).
@@ -2542,8 +2594,7 @@ test "nativegen: bails on unsupported traces" {
             .{ .op = .loop },
         };
         var consts = [_]Value{};
-        var exits = [_]S{};
-        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
         try expectBail(&t);
     }
     // (d) a deferred op (mod — div now compiles via the XMM path, F3; mod still
@@ -2554,11 +2605,11 @@ test "nativegen: bails on unsupported traces" {
             .{ .op = .guard_int, .a = 0 },
             .{ .op = .konst, .aux = 0 },
             .{ .op = .mod, .a = 0, .b = 2 },
+            .{ .op = .phi, .b = 0, .aux = 0 },
             .{ .op = .loop },
         };
         var consts = [_]Value{Value.int(2)};
-        var exits = [_]S{.{ .slot = 0, .ref = 0 }};
-        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
         try expectBail(&t);
     }
     // (e) [#1] a guard_int on a *bool* (a compare result) is not discharge-able →
@@ -2570,11 +2621,11 @@ test "nativegen: bails on unsupported traces" {
             .{ .op = .konst, .aux = 0 }, // 2: 5
             .{ .op = .lt, .a = 0, .b = 2 }, // 3: i < 5  → bool
             .{ .op = .guard_int, .a = 3 }, // 4: guard_int on a bool → bail
+            .{ .op = .phi, .b = 0, .aux = 0 },
             .{ .op = .loop }, // 5
         };
         var consts = [_]Value{Value.int(5)};
-        var exits = [_]S{.{ .slot = 0, .ref = 0 }};
-        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
         try expectBail(&t);
     }
 }
@@ -2610,12 +2661,13 @@ test "nativegen win2: accumulator coalesces when no guard follows the update" {
         .{ .op = .add, .a = 6, .b = 0 }, // 8: acc + i   (after the guard → coalesces)
         .{ .op = .konst, .aux = 0 }, // 9: 1
         .{ .op = .add, .a = 0, .b = 9 }, // 10: i + 1    (after the guard → coalesces)
+        .{ .op = .phi, .b = 8, .aux = 2 },
+        .{ .op = .phi, .b = 10, .aux = 0 },
         .{ .op = .loop }, // 11
     };
     var consts = [_]Value{Value.int(1)};
-    var exits = [_]S{ .{ .slot = 2, .ref = 8 }, .{ .slot = 0, .ref = 10 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try testing.expect(try slotCoalesced(&t, 2)); // acc, left-operand home
     try testing.expect(try slotCoalesced(&t, 0)); // i,  left-operand home
     try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.int(0) });
@@ -2638,12 +2690,13 @@ test "nativegen win2: a guard AFTER the accumulation blocks coalescing (cond 1)"
         .{ .op = .add, .a = 4, .b = 0 }, // 8: acc + i    (precedes a later guard)
         .{ .op = .lt, .a = 7, .b = 1 }, // 9: (i+1) < limit
         .{ .op = .guard_true, .a = 9 }, // 10 ← guard AFTER the acc update
+        .{ .op = .phi, .b = 8, .aux = 2 },
+        .{ .op = .phi, .b = 7, .aux = 0 },
         .{ .op = .loop }, // 11
     };
     var consts = [_]Value{Value.int(1)};
-    var exits = [_]S{ .{ .slot = 2, .ref = 8 }, .{ .slot = 0, .ref = 7 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try testing.expect(!(try slotCoalesced(&t, 2))); // acc must NOT coalesce
     try testing.expect(!(try slotCoalesced(&t, 0))); // i  must NOT coalesce
     // i=1,limit=5 → exits at the guard when i+1==5<5 false; acc/i restored to header.
@@ -2667,13 +2720,15 @@ test "nativegen win2: old value still live blocks coalescing (cond 2)" {
         .{ .op = .add, .a = 6, .b = 0 }, // 8: acc + i
         .{ .op = .konst, .aux = 0 }, // 9: 1
         .{ .op = .add, .a = 0, .b = 9 }, // 10: i + 1
+        .{ .op = .phi, .b = 8, .aux = 2 },
+        .{ .op = .phi, .b = 10, .aux = 0 },
+        .{ .op = .phi, .b = 6, .aux = 3 },
         .{ .op = .loop }, // 11
     };
     var consts = [_]Value{Value.int(1)};
     // slot3 := acc_old (%6), still reading the old acc at the back-edge.
-    var exits = [_]S{ .{ .slot = 2, .ref = 8 }, .{ .slot = 0, .ref = 10 }, .{ .slot = 3, .ref = 6 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try testing.expect(!(try slotCoalesced(&t, 2))); // acc's old value is still live
     try expectMatch(&t, &.{ Value.int(1), Value.int(4), Value.int(0), Value.int(-1) });
 }
@@ -2693,12 +2748,13 @@ test "nativegen win2: commutative-right home coalesces; non-commutative-right do
         .{ .op = .add, .a = 0, .b = 6 }, // 8: i + acc   (home = b, commutative)
         .{ .op = .konst, .aux = 0 }, // 9
         .{ .op = .add, .a = 0, .b = 9 }, // 10: i + 1
+        .{ .op = .phi, .b = 8, .aux = 2 },
+        .{ .op = .phi, .b = 10, .aux = 0 },
         .{ .op = .loop }, // 11
     };
     var consts = [_]Value{Value.int(1)};
-    var add_exits = [_]S{ .{ .slot = 2, .ref = 8 }, .{ .slot = 0, .ref = 10 } };
     var es = [_]u16{};
-    const ta = Trace{ .anchor = undefined, .instrs = &add_instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &add_exits };
+    const ta = Trace{ .anchor = undefined, .instrs = &add_instrs, .consts = &consts, .entry_slots = &es };
     try testing.expect(try slotCoalesced(&ta, 2));
     try expectMatch(&ta, &.{ Value.int(1), Value.int(5), Value.int(0) });
 
@@ -2717,11 +2773,12 @@ test "nativegen win2: commutative-right home coalesces; non-commutative-right do
         .{ .op = .sub, .a = 8, .b = 6 }, // 9: 100 - acc   (home = b, NON-commutative)
         .{ .op = .konst, .aux = 0 }, // 10: 1
         .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1
+        .{ .op = .phi, .b = 9, .aux = 2 },
+        .{ .op = .phi, .b = 11, .aux = 0 },
         .{ .op = .loop }, // 12
     };
     var consts2 = [_]Value{ Value.int(1), Value.int(100) };
-    var sub_exits = [_]S{ .{ .slot = 2, .ref = 9 }, .{ .slot = 0, .ref = 11 } };
-    const ts = Trace{ .anchor = undefined, .instrs = &sub_instrs, .consts = &consts2, .entry_slots = &es, .exit_stores = &sub_exits };
+    const ts = Trace{ .anchor = undefined, .instrs = &sub_instrs, .consts = &consts2, .entry_slots = &es };
     try testing.expect(!(try slotCoalesced(&ts, 2)));
     try expectMatch(&ts, &.{ Value.int(1), Value.int(4), Value.int(0) });
 }
@@ -2744,12 +2801,13 @@ test "nativegen win2: unary into a carried slot whose operand is NOT its home" {
         .{ .op = .neg, .a = 8 }, // 10: -y  (stored into x; operand is y, not x)
         .{ .op = .konst, .aux = 0 }, // 11: 1
         .{ .op = .add, .a = 0, .b = 11 }, // 12: i + 1
+        .{ .op = .phi, .b = 10, .aux = 2 },
+        .{ .op = .phi, .b = 12, .aux = 0 },
         .{ .op = .loop }, // 13
     };
     var consts = [_]Value{Value.int(1)};
-    var exits = [_]S{ .{ .slot = 2, .ref = 10 }, .{ .slot = 0, .ref = 12 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try testing.expect(!(try slotCoalesced(&t, 2))); // x = -y must NOT coalesce into home(x)
     try expectMatch(&t, &.{ Value.int(0), Value.int(3), Value.int(0), Value.int(7) });
 }
@@ -2773,13 +2831,15 @@ test "nativegen win2: a coalesced result consumed by a later op is not scavenged
         .{ .op = .konst, .aux = 1 }, // 10: 7
         .{ .op = .band, .a = 9, .b = 10 }, // 11: acc_new band 7  (reads the coalesced value)
         .{ .op = .add, .a = 0, .b = 8 }, // 12: i + 1
+        .{ .op = .phi, .b = 9, .aux = 2 },
+        .{ .op = .phi, .b = 11, .aux = 3 },
+        .{ .op = .phi, .b = 12, .aux = 0 },
         .{ .op = .loop }, // 13
     };
     var consts = [_]Value{ Value.int(1), Value.int(7) };
     // slot3 := acc_new band 7 (write-only); acc := acc+1; i := i+1.
-    var exits = [_]S{ .{ .slot = 2, .ref = 9 }, .{ .slot = 3, .ref = 11 }, .{ .slot = 0, .ref = 12 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try testing.expect(try slotCoalesced(&t, 2)); // acc coalesces
     try expectMatch(&t, &.{ Value.int(0), Value.int(5), Value.int(0), Value.int(0) });
 }
@@ -2803,12 +2863,14 @@ test "nativegen win2: chained accumulators both coalesce (b reads new a)" {
         .{ .op = .add, .a = 6, .b = 10 }, // 11: a + 1   (→ home(a))
         .{ .op = .add, .a = 8, .b = 11 }, // 12: b + a_new (→ home(b), reads home(a))
         .{ .op = .add, .a = 0, .b = 10 }, // 13: i + 1
+        .{ .op = .phi, .b = 11, .aux = 2 },
+        .{ .op = .phi, .b = 12, .aux = 3 },
+        .{ .op = .phi, .b = 13, .aux = 0 },
         .{ .op = .loop }, // 14
     };
     var consts = [_]Value{Value.int(1)};
-    var exits = [_]S{ .{ .slot = 2, .ref = 11 }, .{ .slot = 3, .ref = 12 }, .{ .slot = 0, .ref = 13 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try testing.expect(try slotCoalesced(&t, 2)); // a
     try testing.expect(try slotCoalesced(&t, 3)); // b
     try expectMatch(&t, &.{ Value.int(0), Value.int(4), Value.int(10), Value.int(100) });
@@ -2832,13 +2894,15 @@ test "nativegen: a swap loop exercises a register home cycle" {
         .{ .op = .guard_int, .a = 8 }, // 9
         .{ .op = .konst, .aux = 0 }, // 10: 1
         .{ .op = .add, .a = 0, .b = 10 }, // 11: i + 1
+        .{ .op = .phi, .b = 8, .aux = 0 },
+        .{ .op = .phi, .b = 6, .aux = 1 },
+        .{ .op = .phi, .b = 11, .aux = 2 },
         .{ .op = .loop }, // 12
     };
     var consts = [_]Value{Value.int(1)};
     // a<-b(ref8), b<-a(ref6), i<-i+1(ref11)
-    var exits = [_]S{ .{ .slot = 0, .ref = 8 }, .{ .slot = 1, .ref = 6 }, .{ .slot = 2, .ref = 11 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     // a=10, b=20, i=0, limit=3: three swaps ⇒ a=20, b=10. The oracle is the judge.
     try expectMatch(&t, &.{ Value.int(10), Value.int(20), Value.int(0), Value.int(3) });
     // limit=0: zero iterations, no swap.
@@ -2866,12 +2930,13 @@ test "nativegen: operand-chain reuses one register across a left-folded sum" {
         .{ .op = .add, .a = 10, .b = 11 }, // 12: t10 + 100    (reuses again)
         .{ .op = .konst, .aux = 2 }, // 13: 1
         .{ .op = .add, .a = 0, .b = 13 }, // 14: i + 1
+        .{ .op = .phi, .b = 12, .aux = 2 },
+        .{ .op = .phi, .b = 14, .aux = 0 },
         .{ .op = .loop }, // 15
     };
     var consts = [_]Value{ Value.int(10), Value.int(100), Value.int(1) };
-    var exits = [_]S{ .{ .slot = 2, .ref = 12 }, .{ .slot = 0, .ref = 14 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
     try expectMatch(&t, &.{ Value.int(0), Value.int(4), Value.int(0) });
     try expectMatch(&t, &.{ Value.int(2), Value.int(2), Value.int(7) }); // zero iters
 }
@@ -2882,8 +2947,6 @@ test "nativegen: more carried+invariant slots than registers forces spilled home
     // acc = acc + i + (x0..x9), with 10 invariant slots → 13 homes > 11 GPRs ⇒ spills.
     var ins: std.ArrayListUnmanaged(I) = .empty;
     defer ins.deinit(gpa);
-    var exits: std.ArrayListUnmanaged(S) = .empty;
-    defer exits.deinit(gpa);
 
     const r_i: u16 = @intCast(ins.items.len);
     try ins.append(gpa, .{ .op = .slot_load, .aux = 0 });
@@ -2921,14 +2984,14 @@ test "nativegen: more carried+invariant slots than registers forces spilled home
     try ins.append(gpa, .{ .op = .konst, .aux = 0 });
     const r_inc: u16 = @intCast(ins.items.len);
     try ins.append(gpa, .{ .op = .add, .a = r_i, .b = r_one });
+    // slot-bound φs (the old exit_stores): acc←sum, i←r_inc, spliced before `loop`.
+    try ins.append(gpa, .{ .op = .phi, .b = sum, .aux = 2 }); // acc
+    try ins.append(gpa, .{ .op = .phi, .b = r_inc, .aux = 0 }); // i
     try ins.append(gpa, .{ .op = .loop });
-
-    try exits.append(gpa, .{ .slot = 2, .ref = sum }); // acc
-    try exits.append(gpa, .{ .slot = 0, .ref = r_inc }); // i
 
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = ins.items, .consts = &consts, .entry_slots = &es, .exit_stores = exits.items };
+    const t = Trace{ .anchor = undefined, .instrs = ins.items, .consts = &consts, .entry_slots = &es };
 
     var regs: [13]Value = undefined;
     regs[0] = Value.int(0); // i
@@ -2954,12 +3017,13 @@ test "nativegen: analyze classifies slots and pins disjoint homes" {
         .{ .op = .add, .a = 6, .b = 0 }, // 8: acc + i
         .{ .op = .konst, .aux = 0 }, // 9: 1
         .{ .op = .add, .a = 0, .b = 9 }, // 10: i + 1
+        .{ .op = .phi, .b = 8, .aux = 2 },
+        .{ .op = .phi, .b = 10, .aux = 0 },
         .{ .op = .loop }, // 11
     };
     var consts = [_]Value{Value.int(1)};
-    var exits = [_]S{ .{ .slot = 2, .ref = 8 }, .{ .slot = 0, .ref = 10 } };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
 
     const kinds = try testing.allocator.alloc(Kind, instrs.len);
     defer testing.allocator.free(kinds);
@@ -3004,12 +3068,12 @@ test "nativegen: analyze rejects a type-unstable carried slot" {
         .{ .op = .guard_int, .a = 0 }, // 1
         .{ .op = .konst, .aux = 0 }, // 2: 3
         .{ .op = .lt, .a = 0, .b = 2 }, // 3: i < 3 (BOOL)
+        .{ .op = .phi, .b = 3, .aux = 0 }, // slot 0 stored as the bool
         .{ .op = .loop }, // 4
     };
     var consts = [_]Value{Value.int(3)};
-    var exits = [_]S{.{ .slot = 0, .ref = 3 }}; // slot 0 stored as the bool
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
 
     const kinds = try testing.allocator.alloc(Kind, instrs.len);
     defer testing.allocator.free(kinds);
@@ -3107,11 +3171,12 @@ test "nativegen: bool-lane t[k] read scan matches the interpreter" {
         .{ .op = .aload, .a = 5, .aux = lane }, // 8: v = t[index]
         .{ .op = .konst, .aux = 0 }, // 9: 1
         .{ .op = .add, .a = 3, .b = 9 }, // 10: index + 1
+        .{ .op = .phi, .b = 10, .aux = 1 },
+        .{ .op = .phi, .b = 8, .aux = 2 },
         .{ .op = .loop }, // 11
     };
-    var exits = [_]S{ .{ .slot = 1, .ref = 10 }, .{ .slot = 2, .ref = 8 } };
     var es = [_]u16{};
-    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
 
     // Start at 2 (first present): scans the whole dense run, bounds-exits past K.
     try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(2), Value.nil() });
@@ -3166,11 +3231,12 @@ test "nativegen: int-lane t[k] read scan matches the interpreter (i8/i16/i32/i64
             .{ .op = .aload, .a = 5, .aux = lane }, // 8: v = t[index]
             .{ .op = .konst, .aux = 0 }, // 9: 1
             .{ .op = .add, .a = 3, .b = 9 }, // 10: index + 1
+            .{ .op = .phi, .b = 10, .aux = 1 },
+            .{ .op = .phi, .b = 8, .aux = 2 },
             .{ .op = .loop }, // 11
         };
-        var exits = [_]S{ .{ .slot = 1, .ref = 10 }, .{ .slot = 2, .ref = 8 } };
         var es = [_]u16{};
-        const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+        const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
 
         try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(2), Value.nil() }); // full scan
         try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(1), Value.nil() }); // hole at key 1
@@ -3200,12 +3266,13 @@ test "nativegen: guard_table failure side-exits natively with completed==0" {
         .{ .op = .aload, .a = 5, .aux = lane },
         .{ .op = .konst, .aux = 0 },
         .{ .op = .add, .a = 3, .b = 9 },
+        .{ .op = .phi, .b = 10, .aux = 1 },
+        .{ .op = .phi, .b = 8, .aux = 2 },
         .{ .op = .loop },
     };
     var consts = [_]Value{Value.int(1)};
-    var exits = [_]S{ .{ .slot = 1, .ref = 10 }, .{ .slot = 2, .ref = 8 } };
     var es = [_]u16{};
-    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
 
     // r0 is an int, not a table → the prologue guard_table check fails (completed==0,
     // regs untouched). The oracle agrees.
@@ -3230,12 +3297,13 @@ test "nativegen: an f64 array lane bails to tier-1a" {
         .{ .op = .aload, .a = 5, .aux = lane },
         .{ .op = .konst, .aux = 0 },
         .{ .op = .add, .a = 3, .b = 9 },
+        .{ .op = .phi, .b = 10, .aux = 1 },
+        .{ .op = .phi, .b = 8, .aux = 2 },
         .{ .op = .loop },
     };
     var consts = [_]Value{Value.int(1)};
-    var exits = [_]S{ .{ .slot = 1, .ref = 10 }, .{ .slot = 2, .ref = 8 } };
     var es = [_]u16{};
-    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
     try expectBail(&tr);
 }
 
@@ -3257,13 +3325,14 @@ test "nativegen: a carried .ptr (table) slot bails (no int/ptr type confusion)" 
         .{ .op = .aload, .a = 5, .aux = lane }, // 8
         .{ .op = .konst, .aux = 0 }, // 9: 1 (an int)
         .{ .op = .add, .a = 3, .b = 9 }, // 10: index+1
+        .{ .op = .phi, .b = 9, .aux = 0 },
+        .{ .op = .phi, .b = 10, .aux = 1 },
         .{ .op = .loop }, // 11
     };
     var consts = [_]Value{Value.int(1)};
     // slot 0 (the table) carried as an int store → the type-confusion trigger.
-    var exits = [_]S{ .{ .slot = 0, .ref = 9 }, .{ .slot = 1, .ref = 10 } };
     var es = [_]u16{};
-    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
     try expectBail(&tr);
 }
 
@@ -3285,12 +3354,13 @@ test "nativegen: guard_present/aload without a dominating guard_bounds bails" {
         .{ .op = .aload, .a = 5, .aux = lane }, // 8
         .{ .op = .konst, .aux = 0 }, // 9
         .{ .op = .add, .a = 3, .b = 9 }, // 10
+        .{ .op = .phi, .b = 10, .aux = 1 },
+        .{ .op = .phi, .b = 8, .aux = 2 },
         .{ .op = .loop }, // 11
     };
     var consts = [_]Value{Value.int(1)};
-    var exits = [_]S{ .{ .slot = 1, .ref = 10 }, .{ .slot = 2, .ref = 8 } };
     var es = [_]u16{};
-    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
     try expectBail(&tr);
 }
 
@@ -3321,7 +3391,7 @@ fn expectTablesEqual(ta: *table.Table, tb: *table.Table, len: i64) !void {
 /// bool lane. r0 = table (invariant .ptr), r1 = index (carried int). This is
 /// exactly nsieve's sieve-clearing inner loop — a pure write of a constant, so
 /// there is no `aload` and the C1 rule is trivially satisfied.
-fn boolWriteTrace(full: *[12]I, consts: *[2]Value, exits: *[1]S, es: *[0]u16) Trace {
+fn boolWriteTrace(full: *[13]I, consts: *[2]Value, es: *[0]u16) Trace {
     const lane: i32 = @intFromEnum(arr.Lane.boolean);
     consts.* = .{ Value.boolean(false), Value.int(1) };
     full.* = .{
@@ -3336,21 +3406,20 @@ fn boolWriteTrace(full: *[12]I, consts: *[2]Value, exits: *[1]S, es: *[0]u16) Tr
         .{ .op = .astore, .a = 5, .b = 7, .aux = lane }, // 8: t[index] = false
         .{ .op = .konst, .aux = 1 }, // 9: 1
         .{ .op = .add, .a = 3, .b = 9 }, // 10: index + 1
-        .{ .op = .loop }, // 11
+        .{ .op = .phi, .b = 10, .aux = 1 }, // 11: index carry (was exit_stores)
+        .{ .op = .loop }, // 12
     };
-    exits.* = .{.{ .slot = 1, .ref = 10 }};
-    return Trace{ .anchor = undefined, .instrs = full, .consts = consts, .entry_slots = es, .exit_stores = exits };
+    return Trace{ .anchor = undefined, .instrs = full, .consts = consts, .entry_slots = es };
 }
 
 test "nativegen: bool-lane t[k]=false write matches the interpreter (heap + regs)" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     const K: i64 = 48;
-    var full: [12]I = undefined;
+    var full: [13]I = undefined;
     var consts: [2]Value = undefined;
-    var exits: [1]S = undefined;
     var es: [0]u16 = undefined;
-    const tr = boolWriteTrace(&full, &consts, &exits, &es);
+    const tr = boolWriteTrace(&full, &consts, &es);
 
     // Oracle (tier-1a) and native run on SEPARATE tables — the trace mutates the
     // heap, so a shared table would double-apply. The final heaps must match.
@@ -3388,11 +3457,10 @@ test "nativegen: astore deopt-replay leaves a deterministic heap (idempotent re-
     // table. The result must equal a single clean run on a DISTINCT table object.
     const gpa = testing.allocator;
     const K: i64 = 40;
-    var full: [12]I = undefined;
+    var full: [13]I = undefined;
     var consts: [2]Value = undefined;
-    var exits: [1]S = undefined;
     var es: [0]u16 = undefined;
-    const tr = boolWriteTrace(&full, &consts, &exits, &es);
+    const tr = boolWriteTrace(&full, &consts, &es);
 
     // t_replay: native pass, then a full oracle re-run over the same heap.
     const t_replay = try buildBoolTable(gpa, K);
@@ -3438,7 +3506,7 @@ fn buildIntTable(gpa: std.mem.Allocator, K: i64, bump: i64) !*table.Table {
 /// `while (k in array) { t[k] = C; k += 1 }` over an int lane, with the mandatory
 /// guard_fits ahead of the store. r0 = table (invariant .ptr), r1 = index (carried
 /// int). A pure constant write → no `aload`, so C1 is trivially satisfied.
-fn intWriteTrace(full: *[13]I, consts: *[2]Value, exits: *[1]S, es: *[0]u16, lane: i32, store_const: i64) Trace {
+fn intWriteTrace(full: *[14]I, consts: *[2]Value, es: *[0]u16, lane: i32, store_const: i64) Trace {
     consts.* = .{ Value.int(store_const), Value.int(1) };
     full.* = .{
         .{ .op = .slot_load, .aux = 0 }, // 0: table
@@ -3453,10 +3521,10 @@ fn intWriteTrace(full: *[13]I, consts: *[2]Value, exits: *[1]S, es: *[0]u16, lan
         .{ .op = .astore, .a = 5, .b = 7, .aux = lane }, // 9: t[index] = C
         .{ .op = .konst, .aux = 1 }, // 10: 1
         .{ .op = .add, .a = 3, .b = 10 }, // 11: index + 1
-        .{ .op = .loop }, // 12
+        .{ .op = .phi, .b = 11, .aux = 1 }, // 12: index carry (was exit_stores)
+        .{ .op = .loop }, // 13
     };
-    exits.* = .{.{ .slot = 1, .ref = 11 }};
-    return Trace{ .anchor = undefined, .instrs = full, .consts = consts, .entry_slots = es, .exit_stores = exits };
+    return Trace{ .anchor = undefined, .instrs = full, .consts = consts, .entry_slots = es };
 }
 
 test "nativegen: int-lane t[k]=C write matches the interpreter (i8/i16/i32/i64)" {
@@ -3477,11 +3545,10 @@ test "nativegen: int-lane t[k]=C write matches the interpreter (i8/i16/i32/i64)"
         // A small negative constant exercises a width-truncating store of a
         // sign-extended value (the low w bytes are the two's-complement encoding).
         const C: i64 = -7;
-        var full: [13]I = undefined;
+        var full: [14]I = undefined;
         var consts: [2]Value = undefined;
-        var exits: [1]S = undefined;
         var es: [0]u16 = undefined;
-        const tr = intWriteTrace(&full, &consts, &exits, &es, lane, C);
+        const tr = intWriteTrace(&full, &consts, &es, lane, C);
 
         // Separate tables: the trace mutates the heap, so a shared table would
         // double-apply. The final heaps (and carried index) must match.
@@ -3546,11 +3613,11 @@ test "nativegen: int-lane astore guard_fits side-exits when the value overflows 
         .{ .op = .astore, .a = 5, .b = 3, .aux = lane }, // 8: t[index] = index
         .{ .op = .konst, .aux = 0 }, // 9: 1
         .{ .op = .add, .a = 3, .b = 9 }, // 10: index + 1
+        .{ .op = .phi, .b = 10, .aux = 1 },
         .{ .op = .loop }, // 11
     };
-    var exits = [_]S{.{ .slot = 1, .ref = 10 }};
     var es = [_]u16{};
-    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
 
     const start: i64 = 120; // 120..127 fit i8; 128 does not → exit on the 9th key
     const t_o = try makeT(gpa, K);
@@ -3582,11 +3649,10 @@ test "nativegen: int-lane astore deopt-replay leaves a deterministic heap (idemp
     const K: i64 = 40;
     const lane: i32 = @intFromEnum(arr.Lane.i32);
     const C: i64 = 70_000; // forces i32 nothing here; just a representative i32 value
-    var full: [13]I = undefined;
+    var full: [14]I = undefined;
     var consts: [2]Value = undefined;
-    var exits: [1]S = undefined;
     var es: [0]u16 = undefined;
-    const tr = intWriteTrace(&full, &consts, &exits, &es, lane, C);
+    const tr = intWriteTrace(&full, &consts, &es, lane, C);
 
     const t_replay = try buildIntTable(gpa, K, 100_000); // i32 lane
     defer t_replay.destroy(gpa);

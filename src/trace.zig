@@ -141,9 +141,37 @@ pub const IrOp = enum(u8) {
 
     // ---- close ----
     /// Loop back-edge: the end of the straight-line trace. Carries no operands;
-    /// the loop-carried register writes are in the trace's `exit_stores`.
+    /// the loop-carried register writes are the slot-bound `phi` nodes (each
+    /// `phi` with `aux >= 0` flushes its update to that register at the back-edge).
     loop,
+
+    // ---- loop-carried value (Phase E) ----
+    /// A first-class loop-carried value (a φ at the loop header). `b` = the value
+    /// carried to the next iteration (the *update*; the body def — what an
+    /// `exit_store.ref` used to name), `aux` = the tier-0 register `slot` this φ
+    /// flushes to at commit/deopt (a *slot-bound* φ, `aux >= 0`), or **-1** for an
+    /// *internal* φ that backs no register (strength-reduction's running
+    /// accumulator). `ty` = carried scalar type.
+    ///
+    /// The *init* (the value on loop entry) differs by kind: a **slot-bound** φ's
+    /// init is implicit — it is `regs[aux]`, read fresh each entry exactly as the
+    /// matching `slot_load` does — so `a` is unused (kept 0). An **internal** φ has
+    /// no register, so its init is an explicit ref: `a` = the preheader value
+    /// (Phase E1's hoisted region), seeded once on the first iteration.
+    ///
+    /// A φ whose value is read in the body is *carried* (gets a home + the back-edge
+    /// shuffle); a slot-bound φ never read is *write-only* (just flushed). `b` is the
+    /// one operand allowed to reference a *later* node (the back-edge), exactly as
+    /// `exit_store.ref` always could — well-formedness validates `b < last`, not
+    /// `b < i`. Replaces the implicit `slot_load`+`exit_store` carry (a slot-bound φ
+    /// + its `slot_load` is what an `exit_store`/`slot_load` pair was). Appended at
+    /// the enum's end so `loop`'s ordinal stays stable for the wire format.
+    phi,
 };
+
+/// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
+/// flushes to no tier-0 register. A slot-bound φ stores its register index (≥ 0).
+pub const PHI_INTERNAL: i32 = -1;
 
 /// One IR instruction. `a`/`b` are operand `Ref`s (or unused); `aux` carries a
 /// slot index (`slot_load`) or const-pool index (`konst`); `ty` is the inferred
@@ -187,8 +215,6 @@ pub const Trace = struct {
     consts: []Value,
     /// Tier-0 registers read as inputs, in `slot_load` order (the entry snapshot).
     entry_slots: []u16,
-    /// Loop-carried register writebacks at the back-edge (the exit snapshot).
-    exit_stores: []SlotStore,
     /// Tier-1b native-codegen cache (Phase 8): lazily compiled machine code for
     /// this trace, or a terminal `unsupported` verdict. `unattempted` until the
     /// first native dispatch (`TraceState.nativeFor`). Runtime-only — not part of
@@ -201,7 +227,6 @@ pub const Trace = struct {
         gpa.free(self.instrs);
         gpa.free(self.consts);
         gpa.free(self.entry_slots);
-        gpa.free(self.exit_stores);
         gpa.destroy(self);
     }
 };
@@ -505,11 +530,10 @@ pub const TraceState = struct {
     /// first; an optimizer OOM falls back to caching the *unoptimized* trace
     /// (correct, just slower) rather than failing the commit.
     fn commit(self: *TraceState) !void {
-        try self.rec.instrs.append(self.gpa, .{ .op = .loop });
-
-        // The exit snapshot: every register the trace defined (loop-carried),
-        // minus *dead temporaries*. A slot at/above `locals_watermark` is a
-        // compiler expression temporary (set only by the anchoring numeric-`for`'s
+        // The loop-carried writebacks, as slot-bound φ nodes (one per register the
+        // trace defined, minus *dead temporaries*), spliced in just before the
+        // terminal `loop`. A slot at/above `locals_watermark` is a compiler
+        // expression temporary (set only by the anchoring numeric-`for`'s
         // `for_loop`; see `recForLoop`/`Recorder.locals_watermark`): dead at the
         // loop-header resume point on every path and after the loop, so tier-0
         // recomputes it on deopt and post-loop code never reads it — writing it
@@ -517,34 +541,41 @@ pub const TraceState = struct {
         // a slot the trace actually read is never dropped (it is `< watermark`
         // anyway). When the watermark is the `maxInt` sentinel (while / generic-
         // `for` / passed-through `for`), nothing is filtered.
-        var stores: std.ArrayListUnmanaged(SlotStore) = .empty;
-        defer stores.deinit(self.gpa);
+        //
+        // A slot-bound φ's init is implicit (`regs[slot]`, read each entry like the
+        // matching `slot_load`), so `a` is 0; `b` is the body def (the update).
         for (self.rec.reg_map, 0..) |s, slot| {
             if (s.state != .def) continue;
             if (slot >= self.rec.locals_watermark and !self.readSlot(@intCast(slot))) continue;
-            try stores.append(self.gpa, .{ .slot = @intCast(slot), .ref = s.ref });
+            try self.rec.instrs.append(self.gpa, .{
+                .op = .phi,
+                .a = 0,
+                .b = s.ref,
+                .aux = @intCast(slot),
+                .ty = self.rec.instrs.items[s.ref].ty,
+            });
         }
+        try self.rec.instrs.append(self.gpa, .{ .op = .loop });
 
         const instrs = self.rec.instrs.items;
         const consts = self.rec.consts.items;
         const entry = self.rec.entry_slots.items;
 
         const fields: tropt.Optimized = if (self.config.optimize)
-            tropt.optimize(self.gpa, instrs, consts, stores.items) catch |e| switch (e) {
+            tropt.optimize(self.gpa, instrs, consts) catch |e| switch (e) {
                 // Never fail a commit (or thrash the anchor) over an optimizer
                 // allocation failure: cache the unoptimized trace instead.
-                error.OutOfMemory => try tropt.dupe(self.gpa, instrs, consts, entry, stores.items),
+                error.OutOfMemory => try tropt.dupe(self.gpa, instrs, consts, entry),
             }
         else
-            try tropt.dupe(self.gpa, instrs, consts, entry, stores.items);
+            try tropt.dupe(self.gpa, instrs, consts, entry);
         errdefer {
             self.gpa.free(fields.instrs);
             self.gpa.free(fields.consts);
             self.gpa.free(fields.entry_slots);
-            self.gpa.free(fields.exit_stores);
         }
 
-        assertWellFormed(fields.instrs, fields.consts.len, fields.exit_stores, self.rec.reg_map.len);
+        assertWellFormed(fields.instrs, fields.consts.len, self.rec.reg_map.len);
 
         const t = try self.gpa.create(Trace);
         errdefer self.gpa.destroy(t);
@@ -553,7 +584,6 @@ pub const TraceState = struct {
             .instrs = fields.instrs,
             .consts = fields.consts,
             .entry_slots = fields.entry_slots,
-            .exit_stores = fields.exit_stores,
         };
         try self.cache.append(self.gpa, t);
     }
@@ -564,8 +594,9 @@ pub const TraceState = struct {
     ///   * the trace is non-empty and terminates in exactly one `loop`;
     ///   * every operand `Ref` is defined earlier (linear SSA: ref < its index);
     ///   * `slot_load`/`konst` `aux` is in register / const-pool bounds;
-    ///   * every `exit_store` ref precedes the `loop` and its slot is a register.
-    fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, exit: []const SlotStore, num_registers: usize) void {
+    ///   * every `phi` update `b` precedes the `loop` and its `aux` slot is a
+    ///     register (or the internal sentinel).
+    fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: usize) void {
         std.debug.assert(instrs.len >= 1);
         const last = instrs.len - 1;
         std.debug.assert(instrs[last].op == .loop);
@@ -590,11 +621,17 @@ pub const TraceState = struct {
                 .aload, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits => {
                     std.debug.assert(ins.a < i);
                 },
+                // φ: the init `a` is an ordinary backward ref (a < i); the update
+                // `b` is the back-edge value and may reference a *later* node, like
+                // an `exit_store.ref` — only required to precede the `loop` marker.
+                // `aux` is the flush slot (a valid register) or the internal sentinel.
+                .phi => {
+                    std.debug.assert(ins.a < i);
+                    std.debug.assert(ins.b < last);
+                    std.debug.assert(ins.aux == PHI_INTERNAL or
+                        (ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < num_registers));
+                },
             }
-        }
-        for (exit) |st| {
-            std.debug.assert(st.ref < last);
-            std.debug.assert(st.slot < num_registers);
         }
     }
 
@@ -1147,11 +1184,21 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_fits,
         => try w.print("%{d}", .{ins.a}),
         .loop => {},
+        // φ: a slot-bound φ prints `update=%b → r{slot}` (init is implicit
+        // `regs[slot]`); an internal φ prints `init=%a update=%b → internal`.
+        .phi => {
+            if (ins.aux == PHI_INTERNAL) {
+                try w.print("init=%{d} update=%{d} -> internal", .{ ins.a, ins.b });
+            } else {
+                try w.print("update=%{d} -> r{d}", .{ ins.b, ins.aux });
+            }
+        },
         else => try w.print("%{d}  %{d}", .{ ins.a, ins.b }),
     }
 }
 
-/// Disassemble a whole trace: header + entry slots + numbered IR + exit stores.
+/// Disassemble a whole trace: header + entry slots + numbered IR (the slot-bound
+/// `phi` rows are the loop-carried writebacks that `exit_stores` used to list).
 pub fn writeTrace(w: *io.Writer, t: *const Trace) io.Writer.Error!void {
     try w.print("trace {s}:{d}  entry=[", .{ t.anchor.proto.name, t.anchor.pc });
     for (t.entry_slots, 0..) |s, i| {
@@ -1164,11 +1211,36 @@ pub fn writeTrace(w: *io.Writer, t: *const Trace) io.Writer.Error!void {
         try writeIrInstr(w, ins);
         try w.writeAll("\n");
     }
-    if (t.exit_stores.len > 0) {
-        try w.writeAll("  exit:");
-        for (t.exit_stores) |st| try w.print(" r{d}<-%{d}", .{ st.slot, st.ref });
-        try w.writeAll("\n");
+}
+
+/// Test helper: splice slot-bound `phi` nodes for a `carry` spec (tier-0 register
+/// `slot` ← body update `ref`) into a `body` that ends in `.loop`, placing them
+/// just before the terminator. This mirrors exactly what `commit()` builds, so
+/// hand-built test traces (in `nativegen`/`irinterp`/`interp`) can keep expressing
+/// loop carry as a `SlotStore` list. Body refs are *stable* — only `loop` shifts
+/// down by `carry.len`, and nothing references `loop` by index, so every operand
+/// ref in `body` stays valid.
+///
+/// `body` / `carry` are `*const [N]…` (pointers to fixed-size arrays): the array
+/// *lengths* are comptime (so the return type is a sized array) while the element
+/// *values* may be runtime — tropt's tests build instrs with a runtime `op`.
+pub fn withPhis(
+    body: anytype,
+    carry: anytype,
+) [@typeInfo(@typeInfo(@TypeOf(body)).pointer.child).array.len +
+    @typeInfo(@typeInfo(@TypeOf(carry)).pointer.child).array.len]IrInstr {
+    const nbody = @typeInfo(@typeInfo(@TypeOf(body)).pointer.child).array.len;
+    const ncarry = @typeInfo(@typeInfo(@TypeOf(carry)).pointer.child).array.len;
+    const last = nbody - 1;
+    std.debug.assert(body[last].op == .loop);
+    var out: [nbody + ncarry]IrInstr = undefined;
+    for (0..last) |i| out[i] = body[i];
+    for (carry, 0..) |st, j| {
+        // Slot-bound φ: implicit init (`regs[slot]`, so `a` = 0), update `b`.
+        out[last + j] = .{ .op = .phi, .a = 0, .b = st.ref, .aux = @intCast(st.slot), .ty = body[st.ref].ty };
     }
+    out[last + ncarry] = .{ .op = .loop };
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,22 +1264,20 @@ test "writeTrace renders a hand-built counting-loop trace" {
     //   %4 = add %0 %1
     //   loop  (acc<-%4, i<-%1)
     const proto = Proto{ .code = &.{}, .name = "main" };
-    var instrs = [_]IrInstr{
+    var instrs = withPhis(&[_]IrInstr{
         .{ .op = .slot_load, .aux = 0, .ty = .int },
         .{ .op = .slot_load, .aux = 1, .ty = .int },
         .{ .op = .guard_int, .a = 0 },
         .{ .op = .guard_int, .a = 1 },
         .{ .op = .add, .a = 0, .b = 1, .ty = .int },
         .{ .op = .loop },
-    };
+    }, &[_]SlotStore{ .{ .slot = 0, .ref = 4 }, .{ .slot = 1, .ref = 1 } });
     var entry = [_]u16{ 0, 1 };
-    var stores = [_]SlotStore{ .{ .slot = 0, .ref = 4 }, .{ .slot = 1, .ref = 1 } };
     const t = Trace{
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &instrs,
         .consts = &.{},
         .entry_slots = &entry,
-        .exit_stores = &stores,
     };
 
     var buf: [512]u8 = undefined;
@@ -1220,7 +1290,9 @@ test "writeTrace renders a hand-built counting-loop trace" {
     try testing.expect(std.mem.indexOf(u8, text, "slot_load") != null);
     try testing.expect(std.mem.indexOf(u8, text, "guard_int") != null);
     try testing.expect(std.mem.indexOf(u8, text, "add") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "exit: r0<-%4 r1<-%1") != null);
+    // The two loop-carried writebacks now render as slot-bound φ rows.
+    try testing.expect(std.mem.indexOf(u8, text, "update=%4 -> r0") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "update=%1 -> r1") != null);
 }
 
 test "onBackEdge counts back-edges per anchor" {

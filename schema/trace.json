@@ -46,14 +46,6 @@
       ]
     },
 
-    "SlotStore": {
-      "description": "A loop-carried writeback: tier-0 register `slot` <- IR value `ref` at the back-edge.",
-      "sequence": [
-        { "name": "slot", "type": "uint16" },
-        { "name": "ref",  "type": "uint16" }
-      ]
-    },
-
     "Trace": {
       "description": "A committed, cached trace. The anchor is a stable proto id (assigned at compile time) plus the loop-header pc; the in-memory *const Proto pointer is never serialized.",
       "sequence": [
@@ -61,8 +53,7 @@
         { "name": "anchor_pc",       "type": "uint32" },
         { "name": "instrs",      "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "IrInstr" } },
         { "name": "consts",      "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "ConstValue" } },
-        { "name": "entry_slots", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "uint16" } },
-        { "name": "exit_stores", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "SlotStore" } }
+        { "name": "entry_slots", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "uint16" } }
       ]
     },
 
