@@ -48,6 +48,7 @@ const arith = @import("arith.zig");
 const value = @import("value.zig");
 const execlog = @import("execlog.zig");
 const table = @import("table.zig");
+const arr = @import("array.zig");
 const Value = value.Value;
 const Trace = trace.Trace;
 
@@ -223,6 +224,19 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                         if (record) rec.guardPass(i, values[ar.a]);
                     } else {
                         if (record) rec.exit(i, .guard, values[ar.a]);
+                        break :iter completed;
+                    }
+                },
+                // The value still fits the recorded int lane (emitted before an
+                // int-lane `astore`). An out-of-range / non-int value would force a
+                // tier-0 lane widen, which neither this in-place encode nor the
+                // native store can do — so side-exit and let tier-0 re-run + widen.
+                .guard_fits => {
+                    const lane: arr.Lane = @enumFromInt(ins.aux);
+                    if (arr.ArrayPart.laneFits(lane, values[ins.a])) {
+                        if (record) rec.guardPass(i, values[ins.a]);
+                    } else {
+                        if (record) rec.exit(i, .guard, values[ins.a]);
                         break :iter completed;
                     }
                 },

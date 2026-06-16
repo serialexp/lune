@@ -132,6 +132,12 @@ pub const IrOp = enum(u8) {
     /// `a`=`aref` ref → the slot is present (narrow-lane presence bit set); a hole
     /// would read as `nil`, which the native int/boolean path can't represent.
     guard_present,
+    /// `a`=value ref, `aux`=lane → the int value fits the narrow int lane's signed
+    /// range (i8/i16/i32). Emitted before an int-lane `astore` so that a value
+    /// which would force a tier-0 lane WIDEN (an alloc+relayout native can't do
+    /// mid-run) side-exits to tier-1a instead of being silently truncated. The
+    /// bool lane and the i64 lane need no such guard — every value fits.
+    guard_fits,
 
     // ---- close ----
     /// Loop back-edge: the end of the straight-line trace. Carries no operands;
@@ -581,7 +587,7 @@ pub const TraceState = struct {
                 .aref, .astore => std.debug.assert(ins.a < i and ins.b < i),
                 // `aload` and the array-access guards read one prior node
                 // (the table value, or the `aref`).
-                .aload, .guard_table, .guard_lane, .guard_bounds, .guard_present => {
+                .aload, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits => {
                     std.debug.assert(ins.a < i);
                 },
             }
@@ -900,6 +906,17 @@ pub const TraceState = struct {
         try self.guardInt(rkey);
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         _ = try self.emit(.{ .op = .guard_bounds, .a = ref });
+        // For an int lane, guard at runtime that the value is an int still in the
+        // lane's range: a later iteration storing an out-of-range (or non-int)
+        // value would force tier-0 to WIDEN the lane (alloc + relayout), which the
+        // native store can't do mid-run, and which would make the tier-1a oracle's
+        // in-place encode diverge — so it side-exits instead. The bool lane needs no
+        // such guard: its `astore` value is always a statically-typed bool (a konst
+        // or a compare result), never a free variable.
+        switch (lane) {
+            .i8, .i16, .i32, .i64 => _ = try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord }),
+            else => {},
+        }
         // No `guard_present`: `astore` *creates* presence (the slot is in-bounds by
         // `guard_bounds`; storing a non-nil value sets the presence bit). The store
         // is effectful and not register-defining, so nothing is `setReg`'d.
@@ -1125,6 +1142,7 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_lane,
         .guard_bounds,
         .guard_present,
+        .guard_fits,
         => try w.print("%{d}", .{ins.a}),
         .loop => {},
         else => try w.print("%{d}  %{d}", .{ ins.a, ins.b }),

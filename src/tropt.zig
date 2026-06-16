@@ -69,7 +69,7 @@ fn kindOf(op: IrOp) OpKind {
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => .guard,
         // Array-access guards reuse the guard machinery: kept as side-effecting
         // roots, deduped by (op, operand-ref), operand marked/remapped via `a`.
-        .guard_table, .guard_lane, .guard_bounds, .guard_present => .guard,
+        .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits => .guard,
         // Packed-array address + load: memory ops, conservatively canonical to
         // themselves (never folded, never CSE'd) so a later store can't be
         // reordered past them. DCE'd if not reachable from a live root.

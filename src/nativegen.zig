@@ -292,6 +292,15 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     const bounds_ok = gpa.alloc(bool, n) catch return false;
     defer gpa.free(bounds_ok);
     @memset(bounds_ok, false);
+    // Per-value: has a `guard_fits` proven this value fits the narrow int lane's
+    // signed range? [B4b] An int-lane astore requires it — native cannot widen
+    // the lane mid-run (it has no allocate-and-repack path), so the recorder
+    // emits a `guard_fits` ahead of every int-lane store and the tier-1a oracle
+    // side-exits identically when the value would overflow the lane. Without a
+    // covering guard_fits an int-lane astore bails the whole trace to tier-1a.
+    const fits_ok = gpa.alloc(bool, n) catch return false;
+    defer gpa.free(fits_ok);
+    @memset(fits_ok, false);
 
     for (t.instrs, 0..) |ins, i| {
         switch (ins.op) {
@@ -417,23 +426,46 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (!bounds_ok[ins.a]) return false; // [I4] bounds must dominate
                 kinds[i] = lk; // bool lane → .bool; i8…i64 → .int (sign-extended)
             },
-            // astore encodes a boolean into the bool-lane slot addressed by the
-            // aref (`a`); `b` is the value. Like aload, the data write is indexed by
-            // idx0, so it requires a dominating bounds check on the same aref [I1/P1]
-            // (else it could write out of bounds). C1 — that the stored value not
-            // depend on any prior `aload` — is enforced at record time (`recArraySet`
-            // aborts), so by here the value is a guarded slot input or constant; we
-            // only require it to be a representable bool. astore produces no value.
+            // guard_fits (B4b): the int value (`a`) fits the narrow int lane's
+            // signed range. Marks the value so a following int-lane astore may
+            // store it without widening; lowers to a range compare (i8/i16/i32) or
+            // nothing (i64 — every i64 fits). Only int lanes use it (the bool lane
+            // stores a boolean, the .value/f64 lanes bail at proveKinds).
+            .guard_fits => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .int) return false; // only int values are range-guarded
+                const lk = laneKind(ins.aux) orelse return false;
+                if (lk != .int) return false; // guard_fits is meaningless off an int lane
+                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                fits_ok[ins.a] = true;
+                kinds[i] = .none;
+            },
+            // astore encodes the value (`b`) into the lane slot addressed by the
+            // aref (`a`). Like aload, the data write is indexed by idx0, so it
+            // requires a dominating bounds check on the same aref [I1/P1] (else it
+            // could write out of bounds). C1 — that the stored value not depend on
+            // any prior `aload` — is enforced at record time (`recArraySet` aborts),
+            // so by here the value is a guarded slot input or constant. astore
+            // produces no value.
             .astore => {
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
-                // B4a lowers only the bool-lane store natively; an int-lane store
-                // (B4b) needs a runtime value-fits-lane guard the recorder has not
-                // emitted yet, so a non-bool astore bails the whole trace to tier-1a.
-                if (ins.aux != BOOL_LANE) return false;
-                if (kinds[ins.b] != .bool) return false; // bool lane stores a boolean
+                const lk = laneKind(ins.aux) orelse return false; // .value / f64 → tier-1a
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 if (!bounds_ok[ins.a]) return false; // [I1/P1] bounds must dominate
+                switch (lk) {
+                    .bool => {
+                        if (kinds[ins.b] != .bool) return false; // bool lane stores a boolean
+                    },
+                    .int => {
+                        // int lane (i8…i64): the value must be a proven int AND
+                        // covered by a guard_fits (so native may store it at the
+                        // lane width without the widening tier-0 would otherwise do).
+                        if (kinds[ins.b] != .int) return false;
+                        if (!fits_ok[ins.b]) return false;
+                    },
+                    else => return false, // laneKind only yields .bool/.int
+                }
                 kinds[i] = .none;
             },
             .loop => {
@@ -570,6 +602,8 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
         // the aref token (a) plus the value to write (b).
         .aref, .astore => .{ .a = true, .b = true },
         .aload, .guard_bounds, .guard_present, .guard_table, .guard_lane => .{ .a = true, .b = false },
+        // guard_fits reads the value it range-checks (a); no second operand.
+        .guard_fits => .{ .a = true, .b = false },
         else => .{ .a = false, .b = false },
     };
 }
@@ -751,7 +785,7 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         var last_body_guard: i64 = -1;
         for (t.instrs, 0..) |ins, idx| {
             switch (ins.op) {
-                .guard_true, .guard_false, .guard_bounds, .guard_present => last_body_guard = @intCast(idx),
+                .guard_true, .guard_false, .guard_bounds, .guard_present, .guard_fits => last_body_guard = @intCast(idx),
                 else => {},
             }
         }
@@ -1357,48 +1391,90 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 }
                 try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
-            // --- lane-aware array write path (B3, bool lane) ---------------------
-            // astore (bool lane): write the value bit at `[data], idx0`, then set the
+            // guard_fits (B4b): range-check the int value (`a`) against the lane's
+            // signed bounds and side-exit if it would overflow. Native stores at the
+            // lane width and cannot widen the lane the way tier-0 would, so a value
+            // that no longer fits must drop back to tier-1a (which then widens). i64
+            // holds every int → no check. The compare clobbers only rax (scratch).
+            .guard_fits => {
+                const w = intLaneWidth(ins.aux);
+                if (w < 8) {
+                    const lo: i32 = switch (w) {
+                        1 => std.math.minInt(i8),
+                        2 => std.math.minInt(i16),
+                        4 => std.math.minInt(i32),
+                        else => unreachable,
+                    };
+                    const hi: i32 = switch (w) {
+                        1 => std.math.maxInt(i8),
+                        2 => std.math.maxInt(i16),
+                        4 => std.math.maxInt(i32),
+                        else => unreachable,
+                    };
+                    try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
+                    try a.cmpRegImm32(.rax, lo);
+                    try a.jcc(.l, deopt_exit); // value < lane min → side-exit (signed)
+                    try a.cmpRegImm32(.rax, hi);
+                    try a.jcc(.g, deopt_exit); // value > lane max → side-exit (signed)
+                }
+            },
+            // --- lane-aware array write path (B3 bool / B4b int) -----------------
+            // astore: write the value into the slot the aref addresses, then set the
             // presence bit at `[present], idx0` LAST (I5 — the commit point for an
             // absent→present transition; for an already-present overwrite the value
-            // bit is the visible change and the store is idempotent under C1).
+            // is the visible change and the store is idempotent under C1).
             // `idx0` (from the aref) is shared with the dominating guard_bounds [I3].
-            // rcx holds idx0 across the whole sequence; rax is the reload scratch for
-            // the table-derived data/present pointers, so the table base may be
-            // spilled. The value lives in `b` (a 0/1 boolean) — branch on it to pick
-            // `bts` (set) vs `btr` (clear), since there is no "write CF to a dynamic
-            // memory bit" instruction.
             .astore => {
                 const aref_ins = t.instrs[ins.a];
-                // idx0 into a stable register (rcx scratch, or its home reg). It must
-                // survive the rax reloads below; rax-based pointer loads never touch it.
-                const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                // Decide set vs clear from the boolean value (0 = false → clear).
-                try placeToReg(a, .rax, placeOfRef(alloc, ins.b));
-                try a.cmpRegImm32(.rax, 0);
-                const clear_lbl = try a.label();
-                const after_val_lbl = try a.label();
-                try a.jcc(.e, clear_lbl); // value == 0 → clear the value bit
-                {
-                    // set path: data ptr → rax, bts [data], idx0.
+                if (ins.aux == BOOL_LANE) {
+                    // bool lane: rcx holds idx0 across the whole sequence; rax is the
+                    // reload scratch for the table-derived data/present pointers, so
+                    // the table base may be spilled. The value lives in `b` (a 0/1
+                    // boolean) — branch on it to pick `bts` (set) vs `btr` (clear),
+                    // since there is no "write CF to a dynamic memory bit" instruction.
+                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try placeToReg(a, .rax, placeOfRef(alloc, ins.b));
+                    try a.cmpRegImm32(.rax, 0);
+                    const clear_lbl = try a.label();
+                    const after_val_lbl = try a.label();
+                    try a.jcc(.e, clear_lbl); // value == 0 → clear the value bit
+                    {
+                        // set path: data ptr → rax, bts [data], idx0.
+                        const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                        try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
+                        try a.btsMemReg(.rax, 0, ireg);
+                        try a.jmp(after_val_lbl);
+                    }
+                    a.bind(clear_lbl);
+                    {
+                        // clear path: data ptr → rax, btr [data], idx0.
+                        const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                        try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
+                        try a.btrMemReg(.rax, 0, ireg);
+                    }
+                    a.bind(after_val_lbl);
+                } else {
+                    // int lane (i8…i64): write the low `w` bytes of the value at
+                    // `[data + idx0*w]`. guard_fits already proved the value fits the
+                    // lane, so a width-truncating store is the exact lane encoding
+                    // (two's-complement). Register pressure: data-ptr + idx0 + value
+                    // are all live at once, but only rax/rcx are scratch — so fold
+                    // idx0 into the address with `lea` (freeing the index reg) before
+                    // loading the value into rcx.
+                    const w = intLaneWidth(ins.aux);
                     const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
                     try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
-                    try a.btsMemReg(.rax, 0, ireg);
-                    try a.jmp(after_val_lbl);
+                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.leaRegMemSib(.rax, .rax, ireg, w, 0); // rax = &data[idx0]
+                    try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
+                    try a.storeMemReg(.rax, w, 0, .rcx); // [rax] = (lane-width) value
                 }
-                a.bind(clear_lbl);
-                {
-                    // clear path: data ptr → rax, btr [data], idx0.
-                    const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
-                    try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
-                    try a.btrMemReg(.rax, 0, ireg);
-                }
-                a.bind(after_val_lbl);
                 // presence bit LAST: present ptr → rax, bts [present], idx0. Storing a
                 // non-nil value always marks the slot present (recArraySet refuses nil
                 // / out-of-lane stores, so this never needs to *clear* presence).
                 const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
                 try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.present);
+                const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
                 try a.btsMemReg(.rax, 0, ireg);
             },
             .guard_true => switch (kinds[ins.a]) {
@@ -2588,5 +2664,196 @@ test "nativegen: astore deopt-replay leaves a deterministic heap (idempotent re-
 
     // Double-apply (native then tier-0 replay) == single-apply: the write is
     // idempotent, so re-running an iteration after a deopt reproduces the heap.
+    try expectTablesEqual(t_replay, t_once, K);
+}
+
+// --- B4b int-lane write-path helpers + tests ---------------------------------
+
+/// Build a narrow int-lane table: keys `2..K` hold `±i` (alternating sign), then
+/// key `K` is pinned to `bump` so the monotonic rehash widening lands the array
+/// on exactly the lane that `bump` forces. Caller owns the returned table.
+fn buildIntTable(gpa: std.mem.Allocator, K: i64, bump: i64) !*table.Table {
+    const t = try table.Table.create(gpa);
+    var i: i64 = 2;
+    while (i <= K) : (i += 1) {
+        const v: i64 = if (@rem(i, 2) == 0) i else -i;
+        try t.set(gpa, Value.int(i), Value.int(v));
+    }
+    try t.set(gpa, Value.int(K), Value.int(bump));
+    return t;
+}
+
+/// `while (k in array) { t[k] = C; k += 1 }` over an int lane, with the mandatory
+/// guard_fits ahead of the store. r0 = table (invariant .ptr), r1 = index (carried
+/// int). A pure constant write → no `aload`, so C1 is trivially satisfied.
+fn intWriteTrace(full: *[13]I, consts: *[2]Value, exits: *[1]S, es: *[0]u16, lane: i32, store_const: i64) Trace {
+    consts.* = .{ Value.int(store_const), Value.int(1) };
+    full.* = .{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .konst, .aux = 0 }, // 7: C
+        .{ .op = .guard_fits, .a = 7, .aux = lane }, // 8: C fits the lane
+        .{ .op = .astore, .a = 5, .b = 7, .aux = lane }, // 9: t[index] = C
+        .{ .op = .konst, .aux = 1 }, // 10: 1
+        .{ .op = .add, .a = 3, .b = 10 }, // 11: index + 1
+        .{ .op = .loop }, // 12
+    };
+    exits.* = .{.{ .slot = 1, .ref = 11 }};
+    return Trace{ .anchor = undefined, .instrs = full, .consts = consts, .entry_slots = es, .exit_stores = exits };
+}
+
+test "nativegen: int-lane t[k]=C write matches the interpreter (i8/i16/i32/i64)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const K: i64 = 48;
+
+    const Cfg = struct { lane: arr.Lane, bump: i64 };
+    const cfgs = [_]Cfg{
+        .{ .lane = .i8, .bump = 100 }, // all |v| <= 127
+        .{ .lane = .i16, .bump = 1000 }, // exceeds i8
+        .{ .lane = .i32, .bump = 100_000 }, // exceeds i16
+        .{ .lane = .i64, .bump = 5_000_000_000 }, // exceeds i32
+    };
+
+    for (cfgs) |cfg| {
+        const lane: i32 = @intFromEnum(cfg.lane);
+        // A small negative constant exercises a width-truncating store of a
+        // sign-extended value (the low w bytes are the two's-complement encoding).
+        const C: i64 = -7;
+        var full: [13]I = undefined;
+        var consts: [2]Value = undefined;
+        var exits: [1]S = undefined;
+        var es: [0]u16 = undefined;
+        const tr = intWriteTrace(&full, &consts, &exits, &es, lane, C);
+
+        // Separate tables: the trace mutates the heap, so a shared table would
+        // double-apply. The final heaps (and carried index) must match.
+        const t_o = try buildIntTable(gpa, K, cfg.bump);
+        defer t_o.destroy(gpa);
+        try testing.expectEqual(cfg.lane, t_o.array.lane);
+        var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
+        const ovals = try gpa.alloc(Value, tr.instrs.len);
+        defer gpa.free(ovals);
+        const ocomp = irinterp.execute(&tr, &oregs, ovals);
+
+        const t_n = try buildIntTable(gpa, K, cfg.bump);
+        defer t_n.destroy(gpa);
+        var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
+        var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+        defer ct.deinit();
+        const ncomp = ct.run(&nregs);
+
+        try testing.expectEqual(ocomp, ncomp);
+        try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
+        try expectTablesEqual(t_o, t_n, K);
+        // Sanity: every present slot 2..K now reads the stored constant.
+        var k: i64 = 2;
+        while (k <= K) : (k += 1) try testing.expectEqual(C, t_n.getInt(k).asInt());
+    }
+}
+
+test "nativegen: int-lane astore guard_fits side-exits when the value overflows the lane" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // An i8-lane table long enough that the stored index value (`t[k] = k`)
+    // outgrows the lane mid-loop: keys run well past 127 while every *initial*
+    // value stays in i8 range (fill = 1), so the lane is i8 but the WRITTEN value
+    // overflows at k == 128 → guard_fits side-exits there. Native and oracle must
+    // stop at the same iteration and leave identical heaps.
+    const gpa = testing.allocator;
+    const K: i64 = 160;
+    const lane: i32 = @intFromEnum(arr.Lane.i8);
+
+    // Build an i8 table of length K with all-small values (lane stays i8).
+    const makeT = struct {
+        fn f(g: std.mem.Allocator, n: i64) !*table.Table {
+            const t = try table.Table.create(g);
+            var i: i64 = 2;
+            while (i <= n) : (i += 1) try t.set(g, Value.int(i), Value.int(1));
+            std.debug.assert(t.array.lane == arr.Lane.i8);
+            return t;
+        }
+    }.f;
+
+    // `t[k] = k` (value = the carried index slot, not a constant). guard_fits on
+    // the index makes the loop side-exit once k no longer fits i8.
+    var consts = [_]Value{Value.int(1)};
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .guard_fits, .a = 3, .aux = lane }, // 7: index fits i8?
+        .{ .op = .astore, .a = 5, .b = 3, .aux = lane }, // 8: t[index] = index
+        .{ .op = .konst, .aux = 0 }, // 9: 1
+        .{ .op = .add, .a = 3, .b = 9 }, // 10: index + 1
+        .{ .op = .loop }, // 11
+    };
+    var exits = [_]S{.{ .slot = 1, .ref = 10 }};
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+
+    const start: i64 = 120; // 120..127 fit i8; 128 does not → exit on the 9th key
+    const t_o = try makeT(gpa, K);
+    defer t_o.destroy(gpa);
+    var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(start) };
+    const ovals = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(ovals);
+    const ocomp = irinterp.execute(&tr, &oregs, ovals);
+
+    const t_n = try makeT(gpa, K);
+    defer t_n.destroy(gpa);
+    var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(start) };
+    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    const ncomp = ct.run(&nregs);
+
+    try testing.expectEqual(@as(usize, 8), ocomp); // k = 120..127 committed, 128 exits
+    try testing.expectEqual(ocomp, ncomp);
+    try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
+    try expectTablesEqual(t_o, t_n, K);
+}
+
+test "nativegen: int-lane astore deopt-replay leaves a deterministic heap (idempotent re-run)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // Same C1 oracle as the bool case, on an i32 lane: native pass then a full
+    // tier-0 re-run over the SAME heap must equal a single clean run on a DISTINCT
+    // table. The constant write is idempotent, so the replayed iteration is safe.
+    const gpa = testing.allocator;
+    const K: i64 = 40;
+    const lane: i32 = @intFromEnum(arr.Lane.i32);
+    const C: i64 = 70_000; // forces i32 nothing here; just a representative i32 value
+    var full: [13]I = undefined;
+    var consts: [2]Value = undefined;
+    var exits: [1]S = undefined;
+    var es: [0]u16 = undefined;
+    const tr = intWriteTrace(&full, &consts, &exits, &es, lane, C);
+
+    const t_replay = try buildIntTable(gpa, K, 100_000); // i32 lane
+    defer t_replay.destroy(gpa);
+    try testing.expectEqual(arr.Lane.i32, t_replay.array.lane);
+    var r_native = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
+    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    _ = ct.run(&r_native);
+    var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
+    const vals = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(vals);
+    _ = irinterp.execute(&tr, &r_replay, vals);
+
+    const t_once = try buildIntTable(gpa, K, 100_000);
+    defer t_once.destroy(gpa);
+    var r_once = [_]Value{ Value.heap(&t_once.header), Value.int(2) };
+    const vals2 = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(vals2);
+    _ = irinterp.execute(&tr, &r_once, vals2);
+
     try expectTablesEqual(t_replay, t_once, K);
 }

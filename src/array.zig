@@ -282,8 +282,16 @@ pub const ArrayPart = extern struct {
     /// to record an out-of-lane `astore` (which would widen — a shape change the
     /// native store ABI can't perform).
     pub fn fits(self: *const ArrayPart, val: Value) bool {
-        if (self.lane == .value or val.isNil()) return true;
-        return switch (self.lane) {
+        return laneFits(self.lane, val);
+    }
+
+    /// Lane-only form of `fits` (no `ArrayPart` instance needed). The JIT's
+    /// `guard_fits` lowering and the tier-1a oracle use this to decide, given a
+    /// recorded lane ordinal and a runtime value, whether an `astore` stays
+    /// in-lane (vs. forcing a tier-0 widen that native can't perform mid-run).
+    pub fn laneFits(lane: Lane, val: Value) bool {
+        if (lane == .value or val.isNil()) return true;
+        return switch (lane) {
             .value => true,
             .boolean => val.isBool(),
             .i8 => val.isInt() and inRange(val.asInt(), std.math.minInt(i8), std.math.maxInt(i8)),
