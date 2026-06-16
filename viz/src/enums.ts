@@ -9,7 +9,7 @@
 // (Future hardening: generate this file from Zig @typeInfo reflection so it
 // cannot drift at all — see docs/design/04-snapshot-replay-schema.md.)
 
-/** IR opcodes, indexed by wire ordinal (mirrors trace.IrOp, 0..26). */
+/** IR opcodes, indexed by wire ordinal (mirrors trace.IrOp, 0..32). */
 export const IR_OP_NAMES = [
   "slot_load", // 0
   "konst", // 1
@@ -37,7 +37,13 @@ export const IR_OP_NAMES = [
   "guard_number", // 23
   "guard_true", // 24
   "guard_false", // 25
-  "loop", // 26
+  "aref", // 26
+  "aload", // 27
+  "guard_table", // 28
+  "guard_lane", // 29
+  "guard_bounds", // 30
+  "guard_present", // 31
+  "loop", // 32
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -68,7 +74,8 @@ export type ValueTagName = (typeof VALUE_TAG_NAMES)[number];
 /** Opcodes that take no operand columns (the loop back-edge terminator). */
 export const NO_OPERAND_OPS: ReadonlySet<IrOpName> = new Set(["loop"]);
 
-/** Unary ops + guards: render a single operand `%a`. */
+/** Unary ops + guards: render a single operand `%a`. (`aref` is two-operand and
+ * falls through to the default `%a, %b` rendering.) */
 export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "neg",
   "not",
@@ -78,6 +85,11 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "guard_number",
   "guard_true",
   "guard_false",
+  "aload",
+  "guard_table",
+  "guard_lane",
+  "guard_bounds",
+  "guard_present",
 ]);
 
 /** Map a raw wire ordinal to a name, falling back to `op:N` if out of range. */

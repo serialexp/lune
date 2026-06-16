@@ -331,10 +331,16 @@ test "wire enum ordinals are a pinned contract (mirrored by viz/src/enums.ts)" {
     try testing.expectEqual(@as(u8, 23), @intFromEnum(IrOp.guard_number));
     try testing.expectEqual(@as(u8, 24), @intFromEnum(IrOp.guard_true));
     try testing.expectEqual(@as(u8, 25), @intFromEnum(IrOp.guard_false));
-    try testing.expectEqual(@as(u8, 26), @intFromEnum(IrOp.loop));
+    try testing.expectEqual(@as(u8, 26), @intFromEnum(IrOp.aref));
+    try testing.expectEqual(@as(u8, 27), @intFromEnum(IrOp.aload));
+    try testing.expectEqual(@as(u8, 28), @intFromEnum(IrOp.guard_table));
+    try testing.expectEqual(@as(u8, 29), @intFromEnum(IrOp.guard_lane));
+    try testing.expectEqual(@as(u8, 30), @intFromEnum(IrOp.guard_bounds));
+    try testing.expectEqual(@as(u8, 31), @intFromEnum(IrOp.guard_present));
+    try testing.expectEqual(@as(u8, 32), @intFromEnum(IrOp.loop));
     // Exhaustiveness: if a member is added/removed, this count changes and forces
     // both this test and enums.ts to be revisited.
-    try testing.expectEqual(@as(usize, 27), @typeInfo(IrOp).@"enum".field_names.len);
+    try testing.expectEqual(@as(usize, 33), @typeInfo(IrOp).@"enum".field_names.len);
 
     const ObsType = trace.ObsType;
     try testing.expectEqual(@as(u8, 0), @intFromEnum(ObsType.unknown));

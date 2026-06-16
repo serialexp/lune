@@ -58,7 +58,7 @@ pub const Optimized = struct {
     exit_stores: []SlotStore,
 };
 
-const OpKind = enum { konst, slot_load, binary, unary, guard, loop };
+const OpKind = enum { konst, slot_load, binary, unary, guard, aref, aload, loop };
 
 fn kindOf(op: IrOp) OpKind {
     return switch (op) {
@@ -67,6 +67,14 @@ fn kindOf(op: IrOp) OpKind {
         .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .eq, .ne, .lt, .le => .binary,
         .neg, .not, .bnot => .unary,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => .guard,
+        // Array-access guards reuse the guard machinery: kept as side-effecting
+        // roots, deduped by (op, operand-ref), operand marked/remapped via `a`.
+        .guard_table, .guard_lane, .guard_bounds, .guard_present => .guard,
+        // Packed-array address + load: memory ops, conservatively canonical to
+        // themselves (never folded, never CSE'd) so a later store can't be
+        // reordered past them. DCE'd if not reachable from a live root.
+        .aref => .aref,
+        .aload => .aload,
         .loop => .loop,
     };
 }
@@ -200,6 +208,9 @@ pub fn optimize(
                     dead[i] = true; // exact-duplicate guard, earlier copy dominates
                 } else try guards.put(gpa, gk, {});
             },
+            // Memory ops are left verbatim: canonical to themselves, no fold/CSE
+            // (so a future `astore` cannot be reordered across an `aload`).
+            .aref, .aload => {},
             .loop => {},
         }
     }
@@ -230,7 +241,11 @@ pub fn optimize(
                     live[canon[ins.a]] = true;
                     live[canon[ins.b]] = true;
                 },
-                .unary, .guard => live[canon[ins.a]] = true,
+                .unary, .guard, .aload => live[canon[ins.a]] = true,
+                .aref => {
+                    live[canon[ins.a]] = true;
+                    live[canon[ins.b]] = true;
+                },
                 .konst, .slot_load, .loop => {},
             }
         }
@@ -258,7 +273,11 @@ pub fn optimize(
                 out.a = new_index[canon[ins.a]];
                 out.b = new_index[canon[ins.b]];
             },
-            .unary, .guard => out.a = new_index[canon[ins.a]],
+            .unary, .guard, .aload => out.a = new_index[canon[ins.a]],
+            .aref => {
+                out.a = new_index[canon[ins.a]];
+                out.b = new_index[canon[ins.b]];
+            },
             .slot_load => try out_entry.append(gpa, @intCast(ins.aux)),
             .konst, .loop => {},
         }

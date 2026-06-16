@@ -97,6 +97,33 @@ pub const IrOp = enum(u8) {
     guard_true,
     guard_false,
 
+    // ---- lane-aware packed-array access (Phase B) ----
+    //
+    // These reach a table's dense array part (`array.zig`) directly, at its
+    // current lane. The 3-input store (table, index, value) won't fit a 16-byte
+    // `IrInstr`, so `aref` *pairs* the (table, index) addressing into one node and
+    // `aload`/`astore` reference it plus at most one more operand. `aux` on every
+    // op below is the `array.Lane` ordinal the access was recorded against.
+    //
+    /// `a`=table value ref, `b`=index ref → element address descriptor. Carries no
+    /// usable `Value` (its operands are what `aload`/`astore` read); native kind
+    /// is a raw pointer (`Kind.ptr`).
+    aref,
+    /// `a`=`aref` ref → decode the packed slot to a `Value` (int/boolean per lane).
+    aload,
+
+    // ---- array-access guards (check via the referenced node; side-exit on miss) ----
+    /// `a`=table value ref → the value is a heap table.
+    guard_table,
+    /// `a`=table value ref, `aux`=lane → the table's array lane equals `aux`
+    /// (bails if a monotonic widen moved it past the recorded lane).
+    guard_lane,
+    /// `a`=`aref` ref → the index is in the array part: `(index-1) <u len`.
+    guard_bounds,
+    /// `a`=`aref` ref → the slot is present (narrow-lane presence bit set); a hole
+    /// would read as `nil`, which the native int/boolean path can't represent.
+    guard_present,
+
     // ---- close ----
     /// Loop back-edge: the end of the straight-line trace. Carries no operands;
     /// the loop-carried register writes are in the trace's `exit_stores`.
@@ -538,6 +565,13 @@ pub const TraceState = struct {
                 },
                 // unary ops and guards read `a` only.
                 .neg, .not, .bnot, .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => {
+                    std.debug.assert(ins.a < i);
+                },
+                // `aref` pairs (table, index) into an address descriptor.
+                .aref => std.debug.assert(ins.a < i and ins.b < i),
+                // `aload` and the array-access guards read one prior node
+                // (the table value, or the `aref`).
+                .aload, .guard_table, .guard_lane, .guard_bounds, .guard_present => {
                     std.debug.assert(ins.a < i);
                 },
             }

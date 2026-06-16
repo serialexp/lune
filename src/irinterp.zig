@@ -47,6 +47,7 @@ const trace = @import("trace.zig");
 const arith = @import("arith.zig");
 const value = @import("value.zig");
 const execlog = @import("execlog.zig");
+const table = @import("table.zig");
 const Value = value.Value;
 const Trace = trace.Trace;
 
@@ -149,6 +150,69 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                     break :iter completed;
                 },
 
+                // ---- lane-aware packed-array read path (Phase B) ----
+                //
+                // `aref` carries no usable Value — it only pairs (table, index)
+                // for the `aload`/guards that reference it. Store nil so the SSA
+                // slot is defined; it is never read *as a value*.
+                .aref => {
+                    values[i] = Value.nil();
+                    if (record) rec.value(i, values[i]);
+                },
+                // Decode the packed slot to a logical Value via the *exact* tier-0
+                // reader (`Table.getInt`), so an executed trace reads byte-identical
+                // to tier-0 by construction. By the time we run, `guard_bounds` and
+                // `guard_present` have already passed, so this hits the array fast
+                // path and returns a present element (never a hash fallback / nil).
+                .aload => {
+                    const ar = t.instrs[ins.a];
+                    const tbl = table.Table.fromHeader(values[ar.a].asHeap());
+                    values[i] = tbl.getInt(values[ar.b].asInt());
+                    if (record) rec.value(i, values[i]);
+                },
+                // The slot holds a heap table.
+                .guard_table => if (values[ins.a].isHeap() and values[ins.a].heapType() == .table) {
+                    if (record) rec.guardPass(i, values[ins.a]);
+                } else {
+                    if (record) rec.exit(i, .guard, values[ins.a]);
+                    break :iter completed;
+                },
+                // The table's array lane still equals the recorded lane (a
+                // monotonic widen would have moved it past `aux`).
+                .guard_lane => {
+                    const tbl = table.Table.fromHeader(values[ins.a].asHeap());
+                    if (@intFromEnum(tbl.array.lane) == ins.aux) {
+                        if (record) rec.guardPass(i, values[ins.a]);
+                    } else {
+                        if (record) rec.exit(i, .guard, values[ins.a]);
+                        break :iter completed;
+                    }
+                },
+                // The index lands in the dense array part: `(index-1) <u len`.
+                .guard_bounds => {
+                    const ar = t.instrs[ins.a];
+                    const tbl = table.Table.fromHeader(values[ar.a].asHeap());
+                    const idx = values[ar.b].asInt();
+                    if (idx >= 1 and idx <= @as(i64, @intCast(tbl.array.len))) {
+                        if (record) rec.guardPass(i, values[ar.a]);
+                    } else {
+                        if (record) rec.exit(i, .guard, values[ar.a]);
+                        break :iter completed;
+                    }
+                },
+                // The slot is present (a narrow-lane hole would read as nil, which
+                // the native int/bool path cannot represent).
+                .guard_present => {
+                    const ar = t.instrs[ins.a];
+                    const tbl = table.Table.fromHeader(values[ar.a].asHeap());
+                    if (!tbl.getInt(values[ar.b].asInt()).isNil()) {
+                        if (record) rec.guardPass(i, values[ar.a]);
+                    } else {
+                        if (record) rec.exit(i, .guard, values[ar.a]);
+                        break :iter completed;
+                    }
+                },
+
                 // ---- close: commit the loop-carried writes, then iterate ----
                 .loop => {
                     for (t.exit_stores) |st| regs[st.slot] = values[st.ref];
@@ -208,4 +272,125 @@ pub fn evalUnary(op: trace.IrOp, a: Value) arith.Error!Value {
         .bnot => arith.bnot(a),
         else => unreachable,
     };
+}
+
+// ---------------------------------------------------------------------------
+// Tests — the lane-aware packed-array READ path (Phase B2).
+//
+// Native codegen auto-bails on any `aref`-bearing trace (`proveKinds` rejects
+// the unknown ops), so B2 has no tier-1a-vs-tier-1b comparison yet — that is
+// B2c. These hand-built traces validate the *oracle*: that `irinterp.execute`
+// reads `t[k]` byte-identically to the tier-0 reader (`Table.getInt`), with the
+// read guards (`guard_table`/`guard_lane`/`guard_bounds`/`guard_present`)
+// side-exiting exactly when tier-0 would diverge.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const IrInstr = trace.IrInstr;
+const IrOp = trace.IrOp;
+const SlotStore = trace.SlotStore;
+const Table = table.Table;
+
+/// Build a single-anchor trace that scans `t[r1], t[r1+1], …` accumulating into
+/// registers, terminating when an index runs past the dense run. Register window:
+///   r0 = table · r1 = running index · r2 = last value loaded
+/// Each iteration:
+///   load+guard the table, `aref` the current index, bounds/present-guard it,
+///   `aload` the slot, advance the index by 1, commit (value→r2, index+1→r1).
+/// A side-exit (bounds/present miss) leaves `regs` at the last clean commit — so
+/// `completed` is the number of present in-bounds slots scanned, exactly what a
+/// tier-0 re-run would reproduce.
+fn scanTrace(lane_ord: i32) [11]IrInstr {
+    return .{
+        .{ .op = .slot_load, .aux = 0 }, // %0 = r0 (table)
+        .{ .op = .guard_table, .a = 0 }, // %1 = guard %0 is a table
+        .{ .op = .guard_lane, .a = 0, .aux = lane_ord }, // %2 = guard lane
+        .{ .op = .slot_load, .aux = 1 }, // %3 = r1 (index)
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane_ord }, // %4 = &t[index]
+        .{ .op = .guard_bounds, .a = 4 }, // %5 = guard (index-1) <u len
+        .{ .op = .guard_present, .a = 4 }, // %6 = guard slot present
+        .{ .op = .aload, .a = 4, .aux = lane_ord }, // %7 = t[index]
+        .{ .op = .konst, .aux = 0 }, // %8 = 1
+        .{ .op = .add, .a = 3, .b = 8 }, // %9 = index + 1
+        .{ .op = .loop }, // %10
+    };
+}
+
+const scan_consts = [_]Value{Value.int(1)};
+// Advance the index (r1 ← index+1) and stash the loaded value (r2 ← t[index]).
+const scan_exit = [_]SlotStore{
+    .{ .slot = 1, .ref = 9 },
+    .{ .slot = 2, .ref = 7 },
+};
+
+fn runScan(t: *Table, start: i64) struct { completed: usize, regs: [3]Value } {
+    var instrs = scanTrace(@intFromEnum(t.array.lane));
+    const tr = Trace{
+        .anchor = undefined,
+        .instrs = &instrs,
+        .consts = @constCast(scan_consts[0..]),
+        .entry_slots = &[_]u16{},
+        .exit_stores = @constCast(scan_exit[0..]),
+    };
+    var regs = [3]Value{ Value.heap(&t.header), Value.int(start), Value.nil() };
+    var values: [11]Value = undefined;
+    const completed = execute(&tr, &regs, &values);
+    return .{ .completed = completed, .regs = regs };
+}
+
+test "B2 read path: scan a bool lane matches tier-0 getInt, hole/bounds side-exit" {
+    const gpa = testing.allocator;
+    const t = try Table.create(gpa);
+    defer t.destroy(gpa);
+
+    // nsieve's sieve: p[2..K] = true, all booleans → a narrow boolean lane.
+    const K: i64 = 64;
+    var i: i64 = 2;
+    while (i <= K) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+    try testing.expectEqual(@import("array.zig").Lane.boolean, t.array.lane);
+
+    // Start at 2 (the first present slot): the scan runs to the end of the dense
+    // run, side-exiting when the index passes `len`.
+    const from2 = runScan(t, 2);
+    try testing.expectEqual(@as(usize, @intCast(K - 1)), from2.completed); // indices 2..K
+    try testing.expect(from2.regs[2].isBool() and from2.regs[2].asBool() == true); // last load
+    // Re-entry coherence: r1 sits one past the last committed index (= K+1),
+    // exactly where tier-0 resumes the partial (out-of-bounds) iteration.
+    try testing.expectEqual(@as(i64, K + 1), from2.regs[1].asInt());
+    // Every loaded value equals the tier-0 reader, by construction.
+    i = 2;
+    while (i <= K) : (i += 1) try testing.expect(t.getInt(i).asBool() == true);
+
+    // Start at 1: key 1 is a hole (a narrow-lane absent slot) — `guard_present`
+    // side-exits on the very first iteration, mirroring tier-0 reading nil there.
+    const from1 = runScan(t, 1);
+    try testing.expectEqual(@as(usize, 0), from1.completed);
+    try testing.expect(from1.regs[1].asInt() == 1); // regs untouched (no clean commit)
+    try testing.expect(from1.regs[2].isNil());
+
+    // Start past the dense run: `guard_bounds` side-exits immediately.
+    const fromHi = runScan(t, K + 5);
+    try testing.expectEqual(@as(usize, 0), fromHi.completed);
+}
+
+test "B2 read path: guard_table side-exits when the slot is not a table" {
+    const gpa = testing.allocator;
+    const t = try Table.create(gpa);
+    defer t.destroy(gpa);
+    try t.set(gpa, Value.int(1), Value.boolean(true));
+    try t.set(gpa, Value.int(2), Value.boolean(true));
+
+    var instrs = scanTrace(@intFromEnum(t.array.lane));
+    const tr = Trace{
+        .anchor = undefined,
+        .instrs = &instrs,
+        .consts = @constCast(scan_consts[0..]),
+        .entry_slots = &[_]u16{},
+        .exit_stores = @constCast(scan_exit[0..]),
+    };
+    // r0 is an int, not a table → guard_table fails on the first iteration.
+    var regs = [3]Value{ Value.int(99), Value.int(1), Value.nil() };
+    var values: [11]Value = undefined;
+    try testing.expectEqual(@as(usize, 0), execute(&tr, &regs, &values));
+    try testing.expect(regs[0].asInt() == 99); // untouched
 }
