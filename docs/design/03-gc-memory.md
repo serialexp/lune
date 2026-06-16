@@ -1,8 +1,8 @@
 # lune — GC, Memory & Buffer Ownership
 
-Status: draft, not yet implemented — stub capturing required decisions
+Status: partial — GC v1 (Phase 4) + lane-packed array storage landed; generational upgrade, typed-array payload + buffer lease (Phase 9b), and trace rooting outstanding
 Owner: Bart
-Last updated: 2026-06-12
+Last updated: 2026-06-16
 
 Prerequisite for **Phase 1** (object header + GC-root model), **Phase 3**
 (write-barrier call sites), and **Phase 4** (the collector). Both reviewers
@@ -46,6 +46,35 @@ ownership, write barriers, and trace rooting.
       Trigger: live × 2, floored at an initial threshold, with a `gc_stress` knob
       that collects at every safepoint (the torture test). Generational/incremental
       upgrade is future work (the barrier seams below are already in place).
+- [x] **Lane-packed table array part — monotonic narrow-lane storage**
+      (`src/array.zig`, `src/table.zig`, `src/gc.zig`). A table's dense array run
+      (keys `1..n`) is stored in the narrowest **lane** its contents fit: `.value`
+      (today's 16 B tagged `Value`, `nil` in-band — the heterogeneous/heap-bearing
+      fallback) or a narrow lane (`boolean` ≈ 2 bits/slot, `i8/i16/i32/i64`, `f64`)
+      of packed elements plus a 1-bit/slot **presence bitmap** (a narrow lane has
+      no bit pattern for a hole). The lane is committed **once**, at the first
+      `rehash` that finds a homogeneous run (`ArrayPart.frozen`), and is thereafter
+      **monotonic**: an out-of-lane store widens *up* the lattice
+      (`boolean`/`i8`→`i16`→`i32`→`i64`→`value`, `f64`→`value`) via `widenFor`, and
+      rehash never re-narrows. This bounds an array's total repack work to
+      amortised O(1)/slot and closes a repeated widen+re-narrow DoS a *fresh* table
+      could otherwise be milked for — each fresh table resets the rehash threshold,
+      defeating the doubling amortisation (`bench/repack_adversarial.lua` "storm"
+      mode: ~12.3 s pre-monotonic → 0.27 s after, at C=8/M=2000/K=2000, vs ~0.06 s
+      in stock LuaJIT). nsieve's all-boolean sieve drops from ~320 MB (16 B/slot)
+      to ~11 MB — *below* LuaJIT's 264 MB — with byte-identical output.
+      **GC tie-in:** a narrow lane holds no heap pointers, so `blacken` skips the
+      array-marking loop entirely (`ArrayPart.isLeaf()`); only the `.value` lane
+      and the hash part are traced. The field layout is a frozen `@offsetOf`
+      contract for the future tier-1b JIT (Phase B; see `01-trace-lifecycle.md`).
+      **Trade-off recorded:** monotonic lanes give up speculative width-reclaim
+      when an array's values later shrink (rare; ~1 byte/slot) in exchange for the
+      O(1) bound and removing the attack surface. The lane then depends on
+      contents-*history*, not just current contents — but that stays **unobservable**
+      (array payloads are raw `gpa` allocations with no `GcHeader.id`, and GC
+      timing / addresses / memory are non-observable per `02-determinism.md`), so a
+      lane that diverges across a snapshot→restore changes no program-visible state;
+      capture/restore stays byte-identical and run-twice determinism holds.
 
 ### Outstanding
 - [x] **Object header.** ✅ Shape settled in Phase 1 (`src/object.zig`):
