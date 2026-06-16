@@ -33,6 +33,8 @@ const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
 const OpCode = bytecode.OpCode;
+const table_mod = @import("table.zig");
+const arr = @import("array.zig");
 
 // ---------------------------------------------------------------------------
 // Trace IR
@@ -645,6 +647,10 @@ pub const TraceState = struct {
             },
             .ret, .halt => self.abort(.cross_frame),
 
+            // lane-aware packed-array read (Phase B): `t[k]` for an in-bounds
+            // dense narrow-lane slot compiles; everything else aborts cleanly.
+            .get_index => try self.recArrayGet(instr, regs),
+
             // tables, globals, upvalues, closures, concat, for_prep, len, …:
             // each pulls in heap-effect / cross-frame / invalidation machinery
             // that is later work. Abort cleanly.
@@ -782,6 +788,44 @@ pub const TraceState = struct {
         }
         const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
         self.setReg(instr.a, r);
+    }
+
+    /// Record `t[k]` (`get_index`, `dst=a b=table c=key`) as a lane-aware packed-
+    /// array read. Emits, in order: `guard_table` + `guard_lane` on the table ref,
+    /// `guard_int` on the key, then `aref` (the element address) + `guard_bounds` +
+    /// `guard_present` + `aload`. Aborts (leaving tier-0 untouched) unless the
+    /// observed access is a *present, in-bounds, narrow-lane* slot — the only shape
+    /// the native/oracle read path models:
+    ///   * non-table container or non-int key → `.bad_type` (hash-part / metatable
+    ///     territory, out of scope);
+    ///   * `.value`-lane array → `.nyi_opcode` (the unpacked 16-B path is a
+    ///     deferred scope cut — `.value` arrays stay on tier-0/1a);
+    ///   * out-of-bounds or hole at record time → `.bad_type` (this iteration would
+    ///     immediately side-exit, so the trace would never pay off).
+    fn recArrayGet(self: *TraceState, instr: Instr, regs: []const Value) !void {
+        const vtab = regs[instr.b];
+        const vkey = regs[instr.c];
+        if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
+        if (!vkey.isInt()) return self.abort(.bad_type);
+        const tbl = table_mod.Table.fromHeader(vtab.asHeap());
+        const lane = tbl.array.lane;
+        if (lane == .value) return self.abort(.nyi_opcode); // unpacked path deferred
+        const idx = vkey.asInt();
+        if (idx < 1 or idx > @as(i64, @intCast(tbl.array.len))) return self.abort(.bad_type);
+        const loaded = tbl.getInt(idx);
+        if (loaded.isNil()) return self.abort(.bad_type); // hole — not a profitable trace
+
+        const lane_ord: i32 = @intFromEnum(lane);
+        const rtab = try self.refOf(instr.b);
+        _ = try self.emit(.{ .op = .guard_table, .a = rtab });
+        _ = try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord });
+        const rkey = try self.refOf(instr.c);
+        try self.guardInt(rkey);
+        const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
+        _ = try self.emit(.{ .op = .guard_bounds, .a = ref });
+        _ = try self.emit(.{ .op = .guard_present, .a = ref });
+        const rload = try self.emit(.{ .op = .aload, .a = ref, .aux = lane_ord, .ty = obsTypeOf(loaded) });
+        self.setReg(instr.a, rload);
     }
 
     /// `eq`/`ne`. First cut: numeric operands only (the common loop-condition
@@ -983,6 +1027,11 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_number,
         .guard_true,
         .guard_false,
+        .aload,
+        .guard_table,
+        .guard_lane,
+        .guard_bounds,
+        .guard_present,
         => try w.print("%{d}", .{ins.a}),
         .loop => {},
         else => try w.print("%{d}  %{d}", .{ ins.a, ins.b }),
@@ -1092,4 +1141,92 @@ test "crossing the hotness threshold arms a recording" {
     state.onBackEdge(&proto, 7, &.{}); // 3 == hotloop → arm
     try testing.expect(state.isRecording());
     try testing.expectEqual(@as(u32, 7), state.rec.anchor.pc);
+}
+
+test "recArrayGet: t[k] on a bool lane records the full guarded read sequence" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    // nsieve's bool sieve → a narrow boolean lane.
+    var i: i64 = 2;
+    while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+    try testing.expectEqual(arr.Lane.boolean, t.array.lane);
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // r1 = table, r2 = key (3) ; `get_index r0, r1, r2`  →  r0 = t[3]
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3) };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+
+    try testing.expect(state.isRecording()); // a clean record — no abort
+    const ops = state.rec.instrs.items;
+    // slot_load(table), guard_table, guard_lane, slot_load(key), guard_int,
+    // aref, guard_bounds, guard_present, aload.
+    try testing.expectEqual(@as(usize, 9), ops.len);
+    try testing.expectEqual(IrOp.slot_load, ops[0].op);
+    try testing.expectEqual(IrOp.guard_table, ops[1].op);
+    try testing.expectEqual(IrOp.guard_lane, ops[2].op);
+    try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[2].aux);
+    try testing.expectEqual(IrOp.slot_load, ops[3].op);
+    try testing.expectEqual(IrOp.guard_int, ops[4].op);
+    try testing.expectEqual(IrOp.aref, ops[5].op);
+    try testing.expectEqual(ops[0].a, ops[5].a); // aref.table == the table slot_load... (ref check below)
+    try testing.expectEqual(@as(Ref, 0), ops[5].a); // table ref
+    try testing.expectEqual(@as(Ref, 3), ops[5].b); // key ref
+    try testing.expectEqual(IrOp.guard_bounds, ops[6].op);
+    try testing.expectEqual(@as(Ref, 5), ops[6].a); // guards the aref
+    try testing.expectEqual(IrOp.guard_present, ops[7].op);
+    try testing.expectEqual(@as(Ref, 5), ops[7].a);
+    try testing.expectEqual(IrOp.aload, ops[8].op);
+    try testing.expectEqual(@as(Ref, 5), ops[8].a); // loads through the aref
+    try testing.expectEqual(ObsType.boolean, ops[8].ty); // bool lane → boolean
+}
+
+test "recArrayGet aborts: non-table container, non-int key, hole, and out-of-bounds" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 2;
+    while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+
+    const Case = struct { tab: Value, key: Value, why: AbortReason };
+    const cases = [_]Case{
+        .{ .tab = Value.int(7), .key = Value.int(3), .why = .bad_type }, // not a table
+        .{ .tab = Value.heap(&t.header), .key = Value.boolean(true), .why = .bad_type }, // non-int key
+        .{ .tab = Value.heap(&t.header), .key = Value.int(1), .why = .bad_type }, // hole at 1
+        .{ .tab = Value.heap(&t.header), .key = Value.int(9999), .why = .bad_type }, // out of bounds
+    };
+    for (cases) |c| {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ Value.nil(), c.tab, c.key };
+        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+        try testing.expect(!state.isRecording()); // aborted
+        try testing.expectEqual(c.why, state.rec.abort_reason.?);
+    }
+}
+
+test "recArrayGet aborts on a .value-lane (unpacked) array — deferred scope cut" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    // A small array that never crossed the rehash threshold stays in the default
+    // (unpacked) .value lane — the path the native/oracle read does not model.
+    try t.set(gpa, Value.int(1), Value.int(10));
+    try testing.expectEqual(arr.Lane.value, t.array.lane);
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(1) };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+    try testing.expect(!state.isRecording());
+    try testing.expectEqual(AbortReason.nyi_opcode, state.rec.abort_reason.?);
 }
