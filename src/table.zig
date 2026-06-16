@@ -51,6 +51,14 @@ pub const Table = struct {
         std.hash_map.default_max_load_percentage,
     );
 
+    /// Byte offset of the embedded `array` (`ArrayPart`) from a `*Table`. The
+    /// tier-1b native compiler (`nativegen.zig`) reaches the packed array
+    /// through this base plus the `ArrayPart.Layout.*` field offsets — never a
+    /// literal. Frozen contract: a change to `Table`/`ArrayPart` layout
+    /// recomputes the JIT's address math automatically, and a `@offsetOf`
+    /// regression fails to compile rather than miscompiling.
+    pub const array_off = @offsetOf(Table, "array");
+
     /// Errors from a store. A bad key is a `TypeError` (Lua: "table index is
     /// nil"/"is NaN"); growth can fail with `OutOfMemory`.
     pub const Error = error{ TypeError, OutOfMemory };

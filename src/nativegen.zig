@@ -20,8 +20,38 @@ const builtin = @import("builtin");
 const x64 = @import("x64.zig");
 const trace = @import("trace.zig");
 const value = @import("value.zig");
+const table = @import("table.zig");
+const arr = @import("array.zig");
 const Value = value.Value;
 const Trace = trace.Trace;
+
+/// Frozen in-memory layout the lane-aware native array path (Phase B) encodes
+/// against. Every constant is imported from the table/array modules via
+/// `@offsetOf`, never a literal — a layout change in `table.zig`/`array.zig` is
+/// reflected here at comptime, and a regression fails to compile rather than
+/// silently miscompiling a load/store address. Reaching a packed slot from a
+/// `*Table` is `ArrLayout.array_base + ArrLayout.<field>`.
+const ArrLayout = struct {
+    /// `*Table` → embedded `ArrayPart`.
+    const array_base = table.Table.array_off;
+    /// `ArrayPart` field offsets (from `array_base`).
+    const lane = arr.ArrayPart.Layout.lane;
+    const len = arr.ArrayPart.Layout.len;
+    const data = arr.ArrayPart.Layout.data;
+    const present = arr.ArrayPart.Layout.present;
+};
+
+comptime {
+    // Sanity (evaluated at file scope, so it always runs and marks ArrLayout
+    // used): the array sits past an 8-byte GcHeader, lane is the first
+    // ArrayPart byte, and the pointer/len fields are usize-aligned. These are
+    // the assumptions the native address math (B2+) relies on.
+    std.debug.assert(ArrLayout.array_base >= @sizeOf(@import("object.zig").GcHeader));
+    std.debug.assert(ArrLayout.lane == 0);
+    std.debug.assert(ArrLayout.len % @alignOf(usize) == 0);
+    std.debug.assert(ArrLayout.data % @alignOf(usize) == 0);
+    std.debug.assert(ArrLayout.present % @alignOf(usize) == 0);
+}
 
 /// True only where we can actually emit and run native code.
 pub const is_x64_linux = builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux;
