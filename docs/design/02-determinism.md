@@ -36,7 +36,10 @@ that for a time-travel debugger it *is* the architecture.
       tier-1a IR-interpreter now *runs* hot traces, but it remains output-invariant:
       it calls the **same `arith.zig`** as tier-0 (byte-identical numerics) and
       deopts to tier-0 on any guard miss, re-running the partial iteration (sound
-      because committed traces have no side effects). So a program prints the same
+      because a committed trace's only side effect is a deopt-replay-idempotent
+      packed-array `astore` — recordable only when its value depends on no prior
+      packed read, C1; see `05-native-codegen.md` §Phase B and the heap-determinism
+      oracle). So a program prints the same
       bytes whether a loop runs in tier-0 or tier-1a — the same "run with or without
       for comparison" property, now extended past recording to execution. The
       evidence is the **extended** `expectProgram` matrix in `src/interp.zig`: every

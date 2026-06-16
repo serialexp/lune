@@ -68,11 +68,18 @@ architecture." This doc is where that policy lives.
       / arithmetic error mid-iteration simply *side-exits* — returns with `regs`
       untouched since the iteration start — and tier-0 re-runs that one partial
       iteration from `anchor.pc`. **No per-guard snapshot is consulted.** Sound
-      because a committed trace has **no side effects** (host calls / tables /
-      globals / cross-frame all abort recording), so re-executing the partial
-      iteration recomputes only pure register values — never a doubled effect.
-      Integer `//`/`%`-by-zero is the only mid-trace error possible (i64 ops wrap,
-      never trap); it side-exits and tier-0 re-raises the identical `DivisionByZero`.
+      because a committed trace's only side effect is a **deopt-replay-idempotent
+      array store** (Phase B `astore`): host calls / globals / cross-frame all abort
+      recording, and the one mutation that *is* allowed — an in-bounds, in-lane
+      packed-array write — is recordable only when its value does not depend on any
+      prior packed read (C1: `recArraySet` aborts if any `aload` exists in the
+      trace). So re-executing the partial iteration after a side-exit reproduces the
+      identical write (re-storing the same value into the same slot) rather than a
+      doubled effect; pure register values are recomputed as before. See
+      `05-native-codegen.md` §Phase B for the C1/C2 invariants and the tier-0
+      deopt-replay oracle that proves heap determinism. Integer `//`/`%`-by-zero is
+      the only mid-trace error possible (i64 ops wrap, never trap); it side-exits and
+      tier-0 re-raises the identical `DivisionByZero`.
 - [x] **No GC safepoint inside `execute`.** A committed trace allocates nothing, so
       no collection is ever needed mid-trace — which is what makes the unrooted
       `values[]` scratch safe: any live heap value in it is also reachable via

@@ -66,7 +66,11 @@ ownership, write barriers, and trace rooting.
       **GC tie-in:** a narrow lane holds no heap pointers, so `blacken` skips the
       array-marking loop entirely (`ArrayPart.isLeaf()`); only the `.value` lane
       and the hash part are traced. The field layout is a frozen `@offsetOf`
-      contract for the future tier-1b JIT (Phase B; see `01-trace-lifecycle.md`).
+      contract for the tier-1b JIT, now consumed by **Phase B** (lane-aware native
+      `t[k]` load/store; see `05-native-codegen.md` §Phase B). The same leaf property
+      is what lets the native `astore` write a narrow-lane slot with **no write
+      barrier** — a narrow lane can never hold a heap reference, so a store into it
+      never creates an old→young / black→white edge the collector must track.
       **Trade-off recorded:** monotonic lanes give up speculative width-reclaim
       when an array's values later shrink (rare; ~1 byte/slot) in exchange for the
       O(1) bound and removing the attack surface. The lane then depends on

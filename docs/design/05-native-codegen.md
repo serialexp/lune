@@ -12,11 +12,12 @@ register, and — behind a single-snapshot safety predicate — updates a carrie
 home **in place** so the back-edge shuffle elides. This put `acc=acc+i` at ~1.10× off
 LuaJIT. Coverage #1 then relaxed `guard_int` onto proven-`Int` *derived* values
 (`Int`-op-of-`Int`s), landing op-chain and multi-accumulator loops on the native
-path (~2.5× off LuaJIT — the richer shapes still have headroom). Float/heap/mixed
-traces, deferred ops, accumulator sinking, and per-exit side traces are later cuts
-(see §Out of scope).
+path (~2.5× off LuaJIT — the richer shapes still have headroom). **Phase B** then
+added a lane-aware **array load/store** path (`t[k]` against the packed `ArrayPart`)
+— see §Phase B below. Float/heap (non-array)/mixed traces, deferred ops, accumulator
+sinking, and per-exit side traces are later cuts (see §Out of scope).
 Owner: Bart
-Last updated: 2026-06-15
+Last updated: 2026-06-16
 
 Realises **Phase 8** in `00-architecture.md`. Tiers 0 and 1a are both
 *interpreters*: tier-0 walks bytecode (`interp.zig`), tier-1a walks the optimized
@@ -356,9 +357,79 @@ transparently (≈ 1.0×).
 
 ---
 
+## Phase B — lane-aware array load/store (tier-1b)
+
+Phase B teaches the native backend to read and write a table's dense run directly,
+against the lane-packed `ArrayPart` (`src/array.zig`) frozen by Phase A. The native
+path handles `t[k]` exactly when `k ∈ 1..len` (the array part); sparse/string keys,
+OOB, holes, and the `.value`/`.f64` lanes all guard-bail to tier-1a.
+
+**IR (recorder → oracle → native), `IrInstr` stays 16 B via the aref-pairing trick:**
+- `aref` (`a`=table, `b`=index, `aux`=lane) → addressing token carrying `idx0 = k-1`.
+  Loop-variant (never hoisted). New native `Kind.aref`.
+- `aload` (`a`=aref, `aux`=lane) → decode the slot to a `Value` (bool lane: `bt` the
+  value bit + `movzx`; int lanes i8/i16/i32/i64: `movsx`/`movsxd`/`mov` per width).
+- `astore` (`a`=aref, `b`=value, `aux`=lane) → encode the value (bool: `bts`/`btr`
+  the value bit; int: width-truncating `mov [data+idx0*w]`), then set the presence
+  bit **LAST** (I5 — the commit point for an absent→present transition).
+- read/write guards: `guard_table` (slot is a `table`), `guard_lane` (array lane ==
+  recorded lane — both hoisted to the prologue), `guard_bounds` (`idx0 <u len`),
+  `guard_present` (`bt` the presence bitmap; a hole would read as `nil`).
+- `guard_fits` (`a`=value, `aux`=lane) — **the int-store soundness guard.** A value
+  that no longer fits a narrow int lane would force tier-0 to WIDEN the array
+  (allocate + relayout), which the native store cannot do mid-run. The recorder
+  emits `guard_fits` before every int-lane `astore`; the tier-1a oracle side-exits
+  via `ArrayPart.laneFits` identically, and native lowers it to a signed range
+  compare (i8/i16/i32; i64 fits everything → no check). The bool lane needs none
+  (its store value is a statically-typed bool).
+
+**Soundness invariants enforced:**
+- **C1** — a write whose value/control depends on a prior packed read is
+  unrecordable: `recArraySet` aborts if *any* `aload` exists in the trace
+  (conservative over both data and control channels). nsieve's sieve-clearing loop
+  is pure constant writes, so it is unaffected. The real oracle for this is **tier-0
+  deopt-replay** (snapshot heap, run native-to-exit then tier-0 from the committed
+  regs, compare against a clean tier-0 run on a distinct table) — `expectMatch`
+  (regs-only) cannot catch a double-apply because both tiers leave the same partial
+  heap on a side-exit.
+- **C2** — no `.ptr`/`.aref` kind in `exit_stores` (the deopt flush writes TAG_INT;
+  a raw pointer there would corrupt the slot). Enforced in `proveKinds`.
+- **I3** one `idx0 = index-1` shared by bounds/present/address. **I4** `guard_bounds`
+  dominates `guard_present`/`aload`/`astore` (`len>0 ⇒ present non-null`). Int astore
+  folds `idx0` into the element address with `lea` so data-ptr + value fit in the two
+  scratch registers (rax/rcx) without a third.
+
+**B5 — nsieve end-to-end + measurement.** The array path compiles end-to-end: an
+integer-limit sieve (`bench/sieve_int.lua`) records both hot loops — the read
+(`if p[i]`) and the bool-lane write (`for k=i+i,m,i do p[k]=false end`) — and both
+`.compiled` to native x86-64 (272 + 238 bytes). Output is byte-identical to LuaJIT.
+
+| int-sieve, N=4 000 000, best-of-3 | time | vs tier-0 |
+|---|---|---|
+| tier-0 (bytecode interp) | 0.37 s | 1.0× |
+| tier-1a (IR interp) | 0.55 s | 0.67× |
+| **tier-1b (native, array path)** | **0.15 s** | **2.5×** |
+| LuaJIT | 0.04 s | 9.3× |
+
+The native array path is **2.5× faster than tier-0 and 3.7× faster than tier-1a**,
+~3.75× off LuaJIT.
+
+> **Caveat — canonical `bench/nsieve.lua` does NOT JIT its hot loop yet.** Its limit
+> `m = (2^(N-i))*10000` comes from a float `pow`, so the numeric-for loop variable and
+> limit are **floats**; the loop bails on `guard_float` before the array work is even
+> reached. This is the deferred **float/XMM** phase, *not* an array-path gap — the
+> array read/write lowering is complete and exercised by the int-limit variant above.
+> Canonical nsieve still runs **byte-identical to LuaJIT under `--jit-native`** for
+> N∈{1,4,6,9,11} (it transparently executes on tier-1a). `bench/sieve_int.lua` is the
+> int-keyed variant that actually JITs, kept as the reproducible array-path benchmark.
+
 ## Out of scope (named follow-ups)
 
 - **Float / mixed / heap traces** — xmm registers, tag dispatch, libm `call`-outs.
+  This is the gap that keeps the **canonical `bench/nsieve.lua`** hot loop on tier-1a
+  (its `2^x`-derived limit makes the loop variable a float → `guard_float` bail);
+  landing float support is what turns the byte-identical-but-interpreted nsieve into a
+  natively-JIT'd one. The non-float **array** read/write path itself is done (Phase B).
 - **Deferred ops** — `div`/`idiv`/`mod`/`pow` (floored-div/mod correction),
   `shl`/`shr` (Lua masked shift counts), `not` (logical, not bitwise).
 - ~~**Relax `guard_int` onto proven-`Int` derived values**~~ — **done (#1):** a
