@@ -69,7 +69,12 @@ elseif mode == "storm" then
       for j = 1, need do a[nextkey + j] = j end   -- force a rehash -> re-narrow
       for j = 1, need do a[nextkey + j] = nil end
       nextkey = nextkey + need
-      need = need * 2
+      -- Cap the per-cycle key burst: the rehash threshold roughly doubles each
+      -- rehash, so crossing it needs ~2x more keys each time — but left uncapped
+      -- the burst is 4*2^C and overflows time/memory for large C. Past the cap the
+      -- threshold simply outruns us and rehashes stop firing, which is fine: under
+      -- monotonic lanes a forced rehash no longer re-narrows anyway.
+      if need < 65536 then need = need * 2 end
     end
     checksum = checksum + a[3]
   end

@@ -75,6 +75,18 @@ pub const ArrayPart = extern struct {
     /// offset 0 of the array part — a stable layout Phase B's `guard_lane` reads
     /// as a single byte (the whole point of the `Layout` contract below).
     lane: Lane = .value,
+    /// One-shot lane commitment flag (lives in `lane`'s alignment padding, so it
+    /// costs no extra bytes). False until a `rehash` commits the array to a
+    /// **narrow** lane (`optimalLane` returning `.value` — empty/heterogeneous —
+    /// does *not* freeze, leaving a later rehash free to narrow once the contents
+    /// settle); true forever after that commit. Once committed, the lane is **monotonic**
+    /// — it only ever widens (up the lattice, on the store path) and is never
+    /// re-narrowed. This bounds an array's total repack work to amortised O(1)/slot
+    /// and removes the repeated-repack attack surface (a fresh table forced to
+    /// widen+re-narrow on every rehash). It also distinguishes a fresh, still
+    /// in-`.value` array (narrow it at the next rehash) from one demoted to
+    /// `.value` by a type-incompatible store (leave it; never re-narrow).
+    frozen: bool = false,
     /// Logical slot count: keys `1..len` map to packed indices `0..len-1`. This
     /// is the array part's extent, **not** `#t` (which trims trailing holes).
     len: usize = 0,
@@ -90,6 +102,7 @@ pub const ArrayPart = extern struct {
 
     pub const Layout = struct {
         pub const lane = @offsetOf(ArrayPart, "lane");
+        pub const frozen = @offsetOf(ArrayPart, "frozen");
         pub const len = @offsetOf(ArrayPart, "len");
         pub const cap = @offsetOf(ArrayPart, "cap");
         pub const data = @offsetOf(ArrayPart, "data");
@@ -120,19 +133,21 @@ pub const ArrayPart = extern struct {
     }
 
     /// `t[i] = val` for `1 <= i <= len` (in-place). If `val` does not fit the
-    /// current narrow lane, the array part widens to `.value` first (O(n), rare).
-    /// Storing `nil` punches a hole.
+    /// current narrow lane, the array part widens **monotonically** up the lane
+    /// lattice first (an out-of-range int steps to the next int lane; a
+    /// type-incompatible value falls to `.value`) — O(n), but bounded to a handful
+    /// of crossings over the array's life. Storing `nil` punches a hole.
     pub fn setInPlace(self: *ArrayPart, gpa: std.mem.Allocator, i: usize, val: Value) std.mem.Allocator.Error!void {
         std.debug.assert(i >= 1 and i <= self.len);
-        if (!self.fits(val)) try self.widenToValue(gpa);
+        if (!self.fits(val)) try self.widenFor(gpa, val);
         self.encode(i - 1, val);
     }
 
-    /// Append `val` as the new key `len+1`, growing the storage. Widens to
-    /// `.value` if `val` does not fit the current lane.
+    /// Append `val` as the new key `len+1`, growing the storage. Widens the lane
+    /// monotonically (see `setInPlace`) if `val` does not fit the current lane.
     pub fn append(self: *ArrayPart, gpa: std.mem.Allocator, val: Value) std.mem.Allocator.Error!void {
         try self.ensureCapacity(gpa, self.len + 1);
-        if (!self.fits(val)) try self.widenToValue(gpa);
+        if (!self.fits(val)) try self.widenFor(gpa, val);
         self.len += 1;
         self.encode(self.len - 1, val);
     }
@@ -208,6 +223,12 @@ pub const ArrayPart = extern struct {
     /// rehash to narrow a `.value` array, or to re-narrow after a widening store.
     pub fn repack(self: *ArrayPart, gpa: std.mem.Allocator, target: Lane) std.mem.Allocator.Error!void {
         if (target == self.lane) return;
+        // `repack` is the one-time lane *commitment* (driven by the first rehash).
+        // After commit the lane only ever widens — and only via the store path
+        // (`widenFor`), never through `repack`. Re-laning a frozen array would be a
+        // monotonicity violation (the repeated-repack attack), so enforce it at the
+        // type boundary rather than relying solely on the caller's `!frozen` guard.
+        std.debug.assert(!self.frozen);
         try self.convert(gpa, target);
     }
 
@@ -423,8 +444,11 @@ pub const ArrayPart = extern struct {
         const new_present: ?[*]u8 = if (target.isNarrow()) try allocPresence(gpa, cap) else null;
 
         // Build a temporary view of the destination to encode into, then commit.
+        // `frozen` carries through unchanged: a monotonic widen on the store path
+        // must keep the array committed (else the next rehash would re-narrow it).
         var dst: ArrayPart = .{
             .lane = target,
+            .frozen = self.frozen,
             .len = self.len,
             .cap = cap,
             .data = new_data,
@@ -439,9 +463,29 @@ pub const ArrayPart = extern struct {
         self.* = dst;
     }
 
-    fn widenToValue(self: *ArrayPart, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
-        if (self.lane == .value) return;
-        try self.convert(gpa, .value);
+    /// Monotonic widen: climb the lane lattice just enough to hold `val`, which
+    /// the caller has determined does **not** fit the current (narrow) lane. An
+    /// int that outgrows its lane steps up to the next int lane (i8→i16→i32→i64);
+    /// any type-incompatible value (a float into an int lane, a bool into an int
+    /// lane, a heap value, …) falls straight to `.value`. The lane never narrows
+    /// again, so over an array's lifetime it crosses at most a handful of
+    /// boundaries — total widening work is amortised O(1) per slot, and the
+    /// repeated-repack attack (re-narrowing at every rehash) is structurally gone.
+    fn widenFor(self: *ArrayPart, gpa: std.mem.Allocator, val: Value) std.mem.Allocator.Error!void {
+        std.debug.assert(self.lane.isNarrow()); // `.value` fits everything; caller short-circuits
+        const target: Lane = switch (self.lane) {
+            .value => unreachable,
+            // A non-fitting int needs a strictly wider int lane (`intLaneFor`
+            // returns the narrowest covering it, which is necessarily > current,
+            // and every wider int lane is a superset — existing slots re-encode
+            // exactly). A non-int forces the type-erased `.value` lane.
+            .i8, .i16, .i32, .i64 => if (val.isInt()) intLaneFor(val.asInt(), val.asInt()) else .value,
+            // boolean/f64 lanes are type-pure: any value that doesn't fit means a
+            // type mismatch, which only `.value` can hold.
+            .boolean, .f64 => .value,
+        };
+        std.debug.assert(target != self.lane);
+        try self.convert(gpa, target);
     }
 };
 
@@ -577,6 +621,64 @@ test "widening on append of an out-of-lane value" {
     try testing.expectEqual(@as(f64, 1.5), a.get(11).asFloat());
 }
 
+test "monotonic widen: an int outgrowing its lane steps up the int ladder, not to value" {
+    const gpa = testing.allocator;
+    var a: ArrayPart = .empty;
+    defer a.deinit(gpa);
+
+    // Pack into i8 (all values in [-128, 127]).
+    var i: usize = 1;
+    while (i <= 10) : (i += 1) try a.append(gpa, Value.int(@intCast(i)));
+    try a.repack(gpa, a.optimalLane());
+    try testing.expectEqual(Lane.i8, a.lane);
+
+    // Store 1000 (out of i8, fits i16) → steps up to i16, NOT .value.
+    try a.setInPlace(gpa, 3, Value.int(1000));
+    try testing.expectEqual(Lane.i16, a.lane);
+    try testing.expectEqual(@as(i64, 1000), a.get(3).asInt());
+    try testing.expectEqual(@as(i64, 1), a.get(1).asInt()); // earlier slots intact
+
+    // Append 100000 (out of i16, fits i32) → steps up to i32.
+    try a.append(gpa, Value.int(100000));
+    try testing.expectEqual(Lane.i32, a.lane);
+    try testing.expectEqual(@as(i64, 100000), a.get(11).asInt());
+
+    // Append 1<<40 (out of i32) → i64.
+    try a.append(gpa, Value.int(1 << 40));
+    try testing.expectEqual(Lane.i64, a.lane);
+    try testing.expectEqual(@as(i64, 1 << 40), a.get(12).asInt());
+}
+
+test "monotonic widen: a type-incompatible store still falls straight to value" {
+    const gpa = testing.allocator;
+    var a: ArrayPart = .empty;
+    defer a.deinit(gpa);
+    var i: usize = 1;
+    while (i <= 10) : (i += 1) try a.append(gpa, Value.int(@intCast(i)));
+    try a.repack(gpa, a.optimalLane());
+    try testing.expectEqual(Lane.i8, a.lane);
+
+    // A float into an int lane is a type mismatch → no int lane covers it → .value.
+    try a.setInPlace(gpa, 4, Value.float(1.5));
+    try testing.expectEqual(Lane.value, a.lane);
+    try testing.expectEqual(@as(f64, 1.5), a.get(4).asFloat());
+    try testing.expectEqual(@as(i64, 1), a.get(1).asInt());
+}
+
+test "monotonic: a frozen lane is preserved across a widening convert" {
+    const gpa = testing.allocator;
+    var a: ArrayPart = .empty;
+    defer a.deinit(gpa);
+    var i: usize = 1;
+    while (i <= 10) : (i += 1) try a.append(gpa, Value.int(@intCast(i)));
+    try a.repack(gpa, a.optimalLane());
+    a.frozen = true; // simulate the rehash commit
+
+    try a.setInPlace(gpa, 3, Value.int(1000)); // i8 → i16 via widenFor/convert
+    try testing.expectEqual(Lane.i16, a.lane);
+    try testing.expect(a.frozen); // commitment survives the widen
+}
+
 test "resize grows with holes and shrinks dropping the tail" {
     const gpa = testing.allocator;
     var a: ArrayPart = .empty;
@@ -617,7 +719,20 @@ test "isLeaf tracks the lane" {
 }
 
 test "Layout offsets are stable and lane is first" {
+    // Phase B's JIT encodes these offsets via `@offsetOf`; pin them so a layout
+    // drift fails here rather than silently miscompiling native array access.
     try testing.expectEqual(@as(usize, 0), ArrayPart.Layout.lane);
+    // `frozen` rides in `lane`'s alignment padding (offset 1), so it must NOT push
+    // the pointer-aligned fields out: `len` still lands at the first usize-aligned
+    // offset and the three word-sized fields follow contiguously. Derived from
+    // `@sizeOf(usize)` so the contract holds on both 64- and 32-bit targets.
+    const word = @sizeOf(usize);
+    try testing.expectEqual(@as(usize, 1), ArrayPart.Layout.frozen);
+    try testing.expectEqual(@alignOf(usize), ArrayPart.Layout.len);
+    try testing.expectEqual(ArrayPart.Layout.len + word, ArrayPart.Layout.cap);
+    try testing.expectEqual(ArrayPart.Layout.cap + word, ArrayPart.Layout.data);
+    try testing.expectEqual(ArrayPart.Layout.data + word, ArrayPart.Layout.present);
+    try testing.expectEqual(ArrayPart.Layout.present + word, @sizeOf(ArrayPart));
 }
 
 test "OOM at any allocation point leaves the array part consistent (no leak, no bad free)" {

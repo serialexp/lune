@@ -282,20 +282,51 @@ pub const Table = struct {
                 const key = Value.int(@intCast(k));
                 if (self.hash.get(key)) |val| {
                     // Write into the array part *before* evicting from the hash: a
-                    // narrow→`.value` widening inside `setInPlace` can OOM, and a
-                    // `fetchRemove`-first ordering would drop the entry on failure.
-                    try self.array.setInPlace(gpa, k, val);
+                    // widening inside `setInPlace` can OOM, and a `fetchRemove`-first
+                    // ordering would drop the entry on failure. On that OOM the keys
+                    // `[k, asize]` are still hash-resident, so trim the array extent
+                    // back to `k-1`: otherwise the freshly-resized nil holes at
+                    // `[k, asize]` would *shadow* those live hash entries on a later
+                    // `get` (which consults the array part for any index `<= len`).
+                    // Already-migrated keys `[old_len+1, k-1]` stay visible.
+                    self.array.setInPlace(gpa, k, val) catch |e| {
+                        self.array.len = k - 1;
+                        return e;
+                    };
                     _ = self.hash.remove(key);
                 }
             }
         }
 
-        // Re-pick the array part's storage lane now that its contents are settled.
-        // The rehash already walked every element above, and this pass folds the
-        // array into the narrowest lane it fits (e.g. nsieve's all-boolean sieve
-        // → a 1-bit boolean lane), recovering most of the per-slot `Value` width.
-        // A pure in-memory change — invisible to `get`/keyframes (see `array.zig`).
-        try self.array.repack(gpa, self.array.optimalLane());
+        // Pick the array part's storage lane — but only **once**, on the first
+        // rehash, then freeze it. The rehash already walked every element above,
+        // and this pass folds the array into the narrowest lane it fits (e.g.
+        // nsieve's all-boolean sieve → a 1-bit boolean lane), recovering most of
+        // the per-slot `Value` width. After this one-shot commit the lane is
+        // **monotonic**: it only ever widens, and only on the store path (an
+        // out-of-lane store steps up the lane lattice via `ArrayPart.widenFor`) —
+        // rehash never re-narrows. That bounds an array's total repack work to
+        // amortised O(1)/slot and removes the repeated widen+re-narrow attack a
+        // fresh table could otherwise be milked for. `repack` is OOM-safe and
+        // leaves `self` untouched on failure, so `frozen` is set only after it
+        // succeeds (a retried rehash re-attempts the commit). A pure in-memory
+        // change — invisible to `get`/keyframes (see `array.zig`).
+        //
+        // Freeze **only** when we actually commit to a narrow lane. If `optimalLane`
+        // returns `.value` (the array is empty, heterogeneous, or heap-bearing at
+        // this rehash) there is nothing to lock in, so leave `frozen` false: a later
+        // rehash, once the contents have settled into a homogeneous run (e.g. an
+        // initially-sparse table that fills a dense int range), can still narrow it.
+        // The narrowing → `.value` direction is the one-time commit; once a *narrow*
+        // lane is committed (`frozen = true`), the lane only ever widens (store path)
+        // and is never re-narrowed — so this still closes the repeated-repack attack.
+        if (!self.array.frozen) {
+            const lane = self.array.optimalLane();
+            if (lane.isNarrow()) {
+                try self.array.repack(gpa, lane);
+                self.array.frozen = true;
+            }
+        }
 
         // Amortise: don't rehash again until the hash population roughly doubles.
         // (`hash.count()` here excludes the still-pending `extra_key`, which the
@@ -593,11 +624,11 @@ test "lane: a small-int run packs into a narrow int lane (16-bit example)" {
     const gpa = testing.allocator;
 
     // Dense 2..N (hole at 1, so the first inserts route through the hash part and
-    // trip a rehash + repack — lane selection is rehash-only, never on the append
-    // fast path). Values stay within [-32768, 32767] so they fit an i16 lane the
-    // whole way (a value escaping the lane mid-append would widen to `.value`,
-    // since the append fast path never re-narrows). The array.zig unit tests cover
-    // i32 selection directly.
+    // trip a rehash, where the lane is committed once). Values stay within
+    // [-32768, 32767] so the committed lane is i16 and no later store needs to
+    // widen it. (An int escaping i16 would step the lane *up* the int ladder, not
+    // jump to `.value`; a non-int would fall to `.value`. The array.zig unit tests
+    // cover the monotonic step-up and i32 selection directly.)
     const N: i64 = 64;
     var i: i64 = 2;
     while (i <= N) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i * 100)); // max 6400
@@ -675,6 +706,84 @@ test "lane: a heterogeneous/heap-bearing array stays in the value lane" {
     try testing.expectEqual(@as(i64, 4), t.get(Value.int(4)).asInt());
     try testing.expect(t.get(Value.int(5)).isHeap());
     try testing.expectEqual(@as(f64, 3.0), t.get(Value.int(3)).asFloat());
+}
+
+test "lane: a sparse-first table still narrows once a dense int run fills in" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    // Sparse integer keys trip an early rehash while the array part is still empty,
+    // so `optimalLane` returns `.value` (nothing to narrow). That must NOT freeze
+    // the lane (the premature-freeze bug), or the dense fill below would be stuck at
+    // 16 B/slot for good.
+    var s: i64 = 0;
+    while (s < 8) : (s += 1) try t.set(gpa, Value.int(1_000_000 + s * 1000), Value.int(1));
+    try testing.expectEqual(arr.Lane.value, t.array.lane);
+    try testing.expectEqual(@as(usize, 0), t.array.len); // sparse keys did not grow the array
+
+    // Now fill a dense small-int run (hole at 1 routes through the hash and trips a
+    // rehash that finds a homogeneous run → it must still commit to a narrow lane).
+    const N: i64 = 80;
+    var i: i64 = 2;
+    while (i <= N) : (i += 1) try t.set(gpa, Value.int(i), Value.int(@mod(i, 100)));
+    try testing.expectEqual(arr.Lane.i8, t.array.lane);
+    try testing.expect(t.array.isLeaf());
+    i = 2;
+    while (i <= N) : (i += 1) try testing.expectEqual(@mod(i, 100), t.get(Value.int(i)).asInt());
+}
+
+test "lane: an out-of-lane int store steps the lane up, never re-narrowing" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    // Commit to i8 (hole at 1 forces the rehash; all values in [-128,127]).
+    const N: i64 = 40;
+    var i: i64 = 2;
+    while (i <= N) : (i += 1) try t.set(gpa, Value.int(i), Value.int(@mod(i, 100) - 50));
+    try testing.expectEqual(arr.Lane.i8, t.array.lane);
+
+    // Store a value past i8 → the lane steps up to i16 (monotonic), staying narrow
+    // and leaf — it does not jump to `.value`.
+    try t.set(gpa, Value.int(10), Value.int(5000));
+    try testing.expectEqual(arr.Lane.i16, t.array.lane);
+    try testing.expect(t.array.isLeaf());
+    try testing.expectEqual(@as(i64, 5000), t.get(Value.int(10)).asInt());
+
+    // Insert many sparse keys to drive repeated rehashes (they stay in the hash
+    // part, never migrating into the array): a monotonic lane must never re-narrow
+    // back to i8, even though the only out-of-i8 value sits at a single slot.
+    var k: i64 = 1_000_000;
+    while (k < 1_000_400) : (k += 1) try t.set(gpa, Value.int(k), Value.int(0));
+    try testing.expectEqual(arr.Lane.i16, t.array.lane); // still i16, never re-narrowed to i8
+}
+
+test "lane: a rehash drain that OOMs leaves the table consistent (no leak/bad-free)" {
+    // Drive a rehash whose drain migrates hash-resident keys into a committed narrow
+    // array, with one migrated value out of the lane (so the drain's `setInPlace`
+    // widens). `checkAllAllocationFailures` forces each successive allocation to
+    // fail, exercising the `len`-rollback path on a mid-drain OOM: the testing
+    // allocator then asserts no leak and no invalid free, catching a mishandled
+    // truncation. (The shadowing-correctness itself is structural: trimming `len`
+    // back to the failed index keeps the not-yet-migrated keys hash-reachable.)
+    const Inner = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            const t = try Table.create(gpa);
+            defer t.destroy(gpa);
+            // Commit a narrow i8 array (hole at 1 forces the rehash).
+            var i: i64 = 2;
+            while (i <= 40) : (i += 1) try t.set(gpa, Value.int(i), Value.int(@mod(i, 100) - 50));
+            // Park an out-of-i8 value and a gap-filling dense run in the hash, then
+            // a sparse key to trip another rehash that grows the array to cover them.
+            try t.set(gpa, Value.int(60), Value.int(9000)); // out of i8 → drain will widen
+            i = 41;
+            while (i <= 59) : (i += 1) try t.set(gpa, Value.int(i), Value.int(0));
+            i = 61;
+            while (i <= 64) : (i += 1) try t.set(gpa, Value.int(i), Value.int(0));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Inner.run, .{});
 }
 
 test "lane: value identity is preserved across a widening store" {
