@@ -125,12 +125,30 @@ pub fn mapExecutable(code: []const u8) MapError!ExecPage {
 // ---------------------------------------------------------------------------
 
 const Reg = x64.Reg;
+const object = @import("object.zig");
 const TAG_INT: u8 = @intFromEnum(value.Tag.int);
 const TAG_BOOL: u8 = @intFromEnum(value.Tag.boolean);
+const TAG_HEAP: u8 = @intFromEnum(value.Tag.heap_ref);
+/// `ObjectType.table` ordinal — the byte at `GcHeader.type` for a table.
+const TABLE_TYPE: u8 = @intFromEnum(object.ObjectType.table);
+/// Offset of `GcHeader.type` (the first header byte) from a `*GcHeader`.
+const HEADER_TYPE_OFF: i32 = @offsetOf(object.GcHeader, "type");
+/// The only narrow lane the native array path lowers in Phase B2/B3 (bool sieve).
+/// Every other lane (`.value`, i8…f64) bails to tier-1a here — `proveKinds`
+/// rejects an `aref`/`aload`/`guard_lane` whose `aux` is not this.
+const BOOL_LANE: i32 = @intFromEnum(arr.Lane.boolean);
 
-/// The proven kind of each SSA ref. `none` = produces no usable value (a guard /
-/// the `loop` marker) — referencing it as an operand is a bail.
-const Kind = enum { none, int, bool };
+/// The proven kind of each SSA ref.
+///   - `none`  — produces no usable value (a guard / the `loop` marker);
+///               referencing it as an operand is a bail.
+///   - `int` / `bool` — a boxed scalar that may be carried, flushed, or stored.
+///   - `ptr`   — a raw `*GcHeader` (a `guard_table`-covered table `slot_load`).
+///               Classified `invariant`, loaded once; **must never** reach
+///               `exit_stores` (the deopt flush boxes as TAG_INT — C2).
+///   - `aref`  — the paired `(table, index)` addressing token produced by `aref`
+///               (its register holds `idx0 = index-1`). A distinct kind so it can
+///               neither feed arithmetic nor be flushed to a slot.
+const Kind = enum { none, int, bool, ptr, aref };
 
 /// A compiled trace: an executable page whose entry is
 /// `fn(regs: [*]Value) callconv(.c) usize` — `regs` base in rdi, the cleanly
@@ -229,6 +247,11 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     const guarded = gpa.alloc(bool, n) catch return false;
     defer gpa.free(guarded);
     @memset(guarded, false);
+    // Parallel to `guarded`, but for `guard_table`: a slot_load it covers is the
+    // table value → classified `.ptr` (invariant, loaded once).
+    const table_guarded = gpa.alloc(bool, n) catch return false;
+    defer gpa.free(table_guarded);
+    @memset(table_guarded, false);
 
     for (t.instrs, 0..) |ins, i| {
         switch (ins.op) {
@@ -241,6 +264,14 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (r >= i) return false; // not linear SSA → malformed
                 if (t.instrs[r].op == .slot_load) guarded[r] = true;
             },
+            .guard_table => {
+                const r = ins.a;
+                if (r >= i) return false; // not linear SSA → malformed
+                // A table guard only ever covers the table-bearing slot_load; the
+                // native path hoists it to a prologue heap/type check.
+                if (t.instrs[r].op != .slot_load) return false;
+                table_guarded[r] = true;
+            },
             else => {},
         }
     }
@@ -249,8 +280,13 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     for (t.instrs, 0..) |ins, i| {
         switch (ins.op) {
             .slot_load => {
-                if (!guarded[i]) return false; // unguarded → cannot prove int
-                kinds[i] = .int;
+                if (guarded[i]) {
+                    kinds[i] = .int;
+                } else if (table_guarded[i]) {
+                    kinds[i] = .ptr; // guard_table-covered → invariant table pointer
+                } else {
+                    return false; // unguarded → cannot prove a kind
+                }
             },
             .konst => {
                 if (ins.aux < 0 or ins.aux >= t.consts.len) return false;
@@ -285,6 +321,43 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (k != .int and k != .bool) return false;
                 kinds[i] = .none;
             },
+            // --- lane-aware array read path (B2) ---------------------------------
+            // guard_table / guard_lane: cover the table slot_load (proven .ptr).
+            // guard_lane additionally pins the lane; the native path only lowers
+            // the bool lane, so any other lane bails here.
+            .guard_table => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .ptr) return false;
+                kinds[i] = .none;
+            },
+            .guard_lane => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .ptr) return false;
+                if (ins.aux != BOOL_LANE) return false; // non-bool lane → tier-1a
+                kinds[i] = .none;
+            },
+            // aref pairs (table, index); its register carries idx0 = index-1. A
+            // distinct `.aref` kind so it can neither feed arithmetic nor be flushed.
+            .aref => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (kinds[ins.a] != .ptr or kinds[ins.b] != .int) return false;
+                if (ins.aux != BOOL_LANE) return false;
+                kinds[i] = .aref;
+            },
+            // guard_bounds (idx0 <u len) precedes guard_present (bt the bitmap);
+            // both consume the aref token and produce nothing.
+            .guard_bounds, .guard_present => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .aref) return false;
+                kinds[i] = .none;
+            },
+            // aload decodes the bool-lane slot to a boolean (movzx of the value bit).
+            .aload => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .aref) return false;
+                if (ins.aux != BOOL_LANE) return false;
+                kinds[i] = .bool;
+            },
             .loop => {
                 if (i != n - 1) return false; // loop must be terminal
                 kinds[i] = .none;
@@ -295,11 +368,13 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
         }
     }
 
-    // Every loop-carried writeback must reference a proven value (int/bool) so we
-    // know its box tag.
+    // Every loop-carried writeback must reference a *boxable scalar* (int/bool) so
+    // the deopt flush knows its tag. [C2] A `.ptr` (raw table pointer) or `.aref`
+    // (addressing token) in `exit_stores` would be flushed as a bogus TAG_INT and
+    // corrupt the slot — reject both here, not just `.none`.
     for (t.exit_stores) |st| {
         if (st.ref >= n) return false;
-        if (kinds[st.ref] == .none) return false;
+        if (kinds[st.ref] != .int and kinds[st.ref] != .bool) return false;
     }
     return true;
 }
@@ -337,10 +412,13 @@ const SlotClass = enum {
 const SlotInfo = struct {
     slot: u16,
     class: SlotClass,
-    kind: Kind, // box tag at commit/flush (int for carried/invariant; store_ref's for write_only)
+    kind: Kind, // box tag at commit/flush (int/ptr for carried/invariant; store_ref's for write_only)
     home: Loc, // valid for carried/invariant
     load_ref: i32, // the slot_load ref, or -1
     store_ref: i32, // the exit_store ref feeding it, or -1
+    /// For a `.ptr` (table) invariant slot: the bool-lane ordinal its `guard_lane`
+    /// pins, checked once in the prologue. `-1` for non-`.ptr` slots.
+    lane: i32,
     /// win 2: the store_ref transient was allocated *into* home, so the op updates the
     /// home in place and the back-edge shuffle move for this slot self-elides. Only set
     /// for `carried` slots passing the safety predicate (see `analyzeInner`).
@@ -388,6 +466,8 @@ const AnalyzeError = std.mem.Allocator.Error || error{
 fn isTransient(op: trace.IrOp) bool {
     return switch (op) {
         .konst, .add, .sub, .mul, .band, .bor, .bxor, .neg, .bnot, .eq, .ne, .lt, .le => true,
+        // aref materializes idx0 in a register; aload materializes the decoded bool.
+        .aref, .aload => true,
         else => false,
     };
 }
@@ -407,6 +487,10 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
     return switch (ins.op) {
         .add, .sub, .mul, .band, .bor, .bxor, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
         .neg, .bnot, .guard_int, .guard_true, .guard_false => .{ .a = true, .b = false },
+        // aref reads table (a, an invariant home) + index (b). aload/guards reach the
+        // table through aref.a, so they read only the aref token (a).
+        .aref => .{ .a = true, .b = true },
+        .aload, .guard_bounds, .guard_present, .guard_table, .guard_lane => .{ .a = true, .b = false },
         else => .{ .a = false, .b = false },
     };
 }
@@ -438,6 +522,7 @@ fn findOrAddSlot(slots: *std.ArrayListUnmanaged(SlotInfo), gpa: std.mem.Allocato
         .home = undefined,
         .load_ref = -1,
         .store_ref = -1,
+        .lane = -1,
         .coalesced = false,
     });
     return slots.items.len - 1;
@@ -486,11 +571,29 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             if (kinds[@intCast(s.store_ref)] != .int) return error.Bail;
         } else if (loaded) {
             s.class = .invariant;
-            s.kind = .int;
+            // int OR ptr (a guard_table-covered table slot, read-only loop-invariant).
+            s.kind = kinds[@intCast(s.load_ref)];
         } else {
             s.class = .write_only;
             s.kind = kinds[@intCast(s.store_ref)];
         }
+    }
+    // A `.ptr` (table) invariant slot needs the bool-lane its `guard_lane` pins, so
+    // the prologue can check it once. Locate the guard_lane covering the slot_load.
+    for (slots.items) |*s| {
+        if (s.kind != .ptr) continue;
+        const lr: u16 = @intCast(s.load_ref);
+        var found = false;
+        for (t.instrs) |g| {
+            if (g.op == .guard_lane and g.a == lr) {
+                s.lane = g.aux;
+                found = true;
+                break;
+            }
+        }
+        // proveKinds only set .ptr via a guard_table; a guard_lane must accompany it
+        // (the recorder always emits both). Defensive: bail rather than miscompile.
+        if (!found) return error.Bail;
     }
 
     // --- liveness: last_use, single backward pass; carried/write store_refs live to the marker ---
@@ -552,12 +655,19 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
     defer gpa.free(is_coalesced_home);
     @memset(is_coalesced_home, false);
     {
-        // The last side-exiting instruction. In this IR the only mid-iteration exits are
-        // guard_true/guard_false (guard_int is hoisted to the prologue). Trace order is
+        // The last side-exiting instruction. Mid-iteration exits are guard_true/
+        // guard_false AND the array read guards guard_bounds/guard_present (guard_int/
+        // guard_table/guard_lane are hoisted to the prologue, so they never side-exit
+        // mid-body). An in-place home update that PRECEDES any of these would be
+        // committed by the deopt flush even though the iteration aborted — so home
+        // coalescing must be blocked past the last of them. Trace order is
         // straight-line, so index order == dominance: "after" == strictly greater index.
         var last_body_guard: i64 = -1;
         for (t.instrs, 0..) |ins, idx| {
-            if (ins.op == .guard_true or ins.op == .guard_false) last_body_guard = @intCast(idx);
+            switch (ins.op) {
+                .guard_true, .guard_false, .guard_bounds, .guard_present => last_body_guard = @intCast(idx),
+                else => {},
+            }
         }
         for (slots.items, 0..) |*s, sid| {
             if (s.class != .carried) continue;
@@ -754,6 +864,31 @@ fn regToPlace(a: *x64.Assembler, dst: Place, src: Reg) !void {
     switch (dst) {
         .reg => |r| if (r != src) try a.movRegReg(r, src),
         .mem => |d| try a.movMemReg(.rsp, d, src),
+    }
+}
+
+/// Ensure a ref's value is in a CPU register usable as a memory *base*, returning
+/// that register. A register home is used directly; a spilled home is loaded into
+/// `scratch` (rax). Used for the invariant table pointer at each array op.
+fn refBaseReg(a: *x64.Assembler, alloc: *const Alloc, ref: usize, scratch: Reg) !Reg {
+    switch (placeOfRef(alloc, ref)) {
+        .reg => |r| return r,
+        .mem => |d| {
+            try a.movRegMem(scratch, .rsp, d);
+            return scratch;
+        },
+    }
+}
+
+/// Like `refBaseReg`, but for a slot's home `Place` (used for the prologue table
+/// checks, where the slot is referenced by its home, not an SSA ref).
+fn refHomeBaseReg(a: *x64.Assembler, s: SlotInfo, scratch: Reg) !Reg {
+    switch (slotHomePlace(s)) {
+        .reg => |r| return r,
+        .mem => |d| {
+            try a.movRegMem(scratch, .rsp, d);
+            return scratch;
+        },
     }
 }
 
@@ -990,9 +1125,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
 
     // [RV-1] Hoisted type guards (all first → no home is live if one fails), then the
     // hoisted slot loads. A guard failure here returns 0 without touching regs[].
+    // An int slot checks TAG_INT; a `.ptr` (table) slot checks TAG_HEAP (its
+    // table-type + lane are verified below, after the pointer is loaded).
     for (alloc.slots) |s| {
         if (s.class == .write_only) continue;
-        try a.cmpByteMemImm(.rdi, @as(i32, s.slot) * 16, TAG_INT);
+        const tag: u8 = if (s.kind == .ptr) TAG_HEAP else TAG_INT;
+        try a.cmpByteMemImm(.rdi, @as(i32, s.slot) * 16, tag);
         try a.jcc(.ne, prologue_fail);
     }
     for (alloc.slots) |s| {
@@ -1006,6 +1144,18 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             },
         }
     }
+    // [C2-prologue] For each `.ptr` table slot the pointer is now in its home; verify
+    // the object is a table and its array lane matches the recorded lane — once, here,
+    // since neither changes within a native run (the read path never widens). A miss
+    // returns 0 (regs[] untouched). The bool-lane is the only lane proveKinds admits.
+    for (alloc.slots) |s| {
+        if (s.class == .write_only or s.kind != .ptr) continue;
+        const preg = try refHomeBaseReg(a, s, .rax);
+        try a.cmpByteMemImm(preg, HEADER_TYPE_OFF, TABLE_TYPE);
+        try a.jcc(.ne, prologue_fail);
+        try a.cmpByteMemImm(preg, ArrLayout.array_base + ArrLayout.lane, @intCast(s.lane));
+        try a.jcc(.ne, prologue_fail);
+    }
 
     a.bind(loop_top);
 
@@ -1014,7 +1164,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // slot_load: hoisted to the prologue (loop-invariant). guard_int: either
             // hoisted (slot_load operand → one prologue tag-check) or a proven-int
             // derived guard that's statically redundant — both emit nothing here.
-            .slot_load, .guard_int => {},
+            // guard_table/guard_lane: hoisted to the prologue table checks (the lane
+            // never changes within a native run) — nothing here either.
+            .slot_load, .guard_int, .guard_table, .guard_lane => {},
             .konst => {
                 const bits = t.consts[@intCast(ins.aux)].payload.bits;
                 switch (placeOfRef(alloc, i)) {
@@ -1054,6 +1206,60 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             .eq, .ne, .lt, .le => {
                 try emitCompare(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
             },
+            // --- lane-aware array read path (B2, bool lane) ----------------------
+            // aref: materialize idx0 = index - 1 (the 0-based packed index) into the
+            // aref token's own location. The table pointer is reached lazily by each
+            // consumer through `aref.a` (the invariant table home), so aref itself
+            // touches only the index.
+            .aref => {
+                const dst = placeOfRef(alloc, i);
+                const idxp = placeOfRef(alloc, ins.b);
+                switch (dst) {
+                    .reg => |R| {
+                        try placeToReg(a, R, idxp);
+                        try a.subRegImm32(R, 1);
+                    },
+                    .mem => |D| {
+                        try placeToReg(a, .rax, idxp);
+                        try a.subRegImm32(.rax, 1);
+                        try a.movMemReg(.rsp, D, .rax);
+                    },
+                }
+            },
+            // guard_bounds: idx0 <u len, else side-exit. [I3] the single idx0 from aref
+            // is shared by bounds/present/aload. [I4] precedes guard_present.
+            .guard_bounds => {
+                const aref_ins = t.instrs[ins.a];
+                const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.len);
+                try a.jcc(.ae, deopt_exit); // idx0 >=u len (covers negative/zero key too)
+            },
+            // guard_present: the slot's presence bit must be set; a hole would read as
+            // nil, which the bool kind can't hold. `bt [present], idx0` → CF=bit.
+            .guard_present => {
+                const aref_ins = t.instrs[ins.a];
+                const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.present);
+                const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                try a.btMemReg(.rax, 0, ireg);
+                try a.jcc(.ae, deopt_exit); // CF==0 → hole → side-exit
+            },
+            // aload (bool lane): value bit = `bt [data], idx0`; materialize CF as a
+            // clean 0/1 boolean into the aload's location (setcc + movzx).
+            .aload => {
+                const aref_ins = t.instrs[ins.a];
+                const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
+                const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                try a.btMemReg(.rax, 0, ireg);
+                // Materialize CF as a clean 0/1 in `al` (reg 0 — always REX-safe), then
+                // movzx to a full register and home it. Going through al avoids `setcc`
+                // on a high-encoding dst (sil/dil/bpl), which the encoder can't address.
+                try a.setcc(.b, .rax);
+                try a.movzxRegReg8(.rax, .rax);
+                try regToPlace(a, placeOfRef(alloc, i), .rax);
+            },
             .guard_true => switch (kinds[ins.a]) {
                 .int => {}, // every int is truthy → guard always passes (no-op)
                 .bool => {
@@ -1063,7 +1269,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     }
                     try a.jcc(.e, deopt_exit); // false (0) → side-exit
                 },
-                .none => unreachable,
+                .none, .ptr, .aref => unreachable, // proveKinds restricts to int/bool
             },
             .guard_false => switch (kinds[ins.a]) {
                 .int => try a.jmp(deopt_exit), // an int is never falsy → always side-exit
@@ -1074,7 +1280,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     }
                     try a.jcc(.ne, deopt_exit); // true (≠0) → side-exit
                 },
-                .none => unreachable,
+                .none, .ptr, .aref => unreachable, // proveKinds restricts to int/bool
             },
             .loop => {
                 // [RV-2] write-only slots commit to regs[] BEFORE the shuffle, so the
@@ -1898,4 +2104,111 @@ test "exec memory: a loop with a backward jump runs natively" {
     try testing.expectEqual(@as(i64, 0), f(0));
     try testing.expectEqual(@as(i64, 15), f(5)); // 5+4+3+2+1
     try testing.expectEqual(@as(i64, 55), f(10));
+}
+
+// ---------------------------------------------------------------------------
+// B2c: lane-aware native array READ path — differential tests (bool lane)
+// ---------------------------------------------------------------------------
+
+test "nativegen: bool-lane t[k] read scan matches the interpreter" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const t = try table.Table.create(gpa);
+    defer t.destroy(gpa);
+
+    // nsieve's sieve shape: p[2..K] = true → a narrow boolean lane (key 1 a hole).
+    const K: i64 = 64;
+    var i: i64 = 2;
+    while (i <= K) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+    try testing.expectEqual(arr.Lane.boolean, t.array.lane);
+
+    const lane: i32 = @intFromEnum(arr.Lane.boolean);
+    var consts = [_]Value{Value.int(1)};
+    // r0=table, r1=index, r2=last load. Each iteration loads t[index] (bool lane),
+    // advances the index, and side-exits on a bounds/present miss.
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .guard_present, .a = 5 }, // 7
+        .{ .op = .aload, .a = 5, .aux = lane }, // 8: v = t[index]
+        .{ .op = .konst, .aux = 0 }, // 9: 1
+        .{ .op = .add, .a = 3, .b = 9 }, // 10: index + 1
+        .{ .op = .loop }, // 11
+    };
+    var exits = [_]S{ .{ .slot = 1, .ref = 10 }, .{ .slot = 2, .ref = 8 } };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+
+    // Start at 2 (first present): scans the whole dense run, bounds-exits past K.
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(2), Value.nil() });
+    // Start at 1: key 1 is a hole → guard_present side-exits on iteration 0.
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(1), Value.nil() });
+    // Start past the run: guard_bounds side-exits immediately.
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(K + 5), Value.nil() });
+    // Start mid-run: a shorter clean prefix, then bounds-exit.
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(40), Value.nil() });
+}
+
+test "nativegen: guard_table failure side-exits natively with completed==0" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const t = try table.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 2;
+    while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    const lane: i32 = @intFromEnum(arr.Lane.boolean);
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .guard_lane, .a = 0, .aux = lane },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_int, .a = 3 },
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane },
+        .{ .op = .guard_bounds, .a = 5 },
+        .{ .op = .guard_present, .a = 5 },
+        .{ .op = .aload, .a = 5, .aux = lane },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 3, .b = 9 },
+        .{ .op = .loop },
+    };
+    var consts = [_]Value{Value.int(1)};
+    var exits = [_]S{ .{ .slot = 1, .ref = 10 }, .{ .slot = 2, .ref = 8 } };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+
+    // r0 is an int, not a table → the prologue guard_table check fails (completed==0,
+    // regs untouched). The oracle agrees.
+    try expectMatch(&tr, &.{ Value.int(99), Value.int(2), Value.nil() });
+}
+
+test "nativegen: a non-bool array lane bails to tier-1a" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // An i16-lane scan (aux != bool ordinal) must be rejected by proveKinds so the
+    // trace stays on the IR-interpreter (B2c lowers the bool lane only).
+    const lane: i32 = @intFromEnum(arr.Lane.i16);
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .guard_lane, .a = 0, .aux = lane },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_int, .a = 3 },
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane },
+        .{ .op = .guard_bounds, .a = 5 },
+        .{ .op = .guard_present, .a = 5 },
+        .{ .op = .aload, .a = 5, .aux = lane },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 3, .b = 9 },
+        .{ .op = .loop },
+    };
+    var consts = [_]Value{Value.int(1)};
+    var exits = [_]S{ .{ .slot = 1, .ref = 10 }, .{ .slot = 2, .ref = 8 } };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try expectBail(&tr);
 }

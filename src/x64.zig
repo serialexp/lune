@@ -530,7 +530,10 @@ pub const Assembler = struct {
 
     /// `setcc reg8` — 0F 90|cc /0 (writes only the low byte; caller must `movzx`).
     pub fn setcc(self: *Assembler, cc: Cond, reg: Reg) !void {
-        try self.rex(false, false, false, reg.hi());
+        // Force a REX prefix for low-encoding 4..7 (rsp/rbp/rsi/rdi): in an 8-bit
+        // `reg` field those mean `ah/ch/dh/bh` *without* REX, but `spl/bpl/sil/dil`
+        // *with* it. (r8..r15 already force REX via `bb`; al/cl/dl/bl need none.)
+        try self.rexF(false, false, false, reg.hi(), reg.lo() >= 4);
         try self.b(0x0F);
         try self.b(0x90 | @intFromEnum(cc));
         try self.modrmReg(0, reg.lo());
@@ -808,6 +811,17 @@ test "enc: setcc unsigned (b / ae)" {
     try expectEnc(&.{ 0x0F, 0x93, 0xC0 }, struct { // setae al
         fn f(a: *Assembler) !void {
             try a.setcc(.ae, .rax);
+        }
+    }.f);
+    // sil/dil/bpl/spl require a REX prefix (else the reg field means ah/ch/dh/bh).
+    try expectEnc(&.{ 0x40, 0x0F, 0x92, 0xC6 }, struct { // setb sil (REX-forced)
+        fn f(a: *Assembler) !void {
+            try a.setcc(.b, .rsi);
+        }
+    }.f);
+    try expectEnc(&.{ 0x41, 0x0F, 0x92, 0xC0 }, struct { // setb r8b
+        fn f(a: *Assembler) !void {
+            try a.setcc(.b, .r8);
         }
     }.f);
 }
