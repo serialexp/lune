@@ -252,6 +252,15 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     const table_guarded = gpa.alloc(bool, n) catch return false;
     defer gpa.free(table_guarded);
     @memset(table_guarded, false);
+    // Per-aref: has a `guard_bounds` on this aref been proven before we reach a
+    // `guard_present`/`aload`? [I4 / review] `present` is non-null only when
+    // `len > 0`, which a passing `guard_bounds` (idx0 <u len) implies — so the
+    // bitmap `bt` and the data load are memory-safe ONLY behind a dominating
+    // bounds check. The recorder emits that order; this enforces it on the IR we
+    // were handed (a malformed/deserialized trace must not segfault).
+    const bounds_ok = gpa.alloc(bool, n) catch return false;
+    defer gpa.free(bounds_ok);
+    @memset(bounds_ok, false);
 
     for (t.instrs, 0..) |ins, i| {
         switch (ins.op) {
@@ -344,18 +353,30 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (ins.aux != BOOL_LANE) return false;
                 kinds[i] = .aref;
             },
-            // guard_bounds (idx0 <u len) precedes guard_present (bt the bitmap);
-            // both consume the aref token and produce nothing.
-            .guard_bounds, .guard_present => {
+            // guard_bounds (idx0 <u len): the bounds proof for this aref. Marks the
+            // aref bounds-checked so a later guard_present/aload may touch memory.
+            .guard_bounds => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
+                bounds_ok[ins.a] = true;
+                kinds[i] = .none;
+            },
+            // guard_present (bt the bitmap): only safe behind a dominating bounds
+            // check on the same aref (else `present` may be null / idx0 OOB).
+            .guard_present => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .aref) return false;
+                if (!bounds_ok[ins.a]) return false; // [I4] bounds must dominate
                 kinds[i] = .none;
             },
             // aload decodes the bool-lane slot to a boolean (movzx of the value bit).
+            // Likewise gated on a dominating bounds check (the data load is indexed
+            // by idx0, which must be proven in range).
             .aload => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
                 if (ins.aux != BOOL_LANE) return false;
+                if (!bounds_ok[ins.a]) return false; // [I4] bounds must dominate
                 kinds[i] = .bool;
             },
             .loop => {
@@ -569,6 +590,13 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             // hoisted (once) guard_int forever while the oracle re-checks every
             // iteration and deopts. Reject so the trace stays on tier-1a.
             if (kinds[@intCast(s.store_ref)] != .int) return error.Bail;
+            // [RV-4 / review P0] A carried slot is treated as int end-to-end: the
+            // prologue tag-checks TAG_INT and the deopt flush boxes TAG_INT. If the
+            // *load* proved `.ptr` (a guard_table-covered table) the table/lane
+            // prologue checks would be skipped and the int payload dereferenced as a
+            // `*GcHeader` → type confusion. A `.ptr` slot must be read-only
+            // (`invariant`); a carried one bails to tier-1a.
+            if (kinds[@intCast(s.load_ref)] != .int) return error.Bail;
         } else if (loaded) {
             s.class = .invariant;
             // int OR ptr (a guard_table-covered table slot, read-only loop-invariant).
@@ -2205,6 +2233,61 @@ test "nativegen: a non-bool array lane bails to tier-1a" {
         .{ .op = .konst, .aux = 0 },
         .{ .op = .add, .a = 3, .b = 9 },
         .{ .op = .loop },
+    };
+    var consts = [_]Value{Value.int(1)};
+    var exits = [_]S{ .{ .slot = 1, .ref = 10 }, .{ .slot = 2, .ref = 8 } };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try expectBail(&tr);
+}
+
+test "nativegen: a carried .ptr (table) slot bails (no int/ptr type confusion)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // slot 0 is loaded as a table (guard_table → .ptr) AND written back as an int
+    // → it would be classified `carried` and treated as int end-to-end, skipping the
+    // table/lane prologue checks and dereferencing an int as a *GcHeader. Must bail.
+    const lane: i32 = @intFromEnum(arr.Lane.boolean);
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .guard_present, .a = 5 }, // 7
+        .{ .op = .aload, .a = 5, .aux = lane }, // 8
+        .{ .op = .konst, .aux = 0 }, // 9: 1 (an int)
+        .{ .op = .add, .a = 3, .b = 9 }, // 10: index+1
+        .{ .op = .loop }, // 11
+    };
+    var consts = [_]Value{Value.int(1)};
+    // slot 0 (the table) carried as an int store → the type-confusion trigger.
+    var exits = [_]S{ .{ .slot = 0, .ref = 9 }, .{ .slot = 1, .ref = 10 } };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .exit_stores = &exits };
+    try expectBail(&tr);
+}
+
+test "nativegen: guard_present/aload without a dominating guard_bounds bails" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // A malformed trace where guard_present precedes guard_bounds. `present` may be
+    // null and idx0 may be OOB → the bitmap `bt`/data load would be unsafe. compile
+    // must reject it (never trust the handed-in IR).
+    const lane: i32 = @intFromEnum(arr.Lane.boolean);
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_present, .a = 5 }, // 6: BEFORE bounds — unsafe
+        .{ .op = .guard_bounds, .a = 5 }, // 7
+        .{ .op = .aload, .a = 5, .aux = lane }, // 8
+        .{ .op = .konst, .aux = 0 }, // 9
+        .{ .op = .add, .a = 3, .b = 9 }, // 10
+        .{ .op = .loop }, // 11
     };
     var consts = [_]Value{Value.int(1)};
     var exits = [_]S{ .{ .slot = 1, .ref = 10 }, .{ .slot = 2, .ref = 8 } };
