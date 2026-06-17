@@ -274,12 +274,6 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     @memset(kinds, .none);
     @memset(slot_of, -1);
 
-    // Phase E1a: a LICM-hoisted trace carries a `preheader` marker + a run-once
-    // region. The native backend's run-once "computed home" lands in E1b; until
-    // then, bail the whole trace to tier-1a (which executes the preheader
-    // correctly), so a hoisted trace is still run, just not natively.
-    for (t.instrs) |ins| if (ins.op == .preheader) return false;
-
     // Pass A: record each slot_load's register slot, and which slot_loads a
     // `guard_int` covers. A guard on a *slot_load* is the type check we hoist to a
     // single tag-check in the prologue (lowering reads the tag straight from
@@ -562,6 +556,12 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (i != n - 1) return false; // loop must be terminal
                 kinds[i] = .none;
             },
+            // Phase E1/E2: the preheader region boundary. A pure marker (no value);
+            // everything before it is the run-once region the lowering emits ahead
+            // of `loop_top`. `analyze` gives each run-once value a computed home.
+            .preheader => {
+                kinds[i] = .none;
+            },
             // A loop-carried φ. `b` (the back-edge update) is the one operand allowed
             // to reference a *later* node, so it is only range-checked here (< n) and
             // kind-checked in the post-pass below (it may not be assigned yet on the
@@ -793,6 +793,19 @@ fn analyze(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, slot_of
 fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, slot_of: []const i32) AnalyzeError!Alloc {
     const n = t.instrs.len;
 
+    // Phase E1/E2: the preheader marker (if any) splits the trace into a run-once
+    // region (index < marker) and the per-iteration body. Run-once value refs and
+    // every internal φ get a *computed home* — a register/spill held across the whole
+    // loop, written once in the prologue (an internal φ also updates at the back-edge),
+    // and NEVER flushed at deopt (they back no tier-0 slot; tier-0 recomputes on replay).
+    var marker_idx: ?usize = null;
+    for (t.instrs, 0..) |ins, i| {
+        if (ins.op == .preheader) {
+            marker_idx = i;
+            break;
+        }
+    }
+
     var slots: std.ArrayListUnmanaged(SlotInfo) = .empty;
     errdefer slots.deinit(gpa);
 
@@ -880,11 +893,11 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             if (rd.b and last_use[ins.b] < i) last_use[ins.b] = @intCast(i);
         }
     }
-    // The value feeding any slot-bound φ's back-edge update must survive to the
-    // shuffle/commit at the terminal `loop` (operandReads does not count φ.b, so this
-    // explicit extension is its only liveness — exactly as the old exit_store had).
+    // The value feeding ANY φ's back-edge update (slot-bound OR internal) must survive
+    // to the shuffle/commit at the terminal `loop` (operandReads does not count φ.b, so
+    // this explicit extension is its only liveness — exactly as the old exit_store had).
     for (t.instrs) |ins| {
-        if (ins.op != .phi or ins.aux < 0) continue;
+        if (ins.op != .phi) continue;
         if (last_use[ins.b] < n - 1) last_use[ins.b] = @intCast(n - 1);
     }
 
@@ -934,6 +947,53 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
     for (t.instrs, 0..) |ins, i| {
         if (ins.op != .slot_load) continue;
         loc[i] = slots.items[@intCast(slot_id_of_ref[i])].home;
+    }
+
+    // --- computed homes (Phase E1/E2) ---
+    // Pin a persistent home for every run-once value (preheader transient) and every
+    // internal φ, drawing from the same pools as slot homes (so their registers are
+    // reserved out of the body linear scan). The scan then skips these refs. A φ's home
+    // is updated at the back-edge; a preheader value's is written once in the prologue.
+    const is_computed = try gpa.alloc(bool, n);
+    defer gpa.free(is_computed);
+    @memset(is_computed, false);
+    {
+        const ms = marker_idx orelse 0;
+        for (t.instrs, 0..) |ins, i| {
+            const is_pre_val = marker_idx != null and i < ms and isTransient(ins.op);
+            const is_int_phi = ins.op == .phi and ins.aux == trace.PHI_INTERNAL;
+            if (!is_pre_val and !is_int_phi) continue;
+            if (is_int_phi) {
+                // The init must be a run-once value (a < marker), so the prologue
+                // init-move reads a home already materialized before `loop_top`.
+                if (marker_idx == null or ins.a >= ms) return error.Bail;
+            }
+            switch (kinds[i]) {
+                .float => {
+                    if (pickRegFrom(&free_xmm, &XMM_ALLOC_ORDER)) |r| {
+                        loc[i] = .{ .xmm = r };
+                        home_xmm_mask |= regBit(r);
+                    } else {
+                        loc[i] = .{ .spill = spill_count };
+                        spill_count += 1;
+                    }
+                },
+                .int, .bool => {
+                    if (pickReg(&free)) |r| {
+                        loc[i] = .{ .reg = r };
+                        home_reg_mask |= regBit(r);
+                        used_callee |= regBit(r) & CALLEE_SAVED_MASK;
+                    } else {
+                        loc[i] = .{ .spill = spill_count };
+                        spill_count += 1;
+                    }
+                },
+                // A computed home must carry a boxable scalar; anything else (a `.ptr`/
+                // `.aref` hoisted into the preheader, or a mis-typed φ) cannot be homed.
+                else => return error.Bail,
+            }
+            is_computed[i] = true;
+        }
     }
 
     // --- home coalescing (win 2): allocate a carried slot's store_ref transient INTO
@@ -1033,6 +1093,9 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
 
         // A win-2 transient is already pinned to its slot home — never reallocate it.
         if (is_coalesced_home[i]) continue;
+        // A run-once preheader value already has a computed home (pinned above, its
+        // register reserved out of the pool) — never reallocate or expire it.
+        if (is_computed[i]) continue;
 
         // [Phase D] A float transient draws from the XMM pool. Operand coalescing
         // (win 1) is disabled for floats (the value always lands in a scratch XMM
@@ -1113,11 +1176,29 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                 .spill => {},
             }
         }
+        // Computed homes (preheader values + internal φs) are also register-disjoint
+        // from slot homes and from each other (drawn from the same pools after slots).
+        for (0..n) |i| {
+            if (!is_computed[i]) continue;
+            switch (loc[i]) {
+                .reg => |r| {
+                    const b = regBit(r);
+                    std.debug.assert(seen & b == 0);
+                    seen |= b;
+                },
+                .xmm => |r| {
+                    const b = regBit(r);
+                    std.debug.assert(seen_xmm & b == 0);
+                    seen_xmm |= b;
+                },
+                .spill => {},
+            }
+        }
         // no transient register aliases a home register (per file) — except a win-2
-        // transient, which is deliberately pinned INTO its slot's home.
+        // transient (pinned INTO its slot's home) or a computed home (pinned above).
         for (t.instrs, 0..) |ins, i| {
             if (!isTransient(ins.op)) continue;
-            if (is_coalesced_home[i]) continue;
+            if (is_coalesced_home[i] or is_computed[i]) continue;
             switch (loc[i]) {
                 .reg => |r| std.debug.assert(home_reg_mask & regBit(r) == 0),
                 .xmm => |r| std.debug.assert(home_xmm_mask & regBit(r) == 0),
@@ -1675,7 +1756,18 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         try a.jcc(.ne, prologue_fail);
     }
 
-    a.bind(loop_top);
+    // Phase E1/E2: with a preheader marker the run-once region (instructions before
+    // it) is emitted by the body loop below but lands physically *before* loop_top —
+    // so the bind is deferred to the `.preheader` arm. Without a marker the whole
+    // trace is the body and loop_top binds here (byte-identical to pre-E1).
+    var marker_idx: ?usize = null;
+    for (t.instrs, 0..) |ins, i| {
+        if (ins.op == .preheader) {
+            marker_idx = i;
+            break;
+        }
+    }
+    if (marker_idx == null) a.bind(loop_top);
 
     for (t.instrs, 0..) |ins, i| {
         switch (ins.op) {
@@ -1943,6 +2035,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 for (alloc.slots) |s| {
                     if (s.class == .carried and !s.coalesced) nmoves += 1;
                 }
+                // Internal φs (Phase E2): each updates its computed home from its
+                // back-edge value `b` in this same parallel shuffle — the move set
+                // spans both register files, so a φ↔slot cycle is broken correctly.
+                for (t.instrs) |p| {
+                    if (p.op == .phi and p.aux == trace.PHI_INTERNAL) nmoves += 1;
+                }
                 const moves = try gpa.alloc(Move, nmoves);
                 defer gpa.free(moves);
                 const done = try gpa.alloc(bool, nmoves);
@@ -1957,6 +2055,15 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     };
                     mi += 1;
                 }
+                for (t.instrs, 0..) |p, pi| {
+                    if (p.op != .phi or p.aux != trace.PHI_INTERNAL) continue;
+                    moves[mi] = .{
+                        .dst = placeOfRef(alloc, pi), // the φ's computed home
+                        .src = placeOfRef(alloc, @intCast(p.b)), // its back-edge update
+                        .is_float = kinds[pi] == .float,
+                    };
+                    mi += 1;
+                }
                 try emitParallelMove(a, moves, done);
                 try a.incReg(.rbx);
                 try a.jmp(loop_top);
@@ -1964,8 +2071,21 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // A φ emits no code in the body: a slot-bound φ's writeback is driven by
             // its slot's `.carried`/`.write_only` class above (the back-edge shuffle /
             // deopt flush read `store_ref`, which was set from this φ's `b` in
-            // `analyzeInner`). An internal φ (computed home) is wired in a later phase.
+            // `analyzeInner`). An internal φ's home is seeded at the `.preheader` arm
+            // and updated in the back-edge shuffle — also nothing here.
             .phi => {},
+            // Phase E1/E2: the preheader marker. The run-once region (instructions
+            // before it) was just emitted by the loop above, physically ahead of
+            // loop_top. Seed each internal φ's computed home from its init (a run-once
+            // value, already materialized), then bind loop_top so everything below
+            // repeats each iteration. A preheader-less trace bound loop_top earlier.
+            .preheader => {
+                for (t.instrs, 0..) |p, pi| {
+                    if (p.op != .phi or p.aux != trace.PHI_INTERNAL) continue;
+                    try movePlace(a, placeOfRef(alloc, pi), placeOfRef(alloc, @intCast(p.a)));
+                }
+                a.bind(loop_top);
+            },
             else => unreachable, // proveKinds rejected everything else
         }
     }
@@ -2069,6 +2189,114 @@ test "nativegen: clean integer counting loop matches the interpreter" {
     try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.int(0) });
     // A tighter limit: 0 commits.
     try expectMatch(&t, &.{ Value.int(7), Value.int(3), Value.int(100) });
+}
+
+test "nativegen(E2): an internal φ (slot-less carry) matches the oracle and is never flushed" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // A hand-built trace shaped like an SR product (no source trigger yet): a
+    // slot-less internal φ `m` is initialised in the preheader to 100 and steps
+    // +10 each iteration; the body accumulates it into a real slot.
+    //   m = 100;  while (i < limit) { acc += m; i += 1; m += 10; }
+    // regs: r0=i, r1=limit, r2=acc. `m` backs NO register (aux = PHI_INTERNAL) —
+    // it lives in a computed home, is excluded from the prologue tag-checks, and
+    // is NEVER written to regs[] at deopt. A wrong home/flush corrupts r0/r1/r2,
+    // which the oracle compares bit-for-bit.
+    var instrs = [_]I{
+        .{ .op = .konst, .aux = 0 }, // 0: 100 — m init (run-once region)
+        .{ .op = .preheader }, // 1: marker
+        .{ .op = .slot_load, .aux = 0 }, // 2: i
+        .{ .op = .slot_load, .aux = 1 }, // 3: limit
+        .{ .op = .phi, .a = 0, .b = 15, .aux = trace.PHI_INTERNAL, .ty = .int }, // 4: m (b → node 15, m+10)
+        .{ .op = .guard_int, .a = 2 }, // 5
+        .{ .op = .guard_int, .a = 3 }, // 6
+        .{ .op = .lt, .a = 2, .b = 3 }, // 7: i < limit
+        .{ .op = .guard_true, .a = 7 }, // 8
+        .{ .op = .slot_load, .aux = 2 }, // 9: acc
+        .{ .op = .guard_int, .a = 9 }, // 10
+        .{ .op = .add, .a = 9, .b = 4, .ty = .int }, // 11: acc + m
+        .{ .op = .konst, .aux = 1 }, // 12: 1
+        .{ .op = .add, .a = 2, .b = 12, .ty = .int }, // 13: i + 1
+        .{ .op = .konst, .aux = 2 }, // 14: 10
+        .{ .op = .add, .a = 4, .b = 14, .ty = .int }, // 15: m + 10  (m back-edge)
+        .{ .op = .phi, .b = 11, .aux = 2 }, // 16: acc carry  (b → node 11, acc+m)
+        .{ .op = .phi, .b = 13, .aux = 0 }, // 17: i carry
+        .{ .op = .loop }, // 18
+    };
+    var consts = [_]Value{ Value.int(100), Value.int(1), Value.int(10) };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+
+    // i=0..5, limit=5: m runs 100,110,...,140; acc = 100+110+120+130+140 = 600.
+    try expectMatch(&t, &.{ Value.int(0), Value.int(5), Value.int(0) });
+    // Mid-loop exit after 3 commits (limit=3): m never reaches regs[].
+    try expectMatch(&t, &.{ Value.int(0), Value.int(3), Value.int(0) });
+    // Immediate exit (i >= limit on entry): 0 commits, regs untouched.
+    try expectMatch(&t, &.{ Value.int(7), Value.int(3), Value.int(0) });
+
+    // Hand-check the oracle itself against expected regs — expectMatch only
+    // proves tier-1a ≡ tier-1b, so a shared wrong Δ would pass it. Pin the
+    // actual values so the internal-φ carry arithmetic is independently correct.
+    {
+        var regs = [_]Value{ Value.int(0), Value.int(5), Value.int(0) };
+        const values = try testing.allocator.alloc(Value, instrs.len);
+        defer testing.allocator.free(values);
+        const completed = irinterp.execute(&t, &regs, values);
+        try testing.expectEqual(@as(usize, 5), completed);
+        try testing.expectEqual(@as(i64, 5), regs[0].asInt()); // i
+        try testing.expectEqual(@as(i64, 5), regs[1].asInt()); // limit
+        try testing.expectEqual(@as(i64, 600), regs[2].asInt()); // acc
+    }
+}
+
+test "nativegen(E2): a FLOAT internal φ (the SR `denom` shape) carries in an XMM computed home" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // The actual strength-reduction target shape (pi_leibniz's `denom`): a float
+    // internal φ initialised in the preheader and stepped by a float constant.
+    //   denom = 1.0;  while (i < limit) { acc += denom; i += 1; denom += 2.0; }
+    // r0=i (int), r1=limit (int), r2=acc (FLOAT). `denom` lives in an XMM computed
+    // home — it is seeded once before loop_top and shuffled at the back-edge, never
+    // flushed at deopt. acc is a carried FLOAT slot (XMM home, TAG_FLOAT flush), so
+    // the test also exercises a float computed home alongside a float carried slot.
+    var instrs = [_]I{
+        .{ .op = .konst, .aux = 0 }, // 0: 1.0 — denom init (run-once)
+        .{ .op = .preheader }, // 1
+        .{ .op = .slot_load, .aux = 0 }, // 2: i
+        .{ .op = .slot_load, .aux = 1 }, // 3: limit
+        .{ .op = .phi, .a = 0, .b = 15, .aux = trace.PHI_INTERNAL, .ty = .float }, // 4: denom
+        .{ .op = .guard_int, .a = 2 }, // 5
+        .{ .op = .guard_int, .a = 3 }, // 6
+        .{ .op = .lt, .a = 2, .b = 3 }, // 7: i < limit
+        .{ .op = .guard_true, .a = 7 }, // 8
+        .{ .op = .slot_load, .aux = 2 }, // 9: acc
+        .{ .op = .guard_float, .a = 9 }, // 10
+        .{ .op = .add, .a = 9, .b = 4, .ty = .float }, // 11: acc + denom
+        .{ .op = .konst, .aux = 1 }, // 12: 1
+        .{ .op = .add, .a = 2, .b = 12, .ty = .int }, // 13: i + 1
+        .{ .op = .konst, .aux = 2 }, // 14: 2.0
+        .{ .op = .add, .a = 4, .b = 14, .ty = .float }, // 15: denom + 2.0 (back-edge)
+        .{ .op = .phi, .b = 11, .aux = 2 }, // 16: acc carry
+        .{ .op = .phi, .b = 13, .aux = 0 }, // 17: i carry
+        .{ .op = .loop }, // 18
+    };
+    var consts = [_]Value{ Value.float(1.0), Value.int(1), Value.float(2.0) };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+
+    // i=0..4, limit=4: denom = 1,3,5,7; acc = 1+3+5+7 = 16.0.
+    try expectMatch(&t, &.{ Value.int(0), Value.int(4), Value.float(0.0) });
+    // Mid-loop exit (limit=2): denom carried, acc=1+3=4.0; denom never in regs[].
+    try expectMatch(&t, &.{ Value.int(0), Value.int(2), Value.float(0.0) });
+
+    // Hand-check the oracle's actual float values (expectMatch is Δ-blind).
+    {
+        var regs = [_]Value{ Value.int(0), Value.int(4), Value.float(0.0) };
+        const values = try testing.allocator.alloc(Value, instrs.len);
+        defer testing.allocator.free(values);
+        const completed = irinterp.execute(&t, &regs, values);
+        try testing.expectEqual(@as(usize, 4), completed);
+        try testing.expectEqual(@as(i64, 4), regs[0].asInt());
+        try testing.expectEqual(@as(f64, 16.0), regs[2].asFloat());
+    }
 }
 
 test "nativegen: a guard_int failure side-exits with completed==0" {
