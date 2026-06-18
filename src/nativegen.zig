@@ -664,6 +664,18 @@ const SlotInfo = struct {
     /// home in place and the back-edge shuffle move for this slot self-elides. Only set
     /// for `carried` slots passing the safety predicate (see `analyzeInner`).
     coalesced: bool,
+    /// Phase 2 (invariant array-base hoisting): for a `.ptr` slot used as an
+    /// `aref.a`, the loop-invariant array base pointers / length, materialized ONCE
+    /// in the prologue into a dedicated register and reused across every iteration
+    /// (instead of re-loading `[tbreg+field]` each time). `null` ⇒ not hoisted (no
+    /// free register, or the field is unused) and the body keeps the per-iteration
+    /// load — correctness never depends on seating. Valid for the whole native run
+    /// by the B5 invariant: the read/write path never reallocates or lane-widens the
+    /// array (`guard_fits` side-exits first). Pure invariant scratch — never written
+    /// back to `regs[]` on exit.
+    data_home: ?Reg = null, // [array_base + data]  (element pointer)
+    present_home: ?Reg = null, // [array_base + present] (int-lane presence bitmap ptr)
+    len_home: ?Reg = null, // [array_base + len]   (element count, for guard_bounds)
 };
 
 /// The allocator's output — the sole input `lower` needs (later commits).
@@ -694,6 +706,13 @@ fn regBit(r: Reg) u16 {
 /// (regs base).
 const ALLOC_ORDER = [_]Reg{ .rdx, .rsi, .r8, .r9, .r10, .r11, .rbp, .r12, .r13, .r14, .r15 };
 const CALLEE_SAVED_MASK: u16 = regBit(.rbp) | regBit(.r12) | regBit(.r13) | regBit(.r14) | regBit(.r15);
+
+/// Preference order for Phase-2 invariant array-base homes: `ALLOC_ORDER` reversed,
+/// so base pointers claim the callee-saved tail (r15…r12, rbp) the body's linear
+/// scan only reaches under register pressure. A low-pressure trace (e.g. nsieve)
+/// therefore hoists its array bases without displacing any hot transient into a
+/// spill; a high-pressure one simply leaves a base un-hoisted (per-iter load).
+const BASE_HOME_ORDER = [_]Reg{ .r15, .r14, .r13, .r12, .rbp, .r11, .r10, .r9, .r8, .rsi, .rdx };
 
 /// Allocatable XMM registers (Phase D float homes/transients). xmm0/xmm1 are the
 /// float scratch pair (the SSE analogue of rax/rcx) — never allocated; xmm2..xmm15
@@ -1007,6 +1026,84 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         }
     }
 
+    // --- Phase 2: reserve invariant array-base homes ---------------------------------
+    // For each `.ptr` slot used as an `aref.a`, the array `data`/`present` pointers and
+    // `len` are loop-invariant across a native run (B5: the path never reallocates or
+    // lane-widens — `guard_fits` side-exits first). Materialize each *once* in the
+    // prologue into a dedicated register instead of re-loading `[tbreg+field]` every
+    // iteration. Only the fields the body actually reads are reserved, drawn from the
+    // callee-saved tail (`BASE_HOME_ORDER`) so a low-pressure trace hoists for free
+    // while a high-pressure one falls back to the per-iteration load (a `null` home).
+    // Reserved here — after computed homes, before coalescing + the body linear scan —
+    // so neither reuses these registers; folded into `home_reg_mask`/`used_callee` so
+    // the disjointness assertions and prologue push/pop already cover them.
+    {
+        const ns = slots.items.len;
+        const need_data = try gpa.alloc(bool, ns);
+        defer gpa.free(need_data);
+        const need_present = try gpa.alloc(bool, ns);
+        defer gpa.free(need_present);
+        const need_len = try gpa.alloc(bool, ns);
+        defer gpa.free(need_len);
+        @memset(need_data, false);
+        @memset(need_present, false);
+        @memset(need_len, false);
+
+        // Which array base each consuming op needs, attributed to the `.ptr` slot its
+        // `aref.a` resolves to. (guard_bounds → len; bool guard_present/aload/astore →
+        // data; int guard_present → present; int astore → data + present.)
+        for (t.instrs) |ins| {
+            const aref_ref: usize = switch (ins.op) {
+                .guard_bounds, .guard_present, .aload, .astore => @intCast(ins.a),
+                else => continue,
+            };
+            const aref_ins = t.instrs[aref_ref];
+            const sid_signed = slot_id_of_ref[aref_ins.a];
+            if (sid_signed < 0) continue; // table operand isn't a slot home — leave per-iter
+            const sid: usize = @intCast(sid_signed);
+            const is_bool = aref_ins.aux == BOOL_LANE;
+            switch (ins.op) {
+                .guard_bounds => need_len[sid] = true,
+                .guard_present => if (is_bool) {
+                    need_data[sid] = true;
+                } else {
+                    need_present[sid] = true;
+                },
+                .aload => need_data[sid] = true,
+                .astore => {
+                    need_data[sid] = true;
+                    if (!is_bool) need_present[sid] = true;
+                },
+                else => unreachable,
+            }
+        }
+
+        for (slots.items, 0..) |*s, sid| {
+            if (s.class == .write_only) continue;
+            if (need_data[sid]) {
+                if (pickRegFrom(&free, &BASE_HOME_ORDER)) |r| {
+                    s.data_home = r;
+                    home_reg_mask |= regBit(r);
+                    used_callee |= regBit(r) & CALLEE_SAVED_MASK;
+                }
+            }
+            if (need_present[sid]) {
+                if (pickRegFrom(&free, &BASE_HOME_ORDER)) |r| {
+                    s.present_home = r;
+                    home_reg_mask |= regBit(r);
+                    used_callee |= regBit(r) & CALLEE_SAVED_MASK;
+                }
+            }
+            if (need_len[sid]) {
+                if (pickRegFrom(&free, &BASE_HOME_ORDER)) |r| {
+                    s.len_home = r;
+                    home_reg_mask |= regBit(r);
+                    used_callee |= regBit(r) & CALLEE_SAVED_MASK;
+                }
+            }
+        }
+    }
+
     // --- home coalescing (win 2): allocate a carried slot's store_ref transient INTO
     // the slot's home, so the op updates the home in place AND the back-edge shuffle
     // self-elides. Gated by a safety predicate (cuts-2's single-snapshot model assumes
@@ -1205,6 +1302,19 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                 .spill => {},
             }
         }
+        // [Phase 2] Invariant array-base homes are register-disjoint from slot homes,
+        // computed homes, and each other (drawn from `free` after both, each pick
+        // clearing its bit). They are GP-only and folded into `home_reg_mask`.
+        for (slots.items) |s| {
+            for ([_]?Reg{ s.data_home, s.present_home, s.len_home }) |maybe| {
+                if (maybe) |r| {
+                    const b = regBit(r);
+                    std.debug.assert(seen & b == 0);
+                    seen |= b;
+                    std.debug.assert(home_reg_mask & b != 0); // must be reserved out of the body
+                }
+            }
+        }
         // no transient register aliases a home register (per file) — except a win-2
         // transient (pinned INTO its slot's home) or a computed home (pinned above).
         for (t.instrs, 0..) |ins, i| {
@@ -1323,6 +1433,34 @@ fn refBaseReg(a: *x64.Assembler, alloc: *const Alloc, ref: usize, scratch: Reg) 
         },
         .xmm => unreachable, // array-path operands are int/ptr, never float
     }
+}
+
+/// [Phase 2] The register holding an invariant array base pointer (`data` or
+/// `present`) for the table referenced by `aref_a` (an aref token's table operand).
+/// If `analyze` hoisted that field into a dedicated register home, return it directly
+/// — no memory traffic. Otherwise fall back to the per-iteration load: fetch the table
+/// pointer (its home, or `scratch`) and load `[tbreg + array_base + field]` into
+/// `scratch`, returning `scratch`. Either way the returned register is a valid memory
+/// base for the subsequent SIB element access. (`len` is a compare operand, handled
+/// inline at `guard_bounds`.)
+const ArrayBaseField = enum { data, present };
+fn arrayFieldReg(a: *x64.Assembler, alloc: *const Alloc, aref_a: usize, field: ArrayBaseField, scratch: Reg) !Reg {
+    const sid = alloc.slot_id_of_ref[aref_a];
+    if (sid >= 0) {
+        const s = alloc.slots[@intCast(sid)];
+        const home: ?Reg = switch (field) {
+            .data => s.data_home,
+            .present => s.present_home,
+        };
+        if (home) |r| return r; // hoisted — already in a register, no load
+    }
+    const tb = try refBaseReg(a, alloc, aref_a, scratch);
+    const fieldoff: i32 = switch (field) {
+        .data => ArrLayout.data,
+        .present => ArrLayout.present,
+    };
+    try a.movRegMem(scratch, tb, ArrLayout.array_base + fieldoff);
+    return scratch;
 }
 
 /// Like `refBaseReg`, but for a slot's home `Place` (used for the prologue table
@@ -1767,6 +1905,22 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         try a.jcc(.ne, prologue_fail);
     }
 
+    // [Phase 2] Materialize the invariant array bases ONCE, now that each `.ptr` slot
+    // is proven a table of the recorded lane. `data`/`present` pointers and `len` are
+    // fixed for the whole native run (B5), so they live in dedicated registers and the
+    // body reads them instead of re-loading `[tbreg+field]` per iteration. The table
+    // pointer is fetched into a base register (its home, or rax for a spilled home);
+    // each home is a callee-saved register (never rax), so it survives across the few
+    // loads here. A slot with no reserved home keeps the per-iteration load.
+    for (alloc.slots) |s| {
+        if (s.class == .write_only or s.kind != .ptr) continue;
+        if (s.data_home == null and s.present_home == null and s.len_home == null) continue;
+        const tb = try refHomeBaseReg(a, s, .rax);
+        if (s.data_home) |r| try a.movRegMem(r, tb, ArrLayout.array_base + ArrLayout.data);
+        if (s.present_home) |r| try a.movRegMem(r, tb, ArrLayout.array_base + ArrLayout.present);
+        if (s.len_home) |r| try a.movRegMem(r, tb, ArrLayout.array_base + ArrLayout.len);
+    }
+
     // Phase E1/E2: with a preheader marker the run-once region (instructions before
     // it) is emitted by the body loop below but lands physically *before* loop_top —
     // so the bind is deferred to the `.preheader` arm. Without a marker the whole
@@ -1889,9 +2043,17 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // is shared by bounds/present/aload. [I4] precedes guard_present.
             .guard_bounds => {
                 const aref_ins = t.instrs[ins.a];
-                const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
                 const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.len);
+                // [Phase 2] compare against the hoisted `len` register if we have one
+                // (reg-reg), else the per-iteration `[tbreg+len]` load.
+                const sid = alloc.slot_id_of_ref[aref_ins.a];
+                const lenhome: ?Reg = if (sid >= 0) alloc.slots[@intCast(sid)].len_home else null;
+                if (lenhome) |lr| {
+                    try a.cmpRegReg(ireg, lr);
+                } else {
+                    const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                    try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.len);
+                }
                 try a.jcc(.ae, deopt_exit); // idx0 >=u len (covers negative/zero key too)
             },
             // guard_present: the slot must hold a value; a hole would read as nil,
@@ -1902,17 +2064,17 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             .guard_present => {
                 const aref_ins = t.instrs[ins.a];
                 if (aref_ins.aux == BOOL_LANE) {
-                    const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
-                    try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
+                    // [Phase 2] data base from its hoisted home (or a per-iter load).
+                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
                     const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.loadRegMemSib(.rax, .rax, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
+                    try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
                     try a.cmpRegImm32(.rax, 0);
                     try a.jcc(.e, deopt_exit); // byte==0 → hole → side-exit
                 } else {
-                    const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
-                    try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.present);
+                    // [Phase 2] present-bitmap base from its hoisted home (or per-iter load).
+                    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
                     const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.btMemReg(.rax, 0, ireg);
+                    try a.btMemReg(preg, 0, ireg);
                     try a.jcc(.ae, deopt_exit); // CF==0 → hole → side-exit
                 }
             },
@@ -1922,22 +2084,22 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // scratch registers, no third needed (the int load's dst reuses rax).
             .aload => {
                 const aref_ins = t.instrs[ins.a];
-                const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
-                try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
+                // [Phase 2] data base from its hoisted home (or a per-iter `[tbreg+data]`
+                // load into rax). The element load's dst is rax either way.
+                const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
                 const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
                 if (ins.aux == BOOL_LANE) {
                     // bool lane: load the in-band byte (1=false, 2=true) and decode
                     // to a clean 0/1 boolean with `byte - 1`. The dominating
                     // guard_present already proved the byte is non-zero (a hole
                     // would be 0), so the result is exactly 0 or 1.
-                    try a.loadRegMemSib(.rax, .rax, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
+                    try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
                     try a.subRegImm32(.rax, 1); // 1→0 (false), 2→1 (true)
                 } else {
                     // int lane (i8…i64): sign-extend the width-byte element at
-                    // `[data + idx0*w]` into a full 64-bit int. dst = rax = the same
-                    // register that held the data pointer (consumed by the load).
+                    // `[data + idx0*w]` into a full 64-bit int.
                     const w = intLaneWidth(ins.aux);
-                    try a.loadRegMemSib(.rax, .rax, ireg, w, true, 0);
+                    try a.loadRegMemSib(.rax, datareg, ireg, w, true, 0);
                 }
                 try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
@@ -1986,10 +2148,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     // cacheline (I5 holds trivially: the byte store IS the commit).
                     // Fold idx0 into the address with `lea` (freeing the index reg),
                     // exactly like the int path, so data-ptr + value fit in rax/rcx.
-                    const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
-                    try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
+                    // [Phase 2] data base from its hoisted home (or a per-iter load).
+                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
                     const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.leaRegMemSib(.rax, .rax, ireg, 1, 0); // rax = &data[idx0]
+                    try a.leaRegMemSib(.rax, datareg, ireg, 1, 0); // rax = &data[idx0]
                     try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // value 0/1 → rcx
                     try a.incReg(.rcx); // 0→1 (false), 1→2 (true)
                     try a.storeMemReg(.rax, 1, 0, .rcx); // mov byte [rax], cl
@@ -2002,22 +2164,22 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     // idx0 into the address with `lea` (freeing the index reg) before
                     // loading the value into rcx.
                     const w = intLaneWidth(ins.aux);
-                    const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
-                    try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.data);
+                    // [Phase 2] data base from its hoisted home (or a per-iter load).
+                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
                     const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.leaRegMemSib(.rax, .rax, ireg, w, 0); // rax = &data[idx0]
+                    try a.leaRegMemSib(.rax, datareg, ireg, w, 0); // rax = &data[idx0]
                     try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
                     try a.storeMemReg(.rax, w, 0, .rcx); // [rax] = (lane-width) value
 
-                    // presence bit LAST: present ptr → rax, bts [present], idx0. [I5]
-                    // the commit point for an absent→present transition. Storing a
-                    // non-nil value always marks the slot present (recArraySet refuses
-                    // nil / out-of-lane stores, so this never *clears* presence). The
-                    // bool lane skips this — its byte store already carries presence.
-                    const pbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
-                    try a.movRegMem(.rax, pbreg, ArrLayout.array_base + ArrLayout.present);
+                    // presence bit LAST: bts [present], idx0. [I5] the commit point for
+                    // an absent→present transition. Storing a non-nil value always marks
+                    // the slot present (recArraySet refuses nil / out-of-lane stores, so
+                    // this never *clears* presence). The bool lane skips this — its byte
+                    // store already carries presence. [Phase 2] present base from its
+                    // hoisted home (or a per-iter load).
+                    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
                     const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.btsMemReg(.rax, 0, pireg);
+                    try a.btsMemReg(preg, 0, pireg);
                 }
             },
             .guard_true => switch (kinds[ins.a]) {
