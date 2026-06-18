@@ -1110,111 +1110,123 @@ pub const Vm = struct {
             // header (anchor). Count it, and arm/close a recording. Gated on
             // `enabled`, so it is inert until `--trace`.
             if (self.trace.config.enabled and pc <= cur_pc) {
-                self.trace.onBackEdge(proto, @intCast(pc), regs);
+                const anchor_pc: u32 = @intCast(pc);
+                // Cheap direct-mapped hot-count pre-filter. A gated/dead loop (the
+                // canonical case: nsieve's array-growing init loop, which can't be
+                // traced) skips the per-back-edge hashmap bookkeeping in
+                // `onBackEdge` + the trace-entry lookup entirely — it just
+                // decrements a `u16` slot and falls back to tier-0. The global
+                // `tick` still advances (inside `skipBackEdge`), so a transiently
+                // gated loop's backoff cooldown keeps elapsing across the skip.
+                // Hot traced loops and warming loops keep a 0 slot and always take
+                // the slow path below, so their behaviour is unchanged.
+                if (!self.trace.skipBackEdge(proto, anchor_pc)) {
+                    self.trace.onBackEdge(proto, anchor_pc, regs);
 
-                // Phase 6 tier-1a entry: if a trace is cached for this loop header
-                // and we're not mid-recording, execute it. `irinterp.execute`
-                // returns with `regs` coherent for the header — it side-exits
-                // *before* committing a partial iteration — so we `continue`
-                // **without** advancing `pc`: tier-0 then re-runs the loop header
-                // to redo the (pure, side-effect-free) deopt iteration. A trace is
-                // only ever entered at exactly its anchor pc, so re-entry is sound.
-                if (self.trace.config.execute and !self.trace.isRecording() and
-                    !self.trace.isGated(.{ .proto = proto, .pc = @intCast(pc) }))
-                {
-                    // A gated anchor has proven it thrashes: every entry
-                    // committed fewer than `min_useful` iterations until the
-                    // re-entry penalty maxed out. The canonical case is a
-                    // strictly-alternating branch (stable types, so fingerprinting
-                    // can't tell the arms apart) where no single straight-line
-                    // trace can amortize entry/exit over more than one iteration —
-                    // running the trace was *slower* than tier-0. Gating entry
-                    // (not just re-arming, as before) lets tier-0
-                    // own the loop and removes the slowdown. The gate retries the
-                    // anchor on an exponential backoff and clears the moment an
-                    // entry finally proves useful, so a loop that only thrashes
-                    // transiently still recovers. Works on the native
-                    // path too: the penalty keys only on `completed`, which native
-                    // execution reports.
-                    //
-                    // Same-anchor chaining: if multiple traces exist for this
-                    // loop header (e.g. different type specializations), try
-                    // each in turn until one commits at least one iteration.
-                    // All traces share the same loop-header re-entry deopt
-                    // discipline, so `regs` is valid for every attempt.
-                    var t: ?*trace.Trace = self.trace.findTrace(proto, @intCast(pc));
-                    var any_fingerprint_matched = false;
-                    while (t) |ct| : (t = self.trace.findNextTrace(proto, @intCast(pc), ct)) {
-                        // --- type fingerprint (step 5) ---
-                        // Skip this trace if the current register types don't
-                        // match its entry type guards.  Avoids trial entries
-                        // that would immediately fail on a guard_int/guard_float
-                        // mismatch.  Branch-direction guards (guard_true/false)
-                        // aren't fingerprinted — they depend on computed values.
-                        if (!ct.matchesFingerprint(regs)) continue;
-                        any_fingerprint_matched = true;
-                        if (self.trace.valuesScratch(ct.instrs.len)) |buf| {
-                            self.trace.entries +%= 1;
-                            const result = if (self.trace.config.record_exec_log)
-                                blk: {
+                    // Phase 6 tier-1a entry: if a trace is cached for this loop header
+                    // and we're not mid-recording, execute it. `irinterp.execute`
+                    // returns with `regs` coherent for the header — it side-exits
+                    // *before* committing a partial iteration — so we `continue`
+                    // **without** advancing `pc`: tier-0 then re-runs the loop header
+                    // to redo the (pure, side-effect-free) deopt iteration. A trace is
+                    // only ever entered at exactly its anchor pc, so re-entry is sound.
+                    if (self.trace.config.execute and !self.trace.isRecording() and
+                        !self.trace.isGated(.{ .proto = proto, .pc = anchor_pc }))
+                    {
+                        // A gated anchor has proven it thrashes: every entry
+                        // committed fewer than `min_useful` iterations until the
+                        // re-entry penalty maxed out. The canonical case is a
+                        // strictly-alternating branch (stable types, so fingerprinting
+                        // can't tell the arms apart) where no single straight-line
+                        // trace can amortize entry/exit over more than one iteration —
+                        // running the trace was *slower* than tier-0. Gating entry
+                        // (not just re-arming, as before) lets tier-0
+                        // own the loop and removes the slowdown. The gate retries the
+                        // anchor on an exponential backoff and clears the moment an
+                        // entry finally proves useful, so a loop that only thrashes
+                        // transiently still recovers. Works on the native
+                        // path too: the penalty keys only on `completed`, which native
+                        // execution reports.
+                        //
+                        // Same-anchor chaining: if multiple traces exist for this
+                        // loop header (e.g. different type specializations), try
+                        // each in turn until one commits at least one iteration.
+                        // All traces share the same loop-header re-entry deopt
+                        // discipline, so `regs` is valid for every attempt.
+                        var t: ?*trace.Trace = self.trace.findTrace(proto, @intCast(pc));
+                        var any_fingerprint_matched = false;
+                        while (t) |ct| : (t = self.trace.findNextTrace(proto, @intCast(pc), ct)) {
+                            // --- type fingerprint (step 5) ---
+                            // Skip this trace if the current register types don't
+                            // match its entry type guards.  Avoids trial entries
+                            // that would immediately fail on a guard_int/guard_float
+                            // mismatch.  Branch-direction guards (guard_true/false)
+                            // aren't fingerprinted — they depend on computed values.
+                            if (!ct.matchesFingerprint(regs)) continue;
+                            any_fingerprint_matched = true;
+                            if (self.trace.valuesScratch(ct.instrs.len)) |buf| {
+                                self.trace.entries +%= 1;
+                                const result = if (self.trace.config.record_exec_log) blk: {
                                     const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, regs, buf);
                                     const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, regs, buf);
                                     break :blk irinterp.executeTraced(rec, ct, regs, buf);
-                                }
-                            else if (self.trace.config.native_codegen)
-                                blk: {
+                                } else if (self.trace.config.native_codegen) blk: {
                                     if (self.trace.nativeFor(ct)) |nt| break :blk irinterp.ExecResult{ .completed = nt.run(regs), .exit_instr = std.math.maxInt(u32) };
                                     break :blk irinterp.execute(ct, regs, buf);
-                                }
-                            else
-                                irinterp.execute(ct, regs, buf);
-                            // Always record the exit instruction — useful for
-                            // per-guard PC debugging even on productive exits.
-                            self.trace.last_exit_instr = result.exit_instr;
+                                } else irinterp.execute(ct, regs, buf);
+                                // Always record the exit instruction — useful for
+                                // per-guard PC debugging even on productive exits.
+                                self.trace.last_exit_instr = result.exit_instr;
 
-                            // --- guard-failure counting (step 4) ---
-                            // Count guard failures on zero-iteration exits
-                            // (type mismatches that passed the fingerprint
-                            // but failed a non-type guard, e.g. branch direction).
-                            // Resolve the PC through `guardExitPc`: array guards
-                            // store a lane ordinal in `aux`, not a PC, and must
-                            // not be counted as guard-PC failures.
-                            if (result.completed == 0) {
-                                if (result.exit_instr != std.math.maxInt(u32)) {
-                                    if (trace.guardExitPc(ct.instrs[result.exit_instr])) |exit_pc| {
-                                        if (exit_pc > 0) {
-                                            self.trace.countGuardFailure(ct.anchor, exit_pc);
+                                // --- guard-failure counting (step 4) ---
+                                // Count guard failures on zero-iteration exits
+                                // (type mismatches that passed the fingerprint
+                                // but failed a non-type guard, e.g. branch direction).
+                                // Resolve the PC through `guardExitPc`: array guards
+                                // store a lane ordinal in `aux`, not a PC, and must
+                                // not be counted as guard-PC failures.
+                                if (result.completed == 0) {
+                                    if (result.exit_instr != std.math.maxInt(u32)) {
+                                        if (trace.guardExitPc(ct.instrs[result.exit_instr])) |exit_pc| {
+                                            if (exit_pc > 0) {
+                                                self.trace.countGuardFailure(ct.anchor, exit_pc);
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            if (result.completed > 0) {
-                                // This trace did useful work — keep its result.
-                                self.trace.onSideExit(ct, result.completed);
-                                continue :outer;
-                            }
-                            // Zero iterations: apply the penalty, then try
-                            // the next trace at this anchor.
-                            self.trace.onSideExit(ct, 0);
+                                if (result.completed > 0) {
+                                    // This trace did useful work — keep its result.
+                                    self.trace.onSideExit(ct, result.completed);
+                                    continue :outer;
+                                }
+                                // Zero iterations: apply the penalty, then try
+                                // the next trace at this anchor.
+                                self.trace.onSideExit(ct, 0);
 
-                            // --- exit-PC chaining (step 3) ---
-                            // If the failing guard was recorded at a different
-                            // PC, look for a side trace there.  This fires
-                            // only after step 4 (side traces) populates the
-                            // cache at non-anchor PCs.
-                            if (self.trace.tryChainExit(ct, result.exit_instr, proto, regs)) |_| {
-                                continue :outer;
-                            }
-                        } else |_| {} // OOM: skip this trace, try next
+                                // --- exit-PC chaining (step 3) ---
+                                // If the failing guard was recorded at a different
+                                // PC, look for a side trace there.  This fires
+                                // only after step 4 (side traces) populates the
+                                // cache at non-anchor PCs.
+                                if (self.trace.tryChainExit(ct, result.exit_instr, proto, regs)) |_| {
+                                    continue :outer;
+                                }
+                            } else |_| {} // OOM: skip this trace, try next
+                        }
+                        // All traces at this anchor failed, OOM'd, or didn't match
+                        // the fingerprint.  If at least one trace exists but none
+                        // matched, count it for side-trace recording.
+                        if (!any_fingerprint_matched and self.trace.hasTrace(.{ .proto = proto, .pc = anchor_pc })) {
+                            self.trace.countFingerprintMiss(.{ .proto = proto, .pc = anchor_pc });
+                        }
+                        // Fall through to tier-0.
                     }
-                    // All traces at this anchor failed, OOM'd, or didn't match
-                    // the fingerprint.  If at least one trace exists but none
-                    // matched, count it for side-trace recording.
-                    if (!any_fingerprint_matched and self.trace.hasTrace(.{ .proto = proto, .pc = @intCast(pc) })) {
-                        self.trace.countFingerprintMiss(.{ .proto = proto, .pc = @intCast(pc) });
-                    }
-                    // Fall through to tier-0.
+                    // Reached only when no trace ran this back-edge — a successful
+                    // trace entry above does `continue :outer` and never gets here.
+                    // If the anchor is gated, install a hot-count skip window so its
+                    // next back-edges bypass all of the above.
+                    self.trace.afterBackEdge(proto, anchor_pc);
                 }
             }
         }
@@ -1309,7 +1321,6 @@ pub const Vm = struct {
         self.reg_top = base + a + 1;
         self.reg_top_pending = true;
     }
-
 };
 
 /// Place a single native result into the caller's window: the value into the
@@ -2113,9 +2124,15 @@ test "#t counts the sequence border" {
     // t = {10, 20, 30}; return #t
     const code = [_]Instr{
         Instr.opA(.new_table, 0),
-        Instr.opAx(.load_int, 1, 1), Instr.opAx(.load_int, 2, 10), Instr.opABC(.set_index, 0, 1, 2),
-        Instr.opAx(.load_int, 1, 2), Instr.opAx(.load_int, 2, 20), Instr.opABC(.set_index, 0, 1, 2),
-        Instr.opAx(.load_int, 1, 3), Instr.opAx(.load_int, 2, 30), Instr.opABC(.set_index, 0, 1, 2),
+        Instr.opAx(.load_int, 1, 1),
+        Instr.opAx(.load_int, 2, 10),
+        Instr.opABC(.set_index, 0, 1, 2),
+        Instr.opAx(.load_int, 1, 2),
+        Instr.opAx(.load_int, 2, 20),
+        Instr.opABC(.set_index, 0, 1, 2),
+        Instr.opAx(.load_int, 1, 3),
+        Instr.opAx(.load_int, 2, 30),
+        Instr.opABC(.set_index, 0, 1, 2),
         Instr.opAB(.len, 1, 0),
         Instr.opAB(.ret, 1, 1),
     };

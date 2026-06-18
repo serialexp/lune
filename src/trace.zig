@@ -242,11 +242,13 @@ pub const AnchorKey = struct { proto: *const Proto, pc: u32 };
 /// failure) is held off until its back-edge counter reaches `retry_at`. On the
 /// retry it is given one more chance; a re-failure calls `gateAnchor` again,
 /// which doubles `window` (capped at `config.backoff_max`) and bumps `strikes`.
-/// At `config.max_strikes` the anchor is abandoned permanently. All fields are
-/// counted in deterministic back-edges, so the schedule is reproducible.
+/// At `config.max_strikes` the anchor is abandoned permanently. The schedule is
+/// counted in the deterministic global back-edge `tick` (which advances on *every*
+/// back-edge, including ones the hot-count pre-filter skips), so the cooldown keeps
+/// elapsing while a gated anchor is being cheaply skipped, and is reproducible.
 pub const Gate = struct {
-    /// Back-edge count at/after which the anchor becomes eligible again.
-    retry_at: u32,
+    /// Global `tick` value at/after which the anchor becomes eligible again.
+    retry_at: u64,
     /// Length of the *next* cooldown window (back-edges); doubles per escalation.
     window: u32,
     /// How many times this anchor has been gated; `>= max_strikes` ⇒ permanent.
@@ -422,13 +424,58 @@ pub const TraceConfig = struct {
     native_codegen: bool = false,
 };
 
+/// Direct-mapped hot-count table size (a power of two). A back-edge hashes its
+/// `(proto, pc)` into this many `u16` slots; the table is a cheap pre-filter that
+/// lets a *gated* anchor skip the per-back-edge hashmap bookkeeping in
+/// `onBackEdge` entirely (it just decrements a slot and bails). Sized generously
+/// — any real program has a handful of hot loops, so collisions (two anchors
+/// sharing a slot) are rare and, when they happen, only cost extra slow-path
+/// visits, never correctness. 2^11 = 2048 slots = 4 KiB inline in `TraceState`.
+const HOTCOUNT_BITS = 11;
+const HOTCOUNT_SIZE = 1 << HOTCOUNT_BITS;
+/// Skip window installed on a *gated* anchor: the number of back-edges its
+/// hot-count slot suppresses before the slow path re-checks the gate. Kept modest
+/// so a transiently-gated loop whose cooldown elapses still re-enters its trace
+/// within a small, bounded number of iterations (recovery responsiveness) while
+/// still cutting the per-back-edge cost of a permanently-dead loop by ~this factor.
+const GATE_SKIP: u16 = 64;
+
+/// Hash `(proto, pc)` into a hot-count slot. Pointer-based, like the existing
+/// `AutoHashMap(AnchorKey, …)` keys — trace timing already varies across runs by
+/// address, which is sound because the trace cache is runtime-only state (never
+/// serialized) and traces are output-transparent (== tier-0). A collision only
+/// changes *which* back-edges take the slow path, never the result.
+inline fn hotIndex(proto: *const Proto, pc: u32) usize {
+    var h: usize = @intFromPtr(proto);
+    h ^= @as(usize, pc) *% 0x9E3779B97F4A7C15;
+    h ^= h >> 29;
+    return h & (HOTCOUNT_SIZE - 1);
+}
+
 /// All recorder state owned by a `Vm`: the hotness counters, the cache of
 /// committed traces, and the single in-progress `Recorder`.
 pub const TraceState = struct {
     gpa: std.mem.Allocator,
     config: TraceConfig = .{},
-    /// Back-edge counters keyed by loop-header anchor.
+    /// Back-edge counters keyed by loop-header anchor. Only touched on the *slow*
+    /// path (when the hot-count pre-filter trips), so for a non-gated anchor it
+    /// still counts every back-edge (the pre-filter leaves un-gated slots at 0),
+    /// preserving the arm-at-`hotloop` timing exactly. A gated anchor's count is
+    /// coarse (the pre-filter skips most of its back-edges), which is fine — the
+    /// gate's own cooldown is driven by `tick`, not this.
     counters: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
+    /// Monotonic global back-edge tick. Incremented on *every* back-edge in the
+    /// dispatch loop — including ones the hot-count pre-filter skips — so it is the
+    /// one clock that never freezes. The gate's `retry_at` cooldown is measured in
+    /// these ticks, which is why a transiently-gated loop's cooldown keeps elapsing
+    /// while the pre-filter is cheaply skipping its back-edges. Deterministic.
+    tick: u64 = 0,
+    /// Direct-mapped hot-count pre-filter (see `hotIndex`/`HOTCOUNT_SIZE`). A slot
+    /// holds the number of back-edges to skip cheaply before re-consulting the slow
+    /// path for the anchor(s) that hash there. Zero ⇒ take the slow path now. Set
+    /// to `GATE_SKIP` when an anchor is found gated, so a dead loop's millions of
+    /// back-edges cost an array decrement instead of three hashmap probes apiece.
+    hotcount: [HOTCOUNT_SIZE]u16 = @splat(0),
     /// Committed traces. A linear scan is fine — the cache is small in Phase 5a
     /// and never invalidated.
     cache: std.ArrayListUnmanaged(*Trace) = .empty,
@@ -737,15 +784,16 @@ pub const TraceState = struct {
     pub fn isGated(self: *const TraceState, anchor: AnchorKey) bool {
         const g = self.gate.get(anchor) orelse return false;
         if (g.strikes >= self.config.max_strikes) return true;
-        return self.backEdgeCount(anchor) < g.retry_at;
+        return self.tick < g.retry_at;
     }
 
     /// Install or escalate the gate on `anchor`: start (or double) the cooldown
     /// window and bump the strike count. The next eligibility is `retry_at` =
-    /// current back-edge count + window; the window then doubles (capped at
+    /// current global `tick` + window; the window then doubles (capped at
     /// `backoff_max`) so a repeatedly-failing anchor is retried exponentially
     /// less often, and after `max_strikes` it is abandoned for good. Deterministic
-    /// — keyed only on the back-edge counter.
+    /// — keyed only on the monotonic back-edge tick, which keeps advancing even
+    /// while the hot-count pre-filter is skipping this anchor's back-edges.
     fn gateAnchor(self: *TraceState, anchor: AnchorKey) void {
         const gop = self.gate.getOrPut(self.gpa, anchor) catch return;
         if (!gop.found_existing) {
@@ -753,7 +801,7 @@ pub const TraceState = struct {
         }
         const g = gop.value_ptr;
         g.strikes +|= 1;
-        g.retry_at = self.backEdgeCount(anchor) +| g.window;
+        g.retry_at = self.tick +| g.window;
         g.window = @min(g.window *| 2, self.config.backoff_max);
     }
 
@@ -761,6 +809,41 @@ pub const TraceState = struct {
     /// once this reaches `config.hotloop`.
     pub fn backEdgeCount(self: *const TraceState, anchor: AnchorKey) u32 {
         return self.counters.get(anchor) orelse 0;
+    }
+
+    // --- hot-count pre-filter ----------------------------------------------
+
+    /// Cheap front gate for the dispatch back-edge handler. Always advances the
+    /// global `tick` (so gate cooldowns keep elapsing), then asks: can this
+    /// back-edge skip the expensive slow path (`onBackEdge` + trace-entry lookup)?
+    ///
+    /// Returns `true` (skip — fall straight back to tier-0) when the anchor's
+    /// hot-count slot is still counting down. Returns `false` (take the slow path)
+    /// when the slot has reached 0, or while a recording is in flight (recording
+    /// must see every back-edge so it can close on its own anchor). Only gated /
+    /// dead loops ever get a non-zero slot, so hot traced loops and warming loops
+    /// always take the slow path and behave exactly as before the pre-filter.
+    pub inline fn skipBackEdge(self: *TraceState, proto: *const Proto, pc: u32) bool {
+        self.tick +%= 1;
+        if (self.rec.active) return false;
+        const slot = &self.hotcount[hotIndex(proto, pc)];
+        if (slot.* > 0) {
+            slot.* -= 1;
+            return true;
+        }
+        return false;
+    }
+
+    /// Called after a back-edge took the slow path *without* entering a trace (the
+    /// dispatch loop skips this when a trace entry succeeded). If the anchor is
+    /// gated, arm its hot-count slot with a `GATE_SKIP` window so the next batch of
+    /// back-edges skips the hashmap bookkeeping entirely. `tick` keeps advancing
+    /// across the skip, so the gate's cooldown still elapses on schedule and the
+    /// anchor is reconsidered when the window expires.
+    pub fn afterBackEdge(self: *TraceState, proto: *const Proto, pc: u32) void {
+        if (self.isGated(.{ .proto = proto, .pc = pc })) {
+            self.hotcount[hotIndex(proto, pc)] = GATE_SKIP;
+        }
     }
 
     // --- state machine -----------------------------------------------------
@@ -791,8 +874,13 @@ pub const TraceState = struct {
         // on every later iteration. A gated anchor whose cooldown is still running
         // (or that has exhausted `max_strikes`) is skipped by `isGated`.
         if (!self.hasTrace(key) and !self.isGated(key)) {
-            const arm_now = if (self.gate.get(key)) |g|
-                count == g.retry_at // cooldown just elapsed → one retry
+            // A gate entry that is no longer `isGated` means its `tick` cooldown has
+            // just elapsed → take the one retry now. Arming starts a recording, so
+            // the next back-edges are consumed by recording rather than re-arming;
+            // we never loop re-arming. A fresh (un-gated) anchor arms on the exact
+            // back-edge it first crosses `hotloop`.
+            const arm_now = if (self.gate.contains(key))
+                true // cooldown elapsed → one retry
             else
                 count == self.config.hotloop; // first time crossing hot
             if (arm_now) self.arm(proto, target_pc);
@@ -1609,8 +1697,10 @@ pub fn writeTrace(w: *io.Writer, t: *const Trace) io.Writer.Error!void {
 pub fn withPhis(
     body: anytype,
     carry: anytype,
-) [@typeInfo(@typeInfo(@TypeOf(body)).pointer.child).array.len +
-    @typeInfo(@typeInfo(@TypeOf(carry)).pointer.child).array.len]IrInstr {
+) [
+    @typeInfo(@typeInfo(@TypeOf(body)).pointer.child).array.len +
+        @typeInfo(@typeInfo(@TypeOf(carry)).pointer.child).array.len
+]IrInstr {
     const nbody = @typeInfo(@typeInfo(@TypeOf(body)).pointer.child).array.len;
     const ncarry = @typeInfo(@typeInfo(@TypeOf(carry)).pointer.child).array.len;
     const last = nbody - 1;
@@ -1659,7 +1749,8 @@ test "writeTrace renders a hand-built counting-loop trace" {
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &instrs,
         .consts = &.{},
-        .entry_slots = &entry, .entry_guards = &.{},
+        .entry_slots = &entry,
+        .entry_guards = &.{},
     };
 
     var buf: [512]u8 = undefined;
@@ -2008,7 +2099,8 @@ test "tryChainExit: chains to a trace at the guard's exit PC" {
         .anchor = .{ .proto = undefined, .pc = 10 },
         .instrs = @constCast(&instrs_a),
         .consts = @constCast(&consts_a),
-        .entry_slots = &entry_a, .entry_guards = &.{},
+        .entry_slots = &entry_a,
+        .entry_guards = &.{},
     };
 
     // Trace B at PC 20: a simple counting loop (r0 from 0 to 3).
@@ -2025,13 +2117,14 @@ test "tryChainExit: chains to a trace at the guard's exit PC" {
         .{ .op = .phi, .a = 0, .b = 5, .aux = 0, .ty = .int }, // %8: r0 ← r0+1
         .{ .op = .loop }, // %9
     };
-    const consts_b = [_]Value{ Value.int(1) };
+    const consts_b = [_]Value{Value.int(1)};
     var trace_b = try gpa.create(Trace);
     trace_b.* = .{
         .anchor = .{ .proto = undefined, .pc = 20 },
         .instrs = @constCast(&instrs_b),
         .consts = @constCast(&consts_b),
-        .entry_slots = &entry_b, .entry_guards = &.{},
+        .entry_slots = &entry_b,
+        .entry_guards = &.{},
     };
 
     // Put both traces in the cache.
@@ -2152,7 +2245,7 @@ test "matchesFingerprint: mismatched int/float" {
     };
     const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
     // Register holds a float, but the trace expects int.
-    var regs = [_]Value{ Value.float(2.5) };
+    var regs = [_]Value{Value.float(2.5)};
     try testing.expect(!t.matchesFingerprint(&regs));
 }
 
