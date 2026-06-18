@@ -94,6 +94,33 @@ pub const Lane = enum(u8) {
             .value, .boolean, .f64 => false,
         };
     }
+
+    /// Can a frozen array currently on `self` ever *become* `target` by future
+    /// stores? Lanes only widen monotonically (`widenFor`) and never re-narrow,
+    /// so this is the reachability relation of the widening lattice:
+    ///
+    ///   - `value` is the top (type-erased) lane: it only reaches itself.
+    ///   - `boolean` and `f64` are type-pure: they reach only themselves and
+    ///     `value` (any off-type store erases straight to `value`).
+    ///   - the int ladder widens upward `i8→i16→i32→i64`, and any int lane can
+    ///     also erase to `value` on a non-int store.
+    ///
+    /// The JIT uses this for widen-eviction: a trace whose `guard_lane` pins
+    /// lane `T` is permanently dead once the live array sits on a lane `L` with
+    /// `!L.canWidenTo(T)` — monotonicity guarantees `T` can never be live again,
+    /// so the guard can never pass and the trace's anchor slot should be freed.
+    pub fn canWidenTo(self: Lane, target: Lane) bool {
+        if (self == target) return true;
+        return switch (self) {
+            .value => false,
+            .boolean => target == .value,
+            .f64 => target == .value,
+            .i8 => target == .i16 or target == .i32 or target == .i64 or target == .value,
+            .i16 => target == .i32 or target == .i64 or target == .value,
+            .i32 => target == .i64 or target == .value,
+            .i64 => target == .value,
+        };
+    }
 };
 
 /// Frozen field offsets for the tier-1b JIT (Phase B, `B0`). Phase B addresses
@@ -832,6 +859,41 @@ test "monotonic: a frozen lane is preserved across a widening convert" {
     try a.setInPlace(gpa, 3, Value.int(1000)); // i8 → i16 via widenFor/convert
     try testing.expectEqual(Lane.i16, a.lane);
     try testing.expect(a.frozen); // commitment survives the widen
+}
+
+test "canWidenTo encodes the monotonic widening lattice exactly" {
+    const all = [_]Lane{ .value, .boolean, .i8, .i16, .i32, .i64, .f64 };
+    // Reachability table: from-lane → the set of lanes it can ever become.
+    // Mirrors `widenFor`: ints climb the ladder then erase to value; pure lanes
+    // (boolean/f64) erase straight to value; value is the top and reaches only
+    // itself. Every lane reaches itself.
+    const Case = struct { from: Lane, reaches: []const Lane };
+    const cases = [_]Case{
+        .{ .from = .value, .reaches = &.{.value} },
+        .{ .from = .boolean, .reaches = &.{ .boolean, .value } },
+        .{ .from = .f64, .reaches = &.{ .f64, .value } },
+        .{ .from = .i8, .reaches = &.{ .i8, .i16, .i32, .i64, .value } },
+        .{ .from = .i16, .reaches = &.{ .i16, .i32, .i64, .value } },
+        .{ .from = .i32, .reaches = &.{ .i32, .i64, .value } },
+        .{ .from = .i64, .reaches = &.{ .i64, .value } },
+    };
+    for (cases) |c| {
+        for (all) |target| {
+            var expected = false;
+            for (c.reaches) |r| {
+                if (r == target) expected = true;
+            }
+            try testing.expectEqual(expected, c.from.canWidenTo(target));
+        }
+    }
+    // The lattice is a strict partial order off the diagonal: no two distinct
+    // lanes can widen to each other (would imply re-narrowing).
+    for (all) |x| {
+        for (all) |y| {
+            if (x == y) continue;
+            try testing.expect(!(x.canWidenTo(y) and y.canWidenTo(x)));
+        }
+    }
 }
 
 test "resize grows with holes and shrinks dropping the tail" {

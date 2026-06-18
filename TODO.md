@@ -281,21 +281,29 @@ int-lane store value as fits-proven when it is a `konst` whose constant fits the
 guard_lane-pinned lane width (sound: guard_lane pins the lane, so an in-range
 constant always fits). Noted while landing Phase B (int astore_append).
 
-## Phase B int astore_append: WIDEN-FLICKER blocks the canonical t[i]=i (next lever)
-Profiled (load-corrected). The int grow store lowers correctly and is FAST when the
-lane is stable: a pre-widened i32 fill (`t[1]=2e9; for i=2,N do t[i]=i end`) runs
-0.01s native vs 0.09s tier-0 (9x, matches LuaJIT 0.01s), 82% native [JIT].
-BUT the headline idiom `for i=1,N do t[i]=i end` runs ~88% tier-0 (no win): the value
-crosses i8->i16->i32, and each monotonic widen invalidates the current-lane trace.
-The stale trace is then re-entered every iteration, fails guard_lane at iteration 0
-(completed==0 < min_useful=8 -> onSideExit penalises the anchor), penalty maxes
-(max_penalty=8) -> gateAnchor cooldown, repeated across the two widens -> the i32
-steady state (~99% of iterations) never gets a stable trace.
-FIX (own change + determinism review): when a trace side-exits with completed==0 due to
-a guard_lane mismatch where the live lane is WIDER than the trace's lane (monotonic, so
-the old-lane trace is permanently dead), retire/replace that trace and allow immediate
-re-record on the new lane, instead of charging the anchor an onSideExit penalty. This
-is the only thing between Phase B and a fast `t[i]=i`.
+## Phase B int astore_append: WIDEN-FLICKER — FIXED (widen-eviction)
+The headline idiom `for i=1,N do t[i]=i end` crosses i8->i16->i32; each monotonic
+widen permanently invalidates the current-lane trace, but the stale trace lingered
+in a per-anchor slot and the wider-lane steady state never got a stable trace
+(~88% tier-0). Fixed by widen-eviction: when a trace side-exits with completed==0
+and the live array's lane has monotonically widened past the trace's `guard_lane`
+lane (`!live.canWidenTo(trace_lane)`, array.zig), the trace is permanently dead, so
+we retire it (`removeTrace`) and reset the anchor's hot-counter so the stabilised
+wider lane re-records. The dispatch walk was also made visit-once
+(`nextTraceExcluding`) — the old `findNextTrace(skip)` cursor could cycle A->B->A
+forever once two stale-lane traces coexisted (latent bug the eviction exposed).
+Result: a fresh-table fill crossing i8->i16 runs 0.06s native vs 0.22s tier-0
+(~3.7x). Output byte-identical across all 8 modes (eviction never affects output —
+tier-0 stays the oracle).
+
+### Known limitation (gate-bounded, output-safe): polymorphic-anchor thrash
+A genuinely bi-hot anchor — same loop PC alternately filling an i8 table and an i32
+table — can record+evict the narrow-lane trace repeatedly (eviction only fires when
+the live lane is WIDER, so the i32 trace is never evicted by an i8 table, but the
+re-recorded i8 trace is evicted whenever the i32 table flows). This is deterministic
+and output-safe; the existing penalty->gateAnchor cooldown bounds the repeated
+low-yield re-entries. Monomorphic fills (the target) are unaffected. If it ever
+shows up in a profile, gate re-recording on a per-anchor widen-eviction count.
 
 ## Phase B int astore_append: loop-INVARIANT int value (t[i]=v) is "unsupported"
 `local v=1000; for i=1,N do t[i]=v end` records but proveKinds rejects the trace (the

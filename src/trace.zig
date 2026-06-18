@@ -641,18 +641,24 @@ pub const TraceState = struct {
         return best;
     }
 
-    /// The next-highest-hit-count trace at `(proto, pc)` that is not `skip`,
-    /// or null.  Used for same-anchor chaining: when the best trace fails,
-    /// try the next-most-successful one.
-    pub fn findNextTrace(self: *const TraceState, proto: *const Proto, pc: u32, skip: *const Trace) ?*Trace {
+    /// Highest-`hit_count` trace at `(proto, pc)` that is not in `visited`, or
+    /// null. Same-anchor walks (the dispatch trial loop and exit-PC chaining)
+    /// use this with a growing `visited` set so they visit each candidate
+    /// **exactly once** and always terminate: a single-`skip` cursor would make
+    /// two equal-priority traces cycle `A→B→A→…` forever whenever both zero-exit
+    /// on the same registers (e.g. two stale narrow-lane traces once the live
+    /// array has widened past both — see widen-eviction).
+    pub fn nextTraceExcluding(self: *const TraceState, proto: *const Proto, pc: u32, visited: []const *Trace) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
-        for (self.cache.items) |t| {
-            if (t.anchor.proto == proto and t.anchor.pc == pc and t != skip) {
-                if (best == null or t.hit_count > best_hits) {
-                    best = t;
-                    best_hits = t.hit_count;
-                }
+        outer: for (self.cache.items) |t| {
+            if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
+            for (visited) |v| {
+                if (v == t) continue :outer;
+            }
+            if (best == null or t.hit_count > best_hits) {
+                best = t;
+                best_hits = t.hit_count;
             }
         }
         return best;
@@ -727,8 +733,22 @@ pub const TraceState = struct {
         // anchor chaining already tried all traces there).
         if (exit_pc == 0 or exit_pc == failed.anchor.pc) return null;
 
-        var st: ?*Trace = self.findTrace(proto, exit_pc);
-        while (st) |sct| : (st = self.findNextTrace(proto, exit_pc, sct)) {
+        // Visit each side trace at `exit_pc` exactly once (highest-hit first).
+        // Using a growing `visited` set rather than a single-`skip` cursor is what
+        // makes this terminate: two equal-priority side traces that both zero-exit
+        // would otherwise cycle `A→B→A→…` forever.
+        var visited: [8]*Trace = undefined;
+        var nvisited: usize = 0;
+        var st: ?*Trace = self.nextTraceExcluding(proto, exit_pc, visited[0..0]);
+        while (st) |sct| : (st = if (nvisited < visited.len)
+            self.nextTraceExcluding(proto, exit_pc, visited[0..nvisited])
+        else
+            null)
+        {
+            if (nvisited < visited.len) {
+                visited[nvisited] = sct;
+                nvisited += 1;
+            }
             const sbuf = self.valuesScratch(sct.instrs.len) catch continue;
             const sresult = irinterp.execute(sct, regs, sbuf);
             if (sresult.completed > 0) {
@@ -786,6 +806,72 @@ pub const TraceState = struct {
             if (t.anchor.proto == anchor.proto and t.anchor.pc == anchor.pc) n += 1;
         }
         return n;
+    }
+
+    /// Widen-eviction predicate: is trace `t` permanently dead because the live
+    /// array its `guard_lane` pins has monotonically widened past the trace's
+    /// recorded lane?  A trace specialises on `tbl.array.lane == aux`; lanes only
+    /// ever widen (`array.zig`, `Lane.canWidenTo`) and never re-narrow, so once
+    /// the live table sits on a lane that cannot reach the recorded lane, the
+    /// guard can never pass again.  Re-derived from the live `regs` (not the
+    /// failing-guard index), so it holds identically whether the trace ran on
+    /// tier-1a or native — the native path doesn't report which guard failed.
+    ///
+    /// Returns true if *any* of `t`'s entry `guard_lane`s is now unsatisfiable.
+    /// Reading a now-wider lane off a *different* table that happens to flow
+    /// through the same anchor is a benign false positive: eviction only drops a
+    /// cache entry (tier-0 stays the oracle and the trace simply re-records), it
+    /// can never change observable output.
+    pub fn laneWidenedPast(self: *const TraceState, t: *const Trace, regs: []const Value) bool {
+        _ = self;
+        for (t.instrs) |ins| {
+            if (ins.op != .guard_lane) continue;
+            // `guard_lane.a` indexes the table-producing instr; that is a
+            // `slot_load` whose `aux` is the tier-0 register the table lives in.
+            const ld_idx: usize = @intCast(ins.a);
+            if (ld_idx >= t.instrs.len) continue;
+            const ld = t.instrs[ld_idx];
+            if (ld.op != .slot_load) continue;
+            const reg: usize = @intCast(ld.aux);
+            if (reg >= regs.len) continue;
+            const v = regs[reg];
+            if (!v.isHeap() or v.heapType() != .table) continue;
+            const live_lane = table_mod.Table.fromHeader(v.asHeap()).array.lane;
+            const trace_lane: arr.Lane = @enumFromInt(ins.aux);
+            if (live_lane != trace_lane and !live_lane.canWidenTo(trace_lane)) return true;
+        }
+        return false;
+    }
+
+    /// Remove a trace from the cache and free it. Used by widen-eviction to
+    /// retire a permanently-dead trace so its per-anchor slot frees up for the
+    /// stabilised wider-lane trace. Cache entries are `*Trace`, so removing one
+    /// never invalidates pointers to the others — but the caller must NOT be
+    /// mid-iteration over the cache through this trace (see the dispatch loop,
+    /// which defers eviction until after its same-anchor walk completes).
+    pub fn removeTrace(self: *TraceState, t: *Trace) void {
+        for (self.cache.items, 0..) |c, idx| {
+            if (c == t) {
+                const anchor = t.anchor;
+                _ = self.cache.swapRemove(idx);
+                t.destroy(self.gpa);
+                // Reopen the anchor for re-recording. `onBackEdge` only arms when
+                // its hot-counter *crosses* `hotloop` (a one-shot `==`), so an
+                // anchor whose counter is already past that point would never
+                // re-record after losing its trace — the loop would run the rest
+                // fully tier-0. Resetting the counter lets the next `hotloop`
+                // back-edges re-arm a recording, which now observes the
+                // stabilised wider lane. Only do this once the anchor has no
+                // traces left (a still-populated anchor re-records via its own
+                // side-trace path and `hasTrace` would block re-arming anyway).
+                // Bounded by the lattice depth: an anchor widens at most
+                // value←i64←i32←i16←i8 / boolean / f64 times before it stabilises.
+                if (self.countTracesAt(anchor) == 0) {
+                    if (self.counters.getPtr(anchor)) |cnt| cnt.* = 0;
+                }
+                return;
+            }
+        }
     }
 
     /// Remove all guard-failure entries for `anchor`. Called after a side
@@ -2403,6 +2489,59 @@ test "matchesFingerprint: empty fingerprint always matches" {
     const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     var regs = [_]Value{ Value.int(1), Value.float(3.14), Value.nil() };
     try testing.expect(t.matchesFingerprint(&regs));
+}
+
+test "nextTraceExcluding: visits each anchor trace once, highest-hit first, then null" {
+    // The dispatch walk's termination guarantee: with the visited set growing by
+    // one each step, `nextTraceExcluding` returns hit-count-descending and never
+    // repeats — so two equal-priority traces can't cycle `A→B→A→…`. We pin both
+    // the ordering and the terminating `null`.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 0 };
+    const loop_only = [_]IrInstr{.{ .op = .loop }};
+
+    // Three traces at the same anchor (pc 10) with distinct hit counts, plus a
+    // decoy at a different anchor (pc 99) that must never be returned.
+    var traces: [4]*Trace = undefined;
+    const specs = [_]struct { pc: u32, hits: u64 }{
+        .{ .pc = 10, .hits = 5 },
+        .{ .pc = 10, .hits = 1 },
+        .{ .pc = 10, .hits = 3 },
+        .{ .pc = 99, .hits = 100 },
+    };
+    for (&traces, specs) |*slot, spec| {
+        const tr = try gpa.create(Trace);
+        tr.* = .{
+            .anchor = .{ .proto = &proto, .pc = spec.pc },
+            .instrs = @constCast(&loop_only),
+            .consts = &.{},
+            .entry_slots = &.{},
+            .entry_guards = &.{},
+            .hit_count = spec.hits,
+        };
+        slot.* = tr;
+        try state.cache.append(gpa, tr);
+    }
+    defer {
+        state.cache.clearRetainingCapacity();
+        for (traces) |tr| gpa.destroy(tr);
+    }
+
+    var visited: [8]*Trace = undefined;
+    var n: usize = 0;
+    // Expected visit order at pc 10: hits 5, then 3, then 1; pc 99 never appears.
+    const expect_hits = [_]u64{ 5, 3, 1 };
+    for (expect_hits) |h| {
+        const next = state.nextTraceExcluding(&proto, 10, visited[0..n]) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(h, next.hit_count);
+        visited[n] = next;
+        n += 1;
+    }
+    // All three visited → the walk terminates.
+    try testing.expect(state.nextTraceExcluding(&proto, 10, visited[0..n]) == null);
 }
 
 test "matchesFingerprint: matching types" {

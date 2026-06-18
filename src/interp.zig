@@ -1164,9 +1164,37 @@ pub const Vm = struct {
                         // each in turn until one commits at least one iteration.
                         // All traces share the same loop-header re-entry deopt
                         // discipline, so `regs` is valid for every attempt.
-                        var t: ?*trace.Trace = self.trace.findTrace(proto, @intCast(pc));
+                        // Same-anchor trial walk. We iterate by an explicit
+                        // *visited* set (`nextTraceExcluding`) rather than the
+                        // single-`skip` `findNextTrace`, so each candidate is tried
+                        // exactly once and the walk always terminates — two
+                        // equal-priority traces that both zero-exit would otherwise
+                        // cycle `A→B→A→…` forever (e.g. two stale narrow-lane traces
+                        // once the live array has widened past both).
+                        var visited: [8]*trace.Trace = undefined;
+                        var nvisited: usize = 0;
                         var any_fingerprint_matched = false;
-                        while (t) |ct| : (t = self.trace.findNextTrace(proto, @intCast(pc), ct)) {
+                        // Widen-eviction: traces whose `guard_lane` pins a lane the
+                        // live array has monotonically widened past can never match
+                        // again. Collect them during the trial walk and retire them
+                        // when we leave it — removing a trace frees the `*Trace`, so
+                        // we must not do it while the walk could still revisit the
+                        // cache. `dead` is a subset of `visited`, so it never
+                        // overflows past the visited cap.
+                        var dead: [8]*trace.Trace = undefined;
+                        var ndead: usize = 0;
+                        var t: ?*trace.Trace = self.trace.nextTraceExcluding(proto, @intCast(pc), visited[0..0]);
+                        while (t) |ct| : (t = if (nvisited < visited.len)
+                            self.trace.nextTraceExcluding(proto, @intCast(pc), visited[0..nvisited])
+                        else
+                            null) {
+                            // Mark visited *before* the body so the loop continuation
+                            // excludes `ct` (and everything tried so far) — this is
+                            // what makes the walk finite.
+                            if (nvisited < visited.len) {
+                                visited[nvisited] = ct;
+                                nvisited += 1;
+                            }
                             // --- type fingerprint (step 5) ---
                             // Skip this trace if the current register types don't
                             // match its entry type guards.  Avoids trial entries
@@ -1209,11 +1237,27 @@ pub const Vm = struct {
                                 if (result.completed > 0) {
                                     // This trace did useful work — keep its result.
                                     self.trace.onSideExit(ct, result.completed);
+                                    // Retire any dead-marked traces before leaving the
+                                    // walk so a stale narrow-lane trace doesn't linger
+                                    // in a slot just because a later trace succeeded.
+                                    // Safe: `continue :outer` abandons the walk, so the
+                                    // freed `*Trace`s are never revisited.
+                                    for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                     continue :outer;
                                 }
                                 // Zero iterations: apply the penalty, then try
                                 // the next trace at this anchor.
                                 self.trace.onSideExit(ct, 0);
+
+                                // Widen-eviction: if this trace's array lane guard
+                                // can never pass again (the live array widened past
+                                // it, monotonically), mark it for retirement so its
+                                // anchor slot frees for the stabilised wider-lane
+                                // trace. Deferred to after the walk (see `dead`).
+                                if (ndead < dead.len and self.trace.laneWidenedPast(ct, regs)) {
+                                    dead[ndead] = ct;
+                                    ndead += 1;
+                                }
 
                                 // --- exit-PC chaining (step 3) ---
                                 // If the failing guard was recorded at a different
@@ -1221,10 +1265,16 @@ pub const Vm = struct {
                                 // only after step 4 (side traces) populates the
                                 // cache at non-anchor PCs.
                                 if (self.trace.tryChainExit(ct, result.exit_instr, proto, regs)) |_| {
+                                    for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                     continue :outer;
                                 }
                             } else |_| {} // OOM: skip this trace, try next
                         }
+                        // Retire traces the walk found permanently dead (lane widened
+                        // past their guard). Safe now that the same-anchor walk is
+                        // complete — removing frees the `*Trace` and would otherwise
+                        // dangle the iterator cursor.
+                        for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                         // All traces at this anchor failed, OOM'd, or didn't match
                         // the fingerprint.  If at least one trace exists but none
                         // matched, count it for side-trace recording.
@@ -4802,6 +4852,48 @@ test "astore_append (int lane): a dense-from-1 fill (t[i]=i) compiles native and
     var osink = io.Writer.fixed(&obuf);
     try runCaptured(gpa, source, &osink, false, .off);
     try testing.expectEqualStrings(osink.buffered(), nsink.buffered());
+}
+
+test "widen-eviction: a lane-crossing fill retires the narrow trace and stabilises on the wider one" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // `for i=1,5000 do t[i]=i end` eager-commits `.i8`, records an i8 append
+    // trace, then crosses i8→i16 at i=128. Pre-eviction the dead i8 trace
+    // lingered (consuming a per-anchor slot) and the loop ran the i16 tail under
+    // a permanently-failing guard. Widen-eviction retires the i8 trace the first
+    // time its `guard_lane` fails against the now-wider live array, and reopens
+    // the anchor so the *stable* i16 lane records + compiles. We assert the
+    // surviving append trace guards i16 (ordinal 3), NOT i8 (ordinal 2), proving
+    // the dead narrow trace was evicted and the wider one took its place.
+    const arr = @import("array.zig");
+    const i8_ord = @intFromEnum(arr.Lane.i8);
+    const i16_ord = @intFromEnum(arr.Lane.i16);
+    const source =
+        \\local t = {}
+        \\for i = 1, 5000 do t[i] = i end
+        \\print(t[5000])
+    ;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var nbuf: [64]u8 = undefined;
+    var nsink = io.Writer.fixed(&nbuf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &nsink);
+    defer chunk.deinit();
+
+    var saw_i16_append = false;
+    var saw_i8_append = false;
+    for (vm.trace.cache.items) |tr| {
+        for (tr.instrs) |ins| {
+            if (ins.op != .astore_append) continue;
+            // The append's lane lives in its own `aux`; the leading guard_lane
+            // carries the same ordinal. Read the op directly.
+            if (ins.aux == i16_ord and tr.native == .compiled) saw_i16_append = true;
+            if (ins.aux == i8_ord) saw_i8_append = true;
+        }
+    }
+    try testing.expect(saw_i16_append); // the stable wider lane records + compiles
+    try testing.expect(!saw_i8_append); // the dead narrow trace was evicted
+    try testing.expectEqualStrings("5000\n", nsink.buffered());
 }
 
 test "astore_append (int lane): a widening int fill is byte-identical across all 8 modes" {
