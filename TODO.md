@@ -2,6 +2,27 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## tier-0 interpreter perf — next lever (after T1+T3)
+
+Two interpreter wins landed: T1 (inline table array fast-path in
+`get_index`/`set_index`) and T3 (hook-elision fast/slow `execImpl(comptime mode)`
+split). nsieve tier-0 0.81s → 0.65s (~20%), `--trace --jit-native` 0.33 → 0.28.
+
+**Threaded dispatch (labeled-switch-continue) was profiled OUT, not done.** nsieve
+tier-0 has branch-misses at **0.03%** and IPC **4.32** — the interpreter is
+instruction-count bound, not misprediction bound, so threading the dispatch switch
+buys ~nothing here. Don't revisit it expecting a win unless a *different*
+benchmark shows real indirect-branch misprediction (check `perf stat -e
+branch-misses` first — the documented "polished the 3%" trap).
+
+The real remaining lever is **fewer instructions retired per opcode**, since we're
+near peak IPC. Biggest structural candidate: the `Value` is 16 bytes, so every
+`regs[x]` is a 16-byte load and arith goes through tag dispatch — **NaN-boxing to
+8 bytes** would roughly halve register traffic. That's a large, determinism-
+sensitive change (touches every Value site + the snapshot/replay schema), so it
+needs its own design doc + Codex/Antigravity review. Smaller nibbles: the
+per-instruction back-edge epilogue check, and tightening the hottest arith arms.
+
 ## stdlib `math` — deferred functions
 
 First `math` cut landed in `src/stdlib/math.zig` (the stdlib now lives in
