@@ -32,6 +32,7 @@ const compiler = @import("compiler.zig");
 const io = @import("io.zig");
 const stdmath = @import("stdlib/math.zig");
 const stdtable = @import("stdlib/table.zig");
+const stdbase = @import("stdlib/base.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -168,7 +169,7 @@ pub const ModuleConst = function.ModuleConst;
 /// concatenated in here, so library code never piles into the interpreter core.
 /// To add a library: append `<lib>.natives` below (and `<lib>.constants` to
 /// `base_constants`).
-pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives;
+pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++ stdbase.natives;
 
 /// The interpreter's own natives. `print` is pure output; `clock` is the first
 /// nondeterministic input.
@@ -255,6 +256,15 @@ pub const CallFrame = struct {
     /// How many results the parent wants (the call instruction's `c`). Unused for
     /// the bottom frame.
     ret_count: u16 = 0,
+    /// Varargs cursor: absolute stack index of this frame's first `...` value.
+    /// The extra arguments (beyond `proto.num_params`) are left in the *caller's*
+    /// window by the `.call` layout and never relocated — the shared `stack` is a
+    /// fixed slab, so this region is stable and GC-rooted for the frame's lifetime.
+    /// Only meaningful when `varargs_count > 0`.
+    varargs_base: usize = 0,
+    /// Number of `...` values for this frame (`nargs - num_params`, clamped at 0).
+    /// Zero for non-vararg callees and vararg callees called with no extra args.
+    varargs_count: usize = 0,
 };
 
 /// The outcome of an `exec` run: either the bottom frame returned (carrying the
@@ -620,6 +630,12 @@ pub const Vm = struct {
     /// caller must therefore have already written any argument values into that
     /// window (a straight-line, allocation-free stretch) before calling this.
     pub fn pushFrame(self: *Vm, closure: *const Closure, base: usize, ret_dest: u16, ret_count: u16) Error!void {
+        return self.pushFrameVararg(closure, base, ret_dest, ret_count, 0, 0);
+    }
+
+    /// `pushFrame` plus an explicit varargs cursor (`.call` computes it for vararg
+    /// callees; everyone else uses the zero defaults via `pushFrame`).
+    pub fn pushFrameVararg(self: *Vm, closure: *const Closure, base: usize, ret_dest: u16, ret_count: u16, varargs_base: usize, varargs_count: usize) Error!void {
         if (self.depth >= max_call_depth) return Error.StackOverflow;
         const nreg = closure.proto.num_registers;
         if (base + nreg > self.stack.len) return Error.StackOverflow;
@@ -629,6 +645,8 @@ pub const Vm = struct {
             .pc = 0,
             .ret_dest = ret_dest,
             .ret_count = ret_count,
+            .varargs_base = varargs_base,
+            .varargs_count = varargs_count,
         };
         self.depth += 1;
         self.stack_top = base + nreg;
@@ -714,7 +732,7 @@ pub const Vm = struct {
         var regs = self.stack[base .. base + proto.num_registers];
         var pc = frame.pc;
 
-        while (true) {
+        outer: while (true) {
             // GC safepoint. Here every live value is reachable from a root (all
             // registers are settled, no half-built object is exposed), so a
             // stop-the-world collection is safe. Non-moving, so surviving
@@ -851,6 +869,16 @@ pub const Vm = struct {
                         pc = applyJump(pc, instr.aux);
                     }
                 },
+                // generic-for test: the preceding `call` filled R[a+3..] with the
+                // iterator's results. Continue iff the first var is non-nil (Lua
+                // stops only on nil; `false` continues), publishing it as the next
+                // control R[a+2] and taking the back-edge. Else fall through (exit).
+                .tfor_loop => {
+                    if (!regs[a + 3].isNil()) {
+                        regs[a + 2] = regs[a + 3];
+                        pc = applyJump(pc, instr.aux);
+                    }
+                },
 
                 // ---- tables ----
                 .new_table => {
@@ -912,10 +940,19 @@ pub const Vm = struct {
                                 else
                                     Value.nil();
                             }
+                            // Varargs cursor: a vararg callee handed more args than
+                            // it has fixed params keeps the surplus where they already
+                            // sit — in the caller's window, below `callee_base`. They
+                            // stay valid (the stack slab never moves) and GC-rooted
+                            // (`forEachRootHeader` scans the whole live prefix) for the
+                            // callee's lifetime. Recorded per-callee so a non-vararg or
+                            // no-surplus callee gets a zero cursor (never inherits one).
+                            const va_count: usize = if (cp.is_vararg and nargs > cp.num_params) nargs - cp.num_params else 0;
+                            const va_base: usize = if (va_count > 0) base + a + 1 + cp.num_params else 0;
                             // Freeze the caller's resume cursor (already one past this
                             // call), push the callee, and reload locals onto it.
                             frame.pc = pc;
-                            try self.pushFrame(cl, callee_base, instr.a, instr.c);
+                            try self.pushFrameVararg(cl, callee_base, instr.a, instr.c, va_base, va_count);
                             frame = &self.frames[self.depth - 1];
                             closure = frame.closure;
                             proto = closure.proto;
@@ -1028,6 +1065,44 @@ pub const Vm = struct {
                     self.stack_top = base + proto.num_registers;
                     continue;
                 },
+
+                // ---- varargs ---- read the current frame's `...` cursor. The
+                // surplus-arg region lives below `base` (in the caller's window),
+                // stable and GC-rooted; these never relocate it.
+                .vararg_first => {
+                    regs[a] = if (frame.varargs_count >= 1) self.stack[frame.varargs_base] else Value.nil();
+                },
+                .vararg_len => {
+                    regs[a] = Value.int(@intCast(frame.varargs_count));
+                },
+                .vararg_get => {
+                    // 1-based, bounds-checked; out of range or non-int index → nil.
+                    const idx_v = regs[instr.b];
+                    var out = Value.nil();
+                    if (idx_v.isInt()) {
+                        const idx = idx_v.asInt();
+                        if (idx >= 1 and idx <= @as(i64, @intCast(frame.varargs_count))) {
+                            out = self.stack[frame.varargs_base + @as(usize, @intCast(idx - 1))];
+                        }
+                    }
+                    regs[a] = out;
+                },
+                .vararg_spread => {
+                    // The dynamic-multret producer half: copy every vararg into
+                    // R[a..a+count) and stamp `reg_top` for the adjacent consumer
+                    // (a `call`/`ret` with `all_results`). Bound against the whole
+                    // stack, not the static window — like the native multret, the
+                    // values may land above `stack_top`, covered by the
+                    // `reg_top_pending` safepoint suppression until consumed.
+                    std.debug.assert(!self.reg_top_pending);
+                    const count = frame.varargs_count;
+                    const dest = base + a;
+                    if (dest + count > self.stack.len) return Error.StackOverflow;
+                    var k: usize = 0;
+                    while (k < count) : (k += 1) self.stack[dest + k] = self.stack[frame.varargs_base + k];
+                    self.reg_top = dest + count;
+                    self.reg_top_pending = true;
+                },
             }
 
             // Phase 5 hotness seam: a backward (or self) jump just took us to
@@ -1044,34 +1119,99 @@ pub const Vm = struct {
                 // **without** advancing `pc`: tier-0 then re-runs the loop header
                 // to redo the (pure, side-effect-free) deopt iteration. A trace is
                 // only ever entered at exactly its anchor pc, so re-entry is sound.
-                if (self.trace.config.execute and !self.trace.isRecording()) {
-                    if (self.trace.findTrace(proto, @intCast(pc))) |t| {
-                        if (self.trace.valuesScratch(t.instrs.len)) |buf| {
-                            // Instrumented path (viz): record this entry's per-iteration
-                            // events + exit ramp into the trace's exec log. Falls back
-                            // to the uninstrumented executor if the recorder can't be
-                            // set up. Observation-only — same `completed`/`regs`.
-                            const completed = if (self.trace.config.record_exec_log)
+                if (self.trace.config.execute and !self.trace.isRecording() and
+                    !self.trace.isBlacklisted(.{ .proto = proto, .pc = @intCast(pc) }))
+                {
+                    // A blacklisted anchor has proven it thrashes: every entry
+                    // committed fewer than `min_useful` iterations until the
+                    // re-entry penalty maxed out. The canonical case is a
+                    // strictly-alternating branch (stable types, so fingerprinting
+                    // can't tell the arms apart) where no single straight-line
+                    // trace can amortize entry/exit over more than one iteration —
+                    // running the trace was *slower* than tier-0. Gating entry on
+                    // the blacklist (not just re-arming, as before) lets tier-0
+                    // own the loop and removes the slowdown. Works on the native
+                    // path too: the penalty keys only on `completed`, which native
+                    // execution reports.
+                    //
+                    // Same-anchor chaining: if multiple traces exist for this
+                    // loop header (e.g. different type specializations), try
+                    // each in turn until one commits at least one iteration.
+                    // All traces share the same loop-header re-entry deopt
+                    // discipline, so `regs` is valid for every attempt.
+                    var t: ?*trace.Trace = self.trace.findTrace(proto, @intCast(pc));
+                    var any_fingerprint_matched = false;
+                    while (t) |ct| : (t = self.trace.findNextTrace(proto, @intCast(pc), ct)) {
+                        // --- type fingerprint (step 5) ---
+                        // Skip this trace if the current register types don't
+                        // match its entry type guards.  Avoids trial entries
+                        // that would immediately fail on a guard_int/guard_float
+                        // mismatch.  Branch-direction guards (guard_true/false)
+                        // aren't fingerprinted — they depend on computed values.
+                        if (!ct.matchesFingerprint(regs)) continue;
+                        any_fingerprint_matched = true;
+                        if (self.trace.valuesScratch(ct.instrs.len)) |buf| {
+                            self.trace.entries +%= 1;
+                            const result = if (self.trace.config.record_exec_log)
                                 blk: {
-                                    const tid = self.trace.traceIndex(t) orelse break :blk irinterp.execute(t, regs, buf);
-                                    const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(t, regs, buf);
-                                    break :blk irinterp.executeTraced(rec, t, regs, buf);
+                                    const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, regs, buf);
+                                    const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, regs, buf);
+                                    break :blk irinterp.executeTraced(rec, ct, regs, buf);
                                 }
                             else if (self.trace.config.native_codegen)
-                                // Tier-1b: run compiled machine code if this trace is
-                                // in the proven-int/bool subset; otherwise fall back to
-                                // tier-1a. Mutually exclusive with the exec-log path
-                                // above (the viz instrumentation observes the executor).
                                 blk: {
-                                    if (self.trace.nativeFor(t)) |ct| break :blk ct.run(regs);
-                                    break :blk irinterp.execute(t, regs, buf);
+                                    if (self.trace.nativeFor(ct)) |nt| break :blk irinterp.ExecResult{ .completed = nt.run(regs), .exit_instr = std.math.maxInt(u32) };
+                                    break :blk irinterp.execute(ct, regs, buf);
                                 }
                             else
-                                irinterp.execute(t, regs, buf);
-                            self.trace.onSideExit(t, completed);
-                            continue;
-                        } else |_| {} // OOM growing scratch: let tier-0 run the loop
+                                irinterp.execute(ct, regs, buf);
+                            // Always record the exit instruction — useful for
+                            // per-guard PC debugging even on productive exits.
+                            self.trace.last_exit_instr = result.exit_instr;
+
+                            // --- guard-failure counting (step 4) ---
+                            // Count guard failures on zero-iteration exits
+                            // (type mismatches that passed the fingerprint
+                            // but failed a non-type guard, e.g. branch direction).
+                            // Resolve the PC through `guardExitPc`: array guards
+                            // store a lane ordinal in `aux`, not a PC, and must
+                            // not be counted as guard-PC failures.
+                            if (result.completed == 0) {
+                                if (result.exit_instr != std.math.maxInt(u32)) {
+                                    if (trace.guardExitPc(ct.instrs[result.exit_instr])) |exit_pc| {
+                                        if (exit_pc > 0) {
+                                            self.trace.countGuardFailure(ct.anchor, exit_pc);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (result.completed > 0) {
+                                // This trace did useful work — keep its result.
+                                self.trace.onSideExit(ct, result.completed);
+                                continue :outer;
+                            }
+                            // Zero iterations: apply the penalty, then try
+                            // the next trace at this anchor.
+                            self.trace.onSideExit(ct, 0);
+
+                            // --- exit-PC chaining (step 3) ---
+                            // If the failing guard was recorded at a different
+                            // PC, look for a side trace there.  This fires
+                            // only after step 4 (side traces) populates the
+                            // cache at non-anchor PCs.
+                            if (self.trace.tryChainExit(ct, result.exit_instr, proto, regs)) |_| {
+                                continue :outer;
+                            }
+                        } else |_| {} // OOM: skip this trace, try next
                     }
+                    // All traces at this anchor failed, OOM'd, or didn't match
+                    // the fingerprint.  If at least one trace exists but none
+                    // matched, count it for side-trace recording.
+                    if (!any_fingerprint_matched and self.trace.hasTrace(.{ .proto = proto, .pc = @intCast(pc) })) {
+                        self.trace.countFingerprintMiss(.{ .proto = proto, .pc = @intCast(pc) });
+                    }
+                    // Fall through to tier-0.
                 }
             }
         }
@@ -2020,6 +2160,68 @@ test "calling a non-function is a type error" {
     try testing.expectError(Error.TypeError, runCode(&code, &.{}, 2));
 }
 
+// ---------------------------------------------------------------------------
+// Varargs V1 — the frame cursor + the four opcodes, exercised on hand-built
+// protos (the compiler lowering lands in V2). A vararg callee with one fixed
+// param, called with extra args, leaves the surplus in the caller's window;
+// the cursor (`varargs_base`/`varargs_count`) points at it with no copy.
+// ---------------------------------------------------------------------------
+
+/// Build a `main` that creates a closure over `child`, loads `args` into the
+/// call window, and calls it wanting `want` results, returning the first.
+fn runVararg(child: *Proto, args: []const i64, want: u16) Error!Value {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    // main: R0 = closure(child); R1.. = args; call R0(args) want `want`; ret R0
+    var code: std.ArrayList(Instr) = .empty;
+    defer code.deinit(testing.allocator);
+    try code.append(testing.allocator, Instr.opAB(.closure, 0, 0));
+    for (args, 0..) |v, i| try code.append(testing.allocator, Instr.opAx(.load_int, @intCast(1 + i), @intCast(v)));
+    try code.append(testing.allocator, Instr.opABC(.call, 0, @intCast(args.len), want));
+    // Sum up to `want` results so a spread's values are observable (want<=3 here).
+    var r: u16 = 1;
+    while (r < want) : (r += 1) try code.append(testing.allocator, Instr.opABC(.add, 0, 0, r));
+    try code.append(testing.allocator, Instr.opAB(.ret, 0, 1));
+    const protos = [_]*const Proto{child};
+    const main = Proto{ .code = code.items, .num_registers = @intCast(1 + args.len + 2), .protos = &protos, .name = "main" };
+    return vm.run(&main);
+}
+
+test "vararg_len counts the surplus args (and is 0 with none)" {
+    const child_code = [_]Instr{ Instr.opA(.vararg_len, 0), Instr.opAB(.ret, 0, 1) };
+    var child = Proto{ .code = &child_code, .num_registers = 1, .num_params = 1, .is_vararg = true, .name = "f" };
+    try testing.expectEqual(@as(i64, 3), (try runVararg(&child, &.{ 10, 20, 30, 40 }, 1)).asInt());
+    try testing.expectEqual(@as(i64, 0), (try runVararg(&child, &.{10}, 1)).asInt());
+}
+
+test "vararg_first yields the first surplus arg, or nil when there are none" {
+    const child_code = [_]Instr{ Instr.opA(.vararg_first, 0), Instr.opAB(.ret, 0, 1) };
+    var child = Proto{ .code = &child_code, .num_registers = 1, .num_params = 1, .is_vararg = true, .name = "f" };
+    try testing.expectEqual(@as(i64, 20), (try runVararg(&child, &.{ 10, 20, 30 }, 1)).asInt());
+    try testing.expect((try runVararg(&child, &.{10}, 1)).isNil());
+}
+
+test "vararg_get is 1-based and bounds-checked (nil out of range)" {
+    // child: idx in R1; R0 = vararg[R1]; return R0.
+    const in_range = [_]Instr{ Instr.opAx(.load_int, 1, 2), Instr.opAB(.vararg_get, 0, 1), Instr.opAB(.ret, 0, 1) };
+    var c1 = Proto{ .code = &in_range, .num_registers = 2, .num_params = 1, .is_vararg = true, .name = "f" };
+    try testing.expectEqual(@as(i64, 30), (try runVararg(&c1, &.{ 10, 20, 30, 40 }, 1)).asInt()); // varargs 20,30,40 → [2]=30
+    const out_of_range = [_]Instr{ Instr.opAx(.load_int, 1, 5), Instr.opAB(.vararg_get, 0, 1), Instr.opAB(.ret, 0, 1) };
+    var c2 = Proto{ .code = &out_of_range, .num_registers = 2, .num_params = 1, .is_vararg = true, .name = "f" };
+    try testing.expect((try runVararg(&c2, &.{ 10, 20, 30, 40 }, 1)).isNil());
+    const zero_index = [_]Instr{ Instr.opAx(.load_int, 1, 0), Instr.opAB(.vararg_get, 0, 1), Instr.opAB(.ret, 0, 1) };
+    var c3 = Proto{ .code = &zero_index, .num_registers = 2, .num_params = 1, .is_vararg = true, .name = "f" };
+    try testing.expect((try runVararg(&c3, &.{ 10, 20, 30, 40 }, 1)).isNil());
+}
+
+test "vararg_spread feeds all surplus args to the caller via all_results" {
+    // child: spread all varargs from R0, return them all (producer half).
+    const child_code = [_]Instr{ Instr.opA(.vararg_spread, 0), Instr.opAB(.ret, 0, bytecode.all_results) };
+    var child = Proto{ .code = &child_code, .num_registers = 1, .num_params = 1, .is_vararg = true, .name = "f" };
+    // main wants 3 results and sums them: 20 + 30 + 40 = 90.
+    try testing.expectEqual(@as(i64, 90), (try runVararg(&child, &.{ 10, 20, 30, 40 }, 3)).asInt());
+}
+
 test "print is installed as a native global; output goes through the sink" {
     // Exercises the host-effect seam end to end, capturing output in a buffer
     // (never the real stdout — the test runner owns fd 1).
@@ -2392,6 +2594,47 @@ test "determinism: two independent runs agree on output, traces, and snapshots" 
         \\  s = s + a + b
         \\end
         \\print(s, pair(7))
+        ,
+        // Generic-for over `pairs` — the deterministic-iteration core guarantee.
+        // Two tables receive the SAME keys in OPPOSITE insertion order; both are
+        // traversed via `pairs` and accumulated into strings. Canonical key order
+        // (tag → heap id → bits) erases the insertion order, so the printed output
+        // is identical between p and q AND stable across the two independent runs.
+        // The string keys also land in the heap, so the snapshot bytes only agree
+        // if iteration is address-independent.
+        \\local p = {}
+        \\p.a = 1
+        \\p.b = 2
+        \\p.c = 3
+        \\local q = {}
+        \\q.c = 3
+        \\q.b = 2
+        \\q.a = 1
+        \\local sp = ""
+        \\for k, v in pairs(p) do sp = sp .. k .. v end
+        \\local sq = ""
+        \\for k, v in pairs(q) do sq = sq .. k .. v end
+        \\print(sp)
+        \\print(sq)
+        ,
+        // Varargs (`...`): destructure surplus, tail-spread forwarding, and
+        // `return ...`. A vararg function aborts trace formation (nyi_opcode), so
+        // this exercises the interpreter/snapshot path; the spread sets `reg_top`
+        // exactly like a multret call, so divergence here would catch any address
+        // or transient-state leak into the serialized bytes.
+        \\local function head(...)
+        \\  local a, b = ...
+        \\  return a, b
+        \\end
+        \\local function tail(x, ...)
+        \\  print(x, ...)
+        \\end
+        \\local s = 0
+        \\for i = 1, 20 do
+        \\  local a, b = head(i, i * i, i * i * i)
+        \\  s = s + a + b
+        \\end
+        \\tail(s, head(s, s))
         ,
     };
     inline for (programs) |src| {
@@ -3107,6 +3350,199 @@ test "e2e: table library — unpack/pack/insert/remove/concat/move" {
     );
 }
 
+test "e2e: generic-for + pairs/ipairs/next" {
+    // Drives `compileGenericFor` + `stdlib/base.zig` through all five modes +
+    // stress GC. Covers: ipairs (array, ascending), ipairs stops at the first nil
+    // hole, pairs over a string-keyed hash (canonical interning-id order),
+    // n=1 `for k in pairs` (the `func` primary-projection path), mixed array+hash,
+    // `false` values continue (only nil stops), break, empty table (zero
+    // iterations), and a user-defined stateless 3-value iterator (`tri, nil, 0`).
+    try expectProgram(
+        \\local a = {10, 20, 30}
+        \\for i, v in ipairs(a) do print(i, v) end
+        \\local h = {1, 2, nil, 4}
+        \\for i, v in ipairs(h) do print("h", i, v) end
+        \\local t = {}
+        \\t.x = 1
+        \\t.y = 2
+        \\t.z = 3
+        \\for k, v in pairs(t) do print(k, v) end
+        \\for k in pairs(t) do print(k) end
+        \\local m = {100, 200}
+        \\m.tag = 9
+        \\for k, v in pairs(m) do print("m", k, v) end
+        \\local ft = {}
+        \\ft.p = false
+        \\local c = 0
+        \\for k, v in pairs(ft) do c = c + 1 end
+        \\print("false-count", c)
+        \\for i, v in ipairs({5, 6, 7, 8}) do
+        \\  if v == 7 then break end
+        \\  print("br", i, v)
+        \\end
+        \\for k, v in pairs({}) do print("nope") end
+        \\print("empty-ok")
+        \\local function tri(s, j)
+        \\  j = j + 1
+        \\  if j > 2 then return nil end
+        \\  return j, j * 2, j * 3
+        \\end
+        \\for x, y, z in tri, nil, 0 do print("tri", x, y, z) end
+    ,
+        "1\t10\n2\t20\n3\t30\n" ++
+            "h\t1\t1\nh\t2\t2\n" ++
+            "x\t1\ny\t2\nz\t3\n" ++
+            "x\ny\nz\n" ++
+            "m\t1\t100\nm\t2\t200\nm\ttag\t9\n" ++
+            "false-count\t1\n" ++
+            "br\t1\t5\nbr\t2\t6\n" ++
+            "empty-ok\n" ++
+            "tri\t1\t2\t3\ntri\t2\t4\t6\n",
+    );
+}
+
+test "e2e: generic-for delete current key during traversal (Lua-legal)" {
+    // Deleting the key currently being visited is allowed; the strictly-greater
+    // successor search in `next` continues correctly without crash or repeat.
+    // Build a 3-key hash, delete each key as we visit it, assert all three are
+    // seen exactly once and the table ends empty.
+    try expectProgram(
+        \\local t = {}
+        \\t.a = 1
+        \\t.b = 2
+        \\t.c = 3
+        \\local count = 0
+        \\for k, v in pairs(t) do
+        \\  count = count + v
+        \\  t[k] = nil
+        \\end
+        \\print(count)
+        \\local left = 0
+        \\for k, v in pairs(t) do left = left + 1 end
+        \\print(left)
+    , "6\n0\n");
+}
+
+test "e2e: repeat/until across all modes" {
+    // Post-test loop driven through every execution + GC mode. Covers: body runs
+    // before the test, `until` referencing a body-local, a nested repeat, and
+    // break. The accumulation is numeric so the trace recorder has a hot loop to
+    // chew on without heap churn.
+    try expectProgram(
+        \\local i = 0
+        \\local sum = 0
+        \\repeat
+        \\  i = i + 1
+        \\  sum = sum + i
+        \\  local stop = 100
+        \\until sum >= stop
+        \\print(i, sum)
+        \\local outer = 0
+        \\local total = 0
+        \\repeat
+        \\  outer = outer + 1
+        \\  local inner = 0
+        \\  repeat
+        \\    inner = inner + 1
+        \\    total = total + 1
+        \\  until inner >= 3
+        \\until outer >= 4
+        \\print(outer, total)
+        \\local k = 0
+        \\repeat
+        \\  k = k + 1
+        \\  if k == 5 then break end
+        \\until k >= 100
+        \\print(k)
+    , "14\t105\n4\t12\n5\n");
+}
+
+test "e2e: LICM hoists a loop-invariant subexpression, transparently (all modes)" {
+    // `a * b` is recomputed in the loop body every iteration, but `a` and `b`
+    // are loop-invariant locals → the recorder sees an invariant `mul`, which
+    // E1 LICM hoists into the preheader (computed once). The `.off` (tier-0)
+    // arm is the real correctness gate: it never runs the optimizer, so its
+    // output proves the hoisted optimized/native arms didn't change the value.
+    // A second invariant chain (`a + b`, also hoistable) exercises a >1-deep
+    // preheader cone. 1000 iters: acc = 1000*(12 + 7) = 19000.
+    try expectProgram(
+        \\local a = 3
+        \\local b = 4
+        \\local acc = 0
+        \\for i = 1, 1000 do
+        \\  acc = acc + a * b + (a + b)
+        \\end
+        \\print(acc)
+    , "19000\n");
+}
+
+test "e2e: varargs spread, destructure, and nil-padding across all modes" {
+    // Bare `...`: forward (`print(...)`), single-value (`local x = ...`),
+    // destructure with surplus and with nil-padding (`local a, b = ...`), a
+    // leading fixed param plus tail spread (`f(x, ...)`), and the empty case
+    // (`...` with no surplus args). Driven through every execution + GC mode.
+    try expectProgram(
+        \\local function fwd(...)
+        \\  print(...)
+        \\end
+        \\local function head(...)
+        \\  local x = ...
+        \\  return x
+        \\end
+        \\local function first2(...)
+        \\  local a, b = ...
+        \\  return a, b
+        \\end
+        \\local function tailcat(x, ...)
+        \\  print(x, ...)
+        \\end
+        \\fwd(1, 2, 3)
+        \\fwd()
+        \\print(head(7, 8))
+        \\print(first2(10, 20, 30))
+        \\print(first2(5))
+        \\tailcat(1, 2, 3)
+        \\tailcat(9)
+    , "1\t2\t3\n\n7\n10\t20\n5\tnil\n1\t2\t3\n9\n");
+}
+
+test "e2e: varargs forwarding through return and nested calls, method spread" {
+    // `return ...` forwards all values; a nested `f(g(...))` chains two spreads;
+    // a method `obj:m(...)` carries `self` plus the spread tail.
+    try expectProgram(
+        \\local function g(...)
+        \\  return ...
+        \\end
+        \\local function f(...)
+        \\  print(g(...))
+        \\end
+        \\f(1, 2)
+        \\f(3, 4, 5)
+        \\local obj = { name = "lune" }
+        \\obj.greet = function(self, ...)
+        \\  print(self.name, ...)
+        \\end
+        \\obj:greet("a", "b")
+        \\obj:greet()
+    , "1\t2\n3\t4\t5\nlune\ta\tb\nlune\n");
+}
+
+test "e2e: parenthesized varargs truncate to a single value" {
+    // `(...)` is the Lua paren-truncation rule: even in a tail position it yields
+    // exactly one value (the first), so `return (...)` and `f((...))` are single.
+    try expectProgram(
+        \\local function pick(...)
+        \\  return (...)
+        \\end
+        \\local function wrap(...)
+        \\  print((...), "end")
+        \\end
+        \\print(pick(10, 20, 30))
+        \\print(pick())
+        \\wrap(1, 2, 3)
+    , "10\nnil\n1\tend\n");
+}
+
 test "e2e: tables and string concat" {
     try expectProgram(
         \\local t = {}
@@ -3431,6 +3867,175 @@ test "exec-log recording is observation-only (record on/off agree)" {
     try testing.expectEqualStrings(off_sink.buffered(), on_sink.buffered());
 }
 
+test "per-guard PC: last_exit_instr is set on zero-iteration guard failure" {
+    // A loop where types change mid-run so the recorded trace fails a guard
+    // on its very first execution. With hotloop=4, iteration 5 records and
+    // iteration 6 executes — the `if i == 6` branch changes direction, so
+    // guard_false on the eq result fails with completed=0.
+    const gpa = testing.allocator;
+    const source =
+        \\local x = 0
+        \\for i = 1, 100 do
+        \\    if i == 6 then x = x + 0.5 else x = x + 1 end
+        \\end
+        \\print(x)
+    ;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.hotguard = 1000; // prevent fingerprint-miss side traces
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runForExecLog(&vm, gpa, source, &sink, true);
+    defer chunk.deinit();
+
+    // The trace MUST have been executed and failed at a guard.
+    try testing.expect(vm.trace.last_exit_instr != std.math.maxInt(u32));
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    const t = vm.trace.cache.items[0];
+    const ei = vm.trace.last_exit_instr;
+    try testing.expect(ei < t.instrs.len);
+
+    // The failing instruction must be a guard.
+    const failed = t.instrs[ei];
+    try testing.expect(switch (failed.op) {
+        .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => true,
+        else => false,
+    });
+    // And its aux must carry the bytecode PC where it was recorded.
+    try testing.expect(failed.aux > 0);
+}
+
+test "side traces: type-changing loop records a second trace at the same anchor" {
+    // When a guard in the root trace fails repeatedly (type change), a side
+    // trace is recorded at the same loop header, and same-anchor chaining
+    // runs the correct trace for each iteration's types.
+    const gpa = testing.allocator;
+    const source =
+        \\local x = 0
+        \\for i = 1, 20 do
+        \\    if i == 6 then x = x + 0.5 else x = x + 1 end
+        \\end
+        \\print(x)
+    ;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotguard = 3; // low threshold for test
+    vm.trace.config.record_exec_log = true;
+
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    _ = try vm.run(chunk.proto);
+
+    // Two traces should exist at the same anchor: the root trace (int path)
+    // and the side trace (float path, recorded after guard failures).
+    try testing.expect(vm.trace.cache.items.len >= 2);
+    // Guard failures are cleared when the side trace arms, and no new
+    // failures are counted once 2+ traces exist (avoids unbounded growth).
+    // Output must be correct despite the type change mid-loop.
+    // i=1..5: x=5 (int); i=6: x=5.5 (float); i=7..20: x=19.5.
+    try testing.expectEqualStrings("19.5\n", sink.buffered());
+}
+
+test "side traces: without side traces the anchor blacklists; with them it stays live" {
+    // Run the same type-changing program twice: once with a hotguard threshold
+    // so high that no side trace fires (the anchor blacklists), and once with
+    // a low threshold (side trace keeps the anchor alive).  Both must produce
+    // correct output — side traces are a performance optimisation, not a
+    // correctness requirement.
+    const gpa = testing.allocator;
+    const source =
+        \\local x = 0
+        \\for i = 1, 30 do
+        \\    if i == 6 then x = x + 0.5 else x = x + 1 end
+        \\end
+        \\print(x)
+    ;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    // --- Run 1: no side traces (hotguard > iteration count) ---
+    {
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        try testing.expect(!diags.hasErrors());
+
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.trace.config.enabled = true;
+        vm.trace.config.execute = true;
+        vm.trace.config.hotloop = 4;
+        vm.trace.config.hotguard = 1000; // effectively never
+        vm.trace.config.max_penalty = 8; // blacklists after 8 zero-yield entries
+
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        _ = try vm.run(chunk.proto);
+
+        // Only the root trace exists — no side trace was ever recorded.
+        try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+        // The anchor is NOT blacklisted: type fingerprinting skips the
+        // trace when x becomes float instead of entering-and-failing,
+        // so no penalty accumulates.
+        try testing.expectEqual(@as(usize, 0), vm.trace.blacklist.count());
+        // Output is still correct — tier-0 handles the type-changed iterations.
+        // i=1..5: x=5; i=6: x=5.5; i=7..30: x = 5.5 + 24 = 29.5.
+        try testing.expectEqualStrings("29.5\n", sink.buffered());
+    }
+
+    // --- Run 2: side traces enabled (hotguard = 3) ---
+    {
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        try testing.expect(!diags.hasErrors());
+
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.trace.config.enabled = true;
+        vm.trace.config.execute = true;
+        vm.trace.config.hotloop = 4;
+        vm.trace.config.hotguard = 3; // fire a side trace after 3 guard failures
+        vm.trace.config.max_penalty = 8; // (would blacklist without side traces)
+
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        _ = try vm.run(chunk.proto);
+
+        // Two traces: the root trace (int path) and the side trace (float path).
+        try testing.expect(vm.trace.cache.items.len >= 2);
+        // The anchor is NOT blacklisted — the float side trace commits useful
+        // iterations (> min_useful), clearing the penalty before it maxes out.
+        try testing.expectEqual(@as(usize, 0), vm.trace.blacklist.count());
+        // Same correct output.
+        try testing.expectEqualStrings("29.5\n", sink.buffered());
+    }
+}
+
 /// Disassemble a `vm`'s sole cached trace into `buf` for shape assertions. `buf`
 /// is sized comfortably above any test trace. The caller must keep the trace's
 /// `anchor.proto` alive (see `runForTrace`) — `writeTrace` prints `proto.name`.
@@ -3464,8 +4069,12 @@ test "recorder: a numeric-for loop records guards + arithmetic + a loop close" {
     try testing.expect(std.mem.indexOf(u8, text, "loop") != null);
 
     const t = vm.trace.cache.items[0];
-    // acc and the loop index are loop-carried, so they surface in the exit snapshot.
-    try testing.expect(t.exit_stores.len >= 1);
+    // acc and the loop index are loop-carried, so they surface as slot-bound φs.
+    var n_phi: usize = 0;
+    for (t.instrs) |ins| {
+        if (ins.op == .phi and ins.aux >= 0) n_phi += 1;
+    }
+    try testing.expect(n_phi >= 1);
     try testing.expect(t.entry_slots.len >= 1);
     // No host/cross-frame op was hit, so nothing was blacklisted.
     try testing.expectEqual(@as(usize, 0), vm.trace.blacklist.count());
@@ -3523,20 +4132,24 @@ test "recorder: dead expression temporaries are dropped from the exit snapshot (
     }
     const watermark: usize = @as(usize, base.?) + 4;
 
-    // Every surviving exit-store is either below the watermark (a real local /
+    // Every surviving slot-bound φ is either below the watermark (a real local /
     // loop control) or a slot the trace actually read — never a dead temporary.
     var saw_acc = false;
-    for (t.exit_stores) |st| {
-        const was_read = std.mem.indexOfScalar(u16, t.entry_slots, st.slot) != null;
-        try testing.expect(@as(usize, st.slot) < watermark or was_read);
-        if (st.slot == 0) saw_acc = true; // `acc` is the first local → slot 0
+    for (t.instrs) |ins| {
+        if (ins.op != .phi or ins.aux < 0) continue;
+        const slot: u16 = @intCast(ins.aux);
+        const was_read = std.mem.indexOfScalar(u16, t.entry_slots, slot) != null;
+        try testing.expect(@as(usize, slot) < watermark or was_read);
+        if (slot == 0) saw_acc = true; // `acc` is the first local → slot 0
     }
     // The loop-carried accumulator is still committed.
     try testing.expect(saw_acc);
     // And no high write-only temporary leaked through.
-    for (t.exit_stores) |st| {
-        if (@as(usize, st.slot) >= watermark)
-            try testing.expect(std.mem.indexOfScalar(u16, t.entry_slots, st.slot) != null);
+    for (t.instrs) |ins| {
+        if (ins.op != .phi or ins.aux < 0) continue;
+        const slot: u16 = @intCast(ins.aux);
+        if (@as(usize, slot) >= watermark)
+            try testing.expect(std.mem.indexOfScalar(u16, t.entry_slots, slot) != null);
     }
 }
 
@@ -3560,8 +4173,10 @@ test "recorder: a while loop keeps its write-only temporaries (no for_loop water
     // There must be at least one defined-but-never-read (write-only) slot still in
     // the snapshot — exactly what the for-loop filter would have removed.
     var saw_write_only = false;
-    for (t.exit_stores) |st| {
-        if (std.mem.indexOfScalar(u16, t.entry_slots, st.slot) == null) saw_write_only = true;
+    for (t.instrs) |ins| {
+        if (ins.op != .phi or ins.aux < 0) continue;
+        const slot: u16 = @intCast(ins.aux);
+        if (std.mem.indexOfScalar(u16, t.entry_slots, slot) == null) saw_write_only = true;
     }
     try testing.expect(saw_write_only);
 }
@@ -3824,7 +4439,7 @@ test "native: a multi-op for-loop with dropped temporaries lowers and matches ti
     try testing.expect(vm.trace.cache.items[0].native == .compiled);
 }
 
-test "native: a float loop is terminally unsupported and falls back to tier-1a" {
+test "native: a float-accumulate loop compiles to the XMM path (Phase D / F1)" {
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     const source =
@@ -3839,12 +4454,14 @@ test "native: a float loop is terminally unsupported and falls back to tier-1a" 
     var chunk = try runNativeForTrace(&vm, gpa, source, &nsink);
     defer chunk.deinit();
 
-    // A trace was recorded, but the float add put it outside the int/bool subset:
-    // the native compiler bailed and memoized `.unsupported` (tier-1a runs it).
+    // Phase D: the float add (carried float accumulator + int-controlled for loop)
+    // is now inside the native subset — the compiler lowers it to the SSE2/XMM path
+    // (cvtsi2sd-free here: both add operands are float) and memoizes `.compiled`.
     try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.cache.items[0].native == .unsupported);
+    try testing.expect(vm.trace.cache.items[0].native == .compiled);
 
-    // Output is still byte-identical to a plain tier-0 run.
+    // Decisive soundness check: native output is byte-identical to a plain tier-0 run
+    // (strict-FP addsd matches the oracle bit-for-bit — 150.0).
     var obuf: [64]u8 = undefined;
     var osink = io.Writer.fixed(&obuf);
     try runCaptured(gpa, source, &osink, false, .off);
@@ -3917,12 +4534,12 @@ test "executor: integer //-by-zero inside a hot loop side-exits; tier-0 re-raise
     }
 }
 
-test "executor: a variable that flips int->float mid-loop deopts, blacklists, and still matches tier-0" {
+test "executor: a variable that flips int->float mid-loop deopts to tier-0 and still matches tier-0" {
     // Recorded as an integer loop (the `i == 20` branch is not taken when it goes
     // hot). At i == 20 tier-0 takes the branch and `x` becomes a float; every later
-    // re-entry then fails its `guard_int` on `x` (zero-yield), so the re-entry
-    // penalty climbs to `max_penalty` and the anchor is blacklisted — tier-0 owns
-    // the tail. The result must still equal tier-0's to the last decimal.
+    // back-edge is a fingerprint mismatch — the trace is skipped, tier-0 runs the
+    // tail directly. No failed entries, no blacklisting. The result must still
+    // equal tier-0's to the last decimal.
     const source =
         \\local x = 0
         \\for i = 1, 200 do
@@ -3933,7 +4550,7 @@ test "executor: a variable that flips int->float mid-loop deopts, blacklists, an
     ;
     try expectTier0Equiv(source);
 
-    // Introspect the brake: the type flip thrashes the trace until it blacklists.
+    // Introspect: the type flip causes fingerprint mismatches, not blacklisting.
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
@@ -3941,7 +4558,9 @@ test "executor: a variable that flips int->float mid-loop deopts, blacklists, an
     var sink = io.Writer.fixed(&buf);
     var chunk = try runExecForTrace(&vm, gpa, source, &sink);
     defer chunk.deinit();
-    try testing.expect(vm.trace.blacklist.count() >= 1);
+    // The anchor is NOT blacklisted — fingerprinting skips the trace after the
+    // type change instead of trial-entering and failing.
+    try testing.expectEqual(@as(usize, 0), vm.trace.blacklist.count());
 }
 
 test "executor: a branchy low-yield loop blacklists the thrashing anchor yet prints correctly" {
@@ -3968,6 +4587,13 @@ test "executor: a branchy low-yield loop blacklists the thrashing anchor yet pri
     defer chunk.deinit();
     try testing.expectEqualStrings("300\n", sink.buffered());
     try testing.expect(vm.trace.blacklist.count() >= 1);
+    // The blacklist must GATE ENTRY, not merely be set: once the anchor maxes out
+    // its penalty (≤ ~max_penalty productive-but-low-yield entries), the dispatch
+    // loop stops entering the cached trace and tier-0 owns the remaining ~180
+    // iterations. Without the entry-gate this loop entered the trace ~100 times
+    // (once per even iteration) and ran *slower* than tier-0. Bound it well under
+    // that to prove re-entry actually halts.
+    try testing.expect(vm.trace.entries < 30);
 }
 
 test "e2e (executor): a long hot loop stays correct across every trace + gc mode" {

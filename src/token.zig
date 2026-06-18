@@ -46,9 +46,11 @@ pub const Token = struct {
         keyword_nil,
         keyword_not,
         keyword_or,
+        keyword_repeat,
         keyword_return,
         keyword_then,
         keyword_true,
+        keyword_until,
         keyword_while,
 
         // punctuation & operators
@@ -123,9 +125,11 @@ pub const Token = struct {
                 .keyword_nil => "nil",
                 .keyword_not => "not",
                 .keyword_or => "or",
+                .keyword_repeat => "repeat",
                 .keyword_return => "return",
                 .keyword_then => "then",
                 .keyword_true => "true",
+                .keyword_until => "until",
                 .keyword_while => "while",
                 .plus => "+",
                 .minus => "-",
@@ -184,9 +188,11 @@ pub const keywords = std.StaticStringMap(Token.Tag).initComptime(.{
     .{ "nil", .keyword_nil },
     .{ "not", .keyword_not },
     .{ "or", .keyword_or },
+    .{ "repeat", .keyword_repeat },
     .{ "return", .keyword_return },
     .{ "then", .keyword_then },
     .{ "true", .keyword_true },
+    .{ "until", .keyword_until },
     .{ "while", .keyword_while },
 });
 

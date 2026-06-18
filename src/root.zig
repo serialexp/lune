@@ -48,6 +48,7 @@ pub const interp = @import("interp.zig");
 /// here so `zig build test` analyses and runs each library's unit tests.
 pub const stdlib_math = @import("stdlib/math.zig");
 pub const stdlib_table = @import("stdlib/table.zig");
+pub const stdlib_base = @import("stdlib/base.zig");
 
 /// Phase 5 — hot-path detection + trace recorder (records IR; tier-0 executes).
 pub const trace = @import("trace.zig");
@@ -70,6 +71,11 @@ pub const execlog = @import("execlog.zig");
 /// Phase 6b — trace optimizer (constant folding / CSE / dead-code elimination;
 /// rewrite passes run once at commit time).
 pub const tropt = @import("tropt.zig");
+
+/// Trace-opportunity detector — a deterministic analysis pass over an optimized
+/// trace that scores it against a catalog of waste signatures (dead carried phis,
+/// duplicate carries, …). Pure detection, no transforms.
+pub const troptdiag = @import("troptdiag.zig");
 
 /// Phase 5b — trace serialization: maps a committed `trace.Trace` to/from its
 /// on-disk wire form via the vendored, generated binschema codec.
@@ -121,6 +127,7 @@ test {
     _ = nativegen;
     _ = execlog;
     _ = tropt;
+    _ = troptdiag;
     _ = traceser;
     _ = keyframeser;
     _ = effectser;

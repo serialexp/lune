@@ -56,6 +56,20 @@ embedding memory introspection, wrap the backing allocator once in
 `assertNoLeaks()`) and feed every subsystem from it. Prefer arenas for
 parse-once/free-all lifetimes (the AST already does this).
 
+### Rule Z-5: Keep the stdlib inventory in lockstep with the stdlib.
+
+`docs/lua-stdlib-inventory.csv` is the canonical map of the Lua 5.4 standard
+library we draw from: one row per function/constant, columns
+`category,function,tier,status,description`. `tier` is the disposition
+(`core` = pure deterministic language; `base-host` = host effects installed in
+every VM; `cli-binding` = the OS world the default CLI ships and a game host
+omits; `excluded` = won't implement, determinism-hostile or out of scope), and
+`status` is implementation progress (`implemented`/`partial`/`not-started`, or
+`n/a` for excluded rows). Whenever you add, finish, rename, namespace, or drop a
+stdlib function, update its row in the **same change** — flip `status`, move the
+`tier`, or add the row — so the inventory never drifts from the tree (global
+Rule #3 spirit). It's the at-a-glance "what's left to replicate" for lune.
+
 ## Build
 
 - `zig build` — build the CLI.

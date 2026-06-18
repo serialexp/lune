@@ -52,17 +52,27 @@ const arr = @import("array.zig");
 const Value = value.Value;
 const Trace = trace.Trace;
 
+/// Result of executing a trace.
+pub const ExecResult = struct {
+    /// Number of loop iterations that committed cleanly.
+    completed: usize,
+    /// Index of the failing IR instruction when completed==0 (guard/arith
+    /// failure). `maxInt(u32)` means the trace ran to completion with no
+    /// failure (completed > 0).
+    exit_instr: u32,
+};
+
 /// Execute trace `t` from the current frame's register window `regs`, using the
 /// caller-owned `values` scratch (indexed by SSA `Ref`; must be at least
-/// `t.instrs.len` long — the caller grows/reuses it). Returns the number of loop
-/// iterations that committed cleanly (the *yield*). On return `regs` is coherent
-/// for tier-0 to resume at `t.anchor.pc`:
+/// `t.instrs.len` long — the caller grows/reuses it). Returns `ExecResult` with
+/// the number of loop iterations that committed cleanly and, on failure, the
+/// index of the failing instruction.
 ///   * a guard failure / arithmetic error returns with `regs` untouched since the
 ///     start of the failing iteration (tier-0 re-runs that partial iteration);
 ///   * a yield of 0 means the very first iteration side-exited (the trace no
 ///     longer matches the observed types) — the caller uses this for the
 ///     re-entry penalty.
-pub fn execute(t: *const Trace, regs: []Value, values: []Value) usize {
+pub fn execute(t: *const Trace, regs: []Value, values: []Value) ExecResult {
     return executeImpl(false, {}, t, regs, values);
 }
 
@@ -71,7 +81,7 @@ pub fn execute(t: *const Trace, regs: []Value, values: []Value) usize {
 /// its exit ramp for the visualizer. `rec` must already be `begin`-ready (targeted
 /// at the trace's log); this calls `begin`/`end` around the run. Used only on the
 /// instrumented (viz/CLI) path — `execute` above is the untouched JIT fast path.
-pub fn executeTraced(rec: *execlog.ExecLogRecorder, t: *const Trace, regs: []Value, values: []Value) usize {
+pub fn executeTraced(rec: *execlog.ExecLogRecorder, t: *const Trace, regs: []Value, values: []Value) ExecResult {
     return executeImpl(true, rec, t, regs, values);
 }
 
@@ -81,7 +91,7 @@ pub fn executeTraced(rec: *execlog.ExecLogRecorder, t: *const Trace, regs: []Val
 /// With `record == true`, `rec` observes every value, guard outcome, commit, and the
 /// terminal side-exit. Recording is observation-only: `regs`/`completed` are
 /// byte-identical to the uninstrumented run (the parity canary test asserts this).
-fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Value, values: []Value) usize {
+fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Value, values: []Value) ExecResult {
     std.debug.assert(values.len >= t.instrs.len);
     if (record) rec.begin();
     var completed: usize = 0;
@@ -146,7 +156,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                 .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .eq, .ne, .lt, .le => {
                     values[i] = evalBinary(ins.op, values[ins.a], values[ins.b]) catch {
                         if (record) rec.exit(i, .arith, Value.nil());
-                        break :iter completed;
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     };
                     if (record) rec.value(i, values[i]);
                 },
@@ -155,7 +165,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                 .neg, .not, .bnot => {
                     values[i] = evalUnary(ins.op, values[ins.a]) catch {
                         if (record) rec.exit(i, .arith, Value.nil());
-                        break :iter completed;
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     };
                     if (record) rec.value(i, values[i]);
                 },
@@ -165,31 +175,31 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                     if (record) rec.guardPass(i, values[ins.a]);
                 } else {
                     if (record) rec.exit(i, .guard, values[ins.a]);
-                    break :iter completed;
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
                 .guard_float => if (values[ins.a].isFloat()) {
                     if (record) rec.guardPass(i, values[ins.a]);
                 } else {
                     if (record) rec.exit(i, .guard, values[ins.a]);
-                    break :iter completed;
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
                 .guard_number => if (values[ins.a].isNumber()) {
                     if (record) rec.guardPass(i, values[ins.a]);
                 } else {
                     if (record) rec.exit(i, .guard, values[ins.a]);
-                    break :iter completed;
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
                 .guard_true => if (values[ins.a].isTruthy()) {
                     if (record) rec.guardPass(i, values[ins.a]);
                 } else {
                     if (record) rec.exit(i, .guard, values[ins.a]);
-                    break :iter completed;
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
                 .guard_false => if (!values[ins.a].isTruthy()) {
                     if (record) rec.guardPass(i, values[ins.a]);
                 } else {
                     if (record) rec.exit(i, .guard, values[ins.a]);
-                    break :iter completed;
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
 
                 // ---- lane-aware packed-array read path (Phase B) ----
@@ -231,7 +241,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                     if (record) rec.guardPass(i, values[ins.a]);
                 } else {
                     if (record) rec.exit(i, .guard, values[ins.a]);
-                    break :iter completed;
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
                 // The table's array lane still equals the recorded lane (a
                 // monotonic widen would have moved it past `aux`).
@@ -241,7 +251,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                         if (record) rec.guardPass(i, values[ins.a]);
                     } else {
                         if (record) rec.exit(i, .guard, values[ins.a]);
-                        break :iter completed;
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     }
                 },
                 // The index lands in the dense array part: `(index-1) <u len`.
@@ -253,7 +263,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                         if (record) rec.guardPass(i, values[ar.a]);
                     } else {
                         if (record) rec.exit(i, .guard, values[ar.a]);
-                        break :iter completed;
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     }
                 },
                 // The slot is present (a narrow-lane hole would read as nil, which
@@ -265,7 +275,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                         if (record) rec.guardPass(i, values[ar.a]);
                     } else {
                         if (record) rec.exit(i, .guard, values[ar.a]);
-                        break :iter completed;
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     }
                 },
                 // The value still fits the recorded int lane (emitted before an
@@ -278,7 +288,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                         if (record) rec.guardPass(i, values[ins.a]);
                     } else {
                         if (record) rec.exit(i, .guard, values[ins.a]);
-                        break :iter completed;
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     }
                 },
 
@@ -309,9 +319,9 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
         // A well-formed trace always terminates in `loop` (checked by the
         // commit-time verifier in trace.zig). If one somehow didn't, stop rather
         // than spin — `regs` is whatever the last commit left, which is coherent.
-        break :iter completed;
+        break :iter ExecResult{ .completed = completed, .exit_instr = std.math.maxInt(u32) };
     };
-    if (record) rec.end(completed_out);
+    if (record) rec.end(completed_out.completed);
     return completed_out;
 }
 
@@ -411,12 +421,12 @@ fn runScan(t: *Table, start: i64) struct { completed: usize, regs: [3]Value } {
         .anchor = undefined,
         .instrs = &instrs,
         .consts = @constCast(scan_consts[0..]),
-        .entry_slots = &[_]u16{},
+        .entry_slots = &[_]u16{}, .entry_guards = &.{},
     };
     var regs = [3]Value{ Value.heap(&t.header), Value.int(start), Value.nil() };
     var values: [13]Value = undefined;
-    const completed = execute(&tr, &regs, &values);
-    return .{ .completed = completed, .regs = regs };
+    const result = execute(&tr, &regs, &values);
+    return .{ .completed = result.completed, .regs = regs };
 }
 
 test "B2 read path: scan a bool lane matches tier-0 getInt, hole/bounds side-exit" {
@@ -477,7 +487,7 @@ test "E0 review: a slot-bound φ carrying a HEAP value emits no exec-log value e
         .{ .op = .loop }, // %7
     };
     const consts = [_]Value{ Value.int(5), Value.int(1) };
-    const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = @constCast(consts[0..]), .entry_slots = &[_]u16{} };
+    const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = @constCast(consts[0..]), .entry_slots = &[_]u16{}, .entry_guards = &.{} };
 
     var rec = execlog.ExecLogRecorder.init(gpa, 64, 8);
     defer rec.deinit();
@@ -487,7 +497,7 @@ test "E0 review: a slot-bound φ carrying a HEAP value emits no exec-log value e
 
     var regs = [3]Value{ Value.heap(&t.header), Value.nil(), Value.int(1) };
     var values: [8]Value = undefined;
-    const completed = executeTraced(&rec, &tr, &regs, &values);
+    const completed = executeTraced(&rec, &tr, &regs, &values).completed;
 
     // Exactly one clean commit (iter 1), then the divide-by-zero side-exit on iter 2.
     try testing.expectEqual(@as(usize, 1), completed);
@@ -511,11 +521,65 @@ test "B2 read path: guard_table side-exits when the slot is not a table" {
         .anchor = undefined,
         .instrs = &instrs,
         .consts = @constCast(scan_consts[0..]),
-        .entry_slots = &[_]u16{},
+        .entry_slots = &[_]u16{}, .entry_guards = &.{},
     };
     // r0 is an int, not a table → guard_table fails on the first iteration.
     var regs = [3]Value{ Value.int(99), Value.int(1), Value.nil() };
     var values: [13]Value = undefined;
-    try testing.expectEqual(@as(usize, 0), execute(&tr, &regs, &values));
+    try testing.expectEqual(@as(usize, 0), execute(&tr, &regs, &values).completed);
     try testing.expect(regs[0].asInt() == 99); // untouched
+}
+
+test "per-guard PC: ExecResult.exit_instr points to the failing guard" {
+    // A trace with two guard_int instructions. The second one fails.
+    var instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0: r0 (int)
+        .{ .op = .guard_int, .a = 0 }, // %1: guard r0 is int — passes
+        .{ .op = .slot_load, .aux = 1 }, // %2: r1 (float → fails guard)
+        .{ .op = .guard_int, .a = 2 }, // %3: guard r1 is int — FAILS
+        .{ .op = .loop }, // %4 (unreachable)
+    };
+    const consts = [_]Value{};
+    const tr = Trace{
+        .anchor = undefined,
+        .instrs = &instrs,
+        .consts = @constCast(consts[0..]),
+        .entry_slots = &[_]u16{}, .entry_guards = &.{},
+    };
+    var regs = [_]Value{ Value.int(1), Value.float(3.14) };
+    var values: [5]Value = undefined;
+    const result = execute(&tr, &regs, &values);
+    try testing.expectEqual(@as(usize, 0), result.completed);
+    // The failing guard is instrs[3] — guard_int on r1
+    try testing.expectEqual(@as(u32, 3), result.exit_instr);
+    // regs untouched
+    try testing.expectEqual(@as(i64, 1), regs[0].asInt());
+}
+
+test "per-guard PC: ExecResult.exit_instr on arith error (divide by zero)" {
+    // A loop that hits integer division by zero on iteration 2.
+    // r2 starts at 1 and decrements → 0, so 5 // r2 becomes DivByZero.
+    var instrs = [_]IrInstr{
+        .{ .op = .konst, .aux = 0 }, // %0 = 5
+        .{ .op = .slot_load, .aux = 2 }, // %1 = r2 (counter: 1→0)
+        .{ .op = .idiv, .a = 0, .b = 1 }, // %2 = 5 // r2
+        .{ .op = .konst, .aux = 1 }, // %3 = 1
+        .{ .op = .sub, .a = 1, .b = 3 }, // %4 = r2 - 1
+        .{ .op = .phi, .a = 0, .b = 4, .aux = 2, .ty = .int }, // %5: r2 ← r2-1
+        .{ .op = .loop }, // %6
+    };
+    const consts = [_]Value{ Value.int(5), Value.int(1) };
+    const tr = Trace{
+        .anchor = undefined,
+        .instrs = &instrs,
+        .consts = @constCast(consts[0..]),
+        .entry_slots = &[_]u16{}, .entry_guards = &.{},
+    };
+    var regs = [_]Value{ Value.nil(), Value.nil(), Value.int(1) };
+    var values: [7]Value = undefined;
+    const result = execute(&tr, &regs, &values);
+    // One clean iteration (r2=1 → 5//1=5), then div-by-zero on iter 2 (r2=0).
+    try testing.expectEqual(@as(usize, 1), result.completed);
+    // The failing instruction is the idiv at index 2.
+    try testing.expectEqual(@as(u32, 2), result.exit_instr);
 }

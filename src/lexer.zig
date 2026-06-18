@@ -300,6 +300,12 @@ test "keywords vs identifiers" {
     });
 }
 
+test "repeat/until lex as keywords, not identifiers" {
+    try expectTags("repeat until repeated untilx", &.{
+        .keyword_repeat, .keyword_until, .identifier, .identifier,
+    });
+}
+
 test "int vs float literals" {
     try expectTags("1 2.0 3e2 0x1F 4.5e-3 .5", &.{
         .int_literal, .float_literal, .float_literal, .int_literal, .float_literal, .float_literal,

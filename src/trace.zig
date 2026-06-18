@@ -29,6 +29,7 @@ const io = @import("io.zig");
 const tropt = @import("tropt.zig");
 const execlog = @import("execlog.zig");
 const nativegen = @import("nativegen.zig");
+const irinterp = @import("irinterp.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -202,6 +203,22 @@ pub const IrInstr = struct {
     snap: SnapIdx = 0,
 };
 
+/// The bytecode PC recorded in a guard's `aux`, or null if this op doesn't carry
+/// one. ONLY `guard_int/float/number/true/false` stamp their recording PC into
+/// `aux` (see `emit`); the array guards (`guard_lane`, `guard_fits`) reuse `aux`
+/// for lane ordinals, and the rest leave it zero — so reading `aux` as a PC there
+/// is a category error that can mis-key a guard-failure counter or, worse, chain
+/// to an unrelated trace. Exit-PC chaining (`tryChainExit`) and guard-failure
+/// counting MUST resolve the exit PC through this accessor — never read `.aux`
+/// directly. Returns the PC for the five PC-carrying guards (which may legitimately
+/// be 0); callers treat 0 as "no usable PC" since no loop-body guard sits at PC 0.
+pub fn guardExitPc(ins: IrInstr) ?u32 {
+    return switch (ins.op) {
+        .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => @intCast(ins.aux),
+        else => null,
+    };
+}
+
 /// A loop-carried writeback: at the back-edge, tier-0 register `slot` holds the
 /// value produced by IR `ref`. The set of these is the trace's exit snapshot —
 /// what a future executor copies back into the register file each iteration.
@@ -220,6 +237,25 @@ pub const SlotStore = struct { slot: u16, ref: Ref };
 /// down properly.
 pub const AnchorKey = struct { proto: *const Proto, pc: u32 };
 
+/// Identifies a guard-failure site: the trace anchor and the bytecode PC of the
+/// failing guard instruction (stored in the guard's `aux` field by the per-guard
+/// PC recording, step 2).  Used to count how often a specific guard fails, so
+/// side-trace recording (step 4) can be triggered at the right threshold.
+pub const GuardKey = struct { anchor: AnchorKey, exit_pc: u32 };
+
+/// The kind of type a trace's entry guard enforces on a register.
+pub const EntryGuardType = enum(u8) {
+    int,
+    float,
+    number, // accepts both int and float (guard_number)
+    table,
+};
+
+/// A register and the type it must have for this trace to be entered.
+/// Pairs are computed from the trace's IR at commit time and stored as a
+/// runtime-only fingerprint — not serialized.
+pub const EntryGuard = struct { slot: u16, ty: EntryGuardType };
+
 /// A completed, cached trace: the recorded IR plus the entry/exit snapshots that
 /// connect it back to tier-0 register slots. Immutable once committed (Phase 5a
 /// never invalidates a cached trace — see the lifecycle doc).
@@ -232,11 +268,21 @@ pub const Trace = struct {
     consts: []Value,
     /// Tier-0 registers read as inputs, in `slot_load` order (the entry snapshot).
     entry_slots: []u16,
+    /// Entry type guards extracted from the IR at commit time: for each register
+    /// this trace guards on entry, the type it must have.  Used by
+    /// `matchesFingerprint` to skip non-matching traces without a trial entry.
+    /// Runtime-only — not serialized.
+    entry_guards: []EntryGuard,
     /// Tier-1b native-codegen cache (Phase 8): lazily compiled machine code for
     /// this trace, or a terminal `unsupported` verdict. `unattempted` until the
     /// first native dispatch (`TraceState.nativeFor`). Runtime-only — not part of
     /// the serialized trace; the page is freed in `destroy`.
     native: nativegen.NativeState = .unattempted,
+    /// Runtime counter: how many times this trace has committed a useful
+    /// number of iterations (>= `min_useful`).  Used by `findTrace` to
+    /// return the most-successful trace first — a stable frequency-based
+    /// priority that does not thrash on alternating types.
+    hit_count: u64 = 0,
 
     /// Free a heap-allocated trace and its arrays.
     pub fn destroy(self: *Trace, gpa: std.mem.Allocator) void {
@@ -244,7 +290,25 @@ pub const Trace = struct {
         gpa.free(self.instrs);
         gpa.free(self.consts);
         gpa.free(self.entry_slots);
+        gpa.free(self.entry_guards);
         gpa.destroy(self);
+    }
+
+    /// Check whether the current register types match this trace's entry
+    /// type guards (the fingerprint).  Returns true if all guarded slots
+    /// have the expected type, or if the trace has no entry guards at all
+    /// (hand-built test traces, traces without type guards).
+    pub fn matchesFingerprint(self: *const Trace, regs: []const Value) bool {
+        for (self.entry_guards) |g| {
+            const v = regs[g.slot];
+            switch (g.ty) {
+                .int => if (!v.isInt()) return false,
+                .float => if (!v.isFloat()) return false,
+                .number => if (!v.isNumber()) return false,
+                .table => if (!v.isHeap() or v.heapType() != .table) return false,
+            }
+        }
+        return true;
     }
 };
 
@@ -302,6 +366,11 @@ pub const TraceConfig = struct {
     /// the minimal brake against re-entry thrash on type-unstable / branchy loops.
     /// The real fix (side traces) is deferred; see docs/design/01-trace-lifecycle.md.
     max_penalty: u32 = 8,
+    /// Guard-failure count at which a side trace is recorded for this
+    /// `(anchor, exit_pc)` pair.  When a guard at PC X in a trace anchored
+    /// at A fails this many times, the next back-edge to A arms a new
+    /// recording that captures the alternate path through the loop body.
+    hotguard: u32 = 50,
     /// Record a per-trace **execution log** (`execlog.zig`) for the visualizer's
     /// iteration animation. Off by default (zero cost on the JIT path — the executor
     /// is comptime-specialized); the wasm playground flips it on. Independent of
@@ -341,6 +410,12 @@ pub const TraceState = struct {
     /// Re-entry penalty per anchor: a low-yield trace entry bumps it, a useful one
     /// clears it; at `config.max_penalty` the anchor is blacklisted (`onSideExit`).
     penalty: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
+    /// Total trace entries executed (incremented in the dispatch loop before each
+    /// `irinterp.execute`/native run). Diagnostic only — used to confirm the
+    /// blacklist entry-gate actually halts re-entry on a thrashing anchor, and a
+    /// cheap signal for benchmark analysis (entries ≫ committed-iterations means a
+    /// low-yield loop the JIT can't amortize).
+    entries: u64 = 0,
     /// The in-progress recording (at most one at a time in Phase 5a).
     rec: Recorder = .{},
     /// Reusable SSA-value scratch for the tier-1a executor (`irinterp.execute`),
@@ -348,6 +423,21 @@ pub const TraceState = struct {
     /// every entry — never allocated per-iteration or per-entry. Not a GC root
     /// (the executor runs no safepoint; see `irinterp.zig`).
     values_scratch: std.ArrayListUnmanaged(Value) = .empty,
+    /// Last guard-failure instruction index, written by the dispatch loop when a
+    /// trace side-exits with zero iterations. Used for per-guard PC recording
+    /// (exit-PC-aware chaining). `maxInt(u32)` means no guard failed (clean exit
+    /// or arith error).
+    last_exit_instr: u32 = std.math.maxInt(u32),
+    /// Per-guard failure counters for side-trace recording (step 4).  Keyed by
+    /// `(anchor, exit_pc)` — each entry tracks how many times a specific guard
+    /// in traces at `anchor` has failed.  When a counter crosses `hotguard`,
+    /// `wants_side_trace` is set and the next back-edge records a side trace.
+    guard_failures: std.AutoHashMapUnmanaged(GuardKey, u32) = .empty,
+    /// When non-null, the next back-edge to this anchor will arm a side-trace
+    /// recording (even if a trace already exists there).  Set by
+    /// `countGuardFailure` when a guard-failure crosses `hotguard`; cleared
+    /// by `onBackEdge` when the side trace is armed.
+    wants_side_trace: ?AnchorKey = null,
     /// Per-trace execution logs for the visualizer (`execlog.zig`), populated only
     /// when `config.record_exec_log`. Keyed by `trace_id` (cache index). Empty and
     /// untouched on the normal JIT path.
@@ -364,6 +454,7 @@ pub const TraceState = struct {
         self.counters.deinit(self.gpa);
         self.blacklist.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
+        self.guard_failures.deinit(self.gpa);
         self.values_scratch.deinit(self.gpa);
         for (self.exec_logs.items) |*l| l.deinit(self.gpa);
         self.exec_logs.deinit(self.gpa);
@@ -397,13 +488,39 @@ pub const TraceState = struct {
         return &self.exec_logs.items[self.exec_logs.items.len - 1];
     }
 
-    /// The trace cached for `(proto, pc)`, or null. Linear scan — the cache is
-    /// small in Phase 5/6 and never invalidated.
+    /// The trace cached for `(proto, pc)` with the highest hit count, or null.
+    /// Frequency-based prioritisation: the trace that has committed the most
+    /// useful iterations is returned first, so the common path is tried before
+    /// rare alternatives.  Stable — does not thrash on alternating types.
     pub fn findTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
+        var best: ?*Trace = null;
+        var best_hits: u64 = 0;
         for (self.cache.items) |t| {
-            if (t.anchor.proto == proto and t.anchor.pc == pc) return t;
+            if (t.anchor.proto == proto and t.anchor.pc == pc) {
+                if (best == null or t.hit_count > best_hits) {
+                    best = t;
+                    best_hits = t.hit_count;
+                }
+            }
         }
-        return null;
+        return best;
+    }
+
+    /// The next-highest-hit-count trace at `(proto, pc)` that is not `skip`,
+    /// or null.  Used for same-anchor chaining: when the best trace fails,
+    /// try the next-most-successful one.
+    pub fn findNextTrace(self: *const TraceState, proto: *const Proto, pc: u32, skip: *const Trace) ?*Trace {
+        var best: ?*Trace = null;
+        var best_hits: u64 = 0;
+        for (self.cache.items) |t| {
+            if (t.anchor.proto == proto and t.anchor.pc == pc and t != skip) {
+                if (best == null or t.hit_count > best_hits) {
+                    best = t;
+                    best_hits = t.hit_count;
+                }
+            }
+        }
+        return best;
     }
 
     /// Is a trace already cached for this anchor? (Prevents re-arming.)
@@ -431,13 +548,14 @@ pub const TraceState = struct {
     }
 
     /// Account for a trace entry that side-exited after committing `completed`
-    /// iterations. A useful entry (>= `min_useful`) clears the anchor's penalty;
-    /// a low-yield one bumps it, and at `max_penalty` the anchor is blacklisted so
-    /// tier-0 takes the loop. Bounds re-entry thrash on type-unstable / branchy
-    /// loops (the real fix, side traces, is deferred — 01-trace-lifecycle.md).
-    pub fn onSideExit(self: *TraceState, t: *const Trace, completed: usize) void {
+    /// iterations. A useful entry (>= `min_useful`) clears the anchor's penalty
+    /// and bumps the trace's `hit_count` (frequency-based trace prioritisation);
+    /// a low-yield one bumps the penalty, and at `max_penalty` the anchor is
+    /// blacklisted.
+    pub fn onSideExit(self: *TraceState, t: *Trace, completed: usize) void {
         const key = t.anchor;
         if (completed >= self.config.min_useful) {
+            t.hit_count +|= 1;
             _ = self.penalty.remove(key);
             return;
         }
@@ -447,6 +565,106 @@ pub const TraceState = struct {
         if (gop.value_ptr.* >= self.config.max_penalty) {
             self.blacklist.put(self.gpa, key, {}) catch {};
         }
+    }
+
+    /// Exit-PC chaining (step 3): after trace `failed` side-exited with
+    /// `exit_instr`, look for a trace at the guard's bytecode PC and try to
+    /// execute it. Returns the number of committed iterations if a side trace
+    /// succeeded, or null if no trace was found / all failed. `regs` is the
+    /// current register window (coherent for the loop header). The caller
+    /// should `continue :outer` on success.
+    pub fn tryChainExit(
+        self: *TraceState,
+        failed: *const Trace,
+        exit_instr: u32,
+        proto: *const Proto,
+        regs: []Value,
+    ) ?usize {
+        if (exit_instr == std.math.maxInt(u32)) return null;
+        // Resolve the exit PC through the op-gated accessor: array guards store a
+        // lane ordinal in `aux`, not a PC, so a first-iteration array-guard exit
+        // must NOT be interpreted as a chain target (that could execute an
+        // unrelated trace against incoherent registers).
+        const exit_pc = guardExitPc(failed.instrs[exit_instr]) orelse return null;
+        // Skip if no PC recorded (aux==0) or exit PC equals the anchor (same-
+        // anchor chaining already tried all traces there).
+        if (exit_pc == 0 or exit_pc == failed.anchor.pc) return null;
+
+        var st: ?*Trace = self.findTrace(proto, exit_pc);
+        while (st) |sct| : (st = self.findNextTrace(proto, exit_pc, sct)) {
+            const sbuf = self.valuesScratch(sct.instrs.len) catch continue;
+            const sresult = irinterp.execute(sct, regs, sbuf);
+            if (sresult.completed > 0) {
+                self.onSideExit(sct, sresult.completed);
+                return sresult.completed;
+            }
+            self.onSideExit(sct, 0);
+        }
+        return null;
+    }
+
+    /// Count a guard failure at `exit_pc` within a trace anchored at `anchor`.
+    /// When the counter crosses `config.hotguard`, sets `wants_side_trace` so
+    /// the next back-edge records a side trace for the alternate path.
+    /// Called from the dispatch loop after a zero-iteration guard failure.
+    pub fn countGuardFailure(self: *TraceState, anchor: AnchorKey, exit_pc: u32) void {
+        // Don't bother counting if we already have multiple traces here —
+        // additional side traces beyond the first few have diminishing returns
+        // and cause unbounded cache growth on alternating-type loops.
+        if (self.countTracesAt(anchor) >= 2) return;
+
+        const key = GuardKey{ .anchor = anchor, .exit_pc = exit_pc };
+        const gop = self.guard_failures.getOrPut(self.gpa, key) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* +|= 1;
+        if (gop.value_ptr.* >= self.config.hotguard and self.wants_side_trace == null) {
+            self.wants_side_trace = anchor;
+        }
+    }
+
+    /// Count a fingerprint miss: no cached trace at `anchor` matched the
+    /// current register types.  Uses the same side-trace threshold
+    /// (`config.hotguard`) as `countGuardFailure`, but the key has
+    /// `exit_pc == 0` to distinguish it from real guard failures.
+    /// Called from the dispatch loop when all traces are skipped by
+    /// fingerprint mismatch.
+    pub fn countFingerprintMiss(self: *TraceState, anchor: AnchorKey) void {
+        if (self.countTracesAt(anchor) >= 2) return;
+        // exit_pc == 0 marks this as a fingerprint miss, not a specific
+        // guard failure.  Shares the same counter namespace for the
+        // hotguard threshold.
+        const key = GuardKey{ .anchor = anchor, .exit_pc = 0 };
+        const gop = self.guard_failures.getOrPut(self.gpa, key) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* +|= 1;
+        if (gop.value_ptr.* >= self.config.hotguard and self.wants_side_trace == null) {
+            self.wants_side_trace = anchor;
+        }
+    }
+
+    /// How many cached traces are at this anchor?
+    fn countTracesAt(self: *const TraceState, anchor: AnchorKey) usize {
+        var n: usize = 0;
+        for (self.cache.items) |t| {
+            if (t.anchor.proto == anchor.proto and t.anchor.pc == anchor.pc) n += 1;
+        }
+        return n;
+    }
+
+    /// Remove all guard-failure entries for `anchor`. Called after a side
+    /// trace is armed so the counter resets and doesn't re-trigger infinitely.
+    fn clearGuardFailures(self: *TraceState, anchor: AnchorKey) void {
+        var to_remove: std.ArrayListUnmanaged(GuardKey) = .empty;
+        var iter = self.guard_failures.keyIterator();
+        while (iter.next()) |k| {
+            if (k.anchor.proto == anchor.proto and k.anchor.pc == anchor.pc) {
+                to_remove.append(self.gpa, k.*) catch continue;
+            }
+        }
+        for (to_remove.items) |k| {
+            _ = self.guard_failures.remove(k);
+        }
+        to_remove.deinit(self.gpa);
     }
 
     /// Resolve (and memoize) the tier-1b native compilation of `t`. Returns a
@@ -475,7 +693,7 @@ pub const TraceState = struct {
         return self.rec.active;
     }
 
-    fn isBlacklisted(self: *const TraceState, anchor: AnchorKey) bool {
+    pub fn isBlacklisted(self: *const TraceState, anchor: AnchorKey) bool {
         return self.blacklist.contains(anchor);
     }
 
@@ -512,6 +730,21 @@ pub const TraceState = struct {
             !self.hasTrace(key) and !self.isBlacklisted(key))
         {
             self.arm(proto, target_pc);
+        }
+        // Side-trace arming (step 4): a guard inside a trace at this anchor
+        // has failed enough times — arm a new recording on the next iteration,
+        // even though a trace already exists here.  The side trace will capture
+        // the alternate path through the loop body.
+        if (self.wants_side_trace) |wanted| {
+            if (wanted.proto == proto and wanted.pc == target_pc) {
+                if (!self.isBlacklisted(key)) {
+                    self.arm(proto, target_pc);
+                    // Clear guard-failure counters for this anchor so we don't
+                    // immediately re-trigger on the next outer-loop iteration.
+                    self.clearGuardFailures(key);
+                }
+                self.wants_side_trace = null;
+            }
         }
     }
 
@@ -594,6 +827,36 @@ pub const TraceState = struct {
 
         assertWellFormed(fields.instrs, fields.consts.len, self.rec.reg_map.len);
 
+        // Compute the entry type fingerprint: for each guard_int/guard_float/
+        // guard_number/guard_table that guards a slot_load, record the
+        // (slot, type) pair.  This lets the dispatch loop skip non-matching
+        // traces without a trial entry.
+        var entry_guards: std.ArrayListUnmanaged(EntryGuard) = .empty;
+        // Covers OOM during the append loop (and a failing `toOwnedSlice`, which
+        // leaves the list intact). After `toOwnedSlice` succeeds the list owns
+        // nothing, so the freed slice gets its own errdefer below.
+        errdefer entry_guards.deinit(self.gpa);
+        for (fields.instrs, 0..) |ins, i| {
+            const egt: ?EntryGuardType = switch (ins.op) {
+                .guard_int => .int,
+                .guard_float => .float,
+                .guard_number => .number,
+                .guard_table => .table,
+                else => null,
+            };
+            if (egt) |ty| {
+                const ref: u32 = @intCast(ins.a);
+                if (ref < i and fields.instrs[ref].op == .slot_load) {
+                    const slot: u16 = @intCast(fields.instrs[ref].aux);
+                    try entry_guards.append(self.gpa, .{ .slot = slot, .ty = ty });
+                }
+            }
+        }
+        const guards_owned = try entry_guards.toOwnedSlice(self.gpa);
+        // Covers OOM in `create(Trace)` and the trailing `cache.append` (the
+        // `fields` errdefer above frees the IR arrays; this frees the fingerprint).
+        errdefer self.gpa.free(guards_owned);
+
         const t = try self.gpa.create(Trace);
         errdefer self.gpa.destroy(t);
         t.* = .{
@@ -601,6 +864,7 @@ pub const TraceState = struct {
             .instrs = fields.instrs,
             .consts = fields.consts,
             .entry_slots = fields.entry_slots,
+            .entry_guards = guards_owned,
         };
         try self.cache.append(self.gpa, t);
     }
@@ -680,6 +944,7 @@ pub const TraceState = struct {
     /// to resolve the `for_loop` back-edge target against the trace anchor.
     pub fn recordInstr(self: *TraceState, instr: Instr, regs: []const Value, proto: *const Proto, pc: u32) void {
         if (self.rec.instrs.items.len >= self.config.maxrecord) return self.abort(.too_long);
+        self.rec.cur_pc = pc;
         self.recordOne(instr, regs, proto, pc) catch self.abort(.alloc);
     }
 
@@ -752,9 +1017,20 @@ pub const TraceState = struct {
     // --- recording helpers -------------------------------------------------
 
     /// Append an IR instruction, returning its SSA ref (its index).
+    /// For simple type-guard ops (`guard_int`, `guard_float`, `guard_number`,
+    /// `guard_true`, `guard_false`), the current bytecode PC is stored in
+    /// `aux` so the executor can report which guard failed (per-guard PC
+    /// recording for exit-PC chaining). Other ops keep their caller-set `aux`.
     fn emit(self: *TraceState, ins: IrInstr) !Ref {
+        var ins_mut = ins;
+        switch (ins_mut.op) {
+            .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => {
+                ins_mut.aux = @intCast(self.rec.cur_pc);
+            },
+            else => {},
+        }
         const ref: Ref = @intCast(self.rec.instrs.items.len);
-        try self.rec.instrs.append(self.gpa, ins);
+        try self.rec.instrs.append(self.gpa, ins_mut);
         return ref;
     }
 
@@ -1160,6 +1436,11 @@ pub const Recorder = struct {
     /// sentinel means "unknown" (while / generic-`for` / a passed-through `for`),
     /// so nothing is filtered and behavior is unchanged.
     locals_watermark: u32 = std.math.maxInt(u32),
+    /// Bytecode PC of the instruction currently being recorded. Set by
+    /// `recordInstr` before `recordOne`; `emit` stores it in the `aux`
+    /// field of guard instructions so the executor can report *which*
+    /// guard failed (per-guard PC recording for exit-PC chaining).
+    cur_pc: u32 = 0,
 
     pub fn deinit(self: *Recorder, gpa: std.mem.Allocator) void {
         self.instrs.deinit(gpa);
@@ -1311,7 +1592,7 @@ test "writeTrace renders a hand-built counting-loop trace" {
         .anchor = .{ .proto = &proto, .pc = 5 },
         .instrs = &instrs,
         .consts = &.{},
-        .entry_slots = &entry,
+        .entry_slots = &entry, .entry_guards = &.{},
     };
 
     var buf: [512]u8 = undefined;
@@ -1591,4 +1872,239 @@ test "recArraySet aborts (C1 control channel): a const store after any packed re
     state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), &regs, &proto, 0);
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
+}
+
+test "per-guard PC recording: guard_int aux carries the bytecode PC" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    // A 3-register frame: r0=r1+r2, both ints, at PC 42.
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    const regs = [_]Value{ Value.nil(), Value.int(10), Value.int(20) };
+    state.recordInstr(Instr.opABC(.add, 0, 1, 2), &regs, &proto, 42);
+
+    try testing.expect(state.isRecording());
+    const ops = state.rec.instrs.items;
+    // Expected: slot_load(r1), slot_load(r2), guard_int(r1), guard_int(r2), add
+    try testing.expectEqual(@as(usize, 5), ops.len);
+    try testing.expectEqual(IrOp.slot_load, ops[0].op);
+    try testing.expectEqual(IrOp.slot_load, ops[1].op);
+    try testing.expectEqual(IrOp.guard_int, ops[2].op);
+    try testing.expectEqual(@as(i32, 42), ops[2].aux); // PC stored in aux
+    try testing.expectEqual(IrOp.guard_int, ops[3].op);
+    try testing.expectEqual(@as(i32, 42), ops[3].aux); // PC stored in aux
+    try testing.expectEqual(IrOp.add, ops[4].op);
+    try testing.expectEqual(@as(i32, 0), ops[4].aux); // add doesn't use aux
+}
+
+test "per-guard PC recording: guard_true aux carries the branch PC" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // r0 is truthy (int 1), so jmp_if_false emits guard_true at PC 7.
+    const regs = [_]Value{ Value.int(1), Value.nil() };
+    state.recordInstr(Instr.opABC(.jmp_if_false, 0, 0, 0), &regs, &proto, 7);
+
+    try testing.expect(state.isRecording());
+    const ops = state.rec.instrs.items;
+    // Expected: slot_load(r0), guard_true
+    try testing.expectEqual(@as(usize, 2), ops.len);
+    try testing.expectEqual(IrOp.slot_load, ops[0].op);
+    try testing.expectEqual(IrOp.guard_true, ops[1].op);
+    try testing.expectEqual(@as(i32, 7), ops[1].aux); // PC stored in aux
+}
+
+test "tryChainExit: chains to a trace at the guard's exit PC" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    // Trace A at PC 10: a guard that will "fail" (we fake the failure by
+    // calling tryChainExit directly).  Its guard_int has aux=20 to point
+    // at Trace B's anchor.
+    var entry_a = [_]u16{0};
+    const instrs_a = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0: r0
+        .{ .op = .guard_int, .a = 0, .aux = 20 }, // %1: guard r0, aux=exit PC 20
+        .{ .op = .loop }, // %2
+    };
+    const consts_a = [_]Value{};
+    var trace_a = try gpa.create(Trace);
+    trace_a.* = .{
+        .anchor = .{ .proto = undefined, .pc = 10 },
+        .instrs = @constCast(&instrs_a),
+        .consts = @constCast(&consts_a),
+        .entry_slots = &entry_a, .entry_guards = &.{},
+    };
+
+    // Trace B at PC 20: a simple counting loop (r0 from 0 to 3).
+    var entry_b = [_]u16{ 0, 1 };
+    const instrs_b = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0: r0 (counter)
+        .{ .op = .slot_load, .aux = 1 }, // %1: r1 (limit)
+        .{ .op = .guard_int, .a = 0, .aux = 20 }, // %2
+        .{ .op = .guard_int, .a = 1, .aux = 20 }, // %3
+        .{ .op = .konst, .aux = 0 }, // %4: 1
+        .{ .op = .add, .a = 0, .b = 4 }, // %5: r0 + 1
+        .{ .op = .lt, .a = 5, .b = 1 }, // %6: (r0+1) < limit
+        .{ .op = .guard_true, .a = 6, .aux = 20 }, // %7
+        .{ .op = .phi, .a = 0, .b = 5, .aux = 0, .ty = .int }, // %8: r0 ← r0+1
+        .{ .op = .loop }, // %9
+    };
+    const consts_b = [_]Value{ Value.int(1) };
+    var trace_b = try gpa.create(Trace);
+    trace_b.* = .{
+        .anchor = .{ .proto = undefined, .pc = 20 },
+        .instrs = @constCast(&instrs_b),
+        .consts = @constCast(&consts_b),
+        .entry_slots = &entry_b, .entry_guards = &.{},
+    };
+
+    // Put both traces in the cache.
+    try state.cache.append(gpa, trace_a);
+    try state.cache.append(gpa, trace_b);
+
+    // Set proto on anchors (needed for findTrace lookup).
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
+    trace_a.anchor.proto = &proto;
+    trace_b.anchor.proto = &proto;
+
+    // Regs: r0=0, r1=4 → Trace B should run 3 iterations (0,1,2;
+    // iteration 3 computes 3<4 which is true, runs, then 4<4 fails).
+    var regs = [_]Value{ Value.int(0), Value.int(4) };
+
+    // Fake a guard failure in Trace A at instr index 1 (the guard_int).
+    const chained = state.tryChainExit(trace_a, 1, &proto, &regs);
+    try testing.expect(chained != null);
+    try testing.expectEqual(@as(usize, 3), chained.?); // Trace B ran 3 iters
+    try testing.expectEqual(@as(i64, 3), regs[0].asInt()); // r0 carried to 3
+
+    // Remove traces from cache before deinit — they have stack-allocated
+    // arrays that must not be freed by destroy().
+    state.cache.clearRetainingCapacity();
+    // Free the Trace heap allocations ourselves (instrs/consts/entry_slots
+    // are stack memory, so skip those fields by not calling destroy).
+    gpa.destroy(trace_a);
+    gpa.destroy(trace_b);
+}
+
+test "tryChainExit: an array-guard exit does NOT chain on its lane ordinal" {
+    // Regression: `guard_lane`/`guard_fits` store a lane ordinal in `aux`, not a
+    // bytecode PC. A first-iteration array-guard exit must resolve to "no chain"
+    // via `guardExitPc` — never be interpreted as a PC. Here the failing guard is
+    // a `guard_lane` whose `aux` (lane ordinal 2) collides with a real decoy trace
+    // anchored at pc 2; without the op gate, tryChainExit would execute the decoy
+    // against incoherent registers and silently miscompute.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
+
+    // Trace A: the failing trace. Its instr index 1 is a guard_lane with aux=2
+    // (a lane ordinal that happens to equal the decoy's anchor pc).
+    var entry_a = [_]u16{0};
+    const instrs_a = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0: r0 (the table)
+        .{ .op = .guard_lane, .a = 0, .aux = 2 }, // %1: lane ordinal 2 — NOT a PC
+        .{ .op = .loop }, // %2
+    };
+    const consts_a = [_]Value{};
+    const trace_a = try gpa.create(Trace);
+    trace_a.* = .{
+        .anchor = .{ .proto = &proto, .pc = 10 },
+        .instrs = @constCast(&instrs_a),
+        .consts = @constCast(&consts_a),
+        .entry_slots = &entry_a,
+        .entry_guards = &.{},
+    };
+
+    // Decoy trace anchored at pc 2 — a plain counting loop that, if (wrongly)
+    // entered, would commit iterations and mutate r0.
+    var entry_b = [_]u16{ 0, 1 };
+    const instrs_b = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0: r0
+        .{ .op = .slot_load, .aux = 1 }, // %1: r1
+        .{ .op = .konst, .aux = 0 }, // %2: 1
+        .{ .op = .add, .a = 0, .b = 2 }, // %3: r0+1
+        .{ .op = .lt, .a = 3, .b = 1 }, // %4: (r0+1) < r1
+        .{ .op = .guard_true, .a = 4, .aux = 2 }, // %5
+        .{ .op = .phi, .a = 0, .b = 3, .aux = 0, .ty = .int }, // %6: r0 ← r0+1
+        .{ .op = .loop }, // %7
+    };
+    const consts_b = [_]Value{Value.int(1)};
+    const trace_b = try gpa.create(Trace);
+    trace_b.* = .{
+        .anchor = .{ .proto = &proto, .pc = 2 }, // collides with the lane ordinal
+        .instrs = @constCast(&instrs_b),
+        .consts = @constCast(&consts_b),
+        .entry_slots = &entry_b,
+        .entry_guards = &.{},
+    };
+
+    try state.cache.append(gpa, trace_a);
+    try state.cache.append(gpa, trace_b);
+
+    var regs = [_]Value{ Value.int(0), Value.int(4) };
+    // The guard_lane is at instr index 1. It must NOT chain to the decoy at pc 2.
+    const chained = state.tryChainExit(trace_a, 1, &proto, &regs);
+    try testing.expect(chained == null);
+    try testing.expectEqual(@as(i64, 0), regs[0].asInt()); // r0 untouched — no decoy ran
+
+    state.cache.clearRetainingCapacity();
+    gpa.destroy(trace_a);
+    gpa.destroy(trace_b);
+}
+
+test "matchesFingerprint: empty fingerprint always matches" {
+    const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var regs = [_]Value{ Value.int(1), Value.float(3.14), Value.nil() };
+    try testing.expect(t.matchesFingerprint(&regs));
+}
+
+test "matchesFingerprint: matching types" {
+    const entry_guards = [_]EntryGuard{
+        .{ .slot = 0, .ty = .int },
+        .{ .slot = 1, .ty = .float },
+    };
+    const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
+    var regs = [_]Value{ Value.int(42), Value.float(3.14) };
+    try testing.expect(t.matchesFingerprint(&regs));
+}
+
+test "matchesFingerprint: mismatched int/float" {
+    const entry_guards = [_]EntryGuard{
+        .{ .slot = 0, .ty = .int },
+    };
+    const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
+    // Register holds a float, but the trace expects int.
+    var regs = [_]Value{ Value.float(2.5) };
+    try testing.expect(!t.matchesFingerprint(&regs));
+}
+
+test "matchesFingerprint: guard_number accepts both int and float" {
+    const entry_guards = [_]EntryGuard{
+        .{ .slot = 0, .ty = .number },
+    };
+    const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
+    try testing.expect(t.matchesFingerprint(&[_]Value{Value.int(1)}));
+    try testing.expect(t.matchesFingerprint(&[_]Value{Value.float(1.5)}));
+    try testing.expect(!t.matchesFingerprint(&[_]Value{Value.nil()}));
+    try testing.expect(!t.matchesFingerprint(&[_]Value{Value.boolean(true)}));
+}
+
+test "matchesFingerprint: guard_table" {
+    const entry_guards = [_]EntryGuard{
+        .{ .slot = 0, .ty = .table },
+    };
+    const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
+    try testing.expect(!t.matchesFingerprint(&[_]Value{Value.int(1)}));
+    try testing.expect(!t.matchesFingerprint(&[_]Value{Value.float(1.0)}));
 }

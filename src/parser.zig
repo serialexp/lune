@@ -7,8 +7,7 @@
 //! does not abort the whole parse. `error.OutOfMemory` propagates.
 //!
 //! Type annotations (`: T`) are parsed and retained but not interpreted (v1).
-//! Deferred (noted, not silent): call sugar `f"s"` / `f{...}`, `repeat/until`,
-//! `goto`/labels.
+//! Deferred (noted, not silent): call sugar `f"s"` / `f{...}`, `goto`/labels.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -123,7 +122,7 @@ const Parser = struct {
 
     fn atBlockEnd(self: *const Parser) bool {
         return switch (self.currentTag()) {
-            .eof, .keyword_end, .keyword_else, .keyword_elseif => true,
+            .eof, .keyword_end, .keyword_else, .keyword_elseif, .keyword_until => true,
             else => false,
         };
     }
@@ -174,6 +173,7 @@ const Parser = struct {
                 .keyword_local,
                 .keyword_if,
                 .keyword_while,
+                .keyword_repeat,
                 .keyword_for,
                 .keyword_function,
                 .keyword_do,
@@ -193,6 +193,7 @@ const Parser = struct {
             .keyword_local => self.parseLocal(),
             .keyword_if => self.parseIf(),
             .keyword_while => self.parseWhile(),
+            .keyword_repeat => self.parseRepeat(),
             .keyword_for => self.parseFor(),
             .keyword_do => self.parseDo(),
             .keyword_function => self.parseFunctionDecl(),
@@ -296,6 +297,16 @@ const Parser = struct {
         const body = try self.parseBlock();
         _ = try self.expect(.keyword_end, "expected 'end' to close 'while'");
         return .{ .span = self.spanFrom(start), .data = .{ .while_ = .{ .cond = cond, .body = body } } };
+    }
+
+    fn parseRepeat(self: *Parser) Error!Stmt {
+        const start = self.advance().start; // 'repeat'
+        const body = try self.parseBlock();
+        _ = try self.expect(.keyword_until, "expected 'until' to close 'repeat'");
+        // The condition is parsed (and later compiled) in the body's scope: Lua
+        // permits `until` to reference locals declared inside the loop body.
+        const cond = try self.parseExpr(0);
+        return .{ .span = self.spanFrom(start), .data = .{ .repeat = .{ .body = body, .cond = cond } } };
     }
 
     fn parseFor(self: *Parser) Error!Stmt {

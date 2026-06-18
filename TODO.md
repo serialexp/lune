@@ -113,9 +113,57 @@ docs/design/05-native-codegen.md §Out of scope):
 Goal (Bart): pick a real LuaJIT benchmark to *work toward* end-to-end on lune, even
 if unrunnable today — it defines the feature roadmap. None of the bench/ programs
 run verbatim: they all need `tonumber`, `io.write`, `string.format`, `unpack`,
-generic-`for`/`pairs`, `repeat/until`, `math.*` — none of which lune has yet (lune's
-natives today: `print`, `clock`, `random`, `getenv`, `argc`, `argv`; no string/
-table/math/io modules; generic-for & repeat/until parsed-but-not-compiled).
+generic-`for`/`pairs`, `repeat/until`, `math.*`. lune now has most of these
+(`math.*`, `table.*` incl. `unpack`, `tonumber`/`string.format`/`io.write`,
+generic-`for` + `pairs`/`ipairs`/`next`, `repeat/until`, and bare varargs `...` —
+see below). Remaining vararg work: named `...rest` (`#rest`/`rest[i]`), keyframe
+persistence, and `{...}`/`{f()}` table-spread.
+
+### ~~Generic-`for` + `pairs`/`ipairs`/`next` (deterministic iteration)~~ — DONE
+`for v1..vn in explist` now compiles (`compiler.compileGenericFor` → one new
+`tfor_loop` opcode; the per-iteration iterator call is a real bytecode `.call`, so
+closures and natives both work with no VM re-entrancy). The basic-library iterators
+live in `src/stdlib/base.zig`: `next`/`pairs`/`ipairs` plus a hidden `@ipairs_iter`
+(un-spellable name, GC-root + keyframe-restorable by name). `next` walks the array
+part ascending then the hash part in **canonical key order** (tag → heap id → bits),
+lifted into `src/key_order.zig` and shared with the keyframe serializer — so a
+mid-iteration snapshot resumes the exact same traversal (F2c corpus covers it).
+First cut sorts the hash keys **on each `next` call** (correct, trivially
+snapshot-safe). **Follow-up:** a per-table lazily-built sorted-key cache for `next`,
+invalidated at the four hash key-set mutation sites — pure perf, behind the same
+D1-D9 tests.
+
+### ~~`repeat ... until cond` (post-test loop)~~ — DONE
+`repeat`/`until` are now lexer keywords, an `ast.repeat` node, a parser
+`parseRepeat`, and `compiler.compileRepeat` (no new opcode — reuses
+`jmp_if_false` as a backward branch, the post-test mirror of `while`). The Lua
+subtlety that `until`'s condition sees locals declared in the body is handled by
+reserving the condition register *below* the body scope so it survives `endScope`'s
+register pop, letting `endScope` close per-iteration upvalue cells normally before
+the back-edge. Covered by compiler unit tests, an all-modes e2e, and a mid-loop
+keyframe resume in the F2c corpus.
+
+### ~~Bare varargs `...` (zero-copy stack cursor)~~ — V1+V2 DONE
+A vararg function's surplus arguments already sit in a stable, GC-rooted region of
+the shared `stack` (the `.call` ABI copies only `num_params` and *drops* the rest,
+but never reallocates the slab), so varargs are a **zero-copy cursor**
+`(varargs_base, varargs_count)` on `CallFrame` — no heap object, no new `Value`
+kind, no allocation. Four opcodes read the current frame's cursor: `vararg_first`
+(single-value position), `vararg_len` (`#`), `vararg_get` (1-based, bounds-checked
+index), and `vararg_spread` (the dynamic-`reg_top` multret producer, bounded vs
+`stack.len`). The compiler lowers bare `...`: first-value in single position,
+per-slot `vararg_get` with constant indices for a destructure (`local a,b = ...`,
+nil-padded), and `vararg_spread` + a consuming `call`/`ret` in every expanding
+position — forward `f(...)`, `g(x, ...)`, `obj:m(...)`, `return ...`, and a nested
+`f(g(...))` (the trailing-arg expansion was unified into `compileArgList` /
+`compileMethodArgs` so an inner call's own trailing `...` also spreads). `(...)`
+truncates to one value via the existing `.paren` node. `...` outside a vararg
+function is a clean compile error. Trace recorder aborts (`nyi_opcode`) on the four
+opcodes, so vararg functions never form a trace. Covered by V1 VM unit tests,
+compiler diagnostics, three all-modes e2e programs, and a determinism-corpus entry.
+**Remaining:** V3 named `...rest` (`#rest`/`rest[i]` + capture diagnostic), V4
+keyframe persistence (frame schema + version bump + suspend-in-vararg F2c), and the
+`{...}`/`{f()}` table-spread follow-up (also fixes the latent `{f()}` bug).
 
 **Recommended target: `nsieve.lua`** — integer + boolean + tables, numeric-`for` hot
 loops; closest to lune's int/bool tier-1b strength and drives the natural next
@@ -200,6 +248,20 @@ Now-unblocked follow-ons (separate from the v8 replay work): a *structural*
 divergence view in `diff.ts` (decode both sides, show the first differing field)
 and a keyframe/effect inspector panel.
 
+
+## viz `diff.test.ts` "wasm ≡ native" fails — `arg` global heap divergence (host setup)
+
+The cross-engine byte-identity test (`viz/test/diff.test.ts`) fails on every
+integer/float case. Root-caused (not E0): the **native** host (`main.zig`)
+populates an `arg` global table from process args, while the **wasm** host
+(`wasm_entry.zig`) injects a null env/args source (argc=0, argv=nil). So the
+native keyframe carries one extra heap object (the `arg` table, +44 bytes) the
+wasm keyframe lacks — even for a no-trace program like `print(1)`. Trace bytes
+are byte-identical across engines; only the keyframe heap differs. This is the
+env/args stdlib feature (tasks #98–102/#132–137), not the trace/phi work.
+**Fix (concurrent stdlib task's call):** either have the wasm host also build an
+empty `arg` table, or teach the diff test to tolerate the host-injected `arg`
+global. Flagged here per Rule #10; left for that task's owner.
 
 ## tier-1b: "CSE-able body" / "multi-var" bench programs fall back to tier-1a
 Confirmed via instrumentation: both bail in **`proveKinds`** (the stage cut-2 did

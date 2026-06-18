@@ -805,15 +805,15 @@ test "tropt E1: hoisting preserves behaviour (optimized ≡ unoptimized over a b
     // Each clean iteration: acc += 12, cnt -= 1; the 6th reads cnt==0 → DivByZero
     // side-exit. Expect 5 commits, acc=60, cnt=0 in BOTH the unoptimized and the
     // LICM-optimized run — a divergence would mean the hoist changed a value.
-    const unopt = trace.Trace{ .anchor = undefined, .instrs = &t.instrs, .consts = &t.consts, .entry_slots = &.{} };
-    const opted = trace.Trace{ .anchor = undefined, .instrs = opt.instrs, .consts = opt.consts, .entry_slots = opt.entry_slots };
+    const unopt = trace.Trace{ .anchor = undefined, .instrs = &t.instrs, .consts = &t.consts, .entry_slots = &.{}, .entry_guards = &.{} };
+    const opted = trace.Trace{ .anchor = undefined, .instrs = opt.instrs, .consts = opt.consts, .entry_slots = opt.entry_slots, .entry_guards = &.{} };
 
     var regs_u = [5]Value{ Value.int(3), Value.int(4), Value.int(0), Value.int(5), Value.int(0) };
     var regs_o = regs_u;
     var vals_u: [16]Value = undefined;
     var vals_o: [16]Value = undefined;
-    const done_u = irinterp.execute(&unopt, &regs_u, &vals_u);
-    const done_o = irinterp.execute(&opted, &regs_o, &vals_o);
+    const done_u = irinterp.execute(&unopt, &regs_u, &vals_u).completed;
+    const done_o = irinterp.execute(&opted, &regs_o, &vals_o).completed;
 
     try testing.expectEqual(@as(usize, 5), done_u);
     try testing.expectEqual(done_u, done_o);

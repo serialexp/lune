@@ -52,6 +52,14 @@ const usage =
     \\                       machine code (or "unsupported") to stderr after the run.
     \\  --dump-traces        imply --trace and print every recorded trace's IR to
     \\                       stderr after the run.
+    \\  --trace-opportunities
+    \\                       imply --trace and analyse every trace for optimisation
+    \\                       waste signatures (dead carries, duplicate phis, …),
+    \\                       printing them to stderr after the run.
+    \\  --trace-hotguard <N>  imply --trace and override the guard-failure threshold
+    \\                       for side-trace recording (default 50).  When a specific
+    \\                       guard fails this many times, the next back-edge records
+    \\                       a side trace capturing the alternate path.
     \\  --emit-traces <file> imply --trace and serialize the recorded trace cache
     \\                       to <file> (binschema wire format) after the run.
     \\  --emit-keyframe <file>
@@ -93,6 +101,14 @@ const TraceOpts = struct {
     /// `--time`: print the VM execute-only wall time (the `vm.run` call alone) to
     /// stderr after the run. Mirrors the browser's execute-only timing readout.
     time: bool = false,
+    /// `--trace-opportunities`: imply `--trace` and run the trace-opportunity
+    /// detector on every recorded+optimized trace, printing waste signatures to
+    /// stderr after the run (like `--dump-traces` but for optimization signals).
+    opportunities: bool = false,
+    /// `--trace-hotguard <N>`: override the guard-failure threshold for side-trace
+    /// recording (default 50).  When a specific guard fails this many times, the
+    /// next back-edge records a side trace.
+    hotguard: ?u32 = null,
 };
 
 pub fn main(init: std.process.Init) u8 {
@@ -129,6 +145,19 @@ pub fn main(init: std.process.Init) u8 {
         } else if (std.mem.eql(u8, arg, "--dump-traces")) {
             topts.enabled = true;
             topts.dump = true;
+        } else if (std.mem.eql(u8, arg, "--trace-opportunities")) {
+            topts.enabled = true;
+            topts.opportunities = true;
+        } else if (std.mem.eql(u8, arg, "--trace-hotguard")) {
+            topts.enabled = true;
+            const val = it.next() orelse {
+                lune.io.eprint("lune: error: --trace-hotguard requires a numeric argument\n", .{});
+                return 2;
+            };
+            topts.hotguard = std.fmt.parseUnsigned(u32, val, 10) catch {
+                lune.io.eprint("lune: error: --trace-hotguard requires a numeric argument, got '{s}'\n", .{val});
+                return 2;
+            };
         } else if (std.mem.eql(u8, arg, "--emit-traces")) {
             topts.enabled = true;
             topts.emit_path = it.next() orelse {
@@ -214,6 +243,7 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     vm.trace.config.execute = topts.execute;
     vm.trace.config.optimize = topts.optimize;
     vm.trace.config.native_codegen = topts.native_codegen;
+    if (topts.hotguard) |v| vm.trace.config.hotguard = v;
     // Inject the native clock. The interpreter holds no platform clock of its own
     // (so the VM core stays portable, incl. wasm); the host that builds the VM —
     // here, the CLI — supplies one. This is the single place the OS clock syscall
@@ -290,6 +320,11 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // interleave with the program's stdout. The chunk is still alive here (its
     // `deinit` is deferred), so each trace's `anchor.proto` is valid.
     if (topts.dump) dumpTraces(&vm);
+
+    // --- dump trace-opportunity report (--trace-opportunities) --- to stderr.
+    // Each cached trace is analysed for waste signatures; findings are printed
+    // inline after the trace IR if --dump-traces is also active, or standalone.
+    if (topts.opportunities) dumpOpportunities(&vm);
 
     // --- dump compiled machine code (--dump-native) --- to stderr. Resolves each
     // trace's native compilation (forcing any not yet attempted), then hexdumps the
@@ -413,6 +448,34 @@ fn dumpTraces(vm: *lune.interp.Vm) void {
             lune.trace.writeTrace(w, t) catch {};
         }
     }
+    w.flush() catch {};
+}
+
+/// Run the trace-opportunity detector on every cached trace and print findings to
+/// stderr (for `--trace-opportunities`).
+fn dumpOpportunities(vm: *lune.interp.Vm) void {
+    const gpa = vm.gpa;
+    const w = lune.io.stderrWriter();
+    if (vm.trace.cache.items.len == 0) {
+        w.print("lune: (no traces — cannot run opportunity detector)\n", .{}) catch {};
+        w.flush() catch {};
+        return;
+    }
+
+    var total: usize = 0;
+    for (vm.trace.cache.items) |t| {
+        const findings = lune.troptdiag.analyze(gpa, t) catch {
+            w.print("lune: error: opportunity analysis OOM\n", .{}) catch {};
+            w.flush() catch {};
+            return;
+        };
+        defer lune.troptdiag.deinitFindings(gpa, findings);
+
+        w.print("trace {s}:{d}  waste opportunities:\n", .{ t.anchor.proto.name, t.anchor.pc }) catch {};
+        lune.troptdiag.writeFindings(w, t, findings) catch {};
+        total += findings.len;
+    }
+    w.print("lune: {d} waste signature(s) across {d} trace(s)\n", .{ total, vm.trace.cache.items.len }) catch {};
     w.flush() catch {};
 }
 

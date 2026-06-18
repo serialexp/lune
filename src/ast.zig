@@ -167,6 +167,10 @@ pub const Stmt = struct {
         do: Block,
         /// `while c do ... end`
         while_: struct { cond: *Expr, body: Block },
+        /// `repeat ... until c`. The `cond` is evaluated in the scope of `body`'s
+        /// locals (Lua lets `until` reference variables declared in the body), so
+        /// the compiler keeps the body scope open across the condition.
+        repeat: struct { body: Block, cond: *Expr },
         /// `if c then ... elseif ... else ... end`
         if_: struct { branches: []const Branch, else_body: ?Block },
         /// `for i = a, b, c do ... end`

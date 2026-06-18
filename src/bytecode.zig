@@ -90,6 +90,13 @@ pub const OpCode = enum(u8) {
     ///             the loop variable R[a+3] and `pc += aux` (back-edge to the
     ///             body). Otherwise fall through (loop done).
     for_loop,
+    /// `a, aux`    generic-for test+continue. The preceding `call` has already
+    ///             written the loop variables into R[a+3..]. If the first loop
+    ///             variable R[a+3] is **not nil** (Lua stops only on nil; `false`
+    ///             continues), copy it to the control slot R[a+2] and `pc += aux`
+    ///             (back-edge to the body). Otherwise fall through (loop done).
+    ///             Unlike `for_loop` it computes nothing — the iterator call did.
+    tfor_loop,
 
     // ---- tables   (Increment B/E) ----
     /// `a`         R[a] = {}   (new empty table)
@@ -122,6 +129,21 @@ pub const OpCode = enum(u8) {
     call,
     /// `a, b`      return `b` values from R[a..a+b]. `b == 0` is "no values".
     ret,
+
+    // ---- varargs (Phase 3d2) — read the current frame's `...` cursor ----
+    /// `a`         R[a] = the first vararg, or nil if there are none. Emitted
+    ///             when `...` / a named vararg appears in single-value position.
+    vararg_first,
+    /// `a`         R[a] = int(vararg count). Emitted for `#name` on a named vararg.
+    vararg_len,
+    /// `a, b`      R[a] = (1 <= R[b] <= count) ? vararg[R[b]] : nil. 1-based,
+    ///             bounds-checked. Emitted for `name[i]` on a named vararg.
+    vararg_get,
+    /// `a`         spread all varargs into R[a..a+count) and set `reg_top` to their
+    ///             end (the dynamic-multret producer half — same protocol as a
+    ///             trailing `call`/native). Emitted in expanding positions: the last
+    ///             call arg, the return list, the last of a multi-assign.
+    vararg_spread,
 
     // ---- misc ----
     /// Stop top-level execution (implicit final instruction of the main chunk).
@@ -244,7 +266,7 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
     switch (instr.op) {
         .halt => {},
         .jmp => try w.print(" {d:>4}", .{instr.aux}),
-        .load_nil, .new_table, .close_upvalues => try w.print(" r{d}", .{instr.a}),
+        .load_nil, .new_table, .close_upvalues, .vararg_first, .vararg_len, .vararg_spread => try w.print(" r{d}", .{instr.a}),
         .load_int => try w.print(" r{d}  {d}", .{ instr.a, instr.aux }),
         .jmp_if_false, .jmp_if_true, .for_prep, .for_loop => try w.print(" r{d}  {d:>4}", .{ instr.a, instr.aux }),
         .load_bool,
@@ -260,6 +282,7 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
         .get_upval,
         .set_upval,
         .ret,
+        .vararg_get,
         => try w.print(" r{d}  {d}", .{ instr.a, instr.b }),
         else => try w.print(" r{d}  {d}  {d}", .{ instr.a, instr.b, instr.c }),
     }

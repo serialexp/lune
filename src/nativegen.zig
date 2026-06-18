@@ -2140,7 +2140,7 @@ fn expectMatch(t: *const Trace, regs_init: []const Value) !void {
     defer testing.allocator.free(iregs);
     const values = try testing.allocator.alloc(Value, t.instrs.len);
     defer testing.allocator.free(values);
-    const icompleted = irinterp.execute(t, iregs, values);
+    const iresult = irinterp.execute(t, iregs, values);
 
     // Native: must compile (caller picks compilable traces) and match bit-for-bit.
     var ct = compile(testing.allocator, t) orelse return error.NativeBailedUnexpectedly;
@@ -2149,7 +2149,7 @@ fn expectMatch(t: *const Trace, regs_init: []const Value) !void {
     defer testing.allocator.free(nregs);
     const ncompleted = ct.run(nregs);
 
-    try testing.expectEqual(icompleted, ncompleted);
+    try testing.expectEqual(iresult.completed, ncompleted);
     try expectRegsEqual(iregs, nregs);
 }
 
@@ -2183,7 +2183,7 @@ test "nativegen: clean integer counting loop matches the interpreter" {
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
     // i=1..5: commits 4 iterations (1+2+3+4=10), exits when i==5 (5<5 false).
     try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.int(0) });
@@ -2224,7 +2224,7 @@ test "nativegen(E2): an internal φ (slot-less carry) matches the oracle and is 
     };
     var consts = [_]Value{ Value.int(100), Value.int(1), Value.int(10) };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
     // i=0..5, limit=5: m runs 100,110,...,140; acc = 100+110+120+130+140 = 600.
     try expectMatch(&t, &.{ Value.int(0), Value.int(5), Value.int(0) });
@@ -2240,7 +2240,7 @@ test "nativegen(E2): an internal φ (slot-less carry) matches the oracle and is 
         var regs = [_]Value{ Value.int(0), Value.int(5), Value.int(0) };
         const values = try testing.allocator.alloc(Value, instrs.len);
         defer testing.allocator.free(values);
-        const completed = irinterp.execute(&t, &regs, values);
+        const completed = irinterp.execute(&t, &regs, values).completed;
         try testing.expectEqual(@as(usize, 5), completed);
         try testing.expectEqual(@as(i64, 5), regs[0].asInt()); // i
         try testing.expectEqual(@as(i64, 5), regs[1].asInt()); // limit
@@ -2280,7 +2280,7 @@ test "nativegen(E2): a FLOAT internal φ (the SR `denom` shape) carries in an XM
     };
     var consts = [_]Value{ Value.float(1.0), Value.int(1), Value.float(2.0) };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
     // i=0..4, limit=4: denom = 1,3,5,7; acc = 1+3+5+7 = 16.0.
     try expectMatch(&t, &.{ Value.int(0), Value.int(4), Value.float(0.0) });
@@ -2292,7 +2292,7 @@ test "nativegen(E2): a FLOAT internal φ (the SR `denom` shape) carries in an XM
         var regs = [_]Value{ Value.int(0), Value.int(4), Value.float(0.0) };
         const values = try testing.allocator.alloc(Value, instrs.len);
         defer testing.allocator.free(values);
-        const completed = irinterp.execute(&t, &regs, values);
+        const completed = irinterp.execute(&t, &regs, values).completed;
         try testing.expectEqual(@as(usize, 4), completed);
         try testing.expectEqual(@as(i64, 4), regs[0].asInt());
         try testing.expectEqual(@as(f64, 16.0), regs[2].asFloat());
@@ -2315,7 +2315,7 @@ test "nativegen: a guard_int failure side-exits with completed==0" {
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     // limit is a float → guard_int #3 fails on the very first iteration.
     try expectMatch(&t, &.{ Value.int(0), Value.float(5.0) });
 }
@@ -2337,7 +2337,7 @@ test "nativegen: a loop-carried boolean is boxed with the boolean tag" {
     };
     var consts = [_]Value{ Value.int(10), Value.int(1) };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     // r1 must end as boolean(true) (tag=1), NOT int(1) (tag=2) — the oracle catches it.
     try expectMatch(&t, &.{ Value.int(0), Value.nil() });
 }
@@ -2358,7 +2358,7 @@ test "nativegen: guard_true on an integer always passes (int 0 is truthy)" {
     };
     var consts = [_]Value{ Value.int(3), Value.int(1) };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     // i=0,1,2 commit (guard_true on int 0 must NOT exit); exits at i=3. completed==3.
     try expectMatch(&t, &.{Value.int(0)});
 }
@@ -2374,7 +2374,7 @@ test "nativegen: guard_false on an integer side-exits immediately" {
     };
     var consts = [_]Value{};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectMatch(&t, &.{Value.int(5)}); // completed==0, regs unchanged
 }
 
@@ -2404,7 +2404,7 @@ test "nativegen(F1): float-accumulate loop matches the strict-FP oracle (movq co
     };
     var consts = [_]Value{ Value.float(0.1), Value.int(1) };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     // 0.1 is not exactly representable: native must accumulate it bit-identically to
     // the oracle's strict-FP addsd (the classic 0.1-drift). 10 iterations.
     try expectMatch(&t, &.{ Value.int(0), Value.int(10), Value.float(0.0) });
@@ -2434,7 +2434,7 @@ test "nativegen(F1): mixed int+float add promotes the int operand via cvtsi2sd" 
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     // i=1..4 → acc = 1+2+3+4 = 10.0 (exact). cvtsi2sd round-to-nearest matches @floatFromInt.
     try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.float(0.0) });
     // A larger run whose partial sums are non-exact once divided would also match,
@@ -2467,7 +2467,7 @@ test "nativegen(F1): float sub and mul preserve operand order, bit-exact" {
     };
     var consts = [_]Value{ Value.float(1.5), Value.float(0.25), Value.int(1) };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectMatch(&t, &.{ Value.int(0), Value.int(6), Value.float(1.0) });
     try expectMatch(&t, &.{ Value.int(0), Value.int(3), Value.float(-2.0) });
 }
@@ -2495,7 +2495,7 @@ test "nativegen(F1): a carried slot loaded float but stored int bails (lk != sk)
     var consts = [_]Value{Value.int(1)};
     // slot 2 carried: load=float(ref6), store=int(ref9) → mismatch.
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectBail(&t);
 }
 
@@ -2519,7 +2519,7 @@ test "nativegen(F1): a malformed int+int add stamped ty=.float bails (no float/i
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectBail(&t);
 }
 
@@ -2551,7 +2551,7 @@ fn expectFloatCmp(op: trace.IrOp, x: f64, y: f64) !void {
     var consts = [_]Value{ Value.int(1), Value.int(1) };
     // slot 3 = the bool result (write-only); slot 0 = the counter (carried).
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectMatch(&t, &.{ Value.int(0), Value.float(x), Value.float(y), Value.nil() });
 }
 
@@ -2613,7 +2613,7 @@ test "nativegen(F2): a float-controlled while loop compiles (ucomisd drives guar
     };
     var consts = [_]Value{Value.float(1.5)};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     // x: 0.0, 1.5, 3.0, 4.5 (<5), then 6.0 (>=5) → 4 commits.
     try expectMatch(&t, &.{ Value.float(0.0), Value.float(5.0) });
     // Already past the limit → 0 commits, x flushed unchanged as a float.
@@ -2644,7 +2644,7 @@ test "nativegen(F2): a mixed int/float compare bails (oracle compares exactly, n
     };
     var consts = [_]Value{ Value.int(1), Value.int(1) };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectBail(&t);
 }
 
@@ -2677,7 +2677,7 @@ fn expectFloatDiv(x: f64, y: f64) !void {
     var consts = [_]Value{ Value.int(1), Value.int(1) };
     // slot 3 is write-only float (the quotient); slot 0 is the int counter.
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     // regs: i=0, x, y, slot3=placeholder (overwritten by the quotient each iteration).
     try expectMatch(&t, &.{ Value.int(0), Value.float(x), Value.float(y), Value.float(0.0) });
 }
@@ -2716,7 +2716,7 @@ test "nativegen(F3): a float-accumulate loop dividing by a constant matches (car
     };
     var consts = [_]Value{ Value.float(3.0), Value.int(1) };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectMatch(&t, &.{ Value.int(0), Value.int(8), Value.float(1.0) });
     try expectMatch(&t, &.{ Value.int(3), Value.int(3), Value.float(1.0) }); // 0 iters, acc flushed unchanged
 }
@@ -2746,7 +2746,7 @@ test "nativegen(F3): int/int division yields a float via cvtsi2sd on both operan
     };
     var consts = [_]Value{ Value.int(1), Value.int(1) };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectMatch(&t, &.{ Value.int(0), Value.int(7), Value.int(2), Value.float(0.0) }); // 7/2 = 3.5
     try expectMatch(&t, &.{ Value.int(0), Value.int(6), Value.int(3), Value.float(0.0) }); // 6/3 = 2.0 (exact)
     try expectMatch(&t, &.{ Value.int(0), Value.int(1), Value.int(0), Value.float(0.0) }); // 1/0 = +inf
@@ -2782,7 +2782,7 @@ test "nativegen: derived guard_int on int arithmetic compiles and matches (#1)" 
     };
     var consts = [_]Value{ Value.int(7), Value.int(1) };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     // i=1,2,3 commit: acc = 8^2+9^2+10^2 = 245; exits at i==4.
     try expectMatch(&t, &.{ Value.int(1), Value.int(4), Value.int(0) });
     // 0 commits (i already == limit): regs unchanged.
@@ -2804,7 +2804,7 @@ test "nativegen: bails on unsupported traces" {
             .{ .op = .loop },
         };
         var consts = [_]Value{Value.float(1.5)};
-        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
         try expectBail(&t);
     }
     // (b) a slot_load with no covering guard_int.
@@ -2817,7 +2817,7 @@ test "nativegen: bails on unsupported traces" {
             .{ .op = .loop },
         };
         var consts = [_]Value{Value.int(1)};
-        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
         try expectBail(&t);
     }
     // (c) guard_number (a float passes it → can't prove int).
@@ -2828,7 +2828,7 @@ test "nativegen: bails on unsupported traces" {
             .{ .op = .loop },
         };
         var consts = [_]Value{};
-        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
         try expectBail(&t);
     }
     // (d) a deferred op (mod — div now compiles via the XMM path, F3; mod still
@@ -2843,7 +2843,7 @@ test "nativegen: bails on unsupported traces" {
             .{ .op = .loop },
         };
         var consts = [_]Value{Value.int(2)};
-        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
         try expectBail(&t);
     }
     // (e) [#1] a guard_int on a *bool* (a compare result) is not discharge-able →
@@ -2859,7 +2859,7 @@ test "nativegen: bails on unsupported traces" {
             .{ .op = .loop }, // 5
         };
         var consts = [_]Value{Value.int(5)};
-        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
         try expectBail(&t);
     }
 }
@@ -2901,7 +2901,7 @@ test "nativegen win2: accumulator coalesces when no guard follows the update" {
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try testing.expect(try slotCoalesced(&t, 2)); // acc, left-operand home
     try testing.expect(try slotCoalesced(&t, 0)); // i,  left-operand home
     try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.int(0) });
@@ -2930,7 +2930,7 @@ test "nativegen win2: a guard AFTER the accumulation blocks coalescing (cond 1)"
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try testing.expect(!(try slotCoalesced(&t, 2))); // acc must NOT coalesce
     try testing.expect(!(try slotCoalesced(&t, 0))); // i  must NOT coalesce
     // i=1,limit=5 → exits at the guard when i+1==5<5 false; acc/i restored to header.
@@ -2962,7 +2962,7 @@ test "nativegen win2: old value still live blocks coalescing (cond 2)" {
     var consts = [_]Value{Value.int(1)};
     // slot3 := acc_old (%6), still reading the old acc at the back-edge.
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try testing.expect(!(try slotCoalesced(&t, 2))); // acc's old value is still live
     try expectMatch(&t, &.{ Value.int(1), Value.int(4), Value.int(0), Value.int(-1) });
 }
@@ -2988,7 +2988,7 @@ test "nativegen win2: commutative-right home coalesces; non-commutative-right do
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const ta = Trace{ .anchor = undefined, .instrs = &add_instrs, .consts = &consts, .entry_slots = &es };
+    const ta = Trace{ .anchor = undefined, .instrs = &add_instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try testing.expect(try slotCoalesced(&ta, 2));
     try expectMatch(&ta, &.{ Value.int(1), Value.int(5), Value.int(0) });
 
@@ -3012,7 +3012,7 @@ test "nativegen win2: commutative-right home coalesces; non-commutative-right do
         .{ .op = .loop }, // 12
     };
     var consts2 = [_]Value{ Value.int(1), Value.int(100) };
-    const ts = Trace{ .anchor = undefined, .instrs = &sub_instrs, .consts = &consts2, .entry_slots = &es };
+    const ts = Trace{ .anchor = undefined, .instrs = &sub_instrs, .consts = &consts2, .entry_slots = &es, .entry_guards = &.{} };
     try testing.expect(!(try slotCoalesced(&ts, 2)));
     try expectMatch(&ts, &.{ Value.int(1), Value.int(4), Value.int(0) });
 }
@@ -3041,7 +3041,7 @@ test "nativegen win2: unary into a carried slot whose operand is NOT its home" {
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try testing.expect(!(try slotCoalesced(&t, 2))); // x = -y must NOT coalesce into home(x)
     try expectMatch(&t, &.{ Value.int(0), Value.int(3), Value.int(0), Value.int(7) });
 }
@@ -3073,7 +3073,7 @@ test "nativegen win2: a coalesced result consumed by a later op is not scavenged
     var consts = [_]Value{ Value.int(1), Value.int(7) };
     // slot3 := acc_new band 7 (write-only); acc := acc+1; i := i+1.
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try testing.expect(try slotCoalesced(&t, 2)); // acc coalesces
     try expectMatch(&t, &.{ Value.int(0), Value.int(5), Value.int(0), Value.int(0) });
 }
@@ -3104,7 +3104,7 @@ test "nativegen win2: chained accumulators both coalesce (b reads new a)" {
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try testing.expect(try slotCoalesced(&t, 2)); // a
     try testing.expect(try slotCoalesced(&t, 3)); // b
     try expectMatch(&t, &.{ Value.int(0), Value.int(4), Value.int(10), Value.int(100) });
@@ -3136,7 +3136,7 @@ test "nativegen: a swap loop exercises a register home cycle" {
     var consts = [_]Value{Value.int(1)};
     // a<-b(ref8), b<-a(ref6), i<-i+1(ref11)
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     // a=10, b=20, i=0, limit=3: three swaps ⇒ a=20, b=10. The oracle is the judge.
     try expectMatch(&t, &.{ Value.int(10), Value.int(20), Value.int(0), Value.int(3) });
     // limit=0: zero iterations, no swap.
@@ -3170,7 +3170,7 @@ test "nativegen: operand-chain reuses one register across a left-folded sum" {
     };
     var consts = [_]Value{ Value.int(10), Value.int(100), Value.int(1) };
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectMatch(&t, &.{ Value.int(0), Value.int(4), Value.int(0) });
     try expectMatch(&t, &.{ Value.int(2), Value.int(2), Value.int(7) }); // zero iters
 }
@@ -3225,7 +3225,7 @@ test "nativegen: more carried+invariant slots than registers forces spilled home
 
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = ins.items, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = ins.items, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
     var regs: [13]Value = undefined;
     regs[0] = Value.int(0); // i
@@ -3257,7 +3257,7 @@ test "nativegen: analyze classifies slots and pins disjoint homes" {
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
     const kinds = try testing.allocator.alloc(Kind, instrs.len);
     defer testing.allocator.free(kinds);
@@ -3307,7 +3307,7 @@ test "nativegen: analyze rejects a type-unstable carried slot" {
     };
     var consts = [_]Value{Value.int(3)};
     var es = [_]u16{};
-    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es };
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
     const kinds = try testing.allocator.alloc(Kind, instrs.len);
     defer testing.allocator.free(kinds);
@@ -3410,7 +3410,7 @@ test "nativegen: bool-lane t[k] read scan matches the interpreter" {
         .{ .op = .loop }, // 11
     };
     var es = [_]u16{};
-    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
     // Start at 2 (first present): scans the whole dense run, bounds-exits past K.
     try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(2), Value.nil() });
@@ -3470,7 +3470,7 @@ test "nativegen: int-lane t[k] read scan matches the interpreter (i8/i16/i32/i64
             .{ .op = .loop }, // 11
         };
         var es = [_]u16{};
-        const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
+        const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
         try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(2), Value.nil() }); // full scan
         try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(1), Value.nil() }); // hole at key 1
@@ -3506,7 +3506,7 @@ test "nativegen: guard_table failure side-exits natively with completed==0" {
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
     // r0 is an int, not a table → the prologue guard_table check fails (completed==0,
     // regs untouched). The oracle agrees.
@@ -3537,7 +3537,7 @@ test "nativegen: an f64 array lane bails to tier-1a" {
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectBail(&tr);
 }
 
@@ -3566,7 +3566,7 @@ test "nativegen: a carried .ptr (table) slot bails (no int/ptr type confusion)" 
     var consts = [_]Value{Value.int(1)};
     // slot 0 (the table) carried as an int store → the type-confusion trigger.
     var es = [_]u16{};
-    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectBail(&tr);
 }
 
@@ -3594,7 +3594,7 @@ test "nativegen: guard_present/aload without a dominating guard_bounds bails" {
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectBail(&tr);
 }
 
@@ -3643,7 +3643,7 @@ fn boolWriteTrace(full: *[13]I, consts: *[2]Value, es: *[0]u16) Trace {
         .{ .op = .phi, .b = 10, .aux = 1 }, // 11: index carry (was exit_stores)
         .{ .op = .loop }, // 12
     };
-    return Trace{ .anchor = undefined, .instrs = full, .consts = consts, .entry_slots = es };
+    return Trace{ .anchor = undefined, .instrs = full, .consts = consts, .entry_slots = es, .entry_guards = &.{} };
 }
 
 test "nativegen: bool-lane t[k]=false write matches the interpreter (heap + regs)" {
@@ -3662,7 +3662,7 @@ test "nativegen: bool-lane t[k]=false write matches the interpreter (heap + regs
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const ocomp = irinterp.execute(&tr, &oregs, ovals);
+    const oresult = irinterp.execute(&tr, &oregs, ovals);
 
     const t_n = try buildBoolTable(gpa, K);
     defer t_n.destroy(gpa);
@@ -3671,7 +3671,7 @@ test "nativegen: bool-lane t[k]=false write matches the interpreter (heap + regs
     defer ct.deinit();
     const ncomp = ct.run(&nregs);
 
-    try testing.expectEqual(ocomp, ncomp);
+    try testing.expectEqual(oresult.completed, ncomp);
     // Only the carried index slot (r1) is comparable — r0 holds each run's distinct
     // table pointer (an invariant slot, never flushed), so it differs by construction.
     try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
@@ -3758,7 +3758,7 @@ fn intWriteTrace(full: *[14]I, consts: *[2]Value, es: *[0]u16, lane: i32, store_
         .{ .op = .phi, .b = 11, .aux = 1 }, // 12: index carry (was exit_stores)
         .{ .op = .loop }, // 13
     };
-    return Trace{ .anchor = undefined, .instrs = full, .consts = consts, .entry_slots = es };
+    return Trace{ .anchor = undefined, .instrs = full, .consts = consts, .entry_slots = es, .entry_guards = &.{} };
 }
 
 test "nativegen: int-lane t[k]=C write matches the interpreter (i8/i16/i32/i64)" {
@@ -3792,7 +3792,7 @@ test "nativegen: int-lane t[k]=C write matches the interpreter (i8/i16/i32/i64)"
         var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
         const ovals = try gpa.alloc(Value, tr.instrs.len);
         defer gpa.free(ovals);
-        const ocomp = irinterp.execute(&tr, &oregs, ovals);
+        const oresult = irinterp.execute(&tr, &oregs, ovals);
 
         const t_n = try buildIntTable(gpa, K, cfg.bump);
         defer t_n.destroy(gpa);
@@ -3801,7 +3801,7 @@ test "nativegen: int-lane t[k]=C write matches the interpreter (i8/i16/i32/i64)"
         defer ct.deinit();
         const ncomp = ct.run(&nregs);
 
-        try testing.expectEqual(ocomp, ncomp);
+        try testing.expectEqual(oresult.completed, ncomp);
         try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
         try expectTablesEqual(t_o, t_n, K);
         // Sanity: every present slot 2..K now reads the stored constant.
@@ -3851,7 +3851,7 @@ test "nativegen: int-lane astore guard_fits side-exits when the value overflows 
         .{ .op = .loop }, // 11
     };
     var es = [_]u16{};
-    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
     const start: i64 = 120; // 120..127 fit i8; 128 does not → exit on the 9th key
     const t_o = try makeT(gpa, K);
@@ -3859,7 +3859,7 @@ test "nativegen: int-lane astore guard_fits side-exits when the value overflows 
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(start) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const ocomp = irinterp.execute(&tr, &oregs, ovals);
+    const oresult = irinterp.execute(&tr, &oregs, ovals);
 
     const t_n = try makeT(gpa, K);
     defer t_n.destroy(gpa);
@@ -3868,8 +3868,8 @@ test "nativegen: int-lane astore guard_fits side-exits when the value overflows 
     defer ct.deinit();
     const ncomp = ct.run(&nregs);
 
-    try testing.expectEqual(@as(usize, 8), ocomp); // k = 120..127 committed, 128 exits
-    try testing.expectEqual(ocomp, ncomp);
+    try testing.expectEqual(@as(usize, 8), oresult.completed); // k = 120..127 committed, 128 exits
+    try testing.expectEqual(oresult.completed, ncomp);
     try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
     try expectTablesEqual(t_o, t_n, K);
 }

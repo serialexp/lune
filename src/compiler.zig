@@ -18,10 +18,12 @@
 //! instructions carry the capture plan in `Proto.upvalues`.
 //!
 //! Supported: expressions, locals, assignment, tables, indexing,
-//! `if`/`while`/numeric-`for`/`do`/`break`/`return`, globals, function
-//! literals/declarations/`local function`, calls and method calls, and upvalue
-//! closures. Not yet: multi-value spread from a call, varargs, and generic
-//! `for ... in` (diagnosed as unsupported).
+//! `if`/`while`/numeric-`for`/generic-`for`/`do`/`break`/`return`, globals,
+//! function literals/declarations/`local function`, calls and method calls, and
+//! upvalue closures, and varargs (`...`: spread/forward/destructure in
+//! expanding positions, first-value in single position; `...` outside a vararg
+//! function is diagnosed). Not yet: named varargs (`...rest`, `#rest`,
+//! `rest[i]`) and `{...}`/`{f()}` table-spread.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -480,6 +482,7 @@ const Compiler = struct {
                 try self.endScope();
             },
             .while_ => |w| try self.compileWhile(w),
+            .repeat => |r| try self.compileRepeat(r),
             .if_ => |f| try self.compileIf(f),
             .numeric_for => |nf| try self.compileNumericFor(nf),
             .return_ => |exprs| try self.compileReturn(exprs),
@@ -488,8 +491,7 @@ const Compiler = struct {
             .function_decl => |fd| try self.compileFunctionDecl(fd),
             .local_function => |lf| try self.compileLocalFunction(lf),
 
-            // Later phases.
-            .generic_for => return self.fail(s.span, "generic for is not supported yet"),
+            .generic_for => |gf| try self.compileGenericFor(gf),
         }
     }
 
@@ -563,6 +565,17 @@ const Compiler = struct {
             // next_reg == base + (n-1): the call's results land in place, filling
             // [base + (n-1), base + want).
             try self.compileCallInPlace(last, remaining);
+        } else if (last.data == .vararg) {
+            // `local a, b, c = x, ...` — fill the remaining slots with the first
+            // `remaining` varargs (`...[1..remaining]`), nil-padded. A constant
+            // index per slot keeps this in fixed registers (no dynamic reg_top).
+            try self.requireVararg(last.span);
+            var j: u16 = 0;
+            while (j < remaining) : (j += 1) {
+                const slot = try self.alloc1();
+                _ = try self.emit(Instr.opAx(.load_int, slot, j + 1));
+                _ = try self.emit(Instr.opAB(.vararg_get, slot, slot));
+            }
         } else {
             const r = try self.alloc1();
             try self.compileExprTo(last, r);
@@ -585,12 +598,8 @@ const Compiler = struct {
             .call => |c| {
                 _ = try self.alloc1(); // function slot at base; results land here
                 try self.compileExprTo(c.callee, base);
-                for (c.args) |arg| {
-                    const r = try self.alloc1();
-                    try self.compileExprTo(arg, r);
-                }
-                if (c.args.len > std.math.maxInt(u16)) return self.fail(expr.span, "too many arguments");
-                _ = try self.emit(Instr.opABC(.call, base, @intCast(c.args.len), nwanted));
+                // Reuse the spread-aware arg layout: a trailing call/`...` expands.
+                try self.compileArgList(c.args, base, expr.span, nwanted);
             },
             .method_call => |mc| {
                 _ = try self.alloc1(); // function slot at base
@@ -602,13 +611,7 @@ const Compiler = struct {
                 _ = try self.emit(Instr.opAB(.load_const, key, k));
                 _ = try self.emit(Instr.opABC(.get_index, base, self_reg, key));
                 self.freeTo(km); // free the key temp; fn + self stay
-                for (mc.args) |arg| {
-                    const r = try self.alloc1();
-                    try self.compileExprTo(arg, r);
-                }
-                const total = mc.args.len + 1; // implicit self
-                if (total > std.math.maxInt(u16)) return self.fail(expr.span, "too many arguments");
-                _ = try self.emit(Instr.opABC(.call, base, @intCast(total), nwanted));
+                try self.compileMethodArgs(base, mc.args, expr.span, nwanted);
             },
             else => unreachable, // guarded by isCall()
         }
@@ -618,6 +621,25 @@ const Compiler = struct {
         // immediately after, before allocating anything else. (`max_reg` already
         // covers the function + argument temporaries from the alloc1s above.)
         self.next_reg = if (nwanted == bytecode.all_results) base else base + nwanted;
+        if (self.next_reg > self.max_reg) self.max_reg = self.next_reg;
+    }
+
+    /// Fail unless the function being compiled is variadic. Gate for every use
+    /// of `...` (bare or named).
+    fn requireVararg(self: *Compiler, span: ast.Span) Error!void {
+        if (!self.is_vararg) return self.fail(span, "cannot use '...' outside a vararg function");
+    }
+
+    /// Emit a `vararg_spread` whose values land at the current `next_reg`, the
+    /// dynamic (`all_results`) sibling of `compileCallInPlace` for a trailing
+    /// `...`. The spread sets `reg_top`/`reg_top_pending`; the consuming
+    /// `call`/`ret` must be emitted immediately after, before any further
+    /// allocation. Postcondition: `next_reg == base` (dynamic count collapses
+    /// like the `all_results` call path). Caller verifies `is_vararg`.
+    fn compileSpreadInPlace(self: *Compiler) Error!void {
+        const base = self.next_reg;
+        _ = try self.emit(Instr.opA(.vararg_spread, base));
+        self.next_reg = base;
         if (self.next_reg > self.max_reg) self.max_reg = self.next_reg;
     }
 
@@ -665,6 +687,15 @@ const Compiler = struct {
                 try self.compileExprTo(e, r);
             }
             try self.compileCallInPlace(exprs[n - 1], bytecode.all_results);
+            _ = try self.emit(Instr.opAB(.ret, base, bytecode.all_results));
+        } else if (exprs[n - 1].data == .vararg) {
+            // `return a, ...` — forward every leading value then spread the rest.
+            try self.requireVararg(exprs[n - 1].span);
+            for (exprs[0 .. n - 1]) |e| {
+                const r = try self.alloc1();
+                try self.compileExprTo(e, r);
+            }
+            try self.compileSpreadInPlace();
             _ = try self.emit(Instr.opAB(.ret, base, bytecode.all_results));
         } else {
             for (exprs) |e| {
@@ -726,6 +757,37 @@ const Compiler = struct {
         self.patchBreaks(loop_idx);
     }
 
+    /// `repeat body until cond`. Runs the body, then loops back while `cond` is
+    /// false (exits when true) — the post-test mirror of `while`. The twist Lua
+    /// requires: `cond` is evaluated in the *body's* scope, so locals declared in
+    /// the body are visible to `until`. We reserve the condition register at `base`
+    /// (below the body scope) and keep it live across the whole iteration, so the
+    /// body's locals sit above it and `endScope` closes their upvalues normally
+    /// before the back-edge — each iteration gets fresh captured cells.
+    fn compileRepeat(self: *Compiler, r: anytype) Error!void {
+        const base = self.next_reg;
+        const loop_top = self.code.items.len;
+
+        const cr = try self.alloc1(); // condition slot, reserved across the body
+
+        // Body locals begin at base+1; `break` closes upvalues from there.
+        try self.loops.append(self.scratch, .{ .scope_base = base + 1 });
+        const loop_idx = self.loops.items.len - 1;
+
+        self.beginScope();
+        try self.compileBlock(r.body);
+        // `cond` sees the body's locals (still in scope); write it into `cr`,
+        // which lives below them and so survives `endScope`'s register pop.
+        try self.compileExprTo(r.cond, cr);
+        try self.endScope(); // pops body locals + closes their upvalues if captured
+
+        // Loop back while the condition is false; fall through (exit) when true.
+        try self.emitJumpTo(.jmp_if_false, cr, loop_top);
+
+        self.freeTo(base); // release the condition slot
+        self.patchBreaks(loop_idx);
+    }
+
     fn compileNumericFor(self: *Compiler, nf: anytype) Error!void {
         // Control registers: [idx, limit, step, var] — must be contiguous.
         const base = self.next_reg;
@@ -764,6 +826,56 @@ const Compiler = struct {
 
         self.patchBreaks(loop_idx);
         self.freeTo(base); // release the 4 control registers
+    }
+
+    /// `for v1..vn in explist do body end`. Layout mirrors `compileNumericFor`:
+    /// control registers [f(iterator), s(state), ctrl(control)] at `base..base+2`,
+    /// the loop variables `v1..vn` at `base+3..`. Each iteration calls
+    /// `f(s, ctrl)` (a real `.call`, so the iterator may be a native like `next`
+    /// *or* a user closure) wanting `n` results into the variable slots; the new
+    /// `tfor_loop` continues iff the first result is non-nil, publishing it as the
+    /// next `ctrl`. The iterator call window is `base+3,4,5`, so even for `n < 3`
+    /// we reserve `3 + max(n,3)` registers.
+    fn compileGenericFor(self: *Compiler, gf: anytype) Error!void {
+        const base = self.next_reg;
+        const n: u16 = @intCast(gf.names.len);
+
+        // [f, s, ctrl] from the explist, multret-adjusted to exactly 3.
+        try self.compileValuesInto(gf.exprs, base, 3);
+        // Reserve the loop-variable / iterator-call window (>= 3 slots).
+        const window: u16 = @max(n, 3);
+        var w: u16 = 0;
+        while (w < window) : (w += 1) _ = try self.alloc1();
+
+        // Jump forward to the test block (mirrors for_prep's forward jump).
+        const prep = try self.emitJump(.jmp, 0);
+        const body_start = self.code.items.len;
+
+        // Loop vars at base+3 are the lowest capturable registers in the loop
+        // scope, so `break` must close upvalues from there.
+        try self.loops.append(self.scratch, .{ .scope_base = @intCast(base + 3) });
+        const loop_idx = self.loops.items.len - 1;
+
+        self.beginScope();
+        for (gf.names, 0..) |name, i| {
+            try self.declareLocal(name, @intCast(base + 3 + i));
+        }
+        try self.compileBlock(gf.body);
+        try self.endScope();
+
+        // Test block (the forward-jmp target and the `tfor_loop` back-edge anchor;
+        // the body falls through into it). Copy f,s,ctrl up into the call window —
+        // f(base+0)/s(base+1) are never clobbered by the call, so they persist
+        // across iterations — then call f(s, ctrl) for n results, then test.
+        self.patchToHere(prep);
+        _ = try self.emit(Instr.opAB(.move, base + 3, base + 0));
+        _ = try self.emit(Instr.opAB(.move, base + 4, base + 1));
+        _ = try self.emit(Instr.opAB(.move, base + 5, base + 2));
+        _ = try self.emit(Instr.opABC(.call, base + 3, 2, n));
+        try self.emitJumpTo(.tfor_loop, base, body_start);
+
+        self.patchBreaks(loop_idx);
+        self.freeTo(base); // release control + variable/window registers
     }
 
     fn compileBreak(self: *Compiler, span: ast.Span) Error!void {
@@ -838,8 +950,12 @@ const Compiler = struct {
             .method_call => |mc| try self.compileMethodCall(mc.obj, mc.name, mc.args, dest, 1),
             .function => |body| try self.compileFunction(body, "anonymous", dest),
 
-            // Phase 3d2.
-            .vararg => return self.fail(e.span, "vararg is not supported yet (Phase 3d2)"),
+            // `...` in single-value position yields its *first* value (or nil).
+            // Tail/expanding positions are handled by the spread sites below.
+            .vararg => {
+                try self.requireVararg(e.span);
+                _ = try self.emit(Instr.opA(.vararg_first, dest));
+            },
         }
     }
 
@@ -1013,6 +1129,15 @@ const Compiler = struct {
             }
             try self.compileCallInPlace(args[n - 1], bytecode.all_results);
             _ = try self.emit(Instr.opABC(.call, base, bytecode.all_results, nwanted));
+        } else if (n >= 1 and args[n - 1].data == .vararg) {
+            // `f(a, ...)` — forward all of `...` as trailing arguments.
+            try self.requireVararg(args[n - 1].span);
+            for (args[0 .. n - 1]) |arg| {
+                const r = try self.alloc1();
+                try self.compileExprTo(arg, r);
+            }
+            try self.compileSpreadInPlace();
+            _ = try self.emit(Instr.opABC(.call, base, bytecode.all_results, nwanted));
         } else {
             for (args) |arg| {
                 const r = try self.alloc1();
@@ -1040,7 +1165,16 @@ const Compiler = struct {
         self.freeTo(km); // free the key temp; fn + self stay
 
         // `self` is already at base+1; lay out the explicit arguments after it.
-        // As with `compileArgList`, a trailing call expands (`all_results`).
+        try self.compileMethodArgs(base, args, obj.span, nwanted);
+        if (nwanted >= 1 and dest != base) _ = try self.emit(Instr.opAB(.move, dest, base));
+        self.freeTo(mark);
+    }
+
+    /// Lay out a method call's explicit arguments after the already-placed
+    /// `self` (at `base + 1`) and emit the `.call`. Like `compileArgList`, a
+    /// trailing call or `...` expands to `all_results`; otherwise `nargs` is the
+    /// explicit count plus the implicit `self`. The function sits at `base`.
+    fn compileMethodArgs(self: *Compiler, base: u16, args: []const *ast.Expr, span: ast.Span, nwanted: u16) Error!void {
         const n = args.len;
         if (n >= 1 and args[n - 1].isCall()) {
             for (args[0 .. n - 1]) |arg| {
@@ -1049,17 +1183,24 @@ const Compiler = struct {
             }
             try self.compileCallInPlace(args[n - 1], bytecode.all_results);
             _ = try self.emit(Instr.opABC(.call, base, bytecode.all_results, nwanted));
+        } else if (n >= 1 and args[n - 1].data == .vararg) {
+            // `obj:m(a, ...)` — `...` spreads as trailing arguments after `self`.
+            try self.requireVararg(args[n - 1].span);
+            for (args[0 .. n - 1]) |arg| {
+                const r = try self.alloc1();
+                try self.compileExprTo(arg, r);
+            }
+            try self.compileSpreadInPlace();
+            _ = try self.emit(Instr.opABC(.call, base, bytecode.all_results, nwanted));
         } else {
             for (args) |arg| {
                 const r = try self.alloc1();
                 try self.compileExprTo(arg, r);
             }
             const total = n + 1; // implicit self
-            if (total > std.math.maxInt(u16)) return self.fail(obj.span, "too many arguments");
+            if (total > std.math.maxInt(u16)) return self.fail(span, "too many arguments");
             _ = try self.emit(Instr.opABC(.call, base, @intCast(total), nwanted));
         }
-        if (nwanted >= 1 and dest != base) _ = try self.emit(Instr.opAB(.move, dest, base));
-        self.freeTo(mark);
     }
 
     /// `function a.b:m(...) ... end` — sugar for assigning a function literal to
@@ -1333,6 +1474,66 @@ test "while loop accumulates" {
     )).asInt());
 }
 
+test "repeat/until runs the body before testing and loops while false" {
+    // Sums 1..5: body runs first, exits once i reaches 5.
+    try testing.expectEqual(@as(i64, 15), (try runScalar(
+        \\local i = 0
+        \\local sum = 0
+        \\repeat
+        \\  i = i + 1
+        \\  sum = sum + i
+        \\until i >= 5
+        \\return sum
+    )).asInt());
+}
+
+test "repeat/until body runs at least once even when the condition is already true" {
+    try testing.expectEqual(@as(i64, 1), (try runScalar(
+        \\local n = 0
+        \\repeat
+        \\  n = n + 1
+        \\until true
+        \\return n
+    )).asInt());
+}
+
+test "repeat/until condition sees locals declared in the body" {
+    // `limit` is declared inside the body; Lua scopes it through `until`.
+    try testing.expectEqual(@as(i64, 4), (try runScalar(
+        \\local i = 0
+        \\repeat
+        \\  i = i + 1
+        \\  local limit = 4
+        \\until i >= limit
+        \\return i
+    )).asInt());
+}
+
+test "repeat/until closes a fresh upvalue cell each iteration" {
+    // If the loop reused one cell, all three closures would read 3.
+    try testing.expectEqual(@as(i64, 1), (try runScalar(
+        \\local fns = {}
+        \\local i = 0
+        \\repeat
+        \\  i = i + 1
+        \\  local x = i
+        \\  fns[i] = function() return x end
+        \\until i >= 3
+        \\return fns[1]()
+    )).asInt());
+}
+
+test "break exits a repeat/until loop" {
+    try testing.expectEqual(@as(i64, 3), (try runScalar(
+        \\local k = 0
+        \\repeat
+        \\  k = k + 1
+        \\  if k == 3 then break end
+        \\until k >= 100
+        \\return k
+    )).asInt());
+}
+
 test "numeric for, with and without an explicit step" {
     try testing.expectEqual(@as(i64, 15), (try runScalar(
         \\local sum = 0
@@ -1578,8 +1779,9 @@ test "nested closures capture across two levels" {
 }
 
 test "unsupported construct produces a diagnostic, not a crash" {
-    // Generic `for ... in` is not supported yet.
-    const src = "for x in y do end";
+    // `...` outside a vararg function is a clean compile error, not a crash:
+    // `f` has no `...` in its parameter list.
+    const src = "local function f() return ... end";
     var diags = Diagnostics.init(testing.allocator);
     defer diags.deinit();
     var tree = try parser.parse(testing.allocator, src, &diags);

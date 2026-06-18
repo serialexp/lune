@@ -28,6 +28,7 @@ const table = @import("table.zig");
 const function = @import("function.zig");
 const bytecode = @import("bytecode.zig");
 const interp = @import("interp.zig");
+const key_order = @import("key_order.zig");
 
 const Value = value.Value;
 const GcHeader = object.GcHeader;
@@ -61,28 +62,18 @@ pub fn toSchemaValue(v: Value) schema.SnapValue {
 }
 
 /// A table hash-part (key, value) pair, used to serialize in a canonical order.
+/// Ordered by the shared `key_order.keyLessThan` — the same comparator the
+/// `pairs`/`next` iterator uses, so snapshot bytes and live iteration agree.
 const HashKV = struct {
     key: Value,
     val: Value,
     fn lessThan(_: void, x: HashKV, y: HashKV) bool {
-        return keyLessThan(x.key, y.key);
+        return key_order.keyLessThan(x.key, y.key);
     }
 };
 
-/// A total order on *distinct* table keys, deterministic across runs. Heap keys
-/// order by their stable object id (interning makes equal keys the same object);
-/// non-heap keys (int/float/bool) order by tag then raw payload bits. Distinct
-/// keys never tie, so this is a strict total order.
-fn keyLessThan(a: Value, b: Value) bool {
-    const ta = @intFromEnum(a.tag);
-    const tb = @intFromEnum(b.tag);
-    if (ta != tb) return ta < tb;
-    if (a.isHeap()) return a.asHeap().id < b.asHeap().id;
-    return a.payload.bits < b.payload.bits;
-}
-
 /// Collect a table's hash-part entries into `a`-owned scratch, sorted by
-/// `keyLessThan`. Serializing the hash part in this **canonical** order (rather
+/// `key_order.keyLessThan`. Serializing the hash part in this **canonical** order (rather
 /// than `std.HashMap`'s internal slot order) makes the snapshot byte layout a
 /// function of the key *set* and their ids alone — never of insertion history.
 /// This is what keeps capture→restore→recapture byte-identical: a restored table,
@@ -1301,6 +1292,49 @@ const f2c_corpus = [_][:0]const u8{
     \\local t = {}
     \\t.r = outer(3, 4)
     \\print(t.r)
+    ,
+    // Generic-for over `pairs` of a string-keyed hash, inside a call. A mid-call
+    // cut lands mid-iteration with a hash-part `ctrl` live on the stack and the
+    // `next` global as the loop's iterator register — resume must continue the
+    // canonical-order traversal from that exact key (D4: mid-iteration snapshot).
+    // Accumulates numerically so no heap string is created-then-dropped before the
+    // cut (keeps the id counter resuming exactly, per the (d) state-equivalence
+    // invariant above).
+    \\local function total(t)
+    \\  local s = 0
+    \\  for k, v in pairs(t) do s = s + v end
+    \\  return s
+    \\end
+    \\local m = {}
+    \\m.a = 10
+    \\m.b = 20
+    \\m.c = 30
+    \\print(total(m))
+    ,
+    // Generic-for over `ipairs` of an array part, inside a call. The cut lands with
+    // an integer `ctrl` and the hidden `@ipairs_iter` native as the iterator —
+    // exercises the by-name native restore for the un-spellable iterator.
+    \\local function asum(a)
+    \\  local s = 0
+    \\  for i, v in ipairs(a) do s = s + v end
+    \\  return s
+    \\end
+    \\local arr = {2, 4, 6, 8, 10}
+    \\print(asum(arr))
+    ,
+    // A `repeat/until` post-test loop inside a call — a mid-loop cut lands with the
+    // back-edge `jmp_if_false` pending, so resume must re-test and continue the
+    // loop from the restored register state.
+    \\local function tri(n)
+    \\  local i = 0
+    \\  local s = 0
+    \\  repeat
+    \\    i = i + 1
+    \\    s = s + i
+    \\  until i >= n
+    \\  return s
+    \\end
+    \\print(tri(6))
     ,
 };
 
