@@ -1120,17 +1120,20 @@ pub const Vm = struct {
                 // to redo the (pure, side-effect-free) deopt iteration. A trace is
                 // only ever entered at exactly its anchor pc, so re-entry is sound.
                 if (self.trace.config.execute and !self.trace.isRecording() and
-                    !self.trace.isBlacklisted(.{ .proto = proto, .pc = @intCast(pc) }))
+                    !self.trace.isGated(.{ .proto = proto, .pc = @intCast(pc) }))
                 {
-                    // A blacklisted anchor has proven it thrashes: every entry
+                    // A gated anchor has proven it thrashes: every entry
                     // committed fewer than `min_useful` iterations until the
                     // re-entry penalty maxed out. The canonical case is a
                     // strictly-alternating branch (stable types, so fingerprinting
                     // can't tell the arms apart) where no single straight-line
                     // trace can amortize entry/exit over more than one iteration —
-                    // running the trace was *slower* than tier-0. Gating entry on
-                    // the blacklist (not just re-arming, as before) lets tier-0
-                    // own the loop and removes the slowdown. Works on the native
+                    // running the trace was *slower* than tier-0. Gating entry
+                    // (not just re-arming, as before) lets tier-0
+                    // own the loop and removes the slowdown. The gate retries the
+                    // anchor on an exponential backoff and clears the moment an
+                    // entry finally proves useful, so a loop that only thrashes
+                    // transiently still recovers. Works on the native
                     // path too: the penalty keys only on `completed`, which native
                     // execution reports.
                     //
@@ -3997,7 +4000,7 @@ test "side traces: without side traces the anchor blacklists; with them it stays
         // The anchor is NOT blacklisted: type fingerprinting skips the
         // trace when x becomes float instead of entering-and-failing,
         // so no penalty accumulates.
-        try testing.expectEqual(@as(usize, 0), vm.trace.blacklist.count());
+        try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
         // Output is still correct — tier-0 handles the type-changed iterations.
         // i=1..5: x=5; i=6: x=5.5; i=7..30: x = 5.5 + 24 = 29.5.
         try testing.expectEqualStrings("29.5\n", sink.buffered());
@@ -4030,7 +4033,7 @@ test "side traces: without side traces the anchor blacklists; with them it stays
         try testing.expect(vm.trace.cache.items.len >= 2);
         // The anchor is NOT blacklisted — the float side trace commits useful
         // iterations (> min_useful), clearing the penalty before it maxes out.
-        try testing.expectEqual(@as(usize, 0), vm.trace.blacklist.count());
+        try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
         // Same correct output.
         try testing.expectEqualStrings("29.5\n", sink.buffered());
     }
@@ -4077,7 +4080,7 @@ test "recorder: a numeric-for loop records guards + arithmetic + a loop close" {
     try testing.expect(n_phi >= 1);
     try testing.expect(t.entry_slots.len >= 1);
     // No host/cross-frame op was hit, so nothing was blacklisted.
-    try testing.expectEqual(@as(usize, 0), vm.trace.blacklist.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
 }
 
 test "recorder: a while loop records a truthiness guard on its condition" {
@@ -4263,7 +4266,7 @@ test "recorder: a call in the loop body aborts cleanly and blacklists the anchor
     // The body's `call` is cross-frame, so the recording aborts — no trace is
     // cached and the loop anchor is blacklisted so it is not re-recorded.
     try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.blacklist.count() >= 1);
+    try testing.expect(vm.trace.gate.count() >= 1);
     try testing.expect(!vm.trace.isRecording());
 }
 
@@ -4282,7 +4285,7 @@ test "recorder: maxrecord bounds trace length (overlong traces abort)" {
     defer chunk.deinit();
 
     try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.blacklist.count() >= 1);
+    try testing.expect(vm.trace.gate.count() >= 1);
     try testing.expect(!vm.trace.isRecording());
 }
 
@@ -4351,7 +4354,7 @@ test "executor: a hot numeric-for sum runs via the IR-interpreter (back-edges co
 
     // One clean trace, never blacklisted, penalty cleared by the big yield.
     try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
-    try testing.expectEqual(@as(usize, 0), vm.trace.blacklist.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
     try testing.expectEqual(@as(usize, 0), vm.trace.penalty.count());
 
     // The decisive "it actually executed" signal: tier-0 saw back-edges only
@@ -4560,7 +4563,7 @@ test "executor: a variable that flips int->float mid-loop deopts to tier-0 and s
     defer chunk.deinit();
     // The anchor is NOT blacklisted — fingerprinting skips the trace after the
     // type change instead of trial-entering and failing.
-    try testing.expectEqual(@as(usize, 0), vm.trace.blacklist.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
 }
 
 test "executor: a branchy low-yield loop blacklists the thrashing anchor yet prints correctly" {
@@ -4586,7 +4589,7 @@ test "executor: a branchy low-yield loop blacklists the thrashing anchor yet pri
     var chunk = try runExecForTrace(&vm, gpa, source, &sink);
     defer chunk.deinit();
     try testing.expectEqualStrings("300\n", sink.buffered());
-    try testing.expect(vm.trace.blacklist.count() >= 1);
+    try testing.expect(vm.trace.gate.count() >= 1);
     // The blacklist must GATE ENTRY, not merely be set: once the anchor maxes out
     // its penalty (≤ ~max_penalty productive-but-low-yield entries), the dispatch
     // loop stops entering the cached trace and tier-0 owns the remaining ~180
@@ -4594,6 +4597,59 @@ test "executor: a branchy low-yield loop blacklists the thrashing anchor yet pri
     // (once per even iteration) and ran *slower* than tier-0. Bound it well under
     // that to prove re-entry actually halts.
     try testing.expect(vm.trace.entries < 30);
+}
+
+test "executor: a thrashing anchor that later stabilizes recovers from the gate" {
+    // The gate is not a death sentence — an anchor that thrashes transiently must
+    // come back. The branch `i % 100 < 90` is a SINGLE guard that oscillates in
+    // phases: 90 iterations true (the trace, recorded on the true arm at i=5, runs
+    // one long useful entry) then 10 iterations false (the trace is entered and the
+    // guard fails immediately → < min_useful → the penalty climbs and, at
+    // max_penalty, gates the anchor with backoff). Crucially the next true-phase
+    // re-enters the SAME cached trace on the SAME guard and commits a long useful
+    // run, which CLEARS the gate. The loop ends deep in a true-phase (i=389,
+    // i%100=89) well past the last gate's cooldown, so recovery has completed and
+    // the gate is empty. A permanent blacklist would have abandoned the anchor on
+    // the first low-yield burst and left it gated forever.
+    const gpa = testing.allocator;
+    const source =
+        \\local s = 0
+        \\for i = 1, 389 do
+        \\  if i % 100 < 90 then s = s + 1 else s = s + 2 end
+        \\end
+        \\print(s)
+    ;
+    try expectTier0Equiv(source);
+
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.max_penalty = 8; // gate after 8 low-yield entries
+    vm.trace.config.backoff_base = 16; // short cooldown so recovery fits in 400 iters
+
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    _ = try vm.run(chunk.proto);
+
+    // `else` (s+2) taken when i%100 ∈ {90..99}: i ∈ {90..99,190..199,290..299} = 30.
+    // `then` (s+1) the other 359. s = 359×1 + 30×2 = 419.
+    try testing.expectEqualStrings("419\n", sink.buffered());
+    // Recovered: the long stable tail committed a useful entry which removed the
+    // gate. If recovery were broken (permanent abandonment) the gate would persist.
+    try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
 }
 
 test "e2e (executor): a long hot loop stays correct across every trace + gc mode" {

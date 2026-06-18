@@ -237,6 +237,22 @@ pub const SlotStore = struct { slot: u16, ref: Ref };
 /// down properly.
 pub const AnchorKey = struct { proto: *const Proto, pc: u32 };
 
+/// Per-anchor cooldown record for the gate (`TraceState.gate`). An anchor that
+/// thrashed (low-yield penalty maxed) or could not be traced (abort / commit
+/// failure) is held off until its back-edge counter reaches `retry_at`. On the
+/// retry it is given one more chance; a re-failure calls `gateAnchor` again,
+/// which doubles `window` (capped at `config.backoff_max`) and bumps `strikes`.
+/// At `config.max_strikes` the anchor is abandoned permanently. All fields are
+/// counted in deterministic back-edges, so the schedule is reproducible.
+pub const Gate = struct {
+    /// Back-edge count at/after which the anchor becomes eligible again.
+    retry_at: u32,
+    /// Length of the *next* cooldown window (back-edges); doubles per escalation.
+    window: u32,
+    /// How many times this anchor has been gated; `>= max_strikes` ⇒ permanent.
+    strikes: u32,
+};
+
 /// Identifies a guard-failure site: the trace anchor and the bytecode PC of the
 /// failing guard instruction (stored in the guard's `aux` field by the per-guard
 /// PC recording, step 2).  Used to count how often a specific guard fails, so
@@ -362,10 +378,25 @@ pub const TraceConfig = struct {
     /// tier-0 (below) costs ~nothing.
     min_useful: u32 = 8,
     /// After this many *low-yield* trace entries (each committing fewer than
-    /// `min_useful` iterations) an anchor is blacklisted so tier-0 owns the loop —
-    /// the minimal brake against re-entry thrash on type-unstable / branchy loops.
-    /// The real fix (side traces) is deferred; see docs/design/01-trace-lifecycle.md.
+    /// `min_useful` iterations) an anchor is gated off so tier-0 owns the loop —
+    /// the brake against re-entry thrash on type-unstable / branchy loops.
     max_penalty: u32 = 8,
+    /// Gate backoff (replaces the old permanent blacklist). When an anchor is
+    /// gated (low-yield penalty maxed, a recording abort, or a commit failure) it
+    /// is held off tier-1 for a *cooldown window* measured in back-edges, after
+    /// which it is retried once. Each re-failure doubles the window — a
+    /// temporarily-unstable loop recovers cheaply, a hopeless one is retried
+    /// exponentially less often. The window is keyed on the deterministic
+    /// per-anchor back-edge counter, never wall-clock or RNG, so the retry
+    /// schedule is reproducible (lune determinism). `backoff_base` is the first
+    /// window; it doubles up to `backoff_max`.
+    backoff_base: u32 = 128,
+    /// Cap on the doubling cooldown window (back-edges).
+    backoff_max: u32 = 1 << 16,
+    /// After this many gate escalations on one anchor, give up permanently (the
+    /// loop has proven hopeless — e.g. a host call in the body that aborts every
+    /// recording, or strict alternation no straight-line trace can amortize).
+    max_strikes: u32 = 6,
     /// Guard-failure count at which a side trace is recorded for this
     /// `(anchor, exit_pc)` pair.  When a guard at PC X in a trace anchored
     /// at A fails this many times, the next back-edge to A arms a new
@@ -401,19 +432,22 @@ pub const TraceState = struct {
     /// Committed traces. A linear scan is fine — the cache is small in Phase 5a
     /// and never invalidated.
     cache: std.ArrayListUnmanaged(*Trace) = .empty,
-    /// Anchors that have been permanently abandoned (a recording aborted, or a
-    /// commit failed). Phase 5a uses a *permanent* blacklist — it prevents
-    /// re-record thrash with no machinery. Doubling-with-jitter penalty backoff
-    /// (so a temporarily-unstable loop can succeed later) is a later increment;
-    /// see docs/design/01-trace-lifecycle.md.
-    blacklist: std.AutoHashMapUnmanaged(AnchorKey, void) = .empty,
+    /// Anchors currently held off tier-1 with a doubling cooldown (`Gate`). Set
+    /// when a recording aborts, a commit fails, or the low-yield re-entry penalty
+    /// maxes out. Unlike the old permanent blacklist, an anchor here is *retried*
+    /// once its cooldown window of back-edges elapses; a re-failure doubles the
+    /// window, and after `config.max_strikes` escalations it is abandoned for
+    /// good. A loop that was only *temporarily* unstable (type-unstable early,
+    /// then settled) recovers; see `isGated` / `gateAnchor`.
+    gate: std.AutoHashMapUnmanaged(AnchorKey, Gate) = .empty,
     /// Re-entry penalty per anchor: a low-yield trace entry bumps it, a useful one
-    /// clears it; at `config.max_penalty` the anchor is blacklisted (`onSideExit`).
+    /// clears it; at `config.max_penalty` the anchor is gated off with a doubling
+    /// cooldown (`onSideExit` → `gateAnchor`).
     penalty: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
     /// Total trace entries executed (incremented in the dispatch loop before each
-    /// `irinterp.execute`/native run). Diagnostic only — used to confirm the
-    /// blacklist entry-gate actually halts re-entry on a thrashing anchor, and a
-    /// cheap signal for benchmark analysis (entries ≫ committed-iterations means a
+    /// `irinterp.execute`/native run). Diagnostic only — used to confirm the gate
+    /// entry-check actually halts re-entry on a thrashing anchor, and a cheap
+    /// signal for benchmark analysis (entries ≫ committed-iterations means a
     /// low-yield loop the JIT can't amortize).
     entries: u64 = 0,
     /// The in-progress recording (at most one at a time in Phase 5a).
@@ -452,7 +486,7 @@ pub const TraceState = struct {
 
     pub fn deinit(self: *TraceState) void {
         self.counters.deinit(self.gpa);
-        self.blacklist.deinit(self.gpa);
+        self.gate.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
         self.guard_failures.deinit(self.gpa);
         self.values_scratch.deinit(self.gpa);
@@ -549,21 +583,23 @@ pub const TraceState = struct {
 
     /// Account for a trace entry that side-exited after committing `completed`
     /// iterations. A useful entry (>= `min_useful`) clears the anchor's penalty
-    /// and bumps the trace's `hit_count` (frequency-based trace prioritisation);
-    /// a low-yield one bumps the penalty, and at `max_penalty` the anchor is
-    /// blacklisted.
+    /// **and any gate** (the loop recovered — forget the backoff history) and
+    /// bumps the trace's `hit_count` (frequency-based trace prioritisation); a
+    /// low-yield one bumps the penalty, and at `max_penalty` the anchor is gated
+    /// off with a doubling cooldown (`gateAnchor`).
     pub fn onSideExit(self: *TraceState, t: *Trace, completed: usize) void {
         const key = t.anchor;
         if (completed >= self.config.min_useful) {
             t.hit_count +|= 1;
             _ = self.penalty.remove(key);
+            _ = self.gate.remove(key);
             return;
         }
         const gop = self.penalty.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
         if (gop.value_ptr.* >= self.config.max_penalty) {
-            self.blacklist.put(self.gpa, key, {}) catch {};
+            self.gateAnchor(key);
         }
     }
 
@@ -693,8 +729,32 @@ pub const TraceState = struct {
         return self.rec.active;
     }
 
-    pub fn isBlacklisted(self: *const TraceState, anchor: AnchorKey) bool {
-        return self.blacklist.contains(anchor);
+    /// Is this anchor currently gated off tier-1? True while a cooldown window is
+    /// still running (back-edge count below `retry_at`) or the anchor has been
+    /// permanently abandoned (`strikes >= max_strikes`). False when no gate exists
+    /// or its cooldown has elapsed (eligible for one retry). Gates both recording
+    /// re-arm (`onBackEdge`) and trace entry (the dispatch loop).
+    pub fn isGated(self: *const TraceState, anchor: AnchorKey) bool {
+        const g = self.gate.get(anchor) orelse return false;
+        if (g.strikes >= self.config.max_strikes) return true;
+        return self.backEdgeCount(anchor) < g.retry_at;
+    }
+
+    /// Install or escalate the gate on `anchor`: start (or double) the cooldown
+    /// window and bump the strike count. The next eligibility is `retry_at` =
+    /// current back-edge count + window; the window then doubles (capped at
+    /// `backoff_max`) so a repeatedly-failing anchor is retried exponentially
+    /// less often, and after `max_strikes` it is abandoned for good. Deterministic
+    /// — keyed only on the back-edge counter.
+    fn gateAnchor(self: *TraceState, anchor: AnchorKey) void {
+        const gop = self.gate.getOrPut(self.gpa, anchor) catch return;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .retry_at = 0, .window = self.config.backoff_base, .strikes = 0 };
+        }
+        const g = gop.value_ptr;
+        g.strikes +|= 1;
+        g.retry_at = self.backEdgeCount(anchor) +| g.window;
+        g.window = @min(g.window *| 2, self.config.backoff_max);
     }
 
     /// Back-edge count recorded for an anchor (0 if never seen). A loop is "hot"
@@ -724,12 +784,18 @@ pub const TraceState = struct {
         const gop = self.counters.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
-        // `==` arms exactly once, at the moment the threshold is crossed — no
-        // re-arm attempts on every later iteration.
-        if (gop.value_ptr.* == self.config.hotloop and
-            !self.hasTrace(key) and !self.isBlacklisted(key))
-        {
-            self.arm(proto, target_pc);
+        const count = gop.value_ptr.*;
+        // Arm a fresh recording when the anchor first becomes hot, or — if it was
+        // gated off after an earlier failure — when its backoff cooldown elapses.
+        // Each `==` fires exactly once at the crossing point, so we never re-arm
+        // on every later iteration. A gated anchor whose cooldown is still running
+        // (or that has exhausted `max_strikes`) is skipped by `isGated`.
+        if (!self.hasTrace(key) and !self.isGated(key)) {
+            const arm_now = if (self.gate.get(key)) |g|
+                count == g.retry_at // cooldown just elapsed → one retry
+            else
+                count == self.config.hotloop; // first time crossing hot
+            if (arm_now) self.arm(proto, target_pc);
         }
         // Side-trace arming (step 4): a guard inside a trace at this anchor
         // has failed enough times — arm a new recording on the next iteration,
@@ -737,7 +803,7 @@ pub const TraceState = struct {
         // the alternate path through the loop body.
         if (self.wants_side_trace) |wanted| {
             if (wanted.proto == proto and wanted.pc == target_pc) {
-                if (!self.isBlacklisted(key)) {
+                if (!self.isGated(key)) {
                     self.arm(proto, target_pc);
                     // Clear guard-failure counters for this anchor so we don't
                     // immediately re-trigger on the next outer-loop iteration.
@@ -755,21 +821,22 @@ pub const TraceState = struct {
         self.rec.reset(self.gpa, .{ .proto = proto, .pc = target_pc }, proto.num_registers) catch return;
     }
 
-    /// Abandon the in-flight recording: deactivate, remember why, and blacklist
-    /// the anchor so it is not retried (no backoff in Phase 5a). Tier-0 is
-    /// untouched — nothing was ever executed from the trace.
+    /// Abandon the in-flight recording: deactivate, remember why, and gate the
+    /// anchor with exponential backoff so it is retried progressively less often
+    /// (and abandoned after `max_strikes`). Tier-0 is untouched — nothing was ever
+    /// executed from the trace.
     fn abort(self: *TraceState, reason: AbortReason) void {
         self.rec.abort_reason = reason;
         self.rec.active = false;
-        self.blacklist.put(self.gpa, self.rec.anchor, {}) catch {};
+        self.gateAnchor(self.rec.anchor);
     }
 
     /// Finalise a cleanly-closed recording into a cached `Trace`. A build failure
-    /// is treated like an abort (discard + blacklist) so we never thrash.
+    /// is treated like an abort (discard + gate-with-backoff) so we never thrash.
     fn closeTrace(self: *TraceState, regs: []const Value) void {
         _ = regs; // reserved: a richer exit snapshot will read live values here.
         self.commit() catch {
-            self.blacklist.put(self.gpa, self.rec.anchor, {}) catch {};
+            self.gateAnchor(self.rec.anchor);
         };
         self.rec.active = false;
     }
