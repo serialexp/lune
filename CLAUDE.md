@@ -76,3 +76,105 @@ Rule #3 spirit). It's the at-a-glance "what's left to replicate" for lune.
 - `zig build test` — run all unit tests (the gate).
 - `zig build run` — run the CLI.
 - `zig build -Denforce-zig-version=true` — hard-fail on toolchain drift (CI).
+
+## LuaJIT is dedication, not magic — and not a talent ceiling
+
+When lune is N× slower than LuaJIT, that gap is **not** innate genius and it is
+**not** a wall. Mike Pall isn't superhuman; he spent ~15 years relentlessly
+optimizing one thing and hand-writing assembly. Any dedicated engineer could
+build something like it given that commitment. Two consequences, and you must
+hold both:
+
+1. **"Is it possible" is always answered yes.** Never invoke "too hard," "out of
+   scope," or "structural work we can't do" to wave away a benchmark gap. The
+   technique is real, achievable, and — decisively — **we have the source**
+   (`~/Projects/LuaJIT/src/`: `lj_record.c`, `lj_asm_*.h`, `lj_opt_*.c`,
+   `lj_crecord.c`, …). Everything Pall did is sitting there to read. So if we
+   *cannot* replicate a thing he did, that is a **shocking failure on our part**,
+   not an acceptable "it's beyond us." Go read how he did it before concluding
+   anything is out of reach.
+2. **The gap is years of accumulated grinding — close it the same way.** One
+   named technique at a time, measured and landed, never one heroic leap to
+   parity. When you catch yourself treating a LuaJIT number as an unreachable
+   ceiling, stop: name the specific technique, read how Pall did it, implement
+   it, measure, repeat.
+
+Anything we do **on top** of what Pall did is bonus, not the bar. Bart is
+"cheating" by pointing the combined intelligence of three LLMs in parallel at
+the same single-minded optimization problem Pall ground on solo — so matching
+him is the floor we owe to the fact that we can read his source, and beating
+him is the upside that parallelism buys. Replicate first; the gravy comes after.
+
+**The one legitimate asterisk: determinism and full session replay.** lune
+carries weight LuaJIT doesn't — byte-identical 8-mode equivalence and
+time-travel replay. So the *only* defensible reason a Pall technique can't be
+lifted verbatim is that doing so would break determinism or replay (smuggling a
+clock, RNG, or raw address into a tiering decision; making a trace
+non-reproducible). Even then this is a constraint on **how**, never a licence to
+skip the win: find the determinism-preserving equivalent of his mechanism — as
+we already did with the direct-mapped hotcount and `int_of_float`, both pure
+functions of deterministic counters — rather than declaring the technique
+impossible. "Replay forbids it" only ever justifies *adapting* the mechanism.
+
+## Performance: profile FIRST, then optimize the part that's actually hot
+
+**Hard-won lesson (nsieve, June 2026): before optimizing the JIT, `perf record` the
+benchmark and confirm where the time actually goes — do not assume the traced code is
+the bottleneck.** We spent a whole arc making the *traced* loops faster (float
+loop-limit → int specialization, then hoisting invariant array base pointers) and the
+second change moved nsieve's wall-clock by 0.00s. A 60-second profile would have said
+so up front. The JIT was ~3% of the runtime; we were polishing the 3%.
+
+How to actually find the bottleneck (this is the recipe, reuse it):
+
+```sh
+zig build -Doptimize=ReleaseFast
+NS=~/Projects/LuaJIT/bench/nsieve.lua
+perf record -g -o /tmp/p.data -- ./zig-out/bin/lune --trace --jit-native $NS 9 >/dev/null 2>&1
+perf report -i /tmp/p.data --stdio --no-children | grep -vE '^\s*#' | head -25
+```
+
+Then **roll the symbols up by tier**, because per-symbol noise hides the real split.
+The one number that matters first is *how much runs on native JIT code vs the tier-0
+interpreter* — sum the `[JIT]` rows vs `interp.Vm.exec`:
+
+```sh
+perf report -i /tmp/p.data --stdio --no-children | grep -vE '^\s*#' | awk '
+/\[JIT\]/ {jit+=$1} /Vm\.exec/ {exec+=$1} /Table\.(get|set)/ {tbl+=$1}
+/hash|wyhash|getIndex/ {hsh+=$1}
+END{printf "native [JIT]: %.1f%%\ntier-0 Vm.exec: %.1f%%\nTable.get/set: %.1f%%\nhashing: %.1f%%\n",jit,exec,tbl,hsh}'
+```
+
+Two gotchas that bit us, so read percentages carefully:
+- **Percentages are relative to a shrinking denominator.** A *working* JIT makes
+  `Table.get` look like a *bigger* fraction (19% with JIT vs 8.5% pure-tier-0) only
+  because the JIT removed `Vm.exec` time from under it. Always cross-check against a
+  pure tier-0 run (`./zig-out/bin/lune $NS 9`, no `--trace`) before concluding a
+  symbol "got worse."
+- **Isolate a suspected loop instead of arguing about it.** Extract the loop into a
+  standalone script with the same call shape and time it + `--dump-native` it. That's
+  how we proved nsieve's init loop `for i=2,m do p[i]=true end` is ~40% of the run and
+  records *no trace* (array growth aborts recording → 100% tier-0). `--dump-native`
+  saying "no traces recorded" / "unsupported" is the signal a hot loop never tiers up.
+
+**nsieve verdict on file (so we don't re-derive it):** ~96% of nsieve runs on the
+tier-0 interpreter; the JIT covers only two non-branchy inner loops' steady state. The
+remaining LuaJIT gap (~5×) is structural JIT-*coverage*, not codegen tightness — making
+already-traced code faster cannot close it. The levers, in order:
+
+1. **Untraceable array growth (~40%, biggest).** The init loop `for i=2,m do p[i]=true
+   end` grows the array, recording aborts, and it runs *fully interpreted* with no trace
+   at all. Nothing downstream (chaining, hoisting) can touch it until growth records.
+2. **Side-trace linking already EXISTS but dead-ends on tier-1a.** `tryChainExit`
+   (trace.zig, called from the dispatch loop in interp.zig) already does exit-PC
+   chaining: on a side-exit it looks up a trace anchored at the exit PC and runs it —
+   guard-failure counters + `--trace-hotguard` + side-trace recording are all built. The
+   catch: the chain executes via `irinterp.execute` (**tier-1a only**, trace.zig:707),
+   and tier-1a is ~equal-to-slower than tier-0 on these bodies (`--trace` 1.20s vs tier-0
+   0.79s), so a *successful* chain swaps tier-0 for something no faster — the gate
+   correctly retires it. To make linking pay, the chain must dispatch the side trace's
+   **native** code (chain native→native), which the float-limit unlock finally makes
+   possible (the inner bodies are now native-able and beat tier-0). Do NOT "add
+   side-trace linking" — it's there; the work is making the chain path native.
+3. **Faster tier-0 dispatch** (threaded/computed-goto) for the genuinely-interpreted
+   remainder — untouched.
