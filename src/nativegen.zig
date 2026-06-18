@@ -37,8 +37,14 @@ const ArrLayout = struct {
     /// `ArrayPart` field offsets (from `array_base`).
     const lane = arr.ArrayPart.Layout.lane;
     const len = arr.ArrayPart.Layout.len;
+    const cap = arr.ArrayPart.Layout.cap;
     const data = arr.ArrayPart.Layout.data;
     const present = arr.ArrayPart.Layout.present;
+    /// `*Table` → embedded hash part's `size` (live entry count, u32). The grow
+    /// store's `guard_append` reads this to prove the hash is empty (so tier-0's
+    /// `migrateFromHash` would be a no-op). `@offsetOf` on the std map field makes a
+    /// layout churn a compile error, never a silent miscompile (Z-1/Z-2).
+    const hash_size = table.Table.hash_off + @offsetOf(table.Table.Map, "size");
 };
 
 comptime {
@@ -559,6 +565,34 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 }
                 kinds[i] = .none;
             },
+            // guard_append (the grow precondition): like guard_bounds, it proves the
+            // aref addresses a writable slot — here `data[len]`, the in-cap append
+            // successor (idx==len+1, len<cap) into a migrate-free (empty-hash) table.
+            // Marks the aref bounds-checked so the following astore_append may store.
+            // Phase A: boolean lane only (the lane was already pinned by guard_lane).
+            .guard_append => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .aref) return false;
+                const aref_ins = t.instrs[ins.a];
+                if (aref_ins.aux != BOOL_LANE) return false; // Phase A: bool lane only
+                if (!laneConsistent(&trace_lane, aref_ins.aux)) return false;
+                bounds_ok[ins.a] = true;
+                kinds[i] = .none;
+            },
+            // astore_append: append the proven-`.bool` value at `data[len]` and bump
+            // len. Like astore, gated on a dominating bounds proof (guard_append) on
+            // the same aref. Boolean lane only in Phase A (one byte/slot, no presence
+            // bitmap); the value must be a proven boolean.
+            .astore_append => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (kinds[ins.a] != .aref) return false;
+                const aref_ins = t.instrs[ins.a];
+                if (aref_ins.aux != BOOL_LANE) return false; // Phase A: bool lane only
+                if (!laneConsistent(&trace_lane, aref_ins.aux)) return false;
+                if (!bounds_ok[ins.a]) return false; // guard_append must dominate
+                if (kinds[ins.b] != .bool) return false; // bool lane stores a boolean
+                kinds[i] = .none;
+            },
             .loop => {
                 if (i != n - 1) return false; // loop must be terminal
                 kinds[i] = .none;
@@ -769,11 +803,13 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
         .int_of_float => .{ .a = true, .b = false },
         // aref reads table (a, an invariant home) + index (b). aload/guards reach the
         // table through aref.a, so they read only the aref token (a). astore reads
-        // the aref token (a) plus the value to write (b).
-        .aref, .astore => .{ .a = true, .b = true },
+        // the aref token (a) plus the value to write (b). astore_append is the grow
+        // analogue (aref token + value).
+        .aref, .astore, .astore_append => .{ .a = true, .b = true },
         .aload, .guard_bounds, .guard_present, .guard_table, .guard_lane => .{ .a = true, .b = false },
-        // guard_fits reads the value it range-checks (a); no second operand.
-        .guard_fits => .{ .a = true, .b = false },
+        // guard_fits reads the value it range-checks (a); guard_append reads the aref
+        // token (a) and reaches len/cap/hash through aref.a — no second operand.
+        .guard_fits, .guard_append => .{ .a = true, .b = false },
         else => .{ .a = false, .b = false },
     };
 }
@@ -1123,7 +1159,7 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         var last_body_guard: i64 = -1;
         for (t.instrs, 0..) |ins, idx| {
             switch (ins.op) {
-                .guard_true, .guard_false, .guard_bounds, .guard_present, .guard_fits, .int_of_float => last_body_guard = @intCast(idx),
+                .guard_true, .guard_false, .guard_bounds, .guard_present, .guard_fits, .guard_append, .int_of_float => last_body_guard = @intCast(idx),
                 else => {},
             }
         }
@@ -2181,6 +2217,67 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
                     try a.btsMemReg(preg, 0, pireg);
                 }
+            },
+            // guard_append (B5-grow): the append precondition, the grow analogue of
+            // guard_bounds. Three memory-relative checks, no extra register beyond the
+            // two the array path already uses (idx0 in `ireg`, table in `tbreg`):
+            //   (1) idx0 == len   — the exact append successor (key tracks the extent).
+            //   (2) idx0 <u cap   — room without a realloc. `len == idx0` from (1), so
+            //       comparing idx0 (not a reloaded len) against cap is equivalent and
+            //       needs no third register.
+            //   (3) hash.size == 0 — the hash is empty, so tier-0's `migrateFromHash`
+            //       would be a no-op; a non-empty hash means a contiguous successor
+            //       could live there, so side-exit and let tier-0 handle the migrate.
+            // Any miss side-exits to tier-0, which reallocs / migrates and re-enters —
+            // so the on-trace append (astore_append) never allocates [determinism: the
+            // realloc only ever runs as this side-exit, identically across all tiers].
+            .guard_append => {
+                const aref_ins = t.instrs[ins.a];
+                const ireg = try refBaseReg(a, alloc, ins.a, .rcx); // idx0
+                const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax); // table ptr
+                try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.len);
+                try a.jcc(.ne, deopt_exit); // idx0 != len → not the append successor
+                try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.cap);
+                try a.jcc(.ae, deopt_exit); // idx0 (==len) >=u cap → would realloc
+                try a.cmpDwordMemImm(tbreg, ArrLayout.hash_size, 0);
+                try a.jcc(.ne, deopt_exit); // hash non-empty → migrate possible
+            },
+            // astore_append (B5-grow): commit one boolean to `data[len]` and bump len.
+            // guard_append proved `idx0 == len < cap` and an empty hash, so this is the
+            // bool-lane byte store (`1=false, 2=true`, value+1 — presence is in-band)
+            // followed by an in-place `inc qword [tbl+len]`. len has NO register home
+            // for an append trace (the home-reservation switch skips astore_append), so
+            // the table struct stays the single source of truth: the bump is immediately
+            // visible to ANY later guard's side-exit, with no register→regs[] writeback.
+            // Later guards DO follow in the body (the loop's index guards / continuation
+            // `guard_true`), and a side-exit there is sound: that guard's snapshot resumes
+            // tier-0 *past* the already-committed store, so the append + len bump happen
+            // exactly once — identical to a pure tier-0 run. (Even in the degenerate case
+            // where an exit were to replay the store, len is already bumped, so it lands
+            // as an idempotent in-bounds overwrite of the same slot, never a 2nd append.)
+            // Were len instead register-homed and flushed only at the back-edge, a
+            // post-bump exit would persist a STALE len — which is precisely why len lives
+            // in memory here. The realloc a full `append` would do never appears on-trace
+            // — it was peeled to the guard_append side-exit.
+            //
+            // Register discipline: rax/rcx are scratch and are never allocation homes
+            // (ALLOC_ORDER excludes them), so no operand of this op is *homed* in rax/rcx
+            // — the byte store may clobber rax freely, then `refBaseReg(table, .rax)`
+            // re-materializes the table pointer (a callee-saved home reg is returned
+            // as-is; a spilled home is reloaded fresh into rax) for the len bump.
+            .astore_append => {
+                const aref_ins = t.instrs[ins.a];
+                // bool-lane byte store, identical to the in-bounds astore bool path.
+                const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                try a.leaRegMemSib(.rax, datareg, ireg, 1, 0); // rax = &data[idx0]
+                try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // value 0/1 → rcx
+                try a.incReg(.rcx); // 0→1 (false), 1→2 (true)
+                try a.storeMemReg(.rax, 1, 0, .rcx); // mov byte [rax], cl
+                // len += 1, in place in the table struct (no len_home for appends). The
+                // table pointer is re-fetched into rax (the bool store clobbered it).
+                const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
+                try a.incMemQword(tbreg, ArrLayout.array_base + ArrLayout.len);
             },
             .guard_true => switch (kinds[ins.a]) {
                 .int => {}, // every int is truthy → guard always passes (no-op)

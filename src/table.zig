@@ -59,6 +59,14 @@ pub const Table = struct {
     /// regression fails to compile rather than miscompiling.
     pub const array_off = @offsetOf(Table, "array");
 
+    /// Byte offset of the embedded `hash` (`Map`) from a `*Table`. The native
+    /// grow-store guard (`astore_append`'s `guard_append`) reads the map's `size`
+    /// field at `hash_off + @offsetOf(Map, "size")` to prove the hash part is empty
+    /// (so `migrateFromHash` is a no-op on-trace). Same frozen-contract spirit as
+    /// `array_off`: a layout change recomputes the JIT's address math or fails to
+    /// compile, never miscompiles.
+    pub const hash_off = @offsetOf(Table, "hash");
+
     /// Errors from a store. A bad key is a `TypeError` (Lua: "table index is
     /// nil"/"is NaN"); growth can fail with `OutOfMemory`.
     pub const Error = error{ TypeError, OutOfMemory };

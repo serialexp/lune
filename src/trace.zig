@@ -202,6 +202,32 @@ pub const IrOp = enum(u8) {
     /// the recording PC for exit-PC chaining, like the other side-exiting guards.
     /// Appended last so every prior op's wire ordinal stays stable.
     int_of_float,
+
+    // ---- array-growth (append) store path (capacity-bounded grow) -------------
+    /// `a` = `aref` ref → the append precondition guard, the grow analogue of
+    /// `guard_bounds`. Side-exits to tier-0 unless ALL hold for the `aref`'s table
+    /// at runtime: (1) the hash part is empty (so `Table.set`'s `migrateFromHash`
+    /// would be a no-op — native/oracle skip it), (2) `idx == len+1` (the key is the
+    /// exact append successor — the store lands at `data[len]`), and (3) `len < cap`
+    /// (room to grow *without* a realloc). On a side-exit tier-0 runs the iteration:
+    /// it `append`s — doubling `cap` via `ensureCapacity` when (3) fails, or absorbing
+    /// a hash successor when (1) fails — then the loop re-enters. Because the realloc
+    /// only ever happens on this side-exit (never on-trace), `len`/`cap`/`data` stay
+    /// byte-identical across tier-0 / tier-1a / native (the B5 invariant, extended to
+    /// growth: the array is never reallocated *on-trace*). Marks the `aref`
+    /// bounds-checked (the store at `data[len]` is in-cap), like `guard_bounds`.
+    /// Appended last so every prior op's wire ordinal stays stable.
+    guard_append,
+    /// `a` = `aref` ref, `b` = value ref → append the value as the new key `len+1`,
+    /// writing `data[len]` in the lane encoding and bumping `len` by one. The grow
+    /// analogue of `astore`: the FIRST mid-iteration *length-changing* heap mutation.
+    /// Behind a dominating `guard_append` (room + shape + empty hash proven) and a
+    /// `guard_fits` (value in-lane), so it neither reallocs, widens, nor migrates —
+    /// `irinterp` lowers it to `ArrayPart.appendInCap`. Effectful (never DCE'd, an
+    /// alias/CSE barrier, and — unlike `astore` — it *writes* `len`, so `guard_append`
+    /// can never be hoisted above it). Produces no value. Boolean lane only in Phase A.
+    /// Appended last so every prior op's wire ordinal stays stable.
+    astore_append,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -1092,11 +1118,11 @@ pub const TraceState = struct {
                 // `int_of_float` reads its sole float operand `a` (a prior node).
                 .int_of_float => std.debug.assert(ins.a < i),
                 // `aref` pairs (table, index) into an address descriptor;
-                // `astore` reads the `aref` (`a`) and the value to write (`b`).
-                .aref, .astore => std.debug.assert(ins.a < i and ins.b < i),
+                // `astore`/`astore_append` read the `aref` (`a`) and the value (`b`).
+                .aref, .astore, .astore_append => std.debug.assert(ins.a < i and ins.b < i),
                 // `aload` and the array-access guards read one prior node
-                // (the table value, or the `aref`).
-                .aload, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits => {
+                // (the table value, or the `aref`). `guard_append` reads the `aref`.
+                .aload, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append => {
                     std.debug.assert(ins.a < i);
                 },
                 // φ: the init `a` is an ordinary backward ref (a < i); the update
@@ -1433,6 +1459,43 @@ pub const TraceState = struct {
         const lane = tbl.array.lane;
         if (lane == .value) return self.abort(.nyi_opcode); // unpacked path deferred
         const idx = vkey.asInt();
+
+        // Grow (append) store: `t[len+1] = v` extends the dense run by one. This is
+        // the bulk of an array-fill loop (nsieve's `for i=2,m do p[i]=true end` after
+        // its first rehash narrows to the boolean lane and drains the hash). Rather
+        // than abort the whole trace (the historic behaviour — the fill then ran fully
+        // tier-0), record an `astore_append` guarded so the realloc/migrate cases fall
+        // back to tier-0 while the in-capacity common case runs native. Phase A: the
+        // boolean lane only (one byte/slot, no presence bitmap — the simplest grow
+        // store); other narrow lanes still abort below.
+        if (lane == .boolean and
+            idx == @as(i64, @intCast(tbl.array.len)) + 1 and
+            tbl.hash.count() == 0 and
+            tbl.array.fits(vval))
+        {
+            // Same C1 deopt-replay rule as `astore`: a prior packed-array read could
+            // have steered this store's value or occurrence, and re-running the
+            // iteration on a side-exit (against the now-longer array) would diverge.
+            if (self.traceHasArrayLoad()) return self.abort(.bad_type);
+            const rval = try self.refOf(instr.c);
+            const lane_ord: i32 = @intFromEnum(lane);
+            const rtab = try self.refOf(instr.a);
+            _ = try self.emit(.{ .op = .guard_table, .a = rtab });
+            _ = try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord });
+            const rkey = try self.refOf(instr.b);
+            try self.guardInt(rkey);
+            const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
+            // guard_append: hash-empty + `idx==len+1` + `len<cap`. The grow analogue
+            // of guard_bounds — side-exits to tier-0 (which reallocs/migrates) when
+            // any precondition fails, so the on-trace append never allocates.
+            _ = try self.emit(.{ .op = .guard_append, .a = ref });
+            // guard_fits: the value still fits the narrow lane (the oracle re-checks a
+            // free-variable store; native bool already proves `.bool`). Same as astore.
+            _ = try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord });
+            _ = try self.emit(.{ .op = .astore_append, .a = ref, .b = rval, .aux = lane_ord });
+            return;
+        }
+
         if (idx < 1 or idx > @as(i64, @intCast(tbl.array.len))) return self.abort(.bad_type);
         // The value must fit the current lane unchanged — an out-of-lane store
         // would widen the array (shape change / allocation) which the native ABI
@@ -1996,6 +2059,49 @@ test "recArraySet: t[k]=false on a bool lane records the full guarded write sequ
     try testing.expectEqual(@as(Ref, 6), ops[9].a); // stores through the aref
     try testing.expectEqual(@as(Ref, 0), ops[9].b); // value = the false slot_load
     try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[9].aux);
+}
+
+test "recArraySet: a bool-lane append (t[len+1]=true) records the guarded grow sequence" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    // Fill 2..32 (index 1 stays a hole) so the table rehashes to the boolean lane and
+    // drains its hash — exactly nsieve's init-loop steady state. len is the high-water
+    // mark (32); the next store t[33] is the append successor (idx == len+1).
+    var i: i64 = 2;
+    while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+    try testing.expectEqual(arr.Lane.boolean, t.array.lane);
+    try testing.expectEqual(@as(usize, 0), t.hash.count()); // hash drained → migrate is a no-op
+    const len_before = t.array.len;
+    const append_key: i64 = @as(i64, @intCast(len_before)) + 1;
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // r1 = table, r2 = key (len+1), r0 = value (true); `set_index a=1 b=2 c=0`.
+    var regs = [_]Value{ Value.boolean(true), Value.heap(&t.header), Value.int(append_key) };
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), &regs, &proto, 0);
+
+    try testing.expect(state.isRecording()); // clean record — the append path, no abort
+    const ops = state.rec.instrs.items;
+    // Same prologue as the in-bounds store, but guard_bounds → guard_append and
+    // astore → astore_append: slot_load(value), slot_load(table), guard_table,
+    // guard_lane, slot_load(key), guard_int, aref, guard_append, guard_fits,
+    // astore_append.
+    try testing.expectEqual(@as(usize, 10), ops.len);
+    try testing.expectEqual(IrOp.aref, ops[6].op);
+    try testing.expectEqual(IrOp.guard_append, ops[7].op);
+    try testing.expectEqual(@as(Ref, 6), ops[7].a); // guards the aref
+    try testing.expectEqual(IrOp.guard_fits, ops[8].op);
+    try testing.expectEqual(IrOp.astore_append, ops[9].op);
+    try testing.expectEqual(@as(Ref, 6), ops[9].a); // stores through the aref
+    try testing.expectEqual(@as(Ref, 0), ops[9].b); // value = the true slot_load
+    try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[9].aux);
+
+    // The recorder must NOT have mutated the table — recording is side-effect free.
+    try testing.expectEqual(len_before, t.array.len);
 }
 
 test "recArraySet aborts: non-table, non-int key, OOB, out-of-lane value, .value lane" {

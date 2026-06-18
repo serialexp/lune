@@ -548,6 +548,14 @@ pub const Assembler = struct {
         try self.b(0xFF);
         try self.modrmReg(0, reg.lo());
     }
+    /// `inc qword [base + disp]` — REX.W FF /0. The astore_append len bump: the
+    /// table's `len` field is updated in place each iteration (no register home,
+    /// so the table struct stays the single source of truth across side-exits).
+    pub fn incMemQword(self: *Assembler, base: Reg, disp: i32) !void {
+        try self.rex(true, false, false, base.hi());
+        try self.b(0xFF);
+        try self.modrmMem(0, base, disp);
+    }
 
     // ---- ALU (reg / mem, imm) ---------------------------------------------------
 
@@ -590,6 +598,18 @@ pub const Assembler = struct {
         try self.b(0x83);
         try self.modrmMem(7, base, disp);
         try self.b(@bitCast(v));
+    }
+
+    /// `cmp dword [base + disp], imm32` — 81 /7 id (32-bit operand, no REX.W). The
+    /// hash-empty guard: `cmp dword [tbl + hash_size_off], 0` (`Map.size` is u32).
+    pub fn cmpDwordMemImm(self: *Assembler, base: Reg, disp: i32, v: u32) !void {
+        try self.rex(false, false, false, base.hi());
+        try self.b(0x81);
+        try self.modrmMem(7, base, disp);
+        try self.b(@truncate(v));
+        try self.b(@truncate(v >> 8));
+        try self.b(@truncate(v >> 16));
+        try self.b(@truncate(v >> 24));
     }
 
     /// `setcc reg8` — 0F 90|cc /0 (writes only the low byte; caller must `movzx`).
@@ -1448,6 +1468,19 @@ test "enc: cmp byte / qword mem, imm" {
     try expectEnc(&.{ 0x48, 0x83, 0x7C, 0x24, 0x10, 0x00 }, struct { // cmp qword [rsp+16], 0
         fn f(a: *Assembler) !void {
             try a.cmpQwordMemImm8(.rsp, 16, 0);
+        }
+    }.f);
+    try expectEnc(&.{ 0x81, 0x7F, 0x18, 0x00, 0x00, 0x00, 0x00 }, struct { // cmp dword [rdi+24], 0
+        fn f(a: *Assembler) !void {
+            try a.cmpDwordMemImm(.rdi, 24, 0);
+        }
+    }.f);
+}
+
+test "enc: inc qword [mem]" {
+    try expectEnc(&.{ 0x48, 0xFF, 0x47, 0x08 }, struct { // inc qword [rdi+8]
+        fn f(a: *Assembler) !void {
+            try a.incMemQword(.rdi, 8);
         }
     }.f);
 }

@@ -4641,6 +4641,66 @@ test "int_of_float: float-limit loop is byte-identical across all 8 modes (deopt
     , "45450\n");
 }
 
+test "native: a bool-lane growth loop compiles native (astore_append) and matches tier-0" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // `for i=2,N do t[i]=true end` grows the boolean array part. After the first
+    // rehash narrows to the bool lane and drains the hash, every iteration is an
+    // append (idx == len+1): the recorder emits guard_append + astore_append, and
+    // proveKinds accepts the bool-lane grow store so it lowers to machine code (a
+    // byte store + an in-place `inc qword [tbl+len]`; the realloc on a cap-doubling
+    // boundary is peeled to a guard_append side-exit, never on-trace).
+    const source =
+        \\local t = {}
+        \\for i = 2, 5000 do t[i] = true end
+        \\local c = 0
+        \\for i = 1, 5000 do if t[i] then c = c + 1 end end
+        \\print(c)
+    ;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var nbuf: [64]u8 = undefined;
+    var nsink = io.Writer.fixed(&nbuf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &nsink);
+    defer chunk.deinit();
+
+    // Some cached trace is the grow loop and carries an astore_append — and that
+    // trace lowered to machine code (proveKinds admitted the bool-lane grow store).
+    var saw_append = false;
+    var compiled_append = false;
+    for (vm.trace.cache.items) |tr| {
+        for (tr.instrs) |ins| {
+            if (ins.op == .astore_append) {
+                saw_append = true;
+                if (tr.native == .compiled) compiled_append = true;
+            }
+        }
+    }
+    try testing.expect(saw_append);
+    try testing.expect(compiled_append);
+    // The native run (grow loop + read loop) is byte-identical to pure tier-0.
+    var obuf: [64]u8 = undefined;
+    var osink = io.Writer.fixed(&obuf);
+    try runCaptured(gpa, source, &osink, false, .off);
+    try testing.expectEqualStrings(osink.buffered(), nsink.buffered());
+}
+
+test "astore_append: a bool-lane growth loop is byte-identical across all 8 modes" {
+    // The grow store through the full matrix (off / record_only / record_execute_noopt
+    // / record_execute / native) × GC stress. The realloc-as-side-exit design is sound
+    // only if `len`/`cap`/`data` land identically in tier-0, tier-1a, and native — a
+    // divergence (a missed len bump, a wrong byte, a realloc leaking on-trace) prints a
+    // different count here. The read loop afterward observes the grown array, so a
+    // mis-sized grow would change the printed total.
+    try expectProgram(
+        \\local t = {}
+        \\for i = 2, 5000 do t[i] = true end
+        \\local c = 0
+        \\for i = 1, 5000 do if t[i] then c = c + 1 end end
+        \\print(c)
+    , "4999\n");
+}
+
 test "executor: integer //-by-zero inside a hot loop side-exits; tier-0 re-raises identically" {
     const source =
         \\local x = 0

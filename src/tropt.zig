@@ -76,13 +76,18 @@ fn kindOf(op: IrOp) OpKind {
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => .guard,
         // Array-access guards reuse the guard machinery: kept as side-effecting
         // roots, deduped by (op, operand-ref), operand marked/remapped via `a`.
-        .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits => .guard,
+        // `guard_append` is the grow analogue of `guard_bounds`; it reads `len`/`cap`
+        // (which `astore_append` writes), so classifying it `.guard` keeps it a
+        // side-effecting root that is never hoisted above the store.
+        .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append => .guard,
         // Packed-array address + load: memory ops, conservatively canonical to
         // themselves (never folded, never CSE'd) so a later store can't be
         // reordered past them. DCE'd if not reachable from a live root.
         .aref => .aref,
         .aload => .aload,
-        .astore => .astore,
+        // `astore_append` is the grow analogue of `astore`: an effectful, never-DCE'd
+        // alias/CSE barrier. Same `.astore` kind (reads `a`=aref + `b`=value).
+        .astore, .astore_append => .astore,
         .loop => .loop,
         // Loop-carried value: a root (the carry); canonical to itself (never
         // folded/CSE'd). Keeps both operands live; `b` is a forward (back-edge)

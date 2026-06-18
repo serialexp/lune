@@ -344,9 +344,11 @@ test "wire enum ordinals are a pinned contract (mirrored by viz/src/enums.ts)" {
     try testing.expectEqual(@as(u8, 35), @intFromEnum(IrOp.phi));
     try testing.expectEqual(@as(u8, 36), @intFromEnum(IrOp.preheader));
     try testing.expectEqual(@as(u8, 37), @intFromEnum(IrOp.int_of_float));
+    try testing.expectEqual(@as(u8, 38), @intFromEnum(IrOp.guard_append));
+    try testing.expectEqual(@as(u8, 39), @intFromEnum(IrOp.astore_append));
     // Exhaustiveness: if a member is added/removed, this count changes and forces
     // both this test and enums.ts to be revisited.
-    try testing.expectEqual(@as(usize, 38), @typeInfo(IrOp).@"enum".field_names.len);
+    try testing.expectEqual(@as(usize, 40), @typeInfo(IrOp).@"enum".field_names.len);
 
     const ObsType = trace.ObsType;
     try testing.expectEqual(@as(u8, 0), @intFromEnum(ObsType.unknown));

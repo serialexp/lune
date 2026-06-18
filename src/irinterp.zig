@@ -256,6 +256,20 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                     values[i] = Value.nil();
                     if (record) rec.value(i, values[i]);
                 },
+                // `astore_append` — the grow analogue of `astore` (the first
+                // mid-iteration *length-changing* mutation). The dominating
+                // `guard_append` proved `idx==len+1`, `len<cap`, and an empty hash, so
+                // the append needs no allocator, no widen, and no `migrateFromHash`:
+                // `appendInCap` writes `data[len]` in-lane and bumps `len` by one,
+                // byte-identical to what tier-0's `append` does *within capacity* (the
+                // realloc/migrate cases were peeled off to a `guard_append` side-exit).
+                .astore_append => {
+                    const ar = t.instrs[ins.a];
+                    const tbl = table.Table.fromHeader(values[ar.a].asHeap());
+                    tbl.array.appendInCap(values[ins.b]);
+                    values[i] = Value.nil();
+                    if (record) rec.value(i, values[i]);
+                },
                 // The slot holds a heap table.
                 .guard_table => if (values[ins.a].isHeap() and values[ins.a].heapType() == .table) {
                     if (record) rec.guardPass(i, values[ins.a]);
@@ -308,6 +322,23 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                         if (record) rec.guardPass(i, values[ins.a]);
                     } else {
                         if (record) rec.exit(i, .guard, values[ins.a]);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
+                // The append precondition (grow analogue of guard_bounds): the hash
+                // part is empty (migrate is a no-op), the key is the exact append
+                // successor (`idx == len+1`), and there is capacity to grow without a
+                // realloc (`len < cap`). Any miss side-exits so tier-0 runs the
+                // iteration (reallocating / migrating as needed) and the loop re-enters.
+                .guard_append => {
+                    const ar = t.instrs[ins.a];
+                    const tbl = table.Table.fromHeader(values[ar.a].asHeap());
+                    const idx = values[ar.b].asInt();
+                    const len: i64 = @intCast(tbl.array.len);
+                    if (tbl.hash.count() == 0 and idx == len + 1 and tbl.array.len < tbl.array.cap) {
+                        if (record) rec.guardPass(i, values[ar.a]);
+                    } else {
+                        if (record) rec.exit(i, .guard, values[ar.a]);
                         break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     }
                 },

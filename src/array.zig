@@ -173,6 +173,23 @@ pub const ArrayPart = extern struct {
         self.encode(i - 1, val);
     }
 
+    /// Append `val` as the new key `len+1` **within the current capacity**, where
+    /// `val` is already known to fit the lane and `len < cap` — so no allocator, no
+    /// `ensureCapacity`, no widen, and (unlike `Table.set`'s append) no
+    /// `migrateFromHash`. This is the JIT's grow-store oracle (`astore_append`): the
+    /// recorder only emits it behind a `guard_append` that proves `idx == len+1`,
+    /// `len < cap`, and an empty hash part (so migration would be a no-op), so
+    /// `irinterp` reproduces the native grow-store byte-for-byte without touching
+    /// the allocator or the hash. Asserts the room + fit so a recorder bug trips in
+    /// debug rather than corrupting the array. The realloc itself stays a tier-0
+    /// side-exit (the `guard_append` capacity check), keeping every mode identical.
+    pub fn appendInCap(self: *ArrayPart, val: Value) void {
+        std.debug.assert(self.len < self.cap);
+        std.debug.assert(self.fits(val));
+        self.len += 1;
+        self.encode(self.len - 1, val);
+    }
+
     /// Append `val` as the new key `len+1`, growing the storage. Widens the lane
     /// monotonically (see `setInPlace`) if `val` does not fit the current lane.
     pub fn append(self: *ArrayPart, gpa: std.mem.Allocator, val: Value) std.mem.Allocator.Error!void {
