@@ -412,6 +412,13 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (kinds[ins.a] != .int) return false;
                 kinds[i] = .int;
             },
+            // int_of_float: the operand must be a proven float (a guard_float-covered
+            // slot_load or a derived float); the result is the exact integer value
+            // (or a side-exit). Lowers to a `cvttsd2si` round-trip check + convert.
+            .int_of_float => {
+                if (kinds[ins.a] != .float) return false;
+                kinds[i] = .int;
+            },
             .eq, .ne, .lt, .le => {
                 // Two int operands → int compare (existing path). Two float operands →
                 // float compare (F2, ucomisd). A MIXED int/float compare bails: the
@@ -718,6 +725,8 @@ fn isTransient(op: trace.IrOp) bool {
         .konst, .add, .sub, .mul, .div, .band, .bor, .bxor, .neg, .bnot, .eq, .ne, .lt, .le => true,
         // aref materializes idx0 in a register; aload materializes the decoded bool.
         .aref, .aload => true,
+        // int_of_float materializes the converted int limit in a register.
+        .int_of_float => true,
         else => false,
     };
 }
@@ -737,6 +746,8 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
     return switch (ins.op) {
         .add, .sub, .mul, .div, .band, .bor, .bxor, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
         .neg, .bnot, .guard_int, .guard_true, .guard_false => .{ .a = true, .b = false },
+        // int_of_float reads its sole float operand (a).
+        .int_of_float => .{ .a = true, .b = false },
         // aref reads table (a, an invariant home) + index (b). aload/guards reach the
         // table through aref.a, so they read only the aref token (a). astore reads
         // the aref token (a) plus the value to write (b).
@@ -1015,7 +1026,7 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         var last_body_guard: i64 = -1;
         for (t.instrs, 0..) |ins, idx| {
             switch (ins.op) {
-                .guard_true, .guard_false, .guard_bounds, .guard_present, .guard_fits => last_body_guard = @intCast(idx),
+                .guard_true, .guard_false, .guard_bounds, .guard_present, .guard_fits, .int_of_float => last_body_guard = @intCast(idx),
                 else => {},
             }
         }
@@ -1837,6 +1848,21 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 } else {
                     try emitCompare(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
                 }
+            },
+            // int_of_float: convert the float limit (in its float home) to an exact
+            // i64, or side-exit. Mirrors `value.floatAsExactInt` via a cvttsd2si
+            // round-trip: truncate to int, convert back, and compare for exact
+            // equality. A non-integral value, an out-of-`[-2^63, 2^63)` value (whose
+            // cvttsd2si yields the integer-indefinite 0x8000…), or a NaN all fail the
+            // compare (NaN sets PF). The result lands in the op's int home.
+            .int_of_float => {
+                try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.a), .float);
+                try a.cvttsd2siRegReg(.rax, XMM_SCRATCH0); // rax = (i64)trunc(f) or indefinite
+                try a.cvtsi2sdRegReg(XMM_SCRATCH1, .rax); // back to double
+                try a.ucomisdRegReg(XMM_SCRATCH0, XMM_SCRATCH1);
+                try a.jcc(.ne, deopt_exit); // ordered & not equal → non-integral / out-of-range
+                try a.jcc(.p, deopt_exit); // unordered (NaN) → side-exit
+                try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
             // --- lane-aware array read path (B2, bool lane) ----------------------
             // aref: materialize idx0 = index - 1 (the 0-based packed index) into the

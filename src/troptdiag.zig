@@ -134,6 +134,7 @@ fn detectDeadCarries(
             .guard_int, .guard_float, .guard_number, .guard_true, .guard_false,
             .aload,
             .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits,
+            .int_of_float,
             => {
                 uses[ins.a] += 1;
             },
@@ -242,6 +243,7 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             .guard_int, .guard_float, .guard_number, .guard_true, .guard_false,
             .aload,
             .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits,
+            .int_of_float,
             => ins.a == idx,
             .aref, .astore => ins.a == idx or ins.b == idx,
             .phi => (ins.aux == trace.PHI_INTERNAL and ins.a == idx) or ins.b == idx,

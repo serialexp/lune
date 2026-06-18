@@ -700,6 +700,15 @@ pub const Assembler = struct {
         try self.sseRM(0xF2, true, 0x2A, dst_xmm, base, disp);
     }
 
+    /// `cvttsd2si dst_gp, src_xmm` — F2 REX.W 0F 2C /r: convert a double to a signed
+    /// 64-bit integer with **truncation toward zero** (matching `@intFromFloat`). A
+    /// NaN / ±inf / out-of-`[-2^63, 2^63)` source yields the "integer indefinite"
+    /// 0x8000000000000000, which the recorder's round-trip test (`cvtsi2sd` +
+    /// `ucomisd`) detects and side-exits on. reg field = dst GP, rm = src XMM.
+    pub fn cvttsd2siRegReg(self: *Assembler, dst_gp: Reg, src_xmm: Reg) !void {
+        try self.sseRR(0xF2, true, 0x2C, dst_gp, src_xmm);
+    }
+
     /// `movq dst_xmm, src_gp` — 66 REX.W 0F 6E /r: move 64 raw bits GP→XMM
     /// (materialize a float constant whose bits are in a GP register).
     pub fn movqXmmReg(self: *Assembler, dst_xmm: Reg, src_gp: Reg) !void {
@@ -1147,6 +1156,18 @@ test "enc: SSE2 GP<->XMM moves + cvtsi2sd" {
     try expectEnc(&.{ 0xF2, 0x48, 0x0F, 0x2A, 0x47, 0x08 }, struct {
         fn f(a: *Assembler) !void {
             try a.cvtsi2sdRegMem(xmm0, .rdi, 8);
+        }
+    }.f);
+    // cvttsd2si rax, xmm0 — F2 REX.W 0F 2C /r (reg=rax, rm=xmm0)
+    try expectEnc(&.{ 0xF2, 0x48, 0x0F, 0x2C, 0xC0 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.cvttsd2siRegReg(.rax, xmm0);
+        }
+    }.f);
+    // cvttsd2si rax, xmm1 (reg=rax, rm=xmm1)
+    try expectEnc(&.{ 0xF2, 0x48, 0x0F, 0x2C, 0xC1 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.cvttsd2siRegReg(.rax, xmm1);
         }
     }.f);
     // movq xmm0, rax — 66 REX.W 0F 6E /r

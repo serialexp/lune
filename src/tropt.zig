@@ -60,7 +60,7 @@ pub const Optimized = struct {
     entry_slots: []u16,
 };
 
-const OpKind = enum { konst, slot_load, binary, unary, guard, aref, aload, astore, loop, phi, preheader };
+const OpKind = enum { konst, slot_load, binary, unary, cvt, guard, aref, aload, astore, loop, phi, preheader };
 
 fn kindOf(op: IrOp) OpKind {
     return switch (op) {
@@ -68,6 +68,11 @@ fn kindOf(op: IrOp) OpKind {
         .slot_load => .slot_load,
         .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .eq, .ne, .lt, .le => .binary,
         .neg, .not, .bnot => .unary,
+        // `int_of_float`: a value producer that ALSO side-exits. Its own `cvt` kind
+        // so it is a liveness root (its side-exit must survive DCE) yet still emits
+        // a value (the int limit) the body's compare consumes — and is invariant-
+        // hoistable (its result depends only on the loop-invariant float limit).
+        .int_of_float => .cvt,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => .guard,
         // Array-access guards reuse the guard machinery: kept as side-effecting
         // roots, deduped by (op, operand-ref), operand marked/remapped via `a`.
@@ -224,6 +229,11 @@ pub fn optimize(
                     dead[i] = true; // exact-duplicate guard, earlier copy dominates
                 } else try guards.put(gpa, gk, {});
             },
+            // `int_of_float`: canonical to itself — never folded (its operand is the
+            // loop-invariant float limit slot_load, never a constant) and never CSE'd
+            // (at most one per trace). Kept as a side-effecting root by the liveness
+            // pass below, like a guard, since it can side-exit.
+            .cvt => {},
             // Memory ops are left verbatim: canonical to themselves, no fold/CSE.
             // `aload` is never CSE'd (each is its own canonical ref), so an
             // `astore` between two reads of the same slot cannot let the later
@@ -252,7 +262,9 @@ pub fn optimize(
         // Kept guards and every `astore` are side-effecting roots (I1: an
         // `astore` and its feeding `aref` must never be DCE'd). Every φ is a root:
         // it is the loop carry / the deopt writeback, never dead.
-        if ((k == .guard and !dead[i]) or k == .astore or k == .phi) live[i] = true;
+        // `.cvt` (int_of_float) is a side-effecting root: it can side-exit, so it must
+        // never be DCE'd even if its value looked dead — exactly like a kept guard.
+        if ((k == .guard and !dead[i]) or k == .astore or k == .phi or k == .cvt) live[i] = true;
         // A φ's back-edge update `b` may be a FORWARD ref (`b > i`) —
         // `assertWellFormed` permits it (only φ.b may point past its own index),
         // and an internal SR φ's `update = add(φ, Δ)` necessarily does. The single
@@ -277,7 +289,7 @@ pub fn optimize(
                     live[canon[ins.a]] = true;
                     live[canon[ins.b]] = true;
                 },
-                .unary, .guard, .aload => live[canon[ins.a]] = true,
+                .unary, .cvt, .guard, .aload => live[canon[ins.a]] = true,
                 // `aref` (table+index) and `astore` (aref+value) both keep two
                 // operands alive.
                 .aref, .astore => {
@@ -356,6 +368,17 @@ pub fn optimize(
                 inv[i] = inv[canon[ins.a]];
                 hoist[i] = inv[i];
             },
+            // `int_of_float`: invariant iff its float-limit operand is (it always is —
+            // a guard_float-covered loop-invariant slot_load). Hoisting moves its single
+            // side-exit to the run-once preheader; sound because the OUTCOME is loop-
+            // invariant — pass or side-exit at completed=0 is identical whether the op
+            // runs once in the preheader or every iteration in the body (same deopt
+            // outcome, per the LICM soundness note above). Hoisting it (and its operand
+            // cone) means one conversion per entry instead of per iteration.
+            .cvt => {
+                inv[i] = inv[canon[ins.a]];
+                hoist[i] = inv[i];
+            },
             // Guards, memory ops, the loop terminator, φ: not invariant-hoistable.
             .guard, .aref, .aload, .astore, .loop, .phi, .preheader => {},
         }
@@ -379,7 +402,7 @@ pub fn optimize(
                     in_pre[canon[instrs[i].a]] = true;
                     in_pre[canon[instrs[i].b]] = true;
                 },
-                .unary => in_pre[canon[instrs[i].a]] = true,
+                .unary, .cvt => in_pre[canon[instrs[i].a]] = true,
                 else => {}, // konst / invariant slot_load: leaf of the cone
             }
         }
@@ -438,7 +461,7 @@ pub fn optimize(
                 out.a = new_index[canon[ins.a]];
                 out.b = new_index[canon[ins.b]];
             },
-            .unary, .guard, .aload => out.a = new_index[canon[ins.a]],
+            .unary, .cvt, .guard, .aload => out.a = new_index[canon[ins.a]],
             .aref, .astore => {
                 out.a = new_index[canon[ins.a]];
                 out.b = new_index[canon[ins.b]];

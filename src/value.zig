@@ -228,6 +228,22 @@ fn reverse(o: NumOrder) NumOrder {
     };
 }
 
+/// The exact integer value of `f`, or `null` if `f` is not an integer that the
+/// x86 `cvttsd2si` instruction can round-trip — i.e. not finite, not integral, or
+/// outside `[-2^63, 2^63)`. This is the oracle for the trace JIT's `int_of_float`
+/// op (`src/trace.zig`): the recorder only specializes a float loop-limit to an int
+/// when this returns non-null, and the tier-1a executor side-exits exactly when it
+/// returns null — so tier-1a matches the native lowering's `cvttsd2si`-round-trip
+/// (`cvttsd2si; cvtsi2sd; ucomisd; jne/jp`) bit-for-bit. The `[-2^63, 2^63)` clamp
+/// mirrors `compareIntFloat` above: `2^63` is representable as f64 but not i64, so
+/// it (and anything larger, plus NaN/±inf) is rejected; `-2^63` is in range.
+pub fn floatAsExactInt(f: f64) ?i64 {
+    if (!std.math.isFinite(f)) return null; // NaN / ±inf
+    if (@trunc(f) != f) return null; // has a fractional part
+    if (f < -9223372036854775808.0 or f >= 9223372036854775808.0) return null;
+    return @intFromFloat(f);
+}
+
 /// Exact ordering of integer `i` against double `f`.
 fn compareIntFloat(i: i64, f: f64) NumOrder {
     if (std.math.isNan(f)) return .unordered;
@@ -255,6 +271,27 @@ test "Value is a 16-byte, 8-aligned slot with tag at offset 0" {
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(Value, "tag"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(Value, "payload"));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(Payload));
+}
+
+test "floatAsExactInt: integral in-range accepts, else rejects" {
+    const exp = std.testing.expectEqual;
+    // Integral, in range → exact value.
+    try exp(@as(?i64, 0), floatAsExactInt(0.0));
+    try exp(@as(?i64, 0), floatAsExactInt(-0.0));
+    try exp(@as(?i64, 5), floatAsExactInt(5.0));
+    try exp(@as(?i64, -4), floatAsExactInt(-4.0));
+    try exp(@as(?i64, 2560000), floatAsExactInt(2560000.0)); // an nsieve `m`
+    // Integral above 2^53 but below 2^63 (exactly representable) → still exact.
+    try exp(@as(?i64, 1 << 60), floatAsExactInt(@as(f64, @floatFromInt(@as(i64, 1) << 60))));
+    // -2^63 is in range (representable as both); +2^63 is not (clamped out).
+    try exp(@as(?i64, std.math.minInt(i64)), floatAsExactInt(-9223372036854775808.0));
+    try exp(@as(?i64, null), floatAsExactInt(9223372036854775808.0));
+    // Non-integral, NaN, ±inf → rejected.
+    try exp(@as(?i64, null), floatAsExactInt(5.5));
+    try exp(@as(?i64, null), floatAsExactInt(-0.5));
+    try exp(@as(?i64, null), floatAsExactInt(std.math.nan(f64)));
+    try exp(@as(?i64, null), floatAsExactInt(std.math.inf(f64)));
+    try exp(@as(?i64, null), floatAsExactInt(-std.math.inf(f64)));
 }
 
 test "constructors and accessors round-trip" {

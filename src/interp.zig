@@ -1130,9 +1130,20 @@ pub const Vm = struct {
                     // **without** advancing `pc`: tier-0 then re-runs the loop header
                     // to redo the (pure, side-effect-free) deopt iteration. A trace is
                     // only ever entered at exactly its anchor pc, so re-entry is sound.
-                    if (self.trace.config.execute and !self.trace.isRecording() and
-                        !self.trace.isGated(.{ .proto = proto, .pc = anchor_pc }))
-                    {
+                    // Per-entry trip-count gating: for a numeric-`for`, decline to
+                    // enter the trace when the remaining iteration count is below
+                    // `min_trip_entry` — tier-0 runs the short loop and we skip the
+                    // `onSideExit` penalty, so the inner loop's trivial large-stride
+                    // runs never gate its profitable long runs. `null` for any
+                    // non-`for_loop` back-edge (while/repeat) ⇒ always eligible.
+                    const for_trips: ?u64 = if (instr.op == .for_loop)
+                        forRemainingTrips(regs[a], regs[a + 1], regs[a + 2])
+                    else
+                        null;
+                    const eligible = self.trace.config.execute and !self.trace.isRecording() and
+                        !self.trace.isGated(.{ .proto = proto, .pc = anchor_pc });
+                    const trip_ok = for_trips == null or for_trips.? >= self.trace.config.min_trip_entry;
+                    if (eligible and trip_ok) {
                         // A gated anchor has proven it thrashes: every entry
                         // committed fewer than `min_useful` iterations until the
                         // re-entry penalty maxed out. The canonical case is a
@@ -1221,6 +1232,17 @@ pub const Vm = struct {
                             self.trace.countFingerprintMiss(.{ .proto = proto, .pc = anchor_pc });
                         }
                         // Fall through to tier-0.
+                    } else if (eligible and !trip_ok) {
+                        // Declined a numeric-`for` purely on trip count: cheap-skip
+                        // the rest of this short invocation so its remaining
+                        // back-edges don't each re-pay full `onBackEdge`
+                        // bookkeeping. `trip - 1` exactly covers the remainder (the
+                        // final `for_loop` exits without a back-edge), so the window
+                        // never bleeds into the next invocation's (possibly
+                        // profitable) entry at this same anchor.
+                        if (for_trips.? >= 2) {
+                            self.trace.armShortLoopSkip(proto, anchor_pc, for_trips.? - 1);
+                        }
                     }
                     // Reached only when no trace ran this back-edge — a successful
                     // trace entry above does `continue :outer` and never gets here.
@@ -1329,6 +1351,42 @@ pub const Vm = struct {
 fn writeSingleResult(regs: []Value, a: usize, nwanted: usize, result: Value) void {
     var k: usize = 0;
     while (k < nwanted) : (k += 1) regs[a + k] = if (k == 0) result else Value.nil();
+}
+
+/// Remaining iterations a numeric-`for` will still execute from its current
+/// state, *including* the iteration whose back-edge we are on:
+/// `(limit - idx)/step + 1`, clamped to `[0, u64max]`. `idx/limit/step` are
+/// `R[a]/R[a+1]/R[a+2]` of the just-executed `for_loop`.
+///
+/// Used only as a heuristic gate on trace *entry* (see the dispatch back-edge
+/// handler): a numeric-for whose remaining trip count is tiny is cheaper to run
+/// on tier-0 than to enter a native trace for, and — more importantly — declining
+/// to enter means no `onSideExit` penalty, so a loop that is profitable for some
+/// strides (many iterations) and trivial for others (a handful) never gates its
+/// shared anchor on the trivial runs. The exact value never affects correctness
+/// (tier-0 and the trace are equivalent), only whether entry is worth it, so the
+/// int path (exact, the common case) and the float fallback need only agree
+/// monotonically around the threshold. Computed in `i128`/`f64` to avoid overflow
+/// on extreme bounds.
+fn forRemainingTrips(idx: Value, limit: Value, step: Value) u64 {
+    const cap = std.math.maxInt(u64);
+    if (idx.isInt() and limit.isInt() and step.isInt()) {
+        const s: i128 = step.asInt();
+        if (s == 0) return cap; // degenerate (Lua would error); don't gate
+        const diff: i128 = @as(i128, limit.asInt()) - @as(i128, idx.asInt());
+        // For descending loops `diff` and `s` are both negative, so `@divFloor`
+        // still yields the correct non-negative quotient.
+        const cnt: i128 = @divFloor(diff, s) + 1;
+        if (cnt <= 0) return 0;
+        if (cnt >= cap) return cap;
+        return @intCast(cnt);
+    }
+    const s = step.toFloat();
+    if (s == 0) return cap;
+    const rem = (limit.toFloat() - idx.toFloat()) / s; // negative if past the end
+    if (!(rem >= 0)) return 0; // also catches NaN
+    if (rem >= @as(f64, @floatFromInt(cap - 1))) return cap;
+    return @as(u64, @intFromFloat(@floor(rem))) + 1;
 }
 
 /// Narrow a native's `anyerror` back into the interpreter's error set. Known
@@ -3952,6 +4010,7 @@ test "side traces: type-changing loop records a second trace at the same anchor"
     vm.trace.config.execute = true;
     vm.trace.config.hotloop = 4;
     vm.trace.config.hotguard = 3; // low threshold for test
+    vm.trace.config.min_trip_entry = 0; // exercise side traces on a short test loop
     vm.trace.config.record_exec_log = true;
 
     var buf: [64]u8 = undefined;
@@ -4003,6 +4062,7 @@ test "side traces: without side traces the anchor blacklists; with them it stays
         vm.trace.config.execute = true;
         vm.trace.config.hotloop = 4;
         vm.trace.config.hotguard = 1000; // effectively never
+        vm.trace.config.min_trip_entry = 0; // exercise entry on a short test loop
         vm.trace.config.max_penalty = 8; // blacklists after 8 zero-yield entries
 
         var buf: [64]u8 = undefined;
@@ -4037,6 +4097,7 @@ test "side traces: without side traces the anchor blacklists; with them it stays
         vm.trace.config.execute = true;
         vm.trace.config.hotloop = 4;
         vm.trace.config.hotguard = 3; // fire a side trace after 3 guard failures
+        vm.trace.config.min_trip_entry = 0; // exercise side traces on a short test loop
         vm.trace.config.max_penalty = 8; // (would blacklist without side traces)
 
         var buf: [64]u8 = undefined;
@@ -4518,6 +4579,66 @@ test "native: a compiled int loop that flips to float mid-run deopts and matches
     var osink = io.Writer.fixed(&obuf);
     try runCaptured(gpa, source, &osink, false, .off);
     try testing.expectEqualStrings(osink.buffered(), nsink.buffered());
+}
+
+test "native: int_of_float — a float-limit loop compiles native, then deopts on a non-integral limit, matching tier-0" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // The numeric-for limit is a FLOAT that is integral (`100.0`), so the recorder
+    // emits `int_of_float` to convert it to an exact i64 once (LICM-hoisted into the
+    // preheader), making the body compare int-vs-int — the whole reason `proveKinds`
+    // accepts the trace and it lowers to machine code. The function is called first
+    // with an integral float limit (compiles native + runs it), then with a
+    // *non-integral* limit (`100.5`): the native trace's `int_of_float` round-trip
+    // check (cvttsd2si;cvtsi2sd;ucomisd;jne/jp) fails and side-exits to tier-0, which
+    // runs the loop with the exact mixed int-vs-float compare. The result must equal a
+    // plain tier-0 run to the last unit — proving the convert-or-deopt is sound.
+    const source =
+        \\local function f(m)
+        \\  local acc = 0
+        \\  for i = 1, m do acc = acc + i end
+        \\  return acc
+        \\end
+        \\local s = 0
+        \\for _ = 1, 8 do s = s + f(100.0) end
+        \\s = s + f(100.0)
+        \\s = s + f(100.5)
+        \\print(s)
+    ;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var nbuf: [64]u8 = undefined;
+    var nsink = io.Writer.fixed(&nbuf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &nsink);
+    defer chunk.deinit();
+
+    // The float-limit loop did lower to machine code (int_of_float made it native-able)...
+    try testing.expect(vm.trace.cache.items[0].native == .compiled);
+    // ...and the native run (deopt on 100.5 included) is byte-identical to tier-0.
+    var obuf: [64]u8 = undefined;
+    var osink = io.Writer.fixed(&obuf);
+    try runCaptured(gpa, source, &osink, false, .off);
+    try testing.expectEqualStrings(osink.buffered(), nsink.buffered());
+}
+
+test "int_of_float: float-limit loop is byte-identical across all 8 modes (deopt on non-integral limit)" {
+    // Same convert-then-deopt shape, but pinned through the full mode matrix
+    // (off / record_only / record_execute_noopt / record_execute / native) × GC
+    // stress. record_execute_noopt keeps `int_of_float` in-body (one extra idempotent
+    // convert per iteration); record_execute / native hoist it into the preheader —
+    // all five must agree to the byte. The non-integral final call exercises the
+    // side-exit in every mode that runs the op.
+    try expectProgram(
+        \\local function f(m)
+        \\  local acc = 0
+        \\  for i = 1, m do acc = acc + i end
+        \\  return acc
+        \\end
+        \\local s = 0
+        \\for _ = 1, 8 do s = s + f(100.0) end
+        \\s = s + f(100.5)
+        \\print(s)
+    , "45450\n");
 }
 
 test "executor: integer //-by-zero inside a hot loop side-exits; tier-0 re-raises identically" {

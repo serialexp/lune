@@ -185,6 +185,23 @@ pub const IrOp = enum(u8) {
     /// enforces both that and the at-most-one-marker rule. Appended last so every
     /// prior ordinal (incl. `loop`/`phi`) stays stable for the wire format.
     preheader,
+
+    // ---- float→int loop-limit specialization (numeric-for) ----
+    /// `a` = a float value ref → its **exact integer value** (`ty == .int`), OR a
+    /// side-exit if the float is not an integer representable in `[-2^63, 2^63)`
+    /// (`value.floatAsExactInt` returns null). Both a value producer AND a guard.
+    ///
+    /// Emitted by `recForLoop` when a numeric-`for` has an int index+step but a
+    /// **float** limit whose observed value is an exact integer: tier-0 compares the
+    /// int index against the float limit EXACTLY (`compareIntFloat`), and for an
+    /// integral limit `L` in range `idx <= L ⟺ idx <= (i64)L`, so converting the
+    /// loop-invariant limit to an int once makes the body compare int-vs-int — which
+    /// the native backend can lower (a mixed int/float compare bails). If a later
+    /// entry's limit is non-integral the op side-exits at the loop header (completed
+    /// unchanged) and tier-0 runs the loop with the exact mixed compare. `aux` carries
+    /// the recording PC for exit-PC chaining, like the other side-exiting guards.
+    /// Appended last so every prior op's wire ordinal stays stable.
+    int_of_float,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -214,7 +231,7 @@ pub const IrInstr = struct {
 /// be 0); callers treat 0 as "no usable PC" since no loop-body guard sits at PC 0.
 pub fn guardExitPc(ins: IrInstr) ?u32 {
     return switch (ins.op) {
-        .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => @intCast(ins.aux),
+        .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float => @intCast(ins.aux),
         else => null,
     };
 }
@@ -379,6 +396,17 @@ pub const TraceConfig = struct {
     /// entry are exactly where a tracing JIT wins nothing, so retiring them to
     /// tier-0 (below) costs ~nothing.
     min_useful: u32 = 8,
+    /// Minimum remaining numeric-`for` trip count for a trace *entry* to be worth
+    /// it. At a `for_loop` back-edge whose computed remaining iteration count is
+    /// below this, the dispatch loop declines to enter the trace and lets tier-0
+    /// run the short loop. This keeps a loop that is profitable for some strides
+    /// (the inner nsieve loop runs `m/i` times — huge for small `i`) but trivial
+    /// for others (1–7 times for large `i`) from gating its shared anchor on the
+    /// trivial runs: declining entry means no `onSideExit` penalty, so the
+    /// profitable long runs stay traced. Only applies to `for_loop` (a clean,
+    /// computable trip count); while/repeat loops are entered as before. Set to 0
+    /// to disable. Heuristic — never affects output, only tiering.
+    min_trip_entry: u32 = 24,
     /// After this many *low-yield* trace entries (each committing fewer than
     /// `min_useful` iterations) an anchor is gated off so tier-0 owns the loop —
     /// the brake against re-entry thrash on type-unstable / branchy loops.
@@ -846,6 +874,18 @@ pub const TraceState = struct {
         }
     }
 
+    /// Install a precise hot-count skip of `n` back-edges on `anchor`. Used by the
+    /// dispatch loop when it declines to enter a numeric-`for` trace on trip-count
+    /// grounds: the rest of that short invocation (exactly `trip - 1` back-edges —
+    /// the final `for_loop` exits without one) should run on tier-0 without each
+    /// back-edge re-paying full `onBackEdge` bookkeeping, but the window must NOT
+    /// bleed past this invocation or it could skip the entry of a following
+    /// profitable (long) invocation at the same anchor. Because the count is exact,
+    /// it never bleeds. Unlike `GATE_SKIP` this does not imply the anchor is gated.
+    pub fn armShortLoopSkip(self: *TraceState, proto: *const Proto, pc: u32, n: u64) void {
+        self.hotcount[hotIndex(proto, pc)] = @intCast(@min(n, std.math.maxInt(u16)));
+    }
+
     // --- state machine -----------------------------------------------------
 
     /// Called by the interpreter whenever a back-edge fires (a backward/self jump
@@ -1049,6 +1089,8 @@ pub const TraceState = struct {
                 .neg, .not, .bnot, .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => {
                     std.debug.assert(ins.a < i);
                 },
+                // `int_of_float` reads its sole float operand `a` (a prior node).
+                .int_of_float => std.debug.assert(ins.a < i),
                 // `aref` pairs (table, index) into an address descriptor;
                 // `astore` reads the `aref` (`a`) and the value to write (`b`).
                 .aref, .astore => std.debug.assert(ins.a < i and ins.b < i),
@@ -1179,7 +1221,10 @@ pub const TraceState = struct {
     fn emit(self: *TraceState, ins: IrInstr) !Ref {
         var ins_mut = ins;
         switch (ins_mut.op) {
-            .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => {
+            // `int_of_float` is value-producing but also side-exits, so it stamps
+            // its PC for exit-PC chaining like the type guards (its `aux` is unused
+            // for anything else — the result kind is `.int`, the operand is `a`).
+            .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float => {
                 ins_mut.aux = @intCast(self.rec.cur_pc);
             },
             else => {},
@@ -1496,12 +1541,29 @@ pub const TraceState = struct {
         const all_int = vidx.isInt() and vstep.isInt();
         const rnext = try self.emit(.{ .op = .add, .a = ridx, .b = rstep, .ty = if (all_int) .int else .float });
 
+        // Float loop-limit specialization: when the index+step are int but the limit
+        // is a **float** whose observed value is an exact integer, convert the
+        // (loop-invariant) limit to an int once via `int_of_float`, so the body
+        // compare is int-vs-int. tier-0 compares int-vs-float EXACTLY, and for an
+        // integral limit `L` in i64 range `idx <= L ⟺ idx <= (i64)L` — so the trip
+        // count and registers are byte-identical, while the native backend (which
+        // bails on a mixed compare) can now lower it. A later non-integral limit
+        // side-exits the op → tier-0 resumes the exact mixed compare. The `guard_float`
+        // already emitted by `guardNum(rlimit, vlimit)` pins this trace to float-limit
+        // entries. The limit is never written by the loop, so the exit snapshot is
+        // unchanged. Only fires for an integral, in-range limit (else stays mixed,
+        // bails to tier-1a as before).
+        const rlimit_cmp = if (all_int and vlimit.isFloat() and value.floatAsExactInt(vlimit.asFloat()) != null)
+            try self.emit(.{ .op = .int_of_float, .a = rlimit, .ty = .int })
+        else
+            rlimit;
+
         // loop continues while (ascending) idx_next <= limit, else limit <= idx_next.
         const ascending = vstep.toFloat() >= 0;
         const cmp = if (ascending)
-            try self.emit(.{ .op = .le, .a = rnext, .b = rlimit, .ty = .boolean })
+            try self.emit(.{ .op = .le, .a = rnext, .b = rlimit_cmp, .ty = .boolean })
         else
-            try self.emit(.{ .op = .le, .a = rlimit, .b = rnext, .ty = .boolean });
+            try self.emit(.{ .op = .le, .a = rlimit_cmp, .b = rnext, .ty = .boolean });
         _ = try self.emit(.{ .op = .guard_true, .a = cmp });
 
         // publish the stepped index and the loop variable (R[a+3]).
@@ -1652,6 +1714,7 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_bounds,
         .guard_present,
         .guard_fits,
+        .int_of_float,
         => try w.print("%{d}", .{ins.a}),
         .loop, .preheader => {},
         // φ: a slot-bound φ prints `update=%b → r{slot}` (init is implicit

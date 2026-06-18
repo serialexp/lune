@@ -202,6 +202,26 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
 
+                // ---- float→int loop-limit specialization ----
+                // Convert the (loop-invariant) float limit to its exact integer
+                // value, or side-exit if it is not an integer representable in
+                // [-2^63, 2^63). `value.floatAsExactInt` is the SAME predicate the
+                // native lowering's `cvttsd2si` round-trip implements, so tier-1a and
+                // native agree bit-for-bit. The operand is float (a dominating
+                // guard_float already side-exited otherwise); be defensive anyway.
+                .int_of_float => {
+                    const v = values[ins.a];
+                    if (v.isFloat()) {
+                        if (value.floatAsExactInt(v.asFloat())) |iv| {
+                            values[i] = Value.int(iv);
+                            if (record) rec.value(i, values[i]);
+                            continue;
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, v);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+
                 // ---- lane-aware packed-array read path (Phase B) ----
                 //
                 // `aref` carries no usable Value — it only pairs (table, index)
