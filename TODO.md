@@ -270,3 +270,34 @@ recorder emits a `guard_int` on a *derived* value (`i+7`), and Pass A only prove
 `guard_int` whose operand is a `slot_load`. Fixing #1 (relax `guard_int` onto
 already-proven-`Int` derived values → no-op) lifts this fallback. Tracked under #1;
 no separate work item.
+
+## Native int store: constant-value stores stay tier-1a (pre-existing, shared)
+A constant int store into a narrow lane (`t[i]=7`, both in-bounds `astore` and
+grow `astore_append`) does NOT lower to native: the trace optimizer folds the
+provably-in-range `guard_fits`, so `proveKinds` finds no `fits_ok` proof for the
+value and rejects the trace. Dynamic values (`t[i]=i`) are unaffected and compile.
+Fix (separate, benefits both store paths): in `nativegen.proveKinds`, treat an
+int-lane store value as fits-proven when it is a `konst` whose constant fits the
+guard_lane-pinned lane width (sound: guard_lane pins the lane, so an in-range
+constant always fits). Noted while landing Phase B (int astore_append).
+
+## Phase B int astore_append: WIDEN-FLICKER blocks the canonical t[i]=i (next lever)
+Profiled (load-corrected). The int grow store lowers correctly and is FAST when the
+lane is stable: a pre-widened i32 fill (`t[1]=2e9; for i=2,N do t[i]=i end`) runs
+0.01s native vs 0.09s tier-0 (9x, matches LuaJIT 0.01s), 82% native [JIT].
+BUT the headline idiom `for i=1,N do t[i]=i end` runs ~88% tier-0 (no win): the value
+crosses i8->i16->i32, and each monotonic widen invalidates the current-lane trace.
+The stale trace is then re-entered every iteration, fails guard_lane at iteration 0
+(completed==0 < min_useful=8 -> onSideExit penalises the anchor), penalty maxes
+(max_penalty=8) -> gateAnchor cooldown, repeated across the two widens -> the i32
+steady state (~99% of iterations) never gets a stable trace.
+FIX (own change + determinism review): when a trace side-exits with completed==0 due to
+a guard_lane mismatch where the live lane is WIDER than the trace's lane (monotonic, so
+the old-lane trace is permanently dead), retire/replace that trace and allow immediate
+re-record on the new lane, instead of charging the anchor an onSideExit penalty. This
+is the only thing between Phase B and a fast `t[i]=i`.
+
+## Phase B int astore_append: loop-INVARIANT int value (t[i]=v) is "unsupported"
+`local v=1000; for i=1,N do t[i]=v end` records but proveKinds rejects the trace (the
+invariant value isn't proven .int / fits-covered after loop-invariant handling). Smaller
+follow-up; affects another common fill idiom. Characterise + fix alongside the flicker.

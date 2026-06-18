@@ -82,6 +82,18 @@ pub const Lane = enum(u8) {
             .i8, .i16, .i32, .i64, .f64 => true,
         };
     }
+
+    /// True for the fixed-width signed-int lanes (`i8…i64`). These share a single
+    /// native store shape — a width-truncating data write plus a presence-bit set
+    /// (`encode`) — so the JIT grow/in-bounds store paths branch on this to pick
+    /// the int lowering vs the boolean in-band byte. `.f64` is excluded: it needs
+    /// XMM stores the native array path does not yet emit.
+    pub fn isInt(self: Lane) bool {
+        return switch (self) {
+            .i8, .i16, .i32, .i64 => true,
+            .value, .boolean, .f64 => false,
+        };
+    }
 };
 
 /// Frozen field offsets for the tier-1b JIT (Phase B, `B0`). Phase B addresses
@@ -366,7 +378,17 @@ pub const ArrayPart = extern struct {
     }
 
     fn bitmapBytes(slots: usize) usize {
-        return (slots + 7) / 8;
+        // Round up to whole 64-bit words, NOT bytes. The native presence path lowers
+        // to a REX.W `bts`/`bt [present], idx` (x64.btsMemReg) whose memory operand is
+        // 8 bytes wide: for a slot in word k it touches `[present + 8*k, +8)`. A
+        // byte-exact `(slots+7)/8` bitmap (e.g. 1 byte at cap 8) would let that 8-byte
+        // access run past the allocation — a latent OOB the native int-store path
+        // (in-bounds astore and grow astore_append) would trip on small arrays. Sizing
+        // to `ceil(slots/64)*8` bytes makes every in-range `bts` land inside the
+        // buffer. Tier-0's byte-granular `setBit`/`isPresent` are unaffected; the extra
+        // trailing bytes are zeroed (allocPresence) and never read as presence for
+        // slots >= cap.
+        return ((slots + 63) / 64) * 8;
     }
 
     /// Does `val` fit the current lane without widening? `nil` always fits (it is
@@ -958,6 +980,46 @@ test "eager commit via the convert arm (data!=null at len==0) is OOM-safe" {
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Inner.run, .{});
+}
+
+test "presence bitmap is sized to whole 64-bit words (native bts can't run past it)" {
+    // The native presence path uses a REX.W `bts [present], idx` that accesses the
+    // 8-byte word holding bit `idx`. So the bitmap for `cap` slots must be at least
+    // `ceil((cap-1)/64 + 1)` words = enough that a `bts` at the top slot (cap-1)
+    // stays in-bounds. Pin both the word-multiple and the sufficiency here so a
+    // regression to a byte-exact `(cap+7)/8` size (which OOBs for cap<64) fails loudly.
+    const cases = [_]usize{ 0, 1, 8, 16, 63, 64, 65, 128, 1000 };
+    for (cases) |cap| {
+        const bytes = ArrayPart.presenceBytes(cap);
+        try testing.expectEqual(@as(usize, 0), bytes % 8); // whole 64-bit words
+        if (cap > 0) {
+            // The word touched by a bts at the highest slot must be fully inside.
+            const top_word = (cap - 1) / 64;
+            try testing.expect(bytes >= (top_word + 1) * 8);
+        }
+    }
+}
+
+test "appendInCap on an int lane encodes the value and sets the presence bit" {
+    // `appendInCap` is the on-trace `astore_append` oracle (tier-1a) that native
+    // Phase-B int lowering must match byte-for-byte. Unlike the bool lane (in-band
+    // presence), an int lane uses a *separate* presence bitmap, so the oracle's
+    // `encode` must both write the width-truncated value AND set the bit — the exact
+    // pair the native int grow store emits (`[data]=value(w)` + `bts [present],idx0`).
+    const gpa = testing.allocator;
+    var a: ArrayPart = .empty;
+    defer a.deinit(gpa);
+    try a.append(gpa, Value.int(7)); // eager-commit → .i8, len 1
+    try testing.expectEqual(Lane.i8, a.lane);
+    try testing.expect(a.lane.usesPresenceBitmap());
+    // Secure room for an in-cap append, then drive the oracle directly (no realloc).
+    try a.ensureCapacity(gpa, a.len + 1);
+    const before = a.len; // 1 (logical len); the new slot's 0-based index is `before`
+    a.appendInCap(Value.int(42));
+    try testing.expectEqual(before + 1, a.len);
+    try testing.expectEqual(Value.int(42), a.get(before + 1)); // new slot round-trips (1-based)
+    try testing.expect(a.isPresent(before)); // its presence bit set (0-based slot index)
+    try testing.expectEqual(Value.int(7), a.get(1)); // earlier slot intact
 }
 
 test "Layout offsets are stable and lane is first" {

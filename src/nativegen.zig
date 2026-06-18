@@ -569,28 +569,41 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             // aref addresses a writable slot — here `data[len]`, the in-cap append
             // successor (idx==len+1, len<cap) into a migrate-free (empty-hash) table.
             // Marks the aref bounds-checked so the following astore_append may store.
-            // Phase A: boolean lane only (the lane was already pinned by guard_lane).
+            // bool + i8…i64 (the lanes laneKind lowers); `.value`/`.f64` → tier-1a.
             .guard_append => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
                 const aref_ins = t.instrs[ins.a];
-                if (aref_ins.aux != BOOL_LANE) return false; // Phase A: bool lane only
+                if (laneKind(aref_ins.aux) == null) return false; // .value/.f64 → tier-1a
                 if (!laneConsistent(&trace_lane, aref_ins.aux)) return false;
                 bounds_ok[ins.a] = true;
                 kinds[i] = .none;
             },
-            // astore_append: append the proven-`.bool` value at `data[len]` and bump
-            // len. Like astore, gated on a dominating bounds proof (guard_append) on
-            // the same aref. Boolean lane only in Phase A (one byte/slot, no presence
-            // bitmap); the value must be a proven boolean.
+            // astore_append: append the value at `data[len]` and bump len. Like
+            // astore, gated on a dominating bounds proof (guard_append) on the same
+            // aref. Same lane/value rules as the in-bounds astore: bool lane stores a
+            // proven boolean (in-band byte); int lanes store a proven int covered by a
+            // dominating guard_fits (so the width-truncating native store is exact).
             .astore_append => {
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
-                const aref_ins = t.instrs[ins.a];
-                if (aref_ins.aux != BOOL_LANE) return false; // Phase A: bool lane only
-                if (!laneConsistent(&trace_lane, aref_ins.aux)) return false;
+                // Validate the lane `lower()` actually switches on (`ins.aux`), exactly
+                // like the in-bounds `astore` — not the aref's aux. The aref arm already
+                // pinned its own aux to `trace_lane`, so checking `ins.aux` against
+                // `trace_lane` here forces ins.aux == aref.aux transitively; a trace
+                // whose astore_append.aux disagreed with its aref would be rejected
+                // rather than lowered with a mismatched width/lane.
+                const lk = laneKind(ins.aux) orelse return false; // .value/.f64 → tier-1a
+                if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 if (!bounds_ok[ins.a]) return false; // guard_append must dominate
-                if (kinds[ins.b] != .bool) return false; // bool lane stores a boolean
+                switch (lk) {
+                    .bool => if (kinds[ins.b] != .bool) return false,
+                    .int => {
+                        if (kinds[ins.b] != .int) return false;
+                        if (!fits_ok[ins.b]) return false; // guard_fits ⇒ width store is exact
+                    },
+                    else => return false, // laneKind only yields .bool/.int
+                }
                 kinds[i] = .none;
             },
             .loop => {
@@ -1087,10 +1100,12 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
 
         // Which array base each consuming op needs, attributed to the `.ptr` slot its
         // `aref.a` resolves to. (guard_bounds → len; bool guard_present/aload/astore →
-        // data; int guard_present → present; int astore → data + present.)
+        // data; int guard_present → present; int astore/astore_append → data + present.)
+        // astore_append also bumps len in memory, but via a re-fetched table pointer in
+        // rax (no len_home for an append trace), so it needs no len reservation here.
         for (t.instrs) |ins| {
             const aref_ref: usize = switch (ins.op) {
-                .guard_bounds, .guard_present, .aload, .astore => @intCast(ins.a),
+                .guard_bounds, .guard_present, .aload, .astore, .astore_append => @intCast(ins.a),
                 else => continue,
             };
             const aref_ins = t.instrs[aref_ref];
@@ -1106,7 +1121,7 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                     need_present[sid] = true;
                 },
                 .aload => need_data[sid] = true,
-                .astore => {
+                .astore, .astore_append => {
                     need_data[sid] = true;
                     if (!is_bool) need_present[sid] = true;
                 },
@@ -1114,6 +1129,19 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             }
         }
 
+        // An astore_append bumps `len` in memory only (no len_home writeback — see the
+        // lowering), so a `len` register hoisted by a sibling guard_bounds on the same
+        // table would go stale the moment the append commits. Don't hoist `len` for any
+        // trace that contains an astore_append; guard_bounds then reloads `len` from the
+        // table each iteration (always the committed value). A pure append fill has no
+        // guard_bounds, so this costs it nothing.
+        var has_append = false;
+        for (t.instrs) |ins| {
+            if (ins.op == .astore_append) {
+                has_append = true;
+                break;
+            }
+        }
         for (slots.items, 0..) |*s, sid| {
             if (s.class == .write_only) continue;
             if (need_data[sid]) {
@@ -1130,7 +1158,7 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                     used_callee |= regBit(r) & CALLEE_SAVED_MASK;
                 }
             }
-            if (need_len[sid]) {
+            if (need_len[sid] and !has_append) {
                 if (pickRegFrom(&free, &BASE_HOME_ORDER)) |r| {
                     s.len_home = r;
                     home_reg_mask |= regBit(r);
@@ -2267,15 +2295,39 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // as-is; a spilled home is reloaded fresh into rax) for the len bump.
             .astore_append => {
                 const aref_ins = t.instrs[ins.a];
-                // bool-lane byte store, identical to the in-bounds astore bool path.
-                const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
-                const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                try a.leaRegMemSib(.rax, datareg, ireg, 1, 0); // rax = &data[idx0]
-                try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // value 0/1 → rcx
-                try a.incReg(.rcx); // 0→1 (false), 1→2 (true)
-                try a.storeMemReg(.rax, 1, 0, .rcx); // mov byte [rax], cl
+                if (ins.aux == BOOL_LANE) {
+                    // bool-lane byte store, identical to the in-bounds astore bool path.
+                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.leaRegMemSib(.rax, datareg, ireg, 1, 0); // rax = &data[idx0]
+                    try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // value 0/1 → rcx
+                    try a.incReg(.rcx); // 0→1 (false), 1→2 (true)
+                    try a.storeMemReg(.rax, 1, 0, .rcx); // mov byte [rax], cl
+                } else {
+                    // int lane (i8…i64): identical to the in-bounds astore int path —
+                    // width-truncating data store (guard_fits proved it fits) followed
+                    // by the presence bit. Unlike the bool byte, the presence bitmap is
+                    // a *separate* write, so this is two stores; both must land before
+                    // the len bump publishes the slot as live.
+                    const w = intLaneWidth(ins.aux);
+                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.leaRegMemSib(.rax, datareg, ireg, w, 0); // rax = &data[idx0]
+                    try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
+                    try a.storeMemReg(.rax, w, 0, .rcx); // [rax] = (lane-width) value
+                    // presence bit: bts [present], idx0. [I5] commit point for the
+                    // absent→present transition (recArraySet refuses nil/out-of-lane,
+                    // so this never clears). Re-materialize present base + idx0 (the
+                    // data store clobbered rax/rcx if they were the fallback homes).
+                    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
+                    const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.btsMemReg(preg, 0, pireg);
+                }
                 // len += 1, in place in the table struct (no len_home for appends). The
-                // table pointer is re-fetched into rax (the bool store clobbered it).
+                // table pointer is re-fetched into rax (the value/presence stores above
+                // clobbered it). Bumping len LAST publishes the fully-written slot —
+                // identical for both lanes, and the single point any later guard's
+                // side-exit observes the append as already committed.
                 const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
                 try a.incMemQword(tbreg, ArrLayout.array_base + ArrLayout.len);
             },

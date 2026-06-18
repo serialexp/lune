@@ -1466,9 +1466,14 @@ pub const TraceState = struct {
         // than abort the whole trace (the historic behaviour — the fill then ran fully
         // tier-0), record an `astore_append` guarded so the realloc/migrate cases fall
         // back to tier-0 while the in-capacity common case runs native. Phase A: the
-        // boolean lane only (one byte/slot, no presence bitmap — the simplest grow
-        // store); other narrow lanes still abort below.
-        if (lane == .boolean and
+        // boolean lane (one in-band byte/slot) and the fixed-width int lanes
+        // (i8…i64: width store + presence bit) — exactly the lanes the native
+        // in-bounds `astore` lowers (`nativegen.laneKind`). `.f64` needs XMM stores
+        // the array path does not yet emit, so it (and `.value`) still abort below.
+        // The emitted IR sequence is lane-generic; `guard_fits` (below) supplies the
+        // int lane's runtime range check, and the value's static `.int` kind comes
+        // from its producing ref (the loop slot) — same as the in-bounds int store.
+        if ((lane == .boolean or lane.isInt()) and
             idx == @as(i64, @intCast(tbl.array.len)) + 1 and
             tbl.hash.count() == 0 and
             tbl.array.fits(vval))

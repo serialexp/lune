@@ -4758,6 +4758,66 @@ test "eager commit: a dense-from-1 bool fill is byte-identical across all 8 mode
     , "5000\n");
 }
 
+test "astore_append (int lane): a dense-from-1 fill (t[i]=i) compiles native and matches tier-0" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // `for i=1,N do t[i]=i end` — the int analogue of the bool fill, storing the loop
+    // counter. Eager commit narrows to `.i8` on the first append; the value then
+    // outgrows the lane (i==128) and `guard_fits` side-exits to tier-0, which WIDENS
+    // (i8→i16) and re-enters, so the steady-state append trace records on the i16 lane.
+    // The recorder emits guard_append + guard_fits + astore_append and proveKinds now
+    // admits the int grow store, so it lowers to a width store + `bts [present]` +
+    // `inc [len]` (Phase B). The read loop sums the values, exercising int aload too.
+    // (A *constant* fill like `t[i]=7` stays tier-1a today: the optimizer folds the
+    // provably-in-range guard_fits, leaving no fits proof — a pre-existing gap shared
+    // with the in-bounds int astore, tracked separately. A dynamic value is the case
+    // Phase B targets.)
+    const source =
+        \\local t = {}
+        \\for i = 1, 5000 do t[i] = i end
+        \\local c = 0
+        \\for i = 1, 5000 do c = c + t[i] end
+        \\print(c)
+    ;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var nbuf: [64]u8 = undefined;
+    var nsink = io.Writer.fixed(&nbuf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &nsink);
+    defer chunk.deinit();
+
+    var saw_append = false;
+    var compiled_append = false;
+    for (vm.trace.cache.items) |tr| {
+        for (tr.instrs) |ins| {
+            if (ins.op == .astore_append) {
+                saw_append = true;
+                if (tr.native == .compiled) compiled_append = true;
+            }
+        }
+    }
+    try testing.expect(saw_append);
+    try testing.expect(compiled_append);
+    var obuf: [64]u8 = undefined;
+    var osink = io.Writer.fixed(&obuf);
+    try runCaptured(gpa, source, &osink, false, .off);
+    try testing.expectEqualStrings(osink.buffered(), nsink.buffered());
+}
+
+test "astore_append (int lane): a widening int fill is byte-identical across all 8 modes" {
+    // The full matrix for an int grow store that crosses a lane boundary. The grow
+    // store, its guard_fits side-exit, the tier-0 widen, and the separate presence
+    // bitmap must all land identically in tier-0, tier-1a, and native — a missed len
+    // bump, a wrong width store, or an unset presence bit would change the printed sum.
+    try expectProgram(
+        \\local t = {}
+        \\for i = 1, 5000 do t[i] = i end
+        \\local c = 0
+        \\for i = 1, 5000 do c = c + t[i] end
+        \\print(c)
+    , "12502500\n");
+}
+
 test "executor: integer //-by-zero inside a hot loop side-exits; tier-0 re-raises identically" {
     const source =
         \\local x = 0
