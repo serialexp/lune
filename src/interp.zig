@@ -885,8 +885,54 @@ pub const Vm = struct {
                     const t = try self.heap.newTable();
                     regs[a] = Value.heap(&t.header);
                 },
-                .get_index => regs[a] = try indexGet(regs[instr.b], regs[instr.c]),
-                .set_index => try self.indexSet(regs[a], regs[instr.b], regs[instr.c]),
+                .get_index => {
+                    // Array fast-path: a table indexed by an in-range integer key
+                    // reads straight from the typed array part, skipping the
+                    // `indexGet → Table.get → normalizeKey → getInt` call layering
+                    // (the ~22% `Table.get` in the nsieve profile). This is a pure
+                    // shortcut to the exact value `getInt` would return for an
+                    // in-bounds int key (table.zig:105); every other shape — float
+                    // key, out-of-range, hash-resident, non-table — falls through
+                    // to the unchanged helper, so semantics and determinism are
+                    // identical (no allocation on either branch).
+                    const container = regs[instr.b];
+                    const key = regs[instr.c];
+                    regs[a] = blk: {
+                        if (container.isHeap() and container.heapType() == .table and key.isInt()) {
+                            const tbl = table.Table.fromHeader(container.asHeap());
+                            const i = key.asInt();
+                            if (i >= 1 and i <= @as(i64, @intCast(tbl.array.len)))
+                                break :blk tbl.array.get(@intCast(i));
+                        }
+                        break :blk try indexGet(container, key);
+                    };
+                },
+                .set_index => {
+                    // Array fast-path mirror of `.get_index`: an in-bounds integer
+                    // store whose value already fits the current lane is the exact
+                    // work `Table.set`'s in-bounds branch does (table.zig:121 →
+                    // `setInPlace`, which with a fitting value is just `encode` —
+                    // no widen, no `migrateFromHash`, no allocation). `setInLane`
+                    // (array.zig:209) is that allocation-free `encode`. A
+                    // lane-missing value, append (`i == len+1`), out-of-range,
+                    // float/nil/NaN key, or non-table all fall through to the
+                    // unchanged `indexSet`, which owns widen/append/hash/delete.
+                    const container = regs[a];
+                    const key = regs[instr.b];
+                    const val = regs[instr.c];
+                    fast: {
+                        if (container.isHeap() and container.heapType() == .table and key.isInt()) {
+                            const tbl = table.Table.fromHeader(container.asHeap());
+                            const i = key.asInt();
+                            if (i >= 1 and i <= @as(i64, @intCast(tbl.array.len)) and tbl.array.fits(val)) {
+                                tbl.array.setInLane(@intCast(i), val);
+                                self.heap.writeBarrier(&tbl.header, val); // no-op until Phase 4
+                                break :fast;
+                            }
+                        }
+                        try self.indexSet(container, key, val);
+                    }
+                },
 
                 // ---- globals ----
                 .get_global => regs[a] = self.globals.get(proto.constants[instr.b]),
