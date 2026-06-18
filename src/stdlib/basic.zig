@@ -1,0 +1,370 @@
+//! lune stdlib — the basic-library scalar helpers `type`, `tostring`,
+//! `tonumber`, `select`, `rawequal`/`rawget`/`rawset`/`rawlen`, plus the
+//! string-returning `math.type` and the pure `os.difftime`.
+//!
+//! These are the "make it usable" core functions — every one a **pure,
+//! deterministic** computation over its argument `Value`s (tier `core` in
+//! `docs/lua-stdlib-inventory.csv`). They touch neither host effects, the trace
+//! recorder, nor the safepoint counter, so they are determinism-invisible: a
+//! `.fast`/`.full` interpreter run produces byte-identical output.
+//!
+//! Unlike `stdlib/math.zig` (which ignores `ctx`), several natives here need the
+//! `*Vm` — to **intern** a result string (`type`/`tostring`/`math.type`) or to
+//! reach the heap. So this module imports `interp` and recovers the VM via
+//! `vmOf(ctx)`, exactly like `stdlib/base.zig`. The two genuinely-shared coercion
+//! helpers (`interp.coerceConcat`, `interp.strBytes`) stay in `interp.zig` and are
+//! referenced qualified, matching the `stdlib/table.zig` precedent.
+//!
+//! ## `select` and the multi-return ABI
+//!
+//! `select(n, ...)` returns the arguments after the n-th (or, for the literal
+//! string `"#"`, their count). It is a `multi` native: the primary `func`
+//! projection yields the first selected value, and the `multi` impl streams the
+//! tail into the caller's register window. Per the `NativeMultiFn` aliasing
+//! contract, `out` overlaps `args` (`out[k+1] == args[k]`); writing the tail
+//! left-to-right is safe because every source index `n+j` is strictly greater
+//! than the aliased destination index `j-1` (since `n >= 1`) — the classic
+//! Lua "shift down" that never clobbers an unread source.
+
+const std = @import("std");
+const value = @import("../value.zig");
+const function = @import("../function.zig");
+const interp = @import("../interp.zig");
+const table_mod = @import("../table.zig");
+const string_mod = @import("../string.zig");
+const io = @import("../io.zig");
+
+const Value = value.Value;
+const Table = table_mod.Table;
+const Vm = interp.Vm;
+
+inline fn vmOf(ctx: *anyopaque) *Vm {
+    return @ptrCast(@alignCast(ctx));
+}
+
+// ---------------------------------------------------------------------------
+// type / tostring
+// ---------------------------------------------------------------------------
+
+/// `type(v)` — the Lua type name of `v` as a string. Reuses `Value.typeName`
+/// (the single source of truth shared with diagnostics): numbers → "number",
+/// closures and natives → "function", tables/typed-arrays → "table".
+fn bType(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    if (args.len == 0) return error.TypeError; // Lua: "bad argument #1 to 'type' (value expected)"
+    return vm.heap.internValue(args[0].typeName());
+}
+
+/// `tostring(v)` — render `v` to a string. A string returns itself (no copy); any
+/// other value is rendered through `io.writeValue` (the same text `print` emits,
+/// so the two never disagree) into a bounded stack buffer, then interned. There
+/// are no metatables yet, so there is no `__tostring`/`__name` to honour — the
+/// default rendering is the whole job.
+fn bToString(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    const v = if (args.len == 0) Value.nil() else args[0];
+    if (v.isHeap() and v.heapType() == .string) return v; // already a string
+    // Non-string renderings are bounded: scalars (<~32 bytes) and the
+    // "kind: 0x<id>" identity form for heap objects. 128 bytes is ample.
+    var buf: [128]u8 = undefined;
+    var w = io.Writer.fixed(&buf);
+    io.writeValue(&w, v) catch unreachable; // fixed buffer is large enough
+    return vm.heap.internValue(w.buffered());
+}
+
+// ---------------------------------------------------------------------------
+// tonumber — relocated from interp.zig's bench stdlib (name kept: "tonumber")
+// ---------------------------------------------------------------------------
+
+/// `tonumber(v [, base])`. Numbers pass through. A string is trimmed and parsed:
+/// with an explicit `base` as an integer in that base; otherwise auto (int first —
+/// honoring a `0x` prefix — then float). Anything unparseable / non-numeric → nil.
+fn bToNumber(_: *anyopaque, args: []const Value) anyerror!Value {
+    if (args.len == 0) return Value.nil();
+    const v = args[0];
+
+    // Explicit base form: `tonumber(s, base)` — string interpreted as an integer.
+    if (args.len >= 2 and args[1].isNumber()) {
+        const base_i = args[1].toFloat();
+        if (base_i < 2 or base_i > 36) return Value.nil();
+        const base: u8 = @intFromFloat(base_i);
+        const s = interp.strBytes(v) orelse return Value.nil();
+        const t = std.mem.trim(u8, s, " \t\n\r");
+        if (t.len == 0) return Value.nil();
+        const parsed = std.fmt.parseInt(i64, t, base) catch return Value.nil();
+        return Value.int(parsed);
+    }
+
+    switch (v.tag) {
+        .int, .float => return v,
+        else => {},
+    }
+    const s = interp.strBytes(v) orelse return Value.nil();
+    const t = std.mem.trim(u8, s, " \t\n\r");
+    if (t.len == 0) return Value.nil();
+    if (std.fmt.parseInt(i64, t, 0)) |iv| {
+        return Value.int(iv);
+    } else |_| {}
+    if (std.fmt.parseFloat(f64, t)) |fv| {
+        return Value.float(fv);
+    } else |_| {}
+    return Value.nil();
+}
+
+// ---------------------------------------------------------------------------
+// select
+// ---------------------------------------------------------------------------
+
+/// Resolve `select`'s first argument to a 1-based start index into the *tail*
+/// (`args[1..]`). `"#"` is handled by callers before this. A negative `n` counts
+/// from the end (`-1` = the last argument). Returns the 0-based index *into
+/// `args`* of the first selected value, clamped so an out-of-range positive `n`
+/// yields an empty selection (Lua errors on `n == 0` or `|n|` past the end; we
+/// surface those as `TypeError`).
+fn selectStart(args: []const Value) error{TypeError}!usize {
+    if (args.len == 0 or !args[0].isNumber()) return error.TypeError;
+    const nargs: i64 = @intCast(args.len - 1); // count of values after the selector
+    var n = args[0].asInt();
+    if (args[0].isFloat()) {
+        const f = args[0].asFloat();
+        if (@trunc(f) != f) return error.TypeError; // non-integer index
+        n = @intFromFloat(f);
+    }
+    if (n < 0) n += nargs + 1; // -1 → last
+    if (n < 1 or n > nargs + 1) return error.TypeError; // Lua: index out of range (n==nargs+1 → empty)
+    return @intCast(n); // 0-based index into args of the first selected value
+}
+
+/// `select("#", ...)` returns the count of extra args; this is the primary
+/// projection helper distinguishing the `"#"` form from the numeric form.
+fn isHashSelector(v: Value) bool {
+    if (interp.strBytes(v)) |s| return s.len == 1 and s[0] == '#';
+    return false;
+}
+
+fn bSelect1(_: *anyopaque, args: []const Value) anyerror!Value {
+    if (args.len >= 1 and isHashSelector(args[0])) {
+        return Value.int(@intCast(args.len - 1));
+    }
+    const start = try selectStart(args);
+    if (start >= args.len) return Value.nil(); // empty selection
+    return args[start];
+}
+
+fn bSelectN(_: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    if (args.len >= 1 and isHashSelector(args[0])) {
+        if (out.len >= 1) out[0] = Value.int(@intCast(args.len - 1));
+        return @min(@as(usize, 1), out.len);
+    }
+    const start = try selectStart(args);
+    // Stream args[start..] into out. Safe under the aliasing contract: source
+    // index (start + k) is always > destination's aliased index (k - 1).
+    var k: usize = 0;
+    while (start + k < args.len and k < out.len) : (k += 1) {
+        out[k] = args[start + k];
+    }
+    return k;
+}
+
+// ---------------------------------------------------------------------------
+// raw access (no metatables exist, so these match the ordinary semantics today)
+// ---------------------------------------------------------------------------
+
+fn tableArg(args: []const Value, i: usize) error{TypeError}!*Table {
+    if (i >= args.len) return error.TypeError;
+    const v = args[i];
+    if (!v.isHeap() or v.heapType() != .table) return error.TypeError;
+    return Table.fromHeader(v.asHeap());
+}
+
+/// `rawequal(a, b)` — primitive equality, bypassing any `__eq`. With no
+/// metatables this is exactly `Value.eql` (numbers compare across the int/float
+/// boundary, heap objects by stable id).
+fn bRawEqual(_: *anyopaque, args: []const Value) anyerror!Value {
+    const a = if (args.len >= 1) args[0] else Value.nil();
+    const b = if (args.len >= 2) args[1] else Value.nil();
+    return Value.boolean(a.eql(b));
+}
+
+/// `rawget(t, k)` — `t[k]` without `__index`.
+fn bRawGet(_: *anyopaque, args: []const Value) anyerror!Value {
+    const t = try tableArg(args, 0);
+    const k = if (args.len >= 2) args[1] else Value.nil();
+    return t.get(k);
+}
+
+/// `rawset(t, k, v)` — `t[k] = v` without `__newindex`; returns `t`. A nil key is
+/// an error (Lua: "table index is nil"); a NaN key likewise ("table index is
+/// NaN").
+fn bRawSet(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    const t = try tableArg(args, 0);
+    const k = if (args.len >= 2) args[1] else Value.nil();
+    const v = if (args.len >= 3) args[2] else Value.nil();
+    if (k.isNil()) return error.TypeError;
+    if (k.isFloat() and std.math.isNan(k.asFloat())) return error.TypeError;
+    try t.set(vm.gpa, k, v);
+    return args[0];
+}
+
+/// `rawlen(v)` — length of a string (bytes) or table (a border), without `__len`.
+fn bRawLen(_: *anyopaque, args: []const Value) anyerror!Value {
+    if (args.len == 0) return error.TypeError;
+    const v = args[0];
+    if (v.isHeap()) {
+        switch (v.heapType()) {
+            .string => return Value.int(@intCast(string_mod.String.fromHeader(v.asHeap()).len)),
+            .table => return Value.int(Table.fromHeader(v.asHeap()).length()),
+            else => {},
+        }
+    }
+    return error.TypeError; // Lua: "table or string expected"
+}
+
+// ---------------------------------------------------------------------------
+// math.type — string-returning, so it lives here (needs the *Vm), not math.zig
+// ---------------------------------------------------------------------------
+
+/// `math.type(x)` — "integer" / "float" / nil. Pure subtype query.
+fn mType(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    if (args.len == 0) return error.TypeError;
+    const v = args[0];
+    if (v.isInt()) return vm.heap.internValue("integer");
+    if (v.isFloat()) return vm.heap.internValue("float");
+    return Value.nil();
+}
+
+// ---------------------------------------------------------------------------
+// os.difftime — pure arithmetic over timestamps (no host clock; `core` tier)
+// ---------------------------------------------------------------------------
+
+/// `os.difftime(t2, t1)` — `t2 - t1` in seconds, as a float. Pure: it never
+/// reads a clock, so it carries no effect and stays in the deterministic core.
+fn osDiffTime(_: *anyopaque, args: []const Value) anyerror!Value {
+    if (args.len < 1 or !args[0].isNumber()) return error.TypeError;
+    const t2 = args[0].toFloat();
+    const t1 = if (args.len >= 2 and args[1].isNumber()) args[1].toFloat() else 0;
+    return Value.float(t2 - t1);
+}
+
+// ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
+
+pub const natives = [_]function.BaseNative{
+    .{ .name = "type", .func = &bType },
+    .{ .name = "tostring", .func = &bToString },
+    .{ .name = "tonumber", .func = &bToNumber },
+    .{ .name = "select", .func = &bSelect1, .multi = &bSelectN },
+    .{ .name = "rawequal", .func = &bRawEqual },
+    .{ .name = "rawget", .func = &bRawGet },
+    .{ .name = "rawset", .func = &bRawSet },
+    .{ .name = "rawlen", .func = &bRawLen },
+    .{ .name = "math.type", .func = &mType, .module = "math", .field = "type" },
+    .{ .name = "os.difftime", .func = &osDiffTime, .module = "os", .field = "difftime" },
+};
+
+// ---------------------------------------------------------------------------
+// Tests — direct native invocation against a live `Vm`. Behavioural coverage
+// across all execution modes lives in `interp.zig`'s `expectProgram` suite;
+// these pin the ABI/edge cases (select aliasing, raw* error paths).
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn bytesOf(v: Value) []const u8 {
+    return interp.strBytes(v).?;
+}
+
+test "type / math.type name the subtype" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    try testing.expectEqualStrings("number", bytesOf(try bType(@ptrCast(&vm), &.{Value.int(1)})));
+    try testing.expectEqualStrings("number", bytesOf(try bType(@ptrCast(&vm), &.{Value.float(1.5)})));
+    try testing.expectEqualStrings("nil", bytesOf(try bType(@ptrCast(&vm), &.{Value.nil()})));
+    try testing.expectEqualStrings("boolean", bytesOf(try bType(@ptrCast(&vm), &.{Value.boolean(true)})));
+
+    try testing.expectEqualStrings("integer", bytesOf(try mType(@ptrCast(&vm), &.{Value.int(1)})));
+    try testing.expectEqualStrings("float", bytesOf(try mType(@ptrCast(&vm), &.{Value.float(1.5)})));
+    try testing.expect((try mType(@ptrCast(&vm), &.{try vm.heap.internValue("x")})).isNil());
+}
+
+test "tostring renders scalars; passes strings through" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    try testing.expectEqualStrings("nil", bytesOf(try bToString(@ptrCast(&vm), &.{Value.nil()})));
+    try testing.expectEqualStrings("42", bytesOf(try bToString(@ptrCast(&vm), &.{Value.int(42)})));
+    try testing.expectEqualStrings("true", bytesOf(try bToString(@ptrCast(&vm), &.{Value.boolean(true)})));
+    const s = try vm.heap.internValue("hi");
+    try testing.expectEqual(s, try bToString(@ptrCast(&vm), &.{s})); // same object, no copy
+}
+
+test "tonumber: pass-through, parse, base" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    try testing.expectEqual(@as(i64, 7), (try bToNumber(@ptrCast(&vm), &.{Value.int(7)})).asInt());
+    try testing.expectEqual(@as(i64, 42), (try bToNumber(@ptrCast(&vm), &.{try vm.heap.internValue("42")})).asInt());
+    try testing.expectEqual(@as(f64, 3.5), (try bToNumber(@ptrCast(&vm), &.{try vm.heap.internValue(" 3.5 ")})).asFloat());
+    try testing.expectEqual(@as(i64, 255), (try bToNumber(@ptrCast(&vm), &.{ try vm.heap.internValue("ff"), Value.int(16) })).asInt());
+    try testing.expect((try bToNumber(@ptrCast(&vm), &.{try vm.heap.internValue("zz")})).isNil());
+}
+
+test "select: # count, positive and negative indices, multi stream" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    const hash = try vm.heap.internValue("#");
+    const a = try vm.heap.internValue("a");
+    const b = try vm.heap.internValue("b");
+    const c = try vm.heap.internValue("c");
+
+    try testing.expectEqual(@as(i64, 3), (try bSelect1(@ptrCast(&vm), &.{ hash, a, b, c })).asInt());
+    // primary projection: select(2, a,b,c) → "b"
+    try testing.expectEqualStrings("b", bytesOf(try bSelect1(@ptrCast(&vm), &.{ Value.int(2), a, b, c })));
+    // negative: select(-1, a,b,c) → "c"
+    try testing.expectEqualStrings("c", bytesOf(try bSelect1(@ptrCast(&vm), &.{ Value.int(-1), a, b, c })));
+
+    // multi stream from index 2 → (b, c)
+    var out: [8]Value = undefined;
+    const n = try bSelectN(@ptrCast(&vm), &.{ Value.int(2), a, b, c }, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("b", bytesOf(out[0]));
+    try testing.expectEqualStrings("c", bytesOf(out[1]));
+
+    // out-of-range index errors.
+    try testing.expectError(error.TypeError, bSelect1(@ptrCast(&vm), &.{ Value.int(0), a }));
+    try testing.expectError(error.TypeError, bSelect1(@ptrCast(&vm), &.{ Value.int(5), a, b }));
+}
+
+test "rawequal / rawget / rawset / rawlen" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    try testing.expect((try bRawEqual(@ptrCast(&vm), &.{ Value.int(1), Value.float(1.0) })).asBool());
+    try testing.expect(!(try bRawEqual(@ptrCast(&vm), &.{ try vm.heap.internValue("a"), try vm.heap.internValue("b") })).asBool());
+
+    const t = try vm.heap.newTable();
+    const tv = Value.heap(&t.header);
+    try t.set(vm.gpa, Value.int(1), Value.int(10));
+    try t.set(vm.gpa, Value.int(2), Value.int(20));
+
+    try testing.expectEqual(@as(i64, 20), (try bRawGet(@ptrCast(&vm), &.{ tv, Value.int(2) })).asInt());
+    try testing.expectEqual(@as(i64, 2), (try bRawLen(@ptrCast(&vm), &.{tv})).asInt());
+    try testing.expectEqual(@as(i64, 5), (try bRawLen(@ptrCast(&vm), &.{try vm.heap.internValue("hello")})).asInt());
+
+    // rawset returns the table; the write is visible.
+    const ret = try bRawSet(@ptrCast(&vm), &.{ tv, Value.int(3), Value.int(30) });
+    try testing.expectEqual(tv, ret);
+    try testing.expectEqual(@as(i64, 30), t.getInt(3).asInt());
+
+    // nil key errors; non-table rawget/rawlen errors.
+    try testing.expectError(error.TypeError, bRawSet(@ptrCast(&vm), &.{ tv, Value.nil(), Value.int(1) }));
+    try testing.expectError(error.TypeError, bRawGet(@ptrCast(&vm), &.{ Value.int(1), Value.int(1) }));
+    try testing.expectError(error.TypeError, bRawLen(@ptrCast(&vm), &.{Value.int(1)}));
+}
+
+test "os.difftime is pure subtraction" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    try testing.expectEqual(@as(f64, 5.0), (try osDiffTime(@ptrCast(&vm), &.{ Value.int(15), Value.int(10) })).asFloat());
+    try testing.expectEqual(@as(f64, 15.0), (try osDiffTime(@ptrCast(&vm), &.{Value.int(15)})).asFloat());
+}

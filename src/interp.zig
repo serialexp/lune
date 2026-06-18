@@ -33,6 +33,8 @@ const io = @import("io.zig");
 const stdmath = @import("stdlib/math.zig");
 const stdtable = @import("stdlib/table.zig");
 const stdbase = @import("stdlib/base.zig");
+const stdbasic = @import("stdlib/basic.zig");
+const stdstring = @import("stdlib/string.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -169,7 +171,12 @@ pub const ModuleConst = function.ModuleConst;
 /// concatenated in here, so library code never piles into the interpreter core.
 /// To add a library: append `<lib>.natives` below (and `<lib>.constants` to
 /// `base_constants`).
-pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++ stdbase.natives;
+/// The value of the bare global `_VERSION`. A fixed, deterministic string (it is
+/// observable program output, so it must never derive from a runtime/host source).
+pub const lune_version = "lune 0.0.0";
+
+pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++
+    stdbase.natives ++ stdbasic.natives ++ stdstring.natives;
 
 /// The interpreter's own natives. `print` is pure output; `clock` is the first
 /// nondeterministic input.
@@ -185,11 +192,9 @@ const core_natives = [_]BaseNative{
     .{ .name = "getenv", .func = &nativeGetenv, .effect = .getenv },
     .{ .name = "argc", .func = &nativeArgc, .effect = .argc },
     .{ .name = "argv", .func = &nativeArgv, .effect = .argv },
-    // Minimal host stdlib for benchmark harnesses (pure host calls — no effects).
-    // `tonumber` is a bare global; `string.format`/`io.write` install into their
-    // module tables. Qualified names keep the serialized identity unique.
-    .{ .name = "tonumber", .func = &nativeTonumber },
-    .{ .name = "string.format", .func = &nativeStringFormat, .module = "string", .field = "format" },
+    // `io.write` is a host-output call (no effect), installed into the `io` module
+    // table. (`tonumber` and `string.format` moved to `stdlib/basic.zig` and
+    // `stdlib/string.zig` respectively, keeping their serialized names.)
     .{ .name = "io.write", .func = &nativeIoWrite, .module = "io", .field = "write" },
 };
 
@@ -206,7 +211,7 @@ pub const base_constants = stdmath.constants;
 /// in lockstep — add a native and its top-level name is known here.
 pub const builtin_global_names = blk: {
     @setEvalBranchQuota(10_000);
-    var tmp: [base_natives.len + 1][]const u8 = undefined;
+    var tmp: [base_natives.len + 2][]const u8 = undefined;
     var n: usize = 0;
     outer: for (base_natives) |bn| {
         const top = bn.module orelse bn.name;
@@ -219,6 +224,10 @@ pub const builtin_global_names = blk: {
     // `arg` is a host-populated table (the CLI fills it from process args), not a
     // native — but programs reference it, so the lint must know it.
     tmp[n] = "arg";
+    n += 1;
+    // `_VERSION` is a bare global string (seeded in `installBaseLib`), not a
+    // native; programs reference it, so the lint must know it too.
+    tmp[n] = "_VERSION";
     n += 1;
     var names: [n][]const u8 = undefined;
     for (&names, 0..) |*slot, i| slot.* = tmp[i];
@@ -478,6 +487,10 @@ pub const Vm = struct {
         // CLI host fills it from process args (`main.zig`, at the host boundary).
         const arg_table = try self.heap.newTable();
         try self.globals.set(self.gpa, try self.heap.internValue("arg"), Value.heap(&arg_table.header));
+        // `_VERSION` — a bare global string (Lua seeds its own value here). A
+        // normal interned heap string in `globals`, so it serializes/restores
+        // through the keyframe path with no special-casing.
+        try self.globals.set(self.gpa, try self.heap.internValue("_VERSION"), try self.heap.internValue(lune_version));
     }
 
     fn defineNative(self: *Vm, bn: BaseNative) Error!void {
@@ -1768,50 +1781,17 @@ fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal host stdlib (benchmark harness): tonumber, string.format, io.write.
-// All pure host calls (no effects). See `base_natives`.
+// Minimal host stdlib (benchmark harness): io.write, plus the shared coercion
+// helpers (`strBytes`, `coerceConcat`) the stdlib modules reuse. All pure host
+// calls (no effects). See `base_natives`.
 // ---------------------------------------------------------------------------
 
-/// The bytes of `v` if it is a heap string, else null.
-fn strBytes(v: Value) ?[]const u8 {
+/// The bytes of `v` if it is a heap string, else null. Public so the stdlib
+/// modules (`stdlib/basic.zig`, `stdlib/string.zig`) can reuse it qualified,
+/// rather than each re-deriving the string-arg projection.
+pub fn strBytes(v: Value) ?[]const u8 {
     if (v.isHeap() and v.heapType() == .string) return string.String.fromHeader(v.asHeap()).bytes();
     return null;
-}
-
-/// `tonumber(v [, base])`. Numbers pass through. A string is trimmed and parsed:
-/// with an explicit `base` as an integer in that base; otherwise auto (int first —
-/// honoring a `0x` prefix — then float). Anything unparseable / non-numeric → nil.
-fn nativeTonumber(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    _ = ctx;
-    if (args.len == 0) return Value.nil();
-    const v = args[0];
-
-    // Explicit base form: `tonumber(s, base)` — string interpreted as an integer.
-    if (args.len >= 2 and args[1].isNumber()) {
-        const base_i = args[1].toFloat();
-        if (base_i < 2 or base_i > 36) return Value.nil();
-        const base: u8 = @intFromFloat(base_i);
-        const s = strBytes(v) orelse return Value.nil();
-        const t = std.mem.trim(u8, s, " \t\n\r");
-        if (t.len == 0) return Value.nil();
-        const parsed = std.fmt.parseInt(i64, t, base) catch return Value.nil();
-        return Value.int(parsed);
-    }
-
-    switch (v.tag) {
-        .int, .float => return v,
-        else => {},
-    }
-    const s = strBytes(v) orelse return Value.nil();
-    const t = std.mem.trim(u8, s, " \t\n\r");
-    if (t.len == 0) return Value.nil();
-    if (std.fmt.parseInt(i64, t, 0)) |iv| {
-        return Value.int(iv);
-    } else |_| {}
-    if (std.fmt.parseFloat(f64, t)) |fv| {
-        return Value.float(fv);
-    } else |_| {}
-    return Value.nil();
 }
 
 /// `io.write(...)`: write each argument's bytes to the VM's output with no
@@ -1828,275 +1808,6 @@ fn nativeIoWrite(ctx: *anyopaque, args: []const Value) anyerror!Value {
     }
     if (to_stdout) io.flush();
     return Value.nil();
-}
-
-/// A parsed `%`-conversion specifier: `%[-+ 0#][width][.prec]<conv>`.
-const FormatSpec = struct {
-    minus: bool = false, // '-' left-justify
-    zero: bool = false, // '0' zero-pad
-    plus: bool = false, // '+' force sign on positives
-    space: bool = false, // ' ' leading space on positives
-    hash: bool = false, // '#' alternate form (o/x/X)
-    width: usize = 0,
-    precision: ?usize = null,
-    conv: u8 = 0,
-};
-
-fn appendN(out: *std.ArrayList(u8), gpa: std.mem.Allocator, byte: u8, n: usize) !void {
-    var k: usize = 0;
-    while (k < n) : (k += 1) try out.append(gpa, byte);
-}
-
-/// Emit a numeric field: optional `prefix` (sign and/or `0x`), then `digits`,
-/// applying integer `precision` (minimum digit count → zero-extend) and field
-/// `width` with the `-`/`0` flags. Used by both integer and float conversions
-/// (floats pass `precision == null`, having already rendered their fraction).
-fn emitNumeric(
-    out: *std.ArrayList(u8),
-    gpa: std.mem.Allocator,
-    prefix: []const u8,
-    digits: []const u8,
-    spec: FormatSpec,
-) !void {
-    var zext: usize = 0; // precision-driven zero extension of the digits
-    if (spec.precision) |p| {
-        if (digits.len < p) zext = p - digits.len;
-    }
-    const body_len = prefix.len + zext + digits.len;
-    const pad: usize = if (spec.width > body_len) spec.width - body_len else 0;
-    // C/Lua: the `0` flag is ignored when an explicit precision is given for ints.
-    const zero_pad = spec.zero and !spec.minus and spec.precision == null;
-
-    if (spec.minus) {
-        try out.appendSlice(gpa, prefix);
-        try appendN(out, gpa, '0', zext);
-        try out.appendSlice(gpa, digits);
-        try appendN(out, gpa, ' ', pad);
-    } else if (zero_pad) {
-        try out.appendSlice(gpa, prefix);
-        try appendN(out, gpa, '0', pad);
-        try appendN(out, gpa, '0', zext);
-        try out.appendSlice(gpa, digits);
-    } else {
-        try appendN(out, gpa, ' ', pad);
-        try out.appendSlice(gpa, prefix);
-        try appendN(out, gpa, '0', zext);
-        try out.appendSlice(gpa, digits);
-    }
-}
-
-/// Coerce a `string.format` numeric argument to a signed integer, truncating a
-/// float toward zero. Errors on a non-number or an out-of-range / non-finite float.
-fn argToInt(v: Value) Error!i64 {
-    switch (v.tag) {
-        .int => return v.asInt(),
-        .float => {
-            const f = v.asFloat();
-            if (!std.math.isFinite(f) or f >= 9.223372036854776e18 or f < -9.223372036854776e18) {
-                return Error.TypeError;
-            }
-            return @intFromFloat(@trunc(f));
-        },
-        else => return Error.TypeError,
-    }
-}
-
-fn signPrefix(neg: bool, spec: FormatSpec) []const u8 {
-    if (neg) return "-";
-    if (spec.plus) return "+";
-    if (spec.space) return " ";
-    return "";
-}
-
-/// `string.format(fmt, ...)` — a focused C-`printf` supporting Lua's conversions:
-/// `d i u o x X c` (integers), `f F e E g G` (floats), `s` (strings, precision =
-/// max length), `q` (Lua-quoted), and `%%`. Honors the `- + space 0 #` flags,
-/// width, and precision.
-fn nativeStringFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    const vm: *Vm = @ptrCast(@alignCast(ctx));
-    if (args.len < 1) return Error.TypeError;
-    const fmt = strBytes(args[0]) orelse return Error.TypeError;
-
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(vm.gpa);
-    const gpa = vm.gpa;
-
-    var argi: usize = 1;
-    var i: usize = 0;
-    while (i < fmt.len) {
-        const c = fmt[i];
-        if (c != '%') {
-            try out.append(gpa, c);
-            i += 1;
-            continue;
-        }
-        i += 1; // consume '%'
-        if (i >= fmt.len) return Error.TypeError;
-        if (fmt[i] == '%') {
-            try out.append(gpa, '%');
-            i += 1;
-            continue;
-        }
-
-        var spec: FormatSpec = .{};
-        // flags
-        flags: while (i < fmt.len) : (i += 1) {
-            switch (fmt[i]) {
-                '-' => spec.minus = true,
-                '0' => spec.zero = true,
-                '+' => spec.plus = true,
-                ' ' => spec.space = true,
-                '#' => spec.hash = true,
-                else => break :flags,
-            }
-        }
-        // width
-        while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {
-            spec.width = spec.width * 10 + (fmt[i] - '0');
-        }
-        // precision
-        if (i < fmt.len and fmt[i] == '.') {
-            i += 1;
-            var p: usize = 0;
-            while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {
-                p = p * 10 + (fmt[i] - '0');
-            }
-            spec.precision = p;
-        }
-        if (i >= fmt.len) return Error.TypeError;
-        spec.conv = fmt[i];
-        i += 1;
-
-        // `%%` already handled; every remaining conversion consumes one argument.
-        if (argi >= args.len) return Error.TypeError;
-        const arg = args[argi];
-        argi += 1;
-
-        var nbuf: [512]u8 = undefined;
-        switch (spec.conv) {
-            'd', 'i' => {
-                const n = try argToInt(arg);
-                const neg = n < 0;
-                const un: u64 = @bitCast(n);
-                const mag: u64 = if (neg) (~un +% 1) else un; // |n| in two's complement (safe at minInt)
-                const digits = std.fmt.bufPrint(&nbuf, "{d}", .{mag}) catch unreachable;
-                try emitNumeric(&out, gpa, signPrefix(neg, spec), digits, spec);
-            },
-            'u' => {
-                const n = try argToInt(arg);
-                const digits = std.fmt.bufPrint(&nbuf, "{d}", .{@as(u64, @bitCast(n))}) catch unreachable;
-                try emitNumeric(&out, gpa, "", digits, spec);
-            },
-            'o' => {
-                const n = try argToInt(arg);
-                const digits = std.fmt.bufPrint(&nbuf, "{o}", .{@as(u64, @bitCast(n))}) catch unreachable;
-                const prefix: []const u8 = if (spec.hash and !(digits.len == 1 and digits[0] == '0')) "0" else "";
-                try emitNumeric(&out, gpa, prefix, digits, spec);
-            },
-            'x', 'X' => {
-                const n = try argToInt(arg);
-                const u: u64 = @bitCast(n);
-                const digits = if (spec.conv == 'x')
-                    std.fmt.bufPrint(&nbuf, "{x}", .{u}) catch unreachable
-                else
-                    std.fmt.bufPrint(&nbuf, "{X}", .{u}) catch unreachable;
-                const prefix: []const u8 = if (spec.hash and u != 0)
-                    (if (spec.conv == 'x') "0x" else "0X")
-                else
-                    "";
-                try emitNumeric(&out, gpa, prefix, digits, spec);
-            },
-            'c' => {
-                const n = try argToInt(arg);
-                const ch: u8 = @truncate(@as(u64, @bitCast(n)));
-                try emitNumeric(&out, gpa, "", &[_]u8{ch}, .{ .minus = spec.minus, .width = spec.width });
-            },
-            'f', 'F', 'e', 'E', 'g', 'G' => {
-                if (!arg.isNumber()) return Error.TypeError;
-                const f = arg.toFloat();
-                const neg = std.math.signbit(f) and !std.math.isNan(f);
-                const mag = if (neg) -f else f;
-                const lower = spec.conv == 'f' or spec.conv == 'e' or spec.conv == 'g';
-                const mode: std.fmt.float.Mode = switch (spec.conv) {
-                    'e', 'E' => .scientific,
-                    else => .decimal,
-                };
-                // `%f/%e` default to 6 fractional digits; `%g` defaults to shortest.
-                const prec: ?usize = spec.precision orelse switch (spec.conv) {
-                    'g', 'G' => null,
-                    else => 6,
-                };
-                var rbuf: [512]u8 = undefined;
-                const rendered = std.fmt.float.render(&rbuf, mag, .{ .mode = mode, .precision = prec }) catch
-                    return Error.TypeError;
-                // `render` lower-cases the exponent 'e'; upper-case for E/G.
-                var body = rendered;
-                if (!lower) {
-                    for (rbuf[0..rendered.len], 0..) |rc, k| {
-                        if (rc == 'e') rbuf[k] = 'E';
-                    }
-                    body = rbuf[0..rendered.len];
-                }
-                // Float precision is already applied: pass precision=null to emit.
-                var fspec = spec;
-                fspec.precision = null;
-                try emitNumeric(&out, gpa, signPrefix(neg, spec), body, fspec);
-            },
-            's' => {
-                if (strBytes(arg)) |full| {
-                    const body = if (spec.precision) |p| full[0..@min(p, full.len)] else full;
-                    try emitString(&out, gpa, body, spec);
-                } else if (arg.isNumber()) {
-                    var sbuf: [64]u8 = undefined;
-                    const full = try coerceConcat(arg, &sbuf);
-                    const body = if (spec.precision) |p| full[0..@min(p, full.len)] else full;
-                    try emitString(&out, gpa, body, spec);
-                } else {
-                    try formatNonStr(&out, gpa, arg, spec);
-                }
-            },
-            'q' => {
-                const s = strBytes(arg) orelse return Error.TypeError;
-                try out.append(gpa, '"');
-                for (s) |qc| switch (qc) {
-                    '"' => try out.appendSlice(gpa, "\\\""),
-                    '\\' => try out.appendSlice(gpa, "\\\\"),
-                    '\n' => try out.appendSlice(gpa, "\\n"),
-                    '\r' => try out.appendSlice(gpa, "\\r"),
-                    0 => try out.appendSlice(gpa, "\\0"),
-                    else => try out.append(gpa, qc),
-                };
-                try out.append(gpa, '"');
-            },
-            else => return Error.TypeError, // unknown conversion
-        }
-    }
-
-    return vm.heap.internValue(out.items);
-}
-
-/// Emit a string field with width + `-` justification (the `0` flag is ignored
-/// for `%s`, matching C/Lua).
-fn emitString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, body: []const u8, spec: FormatSpec) !void {
-    const pad: usize = if (spec.width > body.len) spec.width - body.len else 0;
-    if (spec.minus) {
-        try out.appendSlice(gpa, body);
-        try appendN(out, gpa, ' ', pad);
-    } else {
-        try appendN(out, gpa, ' ', pad);
-        try out.appendSlice(gpa, body);
-    }
-}
-
-/// `%s` fallback for nil/boolean (Lua applies `tostring`).
-fn formatNonStr(out: *std.ArrayList(u8), gpa: std.mem.Allocator, v: Value, spec: FormatSpec) !void {
-    const body: []const u8 = switch (v.tag) {
-        .nil => "nil",
-        .boolean => if (v.asBool()) "true" else "false",
-        else => return Error.TypeError,
-    };
-    const trimmed = if (spec.precision) |p| body[0..@min(p, body.len)] else body;
-    try emitString(out, gpa, trimmed, spec);
 }
 
 /// Coerce a concat operand to bytes: a string's own bytes, or a number formatted
@@ -3835,6 +3546,25 @@ test "e2e: tables and string concat" {
         \\print("hello, " .. t.name)
         \\print("answer=" .. t.answer)
     , "hello, lune\nanswer=42\n");
+}
+
+test "e2e: basic + string stdlib are byte-identical across all modes" {
+    // Exercises the S1/S2 pure natives, including string ops called inside a hot
+    // loop (so recording + native compilation cross a native call). Output must be
+    // identical across {off, record_only, noopt, record_execute, native} × stress.
+    try expectProgram(
+        \\for i = 1, 3 do
+        \\  print(string.format("%d:%s", i, string.rep("ab", i)))
+        \\end
+        \\print(type("x"), math.type(1), math.type(1.5), _VERSION)
+        \\print(select("#", 1, 2, 3), select(2, "a", "b"))
+        \\print(string.sub("hello", 2, 4), string.byte("A"))
+    ,
+        "1:ab\n2:abab\n3:ababab\n" ++
+            "string\tinteger\tfloat\tlune 0.0.0\n" ++
+            "3\tb\n" ++
+            "ell\t65\n",
+    );
 }
 
 test "e2e: closures capture per-iteration bindings; higher-order print" {
