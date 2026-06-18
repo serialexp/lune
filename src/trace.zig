@@ -2000,9 +2000,10 @@ test "recArrayGet aborts on a .value-lane (unpacked) array — deferred scope cu
     const gpa = testing.allocator;
     const t = try table_mod.Table.create(gpa);
     defer t.destroy(gpa);
-    // A small array that never crossed the rehash threshold stays in the default
-    // (unpacked) .value lane — the path the native/oracle read does not model.
-    try t.set(gpa, Value.int(1), Value.int(10));
+    // A heap value can only live in the (unpacked) .value lane — eager commit
+    // leaves it there (laneForValue of a heap ref is .value) — exactly the path
+    // the native/oracle read does not model.
+    try t.set(gpa, Value.int(1), Value.heap(&t.header));
     try testing.expectEqual(arr.Lane.value, t.array.lane);
 
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
@@ -2112,10 +2113,11 @@ test "recArraySet aborts: non-table, non-int key, OOB, out-of-lane value, .value
     while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
     try testing.expectEqual(arr.Lane.boolean, t.array.lane);
 
-    // A separate .value-lane table (small, never rehashed to a narrow lane).
+    // A separate .value-lane table: a heap value can only live in the .value lane
+    // (eager commit leaves it there — laneForValue of a heap ref is .value).
     const tv = try table_mod.Table.create(gpa);
     defer tv.destroy(gpa);
-    try tv.set(gpa, Value.int(1), Value.int(10));
+    try tv.set(gpa, Value.int(1), Value.heap(&tv.header));
     try testing.expectEqual(arr.Lane.value, tv.array.lane);
 
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };

@@ -4701,6 +4701,63 @@ test "astore_append: a bool-lane growth loop is byte-identical across all 8 mode
     , "4999\n");
 }
 
+test "eager commit: a dense-from-1 bool fill traces + compiles native (no hole, no rehash detour)" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // `for i=1,N do t[i]=true end` — the common array-fill idiom, dense from index
+    // 1. Without eager lane commitment this stays on the `.value` lane forever (the
+    // append fast path keeps the hash empty so Table.rehash never fires) and the
+    // recorder aborts on every store. Eager commit narrows to the boolean lane on
+    // the FIRST append, so the steady-state append loop records guard_append +
+    // astore_append and lowers to native — exactly like the hole-at-1 shape, but
+    // for real dense-from-1 code.
+    const source =
+        \\local t = {}
+        \\for i = 1, 5000 do t[i] = true end
+        \\local c = 0
+        \\for i = 1, 5000 do if t[i] then c = c + 1 end end
+        \\print(c)
+    ;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var nbuf: [64]u8 = undefined;
+    var nsink = io.Writer.fixed(&nbuf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &nsink);
+    defer chunk.deinit();
+
+    var saw_append = false;
+    var compiled_append = false;
+    for (vm.trace.cache.items) |tr| {
+        for (tr.instrs) |ins| {
+            if (ins.op == .astore_append) {
+                saw_append = true;
+                if (tr.native == .compiled) compiled_append = true;
+            }
+        }
+    }
+    try testing.expect(saw_append);
+    try testing.expect(compiled_append);
+    var obuf: [64]u8 = undefined;
+    var osink = io.Writer.fixed(&obuf);
+    try runCaptured(gpa, source, &osink, false, .off);
+    try testing.expectEqualStrings(osink.buffered(), nsink.buffered());
+}
+
+test "eager commit: a dense-from-1 bool fill is byte-identical across all 8 modes" {
+    // The eager-commit representation change is determinism-adjacent: it changes
+    // *when* the lane narrows (append-time vs rehash-time). The lane is never
+    // serialized and keyframe restore re-derives it by replaying these same
+    // appends, so every mode must evolve it identically. A mis-timed commit, a
+    // wrong byte, or an on-trace realloc would change the printed count here.
+    try expectProgram(
+        \\local t = {}
+        \\for i = 1, 5000 do t[i] = true end
+        \\local c = 0
+        \\for i = 1, 5000 do if t[i] then c = c + 1 end end
+        \\print(c)
+    , "5000\n");
+}
+
 test "executor: integer //-by-zero inside a hot loop side-exits; tier-0 re-raises identically" {
     const source =
         \\local x = 0

@@ -193,6 +193,45 @@ pub const ArrayPart = extern struct {
     /// Append `val` as the new key `len+1`, growing the storage. Widens the lane
     /// monotonically (see `setInPlace`) if `val` does not fit the current lane.
     pub fn append(self: *ArrayPart, gpa: std.mem.Allocator, val: Value) std.mem.Allocator.Error!void {
+        // Eager narrow-lane commit on the first append into a fresh array. The
+        // append fast path never reaches `Table.rehash` (a dense-from-1 fill keeps
+        // the hash part empty), so without this a homogeneous bool/int/float fill
+        // would stay on `.value` and the JIT recorder would abort on a `.value`
+        // lane (`recArraySet` in trace.zig). Commit once, then `frozen` makes the
+        // lane monotonic — it only ever widens after, via the `widenFor` path
+        // below. Pure in-memory: the lane is never serialised, so it is invisible
+        // to keyframe snapshots and to `get()` (which round-trips logical Values on
+        // any lane). A from-scratch run evolves the lane purely as a function of the
+        // append sequence, so all 8 execution modes agree; and because the lane
+        // never escapes, a keyframe restore that arrives at a different lane (e.g. a
+        // rehash-narrowed table whose hole-at-1 replays as a nil-first append) is
+        // still observably identical.
+        if (self.lane == .value and !self.frozen and self.len == 0 and !val.isNil()) {
+            const target = laneForValue(val);
+            if (target.isNarrow()) {
+                if (self.data != null) {
+                    // A previously-used buffer (e.g. after `resize(0)` or removal)
+                    // is still `.value`-width — reallocate it at the narrow width.
+                    // `len == 0`, so the element-copy is a no-op. `convert` is
+                    // OOM-atomic: on failure the array is left untouched (.value,
+                    // !frozen) and the append retries cleanly.
+                    try self.convert(gpa, target);
+                } else {
+                    // Truly fresh: commit the lane and secure narrow-width capacity
+                    // now. `ensureCapacity` allocates against `self.lane` and is
+                    // itself OOM-atomic, so on failure roll the speculative lane
+                    // back to `.value` — the array stays fresh (len 0, !frozen) and
+                    // retryable, never frozen onto a value that was never stored.
+                    self.lane = target;
+                    self.ensureCapacity(gpa, 1) catch |e| {
+                        self.lane = .value;
+                        return e;
+                    };
+                }
+                // Both arms have committed durably (capacity secured) → freeze.
+                self.frozen = true;
+            }
+        }
         try self.ensureCapacity(gpa, self.len + 1);
         if (!self.fits(val)) try self.widenFor(gpa, val);
         self.len += 1;
@@ -286,6 +325,20 @@ pub const ArrayPart = extern struct {
     // ===================================================================
     // Internals
     // ===================================================================
+
+    /// Narrow lane a single value commits to on a fresh array — the per-element
+    /// form of `optimalLane`. Heap values and `nil` return `.value` (no narrow
+    /// commit: a heap value needs the full `.value` slot, and `nil` carries no
+    /// type information to commit on). Only inspects the tag, never dereferences.
+    fn laneForValue(val: Value) Lane {
+        if (val.isBool()) return .boolean;
+        if (val.isInt()) {
+            const x = val.asInt();
+            return intLaneFor(x, x);
+        }
+        if (val.isFloat()) return .f64;
+        return .value;
+    }
 
     /// Smallest signed-int lane whose range covers `[lo, hi]`.
     fn intLaneFor(lo: i64, hi: i64) Lane {
@@ -653,7 +706,8 @@ test "int lane: values survive a repack and decode exactly" {
     var i: i64 = 1;
     while (i <= 50) : (i += 1) try a.append(gpa, Value.int(i * 100)); // up to 5000 → i16
 
-    try a.repack(gpa, a.optimalLane());
+    // Eager commit narrows on the first append (int 100 → i8), then widens up to
+    // i16 as the values grow — no manual repack needed.
     try testing.expectEqual(Lane.i16, a.lane);
     i = 1;
     while (i <= 50) : (i += 1) try testing.expectEqual(i * 100, a.get(@intCast(i)).asInt());
@@ -663,7 +717,7 @@ test "f64 lane round-trips" {
     const gpa = testing.allocator;
     var a = try fromSlice(gpa, &.{ Value.float(1.5), Value.float(-2.25), Value.float(3.0e10) });
     defer a.deinit(gpa);
-    try a.repack(gpa, a.optimalLane());
+    // fromSlice appends, so the first float eager-commits the f64 lane.
     try testing.expectEqual(Lane.f64, a.lane);
     try testing.expectEqual(@as(f64, 1.5), a.get(1).asFloat());
     try testing.expectEqual(@as(f64, -2.25), a.get(2).asFloat());
@@ -676,8 +730,7 @@ test "widening: an out-of-lane store reverts to the value lane, preserving slots
     defer a.deinit(gpa);
     var i: usize = 1;
     while (i <= 10) : (i += 1) try a.append(gpa, Value.boolean(true));
-    try a.repack(gpa, a.optimalLane());
-    try testing.expectEqual(Lane.boolean, a.lane);
+    try testing.expectEqual(Lane.boolean, a.lane); // eager-committed on first append
 
     // Store an int into a boolean lane → must widen to .value and keep the rest.
     try a.setInPlace(gpa, 5, Value.int(42));
@@ -693,8 +746,7 @@ test "widening on append of an out-of-lane value" {
     defer a.deinit(gpa);
     var i: usize = 1;
     while (i <= 10) : (i += 1) try a.append(gpa, Value.int(@intCast(i)));
-    try a.repack(gpa, a.optimalLane());
-    try testing.expectEqual(Lane.i8, a.lane);
+    try testing.expectEqual(Lane.i8, a.lane); // eager-committed on first append
 
     try a.append(gpa, Value.float(1.5)); // doesn't fit i8 → widen
     try testing.expectEqual(Lane.value, a.lane);
@@ -708,10 +760,9 @@ test "monotonic widen: an int outgrowing its lane steps up the int ladder, not t
     var a: ArrayPart = .empty;
     defer a.deinit(gpa);
 
-    // Pack into i8 (all values in [-128, 127]).
+    // Pack into i8 (all values in [-128, 127]) — eager-committed on first append.
     var i: usize = 1;
     while (i <= 10) : (i += 1) try a.append(gpa, Value.int(@intCast(i)));
-    try a.repack(gpa, a.optimalLane());
     try testing.expectEqual(Lane.i8, a.lane);
 
     // Store 1000 (out of i8, fits i16) → steps up to i16, NOT .value.
@@ -737,8 +788,7 @@ test "monotonic widen: a type-incompatible store still falls straight to value" 
     defer a.deinit(gpa);
     var i: usize = 1;
     while (i <= 10) : (i += 1) try a.append(gpa, Value.int(@intCast(i)));
-    try a.repack(gpa, a.optimalLane());
-    try testing.expectEqual(Lane.i8, a.lane);
+    try testing.expectEqual(Lane.i8, a.lane); // eager-committed on first append
 
     // A float into an int lane is a type mismatch → no int lane covers it → .value.
     try a.setInPlace(gpa, 4, Value.float(1.5));
@@ -753,8 +803,9 @@ test "monotonic: a frozen lane is preserved across a widening convert" {
     defer a.deinit(gpa);
     var i: usize = 1;
     while (i <= 10) : (i += 1) try a.append(gpa, Value.int(@intCast(i)));
-    try a.repack(gpa, a.optimalLane());
-    a.frozen = true; // simulate the rehash commit
+    // Eager commit already narrowed to i8 AND set frozen on the first append —
+    // no need to repack or set frozen by hand.
+    try testing.expect(a.frozen);
 
     try a.setInPlace(gpa, 3, Value.int(1000)); // i8 → i16 via widenFor/convert
     try testing.expectEqual(Lane.i16, a.lane);
@@ -767,8 +818,7 @@ test "resize grows with holes and shrinks dropping the tail" {
     defer a.deinit(gpa);
     try a.append(gpa, Value.int(1));
     try a.append(gpa, Value.int(2));
-    try a.repack(gpa, a.optimalLane());
-    try testing.expectEqual(Lane.i8, a.lane);
+    try testing.expectEqual(Lane.i8, a.lane); // eager-committed on first append
 
     try a.resize(gpa, 6); // grow → slots 3..6 are holes
     try testing.expectEqual(@as(usize, 6), a.len);
@@ -793,11 +843,121 @@ test "empty / all-hole array stays in the value lane" {
 
 test "isLeaf tracks the lane" {
     const gpa = testing.allocator;
+    // A narrow (eager-committed) int array is a leaf.
     var a = try fromSlice(gpa, &.{ Value.int(1), Value.int(2) });
     defer a.deinit(gpa);
-    try testing.expect(!a.isLeaf()); // value lane
+    try testing.expect(a.isLeaf()); // narrow lane, committed on first append
+
+    // A `.value`-lane array (heap-first → no narrow commit) is NOT a leaf.
+    var b: ArrayPart = .empty;
+    defer b.deinit(gpa);
+    var hdr = object.GcHeader.init(.table); // tag-only; never dereferenced
+    try b.append(gpa, Value.heap(&hdr));
+    try testing.expectEqual(Lane.value, b.lane);
+    try testing.expect(!b.isLeaf());
+}
+
+// ---- eager narrow-lane commit on first append ----
+
+test "eager commit: dense-from-1 boolean fill commits .boolean + frozen, no manual repack" {
+    const gpa = testing.allocator;
+    var a: ArrayPart = .empty;
+    defer a.deinit(gpa);
+    var i: usize = 1;
+    while (i <= 32) : (i += 1) try a.append(gpa, Value.boolean(i % 2 == 0));
+    try testing.expectEqual(Lane.boolean, a.lane); // committed on the FIRST append
+    try testing.expect(a.frozen);
+    try testing.expect(a.present == null); // boolean lane is in-band, no bitmap
+    i = 1;
+    while (i <= 32) : (i += 1) try testing.expectEqual(i % 2 == 0, a.get(i).asBool());
+}
+
+test "eager commit: dense-from-1 int fill narrows then widens up the int ladder" {
+    const gpa = testing.allocator;
+    var a: ArrayPart = .empty;
+    defer a.deinit(gpa);
+    try a.append(gpa, Value.int(100)); // eager → i8
+    try testing.expectEqual(Lane.i8, a.lane);
+    try testing.expect(a.frozen);
+    try a.append(gpa, Value.int(5000)); // i8 → i16
+    try testing.expectEqual(Lane.i16, a.lane);
+    try a.append(gpa, Value.int(100000)); // i16 → i32
+    try testing.expectEqual(Lane.i32, a.lane);
+    try testing.expect(a.frozen); // commitment survives every widen
+    try testing.expectEqual(@as(i64, 100), a.get(1).asInt());
+    try testing.expectEqual(@as(i64, 5000), a.get(2).asInt());
+    try testing.expectEqual(@as(i64, 100000), a.get(3).asInt());
+}
+
+test "eager commit: heterogeneous first-two (int then float) ends in the value lane" {
+    const gpa = testing.allocator;
+    var a: ArrayPart = .empty;
+    defer a.deinit(gpa);
+    try a.append(gpa, Value.int(7)); // eager → i8 + frozen
+    try testing.expectEqual(Lane.i8, a.lane);
+    try a.append(gpa, Value.float(1.5)); // float doesn't fit any int lane → .value
+    try testing.expectEqual(Lane.value, a.lane);
+    try testing.expect(a.frozen);
+    try testing.expectEqual(@as(i64, 7), a.get(1).asInt());
+    try testing.expectEqual(@as(f64, 1.5), a.get(2).asFloat());
+}
+
+test "eager commit: heap-first append stays in the value lane, not frozen" {
+    const gpa = testing.allocator;
+    var a: ArrayPart = .empty;
+    defer a.deinit(gpa);
+    var hdr = object.GcHeader.init(.table); // tag-only; laneForValue never derefs
+    try a.append(gpa, Value.heap(&hdr)); // laneForValue → .value → no commit
+    try testing.expectEqual(Lane.value, a.lane);
+    try testing.expect(!a.frozen);
+}
+
+test "eager commit: nil-first then booleans stays .value until a manual repack" {
+    const gpa = testing.allocator;
+    var a: ArrayPart = .empty;
+    defer a.deinit(gpa);
+    try a.append(gpa, Value.nil()); // laneForValue(nil) → .value → no commit
+    try a.append(gpa, Value.boolean(true)); // len != 0 → eager block skipped
+    try testing.expectEqual(Lane.value, a.lane);
+    try testing.expect(!a.frozen);
+    // Not committed, so the explicit rehash-style repack still works.
     try a.repack(gpa, a.optimalLane());
-    try testing.expect(a.isLeaf()); // narrow
+    try testing.expectEqual(Lane.boolean, a.lane);
+}
+
+test "eager commit on a truly-fresh array (data==null) is OOM-safe and retryable" {
+    // The fresh arm commits the lane then secures narrow-width capacity; a forced
+    // OOM there must roll the speculative lane back to `.value` and leave the array
+    // fresh (len 0, !frozen) so a retry succeeds — never frozen onto an unstored
+    // value. `checkAllAllocationFailures` reruns from scratch forcing each alloc to
+    // fail and asserts no leak / no bad free across the rollback path.
+    const Inner = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var a: ArrayPart = .empty; // data == null, the fresh arm
+            defer a.deinit(gpa);
+            try a.append(gpa, Value.boolean(true));
+            try testing.expectEqual(Lane.boolean, a.lane);
+            try testing.expect(a.frozen);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Inner.run, .{});
+}
+
+test "eager commit via the convert arm (data!=null at len==0) is OOM-safe" {
+    // After `resize(0)` the array keeps its `.value`-width buffer (data != null)
+    // at len==0, so the next append takes the eager-commit `convert` branch. Force
+    // each allocation in that path to fail and assert no leak / no bad free.
+    const Inner = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var a: ArrayPart = .empty;
+            defer a.deinit(gpa);
+            try a.append(gpa, Value.nil()); // .value, allocates a buffer (data != null)
+            try a.resize(gpa, 0); // len → 0 but data stays non-null, lane still .value
+            try a.append(gpa, Value.boolean(true)); // hits the convert arm
+            try testing.expectEqual(Lane.boolean, a.lane);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Inner.run, .{});
 }
 
 test "Layout offsets are stable and lane is first" {
@@ -826,7 +986,12 @@ test "OOM at any allocation point leaves the array part consistent (no leak, no 
         fn run(gpa: std.mem.Allocator) !void {
             var a: ArrayPart = .empty;
             defer a.deinit(gpa);
-            // Grow in the value lane → exercises ensureCapacity's realloc + free.
+            // Lead with a nil hole so eager commit does NOT fire (laneForValue(nil)
+            // is .value): the array then grows in the value lane, exercising
+            // ensureCapacity's realloc + free and keeping the value→narrow repack
+            // below meaningful. (The eager-commit `convert` arm has its own OOM
+            // test, "eager commit via the convert arm is OOM-safe".)
+            try a.append(gpa, Value.nil());
             var i: i64 = 1;
             while (i <= 20) : (i += 1) try a.append(gpa, Value.int(i));
             // Repack value→narrow → exercises convert (data + presence allocs).
