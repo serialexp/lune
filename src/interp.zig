@@ -273,6 +273,20 @@ pub const CallFrame = struct {
 /// `suspend_ctl` is armed (a test / future debugger hook); `run` leaves it null.
 pub const ExecOutcome = union(enum) { finished: FrameResult, suspended };
 
+/// Dispatch mode for the two `execImpl` instantiations (T3 hook-elision).
+/// `.fast` compiles out the off-by-default per-instruction prologue hooks
+/// (line-record, suspend check, recording mirror); `.full` keeps them. Both keep
+/// the GC safepoint and `safepoint_seq` increment — those are load-bearing for
+/// replay determinism and never elided. The opcode bodies are one source of
+/// truth shared by both instantiations, so the modes cannot diverge.
+const ExecMode = enum { fast, full };
+
+/// Internal result of one `execImpl` invocation. Extends `ExecOutcome` with
+/// `switch_mode`, the request to re-enter under the other `ExecMode` (recording
+/// just armed → need `.full`; or every hook cleared → drop to `.fast`). The
+/// `exec` wrapper consumes `switch_mode`; it never escapes to a real caller.
+const ExecStep = union(enum) { finished: FrameResult, suspended, switch_mode };
+
 /// One row of a runtime-error backtrace: a function name plus the source span of
 /// the active instruction in that frame (the faulting instruction for the leaf;
 /// the outgoing call site for every parent). `line` is 1-based.
@@ -722,7 +736,38 @@ pub const Vm = struct {
     /// safepoint (all VM state left intact and capturable). `exec` may be called
     /// again to resume: it simply re-reads the top frame's cursor, so a freshly
     /// **restored** VM resumes by calling `exec` with no special entry point.
+    ///
+    /// Thin wrapper over the comptime-specialised `execImpl` (T3 hook-elision).
+    /// Runs `.fast` (off-by-default prologue hooks compiled out) whenever no hook
+    /// is live, else `.full`. A `switch_mode` request — recording armed mid-`.fast`
+    /// (the next instruction needs the recording hook), or every hook cleared
+    /// mid-`.full` — re-enters under the other mode at the parked cursor; it never
+    /// reaches a caller. Both modes share one opcode body, so they cannot diverge.
     pub fn exec(self: *Vm) Error!ExecOutcome {
+        while (true) {
+            const step = if (self.runFastPath())
+                try self.execImpl(.fast)
+            else
+                try self.execImpl(.full);
+            switch (step) {
+                .finished => |fr| return .{ .finished = fr },
+                .suspended => return .suspended,
+                .switch_mode => continue,
+            }
+        }
+    }
+
+    /// May the dispatch loop run with the off-by-default prologue hooks compiled
+    /// out? Only when none is live: no pending suspend cut, no replay line
+    /// recording, and not mid-trace-recording. The GC safepoint is *not* gated on
+    /// here — `.fast` keeps it, so `gc_stress` stays correct without forcing
+    /// `.full`. These three flags are stable across an `exec` invocation except
+    /// `isRecording()`, which can only arm at a back-edge and is caught there.
+    inline fn runFastPath(self: *const Vm) bool {
+        return !(self.suspend_ctl != null or self.record_safepoint_lines or self.trace.isRecording());
+    }
+
+    fn execImpl(self: *Vm, comptime mode: ExecMode) Error!ExecStep {
         // Hot top-frame state, reloaded from `frames[depth-1]` after every push/pop.
         var frame: *CallFrame = &self.frames[self.depth - 1];
         var closure = frame.closure;
@@ -759,19 +804,25 @@ pub const Vm = struct {
             // safepoint k → its line for line-grain stepping. One branch + one
             // append per safepoint; tier-0's correctness oracle pays nothing when
             // off.
-            if (self.record_safepoint_lines) {
+            // `.fast` compiles these two prologue hooks out entirely (it is only
+            // entered when both flags are off — `runFastPath`). `safepoint_seq`
+            // above is *not* gated: it must count every instruction in both modes
+            // so replay cuts land identically (keyframeser reads it as the total).
+            if (mode == .full and self.record_safepoint_lines) {
                 const sp_line: u32 = if (pc < proto.spans.len)
                     compiler.lineFromOffset(self.source, proto.spans[pc].start)
                 else
                     0;
                 try self.safepoint_lines.append(self.gpa, sp_line);
             }
-            if (self.suspend_ctl) |sc| {
-                // Never suspend mid-multret (see the GC note above): `reg_top` is
-                // transient and unserialized, so a snapshot here could not resume.
-                if (!self.reg_top_pending and self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth) {
-                    frame.pc = pc;
-                    return .suspended;
+            if (mode == .full) {
+                if (self.suspend_ctl) |sc| {
+                    // Never suspend mid-multret (see the GC note above): `reg_top` is
+                    // transient and unserialized, so a snapshot here could not resume.
+                    if (!self.reg_top_pending and self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth) {
+                        frame.pc = pc;
+                        return .suspended;
+                    }
                 }
             }
 
@@ -788,7 +839,11 @@ pub const Vm = struct {
             // instruction (and its observed operand types) into the trace IR
             // *before* tier-0 executes it. Recording is transparent — tier-0 still
             // performs the operation below.
-            if (self.trace.isRecording()) self.trace.recordInstr(instr, regs, proto, @intCast(pc));
+            // Recording mirror — `.full` only. `.fast` is never entered while
+            // recording is live (`runFastPath`), and the back-edge handoff below
+            // flips to `.full` the instant `onBackEdge` arms a recording, so the
+            // very next instruction is mirrored.
+            if (mode == .full and self.trace.isRecording()) self.trace.recordInstr(instr, regs, proto, @intCast(pc));
             const a: usize = instr.a;
             switch (instr.op) {
                 // ---- loads & moves ----
@@ -1289,6 +1344,22 @@ pub const Vm = struct {
                                     // Safe: `continue :outer` abandons the walk, so the
                                     // freed `*Trace`s are never revisited.
                                     for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                    // T3 drop-to-fast on the productive-trace path.
+                                    // The handoff at the bottom of the back-edge
+                                    // block is bypassed by this `continue :outer`,
+                                    // so without this a loop that just finished
+                                    // recording and now enters its native trace
+                                    // every iteration would stay in `.full` forever
+                                    // (correct, but it keeps the elided prologue
+                                    // hooks on the tier-0 deopt iterations). Once
+                                    // recording is done and no other hook is live,
+                                    // park `pc` and re-enter `.fast`. Taken once at
+                                    // the transition; in `.fast` this is compiled
+                                    // out, so steady-state native entry is unbranched.
+                                    if (mode == .full and self.runFastPath()) {
+                                        frame.pc = pc;
+                                        return .switch_mode;
+                                    }
                                     continue :outer;
                                 }
                                 // Zero iterations: apply the penalty, then try
@@ -1345,6 +1416,29 @@ pub const Vm = struct {
                     // If the anchor is gated, install a hot-count skip window so its
                     // next back-edges bypass all of the above.
                     self.trace.afterBackEdge(proto, anchor_pc);
+                }
+                // T3 fast/slow handoff — back-edges are the *only* point a
+                // recording can arm (`onBackEdge`), so the check lives here, not
+                // per-instruction. `.fast`: if a recording just armed, the loop
+                // header (the next instruction) must be mirrored, which `.fast`
+                // elides — re-enter `.full`. `.full`: once recording has finished
+                // or aborted and no other hook is live, drop back to `.fast`. The
+                // back-edge instruction itself is never part of the recorded body
+                // (its prologue mirror ran before `onBackEdge` armed), so handing
+                // off here is byte-identical to an always-`.full` recording run.
+                // Park `pc` before handing off, exactly as the `.suspended` path
+                // does: re-entry reloads `pc = frame.pc`, so without this the other
+                // mode would resume at `cur_pc` and re-run this back-edge.
+                if (mode == .fast) {
+                    if (self.trace.isRecording()) {
+                        frame.pc = pc;
+                        return .switch_mode;
+                    }
+                } else {
+                    if (self.runFastPath()) {
+                        frame.pc = pc;
+                        return .switch_mode;
+                    }
                 }
             }
         }
@@ -3629,6 +3723,22 @@ test "e2e: repeat/until across all modes" {
         \\until k >= 100
         \\print(k)
     , "14\t105\n4\t12\n5\n");
+}
+
+test "e2e: T3 hook-elision handoff — a hot loop records then runs native, byte-identical across modes" {
+    // Exercises the T3 fast/slow dispatch seam end to end. `.off` (always `.fast`,
+    // pure tier-0) is the oracle. The recording modes drive both transitions:
+    // `.fast`→`.full` when the hotcount arms a recording at a back-edge (the next
+    // instruction needs the recording mirror that `.fast` elides), then
+    // `.full`→`.fast` once the trace compiles and runs as native steady state. A
+    // handoff that mis-parks `pc` (the bug that hung the gate) would either
+    // diverge from the oracle here or fail to terminate. The loop count is modest
+    // so the GC-stress arms (which collect every instruction) finish quickly.
+    try expectProgram(
+        \\local acc = 0
+        \\for i = 1, 300 do acc = acc + i end
+        \\print(acc)
+    , "45150\n");
 }
 
 test "e2e: LICM hoists a loop-invariant subexpression, transparently (all modes)" {
