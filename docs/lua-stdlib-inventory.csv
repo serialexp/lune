@@ -5,7 +5,7 @@ basic,pcall,core,implemented,"Calls a function in protected mode via Vm.callValu
 basic,xpcall,core,partial,"Like pcall but takes a message handler invoked with the error value after the unwind. Before-unwind traceback access waits on debug.traceback."
 basic,select,core,implemented,"With a number n returns all arguments after the n-th; with '#' returns the count of extra arguments."
 basic,type,core,implemented,"Returns the type of its argument as a string (nil/boolean/number/string/table/function/thread/userdata)."
-basic,tostring,core,implemented,"Converts any value to a string, honouring __tostring and __name metafields."
+basic,tostring,core,implemented,"Converts any value to a string, honouring the __tostring metamethod (a non-string result errors). __name not yet honoured."
 basic,tonumber,core,implemented,"Converts its argument to a number (optionally in a given base), or returns nil/fail."
 basic,pairs,core,implemented,"Returns (next, t, nil): a deterministic iterator over all key/value pairs (array part ascending, then hash part in canonical key order)."
 basic,ipairs,core,implemented,"Returns an iterator over the array part of a table until the first nil."

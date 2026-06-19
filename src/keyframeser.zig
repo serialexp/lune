@@ -549,11 +549,7 @@ pub fn restoreSnapshot(
         const sh = idmap.get(kf.string_metatable_id - 1) orelse return error.UnresolvedHeapRef;
         if (sh.type != .table) return error.MetatableNotATable;
         vm.string_metatable = table.Table.fromHeader(sh);
-        vm.mm = .{
-            .index = try vm.heap.internValue("__index"),
-            .newindex = try vm.heap.internValue("__newindex"),
-            .metatable = try vm.heap.internValue("__metatable"),
-        };
+        try vm.internMetamethodNames();
     }
 
     return vm;

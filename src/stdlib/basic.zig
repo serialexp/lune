@@ -55,14 +55,14 @@ fn bType(ctx: *anyopaque, args: []const Value) anyerror!Value {
     return vm.heap.internValue(args[0].typeName());
 }
 
-/// `tostring(v)` — render `v` to a string. A string returns itself (no copy); any
+/// `tostring(v)` — render `v` to a string. A `__tostring` metamethod wins first
+/// (it must return a string). Otherwise a string returns itself (no copy); any
 /// other value is rendered through `io.writeValue` (the same text `print` emits,
-/// so the two never disagree) into a bounded stack buffer, then interned. There
-/// are no metatables yet, so there is no `__tostring`/`__name` to honour — the
-/// default rendering is the whole job.
+/// so the two never disagree) into a bounded stack buffer, then interned.
 fn bToString(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const v = if (args.len == 0) Value.nil() else args[0];
+    if (try vm.metaToString(v)) |s| return s; // `__tostring` handler
     if (v.isHeap() and v.heapType() == .string) return v; // already a string
     // Non-string renderings are bounded: scalars (<~32 bytes) and the
     // "kind: 0x<id>" identity form for heap objects. 128 bytes is ample.

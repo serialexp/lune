@@ -371,7 +371,13 @@ pub const SuspendCtl = struct { min_depth: u32 = 0, after_safepoints: u64 = 0 };
 /// bare VM). GC-rooted via `forEachRootHeader` so a collection mid-dispatch
 /// cannot sweep them. Chunk 2a needs only these three; chunk 2b grows the set
 /// (`__add`, `__eq`, `__concat`, …) the same way.
+/// The interned metamethod-name strings, cached once so dispatch never
+/// re-interns. Each field `foo` holds the interned string `"__foo"` — the
+/// `"__" ++ field` mapping is exploited by `internMetamethodNames` and
+/// `forEachRootHeader` (both `inline for` over these fields), so adding a
+/// metamethod is a one-line field addition here. All `nil` in a bare VM.
 const MetamethodNames = struct {
+    // -- chunk 2a: indexing + metatable protection --
     /// `"__index"` — read fallback for an absent key (table or function).
     index: Value = Value.nil(),
     /// `"__newindex"` — write fallback for an absent key (table or function).
@@ -379,6 +385,39 @@ const MetamethodNames = struct {
     /// `"__metatable"` — when present, `getmetatable` returns it and
     /// `setmetatable` refuses to change the (protected) metatable.
     metatable: Value = Value.nil(),
+    // -- chunk 2b: arithmetic (fired when an operand is not a number) --
+    add: Value = Value.nil(),
+    sub: Value = Value.nil(),
+    mul: Value = Value.nil(),
+    div: Value = Value.nil(),
+    mod: Value = Value.nil(),
+    pow: Value = Value.nil(),
+    idiv: Value = Value.nil(),
+    /// `"__unm"` — unary minus; handler called as `h(v, v)` (operand twice).
+    unm: Value = Value.nil(),
+    // -- chunk 2b: bitwise (fired when an operand has no integer form) --
+    band: Value = Value.nil(),
+    bor: Value = Value.nil(),
+    bxor: Value = Value.nil(),
+    /// `"__bnot"` — unary bitwise-not; handler called as `h(v, v)`.
+    bnot: Value = Value.nil(),
+    shl: Value = Value.nil(),
+    shr: Value = Value.nil(),
+    // -- chunk 2b: other operators --
+    /// `"__concat"` — `a .. b` when an operand is not a string/number.
+    concat: Value = Value.nil(),
+    /// `"__len"` — `#t` for a table (overrides the raw border length).
+    len: Value = Value.nil(),
+    /// `"__eq"` — `a == b` only when both are tables and raw-unequal.
+    eq: Value = Value.nil(),
+    /// `"__lt"` — `a < b` (and `a > b` ≡ `b < a`) when not raw-comparable.
+    lt: Value = Value.nil(),
+    /// `"__le"` — `a <= b` (and `a >= b` ≡ `b <= a`) when not raw-comparable.
+    le: Value = Value.nil(),
+    /// `"__call"` — calling a non-callable value: `h(value, args...)`.
+    call: Value = Value.nil(),
+    /// `"__tostring"` — `tostring(v)` / `print(v)`; must return a string.
+    tostring: Value = Value.nil(),
 };
 
 pub const Vm = struct {
@@ -524,12 +563,19 @@ pub const Vm = struct {
     /// the already-present ids; the string metatable is rebound to its restored
     /// table). Idempotent w.r.t. interning — `internValue` returns the existing
     /// string when the bytes are already present.
+    /// Intern every `"__<field>"` metamethod name into `self.mm`. Idempotent
+    /// (`internValue` returns the existing string), so both `init` and the
+    /// keyframe restorer can call it — restore re-interns to the already-present
+    /// ids. Single source of truth for the name set: one `inline for` over the
+    /// `MetamethodNames` fields, so adding a metamethod needs no edit here.
+    pub fn internMetamethodNames(self: *Vm) std.mem.Allocator.Error!void {
+        inline for (@typeInfo(MetamethodNames).@"struct".field_names) |name| {
+            @field(self.mm, name) = try self.heap.internValue("__" ++ name);
+        }
+    }
+
     fn initMetatableSupport(self: *Vm) Error!void {
-        self.mm = .{
-            .index = try self.heap.internValue("__index"),
-            .newindex = try self.heap.internValue("__newindex"),
-            .metatable = try self.heap.internValue("__metatable"),
-        };
+        try self.internMetamethodNames();
         // The shared string metatable: `__index` → the `string` module table, so
         // `s:method(...)` (compiled as `get_index` + `call` with `self`) resolves
         // `method` through the string library. Built only when the string module
@@ -998,8 +1044,11 @@ pub const Vm = struct {
                     results_out[0] = r;
                     return 1;
                 } else if (nat.multi != null and results_out.len >= 2) {
-                    // `out` may not overlap `args` here (separate buffers), which is
-                    // a strictly-safer case of the NativeMultiFn alias contract.
+                    // `out` does not overlap `args`: for a direct call they are the
+                    // caller's two distinct buffers; for a `__call` redirect `args`
+                    // is the parked window at/above `pbase` while `results_out` is
+                    // the original caller's buffer below it. Either way a
+                    // strictly-safer case of the NativeMultiFn alias contract.
                     const produced = nat.multi.?(@ptrCast(self), args, results_out) catch |e| return narrowError(e);
                     return @min(produced, results_out.len);
                 } else {
@@ -1061,7 +1110,32 @@ pub const Vm = struct {
                 self.stack_top = saved_top;
                 return n;
             },
-            else => return Error.TypeError,
+            // `__call` from a host reentry (`pcall`/`xpcall`/`table.sort`
+            // comparator/`gsub` fn): a non-callable heap value with a `__call`
+            // metamethod is invoked as `handler(value, args...)`, identically to
+            // the bytecode `.call` arm — both redirect through `callValue`, so a
+            // callable table is callable from *every* site, not just bytecode.
+            // We park `[callee, args...]` contiguously at `stack_top` and raise
+            // `stack_top` over it so the collector roots the redirect args, then
+            // recurse. The recursion chains a deeper `__call` naturally, bounded
+            // by `native_reentry_depth` (a `__call` cycle surfaces as a catchable
+            // StackOverflow, never a hang). On success we shrink back; on error
+            // we leave `stack_top` raised — the catcher (`protectedCall`) restores
+            // its own captured boundary, which subsumes this region, and reads the
+            // still-live faulting frames for `describeFault` first.
+            else => {
+                const handler = self.metamethod(callee, self.mm.call);
+                if (handler.isNil()) return Error.TypeError;
+                const need = 1 + args.len;
+                const pbase = self.stack_top;
+                if (pbase + need > self.stack.len) return Error.StackOverflow;
+                self.stack[pbase] = callee;
+                for (args, 0..) |v, i| self.stack[pbase + 1 + i] = v;
+                self.stack_top = pbase + need; // root the parked redirect args
+                const n = try self.callValue(handler, self.stack[pbase .. pbase + need], results_out);
+                self.stack_top = pbase; // success only (see note above)
+                return n;
+            },
         }
     }
 
@@ -1149,13 +1223,14 @@ pub const Vm = struct {
         //    its catch. Load-bearing for the `xpcall` handler path, which allocates
         //    (and so may collect) while the error value waits to be handed over.
         if (self.pending_error) |ev| if (ev.isHeap()) cb(ctx, ev.asHeap());
-        // 8. metamethod-dispatch roots: the interned metamethod-name strings and
+        // 8. metamethod-dispatch roots: every interned metamethod-name string and
         //    the shared string metatable. Referenced from the VM (not `globals`),
         //    so they must be marked explicitly or a collection mid-dispatch would
         //    sweep them. All `nil`/`null` in a bare VM, so the guards skip them.
-        if (self.mm.index.isHeap()) cb(ctx, self.mm.index.asHeap());
-        if (self.mm.newindex.isHeap()) cb(ctx, self.mm.newindex.asHeap());
-        if (self.mm.metatable.isHeap()) cb(ctx, self.mm.metatable.asHeap());
+        inline for (@typeInfo(MetamethodNames).@"struct".field_names) |name| {
+            const v = @field(self.mm, name);
+            if (v.isHeap()) cb(ctx, v.asHeap());
+        }
         if (self.string_metatable) |smt| cb(ctx, &smt.header);
     }
 
@@ -1303,38 +1378,50 @@ pub const Vm = struct {
                 .move => regs[a] = regs[instr.b],
 
                 // ---- arithmetic (semantics live in arith.zig) ----
-                .add => regs[a] = try arith.add(regs[instr.b], regs[instr.c]),
-                .sub => regs[a] = try arith.sub(regs[instr.b], regs[instr.c]),
-                .mul => regs[a] = try arith.mul(regs[instr.b], regs[instr.c]),
-                .div => regs[a] = try arith.div(regs[instr.b], regs[instr.c]),
-                .idiv => regs[a] = try arith.floorDiv(regs[instr.b], regs[instr.c]),
-                .mod => regs[a] = try arith.mod(regs[instr.b], regs[instr.c]),
-                .pow => regs[a] = try arith.pow(regs[instr.b], regs[instr.c]),
+                // Each op evaluates the raw numeric result eagerly (pure, no
+                // effects); on a `TypeError` (a non-number operand) `arithMeta`
+                // falls back to the `__add`/… metamethod, else propagates
+                // (e.g. `DivisionByZero`). Numbers carry no metatable, so the
+                // common path never touches dispatch.
+                .add => regs[a] = try self.arithMeta(arith.add(regs[instr.b], regs[instr.c]), self.mm.add, regs[instr.b], regs[instr.c]),
+                .sub => regs[a] = try self.arithMeta(arith.sub(regs[instr.b], regs[instr.c]), self.mm.sub, regs[instr.b], regs[instr.c]),
+                .mul => regs[a] = try self.arithMeta(arith.mul(regs[instr.b], regs[instr.c]), self.mm.mul, regs[instr.b], regs[instr.c]),
+                .div => regs[a] = try self.arithMeta(arith.div(regs[instr.b], regs[instr.c]), self.mm.div, regs[instr.b], regs[instr.c]),
+                .idiv => regs[a] = try self.arithMeta(arith.floorDiv(regs[instr.b], regs[instr.c]), self.mm.idiv, regs[instr.b], regs[instr.c]),
+                .mod => regs[a] = try self.arithMeta(arith.mod(regs[instr.b], regs[instr.c]), self.mm.mod, regs[instr.b], regs[instr.c]),
+                .pow => regs[a] = try self.arithMeta(arith.pow(regs[instr.b], regs[instr.c]), self.mm.pow, regs[instr.b], regs[instr.c]),
 
                 // ---- bitwise ----
-                .band => regs[a] = try arith.band(regs[instr.b], regs[instr.c]),
-                .bor => regs[a] = try arith.bor(regs[instr.b], regs[instr.c]),
-                .bxor => regs[a] = try arith.bxor(regs[instr.b], regs[instr.c]),
-                .shl => regs[a] = try arith.shl(regs[instr.b], regs[instr.c]),
-                .shr => regs[a] = try arith.shr(regs[instr.b], regs[instr.c]),
+                .band => regs[a] = try self.arithMeta(arith.band(regs[instr.b], regs[instr.c]), self.mm.band, regs[instr.b], regs[instr.c]),
+                .bor => regs[a] = try self.arithMeta(arith.bor(regs[instr.b], regs[instr.c]), self.mm.bor, regs[instr.b], regs[instr.c]),
+                .bxor => regs[a] = try self.arithMeta(arith.bxor(regs[instr.b], regs[instr.c]), self.mm.bxor, regs[instr.b], regs[instr.c]),
+                .shl => regs[a] = try self.arithMeta(arith.shl(regs[instr.b], regs[instr.c]), self.mm.shl, regs[instr.b], regs[instr.c]),
+                .shr => regs[a] = try self.arithMeta(arith.shr(regs[instr.b], regs[instr.c]), self.mm.shr, regs[instr.b], regs[instr.c]),
 
                 // ---- unary ----
-                .neg => regs[a] = try arith.neg(regs[instr.b]),
+                .neg => regs[a] = try self.unArithMeta(arith.neg(regs[instr.b]), self.mm.unm, regs[instr.b]),
                 .not => regs[a] = Value.boolean(!regs[instr.b].isTruthy()),
-                .bnot => regs[a] = try arith.bnot(regs[instr.b]),
-                .len => regs[a] = try lenOf(regs[instr.b]),
+                .bnot => regs[a] = try self.unArithMeta(arith.bnot(regs[instr.b]), self.mm.bnot, regs[instr.b]),
+                // `#t` honours `__len` for tables; strings/raw-length fall through.
+                .len => regs[a] = try self.lenValue(regs[instr.b]),
 
-                // ---- concat ----
-                .concat => regs[a] = try self.concat(regs[instr.b], regs[instr.c]),
+                // ---- concat ---- `__concat` on `TypeError` (a non-concatable
+                // operand); the located fault is preserved when neither has one.
+                .concat => regs[a] = self.concat(regs[instr.b], regs[instr.c]) catch |e| switch (e) {
+                    Error.TypeError => try self.binMeta(self.mm.concat, regs[instr.b], regs[instr.c], Error.TypeError),
+                    else => return e,
+                },
 
                 // ---- comparisons → boolean register ----
                 // `gt`/`ge` reuse `lt`/`le` with operands swapped (a>b ≡ b<a).
-                .eq => regs[a] = Value.boolean(arith.eq(regs[instr.b], regs[instr.c])),
-                .ne => regs[a] = Value.boolean(!arith.eq(regs[instr.b], regs[instr.c])),
-                .lt => regs[a] = Value.boolean(try arith.lt(regs[instr.b], regs[instr.c])),
-                .le => regs[a] = Value.boolean(try arith.le(regs[instr.b], regs[instr.c])),
-                .gt => regs[a] = Value.boolean(try arith.lt(regs[instr.c], regs[instr.b])),
-                .ge => regs[a] = Value.boolean(try arith.le(regs[instr.c], regs[instr.b])),
+                // `eq`/`ne` consult `__eq` only for two raw-unequal tables;
+                // `lt`/`le` consult `__lt`/`__le` when not raw-comparable.
+                .eq => regs[a] = Value.boolean(try self.valuesEqual(regs[instr.b], regs[instr.c])),
+                .ne => regs[a] = Value.boolean(!try self.valuesEqual(regs[instr.b], regs[instr.c])),
+                .lt => regs[a] = Value.boolean(try self.compareMeta(.lt, regs[instr.b], regs[instr.c])),
+                .le => regs[a] = Value.boolean(try self.compareMeta(.le, regs[instr.b], regs[instr.c])),
+                .gt => regs[a] = Value.boolean(try self.compareMeta(.lt, regs[instr.c], regs[instr.b])),
+                .ge => regs[a] = Value.boolean(try self.compareMeta(.le, regs[instr.c], regs[instr.b])),
 
                 // ---- control flow ----
                 .jmp => pc = applyJump(pc, instr.aux),
@@ -1568,7 +1655,35 @@ pub const Vm = struct {
                                 if (all) self.stampSingleResult(base, a, result) else writeSingleResult(regs, a, nwanted, result);
                             }
                         },
-                        else => return Error.TypeError,
+                        // `__call`: a non-callable heap value (typically a table)
+                        // with a `__call` metamethod is invoked as
+                        // `handler(value, args...)`. The arguments already sit
+                        // contiguously as `[callee, args...]` at `stack[base+a..]`
+                        // — exactly the handler's argument list, so no copy is
+                        // needed; `callValue` reads it before writing results.
+                        // Results honour `nwanted`/`all_results` like the native
+                        // arm. A nil/non-heap callee, or a callee whose `__call`
+                        // chain bottoms out in a non-callable, stays the located
+                        // "attempt to call a <type> value" fault. A `__call` whose
+                        // handler is itself a `__call` table chains through
+                        // `callValue` (bounded by `native_reentry_depth`; a cycle
+                        // surfaces as a catchable StackOverflow, never a hang).
+                        else => {
+                            const handler = self.metamethod(callee, self.mm.call);
+                            if (handler.isNil()) return Error.TypeError;
+                            const nwanted: usize = instr.c;
+                            const call_args = self.stack[base + a .. base + a + 1 + nargs];
+                            if (nwanted == bytecode.all_results) {
+                                const n = try self.callValue(handler, call_args, self.stack[base + a ..]);
+                                std.debug.assert(!self.reg_top_pending);
+                                self.reg_top = base + a + n;
+                                self.reg_top_pending = true;
+                            } else {
+                                const n = try self.callValue(handler, call_args, regs[a .. a + nwanted]);
+                                var k: usize = n;
+                                while (k < nwanted) : (k += 1) regs[a + k] = Value.nil();
+                            }
+                        },
                     }
                 },
 
@@ -1952,6 +2067,125 @@ pub const Vm = struct {
     fn metamethod(self: *Vm, v: Value, name: Value) Value {
         const mt = self.metatableOf(v) orelse return Value.nil();
         return mt.get(name);
+    }
+
+    // ---- chunk 2b: operator metamethod dispatch -----------------------------
+    // Every operator metamethod routes through these few helpers, so the
+    // dispatch semantics (operand order, handler-call shape, fault fallback)
+    // live in one place. A handler call goes through `callValue` (the reentrant
+    // primitive) and is therefore a trace barrier — which is exactly why the
+    // recorder, whose arith/compare/eq arms abort on any non-number operand,
+    // never needs to know these exist.
+
+    /// Call a metamethod `handler` (function, native, or a `__call`-bearing
+    /// value) with `args`, returning its first result (or nil). `callValue`
+    /// raises `TypeError` only when `handler`'s `__call` chain bottoms out in a
+    /// non-callable.
+    fn callMeta(self: *Vm, handler: Value, args: []const Value) Error!Value {
+        var out: [1]Value = .{Value.nil()};
+        const n = try self.callValue(handler, args, &out);
+        return if (n >= 1) out[0] else Value.nil();
+    }
+
+    /// Binary metamethod dispatch for an operator that faulted on its raw
+    /// operands. Tries `a`'s metamethod `name`, then `b`'s; the first found is
+    /// called as `handler(a, b)` and its first result returned. If neither has
+    /// it, re-raise `fault` (the located arithmetic/concat/compare `TypeError`).
+    fn binMeta(self: *Vm, name: Value, a: Value, b: Value, fault: Error) Error!Value {
+        var handler = self.metamethod(a, name);
+        if (handler.isNil()) handler = self.metamethod(b, name);
+        if (handler.isNil()) return fault;
+        return self.callMeta(handler, &.{ a, b });
+    }
+
+    /// Unary metamethod dispatch (`__unm`/`__bnot`): the handler is called with
+    /// the operand twice (`handler(v, v)`), matching Lua's convention.
+    fn unMeta(self: *Vm, name: Value, v: Value, fault: Error) Error!Value {
+        const handler = self.metamethod(v, name);
+        if (handler.isNil()) return fault;
+        return self.callMeta(handler, &.{ v, v });
+    }
+
+    /// Wrap a raw binary arithmetic/bitwise result: on `TypeError` (an operand
+    /// the operator doesn't accept) fall back to the binary metamethod `name`;
+    /// any other arith error (e.g. `DivisionByZero`) propagates unchanged.
+    fn arithMeta(self: *Vm, raw: arith.Error!Value, name: Value, a: Value, b: Value) Error!Value {
+        return raw catch |e| switch (e) {
+            error.TypeError => self.binMeta(name, a, b, Error.TypeError),
+            else => |other| other,
+        };
+    }
+
+    /// Wrap a raw unary arithmetic/bitwise result (`__unm`/`__bnot`).
+    fn unArithMeta(self: *Vm, raw: arith.Error!Value, name: Value, v: Value) Error!Value {
+        return raw catch |e| switch (e) {
+            error.TypeError => self.unMeta(name, v, Error.TypeError),
+            else => |other| other,
+        };
+    }
+
+    /// `a < b` / `a <= b` with `__lt`/`__le` fallback. Raw comparison faults with
+    /// `TypeError` exactly when the operands aren't both numbers (or both
+    /// strings) — which is when Lua consults the metamethod. The handler's result
+    /// is taken for its truthiness.
+    fn compareMeta(self: *Vm, comptime op: enum { lt, le }, a: Value, b: Value) Error!bool {
+        const raw = switch (op) {
+            .lt => arith.lt(a, b),
+            .le => arith.le(a, b),
+        };
+        return raw catch |e| switch (e) {
+            error.TypeError => {
+                const name = switch (op) {
+                    .lt => self.mm.lt,
+                    .le => self.mm.le,
+                };
+                const r = try self.binMeta(name, a, b, Error.TypeError);
+                return r.isTruthy();
+            },
+            else => |other| other,
+        };
+    }
+
+    /// `a == b` with `__eq` fallback. Raw/primitive equality (`arith.eq`, which
+    /// includes table identity) wins first. `__eq` is consulted **only** when
+    /// both operands are tables and raw-unequal (Lua restricts it to same-type
+    /// table/userdata pairs; lune has only tables). The handler result is taken
+    /// for truthiness.
+    fn valuesEqual(self: *Vm, a: Value, b: Value) Error!bool {
+        if (arith.eq(a, b)) return true;
+        if (a.isHeap() and a.heapType() == .table and b.isHeap() and b.heapType() == .table) {
+            var handler = self.metamethod(a, self.mm.eq);
+            if (handler.isNil()) handler = self.metamethod(b, self.mm.eq);
+            if (!handler.isNil()) {
+                const r = try self.callMeta(handler, &.{ a, b });
+                return r.isTruthy();
+            }
+        }
+        return false;
+    }
+
+    /// `#v` with `__len` fallback. A table with a `__len` metamethod calls it
+    /// (`handler(t)` → first result); otherwise a table yields its raw border
+    /// length and a string its byte length (`lenOf`). A non-table/non-string with
+    /// no metamethod faults (`TypeError`, located).
+    fn lenValue(self: *Vm, v: Value) Error!Value {
+        if (v.isHeap() and v.heapType() == .table) {
+            const handler = self.metamethod(v, self.mm.len);
+            if (!handler.isNil()) return self.callMeta(handler, &.{v});
+        }
+        return lenOf(v);
+    }
+
+    /// The `__tostring` rendering of `v`, or `null` when `v` has no `__tostring`
+    /// (the caller then applies the default rendering). The handler must return a
+    /// string — Lua raises "'__tostring' must return a string" otherwise, which
+    /// we surface as `TypeError`.
+    pub fn metaToString(self: *Vm, v: Value) Error!?Value {
+        const handler = self.metamethod(v, self.mm.tostring);
+        if (handler.isNil()) return null;
+        const r = try self.callMeta(handler, &.{v});
+        if (!(r.isHeap() and r.heapType() == .string)) return Error.TypeError;
+        return r;
     }
 
     /// Upper bound on `__index`/`__newindex` table-chain hops before we declare a
@@ -2353,7 +2587,13 @@ fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const w = vm.out orelse io.stdout();
     for (args, 0..) |arg, i| {
         if (i != 0) try w.writeAll("\t");
-        try io.writeValue(w, arg);
+        // Honour `__tostring` when present; otherwise the default rendering
+        // (no interning on the common path).
+        if (try vm.metaToString(arg)) |s| {
+            try w.writeAll(strBytes(s).?);
+        } else {
+            try io.writeValue(w, arg);
+        }
     }
     try w.writeAll("\n");
     if (to_stdout) io.flush();
@@ -3274,6 +3514,265 @@ test "metatable: a native trace re-entered on a metatable'd table dispatches __n
         \\
     ,
         "60\t60\t0\n",
+    );
+}
+
+// ── Chunk 2b: arithmetic / compare / __concat / __len / __call / __tostring
+// metamethods. Each routes the tier-0 op's TypeError (or non-callable) path
+// through the shared dispatch helpers, which call into the VM via `callValue`
+// — a trace barrier, so every recorded op already aborts on a non-number
+// operand and side-exits to tier-0, keeping all 8 modes byte-identical.
+
+test "metatable: arithmetic metamethods (add/sub/mul/div/mod/pow/idiv)" {
+    try expectProgram(
+        \\local V = {}; V.__index = V
+        \\local function v(n) return setmetatable({ n = n }, V) end
+        \\V.__add  = function(a, b) return v(a.n + b.n) end
+        \\V.__sub  = function(a, b) return v(a.n - b.n) end
+        \\V.__mul  = function(a, b) return v(a.n * b.n) end
+        \\V.__div  = function(a, b) return a.n / b.n end
+        \\V.__mod  = function(a, b) return a.n % b.n end
+        \\V.__pow  = function(a, b) return a.n ^ b.n end
+        \\V.__idiv = function(a, b) return a.n // b.n end
+        \\print((v(2) + v(3)).n)
+        \\print((v(7) - v(4)).n)
+        \\print((v(3) * v(5)).n)
+        \\print(v(7) / v(2))
+        \\print(v(7) % v(3))
+        \\print(v(2) ^ v(10))
+        \\print(v(7) // v(2))
+        \\
+    ,
+        "5\n3\n15\n3.5\n1\n1024\n3\n",
+    );
+}
+
+test "metatable: bitwise metamethods (band/bor/bxor/shl/shr/bnot)" {
+    try expectProgram(
+        \\local N = {}; N.__index = N
+        \\local function n(x) return setmetatable({ v = x }, N) end
+        \\N.__band = function(a, b) return a.v & b.v end
+        \\N.__bor  = function(a, b) return a.v | b.v end
+        \\N.__bxor = function(a, b) return a.v ~ b.v end
+        \\N.__shl  = function(a, b) return a.v << b.v end
+        \\N.__shr  = function(a, b) return a.v >> b.v end
+        \\N.__bnot = function(a) return ~a.v end
+        \\print(n(6) & n(3))
+        \\print(n(6) | n(1))
+        \\print(n(6) ~ n(3))
+        \\print(n(1) << n(4))
+        \\print(n(64) >> n(2))
+        \\print(~n(0))
+        \\
+    ,
+        "2\n7\n5\n16\n16\n-1\n",
+    );
+}
+
+test "metatable: unary minus __unm" {
+    try expectProgram(
+        \\local V = {}
+        \\V.__unm = function(a) return -a.n end
+        \\local x = setmetatable({ n = 9 }, V)
+        \\print(-x)
+        \\print(-setmetatable({ n = -4 }, V))
+        \\
+    ,
+        "-9\n4\n",
+    );
+}
+
+test "metatable: __add dispatches from the right operand when the left lacks it" {
+    try expectProgram(
+        \\local V = {}
+        \\V.__add = function(a, b)
+        \\  local an = type(a) == "table" and a.n or a
+        \\  local bn = type(b) == "table" and b.n or b
+        \\  return an + bn
+        \\end
+        \\local x = setmetatable({ n = 10 }, V)
+        \\print(x + 5)
+        \\print(5 + x)
+        \\
+    ,
+        "15\n15\n",
+    );
+}
+
+test "metatable: __eq fires only between two tables" {
+    try expectProgram(
+        \\local V = {}
+        \\V.__eq = function(a, b) return a.n == b.n end
+        \\local function v(n) return setmetatable({ n = n }, V) end
+        \\print(v(2) == v(2))
+        \\print(v(2) == v(3))
+        \\print(v(2) ~= v(3))
+        \\print(v(2) == 2)
+        \\print(v(2) == "x")
+        \\
+    ,
+        "true\nfalse\ntrue\nfalse\nfalse\n",
+    );
+}
+
+test "metatable: comparison __lt/__le with gt/ge via operand swap" {
+    try expectProgram(
+        \\local V = {}
+        \\V.__lt = function(a, b) return a.n < b.n end
+        \\V.__le = function(a, b) return a.n <= b.n end
+        \\local function v(n) return setmetatable({ n = n }, V) end
+        \\print(v(1) < v(2), v(2) < v(2))
+        \\print(v(2) <= v(2), v(3) <= v(2))
+        \\print(v(3) > v(1), v(1) > v(3))
+        \\print(v(2) >= v(5), v(5) >= v(2))
+        \\
+    ,
+        "true\tfalse\ntrue\tfalse\ntrue\tfalse\nfalse\ttrue\n",
+    );
+}
+
+test "metatable: __concat dispatches from either operand" {
+    try expectProgram(
+        \\local V = {}
+        \\V.__concat = function(a, b)
+        \\  local an = type(a) == "table" and a.n or a
+        \\  local bn = type(b) == "table" and b.n or b
+        \\  return "C(" .. an .. "," .. bn .. ")"
+        \\end
+        \\local x = setmetatable({ n = 4 }, V)
+        \\print(x .. "z")
+        \\print("z" .. x)
+        \\print(x .. x)
+        \\
+    ,
+        "C(4,z)\nC(z,4)\nC(4,4)\n",
+    );
+}
+
+test "metatable: __len overrides table length" {
+    try expectProgram(
+        \\local V = {}
+        \\V.__len = function(a) return a.size end
+        \\local x = setmetatable({ 1, 2, size = 42 }, V)
+        \\print(#x)
+        \\local plain = { 1, 2, 3 }
+        \\print(#plain)
+        \\
+    ,
+        "42\n3\n",
+    );
+}
+
+test "metatable: __call single and multi-return" {
+    try expectProgram(
+        \\local adder = setmetatable({ base = 10 }, {
+        \\  __call = function(self, x, y) return self.base + x + y end,
+        \\})
+        \\print(adder(3, 4))
+        \\local multi = setmetatable({}, {
+        \\  __call = function(self, a, b) return a, b, a + b end,
+        \\})
+        \\local x, y, z = multi(2, 5)
+        \\print(x, y, z)
+        \\local sum = 0
+        \\for i = 1, 5 do sum = sum + adder(i, 0) end
+        \\print(sum)
+        \\
+    ,
+        "17\n2\t5\t7\n65\n",
+    );
+}
+
+test "metatable: a callable table dispatches __call through host reentry (pcall, table.sort)" {
+    // `callValue` (the pcall/sort/gsub reentry primitive) honours `__call`
+    // identically to the bytecode call arm — a callable table is callable from
+    // every site, not just direct `t(...)`.
+    try expectProgram(
+        \\local c = setmetatable({}, { __call = function(self, a, b) return a + b end })
+        \\print(pcall(c, 3, 4))
+        \\local items = { 3, 1, 2 }
+        \\local cmp = setmetatable({}, { __call = function(self, x, y) return x < y end })
+        \\table.sort(items, cmp)
+        \\print(items[1], items[2], items[3])
+        \\
+    ,
+        "true\t7\n1\t2\t3\n",
+    );
+}
+
+test "metatable: a __call cycle is caught as a stack overflow, not a hang" {
+    try expectProgram(
+        \\local loop = {}
+        \\setmetatable(loop, { __call = loop })
+        \\print(pcall(function() return loop() end))
+        \\
+    ,
+        "false\tanonymous:3: stack overflow\n",
+    );
+}
+
+test "metatable: __tostring via tostring(), print(), and concat" {
+    try expectProgram(
+        \\local Pt = { __tostring = function(p) return "Pt(" .. p.x .. "," .. p.y .. ")" end }
+        \\local p = setmetatable({ x = 1, y = 2 }, Pt)
+        \\print(tostring(p))
+        \\print(p)
+        \\print("p=" .. tostring(p))
+        \\
+    ,
+        "Pt(1,2)\nPt(1,2)\np=Pt(1,2)\n",
+    );
+}
+
+test "metatable: arithmetic on a table without the metamethod still raises located TypeError" {
+    try expectProgram(
+        \\print(pcall(function() local t = {}; return t + 1 end))
+        \\print(pcall(function() return {} .. "x" end))
+        \\print(pcall(function() return -({}) end))
+        \\
+    ,
+        "false\tanonymous:1: attempt to perform arithmetic on a table value\n" ++
+            "false\tanonymous:2: attempt to concatenate a table value\n" ++
+            "false\tanonymous:3: attempt to perform arithmetic on a table value\n",
+    );
+}
+
+test "metatable: calling a table with no __call raises a located TypeError" {
+    try expectProgram(
+        \\print(pcall(function() local t = {}; return t() end))
+        \\
+    ,
+        "false\tanonymous:1: attempt to call a table value\n",
+    );
+}
+
+test "metatable: __tostring returning a non-string is rejected" {
+    try expectProgram(
+        \\local bad = setmetatable({}, { __tostring = function() return 42 end })
+        \\print(pcall(function() return tostring(bad) end))
+        \\
+    ,
+        "false\tanonymous:2: bad argument to 'tostring'\n",
+    );
+}
+
+// Determinism corpus: a hot loop summing __add-bearing vector objects. The
+// metamethod call is a trace barrier so the loop never tiers up past the call,
+// but the output and the captured snapshot bytes must be byte-identical across
+// two independent runs (proves no nondeterminism leaks through the dispatch
+// helpers). expectProgram already runs this across all 8 modes.
+
+test "metatable: hot loop accumulating through __add is deterministic across modes" {
+    try expectProgram(
+        \\local V = {}; V.__index = V
+        \\V.__add = function(a, b) return setmetatable({ n = a.n + b.n }, V) end
+        \\local function v(n) return setmetatable({ n = n }, V) end
+        \\local acc = v(0)
+        \\for i = 1, 200 do acc = acc + v(i) end
+        \\print(acc.n)
+        \\
+    ,
+        "20100\n",
     );
 }
 

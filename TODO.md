@@ -2,7 +2,7 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
-## Metatables chunk 2b — arithmetic/compare/concat/len/call/tostring metamethods
+## Metatables — chunks 2a + 2b LANDED; remaining follow-ups
 
 Chunk 2a (the OO core) landed (June 2026): `Table.metatable` field + GC mark +
 keyframe persistence (`HeapTable.metatable_id`, `Keyframe.string_metatable_id`,
@@ -14,15 +14,22 @@ snapshot v3); `setmetatable`/`getmetatable` (with `__metatable` protection);
 tables run tier-0. The dispatch keystone is `Vm.metatableOf` + `Vm.metamethod`
 (interp.zig) over the cached `Vm.mm` name strings.
 
-**Chunk 2b (deferred):** the remaining metamethods, each wrapping the tier-0 op's
-`TypeError`/non-callable path and reusing `Vm.metamethod`:
-- `__add __sub __mul __div __mod __pow __idiv` (arith), `__unm` (neg),
-  `__band __bor __bxor __shl __shr __bnot` (bitwise) — fire when an operand is a
-  metatable-bearing table; symmetric operand lookup (left then right).
-- `__eq` (only when both are tables and raw-unequal), `__lt`, `__le` (compare).
-- `__concat` (the `..` non-string/number path), `__len` (the `#` non-table/string
-  path), `__call` (calling a non-function with a `__call` table), `__tostring`
-  (`tostring`/`print` of a metatable-bearing value).
+Chunk 2b (the operator metamethods) landed (June 2026): `__add __sub __mul __div
+__mod __pow __idiv` (arith), `__unm` (neg), `__band __bor __bxor __shl __shr
+__bnot` (bitwise), `__eq` (two-tables-only), `__lt`/`__le` (with `>`/`>=` via
+operand swap), `__concat`, `__len`, `__call` (single + multret), and
+`__tostring` (`tostring`/`print`). All route the tier-0 op's TypeError /
+non-callable path through one shared helper set in interp.zig
+(`binMeta`/`unMeta`/`arithMeta`/`unArithMeta`/`compareMeta`/`valuesEqual`/
+`lenValue`/`metaToString`), each ultimately calling `Vm.callValue` — a trace
+barrier, so every recorded op already aborts on a non-number operand and
+side-exits to tier-0. 8-mode parity + a deterministic hot-loop `__add` corpus
+under `interp.zig` tests.
+
+**Deferred metamethod follow-ups:**
+- `__name` metafield in `tostring`/error rendering (not yet honoured; only
+  `__tostring` is). Out of the 2b scope.
+- `string.format %s` honouring `__tostring` (currently raw-renders).
 
 **Perf follow-up (separate):** a `guard_no_metatable` IR op so the recorder can
 keep tracing metatable-*free* tables across a polymorphic site instead of the
