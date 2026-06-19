@@ -72,10 +72,22 @@ Rule #3 spirit). It's the at-a-glance "what's left to replicate" for lune.
 
 ## Build
 
-- `zig build` — build the CLI.
-- `zig build test` — run all unit tests (the gate).
-- `zig build run` — run the CLI.
-- `zig build -Denforce-zig-version=true` — hard-fail on toolchain drift (CI).
+Use the `just` recipes (`justfile`) as the canonical entry points — they wrap
+the `zig build` invocations and, for benchmarks, guarantee the right binary.
+
+- `just build` — build the CLI. (`zig build`)
+- `just test` — run all unit tests, the gate. (`zig build test`)
+- `just run -- <script> [args]` — run the CLI. (`zig build run`)
+- `just release` — build the optimized CLI (`zig build -Doptimize=ReleaseFast`).
+- `just bench [args]` — run the benchmark suite (`bench/run.py`); **always
+  rebuilds ReleaseFast first**, so you never benchmark a stale Debug binary.
+  Args pass through (`just bench --filter str`, `just bench --reps 7`). See
+  `bench/README.md`. ALWAYS benchmark via this recipe, never a bare
+  `python3 bench/run.py` against whatever happens to be in `zig-out/`.
+- `just check-version` — hard-fail on toolchain drift (CI). NB: this rebuilds
+  `zig-out/bin/lune` as **Debug**; re-run `just release`/`just bench` before
+  timing anything afterward (a plain `zig build`, `zig build test`, or this
+  recipe leaves a Debug binary that benchmarks ~20× slow).
 
 ## LuaJIT is dedication, not magic — and not a talent ceiling
 
