@@ -2,6 +2,45 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## `_G` + error ergonomics LANDED (June 2026)
+
+Lua-compat chunk: `_G`, `xpcall` before-unwind handler, `debug.traceback`.
+- **`_G`** — the global environment exposed as a self-reference into the globals
+  table (id 0), seeded in `installBaseLib` next to `arg`/`_VERSION`. The
+  self-edge serializes as `HeapRef{id=0}` and round-trips the keyframe path; the
+  unknown-global lint knows it (added to `builtin_global_names`).
+- **`xpcall`** — the message handler now runs **before** the stack unwinds
+  (`protectedCall` in `stdlib/errors.zig` reordered: call the handler with the
+  faulting frames live, restore `depth`/`stack_top` only after it returns). pcall
+  unchanged; handler-faults (catchable → `"error in error handling"`,
+  non-catchable → re-raise) unchanged.
+- **`debug.traceback`** — new `src/stdlib/debug.zig`, one native reusing
+  `Vm.backtraceFrames`. Lua-shaped: no `thread` arg (no coroutines); a
+  non-string, non-nil message passes through unchanged; `level` (default 1) skips
+  leaf frames. Pure function of static proto names + source offsets → 8-mode
+  deterministic; a native call is a trace barrier so no recorder/JIT change.
+
+**Intentional semantic change:** because the handler now runs on the *live*
+faulting stack, a located error *inside* the handler (`error(msg, level)` with
+`level` reaching the faulting frames) resolves to the original error site, not
+the restored xpcall boundary — this is Lua's before-unwind behavior and is
+deterministic across all 8 modes (Codex flagged it; it's the intended effect).
+
+**Pre-existing (noted, not in scope):** `nError`'s `raiseLocatedError(bytes,
+@intCast(level))` and any `@intCast(i64→usize)` of a user level can trap on a
+32-bit target (wasm32) for a huge in-`i64`-range level. `debug.traceback`'s own
+level handling was made 32-bit-safe here; the `error()` path is unchanged and the
+wasm build is already broken for an unrelated reason (see the `zig build wasm`
+section). Fix alongside that.
+
+**Deferred / known cosmetics:**
+- Traceback lines render a named function's name as *both* chunk and function
+  (`foo:5: in function 'foo'`) because lune conflates per-function `proto.name`
+  with the chunk name (consistent with existing `chunk:line:` error messages).
+  Cosmetic; not worth a per-function chunk/name split yet.
+- The rest of `debug.*` (`getinfo`/`sethook`/`getlocal`/…) stays unimplemented —
+  most is determinism-hostile or excluded in the inventory.
+
 ## Metatables — chunks 2a + 2b LANDED; remaining follow-ups
 
 Chunk 2a (the OO core) landed (June 2026): `Table.metatable` field + GC mark +

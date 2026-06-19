@@ -23,9 +23,11 @@
 //! per Lua's `level` rule (via `Vm.raiseLocatedError` + the shared `callSiteAt`
 //! locator); non-string messages pass through verbatim.
 //!
-//! Not yet (deferred follow-up): `xpcall`'s handler runs *after* the unwind with
-//! the error value only (no before-unwind traceback — that waits on
-//! `debug.traceback`).
+//! `xpcall`'s message handler runs **before** the stack unwinds (Lua semantics):
+//! it executes as a frame on top of the still-live faulting frames, so a handler
+//! of `debug.traceback` produces a real backtrace of where the error happened.
+//! The boundary (`vm.depth`/`vm.stack_top`) is restored only after the handler
+//! returns.
 
 const std = @import("std");
 const value = @import("../value.zig");
@@ -47,11 +49,13 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
 /// `out[1..] = results`. Returns the number of values written into `out`.
 ///
 /// `handler` non-null ⇒ `xpcall`: on a caught error the message handler is invoked
-/// with the error value (after the boundary is restored) and its results replace
-/// the error value in `out[1..]`. A handler that raises a *catchable* error yields
-/// the fixed string `"error in error handling"` (never recurses); a *non-catchable*
-/// handler fault (OOM, effect-log integrity, replay divergence) re-raises unchanged,
-/// exactly like the primary protected call — it must never be masked.
+/// with the error value **while the faulting frames are still live** (before the
+/// boundary is restored, so `debug.traceback` inside it sees the error site), and
+/// its results replace the error value in `out[1..]`. A handler that raises a
+/// *catchable* error yields the fixed string `"error in error handling"` (never
+/// recurses); a *non-catchable* handler fault (OOM, effect-log integrity, replay
+/// divergence) re-raises unchanged, exactly like the primary protected call — it
+/// must never be masked.
 ///
 /// MUST be called from a native (it reenters the VM). The boundary it restores is
 /// `(vm.depth, vm.stack_top)` captured at entry — `callValue` leaves the faulting
@@ -70,27 +74,40 @@ fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, hand
         // error value from the live frames BEFORE restoring the boundary.
         const errval = vm.pending_error orelse try vm.synthErrorValue(err);
         vm.pending_error = null;
-        vm.depth = entry_depth;
-        vm.stack_top = entry_top;
         out[0] = Value.boolean(false);
 
         if (handler) |h| {
+            // Lua runs the message handler **before** the stack unwinds — a new
+            // frame on top of the still-live faulting frames — so the handler can
+            // inspect where the error happened (e.g. `debug.traceback`). We keep
+            // `vm.depth`/`vm.stack_top` raised here: `callValue` lays the handler's
+            // window at the raised `stack_top` (above the faulting registers) and
+            // runs it bounded at the faulting depth, so the faulting frames stay
+            // intact underneath for the handler to walk. The boundary is restored
+            // only AFTER the handler returns.
             const hn = vm.callValue(h, &.{errval}, results) catch |herr| {
                 // A non-catchable handler fault (OOM, effect-log integrity, a
                 // replay divergence) must propagate unchanged — swallowing it as
                 // "error in error handling" would let a program mask heap pressure
                 // or a determinism break. Re-raise with the frames still live.
                 if (!interp.catchable(herr)) return herr;
-                // A catchable handler fault: restore again and report a fixed
-                // message. Do not recurse into the handler.
+                // A catchable handler fault: restore the boundary and report a
+                // fixed message. Do not recurse into the handler.
                 vm.pending_error = null;
                 vm.depth = entry_depth;
                 vm.stack_top = entry_top;
                 if (out.len > 1) out[1] = try vm.heap.internValue("error in error handling");
                 return @min(out.len, @as(usize, 2));
             };
+            // Handler returned — now unwind to the protected-call boundary.
+            vm.depth = entry_depth;
+            vm.stack_top = entry_top;
             return @min(out.len, 1 + hn);
         }
+        // `pcall` (no handler): nothing observes the live stack, so unwind now and
+        // return `false, errval`.
+        vm.depth = entry_depth;
+        vm.stack_top = entry_top;
         if (out.len > 1) out[1] = errval;
         return @min(out.len, @as(usize, 2));
     };

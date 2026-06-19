@@ -36,6 +36,7 @@ const stdbase = @import("stdlib/base.zig");
 const stdbasic = @import("stdlib/basic.zig");
 const stdstring = @import("stdlib/string.zig");
 const stderrors = @import("stdlib/errors.zig");
+const stddebug = @import("stdlib/debug.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -194,7 +195,8 @@ pub const ModuleConst = function.ModuleConst;
 pub const lune_version = "lune 0.0.0";
 
 pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++
-    stdbase.natives ++ stdbasic.natives ++ stdstring.natives ++ stderrors.natives;
+    stdbase.natives ++ stdbasic.natives ++ stdstring.natives ++ stderrors.natives ++
+    stddebug.natives;
 
 /// The interpreter's own natives. `print` is pure output; `clock` is the first
 /// nondeterministic input.
@@ -229,7 +231,7 @@ pub const base_constants = stdmath.constants;
 /// in lockstep — add a native and its top-level name is known here.
 pub const builtin_global_names = blk: {
     @setEvalBranchQuota(10_000);
-    var tmp: [base_natives.len + 2][]const u8 = undefined;
+    var tmp: [base_natives.len + 3][]const u8 = undefined;
     var n: usize = 0;
     outer: for (base_natives) |bn| {
         const top = bn.module orelse bn.name;
@@ -246,6 +248,10 @@ pub const builtin_global_names = blk: {
     // `_VERSION` is a bare global string (seeded in `installBaseLib`), not a
     // native; programs reference it, so the lint must know it too.
     tmp[n] = "_VERSION";
+    n += 1;
+    // `_G` is the global environment table (seeded in `installBaseLib` as a
+    // self-reference); programs reference it for reflection, so the lint knows it.
+    tmp[n] = "_G";
     n += 1;
     var names: [n][]const u8 = undefined;
     for (&names, 0..) |*slot, i| slot.* = tmp[i];
@@ -635,6 +641,14 @@ pub const Vm = struct {
         // normal interned heap string in `globals`, so it serializes/restores
         // through the keyframe path with no special-casing.
         try self.globals.set(self.gpa, try self.heap.internValue("_VERSION"), try self.heap.internValue(lune_version));
+        // `_G` — the global environment exposed as a global referencing *itself*
+        // (Lua's reflective handle: `_G[name]`, `_G.x = v`, `pairs(_G)`). The
+        // globals table is an ordinary heap table (id 0), so this is just one more
+        // entry whose value is a `HeapRef` back to that same table. The
+        // self-referential edge serializes as `HeapRef{id=0}` and round-trips
+        // through the two-pass keyframe restore like any other table edge (capture
+        // stores ids, never recurses into the referent — no cycle hazard).
+        try self.globals.set(self.gpa, try self.heap.internValue("_G"), Value.heap(&self.globals.header));
     }
 
     fn defineNative(self: *Vm, bn: BaseNative) Error!void {
@@ -3756,6 +3770,113 @@ test "metatable: __tostring returning a non-string is rejected" {
     );
 }
 
+// --- _G (the global environment table) ---------------------------------------
+
+test "_G: reflective access through the global environment table" {
+    try expectProgram(
+        \\print(_G.print == print)
+        \\_G.x = 5
+        \\print(_G.x)
+        \\print(_G._G == _G)
+        \\print(_G._VERSION ~= nil)
+        \\
+    ,
+        "true\n5\ntrue\ntrue\n",
+    );
+}
+
+test "_G: globals and _G are the same table in both directions" {
+    try expectProgram(
+        \\g = 42
+        \\print(_G.g)
+        \\_G.h = 7
+        \\print(_G.h)
+        \\print(_G._G._G.g)
+        \\
+    ,
+        "42\n7\n42\n",
+    );
+}
+
+// --- xpcall before-unwind handler + debug.traceback --------------------------
+
+test "xpcall: message handler transforms the error value" {
+    try expectProgram(
+        "print(xpcall(function() error(\"boom\") end, function(e) return \"H:\" .. e end))\n",
+        "false\tH:anonymous:1: boom\n",
+    );
+}
+
+test "xpcall: a handler that itself errors yields the fixed message" {
+    try expectProgram(
+        "print(xpcall(function() error(\"x\") end, function(e) error(\"handler boom\") end))\n",
+        "false\terror in error handling\n",
+    );
+}
+
+test "xpcall: pcall behaviour is unchanged (false + located value)" {
+    try expectProgram(
+        "print(pcall(function() error(\"boom\") end))\n",
+        "false\tanonymous:1: boom\n",
+    );
+}
+
+test "debug.traceback: handler sees the live faulting stack" {
+    try expectProgram(
+        \\local ok, tb = xpcall(function()
+        \\  local t = nil
+        \\  return t.x
+        \\end, debug.traceback)
+        \\print(ok)
+        \\print(string.find(tb, "stack traceback:", 1, true) ~= nil)
+        \\print(string.find(tb, "attempt to index", 1, true) ~= nil)
+        \\
+    ,
+        "false\ntrue\ntrue\n",
+    );
+}
+
+test "debug.traceback: message prefix + exact format at top level" {
+    try expectProgram(
+        "print(debug.traceback(\"x\"))\n",
+        "x\nstack traceback:\n\tmain:1: in main chunk\n",
+    );
+}
+
+test "debug.traceback: a non-stringable message (table) is returned unchanged" {
+    try expectProgram(
+        \\local t = {}
+        \\print(debug.traceback(t) == t)
+        \\
+    ,
+        "true\n",
+    );
+}
+
+test "debug.traceback: a number message is coerced (Lua's lua_tostring quirk)" {
+    try expectProgram(
+        "print(debug.traceback(42))\n",
+        "42\nstack traceback:\n\tmain:1: in main chunk\n",
+    );
+}
+
+test "debug.traceback: level skips frames (level past the top is empty)" {
+    try expectProgram(
+        "print(debug.traceback(\"x\", 99))\n",
+        "x\nstack traceback:\n",
+    );
+}
+
+test "debug.traceback: an out-of-range float level is a bad argument, not a trap" {
+    try expectProgram(
+        \\local ok, e = pcall(function() return debug.traceback("x", 1e100) end)
+        \\print(ok, string.find(e, "integer representation", 1, true) ~= nil)
+        \\
+    ,
+        "false\ttrue\n",
+    );
+}
+
 // Determinism corpus: a hot loop summing __add-bearing vector objects. The
 // metamethod call is a trace barrier so the loop never tiers up past the call,
 // but the output and the captured snapshot bytes must be byte-identical across
@@ -4135,6 +4256,22 @@ test "determinism: two independent runs agree on output, traces, and snapshots" 
         \\total = total + #log
         \\print(total)
         \\print(("lune"):upper())
+        ,
+        // _G (the global environment self-reference): write and read globals
+        // through `_G` in a hot loop, then chase the self-edge (`_G._G._G…`). The
+        // globals table (id 0) now holds a self-referential entry serialized as
+        // `HeapRef{id=0}`; a divergent id or a leaked address through that edge
+        // would split the snapshot bytes. Writing through `_G` mutates the same
+        // globals table the snapshot captures, so the final heap state is fully
+        // exercised by the run-twice + snapshot equality checks.
+        \\local total = 0
+        \\for i = 1, 50 do
+        \\  _G.acc = (_G.acc or 0) + i
+        \\  total = total + (_G["acc"] % 7)
+        \\end
+        \\total = total + (_G._G._G._G.acc % 13)
+        \\print(total)
+        \\print(_G._G == _G)
         ,
     };
     inline for (programs) |src| {
