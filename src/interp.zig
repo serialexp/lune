@@ -3567,6 +3567,28 @@ test "e2e: basic + string stdlib are byte-identical across all modes" {
     );
 }
 
+test "e2e: string pattern matching is byte-identical across all modes" {
+    // find/match/gmatch/gsub through the VM. The 50-iteration loop calling a
+    // pattern native makes the recorder cross a native call in a hot loop; the
+    // gmatch generic-for exercises the state-table iterator. Output must be
+    // identical across {off, record_only, noopt, record_execute, native} × stress.
+    try expectProgram(
+        \\local c = 0
+        \\for i = 1, 50 do
+        \\  if string.find("hello world", "world") then c = c + 1 end
+        \\end
+        \\print(c, string.match("k=v", "(%w+)=(%w+)"))
+        \\print(string.find("abcabc", "b", 3))
+        \\local n = 0
+        \\for w in string.gmatch("a b c d", "%a") do n = n + 1 end
+        \\print(n, (string.gsub("hello", "l", "L")))
+    ,
+        "50\tk\tv\n" ++
+            "5\t5\n" ++
+            "4\theLLo\n",
+    );
+}
+
 test "e2e: closures capture per-iteration bindings; higher-order print" {
     try expectProgram(
         \\local function adder(x)

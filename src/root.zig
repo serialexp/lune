@@ -49,6 +49,9 @@ pub const interp = @import("interp.zig");
 pub const stdlib_math = @import("stdlib/math.zig");
 pub const stdlib_table = @import("stdlib/table.zig");
 pub const stdlib_base = @import("stdlib/base.zig");
+pub const stdlib_basic = @import("stdlib/basic.zig");
+pub const stdlib_string = @import("stdlib/string.zig");
+pub const stdlib_pattern = @import("stdlib/pattern.zig");
 
 /// Phase 5 — hot-path detection + trace recorder (records IR; tier-0 executes).
 pub const trace = @import("trace.zig");

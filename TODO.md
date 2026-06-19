@@ -330,3 +330,18 @@ shows up in a profile, gate re-recording on a per-anchor widen-eviction count.
 `local v=1000; for i=1,N do t[i]=v end` records but proveKinds rejects the trace (the
 invariant value isn't proven .int / fits-covered after loop-invariant handling). Smaller
 follow-up; affects another common fill idiom. Characterise + fix alongside the flicker.
+
+## stdlib pattern pass — follow-ups (string.find/match/gmatch/gsub landed)
+- **gsub function replacement** is deferred: it needs a call-into-VM-from-native
+  primitive (same blocker as `table.sort`'s comparator). `gsubCore` currently
+  returns `error.GsubFunctionUnsupported` for a function `repl`. CSV row is
+  `partial` until this lands.
+- **Misleading native-error messages** (pre-existing, whole native boundary, not
+  pattern-specific): `Vm.describeFault` derives the message from the *faulting
+  opcode*, and a native runs in the caller's frame, so the faulting op is the
+  `.call` that invoked it — every error a native *returns* renders as "attempt to
+  call a <type> value" (e.g. `string.format("%y")` → TypeError shows as a call
+  error). Fix: in describeFault's `.call` arm, only emit "attempt to call…" when
+  the callee is genuinely non-callable (the actual not-a-function error); for any
+  other error from a callable, fall through to `@errorName(err)` (or a
+  native-supplied message once we add an error-message channel).

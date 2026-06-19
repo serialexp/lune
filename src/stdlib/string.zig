@@ -24,12 +24,33 @@ const value = @import("../value.zig");
 const function = @import("../function.zig");
 const interp = @import("../interp.zig");
 const string_mod = @import("../string.zig");
+const table_mod = @import("../table.zig");
+const pattern = @import("pattern.zig");
 
 const Value = value.Value;
 const Vm = interp.Vm;
+const Table = table_mod.Table;
 
 inline fn vmOf(ctx: *anyopaque) *Vm {
     return @ptrCast(@alignCast(ctx));
+}
+
+/// The hidden numeric iterator `gmatch` hands back, mirroring `base.zig`'s
+/// `@ipairs_iter`: a non-identifier name user code can never spell, installed as
+/// a normal global native (so it is a GC root and keyframe-restorable by name).
+const gmatch_iter_name = "@gmatch_iter";
+
+/// Fetch argument `i` as a table, or `TypeError`.
+fn tableArg(args: []const Value, i: usize) error{TypeError}!*Table {
+    if (i >= args.len) return error.TypeError;
+    const v = args[i];
+    if (!v.isHeap() or v.heapType() != .table) return error.TypeError;
+    return Table.fromHeader(v.asHeap());
+}
+
+/// Fetch the native installed under `name` as a callable `Value`.
+fn globalNative(vm: *Vm, name: []const u8) anyerror!Value {
+    return vm.globals.get(try vm.heap.internValue(name));
 }
 
 /// Fetch argument `i` as string bytes, or `TypeError` if missing/non-string.
@@ -466,6 +487,375 @@ fn formatNonStr(out: *std.ArrayList(u8), gpa: std.mem.Allocator, v: Value, spec:
 }
 
 // ---------------------------------------------------------------------------
+// Pattern matching — find / match / gmatch / gsub (engine in pattern.zig)
+// ---------------------------------------------------------------------------
+//
+// The matcher itself is pure (`pattern.MatchState`); these wrappers handle the
+// `Value`/heap/interning side and the multi-result ABI. Every capture is built
+// into a local buffer first (never directly into `out`, which aliases `args`),
+// then copied — so the aliasing contract is satisfied trivially. Capture index
+// resolution and the `gsub` advance loop follow LuaJIT's `lib_string.c`.
+
+/// Local result buffer: 2 (find's start/end) + up to `max_captures`.
+const ResultBuf = [pattern.max_captures + 2]Value;
+
+/// Resolve Lua's `init` argument to a 0-based scan offset, or `null` if it lands
+/// past the end of `s` (→ no match). Negative counts from the end; positive is
+/// 1-based; `0` is treated as `1` (offset 0).
+fn resolveInit(init_raw: i64, len: usize) ?usize {
+    var init = init_raw;
+    if (init < 0) {
+        init += @intCast(len); // -1 → last char (0-based len-1)
+        if (init < 0) init = 0;
+    } else if (init > 0) {
+        init -= 1; // 1-based → 0-based
+    }
+    if (init > @as(i64, @intCast(len))) return null; // start past end
+    return @intCast(init);
+}
+
+/// Convert capture `i` of a completed match to a `Value`, mirroring
+/// `push_onecapture`: index `i >= level` is only valid at `i == 0` (the whole
+/// match, taken from `whole`); a position capture becomes a 1-based integer; a
+/// string capture is interned.
+fn captureValue(vm: *Vm, ms: *const pattern.MatchState, i: usize, whole: ?[2]usize) anyerror!Value {
+    if (i >= ms.level) {
+        if (i == 0) {
+            const w = whole orelse return error.InvalidCapture;
+            return vm.heap.internValue(ms.src[w[0]..w[1]]);
+        }
+        return error.InvalidCapture;
+    }
+    const cap = ms.captures[i];
+    if (cap.len == pattern.cap_unfinished) return error.MalformedPattern;
+    if (cap.len == pattern.cap_position) return Value.int(@intCast(cap.init + 1));
+    const l: usize = @intCast(cap.len);
+    return vm.heap.internValue(ms.src[cap.init .. cap.init + l]);
+}
+
+/// Number of capture results a match produces (`push_captures`'s `nlevels`).
+fn numCaptures(ms: *const pattern.MatchState, whole: ?[2]usize) usize {
+    if (ms.level == 0) return if (whole != null) 1 else 0;
+    return ms.level;
+}
+
+/// Write every capture value into `buf`, returning the count.
+fn writeCaptures(vm: *Vm, ms: *const pattern.MatchState, whole: ?[2]usize, buf: []Value) anyerror!usize {
+    const n = numCaptures(ms, whole);
+    var i: usize = 0;
+    while (i < n) : (i += 1) buf[i] = try captureValue(vm, ms, i, whole);
+    return n;
+}
+
+// -- find -------------------------------------------------------------------
+
+/// Core of `string.find(s, pat [, init [, plain]])`. Writes results into `buf`
+/// and returns the count: `(start, end, captures...)` on a match, or a single
+/// `nil` on no match.
+fn findCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
+    const s = try strArg(args, 0);
+    const pat = try strArg(args, 1);
+    const st = resolveInit(try optIntArg(args, 2, 1), s.len) orelse {
+        buf[0] = Value.nil();
+        return 1;
+    };
+    const plain = args.len >= 4 and args[3].isTruthy();
+
+    if (plain or !pattern.hasSpecials(pat)) {
+        // Plain substring search (empty needle matches at `st`).
+        if (pat.len == 0) {
+            buf[0] = Value.int(@intCast(st + 1));
+            buf[1] = Value.int(@intCast(st));
+            return 2;
+        }
+        if (st <= s.len) {
+            if (std.mem.indexOfPos(u8, s, st, pat)) |q| {
+                buf[0] = Value.int(@intCast(q + 1));
+                buf[1] = Value.int(@intCast(q + pat.len));
+                return 2;
+            }
+        }
+        buf[0] = Value.nil();
+        return 1;
+    }
+
+    var ms = pattern.MatchState.init(s, pat);
+    var pp: usize = 0;
+    const anchor = pat.len > 0 and pat[0] == '^';
+    if (anchor) pp = 1;
+    var sp = st;
+    while (true) {
+        ms.reset();
+        if (try ms.match(sp, pp)) |e| {
+            buf[0] = Value.int(@intCast(sp + 1));
+            buf[1] = Value.int(@intCast(e));
+            const nc = try writeCaptures(vm, &ms, null, buf[2..]);
+            return 2 + nc;
+        }
+        if (sp >= s.len or anchor) break;
+        sp += 1;
+    }
+    buf[0] = Value.nil();
+    return 1;
+}
+
+fn sFind1(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    var buf: ResultBuf = undefined;
+    _ = try findCore(vmOf(ctx), args, &buf);
+    return buf[0];
+}
+
+fn sFindN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    var buf: ResultBuf = undefined;
+    const n = try findCore(vmOf(ctx), args, &buf);
+    return copyOut(buf[0..n], out);
+}
+
+// -- match ------------------------------------------------------------------
+
+/// Core of `string.match(s, pat [, init])`: the captures (or the whole match if
+/// the pattern has none), or a single `nil`.
+fn matchCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
+    const s = try strArg(args, 0);
+    const pat = try strArg(args, 1);
+    const st = resolveInit(try optIntArg(args, 2, 1), s.len) orelse {
+        buf[0] = Value.nil();
+        return 1;
+    };
+
+    var ms = pattern.MatchState.init(s, pat);
+    var pp: usize = 0;
+    const anchor = pat.len > 0 and pat[0] == '^';
+    if (anchor) pp = 1;
+    var sp = st;
+    while (true) {
+        ms.reset();
+        if (try ms.match(sp, pp)) |e| {
+            return try writeCaptures(vm, &ms, .{ sp, e }, buf);
+        }
+        if (sp >= s.len or anchor) break;
+        sp += 1;
+    }
+    buf[0] = Value.nil();
+    return 1;
+}
+
+fn sMatch1(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    var buf: ResultBuf = undefined;
+    _ = try matchCore(vmOf(ctx), args, &buf);
+    return buf[0];
+}
+
+fn sMatchN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    var buf: ResultBuf = undefined;
+    const n = try matchCore(vmOf(ctx), args, &buf);
+    return copyOut(buf[0..n], out);
+}
+
+// -- gmatch -----------------------------------------------------------------
+//
+// `gmatch(s, pat)` returns the generic-for triple `(@gmatch_iter, state, nil)`,
+// where `state` is a plain table `{ [1]=s, [2]=pat, [3]=pos }` the iterator
+// mutates — serializable and keyframe-restorable, where a closure-with-upvalue
+// would not be. (This makes `gmatch` a 3-tuple rather than Lua's lone closure: a
+// deliberate "Lua-shaped" divergence, invisible to `for w in gmatch(...)`.)
+
+fn sGmatchN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    const vm = vmOf(ctx);
+    _ = try strArg(args, 0); // type-check subject
+    _ = try strArg(args, 1); // type-check pattern
+    const iter = try globalNative(vm, gmatch_iter_name);
+    const state = try vm.heap.newTable();
+    try state.set(vm.gpa, Value.int(1), args[0]); // subject string Value
+    try state.set(vm.gpa, Value.int(2), args[1]); // pattern string Value
+    try state.set(vm.gpa, Value.int(3), Value.int(0)); // 0-based scan offset
+    const triple = [3]Value{ iter, Value.heap(&state.header), Value.nil() };
+    return copyOut(&triple, out);
+}
+
+fn sGmatch1(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    // Degenerate single-result projection: just the iterator (state is lost).
+    const vm = vmOf(ctx);
+    _ = try strArg(args, 0);
+    _ = try strArg(args, 1);
+    return globalNative(vm, gmatch_iter_name);
+}
+
+/// `@gmatch_iter(state)` — LuaJIT's `gmatch_aux`: scan forward from the stored
+/// position for the next match, advance the position (forcing progress past an
+/// empty match), and return the captures; 0 results when exhausted.
+fn gmatchAuxCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
+    const st = try tableArg(args, 0);
+    const s = interp.strBytes(st.getInt(1)) orelse return error.TypeError;
+    const pat = interp.strBytes(st.getInt(2)) orelse return error.TypeError;
+    const pos_v = st.getInt(3);
+    var src: usize = if (pos_v.isInt() and pos_v.asInt() >= 0) @intCast(pos_v.asInt()) else 0;
+
+    var ms = pattern.MatchState.init(s, pat);
+    while (src <= s.len) : (src += 1) {
+        ms.reset();
+        if (try ms.match(src, 0)) |e| {
+            const newpos = if (e == src) e + 1 else e; // ensure progress on empty match
+            try st.set(vm.gpa, Value.int(3), Value.int(@intCast(newpos)));
+            return try writeCaptures(vm, &ms, .{ src, e }, buf);
+        }
+    }
+    return 0; // exhausted
+}
+
+fn sGmatchAux1(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    var buf: ResultBuf = undefined;
+    const n = try gmatchAuxCore(vmOf(ctx), args, &buf);
+    return if (n == 0) Value.nil() else buf[0];
+}
+
+fn sGmatchAuxN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    var buf: ResultBuf = undefined;
+    const n = try gmatchAuxCore(vmOf(ctx), args, &buf);
+    return copyOut(buf[0..n], out);
+}
+
+// -- gsub -------------------------------------------------------------------
+
+/// Append a `Value` (string or number) as text to `out`.
+fn appendValueText(vm: *Vm, out: *std.ArrayList(u8), v: Value) anyerror!void {
+    if (interp.strBytes(v)) |b| {
+        try out.appendSlice(vm.gpa, b);
+        return;
+    }
+    var nb: [64]u8 = undefined;
+    try out.appendSlice(vm.gpa, try interp.coerceConcat(v, &nb));
+}
+
+/// `add_s`: expand a string/number replacement, resolving `%0` (whole match),
+/// `%1`–`%9` (captures), and `%%`/`%x` (literal).
+fn addReplString(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState, repl: []const u8, s_off: usize, e_off: usize) anyerror!void {
+    var i: usize = 0;
+    while (i < repl.len) : (i += 1) {
+        const c = repl[i];
+        if (c != '%') {
+            try out.append(vm.gpa, c);
+            continue;
+        }
+        i += 1;
+        if (i >= repl.len) return error.MalformedPattern; // trailing '%' in replacement
+        const d = repl[i];
+        if (!std.ascii.isDigit(d)) {
+            try out.append(vm.gpa, d); // %% → %, %x → x
+        } else if (d == '0') {
+            try out.appendSlice(vm.gpa, ms.src[s_off..e_off]); // whole match
+        } else {
+            const v = try captureValue(vm, ms, d - '1', .{ s_off, e_off });
+            try appendValueText(vm, out, v);
+        }
+    }
+}
+
+/// `add_value` for a table replacement: look up `repl[firstCapture]`; a
+/// nil/false result keeps the original text.
+fn addReplTable(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState, repl: *Table, s_off: usize, e_off: usize) anyerror!void {
+    const key = try captureValue(vm, ms, 0, .{ s_off, e_off });
+    const v = repl.get(key);
+    if (!v.isTruthy()) {
+        try out.appendSlice(vm.gpa, ms.src[s_off..e_off]); // keep original
+        return;
+    }
+    if (interp.strBytes(v) != null or v.isNumber()) {
+        try appendValueText(vm, out, v);
+        return;
+    }
+    return error.TypeError; // invalid replacement value
+}
+
+/// Core of `string.gsub(s, pat, repl [, n])` → `(result, count)`. `repl` may be
+/// a string/number or a table; a function replacement needs call-into-VM (not
+/// yet available) and is rejected with `GsubFunctionUnsupported`.
+fn gsubCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
+    const s = try strArg(args, 0);
+    const pat = try strArg(args, 1);
+    if (args.len < 3) return error.TypeError;
+    const repl = args[2];
+
+    // Classify the replacement up front (bad kinds error before any work).
+    const repl_table: ?*Table = if (repl.isHeap() and repl.heapType() == .table)
+        Table.fromHeader(repl.asHeap())
+    else
+        null;
+    if (repl_table == null and interp.strBytes(repl) == null and !repl.isNumber()) {
+        if (repl.isHeap() and (repl.heapType() == .function or repl.heapType() == .native))
+            return error.GsubFunctionUnsupported;
+        return error.TypeError;
+    }
+    const repl_str: ?[]const u8 = if (repl_table == null) (interp.strBytes(repl) orelse null) else null;
+
+    const max_n: i64 = if (args.len >= 4 and !args[3].isNil())
+        try optIntArg(args, 3, 0)
+    else
+        @as(i64, @intCast(s.len + 1));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(vm.gpa);
+
+    var ms = pattern.MatchState.init(s, pat);
+    var pp: usize = 0;
+    const anchor = pat.len > 0 and pat[0] == '^';
+    if (anchor) pp = 1;
+
+    var src: usize = 0;
+    var count: i64 = 0;
+    while (count < max_n) {
+        ms.reset();
+        const e_opt = try ms.match(src, pp);
+        if (e_opt) |e| {
+            count += 1;
+            if (repl_table) |t| {
+                try addReplTable(vm, &out, &ms, t, src, e);
+            } else if (repl_str) |r| {
+                try addReplString(vm, &out, &ms, r, src, e);
+            } else {
+                // numeric replacement: coerce to its text, no captures.
+                try appendValueText(vm, &out, repl);
+            }
+            if (e > src) {
+                src = e;
+            } else if (src < s.len) {
+                try out.append(vm.gpa, s[src]);
+                src += 1;
+            } else break;
+        } else if (src < s.len) {
+            try out.append(vm.gpa, s[src]);
+            src += 1;
+        } else break;
+        if (anchor) break;
+    }
+    try out.appendSlice(vm.gpa, s[src..]); // tail
+    buf[0] = try vm.heap.internValue(out.items);
+    buf[1] = Value.int(count);
+    return 2;
+}
+
+fn sGsub1(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    var buf: ResultBuf = undefined;
+    _ = try gsubCore(vmOf(ctx), args, &buf);
+    return buf[0];
+}
+
+fn sGsubN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    var buf: ResultBuf = undefined;
+    const n = try gsubCore(vmOf(ctx), args, &buf);
+    return copyOut(buf[0..n], out);
+}
+
+/// Copy `src` results into `out` (capped at `out.len`), returning the count
+/// written. The VM nil-pads `out[count..]`.
+fn copyOut(src: []const Value, out: []Value) usize {
+    const w = @min(src.len, out.len);
+    var i: usize = 0;
+    while (i < w) : (i += 1) out[i] = src[i];
+    return w;
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -479,6 +869,12 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "string.char", .func = &sChar, .module = "string", .field = "char" },
     .{ .name = "string.byte", .func = &sByte1, .multi = &sByteN, .module = "string", .field = "byte" },
     .{ .name = "string.format", .func = &sFormat, .module = "string", .field = "format" },
+    .{ .name = "string.find", .func = &sFind1, .multi = &sFindN, .module = "string", .field = "find" },
+    .{ .name = "string.match", .func = &sMatch1, .multi = &sMatchN, .module = "string", .field = "match" },
+    .{ .name = "string.gmatch", .func = &sGmatch1, .multi = &sGmatchN, .module = "string", .field = "gmatch" },
+    .{ .name = "string.gsub", .func = &sGsub1, .multi = &sGsubN, .module = "string", .field = "gsub" },
+    // Hidden iterator `gmatch` returns; a bare global like `@ipairs_iter`.
+    .{ .name = gmatch_iter_name, .func = &sGmatchAux1, .multi = &sGmatchAuxN },
 };
 
 // ---------------------------------------------------------------------------
@@ -567,4 +963,106 @@ test "string.format: integer/float/string/quote specs" {
     try testing.expectEqualStrings("[   42][42   ][03.14][ff][hi][\"a\\\"b\"]", bytesOf(r));
     // Unknown conversion errors.
     try testing.expectError(error.TypeError, sFormat(@ptrCast(&vm), &.{ try sv(&vm, "%y"), Value.int(1) }));
+}
+
+// -- pattern wrappers (engine itself is tested in pattern.zig) ---------------
+
+test "string.find: indices, captures, plain, init, no-match" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    var out: [6]Value = undefined;
+
+    // (start, end) of a plain-by-default search (no specials in "lo").
+    var n = try sFindN(@ptrCast(&vm), &.{ try sv(&vm, "hello"), try sv(&vm, "lo") }, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(i64, 4), out[0].asInt());
+    try testing.expectEqual(@as(i64, 5), out[1].asInt());
+
+    // Captures returned after (start, end).
+    n = try sFindN(@ptrCast(&vm), &.{ try sv(&vm, "k=v"), try sv(&vm, "(%w+)=(%w+)") }, &out);
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expectEqual(@as(i64, 1), out[0].asInt());
+    try testing.expectEqual(@as(i64, 3), out[1].asInt());
+    try testing.expectEqualStrings("k", bytesOf(out[2]));
+    try testing.expectEqualStrings("v", bytesOf(out[3]));
+
+    // plain=true treats a special char literally; init skips the leading dot.
+    n = try sFindN(@ptrCast(&vm), &.{ try sv(&vm, "a.b.c"), try sv(&vm, "."), Value.int(3), Value.boolean(true) }, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(i64, 4), out[0].asInt());
+
+    // No match → single nil.
+    n = try sFindN(@ptrCast(&vm), &.{ try sv(&vm, "abc"), try sv(&vm, "x") }, &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expect(out[0].isNil());
+}
+
+test "string.match: captures, whole match, anchors" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    var out: [4]Value = undefined;
+
+    // Two captures.
+    var n = try sMatchN(@ptrCast(&vm), &.{ try sv(&vm, "  key = val"), try sv(&vm, "(%w+)%s*=%s*(%w+)") }, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("key", bytesOf(out[0]));
+    try testing.expectEqualStrings("val", bytesOf(out[1]));
+
+    // No captures → whole match (single result).
+    n = try sMatchN(@ptrCast(&vm), &.{ try sv(&vm, "2026-06"), try sv(&vm, "%d+") }, &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualStrings("2026", bytesOf(out[0]));
+
+    // Single projection mirrors the first result.
+    try testing.expectEqualStrings("2026", bytesOf(try sMatch1(@ptrCast(&vm), &.{ try sv(&vm, "2026-06"), try sv(&vm, "%d+") })));
+}
+
+test "string.gsub: string repl with %1, count, table repl, anchor" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    var out: [2]Value = undefined;
+
+    // %1 capture reference + substitution count.
+    var n = try sGsubN(@ptrCast(&vm), &.{ try sv(&vm, "x=1, y=2"), try sv(&vm, "(%w+)=(%w+)"), try sv(&vm, "%2=%1") }, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("1=x, 2=y", bytesOf(out[0]));
+    try testing.expectEqual(@as(i64, 2), out[1].asInt());
+
+    // Table replacement; missing keys keep the original text.
+    const map = try vm.heap.newTable();
+    try map.set(vm.gpa, try sv(&vm, "name"), try sv(&vm, "Lua"));
+    n = try sGsubN(@ptrCast(&vm), &.{ try sv(&vm, "$name $x"), try sv(&vm, "%$(%w+)"), Value.heap(&map.header) }, &out);
+    try testing.expectEqualStrings("Lua $x", bytesOf(out[0]));
+    try testing.expectEqual(@as(i64, 2), out[1].asInt());
+
+    // Anchor matches at most once; n caps substitutions.
+    n = try sGsubN(@ptrCast(&vm), &.{ try sv(&vm, "aaa"), try sv(&vm, "^a"), try sv(&vm, "A") }, &out);
+    try testing.expectEqualStrings("Aaa", bytesOf(out[0]));
+    try testing.expectEqual(@as(i64, 1), out[1].asInt());
+
+    // Function replacement is not yet supported (needs call-into-VM).
+    const noop = try function.Native.create(vm.gpa, &sLen, "noop");
+    defer noop.destroy(vm.gpa);
+    try testing.expectError(error.GsubFunctionUnsupported, sGsubN(@ptrCast(&vm), &.{ try sv(&vm, "a"), try sv(&vm, "a"), Value.heap(&noop.header) }, &out));
+}
+
+test "@gmatch_iter walks the state table and stops when exhausted" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+
+    const st = try vm.heap.newTable();
+    try st.set(vm.gpa, Value.int(1), try sv(&vm, "a b c"));
+    try st.set(vm.gpa, Value.int(2), try sv(&vm, "%a"));
+    try st.set(vm.gpa, Value.int(3), Value.int(0));
+    const stv = Value.heap(&st.header);
+
+    var out: [2]Value = undefined;
+    const want = [_][]const u8{ "a", "b", "c" };
+    for (want) |w| {
+        const n = try sGmatchAuxN(@ptrCast(&vm), &.{stv}, &out);
+        try testing.expectEqual(@as(usize, 1), n);
+        try testing.expectEqualStrings(w, bytesOf(out[0]));
+    }
+    // Exhausted → 0 results.
+    try testing.expectEqual(@as(usize, 0), try sGmatchAuxN(@ptrCast(&vm), &.{stv}, &out));
 }
