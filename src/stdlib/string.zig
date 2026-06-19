@@ -295,6 +295,99 @@ fn signPrefix(neg: bool, spec: FormatSpec) []const u8 {
     return "";
 }
 
+// --- C-`printf` float bodies (magnitude only; sign/width applied later) --------
+//
+// Zig's `std.fmt.float.render` is the digit engine, but its surface differs from
+// C in two ways lune must paper over for LuaJIT/printf parity: the scientific
+// exponent is bare (`e2`, not `e+02`), and there is no `%g`-style significant-
+// digit mode. These helpers bridge both.
+
+/// `%e`/`%E` magnitude: Zig scientific digits with the exponent normalised to a
+/// sign and at least two digits (`1.5e2` → `1.500000e+02`). `frac` is the number
+/// of fractional digits; `exp_char` is 'e' or 'E'. Writes into `dst`.
+fn renderEng(dst: []u8, mag: f64, frac: usize, exp_char: u8) ![]const u8 {
+    var tmp: [512]u8 = undefined;
+    const sci = std.fmt.float.render(&tmp, mag, .{ .mode = .scientific, .precision = frac }) catch
+        return error.TypeError;
+    const ei = std.mem.indexOfScalar(u8, sci, 'e') orelse return error.TypeError;
+    const mant = sci[0..ei];
+    var raw = sci[ei + 1 ..]; // Zig emits an optional '-' then unpadded digits
+    var neg = false;
+    if (raw.len > 0 and raw[0] == '-') {
+        neg = true;
+        raw = raw[1..];
+    } else if (raw.len > 0 and raw[0] == '+') {
+        raw = raw[1..];
+    }
+    var w: usize = 0;
+    @memcpy(dst[w..][0..mant.len], mant);
+    w += mant.len;
+    dst[w] = exp_char;
+    w += 1;
+    dst[w] = if (neg) '-' else '+';
+    w += 1;
+    var pad: usize = if (raw.len < 2) 2 - raw.len else 0; // C: ≥2 exponent digits
+    while (pad > 0) : (pad -= 1) {
+        dst[w] = '0';
+        w += 1;
+    }
+    @memcpy(dst[w..][0..raw.len], raw);
+    w += raw.len;
+    return dst[0..w];
+}
+
+/// The decimal exponent `%e` with `sig` significant digits would use, for `%g`'s
+/// representation choice. Returns 0 on any render hiccup (only reached for finite
+/// magnitudes, where render does not fail).
+fn floatExp(mag: f64, sig: usize) i32 {
+    var tmp: [512]u8 = undefined;
+    const sci = std.fmt.float.render(&tmp, mag, .{
+        .mode = .scientific,
+        .precision = if (sig > 0) sig - 1 else 0,
+    }) catch return 0;
+    const ei = std.mem.indexOfScalar(u8, sci, 'e') orelse return 0;
+    return std.fmt.parseInt(i32, sci[ei + 1 ..], 10) catch 0;
+}
+
+/// Copy `s` into `dst`, stripping trailing fractional zeros (and a then-trailing
+/// '.') while preserving any exponent suffix — C `%g` without the `#` flag.
+fn stripZeros(dst: []u8, s: []const u8) []const u8 {
+    const ei = std.mem.indexOfAny(u8, s, "eE") orelse s.len;
+    var end = ei;
+    if (std.mem.indexOfScalar(u8, s[0..ei], '.') != null) {
+        while (end > 0 and s[end - 1] == '0') end -= 1;
+        if (end > 0 and s[end - 1] == '.') end -= 1;
+    }
+    var w: usize = 0;
+    @memcpy(dst[w..][0..end], s[0..end]);
+    w += end;
+    const exp = s[ei..];
+    @memcpy(dst[w..][0..exp.len], exp);
+    w += exp.len;
+    return dst[0..w];
+}
+
+/// `%g`/`%G` magnitude: C's significant-digit form. With precision `P` (already
+/// defaulted/clamped to ≥1 by the caller), pick `%e` when the decimal exponent X
+/// is `< -4` or `>= P`, else `%f`, then strip trailing zeros unless `hash`.
+fn renderG(dst: []u8, mag: f64, p: usize, exp_char: u8, hash: bool) ![]const u8 {
+    const X = floatExp(mag, p);
+    var buf: [512]u8 = undefined;
+    var body: []const u8 = undefined;
+    if (X >= -4 and X < @as(i32, @intCast(p))) {
+        const frac: usize = @intCast(@as(i32, @intCast(p)) - 1 - X); // ≥0 since X<P
+        body = std.fmt.float.render(&buf, mag, .{ .mode = .decimal, .precision = frac }) catch
+            return error.TypeError;
+    } else {
+        body = try renderEng(&buf, mag, p - 1, exp_char);
+    }
+    if (hash) {
+        @memcpy(dst[0..body.len], body);
+        return dst[0..body.len];
+    }
+    return stripZeros(dst, body);
+}
+
 /// `string.format(fmt, ...)` — a focused C-`printf` supporting Lua's conversions:
 /// `d i u o x X c` (integers), `f F e E g G` (floats), `s` (strings, precision =
 /// max length), `q` (Lua-quoted), and `%%`. Honors the `- + space 0 #` flags,
@@ -403,30 +496,33 @@ fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
                 const f = arg.toFloat();
                 const neg = std.math.signbit(f) and !std.math.isNan(f);
                 const mag = if (neg) -f else f;
-                const lower = spec.conv == 'f' or spec.conv == 'e' or spec.conv == 'g';
-                const mode: std.fmt.float.Mode = switch (spec.conv) {
-                    'e', 'E' => .scientific,
-                    else => .decimal,
-                };
-                // `%f/%e` default to 6 fractional digits; `%g` defaults to shortest.
-                const prec: ?usize = spec.precision orelse switch (spec.conv) {
-                    'g', 'G' => null,
-                    else => 6,
-                };
+                const upper = spec.conv == 'F' or spec.conv == 'E' or spec.conv == 'G';
                 var rbuf: [512]u8 = undefined;
-                const rendered = std.fmt.float.render(&rbuf, mag, .{ .mode = mode, .precision = prec }) catch
-                    return error.TypeError;
-                // `render` lower-cases the exponent 'e'; upper-case for E/G.
-                var body = rendered;
-                if (!lower) {
-                    for (rbuf[0..rendered.len], 0..) |rc, k| {
-                        if (rc == 'e') rbuf[k] = 'E';
-                    }
-                    body = rbuf[0..rendered.len];
-                }
-                // Float precision is already applied: pass precision=null to emit.
+                var body: []const u8 = undefined;
+                // C renders inf/nan as letters (no digits); the `0` flag is
+                // ignored for them (space-pad only).
                 var fspec = spec;
                 fspec.precision = null;
+                if (std.math.isNan(mag)) {
+                    body = if (upper) "NAN" else "nan";
+                    fspec.zero = false;
+                } else if (std.math.isInf(mag)) {
+                    body = if (upper) "INF" else "inf";
+                    fspec.zero = false;
+                } else switch (spec.conv) {
+                    'f', 'F' => body = std.fmt.float.render(&rbuf, mag, .{
+                        .mode = .decimal,
+                        .precision = spec.precision orelse 6,
+                    }) catch return error.TypeError,
+                    'e', 'E' => body = try renderEng(&rbuf, mag, spec.precision orelse 6, if (upper) 'E' else 'e'),
+                    else => { // 'g'/'G': C significant-digit form, default precision 6, min 1
+                        const p = blk: {
+                            const pp = spec.precision orelse 6;
+                            break :blk if (pp == 0) 1 else pp;
+                        };
+                        body = try renderG(&rbuf, mag, p, if (upper) 'E' else 'e', spec.hash);
+                    },
+                }
                 try emitNumeric(&out, gpa, signPrefix(neg, spec), body, fspec);
             },
             's' => {
@@ -963,6 +1059,41 @@ test "string.format: integer/float/string/quote specs" {
     try testing.expectEqualStrings("[   42][42   ][03.14][ff][hi][\"a\\\"b\"]", bytesOf(r));
     // Unknown conversion errors.
     try testing.expectError(error.TypeError, sFormat(@ptrCast(&vm), &.{ try sv(&vm, "%y"), Value.int(1) }));
+}
+
+test "string.format: C-style %e/%g (exponent, sig-digit selection, strip) match printf" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    const big = 66666.66666666667;
+    const Case = struct { spec: []const u8, v: f64, want: []const u8 };
+    // Every `want` was cross-checked byte-for-byte against LuaJIT's printf.
+    const cases = [_]Case{
+        // %e/%E: always-signed exponent, ≥2 digits.
+        .{ .spec = "%e", .v = 1.5, .want = "1.500000e+00" },
+        .{ .spec = "%e", .v = 0.0001234, .want = "1.234000e-04" },
+        .{ .spec = "%E", .v = 1e20, .want = "1.000000E+20" },
+        .{ .spec = "%.3e", .v = big, .want = "6.667e+04" },
+        .{ .spec = "%012.4e", .v = big, .want = "006.6667e+04" },
+        // %g/%G: significant-digit selection (%e vs %f) + trailing-zero strip.
+        .{ .spec = "%g", .v = big, .want = "66666.7" },
+        .{ .spec = "%g", .v = 0.00001234, .want = "1.234e-05" },
+        .{ .spec = "%g", .v = 123456789.0, .want = "1.23457e+08" },
+        .{ .spec = "%g", .v = 100.0, .want = "100" },
+        .{ .spec = "%g", .v = 0.5, .want = "0.5" },
+        .{ .spec = "%.15g", .v = 123456789.0, .want = "123456789" },
+        .{ .spec = "%.3g", .v = big, .want = "6.67e+04" },
+        .{ .spec = "%G", .v = 1e20, .want = "1E+20" },
+        // %#g keeps the trailing zeros %g would strip.
+        .{ .spec = "%#g", .v = 1.0, .want = "1.00000" },
+        // inf/nan render as letters; the `0` flag is ignored (space-pad).
+        .{ .spec = "%f", .v = std.math.inf(f64), .want = "inf" },
+        .{ .spec = "%E", .v = std.math.inf(f64), .want = "INF" },
+        .{ .spec = "%08.2f", .v = std.math.inf(f64), .want = "     inf" },
+    };
+    for (cases) |c| {
+        const r = try sFormat(@ptrCast(&vm), &.{ try sv(&vm, c.spec), Value.float(c.v) });
+        try testing.expectEqualStrings(c.want, bytesOf(r));
+    }
 }
 
 // -- pattern wrappers (engine itself is tested in pattern.zig) ---------------
