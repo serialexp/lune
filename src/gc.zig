@@ -259,6 +259,9 @@ pub const Heap = struct {
                     self.markValue(entry.key_ptr.*);
                     self.markValue(entry.value_ptr.*);
                 }
+                // The metatable (chunk 2a) is a heap edge: keep it alive while
+                // any table references it.
+                if (t.metatable) |m| self.markHeader(&m.header);
             },
             .upvalue => {
                 // `ptr` follows the cell whether open (into the stack) or closed

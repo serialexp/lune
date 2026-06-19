@@ -9,9 +9,15 @@
 //! rejected. String keys compare by pointer thanks to interning (`string.zig`).
 //!
 //! Phase 3 builds correct semantics; the shape/hidden-class pointer (for frozen
-//! struct-like tables, Phase 9) is not here yet. There is no metatable dispatch
-//! yet either. Growth allocates through an injected allocator (Z-4) — the table
-//! does not cache one.
+//! struct-like tables, Phase 9) is not here yet. Growth allocates through an
+//! injected allocator (Z-4) — the table does not cache one.
+//!
+//! Chunk 2a adds a `metatable` field: an optional `*Table` whose well-known
+//! `__index`/`__newindex`/… fields drive metamethod dispatch in the interpreter
+//! (`interp.zig`). The table itself is metamethod-agnostic — it stores the
+//! pointer and the VM does the lookups; `Table.get`/`set` stay **raw** (the
+//! `rawget`/`rawset` semantics). The GC marks it (`gc.blacken`) and the keyframe
+//! serializer persists it as a heap edge (`keyframeser.zig`).
 
 const std = @import("std");
 const object = @import("object.zig");
@@ -35,6 +41,12 @@ pub const Table = struct {
     array: ArrayPart = .empty,
     /// Hash part: every key not in the array part.
     hash: Map = .empty,
+    /// Optional metatable (chunk 2a). `null` = no metatable (the common case).
+    /// The VM reads its well-known fields (`__index`, `__newindex`, …) for
+    /// metamethod dispatch; the table stores only the pointer. A GC edge
+    /// (`gc.blacken` marks it) and a keyframe edge (`keyframeser` persists its
+    /// id). `Table.get`/`set` ignore it entirely — they are the raw accessors.
+    metatable: ?*Table = null,
     /// Amortised rehash trigger. lune's hash part (`std.HashMapUnmanaged`)
     /// self-grows, so we can't use Lua's "hash full" hook to drive a rehash —
     /// instead we recompute the array/hash split when the hash-part population

@@ -270,8 +270,15 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                     values[i] = Value.nil();
                     if (record) rec.value(i, values[i]);
                 },
-                // The slot holds a heap table.
-                .guard_table => if (values[ins.a].isHeap() and values[ins.a].heapType() == .table) {
+                // The slot holds a heap table with NO metatable. Recording aborts
+                // on a metatable-bearing table (`trace.AbortReason.has_metatable`),
+                // so a trace only models raw array access; if `setmetatable` added a
+                // metatable between entries (or this is a different table than the
+                // one recorded), the raw `aload`/`astore` would skip
+                // `__index`/`__newindex` — so side-exit to tier-0 (full dispatch).
+                .guard_table => if (values[ins.a].isHeap() and values[ins.a].heapType() == .table and
+                    table.Table.fromHeader(values[ins.a].asHeap()).metatable == null)
+                {
                     if (record) rec.guardPass(i, values[ins.a]);
                 } else {
                     if (record) rec.exit(i, .guard, values[ins.a]);

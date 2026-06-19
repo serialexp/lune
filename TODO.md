@@ -2,6 +2,55 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Metatables chunk 2b — arithmetic/compare/concat/len/call/tostring metamethods
+
+Chunk 2a (the OO core) landed (June 2026): `Table.metatable` field + GC mark +
+keyframe persistence (`HeapTable.metatable_id`, `Keyframe.string_metatable_id`,
+snapshot v3); `setmetatable`/`getmetatable` (with `__metatable` protection);
+`__index`/`__newindex` (table + function forms, bounded chain via
+`Vm.indexGet`/`indexSet` + `MetatableChainLoop`); the shared string metatable so
+`("x"):upper()` resolves through `string`; and the recorder aborts
+(`AbortReason.has_metatable`) at `recArrayGet`/`recArraySet` so metatable-bearing
+tables run tier-0. The dispatch keystone is `Vm.metatableOf` + `Vm.metamethod`
+(interp.zig) over the cached `Vm.mm` name strings.
+
+**Chunk 2b (deferred):** the remaining metamethods, each wrapping the tier-0 op's
+`TypeError`/non-callable path and reusing `Vm.metamethod`:
+- `__add __sub __mul __div __mod __pow __idiv` (arith), `__unm` (neg),
+  `__band __bor __bxor __shl __shr __bnot` (bitwise) — fire when an operand is a
+  metatable-bearing table; symmetric operand lookup (left then right).
+- `__eq` (only when both are tables and raw-unequal), `__lt`, `__le` (compare).
+- `__concat` (the `..` non-string/number path), `__len` (the `#` non-table/string
+  path), `__call` (calling a non-function with a `__call` table), `__tostring`
+  (`tostring`/`print` of a metatable-bearing value).
+
+**Perf follow-up (separate):** a `guard_no_metatable` IR op so the recorder can
+keep tracing metatable-*free* tables across a polymorphic site instead of the
+current whole-trace abort. Not needed for correctness — only to recover JIT
+coverage on code that mixes plain and metatable'd tables.
+
+## `zig build wasm` is broken (wasm32 `usize` overflow in trace.zig hotIndex) — PRE-EXISTING
+
+Discovered during the metatables M0 work (June 2026), unrelated to it. `zig
+build wasm` fails to compile:
+
+```
+src/trace.zig:504: error: type 'usize' cannot represent integer value '11400714819323198485'
+    h ^= @as(usize, pc) *% 0x9E3779B97F4A7C15;
+```
+
+On wasm32 `usize` is **32-bit**, so the 64-bit golden-ratio constant in
+`hotIndex` overflows at compile time (and `@intFromPtr(proto)` is 32-bit too).
+The line is unchanged at HEAD — this is a latent breakage from an earlier
+trace/hotcount change, not the metatable work. Consequence: the committed
+`zig-out/bin/lune.wasm` is **stale**, so `viz/test/diff.test.ts`'s cross-engine
+byte-identity check cannot be rebuilt/rerun and its pass/fail reflects an old
+artifact (on top of the separate known `arg`-table divergence below). **Fix:**
+make `hotIndex` width-correct on wasm32 — hash in `u64` explicitly
+(`@as(u64, pc) *% 0x9E3779B97F4A7C15`, fold to `usize` at the end) and use a
+stable proto id instead of `@intFromPtr` for the wasm path. The native
+`zig build test` gate is unaffected and green.
+
 ## tier-0 interpreter perf — next lever (after T1+T3)
 
 Two interpreter wins landed: T1 (inline table array fast-path in

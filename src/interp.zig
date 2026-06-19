@@ -81,6 +81,10 @@ pub const Error = error{
     /// `Vm.pending_error`; this Zig tag is only the unwinding signal. Caught by
     /// `pcall`/`xpcall`, which read+clear `pending_error`.
     LuaError,
+    /// An `__index`/`__newindex` table chain exceeded `max_metatable_chain` hops
+    /// — almost certainly a metatable cycle (`setmetatable(t, {__index=t})` and
+    /// kin). Surfaced as a located runtime fault rather than hanging the VM.
+    MetatableChainLoop,
 };
 
 /// Fixed VM register/call stack: every frame's register window is a slice of
@@ -361,6 +365,22 @@ pub const SuspendCtl = struct { min_depth: u32 = 0, after_safepoints: u64 = 0 };
 /// The tier-0 virtual machine. Owns the resources a running program needs that
 /// outlive a single frame: the object heap, the global table, and the shared
 /// register/call stack.
+/// The interned metamethod-name strings the VM dispatches on, built once in
+/// `Vm.init` so a metamethod lookup never re-interns a `"__index"` key on the
+/// hot path. Each is a heap-string `Value` (or `nil` before `init` runs / in a
+/// bare VM). GC-rooted via `forEachRootHeader` so a collection mid-dispatch
+/// cannot sweep them. Chunk 2a needs only these three; chunk 2b grows the set
+/// (`__add`, `__eq`, `__concat`, …) the same way.
+const MetamethodNames = struct {
+    /// `"__index"` — read fallback for an absent key (table or function).
+    index: Value = Value.nil(),
+    /// `"__newindex"` — write fallback for an absent key (table or function).
+    newindex: Value = Value.nil(),
+    /// `"__metatable"` — when present, `getmetatable` returns it and
+    /// `setmetatable` refuses to change the (protected) metatable.
+    metatable: Value = Value.nil(),
+};
+
 pub const Vm = struct {
     gpa: std.mem.Allocator,
     /// The object heap (strings, tables, closures, …). Owns every heap value a
@@ -473,6 +493,18 @@ pub const Vm = struct {
     /// safepoint k (1-based, matching `safepoint_seq`). Owned by the VM; lets the
     /// replay UI offer line-grain stepping with no extra wasm round-trips.
     safepoint_lines: std.ArrayList(u32) = .empty,
+    /// Interned metamethod-name strings (`__index`/`__newindex`/`__metatable`),
+    /// built once in `init`. Left all-`nil` in a bare VM (`initBare`); the
+    /// keyframe restorer rebuilds them after seeding the heap. GC-rooted via
+    /// `forEachRootHeader`.
+    mm: MetamethodNames = .{},
+    /// The shared built-in **string metatable** (chunk 2a / M3): a table whose
+    /// `__index` is the `string` module table, so indexing a string with an
+    /// absent raw key flows through to the string library and `("x"):upper()`
+    /// works. Built once after `installBaseLib`; `null` in a bare VM until the
+    /// restorer rebinds it. Referenced from the VM (not `globals`), so it is
+    /// GC-rooted explicitly via `forEachRootHeader`.
+    string_metatable: ?*table.Table = null,
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
         var vm = try initBare(gpa);
@@ -482,7 +514,30 @@ pub const Vm = struct {
         // the base library installs (the `print` native + its interned name).
         vm.globals = try vm.heap.newTable();
         try vm.installBaseLib();
+        try vm.initMetatableSupport();
         return vm;
+    }
+
+    /// Build the metamethod-name string cache and the shared string metatable.
+    /// Split out of `init` so the keyframe restorer can rebuild the *same*
+    /// runtime-derived state after it reseeds the heap (the names re-intern to
+    /// the already-present ids; the string metatable is rebound to its restored
+    /// table). Idempotent w.r.t. interning — `internValue` returns the existing
+    /// string when the bytes are already present.
+    fn initMetatableSupport(self: *Vm) Error!void {
+        self.mm = .{
+            .index = try self.heap.internValue("__index"),
+            .newindex = try self.heap.internValue("__newindex"),
+            .metatable = try self.heap.internValue("__metatable"),
+        };
+        // The shared string metatable: `__index` → the `string` module table, so
+        // `s:method(...)` (compiled as `get_index` + `call` with `self`) resolves
+        // `method` through the string library. Built only when the string module
+        // exists (it always does after `installBaseLib`).
+        const string_mod = try self.getOrCreateModuleTable("string");
+        const smt = try self.heap.newTable();
+        try smt.set(self.gpa, self.mm.index, Value.heap(&string_mod.header));
+        self.string_metatable = smt;
     }
 
     /// Build a VM with **no seeded heap**: an empty heap (`next_obj_id == 0`, no
@@ -804,6 +859,7 @@ pub const Vm = struct {
         const message: []const u8 = switch (err) {
             Error.StackOverflow => try arena.dupe(u8, "stack overflow"),
             Error.DivisionByZero => try arena.dupe(u8, "attempt to perform integer division or modulo by zero"),
+            Error.MetatableChainLoop => try arena.dupe(u8, "'__index' chain too long; possible loop"),
             else => switch (instr.op) {
                 .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr => try std.fmt.allocPrint(
                     arena,
@@ -1093,6 +1149,14 @@ pub const Vm = struct {
         //    its catch. Load-bearing for the `xpcall` handler path, which allocates
         //    (and so may collect) while the error value waits to be handed over.
         if (self.pending_error) |ev| if (ev.isHeap()) cb(ctx, ev.asHeap());
+        // 8. metamethod-dispatch roots: the interned metamethod-name strings and
+        //    the shared string metatable. Referenced from the VM (not `globals`),
+        //    so they must be marked explicitly or a collection mid-dispatch would
+        //    sweep them. All `nil`/`null` in a bare VM, so the guards skip them.
+        if (self.mm.index.isHeap()) cb(ctx, self.mm.index.asHeap());
+        if (self.mm.newindex.isHeap()) cb(ctx, self.mm.newindex.asHeap());
+        if (self.mm.metatable.isHeap()) cb(ctx, self.mm.metatable.asHeap());
+        if (self.string_metatable) |smt| cb(ctx, &smt.header);
     }
 
     /// The tier-0 dispatch loop over the **explicit** call stack. Runs the top
@@ -1341,10 +1405,16 @@ pub const Vm = struct {
                         if (container.isHeap() and container.heapType() == .table and key.isInt()) {
                             const tbl = table.Table.fromHeader(container.asHeap());
                             const i = key.asInt();
-                            if (i >= 1 and i <= @as(i64, @intCast(tbl.array.len)))
-                                break :blk tbl.array.get(@intCast(i));
+                            if (i >= 1 and i <= @as(i64, @intCast(tbl.array.len))) {
+                                // A *present* (non-nil) in-bounds slot is a raw read
+                                // regardless of any metatable — Lua only consults
+                                // `__index` for an absent key. A hole (nil) falls
+                                // through to `indexGet`, which checks `__index`.
+                                const v = tbl.array.get(@intCast(i));
+                                if (!v.isNil()) break :blk v;
+                            }
                         }
-                        break :blk try indexGet(container, key);
+                        break :blk try self.indexGet(container, key);
                     };
                 },
                 .set_index => {
@@ -1365,9 +1435,17 @@ pub const Vm = struct {
                             const tbl = table.Table.fromHeader(container.asHeap());
                             const i = key.asInt();
                             if (i >= 1 and i <= @as(i64, @intCast(tbl.array.len)) and tbl.array.fits(val)) {
-                                tbl.array.setInLane(@intCast(i), val);
-                                self.heap.writeBarrier(&tbl.header, val); // no-op until Phase 4
-                                break :fast;
+                                // `__newindex` fires only for an *absent* key on a
+                                // metatable-bearing table. A metatable-free table
+                                // (the overwhelming common case — one predictable
+                                // load) takes the raw store directly; with a
+                                // metatable, only a present (non-nil) slot may be
+                                // stored raw — a hole routes through `indexSet`.
+                                if (tbl.metatable == null or !tbl.array.get(@intCast(i)).isNil()) {
+                                    tbl.array.setInLane(@intCast(i), val);
+                                    self.heap.writeBarrier(&tbl.header, val); // no-op until Phase 4
+                                    break :fast;
+                                }
                             }
                         }
                         try self.indexSet(container, key, val);
@@ -1852,25 +1930,119 @@ pub const Vm = struct {
         return self.heap.internValue(tmp);
     }
 
-    /// `container[key]`. Only tables are indexable in v1 (no string indexing /
-    /// metatables yet).
-    fn indexGet(container: Value, key: Value) Error!Value {
-        if (container.isHeap() and container.heapType() == .table) {
-            return table.Table.fromHeader(container.asHeap()).get(key);
-        }
-        return Error.TypeError;
+    /// The metatable governing `v`, or null. A table carries its own
+    /// (`Table.metatable`); every string shares the built-in `string_metatable`;
+    /// no other value type has one in chunk 2a (numbers/booleans/nil/functions
+    /// would need `debug.setmetatable`, which is excluded). The keystone of
+    /// metamethod dispatch — every `__index`/`__newindex` (and chunk 2b's arith/
+    /// compare metamethods) routes through here.
+    pub fn metatableOf(self: *Vm, v: Value) ?*table.Table {
+        if (!v.isHeap()) return null;
+        return switch (v.heapType()) {
+            .table => table.Table.fromHeader(v.asHeap()).metatable,
+            .string => self.string_metatable,
+            else => null,
+        };
     }
 
-    /// `container[key] = val`. The write-barrier seam fires here: a value stored
-    /// into a heap container.
+    /// Raw-fetch metamethod `name` (an interned `self.mm.*` key) from `v`'s
+    /// metatable, or `nil` if `v` has no metatable or the field is absent. Pure
+    /// (no dispatch) — the caller decides whether the result is a handler to call,
+    /// a table to chain through, or a sentinel.
+    fn metamethod(self: *Vm, v: Value, name: Value) Value {
+        const mt = self.metatableOf(v) orelse return Value.nil();
+        return mt.get(name);
+    }
+
+    /// Upper bound on `__index`/`__newindex` table-chain hops before we declare a
+    /// loop. Deterministic and generous — real inheritance chains are a handful
+    /// deep; this only fires on a (meta)table cycle, which would otherwise hang.
+    const max_metatable_chain = 2000;
+
+    /// `container[key]` with `__index` dispatch. A present (non-nil) raw field is
+    /// returned directly (metatable irrelevant — Lua only consults `__index` for
+    /// an *absent* key). Otherwise:
+    ///   - no metatable / no `__index` → a table yields `nil`; a non-indexable
+    ///     value faults (`TypeError`, located by `describeFault`).
+    ///   - `__index` is a table → repeat the raw-or-meta lookup on it (chained,
+    ///     bounded by `max_metatable_chain`).
+    ///   - `__index` is any other value (a function, typically) → call it as
+    ///     `handler(container, key)` and return its first result.
+    fn indexGet(self: *Vm, container: Value, key: Value) Error!Value {
+        var cur = container;
+        var hops: usize = 0;
+        while (true) : (hops += 1) {
+            if (hops >= max_metatable_chain) return Error.MetatableChainLoop;
+            // Raw read when `cur` is a table; a present field short-circuits.
+            if (cur.isHeap() and cur.heapType() == .table) {
+                const raw = table.Table.fromHeader(cur.asHeap()).get(key);
+                if (!raw.isNil()) return raw;
+            }
+            const handler = self.metamethod(cur, self.mm.index);
+            if (handler.isNil()) {
+                // No `__index`: an absent table key is `nil`; a non-table here is
+                // the original "attempt to index a <type> value" fault.
+                if (cur.isHeap() and cur.heapType() == .table) return Value.nil();
+                return Error.TypeError;
+            }
+            if (handler.isHeap() and handler.heapType() == .table) {
+                cur = handler; // chain: look the key up in the `__index` table
+                continue;
+            }
+            // Functional `__index`: `handler(cur, key)` → first result.
+            var out: [1]Value = .{Value.nil()};
+            const n = try self.callValue(handler, &.{ cur, key }, &out);
+            return if (n >= 1) out[0] else Value.nil();
+        }
+    }
+
+    /// `container[key] = val` with `__newindex` dispatch. A raw-present key is a
+    /// raw store (metatable irrelevant — `__newindex` fires only for an *absent*
+    /// key). Otherwise:
+    ///   - no metatable / no `__newindex` → raw set (creates the key); a
+    ///     non-indexable value faults (`TypeError`).
+    ///   - `__newindex` is a table → repeat the set on it (chained, bounded).
+    ///   - `__newindex` is any other value (a function) → call it as
+    ///     `handler(container, key, val)` (no result).
     fn indexSet(self: *Vm, container: Value, key: Value, val: Value) Error!void {
-        if (container.isHeap() and container.heapType() == .table) {
-            const t = table.Table.fromHeader(container.asHeap());
-            try t.set(self.gpa, key, val);
-            self.heap.writeBarrier(&t.header, val); // no-op until Phase 4
+        var cur = container;
+        var hops: usize = 0;
+        while (true) : (hops += 1) {
+            if (hops >= max_metatable_chain) return Error.MetatableChainLoop;
+            if (cur.isHeap() and cur.heapType() == .table) {
+                const t = table.Table.fromHeader(cur.asHeap());
+                // A present (non-nil) raw key bypasses `__newindex`.
+                if (!t.get(key).isNil()) {
+                    try t.set(self.gpa, key, val);
+                    self.heap.writeBarrier(&t.header, val); // no-op until Phase 4
+                    return;
+                }
+                const handler = self.metamethod(cur, self.mm.newindex);
+                if (handler.isNil()) {
+                    // No `__newindex`: a plain raw store that creates the key.
+                    try t.set(self.gpa, key, val);
+                    self.heap.writeBarrier(&t.header, val); // no-op until Phase 4
+                    return;
+                }
+                if (handler.isHeap() and handler.heapType() == .table) {
+                    cur = handler; // chain the set into the `__newindex` table
+                    continue;
+                }
+                var out: [1]Value = .{Value.nil()};
+                _ = try self.callValue(handler, &.{ cur, key, val }, &out);
+                return;
+            }
+            // `cur` is not a table: only a `__newindex` can rescue it.
+            const handler = self.metamethod(cur, self.mm.newindex);
+            if (handler.isNil()) return Error.TypeError;
+            if (handler.isHeap() and handler.heapType() == .table) {
+                cur = handler;
+                continue;
+            }
+            var out: [1]Value = .{Value.nil()};
+            _ = try self.callValue(handler, &.{ cur, key, val }, &out);
             return;
         }
-        return Error.TypeError;
     }
 
     /// Instantiate a closure for `child_proto`, filling each upvalue cell per the
@@ -2011,6 +2183,7 @@ pub fn catchable(e: Error) bool {
         Error.StackOverflow,
         Error.HostError,
         Error.Unimplemented,
+        Error.MetatableChainLoop,
         => true,
         Error.OutOfMemory,
         Error.EffectLogExhausted,
@@ -2941,6 +3114,169 @@ test "errmsg: an unconverted (pure) native still names the function, located" {
     );
 }
 
+// --- metatables (chunk 2a): __index / __newindex + set/getmetatable ----------
+// Each program runs byte-identical across all 8 modes (gc_stress × 5 trace
+// modes). Metatable-bearing tables abort trace recording (`has_metatable`), so
+// the metamethod path is the tier-0 dispatch under every mode.
+
+test "metatable: __index table gives class/inheritance method lookup" {
+    try expectProgram(
+        \\local Animal = {}
+        \\Animal.__index = Animal
+        \\function Animal.new(name) return setmetatable({ name = name }, Animal) end
+        \\function Animal:speak() return self.name .. " speaks" end
+        \\local a = Animal.new("rex")
+        \\print(a:speak())
+        \\print(a.name)
+        \\
+    ,
+        "rex speaks\nrex\n",
+    );
+}
+
+test "metatable: __index function form" {
+    try expectProgram(
+        \\local t = setmetatable({}, { __index = function(_, k) return "<" .. k .. ">" end })
+        \\print(t.foo)
+        \\t.foo = 1
+        \\print(t.foo)
+        \\
+    ,
+        "<foo>\n1\n",
+    );
+}
+
+test "metatable: __newindex function fires only for absent keys" {
+    try expectProgram(
+        \\local n = 0
+        \\local t = setmetatable({}, { __newindex = function(tt, k, v) n = n + 1; rawset(tt, k, v) end })
+        \\t.a = 1
+        \\t.a = 2
+        \\t.b = 3
+        \\print(n, t.a, t.b)
+        \\
+    ,
+        "2\t2\t3\n",
+    );
+}
+
+test "metatable: __newindex table redirects writes" {
+    try expectProgram(
+        \\local backing = {}
+        \\local t = setmetatable({}, { __newindex = backing })
+        \\t.x = 10
+        \\print(rawget(t, "x"), backing.x)
+        \\
+    ,
+        "nil\t10\n",
+    );
+}
+
+test "metatable: getmetatable and __metatable protection" {
+    try expectProgram(
+        \\local mt = { __metatable = "locked" }
+        \\local t = setmetatable({}, mt)
+        \\print(getmetatable(t))
+        \\print(pcall(setmetatable, t, {}))
+        \\
+    ,
+        "locked\nfalse\tmain:4: cannot change a protected metatable\n",
+    );
+}
+
+test "metatable: setmetatable(t, nil) clears the metatable" {
+    try expectProgram(
+        \\local t = setmetatable({}, { __index = function() return 7 end })
+        \\print(t.missing)
+        \\setmetatable(t, nil)
+        \\print(t.missing)
+        \\print(getmetatable(t))
+        \\
+    ,
+        "7\nnil\nnil\n",
+    );
+}
+
+test "metatable: string methods resolve through the shared string metatable" {
+    try expectProgram(
+        \\print(("foo"):upper())
+        \\print(("hello"):len())
+        \\print(("a,b,c"):gsub(",", ";"))
+        \\print(getmetatable("") ~= nil)
+        \\
+    ,
+        "FOO\n5\na;b;c\t2\ntrue\n",
+    );
+}
+
+test "metatable: __index chain (multi-level inheritance) is bounded and resolves" {
+    try expectProgram(
+        \\local A = {}; A.__index = A; A.kind = "A"
+        \\local B = setmetatable({}, A); B.__index = B
+        \\local obj = setmetatable({}, B)
+        \\print(obj.kind)
+        \\
+    ,
+        "A\n",
+    );
+}
+
+test "metatable: a self-referential __index chain raises rather than hanging" {
+    try expectProgram(
+        \\local loop = {}
+        \\setmetatable(loop, { __index = loop })
+        \\print(pcall(function() return loop.nope end))
+        \\
+    ,
+        "false\tanonymous:3: '__index' chain too long; possible loop\n",
+    );
+}
+
+test "metatable: setmetatable rejects a non-table/non-nil metatable argument" {
+    try expectProgram(
+        \\print(pcall(function() return setmetatable({}, 5) end))
+        \\
+    ,
+        "false\tanonymous:1: bad argument #2 to 'setmetatable' (nil or table expected, got number)\n",
+    );
+}
+
+// Recorder/JIT safety (reviewer-found, chunk 2a): a hot array loop forms a
+// native trace on a metatable-free table; if `setmetatable` later adds a
+// metatable, the cached trace must side-exit to tier-0 (the `guard_table`
+// no-metatable half) so `__newindex` still fires. A wrong (raw native store)
+// would diverge the native mode from tier-0 — caught by all 8 modes here.
+
+test "metatable: setmetatable mid-hot-loop still dispatches __newindex (trace guard)" {
+    try expectProgram(
+        \\local t, n = {}, 0
+        \\local mt = { __newindex = function(tt, k, v) n = n + 1; rawset(tt, k, v) end }
+        \\for i = 1, 100 do
+        \\  if i == 30 then setmetatable(t, mt) end
+        \\  t[i] = true
+        \\end
+        \\print(n)
+        \\
+    ,
+        "71\n",
+    );
+}
+
+test "metatable: a native trace re-entered on a metatable'd table dispatches __newindex" {
+    try expectProgram(
+        \\local function fill(t) for i = 1, 60 do t[i] = i end end
+        \\local a = {}
+        \\fill(a)
+        \\local log = {}
+        \\local b = setmetatable({}, { __newindex = function(_, _, v) log[#log + 1] = v end })
+        \\fill(b)
+        \\print(#a, #log, rawlen(b))
+        \\
+    ,
+        "60\t60\t0\n",
+    );
+}
+
 test "errmsg: a converted table native reports the located bad-argument message" {
     try expectProgram(
         "print(pcall(function() return table.insert(nil, 1) end))\n",
@@ -3275,6 +3611,31 @@ test "determinism: two independent runs agree on output, traces, and snapshots" 
         \\  total = total + #e2
         \\end
         \\print(total)
+        ,
+        // Metatables (chunk 2a): a class via `__index` built and read in a hot
+        // loop, plus a `__newindex` logger. Each object carries a metatable — a
+        // new heap edge the snapshot serializes (`HeapTable.metatable_id`) and the
+        // GC marks. The shared `string_metatable` and the interned `__index`/
+        // `__newindex` names are VM-level roots captured by the snapshot too, so a
+        // divergent id (a rebuilt-not-rebound metatable, an address leak through
+        // the metatable edge) would split the snapshot bytes here. The objects
+        // carry metatables, so trace recording aborts (`has_metatable`) and this
+        // runs the tier-0 dispatch path under all modes.
+        \\local Vec = {}
+        \\Vec.__index = Vec
+        \\function Vec.new(x) return setmetatable({ x = x }, Vec) end
+        \\function Vec:double() return self.x * 2 end
+        \\local log = {}
+        \\local sink = setmetatable({}, { __newindex = function(t, k, v) log[#log + 1] = v end })
+        \\local total = 0
+        \\for i = 1, 60 do
+        \\  local v = Vec.new(i)
+        \\  total = total + v:double()
+        \\  sink[i] = i
+        \\end
+        \\total = total + #log
+        \\print(total)
+        \\print(("lune"):upper())
         ,
     };
     inline for (programs) |src| {

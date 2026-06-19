@@ -518,6 +518,7 @@ pub const HeapString = struct {
 pub const HeapTable = struct {
     array: []const SnapValue,
     entries: []const TableEntry,
+    metatable_id: u32,
 
     pub fn encode(self: HeapTable, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -537,6 +538,7 @@ pub const HeapTable = struct {
         for (self.entries) |_item_1| {
             try _item_1.encodeInto(enc, ctx);
         }
+        try enc.writeUint32(self.metatable_id, .little_endian);
     }
 
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!HeapTable {
@@ -558,6 +560,7 @@ pub const HeapTable = struct {
             _buf_11[_i_8] = try TableEntry.decodeWith(allocator, dec, root);
         }
         result.entries = _buf_11;
+        result.metatable_id = try dec.readUint32(.little_endian);
         return result;
     }
 };
@@ -803,6 +806,7 @@ pub const FrameRef = struct {
 
 pub const Keyframe = struct {
     globals_id: u32,
+    string_metatable_id: u32,
     objects: []const HeapObject,
     stack: []const SnapValue,
     frames: []const FrameRef,
@@ -819,6 +823,7 @@ pub const Keyframe = struct {
 
     pub fn encodeInto(self: Keyframe, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
         try enc.writeUint32(self.globals_id, .little_endian);
+        try enc.writeUint32(self.string_metatable_id, .little_endian);
         try enc.writeUint32(@intCast(self.objects.len), .little_endian);
         for (self.objects) |_item_0| {
             try _item_0.encodeInto(enc, ctx);
@@ -845,6 +850,7 @@ pub const Keyframe = struct {
     pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!Keyframe {
         var result: Keyframe = undefined;
         result.globals_id = try dec.readUint32(.little_endian);
+        result.string_metatable_id = try dec.readUint32(.little_endian);
         const _len_7 = try dec.readUint32(.little_endian);
         const _buf_8 = try allocator.alloc(HeapObject, @as(usize, _len_7));
         for (0.._buf_8.len) |_i_5| {

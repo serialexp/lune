@@ -46,7 +46,9 @@ pub const schema = @import("gen/trace_schema.zig");
 /// (docs/design/04-snapshot-replay-schema.md "two artifacts, one substrate").
 /// v2 (F2c): `FrameRef` gained the per-frame execution cursor (pc/base/
 /// return-wiring) for mid-execution capture + resume. (v1 was final-state only.)
-pub const snapshot_format_version: u32 = 2;
+/// v3 (chunk 2a): `HeapTable` gained `metatable_id` — the table's metatable as a
+/// heap edge (0 = none), so a metatable'd table round-trips through a snapshot.
+pub const snapshot_format_version: u32 = 3;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -115,7 +117,13 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, h: *GcHeader) !schema.HeapObject
             for (kvs, 0..) |kv, i| {
                 entries[i] = .{ .key = toSchemaValue(kv.key), .val = toSchemaValue(kv.val) };
             }
-            break :blk .{ .HeapTable = .{ .array = array, .entries = entries } };
+            // The metatable is a heap edge, encoded as a **1-based** optional id:
+            // `header.id + 1` when present, `0` when absent. Id 0 IS a live object
+            // (the first allocation — `globals` — gets id 0; see `gc.zig`), so a
+            // bare id cannot serve as the "none" sentinel: `setmetatable(t, _G)`
+            // would round-trip as no-metatable and silently drop the edge.
+            const mt_id: u32 = if (t.metatable) |m| m.header.id + 1 else 0;
+            break :blk .{ .HeapTable = .{ .array = array, .entries = entries, .metatable_id = mt_id } };
         },
         .function => blk: {
             const cl = function.Closure.fromHeader(h);
@@ -192,6 +200,13 @@ const Walk = struct {
                     self.pushValue(kv.key);
                     self.pushValue(kv.val);
                 }
+                // The metatable edge (chunk 2a) — the same child `gc.blacken`
+                // marks. Without this, a metatable reachable ONLY via this edge
+                // (the common `setmetatable(t, {…})` with an anonymous metatable)
+                // is omitted from `objects[]`, yet the serializer still writes its
+                // id, so restore fails with `UnresolvedHeapRef`. The serializer and
+                // the GC must enumerate the identical child set.
+                if (t.metatable) |m| self.push(&m.header);
             },
             .upvalue => self.pushValue(function.Upvalue.fromHeader(h).ptr.*),
             .function => {
@@ -255,6 +270,12 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
         .version = snapshot_format_version,
         .keyframe = .{
             .globals_id = vm.globals.header.id,
+            // The shared string metatable is a VM-level root (chunk 2a): captured
+            // by id so restore rebinds the *same* table rather than rebuilding a
+            // fresh one with a drifted id. Encoded **1-based** (`id + 1`); 0 = none
+            // (a bare VM that never built metatable support — only hand-built test
+            // snapshots) — id 0 is a real object, so it cannot be the sentinel.
+            .string_metatable_id = if (vm.string_metatable) |s| s.header.id + 1 else 0,
             .objects = objects,
             .stack = stack,
             .frames = frames,
@@ -285,6 +306,7 @@ const RestoreError = error{
     UnknownProto, // a HeapClosure.proto_id is not in the program's proto tree
     UnknownNative, // a HeapNative.name is not in the native registry
     GlobalsNotATable, // globals_id resolves to a non-table object
+    MetatableNotATable, // a HeapTable.metatable_id resolves to a non-table object
     FrameNotAClosure, // a frame's closure_id resolves to a non-closure
     FrameWindowMismatch, // a frame's base != the running sum of prior register windows
     UpvalueNotAnUpvalue, // a closure/open-upvalue id resolves to a non-upvalue
@@ -451,6 +473,13 @@ pub fn restoreSnapshot(
                     const v = try fromSchemaValue(e.val, &idmap);
                     try t.restoreEntry(gpa, k, v);
                 }
+                // Metatable edge (chunk 2a): 1-based optional id — 0 = none,
+                // otherwise rebind `id - 1` → *Table.
+                if (ht.metatable_id != 0) {
+                    const mh = idmap.get(ht.metatable_id - 1) orelse return error.UnresolvedHeapRef;
+                    if (mh.type != .table) return error.MetatableNotATable;
+                    t.metatable = table.Table.fromHeader(mh);
+                }
             },
             .HeapClosure => |hc| {
                 const cl = function.Closure.fromHeader(h);
@@ -508,6 +537,25 @@ pub fn restoreSnapshot(
         try vm.open_upvalues.append(gpa, .{ .index = ou.stack_index, .cell = cell });
     }
 
+    // VM-level metatable support (chunk 2a). A non-zero `string_metatable_id`
+    // marks a snapshot whose VM had metatable support built (`initMetatableSupport`
+    // — always true for a real run, false only for the hand-built minimal test
+    // corpus). Rebind the string metatable by id (it is a VM-only root, not
+    // reachable from globals) and re-derive the interned metamethod-name cache:
+    // pass-1 re-interned every captured string into `heap.interned`, so these
+    // `internValue` calls resolve to the restored strings with their original ids
+    // (no new objects), keeping `encodeSnapshot ∘ restore == identity`.
+    if (kf.string_metatable_id != 0) {
+        const sh = idmap.get(kf.string_metatable_id - 1) orelse return error.UnresolvedHeapRef;
+        if (sh.type != .table) return error.MetatableNotATable;
+        vm.string_metatable = table.Table.fromHeader(sh);
+        vm.mm = .{
+            .index = try vm.heap.internValue("__index"),
+            .newindex = try vm.heap.internValue("__newindex"),
+            .metatable = try vm.heap.internValue("__metatable"),
+        };
+    }
+
     return vm;
 }
 
@@ -555,6 +603,7 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
         .version = snapshot_format_version,
         .keyframe = .{
             .globals_id = 2,
+            .string_metatable_id = 0,
             .objects = &.{
                 .{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a\x00b\xff\xfe" } } },
                 .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "" } } },
@@ -565,6 +614,7 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
                         .{ .key = sRef(0), .val = sRef(3) },
                         .{ .key = sInt(7), .val = sRef(2) },
                     },
+                    .metatable_id = 0,
                 } } },
                 .{ .id = 3, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 42, .upvalue_ids = &.{ 4, 5 } } } },
                 .{ .id = 6, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 1, .upvalue_ids = &.{} } } },
@@ -853,6 +903,21 @@ test "restore is the exact inverse of capture (byte-identical re-snapshot)" {
         \\t.tag = "bool-lane"
         \\result = t
     );
+    // Metatables (chunk 2a): a table whose metatable is reachable ONLY through the
+    // `metatable` edge (an anonymous `{ __index = ... }`), plus a function handler
+    // that itself hangs off that metatable. The serializer must follow the
+    // metatable edge into `objects[]` (just as `gc.blacken` marks it) or the
+    // serialized `metatable_id` dangles and restore fails with `UnresolvedHeapRef`.
+    // Restore rebinds `metatable_id` by id and re-derives the VM-level mm-name /
+    // string-metatable roots, so the re-capture is byte-identical.
+    try expectRoundTrip(
+        \\local Obj = {}
+        \\Obj.__index = Obj
+        \\function Obj:val() return self.x end
+        \\local o = setmetatable({ x = 7 }, Obj)
+        \\local logged = setmetatable({}, { __newindex = function(t, k, v) rawset(t, k, v) end })
+        \\result = { o = o, logged = logged }
+    );
 }
 
 test "restore rebuilds globals, ids, and a reachable value graph" {
@@ -927,6 +992,66 @@ test "restore rebuilds globals, ids, and a reachable value graph" {
     try testing.expectEqualStrings("print", function.Native.fromHeader(print_val.asHeap()).name);
 }
 
+test "metatable edge to the id-0 object survives round-trip (1-based encoding)" {
+    // Regression: `metatable_id` is a 1-based optional id (`header.id + 1`, 0 =
+    // none), NOT a bare id with 0 = none. Id 0 IS a live object — the first heap
+    // allocation (`globals`) gets it — so the bare-id encoding would serialize a
+    // metatable pointing at the id-0 object as `0` and restore would drop the edge.
+    // Crucially, byte-identity round-trip CANNOT catch this (encode writes 0, the
+    // restored table has no metatable, re-encode writes 0 → b0==b1 holds while the
+    // edge silently vanished). The only sound check is to assert the restored
+    // pointer directly.
+    const gpa = testing.allocator;
+    const source = "g = {}";
+
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    _ = try vm.run(chunk.proto);
+
+    // `globals` is the first allocation, so it holds id 0 — the value that the old
+    // bare-id encoding overloaded as the "none" sentinel.
+    try testing.expectEqual(@as(u32, 0), vm.globals.header.id);
+
+    // Point g's metatable at the id-0 object (globals). Reachable only via the
+    // metatable edge from g's perspective, so a dropped edge is observable.
+    const g_val0 = vm.globals.get(try vm.heap.internValue("g"));
+    try testing.expect(g_val0.isHeap() and g_val0.heapType() == .table);
+    table.Table.fromHeader(g_val0.asHeap()).metatable = vm.globals;
+
+    const b0 = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(b0);
+
+    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    defer {
+        vm2.deinit();
+        gpa.destroy(vm2);
+    }
+
+    // The edge must come back pointing at the restored id-0 object — not null.
+    const g_val = vm2.globals.get(try vm2.heap.internValue("g"));
+    try testing.expect(g_val.isHeap() and g_val.heapType() == .table);
+    const g_mt = table.Table.fromHeader(g_val.asHeap()).metatable;
+    try testing.expect(g_mt != null);
+    try testing.expectEqual(@as(u32, 0), g_mt.?.header.id);
+    try testing.expect(g_mt.? == vm2.globals);
+
+    // And re-capture is byte-identical (the 1-based id survives both directions).
+    const b1 = try encodeSnapshot(gpa, vm2);
+    defer gpa.free(b1);
+    try testing.expectEqualSlices(u8, b0, b1);
+}
+
 test "restore preserves a multi-result native's projection and multi fn" {
     // A multi-return native (`math.modf`) serializes by name only (`HeapNative`),
     // so the restore path must reattach BOTH its single-result `func` projection
@@ -997,6 +1122,7 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
         .version = snapshot_format_version,
         .keyframe = .{
             .globals_id = 2,
+            .string_metatable_id = 0,
             .objects = &.{
                 .{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a\x00b\xff\xfe" } } },
                 .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "" } } },
@@ -1006,6 +1132,7 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
                         .{ .key = sRef(0), .val = sRef(3) },
                         .{ .key = sInt(7), .val = sRef(2) }, // self-ref
                     },
+                    .metatable_id = 0,
                 } } },
                 .{ .id = 3, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 42, .upvalue_ids = &.{ 4, 5 } } } },
                 .{ .id = 6, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 1, .upvalue_ids = &.{} } } },
@@ -1083,9 +1210,11 @@ test "restore surfaces specific errors for malformed snapshots" {
     // A dangling HeapRef in a table value.
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
+        .string_metatable_id = 0,
         .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{},
             .entries = &.{.{ .key = sInt(1), .val = sRef(77) }},
+            .metatable_id = 0,
         } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1095,6 +1224,7 @@ test "restore surfaces specific errors for malformed snapshots" {
     // A closure naming a proto id the program image does not contain.
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
+        .string_metatable_id = 0,
         .objects = &.{.{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 99, .upvalue_ids = &.{} } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1104,6 +1234,7 @@ test "restore surfaces specific errors for malformed snapshots" {
     // A native whose name is not in the registry.
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
+        .string_metatable_id = 0,
         .objects = &.{.{ .id = 0, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "nope" } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1113,6 +1244,7 @@ test "restore surfaces specific errors for malformed snapshots" {
     // globals_id resolves to a string, not a table.
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
+        .string_metatable_id = 0,
         .objects = &.{.{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "x" } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1122,6 +1254,7 @@ test "restore surfaces specific errors for malformed snapshots" {
     // Two objects sharing an id.
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 5,
+        .string_metatable_id = 0,
         .objects = &.{
             .{ .id = 5, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a" } } },
             .{ .id = 5, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "b" } } },
@@ -1134,6 +1267,7 @@ test "restore surfaces specific errors for malformed snapshots" {
     // A wrong-version file is rejected outright.
     try expectRestoreError(.{ .version = snapshot_format_version + 1, .keyframe = .{
         .globals_id = 0,
+        .string_metatable_id = 0,
         .objects = &.{},
         .stack = &.{},
         .frames = &.{},
@@ -1389,8 +1523,9 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
     };
     const bad: schema.SnapshotFile = .{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 9,
+        .string_metatable_id = 0,
         .objects = &.{
-            .{ .id = 9, .obj_type = 1, .body = .{ .HeapTable = .{ .array = &.{}, .entries = &.{} } } },
+            .{ .id = 9, .obj_type = 1, .body = .{ .HeapTable = .{ .array = &.{}, .entries = &.{}, .metatable_id = 0 } } },
             .{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = rootp.id, .upvalue_ids = &.{} } } },
             .{ .id = 1, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = rootp.id, .upvalue_ids = &.{} } } },
         },

@@ -1515,7 +1515,7 @@ export class HeapStringDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A table object: the dense array part (keys 1..n, positionally) plus the hash part (every other key). Edges are SnapValue heap_refs.
+ * A table object: the dense array part (keys 1..n, positionally) plus the hash part (every other key). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel.
  */
 export interface HeapTableInput {
   /**
@@ -1538,10 +1538,15 @@ export interface HeapTableInput {
    * Length prefix type: uint32
    */
   entries: TableEntryInput[];
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  metatable_id: number;
 }
 
 /**
- * A table object: the dense array part (keys 1..n, positionally) plus the hash part (every other key). Edges are SnapValue heap_refs.
+ * A table object: the dense array part (keys 1..n, positionally) plus the hash part (every other key). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel.
  */
 export interface HeapTableOutput {
   /**
@@ -1564,6 +1569,11 @@ export interface HeapTableOutput {
    * Length prefix type: uint32
    */
   entries: TableEntryOutput[];
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  metatable_id: number;
 }
 
 export type HeapTable = HeapTableOutput;
@@ -1597,6 +1607,7 @@ export class HeapTableEncoder extends BitStreamEncoder {
         this.writeUint8(byte);
       }
     }
+    this.writeUint32(value.metatable_id, "little_endian");
     return this.finish();
   }
 
@@ -1617,7 +1628,7 @@ export class HeapTableEncoder extends BitStreamEncoder {
       const entries_itemEncoder = new TableEntryEncoder();
       size += entries_itemEncoder.calculateSize(item);
     }
-    size += 4; // length prefix (uint32)
+    size += 8; // length prefix (uint32) + metatable_id
     return size;
   }
 }
@@ -1746,6 +1757,7 @@ export class HeapTableDecoder extends SeekableBitStreamDecoder {
       }
       value.entries.push(entries__iter);
     }
+    value.metatable_id = this.readUint32("little_endian");
     return value;
   }
 }
@@ -2435,7 +2447,7 @@ export class FrameRefDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
  */
 export interface KeyframeInput {
   /**
@@ -2443,6 +2455,11 @@ export interface KeyframeInput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   globals_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  string_metatable_id: number;
   /**
    * Array
    * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
@@ -2486,7 +2503,7 @@ export interface KeyframeInput {
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
  */
 export interface KeyframeOutput {
   /**
@@ -2494,6 +2511,11 @@ export interface KeyframeOutput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   globals_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  string_metatable_id: number;
   /**
    * Array
    * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
@@ -2550,6 +2572,7 @@ export class KeyframeEncoder extends BitStreamEncoder {
     this.compressionDict.clear();
 
     this.writeUint32(value.globals_id, "little_endian");
+    this.writeUint32(value.string_metatable_id, "little_endian");
     this.writeUint32(value.objects.length, "little_endian");
     for (let value_objects__iter_index = 0; value_objects__iter_index < value.objects.length; value_objects__iter_index++) {
       const value_objects__iter = value.objects[value_objects__iter_index];
@@ -2595,7 +2618,7 @@ export class KeyframeEncoder extends BitStreamEncoder {
    */
   calculateSize(value: Keyframe): number {
     let size = 0;
-    size += 4; // globals_id
+    size += 8; // globals_id + string_metatable_id
     // objects: array (kind: length_prefixed)
     for (const item of value.objects) {
       const objects_itemEncoder = new HeapObjectEncoder();
@@ -2634,6 +2657,7 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
     const value: any = {};
 
     value.globals_id = this.readUint32("little_endian");
+    value.string_metatable_id = this.readUint32("little_endian");
     value.objects = [];
     const objects_length = this.readUint32("little_endian");
     for (let i = 0; i < objects_length; i++) {
@@ -2750,7 +2774,7 @@ export interface SnapshotFileInput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
    */
   keyframe: KeyframeInput;
 }
@@ -2765,7 +2789,7 @@ export interface SnapshotFileOutput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
    */
   keyframe: KeyframeOutput;
 }
@@ -2818,6 +2842,7 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
     value.version = this.readUint32("little_endian");
     value.keyframe = {};
     value.keyframe.globals_id = this.readUint32("little_endian");
+    value.keyframe.string_metatable_id = this.readUint32("little_endian");
     value.keyframe.objects = [];
     const keyframe_objects_length = this.readUint32("little_endian");
     for (let i = 0; i < keyframe_objects_length; i++) {

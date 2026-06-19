@@ -228,6 +228,49 @@ fn bRawLen(_: *anyopaque, args: []const Value) anyerror!Value {
 }
 
 // ---------------------------------------------------------------------------
+// setmetatable / getmetatable — the metatable accessors (chunk 2a)
+// ---------------------------------------------------------------------------
+
+/// `setmetatable(t, mt)` — install `mt` (a table, or `nil` to clear) as `t`'s
+/// metatable; returns `t`. Raises if `t` is not a table, if `mt` is neither a
+/// table nor nil, or if the **current** metatable carries a `__metatable` field
+/// (a protected metatable — Lua forbids changing it). The metatable is a new GC
+/// edge (`gc.blacken` marks `t.metatable`); the write barrier records it for a
+/// future generational collector.
+fn bSetMetatable(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    const t = try tableArg(vm, args, 0);
+    const mt_arg = if (args.len >= 2) args[1] else Value.nil();
+    const new_mt: ?*Table = if (mt_arg.isNil())
+        null
+    else if (mt_arg.isHeap() and mt_arg.heapType() == .table)
+        Table.fromHeader(mt_arg.asHeap())
+    else
+        return vm.badArg(2, "nil or table", mt_arg);
+    // Protection: a current metatable with a non-nil `__metatable` cannot change.
+    if (t.metatable) |cur| {
+        if (!cur.get(vm.mm.metatable).isNil())
+            return vm.raiseLocatedError("cannot change a protected metatable", 1);
+    }
+    t.metatable = new_mt;
+    if (new_mt) |m| vm.heap.writeBarrier(&t.header, Value.heap(&m.header)); // no-op until Phase 4
+    return args[0];
+}
+
+/// `getmetatable(v)` — `v`'s metatable, or `nil`. If that metatable has a
+/// `__metatable` field, return *that* value instead (the protection hook), so a
+/// library can hide or lock its real metatable. Strings share the built-in
+/// string metatable, so `getmetatable("")` is non-nil.
+fn bGetMetatable(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    const v = if (args.len >= 1) args[0] else Value.nil();
+    const mt = vm.metatableOf(v) orelse return Value.nil();
+    const prot = mt.get(vm.mm.metatable);
+    if (!prot.isNil()) return prot;
+    return Value.heap(&mt.header);
+}
+
+// ---------------------------------------------------------------------------
 // math.type — string-returning, so it lives here (needs the *Vm), not math.zig
 // ---------------------------------------------------------------------------
 
@@ -267,6 +310,8 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "rawget", .func = &bRawGet },
     .{ .name = "rawset", .func = &bRawSet },
     .{ .name = "rawlen", .func = &bRawLen },
+    .{ .name = "setmetatable", .func = &bSetMetatable },
+    .{ .name = "getmetatable", .func = &bGetMetatable },
     .{ .name = "math.type", .func = &mType, .module = "math", .field = "type" },
     .{ .name = "os.difftime", .func = &osDiffTime, .module = "os", .field = "difftime" },
 };

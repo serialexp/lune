@@ -140,6 +140,11 @@ const TAG_HEAP: u8 = @intFromEnum(value.Tag.heap_ref);
 const TABLE_TYPE: u8 = @intFromEnum(object.ObjectType.table);
 /// Offset of `GcHeader.type` (the first header byte) from a `*GcHeader`.
 const HEADER_TYPE_OFF: i32 = @offsetOf(object.GcHeader, "type");
+/// Offset of `Table.metatable` (an optional `*Table`; null = 0) from a
+/// `*GcHeader`. The prologue checks this is null: a table that grew a metatable
+/// after the trace was recorded must side-exit to tier-0 (which dispatches
+/// `__index`/`__newindex`), never run the raw native load/store — chunk 2a.
+const METATABLE_OFF: i32 = @offsetOf(table.Table, "metatable");
 /// Packed-lane ordinals the native array path can lower. The bool lane (B2/B3,
 /// the nsieve sieve) is bit-packed; the int lanes (B4) are byte-packed and
 /// SIB-indexed. `.value` (16-B unpacked, heap-bearing) and `f64` (no float
@@ -1964,6 +1969,15 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         if (s.class == .write_only or s.kind != .ptr) continue;
         const preg = try refHomeBaseReg(a, s, .rax);
         try a.cmpByteMemImm(preg, HEADER_TYPE_OFF, TABLE_TYPE);
+        try a.jcc(.ne, prologue_fail);
+        // [chunk 2a] The table must have NO metatable: recording aborted on a
+        // metatable-bearing table, so a trace that reached here only models raw
+        // array access. If `setmetatable` added one between trace entries, the
+        // raw load/store would skip `__index`/`__newindex` — so side-exit to
+        // tier-0 (full dispatch) when `metatable != null`. Checked once in the
+        // prologue: a metamethod call is a trace barrier, so the metatable cannot
+        // change *within* a single native run.
+        try a.cmpQwordMemImm8(preg, METATABLE_OFF, 0);
         try a.jcc(.ne, prologue_fail);
         try a.cmpByteMemImm(preg, ArrLayout.array_base + ArrLayout.lane, @intCast(s.lane));
         try a.jcc(.ne, prologue_fail);

@@ -103,10 +103,11 @@
     },
 
     "HeapTable": {
-      "description": "A table object: the dense array part (keys 1..n, positionally) plus the hash part (every other key). Edges are SnapValue heap_refs.",
+      "description": "A table object: the dense array part (keys 1..n, positionally) plus the hash part (every other key). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel.",
       "sequence": [
-        { "name": "array",   "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "SnapValue" } },
-        { "name": "entries", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "TableEntry" } }
+        { "name": "array",        "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "SnapValue" } },
+        { "name": "entries",      "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "TableEntry" } },
+        { "name": "metatable_id", "type": "uint32" }
       ]
     },
 
@@ -171,9 +172,10 @@
     },
 
     "Keyframe": {
-      "description": "A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.",
+      "description": "A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.",
       "sequence": [
         { "name": "globals_id",    "type": "uint32" },
+        { "name": "string_metatable_id", "type": "uint32" },
         { "name": "objects",       "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "HeapObject" } },
         { "name": "stack",         "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "SnapValue" } },
         { "name": "frames",        "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "FrameRef" } },

@@ -123,7 +123,11 @@ pub const IrOp = enum(u8) {
     astore,
 
     // ---- array-access guards (check via the referenced node; side-exit on miss) ----
-    /// `a`=table value ref → the value is a heap table.
+    /// `a`=table value ref → the value is a heap table **with no metatable**.
+    /// Recording aborts on a metatable-bearing table (`AbortReason.has_metatable`),
+    /// so every trace assumes raw array access; the no-metatable half of this guard
+    /// catches a `setmetatable` that lands between trace entries (chunk 2a) and
+    /// side-exits to tier-0, which does full `__index`/`__newindex` dispatch.
     guard_table,
     /// `a`=table value ref, `aux`=lane → the table's array lane equals `aux`
     /// (bails if a monotonic widen moved it past the recorded lane).
@@ -392,6 +396,14 @@ pub const AbortReason = enum {
     too_long,
     /// An operand had a type the recorder cannot guard/model here.
     bad_type,
+    /// An indexed/appended table carries a metatable, so the access may dispatch
+    /// a `__index`/`__newindex` metamethod (chunk 2a). Recording aborts: the
+    /// metamethod call would be a trace barrier anyway, and a present-slot raw
+    /// read/store could silently skip a metamethod on a *later* iteration if the
+    /// table's shape changes. Conservative and exact — these tables run tier-0,
+    /// which does full metamethod dispatch. Lifting this needs a
+    /// `guard_no_metatable` IR op (deferred perf follow-up).
+    has_metatable,
     /// Allocation failed while building the trace.
     alloc,
 };
@@ -1487,6 +1499,10 @@ pub const TraceState = struct {
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         if (!vkey.isInt()) return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
+        // A metatable means an absent slot could fire `__index` (chunk 2a). Even a
+        // present slot today could become a hole on a later iteration, so the only
+        // sound conservative choice is to bail the whole trace to tier-0.
+        if (tbl.metatable != null) return self.abort(.has_metatable);
         const lane = tbl.array.lane;
         if (lane == .value) return self.abort(.nyi_opcode); // unpacked path deferred
         const idx = vkey.asInt();
@@ -1542,6 +1558,10 @@ pub const TraceState = struct {
         if (!vkey.isInt()) return self.abort(.bad_type);
         if (vval.isNil()) return self.abort(.bad_type); // hole-punch — out of scope
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
+        // A metatable means an absent-key store could fire `__newindex` (chunk 2a);
+        // the append path below stores to exactly such an absent key (`len+1`).
+        // Abort the whole trace to tier-0, which does full `__newindex` dispatch.
+        if (tbl.metatable != null) return self.abort(.has_metatable);
         const lane = tbl.array.lane;
         if (lane == .value) return self.abort(.nyi_opcode); // unpacked path deferred
         const idx = vkey.asInt();
@@ -2105,6 +2125,53 @@ test "recArrayGet aborts on a .value-lane (unpacked) array — deferred scope cu
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.nyi_opcode, state.rec.abort_reason.?);
+}
+
+test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
+    const gpa = testing.allocator;
+    // A dense boolean array — exactly the shape the recorder would otherwise
+    // trace (`recArrayGet`/`recArraySet` lower it) — but carrying a metatable.
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+    const mt = try table_mod.Table.create(gpa);
+    defer mt.destroy(gpa);
+    t.metatable = mt; // the metatable edge the access might dispatch through
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+
+    // get_index: present, in-bounds, bool-lane — would record without a metatable.
+    {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3) };
+        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+        try testing.expect(!state.isRecording());
+        try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
+    }
+    // set_index in-bounds in-lane store.
+    {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ Value.heap(&t.header), Value.int(3), Value.boolean(false) };
+        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), &regs, &proto, 0);
+        try testing.expect(!state.isRecording());
+        try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
+    }
+    // set_index append store (`t[len+1]=true`) — the path that would fire
+    // `__newindex` on an absent key.
+    {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ Value.heap(&t.header), Value.int(33), Value.boolean(true) };
+        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), &regs, &proto, 0);
+        try testing.expect(!state.isRecording());
+        try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
+    }
 }
 
 test "recArraySet: t[k]=false on a bool lane records the full guarded write sequence" {
