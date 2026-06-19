@@ -12,8 +12,11 @@ build:
 release:
     zig build -Doptimize=ReleaseFast
 
-# Run the unit-test gate.
-test:
+# Run the unit-test gate. Depends on `build` so it also refreshes
+# zig-out/bin/lune (Debug) — otherwise a test-only run leaves the installed CLI
+# stale and you debug a binary that predates your changes (costs a few seconds,
+# saves a debugging detour).
+test: build
     zig build test
 
 # Run the CLI (debug):  just run -- script.lua [args...]

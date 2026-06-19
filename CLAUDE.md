@@ -76,7 +76,9 @@ Use the `just` recipes (`justfile`) as the canonical entry points — they wrap
 the `zig build` invocations and, for benchmarks, guarantee the right binary.
 
 - `just build` — build the CLI. (`zig build`)
-- `just test` — run all unit tests, the gate. (`zig build test`)
+- `just test` — run all unit tests, the gate. Depends on `build`, so it also
+  refreshes `zig-out/bin/lune` (Debug) — no more debugging a stale CLI after a
+  test-only run. (`zig build && zig build test`)
 - `just run -- <script> [args]` — run the CLI. (`zig build run`)
 - `just release` — build the optimized CLI (`zig build -Doptimize=ReleaseFast`).
 - `just bench [args]` — run the benchmark suite (`bench/run.py`); **always
