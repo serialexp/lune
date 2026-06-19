@@ -40,11 +40,12 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
 /// a normal global native (so it is a GC root and keyframe-restorable by name).
 const gmatch_iter_name = "@gmatch_iter";
 
-/// Fetch argument `i` as a table, or `TypeError`.
-fn tableArg(args: []const Value, i: usize) error{TypeError}!*Table {
-    if (i >= args.len) return error.TypeError;
+/// Fetch argument `i` (0-based) as a table, or raise the located Lua
+/// `bad argument #<i+1> to '<fn>' (table expected, got <type|no value>)`.
+fn tableArg(vm: *Vm, args: []const Value, i: usize) anyerror!*Table {
+    if (i >= args.len) return vm.badArg(i + 1, "table", null);
     const v = args[i];
-    if (!v.isHeap() or v.heapType() != .table) return error.TypeError;
+    if (!v.isHeap() or v.heapType() != .table) return vm.badArg(i + 1, "table", v);
     return Table.fromHeader(v.asHeap());
 }
 
@@ -53,25 +54,30 @@ fn globalNative(vm: *Vm, name: []const u8) anyerror!Value {
     return vm.globals.get(try vm.heap.internValue(name));
 }
 
-/// Fetch argument `i` as string bytes, or `TypeError` if missing/non-string.
-fn strArg(args: []const Value, i: usize) error{TypeError}![]const u8 {
-    if (i >= args.len) return error.TypeError;
-    return interp.strBytes(args[i]) orelse error.TypeError;
+/// Fetch argument `i` (0-based) as string bytes, or raise the located Lua
+/// `bad argument #<i+1> to '<fn>' (string expected, got <type|no value>)`.
+fn strArg(vm: *Vm, args: []const Value, i: usize) anyerror![]const u8 {
+    if (i >= args.len) return vm.badArg(i + 1, "string", null);
+    return interp.strBytes(args[i]) orelse vm.badArg(i + 1, "string", args[i]);
 }
 
 /// Fetch an optional integer argument (truncating an integral float). Returns
-/// `default` when absent; `TypeError` for a present non-number or non-integral
-/// float.
-fn optIntArg(args: []const Value, i: usize, default: i64) error{TypeError}!i64 {
+/// `default` when absent; raises the located Lua bad-argument error for a present
+/// non-number, and the "number has no integer representation" reason for a
+/// non-integral float.
+fn optIntArg(vm: *Vm, args: []const Value, i: usize, default: i64) anyerror!i64 {
     if (i >= args.len or args[i].isNil()) return default;
     const v = args[i];
     if (v.isInt()) return v.asInt();
     if (v.isFloat()) {
         const f = v.asFloat();
-        if (@trunc(f) != f) return error.TypeError;
+        const two_pow_63 = 9223372036854775808.0;
+        if (!std.math.isFinite(f) or @trunc(f) != f or f < -two_pow_63 or f >= two_pow_63) {
+            return vm.badArgReason(i + 1, "number has no integer representation");
+        }
         return @intFromFloat(f);
     }
-    return error.TypeError;
+    return vm.badArg(i + 1, "number", v);
 }
 
 /// Lua's `posrelat`: map a possibly-negative 1-based position to an absolute
@@ -89,8 +95,8 @@ fn posRelat(pos: i64, len: usize) i64 {
 // ---------------------------------------------------------------------------
 
 /// `string.len(s)` — byte length (same as `#s`).
-fn sLen(_: *anyopaque, args: []const Value) anyerror!Value {
-    const s = try strArg(args, 0);
+fn sLen(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const s = try strArg(vmOf(ctx), args, 0);
     return Value.int(@intCast(s.len));
 }
 
@@ -98,11 +104,11 @@ fn sLen(_: *anyopaque, args: []const Value) anyerror!Value {
 /// negative-index and clamping rules. `j` defaults to `-1` (end of string).
 fn sSub(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const s = try strArg(args, 0);
+    const s = try strArg(vm, args, 0);
     const len = s.len;
 
-    var i = posRelat(try optIntArg(args, 1, 1), len);
-    var j = posRelat(try optIntArg(args, 2, -1), len);
+    var i = posRelat(try optIntArg(vm, args, 1, 1), len);
+    var j = posRelat(try optIntArg(vm, args, 2, -1), len);
     if (i < 1) i = 1;
     if (j > @as(i64, @intCast(len))) j = @intCast(len);
     if (i > j) return vm.heap.internValue(""); // empty
@@ -112,7 +118,7 @@ fn sSub(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// `string.reverse(s)` — bytes reversed.
 fn sReverse(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const s = try strArg(args, 0);
+    const s = try strArg(vm, args, 0);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(vm.gpa);
     try buf.resize(vm.gpa, s.len);
@@ -132,7 +138,7 @@ fn sLower(ctx: *anyopaque, args: []const Value) anyerror!Value {
 
 fn mapCase(ctx: *anyopaque, args: []const Value, comptime f: fn (u8) u8) anyerror!Value {
     const vm = vmOf(ctx);
-    const s = try strArg(args, 0);
+    const s = try strArg(vm, args, 0);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(vm.gpa);
     try buf.resize(vm.gpa, s.len);
@@ -144,10 +150,10 @@ fn mapCase(ctx: *anyopaque, args: []const Value, comptime f: fn (u8) u8) anyerro
 /// (default ""). `n <= 0` → empty string.
 fn sRep(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const s = try strArg(args, 0);
-    const n = try optIntArg(args, 1, 0);
+    const s = try strArg(vm, args, 0);
+    const n = try optIntArg(vm, args, 1, 0);
     const sep: []const u8 = if (args.len >= 3 and !args[2].isNil())
-        (interp.strBytes(args[2]) orelse return error.TypeError)
+        (interp.strBytes(args[2]) orelse return vm.badArg(3, "string", args[2]))
     else
         "";
     if (n <= 0) return vm.heap.internValue("");
@@ -172,9 +178,9 @@ fn sChar(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(vm.gpa);
-    for (args) |a| {
-        const code = try optIntArg(&[_]Value{a}, 0, 0);
-        if (code < 0 or code > 255) return error.TypeError; // Lua: "value out of range"
+    for (args, 0..) |_, idx| {
+        const code = try optIntArg(vm, args, idx, 0);
+        if (code < 0 or code > 255) return vm.badArgReason(idx + 1, "value out of range");
         try buf.append(vm.gpa, @intCast(code));
     }
     return vm.heap.internValue(buf.items);
@@ -184,9 +190,9 @@ fn sChar(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// (a `multi` native). `i` defaults to 1, `j` to `i`; negative/clamped per Lua.
 /// Returns the resolved `[lo, hi]` byte range (1-based inclusive, clamped) or an
 /// empty range as `lo > hi`.
-fn byteRange(args: []const Value, len: usize) error{TypeError}!struct { lo: usize, hi: usize } {
-    const i_raw = try optIntArg(args, 1, 1);
-    const j_raw = try optIntArg(args, 2, i_raw);
+fn byteRange(vm: *Vm, args: []const Value, len: usize) anyerror!struct { lo: usize, hi: usize } {
+    const i_raw = try optIntArg(vm, args, 1, 1);
+    const j_raw = try optIntArg(vm, args, 2, i_raw);
     var i = posRelat(i_raw, len);
     var j = posRelat(j_raw, len);
     if (i < 1) i = 1;
@@ -195,16 +201,18 @@ fn byteRange(args: []const Value, len: usize) error{TypeError}!struct { lo: usiz
     return .{ .lo = @intCast(i), .hi = @intCast(j) };
 }
 
-fn sByte1(_: *anyopaque, args: []const Value) anyerror!Value {
-    const s = try strArg(args, 0);
-    const r = try byteRange(args, s.len);
+fn sByte1(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    const s = try strArg(vm, args, 0);
+    const r = try byteRange(vm, args, s.len);
     if (r.lo > r.hi) return Value.nil();
     return Value.int(@intCast(s[r.lo - 1]));
 }
 
-fn sByteN(_: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
-    const s = try strArg(args, 0);
-    const r = try byteRange(args, s.len);
+fn sByteN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    const vm = vmOf(ctx);
+    const s = try strArg(vm, args, 0);
+    const r = try byteRange(vm, args, s.len);
     if (r.lo > r.hi) return 0;
     var k: usize = 0;
     while (r.lo + k <= r.hi and k < out.len) : (k += 1) {
@@ -649,9 +657,9 @@ fn writeCaptures(vm: *Vm, ms: *const pattern.MatchState, whole: ?[2]usize, buf: 
 /// and returns the count: `(start, end, captures...)` on a match, or a single
 /// `nil` on no match.
 fn findCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
-    const s = try strArg(args, 0);
-    const pat = try strArg(args, 1);
-    const st = resolveInit(try optIntArg(args, 2, 1), s.len) orelse {
+    const s = try strArg(vm, args, 0);
+    const pat = try strArg(vm, args, 1);
+    const st = resolveInit(try optIntArg(vm, args, 2, 1), s.len) orelse {
         buf[0] = Value.nil();
         return 1;
     };
@@ -712,9 +720,9 @@ fn sFindN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 /// Core of `string.match(s, pat [, init])`: the captures (or the whole match if
 /// the pattern has none), or a single `nil`.
 fn matchCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
-    const s = try strArg(args, 0);
-    const pat = try strArg(args, 1);
-    const st = resolveInit(try optIntArg(args, 2, 1), s.len) orelse {
+    const s = try strArg(vm, args, 0);
+    const pat = try strArg(vm, args, 1);
+    const st = resolveInit(try optIntArg(vm, args, 2, 1), s.len) orelse {
         buf[0] = Value.nil();
         return 1;
     };
@@ -758,8 +766,8 @@ fn sMatchN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 
 fn sGmatchN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
-    _ = try strArg(args, 0); // type-check subject
-    _ = try strArg(args, 1); // type-check pattern
+    _ = try strArg(vm, args, 0); // type-check subject
+    _ = try strArg(vm, args, 1); // type-check pattern
     const iter = try globalNative(vm, gmatch_iter_name);
     const state = try vm.heap.newTable();
     try state.set(vm.gpa, Value.int(1), args[0]); // subject string Value
@@ -772,8 +780,8 @@ fn sGmatchN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 fn sGmatch1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     // Degenerate single-result projection: just the iterator (state is lost).
     const vm = vmOf(ctx);
-    _ = try strArg(args, 0);
-    _ = try strArg(args, 1);
+    _ = try strArg(vm, args, 0);
+    _ = try strArg(vm, args, 1);
     return globalNative(vm, gmatch_iter_name);
 }
 
@@ -781,7 +789,7 @@ fn sGmatch1(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// position for the next match, advance the position (forcing progress past an
 /// empty match), and return the captures; 0 results when exhausted.
 fn gmatchAuxCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
-    const st = try tableArg(args, 0);
+    const st = try tableArg(vm, args, 0);
     const s = interp.strBytes(st.getInt(1)) orelse return error.TypeError;
     const pat = interp.strBytes(st.getInt(2)) orelse return error.TypeError;
     const pos_v = st.getInt(3);
@@ -863,13 +871,41 @@ fn addReplTable(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState,
     return error.TypeError; // invalid replacement value
 }
 
-/// Core of `string.gsub(s, pat, repl [, n])` → `(result, count)`. `repl` may be
-/// a string/number or a table; a function replacement needs call-into-VM (not
-/// yet available) and is rejected with `GsubFunctionUnsupported`.
+/// `add_value` for a function replacement: call `repl(captures…)` (the explicit
+/// captures, or the whole match when the pattern has none) via `Vm.callValue`. A
+/// nil/false result keeps the original text; a string/number substitutes; any
+/// other type is an invalid replacement (`TypeError`).
+///
+/// GC: `captureValue` interns the capture strings with no intervening safepoint,
+/// and `callValue` copies them into the rooted VM stack before running `repl`, so
+/// a collection triggered inside `repl` cannot sweep them. The result is captured
+/// before `callValue` shrinks `stack_top`; everything after is pure native code
+/// (no collection), so `rv` stays valid until appended.
+fn addReplFunction(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState, repl: Value, s_off: usize, e_off: usize) anyerror!void {
+    const ncap: usize = if (ms.level > 0) ms.level else 1;
+    var caps: [pattern.max_captures]Value = undefined;
+    var k: usize = 0;
+    while (k < ncap) : (k += 1) caps[k] = try captureValue(vm, ms, k, .{ s_off, e_off });
+    var r: [1]Value = .{Value.nil()};
+    const n = try vm.callValue(repl, caps[0..ncap], r[0..1]);
+    const rv = if (n >= 1) r[0] else Value.nil();
+    if (!rv.isTruthy()) {
+        try out.appendSlice(vm.gpa, ms.src[s_off..e_off]); // keep original
+        return;
+    }
+    if (interp.strBytes(rv) != null or rv.isNumber()) {
+        try appendValueText(vm, out, rv);
+        return;
+    }
+    return error.TypeError; // invalid replacement value
+}
+
+/// Core of `string.gsub(s, pat, repl [, n])` → `(result, count)`. `repl` may be a
+/// string/number, a table, or a function (called per match via `Vm.callValue`).
 fn gsubCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
-    const s = try strArg(args, 0);
-    const pat = try strArg(args, 1);
-    if (args.len < 3) return error.TypeError;
+    const s = try strArg(vm, args, 0);
+    const pat = try strArg(vm, args, 1);
+    if (args.len < 3) return vm.badArg(3, "string/function/table", null);
     const repl = args[2];
 
     // Classify the replacement up front (bad kinds error before any work).
@@ -877,15 +913,17 @@ fn gsubCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
         Table.fromHeader(repl.asHeap())
     else
         null;
-    if (repl_table == null and interp.strBytes(repl) == null and !repl.isNumber()) {
-        if (repl.isHeap() and (repl.heapType() == .function or repl.heapType() == .native))
-            return error.GsubFunctionUnsupported;
-        return error.TypeError;
-    }
-    const repl_str: ?[]const u8 = if (repl_table == null) (interp.strBytes(repl) orelse null) else null;
+    const repl_fn: ?Value = if (repl_table == null and repl.isHeap() and
+        (repl.heapType() == .function or repl.heapType() == .native)) repl else null;
+    if (repl_table == null and repl_fn == null and interp.strBytes(repl) == null and !repl.isNumber())
+        return vm.badArg(3, "string/function/table", repl);
+    const repl_str: ?[]const u8 = if (repl_table == null and repl_fn == null)
+        (interp.strBytes(repl) orelse null)
+    else
+        null;
 
     const max_n: i64 = if (args.len >= 4 and !args[3].isNil())
-        try optIntArg(args, 3, 0)
+        try optIntArg(vm, args, 3, 0)
     else
         @as(i64, @intCast(s.len + 1));
 
@@ -906,6 +944,8 @@ fn gsubCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
             count += 1;
             if (repl_table) |t| {
                 try addReplTable(vm, &out, &ms, t, src, e);
+            } else if (repl_fn) |f| {
+                try addReplFunction(vm, &out, &ms, f, src, e);
             } else if (repl_str) |r| {
                 try addReplString(vm, &out, &ms, r, src, e);
             } else {
@@ -1027,8 +1067,8 @@ test "string.char builds bytes; rejects out-of-range" {
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
     try testing.expectEqualStrings("Hi!", bytesOf(try sChar(@ptrCast(&vm), &.{ Value.int(72), Value.int(105), Value.int(33) })));
-    try testing.expectError(error.TypeError, sChar(@ptrCast(&vm), &.{Value.int(256)}));
-    try testing.expectError(error.TypeError, sChar(@ptrCast(&vm), &.{Value.int(-1)}));
+    try testing.expectError(error.LuaError, sChar(@ptrCast(&vm), &.{Value.int(256)}));
+    try testing.expectError(error.LuaError, sChar(@ptrCast(&vm), &.{Value.int(-1)}));
 }
 
 test "string.byte: primary projection and multi range" {
@@ -1171,10 +1211,13 @@ test "string.gsub: string repl with %1, count, table repl, anchor" {
     try testing.expectEqualStrings("Aaa", bytesOf(out[0]));
     try testing.expectEqual(@as(i64, 1), out[1].asInt());
 
-    // Function replacement is not yet supported (needs call-into-VM).
-    const noop = try function.Native.create(vm.gpa, &sLen, "noop");
-    defer noop.destroy(vm.gpa);
-    try testing.expectError(error.GsubFunctionUnsupported, sGsubN(@ptrCast(&vm), &.{ try sv(&vm, "a"), try sv(&vm, "a"), Value.heap(&noop.header) }, &out));
+    // Function replacement: `sLen` returns the length of its capture argument as
+    // a number, which substitutes for each match.
+    const lenfn = try function.Native.create(vm.gpa, &sLen, "lenfn");
+    defer lenfn.destroy(vm.gpa);
+    n = try sGsubN(@ptrCast(&vm), &.{ try sv(&vm, "hello world"), try sv(&vm, "%w+"), Value.heap(&lenfn.header) }, &out);
+    try testing.expectEqualStrings("5 5", bytesOf(out[0]));
+    try testing.expectEqual(@as(i64, 2), out[1].asInt());
 }
 
 test "@gmatch_iter walks the state table and stops when exhausted" {

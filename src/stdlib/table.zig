@@ -20,15 +20,24 @@
 //! path writes `t[i..j]` into `out` (`min(count, out.len)`) — identical code for
 //! fixed-count and `all_results` callers; the VM nil-pads or stamps `reg_top`.
 //!
-//! Deferred: `table.sort` — a Lua comparator needs the VM to re-enter and call a
-//! closure from a native (no entry point today), and `arith.lt` is numeric-only.
-//! Stays `not-started` in the inventory.
+//! `table.sort(t[, comp])` sorts `t[1..#t]` in place by **heapsort** — chosen for
+//! determinism: O(n log n) worst case, no pivot choice, and it terminates even
+//! under an inconsistent comparator (we do not emulate Lua's "invalid order
+//! function" detection; `docs/design/02-determinism.md` requires reproducibility,
+//! not Lua's exact ordering of equal elements). The default comparator is
+//! `arith.lt` — matching lune's `<` operator exactly (numeric-only today; sorting
+//! non-numbers without a `comp` raises `TypeError`, the same gap `<` has). A
+//! custom comparator re-enters the VM via `Vm.callValue`; a comparator that errors
+//! propagates out (catchable by an enclosing `pcall`). GC discipline: elements are
+//! read by index on every comparison, never cached across a `callValue` (which may
+//! collect), so a comparator that mutates `t` can never leave a stale `Value`.
 
 const std = @import("std");
 const value = @import("../value.zig");
 const function = @import("../function.zig");
 const table_mod = @import("../table.zig");
 const interp = @import("../interp.zig");
+const arith = @import("../arith.zig");
 
 const Value = value.Value;
 const Table = table_mod.Table;
@@ -43,17 +52,19 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
     return @ptrCast(@alignCast(ctx));
 }
 
-/// Fetch argument `i` as a `*Table`, or `TypeError` if missing/non-table.
-fn tableArg(args: []const Value, i: usize) error{TypeError}!*Table {
-    if (i >= args.len) return error.TypeError;
+/// Fetch argument `i` (0-based) as a `*Table`, or raise the located Lua
+/// `bad argument #<i+1> to '<fn>' (table expected, got <type|no value>)`.
+fn tableArg(vm: *Vm, args: []const Value, i: usize) anyerror!*Table {
+    if (i >= args.len) return vm.badArg(i + 1, "table", null);
     const v = args[i];
-    if (!v.isHeap() or v.heapType() != .table) return error.TypeError;
+    if (!v.isHeap() or v.heapType() != .table) return vm.badArg(i + 1, "table", v);
     return Table.fromHeader(v.asHeap());
 }
 
 /// Convert a number `Value` to an `i64` with an exact integer representation
 /// (Lua: "number has no integer representation" otherwise). Used for positions
-/// and ranges, which Lua requires to be integers.
+/// and ranges, which Lua requires to be integers. Pure converter — callers map
+/// the `error.TypeError` to a located bad-argument message via `intArg`.
 fn toInt(v: Value) error{TypeError}!i64 {
     if (v.isInt()) return v.asInt();
     if (v.isFloat()) {
@@ -66,10 +77,14 @@ fn toInt(v: Value) error{TypeError}!i64 {
     return error.TypeError;
 }
 
-/// Fetch argument `i` as an integer (see `toInt`).
-fn intArg(args: []const Value, i: usize) error{TypeError}!i64 {
-    if (i >= args.len) return error.TypeError;
-    return toInt(args[i]);
+/// Fetch argument `i` (0-based) as an integer, raising the located Lua
+/// bad-argument error: `(number expected, got <type|no value>)` when missing or
+/// non-numeric, `(number has no integer representation)` for a non-integral float.
+fn intArg(vm: *Vm, args: []const Value, i: usize) anyerror!i64 {
+    if (i >= args.len) return vm.badArg(i + 1, "number", null);
+    const v = args[i];
+    if (!v.isNumber()) return vm.badArg(i + 1, "number", v);
+    return toInt(v) catch vm.badArgReason(i + 1, "number has no integer representation");
 }
 
 /// True when arg `i` is present and not nil (an *omitted* optional).
@@ -87,12 +102,12 @@ inline fn given(args: []const Value, i: usize) bool {
 /// arguments to 'insert'").
 fn tInsert(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const t = try tableArg(args, 0);
+    const t = try tableArg(vm, args, 0);
     const n = t.length();
     switch (args.len) {
         2 => try t.set(vm.gpa, Value.int(n + 1), args[1]),
         3 => {
-            const pos = try toInt(args[1]);
+            const pos = try intArg(vm, args, 1);
             // Lua: 1 <= pos <= #t+1 ("position out of bounds").
             if (pos < 1 or pos > n + 1) return error.TypeError;
             var i = n;
@@ -112,10 +127,10 @@ fn tInsert(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// removing from an empty list is a no-op returning nil).
 fn tRemove(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const t = try tableArg(args, 0);
+    const t = try tableArg(vm, args, 0);
     const size = t.length();
     var pos: i64 = size;
-    if (given(args, 1)) pos = try toInt(args[1]);
+    if (given(args, 1)) pos = try intArg(vm, args, 1);
     if (pos != size) {
         if (pos < 1 or pos > size + 1) return error.TypeError;
     }
@@ -135,7 +150,7 @@ fn tRemove(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// "invalid value (at index k) in table for 'concat'"). Result is interned.
 fn tConcat(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const t = try tableArg(args, 0);
+    const t = try tableArg(vm, args, 0);
 
     var sep_buf: [64]u8 = undefined;
     const sep: []const u8 = if (given(args, 1))
@@ -143,8 +158,8 @@ fn tConcat(ctx: *anyopaque, args: []const Value) anyerror!Value {
     else
         "";
 
-    const lo: i64 = if (given(args, 2)) try toInt(args[2]) else 1;
-    const hi: i64 = if (given(args, 3)) try toInt(args[3]) else t.length();
+    const lo: i64 = if (given(args, 2)) try intArg(vm, args, 2) else 1;
+    const hi: i64 = if (given(args, 3)) try intArg(vm, args, 3) else t.length();
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(vm.gpa);
@@ -164,11 +179,11 @@ fn tConcat(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// Mirrors Lua 5.4 `ltablib.c:tmove`.
 fn tMove(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const a1 = try tableArg(args, 0);
-    const f = try intArg(args, 1);
-    const e = try intArg(args, 2);
-    const tpos = try intArg(args, 3);
-    const a2 = if (given(args, 4)) try tableArg(args, 4) else a1;
+    const a1 = try tableArg(vm, args, 0);
+    const f = try intArg(vm, args, 1);
+    const e = try intArg(vm, args, 2);
+    const tpos = try intArg(vm, args, 3);
+    const a2 = if (given(args, 4)) try tableArg(vm, args, 4) else a1;
 
     if (e >= f) {
         // Forward when ranges don't overlap-up (or different tables); else
@@ -203,9 +218,9 @@ fn tPack(ctx: *anyopaque, args: []const Value) anyerror!Value {
 
 /// `table.unpack(t, [i, [j]])` primary projection — `t[i]` (default `i=1`).
 fn tUnpack1(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    _ = ctx;
-    const t = try tableArg(args, 0);
-    const i: i64 = if (given(args, 1)) try toInt(args[1]) else 1;
+    const vm = vmOf(ctx);
+    const t = try tableArg(vm, args, 0);
+    const i: i64 = if (given(args, 1)) try intArg(vm, args, 1) else 1;
     return t.getInt(i);
 }
 
@@ -214,10 +229,10 @@ fn tUnpack1(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// out.len)`). All table reads (the `*Table` pointer and `i`/`j`) happen before
 /// any `out` write, honouring the alias contract (`out` overlaps `args`).
 fn tUnpackN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
-    _ = ctx;
-    const t = try tableArg(args, 0);
-    const i: i64 = if (given(args, 1)) try toInt(args[1]) else 1;
-    const j: i64 = if (given(args, 2)) try toInt(args[2]) else t.length();
+    const vm = vmOf(ctx);
+    const t = try tableArg(vm, args, 0);
+    const i: i64 = if (given(args, 1)) try intArg(vm, args, 1) else 1;
+    const j: i64 = if (given(args, 2)) try intArg(vm, args, 2) else t.length();
     if (j < i) return 0;
     const count: usize = @intCast(j - i + 1);
     const write = @min(count, out.len);
@@ -233,6 +248,64 @@ fn tUnpackN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 // ---------------------------------------------------------------------------
 
 /// The `table.*` natives, concatenated into `interp.base_natives`.
+// ---------------------------------------------------------------------------
+// table.sort — in-place heapsort with an optional VM-reentrant comparator
+// ---------------------------------------------------------------------------
+
+/// `a < b` under the active comparator: the user closure (truthiness of its first
+/// result) when `comp` is non-null, else lune's numeric `<` (`arith.lt`).
+fn sortLess(vm: *Vm, comp: ?Value, a: Value, b: Value) anyerror!bool {
+    if (comp) |c| {
+        var r: [1]Value = .{Value.nil()};
+        const n = try vm.callValue(c, &.{ a, b }, r[0..1]);
+        return n >= 1 and r[0].isTruthy();
+    }
+    return arith.lt(a, b);
+}
+
+/// Swap the 1-based array elements `i` and `j`, reading both fresh (the comparator
+/// may have mutated the table since they were last seen).
+fn sortSwap(t: *Table, gpa: std.mem.Allocator, i: i64, j: i64) interp.Error!void {
+    const vi = t.get(Value.int(i));
+    const vj = t.get(Value.int(j));
+    try t.set(gpa, Value.int(i), vj);
+    try t.set(gpa, Value.int(j), vi);
+}
+
+/// Max-heap sift-down over the 1-based subrange `[start, end]`. Each step reads
+/// elements by index, so an inconsistent/mutating comparator only reshuffles the
+/// (still in-bounds) result and always terminates — `root` strictly increases.
+fn sortSiftDown(vm: *Vm, t: *Table, comp: ?Value, start: i64, end: i64) anyerror!void {
+    var root = start;
+    while (root * 2 <= end) {
+        var child = root * 2;
+        if (child + 1 <= end and try sortLess(vm, comp, t.get(Value.int(child)), t.get(Value.int(child + 1))))
+            child += 1;
+        if (try sortLess(vm, comp, t.get(Value.int(root)), t.get(Value.int(child)))) {
+            try sortSwap(t, vm.gpa, root, child);
+            root = child;
+        } else return;
+    }
+}
+
+/// `table.sort(list[, comp])` — sort `list[1..#list]` in place; returns nothing.
+fn tSort(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    const t = try tableArg(vm, args, 0);
+    const comp: ?Value = if (args.len >= 2 and !args[1].isNil()) args[1] else null;
+    const n = t.length();
+    if (n < 2) return Value.nil();
+    // Build the heap, then repeatedly extract the max to the back.
+    var start = @divFloor(n, 2);
+    while (start >= 1) : (start -= 1) try sortSiftDown(vm, t, comp, start, n);
+    var end = n;
+    while (end > 1) : (end -= 1) {
+        try sortSwap(t, vm.gpa, 1, end);
+        try sortSiftDown(vm, t, comp, 1, end - 1);
+    }
+    return Value.nil();
+}
+
 pub const natives = [_]function.BaseNative{
     .{ .name = "table.insert", .func = &tInsert, .module = "table", .field = "insert" },
     .{ .name = "table.remove", .func = &tRemove, .module = "table", .field = "remove" },
@@ -240,6 +313,7 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "table.move", .func = &tMove, .module = "table", .field = "move" },
     .{ .name = "table.pack", .func = &tPack, .module = "table", .field = "pack" },
     .{ .name = "table.unpack", .func = &tUnpack1, .multi = &tUnpackN, .module = "table", .field = "unpack" },
+    .{ .name = "table.sort", .func = &tSort, .module = "table", .field = "sort" },
 };
 
 // ---------------------------------------------------------------------------
@@ -353,9 +427,9 @@ test "table.concat joins with separator and range; rejects non string/number" {
 test "table natives reject a non-table first argument" {
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
-    try testing.expectError(error.TypeError, tInsert(@ptrCast(&vm), &.{ Value.int(1), Value.int(2) }));
-    try testing.expectError(error.TypeError, tUnpack1(@ptrCast(&vm), &.{Value.int(1)}));
-    try testing.expectError(error.TypeError, tConcat(@ptrCast(&vm), &.{Value.int(1)}));
+    try testing.expectError(error.LuaError, tInsert(@ptrCast(&vm), &.{ Value.int(1), Value.int(2) }));
+    try testing.expectError(error.LuaError, tUnpack1(@ptrCast(&vm), &.{Value.int(1)}));
+    try testing.expectError(error.LuaError, tConcat(@ptrCast(&vm), &.{Value.int(1)}));
 }
 
 const string_mod = @import("../string.zig");

@@ -22,13 +22,27 @@
 //! this only pins same-target determinism.
 //!
 //! These functions operate on dynamically-typed `Value`s and return
-//! `error.TypeError` for non-numeric operands (string/table operators come with
-//! those types later). They are pure — no allocation, no VM state — which is why
-//! their shape is pinned with tests now.
+//! `error.TypeError` for operands the operator doesn't accept. Arithmetic is
+//! numbers-only; the ordering comparisons (`lt`/`le`) additionally accept two
+//! strings (lexicographic byte order, deterministic and locale-free) and reject a
+//! mixed string/number pair, as Lua does. They are pure — no allocation, no VM
+//! state — which is why their shape is pinned with tests now.
 
 const std = @import("std");
 const value = @import("value.zig");
+const string = @import("string.zig");
 const Value = value.Value;
+
+/// The UTF-8 byte slice of a string `Value`, or `null` if it isn't a string.
+/// Used only by the ordering comparisons (`lt`/`le`) — strings order
+/// lexicographically by byte, which is deterministic and locale-free. The
+/// trace recorder aborts a compare whose operands aren't numbers (`recCompare`
+/// in `trace.zig`), so string ordering only ever runs on tier-0/1a, never inside
+/// native trace code.
+inline fn strBytes(v: Value) ?[]const u8 {
+    if (v.isHeap() and v.heapType() == .string) return string.String.fromHeader(v.asHeap()).bytes();
+    return null;
+}
 
 pub const Error = error{
     /// An operand was not a number (and no operator overload applies in v1).
@@ -197,18 +211,24 @@ pub fn shr(a: Value, b: Value) Error!Value {
 
 // ---- comparisons ----
 
-/// `a < b` for numbers. A `NaN` operand makes this false. Non-numbers error
-/// (string ordering comes with the string type).
+/// `a < b`. Numbers compare by value (a `NaN` operand makes this false); two
+/// strings compare lexicographically by byte (`std.mem.order`). A mixed
+/// string/number pair errors, exactly as Lua does ("attempt to compare").
 pub fn lt(a: Value, b: Value) Error!bool {
-    try requireNumbers(a, b);
-    return value.compareNumeric(a, b) == .lt;
+    if (a.isNumber() and b.isNumber()) return value.compareNumeric(a, b) == .lt;
+    if (strBytes(a)) |sa| if (strBytes(b)) |sb| return std.mem.order(u8, sa, sb) == .lt;
+    return Error.TypeError;
 }
 
-/// `a <= b` for numbers. A `NaN` operand makes this false.
+/// `a <= b`. Numbers compare by value (a `NaN` operand makes this false); two
+/// strings compare lexicographically by byte. A mixed string/number pair errors.
 pub fn le(a: Value, b: Value) Error!bool {
-    try requireNumbers(a, b);
-    const o = value.compareNumeric(a, b);
-    return o == .lt or o == .eq;
+    if (a.isNumber() and b.isNumber()) {
+        const o = value.compareNumeric(a, b);
+        return o == .lt or o == .eq;
+    }
+    if (strBytes(a)) |sa| if (strBytes(b)) |sb| return std.mem.order(u8, sa, sb) != .gt;
+    return Error.TypeError;
 }
 
 /// `a == b`. Never errors: different types are simply unequal. Numbers compare

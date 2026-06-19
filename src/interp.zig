@@ -35,6 +35,7 @@ const stdtable = @import("stdlib/table.zig");
 const stdbase = @import("stdlib/base.zig");
 const stdbasic = @import("stdlib/basic.zig");
 const stdstring = @import("stdlib/string.zig");
+const stderrors = @import("stdlib/errors.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -75,6 +76,11 @@ pub const Error = error{
     EnvUnavailable,
     /// Allocation failure (register stack, future heap).
     OutOfMemory,
+    /// A lune program raised a VALUE via `error(obj)`/`assert` (or a runtime fault
+    /// re-raised through a protected boundary). The value itself rides
+    /// `Vm.pending_error`; this Zig tag is only the unwinding signal. Caught by
+    /// `pcall`/`xpcall`, which read+clear `pending_error`.
+    LuaError,
 };
 
 /// Fixed VM register/call stack: every frame's register window is a slice of
@@ -89,6 +95,14 @@ const stack_slots: usize = 1 << 16;
 /// `StackOverflow` — `pushFrame` is the single guard. Tier-0 is the correctness
 /// oracle, not the deep-recursion tier.
 const max_call_depth: u32 = 200;
+
+/// Maximum nesting of native→VM reentry (`callValue`). Each level is a native
+/// (e.g. `pcall`/`table.sort`/`gsub`) that calls back into the dispatch loop on
+/// the **Zig host stack** — distinct from `max_call_depth`, which bounds the Lua
+/// frame stack. A `pcall(pcall(pcall(…)))` chain or a comparator that recurses
+/// through `table.sort` grows this; the cap turns host-stack exhaustion into a
+/// clean `StackOverflow` instead of a crash.
+const max_native_reentry: u16 = 200;
 
 /// Which nondeterministic input a native represents (record/replay boundary), or
 /// null for a pure host call. Defined on `function` (the `Native` carrier) to keep
@@ -176,7 +190,7 @@ pub const ModuleConst = function.ModuleConst;
 pub const lune_version = "lune 0.0.0";
 
 pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++
-    stdbase.natives ++ stdbasic.natives ++ stdstring.natives;
+    stdbase.natives ++ stdbasic.natives ++ stdstring.natives ++ stderrors.natives;
 
 /// The interpreter's own natives. `print` is pure output; `clock` is the first
 /// nondeterministic input.
@@ -317,6 +331,23 @@ pub const Fault = struct {
     start: u32 = 0,
     end: u32 = 0,
     frames: []const FaultFrame = &.{},
+    /// True when `message` already carries its own `chunk:line:` location — a
+    /// raised Lua value (`error`/`assert`/`badArg`), which Lua prints verbatim.
+    /// The reporter must NOT append a second " at chunk:line" suffix in this case
+    /// (the type-name faults, which are not self-located, still rely on it).
+    self_located: bool = false,
+};
+
+/// A resolved call site: the frame, its faulting/call instruction, and its source
+/// span/line. The single source of truth for "where is the call `level` frames up"
+/// — shared by `describeFault`'s `.call` arm, `Vm.badArg`, and `error(msg, level)`
+/// so their location logic can never drift.
+pub const CallSite = struct {
+    proto: *const Proto,
+    base: usize,
+    pc: usize,
+    span: bytecode.Span,
+    line: u32,
 };
 
 /// Mid-execution suspend trigger (test / debugger hook; null = never suspend, the
@@ -368,6 +399,18 @@ pub const Vm = struct {
     /// frame's prototype constants alive) and the keyframe serializer captures for
     /// mid-execution resume. Sized to the call-depth bound, so it never allocates.
     frames: [max_call_depth]CallFrame = undefined,
+    /// Current native→VM reentry nesting (`callValue`). Bounded by
+    /// `max_native_reentry` to keep a `pcall`/comparator chain from overflowing the
+    /// Zig host stack. Incremented around each nested `execWith`, restored after.
+    native_reentry_depth: u16 = 0,
+    /// The in-flight Lua error value, set by `error`/`assert` (and read by
+    /// `pcall`/`xpcall`). Non-null only between a raise and the nearest protected
+    /// boundary that catches it — every `pcall` clears it. A **GC root while set**
+    /// (`forEachRootHeader`) and **transient**: like `reg_top`, it is never
+    /// serialized and must be null at any suspend safepoint (a snapshot taken
+    /// mid-unwind could not resume). Runtime faults (`TypeError`, …) leave this
+    /// null and are turned into a value lazily at the catch via `synthErrorValue`.
+    pending_error: ?Value = null,
     /// Open upvalues, keyed by absolute stack index. Searched on capture (to
     /// share a cell) and on scope/frame exit (to close cells over dying slots).
     open_upvalues: std.ArrayList(OpenUpvalue) = .empty,
@@ -575,6 +618,146 @@ pub const Vm = struct {
         return self.exec();
     }
 
+    /// Locate the call site `level` frames up from the top of the live stack.
+    /// `level == 1` is the topmost frame — its live pc is the in-flight call/fault
+    /// (a native runs inline, so when it faults the topmost frame is its caller and
+    /// that pc is the `.call`). Deeper levels are *parent* frames whose pc is the
+    /// resume cursor (one past their outgoing call), so the call-site instruction is
+    /// `pc -| 1` — the same leaf-vs-parent rule as `backtraceFrames`. Returns
+    /// `null` for `level == 0`, `level > depth` (past the stack — Lua suppresses
+    /// the location prefix in that case), or an empty stack.
+    pub fn callSiteAt(self: *Vm, level: usize) ?CallSite {
+        if (self.depth == 0 or level == 0 or level > self.depth) return null;
+        const idx = self.depth - level;
+        const f = &self.frames[idx];
+        const proto = f.closure.proto;
+        const is_top = idx == self.depth - 1;
+        const pc: usize = if (is_top) f.pc else f.pc -| 1;
+        const span: bytecode.Span = if (pc < proto.spans.len) proto.spans[pc] else .{};
+        return .{
+            .proto = proto,
+            .base = f.base,
+            .pc = pc,
+            .span = span,
+            .line = compiler.lineFromOffset(self.source, span.start),
+        };
+    }
+
+    /// The display name for a native in an error message: the field part of its
+    /// registered name (`string.sub` → `sub`), matching how Lua names the called
+    /// function. A top-level native (`print`) has no module prefix and passes through.
+    fn nativeDisplayName(nat: *const function.Native) []const u8 {
+        if (std.mem.lastIndexOfScalar(u8, nat.name, '.')) |dot| return nat.name[dot + 1 ..];
+        return nat.name;
+    }
+
+    /// Render an error *value* (the `pending_error` of a raised `LuaError`) to text,
+    /// Lua-style: a string is its own bytes, a number its decimal text (both via
+    /// `coerceConcat`), and anything else becomes `(error object is a <type> value)`.
+    /// `arena` owns the result.
+    fn renderErrorValue(ev: Value, arena: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+        var nbuf: [64]u8 = undefined;
+        if (coerceConcat(ev, &nbuf)) |bytes| {
+            return arena.dupe(u8, bytes);
+        } else |_| {
+            return std.fmt.allocPrint(arena, "(error object is a {s} value)", .{ev.typeName()});
+        }
+    }
+
+    /// The native at the current call site (the `.call` that invoked the running
+    /// native), plus its caller's chunk name and the call line — everything a
+    /// "bad argument" message needs, all recovered from live state so the caller
+    /// passes none of it. `null` only if there is no resolvable native call site.
+    const NativeSite = struct { fname: []const u8, chunk: []const u8, line: u32 };
+    fn nativeSite(self: *Vm) ?NativeSite {
+        const cs = self.callSiteAt(1) orelse return null;
+        if (cs.pc >= cs.proto.code.len) return null;
+        const instr = cs.proto.code[cs.pc];
+        if (instr.op != .call) return null;
+        const callee = self.stack[cs.base + instr.a];
+        if (!(callee.isHeap() and callee.heapType() == .native)) return null;
+        return .{
+            .fname = nativeDisplayName(function.Native.fromHeader(callee.asHeap())),
+            .chunk = cs.proto.name,
+            .line = cs.line,
+        };
+    }
+
+    /// Intern `body` (already a complete "bad argument …" clause) as the in-flight
+    /// error value, prefixed with the `chunk:line:` of the call site when one is
+    /// resolvable, and return the unwinding signal. Shared tail of `badArg`/
+    /// `badArgReason` so their location handling can't drift. Deterministic: reads
+    /// only the call site and interns an id-stable string.
+    fn raiseBadArg(self: *Vm, site: ?NativeSite, body: []const u8) Error {
+        var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_inst.deinit();
+        const a = arena_inst.allocator();
+        const full = if (site) |s|
+            try std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ s.chunk, s.line, body })
+        else
+            body;
+        self.pending_error = try self.heap.internValue(full);
+        return Error.LuaError;
+    }
+
+    /// Raise Lua's canonical type-mismatch argument error from inside a native:
+    /// `"<chunk:line>: bad argument #<n> to '<fname>' (<expected> expected, got
+    /// <type|no value>)"`. `got == null` ⇒ the argument was absent ("no value").
+    /// Name + location come from the live call site (`nativeSite`); the caller
+    /// supplies only the 1-based index, the expected type, and the offending value.
+    pub fn badArg(self: *Vm, n: usize, expected: []const u8, got: ?Value) Error {
+        const site = self.nativeSite();
+        const fname = if (site) |s| s.fname else "?";
+        const got_name = if (got) |g| g.typeName() else "no value";
+        var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_inst.deinit();
+        const body = try std.fmt.allocPrint(
+            arena_inst.allocator(),
+            "bad argument #{d} to '{s}' ({s} expected, got {s})",
+            .{ n, fname, expected, got_name },
+        );
+        return self.raiseBadArg(site, body);
+    }
+
+    /// Like `badArg`, but with a free-text reason inside the parentheses (e.g.
+    /// "number has no integer representation", "index out of range", "value
+    /// expected") instead of the "X expected, got Y" form.
+    pub fn badArgReason(self: *Vm, n: usize, reason: []const u8) Error {
+        const site = self.nativeSite();
+        const fname = if (site) |s| s.fname else "?";
+        var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_inst.deinit();
+        const body = try std.fmt.allocPrint(
+            arena_inst.allocator(),
+            "bad argument #{d} to '{s}' ({s})",
+            .{ n, fname, reason },
+        );
+        return self.raiseBadArg(site, body);
+    }
+
+    /// Raise `bytes` as the in-flight error value, prepending the `chunk:line:`
+    /// location of the call site `level` frames up (Lua's `error(msg, level)`
+    /// semantics: `level == 1` is the function that called `error`, `level == 2`
+    /// its caller, …). `level == 0` — or no resolvable call site — stores `bytes`
+    /// verbatim. Shared with `error()` so the location logic matches `badArg`'s.
+    /// Deterministic: reads only the call site and interns an id-stable string.
+    pub fn raiseLocatedError(self: *Vm, bytes: []const u8, level: usize) Error {
+        const cs = if (level == 0) null else self.callSiteAt(level);
+        if (cs) |site| {
+            var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena_inst.deinit();
+            const full = try std.fmt.allocPrint(
+                arena_inst.allocator(),
+                "{s}:{d}: {s}",
+                .{ site.proto.name, site.line, bytes },
+            );
+            self.pending_error = try self.heap.internValue(full);
+        } else {
+            self.pending_error = try self.heap.internValue(bytes);
+        }
+        return Error.LuaError;
+    }
+
     /// Build a located, human-readable description of a runtime error, read from
     /// the un-popped top frame (`exec` does not unwind `self.frames` on error —
     /// see the `frame.pc = cur_pc` sync in `exec`). The faulting instruction's
@@ -587,6 +770,26 @@ pub const Vm = struct {
     pub fn describeFault(self: *Vm, source: []const u8, err: Error, arena: std.mem.Allocator) std.mem.Allocator.Error!Fault {
         // No frame (e.g. main chunk too big for the stack) → just the error name.
         if (self.depth == 0) return .{ .message = try arena.dupe(u8, @errorName(err)) };
+
+        // A raised Lua value (`error`/`assert`/`badArg`): the value *is* the
+        // message, already self-located, so the reporter must not append a second
+        // location. The leaf frame is the raiser's caller — `callSiteAt(1)` gives
+        // its line for the traceback header.
+        if (err == Error.LuaError) {
+            const message = if (self.pending_error) |ev|
+                try renderErrorValue(ev, arena)
+            else
+                try arena.dupe(u8, "error");
+            const cs = self.callSiteAt(1);
+            return .{
+                .message = message,
+                .line = if (cs) |c| c.line else 0,
+                .start = if (cs) |c| c.span.start else 0,
+                .end = if (cs) |c| c.span.end else 0,
+                .frames = try self.backtraceFrames(source, arena),
+                .self_located = true,
+            };
+        }
 
         const frame = &self.frames[self.depth - 1];
         const proto = frame.closure.proto;
@@ -613,7 +816,21 @@ pub const Vm = struct {
                 .lt, .le, .gt, .ge => try std.fmt.allocPrint(arena, "attempt to compare {s} with {s}", .{ regs[instr.b].typeName(), regs[instr.c].typeName() }),
                 .get_index => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs[instr.b].typeName()}),
                 .set_index => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs[instr.a].typeName()}),
-                .call => try std.fmt.allocPrint(arena, "attempt to call a {s} value", .{regs[instr.a].typeName()}),
+                .call => blk: {
+                    // A native runs inline (no child frame), so when one returns a
+                    // bare fault the leaf instruction is the `.call` to it — the
+                    // callee is perfectly callable. Name it generically instead of
+                    // the misleading "attempt to call". Detailed per-argument
+                    // messages come from `Vm.badArg` (which raises `LuaError`, so it
+                    // never reaches this non-LuaError arm). A genuine non-callable
+                    // (nil/number/…) keeps the real "attempt to call a X value".
+                    const callee = regs[instr.a];
+                    if (callee.isHeap() and callee.heapType() == .native and err == Error.TypeError)
+                        break :blk try std.fmt.allocPrint(arena, "bad argument to '{s}'", .{nativeDisplayName(function.Native.fromHeader(callee.asHeap()))});
+                    if (callee.isHeap() and (callee.heapType() == .native or callee.heapType() == .function))
+                        break :blk try arena.dupe(u8, @errorName(err));
+                    break :blk try std.fmt.allocPrint(arena, "attempt to call a {s} value", .{callee.typeName()});
+                },
                 else => try arena.dupe(u8, @errorName(err)),
             },
         };
@@ -679,6 +896,143 @@ pub const Vm = struct {
         self.stack_top = base + nreg;
     }
 
+    /// Call a lune callable from native (host) code, run it to completion, write up
+    /// to `results_out.len` results into `results_out`, and return the count
+    /// actually written. `callee` must be a closure or native `Value` (else
+    /// `TypeError`). This is the keystone reentrancy primitive: a native that holds
+    /// `*Vm` via its ctx (`pcall`/`xpcall`, the `table.sort` comparator, `gsub`
+    /// function-replacement) drives a lune function and gets its results back.
+    ///
+    /// It runs a **depth-bounded** nested dispatch (`execWith(entry_depth + 1)`)
+    /// that returns the instant the nested top frame returns. It mutates only
+    /// `self.{frames[entry_depth..], depth, stack_top, native_reentry_depth}` — the
+    /// outer dispatch loop's hot locals (`frame/base/regs/pc`) live on the Zig
+    /// stack of the *outer* `execImpl` and are never touched. On **success** it
+    /// restores `stack_top` to the entry value (`depth` is already back via the
+    /// bounded `ret`). On **error** it deliberately does NOT unwind — frames are
+    /// left live so the catcher (`pcall`) can read them via `describeFault` before
+    /// it restores `depth`/`stack_top`. This matches the whole-VM invariant that a
+    /// runtime error leaves `self.frames` intact for fault description.
+    ///
+    /// Preconditions (asserted): no multret pair is pending (`!reg_top_pending`),
+    /// and no suspend is armed (`suspend_ctl == null` — a suspend taken across a
+    /// native's Zig frame would have no resume cursor). Both hold for the chunk-1
+    /// callers; a future host-mediated-suspension chunk revisits the latter.
+    ///
+    /// GC contract for callers: `results_out` heap values are rooted only while the
+    /// caller's own register window / scratch holds them; consume them before the
+    /// next allocation without stashing a raw `Value` across a safepoint.
+    pub fn callValue(self: *Vm, callee: Value, args: []const Value, results_out: []Value) Error!usize {
+        if (!callee.isHeap()) return Error.TypeError;
+        std.debug.assert(!self.reg_top_pending);
+        std.debug.assert(self.suspend_ctl == null);
+        if (self.native_reentry_depth >= max_native_reentry) return Error.StackOverflow;
+        self.native_reentry_depth += 1;
+        defer self.native_reentry_depth -= 1;
+
+        switch (callee.heapType()) {
+            // Native callee: no frame — mirror the `.call` `.native` dispatch arm.
+            // Results go straight into `results_out` (a concrete count is always
+            // wanted here; the `all_results` stamping path is dispatch-only).
+            .native => {
+                const nat = function.Native.fromHeader(callee.asHeap());
+                if (nat.effect) |kind| {
+                    const r = try performEffect(self, kind, nat, args);
+                    if (results_out.len == 0) return 0;
+                    results_out[0] = r;
+                    return 1;
+                } else if (nat.multi != null and results_out.len >= 2) {
+                    // `out` may not overlap `args` here (separate buffers), which is
+                    // a strictly-safer case of the NativeMultiFn alias contract.
+                    const produced = nat.multi.?(@ptrCast(self), args, results_out) catch |e| return narrowError(e);
+                    return @min(produced, results_out.len);
+                } else {
+                    const r = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
+                    if (results_out.len == 0) return 0;
+                    results_out[0] = r;
+                    return 1;
+                }
+            },
+            // Closure callee: lay out a fresh window at `stack_top`, bind params
+            // exactly like the `.call` arm, push, and run a bounded nested exec.
+            .function => {
+                const cl = Closure.fromHeader(callee.asHeap());
+                const cp = cl.proto;
+                const entry_depth = self.depth;
+                const saved_top = self.stack_top;
+                if (self.depth >= max_call_depth) return Error.StackOverflow;
+                // Args land in a fresh region at `arg_base`; the callee window sits
+                // directly above them. Surplus varargs stay in the arg region (below
+                // `callee_base`), stable and — once `pushFrame` raises `stack_top` —
+                // GC-rooted, exactly as the `.call` arm leaves them in the caller's
+                // window. Reserve `args.len + num_registers` slots.
+                const arg_base = self.stack_top;
+                const callee_base = arg_base + args.len;
+                if (callee_base + cp.num_registers > self.stack.len) return Error.StackOverflow;
+                // Straight-line, allocation-free up to `pushFrameVararg` (which
+                // raises `stack_top`): no safepoint may intervene, so the args we
+                // park above `stack_top` are never seen unrooted by the collector.
+                for (args, 0..) |v, i| self.stack[arg_base + i] = v;
+                var i: usize = 0;
+                while (i < cp.num_registers) : (i += 1) {
+                    self.stack[callee_base + i] = if (i < cp.num_params and i < args.len)
+                        self.stack[arg_base + i]
+                    else
+                        Value.nil();
+                }
+                const va_count: usize = if (cp.is_vararg and args.len > cp.num_params) args.len - cp.num_params else 0;
+                const va_base: usize = if (va_count > 0) arg_base + cp.num_params else 0;
+                try self.pushFrameVararg(cl, callee_base, 0, 0, va_base, va_count);
+
+                // No `errdefer` restore: a runtime error must leave `self.frames`
+                // live (depth raised) so the catching `pcall` can synthesize the
+                // located message before it restores the boundary — the whole-VM
+                // "errors don't unwind frames" invariant. Success falls through to
+                // the explicit `stack_top` restore below.
+                const outcome = try self.execWith(entry_depth + 1);
+                const fr = switch (outcome) {
+                    .finished => |f| f,
+                    // `suspend_ctl == null` (asserted above) ⇒ exec never suspends.
+                    .suspended => unreachable,
+                };
+                // The boundary frame is popped (`depth == entry_depth`) but
+                // `stack_top` is still raised over its window, so its result
+                // registers are live and rooted. Copy them out before shrinking.
+                const src = callee_base + fr.reg;
+                const n = @min(@as(usize, fr.count), results_out.len);
+                var k: usize = 0;
+                while (k < n) : (k += 1) results_out[k] = self.stack[src + k];
+                self.stack_top = saved_top;
+                return n;
+            },
+            else => return Error.TypeError,
+        }
+    }
+
+    /// Turn a runtime fault (a non-`LuaError` Error raised with no `pending_error`)
+    /// into the interned message string that becomes the caught error value. Reuses
+    /// `describeFault`'s located-message synthesis against the **still-live**
+    /// faulting frames — so it MUST run before the catcher restores `depth`. Reads
+    /// only deterministic state (opcodes, operand types, source spans), so the same
+    /// fault yields the same value bytes across all tiers and record/replay.
+    pub fn synthErrorValue(self: *Vm, e: Error) Error!Value {
+        var arena_inst = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_inst.deinit();
+        const a = arena_inst.allocator();
+        const fault = try self.describeFault(self.source, e, a);
+        // A raised value (`error`/`assert`/`badArg`) already carries its own
+        // `chunk:line:`; intern it verbatim. A bare runtime fault (`nil + 1`,
+        // indexing nil, a native's generic bad-argument) is reported by Lua with a
+        // `chunk:line:` prefix on the *caught* value too — prepend it from the leaf
+        // frame's chunk (its proto name) and the fault line. Deterministic: proto
+        // name is static and the line derives from a source offset.
+        if (fault.self_located or fault.line == 0 or self.depth == 0)
+            return self.heap.internValue(fault.message);
+        const chunk = self.frames[self.depth - 1].closure.proto.name;
+        const full = try std.fmt.allocPrint(a, "{s}:{d}: {s}", .{ chunk, fault.line, fault.message });
+        return self.heap.internValue(full);
+    }
+
     /// Run one stop-the-world collection. Invoked only at the dispatch-loop
     /// safepoint. The VM supplies the root set — everything a running program can
     /// still reach — and the heap owns the mark/sweep mechanism (`gc.zig`).
@@ -735,6 +1089,10 @@ pub const Vm = struct {
             for (self.trace.rec.consts.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
         }
         for (self.effect_log.items) |e| if (e.result.isHeap()) cb(ctx, e.result.asHeap());
+        // 7. the in-flight Lua error value — rooted while parked between a raise and
+        //    its catch. Load-bearing for the `xpcall` handler path, which allocates
+        //    (and so may collect) while the error value waits to be handed over.
+        if (self.pending_error) |ev| if (ev.isHeap()) cb(ctx, ev.asHeap());
     }
 
     /// The tier-0 dispatch loop over the **explicit** call stack. Runs the top
@@ -757,11 +1115,20 @@ pub const Vm = struct {
     /// mid-`.full` — re-enters under the other mode at the parked cursor; it never
     /// reaches a caller. Both modes share one opcode body, so they cannot diverge.
     pub fn exec(self: *Vm) Error!ExecOutcome {
+        return self.execWith(1);
+    }
+
+    /// `exec`, bounded by a stop depth. The dispatch loop returns `.finished` the
+    /// instant a `.ret`/`.halt` pops the frame at `stop_depth` (the top-level main
+    /// frame for `stop_depth == 1`; a reentrant `callValue`'s nested top frame for
+    /// `stop_depth == entry_depth + 1`). Threads `stop_depth` through the
+    /// `switch_mode` re-entry so a mode flip mid-nested-run resumes the same bound.
+    fn execWith(self: *Vm, stop_depth: u32) Error!ExecOutcome {
         while (true) {
             const step = if (self.runFastPath())
-                try self.execImpl(.fast)
+                try self.execImpl(.fast, stop_depth)
             else
-                try self.execImpl(.full);
+                try self.execImpl(.full, stop_depth);
             switch (step) {
                 .finished => |fr| return .{ .finished = fr },
                 .suspended => return .suspended,
@@ -780,7 +1147,7 @@ pub const Vm = struct {
         return !(self.suspend_ctl != null or self.record_safepoint_lines or self.trace.isRecording());
     }
 
-    fn execImpl(self: *Vm, comptime mode: ExecMode) Error!ExecStep {
+    fn execImpl(self: *Vm, comptime mode: ExecMode, stop_depth: u32) Error!ExecStep {
         // Hot top-frame state, reloaded from `frames[depth-1]` after every push/pop.
         var frame: *CallFrame = &self.frames[self.depth - 1];
         var closure = frame.closure;
@@ -833,6 +1200,11 @@ pub const Vm = struct {
                     // Never suspend mid-multret (see the GC note above): `reg_top` is
                     // transient and unserialized, so a snapshot here could not resume.
                     if (!self.reg_top_pending and self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth) {
+                        // `pending_error` is transient and unserialized, like
+                        // `reg_top`: a snapshot mid-unwind could not resume. Error
+                        // propagation never reaches a safepoint (it returns straight
+                        // out via `try`), so it is always null here.
+                        std.debug.assert(self.pending_error == null);
                         frame.pc = pc;
                         return .suspended;
                     }
@@ -1136,8 +1508,15 @@ pub const Vm = struct {
                         break :blk @intCast(self.reg_top - (base + @as(usize, a)));
                     } else if (instr.op == .ret) instr.b else 0;
                     const result: FrameResult = .{ .reg = @intCast(a), .count = ret_count };
-                    if (self.depth == 1) {
-                        self.depth = 0;
+                    if (self.depth == stop_depth) {
+                        // Pop the boundary frame. For the top level (stop_depth == 1)
+                        // this nets `depth == 0` exactly as before; for a reentrant
+                        // `callValue` (stop_depth == entry_depth + 1) it leaves the
+                        // outer frames intact at `depth == entry_depth`. Results stay
+                        // in this frame's window (at `base + result.reg`) until the
+                        // caller copies them out — `stack_top` is not shrunk here, so
+                        // the live-register scan still roots them.
+                        self.depth -= 1;
                         return .{ .finished = result };
                     }
                     // Copy results into the parent *while* `stack_top` still covers
@@ -1597,6 +1976,7 @@ fn forRemainingTrips(idx: Value, limit: Value, step: Value) u64 {
 fn narrowError(e: anyerror) Error {
     return switch (e) {
         error.OutOfMemory => Error.OutOfMemory,
+        error.LuaError => Error.LuaError,
         error.TypeError => Error.TypeError,
         error.DivisionByZero => Error.DivisionByZero,
         error.StackOverflow => Error.StackOverflow,
@@ -1612,6 +1992,33 @@ fn narrowError(e: anyerror) Error {
         error.EffectLogExhausted => Error.EffectLogExhausted,
         error.EffectKindMismatch => Error.EffectKindMismatch,
         else => Error.HostError,
+    };
+}
+
+/// Which runtime errors `pcall`/`xpcall` may catch. The allowlist deliberately
+/// EXCLUDES the determinism / replay-integrity faults: `OutOfMemory` (catching it
+/// would let a program observe heap pressure, which varies with GC timing across
+/// modes) and every effect-log error (`EffectLogExhausted`/`EffectKindMismatch`/
+/// `*Unavailable`, whose catching would mask a replay divergence). `StackOverflow`
+/// IS catchable — it is a deterministic function of call depth (identical across
+/// all 8 modes) and Lua reports it as an ordinary catchable error. Exhaustive over
+/// `Error` so a newly added tag forces an explicit catchable/not decision here.
+pub fn catchable(e: Error) bool {
+    return switch (e) {
+        Error.LuaError,
+        Error.TypeError,
+        Error.DivisionByZero,
+        Error.StackOverflow,
+        Error.HostError,
+        Error.Unimplemented,
+        => true,
+        Error.OutOfMemory,
+        Error.EffectLogExhausted,
+        Error.EffectKindMismatch,
+        Error.ClockUnavailable,
+        Error.RandomUnavailable,
+        Error.EnvUnavailable,
+        => false,
     };
 }
 
@@ -2403,6 +2810,7 @@ fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, s
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     vm.out = sink;
+    vm.source = source; // back located error messages (error level prefix, faults)
     vm.heap.gc_stress = stress;
     vm.trace.config.enabled = mode != .off;
     vm.trace.config.execute = mode == .record_execute or mode == .record_execute_noopt or mode == .record_execute_native;
@@ -2434,6 +2842,227 @@ fn expectProgram(source: [:0]const u8, expected: []const u8) !void {
             try testing.expectEqualStrings(expected, sink.buffered());
         }
     }
+}
+
+test "foundations: pcall catches a bare runtime fault (synthesized message)" {
+    try expectProgram(
+        "print(pcall(function() return nil + 1 end))\n",
+        "false\tanonymous:1: attempt to perform arithmetic on a nil value\n",
+    );
+}
+
+// --- error-message polish: located messages across all 8 modes ---------------
+
+test "errmsg: error(msg) renders located through the pcall path" {
+    try expectProgram(
+        "print(pcall(function() error(\"boom\") end))\n",
+        "false\tanonymous:1: boom\n",
+    );
+}
+
+test "errmsg: error(msg, 0) suppresses the location prefix" {
+    try expectProgram(
+        "print(pcall(function() error(\"x\", 0) end))\n",
+        "false\tx\n",
+    );
+}
+
+test "errmsg: error(msg, 2) points at the caller's caller" {
+    try expectProgram(
+        \\local function f() error("deep", 2) end
+        \\print(pcall(function() f() end))
+        \\
+    ,
+        "false\tanonymous:2: deep\n",
+    );
+}
+
+test "errmsg: a non-string error object passes through unprefixed and keeps its type" {
+    try expectProgram(
+        \\local ok, e = pcall(function() error({code = 1}) end)
+        \\print(ok, type(e), e.code)
+        \\
+    ,
+        "false\ttable\t1\n",
+    );
+}
+
+test "errmsg: a converted native gives the detailed located bad-argument message" {
+    try expectProgram(
+        "print(pcall(function() return string.sub(nil, 1) end))\n",
+        "false\tanonymous:1: bad argument #1 to 'sub' (string expected, got nil)\n",
+    );
+}
+
+test "errmsg: a non-integral float arg reports the integer-representation reason" {
+    try expectProgram(
+        "print(pcall(function() return string.sub(\"abc\", 1.5) end))\n",
+        "false\tanonymous:1: bad argument #2 to 'sub' (number has no integer representation)\n",
+    );
+}
+
+test "errmsg: error() with invalid level type or non-integral float raises bad argument" {
+    try expectProgram(
+        "print(pcall(function() error(\"boom\", \"invalid\") end))\n",
+        "false\tanonymous:1: bad argument #2 to 'error' (number expected, got string)\n",
+    );
+    try expectProgram(
+        "print(pcall(function() error(\"boom\", 2.5) end))\n",
+        "false\tanonymous:1: bad argument #2 to 'error' (number has no integer representation)\n",
+    );
+}
+
+test "errmsg: error() with level past depth suppresses location" {
+    try expectProgram(
+        \\local function f() error("deep", 4) end
+        \\print(pcall(function() f() end))
+        \\
+    ,
+        "false\tdeep\n",
+    );
+}
+
+test "errmsg: select() with float arguments handles conversion and bounds checks" {
+    try expectProgram(
+        "print(select(2.0, 'a', 'b', 'c'))\n",
+        "b\tc\n",
+    );
+    try expectProgram(
+        "print(pcall(function() select(1e20, 'a') end))\n",
+        "false\tanonymous:1: bad argument #1 to 'select' (number has no integer representation)\n",
+    );
+}
+
+
+test "errmsg: an unconverted (pure) native still names the function, located" {
+    try expectProgram(
+        "print(pcall(function() return math.floor(\"x\") end))\n",
+        "false\tanonymous:1: bad argument to 'floor'\n",
+    );
+}
+
+test "errmsg: a converted table native reports the located bad-argument message" {
+    try expectProgram(
+        "print(pcall(function() return table.insert(nil, 1) end))\n",
+        "false\tanonymous:1: bad argument #1 to 'insert' (table expected, got nil)\n",
+    );
+}
+
+test "foundations: error raises an arbitrary value caught by pcall" {
+    try expectProgram(
+        \\local ok, e = pcall(function() error({code = 42}) end)
+        \\print(ok, type(e), e.code)
+        \\
+    ,
+        "false\ttable\t42\n",
+    );
+}
+
+test "foundations: recursive pcall — inner result flows out of the outer" {
+    try expectProgram(
+        "print(pcall(function() return pcall(function() error(\"x\") end) end))\n",
+        "true\tfalse\tanonymous:1: x\n",
+    );
+}
+
+test "foundations: table.sort default comparator (ascending)" {
+    try expectProgram(
+        \\local t = {3, 1, 2}
+        \\table.sort(t)
+        \\print(t[1], t[2], t[3])
+        \\
+    ,
+        "1\t2\t3\n",
+    );
+}
+
+test "foundations: table.sort with a custom comparator (descending)" {
+    try expectProgram(
+        \\local t = {5, 3, 8, 1}
+        \\table.sort(t, function(a, b) return a > b end)
+        \\print(t[1], t[2], t[3], t[4])
+        \\
+    ,
+        "8\t5\t3\t1\n",
+    );
+}
+
+test "foundations: a sort comparator that errors propagates to an enclosing pcall" {
+    try expectProgram(
+        "print(pcall(function() table.sort({1, 2}, function() error(\"cmp\") end) end))\n",
+        "false\tanonymous:1: cmp\n",
+    );
+}
+
+test "foundations: string.gsub function replacement substitutes each match" {
+    try expectProgram(
+        "print(string.gsub(\"hello\", \"l\", function(c) return c .. c end))\n",
+        "hellllo\t2\n",
+    );
+}
+
+test "foundations: string.gsub function returning nil keeps the original text" {
+    try expectProgram(
+        "print(string.gsub(\"a1b2c3\", \"%a\", function(c) if c == \"b\" then return \"B\" end end))\n",
+        "a1B2c3\t3\n",
+    );
+}
+
+test "foundations: assert passes its arguments through when truthy" {
+    try expectProgram(
+        "print(assert(5, \"msg\"))\n",
+        "5\tmsg\n",
+    );
+}
+
+test "foundations: assert raises its message when falsy, caught by pcall" {
+    try expectProgram(
+        "print(pcall(function() assert(false, \"boom\") end))\n",
+        "false\tboom\n",
+    );
+}
+
+test "foundations: xpcall runs the message handler on the error value" {
+    try expectProgram(
+        \\local ok, r = xpcall(function() error("orig") end, function(m) return "handled:" .. m end)
+        \\print(ok, r)
+        \\
+    ,
+        "false\thandled:anonymous:1: orig\n",
+    );
+}
+
+test "strings: lexicographic ordering with < <= > >=" {
+    try expectProgram(
+        \\print("a" < "b", "b" < "a", "a" < "a")
+        \\print("ab" < "abc", "abc" < "ab", "Z" < "a")
+        \\print("a" <= "a", "b" <= "a", "ab" >= "ab")
+        \\print("apple" > "apricot", "banana" > "apple")
+        \\
+    ,
+        "true\tfalse\tfalse\n" ++
+            "true\tfalse\ttrue\n" ++
+            "true\tfalse\ttrue\n" ++
+            "false\ttrue\n",
+    );
+}
+
+test "strings: table.sort orders a string list with the default comparator" {
+    try expectProgram(
+        \\local t = {"cherry", "apple", "banana"}
+        \\table.sort(t)
+        \\print(t[1], t[2], t[3])
+        \\
+    ,
+        "apple\tbanana\tcherry\n",
+    );
+}
+
+test "strings: comparing a string with a number is a catchable type error" {
+    try expectProgram(
+        "print(pcall(function() return \"a\" < 1 end))\n",
+        "false\tanonymous:1: attempt to compare string with number\n",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2614,6 +3243,38 @@ test "determinism: two independent runs agree on output, traces, and snapshots" 
         \\  s = s + a + b
         \\end
         \\tail(s, head(s, s))
+        ,
+        // Reentrant call (`Vm.callValue`) inside a hot loop: a sort with a custom
+        // comparator and a gsub with a function replacement, both driven each
+        // iteration. The comparator/replacement reenter the dispatch loop on the
+        // host stack; the captured/argument values are interned strings and table
+        // elements. If reentry leaked an address into the parked error value, the
+        // arg window, or the serialized trace/snapshot, the bytes would diverge.
+        \\local total = 0
+        \\for i = 1, 30 do
+        \\  local t = {(i * 7) % 11, (i * 3) % 11, i % 11, (i * 5) % 11}
+        \\  table.sort(t, function(a, b) return a > b end)
+        \\  total = total + t[1]
+        \\  local r = string.gsub("abc", "%a", function(c) return c .. tostring(i % 3) end)
+        \\  total = total + #r
+        \\end
+        \\print(total)
+        ,
+        // Error raising + located message synthesis inside a hot loop. Each
+        // iteration `pcall`s a function that raises both a Lua value (`error`,
+        // prefixed via the call-site locator) and triggers a native bad-argument
+        // fault (`string.sub(nil)`, located via `Vm.badArg`), accumulating the
+        // caught message lengths. The interned located strings (`chunk:line: …`)
+        // must be byte-identical across runs — a leaked address or a per-run line
+        // would diverge the output AND the snapshot (the strings land in the heap).
+        \\local total = 0
+        \\for i = 1, 40 do
+        \\  local ok1, e1 = pcall(function() error("loop") end)
+        \\  total = total + #e1
+        \\  local ok2, e2 = pcall(function() return string.sub(nil, i) end)
+        \\  total = total + #e2
+        \\end
+        \\print(total)
         ,
     };
     inline for (programs) |src| {

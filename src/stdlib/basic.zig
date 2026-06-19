@@ -121,17 +121,23 @@ fn bToNumber(_: *anyopaque, args: []const Value) anyerror!Value {
 /// `args`* of the first selected value, clamped so an out-of-range positive `n`
 /// yields an empty selection (Lua errors on `n == 0` or `|n|` past the end; we
 /// surface those as `TypeError`).
-fn selectStart(args: []const Value) error{TypeError}!usize {
-    if (args.len == 0 or !args[0].isNumber()) return error.TypeError;
+fn selectStart(vm: *Vm, args: []const Value) anyerror!usize {
+    if (args.len == 0) return vm.badArg(1, "number", null);
+    if (!args[0].isNumber()) return vm.badArg(1, "number", args[0]);
     const nargs: i64 = @intCast(args.len - 1); // count of values after the selector
-    var n = args[0].asInt();
-    if (args[0].isFloat()) {
+    var n: i64 = undefined;
+    if (args[0].isInt()) {
+        n = args[0].asInt();
+    } else {
         const f = args[0].asFloat();
-        if (@trunc(f) != f) return error.TypeError; // non-integer index
+        const two_pow_63 = 9223372036854775808.0;
+        if (!std.math.isFinite(f) or @trunc(f) != f or f < -two_pow_63 or f >= two_pow_63) {
+            return vm.badArgReason(1, "number has no integer representation");
+        }
         n = @intFromFloat(f);
     }
     if (n < 0) n += nargs + 1; // -1 → last
-    if (n < 1 or n > nargs + 1) return error.TypeError; // Lua: index out of range (n==nargs+1 → empty)
+    if (n < 1 or n > nargs + 1) return vm.badArgReason(1, "index out of range"); // n==nargs+1 → empty
     return @intCast(n); // 0-based index into args of the first selected value
 }
 
@@ -142,21 +148,21 @@ fn isHashSelector(v: Value) bool {
     return false;
 }
 
-fn bSelect1(_: *anyopaque, args: []const Value) anyerror!Value {
+fn bSelect1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     if (args.len >= 1 and isHashSelector(args[0])) {
         return Value.int(@intCast(args.len - 1));
     }
-    const start = try selectStart(args);
+    const start = try selectStart(vmOf(ctx), args);
     if (start >= args.len) return Value.nil(); // empty selection
     return args[start];
 }
 
-fn bSelectN(_: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+fn bSelectN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     if (args.len >= 1 and isHashSelector(args[0])) {
         if (out.len >= 1) out[0] = Value.int(@intCast(args.len - 1));
         return @min(@as(usize, 1), out.len);
     }
-    const start = try selectStart(args);
+    const start = try selectStart(vmOf(ctx), args);
     // Stream args[start..] into out. Safe under the aliasing contract: source
     // index (start + k) is always > destination's aliased index (k - 1).
     var k: usize = 0;
@@ -170,10 +176,10 @@ fn bSelectN(_: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 // raw access (no metatables exist, so these match the ordinary semantics today)
 // ---------------------------------------------------------------------------
 
-fn tableArg(args: []const Value, i: usize) error{TypeError}!*Table {
-    if (i >= args.len) return error.TypeError;
+fn tableArg(vm: *Vm, args: []const Value, i: usize) anyerror!*Table {
+    if (i >= args.len) return vm.badArg(i + 1, "table", null);
     const v = args[i];
-    if (!v.isHeap() or v.heapType() != .table) return error.TypeError;
+    if (!v.isHeap() or v.heapType() != .table) return vm.badArg(i + 1, "table", v);
     return Table.fromHeader(v.asHeap());
 }
 
@@ -187,8 +193,8 @@ fn bRawEqual(_: *anyopaque, args: []const Value) anyerror!Value {
 }
 
 /// `rawget(t, k)` — `t[k]` without `__index`.
-fn bRawGet(_: *anyopaque, args: []const Value) anyerror!Value {
-    const t = try tableArg(args, 0);
+fn bRawGet(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const t = try tableArg(vmOf(ctx), args, 0);
     const k = if (args.len >= 2) args[1] else Value.nil();
     return t.get(k);
 }
@@ -198,7 +204,7 @@ fn bRawGet(_: *anyopaque, args: []const Value) anyerror!Value {
 /// NaN").
 fn bRawSet(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const t = try tableArg(args, 0);
+    const t = try tableArg(vm, args, 0);
     const k = if (args.len >= 2) args[1] else Value.nil();
     const v = if (args.len >= 3) args[2] else Value.nil();
     if (k.isNil()) return error.TypeError;
@@ -332,8 +338,8 @@ test "select: # count, positive and negative indices, multi stream" {
     try testing.expectEqualStrings("c", bytesOf(out[1]));
 
     // out-of-range index errors.
-    try testing.expectError(error.TypeError, bSelect1(@ptrCast(&vm), &.{ Value.int(0), a }));
-    try testing.expectError(error.TypeError, bSelect1(@ptrCast(&vm), &.{ Value.int(5), a, b }));
+    try testing.expectError(error.LuaError, bSelect1(@ptrCast(&vm), &.{ Value.int(0), a }));
+    try testing.expectError(error.LuaError, bSelect1(@ptrCast(&vm), &.{ Value.int(5), a, b }));
 }
 
 test "rawequal / rawget / rawset / rawlen" {
@@ -358,7 +364,7 @@ test "rawequal / rawget / rawset / rawlen" {
 
     // nil key errors; non-table rawget/rawlen errors.
     try testing.expectError(error.TypeError, bRawSet(@ptrCast(&vm), &.{ tv, Value.nil(), Value.int(1) }));
-    try testing.expectError(error.TypeError, bRawGet(@ptrCast(&vm), &.{ Value.int(1), Value.int(1) }));
+    try testing.expectError(error.LuaError, bRawGet(@ptrCast(&vm), &.{ Value.int(1), Value.int(1) }));
     try testing.expectError(error.TypeError, bRawLen(@ptrCast(&vm), &.{Value.int(1)}));
 }
 

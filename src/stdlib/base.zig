@@ -56,10 +56,10 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
     return @ptrCast(@alignCast(ctx));
 }
 
-fn tableArg(args: []const Value, i: usize) error{TypeError}!*Table {
-    if (i >= args.len) return error.TypeError;
+fn tableArg(vm: *Vm, args: []const Value, i: usize) anyerror!*Table {
+    if (i >= args.len) return vm.badArg(i + 1, "table", null);
     const v = args[i];
-    if (!v.isHeap() or v.heapType() != .table) return error.TypeError;
+    if (!v.isHeap() or v.heapType() != .table) return vm.badArg(i + 1, "table", v);
     return Table.fromHeader(v.asHeap());
 }
 
@@ -144,7 +144,7 @@ fn nextStep(gpa: std.mem.Allocator, t: *const Table, ctrl: Value) !Step {
 /// pairs(t)`). nil at end of traversal.
 fn nNext1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const t = try tableArg(args, 0);
+    const t = try tableArg(vm, args, 0);
     const ctrl = if (args.len >= 2) args[1] else Value.nil();
     const step = try nextStep(vm.gpa, t, ctrl);
     return if (step.found) step.key else Value.nil();
@@ -154,7 +154,7 @@ fn nNext1(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// VM nil-pads, so the generic-for sees a nil first var and stops).
 fn nNextN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
-    const t = try tableArg(args, 0);
+    const t = try tableArg(vm, args, 0);
     const ctrl = if (args.len >= 2) args[1] else Value.nil();
     const step = try nextStep(vm.gpa, t, ctrl);
     if (!step.found) return 0;
@@ -170,8 +170,8 @@ fn nNextN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 /// `@ipairs_iter(t, i)` primary projection — the next index `i+1`, or nil when
 /// `t[i+1]` is nil (stops the loop).
 fn nInext1(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    _ = ctx;
-    const t = try tableArg(args, 0);
+    const vm = vmOf(ctx);
+    const t = try tableArg(vm, args, 0);
     const i = if (args.len >= 2 and args[1].isInt()) args[1].asInt() else 0;
     const j = i + 1;
     return if (t.getInt(j).isNil()) Value.nil() else Value.int(j);
@@ -180,8 +180,8 @@ fn nInext1(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// `@ipairs_iter(t, i)` multi path — `(i+1, t[i+1])`, or 0 results at the first
 /// nil.
 fn nInextN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
-    _ = ctx;
-    const t = try tableArg(args, 0);
+    const vm = vmOf(ctx);
+    const t = try tableArg(vm, args, 0);
     const i = if (args.len >= 2 and args[1].isInt()) args[1].asInt() else 0;
     const j = i + 1;
     const v = t.getInt(j);
@@ -198,13 +198,13 @@ fn nInextN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 /// `pairs(t)` → `(next, t, nil)`. Primary projection is the iterator (`next`).
 fn nPairs1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    _ = try tableArg(args, 0); // type-check
+    _ = try tableArg(vm, args, 0); // type-check
     return globalNative(vm, "next");
 }
 
 fn nPairsN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
-    const t = try tableArg(args, 0);
+    const t = try tableArg(vm, args, 0);
     const triple = [3]Value{ try globalNative(vm, "next"), Value.heap(&t.header), Value.nil() };
     const w = @min(@as(usize, 3), out.len);
     var i: usize = 0;
@@ -215,13 +215,13 @@ fn nPairsN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 /// `ipairs(t)` → `(@ipairs_iter, t, 0)`. Primary projection is the iterator.
 fn nIpairs1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    _ = try tableArg(args, 0);
+    _ = try tableArg(vm, args, 0);
     return globalNative(vm, ipairs_iter_name);
 }
 
 fn nIpairsN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
-    const t = try tableArg(args, 0);
+    const t = try tableArg(vm, args, 0);
     const triple = [3]Value{ try globalNative(vm, ipairs_iter_name), Value.heap(&t.header), Value.int(0) };
     const w = @min(@as(usize, 3), out.len);
     var i: usize = 0;

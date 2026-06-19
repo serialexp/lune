@@ -332,16 +332,71 @@ invariant value isn't proven .int / fits-covered after loop-invariant handling).
 follow-up; affects another common fill idiom. Characterise + fix alongside the flicker.
 
 ## stdlib pattern pass — follow-ups (string.find/match/gmatch/gsub landed)
-- **gsub function replacement** is deferred: it needs a call-into-VM-from-native
-  primitive (same blocker as `table.sort`'s comparator). `gsubCore` currently
-  returns `error.GsubFunctionUnsupported` for a function `repl`. CSV row is
-  `partial` until this lands.
-- **Misleading native-error messages** (pre-existing, whole native boundary, not
-  pattern-specific): `Vm.describeFault` derives the message from the *faulting
-  opcode*, and a native runs in the caller's frame, so the faulting op is the
-  `.call` that invoked it — every error a native *returns* renders as "attempt to
-  call a <type> value" (e.g. `string.format("%y")` → TypeError shows as a call
-  error). Fix: in describeFault's `.call` arm, only emit "attempt to call…" when
-  the callee is genuinely non-callable (the actual not-a-function error); for any
-  other error from a callable, fall through to `@errorName(err)` (or a
-  native-supplied message once we add an error-message channel).
+- **gsub function replacement** — DONE (chunk-1 foundations). `Vm.callValue`
+  (the call-into-VM-from-native primitive) landed; `addReplFunction` drives the
+  replacement per match. CSV row is `implemented`. Same primitive unblocked
+  `table.sort`'s comparator.
+- **Misleading native-error messages** — DONE (error-message cheap-wins batch).
+  `describeFault`'s `.call` arm now only emits "attempt to call a <type> value"
+  for a genuine non-callable; a native-internal fault renders `"bad argument to
+  '<name>'"` (located), and converted `*Arg` checkers raise the full detailed
+  `Vm.badArg` message. See the "Native-raised fault messages …— DONE" section
+  below.
+
+## Native-raised fault messages are misattributed to the call site — DONE
+
+Fixed in the error-message cheap-wins batch. The keystone was the shared
+`Vm.callSiteAt(level)` locator (interp.zig): when a native faults inline in a
+`.call`, its caller frame still holds that `.call`, so the native's name and the
+source location are recoverable from the live call site without threading.
+- `describeFault`'s `.call` arm now distinguishes a native-internal fault (→
+  `"bad argument to '<name>'"`, located) from a genuine non-callable (keeps
+  `"attempt to call a <type> value"`).
+- `Vm.badArg(n, expected, got)` / `Vm.badArgReason(n, reason)` raise the full
+  Lua-style `"<chunk:line>: bad argument #<n> to '<fn>' (…)"`; the shared
+  `*Arg` checkers in string/table/basic/base route through them. `math.zig`
+  stays a pure module (no `interp` import) and uses the generic located arm.
+- `synthErrorValue` now prefixes `chunk:line:` on caught bare runtime faults too
+  (matching Lua's caught-error value format). Deterministic across all 8 modes
+  (proto name is static, line derives from a source offset).
+Remaining (metatables chunk): `__tostring` on error objects; richer context.
+
+### Known limitation: indirectly-called natives misattribute the arg-error name
+
+When a native is invoked *indirectly* through another native — e.g.
+`pcall(string.sub, nil, 1)` or `pcall(math.floor, "x")` — the bad-argument
+message names the **outer** native (`pcall`), not the faulting one (`sub`):
+
+```
+pcall(string.sub, nil, 1)  → bad argument #1 to 'pcall' (string expected, got nil)   (Lua: 'sub')
+```
+
+Root cause is structural and the mirror image of the fix above: `Vm.callValue`'s
+native path runs the target native inline **without pushing a frame and without a
+`.call` instruction**, so `callSiteAt(1)`/`nativeSite` find the live call site of
+the *outer* native instead. The **direct** call form
+(`(function() return string.sub(nil,1) end)`) is correct — only the
+native-invokes-native indirection is wrong, and it's an uncommon pattern.
+
+Proper fix (deferred — needs a new mechanism, not a hack): have `callValue`'s
+native path set a "currently-invoked native" context (name + the caller's
+call-site) that `nativeSite` consults *before* falling back to the live `.call`
+frame, then clears on return. Confirmed by both reviewers (Codex, Antigravity)
+during the cheap-wins review.
+
+## error(msg, level) location prefix — DONE
+
+`nError` (stdlib/errors.zig) honors `level`: a string message gets a
+`chunk:line:` prefix from `Vm.raiseLocatedError(bytes, level)` (level 1 = the
+function that called `error`, level 0 = no prefix), reusing the shared
+`callSiteAt` locator. Non-string messages pass through verbatim. CSV `error`
+row flipped to `implemented`.
+
+## String ordering (`<` `<=` `>` `>=` on strings) — DONE
+
+`arith.lt`/`arith.le` (`src/arith.zig`) now compare two strings lexicographically
+by byte (`std.mem.order`), keeping mixed string/number a `TypeError` exactly as
+Lua does. `table.sort` on a string list with the default comparator works. Safe
+for the JIT: `recCompare` (trace.zig) aborts a compare whose operands aren't
+numbers, so string ordering only ever runs on tier-0/1a, never inside native
+trace code. Parity tests in interp.zig ("strings: …").

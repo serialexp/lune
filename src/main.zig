@@ -244,6 +244,10 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     vm.trace.config.optimize = topts.optimize;
     vm.trace.config.native_codegen = topts.native_codegen;
     if (topts.hotguard) |v| vm.trace.config.hotguard = v;
+    // The source backs located error messages: `error(msg, level)` prefixes
+    // `chunk:line:` and `synthErrorValue`/`describeFault` read spans against it.
+    // Set unconditionally so a fault anywhere has a real location, not `""`.
+    vm.source = source;
     // Inject the native clock. The interpreter holds no platform clock of its own
     // (so the VM core stays portable, incl. wasm); the host that builds the VM —
     // here, the CLI — supplies one. This is the single place the OS clock syscall
@@ -297,7 +301,13 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
         var fault_arena = std.heap.ArenaAllocator.init(gpa);
         defer fault_arena.deinit();
         if (vm.describeFault(source, err, fault_arena.allocator())) |fault| {
-            lune.io.eprint("lune: runtime error: {s} at {s}:{d}\n", .{ fault.message, name, fault.line });
+            // A self-located message (a raised Lua value) already carries its
+            // `chunk:line:` prefix — print it verbatim, Lua-style. The type-name
+            // faults are not self-located and get the " at chunk:line" suffix.
+            if (fault.self_located)
+                lune.io.eprint("lune: runtime error: {s}\n", .{fault.message})
+            else
+                lune.io.eprint("lune: runtime error: {s} at {s}:{d}\n", .{ fault.message, name, fault.line });
             // A traceback only adds signal when control crossed a call boundary.
             if (fault.frames.len > 1) {
                 lune.io.eprint("stack traceback:\n", .{});
