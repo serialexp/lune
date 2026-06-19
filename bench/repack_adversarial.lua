@@ -21,6 +21,8 @@
 --   poison  — build, then force one full-array widen per table (Lune-only cost).
 --   churn   — one big persistent table, hammered with lane-flipping rehashes.
 -- arg[2] = M (tables / rounds), arg[3] = K (elements per table).
+--
+-- @bench args="poison 2000 1000" luajit=compatible name=repack
 
 local mode = (arg and arg[1]) or "poison"
 local M = tonumber(arg and arg[2]) or 6000

@@ -13,6 +13,8 @@
 --   lune --jit-native    bench/pi_leibniz.lua 50000000   # tier-1b (native x64)
 --   lune --dump-native   bench/pi_leibniz.lua 50000000   # confirm the loop compiles
 --   luajit               bench/pi_leibniz.lua 50000000   # reference
+--
+-- @bench args="5000000" luajit=compatible
 
 local function leibniz(n)
   local sum = 0.0

@@ -1,0 +1,5 @@
+# latest.tsv is a volatile mirror of the most recent run — regenerated every
+# time bench/run.py is invoked, so it is never committed. The timestamped
+# snapshots (YYYYMMDD-HHMMSS-<rev>.tsv) ARE committed: they are the suite's
+# history.
+latest.tsv

@@ -17,6 +17,8 @@
 --   lune --dump-native   bench/sieve_int.lua 4000000   # confirm both traces compile
 --   luajit               bench/sieve_int.lua 4000000   # reference
 -- Output is byte-identical across all four (and to LuaJIT).
+--
+-- @bench args="1000000" luajit=compatible
 
 local function nsieve(p, m)
   for i = 2, m do p[i] = true end
