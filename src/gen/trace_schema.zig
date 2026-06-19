@@ -804,6 +804,44 @@ pub const FrameRef = struct {
     }
 };
 
+pub const LoadedChunk = struct {
+    source: []const u8,
+    name: []const u8,
+
+    pub fn encode(self: LoadedChunk, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: LoadedChunk, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        _ = ctx;
+        try enc.writeUint32(@intCast(self.source.len), .little_endian);
+        try enc.writeBytes(self.source);
+        try enc.writeUint32(@intCast(self.name.len), .little_endian);
+        try enc.writeBytes(self.name);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!LoadedChunk {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!LoadedChunk {
+        _ = allocator;
+        _ = root;
+        var result: LoadedChunk = undefined;
+        const _len_0 = try dec.readUint32(.little_endian);
+        result.source = try dec.readBytesSlice(_len_0);
+        const _len_1 = try dec.readUint32(.little_endian);
+        result.name = try dec.readBytesSlice(_len_1);
+        return result;
+    }
+};
+
 pub const Keyframe = struct {
     globals_id: u32,
     string_metatable_id: u32,
@@ -811,6 +849,7 @@ pub const Keyframe = struct {
     stack: []const SnapValue,
     frames: []const FrameRef,
     open_upvalues: []const OpenUpvalueRef,
+    loaded_chunks: []const LoadedChunk,
 
     pub fn encode(self: Keyframe, allocator: std.mem.Allocator) binschema.Error![]u8 {
         var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
@@ -840,6 +879,10 @@ pub const Keyframe = struct {
         for (self.open_upvalues) |_item_3| {
             try _item_3.encodeInto(enc, ctx);
         }
+        try enc.writeUint32(@intCast(self.loaded_chunks.len), .little_endian);
+        for (self.loaded_chunks) |_item_4| {
+            try _item_4.encodeInto(enc, ctx);
+        }
     }
 
     pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!Keyframe {
@@ -851,30 +894,36 @@ pub const Keyframe = struct {
         var result: Keyframe = undefined;
         result.globals_id = try dec.readUint32(.little_endian);
         result.string_metatable_id = try dec.readUint32(.little_endian);
-        const _len_7 = try dec.readUint32(.little_endian);
-        const _buf_8 = try allocator.alloc(HeapObject, @as(usize, _len_7));
-        for (0.._buf_8.len) |_i_5| {
-            _buf_8[_i_5] = try HeapObject.decodeWith(allocator, dec, root);
+        const _len_8 = try dec.readUint32(.little_endian);
+        const _buf_9 = try allocator.alloc(HeapObject, @as(usize, _len_8));
+        for (0.._buf_9.len) |_i_6| {
+            _buf_9[_i_6] = try HeapObject.decodeWith(allocator, dec, root);
         }
-        result.objects = _buf_8;
-        const _len_12 = try dec.readUint32(.little_endian);
-        const _buf_13 = try allocator.alloc(SnapValue, @as(usize, _len_12));
-        for (0.._buf_13.len) |_i_10| {
-            _buf_13[_i_10] = try SnapValue.decodeWith(allocator, dec, root);
+        result.objects = _buf_9;
+        const _len_13 = try dec.readUint32(.little_endian);
+        const _buf_14 = try allocator.alloc(SnapValue, @as(usize, _len_13));
+        for (0.._buf_14.len) |_i_11| {
+            _buf_14[_i_11] = try SnapValue.decodeWith(allocator, dec, root);
         }
-        result.stack = _buf_13;
-        const _len_17 = try dec.readUint16(.little_endian);
-        const _buf_18 = try allocator.alloc(FrameRef, @as(usize, _len_17));
-        for (0.._buf_18.len) |_i_15| {
-            _buf_18[_i_15] = try FrameRef.decodeWith(allocator, dec, root);
+        result.stack = _buf_14;
+        const _len_18 = try dec.readUint16(.little_endian);
+        const _buf_19 = try allocator.alloc(FrameRef, @as(usize, _len_18));
+        for (0.._buf_19.len) |_i_16| {
+            _buf_19[_i_16] = try FrameRef.decodeWith(allocator, dec, root);
         }
-        result.frames = _buf_18;
-        const _len_22 = try dec.readUint16(.little_endian);
-        const _buf_23 = try allocator.alloc(OpenUpvalueRef, @as(usize, _len_22));
-        for (0.._buf_23.len) |_i_20| {
-            _buf_23[_i_20] = try OpenUpvalueRef.decodeWith(allocator, dec, root);
+        result.frames = _buf_19;
+        const _len_23 = try dec.readUint16(.little_endian);
+        const _buf_24 = try allocator.alloc(OpenUpvalueRef, @as(usize, _len_23));
+        for (0.._buf_24.len) |_i_21| {
+            _buf_24[_i_21] = try OpenUpvalueRef.decodeWith(allocator, dec, root);
         }
-        result.open_upvalues = _buf_23;
+        result.open_upvalues = _buf_24;
+        const _len_28 = try dec.readUint32(.little_endian);
+        const _buf_29 = try allocator.alloc(LoadedChunk, @as(usize, _len_28));
+        for (0.._buf_29.len) |_i_26| {
+            _buf_29[_i_26] = try LoadedChunk.decodeWith(allocator, dec, root);
+        }
+        result.loaded_chunks = _buf_29;
         return result;
     }
 };

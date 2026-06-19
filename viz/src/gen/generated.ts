@@ -2447,7 +2447,108 @@ export class FrameRefDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
+ * One runtime-`load`ed chunk's recompile inputs (L-2): its source text and the chunk name it was loaded under. Restore re-parses + re-compiles `source` (compile is deterministic) and renames the root proto to `name`, so a live `load` closure — and any post-restore fault it raises — is byte-identical to the pre-snapshot VM.
+ */
+export interface LoadedChunkInput {
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  source: number[];
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  name: number[];
+}
+
+/**
+ * One runtime-`load`ed chunk's recompile inputs (L-2): its source text and the chunk name it was loaded under. Restore re-parses + re-compiles `source` (compile is deterministic) and renames the root proto to `name`, so a live `load` closure — and any post-restore fault it raises — is byte-identical to the pre-snapshot VM.
+ */
+export interface LoadedChunkOutput {
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  source: number[];
+  /**
+   * Bytes
+   * Raw byte array. Sugar for array of uint8 — same wire format, simpler schema definition.
+   */
+  name: number[];
+}
+
+export type LoadedChunk = LoadedChunkOutput;
+
+export class LoadedChunkEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: LoadedChunkInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.source.length, "little_endian");
+    for (let value_source__iter_index = 0; value_source__iter_index < value.source.length; value_source__iter_index++) {
+      const value_source__iter = value.source[value_source__iter_index];
+      this.writeUint8(value_source__iter);
+    }
+    this.writeUint32(value.name.length, "little_endian");
+    for (let value_name__iter_index = 0; value_name__iter_index < value.name.length; value_name__iter_index++) {
+      const value_name__iter = value.name[value_name__iter_index];
+      this.writeUint8(value_name__iter);
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a LoadedChunk value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: LoadedChunk): number {
+    let size = 0;
+    // source: bytes (kind: length_prefixed)
+    size += value.source.length;
+    size += 4; // length prefix (uint32)
+    // name: bytes (kind: length_prefixed)
+    size += value.name.length;
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class LoadedChunkDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): LoadedChunkOutput {
+    const value: any = {};
+
+    value.source = [];
+    const source_length = this.readUint32("little_endian");
+    for (let i = 0; i < source_length; i++) {
+      let source__iter: any;
+      source__iter = this.readUint8();
+      value.source.push(source__iter);
+    }
+    value.name = [];
+    const name_length = this.readUint32("little_endian");
+    for (let i = 0; i < name_length; i++) {
+      let name__iter: any;
+      name__iter = this.readUint8();
+      value.name.push(name__iter);
+    }
+    return value;
+  }
+}
+
+/**
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
  */
 export interface KeyframeInput {
   /**
@@ -2500,10 +2601,20 @@ export interface KeyframeInput {
    * Length prefix type: uint16
    */
   open_upvalues: OpenUpvalueRefInput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  loaded_chunks: LoadedChunkInput[];
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
  */
 export interface KeyframeOutput {
   /**
@@ -2556,6 +2667,16 @@ export interface KeyframeOutput {
    * Length prefix type: uint16
    */
   open_upvalues: OpenUpvalueRefOutput[];
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  loaded_chunks: LoadedChunkOutput[];
 }
 
 export type Keyframe = KeyframeOutput;
@@ -2609,6 +2730,15 @@ export class KeyframeEncoder extends BitStreamEncoder {
         this.writeUint8(byte);
       }
     }
+    this.writeUint32(value.loaded_chunks.length, "little_endian");
+    for (let value_loaded_chunks__iter_index = 0; value_loaded_chunks__iter_index < value.loaded_chunks.length; value_loaded_chunks__iter_index++) {
+      const value_loaded_chunks__iter = value.loaded_chunks[value_loaded_chunks__iter_index];
+      const encoder_value_loaded_chunks__iter = new LoadedChunkEncoder();
+      const encoded_value_loaded_chunks__iter = encoder_value_loaded_chunks__iter.encode(value_loaded_chunks__iter);
+      for (const byte of encoded_value_loaded_chunks__iter) {
+        this.writeUint8(byte);
+      }
+    }
     return this.finish();
   }
 
@@ -2643,6 +2773,12 @@ export class KeyframeEncoder extends BitStreamEncoder {
       size += open_upvalues_itemEncoder.calculateSize(item);
     }
     size += 2; // length prefix (uint16)
+    // loaded_chunks: array (kind: length_prefixed)
+    for (const item of value.loaded_chunks) {
+      const loaded_chunks_itemEncoder = new LoadedChunkEncoder();
+      size += loaded_chunks_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
     return size;
   }
 }
@@ -2760,6 +2896,27 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
       open_upvalues__iter.upvalue_id = this.readUint32("little_endian");
       value.open_upvalues.push(open_upvalues__iter);
     }
+    value.loaded_chunks = [];
+    const loaded_chunks_length = this.readUint32("little_endian");
+    for (let i = 0; i < loaded_chunks_length; i++) {
+      let loaded_chunks__iter: any;
+      loaded_chunks__iter = {};
+      loaded_chunks__iter.source = [];
+      const loaded_chunks__iter_source_length = this.readUint32("little_endian");
+      for (let i = 0; i < loaded_chunks__iter_source_length; i++) {
+        let loaded_chunks__iter_source__iter: any;
+        loaded_chunks__iter_source__iter = this.readUint8();
+        loaded_chunks__iter.source.push(loaded_chunks__iter_source__iter);
+      }
+      loaded_chunks__iter.name = [];
+      const loaded_chunks__iter_name_length = this.readUint32("little_endian");
+      for (let i = 0; i < loaded_chunks__iter_name_length; i++) {
+        let loaded_chunks__iter_name__iter: any;
+        loaded_chunks__iter_name__iter = this.readUint8();
+        loaded_chunks__iter.name.push(loaded_chunks__iter_name__iter);
+      }
+      value.loaded_chunks.push(loaded_chunks__iter);
+    }
     return value;
   }
 }
@@ -2774,7 +2931,7 @@ export interface SnapshotFileInput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
    */
   keyframe: KeyframeInput;
 }
@@ -2789,7 +2946,7 @@ export interface SnapshotFileOutput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
    */
   keyframe: KeyframeOutput;
 }
@@ -2944,6 +3101,27 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
       keyframe_open_upvalues__iter.stack_index = this.readUint32("little_endian");
       keyframe_open_upvalues__iter.upvalue_id = this.readUint32("little_endian");
       value.keyframe.open_upvalues.push(keyframe_open_upvalues__iter);
+    }
+    value.keyframe.loaded_chunks = [];
+    const keyframe_loaded_chunks_length = this.readUint32("little_endian");
+    for (let i = 0; i < keyframe_loaded_chunks_length; i++) {
+      let keyframe_loaded_chunks__iter: any;
+      keyframe_loaded_chunks__iter = {};
+      keyframe_loaded_chunks__iter.source = [];
+      const keyframe_loaded_chunks__iter_source_length = this.readUint32("little_endian");
+      for (let i = 0; i < keyframe_loaded_chunks__iter_source_length; i++) {
+        let keyframe_loaded_chunks__iter_source__iter: any;
+        keyframe_loaded_chunks__iter_source__iter = this.readUint8();
+        keyframe_loaded_chunks__iter.source.push(keyframe_loaded_chunks__iter_source__iter);
+      }
+      keyframe_loaded_chunks__iter.name = [];
+      const keyframe_loaded_chunks__iter_name_length = this.readUint32("little_endian");
+      for (let i = 0; i < keyframe_loaded_chunks__iter_name_length; i++) {
+        let keyframe_loaded_chunks__iter_name__iter: any;
+        keyframe_loaded_chunks__iter_name__iter = this.readUint8();
+        keyframe_loaded_chunks__iter.name.push(keyframe_loaded_chunks__iter_name__iter);
+      }
+      value.keyframe.loaded_chunks.push(keyframe_loaded_chunks__iter);
     }
     return value;
   }

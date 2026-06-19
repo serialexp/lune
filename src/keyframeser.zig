@@ -29,6 +29,9 @@ const function = @import("function.zig");
 const bytecode = @import("bytecode.zig");
 const interp = @import("interp.zig");
 const key_order = @import("key_order.zig");
+const parser = @import("parser.zig");
+const compiler = @import("compiler.zig");
+const diag = @import("diag.zig");
 
 const Value = value.Value;
 const GcHeader = object.GcHeader;
@@ -48,7 +51,11 @@ pub const schema = @import("gen/trace_schema.zig");
 /// return-wiring) for mid-execution capture + resume. (v1 was final-state only.)
 /// v3 (chunk 2a): `HeapTable` gained `metatable_id` — the table's metatable as a
 /// heap edge (0 = none), so a metatable'd table round-trips through a snapshot.
-pub const snapshot_format_version: u32 = 3;
+/// v4 (L-2): `Keyframe` gained `loaded_sources` — the source text of every
+/// runtime-`load`ed chunk, in load order. Restore re-compiles each (compile is
+/// deterministic) so a live `load` closure survives snapshot→restore without
+/// serializing bytecode.
+pub const snapshot_format_version: u32 = 4;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -266,6 +273,18 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
         .upvalue_id = ou.cell.header.id,
     };
 
+    // Runtime-`load`ed chunks, in load order (L-2): source + chunk name. Restore
+    // recompiles each — compile is deterministic, so the same sources in the same
+    // order regenerate byte-identical protos/ids — letting a live `load` closure
+    // survive snapshot→restore. The NUL terminator is omitted; restore re-adds it.
+    // The name is the (renamed) root proto's name, so a post-restore fault in
+    // loaded code reports the same `(load):N:`/`<name>:N:` as the live VM.
+    const loaded = try a.alloc(schema.LoadedChunk, vm.loaded_chunks.items.len);
+    for (vm.loaded_chunks.items, 0..) |lc, idx| loaded[idx] = .{
+        .source = lc.source,
+        .name = lc.chunk.proto.name,
+    };
+
     const file: schema.SnapshotFile = .{
         .version = snapshot_format_version,
         .keyframe = .{
@@ -280,6 +299,7 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
             .stack = stack,
             .frames = frames,
             .open_upvalues = open,
+            .loaded_chunks = loaded,
         },
     };
     return file.encode(gpa);
@@ -302,8 +322,11 @@ const RestoreError = error{
     UnsupportedVersion, // SnapshotFile.version != snapshot_format_version
     HeapNotEmpty, // restoring into a non-bare VM would collide ids/interning
     DuplicateId, // two HeapObjects share an id (corrupt snapshot)
+    DuplicateInternedString, // two HeapStrings carry identical bytes (corrupt snapshot — breaks interning)
+    IdSpaceExhausted, // restored ids fill the u32 space, leaving no room for recompiled chunk literals
     UnresolvedHeapRef, // a HeapRef / root id has no matching object
     UnknownProto, // a HeapClosure.proto_id is not in the program's proto tree
+    LoadedChunkRecompileFailed, // a recorded `load` source no longer parses/compiles (corrupt snapshot)
     UnknownNative, // a HeapNative.name is not in the native registry
     GlobalsNotATable, // globals_id resolves to a non-table object
     MetatableNotATable, // a HeapTable.metatable_id resolves to a non-table object
@@ -367,6 +390,70 @@ fn findProto(root: *const Proto, id: u32) ?*const Proto {
     return null;
 }
 
+/// Resolve a `proto_id` across the static `root` tree **and** every runtime-loaded
+/// chunk's tree (L-2). The id space is disjoint by construction (`load` offsets
+/// each loaded tree's ids by the running `next_proto_id`), so a `proto_id` matches
+/// exactly one proto. Static protos are checked first (the common case).
+fn resolveProto(root: *const Proto, vm: *const Vm, id: u32) ?*const Proto {
+    if (findProto(root, id)) |p| return p;
+    for (vm.loaded_chunks.items) |lc| if (findProto(lc.chunk.proto, id)) |p| return p;
+    return null;
+}
+
+/// Recompile every runtime-`load`ed chunk recorded in the keyframe (L-2), in load
+/// order, into `vm.loaded_chunks` — regenerating byte-identical protos/ids because
+/// compile is deterministic. Seeds `vm.next_proto_id` from the static `root` first
+/// (matching `Vm.run`/`start`), then compiles each source at the running id base
+/// and renames the root proto so post-restore faults match the live VM. A source
+/// that fails to recompile means a corrupt/incompatible snapshot. Ownership of the
+/// dup'd source mirrors `stdlib/load.zig`: exactly one freer on every path.
+fn recompileLoadedChunks(vm: *Vm, root: *const Proto, loaded: []const schema.LoadedChunk) RestoreError!void {
+    vm.seedProtoIds(root); // ids [0, countProtos(root)) belong to the static tree
+    for (loaded) |lc| {
+        const owned = try vm.gpa.dupeSentinel(u8, lc.source, 0);
+
+        var diags = diag.Diagnostics.init(vm.gpa);
+        defer diags.deinit();
+
+        var tree = parser.parse(vm.gpa, owned, &diags) catch {
+            vm.gpa.free(owned);
+            return error.LoadedChunkRecompileFailed;
+        };
+        defer tree.deinit();
+        if (diags.hasErrors()) {
+            vm.gpa.free(owned);
+            return error.LoadedChunkRecompileFailed;
+        }
+
+        var chunk = compiler.compileWithOptions(vm.gpa, &vm.heap, owned, tree.root, &diags, .{
+            .known_globals = &interp.builtin_global_names,
+            .id_base = vm.next_proto_id,
+            .vararg_root = true,
+        }) catch {
+            vm.gpa.free(owned);
+            return error.LoadedChunkRecompileFailed;
+        };
+        if (diags.hasErrors()) {
+            chunk.deinit();
+            vm.gpa.free(owned);
+            return error.LoadedChunkRecompileFailed;
+        }
+
+        chunk.proto.name = chunk.arena.allocator().dupe(u8, lc.name) catch {
+            chunk.deinit();
+            vm.gpa.free(owned);
+            return error.OutOfMemory;
+        };
+
+        vm.loaded_chunks.append(vm.gpa, .{ .chunk = chunk, .source = owned }) catch |e| {
+            chunk.deinit();
+            vm.gpa.free(owned);
+            return e;
+        };
+        vm.next_proto_id += chunk.proto_count;
+    }
+}
+
 /// Decode `bytes` and restore them into a fresh VM (see `restoreSnapshot`).
 pub fn restore(
     gpa: std.mem.Allocator,
@@ -407,9 +494,30 @@ pub fn restoreSnapshot(
     defer idmap.deinit();
     try idmap.ensureTotalCapacity(@intCast(kf.objects.len));
 
-    // --- Pass 1: create every object shell, stamped with its original id. ---
+    // Advance the id counter past every restored id BEFORE recompiling loaded
+    // chunks (L-2): a loaded chunk whose closure was collected has no string
+    // objects in the snapshot, so recompiling it re-interns those literals as
+    // fresh heap strings — which must take ids ABOVE the restored range, never
+    // collide with a restored id. (Reachable loaded chunks keep their literals in
+    // the snapshot; recompile reuses them via interning, allocating nothing new.)
     var max_id: u32 = 0;
+    for (kf.objects) |o| max_id = @max(max_id, o.id);
+    // If the restored ids already fill the u32 space, recompiling a loaded chunk
+    // (which allocates fresh interned strings via `link`) would wrap the counter
+    // and collide with a restored id. Reject rather than silently alias. (The
+    // engine assumes < 2³² live objects everywhere; this only bites if a snapshot
+    // both names the top id AND carries loaded chunks to recompile.)
+    if (max_id == std.math.maxInt(u32) and kf.loaded_chunks.len > 0)
+        return error.IdSpaceExhausted;
+    vm.heap.adoptNextId(max_id +| 1);
+
+    // --- Pass 1a: create every object shell EXCEPT closures, stamped with its
+    // original id. Strings are interned first so the recompile below reuses them
+    // (same bytes → same object → same id) rather than minting new ids. Closures
+    // are deferred to pass 1b because they bind a proto that may live in a loaded
+    // chunk not yet recompiled. ---
     for (kf.objects) |o| {
+        if (o.body == .HeapClosure) continue; // deferred to 1b
         if (idmap.contains(o.id)) return error.DuplicateId;
         const header: *GcHeader = switch (o.body) {
             .HeapString => |hs| blk: {
@@ -418,7 +526,15 @@ pub fn restoreSnapshot(
                 // can de-intern it. NOT `heap.intern` — that auto-links a counter id.
                 const s = try string.String.create(gpa, hs.bytes);
                 errdefer s.destroy(gpa);
-                try vm.heap.interned.put(gpa, s.bytes(), s);
+                // A valid snapshot interns one String per byte-sequence, so these
+                // bytes must be unseen. A corrupt snapshot with two strings sharing
+                // bytes (different ids) would overwrite the first mapping here and
+                // leave both objects linked — silently breaking the interning
+                // invariant. Reject it instead.
+                const gop = try vm.heap.interned.getOrPut(gpa, s.bytes());
+                // `errdefer s.destroy` above frees `s` on this error return.
+                if (gop.found_existing) return error.DuplicateInternedString;
+                gop.value_ptr.* = s;
                 vm.heap.linkRestored(&s.header, o.id);
                 break :blk &s.header;
             },
@@ -427,12 +543,7 @@ pub fn restoreSnapshot(
                 vm.heap.linkRestored(&t.header, o.id);
                 break :blk &t.header;
             },
-            .HeapClosure => |hc| blk: {
-                const proto = findProto(root, hc.proto_id) orelse return error.UnknownProto;
-                const cl = try function.Closure.create(gpa, proto, hc.upvalue_ids.len);
-                vm.heap.linkRestored(&cl.header, o.id);
-                break :blk &cl.header;
-            },
+            .HeapClosure => unreachable, // skipped above
             .HeapUpvalue => blk: {
                 // Born closed-and-self-pointing so `ptr` is never dangling; pass 2
                 // sets the value, and the root rebind repoints open cells at a slot.
@@ -453,10 +564,28 @@ pub fn restoreSnapshot(
             },
         };
         idmap.putAssumeCapacityNoClobber(o.id, header);
-        max_id = @max(max_id, o.id);
     }
-    // Future allocations must not reuse a restored id.
-    vm.heap.adoptNextId(max_id +| 1);
+
+    // Rebuild the runtime-`load`ed chunk image (L-2): recompile each recorded
+    // source so `resolveProto` can rebind a dynamic `HeapClosure.proto_id` in pass
+    // 1b. Deterministic recompile reproduces the same protos/ids the live VM had;
+    // string literals resolve to the already-interned snapshot strings above.
+    try recompileLoadedChunks(vm, root, kf.loaded_chunks);
+
+    // --- Pass 1b: create closure shells now that all protos (static + loaded)
+    // exist. linkRestored stamps the original id (the counter was already advanced
+    // past it). ---
+    for (kf.objects) |o| {
+        const hc = switch (o.body) {
+            .HeapClosure => |hc| hc,
+            else => continue,
+        };
+        if (idmap.contains(o.id)) return error.DuplicateId;
+        const proto = resolveProto(root, vm, hc.proto_id) orelse return error.UnknownProto;
+        const cl = try function.Closure.create(gpa, proto, hc.upvalue_ids.len);
+        vm.heap.linkRestored(&cl.header, o.id);
+        idmap.putAssumeCapacityNoClobber(o.id, &cl.header);
+    }
 
     // --- Pass 2: wire inter-object edges (all shells now exist). ---
     for (kf.objects) |o| {
@@ -624,6 +753,7 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
                 .{ .closure_id = 6, .pc = 2, .base = 5, .ret_dest = 1, .ret_count = 1 },
             },
             .open_upvalues = &.{.{ .stack_index = 0, .upvalue_id = 5 }},
+            .loaded_chunks = &.{},
         },
     };
 
@@ -914,6 +1044,78 @@ test "restore is the exact inverse of capture (byte-identical re-snapshot)" {
         \\local logged = setmetatable({}, { __newindex = function(t, k, v) rawset(t, k, v) end })
         \\result = { o = o, logged = logged }
     );
+    // L-2: a live `load` closure reachable from globals. The keyframe carries the
+    // chunk's source; restore recompiles it deterministically to the same proto/id,
+    // so the serialized `HeapClosure.proto_id` resolves and the re-snapshot matches.
+    // No string literals → nothing extra in the constant pool.
+    try expectRoundTrip(
+        \\f = load("return 6 * 7")
+    );
+    // L-2: a loaded chunk WITH a string-literal constant. The literal is interned
+    // into the heap and is reachable through the closure's proto constants (the
+    // walk mirrors `gc.markProtoConstants`), so it serializes as an object with its
+    // own id. Restore re-interns the *same* bytes (pass 1a) BEFORE recompiling, so
+    // the recompiled proto reuses that restored string rather than minting a new id
+    // — the interning invariant (one String per byte-sequence) holds across restore.
+    try expectRoundTrip(
+        \\greet = load("return 'hello, lune'")
+    );
+    // L-2: two loaded chunks, exercising the running `next_proto_id` offset across
+    // chunks (chunk 2's ids start past chunk 1's). The second is vararg-bodied and
+    // multi-proto (a nested function), so its proto subtree must also re-offset to
+    // the identical id range on restore.
+    try expectRoundTrip(
+        \\a = load("return 1")
+        \\b = load("local function inner(x) return x + ... end return inner")
+    );
+}
+
+test "restore reanimates a live load closure that runs with the same result (L-2)" {
+    const gpa = testing.allocator;
+    const source =
+        \\f = load("local a, b = ...\nreturn a * b + 1")
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    // Sanity: the live VM owns exactly the one loaded chunk.
+    try testing.expectEqual(@as(usize, 1), vm.loaded_chunks.items.len);
+
+    const b0 = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(b0);
+
+    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    defer {
+        vm2.deinit();
+        gpa.destroy(vm2);
+    }
+
+    // The loaded chunk was recompiled on restore.
+    try testing.expectEqual(@as(usize, 1), vm2.loaded_chunks.items.len);
+
+    // The restored closure is callable and computes the same vararg result:
+    // (6 * 7) + 1 == 43.
+    const key = try vm2.heap.internValue("f");
+    const f = vm2.globals.get(key);
+    try testing.expect(f.isHeap() and f.heapType() == .function);
+    var out: [1]Value = undefined;
+    const n = try vm2.callValue(f, &.{ Value.int(6), Value.int(7) }, out[0..]);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(i64, 43), out[0].asInt());
 }
 
 test "restore rebuilds globals, ids, and a reachable value graph" {
@@ -1144,6 +1346,7 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
                 .{ .closure_id = 6, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0 },
             },
             .open_upvalues = &.{.{ .stack_index = 0, .upvalue_id = 5 }},
+            .loaded_chunks = &.{},
         },
     };
 
@@ -1215,6 +1418,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .stack = &.{},
         .frames = &.{},
         .open_upvalues = &.{},
+        .loaded_chunks = &.{},
     } }, &rootp, error.UnresolvedHeapRef);
 
     // A closure naming a proto id the program image does not contain.
@@ -1225,6 +1429,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .stack = &.{},
         .frames = &.{},
         .open_upvalues = &.{},
+        .loaded_chunks = &.{},
     } }, &rootp, error.UnknownProto);
 
     // A native whose name is not in the registry.
@@ -1235,6 +1440,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .stack = &.{},
         .frames = &.{},
         .open_upvalues = &.{},
+        .loaded_chunks = &.{},
     } }, &rootp, error.UnknownNative);
 
     // globals_id resolves to a string, not a table.
@@ -1245,6 +1451,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .stack = &.{},
         .frames = &.{},
         .open_upvalues = &.{},
+        .loaded_chunks = &.{},
     } }, &rootp, error.GlobalsNotATable);
 
     // Two objects sharing an id.
@@ -1258,6 +1465,7 @@ test "restore surfaces specific errors for malformed snapshots" {
         .stack = &.{},
         .frames = &.{},
         .open_upvalues = &.{},
+        .loaded_chunks = &.{},
     } }, &rootp, error.DuplicateId);
 
     // A wrong-version file is rejected outright.
@@ -1268,7 +1476,41 @@ test "restore surfaces specific errors for malformed snapshots" {
         .stack = &.{},
         .frames = &.{},
         .open_upvalues = &.{},
+        .loaded_chunks = &.{},
     } }, &rootp, error.UnsupportedVersion);
+
+    // L-2: two HeapStrings carrying identical bytes under distinct ids. A valid
+    // snapshot interns one String per byte-sequence, so this is corrupt — restore
+    // must reject it rather than overwrite the interning map and leave both linked.
+    try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
+        .globals_id = 0,
+        .string_metatable_id = 0,
+        .objects = &.{
+            .{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "dup" } } },
+            .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "dup" } } },
+        },
+        .stack = &.{},
+        .frames = &.{},
+        .open_upvalues = &.{},
+        .loaded_chunks = &.{},
+    } }, &rootp, error.DuplicateInternedString);
+
+    // L-2: the restored id space is exhausted (an object names the top u32 id) AND
+    // the snapshot carries a loaded chunk to recompile — recompiling would allocate
+    // fresh interned strings that wrap the counter into the restored range. Reject.
+    try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
+        .globals_id = 0,
+        .string_metatable_id = 0,
+        .objects = &.{.{ .id = std.math.maxInt(u32), .obj_type = 1, .body = .{ .HeapTable = .{
+            .array = &.{},
+            .entries = &.{},
+            .metatable_id = 0,
+        } } }},
+        .stack = &.{},
+        .frames = &.{},
+        .open_upvalues = &.{},
+        .loaded_chunks = &.{.{ .source = "return 1", .name = "(load)" }},
+    } }, &rootp, error.IdSpaceExhausted);
 }
 
 // ---------------------------------------------------------------------------
@@ -1531,6 +1773,7 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
             .{ .closure_id = 1, .pc = 0, .base = 2, .ret_dest = 0, .ret_count = 0 }, // gap: expected base 1
         },
         .open_upvalues = &.{},
+        .loaded_chunks = &.{},
     } };
     try expectRestoreError(bad, &rootp, error.FrameWindowMismatch);
 }

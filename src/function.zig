@@ -159,6 +159,13 @@ pub const EffectKind = enum(u8) {
     /// `argv(i)` — the i-th command-line argument (heap string, or nil if the
     /// index is out of range). `clock`-style; carries inline string bytes.
     argv = 4,
+    /// `loadfile`/`dofile` file content — a file read is a nondeterministic input
+    /// (the filesystem differs between machines/runs). `clock`-style (the read is
+    /// the boundary): the result is the file's **bytes as a heap string**, or `nil`
+    /// if the file could not be opened, so the effect log carries inline string
+    /// bytes for this kind too (like `getenv`/`argv`). The *path* is ordinary
+    /// program data — only the content is the effect.
+    file_read = 5,
 };
 
 pub const Native = struct {

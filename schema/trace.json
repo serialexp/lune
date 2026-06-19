@@ -171,15 +171,24 @@
       ]
     },
 
+    "LoadedChunk": {
+      "description": "One runtime-`load`ed chunk's recompile inputs (L-2): its source text and the chunk name it was loaded under. Restore re-parses + re-compiles `source` (compile is deterministic) and renames the root proto to `name`, so a live `load` closure — and any post-restore fault it raises — is byte-identical to the pre-snapshot VM.",
+      "sequence": [
+        { "name": "source", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" },
+        { "name": "name",   "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" }
+      ]
+    },
+
     "Keyframe": {
-      "description": "A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture.",
+      "description": "A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.",
       "sequence": [
         { "name": "globals_id",    "type": "uint32" },
         { "name": "string_metatable_id", "type": "uint32" },
         { "name": "objects",       "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "HeapObject" } },
         { "name": "stack",         "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "SnapValue" } },
         { "name": "frames",        "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "FrameRef" } },
-        { "name": "open_upvalues", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "OpenUpvalueRef" } }
+        { "name": "open_upvalues", "type": "array", "kind": "length_prefixed", "length_type": "uint16", "items": { "type": "OpenUpvalueRef" } },
+        { "name": "loaded_chunks", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "LoadedChunk" } }
       ]
     },
 

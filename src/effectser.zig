@@ -31,8 +31,11 @@ pub const schema = @import("gen/trace_schema.zig");
 /// the trace and keyframe versions — a distinct record family sharing only the
 /// binschema *encoding* (docs/design/04 "two artifacts, one substrate"; this is a
 /// third). v2: results are `EffectResult` (scalars + inline string bytes), so the
-/// log can carry `getenv`/`argv` string results (v1 was scalars only).
-pub const effect_format_version: u32 = 2;
+/// log can carry `getenv`/`argv` string results (v1 was scalars only). v3 (L-3):
+/// the `file_read` kind (ordinal 5) joins the kind space — no result-format change
+/// (it reuses the inline-string `EffectResult` like `getenv`), but the expanded
+/// valid-kind set gets its own version so a v2 reader rejects a v3 log explicitly.
+pub const effect_format_version: u32 = 3;
 
 /// Errors from encoding/decoding an effect log.
 pub const DecodeError = error{
@@ -43,10 +46,45 @@ pub const DecodeError = error{
     /// An effect result was a heap value that isn't a string (a table/closure).
     /// Effects only ever return scalars or strings, so this is a serializer bug.
     UnsupportedEffectResult,
+    /// A decoded effect's result type doesn't match what its kind can ever produce
+    /// (e.g. a `file_read`/`getenv` result that isn't nil-or-string, or a `clock`/
+    /// `argc`/`random_seed` result that isn't an int). A well-formed log this code
+    /// wrote never trips this; it guards a corrupt or hand-edited log so replay
+    /// rejects it cleanly here at the decode boundary instead of a downstream
+    /// consumer unwrapping the wrong type and panicking (e.g. `loadfile`'s
+    /// `strBytes(content).?`). The kind→result-type invariant every replay consumer
+    /// relies on is established exactly once, here.
+    MismatchedEffectResult,
     /// binschema decode failure (truncated / malformed bytes).
     Malformed,
     OutOfMemory,
 };
+
+/// The result-type a given effect kind can ever carry, so the decoder can reject a
+/// corrupt log whose result type contradicts its kind. `scalar` covers the numeric
+/// inputs (`clock` nanoseconds, `argc` count, `random_seed` bit-cast u64 — int in
+/// practice, but the `EffectResult` codec also round-trips float, so the gate stays
+/// at "a number", never nil/heap); `string_or_nil` covers the inline-string inputs
+/// (`getenv`/`argv`/`file_read`, where nil = absent/unopenable). The string case is
+/// the one with teeth: it is what lets a replay consumer do `strBytes(result).?`
+/// without a corrupt log turning into a panic. Exhaustive over `EffectKind` so a
+/// newly added kind forces a deliberate classification here.
+fn resultShapeOf(kind: EffectKind) enum { scalar, string_or_nil } {
+    return switch (kind) {
+        .clock, .random_seed, .argc => .scalar,
+        .getenv, .argv, .file_read => .string_or_nil,
+    };
+}
+
+/// Validate that `result` matches the shape `kind` can ever produce (see
+/// `resultShapeOf`). Returns `MismatchedEffectResult` on a contradiction.
+fn checkResultShape(kind: EffectKind, result: Value) DecodeError!void {
+    const ok = switch (resultShapeOf(kind)) {
+        .scalar => result.tag == .int or result.tag == .float,
+        .string_or_nil => result.tag == .nil or (result.isHeap() and result.heapType() == .string),
+    };
+    if (!ok) return error.MismatchedEffectResult;
+}
 
 /// Serialize an ordered effect log to bytes (binschema wire format). The result
 /// is owned by the caller (`gpa.free`). String results (`getenv`/`argv`) are
@@ -81,7 +119,11 @@ pub fn decodeFile(gpa: std.mem.Allocator, heap: *gc.Heap, bytes: []const u8) Dec
     errdefer gpa.free(out);
     for (file.effects, 0..) |we, i| {
         const kind = std.enums.fromInt(EffectKind, we.kind) orelse return error.UnknownEffectKind;
-        out[i] = .{ .kind = kind, .result = try fromEffectResult(heap, we.result) };
+        const result = try fromEffectResult(heap, we.result);
+        // Establish the kind→result-type invariant once, here at the trust
+        // boundary, so no replay consumer has to re-check (or panic on a corrupt log).
+        try checkResultShape(kind, result);
+        out[i] = .{ .kind = kind, .result = result };
     }
     return out;
 }
@@ -229,6 +271,31 @@ test "an unknown effect kind is rejected" {
     const bytes = try file.encode(gpa);
     defer gpa.free(bytes);
     try testing.expectError(error.UnknownEffectKind, decodeFile(gpa, &heap, bytes));
+}
+
+test "a result whose type contradicts its kind is rejected at decode (corrupt log)" {
+    const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    // file_read (ordinal 5) can only carry nil-or-string; an int result is a corrupt
+    // log that would otherwise reach `loadfile`'s `strBytes(content).?` and panic.
+    {
+        const file: schema.EffectFile = .{ .version = effect_format_version, .effects = &.{
+            .{ .kind = @intFromEnum(EffectKind.file_read), .result = .{ .tag = 2, .body = .{ .ConstInt = .{ .v = 42 } } } },
+        } };
+        const bytes = try file.encode(gpa);
+        defer gpa.free(bytes);
+        try testing.expectError(error.MismatchedEffectResult, decodeFile(gpa, &heap, bytes));
+    }
+    // The mirror image: a scalar kind (clock) carrying a string is equally corrupt.
+    {
+        const file: schema.EffectFile = .{ .version = effect_format_version, .effects = &.{
+            .{ .kind = @intFromEnum(EffectKind.clock), .result = .{ .tag = 4, .body = .{ .ConstString = .{ .v = "nope" } } } },
+        } };
+        const bytes = try file.encode(gpa);
+        defer gpa.free(bytes);
+        try testing.expectError(error.MismatchedEffectResult, decodeFile(gpa, &heap, bytes));
+    }
 }
 
 test "a non-string heap effect result is a serializer-side error" {

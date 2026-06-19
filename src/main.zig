@@ -262,6 +262,12 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // is the program's command line. `getenv`/`argv` are `EnvUnavailable` without it.
     var env_ctx = EnvCtx{ .env = env_map, .argv = argv };
     vm.host_env = .{ .ctx = &env_ctx, .getenv = &hostGetenv, .argCount = &hostArgCount, .arg = &hostArg };
+    // Inject the native filesystem read seam for `loadfile`/`dofile`. `fs_ctx` is a
+    // stack local that outlives `vm.run` below; it owns the most-recent file buffer
+    // (freed at scope exit). `loadfile`/`dofile` are `FsUnavailable` without it.
+    var fs_ctx = FsCtx{ .gpa = gpa, .io = io };
+    defer fs_ctx.deinit();
+    vm.fs_source = .{ .ctx = &fs_ctx, .read = &FsCtx.read };
     // Fill the global `arg` table from the program's command line (load-time host
     // input; keeps the exec core deterministic). `arg[0]` = script path.
     vm.populateArgs(argv) catch |err| {
@@ -421,6 +427,39 @@ fn hostArg(ctx: *anyopaque, i: i64) ?[]const u8 {
     if (i < 0 or i >= self.argv.len) return null;
     return self.argv[@intCast(i)];
 }
+
+/// Backing state for the native `file_read` effect (`loadfile`/`dofile`): the real
+/// filesystem, read through the project's `std.Io` wrapper. Injected as
+/// `Vm.fs_source`. The `FsSource` contract returns bytes valid only for the call
+/// (the native interns them immediately), so we hold the most-recent read in `last`
+/// and free it on the next read and at teardown (`deinit`) — a single reusable
+/// owner, never two live buffers.
+const FsCtx = struct {
+    gpa: std.mem.Allocator,
+    io: lune.io.Io,
+    last: ?[]u8 = null,
+
+    fn read(ctx: *anyopaque, path: []const u8) ?[]const u8 {
+        const self: *FsCtx = @ptrCast(@alignCast(ctx));
+        if (self.last) |b| {
+            self.gpa.free(b);
+            self.last = null;
+        }
+        const bytes = std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            path,
+            self.gpa,
+            lune.io.Io.Limit.limited(lune.io.max_source_bytes),
+        ) catch return null; // missing/unreadable/too-large → Lua's `cannot open`
+        self.last = bytes;
+        return bytes;
+    }
+
+    fn deinit(self: *FsCtx) void {
+        if (self.last) |b| self.gpa.free(b);
+        self.last = null;
+    }
+};
 
 /// Serialize a whole-VM keyframe snapshot to `path` (binschema wire format).
 fn emitKeyframe(gpa: std.mem.Allocator, io: lune.io.Io, path: []const u8, vm: *lune.interp.Vm) !void {

@@ -251,6 +251,14 @@ pub const Proto = struct {
     /// uses it to correlate a trace with its proto's disassembly. Defaults to 0
     /// so hand-built test protos compile; the compiler overwrites it.
     id: u32 = 0,
+    /// Source text this proto was compiled from, used by the runtime-error path
+    /// (`callSiteAt`/`describeFault`/`backtraceFrames`) to turn a span offset into
+    /// a line number. The whole proto tree of one chunk shares one source slice.
+    /// Defaults empty (hand-built protos / IR paths); the error path falls back to
+    /// `vm.source` when empty. For a runtime-`load`ed chunk this points at the
+    /// VM-owned source copy, so loaded code reports its *own* line numbers rather
+    /// than the main chunk's. Borrows the buffer (which outlives the proto).
+    source: []const u8 = "",
 };
 
 // ---------------------------------------------------------------------------

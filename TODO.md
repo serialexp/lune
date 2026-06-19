@@ -2,6 +2,33 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## `load` / `loadfile` / `dofile` LANDED — deferred follow-ups (June 2026)
+
+The full runtime-compile arc is in (`src/stdlib/load.zig`):
+- **L-1 `load(chunk [, chunkname])`** — string chunk → vararg closure, `(nil, msg)`
+  on syntax error, VM-owned `loaded_chunks` (freed at `Vm.deinit`), globally-unique
+  proto ids via `compiler.Options.id_base`/`vararg_root`, per-proto `source` so
+  faults report the loaded chunk's line/name.
+- **L-2 recompile-on-restore** — a live `load` closure survives snapshot→restore:
+  the keyframe carries each load's source text (`schema.LoadedChunk`) and restore
+  recompiles deterministically (`recompileLoadedChunks`), resolving `proto_id`
+  across static + dynamic trees. Hardened against `DuplicateInternedString` and
+  `IdSpaceExhausted` (Codex review).
+- **L-3 `loadfile`/`dofile`** — file content read via the injected `fs_source` seam
+  and logged as `EffectKind.file_read` (record) / fed back from the log (replay);
+  `effect_format_version` 2→3. `loadfile` → closure or `(nil, "cannot open <path>")`;
+  `dofile` runs the chunk with no args and returns its results, raising on
+  read/compile error.
+
+Deferred:
+- **Reader-function `chunk`** — only the string form is accepted today.
+- **`mode` arg (`"t"`/`"b"`)** — lune has no binary bytecode; `string.dump` is
+  excluded, so only text loading exists. The arg is simply ignored/unsupported.
+- **`env` arg** — lune has no `_ENV` upvalue, so no per-chunk environment.
+- **Per-chunk arena reclamation** — `load` in a loop accumulates `LoadedChunk`s
+  until VM teardown (correct, leak-free per `testing.allocator`, but unbounded
+  within a run). GC-integrated chunk lifetime is a later optimization.
+
 ## `_G` + error ergonomics LANDED (June 2026)
 
 Lua-compat chunk: `_G`, `xpcall` before-unwind handler, `debug.traceback`.

@@ -48,6 +48,12 @@ pub const Error = error{ CompileError, OutOfMemory };
 pub const Chunk = struct {
     arena: std.heap.ArenaAllocator,
     proto: *Proto,
+    /// Number of protos in this chunk's tree (root + nested), i.e. how many ids
+    /// `assignProtoIds` consumed starting at `Options.id_base`. The runtime
+    /// `load` path uses this to advance the VM's global proto-id counter so each
+    /// dynamically-compiled chunk occupies a disjoint id range (serialization
+    /// resolves a `proto_id` to exactly one proto across static + loaded chunks).
+    proto_count: u32 = 0,
 
     pub fn deinit(self: *Chunk) void {
         self.arena.deinit();
@@ -60,6 +66,17 @@ pub const Chunk = struct {
 /// about the lint (most tests) use `compile`, which passes `.{}`.
 pub const Options = struct {
     known_globals: []const []const u8 = &.{},
+    /// First proto id to assign (pre-order, root = `id_base`). Default 0 for the
+    /// static main chunk. The runtime `load` path passes the VM's running proto-id
+    /// counter so loaded chunks get a disjoint id range — required so a serialized
+    /// closure's `proto_id` resolves to exactly one proto across all chunks.
+    id_base: u32 = 0,
+    /// Compile the top-level chunk as a **vararg function**, so `...` inside it is
+    /// legal and a call passes extra arguments through as varargs. Default false
+    /// (the CLI main chunk takes its arguments via the `arg` table, not `...`).
+    /// The runtime `load` path sets this true to match Lua, where a loaded chunk
+    /// is vararg and `load("return ...")(1, 2)` yields its arguments.
+    vararg_root: bool = false,
 };
 
 /// Compile a parsed chunk. String literals/names are interned into `heap`.
@@ -97,6 +114,7 @@ pub fn compileWithOptions(
         .source = source,
         .diags = diags,
         .globals_usage = &usage,
+        .is_vararg = opts.vararg_root,
     };
     defer c.deinitScratch();
 
@@ -119,18 +137,22 @@ pub fn compileWithOptions(
         .num_registers = c.max_reg,
         .protos = c.protos.items,
         .name = "main",
+        .is_vararg = c.is_vararg,
     };
     // Assign every proto a stable, unique id (pre-order over the proto tree,
-    // root = 0). This is the proto's serialization identity — a trace's anchor
-    // is stored on disk as `proto.id`, not as the in-memory pointer. Order is
-    // irrelevant; only uniqueness and stability-within-a-compile matter.
-    var next_id: u32 = 0;
-    assignProtoIds(proto, &next_id);
+    // root = `id_base`). This is the proto's serialization identity — a trace's
+    // anchor and a serialized closure name their proto by this id, not by the
+    // in-memory pointer. Order is irrelevant; only uniqueness and stability-
+    // within-a-compile matter. The same pass records `source` on every proto so
+    // the runtime-error path can resolve span offsets to lines against the chunk
+    // this proto actually came from (load support).
+    var next_id: u32 = opts.id_base;
+    assignProtoIds(proto, &next_id, source);
 
     // Moving `arena` is safe: code/constants/proto live in arena *heap* buffers,
     // not in the struct, so the pointers stay valid; only the `c.arena` handle
     // goes stale and we no longer use it.
-    return .{ .arena = arena, .proto = proto };
+    return .{ .arena = arena, .proto = proto, .proto_count = next_id - opts.id_base };
 }
 
 /// Pre-order walk assigning each proto a unique id. `@constCast` is sound: the
@@ -149,10 +171,11 @@ pub fn lineFromOffset(source: []const u8, offset: u32) u32 {
     return line;
 }
 
-fn assignProtoIds(proto: *Proto, next: *u32) void {
+fn assignProtoIds(proto: *Proto, next: *u32, source: []const u8) void {
     proto.id = next.*;
+    proto.source = source;
     next.* += 1;
-    for (proto.protos) |child| assignProtoIds(@constCast(child), next);
+    for (proto.protos) |child| assignProtoIds(@constCast(child), next, source);
 }
 
 /// One `get_global` site recorded during compilation, for the unknown-global

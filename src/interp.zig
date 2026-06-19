@@ -37,6 +37,7 @@ const stdbasic = @import("stdlib/basic.zig");
 const stdstring = @import("stdlib/string.zig");
 const stderrors = @import("stdlib/errors.zig");
 const stddebug = @import("stdlib/debug.zig");
+const stdload = @import("stdlib/load.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -75,6 +76,11 @@ pub const Error = error{
     /// platform environment/args of its own. Replay needs none (the results are in
     /// the log). One error covers all three — they share the single `HostEnv` seam.
     EnvUnavailable,
+    /// A `file_read` effect ran (in `off`/`record` mode) but no `fs_source` was
+    /// injected. Mirrors `EnvUnavailable`: the VM holds no filesystem of its own —
+    /// `loadfile`/`dofile` read through the embedder's `FsSource`. Replay needs none
+    /// (the file content is in the log).
+    FsUnavailable,
     /// Allocation failure (register stack, future heap).
     OutOfMemory,
     /// A lune program raised a VALUE via `error(obj)`/`assert` (or a runtime fault
@@ -168,6 +174,21 @@ pub const HostEnv = struct {
     arg: *const fn (ctx: *anyopaque, i: i64) ?[]const u8,
 };
 
+/// An embedder-supplied filesystem read seam, backing the `file_read` effect
+/// (`loadfile`/`dofile`). The VM holds no filesystem of its own — so it still
+/// compiles to `wasm32-freestanding`, where the host injects a null source (or an
+/// in-memory one). Consulted in `off`/`record`; `replay` reads the file content
+/// from the log and never touches disk. With no source set, `loadfile`/`dofile`
+/// fail with `FsUnavailable`. The returned bytes are **borrowed** (valid only for
+/// the call) — the native interns them into the heap immediately, exactly like
+/// `HostEnv.getenv`. `null` ⇒ the file could not be opened (any reason); the
+/// caller turns that into Lua's `(nil, "cannot open <path>")`. The path is plain
+/// program data, so the source need not record it — only the content is the input.
+pub const FsSource = struct {
+    ctx: *anyopaque,
+    read: *const fn (ctx: *anyopaque, path: []const u8) ?[]const u8,
+};
+
 /// The built-in-native registry descriptor and the module-constant descriptor now
 /// live in `function.zig` (the dependency-light home alongside `NativeFn`/
 /// `EffectKind`), so a stdlib module can declare its own slices without importing
@@ -196,7 +217,7 @@ pub const lune_version = "lune 0.0.0";
 
 pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++
     stdbase.natives ++ stdbasic.natives ++ stdstring.natives ++ stderrors.natives ++
-    stddebug.natives;
+    stddebug.natives ++ stdload.natives;
 
 /// The interpreter's own natives. `print` is pure output; `clock` is the first
 /// nondeterministic input.
@@ -519,6 +540,11 @@ pub const Vm = struct {
     /// wasm host = a null source); `replay` feeds results from the log. No source
     /// set ⇒ `EnvUnavailable`.
     host_env: ?HostEnv = null,
+    /// Embedder-supplied filesystem read seam for `loadfile`/`dofile` (null = none).
+    /// Read in `off`/`record` (`main.zig` native = real disk, the wasm host = a
+    /// null/in-memory source); `replay` feeds file content from the log. No source
+    /// set ⇒ `FsUnavailable`.
+    fs_source: ?FsSource = null,
     /// The VM's PRNG, seeded lazily from the first `random()` call's seed (an
     /// effect). `std.Random.Xoshiro256` is pinned *by name* (not `DefaultPrng`) so
     /// the draw stream is a stable part of the language: a given seed reproduces
@@ -550,6 +576,25 @@ pub const Vm = struct {
     /// restorer rebinds it. Referenced from the VM (not `globals`), so it is
     /// GC-rooted explicitly via `forEachRootHeader`.
     string_metatable: ?*table.Table = null,
+    /// Chunks compiled at runtime by `load`/`loadfile`/`dofile`. A `load` closure
+    /// can outlive the call that created it, so the VM owns each compiled `Chunk`
+    /// (its arena holds the proto tree) plus a NUL-terminated copy of the source
+    /// the protos point at (`Proto.source`, used for error line numbers and, in
+    /// L-2, recompile-on-restore). Freed in `deinit` in append order.
+    loaded_chunks: std.ArrayList(LoadedChunk) = .empty,
+    /// Next proto id to hand out. Seeded to the static chunk's proto count in
+    /// `run`/`start` so every dynamically-`load`ed proto gets a globally-unique id
+    /// across the static + dynamic trees — purely so snapshot serialization can
+    /// resolve a `proto_id` to exactly one proto (the pointer-based JIT ignores
+    /// ids). 0 until seeded.
+    next_proto_id: u32 = 0,
+
+    /// A runtime-compiled chunk owned by the VM: the `Chunk` (whose arena owns the
+    /// proto tree) and the NUL-terminated source the protos borrow.
+    pub const LoadedChunk = struct {
+        chunk: compiler.Chunk,
+        source: [:0]u8,
+    };
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
         var vm = try initBare(gpa);
@@ -622,6 +667,11 @@ pub const Vm = struct {
         self.open_upvalues.deinit(self.gpa);
         self.effect_log.deinit(self.gpa);
         self.safepoint_lines.deinit(self.gpa);
+        for (self.loaded_chunks.items) |*lc| {
+            lc.chunk.deinit();
+            self.gpa.free(lc.source);
+        }
+        self.loaded_chunks.deinit(self.gpa);
         self.heap.deinit();
         self.gpa.free(self.stack);
     }
@@ -706,7 +756,24 @@ pub const Vm = struct {
 
     /// Execute a top-level chunk and return its first returned value (`nil` if it
     /// returns nothing or falls off the end via `halt`).
+    /// Seed `next_proto_id` from the static chunk's proto tree so runtime-`load`ed
+    /// protos receive globally-unique ids. Ids are assigned pre-order from 0, so
+    /// the count of protos equals (max id + 1). Idempotent-ish: takes the max of
+    /// the current counter and the tree's count, so calling it on the main chunk
+    /// after loads have already bumped the counter never lowers it.
+    pub fn seedProtoIds(self: *Vm, proto: *const Proto) void {
+        const count = countProtos(proto);
+        if (count > self.next_proto_id) self.next_proto_id = count;
+    }
+
+    fn countProtos(proto: *const Proto) u32 {
+        var n: u32 = 1;
+        for (proto.protos) |child| n += countProtos(child);
+        return n;
+    }
+
     pub fn run(self: *Vm, proto: *const Proto) Error!Value {
+        self.seedProtoIds(proto);
         if (proto.num_registers > self.stack.len) return Error.StackOverflow;
         @memset(self.stack[0..proto.num_registers], Value.nil());
         // The main chunk runs as a closure with no upvalues. It is GC-linked and
@@ -726,6 +793,7 @@ pub const Vm = struct {
     /// chunk's frame exactly as `run` does. Resume after a `.suspended` by
     /// calling `exec()` again (the cursor is parked in `frames[depth-1]`).
     pub fn start(self: *Vm, proto: *const Proto) Error!ExecOutcome {
+        self.seedProtoIds(proto);
         if (proto.num_registers > self.stack.len) return Error.StackOverflow;
         @memset(self.stack[0..proto.num_registers], Value.nil());
         const top = try self.heap.newClosure(proto, 0);
@@ -749,12 +817,17 @@ pub const Vm = struct {
         const is_top = idx == self.depth - 1;
         const pc: usize = if (is_top) f.pc else f.pc -| 1;
         const span: bytecode.Span = if (pc < proto.spans.len) proto.spans[pc] else .{};
+        // Resolve the line against the proto's *own* source when it has one (a
+        // runtime-`load`ed chunk), falling back to the VM's main source for
+        // statically-compiled / hand-built protos. Without this, errors raised
+        // inside loaded code would report line numbers against the main chunk.
+        const src = if (proto.source.len > 0) proto.source else self.source;
         return .{
             .proto = proto,
             .base = f.base,
             .pc = pc,
             .span = span,
-            .line = compiler.lineFromOffset(self.source, span.start),
+            .line = compiler.lineFromOffset(src, span.start),
         };
     }
 
@@ -914,7 +987,9 @@ pub const Vm = struct {
         const instr = proto.code[pc];
         const regs = self.stack[frame.base .. frame.base + proto.num_registers];
         const span: bytecode.Span = if (pc < proto.spans.len) proto.spans[pc] else .{};
-        const line = compiler.lineFromOffset(source, span.start);
+        // Per-proto source so a fault inside a `load`ed chunk reports its own line.
+        const leaf_src = if (proto.source.len > 0) proto.source else source;
+        const line = compiler.lineFromOffset(leaf_src, span.start);
 
         const message: []const u8 = switch (err) {
             Error.StackOverflow => try arena.dupe(u8, "stack overflow"),
@@ -972,9 +1047,12 @@ pub const Vm = struct {
             const fp = f.closure.proto;
             const fpc: usize = if (i == self.depth - 1) f.pc else f.pc -| 1;
             const fspan: bytecode.Span = if (fpc < fp.spans.len) fp.spans[fpc] else .{};
+            // Per-proto source (a `load`ed chunk reports its own lines), falling
+            // back to the passed source for statically-compiled protos.
+            const fsrc = if (fp.source.len > 0) fp.source else source;
             frames[self.depth - 1 - i] = .{
                 .name = fp.name,
-                .line = compiler.lineFromOffset(source, fspan.start),
+                .line = compiler.lineFromOffset(fsrc, fspan.start),
                 .start = fspan.start,
                 .end = fspan.end,
             };
@@ -1342,8 +1420,11 @@ pub const Vm = struct {
             // above is *not* gated: it must count every instruction in both modes
             // so replay cuts land identically (keyframeser reads it as the total).
             if (mode == .full and self.record_safepoint_lines) {
+                // Per-proto source so a safepoint inside a `load`ed chunk maps to
+                // its own line (deterministic: a pure function of proto + source).
+                const sp_src = if (proto.source.len > 0) proto.source else self.source;
                 const sp_line: u32 = if (pc < proto.spans.len)
-                    compiler.lineFromOffset(self.source, proto.spans[pc].start)
+                    compiler.lineFromOffset(sp_src, proto.spans[pc].start)
                 else
                     0;
                 try self.safepoint_lines.append(self.gpa, sp_line);
@@ -2409,6 +2490,9 @@ fn narrowError(e: anyerror) Error {
         // `getenv`/`argc`/`argv` go through `performEffect`, which narrows their
         // native errors — so the missing-source signal must survive the round-trip.
         error.EnvUnavailable => Error.EnvUnavailable,
+        // `loadfile`/`dofile` drive the `file_read` effect from inside their
+        // native (via `obtainFileRead`), so the missing-source signal narrows here.
+        error.FsUnavailable => Error.FsUnavailable,
         error.EffectLogExhausted => Error.EffectLogExhausted,
         error.EffectKindMismatch => Error.EffectKindMismatch,
         else => Error.HostError,
@@ -2439,6 +2523,7 @@ pub fn catchable(e: Error) bool {
         Error.ClockUnavailable,
         Error.RandomUnavailable,
         Error.EnvUnavailable,
+        Error.FsUnavailable,
         => false,
     };
 }
@@ -2521,6 +2606,29 @@ fn obtainRandomSeed(self: *Vm) Error!u64 {
             const v = try nextLoggedEffect(self, .random_seed);
             return @bitCast(v.asInt());
         },
+    }
+}
+
+/// Read a file's content through the `file_read` record/replay boundary, for
+/// `loadfile`/`dofile`. In `off`/`record` it reads the injected `fs_source` (else
+/// `FsUnavailable`) and, in `record`, logs the result once as `.file_read`. In
+/// `replay` it reads the content back from the log and never touches disk. The
+/// result is an interned heap **string** of the file bytes, or `nil` if the file
+/// could not be opened (the caller turns that into Lua's `cannot open` message).
+/// Public so the `loadfile`/`dofile` natives (stdlib/load.zig) can drive it — the
+/// call site is the effect boundary, exactly like `clock`/`getenv`.
+pub fn obtainFileRead(self: *Vm, path: []const u8) Error!Value {
+    switch (self.effect_mode) {
+        .off, .record => {
+            const src = self.fs_source orelse return Error.FsUnavailable;
+            const result = if (src.read(src.ctx, path)) |bytes|
+                try self.heap.internValue(bytes)
+            else
+                Value.nil();
+            if (self.effect_mode == .record) try logEffect(self, .file_read, result);
+            return result;
+        },
+        .replay => return nextLoggedEffect(self, .file_read),
     }
 }
 
@@ -3365,6 +3473,93 @@ test "errmsg: an unconverted (pure) native still names the function, located" {
     try expectProgram(
         "print(pcall(function() return math.floor(\"x\") end))\n",
         "false\tanonymous:1: bad argument to 'floor'\n",
+    );
+}
+
+// --- load (chunk L-1): runtime compilation -----------------------------------
+// `load` compiles a source string into a closure at runtime. It is a pure
+// function of the source bytes (no host effect), so every program below runs
+// byte-identical across all modes via `expectProgram`. A `load` native is a
+// trace barrier like any native, so the compile never perturbs the JIT.
+
+test "load: compiles and runs a returning chunk" {
+    try expectProgram(
+        "local f = load(\"return 6 * 7\"); print(f())\n",
+        "42\n",
+    );
+}
+
+test "load: loaded chunk sees globals and prints" {
+    try expectProgram(
+        \\local f = load("print('hi from load')")
+        \\f()
+        \\
+    ,
+        "hi from load\n",
+    );
+}
+
+test "load: a syntax error returns (nil, message) rather than raising" {
+    try expectProgram(
+        "local f, e = load(\"return ++\"); print(f, type(e))\n",
+        "nil\tstring\n",
+    );
+}
+
+test "load: the error message carries the chunk name and line" {
+    try expectProgram(
+        "local f, e = load(\"return ++\"); print(e)\n",
+        "(load):1: expected an expression\n",
+    );
+}
+
+test "load: an explicit chunk name appears in the error message" {
+    try expectProgram(
+        "local f, e = load(\"x x\", \"mychunk\"); print(e)\n",
+        "mychunk:1: expected a statement (assignment or call)\n",
+    );
+}
+
+test "load: a runtime fault in loaded code reports the loaded chunk's line" {
+    try expectProgram(
+        \\local f = load("local x = 1\nreturn nil + x")
+        \\print(pcall(f))
+        \\
+    ,
+        "false\t(load):2: attempt to perform arithmetic on a nil value\n",
+    );
+}
+
+test "load: a single-result call yields only the closure (primary projection)" {
+    try expectProgram(
+        "print(type(load(\"return 1\")))\n",
+        "function\n",
+    );
+}
+
+test "load: passing a non-string chunk raises a bad-argument error" {
+    try expectProgram(
+        "print(pcall(function() return load(42) end))\n",
+        "false\tanonymous:1: bad argument #1 to 'load' (string expected, got number)\n",
+    );
+}
+
+test "load: a pathologically long chunk name degrades to a fixed message, never panics" {
+    // The error formatter writes into a fixed 512-byte buffer; a longer name must
+    // fall back to a literal rather than hitting `catch unreachable` (reviewer ask).
+    try expectProgram(
+        "local f, e = load(\"x x\", string.rep(\"a\", 600)); print(f, e)\n",
+        "nil\tcompile error\n",
+    );
+}
+
+test "load: a loaded chunk is vararg — arguments arrive through ..." {
+    try expectProgram(
+        \\local add = load("local a, b = ...\nreturn a + b")
+        \\print(add(2, 3), add(10, 20))
+        \\
+    ,
+        "5\t30\n",
     );
 }
 
@@ -4666,6 +4861,178 @@ test "env: replay feeds back a logged string result without calling the native" 
 
     try compileRun(gpa, &vm, "print(getenv(\"IGNORED\"))");
     try testing.expectEqualStrings("REPLAYED\n", sink.buffered());
+}
+
+// ---------------------------------------------------------------------------
+// L-3 — `loadfile`/`dofile` + the `file_read` effect. A file read is a
+// nondeterministic input (the filesystem differs between machines/runs), so the
+// content rides the record/replay boundary exactly like `getenv`/`argv`: a heap
+// string (or nil) logged on record, fed back on replay (the path is plain program
+// data — only the content is the effect). These tests prove (1) `loadfile`/`dofile`
+// work against an injected FS, (2) a record→serialize→replay round-trip reproduces
+// the output with the FS DETACHED on replay (so the content provably came from the
+// log, not disk), (3) a missing file is `(nil, msg)` for `loadfile` and a *raise*
+// for `dofile`, and (4) no injected source is a clear `FsUnavailable`.
+// ---------------------------------------------------------------------------
+
+/// A deterministic in-memory filesystem for the `file_read` effect: a fixed map of
+/// path → content. Any unknown path reads as `null` (couldn't open). Injected as a
+/// `FsSource` so tests never touch the real disk.
+const FakeFs = struct {
+    entries: []const struct { path: []const u8, content: []const u8 },
+    fn readFn(ctx: *anyopaque, path: []const u8) ?[]const u8 {
+        const self: *FakeFs = @ptrCast(@alignCast(ctx));
+        for (self.entries) |e| if (std.mem.eql(u8, e.path, path)) return e.content;
+        return null;
+    }
+    fn source(self: *FakeFs) FsSource {
+        return .{ .ctx = self, .read = &FakeFs.readFn };
+    }
+};
+
+test "L-3: loadfile reads + compiles a file via the file_read effect (record)" {
+    const gpa = testing.allocator;
+    var ffs = FakeFs{ .entries = &.{
+        .{ .path = "lib.lua", .content = "return 6 * 7" },
+    } };
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.effect_mode = .record;
+    vm.fs_source = ffs.source();
+
+    try compileRun(gpa, &vm,
+        \\local f = loadfile("lib.lua")
+        \\print(f())
+    );
+    try testing.expectEqualStrings("42\n", sink.buffered());
+    // Exactly one file_read effect logged (the single loadfile read).
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+    try testing.expectEqual(EffectKind.file_read, vm.effect_log.items[0].kind);
+}
+
+test "L-3: dofile runs the file and returns its results (record)" {
+    const gpa = testing.allocator;
+    var ffs = FakeFs{ .entries = &.{
+        .{ .path = "answer.lua", .content = "local a, b = ...\nreturn 40 + 2, 'ok'" },
+    } };
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.effect_mode = .record;
+    vm.fs_source = ffs.source();
+
+    try compileRun(gpa, &vm,
+        \\print(dofile("answer.lua"))
+    );
+    // dofile runs the chunk with no args; the chunk returns two values.
+    try testing.expectEqualStrings("42\tok\n", sink.buffered());
+}
+
+test "L-3: record→serialize→replay reproduces output with the FS detached" {
+    const gpa = testing.allocator;
+    const effectser = @import("effectser.zig");
+    // `add.lua` is a vararg chunk loaded by `loadfile` and then called with args;
+    // `const.lua` is run directly by `dofile`. Two distinct file_read effects.
+    var ffs = FakeFs{ .entries = &.{
+        .{ .path = "add.lua", .content = "local a, b = ...\nreturn a + b" },
+        .{ .path = "const.lua", .content = "return 100" },
+    } };
+    const driver: [:0]const u8 =
+        \\print(loadfile("add.lua")(3, 4))
+        \\print(dofile("const.lua"))
+    ;
+
+    // --- record: run against the in-memory FS, capture output + serialized log ---
+    var rec_out_buf: [128]u8 = undefined;
+    var log_bytes: []u8 = undefined;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var sink = io.Writer.fixed(&rec_out_buf);
+        vm.out = &sink;
+        vm.effect_mode = .record;
+        vm.fs_source = ffs.source();
+        try compileRun(gpa, &vm, driver);
+        // Two file reads (loadfile + dofile), both file_read effects.
+        try testing.expectEqual(@as(usize, 2), vm.effect_log.items.len);
+        try testing.expectEqual(EffectKind.file_read, vm.effect_log.items[0].kind);
+        try testing.expectEqual(EffectKind.file_read, vm.effect_log.items[1].kind);
+        log_bytes = try effectser.encodeFile(gpa, vm.effect_log.items);
+    }
+    defer gpa.free(log_bytes);
+
+    // --- replay: a fresh VM with NO fs_source. The serialized log is decoded into
+    // its heap and fed back; if any read reached for disk it would be FsUnavailable
+    // (no source) — so byte-identical output proves the content came from the log. ---
+    var rep_out_buf: [128]u8 = undefined;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var sink = io.Writer.fixed(&rep_out_buf);
+        vm.out = &sink;
+        const log = try effectser.decodeFile(gpa, &vm.heap, log_bytes);
+        defer gpa.free(log);
+        try vm.effect_log.appendSlice(gpa, log);
+        vm.effect_mode = .replay;
+        // No fs_source set on purpose.
+        try compileRun(gpa, &vm, driver);
+    }
+    // loadfile("add.lua")(3,4) = 7; dofile("const.lua") = 100.
+    try testing.expectEqualStrings("7\n100\n", rep_out_buf[0..6]);
+    // Record and replay produced byte-identical output.
+    try testing.expectEqualStrings(rep_out_buf[0..6], rec_out_buf[0..6]);
+}
+
+test "L-3: loadfile of a missing file is (nil, msg); dofile raises" {
+    const gpa = testing.allocator;
+    var ffs = FakeFs{ .entries = &.{} }; // empty FS: every path is missing
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.effect_mode = .record;
+    vm.fs_source = ffs.source();
+
+    try compileRun(gpa, &vm,
+        \\local f, e = loadfile("nope.lua")
+        \\print(f, e)
+        \\local ok, err = pcall(dofile, "nope.lua")
+        \\print(ok, err)
+    );
+    // loadfile → (nil, "cannot open nope.lua"); dofile raises the same message,
+    // caught by pcall as (false, msg). The message is a function of the path only
+    // (no host errno), so it is deterministic.
+    try testing.expectEqualStrings(
+        "nil\tcannot open nope.lua\nfalse\tcannot open nope.lua\n",
+        sink.buffered(),
+    );
+}
+
+test "L-3: loadfile/dofile with no fs_source injected is FsUnavailable" {
+    const gpa = testing.allocator;
+    inline for (.{ "loadfile(\"x.lua\")", "dofile(\"x.lua\")" }) |s| {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.effect_mode = .record; // no fs_source set
+        try testing.expectError(error.FsUnavailable, compileRun(gpa, &vm, s));
+    }
+}
+
+test "L-3: a non-string path argument is a bad-argument error" {
+    const gpa = testing.allocator;
+    var ffs = FakeFs{ .entries = &.{} };
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.effect_mode = .record;
+    vm.fs_source = ffs.source();
+    // A numeric path raises `bad argument` (raised, not (nil,msg)) — matching Lua.
+    try testing.expectError(error.LuaError, compileRun(gpa, &vm, "loadfile(42)"));
 }
 
 // ---------------------------------------------------------------------------
