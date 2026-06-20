@@ -271,7 +271,17 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // Fill the global `arg` table from the program's command line (load-time host
     // input; keeps the exec core deterministic). `arg[0]` = script path.
     vm.populateArgs(argv) catch |err| {
-        lune.io.eprint("lune: error: populating arg table failed: {s}\n", .{@errorName(err)});
+        // A non-UTF-8 arg raises a located `LuaError` whose message lives in
+        // `pending_error` (load-time, so `describeFault` sees no frame and would
+        // only print the error name) — render the value directly.
+        if (vm.pending_error) |ev| {
+            var fault_arena = std.heap.ArenaAllocator.init(gpa);
+            defer fault_arena.deinit();
+            const msg = lune.interp.Vm.renderErrorValue(ev, fault_arena.allocator()) catch @errorName(err);
+            lune.io.eprint("lune: error: {s}\n", .{msg});
+        } else {
+            lune.io.eprint("lune: error: populating arg table failed: {s}\n", .{@errorName(err)});
+        }
         return 1;
     };
     // `--emit-effects` records the nondeterministic-input log during the run.

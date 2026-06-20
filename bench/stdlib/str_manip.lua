@@ -1,9 +1,10 @@
 -- string slicing / case / build throughput + LuaJIT parity probe.
 --
 -- Exercises the non-pattern string library: sub (with wrapping offsets), upper,
--- lower, reverse, len, byte, char, rep (with a separator). Accumulates an
--- integer checksum over byte values and lengths so output is deterministic and
--- byte-identical to LuaJIT.
+-- lower, reverse, len, codepoint, char, rep (with a separator). Accumulates an
+-- integer checksum over code-point values and lengths so output is deterministic
+-- and byte-identical to LuaJIT (the base string is all-ASCII, so a lune code
+-- point equals a LuaJIT byte).
 --
 --   lune              bench/stdlib/str_manip.lua 100000   # tier-0
 --   lune --jit-native bench/stdlib/str_manip.lua 100000   # tier-1b
@@ -13,7 +14,7 @@
 
 local sub, upper, lower = string.sub, string.upper, string.lower
 local reverse, len = string.reverse, string.len
-local byte, char, rep = string.byte, string.char, string.rep
+local byte, char, rep = string.codepoint, string.char, string.rep
 
 local base = "The quick brown Fox jumps over the lazy Dog 0123456789"
 

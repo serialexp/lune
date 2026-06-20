@@ -941,7 +941,7 @@ const Compiler = struct {
                 _ = try self.emit(Instr.opAB(.load_const, dest, k));
             },
             .string_raw => |raw| {
-                const bytes = try self.decodeString(raw);
+                const bytes = try self.decodeString(raw, e.span);
                 const k = try self.stringConstant(bytes);
                 _ = try self.emit(Instr.opAB(.load_const, dest, k));
             },
@@ -1276,7 +1276,13 @@ const Compiler = struct {
     /// Decode a raw string lexeme (including its surrounding quotes) into bytes,
     /// resolving escape sequences. Allocated in the arena (transient — interning
     /// copies it).
-    fn decodeString(self: *Compiler, raw: []const u8) Error![]const u8 {
+    ///
+    /// S-B (design doc 06): a string literal is **text** and always valid UTF-8 by
+    /// construction. `\u{XXXX}` encodes a Unicode code point to UTF-8; `\xNN` /
+    /// `\ddd` are restricted to **ASCII** (`≤ 0x7F`) — a byte `≥ 0x80` is a compile
+    /// error pointing at `\u{…}` (a code point) or an integer array (a raw byte) —
+    /// and the finished literal is validated as UTF-8. `span` locates diagnostics.
+    fn decodeString(self: *Compiler, raw: []const u8, span: ast.Span) Error![]const u8 {
         std.debug.assert(raw.len >= 2); // at least the two quotes
         const inner = raw[1 .. raw.len - 1];
         var buf: std.ArrayList(u8) = .empty;
@@ -1307,13 +1313,15 @@ const Compiler = struct {
                 '\'' => try buf.append(self.arena, '\''),
                 '\n' => try buf.append(self.arena, '\n'),
                 'x' => {
-                    var val: u8 = 0;
+                    var val: u16 = 0;
                     var digits: usize = 0;
                     while (digits < 2 and i < inner.len and isHex(inner[i])) : (digits += 1) {
                         val = val * 16 + hexValue(inner[i]);
                         i += 1;
                     }
-                    try buf.append(self.arena, val);
+                    if (digits != 2) return self.fail(span, "\\x escape needs exactly two hex digits");
+                    if (val > 0x7F) return self.fail(span, "\\x escape must be ASCII (<= 0x7F); use \\u{...} for a code point or a byte array for a raw byte");
+                    try buf.append(self.arena, @intCast(val));
                 },
                 '0'...'9' => {
                     var val: u16 = esc - '0';
@@ -1322,11 +1330,32 @@ const Compiler = struct {
                         val = val * 10 + (inner[i] - '0');
                         i += 1;
                     }
-                    try buf.append(self.arena, @intCast(val & 0xff));
+                    if (val > 0x7F) return self.fail(span, "\\ddd escape must be ASCII (<= 127); use \\u{...} for a code point or a byte array for a raw byte");
+                    try buf.append(self.arena, @intCast(val));
+                },
+                'u' => {
+                    // `\u{XXXX}` — a Unicode code point encoded to UTF-8.
+                    if (i >= inner.len or inner[i] != '{') return self.fail(span, "\\u must be followed by '{'");
+                    i += 1;
+                    var cp: u32 = 0;
+                    var digits: usize = 0;
+                    while (i < inner.len and isHex(inner[i])) : (digits += 1) {
+                        cp = cp * 16 + hexValue(inner[i]);
+                        i += 1;
+                        if (cp > 0x10FFFF) return self.fail(span, "\\u{...} code point out of range (> 0x10FFFF)");
+                    }
+                    if (digits == 0) return self.fail(span, "\\u{...} needs at least one hex digit");
+                    if (i >= inner.len or inner[i] != '}') return self.fail(span, "\\u{...} missing closing '}'");
+                    i += 1;
+                    var tmp: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(@intCast(cp), &tmp) catch
+                        return self.fail(span, "\\u{...} is not a valid code point (surrogate or out of range)");
+                    try buf.appendSlice(self.arena, tmp[0..n]);
                 },
                 else => try buf.append(self.arena, esc), // unknown escape → literal
             }
         }
+        if (!std.unicode.utf8ValidateSlice(buf.items)) return self.fail(span, "string literal is not valid UTF-8");
         return buf.items;
     }
 
@@ -1639,6 +1668,54 @@ test "string length via #" {
     try testing.expectEqual(@as(i64, 5), (try runScalar(
         \\return #"hello"
     )).asInt());
+}
+
+/// Assert that compiling `src` fails with a located diagnostic (S-B escape
+/// rules). Mirrors the "unsupported construct" setup: parse, then expect
+/// `compile` to return `CompileError` and record an error in the diagnostics.
+fn expectCompileError(src: [:0]const u8) !void {
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parser.parse(testing.allocator, src, &diags);
+    defer tree.deinit();
+    var vm = try interp.Vm.init(testing.allocator);
+    defer vm.deinit();
+    try testing.expectError(Error.CompileError, compile(testing.allocator, &vm.heap, src, tree.root, &diags));
+    try testing.expect(diags.hasErrors());
+}
+
+test "S-B: \\u{} escape decodes to UTF-8 code point" {
+    // \u{E9} → 'é' (U+00E9, 2 UTF-8 bytes); \u{1F600} → '😀' (U+1F600, 4 bytes).
+    var r = try run(
+        \\return "\u{E9}" .. "\u{1F600}"
+    );
+    defer r.deinit();
+    try testing.expectEqualStrings("é😀", string.String.fromHeader(r.value.asHeap()).bytes());
+}
+
+test "S-B: \\xNN and \\ddd are ASCII-only; non-ASCII is a compile error" {
+    // ASCII \x and \ddd still work.
+    var r = try run(
+        \\return "\x41\066"
+    );
+    defer r.deinit();
+    try testing.expectEqualStrings("AB", string.String.fromHeader(r.value.asHeap()).bytes());
+
+    // A byte >= 0x80 via \x or \ddd is rejected (use \u{...} or a byte array).
+    try expectCompileError("return \"\\xFF\"");
+    try expectCompileError("return \"\\200\"");
+
+    // \x needs exactly two hex digits.
+    try expectCompileError("return \"\\x\"");
+    try expectCompileError("return \"\\xA\"");
+    try expectCompileError("return \"\\xG0\"");
+}
+
+test "S-B: \\u{} rejects surrogates and over-range code points" {
+    try expectCompileError("return \"\\u{D800}\""); // lone surrogate
+    try expectCompileError("return \"\\u{110000}\""); // > U+10FFFF
+    try expectCompileError("return \"\\u{}\""); // empty
+    try expectCompileError("return \"\\u{1G}\""); // bad hex
 }
 
 test "function literal: call an anonymous function" {

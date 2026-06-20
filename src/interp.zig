@@ -726,6 +726,15 @@ pub const Vm = struct {
         const v = self.globals.get(try self.heap.internValue("arg"));
         if (!(v.isHeap() and v.heapType() == .table)) return; // installBaseLib guarantees a table
         const tbl = table.Table.fromHeader(v.asHeap());
+        // S-B: command-line arguments are host text and must be valid UTF-8 before
+        // they enter the string heap, so the `arg[]` table (and its keyframe) holds
+        // only valid UTF-8. Validate *all* args first so a malformed later arg leaves
+        // the table untouched rather than half-filled — population is atomic.
+        // Load-time (no Lua frame) → level 0, message verbatim.
+        for (argv) |a| {
+            if (!std.unicode.utf8ValidateSlice(a))
+                return self.raiseLocatedError("command-line argument is not valid UTF-8", 0);
+        }
         for (argv, 0..) |a, idx| {
             try tbl.set(self.gpa, Value.int(@intCast(idx)), try self.heap.internValue(a));
         }
@@ -843,7 +852,7 @@ pub const Vm = struct {
     /// Lua-style: a string is its own bytes, a number its decimal text (both via
     /// `coerceConcat`), and anything else becomes `(error object is a <type> value)`.
     /// `arena` owns the result.
-    fn renderErrorValue(ev: Value, arena: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
+    pub fn renderErrorValue(ev: Value, arena: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
         var nbuf: [64]u8 = undefined;
         if (coerceConcat(ev, &nbuf)) |bytes| {
             return arena.dupe(u8, bytes);
@@ -944,6 +953,21 @@ pub const Vm = struct {
             self.pending_error = try self.heap.internValue(bytes);
         }
         return Error.LuaError;
+    }
+
+    /// S-B (design doc 06): every program-visible string is valid UTF-8. Host
+    /// inputs (`getenv`/`argv`/`file_read`/the `arg[]` table) can supply arbitrary
+    /// bytes, so the host-input boundary validates here and raises a *catchable*
+    /// error on malformed input — mirroring `string.decode`. Determinism: a pure
+    /// function of the bytes, and (for the recorded `getenv`/`argv` effects) called
+    /// on the *logged* result, so `record` (fresh intern) and `replay` (re-intern
+    /// from the log) validate the identical bytes and raise identically. The error
+    /// message embeds no raw bytes (which would itself be a malformed string).
+    fn validateHostText(self: *Vm, v: Value) Error!void {
+        if (!v.isHeap() or v.heapType() != .string) return; // nil / non-string: nothing to check
+        const s = string.String.fromHeader(v.asHeap()).bytes();
+        if (!std.unicode.utf8ValidateSlice(s))
+            return self.raiseLocatedError("host input is not valid UTF-8", 1);
     }
 
     /// Build a located, human-readable description of a runtime error, read from
@@ -2560,15 +2584,21 @@ fn concatable(v: Value) bool {
 /// instruction stream re-executed on replay requests effects in the same order
 /// they were recorded.
 fn performEffect(self: *Vm, kind: EffectKind, nat: *const function.Native, args: []const Value) Error!Value {
-    switch (self.effect_mode) {
-        .off => return nat.func(@ptrCast(self), args) catch |e| return narrowError(e),
-        .record => {
-            const result = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
-            try logEffect(self, kind, result);
-            return result;
+    const result = switch (self.effect_mode) {
+        .off => nat.func(@ptrCast(self), args) catch |e| return narrowError(e),
+        .record => blk: {
+            const r = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
+            try logEffect(self, kind, r);
+            break :blk r;
         },
-        .replay => return nextLoggedEffect(self, kind),
-    }
+        .replay => try nextLoggedEffect(self, kind),
+    };
+    // S-B: string-producing effects (`getenv`, `argv`) are host text and must be
+    // valid UTF-8. Validating *after* logging keeps record/replay in lockstep:
+    // both modes hold the identical bytes here and raise (or pass) identically.
+    // `clock`/`argc`/`random_seed` return ints → `validateHostText` no-ops.
+    try self.validateHostText(result);
+    return result;
 }
 
 /// Append one effect result to the ordered log (record mode). Shared by
@@ -2618,18 +2648,23 @@ fn obtainRandomSeed(self: *Vm) Error!u64 {
 /// Public so the `loadfile`/`dofile` natives (stdlib/load.zig) can drive it — the
 /// call site is the effect boundary, exactly like `clock`/`getenv`.
 pub fn obtainFileRead(self: *Vm, path: []const u8) Error!Value {
-    switch (self.effect_mode) {
-        .off, .record => {
+    const result = switch (self.effect_mode) {
+        .off, .record => blk: {
             const src = self.fs_source orelse return Error.FsUnavailable;
-            const result = if (src.read(src.ctx, path)) |bytes|
+            const r = if (src.read(src.ctx, path)) |bytes|
                 try self.heap.internValue(bytes)
             else
                 Value.nil();
-            if (self.effect_mode == .record) try logEffect(self, .file_read, result);
-            return result;
+            if (self.effect_mode == .record) try logEffect(self, .file_read, r);
+            break :blk r;
         },
-        .replay => return nextLoggedEffect(self, .file_read),
-    }
+        .replay => try nextLoggedEffect(self, .file_read),
+    };
+    // S-B: file content is host text and must be valid UTF-8 (a missing file is a
+    // non-string `nil` → no-op). Validated after logging for the same record/replay
+    // lockstep reason as `performEffect`.
+    try self.validateHostText(result);
+    return result;
 }
 
 /// `clock()` — the canonical first nondeterministic *input* (doc 02). Returns the
@@ -2766,11 +2801,13 @@ pub fn coerceConcat(v: Value, buf: []u8) Error![]const u8 {
     };
 }
 
-/// `#v` — length of a string (bytes) or table (border). Other types error.
+/// `#v` — length of a string (code points, S-B) or table (border). Other types
+/// error. Strings are code-point-native (design doc 06): `#s` reports the number
+/// of Unicode characters via the cached `cp_len`, not the byte length. O(1).
 fn lenOf(v: Value) Error!Value {
     if (v.isHeap()) {
         return switch (v.heapType()) {
-            .string => Value.int(@intCast(string.String.fromHeader(v.asHeap()).len)),
+            .string => Value.int(@intCast(string.String.fromHeader(v.asHeap()).cpLen())),
             .table => Value.int(table.Table.fromHeader(v.asHeap()).length()),
             else => Error.TypeError,
         };
@@ -3481,6 +3518,38 @@ test "errmsg: an unconverted (pure) native still names the function, located" {
 // function of the source bytes (no host effect), so every program below runs
 // byte-identical across all modes via `expectProgram`. A `load` native is a
 // trace barrier like any native, so the compile never perturbs the JIT.
+
+test "string.encode: s:encode() yields a byte array (UTF-8) across all modes" {
+    try expectProgram(
+        \\local b = ("Hi"):encode()
+        \\print(b[1], b[2], #b)
+        \\local e = ("é"):encode()
+        \\print(e[1], e[2], #e)
+        \\
+    ,
+        "72\t105\t2\n195\t169\t2\n",
+    );
+}
+
+test "string.decode: round-trips encode and reads a hand-built byte array" {
+    try expectProgram(
+        \\print(string.decode(("héllo"):encode()) == "héllo")
+        \\print(string.decode({72, 105, 33}))
+        \\
+    ,
+        "true\nHi!\n",
+    );
+}
+
+test "string.decode: malformed UTF-8 is a catchable error" {
+    try expectProgram(
+        \\local ok, msg = pcall(string.decode, {0xA9})
+        \\print(ok, type(msg))
+        \\
+    ,
+        "false\tstring\n",
+    );
+}
 
 test "load: compiles and runs a returning chunk" {
     try expectProgram(
@@ -4560,6 +4629,7 @@ const FakeEnv = struct {
         const self: *FakeEnv = @ptrCast(@alignCast(ctx));
         if (std.mem.eql(u8, name, "HOME")) return self.home;
         if (std.mem.eql(u8, name, "EMPTY")) return ""; // set, but empty — not nil
+        if (std.mem.eql(u8, name, "BADUTF8")) return "\xFF\xFE"; // not valid UTF-8 (S-B boundary)
         return null;
     }
     fn argCountFn(ctx: *anyopaque) i64 {
@@ -4867,6 +4937,184 @@ test "env: replay feeds back a logged string result without calling the native" 
 
     try compileRun(gpa, &vm, "print(getenv(\"IGNORED\"))");
     try testing.expectEqualStrings("REPLAYED\n", sink.buffered());
+}
+
+test "S-B: getenv/argv of non-UTF-8 host bytes raises a catchable error" {
+    const gpa = testing.allocator;
+    // An env with one valid arg and one invalid-UTF-8 arg.
+    var fenv = FakeEnv{ .args = &.{ "prog", "\xFF\xFE" } };
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [512]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.effect_mode = .record;
+    vm.host_env = fenv.source();
+
+    try compileRun(gpa, &vm,
+        \\print(getenv("HOME"))                 -- valid: still works
+        \\print(argv(0))                          -- valid: "prog"
+        \\local ok, e = pcall(getenv, "BADUTF8")  -- invalid env value → catchable error
+        \\print(ok, type(e))
+        \\local ok2, e2 = pcall(argv, 1)          -- invalid arg → catchable error
+        \\print(ok2, type(e2))
+    );
+    // Valid reads pass through; the two invalid reads raise a string error value.
+    try testing.expectEqualStrings(
+        "/home/bart\nprog\nfalse\tstring\nfalse\tstring\n",
+        sink.buffered(),
+    );
+}
+
+test "S-B: a recorded non-UTF-8 getenv replays byte-identically (validate-after-log)" {
+    const gpa = testing.allocator;
+    const src =
+        \\local ok, e = pcall(getenv, "BADUTF8")
+        \\print(ok, type(e))
+    ;
+    // Record: the invalid bytes ARE logged (validation runs after logEffect), the
+    // error is caught by pcall. Capture output + the effect log.
+    var fenv = FakeEnv{};
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var rec_buf: [256]u8 = undefined;
+    var rec_sink = io.Writer.fixed(&rec_buf);
+    vm.out = &rec_sink;
+    vm.effect_mode = .record;
+    vm.host_env = fenv.source();
+    try compileRun(gpa, &vm, src);
+    const recorded = rec_sink.buffered();
+    try testing.expectEqualStrings("false\tstring\n", recorded);
+    // Exactly one getenv effect logged, holding the raw invalid bytes.
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+    try testing.expectEqual(EffectKind.getenv, vm.effect_log.items[0].kind);
+
+    // Replay the same VM's log (string result lives in this heap) with no host_env:
+    // the native is not called, the logged bytes are re-validated → same raise,
+    // same caught error, byte-identical output.
+    vm.effect_mode = .replay;
+    vm.effect_cursor = 0;
+    vm.host_env = null;
+    var rep_buf: [256]u8 = undefined;
+    var rep_sink = io.Writer.fixed(&rep_buf);
+    vm.out = &rep_sink;
+    try compileRun(gpa, &vm, src);
+    try testing.expectEqualStrings(recorded, rep_sink.buffered());
+}
+
+test "S-B: a recorded non-UTF-8 argv replays byte-identically (validate-after-log)" {
+    const gpa = testing.allocator;
+    const src =
+        \\local ok, e = pcall(argv, 1)
+        \\print(ok, type(e))
+    ;
+    // Record: arg 1 is invalid UTF-8. The bytes ARE logged (validation runs after
+    // logEffect), the error is caught by pcall. argv is a distinct EffectKind from
+    // getenv, so it exercises the same performEffect path under a different kind.
+    var fenv = FakeEnv{ .args = &.{ "prog", "\xFF\xFE" } };
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var rec_buf: [256]u8 = undefined;
+    var rec_sink = io.Writer.fixed(&rec_buf);
+    vm.out = &rec_sink;
+    vm.effect_mode = .record;
+    vm.host_env = fenv.source();
+    try compileRun(gpa, &vm, src);
+    const recorded = rec_sink.buffered();
+    try testing.expectEqualStrings("false\tstring\n", recorded);
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+    try testing.expectEqual(EffectKind.argv, vm.effect_log.items[0].kind);
+
+    // Replay the same VM's log with no host_env: the native is not called, the
+    // logged bytes are re-validated → same raise, byte-identical output.
+    vm.effect_mode = .replay;
+    vm.effect_cursor = 0;
+    vm.host_env = null;
+    var rep_buf: [256]u8 = undefined;
+    var rep_sink = io.Writer.fixed(&rep_buf);
+    vm.out = &rep_sink;
+    try compileRun(gpa, &vm, src);
+    try testing.expectEqualStrings(recorded, rep_sink.buffered());
+}
+
+test "S-B: loadfile of non-UTF-8 file content raises a catchable error" {
+    const gpa = testing.allocator;
+    var ffs = FakeFs{ .entries = &.{
+        .{ .path = "good.lua", .content = "return 1" },
+        .{ .path = "bad.lua", .content = "\xFF\xFE" }, // not valid UTF-8
+    } };
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.effect_mode = .record;
+    vm.fs_source = ffs.source();
+
+    try compileRun(gpa, &vm,
+        \\print((loadfile("good.lua"))())     -- valid file still compiles + runs
+        \\print(pcall(loadfile, "bad.lua"))   -- invalid bytes → catchable error
+    );
+    // The valid file returns 1; the bad read raises a string error value caught by pcall.
+    const out = sink.buffered();
+    try testing.expect(std.mem.startsWith(u8, out, "1\nfalse\t"));
+}
+
+test "S-B: a recorded non-UTF-8 loadfile replays byte-identically (validate-after-log)" {
+    const gpa = testing.allocator;
+    const src =
+        \\local ok, e = pcall(loadfile, "bad.lua")
+        \\print(ok, type(e))
+    ;
+    var ffs = FakeFs{ .entries = &.{
+        .{ .path = "bad.lua", .content = "\xFF\xFE" },
+    } };
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var rec_buf: [256]u8 = undefined;
+    var rec_sink = io.Writer.fixed(&rec_buf);
+    vm.out = &rec_sink;
+    vm.effect_mode = .record;
+    vm.fs_source = ffs.source();
+    try compileRun(gpa, &vm, src);
+    const recorded = rec_sink.buffered();
+    try testing.expectEqualStrings("false\tstring\n", recorded);
+    // Exactly one file_read effect logged, holding the raw invalid bytes.
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+    try testing.expectEqual(EffectKind.file_read, vm.effect_log.items[0].kind);
+
+    // Replay the same VM's log with no fs_source:
+    // the logged bytes are re-validated -> same raise, same caught error, byte-identical output.
+    vm.effect_mode = .replay;
+    vm.effect_cursor = 0;
+    vm.fs_source = null;
+    var rep_buf: [256]u8 = undefined;
+    var rep_sink = io.Writer.fixed(&rep_buf);
+    vm.out = &rep_sink;
+    try compileRun(gpa, &vm, src);
+    try testing.expectEqualStrings(recorded, rep_sink.buffered());
+}
+
+test "S-B: populateArgs rejects a non-UTF-8 command-line argument" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // A valid argv populates fine; an invalid one raises before it can enter `arg`.
+    try vm.populateArgs(&.{ "prog", "ok" });
+    try testing.expectError(error.LuaError, vm.populateArgs(&.{ "prog", "\xFF\xFE" }));
+
+    // Atomicity: a malformed *later* arg must leave `arg[]` untouched, not
+    // half-filled. Validate all args first, then mutate. Here arg[0]="prog" is
+    // valid but arg[1] is invalid — the raise happens before any `tbl.set`, so a
+    // fresh VM's `arg` table has neither entry.
+    var vm2 = try Vm.init(gpa);
+    defer vm2.deinit();
+    try testing.expectError(error.LuaError, vm2.populateArgs(&.{ "prog", "\xFF\xFE" }));
+    const argt = vm2.globals.get(try vm2.heap.internValue("arg"));
+    try testing.expect(argt.isHeap() and argt.heapType() == .table);
+    const tbl = table.Table.fromHeader(argt.asHeap());
+    try testing.expect(tbl.get(Value.int(0)).isNil()); // "prog" never entered
+    try testing.expect(tbl.get(Value.int(1)).isNil());
 }
 
 // ---------------------------------------------------------------------------
@@ -5589,7 +5837,7 @@ test "e2e: basic + string stdlib are byte-identical across all modes" {
         \\end
         \\print(type("x"), math.type(1), math.type(1.5), _VERSION)
         \\print(select("#", 1, 2, 3), select(2, "a", "b"))
-        \\print(string.sub("hello", 2, 4), string.byte("A"))
+        \\print(string.sub("hello", 2, 4), string.codepoint("A"))
     ,
         "1:ab\n2:abab\n3:ababab\n" ++
             "string\tinteger\tfloat\tlune 0.0.0\n" ++
@@ -5617,6 +5865,37 @@ test "e2e: string pattern matching is byte-identical across all modes" {
         "50\tk\tv\n" ++
             "5\t5\n" ++
             "4\theLLo\n",
+    );
+}
+
+test "e2e: code-point-native strings are byte-identical across all modes" {
+    // S-B (design doc 06): #, sub, reverse, char, codepoint, codes, %c, %.Ns and
+    // \u{} all index by Unicode code point, not byte. All of these run tier-0 (the
+    // recorder aborts on `len`, and the rest are native string calls), so the
+    // output must be identical across {off, record_only, noopt, record_execute,
+    // native} × stress.
+    try expectProgram(
+        \\print(#"héllo", #"ab😀")
+        \\print(("héllo"):sub(2, 2), ("héllo"):sub(2))
+        \\print(("ab😀"):reverse())
+        \\print(string.char(0x1F600), string.char(72, 0xE9))
+        \\print(("héllo"):codepoint(2), string.codepoint("ab😀", 3))
+        \\local idx, cps = "", ""
+        \\for i, c in ("aé"):codes() do idx = idx .. i; cps = cps .. c .. " " end
+        \\print(idx, cps)
+        \\print(string.format("%c%c", 0x41, 0x1F600))
+        \\print(string.format("%.2s", "héllo"))
+        \\print("\u{E9}" == "é", "\u{1F600}" == "😀")
+    ,
+        "5\t3\n" ++
+            "é\téllo\n" ++
+            "😀ba\n" ++
+            "😀\tHé\n" ++
+            "233\t128512\n" ++
+            "12\t97 233 \n" ++
+            "A😀\n" ++
+            "hé\n" ++
+            "true\ttrue\n",
     );
 }
 

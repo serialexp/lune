@@ -30,6 +30,7 @@ const pattern = @import("pattern.zig");
 const Value = value.Value;
 const Vm = interp.Vm;
 const Table = table_mod.Table;
+const String = string_mod.String;
 
 inline fn vmOf(ctx: *anyopaque) *Vm {
     return @ptrCast(@alignCast(ctx));
@@ -91,38 +92,122 @@ fn posRelat(pos: i64, len: usize) i64 {
 }
 
 // ---------------------------------------------------------------------------
+// UTF-8 / code-point helpers (S-B, design doc 06)
+//
+// Strings are code-point-native: `len`/`sub`/`reverse`/`codepoint`/`codes` index
+// by character. These helpers translate between 1-based character positions and
+// byte offsets over a string's (valid) UTF-8 buffer. They are total — on the
+// stray non-UTF-8 byte (which cannot enter a string post-S-B) they degrade to a
+// 1-byte step / U+FFFD rather than erroring, so no operation can trap on data.
+// ---------------------------------------------------------------------------
+
+/// Fetch argument `i` (0-based) as a heap `String` object — for code-point-aware
+/// operations that need the cached code-point count and the UTF-8 byte buffer.
+/// (Like `strArg`, lune does not coerce a number here; a non-string raises.)
+fn strObjArg(vm: *Vm, args: []const Value, i: usize) anyerror!*const String {
+    if (i >= args.len) return vm.badArg(i + 1, "string", null);
+    const v = args[i];
+    if (!v.isHeap() or v.heapType() != .string) return vm.badArg(i + 1, "string", v);
+    return String.fromHeader(v.asHeap());
+}
+
+/// Count Unicode code points in valid UTF-8 `s` (every non-continuation byte
+/// starts a code point). Branch-light; used for code-point-aware field widths in
+/// `string.format` so `%Ns`/`%Nc` align by character, consistent with `#s`.
+fn cpCount(s: []const u8) usize {
+    var n: usize = 0;
+    for (s) |b| {
+        if (b & 0xC0 != 0x80) n += 1;
+    }
+    return n;
+}
+
+/// Byte offset at which the 1-based character `ci` starts in `s`. `ci` may be
+/// `cp_len + 1` (one past the end → returns `s.len`), so the character range
+/// `[i, j]` maps to bytes `[charByteOffset(i), charByteOffset(j + 1)]`. `ci <= 1`
+/// is the start.
+fn charByteOffset(s: []const u8, ci: usize) usize {
+    if (ci <= 1) return 0;
+    var skip = ci - 1;
+    var off: usize = 0;
+    while (skip > 0 and off < s.len) : (skip -= 1) {
+        const n = std.unicode.utf8ByteSequenceLength(s[off]) catch 1;
+        off += @min(n, s.len - off);
+    }
+    return off;
+}
+
+/// Decode the code point starting at byte `off` in valid UTF-8 `s`, returning the
+/// scalar value and the byte length of its sequence. Total (U+FFFD / 1-byte step
+/// on malformed input, which does not occur for a valid string).
+fn decodeAt(s: []const u8, off: usize) struct { cp: u21, len: usize } {
+    const n = std.unicode.utf8ByteSequenceLength(s[off]) catch 1;
+    const end = @min(off + n, s.len);
+    const cp = std.unicode.utf8Decode(s[off..end]) catch 0xFFFD;
+    return .{ .cp = cp, .len = end - off };
+}
+
+/// Append the UTF-8 encoding of code point `code` (argument `argn`, 1-based, for
+/// error messages) to `buf`. Rejects negatives, values `> 0x10FFFF`, and
+/// surrogate halves (`utf8Encode` errors on the latter two) with the located
+/// `bad argument #argn ... (value out of range)`.
+fn appendCodepoint(vm: *Vm, argn: usize, code: i64, buf: *std.ArrayList(u8)) anyerror!void {
+    if (code < 0 or code > 0x10FFFF) return vm.badArgReason(argn, "value out of range");
+    var tmp: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(@intCast(code), &tmp) catch
+        return vm.badArgReason(argn, "value out of range");
+    try buf.appendSlice(vm.gpa, tmp[0..n]);
+}
+
+// ---------------------------------------------------------------------------
 // len / sub / reverse / upper / lower / rep
 // ---------------------------------------------------------------------------
 
-/// `string.len(s)` — byte length (same as `#s`).
+/// `string.len(s)` — number of code points (same as `#s`, S-B). O(1) via the
+/// cached count.
 fn sLen(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    const s = try strArg(vmOf(ctx), args, 0);
-    return Value.int(@intCast(s.len));
+    const s = try strObjArg(vmOf(ctx), args, 0);
+    return Value.int(@intCast(s.cpLen()));
 }
 
-/// `string.sub(s, i [, j])` — substring `s[i..j]`, 1-based inclusive, with Lua's
-/// negative-index and clamping rules. `j` defaults to `-1` (end of string).
+/// `string.sub(s, i [, j])` — substring `s[i..j]` by **character** position
+/// (S-B), 1-based inclusive, with Lua's negative-index and clamping rules. `j`
+/// defaults to `-1` (last character). The character range is mapped to byte
+/// offsets on code-point boundaries, so the result is valid UTF-8.
 fn sSub(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const s = try strArg(vm, args, 0);
-    const len = s.len;
+    const s = try strObjArg(vm, args, 0);
+    const clen = s.cpLen();
 
-    var i = posRelat(try optIntArg(vm, args, 1, 1), len);
-    var j = posRelat(try optIntArg(vm, args, 2, -1), len);
+    var i = posRelat(try optIntArg(vm, args, 1, 1), clen);
+    var j = posRelat(try optIntArg(vm, args, 2, -1), clen);
     if (i < 1) i = 1;
-    if (j > @as(i64, @intCast(len))) j = @intCast(len);
+    if (j > @as(i64, @intCast(clen))) j = @intCast(clen);
     if (i > j) return vm.heap.internValue(""); // empty
-    return vm.heap.internValue(s[@intCast(i - 1)..@intCast(j)]);
+
+    const bytes = s.bytes();
+    const start = charByteOffset(bytes, @intCast(i));
+    const end = charByteOffset(bytes, @intCast(j + 1));
+    return vm.heap.internValue(bytes[start..end]);
 }
 
-/// `string.reverse(s)` — bytes reversed.
+/// `string.reverse(s)` — characters reversed (S-B): each UTF-8 sequence is moved
+/// as a unit to its mirrored position, so multibyte characters survive intact.
 fn sReverse(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const s = try strArg(vm, args, 0);
+    const s = try strObjArg(vm, args, 0);
+    const bytes = s.bytes();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(vm.gpa);
-    try buf.resize(vm.gpa, s.len);
-    for (s, 0..) |c, k| buf.items[s.len - 1 - k] = c;
+    try buf.resize(vm.gpa, bytes.len);
+
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = @min(std.unicode.utf8ByteSequenceLength(bytes[off]) catch 1, bytes.len - off);
+        const dst = bytes.len - off - n; // mirror this char's bytes (in order)
+        @memcpy(buf.items[dst .. dst + n], bytes[off .. off + n]);
+        off += n;
+    }
     return vm.heap.internValue(buf.items);
 }
 
@@ -170,55 +255,134 @@ fn sRep(ctx: *anyopaque, args: []const Value) anyerror!Value {
 }
 
 // ---------------------------------------------------------------------------
-// char / byte
+// char / codepoint / codes  (S-B: code points, not bytes)
 // ---------------------------------------------------------------------------
 
-/// `string.char(...)` — build a string from integer byte values (each 0–255).
+/// `string.char(...)` — build a string from integer **code points** (each
+/// `0..0x10FFFF`, surrogates rejected), encoding each to UTF-8. (Was: byte
+/// values 0–255. The byte-building role now lives in `string.decode` of an
+/// integer array; design doc 06.)
 fn sChar(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(vm.gpa);
-    for (args, 0..) |_, idx| {
-        const code = try optIntArg(vm, args, idx, 0);
-        if (code < 0 or code > 255) return vm.badArgReason(idx + 1, "value out of range");
-        try buf.append(vm.gpa, @intCast(code));
+    for (args, 0..) |arg, idx| {
+        // `string.char` arguments are mandatory code points: an explicit nil is a
+        // bad argument, not a default-to-zero (which would silently emit NUL).
+        if (arg.isNil()) return vm.badArg(idx + 1, "number", arg);
+        const code = try optIntArg(vm, args, idx, 0); // arg is non-nil → default unused
+        try appendCodepoint(vm, idx + 1, code, &buf);
     }
     return vm.heap.internValue(buf.items);
 }
 
-/// `string.byte(s [, i [, j]])` — the numeric codes of `s[i..j]`, one per result
-/// (a `multi` native). `i` defaults to 1, `j` to `i`; negative/clamped per Lua.
-/// Returns the resolved `[lo, hi]` byte range (1-based inclusive, clamped) or an
-/// empty range as `lo > hi`.
-fn byteRange(vm: *Vm, args: []const Value, len: usize) anyerror!struct { lo: usize, hi: usize } {
+/// Resolve a 1-based inclusive **character** range `[i, j]` over `clen` code
+/// points, with Lua's negative-index + clamping. `i` defaults to 1, `j` to `i`.
+/// An empty range is reported as `lo > hi`.
+fn charRange(vm: *Vm, args: []const Value, clen: usize) anyerror!struct { lo: usize, hi: usize } {
     const i_raw = try optIntArg(vm, args, 1, 1);
     const j_raw = try optIntArg(vm, args, 2, i_raw);
-    var i = posRelat(i_raw, len);
-    var j = posRelat(j_raw, len);
+    var i = posRelat(i_raw, clen);
+    var j = posRelat(j_raw, clen);
     if (i < 1) i = 1;
-    if (j > @as(i64, @intCast(len))) j = @intCast(len);
+    if (j > @as(i64, @intCast(clen))) j = @intCast(clen);
     if (i > j) return .{ .lo = 1, .hi = 0 }; // empty (lo > hi)
     return .{ .lo = @intCast(i), .hi = @intCast(j) };
 }
 
-fn sByte1(ctx: *anyopaque, args: []const Value) anyerror!Value {
+/// `string.codepoint(s [, i [, j]])` — the Unicode scalar values of the
+/// characters `s[i..j]`, one integer per result (a `multi` native). Replaces
+/// Lua's byte-returning `string.byte` (raw bytes now come from `s:encode()`).
+/// `i` defaults to 1, `j` to `i`; positions are **character** indices.
+fn sCodepoint1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const s = try strArg(vm, args, 0);
-    const r = try byteRange(vm, args, s.len);
+    const s = try strObjArg(vm, args, 0);
+    const r = try charRange(vm, args, s.cpLen());
     if (r.lo > r.hi) return Value.nil();
-    return Value.int(@intCast(s[r.lo - 1]));
+    const bytes = s.bytes();
+    const d = decodeAt(bytes, charByteOffset(bytes, r.lo));
+    return Value.int(@intCast(d.cp));
 }
 
-fn sByteN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+fn sCodepointN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
-    const s = try strArg(vm, args, 0);
-    const r = try byteRange(vm, args, s.len);
+    const s = try strObjArg(vm, args, 0);
+    const r = try charRange(vm, args, s.cpLen());
     if (r.lo > r.hi) return 0;
+    const bytes = s.bytes();
+    var off = charByteOffset(bytes, r.lo);
+    const count = r.hi - r.lo + 1;
     var k: usize = 0;
-    while (r.lo + k <= r.hi and k < out.len) : (k += 1) {
-        out[k] = Value.int(@intCast(s[r.lo - 1 + k]));
+    while (k < count and k < out.len and off < bytes.len) : (k += 1) {
+        const d = decodeAt(bytes, off);
+        out[k] = Value.int(@intCast(d.cp));
+        off += d.len;
     }
     return k;
+}
+
+/// The hidden iterator `s:codes()` hands back, mirroring `@gmatch_iter`: a
+/// non-spellable global native that is a GC root and keyframe-restorable by name.
+const codes_iter_name = "@codes_iter";
+
+/// `s:codes()` — returns the generic-for triple `(@codes_iter, state, nil)`,
+/// where `state` is a plain table `{ [1]=s, [2]=byteCursor, [3]=charsEmitted }`
+/// the iterator mutates (the `gmatch` shape — serializable, unlike a
+/// closure-with-upvalue). Each step yields `(charIndex, codepoint)` with
+/// `charIndex` 1-based, stopping at end of string. O(n) total (the char counter
+/// is threaded, not recomputed).
+fn sCodesN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    const vm = vmOf(ctx);
+    _ = try strObjArg(vm, args, 0); // type-check subject
+    const iter = try globalNative(vm, codes_iter_name);
+    const state = try vm.heap.newTable();
+    try state.set(vm.gpa, Value.int(1), args[0]); // subject string Value
+    try state.set(vm.gpa, Value.int(2), Value.int(0)); // 0-based byte cursor
+    try state.set(vm.gpa, Value.int(3), Value.int(0)); // code points emitted so far
+    const triple = [3]Value{ iter, Value.heap(&state.header), Value.nil() };
+    return copyOut(&triple, out);
+}
+
+fn sCodes1(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    // Degenerate single-result projection: just the iterator (state is lost).
+    const vm = vmOf(ctx);
+    _ = try strObjArg(vm, args, 0);
+    return globalNative(vm, codes_iter_name);
+}
+
+/// `@codes_iter(state)` — decode the character at the stored byte cursor, advance
+/// the cursor past it and the emitted-count by one, and return
+/// `(charIndex, codepoint)`; 0 results when the cursor reaches the end.
+/// `charIndex` is the 1-based character ordinal (threaded in `state[3]`, so each
+/// step is O(1)).
+fn codesAuxCore(vm: *Vm, args: []const Value, out: *[2]Value) anyerror!usize {
+    const st = try tableArg(vm, args, 0);
+    const s = interp.strBytes(st.getInt(1)) orelse return error.TypeError;
+    const pos_v = st.getInt(2);
+    var pos: usize = if (pos_v.isInt() and pos_v.asInt() >= 0) @intCast(pos_v.asInt()) else 0;
+    const emitted_v = st.getInt(3);
+    const emitted: i64 = if (emitted_v.isInt()) emitted_v.asInt() else 0;
+    if (pos >= s.len) return 0; // exhausted
+
+    const d = decodeAt(s, pos);
+    pos += d.len;
+    try st.set(vm.gpa, Value.int(2), Value.int(@intCast(pos)));
+    try st.set(vm.gpa, Value.int(3), Value.int(emitted + 1));
+    out[0] = Value.int(emitted + 1); // 1-based character ordinal
+    out[1] = Value.int(@intCast(d.cp));
+    return 2;
+}
+
+fn sCodesAux1(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    var out: [2]Value = undefined;
+    const n = try codesAuxCore(vmOf(ctx), args, &out);
+    return if (n == 0) Value.nil() else out[0];
+}
+
+fn sCodesAuxN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
+    var pair: [2]Value = undefined;
+    const n = try codesAuxCore(vmOf(ctx), args, &pair);
+    return copyOut(pair[0..n], out);
 }
 
 // ---------------------------------------------------------------------------
@@ -495,9 +659,15 @@ fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
                 try emitNumeric(&out, gpa, prefix, digits, spec);
             },
             'c' => {
+                // S-B: `%c` emits the one-code-point string for this scalar value
+                // (UTF-8), not a single truncated byte. Range/surrogate-checked.
                 const n = try argToInt(arg);
-                const ch: u8 = @truncate(@as(u64, @bitCast(n)));
-                try emitNumeric(&out, gpa, "", &[_]u8{ch}, .{ .minus = spec.minus, .width = spec.width });
+                if (n < 0 or n > 0x10FFFF) return error.TypeError;
+                var tmp: [4]u8 = undefined;
+                const ln = std.unicode.utf8Encode(@intCast(n), &tmp) catch return error.TypeError;
+                // Route through emitString so the width pads by one **character**
+                // (code point), not by the UTF-8 byte length of the encoding.
+                try emitString(&out, gpa, tmp[0..ln], .{ .minus = spec.minus, .width = spec.width });
             },
             'f', 'F', 'e', 'E', 'g', 'G' => {
                 if (!arg.isNumber()) return error.TypeError;
@@ -534,13 +704,15 @@ fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
                 try emitNumeric(&out, gpa, signPrefix(neg, spec), body, fspec);
             },
             's' => {
+                // S-B: `%.Ns` precision counts **code points**, not bytes. For
+                // ASCII (incl. coerced numbers) this equals `min(N, len)`.
                 if (interp.strBytes(arg)) |full| {
-                    const body = if (spec.precision) |p| full[0..@min(p, full.len)] else full;
+                    const body = if (spec.precision) |p| full[0..charByteOffset(full, p + 1)] else full;
                     try emitString(&out, gpa, body, spec);
                 } else if (arg.isNumber()) {
                     var sbuf: [64]u8 = undefined;
                     const full = try interp.coerceConcat(arg, &sbuf);
-                    const body = if (spec.precision) |p| full[0..@min(p, full.len)] else full;
+                    const body = if (spec.precision) |p| full[0..charByteOffset(full, p + 1)] else full;
                     try emitString(&out, gpa, body, spec);
                 } else {
                     try formatNonStr(&out, gpa, arg, spec);
@@ -569,7 +741,10 @@ fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// Emit a string field with width + `-` justification (the `0` flag is ignored
 /// for `%s`, matching C/Lua).
 fn emitString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, body: []const u8, spec: FormatSpec) !void {
-    const pad: usize = if (spec.width > body.len) spec.width - body.len else 0;
+    // S-B: the field width is a **code-point** count (consistent with `#s`), so a
+    // multibyte body pads by characters, not bytes.
+    const width_units = cpCount(body);
+    const pad: usize = if (spec.width > width_units) spec.width - width_units else 0;
     if (spec.minus) {
         try out.appendSlice(gpa, body);
         try appendN(out, gpa, ' ', pad);
@@ -992,6 +1167,56 @@ fn copyOut(src: []const Value, out: []Value) usize {
 }
 
 // ---------------------------------------------------------------------------
+// encode / decode — the text↔bytes boundary (design doc 06, chunk S-A)
+// ---------------------------------------------------------------------------
+
+/// `string.encode(s)` / `s:encode()` — a string's UTF-8 bytes as a **byte array**
+/// (an ordinary lune array: a table with integer keys `1..#bytes`, each value an
+/// integer `0..255`). Total: a valid string always has valid UTF-8 bytes, so this
+/// never fails. On all-ASCII content the result array is bit-identical to the
+/// string's bytes (the boundary is the identity function below U+0080).
+///
+/// Strings are interned-by-bytes and the byte buffer is exactly the thing we copy
+/// out, so this is a plain byte→int fan-out — no recorder, no effect, deterministic.
+fn sEncode(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    const s = try strArg(vm, args, 0);
+    const t = try vm.heap.newTable();
+    for (s, 0..) |b, i| {
+        try t.set(vm.gpa, Value.int(@intCast(i + 1)), Value.int(@intCast(b)));
+    }
+    return Value.heap(&t.header);
+}
+
+/// `string.decode(bytes)` — interpret a **byte array** (a table whose sequence
+/// part holds integers `0..255`) as text, returning the interned string. This is
+/// the one *fallible* constructor: malformed UTF-8 raises a **catchable** error
+/// (so `pcall(string.decode, junk)` is the "try to read these bytes as text"
+/// idiom). A free function — byte arrays are plain tables with no metatable, so
+/// there is no `bytes:decode()`.
+///
+/// The sequence is `bytes[1 .. #bytes]`; each element must be an integer in
+/// `0..255` (a hole or non-integer is a catchable error, since it is not a byte).
+/// All-ASCII input cannot fail (the bytes already are valid UTF-8).
+fn sDecode(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm = vmOf(ctx);
+    const t = try tableArg(vm, args, 0);
+    const n = t.length();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(vm.gpa);
+    var i: i64 = 1;
+    while (i <= n) : (i += 1) {
+        const v = t.getInt(i);
+        if (!v.isInt()) return vm.raiseLocatedError("byte array contains a non-integer element", 1);
+        const code = v.asInt();
+        if (code < 0 or code > 255) return vm.raiseLocatedError("byte array element out of range (0..255)", 1);
+        try buf.append(vm.gpa, @intCast(code));
+    }
+    if (!std.unicode.utf8ValidateSlice(buf.items)) return vm.raiseLocatedError("invalid UTF-8 in byte array", 1);
+    return vm.heap.internValue(buf.items);
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -1003,14 +1228,25 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "string.lower", .func = &sLower, .module = "string", .field = "lower" },
     .{ .name = "string.rep", .func = &sRep, .module = "string", .field = "rep" },
     .{ .name = "string.char", .func = &sChar, .module = "string", .field = "char" },
-    .{ .name = "string.byte", .func = &sByte1, .multi = &sByteN, .module = "string", .field = "byte" },
+    // S-B (design doc 06): `string.codepoint` (scalar values at character
+    // positions) replaces the byte-returning `string.byte`; `string.codes` is the
+    // `(index, codepoint)` iterator. Raw bytes now come from `s:encode()`.
+    .{ .name = "string.codepoint", .func = &sCodepoint1, .multi = &sCodepointN, .module = "string", .field = "codepoint" },
+    .{ .name = "string.codes", .func = &sCodes1, .multi = &sCodesN, .module = "string", .field = "codes" },
     .{ .name = "string.format", .func = &sFormat, .module = "string", .field = "format" },
+    // The text↔bytes boundary (design doc 06, S-A). `encode` is a `string` field
+    // so `s:encode()` resolves through the string metatable; `decode` is a plain
+    // module field (byte arrays have no metatable, so it stays a free function).
+    .{ .name = "string.encode", .func = &sEncode, .module = "string", .field = "encode" },
+    .{ .name = "string.decode", .func = &sDecode, .module = "string", .field = "decode" },
     .{ .name = "string.find", .func = &sFind1, .multi = &sFindN, .module = "string", .field = "find" },
     .{ .name = "string.match", .func = &sMatch1, .multi = &sMatchN, .module = "string", .field = "match" },
     .{ .name = "string.gmatch", .func = &sGmatch1, .multi = &sGmatchN, .module = "string", .field = "gmatch" },
     .{ .name = "string.gsub", .func = &sGsub1, .multi = &sGsubN, .module = "string", .field = "gsub" },
     // Hidden iterator `gmatch` returns; a bare global like `@ipairs_iter`.
     .{ .name = gmatch_iter_name, .func = &sGmatchAux1, .multi = &sGmatchAuxN },
+    // Hidden iterator `s:codes()` returns (S-B); same hidden-global pattern.
+    .{ .name = codes_iter_name, .func = &sCodesAux1, .multi = &sCodesAuxN },
 };
 
 // ---------------------------------------------------------------------------
@@ -1063,32 +1299,64 @@ test "string.rep with separator and non-positive count" {
     try testing.expectEqualStrings("", bytesOf(try sRep(@ptrCast(&vm), &.{ ab, Value.int(-2) })));
 }
 
-test "string.char builds bytes; rejects out-of-range" {
+test "string.char builds from code points (S-B); rejects surrogates/over-range" {
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
+    // ASCII unchanged.
     try testing.expectEqualStrings("Hi!", bytesOf(try sChar(@ptrCast(&vm), &.{ Value.int(72), Value.int(105), Value.int(33) })));
-    try testing.expectError(error.LuaError, sChar(@ptrCast(&vm), &.{Value.int(256)}));
+    // 256 (U+0100 Ā) is now a valid CODE POINT → 2 UTF-8 bytes (was out of range).
+    try testing.expectEqualStrings("Ā", bytesOf(try sChar(@ptrCast(&vm), &.{Value.int(0x100)})));
+    // U+1F600 (😀) → 4 bytes.
+    try testing.expectEqualStrings("😀", bytesOf(try sChar(@ptrCast(&vm), &.{Value.int(0x1F600)})));
+    // Surrogate half, over-range, and negative are rejected.
+    try testing.expectError(error.LuaError, sChar(@ptrCast(&vm), &.{Value.int(0xD800)}));
+    try testing.expectError(error.LuaError, sChar(@ptrCast(&vm), &.{Value.int(0x110000)}));
     try testing.expectError(error.LuaError, sChar(@ptrCast(&vm), &.{Value.int(-1)}));
+    // An explicit nil argument is a bad argument (not a silent default-to-NUL).
+    try testing.expectError(error.LuaError, sChar(@ptrCast(&vm), &.{Value.nil()}));
+    try testing.expectError(error.LuaError, sChar(@ptrCast(&vm), &.{ Value.int(65), Value.nil(), Value.int(66) }));
 }
 
-test "string.byte: primary projection and multi range" {
+test "string.codepoint: scalar values at character positions (S-B)" {
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
-    const abc = try sv(&vm, "ABC");
+    const s = try sv(&vm, "héllo"); // h é l l o — 5 chars, 6 bytes
 
-    // Primary projection: first byte (default i=1).
-    try testing.expectEqual(@as(i64, 65), (try sByte1(@ptrCast(&vm), &.{abc})).asInt());
-    try testing.expectEqual(@as(i64, 67), (try sByte1(@ptrCast(&vm), &.{ abc, Value.int(-1) })).asInt());
+    // Primary projection: scalar at char 1 (default), and char 2 = 'é' = U+00E9.
+    try testing.expectEqual(@as(i64, 'h'), (try sCodepoint1(@ptrCast(&vm), &.{s})).asInt());
+    try testing.expectEqual(@as(i64, 0xE9), (try sCodepoint1(@ptrCast(&vm), &.{ s, Value.int(2) })).asInt());
+    try testing.expectEqual(@as(i64, 'o'), (try sCodepoint1(@ptrCast(&vm), &.{ s, Value.int(-1) })).asInt());
 
-    // Multi: full range.
+    // Multi: full range → 5 scalar values (the 'é' counts as one character).
     var out: [8]Value = undefined;
-    const n = try sByteN(@ptrCast(&vm), &.{ abc, Value.int(1), Value.int(3) }, &out);
-    try testing.expectEqual(@as(usize, 3), n);
-    try testing.expectEqual(@as(i64, 65), out[0].asInt());
-    try testing.expectEqual(@as(i64, 67), out[2].asInt());
+    const n = try sCodepointN(@ptrCast(&vm), &.{ s, Value.int(1), Value.int(5) }, &out);
+    try testing.expectEqual(@as(usize, 5), n);
+    try testing.expectEqual(@as(i64, 'h'), out[0].asInt());
+    try testing.expectEqual(@as(i64, 0xE9), out[1].asInt());
+    try testing.expectEqual(@as(i64, 'o'), out[4].asInt());
 
     // Empty range → zero results.
-    try testing.expectEqual(@as(usize, 0), try sByteN(@ptrCast(&vm), &.{ abc, Value.int(3), Value.int(1) }, &out));
+    try testing.expectEqual(@as(usize, 0), try sCodepointN(@ptrCast(&vm), &.{ s, Value.int(3), Value.int(1) }, &out));
+}
+
+test "string.sub / reverse by code point (S-B)" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    const s = try sv(&vm, "héllo");
+    // sub(2,2) is the single character 'é' (2 bytes), not a half-sequence.
+    try testing.expectEqualStrings("é", bytesOf(try sSub(@ptrCast(&vm), &.{ s, Value.int(2), Value.int(2) })));
+    try testing.expectEqualStrings("éllo", bytesOf(try sSub(@ptrCast(&vm), &.{ s, Value.int(2) })));
+    try testing.expectEqualStrings("llo", bytesOf(try sSub(@ptrCast(&vm), &.{ s, Value.int(-3) })));
+    // reverse keeps multibyte characters intact.
+    try testing.expectEqualStrings("olléh", bytesOf(try sReverse(@ptrCast(&vm), &.{s})));
+    try testing.expectEqualStrings("😀ba", bytesOf(try sReverse(@ptrCast(&vm), &.{try sv(&vm, "ab😀")})));
+}
+
+test "string.len counts code points (S-B)" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    try testing.expectEqual(@as(i64, 5), (try sLen(@ptrCast(&vm), &.{try sv(&vm, "héllo")})).asInt());
+    try testing.expectEqual(@as(i64, 3), (try sLen(@ptrCast(&vm), &.{try sv(&vm, "ab😀")})).asInt());
 }
 
 test "string.format: integer/float/string/quote specs" {
@@ -1099,6 +1367,22 @@ test "string.format: integer/float/string/quote specs" {
     try testing.expectEqualStrings("[   42][42   ][03.14][ff][hi][\"a\\\"b\"]", bytesOf(r));
     // Unknown conversion errors.
     try testing.expectError(error.TypeError, sFormat(@ptrCast(&vm), &.{ try sv(&vm, "%y"), Value.int(1) }));
+}
+
+test "string.format: %s and %c field width pad by code points (S-B)" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    // "é" is one code point (2 UTF-8 bytes): %3s right-justifies to width 3 with
+    // two spaces (not one), and %-3s left-justifies with two trailing spaces.
+    try testing.expectEqualStrings("  é", bytesOf(try sFormat(@ptrCast(&vm), &.{ try sv(&vm, "%3s"), try sv(&vm, "é") })));
+    try testing.expectEqualStrings("é  ", bytesOf(try sFormat(@ptrCast(&vm), &.{ try sv(&vm, "%-3s"), try sv(&vm, "é") })));
+    // "héllo" is 5 code points → width 5 needs no padding even though it's 6 bytes.
+    try testing.expectEqualStrings("héllo", bytesOf(try sFormat(@ptrCast(&vm), &.{ try sv(&vm, "%5s"), try sv(&vm, "héllo") })));
+    // %.2s precision counts code points (already covered by sSub semantics).
+    try testing.expectEqualStrings("hé", bytesOf(try sFormat(@ptrCast(&vm), &.{ try sv(&vm, "%.2s"), try sv(&vm, "héllo") })));
+    // %3c of a 4-byte emoji pads to width 3 (one character + two spaces).
+    try testing.expectEqualStrings("  😀", bytesOf(try sFormat(@ptrCast(&vm), &.{ try sv(&vm, "%3c"), Value.int(0x1F600) })));
+    try testing.expectEqualStrings("😀  ", bytesOf(try sFormat(@ptrCast(&vm), &.{ try sv(&vm, "%-3c"), Value.int(0x1F600) })));
 }
 
 test "string.format: C-style %e/%g (exponent, sig-digit selection, strip) match printf" {
@@ -1239,4 +1523,71 @@ test "@gmatch_iter walks the state table and stops when exhausted" {
     }
     // Exhausted → 0 results.
     try testing.expectEqual(@as(usize, 0), try sGmatchAuxN(@ptrCast(&vm), &.{stv}, &out));
+}
+
+// --- encode / decode (S-A boundary) ----------------------------------------
+
+/// Read a decoded byte array's sequence into a freshly-allocated slice the caller
+/// frees, so a test can assert the exact `(len, bytes)`.
+fn arrBytes(v: Value) ![]u8 {
+    const t = Table.fromHeader(v.asHeap());
+    const n: usize = @intCast(t.length());
+    const out = try testing.allocator.alloc(u8, n);
+    for (0..n) |i| out[i] = @intCast(t.getInt(@intCast(i + 1)).asInt());
+    return out;
+}
+
+test "string.encode: ASCII is the identity byte sequence; multibyte is UTF-8" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+
+    // ASCII: "Hi" → {72, 105}, bit-identical to the bytes.
+    const ascii = try arrBytes(try sEncode(@ptrCast(&vm), &.{try sv(&vm, "Hi")}));
+    defer testing.allocator.free(ascii);
+    try testing.expectEqualSlices(u8, &.{ 72, 105 }, ascii);
+
+    // Multibyte: "é" (U+00E9) → its 2 UTF-8 bytes {0xC3, 0xA9}.
+    const e = try arrBytes(try sEncode(@ptrCast(&vm), &.{try sv(&vm, "é")}));
+    defer testing.allocator.free(e);
+    try testing.expectEqualSlices(u8, &.{ 0xC3, 0xA9 }, e);
+
+    // Empty string → empty array.
+    const empty = try arrBytes(try sEncode(@ptrCast(&vm), &.{try sv(&vm, "")}));
+    defer testing.allocator.free(empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "string.decode: round-trips encode, validates, and is catchably fallible" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+
+    // Round-trip: decode(encode(s)) == s, by interned-pointer identity.
+    const s = try sv(&vm, "héllo wörld");
+    const decoded = try sDecode(@ptrCast(&vm), &.{try sEncode(@ptrCast(&vm), &.{s})});
+    try testing.expectEqual(s.asHeap(), decoded.asHeap()); // same interned object
+    try testing.expectEqualStrings("héllo wörld", bytesOf(decoded));
+
+    // Build a byte array by hand and decode it.
+    const t = try vm.heap.newTable();
+    try t.set(vm.gpa, Value.int(1), Value.int(72));
+    try t.set(vm.gpa, Value.int(2), Value.int(105));
+    try testing.expectEqualStrings("Hi", bytesOf(try sDecode(@ptrCast(&vm), &.{Value.heap(&t.header)})));
+
+    // Invalid UTF-8 (lone continuation byte 0xA9) → catchable LuaError.
+    const bad = try vm.heap.newTable();
+    try bad.set(vm.gpa, Value.int(1), Value.int(0xA9));
+    try testing.expectError(error.LuaError, sDecode(@ptrCast(&vm), &.{Value.heap(&bad.header)}));
+
+    // Out-of-range element → catchable LuaError.
+    const oor = try vm.heap.newTable();
+    try oor.set(vm.gpa, Value.int(1), Value.int(256));
+    try testing.expectError(error.LuaError, sDecode(@ptrCast(&vm), &.{Value.heap(&oor.header)}));
+
+    // Non-integer element → catchable LuaError.
+    const nonint = try vm.heap.newTable();
+    try nonint.set(vm.gpa, Value.int(1), try sv(&vm, "x"));
+    try testing.expectError(error.LuaError, sDecode(@ptrCast(&vm), &.{Value.heap(&nonint.header)}));
+
+    // Non-table argument → bad argument (also LuaError).
+    try testing.expectError(error.LuaError, sDecode(@ptrCast(&vm), &.{Value.int(5)}));
 }

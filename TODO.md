@@ -2,6 +2,44 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Unicode-native strings (design doc 06) — S-A + S-B LANDED (June 2026)
+
+S-A (text↔bytes boundary, `src/stdlib/string.zig`, `sEncode`/`sDecode`):
+`string.encode`/`s:encode()` → byte array (table, integer keys `1..n`, `0..255`),
+total; `string.decode(bytes)` → interned string, raising a **catchable** error on
+invalid UTF-8 / out-of-range / non-integer elements.
+
+S-B (code-point-native strings, the breaking core): a `string` is a sequence of
+Unicode code points. `#s`/`string.len`/`sub`/`reverse`/`string.char`/
+`string.codepoint`/`s:codes()` index by code point; cached `cp_len` on the heap
+`String` (computed in `String.create`, recomputed on restore — no schema bump);
+`#s` is tier-0-only so all 8 modes inherit it (no JIT change). `\u{…}` lexer
+escape; `\xNN`/`\ddd` are ASCII-only (byte ≥ 0x80 → compile error); every literal
+validated UTF-8 at construction (`decodeString` + `utf8ValidateSlice`).
+`string.byte` removed; no `utf8` module ships. CSV + doc-06 updated in lockstep.
+
+**Known intermediate state (closed in S-D):** `sub`/`reverse`/`codepoint` index by
+code point, but the pattern functions (`find`/`match`/`gmatch`/`gsub`) still return
+**byte** indices and match byte-wise. Fine for ASCII; the char-vs-byte gap is the
+doc's explicit staging. `upper`/`lower` stay ASCII C-locale until S-C.
+
+**RESOLVED — host-input UTF-8 boundary.** S-B's review (Codex + Antigravity) flagged
+that the "every string is valid UTF-8 by construction" invariant held for string
+*literals* and `string.decode` but NOT for host-sourced strings. Bart's call: **reject**
+— the host-input boundary now validates and raises a *catchable* error (like
+`string.decode`). `Vm.validateHostText` (`interp.zig`) checks `utf8ValidateSlice` and
+raises a located error; it is called on the *logged* result in `performEffect`
+(`getenv`/`argv`) and `obtainFileRead` (`file_read`) — **after** `logEffect`, so record
+(fresh intern) and replay (re-intern from the log) validate identical bytes and raise
+identically — and inline in `populateArgs` (load-time `arg[]`, before intern). No
+malformed string can now reach a program, so the `cp_len`/`charByteOffset` divergence is
+gone too. `internValue` stays raw (internal callers are valid by construction; the
+replay re-intern path must not re-raise mid-feed).
+
+**Next in the arc (not started):** S-C (case mapping + recorded
+`unicode_version`), S-D (patterns on code points), S-E (the `u8` array lane). Each
+gets the Codex+Antigravity gate where determinism-adjacent.
+
 ## `load` / `loadfile` / `dofile` LANDED — deferred follow-ups (June 2026)
 
 The full runtime-compile arc is in (`src/stdlib/load.zig`):

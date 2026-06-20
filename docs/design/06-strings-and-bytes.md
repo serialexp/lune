@@ -26,20 +26,31 @@ those stay byte-keyed and unchanged, which is what keeps determinism cheap.
 
 ### Done
 
-- (nothing yet — design only)
+- [x] **S-A — the bytes world + conversion boundary** (additive, no
+      string-semantics change). `string.encode`/`s:encode()` → byte array (a
+      table with integer keys `1..n`, each `0..255`); `string.decode(bytes)` →
+      string | catchable error (validates UTF-8). Bytes are plain integer arrays;
+      no new type. `encode` is a `string` module field so `s:encode()` resolves
+      through the string metatable; `decode` is a free function (byte arrays have
+      no metatable). Pure — no effect, a trace barrier like every native;
+      determinism-invisible. ASCII is the identity on both directions. Lives in
+      `src/stdlib/string.zig` (`sEncode`/`sDecode`); unit tests there + 8-mode
+      `expectProgram` parity in `interp.zig`. CSV rows `string.encode`/
+      `string.decode` → implemented. **Strings are still byte-indexed at this
+      point** — S-A only *adds* the conversion; code-point semantics arrive in S-B.
 
 ### Outstanding
-
-- [ ] **S-A — the bytes world + conversion boundary** (additive, no
-      string-semantics change). `string.encode`/`s:encode()` → byte array;
-      `string.decode(bytes)` → string | error (validates UTF-8). Bytes are plain
-      integer arrays; no new type.
-- [ ] **S-B — strings become code-point-native** (the breaking core).
-      `#s`/`len`/`sub`/`reverse`/iteration/`string.char`/`string.codepoint` move
-      to code points; cached code-point count on the heap string; the valid-UTF-8
-      invariant enforced at the construction boundary; `\u{…}` lexer escape;
-      `\xNN`/`\ddd` source escapes build byte arrays, not strings. `utf8.*`
-      dissolves into the string type.
+- [x] **S-B — strings become code-point-native** (the breaking core).
+      `#s`/`len`/`sub`/`reverse`/`string.char`/`string.codepoint`/`s:codes()`
+      index by code point; cached `cp_len` on the heap string (computed in
+      `String.create`, recomputed on restore — no schema bump); the valid-UTF-8
+      invariant enforced at the construction boundary (`decodeString` +
+      `utf8ValidateSlice`); `\u{…}` lexer escape; `\xNN`/`\ddd` source escapes are
+      ASCII-only (a byte ≥ 0x80 is a compile error pointing at `\u{…}` or a byte
+      array). `string.byte` removed; `utf8.*` dissolves into the string type. The
+      char-index `sub` vs still-byte-index pattern functions (`find`/`match`/…)
+      gap is the explicit intermediate state, closed in S-D. (Patterns and case
+      mapping stay byte/ASCII-level until S-C/S-D.)
 - [ ] **S-C — case mapping + pinned Unicode version** (determinism gate).
       `upper`/`lower` Unicode-aware via a vendored, versioned table; ASCII fast
       path; `unicode_version` recorded as a session effect (like the RNG seed).
@@ -124,8 +135,21 @@ including `\u{…}` escapes); (2) concatenation of two valid strings (valid UTF-
 valid UTF-8 = valid UTF-8, no re-check); (3) number/bool coercion in `..`/
 `tostring` (ASCII, trivially valid); (4) `string.char(cp…)` from code points
 (each validated in range, then encoded); (5) `string.decode(bytes)` (the one
-*fallible* constructor — validates, errors on malformed UTF-8). Because strings
-are immutable and interned, validation happens exactly once per distinct content.
+*fallible* constructor — validates, errors on malformed UTF-8); (6) **host inputs**
+— `getenv`/`argv`/`file_read` content and the `arg[]` table — which can supply
+arbitrary bytes and are therefore *also fallible*: the host-input boundary
+validates and raises a catchable error on malformed UTF-8 (`Vm.validateHostText`),
+exactly like `decode`. Because strings are immutable and interned, validation
+happens exactly once per distinct content.
+
+For the **recorded** host inputs (`getenv`/`argv`/`file_read` are nondeterministic
+effects), validation runs *after* the effect is logged, on the recorded result —
+so `record` (fresh intern) and `replay` (re-intern from the log) validate the
+identical bytes and raise identically. The effect log stores the raw bytes; the
+raise is reproduced from them, never smuggled around the log. `internValue` itself
+stays unchecked: every *internal* caller (concat, coercion, error messages, the
+replay re-intern, keyframe restore) is valid by construction, so the host boundary
+is the only place that validates.
 
 ### Cached code-point length (the spare-bits payoff)
 
