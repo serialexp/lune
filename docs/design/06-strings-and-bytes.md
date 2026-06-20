@@ -63,9 +63,19 @@ those stay byte-keyed and unchanged, which is what keeps determinism cheap.
       effect-log prefix rather than carrying a keyframe field, so only
       `effect_format_version` bumped (3→4). Simple mapping is count-preserving:
       `ß`/`ﬀ` are unchanged (no length-changing or locale tailoring).
-- [ ] **S-D — patterns on code points**. `.`, captures, and quantifiers step by
-      code point; `%a %l %u %d …` classes stay ASCII for now (Unicode property
-      classes deferred).
+- [x] **S-D — patterns on code points** *(landed)*. The matcher steps the subject
+      by code point — `.` matches one whole code point, a literal multibyte char is
+      one item, and quantifiers/anchors/captures advance by code-point width — while
+      `find`/`match`/`gmatch`/`gsub` accept and return 1-based **character** indices
+      (so `find` composes with code-point-indexed `sub`; position captures `()` are
+      character indices). `%a %l %u %d …` classes and bracket sets stay **ASCII**:
+      a class never matches a non-ASCII byte (a load-bearing guard — without it a
+      UTF-8 lead/continuation byte would wrongly satisfy the *complement* classes
+      `%A`/`%D`/`[^…]`). **Caveat:** multibyte characters inside bracket sets
+      (`[é]`, `[é-ñ]`) and multibyte `%b` delimiters stay byte/ASCII-level (won't
+      match a whole code point). The matcher is a pure, allocation-free function of
+      its byte inputs — no host effect, no new recorded input — so 8-mode
+      determinism is inherited. Unicode property classes (`\p{L}`) deferred.
 - [ ] **S-E — the `u8` array lane** (perf follow-up, JIT gate). One more rung on
       the monotonic lane lattice so byte arrays pack at one byte/slot;
       zero-extending native load/store in `nativegen.zig`.
@@ -336,22 +346,47 @@ nondeterministic inputs: **the recorded session.**
 - ASCII (`< U+0080`) gets a branch-free fast path; the vendored table is consulted
   only above U+007F. Default case mapping only (no locale tailoring).
 
-## Pattern matching (S-D)
+## Pattern matching (S-D) — landed
 
-The engine (`src/stdlib/pattern.zig`) is byte-oriented today. The plan:
+The engine (`src/stdlib/pattern.zig`) is now code-point-oriented:
 
 - `.`, literal characters, captures, anchors, and quantifiers (`* + - ?`) step by
   **code point** (one UTF-8 sequence at a time), so `.` matches one character and
-  `s:gsub(".", …)` walks characters.
-- The class shorthands `%a %l %u %d %s %w %p %c %x` stay **ASCII** for now.
-  Unicode property classes (`\p{L}`-style) are a deferred follow-up — they would
-  add their own versioned property tables and a second determinism surface; out
-  of scope until there's demand.
+  `s:gsub(".", …)` walks characters. The subject is always valid UTF-8 (S-B
+  invariant), so each advance lands on a code-point boundary and reaches `src.len`
+  exactly — every `$`/end check stays valid. Greedy backtracking (`maxExpand`)
+  steps back one code point at a time via a backward continuation-byte scan
+  (`cur -= 1; while (src[cur] & 0xC0) == 0x80) cur -= 1`), so the matcher stays
+  **allocation-free** (no scratch buffer, no allocator on `MatchState`).
+- The class shorthands `%a %l %u %d %s %w %p %c %x` (and bracket sets) stay
+  **ASCII**. The `singleMatch` caller guards every class/bracket test with
+  `src[s] < 0x80` — **load-bearing, not an optimization**: without it a UTF-8
+  lead/continuation byte (≥0x80) would wrongly satisfy a *complement* class
+  (`%A`/`%D`/`%S`, `[^…]`, all `!isX(byte)` tests). Unicode property classes
+  (`\p{L}`-style) are a deferred follow-up — they would add their own versioned
+  property tables and a second determinism surface; out of scope until there's
+  demand.
+- **Boundary (character indices).** `find`/`match`/`gmatch`/`gsub` accept and
+  return 1-based **character** indices at the `src/stdlib/string.zig` seam: `init`
+  is a character index (`charByteOffset`), `find`'s start/end are character indices
+  (`cpCount`), and position captures `()` are character indices. Captures stay
+  **byte offsets** inside the engine and convert only at the seam. ASCII is
+  numerically identical, so existing ASCII tests/benches are untouched.
+- **Caveat (out of scope, documented).** Multibyte characters inside bracket sets
+  (`[é]`, `[é-ñ]`) and multibyte `%b` delimiters stay byte/ASCII-level — they
+  won't match a whole code point. `%b` and back-references are correct on
+  boundary-aligned spans (byte-equal == code-point-equal there). The `%f` frontier
+  is the one path that feeds a subject byte to an ASCII set *without* the
+  `< 0x80` guard — deliberately: it is **zero-width** (consumes nothing, so it
+  cannot split a code point) and is a byte-for-byte port of Lua 5.4's frontier. A
+  multibyte character is not an ASCII letter, so every one of its bytes reads as
+  `%A`/`%D`/… — the frontier therefore fires entering a multibyte char from an
+  ASCII letter, consistent with the ASCII-class rule (pinned by test).
 - Byte-exact matching, when wanted, is available by matching over a byte array
   view (`s:encode()`); the string-level engine is text-level.
 
 This bounds the new Unicode determinism surface to **exactly one table** (case
-mapping) for the whole effort.
+mapping) for the whole effort — the matcher itself adds no recorded input.
 
 ## Lexer & source (S-B)
 

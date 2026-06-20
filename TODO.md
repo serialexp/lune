@@ -18,10 +18,24 @@ escape; `\xNN`/`\ddd` are ASCII-only (byte ≥ 0x80 → compile error); every li
 validated UTF-8 at construction (`decodeString` + `utf8ValidateSlice`).
 `string.byte` removed; no `utf8` module ships. CSV + doc-06 updated in lockstep.
 
-**Known intermediate state (closed in S-D):** `sub`/`reverse`/`codepoint` index by
-code point, but the pattern functions (`find`/`match`/`gmatch`/`gsub`) still return
-**byte** indices and match byte-wise. Fine for ASCII; the char-vs-byte gap is the
-doc's explicit staging. `upper`/`lower` stay ASCII C-locale until S-C.
+**S-D LANDED (June 2026) — patterns on code points + character indices.** The
+matcher (`src/stdlib/pattern.zig`) now steps the **subject** by code point: `.`
+matches one whole code point, a literal multibyte char is one item (`classEnd`
+groups the UTF-8 sequence), and quantifiers/anchors/captures advance by code-point
+width. Greedy `maxExpand` backtracks one code point at a time via a backward
+continuation-byte scan (`cur -= 1; while (src[cur] & 0xC0)==0x80`), so `MatchState`
+stays **allocation-free** (no scratch). Class shorthands (`%a %d …`) and bracket
+sets stay **ASCII**, guarded by `src[s] < 0x80` in `singleMatch` — load-bearing,
+not an optimization: without it a high byte wrongly satisfies a *complement* class
+(`%A`/`%D`/`[^…]`). At the `string.zig` seam, `find`/`match`/`gmatch`/`gsub` accept
+and return 1-based **character** indices (`resolveInit`→`charByteOffset`, byte
+offsets→`cpCount`, position captures `()`→`byteToChar`); captures stay byte offsets
+inside the engine and convert only at the boundary. The matcher is a pure,
+allocation-free function of its byte inputs — no host effect, no recorded input —
+so 8-mode determinism is inherited (asserted by an `expectProgram` test). **Caveat
+(documented, out of scope):** multibyte chars inside bracket sets (`[é]`, `[é-ñ]`)
+and multibyte `%b` delimiters stay byte/ASCII-level; Unicode property classes
+(`\p{L}`) deferred. CSV + doc-06 updated in lockstep.
 
 **RESOLVED — host-input UTF-8 boundary.** S-B's review (Codex + Antigravity) flagged
 that the "every string is valid UTF-8 by construction" invariant held for string
@@ -65,8 +79,8 @@ it is exposed *symmetrically* for both effects, so the fix belongs at the keyfra
 layer (persist `rng`/`effect_cursor`/`effect_log` + a `snapshot_format_version` bump),
 not as a per-effect patch. Out of scope for S-C — noted so it isn't lost.
 
-**Next in the arc (not started):** S-D (patterns on code points), S-E (the `u8`
-array lane). Each gets the Codex+Antigravity gate where determinism-adjacent.
+**Next in the arc (not started):** S-E (the `u8` array lane — perf follow-up, JIT
+gate). Each gets the Codex+Antigravity gate where determinism-adjacent.
 
 ## `load` / `loadfile` / `dofile` LANDED — deferred follow-ups (June 2026)
 

@@ -5270,6 +5270,32 @@ test "S-C: a unicode_version log entry with a non-int (float) result is rejected
     ));
 }
 
+test "S-D: pattern matching over multibyte text is byte-identical across all modes" {
+    // find/match/gmatch/gsub on a code-point-native string: character indices,
+    // whole-code-point `.`, and multibyte gsub. Pattern ops are pure natives (JIT
+    // trace barriers), so 8-mode parity is inherited — assert it. No host effect,
+    // so this needs no recorded input.
+    try expectProgram(
+        \\local s = "héllo wörld"
+        \\print(s:find("l"))            -- char start/end of first 'l'
+        \\print(s:match("h(.)"))        -- captures the whole 'é'
+        \\print(s:find("w()"))          -- start,end then position capture (char index)
+        \\local t = {}
+        \\for c in s:gmatch("%a") do t[#t+1] = c end
+        \\print(#t, t[1], t[6])         -- ASCII-class only matches ASCII letters
+        \\print((s:gsub(".", "x")))     -- every code point replaced once
+        \\print(s:sub(s:find("wörld"))) -- find result composes with char-indexed sub
+        \\
+    ,
+        "3\t3\n" ++
+            "é\n" ++
+            "7\t7\t8\n" ++
+            "8\th\tr\n" ++
+            "xxxxxxxxxxx\n" ++
+            "wörld\n",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // L-3 — `loadfile`/`dofile` + the `file_read` effect. A file read is a
 // nondeterministic input (the filesystem differs between machines/runs), so the

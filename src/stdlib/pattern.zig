@@ -119,7 +119,18 @@ pub const MatchState = struct {
                 }
                 return pp + 1;
             },
-            else => return pp,
+            else => {
+                // A literal pattern item. ASCII → one byte (`pp == p + 1`). A
+                // UTF-8 lead byte (≥0x80) groups its continuation bytes so a
+                // multibyte literal is ONE item and a following quantifier binds
+                // the whole character (`é*`, `é+`, `(é)`). The pattern is NOT
+                // guaranteed valid UTF-8 (it can be `string.char`/`decode`-built),
+                // so `catch 1` + the `@min` clamp keep `classEnd` total on a
+                // truncated/lone-continuation tail (degrades to a 1-byte literal).
+                if (c < 0x80) return pp;
+                const n: usize = std.unicode.utf8ByteSequenceLength(c) catch 1;
+                return @min(p + n, pat.len);
+            },
         }
     }
 
@@ -148,14 +159,56 @@ pub const MatchState = struct {
         return !sig;
     }
 
-    /// `singlematch(c, p, ep)` — does byte `c` match the single pattern item at
-    /// `[p, ep)`?
-    fn singleMatch(self: *const MatchState, c: u8, p: usize, ep: usize) bool {
+    /// Byte width of the UTF-8 code point starting at subject offset `s` (S-D).
+    /// `src` is always valid UTF-8 (the S-B invariant), so the lead byte is
+    /// well-formed; `catch 1` is a total-function backstop. Never returns 0 and
+    /// never overshoots `src.len`, so advancing `s += seqLen(s)` from a code-point
+    /// boundary always lands on the next boundary and reaches `src.len` exactly —
+    /// keeping every `s == src.len` / `s < src.len` end-check valid. `pub` because
+    /// the `string.zig` outer scans (`find`/`gmatch`/`gsub`) step by it too.
+    pub fn seqLen(self: *const MatchState, s: usize) usize {
+        if (s >= self.src.len) return 0;
+        const n: usize = std.unicode.utf8ByteSequenceLength(self.src[s]) catch 1;
+        return @min(n, self.src.len - s);
+    }
+
+    /// `singlematch(s, p, ep)` — does the single pattern item at `[p, ep)` match
+    /// the code point at subject offset `s`? (S-D: takes a subject offset, not a
+    /// pre-read byte, so the literal arm can compare a whole multibyte sequence.)
+    /// `.` matches any one code point; a `%`-class / bracket set matches exactly
+    /// one **ASCII** byte — the `src[s] < 0x80` guard is load-bearing, not an
+    /// optimization: without it a UTF-8 continuation/lead byte (≥0x80) would
+    /// wrongly satisfy a *complement* class (`%A`/`%D`/`%S`, `[^…]`), which test
+    /// `!isAlphabetic(b)` etc. and so return true for a high byte.
+    fn singleMatch(self: *const MatchState, s: usize, p: usize, ep: usize) bool {
+        if (s >= self.src.len) return false;
+        const c = self.src[s];
         return switch (self.pat[p]) {
             '.' => true,
-            l_esc => matchClass(c, self.pat[p + 1]),
-            '[' => self.matchBracket(c, p, ep - 1),
-            else => self.pat[p] == c,
+            l_esc => c < 0x80 and matchClass(c, self.pat[p + 1]),
+            '[' => c < 0x80 and self.matchBracket(c, p, ep - 1),
+            else => self.litEq(s, p, ep),
+        };
+    }
+
+    /// A literal pattern item spans `pat[p..ep)` — one byte for an ASCII literal,
+    /// the whole lead+continuation run for a multibyte literal (grouped by
+    /// `classEnd`). It matches iff the subject sequence at `s` is byte-identical,
+    /// which for valid UTF-8 is equivalent to a code-point compare (the encoding
+    /// is canonical/prefix-free).
+    fn litEq(self: *const MatchState, s: usize, p: usize, ep: usize) bool {
+        const item = self.pat[p..ep];
+        return self.src.len - s >= item.len and
+            std.mem.eql(u8, self.src[s .. s + item.len], item);
+    }
+
+    /// Byte width consumed by a *successful* `singleMatch` of the item at `p`
+    /// starting at `s`. `.`/literal consume the whole code point; a class/bracket
+    /// consume exactly one byte (the `singleMatch` guard proved it ASCII).
+    fn matchWidth(self: *const MatchState, s: usize, p: usize) usize {
+        return switch (self.pat[p]) {
+            l_esc, '[' => 1,
+            else => self.seqLen(s), // '.' or a literal item
         };
     }
 
@@ -227,13 +280,20 @@ pub const MatchState = struct {
     }
 
     fn maxExpand(self: *MatchState, s: usize, p: usize, ep: usize) Error!?usize {
-        var i: usize = 0;
-        while (s + i < self.src.len and self.singleMatch(self.src[s + i], p, ep)) i += 1;
-        // Greedy: try the longest run first, backing off one repetition at a time.
+        // Greedily consume matching code points (S-D: step by code-point width,
+        // not by byte). `cur` lands on the furthest code-point boundary that still
+        // matches the single item.
+        var cur = s;
+        while (self.singleMatch(cur, p, ep)) cur += self.matchWidth(cur, p);
+        // Greedy: try the longest run first, backing off ONE code point at a time.
+        // Stepping `cur` back to the previous boundary is an O(1) backward scan
+        // over continuation bytes (valid because `src` is valid UTF-8) — so no
+        // scratch buffer / allocation is needed to undo variable-width repetitions.
         while (true) {
-            if (try self.match(s + i, ep + 1)) |r| return r;
-            if (i == 0) return null;
-            i -= 1;
+            if (try self.match(cur, ep + 1)) |r| return r;
+            if (cur == s) return null;
+            cur -= 1;
+            while (cur > s and (self.src[cur] & 0xC0) == 0x80) cur -= 1;
         }
     }
 
@@ -241,8 +301,8 @@ pub const MatchState = struct {
         var s = s0;
         while (true) {
             if (try self.match(s, ep + 1)) |r| return r;
-            if (s < self.src.len and self.singleMatch(self.src[s], p, ep)) {
-                s += 1; // one more repetition
+            if (self.singleMatch(s, p, ep)) {
+                s += self.matchWidth(s, p); // one more repetition, by code point
             } else {
                 return null;
             }
@@ -317,24 +377,26 @@ pub const MatchState = struct {
                 }
             }
 
-            // dflt: a single pattern item, possibly with a quantifier.
+            // dflt: a single pattern item, possibly with a quantifier. (S-D: the
+            // subject advances by the matched item's code-point width, not 1 byte.)
             const ep = try self.classEnd(p);
-            const m = s < src.len and self.singleMatch(src[s], p, ep);
+            const m = self.singleMatch(s, p, ep);
+            const w = if (m) self.matchWidth(s, p) else 0;
             const q: u8 = if (ep < pat.len) pat[ep] else 0;
             switch (q) {
                 '?' => {
                     if (m) {
-                        if (try self.match(s + 1, ep + 1)) |r| return r;
+                        if (try self.match(s + w, ep + 1)) |r| return r;
                     }
                     p = ep + 1;
                     continue; // goto init
                 },
                 '*' => return try self.maxExpand(s, p, ep),
-                '+' => return if (m) try self.maxExpand(s + 1, p, ep) else null,
+                '+' => return if (m) try self.maxExpand(s + w, p, ep) else null,
                 '-' => return try self.minExpand(s, p, ep),
                 else => {
                     if (m) {
-                        s += 1;
+                        s += w;
                         p = ep;
                         continue; // goto init
                     }
@@ -377,7 +439,7 @@ fn firstMatch(src: []const u8, pat: []const u8) !?[2]usize {
         ms.reset();
         if (try ms.match(s, pp)) |e| return [2]usize{ s, e };
         if (s >= src.len or anchor) break;
-        s += 1;
+        s += ms.seqLen(s); // S-D: advance the scan by a whole code point
     }
     return null;
 }
@@ -464,4 +526,96 @@ test "hasSpecials" {
     try testing.expect(hasSpecials("a.b"));
     try testing.expect(hasSpecials("%d"));
     try testing.expect(hasSpecials("[abc]"));
+}
+
+// ---------------------------------------------------------------------------
+// S-D — the subject steps by code point. Byte-offset asserts (the boundary in
+// string.zig converts to character indices). "é" = C3 A9 (2 bytes), "ß" = C3 9F,
+// "€" = E2 82 AC (3 bytes). All returned offsets land on code-point boundaries.
+// ---------------------------------------------------------------------------
+
+test "S-D: '.' matches one whole code point" {
+    // "é" is 2 bytes; '.' consumes the whole character, not one byte.
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 2 }), try firstMatch("é", "."));
+    // 'b' after "aé": '.' over the 'é' lands the literal 'b' at the right byte.
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 4 }), try firstMatch("aéb", "a.b"));
+}
+
+test "S-D: '(.)' captures a whole multibyte code point" {
+    var ms = MatchState.init("é", "(.)");
+    ms.reset();
+    const e = (try ms.match(0, 0)).?;
+    try testing.expectEqual(@as(usize, 2), e);
+    try testing.expectEqual(Capture{ .init = 0, .len = 2 }, ms.captures[0]); // whole "é"
+}
+
+test "S-D: greedy/lazy quantifiers over mixed ASCII+multibyte" {
+    // '.*' greedy consumes everything, ending exactly at the byte length.
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 5 }), try firstMatch("aé b", ".*"));
+    // '.*b' backtracks by whole code points to land 'b'.
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 4 }), try firstMatch("aéb", ".*b"));
+    // '.-c' lazy: shortest run, stepping by code point.
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 5 }), try firstMatch("aébc", ".-c"));
+}
+
+test "S-D: a literal multibyte char is one item under a quantifier" {
+    // 'é+' must quantify the whole 2-byte char, not split it (classEnd grouping).
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 6 }), try firstMatch("ééé", "é+"));
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 4 }), try firstMatch("ééx", "é+"));
+    // 'é?' optional: zero repetitions at a non-é subject is an empty match.
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 0 }), try firstMatch("x", "é?"));
+    // '€*' with a 3-byte char.
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 6 }), try firstMatch("€€a", "€*"));
+}
+
+test "S-D: ASCII classes stop at a non-ASCII byte and never match high bytes" {
+    // '%a+' consumes ASCII letters then stops before é's lead byte (0xC3).
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 2 }), try firstMatch("abéc", "%a+"));
+    // A complement class '%A' must NOT match a UTF-8 lead/continuation byte: an
+    // all-multibyte subject has no %A match at all (the load-bearing <0x80 guard).
+    try testing.expectEqual(@as(?[2]usize, null), try firstMatch("éé", "%A"));
+    // '%s' / '%d' likewise never match high bytes.
+    try testing.expectEqual(@as(?[2]usize, null), try firstMatch("é", "%d"));
+}
+
+test "S-D: anchors, %b, and back-references with multibyte" {
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 2 }), try firstMatch("éabc", "^é"));
+    // %b() with ASCII delimiters and a multibyte body.
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 5 }), try firstMatch("(aé)x", "%b()"));
+    // Back-reference re-matches a captured multibyte span byte-for-byte.
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 4 }), try firstMatch("éé", "(é)%1"));
+    try testing.expectEqual(@as(?[2]usize, null), try firstMatch("éx", "(é)%1"));
+}
+
+test "S-D: %f frontier classifies a multibyte char by its (non-ASCII) bytes" {
+    // `%f` is the one matcher path that feeds subject bytes to an ASCII bracket
+    // set WITHOUT the `singleMatch` `< 0x80` guard — deliberately: it is
+    // zero-width (consumes nothing, so it can never split a code point) and is a
+    // byte-for-byte port of Lua 5.4's frontier (`prev = src[s-1]`, `cur = src[s]`).
+    // Under lune's ASCII-only classes a multibyte char is NOT an ASCII letter, so
+    // every one of its bytes reads as `%A` (non-alpha). The frontier therefore
+    // fires entering a multibyte char from an ASCII letter — consistent with the
+    // documented "classes stay ASCII" rule, not a leak of the guard. Pinned so the
+    // decision is explicit.
+    // 'a' then a frontier INTO a non-ASCII-alpha region (the 'é'): fires, so the
+    // zero-width match ends right after the 'a' (byte 1).
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 1 }), try firstMatch("aé", "a%f[%A]"));
+    // Between two ASCII letters there is no %A frontier: no match anywhere.
+    try testing.expectEqual(@as(?[2]usize, null), try firstMatch("ab", "a%f[%A]"));
+    // Symmetric: a frontier INTO ASCII-alpha fires at the boundary after the 'é'.
+    try testing.expectEqual(@as(?[2]usize, .{ 2, 3 }), try firstMatch("éb", "%f[%a]%a"));
+}
+
+test "S-D: classEnd is total on a truncated multibyte pattern tail" {
+    // Defensive: the matcher accepts arbitrary []const u8, but every *real* lune
+    // string (subject AND pattern) is valid UTF-8 (the S-B invariant), so a
+    // pattern with a lone lead byte 0xC3 is unreachable in practice. We only
+    // require totality here: classEnd must not read past pat.len and match must
+    // return a boundary-aligned result without panicking. (The degenerate
+    // outcome — the 1-byte literal byte-matches é's lead byte and then advances
+    // by the whole code point — is not a contract, just "no crash".)
+    var ms = MatchState.init("é", "\xC3");
+    ms.reset();
+    const r = try ms.match(0, 0); // must not panic / read OOB
+    if (r) |e| try testing.expect(e == 0 or e == 2); // boundary-aligned if it matched
 }

@@ -816,19 +816,23 @@ fn formatNonStr(out: *std.ArrayList(u8), gpa: std.mem.Allocator, v: Value, spec:
 /// Local result buffer: 2 (find's start/end) + up to `max_captures`.
 const ResultBuf = [pattern.max_captures + 2]Value;
 
-/// Resolve Lua's `init` argument to a 0-based scan offset, or `null` if it lands
-/// past the end of `s` (→ no match). Negative counts from the end; positive is
-/// 1-based; `0` is treated as `1` (offset 0).
-fn resolveInit(init_raw: i64, len: usize) ?usize {
-    var init = init_raw;
-    if (init < 0) {
-        init += @intCast(len); // -1 → last char (0-based len-1)
-        if (init < 0) init = 0;
-    } else if (init > 0) {
-        init -= 1; // 1-based → 0-based
-    }
-    if (init > @as(i64, @intCast(len))) return null; // start past end
-    return @intCast(init);
+/// Resolve Lua's `init` argument (a 1-based **character** index, S-D) to a 0-based
+/// **byte** offset into `s`, or `null` if it lands past the end (→ no match).
+/// Negative counts back from the end in characters; `0`/positive are 1-based; the
+/// result lands on a code-point boundary (`charByteOffset`). `pos == clen + 1`
+/// (one past the last char) maps to `s.len` — the empty-match-at-end position.
+fn resolveInit(init_raw: i64, s: []const u8) ?usize {
+    const clen = cpCount(s);
+    var pos = posRelat(init_raw, clen); // 1-based char position (may be 0)
+    if (pos < 1) pos = 1;
+    if (pos > @as(i64, @intCast(clen)) + 1) return null; // start past end+1
+    return charByteOffset(s, @intCast(pos));
+}
+
+/// Convert a 0-based byte offset on a code-point boundary in `s` to a 1-based
+/// **character** index (S-D boundary translation). `off == s.len` → `cpCount + 1`.
+fn byteToChar(s: []const u8, off: usize) usize {
+    return cpCount(s[0..off]) + 1;
 }
 
 /// Convert capture `i` of a completed match to a `Value`, mirroring
@@ -845,7 +849,7 @@ fn captureValue(vm: *Vm, ms: *const pattern.MatchState, i: usize, whole: ?[2]usi
     }
     const cap = ms.captures[i];
     if (cap.len == pattern.cap_unfinished) return error.MalformedPattern;
-    if (cap.len == pattern.cap_position) return Value.int(@intCast(cap.init + 1));
+    if (cap.len == pattern.cap_position) return Value.int(@intCast(byteToChar(ms.src, cap.init)));
     const l: usize = @intCast(cap.len);
     return vm.heap.internValue(ms.src[cap.init .. cap.init + l]);
 }
@@ -872,23 +876,25 @@ fn writeCaptures(vm: *Vm, ms: *const pattern.MatchState, whole: ?[2]usize, buf: 
 fn findCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     const s = try strArg(vm, args, 0);
     const pat = try strArg(vm, args, 1);
-    const st = resolveInit(try optIntArg(vm, args, 2, 1), s.len) orelse {
+    const st = resolveInit(try optIntArg(vm, args, 2, 1), s) orelse {
         buf[0] = Value.nil();
         return 1;
     };
     const plain = args.len >= 4 and args[3].isTruthy();
 
     if (plain or !pattern.hasSpecials(pat)) {
-        // Plain substring search (empty needle matches at `st`).
+        // Plain substring search (empty needle matches at `st`). Byte offsets are
+        // converted to 1-based character indices at the seam (S-D).
         if (pat.len == 0) {
-            buf[0] = Value.int(@intCast(st + 1));
-            buf[1] = Value.int(@intCast(st));
+            buf[0] = Value.int(@intCast(byteToChar(s, st)));
+            buf[1] = Value.int(@intCast(byteToChar(s, st) - 1));
             return 2;
         }
         if (st <= s.len) {
+            // A plain substring of valid UTF-8 lands on a code-point boundary.
             if (std.mem.indexOfPos(u8, s, st, pat)) |q| {
-                buf[0] = Value.int(@intCast(q + 1));
-                buf[1] = Value.int(@intCast(q + pat.len));
+                buf[0] = Value.int(@intCast(byteToChar(s, q)));
+                buf[1] = Value.int(@intCast(cpCount(s[0 .. q + pat.len])));
                 return 2;
             }
         }
@@ -904,13 +910,13 @@ fn findCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     while (true) {
         ms.reset();
         if (try ms.match(sp, pp)) |e| {
-            buf[0] = Value.int(@intCast(sp + 1));
-            buf[1] = Value.int(@intCast(e));
+            buf[0] = Value.int(@intCast(byteToChar(s, sp)));
+            buf[1] = Value.int(@intCast(cpCount(s[0..e])));
             const nc = try writeCaptures(vm, &ms, null, buf[2..]);
             return 2 + nc;
         }
         if (sp >= s.len or anchor) break;
-        sp += 1;
+        sp += ms.seqLen(sp);
     }
     buf[0] = Value.nil();
     return 1;
@@ -935,7 +941,7 @@ fn sFindN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 fn matchCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     const s = try strArg(vm, args, 0);
     const pat = try strArg(vm, args, 1);
-    const st = resolveInit(try optIntArg(vm, args, 2, 1), s.len) orelse {
+    const st = resolveInit(try optIntArg(vm, args, 2, 1), s) orelse {
         buf[0] = Value.nil();
         return 1;
     };
@@ -951,7 +957,7 @@ fn matchCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
             return try writeCaptures(vm, &ms, .{ sp, e }, buf);
         }
         if (sp >= s.len or anchor) break;
-        sp += 1;
+        sp += ms.seqLen(sp);
     }
     buf[0] = Value.nil();
     return 1;
@@ -1009,10 +1015,12 @@ fn gmatchAuxCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     var src: usize = if (pos_v.isInt() and pos_v.asInt() >= 0) @intCast(pos_v.asInt()) else 0;
 
     var ms = pattern.MatchState.init(s, pat);
-    while (src <= s.len) : (src += 1) {
+    while (src <= s.len) : (src += @max(ms.seqLen(src), 1)) {
         ms.reset();
         if (try ms.match(src, 0)) |e| {
-            const newpos = if (e == src) e + 1 else e; // ensure progress on empty match
+            // Ensure progress on an empty match by stepping a whole code point
+            // (S-D); `@max(…, 1)` guarantees termination at end-of-string.
+            const newpos = if (e == src) e + @max(ms.seqLen(e), 1) else e;
             try st.set(vm.gpa, Value.int(3), Value.int(@intCast(newpos)));
             return try writeCaptures(vm, &ms, .{ src, e }, buf);
         }
@@ -1168,12 +1176,16 @@ fn gsubCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
             if (e > src) {
                 src = e;
             } else if (src < s.len) {
-                try out.append(vm.gpa, s[src]);
-                src += 1;
+                // Empty match: copy the unmatched code point whole (S-D) so we
+                // never splice a partial UTF-8 sequence.
+                const w = ms.seqLen(src);
+                try out.appendSlice(vm.gpa, s[src .. src + w]);
+                src += w;
             } else break;
         } else if (src < s.len) {
-            try out.append(vm.gpa, s[src]);
-            src += 1;
+            const w = ms.seqLen(src);
+            try out.appendSlice(vm.gpa, s[src .. src + w]);
+            src += w;
         } else break;
         if (anchor) break;
     }
@@ -1583,6 +1595,70 @@ test "@gmatch_iter walks the state table and stops when exhausted" {
     }
     // Exhausted → 0 results.
     try testing.expectEqual(@as(usize, 0), try sGmatchAuxN(@ptrCast(&vm), &.{stv}, &out));
+}
+
+test "S-D: find/match/gmatch/gsub report and accept CHARACTER indices (multibyte)" {
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    var out: [6]Value = undefined;
+
+    // "héllo": h(1) é(2) l(3) l(4) o(5) — 5 chars, 6 bytes (é is 2 bytes).
+    const hello = try sv(&vm, "héllo");
+
+    // find returns a CHARACTER start/end: 'l' is char 3, not byte 4.
+    var n = try sFindN(@ptrCast(&vm), &.{ hello, try sv(&vm, "l") }, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(i64, 3), out[0].asInt());
+    try testing.expectEqual(@as(i64, 3), out[1].asInt());
+
+    // find result composes with char-indexed sub: sub(start,end) == match.
+    n = try sFindN(@ptrCast(&vm), &.{ hello, try sv(&vm, "llo") }, &out);
+    try testing.expectEqual(@as(i64, 3), out[0].asInt());
+    try testing.expectEqual(@as(i64, 5), out[1].asInt());
+    try testing.expectEqualStrings("llo", bytesOf(try sSub(@ptrCast(&vm), &.{ hello, out[0], out[1] })));
+
+    // `.` matches a whole multibyte code point; find spans it as one character.
+    n = try sFindN(@ptrCast(&vm), &.{ hello, try sv(&vm, "h(.)") }, &out);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqual(@as(i64, 1), out[0].asInt()); // start char
+    try testing.expectEqual(@as(i64, 2), out[1].asInt()); // end char (the 'é')
+    try testing.expectEqualStrings("é", bytesOf(out[2])); // capture is the whole code point
+
+    // Position capture `()` reports a CHARACTER index.
+    n = try sMatchN(@ptrCast(&vm), &.{ hello, try sv(&vm, "l()") }, &out);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(i64, 4), out[0].asInt()); // position after first 'l' = char 4
+
+    // `init` is a 1-based CHARACTER index: starting the scan at char 3 skips 'é'.
+    n = try sFindN(@ptrCast(&vm), &.{ try sv(&vm, "é=é"), try sv(&vm, "é"), Value.int(2) }, &out);
+    try testing.expectEqual(@as(i64, 3), out[0].asInt()); // the second 'é' is char 3
+
+    // gmatch over a multibyte string yields char-aligned whole code points.
+    const st = try vm.heap.newTable();
+    try st.set(vm.gpa, Value.int(1), try sv(&vm, "áéí"));
+    try st.set(vm.gpa, Value.int(2), try sv(&vm, "."));
+    try st.set(vm.gpa, Value.int(3), Value.int(0));
+    const stv = Value.heap(&st.header);
+    const want = [_][]const u8{ "á", "é", "í" };
+    var gout: [2]Value = undefined;
+    for (want) |w| {
+        const gn = try sGmatchAuxN(@ptrCast(&vm), &.{stv}, &gout);
+        try testing.expectEqual(@as(usize, 1), gn);
+        try testing.expectEqualStrings(w, bytesOf(gout[0]));
+    }
+    try testing.expectEqual(@as(usize, 0), try sGmatchAuxN(@ptrCast(&vm), &.{stv}, &gout));
+
+    // gsub: "." matches each code point once → 5 replacements over "héllo".
+    var g2: [2]Value = undefined;
+    const gn = try sGsubN(@ptrCast(&vm), &.{ hello, try sv(&vm, "."), try sv(&vm, "x") }, &g2);
+    try testing.expectEqual(@as(usize, 2), gn);
+    try testing.expectEqualStrings("xxxxx", bytesOf(g2[0]));
+    try testing.expectEqual(@as(i64, 5), g2[1].asInt());
+
+    // gsub with no match copies the multibyte tail intact (never splits a char).
+    _ = try sGsubN(@ptrCast(&vm), &.{ hello, try sv(&vm, "z"), try sv(&vm, "Q") }, &g2);
+    try testing.expectEqualStrings("héllo", bytesOf(g2[0]));
+    try testing.expectEqual(@as(i64, 0), g2[1].asInt());
 }
 
 // --- encode / decode (S-A boundary) ----------------------------------------
