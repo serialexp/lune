@@ -755,7 +755,7 @@ test "lane: a sparse-first table still narrows once a dense int run fills in" {
     const N: i64 = 80;
     var i: i64 = 2;
     while (i <= N) : (i += 1) try t.set(gpa, Value.int(i), Value.int(@mod(i, 100)));
-    try testing.expectEqual(arr.Lane.i8, t.array.lane);
+    try testing.expectEqual(arr.Lane.u8, t.array.lane); // values in [0,255] → byte lane
     try testing.expect(t.array.isLeaf());
     i = 2;
     while (i <= N) : (i += 1) try testing.expectEqual(@mod(i, 100), t.get(Value.int(i)).asInt());

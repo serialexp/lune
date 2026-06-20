@@ -76,9 +76,23 @@ those stay byte-keyed and unchanged, which is what keeps determinism cheap.
       match a whole code point). The matcher is a pure, allocation-free function of
       its byte inputs — no host effect, no new recorded input — so 8-mode
       determinism is inherited. Unicode property classes (`\p{L}`) deferred.
-- [ ] **S-E — the `u8` array lane** (perf follow-up, JIT gate). One more rung on
-      the monotonic lane lattice so byte arrays pack at one byte/slot;
-      zero-extending native load/store in `nativegen.zig`.
+- [x] **S-E — the `u8` array lane** *(landed)*. A `u8` rung on the monotonic lane
+      lattice so byte arrays (integers in `[0,255]`) pack at **one byte/slot**
+      instead of `i16`'s two (a byte overflows signed `i8`'s 127 ceiling). `u8` is a
+      *sibling* entry point, not a rung below `i8`: `laneForValue`/`optimalLane` map
+      a non-negative int `≤ 255` to `u8` (via the new `intLaneForRange` chooser); a
+      negative or `> 255` store widens it to the smallest *signed* lane covering the
+      **combined** range `[min(0,v), max(255,v)]` — always `≥ i16`, never back to
+      `u8` or down to `i8` (so existing high bytes survive). `canWidenTo(.u8, ·) =
+      {i16, i32, i64, value}`; nothing widens *to* `u8`. The native load
+      zero-extends (`movzx`, the existing `loadRegMemSib(width=1, signed=false)`
+      encoder — no new op), where `i8..i64` sign-extend; `guard_fits` range-checks
+      `[0,255]` (lane-derived, not width-derived). The store path (width-truncate +
+      presence bit) is signedness-agnostic and composes unchanged. Lanes are never
+      serialised, so determinism/8-mode parity is inherited; the recorder gate keys
+      on `lane.isInt()`, which now includes `u8`. **Accepted trade:** `{1,2,3}`
+      commits `u8` (was `i8` — both 1 byte/slot, no difference); `{1,2,-3}` commits
+      `u8` then widens to `i16` (was `i8`).
 
 ## Why this exists
 
@@ -417,8 +431,10 @@ What changes, and why each is safe:
   header beside the RNG seed; re-pinned on replay. This is the entire new
   determinism input.
 - **The JIT** — untouched by S-A..S-D (string ops are natives → trace barriers,
-  as today). S-E (the `u8` lane) touches `nativegen.zig` load/store (zero-extend
-  vs i8 sign-extend) and gets the standard review gate.
+  as today). S-E (the `u8` lane, **landed**) adds a zero-extending (`movzx`) native
+  load and a lane-derived `[0,255]` `guard_fits` in `nativegen.zig`; lanes are never
+  serialised and the native load matches the tier-0 `decode` byte-for-byte, so
+  determinism is inherited (the change passed the Codex + Antigravity review gate).
 
 ## Work sequence (landable chunks)
 
@@ -473,10 +489,16 @@ during, or after it (it touches the compiler-entry surface, not strings).
   error** that points you at `\u{…}` (for a code point) or an integer array (for a
   raw byte). This keeps "derive it" — the values/representation carry byte-ness,
   no bespoke syntax — while respecting the U+0080 type distinction.
-- **`u8` lane and the `int_of_float`/store lowering.** `u8` needs zero-extension
-  on load where `i8..i64` sign-extend; confirm the `nativegen.zig` store path's
-  presence-bit + width-truncate shape composes with an unsigned lane without a
-  new op (S-E).
+- ~~**`u8` lane and the `int_of_float`/store lowering.**~~ **Resolved (S-E,
+  landed):** the store path composes with `u8` with **no new op**. The width-1
+  data write (`storeMemReg(width=1)`, which truncates to the low byte) plus the
+  presence-bit `bts` are identical for `u8` and `i8` — only the *load* differs, and
+  the existing `loadRegMemSib(width=1, signed=false)` already emits the
+  zero-extending `movzx` (`0F B6`). So `u8`'s sole codegen divergence is one boolean
+  flag on the load; `guard_fits` derives `[0,255]` from the lane ordinal. No
+  interaction with `int_of_float` (that op produces an `i64`-range int from a float;
+  whether the destination array is `u8` is decided by the same `fits`/widen path as
+  any int store).
 - **How often to vendor a new Unicode version.** Each adds a `switch` arm and a
   table blob. Given case-mapping stability, the answer is "rarely, and only when a
   newly-assigned character's case mapping is actually wanted." Pick an initial

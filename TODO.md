@@ -2,7 +2,7 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
-## Unicode-native strings (design doc 06) — S-A + S-B LANDED (June 2026)
+## Unicode-native strings (design doc 06) — S-A..S-E ALL LANDED (June 2026)
 
 S-A (text↔bytes boundary, `src/stdlib/string.zig`, `sEncode`/`sDecode`):
 `string.encode`/`s:encode()` → byte array (table, integer keys `1..n`, `0..255`),
@@ -79,8 +79,31 @@ it is exposed *symmetrically* for both effects, so the fix belongs at the keyfra
 layer (persist `rng`/`effect_cursor`/`effect_log` + a `snapshot_format_version` bump),
 not as a per-effect patch. Out of scope for S-C — noted so it isn't lost.
 
-**Next in the arc (not started):** S-E (the `u8` array lane — perf follow-up, JIT
-gate). Each gets the Codex+Antigravity gate where determinism-adjacent.
+**S-E LANDED (June 2026) — the `u8` (unsigned-byte) array lane.** Byte arrays
+(integers in `[0,255]`) now pack at **1 byte/slot** instead of `i16`'s two (a byte
+overflows signed `i8`'s 127 ceiling). `u8` is the final rung appended to the
+`Lane` enum (ordinal 7, so existing ordinals stay put — trace IR embeds them in
+`guard_lane.aux`). It is a *sibling* entry point, not below `i8`: a new
+`intLaneForRange(lo,hi)` chooser maps a non-negative `[lo,hi] ⊆ [0,255]` to `u8`
+and routes `laneForValue`/`optimalLane` through it; a negative or `>255` store
+widens to the smallest *signed* lane covering the **combined** range
+`[min(0,v),max(255,v)]` — always `≥ i16`, never `i8`, never back to `u8` (so high
+bytes survive), via `widenFor`'s `.u8` arm. `canWidenTo(.u8,·)={i16,i32,i64,value}`;
+nothing widens *to* `u8`. `decode` zero-extends (`@as(i64, byte)`), `encode`
+`@intCast`s, `laneFits`/`dataBytes`/`usesPresenceBitmap`/`isInt` get `u8` arms. In
+`nativegen.zig`: a `U8_LANE` const, `laneKind→.int`, `intLaneWidth→1`, an `aload`
+that zero-extends (`movzx` — the existing `loadRegMemSib(width=1, signed=false)`,
+**no new x64 op**) instead of the signed lanes' `movsx`, and a `guard_fits` that
+range-checks `[0,255]` derived from the *lane* (not the width, since width-1 is now
+ambiguous with `i8`). The store path (width-truncate + presence `bts`) is
+signedness-agnostic and unchanged; the trace recorder gate (`lane.isInt()`) now
+includes `u8` automatically. Lanes are never serialised and the native load matches
+tier-0 `decode` byte-for-byte, so determinism/8-mode parity is inherited. **Accepted
+trade (Bart's framing):** `{1,2,3}`→`u8` (was `i8`, both 1 B/slot); `{1,2,-3}`→`u8`
+then widens to `i16` (was `i8`). Tests: array unit (commit/zero-extend-decode/
+combined-range widen), nativegen unit (zero-extend read scan, in-range write,
+`guard_fits` side-exit at 256 and −1), interp 8-mode (byte-array workload + `u8→i16`
+widen). doc-06 S-E `[x]` + open-question resolved; bench `cross: ok`, no regression.
 
 ## `load` / `loadfile` / `dofile` LANDED — deferred follow-ups (June 2026)
 

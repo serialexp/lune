@@ -1,96 +1,82 @@
-# CURRENT TASK — S-D (pattern matching on code points + character indices, doc 06)
+# CURRENT TASK — S-E (the `u8` array lane, design doc 06 final chunk)
 
-## Status: implemented + tested, GATE GREEN, Codex+Antigravity review DONE. Awaiting Bart's review before commit (Rule #15 — do NOT commit until approved).
+## Status: implemented + tested, GATE GREEN, bench clean. Awaiting Codex+Antigravity review, then Bart's review before commit (Rule #15 — do NOT commit until approved).
 
-## Review (Codex + Antigravity)
-Both passed the consuming paths, the backward-boundary backtracking, `classEnd`
-totality, and every seam char-index conversion as correct. One split verdict:
-Codex flagged the `%f` frontier (the one path feeding a subject byte to an ASCII
-set *without* the `< 0x80` guard); Antigravity argued it is correct. **Resolution:
-not a bug** — `%f` is zero-width (consumes nothing → cannot split a code point) and
-is a byte-for-byte port of Lua 5.4's frontier; a multibyte char reads as non-ASCII
-on every byte, so the frontier behavior is self-consistent with the documented
-"classes stay ASCII" rule. Made the decision **explicit**: added the
-`S-D: %f frontier classifies a multibyte char by its (non-ASCII) bytes` unit test
-and a doc-06 caveat note. Gate still green.
+This is the LAST chunk of design doc 06 (Unicode-native strings). S-A..S-D already
+landed (S-D as ad5392a). S-E is a pure storage/perf optimization — no new language
+surface.
 
-(S-A + S-B + the host-input UTF-8 boundary landed as c8fb684; S-C — Unicode case
-mapping + pinned `unicode_version` — committed as 433e334.)
+## What S-E does
 
-## What S-D does
+Byte arrays (integers in `[0,255]`) now pack at **1 byte/slot** instead of `i16`'s
+two (a byte ≥ 128 overflows signed `i8`'s 127 ceiling, so today they land on i16).
+A `u8` rung is added to the monotonic lane lattice.
 
-The pattern engine and the `find`/`match`/`gmatch`/`gsub` boundary become
-code-point-native, closing the last char-vs-byte gap in the string surface (doc 06
-§51-52, §66).
+**Part 1 — lattice (`src/array.zig`).**
+- `Lane` gains a `u8` variant **appended at the end** (ordinal 7) so existing
+  ordinals stay put (trace IR embeds the lane ordinal in `guard_lane.aux`). Lattice
+  order is explicit in `canWidenTo`, independent of ordinal.
+- `u8` is a **sibling** of `i8`, not below it. New `intLaneForRange(lo,hi)` returns
+  `.u8` when `[lo,hi] ⊆ [0,255]`, else `intLaneFor` (signed). `laneForValue` and
+  `optimalLane`'s all-int arm route through it.
+- `widenFor`'s `.u8` arm widens to the smallest *signed* lane covering the
+  **combined** range `[min(0,v), max(255,v)]` — always `≥ i16`, never `i8`, never
+  back to `u8`, so existing high bytes re-encode exactly.
+- `canWidenTo(.u8,·) = {i16,i32,i64,value}`; nothing widens *to* `u8`.
+- `decode` zero-extends (`Value.int(@as(i64, byte))`); `encode` `@intCast`s;
+  `laneFits` checks `[0,255]`; `dataBytes`→`cap`; `usesPresenceBitmap`/`isInt`
+  include `u8`.
 
-**Part 1 — engine steps the subject by code point (`src/stdlib/pattern.zig`).**
-- `seqLen(s)` (new, `pub`): UTF-8 width of the code point at byte `s`, clamped to
-  `src.len`. Every subject-advance uses it, never `+1`.
-- `singleMatch(s, p, ep)` takes a byte **offset** (not a pre-read byte). Arms: `.`
-  → any one code point; `%`-class → `src[s] < 0x80 and matchClass`; `[` → `src[s]
-  < 0x80 and matchBracket`; literal → `litEq`. **The `src[s] < 0x80` guard is
-  load-bearing** — without it a high byte satisfies the complement classes
-  (`%A`/`%D`/`[^…]`).
-- `litEq`/`matchWidth` (new): byte-equal literal compare (== code-point compare on
-  canonical UTF-8); width is `seqLen` for `.`/literal, `1` for class/bracket.
-- `classEnd` groups a multibyte literal into ONE item (so `é*` binds the whole
-  char), clamped + `catch 1` to stay total on a truncated pattern tail.
-- `maxExpand` (greedy) backtracks **one code point at a time** via a backward
-  continuation-byte scan (`cur -= 1; while (src[cur] & 0xC0)==0x80`), so
-  `MatchState` stays **allocation-free** (no scratch buffer). `minExpand`/`match`
-  advance by `matchWidth`; `firstMatch` test helper by `seqLen`.
-- Unchanged (confirmed correct): `matchClass`, `matchBracket`, `matchBalance`
-  (`%b`, ASCII delims), `matchCapture` (back-ref), `%f` frontier, capture helpers,
-  `Capture` (stays byte offsets).
+**Part 2 — native codegen (`src/nativegen.zig`; `src/x64.zig` unchanged).**
+- `U8_LANE` const; `laneKind(U8_LANE)→.int`; `intLaneWidth(U8_LANE)→1`.
+- `aload` `u8` branch: zero-extend via `loadRegMemSib(.rax, …, 1, false, 0)`
+  (`movzx`, no `sub`) — the only divergence from the signed lanes' `movsx`. Uses the
+  **existing** encoder, no new x64 op.
+- `guard_fits` `u8` branch: range-check `[0,255]` derived from the *lane* (not the
+  width — width-1 is now ambiguous with `i8`).
+- Store path (`astore`/`astore_append`: width-truncate + presence `bts`) is
+  signedness-agnostic → unchanged.
 
-**Part 2 — character indices at the seam (`src/stdlib/string.zig`).**
-- `resolveInit(init_raw, s)` now treats `init` as a 1-based **character** index →
-  byte offset (`posRelat` on `cpCount`, then `charByteOffset`).
-- `byteToChar(s, off)` (new): byte offset on a boundary → 1-based char index.
-- `findCore` returns char start = `byteToChar(s, sp)`, end = `cpCount(s[0..e])`
-  (both plain and pattern branches); outer scan `sp += seqLen`.
-- `captureValue` position captures (`cap_position`) → `byteToChar(src, cap.init)`.
-- `matchCore` outer scan `sp += seqLen`.
-- `gmatchAuxCore` scan advances by `@max(seqLen, 1)`; empty-match bump steps a
-  whole code point (`@max(…,1)` guarantees end-of-string termination).
-- `gsubCore` empty-match / non-match advance copies the **whole code point**
-  (`appendSlice(s[src..src+seqLen])`) so it never splices a partial sequence.
-  Captures stay byte offsets inside the engine; convert only at the seam.
+**Part 3 — recorder (`src/trace.zig`).** No code change: the append + in-bounds
+`astore` gates key on `lane == .boolean or lane.isInt()` / `array.fits(v)`, both of
+which now include `u8` automatically.
 
-## Out of scope (documented, doc-consistent)
-- Multibyte chars inside bracket sets (`[é]`, `[é-ñ]`) and multibyte `%b`
-  delimiters stay byte/ASCII-level. Unicode property classes (`\p{L}`),
-  normalization, graphemes — deferred.
+## Determinism
+Lanes are internal and **never serialised** (the keyframe wire stores logical
+Values). The native zero-extend `aload` matches tier-0 `decode` byte-for-byte. So
+8-mode parity is inherited. Touches `nativegen.zig` → review gate applies.
 
 ## Tests
-- `src/stdlib/pattern.zig` — 7 multibyte unit tests added in Part 1 (`.` over one
-  code point, `(.)` capture width, greedy/lazy over mixed ASCII+multibyte, literal
-  multibyte under a quantifier, ASCII classes stop at a high byte, anchors/`%b`/
-  back-ref with multibyte, truncated-tail totality).
-- `src/stdlib/string.zig` — `S-D: …CHARACTER indices (multibyte)`: find char
-  positions, find+sub compose, `(.)`/`()` char-indexed captures, init as char
-  index, gmatch char-aligned, `gsub(".", "x")` over "héllo" → "xxxxx".
-- `src/interp.zig` — `S-D: pattern matching over multibyte text is byte-identical
-  across all modes` (8-mode `expectProgram`; pattern ops are trace barriers, so
-  parity is inherited).
+- `src/array.zig` — 3 new u8 tests (byte array commits u8 + 1 B/slot + zero-extend
+  decode; `256` widens to i16; `-1` widens to i16). Existing lane tests updated:
+  small non-negative int arrays now commit `u8` (was `i8`) — `{1,2,3}`, `@mod(i,100)`
+  dense run, etc.; the `canWidenTo` lattice test gains a `u8` row; the i8-specific
+  guard_fits nativegen test now fills with a **negative** to stay on i8.
+- `src/nativegen.zig` — 3 new u8 tests (zero-extend read scan proving `movzx` not
+  `movsx`; in-range `t[k]=C` write; `guard_fits` side-exit at 256 and −1).
+- `src/interp.zig` — 2 new 8-mode `expectProgram` tests (byte-array workload;
+  `u8→i16` mid-run widen); the widen-eviction native test updated to track the `u8`
+  trace eviction (crossover now at i=256, not 128).
 
 ## Bench
-`just bench --filter str`: all str benches `cross: ok` (lune 8-mode consistency
-intact); pattern benches (find_match 36ms, gmatch 64ms, gsub 67ms) unregressed.
-`str_manip` shows `luajit=ERR` — **pre-existing S-B divergence** (the bench uses
-`string.codepoint`, lune's rename of `byte`, which LuaJIT lacks), unrelated to S-D.
+`just bench`: every `cross: ok` (8-mode consistency intact); no regression on the
+int/bool array benches (repack, sieve_int, tbl_ops, scalar, pi_leibniz). `str_manip
+ok/ERR` is the **pre-existing** S-B LuaJIT divergence (uses `string.codepoint`),
+unrelated to S-E.
 
 ## Docs (lockstep, Rule Z-5)
-doc-06 S-D `[x]` (landed note + bracket/`%b` ASCII caveat) + "Pattern matching
-(S-D) — landed" section; CSV find/match/gmatch/gsub rows note character indices;
-TODO S-D-LANDED block + "Next in the arc" → S-E.
+doc-06 S-E checklist `[x]` (landed note) + the `u8`/store-lowering open question
+**resolved** (zero-extend via existing `movzx`, no new op) + the JIT determinism
+summary updated; TODO `S-E LANDED` block + header `S-A..S-E ALL LANDED`. CSV
+unchanged — S-E adds/renames no stdlib function (the lane is internal storage, not a
+user-facing semantic; the byte array is unchanged to the program).
 
 ## Gate
-`just test` = 0.
+`just test` = 0, `just check-version` = 0.
 
 ## Next
-Codex + Antigravity review (esp. the ASCII-class guard, the backward-boundary
-backtracking scan, and the boundary char-index conversion), address findings, then
-Bart's review and commit approval (conventional-commits, trailer
-`Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`). Then S-E
-(`u8` array lane).
+Codex + Antigravity review (esp. `widenFor`'s combined-range superset correctness +
+`canWidenTo`, and the native zero-extend `aload` + `[0,255]` `guard_fits`), address
+findings, then Bart's review and commit approval (conventional-commits, trailer
+`Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`). This
+completes design doc 06.

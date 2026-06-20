@@ -3619,6 +3619,51 @@ test "string.decode: malformed UTF-8 is a catchable error" {
     );
 }
 
+// --- S-E: the u8 (byte) array lane, byte-identical across all 8 modes ---------
+
+test "S-E: a byte-array workload is byte-identical across all modes (u8 lane)" {
+    // Dense fill with values in [0,255] commits the u8 lane (1 byte/slot); the hot
+    // read loop tiers the u8 `aload` to native. High bytes (>=128) must ZERO-extend
+    // — a wrong sign-extend would make t[200]=199 read as a negative and diverge the
+    // sum. Identical output in record_execute_native vs tier-0 proves the native
+    // movzx matches array.decode's zero-extend.
+    try expectProgram(
+        \\local t = {}
+        \\for i = 1, 300 do t[i] = (i - 1) % 256 end
+        \\local sum = 0
+        \\for rep = 1, 100 do
+        \\  for i = 1, 256 do sum = sum + t[i] end
+        \\end
+        \\print(sum)
+        \\print(t[129], t[200], t[256])
+        \\
+    ,
+        "3264000\n128\t199\t255\n",
+    );
+}
+
+test "S-E: a u8->i16 mid-run widen stays deterministic across all modes" {
+    // The array commits u8 (bytes 0..255), then a 5000 store widens it to i16
+    // (u8's combined-range widen → the smallest signed lane covering [0,5000]). The
+    // subsequent hot read loop runs on the widened i16 lane natively. Byte-identical
+    // output confirms the widen + widen-eviction path is deterministic under record/
+    // replay and native compilation.
+    try expectProgram(
+        \\local t = {}
+        \\for i = 1, 256 do t[i] = i - 1 end
+        \\t[100] = 5000
+        \\local sum = 0
+        \\for rep = 1, 100 do
+        \\  for i = 1, 256 do sum = sum + t[i] end
+        \\end
+        \\print(sum)
+        \\print(t[100], t[256])
+        \\
+    ,
+        "3754100\n5000\t255\n",
+    );
+}
+
 test "load: compiles and runs a returning chunk" {
     try expectProgram(
         "local f = load(\"return 6 * 7\"); print(f())\n",
@@ -7253,16 +7298,17 @@ test "astore_append (int lane): a dense-from-1 fill (t[i]=i) compiles native and
 
 test "widen-eviction: a lane-crossing fill retires the narrow trace and stabilises on the wider one" {
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
-    // `for i=1,5000 do t[i]=i end` eager-commits `.i8`, records an i8 append
-    // trace, then crosses i8→i16 at i=128. Pre-eviction the dead i8 trace
-    // lingered (consuming a per-anchor slot) and the loop ran the i16 tail under
-    // a permanently-failing guard. Widen-eviction retires the i8 trace the first
-    // time its `guard_lane` fails against the now-wider live array, and reopens
-    // the anchor so the *stable* i16 lane records + compiles. We assert the
-    // surviving append trace guards i16 (ordinal 3), NOT i8 (ordinal 2), proving
-    // the dead narrow trace was evicted and the wider one took its place.
+    // `for i=1,5000 do t[i]=i end` eager-commits `.u8` (the byte lane — values
+    // start in [0,255]), records a u8 append trace, then crosses u8→i16 at i=256
+    // (value 256 escapes the byte range). Pre-eviction the dead u8 trace lingered
+    // (consuming a per-anchor slot) and the loop ran the i16 tail under a
+    // permanently-failing guard. Widen-eviction retires the u8 trace the first time
+    // its `guard_lane` fails against the now-wider live array, and reopens the
+    // anchor so the *stable* i16 lane records + compiles. We assert the surviving
+    // append trace guards i16, NOT u8, proving the dead narrow trace was evicted and
+    // the wider one took its place.
     const arr = @import("array.zig");
-    const i8_ord = @intFromEnum(arr.Lane.i8);
+    const u8_ord = @intFromEnum(arr.Lane.u8);
     const i16_ord = @intFromEnum(arr.Lane.i16);
     const source =
         \\local t = {}
@@ -7278,18 +7324,18 @@ test "widen-eviction: a lane-crossing fill retires the narrow trace and stabilis
     defer chunk.deinit();
 
     var saw_i16_append = false;
-    var saw_i8_append = false;
+    var saw_u8_append = false;
     for (vm.trace.cache.items) |tr| {
         for (tr.instrs) |ins| {
             if (ins.op != .astore_append) continue;
             // The append's lane lives in its own `aux`; the leading guard_lane
             // carries the same ordinal. Read the op directly.
             if (ins.aux == i16_ord and tr.native == .compiled) saw_i16_append = true;
-            if (ins.aux == i8_ord) saw_i8_append = true;
+            if (ins.aux == u8_ord) saw_u8_append = true;
         }
     }
     try testing.expect(saw_i16_append); // the stable wider lane records + compiles
-    try testing.expect(!saw_i8_append); // the dead narrow trace was evicted
+    try testing.expect(!saw_u8_append); // the dead narrow trace was evicted
     try testing.expectEqualStrings("5000\n", nsink.buffered());
 }
 

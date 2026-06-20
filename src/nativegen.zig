@@ -154,21 +154,24 @@ const I8_LANE: i32 = @intFromEnum(arr.Lane.i8);
 const I16_LANE: i32 = @intFromEnum(arr.Lane.i16);
 const I32_LANE: i32 = @intFromEnum(arr.Lane.i32);
 const I64_LANE: i32 = @intFromEnum(arr.Lane.i64);
+const U8_LANE: i32 = @intFromEnum(arr.Lane.u8);
 
 /// The native scalar `Kind` a packed lane decodes to, or `null` when the native
 /// array path does not lower this lane (`.value` / `f64` → tier-1a). The bool
-/// lane yields a 0/1 boolean; the i8…i64 lanes yield a sign-extended int.
+/// lane yields a 0/1 boolean; the i8…i64 lanes yield a sign-extended int; the
+/// unsigned-byte `u8` lane yields a zero-extended int (same `.int` Kind — the
+/// signedness difference is purely in the `aload` extension width, see below).
 fn laneKind(aux: i32) ?Kind {
     if (aux == BOOL_LANE) return .bool;
-    if (aux == I8_LANE or aux == I16_LANE or aux == I32_LANE or aux == I64_LANE) return .int;
+    if (aux == I8_LANE or aux == I16_LANE or aux == I32_LANE or aux == I64_LANE or aux == U8_LANE) return .int;
     return null;
 }
 
 /// Packed-element width in bytes for an int lane (1/2/4/8 → the SIB scale).
 /// Asserts an int lane (`laneKind(aux) == .int`); the bit-packed bool lane uses
-/// `bt`/`bts`/`btr` instead and never calls this.
+/// `bt`/`bts`/`btr` instead and never calls this. `u8` is one byte wide, like i8.
 fn intLaneWidth(aux: i32) u8 {
-    return if (aux == I8_LANE) 1 else if (aux == I16_LANE) 2 else if (aux == I32_LANE) 4 else if (aux == I64_LANE) 8 else unreachable;
+    return if (aux == I8_LANE or aux == U8_LANE) 1 else if (aux == I16_LANE) 2 else if (aux == I32_LANE) 4 else if (aux == I64_LANE) 8 else unreachable;
 }
 
 /// Enforce that every lane-bearing op in a trace (`guard_lane`/`aref`/`aload`/
@@ -2173,6 +2176,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     // would be 0), so the result is exactly 0 or 1.
                     try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
                     try a.subRegImm32(.rax, 1); // 1→0 (false), 2→1 (true)
+                } else if (ins.aux == U8_LANE) {
+                    // u8 lane: zero-extend the byte element at `[data + idx0]` into a
+                    // full 64-bit int (range 0..255). `movzx` (signed=false), no
+                    // `sub` — this is the only point u8 diverges from the signed int
+                    // lanes, and it matches `array.decode`'s zero-extend exactly.
+                    try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
                 } else {
                     // int lane (i8…i64): sign-extend the width-byte element at
                     // `[data + idx0*w]` into a full 64-bit int.
@@ -2191,6 +2200,17 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     // Bool-lane guard_fits is a tier-1a-only soundness guard; the
                     // value is already proven `.bool` in proveKinds, so there is
                     // nothing to range-check here.
+                } else if (ins.aux == U8_LANE) {
+                    // u8 lane: range-check against the *unsigned-byte* bounds
+                    // `[0,255]` (NOT the i8 `[-128,127]` the width-1 signed lane
+                    // would imply). The value is a full untagged int in rax; the
+                    // signed `cmp`+`jcc(.l/.g)` against 0 and 255 is exact (both
+                    // bounds are small positive constants, no sign-bit ambiguity).
+                    try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
+                    try a.cmpRegImm32(.rax, 0);
+                    try a.jcc(.l, deopt_exit); // value < 0 → side-exit (widen)
+                    try a.cmpRegImm32(.rax, 255);
+                    try a.jcc(.g, deopt_exit); // value > 255 → side-exit (widen)
                 } else {
                     const w = intLaneWidth(ins.aux);
                     if (w < 8) {
@@ -4165,19 +4185,22 @@ test "nativegen: int-lane astore guard_fits side-exits when the value overflows 
     if (comptime !is_x64_linux) return error.SkipZigTest;
     // An i8-lane table long enough that the stored index value (`t[k] = k`)
     // outgrows the lane mid-loop: keys run well past 127 while every *initial*
-    // value stays in i8 range (fill = 1), so the lane is i8 but the WRITTEN value
-    // overflows at k == 128 → guard_fits side-exits there. Native and oracle must
-    // stop at the same iteration and leave identical heaps.
+    // value stays in i8 range (fill = -1, a negative → the *signed* i8 lane, not
+    // the unsigned-byte u8 lane), so the lane is i8 but the WRITTEN value overflows
+    // at k == 128 → guard_fits side-exits there. Native and oracle must stop at the
+    // same iteration and leave identical heaps. (The u8 lane's own [0,255]
+    // guard_fits boundaries are covered by the dedicated u8 test below.)
     const gpa = testing.allocator;
     const K: i64 = 160;
     const lane: i32 = @intFromEnum(arr.Lane.i8);
 
-    // Build an i8 table of length K with all-small values (lane stays i8).
+    // Build an i8 table of length K with all-small NEGATIVE values (lane stays i8;
+    // a non-negative fill would commit the u8 byte lane instead).
     const makeT = struct {
         fn f(g: std.mem.Allocator, n: i64) !*table.Table {
             const t = try table.Table.create(g);
             var i: i64 = 2;
-            while (i <= n) : (i += 1) try t.set(g, Value.int(i), Value.int(1));
+            while (i <= n) : (i += 1) try t.set(g, Value.int(i), Value.int(-1));
             std.debug.assert(t.array.lane == arr.Lane.i8);
             return t;
         }
@@ -4223,6 +4246,124 @@ test "nativegen: int-lane astore guard_fits side-exits when the value overflows 
     try testing.expectEqual(oresult.completed, ncomp);
     try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
     try expectTablesEqual(t_o, t_n, K);
+}
+
+// --- S-E u8-lane (unsigned byte) read/write/guard tests -----------------------
+
+/// Build a u8-lane table: keys `2..K` hold bytes in `[0,255]`, with the last key
+/// pinned to a *high* byte (200) so a scan's final load exercises the
+/// zero-extension that distinguishes u8 from the signed i8 lane. Caller owns it.
+fn buildByteTable(gpa: std.mem.Allocator, K: i64) !*table.Table {
+    const t = try table.Table.create(gpa);
+    var i: i64 = 2;
+    while (i <= K) : (i += 1) try t.set(gpa, Value.int(i), Value.int(@mod(i * 7, 256)));
+    try t.set(gpa, Value.int(K), Value.int(200)); // high byte: 200 zero-extends, ≠ -56
+    return t;
+}
+
+test "nativegen: u8-lane t[k] read scan zero-extends (high bytes read as 0..255, not sign-extended)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const K: i64 = 48;
+    const t = try buildByteTable(gpa, K);
+    defer t.destroy(gpa);
+    try testing.expectEqual(arr.Lane.u8, t.array.lane);
+
+    const lane: i32 = @intFromEnum(arr.Lane.u8);
+    var consts = [_]Value{Value.int(1)};
+    // r0=table, r1=index, r2=last load. The aload must `movzx` (zero-extend): a byte
+    // 200 reads 200, where a wrong `movsx` would carry -56 and mismatch the oracle
+    // (which decodes via array.decode's zero-extend). expectMatch catches the split.
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .guard_present, .a = 5 }, // 7
+        .{ .op = .aload, .a = 5, .aux = lane }, // 8: v = t[index]
+        .{ .op = .konst, .aux = 0 }, // 9: 1
+        .{ .op = .add, .a = 3, .b = 9 }, // 10: index + 1
+        .{ .op = .phi, .b = 10, .aux = 1 },
+        .{ .op = .phi, .b = 8, .aux = 2 },
+        .{ .op = .loop }, // 11
+    };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(2), Value.nil() }); // full scan
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(K), Value.nil() }); // last load = byte 200
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(K + 3), Value.nil() }); // OOB
+}
+
+test "nativegen: u8-lane t[k]=C write matches the interpreter (in-range byte)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const K: i64 = 48;
+    const lane: i32 = @intFromEnum(arr.Lane.u8);
+    const C: i64 = 200; // a high byte: truncating store of 0xC8, read back via zero-extend
+    var full: [14]I = undefined;
+    var consts: [2]Value = undefined;
+    var es: [0]u16 = undefined;
+    const tr = intWriteTrace(&full, &consts, &es, lane, C);
+
+    const t_o = try buildByteTable(gpa, K);
+    defer t_o.destroy(gpa);
+    try testing.expectEqual(arr.Lane.u8, t_o.array.lane);
+    var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
+    const ovals = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(ovals);
+    const oresult = irinterp.execute(&tr, &oregs, ovals);
+
+    const t_n = try buildByteTable(gpa, K);
+    defer t_n.destroy(gpa);
+    var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
+    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    const ncomp = ct.run(&nregs);
+
+    try testing.expectEqual(oresult.completed, ncomp);
+    try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
+    try expectTablesEqual(t_o, t_n, K);
+    var k: i64 = 2;
+    while (k <= K) : (k += 1) try testing.expectEqual(C, t_n.getInt(k).asInt()); // every slot = 200
+}
+
+test "nativegen: u8-lane astore guard_fits side-exits at the [0,255] boundaries (256 and -1)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const K: i64 = 48;
+    const lane: i32 = @intFromEnum(arr.Lane.u8);
+
+    // Each out-of-byte constant must side-exit on the FIRST store (k=2, before any
+    // mutation): native and oracle both stop with completed==0, heaps untouched.
+    for ([_]i64{ 256, -1 }) |C| {
+        var full: [14]I = undefined;
+        var consts: [2]Value = undefined;
+        var es: [0]u16 = undefined;
+        const tr = intWriteTrace(&full, &consts, &es, lane, C);
+
+        const t_o = try buildByteTable(gpa, K);
+        defer t_o.destroy(gpa);
+        try testing.expectEqual(arr.Lane.u8, t_o.array.lane);
+        var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
+        const ovals = try gpa.alloc(Value, tr.instrs.len);
+        defer gpa.free(ovals);
+        const oresult = irinterp.execute(&tr, &oregs, ovals);
+
+        const t_n = try buildByteTable(gpa, K);
+        defer t_n.destroy(gpa);
+        var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
+        var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+        defer ct.deinit();
+        const ncomp = ct.run(&nregs);
+
+        try testing.expectEqual(@as(usize, 0), oresult.completed); // guard_fits exits immediately
+        try testing.expectEqual(oresult.completed, ncomp);
+        try expectTablesEqual(t_o, t_n, K); // both heaps pristine (no store happened)
+    }
 }
 
 test "nativegen: int-lane astore deopt-replay leaves a deterministic heap (idempotent re-run)" {

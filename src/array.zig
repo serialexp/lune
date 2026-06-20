@@ -62,6 +62,14 @@ pub const Lane = enum(u8) {
     i32,
     i64,
     f64,
+    /// One byte per slot, holding an unsigned byte `0..255` (zero-extended on
+    /// read). The byte-array lane: a non-negative integer `<= 255` packs here at
+    /// 1 byte/slot instead of paying `i16`'s two (a byte overflows signed `i8`'s
+    /// 127 ceiling). A negative or `> 255` store widens it to the signed ladder.
+    /// Appended last so the existing ordinals stay put (trace IR embeds the lane
+    /// ordinal in `guard_lane.aux`); lattice order lives in `canWidenTo`, not the
+    /// ordinal.
+    u8,
 
     /// True for every lane except `.value` — i.e. lanes that hold no heap
     /// pointers (so the GC can skip marking the array part and the native store
@@ -79,18 +87,21 @@ pub const Lane = enum(u8) {
     pub fn usesPresenceBitmap(self: Lane) bool {
         return switch (self) {
             .value, .boolean => false,
-            .i8, .i16, .i32, .i64, .f64 => true,
+            .i8, .i16, .i32, .i64, .f64, .u8 => true,
         };
     }
 
-    /// True for the fixed-width signed-int lanes (`i8…i64`). These share a single
-    /// native store shape — a width-truncating data write plus a presence-bit set
-    /// (`encode`) — so the JIT grow/in-bounds store paths branch on this to pick
-    /// the int lowering vs the boolean in-band byte. `.f64` is excluded: it needs
-    /// XMM stores the native array path does not yet emit.
+    /// True for the fixed-width integer **store-shape** lanes (`i8…i64`, plus the
+    /// unsigned-byte `u8`). These share a single native store shape — a
+    /// width-truncating data write plus a presence-bit set (`encode`) — so the JIT
+    /// grow/in-bounds store paths branch on this to pick the int lowering vs the
+    /// boolean in-band byte. The only signedness difference is on the *read*
+    /// (`u8` zero-extends, the signed lanes sign-extend), handled in `decode` and
+    /// the native `aload`. `.f64` is excluded: it needs XMM stores the native array
+    /// path does not yet emit.
     pub fn isInt(self: Lane) bool {
         return switch (self) {
-            .i8, .i16, .i32, .i64 => true,
+            .i8, .i16, .i32, .i64, .u8 => true,
             .value, .boolean, .f64 => false,
         };
     }
@@ -104,6 +115,12 @@ pub const Lane = enum(u8) {
     ///     `value` (any off-type store erases straight to `value`).
     ///   - the int ladder widens upward `i8→i16→i32→i64`, and any int lane can
     ///     also erase to `value` on a non-int store.
+    ///   - `u8` (the unsigned-byte lane, range `[0,255]`) is a sibling entry point,
+    ///     not a rung below `i8`: a store outside `[0,255]` (negative or `>255`)
+    ///     widens it to the smallest *signed* lane covering `[0,255] ∪ {v}`, which
+    ///     is always `≥ i16` (never `i8`, never back to `u8`). Nothing widens *to*
+    ///     `u8` — it is only ever an initial commitment (`laneForValue`/
+    ///     `optimalLane`).
     ///
     /// The JIT uses this for widen-eviction: a trace whose `guard_lane` pins
     /// lane `T` is permanently dead once the live array sits on a lane `L` with
@@ -119,6 +136,7 @@ pub const Lane = enum(u8) {
             .i16 => target == .i32 or target == .i64 or target == .value,
             .i32 => target == .i64 or target == .value,
             .i64 => target == .value,
+            .u8 => target == .i16 or target == .i32 or target == .i64 or target == .value,
         };
     }
 };
@@ -305,9 +323,10 @@ pub const ArrayPart = extern struct {
     // ---- lane selection (called from Table.rehash) ----
 
     /// Scan the live slots and return the narrowest lane that represents them
-    /// exactly: `.boolean` if every present value is a boolean, the smallest
-    /// signed-int lane covering the observed `[min,max]` if every present value
-    /// is an integer, `.f64` if every present value is a float, else `.value`.
+    /// exactly: `.boolean` if every present value is a boolean, the narrowest int
+    /// lane covering the observed `[min,max]` if every present value is an integer
+    /// (`u8` when `[0,255]`, else the smallest signed lane — see `intLaneForRange`),
+    /// `.f64` if every present value is a float, else `.value`.
     /// Holes never constrain the choice (every lane represents them). An array
     /// with no present values stays `.value` (nothing to gain).
     pub fn optimalLane(self: *const ArrayPart) Lane {
@@ -344,7 +363,7 @@ pub const ArrayPart = extern struct {
         if (!any) return .value;
         if (all_bool) return .boolean;
         if (all_float) return .f64;
-        if (all_int) return intLaneFor(lo, hi);
+        if (all_int) return intLaneForRange(lo, hi);
         return .value;
     }
 
@@ -373,10 +392,21 @@ pub const ArrayPart = extern struct {
         if (val.isBool()) return .boolean;
         if (val.isInt()) {
             const x = val.asInt();
-            return intLaneFor(x, x);
+            return intLaneForRange(x, x);
         }
         if (val.isFloat()) return .f64;
         return .value;
+    }
+
+    /// Initial-commitment lane for an integer range `[lo, hi]`. Prefers the
+    /// unsigned-byte `u8` lane (1 byte/slot) when the whole range fits `[0,255]`;
+    /// otherwise the smallest *signed* lane covering it. This is the entry point
+    /// for committing a fresh array (`laneForValue`, `optimalLane`) — NOT for
+    /// widening an already-committed lane, which must preserve the existing slots'
+    /// range (`widenFor` handles that separately).
+    fn intLaneForRange(lo: i64, hi: i64) Lane {
+        if (lo >= 0 and hi <= 255) return .u8;
+        return intLaneFor(lo, hi);
     }
 
     /// Smallest signed-int lane whose range covers `[lo, hi]`.
@@ -392,7 +422,7 @@ pub const ArrayPart = extern struct {
         return switch (lane) {
             .value => cap * @sizeOf(Value),
             .boolean => cap, // one byte/slot (0=absent, 1=false, 2=true), in-band presence
-            .i8 => cap,
+            .i8, .u8 => cap, // one byte/slot; presence via the bitmap
             .i16 => cap * 2,
             .i32 => cap * 4,
             .i64, .f64 => cap * 8,
@@ -439,6 +469,7 @@ pub const ArrayPart = extern struct {
             .i16 => val.isInt() and inRange(val.asInt(), std.math.minInt(i16), std.math.maxInt(i16)),
             .i32 => val.isInt() and inRange(val.asInt(), std.math.minInt(i32), std.math.maxInt(i32)),
             .i64 => val.isInt(),
+            .u8 => val.isInt() and inRange(val.asInt(), 0, 255),
             .f64 => val.isFloat(),
         };
     }
@@ -492,6 +523,7 @@ pub const ArrayPart = extern struct {
                 return switch (self.lane) {
                     .value, .boolean => unreachable,
                     .i8 => Value.int(@as(i8, @bitCast(d[idx]))),
+                    .u8 => Value.int(@as(i64, d[idx])), // zero-extend, range 0..255
                     .i16 => Value.int(readInt(i16, d, idx)),
                     .i32 => Value.int(readInt(i32, d, idx)),
                     .i64 => Value.int(readInt(i64, d, idx)),
@@ -520,6 +552,7 @@ pub const ArrayPart = extern struct {
                 switch (self.lane) {
                     .value, .boolean => unreachable,
                     .i8 => d[idx] = @bitCast(@as(i8, @intCast(val.asInt()))),
+                    .u8 => d[idx] = @intCast(val.asInt()), // val in [0,255] per fits/laneFits
                     .i16 => writeInt(i16, d, idx, @intCast(val.asInt())),
                     .i32 => writeInt(i32, d, idx, @intCast(val.asInt())),
                     .i64 => writeInt(i64, d, idx, val.asInt()),
@@ -657,6 +690,12 @@ pub const ArrayPart = extern struct {
             // and every wider int lane is a superset — existing slots re-encode
             // exactly). A non-int forces the type-erased `.value` lane.
             .i8, .i16, .i32, .i64 => if (val.isInt()) intLaneFor(val.asInt(), val.asInt()) else .value,
+            // The `u8` lane already spans `[0,255]`, so a non-fitting int is
+            // negative or `> 255`; widen to the smallest *signed* lane covering the
+            // **combined** range `[min(0,v), max(255,v)]` (never back to `u8`, never
+            // a narrower-than-existing lane that would drop bytes). This is always
+            // `≥ i16` and a strict superset, so existing slots re-encode exactly.
+            .u8 => if (val.isInt()) intLaneFor(@min(0, val.asInt()), @max(255, val.asInt())) else .value,
             // boolean/f64 lanes are type-pure: any value that doesn't fit means a
             // type mismatch, which only `.value` can hold.
             .boolean, .f64 => .value,
@@ -748,6 +787,59 @@ test "int lanes: narrowest covering [min,max] is chosen" {
     }
 }
 
+test "u8 lane: a byte array commits to u8 at 1 byte/slot and zero-extends on read" {
+    const gpa = testing.allocator;
+    // Every value in [0,255] — including bytes >= 128 that overflow signed i8 —
+    // packs into the unsigned-byte lane.
+    var a = try fromSlice(gpa, &.{ Value.int(0), Value.int(127), Value.int(128), Value.int(200), Value.int(255) });
+    defer a.deinit(gpa);
+    try testing.expectEqual(Lane.u8, a.lane);
+    try testing.expect(a.frozen);
+    try testing.expect(a.lane.usesPresenceBitmap()); // separate bitmap, unlike boolean
+    // 1 byte/slot (NOT i16's two), the whole point of S-E.
+    try testing.expectEqual(a.cap, ArrayPart.dataBytes(a.lane, a.cap));
+    // High bytes decode by ZERO-extension: 200 reads back 200, not -56 (the i8
+    // sign-extended value of byte 0xC8).
+    try testing.expectEqual(@as(i64, 0), a.get(1).asInt());
+    try testing.expectEqual(@as(i64, 127), a.get(2).asInt());
+    try testing.expectEqual(@as(i64, 128), a.get(3).asInt());
+    try testing.expectEqual(@as(i64, 200), a.get(4).asInt());
+    try testing.expectEqual(@as(i64, 255), a.get(5).asInt());
+    try testing.expectEqual(Lane.u8, a.optimalLane());
+}
+
+test "u8 lane: a value > 255 widens to i16, preserving every byte" {
+    const gpa = testing.allocator;
+    var a = try fromSlice(gpa, &.{ Value.int(10), Value.int(200), Value.int(255) });
+    defer a.deinit(gpa);
+    try testing.expectEqual(Lane.u8, a.lane);
+
+    // 256 escapes the byte range → widen to the smallest signed lane covering
+    // [0,256], i.e. i16 (never i8, never back to u8). Existing bytes survive.
+    try a.append(gpa, Value.int(256));
+    try testing.expectEqual(Lane.i16, a.lane);
+    try testing.expectEqual(@as(i64, 10), a.get(1).asInt());
+    try testing.expectEqual(@as(i64, 200), a.get(2).asInt());
+    try testing.expectEqual(@as(i64, 255), a.get(3).asInt());
+    try testing.expectEqual(@as(i64, 256), a.get(4).asInt());
+}
+
+test "u8 lane: a negative store widens to i16 (not i8), preserving high bytes" {
+    const gpa = testing.allocator;
+    var a = try fromSlice(gpa, &.{ Value.int(0), Value.int(200), Value.int(255) });
+    defer a.deinit(gpa);
+    try testing.expectEqual(Lane.u8, a.lane);
+
+    // A -1 store: u8 already spans [0,255], so the smallest signed lane covering
+    // [-1,255] is i16 — NOT i8 (which tops out at 127 and would drop the 200/255
+    // bytes). This is the load-bearing combined-range widen.
+    try a.setInPlace(gpa, 2, Value.int(-1));
+    try testing.expectEqual(Lane.i16, a.lane);
+    try testing.expectEqual(@as(i64, 0), a.get(1).asInt());
+    try testing.expectEqual(@as(i64, -1), a.get(2).asInt());
+    try testing.expectEqual(@as(i64, 255), a.get(3).asInt());
+}
+
 test "int lane: values survive a repack and decode exactly" {
     const gpa = testing.allocator;
     var a: ArrayPart = .empty;
@@ -755,8 +847,8 @@ test "int lane: values survive a repack and decode exactly" {
     var i: i64 = 1;
     while (i <= 50) : (i += 1) try a.append(gpa, Value.int(i * 100)); // up to 5000 → i16
 
-    // Eager commit narrows on the first append (int 100 → i8), then widens up to
-    // i16 as the values grow — no manual repack needed.
+    // Eager commit narrows on the first append (int 100 → u8, the byte lane), then
+    // widens up to i16 as the values grow past 255 — no manual repack needed.
     try testing.expectEqual(Lane.i16, a.lane);
     i = 1;
     while (i <= 50) : (i += 1) try testing.expectEqual(i * 100, a.get(@intCast(i)).asInt());
@@ -795,9 +887,9 @@ test "widening on append of an out-of-lane value" {
     defer a.deinit(gpa);
     var i: usize = 1;
     while (i <= 10) : (i += 1) try a.append(gpa, Value.int(@intCast(i)));
-    try testing.expectEqual(Lane.i8, a.lane); // eager-committed on first append
+    try testing.expectEqual(Lane.u8, a.lane); // eager-committed on first append (bytes → u8)
 
-    try a.append(gpa, Value.float(1.5)); // doesn't fit i8 → widen
+    try a.append(gpa, Value.float(1.5)); // doesn't fit u8 → widen
     try testing.expectEqual(Lane.value, a.lane);
     try testing.expectEqual(@as(usize, 11), a.len);
     try testing.expectEqual(@as(i64, 1), a.get(1).asInt());
@@ -809,12 +901,12 @@ test "monotonic widen: an int outgrowing its lane steps up the int ladder, not t
     var a: ArrayPart = .empty;
     defer a.deinit(gpa);
 
-    // Pack into i8 (all values in [-128, 127]) — eager-committed on first append.
+    // Pack into u8 (all values in [0, 255]) — eager-committed on first append.
     var i: usize = 1;
     while (i <= 10) : (i += 1) try a.append(gpa, Value.int(@intCast(i)));
-    try testing.expectEqual(Lane.i8, a.lane);
+    try testing.expectEqual(Lane.u8, a.lane);
 
-    // Store 1000 (out of i8, fits i16) → steps up to i16, NOT .value.
+    // Store 1000 (out of u8, fits i16) → steps up to i16, NOT .value.
     try a.setInPlace(gpa, 3, Value.int(1000));
     try testing.expectEqual(Lane.i16, a.lane);
     try testing.expectEqual(@as(i64, 1000), a.get(3).asInt());
@@ -837,7 +929,7 @@ test "monotonic widen: a type-incompatible store still falls straight to value" 
     defer a.deinit(gpa);
     var i: usize = 1;
     while (i <= 10) : (i += 1) try a.append(gpa, Value.int(@intCast(i)));
-    try testing.expectEqual(Lane.i8, a.lane); // eager-committed on first append
+    try testing.expectEqual(Lane.u8, a.lane); // eager-committed on first append (bytes → u8)
 
     // A float into an int lane is a type mismatch → no int lane covers it → .value.
     try a.setInPlace(gpa, 4, Value.float(1.5));
@@ -852,17 +944,17 @@ test "monotonic: a frozen lane is preserved across a widening convert" {
     defer a.deinit(gpa);
     var i: usize = 1;
     while (i <= 10) : (i += 1) try a.append(gpa, Value.int(@intCast(i)));
-    // Eager commit already narrowed to i8 AND set frozen on the first append —
+    // Eager commit already narrowed to u8 AND set frozen on the first append —
     // no need to repack or set frozen by hand.
     try testing.expect(a.frozen);
 
-    try a.setInPlace(gpa, 3, Value.int(1000)); // i8 → i16 via widenFor/convert
+    try a.setInPlace(gpa, 3, Value.int(1000)); // u8 → i16 via widenFor/convert
     try testing.expectEqual(Lane.i16, a.lane);
     try testing.expect(a.frozen); // commitment survives the widen
 }
 
 test "canWidenTo encodes the monotonic widening lattice exactly" {
-    const all = [_]Lane{ .value, .boolean, .i8, .i16, .i32, .i64, .f64 };
+    const all = [_]Lane{ .value, .boolean, .i8, .i16, .i32, .i64, .f64, .u8 };
     // Reachability table: from-lane → the set of lanes it can ever become.
     // Mirrors `widenFor`: ints climb the ladder then erase to value; pure lanes
     // (boolean/f64) erase straight to value; value is the top and reaches only
@@ -876,6 +968,9 @@ test "canWidenTo encodes the monotonic widening lattice exactly" {
         .{ .from = .i16, .reaches = &.{ .i16, .i32, .i64, .value } },
         .{ .from = .i32, .reaches = &.{ .i32, .i64, .value } },
         .{ .from = .i64, .reaches = &.{ .i64, .value } },
+        // u8 is a sibling entry point: it widens only to the *signed* ladder
+        // (≥ i16) or value — never to i8, never back to u8. Nothing reaches it.
+        .{ .from = .u8, .reaches = &.{ .u8, .i16, .i32, .i64, .value } },
     };
     for (cases) |c| {
         for (all) |target| {
@@ -902,7 +997,7 @@ test "resize grows with holes and shrinks dropping the tail" {
     defer a.deinit(gpa);
     try a.append(gpa, Value.int(1));
     try a.append(gpa, Value.int(2));
-    try testing.expectEqual(Lane.i8, a.lane); // eager-committed on first append
+    try testing.expectEqual(Lane.u8, a.lane); // eager-committed on first append (bytes → u8)
 
     try a.resize(gpa, 6); // grow → slots 3..6 are holes
     try testing.expectEqual(@as(usize, 6), a.len);
@@ -960,10 +1055,10 @@ test "eager commit: dense-from-1 int fill narrows then widens up the int ladder"
     const gpa = testing.allocator;
     var a: ArrayPart = .empty;
     defer a.deinit(gpa);
-    try a.append(gpa, Value.int(100)); // eager → i8
-    try testing.expectEqual(Lane.i8, a.lane);
+    try a.append(gpa, Value.int(100)); // eager → u8 (byte)
+    try testing.expectEqual(Lane.u8, a.lane);
     try testing.expect(a.frozen);
-    try a.append(gpa, Value.int(5000)); // i8 → i16
+    try a.append(gpa, Value.int(5000)); // u8 → i16
     try testing.expectEqual(Lane.i16, a.lane);
     try a.append(gpa, Value.int(100000)); // i16 → i32
     try testing.expectEqual(Lane.i32, a.lane);
@@ -977,8 +1072,8 @@ test "eager commit: heterogeneous first-two (int then float) ends in the value l
     const gpa = testing.allocator;
     var a: ArrayPart = .empty;
     defer a.deinit(gpa);
-    try a.append(gpa, Value.int(7)); // eager → i8 + frozen
-    try testing.expectEqual(Lane.i8, a.lane);
+    try a.append(gpa, Value.int(7)); // eager → u8 + frozen (byte)
+    try testing.expectEqual(Lane.u8, a.lane);
     try a.append(gpa, Value.float(1.5)); // float doesn't fit any int lane → .value
     try testing.expectEqual(Lane.value, a.lane);
     try testing.expect(a.frozen);
@@ -1071,8 +1166,8 @@ test "appendInCap on an int lane encodes the value and sets the presence bit" {
     const gpa = testing.allocator;
     var a: ArrayPart = .empty;
     defer a.deinit(gpa);
-    try a.append(gpa, Value.int(7)); // eager-commit → .i8, len 1
-    try testing.expectEqual(Lane.i8, a.lane);
+    try a.append(gpa, Value.int(7)); // eager-commit → .u8 (byte lane), len 1
+    try testing.expectEqual(Lane.u8, a.lane);
     try testing.expect(a.lane.usesPresenceBitmap());
     // Secure room for an in-cap append, then drive the oracle directly (no realloc).
     try a.ensureCapacity(gpa, a.len + 1);
