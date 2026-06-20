@@ -35,7 +35,10 @@ pub const schema = @import("gen/trace_schema.zig");
 /// the `file_read` kind (ordinal 5) joins the kind space — no result-format change
 /// (it reuses the inline-string `EffectResult` like `getenv`), but the expanded
 /// valid-kind set gets its own version so a v2 reader rejects a v3 log explicitly.
-pub const effect_format_version: u32 = 3;
+/// v4 (S-C): the `unicode_version` kind (ordinal 6) joins — a scalar int (the
+/// packed Unicode version), no result-format change, same explicit-rejection
+/// rationale as v3.
+pub const effect_format_version: u32 = 4;
 
 /// Errors from encoding/decoding an effect log.
 pub const DecodeError = error{
@@ -71,7 +74,7 @@ pub const DecodeError = error{
 /// newly added kind forces a deliberate classification here.
 fn resultShapeOf(kind: EffectKind) enum { scalar, string_or_nil } {
     return switch (kind) {
-        .clock, .random_seed, .argc => .scalar,
+        .clock, .random_seed, .argc, .unicode_version => .scalar,
         .getenv, .argv, .file_read => .string_or_nil,
     };
 }

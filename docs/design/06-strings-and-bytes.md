@@ -51,9 +51,18 @@ those stay byte-keyed and unchanged, which is what keeps determinism cheap.
       char-index `sub` vs still-byte-index pattern functions (`find`/`match`/…)
       gap is the explicit intermediate state, closed in S-D. (Patterns and case
       mapping stay byte/ASCII-level until S-C/S-D.)
-- [ ] **S-C — case mapping + pinned Unicode version** (determinism gate).
-      `upper`/`lower` Unicode-aware via a vendored, versioned table; ASCII fast
-      path; `unicode_version` recorded as a session effect (like the RNG seed).
+- [x] **S-C — case mapping + pinned Unicode version** (determinism gate).
+      *Landed.* `upper`/`lower` are Unicode-aware via the vendored, versioned
+      **simple (1:1)** case table (`src/gen/unicode_case.zig`, generated from
+      `vendor/ucd/16.0.0/UnicodeData.txt` fields 12/13 by `tools/gen_unicode_case.py`);
+      ASCII is the branch-free fast path. The active version (**16.0.0**) is
+      recorded once per session as the `unicode_version` effect — packed
+      `major<<16|minor<<8|patch`, pinned at the first case op, re-asserted on
+      replay (a mismatch is fatal/uncatchable, `Error.UnicodeVersionMismatch`).
+      The pin is derived, not stored: a snapshot resume re-scans the consumed
+      effect-log prefix rather than carrying a keyframe field, so only
+      `effect_format_version` bumped (3→4). Simple mapping is count-preserving:
+      `ß`/`ﬀ` are unchanged (no length-changing or locale tailoring).
 - [ ] **S-D — patterns on code points**. `.`, captures, and quantifiers step by
       code point; `%a %l %u %d …` classes stay ASCII for now (Unicode property
       classes deferred).

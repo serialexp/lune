@@ -166,6 +166,15 @@ pub const EffectKind = enum(u8) {
     /// bytes for this kind too (like `getenv`/`argv`). The *path* is ordinary
     /// program data — only the content is the effect.
     file_read = 5,
+    /// The active Unicode version behind `string.upper`/`string.lower` (S-C,
+    /// design doc 06). NOT a nondeterministic host input — it is a compiled-in
+    /// constant — but it is *recorded* so a replay that needs a Unicode version
+    /// this binary wasn't built with refuses instead of silently diverging when
+    /// the case table churns. Acquired lazily on the first `upper`/`lower` and
+    /// recorded **once** per session (like `random_seed`); the int result is the
+    /// packed `major<<16|minor<<8|patch` version. On replay it is read back and
+    /// asserted equal to the compiled version (else a fatal `UnicodeVersionMismatch`).
+    unicode_version = 6,
 };
 
 pub const Native = struct {

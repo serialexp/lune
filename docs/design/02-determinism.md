@@ -260,6 +260,21 @@ that for a time-travel debugger it *is* the architecture.
       whose result type contradicts its kind, so a malformed `file_read` entry
       surfaces as a clean `MismatchedEffectResult` at decode rather than a downstream
       unwrap panic.
+- [x] **Compiled-in-table version: `unicode_version`** (S-C, doc 06). Unlike the
+      effects above, this records no *host* input — it pins a **constant baked into
+      the binary** whose content churns between releases: the simple (1:1) case
+      table behind `string.upper`/`string.lower`. The active Unicode version
+      (16.0.0, packed `major<<16|minor<<8|patch`) is logged once per session as
+      **`EffectKind.unicode_version`**=6 at the first case op, then re-asserted on
+      replay; a binary built against a *different* table refuses with a fatal,
+      uncatchable `UnicodeVersionMismatch` rather than silently producing different
+      casing. It rides the scalar-int `EffectResult` path (the `random_seed`
+      template), so the only wire change is the enum arm + `resultShapeOf` →
+      `.scalar` and `effect_format_version` 3→4. The "once per session" guard is
+      *derived, not stored*: the keyframe carries no PRNG/effect-cursor state, so a
+      snapshot resume re-scans the consumed effect-log prefix
+      (`versionAlreadyConsumed`) for a pre-cut pin instead of needing a
+      `snapshot_format_version` bump — proven by the keyframeser resume test.
 - [~] **Host-mediated suspension hook.** Reserve "a host effect may suspend its
       caller" so generators / await / tasks can be added later without new
       machinery. **The substrate now exists** (F2c): the interpreter runs on an
@@ -352,6 +367,7 @@ accounting that makes "deterministic" true rather than aspirational.
 | Randomness | seed | **landed (F2e)**: `random()` draws from a VM-owned PRNG; the one recorded effect is the seed, `EffectKind.random_seed`=1 |
 | File / network / stdin | log results | **file landed (L-3)**: `loadfile`/`dofile` read content through `EffectKind.file_read`=5; the path is plain program data, only the content is the input. Network/stdin still host effects |
 | Environment / args | log at startup | snapshot in header |
+| Unicode case table | pin version per recording | **landed (S-C)**: `string.upper`/`lower` use a compiled-in simple-case table; its version is recorded once as `EffectKind.unicode_version`=6 and re-asserted on replay (fatal mismatch) |
 | Hash seed | fix per recording | header |
 | Table iteration order | design out | address-independent |
 | FP mode / NaN / signed zero | pin / canonicalise | platform math policy |

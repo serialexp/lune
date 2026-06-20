@@ -15,9 +15,12 @@
 //! coupling `stdlib/table.zig` already uses.
 //!
 //! Index semantics follow Lua 5.4 (`lstrlib.c`): negative positions count from
-//! the end and `sub`/`byte` ranges are clamped, never out-of-bounds. `upper`/
-//! `lower` are C-locale ASCII only (`A`–`Z` ↔ `a`–`z`), matching lune's fixed
-//! locale (determinism: a mutable locale is explicitly excluded, see the CSV).
+//! the end and `sub`/`codepoint` ranges are clamped, never out-of-bounds.
+//! `upper`/`lower` (S-C) do Unicode **simple (1:1)** case mapping — default,
+//! locale-independent — via the vendored, version-pinned `gen/unicode_case`
+//! table, with a branch-free ASCII fast path. The active Unicode version is pinned
+//! per session as the `unicode_version` effect (determinism: a mutable locale is
+//! still excluded — see the CSV).
 
 const std = @import("std");
 const value = @import("../value.zig");
@@ -26,6 +29,7 @@ const interp = @import("../interp.zig");
 const string_mod = @import("../string.zig");
 const table_mod = @import("../table.zig");
 const pattern = @import("pattern.zig");
+const unicode_case = @import("../gen/unicode_case.zig");
 
 const Value = value.Value;
 const Vm = interp.Vm;
@@ -211,23 +215,57 @@ fn sReverse(ctx: *anyopaque, args: []const Value) anyerror!Value {
     return vm.heap.internValue(buf.items);
 }
 
-/// `string.upper(s)` — ASCII uppercase (C locale).
+/// `string.upper(s)` — Unicode simple (1:1) uppercase (default, locale-independent).
 fn sUpper(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    return mapCase(ctx, args, std.ascii.toUpper);
+    return mapCaseUnicode(ctx, args, .upper);
 }
 
-/// `string.lower(s)` — ASCII lowercase (C locale).
+/// `string.lower(s)` — Unicode simple (1:1) lowercase (default, locale-independent).
 fn sLower(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    return mapCase(ctx, args, std.ascii.toLower);
+    return mapCaseUnicode(ctx, args, .lower);
 }
 
-fn mapCase(ctx: *anyopaque, args: []const Value, comptime f: fn (u8) u8) anyerror!Value {
+/// Simple case mapping over code points (S-C, design doc 06). ASCII (`< 0x80`) is
+/// a branch-free fast path; above it the vendored `unicode_case` table maps one
+/// code point to one (count-preserving — simple mapping never changes the code-
+/// point count). The active Unicode version is pinned as a session effect
+/// (`vm.noteUnicodeVersion`) so the result stays byte-identical on replay even as
+/// the table churns. Output is valid UTF-8 by construction (every emitted scalar
+/// is re-encoded), so `internValue` needs no re-validation.
+fn mapCaseUnicode(ctx: *anyopaque, args: []const Value, comptime kind: enum { upper, lower }) anyerror!Value {
     const vm = vmOf(ctx);
     const s = try strArg(vm, args, 0);
+    try interp.noteUnicodeVersion(vm);
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(vm.gpa);
-    try buf.resize(vm.gpa, s.len);
-    for (s, 0..) |c, k| buf.items[k] = f(c);
+    var off: usize = 0;
+    while (off < s.len) {
+        const b = s[off];
+        if (b < 0x80) { // ASCII fast path — one byte, one character
+            const c = switch (kind) {
+                .upper => std.ascii.toUpper(b),
+                .lower => std.ascii.toLower(b),
+            };
+            try buf.append(vm.gpa, c);
+            off += 1;
+            continue;
+        }
+        const d = decodeAt(s, off);
+        const mapped = switch (kind) {
+            .upper => unicode_case.toUpper(d.cp),
+            .lower => unicode_case.toLower(d.cp),
+        };
+        var enc: [4]u8 = undefined;
+        if (std.unicode.utf8Encode(mapped, &enc)) |n| {
+            try buf.appendSlice(vm.gpa, enc[0..n]);
+        } else |_| {
+            // The table only ever maps to assigned, non-surrogate scalars, so this
+            // is unreachable in practice; on the impossible chance, keep the input
+            // sequence verbatim rather than corrupting the string.
+            try buf.appendSlice(vm.gpa, s[off .. off + d.len]);
+        }
+        off += d.len;
+    }
     return vm.heap.internValue(buf.items);
 }
 
@@ -1287,6 +1325,28 @@ test "string.reverse / upper / lower (ASCII)" {
     try testing.expectEqualStrings("cba", bytesOf(try sReverse(@ptrCast(&vm), &.{try sv(&vm, "abc")})));
     try testing.expectEqualStrings("AB9C", bytesOf(try sUpper(@ptrCast(&vm), &.{try sv(&vm, "aB9c")})));
     try testing.expectEqualStrings("ab9c", bytesOf(try sLower(@ptrCast(&vm), &.{try sv(&vm, "aB9C")})));
+}
+
+test "string.upper / lower: Unicode simple (1:1) case mapping (S-C)" {
+    // The generated table: a couple of direct scalar maps (é<->É, Greek Α<->α).
+    try testing.expectEqual(@as(u21, 0x00C9), unicode_case.toUpper(0x00E9)); // é -> É
+    try testing.expectEqual(@as(u21, 0x03B1), unicode_case.toLower(0x0391)); // Α -> α
+    try testing.expectEqual(@as(u21, 0x00DF), unicode_case.toUpper(0x00DF)); // ß: no simple upper -> itself
+    try testing.expectEqual(@as(u21, 0x0041), unicode_case.toUpper(0x0041)); // ASCII unaffected by the table
+
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    // Latin-1 + ASCII mix; Greek; mixed scripts. Count-preserving.
+    try testing.expectEqualStrings("CAFÉ", bytesOf(try sUpper(@ptrCast(&vm), &.{try sv(&vm, "café")})));
+    try testing.expectEqualStrings("café", bytesOf(try sLower(@ptrCast(&vm), &.{try sv(&vm, "CAFÉ")})));
+    try testing.expectEqualStrings("αβγ", bytesOf(try sLower(@ptrCast(&vm), &.{try sv(&vm, "ΑΒΓ")})));
+    try testing.expectEqualStrings("ΑΒΓ", bytesOf(try sUpper(@ptrCast(&vm), &.{try sv(&vm, "αβγ")})));
+    // Simple mapping: characters with no simple case map are unchanged.
+    try testing.expectEqualStrings("ß", bytesOf(try sUpper(@ptrCast(&vm), &.{try sv(&vm, "ß")})));
+    try testing.expectEqualStrings("ﬀ", bytesOf(try sUpper(@ptrCast(&vm), &.{try sv(&vm, "ﬀ")})));
+    // Code-point count is preserved (simple mapping is 1:1).
+    const up = try sUpper(@ptrCast(&vm), &.{try sv(&vm, "héllo")});
+    try testing.expectEqual(string_mod.String.fromHeader(up.asHeap()).cpLen(), @as(usize, 5));
 }
 
 test "string.rep with separator and non-positive count" {

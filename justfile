@@ -33,3 +33,8 @@ check-version:
 # Run the benchmark suite (rebuilds ReleaseFast first, so never a stale Debug binary).
 bench *args: release
     python3 bench/run.py {{args}}
+
+# Regenerate src/gen/unicode_case.zig from the vendored UCD (design doc 06, S-C).
+# Pure + offline; only needed when re-vendoring a new pinned Unicode version.
+gen-unicode:
+    python3 tools/gen_unicode_case.py --version 16.0.0 --ucd vendor/ucd/16.0.0/UnicodeData.txt --out src/gen/unicode_case.zig

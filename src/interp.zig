@@ -38,6 +38,7 @@ const stdstring = @import("stdlib/string.zig");
 const stderrors = @import("stdlib/errors.zig");
 const stddebug = @import("stdlib/debug.zig");
 const stdload = @import("stdlib/load.zig");
+const unicode_case = @import("gen/unicode_case.zig");
 const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
@@ -92,6 +93,12 @@ pub const Error = error{
     /// — almost certainly a metatable cycle (`setmetatable(t, {__index=t})` and
     /// kin). Surfaced as a located runtime fault rather than hanging the VM.
     MetatableChainLoop,
+    /// Replay's recorded `unicode_version` effect (S-C) names a Unicode version
+    /// that differs from the one this binary's case table was compiled against.
+    /// `upper`/`lower` would map differently, breaking byte-identical replay, so
+    /// the run refuses rather than silently diverging. Fatal like
+    /// `EffectKindMismatch` — NOT a catchable `LuaError`.
+    UnicodeVersionMismatch,
 };
 
 /// Fixed VM register/call stack: every frame's register window is a slice of
@@ -525,6 +532,13 @@ pub const Vm = struct {
     effect_log: std.ArrayList(Effect) = .empty,
     /// Replay read position into `effect_log` (next effect to feed back).
     effect_cursor: usize = 0,
+    /// S-C: whether this session has already pinned its Unicode version (logged in
+    /// `record` / consumed in `replay`) at the first `upper`/`lower`. In-memory
+    /// only — deliberately NOT serialized: on a snapshot-resume it is re-derived
+    /// from the supplied `(effect_log, effect_cursor)` by `noteUnicodeVersion`
+    /// (scanning for an already-consumed `.unicode_version`), exactly as the PRNG
+    /// is not persisted either. See `noteUnicodeVersion`.
+    unicode_version_pinned: bool = false,
     /// Embedder-supplied clock for `clock()` (null = none injected). The
     /// interpreter holds no platform clock; the host that builds the VM sets this
     /// (`main.zig` native, the JS host on wasm, a fake in tests). A `clock()` in
@@ -2519,6 +2533,10 @@ fn narrowError(e: anyerror) Error {
         error.FsUnavailable => Error.FsUnavailable,
         error.EffectLogExhausted => Error.EffectLogExhausted,
         error.EffectKindMismatch => Error.EffectKindMismatch,
+        // `upper`/`lower` pin the `unicode_version` effect from inside their
+        // native, so a replay version mismatch narrows here — and must stay fatal
+        // (not fall through to the catchable `HostError`).
+        error.UnicodeVersionMismatch => Error.UnicodeVersionMismatch,
         else => Error.HostError,
     };
 }
@@ -2548,6 +2566,7 @@ pub fn catchable(e: Error) bool {
         Error.RandomUnavailable,
         Error.EnvUnavailable,
         Error.FsUnavailable,
+        Error.UnicodeVersionMismatch,
         => false,
     };
 }
@@ -2637,6 +2656,55 @@ fn obtainRandomSeed(self: *Vm) Error!u64 {
             return @bitCast(v.asInt());
         },
     }
+}
+
+/// Has a `.unicode_version` effect already been consumed earlier this session?
+/// Used only on a snapshot-resume: the keyframe carries no "already pinned" flag,
+/// so the first `upper`/`lower` after a restore derives it from the re-attached
+/// log + cursor instead of re-consuming an effect that was pinned before the cut.
+fn versionAlreadyConsumed(self: *Vm) bool {
+    const upto = @min(self.effect_cursor, self.effect_log.items.len);
+    for (self.effect_log.items[0..upto]) |e| if (e.kind == .unicode_version) return true;
+    return false;
+}
+
+/// Pin the active Unicode version through the record/replay boundary (S-C). The
+/// case tables are a compiled-in constant, but their content churns between
+/// Unicode releases, so the version is recorded **once per session** (at the first
+/// `string.upper`/`string.lower`) and re-pinned on replay — mirroring the RNG seed
+/// (`obtainRandomSeed`). In `off` it is a no-op marker; in `record` it logs the
+/// compiled-in packed version; in `replay` it consumes that effect and refuses
+/// (`UnicodeVersionMismatch`) if the recording was made under a different version
+/// than this binary's table — a silent case-mapping divergence would break replay.
+/// Called by `upper`/`lower` (stdlib/string.zig); idempotent after the first call.
+///
+/// Snapshot interaction: a *replay* resume is correct (the cursor-prefix scan above
+/// avoids a double-consume). A *record*-mode resume of a once-per-session pin —
+/// snapshotting a live recording and continuing to record — would re-log the pin,
+/// exactly as it would re-log the RNG seed; that "resume a live recording" flow is
+/// the documented out-of-scope follow-up in TODO.md (it needs the keyframe to carry
+/// `effect_log`/`effect_cursor`), not a partial fix here.
+pub fn noteUnicodeVersion(self: *Vm) Error!void {
+    if (self.unicode_version_pinned) return;
+    switch (self.effect_mode) {
+        .off => {},
+        .record => try logEffect(self, .unicode_version, Value.int(unicode_case.unicode_version_packed)),
+        .replay => {
+            // On a snapshot-resume the version may have been pinned before the cut;
+            // its effect then sits behind the cursor — don't consume a second one.
+            if (!versionAlreadyConsumed(self)) {
+                const v = try nextLoggedEffect(self, .unicode_version);
+                // The shared scalar shape-gate (effectser.checkResultShape) accepts
+                // *either* int or float, so a corrupt log could park a float here;
+                // `asInt()` asserts int. Treat a non-int version as a mismatch (a log
+                // we cannot read the version from is, for our purposes, the wrong
+                // version) rather than asserting on hostile bytes.
+                if (v.tag != .int or v.asInt() != @as(i64, unicode_case.unicode_version_packed))
+                    return Error.UnicodeVersionMismatch;
+            }
+        },
+    }
+    self.unicode_version_pinned = true;
 }
 
 /// Read a file's content through the `file_read` record/replay boundary, for
@@ -5115,6 +5183,91 @@ test "S-B: populateArgs rejects a non-UTF-8 command-line argument" {
     const tbl = table.Table.fromHeader(argt.asHeap());
     try testing.expect(tbl.get(Value.int(0)).isNil()); // "prog" never entered
     try testing.expect(tbl.get(Value.int(1)).isNil());
+}
+
+// ---------------------------------------------------------------------------
+// S-C — Unicode-aware `upper`/`lower` + the `unicode_version` session effect.
+// The case table is a compiled-in constant whose content churns between Unicode
+// releases, so the active version is recorded once per session (at the first
+// case op) and re-pinned on replay — a determinism gate. These tests prove (1)
+// the version is pinned exactly once regardless of how many case ops run, (2) a
+// recorded session replays byte-identically, and (3) a replay under a different
+// version refuses (fatal, uncatchable) rather than silently diverging.
+// ---------------------------------------------------------------------------
+
+test "S-C: Unicode upper/lower is byte-identical across all modes" {
+    try expectProgram(
+        \\print(string.upper("café"), string.lower("ΑΒΓ"))
+        \\print(#string.upper("héllo"))
+        \\
+    ,
+        "CAFÉ\tαβγ\n5\n",
+    );
+}
+
+test "S-C: case ops pin the unicode_version exactly once; replay is byte-identical" {
+    const gpa = testing.allocator;
+    const src =
+        \\print(string.upper("café"))
+        \\print(string.lower("ΑΒΓ"))
+    ;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var rec_buf: [256]u8 = undefined;
+    var rec_sink = io.Writer.fixed(&rec_buf);
+    vm.out = &rec_sink;
+    vm.effect_mode = .record;
+    try compileRun(gpa, &vm, src);
+    const recorded = rec_sink.buffered();
+    try testing.expectEqualStrings("CAFÉ\nαβγ\n", recorded);
+    // Two case operations, but the version is pinned only ONCE.
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+    try testing.expectEqual(EffectKind.unicode_version, vm.effect_log.items[0].kind);
+
+    // Replay the same log → byte-identical (the recorded version equals this
+    // binary's compiled version, so the re-pin passes and the tables match).
+    vm.effect_mode = .replay;
+    vm.effect_cursor = 0;
+    vm.unicode_version_pinned = false;
+    var rep_buf: [256]u8 = undefined;
+    var rep_sink = io.Writer.fixed(&rep_buf);
+    vm.out = &rep_sink;
+    try compileRun(gpa, &vm, src);
+    try testing.expectEqualStrings(recorded, rep_sink.buffered());
+}
+
+test "S-C: a replay log with a wrong unicode_version is a fatal, uncatchable error" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.effect_mode = .replay;
+    // A log claiming a Unicode version this binary's table was NOT built against.
+    try vm.effect_log.append(gpa, .{ .kind = .unicode_version, .result = Value.int(0xDEAD) });
+    // Even wrapped in pcall, the mismatch is a determinism fault: NOT catchable.
+    try testing.expectError(error.UnicodeVersionMismatch, compileRun(gpa, &vm,
+        \\print(pcall(string.upper, "x"))
+    ));
+}
+
+test "S-C: a unicode_version log entry with a non-int (float) result is rejected, not asserted" {
+    // The shared scalar shape-gate accepts int OR float, so a corrupt log could
+    // park a float-tagged result on a .unicode_version entry. noteUnicodeVersion
+    // must turn that into a clean UnicodeVersionMismatch rather than asserting in
+    // asInt() on hostile bytes.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.effect_mode = .replay;
+    try vm.effect_log.append(gpa, .{ .kind = .unicode_version, .result = Value.float(16.0) });
+    try testing.expectError(error.UnicodeVersionMismatch, compileRun(gpa, &vm,
+        \\print(pcall(string.lower, "X"))
+    ));
 }
 
 // ---------------------------------------------------------------------------
