@@ -3544,12 +3544,18 @@ test "load: passing a non-string chunk raises a bad-argument error" {
     );
 }
 
-test "load: a pathologically long chunk name degrades to a fixed message, never panics" {
-    // The error formatter writes into a fixed 512-byte buffer; a longer name must
-    // fall back to a literal rather than hitting `catch unreachable` (reviewer ask).
+test "load: a long chunk name is reported in full (allocated message, no truncation)" {
+    // The error message is allocated, not written into a fixed buffer, so an
+    // arbitrarily long chunk name appears in full as the `<name>:<line>: <msg>`
+    // prefix — verified by checking the 600-char name is the message's prefix and
+    // the message extends past it with the location/syntax text.
     try expectProgram(
-        "local f, e = load(\"x x\", string.rep(\"a\", 600)); print(f, e)\n",
-        "nil\tcompile error\n",
+        \\local name = string.rep("a", 600)
+        \\local f, e = load("x x", name)
+        \\print(f, e:sub(1, 600) == name, #e > 600)
+        \\
+    ,
+        "nil\ttrue\ttrue\n",
     );
 }
 

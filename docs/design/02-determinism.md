@@ -229,6 +229,37 @@ that for a time-travel debugger it *is* the architecture.
       directly.
       The format was deliberately deferred until the first genuine input+output pair
       (vs. output-only `print`) so it was designed against a real effect, not guessed.
+- [x] **Runtime compilation replays deterministically** (L-1/L-2/L-3). `load`,
+      `loadfile`, and `dofile` compile source *at runtime* into a callable closure —
+      a new dynamic proto tree the VM owns (`Vm.loaded_chunks`). This is sound under
+      replay on two counts. (1) **Compilation is a pure function of the source
+      bytes** — no clock, entropy, or environment — so it is *not* an effect; like
+      every native it is a trace barrier, but it logs nothing and recompiles
+      identically. A live `load` closure therefore survives keyframe→restore the
+      pure way: the keyframe carries each loaded chunk's **source text**
+      (`schema.LoadedChunk`), and restore **re-compiles** it in load order
+      (`keyframeser.recompileLoadedChunks`) to regenerate byte-identical protos and
+      ids, then resolves each `HeapClosure.proto_id` across the static **and** loaded
+      trees (`resolveProto`). Same sources recompiled in the same order ⇒ the same id
+      space, so a restored closure rebinds to exactly its proto; no new GC machinery
+      (protos stay arena-owned and VM-reachable, the tracer's borrowed-proto liveness
+      now holds for dynamic protos too). `snapshot_format_version` 3→4. (2) The one
+      genuine nondeterministic input is **file content** for `loadfile`/`dofile`: a
+      file read is logged as **`EffectKind.file_read`**=5 in record and fed back in
+      replay, so replay **never touches disk** (the test detaches the FS entirely and
+      still reproduces byte-identical output). The content rides the *same* inline-
+      string `EffectResult` path as `getenv`/`argv`, so the new kind cost zero
+      wire/codec change — just the enum arm and `effect_format_version` 2→3. The host
+      seam mirrors clock/env: an injected `Vm.fs_source` (real disk in the native
+      CLI; null/in-memory elsewhere), consulted only in `record`/`off`, never in
+      `replay`; no source ⇒ a non-catchable `FsUnavailable`. The path is ordinary
+      program data (it need not be recorded); only the content is the effect, and the
+      `cannot open <path>` miss message is a deterministic function of the path, not
+      the host's errno text, so it replays byte-identically across machines. A
+      decode-boundary guard (`effectser.checkResultShape`) rejects a corrupt log
+      whose result type contradicts its kind, so a malformed `file_read` entry
+      surfaces as a clean `MismatchedEffectResult` at decode rather than a downstream
+      unwrap panic.
 - [~] **Host-mediated suspension hook.** Reserve "a host effect may suspend its
       caller" so generators / await / tasks can be added later without new
       machinery. **The substrate now exists** (F2c): the interpreter runs on an
@@ -319,7 +350,7 @@ accounting that makes "deterministic" true rather than aspirational.
 | Host function calls | log inputs+outputs | the primary boundary |
 | Time / clock | log | **landed (F2d)**: `clock()` host effect, `EffectKind.clock`=0 |
 | Randomness | seed | **landed (F2e)**: `random()` draws from a VM-owned PRNG; the one recorded effect is the seed, `EffectKind.random_seed`=1 |
-| File / network / stdin | log results | host effect |
+| File / network / stdin | log results | **file landed (L-3)**: `loadfile`/`dofile` read content through `EffectKind.file_read`=5; the path is plain program data, only the content is the input. Network/stdin still host effects |
 | Environment / args | log at startup | snapshot in header |
 | Hash seed | fix per recording | header |
 | Table iteration order | design out | address-independent |

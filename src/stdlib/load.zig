@@ -159,14 +159,15 @@ fn loadError(vm: *Vm, owned: [:0]u8, chunk_name: []const u8, diags: *const diag.
     vm.gpa.free(owned);
     out[0] = Value.nil();
     if (out.len < 2) return 1;
-    // A very long `chunk_name` (≥ buf) overflows `bufPrint`; fall back to a fixed
-    // literal rather than panicking (the previous `catch unreachable` could fault
-    // the VM on a pathological name). The message is best-effort diagnostic text.
-    var buf: [512]u8 = undefined;
+    // Allocate the message so an arbitrarily long `chunk_name` is reported in full
+    // (no fixed-buffer truncation/degradation). `internValue` copies it into the
+    // heap, so the scratch is freed immediately after. OOM propagates (non-catchable,
+    // fatal) rather than silently mangling the message.
     const msg = if (firstError(diags)) |d|
-        std.fmt.bufPrint(&buf, "{s}:{d}: {s}", .{ chunk_name, d.line, d.message }) catch "compile error"
+        try std.fmt.allocPrint(vm.gpa, "{s}:{d}: {s}", .{ chunk_name, d.line, d.message })
     else
-        std.fmt.bufPrint(&buf, "{s}: compile error", .{chunk_name}) catch "compile error";
+        try std.fmt.allocPrint(vm.gpa, "{s}: compile error", .{chunk_name});
+    defer vm.gpa.free(msg);
     out[1] = try vm.heap.internValue(msg);
     return 2;
 }
@@ -210,8 +211,10 @@ fn loadfileCore(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
 fn cannotOpen(vm: *Vm, path: []const u8, out: []Value) anyerror!usize {
     out[0] = Value.nil();
     if (out.len < 2) return 1;
-    var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "cannot open {s}", .{path}) catch "cannot open file";
+    // Allocate so an arbitrarily long path is reported in full; `internValue` copies
+    // it, so the scratch is freed right after. OOM propagates (non-catchable, fatal).
+    const msg = try std.fmt.allocPrint(vm.gpa, "cannot open {s}", .{path});
+    defer vm.gpa.free(msg);
     out[1] = try vm.heap.internValue(msg);
     return 2;
 }
