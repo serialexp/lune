@@ -287,6 +287,17 @@ Still deferred, each blocked on a capability lune doesn't have yet:
    `math` table via their registry `.module`/`.field`. This finishes the base-host
    tier — only `basic.warn` and `os.clock`'s `partial` remain outside cli-binding.
 
+   **LANDED (June 2026): base-host tier closed.** `os.clock` now returns
+   Lua-faithful **float seconds** (`nativeClock`, namespaced under `os`; the
+   recorded `.clock` effect now carries the float — the serializer round-trips
+   float scalars); the flat `clock` global is gone. Added the lune extension
+   `os.nsclock()` → raw **integer nanoseconds** (shares the `.clock` effect).
+   `warn(...)` (Lua 5.4) landed as pure stderr output (`Vm.err`, NOT a recorded
+   effect, like `print`): all args must be strings, concatenated to one
+   `lune warning: …` line; a single `@`-prefixed piece is a control message
+   (`@off`/`@on` toggle `Vm.warn_enabled`, recognized even while off; unknown `@…`
+   ignored). `warn_enabled` is per-session, not serialized.
+
 ## stdlib `table` — deferred functions
 
 First `table` cut landed in `src/stdlib/table.zig`: `insert remove concat move

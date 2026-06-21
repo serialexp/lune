@@ -38,7 +38,13 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v4 (S-C): the `unicode_version` kind (ordinal 6) joins — a scalar int (the
 /// packed Unicode version), no result-format change, same explicit-rejection
 /// rationale as v3.
-pub const effect_format_version: u32 = 4;
+/// v5: `clock`'s scalar result changed *units* — `os.clock` now records **float
+/// seconds** (was integer nanoseconds; `os.nsclock` keeps the int). No wire-shape
+/// change (`.clock` was already `scalar`, and the codec round-trips int+float), so
+/// a v4 int-ns log would still *decode* cleanly but replay with wrong units. The
+/// bump makes that incompatibility explicit (refuse, not silently diverge) — the
+/// same fail-loud discipline as the unicode-version guard, not backward-compat.
+pub const effect_format_version: u32 = 5;
 
 /// Errors from encoding/decoding an effect log.
 pub const DecodeError = error{

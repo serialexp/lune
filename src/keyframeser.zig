@@ -1816,7 +1816,7 @@ const TestClock = struct {
 const f2d_combined_source =
     \\local function ticks(n)
     \\  local s = 0
-    \\  for i = 1, n do s = s + clock() end
+    \\  for i = 1, n do s = s + os.nsclock() end
     \\  return s
     \\end
     \\print(ticks(3))

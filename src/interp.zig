@@ -230,7 +230,16 @@ pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++
 /// nondeterministic input.
 const core_natives = [_]BaseNative{
     .{ .name = "print", .func = &nativePrint },
-    .{ .name = "clock", .func = &nativeClock, .effect = .clock },
+    // `warn` is a pure host output to stderr (no effect, like `print`); the `@on`/
+    // `@off` control state lives in `Vm.warn_enabled`.
+    .{ .name = "warn", .func = &nativeWarn },
+    // `os.clock` (float seconds) + `os.nsclock` (int nanoseconds, a lune extension)
+    // share the `.clock` effect. `.name` stays bare (`clock`/`nsclock`) — the
+    // serialized keyframe identity; `.module`/`.field` only drive table install,
+    // exactly as `math.random` did. This drops the flat `clock` global and makes
+    // `os` a known builtin via `builtin_global_names` (`bn.module orelse bn.name`).
+    .{ .name = "clock", .func = &nativeClock, .effect = .clock, .module = "os", .field = "clock" },
+    .{ .name = "nsclock", .func = &nativeNsClock, .effect = .clock, .module = "os", .field = "nsclock" },
     // `random`/`randomseed` carry no `effect`: the call itself isn't the boundary —
     // the *seed* is (acquired once, inside the native, as `.random_seed`). So the
     // dispatch calls them directly; the seed goes through record/replay internally.
@@ -516,6 +525,15 @@ pub const Vm = struct {
     /// stdout (`io.zig`); a test (or a future effect recorder) can point this at
     /// an in-memory writer to capture output without touching the real stdout.
     out: ?*io.Writer = null,
+    /// Where `warn` writes (parallel to `out`). `null` means the process's buffered
+    /// stderr (`io.zig`); a test points this at an in-memory writer to capture the
+    /// warning text. Diagnostics go to stderr so they never interleave with a
+    /// program's stdout.
+    err: ?*io.Writer = null,
+    /// Lua 5.4 `warn` system enabled, toggled by the `@on`/`@off` control messages.
+    /// Per-session runtime state — NOT serialized (a warning preference, not
+    /// replayed program behaviour); a restored VM starts enabled like a fresh one.
+    warn_enabled: bool = true,
     /// Trace recorder state: hotness counters, the trace cache, and the
     /// in-progress recording. Disabled by default (`trace.config.enabled`), so
     /// the VM behaves exactly as before Phase 5 until `--trace` flips it on.
@@ -2740,15 +2758,31 @@ pub fn obtainFileRead(self: *Vm, path: []const u8) Error!Value {
     return result;
 }
 
-/// `clock()` — the canonical first nondeterministic *input* (doc 02). Returns the
-/// host monotonic clock as integer nanoseconds. Pure-nondeterministic: two calls
-/// differ, which is exactly why it must be recorded to replay deterministically.
+/// `os.clock()` — the canonical first nondeterministic *input* (doc 02). Returns
+/// the host monotonic clock as **seconds, a float** (Lua-faithful; `os.nsclock`
+/// exposes the raw integer nanoseconds). Pure-nondeterministic: two calls differ,
+/// which is exactly why it must be recorded to replay deterministically. The
+/// recorded `.clock` effect carries this float value (the `EffectResult` codec
+/// round-trips float scalars; `replay` returns it verbatim without re-dividing).
 /// Ignores its arguments. Reads the value through the embedder-injected
 /// `Vm.clock_source` — the interpreter holds no platform clock of its own, so the
 /// VM core compiles to any target (including `wasm32-freestanding`, which has no
 /// clock syscall). With no source injected this is `ClockUnavailable`; the
 /// `replay` path never reaches here (it feeds the log back in `performEffect`).
 fn nativeClock(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    _ = args;
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    const src = vm.clock_source orelse return Error.ClockUnavailable;
+    return Value.float(@as(f64, @floatFromInt(src.nowNs(src.ctx))) / 1e9);
+}
+
+/// `os.nsclock()` — a lune extension (no Lua equivalent): the same host monotonic
+/// clock as `os.clock`, but returned as **integer nanoseconds** for high-resolution
+/// timing. Shares `EffectKind.clock`; the recorded result is the int ns. Mixing
+/// `os.clock` (float) and `os.nsclock` (int) in one run interleaves float/int
+/// `.clock` entries in the log, consumed by call order on replay (the scalar shape
+/// gate accepts both — see `effectser.resultShapeOf`).
+fn nativeNsClock(ctx: *anyopaque, args: []const Value) anyerror!Value {
     _ = args;
     const vm: *Vm = @ptrCast(@alignCast(ctx));
     const src = vm.clock_source orelse return Error.ClockUnavailable;
@@ -2919,6 +2953,59 @@ fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
     try w.writeAll("\n");
     if (to_stdout) io.flush();
     return Value.nil();
+}
+
+/// `warn(msg1, ···)` — Lua 5.4 diagnostic warnings (lbaselib.c `luaB_warn` +
+/// lauxlib.c default handler). Every argument must be a string. A *single* piece
+/// beginning with `@` is a control message — recognized even while warnings are
+/// off, so `@on` can re-enable: `@off` stops emission, `@on` restarts, any other
+/// `@…` is ignored. Otherwise, when enabled, the string arguments are concatenated
+/// and emitted as one line, prefixed `lune warning: `, to stderr (`Vm.err`, or the
+/// process stderr). Pure output, NOT a recorded effect (like `print`): the call is
+/// a trace barrier and is never replayed, so it carries no `EffectKind`.
+fn nativeWarn(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    // At least one argument, and every argument must be a string — Lua checks all
+    // pieces before any emission (so a bad piece never half-prints a warning).
+    if (args.len < 1) return vm.badArg(1, "string", null);
+    for (args, 0..) |a, i| {
+        if (strBytes(a) == null) return vm.badArg(i + 1, "string", a);
+    }
+    // Control message: a single piece beginning with '@'. Checked before the
+    // enabled-gate so `@on` works while warnings are off (Lua's `checkcontrol`
+    // runs from both the on and off handlers).
+    if (args.len == 1) {
+        const b = strBytes(args[0]).?;
+        if (b.len >= 1 and b[0] == '@') {
+            if (std.mem.eql(u8, b, "@off")) {
+                vm.warn_enabled = false;
+            } else if (std.mem.eql(u8, b, "@on")) {
+                vm.warn_enabled = true;
+            }
+            // unknown `@…` control messages are ignored
+            return Value.nil();
+        }
+    }
+    if (!vm.warn_enabled) return Value.nil();
+    const to_stderr = vm.err == null;
+    const w = vm.err orelse io.stderrWriter();
+    // Diagnostics are **best-effort**: swallow any write/flush error (like
+    // `io.eprint`) so `warn` can never turn a closed-stderr or full-buffer into a
+    // VM fault. This is what keeps the unserialized `warn_enabled` sound — warn
+    // touches only stderr (outside the byte-identical-stdout + effect-log replay
+    // contract) and never the VM's success/error outcome, so a keyframe restore
+    // resetting `warn_enabled` cannot perturb replayed execution.
+    emitWarning(w, args) catch {};
+    if (to_stderr) w.flush() catch {};
+    return Value.nil();
+}
+
+/// Write one assembled `lune warning: <args…>\n` line. Split out so `nativeWarn`
+/// can treat the whole emission as a single best-effort unit (`catch {}`).
+fn emitWarning(w: *io.Writer, args: []const Value) !void {
+    try w.writeAll("lune warning: ");
+    for (args) |a| try w.writeAll(strBytes(a).?);
+    try w.writeAll("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -4919,7 +5006,7 @@ test "F2d: replaying a recorded effect log reproduces the recorded output" {
     const gpa = testing.allocator;
     // Output that *depends on* the clock values, so replay fidelity is observable.
     const source =
-        \\for i = 1, 4 do print(clock()) end
+        \\for i = 1, 4 do print(os.clock()) end
     ;
 
     // Record a run against a known clock sequence (1000, 1001, …): the printed
@@ -4950,7 +5037,7 @@ test "F2d: replaying a recorded effect log reproduces the recorded output" {
 test "F2d: replay with a too-short log reports EffectLogExhausted (no silent divergence)" {
     const gpa = testing.allocator;
     const source =
-        \\print(clock()); print(clock())
+        \\print(os.clock()); print(os.clock())
     ;
     // A one-entry log for a program that asks for two effects. Replay feeds the
     // log back (no clock needed) and runs out on the second call.
@@ -4962,7 +5049,7 @@ test "F2d: off mode logs nothing and calls effects normally (default behaviour)"
     const gpa = testing.allocator;
     // Off mode calls the injected clock directly and logs nothing.
     var clk = CounterClock{ .next = 1 };
-    const run = try effectRun(gpa, "print(clock() > 0)", .off, &.{}, &clk, null);
+    const run = try effectRun(gpa, "print(os.clock() > 0)", .off, &.{}, &clk, null);
     defer run.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), run.log.len);
     try testing.expectEqualStrings("true\n", run.out);
@@ -4972,7 +5059,115 @@ test "F2d: clock() with no injected source is ClockUnavailable" {
     const gpa = testing.allocator;
     // The interpreter holds no clock of its own; record/off with no source set
     // surfaces a clear error rather than reaching for a platform clock.
-    try testing.expectError(error.ClockUnavailable, effectRun(gpa, "print(clock())", .record, &.{}, null, null));
+    try testing.expectError(error.ClockUnavailable, effectRun(gpa, "print(os.clock())", .record, &.{}, null, null));
+}
+
+test "F2d: os.clock is float seconds, os.nsclock is int nanoseconds (same source)" {
+    const gpa = testing.allocator;
+    // Pin the clock so both reads see the same instant (2.5e9 ns = 2.5 s). os.clock
+    // divides to a float; os.nsclock hands back the raw integer nanoseconds.
+    var clk = CounterClock{ .next = 2_500_000_000, .step = 0 };
+    const run = try effectRun(gpa,
+        \\print(os.clock() == 2.5)
+        \\print(os.nsclock() == 2500000000)
+        \\print(math.type(os.clock()), math.type(os.nsclock()))
+    , .off, &.{}, &clk, null);
+    defer run.deinit(gpa);
+    try testing.expectEqualStrings("true\ntrue\nfloat\tinteger\n", run.out);
+    try testing.expectEqual(@as(usize, 0), run.log.len); // off mode logs nothing
+}
+
+test "F2d: a run mixing os.clock (float) and os.nsclock (int) records + replays byte-identically" {
+    const gpa = testing.allocator;
+    // Both natives share EffectKind.clock; the log interleaves float and int
+    // scalars, consumed by call order on replay. The shared-effect replay path is
+    // the thing this exercises (the off-mode shape test above doesn't).
+    const source =
+        \\print(os.clock()); print(os.nsclock()); print(os.clock())
+    ;
+    var clk = CounterClock{ .next = 1_500_000_000, .step = 1_000_000_000 };
+    const rec = try effectRun(gpa, source, .record, &.{}, &clk, null);
+    defer rec.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), rec.log.len); // 2 os.clock + 1 os.nsclock
+    // Replay feeds the log back (no clock injected) → byte-identical output.
+    const rep = try effectRun(gpa, source, .replay, rec.log, null, null);
+    defer rep.deinit(gpa);
+    try testing.expectEqualStrings(rec.out, rep.out);
+    try testing.expectEqual(rec.log.len, rep.log.len);
+}
+
+// ---------------------------------------------------------------------------
+// warn — Lua 5.4 diagnostic warnings (pure stderr output, NOT a recorded effect)
+// ---------------------------------------------------------------------------
+
+const OutErr = struct { out: []const u8, err: []const u8 };
+
+/// Run `source` capturing stdout (`vm.out`) into `out_buf` and `warn` output
+/// (`vm.err`) into `err_buf`; returns slices into those caller-owned buffers.
+fn runOutErr(gpa: std.mem.Allocator, source: [:0]const u8, out_buf: []u8, err_buf: []u8) !OutErr {
+    var out = io.Writer.fixed(out_buf);
+    var err = io.Writer.fixed(err_buf);
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.out = &out;
+    vm.err = &err;
+    vm.source = source;
+    try compileRun(gpa, &vm, source);
+    return .{ .out = out.buffered(), .err = err.buffered() };
+}
+
+test "warn: concatenates string args into one stderr line, separate from stdout" {
+    var ob: [256]u8 = undefined;
+    var eb: [256]u8 = undefined;
+    const r = try runOutErr(testing.allocator,
+        \\warn("a", "b", "c")
+        \\print("x")
+    , &ob, &eb);
+    try testing.expectEqualStrings("lune warning: abc\n", r.err);
+    try testing.expectEqualStrings("x\n", r.out);
+}
+
+test "warn: @off suppresses, @on re-enables (control while off is still honoured)" {
+    var ob: [256]u8 = undefined;
+    var eb: [256]u8 = undefined;
+    const r = try runOutErr(testing.allocator,
+        \\warn("one")
+        \\warn("@off")
+        \\warn("two")
+        \\warn("@on")
+        \\warn("three")
+    , &ob, &eb);
+    // "two" is suppressed; "@on" re-enables even though the system was off.
+    try testing.expectEqualStrings("lune warning: one\nlune warning: three\n", r.err);
+}
+
+test "warn: unknown @control is ignored (system stays on, no line emitted for it)" {
+    var ob: [256]u8 = undefined;
+    var eb: [256]u8 = undefined;
+    const r = try runOutErr(testing.allocator,
+        \\warn("@frobnicate")
+        \\warn("still on")
+    , &ob, &eb);
+    try testing.expectEqualStrings("lune warning: still on\n", r.err);
+}
+
+test "warn: a leading-@ piece is only a control message when it is the sole arg" {
+    var ob: [256]u8 = undefined;
+    var eb: [256]u8 = undefined;
+    const r = try runOutErr(testing.allocator,
+        \\warn("@x", "y")
+    , &ob, &eb);
+    // Two pieces → not a control message → emitted verbatim (concatenated).
+    try testing.expectEqualStrings("lune warning: @xy\n", r.err);
+}
+
+test "warn: non-string and missing arguments are bad-argument errors" {
+    var ob: [256]u8 = undefined;
+    var eb: [256]u8 = undefined;
+    // Every piece is checked before any emission (Lua semantics): a bad 2nd arg
+    // raises even though the 1st is a valid string.
+    try testing.expectError(error.LuaError, runOutErr(testing.allocator, "warn(\"ok\", 5)", &ob, &eb));
+    try testing.expectError(error.LuaError, runOutErr(testing.allocator, "warn()", &ob, &eb));
 }
 
 // ---------------------------------------------------------------------------

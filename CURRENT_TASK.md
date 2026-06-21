@@ -1,73 +1,45 @@
-# CURRENT TASK — finish `math.random` / `math.randomseed`
+# CURRENT TASK — base-host cleanup (`os.clock`/`warn`) + `require`/`package`
 
-## Status: implemented + tested, GATE GREEN, manually verified. Awaiting Codex+Antigravity review, then Bart's review before commit (Rule #15 — do NOT commit until approved).
+Plan: `/home/bart/.claude/plans/clever-yawning-neumann.md`. Two commits, each
+behind the gate + Codex/Antigravity review + Bart's approval (Rule #15).
 
-Finishes the last meaningfully-incomplete base-host functions. The determinism
-plumbing (seed-as-`.random_seed`-effect, `Xoshiro256` pinned by name, host
-`RandomSeedSource`) already existed; this adds the missing *language surface*.
+## Commit 1 — base-host cleanup (os.clock/os.nsclock + warn) — DONE, GATE GREEN
 
-## What this does
+Closes the base-host tier.
 
-- **`math.random`** — three Lua 5.4 forms (was: float-only flat `random`):
-  - `math.random()` → float `[0,1)` (the old behaviour, byte-unchanged path).
-  - `math.random(n)` → int `[1,n]`; `n==0` → a full-width random int (all 64 bits).
-  - `math.random(m,n)` → int `[m,n]` inclusive; `m>n` → "interval is empty"
-    bad-argument error; non-integer/missing arg → bad-argument error.
-- **`math.randomseed`** (new):
-  - `math.randomseed(x)` → deterministic re-seed (pure; logs no effect; replays
-    identically without consuming the log).
-  - `math.randomseed()` → fresh OS-entropy seed via the existing `.random_seed`
-    record/replay boundary (`obtainRandomSeed`); `RandomUnavailable` with no source.
-  - returns the single `u64` seed used (lune's Xoshiro256 takes one word, not
-    PUC's two).
-- **Namespaced under `math`** (Bart's call): the flat `random` global is gone;
-  both are installed into the `math` table via their registry `.module`/`.field`.
-  They stay Vm-touching natives in `interp.zig` (they touch the PRNG + effect log),
-  not the pure `stdlib/math.zig`.
+- **os.clock** (`src/interp.zig` `nativeClock`): now returns **float seconds**
+  (ns/1e9), Lua-faithful, namespaced under `os` via the registry `.module`/`.field`
+  (`.name` stays `"clock"` = keyframe identity). The flat `clock` global is gone.
+  The recorded `.clock` effect now carries the float (the effect serializer
+  round-trips float scalars — `effectser.resultShapeOf`/`checkResultShape`/
+  `toEffectResult`); replay returns it verbatim (the native isn't re-called).
+- **os.nsclock** (new, `nativeNsClock`): lune extension, raw **int nanoseconds**,
+  shares `EffectKind.clock`. Mixed float/int `.clock` entries replay by call order.
+- **warn** (`nativeWarn` + `Vm.err` + `Vm.warn_enabled`): Lua 5.4. All args must be
+  strings (checked before any emission); a single `@`-prefixed piece is a control
+  message (`@off`/`@on` toggle `warn_enabled`, recognized even while off; unknown
+  `@…` ignored); else concatenate → one `lune warning: …` line to stderr (`Vm.err`
+  or process stderr). Pure output, NOT a recorded effect (like print). `warn_enabled`
+  is per-session, not serialized.
+- Tests (interp.zig): os.clock-float/os.nsclock-int shape; a record→replay run
+  **mixing** os.clock + os.nsclock (shared `.clock` effect, consumed by call order,
+  byte-identical replay); warn stderr-vs-stdout, @off/@on (incl. control-while-off),
+  unknown-@ ignored, single-vs-multi-piece control, non-string/missing bad-argument.
+  Migrated the F2d `clock()` programs to `os.clock()`/`os.nsclock()`.
+- Docs: CSV rows `os.clock`+`basic.warn` → implemented; TODO note. Gate +
+  check-version green.
 
-## Determinism
-lune is Lua-*shaped*, NOT PUC-stream-compatible (different engine). The internal
-contract — same seed ⇒ same lune stream, reproducible across runs/replay/
-native+wasm — holds. Integer uniformity uses our own Mersenne-rejection
-`projectU64` on the raw `Xoshiro256.next()` words (Rule Z-2 — off the churny
-`std.Random.intRangeAtMost`, so the stream is a pure function of our code + the
-pinned engine). `math.randomseed()` is a new entropy-producing call site → touches
-the seed/effect path → review gate applies.
-
-## Files
-- `src/interp.zig` — `nativeRandom` rewrite (arg dispatch), new `nativeRandomseed`,
-  `projectU64` + `randIntArg` helpers, `core_natives` registry (`random`/
-  `randomseed` → `module=math`), F2e tests migrated + extended.
-- `src/stdlib/math.zig` — doc-comment only (random stays a Vm native in interp.zig).
-- `docs/lua-stdlib-inventory.csv`, `TODO.md` — lockstep (both rows → implemented).
-
-## Tests (in interp.zig F2e block)
-Migrated the 5 existing F2e e2e tests flat `random()` → `math.random()`. Added:
-range `[m,n]` stays in-bounds + hits both ends; `random(n)`/`(1,1)`/`(0)` spans
-negatives; empty-interval + non-integer + non-number bad-argument errors;
-`randomseed(x)` reproduces the stream (zero effects logged); `randomseed()` entropy
-records exactly one `.random_seed` and replays byte-identically; `randomseed()` with
-no source is `RandomUnavailable`.
-
-## Verified
-- `just test` = 0, `just check-version` = 0.
-- Manual: `math.randomseed(42); math.random(1,6)×5` → identical across two runs
-  (`2 5 1 4 6`); all three forms + full-width int + `randomseed` return value
-  correct; `math.random(5,2)` → `bad argument #2 to 'random' (interval is empty)`.
-
-## Review (DONE — both clean modulo one fix)
-Codex + Antigravity reviewed. `projectU64` uniformity/overflow (incl. the full
-`[mininteger,maxinteger]` span, the `sh: u6` wrap, span 0/1/2^k/maxInt) and the
-range mapping + effect ordering all confirmed sound (Antigravity brute-forced 10M
-inputs). **One finding, fixed:** `nativeRandom` acquired the lazy seed (and in
-record/replay *logged/consumed* the `.random_seed` effect) BEFORE validating the
-integer-form args — so a first-call `math.random("x")`/`math.random(5,2)` would
-perturb the determinism boundary before raising its bad-argument error. Reordered:
-all arg + interval validation now happens first, the lazy seed only immediately
-before an actual draw. Added a regression test (replay with empty log → the
-bad-argument LuaError, NOT EffectLogExhausted; record → zero effects logged).
-Gate re-run green.
+## Review (DONE — both clean modulo three fixes, all applied)
+Codex + Antigravity ran on commit 1. Three actionable items, all fixed:
+1. `effect_format_version` 4→5 (old v4 int-ns clock logs would replay as float
+   seconds verbatim — fail-loud signal, not backcompat per Rule #8).
+2. `nativeWarn` emission made best-effort (`emitWarning(...) catch {}`) so a stderr
+   write failure can never become a catchable VM fault — making the unserialized
+   `warn_enabled` sound (warn touches only stderr, outside the replay contract).
+3. Added the mixed os.clock/os.nsclock record→replay test (the shared-effect
+   replay path; the shape test alone was off-mode only).
 
 ## Next
-Await Bart's review + commit approval (Rule #15). After this: the `require`/
-`package` arc (multi-file programs) per the agreed plan.
+Awaiting Bart's commit approval for commit 1 (Rule #15). Suggested message:
+`feat: finish base-host tier — os.clock/os.nsclock + warn`. After that: Phase 3
+(`require`/`package`).
