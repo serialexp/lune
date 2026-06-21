@@ -3922,6 +3922,51 @@ test "S-E: a u8->i16 mid-run widen stays deterministic across all modes" {
     );
 }
 
+// --- Phase D Gap A: the f64 (double) array lane, byte-identical across all modes -
+
+test "f64 lane: a float-array read reduction is byte-identical across all modes" {
+    // Dense fill with doubles commits the f64 lane (8 bytes/slot); the hot read loop
+    // tiers the f64 `aload` to native (`lea` + `movsd` into an XMM, `addsd` to the
+    // carried float accumulator). The load moves raw bits — `array.decode` for `.f64`
+    // is a `@bitCast` — so record_execute_native must match tier-0 bit-for-bit. The
+    // sum (and the spot reads) are exactly representable, so the text is unambiguous.
+    try expectProgram(
+        \\local t = {}
+        \\for i = 1, 300 do t[i] = i * 0.5 end
+        \\local sum = 0.0
+        \\for rep = 1, 100 do
+        \\  for i = 1, 256 do sum = sum + t[i] end
+        \\end
+        \\print(sum)
+        \\print(t[1], t[129], t[256])
+        \\
+    ,
+        "1644800\n0.5\t64.5\t128\n",
+    );
+}
+
+test "f64 lane: a constant float-array fill is byte-identical across all modes" {
+    // The hot write loop tiers the f64 `astore` to native (`movsd` store + presence
+    // `bts`). guard_fits is a no-op for f64 (every double fits) and tropt folds it for
+    // the constant store, so this also exercises the proveKinds path that admits an
+    // f64 astore with no `fits_ok` coverage. Slots 257..300 stay at their fill value
+    // (the hot loop only writes 1..256), proving the store is correctly bounded.
+    try expectProgram(
+        \\local t = {}
+        \\for i = 1, 300 do t[i] = i * 0.5 end
+        \\for rep = 1, 100 do
+        \\  for i = 1, 256 do t[i] = 2.5 end
+        \\end
+        \\local s = 0.0
+        \\for i = 1, 256 do s = s + t[i] end
+        \\print(s)
+        \\print(t[1], t[200], t[256], t[300])
+        \\
+    ,
+        "640\n2.5\t2.5\t2.5\t150\n",
+    );
+}
+
 test "load: compiles and runs a returning chunk" {
     try expectProgram(
         "local f = load(\"return 6 * 7\"); print(f())\n",

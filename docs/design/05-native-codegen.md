@@ -374,20 +374,25 @@ transparently (≈ 1.0×).
 Phase B teaches the native backend to read and write a table's dense run directly,
 against the lane-packed `ArrayPart` (`src/array.zig`) frozen by Phase A. The native
 path handles `t[k]` exactly when `k ∈ 1..len` (the array part); sparse/string keys,
-OOB, holes, and the `.value`/`.f64` lanes all guard-bail to tier-1a.
+OOB, holes, and the heap-bearing `.value` lane all guard-bail to tier-1a. The
+fixed-width lanes — bool, i8…i64, u8, **and now f64 (Phase D Gap A, see §Phase D)** —
+all lower natively.
 
 **IR (recorder → oracle → native), `IrInstr` stays 16 B via the aref-pairing trick:**
 - `aref` (`a`=table, `b`=index, `aux`=lane) → addressing token carrying `idx0 = k-1`.
   Loop-variant (never hoisted). New native `Kind.aref`.
 - `aload` (`a`=aref, `aux`=lane) → decode the slot to a `Value` (bool lane: `movzx`
   the in-band byte + `sub 1` → 0/1; int lanes i8/i16/i32/i64: `movsx`/`movsxd`/`mov`
-  per width).
+  per width; **f64 lane: `lea` the element address + `movsd` the raw 8 bytes into the
+  aload's XMM/spill home** — no decode, `array.decode` for `.f64` is a `@bitCast`).
 - `astore` (`a`=aref, `b`=value, `aux`=lane) → encode the value. The **bool lane** is
   byte-granular with presence in-band (`0=absent,1=false,2=true`): a single
   `mov byte [data+idx0], value+1` carries value and presence together — one
   non-RMW store, one cacheline, the atomic commit (I5 trivial). The **int lanes**
   write a width-truncating `mov [data+idx0*w]` then set the presence bitmap bit
-  **LAST** (I5 — the commit point for an absent→present transition).
+  **LAST** (I5 — the commit point for an absent→present transition). The **f64 lane**
+  is the int-lane shape with a full-width `movsd [data+idx0*8]` store (no truncation —
+  every double fits) followed by the same presence `bts`.
 - read/write guards: `guard_table` (slot is a `table`), `guard_lane` (array lane ==
   recorded lane — both hoisted to the prologue), `guard_bounds` (`idx0 <u len`),
   `guard_present` (a hole would read as `nil`: bool lane tests the in-band byte ≠ 0;
@@ -399,12 +404,16 @@ OOB, holes, and the `.value`/`.f64` lanes all guard-bail to tier-1a.
   free-variable loop-carried slot, not just a constant, so the recorder cannot assume
   it stays in-lane); the tier-1a oracle side-exits via `ArrayPart.laneFits` identically.
   Native lowers it per lane: an int lane → a signed range compare (i8/i16/i32; i64 fits
-  everything → no check); the **bool** lane → *nothing* (proveKinds already requires the
-  store value to be a proven `.bool`, so the guard is a runtime no-op there) — but the
-  oracle, which runs the raw trace, still needs it so a non-bool free-variable store
-  side-exits instead of tripping `ArrayPart.setInLane`'s in-lane assert. When the store
-  value is a *constant* (e.g. the bool sieve's `t[k]=false`), the optimizer folds the
-  guard away entirely (`tropt` evaluates it via `laneFits` at commit time).
+  everything → no check); the **bool** and **f64** lanes → *nothing* (proveKinds already
+  requires the store value to be a proven `.bool` / `.float`, so the guard is a runtime
+  no-op there) — but the oracle, which runs the raw trace, still needs it so a
+  free-variable store of the wrong type side-exits instead of tripping
+  `ArrayPart.setInLane`'s in-lane assert. When the store value is a *constant* (e.g. the
+  bool sieve's `t[k]=false` or an `a[k]=2.0` float fill), the optimizer folds the guard
+  away entirely (`tropt` evaluates it via `laneFits` at commit time) — so unlike the
+  narrow int lanes, the f64 `astore` requires **no `fits_ok` coverage** in proveKinds
+  (a full-width `movsd` never narrows), letting a constant float fill compile even with
+  the guard folded out.
 
 **Soundness invariants enforced:**
 - **C1** — a write whose value/control depends on a prior packed read is
@@ -519,6 +528,41 @@ single-block trace does yet.
 > The canonical `bench/nsieve.lua` uses `pow` only *once, outside* the hot loop, so its
 > loops compile under Phase D (the `2^x` limit is float, but the loop variable is the
 > int `i`); only programs whose hot loop hits a deferred op stay interpreted.
+
+### Gap A — the f64 array lane (tier-1b)
+
+Phase D's scalar XMM path covered float *arithmetic* but not the float *array* lane:
+`nativegen.laneKind` returned `null` for `.f64`, so every `aload`/`astore`/`guard_fits`
+over a float array bailed in `proveKinds` ("unsupported, runs on tier-1a"). Profiling
+the scimark corpus (`scimark-lu`, 77× off LuaJIT) found it ran **0% native** — 52% of
+its time in `array.ArrayPart.decode` unpacking f64 slots that the JIT never touched.
+
+Gap A is **pure lowering** — the recorder already emits f64 `aload`/`astore`, the
+tier-1a oracle already executes them, and the `movsd`/`lea`/`cvtsi2sd` encodings + XMM
+allocator already existed from Phase D. The change: `laneKind` maps `.f64 → .float`
+(unblocking `proveKinds`), the `aload` arm classifies a loaded double as `.float`, and
+three lowering arms mirror the int lanes with `movsd` substituted for the GP `mov`
+(`lea` element address → `movsd` load into the XMM/spill home; stage value to a scratch
+XMM → `movsd` store + presence `bts`; `guard_fits` is a no-op). Crucially the f64
+`astore` requires **no `fits_ok`** (every double fits a full-width `movsd`), so it
+mirrors the **bool** lane rather than the narrow int lanes — that's what lets a
+constant-float fill compile after `tropt` folds the redundant `guard_fits`.
+
+**Determinism** is inherited from the int lanes: `movsd` moves raw 8-byte patterns and
+`array.decode`/`encode` for `.f64` are `@bitCast` round-trips, so native and tier-0
+move byte-identical bits — no FP rounding in a load or a store (arithmetic
+bit-exactness was already settled by Phase D's strict-FP). Verified byte-identical
+across all 8 determinism modes (read reduction + constant fill).
+
+**Benchmark (float-array probes, ReleaseFast, N=200 k × 1 k).** A pure read reduction
+(`s = s + a[k]`) goes **tier-0 4.74 s → tier-1b 0.34 s (≈13.9×)**; a constant fill
+(`a[k] = 2.5`) goes **2.71 s → 0.30 s (≈9.0×)** — both previously compiled to *zero*
+native instructions. LuaJIT runs them in 0.08 s / 0.04 s, so the remaining ~4–7× is
+codegen tightness (loop overhead, per-iteration guards), **not** JIT coverage. The
+scimark kernels themselves are unmoved by Gap A: their hot loops are read-modify-write
+(`vi[k] = vi[k] - eij*vj[k]`), which the recorder's **C1 rule** still aborts (any
+`astore`-after-`aload` → `.bad_type`). Unblocking those is **Gap B** (sink the `astore`
+below the last loop-exit guard); Gap A is the float-array foundation it builds on.
 
 ## Out of scope (named follow-ups)
 

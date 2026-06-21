@@ -147,23 +147,27 @@ const HEADER_TYPE_OFF: i32 = @offsetOf(object.GcHeader, "type");
 const METATABLE_OFF: i32 = @offsetOf(table.Table, "metatable");
 /// Packed-lane ordinals the native array path can lower. The bool lane (B2/B3,
 /// the nsieve sieve) is bit-packed; the int lanes (B4) are byte-packed and
-/// SIB-indexed. `.value` (16-B unpacked, heap-bearing) and `f64` (no float
-/// registers in this backend) always bail to tier-1a — `laneKind` returns null.
+/// SIB-indexed; the `f64` lane (Phase D, float arrays) is 8-byte doubles read/
+/// written with `movsd` into the XMM pool. Only `.value` (16-B unpacked,
+/// heap-bearing) always bails to tier-1a — `laneKind` returns null for it.
 const BOOL_LANE: i32 = @intFromEnum(arr.Lane.boolean);
 const I8_LANE: i32 = @intFromEnum(arr.Lane.i8);
 const I16_LANE: i32 = @intFromEnum(arr.Lane.i16);
 const I32_LANE: i32 = @intFromEnum(arr.Lane.i32);
 const I64_LANE: i32 = @intFromEnum(arr.Lane.i64);
 const U8_LANE: i32 = @intFromEnum(arr.Lane.u8);
+const F64_LANE: i32 = @intFromEnum(arr.Lane.f64);
 
 /// The native scalar `Kind` a packed lane decodes to, or `null` when the native
-/// array path does not lower this lane (`.value` / `f64` → tier-1a). The bool
-/// lane yields a 0/1 boolean; the i8…i64 lanes yield a sign-extended int; the
+/// array path does not lower this lane (`.value` → tier-1a). The bool lane
+/// yields a 0/1 boolean; the i8…i64 lanes yield a sign-extended int; the
 /// unsigned-byte `u8` lane yields a zero-extended int (same `.int` Kind — the
-/// signedness difference is purely in the `aload` extension width, see below).
+/// signedness difference is purely in the `aload` extension width, see below);
+/// the `f64` lane yields a `.float` (an 8-byte double, XMM-resident).
 fn laneKind(aux: i32) ?Kind {
     if (aux == BOOL_LANE) return .bool;
     if (aux == I8_LANE or aux == I16_LANE or aux == I32_LANE or aux == I64_LANE or aux == U8_LANE) return .int;
+    if (aux == F64_LANE) return .float;
     return null;
 }
 
@@ -478,7 +482,7 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .guard_lane => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .ptr) return false;
-                if (laneKind(ins.aux) == null) return false; // .value / f64 → tier-1a
+                if (laneKind(ins.aux) == null) return false; // .value → tier-1a
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 kinds[i] = .none;
             },
@@ -515,10 +519,10 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .aload => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
-                const lk = laneKind(ins.aux) orelse return false; // .value / f64 → tier-1a
+                const lk = laneKind(ins.aux) orelse return false; // .value → tier-1a
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 if (!bounds_ok[ins.a]) return false; // [I4] bounds must dominate
-                kinds[i] = lk; // bool lane → .bool; i8…i64 → .int (sign-extended)
+                kinds[i] = lk; // bool → .bool; i8…i64/u8 → .int; f64 → .float
             },
             // guard_fits: the value (`a`) still fits the recorded narrow lane.
             // For an int lane it marks the value so a following int-lane astore may
@@ -526,10 +530,11 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             // nothing (i64 — every i64 fits). For the bool lane it is a tier-1a-only
             // soundness guard (a free-variable non-bool store side-exits there);
             // native already proves the value is `.bool`, so it lowers to nothing.
-            // The .value / f64 lanes bail at proveKinds (laneKind → null).
+            // For the f64 lane it likewise lowers to nothing (a double is never
+            // narrowed). Only the `.value` lane bails (laneKind → null).
             .guard_fits => {
                 if (ins.a >= i) return false;
-                const lk = laneKind(ins.aux) orelse return false; // .value / f64 → tier-1a
+                const lk = laneKind(ins.aux) orelse return false; // .value → tier-1a
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 switch (lk) {
                     .int => {
@@ -541,6 +546,15 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                     // requires the astore value to be a proven `.bool`, so this guard
                     // lowers to nothing — just type-check it and drop it.
                     .bool => if (kinds[ins.a] != .bool) return false,
+                    // The f64 lane's guard_fits, like the bool lane's, exists for the
+                    // tier-1a oracle (it side-exits a free-variable non-float store).
+                    // Native already requires the astore value to be a proven `.float`
+                    // and a double is never width-truncated, so this lowers to nothing —
+                    // just type-check it and drop it. Unlike the int lanes it does NOT
+                    // mark `fits_ok`: an f64 astore is a full-width `movsd` that needs no
+                    // range coverage, so it must compile even when tropt has folded this
+                    // guard away (a constant store fits trivially → guard DCE'd).
+                    .float => if (kinds[ins.a] != .float) return false,
                     else => return false,
                 }
                 kinds[i] = .none;
@@ -555,7 +569,7 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .astore => {
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
-                const lk = laneKind(ins.aux) orelse return false; // .value / f64 → tier-1a
+                const lk = laneKind(ins.aux) orelse return false; // .value → tier-1a
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 if (!bounds_ok[ins.a]) return false; // [I1/P1] bounds must dominate
                 switch (lk) {
@@ -569,7 +583,16 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                         if (kinds[ins.b] != .int) return false;
                         if (!fits_ok[ins.b]) return false;
                     },
-                    else => return false, // laneKind only yields .bool/.int
+                    .float => {
+                        // f64 lane: the value need only be a proven float. The store is
+                        // a full-width `movsd` with no truncation, so EVERY double fits —
+                        // there is nothing to range-check, hence no `fits_ok` requirement
+                        // (mirrors the bool lane, NOT the narrow int lanes). This is what
+                        // lets a constant-float fill (`a[k] = 2.0`) compile even though
+                        // tropt folds the redundant guard_fits for the constant.
+                        if (kinds[ins.b] != .float) return false;
+                    },
+                    else => return false, // laneKind yields .bool/.int/.float
                 }
                 kinds[i] = .none;
             },
@@ -577,12 +600,14 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             // aref addresses a writable slot — here `data[len]`, the in-cap append
             // successor (idx==len+1, len<cap) into a migrate-free (empty-hash) table.
             // Marks the aref bounds-checked so the following astore_append may store.
-            // bool + i8…i64 (the lanes laneKind lowers); `.value`/`.f64` → tier-1a.
+            // bool + i8…i64 (the lanes the append path lowers); `.value` → tier-1a.
+            // (`.f64` passes laneKind but the recorder never emits an f64 append —
+            // the astore_append below bails it; see there.)
             .guard_append => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
                 const aref_ins = t.instrs[ins.a];
-                if (laneKind(aref_ins.aux) == null) return false; // .value/.f64 → tier-1a
+                if (laneKind(aref_ins.aux) == null) return false; // .value → tier-1a
                 if (!laneConsistent(&trace_lane, aref_ins.aux)) return false;
                 bounds_ok[ins.a] = true;
                 kinds[i] = .none;
@@ -601,7 +626,7 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 // `trace_lane` here forces ins.aux == aref.aux transitively; a trace
                 // whose astore_append.aux disagreed with its aref would be rejected
                 // rather than lowered with a mismatched width/lane.
-                const lk = laneKind(ins.aux) orelse return false; // .value/.f64 → tier-1a
+                const lk = laneKind(ins.aux) orelse return false; // .value → tier-1a
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 if (!bounds_ok[ins.a]) return false; // guard_append must dominate
                 switch (lk) {
@@ -610,7 +635,10 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                         if (kinds[ins.b] != .int) return false;
                         if (!fits_ok[ins.b]) return false; // guard_fits ⇒ width store is exact
                     },
-                    else => return false, // laneKind only yields .bool/.int
+                    // f64 append is intentionally not lowered in this cut: the recorder's
+                    // append gate (`recArraySet`) excludes the f64 lane, so no f64
+                    // astore_append is ever emitted. Should one appear, bail to tier-1a.
+                    else => return false,
                 }
                 kinds[i] = .none;
             },
@@ -2169,26 +2197,44 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 // load into rax). The element load's dst is rax either way.
                 const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
                 const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                if (ins.aux == BOOL_LANE) {
-                    // bool lane: load the in-band byte (1=false, 2=true) and decode
-                    // to a clean 0/1 boolean with `byte - 1`. The dominating
-                    // guard_present already proved the byte is non-zero (a hole
-                    // would be 0), so the result is exactly 0 or 1.
-                    try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
-                    try a.subRegImm32(.rax, 1); // 1→0 (false), 2→1 (true)
-                } else if (ins.aux == U8_LANE) {
-                    // u8 lane: zero-extend the byte element at `[data + idx0]` into a
-                    // full 64-bit int (range 0..255). `movzx` (signed=false), no
-                    // `sub` — this is the only point u8 diverges from the signed int
-                    // lanes, and it matches `array.decode`'s zero-extend exactly.
-                    try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
+                if (ins.aux == F64_LANE) {
+                    // f64 lane: load the raw 8-byte double at `[data + idx0*8]` into
+                    // the aload's float home (an xmm reg or a spill cell). No decode —
+                    // tier-0's `array.decode` for `.f64` is a raw `@bitCast`, so `movsd`
+                    // moves byte-identical bits (no FP rounding in a load → 8-mode
+                    // parity inherited). `lea` the element address (datareg + idx0*8)
+                    // into rax, then `movsd` from `[rax]`.
+                    try a.leaRegMemSib(.rax, datareg, ireg, 8, 0); // rax = &data[idx0]
+                    switch (placeOfRef(alloc, i)) {
+                        .xmm => |x| try a.movsdRegMem(x, .rax, 0),
+                        .mem => |d| {
+                            try a.movsdRegMem(XMM_SCRATCH0, .rax, 0);
+                            try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
+                        },
+                        .reg => unreachable, // a float never homes in a GP register
+                    }
                 } else {
-                    // int lane (i8…i64): sign-extend the width-byte element at
-                    // `[data + idx0*w]` into a full 64-bit int.
-                    const w = intLaneWidth(ins.aux);
-                    try a.loadRegMemSib(.rax, datareg, ireg, w, true, 0);
+                    if (ins.aux == BOOL_LANE) {
+                        // bool lane: load the in-band byte (1=false, 2=true) and decode
+                        // to a clean 0/1 boolean with `byte - 1`. The dominating
+                        // guard_present already proved the byte is non-zero (a hole
+                        // would be 0), so the result is exactly 0 or 1.
+                        try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
+                        try a.subRegImm32(.rax, 1); // 1→0 (false), 2→1 (true)
+                    } else if (ins.aux == U8_LANE) {
+                        // u8 lane: zero-extend the byte element at `[data + idx0]` into a
+                        // full 64-bit int (range 0..255). `movzx` (signed=false), no
+                        // `sub` — this is the only point u8 diverges from the signed int
+                        // lanes, and it matches `array.decode`'s zero-extend exactly.
+                        try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
+                    } else {
+                        // int lane (i8…i64): sign-extend the width-byte element at
+                        // `[data + idx0*w]` into a full 64-bit int.
+                        const w = intLaneWidth(ins.aux);
+                        try a.loadRegMemSib(.rax, datareg, ireg, w, true, 0);
+                    }
+                    try regToPlace(a, placeOfRef(alloc, i), .rax);
                 }
-                try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
             // guard_fits (B4b): range-check the int value (`a`) against the lane's
             // signed bounds and side-exit if it would overflow. Native stores at the
@@ -2196,7 +2242,13 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // that no longer fits must drop back to tier-1a (which then widens). i64
             // holds every int → no check. The compare clobbers only rax (scratch).
             .guard_fits => {
-                if (ins.aux == BOOL_LANE) {
+                if (ins.aux == F64_LANE) {
+                    // f64-lane guard_fits is a tier-1a-only soundness guard: every
+                    // 8-byte bit pattern is a valid double and the lane never narrows,
+                    // so there is nothing to range-check. The value is already proven
+                    // `.float` in proveKinds. (The oracle, which runs the raw trace,
+                    // still re-checks `fits` — but native f64 stores can never widen.)
+                } else if (ins.aux == BOOL_LANE) {
                     // Bool-lane guard_fits is a tier-1a-only soundness guard; the
                     // value is already proven `.bool` in proveKinds, so there is
                     // nothing to range-check here.
@@ -2239,7 +2291,27 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // `idx0` (from the aref) is shared with the dominating guard_bounds [I3].
             .astore => {
                 const aref_ins = t.instrs[ins.a];
-                if (ins.aux == BOOL_LANE) {
+                if (ins.aux == F64_LANE) {
+                    // f64 lane: stage the value (an xmm home or a spill) into a scratch
+                    // XMM, then `movsd` it to `[data + idx0*8]`. No decode/rounding —
+                    // `array.encode` for `.f64` is a raw `@bitCast`, so the native store
+                    // commits byte-identical bits (8-mode parity inherited). guard_fits
+                    // is a no-op for f64 (every bit pattern is a valid double), so no
+                    // range check precedes this. Stage the value BEFORE clobbering
+                    // rax/rcx with the data base / index (the value home is xmm2..15 or
+                    // a spill, never rax/rcx/XMM_SCRATCH0). Presence write is identical
+                    // to the int lanes (lane-agnostic bitmap).
+                    try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
+                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.leaRegMemSib(.rax, datareg, ireg, 8, 0); // rax = &data[idx0]
+                    try a.movsdMemReg(.rax, 0, XMM_SCRATCH0); // [rax] = double
+                    // presence bit LAST: bts [present], idx0 (the commit point), exactly
+                    // as the int lanes do — the bitmap is lane-agnostic.
+                    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
+                    const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.btsMemReg(preg, 0, pireg);
+                } else if (ins.aux == BOOL_LANE) {
                     // bool lane: presence is in-band, so a single byte store commits
                     // both value and presence atomically — `1=false, 2=true` (the
                     // 0/1 value reg + 1). No separate presence write, no branch, one
@@ -3884,32 +3956,161 @@ test "nativegen: guard_table failure side-exits natively with completed==0" {
     try expectMatch(&tr, &.{ Value.int(99), Value.int(2), Value.nil() });
 }
 
-test "nativegen: an f64 array lane bails to tier-1a" {
-    if (comptime !is_x64_linux) return error.SkipZigTest;
-    // The bool + i8…i64 lanes lower natively (B2c/B3/B4); the f64 lane has no
-    // float-register support in this backend and `.value` is heap-bearing, so
-    // both must be rejected by proveKinds and stay on the IR-interpreter.
+/// An f64-lane table with keys 2..K mapping to distinct doubles (`i * 0.5`).
+/// Mirrors `buildIntTable` but for the float lane; the array-part lane settles to
+/// `.f64` (asserted by the callers).
+fn buildFloatTable(gpa: std.mem.Allocator, K: i64) !*table.Table {
+    const t = try table.Table.create(gpa);
+    var i: i64 = 2;
+    while (i <= K) : (i += 1) {
+        try t.set(gpa, Value.int(i), Value.float(@as(f64, @floatFromInt(i)) * 0.5));
+    }
+    return t;
+}
+
+/// `while (k in array) { t[k] = C; k += 1 }` over the f64 lane, with the (no-op
+/// for f64) guard_fits ahead of the store — exactly the shape `recArraySet` emits
+/// for a constant-float fill before tropt folds the redundant guard. r0 = table
+/// (invariant .ptr), r1 = index (carried int), the store value is a float konst.
+/// A pure constant write → no `aload`, so C1 is trivially satisfied.
+fn floatWriteTrace(full: *[14]I, consts: *[2]Value, es: *[0]u16, store_const: f64) Trace {
     const lane: i32 = @intFromEnum(arr.Lane.f64);
-    var full = [_]I{
-        .{ .op = .slot_load, .aux = 0 },
-        .{ .op = .guard_table, .a = 0 },
-        .{ .op = .guard_lane, .a = 0, .aux = lane },
-        .{ .op = .slot_load, .aux = 1 },
-        .{ .op = .guard_int, .a = 3 },
-        .{ .op = .aref, .a = 0, .b = 3, .aux = lane },
-        .{ .op = .guard_bounds, .a = 5 },
-        .{ .op = .guard_present, .a = 5 },
-        .{ .op = .aload, .a = 5, .aux = lane },
-        .{ .op = .konst, .aux = 0 },
-        .{ .op = .add, .a = 3, .b = 9 },
-        .{ .op = .phi, .b = 10, .aux = 1 },
-        .{ .op = .phi, .b = 8, .aux = 2 },
-        .{ .op = .loop },
+    consts.* = .{ Value.float(store_const), Value.int(1) };
+    full.* = .{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .konst, .aux = 0 }, // 7: C (float)
+        .{ .op = .guard_fits, .a = 7, .aux = lane }, // 8: no-op for f64 (every double fits)
+        .{ .op = .astore, .a = 5, .b = 7, .aux = lane }, // 9: t[index] = C
+        .{ .op = .konst, .aux = 1 }, // 10: 1
+        .{ .op = .add, .a = 3, .b = 10 }, // 11: index + 1
+        .{ .op = .phi, .b = 11, .aux = 1 }, // 12: index carry
+        .{ .op = .loop }, // 13
+    };
+    return Trace{ .anchor = undefined, .instrs = full, .consts = consts, .entry_slots = es, .entry_guards = &.{} };
+}
+
+test "nativegen: f64-lane t[k]=C write matches the interpreter" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // The f64 array lane now lowers natively (Phase D Gap A): aref + guard_bounds +
+    // guard_fits (a no-op for f64) + a full-width `movsd` store + presence `bts`.
+    // Native and the tier-1a oracle must agree bit-for-bit on the mutated heap and
+    // the carried index. `2.5` is exactly representable, so the stored bits are
+    // unambiguous.
+    const gpa = testing.allocator;
+    const K: i64 = 48;
+    const C: f64 = 2.5;
+    var full: [14]I = undefined;
+    var consts: [2]Value = undefined;
+    var es: [0]u16 = undefined;
+    const tr = floatWriteTrace(&full, &consts, &es, C);
+
+    // Separate tables (the trace mutates the heap): native vs the oracle.
+    const t_o = try buildFloatTable(gpa, K);
+    defer t_o.destroy(gpa);
+    try testing.expectEqual(arr.Lane.f64, t_o.array.lane);
+    var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
+    const ovals = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(ovals);
+    const oresult = irinterp.execute(&tr, &oregs, ovals);
+
+    const t_n = try buildFloatTable(gpa, K);
+    defer t_n.destroy(gpa);
+    var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
+    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    const ncomp = ct.run(&nregs);
+
+    try testing.expectEqual(oresult.completed, ncomp);
+    try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
+    try expectTablesEqual(t_o, t_n, K);
+    // Sanity: every present slot 2..K now reads the stored constant bit-for-bit.
+    var k: i64 = 2;
+    while (k <= K) : (k += 1) try testing.expectEqual(@as(u64, @bitCast(C)), t_n.getInt(k).payload.bits);
+}
+
+test "nativegen: f64-lane astore deopt-replay leaves a deterministic heap (idempotent re-run)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // C1 oracle on the f64 lane: a native pass then a full tier-0 re-run over the
+    // SAME heap must equal a single clean run on a DISTINCT table. The constant
+    // write is idempotent, so a replayed (side-exit) iteration is safe.
+    const gpa = testing.allocator;
+    const K: i64 = 40;
+    const C: f64 = -3.25;
+    var full: [14]I = undefined;
+    var consts: [2]Value = undefined;
+    var es: [0]u16 = undefined;
+    const tr = floatWriteTrace(&full, &consts, &es, C);
+
+    const t_replay = try buildFloatTable(gpa, K);
+    defer t_replay.destroy(gpa);
+    try testing.expectEqual(arr.Lane.f64, t_replay.array.lane);
+    var r_native = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
+    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    _ = ct.run(&r_native);
+    var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
+    const vals = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(vals);
+    _ = irinterp.execute(&tr, &r_replay, vals);
+
+    const t_once = try buildFloatTable(gpa, K);
+    defer t_once.destroy(gpa);
+    var r_once = [_]Value{ Value.heap(&t_once.header), Value.int(2) };
+    const vals2 = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(vals2);
+    _ = irinterp.execute(&tr, &r_once, vals2);
+
+    try expectTablesEqual(t_replay, t_once, K);
+}
+
+test "nativegen: f64-lane read reduction (aload) matches the strict-FP oracle" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // while (k in array) { acc = acc + a[k]; k += 1 } over the f64 lane. The f64
+    // `aload` lowers to `lea` + `movsd` into an XMM, then `addsd` into the carried
+    // float accumulator — exercising the read side of Gap A (the write side is
+    // covered by the floatWriteTrace tests above). r0=table (.ptr, invariant),
+    // r1=k (int, carried), r2=acc (float, carried; proven via the in-loop
+    // guard_float). Native and the tier-1a oracle must agree on the accumulated
+    // sum bit-for-bit (both use strict-FP `addsd`).
+    const gpa = testing.allocator;
+    const K: i64 = 40;
+    const lane: i32 = @intFromEnum(arr.Lane.f64);
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: k
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .guard_present, .a = 5 }, // 7
+        .{ .op = .aload, .a = 5, .aux = lane }, // 8: a[k] (float)
+        .{ .op = .slot_load, .aux = 2 }, // 9: acc
+        .{ .op = .guard_float, .a = 9 }, // 10: acc is float
+        .{ .op = .add, .a = 9, .b = 8, .ty = .float }, // 11: acc + a[k] → float
+        .{ .op = .konst, .aux = 0 }, // 12: 1 (int)
+        .{ .op = .add, .a = 3, .b = 12 }, // 13: k + 1 (int)
+        .{ .op = .phi, .b = 11, .aux = 2 }, // acc carry
+        .{ .op = .phi, .b = 13, .aux = 1 }, // k carry
+        .{ .op = .loop }, // 16
     };
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
-    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
-    try expectBail(&tr);
+    const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    const t_f = try buildFloatTable(gpa, K);
+    defer t_f.destroy(gpa);
+    try testing.expectEqual(arr.Lane.f64, t_f.array.lane);
+    // Start at k=2 (the first present key) with acc=0.0; the loop reads a[2..K] and
+    // exits when k steps past the dense run. The read is pure (no astore), so a
+    // shared table across native + oracle is safe.
+    try expectMatch(&tr, &.{ Value.heap(&t_f.header), Value.int(2), Value.float(0.0) });
 }
 
 test "nativegen: a carried .ptr (table) slot bails (no int/ptr type confusion)" {

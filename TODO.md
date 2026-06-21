@@ -454,6 +454,37 @@ docs/design/05-native-codegen.md §Out of scope):
    tier-1a; surfaced to Bart as a separate task, not expanded into Phase 8.
 7. **A wasm codegen backend** — a separate consumer of the same lowering seam.
 
+### f64 array lane (Phase D Gap A) — LANDED (June 2026)
+
+The float (`.f64`) array lane now lowers to native (`nativegen.zig`): `laneKind`
+admits `.f64 → .float`, the `aload` arm classifies a loaded double as `.float`, and
+the `aload`/`astore`/`guard_fits` lowering arms mirror the int lanes with `movsd`
+(`lea` addr → `movsd` load into the XMM/spill home; stage value → `movsd` store +
+presence `bts`; `guard_fits` no-op). The f64 `astore` requires **no `fits_ok`** (a
+full-width `movsd` never narrows — mirrors the bool lane, not the narrow int lanes),
+so a constant-float fill compiles even after `tropt` folds the redundant guard.
+Measured: pure float read reduction **13.9×** over tier-0, constant fill **9.0×**
+(both were 0% native before); ~4–7× off LuaJIT now (codegen tightness, not coverage).
+8-mode byte-identical (read + fill e2e in `interp.zig`); nativegen unit tests for the
+write + idempotent-deopt-replay. Reviewed by Codex + Antigravity, Bart-approved.
+
+**Gap B (next, separate plan + review):** the scimark hot loops are read-modify-write
+(`vi[k] = vi[k] - eij*vj[k]`) and array copies, which the recorder's **C1 rule**
+(`trace.zig` `recArraySet`: any `astore` after any `aload` → `.bad_type`) still
+aborts — so scimark-lu/sor/fft are unmoved by Gap A (jit ≈ t0, ~35–77× off LuaJIT).
+Lifting C1 soundly = **sink the `astore` below the last loop-exit guard** (same shape
+as follow-up #4c above): if no side-exit can occur after the store, coarse deopt never
+re-runs a half-applied iteration. This is the piece that actually moves scimark; Gap A
+is its float-array foundation. Own design doc + Codex/Antigravity review first.
+
+**Minor finding (pre-existing, int lanes):** a constant-int *fill* (`a[k] = 7`) also
+fails to compile — `tropt` folds its `guard_fits` (the constant provably fits), so the
+int `astore` arm's `fits_ok[value]` requirement is never satisfied → bail. Unlike f64
+(full-width, every value fits), a narrow int lane genuinely needs the range proof, so
+the fix would be a proveKinds path that range-checks a *constant* store value directly
+(at prove time) instead of relying on a runtime `guard_fits`. Low priority; not a
+regression (predates Gap A). Noted so it isn't re-discovered as a bug.
+
 ## Benchmark north-star: run a real LuaJIT bench (`~/Projects/LuaJIT/bench/`)
 
 Goal (Bart): pick a real LuaJIT benchmark to *work toward* end-to-end on lune, even
