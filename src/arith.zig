@@ -144,11 +144,14 @@ pub fn pow(a: Value, b: Value) Error!Value {
 // ---- bitwise ----
 //
 // Bitwise operators act on the 64-bit two's-complement pattern of integer
-// operands. v1 requires **integer** operands (a float with an integral value is
-// not yet coerced — that convenience is deferred); non-integers error with
-// `TypeError`. Shifts are *logical* (zero-filled) and Lua-style: a shift count
-// outside [-63, 63] shifts every bit out and yields 0; a negative count shifts
-// the other direction.
+// operands. lune requires **integer** operands and — unlike Lua 5.4 —
+// deliberately does NOT coerce a float, even one with an integral value (e.g.
+// `3.0 & 1` errors). Keeping the numeric tower strict here avoids an implicit
+// float→int convenience; any non-integer operand errors with `TypeError`, which
+// the VM renders as "number has no integer representation" (a float) or "attempt
+// to perform bitwise operation on a <type> value" (a non-number). Shifts are
+// *logical* (zero-filled) and Lua-style: a shift count outside [-63, 63] shifts
+// every bit out and yields 0; a negative count shifts the other direction.
 
 inline fn requireInts(a: Value, b: Value) Error!void {
     if (!a.isInt() or !b.isInt()) return Error.TypeError;

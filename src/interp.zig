@@ -1073,12 +1073,16 @@ pub const Vm = struct {
             Error.DivisionByZero => try arena.dupe(u8, "attempt to perform integer division or modulo by zero"),
             Error.MetatableChainLoop => try arena.dupe(u8, "'__index' chain too long; possible loop"),
             else => switch (instr.op) {
-                .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr => try std.fmt.allocPrint(
+                .add, .sub, .mul, .div, .idiv, .mod, .pow => try std.fmt.allocPrint(
                     arena,
                     "attempt to perform arithmetic on a {s} value",
                     .{firstNonNumber(regs[instr.b], regs[instr.c]).typeName()},
                 ),
-                .neg, .bnot => try std.fmt.allocPrint(arena, "attempt to perform arithmetic on a {s} value", .{regs[instr.b].typeName()}),
+                // Bitwise ops want an integer operand: a float (no integer form)
+                // and a non-number get distinct Lua-5.4-shaped messages.
+                .band, .bor, .bxor, .shl, .shr => try bitwiseFaultMessage(arena, firstNonInteger(regs[instr.b], regs[instr.c])),
+                .neg => try std.fmt.allocPrint(arena, "attempt to perform arithmetic on a {s} value", .{regs[instr.b].typeName()}),
+                .bnot => try bitwiseFaultMessage(arena, regs[instr.b]),
                 .len => try std.fmt.allocPrint(arena, "attempt to get length of a {s} value", .{regs[instr.b].typeName()}),
                 .concat => try std.fmt.allocPrint(arena, "attempt to concatenate a {s} value", .{firstNonConcatable(regs[instr.b], regs[instr.c]).typeName()}),
                 .lt, .le, .gt, .ge => try std.fmt.allocPrint(arena, "attempt to compare {s} with {s}", .{ regs[instr.b].typeName(), regs[instr.c].typeName() }),
@@ -2615,6 +2619,21 @@ pub fn catchable(e: Error) bool {
 /// op only faults when one isn't).
 fn firstNonNumber(x: Value, y: Value) Value {
     return if (!x.isNumber()) x else y;
+}
+
+/// The operand a bitwise op couldn't use: the first that is not an integer. A
+/// float counts as non-integer here — lune's bitwise ops require integer operands
+/// and (deliberately) do not coerce even integral-valued floats.
+fn firstNonInteger(x: Value, y: Value) Value {
+    return if (!x.isInt()) x else y;
+}
+
+/// Message for a bitwise fault, Lua-5.4-shaped: a number operand that isn't an
+/// integer "has no integer representation"; anything else is the wrong type for a
+/// "bitwise operation". `bad` is the offending operand (`firstNonInteger`).
+fn bitwiseFaultMessage(arena: std.mem.Allocator, bad: Value) std.mem.Allocator.Error![]const u8 {
+    if (bad.isNumber()) return arena.dupe(u8, "number has no integer representation");
+    return std.fmt.allocPrint(arena, "attempt to perform bitwise operation on a {s} value", .{bad.typeName()});
 }
 
 /// For a concatenation fault, the operand lune's `concat` couldn't coerce —
@@ -4370,6 +4389,22 @@ test "metatable: arithmetic on a table without the metamethod still raises locat
         "false\tanonymous:1: attempt to perform arithmetic on a table value\n" ++
             "false\tanonymous:2: attempt to concatenate a table value\n" ++
             "false\tanonymous:3: attempt to perform arithmetic on a table value\n",
+    );
+}
+
+test "bitwise faults report integer-representation / bitwise-operation messages" {
+    // lune is strict integer-only for bitwise: a float operand (even integral)
+    // gets "number has no integer representation"; a non-number operand gets
+    // "attempt to perform bitwise operation on a <type> value" — distinct from
+    // the arithmetic message, matching Lua 5.4's split.
+    try expectProgram(
+        \\print(pcall(function() return 3.5 & 1 end))
+        \\print(pcall(function() return 1 << 2.0 end))
+        \\print(pcall(function() return 1 | {} end))
+    ,
+        "false\tanonymous:1: number has no integer representation\n" ++
+            "false\tanonymous:2: number has no integer representation\n" ++
+            "false\tanonymous:3: attempt to perform bitwise operation on a table value\n",
     );
 }
 
