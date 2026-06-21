@@ -1,60 +1,78 @@
-# CURRENT TASK — grow the bench corpus (scimark) then pivot to optimization
+# CURRENT TASK — float codegen Gap B (RMW store-sinking, relaxing C1)
 
-Governing arc: chase Lua compatibility so lune is usable, then optimize. Bart's
-steer: "grow the corpus first," then profile + optimize. The corpus is now
-settled for the surfaces Bart cares about (no coroutines / io for now).
+Governing arc: chase Lua compatibility so lune is usable, THEN optimize toward
+LuaJIT parity (1× everywhere is the bar; determinism/replay must cost 0 perf).
 
-## Landed earlier this session (committed)
+## Gap A — COMMITTED (`b64fd01`)
+Native f64 array-lane lowering (Phase D Gap A). Pure read reductions / fills over
+float arrays now run native. See doc 05 §Phase D Gap A + TODO.md. Done & landed.
 
-1. **`5c47b3a`** require/package module system (base-host).
-2. **`bde108e`** vendored LuaJIT macro-benchmark corpus (8 CLBG ports).
-3. **`0c09771`** long-bracket string literals `[[…]]` / `[=[…]=]`.
-4. **`6057b54`** distinct bitwise-fault messages (describeFault split + arith.zig
-   policy comment + 8-mode test).
-5. **`26ba124`** euler14-bit / nsieve-bit native-operator benches + `luajit_src=`
-   harness key + `_ref/` verbatim originals (corpus 8→10).
+## Gap B — IMPLEMENTED (uncommitted, awaiting Bart's commit approval)
 
-## In progress — scimark suite (NOT yet committed)
+Relaxes the recorder's **C1 rule** so single-store read-modify-write float loops
+(scimark SOR/LU) can record and run native. Design doc: `docs/design/07-rmw-store-sinking.md`.
 
-Vendored the SciMark numeric-throughput kernels via require-from-cwd. Corpus 10→14.
+### Mechanism (store-sinking)
+The recorder used to abort (`.bad_type`) any trace with an `astore` after any `aload`,
+because lune's coarse deopt re-runs a whole iteration from the loop header → a
+store-after-read could double-apply. Now: instead of aborting, the recorder **defers
+the single `astore`** and re-emits it in `commit()` **just before the `.loop`
+terminator** — i.e. below every loop-exit guard (including `recForLoop`'s back-edge
+`guard_true`). On any side-exit the sunk store has NOT executed inside the trace, so
+tier-0 re-runs the side-exiting iteration from bytecode and applies the store exactly
+once → idempotent. Closes both the data channel (RMW value) and control channel
+(read-steered branch), since no read-derived decision sits below the store. SSA
+guarantees the sunk store still addresses `v[x]` (the `aref` captured the pre-increment
+key ref).
 
-- **bench/run.py** (uncommitted): `run_once`/`time_best` gained a `cwd=` param
-  passed to `subprocess.run`; the per-bench loop computes `bench_dir =
-  os.path.dirname(b.path)` and passes `cwd=bench_dir` at all 6 call sites. This
-  mirrors LuaJIT's `run.sh` (`cd $BENCH_DIR`) so `package.path`'s `./?.lua`
-  resolves the shared lib. The bench path itself stays absolute, so cwd only
-  affects `require`.
-- **bench/luajit/scimark_lib.lua** (new, verbatim, NO `@bench` header → discovery
-  skips it): the shared FFT/LU/SOR/SPARSE/MC kernel library.
-- **bench/luajit/scimark-{fft,lu,sor,sparse}.lua** (new): the upstream one-liner
-  wrappers + a `-- @bench args="…" luajit=compatible name=scimark-…` header.
-  Workload args (≈1 s each on ReleaseFast): fft=500, lu=80, sor=1000, sparse=3000.
-  The kernels return a flop count the wrappers discard → **empty stdout** → pure
-  timing benches (empty == empty satisfies `luajit=compatible` parity).
-- **docs**: bench/README (corpus 10→14, the require-from-cwd section), TODO
-  (require-from-cwd DONE + str_manip pre-existing-bug note).
+### Constraint (enforced)
+Exactly one deferred store, and it must be the trace's **last** array access: a second
+heap-observing op (`aload`/`astore`/`astore_append`) after the deferral aborts. Pure
+constant fills (no aload, e.g. nsieve clearing) never defer → unaffected.
 
-Harness verified: all 4 `scimark-*` show `cross ok` + `luajit ok`; the full suite
-still passes (no regression from the cwd change). The scimark kernels sit **35–76×
-off LuaJIT** — exactly the float/array throughput lune's tracing JIT is a no-op on.
+### Changes (all in `src/trace.zig`)
+- `PendingStore` struct + `pending_store: ?PendingStore` field on `Recorder` (+ reset).
+- In-bounds astore path: if the trace has a prior aload, stash into `pending_store`
+  instead of emitting the `astore` (and instead of the old C1 abort).
+- `recArrayGet` / `recArraySet`: abort if `pending_store != null` (B2 — store is last).
+- `commit()`: flush the pending astore before the φ loop, then `.loop`.
 
-### Pre-existing bug surfaced (NOT mine to fix in this commit)
-`bench/stdlib/str_manip.lua` is mislabeled `luajit=compatible` but calls
-`string.codepoint` (5.3+), which LuaJIT lacks → `luajit=ERR`. Independent of the
-cwd change (errors identically from repo root). Noted in TODO.md for a separate
-bench-fix pass.
+### Tests (green)
+- trace.zig recorder units: RMW store deferral (data channel) + read-steered const
+  store (control channel) → both now continue recording with `pending_store` set;
+  a subsequent get_index aborts.
+- nativegen.zig unit: f64-lane RMW with the astore SUNK after the increment matches
+  the tier-1a oracle bit-for-bit.
+- interp.zig e2e: `t[i]=t[i]+1.0` RMW loop **byte-identical across all 8 determinism
+  modes** (the load-bearing deopt-idempotence test). `--dump-native` confirms the
+  `movsd [rax],xmm0` + presence `bts` land at the very bottom of the trace, below
+  every guard, before the loop-back `jmp`.
 
-### Review + commit
-Run Codex + Antigravity if Bart wants a review (this is bench-harness + vendored
-Lua only — no VM/effect/determinism surface, so a lighter touch than the prior
-commits). Then Bart's commit approval (Rule #15). Suggested message:
-`bench: add scimark suite via require-from-cwd (corpus 10→14)`.
+### Measure (`just bench --filter scimark`, ReleaseFast, cross ok = 8-mode identical)
+- scimark-sor: t0/lj 46.9× → **jit/lj 4.5×** (10.5× JIT speedup over tier-0)
+- scimark-lu:  t0/lj 74.5× → **jit/lj 12.4×** (6×)
+- scimark-fft (4 stores/iter) and scimark-sparse (indirect `x[col[k]]` gather) stay
+  ~35–62× — out of scope (multi-store deferral / non-RMW gather are named follow-ons).
+
+### Gate / docs
+`just test` green; `just check-version` green. Docs lockstep done: doc 07 status →
+implemented, doc 05 §C1 invariant + Gap A closing note, TODO.md Gap B section.
+
+### Reviews
+Design reviewed pre-implementation (Codex + Antigravity both sound). **Implementation
+review: pending** (final Codex + Antigravity pass on the landed trace.zig change), then
+Bart's commit approval (Rule #15 — do NOT commit without explicit instruction).
+
+### Suggested commit (Preference #2 conventional commits)
+`feat(jit): sink RMW array stores below loop-exit guards (Gap B, relax C1)`
+Files: src/trace.zig, src/nativegen.zig, src/interp.zig,
+docs/design/07-rmw-store-sinking.md, docs/design/05-native-codegen.md, TODO.md,
+CURRENT_TASK.md.
 Stray untracked files (CURRENT_TASK_E3.md, SESSION_CHANGES.md, check_ordinals,
 bench/results/*.tsv) are NOT mine — leave them.
 
-## Next (the pivot Bart deferred): profile the 14+ corpus, optimize
-With the corpus settled, return to the governing arc's second half: `perf record`
-the corpus (the scimark kernels are the new float/array targets), roll symbols up
-by tier, and pick the next named optimization technique. See the bottom of
-CLAUDE.md (the profile-FIRST recipe) and TODO's "Native codegen follow-ups" +
-"tier-0 interpreter perf" sections for the levers.
+## Follow-ons (not Gap B)
+- Multi-store deferral (FFT: 4 stores/iter) — sink an ordered set of last stores.
+- Sparse gather (`x[col[k]]`) — indirect index, not a same-index RMW; different work.
+- Native follow-up #4c (scalar carried-register home coalescing) — still open, distinct
+  mechanism from array store-sinking.

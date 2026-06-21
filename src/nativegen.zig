@@ -4113,6 +4113,72 @@ test "nativegen: f64-lane read reduction (aload) matches the strict-FP oracle" {
     try expectMatch(&tr, &.{ Value.heap(&t_f.header), Value.int(2), Value.float(0.0) });
 }
 
+test "nativegen: f64-lane read-modify-write (sunk astore) matches the oracle" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // The Gap B store-sinking shape: `while (k in array) { a[k] = a[k] * C; k += 1 }`
+    // — a read-modify-write the old C1 rule aborted. The trace reads a[k] (`aload`),
+    // multiplies by a constant, and the `astore` is SUNK to the end of the body
+    // (after the index increment, before the φ/`.loop`), exactly as `commit()`
+    // emits it. The store reuses the read's `aref` (post-CSE the two are one). The
+    // native backend must lower the sunk store and agree with the tier-1a oracle
+    // bit-for-bit on the mutated heap and the carried index. Termination is via
+    // `guard_present` (k steps past the dense run), so the final partial iteration
+    // side-exits BEFORE the read — never reaching the sunk store. C = 2.0 is exactly
+    // representable, so the products are unambiguous.
+    const gpa = testing.allocator;
+    const K: i64 = 40;
+    const C: f64 = 2.0;
+    const lane: i32 = @intFromEnum(arr.Lane.f64);
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: k
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5: &a[k]
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .guard_present, .a = 5 }, // 7
+        .{ .op = .aload, .a = 5, .aux = lane }, // 8: a[k] (float)
+        .{ .op = .konst, .aux = 0 }, // 9: C (float)
+        .{ .op = .mul, .a = 8, .b = 9, .ty = .float }, // 10: a[k] * C → the RMW value
+        .{ .op = .guard_fits, .a = 10, .aux = lane }, // 11: no-op for f64
+        .{ .op = .konst, .aux = 1 }, // 12: 1 (int)
+        .{ .op = .add, .a = 3, .b = 12 }, // 13: k + 1
+        .{ .op = .astore, .a = 5, .b = 10, .aux = lane }, // 14: SUNK store a[k] = a[k]*C
+        .{ .op = .phi, .b = 13, .aux = 1 }, // 15: k carry
+        .{ .op = .loop }, // 16
+    };
+    var consts = [_]Value{ Value.float(C), Value.int(1) };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    // Separate tables (the trace mutates the heap): native vs the oracle.
+    const t_o = try buildFloatTable(gpa, K);
+    defer t_o.destroy(gpa);
+    try testing.expectEqual(arr.Lane.f64, t_o.array.lane);
+    var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
+    const ovals = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(ovals);
+    const oresult = irinterp.execute(&tr, &oregs, ovals);
+
+    const t_n = try buildFloatTable(gpa, K);
+    defer t_n.destroy(gpa);
+    var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
+    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    const ncomp = ct.run(&nregs);
+
+    try testing.expectEqual(oresult.completed, ncomp);
+    try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
+    try expectTablesEqual(t_o, t_n, K);
+    // Every present slot 2..K now reads (k*0.5)*C, bit-for-bit.
+    var k: i64 = 2;
+    while (k <= K) : (k += 1) {
+        const want: f64 = (@as(f64, @floatFromInt(k)) * 0.5) * C;
+        try testing.expectEqual(@as(u64, @bitCast(want)), t_n.getInt(k).payload.bits);
+    }
+}
+
 test "nativegen: a carried .ptr (table) slot bails (no int/ptr type confusion)" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     // slot 0 is loaded as a table (guard_table → .ptr) AND written back as an int

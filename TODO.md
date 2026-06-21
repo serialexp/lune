@@ -468,14 +468,20 @@ Measured: pure float read reduction **13.9×** over tier-0, constant fill **9.0�
 8-mode byte-identical (read + fill e2e in `interp.zig`); nativegen unit tests for the
 write + idempotent-deopt-replay. Reviewed by Codex + Antigravity, Bart-approved.
 
-**Gap B (next, separate plan + review):** the scimark hot loops are read-modify-write
-(`vi[k] = vi[k] - eij*vj[k]`) and array copies, which the recorder's **C1 rule**
-(`trace.zig` `recArraySet`: any `astore` after any `aload` → `.bad_type`) still
-aborts — so scimark-lu/sor/fft are unmoved by Gap A (jit ≈ t0, ~35–77× off LuaJIT).
-Lifting C1 soundly = **sink the `astore` below the last loop-exit guard** (same shape
-as follow-up #4c above): if no side-exit can occur after the store, coarse deopt never
-re-runs a half-applied iteration. This is the piece that actually moves scimark; Gap A
-is its float-array foundation. Own design doc + Codex/Antigravity review first.
+**Gap B (store-sinking) — LANDED (June 2026, doc 07):** the scimark hot loops are
+read-modify-write (`vi[k] = vi[k] - eij*vj[k]`) and array copies, which the recorder's
+old **C1 rule** (`trace.zig` `recArraySet`: any `astore` after any `aload` →
+`.bad_type`) aborted — so scimark-lu/sor were unmoved by Gap A (jit ≈ t0). Lifting C1:
+the recorder now **defers the single RMW `astore` and re-emits it in `commit()` just
+before `.loop`** — below every loop-exit guard. No side-exit can follow the store, so
+coarse deopt never re-runs a half-applied iteration (tier-0 re-runs the iteration from
+the loop header and stores exactly once). Constrained to one store that is the trace's
+*last* array access (any later aload/astore/append aborts). Measured: scimark-sor
+**46.9× → 4.5×** vs LuaJIT (10.5× over tier-0), scimark-lu **74.5× → 12.4×** (6×).
+8-mode byte-identical (RMW `expectProgram` e2e in `interp.zig`; recorder + nativegen
+unit tests). Reviewed by Codex + Antigravity (design + implementation). **Out of
+scope / follow-on:** FFT (4 stores/iter → multi-store deferral) and sparse (indirect
+`x[col[k]]` gather, not a same-index RMW) stay ~35–62× off LuaJIT.
 
 **Minor finding (pre-existing, int lanes):** a constant-int *fill* (`a[k] = 7`) also
 fails to compile — `tropt` folds its `guard_fits` (the constant provably fits), so the

@@ -3967,6 +3967,38 @@ test "f64 lane: a constant float-array fill is byte-identical across all modes" 
     );
 }
 
+// --- Gap B: read-modify-write store-sinking, byte-identical across all modes ----
+
+test "f64 RMW: a read-modify-write float loop is byte-identical across all modes" {
+    // The hot inner loop is `t[i] = t[i] + 1.0` — an `aload` of t[i] feeds the value
+    // that the `astore` writes back. Under the old C1 rule this aborted recording
+    // ("astore after aload"); store-sinking (doc 07) defers the single astore below
+    // every loop-exit guard so it lands just before `.loop`.
+    //
+    // This is the load-bearing idempotence test. lune's deopt re-runs a whole
+    // iteration from the loop header: a trace completes N iterations, then on the
+    // loop-back guard side-exit tier-0 re-runs iteration N+1 from bytecode. Because
+    // the store is sunk *below* that guard, the side-exiting iteration never executed
+    // its store inside the trace, so tier-0 applies `+1.0` exactly once. If the store
+    // were *not* sunk, the boundary iteration would double-apply (+2.0) and
+    // record_execute_native would diverge from tier-0. The accumulate makes any
+    // double-apply visible in the printed bits.
+    //
+    // After 100 reps over 1..256: t[i] = i*0.5 + 100 (exactly representable);
+    // t[257..300] stay at their fill value, proving the sunk store stays in bounds.
+    try expectProgram(
+        \\local t = {}
+        \\for i = 1, 300 do t[i] = i * 0.5 end
+        \\for rep = 1, 100 do
+        \\  for i = 1, 256 do t[i] = t[i] + 1.0 end
+        \\end
+        \\print(t[1], t[128], t[256], t[300])
+        \\
+    ,
+        "100.5\t164\t228\t150\n",
+    );
+}
+
 test "load: compiles and runs a returning chunk" {
     try expectProgram(
         "local f = load(\"return 6 * 7\"); print(f())\n",

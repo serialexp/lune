@@ -416,12 +416,21 @@ all lower natively.
   the guard folded out.
 
 **Soundness invariants enforced:**
-- **C1** — a write whose value/control depends on a prior packed read is
-  unrecordable: `recArraySet` aborts if *any* `aload` exists in the trace
-  (conservative over both data and control channels). nsieve's sieve-clearing loop
-  is pure constant writes, so it is unaffected. The real oracle for this is **tier-0
-  deopt-replay** (snapshot heap, run native-to-exit then tier-0 from the committed
-  regs, compare against a clean tier-0 run on a distinct table) — `expectMatch`
+- **C1 (relaxed by store-sinking — Gap B, doc 07)** — a write whose value/control
+  depends on a prior packed read used to be unrecordable: `recArraySet` aborted if
+  *any* `aload` existed in the trace (conservative over both data and control
+  channels). That blocked every read-modify-write loop. **Store-sinking** now lifts
+  the restriction for the common single-store RMW shape: rather than aborting, the
+  recorder *defers* the single `astore` and re-emits it in `commit()` just before the
+  `.loop` terminator — i.e. **below every loop-exit guard**. Because no side-exit can
+  occur after the store, deopt never re-runs a half-applied iteration (tier-0 re-runs
+  the side-exiting iteration from the loop header and applies the store exactly once),
+  so the double-apply hazard the rule guarded against cannot arise. The deferral is
+  rejected (still abort) if a *second* heap-observing op (another `aload`/`astore`/
+  `astore_append`) follows the deferred store — the store must be the trace's last
+  array access. nsieve's sieve-clearing loop is pure constant writes (no `aload`), so
+  it never deferred and is unaffected. The real oracle for soundness here is **tier-0
+  deopt-replay** (an 8-mode `expectProgram` RMW loop — `interp.zig`) — `expectMatch`
   (regs-only) cannot catch a double-apply because both tiers leave the same partial
   heap on a side-exit.
 - **C2** — no `.ptr`/`.aref` kind in `exit_stores` (the deopt flush writes TAG_INT;
@@ -559,10 +568,13 @@ across all 8 determinism modes (read reduction + constant fill).
 (`a[k] = 2.5`) goes **2.71 s → 0.30 s (≈9.0×)** — both previously compiled to *zero*
 native instructions. LuaJIT runs them in 0.08 s / 0.04 s, so the remaining ~4–7× is
 codegen tightness (loop overhead, per-iteration guards), **not** JIT coverage. The
-scimark kernels themselves are unmoved by Gap A: their hot loops are read-modify-write
-(`vi[k] = vi[k] - eij*vj[k]`), which the recorder's **C1 rule** still aborts (any
-`astore`-after-`aload` → `.bad_type`). Unblocking those is **Gap B** (sink the `astore`
-below the last loop-exit guard); Gap A is the float-array foundation it builds on.
+scimark kernels themselves were unmoved by Gap A alone: their hot loops are
+read-modify-write (`vi[k] = vi[k] - eij*vj[k]`), which the recorder's old **C1 rule**
+aborted (any `astore`-after-`aload` → `.bad_type`). **Gap B** (store-sinking, doc 07)
+unblocked them by deferring the single RMW `astore` below the last loop-exit guard;
+with both landed, scimark-sor went **46.9× → 4.5×** vs LuaJIT and scimark-lu
+**74.5× → 12.4×** (FFT's 4-stores/iter and sparse's indirect gather stay out of
+scope). Gap A is the float-array foundation Gap B builds on.
 
 ## Out of scope (named follow-ups)
 
