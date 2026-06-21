@@ -1,82 +1,73 @@
-# CURRENT TASK — S-E (the `u8` array lane, design doc 06 final chunk)
+# CURRENT TASK — finish `math.random` / `math.randomseed`
 
-## Status: implemented + tested, GATE GREEN, bench clean. Awaiting Codex+Antigravity review, then Bart's review before commit (Rule #15 — do NOT commit until approved).
+## Status: implemented + tested, GATE GREEN, manually verified. Awaiting Codex+Antigravity review, then Bart's review before commit (Rule #15 — do NOT commit until approved).
 
-This is the LAST chunk of design doc 06 (Unicode-native strings). S-A..S-D already
-landed (S-D as ad5392a). S-E is a pure storage/perf optimization — no new language
-surface.
+Finishes the last meaningfully-incomplete base-host functions. The determinism
+plumbing (seed-as-`.random_seed`-effect, `Xoshiro256` pinned by name, host
+`RandomSeedSource`) already existed; this adds the missing *language surface*.
 
-## What S-E does
+## What this does
 
-Byte arrays (integers in `[0,255]`) now pack at **1 byte/slot** instead of `i16`'s
-two (a byte ≥ 128 overflows signed `i8`'s 127 ceiling, so today they land on i16).
-A `u8` rung is added to the monotonic lane lattice.
-
-**Part 1 — lattice (`src/array.zig`).**
-- `Lane` gains a `u8` variant **appended at the end** (ordinal 7) so existing
-  ordinals stay put (trace IR embeds the lane ordinal in `guard_lane.aux`). Lattice
-  order is explicit in `canWidenTo`, independent of ordinal.
-- `u8` is a **sibling** of `i8`, not below it. New `intLaneForRange(lo,hi)` returns
-  `.u8` when `[lo,hi] ⊆ [0,255]`, else `intLaneFor` (signed). `laneForValue` and
-  `optimalLane`'s all-int arm route through it.
-- `widenFor`'s `.u8` arm widens to the smallest *signed* lane covering the
-  **combined** range `[min(0,v), max(255,v)]` — always `≥ i16`, never `i8`, never
-  back to `u8`, so existing high bytes re-encode exactly.
-- `canWidenTo(.u8,·) = {i16,i32,i64,value}`; nothing widens *to* `u8`.
-- `decode` zero-extends (`Value.int(@as(i64, byte))`); `encode` `@intCast`s;
-  `laneFits` checks `[0,255]`; `dataBytes`→`cap`; `usesPresenceBitmap`/`isInt`
-  include `u8`.
-
-**Part 2 — native codegen (`src/nativegen.zig`; `src/x64.zig` unchanged).**
-- `U8_LANE` const; `laneKind(U8_LANE)→.int`; `intLaneWidth(U8_LANE)→1`.
-- `aload` `u8` branch: zero-extend via `loadRegMemSib(.rax, …, 1, false, 0)`
-  (`movzx`, no `sub`) — the only divergence from the signed lanes' `movsx`. Uses the
-  **existing** encoder, no new x64 op.
-- `guard_fits` `u8` branch: range-check `[0,255]` derived from the *lane* (not the
-  width — width-1 is now ambiguous with `i8`).
-- Store path (`astore`/`astore_append`: width-truncate + presence `bts`) is
-  signedness-agnostic → unchanged.
-
-**Part 3 — recorder (`src/trace.zig`).** No code change: the append + in-bounds
-`astore` gates key on `lane == .boolean or lane.isInt()` / `array.fits(v)`, both of
-which now include `u8` automatically.
+- **`math.random`** — three Lua 5.4 forms (was: float-only flat `random`):
+  - `math.random()` → float `[0,1)` (the old behaviour, byte-unchanged path).
+  - `math.random(n)` → int `[1,n]`; `n==0` → a full-width random int (all 64 bits).
+  - `math.random(m,n)` → int `[m,n]` inclusive; `m>n` → "interval is empty"
+    bad-argument error; non-integer/missing arg → bad-argument error.
+- **`math.randomseed`** (new):
+  - `math.randomseed(x)` → deterministic re-seed (pure; logs no effect; replays
+    identically without consuming the log).
+  - `math.randomseed()` → fresh OS-entropy seed via the existing `.random_seed`
+    record/replay boundary (`obtainRandomSeed`); `RandomUnavailable` with no source.
+  - returns the single `u64` seed used (lune's Xoshiro256 takes one word, not
+    PUC's two).
+- **Namespaced under `math`** (Bart's call): the flat `random` global is gone;
+  both are installed into the `math` table via their registry `.module`/`.field`.
+  They stay Vm-touching natives in `interp.zig` (they touch the PRNG + effect log),
+  not the pure `stdlib/math.zig`.
 
 ## Determinism
-Lanes are internal and **never serialised** (the keyframe wire stores logical
-Values). The native zero-extend `aload` matches tier-0 `decode` byte-for-byte. So
-8-mode parity is inherited. Touches `nativegen.zig` → review gate applies.
+lune is Lua-*shaped*, NOT PUC-stream-compatible (different engine). The internal
+contract — same seed ⇒ same lune stream, reproducible across runs/replay/
+native+wasm — holds. Integer uniformity uses our own Mersenne-rejection
+`projectU64` on the raw `Xoshiro256.next()` words (Rule Z-2 — off the churny
+`std.Random.intRangeAtMost`, so the stream is a pure function of our code + the
+pinned engine). `math.randomseed()` is a new entropy-producing call site → touches
+the seed/effect path → review gate applies.
 
-## Tests
-- `src/array.zig` — 3 new u8 tests (byte array commits u8 + 1 B/slot + zero-extend
-  decode; `256` widens to i16; `-1` widens to i16). Existing lane tests updated:
-  small non-negative int arrays now commit `u8` (was `i8`) — `{1,2,3}`, `@mod(i,100)`
-  dense run, etc.; the `canWidenTo` lattice test gains a `u8` row; the i8-specific
-  guard_fits nativegen test now fills with a **negative** to stay on i8.
-- `src/nativegen.zig` — 3 new u8 tests (zero-extend read scan proving `movzx` not
-  `movsx`; in-range `t[k]=C` write; `guard_fits` side-exit at 256 and −1).
-- `src/interp.zig` — 2 new 8-mode `expectProgram` tests (byte-array workload;
-  `u8→i16` mid-run widen); the widen-eviction native test updated to track the `u8`
-  trace eviction (crossover now at i=256, not 128).
+## Files
+- `src/interp.zig` — `nativeRandom` rewrite (arg dispatch), new `nativeRandomseed`,
+  `projectU64` + `randIntArg` helpers, `core_natives` registry (`random`/
+  `randomseed` → `module=math`), F2e tests migrated + extended.
+- `src/stdlib/math.zig` — doc-comment only (random stays a Vm native in interp.zig).
+- `docs/lua-stdlib-inventory.csv`, `TODO.md` — lockstep (both rows → implemented).
 
-## Bench
-`just bench`: every `cross: ok` (8-mode consistency intact); no regression on the
-int/bool array benches (repack, sieve_int, tbl_ops, scalar, pi_leibniz). `str_manip
-ok/ERR` is the **pre-existing** S-B LuaJIT divergence (uses `string.codepoint`),
-unrelated to S-E.
+## Tests (in interp.zig F2e block)
+Migrated the 5 existing F2e e2e tests flat `random()` → `math.random()`. Added:
+range `[m,n]` stays in-bounds + hits both ends; `random(n)`/`(1,1)`/`(0)` spans
+negatives; empty-interval + non-integer + non-number bad-argument errors;
+`randomseed(x)` reproduces the stream (zero effects logged); `randomseed()` entropy
+records exactly one `.random_seed` and replays byte-identically; `randomseed()` with
+no source is `RandomUnavailable`.
 
-## Docs (lockstep, Rule Z-5)
-doc-06 S-E checklist `[x]` (landed note) + the `u8`/store-lowering open question
-**resolved** (zero-extend via existing `movzx`, no new op) + the JIT determinism
-summary updated; TODO `S-E LANDED` block + header `S-A..S-E ALL LANDED`. CSV
-unchanged — S-E adds/renames no stdlib function (the lane is internal storage, not a
-user-facing semantic; the byte array is unchanged to the program).
+## Verified
+- `just test` = 0, `just check-version` = 0.
+- Manual: `math.randomseed(42); math.random(1,6)×5` → identical across two runs
+  (`2 5 1 4 6`); all three forms + full-width int + `randomseed` return value
+  correct; `math.random(5,2)` → `bad argument #2 to 'random' (interval is empty)`.
 
-## Gate
-`just test` = 0, `just check-version` = 0.
+## Review (DONE — both clean modulo one fix)
+Codex + Antigravity reviewed. `projectU64` uniformity/overflow (incl. the full
+`[mininteger,maxinteger]` span, the `sh: u6` wrap, span 0/1/2^k/maxInt) and the
+range mapping + effect ordering all confirmed sound (Antigravity brute-forced 10M
+inputs). **One finding, fixed:** `nativeRandom` acquired the lazy seed (and in
+record/replay *logged/consumed* the `.random_seed` effect) BEFORE validating the
+integer-form args — so a first-call `math.random("x")`/`math.random(5,2)` would
+perturb the determinism boundary before raising its bad-argument error. Reordered:
+all arg + interval validation now happens first, the lazy seed only immediately
+before an actual draw. Added a regression test (replay with empty log → the
+bad-argument LuaError, NOT EffectLogExhausted; record → zero effects logged).
+Gate re-run green.
 
 ## Next
-Codex + Antigravity review (esp. `widenFor`'s combined-range superset correctness +
-`canWidenTo`, and the native zero-extend `aload` + `[0,255]` `guard_fits`), address
-findings, then Bart's review and commit approval (conventional-commits, trailer
-`Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`). This
-completes design doc 06.
+Await Bart's review + commit approval (Rule #15). After this: the `require`/
+`package` arc (multi-file programs) per the agreed plan.

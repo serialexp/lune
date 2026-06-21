@@ -23,8 +23,13 @@
 //!                              needs heap interning (a `*Vm`).
 //!   - `math.frexp`           — returns *two* values (mantissa, exponent); lands
 //!                              with the rest of the C99 float helpers.
-//!   - `math.random`/`randomseed` — a seeded host effect; the flat `random`
-//!                              global already covers the draw (see interp.zig).
+//!
+//! `math.random`/`math.randomseed` are **not** here: they touch VM state (the
+//! PRNG and the `.random_seed` effect log), so they live in `interp.zig` as
+//! Vm-touching natives (`nativeRandom`/`nativeRandomseed`) but are installed into
+//! this `math` table via their registry `.module`/`.field`. lune uses a single
+//! `u64` seed (`std.Random.Xoshiro256`), so the draw is Lua-shaped but not
+//! PUC-stream-compatible.
 
 const std = @import("std");
 const value = @import("../value.zig");

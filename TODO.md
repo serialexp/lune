@@ -273,10 +273,19 @@ Still deferred, each blocked on a capability lune doesn't have yet:
 2. **`math.frexp`** — returns *two* values (mantissa, exponent). The multi-return
    ABI is ready now (see `math.modf`); just needs implementing alongside the other
    C99 float helpers.
-3. **`math.random` / `math.randomseed`** — the seeded host effect. The flat
-   `random` global already draws from the VM PRNG (`.random_seed` effect); these
-   are the namespaced front + explicit reseed. Land when the base-host effects get
-   namespaced (see the `os.clock`/`math.random` flat-global note).
+3. ~~**`math.random` / `math.randomseed`**~~ — **LANDED (June 2026).** Now
+   namespaced under `math` (the flat `random` global is gone), with all three Lua
+   5.4 forms: `math.random()` float `[0,1)`, `math.random(n)` int `[1,n]` (`n==0` →
+   full-width int), `math.random(m,n)` int `[m,n]` (`m>n` → "interval is empty"
+   bad-argument error). Uniformity comes from our own Mersenne-rejection
+   `projectU64` on the pinned `Xoshiro256` word stream (Rule Z-2 — off the churny
+   `std.Random.intRangeAtMost`; Lua-*shaped*, deliberately **not** PUC-stream-
+   compatible). `math.randomseed(x)` re-seeds deterministically (logs no effect);
+   `math.randomseed()` pulls fresh OS entropy through the existing `.random_seed`
+   record/replay boundary and returns the single `u64` seed used. Both stay
+   Vm-touching natives in `interp.zig` (PRNG + effect log), installed into the
+   `math` table via their registry `.module`/`.field`. This finishes the base-host
+   tier — only `basic.warn` and `os.clock`'s `partial` remain outside cli-binding.
 
 ## stdlib `table` — deferred functions
 

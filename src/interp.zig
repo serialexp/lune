@@ -231,10 +231,15 @@ pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++
 const core_natives = [_]BaseNative{
     .{ .name = "print", .func = &nativePrint },
     .{ .name = "clock", .func = &nativeClock, .effect = .clock },
-    // `random` carries no `effect`: the call itself isn't the boundary — its
-    // *seed* is (acquired once, inside `nativeRandom`, as `.random_seed`). So the
-    // dispatch calls it directly; the seed goes through record/replay internally.
-    .{ .name = "random", .func = &nativeRandom },
+    // `random`/`randomseed` carry no `effect`: the call itself isn't the boundary —
+    // the *seed* is (acquired once, inside the native, as `.random_seed`). So the
+    // dispatch calls them directly; the seed goes through record/replay internally.
+    // Installed into the `math` table (Lua-shaped namespacing); the `.name` stays
+    // bare — it is the serialized keyframe identity, the module/field only drive
+    // table install. Both are Vm-touching natives, so they live here, not in the
+    // pure `stdlib/math.zig`.
+    .{ .name = "random", .func = &nativeRandom, .module = "math", .field = "random" },
+    .{ .name = "randomseed", .func = &nativeRandomseed, .module = "math", .field = "randomseed" },
     // env/args inputs — `clock`-style (the call site is the boundary). `getenv`
     // and `argv` return heap strings, so the effect log carries inline bytes.
     .{ .name = "getenv", .func = &nativeGetenv, .effect = .getenv },
@@ -2750,18 +2755,109 @@ fn nativeClock(ctx: *anyopaque, args: []const Value) anyerror!Value {
     return Value.int(src.nowNs(src.ctx));
 }
 
-/// `random()` — a float in `[0,1)`, drawn from the VM's own PRNG. The
-/// nondeterministic *input* is a single seed (the `.random_seed` effect), obtained
-/// lazily on the first call and recorded once; every draw after that is pure VM
-/// state, so replay reproduces the whole stream from that one logged seed. The
-/// PRNG is `std.Random.Xoshiro256` (pinned by name — see `Vm.rng`), so a given
-/// seed yields the same sequence across runs and across the native/wasm engines.
-/// Ignores its arguments for now (ranges are pure computation atop this — later).
+/// Uniform `u64` in `[0, span]` inclusive, drawn from `rng`. Mirrors PUC Lua's
+/// `project` (lmathlib.c): spread `span`'s bits rightward into the smallest
+/// Mersenne number `lim >= span`, mask each raw word with `lim`, and reject any
+/// result still above `span` — so every value in `[0, span]` is equally likely
+/// regardless of whether the interval size is a power of two. Implemented on the
+/// raw `Xoshiro256.next()` word stream (not `std.Random.intRangeAtMost`) to keep
+/// the integer draw a pure function of *our* code plus the pinned engine, off the
+/// churning std surface (Rule Z-2) — so the stream is reproducible across runs,
+/// replay, and the native/wasm engines. `span == maxInt(u64)` makes `lim` all-ones
+/// (no rejection); `span == 0` returns 0 after consuming one word.
+fn projectU64(rng: *std.Random.Xoshiro256, span: u64) u64 {
+    var lim = span;
+    var sh: u6 = 1;
+    while (lim & (lim +% 1) != 0) : (sh = sh *% 2) lim |= lim >> sh;
+    var r = rng.next() & lim;
+    while (r > span) r = rng.next() & lim;
+    return r;
+}
+
+/// Fetch `random`/`randomseed` argument `i` (0-based) as an integer, raising the
+/// located Lua bad-argument error: `(number expected, got <type|no value>)` when
+/// missing or non-numeric, `(number has no integer representation)` for a
+/// non-integral float. Mirrors `stdlib/table.zig`'s `intArg`.
+fn randIntArg(vm: *Vm, args: []const Value, i: usize) Error!i64 {
+    if (i >= args.len) return vm.badArg(i + 1, "number", null);
+    const v = args[i];
+    if (!v.isNumber()) return vm.badArg(i + 1, "number", v);
+    if (v.isInt()) return v.asInt();
+    const f = v.asFloat();
+    const two_pow_63 = 9223372036854775808.0; // 2^63, exact in f64
+    if (std.math.isFinite(f) and f == @trunc(f) and f >= -two_pow_63 and f < two_pow_63)
+        return @intFromFloat(f);
+    return vm.badArgReason(i + 1, "number has no integer representation");
+}
+
+/// `math.random([m [, n]])` — drawn from the VM's own PRNG. The nondeterministic
+/// *input* is a single seed (the `.random_seed` effect), obtained lazily on the
+/// first call (or set explicitly by `math.randomseed`) and recorded once; every
+/// draw after that is pure VM state, so replay reproduces the whole stream from
+/// that one logged seed. The PRNG is `std.Random.Xoshiro256` (pinned by name —
+/// see `Vm.rng`), so a given seed yields the same sequence across runs and across
+/// the native/wasm engines. Three forms (Lua 5.4):
+///   - no args → float in `[0,1)`;
+///   - one arg `n` → integer in `[1,n]`, except `n == 0` → a full-width random
+///     integer (all 64 bits);
+///   - two args `m,n` → integer in `[m,n]` inclusive (`m > n` is "interval is
+///     empty", a bad-argument error).
+/// lune is Lua-*shaped*, not stream-compatible: the distribution matches PUC's
+/// (uniform via `projectU64`) but the byte sequence does not (different engine).
 fn nativeRandom(ctx: *anyopaque, args: []const Value) anyerror!Value {
-    _ = args;
     const vm: *Vm = @ptrCast(@alignCast(ctx));
+
+    // Validate ALL arguments and the interval BEFORE acquiring the seed, so an
+    // invalid call (bad arg type, empty interval) raises its bad-argument error
+    // without ever touching the entropy/effect boundary — otherwise a first-call
+    // `math.random("x")`/`math.random(5,2)` would lazily pull (and in `record`
+    // mode log, in `replay` consume) a `.random_seed` effect before erroring,
+    // making invalid calls part of the recorded determinism (reviewers' catch).
+    var low: i64 = 1;
+    var up: i64 = undefined;
+    var full_width = false; // the `math.random(0)` special case: a full 64-bit int
+    if (args.len >= 1) {
+        if (args.len == 1) {
+            up = try randIntArg(vm, args, 0);
+            if (up == 0) full_width = true;
+        } else {
+            low = try randIntArg(vm, args, 0);
+            up = try randIntArg(vm, args, 1);
+        }
+        if (!full_width and low > up)
+            return vm.badArgReason(if (args.len == 1) 1 else 2, "interval is empty");
+    }
+
+    // Known-valid (or the 0-arg float form): now seed lazily — on the first draw,
+    // or honour an explicit `math.randomseed` that already set `vm.rng`.
     if (vm.rng == null) vm.rng = std.Random.Xoshiro256.init(try obtainRandomSeed(vm));
-    return Value.float(vm.rng.?.random().float(f64));
+    const rng = &vm.rng.?;
+
+    if (args.len == 0) return Value.float(rng.random().float(f64));
+    if (full_width) return Value.int(@bitCast(rng.next()));
+    // Project a raw word into [0, up-low] (unsigned span: can't overflow even for
+    // the full [mininteger, maxinteger] interval), then shift back up to [low, up].
+    const span: u64 = @as(u64, @bitCast(up)) -% @as(u64, @bitCast(low));
+    const p = projectU64(rng, span);
+    return Value.int(@bitCast(@as(u64, @bitCast(low)) +% p));
+}
+
+/// `math.randomseed([x])` — (re)seed the VM's PRNG. With an integer argument the
+/// seed is deterministic (a pure function of the program, so it logs no effect and
+/// in `replay` re-seeds identically without consuming the log). With no argument it
+/// draws one fresh seed from the host entropy source through the `.random_seed`
+/// record/replay boundary (`obtainRandomSeed`) — exactly like `random()`'s lazy
+/// seed, so the entropy form is recorded and replayed for free, and is
+/// `RandomUnavailable` when no source is injected. lune's Xoshiro256 takes a single
+/// `u64` seed (not PUC's two words), so this returns the one seed actually used.
+fn nativeRandomseed(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    const seed: u64 = if (args.len == 0 or args[0].isNil())
+        try obtainRandomSeed(vm)
+    else
+        @bitCast(try randIntArg(vm, args, 0));
+    vm.rng = std.Random.Xoshiro256.init(seed);
+    return Value.int(@bitCast(seed));
 }
 
 /// `getenv(name)` — read an environment variable. A nondeterministic input (the
@@ -4880,23 +4976,26 @@ test "F2d: clock() with no injected source is ClockUnavailable" {
 }
 
 // ---------------------------------------------------------------------------
-// F2e — seed-based randomness
+// F2e — seed-based randomness (`math.random` / `math.randomseed`)
 //
-// `random()` is a nondeterministic *input* like `clock()`, but seed-based: the
-// single recorded effect is one `random_seed`, acquired lazily on the first call,
-// from which a VM-internal PRNG reproduces the entire draw stream on replay. So a
-// multi-draw program records exactly ONE effect, and replaying that one seed
+// `math.random()` is a nondeterministic *input* like `clock()`, but seed-based:
+// the single recorded effect is one `random_seed`, acquired lazily on the first
+// call, from which a VM-internal PRNG reproduces the entire draw stream on replay.
+// So a multi-draw program records exactly ONE effect, and replaying that one seed
 // reproduces every draw byte-identically. These tests prove (1) record→replay
 // fidelity with a single logged seed, (2) different seeds yield different streams
 // (the PRNG genuinely varies), (3) a missing seed in the log is reported, (4) no
-// injected source is a clear error, and (5) draws lie in [0,1).
+// injected source is a clear error, (5) draws lie in [0,1), (6) the integer forms
+// `math.random(n)` / `math.random(m,n)` stay in range and reject empty intervals,
+// and (7) `math.randomseed` re-seeds deterministically (and its no-arg entropy
+// form records/replays through the same boundary).
 // ---------------------------------------------------------------------------
 
 test "F2e: replaying the recorded seed reproduces the whole draw stream" {
     const gpa = testing.allocator;
     // Three draws — proving the single seed drives the entire stream, not one call.
     const source =
-        \\print(random()); print(random()); print(random())
+        \\print(math.random()); print(math.random()); print(math.random())
     ;
 
     var sd = FixedSeed{ .value = 0xC0FFEE };
@@ -4918,7 +5017,7 @@ test "F2e: replaying the recorded seed reproduces the whole draw stream" {
 test "F2e: different seeds yield different draw streams" {
     const gpa = testing.allocator;
     const source =
-        \\print(random()); print(random())
+        \\print(math.random()); print(math.random())
     ;
     var sd_a = FixedSeed{ .value = 1 };
     var sd_b = FixedSeed{ .value = 2 };
@@ -4934,14 +5033,14 @@ test "F2e: different seeds yield different draw streams" {
 test "F2e: replay with no seed in the log reports EffectLogExhausted" {
     const gpa = testing.allocator;
     // An empty log for a program that needs the seed: replay runs out immediately.
-    try testing.expectError(error.EffectLogExhausted, effectRun(gpa, "print(random())", .replay, &.{}, null, null));
+    try testing.expectError(error.EffectLogExhausted, effectRun(gpa, "print(math.random())", .replay, &.{}, null, null));
 }
 
-test "F2e: random() with no injected source is RandomUnavailable" {
+test "F2e: math.random() with no injected source is RandomUnavailable" {
     const gpa = testing.allocator;
     // The VM owns the PRNG but not the seed; record/off with no source set
     // surfaces a clear error rather than reaching for OS entropy itself.
-    try testing.expectError(error.RandomUnavailable, effectRun(gpa, "print(random())", .record, &.{}, null, null));
+    try testing.expectError(error.RandomUnavailable, effectRun(gpa, "print(math.random())", .record, &.{}, null, null));
 }
 
 test "F2e: draws lie in [0,1)" {
@@ -4950,7 +5049,7 @@ test "F2e: draws lie in [0,1)" {
     const source =
         \\local ok = true
         \\for i = 1, 50 do
-        \\  local r = random()
+        \\  local r = math.random()
         \\  if r < 0 or r >= 1 then ok = false end
         \\end
         \\print(ok)
@@ -4959,6 +5058,132 @@ test "F2e: draws lie in [0,1)" {
     const run = try effectRun(gpa, source, .record, &.{}, null, &sd);
     defer run.deinit(gpa);
     try testing.expectEqualStrings("true\n", run.out);
+}
+
+test "F2e: math.random(m,n) stays in [m,n] and hits both ends" {
+    const gpa = testing.allocator;
+    // Over many draws of a small interval every result must be in [m,n], and the
+    // bounds must actually be reachable (the projection isn't off-by-one).
+    const source =
+        \\local lo, hi = 3, 8
+        \\local ok, sawlo, sawhi = true, false, false
+        \\for i = 1, 400 do
+        \\  local r = math.random(lo, hi)
+        \\  if r < lo or r > hi then ok = false end
+        \\  if r == lo then sawlo = true end
+        \\  if r == hi then sawhi = true end
+        \\end
+        \\print(ok, sawlo, sawhi)
+    ;
+    var sd = FixedSeed{ .value = 42 };
+    const run = try effectRun(gpa, source, .record, &.{}, null, &sd);
+    defer run.deinit(gpa);
+    try testing.expectEqualStrings("true\ttrue\ttrue\n", run.out);
+}
+
+test "F2e: math.random(n) is [1,n]; (1,1) is always 1; (0) spans negatives" {
+    const gpa = testing.allocator;
+    const source =
+        \\local ok = true
+        \\for i = 1, 200 do
+        \\  local r = math.random(6)         -- [1,6]
+        \\  if r < 1 or r > 6 then ok = false end
+        \\  if math.random(1, 1) ~= 1 then ok = false end
+        \\end
+        \\-- random(0) is a full-width integer: over many draws at least one is
+        \\-- negative (the high bit set), proving it isn't clamped to non-negative.
+        \\local sawneg = false
+        \\for i = 1, 200 do if math.random(0) < 0 then sawneg = true end end
+        \\print(ok, sawneg)
+    ;
+    var sd = FixedSeed{ .value = 7 };
+    const run = try effectRun(gpa, source, .record, &.{}, null, &sd);
+    defer run.deinit(gpa);
+    try testing.expectEqualStrings("true\ttrue\n", run.out);
+}
+
+test "F2e: math.random empty interval and non-integer args are bad-argument errors" {
+    const gpa = testing.allocator;
+    var sd = FixedSeed{ .value = 1 };
+    // m > n → "interval is empty".
+    try testing.expectError(error.LuaError, effectRun(gpa, "print(math.random(5, 2))", .record, &.{}, null, &sd));
+    var sd2 = FixedSeed{ .value = 1 };
+    // a non-integral float → "number has no integer representation".
+    try testing.expectError(error.LuaError, effectRun(gpa, "print(math.random(1.5))", .record, &.{}, null, &sd2));
+    var sd3 = FixedSeed{ .value = 1 };
+    // a non-number → "number expected".
+    try testing.expectError(error.LuaError, effectRun(gpa, "print(math.random('x'))", .record, &.{}, null, &sd3));
+}
+
+test "F2e: an invalid math.random call raises before touching the seed/effect boundary" {
+    const gpa = testing.allocator;
+    // Reviewers' catch: arg/interval validation must happen BEFORE the lazy seed,
+    // so an invalid *first* call doesn't consume the entropy/effect boundary. Proof:
+    // in replay mode with an EMPTY log, an invalid call surfaces its bad-argument
+    // LuaError — NOT EffectLogExhausted (which is what trying to read a seed first
+    // would yield). Both the empty-interval and the bad-type forms.
+    try testing.expectError(error.LuaError, effectRun(gpa, "print(math.random(5, 2))", .replay, &.{}, null, null));
+    try testing.expectError(error.LuaError, effectRun(gpa, "print(math.random('x'))", .replay, &.{}, null, null));
+    // And in record mode with a seed source: an invalid first call logs ZERO
+    // effects (the seed was never acquired). Inspect the log on a live VM.
+    var sd = FixedSeed{ .value = 1 };
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.effect_mode = .record;
+    vm.random_seed_source = sd.source();
+    try testing.expectError(error.LuaError, compileRun(gpa, &vm, "math.random(5, 2)"));
+    try testing.expectEqual(@as(usize, 0), vm.effect_log.items.len);
+}
+
+test "F2e: math.randomseed(x) re-seeds deterministically (same seed → same stream)" {
+    const gpa = testing.allocator;
+    // Explicit-seed form logs NO effect (the seed is in the program), and seeding
+    // twice with the same x reproduces the stream — proving the re-seed is a pure
+    // function of x, independent of the lazy entropy seed.
+    const source =
+        \\math.randomseed(123)
+        \\local a = {}
+        \\for i = 1, 5 do a[i] = math.random(1, 1000) end
+        \\math.randomseed(123)
+        \\local same = true
+        \\for i = 1, 5 do if math.random(1, 1000) ~= a[i] then same = false end end
+        \\print(same)
+    ;
+    // No seed source injected: an explicit randomseed needs none, and no lazy seed
+    // is acquired (rng is set before the first draw), so this records zero effects.
+    const run = try effectRun(gpa, source, .off, &.{}, null, null);
+    defer run.deinit(gpa);
+    try testing.expectEqualStrings("true\n", run.out);
+    try testing.expectEqual(@as(usize, 0), run.log.len);
+}
+
+test "F2e: math.randomseed() entropy form records and replays the seed" {
+    const gpa = testing.allocator;
+    // No-arg randomseed pulls one entropy seed through the .random_seed boundary,
+    // so a draw afterward is reproduced byte-for-byte on replay of that one effect.
+    const source =
+        \\math.randomseed()
+        \\print(math.random(1, 1000000))
+    ;
+    var sd = FixedSeed{ .value = 0xABCDEF };
+    const rec = try effectRun(gpa, source, .record, &.{}, null, &sd);
+    defer rec.deinit(gpa);
+    // Exactly one effect: the no-arg randomseed's entropy draw (the later
+    // math.random reuses that PRNG state, logging nothing).
+    try testing.expectEqual(@as(usize, 1), rec.log.len);
+    try testing.expectEqual(EffectKind.random_seed, rec.log[0].kind);
+    const rep = try effectRun(gpa, source, .replay, rec.log, null, null);
+    defer rep.deinit(gpa);
+    try testing.expectEqualStrings(rec.out, rep.out);
+}
+
+test "F2e: math.randomseed() with no injected source is RandomUnavailable" {
+    const gpa = testing.allocator;
+    // The no-arg entropy form needs a seed source, exactly like a lazy random().
+    try testing.expectError(error.RandomUnavailable, effectRun(gpa, "math.randomseed()", .record, &.{}, null, null));
 }
 
 // ---------------------------------------------------------------------------
