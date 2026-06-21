@@ -3683,6 +3683,46 @@ fn expectProgram(source: [:0]const u8, expected: []const u8) !void {
     }
 }
 
+// --- long-bracket string literals (8-mode parity) ----------------------------
+
+test "long string: plain, concat, and length" {
+    try expectProgram(
+        "print([[hello]] .. [[ world]], #[[abc]])\n",
+        "hello world\t3\n",
+    );
+}
+
+test "long string: a leading newline is dropped, later newlines kept" {
+    // The newline right after `[[` is not part of the string; the one before
+    // `]]` is. So the value is "hi\n" (length 3).
+    try expectProgram(
+        "local s = [[\nhi\n]]\nprint(#s)\n",
+        "3\n",
+    );
+}
+
+test "long string: no escape interpretation" {
+    // Backslash-t inside a long string is two literal bytes, not a tab.
+    try expectProgram(
+        "print([[a\\tb]])\n",
+        "a\\tb\n",
+    );
+}
+
+test "long string: leveled brackets pass through inner ]] verbatim" {
+    try expectProgram(
+        "print([==[x]]y]==])\n",
+        "x]]y\n",
+    );
+}
+
+test "leveled long comment is ignored between statements" {
+    try expectProgram(
+        "print(1)--[=[ hidden ]] still hidden ]=]\nprint(2)\n",
+        "1\n2\n",
+    );
+}
+
 test "foundations: pcall catches a bare runtime fault (synthesized message)" {
     try expectProgram(
         "print(pcall(function() return nil + 1 end))\n",

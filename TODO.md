@@ -11,13 +11,24 @@ gap — knocking any of these down unlocks the listed benches as new corpus memb
 
 - **`coroutine` library** (none yet): unlocks `chameneos`, `coroutine-ring`.
   Largest lift; intersects determinism (coroutine resume order must be replayable).
-- **LuaJIT `bit.*` library** (BitOp API — `bit.band/bor/bxor/lshift/...`): unlocks
-  `euler14-bit`, `nsieve-bit`, `mandelbrot-bit`. lune has native 5.4 bitwise
-  operators; this is a thin `bit` module mapping them. Medium.
-- **Leveled long-bracket strings `[=[ … ]=]`** in the lexer + a `loadstring` alias
-  for `load`: unlocks the dynamic-codegen ports `fasta`, `pidigits-nogmp`,
-  `revcomp`, `meteor` (all build a chunk as a `[=[…]=]` string and `loadstring` it,
-  passing `...`). One lexer feature + alias unlocks 4. Medium.
+- **LuaJIT `bit.*` library** (BitOp API — `bit.band/bor/bxor/lshift/...`): the
+  cleanest remaining unlock — `euler14-bit` and `nsieve-bit` have clean
+  deterministic text output and need only `bit` (`mandelbrot-bit`/`md5` also need
+  it but are separately blocked on binary output / non-ASCII `\ddd` escapes). lune
+  has native 5.4 bitwise operators; this is a thin `bit` module mapping them, with
+  LuaJIT's **int32 normalization** semantics (results are signed 32-bit; `tobit`,
+  `tohex`, `rol`/`ror`, `bswap`). **Language-surface call for Bart**: `bit` is a
+  LuaJIT extension, not Lua 5.4 — decide whether it belongs in lune proper (pure,
+  deterministic → would be a base-host module) or stays a bench-only shim.
+- **Leveled long-bracket strings `[[…]]` / `[=[…]=]`** — DONE (June 2026, lexer +
+  compiler, 8-mode tested). This was a genuine Lua 5.4 conformance gap (lune
+  previously lacked long strings entirely, even `[[…]]`). It did **not** unlock the
+  dynamic-codegen ports as hoped: `fasta`/`pidigits-nogmp`/`revcomp`/`meteor` each
+  pile on further LuaJIT-isms — the `jit.*` module, `loadstring` with a *numeric*
+  chunkname, stdin (`revcomp`), and `...` forwarded into the loaded chunk. Left
+  blocked; revisit per-bench if those land. `loadstring` (a 5.1 alias of
+  `load(string)`) was deliberately **not** added — it unlocks nothing measurable on
+  its own and is a 5.1-ism; reconsider alongside the broader compat-alias question.
 - **`require`-from-cwd in `bench/run.py`** (chdir into each bench's dir, like
   LuaJIT's run.sh): unlocks the scimark suite (`scimark-fft/lu/sor/sparse`, which
   `require("scimark_lib")`). Also needs vendoring `scimark_lib.lua`. Small.

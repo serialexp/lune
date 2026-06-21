@@ -6,10 +6,14 @@
 //! `Diagnostics` sink and surfaced as an `.invalid` token so scanning can
 //! continue (better error recovery than bailing on the first bad byte).
 //!
-//! Deferred for v1 (tracked, not silently dropped): long-bracket string
-//! literals (`[[ ... ]]` / `[==[ ... ]==]`). Long-bracket *comments*
-//! (`--[[ ... ]]`, no level markers) are supported. Hex float literals are
-//! deferred (hex integers are supported).
+//! Long-bracket string literals (`[[ ... ]]` / `[==[ ... ]==]`) and long-bracket
+//! comments (`--[[ ... ]]` / `--[==[ ... ]==]`, with matching `=` levels) are
+//! supported. A long string is scanned to a `.string_literal` token spanning the
+//! whole `[==[ ... ]==]`; the compiler decodes it (no escapes, one leading
+//! newline skipped) by discriminating on the leading `[`.
+//!
+//! Deferred for v1 (tracked, not silently dropped): hex float literals (hex
+//! integers are supported).
 
 const std = @import("std");
 const token = @import("token.zig");
@@ -62,6 +66,9 @@ pub const Lexer = struct {
         if (isDigit(c)) return self.number(start, start_line);
         if (c == '.' and isDigit(self.peekNext())) return self.number(start, start_line);
         if (c == '"' or c == '\'') return self.string(start, start_line);
+        if (c == '[') {
+            if (self.longBracketLevel()) |level| return self.longString(start, start_line, level);
+        }
 
         return self.operator(start, start_line);
     }
@@ -91,27 +98,76 @@ pub const Lexer = struct {
     }
 
     fn skipComment(self: *Lexer) void {
-        // Long-bracket block comment: --[[ ... ]]  (no level markers in v1).
-        if (self.peek() == '[' and self.peekNext() == '[') {
-            const open_line = self.line;
-            const open_start = self.index - 2;
-            self.index += 2;
-            while (true) {
-                const c = self.peek();
-                if (c == 0) {
-                    self.diags.err("unterminated block comment", open_start, self.index, open_line);
-                    return;
+        // Long-bracket block comment: --[[ ... ]] / --[==[ ... ]==] (any level).
+        if (self.peek() == '[') {
+            if (self.longBracketLevel()) |level| {
+                const open_line = self.line;
+                const open_start = self.index - 2;
+                self.index += level + 2; // consume `[` `=`{level} `[`
+                while (true) {
+                    const c = self.peek();
+                    if (c == 0) {
+                        self.diags.err("unterminated block comment", open_start, self.index, open_line);
+                        return;
+                    }
+                    if (c == ']') {
+                        if (self.longBracketClose(level)) |after| {
+                            self.index = after;
+                            return;
+                        }
+                    }
+                    if (c == '\n') self.line += 1;
+                    self.index += 1;
                 }
-                if (c == ']' and self.peekNext() == ']') {
-                    self.index += 2;
-                    return;
-                }
-                if (c == '\n') self.line += 1;
-                self.index += 1;
             }
         }
         // Line comment: to end of line (the '\n' is left for skipTrivia).
         while (self.peek() != '\n' and self.peek() != 0) self.index += 1;
+    }
+
+    /// At a `[`, detect a long-bracket opener `[` `=`* `[` and return its level
+    /// (the count of `=`), or null if this `[` is just an index bracket. Does not
+    /// consume. Safe on the sentinel-terminated source: the `=` scan stops at `0`.
+    fn longBracketLevel(self: *const Lexer) ?u32 {
+        std.debug.assert(self.peek() == '[');
+        var j = self.index + 1;
+        while (self.source[j] == '=') j += 1;
+        if (self.source[j] == '[') return j - (self.index + 1);
+        return null;
+    }
+
+    /// At a `]`, does a closing long bracket of `level` (`]` `=`{level} `]`) start
+    /// here? Returns the index just past the close, or null. Does not consume.
+    fn longBracketClose(self: *const Lexer, level: u32) ?u32 {
+        std.debug.assert(self.peek() == ']');
+        var j = self.index + 1;
+        var eq: u32 = 0;
+        while (self.source[j] == '=') : (eq += 1) j += 1;
+        if (eq == level and self.source[j] == ']') return j + 1;
+        return null;
+    }
+
+    /// Scan a long-bracket string `[` `=`{level} `[` ... `]` `=`{level} `]` into a
+    /// single `.string_literal` token spanning the whole literal (brackets
+    /// included). Content (escape-free, leading-newline rules) is decoded later by
+    /// the compiler, which discriminates a long string by its leading `[`.
+    fn longString(self: *Lexer, start: u32, line: u32, level: u32) Token {
+        self.index += level + 2; // consume the opening `[` `=`{level} `[`
+        while (true) {
+            const c = self.peek();
+            if (c == 0) {
+                self.diags.err("unterminated long string", start, self.index, line);
+                return self.make(.invalid, start, line);
+            }
+            if (c == ']') {
+                if (self.longBracketClose(level)) |after| {
+                    self.index = after;
+                    return self.make(.string_literal, start, line);
+                }
+            }
+            if (c == '\n') self.line += 1;
+            self.index += 1;
+        }
     }
 
     // -- token scanners --
@@ -357,6 +413,51 @@ test "line and block comments are skipped, lines tracked" {
     try testing.expectEqual(Token.Tag.identifier, toks[3].tag);
     // `b` is on line 4.
     try testing.expectEqual(@as(u32, 4), toks[3].line);
+}
+
+test "long-bracket strings: levels, nesting, and [ as index still works" {
+    // `[[..]]`, `[=[..]=]`, `[==[..]==]` are one string token each; a bare `[`
+    // after a name is still an index bracket.
+    try expectTags("[[a]] [=[b]=] [==[c]==]", &.{ .string_literal, .string_literal, .string_literal });
+    try expectTags("t[1]", &.{ .identifier, .lbracket, .int_literal, .rbracket });
+    // A level-1 long string swallows `]]` that is not its `]=]` close.
+    try expectTags("[=[ has ]] inside ]=]", &.{.string_literal});
+}
+
+test "long-bracket string lexeme spans the whole literal" {
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    const src: [:0]const u8 = "x = [==[ y ]] z ]==]";
+    const toks = try tokenize(testing.allocator, src, &diags);
+    defer testing.allocator.free(toks);
+    try testing.expect(!diags.hasErrors());
+    try testing.expectEqualStrings("[==[ y ]] z ]==]", toks[2].lexeme(src));
+}
+
+test "leveled long comment is skipped, lines tracked" {
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    const src =
+        \\local a --[==[ a
+        \\  ]] not the close
+        \\  block comment ]==]
+        \\local b
+    ;
+    const toks = try tokenize(testing.allocator, src, &diags);
+    defer testing.allocator.free(toks);
+    try testing.expect(!diags.hasErrors());
+    try testing.expectEqual(@as(usize, 5), toks.len); // local a local b eof
+    try testing.expectEqual(Token.Tag.identifier, toks[3].tag);
+    try testing.expectEqual(@as(u32, 4), toks[3].line); // `b` on line 4
+}
+
+test "unterminated long string records a diagnostic" {
+    var diags = Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    const toks = try tokenize(testing.allocator, "x = [[oops\nmore", &diags);
+    defer testing.allocator.free(toks);
+    try testing.expect(diags.hasErrors());
+    try testing.expectEqual(Token.Tag.invalid, toks[2].tag);
 }
 
 test "unterminated string records a diagnostic and recovers" {

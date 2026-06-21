@@ -1283,7 +1283,11 @@ const Compiler = struct {
     /// error pointing at `\u{…}` (a code point) or an integer array (a raw byte) —
     /// and the finished literal is validated as UTF-8. `span` locates diagnostics.
     fn decodeString(self: *Compiler, raw: []const u8, span: ast.Span) Error![]const u8 {
-        std.debug.assert(raw.len >= 2); // at least the two quotes
+        std.debug.assert(raw.len >= 2);
+        // Long-bracket string: `[` `=`{n} `[` ... `]` `=`{n} `]`. A normal string
+        // always opens with `"`/`'`, so a leading `[` is an unambiguous marker.
+        // No escapes; one leading newline is dropped (Lua 5.4 §3.1).
+        if (raw[0] == '[') return self.decodeLongString(raw, span);
         const inner = raw[1 .. raw.len - 1];
         var buf: std.ArrayList(u8) = .empty;
         try buf.ensureTotalCapacity(self.arena, inner.len);
@@ -1357,6 +1361,31 @@ const Compiler = struct {
         }
         if (!std.unicode.utf8ValidateSlice(buf.items)) return self.fail(span, "string literal is not valid UTF-8");
         return buf.items;
+    }
+
+    /// Decode a long-bracket string literal `raw` = `[` `=`{n} `[` body `]` `=`{n} `]`.
+    /// The content is verbatim (no escape interpretation); if the body begins with
+    /// a newline it is dropped (Lua 5.4 §3.1: a `\r\n`/`\n\r`/`\r`/`\n` immediately
+    /// after the opening bracket is not part of the string). The returned slice
+    /// borrows `self.source`, which is fine — `stringConstant` interns (copies) it
+    /// immediately. UTF-8 validated like every lune string literal.
+    fn decodeLongString(self: *Compiler, raw: []const u8, span: ast.Span) Error![]const u8 {
+        std.debug.assert(raw[0] == '[');
+        var level: usize = 0;
+        while (raw[1 + level] == '=') level += 1;
+        const delim = level + 2; // length of `[` `=`{level} `[` and of the close
+        std.debug.assert(raw.len >= 2 * delim);
+        var inner = raw[delim .. raw.len - delim];
+        // Drop a single leading end-of-line (any of \n, \r, \r\n, \n\r).
+        if (inner.len > 0 and (inner[0] == '\n' or inner[0] == '\r')) {
+            const first = inner[0];
+            inner = inner[1..];
+            if (inner.len > 0 and (inner[0] == '\n' or inner[0] == '\r') and inner[0] != first) {
+                inner = inner[1..];
+            }
+        }
+        if (!std.unicode.utf8ValidateSlice(inner)) return self.fail(span, "string literal is not valid UTF-8");
+        return inner;
     }
 
     fn lineOf(self: *const Compiler, offset: u32) u32 {

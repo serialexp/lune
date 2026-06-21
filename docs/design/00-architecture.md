@@ -66,9 +66,11 @@ _(nothing yet — design only)_
       pointer-based AST with per-node spans (`src/ast.zig`); recursive-descent
       statements + Pratt expressions with full Lua precedence and right-assoc
       `..`/`^` (`src/parser.zig`). Optional **type annotations are parsed and
-      retained** (unchecked, per the language-surface sketch). Deferred and noted
-      in source: long-bracket string literals, hex floats, call sugar
-      (`f"s"`/`f{…}`), `repeat`/`until`, `goto`/labels. 55 tests pass.
+      retained** (unchecked, per the language-surface sketch). Long-bracket
+      string literals + comments (`[[…]]` / `[==[…]==]`, matching `=` levels,
+      one leading newline dropped, no escapes) and `repeat`/`until` are
+      implemented. Deferred and noted in source: hex floats, call sugar
+      (`f"s"`/`f{…}`), `goto`/labels. 55 tests pass.
 - [x] **Phase 3 — Bytecode compiler + tier-0 interpreter.** Done.
       Register-based 12-byte bytecode ISA (`src/bytecode.zig`) with a total
       disassembler; a single-pass compiler (`src/compiler.zig`) with
