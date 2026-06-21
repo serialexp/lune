@@ -298,6 +298,21 @@ Still deferred, each blocked on a capability lune doesn't have yet:
    (`@off`/`@on` toggle `Vm.warn_enabled`, recognized even while off; unknown `@…`
    ignored). `warn_enabled` is per-session, not serialized.
 
+   **LANDED (June 2026): require/package module system.** `require` + the
+   `package` table (`src/stdlib/package.zig`), built on the existing
+   `fs_source`/`file_read` effect — base-host, host-injectable loader, no new seam.
+   Faithful searchers-as-functions model (`package.searchers` = preload + path,
+   both `manual` natives rebound by name on restore). `package.searchpath`,
+   `package.loaded` (pre-seeded with built-ins), `package.preload`, `package.path`,
+   `package.config`; `package.cpath` is an inert empty field (no native loading
+   under determinism), `package.loadlib` stays excluded.
+
+   - FOLLOW-UP (require cycles): a `require` cycle (A requires B requires A) is not
+     yet detected with a dedicated "loop or previous error loading module" message —
+     it currently bottoms out in `StackOverflow` via `native_reentry_depth`. Lua
+     marks `package.loaded[name]` with a sentinel during loading to detect this;
+     add the sentinel + a clear cyclic-require error.
+
 ## stdlib `table` — deferred functions
 
 First `table` cut landed in `src/stdlib/table.zig`: `insert remove concat move

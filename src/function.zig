@@ -241,6 +241,14 @@ pub const BaseNative = struct {
     module: ?[]const u8 = null,
     /// Key within the module table (required iff `module` is set), e.g. `"format"`.
     field: ?[]const u8 = null,
+    /// A native that is registered for **snapshot/restore only** — it lives in
+    /// `base_natives` (so the keyframe restorer rebinds it by name) but has no
+    /// global/module install slot, so `installBaseLib` skips it and the
+    /// unknown-global lint ignores it. The owning library creates its heap `Native`
+    /// itself (by the same `name`) and places it wherever it belongs — e.g. the
+    /// default `package.searchers` array. Without this seam such a native would be
+    /// unrestorable (`UnknownNative`) since the restorer resolves only by registry name.
+    manual: bool = false,
 };
 
 /// A built-in **constant** installed as a field of a module table — e.g.

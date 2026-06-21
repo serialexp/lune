@@ -83,7 +83,10 @@ fn loadCore(vm: *Vm, args: []const Value, out: []Value) anyerror!usize {
 /// `src_bytes`/`chunk_name` must NOT alias `out` (they are dup'd before the first
 /// `out` write, but callers pass either heap-string bytes or freshly read file
 /// bytes, neither of which lives in `out`).
-fn compileToClosure(vm: *Vm, src_bytes: []const u8, chunk_name: []const u8, out: []Value) anyerror!usize {
+///
+/// `pub` so the `package`/`require` module system (`stdlib/package.zig`) compiles a
+/// module's source through the exact same VM-owned-chunk path as `load`/`loadfile`.
+pub fn compileToClosure(vm: *Vm, src_bytes: []const u8, chunk_name: []const u8, out: []Value) anyerror!usize {
     std.debug.assert(out.len >= 1);
     // Own the source for the chunk's lifetime (NUL-terminated, as parser/compiler
     // require). `owned` has exactly one owner at every point: `loadError` frees it

@@ -1190,6 +1190,69 @@ test "restore rebuilds globals, ids, and a reachable value graph" {
     try testing.expectEqualStrings("print", function.Native.fromHeader(print_val.asHeap()).name);
 }
 
+test "restore reanimates the package/require module system (searchers rebind, cache survives)" {
+    const gpa = testing.allocator;
+    // Two preloaded modules; only "a" is required (and cached) before the snapshot.
+    // After restore: require("a") must hit the surviving cache, and require("b") must
+    // run the searcher array — proving the `manual` searcher natives rebound by name
+    // and the restored preload closures are still callable.
+    const source =
+        \\package.preload["a"] = function(n) return "A:" .. n end
+        \\package.preload["b"] = function(n) return "B:" .. n end
+        \\loaded_a = require("a")
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    const b0 = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(b0);
+
+    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    defer {
+        vm2.deinit();
+        gpa.destroy(vm2);
+    }
+
+    // package.searchers restored as a 2-element array of natives, rebound by name.
+    const pkg_val = vm2.globals.get(try vm2.heap.internValue("package"));
+    try testing.expect(pkg_val.isHeap() and pkg_val.heapType() == .table);
+    const pkg = table.Table.fromHeader(pkg_val.asHeap());
+    const searchers_val = pkg.get(try vm2.heap.internValue("searchers"));
+    try testing.expect(searchers_val.isHeap() and searchers_val.heapType() == .table);
+    const searchers = table.Table.fromHeader(searchers_val.asHeap());
+    try testing.expect(searchers.getInt(1).heapType() == .native);
+    try testing.expect(searchers.getInt(2).heapType() == .native);
+
+    // The cached module "a" survived the snapshot (package.loaded.a == "A:a").
+    const loaded_val = pkg.get(try vm2.heap.internValue("loaded"));
+    const loaded = table.Table.fromHeader(loaded_val.asHeap());
+    const cached_a = loaded.get(try vm2.heap.internValue("a"));
+    try testing.expectEqualStrings("A:a", string.String.fromHeader(cached_a.asHeap()).bytes());
+
+    // require still works on the restored VM: "a" from cache, "b" via the rebound
+    // searcher + restored preload closure.
+    const require_val = vm2.globals.get(try vm2.heap.internValue("require"));
+    try testing.expect(require_val.isHeap() and require_val.heapType() == .native);
+    var out: [1]Value = undefined;
+    _ = try vm2.callValue(require_val, &.{try vm2.heap.internValue("a")}, out[0..]);
+    try testing.expectEqualStrings("A:a", string.String.fromHeader(out[0].asHeap()).bytes());
+    _ = try vm2.callValue(require_val, &.{try vm2.heap.internValue("b")}, out[0..]);
+    try testing.expectEqualStrings("B:b", string.String.fromHeader(out[0].asHeap()).bytes());
+}
+
 test "metatable edge to the id-0 object survives round-trip (1-based encoding)" {
     // Regression: `metatable_id` is a 1-based optional id (`header.id + 1`, 0 =
     // none), NOT a bare id with 0 = none. Id 0 IS a live object — the first heap

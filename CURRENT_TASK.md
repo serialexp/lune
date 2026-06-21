@@ -29,17 +29,42 @@ Closes the base-host tier.
 - Docs: CSV rows `os.clock`+`basic.warn` → implemented; TODO note. Gate +
   check-version green.
 
-## Review (DONE — both clean modulo three fixes, all applied)
-Codex + Antigravity ran on commit 1. Three actionable items, all fixed:
-1. `effect_format_version` 4→5 (old v4 int-ns clock logs would replay as float
-   seconds verbatim — fail-loud signal, not backcompat per Rule #8).
-2. `nativeWarn` emission made best-effort (`emitWarning(...) catch {}`) so a stderr
-   write failure can never become a catchable VM fault — making the unserialized
-   `warn_enabled` sound (warn touches only stderr, outside the replay contract).
-3. Added the mixed os.clock/os.nsclock record→replay test (the shared-effect
-   replay path; the shape test alone was off-mode only).
+### Review (commit 1) — DONE, all three fixes applied; **landed as `ee6a821`**.
+
+## Commit 2 — require/package module system — DONE, GATE GREEN, AWAITING REVIEW
+
+`require` + the `package` table, built on the existing `fs_source` + `file_read`
+effect (no new seam, no new effect kind) — so it's **base-host**: a game/embedding
+host that injects its own `fs_source` gets `require` for free, determinism covered.
+
+- **`BaseNative.manual`** (`src/function.zig`): restore-only natives — present in
+  `base_natives` so the keyframe restorer rebinds them by name, but `defineNative`
+  skips install and `builtin_global_names` ignores them. Used for the default
+  searchers (which live in `package.searchers`, not at a named global).
+- **`load.compileToClosure`** made `pub` so `package` compiles modules via the same
+  VM-owned-chunk path as `load`/`loadfile`. `Vm.getOrCreateModuleTable` made `pub`.
+- **`src/stdlib/package.zig`** (new): `require` (cache → searcher iteration via
+  `callValue` → loader → cache-or-true), `package.searchpath`, the two built-in
+  searchers (`preload`, `path` — manual natives), and `installPackageRuntime`
+  (seeds `loaded`/`preload`/`path`/`cpath`(inert)/`config`/`searchers`). Wired into
+  `base_natives` + `installBaseLib`.
+- Tests: interp.zig P3 suite (load+cache/read-once, preload-beats-path, dotted-name
+  mapping, not-found message, empty-module→true, transitive, record→replay parity,
+  user-replaced searcher closure); keyframeser.zig snapshot/restore (searchers
+  rebind, cache survives, require works post-restore). Gate + check-version green.
+- Docs: CSV `package,*` rows cli-binding→base-host, implemented (cpath partial/inert;
+  loadlib stays excluded). require-cycle note in TODO.
+
+### Review (commit 2) — DONE, one real bug found + fixed, both reviewers clean.
+Codex flagged a GC-safety hazard: `requireCore` cached `*Table` pointers for
+`package.loaded`/`package.searchers` across `callValue`; a loader/searcher that
+reassigns those fields could orphan the table so a nested-safepoint GC sweeps it →
+UAF. **Fixed:** added `requirePackageSubTable`, which re-derives the sub-table from
+the permanently-rooted `vm.globals` after every `callValue` (no cached pointer).
+`name_val` stays a rooted arg. Codex re-confirmed the hazard is closed with no new
+leak; Antigravity independently passed all five dimensions (determinism, GC,
+restore, memory, fidelity).
 
 ## Next
-Awaiting Bart's commit approval for commit 1 (Rule #15). Suggested message:
-`feat: finish base-host tier — os.clock/os.nsclock + warn`. After that: Phase 3
-(`require`/`package`).
+Awaiting Bart's commit approval for commit 2 (Rule #15). Suggested message:
+`feat: require/package module system (base-host, host-injectable loader)`.
