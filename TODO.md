@@ -4,22 +4,27 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## LuaJIT benchmark corpus — blocked benches (June 2026)
 
-`bench/luajit/` vendors the 8 CLBG ports that run byte-identical to LuaJIT today
-(array3d, binary-trees, nbody, nsieve, nsieve-bit-fp, partialsums, recursive-fib,
-spectral-norm). The remaining LuaJIT benches are each blocked by one identified
-gap — knocking any of these down unlocks the listed benches as new corpus members:
+`bench/luajit/` vendors the 10 CLBG ports that run byte-identical to LuaJIT today
+(array3d, binary-trees, euler14-bit, nbody, nsieve, nsieve-bit, nsieve-bit-fp,
+partialsums, recursive-fib, spectral-norm). The remaining LuaJIT benches are each
+blocked by one identified gap — knocking any of these down unlocks the listed
+benches as new corpus members:
 
 - **`coroutine` library** (none yet): unlocks `chameneos`, `coroutine-ring`.
   Largest lift; intersects determinism (coroutine resume order must be replayable).
-- **LuaJIT `bit.*` library** (BitOp API — `bit.band/bor/bxor/lshift/...`): the
-  cleanest remaining unlock — `euler14-bit` and `nsieve-bit` have clean
-  deterministic text output and need only `bit` (`mandelbrot-bit`/`md5` also need
-  it but are separately blocked on binary output / non-ASCII `\ddd` escapes). lune
-  has native 5.4 bitwise operators; this is a thin `bit` module mapping them, with
-  LuaJIT's **int32 normalization** semantics (results are signed 32-bit; `tobit`,
-  `tohex`, `rol`/`ror`, `bswap`). **Language-surface call for Bart**: `bit` is a
-  LuaJIT extension, not Lua 5.4 — decide whether it belongs in lune proper (pure,
-  deterministic → would be a base-host module) or stays a bench-only shim.
+- **LuaJIT `bit.*` library** — RESOLVED, not added (June 2026). lune already has
+  native 64-bit bitwise *operators* (`&` `|` `~` `<<` `>>`, wired by the metamethod
+  arc). Bart's call: do **not** add a `bit` module — its int32-normalization would
+  bolt a 32-bit-semantics island onto a 64-bit language, which Lua 5.4 itself
+  rejected in favour of native operators. lune also stays strict integer-only
+  (unlike 5.4 it does not coerce integral floats in bitwise ops; the error message
+  was fixed to the Lua-shaped "number has no integer representation" / "attempt to
+  perform bitwise operation on a <type> value"). `euler14-bit` and `nsieve-bit` are
+  now in the corpus, **rewritten** to native operators (semantically equivalent,
+  not code-identical); LuaJIT runs the verbatim `bit.*` originals under
+  `bench/luajit/_ref/` via the new `luajit_src=` metadata key, and both halves are
+  byte-identical. `mandelbrot-bit`/`md5` remain blocked on binary output / non-ASCII
+  escapes, independent of bitwise support.
 - **Leveled long-bracket strings `[[…]]` / `[=[…]=]`** — DONE (June 2026, lexer +
   compiler, 8-mode tested). This was a genuine Lua 5.4 conformance gap (lune
   previously lacked long strings entirely, even `[[…]]`). It did **not** unlock the

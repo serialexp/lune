@@ -1,43 +1,52 @@
-# CURRENT TASK — LuaJIT benchmark corpus + long-bracket strings
+# CURRENT TASK — native bitwise operators + bit benchmarks
 
 Governing arc: chase Lua compatibility so lune is usable, then optimize. Bart's
-steer after landing require/package: "grow the corpus first."
+steer: "grow the corpus first." Bitwise was the next unlock.
 
 ## Landed this session
 
-1. **`ee6a821`** base-host cleanup (os.clock float / os.nsclock / warn).
-2. **`5c47b3a`** require/package module system (base-host, host-injectable loader).
-3. **`bde108e`** vendored LuaJIT macro-benchmark corpus — `bench/luajit/` with the
-   8 CLBG ports that run byte-identical to LuaJIT today (array3d, binary-trees,
-   nbody, nsieve, nsieve-bit-fp, partialsums, recursive-fib, spectral-norm).
-   Baseline: t0/lj 8x–112x; the JIT is a no-op on the float/array-heavy benches
-   (coverage gap, not codegen). README + TODO document the per-gap backlog.
+1. **`5c47b3a`** require/package module system (base-host).
+2. **`bde108e`** vendored LuaJIT macro-benchmark corpus (8 CLBG ports).
+3. **`0c09771`** long-bracket string literals `[[…]]` / `[=[…]=]`.
 
-## Landed — long-bracket strings
+## In progress — bitwise operators + bit benches (NOT yet committed)
 
-Genuine Lua 5.4 conformance gap: lune lacked long-bracket strings **entirely**
-(even `[[…]]`), only long *comments* at level 0. Implemented:
+Discovery: lune **already has native 64-bit bitwise operators** (`&` `|` `~` `<<`
+`>>`, with `~=` disambiguated) — lexer/parser/compiler/VM (`arith.zig`)/metamethods
+all wired by the metamethod arc (#102). No operator implementation was needed.
 
-- **lexer.zig**: `longBracketLevel`/`longBracketClose` helpers; `longString`
-  scanner emits the whole `[==[…]==]` as one `.string_literal`; `next()` dispatch
-  on `[`; `skipComment` generalized to leveled `--[=[…]=]`. Sentinel-safe (`=`/`]`
-  scans stop at the `0` terminator).
-- **compiler.zig**: `decodeString` branches on `raw[0]=='['` →
-  `decodeLongString`: compute level, strip `level+2` each side, drop one leading
-  EOL (\n/\r/\r\n/\n\r), **no escapes**, UTF-8 validate. Returns a source-slice
-  (safe — `stringConstant` interns/copies immediately).
-- **Tests**: lexer unit (levels 0/1/2, nested `]]`, leveled comment, unterminated,
-  `[` still indexes); interp 8-mode e2e (concat+#len, leading-newline drop, no
-  escapes, leveled passthrough, leveled comment). `just test` + check-version green.
-- **Docs**: lexer module doc, 00-architecture Phase-2 line, TODO updated.
+Bart's decision: do **not** add a LuaJIT `bit` module (its int32-normalization is a
+32-bit island in a 64-bit language; Lua 5.4 itself rejected it for native
+operators). Stay **strict integer-only** (no integral-float coercion). Just fix the
+misleading error message and rewrite the two benches to native ops.
 
-Deliberately **not** added: `loadstring` (5.1 alias) — unlocks nothing measurable
-alone. Long strings did NOT unlock the dynamic-codegen benches (fasta/pidigits/
-revcomp/meteor) — they need the `jit` module, numeric-chunkname loadstring, stdin.
+- **arith.zig**: comment now states the deliberate strict-integer-only policy.
+- **interp.zig `describeFault`**: bitwise ops (`band/bor/bxor/shl/shr/bnot`) split
+  out of the *arithmetic* message arm. New helpers `firstNonInteger` +
+  `bitwiseFaultMessage`: a float operand → "number has no integer representation";
+  a non-number → "attempt to perform bitwise operation on a <type> value" (Lua-5.4
+  shaped). New 8-mode e2e test pins both. `just test` + check-version green.
+- **bench/luajit/euler14-bit.lua, nsieve-bit.lua**: native-operator rewrites,
+  semantically equivalent to the upstream `bit.*` versions. Verified byte-identical
+  to LuaJIT across scales. Corpus is now **10**.
+- **bench/run.py**: new `luajit_src=` metadata key — LuaJIT runs an alternate
+  source (the verbatim `bit.*` original under `bench/luajit/_ref/`) while lune runs
+  the native-operator file. Preserves the "byte-identical to LuaJIT" corpus
+  property for files using 5.4 syntax LuaJIT (5.1) can't parse. Harness confirms
+  both benches `cross ok` + `luajit ok`.
+- **docs**: bench/README (verbatim vs adapted, the `_ref/`+`luajit_src` mechanism,
+  corpus list 8→10), TODO (bit RESOLVED-not-added rationale).
 
-Reviewed clean (Codex + Antigravity), gate green, committed.
+### Review + commit
+Run Codex + Antigravity on the core diff (interp.zig describeFault + arith.zig),
+then Bart's commit approval (Rule #15). Suggested message:
+`feat(interp): distinct bitwise-fault messages; add euler14-bit/nsieve-bit benches`
+(or split: interp/arith error-message change as one commit, the bench+run.py as a
+second). Stray untracked files (CURRENT_TASK_E3.md, SESSION_CHANGES.md,
+check_ordinals, bench/results/*.tsv) are NOT mine — leave them.
 
 ## Next (Bart's steer: grow the corpus)
-Discussing the **`bit` library** (euler14-bit, nsieve-bit — clean text output)
-with Bart: does a LuaJIT `bit` (int32-normalized, pure/deterministic → base-host)
-belong in lune, or stay a bench-only shim? Pending his language-surface decision.
+Remaining unlocks (TODO.md): `coroutine` library (chameneos, coroutine-ring —
+largest, determinism-adjacent); `require`-from-cwd in run.py (scimark suite,
+small); binary/Latin-1 output (mandelbrot, fannkuch); io.read shapes
+(k-nucleotide, sum-file).

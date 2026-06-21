@@ -22,6 +22,11 @@ Metadata line (anywhere in the file):
   args=       literal argv passed to the program (space-split; may be empty)
   luajit=     compatible → diff lune vs LuaJIT and time both;
               skip       → lune-only (5.4 surface LuaJIT lacks); cross-tier only
+  luajit_src= optional alternate source (path relative to this file) that LuaJIT
+              runs instead of this file, for when the lune file uses 5.4 syntax
+              LuaJIT can't parse (e.g. native bitwise operators) but a
+              semantically-equivalent LuaJIT-idiomatic source (the bit.* original)
+              gives byte-identical output. lune always runs this file.
   name=       optional display name (defaults to the path stem)
 
 Usage:
@@ -60,11 +65,19 @@ TIERS = {
 
 
 class Bench:
-    def __init__(self, path, name, argv, luajit):
+    def __init__(self, path, name, argv, luajit, luajit_src=None):
         self.path = path
         self.name = name
         self.argv = argv          # list[str]
         self.luajit = luajit      # "compatible" | "skip"
+        # Optional alternate source run on LuaJIT instead of `path`. Used when the
+        # lune file uses 5.4 syntax LuaJIT (5.1) can't parse — e.g. native bitwise
+        # operators — but a semantically-equivalent LuaJIT-idiomatic source (the
+        # `bit.*` original) produces byte-identical output. lune still runs `path`.
+        self.luajit_src = luajit_src
+
+    def lj_path(self):
+        return self.luajit_src or self.path
 
 
 def discover(filter_sub, scale):
@@ -84,7 +97,10 @@ def discover(filter_sub, scale):
         argv = kv.get("args", "").split()
         if scale != 1.0:
             argv = scale_argv(argv, scale)
-        benches.append(Bench(path, name, argv, kv.get("luajit", "skip")))
+        lj_src = kv.get("luajit_src")
+        if lj_src:
+            lj_src = os.path.normpath(os.path.join(os.path.dirname(path), lj_src))
+        benches.append(Bench(path, name, argv, kv.get("luajit", "skip"), lj_src))
     return benches
 
 
@@ -188,7 +204,7 @@ def main():
         lj_status = "skip"
         lj_out = None
         if b.luajit == "compatible" and have_lj:
-            rc, lj_out, lj_err, _ = run_once([args.luajit, b.path, *b.argv])
+            rc, lj_out, lj_err, _ = run_once([args.luajit, b.lj_path(), *b.argv])
             if rc != 0:
                 lj_status = "ERR"
             else:
@@ -201,7 +217,7 @@ def main():
         jit_ms = time_best([args.lune, "--jit-native", b.path, *b.argv], args.reps)
         lj_ms = None
         if b.luajit == "compatible" and have_lj:
-            lj_ms = time_best([args.luajit, b.path, *b.argv], args.reps)
+            lj_ms = time_best([args.luajit, b.lj_path(), *b.argv], args.reps)
         # secondary: lune execute-only ns (parsed from --time)
         _, _, _, execns_t0 = run_once([args.lune, "--time", b.path, *b.argv], want_time=True)
         _, _, _, execns_jit = run_once([args.lune, "--time", "--jit-native", b.path, *b.argv], want_time=True)

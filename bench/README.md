@@ -81,11 +81,11 @@ Conventions, so a program is both a perf probe and a parity check:
 
 ## Vendored LuaJIT benchmarks (`bench/luajit/`)
 
-`bench/luajit/` holds programs copied **verbatim** from `~/Projects/LuaJIT/bench/`
-(the Computer Language Benchmarks Game ports LuaJIT itself uses), with only a
-prepended `-- @bench` header line added. They are the macro-benchmark corpus we
-measure the lune/LuaJIT gap against — and, because the runner diffs lune's output
-against LuaJIT, they double as Lua-fidelity tests on real programs.
+`bench/luajit/` holds programs from `~/Projects/LuaJIT/bench/` (the Computer
+Language Benchmarks Game ports LuaJIT itself uses), with a prepended `-- @bench`
+header line added. They are the macro-benchmark corpus we measure the lune/LuaJIT
+gap against — and, because the runner diffs lune's output against LuaJIT, they
+double as Lua-fidelity tests on real programs.
 
 Only the subset that runs correctly on lune today is vendored. A program is
 included when it (a) parses and runs, (b) stays inside the stdlib surface lune
@@ -94,18 +94,29 @@ implements, and (c) is byte-for-byte identical to LuaJIT's output (so
 LuaJIT's defaults so tier-0 lune finishes in a fraction of a second — the runner
 times the *same* size on both engines, so the ratio is honest.
 
-Currently vendored: `array3d`, `binary-trees`, `nbody`, `nsieve`,
-`nsieve-bit-fp`, `partialsums`, `recursive-fib`, `spectral-norm`.
+Most are copied **verbatim**. Two — `euler14-bit` and `nsieve-bit` — are
+**adapted**: the upstream uses LuaJIT's BitOp library (`bit.band`/`rshift`/…,
+int32 semantics), which lune deliberately does not provide; lune is 5.4-shaped
+and uses native 64-bit bitwise *operators* (`&`, `|`, `~`, `<<`, `>>`). The lune
+file is rewritten to those operators, semantically equivalent but not
+code-identical, and the verbatim `bit.*` original lives under `_ref/` and is run
+**only by LuaJIT** via the `luajit_src=` metadata key (see `run.py`). Both halves
+still produce byte-identical output, so `luajit=compatible` parity holds. (Files
+under `_ref/` carry no `@bench` header, so discovery skips them as standalone
+benches.)
+
+Currently vendored: `array3d`, `binary-trees`, `euler14-bit`, `nbody`, `nsieve`,
+`nsieve-bit`, `nsieve-bit-fp`, `partialsums`, `recursive-fib`, `spectral-norm`.
 
 Not yet runnable (tracked in `TODO.md`), by blocking gap: coroutines
-(chameneos, coroutine-ring); the LuaJIT `bit.*` library (euler14-bit, nsieve-bit,
-mandelbrot-bit); leveled long-bracket strings `[=[…]=]` + `loadstring` for the
-dynamic-codegen ports (fasta, pidigits-nogmp, revcomp, meteor); `require`-from-cwd
-in this runner (the scimark suite); binary/Latin-1 output (life, mandelbrot,
-fannkuch); a couple of missing functions (k-nucleotide, sum-file); and deep
-non-tail recursion that overflows lune's call stack at LuaJIT's N (recursive-ack).
-Programs that print their own `os.clock` timing (e.g. `series`) are excluded —
-their stdout is not byte-comparable.
+(chameneos, coroutine-ring); binary/Latin-1 output (life, mandelbrot,
+mandelbrot-bit, fannkuch); the `jit` module / numeric-chunkname `loadstring` /
+stdin for the dynamic-codegen ports (fasta, pidigits-nogmp, revcomp, meteor);
+`require`-from-cwd in this runner (the scimark suite); a couple of missing
+functions (k-nucleotide, sum-file); and deep non-tail recursion that overflows
+lune's call stack at LuaJIT's N (recursive-ack). Programs that print their own
+`os.clock` timing (e.g. `series`) are excluded — their stdout is not
+byte-comparable.
 
 ## Results history
 
