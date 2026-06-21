@@ -2,6 +2,35 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## LuaJIT benchmark corpus — blocked benches (June 2026)
+
+`bench/luajit/` vendors the 8 CLBG ports that run byte-identical to LuaJIT today
+(array3d, binary-trees, nbody, nsieve, nsieve-bit-fp, partialsums, recursive-fib,
+spectral-norm). The remaining LuaJIT benches are each blocked by one identified
+gap — knocking any of these down unlocks the listed benches as new corpus members:
+
+- **`coroutine` library** (none yet): unlocks `chameneos`, `coroutine-ring`.
+  Largest lift; intersects determinism (coroutine resume order must be replayable).
+- **LuaJIT `bit.*` library** (BitOp API — `bit.band/bor/bxor/lshift/...`): unlocks
+  `euler14-bit`, `nsieve-bit`, `mandelbrot-bit`. lune has native 5.4 bitwise
+  operators; this is a thin `bit` module mapping them. Medium.
+- **Leveled long-bracket strings `[=[ … ]=]`** in the lexer + a `loadstring` alias
+  for `load`: unlocks the dynamic-codegen ports `fasta`, `pidigits-nogmp`,
+  `revcomp`, `meteor` (all build a chunk as a `[=[…]=]` string and `loadstring` it,
+  passing `...`). One lexer feature + alias unlocks 4. Medium.
+- **`require`-from-cwd in `bench/run.py`** (chdir into each bench's dir, like
+  LuaJIT's run.sh): unlocks the scimark suite (`scimark-fft/lu/sor/sparse`, which
+  `require("scimark_lib")`). Also needs vendoring `scimark_lib.lua`. Small.
+- **Binary / Latin-1 output** (`io.write` of non-UTF-8 bytes) or non-UTF-8 source:
+  `life` (Latin-1 source string), `mandelbrot`/`fannkuch` (binary PBM output +
+  a perm-printing branch divergence). Needs care re: the UTF-8 source/output policy.
+- **Missing functions**: `k-nucleotide`, `sum-file` (io.read/io.lines shapes).
+- **Deep non-tail recursion** overflows lune's call stack at LuaJIT's N:
+  `recursive-ack` (Ack(3,6) overflows; matches only at small N). Needs a growable
+  / deeper VM call stack.
+- Excluded: programs that print their own `os.clock` timing (`series`) — stdout is
+  not byte-comparable across runs (the clock is an effect, legitimately varying).
+
 ## Unicode-native strings (design doc 06) — S-A..S-E ALL LANDED (June 2026)
 
 S-A (text↔bytes boundary, `src/stdlib/string.zig`, `sEncode`/`sDecode`):
