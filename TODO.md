@@ -4,11 +4,11 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 
 ## LuaJIT benchmark corpus — blocked benches (June 2026)
 
-`bench/luajit/` vendors the 10 CLBG ports that run byte-identical to LuaJIT today
-(array3d, binary-trees, euler14-bit, nbody, nsieve, nsieve-bit, nsieve-bit-fp,
-partialsums, recursive-fib, spectral-norm). The remaining LuaJIT benches are each
-blocked by one identified gap — knocking any of these down unlocks the listed
-benches as new corpus members:
+`bench/luajit/` vendors the 14 CLBG/SciMark ports that run byte-identical to
+LuaJIT today (array3d, binary-trees, euler14-bit, nbody, nsieve, nsieve-bit,
+nsieve-bit-fp, partialsums, recursive-fib, spectral-norm, and scimark-fft/lu/sor/
+sparse). The remaining LuaJIT benches are each blocked by one identified gap —
+knocking any of these down unlocks the listed benches as new corpus members:
 
 - **`coroutine` library** (none yet): unlocks `chameneos`, `coroutine-ring`.
   Largest lift; intersects determinism (coroutine resume order must be replayable).
@@ -34,9 +34,14 @@ benches as new corpus members:
   blocked; revisit per-bench if those land. `loadstring` (a 5.1 alias of
   `load(string)`) was deliberately **not** added — it unlocks nothing measurable on
   its own and is a 5.1-ism; reconsider alongside the broader compat-alias question.
-- **`require`-from-cwd in `bench/run.py`** (chdir into each bench's dir, like
-  LuaJIT's run.sh): unlocks the scimark suite (`scimark-fft/lu/sor/sparse`, which
-  `require("scimark_lib")`). Also needs vendoring `scimark_lib.lua`. Small.
+- **`require`-from-cwd in `bench/run.py`** — DONE (June 2026). `run.py` now runs
+  every child (lune all tiers + LuaJIT) with `cwd` set to the bench's own
+  directory (`run_once`/`time_best` gained a `cwd=` param), mirroring LuaJIT's
+  `run.sh` `cd $BENCH_DIR`, so `package.path`'s `./?.lua` resolves the shared
+  `scimark_lib.lua` (vendored verbatim, no `@bench` header). Unlocked the four
+  `scimark-{fft,lu,sor,sparse}` kernels (corpus 10→14). They are pure-timing benches
+  (the kernels return a discarded flop count → empty stdout → empty==empty parity)
+  and sit 35–76× off LuaJIT — the float/array throughput the JIT is still a no-op on.
 - **Binary / Latin-1 output** (`io.write` of non-UTF-8 bytes) or non-UTF-8 source:
   `life` (Latin-1 source string), `mandelbrot`/`fannkuch` (binary PBM output +
   a perm-printing branch divergence). Needs care re: the UTF-8 source/output policy.
@@ -46,6 +51,21 @@ benches as new corpus members:
   / deeper VM call stack.
 - Excluded: programs that print their own `os.clock` timing (`series`) — stdout is
   not byte-comparable across runs (the clock is an effect, legitimately varying).
+
+### Pre-existing bench bug (separate, Rule #10): `bench/stdlib/str_manip.lua` is mislabeled `luajit=compatible`
+Discovered while vendoring scimark (June 2026). `str_manip.lua:17` does `local byte =
+string.codepoint`, but `string.codepoint` is a Lua 5.3+ function LuaJIT (5.1) lacks,
+so on LuaJIT `byte` is nil and line 28 errors `attempt to call upvalue 'byte'`. The
+harness has always shown this as `luajit=ERR` (independent of the new per-bench cwd —
+it errors identically from the repo root). The names don't line up across engines:
+lune has only `string.codepoint` (S-B removed `string.byte` for code-point semantics),
+LuaJIT 5.1 has only `string.byte`. The bench's own comment notes the base string is
+all-ASCII, so a lune code point equals a LuaJIT byte — so parity is achievable two
+ways: (a) flip the bench to `luajit=skip` (simplest, loses the parity check), or (b)
+use the `luajit_src=` mechanism (the `_ref/` file calls `string.byte`, the lune file
+calls `string.codepoint`), the same shape as the `euler14-bit`/`nsieve-bit` split. Out
+of scope for the scimark commit; left for a separate bench-fix pass so it isn't bundled
+with unrelated corpus work.
 
 ## Unicode-native strings (design doc 06) — S-A..S-E ALL LANDED (June 2026)
 

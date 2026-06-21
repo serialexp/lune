@@ -106,17 +106,32 @@ under `_ref/` carry no `@bench` header, so discovery skips them as standalone
 benches.)
 
 Currently vendored: `array3d`, `binary-trees`, `euler14-bit`, `nbody`, `nsieve`,
-`nsieve-bit`, `nsieve-bit-fp`, `partialsums`, `recursive-fib`, `spectral-norm`.
+`nsieve-bit`, `nsieve-bit-fp`, `partialsums`, `recursive-fib`, `spectral-norm`,
+and the four `scimark-*` kernels (`fft`, `lu`, `sor`, `sparse`).
+
+### `require`-from-cwd benches (the scimark suite)
+
+`scimark-fft`/`lu`/`sor`/`sparse` are thin wrappers that `require("scimark_lib")`
+— a shared kernel library (`bench/luajit/scimark_lib.lua`, vendored verbatim with
+**no** `@bench` header so discovery skips it as a standalone bench). For the
+`require` to resolve, the runner runs **every** child (lune and LuaJIT, all tiers)
+with its working directory set to the bench's own directory, mirroring upstream
+LuaJIT's `run.sh` (`cd $BENCH_DIR`). The default `package.path` (`"./?.lua;..."`)
+then finds `./scimark_lib.lua`. The bench path itself is passed absolute, so the
+cwd only affects `require`. The kernels return a flop count that the wrappers
+discard, so their **stdout is empty** — they are pure-timing benches (empty ==
+empty trivially satisfies `luajit=compatible` parity). They are the float- and
+array-heavy numeric throughput workload where lune's tracing JIT is still a no-op
+(`jit ms ≈ t0 ms`, tens of × off LuaJIT), i.e. the headline optimization targets.
 
 Not yet runnable (tracked in `TODO.md`), by blocking gap: coroutines
 (chameneos, coroutine-ring); binary/Latin-1 output (life, mandelbrot,
 mandelbrot-bit, fannkuch); the `jit` module / numeric-chunkname `loadstring` /
 stdin for the dynamic-codegen ports (fasta, pidigits-nogmp, revcomp, meteor);
-`require`-from-cwd in this runner (the scimark suite); a couple of missing
-functions (k-nucleotide, sum-file); and deep non-tail recursion that overflows
-lune's call stack at LuaJIT's N (recursive-ack). Programs that print their own
-`os.clock` timing (e.g. `series`) are excluded — their stdout is not
-byte-comparable.
+a couple of missing functions (k-nucleotide, sum-file); and deep non-tail
+recursion that overflows lune's call stack at LuaJIT's N (recursive-ack).
+Programs that print their own `os.clock` timing (e.g. `series`) are excluded —
+their stdout is not byte-comparable.
 
 ## Results history
 

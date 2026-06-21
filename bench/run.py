@@ -118,10 +118,13 @@ def scale_argv(argv, scale):
     return out
 
 
-def run_once(cmd, want_time=False):
+def run_once(cmd, want_time=False, cwd=None):
     """Run a command, returning (rc, stdout, exec_ns|None). exec_ns is lune's
-    execute-only nanoseconds parsed from --time stderr, when want_time."""
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    execute-only nanoseconds parsed from --time stderr, when want_time. `cwd` runs
+    the child from that directory (so a bench's `require("x")` resolves `./x.lua`,
+    like LuaJIT's run.sh which cd's into the bench dir); the bench path is
+    absolute, so it is unaffected."""
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     exec_ns = None
     if want_time:
         m = EXECNS_RE.search(proc.stderr)
@@ -130,12 +133,13 @@ def run_once(cmd, want_time=False):
     return proc.returncode, proc.stdout, proc.stderr, exec_ns
 
 
-def time_best(cmd, reps):
-    """Best-of-N full-process wall time in ms (min reduces scheduler noise)."""
+def time_best(cmd, reps, cwd=None):
+    """Best-of-N full-process wall time in ms (min reduces scheduler noise).
+    `cwd` runs each child from that directory (see run_once)."""
     best = None
     for _ in range(reps):
         t = time.perf_counter()
-        subprocess.run(cmd, capture_output=True, text=True)
+        subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
         dt = (time.perf_counter() - t) * 1000.0
         best = dt if best is None else min(best, dt)
     return best
@@ -186,11 +190,14 @@ def main():
     print("-" * len(hdr))
 
     for b in benches:
+        # Run children from the bench's own directory so `require("x")` resolves
+        # `./x.lua` (e.g. scimark's shared scimark_lib.lua), mirroring run.sh.
+        bench_dir = os.path.dirname(b.path)
         # --- correctness: one run per tier, compare stdout ---
         outs = {}
         rc_bad = None
         for tier, flags in TIERS.items():
-            rc, out, err, _ = run_once([args.lune, *flags, b.path, *b.argv])
+            rc, out, err, _ = run_once([args.lune, *flags, b.path, *b.argv], cwd=bench_dir)
             outs[tier] = out
             if rc != 0 and rc_bad is None:
                 rc_bad = (tier, short(err or out))
@@ -204,7 +211,7 @@ def main():
         lj_status = "skip"
         lj_out = None
         if b.luajit == "compatible" and have_lj:
-            rc, lj_out, lj_err, _ = run_once([args.luajit, b.lj_path(), *b.argv])
+            rc, lj_out, lj_err, _ = run_once([args.luajit, b.lj_path(), *b.argv], cwd=bench_dir)
             if rc != 0:
                 lj_status = "ERR"
             else:
@@ -213,14 +220,14 @@ def main():
             lj_status = "n/a"
 
         # --- timing: best-of-N wall per engine + lune exec-only ns ---
-        t0_ms = time_best([args.lune, b.path, *b.argv], args.reps)
-        jit_ms = time_best([args.lune, "--jit-native", b.path, *b.argv], args.reps)
+        t0_ms = time_best([args.lune, b.path, *b.argv], args.reps, cwd=bench_dir)
+        jit_ms = time_best([args.lune, "--jit-native", b.path, *b.argv], args.reps, cwd=bench_dir)
         lj_ms = None
         if b.luajit == "compatible" and have_lj:
-            lj_ms = time_best([args.luajit, b.lj_path(), *b.argv], args.reps)
+            lj_ms = time_best([args.luajit, b.lj_path(), *b.argv], args.reps, cwd=bench_dir)
         # secondary: lune execute-only ns (parsed from --time)
-        _, _, _, execns_t0 = run_once([args.lune, "--time", b.path, *b.argv], want_time=True)
-        _, _, _, execns_jit = run_once([args.lune, "--time", "--jit-native", b.path, *b.argv], want_time=True)
+        _, _, _, execns_t0 = run_once([args.lune, "--time", b.path, *b.argv], want_time=True, cwd=bench_dir)
+        _, _, _, execns_jit = run_once([args.lune, "--time", "--jit-native", b.path, *b.argv], want_time=True, cwd=bench_dir)
 
         jit_lj = f"{jit_ms / lj_ms:.1f}x" if lj_ms else "-"
         t0_lj = f"{t0_ms / lj_ms:.1f}x" if lj_ms else "-"
