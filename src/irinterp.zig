@@ -50,6 +50,7 @@ const regwindow = @import("regwindow.zig");
 const RegWindow = regwindow.RegWindow;
 const execlog = @import("execlog.zig");
 const table = @import("table.zig");
+const function = @import("function.zig");
 const arr = @import("array.zig");
 const Value = value.Value;
 const Trace = trace.Trace;
@@ -311,6 +312,21 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 // `__index`/`__newindex` — so side-exit to tier-0 (full dispatch).
                 .guard_table => if (values[ins.a].isHeap() and values[ins.a].heapType() == .table and
                     table.Table.fromHeader(values[ins.a].asHeap()).metatable == null)
+                {
+                    if (record) rec.guardPass(i, values[ins.a]);
+                } else {
+                    if (record) rec.exit(i, .guard, values[ins.a]);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                // Cross-frame tracing: the inlined callee value must still be a Lua
+                // closure of the recorded `Proto.id`. `aux` is the id (a stable `u32`,
+                // not a pointer — survives keyframe restore). Fails *closed*: any
+                // non-closure / wrong-proto callee side-exits to tier-0, which really
+                // pushes the call frame and re-runs the iteration. Proto-id identity is
+                // sound while in-callee upvalue access still aborts (two closures over
+                // one proto are trace-identical when no upvalue is read).
+                .guard_func => if (values[ins.a].isHeap() and values[ins.a].heapType() == .function and
+                    function.Closure.fromHeader(values[ins.a].asHeap()).proto.id == @as(u32, @bitCast(ins.aux)))
                 {
                     if (record) rec.guardPass(i, values[ins.a]);
                 } else {

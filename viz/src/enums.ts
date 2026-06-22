@@ -51,6 +51,7 @@ export const IR_OP_NAMES = [
   "int_of_float", // 37
   "guard_append", // 38
   "astore_append", // 39
+  "guard_func", // 40
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];

@@ -75,6 +75,10 @@ fn kindOf(op: IrOp) OpKind {
         // hoistable (its result depends only on the loop-invariant float limit).
         .int_of_float => .cvt,
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => .guard,
+        // Cross-frame tracing: `guard_func` pins the runtime callee to the recorded
+        // `Proto.id`. A side-effecting (side-exiting) root, deduped by (op, callee
+        // ref), never folded away — `guardConstPasses` defaults to keep. Reads `a`.
+        .guard_func => .guard,
         // Array-access guards reuse the guard machinery: kept as side-effecting
         // roots, deduped by (op, operand-ref), operand marked/remapped via `a`.
         // `guard_append` is the grow analogue of `guard_bounds`; it reads `len`/`cap`
@@ -127,7 +131,27 @@ fn guardConstPasses(ins: IrInstr, v: Value) bool {
 /// Operand-order sensitive (no commutative canonicalization) and includes `ty`
 /// so a future type-sensitive executor can't be tricked by a merge.
 const CseKey = struct { op: IrOp, a: Ref, b: Ref, aux: i32, ty: ObsType };
-const GuardKey = struct { op: IrOp, a: Ref };
+const GuardKey = struct { op: IrOp, a: Ref, aux: i32 };
+
+/// The part of a guard's `aux` that is *semantic identity* — what distinguishes
+/// two otherwise-identical guards on the same operand — as opposed to the
+/// side-metadata the type guards stash there. The type guards
+/// (`guard_int`/`guard_float`/`guard_number`/`guard_true`/`guard_false`) put the
+/// exit/bytecode PC in `aux` for exit chaining; two of those on the same value
+/// at different PCs are still redundant (the earlier dominates), so PC must NOT
+/// be part of the dedup key. But `guard_lane`/`guard_fits` put a *lane ordinal*
+/// in `aux` and `guard_func` puts a *proto id*, and those genuinely change what
+/// the guard checks — `a[i]=v` then `b[i]=v` into two arrays of different narrow
+/// lanes emits two `guard_fits` on the same value `v` with different lanes, and
+/// dropping the second silently truncates the wider value into the narrower lane.
+/// So those auxes ARE part of the key. The remaining array guards
+/// (`guard_table`/`guard_bounds`/`guard_present`/`guard_append`) carry no `aux`.
+fn guardKeyAux(op: IrOp, aux: i32) i32 {
+    return switch (op) {
+        .guard_lane, .guard_fits, .guard_func => aux,
+        else => 0,
+    };
+}
 
 /// The unoptimized path: dupe the recorder's arrays verbatim into owned slices
 /// (the `config.optimize == false` case, and the fallback if `optimize` OOMs).
@@ -230,7 +254,7 @@ pub fn optimize(
                     // always-fails: keep it (defensive; honest recording never
                     // produces this since the guard pins the observed type).
                 }
-                const gk = GuardKey{ .op = ins.op, .a = a2 };
+                const gk = GuardKey{ .op = ins.op, .a = a2, .aux = guardKeyAux(ins.op, ins.aux) };
                 if (guards.contains(gk)) {
                     dead[i] = true; // exact-duplicate guard, earlier copy dominates
                 } else try guards.put(gpa, gk, {});
@@ -661,6 +685,58 @@ test "tropt: a guard_fits on a constant value uses laneFits (never the type-guar
         var opt = try optimize(gpa, &instrs, &consts);
         defer freeOpt(gpa, &opt);
         try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .guard_fits));
+    }
+}
+
+test "tropt: two guard_fits on one value but different lanes are both kept" {
+    // Regression (Antigravity find): `GuardKey` keyed only on `{op, a}`, so two
+    // `guard_fits` on the *same* value ref with *different* lane ordinals (e.g.
+    // `a[i]=v; b[i]=v` into two arrays of different narrow lanes) deduped — the
+    // second was dropped. If the wider lane is guarded first, dropping the
+    // narrower fit-check silently truncates `v` into the narrow lane. The dedup
+    // key must include the *semantic* part of `aux` (the lane ordinal here).
+    const gpa = testing.allocator;
+    const i64_lane: i32 = @intFromEnum(arr.Lane.i64);
+    const i32_lane: i32 = @intFromEnum(arr.Lane.i32);
+
+    // Two distinct lanes on a non-constant value → both fit-checks must survive.
+    {
+        const instrs = trace.withPhis(&[_]IrInstr{
+            .{ .op = .slot_load, .aux = 0 }, // %0 = r0 (the value v, non-constant)
+            .{ .op = .guard_fits, .a = 0, .aux = i64_lane }, // %1 — wide lane, first
+            .{ .op = .guard_fits, .a = 0, .aux = i32_lane }, // %2 — narrow lane (was dropped)
+            .{ .op = .loop }, // %3
+        }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
+        var opt = try optimize(gpa, &instrs, &.{});
+        defer freeOpt(gpa, &opt);
+        try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .guard_fits));
+    }
+
+    // Same lane twice on one value → still deduped (the fix must not over-keep).
+    {
+        const instrs = trace.withPhis(&[_]IrInstr{
+            .{ .op = .slot_load, .aux = 0 }, // %0 = r0
+            .{ .op = .guard_fits, .a = 0, .aux = i64_lane }, // %1
+            .{ .op = .guard_fits, .a = 0, .aux = i64_lane }, // %2 — exact dup → drop
+            .{ .op = .loop }, // %3
+        }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
+        var opt = try optimize(gpa, &instrs, &.{});
+        defer freeOpt(gpa, &opt);
+        try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .guard_fits));
+    }
+
+    // Two `guard_int` on one value at *different PCs* (aux = exit PC, not a lane)
+    // must STILL dedup — PC is side-metadata, not guard identity.
+    {
+        const instrs = trace.withPhis(&[_]IrInstr{
+            .{ .op = .slot_load, .aux = 0 }, // %0 = r0
+            .{ .op = .guard_int, .a = 0, .aux = 10 }, // %1 — PC 10
+            .{ .op = .guard_int, .a = 0, .aux = 20 }, // %2 — PC 20, redundant → drop
+            .{ .op = .loop }, // %3
+        }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
+        var opt = try optimize(gpa, &instrs, &.{});
+        defer freeOpt(gpa, &opt);
+        try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .guard_int));
     }
 }
 

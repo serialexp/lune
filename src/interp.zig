@@ -3996,6 +3996,48 @@ fn expectProgram(source: [:0]const u8, expected: []const u8) !void {
     }
 }
 
+// --- cross-frame tracing (8-mode parity) -------------------------------------
+
+test "cross-frame: a fixed-arity leaf call inlines and stays byte-identical" {
+    // The load-bearing replay-safety proof for Phase 0. The hot loop body calls a
+    // non-recursive, fixed-arity Lua leaf; the recorder inlines it (guard_func +
+    // seeded callee slots + return mapping). This must compute exactly what tier-0
+    // computes by really calling `f`, across all 8 modes AND across a keyframe
+    // restore — which is what proves `guard_func` keying on the stable `Proto.id`
+    // (not a raw pointer) survives replay, where heap objects come back at a new
+    // address with the same preserved id.
+    try expectProgram(
+        \\local function f(x) return x * x + 1 end
+        \\local s = 0
+        \\for i = 1, 200 do s = s + f(i) end
+        \\print(s)
+        \\
+    ,
+        "2686900\n",
+    );
+}
+
+test "cross-frame: a two-deep call chain inlines and stays byte-identical" {
+    // Genuine depth-2 inlining: g is inlined into the loop body, and the `fn(x)`
+    // call *inside* g inlines h one level deeper (verified by --dump-traces emitting
+    // two guard_func ops). The callee `h` is passed as a parameter, NOT read through
+    // an upvalue — upvalue access in a callee is still an abort in Phase 0, so a
+    // `local h; local function g() return h(...) end` chain would silently fall back
+    // to tier-0 and prove nothing. Exercises the recorder frame stack push/pop and
+    // base_off restore across two levels; deopt still replays the whole iteration
+    // from the outer header.
+    try expectProgram(
+        \\local function h(y) return y + 3 end
+        \\local function g(fn, x) return fn(x) * 2 end
+        \\local s = 0
+        \\for i = 1, 120 do s = s + g(h, i) end
+        \\print(s)
+        \\
+    ,
+        "15240\n",
+    );
+}
+
 // --- long-bracket string literals (8-mode parity) ----------------------------
 
 test "long string: plain, concat, and length" {
@@ -7974,7 +8016,7 @@ test "konst interning lets CSE collapse a repeated subexpression end-to-end" {
     try testing.expectEqual(@as(usize, 1), muls);
 }
 
-test "recorder: a call in the loop body aborts cleanly and blacklists the anchor" {
+test "recorder: a non-recursive fixed-arity leaf call is inlined into one trace" {
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
@@ -7986,11 +8028,118 @@ test "recorder: a call in the loop body aborts cleanly and blacklists the anchor
     , true);
     defer chunk.deinit();
 
-    // The body's `call` is cross-frame, so the recording aborts — no trace is
-    // cached and the loop anchor is blacklisted so it is not re-recorded.
+    // Cross-frame tracing (Phase 0): the body's `call` to a fixed-arity, non-
+    // recursive Lua leaf is inlined into the trace (guard_func + seeded callee
+    // slots + return mapping) rather than aborting, so the loop records exactly
+    // one trace, the recording closes cleanly, and the anchor is *not*
+    // blacklisted (an aborted anchor would have been gated — `gate.count() >= 1`).
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder: a vararg call in the loop body still aborts cleanly" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function f(...) return 1 end
+        \\local acc = 0
+        \\for i = 1, 50 do acc = acc + f(i) end
+        \\print(acc)
+    , true);
+    defer chunk.deinit();
+
+    // A vararg callee has no compile-time-fixed register window to seed, so the
+    // recorder must still abort (cross_frame) — no trace cached, recording done.
     try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
     try testing.expect(vm.trace.gate.count() >= 1);
     try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder S1: inlined callee slots are seeded — no callee-index slot_load" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // The callee reads its parameter `x` and a non-param local `t`. S1 seeds every
+    // callee slot `.def` at the `.call` (params → the arg's SSA ref, the rest →
+    // konst(nil)), so when the body records, `refOf` resolves those reads to the
+    // seeded SSA values and NEVER emits a `slot_load` on a callee register index
+    // (slot >= the anchor frame's `num_registers`). A `slot_load` there would be an
+    // out-of-window trace input reading uninitialised slab — the exact OOB S1 stops.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function f(x) local t = x + 1 return t * t end
+        \\local acc = 0
+        \\for i = 1, 50 do acc = acc + f(i) end
+        \\print(acc)
+    , true);
+    defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    const t = vm.trace.cache.items[0];
+    const anchor_window: i32 = @intCast(chunk.proto.num_registers);
+
+    // The inlining actually happened: a guard_func pins the runtime callee identity.
+    var saw_guard_func = false;
+    for (t.instrs) |ins| {
+        if (ins.op == .guard_func) saw_guard_func = true;
+        // S1 invariant: no trace input (`slot_load`) reads a callee-window slot.
+        if (ins.op == .slot_load) try testing.expect(ins.aux < anchor_window);
+    }
+    try testing.expect(saw_guard_func);
+}
+
+test "recorder S2: callee SSA slots are dropped from the loop-closing phi set" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // Callee slots are dead at the outer loop boundary (the call returns before the
+    // loop closes), so `commit()`'s phi loop must cap writeback to the anchor window
+    // and drop them. Every slot-bound phi (`aux >= 0`) must name a slot strictly
+    // below the anchor frame's `num_registers`; a phi at a callee index would make
+    // the `.loop` flush write OOB past the executor's single RegWindow.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function f(x) local t = x + 1 return t * t end
+        \\local acc = 0
+        \\for i = 1, 50 do acc = acc + f(i) end
+        \\print(acc)
+    , true);
+    defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    const t = vm.trace.cache.items[0];
+    const anchor_window: i32 = @intCast(chunk.proto.num_registers);
+    for (t.instrs) |ins| {
+        if (ins.op != .phi or ins.aux < 0) continue; // skip the PHI_INTERNAL sentinel
+        try testing.expect(ins.aux < anchor_window);
+    }
+}
+
+test "recorder S3: the verifier window is the anchor frame, below the reserved scratch" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // S3 pins `assertWellFormed`'s slot bound to the executor's *real* window
+    // (`anchor_num_registers`), NOT the grown `reg_map.len`. This test makes that
+    // bound load-bearing: it confirms the recorder physically reserved callee
+    // scratch ABOVE the anchor window (so callee slots were written at reg_map
+    // indices the executor never touches), while the verifier bound stayed pinned
+    // to the narrow anchor window. If the two coincided the S3 assertion would be
+    // vacuous; here `reg_map.len` strictly exceeds it, so pinning to the narrow
+    // bound is what actually catches an OOB callee `aux`.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function f(x) local t = x + 1 return t * t end
+        \\local acc = 0
+        \\for i = 1, 50 do acc = acc + f(i) end
+        \\print(acc)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    // The recorder's window bound equals the anchor (top-level main) frame's regs.
+    try testing.expectEqual(chunk.proto.num_registers, vm.trace.rec.anchor_num_registers);
+    // …and the reserved scratch genuinely extends past it (callee windows live here).
+    try testing.expect(vm.trace.rec.reg_map.len > @as(usize, vm.trace.rec.anchor_num_registers));
 }
 
 test "recorder: maxrecord bounds trace length (overlong traces abort)" {

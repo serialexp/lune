@@ -2,6 +2,19 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Cross-frame tracing — the *cluster lever* (June 2026)
+
+Cross-frame Phase 0 (`docs/design/10-cross-frame-tracing.md`) inlines pure
+local/param-leaf Lua calls. The JIT-inert bench cluster (array3d, nbody, scalar,
+…) does **not** move on Phase 0 because its calls go through shapes Phase 0
+aborts: **upvalue reads in the callee** (nbody), **method / `__index` dispatch**
+(`arr:set`, array3d), **generic-for closure iterators** (array3d's
+`for … in arr:points()`), and **native callees** (scalar's `type`/`tostring`/…,
+correctly never inlined). Moving the cluster needs upvalue + method + iterator
+inlining — each its own change, beyond the current plan. Tripwire: when in-callee
+upvalue inlining lands, `guard_func` must tighten `Proto.id` → closure
+`GcHeader.id`.
+
 ## LuaJIT benchmark corpus — blocked benches (June 2026)
 
 `bench/luajit/` vendors the 14 CLBG/SciMark ports that run byte-identical to

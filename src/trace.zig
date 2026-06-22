@@ -25,6 +25,7 @@
 const std = @import("std");
 const bytecode = @import("bytecode.zig");
 const value = @import("value.zig");
+const function = @import("function.zig");
 const regwindow = @import("regwindow.zig");
 const RegWindow = regwindow.RegWindow;
 const io = @import("io.zig");
@@ -234,6 +235,23 @@ pub const IrOp = enum(u8) {
     /// can never be hoisted above it). Produces no value. Boolean lane only in Phase A.
     /// Appended last so every prior op's wire ordinal stays stable.
     astore_append,
+
+    // ---- cross-frame call identity guard (cross-frame tracing) ----------------
+    /// `a` = SSA ref of the callee value at the inlined `.call` slot; `aux` =
+    /// the recorded `Proto.id` (`@bitCast(u32↔i32)`, a stable id, NEVER a raw
+    /// pointer — replay restores a closure with the same id but a new address,
+    /// doc 02). Side-exits to tier-0 unless the runtime value is a heap Lua
+    /// closure whose `proto.id == aux`. Fails **closed**: a non-closure, a
+    /// native function, or a different proto all deopt, and tier-0 re-runs the
+    /// iteration from the loop header — re-executing the real `.call`, which
+    /// reconstructs the callee frame for free (the replay-from-header model, so
+    /// no multi-frame snapshot is needed). Proto-id identity is sound only while
+    /// in-callee upvalue access still aborts recording (two closures over one
+    /// proto are trace-identical when no upvalue is read); when upvalue inlining
+    /// lands this must tighten to the closure's `GcHeader.id`. Produces no value
+    /// (`ty == .none`); never DCE'd (it is a `.guard` in `tropt.kindOf`).
+    /// Appended last so every prior op's wire ordinal stays stable.
+    guard_func,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -408,6 +426,10 @@ pub const AbortReason = enum {
     has_metatable,
     /// Allocation failed while building the trace.
     alloc,
+    /// Cross-frame inlining exceeded `max_inline_depth`, or would overflow the
+    /// recorder's grown `reg_map` window. Abort rather than panic on an OOB slab
+    /// read; tier-0 owns the loop. (Deep/unbounded recursion is Phase 3.)
+    too_deep,
 };
 
 /// Tunables for the recorder. Defaults track LuaJIT's where sensible; all are
@@ -1156,6 +1178,14 @@ pub const TraceState = struct {
         }
         for (self.rec.reg_map, 0..) |s, slot| {
             if (s.state != .def) continue;
+            // S2 (cross-frame tracing): callee slots are pure internal SSA
+            // temporaries — defined-before-use inside the inlined body, dead at the
+            // loop boundary, never loop-carried. Only anchor-frame slots may carry
+            // across iterations (including the return-mapped `ret_dest..` writes,
+            // which land back in the anchor window). Writing a callee slot back here
+            // would make the `.loop` flush `regs.set` past the executor's real
+            // `[0, anchor_num_registers)` window — a silent OOB slab write.
+            if (slot >= self.rec.anchor_num_registers) continue;
             if (slot >= self.rec.locals_watermark and !self.readSlot(@intCast(slot))) continue;
             try self.rec.instrs.append(self.gpa, .{
                 .op = .phi,
@@ -1185,7 +1215,13 @@ pub const TraceState = struct {
             self.gpa.free(fields.entry_slots);
         }
 
-        assertWellFormed(fields.instrs, fields.consts.len, self.rec.reg_map.len);
+        // S3 (cross-frame tracing): pin the verifier's register-window bound to the
+        // executor's *real* window (`anchor_num_registers`), not the grown
+        // `reg_map.len` (which includes the callee scratch tail). A `slot_load`/`phi`
+        // `aux` outside `[0, anchor_num_registers)` is exactly the OOB that S1/S2
+        // prevent — so the verifier must reject it, not have its bound widened to
+        // hide it.
+        assertWellFormed(fields.instrs, fields.consts.len, self.rec.anchor_num_registers);
 
         // Compute the entry type fingerprint: for each guard_int/guard_float/
         // guard_number/guard_table that guards a slot_load, record the
@@ -1251,7 +1287,7 @@ pub const TraceState = struct {
                     std.debug.assert(ins.a < i and ins.b < i);
                 },
                 // unary ops and guards read `a` only.
-                .neg, .not, .bnot, .guard_int, .guard_float, .guard_number, .guard_true, .guard_false => {
+                .neg, .not, .bnot, .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .guard_func => {
                     std.debug.assert(ins.a < i);
                 },
                 // `int_of_float` reads its sole float operand `a` (a prior node).
@@ -1349,15 +1385,23 @@ pub const TraceState = struct {
             .jmp_if_false, .jmp_if_true => try self.recBranch(instr, regs),
             .for_loop => try self.recForLoop(instr, regs, pc),
 
-            // a host call is a trace barrier; a Lua call/return is cross-frame.
-            .call => {
-                const callee = regs.get(instr.a);
-                if (callee.isHeap() and callee.heapType() == .native)
-                    self.abort(.host_barrier)
-                else
-                    self.abort(.cross_frame);
-            },
-            .ret, .halt => self.abort(.cross_frame),
+            // Cross-frame tracing: inline a Lua callee's body straight into the
+            // trace (LuaJIT-style `lj_record_call`/`lj_record_ret`). A host
+            // (`native`) call stays a trace barrier; anything we can't inline
+            // (dynamic multret, vararg, `__call`, too deep) aborts cleanly and
+            // tier-0 owns the loop.
+            .call => try self.recCall(instr, regs, proto),
+            .ret => if (self.rec.inline_depth == 0)
+                // A `.ret` in the anchor frame closes the traced function itself —
+                // the loop's back-edge always closes the trace first, so this is
+                // only reached on an odd shape; abort rather than map results into a
+                // caller we never inlined.
+                self.abort(.cross_frame)
+            else
+                try self.recReturn(instr),
+            // `.halt` ends the top-level chunk; never a return from an inlined
+            // callee. Always a barrier.
+            .halt => self.abort(.cross_frame),
 
             // lane-aware packed-array read (Phase B): `t[k]` for an in-bounds
             // dense narrow-lane slot compiles; everything else aborts cleanly.
@@ -1419,18 +1463,28 @@ pub const TraceState = struct {
     /// register emits a `slot_load` (a trace input) and records it in the entry
     /// snapshot.
     fn refOf(self: *TraceState, slot: u16) !Ref {
-        const s = &self.rec.reg_map[slot];
+        // Translate the frame-relative `slot` into a `reg_map` index by the current
+        // frame's absolute offset (0 for the anchor frame; cross-frame tracing
+        // raises it inside an inlined callee). A `slot_load` is only ever emitted
+        // for an anchor-frame slot: S1 pre-seeds every callee slot `.def` at the
+        // inlining `.call`, so a callee index is never `.undef` here — the
+        // executor's `slot_load aux` therefore always lands in `[0,
+        // anchor_num_registers)`.
+        const abs: usize = self.rec.base_off + slot;
+        const s = &self.rec.reg_map[abs];
         if (s.state != .undef) return s.ref;
-        const ref = try self.emit(.{ .op = .slot_load, .aux = slot, .ty = .unknown });
-        try self.rec.entry_slots.append(self.gpa, slot);
+        const aux: i32 = @intCast(abs);
+        const ref = try self.emit(.{ .op = .slot_load, .aux = aux, .ty = .unknown });
+        try self.rec.entry_slots.append(self.gpa, @intCast(abs));
         s.* = .{ .ref = ref, .state = .input };
         return ref;
     }
 
-    /// Record that tier-0 register `slot` now holds the value produced by `ref`
-    /// (a loop-carried write — surfaces in the exit snapshot).
+    /// Record that tier-0 register `slot` (in the current frame) now holds the
+    /// value produced by `ref` (a loop-carried write — surfaces in the exit
+    /// snapshot). Offset by `base_off` like `refOf`.
     fn setReg(self: *TraceState, slot: u16, ref: Ref) void {
-        self.rec.reg_map[slot] = .{ .ref = ref, .state = .def };
+        self.rec.reg_map[self.rec.base_off + slot] = .{ .ref = ref, .state = .def };
     }
 
     /// Whether tier-0 register `slot` was *read* during this recording (i.e. it is
@@ -1768,6 +1822,13 @@ pub const TraceState = struct {
     /// loop-continuation guard, mirroring the opcode. The actual back-edge / close
     /// is handled by `onBackEdge`.
     fn recForLoop(self: *TraceState, instr: Instr, regs: RegWindow, pc: u32) !void {
+        // Cross-frame tracing (Phase 0): never process a `for_loop` inside an
+        // inlined callee. The `target == anchor.pc` watermark test below compares
+        // raw pc integers across *different* protos, so a callee-internal loop
+        // whose body pc coincides with the outer anchor pc would corrupt the
+        // exit-snapshot watermark. Leaf callees in the target benchmark cluster are
+        // straight-line; a callee with its own numeric-`for` aborts and runs tier-0.
+        if (self.rec.inline_depth > 0) return self.abort(.cross_frame);
         const a = instr.a;
 
         // If *this* `for_loop` is the one whose back-edge defines the trace
@@ -1823,6 +1884,114 @@ pub const TraceState = struct {
         // publish the stepped index and the loop variable (R[a+3]).
         self.setReg(a, rnext);
         self.setReg(a + 3, rnext);
+    }
+
+    /// Cross-frame tracing — inline a Lua callee's body straight into the trace
+    /// (LuaJIT's `lj_record_call`). The dispatch loop keeps driving the recorder
+    /// through the callee's bytecode after tier-0 pushes the frame, so all this
+    /// does is: (1) emit a `guard_func` pinning the runtime callee to the recorded
+    /// `Proto.id` (fails closed → deopt to tier-0, which really calls it); (2)
+    /// **S1**-seed every callee slot `.def` so no callee index is ever read
+    /// `.undef` (which would emit an OOB `slot_load`); (3) push a recorder frame and
+    /// shift `base_off` into the callee window. The call's frame-push / param-copy /
+    /// pop never executes on the trace — callee slots are pure internal SSA
+    /// temporaries on the single anchor `RegWindow` (see the safety rails, doc 10).
+    ///
+    /// Aborts cleanly (tier-0 owns the loop) on every shape we don't inline:
+    /// a host (`native`) callee is a trace barrier; a non-callable / `__call`
+    /// metamethod, a vararg callee, dynamic multret (`all_results` arg or result
+    /// window — no compile-time-fixed slots to seed/map), and exceeding
+    /// `MAX_INLINE_DEPTH` or the `reg_map` reservation all abort.
+    fn recCall(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
+        const callee = regs.get(instr.a);
+        if (!callee.isHeap()) return self.abort(.cross_frame);
+        switch (callee.heapType()) {
+            // A host call crosses the embedding boundary — heap effects we can't
+            // model on the trace. Stays the existing host barrier.
+            .native => return self.abort(.host_barrier),
+            .function => {},
+            // `__call` on a table/userdata, or anything else callable only via a
+            // metamethod, is not a plain Lua-closure call. Not inlined.
+            else => return self.abort(.cross_frame),
+        }
+        // Dynamic argument or result windows (`reg_top`-driven multret) have no
+        // compile-time-fixed slot count to seed (args) or map (results). Abort;
+        // fixed multret broadening is Phase 2.
+        if (instr.b == bytecode.all_results) return self.abort(.cross_frame);
+        if (instr.c == bytecode.all_results) return self.abort(.cross_frame);
+
+        const cl = function.Closure.fromHeader(callee.asHeap());
+        const cp = cl.proto;
+        // A vararg callee's extra-args frame cursor isn't modelled on the trace.
+        if (cp.is_vararg) return self.abort(.cross_frame);
+        if (self.rec.inline_depth >= MAX_INLINE_DEPTH) return self.abort(.too_deep);
+
+        // Callee window starts `caller_proto.num_registers` above the current
+        // frame's base — exactly tier-0's `callee_base = base + caller.num_registers`,
+        // in the recorder's anchor-relative `base_off` space. `proto` here is the
+        // *caller* proto (the frame the `.call` executes in).
+        const callee_base_off: u32 = self.rec.base_off + proto.num_registers;
+        if (@as(usize, callee_base_off) + cp.num_registers > self.rec.reg_map.len)
+            return self.abort(.too_deep);
+
+        // (1) guard_func: pin the runtime callee to this proto's stable id. `aux`
+        // carries `Proto.id` (a `u32`, NOT a pointer — pointers change across a
+        // keyframe restore and would break replay). Fails closed in the executor.
+        const callee_ref = try self.refOf(instr.a);
+        _ = try self.emit(.{ .op = .guard_func, .a = callee_ref, .aux = @bitCast(cp.id) });
+
+        // (2) S1: seed every callee slot `.def`. Param slots (`i < num_params` and
+        // an arg was actually passed) take the caller arg's SSA ref; everything else
+        // is `nil`, matching tier-0's nil-fill of an unset register. After this no
+        // callee slot is `.undef`, so `refOf` never emits a `slot_load` on a callee
+        // index (which would be an out-of-window trace input).
+        const nargs: u16 = instr.b;
+        var i: u16 = 0;
+        while (i < cp.num_registers) : (i += 1) {
+            const seed: Ref = if (i < cp.num_params and i < nargs)
+                try self.refOf(@intCast(@as(usize, instr.a) + 1 + i))
+            else
+                try self.konst(Value.nil());
+            self.rec.reg_map[callee_base_off + i] = .{ .ref = seed, .state = .def };
+        }
+
+        // (3) push the recorder frame and descend into the callee window.
+        self.rec.frames[self.rec.inline_depth] = .{
+            .base_off = self.rec.base_off,
+            .ret_dest = instr.a,
+            .ret_count = instr.c,
+        };
+        self.rec.inline_depth += 1;
+        self.rec.base_off = callee_base_off;
+    }
+
+    /// Cross-frame tracing — close an inlined callee (LuaJIT's `lj_record_ret`).
+    /// Only reached at `inline_depth > 0` (the anchor-frame `.ret` aborts). Maps the
+    /// callee's result slots back into the caller's `ret_dest..` window, nil-padding
+    /// to the call site's fixed `ret_count`, then pops the recorder frame and
+    /// restores `base_off`. The result writes use *absolute* `reg_map` indices (the
+    /// caller region is disjoint from and below the callee source region, so a
+    /// single forward pass can read source then write dest without a buffer).
+    fn recReturn(self: *TraceState, instr: Instr) !void {
+        const d = self.rec.inline_depth - 1;
+        const fr = self.rec.frames[d];
+        // Dynamic result count — no fixed window to map. Abort (Phase 2 broadens
+        // fixed multret; dynamic stays a barrier).
+        if (instr.b == bytecode.all_results) return self.abort(.cross_frame);
+        const produced: u16 = instr.b;
+        const want: u16 = fr.ret_count;
+        var k: u16 = 0;
+        while (k < want) : (k += 1) {
+            // `base_off` is still the callee window here, so `refOf` reads the
+            // callee's result slots `instr.a + k`.
+            const ref: Ref = if (k < produced)
+                try self.refOf(@intCast(@as(usize, instr.a) + k))
+            else
+                try self.konst(Value.nil());
+            self.rec.reg_map[@as(usize, fr.base_off) + fr.ret_dest + k] = .{ .ref = ref, .state = .def };
+        }
+        self.rec.base_off = fr.base_off;
+        self.rec.inline_depth = d;
     }
 };
 
@@ -1892,6 +2061,26 @@ const PendingStore = struct { aref: Ref, value: Ref, lane_ord: i32 };
 /// `v[j],v[j+1]` per iteration) exactly; a trace that wants more aborts cleanly.
 const MAX_PENDING_STORES = 4;
 
+/// Maximum nesting of inlined Lua calls a single trace may carry (cross-frame
+/// tracing). Bounds the recorder's grown `reg_map` window and the depth of leaf
+/// inlining. Down-recursion (the same proto re-inlined) is Phase 3; until then a
+/// call beyond this depth aborts cleanly (`AbortReason.too_deep`) and tier-0 owns
+/// the loop.
+const MAX_INLINE_DEPTH = 3;
+
+/// Per-inlined-frame register reservation in the recorder's grown `reg_map`. The
+/// map is sized `anchor.num_registers + MAX_INLINE_DEPTH × MAX_CALLEE_REGS`; a
+/// callee whose `num_registers` exceeds this reservation (or that would overflow
+/// the map at depth) aborts cleanly rather than reading the slab out of bounds.
+/// 256 covers every realistic leaf body the compiler emits.
+const MAX_CALLEE_REGS = 256;
+
+/// One saved caller context for an inlined `.call`, popped at the matching
+/// `.ret`. `base_off` is the caller frame's absolute slot offset (relative to the
+/// anchor frame's base); `ret_dest`/`ret_count` mirror the call's `instr.a`/
+/// `instr.c` (where results land in the caller, and how many it wants).
+const InlineFrame = struct { base_off: u32, ret_dest: u16, ret_count: u16 };
+
 pub const Recorder = struct {
     active: bool = false,
     anchor: AnchorKey = .{ .proto = undefined, .pc = 0 },
@@ -1947,6 +2136,27 @@ pub const Recorder = struct {
     pending_stores: [MAX_PENDING_STORES]PendingStore = undefined,
     pending_store_count: usize = 0,
 
+    // --- cross-frame tracing (inlined Lua calls) ---------------------------
+    /// The anchor (outermost) frame's register count. The grown `reg_map` may be
+    /// wider (it reserves space for inlined callee frames), so the executor's real
+    /// register window is `[0, anchor_num_registers)`. `assertWellFormed` pins
+    /// every `slot_load`/`phi` slot below this bound (S3), and `commit()` caps φ
+    /// writeback to it (S2): callee slots are pure internal SSA temporaries, dead
+    /// at the loop boundary, never loop-carried.
+    anchor_num_registers: u16 = 0,
+    /// Absolute slot offset of the frame currently being recorded, relative to the
+    /// anchor frame's base. 0 for the anchor frame; `caller_base_off +
+    /// caller_proto.num_registers` for an inlined callee. `refOf`/`setReg` add it
+    /// to translate a frame-relative slot into a `reg_map` index, exactly as the
+    /// interpreter's `callee_base = base + caller.num_registers` lays out windows.
+    base_off: u32 = 0,
+    /// Saved caller contexts for the currently-open inlined calls, indexed by
+    /// `inline_depth - 1`. Pushed at an inlined `.call`, popped at the `.ret`.
+    frames: [MAX_INLINE_DEPTH]InlineFrame = undefined,
+    /// Number of inlined calls currently open (frame-stack depth). 0 at the anchor
+    /// frame; a `.call` beyond `MAX_INLINE_DEPTH` aborts `.too_deep`.
+    inline_depth: u8 = 0,
+
     pub fn deinit(self: *Recorder, gpa: std.mem.Allocator) void {
         self.instrs.deinit(gpa);
         self.consts.deinit(gpa);
@@ -1965,15 +2175,23 @@ pub const Recorder = struct {
         self.entry_slots.clearRetainingCapacity();
         self.guarded_refs.clearRetainingCapacity();
         self.konst_map.clearRetainingCapacity();
-        if (self.reg_map.len != num_registers) {
+        // Size the register map for the anchor frame **plus** reserved windows for
+        // inlined callee frames (cross-frame tracing). The executor only ever
+        // touches `[0, anchor_num_registers)`; the tail is scratch the recorder
+        // uses to hold callee SSA temporaries while inlining.
+        const wanted: usize = @as(usize, num_registers) + MAX_INLINE_DEPTH * MAX_CALLEE_REGS;
+        if (self.reg_map.len != wanted) {
             if (self.reg_map.len != 0) gpa.free(self.reg_map);
-            self.reg_map = try gpa.alloc(RegSlot, num_registers);
+            self.reg_map = try gpa.alloc(RegSlot, wanted);
         }
         @memset(self.reg_map, .{});
         self.anchor = anchor;
         self.abort_reason = null;
         self.locals_watermark = std.math.maxInt(u32);
         self.pending_store_count = 0;
+        self.anchor_num_registers = num_registers;
+        self.base_off = 0;
+        self.inline_depth = 0;
         self.active = true;
     }
 };
@@ -2004,6 +2222,7 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_present,
         .guard_fits,
         .int_of_float,
+        .guard_func,
         => try w.print("%{d}", .{ins.a}),
         .loop, .preheader => {},
         // φ: a slot-bound φ prints `update=%b → r{slot}` (init is implicit
