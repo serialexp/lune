@@ -428,7 +428,9 @@ docs/design/05-native-codegen.md §Out of scope):
    coverage yet.
 2. **Float / mixed / heap traces** — xmm registers, tag dispatch, libm `call`-outs.
 3. **Deferred ops** — `div`/`idiv`/`mod`/`pow` (floored-div/mod correction),
-   `shl`/`shr` (Lua masked shift counts), logical `not`.
+   logical `not`. (`shl`/`shr` LANDED June 2026 — branch-bracketed `cl`-shift in
+   `nativegen.emitShift`, confined to nativegen + x64; see the shift-lowering note
+   below.)
 4. ~~**Linear-scan register allocation**~~ — **DONE (cut 2).** Loop-carried &
    invariant slots get register/spill homes loaded once; transients get registers
    via forward linear scan; `regs[]` written only on side-exit (single snapshot).
@@ -453,6 +455,62 @@ docs/design/05-native-codegen.md §Out of scope):
    address could hit a stale trace (now stale *machine code*). Pre-existing in
    tier-1a; surfaced to Bart as a separate task, not expanded into Phase 8.
 7. **A wasm codegen backend** — a separate consumer of the same lowering seam.
+8. **scimark-sparse trip-decline / recorder-bookkeeping residual (~17% jit>t0).**
+   Found while landing the native-unsupported safety net (June 2026). `--jit-native`
+   leaves scimark-sparse ~17% slower than pure tier-0, but it is **not** a
+   native-unsupported / tier-1a problem (the safety net is inert here: gates=0,
+   skips=0, entries=0). Root cause: the hot inner kernel
+   `for i=row[r],row[r+1]-1 do sum=sum+vx[col[i]]*val[i] end` runs exactly
+   `nr=floor(nz/n)=floor(5000/1000)=5` trips — below `min_trip_entry=24` — so dispatch
+   **trip-declines** entry every invocation and the trace never runs (native or
+   tier-1a). The cost is pure trace-dispatch bookkeeping on a short hot loop nested in
+   a hot outer loop: per-back-edge `onBackEdge` (hashmap getOrPut) + `isGated` +
+   `armShortLoopSkip`, plus the middle loop (`for r=1,n`, 1000 trips) which never
+   commits a trace and re-pays `onBackEdge` + fingerprint-miss every back-edge. Pure
+   tier-0 (no `--trace`, `config.enabled=false`) skips all of it. Addressable only by
+   cheaper warming-loop bookkeeping or by tracing the middle loop with the inner loop
+   unrolled — neither is the safety net nor shift codegen. Distinct, pre-existing
+   JIT-coverage issue.
+9. **Int-lane astore of a constant bails native (guard_fits DCE'd).** Found while
+   landing shl/shr (June 2026) by diagnosing why nsieve-bit's array-init loop
+   `for i=0,(m>>6) do p[i]=-1 end` stays native-unsupported (`trace #2`) on the
+   2nd/3rd `nsieve` call (in-bounds store into the reused `primes` table). The
+   recorder emits a `guard_fits` ahead of every int-lane `astore` (trace.zig:1712),
+   but `tropt` **DCE's it when the value is a constant** that provably fits the lane
+   — so `proveKinds`' unconditional `if (!fits_ok[ins.b]) return false`
+   (nativegen.zig int-lane `astore` arm) rejects the trace. This is the *exact* case
+   already exempted for the **f64 lane** (the `astore` requires no `fits_ok` because
+   a `movsd` never narrows; nativegen.zig:~624 comment) and the **bool lane**. The
+   narrow int lanes (i8/i16/i32) genuinely need the range check for *free-variable*
+   stores, but a constant that survived `tropt`'s fold provably fits — the fix is to
+   admit a constant (or otherwise statically-in-lane) int `astore` value without a
+   covering `guard_fits`, mirroring the f64/bool exemption, while still requiring it
+   for free-variable int stores. Determinism subtlety: must prove the constant fits
+   the *recorded* lane width (the prologue `guard_lane` pins it), so a later
+   wider-lane store still side-exits. Net effect: would unlock the init loop's
+   constant fill to native (currently 100% tier-0). Distinct from shl/shr; new
+   nativegen analysis change → fresh plan + Codex/Antigravity review first.
+
+### Native shl/shr lowering (nsieve-bit shift loops) — LANDED (June 2026)
+
+`shl`/`shr` now lower to native (`nativegen.emitShift`): a **branch-bracketed
+`cl`-shift** that reproduces Lua's shift semantics (`arith.shiftLeft`/`shiftRight`)
+exactly — the x86 `shl/shr reg,cl` only honours the low 6 bits of the count, so the
+lowering brackets the hardware shift with explicit range checks: count `< 0` →
+negate and shift the other direction; `|count| ≥ 64` → result 0; else the bare
+`cl`-shift. Confined to `nativegen.zig` (proveKinds Int arm, `isTransient`,
+`operandReads`, `emitShift`, lower dispatch) + `x64.zig` (`shlRegCl`/`shrRegCl`,
+`Cond.s`) — **no** new IR op, no recorder/snapshot/irinterp/tropt change (shl/shr
+stay opaque ops; only native lowering was added). Uses only the dst register (or rax
+for a spilled dst) + rcx scratch, so it fits the cut-2 allocator's two scratch
+registers regardless of operand homes (count loaded into rcx *first*, since the
+allocator may reuse a dying operand's home as the result reg). Differential-tested
+vs the tier-1a oracle across every count regime (in-range, ≥64→0, negative→reverse,
+INT64_MIN). Measured: nsieve-bit **t0 139 ms → jit 55 ms (2.5× native win)** — the
+two shift-bearing inner loops now compile native (538 + 448 bytes); previously they
+were the native-unsupported traces the Part 1 safety net retired to tier-0. (The
+array-init loop `trace #2` stays unsupported for the separate constant-store reason
+in item 9 above.)
 
 ### f64 array lane (Phase D Gap A) — LANDED (June 2026)
 

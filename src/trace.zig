@@ -724,6 +724,25 @@ pub const TraceState = struct {
         }
     }
 
+    /// Gate an anchor whose recorded trace compiles to native-*unsupported* under
+    /// `--jit-native`. Running such a trace on the tier-1a IR-interpreter is
+    /// ~equal-to-slower than tier-0 on the bodies that hit this (shift-heavy
+    /// sieves, etc.), so naively falling back to tier-1a makes `--jit-native`
+    /// *regress* vs plain tier-0. Instead we gate the anchor and let tier-0 own
+    /// the loop (the dispatch's hot-count pre-filter then skips the entry walk).
+    ///
+    /// Unlike the thrash path (`onSideExit`) there's no reason to wait
+    /// `max_penalty` low-yield entries — "unsupported" is known the first time
+    /// `nativeFor` compiles — so we gate immediately. Self-healing via the
+    /// existing backoff: the gate's cooldown lets the anchor retry, and a later
+    /// native-supported specialization that runs usefully clears the gate
+    /// (`onSideExit`). Deterministic — `gateAnchor` keys only on the monotonic
+    /// back-edge `tick`. The `isGated` guard avoids re-escalating an active gate.
+    pub fn gateNativeUnsupported(self: *TraceState, anchor: AnchorKey) void {
+        if (self.isGated(anchor)) return;
+        self.gateAnchor(anchor);
+    }
+
     /// Exit-PC chaining (step 3): after trace `failed` side-exited with
     /// `exit_instr`, look for a trace at the guard's bytecode PC and try to
     /// execute it. Returns the number of committed iterations if a side trace

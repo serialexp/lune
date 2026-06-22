@@ -2209,6 +2209,13 @@ pub const Vm = struct {
                         var visited: [8]*trace.Trace = undefined;
                         var nvisited: usize = 0;
                         var any_fingerprint_matched = false;
+                        // Native safety net (see the skip below): set when a
+                        // fingerprint-matching trace at this anchor compiled to
+                        // native-*unsupported*. If the walk then ends with no
+                        // productive entry, we gate the anchor so tier-0 owns the
+                        // loop rather than re-walking (or falling to tier-1a) every
+                        // back-edge.
+                        var saw_native_unsupported = false;
                         // Widen-eviction: traces whose `guard_lane` pins a lane the
                         // live array has monotonically widened past can never match
                         // again. Collect them during the trial walk and retire them
@@ -2238,6 +2245,22 @@ pub const Vm = struct {
                             // aren't fingerprinted — they depend on computed values.
                             if (!ct.matchesFingerprint(regs)) continue;
                             any_fingerprint_matched = true;
+                            // Native safety net: under `--jit-native`, a trace that
+                            // records but can't compile to native (unsupported op /
+                            // type) would otherwise run on the tier-1a IR-interpreter,
+                            // which is ~equal-to-slower than tier-0 on these bodies —
+                            // so enabling native codegen *regresses* the loop vs plain
+                            // tier-0. Decline to enter it (skip, never tier-1a) and note
+                            // it; the post-walk fall-through gates the anchor *only* if
+                            // nothing productive ran — so a native-supported sibling at
+                            // the same anchor still runs and never thrashes the gate.
+                            // `nativeFor` compiles lazily and memoizes the verdict, so
+                            // this is one compile attempt then an O(1) `union` tag read
+                            // forever (the supported path below re-reads the page).
+                            if (self.trace.config.native_codegen and self.trace.nativeFor(ct) == null) {
+                                saw_native_unsupported = true;
+                                continue;
+                            }
                             if (self.trace.valuesScratch(ct.instrs.len)) |buf| {
                                 self.trace.entries +%= 1;
                                 const result = if (self.trace.config.record_exec_log) blk: {
@@ -2331,6 +2354,18 @@ pub const Vm = struct {
                         // matched, count it for side-trace recording.
                         if (!any_fingerprint_matched and self.trace.hasTrace(.{ .proto = proto, .pc = anchor_pc })) {
                             self.trace.countFingerprintMiss(.{ .proto = proto, .pc = anchor_pc });
+                        }
+                        // Native safety net (part 2): we reach here only when no trace
+                        // ran productively (a productive entry does `continue :outer`).
+                        // If the walk skipped a native-unsupported trace, gate the
+                        // anchor so its next back-edges hit the hot-count skip and
+                        // tier-0 owns the loop — rather than re-walking + re-compiling
+                        // every iteration. Guarded on "nothing productive ran", so a
+                        // native-supported sibling that *did* run never gets gated
+                        // (it `continue :outer`s and bypasses this). Self-heals via the
+                        // gate's backoff + `onSideExit` clear.
+                        if (saw_native_unsupported) {
+                            self.trace.gateNativeUnsupported(.{ .proto = proto, .pc = anchor_pc });
                         }
                         // Fall through to tier-0.
                     } else if (eligible and !trip_ok) {

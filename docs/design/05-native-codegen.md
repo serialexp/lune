@@ -16,10 +16,13 @@ path (~2.5× off LuaJIT — the richer shapes still have headroom). **Phase B** 
 added a lane-aware **array load/store** path (`t[k]` against the packed `ArrayPart`)
 — see §Phase B below. **Phase D** then added a **float/XMM** path (float
 `add`/`sub`/`mul`/`div` + comparisons, int→float promotion) — see §Phase D below.
-Heap (non-array)/mixed traces, the deferred numeric ops, accumulator sinking, and
-per-exit side traces are later cuts (see §Out of scope).
+**Phase E** then added native **`shl`/`shr`** (branch-bracketed `cl`-shift matching
+Lua's full logical-shift semantics), unlocking nsieve-bit's shift loops to native
+(2.5×) — see §Out of scope. Heap (non-array)/mixed traces, the remaining deferred
+numeric ops (`idiv`/`mod`/`pow`/`not`), accumulator sinking, and per-exit side traces
+are later cuts (see §Out of scope).
 Owner: Bart
-Last updated: 2026-06-16
+Last updated: 2026-06-22
 
 Realises **Phase 8** in `00-architecture.md`. Tiers 0 and 1a are both
 *interpreters*: tier-0 walks bytecode (`interp.zig`), tier-1a walks the optimized
@@ -590,8 +593,21 @@ stays out of scope. Gap A is the float-array foundation Gaps B and C build on.
   metatable-free table-field access outside the dense array part. Float arithmetic and
   comparisons are **done (Phase D)**; what remains is the non-numeric polymorphic shapes.
 - **Deferred numeric ops** — `idiv`/`mod`/`pow` (floored-div/mod correction, libm),
-  float `neg` (xorpd sign-mask), `shl`/`shr` (Lua masked shift counts), `not` (logical,
-  not bitwise). `div` is **done (Phase D / F3)** — `divsd`, always float.
+  float `neg` (xorpd sign-mask), `not` (logical, not bitwise). `div` is **done
+  (Phase D / F3)** — `divsd`, always float. `shl`/`shr` are **done (Phase E)** — see
+  below.
+- ~~**`shl`/`shr` (Lua logical shifts)**~~ — **done (Phase E):** lowered to a
+  branch-bracketed `cl`-shift. x86 `shl/shr reg,cl` honours only the low 6 bits of
+  the count, whereas Lua's `arith.shiftLeft`/`shiftRight` are full logical shifts
+  (`|count| ≥ 64 → 0`, negative count reverses direction), so `emitShift` brackets the
+  hardware shift with explicit range checks: load count into rcx first (its home may
+  be the dst reg), `cmp rcx,0`+`js` → negate-and-reverse, `cmp rcx,64`+`jae` →
+  `xor W,W` (result 0), else the bare `cl`-shift. Uses only the dst register (or rax
+  for a spilled dst) + rcx scratch. No new IR op — shl/shr stay opaque ops; only the
+  native lowering was added (`nativegen.zig` + `x64.zig`). Differential-tested vs the
+  tier-1a oracle across every count regime (in-range, ≥64→0, negative, INT64_MIN).
+  Unlocked nsieve-bit's two shift-bearing inner loops to native (t0 139 ms → jit
+  55 ms, 2.5×).
 - ~~**Relax `guard_int` onto proven-`Int` derived values**~~ — **done (#1):** a
   `guard_int` on a statically-`Int` derived value (an `Int`-op-of-`Int`s) lowers to
   nothing; `proveKinds` validates it against the computed kind instead of bailing.

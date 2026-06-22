@@ -70,6 +70,7 @@ pub const Cond = enum(u8) {
     ne = 0x5, // ZF=0           — not-equal / not-zero
     be = 0x6, // CF=1 or ZF=1   — unsigned ≤  (below-or-equal)
     a = 0x7, // CF=0 and ZF=0  — unsigned >  (above)
+    s = 0x8, // SF=1            — sign (negative); used by the shift count-sign test
     p = 0xA, // PF=1            — parity (unordered, after ucomisd compare)
     np = 0xB, // PF=0           — no-parity (ordered)
     l = 0xC, // SF≠OF          — signed <
@@ -545,6 +546,22 @@ pub const Assembler = struct {
         try self.rex(true, false, false, reg.hi());
         try self.b(0xF7);
         try self.modrmReg(3, reg.lo());
+    }
+    /// `shl reg, cl` — REX.W D3 /4. Variable left shift by the low 6 bits of cl
+    /// (hardware masks the count to 0..63). The native shift lowering (`emitShift`)
+    /// brackets this with an explicit Lua-semantics range check, so the masked count
+    /// is always the intended one here.
+    pub fn shlRegCl(self: *Assembler, reg: Reg) !void {
+        try self.rex(true, false, false, reg.hi());
+        try self.b(0xD3);
+        try self.modrmReg(4, reg.lo());
+    }
+    /// `shr reg, cl` — REX.W D3 /5. Logical (unsigned) right shift by cl & 63 — the
+    /// match for Lua's `>>` (always logical) and the magnitude leg of a negative `<<`.
+    pub fn shrRegCl(self: *Assembler, reg: Reg) !void {
+        try self.rex(true, false, false, reg.hi());
+        try self.b(0xD3);
+        try self.modrmReg(5, reg.lo());
     }
     /// `not reg` — REX.W F7 /2 (bitwise complement; matches arith.bnot).
     pub fn notReg(self: *Assembler, reg: Reg) !void {
@@ -1352,6 +1369,29 @@ test "enc: imul / neg / not / inc" {
     try expectEnc(&.{ 0x48, 0xFF, 0xC3 }, struct { // inc rbx
         fn f(a: *Assembler) !void {
             try a.incReg(.rbx);
+        }
+    }.f);
+}
+
+test "enc: shl / shr reg, cl" {
+    try expectEnc(&.{ 0x48, 0xD3, 0xE0 }, struct { // shl rax, cl
+        fn f(a: *Assembler) !void {
+            try a.shlRegCl(.rax);
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0xD3, 0xE8 }, struct { // shr rax, cl
+        fn f(a: *Assembler) !void {
+            try a.shrRegCl(.rax);
+        }
+    }.f);
+    try expectEnc(&.{ 0x49, 0xD3, 0xE2 }, struct { // shl r10, cl (REX.B)
+        fn f(a: *Assembler) !void {
+            try a.shlRegCl(.r10);
+        }
+    }.f);
+    try expectEnc(&.{ 0x49, 0xD3, 0xEF }, struct { // shr r15, cl (REX.B)
+        fn f(a: *Assembler) !void {
+            try a.shrRegCl(.r15);
         }
     }.f);
 }
