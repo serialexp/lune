@@ -2054,6 +2054,39 @@ pub fn withPhis(
 
 const testing = std.testing;
 
+// Test-only register-window adapters over the SoA lanes. The unit tests build flat
+// `[]Value` register fixtures; `winRO` seeds shared scratch lanes from one and hands
+// back a read-only window (recorder / fingerprint sites never write `regs` back).
+// `TestRegs` owns its lanes and adds `commit()` for the few sites whose callee
+// mutates the window and whose test then asserts on the post-run register state.
+var winro_tags: [64]u8 = undefined;
+var winro_pays: [64]u64 = undefined;
+fn winRO(regs: []const Value) RegWindow {
+    std.debug.assert(regs.len <= winro_tags.len);
+    for (regs, 0..) |v, i| {
+        winro_tags[i] = @intFromEnum(v.tag);
+        winro_pays[i] = v.payload.bits;
+    }
+    return RegWindow.of(winro_tags[0..regs.len], winro_pays[0..regs.len]);
+}
+
+const TestRegs = struct {
+    regs: []Value,
+    tags: [64]u8 = undefined,
+    pays: [64]u64 = undefined,
+    fn view(self: *TestRegs) RegWindow {
+        std.debug.assert(self.regs.len <= self.tags.len);
+        for (self.regs, 0..) |v, i| {
+            self.tags[i] = @intFromEnum(v.tag);
+            self.pays[i] = v.payload.bits;
+        }
+        return RegWindow.of(self.tags[0..self.regs.len], self.pays[0..self.regs.len]);
+    }
+    fn commit(self: *TestRegs) void {
+        for (self.regs, 0..) |*v, i| v.* = .{ .tag = @enumFromInt(self.tags[i]), .payload = .{ .bits = self.pays[i] } };
+    }
+};
+
 test "IrInstr stays small" {
     // Cache-sensitive representation; keep it compact. Not serialised here (the
     // wire format is binschema, Phase 5b) — just guard against accidental bloat.
@@ -2150,7 +2183,7 @@ test "recArrayGet: t[k] on a bool lane records the full guarded read sequence" {
 
     // r1 = table, r2 = key (3) ; `get_index r0, r1, r2`  →  r0 = t[3]
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3) };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
 
     try testing.expect(state.isRecording()); // a clean record — no abort
     const ops = state.rec.instrs.items;
@@ -2197,7 +2230,7 @@ test "recArrayGet aborts: non-table container, non-int key, hole, and out-of-bou
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ Value.nil(), c.tab, c.key };
-        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
+        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
         try testing.expect(!state.isRecording()); // aborted
         try testing.expectEqual(c.why, state.rec.abort_reason.?);
     }
@@ -2218,7 +2251,7 @@ test "recArrayGet aborts on a .value-lane (unpacked) array — deferred scope cu
     defer state.deinit();
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(1) };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.nyi_opcode, state.rec.abort_reason.?);
 }
@@ -2243,7 +2276,7 @@ test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3) };
-        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
+        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
         try testing.expect(!state.isRecording());
         try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
     }
@@ -2253,7 +2286,7 @@ test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ Value.heap(&t.header), Value.int(3), Value.boolean(false) };
-        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
+        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), winRO(&regs), &proto, 0);
         try testing.expect(!state.isRecording());
         try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
     }
@@ -2264,7 +2297,7 @@ test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ Value.heap(&t.header), Value.int(33), Value.boolean(true) };
-        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
+        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), winRO(&regs), &proto, 0);
         try testing.expect(!state.isRecording());
         try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
     }
@@ -2285,7 +2318,7 @@ test "recArraySet: t[k]=false on a bool lane records the full guarded write sequ
 
     // r1 = table, r2 = key (3), r0 = value (false); `set_index a=1 b=2 c=0` → t[3]=false.
     var regs = [_]Value{ Value.boolean(false), Value.heap(&t.header), Value.int(3) };
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0);
 
     try testing.expect(state.isRecording()); // clean record — no abort
     const ops = state.rec.instrs.items;
@@ -2337,7 +2370,7 @@ test "recArraySet: a bool-lane append (t[len+1]=true) records the guarded grow s
 
     // r1 = table, r2 = key (len+1), r0 = value (true); `set_index a=1 b=2 c=0`.
     var regs = [_]Value{ Value.boolean(true), Value.heap(&t.header), Value.int(append_key) };
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0);
 
     try testing.expect(state.isRecording()); // clean record — the append path, no abort
     const ops = state.rec.instrs.items;
@@ -2395,7 +2428,7 @@ test "recArraySet aborts: non-table, non-int key, OOB, out-of-lane value, .value
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ c.val, c.tab, c.key };
-        state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), RegWindow.of(&regs), &proto, 0);
+        state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0);
         try testing.expect(!state.isRecording());
         try testing.expectEqual(c.why, state.rec.abort_reason.?);
     }
@@ -2421,13 +2454,13 @@ test "recArraySet defers an RMW store (store-sinking) instead of aborting" {
     // r1 = table, r2 = key. First: r0 = t[r2] (a packed read → aload). The recorder's
     // get_index executes against the live table; r0 then logically holds t[3] = true.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.nil() };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
     try testing.expect(state.isRecording()); // the read records cleanly
 
     // Now t[k] = (the value just read), an RMW. The store defers (sinks) rather
     // than aborting: the trace stays live and `pending_store` is armed.
     regs[0] = Value.boolean(true); // r0 = t[3], a boolean
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0);
     try testing.expect(state.isRecording());
     try testing.expectEqual(@as(usize, 1), state.rec.pending_store_count);
     try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.boolean)), state.rec.pending_stores[0].lane_ord);
@@ -2436,7 +2469,7 @@ test "recArraySet defers an RMW store (store-sinking) instead of aborting" {
 
     // A subsequent packed read must abort: the sunk store has to be the LAST array
     // access (else on-trace store-then-read would diverge from tier-0 replay).
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
 }
@@ -2460,12 +2493,12 @@ test "recArraySet sinks a read-steered const store (control channel) instead of 
 
     // r1 = table, r2 = key. r0 = t[r2] (a packed read).
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.boolean(false) };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
     try testing.expect(state.isRecording());
     // Branch on the read (a guard), then store a *constant* false (r3). The store
     // sinks below the branch guard — still recording, store deferred.
-    state.recordInstr(Instr.opABC(.jmp_if_true, 0, 0, 0), RegWindow.of(&regs), &proto, 0);
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.jmp_if_true, 0, 0, 0), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0);
     try testing.expect(state.isRecording());
     try testing.expectEqual(@as(usize, 1), state.rec.pending_store_count);
 }
@@ -2492,8 +2525,8 @@ test "recArraySet sinks multiple RMW stores (Gap C: butterfly shape)" {
         Value.nil(),         Value.heap(&t.header), Value.int(3), Value.int(4),
         Value.boolean(true), Value.nil(),           Value.nil(),  Value.nil(),
     };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0); // r0 = t[3]
-    state.recordInstr(Instr.opABC(.get_index, 4, 1, 3), RegWindow.of(&regs), &proto, 0); // r4 = t[4]
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0); // r0 = t[3]
+    state.recordInstr(Instr.opABC(.get_index, 4, 1, 3), winRO(&regs), &proto, 0); // r4 = t[4]
     try testing.expect(state.isRecording());
 
     // Tier-0 would have loaded the read values into r0/r4; mirror that so the
@@ -2502,8 +2535,8 @@ test "recArraySet sinks multiple RMW stores (Gap C: butterfly shape)" {
     regs[4] = Value.boolean(true); // r4 = t[4]
 
     // Now write both back: t[3] = r0, t[4] = r4. Both defer.
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), RegWindow.of(&regs), &proto, 0);
-    state.recordInstr(Instr.opABC(.set_index, 1, 3, 4), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 3, 4), winRO(&regs), &proto, 0);
     try testing.expect(state.isRecording());
     try testing.expectEqual(@as(usize, 2), state.rec.pending_store_count);
     // Recorded order preserved: store #0 → key 3's aref, store #1 → key 4's aref.
@@ -2529,21 +2562,21 @@ test "recArraySet aborts when sunk stores exceed MAX_PENDING_STORES" {
 
     // r1 = table, r2 = key, r3 = bool value. One read to arm deferral.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.boolean(true) };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
     try testing.expect(state.isRecording());
 
     // MAX_PENDING_STORES deferred stores (distinct in-bounds keys 3..3+MAX-1) record.
     var k: i64 = 3;
     while (k < 3 + @as(i64, MAX_PENDING_STORES)) : (k += 1) {
         regs[2] = Value.int(k);
-        state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), RegWindow.of(&regs), &proto, 0);
+        state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0);
         try testing.expect(state.isRecording());
     }
     try testing.expectEqual(@as(usize, MAX_PENDING_STORES), state.rec.pending_store_count);
 
     // One more store exceeds the cap → abort.
     regs[2] = Value.int(3 + @as(i64, MAX_PENDING_STORES));
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0);
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
 }
@@ -2558,7 +2591,7 @@ test "per-guard PC recording: guard_int aux carries the bytecode PC" {
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
 
     var regs = [_]Value{ Value.nil(), Value.int(10), Value.int(20) };
-    state.recordInstr(Instr.opABC(.add, 0, 1, 2), RegWindow.of(&regs), &proto, 42);
+    state.recordInstr(Instr.opABC(.add, 0, 1, 2), winRO(&regs), &proto, 42);
 
     try testing.expect(state.isRecording());
     const ops = state.rec.instrs.items;
@@ -2584,7 +2617,7 @@ test "per-guard PC recording: guard_true aux carries the branch PC" {
 
     // r0 is truthy (int 1), so jmp_if_false emits guard_true at PC 7.
     var regs = [_]Value{ Value.int(1), Value.nil() };
-    state.recordInstr(Instr.opABC(.jmp_if_false, 0, 0, 0), RegWindow.of(&regs), &proto, 7);
+    state.recordInstr(Instr.opABC(.jmp_if_false, 0, 0, 0), winRO(&regs), &proto, 7);
 
     try testing.expect(state.isRecording());
     const ops = state.rec.instrs.items;
@@ -2657,7 +2690,9 @@ test "tryChainExit: chains to a trace at the guard's exit PC" {
     var regs = [_]Value{ Value.int(0), Value.int(4) };
 
     // Fake a guard failure in Trace A at instr index 1 (the guard_int).
-    const chained = state.tryChainExit(trace_a, 1, &proto, RegWindow.of(&regs));
+    var tr_regs = TestRegs{ .regs = &regs };
+    const chained = state.tryChainExit(trace_a, 1, &proto, tr_regs.view());
+    tr_regs.commit(); // the chained side trace mutated the window — reflect it back
     try testing.expect(chained != null);
     try testing.expectEqual(@as(usize, 3), chained.?); // Trace B ran 3 iters
     try testing.expectEqual(@as(i64, 3), regs[0].asInt()); // r0 carried to 3
@@ -2730,7 +2765,9 @@ test "tryChainExit: an array-guard exit does NOT chain on its lane ordinal" {
 
     var regs = [_]Value{ Value.int(0), Value.int(4) };
     // The guard_lane is at instr index 1. It must NOT chain to the decoy at pc 2.
-    const chained = state.tryChainExit(trace_a, 1, &proto, RegWindow.of(&regs));
+    var tr_regs = TestRegs{ .regs = &regs };
+    const chained = state.tryChainExit(trace_a, 1, &proto, tr_regs.view());
+    tr_regs.commit(); // commit so a (buggy) decoy mutation would surface — keeps the test's teeth
     try testing.expect(chained == null);
     try testing.expectEqual(@as(i64, 0), regs[0].asInt()); // r0 untouched — no decoy ran
 
@@ -2742,7 +2779,7 @@ test "tryChainExit: an array-guard exit does NOT chain on its lane ordinal" {
 test "matchesFingerprint: empty fingerprint always matches" {
     const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     var regs = [_]Value{ Value.int(1), Value.float(3.14), Value.nil() };
-    try testing.expect(t.matchesFingerprint(RegWindow.of(&regs)));
+    try testing.expect(t.matchesFingerprint(winRO(&regs)));
 }
 
 test "nextTraceExcluding: visits each anchor trace once, highest-hit first, then null" {
@@ -2805,7 +2842,7 @@ test "matchesFingerprint: matching types" {
     };
     const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
     var regs = [_]Value{ Value.int(42), Value.float(3.14) };
-    try testing.expect(t.matchesFingerprint(RegWindow.of(&regs)));
+    try testing.expect(t.matchesFingerprint(winRO(&regs)));
 }
 
 test "matchesFingerprint: mismatched int/float" {
@@ -2815,7 +2852,7 @@ test "matchesFingerprint: mismatched int/float" {
     const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
     // Register holds a float, but the trace expects int.
     var regs = [_]Value{Value.float(2.5)};
-    try testing.expect(!t.matchesFingerprint(RegWindow.of(&regs)));
+    try testing.expect(!t.matchesFingerprint(winRO(&regs)));
 }
 
 test "matchesFingerprint: guard_number accepts both int and float" {
@@ -2823,10 +2860,10 @@ test "matchesFingerprint: guard_number accepts both int and float" {
         .{ .slot = 0, .ty = .number },
     };
     const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
-    try testing.expect(t.matchesFingerprint(RegWindow.of(@constCast(&[_]Value{Value.int(1)}))));
-    try testing.expect(t.matchesFingerprint(RegWindow.of(@constCast(&[_]Value{Value.float(1.5)}))));
-    try testing.expect(!t.matchesFingerprint(RegWindow.of(@constCast(&[_]Value{Value.nil()}))));
-    try testing.expect(!t.matchesFingerprint(RegWindow.of(@constCast(&[_]Value{Value.boolean(true)}))));
+    try testing.expect(t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.int(1)}))));
+    try testing.expect(t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.float(1.5)}))));
+    try testing.expect(!t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.nil()}))));
+    try testing.expect(!t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.boolean(true)}))));
 }
 
 test "matchesFingerprint: guard_table" {
@@ -2834,6 +2871,6 @@ test "matchesFingerprint: guard_table" {
         .{ .slot = 0, .ty = .table },
     };
     const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
-    try testing.expect(!t.matchesFingerprint(RegWindow.of(@constCast(&[_]Value{Value.int(1)}))));
-    try testing.expect(!t.matchesFingerprint(RegWindow.of(@constCast(&[_]Value{Value.float(1.0)}))));
+    try testing.expect(!t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.int(1)}))));
+    try testing.expect(!t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.float(1.0)}))));
 }

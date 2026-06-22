@@ -841,8 +841,8 @@ test "tropt E1: hoisting preserves behaviour (optimized ≡ unoptimized over a b
     var regs_o = regs_u;
     var vals_u: [16]Value = undefined;
     var vals_o: [16]Value = undefined;
-    const done_u = irinterp.execute(&unopt, RegWindow.of(&regs_u), &vals_u).completed;
-    const done_o = irinterp.execute(&opted, RegWindow.of(&regs_o), &vals_o).completed;
+    const done_u = irinterp.executeValues(&unopt, &regs_u, &vals_u).completed;
+    const done_o = irinterp.executeValues(&opted, &regs_o, &vals_o).completed;
 
     try testing.expectEqual(@as(usize, 5), done_u);
     try testing.expectEqual(done_u, done_o);

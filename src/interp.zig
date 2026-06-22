@@ -482,9 +482,23 @@ pub const Vm = struct {
     /// The global environment: a table keyed by interned name strings. Free
     /// (non-local) names read and write here; the base library installs here.
     globals: *table.Table,
-    /// Shared register/call stack. Fixed-size and never reallocated (see
-    /// `stack_slots`), so frame windows stay valid across nested calls.
-    stack: []Value,
+    /// Shared register/call stack, **struct-of-arrays** (docs/design/09): the
+    /// `Value.Tag` discriminant lane and the raw 8-byte `Value.payload.bits` lane,
+    /// stored in parallel so the hot tier-0 arms address a 1-byte tag (scale-1)
+    /// and an 8-byte payload (scale-8) with no 16-byte index scaling and no
+    /// 16-byte arithmetic-temporary spill. Both fixed-size and never reallocated
+    /// (see `stack_slots`), so frame windows stay valid across nested calls.
+    /// `tags.len == payloads.len == stack_slots` always.
+    tags: []u8,
+    payloads: []u64,
+    /// A reusable `[]Value` scratch buffer, absolute-indexed exactly like the
+    /// register file, used **only** at the native / `callValue` boundary to
+    /// materialize the contiguous `[]Value` arg/result slices the native ABI
+    /// still speaks (gather operands in, scatter results back). Off the hot
+    /// arithmetic path. Nesting-safe: `callValue` parks nested args at higher
+    /// absolute indices, so a nested native's scratch region is disjoint from its
+    /// caller's — the same disjointness the SoA register file itself relies on.
+    boundary_scratch: []Value,
     /// Current call depth (number of active frames; guarded by `max_call_depth`).
     depth: u32 = 0,
     /// High-water mark of live register slots across all active frames:
@@ -641,7 +655,9 @@ pub const Vm = struct {
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
         var vm = try initBare(gpa);
-        errdefer gpa.free(vm.stack);
+        errdefer gpa.free(vm.tags);
+        errdefer gpa.free(vm.payloads);
+        errdefer gpa.free(vm.boundary_scratch);
         errdefer vm.heap.deinit();
         // The globals table lives on the heap like any other table (id 0), then
         // the base library installs (the `print` native + its interned name).
@@ -691,13 +707,19 @@ pub const Vm = struct {
     /// assign `globals` before using the VM. Only fails on allocation (the stack),
     /// so the narrow error set lets the keyframe restorer keep a tight `RestoreError`.
     pub fn initBare(gpa: std.mem.Allocator) std.mem.Allocator.Error!Vm {
-        const stack = try gpa.alloc(Value, stack_slots);
-        errdefer gpa.free(stack);
+        const tags = try gpa.alloc(u8, stack_slots);
+        errdefer gpa.free(tags);
+        const payloads = try gpa.alloc(u64, stack_slots);
+        errdefer gpa.free(payloads);
+        const boundary_scratch = try gpa.alloc(Value, stack_slots);
+        errdefer gpa.free(boundary_scratch);
         return Vm{
             .gpa = gpa,
             .heap = gc.Heap.init(gpa),
             .globals = undefined,
-            .stack = stack,
+            .tags = tags,
+            .payloads = payloads,
+            .boundary_scratch = boundary_scratch,
             .trace = trace.TraceState.init(gpa),
         };
     }
@@ -716,43 +738,78 @@ pub const Vm = struct {
         }
         self.loaded_chunks.deinit(self.gpa);
         self.heap.deinit();
-        self.gpa.free(self.stack);
+        self.gpa.free(self.tags);
+        self.gpa.free(self.payloads);
+        self.gpa.free(self.boundary_scratch);
     }
 
     // ---- register-file storage seam (SoA flip, docs/design/09) --------------
     // Every per-slot read/write of the register stack goes through these
-    // accessors (absolute index) or a `RegWindow` (frame-relative), so the
-    // Phase 2 flip to `tags`/`payloads` is a change to these bodies, not a sweep
-    // of call sites. Phase 1: trivial passthroughs over the `[]Value` stack —
-    // `inline`, so they compile identically to the bare index they replace.
+    // accessors (absolute index) or a `RegWindow` (frame-relative). Phase 2: the
+    // backing is struct-of-arrays (`tags` + `payloads`); these gather/scatter the
+    // two lanes with raw payload bits (no recanonicalization). `inline`, so the
+    // cold consumers compile to the same two natural-stride loads/stores.
 
-    /// Read the register at absolute stack index `i`.
+    /// Read the register at absolute stack index `i` (gather both lanes).
     pub inline fn regGet(self: *const Vm, i: usize) Value {
-        return self.stack[i];
+        return .{ .tag = @enumFromInt(self.tags[i]), .payload = .{ .bits = self.payloads[i] } };
     }
 
-    /// Write the register at absolute stack index `i`.
+    /// Write the register at absolute stack index `i` (scatter both lanes; raw
+    /// payload bits).
     pub inline fn regSet(self: *Vm, i: usize, v: Value) void {
-        self.stack[i] = v;
+        self.tags[i] = @intFromEnum(v.tag);
+        self.payloads[i] = v.payload.bits;
     }
 
-    /// Total register slots the stack can hold (Phase 2: `payloads.len`). Used by
-    /// the structural bounds checks (`base + nreg > capacity` → StackOverflow).
+    /// Total register slots the stack can hold. Used by the structural bounds
+    /// checks (`base + nreg > capacity` → StackOverflow).
     pub inline fn regCapacity(self: *const Vm) usize {
-        return self.stack.len;
+        return self.payloads.len;
     }
 
-    /// Nil-fill `count` registers starting at absolute index `from` (Phase 2:
-    /// set the tag lane to nil; payloads need not be cleared).
+    /// Nil-fill `count` registers starting at absolute index `from` — set the tag
+    /// lane to nil and zero the payload lane (mirrors `Value.nil()` exactly so a
+    /// gathered slot is byte-identical to the AoS layout).
     pub inline fn fillNil(self: *Vm, from: usize, count: usize) void {
-        @memset(self.stack[from .. from + count], Value.nil());
+        @memset(self.tags[from .. from + count], @intFromEnum(value.Tag.nil));
+        @memset(self.payloads[from .. from + count], 0);
     }
 
     /// A frame-relative window over `count` registers based at absolute `base`
-    /// (`R[slot]` == `stack[base + slot]`). The cold per-frame consumers (trace
-    /// recorder, `irinterp`) take one of these.
+    /// (`R[slot]` == register `base + slot`). The per-frame consumers (the hot
+    /// tier-0 arms, the trace recorder, `irinterp`) take one of these.
     pub inline fn frameWindow(self: *Vm, base: usize, count: usize) RegWindow {
-        return RegWindow.of(self.stack[base .. base + count]);
+        return RegWindow.of(self.tags[base .. base + count], self.payloads[base .. base + count]);
+    }
+
+    // ---- native / callValue boundary scratch --------------------------------
+    // The native ABI (`NativeFn`/`NativeMultiFn`/`callValue`) speaks contiguous
+    // `[]Value` slices, which the SoA register file cannot view directly. These
+    // materialize the slice into `boundary_scratch` (absolute-indexed like the
+    // register file) — gather operands in before the call, scatter results back
+    // after. Cold (a native call is a trace barrier), so the per-element copy is
+    // off the path SoA exists to speed up.
+
+    /// Gather registers `[lo, hi)` into `boundary_scratch` and return that slice
+    /// as a contiguous `[]Value` (read-only operand view for a native).
+    inline fn gatherScratch(self: *Vm, lo: usize, hi: usize) []Value {
+        var i = lo;
+        while (i < hi) : (i += 1) self.boundary_scratch[i] = self.regGet(i);
+        return self.boundary_scratch[lo..hi];
+    }
+
+    /// A writable `boundary_scratch` slice `[lo, hi)` for a native's result `out`
+    /// (write-only; the contents are undefined until the native fills them).
+    inline fn scratchOut(self: *Vm, lo: usize, hi: usize) []Value {
+        return self.boundary_scratch[lo..hi];
+    }
+
+    /// Scatter `boundary_scratch[lo, hi)` back into the register file after a
+    /// native wrote its results there.
+    inline fn scatterScratch(self: *Vm, lo: usize, hi: usize) void {
+        var i = lo;
+        while (i < hi) : (i += 1) self.regSet(i, self.boundary_scratch[i]);
     }
 
     /// Install the built-in globals (the host-effect boundary) from the single
@@ -1343,7 +1400,7 @@ pub const Vm = struct {
                 self.regSet(pbase, callee);
                 for (args, 0..) |v, i| self.regSet(pbase + 1 + i, v);
                 self.stack_top = pbase + need; // root the parked redirect args
-                const n = try self.callValue(handler, self.stack[pbase .. pbase + need], results_out);
+                const n = try self.callValue(handler, self.gatherScratch(pbase, pbase + need), results_out);
                 self.stack_top = pbase; // success only (see note above)
                 return n;
             },
@@ -1510,7 +1567,7 @@ pub const Vm = struct {
         var proto = closure.proto;
         var code = proto.code;
         var base = frame.base;
-        var regs = self.stack[base .. base + proto.num_registers];
+        var regs = self.frameWindow(base, proto.num_registers);
         var pc = frame.pc;
 
         outer: while (true) {
@@ -1587,68 +1644,119 @@ pub const Vm = struct {
             // recording is live (`runFastPath`), and the back-edge handoff below
             // flips to `.full` the instant `onBackEdge` arms a recording, so the
             // very next instruction is mirrored.
-            if (mode == .full and self.trace.isRecording()) self.trace.recordInstr(instr, RegWindow.of(regs), proto, @intCast(pc));
+            if (mode == .full and self.trace.isRecording()) self.trace.recordInstr(instr, regs, proto, @intCast(pc));
             const a: usize = instr.a;
             switch (instr.op) {
-                // ---- loads & moves ----
-                .load_nil => regs[a] = Value.nil(),
-                .load_bool => regs[a] = Value.boolean(instr.b != 0),
-                .load_int => regs[a] = Value.int(instr.aux),
-                .load_const => regs[a] = proto.constants[instr.b],
-                .move => regs[a] = regs[instr.b],
+                // ---- loads & moves ---- (direct lane writes; no `Value` built)
+                .load_nil => regs.setNil(a),
+                .load_bool => regs.setBool(a, instr.b != 0),
+                .load_int => regs.setInt(a, instr.aux),
+                .load_const => regs.set(a, proto.constants[instr.b]),
+                .move => regs.copy(a, instr.b),
 
                 // ---- arithmetic (semantics live in arith.zig) ----
-                // Each op evaluates the raw numeric result eagerly (pure, no
-                // effects); on a `TypeError` (a non-number operand) `arithMeta`
-                // falls back to the `__add`/… metamethod, else propagates
-                // (e.g. `DivisionByZero`). Numbers carry no metatable, so the
-                // common path never touches dispatch.
-                .add => regs[a] = try self.arithMeta(arith.add(regs[instr.b], regs[instr.c]), self.mm.add, regs[instr.b], regs[instr.c]),
-                .sub => regs[a] = try self.arithMeta(arith.sub(regs[instr.b], regs[instr.c]), self.mm.sub, regs[instr.b], regs[instr.c]),
-                .mul => regs[a] = try self.arithMeta(arith.mul(regs[instr.b], regs[instr.c]), self.mm.mul, regs[instr.b], regs[instr.c]),
-                .div => regs[a] = try self.arithMeta(arith.div(regs[instr.b], regs[instr.c]), self.mm.div, regs[instr.b], regs[instr.c]),
-                .idiv => regs[a] = try self.arithMeta(arith.floorDiv(regs[instr.b], regs[instr.c]), self.mm.idiv, regs[instr.b], regs[instr.c]),
-                .mod => regs[a] = try self.arithMeta(arith.mod(regs[instr.b], regs[instr.c]), self.mm.mod, regs[instr.b], regs[instr.c]),
-                .pow => regs[a] = try self.arithMeta(arith.pow(regs[instr.b], regs[instr.c]), self.mm.pow, regs[instr.b], regs[instr.c]),
+                // The hot both-int / both-float cases compute on the raw payload
+                // lanes directly (no 16-byte `Value` materialized — the SoA win);
+                // every other operand mix falls back to the exact `arith.*` +
+                // `arithMeta` path (mixed promotion, `__add`/… metamethod, or a
+                // propagated error like `DivisionByZero`). Numbers carry no
+                // metatable, so the common path never touches dispatch.
+                .add => try self.binNum(regs, a, instr.b, instr.c, .add, self.mm.add),
+                .sub => try self.binNum(regs, a, instr.b, instr.c, .sub, self.mm.sub),
+                .mul => try self.binNum(regs, a, instr.b, instr.c, .mul, self.mm.mul),
+                .div => {
+                    const tb = regs.tagAt(instr.b);
+                    const tc = regs.tagAt(instr.c);
+                    if (tb == .float and tc == .float) {
+                        @setFloatMode(.strict);
+                        regs.setFloat(a, @as(f64, @bitCast(regs.bitsAt(instr.b))) / @as(f64, @bitCast(regs.bitsAt(instr.c))));
+                    } else {
+                        const lhs = regs.get(instr.b);
+                        const rhs = regs.get(instr.c);
+                        regs.set(a, try self.arithMeta(arith.div(lhs, rhs), self.mm.div, lhs, rhs));
+                    }
+                },
+                .idiv => {
+                    const lhs = regs.get(instr.b);
+                    const rhs = regs.get(instr.c);
+                    regs.set(a, try self.arithMeta(arith.floorDiv(lhs, rhs), self.mm.idiv, lhs, rhs));
+                },
+                .mod => {
+                    const lhs = regs.get(instr.b);
+                    const rhs = regs.get(instr.c);
+                    regs.set(a, try self.arithMeta(arith.mod(lhs, rhs), self.mm.mod, lhs, rhs));
+                },
+                .pow => {
+                    const lhs = regs.get(instr.b);
+                    const rhs = regs.get(instr.c);
+                    regs.set(a, try self.arithMeta(arith.pow(lhs, rhs), self.mm.pow, lhs, rhs));
+                },
 
-                // ---- bitwise ----
-                .band => regs[a] = try self.arithMeta(arith.band(regs[instr.b], regs[instr.c]), self.mm.band, regs[instr.b], regs[instr.c]),
-                .bor => regs[a] = try self.arithMeta(arith.bor(regs[instr.b], regs[instr.c]), self.mm.bor, regs[instr.b], regs[instr.c]),
-                .bxor => regs[a] = try self.arithMeta(arith.bxor(regs[instr.b], regs[instr.c]), self.mm.bxor, regs[instr.b], regs[instr.c]),
-                .shl => regs[a] = try self.arithMeta(arith.shl(regs[instr.b], regs[instr.c]), self.mm.shl, regs[instr.b], regs[instr.c]),
-                .shr => regs[a] = try self.arithMeta(arith.shr(regs[instr.b], regs[instr.c]), self.mm.shr, regs[instr.b], regs[instr.c]),
+                // ---- bitwise ---- (both-int fast lane; else `arith.*` + meta)
+                .band => try self.binBit(regs, a, instr.b, instr.c, .band, self.mm.band),
+                .bor => try self.binBit(regs, a, instr.b, instr.c, .bor, self.mm.bor),
+                .bxor => try self.binBit(regs, a, instr.b, instr.c, .bxor, self.mm.bxor),
+                .shl => {
+                    const lhs = regs.get(instr.b);
+                    const rhs = regs.get(instr.c);
+                    regs.set(a, try self.arithMeta(arith.shl(lhs, rhs), self.mm.shl, lhs, rhs));
+                },
+                .shr => {
+                    const lhs = regs.get(instr.b);
+                    const rhs = regs.get(instr.c);
+                    regs.set(a, try self.arithMeta(arith.shr(lhs, rhs), self.mm.shr, lhs, rhs));
+                },
 
                 // ---- unary ----
-                .neg => regs[a] = try self.unArithMeta(arith.neg(regs[instr.b]), self.mm.unm, regs[instr.b]),
-                .not => regs[a] = Value.boolean(!regs[instr.b].isTruthy()),
-                .bnot => regs[a] = try self.unArithMeta(arith.bnot(regs[instr.b]), self.mm.bnot, regs[instr.b]),
+                .neg => {
+                    switch (regs.tagAt(instr.b)) {
+                        .int => regs.setInt(a, 0 -% @as(i64, @bitCast(regs.bitsAt(instr.b)))),
+                        .float => {
+                            @setFloatMode(.strict);
+                            regs.setFloat(a, -@as(f64, @bitCast(regs.bitsAt(instr.b))));
+                        },
+                        else => {
+                            const v = regs.get(instr.b);
+                            regs.set(a, try self.unArithMeta(arith.neg(v), self.mm.unm, v));
+                        },
+                    }
+                },
+                .not => regs.setBool(a, !regs.get(instr.b).isTruthy()),
+                .bnot => {
+                    const v = regs.get(instr.b);
+                    regs.set(a, try self.unArithMeta(arith.bnot(v), self.mm.bnot, v));
+                },
                 // `#t` honours `__len` for tables; strings/raw-length fall through.
-                .len => regs[a] = try self.lenValue(regs[instr.b]),
+                .len => regs.set(a, try self.lenValue(regs.get(instr.b))),
 
                 // ---- concat ---- `__concat` on `TypeError` (a non-concatable
                 // operand); the located fault is preserved when neither has one.
-                .concat => regs[a] = self.concat(regs[instr.b], regs[instr.c]) catch |e| switch (e) {
-                    Error.TypeError => try self.binMeta(self.mm.concat, regs[instr.b], regs[instr.c], Error.TypeError),
-                    else => return e,
+                .concat => {
+                    const lhs = regs.get(instr.b);
+                    const rhs = regs.get(instr.c);
+                    regs.set(a, self.concat(lhs, rhs) catch |e| switch (e) {
+                        Error.TypeError => try self.binMeta(self.mm.concat, lhs, rhs, Error.TypeError),
+                        else => return e,
+                    });
                 },
 
                 // ---- comparisons → boolean register ----
                 // `gt`/`ge` reuse `lt`/`le` with operands swapped (a>b ≡ b<a).
                 // `eq`/`ne` consult `__eq` only for two raw-unequal tables;
                 // `lt`/`le` consult `__lt`/`__le` when not raw-comparable.
-                .eq => regs[a] = Value.boolean(try self.valuesEqual(regs[instr.b], regs[instr.c])),
-                .ne => regs[a] = Value.boolean(!try self.valuesEqual(regs[instr.b], regs[instr.c])),
-                .lt => regs[a] = Value.boolean(try self.compareMeta(.lt, regs[instr.b], regs[instr.c])),
-                .le => regs[a] = Value.boolean(try self.compareMeta(.le, regs[instr.b], regs[instr.c])),
-                .gt => regs[a] = Value.boolean(try self.compareMeta(.lt, regs[instr.c], regs[instr.b])),
-                .ge => regs[a] = Value.boolean(try self.compareMeta(.le, regs[instr.c], regs[instr.b])),
+                .eq => regs.setBool(a, try self.valuesEqual(regs.get(instr.b), regs.get(instr.c))),
+                .ne => regs.setBool(a, !try self.valuesEqual(regs.get(instr.b), regs.get(instr.c))),
+                .lt => regs.setBool(a, try self.compareMeta(.lt, regs.get(instr.b), regs.get(instr.c))),
+                .le => regs.setBool(a, try self.compareMeta(.le, regs.get(instr.b), regs.get(instr.c))),
+                .gt => regs.setBool(a, try self.compareMeta(.lt, regs.get(instr.c), regs.get(instr.b))),
+                .ge => regs.setBool(a, try self.compareMeta(.le, regs.get(instr.c), regs.get(instr.b))),
 
                 // ---- control flow ----
                 .jmp => pc = applyJump(pc, instr.aux),
-                .jmp_if_false => if (!regs[a].isTruthy()) {
+                .jmp_if_false => if (!regs.get(a).isTruthy()) {
                     pc = applyJump(pc, instr.aux);
                 },
-                .jmp_if_true => if (regs[a].isTruthy()) {
+                .jmp_if_true => if (regs.get(a).isTruthy()) {
                     pc = applyJump(pc, instr.aux);
                 },
 
@@ -1657,26 +1765,26 @@ pub const Vm = struct {
                 // step from idx (so the first for_loop re-adds it), then jump to
                 // the matching for_loop test.
                 .for_prep => {
-                    if (!regs[a].isNumber() or !regs[a + 1].isNumber() or !regs[a + 2].isNumber()) {
+                    if (!regs.get(a).isNumber() or !regs.get(a + 1).isNumber() or !regs.get(a + 2).isNumber()) {
                         return Error.TypeError;
                     }
-                    regs[a] = try arith.sub(regs[a], regs[a + 2]);
+                    regs.set(a, try arith.sub(regs.get(a), regs.get(a + 2)));
                     pc = applyJump(pc, instr.aux);
                 },
                 // idx += step; if still within limit (direction by step sign),
                 // publish idx to the loop var R[a+3] and take the back-edge.
                 .for_loop => {
-                    regs[a] = try arith.add(regs[a], regs[a + 2]);
-                    const idx = regs[a];
-                    const limit = regs[a + 1];
-                    const step = regs[a + 2];
+                    regs.set(a, try arith.add(regs.get(a), regs.get(a + 2)));
+                    const idx = regs.get(a);
+                    const limit = regs.get(a + 1);
+                    const step = regs.get(a + 2);
                     const ascending = !(try arith.lt(step, Value.int(0)));
                     const within = if (ascending)
                         try arith.le(idx, limit)
                     else
                         try arith.le(limit, idx);
                     if (within) {
-                        regs[a + 3] = idx;
+                        regs.set(a + 3, idx);
                         pc = applyJump(pc, instr.aux);
                     }
                 },
@@ -1685,8 +1793,8 @@ pub const Vm = struct {
                 // stops only on nil; `false` continues), publishing it as the next
                 // control R[a+2] and taking the back-edge. Else fall through (exit).
                 .tfor_loop => {
-                    if (!regs[a + 3].isNil()) {
-                        regs[a + 2] = regs[a + 3];
+                    if (!regs.get(a + 3).isNil()) {
+                        regs.set(a + 2, regs.get(a + 3));
                         pc = applyJump(pc, instr.aux);
                     }
                 },
@@ -1694,7 +1802,7 @@ pub const Vm = struct {
                 // ---- tables ----
                 .new_table => {
                     const t = try self.heap.newTable();
-                    regs[a] = Value.heap(&t.header);
+                    regs.set(a, Value.heap(&t.header));
                 },
                 .get_index => {
                     // Array fast-path: a table indexed by an in-range integer key
@@ -1706,9 +1814,9 @@ pub const Vm = struct {
                     // key, out-of-range, hash-resident, non-table — falls through
                     // to the unchanged helper, so semantics and determinism are
                     // identical (no allocation on either branch).
-                    const container = regs[instr.b];
-                    const key = regs[instr.c];
-                    regs[a] = blk: {
+                    const container = regs.get(instr.b);
+                    const key = regs.get(instr.c);
+                    regs.set(a, blk: {
                         if (container.isHeap() and container.heapType() == .table and key.isInt()) {
                             const tbl = table.Table.fromHeader(container.asHeap());
                             const i = key.asInt();
@@ -1722,7 +1830,7 @@ pub const Vm = struct {
                             }
                         }
                         break :blk try self.indexGet(container, key);
-                    };
+                    });
                 },
                 .set_index => {
                     // Array fast-path mirror of `.get_index`: an in-bounds integer
@@ -1734,9 +1842,9 @@ pub const Vm = struct {
                     // lane-missing value, append (`i == len+1`), out-of-range,
                     // float/nil/NaN key, or non-table all fall through to the
                     // unchanged `indexSet`, which owns widen/append/hash/delete.
-                    const container = regs[a];
-                    const key = regs[instr.b];
-                    const val = regs[instr.c];
+                    const container = regs.get(a);
+                    const key = regs.get(instr.b);
+                    const val = regs.get(instr.c);
                     fast: {
                         if (container.isHeap() and container.heapType() == .table and key.isInt()) {
                             const tbl = table.Table.fromHeader(container.asHeap());
@@ -1760,29 +1868,31 @@ pub const Vm = struct {
                 },
 
                 // ---- globals ----
-                .get_global => regs[a] = self.globals.get(proto.constants[instr.b]),
+                .get_global => regs.set(a, self.globals.get(proto.constants[instr.b])),
                 .set_global => {
-                    try self.globals.set(self.gpa, proto.constants[instr.b], regs[a]);
-                    self.heap.writeBarrier(&self.globals.header, regs[a]); // no-op until Phase 4
+                    const v = regs.get(a);
+                    try self.globals.set(self.gpa, proto.constants[instr.b], v);
+                    self.heap.writeBarrier(&self.globals.header, v); // no-op until Phase 4
                 },
 
                 // ---- functions ----
                 .closure => {
                     const child = proto.protos[instr.b];
                     const cl = try self.makeClosure(closure, child, base);
-                    regs[a] = Value.heap(&cl.header);
+                    regs.set(a, Value.heap(&cl.header));
                 },
-                .get_upval => regs[a] = self.upvalGet(closure.upvalues[instr.b]),
+                .get_upval => regs.set(a, self.upvalGet(closure.upvalues[instr.b])),
                 .set_upval => {
-                    self.upvalSet(closure.upvalues[instr.b], regs[a]);
-                    self.heap.writeBarrier(&closure.upvalues[instr.b].header, regs[a]); // no-op until generational
+                    const v = regs.get(a);
+                    self.upvalSet(closure.upvalues[instr.b], v);
+                    self.heap.writeBarrier(&closure.upvalues[instr.b].header, v); // no-op until generational
                 },
                 .close_upvalues => self.closeUpvaluesFrom(base + a),
 
                 // ---- calls ---- a Lua call pushes a frame and reloads onto it; a
                 // native runs inline (no frame) as the current frame's top activity.
                 .call => {
-                    const callee = regs[a];
+                    const callee = regs.get(a);
                     if (!callee.isHeap()) return Error.TypeError;
                     // Resolve the argument count. `all_results` (the consumer half
                     // of dynamic multret, e.g. the outer `print` in
@@ -1829,14 +1939,21 @@ pub const Vm = struct {
                             proto = closure.proto;
                             code = proto.code;
                             base = frame.base;
-                            regs = self.stack[base .. base + proto.num_registers];
+                            regs = self.frameWindow(base, proto.num_registers);
                             pc = frame.pc;
                             continue;
                         },
                         .native => {
                             const nat = function.Native.fromHeader(callee.asHeap());
                             const nwanted: usize = instr.c;
-                            const args = self.stack[base + a + 1 .. base + a + 1 + nargs];
+                            // Materialize the args into the absolute-indexed boundary
+                            // scratch so the native ABI keeps speaking `[]Value` after
+                            // the register file split (SoA). The scratch is laid out at
+                            // the same absolute slot indices as the registers, so the
+                            // `out`-aliases-`args` overlap multi natives rely on is
+                            // preserved exactly; nesting is safe because a deeper call
+                            // parks its own args at higher absolute indices.
+                            const args = self.gatherScratch(base + a + 1, base + a + 1 + nargs);
                             // `all` = the caller wants *every* result (dynamic count,
                             // the producer half of `print(unpack(t))` / `return f()`):
                             // results land starting at `regs[a]` and `reg_top` records
@@ -1860,15 +1977,20 @@ pub const Vm = struct {
                                 const result = try performEffect(self, kind, nat, args);
                                 if (all) self.stampSingleResult(base, a, result) else writeSingleResult(regs, a, nwanted, result);
                             } else if (nat.multi != null and (all or nwanted >= 2)) {
-                                const out = if (all) self.stack[base + a ..] else regs[a .. a + nwanted];
+                                // `out` aliases `args` in scratch (same overlap as the
+                                // old stack slices); the native writes results into
+                                // scratch, then we scatter them back into the registers.
+                                const out = if (all) self.scratchOut(base + a, self.regCapacity()) else self.scratchOut(base + a, base + a + nwanted);
                                 const produced = nat.multi.?(@ptrCast(self), args, out) catch |e| return narrowError(e);
                                 if (all) {
                                     std.debug.assert(!self.reg_top_pending);
+                                    self.scatterScratch(base + a, base + a + produced);
                                     self.reg_top = base + a + produced;
                                     self.reg_top_pending = true;
                                 } else {
                                     var k: usize = produced;
-                                    while (k < nwanted) : (k += 1) regs[a + k] = Value.nil();
+                                    while (k < nwanted) : (k += 1) out[k] = Value.nil();
+                                    self.scatterScratch(base + a, base + a + nwanted);
                                 }
                             } else {
                                 const result = nat.func(@ptrCast(self), args) catch |e| return narrowError(e);
@@ -1892,16 +2014,23 @@ pub const Vm = struct {
                             const handler = self.metamethod(callee, self.mm.call);
                             if (handler.isNil()) return Error.TypeError;
                             const nwanted: usize = instr.c;
-                            const call_args = self.stack[base + a .. base + a + 1 + nargs];
+                            // `[callee, args...]` is exactly the handler's argument
+                            // list — gather it into the absolute-indexed scratch (the
+                            // result `out` aliases it, same overlap as the old stack
+                            // slices; `callValue` reads its args before writing out).
+                            const call_args = self.gatherScratch(base + a, base + a + 1 + nargs);
                             if (nwanted == bytecode.all_results) {
-                                const n = try self.callValue(handler, call_args, self.stack[base + a ..]);
+                                const n = try self.callValue(handler, call_args, self.scratchOut(base + a, self.regCapacity()));
                                 std.debug.assert(!self.reg_top_pending);
+                                self.scatterScratch(base + a, base + a + n);
                                 self.reg_top = base + a + n;
                                 self.reg_top_pending = true;
                             } else {
-                                const n = try self.callValue(handler, call_args, regs[a .. a + nwanted]);
+                                const out = self.scratchOut(base + a, base + a + nwanted);
+                                const n = try self.callValue(handler, call_args, out);
                                 var k: usize = n;
-                                while (k < nwanted) : (k += 1) regs[a + k] = Value.nil();
+                                while (k < nwanted) : (k += 1) out[k] = Value.nil();
+                                self.scatterScratch(base + a, base + a + nwanted);
                             }
                         },
                     }
@@ -1966,7 +2095,7 @@ pub const Vm = struct {
                     proto = closure.proto;
                     code = proto.code;
                     base = frame.base;
-                    regs = self.stack[base .. base + proto.num_registers];
+                    regs = self.frameWindow(base, proto.num_registers);
                     pc = frame.pc;
                     self.stack_top = base + proto.num_registers;
                     continue;
@@ -1976,14 +2105,14 @@ pub const Vm = struct {
                 // surplus-arg region lives below `base` (in the caller's window),
                 // stable and GC-rooted; these never relocate it.
                 .vararg_first => {
-                    regs[a] = if (frame.varargs_count >= 1) self.regGet(frame.varargs_base) else Value.nil();
+                    regs.set(a, if (frame.varargs_count >= 1) self.regGet(frame.varargs_base) else Value.nil());
                 },
                 .vararg_len => {
-                    regs[a] = Value.int(@intCast(frame.varargs_count));
+                    regs.set(a, Value.int(@intCast(frame.varargs_count)));
                 },
                 .vararg_get => {
                     // 1-based, bounds-checked; out of range or non-int index → nil.
-                    const idx_v = regs[instr.b];
+                    const idx_v = regs.get(instr.b);
                     var out = Value.nil();
                     if (idx_v.isInt()) {
                         const idx = idx_v.asInt();
@@ -1991,7 +2120,7 @@ pub const Vm = struct {
                             out = self.regGet(frame.varargs_base + @as(usize, @intCast(idx - 1)));
                         }
                     }
-                    regs[a] = out;
+                    regs.set(a, out);
                 },
                 .vararg_spread => {
                     // The dynamic-multret producer half: copy every vararg into
@@ -2027,7 +2156,7 @@ pub const Vm = struct {
                 // Hot traced loops and warming loops keep a 0 slot and always take
                 // the slow path below, so their behaviour is unchanged.
                 if (!self.trace.skipBackEdge(proto, anchor_pc)) {
-                    self.trace.onBackEdge(proto, anchor_pc, RegWindow.of(regs));
+                    self.trace.onBackEdge(proto, anchor_pc, regs);
 
                     // Phase 6 tier-1a entry: if a trace is cached for this loop header
                     // and we're not mid-recording, execute it. `irinterp.execute`
@@ -2043,7 +2172,7 @@ pub const Vm = struct {
                     // runs never gate its profitable long runs. `null` for any
                     // non-`for_loop` back-edge (while/repeat) ⇒ always eligible.
                     const for_trips: ?u64 = if (instr.op == .for_loop)
-                        forRemainingTrips(regs[a], regs[a + 1], regs[a + 2])
+                        forRemainingTrips(regs.get(a), regs.get(a + 1), regs.get(a + 2))
                     else
                         null;
                     const eligible = self.trace.config.execute and !self.trace.isRecording() and
@@ -2107,18 +2236,18 @@ pub const Vm = struct {
                             // that would immediately fail on a guard_int/guard_float
                             // mismatch.  Branch-direction guards (guard_true/false)
                             // aren't fingerprinted — they depend on computed values.
-                            if (!ct.matchesFingerprint(RegWindow.of(regs))) continue;
+                            if (!ct.matchesFingerprint(regs)) continue;
                             any_fingerprint_matched = true;
                             if (self.trace.valuesScratch(ct.instrs.len)) |buf| {
                                 self.trace.entries +%= 1;
                                 const result = if (self.trace.config.record_exec_log) blk: {
-                                    const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, RegWindow.of(regs), buf);
-                                    const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, RegWindow.of(regs), buf);
-                                    break :blk irinterp.executeTraced(rec, ct, RegWindow.of(regs), buf);
+                                    const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, regs, buf);
+                                    const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, regs, buf);
+                                    break :blk irinterp.executeTraced(rec, ct, regs, buf);
                                 } else if (self.trace.config.native_codegen) blk: {
                                     if (self.trace.nativeFor(ct)) |nt| break :blk irinterp.ExecResult{ .completed = nt.run(regs), .exit_instr = std.math.maxInt(u32) };
-                                    break :blk irinterp.execute(ct, RegWindow.of(regs), buf);
-                                } else irinterp.execute(ct, RegWindow.of(regs), buf);
+                                    break :blk irinterp.execute(ct, regs, buf);
+                                } else irinterp.execute(ct, regs, buf);
                                 // Always record the exit instruction — useful for
                                 // per-guard PC debugging even on productive exits.
                                 self.trace.last_exit_instr = result.exit_instr;
@@ -2176,7 +2305,7 @@ pub const Vm = struct {
                                 // it, monotonically), mark it for retirement so its
                                 // anchor slot frees for the stabilised wider-lane
                                 // trace. Deferred to after the walk (see `dead`).
-                                if (ndead < dead.len and self.trace.laneWidenedPast(ct, RegWindow.of(regs))) {
+                                if (ndead < dead.len and self.trace.laneWidenedPast(ct, regs)) {
                                     dead[ndead] = ct;
                                     ndead += 1;
                                 }
@@ -2186,7 +2315,7 @@ pub const Vm = struct {
                                 // PC, look for a side trace there.  This fires
                                 // only after step 4 (side traces) populates the
                                 // cache at non-anchor PCs.
-                                if (self.trace.tryChainExit(ct, result.exit_instr, proto, RegWindow.of(regs))) |_| {
+                                if (self.trace.tryChainExit(ct, result.exit_instr, proto, regs)) |_| {
                                     for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                     continue :outer;
                                 }
@@ -2329,6 +2458,69 @@ pub const Vm = struct {
     /// Wrap a raw binary arithmetic/bitwise result: on `TypeError` (an operand
     /// the operator doesn't accept) fall back to the binary metamethod `name`;
     /// any other arith error (e.g. `DivisionByZero`) propagates unchanged.
+    /// `R[a] = R[b] <op> R[c]` for add/sub/mul, computing the hot both-int and
+    /// both-float cases directly on the raw payload lanes (no `Value` built — the
+    /// SoA spill/scale win), and deferring every other operand mix to the exact
+    /// `arith.*` + `arithMeta` path. Byte-identical to the AoS arms: the int path
+    /// mirrors `Value.int(x +% y)`, the float path mirrors
+    /// `Value.float(x + y)` under `@setFloatMode(.strict)`.
+    inline fn binNum(self: *Vm, regs: RegWindow, a: usize, b: usize, c: usize, comptime op: enum { add, sub, mul }, name: Value) Error!void {
+        const tb = regs.tagAt(b);
+        const tc = regs.tagAt(c);
+        if (tb == .int and tc == .int) {
+            const x: i64 = @bitCast(regs.bitsAt(b));
+            const y: i64 = @bitCast(regs.bitsAt(c));
+            regs.setInt(a, switch (op) {
+                .add => x +% y,
+                .sub => x -% y,
+                .mul => x *% y,
+            });
+        } else if (tb == .float and tc == .float) {
+            @setFloatMode(.strict);
+            const x: f64 = @bitCast(regs.bitsAt(b));
+            const y: f64 = @bitCast(regs.bitsAt(c));
+            regs.setFloat(a, switch (op) {
+                .add => x + y,
+                .sub => x - y,
+                .mul => x * y,
+            });
+        } else {
+            const lhs = regs.get(b);
+            const rhs = regs.get(c);
+            const raw = switch (op) {
+                .add => arith.add(lhs, rhs),
+                .sub => arith.sub(lhs, rhs),
+                .mul => arith.mul(lhs, rhs),
+            };
+            regs.set(a, try self.arithMeta(raw, name, lhs, rhs));
+        }
+    }
+
+    /// `R[a] = R[b] <op> R[c]` for band/bor/bxor. Bitwise ops require integer
+    /// operands, so the only fast lane is both-int (computed directly); anything
+    /// else (a float, a non-number) routes through `arith.*` which raises
+    /// `TypeError` → `__band`/… metamethod, exactly as the AoS arm did.
+    inline fn binBit(self: *Vm, regs: RegWindow, a: usize, b: usize, c: usize, comptime op: enum { band, bor, bxor }, name: Value) Error!void {
+        if (regs.tagAt(b) == .int and regs.tagAt(c) == .int) {
+            const x: i64 = @bitCast(regs.bitsAt(b));
+            const y: i64 = @bitCast(regs.bitsAt(c));
+            regs.setInt(a, switch (op) {
+                .band => x & y,
+                .bor => x | y,
+                .bxor => x ^ y,
+            });
+        } else {
+            const lhs = regs.get(b);
+            const rhs = regs.get(c);
+            const raw = switch (op) {
+                .band => arith.band(lhs, rhs),
+                .bor => arith.bor(lhs, rhs),
+                .bxor => arith.bxor(lhs, rhs),
+            };
+            regs.set(a, try self.arithMeta(raw, name, lhs, rhs));
+        }
+    }
+
     fn arithMeta(self: *Vm, raw: arith.Error!Value, name: Value, a: Value, b: Value) Error!Value {
         return raw catch |e| switch (e) {
             error.TypeError => self.binMeta(name, a, b, Error.TypeError),
@@ -2579,9 +2771,9 @@ pub const Vm = struct {
 /// Place a single native result into the caller's window: the value into the
 /// first wanted slot, `nil` into the rest. Shared by the effect and pure-single
 /// native paths. `nwanted == 0` discards the result (statement-context call).
-fn writeSingleResult(regs: []Value, a: usize, nwanted: usize, result: Value) void {
+fn writeSingleResult(regs: RegWindow, a: usize, nwanted: usize, result: Value) void {
     var k: usize = 0;
-    while (k < nwanted) : (k += 1) regs[a + k] = if (k == 0) result else Value.nil();
+    while (k < nwanted) : (k += 1) regs.set(a + k, if (k == 0) result else Value.nil());
 }
 
 /// Remaining iterations a numeric-`for` will still execute from its current

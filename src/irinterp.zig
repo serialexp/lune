@@ -87,6 +87,37 @@ pub fn executeTraced(rec: *execlog.ExecLogRecorder, t: *const Trace, regs: RegWi
     return executeImpl(true, rec, t, regs, values);
 }
 
+/// Test-only adapters: run `execute`/`executeTraced` over a flat `[]Value` register
+/// file (the shape the unit tests build), splitting it into the SoA tag/payload lanes
+/// the window now requires and scattering the mutated lanes back into `regs` (raw
+/// payload bits, no recanonicalization) so post-run assertions see the writeback.
+/// A small fixed lane buffer avoids threading an allocator through every test.
+pub fn executeValues(t: *const Trace, regs: []Value, values: []Value) ExecResult {
+    var tbuf: [256]u8 = undefined;
+    var pbuf: [256]u64 = undefined;
+    std.debug.assert(regs.len <= tbuf.len);
+    for (regs, 0..) |v, i| {
+        tbuf[i] = @intFromEnum(v.tag);
+        pbuf[i] = v.payload.bits;
+    }
+    const r = execute(t, RegWindow.of(tbuf[0..regs.len], pbuf[0..regs.len]), values);
+    for (regs, 0..) |*v, i| v.* = .{ .tag = @enumFromInt(tbuf[i]), .payload = .{ .bits = pbuf[i] } };
+    return r;
+}
+
+pub fn executeTracedValues(rec: *execlog.ExecLogRecorder, t: *const Trace, regs: []Value, values: []Value) ExecResult {
+    var tbuf: [256]u8 = undefined;
+    var pbuf: [256]u64 = undefined;
+    std.debug.assert(regs.len <= tbuf.len);
+    for (regs, 0..) |v, i| {
+        tbuf[i] = @intFromEnum(v.tag);
+        pbuf[i] = v.payload.bits;
+    }
+    const r = executeTraced(rec, t, RegWindow.of(tbuf[0..regs.len], pbuf[0..regs.len]), values);
+    for (regs, 0..) |*v, i| v.* = .{ .tag = @enumFromInt(tbuf[i]), .payload = .{ .bits = pbuf[i] } };
+    return r;
+}
+
 /// The single executor body, `comptime`-specialized over `record`. With
 /// `record == false` the `rec` calls are not analyzed (Zig folds the comptime `if`),
 /// so `execute` compiles exactly as before — no recorder overhead on the JIT path.
@@ -485,7 +516,7 @@ fn runScan(t: *Table, start: i64) struct { completed: usize, regs: [3]Value } {
     };
     var regs = [3]Value{ Value.heap(&t.header), Value.int(start), Value.nil() };
     var values: [13]Value = undefined;
-    const result = execute(&tr, RegWindow.of(&regs), &values);
+    const result = executeValues(&tr, &regs, &values);
     return .{ .completed = result.completed, .regs = regs };
 }
 
@@ -557,7 +588,7 @@ test "E0 review: a slot-bound φ carrying a HEAP value emits no exec-log value e
 
     var regs = [3]Value{ Value.heap(&t.header), Value.nil(), Value.int(1) };
     var values: [8]Value = undefined;
-    const completed = executeTraced(&rec, &tr, RegWindow.of(&regs), &values).completed;
+    const completed = executeTracedValues(&rec, &tr, &regs, &values).completed;
 
     // Exactly one clean commit (iter 1), then the divide-by-zero side-exit on iter 2.
     try testing.expectEqual(@as(usize, 1), completed);
@@ -586,7 +617,7 @@ test "B2 read path: guard_table side-exits when the slot is not a table" {
     // r0 is an int, not a table → guard_table fails on the first iteration.
     var regs = [3]Value{ Value.int(99), Value.int(1), Value.nil() };
     var values: [13]Value = undefined;
-    try testing.expectEqual(@as(usize, 0), execute(&tr, RegWindow.of(&regs), &values).completed);
+    try testing.expectEqual(@as(usize, 0), executeValues(&tr, &regs, &values).completed);
     try testing.expect(regs[0].asInt() == 99); // untouched
 }
 
@@ -608,7 +639,7 @@ test "per-guard PC: ExecResult.exit_instr points to the failing guard" {
     };
     var regs = [_]Value{ Value.int(1), Value.float(3.14) };
     var values: [5]Value = undefined;
-    const result = execute(&tr, RegWindow.of(&regs), &values);
+    const result = executeValues(&tr, &regs, &values);
     try testing.expectEqual(@as(usize, 0), result.completed);
     // The failing guard is instrs[3] — guard_int on r1
     try testing.expectEqual(@as(u32, 3), result.exit_instr);
@@ -637,7 +668,7 @@ test "per-guard PC: ExecResult.exit_instr on arith error (divide by zero)" {
     };
     var regs = [_]Value{ Value.nil(), Value.nil(), Value.int(1) };
     var values: [7]Value = undefined;
-    const result = execute(&tr, RegWindow.of(&regs), &values);
+    const result = executeValues(&tr, &regs, &values);
     // One clean iteration (r2=1 → 5//1=5), then div-by-zero on iter 2 (r2=0).
     try testing.expectEqual(@as(usize, 1), result.completed);
     // The failing instruction is the idiv at index 2.

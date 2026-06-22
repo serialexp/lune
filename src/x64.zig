@@ -279,6 +279,16 @@ pub const Assembler = struct {
         try self.imm32(v);
     }
 
+    /// `mov byte [base + disp], imm8` — C6 /0 ib. Writes a single tag-lane byte
+    /// (`tags[slot]`) under the SoA register file, without disturbing the three
+    /// adjacent slots a 4-byte `movMemImm32` would clobber.
+    pub fn movByteMemImm(self: *Assembler, base: Reg, disp: i32, v: u8) !void {
+        try self.rex(false, false, false, base.hi());
+        try self.b(0xC6);
+        try self.modrmMem(0, base, disp);
+        try self.b(v);
+    }
+
     /// `movzx dst, src8` — REX.W 0F B6 /r: zero-extend the low byte of `src` into
     /// the full 64-bit `dst` (the mandatory follow-up to `setcc`).
     pub fn movzxRegReg8(self: *Assembler, dst: Reg, src: Reg) !void {

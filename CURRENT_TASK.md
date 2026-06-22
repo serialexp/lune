@@ -87,15 +87,59 @@ handler slice. These become real gather/scatter at the flip.
 
 Perf-neutral by construction: `inline` over `[]Value` compiles identically.
 
+## Phase 2 — atomic flip + hot-arm rewrite + native ABI — DONE, GREEN (uncommitted, awaiting Bart's approval)
+
+The flip itself, folded with the full hot-arm rewrite and the native ABI change, in
+one (uncommitted) change so main never regresses.
+
+- **Storage flip (interp.zig):** `Vm.stack: []Value` → `tags: []u8` + `payloads:
+  []u64`, allocated together at VM init with matching `defer deinit` (Rule Z-4).
+  `stack_top`/`reg_top` stay slot-index counts (untouched).
+- **`src/regwindow.zig`** — `RegWindow` internals now hold `tags: [*]u8 + payloads:
+  [*]u64 + n`. `of(tags, payloads)` + gather/scatter `get`/`set` for cold consumers;
+  direct `tagAt`/`bitsAt`/`setInt`/`setFloat`/`setBool`/`setNil`/`copy` for the hot
+  arms. All payload movement is **raw bits** (`payload.bits`/`@bitCast`) — no
+  float/NaN recanonicalization, so 8-mode bytes stay identical.
+- **Hot arms (interp.zig, ~60–70):** `load_*`, `move`, all arith (`binNum`/`binBit`
+  inline helpers: both-int/both-float fast lanes on raw bits, else `arith.*` +
+  `arithMeta`), `div`, comparisons, jumps, `for_*`/`tfor_loop`, get/set index,
+  globals, closures, upvalues, `new_table`, vararg — read `payloads[b]`/`tags[b]`
+  directly, write `payloads[a]`/`tags[a]`. The `Value` never materializes in arith.
+- **Boundary scratch (interp.zig):** natives keep their `[]Value` ABI via a single
+  absolute-indexed `Vm.boundary_scratch: []Value` materialized on demand
+  (`gatherScratch`/`scratchOut`/`scatterScratch`), nesting-safe (deeper calls park at
+  higher absolute indices). No native signature changes (NativeFn/NativeMultiFn/
+  callValue/`__call`).
+- **GC scan + keyframeser + `upvalGet`/`upvalSet`** iterate the two arrays moving raw
+  payload bits; wire format byte-identical.
+- **Native ABI (nativegen.zig + x64.zig):** `CompiledTrace.run(regs: RegWindow)` →
+  `EntryFn = fn([*]u8, [*]u64) callconv(.c)`; rdi=tags (scale-1 tag check via new
+  `x64.movByteMemImm`/`cmpByteMemImm` — a 1-byte store, since the 4-byte
+  `movMemImm32` would clobber 3 adjacent slots' tags), rsi=payloads (scale-8). rsi
+  reserved out of `ALLOC_ORDER`/`BASE_HOME_ORDER` so the two base pointers never
+  collide. Test adapters: `runNative` (nativegen), `executeValues`/
+  `executeTracedValues` (irinterp), `winRO`/`TestRegs` (trace.zig) split/scatter
+  `[]Value` fixtures across the two lanes.
+
 ## Gate
-`just test` exit 0 (all 8 modes); `just bench` shows no movement (every `cross=ok`;
-the lone `str_manip(ok/ERR)` flag is a LuaJIT-reference error, lune side `ok`,
-pre-existing). Stray untracked files (CURRENT_TASK_E3.md, SESSION_CHANGES.md,
-check_ordinals, bench/results/*.tsv) are NOT mine — left untouched.
+`just test` exit 0 (all 8 modes byte-identical); native JIT smoke-tested int + float
+(`sum(1e6)`=500000500000, `fsum`=1500000, both match tier-0; `--dump-native`
+compiles a 176-byte trace); `just bench` every `cross=ok` (lone `str_manip` flag is
+the pre-existing LuaJIT-reference error, lune side `ok`).
+
+**Perf verification (pure tier-0 arithmetic loop, ReleaseFast, `perf record`):** the
+predicted win is confirmed — `shll $0x4` (16-byte index scaling) is **gone** from the
+hot loop (0 samples); payload access is scale-8 free SIB (`movq (%rcx,%r12,8)` /
+`imulq (%rcx,%r12,8)` / `movq %rax,(%rcx,%rdx,8)`); tag access is scale-1
+(`movzbl (%r10,%r12)`); `vmovapd …(%rbp)` spills collapsed from ~40 % to a single
+1.44 % site. 88.6 % of samples in `execImpl`, as expected.
+
+Stray untracked files (CURRENT_TASK_E3.md, SESSION_CHANGES.md, check_ordinals,
+bench/results/*.tsv) are NOT mine — left untouched.
 
 ## Next
-- Phases 0 + 1 both green, uncommitted. Phase 0 touches GC mark + snapshot
-  ser/restore (determinism-sensitive); Phase 1 is a pure access-seam refactor —
-  Codex + Antigravity review advisable before commit.
-- Phase 2 — the atomic storage flip folded with the hot-arm rewrite + native ABI
-  (the win). Do NOT commit any of this without Bart's explicit approval (Rule #15).
+- Phases 0 + 1 + 2 all green, uncommitted (Phase 0+1 = commit `79402e0`'s successors;
+  Phase 2 on top). The whole stack lands as the atomic SoA change.
+- **Codex + Antigravity review** of the Phase 2 gather/scatter determinism (raw
+  payload bits, no recanonicalization) + the native two-pointer ABI — the next gate.
+- **Do NOT commit any of this without Bart's explicit approval (Rule #15).**

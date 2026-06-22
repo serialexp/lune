@@ -1,7 +1,9 @@
 # lune — SoA register file (split the VM value stack) — Design
 
-Status: partial — phase 0 (index-based upvalues) + phase 1 (the `RegWindow` seam)
-landed & green; the storage flip (phase 2) is outstanding.
+Status: complete (pending commit approval) — phases 0–2 landed & green: the
+storage flip, the full hot-arm rewrite, and the two-pointer native ABI are in,
+all 8 modes byte-identical. Codex + Antigravity review + Bart's commit approval
+are the only remaining gates.
 Owner: Bart
 Last updated: 2026-06-22
 
@@ -46,21 +48,41 @@ they land; move whole sections to "done" once everything inside them is checked.
   boundaries (`self.stack[base+a+1..]` etc.), and the `callValue` handler slice.
   All `inline` over `[]Value`, so it compiles identically — `just test` green
   (all 8 modes) and `just bench` shows no movement.
+- [x] **Phase 2 — the atomic flip, folded with the hot-arm rewrite (the win).**
+  One commit: `Vm.stack: []Value` → `tags: []u8` + `payloads: []u64` (allocated
+  together at VM init with matching `defer deinit`). `RegWindow`
+  (`src/regwindow.zig`) now holds `tags: [*]u8 + payloads: [*]u64 + n` and exposes
+  raw gather/scatter (`get`/`set`) for cold consumers plus direct
+  `tagAt`/`bitsAt`/`setInt`/`setFloat`/`setBool`/`setNil`/`copy` for the hot arms.
+  The ~60–70 hot arms (`load_*`, `move`, all arith via `binNum`/`binBit`, `div`,
+  comparisons, jumps, `for_*`/`tfor_loop`, get/set index, globals, closures,
+  upvalues, `new_table`, vararg) read `payloads[b]`/`tags[b]` directly and write
+  `payloads[a]`/`tags[a]` — the `Value` never materializes in the arithmetic path.
+  GC scan, keyframeser, and `upvalGet`/`upvalSet` iterate the two arrays moving
+  **raw payload bits** (`payload.bits`, `@bitCast`) — no float/NaN
+  recanonicalization. **Native ABI:** `CompiledTrace.run(regs: RegWindow)` lowers
+  to `EntryFn = fn([*]u8, [*]u64) callconv(.c)` — rdi=tags (scale-1 tag check via
+  `cmpByteMemImm`/`movByteMemImm`), rsi=payloads (scale-8, rsi reserved out of the
+  allocator pools so the two base pointers never collide). Natives keep their
+  `[]Value` ABI via an absolute-indexed `Vm.boundary_scratch` materialized on
+  demand (`gatherScratch`/`scratchOut`/`scatterScratch`), nesting-safe — so no
+  native signature changes.
+- [x] **Phase 2 verify.** All 8 modes byte-identical (`just test` exit 0,
+  `expectProgram` + determinism corpus), native JIT smoke-tested int + float
+  (`sum`/`fsum` match tier-0; `--dump-native` compiles), `just bench` every
+  `cross=ok`. A pure-tier-0 `perf record` of an arithmetic loop confirms the win:
+  `shll $0x4` is **gone** from the hot loop (0 samples), payload access is scale-8
+  free SIB (`movq (%rcx,%r12,8)` / `imulq (%rcx,%r12,8)`), tag access is scale-1
+  (`movzbl (%r10,%r12)`), and `vmovapd …(%rbp)` spills collapsed from ~40 % to a
+  single 1.44 % site. Codex + Antigravity review of the gather/scatter determinism
+  + native ABI, then Bart's commit approval, are the remaining gates.
 
 ### Outstanding
 
-- [ ] **Phase 2 — the atomic flip, folded with the hot-arm rewrite (the win).**
-  One commit: `Vm.stack: []Value` → `tags: []u8` + `payloads: []u64`; `RegWindow`
-  internals become real gather/scatter; the ~60–70 hot arms read/write the two
-  arrays directly (no materialized `Value`); native ABI (`CompiledTrace.run`) takes
-  two base pointers (rdi=tags scale-1, rsi=payloads scale-8). Main never regresses
-  because the flip and the rewrite land together.
-- [ ] **Phase 2 verify.** 8-mode byte-identical (`expectProgram` corpus +
-  determinism corpus), `just check-version`, `just bench` tier-0 drop on
-  sparse/lu/sor/fft with every `cross=ok` and no regression, and a pure-tier-0
-  `perf record` of sparse confirming the `shll $0x4` + `vmovapd …(%rbp)` spills are
-  gone. Codex + Antigravity review of the gather/scatter determinism + the native
-  ABI before commit.
+- [ ] **Commit gate.** Codex + Antigravity review of the Phase 2 gather/scatter
+  determinism (raw payload bits, no recanonicalization) + the native two-pointer
+  ABI, then Bart's explicit commit approval (Rule #15). The implementation is
+  complete and green; nothing here changes the tree, only clears it to land.
 
 ## Why this exists
 

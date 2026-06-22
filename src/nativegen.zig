@@ -23,6 +23,7 @@ const value = @import("value.zig");
 const table = @import("table.zig");
 const arr = @import("array.zig");
 const Value = value.Value;
+const RegWindow = @import("regwindow.zig").RegWindow;
 const Trace = trace.Trace;
 
 /// Frozen in-memory layout the lane-aware native array path (Phase B) encodes
@@ -206,18 +207,21 @@ fn laneConsistent(trace_lane: *?i32, aux: i32) bool {
 const Kind = enum { none, int, bool, ptr, aref, float };
 
 /// A compiled trace: an executable page whose entry is
-/// `fn(regs: [*]Value) callconv(.c) usize` — `regs` base in rdi, the cleanly
-/// committed iteration count (`completed`) returned in rax. Semantically identical
-/// to `irinterp.execute(t, RegWindow.of(regs), scratch)`.
+/// `fn(tags: [*]u8, payloads: [*]u64) callconv(.c) usize` — the SoA register file's
+/// two base pointers (tags in rdi, payloads in rsi), the cleanly committed iteration
+/// count (`completed`) returned in rax. Semantically identical to
+/// `irinterp.execute(t, regs, scratch)`.
 pub const CompiledTrace = struct {
     page: ExecPage,
 
-    pub const EntryFn = fn ([*]Value) callconv(.c) usize;
+    pub const EntryFn = fn ([*]u8, [*]u64) callconv(.c) usize;
 
-    /// Run the trace over `regs` (mutated in place at each loop commit, exactly as
-    /// the IR-interpreter does). Returns the committed-iteration count.
-    pub fn run(self: CompiledTrace, regs: []Value) usize {
-        return self.page.entry(EntryFn)(regs.ptr);
+    /// Run the trace over the register file `regs` (mutated in place at each loop
+    /// commit, exactly as the IR-interpreter does). Returns the committed-iteration
+    /// count. The two lanes are passed as the SysV first two args (rdi=tags,
+    /// rsi=payloads); slot addressing is then the free scale-1 / scale-8 forms.
+    pub fn run(self: CompiledTrace, regs: RegWindow) usize {
+        return self.page.entry(EntryFn)(regs.tags, regs.payloads);
     }
 
     pub fn deinit(self: *CompiledTrace) void {
@@ -786,8 +790,8 @@ fn regBit(r: Reg) u16 {
 
 /// Allocatable GPRs, in preference order: caller-saved first (no prologue save), then
 /// callee-saved (push/pop'd). Excludes rax/rcx (scratch), rbx (completed), rsp, rdi
-/// (regs base).
-const ALLOC_ORDER = [_]Reg{ .rdx, .rsi, .r8, .r9, .r10, .r11, .rbp, .r12, .r13, .r14, .r15 };
+/// (tags base), rsi (payloads base — the SoA register file's second lane pointer).
+const ALLOC_ORDER = [_]Reg{ .rdx, .r8, .r9, .r10, .r11, .rbp, .r12, .r13, .r14, .r15 };
 const CALLEE_SAVED_MASK: u16 = regBit(.rbp) | regBit(.r12) | regBit(.r13) | regBit(.r14) | regBit(.r15);
 
 /// Preference order for Phase-2 invariant array-base homes: `ALLOC_ORDER` reversed,
@@ -795,7 +799,7 @@ const CALLEE_SAVED_MASK: u16 = regBit(.rbp) | regBit(.r12) | regBit(.r13) | regB
 /// scan only reaches under register pressure. A low-pressure trace (e.g. nsieve)
 /// therefore hoists its array bases without displacing any hot transient into a
 /// spill; a high-pressure one simply leaves a base un-hoisted (per-iter load).
-const BASE_HOME_ORDER = [_]Reg{ .r15, .r14, .r13, .r12, .rbp, .r11, .r10, .r9, .r8, .rsi, .rdx };
+const BASE_HOME_ORDER = [_]Reg{ .r15, .r14, .r13, .r12, .rbp, .r11, .r10, .r9, .r8, .rdx };
 
 /// Allocatable XMM registers (Phase D float homes/transients). xmm0/xmm1 are the
 /// float scratch pair (the SSE analogue of rax/rcx) — never allocated; xmm2..xmm15
@@ -1790,23 +1794,27 @@ fn emitFloatBinOp(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, ka: 
     }
 }
 
-/// Flush one slot's `Value` into `regs[slot]`: the tag byte (4-byte imm; bytes 1..3 are
-/// non-semantic padding) then the 8 payload bytes. The payload source is a `Place`:
-/// a GP reg / spill cell raw-copies the 8 bytes (int/bool); an XMM home stores the
-/// double with `movsd` (float). rax is the scratch for a spilled payload.
-fn flushSlot(a: *x64.Assembler, base: i32, kind: Kind, payload: Place) !void {
-    const tag: i32 = switch (kind) {
+/// Flush one slot's `Value` into the SoA register file: the 1-byte tag into
+/// `tags[slot]` (rdi, scale-1) and the 8 payload bytes into `payloads[slot]` (rsi,
+/// scale-8). The tag is written with a single-byte store (NOT the old 4-byte
+/// `movMemImm32`, which under SoA would clobber the next three slots' tag bytes).
+/// The payload source is a `Place`: a GP reg / spill cell raw-copies the 8 bytes
+/// (int/bool); an XMM home stores the double with `movsd` (float). rax is the
+/// scratch for a spilled payload.
+fn flushSlot(a: *x64.Assembler, slot: i32, kind: Kind, payload: Place) !void {
+    const tag: u8 = switch (kind) {
         .bool => TAG_BOOL,
         .float => TAG_FLOAT,
         else => TAG_INT,
     };
-    try a.movMemImm32(.rdi, base, tag);
+    const poff: i32 = slot * 8;
+    try a.movByteMemImm(.rdi, slot, tag);
     switch (payload) {
-        .reg => |r| try a.movMemReg(.rdi, base + 8, r),
-        .xmm => |x| try a.movsdMemReg(.rdi, base + 8, x),
+        .reg => |r| try a.movMemReg(.rsi, poff, r),
+        .xmm => |x| try a.movsdMemReg(.rsi, poff, x),
         .mem => |d| {
             try a.movRegMem(.rax, .rsp, d);
-            try a.movMemReg(.rdi, base + 8, .rax);
+            try a.movMemReg(.rsi, poff, .rax);
         },
     }
 }
@@ -1930,7 +1938,8 @@ fn emitTeardown(a: *x64.Assembler, frame: i32, callee: []const Reg) !void {
     try a.ret();
 }
 
-/// Lower a proven trace to machine code (cut-2). ABI: rdi = regs base, rbx = committed
+/// Lower a proven trace to machine code (cut-2). ABI: rdi = tags base, rsi = payloads
+/// base (the SoA register file's two lanes), rbx = committed
 /// counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers across
 /// iterations (loaded + type-guarded once in the prologue); `regs[]` is written only on
 /// a side-exit (the single snapshot) or for write-only slots at the back-edge.
@@ -1975,19 +1984,21 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             .float => TAG_FLOAT,
             else => TAG_INT,
         };
-        try a.cmpByteMemImm(.rdi, @as(i32, s.slot) * 16, tag);
+        // tag lane: `tags[slot]` at rdi+slot (scale-1, free).
+        try a.cmpByteMemImm(.rdi, @as(i32, s.slot), tag);
         try a.jcc(.ne, prologue_fail);
     }
     for (alloc.slots) |s| {
         if (s.class == .write_only) continue;
-        const off: i32 = @as(i32, s.slot) * 16 + 8;
+        // payload lane: `payloads[slot]` at rsi+slot*8 (scale-8, free).
+        const off: i32 = @as(i32, s.slot) * 8;
         switch (slotHomePlace(s)) {
-            .reg => |r| try a.movRegMem(r, .rdi, off),
-            .xmm => |x| try a.movsdRegMem(x, .rdi, off), // float slot: load the double
+            .reg => |r| try a.movRegMem(r, .rsi, off),
+            .xmm => |x| try a.movsdRegMem(x, .rsi, off), // float slot: load the double
             .mem => |d| {
                 // GP/spill raw 8-byte load (int/bool/ptr, and a spilled float — bits
                 // are bits, so a spilled float reuses the raw round-trip).
-                try a.movRegMem(.rax, .rdi, off);
+                try a.movRegMem(.rax, .rsi, off);
                 try a.movMemReg(.rsp, d, .rax);
             },
         }
@@ -2466,10 +2477,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 // shuffle can't clobber a write-only source that aliases a carried home.
                 for (alloc.slots) |s| {
                     if (s.class != .write_only) continue;
-                    const base: i32 = @as(i32, s.slot) * 16;
                     // Commit the value at its store_ref location (the slot has no home).
                     // flushSlot tags by kind (TAG_FLOAT + movsd for a float store).
-                    try flushSlot(a, base, s.kind, placeOfRef(alloc, @intCast(s.store_ref)));
+                    try flushSlot(a, @as(i32, s.slot), s.kind, placeOfRef(alloc, @intCast(s.store_ref)));
                 }
                 // PHI shuffle: carried home(slot) <- store_ref location. A win-2
                 // coalesced slot already updated its home in place (the move would be a
@@ -2539,11 +2549,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     a.bind(deopt_exit);
     for (alloc.slots) |s| {
         if (s.class != .carried) continue;
-        const base: i32 = @as(i32, s.slot) * 16;
         // Re-box the carried home with its kind's tag: int homes write TAG_INT from a
         // GP reg / spill cell; a float home writes TAG_FLOAT + `movsd` from its XMM
         // (a register-homed float can't go through `movMemReg`). flushSlot dispatches.
-        try flushSlot(a, base, s.kind, slotHomePlace(s));
+        try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
     }
     try a.movRegReg(.rax, .rbx);
     try emitTeardown(a, frame, callee[0..callee_len]);
@@ -2561,7 +2570,6 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
 
 const testing = std.testing;
 const irinterp = @import("irinterp.zig");
-const RegWindow = @import("regwindow.zig").RegWindow;
 const I = trace.IrInstr;
 const S = trace.SlotStore;
 
@@ -2576,6 +2584,24 @@ fn expectRegsEqual(expected: []const Value, actual: []const Value) !void {
     }
 }
 
+/// Test-only adapter: split a flat `[]Value` register file into the SoA tag/payload
+/// lanes the native ABI now consumes, run the trace, scatter the mutated lanes back
+/// into `regs`, and return the committed count. Mirrors how `Vm.frameWindow` hands the
+/// two lanes to `CompiledTrace.run` in production (raw payload bits, no recanon).
+fn runNative(ct: CompiledTrace, regs: []Value) !usize {
+    const tags = try testing.allocator.alloc(u8, regs.len);
+    defer testing.allocator.free(tags);
+    const pays = try testing.allocator.alloc(u64, regs.len);
+    defer testing.allocator.free(pays);
+    for (regs, 0..) |v, i| {
+        tags[i] = @intFromEnum(v.tag);
+        pays[i] = v.payload.bits;
+    }
+    const completed = ct.run(RegWindow.of(tags, pays));
+    for (regs, 0..) |*v, i| v.* = .{ .tag = @enumFromInt(tags[i]), .payload = .{ .bits = pays[i] } };
+    return completed;
+}
+
 /// Run `t` through both the IR-interpreter (the oracle) and the native compiler on
 /// identical fresh register files; assert the same `completed` and final `regs`.
 fn expectMatch(t: *const Trace, regs_init: []const Value) !void {
@@ -2584,14 +2610,14 @@ fn expectMatch(t: *const Trace, regs_init: []const Value) !void {
     defer testing.allocator.free(iregs);
     const values = try testing.allocator.alloc(Value, t.instrs.len);
     defer testing.allocator.free(values);
-    const iresult = irinterp.execute(t, RegWindow.of(iregs), values);
+    const iresult = irinterp.executeValues(t, iregs, values);
 
     // Native: must compile (caller picks compilable traces) and match bit-for-bit.
     var ct = compile(testing.allocator, t) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     const nregs = try testing.allocator.dupe(Value, regs_init);
     defer testing.allocator.free(nregs);
-    const ncompleted = ct.run(nregs);
+    const ncompleted = try runNative(ct, nregs);
 
     try testing.expectEqual(iresult.completed, ncompleted);
     try expectRegsEqual(iregs, nregs);
@@ -2684,7 +2710,7 @@ test "nativegen(E2): an internal φ (slot-less carry) matches the oracle and is 
         var regs = [_]Value{ Value.int(0), Value.int(5), Value.int(0) };
         const values = try testing.allocator.alloc(Value, instrs.len);
         defer testing.allocator.free(values);
-        const completed = irinterp.execute(&t, RegWindow.of(&regs), values).completed;
+        const completed = irinterp.executeValues(&t, &regs, values).completed;
         try testing.expectEqual(@as(usize, 5), completed);
         try testing.expectEqual(@as(i64, 5), regs[0].asInt()); // i
         try testing.expectEqual(@as(i64, 5), regs[1].asInt()); // limit
@@ -2736,7 +2762,7 @@ test "nativegen(E2): a FLOAT internal φ (the SR `denom` shape) carries in an XM
         var regs = [_]Value{ Value.int(0), Value.int(4), Value.float(0.0) };
         const values = try testing.allocator.alloc(Value, instrs.len);
         defer testing.allocator.free(values);
-        const completed = irinterp.execute(&t, RegWindow.of(&regs), values).completed;
+        const completed = irinterp.executeValues(&t, &regs, values).completed;
         try testing.expectEqual(@as(usize, 4), completed);
         try testing.expectEqual(@as(i64, 4), regs[0].asInt());
         try testing.expectEqual(@as(f64, 16.0), regs[2].asFloat());
@@ -4018,14 +4044,14 @@ test "nativegen: f64-lane t[k]=C write matches the interpreter" {
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
+    const oresult = irinterp.executeValues(&tr, &oregs, ovals);
 
     const t_n = try buildFloatTable(gpa, K);
     defer t_n.destroy(gpa);
     var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
     var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
-    const ncomp = ct.run(&nregs);
+    const ncomp = try runNative(ct, &nregs);
 
     try testing.expectEqual(oresult.completed, ncomp);
     try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
@@ -4054,18 +4080,18 @@ test "nativegen: f64-lane astore deopt-replay leaves a deterministic heap (idemp
     var r_native = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
     var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
-    _ = ct.run(&r_native);
+    _ = try runNative(ct, &r_native);
     var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
     const vals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(vals);
-    _ = irinterp.execute(&tr, RegWindow.of(&r_replay), vals);
+    _ = irinterp.executeValues(&tr, &r_replay, vals);
 
     const t_once = try buildFloatTable(gpa, K);
     defer t_once.destroy(gpa);
     var r_once = [_]Value{ Value.heap(&t_once.header), Value.int(2) };
     const vals2 = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(vals2);
-    _ = irinterp.execute(&tr, RegWindow.of(&r_once), vals2);
+    _ = irinterp.executeValues(&tr, &r_once, vals2);
 
     try expectTablesEqual(t_replay, t_once, K);
 }
@@ -4160,14 +4186,14 @@ test "nativegen: f64-lane read-modify-write (sunk astore) matches the oracle" {
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
+    const oresult = irinterp.executeValues(&tr, &oregs, ovals);
 
     const t_n = try buildFloatTable(gpa, K);
     defer t_n.destroy(gpa);
     var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
     var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
-    const ncomp = ct.run(&nregs);
+    const ncomp = try runNative(ct, &nregs);
 
     try testing.expectEqual(oresult.completed, ncomp);
     try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
@@ -4237,14 +4263,14 @@ test "nativegen: f64-lane multi-store RMW (two sunk astores) matches the oracle"
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
+    const oresult = irinterp.executeValues(&tr, &oregs, ovals);
 
     const t_n = try buildFloatTable(gpa, K);
     defer t_n.destroy(gpa);
     var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
     var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
-    const ncomp = ct.run(&nregs);
+    const ncomp = try runNative(ct, &nregs);
 
     try testing.expectEqual(oresult.completed, ncomp);
     try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
@@ -4381,14 +4407,14 @@ test "nativegen: bool-lane t[k]=false write matches the interpreter (heap + regs
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
+    const oresult = irinterp.executeValues(&tr, &oregs, ovals);
 
     const t_n = try buildBoolTable(gpa, K);
     defer t_n.destroy(gpa);
     var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
     var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
-    const ncomp = ct.run(&nregs);
+    const ncomp = try runNative(ct, &nregs);
 
     try testing.expectEqual(oresult.completed, ncomp);
     // Only the carried index slot (r1) is comparable — r0 holds each run's distinct
@@ -4421,11 +4447,11 @@ test "nativegen: astore deopt-replay leaves a deterministic heap (idempotent re-
     var r_native = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
     var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
-    _ = ct.run(&r_native);
+    _ = try runNative(ct, &r_native);
     var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
     const vals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(vals);
-    _ = irinterp.execute(&tr, RegWindow.of(&r_replay), vals);
+    _ = irinterp.executeValues(&tr, &r_replay, vals);
 
     // t_once: a single clean oracle pass on a fresh, unrelated table.
     const t_once = try buildBoolTable(gpa, K);
@@ -4433,7 +4459,7 @@ test "nativegen: astore deopt-replay leaves a deterministic heap (idempotent re-
     var r_once = [_]Value{ Value.heap(&t_once.header), Value.int(2) };
     const vals2 = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(vals2);
-    _ = irinterp.execute(&tr, RegWindow.of(&r_once), vals2);
+    _ = irinterp.executeValues(&tr, &r_once, vals2);
 
     // Double-apply (native then tier-0 replay) == single-apply: the write is
     // idempotent, so re-running an iteration after a deopt reproduces the heap.
@@ -4511,14 +4537,14 @@ test "nativegen: int-lane t[k]=C write matches the interpreter (i8/i16/i32/i64)"
         var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
         const ovals = try gpa.alloc(Value, tr.instrs.len);
         defer gpa.free(ovals);
-        const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
+        const oresult = irinterp.executeValues(&tr, &oregs, ovals);
 
         const t_n = try buildIntTable(gpa, K, cfg.bump);
         defer t_n.destroy(gpa);
         var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
         var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
-        const ncomp = ct.run(&nregs);
+        const ncomp = try runNative(ct, &nregs);
 
         try testing.expectEqual(oresult.completed, ncomp);
         try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
@@ -4581,14 +4607,14 @@ test "nativegen: int-lane astore guard_fits side-exits when the value overflows 
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(start) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
+    const oresult = irinterp.executeValues(&tr, &oregs, ovals);
 
     const t_n = try makeT(gpa, K);
     defer t_n.destroy(gpa);
     var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(start) };
     var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
-    const ncomp = ct.run(&nregs);
+    const ncomp = try runNative(ct, &nregs);
 
     try testing.expectEqual(@as(usize, 8), oresult.completed); // k = 120..127 committed, 128 exits
     try testing.expectEqual(oresult.completed, ncomp);
@@ -4663,14 +4689,14 @@ test "nativegen: u8-lane t[k]=C write matches the interpreter (in-range byte)" {
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
+    const oresult = irinterp.executeValues(&tr, &oregs, ovals);
 
     const t_n = try buildByteTable(gpa, K);
     defer t_n.destroy(gpa);
     var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
     var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
-    const ncomp = ct.run(&nregs);
+    const ncomp = try runNative(ct, &nregs);
 
     try testing.expectEqual(oresult.completed, ncomp);
     try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
@@ -4699,14 +4725,14 @@ test "nativegen: u8-lane astore guard_fits side-exits at the [0,255] boundaries 
         var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
         const ovals = try gpa.alloc(Value, tr.instrs.len);
         defer gpa.free(ovals);
-        const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
+        const oresult = irinterp.executeValues(&tr, &oregs, ovals);
 
         const t_n = try buildByteTable(gpa, K);
         defer t_n.destroy(gpa);
         var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
         var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
         defer ct.deinit();
-        const ncomp = ct.run(&nregs);
+        const ncomp = try runNative(ct, &nregs);
 
         try testing.expectEqual(@as(usize, 0), oresult.completed); // guard_fits exits immediately
         try testing.expectEqual(oresult.completed, ncomp);
@@ -4734,18 +4760,18 @@ test "nativegen: int-lane astore deopt-replay leaves a deterministic heap (idemp
     var r_native = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
     var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
-    _ = ct.run(&r_native);
+    _ = try runNative(ct, &r_native);
     var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
     const vals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(vals);
-    _ = irinterp.execute(&tr, RegWindow.of(&r_replay), vals);
+    _ = irinterp.executeValues(&tr, &r_replay, vals);
 
     const t_once = try buildIntTable(gpa, K, 100_000);
     defer t_once.destroy(gpa);
     var r_once = [_]Value{ Value.heap(&t_once.header), Value.int(2) };
     const vals2 = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(vals2);
-    _ = irinterp.execute(&tr, RegWindow.of(&r_once), vals2);
+    _ = irinterp.executeValues(&tr, &r_once, vals2);
 
     try expectTablesEqual(t_replay, t_once, K);
 }
