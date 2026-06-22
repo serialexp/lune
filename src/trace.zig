@@ -1113,15 +1113,19 @@ pub const TraceState = struct {
         //
         // A slot-bound φ's init is implicit (`regs[slot]`, read each entry like the
         // matching `slot_load`), so `a` is 0; `b` is the body def (the update).
-        // Flush a deferred read-modify-write store (store-sinking) at the end of the
-        // body, below every guard (the body guards + `recForLoop`'s continuation
+        // Flush the deferred read-modify-write stores (store-sinking) at the end of
+        // the body, below every guard (the body guards + `recForLoop`'s continuation
         // `guard_true`, all already in the stream) and before the φ writebacks +
-        // `.loop`. Sinking it below all side-exiting ops makes deopt-replay
-        // idempotent: any guard failure leaves the store un-executed, so tier-0
-        // re-runs the whole iteration and stores exactly once. This is exactly where
-        // an inline (non-deferred) `astore` sits — the body — so the φ block stays
-        // contiguous before `.loop`. See `docs/design/07-rmw-store-sinking.md`.
-        if (self.rec.pending_store) |ps| {
+        // `.loop`. Sinking them below all side-exiting ops makes deopt-replay
+        // idempotent: any guard failure leaves *all* of them un-executed, so tier-0
+        // re-runs the whole iteration along the original source path and applies
+        // exactly that path's stores once each. Flushed FRONT-TO-BACK in the recorded
+        // (tier-0 bytecode) order — so two stores that alias the same slot land in the
+        // VM's order and last-writer-wins matches tier-0 (`08-multi-store-sinking.md`).
+        // This is exactly where inline (non-deferred) `astore`s sit — the body — so
+        // the φ block stays contiguous before `.loop`. Gap B (doc 07) was the single
+        // store; Gap C (doc 08) generalizes to an ordered set.
+        for (self.rec.pending_stores[0..self.rec.pending_store_count]) |ps| {
             try self.rec.instrs.append(self.gpa, .{
                 .op = .astore,
                 .a = ps.aref,
@@ -1510,12 +1514,12 @@ pub const TraceState = struct {
     ///   * out-of-bounds or hole at record time → `.bad_type` (this iteration would
     ///     immediately side-exit, so the trace would never pay off).
     fn recArrayGet(self: *TraceState, instr: Instr, regs: []const Value) !void {
-        // A deferred (sunk) store must be the LAST array access in the trace: an
-        // `aload` after it would read the pre-store value on-trace while tier-0's
-        // deopt-replay (store-then-read) reads the post-store value — divergence.
-        // Abort, exactly as the old C1 rule did (no regression). See
-        // `docs/design/07-rmw-store-sinking.md` §3.2.
-        if (self.rec.pending_store != null) return self.abort(.bad_type);
+        // Deferred (sunk) stores must be the LAST array accesses in the trace: an
+        // `aload` after any of them would read the pre-store value on-trace while
+        // tier-0's deopt-replay (store-then-read) reads the post-store value —
+        // divergence. Abort, exactly as the old C1 rule did (no regression). See
+        // `docs/design/08-multi-store-sinking.md` §mechanism (and doc 07 §3.2).
+        if (self.rec.pending_store_count > 0) return self.abort(.bad_type);
         const vtab = regs[instr.b];
         const vkey = regs[instr.c];
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
@@ -1573,12 +1577,13 @@ pub const TraceState = struct {
     ///     control channels with one obviously-sound rule. nsieve's sieve-clearing
     ///     loop is a pure write of `false` (no `aload`), so the rule costs it nothing.
     fn recArraySet(self: *TraceState, instr: Instr, regs: []const Value) !void {
-        // Single deferred store per trace, and it must be the last array access: a
-        // second `astore`/append after a deferred (sunk) store would either be a
-        // second sink (out of scope — multi-store sinking is a follow-on) or a
-        // post-store write whose deopt ordering we do not model. Abort. See
-        // `docs/design/07-rmw-store-sinking.md` §3.2, §4.3.
-        if (self.rec.pending_store != null) return self.abort(.bad_type);
+        // NB (Gap C): unlike the single-store original, a store arriving while other
+        // stores are already deferred is NOT blanket-aborted here. An in-bounds RMW
+        // store appends to `pending_stores` (the in-bounds path below); an *append*
+        // store (which changes `len`) must still abort — handled in the append branch.
+        // The `pending_store_count` checks live at those two sites, not at the top,
+        // because we cannot tell append-vs-in-bounds until we know `idx`/`len` below.
+        // See `docs/design/08-multi-store-sinking.md`.
         const vtab = regs[instr.a];
         const vkey = regs[instr.b];
         const vval = regs[instr.c];
@@ -1615,6 +1620,9 @@ pub const TraceState = struct {
             // Same C1 deopt-replay rule as `astore`: a prior packed-array read could
             // have steered this store's value or occurrence, and re-running the
             // iteration on a side-exit (against the now-longer array) would diverge.
+            // (A non-empty `pending_stores` implies a prior `aload`, so this also
+            // covers "append after a sunk store" — an append changes `len` and is
+            // never deferred; `docs/design/08-multi-store-sinking.md` §soundness.)
             if (self.traceHasArrayLoad()) return self.abort(.bad_type);
             const rval = try self.refOf(instr.c);
             const lane_ord: i32 = @intFromEnum(lane);
@@ -1649,12 +1657,15 @@ pub const TraceState = struct {
         // + guards inline here, but stash the `astore` node and flush it at trace
         // close (`commit`) below every guard — incl. the `for_loop` continuation
         // guard — so every side-exit leaves the store un-executed and replay stores
-        // exactly once. The `pending_store != null` guard at the top of this fn
-        // (and of `recArrayGet`) enforces the store is the LAST array access (single
-        // store, no store-then-read). A pure-write store (no prior `aload`) is
-        // deopt-idempotent on its own and emits inline as before. See
-        // `docs/design/07-rmw-store-sinking.md`.
+        // exactly once. Gap C sinks up to `MAX_PENDING_STORES` such stores (the FFT
+        // butterfly writes four), flushed in recorded order; a trace wanting more
+        // aborts cleanly here. The post-store invariant (no later `aload`/append, in
+        // `recArrayGet` and the append branch) keeps the sunk stores the trace's last
+        // array accesses. A pure-write store (no prior `aload`) is deopt-idempotent on
+        // its own and emits inline as before. See `docs/design/08-multi-store-sinking.md`.
         const defer_store = self.traceHasArrayLoad();
+        if (defer_store and self.rec.pending_store_count >= MAX_PENDING_STORES)
+            return self.abort(.bad_type);
         const rval = try self.refOf(instr.c);
 
         const lane_ord: i32 = @intFromEnum(lane);
@@ -1682,10 +1693,13 @@ pub const TraceState = struct {
         // `guard_bounds`; storing a non-nil value sets the presence bit). The store
         // is effectful and not register-defining, so nothing is `setReg`'d.
         if (defer_store) {
-            // Read-modify-write: stash the store; `commit()` flushes it below every
-            // guard, just before `.loop`. The guards above (table/lane/int/bounds/
-            // fits) stay inline and continue to dominate the sunk store.
-            self.rec.pending_store = .{ .aref = ref, .value = rval, .lane_ord = lane_ord };
+            // Read-modify-write: stash the store; `commit()` flushes it (and any
+            // siblings) below every guard, just before `.loop`, in this recorded
+            // order. The guards above (table/lane/int/bounds/fits) stay inline and
+            // continue to dominate the sunk store. The cap was checked above.
+            self.rec.pending_stores[self.rec.pending_store_count] =
+                .{ .aref = ref, .value = rval, .lane_ord = lane_ord };
+            self.rec.pending_store_count += 1;
         } else {
             _ = try self.emit(.{ .op = .astore, .a = ref, .b = rval, .aux = lane_ord });
         }
@@ -1847,8 +1861,15 @@ fn konstKey(v: Value) KonstKey {
 /// A deferred read-modify-write array store, sunk below every guard at trace
 /// close. `aref`/`value` are IR refs already emitted inline (the address node and
 /// the value to store); `lane_ord` is the packed-array `Lane` ordinal (the
-/// `astore`'s `aux`). See `Recorder.pending_store`.
+/// `astore`'s `aux`). See `Recorder.pending_stores`.
 const PendingStore = struct { aref: Ref, value: Ref, lane_ord: i32 };
+
+/// Maximum number of read-modify-write stores a single trace may sink (Gap C,
+/// `docs/design/08-multi-store-sinking.md`). Caps the simultaneously-live value
+/// registers the store-sinking holds from computation to the trace-close flush —
+/// bounding native XMM/GP pressure. 4 covers the FFT butterfly (`v[i],v[i+1]` and
+/// `v[j],v[j+1]` per iteration) exactly; a trace that wants more aborts cleanly.
+const MAX_PENDING_STORES = 4;
 
 pub const Recorder = struct {
     active: bool = false,
@@ -1883,19 +1904,27 @@ pub const Recorder = struct {
     /// field of guard instructions so the executor can report *which*
     /// guard failed (per-guard PC recording for exit-PC chaining).
     cur_pc: u32 = 0,
-    /// A single deferred (sunk) array store: an in-bounds `astore` that follows an
-    /// `aload` (a read-modify-write). Rather than abort the trace (the old C1
-    /// rule), `recArraySet` records the store's address + guards inline but stashes
-    /// the `astore` node itself here; `commit()` flushes it *after* every guard
-    /// (incl. the `for_loop` continuation guard), just before the `.loop`
-    /// terminator. Sinking it below all side-exits makes deopt-replay idempotent:
-    /// any guard failure leaves the store un-executed, so tier-0 re-runs the whole
-    /// iteration and stores exactly once. See `docs/design/07-rmw-store-sinking.md`.
-    /// While set, *any* further heap-observing op (`aload`/`astore`/append) aborts
-    /// the trace — the store must be the last array access (no store-then-read
-    /// divergence, single store per trace). `null` ⇒ no deferred store (the common
-    /// case: pure-write loops emit inline as before).
-    pending_store: ?PendingStore = null,
+    /// Deferred (sunk) array stores: in-bounds `astore`s that follow an `aload` (a
+    /// read-modify-write). Rather than abort the trace (the old C1 rule),
+    /// `recArraySet` records each store's address + guards inline but stashes the
+    /// `astore` node itself here; `commit()` flushes them — *front-to-back, in the
+    /// recorded (tier-0 bytecode) order* — *after* every guard (incl. the `for_loop`
+    /// continuation guard), just before the `.loop` terminator. Sinking them below
+    /// all side-exits makes deopt-replay idempotent: any guard failure leaves *all*
+    /// of them un-executed, so tier-0 re-runs the iteration along the original source
+    /// path and applies exactly that path's stores once each. Flushing in recorded
+    /// order keeps last-writer-wins identical between the trace and tier-0 even if two
+    /// stores alias. See `docs/design/08-multi-store-sinking.md` (Gap C); doc 07 is
+    /// the single-store original (Gap B).
+    ///
+    /// While `pending_store_count > 0`, any further *read* (`aload`) or *append*
+    /// (`astore_append`) aborts the trace — the sunk stores must be the trace's last
+    /// array accesses (no store-then-read divergence; append changes `len`). A further
+    /// in-bounds RMW `astore` instead *appends* here, up to `MAX_PENDING_STORES`;
+    /// exceeding the cap aborts. `count == 0` ⇒ no deferred store (the common case:
+    /// pure-write loops emit inline as before).
+    pending_stores: [MAX_PENDING_STORES]PendingStore = undefined,
+    pending_store_count: usize = 0,
 
     pub fn deinit(self: *Recorder, gpa: std.mem.Allocator) void {
         self.instrs.deinit(gpa);
@@ -1923,7 +1952,7 @@ pub const Recorder = struct {
         self.anchor = anchor;
         self.abort_reason = null;
         self.locals_watermark = std.math.maxInt(u32);
-        self.pending_store = null;
+        self.pending_store_count = 0;
         self.active = true;
     }
 };
@@ -2398,8 +2427,8 @@ test "recArraySet defers an RMW store (store-sinking) instead of aborting" {
     regs[0] = Value.boolean(true); // r0 = t[3], a boolean
     state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), &regs, &proto, 0);
     try testing.expect(state.isRecording());
-    try testing.expect(state.rec.pending_store != null);
-    try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.boolean)), state.rec.pending_store.?.lane_ord);
+    try testing.expectEqual(@as(usize, 1), state.rec.pending_store_count);
+    try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.boolean)), state.rec.pending_stores[0].lane_ord);
     // The store is deferred — NOT yet in the instruction stream (it lands at commit).
     for (state.rec.instrs.items) |ins| try testing.expect(ins.op != .astore);
 
@@ -2436,7 +2465,85 @@ test "recArraySet sinks a read-steered const store (control channel) instead of 
     state.recordInstr(Instr.opABC(.jmp_if_true, 0, 0, 0), &regs, &proto, 0);
     state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), &regs, &proto, 0);
     try testing.expect(state.isRecording());
-    try testing.expect(state.rec.pending_store != null);
+    try testing.expectEqual(@as(usize, 1), state.rec.pending_store_count);
+}
+
+test "recArraySet sinks multiple RMW stores (Gap C: butterfly shape)" {
+    // All reads precede all stores (the FFT butterfly shape): read t[3], read t[4],
+    // then store t[3], store t[4]. Both stores are RMW (follow reads) → both defer
+    // and sink, so `pending_store_count == 2` and neither `astore` is in the stream
+    // yet (they flush at commit, in this recorded order). Under Gap B's single-store
+    // rule the SECOND store aborted; Gap C records it. See `docs/design/08-...`.
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 8 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // r1 = table, r2 = key 3, r3 = key 4. r0 = t[3], r4 = t[4] (both reads first).
+    var regs = [_]Value{
+        Value.nil(),         Value.heap(&t.header), Value.int(3), Value.int(4),
+        Value.boolean(true), Value.nil(),           Value.nil(),  Value.nil(),
+    };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0); // r0 = t[3]
+    state.recordInstr(Instr.opABC(.get_index, 4, 1, 3), &regs, &proto, 0); // r4 = t[4]
+    try testing.expect(state.isRecording());
+
+    // Tier-0 would have loaded the read values into r0/r4; mirror that so the
+    // RMW stores below carry in-lane (boolean) values, not the initial nils.
+    regs[0] = Value.boolean(true); // r0 = t[3]
+    regs[4] = Value.boolean(true); // r4 = t[4]
+
+    // Now write both back: t[3] = r0, t[4] = r4. Both defer.
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 3, 4), &regs, &proto, 0);
+    try testing.expect(state.isRecording());
+    try testing.expectEqual(@as(usize, 2), state.rec.pending_store_count);
+    // Recorded order preserved: store #0 → key 3's aref, store #1 → key 4's aref.
+    try testing.expect(state.rec.pending_stores[0].aref != state.rec.pending_stores[1].aref);
+    // Neither store is in the stream yet — they flush at commit.
+    for (state.rec.instrs.items) |ins| try testing.expect(ins.op != .astore);
+}
+
+test "recArraySet aborts when sunk stores exceed MAX_PENDING_STORES" {
+    // One read arms deferral; then MAX_PENDING_STORES in-bounds RMW stores defer, and
+    // the next one exceeds the cap and aborts cleanly (no regression — it aborted
+    // under Gap B too, just one store sooner). Guards the bounded buffer.
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // r1 = table, r2 = key, r3 = bool value. One read to arm deferral.
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.boolean(true) };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+    try testing.expect(state.isRecording());
+
+    // MAX_PENDING_STORES deferred stores (distinct in-bounds keys 3..3+MAX-1) record.
+    var k: i64 = 3;
+    while (k < 3 + @as(i64, MAX_PENDING_STORES)) : (k += 1) {
+        regs[2] = Value.int(k);
+        state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), &regs, &proto, 0);
+        try testing.expect(state.isRecording());
+    }
+    try testing.expectEqual(@as(usize, MAX_PENDING_STORES), state.rec.pending_store_count);
+
+    // One more store exceeds the cap → abort.
+    regs[2] = Value.int(3 + @as(i64, MAX_PENDING_STORES));
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), &regs, &proto, 0);
+    try testing.expect(!state.isRecording());
+    try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
 }
 
 test "per-guard PC recording: guard_int aux carries the bytecode PC" {

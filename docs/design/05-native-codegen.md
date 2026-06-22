@@ -421,14 +421,20 @@ all lower natively.
   *any* `aload` existed in the trace (conservative over both data and control
   channels). That blocked every read-modify-write loop. **Store-sinking** now lifts
   the restriction for the common single-store RMW shape: rather than aborting, the
-  recorder *defers* the single `astore` and re-emits it in `commit()` just before the
+  recorder *defers* the `astore`(s) and re-emits them in `commit()` just before the
   `.loop` terminator — i.e. **below every loop-exit guard**. Because no side-exit can
-  occur after the store, deopt never re-runs a half-applied iteration (tier-0 re-runs
-  the side-exiting iteration from the loop header and applies the store exactly once),
-  so the double-apply hazard the rule guarded against cannot arise. The deferral is
-  rejected (still abort) if a *second* heap-observing op (another `aload`/`astore`/
-  `astore_append`) follows the deferred store — the store must be the trace's last
-  array access. nsieve's sieve-clearing loop is pure constant writes (no `aload`), so
+  occur after the store(s), deopt never re-runs a half-applied iteration (tier-0 re-runs
+  the side-exiting iteration from the loop header and applies the store(s) exactly once),
+  so the double-apply hazard the rule guarded against cannot arise. **Gap C (multi-store,
+  doc 08, landed 2026-06-22)** generalizes this to a bounded ordered set of up to
+  `MAX_PENDING_STORES = 4` deferred stores, flushed front-to-back in recorded
+  (bytecode) order below every guard — so the FFT butterfly (4 reads then 4 stores to
+  two indices) records and runs native (scimark-fft t0 993.9 ms → jit 715.7 ms). The
+  deferral is rejected (still abort) if a heap-*reading* op (`aload`) or an
+  `astore_append` follows a deferred store — the stores must be the trace's last array
+  accesses — or if the store count exceeds the cap. A further in-bounds `astore`
+  appends to the pending set instead of aborting (that is the Gap C change).
+  nsieve's sieve-clearing loop is pure constant writes (no `aload`), so
   it never deferred and is unaffected. The real oracle for soundness here is **tier-0
   deopt-replay** (an 8-mode `expectProgram` RMW loop — `interp.zig`) — `expectMatch`
   (regs-only) cannot catch a double-apply because both tiers leave the same partial
@@ -573,8 +579,10 @@ read-modify-write (`vi[k] = vi[k] - eij*vj[k]`), which the recorder's old **C1 r
 aborted (any `astore`-after-`aload` → `.bad_type`). **Gap B** (store-sinking, doc 07)
 unblocked them by deferring the single RMW `astore` below the last loop-exit guard;
 with both landed, scimark-sor went **46.9× → 4.5×** vs LuaJIT and scimark-lu
-**74.5× → 12.4×** (FFT's 4-stores/iter and sparse's indirect gather stay out of
-scope). Gap A is the float-array foundation Gap B builds on.
+**74.5× → 12.4×**. **Gap C** (multi-store, doc 08) then generalized the deferral to a
+bounded ordered set, moving scimark-fft **54.3× → 39.1×** (t0 993.9 ms → jit 715.7 ms;
+the 4-store butterfly now records native). Sparse's indirect gather (`x[col[k]]`)
+stays out of scope. Gap A is the float-array foundation Gaps B and C build on.
 
 ## Out of scope (named follow-ups)
 

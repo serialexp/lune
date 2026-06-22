@@ -1,0 +1,267 @@
+# lune — multi-store sinking (FFT butterfly) — Design
+
+Status: implemented (2026-06-22) — recorder generalized to a bounded ordered store
+set, flushed front-to-back below every guard at trace close; gate green (8-mode
+determinism inherited), scimark-fft moved off 0 % native (t0 993.9 ms → jit 715.7 ms,
+1.39× tier-0 speedup; `cross=ok`). The mandatory constraint both reviewers converged
+on — `commit()` flushes the pending stores **front-to-back in bytecode-execution
+order** (§mechanism, §7.2) — is implemented and Codex's three doc-accuracy tightenings
+are folded in below (recorded order = tier-0 bytecode order; the side-exit invariant
+is "trace applies none, replay applies the source-path's stores"; later store guards
+are sound only because in-bounds `astore` cannot change what they guard). Gap B
+(doc 07, single-store) is the landed prerequisite. Implementation review (Codex +
+Antigravity) pending before Bart's commit approval.
+Owner: Bart
+Last updated: 2026-06-22
+
+Prerequisite reading: `07-rmw-store-sinking.md` (Gap B — single-store sinking, the
+mechanism this generalizes) and `01-trace-lifecycle.md` §"Loop-header re-entry
+deopt" (the deopt model the soundness argument rests on). This doc extends Gap B's
+single deferred `astore` to a **bounded, ordered set** of deferred stores, so loops
+that write several array slots per iteration — the FFT butterfly — record and run
+native.
+
+## Implementation status
+
+Tracking the gap between this design and what's on the main branch.
+Tick items as they land; move whole sections to "done" once everything inside is
+checked.
+
+### Done
+
+- [x] **C1 — recorder: `pending_store` → bounded `pending_stores` list (`trace.zig`).**
+  Replaced the single optional with `pending_stores: [MAX_PENDING_STORES]PendingStore`
+  + `pending_store_count`; `recArraySet` appends each deferred store; `commit()` flushes
+  all front-to-back (recorded bytecode order) below every guard, before the φ writebacks
+  + `.loop`.
+- [x] **C2 — recorder: post-store read guard + capacity cap (`trace.zig`).** Any
+  `aload`/`astore_append` after the first deferred store still aborts (no read after
+  any store — the §3.2 invariant, unchanged; `recArrayGet` checks
+  `pending_store_count > 0`). A second/third *store* now defers instead of aborting, up
+  to `MAX_PENDING_STORES = 4`; exceeding the cap aborts `.bad_type` cleanly.
+- [x] **C3 — consumers handle N sunk stores (`tropt`/`irinterp`/`nativegen`).** Confirmed
+  no change needed: `tropt` already classifies every `astore` as an effectful,
+  never-DCE'd root with no single-store invariant; `irinterp` runs IR positionally;
+  `nativegen` lowers each `astore` independently and the XMM allocator keeps the N
+  result doubles live to the flush (the 2-store nativegen unit + fft `cross=ok` confirm
+  no miscompile under pressure).
+- [x] **C4 — tests.** Recorder units: a 2-store butterfly records with both stores sunk
+  (distinct arefs, no `astore` in-stream pre-commit); a store-then-read still aborts;
+  >cap aborts. Nativegen unit: a 2-store f64 RMW to two distinct indices matches the
+  oracle bit-for-bit. `interp.zig` 8-mode e2e: a two-store butterfly loop
+  byte-identical across all 8 determinism modes (the load-bearing idempotence test).
+- [x] **C5 — measure + docs.** `just bench --filter scimark`: scimark-fft t0 993.9 ms →
+  jit 715.7 ms (1.39× tier-0 speedup; the butterfly now records native, `cross=ok`),
+  jit/lj 54.3× → 39.1×. Remaining LuaJIT gap is structural FFT *coverage* (bit-reversal
+  + non-butterfly work still tier-0), not this mechanism. Docs updated: this doc,
+  `05-native-codegen.md`, `07`'s §6, `TODO.md`.
+- [x] **Open question — `MAX_PENDING_STORES` value.** §7.1. Resolved: **4** (covers the
+  butterfly exactly; bounds XMM live-range pressure). No spilling observed for the
+  butterfly (fft `cross=ok`, real speedup).
+- [x] **Open question — aliasing among the N stores.** §7.2. Resolved: `commit()` flushes
+  front-to-back in recorded order and never reorders, so trace and tier-0 agree on
+  last-writer-wins regardless of aliasing.
+
+### Outstanding
+
+- [ ] **Implementation review.** Codex + Antigravity pass on the landed `trace.zig`
+  recorder change (the determinism-sensitive store-ordering path), then Bart's commit
+  approval (Rule #15).
+
+## Why this exists
+
+Gap B (doc 07) relaxed the C1 rule for the **single-store** RMW shape and moved
+scimark-sor from 46.9× → 4.5× and scimark-lu 74.5× → 12.4× vs LuaJIT. The two
+remaining scimark numbers it left untouched are **scimark-fft (62×)** and
+scimark-sparse (35×). Sparse is an indirect-gather kernel (`x[col[k]]`) and a
+genuinely different problem. **FFT is not** — profiling shows it is blocked by
+exactly one thing: it writes more than one array slot per iteration.
+
+Profiled diagnosis (the project's profile-first rule; `--dump-native` on isolated
+butterfly probes, June 2026):
+
+| probe | shape | result |
+|---|---|---|
+| `bf1` | single-store RMW, one index (`v[i]=v[i]+1`) | **compiles native** (Gap B) |
+| `bf2` | two stores, two indices (`v[j]=…; v[i]=…`) | **no trace — aborts** |
+| `bf4` | full butterfly (4 reads, 4 stores, two indices) | **no trace — aborts** |
+
+The cliff is precisely **1 → 2 stores**: Gap B's `recArraySet` aborts the second
+eligible store via its `pending_store != null` guard (doc 07 §3.2 / §4.3 — single
+store was an explicit scope limit). Everything else FFT's butterfly needs already
+works: two-index addressing (`j = i+dual2`), the loop-variant stride `2*dual2`, and
+multi-*read* (SOR reads 5 slots and compiles). So multi-store deferral is the *only*
+blocker, and it is a direct generalization of the just-landed, twice-reviewed Gap B
+mechanism.
+
+The FFT inner loop (verbatim shape from `bench/luajit/scimark_lib.lua`):
+
+```lua
+for i=a,a+2*(n-dual2),2*dual2 do
+  local j = i+dual2
+  local jr, ji = v[j], v[j+1]               -- 2 reads
+  local dr, di = wr*jr - wi*ji, wr*ji + wi*jr
+  local ir, ii = v[i], v[i+1]               -- 2 reads
+  v[j], v[j+1] = ir - dr, ii - di           -- 2 stores
+  v[i], v[i+1] = ir + dr, ii + di           -- 2 stores
+end
+```
+
+**All four reads precede all four stores.** No `aload` follows any store — the
+shape Gap B's §3.2 invariant already requires. The values stored (`ir,ii,jr,ji` and
+the products) are all derived from pre-store reads, so deferring all four stores to
+the end of the body and flushing them in source order yields byte-identical results.
+
+## Goals
+
+- Record + natively compile loops that perform **2..N** packed-array stores per
+  iteration, where every store follows every read (no read after any store).
+- Preserve Gap B's soundness guarantee exactly: on any side-exit, *none* of the
+  deferred stores have executed on-trace, so tier-0 re-runs the iteration and applies
+  each store exactly once.
+- Keep all 8 determinism modes byte-identical; keep the tier-1a oracle valid.
+- Land behind `zig build test` + 8-mode determinism, reviewed before commit.
+
+## Non-goals (v1)
+
+- **Store-then-read in the same trace.** Still aborts. Needs store→load forwarding
+  (read the pending value, not the heap) — a larger change, unchanged from Gap B.
+- **Unbounded store counts.** A small fixed cap (`MAX_PENDING_STORES`, §7.1) bounds
+  native register pressure; loops above the cap abort cleanly (no regression — they
+  abort today too).
+- **Aliasing-dependent reordering.** We flush in recorded (program) order and never
+  reorder stores relative to each other, so aliasing is a non-issue (§7.2). We do not
+  attempt to coalesce or eliminate stores to the same slot.
+- **`__newindex` / hash-part / `.value`-lane stores.** Unchanged — still abort.
+
+## The mechanism: defer an ordered set, flush all below the last guard
+
+Gap B's insight (doc 07 §3) is unchanged and is what makes this a small change: an
+`astore` is **effectful but not value-producing** — nothing in the trace reads its
+result — so it can be freely sunk *later* in the trace as long as no later
+instruction reads the slot it writes. Gap B sinks one; we sink several.
+
+Concretely, generalize the recorder's single `pending_store: ?PendingStore` to an
+ordered, bounded list `pending_stores: [MAX]PendingStore` (+ count):
+
+- **`recArraySet`** (in-bounds RMW path): when the store follows an `aload` (the
+  deferral condition) it **appends** a `PendingStore{aref, value, lane_ord}` to the
+  list instead of emitting the `astore` inline. The address node (`aref`) and the
+  store's guards (`guard_table`/`guard_lane`/`guard_int`/`guard_bounds`/`guard_fits`)
+  are still emitted inline, exactly as in Gap B — only the `astore` node is deferred.
+  If the list is already at capacity, abort `.bad_type` (clean, no regression).
+- **`commit()`**: before the φ writeback loop and the `.loop` terminator, iterate the
+  pending list **front-to-back** and append one `astore` node per entry. "Recorded
+  order" here means **tier-0 bytecode execution order** — the order the recorder saw
+  the `set_index` ops, which *is* the VM's actual store order (not textual Lua order,
+  though for straight-line code they coincide). The flush must not coalesce, sort,
+  reverse, or group the stores by table/index: appending front-to-back places all N
+  stores below every guard (the body guards + `recForLoop`'s continuation `guard_true`,
+  all already in the stream) and in the VM's store order — so the trace's
+  last-writer-wins matches tier-0's exactly (§7.2).
+- **Post-store invariant (unchanged from Gap B §3.2):** while the pending list is
+  non-empty, any subsequent `aload` (`recArrayGet`) or `astore_append` aborts
+  `.bad_type`. The stores must be the trace's **last array accesses**; no read may
+  observe a stale pre-store value relative to tier-0's store-then-read replay. A
+  further in-bounds `astore` does **not** abort — it appends to the list (that is the
+  whole point of this change) until the cap is hit.
+
+The pure-write fast path (no prior `aload`) is untouched: those stores emit inline
+and pay nothing, exactly as today.
+
+## Soundness summary (what reviewers must check)
+
+For a trace with an ordered set of K deferred `astore`s (1 ≤ K ≤ MAX) flushed, in
+recorded order, immediately before `.loop`:
+
+1. **No side-exiting op is below any store.** All K stores are flushed below every
+   guard; the only ops `commit()` appends after them are `.phi` writebacks and
+   `.loop`, neither of which can side-exit. So *every* side-exit happens with **all K
+   stores un-executed** — there is no partial-application state. The precise invariant
+   (Codex's tightening): on a side-exit the **trace applies none** of the K stores;
+   tier-0 then re-runs the iteration along **the original source path** and applies
+   **exactly the stores that path executes** — once each. For the straight-line
+   butterfly that is all K; for a control-channel shape with a branch *between* source
+   stores (`if c then t[x]=… end; t[y]=…`) it is whichever stores that branch reaches.
+   Either way trace and tier-0 agree, because the trace applied nothing and tier-0
+   runs the real bytecode. This is the crux: with one store it was "the store hasn't
+   run"; with K it is "*none* of the K have run," exactly as clean because the flush is
+   atomic w.r.t. side-exits (no guard sits between any two sunk stores). Covers the
+   data channel (RMW values) and the control channel (read-steered branches), since no
+   read-derived decision sits below any store.
+   - **Why the later stores' guards are still valid (Codex/Antigravity caveat).** With
+     K stores, the inline `guard_bounds`/`guard_lane`/`guard_fits` for store #2..#K are
+     emitted in the body *before* any store executes (the stores all sink below them),
+     yet in source order they sat *after* store #1. This reordering is sound only
+     because an in-bounds `astore` cannot change anything those guards check: it does
+     not touch table identity (`guard_table`), the lane (`guard_lane` — out-of-lane
+     values abort at record time and `guard_fits` runs inline before any store), the
+     length/capacity (`guard_bounds` — `setInLane` leaves `len`/`cap` untouched), or
+     destroy presence (storing nil aborts). `astore_append` is the exception — it
+     changes `len` — so it is **never** deferred and **always** aborts after a pending
+     store (it is the §mechanism post-store invariant, not a sinkable op).
+2. **No heap-observing op follows any store** (enforced reactively, §mechanism). So
+   no on-trace read can observe a stale pre-store value relative to tier-0's replay.
+3. **Order is preserved.** Stores are flushed in recorded (program) order, so if two
+   sunk stores alias the same slot (not the case in the butterfly, where `j=i+dual2`
+   with `dual2≥2` makes the indices distinct, but the recorder need not prove that),
+   the trace and tier-0 agree on which write wins — both apply them in the same order.
+4. **Determinism is inherited, not re-argued.** Each sunk store moves byte-identical
+   bits (Gap A `movsd` ↔ `@bitCast` parity; int/bool lanes settled earlier).
+   Multi-store sinking changes only *when/how-many* stores are emitted, never *what*
+   they write. The tier-1a oracle executes the same reordered IR, so it stays the
+   differential oracle for the native backend.
+
+The net rule replaces Gap B's "defer one store; abort on a second" with: **defer up
+to MAX stores; sink them all, in order, past every guard at trace close; abort on any
+post-store read/append or on exceeding MAX.**
+
+## Phasing
+
+See the Implementation-status checklist above (C1–C5). C1+C2 are the recorder change
+(one file, `trace.zig`); C3 is a read-only confirmation of the three consumers with
+code added only where lowering actually needs it (the likely spot: ensuring N result
+XMMs stay live to the flush point — see §7.3); C4 is the test trio; C5 is
+measure + docs lockstep + review + Bart approval.
+
+## Open questions for review
+
+### 7.1 — `MAX_PENDING_STORES` value
+The butterfly needs exactly 4. A cap of 4 covers it while bounding the worst-case
+live-range pressure on the XMM allocator (4 simultaneously-live result values held
+from their computation to the flush). Higher caps risk spilling. Recommendation:
+**4**, revisit only if a real kernel needs more. Confirm in review.
+
+### 7.2 — aliasing among the N stores
+If two deferred stores target the same slot, the result depends on store order. We
+flush in recorded order and never reorder, so trace and tier-0 agree. The butterfly's
+indices are provably distinct (`j=i+dual2`, `dual2≥2`), but **we deliberately do not
+rely on that** — order preservation makes aliasing irrelevant to correctness. Confirm
+the flush loop iterates the pending list front-to-back (source order), not reversed.
+
+### 7.3 — native XMM liveness across N stores (the one real codegen risk)
+Gap B extended a single value XMM's live range to the flush point; liveness handled
+it automatically. With K stores, K result XMMs must stay live from their computation
+through the `for_loop` int compare to the flush. The `for_loop` compare uses GP/int
+registers (disjoint class), so it cannot clobber them — but K=4 simultaneously-live
+doubles plus the loop's other float temps could exceed the XMM budget and force a
+spill. Spilling is *correct* (just slower), but a reviewer should confirm: (a) the
+allocator spills rather than miscompiles under pressure, and (b) K=4 actually fits
+for the butterfly without pathological spilling. If it spills badly, that caps the
+real-world win and argues for a lower MAX or a store-scheduling tweak — measure in C5.
+
+### 7.4 — does any guard get emitted after `commit()` begins?
+Same assumption as Gap B (doc 07 §7.2), now load-bearing for K stores: `recForLoop`'s
+`guard_true` is the last guard, and `commit()` runs strictly after it. Confirm no path
+emits a guard between the first pending-store flush and the `.loop` marker. (φ
+writebacks are not guards and never side-exit, so their order relative to the stores
+is immaterial — but the stores must all precede them to keep the body contiguous.)
+
+## References
+
+- `07-rmw-store-sinking.md` — Gap B, the single-store mechanism this generalizes.
+- `05-native-codegen.md` §Phase B (C1/C2 invariants), §Phase D Gap A (f64 array lane).
+- `01-trace-lifecycle.md` §"Loop-header re-entry deopt" — the deopt model.
+- `bench/luajit/scimark_lib.lua` — the FFT butterfly source.
+- `src/trace.zig` — `recArraySet`, `recArrayGet`, `commit`, `PendingStore`,
+  `Recorder.pending_store` (the Gap B field this change generalizes).

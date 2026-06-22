@@ -1,78 +1,64 @@
-# CURRENT TASK — float codegen Gap B (RMW store-sinking, relaxing C1)
+# CURRENT TASK — tier-0 array decode/encode fast path (Gap T0-array)
 
 Governing arc: chase Lua compatibility so lune is usable, THEN optimize toward
-LuaJIT parity (1× everywhere is the bar; determinism/replay must cost 0 perf).
+LuaJIT parity. After the JIT-coverage arc (Gap A/B/C), we pivoted to the tier-0
+interpreter — the denominator under every benchmark, including the ones the JIT can't
+trace.
 
-## Gap A — COMMITTED (`b64fd01`)
-Native f64 array-lane lowering (Phase D Gap A). Pure read reductions / fills over
-float arrays now run native. See doc 05 §Phase D Gap A + TODO.md. Done & landed.
+## Profile-first finding (decisive)
+Pure tier-0 `perf record` (no `--trace`, ReleaseFast) of the array-heavy scimark
+kernels overturned both hypotheses (Bart guessed dispatch):
+- **Dispatch `jmp` = 0.46%** (confirms the old T2 threaded-dispatch skip was right).
+- **`array.ArrayPart.decode` = 54.8% of scimark-sparse, 11% of fft** — an *out-of-line
+  call per element* across the interp.zig→array.zig module boundary.
+- The rest of fft's `execImpl` is inherent **16-byte `Value` shuffling** (`vmovapd`
+  stack spills + `×16` offsets). **NaN-boxing is OFF THE TABLE** (Value's explicit
+  `payload.bits` layout is foundational to determinism+replay). So we cut cost *around*
+  the Value, not the Value.
 
-## Gap B — IMPLEMENTED (uncommitted, awaiting Bart's commit approval)
+## Change — IMPLEMENTED (uncommitted, awaiting Bart's commit approval)
+All in **src/array.zig**:
+1. Marked `get`, `setInLane`, `decode`, `encode` **`inline`** so the read/write chain
+   folds into `execImpl` — the loop-invariant lane `switch` hoists and the per-element
+   call vanishes. (decode went from a 55% standalone symbol to fully inlined; sparse
+   `perf` now shows execImpl 98%, no separate decode.)
+2. Removed a gratuitous `@memcpy`-into-stack-buffer round-trip in `readInt`/`writeInt`
+   — pass the `*const [n]u8` slice straight to `std.mem.readInt(.little)`. Byte-for-byte
+   identical (same function minus the dead copy); this alone was ~0% (the memcpy was
+   already LLVM-elided) but it's a clean simplification kept in the same change.
 
-Relaxes the recorder's **C1 rule** so single-store read-modify-write float loops
-(scimark SOR/LU) can record and run native. Design doc: `docs/design/07-rmw-store-sinking.md`.
+Nothing else changed — recorder, oracle (irinterp), serializer (keyframeser), native
+(nativegen, which uses raw loads, not these fns) all untouched.
 
-### Mechanism (store-sinking)
-The recorder used to abort (`.bad_type`) any trace with an `astore` after any `aload`,
-because lune's coarse deopt re-runs a whole iteration from the loop header → a
-store-after-read could double-apply. Now: instead of aborting, the recorder **defers
-the single `astore`** and re-emits it in `commit()` **just before the `.loop`
-terminator** — i.e. below every loop-exit guard (including `recForLoop`'s back-edge
-`guard_true`). On any side-exit the sunk store has NOT executed inside the trace, so
-tier-0 re-runs the side-exiting iteration from bytecode and applies the store exactly
-once → idempotent. Closes both the data channel (RMW value) and control channel
-(read-steered branch), since no read-derived decision sits below the store. SSA
-guarantees the sunk store still addresses `v[x]` (the `aref` captured the pre-increment
-key ref).
+## Measure (`just bench`, ReleaseFast, all `cross=ok` = 8-mode byte-identical)
+Tier-0 (t0 ms) before → after:
+- scimark-sparse: 866 → **770** (~11%)
+- scimark-lu:     1162 → **1019** (~12%)
+- scimark-sor:    953 → **871** (~9%)
+- scimark-fft:    994 → **911** (~8%)
+Other benches flat (not decode-bound). No regressions; every `cross=ok`.
 
-### Constraint (enforced)
-Exactly one deferred store, and it must be the trace's **last** array access: a second
-heap-observing op (`aload`/`astore`/`astore_append`) after the deferral aborts. Pure
-constant fills (no aload, e.g. nsieve clearing) never defer → unaffected.
+## Gate / reviews
+`zig build test` exit 0; `just check-version` exit 0. Full `just bench` all `cross=ok`
+(the recipe's exit 1 is a pre-existing `str_manip` *LuaJIT-parity* flag — `luajit=ERR`,
+not a lune determinism issue, and unrelated to this array change). Reviewed by Codex +
+Antigravity — both confirmed sound, no findings (readInt change byte-identical incl. f64
+NaN payload bits; `inline` is codegen-only, no semantic/oracle/serializer effect).
 
-### Changes (all in `src/trace.zig`)
-- `PendingStore` struct + `pending_store: ?PendingStore` field on `Recorder` (+ reset).
-- In-bounds astore path: if the trace has a prior aload, stash into `pending_store`
-  instead of emitting the `astore` (and instead of the old C1 abort).
-- `recArrayGet` / `recArraySet`: abort if `pending_store != null` (B2 — store is last).
-- `commit()`: flush the pending astore before the φ loop, then `.loop`.
-
-### Tests (green)
-- trace.zig recorder units: RMW store deferral (data channel) + read-steered const
-  store (control channel) → both now continue recording with `pending_store` set;
-  a subsequent get_index aborts.
-- nativegen.zig unit: f64-lane RMW with the astore SUNK after the increment matches
-  the tier-1a oracle bit-for-bit.
-- interp.zig e2e: `t[i]=t[i]+1.0` RMW loop **byte-identical across all 8 determinism
-  modes** (the load-bearing deopt-idempotence test). `--dump-native` confirms the
-  `movsd [rax],xmm0` + presence `bts` land at the very bottom of the trace, below
-  every guard, before the loop-back `jmp`.
-
-### Measure (`just bench --filter scimark`, ReleaseFast, cross ok = 8-mode identical)
-- scimark-sor: t0/lj 46.9× → **jit/lj 4.5×** (10.5× JIT speedup over tier-0)
-- scimark-lu:  t0/lj 74.5× → **jit/lj 12.4×** (6×)
-- scimark-fft (4 stores/iter) and scimark-sparse (indirect `x[col[k]]` gather) stay
-  ~35–62× — out of scope (multi-store deferral / non-RMW gather are named follow-ons).
-
-### Gate / docs
-`just test` green; `just check-version` green. Docs lockstep done: doc 07 status →
-implemented, doc 05 §C1 invariant + Gap A closing note, TODO.md Gap B section.
-
-### Reviews
-Design reviewed pre-implementation (Codex + Antigravity both sound). **Implementation
-review: pending** (final Codex + Antigravity pass on the landed trace.zig change), then
-Bart's commit approval (Rule #15 — do NOT commit without explicit instruction).
-
-### Suggested commit (Preference #2 conventional commits)
-`feat(jit): sink RMW array stores below loop-exit guards (Gap B, relax C1)`
-Files: src/trace.zig, src/nativegen.zig, src/interp.zig,
-docs/design/07-rmw-store-sinking.md, docs/design/05-native-codegen.md, TODO.md,
-CURRENT_TASK.md.
+## Suggested commit (Preference #2 conventional commits)
+`perf(interp): inline tier-0 array decode/encode into the hot opcode arms`
+Files: src/array.zig, TODO.md, CURRENT_TASK.md.
 Stray untracked files (CURRENT_TASK_E3.md, SESSION_CHANGES.md, check_ordinals,
-bench/results/*.tsv) are NOT mine — leave them.
+bench/results/*.tsv) are NOT mine — leave them. Also untracked from the prior session:
+docs/design/08-multi-store-sinking.md (Gap C — separate, already-approved commit).
 
-## Follow-ons (not Gap B)
-- Multi-store deferral (FFT: 4 stores/iter) — sink an ordered set of last stores.
-- Sparse gather (`x[col[k]]`) — indirect index, not a same-index RMW; different work.
-- Native follow-up #4c (scalar carried-register home coalescing) — still open, distinct
-  mechanism from array store-sinking.
+## Why no design doc
+This is a contained 2-part micro-opt (inline hints + dead-memcpy removal) in one file,
+not a subsystem — noted in TODO.md's perf section instead.
+
+## Follow-ons (not this change)
+- The inherent 16-byte `Value` register-file shuffling in `execImpl` — not addressable
+  without changing the Value rep (forbidden).
+- Faster tier-0 for the genuinely-interpreted remainder beyond array access — the next
+  profile would need to target the post-inline execImpl hot instructions.
+- Sparse's indirect `x[col[k]]` gather JIT coverage — distinct mechanism, still open.

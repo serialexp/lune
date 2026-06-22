@@ -202,7 +202,12 @@ pub const ArrayPart = extern struct {
 
     /// `t[i]` for `1 <= i <= len`. Returns the logical `Value` (or `nil` for a
     /// hole). Caller guarantees the index is in range.
-    pub fn get(self: *const ArrayPart, i: usize) Value {
+    // `inline`: the tier-0 interpreter reads `t[i]` through this on its hottest path
+    // (`.get_index` arm, interp.zig). Across the interp.zig→array.zig module boundary
+    // LLVM was leaving `get`→`decode` out-of-line (the profile showed `decode` as ~55%
+    // of scimark-sparse / ~11% of fft, a *call per element*). Forcing the chain inline
+    // lets the loop-invariant lane `switch` hoist and kills the call overhead.
+    pub inline fn get(self: *const ArrayPart, i: usize) Value {
         std.debug.assert(i >= 1 and i <= self.len);
         return self.decode(i - 1);
     }
@@ -224,7 +229,10 @@ pub const ArrayPart = extern struct {
     /// only emits an `astore` for an in-bounds, in-lane value, so `irinterp` can
     /// reproduce the native store byte-for-byte without an allocator. Asserts the
     /// fit so a recorder bug trips in debug rather than silently truncating.
-    pub fn setInLane(self: *ArrayPart, i: usize, val: Value) void {
+    // `inline`: mirror of `get` for the `.set_index` hot path (and the tier-1a oracle's
+    // `astore`). Folds `setInLane`→`encode` into the caller so the store is a direct
+    // packed write, not a cross-module call.
+    pub inline fn setInLane(self: *ArrayPart, i: usize, val: Value) void {
         std.debug.assert(i >= 1 and i <= self.len);
         std.debug.assert(self.fits(val));
         self.encode(i - 1, val);
@@ -508,7 +516,9 @@ pub const ArrayPart = extern struct {
     }
 
     /// Decode packed slot `idx` (0-based) into a logical `Value`.
-    fn decode(self: *const ArrayPart, idx: usize) Value {
+    /// `inline`: folds into `get`/the `.get_index` opcode arm so the loop-invariant lane
+    /// `switch` hoists out of the hot read loop (was ~55% of scimark-sparse as a call).
+    inline fn decode(self: *const ArrayPart, idx: usize) Value {
         switch (self.lane) {
             .value => return self.valueSlot(idx).*,
             // Boolean: one in-band byte. 0 ⇒ absent (hole); 1 ⇒ false, 2 ⇒ true.
@@ -535,7 +545,9 @@ pub const ArrayPart = extern struct {
 
     /// Encode logical `val` into packed slot `idx` (0-based). Assumes `val` fits
     /// the current lane (caller widens otherwise). `nil` clears presence.
-    fn encode(self: *ArrayPart, idx: usize, val: Value) void {
+    /// `inline`: mirror of `decode` for the store path (`setInLane`/`appendInCap`/the
+    /// `.set_index` arm and the tier-1a oracle).
+    inline fn encode(self: *ArrayPart, idx: usize, val: Value) void {
         switch (self.lane) {
             .value => self.valueSlot(idx).* = val,
             // Boolean: one in-band byte. nil ⇒ 0 (hole); false ⇒ 1, true ⇒ 2
@@ -563,17 +575,22 @@ pub const ArrayPart = extern struct {
         }
     }
 
+    // The packed `data` buffer is `align(@alignOf(Value))` (16-byte) allocated, so an
+    // element at byte offset `idx*n` is `n`-aligned — but we don't even need to assert
+    // that: `std.mem.readInt`/`writeInt` take an array-pointer slice (`*[n]u8`, align 1)
+    // and `@bitCast` it, which the backend lowers to a single (here naturally-aligned)
+    // `mov`/`movsd`. We pass the slice straight through instead of `@memcpy`-ing into a
+    // stack buffer first (the old code's per-element copy showed up as ~55% of
+    // scimark-sparse / ~11% of scimark-fft in the tier-0 profile). Output is bit-for-bit
+    // identical to the buffered version — same `.little`, same bytes — so 8-mode
+    // determinism + replay are unaffected (the explicit endian keeps it host-portable).
     fn readInt(comptime T: type, d: [*]const u8, idx: usize) T {
         const n = @sizeOf(T);
-        var buf: [n]u8 = undefined;
-        @memcpy(&buf, d[idx * n ..][0..n]);
-        return std.mem.readInt(T, &buf, .little);
+        return std.mem.readInt(T, d[idx * n ..][0..n], .little);
     }
     fn writeInt(comptime T: type, d: [*]u8, idx: usize, v: T) void {
         const n = @sizeOf(T);
-        var buf: [n]u8 = undefined;
-        std.mem.writeInt(T, &buf, v, .little);
-        @memcpy(d[idx * n ..][0..n], &buf);
+        std.mem.writeInt(T, d[idx * n ..][0..n], v, .little);
     }
 
     // ---- allocation / growth / lane conversion ----

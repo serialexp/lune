@@ -4179,6 +4179,86 @@ test "nativegen: f64-lane read-modify-write (sunk astore) matches the oracle" {
     }
 }
 
+test "nativegen: f64-lane multi-store RMW (two sunk astores) matches the oracle" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // Gap C (doc 08): the butterfly shape — two RMW stores to two distinct indices per
+    // iteration. `while (k, k+1 in array) { a[k]=a[k]*C1; a[k+1]=a[k+1]*C2; k+=2 }`.
+    // Both reads (`aload` of a[k] and a[k+1]) precede both stores; the two `astore`s
+    // are SUNK to the end of the body (after the k+=2 increment, before the φ/`.loop`),
+    // in recorded order — exactly as `commit()` flushes `pending_stores`. The native
+    // backend must lower both sunk stores and agree with the tier-1a oracle bit-for-bit
+    // on the doubly-mutated heap and the carried index. Termination: the k=K iteration
+    // reads a[K] then a[K+1]; `guard_present` on a[K+1] fails (past the dense run) and
+    // side-exits BEFORE either sunk store — so that iteration writes nothing in either
+    // tier. C1=2.0, C2=3.0 are exactly representable.
+    const gpa = testing.allocator;
+    const K: i64 = 40;
+    const C1: f64 = 2.0;
+    const C2: f64 = 3.0;
+    const lane: i32 = @intFromEnum(arr.Lane.f64);
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: k
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5: &a[k]
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .guard_present, .a = 5 }, // 7
+        .{ .op = .aload, .a = 5, .aux = lane }, // 8: a[k]
+        .{ .op = .konst, .aux = 1 }, // 9: 1 (int)
+        .{ .op = .add, .a = 3, .b = 9 }, // 10: k+1 (int key)
+        .{ .op = .aref, .a = 0, .b = 10, .aux = lane }, // 11: &a[k+1]
+        .{ .op = .guard_bounds, .a = 11 }, // 12
+        .{ .op = .guard_present, .a = 11 }, // 13
+        .{ .op = .aload, .a = 11, .aux = lane }, // 14: a[k+1]
+        .{ .op = .konst, .aux = 2 }, // 15: C1 (float)
+        .{ .op = .mul, .a = 8, .b = 15, .ty = .float }, // 16: a[k]*C1
+        .{ .op = .konst, .aux = 3 }, // 17: C2 (float)
+        .{ .op = .mul, .a = 14, .b = 17, .ty = .float }, // 18: a[k+1]*C2
+        .{ .op = .guard_fits, .a = 16, .aux = lane }, // 19: no-op for f64
+        .{ .op = .guard_fits, .a = 18, .aux = lane }, // 20: no-op for f64
+        .{ .op = .konst, .aux = 0 }, // 21: 2 (int step)
+        .{ .op = .add, .a = 3, .b = 21 }, // 22: k+2
+        .{ .op = .astore, .a = 5, .b = 16, .aux = lane }, // 23: SUNK store #1 a[k]=a[k]*C1
+        .{ .op = .astore, .a = 11, .b = 18, .aux = lane }, // 24: SUNK store #2 a[k+1]=a[k+1]*C2
+        .{ .op = .phi, .b = 22, .aux = 1 }, // 25: k carry
+        .{ .op = .loop }, // 26
+    };
+    var consts = [_]Value{ Value.int(2), Value.int(1), Value.float(C1), Value.float(C2) };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    // Separate tables (the trace mutates the heap): native vs the oracle.
+    const t_o = try buildFloatTable(gpa, K);
+    defer t_o.destroy(gpa);
+    try testing.expectEqual(arr.Lane.f64, t_o.array.lane);
+    var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
+    const ovals = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(ovals);
+    const oresult = irinterp.execute(&tr, &oregs, ovals);
+
+    const t_n = try buildFloatTable(gpa, K);
+    defer t_n.destroy(gpa);
+    var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
+    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    const ncomp = ct.run(&nregs);
+
+    try testing.expectEqual(oresult.completed, ncomp);
+    try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
+    try expectTablesEqual(t_o, t_n, K);
+    // Spot-check the differential result: even keys 2..38 scaled by C1, odd keys 3..39
+    // by C2, key 40 untouched (its iteration side-exited on a[41]'s guard_present).
+    var k: i64 = 2;
+    while (k <= 39) : (k += 1) {
+        const base: f64 = @as(f64, @floatFromInt(k)) * 0.5;
+        const want: f64 = if (@rem(k, 2) == 0) base * C1 else base * C2;
+        try testing.expectEqual(@as(u64, @bitCast(want)), t_n.getInt(k).payload.bits);
+    }
+    try testing.expectEqual(@as(u64, @bitCast(@as(f64, 20.0))), t_n.getInt(40).payload.bits);
+}
+
 test "nativegen: a carried .ptr (table) slot bails (no int/ptr type confusion)" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     // slot 0 is loaded as a table (guard_table → .ptr) AND written back as an int

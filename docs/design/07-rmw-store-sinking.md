@@ -4,8 +4,9 @@ Status: **implemented** (2026-06-22) — recorder defers/sinks the single RMW
 `astore` below every loop-exit guard; green under `zig build test` and 8-mode
 determinism. Design was reviewed (Codex + Antigravity both confirmed sound) before
 implementation. Measured: scimark-sor 46.9× → **4.5×** vs LuaJIT (10.5× JIT
-speedup over tier-0), scimark-lu 74.5× → **12.4×** (6×). FFT (4 stores/iter) and
-sparse (indirect gather) remain out of scope — see §6. Gap A (the f64 array lane,
+speedup over tier-0), scimark-lu 74.5× → **12.4×** (6×). FFT (4 stores/iter) is now
+also covered by the multi-store generalization (`08-multi-store-sinking.md`, landed
+2026-06-22); sparse (indirect gather) remains out of scope — see §6. Gap A (the f64 array lane,
 tier-1b) landed first and is the prerequisite the float-array read/store encodings
 build on.
 Owner: Bart
@@ -202,10 +203,13 @@ likely no new code. Stage:
 
 ## 6. Out of scope (follow-ons)
 
-- **Multi-store sinking (FFT).** FFT writes four slots per iteration with all reads
-  before all stores. Sinking *all* stores (in order) below the loop guard is sound
-  by the same argument, but needs the single-store `tropt` invariant lifted and a
-  multi-pending-store recorder. Separate plan.
+- **Multi-store sinking (FFT).** ~~Separate plan.~~ **LANDED** — generalized to a
+  bounded ordered store set (`MAX_PENDING_STORES = 4`) flushed front-to-back below
+  every guard; scimark-fft moved off 0 % native (t0 993.9 ms → jit 715.7 ms). See
+  `08-multi-store-sinking.md`. FFT writes four slots per iteration with all reads
+  before all stores; sinking all four in recorded order is sound by the same argument
+  as the single store (no consumer needed a single-store invariant lifted — `tropt`
+  never imposed one).
 - **Store-then-read same trace.** Genuinely needs store→load forwarding (read the
   pending value, not the heap) — a larger change. Aborted here, as today.
 - **`__newindex` / hash-part / `.value`-lane stores.** Unchanged — still abort

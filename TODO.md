@@ -479,9 +479,35 @@ the loop header and stores exactly once). Constrained to one store that is the t
 *last* array access (any later aload/astore/append aborts). Measured: scimark-sor
 **46.9× → 4.5×** vs LuaJIT (10.5× over tier-0), scimark-lu **74.5× → 12.4×** (6×).
 8-mode byte-identical (RMW `expectProgram` e2e in `interp.zig`; recorder + nativegen
-unit tests). Reviewed by Codex + Antigravity (design + implementation). **Out of
-scope / follow-on:** FFT (4 stores/iter → multi-store deferral) and sparse (indirect
-`x[col[k]]` gather, not a same-index RMW) stay ~35–62× off LuaJIT.
+unit tests). Reviewed by Codex + Antigravity (design + implementation).
+
+**Gap C (multi-store) — LANDED (June 2026, doc 08):** generalized Gap B's single
+deferred `astore` to a bounded ordered set (`MAX_PENDING_STORES = 4`) flushed
+front-to-back in recorded (bytecode) order below every guard, so FFT's butterfly (4
+reads then 4 RMW stores to two indices) records + runs native. A second/third/fourth
+in-bounds RMW `astore` now appends to the pending set instead of aborting; a post-store
+`aload`/`astore_append` or exceeding the cap still aborts cleanly. Measured: scimark-fft
+**54.3× → 39.1×** vs LuaJIT (t0 993.9 ms → jit 715.7 ms; 1.39× over tier-0; `cross=ok`).
+8-mode byte-identical (two-store butterfly `expectProgram` e2e + recorder/nativegen
+units). **Remaining scope:** sparse (indirect `x[col[k]]` gather, not a same-index RMW)
+stays ~35× off LuaJIT; FFT's remaining gap is structural coverage (bit-reversal +
+non-butterfly work still tier-0), not codegen tightness.
+
+**Tier-0 array decode/encode fast path — LANDED (June 2026):** profiling pure tier-0
+(no `--trace`) of the array-heavy scimark kernels showed the bottleneck is NOT dispatch
+(the interpreter `jmp` is 0.46%) but `array.ArrayPart.decode` — 55% of scimark-sparse /
+11% of scimark-fft, as an *out-of-line call per element* across the interp.zig→array.zig
+module boundary. Fix (src/array.zig only): (1) marked `get`/`setInLane`/`decode`/`encode`
+`inline` so the read/write chain folds into `execImpl` (the loop-invariant lane `switch`
+hoists; the per-element call vanishes — decode dropped from a 55% symbol to fully inlined,
+execImpl 98%); (2) removed a gratuitous `@memcpy` stack-buffer round-trip in
+`readInt`/`writeInt` (byte-identical, same `.little`). Tier-0 wins, all `cross=ok`:
+scimark-sparse 866→770 ms (~11%), lu 1162→1019 (~12%), sor 953→871 (~9%), fft 994→911
+(~8%); other benches flat (not decode-bound). NaN-boxing was explicitly ruled out — the
+16-byte tagged `Value` is foundational to determinism+replay; this cuts cost *around* the
+Value. Reviewed (Codex + Antigravity, both sound). The remaining `execImpl` cost is
+inherent 16-byte `Value` register-file shuffling (`vmovapd` spills + `×16` offsets), not
+addressable without changing the Value rep.
 
 **Minor finding (pre-existing, int lanes):** a constant-int *fill* (`a[k] = 7`) also
 fails to compile — `tropt` folds its `guard_fits` (the constant provably fits), so the

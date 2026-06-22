@@ -3999,6 +3999,42 @@ test "f64 RMW: a read-modify-write float loop is byte-identical across all modes
     );
 }
 
+test "f64 multi-store RMW: a two-store butterfly loop is byte-identical across all modes" {
+    // Gap C (doc 08): the inner loop reads two slots then writes both back
+    // (`a=t[i]; b=t[i+1]; t[i]=a+1; t[i+1]=b+2`) — TWO read-modify-write stores per
+    // iteration, the shape Gap B's single-store rule aborted on (the 2nd store hit
+    // `pending_store != null`). Multi-store sinking defers both stores and flushes
+    // them, in recorded order, below every loop-exit guard.
+    //
+    // Same load-bearing idempotence argument as Gap B, now for K=2: on a side-exit
+    // (incl. the loop-back `guard_true`) NEITHER sunk store has executed on-trace, so
+    // tier-0 re-runs the iteration from the header and applies each `+1.0`/`+2.0`
+    // exactly once. A double-apply on the boundary iteration would shift t[253]/t[254]
+    // by their increment — visible in the printed bits. All reads precede all stores,
+    // so the "no aload after a sunk store" invariant holds.
+    //
+    // After 100 reps over odd i in 1..253 (writing t[i], t[i+1]): t[i] = i*0.5 + 100,
+    // t[i+1] = (i+1)*0.5 + 200 (exactly representable). t[255] stays at its fill value
+    // (the loop's last i is 253, writing t[253],t[254]) — proving the sunk stores stay
+    // in bounds.
+    try expectProgram(
+        \\local t = {}
+        \\for i = 1, 300 do t[i] = i * 0.5 end
+        \\for rep = 1, 100 do
+        \\  for i = 1, 254, 2 do
+        \\    local a = t[i]
+        \\    local b = t[i+1]
+        \\    t[i]   = a + 1.0
+        \\    t[i+1] = b + 2.0
+        \\  end
+        \\end
+        \\print(t[1], t[2], t[253], t[254], t[255])
+        \\
+    ,
+        "100.5\t201\t226.5\t327\t127.5\n",
+    );
+}
+
 test "load: compiles and runs a returning chunk" {
     try expectProgram(
         "local f = load(\"return 6 * 7\"); print(f())\n",
