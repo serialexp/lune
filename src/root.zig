@@ -16,6 +16,7 @@ pub const dispatch = @import("dispatch.zig");
 /// Phase 1 — value & object model and numeric semantics.
 pub const object = @import("object.zig");
 pub const value = @import("value.zig");
+pub const regwindow = @import("regwindow.zig");
 pub const arith = @import("arith.zig");
 
 /// Memory accounting — the `TrackingAllocator` wrapper + allocation discipline.
@@ -108,6 +109,7 @@ test {
     _ = dispatch;
     _ = object;
     _ = value;
+    _ = regwindow;
     _ = arith;
     _ = mem;
     _ = io;

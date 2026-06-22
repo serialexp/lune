@@ -173,10 +173,10 @@ pub const Heap = struct {
         return n;
     }
 
-    /// Allocate an *open* upvalue pointing at `slot`, and register it with the
-    /// heap. Closing/repointing is the interpreter's job.
-    pub fn newUpvalue(self: *Heap, slot: *Value) std.mem.Allocator.Error!*Upvalue {
-        const u = try Upvalue.create(self.gpa, slot);
+    /// Allocate an *open* upvalue over live stack slot `index`, and register it
+    /// with the heap. Closing is the interpreter's job.
+    pub fn newUpvalue(self: *Heap, index: usize) std.mem.Allocator.Error!*Upvalue {
+        const u = try Upvalue.createOpen(self.gpa, index);
         self.link(&u.header);
         return u;
     }
@@ -264,10 +264,15 @@ pub const Heap = struct {
                 if (t.metatable) |m| self.markHeader(&m.header);
             },
             .upvalue => {
-                // `ptr` follows the cell whether open (into the stack) or closed
-                // (into its own `closed` field) — one read covers both states.
+                // Closed ⇒ the value is owned by the cell, so mark it here. Open ⇒
+                // the value lives in a live stack slot, which the VM root scan
+                // (`forEachRootHeader`) already covers — and `gc.zig` has no stack
+                // to resolve the index anyway. So mark only the closed case.
                 const u = Upvalue.fromHeader(h);
-                self.markValue(u.ptr.*);
+                switch (u.loc) {
+                    .open => {},
+                    .closed => |v| self.markValue(v),
+                }
             },
             .function => {
                 const cl = Closure.fromHeader(h);

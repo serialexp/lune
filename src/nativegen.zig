@@ -208,7 +208,7 @@ const Kind = enum { none, int, bool, ptr, aref, float };
 /// A compiled trace: an executable page whose entry is
 /// `fn(regs: [*]Value) callconv(.c) usize` — `regs` base in rdi, the cleanly
 /// committed iteration count (`completed`) returned in rax. Semantically identical
-/// to `irinterp.execute(t, regs, scratch)`.
+/// to `irinterp.execute(t, RegWindow.of(regs), scratch)`.
 pub const CompiledTrace = struct {
     page: ExecPage,
 
@@ -2561,6 +2561,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
 
 const testing = std.testing;
 const irinterp = @import("irinterp.zig");
+const RegWindow = @import("regwindow.zig").RegWindow;
 const I = trace.IrInstr;
 const S = trace.SlotStore;
 
@@ -2583,7 +2584,7 @@ fn expectMatch(t: *const Trace, regs_init: []const Value) !void {
     defer testing.allocator.free(iregs);
     const values = try testing.allocator.alloc(Value, t.instrs.len);
     defer testing.allocator.free(values);
-    const iresult = irinterp.execute(t, iregs, values);
+    const iresult = irinterp.execute(t, RegWindow.of(iregs), values);
 
     // Native: must compile (caller picks compilable traces) and match bit-for-bit.
     var ct = compile(testing.allocator, t) orelse return error.NativeBailedUnexpectedly;
@@ -2683,7 +2684,7 @@ test "nativegen(E2): an internal φ (slot-less carry) matches the oracle and is 
         var regs = [_]Value{ Value.int(0), Value.int(5), Value.int(0) };
         const values = try testing.allocator.alloc(Value, instrs.len);
         defer testing.allocator.free(values);
-        const completed = irinterp.execute(&t, &regs, values).completed;
+        const completed = irinterp.execute(&t, RegWindow.of(&regs), values).completed;
         try testing.expectEqual(@as(usize, 5), completed);
         try testing.expectEqual(@as(i64, 5), regs[0].asInt()); // i
         try testing.expectEqual(@as(i64, 5), regs[1].asInt()); // limit
@@ -2735,7 +2736,7 @@ test "nativegen(E2): a FLOAT internal φ (the SR `denom` shape) carries in an XM
         var regs = [_]Value{ Value.int(0), Value.int(4), Value.float(0.0) };
         const values = try testing.allocator.alloc(Value, instrs.len);
         defer testing.allocator.free(values);
-        const completed = irinterp.execute(&t, &regs, values).completed;
+        const completed = irinterp.execute(&t, RegWindow.of(&regs), values).completed;
         try testing.expectEqual(@as(usize, 4), completed);
         try testing.expectEqual(@as(i64, 4), regs[0].asInt());
         try testing.expectEqual(@as(f64, 16.0), regs[2].asFloat());
@@ -4017,7 +4018,7 @@ test "nativegen: f64-lane t[k]=C write matches the interpreter" {
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const oresult = irinterp.execute(&tr, &oregs, ovals);
+    const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
 
     const t_n = try buildFloatTable(gpa, K);
     defer t_n.destroy(gpa);
@@ -4057,14 +4058,14 @@ test "nativegen: f64-lane astore deopt-replay leaves a deterministic heap (idemp
     var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
     const vals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(vals);
-    _ = irinterp.execute(&tr, &r_replay, vals);
+    _ = irinterp.execute(&tr, RegWindow.of(&r_replay), vals);
 
     const t_once = try buildFloatTable(gpa, K);
     defer t_once.destroy(gpa);
     var r_once = [_]Value{ Value.heap(&t_once.header), Value.int(2) };
     const vals2 = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(vals2);
-    _ = irinterp.execute(&tr, &r_once, vals2);
+    _ = irinterp.execute(&tr, RegWindow.of(&r_once), vals2);
 
     try expectTablesEqual(t_replay, t_once, K);
 }
@@ -4159,7 +4160,7 @@ test "nativegen: f64-lane read-modify-write (sunk astore) matches the oracle" {
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const oresult = irinterp.execute(&tr, &oregs, ovals);
+    const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
 
     const t_n = try buildFloatTable(gpa, K);
     defer t_n.destroy(gpa);
@@ -4236,7 +4237,7 @@ test "nativegen: f64-lane multi-store RMW (two sunk astores) matches the oracle"
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const oresult = irinterp.execute(&tr, &oregs, ovals);
+    const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
 
     const t_n = try buildFloatTable(gpa, K);
     defer t_n.destroy(gpa);
@@ -4380,7 +4381,7 @@ test "nativegen: bool-lane t[k]=false write matches the interpreter (heap + regs
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const oresult = irinterp.execute(&tr, &oregs, ovals);
+    const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
 
     const t_n = try buildBoolTable(gpa, K);
     defer t_n.destroy(gpa);
@@ -4424,7 +4425,7 @@ test "nativegen: astore deopt-replay leaves a deterministic heap (idempotent re-
     var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
     const vals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(vals);
-    _ = irinterp.execute(&tr, &r_replay, vals);
+    _ = irinterp.execute(&tr, RegWindow.of(&r_replay), vals);
 
     // t_once: a single clean oracle pass on a fresh, unrelated table.
     const t_once = try buildBoolTable(gpa, K);
@@ -4432,7 +4433,7 @@ test "nativegen: astore deopt-replay leaves a deterministic heap (idempotent re-
     var r_once = [_]Value{ Value.heap(&t_once.header), Value.int(2) };
     const vals2 = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(vals2);
-    _ = irinterp.execute(&tr, &r_once, vals2);
+    _ = irinterp.execute(&tr, RegWindow.of(&r_once), vals2);
 
     // Double-apply (native then tier-0 replay) == single-apply: the write is
     // idempotent, so re-running an iteration after a deopt reproduces the heap.
@@ -4510,7 +4511,7 @@ test "nativegen: int-lane t[k]=C write matches the interpreter (i8/i16/i32/i64)"
         var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
         const ovals = try gpa.alloc(Value, tr.instrs.len);
         defer gpa.free(ovals);
-        const oresult = irinterp.execute(&tr, &oregs, ovals);
+        const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
 
         const t_n = try buildIntTable(gpa, K, cfg.bump);
         defer t_n.destroy(gpa);
@@ -4580,7 +4581,7 @@ test "nativegen: int-lane astore guard_fits side-exits when the value overflows 
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(start) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const oresult = irinterp.execute(&tr, &oregs, ovals);
+    const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
 
     const t_n = try makeT(gpa, K);
     defer t_n.destroy(gpa);
@@ -4662,7 +4663,7 @@ test "nativegen: u8-lane t[k]=C write matches the interpreter (in-range byte)" {
     var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
     const ovals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(ovals);
-    const oresult = irinterp.execute(&tr, &oregs, ovals);
+    const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
 
     const t_n = try buildByteTable(gpa, K);
     defer t_n.destroy(gpa);
@@ -4698,7 +4699,7 @@ test "nativegen: u8-lane astore guard_fits side-exits at the [0,255] boundaries 
         var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
         const ovals = try gpa.alloc(Value, tr.instrs.len);
         defer gpa.free(ovals);
-        const oresult = irinterp.execute(&tr, &oregs, ovals);
+        const oresult = irinterp.execute(&tr, RegWindow.of(&oregs), ovals);
 
         const t_n = try buildByteTable(gpa, K);
         defer t_n.destroy(gpa);
@@ -4737,14 +4738,14 @@ test "nativegen: int-lane astore deopt-replay leaves a deterministic heap (idemp
     var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
     const vals = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(vals);
-    _ = irinterp.execute(&tr, &r_replay, vals);
+    _ = irinterp.execute(&tr, RegWindow.of(&r_replay), vals);
 
     const t_once = try buildIntTable(gpa, K, 100_000);
     defer t_once.destroy(gpa);
     var r_once = [_]Value{ Value.heap(&t_once.header), Value.int(2) };
     const vals2 = try gpa.alloc(Value, tr.instrs.len);
     defer gpa.free(vals2);
-    _ = irinterp.execute(&tr, &r_once, vals2);
+    _ = irinterp.execute(&tr, RegWindow.of(&r_once), vals2);
 
     try expectTablesEqual(t_replay, t_once, K);
 }

@@ -94,18 +94,27 @@ fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, hand
                 // A catchable handler fault: restore the boundary and report a
                 // fixed message. Do not recurse into the handler.
                 vm.pending_error = null;
+                // Discarding the faulting (and handler) frames: close their open
+                // upvalues so an escaped closure keeps a valid value (their slots
+                // fall above the restored `stack_top`, off the GC root scan).
+                vm.closeUpvaluesFrom(entry_top);
                 vm.depth = entry_depth;
                 vm.stack_top = entry_top;
                 if (out.len > 1) out[1] = try vm.heap.internValue("error in error handling");
                 return @min(out.len, @as(usize, 2));
             };
-            // Handler returned — now unwind to the protected-call boundary.
+            // Handler returned — now unwind to the protected-call boundary,
+            // closing the faulting frames' open upvalues first (see below).
+            vm.closeUpvaluesFrom(entry_top);
             vm.depth = entry_depth;
             vm.stack_top = entry_top;
             return @min(out.len, 1 + hn);
         }
         // `pcall` (no handler): nothing observes the live stack, so unwind now and
-        // return `false, errval`.
+        // return `false, errval`. Close the faulting frames' open upvalues first so
+        // an escaped closure keeps a valid value once `stack_top` drops below their
+        // slots (off the GC root scan).
+        vm.closeUpvaluesFrom(entry_top);
         vm.depth = entry_depth;
         vm.stack_top = entry_top;
         if (out.len > 1) out[1] = errval;

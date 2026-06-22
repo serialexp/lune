@@ -25,6 +25,8 @@
 const std = @import("std");
 const bytecode = @import("bytecode.zig");
 const value = @import("value.zig");
+const regwindow = @import("regwindow.zig");
+const RegWindow = regwindow.RegWindow;
 const io = @import("io.zig");
 const tropt = @import("tropt.zig");
 const execlog = @import("execlog.zig");
@@ -363,9 +365,9 @@ pub const Trace = struct {
     /// type guards (the fingerprint).  Returns true if all guarded slots
     /// have the expected type, or if the trace has no entry guards at all
     /// (hand-built test traces, traces without type guards).
-    pub fn matchesFingerprint(self: *const Trace, regs: []const Value) bool {
+    pub fn matchesFingerprint(self: *const Trace, regs: RegWindow) bool {
         for (self.entry_guards) |g| {
-            const v = regs[g.slot];
+            const v = regs.get(g.slot);
             switch (g.ty) {
                 .int => if (!v.isInt()) return false,
                 .float => if (!v.isFloat()) return false,
@@ -733,7 +735,7 @@ pub const TraceState = struct {
         failed: *const Trace,
         exit_instr: u32,
         proto: *const Proto,
-        regs: []Value,
+        regs: RegWindow,
     ) ?usize {
         if (exit_instr == std.math.maxInt(u32)) return null;
         // Resolve the exit PC through the op-gated accessor: array guards store a
@@ -834,7 +836,7 @@ pub const TraceState = struct {
     /// through the same anchor is a benign false positive: eviction only drops a
     /// cache entry (tier-0 stays the oracle and the trace simply re-records), it
     /// can never change observable output.
-    pub fn laneWidenedPast(self: *const TraceState, t: *const Trace, regs: []const Value) bool {
+    pub fn laneWidenedPast(self: *const TraceState, t: *const Trace, regs: RegWindow) bool {
         _ = self;
         for (t.instrs) |ins| {
             if (ins.op != .guard_lane) continue;
@@ -845,8 +847,8 @@ pub const TraceState = struct {
             const ld = t.instrs[ld_idx];
             if (ld.op != .slot_load) continue;
             const reg: usize = @intCast(ld.aux);
-            if (reg >= regs.len) continue;
-            const v = regs[reg];
+            if (reg >= regs.len()) continue;
+            const v = regs.get(reg);
             if (!v.isHeap() or v.heapType() != .table) continue;
             const live_lane = table_mod.Table.fromHeader(v.asHeap()).array.lane;
             const trace_lane: arr.Lane = @enumFromInt(ins.aux);
@@ -1020,7 +1022,7 @@ pub const TraceState = struct {
     ///  * **not recording** → count this back-edge; on *crossing* `hotloop` (and
     ///    if the anchor is neither already traced nor blacklisted), arm a fresh
     ///    recording that begins on the next loop iteration (at the anchor).
-    pub fn onBackEdge(self: *TraceState, proto: *const Proto, target_pc: u32, regs: []const Value) void {
+    pub fn onBackEdge(self: *TraceState, proto: *const Proto, target_pc: u32, regs: RegWindow) void {
         if (self.rec.active) {
             if (self.rec.anchor.proto == proto and self.rec.anchor.pc == target_pc) {
                 self.closeTrace(regs);
@@ -1085,7 +1087,7 @@ pub const TraceState = struct {
 
     /// Finalise a cleanly-closed recording into a cached `Trace`. A build failure
     /// is treated like an abort (discard + gate-with-backoff) so we never thrash.
-    fn closeTrace(self: *TraceState, regs: []const Value) void {
+    fn closeTrace(self: *TraceState, regs: RegWindow) void {
         _ = regs; // reserved: a richer exit snapshot will read live values here.
         self.commit() catch {
             self.gateAnchor(self.rec.anchor);
@@ -1283,13 +1285,13 @@ pub const TraceState = struct {
     /// `pc` is the *post-increment* program counter (already advanced past
     /// `instr`), matching what `applyJump(pc, aux)` expects — `recForLoop` uses it
     /// to resolve the `for_loop` back-edge target against the trace anchor.
-    pub fn recordInstr(self: *TraceState, instr: Instr, regs: []const Value, proto: *const Proto, pc: u32) void {
+    pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) void {
         if (self.rec.instrs.items.len >= self.config.maxrecord) return self.abort(.too_long);
         self.rec.cur_pc = pc;
         self.recordOne(instr, regs, proto, pc) catch self.abort(.alloc);
     }
 
-    fn recordOne(self: *TraceState, instr: Instr, regs: []const Value, proto: *const Proto, pc: u32) error{OutOfMemory}!void {
+    fn recordOne(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) error{OutOfMemory}!void {
         switch (instr.op) {
             // loads & moves — define the destination, no guards.
             .load_nil => self.setReg(instr.a, try self.konst(Value.nil())),
@@ -1330,7 +1332,7 @@ pub const TraceState = struct {
 
             // a host call is a trace barrier; a Lua call/return is cross-frame.
             .call => {
-                const callee = regs[instr.a];
+                const callee = regs.get(instr.a);
                 if (callee.isHeap() and callee.heapType() == .native)
                     self.abort(.host_barrier)
                 else
@@ -1434,9 +1436,9 @@ pub const TraceState = struct {
         try self.guard(ref, if (v.isInt()) IrOp.guard_int else IrOp.guard_float);
     }
 
-    fn recArith(self: *TraceState, op: IrOp, instr: Instr, regs: []const Value) !void {
-        const vb = regs[instr.b];
-        const vc = regs[instr.c];
+    fn recArith(self: *TraceState, op: IrOp, instr: Instr, regs: RegWindow) !void {
+        const vb = regs.get(instr.b);
+        const vc = regs.get(instr.c);
         if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
         const rb = try self.refOf(instr.b);
         const rc = try self.refOf(instr.c);
@@ -1446,9 +1448,9 @@ pub const TraceState = struct {
         self.setReg(instr.a, r);
     }
 
-    fn recBitwise(self: *TraceState, op: IrOp, instr: Instr, regs: []const Value) !void {
-        const vb = regs[instr.b];
-        const vc = regs[instr.c];
+    fn recBitwise(self: *TraceState, op: IrOp, instr: Instr, regs: RegWindow) !void {
+        const vb = regs.get(instr.b);
+        const vc = regs.get(instr.c);
         if (!vb.isInt() or !vc.isInt()) return self.abort(.bad_type);
         const rb = try self.refOf(instr.b);
         const rc = try self.refOf(instr.c);
@@ -1458,8 +1460,8 @@ pub const TraceState = struct {
         self.setReg(instr.a, r);
     }
 
-    fn recNeg(self: *TraceState, instr: Instr, regs: []const Value) !void {
-        const vb = regs[instr.b];
+    fn recNeg(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        const vb = regs.get(instr.b);
         if (!vb.isNumber()) return self.abort(.bad_type);
         const rb = try self.refOf(instr.b);
         try self.guardNum(rb, vb);
@@ -1475,8 +1477,8 @@ pub const TraceState = struct {
         self.setReg(instr.a, r);
     }
 
-    fn recBnot(self: *TraceState, instr: Instr, regs: []const Value) !void {
-        const vb = regs[instr.b];
+    fn recBnot(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        const vb = regs.get(instr.b);
         if (!vb.isInt()) return self.abort(.bad_type);
         const rb = try self.refOf(instr.b);
         try self.guardInt(rb);
@@ -1484,9 +1486,9 @@ pub const TraceState = struct {
         self.setReg(instr.a, r);
     }
 
-    fn recCompare(self: *TraceState, op: IrOp, swap: bool, instr: Instr, regs: []const Value) !void {
-        const vb = regs[instr.b];
-        const vc = regs[instr.c];
+    fn recCompare(self: *TraceState, op: IrOp, swap: bool, instr: Instr, regs: RegWindow) !void {
+        const vb = regs.get(instr.b);
+        const vc = regs.get(instr.c);
         if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
         var rb = try self.refOf(instr.b);
         var rc = try self.refOf(instr.c);
@@ -1513,15 +1515,15 @@ pub const TraceState = struct {
     ///     deferred scope cut — `.value` arrays stay on tier-0/1a);
     ///   * out-of-bounds or hole at record time → `.bad_type` (this iteration would
     ///     immediately side-exit, so the trace would never pay off).
-    fn recArrayGet(self: *TraceState, instr: Instr, regs: []const Value) !void {
+    fn recArrayGet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
         // Deferred (sunk) stores must be the LAST array accesses in the trace: an
         // `aload` after any of them would read the pre-store value on-trace while
         // tier-0's deopt-replay (store-then-read) reads the post-store value —
         // divergence. Abort, exactly as the old C1 rule did (no regression). See
         // `docs/design/08-multi-store-sinking.md` §mechanism (and doc 07 §3.2).
         if (self.rec.pending_store_count > 0) return self.abort(.bad_type);
-        const vtab = regs[instr.b];
-        const vkey = regs[instr.c];
+        const vtab = regs.get(instr.b);
+        const vkey = regs.get(instr.c);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         if (!vkey.isInt()) return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
@@ -1576,7 +1578,7 @@ pub const TraceState = struct {
     ///     through a guard, so "no earlier `aload` at all" covers both the data and
     ///     control channels with one obviously-sound rule. nsieve's sieve-clearing
     ///     loop is a pure write of `false` (no `aload`), so the rule costs it nothing.
-    fn recArraySet(self: *TraceState, instr: Instr, regs: []const Value) !void {
+    fn recArraySet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
         // NB (Gap C): unlike the single-store original, a store arriving while other
         // stores are already deferred is NOT blanket-aborted here. An in-bounds RMW
         // store appends to `pending_stores` (the in-bounds path below); an *append*
@@ -1584,9 +1586,9 @@ pub const TraceState = struct {
         // The `pending_store_count` checks live at those two sites, not at the top,
         // because we cannot tell append-vs-in-bounds until we know `idx`/`len` below.
         // See `docs/design/08-multi-store-sinking.md`.
-        const vtab = regs[instr.a];
-        const vkey = regs[instr.b];
-        const vval = regs[instr.c];
+        const vtab = regs.get(instr.a);
+        const vkey = regs.get(instr.b);
+        const vval = regs.get(instr.c);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         if (!vkey.isInt()) return self.abort(.bad_type);
         if (vval.isNil()) return self.abort(.bad_type); // hole-punch — out of scope
@@ -1722,9 +1724,9 @@ pub const TraceState = struct {
 
     /// `eq`/`ne`. First cut: numeric operands only (the common loop-condition
     /// case); other types abort.
-    fn recEq(self: *TraceState, op: IrOp, instr: Instr, regs: []const Value) !void {
-        const vb = regs[instr.b];
-        const vc = regs[instr.c];
+    fn recEq(self: *TraceState, op: IrOp, instr: Instr, regs: RegWindow) !void {
+        const vb = regs.get(instr.b);
+        const vc = regs.get(instr.c);
         if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
         const rb = try self.refOf(instr.b);
         const rc = try self.refOf(instr.c);
@@ -1737,16 +1739,16 @@ pub const TraceState = struct {
     /// `jmp_if_false`/`jmp_if_true`: pin the *observed* truthiness of the tested
     /// register. Which path the trace records is whatever tier-0 took; the guard
     /// is what keeps the straight-line trace valid.
-    fn recBranch(self: *TraceState, instr: Instr, regs: []const Value) !void {
+    fn recBranch(self: *TraceState, instr: Instr, regs: RegWindow) !void {
         const ra = try self.refOf(instr.a);
-        const op: IrOp = if (regs[instr.a].isTruthy()) .guard_true else .guard_false;
+        const op: IrOp = if (regs.get(instr.a).isTruthy()) .guard_true else .guard_false;
         _ = try self.emit(.{ .op = op, .a = ra });
     }
 
     /// `for_loop` (numeric-for back-edge): record the increment and the
     /// loop-continuation guard, mirroring the opcode. The actual back-edge / close
     /// is handled by `onBackEdge`.
-    fn recForLoop(self: *TraceState, instr: Instr, regs: []const Value, pc: u32) !void {
+    fn recForLoop(self: *TraceState, instr: Instr, regs: RegWindow, pc: u32) !void {
         const a = instr.a;
 
         // If *this* `for_loop` is the one whose back-edge defines the trace
@@ -1759,9 +1761,9 @@ pub const TraceState = struct {
         // trace merely passes through (different target) is ignored.
         const target: u32 = @intCast(@as(i64, pc) + instr.aux);
         if (target == self.rec.anchor.pc) self.rec.locals_watermark = @as(u32, a) + 4;
-        const vidx = regs[a];
-        const vlimit = regs[a + 1];
-        const vstep = regs[a + 2];
+        const vidx = regs.get(a);
+        const vlimit = regs.get(a + 1);
+        const vstep = regs.get(a + 2);
         if (!vidx.isNumber() or !vlimit.isNumber() or !vstep.isNumber()) return self.abort(.bad_type);
         const ridx = try self.refOf(a);
         const rlimit = try self.refOf(a + 1);
@@ -2109,8 +2111,8 @@ test "onBackEdge counts back-edges per anchor" {
     const cold = AnchorKey{ .proto = &proto, .pc = 99 };
 
     var i: u32 = 0;
-    while (i < 10) : (i += 1) state.onBackEdge(&proto, 3, &.{});
-    state.onBackEdge(&proto, 99, &.{}); // a single, cold back-edge elsewhere
+    while (i < 10) : (i += 1) state.onBackEdge(&proto, 3, RegWindow.empty);
+    state.onBackEdge(&proto, 99, RegWindow.empty); // a single, cold back-edge elsewhere
 
     try testing.expectEqual(@as(u32, 10), state.backEdgeCount(hot));
     try testing.expectEqual(@as(u32, 1), state.backEdgeCount(cold));
@@ -2124,10 +2126,10 @@ test "crossing the hotness threshold arms a recording" {
 
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
     try testing.expect(!state.isRecording());
-    state.onBackEdge(&proto, 7, &.{}); // 1
-    state.onBackEdge(&proto, 7, &.{}); // 2 — not yet hot
+    state.onBackEdge(&proto, 7, RegWindow.empty); // 1
+    state.onBackEdge(&proto, 7, RegWindow.empty); // 2 — not yet hot
     try testing.expect(!state.isRecording());
-    state.onBackEdge(&proto, 7, &.{}); // 3 == hotloop → arm
+    state.onBackEdge(&proto, 7, RegWindow.empty); // 3 == hotloop → arm
     try testing.expect(state.isRecording());
     try testing.expectEqual(@as(u32, 7), state.rec.anchor.pc);
 }
@@ -2148,7 +2150,7 @@ test "recArrayGet: t[k] on a bool lane records the full guarded read sequence" {
 
     // r1 = table, r2 = key (3) ; `get_index r0, r1, r2`  →  r0 = t[3]
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3) };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
 
     try testing.expect(state.isRecording()); // a clean record — no abort
     const ops = state.rec.instrs.items;
@@ -2195,7 +2197,7 @@ test "recArrayGet aborts: non-table container, non-int key, hole, and out-of-bou
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ Value.nil(), c.tab, c.key };
-        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
         try testing.expect(!state.isRecording()); // aborted
         try testing.expectEqual(c.why, state.rec.abort_reason.?);
     }
@@ -2216,7 +2218,7 @@ test "recArrayGet aborts on a .value-lane (unpacked) array — deferred scope cu
     defer state.deinit();
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(1) };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.nyi_opcode, state.rec.abort_reason.?);
 }
@@ -2241,7 +2243,7 @@ test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3) };
-        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
         try testing.expect(!state.isRecording());
         try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
     }
@@ -2251,7 +2253,7 @@ test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ Value.heap(&t.header), Value.int(3), Value.boolean(false) };
-        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), &regs, &proto, 0);
+        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
         try testing.expect(!state.isRecording());
         try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
     }
@@ -2262,7 +2264,7 @@ test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ Value.heap(&t.header), Value.int(33), Value.boolean(true) };
-        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), &regs, &proto, 0);
+        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
         try testing.expect(!state.isRecording());
         try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
     }
@@ -2283,7 +2285,7 @@ test "recArraySet: t[k]=false on a bool lane records the full guarded write sequ
 
     // r1 = table, r2 = key (3), r0 = value (false); `set_index a=1 b=2 c=0` → t[3]=false.
     var regs = [_]Value{ Value.boolean(false), Value.heap(&t.header), Value.int(3) };
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), RegWindow.of(&regs), &proto, 0);
 
     try testing.expect(state.isRecording()); // clean record — no abort
     const ops = state.rec.instrs.items;
@@ -2335,7 +2337,7 @@ test "recArraySet: a bool-lane append (t[len+1]=true) records the guarded grow s
 
     // r1 = table, r2 = key (len+1), r0 = value (true); `set_index a=1 b=2 c=0`.
     var regs = [_]Value{ Value.boolean(true), Value.heap(&t.header), Value.int(append_key) };
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), RegWindow.of(&regs), &proto, 0);
 
     try testing.expect(state.isRecording()); // clean record — the append path, no abort
     const ops = state.rec.instrs.items;
@@ -2393,7 +2395,7 @@ test "recArraySet aborts: non-table, non-int key, OOB, out-of-lane value, .value
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ c.val, c.tab, c.key };
-        state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), &regs, &proto, 0);
+        state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), RegWindow.of(&regs), &proto, 0);
         try testing.expect(!state.isRecording());
         try testing.expectEqual(c.why, state.rec.abort_reason.?);
     }
@@ -2419,13 +2421,13 @@ test "recArraySet defers an RMW store (store-sinking) instead of aborting" {
     // r1 = table, r2 = key. First: r0 = t[r2] (a packed read → aload). The recorder's
     // get_index executes against the live table; r0 then logically holds t[3] = true.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.nil() };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
     try testing.expect(state.isRecording()); // the read records cleanly
 
     // Now t[k] = (the value just read), an RMW. The store defers (sinks) rather
     // than aborting: the trace stays live and `pending_store` is armed.
     regs[0] = Value.boolean(true); // r0 = t[3], a boolean
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), RegWindow.of(&regs), &proto, 0);
     try testing.expect(state.isRecording());
     try testing.expectEqual(@as(usize, 1), state.rec.pending_store_count);
     try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.boolean)), state.rec.pending_stores[0].lane_ord);
@@ -2434,7 +2436,7 @@ test "recArraySet defers an RMW store (store-sinking) instead of aborting" {
 
     // A subsequent packed read must abort: the sunk store has to be the LAST array
     // access (else on-trace store-then-read would diverge from tier-0 replay).
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
 }
@@ -2458,12 +2460,12 @@ test "recArraySet sinks a read-steered const store (control channel) instead of 
 
     // r1 = table, r2 = key. r0 = t[r2] (a packed read).
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.boolean(false) };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
     try testing.expect(state.isRecording());
     // Branch on the read (a guard), then store a *constant* false (r3). The store
     // sinks below the branch guard — still recording, store deferred.
-    state.recordInstr(Instr.opABC(.jmp_if_true, 0, 0, 0), &regs, &proto, 0);
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.jmp_if_true, 0, 0, 0), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), RegWindow.of(&regs), &proto, 0);
     try testing.expect(state.isRecording());
     try testing.expectEqual(@as(usize, 1), state.rec.pending_store_count);
 }
@@ -2490,8 +2492,8 @@ test "recArraySet sinks multiple RMW stores (Gap C: butterfly shape)" {
         Value.nil(),         Value.heap(&t.header), Value.int(3), Value.int(4),
         Value.boolean(true), Value.nil(),           Value.nil(),  Value.nil(),
     };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0); // r0 = t[3]
-    state.recordInstr(Instr.opABC(.get_index, 4, 1, 3), &regs, &proto, 0); // r4 = t[4]
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0); // r0 = t[3]
+    state.recordInstr(Instr.opABC(.get_index, 4, 1, 3), RegWindow.of(&regs), &proto, 0); // r4 = t[4]
     try testing.expect(state.isRecording());
 
     // Tier-0 would have loaded the read values into r0/r4; mirror that so the
@@ -2500,8 +2502,8 @@ test "recArraySet sinks multiple RMW stores (Gap C: butterfly shape)" {
     regs[4] = Value.boolean(true); // r4 = t[4]
 
     // Now write both back: t[3] = r0, t[4] = r4. Both defer.
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), &regs, &proto, 0);
-    state.recordInstr(Instr.opABC(.set_index, 1, 3, 4), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), RegWindow.of(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 3, 4), RegWindow.of(&regs), &proto, 0);
     try testing.expect(state.isRecording());
     try testing.expectEqual(@as(usize, 2), state.rec.pending_store_count);
     // Recorded order preserved: store #0 → key 3's aref, store #1 → key 4's aref.
@@ -2527,21 +2529,21 @@ test "recArraySet aborts when sunk stores exceed MAX_PENDING_STORES" {
 
     // r1 = table, r2 = key, r3 = bool value. One read to arm deferral.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.boolean(true) };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), RegWindow.of(&regs), &proto, 0);
     try testing.expect(state.isRecording());
 
     // MAX_PENDING_STORES deferred stores (distinct in-bounds keys 3..3+MAX-1) record.
     var k: i64 = 3;
     while (k < 3 + @as(i64, MAX_PENDING_STORES)) : (k += 1) {
         regs[2] = Value.int(k);
-        state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), &regs, &proto, 0);
+        state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), RegWindow.of(&regs), &proto, 0);
         try testing.expect(state.isRecording());
     }
     try testing.expectEqual(@as(usize, MAX_PENDING_STORES), state.rec.pending_store_count);
 
     // One more store exceeds the cap → abort.
     regs[2] = Value.int(3 + @as(i64, MAX_PENDING_STORES));
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), &regs, &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), RegWindow.of(&regs), &proto, 0);
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
 }
@@ -2555,8 +2557,8 @@ test "per-guard PC recording: guard_int aux carries the bytecode PC" {
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
 
-    const regs = [_]Value{ Value.nil(), Value.int(10), Value.int(20) };
-    state.recordInstr(Instr.opABC(.add, 0, 1, 2), &regs, &proto, 42);
+    var regs = [_]Value{ Value.nil(), Value.int(10), Value.int(20) };
+    state.recordInstr(Instr.opABC(.add, 0, 1, 2), RegWindow.of(&regs), &proto, 42);
 
     try testing.expect(state.isRecording());
     const ops = state.rec.instrs.items;
@@ -2581,8 +2583,8 @@ test "per-guard PC recording: guard_true aux carries the branch PC" {
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
 
     // r0 is truthy (int 1), so jmp_if_false emits guard_true at PC 7.
-    const regs = [_]Value{ Value.int(1), Value.nil() };
-    state.recordInstr(Instr.opABC(.jmp_if_false, 0, 0, 0), &regs, &proto, 7);
+    var regs = [_]Value{ Value.int(1), Value.nil() };
+    state.recordInstr(Instr.opABC(.jmp_if_false, 0, 0, 0), RegWindow.of(&regs), &proto, 7);
 
     try testing.expect(state.isRecording());
     const ops = state.rec.instrs.items;
@@ -2655,7 +2657,7 @@ test "tryChainExit: chains to a trace at the guard's exit PC" {
     var regs = [_]Value{ Value.int(0), Value.int(4) };
 
     // Fake a guard failure in Trace A at instr index 1 (the guard_int).
-    const chained = state.tryChainExit(trace_a, 1, &proto, &regs);
+    const chained = state.tryChainExit(trace_a, 1, &proto, RegWindow.of(&regs));
     try testing.expect(chained != null);
     try testing.expectEqual(@as(usize, 3), chained.?); // Trace B ran 3 iters
     try testing.expectEqual(@as(i64, 3), regs[0].asInt()); // r0 carried to 3
@@ -2728,7 +2730,7 @@ test "tryChainExit: an array-guard exit does NOT chain on its lane ordinal" {
 
     var regs = [_]Value{ Value.int(0), Value.int(4) };
     // The guard_lane is at instr index 1. It must NOT chain to the decoy at pc 2.
-    const chained = state.tryChainExit(trace_a, 1, &proto, &regs);
+    const chained = state.tryChainExit(trace_a, 1, &proto, RegWindow.of(&regs));
     try testing.expect(chained == null);
     try testing.expectEqual(@as(i64, 0), regs[0].asInt()); // r0 untouched — no decoy ran
 
@@ -2740,7 +2742,7 @@ test "tryChainExit: an array-guard exit does NOT chain on its lane ordinal" {
 test "matchesFingerprint: empty fingerprint always matches" {
     const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     var regs = [_]Value{ Value.int(1), Value.float(3.14), Value.nil() };
-    try testing.expect(t.matchesFingerprint(&regs));
+    try testing.expect(t.matchesFingerprint(RegWindow.of(&regs)));
 }
 
 test "nextTraceExcluding: visits each anchor trace once, highest-hit first, then null" {
@@ -2803,7 +2805,7 @@ test "matchesFingerprint: matching types" {
     };
     const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
     var regs = [_]Value{ Value.int(42), Value.float(3.14) };
-    try testing.expect(t.matchesFingerprint(&regs));
+    try testing.expect(t.matchesFingerprint(RegWindow.of(&regs)));
 }
 
 test "matchesFingerprint: mismatched int/float" {
@@ -2813,7 +2815,7 @@ test "matchesFingerprint: mismatched int/float" {
     const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
     // Register holds a float, but the trace expects int.
     var regs = [_]Value{Value.float(2.5)};
-    try testing.expect(!t.matchesFingerprint(&regs));
+    try testing.expect(!t.matchesFingerprint(RegWindow.of(&regs)));
 }
 
 test "matchesFingerprint: guard_number accepts both int and float" {
@@ -2821,10 +2823,10 @@ test "matchesFingerprint: guard_number accepts both int and float" {
         .{ .slot = 0, .ty = .number },
     };
     const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
-    try testing.expect(t.matchesFingerprint(&[_]Value{Value.int(1)}));
-    try testing.expect(t.matchesFingerprint(&[_]Value{Value.float(1.5)}));
-    try testing.expect(!t.matchesFingerprint(&[_]Value{Value.nil()}));
-    try testing.expect(!t.matchesFingerprint(&[_]Value{Value.boolean(true)}));
+    try testing.expect(t.matchesFingerprint(RegWindow.of(@constCast(&[_]Value{Value.int(1)}))));
+    try testing.expect(t.matchesFingerprint(RegWindow.of(@constCast(&[_]Value{Value.float(1.5)}))));
+    try testing.expect(!t.matchesFingerprint(RegWindow.of(@constCast(&[_]Value{Value.nil()}))));
+    try testing.expect(!t.matchesFingerprint(RegWindow.of(@constCast(&[_]Value{Value.boolean(true)}))));
 }
 
 test "matchesFingerprint: guard_table" {
@@ -2832,6 +2834,6 @@ test "matchesFingerprint: guard_table" {
         .{ .slot = 0, .ty = .table },
     };
     const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
-    try testing.expect(!t.matchesFingerprint(&[_]Value{Value.int(1)}));
-    try testing.expect(!t.matchesFingerprint(&[_]Value{Value.float(1.0)}));
+    try testing.expect(!t.matchesFingerprint(RegWindow.of(@constCast(&[_]Value{Value.int(1)}))));
+    try testing.expect(!t.matchesFingerprint(RegWindow.of(@constCast(&[_]Value{Value.float(1.0)}))));
 }

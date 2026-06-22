@@ -46,6 +46,8 @@ const std = @import("std");
 const trace = @import("trace.zig");
 const arith = @import("arith.zig");
 const value = @import("value.zig");
+const regwindow = @import("regwindow.zig");
+const RegWindow = regwindow.RegWindow;
 const execlog = @import("execlog.zig");
 const table = @import("table.zig");
 const arr = @import("array.zig");
@@ -72,7 +74,7 @@ pub const ExecResult = struct {
 ///   * a yield of 0 means the very first iteration side-exited (the trace no
 ///     longer matches the observed types) — the caller uses this for the
 ///     re-entry penalty.
-pub fn execute(t: *const Trace, regs: []Value, values: []Value) ExecResult {
+pub fn execute(t: *const Trace, regs: RegWindow, values: []Value) ExecResult {
     return executeImpl(false, {}, t, regs, values);
 }
 
@@ -81,7 +83,7 @@ pub fn execute(t: *const Trace, regs: []Value, values: []Value) ExecResult {
 /// its exit ramp for the visualizer. `rec` must already be `begin`-ready (targeted
 /// at the trace's log); this calls `begin`/`end` around the run. Used only on the
 /// instrumented (viz/CLI) path — `execute` above is the untouched JIT fast path.
-pub fn executeTraced(rec: *execlog.ExecLogRecorder, t: *const Trace, regs: []Value, values: []Value) ExecResult {
+pub fn executeTraced(rec: *execlog.ExecLogRecorder, t: *const Trace, regs: RegWindow, values: []Value) ExecResult {
     return executeImpl(true, rec, t, regs, values);
 }
 
@@ -91,7 +93,7 @@ pub fn executeTraced(rec: *execlog.ExecLogRecorder, t: *const Trace, regs: []Val
 /// With `record == true`, `rec` observes every value, guard outcome, commit, and the
 /// terminal side-exit. Recording is observation-only: `regs`/`completed` are
 /// byte-identical to the uninstrumented run (the parity canary test asserts this).
-fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Value, values: []Value) ExecResult {
+fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWindow, values: []Value) ExecResult {
     std.debug.assert(values.len >= t.instrs.len);
     if (record) rec.begin();
     var completed: usize = 0;
@@ -115,7 +117,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
             switch (ins.op) {
                 // ---- inputs ----
                 .slot_load => {
-                    values[i] = regs[@intCast(ins.aux)];
+                    values[i] = regs.get(@intCast(ins.aux));
                     if (record) rec.value(i, values[i]);
                 },
                 .konst => {
@@ -145,7 +147,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                         // event (the old exit_store produced none): keeping no-op
                         // parity AND ensuring a carried *heap* slot never feeds the
                         // scalar-only exec-log encoder (`UnsupportedEffectResult`).
-                        values[i] = regs[@intCast(ins.aux)];
+                        values[i] = regs.get(@intCast(ins.aux));
                     }
                 },
 
@@ -360,7 +362,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: []Val
                         if (p.aux == trace.PHI_INTERNAL) {
                             values[pi] = values[@intCast(p.b)];
                         } else {
-                            regs[@intCast(p.aux)] = values[@intCast(p.b)];
+                            regs.set(@intCast(p.aux), values[@intCast(p.b)]);
                         }
                     }
                     completed += 1;
@@ -483,7 +485,7 @@ fn runScan(t: *Table, start: i64) struct { completed: usize, regs: [3]Value } {
     };
     var regs = [3]Value{ Value.heap(&t.header), Value.int(start), Value.nil() };
     var values: [13]Value = undefined;
-    const result = execute(&tr, &regs, &values);
+    const result = execute(&tr, RegWindow.of(&regs), &values);
     return .{ .completed = result.completed, .regs = regs };
 }
 
@@ -555,7 +557,7 @@ test "E0 review: a slot-bound φ carrying a HEAP value emits no exec-log value e
 
     var regs = [3]Value{ Value.heap(&t.header), Value.nil(), Value.int(1) };
     var values: [8]Value = undefined;
-    const completed = executeTraced(&rec, &tr, &regs, &values).completed;
+    const completed = executeTraced(&rec, &tr, RegWindow.of(&regs), &values).completed;
 
     // Exactly one clean commit (iter 1), then the divide-by-zero side-exit on iter 2.
     try testing.expectEqual(@as(usize, 1), completed);
@@ -584,7 +586,7 @@ test "B2 read path: guard_table side-exits when the slot is not a table" {
     // r0 is an int, not a table → guard_table fails on the first iteration.
     var regs = [3]Value{ Value.int(99), Value.int(1), Value.nil() };
     var values: [13]Value = undefined;
-    try testing.expectEqual(@as(usize, 0), execute(&tr, &regs, &values).completed);
+    try testing.expectEqual(@as(usize, 0), execute(&tr, RegWindow.of(&regs), &values).completed);
     try testing.expect(regs[0].asInt() == 99); // untouched
 }
 
@@ -606,7 +608,7 @@ test "per-guard PC: ExecResult.exit_instr points to the failing guard" {
     };
     var regs = [_]Value{ Value.int(1), Value.float(3.14) };
     var values: [5]Value = undefined;
-    const result = execute(&tr, &regs, &values);
+    const result = execute(&tr, RegWindow.of(&regs), &values);
     try testing.expectEqual(@as(usize, 0), result.completed);
     // The failing guard is instrs[3] — guard_int on r1
     try testing.expectEqual(@as(u32, 3), result.exit_instr);
@@ -635,7 +637,7 @@ test "per-guard PC: ExecResult.exit_instr on arith error (divide by zero)" {
     };
     var regs = [_]Value{ Value.nil(), Value.nil(), Value.int(1) };
     var values: [7]Value = undefined;
-    const result = execute(&tr, &regs, &values);
+    const result = execute(&tr, RegWindow.of(&regs), &values);
     // One clean iteration (r2=1 → 5//1=5), then div-by-zero on iter 2 (r2=0).
     try testing.expectEqual(@as(usize, 1), result.completed);
     // The failing instruction is the idiv at index 2.

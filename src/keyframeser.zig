@@ -107,7 +107,7 @@ fn sortedHashEntries(a: std.mem.Allocator, t: *const table.Table) ![]HashKV {
 ///
 /// `typed_array`/`host` have no wire variant in F2a — a reachable one is a
 /// serializer bug surfaced as `UnsupportedObject`, not a silent drop.
-pub fn toSchemaHeapObject(a: std.mem.Allocator, h: *GcHeader) !schema.HeapObject {
+pub fn toSchemaHeapObject(a: std.mem.Allocator, vm: *Vm, h: *GcHeader) !schema.HeapObject {
     const Body = schema.BsUnion_HeapString_HeapTable_HeapClosure_HeapNative_HeapUpvalue;
     const body: Body = switch (h.type) {
         .string => .{ .HeapString = .{ .bytes = string.String.fromHeader(h).bytes() } },
@@ -140,11 +140,12 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, h: *GcHeader) !schema.HeapObject
         },
         .upvalue => blk: {
             const u = function.Upvalue.fromHeader(h);
-            // `ptr` aims at the cell's own `closed` field iff the cell is closed;
-            // otherwise it points into a live stack slot. Either way `ptr.*` is the
-            // current value (F2b uses `open_upvalues` to re-derive the open slot).
-            const is_closed = u.ptr == &u.closed;
-            break :blk .{ .HeapUpvalue = .{ .closed = @intFromBool(is_closed), .value = toSchemaValue(u.ptr.*) } };
+            // An open cell's value lives in a live stack slot — `upvalGet` resolves
+            // the index against the VM stack; a closed cell owns it directly. (At the
+            // F2a quiescent capture point every reachable cell is closed; F2b uses
+            // `open_upvalues` to re-derive the open slot on restore.)
+            const is_closed = !u.isOpen();
+            break :blk .{ .HeapUpvalue = .{ .closed = @intFromBool(is_closed), .value = toSchemaValue(vm.upvalGet(u)) } };
         },
         .native => .{ .HeapNative = .{ .name = function.Native.fromHeader(h).name } },
         else => return error.UnsupportedObject, // typed_array / host: no F2a variant
@@ -215,7 +216,11 @@ const Walk = struct {
                 // the GC must enumerate the identical child set.
                 if (t.metatable) |m| self.push(&m.header);
             },
-            .upvalue => self.pushValue(function.Upvalue.fromHeader(h).ptr.*),
+            .upvalue => switch (function.Upvalue.fromHeader(h).loc) {
+                // Open ⇒ the value rides a live stack slot already seeded as a root.
+                .open => {},
+                .closed => |v| self.pushValue(v),
+            },
             .function => {
                 const cl = function.Closure.fromHeader(h);
                 for (cl.upvalues) |uv| self.push(&uv.header);
@@ -247,12 +252,12 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
 
     // 2. Map each object to its wire form.
     const objects = try a.alloc(schema.HeapObject, walk.order.items.len);
-    for (walk.order.items, 0..) |h, idx| objects[idx] = try toSchemaHeapObject(a, h);
+    for (walk.order.items, 0..) |h, idx| objects[idx] = try toSchemaHeapObject(a, vm, h);
 
     // 3. Capture the roots verbatim (the live register window, active frames, and
     //    open upvalues — empty at final-state capture; load-bearing in F2b).
     const stack = try a.alloc(schema.SnapValue, vm.stack_top);
-    for (vm.stack[0..vm.stack_top], 0..) |v, idx| stack[idx] = toSchemaValue(v);
+    for (stack, 0..) |*sv, idx| sv.* = toSchemaValue(vm.regGet(idx));
 
     // Capture each frame's resumable cursor (pc/base/return-wiring), not just the
     // closure id — this is what makes a mid-execution snapshot re-executable (F2c).
@@ -314,8 +319,10 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
 // to the identical bytes. Reconstruction is two-pass: pass 1 creates every object
 // shell and records id→header, pass 2 wires the inter-object edges (so cycles and
 // forward references resolve). Roots (globals, stack, frames, open upvalues) are
-// rebound last. The VM is heap-allocated and returned by pointer: open upvalue
-// cells point at `&vm.stack[i]`, so the VM's address must stay fixed.
+// rebound last. The VM is heap-allocated and returned by pointer so its register
+// stack (and the heap it owns) keep a stable address across the caller's lifetime;
+// open upvalue cells reference their slot by **index** (not a `*Value`), so they
+// survive the stack later splitting into parallel tag/payload arrays (doc 09).
 // ---------------------------------------------------------------------------
 
 const RestoreError = error{
@@ -545,11 +552,9 @@ pub fn restoreSnapshot(
             },
             .HeapClosure => unreachable, // skipped above
             .HeapUpvalue => blk: {
-                // Born closed-and-self-pointing so `ptr` is never dangling; pass 2
-                // sets the value, and the root rebind repoints open cells at a slot.
-                const u = try function.Upvalue.create(gpa, undefined);
-                u.closed = Value.nil();
-                u.ptr = &u.closed;
+                // Born closed-holding-nil (never dangling); pass 2 sets a closed
+                // cell's value, and the root rebind switches open cells to `.open`.
+                const u = try function.Upvalue.createClosed(gpa, Value.nil());
                 vm.heap.linkRestored(&u.header, o.id);
                 break :blk &u.header;
             },
@@ -620,8 +625,10 @@ pub fn restoreSnapshot(
             },
             .HeapUpvalue => |hu| {
                 const u = function.Upvalue.fromHeader(h);
-                u.closed = try fromSchemaValue(hu.value, &idmap);
-                u.ptr = &u.closed; // open cells are repointed in the root rebind
+                // A closed cell owns its value. An open cell's recorded value is
+                // re-derived from the live stack at the root rebind below, so the
+                // value here is a harmless placeholder until then.
+                u.loc = .{ .closed = try fromSchemaValue(hu.value, &idmap) };
             },
         }
     }
@@ -631,8 +638,8 @@ pub fn restoreSnapshot(
     if (gh.type != .table) return error.GlobalsNotATable;
     vm.globals = table.Table.fromHeader(gh);
 
-    if (kf.stack.len > vm.stack.len) return error.StackTooLarge;
-    for (kf.stack, 0..) |sv, i| vm.stack[i] = try fromSchemaValue(sv, &idmap);
+    if (kf.stack.len > vm.regCapacity()) return error.StackTooLarge;
+    for (kf.stack, 0..) |sv, i| vm.regSet(i, try fromSchemaValue(sv, &idmap));
     vm.stack_top = kf.stack.len;
 
     if (kf.frames.len > vm.frames.len) return error.TooManyFrames;
@@ -661,8 +668,8 @@ pub fn restoreSnapshot(
         if (uh.type != .upvalue) return error.UpvalueNotAnUpvalue;
         if (ou.stack_index >= vm.stack_top) return error.StackIndexOutOfRange;
         const cell = function.Upvalue.fromHeader(uh);
-        // Repoint the open cell from its closed-self placeholder at the live slot.
-        cell.ptr = &vm.stack[ou.stack_index];
+        // Switch the cell from its closed placeholder to open over the live slot.
+        cell.loc = .{ .open = ou.stack_index };
         try vm.open_upvalues.append(gpa, .{ .index = ou.stack_index, .cell = cell });
     }
 
@@ -1182,7 +1189,7 @@ test "restore rebuilds globals, ids, and a reachable value graph" {
     try testing.expect(add_val.isHeap() and add_val.heapType() == .function);
     const add_cl = function.Closure.fromHeader(add_val.asHeap());
     try testing.expectEqual(@as(usize, 1), add_cl.upvalues.len);
-    try testing.expectEqual(@as(i64, 10), add_cl.upvalues[0].get().asInt());
+    try testing.expectEqual(@as(i64, 10), vm2.upvalGet(add_cl.upvalues[0]).asInt());
 
     // print is still a native bound under its name.
     const print_val = vm2.globals.get(try vm2.heap.internValue("print"));
@@ -1439,19 +1446,19 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
     try testing.expectEqual(@as(usize, 2), vm.frames[0].closure.upvalues.len);
     try testing.expectEqual(@as(usize, 0), vm.frames[1].closure.upvalues.len);
     // The two-upvalue closure's closed cell (id 4) holds 99.
-    try testing.expectEqual(@as(i64, 99), vm.frames[0].closure.upvalues[0].get().asInt());
+    try testing.expectEqual(@as(i64, 99), vm.upvalGet(vm.frames[0].closure.upvalues[0]).asInt());
 
-    // Closed upvalue id 4 holds 99; open upvalue id 5 was repointed at stack[0]
+    // Closed upvalue id 4 holds 99; open upvalue id 5 was rebound over stack[0]
     // and therefore reads the table ref now living there.
     try testing.expectEqual(@as(usize, 1), vm.open_upvalues.items.len);
     const open_cell = vm.open_upvalues.items[0].cell;
     try testing.expectEqual(@as(u32, 5), open_cell.header.id);
-    try testing.expectEqual(&vm.stack[0], open_cell.ptr);
-    try testing.expect(open_cell.get().isHeap() and open_cell.get().asHeap() == &vm.globals.header);
+    try testing.expectEqual(@as(usize, 0), open_cell.loc.open);
+    try testing.expect(vm.upvalGet(open_cell).isHeap() and vm.upvalGet(open_cell).asHeap() == &vm.globals.header);
 
     // Stack window restored.
     try testing.expectEqual(@as(usize, 2), vm.stack_top);
-    try testing.expectEqual(@as(i64, -1), vm.stack[1].asInt());
+    try testing.expectEqual(@as(i64, -1), vm.regGet(1).asInt());
 }
 
 /// Restore the given file and assert it fails with exactly `want`.

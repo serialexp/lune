@@ -20,6 +20,7 @@ const std = @import("std");
 const bytecode = @import("bytecode.zig");
 const arith = @import("arith.zig");
 const value = @import("value.zig");
+const regwindow = @import("regwindow.zig");
 const gc = @import("gc.zig");
 const object = @import("object.zig");
 const string = @import("string.zig");
@@ -44,6 +45,7 @@ const Value = value.Value;
 const Proto = bytecode.Proto;
 const Instr = bytecode.Instr;
 const Closure = function.Closure;
+const RegWindow = regwindow.RegWindow;
 
 /// Runtime errors surfaced to the host. A superset of `arith.Error` so pure
 /// numeric ops coerce in with a bare `try`.
@@ -717,6 +719,42 @@ pub const Vm = struct {
         self.gpa.free(self.stack);
     }
 
+    // ---- register-file storage seam (SoA flip, docs/design/09) --------------
+    // Every per-slot read/write of the register stack goes through these
+    // accessors (absolute index) or a `RegWindow` (frame-relative), so the
+    // Phase 2 flip to `tags`/`payloads` is a change to these bodies, not a sweep
+    // of call sites. Phase 1: trivial passthroughs over the `[]Value` stack —
+    // `inline`, so they compile identically to the bare index they replace.
+
+    /// Read the register at absolute stack index `i`.
+    pub inline fn regGet(self: *const Vm, i: usize) Value {
+        return self.stack[i];
+    }
+
+    /// Write the register at absolute stack index `i`.
+    pub inline fn regSet(self: *Vm, i: usize, v: Value) void {
+        self.stack[i] = v;
+    }
+
+    /// Total register slots the stack can hold (Phase 2: `payloads.len`). Used by
+    /// the structural bounds checks (`base + nreg > capacity` → StackOverflow).
+    pub inline fn regCapacity(self: *const Vm) usize {
+        return self.stack.len;
+    }
+
+    /// Nil-fill `count` registers starting at absolute index `from` (Phase 2:
+    /// set the tag lane to nil; payloads need not be cleared).
+    pub inline fn fillNil(self: *Vm, from: usize, count: usize) void {
+        @memset(self.stack[from .. from + count], Value.nil());
+    }
+
+    /// A frame-relative window over `count` registers based at absolute `base`
+    /// (`R[slot]` == `stack[base + slot]`). The cold per-frame consumers (trace
+    /// recorder, `irinterp`) take one of these.
+    pub inline fn frameWindow(self: *Vm, base: usize, count: usize) RegWindow {
+        return RegWindow.of(self.stack[base .. base + count]);
+    }
+
     /// Install the built-in globals (the host-effect boundary) from the single
     /// `base_natives` registry — the same table the keyframe restorer reads to
     /// rebind a serialized native by name, so install and restore can never drift.
@@ -836,8 +874,8 @@ pub const Vm = struct {
 
     pub fn run(self: *Vm, proto: *const Proto) Error!Value {
         self.seedProtoIds(proto);
-        if (proto.num_registers > self.stack.len) return Error.StackOverflow;
-        @memset(self.stack[0..proto.num_registers], Value.nil());
+        if (proto.num_registers > self.regCapacity()) return Error.StackOverflow;
+        self.fillNil(0, proto.num_registers);
         // The main chunk runs as a closure with no upvalues. It is GC-linked and
         // freed at `deinit`; its `proto` pointer is only dereferenced during this
         // call, so a stack-local test `Proto` is fine.
@@ -845,7 +883,7 @@ pub const Vm = struct {
         try self.pushFrame(top, 0, 0, 0);
         // `run` never arms `suspend_ctl`, so `exec` always finishes here.
         switch (try self.exec()) {
-            .finished => |fr| return if (fr.count >= 1) self.stack[fr.reg] else Value.nil(),
+            .finished => |fr| return if (fr.count >= 1) self.regGet(fr.reg) else Value.nil(),
             .suspended => unreachable,
         }
     }
@@ -856,8 +894,8 @@ pub const Vm = struct {
     /// calling `exec()` again (the cursor is parked in `frames[depth-1]`).
     pub fn start(self: *Vm, proto: *const Proto) Error!ExecOutcome {
         self.seedProtoIds(proto);
-        if (proto.num_registers > self.stack.len) return Error.StackOverflow;
-        @memset(self.stack[0..proto.num_registers], Value.nil());
+        if (proto.num_registers > self.regCapacity()) return Error.StackOverflow;
+        self.fillNil(0, proto.num_registers);
         const top = try self.heap.newClosure(proto, 0);
         try self.pushFrame(top, 0, 0, 0);
         return self.exec();
@@ -924,7 +962,7 @@ pub const Vm = struct {
         if (cs.pc >= cs.proto.code.len) return null;
         const instr = cs.proto.code[cs.pc];
         if (instr.op != .call) return null;
-        const callee = self.stack[cs.base + instr.a];
+        const callee = self.regGet(cs.base + instr.a);
         if (!(callee.isHeap() and callee.heapType() == .native)) return null;
         return .{
             .fname = nativeDisplayName(function.Native.fromHeader(callee.asHeap())),
@@ -1062,7 +1100,7 @@ pub const Vm = struct {
         if (pc >= proto.code.len) return .{ .message = try arena.dupe(u8, @errorName(err)) };
 
         const instr = proto.code[pc];
-        const regs = self.stack[frame.base .. frame.base + proto.num_registers];
+        const regs = self.frameWindow(frame.base, proto.num_registers);
         const span: bytecode.Span = if (pc < proto.spans.len) proto.spans[pc] else .{};
         // Per-proto source so a fault inside a `load`ed chunk reports its own line.
         const leaf_src = if (proto.source.len > 0) proto.source else source;
@@ -1076,18 +1114,18 @@ pub const Vm = struct {
                 .add, .sub, .mul, .div, .idiv, .mod, .pow => try std.fmt.allocPrint(
                     arena,
                     "attempt to perform arithmetic on a {s} value",
-                    .{firstNonNumber(regs[instr.b], regs[instr.c]).typeName()},
+                    .{firstNonNumber(regs.get(instr.b), regs.get(instr.c)).typeName()},
                 ),
                 // Bitwise ops want an integer operand: a float (no integer form)
                 // and a non-number get distinct Lua-5.4-shaped messages.
-                .band, .bor, .bxor, .shl, .shr => try bitwiseFaultMessage(arena, firstNonInteger(regs[instr.b], regs[instr.c])),
-                .neg => try std.fmt.allocPrint(arena, "attempt to perform arithmetic on a {s} value", .{regs[instr.b].typeName()}),
-                .bnot => try bitwiseFaultMessage(arena, regs[instr.b]),
-                .len => try std.fmt.allocPrint(arena, "attempt to get length of a {s} value", .{regs[instr.b].typeName()}),
-                .concat => try std.fmt.allocPrint(arena, "attempt to concatenate a {s} value", .{firstNonConcatable(regs[instr.b], regs[instr.c]).typeName()}),
-                .lt, .le, .gt, .ge => try std.fmt.allocPrint(arena, "attempt to compare {s} with {s}", .{ regs[instr.b].typeName(), regs[instr.c].typeName() }),
-                .get_index => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs[instr.b].typeName()}),
-                .set_index => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs[instr.a].typeName()}),
+                .band, .bor, .bxor, .shl, .shr => try bitwiseFaultMessage(arena, firstNonInteger(regs.get(instr.b), regs.get(instr.c))),
+                .neg => try std.fmt.allocPrint(arena, "attempt to perform arithmetic on a {s} value", .{regs.get(instr.b).typeName()}),
+                .bnot => try bitwiseFaultMessage(arena, regs.get(instr.b)),
+                .len => try std.fmt.allocPrint(arena, "attempt to get length of a {s} value", .{regs.get(instr.b).typeName()}),
+                .concat => try std.fmt.allocPrint(arena, "attempt to concatenate a {s} value", .{firstNonConcatable(regs.get(instr.b), regs.get(instr.c)).typeName()}),
+                .lt, .le, .gt, .ge => try std.fmt.allocPrint(arena, "attempt to compare {s} with {s}", .{ regs.get(instr.b).typeName(), regs.get(instr.c).typeName() }),
+                .get_index => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs.get(instr.b).typeName()}),
+                .set_index => try std.fmt.allocPrint(arena, "attempt to index a {s} value", .{regs.get(instr.a).typeName()}),
                 .call => blk: {
                     // A native runs inline (no child frame), so when one returns a
                     // bare fault the leaf instruction is the `.call` to it — the
@@ -1096,7 +1134,7 @@ pub const Vm = struct {
                     // messages come from `Vm.badArg` (which raises `LuaError`, so it
                     // never reaches this non-LuaError arm). A genuine non-callable
                     // (nil/number/…) keeps the real "attempt to call a X value".
-                    const callee = regs[instr.a];
+                    const callee = regs.get(instr.a);
                     if (callee.isHeap() and callee.heapType() == .native and err == Error.TypeError)
                         break :blk try std.fmt.allocPrint(arena, "bad argument to '{s}'", .{nativeDisplayName(function.Native.fromHeader(callee.asHeap()))});
                     if (callee.isHeap() and (callee.heapType() == .native or callee.heapType() == .function))
@@ -1157,7 +1195,7 @@ pub const Vm = struct {
     pub fn pushFrameVararg(self: *Vm, closure: *const Closure, base: usize, ret_dest: u16, ret_count: u16, varargs_base: usize, varargs_count: usize) Error!void {
         if (self.depth >= max_call_depth) return Error.StackOverflow;
         const nreg = closure.proto.num_registers;
-        if (base + nreg > self.stack.len) return Error.StackOverflow;
+        if (base + nreg > self.regCapacity()) return Error.StackOverflow;
         self.frames[self.depth] = .{
             .closure = closure,
             .base = base,
@@ -1246,17 +1284,17 @@ pub const Vm = struct {
                 // window. Reserve `args.len + num_registers` slots.
                 const arg_base = self.stack_top;
                 const callee_base = arg_base + args.len;
-                if (callee_base + cp.num_registers > self.stack.len) return Error.StackOverflow;
+                if (callee_base + cp.num_registers > self.regCapacity()) return Error.StackOverflow;
                 // Straight-line, allocation-free up to `pushFrameVararg` (which
                 // raises `stack_top`): no safepoint may intervene, so the args we
                 // park above `stack_top` are never seen unrooted by the collector.
-                for (args, 0..) |v, i| self.stack[arg_base + i] = v;
+                for (args, 0..) |v, i| self.regSet(arg_base + i, v);
                 var i: usize = 0;
                 while (i < cp.num_registers) : (i += 1) {
-                    self.stack[callee_base + i] = if (i < cp.num_params and i < args.len)
-                        self.stack[arg_base + i]
+                    self.regSet(callee_base + i, if (i < cp.num_params and i < args.len)
+                        self.regGet(arg_base + i)
                     else
-                        Value.nil();
+                        Value.nil());
                 }
                 const va_count: usize = if (cp.is_vararg and args.len > cp.num_params) args.len - cp.num_params else 0;
                 const va_base: usize = if (va_count > 0) arg_base + cp.num_params else 0;
@@ -1279,7 +1317,7 @@ pub const Vm = struct {
                 const src = callee_base + fr.reg;
                 const n = @min(@as(usize, fr.count), results_out.len);
                 var k: usize = 0;
-                while (k < n) : (k += 1) results_out[k] = self.stack[src + k];
+                while (k < n) : (k += 1) results_out[k] = self.regGet(src + k);
                 self.stack_top = saved_top;
                 return n;
             },
@@ -1301,9 +1339,9 @@ pub const Vm = struct {
                 if (handler.isNil()) return Error.TypeError;
                 const need = 1 + args.len;
                 const pbase = self.stack_top;
-                if (pbase + need > self.stack.len) return Error.StackOverflow;
-                self.stack[pbase] = callee;
-                for (args, 0..) |v, i| self.stack[pbase + 1 + i] = v;
+                if (pbase + need > self.regCapacity()) return Error.StackOverflow;
+                self.regSet(pbase, callee);
+                for (args, 0..) |v, i| self.regSet(pbase + 1 + i, v);
                 self.stack_top = pbase + need; // root the parked redirect args
                 const n = try self.callValue(handler, self.stack[pbase .. pbase + need], results_out);
                 self.stack_top = pbase; // success only (see note above)
@@ -1382,7 +1420,13 @@ pub const Vm = struct {
         comptime cb: fn (@TypeOf(ctx), *object.GcHeader) void,
     ) void {
         cb(ctx, &self.globals.header);
-        for (self.stack[0..self.stack_top]) |v| if (v.isHeap()) cb(ctx, v.asHeap());
+        {
+            var i: usize = 0;
+            while (i < self.stack_top) : (i += 1) {
+                const v = self.regGet(i);
+                if (v.isHeap()) cb(ctx, v.asHeap());
+            }
+        }
         for (self.frames[0..self.depth]) |f| cb(ctx, @constCast(&f.closure.header));
         for (self.open_upvalues.items) |ou| cb(ctx, &ou.cell.header);
         for (self.trace.cache.items) |t| {
@@ -1543,7 +1587,7 @@ pub const Vm = struct {
             // recording is live (`runFastPath`), and the back-edge handoff below
             // flips to `.full` the instant `onBackEdge` arms a recording, so the
             // very next instruction is mirrored.
-            if (mode == .full and self.trace.isRecording()) self.trace.recordInstr(instr, regs, proto, @intCast(pc));
+            if (mode == .full and self.trace.isRecording()) self.trace.recordInstr(instr, RegWindow.of(regs), proto, @intCast(pc));
             const a: usize = instr.a;
             switch (instr.op) {
                 // ---- loads & moves ----
@@ -1728,9 +1772,9 @@ pub const Vm = struct {
                     const cl = try self.makeClosure(closure, child, base);
                     regs[a] = Value.heap(&cl.header);
                 },
-                .get_upval => regs[a] = closure.upvalues[instr.b].get(),
+                .get_upval => regs[a] = self.upvalGet(closure.upvalues[instr.b]),
                 .set_upval => {
-                    closure.upvalues[instr.b].set(regs[a]);
+                    self.upvalSet(closure.upvalues[instr.b], regs[a]);
                     self.heap.writeBarrier(&closure.upvalues[instr.b].header, regs[a]); // no-op until generational
                 },
                 .close_upvalues => self.closeUpvaluesFrom(base + a),
@@ -1754,7 +1798,7 @@ pub const Vm = struct {
                             const cp = cl.proto;
                             const callee_base = base + proto.num_registers;
                             if (self.depth >= max_call_depth) return Error.StackOverflow;
-                            if (callee_base + cp.num_registers > self.stack.len) return Error.StackOverflow;
+                            if (callee_base + cp.num_registers > self.regCapacity()) return Error.StackOverflow;
                             // Lay out the callee window: bind fixed params (nil-fill
                             // any not supplied), nil the rest. Straight-line and
                             // allocation-free — these slots sit above the current
@@ -1762,10 +1806,10 @@ pub const Vm = struct {
                             // may intervene here (none does).
                             var i: usize = 0;
                             while (i < cp.num_registers) : (i += 1) {
-                                self.stack[callee_base + i] = if (i < cp.num_params and i < nargs)
-                                    self.stack[base + a + 1 + i]
+                                self.regSet(callee_base + i, if (i < cp.num_params and i < nargs)
+                                    self.regGet(base + a + 1 + i)
                                 else
-                                    Value.nil();
+                                    Value.nil());
                             }
                             // Varargs cursor: a vararg callee handed more args than
                             // it has fixed params keeps the surplus where they already
@@ -1904,10 +1948,10 @@ pub const Vm = struct {
                     const src = base + result.reg;
                     var k: usize = 0;
                     while (k < want) : (k += 1) {
-                        self.stack[dst + k] = if (k < result.count)
-                            self.stack[src + k]
+                        self.regSet(dst + k, if (k < result.count)
+                            self.regGet(src + k)
                         else
-                            Value.nil();
+                            Value.nil());
                     }
                     if (wants_all) {
                         std.debug.assert(!self.reg_top_pending);
@@ -1932,7 +1976,7 @@ pub const Vm = struct {
                 // surplus-arg region lives below `base` (in the caller's window),
                 // stable and GC-rooted; these never relocate it.
                 .vararg_first => {
-                    regs[a] = if (frame.varargs_count >= 1) self.stack[frame.varargs_base] else Value.nil();
+                    regs[a] = if (frame.varargs_count >= 1) self.regGet(frame.varargs_base) else Value.nil();
                 },
                 .vararg_len => {
                     regs[a] = Value.int(@intCast(frame.varargs_count));
@@ -1944,7 +1988,7 @@ pub const Vm = struct {
                     if (idx_v.isInt()) {
                         const idx = idx_v.asInt();
                         if (idx >= 1 and idx <= @as(i64, @intCast(frame.varargs_count))) {
-                            out = self.stack[frame.varargs_base + @as(usize, @intCast(idx - 1))];
+                            out = self.regGet(frame.varargs_base + @as(usize, @intCast(idx - 1)));
                         }
                     }
                     regs[a] = out;
@@ -1959,9 +2003,9 @@ pub const Vm = struct {
                     std.debug.assert(!self.reg_top_pending);
                     const count = frame.varargs_count;
                     const dest = base + a;
-                    if (dest + count > self.stack.len) return Error.StackOverflow;
+                    if (dest + count > self.regCapacity()) return Error.StackOverflow;
                     var k: usize = 0;
-                    while (k < count) : (k += 1) self.stack[dest + k] = self.stack[frame.varargs_base + k];
+                    while (k < count) : (k += 1) self.regSet(dest + k, self.regGet(frame.varargs_base + k));
                     self.reg_top = dest + count;
                     self.reg_top_pending = true;
                 },
@@ -1983,7 +2027,7 @@ pub const Vm = struct {
                 // Hot traced loops and warming loops keep a 0 slot and always take
                 // the slow path below, so their behaviour is unchanged.
                 if (!self.trace.skipBackEdge(proto, anchor_pc)) {
-                    self.trace.onBackEdge(proto, anchor_pc, regs);
+                    self.trace.onBackEdge(proto, anchor_pc, RegWindow.of(regs));
 
                     // Phase 6 tier-1a entry: if a trace is cached for this loop header
                     // and we're not mid-recording, execute it. `irinterp.execute`
@@ -2063,18 +2107,18 @@ pub const Vm = struct {
                             // that would immediately fail on a guard_int/guard_float
                             // mismatch.  Branch-direction guards (guard_true/false)
                             // aren't fingerprinted — they depend on computed values.
-                            if (!ct.matchesFingerprint(regs)) continue;
+                            if (!ct.matchesFingerprint(RegWindow.of(regs))) continue;
                             any_fingerprint_matched = true;
                             if (self.trace.valuesScratch(ct.instrs.len)) |buf| {
                                 self.trace.entries +%= 1;
                                 const result = if (self.trace.config.record_exec_log) blk: {
-                                    const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, regs, buf);
-                                    const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, regs, buf);
-                                    break :blk irinterp.executeTraced(rec, ct, regs, buf);
+                                    const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, RegWindow.of(regs), buf);
+                                    const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, RegWindow.of(regs), buf);
+                                    break :blk irinterp.executeTraced(rec, ct, RegWindow.of(regs), buf);
                                 } else if (self.trace.config.native_codegen) blk: {
                                     if (self.trace.nativeFor(ct)) |nt| break :blk irinterp.ExecResult{ .completed = nt.run(regs), .exit_instr = std.math.maxInt(u32) };
-                                    break :blk irinterp.execute(ct, regs, buf);
-                                } else irinterp.execute(ct, regs, buf);
+                                    break :blk irinterp.execute(ct, RegWindow.of(regs), buf);
+                                } else irinterp.execute(ct, RegWindow.of(regs), buf);
                                 // Always record the exit instruction — useful for
                                 // per-guard PC debugging even on productive exits.
                                 self.trace.last_exit_instr = result.exit_instr;
@@ -2132,7 +2176,7 @@ pub const Vm = struct {
                                 // it, monotonically), mark it for retirement so its
                                 // anchor slot frees for the stabilised wider-lane
                                 // trace. Deferred to after the walk (see `dead`).
-                                if (ndead < dead.len and self.trace.laneWidenedPast(ct, regs)) {
+                                if (ndead < dead.len and self.trace.laneWidenedPast(ct, RegWindow.of(regs))) {
                                     dead[ndead] = ct;
                                     ndead += 1;
                                 }
@@ -2142,7 +2186,7 @@ pub const Vm = struct {
                                 // PC, look for a side trace there.  This fires
                                 // only after step 4 (side traces) populates the
                                 // cache at non-anchor PCs.
-                                if (self.trace.tryChainExit(ct, result.exit_instr, proto, regs)) |_| {
+                                if (self.trace.tryChainExit(ct, result.exit_instr, proto, RegWindow.of(regs))) |_| {
                                     for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                     continue :outer;
                                 }
@@ -2477,21 +2521,44 @@ pub const Vm = struct {
         for (self.open_upvalues.items) |ou| {
             if (ou.index == index) return ou.cell;
         }
-        const cell = try self.heap.newUpvalue(&self.stack[index]);
+        const cell = try self.heap.newUpvalue(index);
         try self.open_upvalues.append(self.gpa, .{ .index = index, .cell = cell });
         return cell;
     }
 
+    /// Read an upvalue cell's value. Vm-mediated because an *open* cell's value
+    /// lives in the live register stack (the cell holds only the slot index).
+    pub fn upvalGet(self: *const Vm, uv: *const function.Upvalue) Value {
+        return switch (uv.loc) {
+            .open => |index| self.regGet(index),
+            .closed => |v| v,
+        };
+    }
+
+    /// Write an upvalue cell's value. Open ⇒ write through to the live stack slot;
+    /// closed ⇒ update the owned value.
+    pub fn upvalSet(self: *Vm, uv: *function.Upvalue, v: Value) void {
+        switch (uv.loc) {
+            .open => |index| self.regSet(index, v),
+            .closed => uv.loc = .{ .closed = v },
+        }
+    }
+
     /// Close (detach) every open upvalue whose slot index is `>= from`: snapshot
     /// the live value into the cell and drop it from the open list. Called when a
-    /// scope's registers (or a whole frame) are about to be freed.
-    fn closeUpvaluesFrom(self: *Vm, from: usize) void {
+    /// scope's registers (or a whole frame) are about to be freed — including the
+    /// protected-call error unwind (`stdlib/errors.zig`), which discards the
+    /// faulting frames' registers and so must close their upvalues (otherwise an
+    /// escaped closure's cell stays open over a slot above the restored
+    /// `stack_top`, which the GC root scan no longer covers — a dangling value).
+    pub fn closeUpvaluesFrom(self: *Vm, from: usize) void {
         var i = self.open_upvalues.items.len;
         while (i > 0) {
             i -= 1;
             const ou = self.open_upvalues.items[i];
             if (ou.index >= from) {
-                ou.cell.close();
+                // Snapshot the live slot value into the cell (the VM owns the stack).
+                ou.cell.closeWith(self.regGet(ou.index));
                 _ = self.open_upvalues.swapRemove(i);
             }
         }
@@ -2503,7 +2570,7 @@ pub const Vm = struct {
     /// live top is just past it.
     fn stampSingleResult(self: *Vm, base: usize, a: usize, result: Value) void {
         std.debug.assert(!self.reg_top_pending); // exactly one producer pending at a time
-        self.stack[base + a] = result;
+        self.regSet(base + a, result);
         self.reg_top = base + a + 1;
         self.reg_top_pending = true;
     }
@@ -3746,6 +3813,51 @@ test "foundations: pcall catches a bare runtime fault (synthesized message)" {
     try expectProgram(
         "print(pcall(function() return nil + 1 end))\n",
         "false\tanonymous:1: attempt to perform arithmetic on a nil value\n",
+    );
+}
+
+test "pcall unwind closes the faulting frame's escaped upvalue" {
+    // A closure captures a local inside the protected function and escapes (stored
+    // in an outer variable) before the call errors. On unwind the faulting frame's
+    // registers are discarded, so its open upvalue MUST be closed — otherwise it
+    // stays open over a slot that (a) falls above the restored `stack_top`, off the
+    // GC root scan, and (b) gets overwritten by the next call that reuses it. The
+    // `clobber()` call reuses those high slots; `saved()` must still read "live"
+    // (closed snapshot), not the clobbered ints. (Regression: SoA Phase 0
+    // index-based upvalues + pcall unwind.)
+    try expectProgram(
+        \\local saved
+        \\local ok = pcall(function()
+        \\  local x = "live"
+        \\  saved = function() return x end
+        \\  error("boom")
+        \\end)
+        \\local function clobber() local a, b, c = 11, 22, 33 return a + b + c end
+        \\clobber()
+        \\print(ok, saved())
+        \\
+    ,
+        "false\tlive\n",
+    );
+}
+
+test "xpcall unwind closes the faulting frame's escaped upvalue (after handler)" {
+    // Same invariant on the xpcall path: the boundary is restored only after the
+    // message handler runs, and the close must accompany that restore. `clobber()`
+    // reuses the discarded slots; `saved()` must read the closed snapshot 42.
+    try expectProgram(
+        \\local saved
+        \\local ok = xpcall(function()
+        \\  local y = 42
+        \\  saved = function() return y end
+        \\  error("boom")
+        \\end, function(e) return "handled" end)
+        \\local function clobber() local a, b, c = 11, 22, 33 return a + b + c end
+        \\clobber()
+        \\print(ok, saved())
+        \\
+    ,
+        "false\t42\n",
     );
 }
 
