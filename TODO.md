@@ -5,15 +5,31 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 ## Cross-frame tracing — the *cluster lever* (June 2026)
 
 Cross-frame Phase 0 (`docs/design/10-cross-frame-tracing.md`) inlines pure
-local/param-leaf Lua calls. The JIT-inert bench cluster (array3d, nbody, scalar,
-…) does **not** move on Phase 0 because its calls go through shapes Phase 0
-aborts: **upvalue reads in the callee** (nbody), **method / `__index` dispatch**
-(`arr:set`, array3d), **generic-for closure iterators** (array3d's
-`for … in arr:points()`), and **native callees** (scalar's `type`/`tostring`/…,
-correctly never inlined). Moving the cluster needs upvalue + method + iterator
-inlining — each its own change, beyond the current plan. Tripwire: when in-callee
-upvalue inlining lands, `guard_func` must tighten `Proto.id` → closure
-`GcHeader.id`.
+local/param-leaf Lua calls. **Sub-lever 1 — U0 (done, uncommitted):** the recorder
+now also reaches a callee through a loop-invariant **upvalue / global** (entry
+snapshot + `guard_func`), so spectral-norm's inner loop records a trace. No speedup
+yet — that trace carries `guard_func`, which native auto-declines until **U1**
+(native `guard_func` lowering; task #186). The remaining JIT-inert shapes still
+abort: **method / `__index` dispatch** (`arr:set`, array3d), **generic-for closure
+iterators** (array3d's `for … in arr:points()`), and **native callees** (scalar's
+`type`/`tostring`/…, correctly never inlined) — each its own change. Tripwire (still
+open): U0's callee reads no upvalues of *its own*, so `Proto.id` is still a sound
+`guard_func` key; the day we inline a callee whose own body reads an upvalue,
+tighten `Proto.id` → closure `GcHeader.id`.
+
+## nativegen — pre-existing latent shape: conflicting-aux duplicate guards on one slot_load (June 2026)
+
+U1's `guard_func` native lowering hardened its prologue-id scan in `analyzeInner`
+to **bail** if two `guard_func`s cover one snapshot `slot_load` with *different*
+recorded `aux` (the prologue checks one id; the oracle re-checks each and would
+side-exit on the second — a native≠oracle divergence). The **`.ptr`/`guard_lane`
+scan immediately above it has the identical first-match shape** and is *not*
+hardened: two `guard_lane`s on one table `slot_load` with different lane `aux`
+would likewise miscompile. Neither is reachable today (the recorder dedups each
+snapshot to one synthetic slot → one resolved value → one guard), so this is a
+robustness gap in the verifier-gated native subset, not a live bug. If the lane
+path is ever generalized, mirror the func-scan's duplicate-aux bail (and consider
+lifting the check into `proveKinds` to cover all guard kinds uniformly).
 
 ## LuaJIT benchmark corpus — blocked benches (June 2026)
 

@@ -133,6 +133,8 @@ pub fn mapExecutable(code: []const u8) MapError!ExecPage {
 
 const Reg = x64.Reg;
 const object = @import("object.zig");
+const function = @import("function.zig");
+const bytecode = @import("bytecode.zig");
 const TAG_INT: u8 = @intFromEnum(value.Tag.int);
 const TAG_BOOL: u8 = @intFromEnum(value.Tag.boolean);
 const TAG_FLOAT: u8 = @intFromEnum(value.Tag.float);
@@ -146,6 +148,17 @@ const HEADER_TYPE_OFF: i32 = @offsetOf(object.GcHeader, "type");
 /// after the trace was recorded must side-exit to tier-0 (which dispatches
 /// `__index`/`__newindex`), never run the raw native load/store — chunk 2a.
 const METATABLE_OFF: i32 = @offsetOf(table.Table, "metatable");
+/// `ObjectType.function` ordinal — the byte at `GcHeader.type` for a Lua closure.
+/// The cross-frame `guard_func` (U1) checks a snapshot callee value is a closure
+/// of this type before reading its `proto.id`.
+const FUNCTION_TYPE: u8 = @intFromEnum(object.ObjectType.function);
+/// Offset of `Closure.proto` (a `*const Proto`) from a `*GcHeader`. The header is
+/// the first field, so this is the closure's second word.
+const CLOSURE_PROTO_OFF: i32 = @offsetOf(function.Closure, "proto");
+/// Offset of `Proto.id` (a stable `u32` compile-time identity — NOT an address, so
+/// it survives keyframe restore/replay) from a `*const Proto`. `guard_func` compares
+/// the recorded id against `[closure.proto + PROTO_ID_OFF]`.
+const PROTO_ID_OFF: i32 = @offsetOf(bytecode.Proto, "id");
 /// Packed-lane ordinals the native array path can lower. The bool lane (B2/B3,
 /// the nsieve sieve) is bit-packed; the int lanes (B4) are byte-packed and
 /// SIB-indexed; the `f64` lane (Phase D, float arrays) is 8-byte doubles read/
@@ -201,10 +214,16 @@ fn laneConsistent(trace_lane: *?i32, aux: i32) bool {
 ///   - `ptr`   — a raw `*GcHeader` (a `guard_table`-covered table `slot_load`).
 ///               Classified `invariant`, loaded once; **must never** reach
 ///               `exit_stores` (the deopt flush boxes as TAG_INT — C2).
+///   - `func`  — a raw `*GcHeader` for a Lua closure (a `guard_func`-covered
+///               `slot_load`: the cross-frame callee snapshot, U1). Like `.ptr` it
+///               is an invariant heap pointer loaded once and tag-checked TAG_HEAP,
+///               but the prologue verifies it is a closure of the recorded
+///               `Proto.id` (not a table+lane). Consumed ONLY by `guard_func` (an
+///               entry guard) — never feeds arithmetic, an `aref`, or a flush.
 ///   - `aref`  — the paired `(table, index)` addressing token produced by `aref`
 ///               (its register holds `idx0 = index-1`). A distinct kind so it can
 ///               neither feed arithmetic nor be flushed to a slot.
-const Kind = enum { none, int, bool, ptr, aref, float };
+const Kind = enum { none, int, bool, ptr, aref, float, func };
 
 /// A compiled trace: an executable page whose entry is
 /// `fn(tags: [*]u8, payloads: [*]u64) callconv(.c) usize` — the SoA register file's
@@ -319,6 +338,12 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     const table_guarded = gpa.alloc(bool, n) catch return false;
     defer gpa.free(table_guarded);
     @memset(table_guarded, false);
+    // Parallel to `table_guarded`, but for `guard_func` (U1, cross-frame): a
+    // slot_load it covers is the snapshot callee value → classified `.func`
+    // (invariant closure pointer, identity-checked once in the prologue).
+    const func_guarded = gpa.alloc(bool, n) catch return false;
+    defer gpa.free(func_guarded);
+    @memset(func_guarded, false);
     // Per-aref: has a `guard_bounds` on this aref been proven before we reach a
     // `guard_present`/`aload`? [I4 / review] `present` is non-null only when
     // `len > 0`, which a passing `guard_bounds` (idx0 <u len) implies — so the
@@ -362,6 +387,15 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (t.instrs[r].op != .slot_load) return false;
                 table_guarded[r] = true;
             },
+            .guard_func => {
+                const r = ins.a;
+                if (r >= i) return false; // not linear SSA → malformed
+                // A func guard only ever covers the callee-snapshot slot_load (the
+                // recorder emits it on a fresh synthetic input); the native path
+                // hoists it to a prologue closure/proto-id check.
+                if (t.instrs[r].op != .slot_load) return false;
+                func_guarded[r] = true;
+            },
             else => {},
         }
     }
@@ -380,6 +414,8 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                     kinds[i] = .float; // guard_float-covered → float input
                 } else if (table_guarded[i]) {
                     kinds[i] = .ptr; // guard_table-covered → invariant table pointer
+                } else if (func_guarded[i]) {
+                    kinds[i] = .func; // guard_func-covered → invariant callee closure
                 } else {
                     return false; // unguarded → cannot prove a kind
                 }
@@ -489,6 +525,14 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .guard_table => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .ptr) return false;
+                kinds[i] = .none;
+            },
+            // guard_func (U1, cross-frame): covers the callee-snapshot slot_load
+            // (proven `.func`). Pinned to a prologue identity check (closure type +
+            // recorded `Proto.id`); lowers to nothing in the body, like guard_table.
+            .guard_func => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .func) return false;
                 kinds[i] = .none;
             },
             .guard_lane => {
@@ -755,6 +799,10 @@ const SlotInfo = struct {
     /// For a `.ptr` (table) invariant slot: the bool-lane ordinal its `guard_lane`
     /// pins, checked once in the prologue. `-1` for non-`.ptr` slots.
     lane: i32,
+    /// For a `.func` (cross-frame callee snapshot) invariant slot: the recorded
+    /// `Proto.id` its covering `guard_func` pins, checked once in the prologue
+    /// (closure type + this id). Unused (0) for non-`.func` slots.
+    func_id: u32 = 0,
     /// win 2: the store_ref transient was allocated *into* home, so the op updates the
     /// home in place and the back-edge shuffle move for this slot self-elides. Only set
     /// for `carried` slots passing the safety predicate (see `analyzeInner`).
@@ -868,6 +916,8 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
         // analogue (aref token + value).
         .aref, .astore, .astore_append => .{ .a = true, .b = true },
         .aload, .guard_bounds, .guard_present, .guard_table, .guard_lane => .{ .a = true, .b = false },
+        // guard_func reads the callee-snapshot value it identity-checks (a).
+        .guard_func => .{ .a = true, .b = false },
         // guard_fits reads the value it range-checks (a); guard_append reads the aref
         // token (a) and reaches len/cap/hash through aref.a — no second operand.
         .guard_fits, .guard_append => .{ .a = true, .b = false },
@@ -1003,6 +1053,32 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         }
         // proveKinds only set .ptr via a guard_table; a guard_lane must accompany it
         // (the recorder always emits both). Defensive: bail rather than miscompile.
+        if (!found) return error.Bail;
+    }
+    // A `.func` (cross-frame callee snapshot) invariant slot carries the recorded
+    // `Proto.id` from its covering `guard_func`, checked once in the prologue (the
+    // upvalue/global cell is re-resolved + re-seeded each entry, so it cannot change
+    // within a native run). Locate the guard_func and stash its id on the slot.
+    for (slots.items) |*s| {
+        if (s.kind != .func) continue;
+        const lr: u16 = @intCast(s.load_ref);
+        var found = false;
+        for (t.instrs) |g| {
+            if (g.op == .guard_func and g.a == lr) {
+                if (found and @as(u32, @bitCast(g.aux)) != s.func_id) {
+                    // Two guard_funcs on one snapshot with *different* recorded ids:
+                    // the prologue checks one id, but the oracle re-checks each and
+                    // would side-exit on the second — a divergence. The recorder never
+                    // emits this (dedup → one synthetic slot → one resolved closure →
+                    // one id), so it can only arise malformed. Bail, don't miscompile.
+                    return error.Bail;
+                }
+                s.func_id = @bitCast(g.aux);
+                found = true;
+            }
+        }
+        // proveKinds only set .func via a guard_func, so one always exists.
+        // Defensive: bail rather than miscompile.
         if (!found) return error.Bail;
     }
 
@@ -1584,7 +1660,7 @@ fn refHomeBaseReg(a: *x64.Assembler, s: SlotInfo, scratch: Reg) !Reg {
             try a.movRegMem(scratch, .rsp, d);
             return scratch;
         },
-        .xmm => unreachable, // only `.ptr` table slots reach here, never float
+        .xmm => unreachable, // only `.ptr`/`.func` heap-pointer slots reach here, never float
     }
 }
 
@@ -2045,7 +2121,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     for (alloc.slots) |s| {
         if (s.class == .write_only) continue;
         const tag: u8 = switch (s.kind) {
-            .ptr => TAG_HEAP,
+            .ptr, .func => TAG_HEAP, // both are invariant heap pointers
             .float => TAG_FLOAT,
             else => TAG_INT,
         };
@@ -2090,6 +2166,29 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         try a.jcc(.ne, prologue_fail);
     }
 
+    // [U1-prologue] For each `.func` slot the callee pointer is now in its home;
+    // verify it is a Lua closure of the recorded `Proto.id` — the cross-frame
+    // snapshot guard, checked once here (the upvalue/global cell is re-resolved and
+    // re-seeded each entry, so it cannot change within a single native run; a
+    // `set_upval`/`set_global` in the traced region aborts recording). A miss returns
+    // 0 (regs[] untouched), side-exiting to tier-0 which really pushes the call frame
+    // and re-runs the iteration. Byte-identical to irinterp's `guard_func` arm: heap
+    // + type==function + `closure.proto.id == aux`.
+    for (alloc.slots) |s| {
+        if (s.class == .write_only or s.kind != .func) continue;
+        const preg = try refHomeBaseReg(a, s, .rax);
+        // header.type == function (the payload is a TAG_HEAP `*GcHeader`).
+        try a.cmpByteMemImm(preg, HEADER_TYPE_OFF, FUNCTION_TYPE);
+        try a.jcc(.ne, prologue_fail);
+        // proto = [closure + CLOSURE_PROTO_OFF]; then proto.id == recorded id. rax is
+        // a free scratch here (never a home); it may also BE `preg` for a spilled home
+        // (refHomeBaseReg loaded the closure into rax), and overwriting it with the
+        // proto pointer is fine — the closure pointer is dead after this load.
+        try a.movRegMem(.rax, preg, CLOSURE_PROTO_OFF);
+        try a.cmpDwordMemImm(.rax, PROTO_ID_OFF, s.func_id);
+        try a.jcc(.ne, prologue_fail);
+    }
+
     // [Phase 2] Materialize the invariant array bases ONCE, now that each `.ptr` slot
     // is proven a table of the recorded lane. `data`/`present` pointers and `len` are
     // fixed for the whole native run (B5), so they live in dedicated registers and the
@@ -2129,7 +2228,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // guard_float joins the hoisted/redundant no-ops: a guard on a slot_load is
             // the prologue TAG_FLOAT tag-check; a guard on a derived float is statically
             // discharged (proveKinds proved the kind) — both emit nothing here.
-            .slot_load, .guard_int, .guard_float, .guard_table, .guard_lane => {},
+            // guard_func joins the hoisted no-ops: the closure identity check is in
+            // the prologue (loop-invariant snapshot), so nothing here.
+            .slot_load, .guard_int, .guard_float, .guard_table, .guard_lane, .guard_func => {},
             .konst => {
                 const bits = t.consts[@intCast(ins.aux)].payload.bits;
                 switch (placeOfRef(alloc, i)) {
@@ -2528,7 +2629,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     }
                     try a.jcc(.e, deopt_exit); // false (0) → side-exit
                 },
-                .none, .ptr, .aref, .float => unreachable, // proveKinds restricts to int/bool
+                .none, .ptr, .aref, .float, .func => unreachable, // proveKinds restricts to int/bool
             },
             .guard_false => switch (kinds[ins.a]) {
                 .int => try a.jmp(deopt_exit), // an int is never falsy → always side-exit
@@ -2540,7 +2641,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     }
                     try a.jcc(.ne, deopt_exit); // true (≠0) → side-exit
                 },
-                .none, .ptr, .aref, .float => unreachable, // proveKinds restricts to int/bool
+                .none, .ptr, .aref, .float, .func => unreachable, // proveKinds restricts to int/bool
             },
             .loop => {
                 // [RV-2] write-only slots commit to regs[] BEFORE the shuffle, so the
@@ -4106,6 +4207,107 @@ test "nativegen: guard_table failure side-exits natively with completed==0" {
     // r0 is an int, not a table → the prologue guard_table check fails (completed==0,
     // regs untouched). The oracle agrees.
     try expectMatch(&tr, &.{ Value.int(99), Value.int(2), Value.nil() });
+}
+
+/// `while (i < limit) { acc += i; i += 1 }` with an extra invariant `.func`
+/// snapshot slot (slot 3) guarded by a `guard_func aux=guard_id` at the top — the
+/// cross-frame callee identity check (U1). The guard is an entry guard hoisted to
+/// the prologue: when the snapshot closure's `proto.id` matches `guard_id` it runs
+/// the whole loop; on a mismatch the prologue side-exits (completed==0, regs
+/// untouched), exactly like the tier-1a oracle's `guard_func` arm.
+fn funcGuardTrace(full: *[16]I, consts: *[1]Value, es: *[0]u16, guard_id: u32) Trace {
+    consts.* = .{Value.int(1)};
+    full.* = .{
+        .{ .op = .slot_load, .aux = 3 }, // 0: func snapshot (invariant, slot 3)
+        .{ .op = .guard_func, .a = 0, .aux = @bitCast(guard_id) }, // 1: callee identity
+        .{ .op = .slot_load, .aux = 0 }, // 2: i
+        .{ .op = .slot_load, .aux = 1 }, // 3: limit
+        .{ .op = .guard_int, .a = 2 }, // 4
+        .{ .op = .guard_int, .a = 3 }, // 5
+        .{ .op = .lt, .a = 2, .b = 3 }, // 6: i < limit
+        .{ .op = .guard_true, .a = 6 }, // 7
+        .{ .op = .slot_load, .aux = 2 }, // 8: acc
+        .{ .op = .guard_int, .a = 8 }, // 9
+        .{ .op = .add, .a = 8, .b = 2 }, // 10: acc + i
+        .{ .op = .konst, .aux = 0 }, // 11: 1
+        .{ .op = .add, .a = 2, .b = 11 }, // 12: i + 1
+        .{ .op = .phi, .b = 10, .aux = 2 }, // 13: acc carry
+        .{ .op = .phi, .b = 12, .aux = 0 }, // 14: i carry
+        .{ .op = .loop }, // 15
+    };
+    return Trace{ .anchor = undefined, .instrs = full, .consts = consts, .entry_slots = es, .entry_guards = &.{} };
+}
+
+test "nativegen: guard_func passes when the snapshot closure matches the recorded proto.id" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var proto = bytecode.Proto{ .code = &.{}, .name = "callee", .id = 7 };
+    const cl = try function.Closure.create(gpa, &proto, 0);
+    defer cl.destroy(gpa);
+
+    var full: [16]I = undefined;
+    var consts: [1]Value = undefined;
+    var es = [_]u16{};
+    const t = funcGuardTrace(&full, &consts, &es, 7); // guard id == proto.id
+
+    // i=1..5, limit=5 → 4 iterations (acc=10); func snapshot in slot 3 passes the
+    // prologue identity check every entry, so it never side-exits on the guard.
+    try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.int(0), Value.heap(&cl.header) });
+}
+
+test "nativegen: guard_func side-exits when the snapshot closure has a different proto.id" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var proto = bytecode.Proto{ .code = &.{}, .name = "callee", .id = 9 };
+    const cl = try function.Closure.create(gpa, &proto, 0);
+    defer cl.destroy(gpa);
+
+    var full: [16]I = undefined;
+    var consts: [1]Value = undefined;
+    var es = [_]u16{};
+    const t = funcGuardTrace(&full, &consts, &es, 7); // recorded id 7 ≠ closure's 9
+
+    // The prologue `cmp [proto+id], 7` fails → completed==0, regs untouched. The
+    // oracle's guard_func arm side-exits at instr 1 identically.
+    try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.int(0), Value.heap(&cl.header) });
+}
+
+test "nativegen: guard_func side-exits when the snapshot value is not a closure" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    var full: [16]I = undefined;
+    var consts: [1]Value = undefined;
+    var es = [_]u16{};
+    const t = funcGuardTrace(&full, &consts, &es, 7);
+
+    // slot 3 holds an int, not a heap closure → the prologue TAG_HEAP tag-check
+    // fails before the identity check (completed==0, regs untouched). The oracle's
+    // `isHeap()` guard side-exits at instr 1 identically.
+    try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.int(0), Value.int(42) });
+}
+
+test "nativegen: two guard_funcs with conflicting ids on one snapshot decline native" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // A malformed trace the recorder never emits (dedup gives one synthetic slot →
+    // one resolved closure → one id): two guard_funcs on slot_load 0 with *different*
+    // recorded ids. The prologue can only hoist one id; the oracle re-checks each and
+    // would side-exit on the second — a native≠oracle divergence. `analyzeInner`'s
+    // duplicate-aux bail must decline native (tier-1a stays the oracle) rather than
+    // miscompile.
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 3 }, // 0: func snapshot
+        .{ .op = .guard_func, .a = 0, .aux = 7 }, // 1: id 7
+        .{ .op = .guard_func, .a = 0, .aux = 8 }, // 2: conflicting id 8
+        .{ .op = .slot_load, .aux = 0 }, // 3: i
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .konst, .aux = 0 }, // 5: 1
+        .{ .op = .add, .a = 3, .b = 5 }, // 6: i + 1
+        .{ .op = .phi, .b = 6, .aux = 0 }, // 7: i carry
+        .{ .op = .loop }, // 8
+    };
+    var consts = [_]Value{Value.int(1)};
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+    try expectBail(&t);
 }
 
 /// An f64-lane table with keys 2..K mapping to distinct doubles (`i * 0.5`).

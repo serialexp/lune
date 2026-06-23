@@ -1,10 +1,10 @@
 # lune — cross-frame tracing (inline Lua calls into a trace) — Design
 
-Status: partial — Phase 0 (recorder mechanism + leaf-call inlining on the tier-1a
-oracle) landed & green; all 8 modes byte-identical + replay. Phases 1–3
-outstanding. **Scope caveat below: the JIT-inert bench cluster does *not* move in
-Phase 0** — its calls go through upvalue / method / generic-for-iterator / native
-shapes that Phase 0 aborts by design.
+Status: partial — Phase 0 (leaf-call inlining) + cluster Sub-lever 1 **U0**
+(callee-via-upvalue/global recording) + **U1** (native `guard_func` lowering — the
+speedup) landed & green; all 8 modes byte-identical + replay. **spectral-norm's
+inner loop now runs native (~2×: jit 51 ms vs tier-0 104 ms).** Phases 2–3 and the
+method/iterator cluster levers outstanding.
 Owner: Bart
 Last updated: 2026-06-23
 
@@ -59,16 +59,61 @@ they land; move whole sections to "done" once everything inside them is checked.
   call chain …` (genuine depth-2 via a function passed as a *parameter*, verified
   by two `guard_func` ops in `--dump-traces`) — both byte-identical across
   {stress×{off,record-only,no-opt,record-execute,native}} and keyframe restore.
+- [x] **Cluster Sub-lever 1 — U0: record a callee reached via UPVALUE / GLOBAL
+  (tier-1a, no speedup).** The recorder's `recordOne` switch grew `.get_upval` and
+  `.get_global` arms (`recInputGet`). A callee reached through a loop-invariant
+  upvalue/global is a value the executor cannot read (no `*Vm`, no closure), so the
+  recorder snapshots it: it allocates a synthetic input slot *above* the anchor
+  window (counter from `anchor_num_registers`, deduped per source), emits a
+  `slot_load` on that slot + (when the value is a function) a `guard_func`, and
+  records one `InputSeed { kind, source, slot }` on the `Trace`. The dispatch loop
+  (`src/interp.zig`) pre-resolves the value at record time (`upvalGet` / `globals.get`,
+  passed as `recordInstr(… , resolved)`) and re-seeds the slab slot every entry via
+  `seedTraceInputs`, widening the executor `RegWindow` to `num_registers + n_inputs`
+  (declining the entry if it would overflow `regCapacity`). `set_upval`/`set_global`
+  stay out of the switch → abort (the snapshot is only sound while the cell is
+  stable). `assertWellFormed`'s slot bound is widened to
+  `anchor_num_registers + n_inputs` for `slot_load` while φ stays pinned to the
+  anchor window. `tryChainExit` skips input-carrying side traces (no `*Vm` to seed
+  there). No new IR op; native still auto-declines (`guard_func`). Tests: `recorder:
+  a callee reached through an upvalue …` / `… a global …` (assert one `InputSeed`, a
+  `slot_load` on its slot ≥ anchor window, a `guard_func`); `recorder: a set_upval/
+  set_global in the loop body aborts cleanly` (0 traces, gated); 8-mode `cross-frame:
+  a callee reached through an upvalue / a global inlines …` (60100) + `… a changed
+  upvalue callee deopts the snapshot and replays byte-identically` (per-entry
+  re-resolve + `guard_func` side-exit on a proto-Y closure).
+
+- [x] **Phase 1 / Sub-lever 1 U1 — native lowering of `guard_func` (the speedup).**
+  A new `Kind = .func` (in `nativegen.zig`) mirrors `.ptr`: an invariant heap
+  pointer, GP home, prologue tag-checked `TAG_HEAP`, loaded once, consumed **only**
+  by `guard_func`, never feeding arithmetic/`aref`/a flush, so it never reaches
+  `exit_stores`/`flushSlot` (same C2 safety as `.ptr`). `proveKinds` Pass A marks a
+  `slot_load` covered by a `guard_func` as `func_guarded`; Pass B classifies it
+  `.func` and validates each `guard_func`'s operand kind (`→ .none`).
+  `analyzeInner` stashes the recorded `Proto.id` (`guard_func.aux`) onto the slot —
+  and **bails if two `guard_func`s cover one snapshot with conflicting ids** (a
+  shape the recorder never emits — dedup gives one synthetic slot → one resolved
+  closure → one id — but the prologue can hoist only one check while the oracle
+  re-checks each, so a malformed trace must decline native rather than diverge).
+  The check is hoisted to the **prologue** (the snapshot is loop-invariant —
+  re-resolved + re-seeded each entry; a `set_upval`/`set_global` in the region
+  aborts recording): for each `.func` slot, `cmp [closure].type == function`;
+  `mov proto, [closure+proto_off]`; `cmp [proto].id == recorded`; `jne
+  prologue_fail` (returns 0, regs untouched → tier-0 re-runs the iteration). The
+  sequence is byte-identical in outcome to irinterp's `guard_func` arm
+  (`isHeap() ∧ heapType()==function ∧ proto.id==aux`). The body lowers `guard_func`
+  to nothing (it joins the hoisted no-ops with `slot_load`/`guard_int`/…). Offsets
+  are `@offsetOf` (layout-drift-proof). Same op for both the leaf-call corpus and
+  the U0 upvalue/global cluster traces. Reviewed by Codex + Antigravity (cleared
+  oracle-identity for every callee value, `.func` escape analysis, `rax`-scratch
+  safety, offset correctness; the conflicting-aux divergence Codex flagged is now
+  the defensive bail above). Tests: `nativegen: guard_func passes / side-exits on
+  different proto.id / side-exits on a non-closure` (`expectMatch` vs the oracle) +
+  `nativegen: two guard_funcs with conflicting ids … decline native` (`expectBail`).
+  spectral-norm's inner loop runs native (task #186).
 
 ### Outstanding
 
-- [ ] **Phase 1 — native lowering of `guard_func`.** Admit it in
-  `nativegen.proveKinds` A/B (single ref operand, no kind change — same shape as an
-  entry guard), add `isTransient`/`operandReads` arms, and lower it: load the
-  callee value, extract `asClosure().proto.id`, `cmp` to the recorded const, `jne`
-  → the existing deopt stub. No prologue/ABI change. **This is the speedup** — but
-  see the cluster caveat: it speeds up *leaf-call* traces, which the inert cluster
-  does not currently produce.
 - [ ] **Phase 2 — fixed multi-result broadening.** Generalise the `.ret` mapping to
   `produced`/`want` with nil-pad/truncate, fixed counts only; keep the dynamic
   multret abort. Tests for `want>1`, `produced<want`, `produced>want`, `want==0`.
@@ -76,13 +121,16 @@ they land; move whole sections to "done" once everything inside them is checked.
   proto to inline while `inline_depth < cap` (deterministic counter bound, à la
   `recunroll`); enable `(proto.id, pc)` exit identity in `tryChainExit` so a deep
   side trace links. Verify the cap aborts the unbounded case cleanly.
-- [ ] **Cluster lever (beyond this plan) — upvalue / method / iterator inlining.**
-  The JIT-inert cluster (array3d, nbody, scalar, …) calls through shapes Phase 0
-  aborts. Moving it needs in-callee upvalue reads, method (`__index`/field) call
-  dispatch, and generic-for iterator inlining — each its own change. **Tripwire:**
-  the day upvalue inlining lands, `guard_func` must tighten from `Proto.id` to the
-  closure's `GcHeader.id` (two closures over one proto are no longer
-  trace-identical once an upvalue is read).
+- [ ] **Cluster lever (beyond this plan) — method / iterator inlining.** Sub-lever 1
+  (callee reached via upvalue/global) is done at U0; the remaining JIT-inert shapes
+  (array3d, nbody, …) call through *methods* (`__index`/field) and *generic-for
+  iterators*, each its own change. **Tripwire (still open):** U0 reaches the callee
+  *through* an upvalue but the inlined callee reads no upvalues of its *own*, so
+  `Proto.id` is still a sound `guard_func` key (any closure of that proto is
+  interchangeable). The day we inline a callee whose *own body* executes
+  `get_upval`, `guard_func` must tighten from `Proto.id` to the closure's
+  `GcHeader.id` (two closures over one proto are no longer trace-identical once the
+  body reads an upvalue).
 
 ## Why this exists
 
@@ -134,9 +182,10 @@ S1–S3 rails are what *enforce* this rather than assume it.
 
 - Multi-frame side-exit snapshots / off-trace mid-call exits — the
   replay-from-header model makes them unnecessary.
-- Upvalue / global / metatable / method / generic-for-iterator / table-construct
-  inlining — each stays an abort (this is precisely why the inert cluster does not
-  move in Phase 0; see the cluster caveat).
+- Metatable / method / generic-for-iterator / table-construct inlining — each stays
+  an abort (Phase 0). **Updated:** reaching a callee through an upvalue/global is now
+  in scope via Sub-lever 1 (U0 records it; U1 lowers it native). A callee whose *own
+  body* reads upvalues, and method/iterator dispatch, remain out of scope.
 - Native callees — they cross the embedding boundary (`host_barrier`), correctly
   never inlined.
 - Native-codegen *quality* (the residual vs LuaJIT on already-traced loops).
@@ -161,6 +210,69 @@ hold; each is a silent out-of-bounds slab access if violated (the executor index
 - **S3 — pin the verifier bound** to `anchor_num_registers`, not the grown
   `reg_map.len`, so `assertWellFormed` actually catches an OOB callee `aux`.
 
+## Cluster Sub-lever 1 — reach a callee through an UPVALUE / GLOBAL
+
+Phase 0 inlines a callee reached as a plain register value (local/param). The
+JIT-inert cluster does not produce those: **spectral-norm**'s inner loop
+`a = a + x[j] * A(i,j)` reaches `A` through an *upvalue*, so Phase 0 aborted on the
+`get_upval`. Sub-lever 1 admits that shape (and the loop-invariant *global* analogue
+`function f() … end; for i do f(i) end`).
+
+**The hard constraint.** The trace executor has **no `*Vm` and no closure** (tier-1a
+is `execute(t, regs, values)`; the native ABI is just `(tags, payloads)` of the
+`RegWindow`). An upvalue/global value can therefore only be obtained in the
+**dispatch loop** (`src/interp.zig`), which owns the Vm and the frame's `closure`.
+
+**Approach A — entry-snapshot input (chosen).** The callee upvalue/global is
+*loop-invariant*, so resolve it **once per entry**, snapshot it into a dead slab
+slot *above* the frame window, guard it, and let the executor read it as an ordinary
+`slot_load`. **No new IR op** — reuse `slot_load` + `guard_func`. Mechanically:
+
+- **Record time** (`recInputGet` in `src/trace.zig`): the dispatch loop pre-resolves
+  the live value (`upvalGet(closure.upvalues[b])` / `globals.get(proto.constants[b])`)
+  and passes it to `recordInstr(… , resolved)` — it must come from the closure/globals
+  because `recordInstr` runs *before* tier-0 executes the `get_upval`, so `regs.get(dest)`
+  is not yet populated. The recorder allocates a synthetic slot from a counter
+  starting at `anchor_num_registers` (deduped per `(kind, source)`), emits
+  `slot_load aux=slot`, appends the slot to `entry_slots`, records one
+  `InputSeed { kind, source, slot }`, and — when the resolved value is a function —
+  emits `guard_func a=<that ref>, aux=@bitCast(proto.id)`. Restricted to the anchor
+  frame (`inline_depth != 0` → abort): the dispatch loop only has the anchor frame's
+  closure/proto at entry.
+- **Entry time** (`seedTraceInputs` in `src/interp.zig`): before running the trace,
+  re-resolve each `InputSeed` and write it into its slab slot, then build the
+  executor `RegWindow` as `frameWindow(base, num_registers + n_inputs)` — declining
+  the entry (run tier-0) if `base + count` would exceed `regCapacity`. The
+  `[base+num_registers, …)` region holds no live child frame at a normal loop
+  back-edge entry, so the synthetic slots are dead scratch.
+
+**Correctness condition: value stability, not openness.** The snapshot is
+re-resolved and re-guarded **every entry** (a cross-entry change → `guard_func`
+deopt), and within one trace run nothing writes the cell (the callee body is pure
+SSA; `set_upval`/`set_global` in the traced region **abort** — they are not in the
+record switch). Open upvalues are therefore fine: we never need to *write* the cell
+through the trace, only read a stable snapshot of it.
+
+**`Proto.id` still suffices here.** We reach the callee *through* an upvalue, but the
+inlined callee `A` reads no upvalues of *its own*, so any closure of that proto is
+interchangeable and `Proto.id` is the right `guard_func` key. (The
+`Proto.id → GcHeader.id` tighten in the cluster-lever tripwire fires only when we
+later inline a callee whose *own body* executes `get_upval` — not here.)
+
+Why not the alternatives: extending the native ABI to pass the closure + a real
+`upval_load` op (B) cannot resolve *open* upvalues in the executor (needs
+`vm.regGet`) and breaks the 2-arg ABI; baking the resolved closure pointer as a
+konst (C) breaks keyframe-restore/replay (pointers move; ids are preserved — the
+exact reason `guard_func` keys on `Proto.id`).
+
+**Verifier & chaining adjustments.** `assertWellFormed`'s `slot_load` bound widens
+to `[0, anchor_num_registers + n_inputs)` — the deliberate, guarded counterpart to
+S3 — while φ stays pinned to `[0, anchor_num_registers)` (inputs are read-only, never
+loop-carried). `tryChainExit` skips input-carrying side traces: the chain path has
+no `*Vm` to seed the inputs, so such a trace must enter only through the dispatch
+loop. The `InputSeed` table is runtime-only (not serialized; precedent:
+`entry_guards`).
+
 ## Phasing
 
 See the implementation-status checklist above for the authoritative per-phase
@@ -176,15 +288,19 @@ bounded recursion + exit chaining.
   programs shaped like the determinism corpus, not array3d/nbody/scalar. Whether to
   do Phase 1 next or jump to the upvalue/method/iterator cluster lever is a
   prioritisation call for Bart.
-- [ ] **`Proto.id` → `GcHeader.id` tighten timing.** Safe while upvalue reads
-  abort; must tighten the instant in-callee upvalue inlining lands (tracked as the
-  cluster-lever tripwire above).
+- [ ] **`Proto.id` → `GcHeader.id` tighten timing.** Still safe after Sub-lever 1:
+  U0 reaches the callee *through* an upvalue but the inlined callee reads no upvalues
+  of its *own*, so `Proto.id` remains a sound key. Must tighten the instant we inline
+  a callee whose own body executes `get_upval` (tracked as the cluster-lever tripwire
+  above).
 
 ## References
 
 - LuaJIT: `lj_record.c` (`lj_record_call`/`lj_record_ret`), `lj_snap.c`
   (`snapshot_framelinks` — the machinery lune avoids), `recunroll` (Phase 3
   recursion bound).
-- `src/trace.zig` (`recCall`/`recReturn`, S1–S3, `assertWellFormed`),
-  `src/irinterp.zig` (`.guard_func` arm), `src/tropt.zig` (`kindOf`),
-  `docs/design/01`/`02`/`04`/`07`.
+- `src/trace.zig` (`recCall`/`recReturn`, S1–S3, `assertWellFormed`; Sub-lever 1:
+  `recInputGet`, `InputSeed`, `Trace.inputs`), `src/interp.zig` (Sub-lever 1:
+  `seedTraceInputs`, the pre-resolve at the `recordInstr` call site, the widened
+  `RegWindow` at trace entry), `src/irinterp.zig` (`.guard_func` arm),
+  `src/tropt.zig` (`kindOf`), `docs/design/01`/`02`/`04`/`07`.

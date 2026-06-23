@@ -783,6 +783,35 @@ pub const Vm = struct {
         return RegWindow.of(self.tags[base .. base + count], self.payloads[base .. base + count]);
     }
 
+    /// Cross-frame tracing cluster sub-lever 1: seed a trace's synthetic
+    /// upvalue/global inputs and return the executor `RegWindow` widened to cover
+    /// them, or `null` if the widened window would overflow the register stack
+    /// (decline the entry → tier-0 owns the loop). An input-free trace returns the
+    /// caller's narrow window unchanged (the common case, no allocation/seeding).
+    ///
+    /// Each input is loop-invariant for the traced region, so it is re-resolved and
+    /// re-seeded on *every* entry (`upvalGet`/`globals.get`, against the anchor
+    /// frame's `closure`/`proto` — the recorder only ever snapshots anchor-frame
+    /// reads). The synthetic slots live in the dead scratch above the anchor frame
+    /// window (`[base+num_registers, …)`), which holds no live child frame at a
+    /// loop back-edge entry, so writing them clobbers nothing tier-0 will read. The
+    /// trace's `slot_load`s read them back; a `guard_func` (or a downstream type
+    /// guard) deopts if the snapshot changed since recording.
+    fn seedTraceInputs(self: *Vm, ct: *const trace.Trace, base: usize, closure: *const function.Closure, proto: *const Proto, narrow: RegWindow) ?RegWindow {
+        if (ct.inputs.len == 0) return narrow;
+        var count: usize = proto.num_registers;
+        for (ct.inputs) |seed| count = @max(count, @as(usize, seed.slot) + 1);
+        if (base + count > self.regCapacity()) return null;
+        for (ct.inputs) |seed| {
+            const v = switch (seed.kind) {
+                .upvalue => self.upvalGet(closure.upvalues[seed.source]),
+                .global => self.globals.get(proto.constants[seed.source]),
+            };
+            self.regSet(base + seed.slot, v);
+        }
+        return self.frameWindow(base, count);
+    }
+
     // ---- native / callValue boundary scratch --------------------------------
     // The native ABI (`NativeFn`/`NativeMultiFn`/`callValue`) speaks contiguous
     // `[]Value` slices, which the SoA register file cannot view directly. These
@@ -1644,7 +1673,21 @@ pub const Vm = struct {
             // recording is live (`runFastPath`), and the back-edge handoff below
             // flips to `.full` the instant `onBackEdge` arms a recording, so the
             // very next instruction is mirrored.
-            if (mode == .full and self.trace.isRecording()) self.trace.recordInstr(instr, regs, proto, @intCast(pc));
+            if (mode == .full and self.trace.isRecording()) {
+                // Cluster sub-lever 1: the recorder snapshots a callee reached
+                // through an upvalue/global as a synthetic trace input, but it has
+                // no `*Vm`/closure to resolve the live value — so resolve it here
+                // (where `closure`/`globals` are in scope) and pass it through.
+                // `nil` (ignored) for every other opcode. This runs *before* tier-0
+                // executes the instruction, so the value is read from the source,
+                // not the not-yet-written destination register.
+                const resolved: Value = switch (instr.op) {
+                    .get_upval => self.upvalGet(closure.upvalues[instr.b]),
+                    .get_global => self.globals.get(proto.constants[instr.b]),
+                    else => Value.nil(),
+                };
+                self.trace.recordInstr(instr, regs, proto, @intCast(pc), resolved);
+            }
             const a: usize = instr.a;
             switch (instr.op) {
                 // ---- loads & moves ---- (direct lane writes; no `Value` built)
@@ -2261,16 +2304,23 @@ pub const Vm = struct {
                                 saw_native_unsupported = true;
                                 continue;
                             }
+                            // Cluster sub-lever 1: a trace that reaches a callee
+                            // through an upvalue/global carries synthetic entry
+                            // inputs. Seed each into the dead slab region above the
+                            // anchor window and widen the executor window to cover
+                            // them; an input-free trace reuses the narrow `regs`. A
+                            // capacity overflow declines the entry (run tier-0).
+                            const trace_regs = self.seedTraceInputs(ct, base, closure, proto, regs) orelse continue;
                             if (self.trace.valuesScratch(ct.instrs.len)) |buf| {
                                 self.trace.entries +%= 1;
                                 const result = if (self.trace.config.record_exec_log) blk: {
-                                    const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, regs, buf);
-                                    const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, regs, buf);
-                                    break :blk irinterp.executeTraced(rec, ct, regs, buf);
+                                    const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, trace_regs, buf);
+                                    const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, trace_regs, buf);
+                                    break :blk irinterp.executeTraced(rec, ct, trace_regs, buf);
                                 } else if (self.trace.config.native_codegen) blk: {
-                                    if (self.trace.nativeFor(ct)) |nt| break :blk irinterp.ExecResult{ .completed = nt.run(regs), .exit_instr = std.math.maxInt(u32) };
-                                    break :blk irinterp.execute(ct, regs, buf);
-                                } else irinterp.execute(ct, regs, buf);
+                                    if (self.trace.nativeFor(ct)) |nt| break :blk irinterp.ExecResult{ .completed = nt.run(trace_regs), .exit_instr = std.math.maxInt(u32) };
+                                    break :blk irinterp.execute(ct, trace_regs, buf);
+                                } else irinterp.execute(ct, trace_regs, buf);
                                 // Always record the exit instruction — useful for
                                 // per-guard PC debugging even on productive exits.
                                 self.trace.last_exit_instr = result.exit_instr;
@@ -4035,6 +4085,70 @@ test "cross-frame: a two-deep call chain inlines and stays byte-identical" {
         \\
     ,
         "15240\n",
+    );
+}
+
+test "cross-frame: a callee reached through an upvalue inlines and stays byte-identical" {
+    // Cluster sub-lever 1, the canonical replay-safety proof. The hot loop lives in
+    // `inner`, whose body calls `A` — reached not as a local/param but through an
+    // *upvalue* (`get_upval`). The recorder cannot read an upvalue from the executor
+    // (no `*Vm`, no closure there), so it snapshots the loop-invariant callee into a
+    // synthetic slab slot above the anchor window, emits a `slot_load` + `guard_func`,
+    // and the dispatch loop re-seeds that slot every entry. This must match what
+    // tier-0 computes by really resolving the upvalue and calling `A`, across all 8
+    // modes AND a keyframe restore — proving the snapshot+guard is deterministic and
+    // that `guard_func` keyed on the stable `Proto.id` survives replay.
+    try expectProgram(
+        \\local function A(i, j) return i * 100 + j end
+        \\local function inner()
+        \\  local s = 0
+        \\  for j = 1, 200 do s = s + A(2, j) end
+        \\  return s
+        \\end
+        \\print(inner())
+        \\
+    ,
+        "60100\n",
+    );
+}
+
+test "cross-frame: a callee reached through a global inlines and stays byte-identical" {
+    // The global analogue of the upvalue case. `A` is a loop-invariant *global*
+    // (`get_global`, a raw `globals.get` with no `__index` dispatch), snapshotted and
+    // guarded the same way. Byte-identical across all 8 modes + keyframe restore is
+    // the proof the global snapshot+guard replays deterministically.
+    try expectProgram(
+        \\function A(i, j) return i * 100 + j end
+        \\local s = 0
+        \\for j = 1, 200 do s = s + A(2, j) end
+        \\print(s)
+        \\
+    ,
+        "60100\n",
+    );
+}
+
+test "cross-frame: a changed upvalue callee deopts the snapshot and replays byte-identically" {
+    // The snapshot's load-bearing guard. The first `inner()` records a trace whose
+    // `guard_func` pins proto X (the first `A`). Reassigning the captured upvalue `A`
+    // to a different-proto closure means the second `inner()` re-resolves the snapshot
+    // to proto Y on entry; `guard_func` must fail and side-exit to tier-0, which
+    // computes the second sum by really calling the new `A`. Byte-identical across all
+    // 8 modes + keyframe restore proves the per-entry re-resolve + guard is what keeps
+    // the snapshot sound when the loop-invariant cell changes between entries.
+    try expectProgram(
+        \\local A = function(i, j) return i + j end
+        \\local function inner()
+        \\  local s = 0
+        \\  for j = 1, 200 do s = s + A(1, j) end
+        \\  return s
+        \\end
+        \\print(inner())
+        \\A = function(i, j) return i * j end
+        \\print(inner())
+        \\
+    ,
+        "20300\n20100\n",
     );
 }
 
@@ -8052,6 +8166,116 @@ test "recorder: a vararg call in the loop body still aborts cleanly" {
 
     // A vararg callee has no compile-time-fixed register window to seed, so the
     // recorder must still abort (cross_frame) — no trace cached, recording done.
+    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder: a callee reached through an upvalue records a snapshot input + guard_func" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // Cluster sub-lever 1: `inner`'s hot loop calls `A`, reached through an upvalue
+    // (`get_upval`). The recorder cannot read an upvalue in the executor, so it
+    // snapshots the loop-invariant callee into a synthetic slab slot *above* the
+    // anchor window, emits a `slot_load` on that slot (seeded by the dispatch loop)
+    // and a `guard_func` pinning the runtime callee identity, and records exactly one
+    // `InputSeed` describing how to re-resolve it on entry.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local function A(i, j) return i * 100 + j end
+        \\local function inner()
+        \\  local s = 0
+        \\  for j = 1, 80 do s = s + A(2, j) end
+        \\  return s
+        \\end
+        \\print(inner())
+    , true);
+    defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    const t = vm.trace.cache.items[0];
+
+    // Exactly one synthetic input, resolved from an upvalue, slotted above the anchor.
+    try testing.expectEqual(@as(usize, 1), t.inputs.len);
+    try testing.expectEqual(trace.InputKind.upvalue, t.inputs[0].kind);
+    try testing.expect(t.inputs[0].slot >= vm.trace.rec.anchor_num_registers);
+
+    // The snapshot is read by a `slot_load` on exactly that synthetic slot, and a
+    // `guard_func` pins the callee proto.
+    var saw_input_load = false;
+    var saw_guard_func = false;
+    for (t.instrs) |ins| {
+        if (ins.op == .slot_load and ins.aux == @as(i32, t.inputs[0].slot)) saw_input_load = true;
+        if (ins.op == .guard_func) saw_guard_func = true;
+    }
+    try testing.expect(saw_input_load);
+    try testing.expect(saw_guard_func);
+}
+
+test "recorder: a callee reached through a global records a snapshot input + guard_func" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // The global analogue: `A` is a loop-invariant global (`get_global`, a raw
+    // `globals.get`). Same snapshot+guard mechanism, but the `InputSeed.kind` is
+    // `.global` and `source` indexes the constant pool (the global key).
+    var chunk = try runForTrace(&vm, gpa,
+        \\function A(i, j) return i * 100 + j end
+        \\local s = 0
+        \\for j = 1, 80 do s = s + A(2, j) end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    const t = vm.trace.cache.items[0];
+    try testing.expectEqual(@as(usize, 1), t.inputs.len);
+    try testing.expectEqual(trace.InputKind.global, t.inputs[0].kind);
+    try testing.expect(t.inputs[0].slot >= vm.trace.rec.anchor_num_registers);
+
+    var saw_guard_func = false;
+    for (t.instrs) |ins| {
+        if (ins.op == .guard_func) saw_guard_func = true;
+    }
+    try testing.expect(saw_guard_func);
+}
+
+test "recorder: a set_upval in the loop body aborts cleanly" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // Snapshotting is only sound while the upvalue cell is *stable* across the traced
+    // region. A `set_upval` writes the cell, so the recorder must abort (it is NOT in
+    // the record switch) — no trace cached, the anchor gated.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local up = 0
+        \\local function inner()
+        \\  for j = 1, 80 do up = up + j end
+        \\  return up
+        \\end
+        \\print(inner())
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder: a set_global in the loop body aborts cleanly" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // The global counterpart: a `set_global` writes the snapshotted cell, so the
+    // recorder aborts rather than recording a stale-input trace.
+    var chunk = try runForTrace(&vm, gpa,
+        \\g = 0
+        \\local s = 0
+        \\for j = 1, 80 do g = g + j; s = s + j end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
     try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
     try testing.expect(vm.trace.gate.count() >= 1);
     try testing.expect(!vm.trace.isRecording());

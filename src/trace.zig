@@ -341,6 +341,22 @@ pub const EntryGuardType = enum(u8) {
 /// runtime-only fingerprint — not serialized.
 pub const EntryGuard = struct { slot: u16, ty: EntryGuardType };
 
+/// Where a synthetic trace input is resolved from at entry (cross-frame tracing,
+/// cluster sub-lever 1). A callee reached through an UPVALUE or GLOBAL is a
+/// loop-invariant register value the executor cannot read (it has no `*Vm`, no
+/// closure). The recorder snapshots it into a dead slab slot *above* the anchor
+/// frame window and reads it as an ordinary `slot_load`; the dispatch loop seeds
+/// the slot once per entry (`upvalGet`/`globals.get`) before running the trace.
+pub const InputKind = enum(u8) { upvalue, global };
+
+/// One synthetic entry input: the loop-invariant upvalue/global the dispatch loop
+/// resolves and writes into the slab before trace entry. `source` is the upvalue
+/// index (`closure.upvalues[source]`) or the global key's constant-pool index
+/// (`proto.constants[source]`); `slot` is the synthetic frame-relative slab slot
+/// (== the seeding `slot_load`'s `aux`), always `>= anchor_num_registers`.
+/// Runtime-only — not serialized (precedent: `entry_guards`).
+pub const InputSeed = struct { kind: InputKind, source: u32, slot: u16 };
+
 /// A completed, cached trace: the recorded IR plus the entry/exit snapshots that
 /// connect it back to tier-0 register slots. Immutable once committed (Phase 5a
 /// never invalidates a cached trace — see the lifecycle doc).
@@ -353,6 +369,12 @@ pub const Trace = struct {
     consts: []Value,
     /// Tier-0 registers read as inputs, in `slot_load` order (the entry snapshot).
     entry_slots: []u16,
+    /// Synthetic entry inputs (cross-frame tracing cluster sub-lever 1): each
+    /// loop-invariant upvalue/global callee the dispatch loop must resolve and seed
+    /// into a dead slab slot above the anchor window before entry. Empty for the
+    /// common case (no upvalue/global-reached callee). Runtime-only — not
+    /// serialized; freed in `destroy`.
+    inputs: []InputSeed = &.{},
     /// Entry type guards extracted from the IR at commit time: for each register
     /// this trace guards on entry, the type it must have.  Used by
     /// `matchesFingerprint` to skip non-matching traces without a trial entry.
@@ -376,6 +398,7 @@ pub const Trace = struct {
         gpa.free(self.consts);
         gpa.free(self.entry_slots);
         gpa.free(self.entry_guards);
+        if (self.inputs.len != 0) gpa.free(self.inputs);
         gpa.destroy(self);
     }
 
@@ -804,6 +827,11 @@ pub const TraceState = struct {
                 visited[nvisited] = sct;
                 nvisited += 1;
             }
+            // Cluster sub-lever 1: a side trace with synthetic upvalue/global inputs
+            // needs the dispatch loop's per-entry seeding (it has no `*Vm` here), so
+            // it cannot be entered through the chain path. Skip it — it still runs
+            // via the normal seeded same-anchor walk.
+            if (sct.inputs.len != 0) continue;
             const sbuf = self.valuesScratch(sct.instrs.len) catch continue;
             const sresult = irinterp.execute(sct, regs, sbuf);
             if (sresult.completed > 0) {
@@ -1221,7 +1249,7 @@ pub const TraceState = struct {
         // `aux` outside `[0, anchor_num_registers)` is exactly the OOB that S1/S2
         // prevent — so the verifier must reject it, not have its bound widened to
         // hide it.
-        assertWellFormed(fields.instrs, fields.consts.len, self.rec.anchor_num_registers);
+        assertWellFormed(fields.instrs, fields.consts.len, self.rec.anchor_num_registers, @as(usize, self.rec.anchor_num_registers) + self.rec.input_seeds.items.len);
 
         // Compute the entry type fingerprint: for each guard_int/guard_float/
         // guard_number/guard_table that guards a slot_load, record the
@@ -1244,7 +1272,14 @@ pub const TraceState = struct {
                 const ref: u32 = @intCast(ins.a);
                 if (ref < i and fields.instrs[ref].op == .slot_load) {
                     const slot: u16 = @intCast(fields.instrs[ref].aux);
-                    try entry_guards.append(self.gpa, .{ .slot = slot, .ty = ty });
+                    // Fingerprint only anchor-frame slots: a synthetic input slot
+                    // (`>= anchor_num_registers`, cluster sub-lever 1) is not present
+                    // in the narrow `RegWindow` `matchesFingerprint` reads, so adding
+                    // it would be an out-of-window read. Its type is still pinned by
+                    // the guard in the IR — a mismatch side-exits on a trial entry
+                    // instead of being pre-filtered.
+                    if (slot < self.rec.anchor_num_registers)
+                        try entry_guards.append(self.gpa, .{ .slot = slot, .ty = ty });
                 }
             }
         }
@@ -1252,6 +1287,15 @@ pub const TraceState = struct {
         // Covers OOM in `create(Trace)` and the trailing `cache.append` (the
         // `fields` errdefer above frees the IR arrays; this frees the fingerprint).
         errdefer self.gpa.free(guards_owned);
+
+        // Own the synthetic-input seeding recipe (cluster sub-lever 1). Empty for
+        // the common trace (no upvalue/global-reached callee) — a static empty slice
+        // needs no free (`destroy` guards on `len != 0`).
+        const inputs_owned: []InputSeed = if (self.rec.input_seeds.items.len == 0)
+            &.{}
+        else
+            try self.gpa.dupe(InputSeed, self.rec.input_seeds.items);
+        errdefer if (inputs_owned.len != 0) self.gpa.free(inputs_owned);
 
         const t = try self.gpa.create(Trace);
         errdefer self.gpa.destroy(t);
@@ -1261,6 +1305,7 @@ pub const TraceState = struct {
             .consts = fields.consts,
             .entry_slots = fields.entry_slots,
             .entry_guards = guards_owned,
+            .inputs = inputs_owned,
         };
         try self.cache.append(self.gpa, t);
     }
@@ -1273,13 +1318,19 @@ pub const TraceState = struct {
     ///   * `slot_load`/`konst` `aux` is in register / const-pool bounds;
     ///   * every `phi` update `b` precedes the `loop` and its `aux` slot is a
     ///     register (or the internal sentinel).
-    fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: usize) void {
+    /// `num_registers` is the executor's real loop-carried window
+    /// (`anchor_num_registers`) — the bound a `phi` flush may write back to (S2/S3).
+    /// `input_limit` is that window *plus* the synthetic entry inputs (cluster
+    /// sub-lever 1): a `slot_load` may read an input slot in
+    /// `[num_registers, input_limit)`, but no `phi` ever names one (inputs are
+    /// read-only, never `.def`), so the phi bound stays tight.
+    fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: usize, input_limit: usize) void {
         std.debug.assert(instrs.len >= 1);
         const last = instrs.len - 1;
         std.debug.assert(instrs[last].op == .loop);
         for (instrs, 0..) |ins, i| {
             switch (ins.op) {
-                .slot_load => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < num_registers),
+                .slot_load => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < input_limit),
                 .konst => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len),
                 .loop => std.debug.assert(i == last), // the only loop, and it is terminal
                 // binary ops read both `a` and `b`.
@@ -1340,13 +1391,17 @@ pub const TraceState = struct {
     /// `pc` is the *post-increment* program counter (already advanced past
     /// `instr`), matching what `applyJump(pc, aux)` expects — `recForLoop` uses it
     /// to resolve the `for_loop` back-edge target against the trace anchor.
-    pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) void {
+    /// `resolved` carries the live value of an upvalue/global read for the two
+    /// arms that need it (`get_upval`/`get_global`) — the executor cannot resolve
+    /// those (no `*Vm`, no closure), so the dispatch loop pre-resolves and passes
+    /// it here. `Value.nil()` (and ignored) for every other opcode.
+    pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) void {
         if (self.rec.instrs.items.len >= self.config.maxrecord) return self.abort(.too_long);
         self.rec.cur_pc = pc;
-        self.recordOne(instr, regs, proto, pc) catch self.abort(.alloc);
+        self.recordOne(instr, regs, proto, pc, resolved) catch self.abort(.alloc);
     }
 
-    fn recordOne(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) error{OutOfMemory}!void {
+    fn recordOne(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) error{OutOfMemory}!void {
         switch (instr.op) {
             // loads & moves — define the destination, no guards.
             .load_nil => self.setReg(instr.a, try self.konst(Value.nil())),
@@ -1413,9 +1468,20 @@ pub const TraceState = struct {
             // else aborts cleanly.
             .set_index => try self.recArraySet(instr, regs),
 
-            // tables, globals, upvalues, closures, concat, for_prep, len, …:
-            // each pulls in heap-effect / cross-frame / invalidation machinery
-            // that is later work. Abort cleanly.
+            // Cluster sub-lever 1: a callee (or any loop-invariant value) reached
+            // through an UPVALUE or GLOBAL. The executor cannot read these (no
+            // `*Vm`, no closure), so we snapshot the loop-invariant value into a
+            // dead slab slot above the anchor window (`slot_load` from a synthetic
+            // input slot the dispatch loop re-seeds each entry) and — when it is a
+            // function — pin its identity with `guard_func`. `set_upval`/`set_global`
+            // stay aborts (not in this switch): a write in the traced region would
+            // make the snapshot stale, so such loops keep running on tier-0.
+            .get_upval => try self.recInputGet(.upvalue, instr.a, instr.b, resolved),
+            .get_global => try self.recInputGet(.global, instr.a, instr.b, resolved),
+
+            // tables, closures, concat, for_prep, len, …: each pulls in heap-effect
+            // / cross-frame / invalidation machinery that is later work. Abort
+            // cleanly.
             else => self.abort(.nyi_opcode),
         }
     }
@@ -1993,6 +2059,66 @@ pub const TraceState = struct {
         self.rec.base_off = fr.base_off;
         self.rec.inline_depth = d;
     }
+
+    /// Cluster sub-lever 1 — record a `get_upval`/`get_global` as a synthetic entry
+    /// input. The read's loop-invariant value (`resolved`, pre-resolved by the
+    /// dispatch loop since the executor has no `*Vm`/closure) is snapshotted into a
+    /// dead slab slot above the anchor window: emit a `slot_load` from that slot,
+    /// register the (`kind`, `source`→`slot`) seeding recipe on the trace, and — for
+    /// a function callee — pin its identity with `guard_func`. The dispatch loop
+    /// re-seeds the slot every entry (so a cross-entry change deopts via the guard
+    /// or a downstream type guard); a `set_upval`/`set_global` *inside* the traced
+    /// region is not in the record switch, so it aborts — the snapshot can never go
+    /// stale mid-run.
+    fn recInputGet(self: *TraceState, comptime kind: InputKind, dest: u16, source: u16, resolved: Value) !void {
+        // U0 seeds only *anchor-frame* reads: the dispatch loop resolves the
+        // snapshot against the anchor frame's closure/proto at entry, so an
+        // upvalue/global read inside an inlined callee (whose indices refer to a
+        // different closure/proto) cannot be seeded — abort, tier-0 owns the loop.
+        // This is also the doc-10 tripwire: the day an inlined callee's *own* body
+        // reads an upvalue, `guard_func` must tighten from `Proto.id` to the
+        // closure's `GcHeader.id` (two closures over one proto stop being
+        // trace-identical once their captured upvalues are read).
+        if (self.rec.inline_depth != 0) return self.abort(.cross_frame);
+
+        const key = (@as(u64, @intFromEnum(kind)) << 32) | source;
+        if (self.rec.input_dedup.get(key)) |ref| {
+            // A repeat read of the same upvalue/global reuses the one snapshot.
+            self.setReg(dest, ref);
+            return;
+        }
+        // Cap the number of synthetic inputs a single trace may carry. The hard
+        // limit is the executor window the dispatch loop must widen (checked against
+        // `regCapacity` at entry); this cap bounds it cheaply and keeps a
+        // pathological loop from growing the entry snapshot without bound.
+        if (self.rec.input_seeds.items.len >= MAX_TRACE_INPUTS) return self.abort(.too_deep);
+
+        // Defensive: the synthetic slot counter is a `u16` seeded at
+        // `anchor_num_registers`. A function with a near-`u16`-max register window
+        // could push it to the wrap boundary; an `@intCast`-wrapped slot would fold
+        // back *into* the live anchor window as a plausible in-window `slot_load`
+        // that `assertWellFormed` (bound `anchor_num_registers + n_inputs`) cannot
+        // catch — and `seedTraceInputs` would then clobber a live caller register.
+        // Abort rather than wrap. (MAX_TRACE_INPUTS already bounds the count; this
+        // bounds the *index*.)
+        if (self.rec.next_input_slot == std.math.maxInt(u16)) return self.abort(.too_deep);
+
+        const slot = self.rec.next_input_slot;
+        self.rec.next_input_slot += 1;
+        const ref = try self.emit(.{ .op = .slot_load, .aux = @intCast(slot), .ty = .unknown });
+        try self.rec.entry_slots.append(self.gpa, slot);
+        try self.rec.input_seeds.append(self.gpa, .{ .kind = kind, .source = source, .slot = slot });
+        try self.rec.input_dedup.put(self.gpa, key, ref);
+        // Pin a *function* callee's identity so a different proto — or a value that
+        // is no longer a function — side-exits. A non-function loop-invariant (e.g.
+        // an upvalue table) needs no identity guard: its *type* is pinned by the
+        // ordinary operand guard wherever the trace consumes it.
+        if (resolved.isHeap() and resolved.heapType() == .function) {
+            const cl = function.Closure.fromHeader(resolved.asHeap());
+            _ = try self.emit(.{ .op = .guard_func, .a = ref, .aux = @bitCast(cl.proto.id) });
+        }
+        self.setReg(dest, ref);
+    }
 };
 
 /// Result type of a recorded arithmetic op given its observed operands. Mirrors
@@ -2074,6 +2200,12 @@ const MAX_INLINE_DEPTH = 3;
 /// the map at depth) aborts cleanly rather than reading the slab out of bounds.
 /// 256 covers every realistic leaf body the compiler emits.
 const MAX_CALLEE_REGS = 256;
+
+/// Maximum number of synthetic entry inputs (upvalue/global snapshots, cluster
+/// sub-lever 1) a single trace may carry. Each is one slab slot the dispatch loop
+/// re-seeds + widens the executor window by; 8 covers every realistic hot loop
+/// (a handful of upvalue/global callees). A trace wanting more aborts cleanly.
+const MAX_TRACE_INPUTS = 8;
 
 /// One saved caller context for an inlined `.call`, popped at the matching
 /// `.ret`. `base_off` is the caller frame's absolute slot offset (relative to the
@@ -2157,7 +2289,25 @@ pub const Recorder = struct {
     /// frame; a `.call` beyond `MAX_INLINE_DEPTH` aborts `.too_deep`.
     inline_depth: u8 = 0,
 
+    // --- cluster sub-lever 1: upvalue/global-reached callee snapshots ---------
+    /// Synthetic entry inputs accumulated this recording: each loop-invariant
+    /// upvalue/global the dispatch loop must re-seed before entry (see `InputSeed`).
+    /// Becomes the committed trace's `inputs`.
+    input_seeds: std.ArrayListUnmanaged(InputSeed) = .empty,
+    /// Dedup: maps `(kind, source)` (packed `u64`) → the synthetic `slot_load`'s
+    /// SSA ref, so a repeated `get_upval`/`get_global` of the same source reuses one
+    /// input slot + one `guard_func` instead of emitting another.
+    input_dedup: std.AutoHashMapUnmanaged(u64, Ref) = .empty,
+    /// Next synthetic input slab slot to hand out. Initialised to
+    /// `anchor_num_registers` in `reset` (inputs live *above* the anchor window);
+    /// bumped once per unique input. The slot is only ever a `slot_load` `aux` and
+    /// an executor `RegWindow` index — never a `reg_map` index — so it does not
+    /// collide with the inlined-callee scratch the `reg_map` tail reserves.
+    next_input_slot: u16 = 0,
+
     pub fn deinit(self: *Recorder, gpa: std.mem.Allocator) void {
+        self.input_seeds.deinit(gpa);
+        self.input_dedup.deinit(gpa);
         self.instrs.deinit(gpa);
         self.consts.deinit(gpa);
         self.entry_slots.deinit(gpa);
@@ -2175,6 +2325,8 @@ pub const Recorder = struct {
         self.entry_slots.clearRetainingCapacity();
         self.guarded_refs.clearRetainingCapacity();
         self.konst_map.clearRetainingCapacity();
+        self.input_seeds.clearRetainingCapacity();
+        self.input_dedup.clearRetainingCapacity();
         // Size the register map for the anchor frame **plus** reserved windows for
         // inlined callee frames (cross-frame tracing). The executor only ever
         // touches `[0, anchor_num_registers)`; the tail is scratch the recorder
@@ -2192,6 +2344,7 @@ pub const Recorder = struct {
         self.anchor_num_registers = num_registers;
         self.base_off = 0;
         self.inline_depth = 0;
+        self.next_input_slot = num_registers;
         self.active = true;
     }
 };
@@ -2421,7 +2574,7 @@ test "recArrayGet: t[k] on a bool lane records the full guarded read sequence" {
 
     // r1 = table, r2 = key (3) ; `get_index r0, r1, r2`  →  r0 = t[3]
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3) };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
 
     try testing.expect(state.isRecording()); // a clean record — no abort
     const ops = state.rec.instrs.items;
@@ -2468,7 +2621,7 @@ test "recArrayGet aborts: non-table container, non-int key, hole, and out-of-bou
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ Value.nil(), c.tab, c.key };
-        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
+        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording()); // aborted
         try testing.expectEqual(c.why, state.rec.abort_reason.?);
     }
@@ -2489,7 +2642,7 @@ test "recArrayGet aborts on a .value-lane (unpacked) array — deferred scope cu
     defer state.deinit();
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(1) };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.nyi_opcode, state.rec.abort_reason.?);
 }
@@ -2514,7 +2667,7 @@ test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3) };
-        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
+        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
         try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
     }
@@ -2524,7 +2677,7 @@ test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ Value.heap(&t.header), Value.int(3), Value.boolean(false) };
-        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), winRO(&regs), &proto, 0);
+        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
         try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
     }
@@ -2535,7 +2688,7 @@ test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ Value.heap(&t.header), Value.int(33), Value.boolean(true) };
-        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), winRO(&regs), &proto, 0);
+        state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
         try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
     }
@@ -2556,7 +2709,7 @@ test "recArraySet: t[k]=false on a bool lane records the full guarded write sequ
 
     // r1 = table, r2 = key (3), r0 = value (false); `set_index a=1 b=2 c=0` → t[3]=false.
     var regs = [_]Value{ Value.boolean(false), Value.heap(&t.header), Value.int(3) };
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0, Value.nil());
 
     try testing.expect(state.isRecording()); // clean record — no abort
     const ops = state.rec.instrs.items;
@@ -2608,7 +2761,7 @@ test "recArraySet: a bool-lane append (t[len+1]=true) records the guarded grow s
 
     // r1 = table, r2 = key (len+1), r0 = value (true); `set_index a=1 b=2 c=0`.
     var regs = [_]Value{ Value.boolean(true), Value.heap(&t.header), Value.int(append_key) };
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0, Value.nil());
 
     try testing.expect(state.isRecording()); // clean record — the append path, no abort
     const ops = state.rec.instrs.items;
@@ -2666,7 +2819,7 @@ test "recArraySet aborts: non-table, non-int key, OOB, out-of-lane value, .value
         defer state.deinit();
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
         var regs = [_]Value{ c.val, c.tab, c.key };
-        state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0);
+        state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
         try testing.expectEqual(c.why, state.rec.abort_reason.?);
     }
@@ -2692,13 +2845,13 @@ test "recArraySet defers an RMW store (store-sinking) instead of aborting" {
     // r1 = table, r2 = key. First: r0 = t[r2] (a packed read → aload). The recorder's
     // get_index executes against the live table; r0 then logically holds t[3] = true.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.nil() };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording()); // the read records cleanly
 
     // Now t[k] = (the value just read), an RMW. The store defers (sinks) rather
     // than aborting: the trace stays live and `pending_store` is armed.
     regs[0] = Value.boolean(true); // r0 = t[3], a boolean
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording());
     try testing.expectEqual(@as(usize, 1), state.rec.pending_store_count);
     try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.boolean)), state.rec.pending_stores[0].lane_ord);
@@ -2707,7 +2860,7 @@ test "recArraySet defers an RMW store (store-sinking) instead of aborting" {
 
     // A subsequent packed read must abort: the sunk store has to be the LAST array
     // access (else on-trace store-then-read would diverge from tier-0 replay).
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
 }
@@ -2731,12 +2884,12 @@ test "recArraySet sinks a read-steered const store (control channel) instead of 
 
     // r1 = table, r2 = key. r0 = t[r2] (a packed read).
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.boolean(false) };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording());
     // Branch on the read (a guard), then store a *constant* false (r3). The store
     // sinks below the branch guard — still recording, store deferred.
-    state.recordInstr(Instr.opABC(.jmp_if_true, 0, 0, 0), winRO(&regs), &proto, 0);
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.jmp_if_true, 0, 0, 0), winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording());
     try testing.expectEqual(@as(usize, 1), state.rec.pending_store_count);
 }
@@ -2763,8 +2916,8 @@ test "recArraySet sinks multiple RMW stores (Gap C: butterfly shape)" {
         Value.nil(),         Value.heap(&t.header), Value.int(3), Value.int(4),
         Value.boolean(true), Value.nil(),           Value.nil(),  Value.nil(),
     };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0); // r0 = t[3]
-    state.recordInstr(Instr.opABC(.get_index, 4, 1, 3), winRO(&regs), &proto, 0); // r4 = t[4]
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil()); // r0 = t[3]
+    state.recordInstr(Instr.opABC(.get_index, 4, 1, 3), winRO(&regs), &proto, 0, Value.nil()); // r4 = t[4]
     try testing.expect(state.isRecording());
 
     // Tier-0 would have loaded the read values into r0/r4; mirror that so the
@@ -2773,8 +2926,8 @@ test "recArraySet sinks multiple RMW stores (Gap C: butterfly shape)" {
     regs[4] = Value.boolean(true); // r4 = t[4]
 
     // Now write both back: t[3] = r0, t[4] = r4. Both defer.
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0);
-    state.recordInstr(Instr.opABC(.set_index, 1, 3, 4), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.set_index, 1, 3, 4), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording());
     try testing.expectEqual(@as(usize, 2), state.rec.pending_store_count);
     // Recorded order preserved: store #0 → key 3's aref, store #1 → key 4's aref.
@@ -2800,21 +2953,21 @@ test "recArraySet aborts when sunk stores exceed MAX_PENDING_STORES" {
 
     // r1 = table, r2 = key, r3 = bool value. One read to arm deferral.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.boolean(true) };
-    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording());
 
     // MAX_PENDING_STORES deferred stores (distinct in-bounds keys 3..3+MAX-1) record.
     var k: i64 = 3;
     while (k < 3 + @as(i64, MAX_PENDING_STORES)) : (k += 1) {
         regs[2] = Value.int(k);
-        state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0);
+        state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(state.isRecording());
     }
     try testing.expectEqual(@as(usize, MAX_PENDING_STORES), state.rec.pending_store_count);
 
     // One more store exceeds the cap → abort.
     regs[2] = Value.int(3 + @as(i64, MAX_PENDING_STORES));
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0);
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
 }
@@ -2829,7 +2982,7 @@ test "per-guard PC recording: guard_int aux carries the bytecode PC" {
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
 
     var regs = [_]Value{ Value.nil(), Value.int(10), Value.int(20) };
-    state.recordInstr(Instr.opABC(.add, 0, 1, 2), winRO(&regs), &proto, 42);
+    state.recordInstr(Instr.opABC(.add, 0, 1, 2), winRO(&regs), &proto, 42, Value.nil());
 
     try testing.expect(state.isRecording());
     const ops = state.rec.instrs.items;
@@ -2855,7 +3008,7 @@ test "per-guard PC recording: guard_true aux carries the branch PC" {
 
     // r0 is truthy (int 1), so jmp_if_false emits guard_true at PC 7.
     var regs = [_]Value{ Value.int(1), Value.nil() };
-    state.recordInstr(Instr.opABC(.jmp_if_false, 0, 0, 0), winRO(&regs), &proto, 7);
+    state.recordInstr(Instr.opABC(.jmp_if_false, 0, 0, 0), winRO(&regs), &proto, 7, Value.nil());
 
     try testing.expect(state.isRecording());
     const ops = state.rec.instrs.items;
