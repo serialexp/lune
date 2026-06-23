@@ -1,115 +1,97 @@
-# CURRENT TASK — cross-frame tracing, cluster Sub-lever 1 (callee via upvalue/global)
+# CURRENT TASK — JIT hash-field (string-keyed) tracing, H0
 
-Governing intent (Bart): "that was a good flip for our interpreter level, but we
-really need to get back to the native level." Approved plan:
+Governing intent (Bart): close the LuaJIT gap one named technique at a time. The
+cross-frame cluster sub-lever (U0+U1) landed; the next highest-leverage recorder
+gap is **string-keyed field access** (`obj.field`). Until now the recorder only
+handled integer array keys — every `obj.field` get/set lowered to a string-keyed
+`get_index`/`set_index` and aborted the trace. Approved plan:
 `~/.claude/plans/clever-yawning-neumann.md`. Design doc:
-`docs/design/10-cross-frame-tracing.md`.
+`docs/design/11-hash-field-tracing.md`.
 
-Sub-lever 1 lets the recorder reach a callee through an UPVALUE or GLOBAL (not just
-a local/param), so spectral-norm's inner loop (`a = a + x[j] * A(i,j)`, `A` an
-upvalue) records a trace. Phased: **U0** = record on the tier-1a oracle (no speedup,
-done) → **U1** = native `guard_func` lowering (the speedup; merges task #186).
+Phased: **H0** = recorder + tier-1a oracle (byte-identical across 8 modes + replay,
+NO speedup, native auto-declines) → **H1** = native lowering (the speedup).
 
-## U1 — DONE, GREEN (uncommitted, pending Bart approval) — the speedup
+## H0 — DONE, GREEN (uncommitted, pending Bart approval)
 
-Task #186. Native lowering of `guard_func` in `src/nativegen.zig`. A new
-`Kind = .func` mirrors `.ptr` (invariant heap pointer, GP home, prologue-tag-checked
-`TAG_HEAP`, loaded once, consumed ONLY by `guard_func`, never feeds
-arithmetic/`aref`/flush → never reaches `exit_stores`, same C2 safety as `.ptr`).
-`proveKinds` A marks a `guard_func`-covered `slot_load` (`func_guarded`); B
-classifies it `.func` + validates each guard's operand. `analyzeInner` stashes the
-recorded `Proto.id` (`guard_func.aux`) onto the slot and **bails on conflicting-aux
-duplicate guards** (defensive — recorder never emits it). The identity check is
-hoisted to the **prologue** (snapshot is loop-invariant): per `.func` slot,
-`cmp [closure].type==function` → `mov proto,[closure+proto_off]` →
-`cmp [proto].id==recorded` → `jne prologue_fail` (returns 0, regs untouched →
-tier-0 re-runs the iter). Byte-identical in outcome to irinterp's `guard_func` arm.
+`just test` green: 8 modes byte-identical + replay. Native auto-declines (any of
+the four new ops → `proveKinds` returns false → tier-1a oracle runs the body).
 
-- **Reviews:** Codex + Antigravity both cleared oracle-identity (every callee
-  value), `.func` escape analysis, `rax`-scratch safety, `@offsetOf` correctness.
-  Codex's one finding — two `guard_func`s on one snapshot with *different* ids would
-  pass the single prologue check while the oracle exits on the second — is closed by
-  the `analyzeInner` duplicate-aux bail (unreachable via the recorder, but the
-  native subset must equal the oracle for any well-formed trace). The symmetric
-  pre-existing `.ptr`/`guard_lane` first-match shape is noted in TODO.md (Rule #10),
-  not touched (out of U1 scope).
-- **Tests (nativegen.zig, green):** `guard_func passes when … matches the recorded
-  proto.id` / `… side-exits … different proto.id` / `… side-exits … not a closure`
-  (all `expectMatch` vs the oracle) + `two guard_funcs with conflicting ids …
-  decline native` (`expectBail`).
-- **Measure:** `just bench --filter spectral` → jit 51.1 ms vs tier-0 103.6 ms
-  (~2×; the inner loop now runs native). Full sweep: all benches `cross=ok`; the
-  lone `str_manip(ok/ERR)` flag is a **LuaJIT-side** ERR on a `bench/stdlib/` bench
-  (lune `cross=ok`), independent of U1 and pre-existing.
+### Mechanism
 
-## U0 — DONE, GREEN (uncommitted, pending Bart approval)
+Four new `IrOp`s (appended at the END of the enum, wire-ordinal-stable):
+`href`=41 (a=table, b=key-konst → cell descriptor, classified `.aref`), `hload`=42
+(a=href → typed `Value` load, `.aload`), `hstore`=43 (a=href, b=value → in-place
+overwrite, `.astore`), `guard_hash`=44 (a=href, aux=recorded `hash.count()` →
+structural-stability guard, `.guard`). Total 45 ops.
 
-`just test` green: 8 modes byte-identical + replay. Phase 0 (leaf inlining) +
-guard_fits-fix already landed as `0d7823d`, so the uncommitted diff is **pure U0**
-— a clean single logical change (src/trace.zig, src/interp.zig + this doc/task
-update). Codex + Antigravity reviewed; both cleared determinism/replay/OOB/abort/
-leaks. Codex's one low-sev finding (u16 synthetic-slot counter could wrap for a
-near-`u16`-max register window, folding into the live anchor window) is fixed with
-a defensive abort in `recInputGet`.
+- **`src/trace.zig`**: `get_index`/`set_index` dispatch branches on key type —
+  `isInt()` → existing array path; heap **string** key → new `recHashGet`/
+  `recHashSet`; else abort. Abort rules: non-table → `.bad_type`; metatable →
+  `.has_metatable`; absent key (`fieldPtr == null`) → `.bad_type` (present-key
+  only); nil store → `.bad_type`; non-konst key → `.bad_type` (const-key only);
+  non-scalar field value → `.nyi_opcode` (int/float only). C1 store-sink reused:
+  a store after any heap load defers into `pending_stores`, flushed below every
+  guard before `.loop`.
+- **`src/irinterp.zig`**: four oracle arms re-derive table+key from operands and
+  do the real hash ops. `hload` is a **typed self-side-exiting load** — it
+  tag-checks the loaded value against `ins.ty` (int/float) and side-exits BEFORE
+  logging, so a field that drifted to a heap value never reaches the scalar-only
+  exec log (review fix, see below).
+- **`src/tropt.zig`**: classifies the four ops across every OpKind pass.
+- **`src/nativegen.zig`**: one-line `proveKinds`-declines-if-present guard so H0
+  never reaches native lowering.
+- **`src/traceser.zig` + `viz/src/enums.ts`**: four op ordinals (no new const kind;
+  the key is an existing heap-string const).
+- **`src/table.zig`**: `fieldPtr(key)` → `hash.getPtr(normalizeKey(key))`.
 
-### Mechanism (approach A — entry-snapshot input)
+### Reviews — Codex + Antigravity, both findings closed
 
-The executor has no `*Vm`/closure, so an upvalue/global value can only be read in
-the dispatch loop. At record time the dispatch loop pre-resolves the loop-invariant
-value and passes it to the recorder, which snapshots it into a synthetic slab slot
-*above* the anchor window, emits `slot_load` + `guard_func`, and records an
-`InputSeed`. The dispatch loop re-seeds those slots every entry and widens the
-executor `RegWindow`. Sound because the cell is **stable** across the traced region
-(re-resolved+re-guarded each entry; `set_upval`/`set_global` in the region abort).
-`Proto.id` still suffices: the inlined callee reads no upvalues of its own.
+- **Codex HIGH/MEDIUM (the substantive one):** the oracle `hload` arm logged its
+  loaded `Value` via `rec.value` BEFORE the consumer `guard_int`/`guard_float`
+  could reject it. A field that became non-scalar (heap) — via the trace's own
+  `hstore` drifting, or external mutation that keeps `hash.count()` unchanged so
+  `guard_hash` still passes — would leak a heap `Value` into the scalar-only exec
+  log → latent `UnsupportedEffectResult` on serialization (snapshot/replay).
+  Additionally the store value `rval` carried no strict type guard.
+  **Fixes applied & verified green:** (1) made oracle `hload` a typed
+  self-side-exiting load (tag-check vs `ins.ty`, side-exit before `rec.value` on
+  mismatch — mirrors the planned H1 native tag-check); (2) added
+  `guardNum(rval, vval)` in `recHashSet` to pin the store value's type inline
+  (analogue of the array path's `guard_fits`).
+- **Codex dedup sub-concern (resolved as non-issue):** worried `guardNum`'s
+  ref-only dedup could let a `guard_true` skip a numeric guard. Verified (and
+  Antigravity independently observed) that `recBranch` emits `guard_true`/
+  `guard_false` RAW via `self.emit` (not registered in `guarded_refs`), so
+  `guarded_refs` holds ONLY numeric type guards → `guardNum` dedup on the store
+  value is sound.
 
-### Code (all in the tree, uncommitted)
-- **src/trace.zig** — `InputKind`/`InputSeed`; `Trace.inputs` (+ `destroy` free);
-  recorder fields `input_seeds`/`input_dedup`/`next_input_slot` (+ `deinit`/`reset`);
-  `MAX_TRACE_INPUTS=8`; `recordInstr`/`recordOne` gained `resolved: Value`;
-  `.get_upval`/`.get_global` switch arms → `recInputGet` (dedup, synthetic slot,
-  `slot_load`, `entry_slots` append, `InputSeed`, `guard_func` on functions);
-  `assertWellFormed` slot bound widened to `anchor_num_registers + n_inputs`;
-  entry_guard fingerprint capped to anchor slots; `commit` dupes `inputs`;
-  `tryChainExit` skips input-carrying side traces.
-- **src/interp.zig** — pre-resolve block at the `recordInstr` call site
-  (`upvalGet`/`globals.get`); `seedTraceInputs` helper; trace-entry walk seeds inputs
-  + widens `RegWindow` (`orelse continue` on `regCapacity` overflow).
+### Tests (all green)
 
-### Tests (interp.zig, all green)
-- `recorder: a callee reached through an upvalue records a snapshot input +
-  guard_func` / `… through a global …` — one `InputSeed`, a `slot_load` on a slot
-  ≥ anchor window, a `guard_func`.
-- `recorder: a set_upval in the loop body aborts cleanly` / `… set_global …` —
-  0 traces, anchor gated.
-- `cross-frame: a callee reached through an upvalue inlines and stays
-  byte-identical` / `… a global …` (60100) — 8-mode + replay.
-- `cross-frame: a changed upvalue callee deopts the snapshot and replays
-  byte-identically` (20300/20100) — per-entry re-resolve + `guard_func` side-exit
-  when the captured upvalue is reassigned to a different-proto closure.
+- **Recorder units (interp.zig, via `runForTrace`+`dumpTrace`):** const-key read
+  records `href`+`guard_hash`+`hload`+`guard_int` (no `hstore`); int RMW sinks
+  `hstore` below `hload` (asserts `indexOf(hload) < indexOf(hstore)`); float field
+  RMW records `guard_float`; absent-key aborts; metatable aborts; heap/string-value
+  aborts; computed/non-konst key aborts.
+- **8-mode `expectProgram` (interp.zig):** const-key read, int RMW, float RMW,
+  two-key distinct cells, mid-loop type-change deopt — all byte-identical across
+  {stress × {off, record-only, no-opt, record-execute, native}} + keyframe restore.
 
-### Manual verification
-- `./zig-out/bin/lune --dump-traces bench/luajit/spectral-norm.lua 100` →
-  `guard_func` present (was 0); inner loop records a trace via the upvalue snapshot.
-- spectral-norm byte-identical across tier-0 / `--trace` / `--jit-native` /
-  `--trace-record-only` (1.274224116).
-- No speedup expected yet: the trace carries `guard_func`, which native
-  auto-declines until U1.
+### Manual end-to-end verification (rebuilt CLI)
 
-## Next steps
-1. **Get Bart's commit approval for the U0+U1 diff** (no commit without it — Rule
-   #15). Held together per Bart ("keep that uncommitted until we finish U1"). The
-   diff spans src/trace.zig + src/interp.zig (U0), src/nativegen.zig (U1),
-   docs/design/10-cross-frame-tracing.md, CURRENT_TASK.md, TODO.md. Suggested split
-   or bundle:
-   - **Bundle (recommended):** one commit `feat(jit): cross-frame tracing — inline a
-     callee reached via upvalue/global and run it native (cluster sub-lever 1)`.
-   - **Per-file split:** U0 commit (trace.zig+interp.zig) then U1 commit
-     (nativegen.zig); docs/task files go with whichever lands last. Both are
-     Rule-#13-clean (no partial-file staging needed — each file is wholly one phase).
-2. Cluster lever continues (separate changes): method/`__index` dispatch (array3d,
-   nbody), generic-for iterator inlining. See TODO.md + doc-10 Outstanding.
+- `/tmp/h_deopt.lua` (mid-loop field type change) → `0.5` tier-0 == native ==
+  record-only.
+- `/tmp/h_rmw.lua` (`t.n = t.n + 1` ×200) → `200` tier-0 == native;
+  `--dump-traces` shows `href`/`guard_hash`/`hload`/`hstore` with `hload` (%005)
+  before the sunk `hstore` (%021).
 
-## Stray untracked files (NOT mine — leave alone)
-`CURRENT_TASK_E3.md`, `SESSION_CHANGES.md`, `check_ordinals`,
-`bench/results/*.tsv`.
+## H1 — NOT STARTED (the speedup)
+
+Native lowering: prologue `hresolve(table, key)` hoist stashing
+`{cell_ptr, size, metadata}` into new homes; `(size, metadata)` sentinel
+`guard_hash`; typed `hload`/`hstore` lowering with tag-check; new `Kind.href`;
+deopt-replay tests (type-change side-exit, sibling-table grow doesn't dangle, RMW
+double-apply); measure via field micro-bench + `perf record`.
+
+## Stdlib inventory
+
+Untouched — H0 is a JIT recorder change, no stdlib function added/changed.

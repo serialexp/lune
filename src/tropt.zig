@@ -85,14 +85,20 @@ fn kindOf(op: IrOp) OpKind {
         // (which `astore_append` writes), so classifying it `.guard` keeps it a
         // side-effecting root that is never hoisted above the store.
         .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append => .guard,
+        // Hash-field structural guard (doc 11): the grow/rehash analogue of the array
+        // guards. A side-effecting root, deduped by (op, href ref, count-aux); reads
+        // the `href` (`a`). Never hoisted above the `hstore` it protects.
+        .guard_hash => .guard,
         // Packed-array address + load: memory ops, conservatively canonical to
         // themselves (never folded, never CSE'd) so a later store can't be
         // reordered past them. DCE'd if not reachable from a live root.
-        .aref => .aref,
-        .aload => .aload,
+        // `href`/`hload` are the hash-field analogues — same memory-op treatment.
+        .aref, .href => .aref,
+        .aload, .hload => .aload,
         // `astore_append` is the grow analogue of `astore`: an effectful, never-DCE'd
         // alias/CSE barrier. Same `.astore` kind (reads `a`=aref + `b`=value).
-        .astore, .astore_append => .astore,
+        // `hstore` is the hash-field store — same effectful never-DCE'd treatment.
+        .astore, .astore_append, .hstore => .astore,
         .loop => .loop,
         // Loop-carried value: a root (the carry); canonical to itself (never
         // folded/CSE'd). Keeps both operands live; `b` is a forward (back-edge)
@@ -148,7 +154,10 @@ const GuardKey = struct { op: IrOp, a: Ref, aux: i32 };
 /// (`guard_table`/`guard_bounds`/`guard_present`/`guard_append`) carry no `aux`.
 fn guardKeyAux(op: IrOp, aux: i32) i32 {
     return switch (op) {
-        .guard_lane, .guard_fits, .guard_func => aux,
+        // `guard_hash` stashes the recorded hash population in `aux` — genuine
+        // semantic identity (two guards expecting different counts differ), so it
+        // joins the lane/proto auxes in the dedup key rather than the PC-bearing ones.
+        .guard_lane, .guard_fits, .guard_func, .guard_hash => aux,
         else => 0,
     };
 }

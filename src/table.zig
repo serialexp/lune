@@ -121,6 +121,18 @@ pub const Table = struct {
         return self.hash.get(Value.int(i)) orelse Value.nil();
     }
 
+    /// Pointer to the **hash-part** value cell for `key`, or `null` if the key is
+    /// absent from the hash part (including when it lives in the array part — this
+    /// is hash-part only, by design). The JIT recorder/oracle (doc 11) uses this to
+    /// (a) prove a string field key is *present* before tracing a `t.field` access,
+    /// and (b) read/overwrite the cell in place. The returned pointer is stable
+    /// across iterations unless the map grows/rehashes (which `guard_hash` catches),
+    /// so it is hoistable to the native prologue. The key is normalised (`2.0`↔`2`),
+    /// matching `get`/`set`. Never migrates or reshapes the table.
+    pub fn fieldPtr(self: *Table, key: Value) ?*Value {
+        return self.hash.getPtr(normalizeKey(key));
+    }
+
     /// `t[key] = val`. A `nil`/`NaN` key errors; storing `nil` deletes.
     pub fn set(self: *Table, gpa: std.mem.Allocator, key: Value, val: Value) Error!void {
         if (key.isNil()) return Error.TypeError;

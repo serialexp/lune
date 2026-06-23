@@ -137,10 +137,11 @@ fn detectDeadCarries(
             .guard_append,
             .int_of_float,
             .guard_func,
+            .hload, .guard_hash,
             => {
                 uses[ins.a] += 1;
             },
-            .aref, .astore, .astore_append => {
+            .aref, .astore, .astore_append, .href, .hstore => {
                 uses[ins.a] += 1;
                 uses[ins.b] += 1;
             },
@@ -248,8 +249,9 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             .guard_append,
             .int_of_float,
             .guard_func,
+            .hload, .guard_hash,
             => ins.a == idx,
-            .aref, .astore, .astore_append => ins.a == idx or ins.b == idx,
+            .aref, .astore, .astore_append, .href, .hstore => ins.a == idx or ins.b == idx,
             .phi => (ins.aux == trace.PHI_INTERNAL and ins.a == idx) or ins.b == idx,
             .slot_load, .konst, .loop, .preheader => false,
         };

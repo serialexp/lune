@@ -252,6 +252,49 @@ pub const IrOp = enum(u8) {
     /// (`ty == .none`); never DCE'd (it is a `.guard` in `tropt.kindOf`).
     /// Appended last so every prior op's wire ordinal stays stable.
     guard_func,
+
+    // ---- hash-part (string-keyed) field access (doc 11) -----------------------
+    //
+    // The mirror of `aref`/`aload`/`astore` for a table's HASH part, reached by a
+    // *constant* key (an `obj.field` access — the compiler lowers `.field` to a
+    // `load_const <name>` + `get_index`, so the key ref is always a `konst`). The
+    // value cell for a constant key is loop-invariant (stable across iterations
+    // unless the map rehashes), so — like the array base pointer and the
+    // `.ptr`/`.func` snapshots — it hoists to the native prologue (H1). A computed
+    // string key (`t[expr]`) records as a non-`konst` ref and aborts (v1 scope).
+    //
+    /// `a` = table value ref, `b` = the key `konst` ref (an interned string) →
+    /// the hash value-cell address descriptor. The hash analogue of `aref`:
+    /// carries no usable `Value` (its operands are what `hload`/`hstore` read);
+    /// native kind is a raw pointer (`Kind.href`, the re-resolved `getPtr` cell).
+    /// Classified `.aref` in `tropt.kindOf` (same (a=table, b=key) operand shape).
+    href,
+    /// `a` = `href` ref → load the full tagged `Value` from the cell. The hash
+    /// analogue of `aload`: the oracle returns `Table.get(key)`; native loads the
+    /// cell's tag+payload (a following consumer guard — `guard_int`/`guard_number`,
+    /// exactly as for a `slot_load` — narrows it, and native declines a
+    /// heap-valued field). Classified `.aload`.
+    hload,
+    /// `a` = `href` ref, `b` = value ref → store the value into the cell in place
+    /// (`hash.getPtr(key).?.* = v`). The hash analogue of `astore`: present-key
+    /// overwrite only (the recorder rejects an absent key — an insert could grow /
+    /// rehash and dangle every hoisted cell — and a `nil` value, a delete). Follows
+    /// the same C1 store-sink discipline as `astore` (deferred below every guard
+    /// when it follows a load). Effectful; never DCE'd. Classified `.astore`.
+    hstore,
+    /// `a` = `href` ref → the hash-part structural-stability guard. Side-exits to
+    /// tier-0 unless, for the `href`'s table: the recorded key is still **present**
+    /// AND the hash part is structurally unchanged since the cell was resolved
+    /// (`hash.size == aux`, the recorded population — native additionally pins the
+    /// `metadata` pointer to catch a same-size realloc). Pinning `size` catches
+    /// insert/delete/grow; pinning `metadata` (H1) catches realloc-grow — together
+    /// they prove the hoisted cell pointer (re-resolved per entry, NEVER a
+    /// serialized pointer) is still valid. `aux` = recorded `hash.count()` (a small
+    /// count, not a PC — so NOT in `guardExitPc`, like `guard_lane`/`guard_fits`).
+    /// The no-metatable / is-table half is owned by the `guard_table` emitted on
+    /// the raw table ref just before `href`. Produces no value; never DCE'd
+    /// (a `.guard`). Classified `.guard`.
+    guard_hash,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -1197,8 +1240,12 @@ pub const TraceState = struct {
         // the φ block stays contiguous before `.loop`. Gap B (doc 07) was the single
         // store; Gap C (doc 08) generalizes to an ordered set.
         for (self.rec.pending_stores[0..self.rec.pending_store_count]) |ps| {
+            // `ps.op` is `.astore` for a packed-array RMW or `.hstore` for a
+            // hash-field RMW (doc 11); both flush below every guard, in recorded
+            // order, just before `.loop`. `lane_ord` is the array `Lane` ordinal
+            // for `.astore` and unused (0) for `.hstore`.
             try self.rec.instrs.append(self.gpa, .{
-                .op = .astore,
+                .op = ps.op,
                 .a = ps.aref,
                 .b = ps.value,
                 .aux = ps.lane_ord,
@@ -1345,10 +1392,12 @@ pub const TraceState = struct {
                 .int_of_float => std.debug.assert(ins.a < i),
                 // `aref` pairs (table, index) into an address descriptor;
                 // `astore`/`astore_append` read the `aref` (`a`) and the value (`b`).
-                .aref, .astore, .astore_append => std.debug.assert(ins.a < i and ins.b < i),
+                // `href` (table, key konst) and `hstore` (href, value) mirror them.
+                .aref, .astore, .astore_append, .href, .hstore => std.debug.assert(ins.a < i and ins.b < i),
                 // `aload` and the array-access guards read one prior node
                 // (the table value, or the `aref`). `guard_append` reads the `aref`.
-                .aload, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append => {
+                // `hload`/`guard_hash` read the `href` (`a`).
+                .aload, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .hload, .guard_hash => {
                     std.debug.assert(ins.a < i);
                 },
                 // φ: the init `a` is an ordinary backward ref (a < i); the update
@@ -1458,15 +1507,26 @@ pub const TraceState = struct {
             // callee. Always a barrier.
             .halt => self.abort(.cross_frame),
 
-            // lane-aware packed-array read (Phase B): `t[k]` for an in-bounds
-            // dense narrow-lane slot compiles; everything else aborts cleanly.
-            .get_index => try self.recArrayGet(instr, regs),
+            // Table read `t[k]`: an INTEGER key takes the lane-aware packed-array
+            // path (Phase B; in-bounds dense narrow-lane slot only); a constant
+            // STRING key takes the hash-field path (doc 11, `obj.field`); anything
+            // else aborts cleanly. The key type is observed at record time.
+            .get_index => if (regs.get(instr.c).isInt())
+                try self.recArrayGet(instr, regs)
+            else if (isStringKey(regs.get(instr.c)))
+                try self.recHashGet(instr, regs)
+            else
+                self.abort(.bad_type),
 
-            // lane-aware packed-array write (Phase B): `t[k]=v` for an in-bounds
-            // in-lane dense slot whose stored value does not depend on any prior
-            // packed-array read (the conservative C1 deopt-replay rule). Everything
-            // else aborts cleanly.
-            .set_index => try self.recArraySet(instr, regs),
+            // Table write `t[k]=v`: INTEGER key → packed-array write (Phase B,
+            // in-bounds in-lane, C1 deopt-replay rule); constant STRING key →
+            // hash-field write (doc 11, present-key overwrite only); else abort.
+            .set_index => if (regs.get(instr.b).isInt())
+                try self.recArraySet(instr, regs)
+            else if (isStringKey(regs.get(instr.b)))
+                try self.recHashSet(instr, regs)
+            else
+                self.abort(.bad_type),
 
             // Cluster sub-lever 1: a callee (or any loop-invariant value) reached
             // through an UPVALUE or GLOBAL. The executor cannot read these (no
@@ -1764,7 +1824,7 @@ pub const TraceState = struct {
             // (A non-empty `pending_stores` implies a prior `aload`, so this also
             // covers "append after a sunk store" — an append changes `len` and is
             // never deferred; `docs/design/08-multi-store-sinking.md` §soundness.)
-            if (self.traceHasArrayLoad()) return self.abort(.bad_type);
+            if (self.traceHasHeapLoad()) return self.abort(.bad_type);
             const rval = try self.refOf(instr.c);
             const lane_ord: i32 = @intFromEnum(lane);
             const rtab = try self.refOf(instr.a);
@@ -1804,7 +1864,7 @@ pub const TraceState = struct {
         // `recArrayGet` and the append branch) keeps the sunk stores the trace's last
         // array accesses. A pure-write store (no prior `aload`) is deopt-idempotent on
         // its own and emits inline as before. See `docs/design/08-multi-store-sinking.md`.
-        const defer_store = self.traceHasArrayLoad();
+        const defer_store = self.traceHasHeapLoad();
         if (defer_store and self.rec.pending_store_count >= MAX_PENDING_STORES)
             return self.abort(.bad_type);
         const rval = try self.refOf(instr.c);
@@ -1846,19 +1906,161 @@ pub const TraceState = struct {
         }
     }
 
-    /// C1 support: has *any* `aload` (packed-array read) been recorded so far in this
-    /// trace? Used by `recArraySet` to refuse a write that follows a read. This is
-    /// the conservative-sound C1 rule: in a straight-line trace any earlier read can
+    /// C1 support: has *any* heap read — a packed-array `aload` OR a hash-field
+    /// `hload` (doc 11) — been recorded so far in this trace? Used by
+    /// `recArraySet`/`recHashSet` to decide whether a write is a read-modify-write
+    /// that must be deopt-sunk (deferred below every guard). This is the
+    /// conservative-sound C1 rule: in a straight-line trace any earlier read can
     /// influence a later write through its value (data) or through a guard that
     /// selected the path (control), and a side-exit replays the iteration against the
     /// already-mutated heap. Rejecting on the mere presence of an earlier read covers
-    /// both channels without per-value taint reasoning. nsieve's write loop has no
-    /// `aload`, so it is unaffected.
-    fn traceHasArrayLoad(self: *const TraceState) bool {
+    /// both channels without per-value taint reasoning. A pure-write loop (no
+    /// `aload`/`hload`, e.g. nsieve's sieve clear) is unaffected. Array and hash
+    /// loads are pooled because an `aload`-then-`hstore` (or vice versa) is just as
+    /// deopt-unsound as same-kind RMW.
+    fn traceHasHeapLoad(self: *const TraceState) bool {
         for (self.rec.instrs.items) |ins| {
-            if (ins.op == .aload) return true;
+            if (ins.op == .aload or ins.op == .hload) return true;
         }
         return false;
+    }
+
+    /// Is `v` a heap **string** — i.e. an `obj.field`-shaped (hash-part) table key?
+    /// The compiler lowers every `obj.field` to `get_index`/`set_index` with an
+    /// interned-string key, so this is the gate that routes such accesses to the
+    /// hash-field path (doc 11) instead of the integer-array path.
+    fn isStringKey(v: Value) bool {
+        return v.isHeap() and v.heapType() == .string;
+    }
+
+    /// Record `t.field` (`get_index`, `dst=a b=table c=key`, key an interned
+    /// string) as a hash-part field read. The string analogue of `recArrayGet`.
+    /// Emits, in order: `guard_table`(table) → `href`(table, keyconst) →
+    /// `guard_hash`(href, aux=recorded population) → `hload`(href) → the existing
+    /// type-guard on the `hload` ref (`guard_int`/`guard_float`/…). The cell address
+    /// is loop-invariant for a constant key (hoistable to the native prologue in
+    /// H1), so the read mirrors the array `aref`/`aload` path. Aborts (leaving
+    /// tier-0 untouched) unless the access is a *present, non-metatable, constant-
+    /// key* hash field — the only shape the oracle/native path models:
+    ///   * non-table container → `.bad_type`;
+    ///   * `tbl.metatable != null` → `.has_metatable` (an absent slot could fire
+    ///     `__index`; even a present slot could become absent on a later iteration);
+    ///   * key absent from the hash part at record time → `.bad_type` (an absent-key
+    ///     access is the migrate/`__index`/grow territory v1 excludes; the present-
+    ///     key rule is what keeps the hoisted cell from dangling);
+    ///   * computed (non-`konst`) key → `.bad_type` (a runtime-varying key cannot be
+    ///     pinned to one cell — v1 scope; `t[expr]` stays tier-0);
+    ///   * a pending (sunk) store precedes this load → `.bad_type` (same post-store
+    ///     no-load rule as `recArrayGet`: a load after a deferred store would read
+    ///     the pre-store value on-trace but the post-store value on deopt-replay).
+    fn recHashGet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        // Same post-store invariant as `recArrayGet`: a deferred store must be the
+        // trace's last heap access (doc 08 §mechanism). A hash load after one would
+        // diverge on deopt-replay. Array and hash loads/stores share the pool.
+        if (self.rec.pending_store_count > 0) return self.abort(.bad_type);
+        const vtab = regs.get(instr.b);
+        const vkey = regs.get(instr.c);
+        if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
+        const tbl = table_mod.Table.fromHeader(vtab.asHeap());
+        if (tbl.metatable != null) return self.abort(.has_metatable);
+        const cell = tbl.fieldPtr(vkey) orelse return self.abort(.bad_type); // absent
+        // Scalar-field restriction (the hash analogue of the narrow-array-lane rule).
+        // A present cell holds a non-`nil` tagged `Value` of any type. We trace only
+        // **int/float** fields, for two joined reasons: (1) the scalar exec-log
+        // encoder (the cross-mode determinism oracle) cannot encode a heap value, so
+        // `hload`'s logged value must be scalar; (2) only int/float have a *strict*
+        // type guard (`guard_int`/`guard_float`) that pins the field's type so a later
+        // iteration changing it side-exits — a `bool` field could silently become a
+        // truthy heap value that `guard_true` would wave through. A bool/heap/string
+        // field therefore aborts to tier-0, exactly as a `.value` array lane does.
+        const fv = cell.*;
+        if (!(fv.isInt() or fv.isFloat())) return self.abort(.nyi_opcode);
+        // The key must be a recorded `konst` (the bytecode literal interned via
+        // `load_const`), so its ref is provably the constant — no runtime key-
+        // identity guard is needed and the cell is pinnable. A computed key reaches
+        // here as a `slot_load`/arith ref and aborts (v1 scope).
+        const rkey = try self.refOf(instr.c);
+        if (self.rec.instrs.items[@intCast(rkey)].op != .konst) return self.abort(.bad_type);
+
+        const rtab = try self.refOf(instr.b);
+        _ = try self.emit(.{ .op = .guard_table, .a = rtab });
+        const ref = try self.emit(.{ .op = .href, .a = rtab, .b = rkey });
+        _ = try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(tbl.hash.count()) });
+        const rload = try self.emit(.{ .op = .hload, .a = ref, .ty = obsTypeOf(fv) });
+        self.setReg(instr.a, rload);
+        // Decompose the tagged-cell load into a typed load + the existing consumer
+        // type-guard (mirrors `slot_load` + `guardNum`): native lowers `hload` to a
+        // tag-check + payload load of the guarded kind. The oracle returns the whole
+        // `Value`, so this guard is what makes the two agree on the side-exit
+        // iteration (and pins the field type — int→float etc. side-exits).
+        try self.guardNum(rload, fv);
+    }
+
+    /// Record `t.field = v` (`set_index`, `a=table b=key c=value`, key an interned
+    /// string) as a hash-part field write. The string analogue of `recArraySet`'s
+    /// in-bounds store. Present-key overwrite ONLY: the recorder rejects an absent
+    /// key (an insert could grow/rehash and dangle every hoisted cell) and a `nil`
+    /// value (a delete). Follows the same C1 store-sink discipline as `recArraySet`
+    /// — a store following any heap load is deferred below every guard (`commit`).
+    /// Aborts unless:
+    ///   * non-table container → `.bad_type`;
+    ///   * `nil` value (delete) → `.bad_type`;
+    ///   * `tbl.metatable != null` → `.has_metatable` (`__newindex` territory);
+    ///   * key absent at record time → `.bad_type` (insert — out of v1 scope);
+    ///   * computed (non-`konst`) key → `.bad_type`;
+    ///   * deferred-store cap (`MAX_PENDING_STORES`) exceeded → `.bad_type`.
+    fn recHashSet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        const vtab = regs.get(instr.a);
+        const vkey = regs.get(instr.b);
+        const vval = regs.get(instr.c);
+        if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
+        if (vval.isNil()) return self.abort(.bad_type); // delete — out of scope
+        // Scalar-value restriction, the store mirror of `recHashGet`'s read rule: the
+        // exec-log encoder is scalar-only, so the stored value (logged by its
+        // producing `slot_load`/arith ref) must be int/float; a heap/bool field store
+        // aborts to tier-0. Covers the int/float field arithmetic OOP code does
+        // (`obj.x = obj.x + dt*vx`); reference fields (`obj.next = node`) stay tier-0.
+        if (!(vval.isInt() or vval.isFloat())) return self.abort(.nyi_opcode);
+        const tbl = table_mod.Table.fromHeader(vtab.asHeap());
+        if (tbl.metatable != null) return self.abort(.has_metatable);
+        _ = tbl.fieldPtr(vkey) orelse return self.abort(.bad_type); // absent = insert
+        const rkey = try self.refOf(instr.b);
+        if (self.rec.instrs.items[@intCast(rkey)].op != .konst) return self.abort(.bad_type);
+
+        // C1 / store-sinking, identical to `recArraySet`: a write following any heap
+        // read is a read-modify-write that must be deferred below every guard so a
+        // side-exit leaves it un-executed and deopt-replay applies it exactly once.
+        const defer_store = self.traceHasHeapLoad();
+        if (defer_store and self.rec.pending_store_count >= MAX_PENDING_STORES)
+            return self.abort(.bad_type);
+        const rval = try self.refOf(instr.c);
+        // Pin the **store value's** type (int/float). A hash cell holds a full tagged
+        // `Value` with no lane to constrain it, so this guard is the analogue of the
+        // array path's `guard_fits`: it is the sole guarantee the field stays scalar
+        // on-trace. Without it, a value whose runtime type drifts (int→heap) would be
+        // written into the cell, and a later `hload` would read a non-scalar into the
+        // scalar-only exec log. Emitting it inline (it stays in the body even when the
+        // store sinks) makes a drifted store value side-exit *before* the write lands.
+        // Sound via the standard deduped `guardNum`: `guarded_refs` holds only numeric
+        // guards (truthiness `guard_true`/`guard_false` are emitted raw, never
+        // registered), so a prior guard on this ref is necessarily a matching
+        // `guard_int`/`guard_float`.
+        try self.guardNum(rval, vval);
+        const rtab = try self.refOf(instr.a);
+        _ = try self.emit(.{ .op = .guard_table, .a = rtab });
+        const ref = try self.emit(.{ .op = .href, .a = rtab, .b = rkey });
+        _ = try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(tbl.hash.count()) });
+        // `hstore` is effectful (overwrites the present cell in place) and defines no
+        // register. A present-key overwrite never grows the map, so `guard_hash`
+        // (population) stays sufficient. The store value's type is pinned by the
+        // `guardNum` above (native declines a heap value at H1).
+        if (defer_store) {
+            self.rec.pending_stores[self.rec.pending_store_count] =
+                .{ .aref = ref, .value = rval, .lane_ord = 0, .op = .hstore };
+            self.rec.pending_store_count += 1;
+        } else {
+            _ = try self.emit(.{ .op = .hstore, .a = ref, .b = rval });
+        }
     }
 
     /// `eq`/`ne`. First cut: numeric operands only (the common loop-condition
@@ -2178,7 +2380,7 @@ fn konstKey(v: Value) KonstKey {
 /// close. `aref`/`value` are IR refs already emitted inline (the address node and
 /// the value to store); `lane_ord` is the packed-array `Lane` ordinal (the
 /// `astore`'s `aux`). See `Recorder.pending_stores`.
-const PendingStore = struct { aref: Ref, value: Ref, lane_ord: i32 };
+const PendingStore = struct { aref: Ref, value: Ref, lane_ord: i32, op: IrOp = .astore };
 
 /// Maximum number of read-modify-write stores a single trace may sink (Gap C,
 /// `docs/design/08-multi-store-sinking.md`). Caps the simultaneously-live value

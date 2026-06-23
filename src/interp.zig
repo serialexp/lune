@@ -4152,6 +4152,89 @@ test "cross-frame: a changed upvalue callee deopts the snapshot and replays byte
     );
 }
 
+// --- hash-field (string-keyed) tracing (8-mode parity) -----------------------
+// `obj.field` get/set on the hash part records a trace via href/guard_hash/hload/
+// hstore (doc 11, H0). These prove the recorded trace is byte-identical to tier-0
+// across {gc_stress × {off, record-only, no-opt, record-execute, native}} + a
+// keyframe restore — the replay-safety proof. At H0 native auto-declines (the four
+// ops fail proveKinds → tier-1a), so the native mode here runs the tier-1a oracle.
+
+test "hash field: a constant-key field read loop is byte-identical across all 8 modes" {
+    // The minimal read shape: `t.x` is a present, constant-key, int field. Records
+    // guard_table → href → guard_hash → hload → guard_int and runs every iteration
+    // through the cell.
+    try expectProgram(
+        \\local t = {x = 7}
+        \\local s = 0
+        \\for i = 1, 200 do s = s + t.x end
+        \\print(s)
+        \\
+    ,
+        "1400\n",
+    );
+}
+
+test "hash field: an RMW field store (t.n = t.n + 1) is byte-identical across all 8 modes" {
+    // The read-modify-write shape OOP code is built from. The hstore sinks below the
+    // loop close (C1), so a guard side-exit leaves it unexecuted and deopt-replay
+    // applies it exactly once — the double-apply hazard this matrix would catch.
+    try expectProgram(
+        \\local t = {n = 0}
+        \\for i = 1, 200 do t.n = t.n + 1 end
+        \\print(t.n)
+        \\
+    ,
+        "200\n",
+    );
+}
+
+test "hash field: a float-valued field RMW is byte-identical across all 8 modes" {
+    // nbody-shaped float arithmetic on a hash field (`p.x = p.x + 0.5`). Float is the
+    // second in-scope scalar type; guard_float pins it.
+    try expectProgram(
+        \\local p = {x = 0.0}
+        \\for i = 1, 100 do p.x = p.x + 0.5 end
+        \\print(p.x)
+        \\
+    ,
+        "50\n",
+    );
+}
+
+test "hash field: two distinct constant keys record distinct cells, byte-identical" {
+    // `t.a` and `t.b` resolve to two different hoistable cells in the same table; the
+    // recorder emits two independent href/guard_hash/hload chains.
+    try expectProgram(
+        \\local t = {a = 3, b = 4}
+        \\local s = 0
+        \\for i = 1, 100 do s = s + t.a * t.b end
+        \\print(s)
+        \\
+    ,
+        "1200\n",
+    );
+}
+
+test "hash field: a field whose type changes mid-loop deopts and replays byte-identically" {
+    // The type-guard's load-bearing proof. The trace records `t.x` as an int
+    // (guard_int on the hload). At i==50 tier-0 stores a float into `t.x`; on the next
+    // entry the guard_int fails, side-exits to tier-0, and the sum continues in float.
+    // Byte-identical across all 8 modes + keyframe restore proves the field type guard
+    // side-exits on the same iteration the oracle and (eventually) native would.
+    try expectProgram(
+        \\local t = {x = 1}
+        \\local s = 0.0
+        \\for i = 1, 100 do
+        \\  if i == 50 then t.x = 1.5 end
+        \\  s = s + t.x
+        \\end
+        \\print(s)
+        \\
+    ,
+        "125.5\n",
+    );
+}
+
 // --- long-bracket string literals (8-mode parity) ----------------------------
 
 test "long string: plain, concat, and length" {
@@ -8377,6 +8460,169 @@ test "recorder: maxrecord bounds trace length (overlong traces abort)" {
         \\local acc = 0
         \\for i = 1, 50 do acc = acc + i + i + i end
         \\print(acc)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
+}
+
+// --- hash-field (string-keyed) tracing recorder units (doc 11, H0) ----------
+// `obj.field` lowers to `get_index`/`set_index` with an interned *string* key, so
+// the recorder routes it to `recHashGet`/`recHashSet` instead of the integer-array
+// path. These drive real Lua source through `runForTrace` (so the key is a genuine
+// `load_const` `konst`, which the const-key rule requires) and assert the recorded
+// IR shape / the abort behaviour. The 8-mode byte-identical proof lives in the
+// `expectProgram` tests above; these pin the *shape* the optimizer/native consume.
+
+test "recorder (hash field): a constant-key field read records href + guard_hash + hload + type guard" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = {x = 7}
+        \\local s = 0
+        \\for i = 1, 50 do s = s + t.x end
+        \\print(s)
+    , true);
+    defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
+
+    var buf: [8192]u8 = undefined;
+    const text = try dumpTrace(&buf, &vm);
+    // The read decomposes into: guard_table(table) → href(table, "x") →
+    // guard_hash(href) → hload(href) → guard_int (the field is an int, pinned so a
+    // later type change side-exits). Mirrors the array aref/aload sequence.
+    try testing.expect(std.mem.indexOf(u8, text, "guard_table") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "href") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "guard_hash") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "hload") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "guard_int") != null);
+    // A pure field read sinks no store.
+    try testing.expect(std.mem.indexOf(u8, text, "hstore") == null);
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
+}
+
+test "recorder (hash field): an RMW field store (t.n = t.n + 1) sinks the hstore below the load" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = {n = 0}
+        \\for i = 1, 50 do t.n = t.n + 1 end
+        \\print(t.n)
+    , true);
+    defer chunk.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = try dumpTrace(&buf, &vm);
+    // The read records an hload; the write is a read-modify-write, so its hstore is
+    // deferred (C1 store-sinking) and flushed at trace close — it must appear *after*
+    // the hload in the stream, never before. A store that landed inline (before the
+    // loop close) would diverge on deopt-replay.
+    const i_load = std.mem.indexOf(u8, text, "hload");
+    const i_store = std.mem.indexOf(u8, text, "hstore");
+    try testing.expect(i_load != null);
+    try testing.expect(i_store != null);
+    try testing.expect(i_load.? < i_store.?);
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+}
+
+test "recorder (hash field): a float-valued field RMW records (nbody-shaped arithmetic)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local p = {x = 0.0}
+        \\for i = 1, 50 do p.x = p.x + 0.5 end
+        \\print(p.x)
+    , true);
+    defer chunk.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = try dumpTrace(&buf, &vm);
+    // A float field is in scope (int/float are the two scalar-guardable types); the
+    // field is pinned with guard_float, and the RMW store still sinks.
+    try testing.expect(std.mem.indexOf(u8, text, "hload") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "guard_float") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "hstore") != null);
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+}
+
+test "recorder (hash field): an absent constant-key access aborts (no trace)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `t.y` is absent at record time. The present-key rule forbids it: an absent-key
+    // read is `__index`/migrate territory, and an absent-key store could grow/rehash
+    // and dangle every hoisted cell. The recorder aborts → no trace, anchor gated.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = {x = 1}
+        \\local c = 0
+        \\for i = 1, 50 do if t.y then c = c + 1 end end
+        \\print(c)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder (hash field): a metatable-bearing table aborts (.has_metatable)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // A present, constant-key, int field that would otherwise record — but the table
+    // carries a metatable, so a present slot could go absent (or `__index` could fire)
+    // on a later iteration. The recorder aborts on the metatable edge.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = setmetatable({x = 1}, {})
+        \\local s = 0
+        \\for i = 1, 50 do s = s + t.x end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder (hash field): a heap-valued (string) field aborts (scalar-only restriction)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // The field value is a string (heap). Only int/float fields trace: the scalar
+    // exec-log encoder can't serialize a heap value, and a non-scalar field has no
+    // strict type guard to pin it across iterations. Aborts as a `.value` lane does.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = {x = "hi"}
+        \\local n = 0
+        \\for i = 1, 50 do if t.x then n = n + 1 end end
+        \\print(n)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder (hash field): a computed (non-konst) key aborts (const-key rule)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `t[k]` with `k` a runtime variable reaches the hash path (k holds a string), but
+    // its key ref is a `slot_load`, not a `konst`. A runtime-varying key cannot be
+    // pinned to one cell, so the recorder aborts (v1 scope: only literal `t.field`).
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = {a = 1}
+        \\local k = "a"
+        \\local s = 0
+        \\for i = 1, 50 do s = s + t[k] end
+        \\print(s)
     , true);
     defer chunk.deinit();
 

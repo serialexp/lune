@@ -304,6 +304,83 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                     values[i] = Value.nil();
                     if (record) rec.value(i, values[i]);
                 },
+
+                // ---- hash-part (string-keyed) field access path (doc 11) ----
+                //
+                // `href` carries no usable Value — it only pairs (table, key konst)
+                // for the `hload`/`hstore`/`guard_hash` that reference it. Store nil
+                // so the SSA slot is defined; it is never read *as a value*. (The hash
+                // analogue of `aref`.)
+                .href => {
+                    values[i] = Value.nil();
+                    if (record) rec.value(i, values[i]);
+                },
+                // Read the hash-part field via the *exact* tier-0 reader
+                // (`Table.get`), so an executed trace reads byte-identical to tier-0.
+                // `guard_hash` (run before us) proved the key present and the table
+                // metatable-free, so this hits the hash-part and returns the present
+                // value. (The hash analogue of `aload`.)
+                //
+                // `hload` is a **typed** load: `ins.ty` is the recorded scalar type
+                // (int/float — the recorder restricts the field to those). Unlike a
+                // packed array lane, a hash cell holds a full tagged `Value`, so its
+                // runtime type is NOT structurally constrained — a sibling mutation
+                // between entries (same `hash.count()`, so `guard_hash` still passes) or
+                // the trace's own store of a value whose runtime type drifted could make
+                // the cell non-scalar. We therefore tag-check **before logging** and
+                // side-exit on mismatch, so a non-scalar never reaches the scalar-only
+                // exec log (`UnsupportedEffectResult`) and never feeds the consumer
+                // arithmetic. This mirrors the H1 native lowering (load tag, side-exit if
+                // ≠ guarded tag, then load payload); the consumer `guard_int`/`guard_float`
+                // the recorder still emits is then always satisfied here.
+                .hload => {
+                    const hr = t.instrs[ins.a];
+                    const tbl = table.Table.fromHeader(values[hr.a].asHeap());
+                    const fv = tbl.get(values[hr.b]);
+                    const type_ok = switch (ins.ty) {
+                        .int => fv.isInt(),
+                        .float => fv.isFloat(),
+                        else => false, // only int/float fields are recorded
+                    };
+                    if (!type_ok) {
+                        if (record) rec.exit(i, .guard, values[hr.a]);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                    values[i] = fv;
+                    if (record) rec.value(i, values[i]);
+                },
+                // Overwrite the present hash cell in place via `fieldPtr` (NOT
+                // `Table.set`, which could migrate/rehash). `guard_hash` proved the key
+                // present, so the cell exists and a same-key overwrite changes no
+                // structure. `b` is the value (recorder-restricted to int/float).
+                // `hstore` produces no value; store nil so the SSA slot is defined.
+                // (The hash analogue of `astore`.)
+                .hstore => {
+                    const hr = t.instrs[ins.a];
+                    const tbl = table.Table.fromHeader(values[hr.a].asHeap());
+                    tbl.fieldPtr(values[hr.b]).?.* = values[ins.b];
+                    values[i] = Value.nil();
+                    if (record) rec.value(i, values[i]);
+                },
+                // The hash-part structural-stability guard: the table is still
+                // metatable-free, the recorded key is still present, and the hash
+                // population is unchanged (`hash.count() == aux`). Pinning the count
+                // catches insert/delete/grow since the cell was resolved; together with
+                // the present check it proves the (H1-hoisted) cell pointer is still
+                // valid. Any miss side-exits to tier-0 (full dispatch / migrate). `aux`
+                // is the recorded population (a small count, like `guard_lane`'s lane).
+                .guard_hash => {
+                    const hr = t.instrs[ins.a];
+                    const tbl = table.Table.fromHeader(values[hr.a].asHeap());
+                    if (tbl.metatable == null and tbl.fieldPtr(values[hr.b]) != null and
+                        tbl.hash.count() == @as(usize, @intCast(ins.aux)))
+                    {
+                        if (record) rec.guardPass(i, values[hr.a]);
+                    } else {
+                        if (record) rec.exit(i, .guard, values[hr.a]);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
                 // The slot holds a heap table with NO metatable. Recording aborts
                 // on a metatable-bearing table (`trace.AbortReason.has_metatable`),
                 // so a trace only models raw array access; if `setmetatable` added a

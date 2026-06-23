@@ -124,7 +124,10 @@ they land; move whole sections to "done" once everything inside them is checked.
 - [ ] **Cluster lever (beyond this plan) — method / iterator inlining.** Sub-lever 1
   (callee reached via upvalue/global) is done at U0; the remaining JIT-inert shapes
   (array3d, nbody, …) call through *methods* (`__index`/field) and *generic-for
-  iterators*, each its own change. **Tripwire (still open):** U0 reaches the callee
+  iterators*, each its own change. (Plain constant-key field access `obj.field` on a
+  metatable-free table now records via the hash-field path — see
+  `11-hash-field-tracing.md`, H0 landed; `__index`-dispatched method calls remain a
+  separate lever.) **Tripwire (still open):** U0 reaches the callee
   *through* an upvalue but the inlined callee reads no upvalues of its *own*, so
   `Proto.id` is still a sound `guard_func` key (any closure of that proto is
   interchangeable). The day we inline a callee whose *own body* executes
