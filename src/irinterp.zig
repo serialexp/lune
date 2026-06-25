@@ -410,6 +410,38 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                     if (record) rec.exit(i, .guard, values[ins.a]);
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
+                // ---- pure-builtin inlining (doc 12) ----
+                // The seeded callee is still exactly this pure builtin. A reassigned
+                // `sqrt` upvalue (now a non-native, or a native with a different/no
+                // `pure` tag) side-exits to tier-0 on the SAME iteration as native —
+                // `aux` is the `PureBuiltin` ordinal, the value must be a `.native`
+                // carrying that tag. Identity is the enum, never a pointer (doc 02).
+                .guard_pure => {
+                    const v = values[ins.a];
+                    const ok = v.isHeap() and v.heapType() == .native and
+                        function.Native.fromHeader(v.asHeap()).pure == @as(function.PureBuiltin, @enumFromInt(ins.aux));
+                    if (ok) {
+                        if (record) rec.guardPass(i, v);
+                    } else {
+                        if (record) rec.exit(i, .guard, v);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
+                // Leaf pure producer: `@sqrt` of the `guard_float`-pinned operand.
+                // `@sqrt(f64)` (here) and native `sqrtsd` are IEEE correctly-rounded
+                // and bit-identical under the default MXCSR (round-to-nearest-even).
+                // Defensive non-float side-exit (a dominating `guard_float` already
+                // side-exited otherwise). `sqrt(-0.0)=-0.0`, `sqrt(<0)=qNaN`.
+                .fsqrt => {
+                    const v = values[ins.a];
+                    if (v.isFloat()) {
+                        values[i] = Value.float(@sqrt(v.asFloat()));
+                        if (record) rec.value(i, values[i]);
+                        continue;
+                    }
+                    if (record) rec.exit(i, .guard, v);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
                 // The table's array lane still equals the recorded lane (a
                 // monotonic widen would have moved it past `aux`).
                 .guard_lane => {

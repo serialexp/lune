@@ -89,6 +89,13 @@ fn kindOf(op: IrOp) OpKind {
         // guards. A side-effecting root, deduped by (op, href ref, count-aux); reads
         // the `href` (`a`). Never hoisted above the `hstore` it protects.
         .guard_hash => .guard,
+        // Pure-builtin inlining (doc 12). `guard_pure` is the callee-identity guard
+        // (side-effecting root, deduped by (op, callee ref); the `aux` is the
+        // `PureBuiltin` ordinal, folded into the GuardKey via `guardKeyAux`). `fsqrt`
+        // is a pure unary producer — hoistable iff its operand is invariant, DCE'd
+        // if dead — but deliberately NEVER constant-folded (the fold arm skips it).
+        .guard_pure => .guard,
+        .fsqrt => .unary,
         // Packed-array address + load: memory ops, conservatively canonical to
         // themselves (never folded, never CSE'd) so a later store can't be
         // reordered past them. DCE'd if not reachable from a live root.
@@ -157,7 +164,10 @@ fn guardKeyAux(op: IrOp, aux: i32) i32 {
         // `guard_hash` stashes the recorded hash population in `aux` — genuine
         // semantic identity (two guards expecting different counts differ), so it
         // joins the lane/proto auxes in the dedup key rather than the PC-bearing ones.
-        .guard_lane, .guard_fits, .guard_func, .guard_hash => aux,
+        // `guard_pure` stashes the `PureBuiltin` ordinal in `aux` — semantic identity
+        // (a guard for `sqrt` differs from one for a future `floor`), so it joins the
+        // dedup-key auxes rather than the PC-bearing ones.
+        .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_pure => aux,
         else => 0,
     };
 }
@@ -239,14 +249,20 @@ pub fn optimize(
             },
             .unary => {
                 const a2 = canon[ins.a];
-                if (const_val[a2]) |va| {
-                    if (irinterp.evalUnary(ins.op, va)) |res| {
-                        const aux: i32 = @intCast(out_consts.items.len);
-                        try out_consts.append(gpa, res);
-                        fold_aux[i] = aux;
-                        const_val[i] = res;
-                        continue;
-                    } else |_| {}
+                // `fsqrt` is deliberately left unfoldable (doc 12): we never compute
+                // `@sqrt` at compile time — that avoids any fold-vs-runtime sign/NaN
+                // divergence, exactly like `int_of_float`. It still CSEs below. (And
+                // `evalUnary` is `unreachable` for it — it never folds a constant.)
+                if (ins.op != .fsqrt) {
+                    if (const_val[a2]) |va| {
+                        if (irinterp.evalUnary(ins.op, va)) |res| {
+                            const aux: i32 = @intCast(out_consts.items.len);
+                            try out_consts.append(gpa, res);
+                            fold_aux[i] = aux;
+                            const_val[i] = res;
+                            continue;
+                        } else |_| {}
+                    }
                 }
                 const key = CseKey{ .op = ins.op, .a = a2, .b = 0, .aux = ins.aux, .ty = ins.ty };
                 if (cse.get(key)) |c| {

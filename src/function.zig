@@ -154,6 +154,26 @@ pub const NativeFn = *const fn (ctx: *anyopaque, args: []const Value) anyerror!V
 /// mirroring Lua's stack), so it must not be made to copy.
 pub const NativeMultiFn = *const fn (ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize;
 
+/// Which **pure deterministic builtin** a native is, if any — the JIT's stable,
+/// replay-safe identity for a native it is allowed to inline into a trace as a
+/// dedicated leaf IR op (e.g. `math.sqrt` → `fsqrt` → one `sqrtsd`). Null ⇒ the
+/// native is opaque to the recorder (a `recCall` to it aborts with `.host_barrier`).
+///
+/// It is an **enum, never a pointer**: the trace bakes in "callee is this builtin"
+/// and a `guard_pure` op (present in both the tier-1a oracle and native code)
+/// side-exits to tier-0 when the seeded callee no longer carries this tag. Because
+/// the keyframe restorer rebinds natives by registry name, `pure` rides the
+/// registry (set from `interp.base_natives` at install and restore, like `effect`/
+/// `multi`) and is replay-stable by construction — no pointer is ever serialized.
+/// The ordinals are a stable wire enum (carried in `fsqrt`/`guard_pure` IR `aux`),
+/// so existing values must never be renumbered; append new builtins at the end.
+pub const PureBuiltin = enum(u8) {
+    /// `math.sqrt(x)` — IEEE correctly-rounded square root. `@sqrt(f64)` (tier-0 /
+    /// oracle) and native `sqrtsd` agree bit-for-bit under the default MXCSR
+    /// (round-to-nearest-even; lune never calls `fesetround`).
+    sqrt = 0,
+};
+
 /// Which **nondeterministic input** a native represents, if any. A native with a
 /// non-null `EffectKind` is a record/replay boundary: in `record` mode its result
 /// is logged, in `replay` mode it is *not called* and the logged result is fed
@@ -212,6 +232,10 @@ pub const Native = struct {
     /// primary-value projection). Set from the registry like `effect`. A native is
     /// never both an effect and multi-result (effects log a single value).
     multi: ?NativeMultiFn = null,
+    /// Non-null ⇒ this native is a pure deterministic builtin the JIT may inline
+    /// into a trace as a dedicated leaf op (see `PureBuiltin`). Set from the
+    /// registry like `effect`/`multi`, so install and replay can never disagree.
+    pure: ?PureBuiltin = null,
 
     pub fn create(
         gpa: std.mem.Allocator,
@@ -256,6 +280,8 @@ pub const BaseNative = struct {
     /// is the single-result *primary projection* the VM uses for 0/1 wanted
     /// results, and this is used when ≥2 are wanted.
     multi: ?NativeMultiFn = null,
+    /// Non-null ⇒ a pure deterministic builtin the JIT may inline (see `PureBuiltin`).
+    pure: ?PureBuiltin = null,
     /// If set, install into this module table (a global table) rather than as a
     /// top-level global. The unknown-global lint then knows `module` (not `name`).
     module: ?[]const u8 = null,

@@ -912,6 +912,7 @@ pub const Vm = struct {
         const native = try self.heap.newNative(bn.func, bn.name);
         native.effect = bn.effect; // null for pure host calls (e.g. print)
         native.multi = bn.multi; // null unless the native can return ≥2 results
+        native.pure = bn.pure; // null unless a JIT-inlinable pure builtin (e.g. sqrt)
         if (bn.module) |mod| {
             const tbl = try self.getOrCreateModuleTable(mod);
             const fkey = try self.heap.internValue(bn.field.?);
@@ -4298,6 +4299,75 @@ test "hash field: a table that grows between trace entries re-resolves the cell 
         \\
     ,
         "1000\t3000\n",
+    );
+}
+
+// --- pure-builtin tracing (math.sqrt → guard_pure/fsqrt, 8-mode parity) -------
+// `sqrt(x)` on a float in a hot loop records a trace (guard_pure pins the callee
+// identity, fsqrt computes @sqrt) instead of aborting `.host_barrier` (doc 12).
+// In F0 native declines any trace carrying the two new ops: the tier-1a oracle
+// runs them under the record-execute / record-execute-noopt modes, while the
+// `record_execute_native` mode skips the non-compilable trace and falls back to
+// tier-0. Both the oracle's `fsqrt` arm and tier-0's `mSqrt` use `@sqrt`, which
+// agrees bit-for-bit with the future native `sqrtsd` under the default MXCSR — so
+// all five trace modes are byte-identical now and stay so when F1 lands.
+
+test "pure-builtin: a sqrt float-reduction loop is byte-identical across all 8 modes" {
+    // The nbody-shaped inner-loop call: `sqrt` reaches the loop as a loop-invariant
+    // upvalue (`local sqrt = math.sqrt`), guard_pure re-proves its identity, and
+    // fsqrt computes the result from the guarded-float argument every iteration.
+    try expectProgram(
+        \\local sqrt = math.sqrt
+        \\local s = 0.0
+        \\for i = 1, 300 do s = s + sqrt(i * 1.0) end
+        \\print(s)
+        \\
+    ,
+        "3472.556388576408\n",
+    );
+}
+
+test "pure-builtin: a rebound sqrt upvalue deopts via guard_pure and replays byte-identically" {
+    // guard_pure's load-bearing proof. The first `run()` records a trace pinning the
+    // `sqrt` builtin. Reassigning the captured upvalue to an ordinary Lua function
+    // means the second `run()` re-resolves the seeded callee to a non-pure value on
+    // entry; guard_pure must fail closed and side-exit to tier-0, which really calls
+    // the new `sqrt`. Byte-identical across all 8 modes + keyframe restore proves the
+    // per-entry callee re-resolve + identity guard keeps the inlined builtin sound
+    // when the loop-invariant cell changes between entries.
+    try expectProgram(
+        \\local sqrt = math.sqrt
+        \\local function run()
+        \\  local s = 0.0
+        \\  for i = 1, 300 do s = s + sqrt(i * 1.0) end
+        \\  return s
+        \\end
+        \\print(run())
+        \\sqrt = function(x) return x + 1.0 end
+        \\print(run())
+        \\
+    ,
+        "3472.556388576408\n45450\n",
+    );
+}
+
+test "pure-builtin: NaN and -0.0 sqrt results through a traced loop are byte-identical" {
+    // The IEEE edge cases the trace must reproduce exactly: `sqrt(-1.0)` is a quiet
+    // NaN (sign bit set on x86-64 → prints `-nan`) and `sqrt(-0.0)` is `-0.0`. Both
+    // flow through a hot traced loop (loop-invariant const arg → konst + guard_float
+    // + fsqrt), and `fsqrt` is deliberately never constant-folded, so the value is
+    // produced by `@sqrt` on every tier identically.
+    try expectProgram(
+        \\local sqrt = math.sqrt
+        \\local n = 0.0
+        \\for i = 1, 300 do n = sqrt(-1.0) end
+        \\print(n)
+        \\local z = 1.0
+        \\for i = 1, 300 do z = sqrt(-0.0) end
+        \\print(z)
+        \\
+    ,
+        "-nan\n-0\n",
     );
 }
 

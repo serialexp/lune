@@ -257,7 +257,7 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "math.abs", .func = &mAbs, .module = "math", .field = "abs" },
     .{ .name = "math.ceil", .func = &mCeil, .module = "math", .field = "ceil" },
     .{ .name = "math.floor", .func = &mFloor, .module = "math", .field = "floor" },
-    .{ .name = "math.sqrt", .func = &mSqrt, .module = "math", .field = "sqrt" },
+    .{ .name = "math.sqrt", .func = &mSqrt, .module = "math", .field = "sqrt", .pure = .sqrt },
     .{ .name = "math.exp", .func = &mExp, .module = "math", .field = "exp" },
     .{ .name = "math.log", .func = &mLog, .module = "math", .field = "log" },
     .{ .name = "math.sin", .func = &mSin, .module = "math", .field = "sin" },

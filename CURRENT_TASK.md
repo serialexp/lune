@@ -1,153 +1,106 @@
-# CURRENT TASK — JIT hash-field (string-keyed) tracing, H0+H1
+# CURRENT TASK — JIT pure-builtin tracing (`math.sqrt` → native `sqrtsd`), F0
 
 Governing intent (Bart): close the LuaJIT gap one named technique at a time. The
-cross-frame cluster sub-lever (U0+U1) landed; the next highest-leverage recorder
-gap is **string-keyed field access** (`obj.field`). Until now the recorder only
-handled integer array keys — every `obj.field` get/set lowered to a string-keyed
-`get_index`/`set_index` and aborted the trace. Approved plan:
+string-keyed field lever (H0+H1) landed and is committed (`86f0710`). The next
+chosen lever is **sqrt-from-trace**: make `math.sqrt(x)` inside a hot traced loop
+record a trace instead of aborting `recCall` with `.host_barrier`. Target
+benchmark: **nbody** — its inner loop `local mag = sqrt(dx*dx + dy*dy + dz*dz)`
+records zero traces today; `sqrt` reaches the loop as a loop-invariant upvalue
+(`local sqrt = math.sqrt`). Approved plan:
 `~/.claude/plans/clever-yawning-neumann.md`. Design doc:
-`docs/design/11-hash-field-tracing.md`.
+`docs/design/12-pure-builtin-tracing.md`.
 
-Phased: **H0** = recorder + tier-1a oracle (byte-identical across 8 modes + replay,
-NO speedup, native auto-declines) → **H1** = native lowering (the speedup).
+Phased: **F0** = identity plumbing + recorder + tier-1a oracle (byte-identical
+across 8 modes + replay, NO speedup, native auto-declines) → **F1** = native
+`sqrtsd` lowering (the speedup).
 
-## H0 — DONE, GREEN (uncommitted, pending Bart approval)
+**Decisive insight:** `math.sqrt` lowers to a SINGLE x86-64 instruction
+`sqrtsd xmm,xmm` — no libm call. This is the `int_of_float` pattern (a
+self-identifying unary IR op → one SSE instruction), NOT a general "call C from
+native" feature. `@sqrt(f64)` (tier-0 / oracle) and `sqrtsd` (native) are IEEE
+correctly-rounded and bit-identical under the default MXCSR (lune never calls
+`fesetround`).
 
-`just test` green: 8 modes byte-identical + replay. Native auto-declines (any of
-the four new ops → `proveKinds` returns false → tier-1a oracle runs the body).
+## F0 — DONE, GREEN (uncommitted, pending Bart approval)
+
+`just test` green (`--summary all` → test success). Native auto-declines any
+trace carrying the two new ops (`proveKinds`' existing `else => return false`),
+so the `record_execute_native` mode runs the tier-1a oracle on the body.
 
 ### Mechanism
 
-Four new `IrOp`s (appended at the END of the enum, wire-ordinal-stable):
-`href`=41 (a=table, b=key-konst → cell descriptor, classified `.aref`), `hload`=42
-(a=href → typed `Value` load, `.aload`), `hstore`=43 (a=href, b=value → in-place
-overwrite, `.astore`), `guard_hash`=44 (a=href, aux=recorded `hash.count()` →
-structural-stability guard, `.guard`). Total 45 ops.
+Two new `IrOp`s (appended at the END of the enum, wire-ordinal-stable):
+`guard_pure`=45 (a=callee ref, aux=`@intFromEnum(PureBuiltin)` → callee-identity
+guard, classified `.guard`), `fsqrt`=46 (a=float arg ref, ty=.float → leaf
+producer computing `@sqrt`, classified `.unary` but never folded). Total 47 ops.
 
-- **`src/trace.zig`**: `get_index`/`set_index` dispatch branches on key type —
-  `isInt()` → existing array path; heap **string** key → new `recHashGet`/
-  `recHashSet`; else abort. Abort rules: non-table → `.bad_type`; metatable →
-  `.has_metatable`; absent key (`fieldPtr == null`) → `.bad_type` (present-key
-  only); nil store → `.bad_type`; non-konst key → `.bad_type` (const-key only);
-  non-scalar field value → `.nyi_opcode` (int/float only). C1 store-sink reused:
-  a store after any heap load defers into `pending_stores`, flushed below every
-  guard before `.loop`.
-- **`src/irinterp.zig`**: four oracle arms re-derive table+key from operands and
-  do the real hash ops. `hload` is a **typed self-side-exiting load** — it
-  tag-checks the loaded value against `ins.ty` (int/float) and side-exits BEFORE
-  logging, so a field that drifted to a heap value never reaches the scalar-only
-  exec log (review fix, see below).
-- **`src/tropt.zig`**: classifies the four ops across every OpKind pass.
-- **`src/nativegen.zig`**: one-line `proveKinds`-declines-if-present guard so H0
-  never reaches native lowering.
-- **`src/traceser.zig` + `viz/src/enums.ts`**: four op ordinals (no new const kind;
-  the key is an existing heap-string const).
-- **`src/table.zig`**: `fieldPtr(key)` → `hash.getPtr(normalizeKey(key))`.
+- **`src/function.zig`**: `PureBuiltin` enum `{ sqrt }` (stable replay-safe native
+  identity, never a pointer); `pure: ?PureBuiltin = null` on `Native` + `BaseNative`.
+- **`src/stdlib/math.zig`**: `.pure = .sqrt` on the `math.sqrt` registry row.
+- **`src/interp.zig`** (`defineNative`) + **`src/keyframeser.zig`** (HeapNative
+  restore): copy `pure` through alongside `effect`/`multi` — install and replay can
+  never disagree about what is an inlinable pure builtin.
+- **`src/trace.zig`**: `recCall`'s `.native` arm branches on `nat.pure` (`.sqrt` →
+  `recPureSqrt`, else `.host_barrier`). `recPureSqrt` rejects nargs≠1 / nresults≠1
+  (`.cross_frame`) and a non-float arg (`.bad_type`), then emits
+  `guard_pure(callee)` (deduped via `guarded_refs`) → `guard_float(arg)` →
+  `fsqrt(arg)`, result in the call's dest reg. NO frame push / NO `recReturn` (leaf).
+- **`src/irinterp.zig`**: `guard_pure` side-exits unless the value is a `.native`
+  carrying exactly the `aux` `pure` tag; `fsqrt` = `Value.float(@sqrt(arg))` with a
+  defensive non-float side-exit.
+- **`src/tropt.zig`**: `guard_pure` → `.guard` (dedup aux via `guardKeyAux`);
+  `fsqrt` → `.unary` (hoistable/DCE-able) but explicitly skipped by the constant
+  folder (`if (ins.op != .fsqrt)`), so `@sqrt` is never computed at compile time.
+- **`src/troptdiag.zig`**: both ops added to the single-operand uses-count and
+  consumer-set passes.
+- **`src/nativegen.zig`**: NO new code — `proveKinds`' `else => return false`
+  declines the trace → tier-1a oracle runs (mirrors the H0 decline).
+- **`src/traceser.zig` + `viz/src/enums.ts`**: ordinals 45/46 pinned (count → 47);
+  viz mirrors by position.
 
-### Reviews — Codex + Antigravity, both findings closed
+### The determinism crux
 
-- **Codex HIGH/MEDIUM (the substantive one):** the oracle `hload` arm logged its
-  loaded `Value` via `rec.value` BEFORE the consumer `guard_int`/`guard_float`
-  could reject it. A field that became non-scalar (heap) — via the trace's own
-  `hstore` drifting, or external mutation that keeps `hash.count()` unchanged so
-  `guard_hash` still passes — would leak a heap `Value` into the scalar-only exec
-  log → latent `UnsupportedEffectResult` on serialization (snapshot/replay).
-  Additionally the store value `rval` carried no strict type guard.
-  **Fixes applied & verified green:** (1) made oracle `hload` a typed
-  self-side-exiting load (tag-check vs `ins.ty`, side-exit before `rec.value` on
-  mismatch — mirrors the planned H1 native tag-check); (2) added
-  `guardNum(rval, vval)` in `recHashSet` to pin the store value's type inline
-  (analogue of the array path's `guard_fits`).
-- **Codex dedup sub-concern (resolved as non-issue):** worried `guardNum`'s
-  ref-only dedup could let a `guard_true` skip a numeric guard. Verified (and
-  Antigravity independently observed) that `recBranch` emits `guard_true`/
-  `guard_false` RAW via `self.emit` (not registered in `guarded_refs`), so
-  `guarded_refs` holds ONLY numeric type guards → `guardNum` dedup on the store
-  value is sound.
+The trace bakes in "callee is sqrt". The `sqrt` upvalue can be reassigned between
+trace entries, so `guard_pure` (in BOTH oracle and native) re-proves the callee is
+still the `sqrt` builtin and side-exits to tier-0 on the same iteration in both
+tiers when it changes. Identity is a `PureBuiltin` enum (never a pointer); replay
+rebinds natives by registry name, so the enum rides the registry and is
+replay-stable. The callee is a once-seeded loop-invariant input → `guard_pure` is
+LICM-hoistable (one check per entry).
 
 ### Tests (all green)
 
-- **Recorder units (interp.zig, via `runForTrace`+`dumpTrace`):** const-key read
-  records `href`+`guard_hash`+`hload`+`guard_int` (no `hstore`); int RMW sinks
-  `hstore` below `hload` (asserts `indexOf(hload) < indexOf(hstore)`); float field
-  RMW records `guard_float`; absent-key aborts; metatable aborts; heap/string-value
-  aborts; computed/non-konst key aborts.
-- **8-mode `expectProgram` (interp.zig):** const-key read, int RMW, float RMW,
-  two-key distinct cells, mid-loop type-change deopt — all byte-identical across
-  {stress × {off, record-only, no-opt, record-execute, native}} + keyframe restore.
+- **Recorder units (`trace.zig`):** `recPureSqrt: sqrt(float)` asserts the
+  `slot_load → guard_pure → slot_load → guard_float → fsqrt` order, `guard_pure.a`
+  = seeded callee ref, `guard_pure.aux == @intFromEnum(.sqrt)`, `fsqrt.a` = arg
+  ref, `fsqrt.ty == .float`, and the call dest holds the `fsqrt` result.
+  Abort units: `sqrt(a,b)` / `x,y=sqrt(a)` → `.cross_frame`; int arg →
+  `.bad_type`; a non-pure native (`print`-shaped) → `.host_barrier`.
+- **8-mode `expectProgram` (`interp.zig`):** a float-reduction sqrt loop
+  (`3472.556388576408`); a rebound-upvalue guard_pure deopt
+  (`3472.556388576408\n45450`); the NaN / `-0.0` edge cases (`-nan\n-0`) — all
+  byte-identical across {stress × {off, record-only, no-opt, record-execute,
+  native}} + keyframe restore.
 
 ### Manual end-to-end verification (rebuilt CLI)
 
-- `/tmp/h_deopt.lua` (mid-loop field type change) → `0.5` tier-0 == native ==
-  record-only.
-- `/tmp/h_rmw.lua` (`t.n = t.n + 1` ×200) → `200` tier-0 == native;
-  `--dump-traces` shows `href`/`guard_hash`/`hload`/`hstore` with `hload` (%005)
-  before the sunk `hstore` (%021).
+- `/tmp/sq1.lua` (float-reduction) `--dump-traces` shows `guard_pure %1 [sqrt]`
+  and `fsqrt`. `/tmp/sq3b.lua` records 2 fsqrt traces (NaN + -0.0 loops).
 
-## H1 — DONE, GREEN (uncommitted, pending Bart approval)
+### Pending (F0)
 
-Native lowering via **seed-based cell resolution (Approach B)** — H0 IR frozen, the
-oracle keeps re-deriving the cell + emitting real `guard_hash` events.
+Codex + Antigravity review (determinism of the `PureBuiltin` identity guard, the
+`@sqrt`≡`sqrtsd` bit-equality, abort coverage), then surface to Bart and request
+commit approval (Rule #15 — no commit without explicit approval).
 
-### Mechanism
+## F1 — NOT STARTED
 
-- **`src/trace.zig`** (H1-B1): `InputSeed.hash_cell{table_reg, key_const, slot}`;
-  the recorder allocates a synthetic slab slot and stamps it into `href.aux`.
-- **`src/interp.zig`** (H1-B2): `seedTraceInputs` resolves `cell =
-  table.fieldPtr(consts[key_const])` each entry, validates metatable-free + present +
-  `hash.count()==aux`, writes `@intFromPtr(cell)` into `payloads[slot]`. If any
-  `hash_cell` fails to resolve/validate → entry runs **tier-1a** (oracle), not native
-  → byte-identical (`completed=0`, tier-0 re-runs).
-- **`src/nativegen.zig`** (H1-B3): `Kind.href` (invariant cell ptr, GP home, never in
-  `exit_stores`); prologue loads `[rsi + aux*8]`; `guard_hash` → no-op (seed-gated);
-  `hload` → tag-check `[cell+0]` vs guarded ty → `deopt_exit`, then payload `[cell+8]`;
-  `hstore` → write tag+payload to `[cell]`. **Analyze-lane fix:** a hash-only `.ptr`
-  slot has no `guard_lane` (array-only), so the lane is made optional (required only
-  when an `aref` references the slot) and the prologue lane-check gated on `lane >= 0`.
-
-### Tests (all green, 8-mode + replay)
-
-- Field-RMW (`t.x=t.x+t.y`), field-get, float-field RMW, mid-loop type-change deopt,
-  two-key distinct cells — byte-identical tier-0 ≡ oracle ≡ native + keyframe restore.
-- **Sibling-grow (cell-dangle proof):** a table that grows between trace entries
-  re-resolves the cell every entry and never dangles — `1000\t3000`.
-- RMW double-apply is covered by the field-RMW 8-mode parity (native ≡ oracle).
-
-### Measure
-
-`bench/field_hash.lua` (`t.x = t.x + t.y` RMW): tier-0 **1534 ms** → native **22.3
-ms** (**68.8×**), within **2.6×** of LuaJIT (8.5 ms). `perf record`: **99.9%** native
-`[JIT]`, `Table.get/set` **0.0%** — the value-cell pointer is fully hoisted. The field
-body compiles to 220 bytes of x86-64.
-
-### Reviews — Codex + Antigravity (H1 native lowering)
-
-- **Codex HIGH (determinism, the substantive finding — FIXED):** `hload` lowers
-  to a **mid-body side-exit** (tag-check `[cell+0]` vs the guarded field type →
-  `jcc(.ne, deopt_exit)`), but it was absent from the `last_body_guard` set in the
-  win2 accumulator-home-coalescing pass (nativegen.zig ~1419). So a carried
-  accumulator whose in-place update **preceded** a later `hload` could coalesce
-  into its home register; if that `hload` then side-exited (field drifted
-  int→float between entries), the deopt flush would commit the **already-bumped**
-  accumulator — diverging from the tier-1a oracle, which side-exits at `hload`
-  with the carried slot untouched. **Fix:** added `.hload` to the
-  `last_body_guard` switch so any home update at index ≤ the last `hload` is
-  blocked from coalescing (matches the documented invariant — the comment block
-  enumerates the side-exiting ops, and `hload` is one). `guard_hash` stays out of
-  the set (hoisted to the seed, never side-exits).
-  **Regression test:** `nativegen win2(H1): an hload AFTER the accumulation blocks
-  coalescing (cond 1)` — a trace with `add(acc,1)` at idx 6 preceding `hload` at
-  idx 9 asserts `slotCoalesced(&t, 1) == false`. Verified load-bearing: reverting
-  the one-token fix turns the test red, re-applying turns it green.
-- **Antigravity:** independently cleared the rest of the H1 lowering as sound
-  (seed cell re-resolution, `guard_hash` no-op gating, tag-check deopt, in-place
-  `hstore`).
-
-### Pending
-
-Surface the review outcome + the fix to Bart, then request commit approval
-(Rule #15 — no commit without explicit approval).
+x64.zig `sqrtsdRegReg` (`F2 0F 51 /r`) + encoding test; nativegen
+proveKinds/isTransient/operandReads/last_body_guard/lower for `fsqrt`+`guard_pure`;
+remove the F0 decline; nbody `--dump-native` shows `sqrtsd`; `just bench --filter
+nbody` measure; flip doc 12 to "F1 native landed."
 
 ## Stdlib inventory
 
-Untouched — H0 is a JIT recorder change, no stdlib function added/changed.
+Untouched — F0 is a JIT recorder change. `math.sqrt` stays `status=implemented`
+(`docs/lua-stdlib-inventory.csv:74`).

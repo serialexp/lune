@@ -564,6 +564,7 @@ pub fn restoreSnapshot(
                 const n = try function.Native.create(gpa, entry.func, entry.name);
                 n.effect = entry.effect; // an effect native stays an effect on replay
                 n.multi = entry.multi; // …and keeps its multi-result projection
+                n.pure = entry.pure; // …and its JIT-inlinable pure-builtin tag
                 vm.heap.linkRestored(&n.header, o.id);
                 break :blk &n.header;
             },

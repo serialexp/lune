@@ -295,6 +295,31 @@ pub const IrOp = enum(u8) {
     /// the raw table ref just before `href`. Produces no value; never DCE'd
     /// (a `.guard`). Classified `.guard`.
     guard_hash,
+
+    // ---- pure-builtin inlining (doc 12) ---------------------------------------
+    //
+    // A `recCall` to a native flagged `PureBuiltin` (e.g. `math.sqrt`) is inlined
+    // as a dedicated leaf producer instead of aborting `.host_barrier`. The trace
+    // bakes in "callee is this builtin"; `guard_pure` re-proves that identity, and
+    // the producer (`fsqrt`) computes the result directly from its float operand.
+    //
+    /// `a` = the callee value ref (a once-seeded loop-invariant upvalue/global),
+    /// `aux` = `@intFromEnum(PureBuiltin)`. Side-exits to tier-0 unless the runtime
+    /// callee is still a `.native` carrying exactly this `pure` tag — so a reassigned
+    /// `sqrt` upvalue deopts on the same iteration in both the oracle and native.
+    /// The callee is a once-seeded synthetic input, so the value is loop-invariant
+    /// and the guard is a candidate for LICM (like `guard_func`); the current pass
+    /// does NOT hoist guards (re-checking an invariant value each iteration is cheap
+    /// — see `tropt`'s LICM note), so today it re-checks per iteration. Produces no
+    /// value; never DCE'd. Classified `.guard`.
+    guard_pure,
+    /// `a` = the float argument ref → the pure-builtin result. v1 is `sqrt` only:
+    /// the oracle computes `Value.float(@sqrt(arg))` and native lowers to a single
+    /// `sqrtsd` (both IEEE correctly-rounded, bit-identical under the default MXCSR).
+    /// A leaf unary producer: it cannot itself side-exit — its operand's preceding
+    /// `guard_float` pins the arg type. `ty` is always `.float`. Classified `.unary`
+    /// (NOT a constant-folder input — see doc 12 / `tropt`).
+    fsqrt,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -1411,6 +1436,9 @@ pub const TraceState = struct {
                 },
                 // `int_of_float` reads its sole float operand `a` (a prior node).
                 .int_of_float => std.debug.assert(ins.a < i),
+                // `guard_pure` reads the callee ref `a`; `fsqrt` reads its float
+                // operand `a` — both prior nodes.
+                .guard_pure, .fsqrt => std.debug.assert(ins.a < i),
                 // `aref` pairs (table, index) into an address descriptor;
                 // `astore`/`astore_append` read the `aref` (`a`) and the value (`b`).
                 // `href` (table, key konst) and `hstore` (href, value) mirror them.
@@ -2255,8 +2283,16 @@ pub const TraceState = struct {
         if (!callee.isHeap()) return self.abort(.cross_frame);
         switch (callee.heapType()) {
             // A host call crosses the embedding boundary — heap effects we can't
-            // model on the trace. Stays the existing host barrier.
-            .native => return self.abort(.host_barrier),
+            // model on the trace — UNLESS the native is a pure deterministic builtin
+            // the JIT may inline as a dedicated leaf op (e.g. `math.sqrt`). Anything
+            // else stays the host barrier.
+            .native => {
+                const nat = function.Native.fromHeader(callee.asHeap());
+                if (nat.pure) |pb| switch (pb) {
+                    .sqrt => return self.recPureSqrt(instr, regs),
+                };
+                return self.abort(.host_barrier);
+            },
             .function => {},
             // `__call` on a table/userdata, or anything else callable only via a
             // metamethod, is not a plain Lua-closure call. Not inlined.
@@ -2311,6 +2347,40 @@ pub const TraceState = struct {
         };
         self.rec.inline_depth += 1;
         self.rec.base_off = callee_base_off;
+    }
+
+    /// Inline a `math.sqrt(x)` call (callee flagged `PureBuiltin.sqrt`, doc 12) as a
+    /// leaf `fsqrt` producer instead of aborting `.host_barrier`. Emits, in order:
+    /// `guard_pure(callee)` (re-prove the seeded callee is still this exact builtin —
+    /// deduped like a type guard, LICM-hoistable since the callee is a once-seeded
+    /// loop invariant), `guard_float(arg)` (pin the float operand), then
+    /// `fsqrt(arg)` whose result lands directly in the call's destination register.
+    /// NO frame push / NO `recReturn`: `fsqrt` is a leaf producer — the single value
+    /// the call site wants is `instr.a` itself, with no callee window to model.
+    fn recPureSqrt(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        // One fixed arg, one fixed result. Dynamic windows (`all_results`) and any
+        // other arity have no leaf shape — abort, tier-0 owns the call.
+        if (instr.b != 1) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        // v1 is float-only: a non-float arg (int included) aborts so tier-0 owns the
+        // int→float promotion. The observed-float arg is pinned by `guard_float`.
+        const arg = regs.get(@intCast(@as(usize, instr.a) + 1));
+        if (!arg.isFloat()) return self.abort(.bad_type);
+
+        // `guard_pure` re-proves the callee identity. The callee ref is the seeded
+        // loop-invariant input (so the guard checks the same value `seedTraceInputs`
+        // re-resolves). Deduped against `guarded_refs` — one SSA value, one identity
+        // check (a native callee never carries a numeric type guard, so reusing the
+        // set is sound). `aux` carries the `PureBuiltin` ordinal, not a PC.
+        const callee_ref = try self.refOf(instr.a);
+        if (!self.rec.guarded_refs.contains(callee_ref)) {
+            try self.rec.guarded_refs.put(self.gpa, callee_ref, {});
+            _ = try self.emit(.{ .op = .guard_pure, .a = callee_ref, .aux = @intFromEnum(function.PureBuiltin.sqrt) });
+        }
+        const arg_ref = try self.refOf(@intCast(@as(usize, instr.a) + 1));
+        try self.guard(arg_ref, .guard_float);
+        const r = try self.emit(.{ .op = .fsqrt, .a = arg_ref, .ty = .float });
+        self.setReg(instr.a, r);
     }
 
     /// Cross-frame tracing — close an inlined callee (LuaJIT's `lj_record_ret`).
@@ -2666,7 +2736,10 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_fits,
         .int_of_float,
         .guard_func,
+        .fsqrt,
         => try w.print("%{d}", .{ins.a}),
+        // `guard_pure` reads the callee `%a` and tags the builtin in `aux`.
+        .guard_pure => try w.print("%{d}  [{s}]", .{ ins.a, @tagName(@as(function.PureBuiltin, @enumFromInt(ins.aux))) }),
         .loop, .preheader => {},
         // φ: a slot-bound φ prints `update=%b → r{slot}` (init is implicit
         // `regs[slot]`); an internal φ prints `init=%a update=%b → internal`.
@@ -3260,6 +3333,81 @@ test "recArraySet aborts when sunk stores exceed MAX_PENDING_STORES" {
     state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
+}
+
+// --- pure-builtin tracing (math.sqrt → guard_pure/fsqrt, doc 12) --------------
+
+/// A do-nothing `NativeFn` body for recorder unit tests: the recorder never
+/// *calls* the native (it inlines `fsqrt` directly), it only reads the heap
+/// `Native`'s `pure` tag, so the body is irrelevant.
+fn sqrtStub(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    _ = ctx;
+    _ = args;
+    return Value.nil();
+}
+
+test "recPureSqrt: sqrt(float) records guard_pure, guard_float, fsqrt" {
+    const gpa = testing.allocator;
+    const nat = try function.Native.create(gpa, &sqrtStub, "math.sqrt");
+    defer nat.destroy(gpa);
+    nat.pure = .sqrt;
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // r0 = sqrt (callee + result dest), r1 = arg (a float). `call r0, 1, 1`.
+    var regs = [_]Value{ Value.heap(&nat.header), Value.float(2.0), Value.nil() };
+    state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &proto, 0, Value.nil());
+
+    try testing.expect(state.isRecording()); // a clean record — no abort
+    const ops = state.rec.instrs.items;
+    // slot_load(callee), guard_pure, slot_load(arg), guard_float, fsqrt.
+    try testing.expectEqual(@as(usize, 5), ops.len);
+    try testing.expectEqual(IrOp.slot_load, ops[0].op);
+    try testing.expectEqual(IrOp.guard_pure, ops[1].op);
+    try testing.expectEqual(@as(Ref, 0), ops[1].a); // guards the seeded callee ref
+    try testing.expectEqual(@as(i32, @intFromEnum(function.PureBuiltin.sqrt)), ops[1].aux);
+    try testing.expectEqual(IrOp.slot_load, ops[2].op);
+    try testing.expectEqual(IrOp.guard_float, ops[3].op);
+    try testing.expectEqual(@as(Ref, 2), ops[3].a); // guards the arg ref
+    try testing.expectEqual(IrOp.fsqrt, ops[4].op);
+    try testing.expectEqual(@as(Ref, 2), ops[4].a); // fsqrt reads the arg ref
+    try testing.expectEqual(ObsType.float, ops[4].ty);
+    // The call's destination register holds the fsqrt result (ref 4), not the callee.
+    try testing.expectEqual(@as(Ref, 4), try state.refOf(0));
+}
+
+test "recPureSqrt aborts: bad arity, non-float arg, and a non-pure native" {
+    const gpa = testing.allocator;
+    const sq = try function.Native.create(gpa, &sqrtStub, "math.sqrt");
+    defer sq.destroy(gpa);
+    sq.pure = .sqrt;
+    const plain = try function.Native.create(gpa, &sqrtStub, "print");
+    defer plain.destroy(gpa); // pure == null
+
+    const Case = struct { callee: *function.Native, arg: Value, b: u16, c: u16, why: AbortReason };
+    const cases = [_]Case{
+        // sqrt(a, b): two args → no leaf shape.
+        .{ .callee = sq, .arg = Value.float(2.0), .b = 2, .c = 1, .why = .cross_frame },
+        // x, y = sqrt(a): two results → no leaf shape.
+        .{ .callee = sq, .arg = Value.float(2.0), .b = 1, .c = 2, .why = .cross_frame },
+        // sqrt(int): v1 is float-only; tier-0 owns the int→float promotion.
+        .{ .callee = sq, .arg = Value.int(4), .b = 1, .c = 1, .why = .bad_type },
+        // print(x): a native with no `pure` tag stays the host barrier.
+        .{ .callee = plain, .arg = Value.float(2.0), .b = 1, .c = 1, .why = .host_barrier },
+    };
+    for (cases) |c| {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ Value.heap(&c.callee.header), c.arg, Value.nil() };
+        state.recordInstr(Instr.opABC(.call, 0, c.b, c.c), winRO(&regs), &proto, 0, Value.nil());
+        try testing.expect(!state.isRecording());
+        try testing.expectEqual(c.why, state.rec.abort_reason.?);
+    }
 }
 
 test "per-guard PC recording: guard_int aux carries the bytecode PC" {

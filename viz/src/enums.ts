@@ -56,6 +56,8 @@ export const IR_OP_NAMES = [
   "hload", // 42
   "hstore", // 43
   "guard_hash", // 44
+  "guard_pure", // 45
+  "fsqrt", // 46
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -108,6 +110,8 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "guard_append",
   "hload",
   "guard_hash",
+  "guard_pure",
+  "fsqrt",
 ]);
 
 /** Map a raw wire ordinal to a name, falling back to `op:N` if out of range. */
