@@ -797,7 +797,17 @@ pub const Vm = struct {
     /// loop back-edge entry, so writing them clobbers nothing tier-0 will read. The
     /// trace's `slot_load`s read them back; a `guard_func` (or a downstream type
     /// guard) deopts if the snapshot changed since recording.
-    fn seedTraceInputs(self: *Vm, ct: *const trace.Trace, base: usize, closure: *const function.Closure, proto: *const Proto, narrow: RegWindow) ?RegWindow {
+    ///
+    /// `native_eligible` (caller pre-set to `true`) is cleared iff a `hash_cell`
+    /// seed (H1, doc 11 §5) fails to resolve/validate at this entry — the table
+    /// isn't a metatable-free table, the constant key is absent, or the recorded
+    /// population changed. The caller then runs this entry on **tier-1a** instead of
+    /// native: the oracle re-derives the cell from `href`'s operands and side-exits
+    /// at the same `guard_table`/`guard_hash` native would have, so the outcome is
+    /// byte-identical (zero-iteration exit → tier-0 re-runs). `upvalue`/`global`
+    /// seeds never touch it (their staleness is caught by an ordinary guard on the
+    /// trace, not at seed time).
+    fn seedTraceInputs(self: *Vm, ct: *const trace.Trace, base: usize, closure: *const function.Closure, proto: *const Proto, narrow: RegWindow, native_eligible: *bool) ?RegWindow {
         if (ct.inputs.len == 0) return narrow;
         var count: usize = proto.num_registers;
         for (ct.inputs) |seed| count = @max(count, @as(usize, seed.slot) + 1);
@@ -806,6 +816,28 @@ pub const Vm = struct {
             const v = switch (seed.kind) {
                 .upvalue => self.upvalGet(closure.upvalues[seed.source]),
                 .global => self.globals.get(proto.constants[seed.source]),
+                .hash_cell => blk: {
+                    // Resolve the loop-invariant value-cell pointer and stash it raw
+                    // for the native prologue (`[rsi + slot*8]`). Validate exactly the
+                    // oracle's per-iteration `guard_hash`: metatable-free, key present,
+                    // population unchanged. A `0` result means "ineligible" — a real
+                    // cell pointer is never null — so native declines and tier-1a owns
+                    // this entry. The slot is tagged `.int` so the raw pointer is never
+                    // mistaken for a `GcHeader` by a GC scan of this dead scratch.
+                    const vtab = self.regGet(base + seed.table_reg);
+                    var cell_bits: u64 = 0;
+                    if (vtab.isHeap() and vtab.heapType() == .table) {
+                        const tbl = table.Table.fromHeader(vtab.asHeap());
+                        if (tbl.metatable == null) {
+                            if (tbl.fieldPtr(ct.consts[seed.source])) |cell| {
+                                if (tbl.hash.count() == seed.expected_count)
+                                    cell_bits = @intFromPtr(cell);
+                            }
+                        }
+                    }
+                    if (cell_bits == 0) native_eligible.* = false;
+                    break :blk Value{ .tag = .int, .payload = .{ .bits = cell_bits } };
+                },
             };
             self.regSet(base + seed.slot, v);
         }
@@ -2310,7 +2342,12 @@ pub const Vm = struct {
                             // anchor window and widen the executor window to cover
                             // them; an input-free trace reuses the narrow `regs`. A
                             // capacity overflow declines the entry (run tier-0).
-                            const trace_regs = self.seedTraceInputs(ct, base, closure, proto, regs) orelse continue;
+                            // `native_eligible` stays true unless a `hash_cell` seed
+                            // can't resolve this entry (H1) — then native declines and
+                            // tier-1a owns the entry (byte-identical, see
+                            // `seedTraceInputs`).
+                            var native_eligible = true;
+                            const trace_regs = self.seedTraceInputs(ct, base, closure, proto, regs, &native_eligible) orelse continue;
                             if (self.trace.valuesScratch(ct.instrs.len)) |buf| {
                                 self.trace.entries +%= 1;
                                 const result = if (self.trace.config.record_exec_log) blk: {
@@ -2318,7 +2355,9 @@ pub const Vm = struct {
                                     const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, trace_regs, buf);
                                     break :blk irinterp.executeTraced(rec, ct, trace_regs, buf);
                                 } else if (self.trace.config.native_codegen) blk: {
-                                    if (self.trace.nativeFor(ct)) |nt| break :blk irinterp.ExecResult{ .completed = nt.run(trace_regs), .exit_instr = std.math.maxInt(u32) };
+                                    if (native_eligible) {
+                                        if (self.trace.nativeFor(ct)) |nt| break :blk irinterp.ExecResult{ .completed = nt.run(trace_regs), .exit_instr = std.math.maxInt(u32) };
+                                    }
                                     break :blk irinterp.execute(ct, trace_regs, buf);
                                 } else irinterp.execute(ct, trace_regs, buf);
                                 // Always record the exit instruction — useful for
@@ -4154,10 +4193,13 @@ test "cross-frame: a changed upvalue callee deopts the snapshot and replays byte
 
 // --- hash-field (string-keyed) tracing (8-mode parity) -----------------------
 // `obj.field` get/set on the hash part records a trace via href/guard_hash/hload/
-// hstore (doc 11, H0). These prove the recorded trace is byte-identical to tier-0
+// hstore (doc 11). These prove the recorded trace is byte-identical to tier-0
 // across {gc_stress × {off, record-only, no-opt, record-execute, native}} + a
-// keyframe restore — the replay-safety proof. At H0 native auto-declines (the four
-// ops fail proveKinds → tier-1a), so the native mode here runs the tier-1a oracle.
+// keyframe restore — the replay-safety proof. With H1 landed the four ops lower to
+// native (seed-resolved invariant cell pointer + typed tag-checked load/store), so
+// the `record_execute_native` mode now genuinely exercises the native field path; a
+// per-entry seed-resolution miss routes that entry to the tier-1a oracle, which
+// side-exits identically — so the matrix stays byte-identical either way.
 
 test "hash field: a constant-key field read loop is byte-identical across all 8 modes" {
     // The minimal read shape: `t.x` is a present, constant-key, int field. Records
@@ -4232,6 +4274,30 @@ test "hash field: a field whose type changes mid-loop deopts and replays byte-id
         \\
     ,
         "125.5\n",
+    );
+}
+
+test "hash field: a table that grows between trace entries re-resolves the cell (no dangle)" {
+    // The cell-dangle proof for Approach B. The hot inner loop traces `t.n` (a present
+    // cell). Between inner-loop entries the outer loop inserts a NEW key, growing `t`'s
+    // hash part — a rehash that can MOVE the value cell. Because the seeded cell pointer
+    // is re-resolved (`getPtr`) and its `hash.count()` re-validated at every entry
+    // (never serialized, never assumed stable), a grown table fails the count check →
+    // that entry declines native and runs the tier-1a oracle, whose guard_hash side-
+    // exits to tier-0. The hoisted pointer can therefore never dangle. Byte-identical
+    // across all 8 modes + keyframe restore is the proof.
+    try expectProgram(
+        \\local t = {n = 0}
+        \\local total = 0
+        \\for outer = 1, 5 do
+        \\  for i = 1, 200 do t.n = t.n + 1 end
+        \\  t["k" .. outer] = outer
+        \\  total = total + t.n
+        \\end
+        \\print(t.n, total)
+        \\
+    ,
+        "1000\t3000\n",
     );
 }
 

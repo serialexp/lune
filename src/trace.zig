@@ -390,15 +390,36 @@ pub const EntryGuard = struct { slot: u16, ty: EntryGuardType };
 /// closure). The recorder snapshots it into a dead slab slot *above* the anchor
 /// frame window and reads it as an ordinary `slot_load`; the dispatch loop seeds
 /// the slot once per entry (`upvalGet`/`globals.get`) before running the trace.
-pub const InputKind = enum(u8) { upvalue, global };
+/// `hash_cell` (doc 11, H1): the loop-invariant **value-cell pointer** of a
+/// constant-key field access (`obj.field`). Unlike `upvalue`/`global` it seeds no
+/// `slot_load` — the existing `href` op consumes it (via `href.aux == slot`) — and
+/// it writes a raw `@intFromPtr(cell)` into the slab payload for the **native** path
+/// only; the tier-1a oracle ignores the slot and re-derives the cell from `href`'s
+/// `(table,key)` operands each iteration (so H0's IR and exec-log behaviour are
+/// frozen). Re-resolved every entry via `Table.fieldPtr`, so — like every seed — no
+/// pointer is ever serialized.
+pub const InputKind = enum(u8) { upvalue, global, hash_cell };
 
-/// One synthetic entry input: the loop-invariant upvalue/global the dispatch loop
-/// resolves and writes into the slab before trace entry. `source` is the upvalue
-/// index (`closure.upvalues[source]`) or the global key's constant-pool index
+/// One synthetic entry input the dispatch loop resolves and writes into the slab
+/// before trace entry. For `upvalue`/`global`: `source` is the upvalue index
+/// (`closure.upvalues[source]`) or the global key's constant-pool index
 /// (`proto.constants[source]`); `slot` is the synthetic frame-relative slab slot
-/// (== the seeding `slot_load`'s `aux`), always `>= anchor_num_registers`.
+/// (== the seeding `slot_load`'s `aux`), always `>= anchor_num_registers`. For
+/// `hash_cell` (H1): `source` is the **key**'s constant-pool index, `table_reg` is
+/// the anchor slot holding the table value, and `expected_count` is the recorded
+/// `hash.count()` (the `guard_hash` aux) the seed re-checks for native eligibility.
 /// Runtime-only — not serialized (precedent: `entry_guards`).
-pub const InputSeed = struct { kind: InputKind, source: u32, slot: u16 };
+pub const InputSeed = struct {
+    kind: InputKind,
+    source: u32,
+    slot: u16,
+    /// `hash_cell` only: anchor slot the table value lives in at entry.
+    table_reg: u16 = 0,
+    /// `hash_cell` only: recorded `hash.count()` — the entry must match it (the
+    /// native analogue of the oracle's per-iteration `guard_hash` count check), else
+    /// the entry declines native and runs tier-1a (which side-exits at `guard_hash`).
+    expected_count: u32 = 0,
+};
 
 /// A completed, cached trace: the recorded IR plus the entry/exit snapshots that
 /// connect it back to tier-0 register slots. Immutable once committed (Phase 5a
@@ -1933,6 +1954,56 @@ pub const TraceState = struct {
         return v.isHeap() and v.heapType() == .string;
     }
 
+    /// H1 native seeding (Approach B, doc 11 §5). Register the loop-invariant
+    /// **value-cell pointer** of a constant-key field access as a `hash_cell` entry
+    /// input so the *native* path can read the cell from the slab prologue
+    /// (`[rsi + slot*8]`), exactly as U0 hoists an upvalue/global. Returns the
+    /// synthetic slab slot to stamp into `href.aux`, or `null` when the cell can't be
+    /// seeded — in which case the trace is still valid at **tier-1a** (the oracle
+    /// re-derives the cell from `href`'s `(table,key)` operands each iteration and
+    /// ignores `aux`); only *native* execution declines for this entry.
+    ///
+    /// `rtab` must resolve to a `slot_load` so the dispatch loop can re-read the
+    /// table value from an anchor slot every entry; a table produced on-trace (e.g. a
+    /// call result) isn't seedable. `rkey` is the `konst` ref whose `aux` is the
+    /// key's const-pool index — recorded as `source` so `seedTraceInputs` can recover
+    /// the key `Value` and call `Table.fieldPtr`. `count` is the recorded
+    /// `hash.count()` (the `guard_hash` aux) the seed re-validates at entry, the
+    /// native analogue of the oracle's per-iteration `guard_hash` population check.
+    ///
+    /// Unlike `recInputGet`, exhausting the input budget is **not** an abort: the
+    /// tier-1a trace stands, native just declines (returns `null`). An RMW's read and
+    /// write `href`s dedup onto one slot via `hash_cell_dedup`.
+    fn seedHashCell(self: *TraceState, rtab: Ref, rkey: Ref, count: u32) !?u16 {
+        const tab_instr = self.rec.instrs.items[@intCast(rtab)];
+        // The table must live in a re-readable anchor slot (a `slot_load`, which both
+        // an ordinary register read and a U0-seeded upvalue/global resolve to). A
+        // table computed on-trace has no entry slab slot to re-resolve from.
+        if (tab_instr.op != .slot_load) return null;
+        const table_reg: u16 = @intCast(tab_instr.aux);
+        const key_const: u32 = @intCast(self.rec.instrs.items[@intCast(rkey)].aux);
+
+        const dkey = (@as(u64, table_reg) << 32) | key_const;
+        if (self.rec.hash_cell_dedup.get(dkey)) |slot| return slot;
+
+        // Budget/index guards mirror `recInputGet`, but a miss declines native rather
+        // than aborting the (still-valid-at-tier-1a) trace.
+        if (self.rec.input_seeds.items.len >= MAX_TRACE_INPUTS) return null;
+        if (self.rec.next_input_slot == std.math.maxInt(u16)) return null;
+
+        const slot = self.rec.next_input_slot;
+        self.rec.next_input_slot += 1;
+        try self.rec.input_seeds.append(self.gpa, .{
+            .kind = .hash_cell,
+            .source = key_const,
+            .slot = slot,
+            .table_reg = table_reg,
+            .expected_count = count,
+        });
+        try self.rec.hash_cell_dedup.put(self.gpa, dkey, slot);
+        return slot;
+    }
+
     /// Record `t.field` (`get_index`, `dst=a b=table c=key`, key an interned
     /// string) as a hash-part field read. The string analogue of `recArrayGet`.
     /// Emits, in order: `guard_table`(table) → `href`(table, keyconst) →
@@ -1984,8 +2055,13 @@ pub const TraceState = struct {
 
         const rtab = try self.refOf(instr.b);
         _ = try self.emit(.{ .op = .guard_table, .a = rtab });
-        const ref = try self.emit(.{ .op = .href, .a = rtab, .b = rkey });
-        _ = try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(tbl.hash.count()) });
+        // Seed the loop-invariant cell pointer for native (H1); `href.aux` carries
+        // the synthetic slab slot, or `-1` to mark "not seeded → native declines".
+        // The tier-1a oracle ignores `aux`, so a `null` seed leaves H0 untouched.
+        const count: u32 = @intCast(tbl.hash.count());
+        const seed_slot = try self.seedHashCell(rtab, rkey, count);
+        const ref = try self.emit(.{ .op = .href, .a = rtab, .b = rkey, .aux = if (seed_slot) |s| @as(i32, s) else -1 });
+        _ = try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(count) });
         const rload = try self.emit(.{ .op = .hload, .a = ref, .ty = obsTypeOf(fv) });
         self.setReg(instr.a, rload);
         // Decompose the tagged-cell load into a typed load + the existing consumer
@@ -2048,8 +2124,12 @@ pub const TraceState = struct {
         try self.guardNum(rval, vval);
         const rtab = try self.refOf(instr.a);
         _ = try self.emit(.{ .op = .guard_table, .a = rtab });
-        const ref = try self.emit(.{ .op = .href, .a = rtab, .b = rkey });
-        _ = try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(tbl.hash.count()) });
+        // Seed the cell pointer for native (H1) — see `recHashGet`. An RMW's read and
+        // write `href`s dedup onto the same slot via `seedHashCell`.
+        const count: u32 = @intCast(tbl.hash.count());
+        const seed_slot = try self.seedHashCell(rtab, rkey, count);
+        const ref = try self.emit(.{ .op = .href, .a = rtab, .b = rkey, .aux = if (seed_slot) |s| @as(i32, s) else -1 });
+        _ = try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(count) });
         // `hstore` is effectful (overwrites the present cell in place) and defines no
         // register. A present-key overwrite never grows the map, so `guard_hash`
         // (population) stays sufficient. The store value's type is pinned by the
@@ -2500,6 +2580,12 @@ pub const Recorder = struct {
     /// SSA ref, so a repeated `get_upval`/`get_global` of the same source reuses one
     /// input slot + one `guard_func` instead of emitting another.
     input_dedup: std.AutoHashMapUnmanaged(u64, Ref) = .empty,
+    /// Dedup for H1 `hash_cell` seeds: maps `(table_reg, key_const)` (packed `u64`)
+    /// → the synthetic slab slot, so an RMW's read+write `href`s (and repeated reads
+    /// of the same field) share one seeded cell pointer instead of consuming two of
+    /// the `MAX_TRACE_INPUTS` budget. Separate from `input_dedup` because the value
+    /// is a raw slot (no `slot_load` ref — `href` is the consumer via its `aux`).
+    hash_cell_dedup: std.AutoHashMapUnmanaged(u64, u16) = .empty,
     /// Next synthetic input slab slot to hand out. Initialised to
     /// `anchor_num_registers` in `reset` (inputs live *above* the anchor window);
     /// bumped once per unique input. The slot is only ever a `slot_load` `aux` and
@@ -2510,6 +2596,7 @@ pub const Recorder = struct {
     pub fn deinit(self: *Recorder, gpa: std.mem.Allocator) void {
         self.input_seeds.deinit(gpa);
         self.input_dedup.deinit(gpa);
+        self.hash_cell_dedup.deinit(gpa);
         self.instrs.deinit(gpa);
         self.consts.deinit(gpa);
         self.entry_slots.deinit(gpa);
@@ -2529,6 +2616,7 @@ pub const Recorder = struct {
         self.konst_map.clearRetainingCapacity();
         self.input_seeds.clearRetainingCapacity();
         self.input_dedup.clearRetainingCapacity();
+        self.hash_cell_dedup.clearRetainingCapacity();
         // Size the register map for the anchor frame **plus** reserved windows for
         // inlined callee frames (cross-frame tracing). The executor only ever
         // touches `[0, anchor_num_registers)`; the tail is scratch the recorder

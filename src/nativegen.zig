@@ -139,6 +139,13 @@ const TAG_INT: u8 = @intFromEnum(value.Tag.int);
 const TAG_BOOL: u8 = @intFromEnum(value.Tag.boolean);
 const TAG_FLOAT: u8 = @intFromEnum(value.Tag.float);
 const TAG_HEAP: u8 = @intFromEnum(value.Tag.heap_ref);
+/// Byte offsets within a 16-byte tagged `Value` — used by `hload`/`hstore` to
+/// touch a hash-part value cell (`*Value`) directly. The tag lives at offset 0
+/// (1 byte), the payload union at offset 8 (8 bytes); the 7 bytes between are
+/// padding the oracle's struct-assign also leaves undefined, so native writing
+/// only tag+payload is byte-identical at every observable point.
+const VALUE_TAG_OFF: i32 = @offsetOf(value.Value, "tag");
+const VALUE_PAYLOAD_OFF: i32 = @offsetOf(value.Value, "payload");
 /// `ObjectType.table` ordinal — the byte at `GcHeader.type` for a table.
 const TABLE_TYPE: u8 = @intFromEnum(object.ObjectType.table);
 /// Offset of `GcHeader.type` (the first header byte) from a `*GcHeader`.
@@ -223,7 +230,13 @@ fn laneConsistent(trace_lane: *?i32, aux: i32) bool {
 ///   - `aref`  — the paired `(table, index)` addressing token produced by `aref`
 ///               (its register holds `idx0 = index-1`). A distinct kind so it can
 ///               neither feed arithmetic nor be flushed to a slot.
-const Kind = enum { none, int, bool, ptr, aref, float, func };
+///   - `href` — the hash-part value-cell pointer produced by `href` (H1). A
+///               loop-invariant `*Value` into a table's hash part, **seeded** into a
+///               slab slot per entry (`seedTraceInputs`) and loaded from
+///               `[rsi + aux*8]`, not computed from the operands. Like `.aref` it is a
+///               distinct addressing kind — it can neither feed arithmetic nor be
+///               flushed to a slot (C2). Consumed only by `hload`/`hstore`/`guard_hash`.
+const Kind = enum { none, int, bool, ptr, aref, float, func, href };
 
 /// A compiled trace: an executable page whose entry is
 /// `fn(tags: [*]u8, payloads: [*]u64) callconv(.c) usize` — the SoA register file's
@@ -362,12 +375,30 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     const fits_ok = gpa.alloc(bool, n) catch return false;
     defer gpa.free(fits_ok);
     @memset(fits_ok, false);
+    // Per-konst: is this `.konst` ref used as the *key operand* of an `href` (H1)?
+    // The key is the interned field-name string — a heap const, which the `.konst`
+    // arm below would otherwise reject (`else => return false`). An href reads its
+    // cell from the seeded slab slot, never from the key, so the key carries no
+    // native value: a marked heap-key konst is accepted as `.none` and `lower`
+    // emits nothing for it. Any OTHER use of a heap const (one feeding a non-href
+    // op) stays unmarked and bails, exactly as before.
+    const href_key = gpa.alloc(bool, n) catch return false;
+    defer gpa.free(href_key);
+    @memset(href_key, false);
 
     for (t.instrs, 0..) |ins, i| {
         switch (ins.op) {
             .slot_load => {
                 if (ins.aux < 0 or ins.aux > 0xFFFF) return false;
                 slot_of[i] = ins.aux;
+            },
+            // H1: mark this href's key operand so the `.konst` arm accepts the
+            // interned heap-string key (its only use). Full href validation is in
+            // Pass B; here we only need the forward-collected key marking.
+            .href => {
+                const r = ins.b;
+                if (r >= i) return false; // not linear SSA → malformed
+                if (t.instrs[r].op == .konst) href_key[r] = true;
             },
             .guard_int => {
                 const r = ins.a;
@@ -426,7 +457,12 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                     .int => .int,
                     .boolean => .bool,
                     .float => .float, // Phase D: a float constant materializes via movq
-                    else => return false, // nil / heap const → bail
+                    // H1: a heap const is admissible ONLY as an href key (the interned
+                    // field-name string). It carries no native value — href reads the
+                    // seeded cell, not the key — so accept it as `.none` and let `lower`
+                    // emit nothing. Any other heap-const use stays unmarked → bails.
+                    .heap_ref => if (href_key[i]) .none else return false,
+                    else => return false, // nil → bail
                 };
             },
             // Arithmetic: the recorder stamps the *result* type in `ins.ty`
@@ -533,6 +569,57 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .guard_func => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .func) return false;
+                kinds[i] = .none;
+            },
+            // --- hash-part field path (H1) --------------------------------------
+            // href: the loop-invariant value-cell pointer (`*Value`) for a constant
+            // string key into a table's hash part. `a` is the table slot_load (proven
+            // `.ptr`, guard_table-covered); `b` is the interned key konst (marked an
+            // href_key above → accepted `.none`). The cell is NOT computed from a/b in
+            // native — it is resolved once per entry by `seedTraceInputs` and written
+            // into slab slot `ins.aux`, from which `lower` loads it (`[rsi+aux*8]`). A
+            // distinct `.href` kind (like `.aref`): it can neither feed arithmetic nor
+            // be flushed to a carried slot (C2).
+            .href => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (kinds[ins.a] != .ptr) return false; // table must be the guarded ptr
+                if (t.instrs[ins.b].op != .konst) return false; // key is a constant
+                if (ins.aux < 0 or ins.aux > 0xFFFF) return false; // valid seed slot
+                kinds[i] = .href;
+            },
+            // guard_hash: the structural sentinel. The oracle re-resolves the cell and
+            // re-checks `metatable==null ∧ getPtr(key)!=null ∧ hash.count()==recorded`
+            // every iteration; native relies on the per-entry seed validation in
+            // `seedTraceInputs` (a failed resolve routes the whole entry to tier-1a
+            // instead of native) and the per-iteration `hload` tag-check, so in the
+            // native body this guard lowers to nothing. Covers an href.
+            .guard_hash => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .href) return false;
+                kinds[i] = .none;
+            },
+            // hload: a typed load from the cell. `a` is the href; the recorder stamps
+            // the observed scalar type in `ins.ty` and emits the existing type-guard on
+            // this ref. Native restricts to int/float field values (a heap-valued field
+            // declines native, like the `.value` array lane); the load tag-checks
+            // `[cell+0]` (side-exit on mismatch) then loads `[cell+8]`.
+            .hload => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .href) return false;
+                kinds[i] = switch (ins.ty) {
+                    .int => .int,
+                    .float => .float,
+                    else => return false, // heap/bool field value → tier-1a
+                };
+            },
+            // hstore: overwrite the present cell in place (no grow — the present-key
+            // rule holds). `a` is the href, `b` the value; native lowers int/float
+            // values to a tag+payload store and declines a heap value. Produces nothing.
+            .hstore => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (kinds[ins.a] != .href) return false;
+                const vk = kinds[ins.b];
+                if (vk != .int and vk != .float) return false; // heap value → tier-1a
                 kinds[i] = .none;
             },
             .guard_lane => {
@@ -889,6 +976,9 @@ fn isTransient(op: trace.IrOp) bool {
         .aref, .aload => true,
         // int_of_float materializes the converted int limit in a register.
         .int_of_float => true,
+        // href materializes the seeded cell pointer in a register (like aref); hload
+        // materializes the decoded scalar field value. hstore/guard_hash are effects.
+        .href, .hload => true,
         else => false,
     };
 }
@@ -921,6 +1011,14 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
         // guard_fits reads the value it range-checks (a); guard_append reads the aref
         // token (a) and reaches len/cap/hash through aref.a — no second operand.
         .guard_fits, .guard_append => .{ .a = true, .b = false },
+        // href reads NEITHER operand: the cell pointer comes from the seeded slab slot
+        // (`ins.aux`), not from the table (a) or key konst (b). hload reaches the cell
+        // through the href token (a). hstore reads the href token (a) plus the value to
+        // write (b). guard_hash reads the href token (a) it is anchored on (lowers to
+        // nothing, but operand liveness must keep the href live across it).
+        .href => .{ .a = false, .b = false },
+        .hload, .guard_hash => .{ .a = true, .b = false },
+        .hstore => .{ .a = true, .b = true },
         else => .{ .a = false, .b = false },
     };
 }
@@ -1038,22 +1136,26 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             s.kind = kinds[@intCast(s.store_ref)];
         }
     }
-    // A `.ptr` (table) invariant slot needs the bool-lane its `guard_lane` pins, so
-    // the prologue can check it once. Locate the guard_lane covering the slot_load.
+    // A `.ptr` (table) invariant slot accessed as an ARRAY needs the lane its
+    // `guard_lane` pins, so the prologue can check it once. Locate the guard_lane
+    // covering the slot_load. A table accessed only via the HASH part (H1: `href`,
+    // no `aref`) carries no array lane — the recorder emits `guard_table` but no
+    // `guard_lane` — so `s.lane` stays -1 and the prologue skips the lane check (the
+    // data/present/len array-base hoist is likewise keyed on aref usage, so a
+    // hash-only slot gets none). A table used BOTH ways has the guard_lane and is
+    // pinned normally. The table-type + metatable prologue checks cover the hash
+    // path's validity regardless of lane.
     for (slots.items) |*s| {
         if (s.kind != .ptr) continue;
         const lr: u16 = @intCast(s.load_ref);
-        var found = false;
+        // An aref on this slot REQUIRES a guard_lane (the recorder always emits both);
+        // a malformed trace with array access but no lane would miscompile, so track it.
+        var has_aref = false;
         for (t.instrs) |g| {
-            if (g.op == .guard_lane and g.a == lr) {
-                s.lane = g.aux;
-                found = true;
-                break;
-            }
+            if (g.op == .aref and g.a == lr) has_aref = true;
+            if (g.op == .guard_lane and g.a == lr) s.lane = g.aux;
         }
-        // proveKinds only set .ptr via a guard_table; a guard_lane must accompany it
-        // (the recorder always emits both). Defensive: bail rather than miscompile.
-        if (!found) return error.Bail;
+        if (has_aref and s.lane < 0) return error.Bail; // array access without a pinned lane
     }
     // A `.func` (cross-frame callee snapshot) invariant slot carries the recorded
     // `Proto.id` from its covering `guard_func`, checked once in the prologue (the
@@ -1304,14 +1406,17 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         // The last side-exiting instruction. Mid-iteration exits are guard_true/
         // guard_false AND the array read guards guard_bounds/guard_present (guard_int/
         // guard_table/guard_lane are hoisted to the prologue, so they never side-exit
-        // mid-body). An in-place home update that PRECEDES any of these would be
-        // committed by the deopt flush even though the iteration aborted — so home
-        // coalescing must be blocked past the last of them. Trace order is
-        // straight-line, so index order == dominance: "after" == strictly greater index.
+        // mid-body). `hload` ALSO side-exits mid-body: it lowers to a tag-check against
+        // the guarded field type and jumps to deopt_exit on mismatch (guard_hash is the
+        // one hash op that's hoisted to the seed and never side-exits). An in-place home
+        // update that PRECEDES any of these would be committed by the deopt flush even
+        // though the iteration aborted — so home coalescing must be blocked past the
+        // last of them. Trace order is straight-line, so index order == dominance:
+        // "after" == strictly greater index.
         var last_body_guard: i64 = -1;
         for (t.instrs, 0..) |ins, idx| {
             switch (ins.op) {
-                .guard_true, .guard_false, .guard_bounds, .guard_present, .guard_fits, .guard_append, .int_of_float => last_body_guard = @intCast(idx),
+                .guard_true, .guard_false, .guard_bounds, .guard_present, .guard_fits, .guard_append, .int_of_float, .hload => last_body_guard = @intCast(idx),
                 else => {},
             }
         }
@@ -2162,8 +2267,14 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         // change *within* a single native run.
         try a.cmpQwordMemImm8(preg, METATABLE_OFF, 0);
         try a.jcc(.ne, prologue_fail);
-        try a.cmpByteMemImm(preg, ArrLayout.array_base + ArrLayout.lane, @intCast(s.lane));
-        try a.jcc(.ne, prologue_fail);
+        // Lane check only for array-accessed tables (s.lane >= 0). A hash-only table
+        // (H1: href, no aref) has no pinned lane — skip it; the type + metatable checks
+        // above already cover the hash path's validity, and the cell pointer was
+        // resolved + validated per-entry by seedTraceInputs.
+        if (s.lane >= 0) {
+            try a.cmpByteMemImm(preg, ArrLayout.array_base + ArrLayout.lane, @intCast(s.lane));
+            try a.jcc(.ne, prologue_fail);
+        }
     }
 
     // [U1-prologue] For each `.func` slot the callee pointer is now in its home;
@@ -2230,8 +2341,16 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // discharged (proveKinds proved the kind) — both emit nothing here.
             // guard_func joins the hoisted no-ops: the closure identity check is in
             // the prologue (loop-invariant snapshot), so nothing here.
-            .slot_load, .guard_int, .guard_float, .guard_table, .guard_lane, .guard_func => {},
+            // guard_hash (H1) joins the hoisted/redundant no-ops: the structural
+            // recheck happens at entry in `seedTraceInputs` (a failed cell resolve
+            // routes the entry to tier-1a, never native) and per-iteration in the
+            // `hload` tag-check, so in the native body it emits nothing.
+            .slot_load, .guard_int, .guard_float, .guard_table, .guard_lane, .guard_func, .guard_hash => {},
             .konst => {
+                // H1: a `.none`-kind konst is an interned heap-string href key. href
+                // reads the seeded cell, not the key, so the key carries no native
+                // value — emit nothing (analyze gave it a dead Loc nothing reads).
+                if (kinds[i] == .none) continue;
                 const bits = t.consts[@intCast(ins.aux)].payload.bits;
                 switch (placeOfRef(alloc, i)) {
                     .reg => |r| try a.movRegImm64(r, @bitCast(bits)),
@@ -2308,6 +2427,71 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try a.jcc(.ne, deopt_exit); // ordered & not equal → non-integral / out-of-range
                 try a.jcc(.p, deopt_exit); // unordered (NaN) → side-exit
                 try regToPlace(a, placeOfRef(alloc, i), .rax);
+            },
+            // --- hash-part field path (H1) --------------------------------------
+            // href: load the loop-invariant value-cell pointer (`*Value`) from its
+            // seeded slab slot `[rsi + aux*8]` into the href token's home. The cell was
+            // resolved + validated once per entry by `seedTraceInputs` (writing it into
+            // payload slot `ins.aux` tagged TAG_INT); the body reads it instead of
+            // recomputing the hash lookup, exactly as `aref` reads an invariant base.
+            .href => {
+                const off: i32 = @as(i32, @intCast(ins.aux)) * 8;
+                switch (placeOfRef(alloc, i)) {
+                    .reg => |r| try a.movRegMem(r, .rsi, off),
+                    .mem => |d| {
+                        try a.movRegMem(.rax, .rsi, off);
+                        try a.movMemReg(.rsp, d, .rax);
+                    },
+                    .xmm => unreachable, // a cell pointer is an int kind, never an XMM home
+                }
+            },
+            // hload: a typed load from the cell. The dominating guard_hash + per-entry
+            // seed validation pinned the cell's identity; here we tag-check `[cell+0]`
+            // against the recorded scalar type (side-exit on a type change — the field
+            // turned from int↔float or to a heap value mid-loop) and load `[cell+8]`.
+            .hload => {
+                const creg = try refBaseReg(a, alloc, ins.a, .rcx);
+                const want_tag: u8 = if (kinds[i] == .float) TAG_FLOAT else TAG_INT;
+                try a.cmpByteMemImm(creg, VALUE_TAG_OFF, want_tag);
+                try a.jcc(.ne, deopt_exit); // field type changed → drop to tier-1a/tier-0
+                if (kinds[i] == .float) {
+                    switch (placeOfRef(alloc, i)) {
+                        .xmm => |x| try a.movsdRegMem(x, creg, VALUE_PAYLOAD_OFF),
+                        .mem => |d| {
+                            try a.movsdRegMem(XMM_SCRATCH0, creg, VALUE_PAYLOAD_OFF);
+                            try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
+                        },
+                        .reg => unreachable, // a float never homes in a GP register
+                    }
+                } else {
+                    try a.movRegMem(.rax, creg, VALUE_PAYLOAD_OFF);
+                    try regToPlace(a, placeOfRef(alloc, i), .rax);
+                }
+            },
+            // hstore: overwrite the present cell in place — tag byte then payload. The
+            // present-key rule (record-time abort on an absent key) guarantees the cell
+            // exists and a put never grows, so this is a pure in-place 16-byte write (we
+            // touch only tag+payload; the 7 padding bytes are unobservable, matching the
+            // oracle's struct-assign which also leaves them undefined). int → TAG_INT +
+            // 8-byte payload; float → TAG_FLOAT + `movsd`. Heap values declined (proveKinds).
+            .hstore => {
+                if (kinds[ins.b] == .float) {
+                    // Stage the value into XMM_SCRATCH0 first (independent of rax/rcx),
+                    // then write tag + payload through the cell pointer.
+                    try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
+                    const creg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.movByteMemImm(creg, VALUE_TAG_OFF, TAG_FLOAT);
+                    try a.movsdMemReg(creg, VALUE_PAYLOAD_OFF, XMM_SCRATCH0);
+                } else {
+                    // Load the value into rax BEFORE resolving the cell pointer: a
+                    // spilled href resolves through rcx (never rax), and no value home
+                    // is rax/rcx (both are scratch, outside ALLOC_ORDER) — so the value
+                    // in rax survives the cell-pointer load.
+                    try placeToReg(a, .rax, placeOfRef(alloc, ins.b));
+                    const creg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.movByteMemImm(creg, VALUE_TAG_OFF, TAG_INT);
+                    try a.storeMemReg(creg, 8, VALUE_PAYLOAD_OFF, .rax);
+                }
             },
             // --- lane-aware array read path (B2, bool lane) ----------------------
             // aref: materialize idx0 = index - 1 (the 0-based packed index) into the
@@ -2629,7 +2813,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     }
                     try a.jcc(.e, deopt_exit); // false (0) → side-exit
                 },
-                .none, .ptr, .aref, .float, .func => unreachable, // proveKinds restricts to int/bool
+                .none, .ptr, .aref, .float, .func, .href => unreachable, // proveKinds restricts to int/bool
             },
             .guard_false => switch (kinds[ins.a]) {
                 .int => try a.jmp(deopt_exit), // an int is never falsy → always side-exit
@@ -2641,7 +2825,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     }
                     try a.jcc(.ne, deopt_exit); // true (≠0) → side-exit
                 },
-                .none, .ptr, .aref, .float, .func => unreachable, // proveKinds restricts to int/bool
+                .none, .ptr, .aref, .float, .func, .href => unreachable, // proveKinds restricts to int/bool
             },
             .loop => {
                 // [RV-2] write-only slots commit to regs[] BEFORE the shuffle, so the
@@ -3632,6 +3816,40 @@ test "nativegen win2: a guard AFTER the accumulation blocks coalescing (cond 1)"
     // i=1,limit=5 → exits at the guard when i+1==5<5 false; acc/i restored to header.
     try expectMatch(&t, &.{ Value.int(1), Value.int(5), Value.int(0) });
     try expectMatch(&t, &.{ Value.int(1), Value.int(2), Value.int(50) }); // exits 2nd iter
+}
+
+test "nativegen win2(H1): an hload AFTER the accumulation blocks coalescing (cond 1)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // H1 regression. `hload` is a mid-body side-exit: it tag-checks the field cell
+    // against the guarded type and jumps to deopt_exit on mismatch (e.g. the field
+    // drifted int→float between trace entries). So an accumulator update that PRECEDES
+    // an hload must NOT coalesce into its home — otherwise the deopt flush at the hload
+    // would commit the bumped accumulator even though the iteration aborted, diverging
+    // from the tier-1a oracle (which side-exits at hload with the carried slot
+    // untouched). Guard: `hload` must be in `last_body_guard`.
+    //   acc += 1 at idx 6 precedes the hload at idx 9 → cond 1 must block acc's coalesce.
+    const kt = try table.Table.create(testing.allocator);
+    defer kt.destroy(testing.allocator);
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .konst, .aux = 0 }, // 2: interned key (heap string stand-in)
+        .{ .op = .slot_load, .aux = 1 }, // 3: acc
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .konst, .aux = 1 }, // 5: 1
+        .{ .op = .add, .a = 3, .b = 5, .ty = .int }, // 6: acc + 1  (precedes the hload)
+        .{ .op = .href, .a = 0, .b = 2, .aux = 0 }, // 7: cell
+        .{ .op = .guard_hash, .a = 7 }, // 8
+        .{ .op = .hload, .a = 7, .ty = .int }, // 9 ← mid-body side-exit AFTER the acc update
+        .{ .op = .phi, .b = 6, .aux = 1 }, // acc carry ← acc+1
+        .{ .op = .phi, .b = 9, .aux = 2 }, // lastseen carry ← hload (keeps hload live)
+        .{ .op = .loop }, // 10
+    };
+    // const 0 must be a heap value (the href key); const 1 is the int step.
+    var consts = [_]Value{ Value.heap(&kt.header), Value.int(1) };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+    try testing.expect(!(try slotCoalesced(&t, 1))); // acc must NOT coalesce
 }
 
 test "nativegen win2: old value still live blocks coalescing (cond 2)" {

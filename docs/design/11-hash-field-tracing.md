@@ -1,9 +1,11 @@
 # lune — tracing string-keyed (hash-part) table field get/set
 
-Status: **partial** — H0 (recorder + tier-1a oracle) landed 2026-06-23, green under
-`zig build test` and byte-identical across all 8 determinism modes. H1 (native
-lowering — the speedup) is outstanding; at H0 native auto-declines and the four new
-ops run on the tier-1a oracle.
+Status: **complete** — H0 (recorder + tier-1a oracle) and H1 (native lowering, the
+speedup) both landed 2026-06-23, green under `zig build test` and byte-identical
+across all 8 determinism modes + keyframe replay. The field micro-bench runs **99.9%
+on native [JIT]** (perf-confirmed, `Table.get/set` 0.0%), a **68.8× speedup** over
+tier-0 (1534 ms → 22.3 ms), within **2.6× of LuaJIT** (8.5 ms). Computed-key /
+absent-key inserts remain deferred follow-ons (see Outstanding).
 Owner: Bart
 Last updated: 2026-06-23
 
@@ -46,24 +48,52 @@ they land; move whole sections to "done" once everything inside them is checked.
   float field records; absent-key / metatable / heap-value / computed-key all abort
   with no trace. 8-mode `expectProgram`: field-read, int RMW, float RMW, two-key, and
   a mid-loop type-change deopt — all byte-identical + keyframe restore.
+- [x] **H1 — native lowering (THE speedup), seed-based (Approach B).** The
+  loop-invariant cell pointer is resolved **in the dispatch loop** (`seedTraceInputs`,
+  Zig — which has the `*Vm`/table) at *every* entry and stashed into a synthetic slab
+  slot, exactly mirroring U0's upvalue/global `InputSeed`. Native reads it as an
+  invariant `Kind.href` home — no native→Zig call, no inline hash probe. Specifics:
+  - **H0 IR frozen.** `href` stays `(a=table, b=key)`; the tier-1a oracle keeps
+    re-deriving the cell via `fieldPtr` per iteration and emitting real `guard_hash`
+    exec-log events. This is mandatory: replay compares exec logs, so `guard_hash`
+    cannot be subsumed into the seed (a decline-at-seed would drop the i0 guard event
+    and diverge the log from the non-native modes). `href.aux` (unused by the oracle)
+    carries the native synthetic slot index.
+  - **Seed-only `InputSeed.hash_cell`** (`{table_reg, key_const, slot}`):
+    `seedTraceInputs` resolves `table = regGet(base+table_reg)`,
+    `cell = table.fieldPtr(consts[key_const])`, validates metatable-free + present +
+    `hash.count()==aux`, and writes `@intFromPtr(cell)` into `payloads[slot]`. Unlike
+    a U0 seed it emits **no** `slot_load` — the existing `href` op (via `href.aux`) is
+    the consumer. Re-seeded every entry, never serialized (dead scratch above the
+    anchor window) → same determinism as U0.
+  - **Per-entry native eligibility.** If any `hash_cell` fails to resolve/validate,
+    the entry runs **tier-1a** (the oracle), not native — byte-identical to the oracle
+    side-exiting at `guard_hash` i0 (both yield `completed=0`, tier-0 re-runs). Native
+    therefore only ever runs when the structure is valid at entry, and within a native
+    run the structure is invariant (own store is present-key; no external code runs).
+  - **`nativegen`:** `Kind.href` (invariant cell pointer, GP home, **never** in
+    `exit_stores` — C2, like `.ptr`/`.aref`); prologue loads the cell from
+    `[rsi + aux*8]`; `guard_hash` lowers to **nothing** (validated by seed
+    eligibility); `hload` = tag-check `[cell+0]` vs guarded ty → side-exit, then load
+    payload `[cell+8]`; `hstore` = store tag+payload to `[cell]` (heap value declines
+    native, as the recorder already restricts to int/float). A hash-only table's
+    `.ptr` slot has no `guard_lane` (lanes are array-only), so the analyze pass makes
+    the lane optional — required only when an `aref` references the slot — and the
+    prologue lane-check is gated on `lane >= 0`.
+- [x] **H1 deopt-replay tests (`nativegen`/`interp.zig`).** A field whose type
+  changes mid-loop side-exits via the `hload` tag-check (the type-change 8-mode test);
+  a sibling-table grow between trace entries re-resolves the cell and never dangles
+  (the "grows between trace entries" 8-mode test); RMW double-apply is covered by the
+  existing field-RMW 8-mode parity (native ≡ oracle ≡ tier-0).
+- [x] **H1 measure.** `bench/field_hash.lua` (`t.x = t.x + t.y` RMW): tier-0 1534 ms
+  → native 22.3 ms (**68.8×**), within **2.6× of LuaJIT** (8.5 ms). `perf record`
+  confirms **99.9%** of the run is native `[JIT]` with `Table.get/set` at **0.0%** —
+  the value-cell pointer is fully hoisted. nbody/array3d still record (coverage win)
+  but their companion blockers (`sqrt`, the closure iterator) keep them tier-1a until
+  those levers land.
 
 ### Outstanding
 
-- [ ] **H1 — native lowering (THE speedup).** Admit the four ops in `nativegen`
-  (`proveKinds` A/B, `isTransient`/`operandReads`/`lower`); add a prologue
-  `hresolve(table, key) -> {cell_ptr, size, metadata}` hoist paralleling the Phase-2
-  array-base hoist, with new `cell_home`/`hsize_home`/`hmeta_home` and a new
-  `Kind.href`. Per-iteration: `guard_hash` compares live `[table+hash_off]`/`[+8]` to
-  the stashed `size`/`metadata`; `hload` = tag-check + payload load; `hstore` =
-  tag+payload store (a heap value declines native).
-- [ ] **H1 deopt-replay tests (`nativegen`).** A field whose type changes mid-loop
-  side-exits via the type guard; a sibling-table `put` that grows the map does not
-  dangle the hoisted cell (guard_hash size/metadata side-exit); an RMW double-apply
-  idempotence test across a forced mid-body side-exit.
-- [ ] **H1 measure.** Field micro-bench moves off the tier-0 baseline; `perf record`
-  confirms `[JIT]` coverage of the field body. nbody/array3d still record (coverage
-  win) even though their companion blockers (`sqrt`, the closure iterator) keep them
-  tier-1a until those levers land.
 - [ ] **Computed-key / absent-key follow-ons (deferred).** `t[expr]` (runtime key)
   and absent-key insert/`__index` are out of v1 scope — they need a runtime
   key-identity guard and a grow-aware cell re-resolve respectively. Defer until a
@@ -196,9 +226,23 @@ replay.
 
 ### H1 — native lowering (THE speedup) — **outstanding**
 
-See the Outstanding checklist. The prologue `hresolve` hoist + `(size, metadata)`
-sentinel + typed `hload`/`hstore` lowering; `obj.x = obj.x + 1`-shaped loops run
-native; measured via the field micro-bench and `perf record`.
+See the Outstanding checklist. **Seed-based (Approach B, chosen 2026-06-23):** the
+cell pointer is re-resolved per entry in the dispatch loop (`seedTraceInputs`) and
+stashed in a synthetic slot — mirroring U0's `InputSeed` — so native reads it as an
+invariant `Kind.href` home with no native→Zig call and no inline hash probe. H0's IR
+and oracle stay frozen (the per-iteration `guard_hash` keeps emitting exec-log events
+for replay parity); `href.aux` carries the synthetic slot; native's `guard_hash`
+lowers to nothing because seed eligibility already proved the structure at entry.
+`obj.x = obj.x + 1`-shaped loops run native; measured via the field micro-bench and
+`perf record`.
+
+> **Rejected alternative (the plan's original wording):** a prologue `hresolve`
+> *helper call* from native (`{cell_ptr,size,metadata}` into `cell_home`/…). It would
+> introduce the codebase's first native→Zig call (new ABI/clobber/alignment surface)
+> and was the riskiest path; seeding reuses the U0 machinery instead. The
+> `(size,metadata)` sentinel is likewise unnecessary: within a native run the cell
+> never dangles (own store is present-key, no external code runs), and a cross-entry
+> structural change is caught by the per-entry seed validation, not a body guard.
 
 ## 6. Out of scope (follow-ons)
 

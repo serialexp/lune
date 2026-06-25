@@ -2,23 +2,27 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
-## Hash-field (string-keyed) tracing — H1 native lowering (June 2026)
+## Hash-field (string-keyed) tracing — H0+H1 LANDED (June 2026, uncommitted, pending approval)
 
-H0 landed (uncommitted, pending approval): `obj.field` get/set now records a trace
-at tier-1a (`href`/`hload`/`hstore`/`guard_hash`), byte-identical across 8 modes +
-replay; native auto-declines. Doc: `docs/design/11-hash-field-tracing.md`.
+`obj.field` get/set now records a trace (`href`/`hload`/`hstore`/`guard_hash`) and
+runs **native** via a seed-resolved loop-invariant value-cell pointer (Approach B):
+`seedTraceInputs` resolves the cell each entry into a synthetic slab slot; `Kind.href`
+reads it as an invariant home; `hload` tag-checks + loads payload; `hstore` writes
+tag+payload; `guard_hash` lowers to nothing (per-entry seed eligibility gates native
+vs the tier-1a oracle). Byte-identical across 8 modes + keyframe replay. Doc:
+`docs/design/11-hash-field-tracing.md` (status: complete).
 
-**H1 (the speedup, not started):** native lowering — prologue `hresolve(table,key)`
-hoist stashing `{cell_ptr, size, metadata}` into new homes; `(size, metadata)`
-sentinel `guard_hash`; typed `hload`/`hstore` lowering with tag-check + payload
-load/store; new `Kind.href`. Deopt-replay tests: field type-change side-exit;
-sibling-table grow doesn't dangle the hoisted cell (size/metadata side-exit); RMW
-double-apply. Measure via a field micro-bench + `perf record` for `[JIT]` coverage.
+**Measured (`bench/field_hash.lua`, `t.x = t.x + t.y` RMW):** tier-0 1534 ms →
+native 22.3 ms (**68.8×**), within **2.6× of LuaJIT** (8.5 ms); `perf record` shows
+**99.9%** native `[JIT]`, `Table.get/set` 0.0%.
 
 **Honest scope caveat (told to Bart):** this lever alone moves zero corpus benches
 — nbody also calls `sqrt` (host_barrier abort) and array3d also has a stateful
 closure iterator; each needs a companion lever. H0/H1 unblock the *first* abort so
 those companions can land on top.
+
+**Deferred follow-ons:** computed-key `t[expr]` (runtime key-identity guard) and
+absent-key insert / `__index` (grow-aware cell re-resolve) — out of v1 scope.
 
 ## Cross-frame tracing — the *cluster lever* (June 2026)
 
