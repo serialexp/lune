@@ -257,8 +257,13 @@ pub const Lexer = struct {
             '%' => .percent,
             '^' => .caret,
             '#' => .hash,
-            '&' => .ampersand,
-            '|' => .pipe,
+            // Customary operator aliases (LuaJIT 3.0 parity): `&&`/`||`/`!`/`!=`
+            // are pure lexical synonyms — they emit the very same tokens as
+            // `and`/`or`/`not`/`~=`, so the parser and evaluator never know the
+            // difference. A lone `&`/`|` stays bitwise; only the doubled form aliases.
+            '&' => self.pick('&', .keyword_and, .ampersand),
+            '|' => self.pick('|', .keyword_or, .pipe),
+            '!' => self.pick('=', .ne, .keyword_not),
             '~' => self.tildeOp(),
             '(' => .lparen,
             ')' => .rparen,
@@ -393,6 +398,16 @@ test "maximal-munch operators" {
         .plus,  .minus, .star,    .slash, .slash_slash, .percent, .caret,
         .eq,    .ne,    .le,      .ge,    .lt,          .gt,      .lshift,
         .rshift, .dot_dot, .ellipsis, .double_colon, .assign, .colon, .dot,
+    });
+}
+
+test "customary operator aliases: ! && || !=" {
+    // The aliases emit the SAME tags as their classic spellings; a lone `&`/`|`
+    // stays bitwise.
+    try expectTags("&& || ! != & | a & b", &.{
+        .keyword_and, .keyword_or, .keyword_not, .ne,
+        .ampersand,   .pipe,       .identifier,  .ampersand,
+        .identifier,
     });
 }
 

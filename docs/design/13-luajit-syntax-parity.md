@@ -1,6 +1,6 @@
 # lune — LuaJIT 3.0 Syntax-Extension Parity
 
-Status: partial — Phase 1 (`~>>`) landed; Phases 2–5 outstanding
+Status: partial — Phases 1 & 3 landed; Phases 4–5 outstanding
 Owner: Bart
 Last updated: 2026-06-26
 
@@ -29,22 +29,26 @@ whole phases to "Done" once everything inside is checked.
       differential test across all count regimes. Verified identical across
       tier-0 / tier-1a / native via the CLI; the JIT records `sar` and compiles
       it natively (not declined). The open AST-name question is resolved: `sar`.
+      Subsumes the former **Phase 6** (confirm `~>>` lowers under the JIT) —
+      proven natively-lowered as part of this phase, not a separate follow-up.
+- [x] **Phase 3 — Customary operators `! && || !=`.** Pure lexer aliases: `&&`→
+      `and`, `||`→`or`, `!`→`not`, `!=`→`~=` (`ne`), emitting the very same tokens
+      so the parser/evaluator are untouched (zero AST/eval change). A lone `&`/`|`
+      stays bitwise; only the doubled form aliases, and `!` vs `!=` disambiguates
+      by the trailing `=`. Lexer-tag test + end-to-end eval test covering
+      short-circuit and value-returning (not boolean-coercing) semantics.
 
 ### Outstanding
 
 - [ ] **Phase 2 — `~>>=` compound form.** Rides on the general compound-assignment
       desugar (Phase 5) but the *operator* belongs to the bitwise set; land the
       token alongside Phase 1, wire the desugar in Phase 5.
-- [ ] **Phase 3 — Customary operators `! && || !=`.** Lexer aliases that emit the
-      existing `not` / `and` / `or` / `ne` tokens. Zero AST/eval change.
 - [ ] **Phase 4 — `??` nil-coalescing.** New token, AST node, short-circuit eval,
       precedence at the `or` level, pure-nil check, tests.
 - [ ] **Phase 5 — Compound assignment `+= -= *= /= //= %= &= |= ~= <<= >>= ~>>= ..=`.**
       Parser desugar with single-evaluation of the target prefix; no `^=`; `~=`
       parses as xor-assign in statement context. Tests for the prefix-eval-once
       contract and the `~=` disambiguation.
-- [ ] **Phase 6 — `~>>`/`~>>=` confirm under JIT.** Ensure the arithmetic shift
-      lowers natively (or cleanly declines), same as `>>`/`<<` already do.
 - [ ] **Decision needed — error policy doc-link.** Cross-reference the fail-loud
       `//`-by-zero call from `02-determinism.md` (or wherever the error taxonomy
       lives) so the divergence from LuaJIT is recorded in one canonical place.

@@ -5036,6 +5036,31 @@ test "metatable: arithmetic metamethods (add/sub/mul/div/mod/pow/idiv)" {
     );
 }
 
+test "customary operators: ! && || != alias not/and/or/~=" {
+    try expectProgram(
+        \\print(!true)
+        \\print(!false)
+        \\print(!nil)
+        \\print(1 == 1 && 2 == 2)
+        \\print(1 == 2 || 3 == 3)
+        \\print(1 != 2)
+        \\print(1 != 1)
+        \\-- short-circuit must match `and`/`or`: the RHS is not evaluated
+        \\local hit = false
+        \\local function side() hit = true; return true end
+        \\local _ = false && side()
+        \\print(hit)
+        \\local _ = true || side()
+        \\print(hit)
+        \\-- value-returning (not boolean-coercing), exactly like and/or
+        \\print(nil || 7)
+        \\print(5 && 9)
+        \\
+    ,
+        "false\ntrue\ntrue\ntrue\ntrue\ntrue\nfalse\nfalse\nfalse\n7\n9\n",
+    );
+}
+
 test "bitwise: ~>> arithmetic right shift (sign-extending, 64-bit)" {
     try expectProgram(
         \\print(-8 ~>> 1)
