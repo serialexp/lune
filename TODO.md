@@ -897,3 +897,67 @@ Lua does. `table.sort` on a string list with the default comparator works. Safe
 for the JIT: `recCompare` (trace.zig) aborts a compare whose operands aren't
 numbers, so string ordering only ever runs on tier-0/1a, never inside native
 trace code. Parity tests in interp.zig ("strings: …").
+
+## LuaJIT 3.0 syntax extensions — parity survey + decision log (June 2026)
+
+> **Promoted to `docs/design/13-luajit-syntax-parity.md` (June 2026).** That doc is
+> now the contract (decisions, semantics-to-match, phasing checklist). Keep edits
+> there; this section is retained as the original scratch/survey for context.
+
+Mike Pall is formalizing a "Lua-shaped, not Lua-compatible" syntax-extension set
+for LuaJIT 3.0 — the same thesis as lune. Source of truth is the evolving spec in
+the **first comment** of LuaJIT/LuaJIT#1475 (full per-operator semantics), with the
+backport scope/checklist in #1476 and the instrumentation-ABI call in #1457. Policy
+Bart set: **match LuaJIT's exact semantics unless we have a specific reason not to;
+where semantics must diverge, keep the *syntax* aligned.**
+
+Precedence foundation is already aligned: lune's Pratt binding powers
+(`infixBp`, src/parser.zig:485-512) match Mike's published precedence table for
+every shared operator, including the bitwise ordering (`&` > binary-`~` > `|`,
+between shifts and comparison). New operators have well-defined slots: `?.` at
+index/call level, `??` at `or` level, `?:` just below `or` (right-assoc).
+
+### Decision log (Bart, June 2026)
+
+| # | Operator(s) | Decision |
+|---|-------------|----------|
+| 1 | `//` by zero (& general error policy) | **Fail loud / throw.** Syntax matches LuaJIT, semantics diverge (no `inf`/`nan` result). Fail-loud is lune philosophy; it is *not* a JIT tax — a throw is deterministic control flow (replay-safe), and on a guarded-upstream hot path the cost is one predictable branch the optimizer can eliminate as a redundant guard. What hurts a trace is the exceptional path being *taken*, not its existence. |
+| 2 | `& \| ~ << >> ~>>` (bitwise) | Keep **syntax** aligned; **64-bit native** semantics — deliberate divergence from LuaJIT's 32-bit `bit.*` (lune has no `bit` library; native i64 ops, see "stdlib `math`"/bitwise notes above). |
+| 3 | `~>>` arithmetic right shift + `~>>=` | **Add** — completes the operator set. Currently lune has `>>` (logical) but no `~>>`; add the token (`~>>`), AST op (e.g. `sar`), and compound form. |
+| 4 | `! && \|\| !=` (customary operators) | **Add** as pure aliases for `not`/`and`/`or`/`~=`. Two-ways-to-write is acceptable here (Bart writes `&&`). Identical semantics. |
+| 5 | `??` (nil-coalescing) | **Add.** Checks **pure nil only** (the only nil lune has — no NULL cdata). Eval `a` once, short-circuit `b`. |
+
+### Still on the table (not yet decided) — exact semantics to match when we do
+
+- **`?:` ternary** — right-assoc, short-circuits; the wart to replicate: `b` can't
+  directly hold `obj:method()` (parse ambiguity) → requires parens.
+- **`?.` safe navigation** — trickiest. Match: `?.[key]` not `?[key]`; whole-chain
+  short-circuit (`foo?.a.b` → nil, but `(foo?.a).b` throws — JS-identical, Mike
+  confirmed); works on assignment LHS too (unlike JS); method form `obj?.:method()`.
+  Full placement table in the #1475 spec.
+- **Compound assignment `+= -= *= … ..=`** — eval prefix once
+  (`x.y.z.field += b` → temp `x.y.z`). Gotchas: `~=` becomes xor-assign in
+  *statement* context (no ambiguity — inequality `~=` is expression-only); **no
+  `^=`** (deliberately omitted by Mike); his table has a typo (`&=` shown as
+  `a = a ^ b`, means `a = a & b`).
+- **`??=`** — short-circuits `b`.
+- **`continue`** — landmine is `repeat…until` where `continue` jumps into a local's
+  scope referenced by `until`. Mike rejects continue-into-scope; he can afford the
+  analysis (3.0 parser is SSA). lune is tree-walk+JIT → needs its own equivalent
+  check, not a verbatim lift.
+- **Underscores in number literals** — `1_000_000`. Lexer-only.
+
+### Don't chase yet (Mike hasn't frozen the syntax)
+
+`const` (soft keyword, leaning `const` over `<const>`), short-function
+(`|…| -> expr` / `|…| -> do … end`, TBD), string interpolation ("needed?"), and
+**match/switch** (novel `in expr do … end` with `=>` arms, mid-design). Matching
+now = matching a moving target.
+
+### Adjacent: #1457 instrumentation ABI
+
+Mike is proposing near-zero-overhead VM instrumentation (map machine-code addr →
+trace number, per-trace details, frame walking) so external profilers don't
+disassemble the VM. That's the introspection surface our trace visualiser /
+time-travel replay already owns natively. Worth lurking as a gap-check on what a
+tracing JIT "should" expose.
