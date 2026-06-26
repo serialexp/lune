@@ -1906,7 +1906,10 @@ pub const Vm = struct {
                         if (container.isHeap() and container.heapType() == .table and key.isInt()) {
                             const tbl = table.Table.fromHeader(container.asHeap());
                             const i = key.asInt();
-                            if (i >= 1 and i <= @as(i64, @intCast(tbl.array.len))) {
+                            // A grid table's `t[i]` is a transient `row_view`, not a
+                            // raw slot — skip the fast path and let `indexGet →
+                            // Table.getInt` mint the handle. (Phase 3, doc 14.)
+                            if (!tbl.array.isGrid() and i >= 1 and i <= @as(i64, @intCast(tbl.array.len))) {
                                 // A *present* (non-nil) in-bounds slot is a raw read
                                 // regardless of any metatable — Lua only consults
                                 // `__index` for an absent key. A hole (nil) falls
@@ -1935,7 +1938,11 @@ pub const Vm = struct {
                         if (container.isHeap() and container.heapType() == .table and key.isInt()) {
                             const tbl = table.Table.fromHeader(container.asHeap());
                             const i = key.asInt();
-                            if (i >= 1 and i <= @as(i64, @intCast(tbl.array.len)) and tbl.array.fits(val)) {
+                            // A grid store is an outer row (re)assignment — a Phase 5
+                            // deflation trigger owned by `indexSet`; never raw-stored
+                            // here (and `fits(nil)` is `true`, so without this guard a
+                            // `nil` store would reach `array.get` on a grid).
+                            if (!tbl.array.isGrid() and i >= 1 and i <= @as(i64, @intCast(tbl.array.len)) and tbl.array.fits(val)) {
                                 // `__newindex` fires only for an *absent* key on a
                                 // metatable-bearing table. A metatable-free table
                                 // (the overwhelming common case — one predictable
@@ -2754,6 +2761,11 @@ pub const Vm = struct {
         var hops: usize = 0;
         while (true) : (hops += 1) {
             if (hops >= max_metatable_chain) return Error.MetatableChainLoop;
+            // A `row_view` (transient grid row, doc 14) has no metatable and no
+            // hash part: `row[j]` forwards straight into the parent grid's flat
+            // cells. (An *outer* grid `t[i]` already minted this handle via
+            // `Table.getInt`; this is the *inner* index.)
+            if (cur.isRowView()) return table.Table.rowViewGet(cur, key);
             // Raw read when `cur` is a table; a present field short-circuits.
             if (cur.isHeap() and cur.heapType() == .table) {
                 const raw = table.Table.fromHeader(cur.asHeap()).get(key);
@@ -2790,8 +2802,23 @@ pub const Vm = struct {
         var hops: usize = 0;
         while (true) : (hops += 1) {
             if (hops >= max_metatable_chain) return Error.MetatableChainLoop;
+            // Inner store into a grid row: `row[j] = v` forwards into the parent
+            // grid's flat cells when it fits (int key, in-stride, value fits the
+            // cell lane). A store that can't stay in the grid (non-int key,
+            // past-stride index, wider value) means the row must deflate to a real
+            // table — Phase 5; not yet implemented. (doc 14.)
+            if (cur.isRowView()) {
+                if (table.Table.rowViewSet(cur, key, val)) {
+                    self.heap.writeBarrier(cur.rowViewParent(), val); // no-op until Phase 4
+                    return;
+                }
+                return Error.Unimplemented; // TODO(Phase 5): deflate row → table, then store
+            }
             if (cur.isHeap() and cur.heapType() == .table) {
                 const t = table.Table.fromHeader(cur.asHeap());
+                // An *outer* store on a grid table (`t[i] = v`: replace/append a
+                // whole row) is a deflation trigger — Phase 5; not yet implemented.
+                if (t.array.isGrid()) return Error.Unimplemented; // TODO(Phase 5)
                 // A present (non-nil) raw key bypasses `__newindex`.
                 if (!t.get(key).isNil()) {
                     try t.set(self.gpa, key, val);
@@ -3485,6 +3512,8 @@ pub fn coerceConcat(v: Value, buf: []u8) Error![]const u8 {
 /// error. Strings are code-point-native (design doc 06): `#s` reports the number
 /// of Unicode characters via the cached `cp_len`, not the byte length. O(1).
 fn lenOf(v: Value) Error!Value {
+    // `#row_view` — the grid row's logical border (its `row_len` high-water).
+    if (v.isRowView()) return Value.int(table.Table.rowViewLen(v));
     if (v.isHeap()) {
         return switch (v.heapType()) {
             .string => Value.int(@intCast(string.String.fromHeader(v.asHeap()).cpLen())),
@@ -9632,4 +9661,53 @@ test "tropt: seeded differential fuzz — tier-0 == execute-noopt == execute-opt
         try testing.expectEqualStrings(s_off.buffered(), s_no.buffered());
         try testing.expectEqualStrings(s_off.buffered(), s_op.buffered());
     }
+}
+
+// --- grid row forwarding through the interpreter (Phase 3, doc 14) -----------
+
+test "grid: indexGet/indexSet/len forward a row_view; outer + non-fitting set defer" {
+    const arr = @import("array.zig");
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+
+    // A grid table built by hand (no inflation yet — that's Phase 4). Kept off the
+    // heap's GC list (a plain `create`/`destroy`) so this Phase-3 test never asks
+    // the not-yet-grid-aware collector (Phase 6) to mark it.
+    const t = try table.Table.create(gpa);
+    defer t.destroy(gpa);
+    t.array = try arr.ArrayPart.initGrid(gpa, 2, 3, .i32); // 2 rows × 3 i32 cells
+    t.array.gridSet(0, 0, Value.int(10));
+    t.array.gridSet(0, 1, Value.int(20));
+    t.array.gridSet(1, 0, Value.int(70));
+    const g = Value.heap(&t.header);
+
+    // Outer `g[1]` → a row_view; the fast path is skipped, `indexGet` mints it.
+    const r1 = try vm.indexGet(g, Value.int(1));
+    try testing.expect(r1.isRowView());
+    try testing.expectEqual(@as(u32, 0), r1.rowViewRow());
+
+    // Inner `g[1][2]` forwards into the cell; a hole reads nil.
+    try testing.expectEqual(@as(i64, 20), (try vm.indexGet(r1, Value.int(2))).asInt());
+    try testing.expect((try vm.indexGet(r1, Value.int(3))).isNil());
+
+    // `#g` is the row count; `#g[1]` is the row's border.
+    try testing.expectEqual(@as(i64, 2), (try lenOf(g)).asInt());
+    try testing.expectEqual(@as(i64, 2), (try lenOf(r1)).asInt());
+
+    // Inner store `g[1][3] = 30` forwards (i32 fits) and extends the border.
+    try vm.indexSet(r1, Value.int(3), Value.int(30));
+    try testing.expectEqual(@as(i64, 30), (try vm.indexGet(r1, Value.int(3))).asInt());
+    try testing.expectEqual(@as(i64, 3), (try lenOf(r1)).asInt());
+
+    // A second row is independent.
+    const r2 = try vm.indexGet(g, Value.int(2));
+    try testing.expectEqual(@as(i64, 70), (try vm.indexGet(r2, Value.int(1))).asInt());
+    try testing.expect((try vm.indexGet(r2, Value.int(2))).isNil());
+
+    // Deferred to Phase 5 (deflation), surfaced as `Unimplemented` for now:
+    //  - an *outer* store on a grid table (replace/append a whole row), and
+    //  - an *inner* store that can't stay in the grid (value wider than the lane).
+    try testing.expectError(Error.Unimplemented, vm.indexSet(g, Value.int(1), Value.int(9)));
+    try testing.expectError(Error.Unimplemented, vm.indexSet(r1, Value.int(1), Value.float(1.5)));
 }

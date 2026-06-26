@@ -1,11 +1,13 @@
 # Nested Numeric Array Flattening — Design
 
-Status: partial — **building D.** Phases 0–2 landed on `master` (decision gate;
-`RowView` fat value; grid representation in `ArrayPart`). Architecture pivoted
-post-review to **transient fat-value rows with copy-out on escape**, which
-dissolves the GC-pinning and identity-cache objections. Determinism/replay is the
-one principled gate and is satisfiable (see §Determinism gate). Build size is
-explicitly *not* a blocker (see §Decision). Next: Phase 3 (row forwarding).
+Status: partial — **building D.** Phases 0–3 landed on `master` (decision gate;
+`RowView` fat value; grid representation in `ArrayPart`; row forwarding through
+the interpreter). Architecture pivoted post-review to **transient fat-value rows
+with copy-out on escape**, which dissolves the GC-pinning and identity-cache
+objections. Determinism/replay is the one principled gate and is satisfiable (see
+§Determinism gate). Build size is explicitly *not* a blocker (see §Decision).
+Next: Phase 4 (tier-0 inflation — the first path that produces a grid at runtime,
+which then needs Phase 5 escape + Phase 6 GC before grids can be enabled live).
 Owner: Bart
 Last updated: 2026-06-26
 
@@ -46,12 +48,23 @@ land; move whole sections to Done once everything inside is checked.
   cell codec that mirrors the scalar one byte-for-byte; scalar paths assert
   `lane != .grid`. Six unit tests (round-trip, scalar-identical decode, jagged
   `row_len`, u8 packing, empty grid, OOM-safety). No interp wiring yet — Phase 3.
+- [x] **Phase 3 — Row forwarding.** Outer `t[i]` on a grid table mints a
+  transient `row_view` (`Table.getInt` grid arm, `@constCast` parent handle);
+  both index fast paths in `interp.zig` skip grids so the handle is minted via
+  `indexGet`. Inner `row[j]` get/set forward into the flat cells
+  (`Table.rowViewGet`/`rowViewSet`); a non-int key, past-stride index, or
+  lane-missing value returns `false` ⇒ deflation (Phase 5, surfaced as
+  `Unimplemented` for now), as does any *outer* grid store. `#row` →
+  `gridRowLen`, `#t` → row count; `next`/`pairs`/`ipairs` traverse a row as a
+  length-`#row` array (`iterableArg` accepts a `row_view`; `rowViewNextStep`).
+  `tostring(row)` already renders table-like (Phase 1 `io.writeValue` arm).
+  Dormant until Phase 4 produces a grid at runtime — exercised by hand-built grid
+  tables: 3 `table.zig` + 1 `interp.zig` + 1 `base.zig` unit tests. **Deferred to
+  Phase 5** (with `Unimplemented` stubs in `indexSet`): outer row (re)assignment /
+  append, and inner stores that overflow the grid.
 
 ### Outstanding
 
-- [ ] **Phase 3 — Row forwarding.** `get_index`/`set_index` on a `RowView`
-  forward into `parent.grid[row*stride + (k-1)]` at the element lane; `#row`,
-  `next`/`pairs` over a row enumerate the logical row.
 - [ ] **Phase 4 — Inflation (tier-0 widen-into-grid).** `a[i][j]=v` on a
   homogeneous-numeric nested table migrates the parent into a grid, exactly as
   `setInPlace` widens i8→value today. Hysteresis (reuse `frozen`/monotonic) so a
@@ -168,7 +181,7 @@ without ever materialising the row.
 
 ## Mechanism
 
-### Inflation — when a plain table becomes a grid (Phase 3)
+### Inflation — when a plain table becomes a grid (Phase 4)
 
 Trigger lives where `setInPlace`'s widen already lives. On `a[i][j] = v`:
 - `a` is a table, `a[i]` is (or is about to be) a table, `v` is a narrow scalar.
@@ -181,7 +194,7 @@ Trigger lives where `setInPlace`'s widen already lives. On `a[i][j] = v`:
 This is deliberately the same shape as `widenFor` (array.zig): a store that
 doesn't fit the current representation migrates it to a more capable one.
 
-### Deflation — the inverse the scalar lattice never needed (Phase 4)
+### Deflation — the inverse the scalar lattice never needed (Phase 5)
 
 A row deflates back to a real `Table` when it can no longer be a grid row:
 - **Escape:** the program takes a live handle to `a[i]` (see Open questions for

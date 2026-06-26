@@ -116,9 +116,65 @@ pub const Table = struct {
     /// `t[i]` for an integer key (array part fast path).
     pub fn getInt(self: *const Table, i: i64) Value {
         if (i >= 1 and i <= @as(i64, @intCast(self.array.len))) {
+            // A grid table's rows are *virtual*: `t[i]` is a transient `row_view`
+            // onto grid row `i-1` (a fat value, no heap object), not a stored
+            // slot. The handle carries this table's header so an inner index
+            // (`row[j]`) can forward into the flat cell buffer. (Phase 3, doc 14.)
+            // `@constCast`: the handle borrows the table mutably (an inner store
+            // writes a cell); the table is genuinely heap-mutable — `*const` is
+            // only this read path's view.
+            if (self.array.isGrid())
+                return Value.rowView(@constCast(&self.header), @intCast(i - 1));
             return self.array.get(@intCast(i));
         }
         return self.hash.get(Value.int(i)) orelse Value.nil();
+    }
+
+    /// `row_view[key]` read — forward an inner index of a grid row into the flat
+    /// cell buffer. `rv` must be a `row_view`. A non-integer or out-of-stride key
+    /// reads `nil`: a grid row holds only its numeric cells (no hash part, no
+    /// metatable until it deflates — Phase 5). (Phase 3, doc 14.)
+    pub fn rowViewGet(rv: Value, key: Value) Value {
+        const t = fromHeader(rv.rowViewParent());
+        std.debug.assert(t.array.isGrid());
+        const row: usize = rv.rowViewRow();
+        const nk = normalizeKey(key);
+        if (nk.isInt()) {
+            const j = nk.asInt();
+            if (j >= 1 and j <= @as(i64, @intCast(t.array.stride)))
+                return t.array.gridGet(row, @intCast(j - 1));
+        }
+        return Value.nil();
+    }
+
+    /// `row_view[key] = val` write — forward an inner store into the grid row's
+    /// flat cell buffer. Returns `true` once stored. Returns `false` when the
+    /// store cannot stay in the grid — a non-integer key, an index past the
+    /// stride, or a value that does not fit the cell lane (`grid_elem`); the
+    /// caller must then deflate the row to a real table (Phase 5). A `nil` store
+    /// fits every lane and punches a hole. (Phase 3, doc 14.)
+    pub fn rowViewSet(rv: Value, key: Value, val: Value) bool {
+        const t = fromHeader(rv.rowViewParent());
+        std.debug.assert(t.array.isGrid());
+        const row: usize = rv.rowViewRow();
+        const nk = normalizeKey(key);
+        if (nk.isInt()) {
+            const j = nk.asInt();
+            if (j >= 1 and j <= @as(i64, @intCast(t.array.stride)) and
+                ArrayPart.laneFits(t.array.grid_elem, val))
+            {
+                t.array.gridSet(row, @intCast(j - 1), val);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Logical length of grid row `row` (0-based) — its `#` border. (Phase 3.)
+    pub fn rowViewLen(rv: Value) i64 {
+        const t = fromHeader(rv.rowViewParent());
+        std.debug.assert(t.array.isGrid());
+        return @intCast(t.array.gridRowLen(rv.rowViewRow()));
     }
 
     /// Pointer to the **hash-part** value cell for `key`, or `null` if the key is
@@ -135,6 +191,10 @@ pub const Table = struct {
 
     /// `t[key] = val`. A `nil`/`NaN` key errors; storing `nil` deletes.
     pub fn set(self: *Table, gpa: std.mem.Allocator, key: Value, val: Value) Error!void {
+        // A grid table never takes a raw store: outer row (re)assignment and row
+        // append are deflation triggers handled in the interpreter's `indexSet`
+        // (Phase 5), which intercepts grids before reaching here.
+        std.debug.assert(!self.array.isGrid());
         if (key.isNil()) return Error.TypeError;
         if (key.isFloat() and std.math.isNan(key.asFloat())) return Error.TypeError;
 
@@ -377,6 +437,10 @@ pub const Table = struct {
     /// A *border* `n` such that `t[n] ~= nil` and `t[n+1] == nil` (or `0`). Like
     /// Lua, with holes any valid border may be returned; this is `#t`.
     pub fn length(self: *const Table) i64 {
+        // Every grid row `1..rows` is a present `row_view` (a table is never nil)
+        // and a grid carries no hash-part border, so `#t` is exactly the row
+        // count. (Phase 3, doc 14.)
+        if (self.array.isGrid()) return @intCast(self.array.gridRows());
         var n: usize = self.array.len;
         // Trim trailing nils: if the array part ends in a nil, the border is the
         // last non-nil prefix and cannot extend past it.
@@ -885,4 +949,83 @@ test "lane: value identity is preserved across a widening store" {
             try testing.expectEqual(i, t.get(Value.int(i)).asInt());
         }
     }
+}
+
+// --- grid row forwarding (Phase 3, doc 14) -----------------------------------
+
+test "grid table: getInt mints a row_view; #t is the row count" {
+    const gpa = testing.allocator;
+    const t = try Table.create(gpa);
+    defer t.destroy(gpa);
+    t.array = try ArrayPart.initGrid(gpa, 3, 4, .f64); // 3 rows × 4 f64 cells
+
+    // `t[i]` for an in-range row is a transient row_view onto row i-1.
+    const r1 = t.getInt(1);
+    try testing.expect(r1.isRowView());
+    try testing.expectEqual(@as(*GcHeader, &t.header), r1.rowViewParent());
+    try testing.expectEqual(@as(u32, 0), r1.rowViewRow());
+    try testing.expectEqual(@as(u32, 2), t.getInt(3).rowViewRow());
+    // `t.get` (normalising path) reaches the same handle; `2.0` aliases `2`.
+    try testing.expect(t.get(Value.float(2)).isRowView());
+
+    // Out-of-range rows are nil (no row, no hash part on a grid).
+    try testing.expect(t.getInt(0).isNil());
+    try testing.expect(t.getInt(4).isNil());
+
+    // `#t` is exactly the row count — every row is a present row_view.
+    try testing.expectEqual(@as(i64, 3), t.length());
+}
+
+test "grid row_view: get/set forward into the flat cells; len tracks high-water" {
+    const gpa = testing.allocator;
+    const t = try Table.create(gpa);
+    defer t.destroy(gpa);
+    t.array = try ArrayPart.initGrid(gpa, 2, 4, .f64);
+    // Row 0 (Lua row 1): cells [10, 11, 12, hole].
+    t.array.gridSet(0, 0, Value.float(10));
+    t.array.gridSet(0, 1, Value.float(11));
+    t.array.gridSet(0, 2, Value.float(12));
+
+    const rv = t.getInt(1);
+
+    // Inner reads forward 1-based → 0-based, holes and past-stride read nil.
+    try testing.expectEqual(@as(f64, 10), Table.rowViewGet(rv, Value.int(1)).asFloat());
+    try testing.expectEqual(@as(f64, 12), Table.rowViewGet(rv, Value.int(3)).asFloat());
+    try testing.expect(Table.rowViewGet(rv, Value.int(4)).isNil()); // hole within stride
+    try testing.expect(Table.rowViewGet(rv, Value.int(5)).isNil()); // past stride
+    try testing.expect(Table.rowViewGet(rv, Value.boolean(true)).isNil()); // non-int key
+
+    // `#row` is its border high-water (3 non-nil from the left).
+    try testing.expectEqual(@as(i64, 3), Table.rowViewLen(rv));
+
+    // A fitting store forwards and raises the border.
+    try testing.expect(Table.rowViewSet(rv, Value.int(4), Value.float(13)));
+    try testing.expectEqual(@as(f64, 13), Table.rowViewGet(rv, Value.int(4)).asFloat());
+    try testing.expectEqual(@as(i64, 4), Table.rowViewLen(rv));
+
+    // A nil store fits every lane, punches a hole, and does NOT shrink the border.
+    try testing.expect(Table.rowViewSet(rv, Value.int(2), Value.nil()));
+    try testing.expect(Table.rowViewGet(rv, Value.int(2)).isNil());
+    try testing.expectEqual(@as(i64, 4), Table.rowViewLen(rv));
+
+    // Stores that can't stay in the grid signal deflation (false), no mutation.
+    try testing.expect(!Table.rowViewSet(rv, Value.int(1), Value.int(99))); // int ∉ f64 lane
+    try testing.expect(!Table.rowViewSet(rv, Value.int(5), Value.float(1))); // past stride
+    try testing.expect(!Table.rowViewSet(rv, Value.boolean(true), Value.float(1))); // non-int key
+    try testing.expectEqual(@as(f64, 10), Table.rowViewGet(rv, Value.int(1)).asFloat()); // untouched
+}
+
+test "grid row_view: an int-lane grid decodes cells identically to a scalar slot" {
+    const gpa = testing.allocator;
+    const t = try Table.create(gpa);
+    defer t.destroy(gpa);
+    t.array = try ArrayPart.initGrid(gpa, 1, 3, .i32);
+    t.array.gridSet(0, 0, Value.int(-5));
+    t.array.gridSet(0, 1, Value.int(1000));
+
+    const rv = t.getInt(1);
+    try testing.expectEqual(@as(i64, -5), Table.rowViewGet(rv, Value.int(1)).asInt());
+    try testing.expectEqual(@as(i64, 1000), Table.rowViewGet(rv, Value.int(2)).asInt());
+    try testing.expect(Table.rowViewGet(rv, Value.int(3)).isNil());
+    try testing.expectEqual(@as(i64, 2), Table.rowViewLen(rv));
 }

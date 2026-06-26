@@ -63,6 +63,17 @@ fn tableArg(vm: *Vm, args: []const Value, i: usize) anyerror!*Table {
     return Table.fromHeader(v.asHeap());
 }
 
+/// Like `tableArg` but also accepts a `row_view` (a transient grid row, doc 14):
+/// `next`/`pairs`/`ipairs` traverse a row as a length-`#row` array. Returns the
+/// container *value* — the iterators carry it verbatim as the loop state.
+fn iterableArg(vm: *Vm, args: []const Value, i: usize) anyerror!Value {
+    if (i >= args.len) return vm.badArg(i + 1, "table", null);
+    const v = args[i];
+    if (v.isRowView()) return v;
+    if (!v.isHeap() or v.heapType() != .table) return vm.badArg(i + 1, "table", v);
+    return v;
+}
+
 /// Fetch the native installed under `name` as a callable `Value` (from globals).
 fn globalNative(vm: *Vm, name: []const u8) anyerror!Value {
     return vm.globals.get(try vm.heap.internValue(name));
@@ -140,13 +151,36 @@ fn nextStep(gpa: std.mem.Allocator, t: *const Table, ctrl: Value) !Step {
     return hashSuccessorStep(gpa, t, ctrl);
 }
 
+/// `next` over a `row_view` (doc 14): ascending columns `1..stride`, skipping
+/// `nil` holes — a grid row has no hash part. Mirrors the array-part arm of
+/// `nextStep`. Pure (no allocation): cells live in the parent grid's flat buffer.
+fn rowViewNextStep(rv: Value, ctrl: Value) Step {
+    const stride = Table.fromHeader(rv.rowViewParent()).array.stride;
+    var j: i64 = 1;
+    if (!ctrl.isNil()) {
+        if (!ctrl.isInt()) return .{ .found = false };
+        j = ctrl.asInt() + 1;
+    }
+    while (j <= @as(i64, @intCast(stride))) : (j += 1) {
+        const v = Table.rowViewGet(rv, Value.int(j));
+        if (!v.isNil()) return .{ .found = true, .key = Value.int(j), .val = v };
+    }
+    return .{ .found = false };
+}
+
+/// `next(t [, ctrl])` over a table or a `row_view`, dispatching on the container.
+fn nextStepAny(gpa: std.mem.Allocator, container: Value, ctrl: Value) !Step {
+    if (container.isRowView()) return rowViewNextStep(container, ctrl);
+    return nextStep(gpa, Table.fromHeader(container.asHeap()), ctrl);
+}
+
 /// `next(t [, ctrl])` primary projection — the next key only (drives `for k in
 /// pairs(t)`). nil at end of traversal.
 fn nNext1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const t = try tableArg(vm, args, 0);
+    const container = try iterableArg(vm, args, 0);
     const ctrl = if (args.len >= 2) args[1] else Value.nil();
-    const step = try nextStep(vm.gpa, t, ctrl);
+    const step = try nextStepAny(vm.gpa, container, ctrl);
     return if (step.found) step.key else Value.nil();
 }
 
@@ -154,9 +188,9 @@ fn nNext1(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// VM nil-pads, so the generic-for sees a nil first var and stops).
 fn nNextN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
-    const t = try tableArg(vm, args, 0);
+    const container = try iterableArg(vm, args, 0);
     const ctrl = if (args.len >= 2) args[1] else Value.nil();
-    const step = try nextStep(vm.gpa, t, ctrl);
+    const step = try nextStepAny(vm.gpa, container, ctrl);
     if (!step.found) return 0;
     if (out.len >= 1) out[0] = step.key;
     if (out.len >= 2) out[1] = step.val;
@@ -169,22 +203,29 @@ fn nNextN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 
 /// `@ipairs_iter(t, i)` primary projection — the next index `i+1`, or nil when
 /// `t[i+1]` is nil (stops the loop).
+/// `container[j]` for an integer key over a table or `row_view` — the `ipairs`
+/// iterator's per-step read.
+fn iterableGetInt(container: Value, j: i64) Value {
+    if (container.isRowView()) return Table.rowViewGet(container, Value.int(j));
+    return Table.fromHeader(container.asHeap()).getInt(j);
+}
+
 fn nInext1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const t = try tableArg(vm, args, 0);
+    const container = try iterableArg(vm, args, 0);
     const i = if (args.len >= 2 and args[1].isInt()) args[1].asInt() else 0;
     const j = i + 1;
-    return if (t.getInt(j).isNil()) Value.nil() else Value.int(j);
+    return if (iterableGetInt(container, j).isNil()) Value.nil() else Value.int(j);
 }
 
 /// `@ipairs_iter(t, i)` multi path — `(i+1, t[i+1])`, or 0 results at the first
 /// nil.
 fn nInextN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
-    const t = try tableArg(vm, args, 0);
+    const container = try iterableArg(vm, args, 0);
     const i = if (args.len >= 2 and args[1].isInt()) args[1].asInt() else 0;
     const j = i + 1;
-    const v = t.getInt(j);
+    const v = iterableGetInt(container, j);
     if (v.isNil()) return 0;
     if (out.len >= 1) out[0] = Value.int(j);
     if (out.len >= 2) out[1] = v;
@@ -198,14 +239,14 @@ fn nInextN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 /// `pairs(t)` → `(next, t, nil)`. Primary projection is the iterator (`next`).
 fn nPairs1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    _ = try tableArg(vm, args, 0); // type-check
+    _ = try iterableArg(vm, args, 0); // type-check (table or row_view)
     return globalNative(vm, "next");
 }
 
 fn nPairsN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
-    const t = try tableArg(vm, args, 0);
-    const triple = [3]Value{ try globalNative(vm, "next"), Value.heap(&t.header), Value.nil() };
+    const state = try iterableArg(vm, args, 0); // the row_view / table loop state
+    const triple = [3]Value{ try globalNative(vm, "next"), state, Value.nil() };
     const w = @min(@as(usize, 3), out.len);
     var i: usize = 0;
     while (i < w) : (i += 1) out[i] = triple[i];
@@ -215,14 +256,14 @@ fn nPairsN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 /// `ipairs(t)` → `(@ipairs_iter, t, 0)`. Primary projection is the iterator.
 fn nIpairs1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    _ = try tableArg(vm, args, 0);
+    _ = try iterableArg(vm, args, 0);
     return globalNative(vm, ipairs_iter_name);
 }
 
 fn nIpairsN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
     const vm = vmOf(ctx);
-    const t = try tableArg(vm, args, 0);
-    const triple = [3]Value{ try globalNative(vm, ipairs_iter_name), Value.heap(&t.header), Value.int(0) };
+    const state = try iterableArg(vm, args, 0);
+    const triple = [3]Value{ try globalNative(vm, ipairs_iter_name), state, Value.int(0) };
     const w = @min(@as(usize, 3), out.len);
     var i: usize = 0;
     while (i < w) : (i += 1) out[i] = triple[i];
@@ -240,3 +281,54 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "ipairs", .func = &nIpairs1, .multi = &nIpairsN },
     .{ .name = ipairs_iter_name, .func = &nInext1, .multi = &nInextN },
 };
+
+// --- grid row iteration (Phase 3, doc 14) ------------------------------------
+
+const testing = std.testing;
+const arr = @import("../array.zig");
+
+test "next/ipairs traverse a grid row_view as a length-#row array" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    const ctx: *anyopaque = @ptrCast(&vm);
+
+    // Off-heap grid (Phase 3 predates GC-awareness, Phase 6). Row 0: [1, hole, 3].
+    const t = try Table.create(gpa);
+    defer t.destroy(gpa);
+    t.array = try arr.ArrayPart.initGrid(gpa, 1, 4, .i32);
+    t.array.gridSet(0, 0, Value.int(1));
+    t.array.gridSet(0, 2, Value.int(3));
+    const rv = t.getInt(1);
+    try testing.expect(rv.isRowView());
+
+    // `next` skips the hole: (1,1) then (3,3), then exhausted.
+    var out: [2]Value = undefined;
+    var n = try nNextN(ctx, &.{ rv, Value.nil() }, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(i64, 1), out[0].asInt());
+    try testing.expectEqual(@as(i64, 1), out[1].asInt());
+
+    n = try nNextN(ctx, &.{ rv, Value.int(1) }, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(i64, 3), out[0].asInt());
+    try testing.expectEqual(@as(i64, 3), out[1].asInt());
+
+    n = try nNextN(ctx, &.{ rv, Value.int(3) }, &out);
+    try testing.expectEqual(@as(usize, 0), n); // past the last non-nil cell → done
+
+    // `pairs(rv)` hands back (next, rv, nil) — the row_view rides as the state.
+    var trip: [3]Value = undefined;
+    const w = try nPairsN(ctx, &.{rv}, &trip);
+    try testing.expectEqual(@as(usize, 3), w);
+    try testing.expect(trip[1].isRowView());
+    try testing.expect(trip[2].isNil());
+
+    // `ipairs` iterator stops at the first nil: (1,1) then done (cell 2 is a hole).
+    n = try nInextN(ctx, &.{ rv, Value.int(0) }, &out);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(i64, 1), out[0].asInt());
+    try testing.expectEqual(@as(i64, 1), out[1].asInt());
+    n = try nInextN(ctx, &.{ rv, Value.int(1) }, &out);
+    try testing.expectEqual(@as(usize, 0), n); // t[2] is a hole → ipairs halts
+}
