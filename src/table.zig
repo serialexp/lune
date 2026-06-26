@@ -55,6 +55,17 @@ pub const Table = struct {
     /// `create`/`initBare`/restore need no extra wiring; it only gates an
     /// optimisation, never correctness.
     rehash_threshold: usize = 4,
+    /// Grid hysteresis (doc 14, Phase 4b). `true` once this table has been ruled
+    /// out as a flattened grid — either a `Heap.inflateToGrid` scan found it
+    /// non-homogeneous, or a live grid here was deflated (an escape, a bare
+    /// structural store, or a type-changing cell store). The fused `set_index2`
+    /// store path skips the (potentially O(cells)) inflation scan while this is set,
+    /// so each table is scanned at most once and a just-deflated grid is never
+    /// immediately re-inflated (no inflate/deflate thrash). Never serialised: it
+    /// only gates an in-memory optimisation, and grid vs. nested are byte-identical
+    /// in logical values, so a restored table re-deciding from `false` is sound
+    /// (doc 14 §Determinism gate). Default `false`; `create`/restore need no wiring.
+    no_grid: bool = false,
 
     pub const Map = std.HashMapUnmanaged(
         Value,
@@ -473,8 +484,10 @@ pub const Table = struct {
 
 /// Map key normalisation: a float with an exact integral value in `i64` range
 /// becomes the equivalent integer key, so `t[2]` and `t[2.0]` are one slot.
-/// Everything else is returned unchanged.
-fn normalizeKey(key: Value) Value {
+/// Everything else is returned unchanged. Public so the interpreter's fused
+/// grid-cell paths (doc 14) normalise outer/inner index keys the same way
+/// `get`/`set` do (`a[i][2.0]` ↔ `a[i][2]`).
+pub fn normalizeKey(key: Value) Value {
     if (key.isFloat()) {
         const f = key.asFloat();
         if (!std.math.isNan(f) and !std.math.isInf(f) and

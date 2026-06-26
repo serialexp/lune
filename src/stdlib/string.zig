@@ -51,7 +51,11 @@ fn tableArg(vm: *Vm, args: []const Value, i: usize) anyerror!*Table {
     if (i >= args.len) return vm.badArg(i + 1, "table", null);
     const v = args[i];
     if (!v.isHeap() or v.heapType() != .table) return vm.badArg(i + 1, "table", v);
-    return Table.fromHeader(v.asHeap());
+    const t = Table.fromHeader(v.asHeap());
+    // Gate (doc 14): grids are touched only by fused `a[i][j]`; a bare stdlib op
+    // deflates the grid back to real row tables first.
+    if (t.array.isGrid()) try vm.heap.deflateGrid(t);
+    return t;
 }
 
 /// Fetch the native installed under `name` as a callable `Value`.

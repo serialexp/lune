@@ -1,18 +1,15 @@
 # Nested Numeric Array Flattening — Design
 
-Status: partial — **building D.** Phases 0–3 landed on `master` (decision gate;
-`RowView` fat value; grid representation in `ArrayPart`; row forwarding through
-the interpreter). Architecture pivoted post-review to **transient fat-value rows
-with copy-out on escape** — then pivoted *again* (2026-06-26, Bart) to **gate
-grids behind fused indexing**: see §Escape detection — the gate decision below.
-The `inflateToGrid`/`deflateGrid` primitives landed (uncommitted) on `gc.Heap`.
+Status: partial — **building D.** Phases 0–6 landed on `master`. Live grids are
+now produced at runtime: a homogeneous-numeric nested table inflates on its first
+fused `a[i][j]=v`, grows by **reshape-on-overflow** (stride / cell-lane), and
+deflates only on a genuine type change or any *bare* access — the **gate behind
+fused indexing** (2026-06-26, Bart; see §Escape detection). Grids survive GC
+stress live. Remaining: Phase 7 (determinism + keyframe verification) and Phase 8
+(the trace-recorder fast path, where the locality win is cashed — grids today
+abort recording on `get_index2`/`set_index2`, so they run correctly but tier-0).
 Determinism/replay is the one principled gate and is satisfiable (see
 §Determinism gate). Build size is explicitly *not* a blocker (see §Decision).
-**Re-ordered phasing:** fused multi-level indexing (was Phase 8) now precedes
-live grids — grids are never enabled until tier-0 only touches them through a
-fused op, so no bare `row_view` ever escapes to a register. Next: fused
-`get_index2`/`set_index2` opcodes (compiler + interp), then inflation wired into
-the fused store path, then the recorder fast path.
 Owner: Bart
 Last updated: 2026-06-26
 
@@ -79,32 +76,39 @@ land; move whole sections to Done once everything inside is checked.
   new opcodes (`.nyi_opcode`) until Phase 8. This is the vehicle that, once grids
   exist, never materialises a bare `row_view` into a register — closing the
   swap/identity hole (§Escape detection).
-
-### Outstanding
-
-The escape-detection re-plan (§Escape detection) **re-orders** these. The
-`inflateToGrid`/`deflateGrid` primitives are built; the work now is the fused
-indexing that lets grids be enabled safely.
-
-- [ ] **Phase 4b — Inflation wired into the fused store path.** `a[i][j]=v` on a
-  homogeneous-numeric nested `a` calls `Heap.inflateToGrid` (built); the fused
-  ops then read/write grid cells directly. Hysteresis: a don't-retry flag so a
-  non-qualifying or recently-deflated parent is scanned at most once.
-- [ ] **Phase 4c — Bare access ⇒ deflate (escape).** A bare `get_index`/
-  `set_index` (single level) on a grid table is conservatively an escape: it
-  calls `Heap.deflateGrid` (built) and proceeds on the now-nested table. So a
-  `row_view` value is *never produced at runtime* — only the fused path touches a
-  grid, and it never leaks a view. Inner-overflow / outer-reassignment stores
-  (the Phase 3 `Unimplemented` stubs) likewise deflate.
-- [ ] **Phase 5 — `expectProgram` correctness sweep.** All 8 modes + GC stress on
-  the canonical workloads: `a[i][j]` matrix fill/read, jagged rows, **in-place
-  row swap / sort** (the pattern that motivated the gate — it deflates on the
-  bare `tmp=a[i]` and stays correct), `a[i]==a[i]`, row passed to a function /
-  stored in a table (deflates), `#a[i]`, `pairs`/`ipairs`.
-- [ ] **Phase 6 — GC integration.** `blacken` over a grid skips the (non-heap)
-  leaves; the grid buffer is owned by the parent. Already largely satisfied
-  (`isLeaf` skips a grid array; no `row_view` heap objects exist) — verify under
-  GC stress with grids live.
+- [x] **Phase 4b — Inflation wired into the fused store path.** `set_index2` on a
+  homogeneous-numeric nested `a` calls `Heap.inflateToGrid`; the fused ops then
+  read/write grid cells directly (`Vm.fusedGet`/`fusedStore`/`gridCellGet`/
+  `gridCellStore` in `interp.zig`). Inflation is **reshape-on-overflow** (Bart,
+  2026-06-26): a store whose column outruns `stride` grows the grid geometrically
+  (`gridGrowStride`) and one whose int outgrows the cell lane climbs the lane
+  ladder in place (`gridWidenElem` via `gridWidenTargetForInt`) — both stay a
+  grid. Only a *type change* (float into an int grid, or a non-numeric leaf)
+  deflates. Hysteresis: a `Table.no_grid` flag (set on a failed inflate scan or
+  on any deflate) bounds the scan to once per table and stops inflate/deflate
+  thrash. One direct unit test (inflate → stride-grow → lane-widen → type-change
+  deflate → no re-inflate).
+- [x] **Phase 4c — Bare access ⇒ deflate (escape).** A bare `indexGet`/`indexSet`
+  on a grid deflates it first (the table-branch entry of both, `interp.zig`), so a
+  `row_view` is *never produced at runtime* — only the fused path touches a grid.
+  The Phase 3 `indexSet` `Unimplemented` stubs are gone (the rowView arm deflates
+  the parent and retries on the real row; the grid-table arm deflates then
+  proceeds). The stdlib surface that reads the matrix itself — every `tableArg`
+  (table/base/basic/string) and `iterableArg` (next/pairs/ipairs) — deflates a
+  grid on entry, so `table.*`, `raw*`, `setmetatable`, and iteration all see real
+  row tables. Two gate unit tests (bare `indexGet`/`indexSet` deflate).
+- [x] **Phase 5 — `expectProgram` correctness sweep.** Eight grid e2e tests, each
+  byte-identical across all 10 modes (`gc_stress`×{off, record-only, no-opt,
+  record-execute, native}): matrix fill/read with a compute pass,
+  reshape-on-overflow (stride grow), lane-widen, type-change deflate, bare row
+  escape + mutate + `ipairs` + `a[1]==a[1]`, `table.insert` append, **the
+  in-place row swap** (the motivating counterexample — deflates on `tmp=a[i]`,
+  stays correct), and `table.sort` over rows by a key.
+- [x] **Phase 6 — GC integration.** `blacken` over a grid skips the (non-heap)
+  leaves; the grid buffer is owned by the parent and freed by `ArrayPart.deinit`.
+  Verified live: the eight Phase 5 e2e tests run with `gc_stress=true` (collect at
+  *every* safepoint) while grids are live and inflate/deflate mid-program — green,
+  so a live grid is neither wrongly collected nor leaks its row tables on deflate.
 - [ ] **Phase 7 — Determinism + keyframe.** Prove the grid is in-memory only
   (never serialised), identity is `parent.id`-based (address-independent), all 8
   modes + keyframe restore observe identical logical values, and grids are

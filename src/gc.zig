@@ -168,9 +168,15 @@ pub const Heap = struct {
         const gpa = self.gpa;
 
         // --- outer shape ---
+        if (parent.no_grid) return false; // hysteresis: ruled out, don't re-scan
         if (parent.array.isGrid()) return false; // already a grid
         if (parent.array.lane != .value) return false; // rows are heap refs ⇒ .value
         if (parent.hash.count() != 0) return false; // grid owns the whole 1..len run
+        // A grid's outer `a[i]` miss returns nil with no `__index` consultation
+        // (the fused read path, doc 14); a metatable'd parent would break that, so a
+        // matrix carrying a metatable simply stays nested (rare; deflated on
+        // `setmetatable` regardless).
+        if (parent.metatable != null) return false;
         const rows = parent.array.len;
         if (rows == 0) return false;
 
@@ -279,6 +285,10 @@ pub const Heap = struct {
 
         parent.array.deinit(gpa);
         parent.array = outer;
+        // Hysteresis (doc 14, Phase 4b): a table that just deflated is not
+        // re-inflated by a following fused store — that would thrash. It stays
+        // nested for the rest of its life (a fresh restore re-decides from false).
+        parent.no_grid = true;
     }
 
     /// Intern `content`: return the existing object for these bytes, or allocate,
@@ -771,5 +781,24 @@ test "inflateToGrid: blockers — mixed int/float, hash on a row, metatable, non
         try outer.set(heap.gpa, Value.int(1), Value.heap(&row.header));
         try outer.set(heap.gpa, try heap.internValue("x"), Value.int(0));
         try testing.expect(!heap.inflateToGrid(outer));
+    }
+    // a metatable on the parent ⇒ block (the grid read path skips __index)
+    {
+        const outer = try heap.newTable();
+        const row = try heap.newTable();
+        try row.set(heap.gpa, Value.int(1), Value.int(1));
+        try outer.set(heap.gpa, Value.int(1), Value.heap(&row.header));
+        outer.metatable = try heap.newTable();
+        try testing.expect(!heap.inflateToGrid(outer));
+    }
+    // the `no_grid` hysteresis flag ⇒ block even when otherwise eligible
+    {
+        const outer = try heap.newTable();
+        const row = try heap.newTable();
+        try row.set(heap.gpa, Value.int(1), Value.int(1));
+        try outer.set(heap.gpa, Value.int(1), Value.heap(&row.header));
+        outer.no_grid = true;
+        try testing.expect(!heap.inflateToGrid(outer));
+        try testing.expect(!outer.array.isGrid());
     }
 }

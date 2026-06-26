@@ -60,7 +60,11 @@ fn tableArg(vm: *Vm, args: []const Value, i: usize) anyerror!*Table {
     if (i >= args.len) return vm.badArg(i + 1, "table", null);
     const v = args[i];
     if (!v.isHeap() or v.heapType() != .table) return vm.badArg(i + 1, "table", v);
-    return Table.fromHeader(v.asHeap());
+    const t = Table.fromHeader(v.asHeap());
+    // Gate (doc 14): a grid is only ever touched by fused `a[i][j]`; any bare
+    // stdlib access deflates it back to real row tables first.
+    if (t.array.isGrid()) try vm.heap.deflateGrid(t);
+    return t;
 }
 
 /// Like `tableArg` but also accepts a `row_view` (a transient grid row, doc 14):
@@ -71,6 +75,10 @@ fn iterableArg(vm: *Vm, args: []const Value, i: usize) anyerror!Value {
     const v = args[i];
     if (v.isRowView()) return v;
     if (!v.isHeap() or v.heapType() != .table) return vm.badArg(i + 1, "table", v);
+    // Gate: iterating the matrix itself deflates it (so the loop sees real row
+    // tables, never bare row_views). A row_view container is handled above.
+    const t = Table.fromHeader(v.asHeap());
+    if (t.array.isGrid()) try vm.heap.deflateGrid(t);
     return v;
 }
 

@@ -25,6 +25,7 @@ const gc = @import("gc.zig");
 const object = @import("object.zig");
 const string = @import("string.zig");
 const table = @import("table.zig");
+const array = @import("array.zig");
 const function = @import("function.zig");
 const trace = @import("trace.zig");
 const irinterp = @import("irinterp.zig");
@@ -1960,27 +1961,25 @@ pub const Vm = struct {
                     }
                 },
                 .get_index2 => {
-                    // Fused two-level read `R[a] = R[b][R[c]][R[aux]]`. The
-                    // intermediate `R[b][R[c]]` is consumed here and never lands
-                    // in a register, so a grid row (doc 14) can never escape as a
-                    // bare `row_view`. On a nested table this is exactly two
-                    // `indexGet`s — semantically identical to the unfused form.
+                    // Fused two-level read `R[a] = R[b][R[c]][R[aux]]`. On a grid
+                    // (doc 14) this reads the flat cell directly — the *only* grid
+                    // reader, so it never mints a `row_view`. On a nested table it is
+                    // exactly two `indexGet`s, semantically identical to the unfused
+                    // form (metatables on either level still dispatch).
                     const container = regs.get(instr.b);
                     const key1 = regs.get(instr.c);
                     const key2 = regs.get(@as(u16, @intCast(instr.aux)));
-                    const mid = try self.indexGet(container, key1);
-                    regs.set(a, try self.indexGet(mid, key2));
+                    regs.set(a, try self.fusedGet(container, key1, key2));
                 },
                 .set_index2 => {
                     // Fused two-level store `R[a][R[b]][R[c]] = R[aux]`. The grid
-                    // inflation trigger (doc 14, Phase 4b) will live here; for now
-                    // it is two-step (`indexGet` the row, then `indexSet`).
+                    // inflation trigger and the in-grid cell store (with
+                    // reshape-on-overflow) live in `fusedStore` (doc 14, Phase 4b).
                     const container = regs.get(a);
                     const key1 = regs.get(instr.b);
                     const key2 = regs.get(instr.c);
                     const val = regs.get(@as(u16, @intCast(instr.aux)));
-                    const mid = try self.indexGet(container, key1);
-                    try self.indexSet(mid, key2, val);
+                    try self.fusedStore(container, key1, key2, val);
                 },
 
                 // ---- globals ----
@@ -2779,6 +2778,116 @@ pub const Vm = struct {
     ///     bounded by `max_metatable_chain`).
     ///   - `__index` is any other value (a function, typically) → call it as
     ///     `handler(container, key)` and return its first result.
+    // ===================================================================
+    // Fused two-level index (doc 14) — the grid gate.
+    //
+    // `a[i][j]` / `a[i][j]=v` compile to single `get_index2`/`set_index2` ops. On a
+    // flattened grid these read/write the flat cell *directly* (never minting a
+    // `row_view`); on a plain nested table they fall back to two ordinary index
+    // steps. A store may inflate a homogeneous-numeric `a` into a grid, and grows
+    // the grid (stride / cell lane) on overflow rather than deflating — only a
+    // genuine type change deflates (Bart's escape model, 2026-06-26).
+    // ===================================================================
+
+    /// `R[a] = container[key1][key2]`. Grid → direct cell read; else two index steps.
+    fn fusedGet(self: *Vm, container: Value, key1: Value, key2: Value) Error!Value {
+        if (container.isHeap() and container.heapType() == .table) {
+            const t = table.Table.fromHeader(container.asHeap());
+            if (t.array.isGrid()) return self.gridCellGet(t, key1, key2);
+        }
+        const mid = try self.indexGet(container, key1);
+        return self.indexGet(mid, key2);
+    }
+
+    /// Read grid cell `t[i][j]` faithfully, reproducing the nested-table semantics
+    /// so no deflation is needed on the read path: an in-range row with an
+    /// in-stride present int column yields the cell; an in-range row with any other
+    /// inner key yields `nil` (a numeric row holds only its cells); an out-of-range
+    /// or non-integer outer key means `t[i]` is `nil`, so indexing it faults exactly
+    /// like the unfused `nil[j]` ("attempt to index a nil value").
+    fn gridCellGet(self: *Vm, t: *table.Table, key1: Value, key2: Value) Error!Value {
+        const k1 = table.normalizeKey(key1);
+        if (k1.isInt()) {
+            const i = k1.asInt();
+            if (i >= 1 and i <= @as(i64, @intCast(t.array.gridRows()))) {
+                const k2 = table.normalizeKey(key2);
+                if (k2.isInt()) {
+                    const j = k2.asInt();
+                    if (j >= 1 and j <= @as(i64, @intCast(t.array.stride)))
+                        return t.array.gridGet(@intCast(i - 1), @intCast(j - 1));
+                }
+                return Value.nil(); // inner miss on a numeric row ⇒ nil
+            }
+        }
+        // Outer miss: `t[i]` is nil (a grid only holds rows 1..rows). Index the nil
+        // exactly as the unfused two-step would — same "index a nil value" fault.
+        return self.indexGet(Value.nil(), key2);
+    }
+
+    /// `container[key1][key2] = val`. On a grid (or a freshly inflated one) stores
+    /// the cell directly, growing stride/lane on overflow; a store that can't be a
+    /// grid cell (type change, non-int key, out-of-range row) deflates and retries
+    /// as a nested store. On a plain table, attempts inflation first, else two steps.
+    fn fusedStore(self: *Vm, container: Value, key1: Value, key2: Value, val: Value) Error!void {
+        if (container.isHeap() and container.heapType() == .table) {
+            const t = table.Table.fromHeader(container.asHeap());
+            // Inflation trigger (Phase 4b): a homogeneous-numeric nested table
+            // becomes a grid on the first fused store; `no_grid` makes the (≤ O(cells))
+            // scan fire at most once per table.
+            if (!t.array.isGrid() and !t.no_grid) {
+                if (!self.heap.inflateToGrid(t)) t.no_grid = true;
+            }
+            if (t.array.isGrid()) {
+                if (try self.gridCellStore(t, key1, key2, val)) return;
+                // Could not stay a grid cell: the grid was deflated; fall through to
+                // the nested store on the now-real row.
+            }
+        }
+        const mid = try self.indexGet(container, key1);
+        try self.indexSet(mid, key2, val);
+    }
+
+    /// Store grid cell `t[i][j] = val`, returning `true` once stored in-grid. Grows
+    /// the stride and/or widens the cell lane (geometrically) when the in-family
+    /// store overflows the current shape. Returns `false` after deflating the grid
+    /// when the store can't be a grid cell — a non-int key, an out-of-range row, or
+    /// a value whose numeric family differs from the cell lane (int↔float) or which
+    /// is non-numeric — leaving the caller to do an ordinary nested store.
+    fn gridCellStore(self: *Vm, t: *table.Table, key1: Value, key2: Value, val: Value) Error!bool {
+        const k1 = table.normalizeKey(key1);
+        const k2 = table.normalizeKey(key2);
+        if (k1.isInt() and k2.isInt()) {
+            const i = k1.asInt();
+            const j = k2.asInt();
+            if (i >= 1 and i <= @as(i64, @intCast(t.array.gridRows())) and j >= 1) {
+                const row: usize = @intCast(i - 1);
+                const col: usize = @intCast(j - 1);
+                if (val.isNil()) {
+                    // A nil store clears a cell; past the stride it is already absent
+                    // (no-op, no growth — matches `row[j]=nil` for an unset key).
+                    if (j <= @as(i64, @intCast(t.array.stride))) t.array.gridSet(row, col, val);
+                    return true;
+                }
+                // Same numeric family as the cell lane? f64 grid ↔ float; int grid ↔ int.
+                const same_family = if (t.array.grid_elem == .f64) val.isFloat() else val.isInt();
+                if (same_family) {
+                    if (j > @as(i64, @intCast(t.array.stride)))
+                        try t.array.gridGrowStride(self.gpa, col + 1);
+                    if (!array.ArrayPart.laneFits(t.array.grid_elem, val)) {
+                        // Same family but wider int ⇒ climb the cell lane ladder.
+                        const target = array.ArrayPart.gridWidenTargetForInt(t.array.grid_elem, val).?;
+                        try t.array.gridWidenElem(self.gpa, target);
+                    }
+                    t.array.gridSet(row, col, val);
+                    return true;
+                }
+                // Family mismatch (float into int grid, int into f64 grid) ⇒ deflate.
+            }
+        }
+        try self.heap.deflateGrid(t);
+        return false;
+    }
+
     fn indexGet(self: *Vm, container: Value, key: Value) Error!Value {
         var cur = container;
         var hops: usize = 0;
@@ -2791,6 +2900,16 @@ pub const Vm = struct {
             if (cur.isRowView()) return table.Table.rowViewGet(cur, key);
             // Raw read when `cur` is a table; a present field short-circuits.
             if (cur.isHeap() and cur.heapType() == .table) {
+                // Gate (doc 14, Phase 4c): a grid is touched *only* by the fused
+                // `get_index2`/`set_index2` ops (which read cells directly). Any
+                // other outer access — a bare `a[i]`, a metamethod chain, a library
+                // call — deflates first, so a `row_view` never escapes into a
+                // register/heap slot (the swap/identity hazard). Deflation restores
+                // byte-identical nested tables, so the read below is then ordinary.
+                {
+                    const t0 = table.Table.fromHeader(cur.asHeap());
+                    if (t0.array.isGrid()) try self.heap.deflateGrid(t0);
+                }
                 const raw = table.Table.fromHeader(cur.asHeap()).get(key);
                 if (!raw.isNil()) return raw;
             }
@@ -2835,13 +2954,24 @@ pub const Vm = struct {
                     self.heap.writeBarrier(cur.rowViewParent(), val); // no-op until Phase 4
                     return;
                 }
-                return Error.Unimplemented; // TODO(Phase 5): deflate row → table, then store
+                // A store that can't stay in the row's grid cells: deflate the
+                // parent grid and retry the store on the now-real row table. Under
+                // the gate a `row_view` only reaches here via a hand-built grid
+                // (tests); the runtime fused path never mints one. (doc 14.)
+                const parent = table.Table.fromHeader(cur.rowViewParent());
+                const row_idx = cur.rowViewRow();
+                try self.heap.deflateGrid(parent);
+                cur = parent.getInt(@as(i64, @intCast(row_idx)) + 1); // the real row table now
+                continue;
             }
             if (cur.isHeap() and cur.heapType() == .table) {
                 const t = table.Table.fromHeader(cur.asHeap());
-                // An *outer* store on a grid table (`t[i] = v`: replace/append a
-                // whole row) is a deflation trigger — Phase 5; not yet implemented.
-                if (t.array.isGrid()) return Error.Unimplemented; // TODO(Phase 5)
+                // Gate (doc 14, Phase 4c): a bare outer store `t[i] = v` on a grid
+                // (row reassignment / a structural change) deflates first, then the
+                // store proceeds on the nested table below. Only the fused
+                // `set_index2` path stores grid cells; everything else deflates, so a
+                // `row_view` never escapes.
+                if (t.array.isGrid()) try self.heap.deflateGrid(t);
                 // A present (non-nil) raw key bypasses `__newindex`.
                 if (!t.get(key).isNil()) {
                     try t.set(self.gpa, key, val);
@@ -9686,17 +9816,22 @@ test "tropt: seeded differential fuzz — tier-0 == execute-noopt == execute-opt
     }
 }
 
-// --- grid row forwarding through the interpreter (Phase 3, doc 14) -----------
+// --- the grid gate: bare index access deflates (Phase 4c, doc 14) ------------
+//
+// Row forwarding through a live `row_view` (Phase 3) is exercised directly in
+// table.zig ("grid row_view: get/set forward …"). At the *interpreter* boundary
+// the escape model forbids ever handing a bare `row_view` to user code: any
+// ordinary `indexGet`/`indexSet` on a grid table deflates it back to real row
+// Tables first, so no stale-alias hazard can arise. These tests pin that gate.
 
-test "grid: indexGet/indexSet/len forward a row_view; outer + non-fitting set defer" {
+test "grid gate: a bare indexGet on a grid deflates it and returns a real row table" {
     const arr = @import("array.zig");
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
 
-    // A grid table built by hand (no inflation yet — that's Phase 4). Kept off the
-    // heap's GC list (a plain `create`/`destroy`) so this Phase-3 test never asks
-    // the not-yet-grid-aware collector (Phase 6) to mark it.
+    // Hand-built grid, off the GC list (plain create/destroy). deflateGrid mints
+    // the row Tables via the heap, so those land on the GC list and free at deinit.
     const t = try table.Table.create(gpa);
     defer t.destroy(gpa);
     t.array = try arr.ArrayPart.initGrid(gpa, 2, 3, .i32); // 2 rows × 3 i32 cells
@@ -9705,34 +9840,105 @@ test "grid: indexGet/indexSet/len forward a row_view; outer + non-fitting set de
     t.array.gridSet(1, 0, Value.int(70));
     const g = Value.heap(&t.header);
 
-    // Outer `g[1]` → a row_view; the fast path is skipped, `indexGet` mints it.
+    // A bare outer `g[1]` deflates the grid and yields a *real* heap Table — never
+    // a row_view. The parent is now nested and flagged so it won't re-inflate.
     const r1 = try vm.indexGet(g, Value.int(1));
-    try testing.expect(r1.isRowView());
-    try testing.expectEqual(@as(u32, 0), r1.rowViewRow());
+    try testing.expect(!r1.isRowView());
+    try testing.expect(r1.isHeap() and r1.heapType() == .table);
+    try testing.expect(!t.array.isGrid());
+    try testing.expect(t.no_grid);
 
-    // Inner `g[1][2]` forwards into the cell; a hole reads nil.
+    // The rebuilt row reproduces the cells (cols 0,1 set ⇒ keys 1,2; col 2 a hole).
+    try testing.expectEqual(@as(i64, 10), (try vm.indexGet(r1, Value.int(1))).asInt());
     try testing.expectEqual(@as(i64, 20), (try vm.indexGet(r1, Value.int(2))).asInt());
     try testing.expect((try vm.indexGet(r1, Value.int(3))).isNil());
-
-    // `#g` is the row count; `#g[1]` is the row's border.
-    try testing.expectEqual(@as(i64, 2), (try lenOf(g)).asInt());
     try testing.expectEqual(@as(i64, 2), (try lenOf(r1)).asInt());
 
-    // Inner store `g[1][3] = 30` forwards (i32 fits) and extends the border.
-    try vm.indexSet(r1, Value.int(3), Value.int(30));
-    try testing.expectEqual(@as(i64, 30), (try vm.indexGet(r1, Value.int(3))).asInt());
-    try testing.expectEqual(@as(i64, 3), (try lenOf(r1)).asInt());
+    // `#g` is still the row count; the second row is an independent table.
+    try testing.expectEqual(@as(i64, 2), (try lenOf(g)).asInt());
+    const r2 = try vm.indexGet(g, Value.int(2));
+    try testing.expect(r2.isHeap() and r2.heapType() == .table);
+    try testing.expect(!r1.eql(r2));
+    try testing.expectEqual(@as(i64, 70), (try vm.indexGet(r2, Value.int(1))).asInt());
+}
 
-    // A second row is independent.
+test "grid gate: a bare indexSet on a grid deflates it, then stores the whole row" {
+    const arr = @import("array.zig");
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+
+    const t = try table.Table.create(gpa);
+    defer t.destroy(gpa);
+    t.array = try arr.ArrayPart.initGrid(gpa, 2, 3, .i32);
+    t.array.gridSet(0, 0, Value.int(10));
+    t.array.gridSet(1, 0, Value.int(70));
+    const g = Value.heap(&t.header);
+
+    // A bare outer store replaces the whole slot — that is only meaningful on a
+    // nested table, so the grid deflates first, then the store lands as a scalar.
+    try vm.indexSet(g, Value.int(1), Value.int(9));
+    try testing.expect(!t.array.isGrid());
+    try testing.expect(t.no_grid);
+    try testing.expectEqual(@as(i64, 9), (try vm.indexGet(g, Value.int(1))).asInt());
+
+    // Row 2 survived the deflation as a real row table.
     const r2 = try vm.indexGet(g, Value.int(2));
     try testing.expectEqual(@as(i64, 70), (try vm.indexGet(r2, Value.int(1))).asInt());
-    try testing.expect((try vm.indexGet(r2, Value.int(2))).isNil());
+}
 
-    // Deferred to Phase 5 (deflation), surfaced as `Unimplemented` for now:
-    //  - an *outer* store on a grid table (replace/append a whole row), and
-    //  - an *inner* store that can't stay in the grid (value wider than the lane).
-    try testing.expectError(Error.Unimplemented, vm.indexSet(g, Value.int(1), Value.int(9)));
-    try testing.expectError(Error.Unimplemented, vm.indexSet(r1, Value.int(1), Value.float(1.5)));
+// --- Phase 4b: inflation + reshape through the fused store path (doc 14) ------
+
+test "fused store: a homogeneous-numeric matrix inflates, reshapes, then deflates on type change" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+
+    // Build nested `{ {1,2}, {3,4} }` on the heap (everything GC-linked; freed at
+    // deinit whether or not it's rooted, so no globals dance is needed).
+    const a = try vm.heap.newTable();
+    const r0 = try vm.heap.newTable();
+    const r1 = try vm.heap.newTable();
+    try r0.set(gpa, Value.int(1), Value.int(1));
+    try r0.set(gpa, Value.int(2), Value.int(2));
+    try r1.set(gpa, Value.int(1), Value.int(3));
+    try r1.set(gpa, Value.int(2), Value.int(4));
+    try a.set(gpa, Value.int(1), Value.heap(&r0.header));
+    try a.set(gpa, Value.int(2), Value.heap(&r1.header));
+    const av = Value.heap(&a.header);
+
+    // First fused store inflates `a` into a grid and writes the cell in-grid.
+    try vm.fusedStore(av, Value.int(1), Value.int(1), Value.int(9));
+    try testing.expect(a.array.isGrid());
+    try testing.expectEqual(@as(i64, 9), (try vm.fusedGet(av, Value.int(1), Value.int(1))).asInt());
+    try testing.expectEqual(@as(i64, 4), (try vm.fusedGet(av, Value.int(2), Value.int(2))).asInt());
+
+    // Reshape on stride overflow: column 3 outruns the stride-2 grid → geometric
+    // grow (stays a grid, never deflates — Bart's reshape-on-overflow rule).
+    try vm.fusedStore(av, Value.int(1), Value.int(3), Value.int(7));
+    try testing.expect(a.array.isGrid());
+    try testing.expect(a.array.stride >= 3);
+    try testing.expectEqual(@as(i64, 7), (try vm.fusedGet(av, Value.int(1), Value.int(3))).asInt());
+
+    // Lane widen: a value past the current int lane climbs the cell-lane ladder
+    // in place, still a grid.
+    try vm.fusedStore(av, Value.int(2), Value.int(1), Value.int(100000));
+    try testing.expect(a.array.isGrid());
+    try testing.expectEqual(@as(i64, 100000), (try vm.fusedGet(av, Value.int(2), Value.int(1))).asInt());
+
+    // Type change (float into an int grid) is the one trigger that deflates; the
+    // store still lands, now nested, and the earlier cells survive intact.
+    try vm.fusedStore(av, Value.int(1), Value.int(1), Value.float(1.5));
+    try testing.expect(!a.array.isGrid());
+    try testing.expect(a.no_grid);
+    try testing.expectEqual(@as(f64, 1.5), (try vm.fusedGet(av, Value.int(1), Value.int(1))).asFloat());
+    try testing.expectEqual(@as(i64, 7), (try vm.fusedGet(av, Value.int(1), Value.int(3))).asInt());
+    try testing.expectEqual(@as(i64, 100000), (try vm.fusedGet(av, Value.int(2), Value.int(1))).asInt());
+
+    // Hysteresis: a deflated matrix does not re-inflate on the next fused store.
+    try vm.fusedStore(av, Value.int(2), Value.int(2), Value.int(8));
+    try testing.expect(!a.array.isGrid());
+    try testing.expectEqual(@as(i64, 8), (try vm.fusedGet(av, Value.int(2), Value.int(2))).asInt());
 }
 
 // --- Phase 4a: fused two-level index (get_index2 / set_index2) ---------------
@@ -9785,5 +9991,115 @@ test "fused index: evaluation order matches the unfused RHS-first convention" {
         \\
     ,
         "3\t1\t2\n1\t2\n",
+    );
+}
+
+// --- Phase 4b/4c: grids end-to-end from Lua (8-mode byte-identical) -----------
+// A grid is logically transparent: every program below must print exactly what
+// the equivalent nested-table program would, in all 8 execution modes. That the
+// matrix flattens (or reshapes, or deflates) underneath is invisible to the user.
+
+test "grid e2e: fill a matrix with fused stores then read it back" {
+    try expectProgram(
+        \\local m = { {1,2,3}, {4,5,6}, {7,8,9} }
+        \\for i=1,3 do for j=1,3 do m[i][j] = m[i][j] * 10 end end
+        \\local s = 0
+        \\for i=1,3 do for j=1,3 do s = s + m[i][j] end end
+        \\print(s, m[1][1], m[3][3])
+        \\
+    ,
+        "450\t10\t90\n",
+    );
+}
+
+test "grid e2e: a fused store past the stride grows the grid (reshape-on-overflow)" {
+    try expectProgram(
+        \\local m = { {1,2}, {3,4} }
+        \\m[1][1] = 9          -- inflate
+        \\m[1][3] = 7          -- column 3 outruns stride 2 → grow, stay flat
+        \\m[2][4] = 8          -- column 4 fits the grown stride; still flat
+        \\print(m[1][1], m[1][2], m[1][3], m[2][4], m[1][4])
+        \\
+    ,
+        "9\t2\t7\t8\tnil\n",
+    );
+}
+
+test "grid e2e: a wider int store climbs the cell lane in place" {
+    try expectProgram(
+        \\local m = { {1,2}, {3,4} }
+        \\m[1][1] = 1          -- inflate at a tiny lane
+        \\m[2][2] = 1000000    -- past the lane → widen, stay flat
+        \\print(m[2][2], m[1][1], m[2][1])
+        \\
+    ,
+        "1000000\t1\t3\n",
+    );
+}
+
+test "grid e2e: a float into an int grid deflates, and the value still lands" {
+    try expectProgram(
+        \\local m = { {1,2}, {3,4} }
+        \\m[1][1] = 9          -- inflate (int grid)
+        \\m[2][2] = 1.5        -- type change → deflate, store nested
+        \\print(m[1][1], m[2][2], m[1][2], m[2][1])
+        \\
+    ,
+        "9\t1.5\t2\t3\n",
+    );
+}
+
+test "grid e2e: bare row access deflates yet stays correct (pairs, escape, equality)" {
+    try expectProgram(
+        \\local m = { {10,20}, {30,40} }
+        \\m[1][1] = 11                 -- inflate
+        \\local row = m[1]             -- bare access ⇒ deflate; row is a real table
+        \\row[2] = 22                  -- mutating the escaped row is visible in m
+        \\local sum = 0
+        \\for _,v in ipairs(m[1]) do sum = sum + v end
+        \\print(m[1][1], m[1][2], sum, m[1] == m[1], m[2][2])
+        \\
+    ,
+        "11\t22\t33\ttrue\t40\n",
+    );
+}
+
+test "grid e2e: table.insert on the matrix deflates and appends a whole row" {
+    try expectProgram(
+        \\local m = { {1,2}, {3,4} }
+        \\m[1][1] = 9                  -- inflate
+        \\table.insert(m, {5,6})       -- bare op on the matrix ⇒ deflate
+        \\print(#m, m[3][1], m[3][2], m[1][1])
+        \\
+    ,
+        "3\t5\t6\t9\n",
+    );
+}
+
+test "grid e2e: an in-place row swap (the motivating counterexample) stays correct" {
+    // `tmp = a[i]` is a bare access ⇒ the grid deflates and `tmp` is a real row
+    // table, so the stale-alias hazard the gate was designed to avoid cannot arise.
+    try expectProgram(
+        \\local a = { {1,2,3}, {4,5,6} }
+        \\a[1][1] = 10                 -- inflate
+        \\local tmp = a[1]             -- bare access ⇒ deflate; tmp aliases the real row
+        \\a[1] = a[2]
+        \\a[2] = tmp
+        \\print(a[1][1], a[1][3], a[2][1], a[2][3])
+        \\
+    ,
+        "4\t6\t10\t3\n",
+    );
+}
+
+test "grid e2e: table.sort over rows by a key deflates and orders correctly" {
+    try expectProgram(
+        \\local a = { {3,30}, {1,10}, {2,20} }
+        \\a[1][1] = 3                  -- inflate (no-op value, just to flatten)
+        \\table.sort(a, function(x,y) return x[1] < y[1] end)
+        \\print(a[1][1], a[2][1], a[3][1], a[1][2], a[3][2])
+        \\
+    ,
+        "1\t2\t3\t10\t30\n",
     );
 }

@@ -932,6 +932,120 @@ pub const ArrayPart = extern struct {
         }
     }
 
+    // ---- grid reshape (doc 14, Phase 4b) — grow on overflow, never deflate ----
+    //
+    // Bart's escape model: a fused `a[i][j]=v` store whose `j` outruns the current
+    // `stride`, or whose integer outgrows the current `grid_elem`, **grows the grid**
+    // (geometrically, so amortised O(1)/cell — the array-growth philosophy), rather
+    // than deflating. Only a genuine *type* change (a float into an int grid, a
+    // non-numeric leaf) deflates; that decision lives in the interpreter, which calls
+    // these reshapes when the family is preserved.
+
+    /// Grow the grid's column count (`stride`) to at least `min_stride`,
+    /// geometrically (repeated single-column extensions stay amortised O(1)/cell,
+    /// mirroring `ensureCapacity`'s row growth). Re-lays the row-major `data` buffer
+    /// and the per-cell presence bitmap into the wider stride; `row_len`, `len`,
+    /// `cap`, and `grid_elem` are unchanged, and the new trailing cells of each row
+    /// are holes. OOM-atomic: on failure the grid is left exactly as it was.
+    pub fn gridGrowStride(self: *ArrayPart, gpa: std.mem.Allocator, min_stride: usize) std.mem.Allocator.Error!void {
+        std.debug.assert(self.isGrid());
+        if (min_stride <= self.stride) return;
+        const old_stride = self.stride;
+        const rows = self.cap;
+
+        // Geometric: at least double, but jump straight to `min_stride` if larger.
+        var new_stride = if (old_stride == 0) @as(usize, 1) else old_stride;
+        while (new_stride < min_stride) new_stride = new_stride *| 2;
+
+        // Overflow-guard the new cell count and its byte size (initGrid's guard).
+        const max_cells = std.math.maxInt(usize) / @sizeOf(Value);
+        if (rows != 0 and new_stride > max_cells / rows) return error.OutOfMemory;
+        const new_cells = gridCells(rows, new_stride);
+        if (new_cells > max_cells) return error.OutOfMemory;
+
+        const new_data = try allocData(gpa, self.grid_elem, new_cells);
+        errdefer if (new_data) |nd| gpa.free(nd[0..dataBytes(self.grid_elem, new_cells)]);
+        const new_present = try allocPresence(gpa, new_cells);
+
+        // Re-lay each row from `old_stride` to `new_stride`: bulk-copy its data bytes
+        // (grid cells are whole-byte fixed-width lanes — `cell_bytes >= 1`), then move
+        // each present bit to its new flat index (cell indices shift with the stride).
+        if (self.data) |old_data| {
+            const cell_bytes = dataBytes(self.grid_elem, 1);
+            const old_present = self.present.?;
+            var row: usize = 0;
+            while (row < rows) : (row += 1) {
+                const old_base = row * old_stride;
+                const new_base = row * new_stride;
+                if (old_stride > 0) {
+                    const nbytes = old_stride * cell_bytes;
+                    @memcpy(
+                        new_data.?[new_base * cell_bytes ..][0..nbytes],
+                        old_data[old_base * cell_bytes ..][0..nbytes],
+                    );
+                }
+                var col: usize = 0;
+                while (col < old_stride) : (col += 1) {
+                    if (getBit(old_present, old_base + col)) setBit(new_present.?, new_base + col, true);
+                }
+            }
+        }
+
+        // Free old buffers, commit the wider stride.
+        const old_cells = gridCells(self.cap, old_stride);
+        if (self.data) |d| gpa.free(d[0..dataBytes(self.grid_elem, old_cells)]);
+        if (self.present) |p| gpa.free(p[0..presenceBytes(old_cells)]);
+        self.data = new_data;
+        self.present = new_present;
+        self.stride = new_stride;
+    }
+
+    /// Widen the grid's cell lane (`grid_elem`) to `target` — a strictly wider lane
+    /// in the **same numeric family** (the int ladder; never int↔float, which is a
+    /// type change the interpreter handles by deflating). Re-encodes every present
+    /// cell through a logical `Value`; `stride`/`row_len`/`len`/`cap` and the cell
+    /// layout (hence the presence bitmap) are unchanged — only the per-cell byte
+    /// width grows. OOM-atomic. The grid analogue of the scalar `widenFor`.
+    pub fn gridWidenElem(self: *ArrayPart, gpa: std.mem.Allocator, target: Lane) std.mem.Allocator.Error!void {
+        std.debug.assert(self.isGrid());
+        std.debug.assert(target.usesPresenceBitmap() and target != self.grid_elem);
+        const cells = gridCells(self.cap, self.stride);
+
+        const new_data = try allocData(gpa, target, cells);
+        errdefer if (new_data) |nd| gpa.free(nd[0..dataBytes(target, cells)]);
+
+        // Re-encode present cells; the shared presence bitmap is reused as-is (cell
+        // positions don't move), so absent cells stay holes.
+        if (self.data) |old_data| {
+            const present = self.present.?;
+            var idx: usize = 0;
+            while (idx < cells) : (idx += 1) {
+                if (getBit(present, idx)) {
+                    const v = decodeGridCell(self.grid_elem, old_data, present, idx);
+                    encodeGridCell(target, new_data.?, present, idx, v);
+                }
+            }
+            gpa.free(old_data[0..dataBytes(self.grid_elem, cells)]);
+        }
+        self.data = new_data;
+        self.grid_elem = target;
+    }
+
+    /// The strictly-wider integer cell lane needed to hold `v` (an integer that does
+    /// not fit the current int `grid_elem`), or `null` when `v` cannot be
+    /// accommodated by an in-family widen — a float (int↔float is a type change), a
+    /// non-number, or a grid already on `.f64` (an int into a float grid changes the
+    /// cell's observable subtype). The interpreter deflates in the `null` case.
+    /// Mirrors `widenFor`'s int-ladder arm exactly.
+    pub fn gridWidenTargetForInt(grid_elem: Lane, v: Value) ?Lane {
+        if (!v.isInt()) return null;
+        return switch (grid_elem) {
+            .i8, .i16, .i32, .i64 => intLaneFor(v.asInt(), v.asInt()),
+            .u8 => intLaneFor(@min(0, v.asInt()), @max(255, v.asInt())),
+            else => null, // .f64 (subtype change) or a non-int leaf lane
+        };
+    }
+
     /// Decode packed grid cell `idx` (flat 0-based) at fixed-width bitmap lane
     /// `lane`. Mirrors the scalar `decode` int/float arms exactly (shared
     /// `readInt`/`getBit`), so a grid cell round-trips byte-identically to a scalar
@@ -1611,6 +1725,91 @@ test "grid: initGrid is OOM-safe at every allocation point (no leak, no bad free
             defer g.deinit(gpa);
             g.gridSet(1, 1, Value.float(2.5));
             try testing.expectEqual(@as(f64, 2.5), g.gridGet(1, 1).asFloat());
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Inner.run, .{});
+}
+
+test "grid reshape: gridGrowStride preserves cells/holes/row_len, grows geometrically" {
+    const gpa = testing.allocator;
+    var g = try ArrayPart.initGrid(gpa, 3, 2, .i16);
+    defer g.deinit(gpa);
+
+    // Fill a jagged shape across the original stride 2.
+    g.gridSet(0, 0, Value.int(10));
+    g.gridSet(0, 1, Value.int(11));
+    g.gridSet(1, 0, Value.int(20)); // row 1 length 1; col 1 a hole
+    g.gridSet(2, 1, Value.int(31)); // row 2: col 0 hole, col 1 present (row_len 2)
+    try testing.expectEqual(@as(usize, 2), g.gridRowLen(0));
+    try testing.expectEqual(@as(usize, 1), g.gridRowLen(1));
+    try testing.expectEqual(@as(usize, 2), g.gridRowLen(2));
+
+    // Need column index 4 (1-based 5) → grow. Geometric: 2 → 4 → 8 covers >=5.
+    try g.gridGrowStride(gpa, 5);
+    try testing.expectEqual(@as(usize, 8), g.stride);
+
+    // Every prior cell, hole, and per-row length survives the re-lay.
+    try testing.expectEqual(@as(i64, 10), g.gridGet(0, 0).asInt());
+    try testing.expectEqual(@as(i64, 11), g.gridGet(0, 1).asInt());
+    try testing.expectEqual(@as(i64, 20), g.gridGet(1, 0).asInt());
+    try testing.expect(g.gridGet(1, 1).isNil());
+    try testing.expect(g.gridGet(2, 0).isNil());
+    try testing.expectEqual(@as(i64, 31), g.gridGet(2, 1).asInt());
+    try testing.expectEqual(@as(usize, 2), g.gridRowLen(0));
+    try testing.expectEqual(@as(usize, 1), g.gridRowLen(1));
+    try testing.expectEqual(@as(usize, 2), g.gridRowLen(2));
+    // New trailing columns are holes; now addressable.
+    var c: usize = 2;
+    while (c < 8) : (c += 1) try testing.expect(g.gridGet(0, c).isNil());
+
+    // A no-op grow (min_stride <= stride) leaves it untouched.
+    try g.gridGrowStride(gpa, 3);
+    try testing.expectEqual(@as(usize, 8), g.stride);
+}
+
+test "grid reshape: gridWidenElem re-encodes cells into a wider int lane" {
+    const gpa = testing.allocator;
+    var g = try ArrayPart.initGrid(gpa, 2, 2, .u8);
+    defer g.deinit(gpa);
+    g.gridSet(0, 0, Value.int(5));
+    g.gridSet(0, 1, Value.int(250));
+    g.gridSet(1, 1, Value.int(7)); // (1,0) stays a hole
+
+    // A store of 1000 (> u8) needs the next signed lane covering [0,255] ∪ {1000}.
+    const target = ArrayPart.gridWidenTargetForInt(g.grid_elem, Value.int(1000)).?;
+    try testing.expectEqual(Lane.i16, target);
+    try g.gridWidenElem(gpa, target);
+    try testing.expectEqual(Lane.i16, g.grid_elem);
+
+    // Values round-trip; the hole stays a hole; row_len unchanged.
+    try testing.expectEqual(@as(i64, 5), g.gridGet(0, 0).asInt());
+    try testing.expectEqual(@as(i64, 250), g.gridGet(0, 1).asInt());
+    try testing.expect(g.gridGet(1, 0).isNil());
+    try testing.expectEqual(@as(i64, 7), g.gridGet(1, 1).asInt());
+    // The widened lane now stores the value that didn't fit before.
+    g.gridSet(1, 0, Value.int(1000));
+    try testing.expectEqual(@as(i64, 1000), g.gridGet(1, 0).asInt());
+}
+
+test "grid reshape: gridWidenTargetForInt refuses cross-family / non-int widens" {
+    // Float into an int grid, or any value into an f64 grid, has no in-family widen.
+    try testing.expectEqual(@as(?Lane, null), ArrayPart.gridWidenTargetForInt(.i32, Value.float(1.0)));
+    try testing.expectEqual(@as(?Lane, null), ArrayPart.gridWidenTargetForInt(.f64, Value.int(1)));
+    try testing.expectEqual(@as(?Lane, null), ArrayPart.gridWidenTargetForInt(.i32, Value.boolean(true)));
+    // An int that outgrows i8 climbs the signed ladder.
+    try testing.expectEqual(@as(?Lane, .i16), ArrayPart.gridWidenTargetForInt(.i8, Value.int(1000)));
+}
+
+test "grid reshape: gridGrowStride is OOM-safe (grid intact on failure)" {
+    const Inner = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var g = try ArrayPart.initGrid(gpa, 3, 2, .i32);
+            defer g.deinit(gpa);
+            g.gridSet(0, 0, Value.int(1));
+            g.gridSet(2, 1, Value.int(9));
+            try g.gridGrowStride(gpa, 6);
+            try testing.expectEqual(@as(i64, 1), g.gridGet(0, 0).asInt());
+            try testing.expectEqual(@as(i64, 9), g.gridGet(2, 1).asInt());
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Inner.run, .{});

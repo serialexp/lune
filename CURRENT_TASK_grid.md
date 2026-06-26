@@ -37,19 +37,27 @@ and persistent-alias fail this. Gating (no bare row_view ever) avoids it.
    fuses chained `a[i][j]` / `a[i][j]=v`; interp handlers do the two-step access
    via indexGet/indexSet. 3 expectProgram tests (chained get/set, inner
    __index/__newindex dispatch, eval order). Recorder aborts on them until P8.
-2. [ ] **Phase 4b — inflation in the fused store path.** `set_index2` on a
-   homogeneous-numeric nested `a` calls `inflateToGrid`; fused ops then hit grid
-   cells directly. Don't-retry flag for hysteresis.
-3. [ ] **Phase 4c — bare access deflates.** Bare `get_index`/`set_index` on a
-   grid calls `deflateGrid` then proceeds nested. Replace the Phase 3
-   `Unimplemented` stubs with deflation. Now grids are produced AND safe.
-4. [ ] **Phase 5 — `expectProgram` sweep (8 modes + GC stress).** matrix
-   fill/read, jagged, **row swap/sort**, `a[i]==a[i]`, row escapes (function arg
-   / table store) deflate, `#a[i]`, `pairs`/`ipairs`.
-5. [ ] **Phase 6 — GC under stress with grids live** (largely already satisfied).
+2. [x] **Phase 4b — inflation in the fused store path.** DONE (green). `fusedStore`
+   inflates a homogeneous-numeric nested `a` on the first `a[i][j]=v`; cells then
+   hit the grid directly. **Reshape-on-overflow** (Bart): column past `stride` →
+   `gridGrowStride` (geometric); int past the cell lane → `gridWidenElem`. Only a
+   type change deflates. `Table.no_grid` hysteresis bounds the scan + stops thrash.
+3. [x] **Phase 4c — bare access deflates.** DONE (green). Bare `indexGet`/`indexSet`
+   on a grid deflates first; Phase 3 `Unimplemented` stubs replaced. stdlib
+   `tableArg` (table/base/basic/string) + `iterableArg` deflate on entry, so
+   `table.*`, `raw*`, `setmetatable`, `next`/`pairs`/`ipairs` see real rows.
+4. [x] **Phase 5 — `expectProgram` sweep (10 modes + GC stress).** DONE (green). 8
+   grid e2e tests: fill/read+compute, stride-grow, lane-widen, type-change deflate,
+   row escape+mutate+ipairs+`a[1]==a[1]`, `table.insert`, **in-place row swap**,
+   `table.sort` by key. Plus 2 gate + 1 inflation/reshape direct unit tests.
+5. [x] **Phase 6 — GC under stress with grids live.** DONE — the Phase 5 e2e tests
+   run with `gc_stress=true` (collect at every safepoint) while grids inflate/
+   deflate mid-program; green ⇒ no wrong-collect, no row-table leak on deflate.
 6. [ ] **Phase 7 — determinism + keyframe** (deflate/skip grids at capture).
-7. [ ] **Phase 8 — recorder fast path** (the perf win).
-8. [ ] Doc 14 → Done as phases land; inventory if needed. Commit the arc.
+7. [ ] **Phase 8 — recorder fast path** (the perf win; grids currently abort
+   recording on `get_index2`/`set_index2` ⇒ correct but tier-0).
+8. [x] Doc 14 updated (4b/4c/5/6 → Done, status header). No inventory change (no
+   stdlib function added/renamed). Next: commit the arc.
 
 ## Notes
 - Under the gate, Phase 1 `row_view` Value + Phase 3 `rowViewGet/Set/Len` become
