@@ -27,7 +27,26 @@ pub const Tag = enum(u8) {
     float,
     /// Pointer to a GC object; payload is a `*GcHeader`.
     heap_ref,
+    /// A **transient** handle to one row of a flattened nested-array grid
+    /// (`docs/design/14-nested-array-flattening.md`). NOT a heap object: the
+    /// 8-byte payload packs the parent table's `*GcHeader` (low 48 bits) and the
+    /// 0-based row index (high 16 bits) — so a `RowView` allocates nothing and a
+    /// hot `a[i][j]` loop stays allocation-free. Identity is **structural**
+    /// (`parent.id`, `row`), never an address, so `a[i] == a[i]` and
+    /// row-as-hash-key are deterministic. A `RowView` must never persist in the
+    /// heap: the instant it would be stored into a heap slot it inflates to a
+    /// real `Table` (copy-out), which is what keeps the grid from being pinned.
+    /// The 16-bit row field caps a grid at 65536 rows; wider arrays stay nested.
+    row_view,
 };
+
+/// Low-48-bit mask: the parent `*GcHeader` of a `row_view`, recovered from the
+/// packed payload. User-space heap pointers are canonical with the top 16 bits
+/// clear, so masking round-trips the pointer; the freed high 16 bits hold `row`.
+pub const row_view_ptr_mask: u64 = (1 << 48) - 1;
+/// Maximum row index a `row_view` can address (high 16 bits of the payload).
+/// A grid with more rows than this stays nested rather than flattening.
+pub const row_view_max_row: u32 = (1 << 16) - 1;
 
 /// The 8-byte payload. Untagged — the `Value.tag` selects the active field.
 /// `extern union` for a defined, stable layout (the serializer reads `bits`).
@@ -67,6 +86,16 @@ pub const Value = extern struct {
         return .{ .tag = .heap_ref, .payload = .{ .ptr = ptr } };
     }
 
+    /// A transient row handle into a flattened grid. `parent` is the grid-bearing
+    /// table's header; `row` is the 0-based row index (must be `<=
+    /// row_view_max_row`). See the `row_view` tag doc. Allocates nothing.
+    pub fn rowView(parent: *GcHeader, row: u32) Value {
+        std.debug.assert(row <= row_view_max_row);
+        const ptr_bits: u64 = @intFromPtr(parent);
+        std.debug.assert(ptr_bits & ~row_view_ptr_mask == 0); // canonical user-space ptr
+        return .{ .tag = .row_view, .payload = .{ .bits = (@as(u64, row) << 48) | ptr_bits } };
+    }
+
     // ---- predicates ----
 
     pub fn isNil(self: Value) bool {
@@ -91,6 +120,22 @@ pub const Value = extern struct {
 
     pub fn isHeap(self: Value) bool {
         return self.tag == .heap_ref;
+    }
+
+    pub fn isRowView(self: Value) bool {
+        return self.tag == .row_view;
+    }
+
+    /// The parent grid table's header for a `row_view` (low 48 bits of payload).
+    pub fn rowViewParent(self: Value) *GcHeader {
+        std.debug.assert(self.tag == .row_view);
+        return @ptrFromInt(self.payload.bits & row_view_ptr_mask);
+    }
+
+    /// The 0-based row index for a `row_view` (high 16 bits of payload).
+    pub fn rowViewRow(self: Value) u32 {
+        std.debug.assert(self.tag == .row_view);
+        return @intCast(self.payload.bits >> 48);
     }
 
     /// Lua-shaped truthiness: only `nil` and `false` are falsy. `0`, `""`, and
@@ -157,6 +202,8 @@ pub const Value = extern struct {
                 .host => "userdata",
                 _ => "value",
             },
+            // A grid row is observationally a table.
+            .row_view => "table",
         };
     }
 
@@ -185,6 +232,12 @@ pub const Value = extern struct {
             .nil => true,
             .boolean => self.asBool() == other.asBool(),
             .heap_ref => self.asHeap().id == other.asHeap().id,
+            // Structural identity: same parent table (by id, not address) and
+            // same row. Two `RowView`s into the same grid row are `==`, and a
+            // `RowView` never equals a heap table (tags differ → handled above),
+            // which is correct because an escaped row inflates to its own table.
+            .row_view => self.rowViewParent().id == other.rowViewParent().id and
+                self.rowViewRow() == other.rowViewRow(),
             // numbers handled above
             .int, .float => unreachable,
         };
@@ -340,4 +393,46 @@ test "eql: i64 extremes vs f64 out of range" {
     try std.testing.expect(!max.eql(Value.float(9223372036854775808.0)));
     try std.testing.expect(!Value.int(0).eql(Value.float(std.math.inf(f64))));
     try std.testing.expect(!Value.int(0).eql(Value.float(std.math.nan(f64))));
+}
+
+test "rowView: packs (parent, row), round-trips, and is observationally a table" {
+    // Two distinct parent headers with stable ids (as the heap would assign).
+    var h1 = GcHeader.init(.table);
+    h1.id = 11;
+    var h2 = GcHeader.init(.table);
+    h2.id = 22;
+
+    const rv = Value.rowView(&h1, 7);
+    // Pack/unpack round-trips both fields, no allocation.
+    try std.testing.expect(rv.isRowView());
+    try std.testing.expect(!rv.isHeap()); // distinct tag — never confused with a real table
+    try std.testing.expectEqual(@as(*GcHeader, &h1), rv.rowViewParent());
+    try std.testing.expectEqual(@as(u32, 7), rv.rowViewRow());
+    // Observationally a table, and truthy (Lua: only nil/false are falsy).
+    try std.testing.expectEqualStrings("table", rv.typeName());
+    try std.testing.expect(rv.isTruthy());
+}
+
+test "rowView eql: structural identity by (parent id, row)" {
+    var h1 = GcHeader.init(.table);
+    h1.id = 1;
+    var h2 = GcHeader.init(.table);
+    h2.id = 2;
+
+    // Same parent + same row → equal (a[i] == a[i]).
+    try std.testing.expect(Value.rowView(&h1, 3).eql(Value.rowView(&h1, 3)));
+    // Same parent, different row → not equal.
+    try std.testing.expect(!Value.rowView(&h1, 3).eql(Value.rowView(&h1, 4)));
+    // Different parent, same row → not equal.
+    try std.testing.expect(!Value.rowView(&h1, 3).eql(Value.rowView(&h2, 3)));
+    // A row handle never equals a real heap table (tags differ).
+    try std.testing.expect(!Value.rowView(&h1, 0).eql(Value.heap(&h1)));
+}
+
+test "rowView: max row index round-trips (16-bit row field)" {
+    var h = GcHeader.init(.table);
+    h.id = 5;
+    const rv = Value.rowView(&h, row_view_max_row);
+    try std.testing.expectEqual(row_view_max_row, rv.rowViewRow());
+    try std.testing.expectEqual(@as(*GcHeader, &h), rv.rowViewParent());
 }

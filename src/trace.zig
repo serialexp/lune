@@ -2562,6 +2562,10 @@ fn obsTypeOf(v: Value) ObsType {
         .int => .int,
         .float => .float,
         .heap_ref => .heap,
+        // TODO(Phase 8, doc 14): the fused grid-index path observes grid rows
+        // directly; until it lands the recorder never sees a `row_view` operand
+        // (grids are disabled), so this is unreachable.
+        .row_view => unreachable,
     };
 }
 
@@ -2592,6 +2596,8 @@ fn konstKey(v: Value) KonstKey {
             .int => @bitCast(v.asInt()),
             .float => @bitCast(v.asFloat()),
             .heap_ref => @intFromPtr(v.asHeap()),
+            // Never a trace constant (runtime transient).
+            .row_view => unreachable,
         },
     };
 }

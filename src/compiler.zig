@@ -1478,6 +1478,8 @@ fn sameConstant(a: Value, b: Value) bool {
         .nil => true,
         .boolean, .int, .float => a.payload.bits == b.payload.bits,
         .heap_ref => a.payload.ptr == b.payload.ptr,
+        // A grid row handle is a runtime transient, never a compiled constant.
+        .row_view => unreachable,
     };
 }
 

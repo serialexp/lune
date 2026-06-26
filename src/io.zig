@@ -172,6 +172,10 @@ pub fn writeValue(w: *Writer, v: Value) Writer.Error!void {
                 v.asHeap().id,
             }),
         },
+        // A transient grid row handle. Diagnostic form only — Phase 3 makes
+        // `tostring(a[i])` render exactly like a table. Identity is the parent's
+        // stable id + the row, never an address (determinism).
+        .row_view => try w.print("table: 0x{x}#{d}", .{ v.rowViewParent().id, v.rowViewRow() }),
     }
 }
 

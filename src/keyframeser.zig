@@ -67,6 +67,12 @@ pub fn toSchemaValue(v: Value) schema.SnapValue {
         .int => .{ .tag = @intFromEnum(value.Tag.int), .body = .{ .ConstInt = .{ .v = v.asInt() } } },
         .float => .{ .tag = @intFromEnum(value.Tag.float), .body = .{ .ConstFloat = .{ .v = v.asFloat() } } },
         .heap_ref => .{ .tag = @intFromEnum(value.Tag.heap_ref), .body = .{ .HeapRef = .{ .id = v.asHeap().id } } },
+        // TODO(Phase 7, doc 14): a `row_view` can only reach a snapshot if it is
+        // live in a register at a snapshot point. Either prove that never happens
+        // (rows are consumed within one expression, snapshots fall on safe
+        // boundaries) or serialize it as (parent id, row). Unreachable today:
+        // grids are not yet enabled, so no `row_view` is ever produced.
+        .row_view => unreachable,
     };
 }
 

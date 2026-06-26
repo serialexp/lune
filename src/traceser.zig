@@ -54,6 +54,8 @@ pub fn toSchemaConst(v: Value) error{UnsupportedConst}!schema.ConstValue {
                 .body = .{ .ConstString = .{ .v = string.String.fromHeader(hdr).bytes() } },
             };
         },
+        // A grid row handle is a runtime transient, never a trace constant.
+        .row_view => return error.UnsupportedConst,
     };
 }
 
@@ -373,5 +375,9 @@ test "wire enum ordinals are a pinned contract (mirrored by viz/src/enums.ts)" {
     try testing.expectEqual(@as(u8, 2), @intFromEnum(Tag.int));
     try testing.expectEqual(@as(u8, 3), @intFromEnum(Tag.float));
     try testing.expectEqual(@as(u8, 4), @intFromEnum(Tag.heap_ref));
-    try testing.expectEqual(@as(usize, 5), @typeInfo(Tag).@"enum".field_names.len);
+    // 5: transient grid row handle (doc 14), appended so existing wire ordinals
+    // 0..4 are undisturbed. Never serialized (inflates to a table first), but the
+    // ordinal is pinned to keep value.Tag and enums.ts in lockstep.
+    try testing.expectEqual(@as(u8, 5), @intFromEnum(Tag.row_view));
+    try testing.expectEqual(@as(usize, 6), @typeInfo(Tag).@"enum".field_names.len);
 }

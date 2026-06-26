@@ -152,6 +152,9 @@ pub fn toEffectResult(v: Value) DecodeError!schema.EffectResult {
             .{ .tag = 4, .body = .{ .ConstString = .{ .v = string.String.fromHeader(v.asHeap()).bytes() } } }
         else
             error.UnsupportedEffectResult,
+        // A grid row handle is never an effect result (effects return scalars or
+        // strings); reaching here is a serializer-side bug.
+        .row_view => error.UnsupportedEffectResult,
     };
 }
 

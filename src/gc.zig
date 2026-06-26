@@ -226,7 +226,16 @@ pub const Heap = struct {
 
     /// Mark a `Value` if it references a heap object (scalars are no-ops).
     pub fn markValue(self: *Heap, v: Value) void {
-        if (v.isHeap()) self.markHeader(v.asHeap());
+        if (v.isHeap()) {
+            self.markHeader(v.asHeap());
+        } else if (v.isRowView()) {
+            // A transient grid row handle (doc 14) keeps its parent grid table
+            // alive while it is live in a register during a collection. The row
+            // is an index into the parent's buffer, so marking the parent covers
+            // the row's storage; there is no separate row object. Exercised once
+            // grids are enabled (Phase 6).
+            self.markHeader(v.rowViewParent());
+        }
     }
 
     /// Drain the gray worklist: blacken each object and grey its children, until

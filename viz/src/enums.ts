@@ -75,13 +75,17 @@ export const OBS_TYPE_NAMES = [
 
 export type ObsTypeName = (typeof OBS_TYPE_NAMES)[number];
 
-/** Value tags, indexed by wire ordinal (mirrors value.Tag, 0..4). */
+/** Value tags, indexed by wire ordinal (mirrors value.Tag, 0..5). */
 export const VALUE_TAG_NAMES = [
   "nil", // 0
   "boolean", // 1
   "int", // 2
   "float", // 3
   "heap_ref", // 4
+  // 5: a transient grid row handle (doc 14). Never actually serialized — it
+  // inflates to a real table before persisting — but the ordinal is reserved so
+  // the wire contract stays aligned with value.Tag.
+  "row_view", // 5
 ] as const;
 
 export type ValueTagName = (typeof VALUE_TAG_NAMES)[number];
