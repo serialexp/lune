@@ -9,7 +9,7 @@
 // (Future hardening: generate this file from Zig @typeInfo reflection so it
 // cannot drift at all — see docs/design/04-snapshot-replay-schema.md.)
 
-/** IR opcodes, indexed by wire ordinal (mirrors trace.IrOp, 0..47). */
+/** IR opcodes, indexed by wire ordinal (mirrors trace.IrOp, 0..55). */
 export const IR_OP_NAMES = [
   "slot_load", // 0
   "konst", // 1
@@ -59,6 +59,16 @@ export const IR_OP_NAMES = [
   "guard_pure", // 45
   "fsqrt", // 46
   "sar", // 47  (~>> arithmetic right shift; appended at the enum end)
+  // Flattened-grid cell access (doc 14, Phase 8); appended at the enum end so
+  // wire ordinals 0..47 are undisturbed.
+  "garow", // 48  (table, row) → row-base address
+  "gcell", // 49  (garow, col) → cell address
+  "gload", // 50  load grid cell
+  "gstore", // 51  store grid cell
+  "guard_grid", // 52  container still an int grid at the recorded element lane
+  "guard_stride", // 53  grid stride still equals the recorded value
+  "guard_gcol", // 54  column in [1, stride]
+  "guard_gpresent", // 55  cell present
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -117,6 +127,13 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "guard_hash",
   "guard_pure",
   "fsqrt",
+  // Single-operand grid ops (doc 14): the cell load + the four structural guards
+  // render `%a`. garow/gcell/gstore are two-operand and use the default `%a, %b`.
+  "gload",
+  "guard_grid",
+  "guard_stride",
+  "guard_gcol",
+  "guard_gpresent",
 ]);
 
 /** Map a raw wire ordinal to a name, falling back to `op:N` if out of range. */

@@ -356,9 +356,19 @@ test "wire enum ordinals are a pinned contract (mirrored by viz/src/enums.ts)" {
     try testing.expectEqual(@as(u8, 45), @intFromEnum(IrOp.guard_pure));
     try testing.expectEqual(@as(u8, 46), @intFromEnum(IrOp.fsqrt));
     try testing.expectEqual(@as(u8, 47), @intFromEnum(IrOp.sar));
+    // Flattened-grid cell access (doc 14, Phase 8), appended after `sar` so wire
+    // ordinals 0..47 are undisturbed.
+    try testing.expectEqual(@as(u8, 48), @intFromEnum(IrOp.garow));
+    try testing.expectEqual(@as(u8, 49), @intFromEnum(IrOp.gcell));
+    try testing.expectEqual(@as(u8, 50), @intFromEnum(IrOp.gload));
+    try testing.expectEqual(@as(u8, 51), @intFromEnum(IrOp.gstore));
+    try testing.expectEqual(@as(u8, 52), @intFromEnum(IrOp.guard_grid));
+    try testing.expectEqual(@as(u8, 53), @intFromEnum(IrOp.guard_stride));
+    try testing.expectEqual(@as(u8, 54), @intFromEnum(IrOp.guard_gcol));
+    try testing.expectEqual(@as(u8, 55), @intFromEnum(IrOp.guard_gpresent));
     // Exhaustiveness: if a member is added/removed, this count changes and forces
     // both this test and enums.ts to be revisited.
-    try testing.expectEqual(@as(usize, 48), @typeInfo(IrOp).@"enum".field_names.len);
+    try testing.expectEqual(@as(usize, 56), @typeInfo(IrOp).@"enum".field_names.len);
 
     const ObsType = trace.ObsType;
     try testing.expectEqual(@as(u8, 0), @intFromEnum(ObsType.unknown));

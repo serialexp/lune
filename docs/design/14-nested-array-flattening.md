@@ -8,11 +8,13 @@ fused indexing** (2026-06-26, Bart; see §Escape detection). Grids survive GC
 stress live, and determinism/replay is closed: a grid is never serialised
 (deflated to logical nested rows at capture, with **deterministic reserved-space
 row ids** so a mid-execution cut resumes byte-identically — Phase 7). Remaining:
-Phase 8 only (the trace-recorder fast path, where the locality win is cashed —
-grids today abort recording on `get_index2`/`set_index2`, so they run correctly
-but tier-0). Build size is explicitly *not* a blocker (see §Decision).
+Phase 8 Stage B only (native lowering). **Stage A landed**: the trace recorder now
+lowers `get_index2`/`set_index2` to a grid address chain behind grid guards and
+the tier-1a IR interpreter executes them byte-identically — grids tier up onto the
+oracle instead of aborting, with native codegen still bailing pending Stage B.
+Build size is explicitly *not* a blocker (see §Decision).
 Owner: Bart
-Last updated: 2026-06-26
+Last updated: 2026-06-27
 
 ## Implementation status
 
@@ -126,10 +128,30 @@ land; move whole sections to Done once everything inside is checked.
   resume corpus (resumes to a **byte-identical** final snapshot through a mid-grid
   cut) plus a 3-case single-VM round-trip test; both run across all 10 modes incl.
   `gc_stress`.
-- [ ] **Phase 8 — Trace recorder support.** Record `get_index2`/`set_index2` as
-  grid-relative address arithmetic (`base + (i*stride+j)`) behind `guard_grid` +
-  bounds + not-deflated guards, side-exiting to tier-0 when a row has deflated.
-  This is where the locality win is cashed.
+- [x] **Phase 8 Stage A — Trace recorder + tier-1a oracle.** The recorder lowers
+  `get_index2`/`set_index2` into the 2-op grid address chain
+  (`garow`(table,row) → `gcell`(garow,col)) behind `guard_grid` + `guard_stride` +
+  `guard_bounds` (row) + `guard_gcol` (col) + `guard_gpresent`, then `gload` /
+  (`guard_fits`+)`gstore` — int element lanes only; an f64 grid, a would-grow
+  (`col>stride`/new row) or would-widen store, or a not-yet-inflated nested table
+  all abort cleanly to tier-0. The tier-1a IR interpreter executes all eight ops
+  via the exact tier-0 grid reader/writer (`array.gridGet`/`gridSet`), so an
+  executed trace is byte-identical to tier-0. `tropt` classifies the ops
+  (`garow`/`gcell`→aref, `gload`→aload, `gstore`→astore, the four guards→guard;
+  grid_elem/stride join the guard dedup key) so LICM/CSE/DCE handle them. C1
+  deopt-replay safety: Stage A aborts a grid store after any heap read (no
+  store-sinking yet) — matmul's hot inner product is read-only, so this is free.
+  Native codegen bails (`proveKinds` rejects the grid ops → trace runs on the
+  tier-1a oracle). Verified: `grid_matmul` records 4 traces (no `get_index2`/
+  `set_index2` aborts) and is byte-identical across tier-0 / `--trace` /
+  `--trace-no-opt` / `--trace-record-only` / `--jit-native`; `just test` green;
+  traceser ordinal test + `viz/enums.ts` extended to ordinal 55.
+- [ ] **Phase 8 Stage B — Native lowering.** Teach `nativegen`
+  (`proveKinds`/`lower`/`analyze`/`isTransient`/`operandReads`/home-reservation) to
+  compile the eight grid ops to grid-relative address arithmetic
+  (`base + (row*stride + col)` at the cell lane) so the inner product runs as
+  native x64. This is where the matmul locality win is finally cashed; re-bench
+  `grid_matmul` against the recorded baseline (t0≈304ms, jit≈318ms, lj≈7.5ms).
 
 ## Why this exists
 

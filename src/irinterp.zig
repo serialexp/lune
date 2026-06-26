@@ -305,6 +305,49 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                     if (record) rec.value(i, values[i]);
                 },
 
+                // ---- flattened-grid cell access path (doc 14, Phase 8) ----
+                //
+                // `garow` pairs (table, row) and `gcell` pairs (garow, col); both
+                // carry no usable Value (the analogue of `aref`). The cell ops walk
+                // the chain to recover (table, row, col): `gcell.a` → garow,
+                // `garow.a` → table value, `garow.b` → row value, `gcell.b` → col
+                // value. Rows/cols are 1-based Lua indices; the grid API is 0-based.
+                .garow, .gcell => {
+                    values[i] = Value.nil();
+                    if (record) rec.value(i, values[i]);
+                },
+                // Read grid cell `(row,col)` via the exact tier-0 grid reader, so an
+                // executed trace reads byte-identical to tier-0. `guard_grid`,
+                // `guard_bounds` (row), `guard_gcol` (col), and `guard_gpresent` have
+                // all passed, so this hits a present cell of an int grid (the recorder
+                // restricts grids to int element lanes — doc 14 Phase 8a). The decoded
+                // cell is structurally an int (guaranteed by `grid_elem`), so unlike
+                // `hload` no tag recheck is needed.
+                .gload => {
+                    const gc = t.instrs[ins.a];
+                    const ga = t.instrs[gc.a];
+                    const tbl = table.Table.fromHeader(values[ga.a].asHeap());
+                    const row: usize = @intCast(values[ga.b].asInt() - 1);
+                    const col: usize = @intCast(values[gc.b].asInt() - 1);
+                    values[i] = tbl.array.gridGet(row, col);
+                    if (record) rec.value(i, values[i]);
+                },
+                // Write grid cell `(row,col)` in place via the exact tier-0 grid
+                // writer. `guard_grid`/`guard_stride`/`guard_bounds`/`guard_gcol`
+                // proved the cell is inside the grid (no grow) and `guard_fits` proved
+                // the value fits `grid_elem` (no widen), so this neither reshapes nor
+                // allocates. `b` is the value. Produces no value (store nil).
+                .gstore => {
+                    const gc = t.instrs[ins.a];
+                    const ga = t.instrs[gc.a];
+                    const tbl = table.Table.fromHeader(values[ga.a].asHeap());
+                    const row: usize = @intCast(values[ga.b].asInt() - 1);
+                    const col: usize = @intCast(values[gc.b].asInt() - 1);
+                    tbl.array.gridSet(row, col, values[ins.b]);
+                    values[i] = Value.nil();
+                    if (record) rec.value(i, values[i]);
+                },
+
                 // ---- hash-part (string-keyed) field access path (doc 11) ----
                 //
                 // `href` carries no usable Value — it only pairs (table, key konst)
@@ -504,6 +547,66 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                         if (record) rec.guardPass(i, values[ar.a]);
                     } else {
                         if (record) rec.exit(i, .guard, values[ar.a]);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
+
+                // ---- flattened-grid structural guards (doc 14, Phase 8) ----
+                //
+                // The container is still an int grid at the recorded element lane.
+                // A bare access would have deflated it (`lane != .grid`), and a
+                // monotonic widen of the cell lane (e.g. i8→i32) moves `grid_elem`
+                // past `aux` — either side-exits to tier-0, where the access runs on
+                // the materialised representation.
+                .guard_grid => {
+                    const tbl = table.Table.fromHeader(values[ins.a].asHeap());
+                    if (tbl.array.lane == .grid and @intFromEnum(tbl.array.grid_elem) == ins.aux) {
+                        if (record) rec.guardPass(i, values[ins.a]);
+                    } else {
+                        if (record) rec.exit(i, .guard, values[ins.a]);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
+                // The grid's column count still equals the recorded stride. A fused
+                // store whose column outran `stride` grows it (doc 14 reshape); the
+                // recorded address arithmetic (`row*stride + col`) is only valid for
+                // the pinned stride, so any change side-exits.
+                .guard_stride => {
+                    const tbl = table.Table.fromHeader(values[ins.a].asHeap());
+                    if (tbl.array.stride == @as(usize, @intCast(ins.aux))) {
+                        if (record) rec.guardPass(i, values[ins.a]);
+                    } else {
+                        if (record) rec.exit(i, .guard, values[ins.a]);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
+                // The column lands inside the row: `1 <= col <= stride`. Walk
+                // `gcell.a` → garow → table for the stride, `gcell.b` for the column.
+                .guard_gcol => {
+                    const gc = t.instrs[ins.a];
+                    const ga = t.instrs[gc.a];
+                    const tbl = table.Table.fromHeader(values[ga.a].asHeap());
+                    const col = values[gc.b].asInt();
+                    if (col >= 1 and col <= @as(i64, @intCast(tbl.array.stride))) {
+                        if (record) rec.guardPass(i, values[ga.a]);
+                    } else {
+                        if (record) rec.exit(i, .guard, values[ga.a]);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
+                // The addressed cell is present (a hole would read as nil, which the
+                // native int path cannot represent — the grid analogue of
+                // `guard_present`).
+                .guard_gpresent => {
+                    const gc = t.instrs[ins.a];
+                    const ga = t.instrs[gc.a];
+                    const tbl = table.Table.fromHeader(values[ga.a].asHeap());
+                    const row: usize = @intCast(values[ga.b].asInt() - 1);
+                    const col: usize = @intCast(values[gc.b].asInt() - 1);
+                    if (!tbl.array.gridGet(row, col).isNil()) {
+                        if (record) rec.guardPass(i, values[ga.a]);
+                    } else {
+                        if (record) rec.exit(i, .guard, values[ga.a]);
                         break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     }
                 },

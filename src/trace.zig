@@ -329,6 +329,80 @@ pub const IrOp = enum(u8) {
     /// producer). Appended last so every prior op's wire ordinal stays stable
     /// (the traceser ordinal-pinning convention — NEW ops go at the enum end).
     sar,
+
+    // ---- flattened-grid cell access (doc 14, Phase 8) -------------------------
+    //
+    // The mirror of `aref`/`aload`/`astore` for a table whose array part is a
+    // **flattened grid** (`lane == .grid`): a contiguous row-major buffer of
+    // `cap*stride` cells at the fixed-width `grid_elem` lane (i8/u8/i16/i32/i64;
+    // f64 deferred), with a per-cell presence bitmap. Reached ONLY by a fused
+    // `get_index2`/`set_index2` (`a[i][j]`) — the gate (doc 14 §Escape) keeps a
+    // grid from ever materialising a bare `row_view`, so these are the only grid
+    // accessors and the scalar `aref`/`aload`/`astore` (which go through the
+    // grid-hostile `tbl.getInt`/`setInLane`) never touch one.
+    //
+    // A cell needs (table, row, col) = three refs, which won't fit one 16-byte
+    // `IrInstr`, so the address is a **two-op chain**: `garow` pairs (table,row)
+    // and `gcell` pairs (garow,col). `aux` on every op below is the `grid_elem`
+    // `array.Lane` ordinal (a real fixed-width lane, so `nativegen.laneKind`/
+    // `intLaneWidth` classify it exactly like a scalar int lane).
+    //
+    /// `a`=table value ref, `b`=row index ref → grid row descriptor; carries no
+    /// usable `Value` (its operands are what `gcell` reads). Tier-1b materialises
+    /// `row0 = row-1`. The grid analogue of `aref`; classified `.aref` in
+    /// `tropt.kindOf` (same (a,b) operand shape). Bounds-checked by a `guard_bounds`
+    /// (a grid's `len == rows`, so the existing `1<=index<=len` body is the row
+    /// bound). Appended last so every prior op's wire ordinal stays stable.
+    garow,
+    /// `a`=`garow` ref, `b`=column index ref → the full grid cell descriptor.
+    /// Tier-1b materialises the flat row-major index `flat = row0*stride + (col-1)`
+    /// (the table is reached through `garow.a`, `stride` loaded live). Carries no
+    /// usable `Value`. Classified `.aref`. Appended last.
+    gcell,
+    /// `a`=`gcell` ref → decode the addressed grid cell to a `Value`. Tier-1a runs
+    /// the exact tier-0 reader `array.gridGet(row-1, col-1)` (byte-identical);
+    /// tier-1b loads `data + flat*width` at the `grid_elem` width. `aux`=grid_elem,
+    /// `ty`=observed scalar type. The grid analogue of `aload`; classified `.aload`.
+    /// Appended last.
+    gload,
+    /// `a`=`gcell` ref, `b`=value ref → encode `b` into the addressed grid cell.
+    /// Tier-1a runs `array.gridSet(row-1, col-1, v)`; tier-1b stores at the lane
+    /// width and sets the presence bit. Behind a dominating `guard_fits` (value in
+    /// `grid_elem`) and the cell's row/col bound guards. The recorder emits it only
+    /// for an in-grid, in-bounds, in-lane store (a grow/widen aborts to tier-0), so
+    /// it never reshapes/reallocs. Effectful (never DCE'd, an alias/CSE barrier).
+    /// The grid analogue of `astore`; classified `.astore`. Appended last.
+    gstore,
+    /// `a`=table value ref, `aux`=grid_elem ordinal → the table's array part is
+    /// still a grid at the recorded element lane (`lane == .grid && grid_elem ==
+    /// aux`). The grid's deflation + element-widen guard: a bare access deflates the
+    /// grid (lane flips off `.grid`) and `gridWidenElem` changes `grid_elem`; either
+    /// side-exits to tier-0. Produces no value; never DCE'd. Classified `.guard`.
+    /// `aux` is the recorded lane (semantic identity, like `guard_lane`). Appended last.
+    guard_grid,
+    /// `a`=table value ref, `aux`=recorded stride → the grid's column count is
+    /// unchanged (`stride == aux`). Pins stride so `gcell`'s `row0*stride` math
+    /// stays valid AND a `gridGrowStride` (which **reallocates** `data`/`present`)
+    /// side-exits before any hoisted base pointer dangles. Produces no value; never
+    /// DCE'd. Classified `.guard`; `aux` (the stride) is semantic identity. The
+    /// recorder aborts if the live stride exceeds `i32` (absurd for a real grid).
+    /// Appended last.
+    guard_stride,
+    /// `a`=`gcell` ref → the column index is in the grid's column extent
+    /// (`1 <= col <= stride`). The column-dimension analogue of `guard_bounds`
+    /// (which, on the `garow`, covers the row dimension). Reads `col` from `gcell.b`
+    /// and the table through `gcell.a`→`garow.a`. Together with the row bound this
+    /// proves the flat index lands in the correct cell (not merely `< cells`, which
+    /// would alias across rows). Produces no value; never DCE'd. Classified `.guard`.
+    /// Appended last.
+    guard_gcol,
+    /// `a`=`gcell` ref → the addressed grid cell is present (a hole reads as `nil`,
+    /// which the narrow int path can't represent). The grid analogue of
+    /// `guard_present` — but distinct because `guard_present`'s tier-1a body calls
+    /// the scalar `tbl.getInt`, which asserts `lane != .grid`. Tier-1a checks
+    /// `!array.gridGet(row-1,col-1).isNil()`; tier-1b `bt`s the presence bitmap at
+    /// the flat index. Produces no value; never DCE'd. Classified `.guard`. Appended last.
+    guard_gpresent,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -1515,6 +1589,11 @@ pub const TraceState = struct {
                 // `astore`/`astore_append` read the `aref` (`a`) and the value (`b`).
                 // `href` (table, key konst) and `hstore` (href, value) mirror them.
                 .aref, .astore, .astore_append, .href, .hstore => std.debug.assert(ins.a < i and ins.b < i),
+                // Grid cell access (doc 14, Phase 8): `garow` pairs (table,row),
+                // `gcell` pairs (garow,col), `gstore` reads (gcell, value) — all two
+                // prior operands. `gload` and the grid guards read one prior node.
+                .garow, .gcell, .gstore => std.debug.assert(ins.a < i and ins.b < i),
+                .gload, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent => std.debug.assert(ins.a < i),
                 // `aload` and the array-access guards read one prior node
                 // (the table value, or the `aref`). `guard_append` reads the `aref`.
                 // `hload`/`guard_hash` read the `href` (`a`).
@@ -1650,6 +1729,15 @@ pub const TraceState = struct {
                 try self.recHashSet(instr, regs)
             else
                 self.abort(.bad_type),
+
+            // Fused two-level access `a[i][j]` / `a[i][j]=v` (doc 14, Phase 8). We
+            // record ONLY when the container is already a flattened grid with an
+            // int element lane and the access is a present, in-bounds, in-lane cell
+            // — exactly the shape the grid native/oracle path models. Everything
+            // else (nested tables not yet inflated, a grow/widen store, an f64 grid)
+            // aborts to tier-0, which inflates / reshapes / runs the slow path.
+            .get_index2 => try self.recGridGet(instr, regs),
+            .set_index2 => try self.recGridSet(instr, regs),
 
             // Cluster sub-lever 1: a callee (or any loop-invariant value) reached
             // through an UPVALUE or GLOBAL. The executor cannot read these (no
@@ -2029,21 +2117,123 @@ pub const TraceState = struct {
         }
     }
 
-    /// C1 support: has *any* heap read — a packed-array `aload` OR a hash-field
-    /// `hload` (doc 11) — been recorded so far in this trace? Used by
-    /// `recArraySet`/`recHashSet` to decide whether a write is a read-modify-write
-    /// that must be deopt-sunk (deferred below every guard). This is the
-    /// conservative-sound C1 rule: in a straight-line trace any earlier read can
-    /// influence a later write through its value (data) or through a guard that
-    /// selected the path (control), and a side-exit replays the iteration against the
-    /// already-mutated heap. Rejecting on the mere presence of an earlier read covers
-    /// both channels without per-value taint reasoning. A pure-write loop (no
-    /// `aload`/`hload`, e.g. nsieve's sieve clear) is unaffected. Array and hash
-    /// loads are pooled because an `aload`-then-`hstore` (or vice versa) is just as
-    /// deopt-unsound as same-kind RMW.
+    /// Record `a[i][j]` (`get_index2`, `dst=a tab=b row=c col=aux`) as a flattened-
+    /// grid cell read (doc 14, Phase 8). Emits, in order: `guard_grid` + `guard_stride`
+    /// on the table, `guard_int` on row + col, the `garow`/`gcell` address chain with
+    /// `guard_bounds` (row) + `guard_gcol` (col), then `guard_gpresent` + `gload`.
+    /// Aborts (leaving tier-0 untouched) unless the container is already a grid with an
+    /// **int** element lane and the access is a *present, in-bounds* cell — every other
+    /// shape (a not-yet-inflated nested table, an f64 grid, an out-of-bounds/hole cell)
+    /// runs on tier-0.
+    fn recGridGet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        // Like recArrayGet: a grid load after a sunk store would read stale on-trace.
+        if (self.rec.pending_store_count > 0) return self.abort(.bad_type);
+        const col_reg: u16 = @intCast(instr.aux);
+        const vtab = regs.get(instr.b);
+        const vrow = regs.get(instr.c);
+        const vcol = regs.get(col_reg);
+        if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
+        if (!vrow.isInt() or !vcol.isInt()) return self.abort(.bad_type);
+        const tbl = table_mod.Table.fromHeader(vtab.asHeap());
+        if (tbl.metatable != null) return self.abort(.has_metatable);
+        const ap = &tbl.array;
+        if (ap.lane != .grid) return self.abort(.nyi_opcode); // not inflated → nested-table path (deferred)
+        if (!ap.grid_elem.isInt()) return self.abort(.nyi_opcode); // f64 grid deferred (int lanes first)
+        if (ap.stride > std.math.maxInt(i32)) return self.abort(.bad_type); // guard_stride aux is i32
+        const row = vrow.asInt();
+        const col = vcol.asInt();
+        if (row < 1 or row > @as(i64, @intCast(ap.gridRows()))) return self.abort(.bad_type);
+        if (col < 1 or col > @as(i64, @intCast(ap.stride))) return self.abort(.bad_type);
+        const loaded = ap.gridGet(@intCast(row - 1), @intCast(col - 1));
+        if (loaded.isNil()) return self.abort(.bad_type); // hole — not a profitable trace
+
+        const ge: i32 = @intFromEnum(ap.grid_elem);
+        const stride_aux: i32 = @intCast(ap.stride);
+        const rtab = try self.refOf(instr.b);
+        _ = try self.emit(.{ .op = .guard_grid, .a = rtab, .aux = ge });
+        _ = try self.emit(.{ .op = .guard_stride, .a = rtab, .aux = stride_aux });
+        const rrow = try self.refOf(instr.c);
+        try self.guardInt(rrow);
+        const rcol = try self.refOf(col_reg);
+        try self.guardInt(rcol);
+        const garow = try self.emit(.{ .op = .garow, .a = rtab, .b = rrow, .aux = ge });
+        _ = try self.emit(.{ .op = .guard_bounds, .a = garow }); // row in [1,rows] (grid len == rows)
+        const gcell = try self.emit(.{ .op = .gcell, .a = garow, .b = rcol, .aux = ge });
+        _ = try self.emit(.{ .op = .guard_gcol, .a = gcell }); // col in [1,stride]
+        _ = try self.emit(.{ .op = .guard_gpresent, .a = gcell });
+        const rload = try self.emit(.{ .op = .gload, .a = gcell, .aux = ge, .ty = obsTypeOf(loaded) });
+        self.setReg(instr.a, rload);
+    }
+
+    /// Record `a[i][j]=v` (`set_index2`, `tab=a row=b col=c val=aux`) as a flattened-
+    /// grid cell write (doc 14, Phase 8). Mirrors `recGridGet`'s addressing, then
+    /// `guard_fits` + `gstore`. Aborts unless the store is an in-grid, in-bounds,
+    /// in-lane cell write: a new row (`row>rows`) or column past `stride` would GROW
+    /// the grid, and an out-of-lane value would WIDEN it — both reshape/realloc the
+    /// flat buffer, which the on-trace store cannot do, so they run on tier-0 (the
+    /// guards then side-exit on a later iteration that would reshape). Phase 8a keeps
+    /// the C1 deopt-replay rule simple: a store after *any* heap read aborts (no
+    /// store-sinking yet) — matmul's hot inner loop is read-only, so this is free.
+    fn recGridSet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        const val_reg: u16 = @intCast(instr.aux);
+        const vtab = regs.get(instr.a);
+        const vrow = regs.get(instr.b);
+        const vcol = regs.get(instr.c);
+        const vval = regs.get(val_reg);
+        if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
+        if (!vrow.isInt() or !vcol.isInt()) return self.abort(.bad_type);
+        if (vval.isNil()) return self.abort(.bad_type); // hole-punch — out of scope
+        const tbl = table_mod.Table.fromHeader(vtab.asHeap());
+        if (tbl.metatable != null) return self.abort(.has_metatable);
+        const ap = &tbl.array;
+        if (ap.lane != .grid) return self.abort(.nyi_opcode);
+        if (!ap.grid_elem.isInt()) return self.abort(.nyi_opcode);
+        if (ap.stride > std.math.maxInt(i32)) return self.abort(.bad_type);
+        const row = vrow.asInt();
+        const col = vcol.asInt();
+        if (row < 1 or row > @as(i64, @intCast(ap.gridRows()))) return self.abort(.bad_type); // grow row → tier-0
+        if (col < 1 or col > @as(i64, @intCast(ap.stride))) return self.abort(.bad_type); // grow stride → tier-0
+        if (!arr.ArrayPart.laneFits(ap.grid_elem, vval)) return self.abort(.bad_type); // widen elem → tier-0
+        // C1 (deopt-replay idempotence): a store after any prior heap read could
+        // double-apply when a side-exit re-runs the iteration against the already-
+        // mutated grid. Phase 8a aborts rather than sinking (see recArraySet for the
+        // sinking machinery a later phase can extend to grids).
+        if (self.traceHasHeapLoad()) return self.abort(.bad_type);
+
+        const ge: i32 = @intFromEnum(ap.grid_elem);
+        const stride_aux: i32 = @intCast(ap.stride);
+        const rval = try self.refOf(val_reg);
+        const rtab = try self.refOf(instr.a);
+        _ = try self.emit(.{ .op = .guard_grid, .a = rtab, .aux = ge });
+        _ = try self.emit(.{ .op = .guard_stride, .a = rtab, .aux = stride_aux });
+        const rrow = try self.refOf(instr.b);
+        try self.guardInt(rrow);
+        const rcol = try self.refOf(instr.c);
+        try self.guardInt(rcol);
+        const garow = try self.emit(.{ .op = .garow, .a = rtab, .b = rrow, .aux = ge });
+        _ = try self.emit(.{ .op = .guard_bounds, .a = garow });
+        const gcell = try self.emit(.{ .op = .gcell, .a = garow, .b = rcol, .aux = ge });
+        _ = try self.emit(.{ .op = .guard_gcol, .a = gcell });
+        _ = try self.emit(.{ .op = .guard_fits, .a = rval, .aux = ge });
+        // No guard_gpresent: gstore *creates* presence (mirrors astore).
+        _ = try self.emit(.{ .op = .gstore, .a = gcell, .b = rval, .aux = ge });
+    }
+
+    /// C1 support: has *any* heap read — a packed-array `aload`, a hash-field
+    /// `hload` (doc 11), OR a grid-cell `gload` (doc 14) — been recorded so far in
+    /// this trace? Used by `recArraySet`/`recHashSet`/`recGridSet` to decide whether a
+    /// write is a read-modify-write that must be deopt-sunk (or, for grids in Phase 8a,
+    /// aborted). This is the conservative-sound C1 rule: in a straight-line trace any
+    /// earlier read can influence a later write through its value (data) or through a
+    /// guard that selected the path (control), and a side-exit replays the iteration
+    /// against the already-mutated heap. Rejecting on the mere presence of an earlier
+    /// read covers both channels without per-value taint reasoning. A pure-write loop
+    /// (no `aload`/`hload`/`gload`, e.g. nsieve's sieve clear) is unaffected. The three
+    /// load kinds are pooled because an `aload`-then-`hstore` (or any cross pair) is
+    /// just as deopt-unsound as same-kind RMW.
     fn traceHasHeapLoad(self: *const TraceState) bool {
         for (self.rec.instrs.items) |ins| {
-            if (ins.op == .aload or ins.op == .hload) return true;
+            if (ins.op == .aload or ins.op == .hload or ins.op == .gload) return true;
         }
         return false;
     }

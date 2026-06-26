@@ -121,6 +121,82 @@ clean yardstick; revisit scimark once the f64 grid lane lands in a later phase.
   bytecode only fuses 2-level today (`get_index2`), so 2-level is the natural cut.
 - (3) Whether to author a dedicated grid matmul microbench vs. driving scimark.
 
+## Phase 8 — CONCRETE IR DESIGN (decided 2026-06-27; int lanes, 2-level)
+
+After reading all four tiers, the encoding is fixed. The hard constraint:
+`IrInstr` carries only `.a`/`.b`/`.aux` (16 B), but a grid cell needs (table, row,
+col) = 3 refs. Resolved with a **2-op address chain** so nothing grows past two
+operands and `tropt.zig` needs only `kindOf` additions (the proven
+liveness/LICM/compaction switches dispatch on `kindOf` and already handle the
+`.aref`/`.aload`/`.astore`/`.guard` kinds generically):
+
+- `garow` — `.a=table, .b=row, .aux=grid_elem_ord` → pairs (table,row); tier-1b
+  materialises `row0 = row-1`. **kind `.aref`.**
+- `gcell` — `.a=garow, .b=col, .aux=grid_elem_ord` → the full cell token; tier-1b
+  materialises `flat = row0*stride + (col-1)` (walks `gcell.a→garow.a` for the
+  table, loads `stride` live). **kind `.aref`.**
+- `gload` — `.a=gcell, .aux=grid_elem_ord, .ty=obs` → tier-1a `array.gridGet(row-1,
+  col-1)`; tier-1b `data + flat*width` load. **kind `.aload`.**
+- `gstore` — `.a=gcell, .b=value, .aux=grid_elem_ord` → tier-1a `array.gridSet`;
+  tier-1b store + presence `bts`. **kind `.astore`.**
+- `guard_grid` — `.a=table, .aux=grid_elem_ord` → `lane==.grid && grid_elem==aux`.
+  The **deflation + elem-widen** guard (a deflate flips lane; `gridWidenElem`
+  changes grid_elem). **kind `.guard`.**
+- `guard_stride` — `.a=table, .aux=stride` → `stride==aux`. Pins stride so the
+  flat math is valid and a `gridGrowStride` (which **reallocates** data/present)
+  side-exits before any hoisted pointer goes stale. **kind `.guard`.**
+- `guard_gcol` — `.a=gcell` → `1 <= col <= stride` (reads `col` from `gcell.b`,
+  table via `gcell.a→garow.a`). The column-dimension bound. **kind `.guard`.**
+- `guard_gpresent` — `.a=gcell` → cell present (`!gridGet(...).isNil()` / `bt`).
+  **kind `.guard`.** (Can't reuse `guard_present`: its tier-1a body calls the
+  scalar `tbl.getInt`, which asserts `lane != .grid`.)
+
+**Reused unchanged:** `guard_bounds` on `garow` gives the **row** bound (its
+tier-1a body checks `1<=index<=len`, and a grid's `len==rows`); `guard_fits` on
+the store value (checks the value fits `grid_elem`). Why dedicated `gload`/`gstore`/
+`guard_gpresent` instead of reusing `aload`/`astore`/`guard_present`: those three
+re-derive through the **scalar** `tbl.getInt(idx)` / `setInLane(idx,v)` API, which
+asserts `lane != .grid` — the gate's whole point. So the grid needs its own
+cell-addressed load/store/present that call `array.gridGet/gridSet` (tier-1a) and
+flat addressing (tier-1b).
+
+Recorded sequence for a read `A[i][j]` (`get_index2 dst=a tab=b row=c col=aux`):
+```
+rtab = refOf(tab); guard_grid(rtab, ge); guard_stride(rtab, stride)
+ri = refOf(row); guardInt(ri);  rj = refOf(col); guardInt(rj)
+garow = aref-chain(rtab, ri, ge); guard_bounds(garow)      // row in [1,rows]
+gcell = gcell(garow, rj, ge); guard_gcol(gcell)            // col in [1,stride]
+guard_gpresent(gcell)
+gload(gcell, ge) → setReg(dst)
+```
+Store `C[i][j]=v` mirrors it with `guard_fits(rval, ge)` + `gstore` (and the same
+C1 deopt-replay rule as `astore`: abort if a prior grid/array load exists, or sink
+— Phase 8a keeps it simple and **aborts** the store-after-load case, like the
+single-store original; matmul's hot trace is the inner k-loop which only *reads*
+A and B, so this costs nothing). Record only when the observed container is
+already a grid with an **int** `grid_elem`; a would-grow (`col>stride`) or
+would-widen (`!fits`) store **aborts** (tier-0 reshapes; the guards then side-exit
+on later iterations). f64 grid_elem → abort (int lanes first).
+
+**Soundness of the guard set:** `guard_grid` catches deflate + elem-widen;
+`guard_stride` catches stride-grow (the realloc); `guard_bounds(garow)` + `guard_gcol`
+together prove `flat ∈ [0,rows*stride)` AND the right cell (per-dimension, not just
+`flat<cells` which would alias across rows); `guard_gpresent` catches holes;
+`guard_fits` catches lane-widen on stores. Any miss → side-exit to tier-0.
+
+**Staging (each independently `just test`-green):**
+- **Stage A — record + tier-1a oracle only; native BAILS.** Add the 8 ops
+  (enum/kindOf/guardKeyAux/guardConstPasses), tier-1a exec, recorder cases,
+  `assertWellFormed`, traceser ordinal test. `proveKinds` returns `false` on any
+  grid op → grid traces run on the tier-1a oracle. Since the oracle is ~tier-0
+  speed, the yield gate may retire them — net ≈ tier-0, no regression, but the
+  record/oracle path is exercised across 8/10 modes for correctness.
+- **Stage B — native lowering (the win).** `proveKinds`/`lower`/`isTransient`/
+  `operandReads`/home-reservation for the 8 ops: `garow`→`row-1`, `gcell`→
+  `row0*stride+(col-1)` (imul + load stride), `gload`/`gstore` flat addressing at
+  `grid_elem` width + presence `bt`/`bts`. Re-bench `grid_matmul` vs baseline
+  (t0=304ms, jit=318ms, lj=7.5ms).
+
 ## Notes
 - Under the gate, Phase 1 `row_view` Value + Phase 3 `rowViewGet/Set/Len` become
   dormant at runtime (kept green; fused ops compute cell addresses directly).
@@ -128,3 +204,41 @@ clean yardstick; revisit scimark once the f64 grid lane lands in a later phase.
 - GC already grid-safe: grid cells are narrow leaves → `blacken` skips them.
 - Collection only fires at the dispatch-loop safepoint (`Vm.collect`), never
   inside `newTable`/`link` → inflate/deflate are GC-atomic (verified gc.zig:26).
+
+## Stage A — LANDED (2026-06-27, `just test` green)
+
+The 8 ops + recorder + tier-1a oracle are in and committed:
+- `src/trace.zig`: 8 `IrOp`s appended after `sar` (ordinals 48–55);
+  `assertWellFormed`; `recGridGet`/`recGridSet` (emit the address chain +
+  guards; abort on non-grid / f64 grid / grow / widen / hole; Stage-A C1 = abort
+  store after any heap load); `traceHasHeapLoad` now pools `gload`.
+- `src/tropt.zig`: `kindOf` (garow/gcell→aref, gload→aload, gstore→astore, 4
+  guards→guard); `guardKeyAux` includes `guard_grid`(elem)/`guard_stride`(stride).
+- `src/irinterp.zig`: tier-1a exec for all 8 via `array.gridGet`/`gridSet` +
+  chain-walk guards (byte-identical to tier-0).
+- `src/troptdiag.zig`: dead-carry use-counting switches extended.
+- `src/traceser.zig`: ordinal test → 56 ops. `viz/src/enums.ts`: ordinals 48–55.
+- `nativegen.zig`: UNCHANGED — `proveKinds`'s `else => return false` already bails
+  on the grid ops, so grid traces run on the tier-1a oracle (`--dump-native`:
+  "unsupported — runs on the tier-1a interpreter").
+
+Verified: `grid_matmul` records 4 traces (the recorded IR shows the exact
+load/store chains), `--dump-aborts` shows NO `get_index2`/`set_index2` aborts
+(only the bare scalar init loop's `set_index`/`for_prep`), and output is
+byte-identical across tier-0 / `--trace` / `--trace-no-opt` /
+`--trace-record-only` / `--jit-native`.
+
+## Stage B — NEXT (the win)
+`nativegen` lowering for the 8 ops (see Stage B bullet above). Entry points to
+touch, mirroring the `aref`/`aload`/`astore` paths:
+- `proveKinds` (src/nativegen.zig ~346): admit the grid ops — `garow`/`gcell` are
+  int-kind address producers; `gload` yields the cell's int; `gstore` is an
+  effect; the 4 guards are deopt points. Set `bounds_ok`/lane bookkeeping as the
+  array path does.
+- `lower` (~2483 switch): `garow`→`row-1`; `gcell`→`row0*imul stride + (col-1)`
+  (load stride from the table, or fold via the `guard_stride` constant);
+  `gload`/`gstore`→flat addressing at `grid_elem` width + presence `bt`/`bts`.
+- `isTransient`/`operandReads`/`analyze` home-reservation + the guard-skip switch
+  (~2483) — add the grid ops alongside their array analogues.
+- Re-bench `grid_matmul` via `just bench --filter grid` vs baseline
+  (t0=304ms, jit=318ms, lj=7.5ms).

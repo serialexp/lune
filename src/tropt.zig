@@ -85,6 +85,11 @@ fn kindOf(op: IrOp) OpKind {
         // (which `astore_append` writes), so classifying it `.guard` keeps it a
         // side-effecting root that is never hoisted above the store.
         .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append => .guard,
+        // Grid-cell guards (doc 14, Phase 8): the flattened-grid analogues of the
+        // array guards. All side-effecting roots, never hoisted past the `gstore`
+        // they protect. `guard_grid`/`guard_stride` read the table (`a`);
+        // `guard_gcol`/`guard_gpresent` read the `gcell` address (`a`).
+        .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent => .guard,
         // Hash-field structural guard (doc 11): the grow/rehash analogue of the array
         // guards. A side-effecting root, deduped by (op, href ref, count-aux); reads
         // the `href` (`a`). Never hoisted above the `hstore` it protects.
@@ -101,11 +106,22 @@ fn kindOf(op: IrOp) OpKind {
         // reordered past them. DCE'd if not reachable from a live root.
         // `href`/`hload` are the hash-field analogues — same memory-op treatment.
         .aref, .href => .aref,
+        // Grid-cell address chain (doc 14, Phase 8): `garow` (table+row → row base)
+        // and `gcell` (row base+col → cell) are memory-address producers, same
+        // canonical-to-self memory-op treatment as `aref` so a later `gstore` can't
+        // be reordered past them. DCE'd if not reachable from a live root.
+        .garow, .gcell => .aref,
         .aload, .hload => .aload,
+        // Grid-cell load (doc 14, Phase 8): the hash/array-load analogue. Reads the
+        // `gcell` address (`a`).
+        .gload => .aload,
         // `astore_append` is the grow analogue of `astore`: an effectful, never-DCE'd
         // alias/CSE barrier. Same `.astore` kind (reads `a`=aref + `b`=value).
         // `hstore` is the hash-field store — same effectful never-DCE'd treatment.
         .astore, .astore_append, .hstore => .astore,
+        // Grid-cell store (doc 14, Phase 8): effectful, never-DCE'd alias/CSE barrier.
+        // Reads `a`=gcell address + `b`=value, same as `astore`.
+        .gstore => .astore,
         .loop => .loop,
         // Loop-carried value: a root (the carry); canonical to itself (never
         // folded/CSE'd). Keeps both operands live; `b` is a forward (back-edge)
@@ -167,7 +183,12 @@ fn guardKeyAux(op: IrOp, aux: i32) i32 {
         // `guard_pure` stashes the `PureBuiltin` ordinal in `aux` — semantic identity
         // (a guard for `sqrt` differs from one for a future `floor`), so it joins the
         // dedup-key auxes rather than the PC-bearing ones.
-        .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_pure => aux,
+        // `guard_grid` stashes the grid element-lane ordinal and `guard_stride` the
+        // pinned stride — both genuine semantic identity (a guard expecting an i32
+        // lane differs from one expecting i8; a stride-200 guard differs from
+        // stride-100), so they join the lane/proto auxes in the dedup key.
+        // `guard_gcol`/`guard_gpresent` carry no aux (fall through to 0).
+        .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_pure, .guard_grid, .guard_stride => aux,
         else => 0,
     };
 }

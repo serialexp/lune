@@ -139,10 +139,16 @@ fn detectDeadCarries(
             .guard_func,
             .hload, .guard_hash,
             .guard_pure, .fsqrt,
+            // Grid-cell ops reading only `a` (doc 14): the cell load and the four
+            // structural guards reach the table/cell through the address chain.
+            .gload, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent,
             => {
                 uses[ins.a] += 1;
             },
-            .aref, .astore, .astore_append, .href, .hstore => {
+            // Grid-cell address producers + store read both operands (table+row,
+            // garow+col, gcell+value).
+            .aref, .astore, .astore_append, .href, .hstore,
+            .garow, .gcell, .gstore => {
                 uses[ins.a] += 1;
                 uses[ins.b] += 1;
             },
@@ -252,8 +258,10 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             .guard_func,
             .hload, .guard_hash,
             .guard_pure, .fsqrt,
+            .gload, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent,
             => ins.a == idx,
-            .aref, .astore, .astore_append, .href, .hstore => ins.a == idx or ins.b == idx,
+            .aref, .astore, .astore_append, .href, .hstore,
+            .garow, .gcell, .gstore => ins.a == idx or ins.b == idx,
             .phi => (ins.aux == trace.PHI_INTERNAL and ins.a == idx) or ins.b == idx,
             .slot_load, .konst, .loop, .preheader => false,
         };
