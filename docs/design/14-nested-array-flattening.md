@@ -15,7 +15,15 @@ land; move whole sections to Done once everything inside is checked.
 
 ### Done
 
-_(nothing yet — this doc exists to be reviewed for feasibility before any code)_
+- [x] **Phase 1 — `RowView` fat value + structural identity.** `row_view`
+  `Value` tag (parent `*GcHeader` in low 48 bits + 16-bit row in high 16);
+  `eql`/identity by `(parent.id, row)`; `typeName` → "table"; truthy. Threaded
+  through every exhaustive `Tag` switch (serializers, JIT encoders, renderer);
+  `gc.markValue` marks the parent so a register-live row handle survives a
+  collection (landed early — the GC arm belongs with the value). Wire ordinal
+  appended at 5; pinned-contract test + `viz/src/enums.ts` mirror in lockstep.
+  Four unit tests. Commit `c55d109`. (Grids not yet enabled, so no `row_view` is
+  produced at runtime — this is the value-level surface only.)
 
 ### Outstanding
 
