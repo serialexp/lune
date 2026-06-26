@@ -250,19 +250,20 @@ pub const Lexer = struct {
         const c = self.peek();
         self.index += 1;
         const tag: Token.Tag = switch (c) {
-            '+' => .plus,
-            '-' => .minus,
-            '*' => .star,
-            '/' => self.pick('/', .slash_slash, .slash),
-            '%' => .percent,
-            '^' => .caret,
+            '+' => self.pick('=', .plus_assign, .plus),
+            '-' => self.pick('=', .minus_assign, .minus),
+            '*' => self.pick('=', .star_assign, .star),
+            '/' => self.slashOp(),
+            '%' => self.pick('=', .percent_assign, .percent),
+            '^' => .caret, // no `^=` (exponent; compound form deliberately excluded)
             '#' => .hash,
             // Customary operator aliases (LuaJIT 3.0 parity): `&&`/`||`/`!`/`!=`
             // are pure lexical synonyms — they emit the very same tokens as
             // `and`/`or`/`not`/`~=`, so the parser and evaluator never know the
-            // difference. A lone `&`/`|` stays bitwise; only the doubled form aliases.
-            '&' => self.pick('&', .keyword_and, .ampersand),
-            '|' => self.pick('|', .keyword_or, .pipe),
+            // difference. A lone `&`/`|` stays bitwise; the compound `&=`/`|=`
+            // assignment forms take priority over neither (doubled wins longest).
+            '&' => self.ampOp(),
+            '|' => self.pipeOp(),
             '!' => self.pick('=', .ne, .keyword_not),
             '?' => self.pick('?', .question_question, .question),
             '~' => self.tildeOp(),
@@ -276,8 +277,8 @@ pub const Lexer = struct {
             ',' => .comma,
             '=' => self.pick('=', .eq, .assign),
             ':' => self.pick(':', .double_colon, .colon),
-            '<' => self.pickTwo('=', .le, '<', .lshift, .lt),
-            '>' => self.pickTwo('=', .ge, '>', .rshift, .gt),
+            '<' => self.ltOp(),
+            '>' => self.gtOp(),
             '.' => self.dots(),
             else => {
                 self.diags.err("unexpected character", start, self.index, line);
@@ -310,28 +311,82 @@ pub const Lexer = struct {
         return no;
     }
 
-    /// After consuming one `~`: resolve `~=` (inequality) / `~>>` (arithmetic
-    /// right shift) / `~` (bitwise xor / unary not). `~>` with a single `>` is
-    /// left as a bare `~` followed by `>`; only the full `~>>` munches.
+    /// After consuming one `~`: resolve `~=` (inequality / xor-assign) / `~>>=`
+    /// (arithmetic-shift assign) / `~>>` (arithmetic right shift) / `~` (bitwise
+    /// xor / unary not). `~>` with a single `>` is left as a bare `~` then `>`;
+    /// only the full `~>>` munches. Longest-match order: `~>>=` before `~>>`.
     fn tildeOp(self: *Lexer) Token.Tag {
         if (self.peek() == '=') {
             self.index += 1;
             return .ne;
         }
         if (self.peek() == '>' and self.peekNext() == '>') {
-            self.index += 2;
+            self.index += 2; // consumed `~>>`
+            if (self.peek() == '=') {
+                self.index += 1;
+                return .rshift_arith_assign;
+            }
             return .rshift_arith;
         }
         return .tilde;
     }
 
-    /// After consuming one `.`: resolve `.` / `..` / `...`.
+    /// After consuming one `/`: `//=` / `//` / `/=` / `/`.
+    fn slashOp(self: *Lexer) Token.Tag {
+        if (self.peek() == '/') {
+            self.index += 1; // consumed `//`
+            return self.pick('=', .slash_slash_assign, .slash_slash);
+        }
+        return self.pick('=', .slash_assign, .slash);
+    }
+
+    /// After consuming one `&`: `&&` (logical-and alias) / `&=` / `&`.
+    fn ampOp(self: *Lexer) Token.Tag {
+        if (self.peek() == '&') {
+            self.index += 1;
+            return .keyword_and;
+        }
+        return self.pick('=', .amp_assign, .ampersand);
+    }
+
+    /// After consuming one `|`: `||` (logical-or alias) / `|=` / `|`.
+    fn pipeOp(self: *Lexer) Token.Tag {
+        if (self.peek() == '|') {
+            self.index += 1;
+            return .keyword_or;
+        }
+        return self.pick('=', .pipe_assign, .pipe);
+    }
+
+    /// After consuming one `<`: `<<=` / `<<` / `<=` / `<`.
+    fn ltOp(self: *Lexer) Token.Tag {
+        if (self.peek() == '<') {
+            self.index += 1; // consumed `<<`
+            return self.pick('=', .lshift_assign, .lshift);
+        }
+        return self.pick('=', .le, .lt);
+    }
+
+    /// After consuming one `>`: `>>=` / `>>` / `>=` / `>`.
+    fn gtOp(self: *Lexer) Token.Tag {
+        if (self.peek() == '>') {
+            self.index += 1; // consumed `>>`
+            return self.pick('=', .rshift_assign, .rshift);
+        }
+        return self.pick('=', .ge, .gt);
+    }
+
+    /// After consuming one `.`: resolve `.` / `..` / `..=` / `...`.
     fn dots(self: *Lexer) Token.Tag {
         if (self.peek() != '.') return .dot;
         self.index += 1; // second dot
         if (self.peek() == '.') {
             self.index += 1; // third dot
             return .ellipsis;
+        }
+        if (self.peek() == '=') {
+            self.index += 1;
+            return .concat_assign;
         }
         return .dot_dot;
     }

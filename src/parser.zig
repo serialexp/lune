@@ -238,9 +238,49 @@ const Parser = struct {
         };
     }
 
+    /// Map a compound-assignment operator token to its underlying binary op, or
+    /// null if the token is not a compound-assign operator. `~=` (`.ne`) is the
+    /// special case: in statement context — right after an lvalue — it is
+    /// xor-assign (`bxor`), NOT the inequality comparison (which only ever occurs
+    /// in expression context). The deliberately-absent `^=` has no token at all.
+    fn compoundAssignOp(tag: Tag) ?ast.BinaryOp {
+        return switch (tag) {
+            .plus_assign => .add,
+            .minus_assign => .sub,
+            .star_assign => .mul,
+            .slash_assign => .div,
+            .slash_slash_assign => .idiv,
+            .percent_assign => .mod,
+            .amp_assign => .band,
+            .pipe_assign => .bor,
+            .ne => .bxor, // `~=` in statement context = xor-assign
+            .lshift_assign => .shl,
+            .rshift_assign => .shr,
+            .rshift_arith_assign => .sar,
+            .concat_assign => .concat,
+            else => null,
+        };
+    }
+
     fn parseExprStatement(self: *Parser) Error!Stmt {
         const start = self.current().start;
         const first = try self.parseSuffixed();
+
+        // Compound assignment `target OP= value` (single target). Detected before
+        // the plain `=`/`,` assignment because `~=` (xor-assign) shares the `ne`
+        // token with inequality — here, right after an lvalue, it is xor-assign.
+        if (compoundAssignOp(self.current().tag)) |op| {
+            if (!first.isAssignable()) {
+                self.diags.err("cannot assign to this expression", first.span.start, first.span.end, 0);
+                return Error.ParseError;
+            }
+            _ = self.advance(); // the compound-assign operator
+            const value = try self.parseExpr(0);
+            return .{
+                .span = self.spanFrom(start),
+                .data = .{ .compound_assign = .{ .target = first, .op = op, .value = value } },
+            };
+        }
 
         if (self.check(.assign) or self.check(.comma)) {
             var targets: std.ArrayList(*Expr) = .empty;
@@ -787,6 +827,27 @@ test "multiple assignment" {
     try testing.expectEqual(@as(usize, 2), a.targets.len);
     try testing.expectEqual(@as(usize, 2), a.values.len);
     try testing.expectEqualStrings("x", a.targets[0].data.name);
+}
+
+test "compound assignment desugars to a compound_assign node with the right op" {
+    var tree = try parseOk(
+        \\a += 1
+        \\t[k] ~>>= 2
+        \\o.n ~= 3
+    );
+    defer tree.deinit();
+    const a = tree.root[0].data.compound_assign;
+    try testing.expectEqual(ast.BinaryOp.add, a.op);
+    try testing.expectEqualStrings("a", a.target.data.name);
+
+    const b = tree.root[1].data.compound_assign;
+    try testing.expectEqual(ast.BinaryOp.sar, b.op);
+    try testing.expect(b.target.data == .index);
+
+    // `~=` as a statement operator is xor-assign, not inequality.
+    const c = tree.root[2].data.compound_assign;
+    try testing.expectEqual(ast.BinaryOp.bxor, c.op);
+    try testing.expect(c.target.data == .field);
 }
 
 test "if / elseif / else" {

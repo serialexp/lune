@@ -91,6 +91,21 @@ pub const Token = struct {
         question, // ?   (reserved: optional-type marker / future ?. ?:)
         question_question, // ??  (nil-coalescing)
 
+        // compound assignment (LuaJIT 3.0 parity). `~=` xor-assign reuses the
+        // `ne` token (disambiguated by statement context); there is no `^=`.
+        plus_assign, // +=
+        minus_assign, // -=
+        star_assign, // *=
+        slash_assign, // /=
+        slash_slash_assign, // //=
+        percent_assign, // %=
+        amp_assign, // &=
+        pipe_assign, // |=
+        lshift_assign, // <<=
+        rshift_assign, // >>=
+        rshift_arith_assign, // ~>>=
+        concat_assign, // ..=
+
         // sentinels
         eof,
         /// A lexing error occurred at this span; a diagnostic was recorded.
@@ -170,6 +185,18 @@ pub const Token = struct {
                 .ellipsis => "...",
                 .question => "?",
                 .question_question => "??",
+                .plus_assign => "+=",
+                .minus_assign => "-=",
+                .star_assign => "*=",
+                .slash_assign => "/=",
+                .slash_slash_assign => "//=",
+                .percent_assign => "%=",
+                .amp_assign => "&=",
+                .pipe_assign => "|=",
+                .lshift_assign => "<<=",
+                .rshift_assign => ">>=",
+                .rshift_arith_assign => "~>>=",
+                .concat_assign => "..=",
                 else => null,
             };
         }

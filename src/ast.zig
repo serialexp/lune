@@ -163,6 +163,11 @@ pub const Stmt = struct {
         local_function: struct { name: []const u8, body: *FunctionBody },
         /// `t1, t2 = e1, e2` (targets are assignable exprs).
         assign: struct { targets: []const *Expr, values: []const *Expr },
+        /// `target OP= value` (single target). The compiler evaluates `target`'s
+        /// prefix/index **once**, then stores `target = target OP value`. `op` is
+        /// the underlying binary op (`+=` → `add`, `~=` → `bxor`, …); never a
+        /// short-circuit op (`and_`/`or_`/`coalesce` have no compound form).
+        compound_assign: struct { target: *Expr, op: BinaryOp, value: *Expr },
         /// A call used as a statement.
         call: *Expr,
         /// `do ... end`

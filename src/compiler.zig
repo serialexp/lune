@@ -499,6 +499,7 @@ const Compiler = struct {
         switch (s.data) {
             .local => |l| try self.compileLocal(l),
             .assign => |a| try self.compileAssign(a),
+            .compound_assign => |ca| try self.compileCompoundAssign(ca),
             .do => |body| {
                 self.beginScope();
                 try self.compileBlock(body);
@@ -538,6 +539,68 @@ const Compiler = struct {
             try self.compileStore(tgt, @intCast(val_base + j));
         }
         self.freeTo(mark);
+    }
+
+    /// `target OP= value`. Desugars to `target = target OP value` while evaluating
+    /// `target`'s prefix/index expressions **exactly once** (the single-evaluation
+    /// contract: `t[f()] += 1` calls `f` once). `op` is always a real binary op
+    /// (the parser never produces a short-circuit op here), so `binOpCode` is safe.
+    fn compileCompoundAssign(self: *Compiler, ca: anytype) Error!void {
+        const tgt = ca.target;
+        const op_span = ast.Span{ .start = tgt.span.start, .end = ca.value.span.end };
+        switch (tgt.data) {
+            .name => |nm| {
+                // No side-effecting prefix: load current, combine, store back.
+                const m = self.next_reg;
+                const acc = try self.alloc1();
+                try self.loadName(nm, acc, tgt.span);
+                const rhs = try self.alloc1();
+                try self.compileExprTo(ca.value, rhs);
+                self.cur_span = op_span;
+                _ = try self.emit(Instr.opABC(binOpCode(ca.op), acc, acc, rhs));
+                try self.storeName(nm, acc, tgt.span);
+                self.freeTo(m);
+            },
+            .field => |f| {
+                // Evaluate `obj` once; the key is a constant string (no eval order
+                // concern), held in a register so the load and store share it.
+                const m = self.next_reg;
+                const obj = try self.alloc1();
+                try self.compileExprTo(f.obj, obj);
+                const key = try self.alloc1();
+                const k = try self.stringConstant(f.name);
+                _ = try self.emit(Instr.opAB(.load_const, key, k));
+                try self.compoundIndexStore(obj, key, ca.op, ca.value, op_span);
+                self.freeTo(m);
+            },
+            .index => |ix| {
+                // Evaluate BOTH `obj` and `key` once, then load→combine→store
+                // through the held registers.
+                const m = self.next_reg;
+                const obj = try self.alloc1();
+                try self.compileExprTo(ix.obj, obj);
+                const key = try self.alloc1();
+                try self.compileExprTo(ix.key, key);
+                try self.compoundIndexStore(obj, key, ca.op, ca.value, op_span);
+                self.freeTo(m);
+            },
+            else => unreachable, // parser guarantees the target is assignable
+        }
+    }
+
+    /// Shared tail of an indexed compound assignment: `obj[key] = obj[key] OP value`
+    /// reusing the already-evaluated `obj`/`key` registers (single-eval). Allocates
+    /// only scratch above them and frees it before returning.
+    fn compoundIndexStore(self: *Compiler, obj: u16, key: u16, op: ast.BinaryOp, rhs_expr: *const ast.Expr, op_span: ast.Span) Error!void {
+        const m = self.next_reg;
+        const cur = try self.alloc1();
+        _ = try self.emit(Instr.opABC(.get_index, cur, obj, key));
+        const rhs = try self.alloc1();
+        try self.compileExprTo(rhs_expr, rhs);
+        self.cur_span = op_span;
+        _ = try self.emit(Instr.opABC(binOpCode(op), cur, cur, rhs));
+        _ = try self.emit(Instr.opABC(.set_index, obj, key, cur));
+        self.freeTo(m);
     }
 
     /// Fill registers `[base, base + want)` with the values of `exprs`, applying

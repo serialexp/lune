@@ -5101,6 +5101,68 @@ test "customary operators: ! && || != alias not/and/or/~=" {
     );
 }
 
+test "compound assignment: every operator on a name target" {
+    try expectProgram(
+        \\local a = 10
+        \\a += 5;   print(a)   -- 15
+        \\a -= 3;   print(a)   -- 12
+        \\a *= 2;   print(a)   -- 24
+        \\a //= 5;  print(a)   -- 4
+        \\a %= 3;   print(a)   -- 1
+        \\a <<= 4;  print(a)   -- 16
+        \\a >>= 1;  print(a)   -- 8
+        \\a |= 1;   print(a)   -- 9
+        \\a &= 12;  print(a)   -- 8
+        \\a ~= 5;   print(a)   -- 13  (xor-assign, NOT inequality)
+        \\a ~>>= 1; print(a)   -- 6   (arithmetic right shift)
+        \\local f = 7.0
+        \\f /= 2;   print(f)   -- 3.5  (true division)
+        \\local s = "foo"
+        \\s ..= "bar"; print(s) -- foobar
+        \\
+    ,
+        "15\n12\n24\n4\n1\n16\n8\n9\n8\n13\n6\n3.5\nfoobar\n",
+    );
+}
+
+test "compound assignment: ~= is xor-assign in statement context, inequality elsewhere" {
+    // The same `~=` token means xor-assign as a statement and ~= (inequality) in
+    // an expression — disambiguated purely by parse position.
+    try expectProgram(
+        \\local a = 12
+        \\a ~= 10           -- xor-assign: 12 ~ 10 = 6
+        \\print(a)          -- 6
+        \\print(a ~= 6)     -- inequality: false
+        \\print(a ~= 7)     -- inequality: true
+        \\
+    ,
+        "6\nfalse\ntrue\n",
+    );
+}
+
+test "compound assignment: field and index targets, prefix evaluated exactly once" {
+    try expectProgram(
+        \\-- index target with a side-effecting key: must be evaluated once.
+        \\local calls = 0
+        \\local function idx() calls = calls + 1; return 2 end
+        \\local t = {10, 20, 30}
+        \\t[idx()] += 100
+        \\print(t[2], calls)   -- 120  1
+        \\-- field target
+        \\local o = { n = 5 }
+        \\o.n *= 4
+        \\print(o.n)           -- 20
+        \\-- side-effecting object prefix evaluated once, too
+        \\local ocalls = 0
+        \\local function obj() ocalls = ocalls + 1; return o end
+        \\obj().n -= 3
+        \\print(o.n, ocalls)   -- 17  1
+        \\
+    ,
+        "120\t1\n20\n17\t1\n",
+    );
+}
+
 test "bitwise: ~>> arithmetic right shift (sign-extending, 64-bit)" {
     try expectProgram(
         \\print(-8 ~>> 1)

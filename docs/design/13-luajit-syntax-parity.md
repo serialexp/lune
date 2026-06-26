@@ -1,6 +1,6 @@
 # lune — LuaJIT 3.0 Syntax-Extension Parity
 
-Status: partial — Phases 1, 3 & 4 landed; Phases 2 & 5 outstanding
+Status: partial — Phases 1–5 landed; only the error-policy doc-link cross-reference outstanding
 Owner: Bart
 Last updated: 2026-06-26
 
@@ -51,16 +51,33 @@ whole phases to "Done" once everything inside is checked.
       nil-guard IR op) is a future follow-up, not in this phase's scope.
       `bytecode.OpCode` carries no wire ordinal (only `trace.IrOp`/`ObsType`/
       `value.Tag` do), so inserting `jmp_if_not_nil` mid-enum is safe.
+- [x] **Phase 5 — Compound assignment `+= -= *= /= //= %= &= |= ~= <<= >>= ~>>= ..=`.**
+      Twelve compound-assign tokens in `token.zig` (no `^=`; `~=` xor-assign reuses
+      the `ne` token, disambiguated by statement context); lexer maximal-munch
+      dispatch (`slashOp`/`ampOp`/`pipeOp`/`ltOp`/`gtOp` helpers, `tildeOp` extended
+      for `~>>=`, `dots` extended for `..=`). New AST `Stmt.compound_assign
+      { target, op, value }` where `op` is the underlying `BinaryOp` (`+=`→`add`,
+      `~=`→`bxor`, `~>>=`→`sar`, …, never a short-circuit op). Parser detects the
+      compound operator after an assignable lvalue (`compoundAssignOp` mapping) and
+      requires the target be assignable. Compiler `compileCompoundAssign` desugars
+      to `target = target OP value` with **single-evaluation of the target prefix**:
+      `.name` loads/stores directly; `.field`/`.index` evaluate the object (and key)
+      once into held registers, then read→combine→write through them
+      (`compoundIndexStore`). Reuses the existing `binOpCode` lowering so every
+      compound op tiers through the JIT exactly as its binary form does (verified
+      byte-identical tier-0 vs `--trace --jit-native` on a hot `+=`/`%=` loop).
+      Parser test (op mapping + `~=`-as-xor disambiguation) and eval tests
+      (every operator on a name target, `~=` statement-vs-expression split, and the
+      prefix-eval-once proof `t[f()] += …` / `obj().n -= …` calling the side-effect
+      once).
+- [x] **Phase 2 — `~>>=` compound form.** Landed as part of Phase 5: the
+      `rshift_arith_assign` token (`~>>=`) lexes via the extended `tildeOp` and maps
+      to `BinaryOp.sar` in `compoundAssignOp`, so `x ~>>= n` desugars to
+      `x = x ~>> n` and rides the same single-eval path. Covered by the Phase 5
+      name-target eval test (`a ~>>= 1`).
 
 ### Outstanding
 
-- [ ] **Phase 2 — `~>>=` compound form.** Rides on the general compound-assignment
-      desugar (Phase 5) but the *operator* belongs to the bitwise set; land the
-      token alongside Phase 1, wire the desugar in Phase 5.
-- [ ] **Phase 5 — Compound assignment `+= -= *= /= //= %= &= |= ~= <<= >>= ~>>= ..=`.**
-      Parser desugar with single-evaluation of the target prefix; no `^=`; `~=`
-      parses as xor-assign in statement context. Tests for the prefix-eval-once
-      contract and the `~=` disambiguation.
 - [ ] **Decision needed — error policy doc-link.** Cross-reference the fail-loud
       `//`-by-zero call from `02-determinism.md` (or wherever the error taxonomy
       lives) so the divergence from LuaJIT is recorded in one canonical place.
