@@ -69,16 +69,29 @@ and persistent-alias fail this. Gating (no bare row_view ever) avoids it.
 8. [x] Doc 14 updated (4b/4c/5/6/7 → Done, status header → "Phases 0–7"). No
    inventory change (no stdlib function added/renamed). Phase 7 committed `9b39918`.
 
-## Phase 8 scope (recorder fast path) — NOT STARTED, awaiting Bart
+## Phase 8 scope (recorder fast path) — STEP 0 DONE (baseline), codegen next
 
-**Profiling-first blocker (CLAUDE.md "profile FIRST"):** no existing bench forms a
-grid. array3d uses a *manual* flat `image[pos]` 1-D array (no nested `a[i][j]`);
-nbody uses hash-field structs (`b.x`). The genuine nested-numeric `a[i][j]` that
-inflates appears only in **scimark** (`scimark_lib.lua` LU: `a[jp][j]`) and
-LuaJIT's **meteor** (`rot[j][i]=…`). Step 0 of Phase 8 is to confirm one of these
-(or a fresh microbench like a matmul) actually inflates to a grid at runtime and
-that `--dump-aborts` shows `get_index2`/`set_index2` dominating, establishing a
-baseline number — before writing any codegen.
+Bart's calls (2026-06-26): **microbench + baseline first**, **int lanes first**.
+
+**Step 0 — DONE.** Authored `bench/grid_matmul.lua` (int N×N dense matmul; three
+matrices that inflate to grids and are read/written via fused `get_index2`/
+`set_index2`). Verified:
+- Grids genuinely form: a temp probe in `inflateToGrid` showed exactly 3 inflations
+  (A, B, C), confirming the fused-store inflation path fires.
+- `--dump-aborts` confirms the hot loops abort on `get_index2`/`set_index2`
+  (`nyi_opcode`) — the exact opcodes Phase 8 must record.
+- Output byte-identical across lune tier-0, `--jit-native`, and LuaJIT (checksum
+  19602000000 at N=200).
+- **Baseline (`just bench --filter grid_matmul`, N=200, ReleaseFast, 5 reps):**
+  `t0 = 304 ms`, `jit = 318 ms`, `luajit = 7.5 ms` → **~41× slower than LuaJIT,
+  and the JIT currently gives NO benefit** (4% *slower* than tier-0: pure
+  recording overhead with the access aborting). This is the number Phase 8 moves.
+
+**Background (rejected real benches):** array3d uses a *manual* flat `image[pos]`
+1-D array (no nested `a[i][j]`); nbody uses hash-field structs (`b.x`). Genuine
+nested-numeric `a[i][j]` appears only in scimark (LU `a[jp][j]`, float — would
+bail on the f64 cell lane) and LuaJIT meteor. A focused int microbench is the
+clean yardstick; revisit scimark once the f64 grid lane lands in a later phase.
 
 **Codegen surface (multi-tier — this is the big one):**
 - `src/trace.zig` recorder: add `.get_index2`/`.set_index2` cases (today → `else
