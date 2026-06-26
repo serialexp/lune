@@ -10012,6 +10012,28 @@ test "grid e2e: fill a matrix with fused stores then read it back" {
     );
 }
 
+test "grid e2e: an f64 cell grid fills, accumulates, and reads back (native XMM cells)" {
+    // The float twin of the fill test, sized to tier up so the f64 grid cell path
+    // (gload/gstore via `movsd`, doc 14 Phase 8 Stage C) runs natively under
+    // `record_execute_native` — byte-identical to tier-0 across all 8 modes. The
+    // rows start as dense f64 arrays (`0.0`) so inflation unifies the cell lane to
+    // f64; the hot inner loop both reads and writes f64 cells.
+    try expectProgram(
+        \\local m = {}
+        \\for i=1,8 do local r={} for j=1,8 do r[j]=0.0 end m[i]=r end
+        \\for i=1,8 do for j=1,8 do m[i][j] = i*0.5 + j*0.25 end end  -- inflate → f64 grid
+        \\local s = 0.0
+        \\for rep=1,40 do
+        \\  for i=1,8 do for j=1,8 do s = s + m[i][j] * 2.0 end end
+        \\end
+        \\for i=1,8 do m[i][i] = s end                                -- f64 cell stores
+        \\print(string.format("%.2f %.2f %.2f", s, m[1][1], m[8][8]))
+        \\
+    ,
+        "17280.00 17280.00 17280.00\n",
+    );
+}
+
 test "grid e2e: a fused store past the stride grows the grid (reshape-on-overflow)" {
     try expectProgram(
         \\local m = { {1,2}, {3,4} }

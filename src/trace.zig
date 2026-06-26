@@ -2122,9 +2122,9 @@ pub const TraceState = struct {
     /// on the table, `guard_int` on row + col, the `garow`/`gcell` address chain with
     /// `guard_bounds` (row) + `guard_gcol` (col), then `guard_gpresent` + `gload`.
     /// Aborts (leaving tier-0 untouched) unless the container is already a grid with an
-    /// **int** element lane and the access is a *present, in-bounds* cell — every other
-    /// shape (a not-yet-inflated nested table, an f64 grid, an out-of-bounds/hole cell)
-    /// runs on tier-0.
+    /// **int or f64** element lane and the access is a *present, in-bounds* cell — every
+    /// other shape (a not-yet-inflated nested table, an out-of-bounds/hole cell) runs on
+    /// tier-0.
     fn recGridGet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
         // Like recArrayGet: a grid load after a sunk store would read stale on-trace.
         if (self.rec.pending_store_count > 0) return self.abort(.bad_type);
@@ -2138,7 +2138,7 @@ pub const TraceState = struct {
         if (tbl.metatable != null) return self.abort(.has_metatable);
         const ap = &tbl.array;
         if (ap.lane != .grid) return self.abort(.nyi_opcode); // not inflated → nested-table path (deferred)
-        if (!ap.grid_elem.isInt()) return self.abort(.nyi_opcode); // f64 grid deferred (int lanes first)
+        if (!ap.grid_elem.isInt() and ap.grid_elem != .f64) return self.abort(.nyi_opcode); // only int + f64 cells lower
         if (ap.stride > std.math.maxInt(i32)) return self.abort(.bad_type); // guard_stride aux is i32
         const row = vrow.asInt();
         const col = vcol.asInt();
@@ -2189,7 +2189,7 @@ pub const TraceState = struct {
         if (tbl.metatable != null) return self.abort(.has_metatable);
         const ap = &tbl.array;
         if (ap.lane != .grid) return self.abort(.nyi_opcode);
-        if (!ap.grid_elem.isInt()) return self.abort(.nyi_opcode);
+        if (!ap.grid_elem.isInt() and ap.grid_elem != .f64) return self.abort(.nyi_opcode); // only int + f64 cells lower
         if (ap.stride > std.math.maxInt(i32)) return self.abort(.bad_type);
         const row = vrow.asInt();
         const col = vcol.asInt();

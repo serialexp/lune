@@ -261,5 +261,29 @@ byte-identical across tier-0 / `--trace` / `--trace-no-opt` /
 - **Doc 14** status → complete (Phase 8 Stage B bullet → Done). No stdlib
   inventory change.
 
-Future cut (not this phase): f64 grid cells (needs XMM cell store/load in the
-native array path); store-after-load sinking for grids (Stage A/B both abort it).
+## Stage C — LANDED (2026-06-27, `just test` green)
+f64 grid cells now lower to native, reusing the scalar-array f64 (XMM) machinery:
+- **Recorder (`trace.zig`):** `recGridGet`/`recGridSet` drop the `grid_elem.isInt()`
+  abort → now `isInt() or .f64`. The f64 `gstore` value must be a float
+  (`laneFits(.f64, v) == v.isFloat()`); an int-into-f64 store still aborts to tier-0
+  (sound). `gload.ty` is `obsTypeOf(loaded)` = `.float` for an f64 cell.
+- **`nativegen.proveKinds`:** `guard_grid`/`garow`/`gcell` accept `laneKind == .float`
+  (was int-only); `gload` takes `kinds[i] = lk` (f64 → `.float`, an XMM home);
+  `gstore` switches on the lane — int requires a fits_ok int value, f64 requires a
+  proven `.float` (full-width `movsd`, no fits_ok, mirroring the f64 `astore`).
+- **`nativegen.lower`:** `gload` f64 → `lea rax,[data+flat*8]; movsd xmm,[rax]`;
+  `gstore` f64 → stage value in XMM_SCRATCH0, `lea`, `movsd [rax],xmm`, then the
+  lane-agnostic presence `bts`. Slot pinning / home-reservation / `isTransient` /
+  `operandReads` were already lane-agnostic — no change. The prologue grid_elem/stride
+  checks already use the recorded ordinal, so f64 works unchanged.
+- **tier-1a (`irinterp.zig`):** already executed f64 grids via the lane-agnostic
+  `gridGet`/`gridSet` + `laneFits`; only stale "int grid" comments updated.
+- **Result (`bench/grid_matmul_f64.lua`, new):** **jit 338 ms → 40 ms** (8.4×; LuaJIT
+  gap 42× → 5.0×), `cross=ok` + `luajit=ok` (byte-identical across all 8 modes + LJ).
+  `--dump-native`: hot k-loop is two `movsd` cell loads + `mulsd`/`addsd` in XMM
+  behind the folded-stride `imul` + `bt` presence checks; C-store trace `movsd`s the
+  cell + `bts`. Init loops stay tier-0 (array growth → no trace), as before.
+
+Future cut (not this phase): store-after-load sinking for grids (Stage A/B/C all
+abort the RMW-after-load case — matmul's hot trace is read-only so it costs nothing);
+bool grid cells (no grid ever forms with a bool element lane today).

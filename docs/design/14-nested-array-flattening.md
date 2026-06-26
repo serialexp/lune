@@ -13,10 +13,12 @@ address chain behind grid guards (Stage A), and `nativegen` now lowers that chai
 to grid-relative address arithmetic — `flat = row0*stride + (col-1)` with the
 stride folded as an imm32 behind prologue `guard_grid`/`guard_stride` checks, the
 cell load/store at the `grid_elem` width, side-exiting to tier-0 on reshape
-(Stage B). `grid_matmul` (int lanes) goes from **jit 318 ms → 36 ms** (8.8×;
-LuaJIT gap 39× → 4.5×), byte-identical across all eight modes and to LuaJIT.
-Outstanding only as future work: f64 grid cells (this cut is int-lane only).
-Build size is explicitly *not* a blocker (see §Decision).
+(Stage B). Both **int and f64** cell lanes lower: an int cell sign/zero-extends
+into a GP home, an f64 cell `movsd`s the raw double into an XMM home (Stage C).
+`grid_matmul` (int lanes) goes from **jit 318 ms → 36 ms** (8.8×; LuaJIT gap
+39× → 4.5×) and `grid_matmul_f64` (f64 lanes) from **jit 338 ms → 40 ms**
+(8.4×; LuaJIT gap 42× → 5.0×), both byte-identical across all eight modes and to
+LuaJIT. Build size is explicitly *not* a blocker (see §Decision).
 Owner: Bart
 Last updated: 2026-06-27
 
@@ -168,9 +170,23 @@ land; move whole sections to Done once everything inside is checked.
   `gcell→garow→table` chain; the row bound rides the existing `guard_bounds` on the
   garow (grid len == row count). Result: `grid_matmul` **jit 318 ms → 36 ms** (8.8×;
   LuaJIT gap 39× → 4.5×), byte-identical across all eight modes and to LuaJIT,
-  serialisation round-trip intact, `just test` green. Int element lanes only — an
-  f64 grid still bails to the tier-1a oracle (the native array path has no XMM cell
-  store/load yet), a future cut.
+  serialisation round-trip intact, `just test` green. (Int element lanes in this
+  stage; f64 cells followed in Stage C.)
+- [x] **Phase 8 Stage C — f64 grid cells.** The grid path now lowers `f64`
+  element lanes alongside the int lanes, reusing the scalar-array f64 machinery.
+  `proveKinds` admits `laneKind == .float` on `guard_grid`/`garow`/`gcell`; `gload`
+  takes the `grid_elem` kind (`.float` → an XMM home) and `gstore` requires a proven
+  `.float` value (full-width `movsd`, every double fits → no `guard_fits` coverage,
+  mirroring the f64 `astore`). Codegen `movsd`s the raw 8-byte cell at `[data +
+  flat*8]` to/from the float home — no decode/rounding (`encode`/`decodeGridCell`
+  for `.f64` are raw `@bitCast`s, so 8-mode parity is inherited) — with the presence
+  `bts`/`bt` unchanged (lane-agnostic). The recorder drops the `grid_elem.isInt()`
+  abort (now `isInt() or .f64`); tier-1a already executed f64 grids via the
+  lane-agnostic `gridGet`/`gridSet`, so only comments changed there. New yardstick
+  `bench/grid_matmul_f64.lua`: **jit 338 ms → 40 ms** (8.4×; LuaJIT gap 42× → 5.0×),
+  byte-identical across all eight modes and to LuaJIT, `just test` green. The native
+  disassembly shows the hot k-loop as two `movsd` cell loads + `mulsd`/`addsd` in
+  XMM behind the folded-stride `imul` and `bt` presence checks.
 
 ## Why this exists
 

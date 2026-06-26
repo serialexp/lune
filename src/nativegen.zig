@@ -886,7 +886,7 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .ptr) return false;
                 const lk = laneKind(ins.aux) orelse return false; // grid_elem lane
-                if (lk != .int) return false; // int grid lanes only (this cut)
+                if (lk != .int and lk != .float) return false; // int + f64 grid lanes
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 kinds[i] = .none;
             },
@@ -907,7 +907,7 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .ptr or kinds[ins.b] != .int) return false;
                 const lk = laneKind(ins.aux) orelse return false;
-                if (lk != .int) return false; // recorder aborts f64/bool grids
+                if (lk != .int and lk != .float) return false; // int + f64 grid lanes (bool never a grid)
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 kinds[i] = .aref;
             },
@@ -922,7 +922,7 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .aref or kinds[ins.b] != .int) return false;
                 const lk = laneKind(ins.aux) orelse return false;
-                if (lk != .int) return false;
+                if (lk != .int and lk != .float) return false;
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 if (!bounds_ok[ins.a]) return false; // row bound must dominate the gcell
                 kinds[i] = .aref;
@@ -947,34 +947,43 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (!gcol_ok[ins.a]) return false; // column bound must dominate
                 kinds[i] = .none;
             },
-            // gload: a typed load from the grid cell addressed by the gcell. The
-            // recorder stamps the observed cell type in `ins.ty` (always int — it
-            // aborts non-int grids). Gated on the column proof; the row proof is
-            // already discharged at the gcell. Sign-extends the grid_elem-width cell.
+            // gload: a typed load from the grid cell addressed by the gcell. Gated on
+            // the column proof; the row proof is already discharged at the gcell. An
+            // int cell sign/zero-extends the grid_elem-width element into a GP home; an
+            // f64 cell `movsd`s the raw double into an XMM home (kind `.float`).
             .gload => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
                 if (!gcol_ok[ins.a]) return false; // column bound must dominate
                 const lk = laneKind(ins.aux) orelse return false;
-                if (lk != .int) return false;
+                if (lk != .int and lk != .float) return false;
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
-                kinds[i] = .int;
+                kinds[i] = lk; // int grid → .int (GP); f64 grid → .float (XMM)
             },
             // gstore: encode the value (`b`) into the grid cell addressed by the
             // gcell (`a`) and set its presence bit. Gated on the column proof; the
             // row proof is discharged at the gcell. The recorder emits a covering
-            // guard_fits on the value and aborts a widening store, so the value is a
-            // proven int that fits grid_elem — store at the cell width, then set the
-            // presence bit. Produces no value.
+            // guard_fits on the value and aborts a growing store, so for an int lane
+            // the value is a proven int that fits grid_elem (store at the cell width);
+            // for an f64 lane it is a proven float committed as a full-width `movsd`
+            // (every double fits → no fits_ok requirement, mirroring the f64 astore).
+            // Produces no value.
             .gstore => {
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
-                if (kinds[ins.b] != .int) return false;
                 if (!gcol_ok[ins.a]) return false; // column bound must dominate
-                if (!fits_ok[ins.b]) return false; // guard_fits ⇒ width store is exact
                 const lk = laneKind(ins.aux) orelse return false;
-                if (lk != .int) return false;
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                switch (lk) {
+                    .int => {
+                        if (kinds[ins.b] != .int) return false;
+                        if (!fits_ok[ins.b]) return false; // guard_fits ⇒ width store is exact
+                    },
+                    .float => {
+                        if (kinds[ins.b] != .float) return false; // full-width movsd, no range check
+                    },
+                    else => return false,
+                }
                 kinds[i] = .none;
             },
             .loop => {
@@ -3239,33 +3248,62 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try a.jcc(.ae, deopt_exit); // CF==0 → hole → side-exit
             },
             // gload: load the grid cell at the flat index (gcell value) and decode by the
-            // grid_elem width into the gload's int home — sign-extend the signed lanes,
-            // zero-extend u8 (matching `array.decodeGridCell`).
+            // grid_elem width into the gload's home. Int lanes sign-extend (zero-extend
+            // u8) into a GP home (matching `array.decodeGridCell`); the f64 lane `movsd`s
+            // the raw 8-byte double at `[data + flat*8]` into an XMM/spill float home —
+            // no decode/rounding (decodeGridCell for `.f64` is a raw `@bitCast`, so the
+            // bits move byte-identically, 8-mode parity inherited). Mirrors the aload arm.
             .gload => {
                 const gcell_ins = t.instrs[ins.a];
                 const garow_ins = t.instrs[gcell_ins.a];
                 const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax);
                 const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
-                if (ins.aux == U8_LANE) {
+                if (ins.aux == F64_LANE) {
+                    try a.leaRegMemSib(.rax, datareg, flatreg, 8, 0); // rax = &data[flat]
+                    switch (placeOfRef(alloc, i)) {
+                        .xmm => |x| try a.movsdRegMem(x, .rax, 0),
+                        .mem => |d| {
+                            try a.movsdRegMem(XMM_SCRATCH0, .rax, 0);
+                            try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
+                        },
+                        .reg => unreachable, // a float never homes in a GP register
+                    }
+                } else if (ins.aux == U8_LANE) {
                     try a.loadRegMemSib(.rax, datareg, flatreg, 1, false, 0); // movzx
+                    try regToPlace(a, placeOfRef(alloc, i), .rax);
                 } else {
                     const w = intLaneWidth(ins.aux);
                     try a.loadRegMemSib(.rax, datareg, flatreg, w, true, 0); // sign-extend
+                    try regToPlace(a, placeOfRef(alloc, i), .rax);
                 }
-                try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
-            // gstore: width-truncating data write at the flat cell index (guard_fits
-            // proved the value fits grid_elem), then set the presence bit LAST (the
-            // absent→present commit point). Mirrors the in-bounds int-lane `astore`.
+            // gstore: write the cell at the flat index, then set the presence bit LAST
+            // (the absent→present commit point). An int lane does a width-truncating
+            // store (guard_fits proved the value fits grid_elem); the f64 lane stages
+            // the value into a scratch XMM and `movsd`s the raw double at `[data+flat*8]`
+            // (full-width, no truncation — `encodeGridCell` for `.f64` is a raw
+            // `@bitCast`, so the bits commit byte-identically). Mirrors the in-bounds
+            // `astore` int / f64 paths.
             .gstore => {
                 const gcell_ins = t.instrs[ins.a];
                 const garow_ins = t.instrs[gcell_ins.a];
-                const w = intLaneWidth(ins.aux);
-                const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax);
-                const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
-                try a.leaRegMemSib(.rax, datareg, flatreg, w, 0); // rax = &data[flat]
-                try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // value → rcx
-                try a.storeMemReg(.rax, w, 0, .rcx); // [rax] = (lane-width) value
+                if (ins.aux == F64_LANE) {
+                    // Stage the value into XMM_SCRATCH0 BEFORE clobbering rax/rcx with the
+                    // data base / flat index (the value home is xmm2..15 or a spill,
+                    // never rax/rcx/XMM_SCRATCH0).
+                    try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
+                    const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax);
+                    const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.leaRegMemSib(.rax, datareg, flatreg, 8, 0); // rax = &data[flat]
+                    try a.movsdMemReg(.rax, 0, XMM_SCRATCH0); // [rax] = double
+                } else {
+                    const w = intLaneWidth(ins.aux);
+                    const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax);
+                    const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    try a.leaRegMemSib(.rax, datareg, flatreg, w, 0); // rax = &data[flat]
+                    try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // value → rcx
+                    try a.storeMemReg(.rax, w, 0, .rcx); // [rax] = (lane-width) value
+                }
                 const preg = try arrayFieldReg(a, alloc, garow_ins.a, .present, .rax);
                 const pflat = try refBaseReg(a, alloc, ins.a, .rcx);
                 try a.btsMemReg(preg, 0, pflat);

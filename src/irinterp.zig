@@ -319,10 +319,9 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 // Read grid cell `(row,col)` via the exact tier-0 grid reader, so an
                 // executed trace reads byte-identical to tier-0. `guard_grid`,
                 // `guard_bounds` (row), `guard_gcol` (col), and `guard_gpresent` have
-                // all passed, so this hits a present cell of an int grid (the recorder
-                // restricts grids to int element lanes — doc 14 Phase 8a). The decoded
-                // cell is structurally an int (guaranteed by `grid_elem`), so unlike
-                // `hload` no tag recheck is needed.
+                // all passed, so this hits a present cell of an int- or f64-lane grid.
+                // The decoded cell's type is fixed by `grid_elem` (int or float), so
+                // unlike `hload` no tag recheck is needed.
                 .gload => {
                     const gc = t.instrs[ins.a];
                     const ga = t.instrs[gc.a];
@@ -553,8 +552,8 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
 
                 // ---- flattened-grid structural guards (doc 14, Phase 8) ----
                 //
-                // The container is still an int grid at the recorded element lane.
-                // A bare access would have deflated it (`lane != .grid`), and a
+                // The container is still a grid at the recorded element lane (int or
+                // f64). A bare access would have deflated it (`lane != .grid`), and a
                 // monotonic widen of the cell lane (e.g. i8→i32) moves `grid_elem`
                 // past `aux` — either side-exits to tier-0, where the access runs on
                 // the materialised representation.
