@@ -563,6 +563,23 @@ pub const Assembler = struct {
         try self.b(0xD3);
         try self.modrmReg(5, reg.lo());
     }
+    /// `sar reg, cl` — REX.W D3 /7. Arithmetic (sign-extending) right shift by
+    /// cl & 63 — the match for lune's `~>>` (`arith.sar`). The native lowering
+    /// (`emitShift`) brackets it with the same explicit range check as shl/shr.
+    pub fn sarRegCl(self: *Assembler, reg: Reg) !void {
+        try self.rex(true, false, false, reg.hi());
+        try self.b(0xD3);
+        try self.modrmReg(7, reg.lo());
+    }
+    /// `sar reg, imm8` — REX.W C1 /7 ib. Arithmetic right shift by a fixed
+    /// immediate count. `emitShift` uses `sar reg, 63` for `~>>`'s out-of-range
+    /// (count >= 64) leg to broadcast the sign bit (-1 or 0).
+    pub fn sarRegImm8(self: *Assembler, reg: Reg, imm: u8) !void {
+        try self.rex(true, false, false, reg.hi());
+        try self.b(0xC1);
+        try self.modrmReg(7, reg.lo());
+        try self.b(imm);
+    }
     /// `not reg` — REX.W F7 /2 (bitwise complement; matches arith.bnot).
     pub fn notReg(self: *Assembler, reg: Reg) !void {
         try self.rex(true, false, false, reg.hi());
@@ -1414,6 +1431,29 @@ test "enc: shl / shr reg, cl" {
     try expectEnc(&.{ 0x49, 0xD3, 0xEF }, struct { // shr r15, cl (REX.B)
         fn f(a: *Assembler) !void {
             try a.shrRegCl(.r15);
+        }
+    }.f);
+}
+
+test "enc: sar reg, cl / sar reg, imm8" {
+    try expectEnc(&.{ 0x48, 0xD3, 0xF8 }, struct { // sar rax, cl  (D3 /7)
+        fn f(a: *Assembler) !void {
+            try a.sarRegCl(.rax);
+        }
+    }.f);
+    try expectEnc(&.{ 0x49, 0xD3, 0xFA }, struct { // sar r10, cl  (REX.B, D3 /7)
+        fn f(a: *Assembler) !void {
+            try a.sarRegCl(.r10);
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0xC1, 0xF8, 0x05 }, struct { // sar rax, 5  (C1 /7 ib)
+        fn f(a: *Assembler) !void {
+            try a.sarRegImm8(.rax, 5);
+        }
+    }.f);
+    try expectEnc(&.{ 0x49, 0xC1, 0xFA, 0x3F }, struct { // sar r10, 63 (REX.B, C1 /7 ib)
+        fn f(a: *Assembler) !void {
+            try a.sarRegImm8(.r10, 63);
         }
     }.f);
 }

@@ -1,6 +1,6 @@
 # lune — LuaJIT 3.0 Syntax-Extension Parity
 
-Status: draft — decisions made, nothing implemented
+Status: partial — Phase 1 (`~>>`) landed; Phases 2–5 outstanding
 Owner: Bart
 Last updated: 2026-06-26
 
@@ -16,12 +16,22 @@ whole phases to "Done" once everything inside is checked.
 
 ### Done
 
-_(nothing yet — design only)_
+- [x] **Phase 1 — `~>>` arithmetic right shift.** New token `rshift_arith` (`~>>`)
+      with maximal-munch disambiguation from `~=` / `~` / `~>`; AST op `sar`,
+      bytecode `sar`, compiler mapping; `arith.sar` oracle (sign-extending i64,
+      sign-fill on count ≥ 64, logical-left reverse on negative count) + unit
+      tests; tier-0 dispatch + `__sar` metamethod + bitwise fault message; parser
+      precedence (shift level, l=14/r=15); trace IR `sar` (appended at enum end =
+      ordinal 47, wire-pinned in `traceser` + `viz/src/enums.ts`); tier-1a
+      `irinterp` eval; `tropt`/`troptdiag` binary classification; `x64`
+      `sarRegCl` (D3 /7) + `sarRegImm8` (C1 /7 ib) encoders + tests; `nativegen`
+      `proveKinds`/`isTransient`/`operandReads`/`emitShift` (sign-fill leg) +
+      differential test across all count regimes. Verified identical across
+      tier-0 / tier-1a / native via the CLI; the JIT records `sar` and compiles
+      it natively (not declined). The open AST-name question is resolved: `sar`.
 
 ### Outstanding
 
-- [ ] **Phase 1 — `~>>` arithmetic right shift.** New token `~>>`, AST op `sar`,
-      tier-0 eval (sign-extending i64 shift), native lowering, parity tests.
 - [ ] **Phase 2 — `~>>=` compound form.** Rides on the general compound-assignment
       desugar (Phase 5) but the *operator* belongs to the bitwise set; land the
       token alongside Phase 1, wire the desugar in Phase 5.
@@ -192,8 +202,8 @@ so it gets the most test surface.
 - [ ] Where does the canonical "lune fails loud, no silent inf/nan" statement
       live — `02-determinism.md`, a new error-taxonomy doc, or here? (Decision 1
       references it; pick one home.)
-- [ ] AST op name for arithmetic shift: `sar`, `ashr`, or `shr_arith`? (Cosmetic;
-      pick one before Phase 1.)
+- [x] AST op name for arithmetic shift: **resolved to `sar`** (matches the x86
+      mnemonic and the existing `shl`/`shr` naming). Landed in Phase 1.
 - [ ] Do customary aliases round-trip through any pretty-printer / formatter we
       own? If a formatter exists, decide whether it canonicalizes `&&`→`and` or
       preserves source (Mike's criterion 5: don't hurt tool developers).

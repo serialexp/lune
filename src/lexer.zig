@@ -259,7 +259,7 @@ pub const Lexer = struct {
             '#' => .hash,
             '&' => .ampersand,
             '|' => .pipe,
-            '~' => self.pick('=', .ne, .tilde),
+            '~' => self.tildeOp(),
             '(' => .lparen,
             ')' => .rparen,
             '{' => .lbrace,
@@ -302,6 +302,21 @@ pub const Lexer = struct {
             return t2;
         }
         return no;
+    }
+
+    /// After consuming one `~`: resolve `~=` (inequality) / `~>>` (arithmetic
+    /// right shift) / `~` (bitwise xor / unary not). `~>` with a single `>` is
+    /// left as a bare `~` followed by `>`; only the full `~>>` munches.
+    fn tildeOp(self: *Lexer) Token.Tag {
+        if (self.peek() == '=') {
+            self.index += 1;
+            return .ne;
+        }
+        if (self.peek() == '>' and self.peekNext() == '>') {
+            self.index += 2;
+            return .rshift_arith;
+        }
+        return .tilde;
     }
 
     /// After consuming one `.`: resolve `.` / `..` / `...`.
@@ -378,6 +393,16 @@ test "maximal-munch operators" {
         .plus,  .minus, .star,    .slash, .slash_slash, .percent, .caret,
         .eq,    .ne,    .le,      .ge,    .lt,          .gt,      .lshift,
         .rshift, .dot_dot, .ellipsis, .double_colon, .assign, .colon, .dot,
+    });
+}
+
+test "tilde disambiguation: ~ ~= ~>>" {
+    // `~>>` munches as one arithmetic-shift token; `~>` is `~` then `>`;
+    // `~=` is inequality; bare `~` stands alone.
+    try expectTags("~ ~= ~>> a ~> b ~~", &.{
+        .tilde,      .ne,    .rshift_arith, .identifier,
+        .tilde,      .gt,    .identifier,   .tilde,
+        .tilde,
     });
 }
 

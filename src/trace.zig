@@ -320,6 +320,15 @@ pub const IrOp = enum(u8) {
     /// `guard_float` pins the arg type. `ty` is always `.float`. Classified `.unary`
     /// (NOT a constant-folder input — see doc 12 / `tropt`).
     fsqrt,
+
+    // ---- arithmetic right shift (`~>>`, lune syntax extension) ----------------
+    /// `a` = value ref, `b` = count ref → arithmetic (sign-extending) right shift,
+    /// the `~>>` operator. The bitwise-group analogue of `shr`/`shl`: both operands
+    /// guarded `.int` upstream, 64-bit width like the rest of lune's integer
+    /// bitwise set, oracle is `arith.sar`. Classified `.binary` (a pure two-int
+    /// producer). Appended last so every prior op's wire ordinal stays stable
+    /// (the traceser ordinal-pinning convention — NEW ops go at the enum end).
+    sar,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -1427,7 +1436,7 @@ pub const TraceState = struct {
                 .konst => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len),
                 .loop => std.debug.assert(i == last), // the only loop, and it is terminal
                 // binary ops read both `a` and `b`.
-                .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .eq, .ne, .lt, .le => {
+                .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => {
                     std.debug.assert(ins.a < i and ins.b < i);
                 },
                 // unary ops and guards read `a` only.
@@ -1521,6 +1530,7 @@ pub const TraceState = struct {
             .bxor => try self.recBitwise(.bxor, instr, regs),
             .shl => try self.recBitwise(.shl, instr, regs),
             .shr => try self.recBitwise(.shr, instr, regs),
+            .sar => try self.recBitwise(.sar, instr, regs),
             .neg => try self.recNeg(instr, regs),
             .not => try self.recNot(instr),
             .bnot => try self.recBnot(instr, regs),

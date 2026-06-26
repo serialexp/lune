@@ -55,6 +55,7 @@ pub const OpCode = enum(u8) {
     bxor,
     shl,
     shr,
+    sar,
 
     // ---- unary:        R[a] = op R[b] ----
     neg,

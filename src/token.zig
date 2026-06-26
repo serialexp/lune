@@ -67,6 +67,7 @@ pub const Token = struct {
         tilde, // ~   (bitwise xor / unary not)
         lshift, // <<
         rshift, // >>
+        rshift_arith, // ~>>  (arithmetic / sign-extending right shift)
         eq, // ==
         ne, // ~=
         lt, // <
@@ -144,6 +145,7 @@ pub const Token = struct {
                 .tilde => "~",
                 .lshift => "<<",
                 .rshift => ">>",
+                .rshift_arith => "~>>",
                 .eq => "==",
                 .ne => "~=",
                 .lt => "<",

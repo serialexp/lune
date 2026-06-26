@@ -497,6 +497,7 @@ const Parser = struct {
             .ampersand => .{ .op = .band, .l = 12, .r = 13 },
             .lshift => .{ .op = .shl, .l = 14, .r = 15 },
             .rshift => .{ .op = .shr, .l = 14, .r = 15 },
+            .rshift_arith => .{ .op = .sar, .l = 14, .r = 15 },
             // concat is right-associative: l > r.
             .dot_dot => .{ .op = .concat, .l = 17, .r = 16 },
             .plus => .{ .op = .add, .l = 18, .r = 19 },

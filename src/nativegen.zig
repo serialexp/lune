@@ -534,7 +534,7 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             // Lua's full shift semantics (negative count → reverse direction, |count|
             // >= 64 → 0) with an explicit range bracket, so any int count is correct —
             // no masking assumption (`emitShift`).
-            .shl, .shr => {
+            .shl, .shr, .sar => {
                 if (kinds[ins.a] != .int or kinds[ins.b] != .int) return false;
                 kinds[i] = .int;
             },
@@ -1034,7 +1034,7 @@ const AnalyzeError = std.mem.Allocator.Error || error{
 /// and the loop marker produce no value.
 fn isTransient(op: trace.IrOp) bool {
     return switch (op) {
-        .konst, .add, .sub, .mul, .div, .band, .bor, .bxor, .shl, .shr, .neg, .bnot, .eq, .ne, .lt, .le => true,
+        .konst, .add, .sub, .mul, .div, .band, .bor, .bxor, .shl, .shr, .sar, .neg, .bnot, .eq, .ne, .lt, .le => true,
         // aref materializes idx0 in a register; aload materializes the decoded bool.
         .aref, .aload => true,
         // int_of_float materializes the converted int limit in a register.
@@ -1061,7 +1061,7 @@ fn isCommutative(op: trace.IrOp) bool {
 /// The operand refs an instruction reads (matching `proveKinds`/`lower` exactly).
 fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
     return switch (ins.op) {
-        .add, .sub, .mul, .div, .band, .bor, .bxor, .shl, .shr, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
+        .add, .sub, .mul, .div, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
         .neg, .bnot, .guard_int, .guard_true, .guard_false => .{ .a = true, .b = false },
         // int_of_float reads its sole float operand (a).
         .int_of_float => .{ .a = true, .b = false },
@@ -1940,16 +1940,18 @@ fn emitBinAlu(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Plac
     }
 }
 
-/// Lower a Lua shift `dst = pa <shift> pb` (`pb` = the count). Reproduces the FULL
-/// Lua semantics the oracle (`arith.shiftLeft`/`shiftRight`) computes, making no
-/// assumption that the count is masked: a negative count shifts the other direction,
-/// and `|count| >= 64` yields 0. x86 `shl/shr reg, cl` honours only the low 6 bits of
-/// the count, so the out-of-`[0,63]` cases are handled with an explicit branch bracket
-/// rather than a bare hardware shift (which would alias 64→0, 65→1, … and mishandle a
-/// negative count). The value works in `W` (the dst register, or rax for a spilled
-/// dst); the count lives in cl (rcx, a scratch reg) for the duration. Registers used:
-/// `W` + rcx only — no extra temporary — so it fits the cut-2 allocator's two scratch
-/// registers no matter how many homes are live.
+/// Lower a Lua/lune shift `dst = pa <shift> pb` (`pb` = the count). Reproduces the
+/// FULL operator semantics the oracle (`arith.shiftLeft`/`shiftRight`/`shiftRightArith`)
+/// computes, making no assumption that the count is masked: a negative count shifts the
+/// other direction, and an out-of-range positive count saturates — to `0` for the
+/// logical shifts (`shl`/`shr`), or to the **sign fill** (`-1`/`0`) for the arithmetic
+/// right shift (`sar`, the `~>>` operator). x86 `shl/shr/sar reg, cl` honour only the
+/// low 6 bits of the count, so the out-of-`[0,63]` cases are handled with an explicit
+/// branch bracket rather than a bare hardware shift (which would alias 64→0, 65→1, … and
+/// mishandle a negative count). The value works in `W` (the dst register, or rax for a
+/// spilled dst); the count lives in cl (rcx, a scratch reg) for the duration. Registers
+/// used: `W` + rcx only — no extra temporary — so it fits the cut-2 allocator's two
+/// scratch registers no matter how many homes are live.
 fn emitShift(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Place) !void {
     // Working register: the dst register itself, or rax when dst is spilled.
     const W: Reg = switch (dst) {
@@ -1968,29 +1970,45 @@ fn emitShift(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Place
     const neg_lbl = try a.label();
     const zero_lbl = try a.label();
     const done_lbl = try a.label();
+    // sar's positive-overflow leg broadcasts the sign bit instead of zeroing; only
+    // referenced/bound on the `.sar` path.
+    const sign_lbl = if (op == .sar) try a.label() else undefined;
 
     // count < 0 → reverse-direction branch.
     try a.cmpRegImm32(.rcx, 0);
     try a.jcc(.s, neg_lbl);
-    // count >= 64 → result 0 (a bare hardware shift would mask the count instead).
+    // count >= 64 → out of range. Logical shifts yield 0; arithmetic right shift
+    // saturates to the sign fill (`sar W, 63`).
     try a.cmpRegImm32(.rcx, 64);
-    try a.jcc(.ae, zero_lbl);
-    // 0 <= count < 64 → the op's primary direction (shl=left, shr=logical-right).
-    if (op == .shl) try a.shlRegCl(W) else try a.shrRegCl(W);
+    if (op == .sar) try a.jcc(.ae, sign_lbl) else try a.jcc(.ae, zero_lbl);
+    // 0 <= count < 64 → the op's primary direction.
+    switch (op) {
+        .shl => try a.shlRegCl(W),
+        .shr => try a.shrRegCl(W),
+        .sar => try a.sarRegCl(W),
+        else => unreachable,
+    }
     try a.jmp(done_lbl);
 
     a.bind(neg_lbl);
     // magnitude = -count; an out-of-range magnitude (incl. INT64_MIN, whose negation
-    // stays INT64_MIN — huge as unsigned) → result 0.
+    // stays INT64_MIN — huge as unsigned) → result 0 (the reverse is always logical).
     try a.negReg(.rcx);
     try a.cmpRegImm32(.rcx, 64);
     try a.jcc(.ae, zero_lbl);
-    // Reverse direction by the magnitude (Lua: `x << -n` == `x >> n`, both logical).
+    // Reverse direction by the magnitude (`x << -n` == `x >> n`; for sar the reverse is
+    // a logical left, exactly as for shr).
     if (op == .shl) try a.shrRegCl(W) else try a.shlRegCl(W);
     try a.jmp(done_lbl);
 
     a.bind(zero_lbl);
     try a.xorRegReg(W, W);
+    if (op == .sar) {
+        // zero_lbl falls through to done unless sar's sign leg follows; jump past it.
+        try a.jmp(done_lbl);
+        a.bind(sign_lbl);
+        try a.sarRegImm8(W, 63); // broadcast bit 63 → all-ones (-1) or all-zeros (0)
+    }
 
     a.bind(done_lbl);
     // Spilled dst: write the computed value back to its stack home.
@@ -2492,9 +2510,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     try emitBinAlu(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
                 }
             },
-            .shl, .shr => {
-                // Always int (proveKinds pins both operands int). Full Lua semantics
-                // via the branch-bracketed cl shift (emitShift).
+            .shl, .shr, .sar => {
+                // Always int (proveKinds pins both operands int). Full Lua/lune semantics
+                // via the branch-bracketed cl shift (emitShift); `.sar` adds the
+                // sign-fill overflow leg.
                 try emitShift(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
             },
             .neg, .bnot => {
@@ -3216,6 +3235,20 @@ test "nativegen: shl/shr native lowering matches the Lua shift oracle across cou
     try expectShiftMatch(.shr, 1, -5); // negative → logical <<5 → 32
     try expectShiftMatch(.shr, 1, -64); // |n|=64 → 0
     try expectShiftMatch(.shr, -1, MIN); // INT64_MIN count → 0
+    // sar (~>>): arithmetic right for n≥0 (sign-extends), logical left by |n| for n<0,
+    // sign-fill for n≥64, 0 for |n|≥64 on the reverse leg.
+    try expectShiftMatch(.sar, 256, 4); // 16 (positive operand == logical)
+    try expectShiftMatch(.sar, -1, 1); // sign-extend → -1
+    try expectShiftMatch(.sar, -1, 63); // sign-extend → -1 (NOT 1 like shr)
+    try expectShiftMatch(.sar, -4, 1); // -2
+    try expectShiftMatch(.sar, -1, 64); // ≥64 → sign fill -1
+    try expectShiftMatch(.sar, -1, 100); // ≥64 → sign fill -1
+    try expectShiftMatch(.sar, 1, 64); // ≥64, positive → 0
+    try expectShiftMatch(.sar, MIN, 100); // ≥64, negative → -1
+    try expectShiftMatch(.sar, MIN, 63); // sign-extend INT64_MIN → -1
+    try expectShiftMatch(.sar, 1, -5); // negative count → logical <<5 → 32
+    try expectShiftMatch(.sar, 1, -64); // |n|=64 → 0
+    try expectShiftMatch(.sar, -1, MIN); // INT64_MIN count → 0
 }
 
 test "nativegen(E2): an internal φ (slot-less carry) matches the oracle and is never flushed" {

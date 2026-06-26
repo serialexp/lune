@@ -9,7 +9,7 @@
 // (Future hardening: generate this file from Zig @typeInfo reflection so it
 // cannot drift at all — see docs/design/04-snapshot-replay-schema.md.)
 
-/** IR opcodes, indexed by wire ordinal (mirrors trace.IrOp, 0..44). */
+/** IR opcodes, indexed by wire ordinal (mirrors trace.IrOp, 0..47). */
 export const IR_OP_NAMES = [
   "slot_load", // 0
   "konst", // 1
@@ -58,6 +58,7 @@ export const IR_OP_NAMES = [
   "guard_hash", // 44
   "guard_pure", // 45
   "fsqrt", // 46
+  "sar", // 47  (~>> arithmetic right shift; appended at the enum end)
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];

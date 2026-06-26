@@ -42,7 +42,8 @@ pub const BinaryOp = enum {
     bor, // |
     bxor, // ~
     shl, // <<
-    shr, // >>
+    shr, // >>  (logical / zero-fill)
+    sar, // ~>> (arithmetic / sign-extending)
 };
 
 pub const UnaryOp = enum {

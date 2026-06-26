@@ -457,6 +457,8 @@ const MetamethodNames = struct {
     bnot: Value = Value.nil(),
     shl: Value = Value.nil(),
     shr: Value = Value.nil(),
+    /// `"__sar"` — `a ~>> b` (arithmetic right shift; lune extension).
+    sar: Value = Value.nil(),
     // -- chunk 2b: other operators --
     /// `"__concat"` — `a .. b` when an operand is not a string/number.
     concat: Value = Value.nil(),
@@ -1237,7 +1239,7 @@ pub const Vm = struct {
                 ),
                 // Bitwise ops want an integer operand: a float (no integer form)
                 // and a non-number get distinct Lua-5.4-shaped messages.
-                .band, .bor, .bxor, .shl, .shr => try bitwiseFaultMessage(arena, firstNonInteger(regs.get(instr.b), regs.get(instr.c))),
+                .band, .bor, .bxor, .shl, .shr, .sar => try bitwiseFaultMessage(arena, firstNonInteger(regs.get(instr.b), regs.get(instr.c))),
                 .neg => try std.fmt.allocPrint(arena, "attempt to perform arithmetic on a {s} value", .{regs.get(instr.b).typeName()}),
                 .bnot => try bitwiseFaultMessage(arena, regs.get(instr.b)),
                 .len => try std.fmt.allocPrint(arena, "attempt to get length of a {s} value", .{regs.get(instr.b).typeName()}),
@@ -1781,6 +1783,11 @@ pub const Vm = struct {
                     const lhs = regs.get(instr.b);
                     const rhs = regs.get(instr.c);
                     regs.set(a, try self.arithMeta(arith.shr(lhs, rhs), self.mm.shr, lhs, rhs));
+                },
+                .sar => {
+                    const lhs = regs.get(instr.b);
+                    const rhs = regs.get(instr.c);
+                    regs.set(a, try self.arithMeta(arith.sar(lhs, rhs), self.mm.sar, lhs, rhs));
                 },
 
                 // ---- unary ----
@@ -5029,7 +5036,23 @@ test "metatable: arithmetic metamethods (add/sub/mul/div/mod/pow/idiv)" {
     );
 }
 
-test "metatable: bitwise metamethods (band/bor/bxor/shl/shr/bnot)" {
+test "bitwise: ~>> arithmetic right shift (sign-extending, 64-bit)" {
+    try expectProgram(
+        \\print(-8 ~>> 1)
+        \\print(-1 ~>> 63)
+        \\print(256 ~>> 4)
+        \\print(-1 ~>> 100)
+        \\print(1 ~>> -5)
+        \\print((1 << 62) ~>> 60)
+        \\
+    ,
+        // -4, -1 (sign fill, not 1), 16, -1 (overshift saturates to sign), 32 (neg
+        // count = logical left), 4
+        "-4\n-1\n16\n-1\n32\n4\n",
+    );
+}
+
+test "metatable: bitwise metamethods (band/bor/bxor/shl/shr/sar/bnot)" {
     try expectProgram(
         \\local N = {}; N.__index = N
         \\local function n(x) return setmetatable({ v = x }, N) end
@@ -5038,16 +5061,18 @@ test "metatable: bitwise metamethods (band/bor/bxor/shl/shr/bnot)" {
         \\N.__bxor = function(a, b) return a.v ~ b.v end
         \\N.__shl  = function(a, b) return a.v << b.v end
         \\N.__shr  = function(a, b) return a.v >> b.v end
+        \\N.__sar  = function(a, b) return a.v ~>> b.v end
         \\N.__bnot = function(a) return ~a.v end
         \\print(n(6) & n(3))
         \\print(n(6) | n(1))
         \\print(n(6) ~ n(3))
         \\print(n(1) << n(4))
         \\print(n(64) >> n(2))
+        \\print(n(-8) ~>> n(1))
         \\print(~n(0))
         \\
     ,
-        "2\n7\n5\n16\n16\n-1\n",
+        "2\n7\n5\n16\n16\n-4\n-1\n",
     );
 }
 

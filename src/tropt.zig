@@ -67,7 +67,7 @@ fn kindOf(op: IrOp) OpKind {
     return switch (op) {
         .konst => .konst,
         .slot_load => .slot_load,
-        .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .eq, .ne, .lt, .le => .binary,
+        .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => .binary,
         .neg, .not, .bnot => .unary,
         // `int_of_float`: a value producer that ALSO side-exits. Its own `cvt` kind
         // so it is a liveness root (its side-exit must survive DCE) yet still emits

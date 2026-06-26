@@ -1430,6 +1430,7 @@ fn binOpCode(op: ast.BinaryOp) OpCode {
         .bxor => .bxor,
         .shl => .shl,
         .shr => .shr,
+        .sar => .sar,
         .and_, .or_ => unreachable, // handled by short-circuit lowering
     };
 }

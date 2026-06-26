@@ -124,7 +124,7 @@ fn detectDeadCarries(
     for (t.instrs) |ins| {
         switch (ins.op) {
             .add, .sub, .mul, .div, .idiv, .mod, .pow,
-            .band, .bor, .bxor, .shl, .shr,
+            .band, .bor, .bxor, .shl, .shr, .sar,
             .eq, .ne, .lt, .le,
             => {
                 uses[ins.a] += 1;
@@ -240,7 +240,7 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
     for (instrs, 0..) |ins, i| {
         const consumes = switch (ins.op) {
             .add, .sub, .mul, .div, .idiv, .mod, .pow,
-            .band, .bor, .bxor, .shl, .shr,
+            .band, .bor, .bxor, .shl, .shr, .sar,
             .eq, .ne, .lt, .le,
             => ins.a == idx or ins.b == idx,
             .neg, .not, .bnot,
@@ -356,7 +356,7 @@ fn detectUnhoistedInvariants(
             .konst => inv[i] = true,
             .slot_load => inv[i] = !carried_slots.contains(ins.aux),
             .add, .sub, .mul, .div, .idiv, .mod, .pow,
-            .band, .bor, .bxor, .shl, .shr,
+            .band, .bor, .bxor, .shl, .shr, .sar,
             => inv[i] = inv[ins.a] and inv[ins.b],
             .neg, .not, .bnot => inv[i] = inv[ins.a],
             else => {}, // guards, memory, phi, loop, preheader: never invariant
@@ -373,7 +373,7 @@ fn detectUnhoistedInvariants(
 
         switch (ins.op) {
             .add, .sub, .mul, .div, .pow,
-            .band, .bor, .bxor, .shl, .shr,
+            .band, .bor, .bxor, .shl, .shr, .sar,
             .neg, .not, .bnot,
             => {
                 const owned = try gpa.dupe(Ref, &.{@intCast(i)});

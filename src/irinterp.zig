@@ -187,7 +187,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 //      (`evalBinary`, the *same* code the optimizer folds with).
                 //      Any error (only integer //- or %-by-zero is reachable; see
                 //      arith.zig) side-exits to tier-0, which re-raises it. ----
-                .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .eq, .ne, .lt, .le => {
+                .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => {
                     values[i] = evalBinary(ins.op, values[ins.a], values[ins.b]) catch {
                         if (record) rec.exit(i, .arith, Value.nil());
                         break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
@@ -564,6 +564,7 @@ pub fn evalBinary(op: trace.IrOp, a: Value, b: Value) arith.Error!Value {
         .bxor => arith.bxor(a, b),
         .shl => arith.shl(a, b),
         .shr => arith.shr(a, b),
+        .sar => arith.sar(a, b),
         .eq => Value.boolean(arith.eq(a, b)),
         .ne => Value.boolean(!arith.eq(a, b)),
         .lt => Value.boolean(try arith.lt(a, b)),

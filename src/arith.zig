@@ -212,6 +212,26 @@ pub fn shr(a: Value, b: Value) Error!Value {
     return Value.int(shiftRight(a.asInt(), b.asInt()));
 }
 
+/// Arithmetic (sign-extending) right shift of `x` by `n` bits. `n < 0` shifts
+/// left (logical); a right shift by `|n| >= 64` saturates to the sign fill
+/// (`-1` for negative `x`, `0` otherwise) rather than `0`. The positive leg
+/// uses Zig's signed `>>`, which is arithmetic. Written directly (not via `-n`)
+/// so a `minInt` count cannot overflow the negation.
+fn shiftRightArith(x: i64, n: i64) i64 {
+    if (n >= 63) return x >> 63; // full sign fill (clamp the count to 63)
+    if (n >= 0) return x >> @intCast(n);
+    if (n <= -64) return 0;
+    const ux: u64 = @bitCast(x);
+    return @bitCast(ux << @intCast(-n));
+}
+
+/// `a ~>> b` (arithmetic right shift, sign-extending). lune-only operator
+/// (LuaJIT 3.0 syntax); 64-bit width like the rest of lune's bitwise set.
+pub fn sar(a: Value, b: Value) Error!Value {
+    try requireInts(a, b);
+    return Value.int(shiftRightArith(a.asInt(), b.asInt()));
+}
+
 // ---- comparisons ----
 
 /// `a < b`. Numbers compare by value (a `NaN` operand makes this false); two
@@ -348,6 +368,26 @@ test "shifts are logical and Lua-style (negative count, overshift to zero)" {
     try expectEqual(@as(i64, 0), (try shr(Value.int(-1), Value.int(100))).asInt());
     // a minInt shift count must not overflow when shifting the other way
     try expectEqual(@as(i64, 0), (try shr(Value.int(1), Value.int(std.math.minInt(i64)))).asInt());
+}
+
+test "arithmetic right shift (~>>) sign-extends" {
+    // positive operand: identical to logical shr
+    try expectEqual(@as(i64, 0b1), (try sar(Value.int(0b100000), Value.int(5))).asInt());
+    // negative operand fills with the sign bit (1s), unlike logical shr
+    try expectEqual(@as(i64, -1), (try sar(Value.int(-1), Value.int(63))).asInt());
+    try expectEqual(@as(i64, -1), (try sar(Value.int(-1), Value.int(1))).asInt());
+    try expectEqual(@as(i64, -2), (try sar(Value.int(-4), Value.int(1))).asInt());
+    // overshift right saturates to the sign fill, not zero
+    try expectEqual(@as(i64, -1), (try sar(Value.int(-1), Value.int(100))).asInt());
+    try expectEqual(@as(i64, 0), (try sar(Value.int(1), Value.int(64))).asInt());
+    try expectEqual(@as(i64, 0), (try sar(Value.int(std.math.maxInt(i64)), Value.int(100))).asInt());
+    // negative count shifts left (logical), |n| >= 64 -> 0
+    try expectEqual(@as(i64, 0b100000), (try sar(Value.int(0b1), Value.int(-5))).asInt());
+    try expectEqual(@as(i64, 0), (try sar(Value.int(-1), Value.int(-64))).asInt());
+    // minInt shift count must not overflow the negation
+    try expectEqual(@as(i64, 0), (try sar(Value.int(1), Value.int(std.math.minInt(i64)))).asInt());
+    // minInt operand: -1 fill saturates
+    try expectEqual(@as(i64, -1), (try sar(Value.int(std.math.minInt(i64)), Value.int(63))).asInt());
 }
 
 test "type errors on non-numbers" {
