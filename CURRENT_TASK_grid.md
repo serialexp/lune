@@ -228,17 +228,38 @@ load/store chains), `--dump-aborts` shows NO `get_index2`/`set_index2` aborts
 byte-identical across tier-0 / `--trace` / `--trace-no-opt` /
 `--trace-record-only` / `--jit-native`.
 
-## Stage B — NEXT (the win)
-`nativegen` lowering for the 8 ops (see Stage B bullet above). Entry points to
-touch, mirroring the `aref`/`aload`/`astore` paths:
-- `proveKinds` (src/nativegen.zig ~346): admit the grid ops — `garow`/`gcell` are
-  int-kind address producers; `gload` yields the cell's int; `gstore` is an
-  effect; the 4 guards are deopt points. Set `bounds_ok`/lane bookkeeping as the
-  array path does.
-- `lower` (~2483 switch): `garow`→`row-1`; `gcell`→`row0*imul stride + (col-1)`
-  (load stride from the table, or fold via the `guard_stride` constant);
-  `gload`/`gstore`→flat addressing at `grid_elem` width + presence `bt`/`bts`.
-- `isTransient`/`operandReads`/`analyze` home-reservation + the guard-skip switch
-  (~2483) — add the grid ops alongside their array analogues.
-- Re-bench `grid_matmul` via `just bench --filter grid` vs baseline
-  (t0=304ms, jit=318ms, lj=7.5ms).
+## Stage B — LANDED (2026-06-27, `just test` green)
+`nativegen` now lowers all 8 grid ops to native x64. Model (Bart's pick,
+"Reuse .aref + fold stride const"):
+- **Kinds (`proveKinds` Pass B):** `garow`/`gcell` → `.aref` (the existing
+  addressing-token kind, so they compose with `guard_bounds`/home-reservation and
+  can't be flushed); `gload` → `.int`; `gstore`/`guard_gcol`/`guard_gpresent` →
+  `.none`; `guard_grid`/`guard_stride` → `.none` (prologue-only). New `gcol_ok[]`
+  array mirrors `bounds_ok[]`: a memory op requires `bounds_ok[garow]` (row, set at
+  `gcell`) **and** `gcol_ok[gcell]` (column). Pass A marks `guard_grid` as a table
+  guard (→ slot becomes `.ptr`). Int lanes only (`laneKind==.int`); f64/bool bail.
+- **Slot pinning (`analyze`):** a `.ptr` slot with a `garow` on it gets
+  `s.lane=GRID_LANE`, `s.grid_elem`, `s.grid_stride` from its `guard_grid`/
+  `guard_stride`; bails if it also carries a scalar lane (a table is grid XOR
+  array). Home-reservation walks the **two-hop** `gcell→garow→table` chain for the
+  data/present bases (`gload`→data, `gstore`→data+present, `guard_gpresent`→
+  present); `guard_bounds(garow)`→len rides the existing one-hop arm.
+- **Codegen (`lower`):** `garow`→`row-1` (like aref idx0); `gcell`→`movabs
+  rcx,stride; imul rax,rcx; add col; dec` (stride folded as imm32 from
+  `s.grid_stride`); `gload`→SIB `[data+flat*w]` sign/zero-extend; `gstore`→
+  width-truncating store + `bts [present],flat`; `guard_gcol`→`[1,stride]` range
+  bracket; `guard_gpresent`→`bt [present],flat`. `guard_grid`/`guard_stride` are
+  prologue checks (`lane==.grid ∧ grid_elem ∧ stride`), no body code.
+- **Recorder tweak:** `guard_gcol` now carries the column ref in `.b` (was `.a`
+  only) so native liveness keeps it for the range-compare — touched
+  `assertWellFormed`, `operandReads`, `troptdiag`, `viz/enums.ts`.
+- **Result:** `grid_matmul` **jit 318 ms → 36.2 ms** (8.8×; lj gap 39× → 4.5×),
+  byte-identical across all 8 modes + LuaJIT, serialisation round-trip intact,
+  `--dump-native` now compiles the two hot grid traces (init loops still tier-0).
+  Two of four traces compile (#2 hot k-loop, #3 C-store loop); #0/#1 are the bare
+  scalar init loops (array growth → no trace), unchanged.
+- **Doc 14** status → complete (Phase 8 Stage B bullet → Done). No stdlib
+  inventory change.
+
+Future cut (not this phase): f64 grid cells (needs XMM cell store/load in the
+native array path); store-after-load sinking for grids (Stage A/B both abort it).

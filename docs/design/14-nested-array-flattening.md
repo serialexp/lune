@@ -1,17 +1,21 @@
 # Nested Numeric Array Flattening — Design
 
-Status: partial — **building D.** Phases 0–7 landed on `master`. Live grids are
-now produced at runtime: a homogeneous-numeric nested table inflates on its first
+Status: complete (D) — Phases 0–8 landed on `master`. Live grids are
+produced at runtime: a homogeneous-numeric nested table inflates on its first
 fused `a[i][j]=v`, grows by **reshape-on-overflow** (stride / cell-lane), and
 deflates only on a genuine type change or any *bare* access — the **gate behind
 fused indexing** (2026-06-26, Bart; see §Escape detection). Grids survive GC
 stress live, and determinism/replay is closed: a grid is never serialised
 (deflated to logical nested rows at capture, with **deterministic reserved-space
-row ids** so a mid-execution cut resumes byte-identically — Phase 7). Remaining:
-Phase 8 Stage B only (native lowering). **Stage A landed**: the trace recorder now
-lowers `get_index2`/`set_index2` to a grid address chain behind grid guards and
-the tier-1a IR interpreter executes them byte-identically — grids tier up onto the
-oracle instead of aborting, with native codegen still bailing pending Stage B.
+row ids** so a mid-execution cut resumes byte-identically — Phase 7). **Phase 8
+is fully landed**: the trace recorder lowers `get_index2`/`set_index2` to a grid
+address chain behind grid guards (Stage A), and `nativegen` now lowers that chain
+to grid-relative address arithmetic — `flat = row0*stride + (col-1)` with the
+stride folded as an imm32 behind prologue `guard_grid`/`guard_stride` checks, the
+cell load/store at the `grid_elem` width, side-exiting to tier-0 on reshape
+(Stage B). `grid_matmul` (int lanes) goes from **jit 318 ms → 36 ms** (8.8×;
+LuaJIT gap 39× → 4.5×), byte-identical across all eight modes and to LuaJIT.
+Outstanding only as future work: f64 grid cells (this cut is int-lane only).
 Build size is explicitly *not* a blocker (see §Decision).
 Owner: Bart
 Last updated: 2026-06-27
@@ -146,12 +150,27 @@ land; move whole sections to Done once everything inside is checked.
   `set_index2` aborts) and is byte-identical across tier-0 / `--trace` /
   `--trace-no-opt` / `--trace-record-only` / `--jit-native`; `just test` green;
   traceser ordinal test + `viz/enums.ts` extended to ordinal 55.
-- [ ] **Phase 8 Stage B — Native lowering.** Teach `nativegen`
-  (`proveKinds`/`lower`/`analyze`/`isTransient`/`operandReads`/home-reservation) to
-  compile the eight grid ops to grid-relative address arithmetic
-  (`base + (row*stride + col)` at the cell lane) so the inner product runs as
-  native x64. This is where the matmul locality win is finally cashed; re-bench
-  `grid_matmul` against the recorded baseline (t0≈304ms, jit≈318ms, lj≈7.5ms).
+- [x] **Phase 8 Stage B — Native lowering.** `nativegen`
+  (`proveKinds`/`lower`/`analyze`/`isTransient`/`operandReads`/home-reservation)
+  compiles the eight grid ops to grid-relative address arithmetic. The chosen model
+  (Bart, 2026-06-27) **reuses the existing `.aref` kind**: `garow` materialises
+  `row0 = row-1` (mirroring an aref's idx0); `gcell` materialises the flat index
+  `flat = row0*stride + (col-1)` with `stride` **folded as an imm32** read off the
+  grid table's `SlotInfo.grid_stride` (`movabs rcx,stride; imul rax,rcx; add col;
+  dec`). `gload`/`gstore` load/store at the `grid_elem` width (sign-extend i8…i64,
+  zero-extend u8) via SIB `[data + flat*w]`, `gstore` setting the presence bit last;
+  `guard_gpresent` is `bt [present], flat`; `guard_gcol` is a `[1,stride]` range
+  bracket on the column (it now carries the column ref in `.b` for native liveness).
+  `guard_grid`/`guard_stride` are **prologue-only**, hoisted alongside the existing
+  table/lane checks (`array.lane==.grid ∧ grid_elem ∧ stride`), invariant for the
+  native run because the recorder aborts any growing/widening store. The home-
+  reservation walk resolves the data/present bases through the **two-hop**
+  `gcell→garow→table` chain; the row bound rides the existing `guard_bounds` on the
+  garow (grid len == row count). Result: `grid_matmul` **jit 318 ms → 36 ms** (8.8×;
+  LuaJIT gap 39× → 4.5×), byte-identical across all eight modes and to LuaJIT,
+  serialisation round-trip intact, `just test` green. Int element lanes only — an
+  f64 grid still bails to the tier-1a oracle (the native array path has no XMM cell
+  store/load yet), a future cut.
 
 ## Why this exists
 

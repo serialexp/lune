@@ -127,12 +127,12 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "guard_hash",
   "guard_pure",
   "fsqrt",
-  // Single-operand grid ops (doc 14): the cell load + the four structural guards
-  // render `%a`. garow/gcell/gstore are two-operand and use the default `%a, %b`.
+  // Single-operand grid ops (doc 14): the cell load + three structural guards
+  // render `%a`. garow/gcell/gstore/guard_gcol are two-operand (guard_gcol carries
+  // the column ref in `%b`) and use the default `%a, %b`.
   "gload",
   "guard_grid",
   "guard_stride",
-  "guard_gcol",
   "guard_gpresent",
 ]);
 

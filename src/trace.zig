@@ -1592,8 +1592,8 @@ pub const TraceState = struct {
                 // Grid cell access (doc 14, Phase 8): `garow` pairs (table,row),
                 // `gcell` pairs (garow,col), `gstore` reads (gcell, value) — all two
                 // prior operands. `gload` and the grid guards read one prior node.
-                .garow, .gcell, .gstore => std.debug.assert(ins.a < i and ins.b < i),
-                .gload, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent => std.debug.assert(ins.a < i),
+                .garow, .gcell, .gstore, .guard_gcol => std.debug.assert(ins.a < i and ins.b < i),
+                .gload, .guard_grid, .guard_stride, .guard_gpresent => std.debug.assert(ins.a < i),
                 // `aload` and the array-access guards read one prior node
                 // (the table value, or the `aref`). `guard_append` reads the `aref`.
                 // `hload`/`guard_hash` read the `href` (`a`).
@@ -2159,7 +2159,9 @@ pub const TraceState = struct {
         const garow = try self.emit(.{ .op = .garow, .a = rtab, .b = rrow, .aux = ge });
         _ = try self.emit(.{ .op = .guard_bounds, .a = garow }); // row in [1,rows] (grid len == rows)
         const gcell = try self.emit(.{ .op = .gcell, .a = garow, .b = rcol, .aux = ge });
-        _ = try self.emit(.{ .op = .guard_gcol, .a = gcell }); // col in [1,stride]
+        // guard_gcol carries the column ref in `.b` (col in [1,stride]); native keeps
+        // it live for the range-compare, the oracle re-reads gcell.b instead.
+        _ = try self.emit(.{ .op = .guard_gcol, .a = gcell, .b = rcol });
         _ = try self.emit(.{ .op = .guard_gpresent, .a = gcell });
         const rload = try self.emit(.{ .op = .gload, .a = gcell, .aux = ge, .ty = obsTypeOf(loaded) });
         self.setReg(instr.a, rload);
@@ -2213,7 +2215,7 @@ pub const TraceState = struct {
         const garow = try self.emit(.{ .op = .garow, .a = rtab, .b = rrow, .aux = ge });
         _ = try self.emit(.{ .op = .guard_bounds, .a = garow });
         const gcell = try self.emit(.{ .op = .gcell, .a = garow, .b = rcol, .aux = ge });
-        _ = try self.emit(.{ .op = .guard_gcol, .a = gcell });
+        _ = try self.emit(.{ .op = .guard_gcol, .a = gcell, .b = rcol });
         _ = try self.emit(.{ .op = .guard_fits, .a = rval, .aux = ge });
         // No guard_gpresent: gstore *creates* presence (mirrors astore).
         _ = try self.emit(.{ .op = .gstore, .a = gcell, .b = rval, .aux = ge });

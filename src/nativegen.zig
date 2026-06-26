@@ -41,6 +41,12 @@ const ArrLayout = struct {
     const cap = arr.ArrayPart.Layout.cap;
     const data = arr.ArrayPart.Layout.data;
     const present = arr.ArrayPart.Layout.present;
+    /// Grid fields (doc 14): the per-cell element lane and the row stride. A grid's
+    /// `data`/`present` are the SAME fields as a scalar array's, reinterpreted as a
+    /// flat `cap*stride` cell buffer indexed by `row*stride + col` at `grid_elem`
+    /// width. `@offsetOf` makes a layout churn a compile error (Z-1/Z-2).
+    const grid_elem = arr.ArrayPart.Layout.grid_elem;
+    const stride = arr.ArrayPart.Layout.stride;
     /// `*Table` → embedded hash part's `size` (live entry count, u32). The grow
     /// store's `guard_append` reads this to prove the hash is empty (so tier-0's
     /// `migrateFromHash` would be a no-op). `@offsetOf` on the std map field makes a
@@ -198,6 +204,12 @@ const I32_LANE: i32 = @intFromEnum(arr.Lane.i32);
 const I64_LANE: i32 = @intFromEnum(arr.Lane.i64);
 const U8_LANE: i32 = @intFromEnum(arr.Lane.u8);
 const F64_LANE: i32 = @intFromEnum(arr.Lane.f64);
+/// The grid meta-lane (doc 14): a `.grid` array's `lane` field. Used as the
+/// `SlotInfo.lane` prologue check for a grid table (`array.lane == .grid`); the
+/// per-cell element width comes from the separate `grid_elem` field/ordinal,
+/// which the grid ops carry in their `aux` (an int lane, so `laneKind`/
+/// `intLaneWidth` classify it exactly like a scalar int lane).
+const GRID_LANE: i32 = @intFromEnum(arr.Lane.grid);
 
 /// The native scalar `Kind` a packed lane decodes to, or `null` when the native
 /// array path does not lower this lane (`.value` → tier-1a). The bool lane
@@ -402,6 +414,15 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     const fits_ok = gpa.alloc(bool, n) catch return false;
     defer gpa.free(fits_ok);
     @memset(fits_ok, false);
+    // Per-gcell (doc 14): has a `guard_gcol` proven this cell's column in
+    // `[1, stride]`? A grid `gload`/`gstore`/`guard_gpresent` touches `data`/
+    // `present` at the flat index `gcell` computed (`row0*stride + col-1`), which
+    // is in `[0, rows*stride)` — and thus inside the `cap*stride` buffer — only
+    // when BOTH the row bound (`guard_bounds` on the `garow`) and this column bound
+    // hold. Without a covering guard_gcol a grid memory op bails to tier-1a.
+    const gcol_ok = gpa.alloc(bool, n) catch return false;
+    defer gpa.free(gcol_ok);
+    @memset(gcol_ok, false);
     // Per-konst: is this `.konst` ref used as the *key operand* of an `href` (H1)?
     // The key is the interned field-name string — a heap const, which the `.konst`
     // arm below would otherwise reject (`else => return false`). An href reads its
@@ -442,6 +463,16 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (r >= i) return false; // not linear SSA → malformed
                 // A table guard only ever covers the table-bearing slot_load; the
                 // native path hoists it to a prologue heap/type check.
+                if (t.instrs[r].op != .slot_load) return false;
+                table_guarded[r] = true;
+            },
+            // guard_grid (doc 14): the grid analogue of guard_table+guard_lane. It
+            // covers the grid table's slot_load (proven `.ptr`); the prologue
+            // additionally verifies `lane == .grid ∧ grid_elem == aux`. Like
+            // guard_table it only ever guards a table-bearing slot_load.
+            .guard_grid => {
+                const r = ins.a;
+                if (r >= i) return false; // not linear SSA → malformed
                 if (t.instrs[r].op != .slot_load) return false;
                 table_guarded[r] = true;
             },
@@ -842,6 +873,110 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 }
                 kinds[i] = .none;
             },
+            // --- flattened-grid cell path (doc 14, Phase 8) ---------------------
+            // guard_grid / guard_stride: cover the grid table's slot_load (proven
+            // `.ptr`). Both are PROLOGUE-pinned structural guards — the prologue
+            // checks `lane == .grid ∧ grid_elem == aux` (guard_grid) and
+            // `stride == aux` (guard_stride) once per native entry, so in the body
+            // they lower to nothing, exactly like guard_table/guard_lane. Sound
+            // because grid_elem and stride are invariant across a native run: the
+            // recorder aborts any growing/widening store, and a deflation only ever
+            // happens on a bare access, which is never part of a recorded trace.
+            .guard_grid => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .ptr) return false;
+                const lk = laneKind(ins.aux) orelse return false; // grid_elem lane
+                if (lk != .int) return false; // int grid lanes only (this cut)
+                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                kinds[i] = .none;
+            },
+            .guard_stride => {
+                // `ins.aux` is the recorded stride VALUE (a row width), not a lane —
+                // do not run laneKind on it. The prologue compares the live
+                // `array.stride` against it; an enlarged grid side-exits there.
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .ptr) return false;
+                kinds[i] = .none;
+            },
+            // garow pairs (grid table, row); its register carries the row base —
+            // concretely row0 = row-1 (the 0-based row), exactly mirroring `aref`'s
+            // idx0. Reuses the `.aref` kind so it composes with the existing
+            // guard_bounds (row0 <u rows, since a grid's array length == its row
+            // count) and the home-reservation machinery.
+            .garow => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (kinds[ins.a] != .ptr or kinds[ins.b] != .int) return false;
+                const lk = laneKind(ins.aux) orelse return false;
+                if (lk != .int) return false; // recorder aborts f64/bool grids
+                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                kinds[i] = .aref;
+            },
+            // gcell pairs (garow, col); its register carries the FLAT cell index
+            // flat = row0*stride + (col-1), with `stride` folded as an imm32 from the
+            // covering guard_stride. Also `.aref`-kind (it addresses one scalar cell,
+            // just like an aref's idx0) so the gload/gstore/guard_gpresent arms below
+            // treat it uniformly. The row-bounds proof lives on the `garow`
+            // (guard_bounds), which the recorder emits before this gcell — require it
+            // here so the flat index a memory op will dereference is row-safe.
+            .gcell => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (kinds[ins.a] != .aref or kinds[ins.b] != .int) return false;
+                const lk = laneKind(ins.aux) orelse return false;
+                if (lk != .int) return false;
+                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                if (!bounds_ok[ins.a]) return false; // row bound must dominate the gcell
+                kinds[i] = .aref;
+            },
+            // guard_gcol (col in [1, stride]): the column bound for this gcell, the
+            // grid analogue of guard_bounds. `b` carries the column ref (kept live so
+            // native can range-compare it). Marks the gcell column-checked so a
+            // following gload/gstore/guard_gpresent may dereference the cell.
+            .guard_gcol => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (kinds[ins.a] != .aref or kinds[ins.b] != .int) return false;
+                gcol_ok[ins.a] = true;
+                kinds[i] = .none;
+            },
+            // guard_gpresent (cell present): bt the per-cell presence bitmap at the
+            // flat index. Safe only behind BOTH the row bound (carried on the garow,
+            // already required at the gcell) and the column bound (guard_gcol on this
+            // gcell) — else the bit index is outside the buffer.
+            .guard_gpresent => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .aref) return false;
+                if (!gcol_ok[ins.a]) return false; // column bound must dominate
+                kinds[i] = .none;
+            },
+            // gload: a typed load from the grid cell addressed by the gcell. The
+            // recorder stamps the observed cell type in `ins.ty` (always int — it
+            // aborts non-int grids). Gated on the column proof; the row proof is
+            // already discharged at the gcell. Sign-extends the grid_elem-width cell.
+            .gload => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .aref) return false;
+                if (!gcol_ok[ins.a]) return false; // column bound must dominate
+                const lk = laneKind(ins.aux) orelse return false;
+                if (lk != .int) return false;
+                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                kinds[i] = .int;
+            },
+            // gstore: encode the value (`b`) into the grid cell addressed by the
+            // gcell (`a`) and set its presence bit. Gated on the column proof; the
+            // row proof is discharged at the gcell. The recorder emits a covering
+            // guard_fits on the value and aborts a widening store, so the value is a
+            // proven int that fits grid_elem — store at the cell width, then set the
+            // presence bit. Produces no value.
+            .gstore => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (kinds[ins.a] != .aref) return false;
+                if (kinds[ins.b] != .int) return false;
+                if (!gcol_ok[ins.a]) return false; // column bound must dominate
+                if (!fits_ok[ins.b]) return false; // guard_fits ⇒ width store is exact
+                const lk = laneKind(ins.aux) orelse return false;
+                if (lk != .int) return false;
+                if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                kinds[i] = .none;
+            },
             .loop => {
                 if (i != n - 1) return false; // loop must be terminal
                 kinds[i] = .none;
@@ -953,6 +1088,16 @@ const SlotInfo = struct {
     /// prologue (native type + this tag's payload byte + the non-null flag). `-1` for
     /// non-`.native` slots.
     pure_tag: i32 = -1,
+    /// For a `.ptr` table accessed as a GRID (doc 14): the `grid_elem` lane ordinal
+    /// (an int lane) its covering `guard_grid` pins and the `stride` its
+    /// `guard_stride` pins, both checked once in the prologue (`array.grid_elem ==
+    /// grid_elem ∧ array.stride == grid_stride`; `s.lane` is set to `GRID_LANE` so
+    /// the shared lane check verifies `array.lane == .grid`). `-1` when the slot is
+    /// not a grid table. `grid_stride` is also the folded immediate `gcell` uses for
+    /// its `row*stride` multiply — sound because the prologue proved it equals the
+    /// runtime stride and no traced store grows it (the recorder aborts a grow).
+    grid_elem: i32 = -1,
+    grid_stride: i32 = -1,
     /// win 2: the store_ref transient was allocated *into* home, so the op updates the
     /// home in place and the back-edge shuffle move for this slot self-elides. Only set
     /// for `carried` slots passing the safety predicate (see `analyzeInner`).
@@ -1044,6 +1189,10 @@ fn isTransient(op: trace.IrOp) bool {
         // href materializes the seeded cell pointer in a register (like aref); hload
         // materializes the decoded scalar field value. hstore/guard_hash are effects.
         .href, .hload => true,
+        // grid (doc 14): garow materializes the row base (row0, like aref), gcell the
+        // flat cell index, gload the decoded int cell. gstore/the grid guards are
+        // effects/value-less.
+        .garow, .gcell, .gload => true,
         else => false,
     };
 }
@@ -1087,6 +1236,13 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
         .href => .{ .a = false, .b = false },
         .hload, .guard_hash => .{ .a = true, .b = false },
         .hstore => .{ .a = true, .b = true },
+        // grid (doc 14): garow reads table (a) + row (b); gcell reads the garow token
+        // (a) + col (b); gstore reads the gcell token (a) + value (b); guard_gcol reads
+        // the gcell token (a) + the column ref (b) it range-checks. gload reaches the
+        // cell through the gcell token (a). guard_gpresent reads the gcell token (a).
+        // guard_grid/guard_stride reach the table through their slot_load operand (a).
+        .garow, .gcell, .gstore, .guard_gcol => .{ .a = true, .b = true },
+        .gload, .guard_gpresent, .guard_grid, .guard_stride => .{ .a = true, .b = false },
         else => .{ .a = false, .b = false },
     };
 }
@@ -1224,6 +1380,29 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             if (g.op == .guard_lane and g.a == lr) s.lane = g.aux;
         }
         if (has_aref and s.lane < 0) return error.Bail; // array access without a pinned lane
+    }
+    // A `.ptr` table accessed as a GRID (doc 14) carries no `guard_lane`; instead a
+    // `guard_grid` pins `lane == .grid ∧ grid_elem` and a `guard_stride` pins the row
+    // width. Tag the slot with the meta-lane GRID_LANE plus the recorded grid_elem and
+    // stride so the prologue can verify all three once per entry. A table is a grid OR
+    // a scalar array at any instant — never both — so a slot already carrying a scalar
+    // lane (set above) here is malformed; bail rather than miscompile.
+    for (slots.items) |*s| {
+        if (s.kind != .ptr) continue;
+        const lr: u16 = @intCast(s.load_ref);
+        var has_garow = false;
+        var ge: i32 = -1;
+        var gs: i32 = -1;
+        for (t.instrs) |g| {
+            if (g.op == .garow and g.a == lr) has_garow = true;
+            if (g.op == .guard_grid and g.a == lr) ge = g.aux;
+            if (g.op == .guard_stride and g.a == lr) gs = g.aux;
+        }
+        if (!has_garow) continue;
+        if (s.lane >= 0 or ge < 0 or gs < 0) return error.Bail;
+        s.lane = GRID_LANE;
+        s.grid_elem = ge;
+        s.grid_stride = gs;
     }
     // A `.func` (cross-frame callee snapshot) invariant slot carries the recorded
     // `Proto.id` from its covering `guard_func`, checked once in the prologue (the
@@ -1417,20 +1596,34 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         @memset(need_len, false);
 
         // Which array base each consuming op needs, attributed to the `.ptr` slot its
-        // `aref.a` resolves to. (guard_bounds → len; bool guard_present/aload/astore →
-        // data; int guard_present → present; int astore/astore_append → data + present.)
+        // address operand roots at. (guard_bounds → len; bool guard_present/aload/astore
+        // → data; int guard_present → present; int astore/astore_append → data + present.)
         // astore_append also bumps len in memory, but via a re-fetched table pointer in
         // rax (no len_home for an append trace), so it needs no len reservation here.
+        //
+        // A scalar array op roots ONE hop (aref.a == table slot_load); a grid op
+        // (doc 14) roots TWO hops (gcell.a == garow, garow.a == table slot_load). Its
+        // grid guard_bounds is on the GAROW, whose `.a` is already the table slot_load,
+        // so it falls into the one-hop arm below unchanged. The cell ops (gload/gstore/
+        // guard_gpresent) carry the gcell and need the extra hop.
         for (t.instrs) |ins| {
-            const aref_ref: usize = switch (ins.op) {
-                .guard_bounds, .guard_present, .aload, .astore, .astore_append => @intCast(ins.a),
+            var sid_signed: i32 = -1;
+            var is_bool = false;
+            switch (ins.op) {
+                .guard_bounds, .guard_present, .aload, .astore, .astore_append => {
+                    const aref_ins = t.instrs[@intCast(ins.a)];
+                    sid_signed = slot_id_of_ref[aref_ins.a];
+                    is_bool = aref_ins.aux == BOOL_LANE;
+                },
+                .gload, .gstore, .guard_gpresent => {
+                    const gcell_ins = t.instrs[@intCast(ins.a)];
+                    const garow_ins = t.instrs[@intCast(gcell_ins.a)];
+                    sid_signed = slot_id_of_ref[garow_ins.a]; // two hops to the table slot
+                },
                 else => continue,
-            };
-            const aref_ins = t.instrs[aref_ref];
-            const sid_signed = slot_id_of_ref[aref_ins.a];
+            }
             if (sid_signed < 0) continue; // table operand isn't a slot home — leave per-iter
             const sid: usize = @intCast(sid_signed);
-            const is_bool = aref_ins.aux == BOOL_LANE;
             switch (ins.op) {
                 .guard_bounds => need_len[sid] = true,
                 .guard_present => if (is_bool) {
@@ -1442,6 +1635,15 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                 .astore, .astore_append => {
                     need_data[sid] = true;
                     if (!is_bool) need_present[sid] = true;
+                },
+                // Grid cells (doc 14) are int-lane only in this cut: a load needs the
+                // data base; a store needs data + the presence bitmap; a presence guard
+                // needs only the bitmap.
+                .gload => need_data[sid] = true,
+                .guard_gpresent => need_present[sid] = true,
+                .gstore => {
+                    need_data[sid] = true;
+                    need_present[sid] = true;
                 },
                 else => unreachable,
             }
@@ -2385,6 +2587,21 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             try a.cmpByteMemImm(preg, ArrLayout.array_base + ArrLayout.lane, @intCast(s.lane));
             try a.jcc(.ne, prologue_fail);
         }
+        // Grid table (doc 14): the lane check above already proved `array.lane ==
+        // .grid` (s.lane == GRID_LANE). Additionally pin the cell element lane and the
+        // row stride the recorder folded — gcell's flat-index math uses `stride` as an
+        // immediate and gload/gstore use the `grid_elem` width, both sound for the run
+        // only if these still match. A grow/widen between entries side-exits here.
+        if (s.grid_elem >= 0) {
+            try a.cmpByteMemImm(preg, ArrLayout.array_base + ArrLayout.grid_elem, @intCast(s.grid_elem));
+            try a.jcc(.ne, prologue_fail);
+            // stride is a usize field; the recorder aborted any stride > maxInt(i32),
+            // so s.grid_stride fits an imm32 and the full-width compare is exact (a
+            // runtime stride grown past i32 simply won't equal it → side-exit).
+            try a.movRegMem(.rax, preg, ArrLayout.array_base + ArrLayout.stride);
+            try a.cmpRegImm32(.rax, s.grid_stride);
+            try a.jcc(.ne, prologue_fail);
+        }
     }
 
     // [U1-prologue] For each `.func` slot the callee pointer is now in its home;
@@ -2480,7 +2697,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // `hload` tag-check, so in the native body it emits nothing.
             // guard_pure joins the hoisted no-ops: the native-identity check is in the
             // prologue (loop-invariant callee snapshot), so nothing here.
-            .slot_load, .guard_int, .guard_float, .guard_table, .guard_lane, .guard_func, .guard_hash, .guard_pure => {},
+            // guard_grid/guard_stride (doc 14): the grid structural guards, hoisted to
+            // the prologue grid-elem/stride checks (invariant within a native run) —
+            // nothing here, exactly like guard_table/guard_lane.
+            .slot_load, .guard_int, .guard_float, .guard_table, .guard_lane, .guard_func, .guard_hash, .guard_pure, .guard_grid, .guard_stride => {},
             .konst => {
                 // H1: a `.none`-kind konst is an interned heap-string href key. href
                 // reads the seeded cell, not the key, so the key carries no native
@@ -2954,6 +3174,101 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 // side-exit observes the append as already committed.
                 const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
                 try a.incMemQword(tbreg, ArrLayout.array_base + ArrLayout.len);
+            },
+            // --- flattened-grid cell path (doc 14, Phase 8) ---------------------
+            // garow: materialize row0 = row - 1 (the 0-based row) into the garow token's
+            // home, exactly like `aref`'s idx0. The grid table is reached lazily by each
+            // consumer through `garow.a`; garow itself touches only the row operand (b).
+            .garow => {
+                const dst = placeOfRef(alloc, i);
+                const rowp = placeOfRef(alloc, ins.b);
+                switch (dst) {
+                    .reg => |R| {
+                        try placeToReg(a, R, rowp);
+                        try a.subRegImm32(R, 1);
+                    },
+                    .mem => |D| {
+                        try placeToReg(a, .rax, rowp);
+                        try a.subRegImm32(.rax, 1);
+                        try a.movMemReg(.rsp, D, .rax);
+                    },
+                    .xmm => unreachable, // row0 is an int (aref kind), never an XMM home
+                }
+            },
+            // gcell: materialize the FLAT cell index flat = row0*stride + (col - 1) into
+            // the gcell token's home. `row0` is the garow value (a), `col` the column
+            // (b), and `stride` is folded as an immediate from the grid table slot — the
+            // prologue `guard_stride` proved it equals the runtime stride, so the folded
+            // multiply is exact for the whole native run.
+            .gcell => {
+                const garow_ins = t.instrs[ins.a];
+                const sid = alloc.slot_id_of_ref[garow_ins.a]; // table slot (always homed)
+                const stridev: i32 = alloc.slots[@intCast(sid)].grid_stride;
+                try placeToReg(a, .rax, placeOfRef(alloc, ins.a)); // rax = row0
+                try a.movRegImm64(.rcx, stridev); // rcx = stride
+                try a.imulRegReg(.rax, .rcx); // rax = row0*stride
+                try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // rcx = col
+                try a.addRegReg(.rax, .rcx); // rax = row0*stride + col
+                try a.subRegImm32(.rax, 1); // flat = row0*stride + (col - 1)
+                try regToPlace(a, placeOfRef(alloc, i), .rax);
+            },
+            // guard_gcol: col in [1, stride], else side-exit. `col` is b; `stride` is
+            // folded from the grid table slot (gcell.a = garow, garow.a = table slot).
+            // Together with the garow's guard_bounds (row0 <u rows) this proves the flat
+            // index lands inside the `cap*stride` buffer.
+            .guard_gcol => {
+                const gcell_ins = t.instrs[ins.a];
+                const garow_ins = t.instrs[gcell_ins.a];
+                const sid = alloc.slot_id_of_ref[garow_ins.a];
+                const stridev: i32 = alloc.slots[@intCast(sid)].grid_stride;
+                const colreg = try refBaseReg(a, alloc, ins.b, .rcx);
+                try a.cmpRegImm32(colreg, 1);
+                try a.jcc(.l, deopt_exit); // col < 1 → side-exit (≤0 / grow)
+                try a.cmpRegImm32(colreg, stridev);
+                try a.jcc(.g, deopt_exit); // col > stride → side-exit (grow)
+            },
+            // guard_gpresent: the cell must hold a value (a hole decodes as nil, which
+            // the int cell kind can't carry). `bt [present], flat` against the per-cell
+            // presence bitmap, indexed by the gcell flat index.
+            .guard_gpresent => {
+                const gcell_ins = t.instrs[ins.a];
+                const garow_ins = t.instrs[gcell_ins.a];
+                const preg = try arrayFieldReg(a, alloc, garow_ins.a, .present, .rax);
+                const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
+                try a.btMemReg(preg, 0, flatreg);
+                try a.jcc(.ae, deopt_exit); // CF==0 → hole → side-exit
+            },
+            // gload: load the grid cell at the flat index (gcell value) and decode by the
+            // grid_elem width into the gload's int home — sign-extend the signed lanes,
+            // zero-extend u8 (matching `array.decodeGridCell`).
+            .gload => {
+                const gcell_ins = t.instrs[ins.a];
+                const garow_ins = t.instrs[gcell_ins.a];
+                const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax);
+                const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
+                if (ins.aux == U8_LANE) {
+                    try a.loadRegMemSib(.rax, datareg, flatreg, 1, false, 0); // movzx
+                } else {
+                    const w = intLaneWidth(ins.aux);
+                    try a.loadRegMemSib(.rax, datareg, flatreg, w, true, 0); // sign-extend
+                }
+                try regToPlace(a, placeOfRef(alloc, i), .rax);
+            },
+            // gstore: width-truncating data write at the flat cell index (guard_fits
+            // proved the value fits grid_elem), then set the presence bit LAST (the
+            // absent→present commit point). Mirrors the in-bounds int-lane `astore`.
+            .gstore => {
+                const gcell_ins = t.instrs[ins.a];
+                const garow_ins = t.instrs[gcell_ins.a];
+                const w = intLaneWidth(ins.aux);
+                const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax);
+                const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
+                try a.leaRegMemSib(.rax, datareg, flatreg, w, 0); // rax = &data[flat]
+                try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // value → rcx
+                try a.storeMemReg(.rax, w, 0, .rcx); // [rax] = (lane-width) value
+                const preg = try arrayFieldReg(a, alloc, garow_ins.a, .present, .rax);
+                const pflat = try refBaseReg(a, alloc, ins.a, .rcx);
+                try a.btsMemReg(preg, 0, pflat);
             },
             .guard_true => switch (kinds[ins.a]) {
                 .int => {}, // every int is truthy → guard always passes (no-op)
