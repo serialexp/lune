@@ -1959,6 +1959,29 @@ pub const Vm = struct {
                         try self.indexSet(container, key, val);
                     }
                 },
+                .get_index2 => {
+                    // Fused two-level read `R[a] = R[b][R[c]][R[aux]]`. The
+                    // intermediate `R[b][R[c]]` is consumed here and never lands
+                    // in a register, so a grid row (doc 14) can never escape as a
+                    // bare `row_view`. On a nested table this is exactly two
+                    // `indexGet`s — semantically identical to the unfused form.
+                    const container = regs.get(instr.b);
+                    const key1 = regs.get(instr.c);
+                    const key2 = regs.get(@as(u16, @intCast(instr.aux)));
+                    const mid = try self.indexGet(container, key1);
+                    regs.set(a, try self.indexGet(mid, key2));
+                },
+                .set_index2 => {
+                    // Fused two-level store `R[a][R[b]][R[c]] = R[aux]`. The grid
+                    // inflation trigger (doc 14, Phase 4b) will live here; for now
+                    // it is two-step (`indexGet` the row, then `indexSet`).
+                    const container = regs.get(a);
+                    const key1 = regs.get(instr.b);
+                    const key2 = regs.get(instr.c);
+                    const val = regs.get(@as(u16, @intCast(instr.aux)));
+                    const mid = try self.indexGet(container, key1);
+                    try self.indexSet(mid, key2, val);
+                },
 
                 // ---- globals ----
                 .get_global => regs.set(a, self.globals.get(proto.constants[instr.b])),
@@ -9710,4 +9733,57 @@ test "grid: indexGet/indexSet/len forward a row_view; outer + non-fitting set de
     //  - an *inner* store that can't stay in the grid (value wider than the lane).
     try testing.expectError(Error.Unimplemented, vm.indexSet(g, Value.int(1), Value.int(9)));
     try testing.expectError(Error.Unimplemented, vm.indexSet(r1, Value.int(1), Value.float(1.5)));
+}
+
+// --- Phase 4a: fused two-level index (get_index2 / set_index2) ---------------
+
+test "fused index: chained get/set on nested tables is byte-identical across 8 modes" {
+    try expectProgram(
+        \\local a = { {10,20,30}, {40,50,60} }
+        \\a[1][2] = 99
+        \\print(a[1][2], a[2][3], a[1][1])
+        \\local b = { { {7,8} } }
+        \\b[1][1][2] = 88
+        \\print(b[1][1][2], b[1][1][1])
+        \\
+    ,
+        "99\t60\t10\n88\t7\n",
+    );
+}
+
+test "fused index: __index / __newindex on the inner level still dispatch" {
+    try expectProgram(
+        \\local proto = { z = 42 }
+        \\local row = setmetatable({}, { __index = proto })
+        \\local outer = { row }
+        \\print(outer[1]["z"])
+        \\local log = {}
+        \\local mrow = setmetatable({}, { __newindex = function(t,k,v) log[k]=v end })
+        \\local o2 = { mrow }
+        \\o2[1]["hit"] = 7
+        \\print(log["hit"], rawget(mrow, "hit"))
+        \\
+    ,
+        "42\n7\tnil\n",
+    );
+}
+
+test "fused index: evaluation order matches the unfused RHS-first convention" {
+    // Single-level store is RHS-first (`g[k(1)]=k(2)` ⇒ 2 then 1); the fused
+    // two-level store must keep the same order: value, then the two keys L→R.
+    try expectProgram(
+        \\local order = {}
+        \\local function k(n) order[#order+1] = n; return n end
+        \\local g = { {0,0,0} }
+        \\g[k(1)][k(2)] = k(3)
+        \\print(order[1], order[2], order[3])
+        \\local rd = {}
+        \\local function r(n) rd[#rd+1] = n; return n end
+        \\local a = { {5} }
+        \\local _ = a[r(1)][r(2)]
+        \\print(rd[1], rd[2])
+        \\
+    ,
+        "3\t1\t2\n1\t2\n",
+    );
 }

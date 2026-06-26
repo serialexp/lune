@@ -744,13 +744,31 @@ const Compiler = struct {
                 self.freeTo(m);
             },
             .index => |ix| {
-                const m = self.next_reg;
-                const obj = try self.alloc1();
-                try self.compileExprTo(ix.obj, obj);
-                const key = try self.alloc1();
-                try self.compileExprTo(ix.key, key);
-                _ = try self.emit(Instr.opABC(.set_index, obj, key, src));
-                self.freeTo(m);
+                // Fuse `obj[i][j] = src` into one `set_index2` (mirror of the
+                // `get_index2` fusion above): the intermediate row `obj[i]` is
+                // consumed in a single op and never leaks as a bare `row_view`.
+                // The grid inflation trigger (doc 14, Phase 4b) will live in the
+                // `set_index2` handler.
+                if (ix.obj.data == .index) {
+                    const inner = ix.obj.data.index;
+                    const m = self.next_reg;
+                    const base = try self.alloc1();
+                    try self.compileExprTo(inner.obj, base);
+                    const key1 = try self.alloc1();
+                    try self.compileExprTo(inner.key, key1);
+                    const key2 = try self.alloc1();
+                    try self.compileExprTo(ix.key, key2);
+                    _ = try self.emit(.{ .op = .set_index2, .a = base, .b = key1, .c = key2, .aux = @intCast(src) });
+                    self.freeTo(m);
+                } else {
+                    const m = self.next_reg;
+                    const obj = try self.alloc1();
+                    try self.compileExprTo(ix.obj, obj);
+                    const key = try self.alloc1();
+                    try self.compileExprTo(ix.key, key);
+                    _ = try self.emit(Instr.opABC(.set_index, obj, key, src));
+                    self.freeTo(m);
+                }
             },
             else => unreachable, // parser guarantees targets are assignable
         }
@@ -1023,13 +1041,32 @@ const Compiler = struct {
                 self.freeTo(m);
             },
             .index => |ix| {
-                const m = self.next_reg;
-                const obj = try self.alloc1();
-                try self.compileExprTo(ix.obj, obj);
-                const key = try self.alloc1();
-                try self.compileExprTo(ix.key, key);
-                _ = try self.emit(Instr.opABC(.get_index, dest, obj, key));
-                self.freeTo(m);
+                // Fuse a chained `obj[i][j]` into one `get_index2` so the
+                // intermediate row `obj[i]` is consumed in a single op and never
+                // materialises as a bare `row_view` value — the gate that lets a
+                // grid (doc 14) be read without leaking a view to a register.
+                // Only the two innermost levels fuse; deeper chains compose
+                // (the outer becomes a plain `get_index` on the fused result).
+                if (ix.obj.data == .index) {
+                    const inner = ix.obj.data.index;
+                    const m = self.next_reg;
+                    const base = try self.alloc1();
+                    try self.compileExprTo(inner.obj, base);
+                    const key1 = try self.alloc1();
+                    try self.compileExprTo(inner.key, key1);
+                    const key2 = try self.alloc1();
+                    try self.compileExprTo(ix.key, key2);
+                    _ = try self.emit(.{ .op = .get_index2, .a = dest, .b = base, .c = key1, .aux = @intCast(key2) });
+                    self.freeTo(m);
+                } else {
+                    const m = self.next_reg;
+                    const obj = try self.alloc1();
+                    try self.compileExprTo(ix.obj, obj);
+                    const key = try self.alloc1();
+                    try self.compileExprTo(ix.key, key);
+                    _ = try self.emit(Instr.opABC(.get_index, dest, obj, key));
+                    self.freeTo(m);
+                }
             },
             .table => |fields| try self.compileTable(fields, dest),
             .call => |c| try self.compileCall(c.callee, c.args, dest, 1),

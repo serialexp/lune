@@ -34,6 +34,7 @@ const std = @import("std");
 const object = @import("object.zig");
 const string = @import("string.zig");
 const table = @import("table.zig");
+const arr = @import("array.zig");
 const value = @import("value.zig");
 const function = @import("function.zig");
 const bytecode = @import("bytecode.zig");
@@ -138,6 +139,146 @@ pub const Heap = struct {
         const t = try Table.create(self.gpa);
         self.link(&t.header);
         return t;
+    }
+
+    /// Attempt to flatten a `.value` array-of-rows table into a flat grid
+    /// (doc 14, Phase 4). **STRICT homogeneous-numeric** precondition — inflate
+    /// only when:
+    ///   * the parent's array part is `.value` (its elements are heap refs),
+    ///     with an **empty hash part** (the grid owns the whole `1..len` run, so
+    ///     a stray hash border would change the observable `#`), and `len >= 1`;
+    ///   * every element `1..len` is a heap **table** with no metatable, an
+    ///     empty hash part, and a numeric array lane (`i8`/`u8`/`i16`/`i32`/`i64`
+    ///     /`f64` — never `.value`/`.boolean`/`.grid`); and
+    ///   * every cell across every row unifies to ONE fixed-width lane — all-int
+    ///     ⇒ narrowest int lane over the global `[lo, hi]`, all-float ⇒ `f64`.
+    /// Mixed int/float, a bool/heap cell, or a nil/scalar row blocks inflation.
+    /// Jagged rows are allowed (the grid is sized to the longest row = bounding
+    /// box; short rows keep their own `row_len`).
+    ///
+    /// Returns `true` and swaps the grid in on success (the old `.value` buffer
+    /// of row refs is dropped — the orphaned row tables are reclaimed at the next
+    /// GC safepoint). On any precondition miss **or** OOM the parent is left
+    /// exactly as it was and returns `false` — the caller records a don't-retry
+    /// flag (hysteresis), so a non-qualifying table is scanned at most once.
+    ///
+    /// GC-atomic: runs inside a single opcode, so no collection sees the
+    /// half-swapped parent (collection only fires at the dispatch-loop safepoint).
+    pub fn inflateToGrid(self: *Heap, parent: *Table) bool {
+        const gpa = self.gpa;
+
+        // --- outer shape ---
+        if (parent.array.isGrid()) return false; // already a grid
+        if (parent.array.lane != .value) return false; // rows are heap refs ⇒ .value
+        if (parent.hash.count() != 0) return false; // grid owns the whole 1..len run
+        const rows = parent.array.len;
+        if (rows == 0) return false;
+
+        // --- scan rows: qualify each, unify the cell lane, measure the box ---
+        var stride: usize = 0;
+        var all_int = true;
+        var all_float = true;
+        var lo: i64 = std.math.maxInt(i64);
+        var hi: i64 = std.math.minInt(i64);
+
+        var r: usize = 0;
+        while (r < rows) : (r += 1) {
+            const rv = parent.array.get(r + 1);
+            if (!rv.isHeap()) return false; // nil row or scalar ⇒ block
+            const h = rv.asHeap();
+            if (h.type != .table) return false; // typed_array/string/... ⇒ block
+            const row = Table.fromHeader(h);
+            if (row.metatable != null) return false;
+            if (row.hash.count() != 0) return false;
+            const rl = row.array.len;
+            if (rl == 0) continue; // an empty row contributes no cells
+            switch (row.array.lane) {
+                .i8, .u8, .i16, .i32, .i64, .f64 => {}, // numeric leaf ok
+                else => return false, // .value/.boolean/.grid ⇒ block
+            }
+            if (rl > stride) stride = rl;
+            var c: usize = 0;
+            while (c < rl) : (c += 1) {
+                const v = row.array.get(c + 1);
+                if (v.isNil()) continue; // jagged hole inside the row
+                if (v.isInt()) {
+                    all_float = false;
+                    const x = v.asInt();
+                    if (x < lo) lo = x;
+                    if (x > hi) hi = x;
+                } else if (v.isFloat()) {
+                    all_int = false;
+                } else {
+                    return false; // bool/heap cell ⇒ block
+                }
+            }
+        }
+
+        if (stride == 0) return false; // no cells anywhere ⇒ nothing to flatten
+        if (!all_int and !all_float) return false; // mixed int/float ⇒ block
+        const grid_elem: arr.Lane = if (all_int) arr.ArrayPart.intLaneForRange(lo, hi) else .f64;
+
+        // --- build the grid (OOM-atomic: parent untouched until the swap) ---
+        var grid = arr.ArrayPart.initGrid(gpa, rows, stride, grid_elem) catch return false;
+        r = 0;
+        while (r < rows) : (r += 1) {
+            const row = Table.fromHeader(parent.array.get(r + 1).asHeap());
+            var c: usize = 0;
+            while (c < row.array.len) : (c += 1) {
+                const v = row.array.get(c + 1);
+                if (!v.isNil()) grid.gridSet(r, c, v); // grid_elem fits every cell by construction
+            }
+        }
+
+        // --- swap (no safepoint between here and return) ---
+        parent.array.deinit(gpa); // drop the .value row-ref buffer; row tables orphaned → GC
+        parent.array = grid;
+        return true;
+    }
+
+    /// Tear a flattened grid back into a `.value` array of real heap row Tables
+    /// (doc 14, Phase 5) — the inverse of `inflateToGrid`. Each grid row becomes
+    /// a freshly allocated `Table` whose array part holds that row's logical
+    /// cells `1..gridRowLen(row)` (inner nil holes preserved); the parent's
+    /// `.grid` array is replaced by a `.value` array of those row refs. Restores
+    /// full table semantics so a row can grow, take a metatable, or hold
+    /// heterogeneous values — the price paid whenever a mutation can't be
+    /// represented in-grid, or a row escapes to the heap (its real Table ref must
+    /// then alias through the parent slot).
+    ///
+    /// Allocation-heavy (one `Table` per row) but GC-atomic: runs inside one
+    /// opcode, so the half-built parent is never exposed to a collection. On OOM
+    /// the grid is left intact (the new outer array is discarded) so the original
+    /// op can surface the error and the parent stays a valid grid.
+    pub fn deflateGrid(self: *Heap, parent: *Table) std.mem.Allocator.Error!void {
+        std.debug.assert(parent.array.isGrid());
+        const gpa = self.gpa;
+        const rows = parent.array.gridRows();
+
+        // Build the replacement outer `.value` array first; only swap once every
+        // row Table is built, so an OOM leaves the grid untouched and retryable.
+        var outer = arr.ArrayPart.empty;
+        errdefer outer.deinit(gpa);
+
+        var r: usize = 0;
+        while (r < rows) : (r += 1) {
+            const row = try self.newTable(); // linked + id-stamped
+            const rl = parent.array.gridRowLen(r);
+            var c: usize = 0;
+            while (c < rl) : (c += 1) {
+                const v = parent.array.gridGet(r, c);
+                // Skip nil holes: leaving key c+1 unset reproduces the hole in the
+                // rebuilt row exactly (`get` returns nil for an absent key).
+                if (!v.isNil()) row.set(gpa, Value.int(@intCast(c + 1)), v) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.TypeError => unreachable, // a positive int key is never nil/NaN
+                };
+            }
+            try outer.append(gpa, Value.heap(&row.header));
+        }
+
+        parent.array.deinit(gpa);
+        parent.array = outer;
     }
 
     /// Intern `content`: return the existing object for these bytes, or allocate,
@@ -538,4 +679,97 @@ test "shouldCollect honours the stress knob and the threshold" {
     heap.next_gc = 1;
     _ = try heap.intern("x");
     try testing.expect(heap.shouldCollect()); // count (1) >= next_gc (1)
+}
+
+test "inflateToGrid: strict homogeneous int rows flatten; round-trip via deflate is logically identical" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    // outer = { {1,2,3}, {4,5}, {6,7,8} }  (jagged, all ints)
+    const outer = try heap.newTable();
+    const want = [_][]const i64{ &.{ 1, 2, 3 }, &.{ 4, 5 }, &.{ 6, 7, 8 } };
+    for (want, 0..) |rowvals, ri| {
+        const row = try heap.newTable();
+        for (rowvals, 0..) |x, ci| try row.set(heap.gpa, Value.int(@intCast(ci + 1)), Value.int(x));
+        try outer.set(heap.gpa, Value.int(@intCast(ri + 1)), Value.heap(&row.header));
+    }
+    try testing.expect(!outer.array.isGrid());
+
+    try testing.expect(heap.inflateToGrid(outer));
+    try testing.expect(outer.array.isGrid());
+    try testing.expectEqual(@as(usize, 3), outer.array.gridRows());
+    try testing.expectEqual(@as(usize, 3), outer.array.stride); // bounding box = longest row
+    // Row lengths track the jagged shape.
+    try testing.expectEqual(@as(usize, 3), outer.array.gridRowLen(0));
+    try testing.expectEqual(@as(usize, 2), outer.array.gridRowLen(1));
+    try testing.expectEqual(@as(usize, 3), outer.array.gridRowLen(2));
+    // Cells decode identically.
+    try testing.expectEqual(@as(i64, 5), outer.array.gridGet(1, 1).asInt());
+    try testing.expectEqual(@as(i64, 8), outer.array.gridGet(2, 2).asInt());
+
+    // Deflate restores the nested-table shape with logically identical values.
+    try heap.deflateGrid(outer);
+    try testing.expect(!outer.array.isGrid());
+    for (want, 0..) |rowvals, ri| {
+        const rt = Table.fromHeader(outer.get(Value.int(@intCast(ri + 1))).asHeap());
+        try testing.expectEqual(@as(i64, @intCast(rowvals.len)), rt.length());
+        for (rowvals, 0..) |x, ci| {
+            try testing.expectEqual(x, rt.get(Value.int(@intCast(ci + 1))).asInt());
+        }
+    }
+}
+
+test "inflateToGrid: all-float rows unify to f64" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const outer = try heap.newTable();
+    inline for (0..2) |ri| {
+        const row = try heap.newTable();
+        try row.set(heap.gpa, Value.int(1), Value.float(@floatFromInt(ri)));
+        try row.set(heap.gpa, Value.int(2), Value.float(1.5));
+        try outer.set(heap.gpa, Value.int(@intCast(ri + 1)), Value.heap(&row.header));
+    }
+    try testing.expect(heap.inflateToGrid(outer));
+    try testing.expectEqual(arr.Lane.f64, outer.array.grid_elem);
+    try testing.expectEqual(@as(f64, 1.5), outer.array.gridGet(0, 1).asFloat());
+}
+
+test "inflateToGrid: blockers — mixed int/float, hash on a row, metatable, non-table row, outer hash" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    // mixed int/float across cells ⇒ block
+    {
+        const outer = try heap.newTable();
+        const row = try heap.newTable();
+        try row.set(heap.gpa, Value.int(1), Value.int(1));
+        try row.set(heap.gpa, Value.int(2), Value.float(2.5));
+        try outer.set(heap.gpa, Value.int(1), Value.heap(&row.header));
+        try testing.expect(!heap.inflateToGrid(outer));
+        try testing.expect(!outer.array.isGrid());
+    }
+    // a row with a hash part ⇒ block
+    {
+        const outer = try heap.newTable();
+        const row = try heap.newTable();
+        try row.set(heap.gpa, Value.int(1), Value.int(1));
+        try row.set(heap.gpa, try heap.internValue("k"), Value.int(9));
+        try outer.set(heap.gpa, Value.int(1), Value.heap(&row.header));
+        try testing.expect(!heap.inflateToGrid(outer));
+    }
+    // a non-table (scalar) row ⇒ block
+    {
+        const outer = try heap.newTable();
+        try outer.set(heap.gpa, Value.int(1), Value.int(7));
+        try testing.expect(!heap.inflateToGrid(outer));
+    }
+    // outer hash border ⇒ block (would change observable #)
+    {
+        const outer = try heap.newTable();
+        const row = try heap.newTable();
+        try row.set(heap.gpa, Value.int(1), Value.int(1));
+        try outer.set(heap.gpa, Value.int(1), Value.heap(&row.header));
+        try outer.set(heap.gpa, try heap.internValue("x"), Value.int(0));
+        try testing.expect(!heap.inflateToGrid(outer));
+    }
 }

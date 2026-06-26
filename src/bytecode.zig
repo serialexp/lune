@@ -111,6 +111,17 @@ pub const OpCode = enum(u8) {
     get_index,
     /// `a, b, c`   R[a][R[b]] = R[c]
     set_index,
+    /// `a, b, c, aux`  R[a] = R[b][R[c]][R[aux]]   (fused two-level read)
+    ///             The compiler emits this for a chained `obj[i][j]` so the
+    ///             intermediate row `obj[i]` is consumed in one op and never
+    ///             materialises as a bare `row_view` value — the gate that lets a
+    ///             grid (doc 14) be touched without leaking a view to a register.
+    ///             Semantically identical to two `get_index`es on a nested table.
+    get_index2,
+    /// `a, b, c, aux`  R[a][R[b]][R[c]] = R[aux]   (fused two-level store)
+    ///             Emitted for `obj[i][j] = v`. The grid inflation trigger
+    ///             (doc 14) lives here; on a nested table it is two-step identical.
+    set_index2,
 
     // ---- globals  (Increment D) ----
     /// `a, b`      R[a] = G[K[b]]   (K[b] is the global name string)

@@ -487,8 +487,10 @@ pub const ArrayPart = extern struct {
     /// otherwise the smallest *signed* lane covering it. This is the entry point
     /// for committing a fresh array (`laneForValue`, `optimalLane`) — NOT for
     /// widening an already-committed lane, which must preserve the existing slots'
-    /// range (`widenFor` handles that separately).
-    fn intLaneForRange(lo: i64, hi: i64) Lane {
+    /// range (`widenFor` handles that separately). Public so grid inflation
+    /// (`gc.Heap.inflateToGrid`) can pick the unified cell lane over the global
+    /// `[lo, hi]` of every cell it is about to flatten.
+    pub fn intLaneForRange(lo: i64, hi: i64) Lane {
         if (lo >= 0 and hi <= 255) return .u8;
         return intLaneFor(lo, hi);
     }

@@ -3,11 +3,16 @@
 Status: partial — **building D.** Phases 0–3 landed on `master` (decision gate;
 `RowView` fat value; grid representation in `ArrayPart`; row forwarding through
 the interpreter). Architecture pivoted post-review to **transient fat-value rows
-with copy-out on escape**, which dissolves the GC-pinning and identity-cache
-objections. Determinism/replay is the one principled gate and is satisfiable (see
+with copy-out on escape** — then pivoted *again* (2026-06-26, Bart) to **gate
+grids behind fused indexing**: see §Escape detection — the gate decision below.
+The `inflateToGrid`/`deflateGrid` primitives landed (uncommitted) on `gc.Heap`.
+Determinism/replay is the one principled gate and is satisfiable (see
 §Determinism gate). Build size is explicitly *not* a blocker (see §Decision).
-Next: Phase 4 (tier-0 inflation — the first path that produces a grid at runtime,
-which then needs Phase 5 escape + Phase 6 GC before grids can be enabled live).
+**Re-ordered phasing:** fused multi-level indexing (was Phase 8) now precedes
+live grids — grids are never enabled until tier-0 only touches them through a
+fused op, so no bare `row_view` ever escapes to a register. Next: fused
+`get_index2`/`set_index2` opcodes (compiler + interp), then inflation wired into
+the fused store path, then the recorder fast path.
 Owner: Bart
 Last updated: 2026-06-26
 
@@ -62,30 +67,52 @@ land; move whole sections to Done once everything inside is checked.
   tables: 3 `table.zig` + 1 `interp.zig` + 1 `base.zig` unit tests. **Deferred to
   Phase 5** (with `Unimplemented` stubs in `indexSet`): outer row (re)assignment /
   append, and inner stores that overflow the grid.
+- [x] **Phase 4a — Fused multi-level index opcodes (the gate).** New
+  `get_index2`/`set_index2` bytecode (`bytecode.zig`); the compiler emits them
+  for a chained `a[i][j]` / `a[i][j]=v` (the `.index`-of-`.index` arms of
+  `compileExprTo` and `compileStore`), falling back to the two-op form otherwise.
+  Interp handlers do the two-step access via `indexGet`/`indexSet`, so metatable
+  dispatch on either level and the RHS-first evaluation order are byte-identical
+  to the unfused form. Landed as a *pure optimisation on ordinary nested tables*
+  — no grids yet — green on its own (3 `expectProgram` tests: chained get/set,
+  inner `__index`/`__newindex` dispatch, eval order). The recorder aborts on the
+  new opcodes (`.nyi_opcode`) until Phase 8. This is the vehicle that, once grids
+  exist, never materialises a bare `row_view` into a register — closing the
+  swap/identity hole (§Escape detection).
 
 ### Outstanding
 
-- [ ] **Phase 4 — Inflation (tier-0 widen-into-grid).** `a[i][j]=v` on a
-  homogeneous-numeric nested table migrates the parent into a grid, exactly as
-  `setInPlace` widens i8→value today. Hysteresis (reuse `frozen`/monotonic) so a
-  recently-deflated grid does not re-inflate and thrash.
-- [ ] **Phase 5 — Escape ⇒ inflate-to-table (the correctness keystone).** Every
-  heap-store opcode (`set_index`, `set_global`, upvalue close, table
-  constructor) checks for a transient `RowView` operand and copies the row out to
-  a real `Table` before storing. Same for `setmetatable(row,…)`, `rawset`, and
-  any op the grid can't represent. Guarantees no `RowView` ever persists in the
-  heap, so the grid is never pinned.
+The escape-detection re-plan (§Escape detection) **re-orders** these. The
+`inflateToGrid`/`deflateGrid` primitives are built; the work now is the fused
+indexing that lets grids be enabled safely.
+
+- [ ] **Phase 4b — Inflation wired into the fused store path.** `a[i][j]=v` on a
+  homogeneous-numeric nested `a` calls `Heap.inflateToGrid` (built); the fused
+  ops then read/write grid cells directly. Hysteresis: a don't-retry flag so a
+  non-qualifying or recently-deflated parent is scanned at most once.
+- [ ] **Phase 4c — Bare access ⇒ deflate (escape).** A bare `get_index`/
+  `set_index` (single level) on a grid table is conservatively an escape: it
+  calls `Heap.deflateGrid` (built) and proceeds on the now-nested table. So a
+  `row_view` value is *never produced at runtime* — only the fused path touches a
+  grid, and it never leaks a view. Inner-overflow / outer-reassignment stores
+  (the Phase 3 `Unimplemented` stubs) likewise deflate.
+- [ ] **Phase 5 — `expectProgram` correctness sweep.** All 8 modes + GC stress on
+  the canonical workloads: `a[i][j]` matrix fill/read, jagged rows, **in-place
+  row swap / sort** (the pattern that motivated the gate — it deflates on the
+  bare `tmp=a[i]` and stays correct), `a[i]==a[i]`, row passed to a function /
+  stored in a table (deflates), `#a[i]`, `pairs`/`ipairs`.
 - [ ] **Phase 6 — GC integration.** `blacken` over a grid skips the (non-heap)
-  leaves; the grid buffer is owned by the parent. No `RowView` heap objects
-  exist to mark — escaped rows are already concrete tables.
+  leaves; the grid buffer is owned by the parent. Already largely satisfied
+  (`isLeaf` skips a grid array; no `row_view` heap objects exist) — verify under
+  GC stress with grids live.
 - [ ] **Phase 7 — Determinism + keyframe.** Prove the grid is in-memory only
-  (never serialised), identity is `parent.id`-based (address-independent), and
-  all 8 modes + keyframe restore observe identical logical values. See
-  §Determinism gate.
-- [ ] **Phase 8 — Trace recorder support.** A fused multi-level index path that
-  records `a[i][j][k]` as grid-relative address arithmetic (`base +
-  (i*stride+j)`) behind `guard_grid` + bounds + not-deflated guards, side-exiting
-  to tier-0 when a row has deflated. This is where the locality win is cashed.
+  (never serialised), identity is `parent.id`-based (address-independent), all 8
+  modes + keyframe restore observe identical logical values, and grids are
+  deflated (or skipped) at keyframe capture. See §Determinism gate.
+- [ ] **Phase 8 — Trace recorder support.** Record `get_index2`/`set_index2` as
+  grid-relative address arithmetic (`base + (i*stride+j)`) behind `guard_grid` +
+  bounds + not-deflated guards, side-exiting to tier-0 when a row has deflated.
+  This is where the locality win is cashed.
 
 ## Why this exists
 
@@ -244,16 +271,44 @@ correctness into the actual speedup. The build stays green at every phase
 (inflation round-trip, deflation-on-escape identity, `a[i]==a[i]`,
 alias-through-`RowView`, jagged bounding box, GC of escaped-orphan rows).
 
-## Open questions for review
+## Escape detection — the gate decision (2026-06-26, Bart)
 
-- [ ] **Escape detection in tier-0.** At the bytecode level `a[i][j]`
-  materialises the row ref into a register transiently (two `get_index`
-  opcodes), so the interpreter can't trivially tell "transient sub-index" from
-  "escaping read." Options: (a) a fused `get_index2`/`get_index3` opcode the
-  compiler emits for chained indexing, so a bare `get_index` is conservatively
-  treated as an escape; (b) always hand back a cached `RowView` for grid rows
-  (uniform correctness, allocation amortised by the per-row cache) and let the
-  fast path special-case `RowView[j]`. Which?
+**Resolved: option (a) — gate grids behind fused indexing.** A bare `get_index`
+is conservatively an escape (it deflates the grid); the compiler emits a fused
+`get_index2`/`set_index2` for chained `a[i][j]` that reads/writes the grid cell
+directly and never produces a `row_view` `Value`. So at runtime a `row_view` is
+never materialised into a register at all, and the grid is only ever touched
+through the fused path.
+
+**Why the alternatives were rejected — the in-place row swap.** During Phase 4+5
+implementation a decisive counterexample surfaced that breaks **both** the
+"copy-out on escape" architecture (Decision section below) *and* a
+"persistent-`row_view`-alias" variant:
+
+```lua
+local tmp = a[i]   -- transient row_view(a, i-1); grid intact; NOT a heap store
+a[i] = a[j]        -- outer store on a grid ⇒ DEFLATE a; slot i is then reassigned
+a[j] = tmp         -- tmp must still denote the ORIGINAL a[i]
+```
+
+`tmp` is a bare `row_view` parked in a register across the deflation. Any scheme
+that resolves a stale `row_view` *through the parent's array slot* reads the
+**reassigned** value, not tmp's original row — and copy-out-on-escape can't save
+it either, because tmp's copy-out happens only at line 3, after the grid is gone
+and slot `i` already overwritten (this is the same hazard the review flagged as
+"orphaned-row-on-reassignment," lines below). The only fully sound slot-free fix
+is a per-grid `row → *Table` deflation map frozen at deflation time — extra
+permanent state on every deflated `Table`. Rather than pay that, **gate**: never
+let a bare `row_view` exist at runtime, so the parked-stale-view case cannot
+arise. The `row_view` `Value` (Phase 1) and the `rowViewGet`/`Set`/`Len`
+forwarding (Phase 3) become dormant at runtime under this gate — kept (green,
+harmless), but the fused opcodes compute cell addresses directly without minting
+a view.
+
+This re-orders the phasing: fused indexing (was Phase 8) is now the prerequisite
+(Phase 4a) for enabling live grids.
+
+## Open questions for review
 - [x] **2a (`.grid` lane) vs 2b (separate `GridPart`)** — ~~layout churn vs a
   second representation to branch on.~~ **Decided 2a** (Bart): the `Layout`
   "frozen contract" is purely our own compile-time-checked invariant — nothing
