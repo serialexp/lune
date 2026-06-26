@@ -1,0 +1,379 @@
+# Nested Numeric Array Flattening — Design
+
+Status: draft — **direction approved: build grid flattening (D).** Architecture
+pivoted post-review to **transient fat-value rows with copy-out on escape**,
+which dissolves the GC-pinning and identity-cache objections. Determinism/replay
+is the one principled gate and is satisfiable (see §Determinism gate). Build size
+is explicitly *not* a blocker (see §Decision).
+Owner: Bart
+Last updated: 2026-06-26
+
+## Implementation status
+
+Tracking the gap between this design and what's on `master`. Tick items as they
+land; move whole sections to Done once everything inside is checked.
+
+### Done
+
+_(nothing yet — this doc exists to be reviewed for feasibility before any code)_
+
+### Outstanding
+
+- [x] **Phase 0 — Decision gate.** ~~Land this doc, get Codex + Antigravity
+  feasibility sign-off.~~ **Done — and decided: BUILD D.** Both reviewers sized
+  it as a 2–6-month project and recommended the `.table` lane first — but that
+  sizing prices *human* lifetime, the input that made Pall's cdata line rational.
+  Under AI-assisted coding a failed attempt costs token budget, not months, so
+  build-size is not a reason to default to the cheaper option. The only
+  principled blockers are **unsoundness** (reviewers agreed it's soundable) and
+  **determinism/replay** (satisfiable — §Determinism gate). The reviews still
+  paid off: they surfaced the GC-pinning / identity-cache failure modes, and the
+  fix (transient fat-value rows, §Decision) came straight out of them.
+Architecture is the **transient fat-value** model (§Decision), not the
+heap-`RowView` first cut. Phases retargeted accordingly:
+
+- [ ] **Phase 1 — `RowView` fat value + structural identity.** A new `Value`
+  tag `row_view` carrying `{ parent: *Table, row: u32 }` in the 8-byte payload.
+  `eql`/`rawequal` compare `(parent.id, row)`; `Value` printing, type name
+  (`table`), truthiness all behave as a table. No heap object, no allocation.
+- [ ] **Phase 2 — Grid representation in the array part.** A flat
+  `[rows*stride]` packed buffer at a narrow element lane, a per-row length/
+  presence vector, and the stride. Decide 2a (`.grid` lane on `ArrayPart`) vs 2b
+  (separate `GridPart`) — see §Open questions.
+- [ ] **Phase 3 — Row forwarding.** `get_index`/`set_index` on a `RowView`
+  forward into `parent.grid[row*stride + (k-1)]` at the element lane; `#row`,
+  `next`/`pairs` over a row enumerate the logical row.
+- [ ] **Phase 4 — Inflation (tier-0 widen-into-grid).** `a[i][j]=v` on a
+  homogeneous-numeric nested table migrates the parent into a grid, exactly as
+  `setInPlace` widens i8→value today. Hysteresis (reuse `frozen`/monotonic) so a
+  recently-deflated grid does not re-inflate and thrash.
+- [ ] **Phase 5 — Escape ⇒ inflate-to-table (the correctness keystone).** Every
+  heap-store opcode (`set_index`, `set_global`, upvalue close, table
+  constructor) checks for a transient `RowView` operand and copies the row out to
+  a real `Table` before storing. Same for `setmetatable(row,…)`, `rawset`, and
+  any op the grid can't represent. Guarantees no `RowView` ever persists in the
+  heap, so the grid is never pinned.
+- [ ] **Phase 6 — GC integration.** `blacken` over a grid skips the (non-heap)
+  leaves; the grid buffer is owned by the parent. No `RowView` heap objects
+  exist to mark — escaped rows are already concrete tables.
+- [ ] **Phase 7 — Determinism + keyframe.** Prove the grid is in-memory only
+  (never serialised), identity is `parent.id`-based (address-independent), and
+  all 8 modes + keyframe restore observe identical logical values. See
+  §Determinism gate.
+- [ ] **Phase 8 — Trace recorder support.** A fused multi-level index path that
+  records `a[i][j][k]` as grid-relative address arithmetic (`base +
+  (i*stride+j)`) behind `guard_grid` + bounds + not-deflated guards, side-exiting
+  to tier-0 when a row has deflated. This is where the locality win is cashed.
+
+## Why this exists
+
+Today an array whose elements are themselves arrays/tables — nbody's
+`bodies[i]`, array3d's `a[i][j][k]` — lands in the catch-all `.value` lane
+(`ArrayPart.optimalLane`, array.zig:366: any heap element ⇒ `.value`). The trace
+recorder aborts `get_index`/`set_index` on a `.value` lane (`recArrayGet`,
+trace.zig:1857, `.nyi_opcode`), so these workloads run ~entirely on the tier-0
+interpreter and never tier up. `--dump-aborts` localised both benchmarks'
+single biggest gap to exactly this one opcode/lane combination.
+
+There are two ways to close it:
+
+- **The `.table` lane (option A, see doc 13's discussion / the cheaper path):**
+  add a homogeneous-heap lane so `a[i]` records as a guarded table-typed load
+  and `a[i][j]` chains as nested pointer-chasing packed loads. Unblocks *trace
+  coverage* with no new semantics, but the rows stay scattered on the heap — no
+  cache locality, N dependent loads per access.
+
+- **Grid flattening (option D, this doc):** lay the nested numeric arrays out as
+  one contiguous strided buffer in the parent table, so `a[i][j][k]` is
+  `base + (i*d2+j)*d3 + k` — one multiply-add, one load, cache-friendly. This is
+  the global structural win for every workload that touches a numeric matrix,
+  but it collides with Lua's reference semantics for `a[i]` (rows are tables
+  with identity and aliasing) and so needs an inflation/deflation lattice plus
+  row-view objects to stay correct.
+
+This doc is the contract for **option D**.
+
+## The core tension (read this before the mechanism)
+
+Scalar lane narrowing (i8/i16/.../f64) is sound and lives purely in the storage
+layer for one reason: **its elements are value types with no identity.** `a[i]`
+on an int lane returns a *copy* of an int; nothing can alias it or ask "is this
+the same int," so the storage layer can swap representations invisibly.
+
+Rows are tables: **reference types with identity and aliasing.** Lua lets the
+program observe a row as a first-class handle, and the flat representation must
+keep every one of these correct:
+
+1. `local r = a[1]; r[4] = 99` — `r` aliases row 1; the write must hit the grid.
+2. `a[1] == a[1]` — must return the same object both times (identity).
+3. `a[1] = otherTable` — reassigns the whole row to an unrelated table.
+4. `a[1]` may be stored elsewhere, passed to a function, survive across GC.
+5. Rows may be jagged or grow past the stride.
+
+Flattening is therefore only legal for rows that **do not escape** as live
+handles, and the representation must **deflate** any row that does. Inflation is
+the i8→value analogue (a store migrates the representation up); deflation is the
+new inverse the scalar lattice never needed (scalars never escape, so they never
+deflate). Jaggedness/sparsity is *not* a correctness barrier — a grid sized to
+the bounding box wastes memory on short rows but stays correct; the bet (Bart's)
+is that `a[i][j]` workloads are overwhelmingly rectangular-ish and numeric.
+
+## Domain model
+
+### `RowView` (Phase 1)
+
+```
+RowView = extern struct {
+    header: GcHeader,      // ObjectType.row_view
+    parent: *Table,        // the grid-bearing table
+    row: u32,              // 0-based row index into the grid
+    _pad: ...,
+}
+```
+
+- `get_index`/`set_index` on a `RowView` forward into
+  `parent.grid[row*stride + (k-1)]` at the grid's element lane.
+- Identity: the parent caches the materialised `RowView` per row (a sparse
+  `row → *RowView` map, populated lazily on first escape) so a second `a[i]`
+  returns the same pointer and `a[i] == a[i]` holds.
+- A `RowView` keeps its `parent` alive (GC edge) and pins the grid row.
+
+### Grid array-part (Phase 2)
+
+Two viable encodings, to be chosen during review:
+
+- **(2a) New `.grid` lane** on the existing `ArrayPart`: `data` reinterpreted as
+  a flat `[rows*stride]` buffer at a sub-element lane (`grid_elem: Lane`), plus a
+  per-row `len`/presence vector and a `stride`. Keeps everything in one struct;
+  costs `ArrayPart` two new fields (layout churn the JIT's `Layout` contract
+  catches at compile time).
+- **(2b) Separate `GridPart`** pointed to from the parent when nested. Keeps
+  `ArrayPart` untouched (no JIT `Layout` disturbance) at the cost of a second
+  representation the table must branch on.
+
+Either way the parent's *outer* `get(i)` returns "the i-th row" — which is a
+`RowView` (materialised/cached) when read as a value, but the **fused** index
+path (Phase 7 + the tier-0 fast path) reads `grid[i*stride + j]` directly
+without ever materialising the row.
+
+## Mechanism
+
+### Inflation — when a plain table becomes a grid (Phase 3)
+
+Trigger lives where `setInPlace`'s widen already lives. On `a[i][j] = v`:
+- `a` is a table, `a[i]` is (or is about to be) a table, `v` is a narrow scalar.
+- If `a`'s elements are all such rows (homogeneous, numeric leaves), migrate `a`
+  into a grid with `stride = max observed row length` (grows by reshape, like
+  array growth today). The existing nested row tables are copied into the grid
+  and freed; any that already escaped (have outstanding refs) block inflation
+  for that row — it stays nested.
+
+This is deliberately the same shape as `widenFor` (array.zig): a store that
+doesn't fit the current representation migrates it to a more capable one.
+
+### Deflation — the inverse the scalar lattice never needed (Phase 4)
+
+A row deflates back to a real `Table` when it can no longer be a grid row:
+- **Escape:** the program takes a live handle to `a[i]` (see Open questions for
+  how tier-0 detects this). Deflation here means: stop, materialise a `RowView`
+  (cheap — no copy, it's a view) OR copy the row out to a real table. The
+  `RowView` route is preferred (keeps the grid intact); copy-out is the fallback
+  when a `RowView`'s invariants can't hold (e.g. the row then grows).
+- **Reassignment:** `a[i] = x` overwrites slot i with a real ref; the old grid
+  row is orphaned (kept alive only if a `RowView` still references it).
+- **Row growth past stride / non-numeric leaf store:** reshape the grid (grow
+  stride) or deflate that row to nested.
+
+Invariant: **at every deflation boundary, readers see byte-identical logical
+values** before and after. This is the determinism contract (doc 02) and the
+correctness contract simultaneously.
+
+### Trace recorder (Phase 7) — where the win is cashed
+
+A fused multi-level index records `a[i][j][k]` as:
+`guard_grid(a)` + bounds guards on i/j/k + one `aref` computing
+`base + (i*stride_i + j)*stride_j + k` + one `aload` at the grid element lane.
+A side-exit fires if any row on the path has deflated (the `guard_grid` /
+per-row-present check fails), dropping to tier-0 which holds the always-correct
+nested/deflated representation. This is structurally identical to today's
+`guard_lane` + `aref` + `aload`, just with multi-dimensional address arithmetic
+and a grid-validity guard instead of a single-lane guard.
+
+## Non-goals (v1)
+
+- **Explicit `typed_array` n-d (`object.zig` TypedArray).** That's the FFI-cdata
+  analogue with no per-row table identity — a *separate*, simpler target. This
+  doc is specifically about making *plain Lua nested tables* flatten implicitly.
+  If review concludes implicit flattening is too costly, n-d `typed_array` is
+  the documented fallback for the cache win.
+- **Non-numeric grids.** A grid of strings/tables stays nested (`.table` lane or
+  `.value`). Grids are for narrow scalar leaves only.
+- **Auto-flattening arrays whose rows demonstrably escape.** Those stay nested;
+  the optimisation is best-effort, never mandatory for correctness.
+
+## Phasing
+
+Phases 1–6 make the representation correct under tier-0 alone (no trace) — the
+gate is that all 8 modes + keyframe replay stay byte-identical with grids
+enabled, with deflation exercised. Phase 7 adds the trace fast path that turns
+correctness into the actual speedup. The build stays green at every phase
+(Rule Z-3); each representational invariant gets its shape pinned with tests
+(inflation round-trip, deflation-on-escape identity, `a[i]==a[i]`,
+alias-through-`RowView`, jagged bounding box, GC of escaped-orphan rows).
+
+## Open questions for review
+
+- [ ] **Escape detection in tier-0.** At the bytecode level `a[i][j]`
+  materialises the row ref into a register transiently (two `get_index`
+  opcodes), so the interpreter can't trivially tell "transient sub-index" from
+  "escaping read." Options: (a) a fused `get_index2`/`get_index3` opcode the
+  compiler emits for chained indexing, so a bare `get_index` is conservatively
+  treated as an escape; (b) always hand back a cached `RowView` for grid rows
+  (uniform correctness, allocation amortised by the per-row cache) and let the
+  fast path special-case `RowView[j]`. Which?
+- [ ] **2a (`.grid` lane) vs 2b (separate `GridPart`)** — layout churn vs a
+  second representation to branch on.
+- [ ] **Is the win worth the deflation machinery vs option A?** A unblocks the
+  same benchmarks' *coverage* for a fraction of the work but leaves rows
+  scattered. D adds locality globally but is a large, semantically delicate
+  build. This is the decision Phase 0 must settle.
+- [ ] **GC cost of the per-row `RowView` cache** and orphaned-but-referenced
+  rows — does this reintroduce per-element heap objects in the escape-heavy
+  case, eroding the win exactly where the representation is most stressed?
+
+## Feasibility review outcome (2026-06-26)
+
+Two independent external reviews (Codex high-reasoning, Antigravity) reached the
+**same conclusion**: build the `.table` lane first; grid flattening is sound but
+a long, semantically delicate project, not a quick win. Verbatim sizings — Codex:
+`.table` lane "1–3 week project," grid flattening "2–6 months to make solid";
+Antigravity: `.table` lane "2-week build," grid flattening "6-month tar pit."
+
+Both flagged failure modes I under-weighted, recorded here so they're not
+rediscovered the hard way:
+
+- **GC space-leak via parent pinning (the sharpest new objection).** A `RowView`
+  must read from the parent's contiguous buffer, so a single escaped row pins the
+  *entire* grid. `local r = a[1]` on a 1000×1000 f64 grid, then drop `a` → the
+  whole 8 MB buffer is uncollectable while `r` lives. Avoiding it needs copy-out
+  of the row on parent death (hard to coordinate with our GC) or accepting the
+  leak. Scalar lanes never had this because scalars don't escape.
+- **Identity-cache strong/weak dilemma.** Strong per-row `RowView` cache →
+  unbounded bloat (every touched row pinned for the parent's life). Weak cache →
+  requires weak-pointer marking in the GC, new bookkeeping + sweep cost.
+- **Orphaned-row-on-reassignment.** `local r=a[1]; a[1]=other` means `r` must keep
+  denoting the *old* row contents — deflation must copy the slice out to a fresh
+  table and rewrite `r`'s identity target, not just deflate the parent.
+- **Observability surface (Codex's list).** `rawequal`, row-as-hash-key, weak
+  tables, `next`/`pairs` over a row, `#row`, `setmetatable(row,…)`, `rawget`/
+  `rawset`, coroutine-suspended row refs, debug APIs — each must either implement
+  full row-table semantics on `RowView` or force a stable, identity-preserving
+  deflation. "A grid row has a stable table identity that may be virtual
+  internally, and every table-observing op must honour it" — that's implementing
+  virtual tables with lazy materialisation, far past storage widening.
+- **Deflation cascades / perf cliff.** A trace compiled for the flat layout that
+  hits a deflation in a loop enters continuous alloc/dealloc — invisible and
+  worse than never flattening. This is *why* LuaJIT keeps flat n-d in FFI cdata:
+  cdata bypasses per-row identity, metatables, weak refs, hash-key use. Plain
+  tables are "too observable." We would be crossing a line Pall drew deliberately;
+  the hidden cost is exactly semantic transparency.
+
+**Better escape-detection option than the doc's (a)/(b)** — both reviewers,
+converging:
+- Codex: keep "borrowed/pinned" **purely inside the trace IR**, never a
+  VM-visible state. Once a row becomes a runtime `Value` it is a real identity
+  object; tier-0 always returns a stable cached `RowView`. Fused opcodes are a
+  *perf* fast path, not the correctness foundation.
+- Antigravity (Option C): represent `RowView` as a **transient 16-byte fat
+  `Value`** (tag + parent ptr + row index) — no heap allocation; `rawequal` =
+  compare parent+row. The catch: every opcode that stores a `Value` into a heap
+  object must eagerly inflate/deflate the transient into a concrete table on the
+  way in. Trades heap churn for a check on every heap-store opcode.
+
+The reviewers' net recommendation was "`.table` lane first, defer D." That
+recommendation rests on the 2–6-month sizing, which is a *human-time* cost — see
+§Decision for why that input no longer dominates. Their **technical** findings
+(the failure modes above) stand and are what the revised architecture below is
+built to neutralise.
+
+## Decision (post-review): build D, on a revised architecture
+
+**Why build-size is not the deciding factor.** The "tar pit" verdict prices six
+months of an engineer's irreplaceable time against an uncertain payoff — exactly
+the calculus that made Pall confine flat n-d to FFI cdata. That input is now
+~zero: a failed attempt costs token budget and recoverable effort, not months of
+a life. So the decision reduces to the project's two real gates — is it sound
+(yes), and does it preserve determinism/replay (yes, below). Build size is not a
+gate. (This reverses the "do A first" lean recorded above; the original
+heap-`RowView`-with-cache domain model in §Domain model is kept as the rejected
+alternative.)
+
+**The architecture pivot that dissolves the worst objections.** The reviews'
+sharpest failure modes — GC parent-pinning (one escaped row pins the whole grid),
+the identity-cache strong/weak dilemma, and per-element heap churn in loops — are
+all artefacts of representing a row as a *heap* `RowView` that points into the
+grid and must be cached for identity. Drop that. Instead (Antigravity's Option C
++ Codex's "borrowed stays internal," converging):
+
+- **Rows are transient fat values, not heap objects.** `a[i]` on a grid returns a
+  16-byte `RowView` *value* — `{ tag: row_view, parent: *Table, row: u32 }` —
+  packed into the existing `Value` payload. No heap allocation, so a hot
+  `a[i][j]` loop allocates nothing.
+- **Identity is structural.** `a[i] == a[i]` and `rawequal(a[i], a[i])` compare
+  `(parent, row)`. No identity cache exists, so there is no strong/weak dilemma —
+  and, decisively, no dependence on GC timing (the determinism point below).
+- **Escape ⇒ copy-out, not pin.** The instant a `RowView` value would be stored
+  into a heap object (any heap-store opcode: `set_index`, `set_global`, upvalue
+  close, table-constructor), that opcode **inflates it to a real concrete
+  `Table`** — copying the row's slice out of the grid. An escaped row is then a
+  normal table that does not reference the grid, so it cannot pin it. The grid
+  only ever holds rows that never escaped. Antigravity's own 8 MB-pinning killer
+  is thereby designed out, not mitigated.
+- **The cost moves to the heap-store opcodes.** Every opcode that writes a
+  `Value` into a heap slot gains a check "is this a transient `RowView`? then
+  inflate first." Bounded, on the store path (not the read path), and to be
+  measured against non-grid workloads for regression.
+
+This replaces the `RowView`/identity-cache bullets in §Domain model and the
+(a)/(b) escape-detection options in §Open questions; both are kept above as the
+rejected first cut.
+
+## Determinism gate (the one principled blocker — and why it clears)
+
+Per `00-architecture.md`, the only legitimate reason a representation trick is
+off-limits is that it breaks byte-identical 8-mode equivalence or keyframe
+replay. Grid flattening clears this:
+
+- **The grid is never serialised.** Like `lane`, it is an in-memory
+  optimisation; keyframes persist *logical* values (`array.get(i)` round-trips on
+  any representation), so a restore that lands on a different grid/nested state is
+  still observably identical.
+- **Identity is address-independent.** `RowView` equality is `(parent.id, row)`,
+  not a heap address — same discipline as `key_order` and the `ValueContext` hash
+  (which key off `asHeap().id`, never the pointer). So `a[i]==a[i]` and
+  row-as-hash-key are reproducible across modes.
+- **Inflation/deflation are pure functions of the operation stream.** Inflation
+  fires on a deterministic store shape; deflation fires on a deterministic op
+  (escape via a heap store, `setmetatable`, row growth past stride). Neither is
+  driven by the collector or by a clock.
+- **The single forbidden mechanism: GC-timing-driven deflation.** A weak identity
+  cache would make `a[i]==a[i]` depend on whether a `RowView` was collected —
+  non-deterministic. The fat-value model has no cache, so this hazard does not
+  exist by construction. (This is *why* the structural-identity choice is load-
+  bearing, not just convenient.)
+
+Determinism therefore constrains *how* (no weak cache, structural identity,
+op-driven transitions), never *whether* — exactly the asterisk the architecture
+doc reserves.
+
+## References
+
+- `src/array.zig` — `ArrayPart`, `Lane`, `optimalLane`, `widenFor`, `setInPlace`,
+  the `Layout` JIT contract.
+- `src/table.zig` — `Table`, `array`/`hash` split, `getInt`.
+- `src/interp.zig:1893` — the `get_index`/`set_index` tier-0 fast paths.
+- `src/trace.zig:1840` — `recArrayGet`/`recArraySet` (the `.value` abort to lift).
+- `src/gc.zig:243` — `blacken`; `isLeaf` (array.zig:197) drives array marking.
+- `src/object.zig` — `TypedArray` (the explicit n-d fallback, a non-goal here).
+- `docs/design/02-determinism.md`, `03-gc-memory.md` — the contracts grids must
+  not break.
