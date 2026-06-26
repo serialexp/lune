@@ -1,13 +1,13 @@
 # lune — tracing pure builtins (`math.sqrt` → native `sqrtsd`)
 
-Status: **partial — F0 (recorder + tier-1a oracle) landed; F1 (native `sqrtsd`)
-outstanding.** F0 is byte-identical across all 8 determinism modes + keyframe
-replay. The tier-1a oracle exercises the two new ops via the record-execute and
-record-execute-noopt modes; native codegen *declines* any trace carrying them, and
-in `--jit-native` mode a declined trace is skipped so the loop falls back to
-**tier-0** (not the oracle — see `nativeFor == null → continue` in the dispatch
-walk, `interp.zig`). All five trace modes therefore agree byte-for-byte. No speedup
-yet (that is F1).
+Status: **complete (v1) — F0 (recorder + tier-1a oracle) and F1 (native `sqrtsd`)
+both landed.** Byte-identical across all 8 determinism modes + keyframe replay; the
+`record_execute_native` mode now compiles the two ops to native (`sqrtsd` + a
+prologue native-identity guard) and agrees bit-for-bit with the tier-1a oracle and
+tier-0. A sustained sqrt-bound traced loop runs **~3.8× faster** native vs tier-0
+(see "nbody coverage + measure"). **nbody itself does not yet benefit** — a separate
+short-trip-count blocker stops its inner loop from tiering up at all (recorded
+below); closing that is a future lever, not part of this one.
 Owner: Bart
 Last updated: 2026-06-26
 
@@ -130,12 +130,12 @@ they land; move whole sections to "done" once everything inside them is checked.
   is a `.guard` (dedup aux via `guardKeyAux`); `fsqrt` is `.unary` (hoistable,
   DCE-able) but explicitly skipped by the constant folder; uses-counting and
   consumer-set passes updated.
-- [x] **F0 native auto-decline (`nativegen.zig`).** `proveKinds`' existing
-  `else => return false` declines any trace carrying the two ops. No new code; in
-  `--jit-native` mode the dispatch walk skips a non-compilable trace
-  (`nativeFor == null → continue`), so the loop falls back to tier-0. The oracle
-  path is exercised by the record-execute / record-execute-noopt modes instead;
-  all five trace modes stay byte-identical.
+- [x] **F0 native auto-decline (`nativegen.zig`) — superseded by F1.** F0 shipped
+  with `proveKinds`' `else => return false` declining any trace carrying the two ops
+  (in `--jit-native` mode the dispatch walk skipped the non-compilable trace,
+  `nativeFor == null → continue`, falling back to tier-0; the oracle was exercised by
+  the record-execute modes). F1 replaced that decline with real lowering — see the F1
+  `nativegen.zig` item below.
 - [x] **F0 wire ordinals (`traceser.zig` + `viz/src/enums.ts`).** 45/46 pinned by
   the contract test (count → 47); the viz tables mirror them by position.
 - [x] **F0 tests (`trace.zig` + `interp.zig`).** Recorder unit asserts the
@@ -145,20 +145,52 @@ they land; move whole sections to "done" once everything inside them is checked.
   `x,y=sqrt(a)` (nresults 2) → `.cross_frame`, int arg → `.bad_type`, a non-pure
   native → `.host_barrier`; three 8-mode `expectProgram`s — a float-reduction sqrt
   loop, a rebound-upvalue guard_pure deopt, and the NaN / `-0.0` edge cases — all
-  byte-identical across the matrix + keyframe replay.
+  byte-identical across the matrix + keyframe replay. With F1 landed, the
+  `record_execute_native` mode now compiles these loops to native, so the same three
+  tests also validate native ≡ oracle ≡ tier-0.
+- [x] **F1 — `x64.zig` `sqrtsdRegReg`/`sqrtsdRegMem`** (`F2 0F 51 /r`) + two encoding
+  unit tests (`sqrtsd xmm0,xmm1` → `F2 0F 51 C1`; `sqrtsd xmm2,xmm2` → `F2 0F 51 D2`).
+- [x] **F1 — `nativegen.zig` lowering.** New `Kind.native` for the callee snapshot.
+  `proveKinds`: `guard_pure` marks its slot_load `.native` (parallel to `func_guarded`),
+  `guard_pure` → `.none`, `fsqrt` → `.float` iff operand proven float. `SlotInfo.pure_tag`
+  carries the recorded `PureBuiltin` ordinal; `analyzeInner` stashes it from the covering
+  `guard_pure` (mirroring `func_id`). The prologue checks each `.native` slot ONCE:
+  `header.type==native` ∧ `[native+pure]==tag` ∧ `[native+pure+1]==1` (the
+  `?PureBuiltin` is 2 bytes `[payload, has_value]`; two byte compares avoid a 16-bit
+  immediate encoder) → `jcc(.ne, prologue_fail)`. This is a **prologue identity check
+  like `guard_func`, NOT an LICM/preheader hoist** (the current LICM pass does not
+  hoist guards). `fsqrt` lowers to `floatOperandToXmm` + `sqrtsdRegReg(x0,x0)` + store
+  to the float home; it never side-exits (a stale callee is caught by the hoisted
+  `guard_pure`). `isTransient`/`operandReads` updated. F0 `else => return false`
+  decline removed for the two ops.
+- [x] **F1 — nbody coverage + measure.** `--dump-native` on a sustained sqrt loop
+  shows `f2 0f 51 c0` (`sqrtsd xmm0,xmm0`). Native ≡ tier-0 on the float-reduction loop
+  and the rebound-upvalue deopt. **Sustained sqrt loop** (`s += sqrt(i*1.0)`, 5e7 iters):
+  tier-0 **1.39 s** → `--jit-native` **0.37 s** (**3.8×**); LuaJIT 0.07 s (the residual
+  is tier-0-dispatch + codegen-tightness gap, not this lever). **nbody (`bench`,
+  N=50000): t0 286 ms → jit 285 ms — unchanged**, because nbody records **zero traces**:
+  its inner `for j=i+1,nbody` loop has trip count ≤4 (nbody=5), too short to trip the
+  back-edge hotcount and complete a recording. The sqrt abort *was* a real blocker (a
+  sustained copy of the same inner body now records `guard_pure`+`fsqrt` and compiles
+  native), but it was not the *only* one; the short-trip-count blocker is independent
+  and out of scope for this lever (a future short-loop / outer-loop recording lever).
+- [x] **F1 — Codex + Antigravity review + layout hardening.** Both reviewers confirmed
+  the native `guard_pure` prologue is byte-identical to the oracle arm, the `@sqrt` ≡
+  `sqrtsd` bit-equality holds under default MXCSR (incl. `-0.0`/qNaN/`±inf`/subnormals),
+  and the prologue hoist is safe (a reassigned callee local becomes a `.carried`
+  non-scalar slot → bail to tier-1a; `set_upval`/`set_global`/native-into-table all
+  abort recording). Hardening from their shared low-priority note: a `comptime`
+  `@sizeOf(?PureBuiltin) == 2` assert beside `NATIVE_PURE_OFF` plus a runtime test
+  pinning the `[payload@+0, has_value@+1]` byte order the two prologue compares depend
+  on — a future toolchain optional-layout change now fails the build/test rather than
+  silently miscompiling the identity guard.
 
 ### Outstanding
 
-- [ ] **F1 — `x64.zig` `sqrtsdRegReg`/`sqrtsdRegMem`** (`F2 0F 51 /r`) + encoding
-  unit test.
-- [ ] **F1 — `nativegen.zig` lowering.** `proveKinds` `fsqrt` → `Kind.float` iff
-  operand proven float, `guard_pure` → guard (no kind); `isTransient`/
-  `operandReads`/`last_body_guard`; `lower`: `guard_pure` = deref callee header,
-  check `heapType==.native` ∧ `[native+pure_off]==aux` → `jcc(.ne, deopt_exit)`
-  (LICM-hoisted to preheader); `fsqrt` = `sqrtsd` into the float home. Remove the
-  F0 decline for these two ops.
-- [ ] **F1 — nbody coverage + measure.** `--dump-native` shows `sqrtsd`;
-  `just bench --filter nbody` tier-0 vs `--jit-native` vs LuaJIT, recorded here.
+- [ ] **Defer — short-trip-count loop recording** (the second nbody blocker). nbody's
+  inner loop iterates ≤4× per entry, so it never tiers up regardless of the sqrt fix.
+  A separate lever (record across entries / unroll / record the outer call loop). Not
+  this technique.
 - [ ] **Defer — non-float arg admission** (`guard_number` + cvt). Out of v1 scope.
 - [ ] **Defer — further pure builtins** (`floor`/`abs`/…): one `PureBuiltin`
   enumerator + one `f*` op each; the machinery is reusable as-is.

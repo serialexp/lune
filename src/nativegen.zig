@@ -166,6 +166,26 @@ const CLOSURE_PROTO_OFF: i32 = @offsetOf(function.Closure, "proto");
 /// it survives keyframe restore/replay) from a `*const Proto`. `guard_func` compares
 /// the recorded id against `[closure.proto + PROTO_ID_OFF]`.
 const PROTO_ID_OFF: i32 = @offsetOf(bytecode.Proto, "id");
+/// `ObjectType.native` ordinal — the byte at `GcHeader.type` for a host native.
+/// The pure-builtin `guard_pure` checks a snapshot callee value is a native of this
+/// type before reading its `pure` tag.
+const NATIVE_TYPE: u8 = @intFromEnum(object.ObjectType.native);
+/// Offset of `Native.pure` (a `?PureBuiltin` — an `enum(u8)` optional, 2 bytes laid
+/// out `[payload, has_value]`) from a `*GcHeader`. `guard_pure` proves the callee is
+/// the recorded pure builtin with two byte compares: `[native + pure]` (the payload
+/// ordinal) == the recorded `PureBuiltin` tag, AND `[native + pure + 1]` (the
+/// non-null flag) == 1. Two byte compares sidestep needing a 16-bit-immediate
+/// compare encoder and don't depend on the optional's internal byte order beyond the
+/// verified `[payload, flag]` layout.
+const NATIVE_PURE_OFF: i32 = @offsetOf(function.Native, "pure");
+comptime {
+    // Pin the `?PureBuiltin` size the `guard_pure` prologue depends on (Z-1: a
+    // toolchain bump that changes optional layout must fail the build loudly, not
+    // silently miscompile the two-byte identity check). The `[payload, has_value]`
+    // byte *order* can't be asserted at comptime (an optional has no well-defined
+    // comptime layout to deref) — it's pinned by the runtime test below instead.
+    std.debug.assert(@sizeOf(?function.PureBuiltin) == 2);
+}
 /// Packed-lane ordinals the native array path can lower. The bool lane (B2/B3,
 /// the nsieve sieve) is bit-packed; the int lanes (B4) are byte-packed and
 /// SIB-indexed; the `f64` lane (Phase D, float arrays) is 8-byte doubles read/
@@ -236,7 +256,7 @@ fn laneConsistent(trace_lane: *?i32, aux: i32) bool {
 ///               `[rsi + aux*8]`, not computed from the operands. Like `.aref` it is a
 ///               distinct addressing kind — it can neither feed arithmetic nor be
 ///               flushed to a slot (C2). Consumed only by `hload`/`hstore`/`guard_hash`.
-const Kind = enum { none, int, bool, ptr, aref, float, func, href };
+const Kind = enum { none, int, bool, ptr, aref, float, func, href, native };
 
 /// A compiled trace: an executable page whose entry is
 /// `fn(tags: [*]u8, payloads: [*]u64) callconv(.c) usize` — the SoA register file's
@@ -357,6 +377,13 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
     const func_guarded = gpa.alloc(bool, n) catch return false;
     defer gpa.free(func_guarded);
     @memset(func_guarded, false);
+    // Parallel to `func_guarded`, but for `guard_pure` (the pure-builtin identity
+    // guard): a slot_load it covers is the callee-snapshot value → classified
+    // `.native` (invariant native pointer, identity-checked once in the prologue
+    // against the recorded `PureBuiltin` tag).
+    const pure_guarded = gpa.alloc(bool, n) catch return false;
+    defer gpa.free(pure_guarded);
+    @memset(pure_guarded, false);
     // Per-aref: has a `guard_bounds` on this aref been proven before we reach a
     // `guard_present`/`aload`? [I4 / review] `present` is non-null only when
     // `len > 0`, which a passing `guard_bounds` (idx0 <u len) implies — so the
@@ -427,6 +454,15 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (t.instrs[r].op != .slot_load) return false;
                 func_guarded[r] = true;
             },
+            .guard_pure => {
+                const r = ins.a;
+                if (r >= i) return false; // not linear SSA → malformed
+                // A pure guard only ever covers the callee-snapshot slot_load (the
+                // recorder emits it on a fresh seeded upvalue/global input); the native
+                // path hoists it to a prologue native/`PureBuiltin`-tag check.
+                if (t.instrs[r].op != .slot_load) return false;
+                pure_guarded[r] = true;
+            },
             else => {},
         }
     }
@@ -447,6 +483,8 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                     kinds[i] = .ptr; // guard_table-covered → invariant table pointer
                 } else if (func_guarded[i]) {
                     kinds[i] = .func; // guard_func-covered → invariant callee closure
+                } else if (pure_guarded[i]) {
+                    kinds[i] = .native; // guard_pure-covered → invariant callee native
                 } else {
                     return false; // unguarded → cannot prove a kind
                 }
@@ -570,6 +608,25 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .func) return false;
                 kinds[i] = .none;
+            },
+            // guard_pure (the pure-builtin identity guard): covers the callee-snapshot
+            // slot_load (proven `.native`). Pinned to a prologue identity check (native
+            // type + recorded `PureBuiltin` tag); lowers to nothing in the body, like
+            // guard_func. The callee is a once-seeded loop-invariant upvalue/global, so
+            // one prologue check covers the whole native run.
+            .guard_pure => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .native) return false;
+                kinds[i] = .none;
+            },
+            // fsqrt: a leaf float producer computing `@sqrt` of its operand (the same
+            // IEEE correctly-rounded sqrt as native `sqrtsd` under the default MXCSR).
+            // The operand must be a proven float (its dominating `guard_float` pinned
+            // the kind); the result is a float. Lowers to a single `sqrtsd`.
+            .fsqrt => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .float) return false;
+                kinds[i] = .float;
             },
             // --- hash-part field path (H1) --------------------------------------
             // href: the loop-invariant value-cell pointer (`*Value`) for a constant
@@ -819,8 +876,9 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                     kinds[i] = .none;
                 }
             },
-            // Everything else (div/idiv/mod/pow/guard_number/float-neg) is deferred —
-            // bail to tier-1a. (shl/shr and guard_float are handled above.)
+            // Everything else (idiv/mod/pow/guard_number/float-neg) is deferred —
+            // bail to tier-1a. (shl/shr, guard_float, guard_pure and fsqrt are handled
+            // above.)
             else => return false,
         }
     }
@@ -890,6 +948,11 @@ const SlotInfo = struct {
     /// `Proto.id` its covering `guard_func` pins, checked once in the prologue
     /// (closure type + this id). Unused (0) for non-`.func` slots.
     func_id: u32 = 0,
+    /// For a `.native` (pure-builtin callee snapshot) invariant slot: the recorded
+    /// `PureBuiltin` ordinal its covering `guard_pure` pins, checked once in the
+    /// prologue (native type + this tag's payload byte + the non-null flag). `-1` for
+    /// non-`.native` slots.
+    pure_tag: i32 = -1,
     /// win 2: the store_ref transient was allocated *into* home, so the op updates the
     /// home in place and the back-edge shuffle move for this slot self-elides. Only set
     /// for `carried` slots passing the safety predicate (see `analyzeInner`).
@@ -976,6 +1039,8 @@ fn isTransient(op: trace.IrOp) bool {
         .aref, .aload => true,
         // int_of_float materializes the converted int limit in a register.
         .int_of_float => true,
+        // fsqrt materializes the `@sqrt` result in a float home (XMM/spill).
+        .fsqrt => true,
         // href materializes the seeded cell pointer in a register (like aref); hload
         // materializes the decoded scalar field value. hstore/guard_hash are effects.
         .href, .hload => true,
@@ -1008,6 +1073,9 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
         .aload, .guard_bounds, .guard_present, .guard_table, .guard_lane => .{ .a = true, .b = false },
         // guard_func reads the callee-snapshot value it identity-checks (a).
         .guard_func => .{ .a = true, .b = false },
+        // guard_pure reads the callee-snapshot native it identity-checks (a); fsqrt
+        // reads its sole float operand (a).
+        .guard_pure, .fsqrt => .{ .a = true, .b = false },
         // guard_fits reads the value it range-checks (a); guard_append reads the aref
         // token (a) and reaches len/cap/hash through aref.a — no second operand.
         .guard_fits, .guard_append => .{ .a = true, .b = false },
@@ -1181,6 +1249,30 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         }
         // proveKinds only set .func via a guard_func, so one always exists.
         // Defensive: bail rather than miscompile.
+        if (!found) return error.Bail;
+    }
+    // A `.native` (pure-builtin callee snapshot) invariant slot carries the recorded
+    // `PureBuiltin` ordinal from its covering `guard_pure`, checked once in the
+    // prologue (the upvalue/global cell is re-resolved + re-seeded each entry, so it
+    // cannot change within a native run). Locate the guard_pure and stash its tag.
+    for (slots.items) |*s| {
+        if (s.kind != .native) continue;
+        const lr: u16 = @intCast(s.load_ref);
+        var found = false;
+        for (t.instrs) |g| {
+            if (g.op == .guard_pure and g.a == lr) {
+                if (found and g.aux != s.pure_tag) {
+                    // Two guard_pures on one snapshot with *different* recorded tags:
+                    // the prologue checks one, but the oracle re-checks each and would
+                    // side-exit on the second — a divergence. The recorder never emits
+                    // this (one seeded callee → one tag), so it can only arise malformed.
+                    return error.Bail;
+                }
+                s.pure_tag = g.aux;
+                found = true;
+            }
+        }
+        // proveKinds only set .native via a guard_pure, so one always exists.
         if (!found) return error.Bail;
     }
 
@@ -1765,7 +1857,7 @@ fn refHomeBaseReg(a: *x64.Assembler, s: SlotInfo, scratch: Reg) !Reg {
             try a.movRegMem(scratch, .rsp, d);
             return scratch;
         },
-        .xmm => unreachable, // only `.ptr`/`.func` heap-pointer slots reach here, never float
+        .xmm => unreachable, // only `.ptr`/`.func`/`.native` heap-pointer slots reach here, never float
     }
 }
 
@@ -2226,7 +2318,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     for (alloc.slots) |s| {
         if (s.class == .write_only) continue;
         const tag: u8 = switch (s.kind) {
-            .ptr, .func => TAG_HEAP, // both are invariant heap pointers
+            .ptr, .func, .native => TAG_HEAP, // all invariant heap pointers
             .float => TAG_FLOAT,
             else => TAG_INT,
         };
@@ -2300,6 +2392,29 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         try a.jcc(.ne, prologue_fail);
     }
 
+    // [guard_pure prologue] For each `.native` slot the callee pointer is now in its
+    // home; verify it is a host native carrying exactly the recorded `PureBuiltin` tag
+    // — the pure-builtin identity guard, checked once here (the upvalue/global cell is
+    // re-resolved + re-seeded each entry, so it cannot change within a native run; a
+    // `set_upval`/`set_global` in the traced region aborts recording). A miss returns 0
+    // (regs[] untouched), side-exiting to tier-0 which really pushes the call frame and
+    // re-runs the iteration. Byte-identical to irinterp's `guard_pure` arm: heap +
+    // type==native + `native.pure == @enumFromInt(tag)`. The `pure` field is a 2-byte
+    // `?PureBuiltin` laid out `[payload, has_value]`, so the non-null check is the flag
+    // byte == 1 and the identity check is the payload byte == tag.
+    for (alloc.slots) |s| {
+        if (s.class == .write_only or s.kind != .native) continue;
+        const preg = try refHomeBaseReg(a, s, .rax);
+        // header.type == native (the payload is a TAG_HEAP `*GcHeader`).
+        try a.cmpByteMemImm(preg, HEADER_TYPE_OFF, NATIVE_TYPE);
+        try a.jcc(.ne, prologue_fail);
+        // pure non-null (flag byte == 1) AND payload ordinal == recorded tag.
+        try a.cmpByteMemImm(preg, NATIVE_PURE_OFF + 1, 1);
+        try a.jcc(.ne, prologue_fail);
+        try a.cmpByteMemImm(preg, NATIVE_PURE_OFF, @intCast(s.pure_tag));
+        try a.jcc(.ne, prologue_fail);
+    }
+
     // [Phase 2] Materialize the invariant array bases ONCE, now that each `.ptr` slot
     // is proven a table of the recorded lane. `data`/`present` pointers and `len` are
     // fixed for the whole native run (B5), so they live in dedicated registers and the
@@ -2345,7 +2460,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // recheck happens at entry in `seedTraceInputs` (a failed cell resolve
             // routes the entry to tier-1a, never native) and per-iteration in the
             // `hload` tag-check, so in the native body it emits nothing.
-            .slot_load, .guard_int, .guard_float, .guard_table, .guard_lane, .guard_func, .guard_hash => {},
+            // guard_pure joins the hoisted no-ops: the native-identity check is in the
+            // prologue (loop-invariant callee snapshot), so nothing here.
+            .slot_load, .guard_int, .guard_float, .guard_table, .guard_lane, .guard_func, .guard_hash, .guard_pure => {},
             .konst => {
                 // H1: a `.none`-kind konst is an interned heap-string href key. href
                 // reads the seeded cell, not the key, so the key carries no native
@@ -2427,6 +2544,22 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try a.jcc(.ne, deopt_exit); // ordered & not equal → non-integral / out-of-range
                 try a.jcc(.p, deopt_exit); // unordered (NaN) → side-exit
                 try regToPlace(a, placeOfRef(alloc, i), .rax);
+            },
+            // fsqrt: the inlined pure builtin. `@sqrt` ≡ `sqrtsd` bit-for-bit under the
+            // default MXCSR (round-to-nearest-even, which lune never changes) — including
+            // `sqrt(-0.0) = -0.0`, `sqrt(x<0) = qNaN`, `sqrt(+inf) = +inf` — so this one
+            // SSE instruction reproduces the tier-1a oracle's `Value.float(@sqrt(arg))`
+            // exactly. The operand is a proven float; stage it into a scratch XMM, sqrt
+            // in place, then move to the float home (xmm or spill). No side-exit: a stale
+            // callee is caught by the hoisted `guard_pure`, not here.
+            .fsqrt => {
+                try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.a), .float); // proveKinds pinned .float
+                try a.sqrtsdRegReg(XMM_SCRATCH0, XMM_SCRATCH0);
+                switch (placeOfRef(alloc, i)) {
+                    .xmm => |x| if (x != XMM_SCRATCH0) try a.movsdRegReg(x, XMM_SCRATCH0),
+                    .mem => |d| try a.movsdMemReg(.rsp, d, XMM_SCRATCH0),
+                    .reg => unreachable, // a float result never homes in a GP register
+                }
             },
             // --- hash-part field path (H1) --------------------------------------
             // href: load the loop-invariant value-cell pointer (`*Value`) from its
@@ -2813,7 +2946,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     }
                     try a.jcc(.e, deopt_exit); // false (0) → side-exit
                 },
-                .none, .ptr, .aref, .float, .func, .href => unreachable, // proveKinds restricts to int/bool
+                .none, .ptr, .aref, .float, .func, .href, .native => unreachable, // proveKinds restricts to int/bool
             },
             .guard_false => switch (kinds[ins.a]) {
                 .int => try a.jmp(deopt_exit), // an int is never falsy → always side-exit
@@ -2825,7 +2958,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     }
                     try a.jcc(.ne, deopt_exit); // true (≠0) → side-exit
                 },
-                .none, .ptr, .aref, .float, .func, .href => unreachable, // proveKinds restricts to int/bool
+                .none, .ptr, .aref, .float, .func, .href, .native => unreachable, // proveKinds restricts to int/bool
             },
             .loop => {
                 // [RV-2] write-only slots commit to regs[] BEFORE the shuffle, so the
@@ -2985,6 +3118,20 @@ fn expectBail(t: *const Trace) !void {
         c.deinit();
         return error.TestExpectedBail;
     }
+}
+
+test "nativegen: ?PureBuiltin is laid out [payload, has_value] (guard_pure prologue contract)" {
+    // The native `guard_pure` prologue reads the callee's `pure` field with two byte
+    // compares relative to NATIVE_PURE_OFF: the payload ordinal at +0 and the non-null
+    // flag at +1. Pin that `[payload, has_value]` order here so a toolchain change to
+    // the optional-enum layout fails this test instead of silently miscompiling the
+    // identity guard (the size is comptime-asserted next to the constant above).
+    var p: ?function.PureBuiltin = .sqrt;
+    const bytes = std.mem.asBytes(&p);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(function.PureBuiltin.sqrt)), bytes[0]); // payload at +0
+    try std.testing.expectEqual(@as(u8, 1), bytes[1]); // has_value flag at +1
+    p = null;
+    try std.testing.expectEqual(@as(u8, 0), bytes[1]); // flag clears on null
 }
 
 test "nativegen: clean integer counting loop matches the interpreter" {

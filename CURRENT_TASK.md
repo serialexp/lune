@@ -93,12 +93,78 @@ Codex + Antigravity review (determinism of the `PureBuiltin` identity guard, the
 `@sqrt`≡`sqrtsd` bit-equality, abort coverage), then surface to Bart and request
 commit approval (Rule #15 — no commit without explicit approval).
 
-## F1 — NOT STARTED
+## F1 — DONE, GREEN (uncommitted, pending Bart approval)
 
-x64.zig `sqrtsdRegReg` (`F2 0F 51 /r`) + encoding test; nativegen
-proveKinds/isTransient/operandReads/last_body_guard/lower for `fsqrt`+`guard_pure`;
-remove the F0 decline; nbody `--dump-native` shows `sqrtsd`; `just bench --filter
-nbody` measure; flip doc 12 to "F1 native landed."
+`just test` green. Native `sqrtsd` lowering landed; F0 decline removed.
+
+### Mechanism (F1)
+
+- **`src/x64.zig`**: `sqrtsdRegReg`/`sqrtsdRegMem` (`F2 0F 51 /r`) + two encoding tests.
+- **`src/nativegen.zig`**:
+  - New `Kind.native` for the callee-snapshot slot (a heap native pointer, GP home
+    like `.func`/`.ptr`).
+  - `proveKinds`: a `pure_guarded` pass marks the `guard_pure`-covered slot_load
+    `.native` (parallel to `func_guarded`); `guard_pure` → `.none`; `fsqrt` →
+    `.float` iff operand proven float.
+  - `SlotInfo.pure_tag` carries the recorded `PureBuiltin` ordinal; `analyzeInner`
+    stashes it from the covering `guard_pure` (mirrors the `func_id` stash, with the
+    same two-guards-disagree bail).
+  - **Prologue** checks each `.native` slot ONCE (like `guard_func`, NOT via LICM):
+    `header.type==native` ∧ `[native+pure]==tag` ∧ `[native+pure+1]==1`. The
+    `?PureBuiltin` field is 2 bytes `[payload, has_value]` (verified empirically); two
+    byte compares avoid needing a 16-bit-immediate compare encoder. Miss →
+    `prologue_fail` (returns 0, side-exits to tier-0).
+  - **Body**: `guard_pure` joins the hoisted no-ops; `fsqrt` = `floatOperandToXmm`
+    (stage arg into xmm0) + `sqrtsdRegReg(xmm0,xmm0)` + store to the float home. No
+    body side-exit (a stale callee is caught by the hoisted prologue guard).
+  - `isTransient`/`operandReads` updated; `else => return false` decline removed for
+    the two ops. `Kind.native` added to the two `guard_true/false` unreachable lists.
+
+### Verification (F1)
+
+- `--dump-native` on a sustained sqrt loop shows `f2 0f 51 c0` (`sqrtsd xmm0,xmm0`).
+- Native ≡ tier-0 on the float-reduction loop (`59650.633125239394`) and the
+  rebound-upvalue deopt (`7464.5342420517045\n125750` — guard_pure prologue side-exits
+  to tier-0 when `sqrt` is reassigned, tier-0 runs the new closure).
+- **Measure:** sustained `s += sqrt(i*1.0)` (5e7 iters): tier-0 **1.39 s** →
+  `--jit-native` **0.37 s** (**3.8×**); LuaJIT 0.07 s.
+- **nbody is UNCHANGED** (`bench` N=50000: t0 286 ms → jit 285 ms): it records ZERO
+  traces because its inner `for j=i+1,nbody` loop has trip count ≤4 (nbody=5), too
+  short to trip the back-edge hotcount. The sqrt abort *was* a real blocker (a
+  sustained copy of the inner body now records + compiles native), but the
+  short-trip-count blocker is independent and out of this lever's scope — a future
+  lever. Recorded honestly in doc 12.
+
+### Review (F1) — DONE, both reviewers signed off
+
+Codex + Antigravity both reviewed the F1 diff: **no P0/P1 correctness or determinism
+bugs**. Both confirmed (1) the native `guard_pure` prologue check (header.type==native,
+flag byte==1, payload==recorded tag) is byte-identical to the oracle's `guard_pure`
+arm in `irinterp.zig` — no 8-mode divergence; (2) the `?PureBuiltin` 2-byte
+`[payload, has_value]` layout + `@offsetOf(Native,"pure")` base are correct on the
+pinned toolchain (Native's header is field 0, so the native pointer == `*GcHeader`);
+(3) `@sqrt` ≡ `sqrtsd` bit-for-bit under default MXCSR (verified `-0.0`, negatives→qNaN,
+`±inf`, subnormals); (4) hoisting `guard_pure` to the prologue is safe — a reassigned
+callee local becomes a `.carried` non-scalar slot and bails to tier-1a, and
+`set_upval`/`set_global`/storing-a-native-to-a-table all abort recording; (5) the
+fsqrt body lowering is sound.
+
+**Hardening applied from the shared low-priority suggestion:**
+- `comptime` assert `@sizeOf(?PureBuiltin) == 2` next to `NATIVE_PURE_OFF`, plus a new
+  runtime test (`nativegen: ?PureBuiltin is laid out [payload, has_value] …`) pinning
+  the payload@+0 / flag@+1 byte order the prologue depends on — a future toolchain
+  optional-layout change now fails the build/test instead of silently miscompiling.
+  (The byte *order* can't be comptime-asserted — an optional has no well-defined
+  comptime layout to deref — so it lives in the runtime test.)
+- Fixed a stale `floatOperandToXmm` unreachable comment to mention `.native`; passed
+  `.float` literally to the fsqrt `floatOperandToXmm` to match the `int_of_float` sibling.
+
+Gate still green after the additions.
+
+### Pending (F1)
+
+Surface to Bart and request commit approval (Rule #15 — no commit without explicit
+approval).
 
 ## Stdlib inventory
 

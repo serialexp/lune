@@ -726,6 +726,16 @@ pub const Assembler = struct {
     pub fn divsdRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
         try self.sseRM(0xF2, false, 0x5E, dst, base, disp);
     }
+    /// `sqrtsd dst, src` — F2 0F 51 /r: IEEE correctly-rounded square root of the
+    /// low double in `src` into `dst` (the high lane is copied from `dst`/src per
+    /// the scalar form). Used to lower the `fsqrt` IR op (math.sqrt, doc 12).
+    pub fn sqrtsdRegReg(self: *Assembler, dst: Reg, src: Reg) !void {
+        try self.sseRR(0xF2, false, 0x51, dst, src);
+    }
+    /// `sqrtsd dst, [base+disp]` — F2 0F 51 /r.
+    pub fn sqrtsdRegMem(self: *Assembler, dst: Reg, base: Reg, disp: i32) !void {
+        try self.sseRM(0xF2, false, 0x51, dst, base, disp);
+    }
 
     /// `ucomisd a, b` — 66 0F 2E /r: unordered compare two doubles, set ZF/PF/CF.
     /// (Unordered ⇒ ZF=PF=CF=1; the NaN-aware setcc combine reads PF.)
@@ -1137,6 +1147,18 @@ test "enc: SSE2 scalar-double arith (reg, reg)" {
     try expectEnc(&.{ 0xF2, 0x0F, 0x5E, 0xC1 }, struct {
         fn f(a: *Assembler) !void {
             try a.divsdRegReg(xmm0, xmm1);
+        }
+    }.f);
+    // sqrtsd xmm0, xmm1 — F2 0F 51
+    try expectEnc(&.{ 0xF2, 0x0F, 0x51, 0xC1 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.sqrtsdRegReg(xmm0, xmm1);
+        }
+    }.f);
+    // sqrtsd xmm2, xmm2 (in-place) — F2 0F 51, modrm reg=2 rm=2 → 0xD2
+    try expectEnc(&.{ 0xF2, 0x0F, 0x51, 0xD2 }, struct {
+        fn f(a: *Assembler) !void {
+            try a.sqrtsdRegReg(xmm2, xmm2);
         }
     }.f);
     // ucomisd xmm0, xmm1 — 66 0F 2E
