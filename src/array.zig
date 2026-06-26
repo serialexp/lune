@@ -71,9 +71,26 @@ pub const Lane = enum(u8) {
     /// ordinal.
     u8,
 
+    /// The **grid meta-lane** (doc 14): this array part is a flattened nested
+    /// numeric array. `data` is a flat row-major `[cap*stride]` buffer of
+    /// `grid_elem`-width scalar cells; `present` is a per-*cell* presence bitmap
+    /// over those `cap*stride` cells; `row_len[r]` is the logical length of row
+    /// `r`; `len` is the row count and `cap` the row capacity. Its outer
+    /// "element" is a **row**, not a scalar — read as a value it is a transient
+    /// `row_view` `Value` (Phase 3), never a packed scalar — so the scalar
+    /// `decode`/`encode`/`get`/`append`/widen paths do **not** apply to it. Grid
+    /// access goes through the dedicated `initGrid`/`gridGet`/`gridSet`/`gridRowLen`
+    /// methods below; the scalar paths assert `lane != .grid`. Appended at the end
+    /// (ordinal 8) so every existing `guard_lane.aux` ordinal stays put. Not a rung
+    /// of the scalar widening lattice — `canWidenTo` keeps it isolated; inflation
+    /// into a grid is a separate migration (Phase 4), never a `widenFor` step.
+    grid,
+
     /// True for every lane except `.value` — i.e. lanes that hold no heap
     /// pointers (so the GC can skip marking the array part and the native store
-    /// needs no write barrier).
+    /// needs no write barrier). The grid lane is narrow too: its cells are scalar
+    /// leaves and its rows are virtual (a `row_view` is a fat *value*, never a
+    /// stored heap pointer), so a grid array part has no heap edges to mark.
     pub fn isNarrow(self: Lane) bool {
         return self != .value;
     }
@@ -88,6 +105,11 @@ pub const Lane = enum(u8) {
         return switch (self) {
             .value, .boolean => false,
             .i8, .i16, .i32, .i64, .f64, .u8 => true,
+            // The grid keeps a per-*cell* presence bitmap (over `cap*stride`
+            // cells), but its size is grid-specific (`gridCells`), so the grid
+            // never flows through the scalar alloc/`deinit` paths that consult
+            // this predicate — those assert `lane != .grid`. Reported truthfully.
+            .grid => true,
         };
     }
 
@@ -103,6 +125,9 @@ pub const Lane = enum(u8) {
         return switch (self) {
             .i8, .i16, .i32, .i64, .u8 => true,
             .value, .boolean, .f64 => false,
+            // Not a scalar store-shape lane — grid stores go through the grid
+            // cell path, never the scalar int/grow lowering this gates.
+            .grid => false,
         };
     }
 
@@ -137,6 +162,13 @@ pub const Lane = enum(u8) {
             .i32 => target == .i64 or target == .value,
             .i64 => target == .value,
             .u8 => target == .i16 or target == .i32 or target == .i64 or target == .value,
+            // The grid is not part of the scalar widening lattice (it holds rows,
+            // not scalars): it reaches only itself (the `self == target` early
+            // return above), and nothing scalar widens *to* it via this relation —
+            // inflation into a grid is a separate migration (Phase 4), not a
+            // `widenFor` rung. So a grid-pinned guard is never widen-evicted by a
+            // scalar widen, and a scalar guard is never satisfied by a grid.
+            .grid => false,
         };
     }
 };
@@ -162,10 +194,21 @@ pub const ArrayPart = extern struct {
     /// in-`.value` array (narrow it at the next rehash) from one demoted to
     /// `.value` by a type-incompatible store (leave it; never re-narrow).
     frozen: bool = false,
+    /// **Grid sub-lane** (doc 14): meaningful only when `lane == .grid`, where it
+    /// names the scalar lane every flattened *cell* is packed at (a presence-bitmap
+    /// fixed-width lane — `i8`/`u8`/`i16`/`i32`/`i64`/`f64`; the boolean/value lanes
+    /// are out of grid scope in v1). On every non-grid lane it is `.value` and
+    /// unused. Rides in `lane`/`frozen`'s alignment padding (offset 2), so adding it
+    /// costs no bytes and does **not** move `len`/`cap`/`data`/`present` — the
+    /// nativegen `Layout` offsets the JIT already encodes against are byte-identical.
+    grid_elem: Lane = .value,
     /// Logical slot count: keys `1..len` map to packed indices `0..len-1`. This
     /// is the array part's extent, **not** `#t` (which trims trailing holes).
+    /// For a grid, this is the **row count**.
     len: usize = 0,
     /// Allocated slot capacity (`>= len`); growth amortises like `ArrayList`.
+    /// For a grid, this is the allocated **row capacity** (`data` holds
+    /// `cap*stride` cells).
     cap: usize = 0,
     /// Packed element payload, lane-width each. 8-byte aligned so the `.value`
     /// lane can reinterpret it as `[*]Value` and `.i64`/`.f64` stay aligned.
@@ -173,20 +216,46 @@ pub const ArrayPart = extern struct {
     data: ?[*]align(@alignOf(Value)) u8 = null,
     /// Presence bitmap, 1 bit/slot (`null` for the `.value` lane, which encodes
     /// holes in-band). Bit `i` set ⇒ slot `i` holds a value; clear ⇒ hole/`nil`.
+    /// For a grid, this is the per-*cell* bitmap over `cap*stride` cells (bit
+    /// `row*stride + col`).
     present: ?[*]u8 = null,
+    /// **Grid stride** (doc 14): meaningful only when `lane == .grid` — the number
+    /// of cells per row, so cell `(row, col)` lives at flat index `row*stride+col`.
+    /// `0` on every non-grid lane. Appended after `present` so the existing JIT
+    /// `Layout` offsets are undisturbed.
+    stride: usize = 0,
+    /// **Grid per-row logical length** (doc 14): meaningful only when
+    /// `lane == .grid` — `row_len[r]` is the high-water logical length of row `r`
+    /// (`0 <= row_len[r] <= stride`), the row's `#`-border analogue, so jagged rows
+    /// round-trip. `null` on every non-grid lane. Appended last.
+    row_len: ?[*]u32 = null,
 
     pub const Layout = struct {
         pub const lane = @offsetOf(ArrayPart, "lane");
         pub const frozen = @offsetOf(ArrayPart, "frozen");
+        pub const grid_elem = @offsetOf(ArrayPart, "grid_elem");
         pub const len = @offsetOf(ArrayPart, "len");
         pub const cap = @offsetOf(ArrayPart, "cap");
         pub const data = @offsetOf(ArrayPart, "data");
         pub const present = @offsetOf(ArrayPart, "present");
+        pub const stride = @offsetOf(ArrayPart, "stride");
+        pub const row_len = @offsetOf(ArrayPart, "row_len");
     };
 
     pub const empty: ArrayPart = .{};
 
     pub fn deinit(self: *ArrayPart, gpa: std.mem.Allocator) void {
+        if (self.lane == .grid) {
+            // Grid buffers are sized by the flattened cell count (`cap*stride`),
+            // not the scalar `cap`, and carry the extra `row_len` vector — free
+            // them on their own terms.
+            const cells = gridCells(self.cap, self.stride);
+            if (self.data) |d| gpa.free(d[0..dataBytes(self.grid_elem, cells)]);
+            if (self.present) |p| gpa.free(p[0..presenceBytes(cells)]);
+            if (self.row_len) |r| gpa.free(r[0..self.cap]);
+            self.* = .empty;
+            return;
+        }
         if (self.data) |d| gpa.free(d[0..dataBytes(self.lane, self.cap)]);
         if (self.present) |p| gpa.free(p[0..presenceBytes(self.cap)]);
         self.* = .empty;
@@ -208,6 +277,7 @@ pub const ArrayPart = extern struct {
     // of scimark-sparse / ~11% of fft, a *call per element*). Forcing the chain inline
     // lets the loop-invariant lane `switch` hoist and kills the call overhead.
     pub inline fn get(self: *const ArrayPart, i: usize) Value {
+        std.debug.assert(self.lane != .grid); // a grid's element is a row, not a scalar (Phase 3)
         std.debug.assert(i >= 1 and i <= self.len);
         return self.decode(i - 1);
     }
@@ -218,6 +288,7 @@ pub const ArrayPart = extern struct {
     /// type-incompatible value falls to `.value`) — O(n), but bounded to a handful
     /// of crossings over the array's life. Storing `nil` punches a hole.
     pub fn setInPlace(self: *ArrayPart, gpa: std.mem.Allocator, i: usize, val: Value) std.mem.Allocator.Error!void {
+        std.debug.assert(self.lane != .grid); // grid stores go through gridSet (Phase 3/4)
         std.debug.assert(i >= 1 and i <= self.len);
         if (!self.fits(val)) try self.widenFor(gpa, val);
         self.encode(i - 1, val);
@@ -233,6 +304,7 @@ pub const ArrayPart = extern struct {
     // `astore`). Folds `setInLane`→`encode` into the caller so the store is a direct
     // packed write, not a cross-module call.
     pub inline fn setInLane(self: *ArrayPart, i: usize, val: Value) void {
+        std.debug.assert(self.lane != .grid); // grid stores go through gridSet (Phase 3/4)
         std.debug.assert(i >= 1 and i <= self.len);
         std.debug.assert(self.fits(val));
         self.encode(i - 1, val);
@@ -249,6 +321,7 @@ pub const ArrayPart = extern struct {
     /// debug rather than corrupting the array. The realloc itself stays a tier-0
     /// side-exit (the `guard_append` capacity check), keeping every mode identical.
     pub fn appendInCap(self: *ArrayPart, val: Value) void {
+        std.debug.assert(self.lane != .grid); // grid growth is a reshape (Phase 4), not a scalar append
         std.debug.assert(self.len < self.cap);
         std.debug.assert(self.fits(val));
         self.len += 1;
@@ -258,6 +331,7 @@ pub const ArrayPart = extern struct {
     /// Append `val` as the new key `len+1`, growing the storage. Widens the lane
     /// monotonically (see `setInPlace`) if `val` does not fit the current lane.
     pub fn append(self: *ArrayPart, gpa: std.mem.Allocator, val: Value) std.mem.Allocator.Error!void {
+        std.debug.assert(self.lane != .grid); // grid growth is a reshape (Phase 4), not a scalar append
         // Eager narrow-lane commit on the first append into a fresh array. The
         // append fast path never reaches `Table.rehash` (a dense-from-1 fill keeps
         // the hash part empty), so without this a homogeneous bool/int/float fill
@@ -306,6 +380,7 @@ pub const ArrayPart = extern struct {
     /// Resize the array part to exactly `n` slots. Growing fills the new slots
     /// with `nil` (holes); shrinking simply drops the tail. Lane is preserved.
     pub fn resize(self: *ArrayPart, gpa: std.mem.Allocator, n: usize) std.mem.Allocator.Error!void {
+        std.debug.assert(self.lane != .grid); // grid resize is a reshape (Phase 4)
         if (n > self.cap) try self.ensureCapacity(gpa, n);
         if (n > self.len) {
             // New slots are holes. The int/float lanes lean on the presence
@@ -338,6 +413,7 @@ pub const ArrayPart = extern struct {
     /// Holes never constrain the choice (every lane represents them). An array
     /// with no present values stays `.value` (nothing to gain).
     pub fn optimalLane(self: *const ArrayPart) Lane {
+        std.debug.assert(self.lane != .grid); // grid never re-narrows through the scalar rehash
         var any = false;
         var all_bool = true;
         var all_int = true;
@@ -434,6 +510,10 @@ pub const ArrayPart = extern struct {
             .i16 => cap * 2,
             .i32 => cap * 4,
             .i64, .f64 => cap * 8,
+            // A grid sizes `data` from its flattened cell count at `grid_elem`
+            // width (`dataBytes(grid_elem, cap*stride)`), never from the meta-lane
+            // itself — callers use `gridCells`/`grid_elem`, so this is unreachable.
+            .grid => unreachable,
         };
     }
 
@@ -479,6 +559,10 @@ pub const ArrayPart = extern struct {
             .i64 => val.isInt(),
             .u8 => val.isInt() and inRange(val.asInt(), 0, 255),
             .f64 => val.isFloat(),
+            // The grid's outer element is a row, not a scalar — no scalar value
+            // "fits" the meta-lane as a flat store; grid cell fit is tested against
+            // `grid_elem` via `laneFits(grid_elem, …)` on the grid path instead.
+            .grid => false,
         };
     }
 
@@ -521,6 +605,9 @@ pub const ArrayPart = extern struct {
     inline fn decode(self: *const ArrayPart, idx: usize) Value {
         switch (self.lane) {
             .value => return self.valueSlot(idx).*,
+            // A grid's outer element is a row (a `row_view` value, Phase 3), not a
+            // packed scalar — its cells are read through `gridGet`, never `decode`.
+            .grid => unreachable,
             // Boolean: one in-band byte. 0 ⇒ absent (hole); 1 ⇒ false, 2 ⇒ true.
             .boolean => {
                 const b = self.data.?[idx];
@@ -531,7 +618,7 @@ pub const ArrayPart = extern struct {
                 if (!self.isPresent(idx)) return Value.nil();
                 const d = self.data.?;
                 return switch (self.lane) {
-                    .value, .boolean => unreachable,
+                    .value, .boolean, .grid => unreachable,
                     .i8 => Value.int(@as(i8, @bitCast(d[idx]))),
                     .u8 => Value.int(@as(i64, d[idx])), // zero-extend, range 0..255
                     .i16 => Value.int(readInt(i16, d, idx)),
@@ -550,6 +637,8 @@ pub const ArrayPart = extern struct {
     inline fn encode(self: *ArrayPart, idx: usize, val: Value) void {
         switch (self.lane) {
             .value => self.valueSlot(idx).* = val,
+            // A grid's cells are written through `gridSet`, never `encode`.
+            .grid => unreachable,
             // Boolean: one in-band byte. nil ⇒ 0 (hole); false ⇒ 1, true ⇒ 2
             // (`1 + @intFromBool`). This single byte store carries both presence
             // and value — the native astore's atomic commit point (no separate
@@ -562,7 +651,7 @@ pub const ArrayPart = extern struct {
                 }
                 const d = self.data.?;
                 switch (self.lane) {
-                    .value, .boolean => unreachable,
+                    .value, .boolean, .grid => unreachable,
                     .i8 => d[idx] = @bitCast(@as(i8, @intCast(val.asInt()))),
                     .u8 => d[idx] = @intCast(val.asInt()), // val in [0,255] per fits/laneFits
                     .i16 => writeInt(i16, d, idx, @intCast(val.asInt())),
@@ -663,6 +752,7 @@ pub const ArrayPart = extern struct {
     /// a logical `Value`. Allocates fresh storage sized to the current `cap`,
     /// copies, then frees the old buffers.
     fn convert(self: *ArrayPart, gpa: std.mem.Allocator, target: Lane) std.mem.Allocator.Error!void {
+        std.debug.assert(self.lane != .grid and target != .grid); // grid migration is a reshape, not a lane convert
         std.debug.assert(target != self.lane);
         const cap = self.cap;
 
@@ -716,9 +806,164 @@ pub const ArrayPart = extern struct {
             // boolean/f64 lanes are type-pure: any value that doesn't fit means a
             // type mismatch, which only `.value` can hold.
             .boolean, .f64 => .value,
+            // A grid never widens through the scalar store path (its stores go via
+            // gridSet); `setInPlace`/`append` assert `lane != .grid` upstream.
+            .grid => unreachable,
         };
         std.debug.assert(target != self.lane);
         try self.convert(gpa, target);
+    }
+
+    // ===================================================================
+    // Grid representation (doc 14, Phase 2) — flattened nested numeric arrays.
+    //
+    // A `.grid` array part lays a nested numeric array out as one contiguous
+    // row-major buffer: `data` holds `cap*stride` scalar cells at `grid_elem`
+    // width, `present` is a per-cell presence bitmap over those cells, and
+    // `row_len[r]` is the logical length of row `r`. The outer element is a row
+    // (a transient `row_view` value, Phase 3), so these dedicated cell/row methods
+    // — never the scalar `get`/`encode`/`append`/widen paths — are how a grid is
+    // accessed. Phase 2 builds and round-trips the representation; inflation
+    // (Phase 4) and RowView forwarding (Phase 3) are not wired in yet.
+    // ===================================================================
+
+    /// `true` iff this array part is a flattened grid.
+    pub inline fn isGrid(self: *const ArrayPart) bool {
+        return self.lane == .grid;
+    }
+
+    /// Flattened cell count for a `rows × stride` grid.
+    fn gridCells(rows: usize, stride: usize) usize {
+        return rows * stride;
+    }
+
+    /// Flat row-major index of cell `(row, col)`.
+    inline fn gridCellIndex(self: *const ArrayPart, row: usize, col: usize) usize {
+        return row * self.stride + col;
+    }
+
+    /// Build a fresh `rows × stride` grid at scalar element lane `grid_elem`, every
+    /// cell a hole. `grid_elem` must be a presence-bitmap fixed-width lane
+    /// (`i8`/`u8`/`i16`/`i32`/`i64`/`f64`); boolean/value leaves are out of grid
+    /// scope in v1. OOM-atomic: on failure nothing leaks and the error propagates.
+    pub fn initGrid(
+        gpa: std.mem.Allocator,
+        rows: usize,
+        stride: usize,
+        grid_elem: Lane,
+    ) std.mem.Allocator.Error!ArrayPart {
+        std.debug.assert(grid_elem.usesPresenceBitmap()); // fixed-width bitmap leaf
+        std.debug.assert(stride >= 1);
+
+        // Overflow-guard the cell count and its byte size exactly like
+        // `ensureCapacity` guards the scalar `cap` (critical where usize is 32-bit:
+        // a wrapped tiny allocation behind a huge logical extent is a heap overflow).
+        const max_cells = std.math.maxInt(usize) / @sizeOf(Value);
+        if (rows != 0 and stride > max_cells / rows) return error.OutOfMemory;
+        const cells = gridCells(rows, stride);
+        if (cells > max_cells) return error.OutOfMemory;
+
+        // Allocate all three buffers before committing; an OOM on a later alloc
+        // frees the earlier ones via the errdefers and leaves nothing behind.
+        const data = try allocData(gpa, grid_elem, cells);
+        errdefer if (data) |d| gpa.free(d[0..dataBytes(grid_elem, cells)]);
+        const present = try allocPresence(gpa, cells); // grid_elem always uses a bitmap
+        errdefer if (present) |p| gpa.free(p[0..presenceBytes(cells)]);
+
+        var row_len: ?[*]u32 = null;
+        if (rows != 0) {
+            const rl = try gpa.alloc(u32, rows);
+            @memset(rl, 0); // every row starts logically empty
+            row_len = rl.ptr;
+        }
+
+        return .{
+            .lane = .grid,
+            .grid_elem = grid_elem,
+            // A grid is a committed representation: `frozen` keeps the scalar
+            // rehash (`Table.rehash`, which only fires when `!frozen`) from ever
+            // calling `optimalLane`/`repack` on it — both assert `lane != .grid`.
+            .frozen = true,
+            .len = rows,
+            .cap = rows,
+            .stride = stride,
+            .data = data,
+            .present = present,
+            .row_len = row_len,
+        };
+    }
+
+    /// Number of rows in the grid (`= len`).
+    pub inline fn gridRows(self: *const ArrayPart) usize {
+        std.debug.assert(self.isGrid());
+        return self.len;
+    }
+
+    /// Logical length (`#`-border high-water) of row `row` (0-based).
+    pub inline fn gridRowLen(self: *const ArrayPart, row: usize) usize {
+        std.debug.assert(self.isGrid() and row < self.len);
+        return if (self.row_len) |r| r[row] else 0;
+    }
+
+    /// `grid[row][col+1]` — read cell `(row, col)` (both 0-based) as a logical
+    /// `Value` (or `nil` for a hole).
+    pub inline fn gridGet(self: *const ArrayPart, row: usize, col: usize) Value {
+        std.debug.assert(self.isGrid() and row < self.len and col < self.stride);
+        return decodeGridCell(self.grid_elem, self.data.?, self.present.?, self.gridCellIndex(row, col));
+    }
+
+    /// `grid[row][col+1] = val` — write cell `(row, col)` (both 0-based). `val`
+    /// must already fit `grid_elem` (the caller guards it; the grid-widening reshape
+    /// is Phase 4) or be `nil` (punch a hole). A non-nil store raises the row's
+    /// logical length to `max(row_len, col+1)`, mirroring how the scalar array's
+    /// `len` tracks its high-water slot; a `nil` store does not shrink it (Lua `#`
+    /// is any border).
+    pub inline fn gridSet(self: *ArrayPart, row: usize, col: usize, val: Value) void {
+        std.debug.assert(self.isGrid() and row < self.len and col < self.stride);
+        std.debug.assert(laneFits(self.grid_elem, val)); // fits the cell lane, or nil
+        encodeGridCell(self.grid_elem, self.data.?, self.present.?, self.gridCellIndex(row, col), val);
+        if (!val.isNil()) {
+            const want: u32 = @intCast(col + 1);
+            if (self.row_len) |r| {
+                if (want > r[row]) r[row] = want;
+            }
+        }
+    }
+
+    /// Decode packed grid cell `idx` (flat 0-based) at fixed-width bitmap lane
+    /// `lane`. Mirrors the scalar `decode` int/float arms exactly (shared
+    /// `readInt`/`getBit`), so a grid cell round-trips byte-identically to a scalar
+    /// slot — the determinism contract for a deflated row reading the same values.
+    inline fn decodeGridCell(lane: Lane, data: [*]const u8, present: [*]const u8, idx: usize) Value {
+        if (!getBit(present, idx)) return Value.nil();
+        return switch (lane) {
+            .i8 => Value.int(@as(i8, @bitCast(data[idx]))),
+            .u8 => Value.int(@as(i64, data[idx])), // zero-extend, range 0..255
+            .i16 => Value.int(readInt(i16, data, idx)),
+            .i32 => Value.int(readInt(i32, data, idx)),
+            .i64 => Value.int(readInt(i64, data, idx)),
+            .f64 => Value.float(@bitCast(readInt(u64, data, idx))),
+            .value, .boolean, .grid => unreachable, // not a grid leaf lane
+        };
+    }
+
+    /// Encode logical `val` into packed grid cell `idx`. Mirror of the scalar
+    /// `encode` int/float arms (shared `writeInt`/`setBit`); `nil` clears presence.
+    inline fn encodeGridCell(lane: Lane, data: [*]u8, present: [*]u8, idx: usize, val: Value) void {
+        if (val.isNil()) {
+            setBit(present, idx, false);
+            return;
+        }
+        switch (lane) {
+            .i8 => data[idx] = @bitCast(@as(i8, @intCast(val.asInt()))),
+            .u8 => data[idx] = @intCast(val.asInt()), // val in [0,255] per laneFits
+            .i16 => writeInt(i16, data, idx, @intCast(val.asInt())),
+            .i32 => writeInt(i32, data, idx, @intCast(val.asInt())),
+            .i64 => writeInt(i64, data, idx, val.asInt()),
+            .f64 => writeInt(u64, data, idx, @bitCast(val.asFloat())),
+            .value, .boolean, .grid => unreachable,
+        }
+        setBit(present, idx, true);
     }
 };
 
@@ -1200,17 +1445,25 @@ test "Layout offsets are stable and lane is first" {
     // Phase B's JIT encodes these offsets via `@offsetOf`; pin them so a layout
     // drift fails here rather than silently miscompiling native array access.
     try testing.expectEqual(@as(usize, 0), ArrayPart.Layout.lane);
-    // `frozen` rides in `lane`'s alignment padding (offset 1), so it must NOT push
-    // the pointer-aligned fields out: `len` still lands at the first usize-aligned
-    // offset and the three word-sized fields follow contiguously. Derived from
-    // `@sizeOf(usize)` so the contract holds on both 64- and 32-bit targets.
+    // `frozen` and the grid sub-lane `grid_elem` ride in `lane`'s alignment padding
+    // (offsets 1 and 2), so they must NOT push the pointer-aligned fields out: `len`
+    // still lands at the first usize-aligned offset and the word-sized fields follow
+    // contiguously. Crucially this keeps `len`/`cap`/`data`/`present` byte-identical
+    // to before the grid fields existed — the offsets nativegen already encodes
+    // against are undisturbed. Derived from `@sizeOf(usize)` so the contract holds on
+    // both 64- and 32-bit targets.
     const word = @sizeOf(usize);
     try testing.expectEqual(@as(usize, 1), ArrayPart.Layout.frozen);
+    try testing.expectEqual(@as(usize, 2), ArrayPart.Layout.grid_elem);
     try testing.expectEqual(@alignOf(usize), ArrayPart.Layout.len);
     try testing.expectEqual(ArrayPart.Layout.len + word, ArrayPart.Layout.cap);
     try testing.expectEqual(ArrayPart.Layout.cap + word, ArrayPart.Layout.data);
     try testing.expectEqual(ArrayPart.Layout.data + word, ArrayPart.Layout.present);
-    try testing.expectEqual(ArrayPart.Layout.present + word, @sizeOf(ArrayPart));
+    // The grid fields are appended after `present` (doc 14 Phase 2), so they land
+    // last and only grow the struct — the offsets above are untouched.
+    try testing.expectEqual(ArrayPart.Layout.present + word, ArrayPart.Layout.stride);
+    try testing.expectEqual(ArrayPart.Layout.stride + word, ArrayPart.Layout.row_len);
+    try testing.expectEqual(ArrayPart.Layout.row_len + word, @sizeOf(ArrayPart));
 }
 
 test "OOM at any allocation point leaves the array part consistent (no leak, no bad free)" {
@@ -1236,6 +1489,126 @@ test "OOM at any allocation point leaves the array part consistent (no leak, no 
             try a.setInPlace(gpa, 5, Value.float(2.5));
             // Grow again in the (now value) lane to re-exercise ensureCapacity.
             try a.append(gpa, Value.int(99));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Inner.run, .{});
+}
+
+// ---- grid representation (doc 14, Phase 2) ----
+
+test "grid: round-trips f64 cells row-major, holes read as nil" {
+    const gpa = testing.allocator;
+    var g = try ArrayPart.initGrid(gpa, 3, 4, .f64); // 3 rows × stride 4
+    defer g.deinit(gpa);
+
+    try testing.expect(g.isGrid());
+    try testing.expectEqual(Lane.grid, g.lane);
+    try testing.expectEqual(Lane.f64, g.grid_elem);
+    try testing.expect(g.frozen);
+    try testing.expectEqual(@as(usize, 3), g.gridRows());
+    try testing.expectEqual(@as(usize, 4), g.stride);
+
+    // Every cell starts a hole.
+    var r: usize = 0;
+    while (r < 3) : (r += 1) {
+        var c: usize = 0;
+        while (c < 4) : (c += 1) try testing.expect(g.gridGet(r, c).isNil());
+        try testing.expectEqual(@as(usize, 0), g.gridRowLen(r));
+    }
+
+    // Fill (r,c) = r*10 + c as a float; read it back exactly.
+    r = 0;
+    while (r < 3) : (r += 1) {
+        var c: usize = 0;
+        while (c < 4) : (c += 1) g.gridSet(r, c, Value.float(@floatFromInt(r * 10 + c)));
+    }
+    r = 0;
+    while (r < 3) : (r += 1) {
+        var c: usize = 0;
+        while (c < 4) : (c += 1)
+            try testing.expectEqual(@as(f64, @floatFromInt(r * 10 + c)), g.gridGet(r, c).asFloat());
+        try testing.expectEqual(@as(usize, 4), g.gridRowLen(r)); // high-water = full stride
+    }
+}
+
+test "grid: int leaf round-trips and a cell decodes identically to a scalar slot" {
+    const gpa = testing.allocator;
+    var g = try ArrayPart.initGrid(gpa, 2, 3, .i32);
+    defer g.deinit(gpa);
+
+    g.gridSet(0, 0, Value.int(-5));
+    g.gridSet(0, 1, Value.int(100000));
+    g.gridSet(1, 2, Value.int(7));
+
+    try testing.expectEqual(@as(i64, -5), g.gridGet(0, 0).asInt());
+    try testing.expectEqual(@as(i64, 100000), g.gridGet(0, 1).asInt());
+    try testing.expect(g.gridGet(0, 2).isNil()); // never written
+    try testing.expect(g.gridGet(1, 0).isNil());
+    try testing.expectEqual(@as(i64, 7), g.gridGet(1, 2).asInt());
+
+    // A grid cell must decode byte-identically to the same value in a scalar i32
+    // array part — the determinism contract (a deflated row reads the same values).
+    var scalar = try fromSlice(gpa, &.{ Value.int(-5), Value.int(100000) });
+    defer scalar.deinit(gpa);
+    try testing.expectEqual(Lane.i32, scalar.lane);
+    try testing.expectEqual(scalar.get(1), g.gridGet(0, 0));
+    try testing.expectEqual(scalar.get(2), g.gridGet(0, 1));
+}
+
+test "grid: jagged rows — row_len is the high-water column, nil store does not shrink it" {
+    const gpa = testing.allocator;
+    var g = try ArrayPart.initGrid(gpa, 2, 5, .i16);
+    defer g.deinit(gpa);
+
+    // Row 0: cells 0,1,2 present (logical length 3); columns 3,4 stay holes.
+    g.gridSet(0, 0, Value.int(10));
+    g.gridSet(0, 1, Value.int(20));
+    g.gridSet(0, 2, Value.int(30));
+    try testing.expectEqual(@as(usize, 3), g.gridRowLen(0));
+
+    // Internal hole: clearing cell 1 reads back nil but does NOT shrink the border.
+    g.gridSet(0, 1, Value.nil());
+    try testing.expect(g.gridGet(0, 1).isNil());
+    try testing.expectEqual(@as(i64, 10), g.gridGet(0, 0).asInt());
+    try testing.expectEqual(@as(i64, 30), g.gridGet(0, 2).asInt());
+    try testing.expectEqual(@as(usize, 3), g.gridRowLen(0)); // # is any border; unchanged
+
+    // Row 1 left empty entirely.
+    try testing.expectEqual(@as(usize, 0), g.gridRowLen(1));
+    var c: usize = 0;
+    while (c < 5) : (c += 1) try testing.expect(g.gridGet(1, c).isNil());
+}
+
+test "grid: u8 leaf packs at one byte/cell" {
+    const gpa = testing.allocator;
+    var g = try ArrayPart.initGrid(gpa, 4, 4, .u8);
+    defer g.deinit(gpa);
+    // The flat data buffer is exactly cap*stride bytes for a u8 grid.
+    try testing.expectEqual(@as(usize, 4 * 4), ArrayPart.dataBytes(.u8, 4 * 4));
+    g.gridSet(2, 3, Value.int(200)); // > i8 max, fits u8, zero-extends on read
+    try testing.expectEqual(@as(i64, 200), g.gridGet(2, 3).asInt());
+}
+
+test "grid: a row-0 grid allocates nothing and deinits cleanly" {
+    const gpa = testing.allocator;
+    var g = try ArrayPart.initGrid(gpa, 0, 8, .f64);
+    defer g.deinit(gpa);
+    try testing.expect(g.isGrid());
+    try testing.expectEqual(@as(usize, 0), g.gridRows());
+    try testing.expect(g.data == null);
+    try testing.expect(g.present == null);
+    try testing.expect(g.row_len == null);
+}
+
+test "grid: initGrid is OOM-safe at every allocation point (no leak, no bad free)" {
+    const Inner = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            // 3×4 f64 grid: data alloc, presence alloc, row_len alloc — force each
+            // to fail in turn and assert the errdefers unwind cleanly.
+            var g = try ArrayPart.initGrid(gpa, 3, 4, .f64);
+            defer g.deinit(gpa);
+            g.gridSet(1, 1, Value.float(2.5));
+            try testing.expectEqual(@as(f64, 2.5), g.gridGet(1, 1).asFloat());
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Inner.run, .{});

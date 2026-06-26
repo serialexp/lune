@@ -1,10 +1,11 @@
 # Nested Numeric Array Flattening — Design
 
-Status: draft — **direction approved: build grid flattening (D).** Architecture
-pivoted post-review to **transient fat-value rows with copy-out on escape**,
-which dissolves the GC-pinning and identity-cache objections. Determinism/replay
-is the one principled gate and is satisfiable (see §Determinism gate). Build size
-is explicitly *not* a blocker (see §Decision).
+Status: partial — **building D.** Phases 0–2 landed on `master` (decision gate;
+`RowView` fat value; grid representation in `ArrayPart`). Architecture pivoted
+post-review to **transient fat-value rows with copy-out on escape**, which
+dissolves the GC-pinning and identity-cache objections. Determinism/replay is the
+one principled gate and is satisfiable (see §Determinism gate). Build size is
+explicitly *not* a blocker (see §Decision). Next: Phase 3 (row forwarding).
 Owner: Bart
 Last updated: 2026-06-26
 
@@ -15,6 +16,16 @@ land; move whole sections to Done once everything inside is checked.
 
 ### Done
 
+- [x] **Phase 0 — Decision gate.** Doc landed; Codex + Antigravity feasibility
+  sign-off obtained. **Decided: BUILD D**, on the **transient fat-value**
+  architecture (§Decision), not the heap-`RowView` first cut. Both reviewers
+  sized it at 2–6 months and recommended the `.table` lane first — but that
+  sizing prices *human* lifetime, the input that made Pall's cdata line rational;
+  under AI-assisted coding a failed attempt costs token budget, not months, so
+  build-size is not a gate. The only principled blockers are **unsoundness**
+  (reviewers agreed it's soundable) and **determinism/replay** (satisfiable —
+  §Determinism gate). The reviews surfaced the GC-pinning / identity-cache
+  failure modes; the fat-value fix came straight out of them.
 - [x] **Phase 1 — `RowView` fat value + structural identity.** `row_view`
   `Value` tag (parent `*GcHeader` in low 48 bits + 16-bit row in high 16);
   `eql`/identity by `(parent.id, row)`; `typeName` → "table"; truthy. Threaded
@@ -24,30 +35,20 @@ land; move whole sections to Done once everything inside is checked.
   appended at 5; pinned-contract test + `viz/src/enums.ts` mirror in lockstep.
   Four unit tests. Commit `c55d109`. (Grids not yet enabled, so no `row_view` is
   produced at runtime — this is the value-level surface only.)
+- [x] **Phase 2 — Grid representation in the array part.** Chose **2a**: a
+  `.grid` meta-lane on `ArrayPart` (Bart's call — nothing external depends on the
+  `Layout` "contract," so touching it costs nothing). `data` is a flat row-major
+  `[cap*stride]` buffer at a `grid_elem` sub-lane (`i8`/`u8`/`i16`/`i32`/`i64`/
+  `f64`), `present` a per-cell bitmap, `row_len[r]` the per-row high-water length.
+  `grid_elem` rides in `lane`'s offset-2 padding so `len`/`cap`/`data`/`present`
+  stay byte-identical (nativegen untouched); `stride`/`row_len` appended after
+  `present`. Self-contained `initGrid`/`gridGet`/`gridSet`/`gridRowLen` with a
+  cell codec that mirrors the scalar one byte-for-byte; scalar paths assert
+  `lane != .grid`. Six unit tests (round-trip, scalar-identical decode, jagged
+  `row_len`, u8 packing, empty grid, OOM-safety). No interp wiring yet — Phase 3.
 
 ### Outstanding
 
-- [x] **Phase 0 — Decision gate.** ~~Land this doc, get Codex + Antigravity
-  feasibility sign-off.~~ **Done — and decided: BUILD D.** Both reviewers sized
-  it as a 2–6-month project and recommended the `.table` lane first — but that
-  sizing prices *human* lifetime, the input that made Pall's cdata line rational.
-  Under AI-assisted coding a failed attempt costs token budget, not months, so
-  build-size is not a reason to default to the cheaper option. The only
-  principled blockers are **unsoundness** (reviewers agreed it's soundable) and
-  **determinism/replay** (satisfiable — §Determinism gate). The reviews still
-  paid off: they surfaced the GC-pinning / identity-cache failure modes, and the
-  fix (transient fat-value rows, §Decision) came straight out of them.
-Architecture is the **transient fat-value** model (§Decision), not the
-heap-`RowView` first cut. Phases retargeted accordingly:
-
-- [ ] **Phase 1 — `RowView` fat value + structural identity.** A new `Value`
-  tag `row_view` carrying `{ parent: *Table, row: u32 }` in the 8-byte payload.
-  `eql`/`rawequal` compare `(parent.id, row)`; `Value` printing, type name
-  (`table`), truthiness all behave as a table. No heap object, no allocation.
-- [ ] **Phase 2 — Grid representation in the array part.** A flat
-  `[rows*stride]` packed buffer at a narrow element lane, a per-row length/
-  presence vector, and the stride. Decide 2a (`.grid` lane on `ArrayPart`) vs 2b
-  (separate `GridPart`) — see §Open questions.
 - [ ] **Phase 3 — Row forwarding.** `get_index`/`set_index` on a `RowView`
   forward into `parent.grid[row*stride + (k-1)]` at the element lane; `#row`,
   `next`/`pairs` over a row enumerate the logical row.
@@ -148,7 +149,8 @@ RowView = extern struct {
 
 ### Grid array-part (Phase 2)
 
-Two viable encodings, to be chosen during review:
+**Decided: 2a, and landed** (see Implementation status). The two encodings that
+were on the table:
 
 - **(2a) New `.grid` lane** on the existing `ArrayPart`: `data` reinterpreted as
   a flat `[rows*stride]` buffer at a sub-element lane (`grid_elem: Lane`), plus a
@@ -239,8 +241,12 @@ alias-through-`RowView`, jagged bounding box, GC of escaped-orphan rows).
   treated as an escape; (b) always hand back a cached `RowView` for grid rows
   (uniform correctness, allocation amortised by the per-row cache) and let the
   fast path special-case `RowView[j]`. Which?
-- [ ] **2a (`.grid` lane) vs 2b (separate `GridPart`)** — layout churn vs a
-  second representation to branch on.
+- [x] **2a (`.grid` lane) vs 2b (separate `GridPart`)** — ~~layout churn vs a
+  second representation to branch on.~~ **Decided 2a** (Bart): the `Layout`
+  "frozen contract" is purely our own compile-time-checked invariant — nothing
+  external consumes it — so disturbing it costs nothing, and one struct beats two
+  representations to branch on. Landed in Phase 2; `grid_elem` slotted into
+  existing padding kept even the nativegen-addressed offsets byte-identical.
 - [ ] **Is the win worth the deflation machinery vs option A?** A unblocks the
   same benchmarks' *coverage* for a fraction of the work but leaves rows
   scattered. D adds locality globally but is a large, semantically delicate
