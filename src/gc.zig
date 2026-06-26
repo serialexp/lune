@@ -48,6 +48,21 @@ const Native = function.Native;
 const Upvalue = function.Upvalue;
 const Proto = bytecode.Proto;
 
+/// Base of the **reserved id space** for capture-time grid deflation (doc 14,
+/// Phase 7). A grid is never serialised; `deflateAllGrids` rebuilds its logical
+/// nested rows at capture, but those phantom row Tables exist only for the
+/// snapshot and are immediately orphaned on restore (a re-inflating program
+/// re-decides from scratch). If they drew ids from the monotonic counter they
+/// would (a) bump it and (b) take allocation-order-dependent values — both shift
+/// every id minted afterwards, so a snapshot taken mid-execution would not match
+/// the same snapshot reached by resume (invariant (d) breaks). Instead they draw
+/// ids from this high half of the u32 space by a **canonical** (parent-id-sorted)
+/// enumeration: a pure function of logical state, identical across ref/resume,
+/// and — since the real counter is asserted never to reach here (2³¹ allocations)
+/// — collision-free with every genuine object. Restore ignores ids at/above this
+/// base when reconstructing `next_obj_id`, so they never pollute the counter.
+pub const reserved_grid_id_base: u32 = 0x8000_0000;
+
 /// The initial collection threshold (and the floor it never drops below): the
 /// collector first runs once the live-object count reaches this, and afterwards
 /// targets `max(this, live * heap_growth)`. Small enough that even short
@@ -257,6 +272,18 @@ pub const Heap = struct {
     /// the grid is left intact (the new outer array is discarded) so the original
     /// op can surface the error and the parent stays a valid grid.
     pub fn deflateGrid(self: *Heap, parent: *Table) std.mem.Allocator.Error!void {
+        return self.deflateGridImpl(parent, null);
+    }
+
+    /// Shared core of runtime and capture-time deflation. `reserved` selects how
+    /// the rebuilt row Tables are identified:
+    ///   * `null` (runtime, bare-access escape): each row gets a fresh monotonic
+    ///     id via `newTable` — a genuine new program object, counter advances.
+    ///   * non-null (capture-time, `deflateAllGrids`): each row is stamped with
+    ///     `reserved.*` and the cursor advances, drawing from `reserved_grid_id_base`
+    ///     without touching the monotonic counter. These rows are phantom (snapshot
+    ///     only); see the constant's doc for why this preserves determinism.
+    fn deflateGridImpl(self: *Heap, parent: *Table, reserved: ?*u32) std.mem.Allocator.Error!void {
         std.debug.assert(parent.array.isGrid());
         const gpa = self.gpa;
         const rows = parent.array.gridRows();
@@ -268,7 +295,13 @@ pub const Heap = struct {
 
         var r: usize = 0;
         while (r < rows) : (r += 1) {
-            const row = try self.newTable(); // linked + id-stamped
+            const row = if (reserved) |cur| blk: {
+                const t = try Table.create(gpa);
+                std.debug.assert(cur.* >= reserved_grid_id_base);
+                self.linkRestored(&t.header, cur.*);
+                cur.* += 1;
+                break :blk t;
+            } else try self.newTable(); // linked + id-stamped
             const rl = parent.array.gridRowLen(r);
             var c: usize = 0;
             while (c < rl) : (c += 1) {
@@ -289,6 +322,45 @@ pub const Heap = struct {
         // re-inflated by a following fused store — that would thrash. It stays
         // nested for the rest of its life (a fresh restore re-decides from false).
         parent.no_grid = true;
+    }
+
+    /// Deflate every live grid table back to real nested row Tables (doc 14,
+    /// Phase 7). A grid is an in-memory-only optimisation and is **never**
+    /// serialised — keyframe capture persists the *logical* nested form, so a
+    /// restore that lands on a different grid/nested state is observably
+    /// identical. Called once at the top of `keyframeser.encodeSnapshot`.
+    ///
+    /// Phantom-row ids must be a pure function of *logical* state, not allocation
+    /// history, or a snapshot taken mid-execution would not match the same snapshot
+    /// reached by resume (the phantom rows would land on different ids and shift
+    /// everything minted afterwards). So we deflate grids in a **canonical order**
+    /// — sorted by the parent table's stable id — assigning each row a sequential
+    /// id from `reserved_grid_id_base`. The sweep-list order is allocation-order
+    /// and diverges across resume, hence the explicit sort. Restore ignores ids in
+    /// the reserved half when reconstructing the counter, so these never pollute it.
+    pub fn deflateAllGrids(self: *Heap) std.mem.Allocator.Error!void {
+        // The real counter must never have entered the reserved half (2³¹ live
+        // objects is unreachable); if it had, a phantom id could alias a genuine
+        // object. Cheap guard against a future that breaks the invariant.
+        std.debug.assert(self.next_obj_id <= reserved_grid_id_base);
+
+        // Collect every grid parent, then sort by id for a deterministic order.
+        var grids: std.ArrayListUnmanaged(*Table) = .empty;
+        defer grids.deinit(self.gpa);
+        var it = self.objects;
+        while (it) |h| : (it = h.next) {
+            if (h.type != .table) continue;
+            const t = Table.fromHeader(h);
+            if (t.array.isGrid()) try grids.append(self.gpa, t);
+        }
+        std.mem.sort(*Table, grids.items, {}, struct {
+            fn lt(_: void, a: *Table, b: *Table) bool {
+                return a.header.id < b.header.id;
+            }
+        }.lt);
+
+        var cursor: u32 = reserved_grid_id_base;
+        for (grids.items) |t| try self.deflateGridImpl(t, &cursor);
     }
 
     /// Intern `content`: return the existing object for these bytes, or allocate,

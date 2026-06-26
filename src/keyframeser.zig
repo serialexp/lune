@@ -28,6 +28,7 @@ const table = @import("table.zig");
 const function = @import("function.zig");
 const bytecode = @import("bytecode.zig");
 const interp = @import("interp.zig");
+const gc = @import("gc.zig");
 const key_order = @import("key_order.zig");
 const parser = @import("parser.zig");
 const compiler = @import("compiler.zig");
@@ -67,11 +68,13 @@ pub fn toSchemaValue(v: Value) schema.SnapValue {
         .int => .{ .tag = @intFromEnum(value.Tag.int), .body = .{ .ConstInt = .{ .v = v.asInt() } } },
         .float => .{ .tag = @intFromEnum(value.Tag.float), .body = .{ .ConstFloat = .{ .v = v.asFloat() } } },
         .heap_ref => .{ .tag = @intFromEnum(value.Tag.heap_ref), .body = .{ .HeapRef = .{ .id = v.asHeap().id } } },
-        // TODO(Phase 7, doc 14): a `row_view` can only reach a snapshot if it is
-        // live in a register at a snapshot point. Either prove that never happens
-        // (rows are consumed within one expression, snapshots fall on safe
-        // boundaries) or serialize it as (parent id, row). Unreachable today:
-        // grids are not yet enabled, so no `row_view` is ever produced.
+        // A `row_view` never reaches the wire (doc 14, Phase 7). The gate ensures a
+        // view is produced only transiently by a fused `a[i][j]` and consumed
+        // within that one opcode — it never persists in a register across a
+        // safepoint, and any *bare* access deflates the grid first. Snapshots fall
+        // on opcode boundaries (safepoints), and `encodeSnapshot` additionally
+        // deflates all grids up front, so neither a register nor a table array can
+        // hand us one here.
         .row_view => unreachable,
     };
 }
@@ -248,6 +251,14 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
+
+    // 0. Deflate every live grid back to nested row Tables (doc 14, Phase 7). A
+    //    grid is an in-memory-only optimisation never written to the wire; capture
+    //    persists the logical nested form, so the snapshot is identical whether or
+    //    not a matrix happened to be flattened at this instant. After this no
+    //    `t.array.get` below can hit a grid (which would assert) and no `row_view`
+    //    can be produced.
+    try vm.heap.deflateAllGrids();
 
     // 1. Enumerate the reachable heap graph from the VM roots.
     var walk = Walk{ .a = a };
@@ -513,14 +524,22 @@ pub fn restoreSnapshot(
     // fresh heap strings — which must take ids ABOVE the restored range, never
     // collide with a restored id. (Reachable loaded chunks keep their literals in
     // the snapshot; recompile reuses them via interning, allocating nothing new.)
+    // Phantom grid rows (doc 14, Phase 7) carry ids in the reserved high half
+    // (`gc.reserved_grid_id_base`+) so capture timing can't shift them. They are
+    // NOT genuine allocations and must not advance the counter — a post-restore
+    // allocation belongs in the normal low space, right above the real objects.
+    // So compute the high-water from non-reserved ids only.
     var max_id: u32 = 0;
-    for (kf.objects) |o| max_id = @max(max_id, o.id);
-    // If the restored ids already fill the u32 space, recompiling a loaded chunk
-    // (which allocates fresh interned strings via `link`) would wrap the counter
-    // and collide with a restored id. Reject rather than silently alias. (The
-    // engine assumes < 2³² live objects everywhere; this only bites if a snapshot
-    // both names the top id AND carries loaded chunks to recompile.)
-    if (max_id == std.math.maxInt(u32) and kf.loaded_chunks.len > 0)
+    for (kf.objects) |o| {
+        if (o.id >= gc.reserved_grid_id_base) continue;
+        max_id = @max(max_id, o.id);
+    }
+    // If the restored ids already fill the (non-reserved) id space, recompiling a
+    // loaded chunk (which allocates fresh interned strings via `link`) would wrap
+    // the counter and collide with a restored id. Reject rather than silently
+    // alias. (The engine assumes < 2³¹ live objects everywhere; this only bites if
+    // a snapshot both names the top id AND carries loaded chunks to recompile.)
+    if (max_id == gc.reserved_grid_id_base - 1 and kf.loaded_chunks.len > 0)
         return error.IdSpaceExhausted;
     vm.heap.adoptNextId(max_id +| 1);
 
@@ -1084,6 +1103,35 @@ test "restore is the exact inverse of capture (byte-identical re-snapshot)" {
     );
 }
 
+test "keyframe: a live grid deflates at capture and round-trips byte-identically (doc 14)" {
+    // A matrix left *flattened* at final state must serialize as its logical nested
+    // form — a grid is an in-memory optimisation, never written to the wire — and
+    // re-snapshot byte-identically. `encodeSnapshot` deflates all grids up front;
+    // restore only ever builds nested tables, so the re-capture matches.
+    try expectRoundTrip(
+        \\m = { {1,2,3}, {4,5,6} }
+        \\m[1][1] = 10            -- inflate to a grid; still reachable from globals
+    );
+    // Reshaped (grown stride) + lane-widened, still a grid at capture; deflation
+    // must reproduce the grown box and the widened cells as plain row tables.
+    try expectRoundTrip(
+        \\m = { {1,2}, {3,4} }
+        \\m[1][1] = 9
+        \\m[1][3] = 7             -- grow stride past 2
+        \\m[2][1] = 1000000       -- widen the cell lane
+        \\result = m
+    );
+    // A self-referential outer table that *also* holds a flattened matrix: the
+    // matrix deflates, the cycle and the sibling string key round-trip unchanged.
+    try expectRoundTrip(
+        \\g = {}
+        \\g.grid = { {1,2}, {3,4} }
+        \\g.grid[2][2] = 40       -- inflate the inner matrix
+        \\g.self = g
+        \\g.name = "lune"
+    );
+}
+
 test "restore reanimates a live load closure that runs with the same result (L-2)" {
     const gpa = testing.allocator;
     const source =
@@ -1572,13 +1620,14 @@ test "restore surfaces specific errors for malformed snapshots" {
         .loaded_chunks = &.{},
     } }, &rootp, error.DuplicateInternedString);
 
-    // L-2: the restored id space is exhausted (an object names the top u32 id) AND
-    // the snapshot carries a loaded chunk to recompile — recompiling would allocate
+    // L-2: the restored id space is exhausted (an object names the top *genuine*
+    // id — the reserved high half is for phantom grid rows, doc 14 Phase 7) AND the
+    // snapshot carries a loaded chunk to recompile — recompiling would allocate
     // fresh interned strings that wrap the counter into the restored range. Reject.
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
-        .objects = &.{.{ .id = std.math.maxInt(u32), .obj_type = 1, .body = .{ .HeapTable = .{
+        .objects = &.{.{ .id = gc.reserved_grid_id_base - 1, .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{},
             .entries = &.{},
             .metatable_id = 0,
@@ -1784,6 +1833,30 @@ const f2c_corpus = [_][:0]const u8{
     \\  return s
     \\end
     \\print(tri(6))
+    ,
+    // A homogeneous-numeric matrix that inflates to a **grid** (doc 14) and stays
+    // live across both loops, so a mid-run cut almost always lands while `m` is a
+    // grid. Capture deflates the grid to logical nested rows with reserved-space
+    // ids (Phase 7); this case is the proof that those ids are a pure function of
+    // logical state — the resumed run re-inflates and re-captures to a
+    // BYTE-IDENTICAL final snapshot (invariant (d)) despite the phantom rows. All
+    // arithmetic is numeric, so nothing heap is created-then-dropped before a cut.
+    \\local function grid()
+    \\  local m = {{1,2,3,4},{5,6,7,8},{9,10,11,12},{13,14,15,16}}
+    \\  for i = 1, 4 do
+    \\    for j = 1, 4 do
+    \\      m[i][j] = m[i][j] + 1
+    \\    end
+    \\  end
+    \\  local s = 0
+    \\  for i = 1, 4 do
+    \\    for j = 1, 4 do
+    \\      s = s + m[i][j]
+    \\    end
+    \\  end
+    \\  return s
+    \\end
+    \\print(grid())
     ,
 };
 

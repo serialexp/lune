@@ -1,15 +1,16 @@
 # Nested Numeric Array Flattening — Design
 
-Status: partial — **building D.** Phases 0–6 landed on `master`. Live grids are
+Status: partial — **building D.** Phases 0–7 landed on `master`. Live grids are
 now produced at runtime: a homogeneous-numeric nested table inflates on its first
 fused `a[i][j]=v`, grows by **reshape-on-overflow** (stride / cell-lane), and
 deflates only on a genuine type change or any *bare* access — the **gate behind
 fused indexing** (2026-06-26, Bart; see §Escape detection). Grids survive GC
-stress live. Remaining: Phase 7 (determinism + keyframe verification) and Phase 8
-(the trace-recorder fast path, where the locality win is cashed — grids today
-abort recording on `get_index2`/`set_index2`, so they run correctly but tier-0).
-Determinism/replay is the one principled gate and is satisfiable (see
-§Determinism gate). Build size is explicitly *not* a blocker (see §Decision).
+stress live, and determinism/replay is closed: a grid is never serialised
+(deflated to logical nested rows at capture, with **deterministic reserved-space
+row ids** so a mid-execution cut resumes byte-identically — Phase 7). Remaining:
+Phase 8 only (the trace-recorder fast path, where the locality win is cashed —
+grids today abort recording on `get_index2`/`set_index2`, so they run correctly
+but tier-0). Build size is explicitly *not* a blocker (see §Decision).
 Owner: Bart
 Last updated: 2026-06-26
 
@@ -109,10 +110,22 @@ land; move whole sections to Done once everything inside is checked.
   Verified live: the eight Phase 5 e2e tests run with `gc_stress=true` (collect at
   *every* safepoint) while grids are live and inflate/deflate mid-program — green,
   so a live grid is neither wrongly collected nor leaks its row tables on deflate.
-- [ ] **Phase 7 — Determinism + keyframe.** Prove the grid is in-memory only
-  (never serialised), identity is `parent.id`-based (address-independent), all 8
-  modes + keyframe restore observe identical logical values, and grids are
-  deflated (or skipped) at keyframe capture. See §Determinism gate.
+- [x] **Phase 7 — Determinism + keyframe.** A grid is in-memory only: never on the
+  wire. `keyframeser.encodeSnapshot` calls `Heap.deflateAllGrids` up front, so the
+  walk only ever sees logical nested rows; `toSchemaValue` keeps `.row_view =>
+  unreachable` (the gate guarantees no bare row_view escapes). Identity stays
+  `parent.id`-based throughout. **Cross-resume byte-identity (the subtle part):** a
+  grid live at a mid-execution cut deflates at capture, which would normally mint
+  allocation-order row ids that shift everything afterwards and break a resumed
+  run's final snapshot. Fixed with **deterministic reserved-space row ids** (Bart's
+  call): `deflateAllGrids` enumerates grids in canonical (parent-id-sorted) order
+  and stamps each rebuilt row from `gc.reserved_grid_id_base` (the high half of the
+  u32 space) via `linkRestored` — a pure function of logical state, never touching
+  the monotonic counter; restore ignores reserved ids when reconstructing the
+  counter, so they never pollute it. Proven by a grid program added to the f2c
+  resume corpus (resumes to a **byte-identical** final snapshot through a mid-grid
+  cut) plus a 3-case single-VM round-trip test; both run across all 10 modes incl.
+  `gc_stress`.
 - [ ] **Phase 8 — Trace recorder support.** Record `get_index2`/`set_index2` as
   grid-relative address arithmetic (`base + (i*stride+j)`) behind `guard_grid` +
   bounds + not-deflated guards, side-exiting to tier-0 when a row has deflated.
@@ -207,7 +220,7 @@ were on the table:
 
 Either way the parent's *outer* `get(i)` returns "the i-th row" — which is a
 `RowView` (materialised/cached) when read as a value, but the **fused** index
-path (Phase 7 + the tier-0 fast path) reads `grid[i*stride + j]` directly
+path (Phase 8 + the tier-0 fast path) reads `grid[i*stride + j]` directly
 without ever materialising the row.
 
 ## Mechanism
@@ -242,7 +255,7 @@ Invariant: **at every deflation boundary, readers see byte-identical logical
 values** before and after. This is the determinism contract (doc 02) and the
 correctness contract simultaneously.
 
-### Trace recorder (Phase 7) — where the win is cashed
+### Trace recorder (Phase 8) — where the win is cashed
 
 A fused multi-level index records `a[i][j][k]` as:
 `guard_grid(a)` + bounds guards on i/j/k + one `aref` computing
@@ -269,7 +282,7 @@ and a grid-validity guard instead of a single-lane guard.
 
 Phases 1–6 make the representation correct under tier-0 alone (no trace) — the
 gate is that all 8 modes + keyframe replay stay byte-identical with grids
-enabled, with deflation exercised. Phase 7 adds the trace fast path that turns
+enabled, with deflation exercised. Phase 8 adds the trace fast path that turns
 correctness into the actual speedup. The build stays green at every phase
 (Rule Z-3); each representational invariant gets its shape pinned with tests
 (inflation round-trip, deflation-on-escape identity, `a[i]==a[i]`,
@@ -433,7 +446,24 @@ replay. Grid flattening clears this:
 - **The grid is never serialised.** Like `lane`, it is an in-memory
   optimisation; keyframes persist *logical* values (`array.get(i)` round-trips on
   any representation), so a restore that lands on a different grid/nested state is
-  still observably identical.
+  still observably identical. **Implemented (Phase 7):** `encodeSnapshot` calls
+  `Heap.deflateAllGrids` before the heap walk, so every grid is rebuilt to logical
+  nested row Tables and the serializer only ever sees `.value` rows; `.row_view`
+  stays `unreachable` on the wire (the fused-indexing gate guarantees no bare
+  row_view escapes a register).
+- **Capture-time deflation must not perturb the id stream.** Deflating a *live*
+  grid at a mid-execution cut mints replacement row Tables. If those drew ids from
+  the monotonic counter, capture timing would shift every id allocated afterwards,
+  so a resumed run's final snapshot would diverge from the reference run's (the
+  F2c (d) invariant). **Implemented (Phase 7), Bart's call — deterministic
+  reserved-space ids:** `deflateAllGrids` enumerates grids in canonical
+  (parent-id-sorted) order and stamps each rebuilt row sequentially from
+  `gc.reserved_grid_id_base` (the high half of the u32 space) via `linkRestored`,
+  a pure function of logical state that never advances the counter. Restore skips
+  reserved ids when reconstructing `next_obj_id`, so the phantom rows neither
+  collide with a genuine object (the real counter is asserted never to reach 2³¹)
+  nor pollute the post-restore counter. Proven by a grid program in the f2c resume
+  corpus that resumes to a byte-identical final snapshot through a live-grid cut.
 - **Identity is address-independent.** `RowView` equality is `(parent.id, row)`,
   not a heap address — same discipline as `key_order` and the `ValueContext` hash
   (which key off `asHeap().id`, never the pointer). So `a[i]==a[i]` and

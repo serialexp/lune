@@ -53,7 +53,16 @@ and persistent-alias fail this. Gating (no bare row_view ever) avoids it.
 5. [x] **Phase 6 — GC under stress with grids live.** DONE — the Phase 5 e2e tests
    run with `gc_stress=true` (collect at every safepoint) while grids inflate/
    deflate mid-program; green ⇒ no wrong-collect, no row-table leak on deflate.
-6. [ ] **Phase 7 — determinism + keyframe** (deflate/skip grids at capture).
+6. [x] **Phase 7 — determinism + keyframe.** DONE (green). Grid is never on the
+   wire: `keyframeser.encodeSnapshot` calls `Heap.deflateAllGrids` up front;
+   `.row_view => unreachable` stays (gate guarantees no bare view escapes).
+   **Cross-resume byte-identity** solved with **deterministic reserved-space row
+   ids** (Bart's call): `deflateAllGrids` enumerates grids in canonical
+   (parent-id-sorted) order, stamps each rebuilt row from `gc.reserved_grid_id_base`
+   via `linkRestored` (pure fn of logical state, never bumps the counter); restore
+   skips reserved ids when rebuilding `next_obj_id`. Proven by a grid program in the
+   f2c resume corpus (byte-identical final snapshot through a live-grid mid-cut) +
+   a 3-case single-VM round-trip test; all run across 10 modes incl. gc_stress.
 7. [ ] **Phase 8 — recorder fast path** (the perf win; grids currently abort
    recording on `get_index2`/`set_index2` ⇒ correct but tier-0).
 8. [x] Doc 14 updated (4b/4c/5/6 → Done, status header). No inventory change (no
