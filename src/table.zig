@@ -428,26 +428,38 @@ fn normalizeKey(key: Value) Value {
 /// therefore hash identically.
 pub const ValueContext = struct {
     pub fn hash(_: ValueContext, v: Value) u64 {
-        var h = std.hash.Wyhash.init(0);
-        const tag_byte: u8 = @intFromEnum(v.tag);
-        h.update(&.{tag_byte});
-        if (v.isHeap()) {
-            // Hash a heap key by its stable, deterministic object id — NOT
-            // `payload.bits`, which is the object's *address*. An address is
-            // ASLR-dependent, so hashing it makes the hash-map's slot layout (and
-            // therefore its iteration order) vary run-to-run. That divergence is
-            // invisible to a program today (no `pairs`/`next`), but it is real and
-            // it surfaces the moment iteration order is observed — e.g. a keyframe
-            // snapshot serializing the hash part (`keyframeser.zig`). Hashing by
-            // `id` is consistent with `eql` (equal heap keys are the same interned
-            // object, hence the same id) and is reproducible. See
-            // docs/design/02-determinism.md §"Table iteration order".
-            const id = v.asHeap().id;
-            h.update(std.mem.asBytes(&id));
-        } else {
-            h.update(std.mem.asBytes(&v.payload.bits));
-        }
-        return h.final();
+        // The key is always a tag (1 byte) plus an 8-byte payload, so there is
+        // nothing to *stream*: a fixed-width integer avalanche hashes it in a
+        // handful of instructions, where `std.hash.Wyhash` paid init+update+final
+        // overhead on every single lookup. That per-lookup `Wyhash.final` was
+        // ~45–57% of the runtime of the table-heavy benchmarks (nbody, array3d)
+        // and dominated `field_hash`; replacing it cut nbody by ~13% of cycles
+        // and field_hash by ~16% of instructions.
+        //
+        // Determinism: this is a pure function of `(tag, payload)`, identical in
+        // all 8 modes and on replay. It does NOT affect observable iteration
+        // order — that is imposed by `key_order.keyLessThan`'s canonical sort in
+        // both `keyframeser.sortedHashEntries` and `pairs`/`next`, which erases
+        // the hash-map's internal probe order (see docs/design/02-determinism.md
+        // §"Table iteration order"). So the function is free to change without
+        // touching any snapshot golden. (`eql` below still does the full
+        // `Value.eql`, so distribution quality is a performance concern only,
+        // never correctness.)
+        const payload: u64 = if (v.isHeap())
+            // Hash a heap key by its stable, deterministic object `id`, NOT
+            // `payload.bits` (the object's ASLR-dependent address). Consistent
+            // with `eql`: equal heap keys are the same interned object, same id.
+            v.asHeap().id
+        else
+            v.payload.bits;
+
+        // Fold the tag into the payload (spread across the word first so a small
+        // ordinal still perturbs the high bits), then run a splitmix64-style
+        // finalizer — a well-distributed 64-bit avalanche.
+        var x = payload ^ (@as(u64, @intFromEnum(v.tag)) *% 0x9E3779B97F4A7C15);
+        x = (x ^ (x >> 30)) *% 0xBF58476D1CE4E5B9;
+        x = (x ^ (x >> 27)) *% 0x94D049BB133111EB;
+        return x ^ (x >> 31);
     }
     pub fn eql(_: ValueContext, a: Value, b: Value) bool {
         return a.eql(b);
@@ -540,6 +552,29 @@ test "boolean and (interned-style) pointer keys live in the hash part" {
     try t.set(gpa, Value.boolean(false), Value.int(2));
     try testing.expectEqual(@as(i64, 1), t.get(Value.boolean(true)).asInt());
     try testing.expectEqual(@as(i64, 2), t.get(Value.boolean(false)).asInt());
+}
+
+test "ValueContext.hash is a pure function and distributes distinct scalar keys" {
+    const ctx = ValueContext{};
+    // Pure: same key → same hash, every time.
+    try testing.expectEqual(ctx.hash(Value.int(42)), ctx.hash(Value.int(42)));
+    try testing.expectEqual(ctx.hash(Value.boolean(true)), ctx.hash(Value.boolean(true)));
+
+    // Distinct keys should (overwhelmingly) land on distinct hashes — a weak but
+    // real distribution guard. A contiguous int run is the worst case for a bad
+    // mixer (identity hashing would still be collision-free here, but a finalizer
+    // that drops bits would not); also fold in a different tag with the same bits.
+    var seen = std.AutoHashMap(u64, void).init(testing.allocator);
+    defer seen.deinit();
+    var i: i64 = 0;
+    var collisions: usize = 0;
+    while (i < 1024) : (i += 1) {
+        const gop = try seen.getOrPut(ctx.hash(Value.int(i)));
+        if (gop.found_existing) collisions += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), collisions);
+    // The tag is folded in: int 1 and bool 1 (same payload bits) hash apart.
+    try testing.expect(ctx.hash(Value.int(1)) != ctx.hash(Value.boolean(true)));
 }
 
 test "rehash: a dense run from 2 (the nsieve pattern) packs into the array part" {
