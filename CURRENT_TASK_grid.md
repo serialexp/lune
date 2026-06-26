@@ -64,9 +64,49 @@ and persistent-alias fail this. Gating (no bare row_view ever) avoids it.
    f2c resume corpus (byte-identical final snapshot through a live-grid mid-cut) +
    a 3-case single-VM round-trip test; all run across 10 modes incl. gc_stress.
 7. [ ] **Phase 8 — recorder fast path** (the perf win; grids currently abort
-   recording on `get_index2`/`set_index2` ⇒ correct but tier-0).
-8. [x] Doc 14 updated (4b/4c/5/6 → Done, status header). No inventory change (no
-   stdlib function added/renamed). Next: commit the arc.
+   recording on `get_index2`/`set_index2` ⇒ correct but tier-0). NOT STARTED —
+   scope below. **Profile FIRST (CLAUDE.md): need a grid-forming benchmark.**
+8. [x] Doc 14 updated (4b/4c/5/6/7 → Done, status header → "Phases 0–7"). No
+   inventory change (no stdlib function added/renamed). Phase 7 committed `9b39918`.
+
+## Phase 8 scope (recorder fast path) — NOT STARTED, awaiting Bart
+
+**Profiling-first blocker (CLAUDE.md "profile FIRST"):** no existing bench forms a
+grid. array3d uses a *manual* flat `image[pos]` 1-D array (no nested `a[i][j]`);
+nbody uses hash-field structs (`b.x`). The genuine nested-numeric `a[i][j]` that
+inflates appears only in **scimark** (`scimark_lib.lua` LU: `a[jp][j]`) and
+LuaJIT's **meteor** (`rot[j][i]=…`). Step 0 of Phase 8 is to confirm one of these
+(or a fresh microbench like a matmul) actually inflates to a grid at runtime and
+that `--dump-aborts` shows `get_index2`/`set_index2` dominating, establishing a
+baseline number — before writing any codegen.
+
+**Codegen surface (multi-tier — this is the big one):**
+- `src/trace.zig` recorder: add `.get_index2`/`.set_index2` cases (today → `else
+  => abort(.nyi_opcode)`). Mirror `recArrayGet`/`recArraySet` (lines 1840/1903)
+  but emit grid-relative addressing: `guard_grid(tab)` + bounds guards on i and j
+  + an `aref`-analogue computing `base + (i*stride + j)` at the `grid_elem` lane +
+  `aload`/`astore`. Side-exit to tier-0 when the grid has deflated.
+- New IR ops (`src/trace.zig` `IrOp`): `guard_grid` (lane==.grid + grid_elem
+  matches recorded), a grid `aref` variant (carries stride; 2-D index), reusing
+  `aload`/`astore` at `grid_elem`. Decide: reuse `aref` with an `aux`-encoded
+  grid flag, or a distinct `garef`.
+- `src/tropt.zig` `kindOf`: classify the new ops.
+- `src/irinterp.zig` (tier-1a): execute the grid ops via `array.gridGet/gridSet`.
+- `src/nativegen.zig` (tier-1b): lower grid `aref` to `base + (i*stride+j)*width`
+  address arith + lane-width load/store + presence `bt`/`bts`. `ArrayPart.Layout`
+  already freezes the field offsets (lane/grid_elem/len/cap/data/present/stride/
+  row_len) for exactly this.
+- Guard-invalidation: a grid that *widens* `grid_elem` or *grows* `stride` mid-
+  trace must invalidate like `guard_lane`'s widen check (trace.zig:1029). The
+  `guard_grid` must pin both `grid_elem` AND `stride` (a stride grow re-lays the
+  flat buffer, so a recorded `i*stride+j` would be wrong) → side-exit on either.
+
+**Open design choices for Bart (Rule #17 — options, not a pick):**
+- (1) f64 grids in the recorder now, or int-lanes-first (f64 needs XMM load/store
+  the array path doesn't yet emit — `recArraySet` already defers `.f64`).
+- (2) Single fused level (`a[i][j]`) first, or full n-level (`a[i][j][k]`) — the
+  bytecode only fuses 2-level today (`get_index2`), so 2-level is the natural cut.
+- (3) Whether to author a dedicated grid matmul microbench vs. driving scimark.
 
 ## Notes
 - Under the gate, Phase 1 `row_view` Value + Phase 3 `rowViewGet/Set/Len` become
