@@ -56,6 +56,10 @@ const usage =
     \\                       imply --trace and analyse every trace for optimisation
     \\                       waste signatures (dead carries, duplicate phis, …),
     \\                       printing them to stderr after the run.
+    \\  --dump-aborts        imply --trace and log every recording that aborts, then
+    \\                       print an aggregated table (anchor, reason, opcode, how
+    \\                       far it got, recurrence count) to stderr after the run —
+    \\                       diagnoses why a hot loop never tiers up.
     \\  --trace-hotguard <N>  imply --trace and override the guard-failure threshold
     \\                       for side-trace recording (default 50).  When a specific
     \\                       guard fails this many times, the next back-edge records
@@ -109,6 +113,10 @@ const TraceOpts = struct {
     /// recording (default 50).  When a specific guard fails this many times, the
     /// next back-edge records a side trace.
     hotguard: ?u32 = null,
+    /// `--dump-aborts`: imply `--trace`, record every abandoned recording into the
+    /// abort log (`config.record_aborts`), and print the aggregated table to stderr
+    /// after the run — which loop dies on which opcode/reason, and how far it got.
+    dump_aborts: bool = false,
 };
 
 pub fn main(init: std.process.Init) u8 {
@@ -148,6 +156,9 @@ pub fn main(init: std.process.Init) u8 {
         } else if (std.mem.eql(u8, arg, "--trace-opportunities")) {
             topts.enabled = true;
             topts.opportunities = true;
+        } else if (std.mem.eql(u8, arg, "--dump-aborts")) {
+            topts.enabled = true;
+            topts.dump_aborts = true;
         } else if (std.mem.eql(u8, arg, "--trace-hotguard")) {
             topts.enabled = true;
             const val = it.next() orelse {
@@ -243,6 +254,7 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     vm.trace.config.execute = topts.execute;
     vm.trace.config.optimize = topts.optimize;
     vm.trace.config.native_codegen = topts.native_codegen;
+    vm.trace.config.record_aborts = topts.dump_aborts;
     if (topts.hotguard) |v| vm.trace.config.hotguard = v;
     // The source backs located error messages: `error(msg, level)` prefixes
     // `chunk:line:` and `synthErrorValue`/`describeFault` read spans against it.
@@ -357,6 +369,11 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // emitted bytes or reports the `unsupported` verdict. The chunk is still alive,
     // so each trace (and its anchor proto) is valid.
     if (topts.dump_native) dumpNative(&vm);
+
+    // --- dump the abort log (--dump-aborts) --- to stderr. Shows every loop that
+    // could not be traced, deduped by (anchor, reason, opcode) with a recurrence
+    // count, so a program stuck on tier-0 reveals exactly what blocks tiering.
+    if (topts.dump_aborts) dumpAborts(&vm);
 
     // --- emit serialized traces (--emit-traces <file>) --- the chunk is still
     // alive, so every trace's `anchor.proto` (and its `id`) is valid.
@@ -497,6 +514,21 @@ fn emitTraces(gpa: std.mem.Allocator, io: lune.io.Io, path: []const u8, vm: *lun
 }
 
 /// Disassemble every cached trace to stderr (for `--dump-traces`).
+/// Dump the recording abort log (`--dump-aborts`) to stderr: one aggregated row
+/// per `(anchor, reason, opcode)`, sorted by recurrence count. A program that
+/// stays on tier-0 names exactly which loop blocks tiering and why.
+fn dumpAborts(vm: *lune.interp.Vm) void {
+    const w = lune.io.stderrWriter();
+    const rows = vm.trace.abort_log.items;
+    if (rows.len == 0) {
+        w.print("lune: no recording aborts\n", .{}) catch {};
+    } else {
+        w.print("lune: {d} distinct recording-abort site(s)\n", .{rows.len}) catch {};
+        lune.trace.writeAborts(w, rows) catch {};
+    }
+    w.flush() catch {};
+}
+
 fn dumpTraces(vm: *lune.interp.Vm) void {
     const w = lune.io.stderrWriter();
     if (vm.trace.cache.items.len == 0) {

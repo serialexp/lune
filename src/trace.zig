@@ -553,6 +553,30 @@ pub const AbortReason = enum {
     too_deep,
 };
 
+/// One aggregated abort, accumulated in `TraceState.abort_log` when
+/// `config.record_aborts`. Rows are deduped by `(anchor.pc, reason, op)` so a
+/// loop that aborts a million times collapses to a single row with a `count` —
+/// the diagnostic-friendly shape ("this loop dies on `new_table`, `nyi_opcode`,
+/// after 6 IR instrs, N times"). Purely informational; nothing in the tiering
+/// path reads it. The `proto` pointer is borrowed (valid while the chunk is
+/// alive, which it is when `--dump-aborts` prints, exactly like `--dump-traces`).
+pub const AbortRecord = struct {
+    /// Loop-header anchor the recording was attempting.
+    proto: *const Proto,
+    anchor_pc: u32,
+    /// Bytecode PC of the instruction that triggered the abort (`rec.cur_pc`).
+    abort_pc: u32,
+    /// The tier-0 opcode being recorded when the abort fired (`rec.cur_op`).
+    op: OpCode,
+    /// Why the recording was abandoned.
+    reason: AbortReason,
+    /// How many IR instructions the partial trace had reached before aborting —
+    /// "how far it got" (0 = died on the very first recorded instruction).
+    ir_len: u32,
+    /// How many times this exact `(anchor, reason, op)` abort recurred.
+    count: u64 = 1,
+};
+
 /// Tunables for the recorder. Defaults track LuaJIT's where sensible; all are
 /// overridable (tests use tiny thresholds, the CLI flips `enabled`).
 pub const TraceConfig = struct {
@@ -633,6 +657,13 @@ pub const TraceConfig = struct {
     /// compiler bails and the trace silently stays on tier-1a. Mutually exclusive
     /// with `record_exec_log` (the viz instrumentation observes the interpreter).
     native_codegen: bool = false,
+    /// Record an **abort log** (`TraceState.abort_log`): every recording that is
+    /// abandoned appends/bumps a row keyed by `(anchor, reason, triggering
+    /// opcode)`, with the partial IR length reached. Off by default (the abort
+    /// path stays a single field write); the CLI `--dump-aborts` flips it on so a
+    /// loop that never tiers up can be diagnosed (which opcode/reason kills it, and
+    /// how far the trace got). Diagnostic only — never affects tiering or output.
+    record_aborts: bool = false,
 };
 
 /// Direct-mapped hot-count table size (a power of two). A back-edge hashes its
@@ -737,6 +768,10 @@ pub const TraceState = struct {
     /// The recorder driving `exec_logs`, lazily created on first use so the off path
     /// allocates nothing. Reused (per-entry scratch retained) across every entry.
     exec_recorder: ?execlog.ExecLogRecorder = null,
+    /// Aborted-recording diagnostic log, populated only when `config.record_aborts`
+    /// (the `--dump-aborts` CLI flag). Deduped by `(anchor, reason, op)`; see
+    /// `AbortRecord` and `logAbort`. Empty and untouched on the normal path.
+    abort_log: std.ArrayListUnmanaged(AbortRecord) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) TraceState {
         return .{ .gpa = gpa };
@@ -750,6 +785,7 @@ pub const TraceState = struct {
         self.values_scratch.deinit(self.gpa);
         for (self.exec_logs.items) |*l| l.deinit(self.gpa);
         self.exec_logs.deinit(self.gpa);
+        self.abort_log.deinit(self.gpa);
         if (self.exec_recorder) |*r| r.deinit();
         for (self.cache.items) |t| t.destroy(self.gpa);
         self.cache.deinit(self.gpa);
@@ -1248,8 +1284,35 @@ pub const TraceState = struct {
     /// executed from the trace.
     fn abort(self: *TraceState, reason: AbortReason) void {
         self.rec.abort_reason = reason;
+        if (self.config.record_aborts) self.logAbort(reason);
         self.rec.active = false;
         self.gateAnchor(self.rec.anchor);
+    }
+
+    /// Append-or-bump the abort diagnostic log (`--dump-aborts`). Deduped by
+    /// `(anchor.pc, reason, op)` so a loop aborting on every back-edge is one row
+    /// with a growing `count`, not millions. A linear scan is fine — distinct
+    /// abort sites are few (a handful of loops × a handful of reasons), and this is
+    /// off the hot path entirely (only runs when `config.record_aborts`). On OOM we
+    /// simply drop the row: a diagnostic must never perturb execution.
+    fn logAbort(self: *TraceState, reason: AbortReason) void {
+        const anchor = self.rec.anchor;
+        for (self.abort_log.items) |*r| {
+            if (r.anchor_pc == anchor.pc and r.proto == anchor.proto and
+                r.reason == reason and r.op == self.rec.cur_op)
+            {
+                r.count += 1;
+                return;
+            }
+        }
+        self.abort_log.append(self.gpa, .{
+            .proto = anchor.proto,
+            .anchor_pc = anchor.pc,
+            .abort_pc = self.rec.cur_pc,
+            .op = self.rec.cur_op,
+            .reason = reason,
+            .ir_len = @intCast(self.rec.instrs.items.len),
+        }) catch {};
     }
 
     /// Finalise a cleanly-closed recording into a cached `Trace`. A build failure
@@ -1505,6 +1568,7 @@ pub const TraceState = struct {
     pub fn recordInstr(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) void {
         if (self.rec.instrs.items.len >= self.config.maxrecord) return self.abort(.too_long);
         self.rec.cur_pc = pc;
+        self.rec.cur_op = instr.op;
         self.recordOne(instr, regs, proto, pc, resolved) catch self.abort(.alloc);
     }
 
@@ -2608,6 +2672,11 @@ pub const Recorder = struct {
     /// field of guard instructions so the executor can report *which*
     /// guard failed (per-guard PC recording for exit-PC chaining).
     cur_pc: u32 = 0,
+    /// Tier-0 opcode of the instruction currently being recorded. Set alongside
+    /// `cur_pc` in `recordInstr`; read by `logAbort` (when `config.record_aborts`)
+    /// to name the opcode that triggered an abort. `.halt` is a harmless initial
+    /// placeholder — overwritten before any abort can reference it.
+    cur_op: OpCode = .halt,
     /// Deferred (sunk) array stores: in-bounds `astore`s that follow an `aload` (a
     /// read-modify-write). Rather than abort the trace (the old C1 rule),
     /// `recArraySet` records each store's address + guards inline but stashes the
@@ -2777,6 +2846,35 @@ pub fn writeTrace(w: *io.Writer, t: *const Trace) io.Writer.Error!void {
         try w.print("  %{d:0>3}  ", .{i});
         try writeIrInstr(w, ins);
         try w.writeAll("\n");
+    }
+}
+
+/// Render the abort log (`--dump-aborts`) as one aligned row per distinct
+/// `(anchor, reason, opcode)`, sorted by `count` descending so the loops that
+/// abort most — the ones actually keeping a program on tier-0 — are at the top.
+/// `rows` is `state.abort_log.items`; the caller owns it (this only reads).
+pub fn writeAborts(w: *io.Writer, rows: []AbortRecord) io.Writer.Error!void {
+    // Sort a borrowed view in place by count desc, then anchor pc for stability.
+    std.mem.sort(AbortRecord, rows, {}, struct {
+        fn lt(_: void, a: AbortRecord, b: AbortRecord) bool {
+            if (a.count != b.count) return a.count > b.count;
+            if (a.anchor_pc != b.anchor_pc) return a.anchor_pc < b.anchor_pc;
+            return @intFromEnum(a.op) < @intFromEnum(b.op);
+        }
+    }.lt);
+    try w.print("{s:>12}  {s:>6}  {s:>7}  {s:<14}  {s:>6}  {s:<16}  {s}\n", .{
+        "count", "anc@pc", "abrt@pc", "reason", "ir_len", "opcode", "anchor",
+    });
+    for (rows) |r| {
+        try w.print("{d:>12}  {d:>6}  {d:>7}  {s:<14}  {d:>6}  {s:<16}  {s}\n", .{
+            r.count,
+            r.anchor_pc,
+            r.abort_pc,
+            @tagName(r.reason),
+            r.ir_len,
+            @tagName(r.op),
+            r.proto.name,
+        });
     }
 }
 
@@ -3018,6 +3116,52 @@ test "recArrayGet aborts on a .value-lane (unpacked) array — deferred scope cu
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.nyi_opcode, state.rec.abort_reason.?);
+}
+
+test "abort log records (anchor, reason, opcode) and dedups recurrences" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    try t.set(gpa, Value.int(1), Value.heap(&t.header)); // forces the .value lane
+    try testing.expectEqual(arr.Lane.value, t.array.lane);
+
+    const proto = Proto{ .code = &.{}, .name = "loop", .num_registers = 3 };
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.config.record_aborts = true; // what --dump-aborts flips on
+
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(1) };
+    // Re-arm and abort the same anchor/op three times: a real loop aborts on every
+    // back-edge, and the log must collapse that to one row with count == 3.
+    for (0..3) |_| {
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 7 }, proto.num_registers);
+        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 9, Value.nil());
+    }
+
+    try testing.expectEqual(@as(usize, 1), state.abort_log.items.len);
+    const row = state.abort_log.items[0];
+    try testing.expectEqual(@as(u64, 3), row.count);
+    try testing.expectEqual(@as(u32, 7), row.anchor_pc);
+    try testing.expectEqual(@as(u32, 9), row.abort_pc);
+    try testing.expectEqual(OpCode.get_index, row.op);
+    try testing.expectEqual(AbortReason.nyi_opcode, row.reason);
+    // `ir_len` is the CUMULATIVE partial-trace length at abort time. This anchor
+    // records nothing before the aborting `get_index`, so it is 0. In a real loop
+    // (nbody's `bodies[i]`, array3d's `a[i][j]`) the loop header contributes a few
+    // IR instrs first, so the same abort shows ir_len≈2 — "got this far, then died".
+    try testing.expectEqual(@as(u32, 0), row.ir_len);
+
+    // A distinct reason at the same anchor is a separate row.
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 7 }, proto.num_registers);
+    state.recordInstr(Instr.opAB(.new_table, 0, 0), winRO(&regs), &proto, 3, Value.nil());
+    try testing.expectEqual(@as(usize, 2), state.abort_log.items.len);
+
+    // With the flag off, nothing is logged.
+    var quiet = TraceState.init(gpa);
+    defer quiet.deinit();
+    try quiet.rec.reset(gpa, .{ .proto = &proto, .pc = 7 }, proto.num_registers);
+    quiet.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 9, Value.nil());
+    try testing.expectEqual(@as(usize, 0), quiet.abort_log.items.len);
 }
 
 test "recArrayGet/recArraySet abort on a metatable-bearing table (chunk 2a)" {
