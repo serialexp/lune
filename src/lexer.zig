@@ -264,6 +264,7 @@ pub const Lexer = struct {
             '&' => self.pick('&', .keyword_and, .ampersand),
             '|' => self.pick('|', .keyword_or, .pipe),
             '!' => self.pick('=', .ne, .keyword_not),
+            '?' => self.pick('?', .question_question, .question),
             '~' => self.tildeOp(),
             '(' => .lparen,
             ')' => .rparen,
@@ -398,6 +399,12 @@ test "maximal-munch operators" {
         .plus,  .minus, .star,    .slash, .slash_slash, .percent, .caret,
         .eq,    .ne,    .le,      .ge,    .lt,          .gt,      .lshift,
         .rshift, .dot_dot, .ellipsis, .double_colon, .assign, .colon, .dot,
+    });
+}
+
+test "nil-coalescing: ?? and lone ?" {
+    try expectTags("a ?? b ? c", &.{
+        .identifier, .question_question, .identifier, .question, .identifier,
     });
 }
 

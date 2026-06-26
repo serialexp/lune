@@ -1842,6 +1842,9 @@ pub const Vm = struct {
                 .jmp_if_true => if (regs.get(a).isTruthy()) {
                     pc = applyJump(pc, instr.aux);
                 },
+                .jmp_if_not_nil => if (!regs.get(a).isNil()) {
+                    pc = applyJump(pc, instr.aux);
+                },
 
                 // ---- numeric for ----
                 // R[a..a+3) = (idx, limit, step). Validate numbers, pre-subtract
@@ -5033,6 +5036,43 @@ test "metatable: arithmetic metamethods (add/sub/mul/div/mod/pow/idiv)" {
         \\
     ,
         "5\n3\n15\n3.5\n1\n1024\n3\n",
+    );
+}
+
+test "nil-coalescing: ?? returns rhs only on pure nil, short-circuits" {
+    try expectProgram(
+        \\print(nil ?? 5)
+        \\print(7 ?? 5)
+        \\-- pure-nil: a non-nil-but-falsy lhs is KEPT (this is the `or` pitfall ?? avoids)
+        \\print(false ?? 9)
+        \\print(0 ?? 9)
+        \\print("" ?? 9)
+        \\-- left-assoc chain: first non-nil wins
+        \\print(nil ?? nil ?? 3)
+        \\print(nil ?? 2 ?? 3)
+        \\-- short-circuit: rhs not evaluated when lhs is non-nil
+        \\local hit = false
+        \\local function side() hit = true; return 1 end
+        \\local _ = 42 ?? side()
+        \\print(hit)
+        \\local _ = nil ?? side()
+        \\print(hit)
+        \\
+    ,
+        "5\n7\nfalse\n0\n\n3\n2\nfalse\ntrue\n",
+    );
+}
+
+test "nil-coalescing: ?? precedence sits at the or level" {
+    try expectProgram(
+        \\-- `or` and `??` share a level, left-assoc: evaluate left to right.
+        \\print(false or nil ?? 8)
+        \\-- (false or nil) ?? 8  ->  nil ?? 8  ->  8
+        \\print(nil ?? false or 8)
+        \\-- (nil ?? false) or 8  ->  false or 8  ->  8
+        \\
+    ,
+        "8\n8\n",
     );
 }
 

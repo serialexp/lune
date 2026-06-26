@@ -38,6 +38,7 @@ pub const BinaryOp = enum {
     ge, // >=
     and_, // and
     or_, // or
+    coalesce, // ??  (nil-coalescing; short-circuit, pure-nil)
     band, // &
     bor, // |
     bxor, // ~

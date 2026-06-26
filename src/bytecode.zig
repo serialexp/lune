@@ -82,6 +82,11 @@ pub const OpCode = enum(u8) {
     jmp_if_false,
     /// `a, aux`    if  truthy(R[a]) pc += aux
     jmp_if_true,
+    /// `a, aux`    if R[a] is NOT nil, pc += aux. The nil-specific test backing
+    ///             `??` (nil-coalescing): unlike `jmp_if_true`, a non-nil-but-
+    ///             falsy value (`false`, `0`) keeps the lhs rather than falling
+    ///             through to the rhs.
+    jmp_if_not_nil,
     /// `a, aux`    numeric-for setup. R[a..a+3) = (idx, limit, step); validates
     ///             they are numbers, pre-subtracts step from idx, then `pc += aux`
     ///             to the matching `for_loop`.
@@ -277,7 +282,7 @@ pub fn writeInstr(w: *io.Writer, instr: Instr) io.Writer.Error!void {
         .jmp => try w.print(" {d:>4}", .{instr.aux}),
         .load_nil, .new_table, .close_upvalues, .vararg_first, .vararg_len, .vararg_spread => try w.print(" r{d}", .{instr.a}),
         .load_int => try w.print(" r{d}  {d}", .{ instr.a, instr.aux }),
-        .jmp_if_false, .jmp_if_true, .for_prep, .for_loop => try w.print(" r{d}  {d:>4}", .{ instr.a, instr.aux }),
+        .jmp_if_false, .jmp_if_true, .jmp_if_not_nil, .for_prep, .for_loop => try w.print(" r{d}  {d:>4}", .{ instr.a, instr.aux }),
         .load_bool,
         .load_const,
         .move,

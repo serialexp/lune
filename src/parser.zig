@@ -485,6 +485,8 @@ const Parser = struct {
     fn infixBp(tag: Tag) ?BindInfo {
         return switch (tag) {
             .keyword_or => .{ .op = .or_, .l = 2, .r = 3 },
+            // `??` sits at the `or` level, left-associative (same binding powers).
+            .question_question => .{ .op = .coalesce, .l = 2, .r = 3 },
             .keyword_and => .{ .op = .and_, .l = 4, .r = 5 },
             .lt => .{ .op = .lt, .l = 6, .r = 7 },
             .gt => .{ .op = .gt, .l = 6, .r = 7 },

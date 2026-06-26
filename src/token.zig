@@ -88,6 +88,8 @@ pub const Token = struct {
         dot, // .
         dot_dot, // ..  (concatenation)
         ellipsis, // ... (varargs)
+        question, // ?   (reserved: optional-type marker / future ?. ?:)
+        question_question, // ??  (nil-coalescing)
 
         // sentinels
         eof,
@@ -166,6 +168,8 @@ pub const Token = struct {
                 .dot => ".",
                 .dot_dot => "..",
                 .ellipsis => "...",
+                .question => "?",
+                .question_question => "??",
                 else => null,
             };
         }

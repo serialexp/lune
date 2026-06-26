@@ -1013,6 +1013,15 @@ const Compiler = struct {
                 self.patchToHere(skip);
                 return;
             },
+            .coalesce => {
+                // `a ?? b`: keep lhs unless it is *nil* (pure-nil, not falsiness —
+                // `false ?? b` is `false`). RHS is skipped when lhs is non-nil.
+                try self.compileExprTo(lhs, dest);
+                const skip = try self.emitJump(.jmp_if_not_nil, dest); // non-nil → keep lhs
+                try self.compileExprTo(rhs, dest);
+                self.patchToHere(skip);
+                return;
+            },
             else => {},
         }
 
@@ -1431,7 +1440,7 @@ fn binOpCode(op: ast.BinaryOp) OpCode {
         .shl => .shl,
         .shr => .shr,
         .sar => .sar,
-        .and_, .or_ => unreachable, // handled by short-circuit lowering
+        .and_, .or_, .coalesce => unreachable, // handled by short-circuit lowering
     };
 }
 

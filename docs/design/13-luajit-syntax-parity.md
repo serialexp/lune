@@ -1,6 +1,6 @@
 # lune — LuaJIT 3.0 Syntax-Extension Parity
 
-Status: partial — Phases 1 & 3 landed; Phases 4–5 outstanding
+Status: partial — Phases 1, 3 & 4 landed; Phases 2 & 5 outstanding
 Owner: Bart
 Last updated: 2026-06-26
 
@@ -37,14 +37,26 @@ whole phases to "Done" once everything inside is checked.
       stays bitwise; only the doubled form aliases, and `!` vs `!=` disambiguates
       by the trailing `=`. Lexer-tag test + end-to-end eval test covering
       short-circuit and value-returning (not boolean-coercing) semantics.
+- [x] **Phase 4 — `??` nil-coalescing.** New tokens `question` (`?`, reserved
+      seam for the parked `?.`/`?:`/optional-type marker) and `question_question`
+      (`??`); AST `BinaryOp.coalesce`; parser precedence at the `or` level,
+      left-assoc; compiler short-circuit lowering via a new **`jmp_if_not_nil`**
+      bytecode op (a *pure-nil* test — `false ??`/`0 ??` keep the lhs, the `or`
+      pitfall `??` exists to avoid — distinct from `jmp_if_true`'s truthiness);
+      tier-0 dispatch. Lexer-tag + eval tests (pure-nil, short-circuit, left-assoc
+      chain, `or`-level precedence). **JIT note:** `jmp_if_not_nil` is not yet a
+      recordable trace op, so a `??` on a hot path cleanly aborts recording
+      (`nyi_opcode`) and runs tier-0 — verified non-crashing under
+      `--trace --jit-native` with byte-identical output. Native coverage (a
+      nil-guard IR op) is a future follow-up, not in this phase's scope.
+      `bytecode.OpCode` carries no wire ordinal (only `trace.IrOp`/`ObsType`/
+      `value.Tag` do), so inserting `jmp_if_not_nil` mid-enum is safe.
 
 ### Outstanding
 
 - [ ] **Phase 2 — `~>>=` compound form.** Rides on the general compound-assignment
       desugar (Phase 5) but the *operator* belongs to the bitwise set; land the
       token alongside Phase 1, wire the desugar in Phase 5.
-- [ ] **Phase 4 — `??` nil-coalescing.** New token, AST node, short-circuit eval,
-      precedence at the `or` level, pure-nil check, tests.
 - [ ] **Phase 5 — Compound assignment `+= -= *= /= //= %= &= |= ~= <<= >>= ~>>= ..=`.**
       Parser desugar with single-evaluation of the target prefix; no `^=`; `~=`
       parses as xor-assign in statement context. Tests for the prefix-eval-once
