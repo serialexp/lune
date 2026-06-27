@@ -499,7 +499,12 @@ pub const Table = struct {
 /// Everything else is returned unchanged. Public so the interpreter's fused
 /// grid-cell paths (doc 14) normalise outer/inner index keys the same way
 /// `get`/`set` do (`a[i][2.0]` ↔ `a[i][2]`).
-pub fn normalizeKey(key: Value) Value {
+pub inline fn normalizeKey(key: Value) Value {
+    // `inline`: this is a single tag-compare on the hot int-key path, but the
+    // compiler was emitting it as a real call (its own symbol, 16-byte `Value`
+    // passed by value) — ~6.5% of grid_matmul_f64's tier-0 run was the call
+    // overhead alone, paid twice per fused cell read (`gridCellGet`). Folding it
+    // into the 11 call sites collapses the common path to a tag check + return.
     if (key.isFloat()) {
         const f = key.asFloat();
         if (!std.math.isNan(f) and !std.math.isInf(f) and
