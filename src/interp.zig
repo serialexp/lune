@@ -1722,10 +1722,14 @@ pub const Vm = struct {
         // deopt re-entries and the post-epilogue header re-fetch. The central
         // dispatch is now a labeled `sw: switch`: straight-line arms thread
         // directly to the next instruction via `continue :sw (try self.nextOp(...)
-        // orelse return .suspended)`, and only a real loop back-edge `break :sw`
-        // into the (unchanged) epilogue below. The whole per-instruction prologue
+        // orelse return .suspended)`, and the epilogue below is reached *only* via
+        // `break :sw` from a jump arm on a real loop back-edge. Everything else
+        // threads or `continue :outer`s: `.call`'s Lua-function and `.ret` arms
+        // reload frame locals and `continue :outer`; `.call`'s native/`__call`
+        // arms thread with an explicit `continue :sw` tail (they advance `pc` past
+        // the call like any straight-line op). The whole per-instruction prologue
         // (GC safepoint, `safepoint_seq`, suspend, replay, recording mirror) lives
-        // in `step`, so it still runs between every pair of instructions in both
+        // in `nextOp`, so it still runs between every pair of instructions in both
         // modes — byte-identical to the old inlined prologue.
         outer: while (true) {
             sw: switch (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended) {
@@ -2264,6 +2268,13 @@ pub const Vm = struct {
                             }
                         },
                     }
+                    // The native and `__call` arms run inline (no frame push) and
+                    // leave `pc` one past the call, exactly like a straight-line op,
+                    // so they thread to the next instruction. (The `.function` arm
+                    // never reaches here — it `continue :outer`s after reloading
+                    // onto the callee frame.) Threading here keeps the back-edge
+                    // epilogue reachable *only* via `break :sw`.
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
 
                 // ---- returns ---- pop this frame; copy results into the parent's
