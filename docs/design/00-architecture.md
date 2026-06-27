@@ -41,10 +41,13 @@ _(nothing yet — design only)_
       calls; the build forces `use_llvm = true` (principle #4). Done.
       **The smoke test (`src/dispatch.zig`) is a permanent capability gate, not
       disposable code** — its *toy loop* is throwaway, but guaranteed tail calls
-      are pillar #4 and the test is what keeps them verified on every target. The
-      current tier-0 (`interp.zig`, Phase 3) is intentionally a `while/switch`
-      correctness oracle that does **not** thread its dispatch yet; threaded
-      dispatch is a reserved fast-path technique. Any new target (e.g. wasm32) must
+      are pillar #4 and the test is what keeps them verified on every target.
+      Tier-0 (`interp.zig`, Phase 3) remains the `while`-shelled correctness
+      oracle, but its central `switch` is now **threaded via labeled-`switch` +
+      `continue :sw`** (computed-goto-style per-opcode dispatch branches; the
+      per-instruction prologue lives in `inline fn nextOp`). That is a *different*
+      mechanism from the `@call(.always_tail)` tail-call threading the smoke test
+      guards — the latter stays a reserved fast-path technique. Any new target (e.g. wasm32) must
       **keep this test green** (enable the target's tail-call feature, mirroring
       `use_llvm = true` on native) — a target that can't emit guaranteed tail calls
       must fail here loudly, never be silently gated out.
