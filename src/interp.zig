@@ -1625,6 +1625,83 @@ pub const Vm = struct {
         return !(self.suspend_ctl != null or self.record_safepoint_lines or self.trace.isRecording());
     }
 
+    /// Per-instruction prologue + fetch for the threaded dispatch loop, factored
+    /// out of `execImpl` so every opcode arm can re-dispatch with `continue :sw
+    /// (try self.nextOp(...) orelse return .suspended)`. Runs **between every pair
+    /// of instructions in both modes**, so GC timing, `safepoint_seq` counting,
+    /// suspend points, replay-line recording, and the trace recording mirror stay
+    /// byte-identical to the old centralized `while`-loop prologue.
+    ///
+    /// Returns the next opcode to dispatch, or `null` when a `.full`-mode suspend
+    /// fires (the caller turns that into `return .suspended`). `frame.pc`,
+    /// `cur_pc`, `instr`, and `a` are written through the out-pointers; `pc` is
+    /// advanced past the fetched instruction. `inline` so the loop locals stay in
+    /// registers and the `.fast` instantiation compiles the full-only hooks out.
+    inline fn nextOp(
+        self: *Vm,
+        comptime mode: ExecMode,
+        frame: *CallFrame,
+        closure: *const Closure,
+        proto: *const Proto,
+        code: []const Instr,
+        regs: RegWindow,
+        pc: *usize,
+        cur_pc: *usize,
+        instr: *Instr,
+        a: *usize,
+    ) Error!?bytecode.OpCode {
+        // GC safepoint — see the long note at the call-equivalent site in the old
+        // loop: every live value is rooted here, the collection is non-moving, and
+        // it is suppressed while a multret result set is pending.
+        if (!self.reg_top_pending and self.heap.shouldCollect()) self.collect();
+
+        // Free-running safepoint counter — must advance every instruction in both
+        // modes so replay cuts land identically (keyframeser reads it as the total).
+        self.safepoint_seq += 1;
+
+        // Replay line-index recorder — `.full` only (compiled out in `.fast`).
+        if (mode == .full and self.record_safepoint_lines) {
+            const sp_src = if (proto.source.len > 0) proto.source else self.source;
+            const sp_line: u32 = if (pc.* < proto.spans.len)
+                compiler.lineFromOffset(sp_src, proto.spans[pc.*].start)
+            else
+                0;
+            try self.safepoint_lines.append(self.gpa, sp_line);
+        }
+
+        // Mid-execution suspend point — an instruction boundary. `.full` only.
+        if (mode == .full) {
+            if (self.suspend_ctl) |sc| {
+                if (!self.reg_top_pending and self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth) {
+                    std.debug.assert(self.pending_error == null);
+                    frame.pc = pc.*;
+                    return null;
+                }
+            }
+        }
+
+        const cur = pc.*;
+        cur_pc.* = cur;
+        // Keep the faulting location recoverable (see the old loop's note).
+        frame.pc = cur;
+        const i = code[cur];
+        pc.* = cur + 1;
+        instr.* = i;
+        a.* = i.a;
+
+        // Recording mirror — `.full` only. Mirrors this instruction (and its
+        // observed operand types) into the trace IR *before* tier-0 executes it.
+        if (mode == .full and self.trace.isRecording()) {
+            const resolved: Value = switch (i.op) {
+                .get_upval => self.upvalGet(closure.upvalues[i.b]),
+                .get_global => self.globals.get(proto.constants[i.b]),
+                else => Value.nil(),
+            };
+            self.trace.recordInstr(i, regs, proto, @intCast(pc.*), resolved);
+        }
+        return i.op;
+    }
+
     fn execImpl(self: *Vm, comptime mode: ExecMode, stop_depth: u32) Error!ExecStep {
         // Hot top-frame state, reloaded from `frames[depth-1]` after every push/pop.
         var frame: *CallFrame = &self.frames[self.depth - 1];
@@ -1634,104 +1711,45 @@ pub const Vm = struct {
         var base = frame.base;
         var regs = self.frameWindow(base, proto.num_registers);
         var pc = frame.pc;
+        // Threaded-dispatch loop locals. `step` writes `cur_pc`/`instr`/`a` and
+        // advances `pc` on every fetch; declared here so each opcode arm can
+        // re-dispatch with `continue :sw`. Always set by `step` before any use.
+        var cur_pc: usize = undefined;
+        var instr: Instr = undefined;
+        var a: usize = undefined;
 
+        // `outer:` is retained for the back-edge epilogue's two `continue :outer`
+        // deopt re-entries and the post-epilogue header re-fetch. The central
+        // dispatch is now a labeled `sw: switch`: straight-line arms thread
+        // directly to the next instruction via `continue :sw (try self.nextOp(...)
+        // orelse return .suspended)`, and only a real loop back-edge `break :sw`
+        // into the (unchanged) epilogue below. The whole per-instruction prologue
+        // (GC safepoint, `safepoint_seq`, suspend, replay, recording mirror) lives
+        // in `step`, so it still runs between every pair of instructions in both
+        // modes — byte-identical to the old inlined prologue.
         outer: while (true) {
-            // GC safepoint. Here every live value is reachable from a root (all
-            // registers are settled, no half-built object is exposed), so a
-            // stop-the-world collection is safe. Non-moving, so surviving
-            // pointers in `regs` stay valid.
-            //
-            // Suppressed while a multret result set is pending (`reg_top_pending`):
-            // a producer (e.g. `table.unpack` with `c == all_results`) may have
-            // written results *above* this frame's `num_registers`, which the root
-            // walk (bounded by `stack_top`) would not scan. Producer and consumer
-            // are adjacent instructions and neither allocates in the gap, so
-            // skipping exactly this one safepoint is sound — and it keeps `reg_top`
-            // out of both the GC root set and any keyframe snapshot.
-            if (!self.reg_top_pending and self.heap.shouldCollect()) self.collect();
-
-            // Mid-execution suspend point — an instruction boundary, never
-            // mid-opcode or mid-native. Sync `pc` into the top frame first so the
-            // captured cursor resumes exactly here. `safepoint_seq` is free-running
-            // (extra safepoints from the explicit-stack pop are harmless: a
-            // collection is invisible, and the counter only drives this test hook).
-            self.safepoint_seq += 1;
-            // Replay line-index recorder (off by default — the wasm record run
-            // and the replay tests turn it on). Append the 1-based source line of
-            // the instruction *about to run* at this safepoint, so the UI can map
-            // safepoint k → its line for line-grain stepping. One branch + one
-            // append per safepoint; tier-0's correctness oracle pays nothing when
-            // off.
-            // `.fast` compiles these two prologue hooks out entirely (it is only
-            // entered when both flags are off — `runFastPath`). `safepoint_seq`
-            // above is *not* gated: it must count every instruction in both modes
-            // so replay cuts land identically (keyframeser reads it as the total).
-            if (mode == .full and self.record_safepoint_lines) {
-                // Per-proto source so a safepoint inside a `load`ed chunk maps to
-                // its own line (deterministic: a pure function of proto + source).
-                const sp_src = if (proto.source.len > 0) proto.source else self.source;
-                const sp_line: u32 = if (pc < proto.spans.len)
-                    compiler.lineFromOffset(sp_src, proto.spans[pc].start)
-                else
-                    0;
-                try self.safepoint_lines.append(self.gpa, sp_line);
-            }
-            if (mode == .full) {
-                if (self.suspend_ctl) |sc| {
-                    // Never suspend mid-multret (see the GC note above): `reg_top` is
-                    // transient and unserialized, so a snapshot here could not resume.
-                    if (!self.reg_top_pending and self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth) {
-                        // `pending_error` is transient and unserialized, like
-                        // `reg_top`: a snapshot mid-unwind could not resume. Error
-                        // propagation never reaches a safepoint (it returns straight
-                        // out via `try`), so it is always null here.
-                        std.debug.assert(self.pending_error == null);
-                        frame.pc = pc;
-                        return .suspended;
-                    }
-                }
-            }
-
-            const cur_pc = pc;
-            // Keep the faulting location recoverable: on a runtime error a `try`
-            // below propagates straight out of `exec` (the explicit frame stack
-            // is *not* unwound), so the top frame's `pc` is what `describeFault`
-            // reads. One store/iteration; tier-0 is the correctness oracle, not a
-            // hot tier (the JIT is the speed story).
-            frame.pc = cur_pc;
-            const instr = code[pc];
-            pc += 1;
-            // Phase 5 recording hook: while a trace is being recorded, mirror this
-            // instruction (and its observed operand types) into the trace IR
-            // *before* tier-0 executes it. Recording is transparent — tier-0 still
-            // performs the operation below.
-            // Recording mirror — `.full` only. `.fast` is never entered while
-            // recording is live (`runFastPath`), and the back-edge handoff below
-            // flips to `.full` the instant `onBackEdge` arms a recording, so the
-            // very next instruction is mirrored.
-            if (mode == .full and self.trace.isRecording()) {
-                // Cluster sub-lever 1: the recorder snapshots a callee reached
-                // through an upvalue/global as a synthetic trace input, but it has
-                // no `*Vm`/closure to resolve the live value — so resolve it here
-                // (where `closure`/`globals` are in scope) and pass it through.
-                // `nil` (ignored) for every other opcode. This runs *before* tier-0
-                // executes the instruction, so the value is read from the source,
-                // not the not-yet-written destination register.
-                const resolved: Value = switch (instr.op) {
-                    .get_upval => self.upvalGet(closure.upvalues[instr.b]),
-                    .get_global => self.globals.get(proto.constants[instr.b]),
-                    else => Value.nil(),
-                };
-                self.trace.recordInstr(instr, regs, proto, @intCast(pc), resolved);
-            }
-            const a: usize = instr.a;
-            switch (instr.op) {
+            sw: switch (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended) {
                 // ---- loads & moves ---- (direct lane writes; no `Value` built)
-                .load_nil => regs.setNil(a),
-                .load_bool => regs.setBool(a, instr.b != 0),
-                .load_int => regs.setInt(a, instr.aux),
-                .load_const => regs.set(a, proto.constants[instr.b]),
-                .move => regs.copy(a, instr.b),
+                .load_nil => {
+                    regs.setNil(a);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .load_bool => {
+                    regs.setBool(a, instr.b != 0);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .load_int => {
+                    regs.setInt(a, instr.aux);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .load_const => {
+                    regs.set(a, proto.constants[instr.b]);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .move => {
+                    regs.copy(a, instr.b);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
 
                 // ---- arithmetic (semantics live in arith.zig) ----
                 // The hot both-int / both-float cases compute on the raw payload
@@ -1740,9 +1758,18 @@ pub const Vm = struct {
                 // `arithMeta` path (mixed promotion, `__add`/… metamethod, or a
                 // propagated error like `DivisionByZero`). Numbers carry no
                 // metatable, so the common path never touches dispatch.
-                .add => try self.binNum(regs, a, instr.b, instr.c, .add, self.mm.add),
-                .sub => try self.binNum(regs, a, instr.b, instr.c, .sub, self.mm.sub),
-                .mul => try self.binNum(regs, a, instr.b, instr.c, .mul, self.mm.mul),
+                .add => {
+                    try self.binNum(regs, a, instr.b, instr.c, .add, self.mm.add);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .sub => {
+                    try self.binNum(regs, a, instr.b, instr.c, .sub, self.mm.sub);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .mul => {
+                    try self.binNum(regs, a, instr.b, instr.c, .mul, self.mm.mul);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
                 .div => {
                     const tb = regs.tagAt(instr.b);
                     const tc = regs.tagAt(instr.c);
@@ -1754,41 +1781,57 @@ pub const Vm = struct {
                         const rhs = regs.get(instr.c);
                         regs.set(a, try self.arithMeta(arith.div(lhs, rhs), self.mm.div, lhs, rhs));
                     }
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 .idiv => {
                     const lhs = regs.get(instr.b);
                     const rhs = regs.get(instr.c);
                     regs.set(a, try self.arithMeta(arith.floorDiv(lhs, rhs), self.mm.idiv, lhs, rhs));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 .mod => {
                     const lhs = regs.get(instr.b);
                     const rhs = regs.get(instr.c);
                     regs.set(a, try self.arithMeta(arith.mod(lhs, rhs), self.mm.mod, lhs, rhs));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 .pow => {
                     const lhs = regs.get(instr.b);
                     const rhs = regs.get(instr.c);
                     regs.set(a, try self.arithMeta(arith.pow(lhs, rhs), self.mm.pow, lhs, rhs));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
 
                 // ---- bitwise ---- (both-int fast lane; else `arith.*` + meta)
-                .band => try self.binBit(regs, a, instr.b, instr.c, .band, self.mm.band),
-                .bor => try self.binBit(regs, a, instr.b, instr.c, .bor, self.mm.bor),
-                .bxor => try self.binBit(regs, a, instr.b, instr.c, .bxor, self.mm.bxor),
+                .band => {
+                    try self.binBit(regs, a, instr.b, instr.c, .band, self.mm.band);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .bor => {
+                    try self.binBit(regs, a, instr.b, instr.c, .bor, self.mm.bor);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .bxor => {
+                    try self.binBit(regs, a, instr.b, instr.c, .bxor, self.mm.bxor);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
                 .shl => {
                     const lhs = regs.get(instr.b);
                     const rhs = regs.get(instr.c);
                     regs.set(a, try self.arithMeta(arith.shl(lhs, rhs), self.mm.shl, lhs, rhs));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 .shr => {
                     const lhs = regs.get(instr.b);
                     const rhs = regs.get(instr.c);
                     regs.set(a, try self.arithMeta(arith.shr(lhs, rhs), self.mm.shr, lhs, rhs));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 .sar => {
                     const lhs = regs.get(instr.b);
                     const rhs = regs.get(instr.c);
                     regs.set(a, try self.arithMeta(arith.sar(lhs, rhs), self.mm.sar, lhs, rhs));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
 
                 // ---- unary ----
@@ -1804,14 +1847,22 @@ pub const Vm = struct {
                             regs.set(a, try self.unArithMeta(arith.neg(v), self.mm.unm, v));
                         },
                     }
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
-                .not => regs.setBool(a, !regs.get(instr.b).isTruthy()),
+                .not => {
+                    regs.setBool(a, !regs.get(instr.b).isTruthy());
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
                 .bnot => {
                     const v = regs.get(instr.b);
                     regs.set(a, try self.unArithMeta(arith.bnot(v), self.mm.bnot, v));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 // `#t` honours `__len` for tables; strings/raw-length fall through.
-                .len => regs.set(a, try self.lenValue(regs.get(instr.b))),
+                .len => {
+                    regs.set(a, try self.lenValue(regs.get(instr.b)));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
 
                 // ---- concat ---- `__concat` on `TypeError` (a non-concatable
                 // operand); the located fault is preserved when neither has one.
@@ -1822,29 +1873,65 @@ pub const Vm = struct {
                         Error.TypeError => try self.binMeta(self.mm.concat, lhs, rhs, Error.TypeError),
                         else => return e,
                     });
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
 
                 // ---- comparisons → boolean register ----
                 // `gt`/`ge` reuse `lt`/`le` with operands swapped (a>b ≡ b<a).
                 // `eq`/`ne` consult `__eq` only for two raw-unequal tables;
                 // `lt`/`le` consult `__lt`/`__le` when not raw-comparable.
-                .eq => regs.setBool(a, try self.valuesEqual(regs.get(instr.b), regs.get(instr.c))),
-                .ne => regs.setBool(a, !try self.valuesEqual(regs.get(instr.b), regs.get(instr.c))),
-                .lt => regs.setBool(a, try self.compareMeta(.lt, regs.get(instr.b), regs.get(instr.c))),
-                .le => regs.setBool(a, try self.compareMeta(.le, regs.get(instr.b), regs.get(instr.c))),
-                .gt => regs.setBool(a, try self.compareMeta(.lt, regs.get(instr.c), regs.get(instr.b))),
-                .ge => regs.setBool(a, try self.compareMeta(.le, regs.get(instr.c), regs.get(instr.b))),
+                .eq => {
+                    regs.setBool(a, try self.valuesEqual(regs.get(instr.b), regs.get(instr.c)));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .ne => {
+                    regs.setBool(a, !try self.valuesEqual(regs.get(instr.b), regs.get(instr.c)));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .lt => {
+                    regs.setBool(a, try self.compareMeta(.lt, regs.get(instr.b), regs.get(instr.c)));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .le => {
+                    regs.setBool(a, try self.compareMeta(.le, regs.get(instr.b), regs.get(instr.c)));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .gt => {
+                    regs.setBool(a, try self.compareMeta(.lt, regs.get(instr.c), regs.get(instr.b)));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .ge => {
+                    regs.setBool(a, try self.compareMeta(.le, regs.get(instr.c), regs.get(instr.b)));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
 
                 // ---- control flow ----
-                .jmp => pc = applyJump(pc, instr.aux),
-                .jmp_if_false => if (!regs.get(a).isTruthy()) {
+                // Jumps stay threaded for the *forward* (and not-taken) case —
+                // `continue :sw` re-dispatches the next instruction directly. Only
+                // a real loop back-edge (`pc <= cur_pc` while tracing is enabled —
+                // exactly the epilogue's guard) breaks out to run the back-edge
+                // epilogue below; when tracing is off the epilogue is inert, so a
+                // back-edge threads too. `cur_pc` is this jump's own pc (set by
+                // `step`), so the test sees the post-jump target.
+                .jmp => {
                     pc = applyJump(pc, instr.aux);
+                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
-                .jmp_if_true => if (regs.get(a).isTruthy()) {
-                    pc = applyJump(pc, instr.aux);
+                .jmp_if_false => {
+                    if (!regs.get(a).isTruthy()) pc = applyJump(pc, instr.aux);
+                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
-                .jmp_if_not_nil => if (!regs.get(a).isNil()) {
-                    pc = applyJump(pc, instr.aux);
+                .jmp_if_true => {
+                    if (regs.get(a).isTruthy()) pc = applyJump(pc, instr.aux);
+                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
+                .jmp_if_not_nil => {
+                    if (!regs.get(a).isNil()) pc = applyJump(pc, instr.aux);
+                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
 
                 // ---- numeric for ----
@@ -1857,6 +1944,10 @@ pub const Vm = struct {
                     }
                     regs.set(a, try arith.sub(regs.get(a), regs.get(a + 2)));
                     pc = applyJump(pc, instr.aux);
+                    // `for_prep` always jumps forward to the matching `for_loop`, so
+                    // this never back-edges; kept uniform with the other jumps.
+                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 // idx += step; if still within limit (direction by step sign),
                 // publish idx to the loop var R[a+3] and take the back-edge.
@@ -1874,6 +1965,8 @@ pub const Vm = struct {
                         regs.set(a + 3, idx);
                         pc = applyJump(pc, instr.aux);
                     }
+                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 // generic-for test: the preceding `call` filled R[a+3..] with the
                 // iterator's results. Continue iff the first var is non-nil (Lua
@@ -1884,12 +1977,15 @@ pub const Vm = struct {
                         regs.set(a + 2, regs.get(a + 3));
                         pc = applyJump(pc, instr.aux);
                     }
+                    if (self.trace.config.enabled and pc <= cur_pc) break :sw;
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
 
                 // ---- tables ----
                 .new_table => {
                     const t = try self.heap.newTable();
                     regs.set(a, Value.heap(&t.header));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 .get_index => {
                     // Array fast-path: a table indexed by an in-range integer key
@@ -1921,6 +2017,7 @@ pub const Vm = struct {
                         }
                         break :blk try self.indexGet(container, key);
                     });
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 .set_index => {
                     // Array fast-path mirror of `.get_index`: an in-bounds integer
@@ -1959,6 +2056,7 @@ pub const Vm = struct {
                         }
                         try self.indexSet(container, key, val);
                     }
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 .get_index2 => {
                     // Fused two-level read `R[a] = R[b][R[c]][R[aux]]`. On a grid
@@ -1970,6 +2068,7 @@ pub const Vm = struct {
                     const key1 = regs.get(instr.c);
                     const key2 = regs.get(@as(u16, @intCast(instr.aux)));
                     regs.set(a, try self.fusedGet(container, key1, key2));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 .set_index2 => {
                     // Fused two-level store `R[a][R[b]][R[c]] = R[aux]`. The grid
@@ -1980,14 +2079,19 @@ pub const Vm = struct {
                     const key2 = regs.get(instr.c);
                     const val = regs.get(@as(u16, @intCast(instr.aux)));
                     try self.fusedStore(container, key1, key2, val);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
 
                 // ---- globals ----
-                .get_global => regs.set(a, self.globals.get(proto.constants[instr.b])),
+                .get_global => {
+                    regs.set(a, self.globals.get(proto.constants[instr.b]));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
                 .set_global => {
                     const v = regs.get(a);
                     try self.globals.set(self.gpa, proto.constants[instr.b], v);
                     self.heap.writeBarrier(&self.globals.header, v); // no-op until Phase 4
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
 
                 // ---- functions ----
@@ -1995,14 +2099,22 @@ pub const Vm = struct {
                     const child = proto.protos[instr.b];
                     const cl = try self.makeClosure(closure, child, base);
                     regs.set(a, Value.heap(&cl.header));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
-                .get_upval => regs.set(a, self.upvalGet(closure.upvalues[instr.b])),
+                .get_upval => {
+                    regs.set(a, self.upvalGet(closure.upvalues[instr.b]));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
                 .set_upval => {
                     const v = regs.get(a);
                     self.upvalSet(closure.upvalues[instr.b], v);
                     self.heap.writeBarrier(&closure.upvalues[instr.b].header, v); // no-op until generational
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
-                .close_upvalues => self.closeUpvaluesFrom(base + a),
+                .close_upvalues => {
+                    self.closeUpvaluesFrom(base + a);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                },
 
                 // ---- calls ---- a Lua call pushes a frame and reloads onto it; a
                 // native runs inline (no frame) as the current frame's top activity.
@@ -2056,7 +2168,10 @@ pub const Vm = struct {
                             base = frame.base;
                             regs = self.frameWindow(base, proto.num_registers);
                             pc = frame.pc;
-                            continue;
+                            // Reloaded onto the callee frame; re-enter the outer
+                            // loop so `step` fetches the callee's first instruction
+                            // with a full prologue (GC/seq/suspend/recording).
+                            continue :outer;
                         },
                         .native => {
                             const nat = function.Native.fromHeader(callee.asHeap());
@@ -2213,7 +2328,10 @@ pub const Vm = struct {
                     regs = self.frameWindow(base, proto.num_registers);
                     pc = frame.pc;
                     self.stack_top = base + proto.num_registers;
-                    continue;
+                    // Reloaded onto the parent frame; re-enter the outer loop so
+                    // `step` fetches the parent's next instruction with a full
+                    // prologue. (The parent `pc` is already past the call.)
+                    continue :outer;
                 },
 
                 // ---- varargs ---- read the current frame's `...` cursor. The
@@ -2221,9 +2339,11 @@ pub const Vm = struct {
                 // stable and GC-rooted; these never relocate it.
                 .vararg_first => {
                     regs.set(a, if (frame.varargs_count >= 1) self.regGet(frame.varargs_base) else Value.nil());
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 .vararg_len => {
                     regs.set(a, Value.int(@intCast(frame.varargs_count)));
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 .vararg_get => {
                     // 1-based, bounds-checked; out of range or non-int index → nil.
@@ -2236,6 +2356,7 @@ pub const Vm = struct {
                         }
                     }
                     regs.set(a, out);
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
                 .vararg_spread => {
                     // The dynamic-multret producer half: copy every vararg into
@@ -2252,6 +2373,7 @@ pub const Vm = struct {
                     while (k < count) : (k += 1) self.regSet(dest + k, self.regGet(frame.varargs_base + k));
                     self.reg_top = dest + count;
                     self.reg_top_pending = true;
+                    continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
             }
 
