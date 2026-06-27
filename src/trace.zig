@@ -1307,6 +1307,38 @@ pub const TraceState = struct {
             return;
         }
         const key = AnchorKey{ .proto = proto, .pc = target_pc };
+
+        // Side-trace arming (step 4): a guard inside a trace at this anchor has
+        // failed enough times — arm a new recording on the next iteration, even
+        // though a trace already exists here. The side trace captures the
+        // alternate path through the loop body. This legitimately targets an
+        // already-traced anchor, so it must run *before* the has-trace fast path
+        // below.
+        if (self.wants_side_trace) |wanted| {
+            if (wanted.proto == proto and wanted.pc == target_pc) {
+                if (!self.isGated(key)) {
+                    self.arm(proto, target_pc);
+                    // Clear guard-failure counters for this anchor so we don't
+                    // immediately re-trigger on the next outer-loop iteration.
+                    self.clearGuardFailures(key);
+                }
+                self.wants_side_trace = null;
+                return;
+            }
+        }
+
+        // Hot native re-entry fast path. Once an anchor is traced, the warming
+        // counter can never arm again (`hasTrace` already gated arming below) and
+        // nothing functional reads it — only the warming phase and tests do. So
+        // for a traced anchor we skip the per-back-edge hashmap bookkeeping
+        // entirely: this removes a wyhash `counters.getOrPut` from *every*
+        // tier-0 → native trace entry, which is the dominant remaining hash cost
+        // on matmul-class loops that re-enter a native inner trace tens of
+        // thousands of times. The dispatch loop's own trace-entry walk owns
+        // re-entry from here; the cheap linear cache scan in `hasTrace` (a handful
+        // of pointer compares) replaces the hash probe.
+        if (self.hasTrace(key)) return;
+
         const gop = self.counters.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
@@ -1315,8 +1347,10 @@ pub const TraceState = struct {
         // gated off after an earlier failure — when its backoff cooldown elapses.
         // Each `==` fires exactly once at the crossing point, so we never re-arm
         // on every later iteration. A gated anchor whose cooldown is still running
-        // (or that has exhausted `max_strikes`) is skipped by `isGated`.
-        if (!self.hasTrace(key) and !self.isGated(key)) {
+        // (or that has exhausted `max_strikes`) is skipped by `isGated`. (The
+        // `!hasTrace` arm guard is now redundant — we returned above for traced
+        // anchors — so only `isGated` remains.)
+        if (!self.isGated(key)) {
             // A gate entry that is no longer `isGated` means its `tick` cooldown has
             // just elapsed → take the one retry now. Arming starts a recording, so
             // the next back-edges are consumed by recording rather than re-arming;
@@ -1327,21 +1361,6 @@ pub const TraceState = struct {
             else
                 count == self.config.hotloop; // first time crossing hot
             if (arm_now) self.arm(proto, target_pc);
-        }
-        // Side-trace arming (step 4): a guard inside a trace at this anchor
-        // has failed enough times — arm a new recording on the next iteration,
-        // even though a trace already exists here.  The side trace will capture
-        // the alternate path through the loop body.
-        if (self.wants_side_trace) |wanted| {
-            if (wanted.proto == proto and wanted.pc == target_pc) {
-                if (!self.isGated(key)) {
-                    self.arm(proto, target_pc);
-                    // Clear guard-failure counters for this anchor so we don't
-                    // immediately re-trigger on the next outer-loop iteration.
-                    self.clearGuardFailures(key);
-                }
-                self.wants_side_trace = null;
-            }
         }
     }
 
