@@ -1689,6 +1689,15 @@ pub const Vm = struct {
         instr.* = i;
         a.* = i.a;
 
+        // Nested-loop continuation (Phase 1): a continuation recording armed by a
+        // hot inner loop-done exit begins at its (non-header) anchor pc, which
+        // tier-0 reaches here — *before* the mirror below, so the anchor
+        // instruction is recorded as the trace's first op (exactly as a root
+        // trace's anchor is). A cheap optional-null read when nothing is pending.
+        if (mode == .full and self.trace.pending_exit_anchor != null) {
+            self.trace.maybeStartContinuation(proto, @intCast(cur));
+        }
+
         // Recording mirror — `.full` only. Mirrors this instruction (and its
         // observed operand types) into the trace IR *before* tier-0 executes it.
         if (mode == .full and self.trace.isRecording()) {
@@ -2557,12 +2566,36 @@ pub const Vm = struct {
                                 if (result.completed > 0) {
                                     // This trace did useful work — keep its result.
                                     self.trace.onSideExit(ct, result.completed);
+                                    // Nested-loop linking (Phase 1): if this is an
+                                    // inner numeric-`for` running to completion (its
+                                    // terminal loop guard failed) and the exit lands
+                                    // on an enclosing loop, arm a continuation
+                                    // recording at the post-loop pc. Records the
+                                    // outer body forward; Phase 2 links it back here.
+                                    // Output-neutral (the recording aborts at the
+                                    // inner `for_prep` until Phase 2).
+                                    self.trace.maybeArmContinuation(ct, result.exit_instr, proto);
                                     // Retire any dead-marked traces before leaving the
                                     // walk so a stale narrow-lane trace doesn't linger
                                     // in a slot just because a later trace succeeded.
                                     // Safe: `continue :outer` abandons the walk, so the
                                     // freed `*Trace`s are never revisited.
                                     for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                    // Nested-loop linking (Phase 1): a continuation
+                                    // recording just armed (pending at the post-loop
+                                    // pc). Its dispatch-prologue activation hook is
+                                    // `.full`-only, so the inner loop's final-iteration
+                                    // deopt-replay — which walks tier-0 from the inner
+                                    // anchor up to that post-loop pc — must run in
+                                    // `.full`. In `.fast` (the steady state of a hot
+                                    // inner loop) switch up; in `.full` just stay.
+                                    if (self.trace.pending_exit_anchor != null) {
+                                        if (mode == .fast) {
+                                            frame.pc = pc;
+                                            return .switch_mode; // → .full
+                                        }
+                                        continue :outer; // already `.full`
+                                    }
                                     // T3 drop-to-fast on the productive-trace path.
                                     // The handoff at the bottom of the back-edge
                                     // block is bypassed by this `continue :outer`,
@@ -4518,6 +4551,31 @@ test "cross-frame: a changed upvalue callee deopts the snapshot and replays byte
         \\
     ,
         "20300\n20100\n",
+    );
+}
+
+test "nested-loop: a 2-deep numeric-for nest is byte-identical across all modes (Phase 1)" {
+    // The end-to-end output gate for nested-loop trace linking (Phase 1,
+    // `docs/design/15-nested-loop-linking.md`). The inner loop traces as a root;
+    // its loop-done exit arms a *continuation* recording at the post-inner-loop pc
+    // that records the outer body and aborts at the inner `for_prep` (LINNER) until
+    // Phase 2 links it. Nothing the continuation does commits, so output must stay
+    // byte-identical to tier-0 across {gc_stress × {off, record-only, no-opt,
+    // record-execute, native}} — this pins proof obligation **P1** (arming is
+    // transparent: it never changes a printed byte). Inner trip count (30) clears
+    // `min_trip_entry` so the inner trace is genuinely entered and the arming path
+    // actually runs in the executing modes.
+    try expectProgram(
+        \\local s = 0
+        \\for i = 1, 40 do
+        \\  for j = 1, 30 do
+        \\    s = s + i * j
+        \\  end
+        \\end
+        \\print(s)
+        \\
+    ,
+        "381300\n",
     );
 }
 
@@ -9283,6 +9341,53 @@ fn expectTier0Equiv(source: [:0]const u8) !void {
     var s1 = io.Writer.fixed(&buf1);
     try runCaptured(testing.allocator, source, &s1, false, .record_execute);
     try testing.expectEqualStrings(s0.buffered(), s1.buffered());
+}
+
+test "nested-loop: a hot inner loop arms a continuation recording at the post-loop pc (Phase 1)" {
+    // Phase 1 of nested-loop trace linking (`docs/design/15-nested-loop-linking.md`).
+    // The inner numeric-`for` traces as a root; on its loop-done exit we arm a
+    // *continuation* recording anchored at the **post-inner-loop pc** — a
+    // non-header anchor, the new machinery. That continuation records the outer
+    // body forward and re-reaches the inner `for_prep`, where it aborts (LINNER) —
+    // exactly the point Phase 2 will turn into a `.link`. Nothing commits, so
+    // output is byte-identical to tier-0 (the `expectProgram` matrix pins that
+    // separately); here we prove the continuation genuinely *armed* by observing a
+    // second, distinct `for_prep` abort site (the outer-anchored recording is the
+    // first; the continuation, anchored at the higher post-loop pc, is the second).
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.record_aborts = true; // populate the abort log for inspection
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    // Inner trip count (30) exceeds `min_trip_entry` (24) so the inner trace is
+    // actually *entered* — below it the dispatch declines tier-1 and the loop-done
+    // exit never runs through `irinterp`, so the continuation could not arm.
+    var chunk = try runExecForTrace(&vm, gpa,
+        \\local s = 0
+        \\for i = 1, 40 do
+        \\  for j = 1, 30 do
+        \\    s = s + i * j
+        \\  end
+        \\end
+        \\print(s)
+    , &sink);
+    defer chunk.deinit(); // keep the proto alive: anchors point into it
+
+    // sum(1..40)=820, sum(1..30)=465, 820*465 = 381300.
+    try testing.expectEqualStrings("381300\n", sink.buffered());
+    // The inner loop traced as a root.
+    try testing.expect(vm.trace.cache.items.len >= 1);
+
+    // Two distinct `for_prep` abort sites: the outer-loop-anchored recording AND
+    // the continuation anchored at the post-inner-loop pc. The abort log dedups by
+    // `(anchor_pc, proto, reason, op)`, so two `for_prep` rows ⇒ two distinct
+    // anchors ⇒ the continuation arming path ran.
+    var prep_sites: usize = 0;
+    for (vm.trace.abort_log.items) |r| {
+        if (r.op == .for_prep) prep_sites += 1;
+    }
+    try testing.expect(prep_sites >= 2);
 }
 
 test "executor: a hot numeric-for sum runs via the IR-interpreter (back-edges collapse)" {

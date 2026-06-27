@@ -835,6 +835,19 @@ pub const TraceState = struct {
     /// `countGuardFailure` when a guard-failure crosses `hotguard`; cleared
     /// by `onBackEdge` when the side trace is armed.
     wants_side_trace: ?AnchorKey = null,
+    /// **Nested-loop trace linking (Phase 1).** When non-null, a *continuation*
+    /// recording is pending at this (non-header) anchor — the bytecode PC tier-0
+    /// resumes at after an inner numeric-`for` loop runs to completion (the inner
+    /// loop-done `guard_true`'s recorded `exit_pc`). Unlike a root or side trace,
+    /// this is **not** a back-edge target, so it cannot arm in `onBackEdge`;
+    /// `maybeArmContinuation` sets it on a hot inner loop-done exit and
+    /// `maybeStartContinuation` consumes it in the dispatch prologue the moment
+    /// `cur_pc` reaches the anchor — *after* tier-0 has deopt-replayed the final
+    /// inner iteration, so the continuation records the **outer** body forward, not
+    /// a stray inner iteration. Recording the inner `for_prep` it then re-reaches
+    /// still aborts (LINNER) until Phase 2 turns it into a `.link`. See
+    /// `docs/design/15-nested-loop-linking.md`.
+    pending_exit_anchor: ?AnchorKey = null,
     /// Per-trace execution logs for the visualizer (`execlog.zig`), populated only
     /// when `config.record_exec_log`. Keyed by `trace_id` (cache index). Empty and
     /// untouched on the normal JIT path.
@@ -1049,6 +1062,66 @@ pub const TraceState = struct {
             self.onSideExit(sct, 0);
         }
         return null;
+    }
+
+    /// **Nested-loop continuation arming (Phase 1).** Called on a *productive*
+    /// (`completed > 0`) side-exit of a numeric-`for` trace whose terminal
+    /// loop-continuation `guard_true` failed — i.e. the inner loop ran to
+    /// completion. When that exit lands directly on an *enclosing* loop's
+    /// back-edge instruction (`code[exit_pc]` is a `for_loop`/`tfor_loop`), this is
+    /// a 2-level nest: arm a *continuation* recording anchored at `exit_pc`, the
+    /// post-inner-loop pc, so it records the outer body forward and — once Phase 2
+    /// lands — links back to this inner root instead of unrolling it.
+    ///
+    /// The recording does **not** begin here. tier-0 must first deopt-replay the
+    /// inner loop's final iteration (the productive exit side-exits before
+    /// committing it); `maybeStartContinuation` activates the recording once
+    /// `cur_pc` reaches `exit_pc`, so the recorder's first op is the outer body,
+    /// never a stray inner iteration.
+    ///
+    /// Conservative + self-limiting, and output-preserving: only the
+    /// directly-enclosing-loop shape arms (nsieve's "outer body after the inner
+    /// loop" shape is generalized in Phase 3); an already-traced, gated, or
+    /// already-pending anchor is skipped; and the Phase 1 continuation always
+    /// aborts at the inner `for_prep` (LINNER) — which gates `exit_pc` with
+    /// backoff — so nothing commits and tier-0 output is byte-identical whether or
+    /// not this fires. See `docs/design/15-nested-loop-linking.md`.
+    pub fn maybeArmContinuation(self: *TraceState, failed: *const Trace, exit_instr: u32, proto: *const Proto) void {
+        if (exit_instr == std.math.maxInt(u32)) return; // native: no per-guard pc
+        if (self.rec.active or self.pending_exit_anchor != null) return;
+        const ins = failed.instrs[exit_instr];
+        // Only a loop-continuation `guard_true` failing marks "loop ran to
+        // completion"; a body type-guard (`guard_int`/…) failing is a different,
+        // mid-iteration exit and must not seed a continuation.
+        if (ins.op != .guard_true) return;
+        const exit_pc = guardExitPc(ins) orelse return;
+        if (exit_pc == 0 or exit_pc == failed.anchor.pc) return;
+        if (exit_pc >= proto.code.len) return;
+        // Phase 1 scope: the loop-done exit must land on an enclosing loop's
+        // back-edge (the inner loop is the last statement of the outer body — the
+        // canonical nest). This cheap structural test is deterministic and keeps
+        // standalone hot loops from each arming a speculative post-loop recording.
+        const outer = proto.code[exit_pc].op;
+        if (outer != .for_loop and outer != .tfor_loop) return;
+        const key = AnchorKey{ .proto = proto, .pc = exit_pc };
+        // Don't fight the normal machinery: a trace already cached here, or a gated
+        // anchor (a prior continuation aborted → back off), is left alone.
+        if (self.hasTrace(key) or self.isGated(key)) return;
+        self.pending_exit_anchor = key;
+    }
+
+    /// Dispatch-prologue hook (Phase 1): activate a pending continuation recording
+    /// the instant tier-0 reaches its (non-header) anchor pc. By construction this
+    /// is *after* the inner loop's final-iteration deopt-replay, so the recorder's
+    /// first instruction is the outer body. A no-op (one optional read) when
+    /// nothing is pending — the common case. On allocator OOM the arm is dropped
+    /// (recording simply doesn't start; tier-0 is unaffected).
+    pub fn maybeStartContinuation(self: *TraceState, proto: *const Proto, cur_pc: u32) void {
+        const key = self.pending_exit_anchor orelse return;
+        if (self.rec.active) return; // never clobber an in-flight recording
+        if (key.proto != proto or key.pc != cur_pc) return;
+        self.pending_exit_anchor = null;
+        self.rec.reset(self.gpa, key, proto.num_registers) catch return;
     }
 
     /// Count a guard failure at `exit_pc` within a trace anchored at `anchor`.

@@ -1,172 +1,93 @@
-# CURRENT TASK — JIT pure-builtin tracing (`math.sqrt` → native `sqrtsd`), F0
+# CURRENT TASK — Nested-loop trace linking, Phase 1 (non-header exit-PC anchors)
 
 Governing intent (Bart): close the LuaJIT gap one named technique at a time. The
-string-keyed field lever (H0+H1) landed and is committed (`86f0710`). The next
-chosen lever is **sqrt-from-trace**: make `math.sqrt(x)` inside a hot traced loop
-record a trace instead of aborting `recCall` with `.host_barrier`. Target
-benchmark: **nbody** — its inner loop `local mag = sqrt(dx*dx + dy*dy + dz*dz)`
-records zero traces today; `sqrt` reaches the loop as a loop-invariant upvalue
-(`local sqrt = math.sqrt`). Approved plan:
-`~/.claude/plans/clever-yawning-neumann.md`. Design doc:
-`docs/design/12-pure-builtin-tracing.md`.
+current lever is **nested-loop trace linking** — let an outer loop containing an
+inner numeric-`for` tier up the LuaJIT way (the inner loop is the root trace; its
+loop-done exit spawns a *continuation* side trace that records the outer body and
+links back to the inner root), instead of aborting at the inner `for_prep` and
+running the whole nest on tier-0. Approved 5-phase plan:
+`~/.claude/plans/rosy-noodling-catmull.md`. Design doc:
+`docs/design/15-nested-loop-linking.md` (the proof-obligation contract P1/P2/P4).
 
-Phased: **F0** = identity plumbing + recorder + tier-1a oracle (byte-identical
-across 8 modes + replay, NO speedup, native auto-declines) → **F1** = native
-`sqrtsd` lowering (the speedup).
+This is a **structural JIT-coverage** feature, not codegen tightness. No speedup
+until Phase 4 makes the chain native; Phases 1–3 deliver correctness behind the
+gate. Tasks: #19 (Phase 1), #20 (Phase 2), #21 (Phase 3), #22 (Phase 4).
 
-**Decisive insight:** `math.sqrt` lowers to a SINGLE x86-64 instruction
-`sqrtsd xmm,xmm` — no libm call. This is the `int_of_float` pattern (a
-self-identifying unary IR op → one SSE instruction), NOT a general "call C from
-native" feature. `@sqrt(f64)` (tier-0 / oracle) and `sqrtsd` (native) are IEEE
-correctly-rounded and bit-identical under the default MXCSR (lune never calls
-`fesetround`).
+## Phase 1 — DONE, GREEN (uncommitted, pending Bart approval / commit)
 
-## F0 — DONE, GREEN (uncommitted, pending Bart approval)
+`just test` green (10-mode determinism matrix). Output byte-identical: the
+continuation always **aborts** (LINNER) before committing anything, so arming is
+transparent — discharges **P1**.
 
-`just test` green (`--summary all` → test success). Native auto-declines any
-trace carrying the two new ops (`proveKinds`' existing `else => return false`),
-so the `record_execute_native` mode runs the tier-1a oracle on the body.
+### What Phase 1 does
 
-### Mechanism
+The inner numeric-`for` traces as a root (unchanged). On its **productive**
+loop-done exit (the `for_loop` `guard_true` failing because the loop is
+exhausted, `completed = N > 0`), we arm a **continuation recording anchored at the
+post-inner-loop pc** — a *non-header* anchor, the new machinery. The continuation
+records the outer body forward, re-reaches the inner `for_prep`, and **aborts**
+there. That abort site is exactly where Phase 2's `.link` terminator will go.
+There is NO "close with `.loop`" in a real 2-level nest (the plan's original
+wording was wrong) — the continuation always reaches the inner prep first.
 
-Two new `IrOp`s (appended at the END of the enum, wire-ordinal-stable):
-`guard_pure`=45 (a=callee ref, aux=`@intFromEnum(PureBuiltin)` → callee-identity
-guard, classified `.guard`), `fsqrt`=46 (a=float arg ref, ty=.float → leaf
-producer computing `@sqrt`, classified `.unary` but never folded). Total 47 ops.
+### Mechanism (files touched)
 
-- **`src/function.zig`**: `PureBuiltin` enum `{ sqrt }` (stable replay-safe native
-  identity, never a pointer); `pure: ?PureBuiltin = null` on `Native` + `BaseNative`.
-- **`src/stdlib/math.zig`**: `.pure = .sqrt` on the `math.sqrt` registry row.
-- **`src/interp.zig`** (`defineNative`) + **`src/keyframeser.zig`** (HeapNative
-  restore): copy `pure` through alongside `effect`/`multi` — install and replay can
-  never disagree about what is an inlinable pure builtin.
-- **`src/trace.zig`**: `recCall`'s `.native` arm branches on `nat.pure` (`.sqrt` →
-  `recPureSqrt`, else `.host_barrier`). `recPureSqrt` rejects nargs≠1 / nresults≠1
-  (`.cross_frame`) and a non-float arg (`.bad_type`), then emits
-  `guard_pure(callee)` (deduped via `guarded_refs`) → `guard_float(arg)` →
-  `fsqrt(arg)`, result in the call's dest reg. NO frame push / NO `recReturn` (leaf).
-- **`src/irinterp.zig`**: `guard_pure` side-exits unless the value is a `.native`
-  carrying exactly the `aux` `pure` tag; `fsqrt` = `Value.float(@sqrt(arg))` with a
-  defensive non-float side-exit.
-- **`src/tropt.zig`**: `guard_pure` → `.guard` (dedup aux via `guardKeyAux`);
-  `fsqrt` → `.unary` (hoistable/DCE-able) but explicitly skipped by the constant
-  folder (`if (ins.op != .fsqrt)`), so `@sqrt` is never computed at compile time.
-- **`src/troptdiag.zig`**: both ops added to the single-operand uses-count and
-  consumer-set passes.
-- **`src/nativegen.zig`**: NO new code — `proveKinds`' `else => return false`
-  declines the trace → tier-1a oracle runs (mirrors the H0 decline).
-- **`src/traceser.zig` + `viz/src/enums.ts`**: ordinals 45/46 pinned (count → 47);
-  viz mirrors by position.
+- **`src/trace.zig`**
+  - `TraceState.pending_exit_anchor: ?AnchorKey` — holds a deferred continuation
+    recording at a non-header anchor (one in flight at a time).
+  - `maybeArmContinuation(failed, exit_instr, proto)` — called from the productive
+    side-exit path. Bails on `exit_instr == maxInt` (native: no per-guard pc →
+    arming deferred to Phase 4), on an already-active/pending recording, on a
+    non-`guard_true` exit, on `exit_pc == 0 / == anchor.pc / out of range`, and
+    unless `code[exit_pc]` is a `for_loop`/`tfor_loop` (the enclosing loop). Skips
+    if a trace already exists / the anchor is gated. Otherwise sets
+    `pending_exit_anchor`.
+  - `maybeStartContinuation(proto, cur_pc)` — the activation: when the deferred
+    anchor's pc is reached, `rec.reset(gpa, key, num_registers)` starts recording.
+    `reset` is anchor-PC-agnostic; `reg_map` is seeded **lazily** from the live
+    registers at the exit because `refOf` emits a `slot_load` on first read.
+  - `recForLoop` watermark only fires on `target == anchor.pc`; the continuation's
+    anchor (post-loop pc) ≠ the outer back-edge target, so no watermark — correct.
+- **`src/interp.zig`**
+  - `nextOp` dispatch prologue (`mode == .full` only): if
+    `pending_exit_anchor != null`, call `maybeStartContinuation(proto, cur)`.
+  - Productive-exit path: `maybeArmContinuation(ct, result.exit_instr, proto)`
+    after `onSideExit`.
+  - Productive-exit tail: when `pending_exit_anchor != null`, flip `.fast`→`.full`
+    (`return .switch_mode`) — or `continue :outer` if already `.full` — so the
+    inner loop's final-iteration **deopt-replay** (which walks tier-0 from the
+    inner anchor to the post-loop pc) runs with the `.full`-only activation hook
+    live. Without this the hook never fires in the steady-state `.fast` loop.
 
-### The determinism crux
+### Tests (both green, `src/interp.zig`)
 
-The trace bakes in "callee is sqrt". The `sqrt` upvalue can be reassigned between
-trace entries, so `guard_pure` (in BOTH oracle and native) re-proves the callee is
-still the `sqrt` builtin and side-exits to tier-0 on the same iteration in both
-tiers when it changes. Identity is a `PureBuiltin` enum (never a pointer); replay
-rebinds natives by registry name, so the enum rides the registry and is
-replay-stable. The callee is a once-seeded loop-invariant input → `guard_pure` is
-LICM-hoistable (one check per entry).
+1. `"nested-loop: a 2-deep numeric-for nest is byte-identical across all modes
+   (Phase 1)"` — `expectProgram` 10-mode output gate (`381300\n`), pins P1.
+2. `"nested-loop: a hot inner loop arms a continuation recording at the post-loop
+   pc (Phase 1)"` — `runExecForTrace` (hotloop=4, `record_aborts` on) asserting a
+   **second, distinct `for_prep` abort site** exists (the continuation anchored at
+   the post-loop pc, ≠ the outer-anchored recording) — proves the continuation
+   genuinely armed, which the output test alone cannot.
 
-### Tests (all green)
+### Gotcha worth remembering
 
-- **Recorder units (`trace.zig`):** `recPureSqrt: sqrt(float)` asserts the
-  `slot_load → guard_pure → slot_load → guard_float → fsqrt` order, `guard_pure.a`
-  = seeded callee ref, `guard_pure.aux == @intFromEnum(.sqrt)`, `fsqrt.a` = arg
-  ref, `fsqrt.ty == .float`, and the call dest holds the `fsqrt` result.
-  Abort units: `sqrt(a,b)` / `x,y=sqrt(a)` → `.cross_frame`; int arg →
-  `.bad_type`; a non-pure native (`print`-shaped) → `.host_barrier`.
-- **8-mode `expectProgram` (`interp.zig`):** a float-reduction sqrt loop
-  (`3472.556388576408`); a rebound-upvalue guard_pure deopt
-  (`3472.556388576408\n45450`); the NaN / `-0.0` edge cases (`-nan\n-0`) — all
-  byte-identical across {stress × {off, record-only, no-opt, record-execute,
-  native}} + keyframe restore.
+`min_trip_entry = 24`: an inner loop with fewer than 24 trips is **declined** at
+tier-1 entry, so its loop-done exit never runs through `irinterp` and the
+continuation cannot arm. The tests use a 30-trip inner loop so the inner trace is
+genuinely entered. (First test draft used a 12-trip inner loop → arming never
+fired → `prep_sites >= 2` failed.)
 
-### Manual end-to-end verification (rebuilt CLI)
+## Next — Phase 2 (task #20, blocked by #19)
 
-- `/tmp/sq1.lua` (float-reduction) `--dump-traces` shows `guard_pure %1 [sqrt]`
-  and `fsqrt`. `/tmp/sq3b.lua` records 2 fsqrt traces (NaN + -0.0 loops).
+Link terminator (`.link`) + snapshot hand-off (P2, the load-bearing invariant):
+`assertWellFormed`/`commit`/`tropt` accept `.link` as a valid terminal; the
+continuation records `for_prep`'s subtract (`R[a] = init − step`) then emits
+`.link` to the inner root instead of recording the inner `for_loop`. Convert the
+current LINNER abort into the link. Watermark guard. Land green at tier-1a.
 
-### Pending (F0)
+## Uncommitted tree
 
-Codex + Antigravity review (determinism of the `PureBuiltin` identity guard, the
-`@sqrt`≡`sqrtsd` bit-equality, abort coverage), then surface to Bart and request
-commit approval (Rule #15 — no commit without explicit approval).
-
-## F1 — DONE, GREEN (uncommitted, pending Bart approval)
-
-`just test` green. Native `sqrtsd` lowering landed; F0 decline removed.
-
-### Mechanism (F1)
-
-- **`src/x64.zig`**: `sqrtsdRegReg`/`sqrtsdRegMem` (`F2 0F 51 /r`) + two encoding tests.
-- **`src/nativegen.zig`**:
-  - New `Kind.native` for the callee-snapshot slot (a heap native pointer, GP home
-    like `.func`/`.ptr`).
-  - `proveKinds`: a `pure_guarded` pass marks the `guard_pure`-covered slot_load
-    `.native` (parallel to `func_guarded`); `guard_pure` → `.none`; `fsqrt` →
-    `.float` iff operand proven float.
-  - `SlotInfo.pure_tag` carries the recorded `PureBuiltin` ordinal; `analyzeInner`
-    stashes it from the covering `guard_pure` (mirrors the `func_id` stash, with the
-    same two-guards-disagree bail).
-  - **Prologue** checks each `.native` slot ONCE (like `guard_func`, NOT via LICM):
-    `header.type==native` ∧ `[native+pure]==tag` ∧ `[native+pure+1]==1`. The
-    `?PureBuiltin` field is 2 bytes `[payload, has_value]` (verified empirically); two
-    byte compares avoid needing a 16-bit-immediate compare encoder. Miss →
-    `prologue_fail` (returns 0, side-exits to tier-0).
-  - **Body**: `guard_pure` joins the hoisted no-ops; `fsqrt` = `floatOperandToXmm`
-    (stage arg into xmm0) + `sqrtsdRegReg(xmm0,xmm0)` + store to the float home. No
-    body side-exit (a stale callee is caught by the hoisted prologue guard).
-  - `isTransient`/`operandReads` updated; `else => return false` decline removed for
-    the two ops. `Kind.native` added to the two `guard_true/false` unreachable lists.
-
-### Verification (F1)
-
-- `--dump-native` on a sustained sqrt loop shows `f2 0f 51 c0` (`sqrtsd xmm0,xmm0`).
-- Native ≡ tier-0 on the float-reduction loop (`59650.633125239394`) and the
-  rebound-upvalue deopt (`7464.5342420517045\n125750` — guard_pure prologue side-exits
-  to tier-0 when `sqrt` is reassigned, tier-0 runs the new closure).
-- **Measure:** sustained `s += sqrt(i*1.0)` (5e7 iters): tier-0 **1.39 s** →
-  `--jit-native` **0.37 s** (**3.8×**); LuaJIT 0.07 s.
-- **nbody is UNCHANGED** (`bench` N=50000: t0 286 ms → jit 285 ms): it records ZERO
-  traces because its inner `for j=i+1,nbody` loop has trip count ≤4 (nbody=5), too
-  short to trip the back-edge hotcount. The sqrt abort *was* a real blocker (a
-  sustained copy of the inner body now records + compiles native), but the
-  short-trip-count blocker is independent and out of this lever's scope — a future
-  lever. Recorded honestly in doc 12.
-
-### Review (F1) — DONE, both reviewers signed off
-
-Codex + Antigravity both reviewed the F1 diff: **no P0/P1 correctness or determinism
-bugs**. Both confirmed (1) the native `guard_pure` prologue check (header.type==native,
-flag byte==1, payload==recorded tag) is byte-identical to the oracle's `guard_pure`
-arm in `irinterp.zig` — no 8-mode divergence; (2) the `?PureBuiltin` 2-byte
-`[payload, has_value]` layout + `@offsetOf(Native,"pure")` base are correct on the
-pinned toolchain (Native's header is field 0, so the native pointer == `*GcHeader`);
-(3) `@sqrt` ≡ `sqrtsd` bit-for-bit under default MXCSR (verified `-0.0`, negatives→qNaN,
-`±inf`, subnormals); (4) hoisting `guard_pure` to the prologue is safe — a reassigned
-callee local becomes a `.carried` non-scalar slot and bails to tier-1a, and
-`set_upval`/`set_global`/storing-a-native-to-a-table all abort recording; (5) the
-fsqrt body lowering is sound.
-
-**Hardening applied from the shared low-priority suggestion:**
-- `comptime` assert `@sizeOf(?PureBuiltin) == 2` next to `NATIVE_PURE_OFF`, plus a new
-  runtime test (`nativegen: ?PureBuiltin is laid out [payload, has_value] …`) pinning
-  the payload@+0 / flag@+1 byte order the prologue depends on — a future toolchain
-  optional-layout change now fails the build/test instead of silently miscompiling.
-  (The byte *order* can't be comptime-asserted — an optional has no well-defined
-  comptime layout to deref — so it lives in the runtime test.)
-- Fixed a stale `floatOperandToXmm` unreachable comment to mention `.native`; passed
-  `.float` literally to the fsqrt `floatOperandToXmm` to match the `int_of_float` sibling.
-
-Gate still green after the additions.
-
-### Pending (F1)
-
-Surface to Bart and request commit approval (Rule #15 — no commit without explicit
-approval).
-
-## Stdlib inventory
-
-Untouched — F0 is a JIT recorder change. `math.sqrt` stays `status=implemented`
-(`docs/lua-stdlib-inventory.csv:74`).
+Modified (mine): `src/trace.zig`, `src/interp.zig`,
+`docs/design/15-nested-loop-linking.md`. Untracked files (CURRENT_TASK_E3.md,
+SESSION_CHANGES.md, bench/results/*.tsv, check_ordinals) belong to other agents —
+**do NOT stage**.

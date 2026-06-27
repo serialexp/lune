@@ -1,6 +1,6 @@
 # Nested-Loop Trace Linking — Design
 
-Status: draft, not yet implemented — Phases 1–4 outstanding
+Status: partial — Phase 1 (non-header exit-PC anchors) landed; Phases 2–4 outstanding
 Owner: Bart
 Last updated: 2026-06-27
 
@@ -28,13 +28,23 @@ land; move whole sections to Done once everything inside is checked.
 - [x] **Foundational (pre-existing, kept).** The `for_prep` LINNER abort already
   matches LuaJIT's root-trace-hits-inner-loop behaviour and is retained, not
   removed (see §The mechanism, step 1).
+- [x] **Phase 1 — Non-header (exit-PC) anchors.** `TraceState.pending_exit_anchor`
+  + `maybeArmContinuation` (on a productive inner loop-done exit) +
+  `maybeStartContinuation` (a `.full`-mode dispatch-prologue activation hook that
+  seeds `reg_map` lazily from the live registers at the post-loop pc via
+  `refOf`/`slot_load`). The productive-exit tail flips `.fast`→`.full`
+  (`switch_mode`) so the inner loop's final-iteration deopt-replay reaches the
+  post-loop pc with the hook live. The continuation records the outer body forward
+  and re-reaches the inner `for_prep`, where it **aborts (LINNER)** — there is no
+  "close with `.loop`" in a real 2-level nest (the recording always reaches the
+  inner prep before returning to its own anchor); that abort site is exactly where
+  Phase 2's `.link` goes. Native arming deferred (native loop-done exits carry
+  `exit_instr = maxInt`, no per-guard pc) to Phase 4. Discharged **P1**: pinned by
+  an `expectProgram` 10-mode output-invariance test plus a focused
+  `runExecForTrace` test asserting a second, distinct `for_prep` abort site (the
+  continuation, anchored at the post-loop pc) actually arms.
 
 ### Outstanding
-
-- [ ] **Phase 1 — Non-header (exit-PC) anchors.** `armAtExitPc` + seed `reg_map`
-  from the live registers at an arbitrary exit PC; trigger a continuation
-  recording on a hot inner **loop-done** exit. Continuation trace records the
-  outer body and closes with a normal `.loop` (no link yet). Discharge **P1**.
 - [ ] **Phase 2 — Link terminator + snapshot hand-off.** New `.link` IR
   terminator (accepted by `assertWellFormed`, preserved by `commit`/`tropt`);
   continuation recording records `for_prep`'s subtract then links to the inner
