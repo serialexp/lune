@@ -2972,8 +2972,12 @@ pub const Vm = struct {
                 // `set_index2` path stores grid cells; everything else deflates, so a
                 // `row_view` never escapes.
                 if (t.array.isGrid()) try self.heap.deflateGrid(t);
-                // A present (non-nil) raw key bypasses `__newindex`.
-                if (!t.get(key).isNil()) {
+                // A present (non-nil) raw key bypasses `__newindex`. With no
+                // metatable there is no `__newindex` at all, so the presence probe
+                // is pure waste — both branches below just raw-store. Short-circuit
+                // it (the `or` skips `t.get`) so a plain `t[i] = v` never pays a
+                // redundant `Table.get` per store on the hot array-build path.
+                if (t.metatable == null or !t.get(key).isNil()) {
                     try t.set(self.gpa, key, val);
                     self.heap.writeBarrier(&t.header, val); // no-op until Phase 4
                     return;

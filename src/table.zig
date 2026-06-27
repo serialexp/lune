@@ -121,6 +121,10 @@ pub const Table = struct {
         const nk = normalizeKey(key);
         if (nk.isInt()) return self.getInt(nk.asInt());
         if (nk.isNil()) return Value.nil();
+        // No hash part → the key can't be hash-resident. The Zig hashmap's own
+        // `size == 0` short-circuit lives behind a non-inlined call; checking the
+        // inline `count()` here skips that call entirely on the hot array path.
+        if (self.hash.count() == 0) return Value.nil();
         return self.hash.get(nk) orelse Value.nil();
     }
 
@@ -138,6 +142,10 @@ pub const Table = struct {
                 return Value.rowView(@constCast(&self.header), @intCast(i - 1));
             return self.array.get(@intCast(i));
         }
+        // Out of array range: only the hash part can hold this key. Skip the
+        // (non-inlined) hashmap call when there is no hash part — the common case
+        // on an array being built/read by contiguous integer keys.
+        if (self.hash.count() == 0) return Value.nil();
         return self.hash.get(Value.int(i)) orelse Value.nil();
     }
 
@@ -279,6 +287,10 @@ pub const Table = struct {
     /// After extending the array part, absorb any now-contiguous successor keys
     /// that were sitting in the hash part.
     fn migrateFromHash(self: *Table, gpa: std.mem.Allocator) Error!void {
+        // Nothing in the hash part can be a contiguous successor if the hash part
+        // is empty — and a sequential array build keeps it empty. This inline
+        // guard keeps every such append off the non-inlined hashmap probe.
+        if (self.hash.count() == 0) return;
         while (true) {
             const next = Value.int(@as(i64, @intCast(self.array.len)) + 1);
             const v = self.hash.get(next) orelse break;
