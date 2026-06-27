@@ -231,6 +231,27 @@ fn intLaneWidth(aux: i32) u8 {
     return if (aux == I8_LANE or aux == U8_LANE) 1 else if (aux == I16_LANE) 2 else if (aux == I32_LANE) 4 else if (aux == I64_LANE) 8 else unreachable;
 }
 
+/// True when SSA ref `r` is a `.konst` whose value statically fits the lane named
+/// by `aux`. A *constant* int-lane array store needs no runtime `guard_fits`: the
+/// recorder only emits the store when the value fit the lane (`recArraySet`'s
+/// `array.fits` precondition), and a constant never changes — so tropt proves the
+/// `guard_fits` always-passes and folds it away (`tropt` const-eval via the same
+/// `laneFits`). Native then sees no covering `guard_fits` and would bail the whole
+/// trace to tier-1a; re-derive the static fit here with the identical `laneFits`
+/// rule so a constant int-lane fill/init store (`p[i]=0`, `a[k]=7`) compiles to
+/// native instead. Narrow lanes (i8…i32/u8) range-check the constant; the i64 lane
+/// fits every int. Mirrors the f64 arm, which already compiles a const-fill whose
+/// guard_fits tropt DCE'd. A *variant* (non-const) narrow-lane value keeps its
+/// guard_fits (tropt can't prove it always fits), so it takes the `fits_ok` path,
+/// not this one.
+fn konstFitsLane(t: *const Trace, r: trace.Ref, aux: i32) bool {
+    if (r >= t.instrs.len) return false;
+    const ki = t.instrs[r];
+    if (ki.op != .konst) return false;
+    if (ki.aux < 0 or ki.aux >= t.consts.len) return false;
+    return arr.ArrayPart.laneFits(@enumFromInt(aux), t.consts[@intCast(ki.aux)]);
+}
+
 /// Enforce that every lane-bearing op in a trace (`guard_lane`/`aref`/`aload`/
 /// `astore`) names the SAME lane. The prologue checks the runtime array lane
 /// once against the `guard_lane` ordinal; tying the per-op `aux` to that single
@@ -809,10 +830,15 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                     },
                     .int => {
                         // int lane (i8…i64): the value must be a proven int AND
-                        // covered by a guard_fits (so native may store it at the
-                        // lane width without the widening tier-0 would otherwise do).
+                        // provably fit the lane width, so native may store it at the
+                        // lane width without the widening tier-0 would otherwise do.
+                        // Fit is established by a covering guard_fits (a free-variable
+                        // store) OR, when tropt folded that guard away because the
+                        // value is a constant that trivially fits, by re-deriving the
+                        // static fit here (a const fill/init store) — mirrors the f64
+                        // arm below.
                         if (kinds[ins.b] != .int) return false;
-                        if (!fits_ok[ins.b]) return false;
+                        if (!fits_ok[ins.b] and !konstFitsLane(t, ins.b, ins.aux)) return false;
                     },
                     .float => {
                         // f64 lane: the value need only be a proven float. The store is
@@ -864,7 +890,9 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                     .bool => if (kinds[ins.b] != .bool) return false,
                     .int => {
                         if (kinds[ins.b] != .int) return false;
-                        if (!fits_ok[ins.b]) return false; // guard_fits ⇒ width store is exact
+                        // guard_fits ⇒ width store is exact; or a constant whose fit
+                        // tropt proved and folded away (const fill append, `p[i]=0`).
+                        if (!fits_ok[ins.b] and !konstFitsLane(t, ins.b, ins.aux)) return false;
                     },
                     // f64 append is intentionally not lowered in this cut: the recorder's
                     // append gate (`recArraySet`) excludes the f64 lane, so no f64
@@ -5628,6 +5656,75 @@ test "nativegen: int-lane t[k]=C write matches the interpreter (i8/i16/i32/i64)"
         try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
         try expectTablesEqual(t_o, t_n, K);
         // Sanity: every present slot 2..K now reads the stored constant.
+        var k: i64 = 2;
+        while (k <= K) : (k += 1) try testing.expectEqual(C, t_n.getInt(k).asInt());
+    }
+}
+
+/// Like `intWriteTrace` but with NO `guard_fits` on the stored constant — exactly
+/// the IR tropt hands native after it proves the (constant) store value fits the
+/// lane and DCEs the always-pass guard. Native must re-derive the static fit
+/// (`konstFitsLane`) and compile rather than bail to tier-1a.
+fn intWriteTraceNoFits(full: *[13]I, consts: *[2]Value, es: *[0]u16, lane: i32, store_const: i64) Trace {
+    consts.* = .{ Value.int(store_const), Value.int(1) };
+    full.* = .{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .konst, .aux = 0 }, // 7: C  (guard_fits folded away by tropt)
+        .{ .op = .astore, .a = 5, .b = 7, .aux = lane }, // 8: t[index] = C
+        .{ .op = .konst, .aux = 1 }, // 9: 1
+        .{ .op = .add, .a = 3, .b = 9 }, // 10: index + 1
+        .{ .op = .phi, .b = 10, .aux = 1 }, // 11: index carry
+        .{ .op = .loop }, // 12
+    };
+    return Trace{ .anchor = undefined, .instrs = full, .consts = consts, .entry_slots = es, .entry_guards = &.{} };
+}
+
+test "nativegen: const int-lane t[k]=C write compiles WITHOUT a guard_fits (tropt-DCE'd) and matches the interpreter" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const K: i64 = 48;
+
+    const Cfg = struct { lane: arr.Lane, bump: i64 };
+    const cfgs = [_]Cfg{
+        .{ .lane = .i8, .bump = 100 }, // narrow: konstFitsLane range-checks
+        .{ .lane = .i16, .bump = 1000 },
+        .{ .lane = .i32, .bump = 100_000 },
+        .{ .lane = .i64, .bump = 5_000_000_000 }, // wide: every int fits
+    };
+
+    for (cfgs) |cfg| {
+        const lane: i32 = @intFromEnum(cfg.lane);
+        const C: i64 = -7; // fits every lane above
+        var full: [13]I = undefined;
+        var consts: [2]Value = undefined;
+        var es: [0]u16 = undefined;
+        const tr = intWriteTraceNoFits(&full, &consts, &es, lane, C);
+
+        const t_o = try buildIntTable(gpa, K, cfg.bump);
+        defer t_o.destroy(gpa);
+        try testing.expectEqual(cfg.lane, t_o.array.lane);
+        var oregs = [_]Value{ Value.heap(&t_o.header), Value.int(2) };
+        const ovals = try gpa.alloc(Value, tr.instrs.len);
+        defer gpa.free(ovals);
+        const oresult = irinterp.executeValues(&tr, &oregs, ovals);
+
+        const t_n = try buildIntTable(gpa, K, cfg.bump);
+        defer t_n.destroy(gpa);
+        var nregs = [_]Value{ Value.heap(&t_n.header), Value.int(2) };
+        // The whole point: compile() must NOT bail just because guard_fits is absent.
+        var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+        defer ct.deinit();
+        const ncomp = try runNative(ct, &nregs);
+
+        try testing.expectEqual(oresult.completed, ncomp);
+        try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
+        try expectTablesEqual(t_o, t_n, K);
         var k: i64 = 2;
         while (k <= K) : (k += 1) try testing.expectEqual(C, t_n.getInt(k).asInt());
     }
