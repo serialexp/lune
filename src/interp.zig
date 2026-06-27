@@ -1617,12 +1617,19 @@ pub const Vm = struct {
 
     /// May the dispatch loop run with the off-by-default prologue hooks compiled
     /// out? Only when none is live: no pending suspend cut, no replay line
-    /// recording, and not mid-trace-recording. The GC safepoint is *not* gated on
-    /// here — `.fast` keeps it, so `gc_stress` stays correct without forcing
-    /// `.full`. These three flags are stable across an `exec` invocation except
-    /// `isRecording()`, which can only arm at a back-edge and is caught there.
+    /// recording, not mid-trace-recording, and no continuation recording pending
+    /// activation. The GC safepoint is *not* gated on here — `.fast` keeps it, so
+    /// `gc_stress` stays correct without forcing `.full`. These flags are stable
+    /// across an `exec` invocation except `isRecording()` (arms at a back-edge,
+    /// caught there) and `pending_exit_anchor` (set on a productive side-exit): a
+    /// pending continuation must hold `.full` so the dispatch-prologue activation
+    /// hook (`maybeStartContinuation`, `.full`-only) fires when tier-0's
+    /// final-iteration deopt-replay reaches the non-header anchor pc. The window is
+    /// short — the hook consumes the pending anchor at the very next reach of that
+    /// pc — after which `.fast` resumes.
     inline fn runFastPath(self: *const Vm) bool {
-        return !(self.suspend_ctl != null or self.record_safepoint_lines or self.trace.isRecording());
+        return !(self.suspend_ctl != null or self.record_safepoint_lines or
+            self.trace.isRecording() or self.trace.pending_exit_anchor != null);
     }
 
     /// Per-instruction prologue + fetch for the threaded dispatch loop, factored
@@ -9343,21 +9350,22 @@ fn expectTier0Equiv(source: [:0]const u8) !void {
     try testing.expectEqualStrings(s0.buffered(), s1.buffered());
 }
 
-test "nested-loop: a hot inner loop arms a continuation recording at the post-loop pc (Phase 1)" {
-    // Phase 1 of nested-loop trace linking (`docs/design/15-nested-loop-linking.md`).
+test "nested-loop: a hot inner loop's continuation links to the inner root at the inner for_prep (Phase 2)" {
+    // Phase 2 of nested-loop trace linking (`docs/design/15-nested-loop-linking.md`).
     // The inner numeric-`for` traces as a root; on its loop-done exit we arm a
-    // *continuation* recording anchored at the **post-inner-loop pc** — a
-    // non-header anchor, the new machinery. That continuation records the outer
-    // body forward and re-reaches the inner `for_prep`, where it aborts (LINNER) —
-    // exactly the point Phase 2 will turn into a `.link`. Nothing commits, so
-    // output is byte-identical to tier-0 (the `expectProgram` matrix pins that
-    // separately); here we prove the continuation genuinely *armed* by observing a
-    // second, distinct `for_prep` abort site (the outer-anchored recording is the
-    // first; the continuation, anchored at the higher post-loop pc, is the second).
+    // *continuation* recording anchored at the **post-inner-loop pc** — a non-header
+    // anchor (the Phase 1 machinery). That continuation records the outer body
+    // forward and re-reaches the inner `for_prep`; because the inner root is already
+    // cached, Phase 2 records `for_prep`'s pre-decrement and **closes the trace with
+    // a `.link`** to the inner root (instead of the Phase 1 LINNER abort). The link
+    // trace is cached but never *executed* in Phase 2 (`tryChainExit` skips it, and
+    // its post-loop anchor pc is not a back-edge target the dispatch loop enters), so
+    // output stays byte-identical to tier-0 — the `expectProgram` matrix pins that
+    // separately. Here we prove the link committed by finding a `.link`-terminated
+    // trace in the cache alongside the inner `.loop` root.
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    vm.trace.config.record_aborts = true; // populate the abort log for inspection
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     // Inner trip count (30) exceeds `min_trip_entry` (24) so the inner trace is
@@ -9376,18 +9384,34 @@ test "nested-loop: a hot inner loop arms a continuation recording at the post-lo
 
     // sum(1..40)=820, sum(1..30)=465, 820*465 = 381300.
     try testing.expectEqualStrings("381300\n", sink.buffered());
-    // The inner loop traced as a root.
-    try testing.expect(vm.trace.cache.items.len >= 1);
 
-    // Two distinct `for_prep` abort sites: the outer-loop-anchored recording AND
-    // the continuation anchored at the post-inner-loop pc. The abort log dedups by
-    // `(anchor_pc, proto, reason, op)`, so two `for_prep` rows ⇒ two distinct
-    // anchors ⇒ the continuation arming path ran.
-    var prep_sites: usize = 0;
-    for (vm.trace.abort_log.items) |r| {
-        if (r.op == .for_prep) prep_sites += 1;
+    // The cache holds the inner `.loop` root AND the continuation `.link` trace.
+    var loop_traces: usize = 0;
+    var link_traces: usize = 0;
+    for (vm.trace.cache.items) |t| {
+        try testing.expect(t.instrs.len >= 1);
+        switch (t.instrs[t.instrs.len - 1].op) {
+            .loop => loop_traces += 1,
+            .link => link_traces += 1,
+            else => {},
+        }
     }
-    try testing.expect(prep_sites >= 2);
+    try testing.expect(loop_traces >= 1); // the inner numeric-for root
+    try testing.expect(link_traces >= 1); // the continuation linked, not aborted
+
+    // The link trace's terminator carries the inner root's anchor pc, and that pc
+    // really is the anchor of a cached root trace (the hand-off target — P2).
+    for (vm.trace.cache.items) |t| {
+        const term = t.instrs[t.instrs.len - 1];
+        if (term.op != .link) continue;
+        const inner_pc: u32 = @intCast(term.aux);
+        var found_root = false;
+        for (vm.trace.cache.items) |r| {
+            if (r.anchor.proto == t.anchor.proto and r.anchor.pc == inner_pc and
+                r.instrs[r.instrs.len - 1].op == .loop) found_root = true;
+        }
+        try testing.expect(found_root);
+    }
 }
 
 test "executor: a hot numeric-for sum runs via the IR-interpreter (back-edges collapse)" {

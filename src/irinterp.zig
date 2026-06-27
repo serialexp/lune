@@ -632,6 +632,16 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 // pass it falls through as a no-op; on later iterations it (and the
                 // whole region before it) is skipped by the `body_start` guard above.
                 .preheader => {},
+
+                // ---- link: terminal hand-off to an inner root trace (doc 15) ----
+                // Phase 2 executes this as a **clean zero-commit side-exit**: break
+                // with `completed` unchanged (a continuation has no back-edge, so this
+                // is 0) and apply *no* φ writeback, so the registers stay exactly as the
+                // outer body left them and tier-0 redoes the iteration from the anchor
+                // byte-identically (discharges the fall-through half of P2). Phase 3
+                // teaches the executor to instead *follow* the link: run the inner root
+                // anchored at `aux`, then ping-pong inner-root ⇄ continuation.
+                .link => break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) },
             }
         }
         // A well-formed trace always terminates in `loop` (checked by the

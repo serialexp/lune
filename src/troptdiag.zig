@@ -156,7 +156,9 @@ fn detectDeadCarries(
                 uses[ins.b] += 1; // the update is always a use
                 if (ins.aux == trace.PHI_INTERNAL) uses[ins.a] += 1; // internal phi uses its init
             },
-            .slot_load, .konst, .loop, .preheader => {},
+            // `.link` (doc 15) carries no operand refs (`aux` is the inner anchor pc),
+            // so like `.loop`/`.preheader` it contributes no uses.
+            .slot_load, .konst, .loop, .preheader, .link => {},
         }
     }
 
@@ -263,7 +265,8 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             .aref, .astore, .astore_append, .href, .hstore,
             .garow, .gcell, .gstore, .guard_gcol => ins.a == idx or ins.b == idx,
             .phi => (ins.aux == trace.PHI_INTERNAL and ins.a == idx) or ins.b == idx,
-            .slot_load, .konst, .loop, .preheader => false,
+            // `.link` (doc 15) consumes no refs (`aux` is the inner anchor pc).
+            .slot_load, .konst, .loop, .preheader, .link => false,
         };
         if (consumes) {
             found_consumer = true;

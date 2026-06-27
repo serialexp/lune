@@ -403,6 +403,26 @@ pub const IrOp = enum(u8) {
     /// `!array.gridGet(row-1,col-1).isNil()`; tier-1b `bt`s the presence bitmap at
     /// the flat index. Produces no value; never DCE'd. Classified `.guard`. Appended last.
     guard_gpresent,
+    // ---- nested-loop trace linking (doc 15, Phase 2) --------------------------
+    /// Terminal **link** to an inner root trace — the lune analogue of LuaJIT's
+    /// `LJ_TRLINK_ROOT`. Emitted *instead of* `.loop` to close a *continuation*
+    /// trace (one anchored at a non-header exit pc, recording the outer body) when,
+    /// going forward, it re-reaches an inner numeric-`for`'s `for_prep` whose loop
+    /// header **already has a root trace**. The recorder records `for_prep`'s
+    /// pre-decrement (`R[a] = init − step`) as the final body op, then this
+    /// terminator hands control to the inner root anchored at `aux` (a bytecode pc
+    /// in the *same* proto — replay-safe, never a pointer). Carries no operand refs
+    /// (`a`/`b` unused). Structurally a terminal exactly like `.loop`: exactly one,
+    /// last in the trace, with the φ block immediately preceding it as the
+    /// register hand-off snapshot.
+    ///
+    /// Phase 2 executes it as a **clean zero-commit side-exit**: the executor
+    /// breaks at `.link` with `completed` unchanged and applies *no* φ writeback,
+    /// so tier-0 redoes the iteration from the anchor (byte-identical fall-through).
+    /// Phase 3 makes tier-1a *follow* the link (run the inner root, ping-pong);
+    /// Phase 4 lowers it to a native-to-native chain. Appended last so every prior
+    /// op's wire ordinal stays stable.
+    link,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -1053,6 +1073,14 @@ pub const TraceState = struct {
             // it cannot be entered through the chain path. Skip it — it still runs
             // via the normal seeded same-anchor walk.
             if (sct.inputs.len != 0) continue;
+            // Phase 2 (doc 15): a continuation trace closes with a `.link` terminator,
+            // but the executor cannot yet *follow* the link. Running it straight
+            // through would execute the outer body's sunk stores and then fall through
+            // at `.link` with `completed == 0`, double-applying those stores when
+            // tier-0 redoes the iteration from the anchor. Until Phase 3 teaches the
+            // chain to follow the link (run the inner root, ping-pong), never enter a
+            // link trace — it stays cached but inert, so output is byte-identical.
+            if (sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link) continue;
             const sbuf = self.valuesScratch(sct.instrs.len) catch continue;
             const sresult = irinterp.execute(sct, regs, sbuf);
             if (sresult.completed > 0) {
@@ -1122,6 +1150,10 @@ pub const TraceState = struct {
         if (key.proto != proto or key.pc != cur_pc) return;
         self.pending_exit_anchor = null;
         self.rec.reset(self.gpa, key, proto.num_registers) catch return;
+        // Mark this recording a continuation so `recForPrepLink` may close it with a
+        // `.link` at the inner `for_prep` (a root recording, armed via `arm`, leaves
+        // this false and instead LINNER-aborts there — LuaJIT's model).
+        self.rec.is_continuation = true;
     }
 
     /// Count a guard failure at `exit_pc` within a trace anchored at `anchor`.
@@ -1554,13 +1586,25 @@ pub const TraceState = struct {
                 .ty = self.rec.instrs.items[s.ref].ty,
             });
         }
-        try self.rec.instrs.append(self.gpa, .{ .op = .loop });
+        // Terminal: a continuation that re-reached an inner root closes with a
+        // `.link` hand-off (doc 15, Phase 2) carrying the inner anchor pc in `aux`;
+        // every other trace closes with the back-edge `.loop`. The φ block above is
+        // the register hand-off snapshot in either case.
+        if (self.rec.link_target) |lt| {
+            try self.rec.instrs.append(self.gpa, .{ .op = .link, .aux = @intCast(lt) });
+        } else {
+            try self.rec.instrs.append(self.gpa, .{ .op = .loop });
+        }
 
         const instrs = self.rec.instrs.items;
         const consts = self.rec.consts.items;
         const entry = self.rec.entry_slots.items;
 
-        const fields: tropt.Optimized = if (self.config.optimize)
+        // Link traces are cached **unoptimized**: `tropt.optimize` asserts a `.loop`
+        // terminal (and its LICM/φ machinery is written for back-edge loops), and a
+        // Phase-2 link trace is never executed anyway (see `tryChainExit`), so there
+        // is nothing to optimize. `dupe` preserves the `.link` terminal verbatim.
+        const fields: tropt.Optimized = if (self.config.optimize and self.rec.link_target == null)
             tropt.optimize(self.gpa, instrs, consts) catch |e| switch (e) {
                 // Never fail a commit (or thrash the anchor) over an optimizer
                 // allocation failure: cache the unoptimized trace instead.
@@ -1658,12 +1702,18 @@ pub const TraceState = struct {
     fn assertWellFormed(instrs: []const IrInstr, consts_len: usize, num_registers: usize, input_limit: usize) void {
         std.debug.assert(instrs.len >= 1);
         const last = instrs.len - 1;
-        std.debug.assert(instrs[last].op == .loop);
+        // The trace terminates in exactly one terminal: `.loop` (root/continuation
+        // back-edge) or `.link` (continuation hand-off to an inner root, doc 15).
+        std.debug.assert(instrs[last].op == .loop or instrs[last].op == .link);
         for (instrs, 0..) |ins, i| {
             switch (ins.op) {
                 .slot_load => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < input_limit),
                 .konst => std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len),
                 .loop => std.debug.assert(i == last), // the only loop, and it is terminal
+                // `.link` (doc 15): terminal hand-off to an inner root. Like `.loop`
+                // it is the sole terminal; `aux` is the inner anchor pc, not an
+                // operand ref, so nothing to bound-check beyond terminality.
+                .link => std.debug.assert(i == last),
                 // binary ops read both `a` and `b`.
                 .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => {
                     std.debug.assert(ins.a < i and ins.b < i);
@@ -1782,6 +1832,14 @@ pub const TraceState = struct {
             .jmp => {}, // straight-line trace: control flow is implicit.
             .jmp_if_false, .jmp_if_true => try self.recBranch(instr, regs),
             .for_loop => try self.recForLoop(instr, regs, pc),
+            // Nested-loop trace linking (doc 15, Phase 2). A continuation recording
+            // re-reaching an inner numeric-`for`'s `for_prep` whose loop header
+            // already has a root trace records `for_prep`'s pre-decrement and closes
+            // with a `.link` to that root, instead of unrolling the inner loop.
+            // When no inner root exists yet (or the shape isn't linkable), this falls
+            // back to the historical LINNER abort (`.nyi_opcode`) — byte-identical to
+            // before — so the inner loop spawns its own root first.
+            .for_prep => try self.recForPrepLink(instr, regs, proto, pc),
 
             // Cross-frame tracing: inline a Lua callee's body straight into the
             // trace (LuaJIT-style `lj_record_call`/`lj_record_ret`). A host
@@ -2620,6 +2678,79 @@ pub const TraceState = struct {
         self.setReg(a + 3, rnext);
     }
 
+    /// `for_prep` (numeric-for entry): the nested-loop **trace-link** site (doc 15,
+    /// Phase 2 — the lune analogue of LuaJIT's `rec_loop_jit` / `LJ_TRLINK_ROOT`).
+    ///
+    /// A `for_prep` pre-decrements its index (`R[a] = init − step`) and jumps forward
+    /// to the matching `for_loop`, whose back-edge target is the loop body start —
+    /// which is exactly `for_prep`'s *post-increment* pc (`pc` here), so the inner
+    /// loop's **root-trace anchor pc == `pc`**. If a root trace is already cached
+    /// there, this recording (a continuation that fell out of the inner loop and
+    /// recorded the outer body forward) records the pre-decrement and **links** to
+    /// the inner root instead of recording the inner `for_loop`/unrolling. Otherwise
+    /// it aborts `.nyi_opcode` (LINNER): let the inner loop spawn its own root first.
+    /// The decision is a pure function of the cache + bytecode (no clock/RNG/address),
+    /// so it is identical across every record/exec mode — P1 carries to P2.
+    ///
+    /// **P2 (the load-bearing hand-off invariant, doc 15).** At the link, the
+    /// continuation's snapshot for `R[a]` is `init − step`, byte-identical to the
+    /// inner root's `entry_slots[R[a]]`: the inner root was recorded at `for_loop`
+    /// time, which first does `R[a] += step` and reads the result — so its recorded
+    /// *pre-execution* idx is precisely the `init − step` this `for_prep` leaves.
+    /// `R[a+1]` (limit) / `R[a+2]` (step) are untouched by the loop and flow straight
+    /// through. Phase 3 consumes this snapshot to follow the link; Phase 2 only
+    /// records it (the link trace is never executed — see `tryChainExit`).
+    fn recForPrepLink(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) !void {
+        // A `for_prep` inside an inlined callee shares `recForLoop`'s cross-frame
+        // hazard (raw-pc anchor comparison across protos); keep the historical abort.
+        if (self.rec.inline_depth > 0) return self.abort(.nyi_opcode);
+        // Only a *continuation* links (LuaJIT's model). A root recording that reaches
+        // an inner `for_prep` aborts LINNER — byte-identical to the pre-Phase-2
+        // behaviour — so it never anchors a link trace at a real back-edge target.
+        if (!self.rec.is_continuation) return self.abort(.nyi_opcode);
+        const a = instr.a;
+
+        // Locate the matching `for_loop` (the forward jump target) and verify the
+        // shape. `pc` is the post-increment pc, so `pc + instr.aux` is the `for_loop`
+        // bytecode index (mirrors the interpreter's `applyJump(pc, aux)`), and that
+        // `for_loop`'s back-edge target — the inner loop header / root anchor — is
+        // `pc` itself (the instruction immediately after `for_prep`).
+        const fl_i: i64 = @as(i64, pc) + instr.aux;
+        if (fl_i < 0 or fl_i >= @as(i64, @intCast(proto.code.len))) return self.abort(.nyi_opcode);
+        const fl_pc: u32 = @intCast(fl_i);
+        if (proto.code[fl_pc].op != .for_loop) return self.abort(.nyi_opcode);
+        const inner_anchor: u32 = pc; // body start == for_loop back-edge target
+        // Cross-check the layout assumption: the `for_loop`'s own back-edge resolves
+        // to `inner_anchor` (debug-only; release trusts the `.for_loop` shape check).
+        std.debug.assert(@as(i64, @intCast(fl_pc)) + 1 + proto.code[fl_pc].aux == @as(i64, @intCast(inner_anchor)));
+
+        // LINNER (LuaJIT `rec_loop_jit`): only link if the inner loop header already
+        // has a root trace. Otherwise abort — the inner loop must trace as a root
+        // first; once it does, a later continuation links here.
+        const inner_key = AnchorKey{ .proto = proto, .pc = inner_anchor };
+        if (!self.hasTrace(inner_key)) return self.abort(.nyi_opcode);
+
+        // Record the pre-decrement `R[a] = init − step` (the value the inner root
+        // reads as its pre-execution idx — discharges P2). Guard the operands as
+        // numbers exactly like `recForLoop`; a non-number init/step is not a numeric
+        // `for` we model, so fall back to the abort.
+        const vinit = regs.get(a);
+        const vstep = regs.get(a + 2);
+        if (!vinit.isNumber() or !vstep.isNumber()) return self.abort(.bad_type);
+        const rinit = try self.refOf(a);
+        const rstep = try self.refOf(a + 2);
+        try self.guardNum(rinit, vinit);
+        try self.guardNum(rstep, vstep);
+        const all_int = vinit.isInt() and vstep.isInt();
+        const rsub = try self.emit(.{ .op = .sub, .a = rinit, .b = rstep, .ty = if (all_int) .int else .float });
+        self.setReg(a, rsub);
+
+        // Close with the `.link` terminator (commit reads `link_target`). closeTrace
+        // commits + clears `active`; a build failure gates the anchor, like any abort.
+        self.rec.link_target = inner_anchor;
+        self.closeTrace(regs);
+    }
+
     /// Cross-frame tracing — inline a Lua callee's body straight into the trace
     /// (LuaJIT's `lj_record_call`). The dispatch loop keeps driving the recorder
     /// through the callee's bytecode after tier-0 pushes the frame, so all this
@@ -2957,6 +3088,25 @@ pub const Recorder = struct {
     /// sentinel means "unknown" (while / generic-`for` / a passed-through `for`),
     /// so nothing is filtered and behavior is unchanged.
     locals_watermark: u32 = std.math.maxInt(u32),
+    /// Nested-loop trace linking (doc 15, Phase 2): when set, this recording is a
+    /// *continuation* that re-reached an inner numeric-`for`'s `for_prep` whose loop
+    /// header already has a root trace. The value is the inner root's anchor pc (a
+    /// bytecode pc in this same proto). `commit()` then closes the trace with a
+    /// `.link{aux=link_target}` terminator *instead of* `.loop`, and caches it
+    /// unoptimized (link traces skip `tropt`). `null` for every ordinary
+    /// root/continuation trace (closes with `.loop`). Reset to `null` by `reset`.
+    link_target: ?u32 = null,
+    /// Nested-loop trace linking (doc 15, Phase 2): true iff this recording is a
+    /// *continuation* — armed at a non-header exit pc by `maybeStartContinuation`,
+    /// recording the outer body after an inner loop's loop-done exit. Only a
+    /// continuation may close with a `.link` when it re-reaches an inner `for_prep`
+    /// (LuaJIT's model: a *root* recording that hits an inner loop aborts LINNER and
+    /// lets the inner spawn the side trace, so the root never links). Crucially this
+    /// keeps link anchors off real back-edge targets — a root at the outer header
+    /// would anchor a link trace at the outer body start (a genuine loop header the
+    /// dispatch loop *enters*), which Phase 2 cannot execute. Set true by
+    /// `maybeStartContinuation`; cleared to `false` by `reset` (every `arm`).
+    is_continuation: bool = false,
     /// Bytecode PC of the instruction currently being recorded. Set by
     /// `recordInstr` before `recordOne`; `emit` stores it in the `aux`
     /// field of guard instructions so the executor can report *which*
@@ -3069,6 +3219,8 @@ pub const Recorder = struct {
         self.anchor = anchor;
         self.abort_reason = null;
         self.locals_watermark = std.math.maxInt(u32);
+        self.link_target = null;
+        self.is_continuation = false;
         self.pending_store_count = 0;
         self.anchor_num_registers = num_registers;
         self.base_off = 0;
@@ -3110,6 +3262,8 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         // `guard_pure` reads the callee `%a` and tags the builtin in `aux`.
         .guard_pure => try w.print("%{d}  [{s}]", .{ ins.a, @tagName(@as(function.PureBuiltin, @enumFromInt(ins.aux))) }),
         .loop, .preheader => {},
+        // `.link` (doc 15): terminal hand-off; `aux` is the inner root's anchor pc.
+        .link => try w.print("-> {d}", .{ins.aux}),
         // φ: a slot-bound φ prints `update=%b → r{slot}` (init is implicit
         // `regs[slot]`); an internal φ prints `init=%a update=%b → internal`.
         .phi => {

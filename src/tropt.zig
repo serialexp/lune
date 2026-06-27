@@ -123,6 +123,12 @@ fn kindOf(op: IrOp) OpKind {
         // Reads `a`=gcell address + `b`=value, same as `astore`.
         .gstore => .astore,
         .loop => .loop,
+        // `.link` (doc 15): a terminal hand-off to an inner root trace. Continuation
+        // (link) traces are cached *unoptimized* via `dupe` — `optimize` is never run
+        // on them — so this arm exists only for switch-exhaustiveness. Classified as
+        // the `.loop` terminal kind: structurally identical (sole terminal, last op,
+        // no value), so any terminal-leave-alone logic does the right thing.
+        .link => .loop,
         // Loop-carried value: a root (the carry); canonical to itself (never
         // folded/CSE'd). Keeps both operands live; `b` is a forward (back-edge)
         // ref, remapped by a fixup after compaction.

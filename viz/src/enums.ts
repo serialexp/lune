@@ -69,6 +69,9 @@ export const IR_OP_NAMES = [
   "guard_stride", // 53  grid stride still equals the recorded value
   "guard_gcol", // 54  column in [1, stride]
   "guard_gpresent", // 55  cell present
+  // Nested-loop trace linking (doc 15, Phase 2); appended at the enum end so wire
+  // ordinals 0..55 are undisturbed.
+  "link", // 56  terminal hand-off to an inner root trace (aux = inner anchor pc)
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -102,7 +105,7 @@ export type ValueTagName = (typeof VALUE_TAG_NAMES)[number];
 
 /** Opcodes that take no operand columns (the loop back-edge terminator and the
  * preheader region boundary — both pure structural markers). */
-export const NO_OPERAND_OPS: ReadonlySet<IrOpName> = new Set(["loop", "preheader"]);
+export const NO_OPERAND_OPS: ReadonlySet<IrOpName> = new Set(["loop", "preheader", "link"]);
 
 /** Unary ops + guards: render a single operand `%a`. (`aref` is two-operand and
  * falls through to the default `%a, %b` rendering.) */

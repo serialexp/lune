@@ -1,6 +1,6 @@
 # Nested-Loop Trace Linking — Design
 
-Status: partial — Phase 1 (non-header exit-PC anchors) landed; Phases 2–4 outstanding
+Status: partial — Phases 1–2 (exit-PC anchors + `.link` terminator) landed; Phases 3–4 outstanding
 Owner: Bart
 Last updated: 2026-06-27
 
@@ -43,12 +43,32 @@ land; move whole sections to Done once everything inside is checked.
   an `expectProgram` 10-mode output-invariance test plus a focused
   `runExecForTrace` test asserting a second, distinct `for_prep` abort site (the
   continuation, anchored at the post-loop pc) actually arms.
+- [x] **Phase 2 — Link terminator + snapshot hand-off.** New `.link` IR terminator
+  (`trace.IrOp`, wire ordinal 56 — appended at the enum end, mirrored in
+  `traceser.zig`'s ordinal contract and `viz/src/enums.ts`). `assertWellFormed`
+  accepts `.loop` **or** `.link` as the sole terminal; `commit` appends
+  `.link{aux = inner anchor pc}` when `Recorder.link_target` is set and caches the
+  trace **unoptimized** (`tropt` is skipped — its LICM/φ machinery and the
+  `instrs[n-1].op == .loop` assert are written for back-edge loops, and a Phase-2
+  link trace is never executed anyway). `recForPrepLink` (dispatched from the
+  `.for_prep` recording arm) records `for_prep`'s pre-decrement `R[a] = init − step`
+  and closes with the link **iff** (a) this recording is a *continuation*
+  (`Recorder.is_continuation`, set only by `maybeStartContinuation`) — a *root*
+  recording that reaches an inner `for_prep` still LINNER-aborts, matching LuaJIT
+  and keeping link anchors off real back-edge targets — and (b) the inner loop
+  header (the `for_loop` back-edge target == `for_prep`'s post-increment pc) already
+  has a cached root trace; otherwise it LINNER-aborts unchanged. Discharged **P2**:
+  the recorded `R[a] = init − step` is byte-identical to the inner root's
+  `entry_slots[R[a]]` (the inner root reads its pre-execution idx at `for_loop`
+  time, i.e. exactly what `for_prep` leaves). The link trace is committed but
+  **never executed** in Phase 2 — `tryChainExit` skips any `.link`-terminated trace,
+  and the continuation's post-loop anchor pc is not a back-edge target the dispatch
+  loop enters — so output stays byte-identical (pinned by the `expectProgram` matrix
+  plus a focused test asserting a `.link`-terminated trace is cached whose `aux`
+  resolves to a cached `.loop` root). `irinterp` has the `.link` arm (a clean
+  zero-commit fall-through) ready for Phase 3, but it is dead in Phase 2.
 
 ### Outstanding
-- [ ] **Phase 2 — Link terminator + snapshot hand-off.** New `.link` IR
-  terminator (accepted by `assertWellFormed`, preserved by `commit`/`tropt`);
-  continuation recording records `for_prep`'s subtract then links to the inner
-  root. Discharge **P2** (the load-bearing hand-off invariant). Watermark guard.
 - [ ] **Phase 3 — Linked execution, tier-1a.** `irinterp.execute` follows
   `.link`; roll-up treats the inner loop-done exit as one outer success.
   Nested-loop program in the `expectProgram` 8-mode matrix incl. a keyframe
@@ -202,6 +222,19 @@ divergence when crossing `.link` in either direction.
 - **Termination.** continuation → inner-root → `.loop`; no deeper nesting. Reuse
   `tryChainExit`'s existing 8-deep visited set; `irinterp.execute` does not call
   `tryChainExit`, so a linked run cannot recurse into the chainer.
+- **Only continuations link (Phase 2).** `recForPrepLink` links iff
+  `Recorder.is_continuation` (set only by `maybeStartContinuation`). A *root*
+  recording reaching an inner `for_prep` still LINNER-aborts — LuaJIT's model, and
+  the guard that keeps a link trace from anchoring at the outer body start, which
+  *is* a real back-edge target the dispatch loop would enter. (A link trace's own
+  anchor — the continuation's post-inner-loop pc — is never a back-edge target.)
+- **Link traces are inert until Phase 3.** `tryChainExit` skips any
+  `.link`-terminated trace (the only path that could otherwise reach the
+  continuation's anchor pc). Running one straight through would execute the outer
+  body's sunk stores and then fall through at `.link` with `completed == 0`,
+  double-applying them on the tier-0 redo. **Phase 3 must remove that skip** as it
+  teaches the chain to *follow* the link (run the inner root, ping-pong) — the
+  `irinterp` `.link` arm is already a clean zero-commit fall-through placeholder.
 
 ## Non-goals (initial cut)
 
