@@ -2692,14 +2692,24 @@ pub const TraceState = struct {
     /// The decision is a pure function of the cache + bytecode (no clock/RNG/address),
     /// so it is identical across every record/exec mode — P1 carries to P2.
     ///
-    /// **P2 (the load-bearing hand-off invariant, doc 15).** At the link, the
-    /// continuation's snapshot for `R[a]` is `init − step`, byte-identical to the
-    /// inner root's `entry_slots[R[a]]`: the inner root was recorded at `for_loop`
-    /// time, which first does `R[a] += step` and reads the result — so its recorded
-    /// *pre-execution* idx is precisely the `init − step` this `for_prep` leaves.
-    /// `R[a+1]` (limit) / `R[a+2]` (step) are untouched by the loop and flow straight
-    /// through. Phase 3 consumes this snapshot to follow the link; Phase 2 only
-    /// records it (the link trace is never executed — see `tryChainExit`).
+    /// **P2 (the load-bearing hand-off invariant, doc 15).** The link hand-off must
+    /// reproduce the inner root's *entry state* — the tier-0 registers it reads at its
+    /// anchor (`entry_slots`). The inner root anchors at the loop **body start** (the
+    /// `for_loop` back-edge target), which tier-0 first reaches only AFTER `for_prep`
+    /// (`R[a] = init − step`) **and** the first `for_loop` (`R[a] += step → init`,
+    /// publishing the visible loop var `R[a+3] = init`). So the byte-identical hand-off
+    /// is `R[a] = init` **and** `R[a+3] = init` — the body reads the visible var
+    /// `R[a+3]` at the trace top, and the `for_loop` at the trace bottom reads `R[a]`
+    /// to step it, so BOTH are live entry inputs. (An earlier draft recorded only
+    /// `R[a] = init − step` and left `R[a+3]` stale — verified wrong by dumping the
+    /// inner root's `entry_slots`, which include the visible-var slot; the inner root
+    /// would then re-run the first iteration and read a stale loop var.) `R[a+1]`
+    /// (limit) / `R[a+2]` (step) are untouched by the loop and flow straight through.
+    /// A first-iteration bounds guard (`init` within `limit`) gates the link: a
+    /// zero-trip inner loop fails it and falls back to tier-0 rather than entering the
+    /// inner root, which assumes ≥1 iteration. Phase 3 consumes this snapshot to follow
+    /// the link; Phase 2 only records it (the link trace is never executed — see
+    /// `tryChainExit`).
     fn recForPrepLink(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) !void {
         // A `for_prep` inside an inlined callee shares `recForLoop`'s cross-frame
         // hazard (raw-pc anchor comparison across protos); keep the historical abort.
@@ -2730,20 +2740,44 @@ pub const TraceState = struct {
         const inner_key = AnchorKey{ .proto = proto, .pc = inner_anchor };
         if (!self.hasTrace(inner_key)) return self.abort(.nyi_opcode);
 
-        // Record the pre-decrement `R[a] = init − step` (the value the inner root
-        // reads as its pre-execution idx — discharges P2). Guard the operands as
-        // numbers exactly like `recForLoop`; a non-number init/step is not a numeric
-        // `for` we model, so fall back to the abort.
+        // Reconstruct the inner root's entry state (discharges P2 — see the doc
+        // comment). Guard init/limit/step are numbers (all three — tier-0 `for_prep`
+        // type-checks `limit` too, so a non-number limit must side-exit here rather
+        // than commit a bogus link); a non-number is not a numeric `for` we model, so
+        // fall back to the abort.
         const vinit = regs.get(a);
+        const vlimit = regs.get(a + 1);
         const vstep = regs.get(a + 2);
-        if (!vinit.isNumber() or !vstep.isNumber()) return self.abort(.bad_type);
+        if (!vinit.isNumber() or !vlimit.isNumber() or !vstep.isNumber()) return self.abort(.bad_type);
         const rinit = try self.refOf(a);
+        const rlimit = try self.refOf(a + 1);
         const rstep = try self.refOf(a + 2);
         try self.guardNum(rinit, vinit);
+        try self.guardNum(rlimit, vlimit);
         try self.guardNum(rstep, vstep);
+
+        // First-iteration bounds test, mirroring `recForLoop`'s compare (incl. the
+        // float-limit → int specialization so a mixed int/float compare stays lowerable
+        // and byte-identical to tier-0's `idx <= limit`). tier-0 tests `(init−step)+step
+        // = init` against `limit`, so we compare `init` directly. On failure the inner
+        // loop runs zero times → side-exit to tier-0 instead of entering the inner root.
         const all_int = vinit.isInt() and vstep.isInt();
-        const rsub = try self.emit(.{ .op = .sub, .a = rinit, .b = rstep, .ty = if (all_int) .int else .float });
-        self.setReg(a, rsub);
+        const rlimit_cmp = if (all_int and vlimit.isFloat() and value.floatAsExactInt(vlimit.asFloat()) != null)
+            try self.emit(.{ .op = .int_of_float, .a = rlimit, .ty = .int })
+        else
+            rlimit;
+        const ascending = vstep.toFloat() >= 0;
+        const cmp = if (ascending)
+            try self.emit(.{ .op = .le, .a = rinit, .b = rlimit_cmp, .ty = .boolean })
+        else
+            try self.emit(.{ .op = .le, .a = rlimit_cmp, .b = rinit, .ty = .boolean });
+        _ = try self.emit(.{ .op = .guard_true, .a = cmp });
+
+        // Publish the inner root's entry state: the control index `R[a]` and the visible
+        // loop var `R[a+3]` both start at `init`. (limit `R[a+1]` / step `R[a+2]` are
+        // untouched by the loop and already flow through the exit snapshot.)
+        self.setReg(a, rinit);
+        self.setReg(a + 3, rinit);
 
         // Close with the `.link` terminator (commit reads `link_target`). closeTrace
         // commits + clears `active`; a build failure gates the anchor, like any abort.

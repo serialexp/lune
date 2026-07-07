@@ -51,16 +51,21 @@ land; move whole sections to Done once everything inside is checked.
   trace **unoptimized** (`tropt` is skipped — its LICM/φ machinery and the
   `instrs[n-1].op == .loop` assert are written for back-edge loops, and a Phase-2
   link trace is never executed anyway). `recForPrepLink` (dispatched from the
-  `.for_prep` recording arm) records `for_prep`'s pre-decrement `R[a] = init − step`
+  `.for_prep` recording arm) reconstructs the inner root's entry state
+  (`R[a] = init`, visible var `R[a+3] = init`, plus a first-iteration bounds guard)
   and closes with the link **iff** (a) this recording is a *continuation*
   (`Recorder.is_continuation`, set only by `maybeStartContinuation`) — a *root*
   recording that reaches an inner `for_prep` still LINNER-aborts, matching LuaJIT
   and keeping link anchors off real back-edge targets — and (b) the inner loop
   header (the `for_loop` back-edge target == `for_prep`'s post-increment pc) already
-  has a cached root trace; otherwise it LINNER-aborts unchanged. Discharged **P2**:
-  the recorded `R[a] = init − step` is byte-identical to the inner root's
-  `entry_slots[R[a]]` (the inner root reads its pre-execution idx at `for_loop`
-  time, i.e. exactly what `for_prep` leaves). The link trace is committed but
+  has a cached root trace; otherwise it LINNER-aborts unchanged. Discharged **P2**
+  (corrected after empirically dumping the inner root's `entry_slots` — see the P2
+  section below): the hand-off reproduces the inner root's *entry state*, which
+  (because the root anchors at the loop **body start**, reached only after `for_prep`
+  **and** the first `for_loop`) is `R[a] = init` **and** the visible loop var
+  `R[a+3] = init` — both live entry inputs — not `R[a] = init − step`. A
+  first-iteration bounds guard (`init` within `limit`) gates the link so a zero-trip
+  inner loop falls back to tier-0. The link trace is committed but
   **never executed** in Phase 2 — `tryChainExit` skips any `.link`-terminated trace,
   and the continuation's post-loop anchor pc is not a back-edge target the dispatch
   loop enters — so output stays byte-identical (pinned by the `expectProgram` matrix
@@ -130,10 +135,13 @@ that "later".
 
 3. **Re-reaching the inner header → link (Phase 2).** When the continuation
    recording, going forward, reaches the inner loop header and a **root trace
-   already exists there**, it records `for_prep`'s subtract (`R[a] = init − step`)
-   and then **stops**, emitting a new `.link` terminator that names the inner root
-   trace — instead of recording the inner `for_loop` (which would unroll). The
-   `.link` is the lune equivalent of `LJ_TRLINK_ROOT`.
+   already exists there**, it reconstructs the inner root's *entry state* — the
+   control index `R[a] = init` and the visible loop var `R[a+3] = init` (see P2 for
+   why both, and why `init` and not `init − step`) — guards `init`/`limit`/`step`
+   are numbers and the first iteration is in-bounds, then **stops**, emitting a new
+   `.link` terminator that names the inner root trace — instead of recording the
+   inner `for_loop` (which would unroll). The `.link` is the lune equivalent of
+   `LJ_TRLINK_ROOT`.
 
 4. **Linked execution (Phase 3 tier-1a, Phase 4 native).** On the inner root's
    loop-done exit, `tryChainExit` finds the continuation trace at that exit PC and
@@ -165,24 +173,45 @@ arming fires. Pin with a test asserting identical cache/anchor state across mode
 
 ### P2 — The `for_prep` hand-off is byte-identical (Phase 2) — load-bearing
 
-At the link point the continuation trace's exit snapshot for the inner control
-slot `R[a]` equals `init − step`, which is **byte-identical** to the inner root
-trace's `entry_slots[R[a]]`.
+At the link point the continuation trace's exit snapshot must reproduce the inner
+root trace's **entry state** — every tier-0 register the inner root reads at its
+anchor (its `entry_slots`). For a numeric `for j = init, limit, step`, that is
+`R[a] = init` (control index), `R[a+3] = init` (the **visible loop var**),
+`R[a+1] = limit`, and `R[a+2] = step`.
 
-*Why it holds.* tier-0's `for_prep` (`interp.zig`) pre-decrements:
-`R[a] = sub(R[a], R[a+2])` = `init − step`, then jumps to `for_loop`, whose first
-act is to add `step` back. The inner root trace was recorded **at `for_loop`
-time**, and the recorder reads *pre-execution* operands — so the inner trace's
-`slot_load` for `R[a]` captured the value `for_prep` had just left on the
-**immediately preceding** outer iteration, i.e. a pre-decremented idx. Therefore
-the continuation trace recording `for_prep`'s subtract and terminating at the
-`for_loop` boundary leaves `R[a] = init − step`, exactly what the inner trace's
-entry expects. `R[a+1]` (limit) and `R[a+2]` (step) are unmutated by `for_prep`
-and flow through untouched; any other slot the inner trace's `entry_guards` cover
-is produced by the continuation's recorded outer body and must satisfy those
-guards by construction (verified, or a runtime entry-guard check fails the link
-into a deopt, never a wrong result). A change to `for_prep` semantics or to *when*
-the recorder takes `slot_load`s would break this — hence the written invariant.
+*Why `init`, not `init − step`, and why the visible var matters.* The inner root
+anchors at the loop **body start** — the `for_loop` back-edge target — and records
+**body-first** (the body, then the `for_loop` at the bottom). Tier-0 first reaches
+that body-start pc only *after* `for_prep` (`R[a] = init − step`) **and** the first
+`for_loop` (`R[a] += step → init`, which also publishes the loop var
+`R[a+3] = init`). So on entry the inner root sees `R[a] = init` and
+`R[a+3] = init`. Both are live inputs: the body reads the visible var `R[a+3]` at
+the top, and the bottom `for_loop` reads `R[a]` to step it (confirmed by dumping
+the inner root's `entry_slots`, which include the visible-var slot). Feeding
+`R[a] = init − step` would make the inner root's `for_loop` recompute `init` and
+**re-run the first iteration**; leaving `R[a+3]` unset would feed the body a stale
+loop var from the previous outer iteration.
+
+*What the continuation records.* `recForPrepLink` guards `init`/`limit`/`step` are
+numbers (all three — tier-0 `for_prep` type-checks `limit` too), emits a
+first-iteration bounds guard (`init` within `limit`, mirroring `recForLoop`'s
+compare incl. the float-limit→int specialization) so a zero-trip inner loop
+side-exits to tier-0 instead of wrongly entering the inner root, then publishes
+`R[a] = init` and `R[a+3] = init` into the exit snapshot. `R[a+1]`/`R[a+2]` are
+unmutated by the loop and flow through untouched; any other slot the inner root's
+entry guards cover (e.g. the accumulator `R0`) is either produced by the
+continuation's recorded outer body or retained unchanged in the register file, and
+must satisfy those guards by construction (or a runtime entry-guard check fails the
+link into a deopt, never a wrong result).
+
+*History.* An earlier Phase-2 draft recorded only `R[a] = init − step` and left
+`R[a+3]` stale, on the mistaken premise that the inner root was recorded "at
+`for_loop` time reading a pre-decremented idx." Dumping the actual inner-root IR
+(`entry_slots = {…, visible-var slot, idx slot, …}`, body-first) disproved it. The
+draft was inert in Phase 2 (the link trace is never executed) but would have
+produced wrong results in Phase 3. A change to `for_prep`/`for_loop` semantics, to
+the root anchor pc, or to *when* the recorder takes `slot_load`s would break this —
+hence the written invariant.
 
 ### P3 — The link decision is mode-invariant (Phase 2)
 

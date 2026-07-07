@@ -26,8 +26,23 @@ time and keeps the matrix byte-identical.
 The Phase 1 continuation (armed on a productive inner loop-done exit, anchored at
 the post-inner-loop pc) records the outer body forward and re-reaches the inner
 `for_prep`. Phase 2 turns that LINNER abort into a **link**: `recForPrepLink`
-records `for_prep`'s pre-decrement `R[a] = init − step` and closes the trace with
-a new `.link` terminator naming the inner root's anchor pc.
+reconstructs the inner root's **entry state** and closes the trace with a new
+`.link` terminator naming the inner root's anchor pc.
+
+### Hand-off correctness fix (post-review, this session)
+
+A code review (codex + antigravity) plus an empirical IR dump of the inner root's
+`entry_slots` disproved the original P2 claim. The inner root anchors at the loop
+**body start** and records **body-first**, so its entry state (reached only after
+`for_prep` AND the first `for_loop`) is `R[a] = init` **and** the visible loop var
+`R[a+3] = init` — both live entry inputs — **not** `R[a] = init − step` with
+`R[a+3]` stale. `recForPrepLink` now: guards `init`/`limit`/`step` are numbers (the
+`limit` guard was previously missing), emits a first-iteration bounds guard (`init`
+within `limit`) so a zero-trip inner loop side-exits to tier-0, and publishes
+`R[a] = init` + `R[a+3] = init` into the exit snapshot. Verified by dumping the
+link trace IR: `phi(R5) ← init`, `phi(R8) ← init` (were `init−step` / missing).
+Still inert in Phase 2 (link never executed) → gate stays byte-identical; but now
+a *correct* snapshot for Phase 3 to consume. P2 in `docs/design/15-…` rewritten.
 
 ### Mechanism (files touched)
 
@@ -92,10 +107,32 @@ productive-exit entry; generalize the trigger to nsieve's shape; add a nested-lo
 `expectProgram` 10-mode test incl. a keyframe cut→resume across a link. Correct
 but not yet faster (tier-1a ≈ tier-0).
 
+### Remaining review items to fold into Phase 3 (from codex + antigravity)
+
+The hand-off snapshot + the missing `limit` guard are **fixed** (above). Still
+open, all Phase-3-relevant (inert while the link isn't executed):
+
+- **`.link` must write back its exit snapshot before handing off.** `irinterp`'s
+  current `.link` arm breaks *without* φ writeback. Phase 3 must flush the
+  continuation's snapshot (now correct: R[a]=init, R[a+3]=init) into the register
+  file, THEN enter the inner root — else the hand-off registers never land.
+- **Explicit `.link` skip in the same-anchor trial-walk** (`interp.zig` ~2540). The
+  "never executed" property currently rests on anchor placement, not an executor
+  guard; `tryChainExit` skips `.link` but the trial-walk `irinterp.execute`/
+  `nativeFor().run` path does not. Add a belt-and-suspenders skip.
+- **`hasTrace(inner_key)` ≠ "a `.loop` root".** Tighten the link precondition to
+  require the cached trace terminate in `.loop` (the test checks this; production
+  doesn't).
+- **`pending_exit_anchor` has no cleanup on error/yield/OOM** — could pin the VM in
+  `.full` mode and lock out future arming. Add a reset on frame unwind / trace reset.
+- **Debug-only layout assert** (`trace.zig` ~2725): the `for_loop`-back-edge
+  identity is `std.debug.assert`; consider a runtime check for release.
+- **Cosmetic:** `viz/src/enums.ts:12` comment still says `0..55` (now `0..56`).
+
 ## Uncommitted tree
 
-Modified (mine): `src/trace.zig`, `src/interp.zig`, `src/irinterp.zig`,
-`src/tropt.zig`, `src/troptdiag.zig`, `src/traceser.zig`, `viz/src/enums.ts`,
-`docs/design/15-nested-loop-linking.md`, `CURRENT_TASK.md`. Untracked files
+Modified (mine): `src/trace.zig`, `docs/design/15-nested-loop-linking.md`,
+`CURRENT_TASK.md` (the hand-off fix + review-driven doc updates; `interp.zig` and
+the other Phase-2 files are already committed at `b6a074a`). Untracked files
 (CURRENT_TASK_E3.md, SESSION_CHANGES.md, bench/results/*.tsv, check_ordinals)
 belong to other agents — **do NOT stage**.
