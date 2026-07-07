@@ -65,6 +65,64 @@ pub const ExecResult = struct {
     exit_instr: u32,
 };
 
+/// Commit the final numeric-`for` iteration at a loop-done side exit so a linked
+/// continuation can start at the post-loop PC without tier-0 replaying that
+/// iteration. This is deliberately not part of ordinary `execute`: normal deopt
+/// still resumes at the loop header with `regs` untouched.
+pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value, exit_instr: u32) bool {
+    if (exit_instr == std.math.maxInt(u32) or exit_instr >= t.instrs.len) return false;
+    const guard = t.instrs[exit_instr];
+    if (guard.op != .guard_true) return false;
+    const exit_pc = trace.guardExitPc(guard) orelse return false;
+    if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
+    const for_ins = t.anchor.proto.code[exit_pc - 1];
+    if (for_ins.op != .for_loop) return false;
+
+    var si: usize = @intCast(exit_instr + 1);
+    while (si < t.instrs.len) : (si += 1) {
+        const p = t.instrs[si];
+        switch (p.op) {
+            .astore => {
+                const ar = t.instrs[p.a];
+                const tbl = table.Table.fromHeader(values[ar.a].asHeap());
+                tbl.array.setInLane(@intCast(values[ar.b].asInt()), values[p.b]);
+            },
+            .hstore => {
+                const hr = t.instrs[p.a];
+                const tbl = table.Table.fromHeader(values[hr.a].asHeap());
+                tbl.fieldPtr(values[hr.b]).?.* = values[p.b];
+            },
+            .gstore => {
+                // Defensive only today. A linked source-level 2D-grid nest
+                // (`m[i][j] = m[i][j] + k`) aborts recording at the fused
+                // `get_index2`/`set_index2` opcode before any continuation link is
+                // committed, so no linked loop-done flush can currently contain a
+                // `gstore`. Keep the commit path functional for the future recorder
+                // work that makes fused grid stores linkable.
+                const gc = t.instrs[p.a];
+                const ga = t.instrs[gc.a];
+                const tbl = table.Table.fromHeader(values[ga.a].asHeap());
+                const row: usize = @intCast(values[ga.b].asInt() - 1);
+                const col: usize = @intCast(values[gc.b].asInt() - 1);
+                tbl.array.gridSet(row, col, values[p.b]);
+            },
+            .phi, .loop, .link => break,
+            else => {},
+        }
+    }
+
+    const visible_var_slot: i32 = @as(i32, @intCast(for_ins.a)) + 3;
+    for (t.instrs, 0..) |p, pi| {
+        if (p.op != .phi) continue;
+        if (p.aux == trace.PHI_INTERNAL) {
+            values[pi] = values[@intCast(p.b)];
+        } else if (p.aux != visible_var_slot) {
+            regs.set(@intCast(p.aux), values[@intCast(p.b)]);
+        }
+    }
+    return true;
+}
+
 /// Execute trace `t` from the current frame's register window `regs`, using the
 /// caller-owned `values` scratch (indexed by SSA `Ref`; must be at least
 /// `t.instrs.len` long — the caller grows/reuses it). Returns `ExecResult` with
@@ -615,14 +673,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                     // φ writeback: a slot-bound φ flushes its update to the register
                     // (the carry tier-0 resumes from); an internal φ refreshes its own
                     // carried scratch so the next iteration retains it.
-                    for (t.instrs, 0..) |p, pi| {
-                        if (p.op != .phi) continue;
-                        if (p.aux == trace.PHI_INTERNAL) {
-                            values[pi] = values[@intCast(p.b)];
-                        } else {
-                            regs.set(@intCast(p.aux), values[@intCast(p.b)]);
-                        }
-                    }
+                    flushPhiWriteback(t, regs, values);
                     completed += 1;
                     if (record) rec.commit();
                     continue :iter;
@@ -634,14 +685,15 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 .preheader => {},
 
                 // ---- link: terminal hand-off to an inner root trace (doc 15) ----
-                // Phase 2 executes this as a **clean zero-commit side-exit**: break
-                // with `completed` unchanged (a continuation has no back-edge, so this
-                // is 0) and apply *no* φ writeback, so the registers stay exactly as the
-                // outer body left them and tier-0 redoes the iteration from the anchor
-                // byte-identically (discharges the fall-through half of P2). Phase 3
-                // teaches the executor to instead *follow* the link: run the inner root
-                // anchored at `aux`, then ping-pong inner-root ⇄ continuation.
-                .link => break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) },
+                // Phase 3: reaching `.link` is a terminal hand-off, not a loop
+                // commit, but the continuation's exit snapshot is the hand-off
+                // contract. Flush it before reporting the link exit so the chainer
+                // can enter the inner root with `R[a]` / `R[a+3]` (and any other
+                // carried slots) byte-identical to the root trace's entry state.
+                .link => {
+                    flushPhiWriteback(t, regs, values);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
             }
         }
         // A well-formed trace always terminates in `loop` (checked by the
@@ -651,6 +703,17 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
     };
     if (record) rec.end(completed_out.completed);
     return completed_out;
+}
+
+fn flushPhiWriteback(t: *const Trace, regs: RegWindow, values: []Value) void {
+    for (t.instrs, 0..) |p, pi| {
+        if (p.op != .phi) continue;
+        if (p.aux == trace.PHI_INTERNAL) {
+            values[pi] = values[@intCast(p.b)];
+        } else {
+            regs.set(@intCast(p.aux), values[@intCast(p.b)]);
+        }
+    }
 }
 
 /// Evaluate a binary IR op (arithmetic / bitwise / comparison) over two values,

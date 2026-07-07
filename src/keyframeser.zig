@@ -1860,6 +1860,27 @@ const f2c_corpus = [_][:0]const u8{
     ,
 };
 
+// A nested numeric-for shape sized so the tracing JIT would form the Phase-3 link
+// chain if this harness enabled tracing: inner trip count exceeds `min_trip_entry`,
+// outer trip count gives the loop-done exit enough hits to arm the continuation,
+// and the post-inner `s = s + i` keeps the nsieve-style "work after inner loop"
+// shape. The F2c harness is intentionally tier-0-only today (see the test below),
+// so this covers cut/resume on the same bytecode shape rather than asserting a
+// literal cut inside tier-1a linked execution.
+const f2c_linking_shape_source =
+    \\local function linked_shape()
+    \\  local s = 0
+    \\  for i = 1, 400 do
+    \\    for j = 1, 60 do
+    \\      s = s + i * 3 + j
+    \\    end
+    \\    s = s + i
+    \\  end
+    \\  return s
+    \\end
+    \\print(linked_shape())
+;
+
 test "F2c: resume from a mid-execution keyframe reproduces output and final state" {
     const gpa = testing.allocator;
     for (f2c_corpus) |source| {
@@ -1879,6 +1900,24 @@ test "F2c: resume from a mid-execution keyframe reproduces output and final stat
             .after_safepoints = 1,
         }, ref));
     }
+}
+
+test "F2c: linking-shaped nested numeric-for resumes from a tier-0 keyframe" {
+    // Feasibility finding for doc 15: `referenceRun` and `expectResume` create a
+    // fresh `Vm.init` and never set `vm.trace.config.enabled`, whose default is
+    // false. Therefore F2c cuts cannot literally land inside a tier-1a link chain;
+    // they snapshot tier-0 heap/stack/frame state at safepoints. The trace-side
+    // proof that this source shape links lives in the Phase-3 counter tests in
+    // `interp.zig`; this test pins keyframe resume on the same nested-loop shape.
+    const gpa = testing.allocator;
+    const ref = try referenceRun(gpa, f2c_linking_shape_source);
+    defer ref.deinit(gpa);
+    try testing.expect(ref.total_safepoints > 1000);
+
+    gpa.free(try expectResume(gpa, f2c_linking_shape_source, .{
+        .min_depth = 2,
+        .after_safepoints = ref.total_safepoints / 2,
+    }, ref));
 }
 
 test "F2c: independent VMs suspended at the same cut produce byte-identical keyframes" {

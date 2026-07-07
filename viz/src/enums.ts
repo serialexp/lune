@@ -9,7 +9,7 @@
 // (Future hardening: generate this file from Zig @typeInfo reflection so it
 // cannot drift at all — see docs/design/04-snapshot-replay-schema.md.)
 
-/** IR opcodes, indexed by wire ordinal (mirrors trace.IrOp, 0..55). */
+/** IR opcodes, indexed by wire ordinal (mirrors trace.IrOp, 0..56). */
 export const IR_OP_NAMES = [
   "slot_load", // 0
   "konst", // 1

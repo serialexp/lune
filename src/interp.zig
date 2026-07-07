@@ -1602,14 +1602,21 @@ pub const Vm = struct {
     /// `stop_depth == entry_depth + 1`). Threads `stop_depth` through the
     /// `switch_mode` re-entry so a mode flip mid-nested-run resumes the same bound.
     fn execWith(self: *Vm, stop_depth: u32) Error!ExecOutcome {
+        errdefer self.trace.clearPendingExitAnchor();
         while (true) {
             const step = if (self.runFastPath())
                 try self.execImpl(.fast, stop_depth)
             else
                 try self.execImpl(.full, stop_depth);
             switch (step) {
-                .finished => |fr| return .{ .finished = fr },
-                .suspended => return .suspended,
+                .finished => |fr| {
+                    self.trace.clearPendingExitAnchor();
+                    return .{ .finished = fr };
+                },
+                .suspended => {
+                    self.trace.clearPendingExitAnchor();
+                    return .suspended;
+                },
                 .switch_mode => continue,
             }
         }
@@ -2501,6 +2508,12 @@ pub const Vm = struct {
                                 visited[nvisited] = ct;
                                 nvisited += 1;
                             }
+                            // `.link` traces are continuations entered only by
+                            // exit-PC chaining after an inner loop-done exit. Never
+                            // trial-enter one through the same-anchor walk, even if
+                            // a malformed or future bytecode shape puts it at a
+                            // back-edge pc.
+                            if (ct.instrs.len != 0 and ct.instrs[ct.instrs.len - 1].op == .link) continue;
                             // --- type fingerprint (step 5) ---
                             // Skip this trace if the current register types don't
                             // match its entry type guards.  Avoids trial entries
@@ -2603,6 +2616,18 @@ pub const Vm = struct {
                                         }
                                         continue :outer; // already `.full`
                                     }
+                                    // Nested-loop linking (Phase 3): once the
+                                    // continuation trace exists, a productive
+                                    // inner loop-done exit can chain to it. The
+                                    // chainer commits the final inner iteration
+                                    // from `buf`, runs continuation ⇄ inner-root
+                                    // for a bounded burst, and tells us where
+                                    // tier-0 should resume when it yields.
+                                    if (self.trace.tryChainProductiveLoopDone(ct, result.exit_instr, proto, trace_regs, buf)) |chain| {
+                                        if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                                        for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                        continue :outer;
+                                    }
                                     // T3 drop-to-fast on the productive-trace path.
                                     // The handoff at the bottom of the back-edge
                                     // block is bypassed by this `continue :outer`,
@@ -2640,7 +2665,8 @@ pub const Vm = struct {
                                 // PC, look for a side trace there.  This fires
                                 // only after step 4 (side traces) populates the
                                 // cache at non-anchor PCs.
-                                if (self.trace.tryChainExit(ct, result.exit_instr, proto, regs)) |_| {
+                                if (self.trace.tryChainExit(ct, result.exit_instr, proto, regs)) |chain| {
+                                    if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                     for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                     continue :outer;
                                 }
@@ -4561,28 +4587,29 @@ test "cross-frame: a changed upvalue callee deopts the snapshot and replays byte
     );
 }
 
-test "nested-loop: a 2-deep numeric-for nest is byte-identical across all modes (Phase 1)" {
-    // The end-to-end output gate for nested-loop trace linking (Phase 1,
-    // `docs/design/15-nested-loop-linking.md`). The inner loop traces as a root;
-    // its loop-done exit arms a *continuation* recording at the post-inner-loop pc
-    // that records the outer body and aborts at the inner `for_prep` (LINNER) until
-    // Phase 2 links it. Nothing the continuation does commits, so output must stay
-    // byte-identical to tier-0 across {gc_stress × {off, record-only, no-opt,
-    // record-execute, native}} — this pins proof obligation **P1** (arming is
-    // transparent: it never changes a printed byte). Inner trip count (30) clears
-    // `min_trip_entry` so the inner trace is genuinely entered and the arming path
-    // actually runs in the executing modes.
+test "nested-loop: a linked 2-deep numeric-for nest is byte-identical across all modes (Phase 3)" {
+    // The end-to-end output gate for nested-loop trace linking
+    // (`docs/design/15-nested-loop-linking.md`). The inner loop traces as a root;
+    // its loop-done exit arms a continuation at the post-inner-loop pc; the
+    // continuation records the remaining outer-body work, reaches the next inner
+    // `for_prep`, and links back to the inner root. Phase 3 executes that tier-1a
+    // chain, including the nsieve-shaped statement between the inner loop and the
+    // outer back-edge. Output must stay byte-identical to tier-0 across
+    // {gc_stress × {off, record-only, no-opt, record-execute, native}}. Inner trip
+    // count (30) clears `min_trip_entry` so the inner trace is genuinely entered
+    // and the linked path can run in the executing modes.
     try expectProgram(
         \\local s = 0
         \\for i = 1, 40 do
         \\  for j = 1, 30 do
         \\    s = s + i * j
         \\  end
+        \\  s = s + i
         \\end
         \\print(s)
         \\
     ,
-        "381300\n",
+        "382120\n",
     );
 }
 
@@ -9356,13 +9383,11 @@ test "nested-loop: a hot inner loop's continuation links to the inner root at th
     // *continuation* recording anchored at the **post-inner-loop pc** — a non-header
     // anchor (the Phase 1 machinery). That continuation records the outer body
     // forward and re-reaches the inner `for_prep`; because the inner root is already
-    // cached, Phase 2 records `for_prep`'s pre-decrement and **closes the trace with
-    // a `.link`** to the inner root (instead of the Phase 1 LINNER abort). The link
-    // trace is cached but never *executed* in Phase 2 (`tryChainExit` skips it, and
-    // its post-loop anchor pc is not a back-edge target the dispatch loop enters), so
-    // output stays byte-identical to tier-0 — the `expectProgram` matrix pins that
-    // separately. Here we prove the link committed by finding a `.link`-terminated
-    // trace in the cache alongside the inner `.loop` root.
+    // cached, Phase 2 reconstructs the inner root's entry snapshot and **closes the
+    // trace with a `.link`** to the inner root (instead of the Phase 1 LINNER abort).
+    // Phase 3 may execute the link, but this shape test is still about the recorded
+    // cache: prove the link committed by finding a `.link`-terminated trace alongside
+    // the inner `.loop` root.
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
@@ -9412,6 +9437,70 @@ test "nested-loop: a hot inner loop's continuation links to the inner root at th
         }
         try testing.expect(found_root);
     }
+}
+
+test "nested-loop: linked continuation execution is observable (Phase 3)" {
+    const source =
+        \\local s = 0
+        \\for i = 1, 40 do
+        \\  for j = 1, 30 do
+        \\    s = s + i * j
+        \\  end
+        \\  s = s + i
+        \\end
+        \\print(s)
+    ;
+
+    var tier0_buf: [64]u8 = undefined;
+    var tier0 = io.Writer.fixed(&tier0_buf);
+    try runCaptured(testing.allocator, source, &tier0, false, .off);
+
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var jit_buf: [64]u8 = undefined;
+    var jit = io.Writer.fixed(&jit_buf);
+    var chunk = try runExecForTrace(&vm, gpa, source, &jit);
+    defer chunk.deinit();
+
+    try testing.expectEqualStrings(tier0.buffered(), jit.buffered());
+    try testing.expect(vm.trace.link_ir_exits > 0);
+    try testing.expect(vm.trace.link_follow_count > 0);
+}
+
+test "nested-loop: linked array stores commit exactly once at tier-1a boundary" {
+    const source =
+        \\local a = {}
+        \\for k = 1, 200 do a[k] = 0 end
+        \\local s = 0
+        \\for i = 1, 400 do
+        \\  for j = 1, 100 do
+        \\    a[j] = a[j] + i
+        \\  end
+        \\  s = s + i
+        \\end
+        \\local sum = 0
+        \\for k = 1, 200 do sum = sum + a[k] end
+        \\print(sum)
+        \\print(s)
+    ;
+
+    var tier0_buf: [64]u8 = undefined;
+    var tier0 = io.Writer.fixed(&tier0_buf);
+    try runCaptured(testing.allocator, source, &tier0, false, .off);
+    try testing.expectEqualStrings("8020000\n80200\n", tier0.buffered());
+
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var jit_buf: [64]u8 = undefined;
+    var jit = io.Writer.fixed(&jit_buf);
+    var chunk = try runExecForTrace(&vm, gpa, source, &jit);
+    defer chunk.deinit();
+
+    try testing.expect(vm.trace.link_ir_exits > 0);
+    try testing.expect(vm.trace.link_follow_count > 0);
+    try testing.expectEqualStrings(tier0.buffered(), jit.buffered());
 }
 
 test "executor: a hot numeric-for sum runs via the IR-interpreter (back-edges collapse)" {

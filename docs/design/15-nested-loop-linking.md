@@ -1,8 +1,8 @@
 # Nested-Loop Trace Linking — Design
 
-Status: partial — Phases 1–2 (exit-PC anchors + `.link` terminator) landed; Phases 3–4 outstanding
+Status: partial — Phases 1–3 (exit-PC anchors + `.link` tier-1a execution) landed; Phase 4 outstanding
 Owner: Bart
-Last updated: 2026-06-27
+Last updated: 2026-07-07
 
 The tracing JIT cannot trace **nested numeric-`for` loops**. An outer loop that
 contains an inner loop never tiers up: the recorder aborts at the inner loop's
@@ -13,7 +13,7 @@ codegen tightness) and a measurable slice of the remaining LuaJIT gap on nsieve
 
 This doc is the contract for closing that gap the way LuaJIT does — **trace
 linking**, not loop unrolling — and the home for the determinism **proof
-obligations** the phases must discharge to stay byte-identical across the 8-mode
+obligations** the phases must discharge to stay byte-identical across the 10-mode
 matrix.
 
 ## Implementation status
@@ -49,9 +49,9 @@ land; move whole sections to Done once everything inside is checked.
   accepts `.loop` **or** `.link` as the sole terminal; `commit` appends
   `.link{aux = inner anchor pc}` when `Recorder.link_target` is set and caches the
   trace **unoptimized** (`tropt` is skipped — its LICM/φ machinery and the
-  `instrs[n-1].op == .loop` assert are written for back-edge loops, and a Phase-2
-  link trace is never executed anyway). `recForPrepLink` (dispatched from the
-  `.for_prep` recording arm) reconstructs the inner root's entry state
+  `instrs[n-1].op == .loop` assert are written for back-edge loops; Phase 3
+  executes the unoptimized straight-line continuation). `recForPrepLink`
+  (dispatched from the `.for_prep` recording arm) reconstructs the inner root's entry state
   (`R[a] = init`, visible var `R[a+3] = init`, plus a first-iteration bounds guard)
   and closes with the link **iff** (a) this recording is a *continuation*
   (`Recorder.is_continuation`, set only by `maybeStartContinuation`) — a *root*
@@ -65,19 +65,38 @@ land; move whole sections to Done once everything inside is checked.
   **and** the first `for_loop`) is `R[a] = init` **and** the visible loop var
   `R[a+3] = init` — both live entry inputs — not `R[a] = init − step`. A
   first-iteration bounds guard (`init` within `limit`) gates the link so a zero-trip
-  inner loop falls back to tier-0. The link trace is committed but
-  **never executed** in Phase 2 — `tryChainExit` skips any `.link`-terminated trace,
-  and the continuation's post-loop anchor pc is not a back-edge target the dispatch
-  loop enters — so output stays byte-identical (pinned by the `expectProgram` matrix
+  inner loop falls back to tier-0. The link trace is committed but was inert in
+  Phase 2, so output stayed byte-identical (pinned by the `expectProgram` matrix
   plus a focused test asserting a `.link`-terminated trace is cached whose `aux`
-  resolves to a cached `.loop` root). `irinterp` has the `.link` arm (a clean
-  zero-commit fall-through) ready for Phase 3, but it is dead in Phase 2.
+  resolves to a cached `.loop` root).
+- [x] **Phase 3 — Linked execution, tier-1a.** Productive inner loop-done exits now
+  route through `tryChainExit` after committing the final numeric-for iteration's
+  linked hand-off state (sunk stores + slot-bound φs, with the visible loop var
+  left at tier-0's last in-bounds value). `irinterp.execute` flushes a `.link`
+  trace's φ snapshot before returning the link exit; `tryChainExit` follows that
+  link to the cached `.loop` inner root and ping-pongs continuation ⇄ inner root
+  with the existing 8-hop bound until a real exit. The chain returns the bytecode
+  PC where tier-0 must resume: post-inner-loop when registers are at the
+  continuation anchor (including a flushed initial loop-done exit whose
+  continuation exits before `.link`), or the inner root anchor when the bound
+  yields immediately after a `.link`. Roll-up treats an inner loop-done exit as
+  one successful enclosing-loop completion even when the inner root reports
+  `completed == 0`, so the continuation is not penalized for a correct hand-off.
+  Link creation now requires a cached `.loop` root, the same-anchor trial walk
+  explicitly skips `.link` traces, pending continuation arms are cleared when
+  execution leaves the dispatch loop, and the continuation trigger handles the
+  nsieve-shaped "work after inner loop, then outer back-edge" form. Pinned by a
+  nested-loop `expectProgram` 10-mode test (including the nsieve-shaped post-inner
+  statement) plus focused execution-counter tests asserting the `.link` arm and
+  follow branch actually ran, including an additive array-store nest that catches
+  double-commit across the tier-1a→tier-0 boundary. The keyframe loose end is
+  closed as tier-0-shaped coverage, not a literal link-crossing cut: the F2c
+  harness creates fresh VMs with tracing disabled, so it cannot suspend inside a
+  tier-1a chain. A dedicated F2c test now runs a 400×60 linking-shaped nested
+  numeric-for through mid-execution capture/resume to prove the same bytecode
+  shape remains snapshot-resumable.
 
 ### Outstanding
-- [ ] **Phase 3 — Linked execution, tier-1a.** `irinterp.execute` follows
-  `.link`; roll-up treats the inner loop-done exit as one outer success.
-  Nested-loop program in the `expectProgram` 8-mode matrix incl. a keyframe
-  cut→resume across a link. Correct but not yet faster.
 - [ ] **Phase 4 — Native-to-native chain.** `nativegen` lowers `.link` to a
   native jump/tailcall into the inner trace's native entry; inner loop-done exit
   returns into the continuation's native code. Discharge **P4**. Re-profile.
@@ -147,12 +166,16 @@ that "later".
    loop-done exit, `tryChainExit` finds the continuation trace at that exit PC and
    runs it; the continuation runs the outer body and, at its `.link`, transfers
    control back into the inner root. Tier-1a (Phase 3) does this by nesting
-   `irinterp.execute`; native (Phase 4) does it with a direct jump/tailcall into
-   the inner trace's native entry.
+   `irinterp.execute`. Because the ordinary tier-1a deopt model leaves registers
+   at the loop header on a guard exit, the productive loop-done chain first commits
+   the final numeric-for iteration's hand-off state from the executor scratch, then
+   resumes tier-0 at the PC that matches the bounded chain's final register state.
+   Native (Phase 4) does it with a direct jump/tailcall into the inner trace's
+   native entry.
 
 ## Proof obligations (the determinism contract)
 
-The primary gate is the 8-mode matrix — `{gc_stress off/on} × {trace off,
+The primary gate is the 10-mode matrix — `{gc_stress off/on} × {trace off,
 record-only, record+exec-noopt, record+exec-opt, record+exec-native}` — producing
 **byte-identical** output, plus the keyframe/replay goldens. These invariants
 must hold and are stated here so a future refactor cannot silently break them.
@@ -228,26 +251,54 @@ The native linked chain produces byte-identical registers to the tier-1a linked
 chain at every link boundary (the existing native-vs-oracle pattern). No
 divergence when crossing `.link` in either direction.
 
+### Keyframes and linked traces (Phase 3 finding)
+
+Current F2c keyframe capture/resume tests are **tier-0-only**. The source evidence
+is direct: `keyframeser.zig`'s `referenceRun` and `expectResume` both construct a
+fresh `Vm.init`, compile the program, and run/start it without setting
+`vm.trace.config.enabled`; `TraceState` defaults to disabled, and only the CLI /
+`interp.zig` trace helpers opt in.
+
+So a Phase-3 "keyframe cut across a link" is not currently feasible in that
+harness. A keyframe records tier-0-visible heap, stack, frame cursors, globals,
+and open upvalues at interpreter safepoints. Tier-1a traces have no mid-trace
+safepoints, and the linked chain's contract is to flush/deopt to coherent tier-0
+state at every boundary where the interpreter resumes. Replay safety is therefore
+covered by the existing F2c machinery for any equivalent tier-0 bytecode shape,
+plus the separate Phase-3 trace tests that assert `link_ir_exits > 0` and
+`link_follow_count > 0` for the same nested-loop class. The added F2c
+`linked_shape` test uses outer=400, inner=60, and a post-inner statement: if
+tracing were enabled, it is large enough to build and follow the inner-root ⇄
+continuation link, but under F2c it proves byte-identical cut/resume at tier-0
+safepoints.
+
 ## Edge cases & guards
 
-- **Loop-done vs type-change vs `if`-branch exits.** The inner `for_loop`'s
-  `guard_true` carries the `for_loop` PC in its `aux` (per-guard PC recording);
-  an `if`-branch `guard_true` carries the branch instruction's PC. Distinct
-  bytecode offsets ⇒ distinct `GuardKey.exit_pc`, so arming targets the right
-  site. Type-change exits are the `guard_int/float/number` guards emitted *before*
-  the `guard_true` and are a different failure entirely.
-- **`.link` well-formedness.** `assertWellFormed` currently asserts the terminal
-  op is `.loop`. Phase 2 must extend it to accept `.link` as a valid terminal, or
-  every linked trace panics the debug-build verifier (a correctness-oracle
-  regression).
+- **Loop-done vs type-change vs `if`-branch exits.** Guards stamp the
+  post-increment bytecode PC (`recordInstr`'s `pc` argument), so an inner
+  `for_loop` loop-done `guard_true` carries the post-inner-loop PC in `aux`, and
+  the actual `for_loop` instruction is at `exit_pc - 1`. An `if`-branch
+  `guard_true` carries the branch's own post-increment PC. Distinct bytecode
+  offsets ⇒ distinct `GuardKey.exit_pc`, so arming targets the right site.
+  Type-change exits are the `guard_int/float/number` guards emitted *before* the
+  `guard_true` and are a different failure entirely.
+- **`.link` well-formedness.** `assertWellFormed` accepts `.loop` or `.link` as
+  the sole terminal, so a linked trace remains verifier-valid.
 - **Watermark.** `recForLoop`'s `target == anchor.pc` (which sets
   `locals_watermark`) must fire only for the continuation trace's *own* anchoring
   back-edge, never the inner `for_loop` it passes through, or the exit snapshot
   drops live slots.
-- **Roll-up / penalty.** In linked execution, the inner trace's loop-done exit
-  returns `completed = 0`; the continuation must treat that as **one successful
-  outer-body completion**, not a failed trace (else `onSideExit(., 0)` penalizes
-  and eventually gates a correct trace).
+- **Roll-up / penalty.** In linked execution, the inner trace's loop-done exit is
+  **one successful outer-body completion**, even if the inner root reports
+  `completed = 0` (else `onSideExit(., 0)` penalizes and eventually gates a
+  correct trace).
+- **Bounded resume PC.** Once `flushNumericForLoopDone` has committed a loop-done
+  iteration, the chain must not fall back to the ordinary loop-header deopt path:
+  tier-0 would replay the final in-bounds iteration and double-apply sunk stores.
+  If the continuation exits before `.link` (for example the outer loop is done),
+  tier-0 resumes at the continuation anchor. When the bound yields immediately
+  after a continuation `.link`, tier-0 resumes at the inner root anchor; resuming
+  at the post-inner pc in that state skips a whole inner loop.
 - **Termination.** continuation → inner-root → `.loop`; no deeper nesting. Reuse
   `tryChainExit`'s existing 8-deep visited set; `irinterp.execute` does not call
   `tryChainExit`, so a linked run cannot recurse into the chainer.
@@ -257,13 +308,19 @@ divergence when crossing `.link` in either direction.
   the guard that keeps a link trace from anchoring at the outer body start, which
   *is* a real back-edge target the dispatch loop would enter. (A link trace's own
   anchor — the continuation's post-inner-loop pc — is never a back-edge target.)
-- **Link traces are inert until Phase 3.** `tryChainExit` skips any
-  `.link`-terminated trace (the only path that could otherwise reach the
-  continuation's anchor pc). Running one straight through would execute the outer
-  body's sunk stores and then fall through at `.link` with `completed == 0`,
-  double-applying them on the tier-0 redo. **Phase 3 must remove that skip** as it
-  teaches the chain to *follow* the link (run the inner root, ping-pong) — the
-  `irinterp` `.link` arm is already a clean zero-commit fall-through placeholder.
+- **Link traces execute only through exit-PC chaining.** The same-anchor trial walk
+  skips `.link` traces; `tryChainExit` is the only tier-1a entry path because it
+  has the failed inner root, the continuation anchor, and the 8-hop visited bound.
+  `irinterp` flushes the `.link` trace's φ snapshot before reporting the link exit;
+  `tryChainExit` then enters the cached `.loop` inner root and rolls an inner
+  loop-done exit up as one enclosing-loop completion.
+- **`gstore` loop-done flush is defensive today.** Although
+  `flushNumericForLoopDone` has a `gstore` commit arm beside `astore`/`hstore`,
+  a linked source-level 2D-grid nest cannot currently reach it. The fused
+  `m[i][j] = m[i][j] + k` bytecodes record through `get_index2`/`set_index2`;
+  for this nest they abort as `nyi_opcode` before any continuation link is
+  committed, so `--dump-traces` shows no `gstore` and no linked continuation.
+  The arm stays functional for future fused-grid recording work.
 
 ## Non-goals (initial cut)
 
@@ -277,7 +334,7 @@ divergence when crossing `.link` in either direction.
 ## References
 
 - `01-trace-lifecycle.md` — recording transparency, anchors, termination policy.
-- `02-determinism.md` — the 8-mode matrix + replay contract this must satisfy.
+- `02-determinism.md` — the determinism matrix + replay contract this must satisfy.
 - `05-native-codegen.md` — native entry/exit, the oracle pattern (Phase 4).
 - `~/Projects/LuaJIT/src/lj_record.c` — `rec_loop_jit`, `rec_loop_interp`,
   `rec_for`, the `LJ_TRLINK_*` link types (`lj_jit.h`).

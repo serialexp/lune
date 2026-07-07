@@ -409,19 +409,16 @@ pub const IrOp = enum(u8) {
     /// trace (one anchored at a non-header exit pc, recording the outer body) when,
     /// going forward, it re-reaches an inner numeric-`for`'s `for_prep` whose loop
     /// header **already has a root trace**. The recorder records `for_prep`'s
-    /// pre-decrement (`R[a] = init − step`) as the final body op, then this
-    /// terminator hands control to the inner root anchored at `aux` (a bytecode pc
-    /// in the *same* proto — replay-safe, never a pointer). Carries no operand refs
-    /// (`a`/`b` unused). Structurally a terminal exactly like `.loop`: exactly one,
-    /// last in the trace, with the φ block immediately preceding it as the
-    /// register hand-off snapshot.
+    /// entry state (`R[a] = init`, `R[a+3] = init`) as the final hand-off snapshot,
+    /// then this terminator hands control to the inner root anchored at `aux` (a
+    /// bytecode pc in the *same* proto — replay-safe, never a pointer). Carries no
+    /// operand refs (`a`/`b` unused). Structurally a terminal exactly like `.loop`:
+    /// exactly one, last in the trace, with the φ block immediately preceding it as
+    /// the register hand-off snapshot.
     ///
-    /// Phase 2 executes it as a **clean zero-commit side-exit**: the executor
-    /// breaks at `.link` with `completed` unchanged and applies *no* φ writeback,
-    /// so tier-0 redoes the iteration from the anchor (byte-identical fall-through).
-    /// Phase 3 makes tier-1a *follow* the link (run the inner root, ping-pong);
-    /// Phase 4 lowers it to a native-to-native chain. Appended last so every prior
-    /// op's wire ordinal stays stable.
+    /// Phase 3 tier-1a flushes the snapshot and follows the link through
+    /// `tryChainExit`; Phase 4 lowers it to a native-to-native chain. Appended last
+    /// so every prior op's wire ordinal stays stable.
     link,
 };
 
@@ -461,6 +458,15 @@ pub fn guardExitPc(ins: IrInstr) ?u32 {
 /// value produced by IR `ref`. The set of these is the trace's exit snapshot —
 /// what a future executor copies back into the register file each iteration.
 pub const SlotStore = struct { slot: u16, ref: Ref };
+
+/// Result of an exit-PC chain attempt. Ordinary same-loop side traces resume at
+/// the caller's current loop header (`resume_pc == null`). Nested-loop link
+/// chains consume a post-inner-loop continuation and therefore resume tier-0 at
+/// that continuation anchor when the bounded chain yields back.
+pub const ChainResult = struct {
+    completed: usize,
+    resume_pc: ?u32 = null,
+};
 
 /// Identifies a trace anchor: a loop header at byte-`pc` within a `Proto`. Loop
 /// headers are the only root-trace anchors in Phase 5a (hot side exits seed side
@@ -833,6 +839,13 @@ pub const TraceState = struct {
     /// signal for benchmark analysis (entries ≫ committed-iterations means a
     /// low-yield loop the JIT can't amortize).
     entries: u64 = 0,
+    /// Diagnostic/test counters for nested-loop link execution. `link_ir_exits`
+    /// counts continuations that actually reached the irinterp `.link` arm;
+    /// `link_follow_count` counts those links being followed into the inner root.
+    /// They are intentionally harmless in release builds and give tests a direct
+    /// proof that Phase 3 is not inert.
+    link_ir_exits: u64 = 0,
+    link_follow_count: u64 = 0,
     /// The in-progress recording (at most one at a time in Phase 5a).
     rec: Recorder = .{},
     /// Reusable SSA-value scratch for the tier-1a executor (`irinterp.execute`),
@@ -941,6 +954,23 @@ pub const TraceState = struct {
         return best;
     }
 
+    /// Highest-hit cached root trace at `(proto, pc)`. Link hand-offs are only
+    /// sound to a real loop-root terminal; a continuation at the same bytecode PC
+    /// is not an entry target for `.link`.
+    pub fn findLoopTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
+        var best: ?*Trace = null;
+        var best_hits: u64 = 0;
+        for (self.cache.items) |t| {
+            if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
+            if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .loop) continue;
+            if (best == null or t.hit_count > best_hits) {
+                best = t;
+                best_hits = t.hit_count;
+            }
+        }
+        return best;
+    }
+
     /// Highest-`hit_count` trace at `(proto, pc)` that is not in `visited`, or
     /// null. Same-anchor walks (the dispatch trial loop and exit-PC chaining)
     /// use this with a growing `visited` set so they visit each candidate
@@ -1041,7 +1071,33 @@ pub const TraceState = struct {
         exit_instr: u32,
         proto: *const Proto,
         regs: RegWindow,
-    ) ?usize {
+    ) ?ChainResult {
+        return self.tryChainExitInternal(failed, exit_instr, proto, regs, null);
+    }
+
+    /// Productive numeric-for loop-done chaining. Unlike ordinary deopt, the
+    /// linked path starts at the post-loop continuation, so the just-failed final
+    /// inner iteration must be committed from the executor scratch before the
+    /// continuation runs.
+    pub fn tryChainProductiveLoopDone(
+        self: *TraceState,
+        failed: *const Trace,
+        exit_instr: u32,
+        proto: *const Proto,
+        regs: RegWindow,
+        values: []Value,
+    ) ?ChainResult {
+        return self.tryChainExitInternal(failed, exit_instr, proto, regs, values);
+    }
+
+    fn tryChainExitInternal(
+        self: *TraceState,
+        failed: *const Trace,
+        exit_instr: u32,
+        proto: *const Proto,
+        regs: RegWindow,
+        initial_loop_done_values: ?[]Value,
+    ) ?ChainResult {
         if (exit_instr == std.math.maxInt(u32)) return null;
         // Resolve the exit PC through the op-gated accessor: array guards store a
         // lane ordinal in `aux`, not a PC, so a first-iteration array-guard exit
@@ -1073,19 +1129,89 @@ pub const TraceState = struct {
             // it cannot be entered through the chain path. Skip it — it still runs
             // via the normal seeded same-anchor walk.
             if (sct.inputs.len != 0) continue;
-            // Phase 2 (doc 15): a continuation trace closes with a `.link` terminator,
-            // but the executor cannot yet *follow* the link. Running it straight
-            // through would execute the outer body's sunk stores and then fall through
-            // at `.link` with `completed == 0`, double-applying those stores when
-            // tier-0 redoes the iteration from the anchor. Until Phase 3 teaches the
-            // chain to follow the link (run the inner root, ping-pong), never enter a
-            // link trace — it stays cached but inert, so output is byte-identical.
-            if (sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link) continue;
+            const is_link = sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link;
+            if (initial_loop_done_values != null and !is_link) continue;
             const sbuf = self.valuesScratch(sct.instrs.len) catch continue;
+            // Once a productive loop-done exit has been flushed, the ordinary
+            // loop-header deopt path is no longer valid: tier-0 must resume at the
+            // PC that matches the now-committed state. The target advances from the
+            // post-inner continuation anchor to the inner root anchor only after a
+            // `.link` snapshot has been flushed.
+            var flushed_resume_pc: ?u32 = null;
+            if (initial_loop_done_values) |vals| {
+                if (!irinterp.flushNumericForLoopDone(failed, regs, vals, exit_instr)) return null;
+                flushed_resume_pc = exit_pc;
+            }
             const sresult = irinterp.execute(sct, regs, sbuf);
+            if (is_link and sresult.exit_instr == sct.instrs.len - 1) {
+                self.link_ir_exits +|= 1;
+                var linked_completed: usize = 0;
+                const current_link = sct;
+                var resume_pc: u32 = @intCast(current_link.instrs[current_link.instrs.len - 1].aux);
+                flushed_resume_pc = resume_pc;
+                var hops: usize = 0;
+                while (hops < visited.len) : (hops += 1) {
+                    const link_term = current_link.instrs[current_link.instrs.len - 1];
+                    const inner_pc: u32 = @intCast(link_term.aux);
+                    const inner = self.findLoopTrace(proto, inner_pc) orelse break;
+                    if (inner.inputs.len != 0) break;
+                    self.link_follow_count +|= 1;
+
+                    const ibuf = self.valuesScratch(inner.instrs.len) catch break;
+                    const iresult = irinterp.execute(inner, regs, ibuf);
+                    if (iresult.exit_instr == std.math.maxInt(u32)) break;
+
+                    const inner_exit_pc = guardExitPc(inner.instrs[iresult.exit_instr]) orelse break;
+                    const loop_done = inner_exit_pc == current_link.anchor.pc;
+                    if (!loop_done) {
+                        if (iresult.completed > 0) {
+                            self.onSideExit(inner, iresult.completed);
+                            return .{
+                                .completed = if (linked_completed > 0) linked_completed else iresult.completed,
+                                .resume_pc = resume_pc,
+                            };
+                        }
+                        self.onSideExit(inner, 0);
+                        break;
+                    }
+                    if (!irinterp.flushNumericForLoopDone(inner, regs, ibuf, iresult.exit_instr)) break;
+                    resume_pc = current_link.anchor.pc;
+
+                    // Roll-up (doc 15 P3): the inner root running to its loop-done
+                    // exit completes exactly one enclosing-loop iteration. This is
+                    // true even when the root reports `completed == 0` (e.g. a
+                    // one-trip inner loop): it is a successful linked hand-off, not a
+                    // low-yield trace entry to penalize.
+                    self.onSideExit(inner, if (iresult.completed > 0) iresult.completed else 1);
+                    linked_completed += 1;
+
+                    const cbuf = self.valuesScratch(current_link.instrs.len) catch break;
+                    const cresult = irinterp.execute(current_link, regs, cbuf);
+                    if (cresult.exit_instr == current_link.instrs.len - 1) {
+                        resume_pc = inner_pc;
+                        continue;
+                    }
+                    if (cresult.completed > 0) {
+                        self.onSideExit(current_link, cresult.completed);
+                        return .{ .completed = linked_completed + cresult.completed, .resume_pc = resume_pc };
+                    }
+                    break;
+                }
+                if (linked_completed > 0) {
+                    self.onSideExit(sct, linked_completed);
+                    return .{ .completed = linked_completed, .resume_pc = resume_pc };
+                }
+                self.onSideExit(sct, 0);
+                if (flushed_resume_pc) |target_pc| return .{ .completed = 0, .resume_pc = target_pc };
+                continue;
+            }
+            if (flushed_resume_pc) |target_pc| {
+                self.onSideExit(sct, 0);
+                return .{ .completed = 0, .resume_pc = target_pc };
+            }
             if (sresult.completed > 0) {
                 self.onSideExit(sct, sresult.completed);
-                return sresult.completed;
+                return .{ .completed = sresult.completed };
             }
             self.onSideExit(sct, 0);
         }
@@ -1095,11 +1221,11 @@ pub const TraceState = struct {
     /// **Nested-loop continuation arming (Phase 1).** Called on a *productive*
     /// (`completed > 0`) side-exit of a numeric-`for` trace whose terminal
     /// loop-continuation `guard_true` failed — i.e. the inner loop ran to
-    /// completion. When that exit lands directly on an *enclosing* loop's
-    /// back-edge instruction (`code[exit_pc]` is a `for_loop`/`tfor_loop`), this is
-    /// a 2-level nest: arm a *continuation* recording anchored at `exit_pc`, the
-    /// post-inner-loop pc, so it records the outer body forward and — once Phase 2
-    /// lands — links back to this inner root instead of unrolling it.
+    /// completion. When that exit can reach an enclosing loop's back-edge (either
+    /// immediately, or after straight-line outer-body work like nsieve's count
+    /// update), this is a 2-level nest: arm a *continuation* recording anchored at
+    /// `exit_pc`, the post-inner-loop pc, so it records the outer body forward and
+    /// links back to this inner root instead of unrolling it.
     ///
     /// The recording does **not** begin here. tier-0 must first deopt-replay the
     /// inner loop's final iteration (the productive exit side-exits before
@@ -1107,13 +1233,10 @@ pub const TraceState = struct {
     /// `cur_pc` reaches `exit_pc`, so the recorder's first op is the outer body,
     /// never a stray inner iteration.
     ///
-    /// Conservative + self-limiting, and output-preserving: only the
-    /// directly-enclosing-loop shape arms (nsieve's "outer body after the inner
-    /// loop" shape is generalized in Phase 3); an already-traced, gated, or
-    /// already-pending anchor is skipped; and the Phase 1 continuation always
-    /// aborts at the inner `for_prep` (LINNER) — which gates `exit_pc` with
-    /// backoff — so nothing commits and tier-0 output is byte-identical whether or
-    /// not this fires. See `docs/design/15-nested-loop-linking.md`.
+    /// Conservative + self-limiting, and output-preserving: the scan is bounded,
+    /// stops at returns, and only accepts a later back-edge whose target encloses
+    /// the inner anchor; an already-traced, gated, or already-pending anchor is
+    /// skipped. See `docs/design/15-nested-loop-linking.md`.
     pub fn maybeArmContinuation(self: *TraceState, failed: *const Trace, exit_instr: u32, proto: *const Proto) void {
         if (exit_instr == std.math.maxInt(u32)) return; // native: no per-guard pc
         if (self.rec.active or self.pending_exit_anchor != null) return;
@@ -1125,17 +1248,30 @@ pub const TraceState = struct {
         const exit_pc = guardExitPc(ins) orelse return;
         if (exit_pc == 0 or exit_pc == failed.anchor.pc) return;
         if (exit_pc >= proto.code.len) return;
-        // Phase 1 scope: the loop-done exit must land on an enclosing loop's
-        // back-edge (the inner loop is the last statement of the outer body — the
-        // canonical nest). This cheap structural test is deterministic and keeps
-        // standalone hot loops from each arming a speculative post-loop recording.
-        const outer = proto.code[exit_pc].op;
-        if (outer != .for_loop and outer != .tfor_loop) return;
+        if (proto.code[exit_pc - 1].op != .for_loop) return;
+        if (!continuationReachesEnclosingBackEdge(proto, exit_pc, failed.anchor.pc)) return;
         const key = AnchorKey{ .proto = proto, .pc = exit_pc };
         // Don't fight the normal machinery: a trace already cached here, or a gated
         // anchor (a prior continuation aborted → back off), is left alone.
         if (self.hasTrace(key) or self.isGated(key)) return;
         self.pending_exit_anchor = key;
+    }
+
+    fn continuationReachesEnclosingBackEdge(proto: *const Proto, start_pc: u32, inner_anchor: u32) bool {
+        const scan_limit: usize = @min(proto.code.len, @as(usize, @intCast(start_pc)) + 128);
+        var pc: usize = @intCast(start_pc);
+        while (pc < scan_limit) : (pc += 1) {
+            const ins = proto.code[pc];
+            switch (ins.op) {
+                .for_loop, .tfor_loop => {
+                    const target = @as(i64, @intCast(pc)) + 1 + ins.aux;
+                    if (target >= 0 and target <= @as(i64, @intCast(inner_anchor))) return true;
+                },
+                .ret, .halt => return false,
+                else => {},
+            }
+        }
+        return false;
     }
 
     /// Dispatch-prologue hook (Phase 1): activate a pending continuation recording
@@ -1154,6 +1290,14 @@ pub const TraceState = struct {
         // `.link` at the inner `for_prep` (a root recording, armed via `arm`, leaves
         // this false and instead LINNER-aborts there — LuaJIT's model).
         self.rec.is_continuation = true;
+    }
+
+    /// Drop a pending non-header continuation arm. Used when VM execution leaves
+    /// the dispatch loop before the `.full` prologue can consume it (error,
+    /// suspension, or frame unwind), so the VM cannot stay pinned in `.full` mode
+    /// behind a stale post-loop pc.
+    pub fn clearPendingExitAnchor(self: *TraceState) void {
+        self.pending_exit_anchor = null;
     }
 
     /// Count a guard failure at `exit_pc` within a trace anchored at `anchor`.
@@ -1601,9 +1745,9 @@ pub const TraceState = struct {
         const entry = self.rec.entry_slots.items;
 
         // Link traces are cached **unoptimized**: `tropt.optimize` asserts a `.loop`
-        // terminal (and its LICM/φ machinery is written for back-edge loops), and a
-        // Phase-2 link trace is never executed anyway (see `tryChainExit`), so there
-        // is nothing to optimize. `dupe` preserves the `.link` terminal verbatim.
+        // terminal and its LICM/φ machinery is written for back-edge loops. Phase 3
+        // executes link traces through `tryChainExit`, but the unoptimized straight-line
+        // continuation is the intended hand-off shape. `dupe` preserves `.link`.
         const fields: tropt.Optimized = if (self.config.optimize and self.rec.link_target == null)
             tropt.optimize(self.gpa, instrs, consts) catch |e| switch (e) {
                 // Never fail a commit (or thrash the anchor) over an optimizer
@@ -2708,8 +2852,7 @@ pub const TraceState = struct {
     /// A first-iteration bounds guard (`init` within `limit`) gates the link: a
     /// zero-trip inner loop fails it and falls back to tier-0 rather than entering the
     /// inner root, which assumes ≥1 iteration. Phase 3 consumes this snapshot to follow
-    /// the link; Phase 2 only records it (the link trace is never executed — see
-    /// `tryChainExit`).
+    /// the link through `tryChainExit`.
     fn recForPrepLink(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) !void {
         // A `for_prep` inside an inlined callee shares `recForLoop`'s cross-frame
         // hazard (raw-pc anchor comparison across protos); keep the historical abort.
@@ -2731,14 +2874,16 @@ pub const TraceState = struct {
         if (proto.code[fl_pc].op != .for_loop) return self.abort(.nyi_opcode);
         const inner_anchor: u32 = pc; // body start == for_loop back-edge target
         // Cross-check the layout assumption: the `for_loop`'s own back-edge resolves
-        // to `inner_anchor` (debug-only; release trusts the `.for_loop` shape check).
-        std.debug.assert(@as(i64, @intCast(fl_pc)) + 1 + proto.code[fl_pc].aux == @as(i64, @intCast(inner_anchor)));
+        // to `inner_anchor`. Treat a mismatch as an ordinary LINNER abort in release
+        // builds too; otherwise a malformed bytecode shape could link to the wrong pc.
+        if (@as(i64, @intCast(fl_pc)) + 1 + proto.code[fl_pc].aux != @as(i64, @intCast(inner_anchor)))
+            return self.abort(.nyi_opcode);
 
         // LINNER (LuaJIT `rec_loop_jit`): only link if the inner loop header already
-        // has a root trace. Otherwise abort — the inner loop must trace as a root
-        // first; once it does, a later continuation links here.
+        // has a `.loop` root trace. Otherwise abort — the inner loop must trace as a
+        // root first; once it does, a later continuation links here.
         const inner_key = AnchorKey{ .proto = proto, .pc = inner_anchor };
-        if (!self.hasTrace(inner_key)) return self.abort(.nyi_opcode);
+        if (self.findLoopTrace(inner_key.proto, inner_key.pc) == null) return self.abort(.nyi_opcode);
 
         // Reconstruct the inner root's entry state (discharges P2 — see the doc
         // comment). Guard init/limit/step are numbers (all three — tier-0 `for_prep`
@@ -4155,7 +4300,8 @@ test "tryChainExit: chains to a trace at the guard's exit PC" {
     const chained = state.tryChainExit(trace_a, 1, &proto, tr_regs.view());
     tr_regs.commit(); // the chained side trace mutated the window — reflect it back
     try testing.expect(chained != null);
-    try testing.expectEqual(@as(usize, 3), chained.?); // Trace B ran 3 iters
+    try testing.expectEqual(@as(usize, 3), chained.?.completed); // Trace B ran 3 iters
+    try testing.expect(chained.?.resume_pc == null);
     try testing.expectEqual(@as(i64, 3), regs[0].asInt()); // r0 carried to 3
 
     // Remove traces from cache before deinit — they have stack-allocated
