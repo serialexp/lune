@@ -2,27 +2,6 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
-## Pre-existing: exec-log serializer crashes on heap Values (July 2026)
-
-`execlogser.encodeFile` routes every exec-log event value through
-`effectser.toEffectResult`, which returns `UnsupportedEffectResult` for non-string
-heap refs. But the irinterp already logs heap Values in at least two places:
-
-- `slot_load` (irinterp.zig:211): logs unconditionally, including table containers
-- `guard_table` pass/exit (irinterp.zig:493/495): logs the heap operand via
-  `rec.guardPass` / `rec.exit`
-
-So **any traced loop that touches a table** (i.e. all of them — every array/hash
-access starts with a `slot_load` of the container table) puts heap Values into the
-exec-log. If `record_exec_log` is ever set to `true` and the log is serialized,
-it will fail. Currently harmless: `record_exec_log` defaults to `false` and only
-the wasm playground (`wasm_entry.zig:543`) sets it. No test serializes the log.
-
-Fix options: (a) make `toEffectResult` encode heap refs (e.g. as an opaque
-pointer-hash or GC-object-id), or (b) filter heap-valued events out before
-serialization, or (c) skip `rec.value()`/`rec.guardPass()` for heap operands at
-the irinterp call sites. Option (c) is cheapest but loses viz detail.
-
 ## Hash-field (string-keyed) tracing — H0+H1 LANDED (June 2026, uncommitted, pending approval)
 
 `obj.field` get/set now records a trace (`href`/`hload`/`hstore`/`guard_hash`) and

@@ -234,9 +234,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                         // old `exit_stores` list was. The body reads the register via
                         // its `slot_load`, never this φ node, so the φ value is dead
                         // except as the back-edge writeback. Emit NO exec-log value
-                        // event (the old exit_store produced none): keeping no-op
-                        // parity AND ensuring a carried *heap* slot never feeds the
-                        // scalar-only exec-log encoder (`UnsupportedEffectResult`).
+                        // event (the old exit_store produced none).
                         values[i] = regs.get(@intCast(ins.aux));
                     }
                 },
@@ -333,12 +331,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                     const ar = t.instrs[ins.a];
                     const tbl = table.Table.fromHeader(values[ar.a].asHeap());
                     values[i] = tbl.getInt(values[ar.b].asInt());
-                    // A `.value`-lane aload of a table produces a heap Value — an
-                    // intermediate pointer consumed by the chained hash-field access,
-                    // not a meaningful scalar result. Skip the exec-log event to avoid
-                    // feeding the scalar-only encoder a heap Value (same precedent as
-                    // slot-bound phi at line ~236). Scalar-lane aload values log normally.
-                    if (record and !values[i].isHeap()) rec.value(i, values[i]);
+                    if (record) rec.value(i, values[i]);
                 },
                 // `astore` — the FIRST mid-iteration heap mutation in the system
                 // (see docs/design/02-determinism.md). Encode `b` into the packed

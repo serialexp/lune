@@ -153,14 +153,21 @@ pub const ExecLogRecorder = struct {
     }
 
     /// Record a non-guard instruction's result. Inert past the detail cap.
+    /// Non-string heap values (tables, closures, …) are silently dropped: the
+    /// wire encoder (`effectser.toEffectResult`) can only represent scalars and
+    /// strings, so recording a heap ref would poison the entire log at
+    /// serialization time. The viz doesn't need intermediate pointers anyway.
     pub fn value(self: *ExecLogRecorder, ref: usize, v: Value) void {
         if (!self.active or self.detail_done) return;
+        if (isUnencodable(v)) return;
         self.scratch.append(self.gpa, .{ .kind = .value, .ref = @intCast(ref), .value = v }) catch {};
     }
 
     /// Record a surviving guard (its checked operand). Inert past the detail cap.
+    /// Non-string heap operands are dropped (same reasoning as `value`).
     pub fn guardPass(self: *ExecLogRecorder, ref: usize, operand: Value) void {
         if (!self.active or self.detail_done) return;
+        if (isUnencodable(operand)) return;
         self.scratch.append(self.gpa, .{ .kind = .guard_pass, .ref = @intCast(ref), .value = operand }) catch {};
     }
 
@@ -175,12 +182,22 @@ pub const ExecLogRecorder = struct {
     }
 
     /// Record the terminal side-exit. Always appended (even past the detail cap), so
-    /// the exit ramp is never lost.
+    /// the exit ramp is never lost. Non-string heap operands are replaced with nil
+    /// (the exit event itself must survive — only the unserializable operand is lost).
     pub fn exit(self: *ExecLogRecorder, ref: usize, kind: ExitKind, operand: Value) void {
         if (!self.active) return;
         self.exit_ref = @intCast(ref);
         self.exit_kind = kind;
-        self.scratch.append(self.gpa, .{ .kind = .exit, .ref = @intCast(ref), .value = operand }) catch {};
+        const safe = if (isUnencodable(operand)) Value.nil() else operand;
+        self.scratch.append(self.gpa, .{ .kind = .exit, .ref = @intCast(ref), .value = safe }) catch {};
+    }
+
+    /// A non-string heap value cannot survive `effectser.toEffectResult` (the wire
+    /// encoder for exec-log values). Tables, closures, and other non-string heap
+    /// objects are intermediate IR artifacts (container refs, function guards) that
+    /// the viz doesn't need — filter them here so individual call sites don't have to.
+    fn isUnencodable(v: Value) bool {
+        return v.tag == .heap_ref and v.heapType() != .string;
     }
 
     /// Finalize the entry with the executor's `completed` yield, copying the scratch
@@ -202,3 +219,75 @@ pub const ExecLogRecorder = struct {
         };
     }
 };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const gc = @import("gc.zig");
+
+test "recorder drops non-string heap values from value/guardPass and nil-substitutes in exit" {
+    const gpa = testing.allocator;
+
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+
+    // Create a table — a non-string heap value the encoder cannot serialize.
+    const tbl = try heap.newTable();
+    const heap_val = Value.heap(&tbl.header);
+
+    // Scalar values the encoder CAN serialize.
+    const int_val = Value.int(42);
+    const float_val = Value.float(3.14);
+
+    var log = TraceExecLog{ .trace_id = 0 };
+    defer log.deinit(gpa);
+
+    var rec = ExecLogRecorder{
+        .gpa = gpa,
+        .max_iters = 100,
+        .max_entries = 100,
+        .log = &log,
+    };
+    defer rec.deinit();
+
+    rec.begin();
+
+    // Scalar value — recorded.
+    rec.value(0, int_val);
+    // Heap value — silently dropped.
+    rec.value(1, heap_val);
+    // Scalar guardPass — recorded.
+    rec.guardPass(2, float_val);
+    // Heap guardPass — silently dropped.
+    rec.guardPass(3, heap_val);
+    // Commit (one iteration).
+    rec.commit();
+    // Exit with heap operand — event recorded, but operand replaced with nil.
+    rec.exit(4, .guard, heap_val);
+
+    rec.end(1);
+
+    try testing.expectEqual(@as(usize, 1), log.entries.items.len);
+    const events = log.entries.items[0].events;
+
+    // Expected: value(0), guardPass(2), commit, exit(4) — two heap events dropped.
+    try testing.expectEqual(@as(usize, 4), events.len);
+
+    try testing.expectEqual(ExecEventKind.value, events[0].kind);
+    try testing.expectEqual(@as(u32, 0), events[0].ref);
+    try testing.expect(events[0].value.isInt());
+
+    try testing.expectEqual(ExecEventKind.guard_pass, events[1].kind);
+    try testing.expectEqual(@as(u32, 2), events[1].ref);
+    try testing.expect(events[1].value.isFloat());
+
+    try testing.expectEqual(ExecEventKind.commit, events[2].kind);
+
+    try testing.expectEqual(ExecEventKind.exit, events[3].kind);
+    try testing.expectEqual(@as(u32, 4), events[3].ref);
+    // Heap operand replaced with nil — the exit event survives but the
+    // unserializable operand doesn't.
+    try testing.expect(events[3].value.isNil());
+}
