@@ -2339,18 +2339,25 @@ pub const TraceState = struct {
         self.setReg(instr.a, r);
     }
 
-    /// Record `t[k]` (`get_index`, `dst=a b=table c=key`) as a lane-aware packed-
-    /// array read. Emits, in order: `guard_table` + `guard_lane` on the table ref,
-    /// `guard_int` on the key, then `aref` (the element address) + `guard_bounds` +
-    /// `guard_present` + `aload`. Aborts (leaving tier-0 untouched) unless the
-    /// observed access is a *present, in-bounds, narrow-lane* slot — the only shape
-    /// the native/oracle read path models:
-    ///   * non-table container or non-int key → `.bad_type` (hash-part / metatable
-    ///     territory, out of scope);
-    ///   * `.value`-lane array → `.nyi_opcode` (the unpacked 16-B path is a
-    ///     deferred scope cut — `.value` arrays stay on tier-0/1a);
-    ///   * out-of-bounds or hole at record time → `.bad_type` (this iteration would
-    ///     immediately side-exit, so the trace would never pay off).
+    /// Record `t[k]` (`get_index`, `dst=a b=table c=key`) as an array read.
+    ///
+    /// **Narrow lanes** (i8–i64/f64/u8/boolean): emits `guard_table` + `guard_lane`
+    /// on the table ref, `guard_int` on the key, then `aref` + `guard_bounds` +
+    /// `guard_present` + `aload`. The result is a scalar value.
+    ///
+    /// **`.value` lane — table elements** (the array-of-structs pattern): emits the
+    /// same prefix but omits `guard_present` (`.value` lane has no presence bitmap —
+    /// nil is in-band) and appends `guard_table` on the *loaded value*, verifying
+    /// the element is a table with no metatable. The result is a heap table ref
+    /// that subsequent `recHashGet`/`recHashSet` calls chain from (e.g. `bodies[i].x`).
+    /// Native declines these traces (`laneKind(.value) → null`); tier-1a executes them.
+    ///
+    /// Aborts (leaving tier-0 untouched) when:
+    ///   * non-table container or non-int key → `.bad_type`;
+    ///   * out-of-bounds or hole at record time → `.bad_type`;
+    ///   * `.value`-lane with a non-table element (function, string, scalar) →
+    ///     `.nyi_opcode` (different guard/native path needed);
+    ///   * element table has a metatable → `.has_metatable`.
     fn recArrayGet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
         // Deferred (sunk) stores must be the LAST array accesses in the trace: an
         // `aload` after any of them would read the pre-store value on-trace while
@@ -2368,11 +2375,39 @@ pub const TraceState = struct {
         // sound conservative choice is to bail the whole trace to tier-0.
         if (tbl.metatable != null) return self.abort(.has_metatable);
         const lane = tbl.array.lane;
-        if (lane == .value) return self.abort(.nyi_opcode); // unpacked path deferred
         const idx = vkey.asInt();
         if (idx < 1 or idx > @as(i64, @intCast(tbl.array.len))) return self.abort(.bad_type);
         const loaded = tbl.getInt(idx);
         if (loaded.isNil()) return self.abort(.bad_type); // hole — not a profitable trace
+
+        if (lane == .value) {
+            // The `.value` lane stores full 16-byte Values (tag+payload, nil in-band).
+            // Accept only when the loaded element is a **table** — the array-of-structs
+            // pattern (`bodies[i].x`). Other heap types (functions, strings) and scalars
+            // in a `.value` lane stay nyi — they'd need a different guard + native path.
+            if (!loaded.isHeap() or loaded.heapType() != .table) return self.abort(.nyi_opcode);
+            const elem_tbl = table_mod.Table.fromHeader(loaded.asHeap());
+            if (elem_tbl.metatable != null) return self.abort(.has_metatable);
+
+            const lane_ord: i32 = @intFromEnum(lane); // 0 for .value
+            const rtab = try self.refOf(instr.b);
+            _ = try self.emit(.{ .op = .guard_table, .a = rtab });
+            _ = try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord });
+            const rkey = try self.refOf(instr.c);
+            try self.guardInt(rkey);
+            const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
+            _ = try self.emit(.{ .op = .guard_bounds, .a = ref });
+            // No guard_present: the `.value` lane has no presence bitmap — nil is
+            // encoded in-band (tag == .nil). A nil element fails the guard_table
+            // below (nil is not a heap_ref) and side-exits to tier-0. Correct.
+            const rload = try self.emit(.{ .op = .aload, .a = ref, .aux = lane_ord, .ty = obsTypeOf(loaded) });
+            // Guard the loaded value is a table with no metatable. This is the type
+            // guard analogous to guard_int/guard_float for scalar loads — it side-exits
+            // when the element's type changes between iterations.
+            _ = try self.emit(.{ .op = .guard_table, .a = rload });
+            self.setReg(instr.a, rload);
+            return;
+        }
 
         const lane_ord: i32 = @intFromEnum(lane);
         const rtab = try self.refOf(instr.b);
@@ -3853,21 +3888,53 @@ test "recArrayGet aborts: non-table container, non-int key, hole, and out-of-bou
     }
 }
 
-test "recArrayGet aborts on a .value-lane (unpacked) array — deferred scope cut" {
+test "recArrayGet records a .value-lane table element (array-of-structs)" {
     const gpa = testing.allocator;
+    // Create a table whose array part holds a table — forces .value lane.
+    const inner = try table_mod.Table.create(gpa);
+    defer inner.destroy(gpa);
+    const outer = try table_mod.Table.create(gpa);
+    defer outer.destroy(gpa);
+    try outer.set(gpa, Value.int(1), Value.heap(&inner.header));
+    try testing.expectEqual(arr.Lane.value, outer.array.lane);
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    var regs = [_]Value{ Value.nil(), Value.heap(&outer.header), Value.int(1) };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
+    // Recording should succeed — the .value-lane table path emits IR.
+    try testing.expect(state.isRecording());
+    try testing.expectEqual(@as(?AbortReason, null), state.rec.abort_reason);
+    // Verify the IR sequence: the last two instructions should be
+    // aload(.value, ty=.heap) followed by guard_table (on the loaded element).
+    const instrs = state.rec.instrs.items;
+    const last = instrs[instrs.len - 1];
+    try testing.expectEqual(IrOp.guard_table, last.op);
+    const aload_ref = last.a;
+    const aload_ins = instrs[@intCast(aload_ref)];
+    try testing.expectEqual(IrOp.aload, aload_ins.op);
+    try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.value)), aload_ins.aux);
+}
+
+test "recArrayGet aborts on a .value-lane non-table element — nyi scope cut" {
+    const gpa = testing.allocator;
+    // Force .value lane by storing a table then a boolean at different indices.
+    const inner = try table_mod.Table.create(gpa);
+    defer inner.destroy(gpa);
     const t = try table_mod.Table.create(gpa);
     defer t.destroy(gpa);
-    // A heap value can only live in the (unpacked) .value lane — eager commit
-    // leaves it there (laneForValue of a heap ref is .value) — exactly the path
-    // the native/oracle read does not model.
-    try t.set(gpa, Value.int(1), Value.heap(&t.header));
+    try t.set(gpa, Value.int(1), Value.heap(&inner.header)); // → .value lane
+    try t.set(gpa, Value.int(2), Value.boolean(true)); // stays .value (can't narrow)
     try testing.expectEqual(arr.Lane.value, t.array.lane);
 
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
     var state = TraceState.init(gpa);
     defer state.deinit();
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
-    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(1) };
+    // Access index 2 (the boolean) — non-table element in .value lane → nyi_opcode.
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(2) };
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.nyi_opcode, state.rec.abort_reason.?);
@@ -3875,9 +3942,14 @@ test "recArrayGet aborts on a .value-lane (unpacked) array — deferred scope cu
 
 test "abort log records (anchor, reason, opcode) and dedups recurrences" {
     const gpa = testing.allocator;
+    // Force .value lane by storing a table at [1] and a boolean at [2].
+    // Accessing [2] (a non-table in .value lane) triggers nyi_opcode.
+    const inner = try table_mod.Table.create(gpa);
+    defer inner.destroy(gpa);
     const t = try table_mod.Table.create(gpa);
     defer t.destroy(gpa);
-    try t.set(gpa, Value.int(1), Value.heap(&t.header)); // forces the .value lane
+    try t.set(gpa, Value.int(1), Value.heap(&inner.header)); // → .value lane
+    try t.set(gpa, Value.int(2), Value.boolean(true)); // stays .value
     try testing.expectEqual(arr.Lane.value, t.array.lane);
 
     const proto = Proto{ .code = &.{}, .name = "loop", .num_registers = 3 };
@@ -3885,7 +3957,8 @@ test "abort log records (anchor, reason, opcode) and dedups recurrences" {
     defer state.deinit();
     state.config.record_aborts = true; // what --dump-aborts flips on
 
-    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(1) };
+    // Access index 2 (the boolean, not the table) → nyi_opcode.
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(2) };
     // Re-arm and abort the same anchor/op three times: a real loop aborts on every
     // back-edge, and the log must collapse that to one row with count == 3.
     for (0..3) |_| {

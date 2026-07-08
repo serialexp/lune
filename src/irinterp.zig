@@ -325,14 +325,20 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 },
                 // Decode the packed slot to a logical Value via the *exact* tier-0
                 // reader (`Table.getInt`), so an executed trace reads byte-identical
-                // to tier-0 by construction. By the time we run, `guard_bounds` and
-                // `guard_present` have already passed, so this hits the array fast
-                // path and returns a present element (never a hash fallback / nil).
+                // to tier-0 by construction. By the time we run, `guard_bounds` (and
+                // `guard_present` for narrow lanes) have already passed, so this hits
+                // the array fast path. For `.value`-lane table loads, the subsequent
+                // `guard_table` on the result verifies it is a table.
                 .aload => {
                     const ar = t.instrs[ins.a];
                     const tbl = table.Table.fromHeader(values[ar.a].asHeap());
                     values[i] = tbl.getInt(values[ar.b].asInt());
-                    if (record) rec.value(i, values[i]);
+                    // A `.value`-lane aload of a table produces a heap Value — an
+                    // intermediate pointer consumed by the chained hash-field access,
+                    // not a meaningful scalar result. Skip the exec-log event to avoid
+                    // feeding the scalar-only encoder a heap Value (same precedent as
+                    // slot-bound phi at line ~236). Scalar-lane aload values log normally.
+                    if (record and !values[i].isHeap()) rec.value(i, values[i]);
                 },
                 // `astore` — the FIRST mid-iteration heap mutation in the system
                 // (see docs/design/02-determinism.md). Encode `b` into the packed

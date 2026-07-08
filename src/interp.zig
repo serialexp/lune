@@ -10571,3 +10571,47 @@ test "grid e2e: table.sort over rows by a key deflates and orders correctly" {
         "1\t2\t3\t10\t30\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// array-of-structs (.value-lane table load) — the bodies[i].x pattern
+// ---------------------------------------------------------------------------
+
+test "array-of-structs: read-only loop over .value-lane table array is byte-identical" {
+    // A small array of tables with scalar fields — the canonical `bodies[i].x`
+    // pattern. The hot loop reads float fields from each element. Before the
+    // .value-lane table support, the recorder aborted here (nyi_opcode on
+    // get_index); after it, tier-1a traces the loop (native declines — Phase 2).
+    // The 10-mode matrix proves byte-identical output.
+    try expectProgram(
+        \\local bodies = {}
+        \\for i = 1, 100 do
+        \\  bodies[i] = { x = i * 1.5, y = i * 2.5 }
+        \\end
+        \\local sx, sy = 0.0, 0.0
+        \\for i = 1, 100 do
+        \\  local b = bodies[i]
+        \\  sx = sx + b.x
+        \\  sy = sy + b.y
+        \\end
+        \\print(sx, sy)
+    , "7575\t12625\n");
+}
+
+test "array-of-structs: single-field read accumulation across element tables" {
+    // A loop that reads one scalar field from each element table in an array,
+    // accumulating the values. Exercises the aload(.value, ty=.heap) →
+    // guard_table(aload) → href → guard_hash → hload chain — the full
+    // array-of-structs read path. No field writes, so no store-sinking
+    // interaction. Byte-identical across the 10-mode matrix.
+    try expectProgram(
+        \\local items = {}
+        \\for i = 1, 50 do
+        \\  items[i] = { val = i * 1.0 }
+        \\end
+        \\local total = 0.0
+        \\for i = 1, 50 do
+        \\  total = total + items[i].val
+        \\end
+        \\print(total)
+    , "1275\n");
+}
