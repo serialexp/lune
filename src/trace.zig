@@ -846,6 +846,10 @@ pub const TraceState = struct {
     /// proof that Phase 3 is not inert.
     link_ir_exits: u64 = 0,
     link_follow_count: u64 = 0,
+    /// Phase 4 native-chain diagnostics. These mirror the tier-1a counters above,
+    /// but only increment when both linked traces execute through native pages.
+    native_link_exits: u64 = 0,
+    native_link_follow_count: u64 = 0,
     /// The in-progress recording (at most one at a time in Phase 5a).
     rec: Recorder = .{},
     /// Reusable SSA-value scratch for the tier-1a executor (`irinterp.execute`),
@@ -1090,6 +1094,134 @@ pub const TraceState = struct {
         return self.tryChainExitInternal(failed, exit_instr, proto, regs, values);
     }
 
+    /// True when a native trace has a link-terminated continuation waiting at one
+    /// of its numeric-for loop-done exits. The dispatcher uses this before native
+    /// entry so the original run can commit the final iteration in linked mode;
+    /// after a normal native deopt the pre-run snapshot needed for that commit is
+    /// already gone.
+    pub fn hasNativeLoopDoneLink(self: *const TraceState, failed: *const Trace, proto: *const Proto) bool {
+        for (failed.instrs) |ins| {
+            if (ins.op != .guard_true) continue;
+            const exit_pc = guardExitPc(ins) orelse continue;
+            if (exit_pc == 0 or exit_pc == failed.anchor.pc or exit_pc > proto.code.len) continue;
+            if (proto.code[exit_pc - 1].op != .for_loop) continue;
+
+            var visited: [8]*Trace = undefined;
+            var nvisited: usize = 0;
+            var st: ?*Trace = self.nextTraceExcluding(proto, exit_pc, visited[0..0]);
+            while (st) |sct| : (st = if (nvisited < visited.len)
+                self.nextTraceExcluding(proto, exit_pc, visited[0..nvisited])
+            else
+                null)
+            {
+                if (nvisited < visited.len) {
+                    visited[nvisited] = sct;
+                    nvisited += 1;
+                }
+                if (sct.inputs.len != 0) continue;
+                if (sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Phase 4 native numeric-for loop-done chaining. Native execution now reports
+    /// the failing guard's IR index. The dispatcher must have entered the root with
+    /// `runLinkedLoopDone`, so a numeric-for loop-done exit has already committed the
+    /// final iteration's post-guard stores and phi snapshot. This path only follows
+    /// native-compiled `.link` continuations and native inner roots; if either side
+    /// cannot compile, it returns null and tier-0 resumes at the committed PC.
+    pub fn tryChainProductiveLoopDoneNative(
+        self: *TraceState,
+        failed: *Trace,
+        exit_instr: u32,
+        proto: *const Proto,
+        regs: RegWindow,
+    ) ?ChainResult {
+        if (exit_instr == std.math.maxInt(u32)) return null;
+        const exit_pc = guardExitPc(failed.instrs[exit_instr]) orelse return null;
+        if (exit_pc == 0 or exit_pc == failed.anchor.pc) return null;
+
+        var visited: [8]*Trace = undefined;
+        var nvisited: usize = 0;
+        var st: ?*Trace = self.nextTraceExcluding(proto, exit_pc, visited[0..0]);
+        while (st) |sct| : (st = if (nvisited < visited.len)
+            self.nextTraceExcluding(proto, exit_pc, visited[0..nvisited])
+        else
+            null)
+        {
+            if (nvisited < visited.len) {
+                visited[nvisited] = sct;
+                nvisited += 1;
+            }
+            if (sct.inputs.len != 0) continue;
+            const is_link = sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link;
+            if (!is_link) continue;
+
+            const snt = self.nativeFor(sct) orelse return .{ .completed = 0, .resume_pc = exit_pc };
+            const sresult = snt.run(regs);
+            if (sresult.exit_instr != sct.instrs.len - 1) {
+                self.onSideExit(sct, 0);
+                return .{ .completed = 0, .resume_pc = exit_pc };
+            }
+
+            self.native_link_exits +|= 1;
+            var linked_completed: usize = 0;
+            const current_link = sct;
+            const link_term = current_link.instrs[current_link.instrs.len - 1];
+            const inner_pc: u32 = @intCast(link_term.aux);
+            var resume_pc: u32 = inner_pc;
+            var hops: usize = 0;
+            while (hops < visited.len) : (hops += 1) {
+                const inner = self.findLoopTrace(proto, inner_pc) orelse break;
+                if (inner.inputs.len != 0) break;
+                const int_native = self.nativeFor(inner) orelse break;
+                self.native_link_follow_count +|= 1;
+                self.link_follow_count +|= 1;
+
+                const iresult = int_native.runLinkedLoopDone(regs);
+                if (iresult.exit_instr == std.math.maxInt(u32)) break;
+
+                const inner_exit_pc = guardExitPc(inner.instrs[iresult.exit_instr]) orelse break;
+                const loop_done = inner_exit_pc == current_link.anchor.pc;
+                if (!loop_done) {
+                    if (iresult.completed > 0) {
+                        self.onSideExit(inner, iresult.completed);
+                        return .{
+                            .completed = if (linked_completed > 0) linked_completed else iresult.completed,
+                            .resume_pc = resume_pc,
+                        };
+                    }
+                    self.onSideExit(inner, 0);
+                    break;
+                }
+
+                resume_pc = current_link.anchor.pc;
+                self.onSideExit(inner, if (iresult.completed > 0) iresult.completed else 1);
+                linked_completed += 1;
+
+                const cresult = snt.run(regs);
+                if (cresult.exit_instr == current_link.instrs.len - 1) {
+                    self.native_link_exits +|= 1;
+                    resume_pc = inner_pc;
+                    continue;
+                }
+                if (cresult.completed > 0) {
+                    self.onSideExit(current_link, cresult.completed);
+                    return .{ .completed = linked_completed + cresult.completed, .resume_pc = resume_pc };
+                }
+                break;
+            }
+            if (linked_completed > 0) {
+                self.onSideExit(sct, linked_completed);
+                return .{ .completed = linked_completed, .resume_pc = resume_pc };
+            }
+            self.onSideExit(sct, 0);
+            return .{ .completed = 0, .resume_pc = resume_pc };
+        }
+        return null;
+    }
+
     fn tryChainExitInternal(
         self: *TraceState,
         failed: *const Trace,
@@ -1238,7 +1370,7 @@ pub const TraceState = struct {
     /// the inner anchor; an already-traced, gated, or already-pending anchor is
     /// skipped. See `docs/design/15-nested-loop-linking.md`.
     pub fn maybeArmContinuation(self: *TraceState, failed: *const Trace, exit_instr: u32, proto: *const Proto) void {
-        if (exit_instr == std.math.maxInt(u32)) return; // native: no per-guard pc
+        if (exit_instr == std.math.maxInt(u32)) return; // no guard identity
         if (self.rec.active or self.pending_exit_anchor != null) return;
         const ins = failed.instrs[exit_instr];
         // Only a loop-continuation `guard_true` failing marks "loop ran to
@@ -1355,7 +1487,7 @@ pub const TraceState = struct {
     /// the live table sits on a lane that cannot reach the recorded lane, the
     /// guard can never pass again.  Re-derived from the live `regs` (not the
     /// failing-guard index), so it holds identically whether the trace ran on
-    /// tier-1a or native — the native path doesn't report which guard failed.
+    /// tier-1a or native — it does not depend on which guard failed.
     ///
     /// Returns true if *any* of `t`'s entry `guard_lane`s is now unsatisfiable.
     /// Reading a now-wider lane off a *different* table that happens to flow

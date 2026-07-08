@@ -291,22 +291,47 @@ fn laneConsistent(trace_lane: *?i32, aux: i32) bool {
 ///               flushed to a slot (C2). Consumed only by `hload`/`hstore`/`guard_hash`.
 const Kind = enum { none, int, bool, ptr, aref, float, func, href, native };
 
+const NativeResult = extern struct {
+    completed: usize,
+    exit_instr: u32,
+    linked_loop_done: u64,
+};
+
 /// A compiled trace: an executable page whose entry is
-/// `fn(tags: [*]u8, payloads: [*]u64) callconv(.c) usize` — the SoA register file's
-/// two base pointers (tags in rdi, payloads in rsi), the cleanly committed iteration
-/// count (`completed`) returned in rax. Semantically identical to
-/// `irinterp.execute(t, regs, scratch)`.
+/// `fn(tags: [*]u8, payloads: [*]u64, result: *NativeResult) callconv(.c) void` —
+/// the SoA register file's two base pointers (tags in rdi, payloads in rsi), plus
+/// an out-param in rdx for the committed iteration count and deterministic exit
+/// instruction. Semantically identical to `irinterp.execute(t, regs, scratch)`.
 pub const CompiledTrace = struct {
     page: ExecPage,
 
-    pub const EntryFn = fn ([*]u8, [*]u64) callconv(.c) usize;
+    pub const EntryFn = fn ([*]u8, [*]u64, *NativeResult) callconv(.c) void;
 
     /// Run the trace over the register file `regs` (mutated in place at each loop
     /// commit, exactly as the IR-interpreter does). Returns the committed-iteration
-    /// count. The two lanes are passed as the SysV first two args (rdi=tags,
-    /// rsi=payloads); slot addressing is then the free scale-1 / scale-8 forms.
-    pub fn run(self: CompiledTrace, regs: RegWindow) usize {
-        return self.page.entry(EntryFn)(regs.tags, regs.payloads);
+    /// count plus the failing IR instruction when native can identify it. The two
+    /// lanes are passed as the SysV first two args (rdi=tags, rsi=payloads); the
+    /// result pointer is the third (rdx), reserved out of the allocator pools.
+    pub fn run(self: CompiledTrace, regs: RegWindow) irinterp.ExecResult {
+        return self.runWithLinkedLoopDone(regs, false);
+    }
+
+    /// Run in the chain-consumed loop-done mode. Numeric-for loop-done exits commit
+    /// the final iteration's post-guard stores and phi snapshot before returning,
+    /// so the native nested-loop chainer can jump to the `.link` continuation
+    /// without tier-0 replay.
+    pub fn runLinkedLoopDone(self: CompiledTrace, regs: RegWindow) irinterp.ExecResult {
+        return self.runWithLinkedLoopDone(regs, true);
+    }
+
+    fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool) irinterp.ExecResult {
+        var result = NativeResult{
+            .completed = 0,
+            .exit_instr = std.math.maxInt(u32),
+            .linked_loop_done = if (linked_loop_done) 1 else 0,
+        };
+        self.page.entry(EntryFn)(regs.tags, regs.payloads, &result);
+        return .{ .completed = result.completed, .exit_instr = result.exit_instr };
     }
 
     pub fn deinit(self: *CompiledTrace) void {
@@ -347,9 +372,12 @@ pub fn compile(gpa: std.mem.Allocator, t: *const Trace) ?CompiledTrace {
     if (comptime !is_x64_linux) return null;
 
     const n = t.instrs.len;
-    // A well-formed trace is non-empty and ends in exactly one `loop`. Re-checked
-    // here because `assertWellFormed` is gone in release builds (never trust the IR).
-    if (n == 0 or n > 0xFFFF or t.instrs[n - 1].op != .loop) return null;
+    // A well-formed native-able trace is non-empty and ends in a terminal `loop`
+    // or `link`. Re-checked here because `assertWellFormed` is gone in release
+    // builds (never trust the IR).
+    if (n == 0 or n > 0xFFFF) return null;
+    const terminal = t.instrs[n - 1].op;
+    if (terminal != .loop and terminal != .link) return null;
 
     const kinds = gpa.alloc(Kind, n) catch return null;
     defer gpa.free(kinds);
@@ -1018,6 +1046,10 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 if (i != n - 1) return false; // loop must be terminal
                 kinds[i] = .none;
             },
+            .link => {
+                if (i != n - 1) return false; // link must be terminal
+                kinds[i] = .none;
+            },
             // Phase E1/E2: the preheader region boundary. A pure marker (no value);
             // everything before it is the run-once region the lowering emits ahead
             // of `loop_top`. `analyze` gives each run-once value a computed home.
@@ -1178,8 +1210,8 @@ fn regBit(r: Reg) u16 {
 
 /// Allocatable GPRs, in preference order: caller-saved first (no prologue save), then
 /// callee-saved (push/pop'd). Excludes rax/rcx (scratch), rbx (completed), rsp, rdi
-/// (tags base), rsi (payloads base — the SoA register file's second lane pointer).
-const ALLOC_ORDER = [_]Reg{ .rdx, .r8, .r9, .r10, .r11, .rbp, .r12, .r13, .r14, .r15 };
+/// (tags base), rsi (payloads base), and rdx (native result out-param).
+const ALLOC_ORDER = [_]Reg{ .r8, .r9, .r10, .r11, .rbp, .r12, .r13, .r14, .r15 };
 const CALLEE_SAVED_MASK: u16 = regBit(.rbp) | regBit(.r12) | regBit(.r13) | regBit(.r14) | regBit(.r15);
 
 /// Preference order for Phase-2 invariant array-base homes: `ALLOC_ORDER` reversed,
@@ -1187,7 +1219,7 @@ const CALLEE_SAVED_MASK: u16 = regBit(.rbp) | regBit(.r12) | regBit(.r13) | regB
 /// scan only reaches under register pressure. A low-pressure trace (e.g. nsieve)
 /// therefore hoists its array bases without displacing any hot transient into a
 /// spill; a high-pressure one simply leaves a base un-hoisted (per-iter load).
-const BASE_HOME_ORDER = [_]Reg{ .r15, .r14, .r13, .r12, .rbp, .r11, .r10, .r9, .r8, .rdx };
+const BASE_HOME_ORDER = [_]Reg{ .r15, .r14, .r13, .r12, .rbp, .r11, .r10, .r9, .r8 };
 
 /// Allocatable XMM registers (Phase D float homes/transients). xmm0/xmm1 are the
 /// float scratch pair (the SSE analogue of rax/rcx) — never allocated; xmm2..xmm15
@@ -2533,12 +2565,152 @@ fn emitTeardown(a: *x64.Assembler, frame: i32, callee: []const Reg) !void {
     try a.ret();
 }
 
+fn nativeExitLabel(a: *x64.Assembler, exit_labels: []?x64.Label, instr_idx: usize) !x64.Label {
+    if (exit_labels[instr_idx]) |l| return l;
+    const l = try a.label();
+    exit_labels[instr_idx] = l;
+    return l;
+}
+
+fn jccNativeExit(a: *x64.Assembler, exit_labels: []?x64.Label, instr_idx: usize, cc: x64.Cond) !void {
+    try a.jcc(cc, try nativeExitLabel(a, exit_labels, instr_idx));
+}
+
+fn jmpNativeExit(a: *x64.Assembler, exit_labels: []?x64.Label, instr_idx: usize) !void {
+    try a.jmp(try nativeExitLabel(a, exit_labels, instr_idx));
+}
+
+fn nativeLinkedLoopDoneLabel(a: *x64.Assembler, linked_loop_done_labels: []?x64.Label, instr_idx: usize) !x64.Label {
+    if (linked_loop_done_labels[instr_idx]) |l| return l;
+    const l = try a.label();
+    linked_loop_done_labels[instr_idx] = l;
+    return l;
+}
+
+fn isNumericForLoopDoneGuard(t: *const Trace, instr_idx: usize) bool {
+    if (instr_idx >= t.instrs.len) return false;
+    const guard = t.instrs[instr_idx];
+    if (guard.op != .guard_true) return false;
+    const exit_pc = trace.guardExitPc(guard) orelse return false;
+    if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
+    return t.anchor.proto.code[exit_pc - 1].op == .for_loop;
+}
+
+fn emitHStore(a: *x64.Assembler, kinds: []const Kind, alloc: *const Alloc, ins: trace.IrInstr) !void {
+    if (kinds[ins.b] == .float) {
+        // Stage the value into XMM_SCRATCH0 first (independent of rax/rcx), then
+        // write tag + payload through the cell pointer.
+        try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
+        const creg = try refBaseReg(a, alloc, ins.a, .rcx);
+        try a.movByteMemImm(creg, VALUE_TAG_OFF, TAG_FLOAT);
+        try a.movsdMemReg(creg, VALUE_PAYLOAD_OFF, XMM_SCRATCH0);
+    } else {
+        // Load the value before resolving the cell pointer: a spilled href resolves
+        // through rcx (never rax), and value homes are outside rax/rcx.
+        try placeToReg(a, .rax, placeOfRef(alloc, ins.b));
+        const creg = try refBaseReg(a, alloc, ins.a, .rcx);
+        try a.movByteMemImm(creg, VALUE_TAG_OFF, TAG_INT);
+        try a.storeMemReg(creg, 8, VALUE_PAYLOAD_OFF, .rax);
+    }
+}
+
+fn emitAStore(a: *x64.Assembler, t: *const Trace, alloc: *const Alloc, ins: trace.IrInstr) !void {
+    const aref_ins = t.instrs[ins.a];
+    if (ins.aux == F64_LANE) {
+        try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
+        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+        const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+        try a.leaRegMemSib(.rax, datareg, ireg, 8, 0);
+        try a.movsdMemReg(.rax, 0, XMM_SCRATCH0);
+        const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
+        const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
+        try a.btsMemReg(preg, 0, pireg);
+    } else if (ins.aux == BOOL_LANE) {
+        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+        const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+        try a.leaRegMemSib(.rax, datareg, ireg, 1, 0);
+        try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
+        try a.incReg(.rcx);
+        try a.storeMemReg(.rax, 1, 0, .rcx);
+    } else {
+        const w = intLaneWidth(ins.aux);
+        const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+        const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+        try a.leaRegMemSib(.rax, datareg, ireg, w, 0);
+        try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
+        try a.storeMemReg(.rax, w, 0, .rcx);
+
+        const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
+        const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
+        try a.btsMemReg(preg, 0, pireg);
+    }
+}
+
+fn emitGStore(a: *x64.Assembler, t: *const Trace, alloc: *const Alloc, ins: trace.IrInstr) !void {
+    const gcell_ins = t.instrs[ins.a];
+    const garow_ins = t.instrs[gcell_ins.a];
+    if (ins.aux == F64_LANE) {
+        try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
+        const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax);
+        const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
+        try a.leaRegMemSib(.rax, datareg, flatreg, 8, 0);
+        try a.movsdMemReg(.rax, 0, XMM_SCRATCH0);
+    } else {
+        const w = intLaneWidth(ins.aux);
+        const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax);
+        const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
+        try a.leaRegMemSib(.rax, datareg, flatreg, w, 0);
+        try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
+        try a.storeMemReg(.rax, w, 0, .rcx);
+    }
+    const preg = try arrayFieldReg(a, alloc, garow_ins.a, .present, .rax);
+    const pflat = try refBaseReg(a, alloc, ins.a, .rcx);
+    try a.btsMemReg(preg, 0, pflat);
+}
+
+fn emitLinkedLoopDoneSnapshot(
+    a: *x64.Assembler,
+    t: *const Trace,
+    kinds: []const Kind,
+    alloc: *const Alloc,
+    exit_instr: usize,
+) !void {
+    var si = exit_instr + 1;
+    while (si < t.instrs.len) : (si += 1) {
+        const p = t.instrs[si];
+        switch (p.op) {
+            .astore => try emitAStore(a, t, alloc, p),
+            .hstore => try emitHStore(a, kinds, alloc, p),
+            .gstore => try emitGStore(a, t, alloc, p),
+            .phi, .loop, .link => break,
+            else => {},
+        }
+    }
+
+    const guard = t.instrs[exit_instr];
+    const exit_pc = trace.guardExitPc(guard).?;
+    const for_ins = t.anchor.proto.code[exit_pc - 1];
+    const visible_var_slot: i32 = @as(i32, @intCast(for_ins.a)) + 3;
+    for (t.instrs) |p| {
+        if (p.op != .phi or p.aux == trace.PHI_INTERNAL) continue;
+        if (p.aux == visible_var_slot) continue;
+        try flushSlot(a, @as(i32, @intCast(p.aux)), kinds[@intCast(p.b)], placeOfRef(alloc, @intCast(p.b)));
+    }
+}
+
 /// Lower a proven trace to machine code (cut-2). ABI: rdi = tags base, rsi = payloads
-/// base (the SoA register file's two lanes), rbx = committed
-/// counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers across
-/// iterations (loaded + type-guarded once in the prologue); `regs[]` is written only on
-/// a side-exit (the single snapshot) or for write-only slots at the back-edge.
+/// base (the SoA register file's two lanes), rdx = native result out-param, rbx =
+/// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
+/// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
+/// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
 fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler) !void {
+    const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
+    defer gpa.free(exit_labels);
+    @memset(exit_labels, null);
+    const linked_loop_done_labels = try gpa.alloc(?x64.Label, t.instrs.len);
+    defer gpa.free(linked_loop_done_labels);
+    @memset(linked_loop_done_labels, null);
+
     // Callee-saved registers we clobber — as a home OR as a transient — must be
     // preserved across the call. `used_callee_saved` already ORs both; iterate a fixed
     // order so push/pop pair up. (Homing only the slot homes here was a latent bug: a
@@ -2817,8 +2989,8 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try a.cvttsd2siRegReg(.rax, XMM_SCRATCH0); // rax = (i64)trunc(f) or indefinite
                 try a.cvtsi2sdRegReg(XMM_SCRATCH1, .rax); // back to double
                 try a.ucomisdRegReg(XMM_SCRATCH0, XMM_SCRATCH1);
-                try a.jcc(.ne, deopt_exit); // ordered & not equal → non-integral / out-of-range
-                try a.jcc(.p, deopt_exit); // unordered (NaN) → side-exit
+                try jccNativeExit(a, exit_labels, i, .ne); // ordered & not equal → non-integral / out-of-range
+                try jccNativeExit(a, exit_labels, i, .p); // unordered (NaN) → side-exit
                 try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
             // fsqrt: the inlined pure builtin. `@sqrt` ≡ `sqrtsd` bit-for-bit under the
@@ -2862,7 +3034,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 const creg = try refBaseReg(a, alloc, ins.a, .rcx);
                 const want_tag: u8 = if (kinds[i] == .float) TAG_FLOAT else TAG_INT;
                 try a.cmpByteMemImm(creg, VALUE_TAG_OFF, want_tag);
-                try a.jcc(.ne, deopt_exit); // field type changed → drop to tier-1a/tier-0
+                try jccNativeExit(a, exit_labels, i, .ne); // field type changed → drop to tier-1a/tier-0
                 if (kinds[i] == .float) {
                     switch (placeOfRef(alloc, i)) {
                         .xmm => |x| try a.movsdRegMem(x, creg, VALUE_PAYLOAD_OFF),
@@ -2884,23 +3056,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // oracle's struct-assign which also leaves them undefined). int → TAG_INT +
             // 8-byte payload; float → TAG_FLOAT + `movsd`. Heap values declined (proveKinds).
             .hstore => {
-                if (kinds[ins.b] == .float) {
-                    // Stage the value into XMM_SCRATCH0 first (independent of rax/rcx),
-                    // then write tag + payload through the cell pointer.
-                    try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
-                    const creg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.movByteMemImm(creg, VALUE_TAG_OFF, TAG_FLOAT);
-                    try a.movsdMemReg(creg, VALUE_PAYLOAD_OFF, XMM_SCRATCH0);
-                } else {
-                    // Load the value into rax BEFORE resolving the cell pointer: a
-                    // spilled href resolves through rcx (never rax), and no value home
-                    // is rax/rcx (both are scratch, outside ALLOC_ORDER) — so the value
-                    // in rax survives the cell-pointer load.
-                    try placeToReg(a, .rax, placeOfRef(alloc, ins.b));
-                    const creg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.movByteMemImm(creg, VALUE_TAG_OFF, TAG_INT);
-                    try a.storeMemReg(creg, 8, VALUE_PAYLOAD_OFF, .rax);
-                }
+                try emitHStore(a, kinds, alloc, ins);
             },
             // --- lane-aware array read path (B2, bool lane) ----------------------
             // aref: materialize idx0 = index - 1 (the 0-based packed index) into the
@@ -2938,7 +3094,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
                     try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.len);
                 }
-                try a.jcc(.ae, deopt_exit); // idx0 >=u len (covers negative/zero key too)
+                try jccNativeExit(a, exit_labels, i, .ae); // idx0 >=u len (covers negative/zero key too)
             },
             // guard_present: the slot must hold a value; a hole would read as nil,
             // which the int/bool kind can't hold. The hole test is lane-specific:
@@ -2953,13 +3109,13 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
                     try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
                     try a.cmpRegImm32(.rax, 0);
-                    try a.jcc(.e, deopt_exit); // byte==0 → hole → side-exit
+                    try jccNativeExit(a, exit_labels, i, .e); // byte==0 → hole → side-exit
                 } else {
                     // [Phase 2] present-bitmap base from its hoisted home (or per-iter load).
                     const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
                     const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
                     try a.btMemReg(preg, 0, ireg);
-                    try a.jcc(.ae, deopt_exit); // CF==0 → hole → side-exit
+                    try jccNativeExit(a, exit_labels, i, .ae); // CF==0 → hole → side-exit
                 }
             },
             // aload: decode the packed slot the aref addresses into the aload's home.
@@ -3035,9 +3191,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     // bounds are small positive constants, no sign-bit ambiguity).
                     try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
                     try a.cmpRegImm32(.rax, 0);
-                    try a.jcc(.l, deopt_exit); // value < 0 → side-exit (widen)
+                    try jccNativeExit(a, exit_labels, i, .l); // value < 0 → side-exit (widen)
                     try a.cmpRegImm32(.rax, 255);
-                    try a.jcc(.g, deopt_exit); // value > 255 → side-exit (widen)
+                    try jccNativeExit(a, exit_labels, i, .g); // value > 255 → side-exit (widen)
                 } else {
                     const w = intLaneWidth(ins.aux);
                     if (w < 8) {
@@ -3055,9 +3211,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                         };
                         try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
                         try a.cmpRegImm32(.rax, lo);
-                        try a.jcc(.l, deopt_exit); // value < lane min → side-exit (signed)
+                        try jccNativeExit(a, exit_labels, i, .l); // value < lane min → side-exit (signed)
                         try a.cmpRegImm32(.rax, hi);
-                        try a.jcc(.g, deopt_exit); // value > lane max → side-exit (signed)
+                        try jccNativeExit(a, exit_labels, i, .g); // value > lane max → side-exit (signed)
                     }
                 }
             },
@@ -3065,67 +3221,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // astore: write the value into the slot the aref addresses.
             // `idx0` (from the aref) is shared with the dominating guard_bounds [I3].
             .astore => {
-                const aref_ins = t.instrs[ins.a];
-                if (ins.aux == F64_LANE) {
-                    // f64 lane: stage the value (an xmm home or a spill) into a scratch
-                    // XMM, then `movsd` it to `[data + idx0*8]`. No decode/rounding —
-                    // `array.encode` for `.f64` is a raw `@bitCast`, so the native store
-                    // commits byte-identical bits (8-mode parity inherited). guard_fits
-                    // is a no-op for f64 (every bit pattern is a valid double), so no
-                    // range check precedes this. Stage the value BEFORE clobbering
-                    // rax/rcx with the data base / index (the value home is xmm2..15 or
-                    // a spill, never rax/rcx/XMM_SCRATCH0). Presence write is identical
-                    // to the int lanes (lane-agnostic bitmap).
-                    try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
-                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
-                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.leaRegMemSib(.rax, datareg, ireg, 8, 0); // rax = &data[idx0]
-                    try a.movsdMemReg(.rax, 0, XMM_SCRATCH0); // [rax] = double
-                    // presence bit LAST: bts [present], idx0 (the commit point), exactly
-                    // as the int lanes do — the bitmap is lane-agnostic.
-                    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
-                    const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.btsMemReg(preg, 0, pireg);
-                } else if (ins.aux == BOOL_LANE) {
-                    // bool lane: presence is in-band, so a single byte store commits
-                    // both value and presence atomically — `1=false, 2=true` (the
-                    // 0/1 value reg + 1). No separate presence write, no branch, one
-                    // cacheline (I5 holds trivially: the byte store IS the commit).
-                    // Fold idx0 into the address with `lea` (freeing the index reg),
-                    // exactly like the int path, so data-ptr + value fit in rax/rcx.
-                    // [Phase 2] data base from its hoisted home (or a per-iter load).
-                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
-                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.leaRegMemSib(.rax, datareg, ireg, 1, 0); // rax = &data[idx0]
-                    try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // value 0/1 → rcx
-                    try a.incReg(.rcx); // 0→1 (false), 1→2 (true)
-                    try a.storeMemReg(.rax, 1, 0, .rcx); // mov byte [rax], cl
-                } else {
-                    // int lane (i8…i64): write the low `w` bytes of the value at
-                    // `[data + idx0*w]`. guard_fits already proved the value fits the
-                    // lane, so a width-truncating store is the exact lane encoding
-                    // (two's-complement). Register pressure: data-ptr + idx0 + value
-                    // are all live at once, but only rax/rcx are scratch — so fold
-                    // idx0 into the address with `lea` (freeing the index reg) before
-                    // loading the value into rcx.
-                    const w = intLaneWidth(ins.aux);
-                    // [Phase 2] data base from its hoisted home (or a per-iter load).
-                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
-                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.leaRegMemSib(.rax, datareg, ireg, w, 0); // rax = &data[idx0]
-                    try placeToReg(a, .rcx, placeOfRef(alloc, ins.b));
-                    try a.storeMemReg(.rax, w, 0, .rcx); // [rax] = (lane-width) value
-
-                    // presence bit LAST: bts [present], idx0. [I5] the commit point for
-                    // an absent→present transition. Storing a non-nil value always marks
-                    // the slot present (recArraySet refuses nil / out-of-lane stores, so
-                    // this never *clears* presence). The bool lane skips this — its byte
-                    // store already carries presence. [Phase 2] present base from its
-                    // hoisted home (or a per-iter load).
-                    const preg = try arrayFieldReg(a, alloc, aref_ins.a, .present, .rax);
-                    const pireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.btsMemReg(preg, 0, pireg);
-                }
+                try emitAStore(a, t, alloc, ins);
             },
             // guard_append (B5-grow): the append precondition, the grow analogue of
             // guard_bounds. Three memory-relative checks, no extra register beyond the
@@ -3145,11 +3241,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 const ireg = try refBaseReg(a, alloc, ins.a, .rcx); // idx0
                 const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax); // table ptr
                 try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.len);
-                try a.jcc(.ne, deopt_exit); // idx0 != len → not the append successor
+                try jccNativeExit(a, exit_labels, i, .ne); // idx0 != len → not the append successor
                 try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.cap);
-                try a.jcc(.ae, deopt_exit); // idx0 (==len) >=u cap → would realloc
+                try jccNativeExit(a, exit_labels, i, .ae); // idx0 (==len) >=u cap → would realloc
                 try a.cmpDwordMemImm(tbreg, ArrLayout.hash_size, 0);
-                try a.jcc(.ne, deopt_exit); // hash non-empty → migrate possible
+                try jccNativeExit(a, exit_labels, i, .ne); // hash non-empty → migrate possible
             },
             // astore_append (B5-grow): commit one boolean to `data[len]` and bump len.
             // guard_append proved `idx0 == len < cap` and an empty hash, so this is the
@@ -3260,9 +3356,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 const stridev: i32 = alloc.slots[@intCast(sid)].grid_stride;
                 const colreg = try refBaseReg(a, alloc, ins.b, .rcx);
                 try a.cmpRegImm32(colreg, 1);
-                try a.jcc(.l, deopt_exit); // col < 1 → side-exit (≤0 / grow)
+                try jccNativeExit(a, exit_labels, i, .l); // col < 1 → side-exit (≤0 / grow)
                 try a.cmpRegImm32(colreg, stridev);
-                try a.jcc(.g, deopt_exit); // col > stride → side-exit (grow)
+                try jccNativeExit(a, exit_labels, i, .g); // col > stride → side-exit (grow)
             },
             // guard_gpresent: the cell must hold a value (a hole decodes as nil, which
             // the int cell kind can't carry). `bt [present], flat` against the per-cell
@@ -3273,7 +3369,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 const preg = try arrayFieldReg(a, alloc, garow_ins.a, .present, .rax);
                 const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
                 try a.btMemReg(preg, 0, flatreg);
-                try a.jcc(.ae, deopt_exit); // CF==0 → hole → side-exit
+                try jccNativeExit(a, exit_labels, i, .ae); // CF==0 → hole → side-exit
             },
             // gload: load the grid cell at the flat index (gcell value) and decode by the
             // grid_elem width into the gload's home. Int lanes sign-extend (zero-extend
@@ -3313,28 +3409,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // `@bitCast`, so the bits commit byte-identically). Mirrors the in-bounds
             // `astore` int / f64 paths.
             .gstore => {
-                const gcell_ins = t.instrs[ins.a];
-                const garow_ins = t.instrs[gcell_ins.a];
-                if (ins.aux == F64_LANE) {
-                    // Stage the value into XMM_SCRATCH0 BEFORE clobbering rax/rcx with the
-                    // data base / flat index (the value home is xmm2..15 or a spill,
-                    // never rax/rcx/XMM_SCRATCH0).
-                    try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
-                    const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax);
-                    const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.leaRegMemSib(.rax, datareg, flatreg, 8, 0); // rax = &data[flat]
-                    try a.movsdMemReg(.rax, 0, XMM_SCRATCH0); // [rax] = double
-                } else {
-                    const w = intLaneWidth(ins.aux);
-                    const datareg = try arrayFieldReg(a, alloc, garow_ins.a, .data, .rax);
-                    const flatreg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    try a.leaRegMemSib(.rax, datareg, flatreg, w, 0); // rax = &data[flat]
-                    try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // value → rcx
-                    try a.storeMemReg(.rax, w, 0, .rcx); // [rax] = (lane-width) value
-                }
-                const preg = try arrayFieldReg(a, alloc, garow_ins.a, .present, .rax);
-                const pflat = try refBaseReg(a, alloc, ins.a, .rcx);
-                try a.btsMemReg(preg, 0, pflat);
+                try emitGStore(a, t, alloc, ins);
             },
             .guard_true => switch (kinds[ins.a]) {
                 .int => {}, // every int is truthy → guard always passes (no-op)
@@ -3344,19 +3419,19 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                         .mem => |d| try a.cmpQwordMemImm8(.rsp, d, 0),
                         .xmm => unreachable, // a bool is never homed in an XMM
                     }
-                    try a.jcc(.e, deopt_exit); // false (0) → side-exit
+                    try jccNativeExit(a, exit_labels, i, .e); // false (0) → side-exit
                 },
                 .none, .ptr, .aref, .float, .func, .href, .native => unreachable, // proveKinds restricts to int/bool
             },
             .guard_false => switch (kinds[ins.a]) {
-                .int => try a.jmp(deopt_exit), // an int is never falsy → always side-exit
+                .int => try jmpNativeExit(a, exit_labels, i), // an int is never falsy → always side-exit
                 .bool => {
                     switch (placeOfRef(alloc, ins.a)) {
                         .reg => |r| try a.cmpRegImm32(r, 0),
                         .mem => |d| try a.cmpQwordMemImm8(.rsp, d, 0),
                         .xmm => unreachable, // a bool is never homed in an XMM
                     }
-                    try a.jcc(.ne, deopt_exit); // true (≠0) → side-exit
+                    try jccNativeExit(a, exit_labels, i, .ne); // true (≠0) → side-exit
                 },
                 .none, .ptr, .aref, .float, .func, .href, .native => unreachable, // proveKinds restricts to int/bool
             },
@@ -3409,6 +3484,19 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try a.incReg(.rbx);
                 try a.jmp(loop_top);
             },
+            .link => {
+                // A link-terminated continuation is a one-shot hand-off, not a loop
+                // back-edge. Flush every slot-bound φ snapshot directly into regs[]
+                // so the linked inner root sees exactly the same entry state as the
+                // tier-1a `.link` arm's `flushPhiWriteback`.
+                for (alloc.slots) |s| {
+                    if (s.store_ref < 0) continue;
+                    try flushSlot(a, @as(i32, s.slot), s.kind, placeOfRef(alloc, @intCast(s.store_ref)));
+                }
+                try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+                try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
+                try emitTeardown(a, frame, callee[0..callee_len]);
+            },
             // A φ emits no code in the body: a slot-bound φ's writeback is driven by
             // its slot's `.carried`/`.write_only` class above (the back-edge shuffle /
             // deopt flush read `store_ref`, which was set from this φ's `b` in
@@ -3431,9 +3519,36 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         }
     }
 
+    // Per-guard side-exit stubs. Each writes the deterministic failing IR index,
+    // then jumps to the shared single-snapshot flush.
+    for (exit_labels, 0..) |maybe_l, ei| {
+        if (maybe_l) |l| {
+            a.bind(l);
+            try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(ei));
+            if (isNumericForLoopDoneGuard(t, ei)) {
+                try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
+                try a.jcc(.ne, try nativeLinkedLoopDoneLabel(a, linked_loop_done_labels, ei));
+            }
+            try a.jmp(deopt_exit);
+        }
+    }
+
+    // LINKED_LOOP_DONE_EXIT: only used by `runLinkedLoopDone`. The ordinary native
+    // side-exit path leaves the failing iteration for tier-0 replay; a native link
+    // chain consumes the post-loop continuation instead, so it must commit the
+    // post-guard stores and phi snapshot before returning.
+    for (linked_loop_done_labels, 0..) |maybe_l, ei| {
+        if (maybe_l) |l| {
+            a.bind(l);
+            try emitLinkedLoopDoneSnapshot(a, t, kinds, alloc, ei);
+            try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+            try emitTeardown(a, frame, callee[0..callee_len]);
+        }
+    }
+
     // DEOPT_EXIT: the single snapshot flush. Write each carried home back to regs[]
-    // (always int-tagged) — invariant + write-only slots are already coherent. Then
-    // return `completed`.
+    // — invariant + write-only slots are already coherent. Then write `completed`
+    // to the native result out-param and return.
     a.bind(deopt_exit);
     for (alloc.slots) |s| {
         if (s.class != .carried) continue;
@@ -3442,13 +3557,15 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         // (a register-homed float can't go through `movMemReg`). flushSlot dispatches.
         try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
     }
-    try a.movRegReg(.rax, .rbx);
+    try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
     try emitTeardown(a, frame, callee[0..callee_len]);
 
     // PROLOGUE_FAIL: a hoisted type guard failed before any commit. Return 0 with
-    // regs[] untouched (the cut-1 EXIT would have flushed half-initialized homes).
+    // regs[] untouched and no per-body guard identity (the cut-1 EXIT would have
+    // flushed half-initialized homes).
     a.bind(prologue_fail);
-    try a.xorRegReg(.rax, .rax);
+    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "completed"), 0);
+    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), -1);
     try emitTeardown(a, frame, callee[0..callee_len]);
 }
 
@@ -3474,9 +3591,9 @@ fn expectRegsEqual(expected: []const Value, actual: []const Value) !void {
 
 /// Test-only adapter: split a flat `[]Value` register file into the SoA tag/payload
 /// lanes the native ABI now consumes, run the trace, scatter the mutated lanes back
-/// into `regs`, and return the committed count. Mirrors how `Vm.frameWindow` hands the
+/// into `regs`, and return the native result. Mirrors how `Vm.frameWindow` hands the
 /// two lanes to `CompiledTrace.run` in production (raw payload bits, no recanon).
-fn runNative(ct: CompiledTrace, regs: []Value) !usize {
+fn runNative(ct: CompiledTrace, regs: []Value) !irinterp.ExecResult {
     const tags = try testing.allocator.alloc(u8, regs.len);
     defer testing.allocator.free(tags);
     const pays = try testing.allocator.alloc(u64, regs.len);
@@ -3485,9 +3602,9 @@ fn runNative(ct: CompiledTrace, regs: []Value) !usize {
         tags[i] = @intFromEnum(v.tag);
         pays[i] = v.payload.bits;
     }
-    const completed = ct.run(RegWindow.of(tags, pays));
+    const result = ct.run(RegWindow.of(tags, pays));
     for (regs, 0..) |*v, i| v.* = .{ .tag = @enumFromInt(tags[i]), .payload = .{ .bits = pays[i] } };
-    return completed;
+    return result;
 }
 
 /// Run `t` through both the IR-interpreter (the oracle) and the native compiler on
@@ -3505,9 +3622,9 @@ fn expectMatch(t: *const Trace, regs_init: []const Value) !void {
     defer ct.deinit();
     const nregs = try testing.allocator.dupe(Value, regs_init);
     defer testing.allocator.free(nregs);
-    const ncompleted = try runNative(ct, nregs);
+    const nresult = try runNative(ct, nregs);
 
-    try testing.expectEqual(iresult.completed, ncompleted);
+    try testing.expectEqual(iresult.completed, nresult.completed);
     try expectRegsEqual(iregs, nregs);
 }
 
@@ -5159,7 +5276,7 @@ test "nativegen: f64-lane t[k]=C write matches the interpreter" {
     defer ct.deinit();
     const ncomp = try runNative(ct, &nregs);
 
-    try testing.expectEqual(oresult.completed, ncomp);
+    try testing.expectEqual(oresult.completed, ncomp.completed);
     try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
     try expectTablesEqual(t_o, t_n, K);
     // Sanity: every present slot 2..K now reads the stored constant bit-for-bit.
@@ -5301,7 +5418,7 @@ test "nativegen: f64-lane read-modify-write (sunk astore) matches the oracle" {
     defer ct.deinit();
     const ncomp = try runNative(ct, &nregs);
 
-    try testing.expectEqual(oresult.completed, ncomp);
+    try testing.expectEqual(oresult.completed, ncomp.completed);
     try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
     try expectTablesEqual(t_o, t_n, K);
     // Every present slot 2..K now reads (k*0.5)*C, bit-for-bit.
@@ -5378,7 +5495,7 @@ test "nativegen: f64-lane multi-store RMW (two sunk astores) matches the oracle"
     defer ct.deinit();
     const ncomp = try runNative(ct, &nregs);
 
-    try testing.expectEqual(oresult.completed, ncomp);
+    try testing.expectEqual(oresult.completed, ncomp.completed);
     try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
     try expectTablesEqual(t_o, t_n, K);
     // Spot-check the differential result: even keys 2..38 scaled by C1, odd keys 3..39
@@ -5522,7 +5639,7 @@ test "nativegen: bool-lane t[k]=false write matches the interpreter (heap + regs
     defer ct.deinit();
     const ncomp = try runNative(ct, &nregs);
 
-    try testing.expectEqual(oresult.completed, ncomp);
+    try testing.expectEqual(oresult.completed, ncomp.completed);
     // Only the carried index slot (r1) is comparable — r0 holds each run's distinct
     // table pointer (an invariant slot, never flushed), so it differs by construction.
     try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
@@ -5652,7 +5769,7 @@ test "nativegen: int-lane t[k]=C write matches the interpreter (i8/i16/i32/i64)"
         defer ct.deinit();
         const ncomp = try runNative(ct, &nregs);
 
-        try testing.expectEqual(oresult.completed, ncomp);
+        try testing.expectEqual(oresult.completed, ncomp.completed);
         try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
         try expectTablesEqual(t_o, t_n, K);
         // Sanity: every present slot 2..K now reads the stored constant.
@@ -5722,7 +5839,7 @@ test "nativegen: const int-lane t[k]=C write compiles WITHOUT a guard_fits (trop
         defer ct.deinit();
         const ncomp = try runNative(ct, &nregs);
 
-        try testing.expectEqual(oresult.completed, ncomp);
+        try testing.expectEqual(oresult.completed, ncomp.completed);
         try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
         try expectTablesEqual(t_o, t_n, K);
         var k: i64 = 2;
@@ -5792,7 +5909,7 @@ test "nativegen: int-lane astore guard_fits side-exits when the value overflows 
     const ncomp = try runNative(ct, &nregs);
 
     try testing.expectEqual(@as(usize, 8), oresult.completed); // k = 120..127 committed, 128 exits
-    try testing.expectEqual(oresult.completed, ncomp);
+    try testing.expectEqual(oresult.completed, ncomp.completed);
     try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
     try expectTablesEqual(t_o, t_n, K);
 }
@@ -5873,7 +5990,7 @@ test "nativegen: u8-lane t[k]=C write matches the interpreter (in-range byte)" {
     defer ct.deinit();
     const ncomp = try runNative(ct, &nregs);
 
-    try testing.expectEqual(oresult.completed, ncomp);
+    try testing.expectEqual(oresult.completed, ncomp.completed);
     try testing.expectEqual(oregs[1].payload.bits, nregs[1].payload.bits);
     try expectTablesEqual(t_o, t_n, K);
     var k: i64 = 2;
@@ -5910,7 +6027,7 @@ test "nativegen: u8-lane astore guard_fits side-exits at the [0,255] boundaries 
         const ncomp = try runNative(ct, &nregs);
 
         try testing.expectEqual(@as(usize, 0), oresult.completed); // guard_fits exits immediately
-        try testing.expectEqual(oresult.completed, ncomp);
+        try testing.expectEqual(oresult.completed, ncomp.completed);
         try expectTablesEqual(t_o, t_n, K); // both heaps pristine (no store happened)
     }
 }

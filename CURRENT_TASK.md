@@ -1,4 +1,4 @@
-# CURRENT TASK — Nested-loop trace linking, Phase 3 (linked tier-1a execution)
+# CURRENT TASK — Nested-loop trace linking, Phase 4 (native-to-native chain)
 
 Governing intent (Bart): close the LuaJIT gap one named technique at a time. The
 current lever is **nested-loop trace linking** — let an outer loop containing an
@@ -11,7 +11,81 @@ running the whole nest on tier-0. Approved 5-phase plan:
 
 This is a **structural JIT-coverage** feature, not codegen tightness. No speedup
 until Phase 4 makes the chain native; Phases 1–3 deliver correctness behind the
-gate. Tasks: #19 (Phase 1, done), #20 (Phase 2, done), #21 (Phase 3), #22 (Phase 4).
+gate. Tasks: #19 (Phase 1, done), #20 (Phase 2, done), #21 (Phase 3, done),
+#22 (Phase 4, done — this session).
+
+## Phase 4 — DONE, GREEN (native chain; implemented by Codex, reviewed here)
+
+Native-to-native chain landed. `just test` green (742 tests, 10-mode matrix +
+keyframe/replay goldens). **Payoff measured** (`just bench --filter grid_matmul`,
+ReleaseFast): the nested-loop benchmarks now run **6.6× faster than tier-0** on
+`grid_matmul` (243.4 → 36.7 ms) and **7.3×** on `grid_matmul_f64` (251 → 34.6 ms),
+`cross ok` / `luajit ok`. nsieve + both grid nests link natively
+(`native_link_exits` 2 / 198).
+
+### What Phase 4 does
+
+- **Native exit ABI.** `CompiledTrace.run` now returns `irinterp.ExecResult`
+  (`completed` + deterministic `exit_instr`) via an `rdx` out-param (`NativeResult`,
+  reserved out of both allocator pools). Each body guard routes through a per-guard
+  stub that stamps its IR index `i` before the shared deopt flush, so native's
+  `exit_instr` == tier-1a's `exit_instr` (both = the failing IR index) **by
+  construction**. Prologue declines stay `maxInt` (entry decline, not a chainable
+  loop-done). This is what lets a native inner root distinguish its numeric-for
+  loop-done guard from ordinary guard/prologue exits.
+- **`.link` lowering.** `nativegen.compile` accepts a `.link`-terminated
+  continuation; the `.link` arm flushes slot-bound φ hand-off snapshot and returns
+  the link instruction index.
+- **`tryChainProductiveLoopDoneNative`** (trace.zig) follows continuation ⇄
+  inner-root through compiled native pages when both sides are native-able, same
+  bounded resume-PC rules as Phase 3; falls back to the tier-1a chainer otherwise.
+- **Link-aware loop-done epilogue** (the review fix, see below): the dispatcher
+  enters a root that already has a `.link` continuation via a link-aware native
+  mode (`runLinkedLoopDone`, a runtime flag in `NativeResult`). Only the numeric-for
+  loop-done guard takes a special epilogue that commits post-guard sunk stores
+  (`astore`/`hstore`/`gstore`, via the same `emitAStore`/`emitHStore`/`emitGStore`
+  helpers the body uses — one source of truth) + φ writeback before returning.
+  Ordinary guard exits keep the normal native deopt contract, so single-loop native
+  traces are unchanged.
+
+### Review finding (caught here, fixed by Codex) — store under-commit
+
+First Codex round passed `just test` green but was **wrong**: the native chain
+silently dropped **one outer iteration's entire inner-loop store pass**, exactly
+once, at the outer iteration where the native link first engages (native deopt
+exits before committing the sunk final-iteration `astore`). It was masked because
+the scalar continuation accumulator uses idempotent φ-writeback — so Codex's
+scalar-only Phase-4 test could not see it, and no store-bearing native-linking nest
+existed in the matrix. Found empirically: a `a[j]=a[j]+i` inner store diverged
+under `--jit-native` only (tier-1a chain stayed byte-identical); inner=30 lost
+outer i=256, inner=50 lost outer i=23 (deficit uniform across all cells, fixed for
+all larger outer bounds). Fix = the link-aware loop-done epilogue above. Now
+byte-identical across a 128-config sweep (inner ∈ {30,50,64,99,100,101,128,200} ×
+outer ∈ {24..700}) + hash-store + triple-nested shapes. **Regression added** in
+`src/interp.zig`: `"nested-loop: native linked array stores commit exactly once
+(Phase 4)"` — the additive-store repro, compares tier-0/tier-1a/native, asserts
+`native_link_exits > 0`; fails-before / passes-after (verified).
+
+### Phase-4 files touched
+
+- **`src/nativegen.zig`** — `NativeResult` out-param ABI + per-guard exit stubs;
+  `.link` accepted + lowered; `runLinkedLoopDone` + `isNumericForLoopDoneGuard` +
+  the loop-done store/φ epilogue; store-emit helpers factored (`emitAStore` /
+  `emitHStore` / `emitGStore`) and shared by body + epilogue.
+- **`src/trace.zig`** — `tryChainProductiveLoopDoneNative` + `native_link_exits` /
+  `native_link_follow_count` counters.
+- **`src/interp.zig`** — dispatcher pre-detects an available `.link` continuation
+  and enters the inner root in linked-loop-done native mode; native productive
+  loop-done exits try the native chainer; the Phase-4 store regression test.
+- **`docs/design/15-nested-loop-linking.md`** — Status → done (Phases 1–4);
+  Phase-4 checklist ticked; P4 discharged; the store-regression note.
+
+Outstanding (not required for Phase 4, future work): a true in-machine-code direct
+tail-jump continuation→inner-root (the landed chain is dispatcher-mediated
+native-to-native — each side runs native, the chainer bounces between them). And
+2D-grid `m[i][j]` nests still abort recording at fused `get_index2`/`set_index2`,
+so they don't link yet (grid_matmul links via the row-accumulator nest, not the
+fused 2D store).
 
 ## Phase 3 — DONE, GREEN
 
@@ -192,17 +266,17 @@ resolves to a cached `.loop` root (the inner numeric-for). Replaces the Phase 1
 tier-1 entry, so its loop-done exit never runs through `irinterp` and the
 continuation cannot arm. The tests use a 30-trip inner loop.
 
-## Next — Phase 4 (task #22)
+## Next — the 5-phase plan is complete (Phases 0–4 all landed)
 
-Native-to-native chain. Lower `.link` in `src/nativegen.zig` so a continuation
-tail-jumps/calls into the inner root's native entry, and arrange the inner
-loop-done exit to return into the continuation's native path. Discharge P4:
-native linked execution must produce byte-identical registers to the tier-1a
-linked chain at every boundary. Then re-profile nsieve and grid_matmul.
+Optional follow-ups (not part of the approved plan): the in-machine-code direct
+tail-jump chain, and extending native linking to 2D-grid fused-store nests (they
+currently abort recording). Neither is required — nested numeric-`for` loops now
+run native end-to-end.
 
-## Uncommitted tree
+## Uncommitted tree (Phase 4 — awaiting Bart's commit decision)
 
-Modified (Phase 3): `src/trace.zig`, `src/irinterp.zig`, `src/interp.zig`,
-`viz/src/enums.ts`, `docs/design/15-nested-loop-linking.md`, `CURRENT_TASK.md`.
+Modified (Phase 4): `src/nativegen.zig`, `src/trace.zig`, `src/interp.zig`,
+`docs/design/15-nested-loop-linking.md`, `CURRENT_TASK.md`. (`src/main.zig` debug
+instrumentation used during review was reverted — no diff.)
 Untracked files (`CURRENT_TASK_E3.md`, `SESSION_CHANGES.md`,
 `bench/results/*.tsv`, `check_ordinals`) belong to other agents — **do NOT stage**.

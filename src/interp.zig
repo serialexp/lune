@@ -2552,13 +2552,22 @@ pub const Vm = struct {
                             const trace_regs = self.seedTraceInputs(ct, base, closure, proto, regs, &native_eligible) orelse continue;
                             if (self.trace.valuesScratch(ct.instrs.len)) |buf| {
                                 self.trace.entries +%= 1;
+                                var ran_native = false;
+                                var ran_native_link_mode = false;
                                 const result = if (self.trace.config.record_exec_log) blk: {
                                     const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, trace_regs, buf);
                                     const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, trace_regs, buf);
                                     break :blk irinterp.executeTraced(rec, ct, trace_regs, buf);
                                 } else if (self.trace.config.native_codegen) blk: {
                                     if (native_eligible) {
-                                        if (self.trace.nativeFor(ct)) |nt| break :blk irinterp.ExecResult{ .completed = nt.run(trace_regs), .exit_instr = std.math.maxInt(u32) };
+                                        if (self.trace.nativeFor(ct)) |nt| {
+                                            ran_native = true;
+                                            ran_native_link_mode = self.trace.hasNativeLoopDoneLink(ct, proto);
+                                            break :blk if (ran_native_link_mode)
+                                                nt.runLinkedLoopDone(trace_regs)
+                                            else
+                                                nt.run(trace_regs);
+                                        }
                                     }
                                     break :blk irinterp.execute(ct, trace_regs, buf);
                                 } else irinterp.execute(ct, trace_regs, buf);
@@ -2623,10 +2632,18 @@ pub const Vm = struct {
                                     // from `buf`, runs continuation ⇄ inner-root
                                     // for a bounded burst, and tells us where
                                     // tier-0 should resume when it yields.
-                                    if (self.trace.tryChainProductiveLoopDone(ct, result.exit_instr, proto, trace_regs, buf)) |chain| {
-                                        if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                                        for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
-                                        continue :outer;
+                                    if (ran_native and ran_native_link_mode) {
+                                        if (self.trace.tryChainProductiveLoopDoneNative(ct, result.exit_instr, proto, trace_regs)) |chain| {
+                                            if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                                            for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                            continue :outer;
+                                        }
+                                    } else if (!ran_native) {
+                                        if (self.trace.tryChainProductiveLoopDone(ct, result.exit_instr, proto, trace_regs, buf)) |chain| {
+                                            if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                                            for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                            continue :outer;
+                                        }
                                     }
                                     // T3 drop-to-fast on the productive-trace path.
                                     // The handoff at the bottom of the back-edge
@@ -9501,6 +9518,80 @@ test "nested-loop: linked array stores commit exactly once at tier-1a boundary" 
     try testing.expect(vm.trace.link_ir_exits > 0);
     try testing.expect(vm.trace.link_follow_count > 0);
     try testing.expectEqualStrings(tier0.buffered(), jit.buffered());
+}
+
+test "nested-loop: linked continuation execution goes native (Phase 4)" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const source =
+        \\local s = 0
+        \\for i = 1, 50 do
+        \\  for j = 1, 35 do
+        \\    s = s + i * j
+        \\  end
+        \\  s = s + i
+        \\end
+        \\print(s)
+    ;
+
+    var tier0_buf: [64]u8 = undefined;
+    var tier0 = io.Writer.fixed(&tier0_buf);
+    try runCaptured(testing.allocator, source, &tier0, false, .off);
+
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var native_buf: [64]u8 = undefined;
+    var native = io.Writer.fixed(&native_buf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &native);
+    defer chunk.deinit();
+
+    try testing.expectEqualStrings(tier0.buffered(), native.buffered());
+    try testing.expect(vm.trace.native_link_exits > 0);
+    try testing.expect(vm.trace.native_link_follow_count > 0);
+}
+
+test "nested-loop: native linked array stores commit exactly once (Phase 4)" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const source =
+        \\local a = {}
+        \\for k = 1, 30 do a[k] = 0 end
+        \\local s = 0
+        \\for i = 1, 400 do
+        \\  for j = 1, 30 do
+        \\    a[j] = a[j] + i
+        \\  end
+        \\  s = s + i
+        \\end
+        \\local sum = 0
+        \\for k = 1, 30 do sum = sum + a[k] end
+        \\print(sum)
+        \\print(s)
+    ;
+
+    var tier0_buf: [64]u8 = undefined;
+    var tier0 = io.Writer.fixed(&tier0_buf);
+    try runCaptured(testing.allocator, source, &tier0, false, .off);
+    try testing.expectEqualStrings("2406000\n80200\n", tier0.buffered());
+
+    const gpa = testing.allocator;
+    var opt_vm = try Vm.init(gpa);
+    defer opt_vm.deinit();
+    var opt_buf: [64]u8 = undefined;
+    var opt = io.Writer.fixed(&opt_buf);
+    var opt_chunk = try runExecForTrace(&opt_vm, gpa, source, &opt);
+    defer opt_chunk.deinit();
+    try testing.expectEqualStrings(tier0.buffered(), opt.buffered());
+
+    var native_vm = try Vm.init(gpa);
+    defer native_vm.deinit();
+    var native_buf: [64]u8 = undefined;
+    var native = io.Writer.fixed(&native_buf);
+    var native_chunk = try runNativeForTrace(&native_vm, gpa, source, &native);
+    defer native_chunk.deinit();
+
+    try testing.expectEqualStrings(tier0.buffered(), native.buffered());
+    try testing.expect(native_vm.trace.native_link_exits > 0);
+    try testing.expect(native_vm.trace.native_link_follow_count > 0);
 }
 
 test "executor: a hot numeric-for sum runs via the IR-interpreter (back-edges collapse)" {

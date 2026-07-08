@@ -1,8 +1,8 @@
 # Nested-Loop Trace Linking — Design
 
-Status: partial — Phases 1–3 (exit-PC anchors + `.link` tier-1a execution) landed; Phase 4 outstanding
+Status: done — Phases 1–4 landed (exit-PC anchors + `.link` tier-1a/native execution)
 Owner: Bart
-Last updated: 2026-07-07
+Last updated: 2026-07-08
 
 The tracing JIT cannot trace **nested numeric-`for` loops**. An outer loop that
 contains an inner loop never tiers up: the recorder aborts at the inner loop's
@@ -38,8 +38,8 @@ land; move whole sections to Done once everything inside is checked.
   and re-reaches the inner `for_prep`, where it **aborts (LINNER)** — there is no
   "close with `.loop`" in a real 2-level nest (the recording always reaches the
   inner prep before returning to its own anchor); that abort site is exactly where
-  Phase 2's `.link` goes. Native arming deferred (native loop-done exits carry
-  `exit_instr = maxInt`, no per-guard pc) to Phase 4. Discharged **P1**: pinned by
+  Phase 2's `.link` goes. Native arming was deferred to Phase 4, which added
+  native exit identity. Discharged **P1**: pinned by
   an `expectProgram` 10-mode output-invariance test plus a focused
   `runExecForTrace` test asserting a second, distinct `for_prep` abort site (the
   continuation, anchored at the post-loop pc) actually arms.
@@ -95,11 +95,27 @@ land; move whole sections to Done once everything inside is checked.
   tier-1a chain. A dedicated F2c test now runs a 400×60 linking-shaped nested
   numeric-for through mid-execution capture/resume to prove the same bytecode
   shape remains snapshot-resumable.
+- [x] **Phase 4 — Native-to-native chain.** Native compiled traces now report
+  `irinterp.ExecResult` shape (`completed`, deterministic `exit_instr`) through
+  an out-param ABI, so a native inner root can distinguish its numeric-for
+  loop-done guard from ordinary guard/prologue exits. `nativegen` accepts `.link`
+  terminals: a native continuation runs once, flushes its slot-bound hand-off φ
+  snapshot, and returns the `.link` instruction index. `tryChainProductiveLoopDoneNative`
+  follows continuation ⇄ inner-root using compiled native pages when both sides
+  are native-able, with the same bounded resume-PC rules as Phase 3. The dispatcher
+  enters roots that already have a `.link` continuation through a link-aware native
+  mode; only numeric-for loop-done exits take the special epilogue that commits
+  post-guard stores and φ writeback before returning to the chainer. Ordinary guard
+  exits keep the normal native deopt contract. Pinned by the 10-mode `expectProgram`
+  matrix plus focused Phase-4 regressions that assert `native_link_exits > 0` and
+  `native_link_follow_count > 0`, including an additive array-store inner loop so
+  an inert or scalar-only native path cannot pass green. Discharged **P4** for the
+  current native-able nested numeric-for subset.
 
 ### Outstanding
-- [ ] **Phase 4 — Native-to-native chain.** `nativegen` lowers `.link` to a
-  native jump/tailcall into the inner trace's native entry; inner loop-done exit
-  returns into the continuation's native code. Discharge **P4**. Re-profile.
+
+_(none for the initial nested numeric-for linking cut; benchmarking/re-profile is
+the follow-up review step.)_
 
 ## Why linking, not unrolling
 
@@ -170,8 +186,11 @@ that "later".
    at the loop header on a guard exit, the productive loop-done chain first commits
    the final numeric-for iteration's hand-off state from the executor scratch, then
    resumes tier-0 at the PC that matches the bounded chain's final register state.
-   Native (Phase 4) does it with a direct jump/tailcall into the inner trace's
-   native entry.
+   Native (Phase 4) does it by running the continuation and inner root through
+   compiled native pages, using native exit identity to follow `.link` boundaries.
+   A link-aware native entry mode gives numeric-for loop-done exits their own
+   epilogue, so the final iteration's post-guard stores and φ writeback are
+   committed by the original native run before the chainer enters the continuation.
 
 ## Proof obligations (the determinism contract)
 
