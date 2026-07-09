@@ -580,6 +580,15 @@ pub const Assembler = struct {
         try self.modrmReg(7, reg.lo());
         try self.b(imm);
     }
+    /// `shl reg, imm8` — REX.W C1 /4 ib. Logical left shift by a fixed immediate.
+    /// Used for `.value`-lane element addressing (`idx0 * 16` = shl 4) where the
+    /// SIB scale factor maxes out at 8.
+    pub fn shlRegImm8(self: *Assembler, reg: Reg, imm: u8) !void {
+        try self.rex(true, false, false, reg.hi());
+        try self.b(0xC1);
+        try self.modrmReg(4, reg.lo());
+        try self.b(imm);
+    }
     /// `not reg` — REX.W F7 /2 (bitwise complement; matches arith.bnot).
     pub fn notReg(self: *Assembler, reg: Reg) !void {
         try self.rex(true, false, false, reg.hi());
@@ -811,6 +820,15 @@ pub const Assembler = struct {
     pub fn pop(self: *Assembler, reg: Reg) !void {
         try self.rex(false, false, false, reg.hi());
         try self.b(0x58 + @as(u8, reg.lo()));
+    }
+    /// `call reg` — FF /2. Indirect call through a GP register. The resolver
+    /// call-out for per-iteration hash-cell resolution in `.value`-lane traces.
+    pub fn callReg(self: *Assembler, reg: Reg) !void {
+        // callReg uses a 64-bit operand implicitly (no REX.W needed), but the
+        // REX prefix is required when the register is r8–r15.
+        if (reg.hi()) try self.b(0x41);
+        try self.b(0xFF);
+        try self.modrmReg(2, reg.lo());
     }
     /// `ret` — C3.
     pub fn ret(self: *Assembler) !void {
@@ -1454,6 +1472,28 @@ test "enc: sar reg, cl / sar reg, imm8" {
     try expectEnc(&.{ 0x49, 0xC1, 0xFA, 0x3F }, struct { // sar r10, 63 (REX.B, C1 /7 ib)
         fn f(a: *Assembler) !void {
             try a.sarRegImm8(.r10, 63);
+        }
+    }.f);
+    // shl reg, imm8 — C1 /4 ib
+    try expectEnc(&.{ 0x48, 0xC1, 0xE0, 0x04 }, struct { // shl rax, 4
+        fn f(a: *Assembler) !void {
+            try a.shlRegImm8(.rax, 4);
+        }
+    }.f);
+    try expectEnc(&.{ 0x49, 0xC1, 0xE2, 0x04 }, struct { // shl r10, 4 (REX.B)
+        fn f(a: *Assembler) !void {
+            try a.shlRegImm8(.r10, 4);
+        }
+    }.f);
+    // call reg — FF /2
+    try expectEnc(&.{ 0xFF, 0xD0 }, struct { // call rax
+        fn f(a: *Assembler) !void {
+            try a.callReg(.rax);
+        }
+    }.f);
+    try expectEnc(&.{ 0x41, 0xFF, 0xD2 }, struct { // call r10 (REX.B)
+        fn f(a: *Assembler) !void {
+            try a.callReg(.r10);
         }
     }.f);
 }

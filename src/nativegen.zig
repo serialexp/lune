@@ -211,6 +211,49 @@ const F64_LANE: i32 = @intFromEnum(arr.Lane.f64);
 /// `intLaneWidth` classify it exactly like a scalar int lane).
 const GRID_LANE: i32 = @intFromEnum(arr.Lane.grid);
 
+/// The `.value` lane ordinal — 16-byte full-`Value` elements, heap-bearing.
+/// Phase 2 admits this lane for aload→guard_table→href→hload chains (the
+/// array-of-structs pattern `bodies[i].x`); the aload itself produces a `.heap`
+/// kind (a per-iteration `*GcHeader` table pointer) consumed by the hash-field
+/// path, not a scalar lane kind.
+const VALUE_LANE: i32 = @intFromEnum(arr.Lane.value);
+
+/// Offset from a `*GcHeader` (the table's embedded header) to the hash-part
+/// `size` (u32 live-entry count). The comptime chain is:
+/// `@offsetOf(Table, "hash") + @offsetOf(Map, "size") - @offsetOf(Table, "header")`.
+/// Since `header` is always the first field (`@offsetOf(Table, "header") == 0`
+/// for Zig's default layout where `GcHeader` is first), this equals
+/// `ArrLayout.hash_size`. We name it separately for clarity and pin the
+/// assumption via a comptime assert below.
+const HASH_SIZE_FROM_HEADER: i32 = ArrLayout.hash_size - @as(i32, @intCast(@offsetOf(table.Table, "header")));
+comptime {
+    // The header-to-hash offset must be non-negative (header is before hash).
+    std.debug.assert(HASH_SIZE_FROM_HEADER >= 0);
+}
+
+/// Per-iteration hash-cell resolver for `.value`-lane table loads (Phase 2).
+///
+/// The native loop body calls this via `call rax` to resolve the value-cell
+/// pointer for a constant string key in a per-iteration element table. The
+/// existing loop-invariant href path resolves the cell once at entry via
+/// `seedTraceInputs`; this function is the per-iteration equivalent.
+///
+/// SysV ABI: rdi = `*GcHeader` (element table from aload), rsi = key tag
+/// bits (low byte = `Tag` ordinal), rdx = key payload bits. Returns the
+/// `*Value` cell pointer as a `usize` in rax, or 0 if the key is absent.
+///
+/// Does NOT check metatable (`guard_table` already did) or hash count
+/// (`guard_hash` does it inline). Pure `fieldPtr` resolution — a wrapper
+/// that confines the Zig HashMap's non-extern internals to one call site
+/// (Rule Z-2).
+fn resolveHashCell(header_bits: usize, key_tag_bits: u64, key_payload_bits: u64) callconv(.c) usize {
+    const header: *object.GcHeader = @ptrFromInt(header_bits);
+    const tbl = table.Table.fromHeader(header);
+    const key = Value{ .tag = @enumFromInt(@as(u8, @truncate(key_tag_bits))), .payload = .{ .bits = key_payload_bits } };
+    const cell = tbl.fieldPtr(key) orelse return 0;
+    return @intFromPtr(cell);
+}
+
 /// The native scalar `Kind` a packed lane decodes to, or `null` when the native
 /// array path does not lower this lane (`.value` → tier-1a). The bool lane
 /// yields a 0/1 boolean; the i8…i64 lanes yield a sign-extended int; the
@@ -289,7 +332,7 @@ fn laneConsistent(trace_lane: *?i32, aux: i32) bool {
 ///               `[rsi + aux*8]`, not computed from the operands. Like `.aref` it is a
 ///               distinct addressing kind — it can neither feed arithmetic nor be
 ///               flushed to a slot (C2). Consumed only by `hload`/`hstore`/`guard_hash`.
-const Kind = enum { none, int, bool, ptr, aref, float, func, href, native };
+const Kind = enum { none, int, bool, ptr, aref, float, func, href, native, heap };
 
 const NativeResult = extern struct {
     completed: usize,
@@ -510,10 +553,16 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .guard_table => {
                 const r = ins.a;
                 if (r >= i) return false; // not linear SSA → malformed
-                // A table guard only ever covers the table-bearing slot_load; the
-                // native path hoists it to a prologue heap/type check.
-                if (t.instrs[r].op != .slot_load) return false;
-                table_guarded[r] = true;
+                // A table guard on a slot_load covers the table-bearing snapshot
+                // slot; the native path hoists it to a prologue heap/type check.
+                // A guard on an aload (Phase 2, .value-lane) is a per-iteration
+                // body guard — accept it but don't mark table_guarded (no slot
+                // to pin for the prologue).
+                if (t.instrs[r].op == .slot_load) {
+                    table_guarded[r] = true;
+                } else if (t.instrs[r].op != .aload) {
+                    return false;
+                }
             },
             // guard_grid (doc 14): the grid analogue of guard_table+guard_lane. It
             // covers the grid table's slot_load (proven `.ptr`); the prologue
@@ -678,7 +727,10 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             // the bool lane, so any other lane bails here.
             .guard_table => {
                 if (ins.a >= i) return false;
-                if (kinds[ins.a] != .ptr) return false;
+                // `.ptr` = loop-invariant table (prologue-hoisted, no-op in body).
+                // `.heap` = per-iteration element table from .value-lane aload
+                // (Phase 2) — body guard, NOT hoisted.
+                if (kinds[ins.a] != .ptr and kinds[ins.a] != .heap) return false;
                 kinds[i] = .none;
             },
             // guard_func (U1, cross-frame): covers the callee-snapshot slot_load
@@ -709,19 +761,26 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
                 kinds[i] = .float;
             },
             // --- hash-part field path (H1) --------------------------------------
-            // href: the loop-invariant value-cell pointer (`*Value`) for a constant
-            // string key into a table's hash part. `a` is the table slot_load (proven
-            // `.ptr`, guard_table-covered); `b` is the interned key konst (marked an
-            // href_key above → accepted `.none`). The cell is NOT computed from a/b in
-            // native — it is resolved once per entry by `seedTraceInputs` and written
-            // into slab slot `ins.aux`, from which `lower` loads it (`[rsi+aux*8]`). A
-            // distinct `.href` kind (like `.aref`): it can neither feed arithmetic nor
-            // be flushed to a carried slot (C2).
+            // href: a value-cell pointer (`*Value`) for a constant string key into
+            // a table's hash part. Two sub-paths:
+            // - `.ptr` table (loop-invariant): cell resolved once per entry by
+            //   `seedTraceInputs` into slab slot `ins.aux` ≥ 0.
+            // - `.heap` table (Phase 2, per-iteration): cell resolved per iteration
+            //   by a call-out to `resolveHashCell`; `ins.aux == -1` (no seed slot).
+            // In both cases `b` is the interned key konst (marked an href_key above
+            // → accepted `.none`). The result is a distinct `.href` kind.
             .href => {
                 if (ins.a >= i or ins.b >= i) return false;
-                if (kinds[ins.a] != .ptr) return false; // table must be the guarded ptr
                 if (t.instrs[ins.b].op != .konst) return false; // key is a constant
-                if (ins.aux < 0 or ins.aux > 0xFFFF) return false; // valid seed slot
+                if (kinds[ins.a] == .ptr) {
+                    // Loop-invariant: seed slot must be valid.
+                    if (ins.aux < 0 or ins.aux > 0xFFFF) return false;
+                } else if (kinds[ins.a] == .heap) {
+                    // Per-iteration: recorder sets aux = -1 (no seed).
+                    if (ins.aux != -1) return false;
+                } else {
+                    return false;
+                }
                 kinds[i] = .href;
             },
             // guard_hash: the structural sentinel. The oracle re-resolves the cell and
@@ -762,7 +821,11 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .guard_lane => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .ptr) return false;
-                if (laneKind(ins.aux) == null) return false; // .value → tier-1a
+                // `.value` lane: accepted for Phase 2 (array-of-structs). The
+                // prologue checks `array.lane == .value` the same way it checks
+                // any other lane byte. No scalar lane-kind produced — the aload
+                // arm handles the `.value` case separately.
+                if (ins.aux != VALUE_LANE and laneKind(ins.aux) == null) return false;
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 kinds[i] = .none;
             },
@@ -771,7 +834,7 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .aref => {
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .ptr or kinds[ins.b] != .int) return false;
-                if (laneKind(ins.aux) == null) return false;
+                if (ins.aux != VALUE_LANE and laneKind(ins.aux) == null) return false;
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 kinds[i] = .aref;
             },
@@ -799,10 +862,18 @@ fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_of: [
             .aload => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
-                const lk = laneKind(ins.aux) orelse return false; // .value → tier-1a
-                if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 if (!bounds_ok[ins.a]) return false; // [I4] bounds must dominate
-                kinds[i] = lk; // bool → .bool; i8…i64/u8 → .int; f64 → .float
+                if (ins.aux == VALUE_LANE) {
+                    // Phase 2: .value-lane aload produces a per-iteration heap
+                    // pointer (a *GcHeader for a table). Only the .heap ty is
+                    // accepted — scalar .value-lane elements still bail.
+                    if (ins.ty != .heap) return false;
+                    kinds[i] = .heap;
+                } else {
+                    const lk = laneKind(ins.aux) orelse return false;
+                    if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                    kinds[i] = lk; // bool → .bool; i8…i64/u8 → .int; f64 → .float
+                }
             },
             // guard_fits: the value (`a`) still fits the recorded narrow lane.
             // For an int lane it marks the value so a following int-lane astore may
@@ -1194,6 +1265,16 @@ const Alloc = struct {
     spill_count: u32, // frame slots used (homes + transients); frame = spill_count*8
     used_callee_saved: u16, // bitmask of callee-saved GPRs used (must be push/pop'd)
 
+    // --- callout save area (Phase 2, .value-lane href) ---
+    // When a trace contains a .heap-rooted href (per-iteration hash-cell
+    // resolution via `resolveHashCell`), the callout clobbers all SysV
+    // caller-saved registers. Live homes in those registers must be saved
+    // to the frame before the call and restored after. These fields describe
+    // the save area appended to the spill region (slots callout_save_base ..
+    // callout_save_base + callout_save_count - 1).
+    callout_save_base: u32 = 0, // first spill-slot index of save area
+    callout_save_count: u32 = 0, // number of 8-byte slots reserved
+
     fn deinit(self: *Alloc, gpa: std.mem.Allocator) void {
         gpa.free(self.loc);
         gpa.free(self.last_use);
@@ -1544,6 +1625,22 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
     for (t.instrs) |ins| {
         if (ins.op != .phi) continue;
         if (last_use[ins.b] < n - 1) last_use[ins.b] = @intCast(n - 1);
+    }
+    // A `.heap`-rooted href reads ins.a (the per-iteration *GcHeader from an aload)
+    // but `operandReads(.href)` returns {false, false} (the loop-invariant path reads
+    // from the seeded slab slot, not from operand refs). Extend the aload result's
+    // liveness here so it survives to the href and the guard_hash that follows it.
+    // guard_hash also reads href_ins.a (the same aload) to check hash population.
+    for (t.instrs, 0..) |ins, i| {
+        if (ins.op == .href and kinds[ins.a] == .heap) {
+            if (last_use[ins.a] < i) last_use[ins.a] = @intCast(i);
+        }
+        if (ins.op == .guard_hash) {
+            const href_ins = t.instrs[ins.a];
+            if (kinds[href_ins.a] == .heap) {
+                if (last_use[href_ins.a] < i) last_use[href_ins.a] = @intCast(i);
+            }
+        }
     }
 
     // --- allocation: pin slot homes, then linear-scan the transients ---
@@ -1990,6 +2087,44 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         }
     }
 
+    // --- callout save area (Phase 2, .heap-rooted href) ---
+    // If any href in this trace operates on a `.heap`-kind table (per-iteration
+    // hash-cell resolution via `resolveHashCell`), the callout clobbers all SysV
+    // caller-saved registers. Reserve frame slots to save/restore live homes.
+    var callout_save_base: u32 = 0;
+    var callout_save_count: u32 = 0;
+    {
+        var needs_callout = false;
+        for (t.instrs) |ins| {
+            if (ins.op == .href and kinds[ins.a] == .heap) {
+                needs_callout = true;
+                break;
+            }
+        }
+        if (needs_callout) {
+            callout_save_base = spill_count;
+            // The callout clobbers ALL SysV caller-saved registers. We must save
+            // not just slot homes but also transient registers that may be live
+            // across the callout (e.g. a float hload result from a prior field
+            // access in the same iteration, still alive at the second href).
+            // Simplest correct approach: save ALL caller-saved GP and XMM
+            // allocatable registers unconditionally, plus rdi/rsi (SoA bases)
+            // and rdx (*NativeResult out-param, used at side-exits).
+            var count: u32 = 3; // rdi + rsi + rdx
+            // All allocatable caller-saved GPRs: r8, r9, r10, r11.
+            count += 4;
+            // All allocatable XMMs: xmm2–xmm15 (XMM_ALLOC_ORDER, 14 regs).
+            count += XMM_ALLOC_ORDER.len;
+            callout_save_count = count;
+            // +1 for the alignment padding slot: the JIT body runs with
+            // rsp % 16 == 8 (correct for the JIT's own return convention but
+            // wrong for an outgoing SysV call). `emitHrefCallout` does
+            // `sub rsp, 8` before the call and `add rsp, 8` after — the
+            // extra slot ensures this doesn't underflow the frame.
+            spill_count += count + 1;
+        }
+    }
+
     return .{
         .loc = loc,
         .last_use = last_use,
@@ -1997,6 +2132,8 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         .slots = try slots.toOwnedSlice(gpa),
         .spill_count = spill_count,
         .used_callee_saved = used_callee,
+        .callout_save_base = callout_save_base,
+        .callout_save_count = callout_save_count,
     };
 }
 
@@ -2596,6 +2733,132 @@ fn isNumericForLoopDoneGuard(t: *const Trace, instr_idx: usize) bool {
     return t.anchor.proto.code[exit_pc - 1].op == .for_loop;
 }
 
+/// Emit the per-iteration hash-cell resolution call-out for a `.heap`-rooted href.
+/// The sequence saves all live caller-saved homes (rdi/rsi SoA bases + GP + XMM)
+/// into the pre-reserved frame area, sets up SysV ABI arguments, calls
+/// `resolveHashCell`, restores, checks the result, and stores the cell pointer in
+/// the href's home. On a 0 return (cell not found) the trace side-exits.
+fn emitHrefCallout(
+    a: *x64.Assembler,
+    t: *const Trace,
+    alloc: *const Alloc,
+    kinds: []const Kind,
+    ins: trace.IrInstr,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
+    _ = kinds;
+    const CALLER_SAVED_GP = [_]Reg{ .r8, .r9, .r10, .r11 };
+    var off: u32 = alloc.callout_save_base;
+
+    // 1. Save rdi (tags base), rsi (payloads base), and rdx (*NativeResult).
+    try a.movMemReg(.rsp, @intCast(off * 8), .rdi);
+    off += 1;
+    try a.movMemReg(.rsp, @intCast(off * 8), .rsi);
+    off += 1;
+    try a.movMemReg(.rsp, @intCast(off * 8), .rdx);
+    off += 1;
+
+    // 2. Save ALL caller-saved GP registers (r8–r11), not just homes —
+    //    transients in these registers may be live across the callout.
+    for (CALLER_SAVED_GP) |r| {
+        try a.movMemReg(.rsp, @intCast(off * 8), r);
+        off += 1;
+    }
+
+    // 3. Save ALL allocatable XMMs (xmm2–xmm15): same reasoning —
+    //    a transient float live across the callout would be clobbered.
+    for (XMM_ALLOC_ORDER) |r| {
+        try a.movsdMemReg(.rsp, @intCast(off * 8), r);
+        off += 1;
+    }
+
+    // Sanity: we used exactly the reserved number of slots.
+    std.debug.assert(off == alloc.callout_save_base + alloc.callout_save_count);
+
+    // 4. Set up SysV ABI arguments:
+    //    rdi = *GcHeader (from the aload's home — the .heap table pointer)
+    //    rsi = key tag bits (compile-time constant from the trace's const pool)
+    //    rdx = key payload bits (compile-time constant)
+    //
+    // The href's ins.b is a konst instruction; the konst's aux indexes t.consts.
+    const konst_ins = t.instrs[ins.b];
+    const key = t.consts[@intCast(konst_ins.aux)];
+    const key_tag: u64 = @intFromEnum(key.tag);
+    const key_payload: u64 = key.payload.bits;
+
+    // Load the table *GcHeader into rdi (arg0). The aload result (ins.a) might be
+    // in a register home, a spill, or might have been clobbered if its home was rdi
+    // — but we already saved rdi, and refBaseReg uses .rax as scratch, which is fine
+    // since we haven't loaded args into it yet.
+    try placeToReg(a, .rdi, placeOfRef(alloc, ins.a));
+
+    // Key tag and payload are compile-time constants.
+    try a.movRegImm64(.rsi, @bitCast(key_tag));
+    try a.movRegImm64(.rdx, @bitCast(key_payload));
+
+    // 5. Call resolveHashCell via an absolute address in rax.
+    // The JIT body runs with rsp % 16 == 8 (return-address push from the
+    // C-ABI entry call). SysV requires rsp % 16 == 0 at a `call` site, so
+    // bump the stack by 8 to fix alignment, then undo after the call.
+    try a.subRegImm32(.rsp, 8);
+    try a.movRegImm64(.rax, @bitCast(@intFromPtr(&resolveHashCell)));
+    try a.callReg(.rax);
+    try a.addRegImm32(.rsp, 8);
+
+    // rax now holds the cell pointer (or 0 on miss).
+    // Move it out of the way before restoring — store in the href's home.
+    // But first: check for 0 (cell not found → side-exit) BEFORE restore,
+    // because the side-exit path doesn't need restored registers (it re-enters
+    // the interpreter which reloads everything from scratch). Actually — the
+    // deopt exit path at jccNativeExit relies on slot homes being correct for
+    // the flush. So we must restore THEN check.
+    //
+    // Strategy: stash rax in rcx (scratch, not a home, not clobbered by restore),
+    // restore everything, then test rcx.
+    try a.movRegReg(.rcx, .rax);
+
+    // 6. Restore in reverse order.
+    off = alloc.callout_save_base + alloc.callout_save_count;
+
+    // Restore ALL allocatable XMMs (reverse order of save).
+    {
+        var ri: usize = XMM_ALLOC_ORDER.len;
+        while (ri > 0) {
+            ri -= 1;
+            off -= 1;
+            try a.movsdRegMem(XMM_ALLOC_ORDER[ri], .rsp, @intCast(off * 8));
+        }
+    }
+
+    // Restore ALL caller-saved GP registers (reverse order).
+    {
+        var ri: usize = CALLER_SAVED_GP.len;
+        while (ri > 0) {
+            ri -= 1;
+            off -= 1;
+            try a.movRegMem(CALLER_SAVED_GP[ri], .rsp, @intCast(off * 8));
+        }
+    }
+
+    // Restore rdx, rsi, rdi (reverse of save order).
+    off -= 1;
+    try a.movRegMem(.rdx, .rsp, @intCast(off * 8));
+    off -= 1;
+    try a.movRegMem(.rsi, .rsp, @intCast(off * 8));
+    off -= 1;
+    try a.movRegMem(.rdi, .rsp, @intCast(off * 8));
+
+    std.debug.assert(off == alloc.callout_save_base);
+
+    // 7. Check the result (stashed in rcx). 0 = cell not found → side-exit.
+    try a.cmpRegImm32(.rcx, 0);
+    try jccNativeExit(a, exit_labels, i, .e); // ZF=1 → rcx==0 → miss
+
+    // 8. Store the cell pointer (in rcx) into the href's home.
+    try regToPlace(a, placeOfRef(alloc, i), .rcx);
+}
+
 fn emitHStore(a: *x64.Assembler, kinds: []const Kind, alloc: *const Alloc, ins: trace.IrInstr) !void {
     if (kinds[ins.b] == .float) {
         // Stage the value into XMM_SCRATCH0 first (independent of rax/rcx), then
@@ -2909,7 +3172,36 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // guard_grid/guard_stride (doc 14): the grid structural guards, hoisted to
             // the prologue grid-elem/stride checks (invariant within a native run) —
             // nothing here, exactly like guard_table/guard_lane.
-            .slot_load, .guard_int, .guard_float, .guard_table, .guard_lane, .guard_func, .guard_hash, .guard_pure, .guard_grid, .guard_stride => {},
+            .slot_load, .guard_int, .guard_float, .guard_lane, .guard_func, .guard_pure, .guard_grid, .guard_stride => {},
+            // guard_table: hoisted no-op for .ptr-kind operands (prologue checks).
+            // For .heap-kind operands (Phase 2, per-iteration element tables from
+            // .value-lane aload), emit per-iteration type + metatable checks.
+            .guard_table => {
+                if (kinds[ins.a] == .heap) {
+                    const tbl_reg = try refBaseReg(a, alloc, ins.a, .rax);
+                    // Check GcHeader.type == TABLE_TYPE
+                    try a.cmpByteMemImm(tbl_reg, HEADER_TYPE_OFF, TABLE_TYPE);
+                    try jccNativeExit(a, exit_labels, i, .ne);
+                    // Check Table.metatable == null (metatable field is at a
+                    // known offset from *GcHeader since header is the first field).
+                    try a.cmpQwordMemImm8(tbl_reg, METATABLE_OFF, 0);
+                    try jccNativeExit(a, exit_labels, i, .ne);
+                }
+                // else: .ptr → prologue-hoisted, no-op
+            },
+            // guard_hash: for .ptr-rooted href, the seed validation covers it (no-op).
+            // For .heap-rooted href (Phase 2), emit per-iteration hash.count() check.
+            .guard_hash => {
+                const href_ins = t.instrs[ins.a];
+                if (kinds[href_ins.a] == .heap) {
+                    // Load the element table's *GcHeader (the href's table operand).
+                    const tbl_reg = try refBaseReg(a, alloc, href_ins.a, .rax);
+                    // Compare hash.count() (u32) against the recorded population.
+                    try a.cmpDwordMemImm(tbl_reg, HASH_SIZE_FROM_HEADER, @intCast(ins.aux));
+                    try jccNativeExit(a, exit_labels, i, .ne);
+                }
+                // else: .ptr → seed-validated, no-op
+            },
             .konst => {
                 // H1: a `.none`-kind konst is an interned heap-string href key. href
                 // reads the seeded cell, not the key, so the key carries no native
@@ -3016,14 +3308,22 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // payload slot `ins.aux` tagged TAG_INT); the body reads it instead of
             // recomputing the hash lookup, exactly as `aref` reads an invariant base.
             .href => {
-                const off: i32 = @as(i32, @intCast(ins.aux)) * 8;
-                switch (placeOfRef(alloc, i)) {
-                    .reg => |r| try a.movRegMem(r, .rsi, off),
-                    .mem => |d| {
-                        try a.movRegMem(.rax, .rsi, off);
-                        try a.movMemReg(.rsp, d, .rax);
-                    },
-                    .xmm => unreachable, // a cell pointer is an int kind, never an XMM home
+                if (kinds[ins.a] == .heap) {
+                    // Phase 2: per-iteration hash-cell resolution via call-out.
+                    // Save rdi/rsi (SoA bases) and all live caller-saved homes,
+                    // call resolveHashCell, restore, check result.
+                    try emitHrefCallout(a, t, alloc, kinds, ins, i, exit_labels);
+                } else {
+                    // Loop-invariant: load seeded cell pointer from slab.
+                    const off: i32 = @as(i32, @intCast(ins.aux)) * 8;
+                    switch (placeOfRef(alloc, i)) {
+                        .reg => |r| try a.movRegMem(r, .rsi, off),
+                        .mem => |d| {
+                            try a.movRegMem(.rax, .rsi, off);
+                            try a.movMemReg(.rsp, d, .rax);
+                        },
+                        .xmm => unreachable, // a cell pointer is an int kind, never an XMM home
+                    }
                 }
             },
             // hload: a typed load from the cell. The dominating guard_hash + per-entry
@@ -3124,11 +3424,31 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // scratch registers, no third needed (the int load's dst reuses rax).
             .aload => {
                 const aref_ins = t.instrs[ins.a];
-                // [Phase 2] data base from its hoisted home (or a per-iter `[tbreg+data]`
-                // load into rax). The element load's dst is rax either way.
-                const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
-                const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                if (ins.aux == F64_LANE) {
+                if (ins.aux == VALUE_LANE) {
+                    // Phase 2: .value-lane aload — load a 16-byte Value element,
+                    // verify it's a heap ref, and extract the *GcHeader payload.
+                    //
+                    // data + idx0*16: SIB can't scale by 16, so shl idx0 by 4 then
+                    // add data. The element is a full Value: [tag(1) pad(7) payload(8)].
+                    // We check tag == TAG_HEAP then load the payload (a *GcHeader).
+                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    // rax = idx0; can't use ireg directly — it might be the aref's
+                    // home that we must not clobber (rcx is scratch).
+                    try a.movRegReg(.rax, ireg);
+                    try a.shlRegImm8(.rax, 4); // rax = idx0 * 16
+                    try a.addRegReg(.rax, datareg); // rax = &data[idx0] (Value*)
+                    // Tag check: byte [rax + TAG_OFF] == TAG_HEAP
+                    try a.cmpByteMemImm(.rax, VALUE_TAG_OFF, TAG_HEAP);
+                    try jccNativeExit(a, exit_labels, i, .ne); // not heap → side-exit
+                    // Load *GcHeader from payload
+                    try a.movRegMem(.rax, .rax, VALUE_PAYLOAD_OFF);
+                    try regToPlace(a, placeOfRef(alloc, i), .rax);
+                } else {
+                    // Scalar lanes: data base from hoisted home (or per-iter load).
+                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                    const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+                    if (ins.aux == F64_LANE) {
                     // f64 lane: load the raw 8-byte double at `[data + idx0*8]` into
                     // the aload's float home (an xmm reg or a spill cell). No decode —
                     // tier-0's `array.decode` for `.f64` is a raw `@bitCast`, so `movsd`
@@ -3166,6 +3486,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     }
                     try regToPlace(a, placeOfRef(alloc, i), .rax);
                 }
+                } // close outer `else` for scalar lanes
             },
             // guard_fits (B4b): range-check the int value (`a`) against the lane's
             // signed bounds and side-exit if it would overflow. Native stores at the
@@ -3421,7 +3742,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     }
                     try jccNativeExit(a, exit_labels, i, .e); // false (0) → side-exit
                 },
-                .none, .ptr, .aref, .float, .func, .href, .native => unreachable, // proveKinds restricts to int/bool
+                .none, .ptr, .aref, .float, .func, .href, .native, .heap => unreachable, // proveKinds restricts to int/bool
             },
             .guard_false => switch (kinds[ins.a]) {
                 .int => try jmpNativeExit(a, exit_labels, i), // an int is never falsy → always side-exit
@@ -3433,7 +3754,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     }
                     try jccNativeExit(a, exit_labels, i, .ne); // true (≠0) → side-exit
                 },
-                .none, .ptr, .aref, .float, .func, .href, .native => unreachable, // proveKinds restricts to int/bool
+                .none, .ptr, .aref, .float, .func, .href, .native, .heap => unreachable, // proveKinds restricts to int/bool
             },
             .loop => {
                 // [RV-2] write-only slots commit to regs[] BEFORE the shuffle, so the
@@ -5069,6 +5390,144 @@ test "nativegen: int-lane t[k] read scan matches the interpreter (i8/i16/i32/i64
         try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(K + 3), Value.nil() }); // OOB
         try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(K), Value.nil() }); // last present (=bump)
     }
+}
+
+test "nativegen(Phase F): .value-lane array-of-structs int-field read matches the interpreter" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    // The canonical `bodies[i].field` array-of-structs shape, hand-built as IR:
+    //   container[i] is a *table* (a `.value`-lane element), and the hot loop reads a
+    //   scalar field out of each element table via the full Phase F chain
+    //   aload(.value, ty=.heap) → guard_table → href(aux=-1) → guard_hash → hload.
+    // A single interned string is the shared field key, so the href key const and
+    // every element's stored key are the same object (pointer-identity hit).
+    const key = try @import("string.zig").String.create(gpa, "v");
+    defer key.destroy(gpa);
+    const key_val = Value.heap(&key.header);
+
+    const N: usize = 32;
+    var elems: [N]*table.Table = undefined;
+    var built: usize = 0;
+    defer for (elems[0..built]) |e| e.destroy(gpa);
+
+    const container = try table.Table.create(gpa);
+    defer container.destroy(gpa);
+
+    // Element i (1-based) has exactly one hash field `v = i` (an int). Storing the
+    // element tables (heap values) into contiguous int keys forces the container's
+    // array part onto the `.value` lane.
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        const e = try table.Table.create(gpa);
+        elems[i] = e;
+        built += 1;
+        try e.set(gpa, key_val, Value.int(@intCast(i + 1)));
+        try container.set(gpa, Value.int(@intCast(i + 1)), Value.heap(&e.header));
+    }
+    try testing.expectEqual(arr.Lane.value, container.array.lane);
+
+    const lane: i32 = VALUE_LANE;
+    // consts[0] = the interned field key (an href key → proven `.none`); [1] = int 1.
+    var consts = [_]Value{ key_val, Value.int(1) };
+    // r0=container, r1=index, r2=acc. Each iteration reads container[index].v,
+    // accumulates it, advances the index, and bounds-exits past the dense run.
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: container
+        .{ .op = .guard_table, .a = 0 }, // 1: (prologue-hoisted .ptr guard)
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .aload, .a = 5, .aux = lane, .ty = .heap }, // 7: element *Table
+        .{ .op = .guard_table, .a = 7 }, // 8: per-iteration element guard (.heap)
+        .{ .op = .konst, .aux = 0 }, // 9: the field key
+        .{ .op = .href, .a = 7, .b = 9, .aux = -1 }, // 10: per-iteration cell
+        .{ .op = .guard_hash, .a = 10, .aux = 1 }, // 11: element has 1 field
+        .{ .op = .hload, .a = 10, .ty = .int }, // 12: v = element.v
+        .{ .op = .slot_load, .aux = 2 }, // 13: acc
+        .{ .op = .guard_int, .a = 13 }, // 14
+        .{ .op = .add, .a = 13, .b = 12, .ty = .int }, // 15: acc + v
+        .{ .op = .konst, .aux = 1 }, // 16: 1
+        .{ .op = .add, .a = 3, .b = 16, .ty = .int }, // 17: index + 1
+        .{ .op = .phi, .b = 17, .aux = 1 }, // index carry
+        .{ .op = .phi, .b = 15, .aux = 2 }, // acc carry
+        .{ .op = .loop }, // 18
+    };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    // Full scan from 1: sums v over the whole dense run, bounds-exits past N.
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(1), Value.int(0) });
+    // Start mid-run: a shorter clean prefix, then bounds-exit.
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(20), Value.int(0) });
+    // Start past the run: guard_bounds side-exits immediately (completed==0).
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(@intCast(N + 5)), Value.int(0) });
+}
+
+test "nativegen(Phase F): .value-lane array-of-structs float-field read matches the interpreter" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    // As above but the element field is a FLOAT (the real `bodies[i].x` type), so
+    // `hload` tag-checks TAG_FLOAT and lands the value in an XMM home; the carried
+    // accumulator is a float. Proves the Phase F chain's float `hload` arm.
+    const key = try @import("string.zig").String.create(gpa, "x");
+    defer key.destroy(gpa);
+    const key_val = Value.heap(&key.header);
+
+    const N: usize = 24;
+    var elems: [N]*table.Table = undefined;
+    var built: usize = 0;
+    defer for (elems[0..built]) |e| e.destroy(gpa);
+
+    const container = try table.Table.create(gpa);
+    defer container.destroy(gpa);
+
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        const e = try table.Table.create(gpa);
+        elems[i] = e;
+        built += 1;
+        try e.set(gpa, key_val, Value.float(@as(f64, @floatFromInt(i + 1)) * 1.5));
+        try container.set(gpa, Value.int(@intCast(i + 1)), Value.heap(&e.header));
+    }
+    try testing.expectEqual(arr.Lane.value, container.array.lane);
+
+    const lane: i32 = VALUE_LANE;
+    var consts = [_]Value{ key_val, Value.int(1) };
+    // r0=container, r1=index, r2=acc(float). Reads container[index].x (a float),
+    // accumulates into the float acc via addsd, advances the index.
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: container
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .aload, .a = 5, .aux = lane, .ty = .heap }, // 7: element *Table
+        .{ .op = .guard_table, .a = 7 }, // 8
+        .{ .op = .konst, .aux = 0 }, // 9: field key
+        .{ .op = .href, .a = 7, .b = 9, .aux = -1 }, // 10: per-iteration cell
+        .{ .op = .guard_hash, .a = 10, .aux = 1 }, // 11
+        .{ .op = .hload, .a = 10, .ty = .float }, // 12: x = element.x (float)
+        .{ .op = .slot_load, .aux = 2 }, // 13: acc (float)
+        .{ .op = .guard_float, .a = 13 }, // 14
+        .{ .op = .add, .a = 13, .b = 12, .ty = .float }, // 15: acc + x
+        .{ .op = .konst, .aux = 1 }, // 16: 1
+        .{ .op = .add, .a = 3, .b = 16, .ty = .int }, // 17: index + 1
+        .{ .op = .phi, .b = 17, .aux = 1 }, // index carry
+        .{ .op = .phi, .b = 15, .aux = 2 }, // acc carry
+        .{ .op = .loop }, // 18
+    };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(1), Value.float(0.0) });
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(10), Value.float(0.0) });
+    try expectMatch(&tr, &.{ Value.heap(&container.header), Value.int(@intCast(N + 5)), Value.float(0.0) });
 }
 
 test "nativegen: guard_table failure side-exits natively with completed==0" {

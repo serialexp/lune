@@ -18,11 +18,13 @@ added a lane-aware **array load/store** path (`t[k]` against the packed `ArrayPa
 `add`/`sub`/`mul`/`div` + comparisons, int→float promotion) — see §Phase D below.
 **Phase E** then added native **`shl`/`shr`** (branch-bracketed `cl`-shift matching
 Lua's full logical-shift semantics), unlocking nsieve-bit's shift loops to native
-(2.5×) — see §Out of scope. Heap (non-array)/mixed traces, the remaining deferred
-numeric ops (`idiv`/`mod`/`pow`/`not`), accumulator sinking, and per-exit side traces
-are later cuts (see §Out of scope).
+(2.5×) — see §Out of scope. **Phase F** then added native **`.value`-lane table
+loads** — the array-of-structs pattern (`bodies[i].x`) where each element is a full
+`Value` table — via a per-iteration C-ABI call-out to a hash-cell resolver; see
+§Phase F below. The remaining deferred numeric ops (`idiv`/`mod`/`pow`/`not`),
+accumulator sinking, and per-exit side traces are later cuts (see §Out of scope).
 Owner: Bart
-Last updated: 2026-06-22
+Last updated: 2026-07-09
 
 Realises **Phase 8** in `00-architecture.md`. Tiers 0 and 1a are both
 *interpreters*: tier-0 walks bytecode (`interp.zig`), tier-1a walks the optimized
@@ -587,11 +589,117 @@ bounded ordered set, moving scimark-fft **54.3× → 39.1×** (t0 993.9 ms → j
 the 4-store butterfly now records native). Sparse's indirect gather (`x[col[k]]`)
 stays out of scope. Gap A is the float-array foundation Gaps B and C build on.
 
+## Phase F — `.value`-lane table loads (array-of-structs, tier-1b)
+
+Phase F teaches the native backend to read table fields from `.value`-lane array
+elements — the array-of-structs pattern `bodies[i].x` where each element is a full
+16-byte `Value` carrying a table pointer. Previously, the `.value` lane bailed in
+`proveKinds` (`laneKind(.value) == null`), forcing all such traces to tier-1a. Phase F
+adds a new `Kind.heap` (a per-iteration `*GcHeader` table pointer from a `.value`-lane
+`aload`), relaxes the relevant gates in `proveKinds`, and emits a per-iteration
+**C-ABI call-out** to resolve hash-cell addresses.
+
+**IR sequence (from the recorder):**
+```
+guard_table(container) → guard_lane(.value) → guard_int(key)
+→ aref(.value) → guard_bounds
+→ aload(.value, ty=.heap) → guard_table(aload)
+→ href(aload, konst_key, aux=-1) → guard_hash → hload(href, ty=int/float)
+```
+
+The key new piece is that `href` here is **loop-variant** — each iteration loads a
+*different* table from the `.value`-lane element, so the hash cell must be resolved
+per iteration (unlike the loop-invariant `href` for `t.x` on a single table, which
+`seedTraceInputs` resolves once per entry).
+
+**Why a call-out (not an inlined hash probe):** Zig's `std.HashMapUnmanaged` is not
+an `extern struct` — its `Header { values, keys, capacity }` layout is
+compiler-version-dependent. Inlining the probe (metadata fingerprints, key comparison,
+linear walk) would couple native codegen to Zig's current HashMap internals and break
+on a toolchain bump. Per Rule Z-2: confine the churny surface to a wrapper.
+
+### The resolver
+
+```zig
+fn resolveHashCell(header_bits: usize, key_tag: u64, key_payload: u64) callconv(.c) usize
+```
+
+Converts `header_bits` → `*Table` via `Table.fromHeader`, constructs a `Value` key
+from tag + payload, calls `tbl.fieldPtr(key)`, and returns `@intFromPtr(cell)` or 0
+on miss (key not found). The key tag and payload are compile-time constants from the
+trace's const pool — a `.value`-lane `href` always has `aux == -1` (no seed slot; the
+table changes every iteration).
+
+### proveKinds extensions
+
+| IR op | Previous gate | Phase F change |
+|-------|---------------|----------------|
+| `guard_lane` | `laneKind(.value) == null` → bail | Accept `.value`: skip `laneKind`, check `laneConsistent`, produce `.none` |
+| `aref` | `laneKind(.value) == null` → bail | Accept `.value`: produce `.aref` |
+| `aload` | `laneKind(.value) == null` → bail | For `.value` + `ty == .heap`: produce **`.heap`** kind |
+| `guard_table` | `kinds[a] != .ptr` → bail | Also accept `.heap` (per-iteration table guard) |
+| `href` | `kinds[a] != .ptr` → bail | Also accept `.heap`; skip seed-slot validation when `ins.aux == -1` |
+
+The `.heap` kind is a transient per-iteration pointer — it never flows through
+`exit_stores` or `phi` slots. The `guard_hash` and `hload` gates are unchanged
+(they operate on `.href`, which `href` still produces).
+
+### Call-out ABI (SysV x86-64)
+
+The call-out is the most delicate piece: it clobbers **all** caller-saved registers
+(rdi, rsi, rdx, rcx, r8–r11, rax, all XMMs). The sequence in `emitHrefCallout`:
+
+1. **Save rdi, rsi, rdx** to frame slots — rdi/rsi are tags/payloads base pointers
+   used throughout the JIT body; rdx holds `*NativeResult` (used at side-exits for
+   writing `completed`/`exit_instr`).
+2. **Save all r8–r11 unconditionally** (not just homes — a transient register live
+   across the callout would be clobbered).
+3. **Save all xmm2–xmm15 unconditionally** (SysV has no callee-saved XMMs).
+4. Load table pointer into rdi, compile-time key tag into rsi, key payload into rdx.
+5. `sub rsp, 8` — the JIT body runs with `rsp % 16 == 8` (from the entry call's
+   return address push); SysV requires `rsp % 16 == 0` at a `call` site.
+6. `movabs rax, &resolveHashCell; call rax`
+7. `add rsp, 8` — undo alignment.
+8. `mov rcx, rax` — stash result (rax is about to be clobbered by restores).
+9. Restore all registers in reverse order.
+10. `cmp rcx, 0; je exit` — cell not found → side-exit.
+11. Store cell pointer into the `href`'s home register.
+
+Frame reservation: `analyzeInner` reserves 3 (rdi+rsi+rdx) + 4 (r8–r11) + 14
+(xmm2–xmm15) + 1 (alignment padding) = 22 frame slots whenever any `.heap`-rooted
+`href` exists in the trace.
+
+### Liveness extension
+
+`operandReads(.href)` returns `{false, false}` for the loop-invariant path (where
+the table is a seed input, not an IR operand). For `.heap`-rooted hrefs, the table
+*is* the `ins.a` operand and must stay live through both the `href` and any subsequent
+`guard_hash` that reads the same table pointer. `analyzeInner` explicitly extends
+liveness for `.heap`-rooted `href` operands to cover both the `href` itself and any
+`guard_hash` that transitively references it.
+
+### Benchmark (`bench/field_hash.lua`)
+
+The array-of-structs pattern — `bodies[i].x + bodies[i].y` summing two float fields
+from 1000 tables stored in a `.value`-lane array, 200k outer iterations:
+
+| tier | time | vs tier-0 |
+|------|------|-----------|
+| tier-0 (bytecode interp) | 923 ms | 1.0× |
+| tier-1a (IR interp) | ~920 ms | ~1.0× |
+| **tier-1b (native, Phase F)** | **13.6 ms** | **66×** |
+| LuaJIT | 8.6 ms | 107× |
+
+The native path is **66× faster than tier-0** and within **1.6× of LuaJIT**. The
+remaining gap is the call-out overhead (LuaJIT inlines its hash probe) — a future
+follow-up could inline the probe if profiling shows the call dominates.
+
 ## Out of scope (named follow-ups)
 
-- **Mixed / heap (non-array) traces** — heap-value tag dispatch, nil handling, and
-  metatable-free table-field access outside the dense array part. Float arithmetic and
-  comparisons are **done (Phase D)**; what remains is the non-numeric polymorphic shapes.
+- ~~**Mixed / heap (non-array) traces**~~ — **partially done (Phase F):** `.value`-lane
+  table loads (the array-of-structs pattern) now compile natively via a per-iteration
+  call-out. What remains: heap-value tag dispatch for non-array containers, nil
+  handling, string keys, and metatable-bearing tables.
 - **Deferred numeric ops** — `idiv`/`mod`/`pow` (floored-div/mod correction, libm),
   float `neg` (xorpd sign-mask), `not` (logical, not bitwise). `div` is **done
   (Phase D / F3)** — `divsd`, always float. `shl`/`shr` are **done (Phase E)** — see

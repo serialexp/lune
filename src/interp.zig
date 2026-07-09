@@ -10580,8 +10580,9 @@ test "array-of-structs: read-only loop over .value-lane table array is byte-iden
     // A small array of tables with scalar fields — the canonical `bodies[i].x`
     // pattern. The hot loop reads float fields from each element. Before the
     // .value-lane table support, the recorder aborted here (nyi_opcode on
-    // get_index); after it, tier-1a traces the loop (native declines — Phase 2).
-    // The 10-mode matrix proves byte-identical output.
+    // get_index); Phase 1 let tier-1a trace the loop, and Phase F (native codegen
+    // for .value-lane table loads) now compiles it to x86-64 as well. The 10-mode
+    // matrix proves byte-identical output across all tiers.
     try expectProgram(
         \\local bodies = {}
         \\for i = 1, 100 do
