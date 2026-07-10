@@ -2633,13 +2633,13 @@ pub const Vm = struct {
                                     // for a bounded burst, and tells us where
                                     // tier-0 should resume when it yields.
                                     if (ran_native and ran_native_link_mode) {
-                                        if (self.trace.tryChainProductiveLoopDoneNative(ct, result.exit_instr, proto, trace_regs)) |chain| {
+                                        if (self.trace.driveChain(ct, result, proto, trace_regs, .native_only, .native_numeric_for_done, &.{})) |chain| {
                                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                             for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                             continue :outer;
                                         }
                                     } else if (!ran_native) {
-                                        if (self.trace.tryChainProductiveLoopDone(ct, result.exit_instr, proto, trace_regs, buf)) |chain| {
+                                        if (self.trace.driveChain(ct, result, proto, trace_regs, .ir, .{ .ir_numeric_for_done = buf }, &.{})) |chain| {
                                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                             for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                             continue :outer;
@@ -2682,7 +2682,7 @@ pub const Vm = struct {
                                 // PC, look for a side trace there.  This fires
                                 // only after step 4 (side traces) populates the
                                 // cache at non-anchor PCs.
-                                if (self.trace.tryChainExit(ct, result.exit_instr, proto, regs)) |chain| {
+                                if (self.trace.driveChain(ct, result, proto, regs, .ir, .ordinary_header, &.{})) |chain| {
                                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                     for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                     continue :outer;

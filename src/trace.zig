@@ -417,7 +417,7 @@ pub const IrOp = enum(u8) {
     /// the register hand-off snapshot.
     ///
     /// Phase 3 tier-1a flushes the snapshot and follows the link through
-    /// `tryChainExit`; Phase 4 lowers it to a native-to-native chain. Appended last
+    /// `driveChain`; Phase 4 lowers it to a native-to-native chain. Appended last
     /// so every prior op's wire ordinal stays stable.
     link,
 };
@@ -443,7 +443,7 @@ pub const IrInstr = struct {
 /// `aux` (see `emit`); the array guards (`guard_lane`, `guard_fits`) reuse `aux`
 /// for lane ordinals, and the rest leave it zero — so reading `aux` as a PC there
 /// is a category error that can mis-key a guard-failure counter or, worse, chain
-/// to an unrelated trace. Exit-PC chaining (`tryChainExit`) and guard-failure
+/// to an unrelated trace. Exit-PC chaining (`driveChain`) and guard-failure
 /// counting MUST resolve the exit PC through this accessor — never read `.aux`
 /// directly. Returns the PC for the five PC-carrying guards (which may legitimately
 /// be 0); callers treat 0 as "no usable PC" since no loop-body guard sits at PC 0.
@@ -466,6 +466,35 @@ pub const SlotStore = struct { slot: u16, ref: Ref };
 pub const ChainResult = struct {
     completed: usize,
     resume_pc: ?u32 = null,
+};
+
+/// The execution tier a chain drive uses for the candidate traces it enters.
+/// Chosen at each dispatcher call site (comptime), NOT per-candidate:
+///   * `.ir`          — run candidates on the tier-1a IR interpreter. Used by the
+///                      ordinary zero-exit chain and the tier-1a loop-done chain.
+///   * `.native_only` — run candidates as native compiled code; a candidate with
+///                      no native compilation ends the drive (never silently
+///                      tier-1a). Used by the native loop-done chain.
+/// See `docs/design/16-coherent-state-chaining.md`.
+pub const ChainTier = enum { ir, native_only };
+
+/// How the *failed* trace left the register file when it side-exited — this fixes
+/// where tier-0 must resume if the drive yields, and whether a loop-done commit is
+/// still owed before a continuation can run. (Design doc 16, "exit kinds".)
+///   * `.ordinary_header`       — an ordinary guard exit; `regs` are coherent at
+///                                `failed.anchor.pc` and nothing is owed.
+///   * `.ir_numeric_for_done`   — a tier-1a numeric-`for` loop-done exit; the final
+///                                iteration's sunk stores + φ hand-off are still in
+///                                the carried executor scratch (`[]Value`) and must
+///                                be flushed via `flushNumericForLoopDone` before a
+///                                continuation runs.
+///   * `.native_numeric_for_done` — a native numeric-`for` loop-done exit; the root
+///                                was entered with `runLinkedLoopDone`, so the final
+///                                iteration is already materialized — no flush owed.
+pub const ExitMaterialization = union(enum) {
+    ordinary_header,
+    ir_numeric_for_done: []Value,
+    native_numeric_for_done,
 };
 
 /// Identifies a trace anchor: a loop header at byte-`pc` within a `Proto`. Loop
@@ -1069,29 +1098,205 @@ pub const TraceState = struct {
     /// succeeded, or null if no trace was found / all failed. `regs` is the
     /// current register window (coherent for the loop header). The caller
     /// should `continue :outer` on success.
-    pub fn tryChainExit(
+    /// **Unified coherent-state chain driver (design doc 16).** After trace
+    /// `failed` side-exited at `result.exit_instr`, look for a compiled trace at
+    /// the exit's bytecode PC and run it — chaining native→native (or ir→ir) for a
+    /// bounded burst instead of dropping back to tier-0. Subsumes the old
+    /// `tryChainExit` / `tryChainProductiveLoopDone` / `tryChainProductiveLoopDoneNative`
+    /// trio; `tier` (comptime) and `materialization` recover their three behaviours
+    /// exactly:
+    ///   * `.ir`  + `.ordinary_header`        ≡ old `tryChainExit` (zero-exit path)
+    ///   * `.ir`  + `.ir_numeric_for_done`    ≡ old `tryChainProductiveLoopDone`
+    ///   * `.native_only` + `.native_numeric_for_done` ≡ old `tryChainProductiveLoopDoneNative`
+    ///
+    /// Returns the committed iteration count and the PC tier-0 should resume at
+    /// (`resume_pc == null` ⇒ resume at `failed.anchor.pc`), or null if nothing
+    /// ran (caller falls to tier-0 at the header, unchanged). `initially_excluded`
+    /// seeds the candidate walk's visited set — the existing sites pass empty
+    /// (their walk PC is the exit PC, disjoint from the dispatcher's anchor walk);
+    /// Phase 2's anchor-coherent chaining will seed it with the same-anchor walk.
+    pub fn driveChain(
         self: *TraceState,
         failed: *const Trace,
-        exit_instr: u32,
+        result: irinterp.ExecResult,
         proto: *const Proto,
         regs: RegWindow,
+        comptime tier: ChainTier,
+        materialization: ExitMaterialization,
+        initially_excluded: []const *Trace,
     ) ?ChainResult {
-        return self.tryChainExitInternal(failed, exit_instr, proto, regs, null);
-    }
+        const exit_instr = result.exit_instr;
+        if (exit_instr == std.math.maxInt(u32)) return null;
+        // Resolve the exit PC through the op-gated accessor: array guards store a
+        // lane ordinal in `aux`, not a PC, so a first-iteration array-guard exit
+        // must NOT be interpreted as a chain target (it could execute an unrelated
+        // trace against incoherent registers).
+        const walk_pc = guardExitPc(failed.instrs[exit_instr]) orelse return null;
+        // No PC recorded (aux==0), or the exit PC is the anchor (same-anchor
+        // chaining already tried every trace there): nothing to chain to.
+        if (walk_pc == 0 or walk_pc == failed.anchor.pc) return null;
 
-    /// Productive numeric-for loop-done chaining. Unlike ordinary deopt, the
-    /// linked path starts at the post-loop continuation, so the just-failed final
-    /// inner iteration must be committed from the executor scratch before the
-    /// continuation runs.
-    pub fn tryChainProductiveLoopDone(
-        self: *TraceState,
-        failed: *const Trace,
-        exit_instr: u32,
-        proto: *const Proto,
-        regs: RegWindow,
-        values: []Value,
-    ) ?ChainResult {
-        return self.tryChainExitInternal(failed, exit_instr, proto, regs, values);
+        const loop_done_values: ?[]Value = switch (materialization) {
+            .ir_numeric_for_done => |vals| vals,
+            else => null,
+        };
+
+        // Visit each candidate at `walk_pc` exactly once (highest-hit first). A
+        // growing `visited` set (rather than a single-`skip` cursor) is what makes
+        // this terminate: two equal-priority candidates that both zero-exit would
+        // otherwise cycle `A→B→A→…` forever. Seed it with `initially_excluded`.
+        var visited: [8]*Trace = undefined;
+        var nvisited: usize = 0;
+        for (initially_excluded) |ex| {
+            if (nvisited >= visited.len) break;
+            visited[nvisited] = ex;
+            nvisited += 1;
+        }
+
+        var st: ?*Trace = self.nextTraceExcluding(proto, walk_pc, visited[0..nvisited]);
+        while (st) |sct| : (st = if (nvisited < visited.len)
+            self.nextTraceExcluding(proto, walk_pc, visited[0..nvisited])
+        else
+            null)
+        {
+            if (nvisited < visited.len) {
+                visited[nvisited] = sct;
+                nvisited += 1;
+            }
+            // A candidate with synthetic upvalue/global inputs needs the dispatch
+            // loop's per-entry seeding (no `*Vm` here), so it cannot be entered
+            // through the chain path. Skip it — it still runs via the seeded
+            // same-anchor walk.
+            if (sct.inputs.len != 0) continue;
+            const is_link = sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link;
+            // Loop-done chains (ir and native) only follow `.link` continuations;
+            // an ordinary side trace at the post-loop PC is not a valid hand-off.
+            if (loop_done_values != null and !is_link) continue;
+            if (tier == .native_only and !is_link) continue;
+
+            // Once a productive loop-done exit has committed, the ordinary loop-
+            // header deopt path is no longer valid: tier-0 must resume at the PC
+            // matching the now-committed state (the post-inner continuation PC,
+            // advancing to the inner-root PC after a `.link` snapshot flush). For
+            // native the commit already happened (`runLinkedLoopDone`); for tier-1a
+            // loop-done we flush the failed trace's final iteration from scratch now.
+            var flushed_resume_pc: ?u32 = null;
+            var sresult: irinterp.ExecResult = undefined;
+            var snt: *const nativegen.CompiledTrace = undefined;
+            if (tier == .native_only) {
+                snt = self.nativeFor(sct) orelse return .{ .completed = 0, .resume_pc = walk_pc };
+                flushed_resume_pc = walk_pc;
+                sresult = snt.run(regs);
+            } else {
+                const sbuf = self.valuesScratch(sct.instrs.len) catch continue;
+                if (loop_done_values) |vals| {
+                    if (!irinterp.flushNumericForLoopDone(failed, regs, vals, exit_instr)) return null;
+                    flushed_resume_pc = walk_pc;
+                }
+                sresult = irinterp.execute(sct, regs, sbuf);
+            }
+
+            // --- linked burst: the continuation ran to its `.link` terminator, so
+            // ping-pong continuation ⇄ inner-root for a bounded number of hops. ---
+            if (is_link and sresult.exit_instr == sct.instrs.len - 1) {
+                if (tier == .native_only) {
+                    self.native_link_exits +|= 1;
+                } else {
+                    self.link_ir_exits +|= 1;
+                }
+                var linked_completed: usize = 0;
+                const current_link = sct;
+                // The design's `coherent_pc` cursor: where tier-0 resumes when the
+                // burst yields. Starts at the inner-root PC named by the `.link`.
+                var resume_pc: u32 = @intCast(current_link.instrs[current_link.instrs.len - 1].aux);
+                var hops: usize = 0;
+                while (hops < visited.len) : (hops += 1) {
+                    const link_term = current_link.instrs[current_link.instrs.len - 1];
+                    const inner_pc: u32 = @intCast(link_term.aux);
+                    const inner = self.findLoopTrace(proto, inner_pc) orelse break;
+                    if (inner.inputs.len != 0) break;
+                    if (tier == .native_only) self.native_link_follow_count +|= 1;
+                    self.link_follow_count +|= 1;
+
+                    var iresult: irinterp.ExecResult = undefined;
+                    var ibuf: []Value = &.{};
+                    if (tier == .native_only) {
+                        const int_native = self.nativeFor(inner) orelse break;
+                        iresult = int_native.runLinkedLoopDone(regs);
+                    } else {
+                        ibuf = self.valuesScratch(inner.instrs.len) catch break;
+                        iresult = irinterp.execute(inner, regs, ibuf);
+                    }
+                    if (iresult.exit_instr == std.math.maxInt(u32)) break;
+
+                    const inner_exit_pc = guardExitPc(inner.instrs[iresult.exit_instr]) orelse break;
+                    const loop_done = inner_exit_pc == current_link.anchor.pc;
+                    if (!loop_done) {
+                        if (iresult.completed > 0) {
+                            self.onSideExit(inner, iresult.completed);
+                            return .{
+                                .completed = if (linked_completed > 0) linked_completed else iresult.completed,
+                                .resume_pc = resume_pc,
+                            };
+                        }
+                        self.onSideExit(inner, 0);
+                        break;
+                    }
+                    // Native committed the loop-done inside `runLinkedLoopDone`; the
+                    // tier-1a path still owes the final-iteration flush.
+                    if (tier == .ir) {
+                        if (!irinterp.flushNumericForLoopDone(inner, regs, ibuf, iresult.exit_instr)) break;
+                    }
+                    resume_pc = current_link.anchor.pc;
+
+                    // Roll-up (doc 15 P3): the inner root running to its loop-done
+                    // exit completes exactly one enclosing-loop iteration — true even
+                    // when it reports `completed == 0` (a one-trip inner loop). It is
+                    // a successful hand-off, not a low-yield entry to penalize.
+                    self.onSideExit(inner, if (iresult.completed > 0) iresult.completed else 1);
+                    linked_completed += 1;
+
+                    var cresult: irinterp.ExecResult = undefined;
+                    if (tier == .native_only) {
+                        cresult = snt.run(regs);
+                    } else {
+                        const cbuf = self.valuesScratch(current_link.instrs.len) catch break;
+                        cresult = irinterp.execute(current_link, regs, cbuf);
+                    }
+                    if (cresult.exit_instr == current_link.instrs.len - 1) {
+                        if (tier == .native_only) self.native_link_exits +|= 1;
+                        resume_pc = inner_pc;
+                        continue;
+                    }
+                    if (cresult.completed > 0) {
+                        self.onSideExit(current_link, cresult.completed);
+                        return .{ .completed = linked_completed + cresult.completed, .resume_pc = resume_pc };
+                    }
+                    break;
+                }
+                if (linked_completed > 0) {
+                    self.onSideExit(sct, linked_completed);
+                    return .{ .completed = linked_completed, .resume_pc = resume_pc };
+                }
+                self.onSideExit(sct, 0);
+                // A burst that committed nothing hasn't advanced `resume_pc` past its
+                // initial inner-root PC, so this is the coherent resume target.
+                return .{ .completed = 0, .resume_pc = resume_pc };
+            }
+
+            // Not a completed link run.
+            if (flushed_resume_pc) |target_pc| {
+                self.onSideExit(sct, 0);
+                return .{ .completed = 0, .resume_pc = target_pc };
+            }
+            if (sresult.completed > 0) {
+                self.onSideExit(sct, sresult.completed);
+                return .{ .completed = sresult.completed };
+            }
+            self.onSideExit(sct, 0);
+            // Zero iterations, no flush owed (ordinary path): try the next candidate.
+        }
+        return null;
     }
 
     /// True when a native trace has a link-terminated continuation waiting at one
@@ -1123,231 +1328,6 @@ pub const TraceState = struct {
             }
         }
         return false;
-    }
-
-    /// Phase 4 native numeric-for loop-done chaining. Native execution now reports
-    /// the failing guard's IR index. The dispatcher must have entered the root with
-    /// `runLinkedLoopDone`, so a numeric-for loop-done exit has already committed the
-    /// final iteration's post-guard stores and phi snapshot. This path only follows
-    /// native-compiled `.link` continuations and native inner roots; if either side
-    /// cannot compile, it returns null and tier-0 resumes at the committed PC.
-    pub fn tryChainProductiveLoopDoneNative(
-        self: *TraceState,
-        failed: *Trace,
-        exit_instr: u32,
-        proto: *const Proto,
-        regs: RegWindow,
-    ) ?ChainResult {
-        if (exit_instr == std.math.maxInt(u32)) return null;
-        const exit_pc = guardExitPc(failed.instrs[exit_instr]) orelse return null;
-        if (exit_pc == 0 or exit_pc == failed.anchor.pc) return null;
-
-        var visited: [8]*Trace = undefined;
-        var nvisited: usize = 0;
-        var st: ?*Trace = self.nextTraceExcluding(proto, exit_pc, visited[0..0]);
-        while (st) |sct| : (st = if (nvisited < visited.len)
-            self.nextTraceExcluding(proto, exit_pc, visited[0..nvisited])
-        else
-            null)
-        {
-            if (nvisited < visited.len) {
-                visited[nvisited] = sct;
-                nvisited += 1;
-            }
-            if (sct.inputs.len != 0) continue;
-            const is_link = sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link;
-            if (!is_link) continue;
-
-            const snt = self.nativeFor(sct) orelse return .{ .completed = 0, .resume_pc = exit_pc };
-            const sresult = snt.run(regs);
-            if (sresult.exit_instr != sct.instrs.len - 1) {
-                self.onSideExit(sct, 0);
-                return .{ .completed = 0, .resume_pc = exit_pc };
-            }
-
-            self.native_link_exits +|= 1;
-            var linked_completed: usize = 0;
-            const current_link = sct;
-            const link_term = current_link.instrs[current_link.instrs.len - 1];
-            const inner_pc: u32 = @intCast(link_term.aux);
-            var resume_pc: u32 = inner_pc;
-            var hops: usize = 0;
-            while (hops < visited.len) : (hops += 1) {
-                const inner = self.findLoopTrace(proto, inner_pc) orelse break;
-                if (inner.inputs.len != 0) break;
-                const int_native = self.nativeFor(inner) orelse break;
-                self.native_link_follow_count +|= 1;
-                self.link_follow_count +|= 1;
-
-                const iresult = int_native.runLinkedLoopDone(regs);
-                if (iresult.exit_instr == std.math.maxInt(u32)) break;
-
-                const inner_exit_pc = guardExitPc(inner.instrs[iresult.exit_instr]) orelse break;
-                const loop_done = inner_exit_pc == current_link.anchor.pc;
-                if (!loop_done) {
-                    if (iresult.completed > 0) {
-                        self.onSideExit(inner, iresult.completed);
-                        return .{
-                            .completed = if (linked_completed > 0) linked_completed else iresult.completed,
-                            .resume_pc = resume_pc,
-                        };
-                    }
-                    self.onSideExit(inner, 0);
-                    break;
-                }
-
-                resume_pc = current_link.anchor.pc;
-                self.onSideExit(inner, if (iresult.completed > 0) iresult.completed else 1);
-                linked_completed += 1;
-
-                const cresult = snt.run(regs);
-                if (cresult.exit_instr == current_link.instrs.len - 1) {
-                    self.native_link_exits +|= 1;
-                    resume_pc = inner_pc;
-                    continue;
-                }
-                if (cresult.completed > 0) {
-                    self.onSideExit(current_link, cresult.completed);
-                    return .{ .completed = linked_completed + cresult.completed, .resume_pc = resume_pc };
-                }
-                break;
-            }
-            if (linked_completed > 0) {
-                self.onSideExit(sct, linked_completed);
-                return .{ .completed = linked_completed, .resume_pc = resume_pc };
-            }
-            self.onSideExit(sct, 0);
-            return .{ .completed = 0, .resume_pc = resume_pc };
-        }
-        return null;
-    }
-
-    fn tryChainExitInternal(
-        self: *TraceState,
-        failed: *const Trace,
-        exit_instr: u32,
-        proto: *const Proto,
-        regs: RegWindow,
-        initial_loop_done_values: ?[]Value,
-    ) ?ChainResult {
-        if (exit_instr == std.math.maxInt(u32)) return null;
-        // Resolve the exit PC through the op-gated accessor: array guards store a
-        // lane ordinal in `aux`, not a PC, so a first-iteration array-guard exit
-        // must NOT be interpreted as a chain target (that could execute an
-        // unrelated trace against incoherent registers).
-        const exit_pc = guardExitPc(failed.instrs[exit_instr]) orelse return null;
-        // Skip if no PC recorded (aux==0) or exit PC equals the anchor (same-
-        // anchor chaining already tried all traces there).
-        if (exit_pc == 0 or exit_pc == failed.anchor.pc) return null;
-
-        // Visit each side trace at `exit_pc` exactly once (highest-hit first).
-        // Using a growing `visited` set rather than a single-`skip` cursor is what
-        // makes this terminate: two equal-priority side traces that both zero-exit
-        // would otherwise cycle `A→B→A→…` forever.
-        var visited: [8]*Trace = undefined;
-        var nvisited: usize = 0;
-        var st: ?*Trace = self.nextTraceExcluding(proto, exit_pc, visited[0..0]);
-        while (st) |sct| : (st = if (nvisited < visited.len)
-            self.nextTraceExcluding(proto, exit_pc, visited[0..nvisited])
-        else
-            null)
-        {
-            if (nvisited < visited.len) {
-                visited[nvisited] = sct;
-                nvisited += 1;
-            }
-            // Cluster sub-lever 1: a side trace with synthetic upvalue/global inputs
-            // needs the dispatch loop's per-entry seeding (it has no `*Vm` here), so
-            // it cannot be entered through the chain path. Skip it — it still runs
-            // via the normal seeded same-anchor walk.
-            if (sct.inputs.len != 0) continue;
-            const is_link = sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link;
-            if (initial_loop_done_values != null and !is_link) continue;
-            const sbuf = self.valuesScratch(sct.instrs.len) catch continue;
-            // Once a productive loop-done exit has been flushed, the ordinary
-            // loop-header deopt path is no longer valid: tier-0 must resume at the
-            // PC that matches the now-committed state. The target advances from the
-            // post-inner continuation anchor to the inner root anchor only after a
-            // `.link` snapshot has been flushed.
-            var flushed_resume_pc: ?u32 = null;
-            if (initial_loop_done_values) |vals| {
-                if (!irinterp.flushNumericForLoopDone(failed, regs, vals, exit_instr)) return null;
-                flushed_resume_pc = exit_pc;
-            }
-            const sresult = irinterp.execute(sct, regs, sbuf);
-            if (is_link and sresult.exit_instr == sct.instrs.len - 1) {
-                self.link_ir_exits +|= 1;
-                var linked_completed: usize = 0;
-                const current_link = sct;
-                var resume_pc: u32 = @intCast(current_link.instrs[current_link.instrs.len - 1].aux);
-                flushed_resume_pc = resume_pc;
-                var hops: usize = 0;
-                while (hops < visited.len) : (hops += 1) {
-                    const link_term = current_link.instrs[current_link.instrs.len - 1];
-                    const inner_pc: u32 = @intCast(link_term.aux);
-                    const inner = self.findLoopTrace(proto, inner_pc) orelse break;
-                    if (inner.inputs.len != 0) break;
-                    self.link_follow_count +|= 1;
-
-                    const ibuf = self.valuesScratch(inner.instrs.len) catch break;
-                    const iresult = irinterp.execute(inner, regs, ibuf);
-                    if (iresult.exit_instr == std.math.maxInt(u32)) break;
-
-                    const inner_exit_pc = guardExitPc(inner.instrs[iresult.exit_instr]) orelse break;
-                    const loop_done = inner_exit_pc == current_link.anchor.pc;
-                    if (!loop_done) {
-                        if (iresult.completed > 0) {
-                            self.onSideExit(inner, iresult.completed);
-                            return .{
-                                .completed = if (linked_completed > 0) linked_completed else iresult.completed,
-                                .resume_pc = resume_pc,
-                            };
-                        }
-                        self.onSideExit(inner, 0);
-                        break;
-                    }
-                    if (!irinterp.flushNumericForLoopDone(inner, regs, ibuf, iresult.exit_instr)) break;
-                    resume_pc = current_link.anchor.pc;
-
-                    // Roll-up (doc 15 P3): the inner root running to its loop-done
-                    // exit completes exactly one enclosing-loop iteration. This is
-                    // true even when the root reports `completed == 0` (e.g. a
-                    // one-trip inner loop): it is a successful linked hand-off, not a
-                    // low-yield trace entry to penalize.
-                    self.onSideExit(inner, if (iresult.completed > 0) iresult.completed else 1);
-                    linked_completed += 1;
-
-                    const cbuf = self.valuesScratch(current_link.instrs.len) catch break;
-                    const cresult = irinterp.execute(current_link, regs, cbuf);
-                    if (cresult.exit_instr == current_link.instrs.len - 1) {
-                        resume_pc = inner_pc;
-                        continue;
-                    }
-                    if (cresult.completed > 0) {
-                        self.onSideExit(current_link, cresult.completed);
-                        return .{ .completed = linked_completed + cresult.completed, .resume_pc = resume_pc };
-                    }
-                    break;
-                }
-                if (linked_completed > 0) {
-                    self.onSideExit(sct, linked_completed);
-                    return .{ .completed = linked_completed, .resume_pc = resume_pc };
-                }
-                self.onSideExit(sct, 0);
-                if (flushed_resume_pc) |target_pc| return .{ .completed = 0, .resume_pc = target_pc };
-                continue;
-            }
-            if (flushed_resume_pc) |target_pc| {
-                self.onSideExit(sct, 0);
-                return .{ .completed = 0, .resume_pc = target_pc };
-            }
-            if (sresult.completed > 0) {
-                self.onSideExit(sct, sresult.completed);
-                return .{ .completed = sresult.completed };
-            }
-            self.onSideExit(sct, 0);
-        }
-        return null;
     }
 
     /// **Nested-loop continuation arming (Phase 1).** Called on a *productive*
@@ -1878,7 +1858,7 @@ pub const TraceState = struct {
 
         // Link traces are cached **unoptimized**: `tropt.optimize` asserts a `.loop`
         // terminal and its LICM/φ machinery is written for back-edge loops. Phase 3
-        // executes link traces through `tryChainExit`, but the unoptimized straight-line
+        // executes link traces through `driveChain`, but the unoptimized straight-line
         // continuation is the intended hand-off shape. `dupe` preserves `.link`.
         const fields: tropt.Optimized = if (self.config.optimize and self.rec.link_target == null)
             tropt.optimize(self.gpa, instrs, consts) catch |e| switch (e) {
@@ -3019,7 +2999,7 @@ pub const TraceState = struct {
     /// A first-iteration bounds guard (`init` within `limit`) gates the link: a
     /// zero-trip inner loop fails it and falls back to tier-0 rather than entering the
     /// inner root, which assumes ≥1 iteration. Phase 3 consumes this snapshot to follow
-    /// the link through `tryChainExit`.
+    /// the link through `driveChain`.
     fn recForPrepLink(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32) !void {
         // A `for_prep` inside an inlined callee shares `recForLoop`'s cross-frame
         // hazard (raw-pc anchor comparison across protos); keep the historical abort.
@@ -4502,7 +4482,7 @@ test "tryChainExit: chains to a trace at the guard's exit PC" {
 
     // Fake a guard failure in Trace A at instr index 1 (the guard_int).
     var tr_regs = TestRegs{ .regs = &regs };
-    const chained = state.tryChainExit(trace_a, 1, &proto, tr_regs.view());
+    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{});
     tr_regs.commit(); // the chained side trace mutated the window — reflect it back
     try testing.expect(chained != null);
     try testing.expectEqual(@as(usize, 3), chained.?.completed); // Trace B ran 3 iters
@@ -4578,7 +4558,7 @@ test "tryChainExit: an array-guard exit does NOT chain on its lane ordinal" {
     var regs = [_]Value{ Value.int(0), Value.int(4) };
     // The guard_lane is at instr index 1. It must NOT chain to the decoy at pc 2.
     var tr_regs = TestRegs{ .regs = &regs };
-    const chained = state.tryChainExit(trace_a, 1, &proto, tr_regs.view());
+    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{});
     tr_regs.commit(); // commit so a (buggy) decoy mutation would surface — keeps the test's teeth
     try testing.expect(chained == null);
     try testing.expectEqual(@as(i64, 0), regs[0].asInt()); // r0 untouched — no decoy ran
