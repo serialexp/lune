@@ -830,6 +830,15 @@ pub const Assembler = struct {
         try self.b(0xFF);
         try self.modrmReg(2, reg.lo());
     }
+    /// `jmp reg` — FF /4. Indirect near jump through a GP register (absolute target
+    /// held in the register). Used by the frameless trampoline (`jmp rcx` into the
+    /// body_entry arg) and by each frameless body side-exit (`jmp rax` to the shared
+    /// teardown address). Mirrors `callReg` but with the /4 modrm extension.
+    pub fn jmpReg(self: *Assembler, reg: Reg) !void {
+        if (reg.hi()) try self.b(0x41);
+        try self.b(0xFF);
+        try self.modrmReg(4, reg.lo());
+    }
     /// `ret` — C3.
     pub fn ret(self: *Assembler) !void {
         try self.b(0xC3);
@@ -1494,6 +1503,22 @@ test "enc: sar reg, cl / sar reg, imm8" {
     try expectEnc(&.{ 0x41, 0xFF, 0xD2 }, struct { // call r10 (REX.B)
         fn f(a: *Assembler) !void {
             try a.callReg(.r10);
+        }
+    }.f);
+    // jmp reg — FF /4
+    try expectEnc(&.{ 0xFF, 0xE1 }, struct { // jmp rcx
+        fn f(a: *Assembler) !void {
+            try a.jmpReg(.rcx);
+        }
+    }.f);
+    try expectEnc(&.{ 0xFF, 0xE0 }, struct { // jmp rax
+        fn f(a: *Assembler) !void {
+            try a.jmpReg(.rax);
+        }
+    }.f);
+    try expectEnc(&.{ 0x41, 0xFF, 0xE7 }, struct { // jmp r15 (REX.B)
+        fn f(a: *Assembler) !void {
+            try a.jmpReg(.r15);
         }
     }.f);
 }

@@ -1,8 +1,8 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
-Status: partial — Increment 1 landed (shared mcode arena, P-D; co-location only, behaviour byte-identical). Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Mechanism mapped on both sides; peer review (gpt-5.6-sol, 2026-07-11) found the first-draft "swing one rel32" Phase 2 unsound. A second LuaJIT-source pass produced the grounded port architecture below (§Port architecture): keep lune's `regs[]` memory handoff, pin only 2–3 base pointers to reserved registers, run frameless bodies under one shared trampoline. Next: Increment 2 (shared trampoline + frameless bodies, P-A/P-B/P-C/P-G/P-F).
+Status: partial — Increment 1 (shared mcode arena, P-D) and Increment 2.1 (frameless chain-entry ABI, P-A) landed; both byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies now run frameless under one shared trampoline (`ensureTrampoline`); exits still land on `shared_exit` (no linking yet). Next: Increment 2.2 (`ChainResult` P-B + `(final_trace_id,exit_instr)→PC` dispatcher mapping), then 2.3 link-slot population (P-C/P-G), 2.4 P-F verification.
 Owner: Bart
-Last updated: 2026-07-11 (Increment 2 concrete design written + peer-reviewed by gpt-5.6-sol; 3 showstoppers + must-fixes folded in; blocked on the P-F determinism-contract decision before coding)
+Last updated: 2026-07-11 (Increment 2.1 landed — frameless trampoline + frameless bodies, P-A; 10-mode matrix green, nsieve/field_hash/grid tier-0==native byte-identical, nsieve jit ms flat)
 
 Coherent-state chaining (doc 16) proved *correct* but *performance-neutral* on
 nsieve: the JIT compiles every hot loop to native code, chaining hands control
@@ -54,18 +54,27 @@ land; move whole sections to Done once everything inside is checked.
   ±2 GiB reachability check is deferred to Increment 2. Behaviour byte-identical:
   10-mode matrix green, nsieve identical across tier-0/tier-1a/native, bench
   unchanged (arena work is compile-time only, never the hot loop).
+- [x] **P-A — Frameless chain-entry ABI (Increment 2.1).** The shared trampoline
+  (`McodeArena.ensureTrampoline`) owns the single C frame: it saves every
+  callee-saved GPR once, reserves a fixed `SPILL_MAX`-slot spill area (keeping body
+  `rsp % 16 == 8`), zeroes the rbx counter, and `jmp`s into the body (`body_entry`
+  in rcx). Trace bodies are now frameless — `lower` skips the per-trace
+  `push/sub/pop/ret` when `shared_exit != null` and every side-exit jumps (absolute)
+  to the trampoline's `shared_exit` instead of tearing down its own frame. A body
+  needing more than `SPILL_MAX` (512) spill slots bails to tier-1a. `CompiledTrace`
+  gained `trampoline_entry`; `run` dispatches through the trampoline for arena
+  (production) pages and directly for owned (test) pages. This is option (ii) from
+  the P-A sketch — linked traces share one frame and don't each push/pop — the ABI
+  foundation the link handoff (P-C) and chain-wide result (P-B) build on. No linking
+  yet: exits still land on `shared_exit`, so behaviour is byte-identical (10-mode
+  matrix green; nsieve + nsieve-bit + field_hash/grid/array all tier-0==native;
+  nsieve jit ms flat vs the pre-change baseline).
 
 ### Outstanding
 
 **Blocking prerequisites — must be designed before any patch is safe** (peer
 review, 2026-07-11; see §Blocking prerequisites for the argument):
 
-- [ ] **P-A — Native chain-entry ABI.** A patched exit cannot `jmp` a child's
-  C-ABI prologue on top of the parent's live frame (stack corruption). Define how
-  a parent hands off: either (i) parent tears down its frame/callee-saves and rolls
-  its `completed` into a chain accumulator *before* a tail-jump to a child C entry,
-  or (ii) a bespoke internal chain-entry ABI where linked traces share one frame
-  and don't each push/pop. Everything else depends on this.
 - [ ] **P-B — Chain-wide result contract.** `NativeResult` describes one trace;
   a child overwrites `completed`/`exit_instr` with *its* IR indices, which the
   dispatcher then mis-attributes to the parent (`interp.zig:2584,2595`) → OOB /
@@ -554,9 +563,17 @@ path (it has `final_trace_id` to attribute correctly). Link slots are reset to
 is also the P-E lifetime hook.
 
 **Sub-stepping (each behind `just test`, byte-identical gate):**
-- 2.1 Trampoline + frameless bodies, **all slots pinned to `shared_exit`** (pure
+- 2.1 Trampoline + frameless bodies, **all exits pinned to `shared_exit`** (pure
   ABI move; no linking; behaviour byte-identical — this de-risks the frame change
-  in isolation).
+  in isolation). **LANDED** — see the Done bullet above. Refinement made while
+  coding: 2.1 emits a *direct* absolute `movabs rax, shared_exit; jmp rax` at each
+  exit rather than the indirect `jmp [slot]` of the final design. With no slots
+  armed yet the two are behaviourally identical, and the direct form needs no
+  per-trace slot table; 2.3 replaces it with the indirect `jmp [slot]` handoff
+  (slot default = `shared_exit`) when link population arrives. The trampoline lives
+  as a permanent, never-freed `McodeArena` slot (`ensureTrampoline`, emitted once);
+  the test path (`compile`, `arena == null`) keeps the self-framed ABI, giving a
+  built-in A/B of both ABIs over the same lowered trace.
 - 2.2 `ChainResult` (P-B) + dispatcher `(final_trace_id,exit_instr)→PC` mapping,
   still no linking. Byte-identical.
 - 2.3 Link-slot population from `driveChain` for `.link` first (simplest kind),

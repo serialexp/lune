@@ -162,6 +162,16 @@ pub fn mapExecutable(code: []const u8) MapError!ExecPage {
     return .{ .code = mem[0..code.len], .owner = .{ .owned = mem } };
 }
 
+/// Frameless-ABI spill ceiling (P-A / doc 17 Increment 2). The shared trampoline
+/// reserves exactly `SPILL_MAX * 8` bytes of spill area once; a frameless body may
+/// address `[rsp + idx*8]` for `idx < SPILL_MAX`. A trace whose `alloc.spill_count`
+/// exceeds this bails to tier-1a (`compileImpl` returns null). 512 slots = 4 KiB —
+/// far above any real trace's spill_count (tens), so the bail is a safety net, not a
+/// path hit in practice. MUST be even so `SPILL_MAX*8` is 16-aligned, which (with the
+/// trampoline's 6 callee-saved pushes) keeps the body's `rsp % 16 == 8` — the same
+/// invariant the self-framed prologue guarantees and the hash-cell callout relies on.
+pub const SPILL_MAX: u32 = 512;
+
 /// A shared, contiguous machine-code arena — the lune analogue of LuaJIT's
 /// `lj_mcode.c` mcode areas. Instead of one `mmap` per compiled trace, every trace's
 /// code lives as a slice of a small chain of large regions. This is prerequisite P-D
@@ -198,9 +208,65 @@ pub const McodeArena = struct {
     gpa: std.mem.Allocator,
     regions: std.ArrayListUnmanaged(Region) = .empty,
     free_list: std.ArrayListUnmanaged(FreeBlock) = .empty,
+    /// The shared frameless trampoline (P-A / doc 17 Increment 2), emitted lazily on
+    /// the first `compileInto`. Absolute addresses into a permanent arena slot that is
+    /// never freed — stable for the arena's lifetime (regions never move). `null`
+    /// until first use.
+    trampoline_entry: ?usize = null,
+    trampoline_exit: ?usize = null,
 
     pub fn init(gpa: std.mem.Allocator) McodeArena {
         return .{ .gpa = gpa };
+    }
+
+    /// The two stable absolute addresses a frameless compile needs.
+    pub const Trampoline = struct { entry: usize, shared_exit: usize };
+
+    /// Lazily emit (once) and return the shared frameless trampoline. The trampoline
+    /// owns the C frame so bodies don't: it saves every callee-saved GPR, reserves the
+    /// `SPILL_MAX` spill area (keeping body `rsp % 16 == 8`), zeroes the rbx iteration
+    /// counter, then `jmp`s into `body_entry` (passed in rcx). `shared_exit` reverses
+    /// the prologue and returns to the C caller. C-ABI:
+    /// `fn(rdi=tags, rsi=payloads, rdx=*NativeResult, rcx=body_entry) callconv(.c) void`.
+    pub fn ensureTrampoline(self: *McodeArena) (MapError || std.mem.Allocator.Error)!Trampoline {
+        if (self.trampoline_entry) |e| return .{ .entry = e, .shared_exit = self.trampoline_exit.? };
+
+        var a = x64.Assembler.init(self.gpa);
+        defer a.deinit();
+        const exit_lbl = try a.label();
+        // Prologue: save all callee-saved (unconditionally — bodies then clobber
+        // rbp/r12–r15 freely), reserve the spill area, zero the counter, enter body.
+        try a.push(.rbx);
+        try a.push(.rbp);
+        try a.push(.r12);
+        try a.push(.r13);
+        try a.push(.r14);
+        try a.push(.r15);
+        // 6 pushes (48 B) keep rsp % 16 == 8 after the C-ABI call's return-address
+        // push; SPILL_MAX*8 is 16-aligned, so the body sees rsp % 16 == 8 too.
+        try a.subRegImm32(.rsp, @intCast(SPILL_MAX * 8));
+        try a.xorRegReg(.rbx, .rbx);
+        try a.jmpReg(.rcx); // enter body_entry (arg3); rcx is body scratch afterward
+        // shared_exit: undo the prologue and return. Bodies `jmp` here (absolute)
+        // after writing completed/exit_instr to [rdx].
+        a.bind(exit_lbl);
+        try a.addRegImm32(.rsp, @intCast(SPILL_MAX * 8));
+        try a.pop(.r15);
+        try a.pop(.r14);
+        try a.pop(.r13);
+        try a.pop(.r12);
+        try a.pop(.rbp);
+        try a.pop(.rbx);
+        try a.ret();
+        a.resolve();
+
+        // Alloc into the arena; the returned page is intentionally never deinit'd —
+        // this slot is permanent (never on the free-list), so its address is stable.
+        const page = try self.alloc(a.code.items);
+        const base = @intFromPtr(page.code.ptr);
+        self.trampoline_entry = base;
+        self.trampoline_exit = base + a.labels.items[exit_lbl.id].?;
+        return .{ .entry = base, .shared_exit = self.trampoline_exit.? };
     }
 
     pub fn deinit(self: *McodeArena) void {
@@ -512,8 +578,16 @@ const NativeResult = extern struct {
 /// instruction. Semantically identical to `irinterp.execute(t, regs, scratch)`.
 pub const CompiledTrace = struct {
     page: ExecPage,
+    /// Frameless dispatch (P-A / doc 17 Increment 2). `null` → the page is a
+    /// self-framed function (test path via `compile`/`mapExecutable`), called
+    /// directly as `EntryFn`. Non-null → the page is a frameless body; run it by
+    /// calling this shared trampoline with `page.code.ptr` as the body_entry arg.
+    trampoline_entry: ?usize = null,
 
     pub const EntryFn = fn ([*]u8, [*]u64, *NativeResult) callconv(.c) void;
+    /// The shared frameless trampoline's C-ABI type: SoA lanes + result out-param,
+    /// plus the body entry address in the 4th arg (rcx).
+    pub const TrampolineFn = fn ([*]u8, [*]u64, *NativeResult, *const anyopaque) callconv(.c) void;
 
     /// Run the trace over the register file `regs` (mutated in place at each loop
     /// commit, exactly as the IR-interpreter does). Returns the committed-iteration
@@ -538,7 +612,12 @@ pub const CompiledTrace = struct {
             .exit_instr = std.math.maxInt(u32),
             .linked_loop_done = if (linked_loop_done) 1 else 0,
         };
-        self.page.entry(EntryFn)(regs.tags, regs.payloads, &result);
+        if (self.trampoline_entry) |tramp| {
+            const f: *const TrampolineFn = @ptrFromInt(tramp);
+            f(regs.tags, regs.payloads, &result, self.page.code.ptr);
+        } else {
+            self.page.entry(EntryFn)(regs.tags, regs.payloads, &result);
+        }
         return .{ .completed = result.completed, .exit_instr = result.exit_instr };
     }
 
@@ -613,16 +692,31 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
     var alloc = analyze(gpa, t, kinds, slot_of) orelse return null;
     defer alloc.deinit(gpa);
 
+    // Frameless production path (arena present): reserve the shared trampoline and
+    // emit a body that `jmp`s to its shared_exit. Test path (arena == null) keeps the
+    // self-framed ABI so the standalone-page unit tests are untouched — and gives a
+    // built-in A/B of the two ABIs over the same lowered trace.
+    var shared_exit: ?usize = null;
+    var tramp_entry: ?usize = null;
+    if (arena) |ar| {
+        // A frameless body may only address SPILL_MAX spill slots (the trampoline
+        // reserves exactly that many). Beyond it → bail to tier-1a.
+        if (alloc.spill_count > SPILL_MAX) return null;
+        const tr = ar.ensureTrampoline() catch return null;
+        shared_exit = tr.shared_exit;
+        tramp_entry = tr.entry;
+    }
+
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    lower(gpa, t, kinds, &alloc, &asm_buf) catch return null;
+    lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit) catch return null;
     asm_buf.resolve();
 
     const page = if (arena) |a|
         a.alloc(asm_buf.code.items) catch return null
     else
         mapExecutable(asm_buf.code.items) catch return null;
-    return .{ .page = page };
+    return .{ .page = page, .trampoline_entry = tramp_entry };
 }
 
 /// Forward type-proof over the linear SSA. Fills `kinds` (and `slot_of`, the
@@ -2871,7 +2965,7 @@ fn emitParallelMove(a: *x64.Assembler, moves: []Move, done: []bool) !void {
     std.debug.assert(left == 0);
 }
 
-/// Restore the stack/callee-saved state and return. Shared by both epilogues.
+/// Restore the stack/callee-saved state and return. Self-framed epilogue.
 fn emitTeardown(a: *x64.Assembler, frame: i32, callee: []const Reg) !void {
     if (frame > 0) try a.addRegImm32(.rsp, frame);
     var k = callee.len;
@@ -2881,6 +2975,20 @@ fn emitTeardown(a: *x64.Assembler, frame: i32, callee: []const Reg) !void {
     }
     try a.pop(.rbx);
     try a.ret();
+}
+
+/// Emit a trace's return path. Self-framed (`shared_exit == null`, test path): tear
+/// down the per-trace frame + callee-saved and `ret`. Frameless (`shared_exit` set,
+/// production path): the shared trampoline owns the frame, so just jump to its
+/// teardown at the absolute address. rax is dead scratch at every exit site (the
+/// slot flush + result writes are already done), so it is free to hold the target.
+fn emitReturn(a: *x64.Assembler, frame: i32, callee: []const Reg, shared_exit: ?usize) !void {
+    if (shared_exit) |se| {
+        try a.movRegImm64(.rax, @bitCast(@as(u64, se)));
+        try a.jmpReg(.rax);
+    } else {
+        try emitTeardown(a, frame, callee);
+    }
 }
 
 fn nativeExitLabel(a: *x64.Assembler, exit_labels: []?x64.Label, instr_idx: usize) !x64.Label {
@@ -3147,7 +3255,7 @@ fn emitLinkedLoopDoneSnapshot(
 /// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
 /// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
 /// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
-fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler) !void {
+fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize) !void {
     const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(exit_labels);
     @memset(exit_labels, null);
@@ -3175,10 +3283,17 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     const frame: i32 = @intCast(std.mem.alignForward(usize, pushes * 8 + alloc.spill_count * 8, 16) - pushes * 8);
 
     // Prologue: save rbx + callee-saved homes, completed = 0, reserve the frame.
-    try a.push(.rbx);
-    for (callee[0..callee_len]) |r| try a.push(r);
-    try a.xorRegReg(.rbx, .rbx);
-    if (frame > 0) try a.subRegImm32(.rsp, frame);
+    // Frameless (production): the shared trampoline already saved ALL callee-saved,
+    // zeroed rbx, and reserved SPILL_MAX*8 of spill area, so the body starts directly
+    // at the hoisted guards below. `[rsp + idx*8]` spill addressing is identical
+    // (idx < SPILL_MAX, guaranteed by the compileImpl bail); `frame`/`callee` are
+    // computed above but used only by the self-framed epilogue.
+    if (shared_exit == null) {
+        try a.push(.rbx);
+        for (callee[0..callee_len]) |r| try a.push(r);
+        try a.xorRegReg(.rbx, .rbx);
+        if (frame > 0) try a.subRegImm32(.rsp, frame);
+    }
 
     const loop_top = try a.label();
     const deopt_exit = try a.label();
@@ -3997,7 +4112,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 }
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
                 try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
-                try emitTeardown(a, frame, callee[0..callee_len]);
+                try emitReturn(a, frame, callee[0..callee_len], shared_exit);
             },
             // A φ emits no code in the body: a slot-bound φ's writeback is driven by
             // its slot's `.carried`/`.write_only` class above (the back-edge shuffle /
@@ -4044,7 +4159,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             a.bind(l);
             try emitLinkedLoopDoneSnapshot(a, t, kinds, alloc, ei);
             try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
-            try emitTeardown(a, frame, callee[0..callee_len]);
+            try emitReturn(a, frame, callee[0..callee_len], shared_exit);
         }
     }
 
@@ -4060,7 +4175,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
     }
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
-    try emitTeardown(a, frame, callee[0..callee_len]);
+    try emitReturn(a, frame, callee[0..callee_len], shared_exit);
 
     // PROLOGUE_FAIL: a hoisted type guard failed before any commit. Return 0 with
     // regs[] untouched and no per-body guard identity (the cut-1 EXIT would have
@@ -4068,7 +4183,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     a.bind(prologue_fail);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "completed"), 0);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), -1);
-    try emitTeardown(a, frame, callee[0..callee_len]);
+    try emitReturn(a, frame, callee[0..callee_len], shared_exit);
 }
 
 // ---------------------------------------------------------------------------
