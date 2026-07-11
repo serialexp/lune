@@ -647,16 +647,18 @@ showstoppers + several load-bearing fixes must land first:**
   bodies because the callout restores them; CET/IBT would need landing pads at body
   entries only if ever built with enforcement (not a current constraint).
 
-**Open decision this surfaces (P-F contract — for Bart):** native link-slots make
-the *recording set* diverge between native and tier-1a modes (tier-1a has no mcode
-to arm), and `hit_count`/penalty/gate bypass means native and tier-1a acquire
-different tiering state. This does **not** change stdout if every trace is
-semantically correct (the existing C5 contract already permits different trace sets
-per mode), but it does make trace *dumps*/serialization observably mode-dependent.
-Two contracts: **(a)** relax determinism to semantic output + replay equivalence and
-declare tiering metadata mode-local; or **(b)** replicate deterministic per-hop
-accounting on the `shared_exit` path (using `final_trace_id` to attribute). This is
-an architectural call, not mine to make.
+**P-F contract — DECIDED (Bart, 2026-07-11): replicate-but-inert.** Native
+link-slots make tiering metadata (`hit_count`/penalty/gate, recording set) diverge
+between native and tier-1a modes; it does not change stdout (the C5 contract already
+permits different trace *sets* per mode) but it does make internal counters / trace
+dumps mode-dependent. Rather than relax the contract *or* pay the accounting cost
+always, the chain carries a **per-hop transition record that is gated by a config
+flag** (parallel to `record_exec_log`): when the flag is on (the 10-mode matrix /
+determinism goldens), `shared_exit` replays the per-hop accounting the dispatcher
+would have done — attributed via `final_trace_id` — so tests assert byte-identical
+tiering metadata across modes; when off (production `--jit-native`), the transition
+record and replay are skipped entirely, so the mcode handoff stays cheap. "Test
+equivalence while not paying the cost when not relevant."
 
 ### Increment 3 — Exit-branch patching + lifetime (P-E)
 
