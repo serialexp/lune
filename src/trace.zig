@@ -873,12 +873,35 @@ pub const TraceState = struct {
     /// `link_follow_count` counts those links being followed into the inner root.
     /// They are intentionally harmless in release builds and give tests a direct
     /// proof that Phase 3 is not inert.
+    ///
+    /// Since coherent-state chaining (doc 16, Phase 2–3) these aggregate *both*
+    /// classes of `.link` burst that flow through the same driveChain code: the
+    /// loop-done continuation (anchored at the inner-exit PC) and the prime-side
+    /// entry ramp (anchored at the outer header). They cannot be told apart at the
+    /// `.link` arm, so use `prime_side_chain_follows` (below) when you need the
+    /// prime-path-specific count.
     link_ir_exits: u64 = 0,
     link_follow_count: u64 = 0,
     /// Phase 4 native-chain diagnostics. These mirror the tier-1a counters above,
     /// but only increment when both linked traces execute through native pages.
     native_link_exits: u64 = 0,
     native_link_follow_count: u64 = 0,
+    /// **Coherent-state chaining (doc 16, Phase 2) diagnostics.** `prime_side_arms`
+    /// counts outer-header prime side-traces armed (a productive branch-guard went
+    /// hot and we switched to `.full` to record the current prime iteration).
+    /// `tier0_outer_body_entries` counts tier-0 executions of a traced anchor's body
+    /// top — the design's required NEW signal for "how often the prime path drops to
+    /// tier-0" (the back-edge counter returns early once any trace exists at the
+    /// anchor, so it cannot measure this). Both are mode-invariant and give tests a
+    /// direct proof Phase 2 is not inert.
+    prime_side_arms: u64 = 0,
+    tier0_outer_body_entries: u64 = 0,
+    /// Counts prime side-trace link-bursts actually *entered* via the
+    /// `.ordinary_header` chain (as opposed to a loop-done `.link` continuation,
+    /// which bumps `native_link_exits`/`link_ir_exits` and is indistinguishable
+    /// there). This is the Phase-2-specific "the prime chain fired, not merely
+    /// recorded" signal the design demands — output equality alone can't prove it.
+    prime_side_chain_follows: u64 = 0,
     /// The in-progress recording (at most one at a time in Phase 5a).
     rec: Recorder = .{},
     /// Reusable SSA-value scratch for the tier-1a executor (`irinterp.execute`),
@@ -914,6 +937,31 @@ pub const TraceState = struct {
     /// still aborts (LINNER) until Phase 2 turns it into a `.link`. See
     /// `docs/design/15-nested-loop-linking.md`.
     pending_exit_anchor: ?AnchorKey = null,
+    /// **Coherent-state chaining (doc 16, Phase 2).** Per-guard counters for
+    /// *productive* source-level branch-guard exits (e.g. nsieve's `guard_false(p[i])`
+    /// firing when a composite-skipping outer trace finally hits a prime). Kept in a
+    /// map separate from `guard_failures` so productive-branch counting never
+    /// cross-talks with the zero-exit side-trace machinery. Keyed by
+    /// `(anchor, exit_pc)`; crosses `config.hotguard` → `wants_prime_side`.
+    prime_exits: std.AutoHashMapUnmanaged(GuardKey, u32) = .empty,
+    /// **Coherent-state chaining (doc 16, Phase 2).** When non-null, a productive
+    /// branch-guard at this outer-header anchor has gone hot: the next such exit
+    /// should arm an *immediate* replay of the current (prime) iteration — recording
+    /// the taken branch forward through the inner `for_prep` and closing with a
+    /// `.link` to the inner root — rather than the *next* iteration (which the
+    /// `wants_side_trace`/`onBackEdge` path would record, and which is ~93% a
+    /// composite in nsieve, the wrong path). Set by `countProductiveBranchExit`;
+    /// consumed at the productive-exit site by handing off to `pending_replay_anchor`.
+    wants_prime_side: ?AnchorKey = null,
+    /// **Coherent-state chaining (doc 16, Phase 2).** When non-null, an outer-header
+    /// prime side-trace recording is pending at this anchor. Unlike
+    /// `pending_exit_anchor` (a *post-inner* continuation pc), this anchor is the
+    /// failed trace's OWN coherent anchor — the registers are already coherent there
+    /// on the productive exit, so tier-0 re-enters at the anchor and
+    /// `maybeStartReplaySide` starts the `.side` recording the instant `cur_pc`
+    /// reaches it, capturing the prime branch of that same iteration. Cleared by
+    /// `maybeStartReplaySide` (consumed) or `clearPendingExitAnchor` (frame unwind).
+    pending_replay_anchor: ?AnchorKey = null,
     /// Per-trace execution logs for the visualizer (`execlog.zig`), populated only
     /// when `config.record_exec_log`. Keyed by `trace_id` (cache index). Empty and
     /// untouched on the normal JIT path.
@@ -935,6 +983,7 @@ pub const TraceState = struct {
         self.gate.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
         self.guard_failures.deinit(self.gpa);
+        self.prime_exits.deinit(self.gpa);
         self.values_scratch.deinit(self.gpa);
         for (self.exec_logs.items) |*l| l.deinit(self.gpa);
         self.exec_logs.deinit(self.gpa);
@@ -996,6 +1045,27 @@ pub const TraceState = struct {
         for (self.cache.items) |t| {
             if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
             if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .loop) continue;
+            if (best == null or t.hit_count > best_hits) {
+                best = t;
+                best_hits = t.hit_count;
+            }
+        }
+        return best;
+    }
+
+    /// Highest-hit cached `.link` trace at `(proto, pc)` — i.e. a continuation
+    /// (doc 15) or a prime side-trace (doc 16). This is the ping-pong *driver*
+    /// the linked burst hands control to after an inner-root loop-done: it is
+    /// anchored at the post-inner PC and advances the enclosing loop before
+    /// linking back to the inner root. Distinct from `findLoopTrace`, which
+    /// finds the `.loop`-terminated inner root itself.
+    pub fn findLinkTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
+        var best: ?*Trace = null;
+        var best_hits: u64 = 0;
+        for (self.cache.items) |t| {
+            if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
+            if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .link) continue;
+            if (t.inputs.len != 0) continue;
             if (best == null or t.hit_count > best_hits) {
                 best = t;
                 best_hits = t.hit_count;
@@ -1127,14 +1197,27 @@ pub const TraceState = struct {
     ) ?ChainResult {
         const exit_instr = result.exit_instr;
         if (exit_instr == std.math.maxInt(u32)) return null;
-        // Resolve the exit PC through the op-gated accessor: array guards store a
-        // lane ordinal in `aux`, not a PC, so a first-iteration array-guard exit
-        // must NOT be interpreted as a chain target (it could execute an unrelated
-        // trace against incoherent registers).
-        const walk_pc = guardExitPc(failed.instrs[exit_instr]) orelse return null;
-        // No PC recorded (aux==0), or the exit PC is the anchor (same-anchor
-        // chaining already tried every trace there): nothing to chain to.
-        if (walk_pc == 0 or walk_pc == failed.anchor.pc) return null;
+        const walk_pc = switch (materialization) {
+            // Coherent-anchor chaining (doc 16): after an *ordinary* guard deopt the
+            // registers are coherent at the failed trace's **anchor**, not the
+            // guard's exit PC — a trace may only be entered at its own coherent
+            // anchor. So chain to same-anchor siblings (including an outer-header
+            // prime side-trace). The guard's `aux` is a lane ordinal for array
+            // guards — irrelevant here; we resume at the anchor regardless of which
+            // guard fired. `initially_excluded` (the dispatcher's same-anchor
+            // `visited` set) keeps us from re-running the failed trace or any
+            // sibling the cold walk already tried this back-edge.
+            .ordinary_header => failed.anchor.pc,
+            // Loop-done materializations chain to a `.link` continuation living at
+            // the guard's *exit* PC (a real post-loop bytecode pc). Resolve it
+            // through the op-gated accessor so an array-guard lane ordinal is never
+            // mistaken for a PC, and reject a 0/anchor exit PC (nothing to chain to).
+            else => blk: {
+                const wp = guardExitPc(failed.instrs[exit_instr]) orelse return null;
+                if (wp == 0 or wp == failed.anchor.pc) return null;
+                break :blk wp;
+            },
+        };
 
         const loop_done_values: ?[]Value = switch (materialization) {
             .ir_numeric_for_done => |vals| vals,
@@ -1204,8 +1287,20 @@ pub const TraceState = struct {
                 } else {
                     self.link_ir_exits +|= 1;
                 }
+                // Phase-2 chain-firing signal: this burst entered through the
+                // coherent-anchor (outer-header prime side-trace) path, not a
+                // loop-done continuation. Bump regardless of tier.
+                if (materialization == .ordinary_header) self.prime_side_chain_follows +|= 1;
                 var linked_completed: usize = 0;
-                const current_link = sct;
+                // The ping-pong *driver*: a `.link` trace anchored at the post-inner
+                // PC that advances the enclosing loop and links back to the inner
+                // root. Seeded with `sct` — which for a doc-15 continuation IS the
+                // driver, but for a doc-16 prime side-trace is only the *entry ramp*
+                // (anchored at the outer header, not the post-inner PC). After the
+                // first inner loop-done we swap to the real continuation (below), so
+                // the burst advances the outer loop natively instead of dropping to
+                // tier-0. Mutable for exactly that swap.
+                var current_link = sct;
                 // The design's `coherent_pc` cursor: where tier-0 resumes when the
                 // burst yields. Starts at the inner-root PC named by the `.link`.
                 var resume_pc: u32 = @intCast(current_link.instrs[current_link.instrs.len - 1].aux);
@@ -1230,7 +1325,17 @@ pub const TraceState = struct {
                     if (iresult.exit_instr == std.math.maxInt(u32)) break;
 
                     const inner_exit_pc = guardExitPc(inner.instrs[iresult.exit_instr]) orelse break;
-                    const loop_done = inner_exit_pc == current_link.anchor.pc;
+                    // The inner root reached its numeric loop-done ⟺ its exit PC
+                    // follows a `for_loop` (mode-invariant static bytecode; the same
+                    // discriminator `isSourceBranchGuardExit` uses inverted). This
+                    // must NOT be `inner_exit_pc == current_link.anchor.pc`: that
+                    // only holds when the driver is already the post-inner
+                    // continuation, and is false for a prime-side entry ramp anchored
+                    // at the outer header — which would misclassify a *completed*
+                    // inner loop as a mid-loop side-exit and resume tier-0 back at the
+                    // inner header, re-running the whole (idempotent) marking loop.
+                    const loop_done = inner_exit_pc >= 1 and
+                        proto.code[inner_exit_pc - 1].op == .for_loop;
                     if (!loop_done) {
                         if (iresult.completed > 0) {
                             self.onSideExit(inner, iresult.completed);
@@ -1246,6 +1351,28 @@ pub const TraceState = struct {
                     // tier-1a path still owes the final-iteration flush.
                     if (tier == .ir) {
                         if (!irinterp.flushNumericForLoopDone(inner, regs, ibuf, iresult.exit_instr)) break;
+                    }
+                    // Hole B (doc 16, Phase 3): hand the ping-pong to the continuation
+                    // anchored at the inner's post-loop PC. When the burst was seeded
+                    // by a prime-side entry ramp (anchored at the outer header), swap
+                    // the driver to that continuation so the *next* hop advances the
+                    // outer loop and re-enters the next iteration's inner loop
+                    // natively, rather than breaking to tier-0. When already on the
+                    // continuation (doc-15 steady state) this is a no-op. If no
+                    // continuation exists at the post-inner PC, resume tier-0 there —
+                    // NOT at the inner header — so the inner loop is not re-run.
+                    if (current_link.anchor.pc != inner_exit_pc) {
+                        const cont = self.findLinkTrace(proto, inner_exit_pc) orelse {
+                            self.onSideExit(inner, if (iresult.completed > 0) iresult.completed else 1);
+                            return .{ .completed = linked_completed + 1, .resume_pc = inner_exit_pc };
+                        };
+                        if (tier == .native_only) {
+                            snt = self.nativeFor(cont) orelse {
+                                self.onSideExit(inner, if (iresult.completed > 0) iresult.completed else 1);
+                                return .{ .completed = linked_completed + 1, .resume_pc = inner_exit_pc };
+                            };
+                        }
+                        current_link = cont;
                     }
                     resume_pc = current_link.anchor.pc;
 
@@ -1265,6 +1392,12 @@ pub const TraceState = struct {
                     }
                     if (cresult.exit_instr == current_link.instrs.len - 1) {
                         if (tier == .native_only) self.native_link_exits +|= 1;
+                        // `inner_pc` is the value read from *this* hop's entry link
+                        // (line ~1310), before any driver swap above. That is the
+                        // correct resume target: after a prime-side→continuation
+                        // swap the continuation's own `link->inner` names the same
+                        // inner-root PC, so this stays stable and the next hop
+                        // recomputes it from `current_link` regardless.
                         resume_pc = inner_pc;
                         continue;
                     }
@@ -1400,16 +1533,35 @@ pub const TraceState = struct {
         self.rec.reset(self.gpa, key, proto.num_registers) catch return;
         // Mark this recording a continuation so `recForPrepLink` may close it with a
         // `.link` at the inner `for_prep` (a root recording, armed via `arm`, leaves
-        // this false and instead LINNER-aborts there — LuaJIT's model).
-        self.rec.is_continuation = true;
+        // this `.root` and instead LINNER-aborts there — LuaJIT's model).
+        self.rec.kind = .continuation;
     }
 
-    /// Drop a pending non-header continuation arm. Used when VM execution leaves
-    /// the dispatch loop before the `.full` prologue can consume it (error,
-    /// suspension, or frame unwind), so the VM cannot stay pinned in `.full` mode
-    /// behind a stale post-loop pc.
+    /// Dispatch-prologue hook (doc 16, Phase 2): activate a pending *prime
+    /// side-trace* recording the instant tier-0 reaches its anchor pc. Unlike
+    /// `maybeStartContinuation`, the anchor is the failed trace's OWN coherent
+    /// anchor (the outer header): the registers are already coherent there from the
+    /// productive exit, so tier-0 re-enters at the anchor with no deopt-replay and the
+    /// recorder's first instruction is the outer body's taken (prime) branch. Records
+    /// forward through the inner `for_prep`; `recForPrepLink` closes it with a `.link`
+    /// to the inner root (permitted because `kind == .side`). A no-op (one optional
+    /// read) when nothing is pending. On allocator OOM the arm is dropped.
+    pub fn maybeStartReplaySide(self: *TraceState, proto: *const Proto, cur_pc: u32) void {
+        const key = self.pending_replay_anchor orelse return;
+        if (self.rec.active) return; // never clobber an in-flight recording
+        if (key.proto != proto or key.pc != cur_pc) return;
+        self.pending_replay_anchor = null;
+        self.rec.reset(self.gpa, key, proto.num_registers) catch return;
+        self.rec.kind = .side;
+    }
+
+    /// Drop pending `.full`-pinning arms (continuation *and* prime-side replay).
+    /// Used when VM execution leaves the dispatch loop before the `.full` prologue
+    /// can consume them (error, suspension, or frame unwind), so the VM cannot stay
+    /// pinned in `.full` mode behind a stale pending anchor.
     pub fn clearPendingExitAnchor(self: *TraceState) void {
         self.pending_exit_anchor = null;
+        self.pending_replay_anchor = null;
     }
 
     /// Count a guard failure at `exit_pc` within a trace anchored at `anchor`.
@@ -1449,6 +1601,81 @@ pub const TraceState = struct {
         if (gop.value_ptr.* >= self.config.hotguard and self.wants_side_trace == null) {
             self.wants_side_trace = anchor;
         }
+    }
+
+    /// **Coherent-state chaining (doc 16, Phase 2) discriminator.** True iff
+    /// `failed.instrs[exit_instr]` is a *source-level branch guard* exit — a
+    /// `guard_true`/`guard_false` whose exit PC is a real bytecode pc NOT immediately
+    /// preceded by a `for_loop`. The `for_loop` predecessor marks a numeric-`for`
+    /// *loop-done* guard (a continuation candidate, doc 15); everything else that is
+    /// a branch guard is a prime-side-trace candidate. Shared by the counter, the
+    /// arm gate, and the chain gate so all three agree on "what is a prime-side exit".
+    ///
+    /// Only numeric `for_loop` needs excluding: generic-for (`tfor_loop`) is
+    /// unrecordable (the recorder aborts on it), so a loop-done guard for a
+    /// generic-for never reaches a trace and can't reach this discriminator — there
+    /// is no false-negative where a real branch guard is mistaken for a loop-done one.
+    pub fn isSourceBranchGuardExit(self: *const TraceState, failed: *const Trace, exit_instr: u32, proto: *const Proto) bool {
+        _ = self;
+        if (exit_instr == std.math.maxInt(u32)) return false;
+        const ins = failed.instrs[exit_instr];
+        if (ins.op != .guard_true and ins.op != .guard_false) return false;
+        const exit_pc = guardExitPc(ins) orelse return false;
+        if (exit_pc == 0 or exit_pc == failed.anchor.pc) return false;
+        if (exit_pc <= proto.code.len and proto.code[exit_pc - 1].op == .for_loop) return false;
+        return true;
+    }
+
+    /// **Coherent-state chaining (doc 16, Phase 2).** Count a *productive*
+    /// (`completed > 0`, gated by the caller) source-level branch-guard exit for
+    /// prime-side-trace arming. A **source-level branch guard** is any
+    /// `guard_true`/`guard_false` whose exit PC is NOT immediately preceded by a
+    /// `for_loop` — that predecessor marks a numeric-`for` *loop-done* guard, which
+    /// is handled by continuations (doc 15), never a prime side-trace. When the
+    /// per-guard counter crosses `config.hotguard`, sets `wants_prime_side` so the
+    /// productive-exit site arms an immediate replay of the current (prime)
+    /// iteration. Symmetric with `countGuardFailure`, but on the *productive* path
+    /// and in its own `prime_exits` map (no cross-talk with the zero-exit side-trace
+    /// counters). Mode-invariant: keys only off the caller's `completed > 0` gate and
+    /// guard identity (`exit_instr` → `guardExitPc` → `proto.code[exit_pc-1]`), all
+    /// reported identically by tier-1a and native.
+    pub fn countProductiveBranchExit(self: *TraceState, failed: *const Trace, exit_instr: u32, proto: *const Proto) void {
+        if (!self.isSourceBranchGuardExit(failed, exit_instr, proto)) return;
+        // Same diminishing-returns cap as `countGuardFailure` — this also bounds
+        // prime side-traces to one per anchor: once the skip trace + prime side
+        // coexist (`countTracesAt == 2`), counting stops and never re-arms.
+        if (self.countTracesAt(failed.anchor) >= 2) return;
+
+        const exit_pc = guardExitPc(failed.instrs[exit_instr]).?; // checked by the discriminator
+        const key = GuardKey{ .anchor = failed.anchor, .exit_pc = exit_pc };
+        const gop = self.prime_exits.getOrPut(self.gpa, key) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* +|= 1;
+        if (gop.value_ptr.* >= self.config.hotguard and self.wants_prime_side == null) {
+            self.wants_prime_side = failed.anchor;
+        }
+    }
+
+    /// Remove all productive-branch counters for `anchor`. Called after a prime
+    /// side-trace is armed so the counter resets and doesn't re-trigger. Mirrors
+    /// `clearGuardFailures`.
+    pub fn clearPrimeExits(self: *TraceState, anchor: AnchorKey) void {
+        var to_remove: std.ArrayListUnmanaged(GuardKey) = .empty;
+        var iter = self.prime_exits.keyIterator();
+        while (iter.next()) |k| {
+            if (k.anchor.proto == anchor.proto and k.anchor.pc == anchor.pc) {
+                // OOM here is benign: a counter left behind just means the
+                // per-anchor productive count keeps its value, and the
+                // `countTracesAt(anchor) >= 2` cap in countProductiveBranchExit
+                // already prevents re-arming once the prime side-trace exists.
+                // Worst case is a stale map entry, never a correctness issue.
+                to_remove.append(self.gpa, k.*) catch continue;
+            }
+        }
+        for (to_remove.items) |k| {
+            _ = self.prime_exits.remove(k);
+        }
+        to_remove.deinit(self.gpa);
     }
 
     /// How many cached traces are at this anchor?
@@ -3004,10 +3231,11 @@ pub const TraceState = struct {
         // A `for_prep` inside an inlined callee shares `recForLoop`'s cross-frame
         // hazard (raw-pc anchor comparison across protos); keep the historical abort.
         if (self.rec.inline_depth > 0) return self.abort(.nyi_opcode);
-        // Only a *continuation* links (LuaJIT's model). A root recording that reaches
-        // an inner `for_prep` aborts LINNER — byte-identical to the pre-Phase-2
-        // behaviour — so it never anchors a link trace at a real back-edge target.
-        if (!self.rec.is_continuation) return self.abort(.nyi_opcode);
+        // Only a *side* or *continuation* links (LuaJIT's model). A `.root` recording
+        // that reaches an inner `for_prep` aborts LINNER — byte-identical to the
+        // pre-Phase-2 behaviour — so it never anchors a link trace at a real
+        // back-edge target.
+        if (self.rec.kind == .root) return self.abort(.nyi_opcode);
         const a = instr.a;
 
         // Locate the matching `for_loop` (the forward jump target) and verify the
@@ -3386,6 +3614,25 @@ const MAX_TRACE_INPUTS = 8;
 /// `instr.c` (where results land in the caller, and how many it wants).
 const InlineFrame = struct { base_off: u32, ret_dest: u16, ret_count: u16 };
 
+/// Disposition of an in-flight recording, deciding whether it may close with a
+/// `.link` terminator (doc 16). Only the *anchor* — where the recording started
+/// and what already lives there — differs between the three; the link-permission
+/// rule is "a `root` never links; a `side` or `continuation` may".
+///
+/// - `.root`      — the ordinary case. Armed by `arm` (hot-count or
+///                  `wants_side_trace`) at an anchor that has no trace yet (or is
+///                  a fresh root). A root that reaches an inner `for_prep` aborts
+///                  LINNER (LuaJIT's model) so it never anchors a link trace on a
+///                  real back-edge target.
+/// - `.side`      — an outer-header prime side-trace (doc 16, Phase 2), armed by
+///                  `maybeStartReplaySide` at the failed trace's own coherent
+///                  anchor to record the *current* (e.g. prime) iteration's path.
+///                  May close with a `.link` into an existing inner root.
+/// - `.continuation` — a nested-loop continuation (doc 15), armed by
+///                  `maybeStartContinuation` at a non-header exit pc after an
+///                  inner loop's loop-done exit. May close with a `.link`.
+pub const TraceKind = enum { root, side, continuation };
+
 pub const Recorder = struct {
     active: bool = false,
     anchor: AnchorKey = .{ .proto = undefined, .pc = 0 },
@@ -3430,9 +3677,11 @@ pub const Recorder = struct {
     /// lets the inner spawn the side trace, so the root never links). Crucially this
     /// keeps link anchors off real back-edge targets — a root at the outer header
     /// would anchor a link trace at the outer body start (a genuine loop header the
-    /// dispatch loop *enters*), which Phase 2 cannot execute. Set true by
-    /// `maybeStartContinuation`; cleared to `false` by `reset` (every `arm`).
-    is_continuation: bool = false,
+    /// dispatch loop *enters*), which Phase 2 cannot execute. Set by
+    /// `maybeStartContinuation` (`.continuation`) or `maybeStartReplaySide`
+    /// (`.side`); reset to `.root` by `reset` (every `arm`). `recForPrepLink`
+    /// permits a `.link` close for `.side`/`.continuation` but never `.root`.
+    kind: TraceKind = .root,
     /// Bytecode PC of the instruction currently being recorded. Set by
     /// `recordInstr` before `recordOne`; `emit` stores it in the `aux`
     /// field of guard instructions so the executor can report *which*
@@ -3546,7 +3795,7 @@ pub const Recorder = struct {
         self.abort_reason = null;
         self.locals_watermark = std.math.maxInt(u32);
         self.link_target = null;
-        self.is_continuation = false;
+        self.kind = .root;
         self.pending_store_count = 0;
         self.anchor_num_registers = num_registers;
         self.base_off = 0;
@@ -4419,18 +4668,19 @@ test "per-guard PC recording: guard_true aux carries the branch PC" {
     try testing.expectEqual(@as(i32, 7), ops[1].aux); // PC stored in aux
 }
 
-test "tryChainExit: chains to a trace at the guard's exit PC" {
+test "driveChain ordinary_header: chains to a same-anchor sibling" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
 
-    // Trace A at PC 10: a guard that will "fail" (we fake the failure by
-    // calling tryChainExit directly).  Its guard_int has aux=20 to point
-    // at Trace B's anchor.
+    // Trace A at PC 10: the trace whose guard "fails" (faked by calling
+    // driveChain directly). After an *ordinary* guard exit the registers are
+    // coherent at A's anchor (pc 10), so the driver chains to a same-anchor
+    // sibling there — NOT to the guard's exit PC.
     var entry_a = [_]u16{0};
     const instrs_a = [_]IrInstr{
         .{ .op = .slot_load, .aux = 0 }, // %0: r0
-        .{ .op = .guard_int, .a = 0, .aux = 20 }, // %1: guard r0, aux=exit PC 20
+        .{ .op = .guard_int, .a = 0, .aux = 20 }, // %1: guard r0 (aux is exit PC, ignored for ordinary chaining)
         .{ .op = .loop }, // %2
     };
     const consts_a = [_]Value{};
@@ -4443,24 +4693,25 @@ test "tryChainExit: chains to a trace at the guard's exit PC" {
         .entry_guards = &.{},
     };
 
-    // Trace B at PC 20: a simple counting loop (r0 from 0 to 3).
+    // Trace B: a sibling at the SAME anchor (pc 10) — a simple counting loop
+    // (r0 from 0 to 3). Reached only because A is in `initially_excluded`.
     var entry_b = [_]u16{ 0, 1 };
     const instrs_b = [_]IrInstr{
         .{ .op = .slot_load, .aux = 0 }, // %0: r0 (counter)
         .{ .op = .slot_load, .aux = 1 }, // %1: r1 (limit)
-        .{ .op = .guard_int, .a = 0, .aux = 20 }, // %2
-        .{ .op = .guard_int, .a = 1, .aux = 20 }, // %3
+        .{ .op = .guard_int, .a = 0, .aux = 10 }, // %2
+        .{ .op = .guard_int, .a = 1, .aux = 10 }, // %3
         .{ .op = .konst, .aux = 0 }, // %4: 1
         .{ .op = .add, .a = 0, .b = 4 }, // %5: r0 + 1
         .{ .op = .lt, .a = 5, .b = 1 }, // %6: (r0+1) < limit
-        .{ .op = .guard_true, .a = 6, .aux = 20 }, // %7
+        .{ .op = .guard_true, .a = 6, .aux = 10 }, // %7
         .{ .op = .phi, .a = 0, .b = 5, .aux = 0, .ty = .int }, // %8: r0 ← r0+1
         .{ .op = .loop }, // %9
     };
     const consts_b = [_]Value{Value.int(1)};
     var trace_b = try gpa.create(Trace);
     trace_b.* = .{
-        .anchor = .{ .proto = undefined, .pc = 20 },
+        .anchor = .{ .proto = undefined, .pc = 10 }, // same anchor as A
         .instrs = @constCast(&instrs_b),
         .consts = @constCast(&consts_b),
         .entry_slots = &entry_b,
@@ -4480,9 +4731,10 @@ test "tryChainExit: chains to a trace at the guard's exit PC" {
     // iteration 3 computes 3<4 which is true, runs, then 4<4 fails).
     var regs = [_]Value{ Value.int(0), Value.int(4) };
 
-    // Fake a guard failure in Trace A at instr index 1 (the guard_int).
+    // Fake a guard failure in Trace A at instr index 1 (the guard_int), and
+    // exclude A (the dispatcher's `visited` set) so the driver walks to B.
     var tr_regs = TestRegs{ .regs = &regs };
-    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{});
+    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a});
     tr_regs.commit(); // the chained side trace mutated the window — reflect it back
     try testing.expect(chained != null);
     try testing.expectEqual(@as(usize, 3), chained.?.completed); // Trace B ran 3 iters
@@ -4498,21 +4750,20 @@ test "tryChainExit: chains to a trace at the guard's exit PC" {
     gpa.destroy(trace_b);
 }
 
-test "tryChainExit: an array-guard exit does NOT chain on its lane ordinal" {
-    // Regression: `guard_lane`/`guard_fits` store a lane ordinal in `aux`, not a
-    // bytecode PC. A first-iteration array-guard exit must resolve to "no chain"
-    // via `guardExitPc` — never be interpreted as a PC. Here the failing guard is
-    // a `guard_lane` whose `aux` (lane ordinal 2) collides with a real decoy trace
-    // anchored at pc 2; without the op gate, tryChainExit would execute the decoy
-    // against incoherent registers and silently miscompute.
+test "driveChain ordinary_header: chains at the anchor, not a guard's lane ordinal" {
+    // Regression: ordinary-exit chaining walks the failed trace's ANCHOR (where the
+    // registers are coherent), never a guard's `aux`. `guard_lane`/`guard_fits`
+    // store a lane ordinal in `aux`, not a bytecode PC — a decoy trace anchored at
+    // that ordinal (pc 2) must never be entered. Here A's guard_lane has aux=2; the
+    // driver walks A's anchor (pc 10) instead, so the decoy at pc 2 is unreachable.
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
 
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
 
-    // Trace A: the failing trace. Its instr index 1 is a guard_lane with aux=2
-    // (a lane ordinal that happens to equal the decoy's anchor pc).
+    // Trace A: the failing trace at pc 10. Its instr index 1 is a guard_lane with
+    // aux=2 (a lane ordinal that happens to equal the decoy's anchor pc).
     var entry_a = [_]u16{0};
     const instrs_a = [_]IrInstr{
         .{ .op = .slot_load, .aux = 0 }, // %0: r0 (the table)
@@ -4556,9 +4807,10 @@ test "tryChainExit: an array-guard exit does NOT chain on its lane ordinal" {
     try state.cache.append(gpa, trace_b);
 
     var regs = [_]Value{ Value.int(0), Value.int(4) };
-    // The guard_lane is at instr index 1. It must NOT chain to the decoy at pc 2.
+    // Exclude A (the dispatcher's `visited` set). The driver walks A's anchor
+    // (pc 10), finds no other sibling there, and must NOT reach the decoy at pc 2.
     var tr_regs = TestRegs{ .regs = &regs };
-    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{});
+    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a});
     tr_regs.commit(); // commit so a (buggy) decoy mutation would surface — keeps the test's teeth
     try testing.expect(chained == null);
     try testing.expectEqual(@as(i64, 0), regs[0].asInt()); // r0 untouched — no decoy ran

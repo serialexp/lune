@@ -1,8 +1,8 @@
 # Coherent-State Native Exit Chaining — Design
 
-Status: partial — Phase 0 (design) + Phase 1 (unified driver) landed; Phases 2–3 outstanding
+Status: complete — Phases 0–3 landed. Mechanism is general infrastructure; near-inert on nsieve specifically (coverage-bound, see Phase 2/3 Done notes), kept on for the transition shape it *does* cover and for future workloads.
 Owner: Bart
-Last updated: 2026-07-10 (Phase 1 landed)
+Last updated: 2026-07-11 (Phases 2–3 landed)
 
 The tracing JIT compiles every hot loop in nsieve to native code, yet ~93% of
 cycles still run on the tier-0 interpreter and lune sits ~2× off LuaJIT (N=9:
@@ -44,21 +44,61 @@ land; move whole sections to Done once everything inside is checked.
 - [x] **Open question — chain tier under `--jit-native`.** Resolved: `driveChain`'s
   `native_only` tier resolves `snt = nativeFor(sct) orelse return {0, walk_pc}` — it
   never silently drops to tier-1a on the chain path, matching the native-unsupported gate.
+- [x] **Phase 2 — Outer-header prime side-trace (closes Hole A).** On a
+  *productive* branch-guard exit (`isSourceBranchGuardExit` discriminator — a
+  `guard_true`/`guard_false` whose exit PC is not preceded by `for_loop`), a
+  per-`(anchor, exit_pc)` counter in the sibling `prime_exits` map arms
+  `wants_prime_side` at `config.hotguard`. The productive-exit site then forces
+  `.full` via `pending_replay_anchor` and re-enters tier-0 at the coherent anchor;
+  the `.full` prologue hook `maybeStartReplaySide` records the taken-branch body as
+  a `.side` trace (`TraceKind` refactor: `root`/`side`/`continuation`, root never
+  links) linking into the inner root. `driveChain`'s `.ordinary_header`
+  materialization walks `failed.anchor.pc` (the coherent anchor) rather than the
+  guard exit PC, so the chain enters that new prime side-trace. Counters
+  `prime_side_arms` + `prime_side_chain_follows` prove arm + fire; a differential
+  nsieve test pins byte-identical output tier-0 vs `--jit-native` with both
+  counters > 0. Mode-invariant: keys only off `result.completed` and static
+  bytecode PCs.
+- [x] **Phase 3 — Composite-path sibling continuation / driver swap (closes Hole
+  B).** The linked burst's `current_link` is a mutable ping-pong driver. On the
+  inner loop-done exit (`proto.code[inner_exit_pc-1].op == .for_loop` discriminator),
+  when the driver is still the prime-side *entry ramp* (anchored at the outer
+  header, `anchor.pc != inner_exit_pc`), `findLinkTrace(proto, inner_exit_pc)` swaps
+  it to the post-inner continuation and — under `native_only` — resolves that
+  continuation's native page, so the burst stays native across the prime cluster
+  instead of dropping to tier-0. If no continuation exists there, resume tier-0 at
+  the post-inner PC (never the inner header — the idempotent marking loop must not
+  re-run).
+- [x] **Re-profiled.** nsieve reality recorded below; the mechanism is
+  **coverage-bound near-inert** on nsieve and carries a small reproducible
+  wall-clock regression — kept on as general infrastructure, not as an nsieve win.
 
-### Outstanding
+### nsieve outcome (why "complete" ≠ "nsieve got faster")
 
-- [ ] **Phase 2 — Outer-header prime side-trace (closes Hole A).** On a
-  *productive* branch-guard exit, arm a side-trace at the failed trace's own
-  anchor (the outer header) that records the taken-branch body forward and links
-  into the inner loop. This is the target the driver chains to for nsieve's
-  skip→prime transition. Bigger expected win.
-- [ ] **Phase 3 — Composite-path sibling continuation (closes Hole B).** Record a
-  skip-path sibling continuation at the post-inner anchor so the linked burst
-  chains through composites instead of `break`ing to tier-0 on the first
-  `guard_true(p[i])` miss.
-- [ ] **Re-profile after each phase.** nsieve `.off`/`--trace`/`--jit-native` vs
-  LuaJIT; assert a *new tier-0-outer-body counter* trends to ~0 after warm-up (the
-  existing back-edge counter is the wrong signal — see Test plan).
+The doc's founding premise — *"the traces are not the problem, the transitions
+are"* — does **not** hold for nsieve, and the profiling in this session
+established why:
+
+- **The skip trace reaches a prime only ~55 times per N=7 run** (measured:
+  `prime_side_chain_follows` + native link-follows in the low tens). The
+  skip→prime transition the whole design targets fires a few dozen times, not
+  millions — there is almost nothing to accelerate.
+- **~96% of nsieve is the untraceable INIT loop** `for i=2,m do p[i]=true end`,
+  which array-grows every iteration, aborts recording, and runs fully
+  interpreted with *no trace at all* (CLAUDE.md's documented lever #1). Chaining
+  cannot touch code that never records.
+- **The prime marking loop is idempotent**, so even when a misclassification
+  re-ran it (the Phase 2 regression), output stayed byte-identical — masking the
+  bug until profiled. Phase 3's driver swap fixed the redundant re-execution.
+- **Net wall-clock: a reproducible ~10% regression** (N=9 interleaved A/B: chain
+  on ~0.25s vs off ~0.23s), from the per-productive-exit counting + arming
+  bookkeeping on a path whose payoff never materializes at nsieve's coverage.
+
+Kept **on** because the mechanism is correct, general, and determinism-preserving
+(the founding premise holds for *other* transition-dense workloads); nsieve is
+simply the wrong benchmark to prove it, and its remaining LuaJIT gap is JIT
+*coverage* of the init loop, not transition cost. See the CLAUDE.md nsieve
+verdict, which this session's profiling independently reproduced.
 
 ## Why this exists
 
@@ -486,6 +526,22 @@ as `15` §P1 (arming is driven by deterministic guard-failure / exit counters,
 unaffected by gc_stress or trace mode). The immediate-`.full`-arm signals added in
 Phases 2 and 3 must themselves be counter-driven and mode-invariant, not keyed off
 anything native-only.
+
+**Status after Phases 2–3 (2026-07-11):** all five hold and are pinned green.
+C1 — the differential nsieve test asserts byte-identical stdout tier-0 vs
+`--jit-native` (`.off ≡ .record_execute_native`), and the full 10-mode matrix
+stays green. C2 — `driveChain`'s `.ordinary_header` walks `failed.anchor.pc`, never
+the guard exit PC, so a sibling at a non-coherent PC is not entered; the burst's
+loop-done discriminator (`for_loop` predecessor) further prevents entering the
+inner header on a completed loop. C3 — the burst is still bounded by
+`visited.len` (8) hops; the prime-side→continuation swap replaces the driver
+in place, it does not add hops. C4 — the `native_only` swap resolves the
+continuation's native page (`nativeFor(cont)`) or yields to tier-0, and the
+`.ir`/`native_only` paths share the same `completed`/`onSideExit` roll-up. C5 —
+arming keys only off `result.completed` and static bytecode PCs
+(`isSourceBranchGuardExit`, the `prime_exits` counter vs `config.hotguard`); the
+`TraceKind` link-permission test pins root-never-links, and the matrix would trip
+on any native-only signal leaking into the arm decision.
 
 ## Failure modes to watch
 

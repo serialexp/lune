@@ -1636,7 +1636,8 @@ pub const Vm = struct {
     /// pc — after which `.fast` resumes.
     inline fn runFastPath(self: *const Vm) bool {
         return !(self.suspend_ctl != null or self.record_safepoint_lines or
-            self.trace.isRecording() or self.trace.pending_exit_anchor != null);
+            self.trace.isRecording() or self.trace.pending_exit_anchor != null or
+            self.trace.pending_replay_anchor != null);
     }
 
     /// Per-instruction prologue + fetch for the threaded dispatch loop, factored
@@ -1710,6 +1711,15 @@ pub const Vm = struct {
         // trace's anchor is). A cheap optional-null read when nothing is pending.
         if (mode == .full and self.trace.pending_exit_anchor != null) {
             self.trace.maybeStartContinuation(proto, @intCast(cur));
+        }
+
+        // Coherent-state chaining (doc 16, Phase 2): a prime side-trace armed on a
+        // productive branch-guard exit begins at the failed trace's own coherent
+        // anchor (the outer header), which tier-0 reaches here with registers already
+        // coherent — no deopt-replay needed. Same `.full`-only, before-the-mirror
+        // placement so the anchor instruction is the recording's first op.
+        if (mode == .full and self.trace.pending_replay_anchor != null) {
+            self.trace.maybeStartReplaySide(proto, @intCast(cur));
         }
 
         // Recording mirror — `.full` only. Mirrors this instruction (and its
@@ -2604,6 +2614,16 @@ pub const Vm = struct {
                                     // Output-neutral (the recording aborts at the
                                     // inner `for_prep` until Phase 2).
                                     self.trace.maybeArmContinuation(ct, result.exit_instr, proto);
+                                    // Coherent-state chaining (doc 16, Phase 2): a
+                                    // *productive* source-level branch-guard exit (e.g.
+                                    // nsieve's `guard_false(p[i])` firing when a
+                                    // composite-skipping outer trace finally hits a
+                                    // prime) counts toward arming a prime side-trace at
+                                    // this outer header. The function filters out
+                                    // numeric-for loop-done guards (handled above by
+                                    // `maybeArmContinuation`). Inert until the
+                                    // productive chain call consumes `wants_prime_side`.
+                                    self.trace.countProductiveBranchExit(ct, result.exit_instr, proto);
                                     // Retire any dead-marked traces before leaving the
                                     // walk so a stale narrow-lane trace doesn't linger
                                     // in a slot just because a later trace succeeded.
@@ -2625,6 +2645,37 @@ pub const Vm = struct {
                                         }
                                         continue :outer; // already `.full`
                                     }
+                                    // Coherent-state chaining (doc 16, Phase 2): the
+                                    // productive branch-guard exit just crossed the arm
+                                    // threshold (`wants_prime_side` set for THIS anchor).
+                                    // Record the current prime iteration as a `.side`
+                                    // trace anchored at this outer header — regs are
+                                    // already coherent here, so tier-0 re-enters at the
+                                    // anchor with no deopt-replay and records
+                                    // `guard_true(p[i]) → inner for_prep → link`. Force
+                                    // `.full` so the replay-side prologue hook fires; do
+                                    // NOT advance pc (regs coherent at `ct.anchor`).
+                                    // Self-limiting: `clearPrimeExits` resets the counter
+                                    // and `countTracesAt >= 2` stops re-arming once the
+                                    // prime side-trace exists.
+                                    if (self.trace.wants_prime_side) |want| {
+                                        if (want.proto == ct.anchor.proto and want.pc == ct.anchor.pc and
+                                            !self.trace.isRecording() and
+                                            self.trace.pending_replay_anchor == null and
+                                            !self.trace.isGated(ct.anchor))
+                                        {
+                                            self.trace.pending_replay_anchor = ct.anchor;
+                                            self.trace.wants_prime_side = null;
+                                            self.trace.clearPrimeExits(ct.anchor);
+                                            self.trace.prime_side_arms +|= 1;
+                                            for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                            if (mode == .fast) {
+                                                frame.pc = pc;
+                                                return .switch_mode; // → .full
+                                            }
+                                            continue :outer; // already `.full`
+                                        }
+                                    }
                                     // Nested-loop linking (Phase 3): once the
                                     // continuation trace exists, a productive
                                     // inner loop-done exit can chain to it. The
@@ -2643,6 +2694,52 @@ pub const Vm = struct {
                                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                             for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                             continue :outer;
+                                        }
+                                    }
+                                    // Coherent-state chaining (doc 16, Phase 2): a
+                                    // productive *source-level branch-guard* exit
+                                    // (nsieve's `guard_false(p[i])` firing on a prime
+                                    // after committing composite iterations) leaves regs
+                                    // coherent at the outer header — the same loop-header
+                                    // re-entry deopt discipline as the zero-exit path
+                                    // below. Chain to a same-anchor sibling the cold walk
+                                    // didn't run — the prime side-trace armed by 2D — so
+                                    // the prime iteration + following composites run in
+                                    // the linked burst instead of dropping to tier-0.
+                                    // Seed `initially_excluded` with the walk's `visited`
+                                    // set (don't re-run the skip trace or a sibling
+                                    // already tried this back-edge). Native tier when the
+                                    // failed trace ran native (chain native→native),
+                                    // tier-1a otherwise. Null (no prime side-trace yet, or
+                                    // its inner guards failed) falls through to the T3
+                                    // handoff → tier-0 at the header, unchanged: the skip
+                                    // trace already committed its composites, so `i` has
+                                    // advanced and tier-0 runs the prime iteration and
+                                    // makes progress (no spin).
+                                    //
+                                    // `regs` (the live tier-0 register file) is
+                                    // passed, not a trace-local `trace_regs`,
+                                    // and that is intentional: driveChain only
+                                    // ever enters zero-input traces (findLinkTrace
+                                    // requires `t.inputs.len == 0`; loop/link
+                                    // roots read state from the coherent register
+                                    // file at their anchor). There is no input
+                                    // remapping to thread, so the live regs are
+                                    // exactly the coherent state each entered
+                                    // trace expects.
+                                    if (self.trace.isSourceBranchGuardExit(ct, result.exit_instr, proto)) {
+                                        if (ran_native) {
+                                            if (self.trace.driveChain(ct, result, proto, regs, .native_only, .ordinary_header, visited[0..nvisited])) |chain| {
+                                                if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                                                for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                                continue :outer;
+                                            }
+                                        } else {
+                                            if (self.trace.driveChain(ct, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited])) |chain| {
+                                                if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                                                for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                                continue :outer;
+                                            }
                                         }
                                     }
                                     // T3 drop-to-fast on the productive-trace path.
@@ -2677,12 +2774,15 @@ pub const Vm = struct {
                                     ndead += 1;
                                 }
 
-                                // --- exit-PC chaining (step 3) ---
-                                // If the failing guard was recorded at a different
-                                // PC, look for a side trace there.  This fires
-                                // only after step 4 (side traces) populates the
-                                // cache at non-anchor PCs.
-                                if (self.trace.driveChain(ct, result, proto, regs, .ir, .ordinary_header, &.{})) |chain| {
+                                // --- coherent-anchor chaining (doc 16) ---
+                                // After this zero-exit the registers are coherent at
+                                // `ct.anchor`, so chain to a same-anchor sibling the
+                                // cold walk hasn't run (e.g. an outer-header prime
+                                // side-trace). Seed `initially_excluded` with the
+                                // walk's `visited` set so we neither re-run the trace
+                                // that just failed nor re-penalize a sibling already
+                                // tried this back-edge.
+                                if (self.trace.driveChain(ct, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited])) |chain| {
                                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                     for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                     continue :outer;
@@ -2711,6 +2811,19 @@ pub const Vm = struct {
                         // gate's backoff + `onSideExit` clear.
                         if (saw_native_unsupported) {
                             self.trace.gateNativeUnsupported(.{ .proto = proto, .pc = anchor_pc });
+                        }
+                        // Coherent-state chaining (doc 16, Phase 2) diagnostic: tier-0
+                        // is about to run this *traced* anchor's body because no trace
+                        // or chain took over this back-edge — the design's REQUIRED
+                        // tier-0-outer-body signal. (The back-edge counter is the wrong
+                        // one: `onBackEdge` returns before incrementing once any trace
+                        // exists here, so it flattens even under full tier-0 fallback.)
+                        // Guarded on a trace existing so untraced hot loops don't
+                        // inflate it; a productive trace/chain entry `continue :outer`s
+                        // above and never reaches here. Under Phase 2 the prime path
+                        // chains instead of dropping here, so this trends to ~0.
+                        if (self.trace.hasTrace(.{ .proto = proto, .pc = anchor_pc })) {
+                            self.trace.tier0_outer_body_entries +|= 1;
                         }
                         // Fall through to tier-0.
                     } else if (eligible and !trip_ok) {
@@ -9592,6 +9705,128 @@ test "nested-loop: native linked array stores commit exactly once (Phase 4)" {
     try testing.expectEqualStrings(tier0.buffered(), native.buffered());
     try testing.expect(native_vm.trace.native_link_exits > 0);
     try testing.expect(native_vm.trace.native_link_follow_count > 0);
+}
+
+test "coherent-state chaining (doc 16, Phase 2): nsieve prime path chains, not tier-0" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // Faithful nsieve shape: an outer loop whose body branches on a boolean
+    // array (`if p[i]`) and, on the taken (prime) branch, runs a nested marking
+    // loop. Pre-Phase-2 the *skip* trace (composite path) runs native but every
+    // prime iteration drops to tier-0 with no trace at the coherent anchor. Phase
+    // 2 records a prime side-trace at the outer header and chains
+    // skip → prime-side → inner → continuation, all native.
+    const source =
+        \\local function nsieve(m)
+        \\  local p = {}
+        \\  for i=2,m do p[i] = true end
+        \\  local count = 0
+        \\  for i=2,m do
+        \\    if p[i] then
+        \\      for k=i+i,m,i do p[k] = false end
+        \\      count = count + 1
+        \\    end
+        \\  end
+        \\  return count
+        \\end
+        \\print(nsieve(100000))
+    ;
+    // 9592 = π(100000), the number of primes ≤ 100000. A single call at this m
+    // is what lets the *skip* trace productively exit on primes often enough to
+    // cross the (default) `hotguard` arm threshold — the 3-call benchmark warms
+    // it during its first (much larger) call. Runs in ~0.04s Debug, so it stays
+    // fast even under the leak-checking test allocator.
+    const expected = "9592\n";
+
+    var tier0_buf: [64]u8 = undefined;
+    var tier0 = io.Writer.fixed(&tier0_buf);
+    try runCaptured(testing.allocator, source, &tier0, false, .off);
+    try testing.expectEqualStrings(expected, tier0.buffered());
+
+    // Inline native harness with the *default* thresholds (mirrors the CLI's
+    // `--trace --jit-native`, not `runNativeForTrace`'s lowered `hotloop=4` —
+    // the low hot-count records the outer header on an early prime iteration and
+    // never lands on the composite-skip shape the mechanism keys off).
+    const gpa = testing.allocator;
+    var native_vm = try Vm.init(gpa);
+    defer native_vm.deinit();
+    var native_buf: [64]u8 = undefined;
+    var native = io.Writer.fixed(&native_buf);
+    {
+        const parser = @import("parser.zig");
+        const diag = @import("diag.zig");
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        native_vm.trace.config.enabled = true;
+        native_vm.trace.config.execute = true;
+        native_vm.trace.config.optimize = true;
+        native_vm.trace.config.native_codegen = true;
+        native_vm.out = &native;
+        var chunk = try compiler.compile(gpa, &native_vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try native_vm.run(chunk.proto);
+    }
+
+    // Correctness: native output byte-identical to tier-0 — the primary gate.
+    try testing.expectEqualStrings(tier0.buffered(), native.buffered());
+
+    // Phase-2-specific signals — output equality alone can't prove the chain
+    // fired (full tier-0 fallback also produces the right answer):
+    //  1. a prime side-trace was actually armed (2C/2D), and
+    //  2. its coherent-anchor link-burst was actually *entered* (2E) — the
+    //     `.ordinary_header`-only follow counter isolates it from loop-done
+    //     continuation bursts.
+    try testing.expect(native_vm.trace.prime_side_arms > 0);
+    try testing.expect(native_vm.trace.prime_side_chain_follows > 0);
+
+    // The design's tier-0-outer-body signal: without chaining, every prime
+    // iteration drops to tier-0 at the outer header (≈9592 of them). With the
+    // prime chain the prime path stays native, so the chain fires far more often
+    // than tier-0 runs the outer body. Self-relative so it's robust to warm-up
+    // length and threshold changes.
+    try testing.expect(native_vm.trace.prime_side_chain_follows > native_vm.trace.tier0_outer_body_entries);
+}
+
+test "coherent-state chaining (doc 16, Phase 2): TraceKind link-permission (root loops, continuation links)" {
+    // The 2A `TraceKind` gate in `recForPrepLink` (trace.zig): a `.root` recording
+    // that reaches an inner `for_prep` aborts LINNER and never anchors a `.link`,
+    // while a `.side`/`.continuation` recording links to the inner root. Asserted
+    // here at the trace-shape level: a 2-level nest produces at least one `.loop`
+    // root (the inner loop header) AND at least one `.link` continuation. If the
+    // gate wrongly let roots link (or wrongly blocked continuations), one of these
+    // populations would vanish. (The `.side` half of the permission is exercised
+    // end-to-end by the nsieve prime-chain test above; root-never-links is also
+    // pinned by the 10-mode determinism matrix, which any output drift would trip.)
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runExecForTrace(&vm, gpa,
+        \\local s = 0
+        \\for i = 1, 40 do
+        \\  for j = 1, 30 do s = s + i * j end
+        \\  s = s + i
+        \\end
+        \\print(s)
+    , &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("382120\n", sink.buffered());
+
+    var loop_traces: usize = 0;
+    var link_traces: usize = 0;
+    for (vm.trace.cache.items) |t| {
+        if (t.instrs.len == 0) continue;
+        switch (t.instrs[t.instrs.len - 1].op) {
+            .loop => loop_traces += 1,
+            .link => link_traces += 1,
+            else => {},
+        }
+    }
+    try testing.expect(loop_traces > 0);
+    try testing.expect(link_traces > 0);
 }
 
 test "executor: a hot numeric-for sum runs via the IR-interpreter (back-edges collapse)" {
