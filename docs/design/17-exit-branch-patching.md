@@ -2,7 +2,7 @@
 
 Status: partial — Increment 1 landed (shared mcode arena, P-D; co-location only, behaviour byte-identical). Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Mechanism mapped on both sides; peer review (gpt-5.6-sol, 2026-07-11) found the first-draft "swing one rel32" Phase 2 unsound. A second LuaJIT-source pass produced the grounded port architecture below (§Port architecture): keep lune's `regs[]` memory handoff, pin only 2–3 base pointers to reserved registers, run frameless bodies under one shared trampoline. Next: Increment 2 (shared trampoline + frameless bodies, P-A/P-B/P-C/P-G/P-F).
 Owner: Bart
-Last updated: 2026-07-11 (Increment 1 — McodeArena — landed)
+Last updated: 2026-07-11 (Increment 2 concrete design written + peer-reviewed by gpt-5.6-sol; 3 showstoppers + must-fixes folded in; blocked on the P-F determinism-contract decision before coding)
 
 Coherent-state chaining (doc 16) proved *correct* but *performance-neutral* on
 nsieve: the JIT compiles every hot loop to native code, chaining hands control
@@ -427,6 +427,236 @@ prologue-failure fallback (P-G), and replicate/prove-inert the skipped accountin
 (P-F). Gate: 10-mode matrix byte-identical; keyframe + replay goldens unchanged;
 **component-timed** nsieve A/B (dispatch vs. handoff vs. prologue vs. residual
 hops).
+
+#### Increment 2 — detailed design (frameless + link-slot handoff)
+
+This is the concrete plan the phasing bullet above summarises. It is grounded in
+the *current* native ABI (mapped exhaustively from `nativegen.zig`, 2026-07-11):
+
+Current per-trace ABI (what we are replacing):
+- Entry `fn(rdi=tags, rsi=payloads, rdx=*NativeResult) callconv(.c) void`.
+- Prologue: `push rbx; push <callee-saved used>; xor rbx,rbx; sub rsp,frame`.
+  `rbx` = committed-iteration counter; `rdi/rsi/rdx` held across the body;
+  `rax/rcx` scratch; allocatable GPRs `r8–r11` (caller-saved) + `rbp,r12–r15`
+  (callee-saved, saved only if used); allocatable XMMs `xmm2–xmm15`; spills at
+  `[rsp+k*8]` in the trace's own frame.
+- Every exit `flushSlot`s live carried/write-only slots back to `regs[]`
+  (tags[slot]=tag byte via rdi, payloads[slot*8]=payload via rsi), writes
+  `completed`(rbx) + `exit_instr`(i) to `[rdx]`, then `emitTeardown` (restore rsp,
+  pop callee-saved, pop rbx, `ret`). `.loop` back-edge is a local `jmp loop_top`.
+- Only runtime call is `resolveHashCell`, absolute `mov rax,imm64; call rax`, with
+  manual save/restore of rdi/rsi/rdx + caller-saved around it. **No cross-buffer
+  rel32 exists.**
+
+**Load-bearing correctness fact (the whole design rests on this):** the *only*
+state that crosses a trace→trace transition is `regs[]` (tags/payloads, in
+memory), `rbx` (the counter), and `rsp` (constant in a frameless chain). Register
+homes are **not** live across a transition — every exit already flushes live slots
+to `regs[]`, and every trace's hoisted prologue reloads its homes from `regs[]`.
+So a child can reuse the parent's spill area and registers freely; the handoff is
+pure memory. (This is the memory-handoff model; register-level coherence that skips
+the flush+reload is the deferred "Later" step, measured first.)
+
+**1. Trampoline owns the one C frame (P-A).** Replace the per-trace C prologue/
+epilogue with a single shared trampoline, emitted once into the arena (or kept as a
+Zig `naked`/asm stub):
+```
+trampoline(tags=rdi, payloads=rsi, result=rdx, entry=rcx):
+    push rbx; push rbp; push r12; push r13; push r14; push r15   ; save ALL callee-saved once
+    sub rsp, SPILL_MAX*8 (+align)                                  ; one generous shared spill area
+    xor rbx, rbx                                                  ; chain-cumulative counter
+    jmp rcx                                                       ; enter the first trace body
+shared_exit:                                                       ; every final exit lands here
+    ; result.completed / exit_instr / final_trace_id already written by the exiting body
+    add rsp, SPILL_MAX*8 (+align); pop r15..r12; pop rbp; pop rbx; ret
+```
+`SPILL_MAX` is the max spill-slot count any compiled trace can use (a fixed bound;
+today's allocator caps spills — pin a comptime `SPILL_MAX` and **bail compile** if a
+trace exceeds it, exactly as we bail other unsupported shapes). The trampoline is
+the C-callable entry; `CompiledTrace.run` calls `trampoline(tags,payloads,&result,
+body_entry)`.
+
+**2. Frameless bodies.** Each trace body drops its own `push`/`sub rsp`/`pop`/`ret`.
+It uses `rbx` (counter), `r8–r15/rbp` (homes), `xmm2–15`, `rax/rcx` scratch, spills
+at `[rsp+k*8]` in the *shared* frame. Homes are clobbered freely (trampoline saved
+them). `.loop` is unchanged (local `jmp loop_top`). The hoisted prologue (type
+checks + slot loads from `regs[]`) stays — it is exactly the child-entry reload.
+
+**3. Link-slot indirect handoff (P-A/P-C) — no code patching in Increment 2.** Give
+each compiled trace a small **link-slot table**: one writable 8-byte pointer per
+*chainable exit* (each ordinary guard exit, the `.link` terminal, each linked-loop-
+done exit — the P-C taxonomy). Each slot defaults to `&shared_exit`. An exit site
+emits, after its `flushSlot`s + `result` writes:
+```
+    jmp qword [rip + link_slot_for_this_exit]     ; default target = shared_exit
+```
+So with all slots at their default, behaviour is byte-identical to today (flush →
+write result → leave to the dispatcher via shared_exit → `ret`). When the
+dispatcher's existing `driveChain` logic selects a native child `C` for parent `P`'s
+exit `E`, instead of returning to re-enter `C` by C-ABI call, it **stores `C`'s
+body-entry address into `P.link_slots[E]`** (a plain data write — no `mprotect`, W^X
+untouched, since the slot is data, not code). The next time `P` fails guard `E` it
+`jmp`s straight into `C`'s frameless body under the same frame. This is the native→
+native handoff that removes the ~600 ns Zig round-trip, achieved without touching
+the code pages. (Increment 3 upgrades the hottest of these from `jmp [slot]` to a
+patched direct `rel32`, shaving the indirect-load; the slot table also *is* the
+unpatch/lifetime handle for P-E.)
+
+**4. Chain-wide result contract (P-B).** `NativeResult` describes one trace; a
+chain needs the *final* trace's identity. Extend to:
+```
+ChainResult { completed: usize,        // cumulative rbx across the whole chain
+              exit_instr: u32,          // exit index within the FINAL trace
+              final_trace_id: u32,      // which trace performed the final exit
+              linked_loop_done: u64 }
+```
+`rbx` already accumulates naturally (never reset on a link jmp). Each body's exit
+sites write `exit_instr` **and** a compile-time-constant `final_trace_id` (the
+trace's cache id, baked as an imm32) before `jmp [slot]`. The dispatcher then maps
+`(final_trace_id, exit_instr) → resume PC` instead of assuming the entered trace.
+This removes the `interp.zig:2584,2595` mis-attribution hazard.
+
+**5. Per-exit-kind rules (P-C).** Three exit kinds, each already distinct in
+`nativegen.zig`, get a link slot and the uniform `jmp [slot]` tail:
+- ordinary guard exit (shared `deopt_exit` today, `:4051`) — one slot per guard `i`;
+- `.link` terminal (`:3989`) — one slot (its natural successor is the linked trace);
+- linked-loop-done (`emitLinkedLoopDoneSnapshot`, `:3115`; exit path `:4038`) — one
+  slot per loop-done guard; the post-guard snapshot stores stay *before* the tail.
+Prologue-fail (`:4065`) is **not** chainable (no child makes sense pre-first-
+iteration): it writes completed=0, exit_instr=-1, and `jmp shared_exit` directly.
+
+**6. Child eligibility + prologue-failure fallback (P-G).** A slot is only populated
+for a child that is native (`.compiled`), has zero synthetic inputs
+(`inputs.len==0`; `seedTraceInputs` handoff is not expressible through a bare jmp —
+those children stay dispatcher-driven), and whose terminal shape is chainable. When
+a populated child's own hoisted prologue guard fails (its entry types don't match
+the handoff `regs[]`), that is just a normal guard exit *inside the child*: it
+flushes, writes the child's `(final_trace_id, exit_instr)`, and `jmp`s the child's
+own slot (default `shared_exit`) — the cumulative `rbx` is intact, so the dispatcher
+resumes correctly at the child's guard PC. No parent-count loss, no sibling retry
+needed (the dispatcher re-evaluates from the coherent resume PC as it does today).
+
+**7. Determinism (P-F).** The in-mcode handoff *skips* the per-hop dispatcher
+accounting that today runs between native traces: `onSideExit`, `hit_count`,
+penalty/gate bumps, prime-side arming, lane-widen eviction (`interp.zig:2588,2605,
+2763`). These steer *future* recording, so byte-identity is not automatic. Increment
+2 keeps them correct by **only populating a link slot after the dispatcher has
+already driven that transition enough times to have done its accounting** — i.e. the
+slot is armed *by* `driveChain` at the same point it already commits to the chain, so
+every accounting side effect that would happen up to arming still happens on the
+dispatcher path; once armed, the transition is deterministic control flow between
+semantically-equivalent traces whose committed values all round-trip through `regs[]`.
+The obligation to discharge in code: prove (via the 10-mode matrix + keyframe/replay
+goldens) that no *armed* slot changes which traces get recorded later. If any does,
+the fallback is to replicate that specific counter on the trampoline's `shared_exit`
+path (it has `final_trace_id` to attribute correctly). Link slots are reset to
+`&shared_exit` on any event that would invalidate the child (retire, flush) — which
+is also the P-E lifetime hook.
+
+**Sub-stepping (each behind `just test`, byte-identical gate):**
+- 2.1 Trampoline + frameless bodies, **all slots pinned to `shared_exit`** (pure
+  ABI move; no linking; behaviour byte-identical — this de-risks the frame change
+  in isolation).
+- 2.2 `ChainResult` (P-B) + dispatcher `(final_trace_id,exit_instr)→PC` mapping,
+  still no linking. Byte-identical.
+- 2.3 Link-slot population from `driveChain` for `.link` first (simplest kind),
+  then guard + loop-done (P-C/P-G). nsieve A/B + matrix.
+- 2.4 P-F verification pass; replicate any counter proven live.
+
+##### Peer-review corrections (gpt-5.6-sol, 2026-07-11) — fold in BEFORE coding
+
+The review confirmed the pure-memory handoff premise (point A) is sound —
+ordinary deopt flushes carried slots (`nativegen.zig:4051`), write-only slots
+commit at each back-edge (`:3940`), invariant slots stay in `regs[]`, `.link`
+snapshots every slot (`:3989`), and child entry reconstructs *all* homes incl.
+hoisted array base pointers (`:3306`) and preheader/phi init (`:4008`). No
+child-visible value survives only in a parent register/spill. **But three
+showstoppers + several load-bearing fixes must land first:**
+
+- **SHOWSTOPPER 1 — loop-done dual materialization.** A loop-done guard has two
+  incompatible state contracts: ordinary deopt (do *not* commit the final
+  iteration; resume at the header) vs. linked completion (commit post-guard stores
+  + phi snapshot, enter continuation). Today the guard picks via
+  `NativeResult.linked_loop_done` (`:4024,:4030,:4042`). Point 5's "snapshot stays
+  before the tail" is WRONG: with the slot defaulting to `shared_exit`, the default
+  path would commit the final iteration and return as an ordinary deopt → tier-0
+  replays it → duplicated stores / mis-advanced for-state. **Fix:** the indirection
+  must select *before* materialization — default slot → ordinary-deopt stub (no
+  final-iteration snapshot); armed slot → an exit-specific linked-materialization
+  stub that snapshots *then* jumps to the child. A slot pointing straight at the
+  child cannot choose between the two contracts.
+- **SHOWSTOPPER 2 — dangling code links (P-E is NOT deferrable to Increment 3).**
+  `removeTrace`→`destroy` frees the child's arena slot to the reuse free-list
+  (`trace.zig:1757,1761`→`622`→`nativegen.zig:294`); a later compile overwrites it
+  (`:254`). A parent slot still pointing there is a code-use-after-free, and
+  **widen-eviction makes this reachable in normal operation** (`interp.zig:2767`),
+  not just shutdown. **Fix (required as soon as slots exist):** inbound-link
+  ownership — backlinks reset before destroy, or link refcount blocking removal, or
+  generation-checked indirection through a stable link object. "Dead code happens to
+  stay readable" is insufficient under arena reuse.
+- **SHOWSTOPPER 3 — child prologue-fail vs. cumulative counter.** Point 6 (cumulative
+  `rbx` intact) contradicts point 5 (prologue-fail writes `completed=0`, `:4065`).
+  After a productive parent→child jump where the child's entry guard fails, writing
+  zero loses committed progress, triggers the zero-yield penalty path, and can spur
+  bogus sibling retries. **Fix:** child prologue-fail must write cumulative progress
+  + `final_trace_id=child` + a *distinct* reason (`prologue_fail`), never an
+  overloaded `exit_instr=-1`. The dispatcher must treat "final child committed zero
+  *locally*" and "chain committed nonzero *globally*" as two separate facts.
+- **MUST-FIX — `completed` is not raw cumulative `rbx`.** Nested chaining rolls up as
+  `linked_completed += 1` per inner run (one inner run = one enclosing iteration),
+  NOT the sum of raw inner iterations (`trace.zig:1387,1391`). `completed` drives
+  useful/low-yield classification, `hit_count`, penalty/gate (`:1132,1140,1145`),
+  zero-guard counting (`interp.zig:2588`), and arming (`:2605`). So `ChainResult`
+  needs *separate* fields: final-trace **local** commits, enclosing-chain progress,
+  and the final exit reason/identity — cumulative `rbx` is at most diagnostic. (No
+  dispatcher PC-advance is proportional to `completed`; resume PC is separate.)
+- **MUST-FIX — all exit consumers need the FINAL trace, not just PC lookup.** The
+  dispatcher indexes `ct.instrs[result.exit_instr]` in guard-failure lookup
+  (`interp.zig:2595`), `maybeArmContinuation` (`:2616`), productive-branch counting
+  (`:2626`), source-branch discrimination (`:2730`), and `onSideExit(ct,…)` (`:2607`).
+  Feeding the entered *parent* with the child's exit index is OOB / misclassifies.
+  Every one must switch to the final trace + its local count.
+- **MUST-FIX — stable trace identity.** The only id today is the cache index from a
+  `cache.items` scan (`trace.zig:1113`), and `removeTrace` uses `swapRemove`
+  (`:1761`) so indices are reassigned. A baked-imm32 `final_trace_id` goes stale
+  after any eviction. Add a never-reassigned runtime id to `Trace` + a lookup table,
+  valid ≥ as long as any mcode link can reference it.
+- **MUST-FIX — stack alignment.** At C entry `rsp%16==8`; 6 pushes keep `%16==8`;
+  the callout helper assumes body `rsp%16==8` and subtracts 8 before `call`
+  (`nativegen.zig:2981`). The shared frame reservation must be rounded to a multiple
+  of 16 (not merely `SPILL_MAX*8`) and must include the callout-save region in the
+  max (`:2273,2305`), else an odd `SPILL_MAX` breaks the SysV call alignment.
+- **MUST-FIX — slot reachability + W^X.** `jmp qword [rip+disp32]` only reaches
+  ±2 GiB; a heap side-table has no such guarantee, and slots embedded in an RX arena
+  region can't take "plain data writes" without a RW toggle (`:215`). **Fix:** put
+  slots in a separate *nearby RW page*, or load the slot address as a full imm64 and
+  `jmp qword [rax]` (absolute — no rel32 constraint; `rax` is scratch post-flush).
+  The target pointer itself may be anywhere (loaded as imm64); only code→slot
+  addressing is constrained.
+- **MUST-FIX — safepoint/observation blackout.** `driveChain` caps a burst at 8 hops
+  (`trace.zig:1315`); an mcode continuation↔inner-root cycle removes that bound and
+  can run an entire enclosing loop without returning, expanding the safepoint/GC/
+  suspend/replay-line blackout (`interp.zig:1643,1668`) from one loop to an arbitrary
+  nested computation. **Fix:** when `suspend_ctl`, replay-line recording, exec-log,
+  or any observation hook is active, leave slots unarmed / reset to the dispatcher
+  (no mcode poll in Increment 2).
+- **Terminology:** `body_entry` = the child's guards/reloads/preheader, **not**
+  `loop_top`.
+- **Nits:** aligned 8-byte slot writes need no icache flush (single-thread, data);
+  the trampoline need not save XMMs (caller-saved); `rdi/rsi/rdx` stay live through
+  bodies because the callout restores them; CET/IBT would need landing pads at body
+  entries only if ever built with enforcement (not a current constraint).
+
+**Open decision this surfaces (P-F contract — for Bart):** native link-slots make
+the *recording set* diverge between native and tier-1a modes (tier-1a has no mcode
+to arm), and `hit_count`/penalty/gate bypass means native and tier-1a acquire
+different tiering state. This does **not** change stdout if every trace is
+semantically correct (the existing C5 contract already permits different trace sets
+per mode), but it does make trace *dumps*/serialization observably mode-dependent.
+Two contracts: **(a)** relax determinism to semantic output + replay equivalence and
+declare tiering metadata mode-local; or **(b)** replicate deterministic per-hop
+accounting on the `shared_exit` path (using `final_trace_id` to attribute). This is
+an architectural call, not mine to make.
 
 ### Increment 3 — Exit-branch patching + lifetime (P-E)
 
