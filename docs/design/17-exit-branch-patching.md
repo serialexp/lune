@@ -1,8 +1,8 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
-Status: draft — NOT implementation-ready. Mechanism mapped on both sides; peer review (gpt-5.6-sol, 2026-07-11) found the first-draft "swing one rel32" Phase 2 unsound. The real port needs a native chain-entry ABI + a shared code arena + a chain-wide result contract before any patch is safe. The headline "Phase 2 flips nsieve" hypothesis is **unsupported** as first drafted (most nsieve hops stay unpatched). See §Blocking prerequisites.
+Status: draft — direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Mechanism mapped on both sides; peer review (gpt-5.6-sol, 2026-07-11) found the first-draft "swing one rel32" Phase 2 unsound. A second LuaJIT-source pass produced the grounded port architecture below (§Port architecture): keep lune's `regs[]` memory handoff, pin only 2–3 base pointers to reserved registers, run frameless bodies under one shared trampoline. First landable increment: the shared mcode arena (co-location only, byte-identical behavior). Not yet implemented.
 Owner: Bart
-Last updated: 2026-07-11 (peer review folded in)
+Last updated: 2026-07-11 (port architecture grounded against LuaJIT lj_mcode.c + vm_x86.dasc)
 
 Coherent-state chaining (doc 16) proved *correct* but *performance-neutral* on
 nsieve: the JIT compiles every hot loop to native code, chaining hands control
@@ -330,40 +330,101 @@ gone, and the `driveChain` that would have tried another sibling was bypassed. T
 link contract must define this fallback (e.g. child-prologue-fail returns to a
 dispatcher entry that re-derives coherent tier-0 state at the anchor).
 
-## Phasing (unblocked only after the prerequisites)
+## Port architecture (LuaJIT-grounded)
 
-### Phase 1 — Patch infrastructure (no behavior change)
+A second read of LuaJIT's `lj_mcode.c` (arena) and `vm_x86.dasc` /
+`lj_target_x86.h` (frameless ABI) settled *how* to adapt, and the central finding
+is that **lune does not need LuaJIT's full fixed-register convention.** LuaJIT
+keeps `BASE`/`PC`/`DISPATCH`/`KBASE` in fixed registers (`lj_target_x86.h:46-53`)
+so a trace→trace `jmp` needs zero marshalling. lune already round-trips every
+Lua-level value through the `regs[]` SoA memory file, so it only needs the two
+sides to agree on **where the base pointers live** — a 2–3 register mini-convention
+— not on where any Lua value lives. That keeps the handoff a pure function of
+`regs[]` memory (determinism-safe: nothing new is smuggled into a register that
+isn't already a deterministic function of the slab) while still enabling a bare
+`jmp`.
 
-- **`exit_instr → offset` map on `CompiledTrace`.** During `lower`, record the
-  byte offset of each patchable jump's `rel32` operand (the assembler knows the
-  emit position); store it on `CompiledTrace`. Only new persisted state; changes no
-  emitted byte. This much is safe to build independently of the ABI decision and is
-  a reasonable first concrete step *if* Bart wants motion before P-A is settled.
-- **`ExecPage.repatch(offset, bytes)`** — `mprotect(RW)` → overwrite →
-  `mprotect(RX)`; assert the write stays within the page. Note the page is briefly
-  non-executable during `mprotect`, so this composes with the safe-point decision,
-  not with dword-atomicity.
-- Gate: `just test`, 10-mode matrix byte-identical (nothing calls `repatch` yet).
+**The arena (P-D), from `lj_mcode.c`.** One (or few) large `mmap`'d region(s)
+instead of a per-trace `mmap`, placed inside a rel32 window so any trace can
+`jmp`/`call` any other and the runtime. Port verbatim-in-spirit:
+`mcode_setrange`/`mcode_inrange` (`lj_mcode.c:269,288`) — a `[mcmin,mcmax]` window
+of width ≤ rel32 range, **centered on the code traces must reach** (LuaJIT centers
+on `lj_vm_exit_handler`; lune centers on the Zig `driveChain`/trampoline address so
+trace↔runtime calls stay reachable); the contiguous-below-then-probe placement
+loop (`mcode_alloc`, `:295-320`); the `LJ_TRERR_MCODEAL` **abort-the-trace**
+fallback when no in-range placement is found (`:333`) — out-of-range is never
+tolerated. Sub-allocate each trace from a `mctop`/`mcbot` cursor pair; the
+`ExecPage` becomes a *slice* of the shared region, not an owned mapping. Area-level
+W^X with the `mcprot` RW/RX cache (`:252`) and an `lj_mcode_patch`-style RW/RX
+bracket (`:416`) for the patch window.
 
-### Phase 2 — Memory-handoff link (needs P-A, P-B, P-C, P-D, P-E, P-G)
+**The frameless model (P-A), from `vm_x86.dasc`.** LuaJIT traces have no C frame:
+`BC_JLOOP` publishes `BASE`, saves the extra callee-saves *once* at the
+interpreter↔trace boundary, and `jmp`s into `T->mcode` (`vm_x86.dasc:5429-5461`);
+trace→trace links are bare `jmp`s (`asm_tail_fixup`, `lj_asm_x86.h:2961-2963`, taken
+**unconditionally** when there's a link target because the arena guarantees reach);
+the *only* frame restore is the exit handler (`vm_x86.dasc:2867`), owned by the
+interpreter, entered once and left once regardless of how many traces chained.
+lune's analogue:
 
-- Implement the chain-entry ABI (P-A) and result contract (P-B), then link each
-  transition kind (P-C) native→native through `regs[]`, honoring eligibility and
-  fallback (P-G), reachability (P-D), and lifetime (P-E). Replicate or prove-inert
-  the skipped accounting (P-F).
-- Gate: 10-mode matrix byte-identical; keyframe + replay goldens unchanged;
-  **component-timed** nsieve A/B (dispatch vs. handoff vs. prologue vs. residual
-  unpatched hops), per doc 16 methodology.
+- **One shared trampoline owns the single C frame.** It does the real prologue
+  (`push rbx` + callee-saves + frame + pins `tags`/`payloads`/`result` into the
+  reserved registers, mirroring `nativegen.zig:2997-3000`), then `jmp`s to the
+  first trace body's entry label.
+- **Trace bodies become frameless** — drop their per-trace `push/sub`
+  (`nativegen.zig:2997-3000`) and `pop/ret` (`:2699-2702`). A body ends by either
+  (i) `jmp`ing directly to the next body's label (the chain link — the bare `jmp`
+  that replaces the ~600 ns Zig round-trip), or (ii) `jmp`ing to **one shared
+  epilogue** that fills `NativeResult`, runs `pop`/`ret` once, and returns to Zig.
+- **Exactly one frame is built/torn down per chain entry from Zig**, not per trace.
+  `driveChain` calls the trampoline once and gets one chain-wide `NativeResult`
+  (P-B) back after the chain reaches a genuine exit.
 
-### Phase 3 — Register-level coherence (defer; measure Phase 2 first)
+This is where the nsieve win actually lands: the per-transition re-entry collapses
+to a single `jmp rel32` per link.
 
-- Only if Phase 2's component timings show the flush→memory→reload round-trip still
-  dominates. Sub-options: a canonical anchor→register assignment so siblings agree
-  by construction (child skips flush *and* reload), or a ported `asm_head_side`
-  reconciling head. Note (peer review): canonical register assignment alone does
-  not discharge the child's *structural/identity* entry guards — those are separate
-  from value placement and must still be reconciled (inherited-vs-new guard
-  semantics).
+## Phasing (three ordered increments)
+
+### Increment 1 — Shared arena, keep the per-trace C ABI (P-D)
+
+Pure co-location: replace `mapExecutable`'s per-trace `mmap` (`nativegen.zig:104`)
+with an arena (`mcode_allocarea`/`mcode_alloc` analogue), sub-allocated by a
+cursor pair, placed in a rel32 window centered on the runtime. **Keep the per-trace
+`call`/`ret` C ABI unchanged** — traces are still C functions, just co-located.
+Buys nothing for speed on its own; it is the *precondition* for every later bare
+`jmp`, and is independently testable (same behavior, one big mapping instead of N).
+Includes the area-level W^X toggle + `lj_mcode_patch`-style RW/RX bracket, and the
+`exit_instr → mcode-offset` map + `repatch` originally scoped as "Phase 1"
+(cheap, ABI-agnostic, lands here). Gate: `just test`, 10-mode matrix
+byte-identical, nothing patched yet.
+
+### Increment 2 — Shared trampoline + frameless bodies (P-A, P-B, P-C, P-G, P-F)
+
+Introduce the single entry trampoline, strip per-trace prologue/epilogue, pin the
+2–3 base pointers, and convert chain links from Zig round-trips into bare `jmp`s
+between body labels — for each exit kind (ordinary guard / `.link` /
+linked-loop-done, P-C). Add the chain-wide result (P-B), child eligibility +
+prologue-failure fallback (P-G), and replicate/prove-inert the skipped accounting
+(P-F). Gate: 10-mode matrix byte-identical; keyframe + replay goldens unchanged;
+**component-timed** nsieve A/B (dispatch vs. handoff vs. prologue vs. residual
+hops).
+
+### Increment 3 — Exit-branch patching + lifetime (P-E)
+
+With co-location (rel32 always reaches) and frameless bodies (a mid-chain `jmp` is
+legal), port `lj_asm_patchexit` (`lj_asm_x86.h:3127`): rewrite a guard's
+`jcc`/tail-`jmp` rel32 in place to jump straight into a child body. Add unpatch-on-
+retire (P-E, mirroring LuaJIT's RW window + the deliberate GC-exit skip at
+`lj_asm_x86.h:3153`). Gate as Increment 2, plus the safe-point argument (P-EBP-4).
+
+### Later — Register-level coherence (defer; measure first)
+
+Only if Increment 2/3 component timings show the flush→memory→reload round-trip
+still dominates: a canonical anchor→register assignment (siblings agree by
+construction, child skips flush *and* reload) or a ported `asm_head_side`. Note
+(peer review): canonical register assignment alone does not discharge the child's
+*structural/identity* entry guards — those are separate from value placement and
+must still be reconciled.
 
 ## Determinism obligations
 
