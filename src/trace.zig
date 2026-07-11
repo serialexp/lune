@@ -828,6 +828,11 @@ inline fn hotIndex(proto: *const Proto, pc: u32) usize {
 pub const TraceState = struct {
     gpa: std.mem.Allocator,
     config: TraceConfig = .{},
+    /// Shared machine-code arena — all tier-1b native traces are co-located slices of
+    /// this (P-D of the exit-branch-patching port, doc 17). Replaces the old one-
+    /// `mmap`-per-trace model so a future increment can link trace→trace with a bare
+    /// `rel32` jump. Lifetime ≥ every trace (deinited *after* the cache is freed).
+    mcode_arena: nativegen.McodeArena,
     /// Back-edge counters keyed by loop-header anchor. Only touched on the *slow*
     /// path (when the hot-count pre-filter trips), so for a non-gated anchor it
     /// still counts every back-edge (the pre-filter leaves un-gated slots at 0),
@@ -975,7 +980,7 @@ pub const TraceState = struct {
     abort_log: std.ArrayListUnmanaged(AbortRecord) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) TraceState {
-        return .{ .gpa = gpa };
+        return .{ .gpa = gpa, .mcode_arena = nativegen.McodeArena.init(gpa) };
     }
 
     pub fn deinit(self: *TraceState) void {
@@ -989,8 +994,11 @@ pub const TraceState = struct {
         self.exec_logs.deinit(self.gpa);
         self.abort_log.deinit(self.gpa);
         if (self.exec_recorder) |*r| r.deinit();
+        // Free each trace (its `native.deinit()` returns mcode slots to the arena's
+        // free-list) *before* tearing down the arena those slots live in.
         for (self.cache.items) |t| t.destroy(self.gpa);
         self.cache.deinit(self.gpa);
+        self.mcode_arena.deinit();
         self.rec.deinit(self.gpa);
     }
 
@@ -1797,7 +1805,7 @@ pub const TraceState = struct {
             .compiled => return &t.native.compiled,
             .unsupported => return null,
             .unattempted => {
-                if (nativegen.compile(self.gpa, t)) |ct| {
+                if (nativegen.compileInto(self.gpa, &self.mcode_arena, t)) |ct| {
                     t.native = .{ .compiled = ct };
                     return &t.native.compiled;
                 }

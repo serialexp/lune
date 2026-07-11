@@ -79,28 +79,57 @@ pub const MapError = error{
     MprotectFailed,
 };
 
-/// An `mmap`'d, executable page holding emitted machine code. `entry()` reinterprets
-/// its base as a function pointer; `deinit()` returns the page to the kernel.
+/// A callable view of emitted machine code. `entry()` reinterprets its base as a
+/// function pointer; `deinit()` releases the backing memory.
+///
+/// Two ownership disciplines share this handle:
+///   - `.owned` — a standalone `mmap` mapped by `mapExecutable` (the two exec-memory
+///     unit tests + the `compile(gpa, t)` test entry point). `deinit` munmaps it.
+///   - `.arena` — a *slice* of an `McodeArena` region (the production path via
+///     `nativeFor`→`compileInto`). The bytes are not individually mapped; `deinit`
+///     returns the slot to the arena's free-list (LuaJIT-style co-located mcode).
 pub const ExecPage = struct {
-    /// The whole mapped region (page-rounded). Owned; freed by `deinit`.
-    mem: []align(page_align) u8,
-    /// Bytes of actual code at the start of `mem`.
-    len: usize,
+    /// The emitted code bytes. For `.arena` pages this is a subslice of a region
+    /// (base is 16-byte-aligned by construction, not page-aligned). Execution and
+    /// `--dump-native` read this; nothing at runtime needs a page-rounded length.
+    code: []u8,
+    owner: Owner,
 
-    /// Reinterpret the page base as a C-ABI function pointer of type `Fn`.
+    const ArenaSlot = struct {
+        arena: *McodeArena,
+        region: u32,
+        offset: usize,
+        /// The slot's *capacity* (16-aligned `code.len` at alloc time), returned to
+        /// the free-list on `deinit` so a reused slot never shrinks.
+        cap: usize,
+    };
+
+    const Owner = union(enum) {
+        /// The whole page-rounded mapping this handle owns; `deinit` munmaps it.
+        owned: []align(page_align) u8,
+        /// A slot inside a shared arena region; `deinit` frees it to the free-list.
+        arena: ArenaSlot,
+    };
+
+    /// Reinterpret the code base as a C-ABI function pointer of type `Fn`.
     /// Caller guarantees the emitted code matches `Fn`'s signature.
     pub fn entry(self: ExecPage, comptime Fn: type) *const Fn {
-        return @ptrCast(self.mem.ptr);
+        return @ptrCast(self.code.ptr);
     }
 
     pub fn deinit(self: *ExecPage) void {
-        if (comptime is_x64_linux) std.posix.munmap(self.mem);
+        switch (self.owner) {
+            .owned => |mem| if (comptime is_x64_linux) std.posix.munmap(mem),
+            .arena => |slot| slot.arena.free(slot.region, slot.offset, slot.cap),
+        }
         self.* = undefined;
     }
 };
 
-/// Copy `code` into a fresh page and make it executable (W^X: mapped RW, written,
-/// then flipped to R+X). Returns a callable `ExecPage`. `code` must be non-empty.
+/// Copy `code` into a fresh standalone page and make it executable (W^X: mapped RW,
+/// written, then flipped to R+X). Returns an owning `ExecPage`. `code` must be
+/// non-empty. Used by the exec-memory unit tests and the `compile(gpa, t)` test
+/// entry point; the production path co-locates code in an `McodeArena` instead.
 pub fn mapExecutable(code: []const u8) MapError!ExecPage {
     if (comptime !is_x64_linux) return error.UnsupportedTarget;
     std.debug.assert(code.len > 0);
@@ -130,8 +159,144 @@ pub fn mapExecutable(code: []const u8) MapError!ExecPage {
         else => return error.MprotectFailed,
     }
 
-    return .{ .mem = mem, .len = code.len };
+    return .{ .code = mem[0..code.len], .owner = .{ .owned = mem } };
 }
+
+/// A shared, contiguous machine-code arena — the lune analogue of LuaJIT's
+/// `lj_mcode.c` mcode areas. Instead of one `mmap` per compiled trace, every trace's
+/// code lives as a slice of a small chain of large regions. This is prerequisite P-D
+/// of the exit-branch-patching port (doc 17): co-locating all mcode is what will let
+/// a later increment link trace→trace with a bare `rel32` jump (guard-patch), which a
+/// per-trace `mmap` can never guarantee is within ±2 GiB. Increment 1 only co-locates
+/// — no cross-region references are emitted yet, so the ±2 GiB reachability check is
+/// deliberately deferred (all runtime-helper calls are absolute `mov rax,imm64;call`).
+///
+/// Reclamation: per-trace `free` returns the slot to a first-fit free-list (a retired
+/// trace's mcode is reused by a later compile of the same-or-smaller size). This keeps
+/// today's immediate-reclaim behaviour rather than LuaJIT's never-free-until-flush
+/// model; if it measures worse than a pure bump allocator we revisit (per Bart).
+pub const McodeArena = struct {
+    /// Default region size. Big enough that a whole benchmark's traces fit in one or
+    /// two regions (traces are hundreds of bytes); small enough to not waste address
+    /// space. A single trace larger than this gets its own exact-fit region.
+    pub const REGION_SIZE: usize = 1 << 20; // 1 MiB
+    /// Entry alignment — keeps every trace entry 16-byte-aligned (a codegen nicety;
+    /// x86-64 has no hard code-alignment requirement) and makes the free-list's
+    /// capacity bookkeeping tidy.
+    const ENTRY_ALIGN: usize = 16;
+
+    const Region = struct {
+        /// The whole page-rounded mapping. Toggled RW↔RX around each write (mcprot).
+        mem: []align(page_align) u8,
+        /// Bump cursor: bytes handed out from the front (16-aligned).
+        used: usize,
+    };
+
+    /// A returned slot available for reuse. `cap` is the slot's 16-aligned capacity.
+    const FreeBlock = struct { region: u32, offset: usize, cap: usize };
+
+    gpa: std.mem.Allocator,
+    regions: std.ArrayListUnmanaged(Region) = .empty,
+    free_list: std.ArrayListUnmanaged(FreeBlock) = .empty,
+
+    pub fn init(gpa: std.mem.Allocator) McodeArena {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(self: *McodeArena) void {
+        if (comptime is_x64_linux) {
+            for (self.regions.items) |r| std.posix.munmap(r.mem);
+        }
+        self.regions.deinit(self.gpa);
+        self.free_list.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    /// Flip a region between writable (RW) and executable (RX). Single-threaded VM:
+    /// no native code executes during a compile, so temporarily making a whole region
+    /// writable (including already-compiled sibling traces) is safe — it is flipped
+    /// back to RX before the compile returns.
+    fn protectRegion(mem: []align(page_align) u8, exec: bool) MapError!void {
+        const prot: std.posix.PROT = if (exec)
+            .{ .READ = true, .EXEC = true }
+        else
+            .{ .READ = true, .WRITE = true };
+        switch (std.posix.errno(std.posix.system.mprotect(mem.ptr, mem.len, prot))) {
+            .SUCCESS => {},
+            else => return error.MprotectFailed,
+        }
+    }
+
+    fn mapRegion(self: *McodeArena, min_bytes: usize) (MapError || std.mem.Allocator.Error)!*Region {
+        const page = std.heap.pageSize();
+        const len = std.mem.alignForward(usize, @max(min_bytes, REGION_SIZE), page);
+        const mem = std.posix.mmap(
+            null,
+            len,
+            .{ .READ = true, .EXEC = true },
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1,
+            0,
+        ) catch return error.MmapFailed;
+        errdefer std.posix.munmap(mem);
+        try self.regions.append(self.gpa, .{ .mem = mem, .used = 0 });
+        return &self.regions.items[self.regions.items.len - 1];
+    }
+
+    /// Copy `code` into the arena and return a callable `ExecPage` viewing it.
+    /// Reuses a free-list slot when one is large enough (first fit); otherwise bump-
+    /// allocates from a region with room, mapping a new region when none fits.
+    pub fn alloc(self: *McodeArena, code: []const u8) (MapError || std.mem.Allocator.Error)!ExecPage {
+        if (comptime !is_x64_linux) return error.UnsupportedTarget;
+        std.debug.assert(code.len > 0);
+        const cap = std.mem.alignForward(usize, code.len, ENTRY_ALIGN);
+
+        // 1. First-fit reuse of a retired slot.
+        for (self.free_list.items, 0..) |fb, i| {
+            if (fb.cap >= cap) {
+                const region_mem = self.regions.items[fb.region].mem;
+                try protectRegion(region_mem, false);
+                @memcpy(region_mem[fb.offset..][0..code.len], code);
+                try protectRegion(region_mem, true);
+                _ = self.free_list.swapRemove(i);
+                return .{
+                    .code = region_mem[fb.offset..][0..code.len],
+                    // Keep the original slot capacity so a re-free never shrinks it.
+                    .owner = .{ .arena = .{ .arena = self, .region = fb.region, .offset = fb.offset, .cap = fb.cap } },
+                };
+            }
+        }
+
+        // 2. Bump-allocate from a region with room (else map a fresh one).
+        var region_idx: u32 = std.math.maxInt(u32);
+        for (self.regions.items, 0..) |r, i| {
+            if (r.mem.len - r.used >= cap) {
+                region_idx = @intCast(i);
+                break;
+            }
+        }
+        if (region_idx == std.math.maxInt(u32)) {
+            _ = try self.mapRegion(cap);
+            region_idx = @intCast(self.regions.items.len - 1);
+        }
+        const region = &self.regions.items[region_idx];
+        const off = region.used;
+        try protectRegion(region.mem, false);
+        @memcpy(region.mem[off..][0..code.len], code);
+        try protectRegion(region.mem, true);
+        region.used += cap;
+        return .{
+            .code = region.mem[off..][0..code.len],
+            .owner = .{ .arena = .{ .arena = self, .region = region_idx, .offset = off, .cap = cap } },
+        };
+    }
+
+    /// Return a slot to the free-list. Best-effort: on OOM the slot is simply leaked
+    /// back into the region (dead space until arena deinit) — never fatal.
+    pub fn free(self: *McodeArena, region: u32, offset: usize, cap: usize) void {
+        self.free_list.append(self.gpa, .{ .region = region, .offset = offset, .cap = cap }) catch {};
+    }
+};
 
 // ---------------------------------------------------------------------------
 // The integer-trace compiler
@@ -412,6 +577,19 @@ pub const NativeState = union(enum) {
 /// back to the tier-1a IR-interpreter. Success transfers ownership of an executable
 /// page to the returned `CompiledTrace` (free it with `deinit`).
 pub fn compile(gpa: std.mem.Allocator, t: *const Trace) ?CompiledTrace {
+    return compileImpl(gpa, t, null);
+}
+
+/// Production entry point: compile `t` and co-locate its code in the shared `arena`
+/// (P-D). Same bail semantics as `compile`; the only difference is where the mcode
+/// lives (an arena slot vs a standalone `mmap`).
+pub fn compileInto(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace) ?CompiledTrace {
+    return compileImpl(gpa, t, arena);
+}
+
+/// Shared compile body. `arena == null` maps a standalone owned page (test path);
+/// non-null co-locates the code as an arena slot (production path).
+fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?CompiledTrace {
     if (comptime !is_x64_linux) return null;
 
     const n = t.instrs.len;
@@ -440,7 +618,10 @@ pub fn compile(gpa: std.mem.Allocator, t: *const Trace) ?CompiledTrace {
     lower(gpa, t, kinds, &alloc, &asm_buf) catch return null;
     asm_buf.resolve();
 
-    const page = mapExecutable(asm_buf.code.items) catch return null;
+    const page = if (arena) |a|
+        a.alloc(asm_buf.code.items) catch return null
+    else
+        mapExecutable(asm_buf.code.items) catch return null;
     return .{ .page = page };
 }
 

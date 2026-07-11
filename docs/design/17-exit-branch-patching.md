@@ -1,8 +1,8 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
-Status: draft — direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Mechanism mapped on both sides; peer review (gpt-5.6-sol, 2026-07-11) found the first-draft "swing one rel32" Phase 2 unsound. A second LuaJIT-source pass produced the grounded port architecture below (§Port architecture): keep lune's `regs[]` memory handoff, pin only 2–3 base pointers to reserved registers, run frameless bodies under one shared trampoline. First landable increment: the shared mcode arena (co-location only, byte-identical behavior). Not yet implemented.
+Status: partial — Increment 1 landed (shared mcode arena, P-D; co-location only, behaviour byte-identical). Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Mechanism mapped on both sides; peer review (gpt-5.6-sol, 2026-07-11) found the first-draft "swing one rel32" Phase 2 unsound. A second LuaJIT-source pass produced the grounded port architecture below (§Port architecture): keep lune's `regs[]` memory handoff, pin only 2–3 base pointers to reserved registers, run frameless bodies under one shared trampoline. Next: Increment 2 (shared trampoline + frameless bodies, P-A/P-B/P-C/P-G/P-F).
 Owner: Bart
-Last updated: 2026-07-11 (port architecture grounded against LuaJIT lj_mcode.c + vm_x86.dasc)
+Last updated: 2026-07-11 (Increment 1 — McodeArena — landed)
 
 Coherent-state chaining (doc 16) proved *correct* but *performance-neutral* on
 nsieve: the JIT compiles every hot loop to native code, chaining hands control
@@ -43,6 +43,17 @@ land; move whole sections to Done once everything inside is checked.
   `lj_trace.c`); lune's native guard-exit emission mapped to the patch-point
   (`nativegen.zig` exit stubs → shared `deopt_exit`; W^X page finalize). The one
   architectural difference (register vs. `regs[]`-memory handoff) identified.
+- [x] **P-D — Shared code arena (Increment 1).** `McodeArena` (`nativegen.zig`):
+  a chain of ~1 MiB `mmap`'d regions, bump cursor + first-fit free-list, mcprot-
+  style RW↔RX toggle per write. Owned by `TraceState` (`mcode_arena`), deinited
+  *after* the trace cache so per-trace `free` returns slots first. Every native
+  trace is now a co-located slice (`ExecPage` is a view: `.owned` mmap for the
+  test path, `.arena` slot for production via `compileInto`→`nativeFor`). Per-trace
+  reclaim kept via the free-list (Bart's call: try reclaim first, revisit if it
+  measures worse than pure bump). No cross-region references emitted yet, so the
+  ±2 GiB reachability check is deferred to Increment 2. Behaviour byte-identical:
+  10-mode matrix green, nsieve identical across tier-0/tier-1a/native, bench
+  unchanged (arena work is compile-time only, never the hot loop).
 
 ### Outstanding
 
@@ -66,14 +77,14 @@ review, 2026-07-11; see §Blocking prerequisites for the argument):
   return/materialization paths and post-loop coherent PCs. Each transition kind in
   nsieve's chain needs its own patch/link rule; patching only ordinary guards
   leaves most hops re-entering Zig.
-- [ ] **P-D — Shared code arena (rel32 reachability).** Traces are independent
-  `mmap`s with no ±2 GiB guarantee (`nativegen.zig:104`); a `rel32` from parent to
-  child may not reach. LuaJIT owns one contiguous mcode arena. Need a near code
-  arena, near trampolines, or absolute-indirect transfer.
-- [ ] **P-E — Patched-target lifetime / unpatching.** Retired traces are unmapped
-  (`removeTrace`→`destroy`, `trace.zig:1749,622`); a parent patched to a freed
-  child is use-after-unmap. Need dependency tracking + unpatch-on-retire (or pinned
-  trampolines).
+- [ ] **P-E — Patched-target lifetime / unpatching.** Since Increment 1 the arena
+  keeps regions mapped for the whole run, so a stale patch is no longer a raw
+  use-after-*unmap* — but it is now use-after-*reuse*: `removeTrace`→`destroy`
+  (`trace.zig:1749,622`) returns the child's mcode slot to the arena free-list, and
+  a later `compileInto` can hand that exact slot to an **unrelated** trace, so a
+  parent still patched to it would `jmp` into foreign code. Need dependency tracking
+  + unpatch-on-retire before a freed slot may be reused (or pin patched-into slots
+  out of the free-list / use trampolines). Strictly required once patching exists.
 - [ ] **P-F — Determinism replication.** The patched path *skips*
   `onSideExit`/`hit_count`/penalty/gate/prime-side arming/lane-widen eviction
   (`interp.zig:2588,2605,2763`) — all of which steer *future* recording. Skipping
@@ -385,18 +396,26 @@ to a single `jmp rel32` per link.
 
 ## Phasing (three ordered increments)
 
-### Increment 1 — Shared arena, keep the per-trace C ABI (P-D)
+### Increment 1 — Shared arena, keep the per-trace C ABI (P-D) — ✅ LANDED
 
-Pure co-location: replace `mapExecutable`'s per-trace `mmap` (`nativegen.zig:104`)
-with an arena (`mcode_allocarea`/`mcode_alloc` analogue), sub-allocated by a
-cursor pair, placed in a rel32 window centered on the runtime. **Keep the per-trace
-`call`/`ret` C ABI unchanged** — traces are still C functions, just co-located.
-Buys nothing for speed on its own; it is the *precondition* for every later bare
-`jmp`, and is independently testable (same behavior, one big mapping instead of N).
-Includes the area-level W^X toggle + `lj_mcode_patch`-style RW/RX bracket, and the
-`exit_instr → mcode-offset` map + `repatch` originally scoped as "Phase 1"
-(cheap, ABI-agnostic, lands here). Gate: `just test`, 10-mode matrix
-byte-identical, nothing patched yet.
+Pure co-location: replaced `mapExecutable`'s per-trace `mmap` (production path)
+with `McodeArena` (`nativegen.zig`) — a chain of ~1 MiB regions, bump cursor +
+first-fit free-list, mcprot-style RW↔RX toggle per write. **The per-trace
+`call`/`ret` C ABI is unchanged** — traces are still C functions, just co-located.
+`ExecPage` became a view (`.owned` for `mapExecutable`'s standalone test path,
+`.arena` for the arena); `compile(gpa,t)` (tests) and `compileInto(gpa,arena,t)`
+(production via `nativeFor`) share `compileImpl`. Owned by `TraceState`
+(`mcode_arena`), deinited after the trace cache. Bought nothing for speed on its
+own (arena work is compile-time only); it is the *precondition* for every later
+bare `jmp`, landed independently with byte-identical behaviour.
+
+**Deferred out of Increment 1** (were listed here, moved to Increment 2/3 where
+they actually apply): the rel32-window placement centred on the runtime + strict
+in-range check (nothing emits a cross-region reference yet — all runtime-helper
+calls are absolute `mov rax,imm64; call rax`), and the `exit_instr → mcode-offset`
+map + `repatch` (that is patch infrastructure, so it lands with Increment 3).
+Gate met: `just test` green, 10-mode matrix + nsieve byte-identical, nothing
+patched yet.
 
 ### Increment 2 — Shared trampoline + frameless bodies (P-A, P-B, P-C, P-G, P-F)
 

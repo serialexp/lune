@@ -585,7 +585,7 @@ fn dumpNative(vm: *lune.interp.Vm) void {
     w.print("lune: native codegen for {d} trace(s)\n", .{items.len}) catch {};
     for (items, 0..) |t, i| {
         if (vm.trace.nativeFor(t)) |ct| {
-            const code = ct.page.mem[0..ct.page.len];
+            const code = ct.page.code;
             w.print("trace #{d}: compiled, {d} bytes of x86-64\n", .{ i, code.len }) catch {};
             var off: usize = 0;
             while (off < code.len) : (off += 16) {
