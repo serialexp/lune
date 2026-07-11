@@ -1,8 +1,8 @@
 # Coherent-State Native Exit Chaining — Design
 
-Status: complete — Phases 0–3 landed. Mechanism is general infrastructure; near-inert on nsieve specifically (coverage-bound, see Phase 2/3 Done notes), kept on for the transition shape it *does* cover and for future workloads.
+Status: Phases 0–3 landed + regression fixed (5ba4048). Mechanism is correct, general, and determinism-preserving, but on nsieve it is performance-*neutral*, not a win — `driveChain`'s per-transition runtime re-entry cancels the benefit on 1–2-iteration clusters. A net win there needs exit-branch patching (Outstanding).
 Owner: Bart
-Last updated: 2026-07-11 (Phases 2–3 landed)
+Last updated: 2026-07-11 (accounting regression root-caused + fixed)
 
 The tracing JIT compiles every hot loop in nsieve to native code, yet ~93% of
 cycles still run on the tier-0 interpreter and lune sits ~2× off LuaJIT (N=9:
@@ -69,36 +69,86 @@ land; move whole sections to Done once everything inside is checked.
   instead of dropping to tier-0. If no continuation exists there, resume tier-0 at
   the post-inner PC (never the inner header — the idempotent marking loop must not
   re-run).
-- [x] **Re-profiled.** nsieve reality recorded below; the mechanism is
-  **coverage-bound near-inert** on nsieve and carries a small reproducible
-  wall-clock regression — kept on as general infrastructure, not as an nsieve win.
+- [x] **Re-profiled + regression root-caused and fixed.** A fable agent and a
+  gpt-5.6-sol (codex) agent independently investigated why Phases 2–3 were not the
+  expected win; both found a self-inflicted accounting bug (see below), fixed in
+  `5ba4048`. nsieve is back to the pre-Phase-2 baseline, but chaining is
+  performance-*neutral* there, not a win.
 
-### nsieve outcome (why "complete" ≠ "nsieve got faster")
+### nsieve outcome (corrected — supersedes the earlier "untraceable init loop" claim)
 
-The doc's founding premise — *"the traces are not the problem, the transitions
-are"* — does **not** hold for nsieve, and the profiling in this session
-established why:
+> **The first version of this section was wrong** and is retained only as a
+> cautionary note. It claimed nsieve is ~96% an *untraceable* INIT loop and that
+> the mechanism was coverage-bound near-inert with an acceptable ~10% regression.
+> Two independent agent investigations + a clean interleaved A/B disproved every
+> load-bearing part of that. Here is what actually holds.
 
-- **The skip trace reaches a prime only ~55 times per N=7 run** (measured:
-  `prime_side_chain_follows` + native link-follows in the low tens). The
-  skip→prime transition the whole design targets fires a few dozen times, not
-  millions — there is almost nothing to accelerate.
-- **~96% of nsieve is the untraceable INIT loop** `for i=2,m do p[i]=true end`,
-  which array-grows every iteration, aborts recording, and runs fully
-  interpreted with *no trace at all* (CLAUDE.md's documented lever #1). Chaining
-  cannot touch code that never records.
-- **The prime marking loop is idempotent**, so even when a misclassification
-  re-ran it (the Phase 2 regression), output stayed byte-identical — masking the
-  bug until profiled. Phase 3's driver swap fixed the redundant re-execution.
-- **Net wall-clock: a reproducible ~10% regression** (N=9 interleaved A/B: chain
-  on ~0.25s vs off ~0.23s), from the per-productive-exit counting + arming
-  bookkeeping on a path whose payoff never materializes at nsieve's coverage.
+- **The INIT loop `for i=2,m do p[i]=true end` traces and compiles to native.**
+  `--dump-aborts` shows **zero** recording aborts; the loop records as
+  `guard_append → astore_append → loop` and lowers to ~413 bytes of x86-64
+  (recorder: `trace.zig` grow-store path; native: `nativegen.zig`
+  `astore_append`). It is ~25–35% of the run, **not 96%**. (Doc 16 even
+  self-contradicted here: the prose called INIT untraceable while the trace table
+  in *The nsieve kernel* below lists its compiled `astore_append` trace — the
+  table was right.) The stale CLAUDE.md "nsieve verdict" that seeded this claim
+  predates the `astore_append` work and needs updating.
+- **The chain did not stop at ~55 fires because of a coverage ceiling — it gated
+  itself off.** A successful prime-side burst commits only 1–2 *enclosing*
+  iterations before a composite ends the cluster; that count is below
+  `min_useful`, so `driveChain`'s end-of-burst `onSideExit(sct, linked_completed)`
+  scored the burst as *low-yield* and bumped the seed's anchor penalty. The seed
+  (prime side-trace) shares its outer-header anchor (pc 14) with the profitable
+  skip trace, so the penalty gated **both**, escalating to a permanent strike
+  within ~0.1% of the run and collapsing skip coverage from ~21,317 native
+  entries to ~15. That lost skip coverage — millions of composite iterations
+  falling back to tier-0 — **was** the ~10% regression. Fixed in `5ba4048` by
+  making a successful coherent handoff penalty-neutral for the seed anchor.
+- **After the fix, chaining is ≈ parity on nsieve, not a win.** Interleaved
+  A/B, N=9, CPU-pinned, min-of-25: pre-Phase-2 baseline ~238ms; fixed ~238.5ms;
+  the regressed Phase-2/3 commit `d31fc0b` ~247.6ms. So the fix recovers the
+  regression but does not turn chaining positive here.
+- **Why parity, not a win — the real, measured finding.** `driveChain` re-enters
+  the runtime on *every* transition (dispatcher round-trip, anchor hash lookups,
+  fingerprint check, `ExitMaterialization`, reg-slab entry/exit). On nsieve's
+  1–2-iteration prime clusters that per-transition cost (~600ns, fable) rivals the
+  cost of simply tier-0-interpreting the ~14-composite gap, so the benefit
+  cancels. Proof by contradiction: *increasing* chain coverage makes nsieve
+  **slower** — crediting the burst as fully useful (clearing penalty+gate so it
+  never self-limits) measured ~363ms, worse than every other variant. The
+  mechanism's own early self-gating in `d31fc0b` was accidentally *limiting the
+  damage*.
 
-Kept **on** because the mechanism is correct, general, and determinism-preserving
-(the founding premise holds for *other* transition-dense workloads); nsieve is
-simply the wrong benchmark to prove it, and its remaining LuaJIT gap is JIT
-*coverage* of the init loop, not transition cost. See the CLAUDE.md nsieve
-verdict, which this session's profiling independently reproduced.
+**Verdict on the premise.** "The traces are not the problem — the transitions
+are" is not vindicated by nsieve: here the transitions are cheap to *skip*
+(drop to tier-0 for 7% of iterations) and expensive to *chain* through a runtime
+re-entry. The premise can still hold for transition-dense workloads where the
+per-transition cost is amortised over long linked bodies, but nsieve is not that
+workload. The only architecture that wins on tiny clusters is **Pall's
+exit-branch patching** (`lj_asm_patchexit`, `LuaJIT/src/lj_trace.c` →
+`lj_asm_x86.h`): the parent trace's guard is machine-code-patched to jump
+directly into the side trace, with zero dispatcher involvement per transition —
+the guard *is* the chain. That is the outstanding lever if we want chaining to be
+a net win on nsieve; `driveChain`'s re-entry model structurally cannot be.
+
+### Outstanding
+
+- [ ] **Exit-branch patching (the real win lever).** Replace `driveChain`'s
+  per-transition runtime re-entry with machine-code patching of the parent
+  trace's guard exit to jump straight into the side/continuation trace (LuaJIT
+  `lj_asm_patchexit`). This is the only path that makes chaining a *net win* on
+  tiny (1–2-iteration) clusters like nsieve's primes. Large; determinism/replay
+  implications need their own design pass (patching must be a deterministic
+  function of already-recorded traces). **Defer** until we decide chaining is
+  worth pushing past parity on nsieve — the accounting fix already removed the
+  regression, so there is no fire.
+- [ ] **`interp.zig` zero-exit chain hardcodes `.ir` tier under `--jit-native`.**
+  The zero-exit `driveChain` call (the old `tryChainExit` path) always uses the
+  `.ir` tier even when the failed trace ran native, so a native zero-exit chains
+  through tier-1a rather than native→native. Pre-existing (not a Phase 2/3
+  regression) and inert at the default `min_useful`, but a latent landmine (fable
+  found it running millions of inner iterations on tier-1a at `min_useful=2`).
+  Fix: select the tier by `ran_native`, mirroring the productive-branch-guard
+  chain site. Held back from the accounting-fix commit to keep that A/B clean.
 
 ## Why this exists
 

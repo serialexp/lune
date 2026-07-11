@@ -166,19 +166,35 @@ Two gotchas that bit us, so read percentages carefully:
   pure tier-0 run (`./zig-out/bin/lune $NS 9`, no `--trace`) before concluding a
   symbol "got worse."
 - **Isolate a suspected loop instead of arguing about it.** Extract the loop into a
-  standalone script with the same call shape and time it + `--dump-native` it. That's
-  how we proved nsieve's init loop `for i=2,m do p[i]=true end` is ~40% of the run and
-  records *no trace* (array growth aborts recording → 100% tier-0). `--dump-native`
-  saying "no traces recorded" / "unsupported" is the signal a hot loop never tiers up.
+  standalone script with the same call shape and time it + `--dump-native` it.
+  `--dump-native` saying "no traces recorded" / "unsupported" is the signal a hot loop
+  never tiers up.
 
-**nsieve verdict on file (so we don't re-derive it):** ~96% of nsieve runs on the
+> **CORRECTION (2026-07-11).** The verdict below was substantially wrong and is kept
+> only so the stale reasoning is visible. Two independent agent investigations (fable +
+> gpt-5.6-sol) plus a clean A/B disproved it. What actually holds:
+> - **The init loop `for i=2,m do p[i]=true end` traces and compiles to native** via
+>   `guard_append → astore_append → loop` (~413 bytes x86-64); `--dump-aborts` shows
+>   **zero** aborts. It is ~25–35% of the run, not ~40% "fully interpreted". The
+>   "array growth aborts recording → no trace" claim predates the `astore_append` work
+>   and is false.
+> - nsieve is ~85–90% tier-0 by *cycles* (dispatch + arith helpers over the outer scan),
+>   not "~96% because the init loop can't trace".
+> - The "make side-trace linking native" lever (below) was built as doc 15 + doc 16, and
+>   on nsieve it is **performance-neutral, not a win**: `driveChain` re-enters the runtime
+>   per transition (~600ns), which cancels the benefit on 1–2-iteration prime clusters.
+>   The real win needs LuaJIT-style exit-branch *patching* (guard patched to jump straight
+>   into the side trace, no runtime re-entry). See `docs/design/16-coherent-state-chaining.md`
+>   → "nsieve outcome (corrected)".
+
+**nsieve verdict on file — STALE, see correction above:** ~96% of nsieve runs on the
 tier-0 interpreter; the JIT covers only two non-branchy inner loops' steady state. The
 remaining LuaJIT gap (~5×) is structural JIT-*coverage*, not codegen tightness — making
 already-traced code faster cannot close it. The levers, in order:
 
-1. **Untraceable array growth (~40%, biggest).** The init loop `for i=2,m do p[i]=true
+1. **Untraceable array growth (~40%, biggest).** ~~The init loop `for i=2,m do p[i]=true
    end` grows the array, recording aborts, and it runs *fully interpreted* with no trace
-   at all. Nothing downstream (chaining, hoisting) can touch it until growth records.
+   at all.~~ **FALSE — see correction above; the init loop traces via `astore_append`.**
 2. **Side-trace linking already EXISTS but dead-ends on tier-1a.** `tryChainExit`
    (trace.zig, called from the dispatch loop in interp.zig) already does exit-PC
    chaining: on a side-exit it looks up a trace anchored at the exit PC and runs it —
