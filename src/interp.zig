@@ -2782,10 +2782,33 @@ pub const Vm = struct {
                                 // walk's `visited` set so we neither re-run the trace
                                 // that just failed nor re-penalize a sibling already
                                 // tried this back-edge.
-                                if (self.trace.driveChain(ct, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited])) |chain| {
-                                    if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                                    for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
-                                    continue :outer;
+                                //
+                                // Tier selection mirrors the productive branch-guard
+                                // site above: chain native→native when the failed
+                                // trace ran native (`ran_native`, set at trace entry),
+                                // tier-1a otherwise. Previously this site hardcoded
+                                // `.ir` even under `--jit-native`, so a native
+                                // zero-exit that chained a same-anchor sibling dropped
+                                // that sibling to tier-1a — the coherent regs are
+                                // identical, so it was inert at the default
+                                // `min_useful`, but latent once chaining fires. Keying
+                                // off `ran_native` (a mode-invariant fact — the trace
+                                // either has native code or it doesn't) preserves C5.
+                                // `tier` is a comptime param, so branch on `ran_native`
+                                // into two literal-tier calls (as the branch-guard site
+                                // above does) rather than a runtime tier value.
+                                if (ran_native) {
+                                    if (self.trace.driveChain(ct, result, proto, regs, .native_only, .ordinary_header, visited[0..nvisited])) |chain| {
+                                        if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                                        for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                        continue :outer;
+                                    }
+                                } else {
+                                    if (self.trace.driveChain(ct, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited])) |chain| {
+                                        if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                                        for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                        continue :outer;
+                                    }
                                 }
                             } else |_| {} // OOM: skip this trace, try next
                         }
