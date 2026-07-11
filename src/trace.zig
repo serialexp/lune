@@ -1408,7 +1408,25 @@ pub const TraceState = struct {
                     break;
                 }
                 if (linked_completed > 0) {
-                    self.onSideExit(sct, linked_completed);
+                    // A successful coherent chain burst is **penalty-neutral** for the
+                    // seed anchor — deliberately no `onSideExit` here. The burst
+                    // committed `linked_completed` enclosing iterations AND their whole
+                    // inner-loop bodies natively rather than dropping to tier-0. The raw
+                    // enclosing count is usually 1-2 (nsieve: one prime, then a composite
+                    // ends the cluster), which is BELOW `min_useful`, so the pre-fix
+                    // `onSideExit(sct, linked_completed)` took the low-yield branch and
+                    // bumped the seed's anchor penalty. On doc 16's prime path the seed
+                    // (the prime side-trace) *shares* its outer-header anchor with the
+                    // profitable skip trace, so that penalty gated BOTH and escalated to
+                    // a permanent strike within ~0.1% of the run — collapsing skip
+                    // coverage (21k native entries → ~15) and causing the whole Phase-2/3
+                    // regression. The seed's real profitability is already tracked by its
+                    // own standalone entries; a productive chain must not add a low-yield
+                    // strike here. (Clearing the penalty/gate instead — crediting it as
+                    // *useful* — was measured worse: it defeats the gate that parks the
+                    // anchor and thrashes on re-walk/recompile. Neutral is correct.)
+                    // Mode-invariant: `linked_completed` and the anchor match across
+                    // tier-1a/native, so no mode records a different penalty here.
                     return .{ .completed = linked_completed, .resume_pc = resume_pc };
                 }
                 self.onSideExit(sct, 0);
