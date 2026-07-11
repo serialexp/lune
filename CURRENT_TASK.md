@@ -3,11 +3,41 @@
 ## Status 2026-07-11
 
 - **Increment 1 (P-D, shared mcode arena): LANDED** — commit `a970da4`.
-- **Increment 2.1 (P-A, frameless chain-entry ABI): LANDED (uncommitted at time of
-  writing this note — commit next).** Frameless trampoline + frameless bodies; all
-  exits pinned to `shared_exit`; NO linking / NO ChainResult yet. Byte-identical.
-- **Increment 2.2+ : DESIGNED + PEER-REVIEWED + DECIDED** — see
+- **Increment 2.1 (P-A, frameless chain-entry ABI): LANDED** — commit `3f46d5e`.
+  Frameless trampoline + frameless bodies; all exits pinned to `shared_exit`.
+- **Increment 2.2 (P-B, chain-wide result contract): LANDED (uncommitted at time of
+  writing this note — commit next).** Stable `Trace.id` + `NativeResult.final_trace_id`
+  baked at every native exit + `traceById` dispatcher resolve/assert. No linking yet;
+  every exit bakes its own `ct.id`, so `final == ct` and behaviour is byte-identical.
+- **Increment 2.3+ : DESIGNED + PEER-REVIEWED + DECIDED** — see
   `docs/design/17-exit-branch-patching.md` (§"Increment 2 — detailed design").
+
+## What 2.2 changed (the chain-wide result contract, P-B)
+
+Files: `src/irinterp.zig`, `src/trace.zig`, `src/nativegen.zig`, `src/interp.zig`.
+
+- **`irinterp.zig`**: `pub const NO_TRACE_ID: u32 = maxInt(u32)` sentinel;
+  `ExecResult` gains `final_trace_id: u32 = NO_TRACE_ID` (**defaulted** → the ~40
+  tier-1a `ExecResult{…}` sites are untouched, zero churn).
+- **`trace.zig`**: `Trace.id: u32` (stable, monotonic, never reused — the cache
+  index is `swapRemove`'d so it can't be a baked constant); `TraceState.next_trace_id`
+  bumped + assigned at finalize; `traceById(id)` resolver.
+- **`nativegen.zig`**: `NativeResult.final_trace_id: u32`; `emitReturn` takes a
+  `trace_id` param and bakes it via `movMemImm32(.rdx, @offsetOf(NativeResult,
+  "final_trace_id"), trace_id)` before teardown/jump (rdx = `*NativeResult` at every
+  exit); the 4 `lower` call sites pass `t.id`; `runWithLinkedLoopDone` inits and
+  marshals the field.
+- **`interp.zig`**: dispatcher resolves `final = traceById(result.final_trace_id)
+  orelse ct` and `if (ran_native) assert(final == ct)` — validates the full baked-id
+  round-trip while staying byte-identical (consumers still route through `ct`; 2.3
+  switches them to `final`).
+
+### Verification done for 2.2
+- `just test` green (EXIT=0; Debug asserts active).
+- nsieve 9: tier-0 == tier-1a == native byte-identical; `--jit-native` exit 0
+  (assert `final == ct` passed for all native traces).
+- Differential tier-0 vs native OK on: nsieve, nsieve-bit, fannkuch, mandelbrot,
+  nbody, spectral-norm.
 
 ## What 2.1 changed (the frameless ABI move)
 
@@ -53,20 +83,21 @@ lands. Behaviourally identical while no slot is armed.
   52.5→53.3 nsieve-bit; within noise). ABI move is perf-neutral (expected — no
   linking yet, just one extra indirect jmp per trace entry/exit).
 
-## NEXT: Increment 2.2 — ChainResult (P-B) + dispatcher PC mapping
+## NEXT: Increment 2.3 — link-slot population (P-C / P-G)
 
-Still NO linking; byte-identical gate. Replace the single-trace `NativeResult`
-handoff with a chain-wide result carrying: FINAL trace identity, FINAL exit
-identity, CUMULATIVE completed work, coherent resume PC. Must-fixes from the
-review (already in doc 17 §"Peer-review corrections"):
-- `completed` ≠ raw cumulative rbx (nested roll-up is +1 per inner run).
-- Every exit consumer must index the FINAL trace, not the parent
-  (`interp.zig:2584,2595` mis-attribution → OOB / wrong accounting).
-- Stable never-reassigned trace id (cache index is `swapRemove`'d).
-- Child prologue-fail must carry cumulative progress + a distinct reason, not
-  `completed = 0`.
-Then 2.3 link-slot population (`.link` first, then guard + loop-done; P-C/P-G),
-2.4 P-F flag verification. Increment 3 = `lj_asm_patchexit` port + P-E
+The chain-wide result plumbing (2.2) exists but nothing populates a non-self
+`final_trace_id` yet. 2.3 makes `driveChain` bake/populate the real link:
+- Per-exit-kind link rules (P-C): `.link` terminal first, then ordinary guard,
+  then linked-loop-done — each transition kind in nsieve's chain gets its own
+  link/materialization rule.
+- Populate the link slot / final-id handoff so a linked child overwrites
+  `final_trace_id` at the exit; then **route the dispatcher consumers through
+  `final`** instead of `ct` (last_exit_instr guard-fail counting, onSideExit,
+  maybeArmContinuation, countProductiveBranchExit, driveChain, isSourceBranch…).
+  Removing the `assert(final == ct)` is the signal linking is live.
+- Child eligibility + prologue-failure fallback contract (P-G): child prologue-fail
+  must carry cumulative progress + a distinct reason, not `completed = 0`.
+Then 2.4 P-F flag verification. Increment 3 = `lj_asm_patchexit` port + P-E
 unpatch-on-retire lifetime (NOT deferrable — free-list reuse + widen-eviction make
 code-UAF reachable; reset inbound slots before destroy).
 

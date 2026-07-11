@@ -1,8 +1,8 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
-Status: partial — Increment 1 (shared mcode arena, P-D) and Increment 2.1 (frameless chain-entry ABI, P-A) landed; both byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies now run frameless under one shared trampoline (`ensureTrampoline`); exits still land on `shared_exit` (no linking yet). Next: Increment 2.2 (`ChainResult` P-B + `(final_trace_id,exit_instr)→PC` dispatcher mapping), then 2.3 link-slot population (P-C/P-G), 2.4 P-F verification.
+Status: partial — Increment 1 (shared mcode arena, P-D), Increment 2.1 (frameless chain-entry ABI, P-A) and Increment 2.2 (chain-wide result contract, P-B) landed; all byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies now run frameless under one shared trampoline (`ensureTrampoline`); every native exit stub bakes the final trace's stable id into `NativeResult.final_trace_id`, resolved by the dispatcher via `traceById` (asserts `final == ct` while no link is armed). Next: Increment 2.3 link-slot population (P-C/P-G) — populate the id/link handoff from `driveChain` and route dispatcher consumers through `final`; then 2.4 P-F verification.
 Owner: Bart
-Last updated: 2026-07-11 (Increment 2.1 landed — frameless trampoline + frameless bodies, P-A; 10-mode matrix green, nsieve/field_hash/grid tier-0==native byte-identical, nsieve jit ms flat)
+Last updated: 2026-07-11 (Increment 2.2 landed — chain-wide result contract, P-B; stable `Trace.id` + `NativeResult.final_trace_id` baked at every exit + `traceById` dispatcher resolve/assert; nsieve/nsieve-bit/fannkuch/mandelbrot/nbody/spectral-norm tier-0==native byte-identical, Debug asserts pass)
 
 Coherent-state chaining (doc 16) proved *correct* but *performance-neutral* on
 nsieve: the JIT compiles every hot loop to native code, chaining hands control
@@ -69,17 +69,28 @@ land; move whole sections to Done once everything inside is checked.
   yet: exits still land on `shared_exit`, so behaviour is byte-identical (10-mode
   matrix green; nsieve + nsieve-bit + field_hash/grid/array all tier-0==native;
   nsieve jit ms flat vs the pre-change baseline).
+- [x] **P-B — Chain-wide result contract (Increment 2.2).** `NativeResult` gains
+  `final_trace_id: u32` — the stable id of the *final* trace in the chain, baked as
+  an imm32 into every native exit stub (`emitReturn` writes it to
+  `@offsetOf(NativeResult,"final_trace_id")` via rdx, which holds `*NativeResult` at
+  every exit). `ExecResult` (tier-1a) grows the same field, *defaulted* to
+  `NO_TRACE_ID` so the ~40 tier-1a construction sites are untouched (zero churn).
+  Traces carry a stable, never-reused `id` (monotonic `TraceState.next_trace_id`,
+  assigned at finalize) because the cache index is `swapRemove`'d and unusable as a
+  baked constant; `TraceState.traceById(id)` resolves it. The dispatcher computes
+  `final = traceById(result.final_trace_id) orelse ct` and asserts `final == ct`
+  under `ran_native`. With no linking armed yet every exit bakes its own `ct.id`, so
+  `final == ct` always holds — the assert validates the full baked-id round-trip
+  (id → stub imm32 → `NativeResult` → `traceById`) end-to-end while staying
+  byte-identical. Consumers stay routed through `ct`; 2.3 routes them through
+  `final` once child links populate a real id. (nsieve/nsieve-bit/fannkuch/
+  mandelbrot/nbody/spectral-norm all tier-0==native; Debug asserts pass.)
 
 ### Outstanding
 
 **Blocking prerequisites — must be designed before any patch is safe** (peer
 review, 2026-07-11; see §Blocking prerequisites for the argument):
 
-- [ ] **P-B — Chain-wide result contract.** `NativeResult` describes one trace;
-  a child overwrites `completed`/`exit_instr` with *its* IR indices, which the
-  dispatcher then mis-attributes to the parent (`interp.zig:2584,2595`) → OOB /
-  wrong accounting. Need a result carrying *final* trace identity, *final* exit
-  identity, *cumulative* completed work, and the coherent resume PC.
 - [ ] **P-C — Exit-kind taxonomy.** Only ordinary per-guard exits hit
   `deopt_exit`. `.link` terminals (`nativegen.zig:3808`) and linked-numeric-for
   loop-done (`emitLinkedLoopDoneSnapshot`, `nativegen.zig:2934`) have their own

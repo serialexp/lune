@@ -569,6 +569,12 @@ const NativeResult = extern struct {
     completed: usize,
     exit_instr: u32,
     linked_loop_done: u64,
+    /// P-B (doc 17): the stable `Trace.id` of the trace performing the final exit,
+    /// baked as an imm32 into every exit stub (`emitReturn`). With no linking yet it
+    /// is always the entered trace's id; once a native parent `jmp`s into a linked
+    /// child (2.3), the child's exit stub overwrites it, so the dispatcher can map
+    /// the result back to the correct final trace instead of assuming the parent.
+    final_trace_id: u32,
 };
 
 /// A compiled trace: an executable page whose entry is
@@ -611,6 +617,7 @@ pub const CompiledTrace = struct {
             .completed = 0,
             .exit_instr = std.math.maxInt(u32),
             .linked_loop_done = if (linked_loop_done) 1 else 0,
+            .final_trace_id = irinterp.NO_TRACE_ID,
         };
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
@@ -618,7 +625,7 @@ pub const CompiledTrace = struct {
         } else {
             self.page.entry(EntryFn)(regs.tags, regs.payloads, &result);
         }
-        return .{ .completed = result.completed, .exit_instr = result.exit_instr };
+        return .{ .completed = result.completed, .exit_instr = result.exit_instr, .final_trace_id = result.final_trace_id };
     }
 
     pub fn deinit(self: *CompiledTrace) void {
@@ -2982,7 +2989,11 @@ fn emitTeardown(a: *x64.Assembler, frame: i32, callee: []const Reg) !void {
 /// production path): the shared trampoline owns the frame, so just jump to its
 /// teardown at the absolute address. rax is dead scratch at every exit site (the
 /// slot flush + result writes are already done), so it is free to hold the target.
-fn emitReturn(a: *x64.Assembler, frame: i32, callee: []const Reg, shared_exit: ?usize) !void {
+fn emitReturn(a: *x64.Assembler, frame: i32, callee: []const Reg, shared_exit: ?usize, trace_id: u32) !void {
+    // P-B (doc 17): stamp the final trace's stable id into the result. rdx still holds
+    // the *NativeResult at every exit site (it is reserved for the whole body). Baked
+    // as an imm32 (the trace's own id here; a linked child overwrites it in 2.3).
+    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(trace_id));
     if (shared_exit) |se| {
         try a.movRegImm64(.rax, @bitCast(@as(u64, se)));
         try a.jmpReg(.rax);
@@ -4112,7 +4123,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 }
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
                 try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
-                try emitReturn(a, frame, callee[0..callee_len], shared_exit);
+                try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id);
             },
             // A φ emits no code in the body: a slot-bound φ's writeback is driven by
             // its slot's `.carried`/`.write_only` class above (the back-edge shuffle /
@@ -4159,7 +4170,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             a.bind(l);
             try emitLinkedLoopDoneSnapshot(a, t, kinds, alloc, ei);
             try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
-            try emitReturn(a, frame, callee[0..callee_len], shared_exit);
+            try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id);
         }
     }
 
@@ -4175,7 +4186,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
     }
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
-    try emitReturn(a, frame, callee[0..callee_len], shared_exit);
+    try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id);
 
     // PROLOGUE_FAIL: a hoisted type guard failed before any commit. Return 0 with
     // regs[] untouched and no per-body guard identity (the cut-1 EXIT would have
@@ -4183,7 +4194,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     a.bind(prologue_fail);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "completed"), 0);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), -1);
-    try emitReturn(a, frame, callee[0..callee_len], shared_exit);
+    try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id);
 }
 
 // ---------------------------------------------------------------------------

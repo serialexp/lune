@@ -55,6 +55,13 @@ const arr = @import("array.zig");
 const Value = value.Value;
 const Trace = trace.Trace;
 
+/// Sentinel `final_trace_id`: "no chain-final trace was identified" — a tier-1a
+/// result (which always belongs to the entered trace) or a native result whose
+/// exit stub somehow didn't write the id. The dispatcher resolves it to the entered
+/// trace `ct`. `maxInt(u32)` is unreachable as a real `Trace.id` (a session never
+/// records 4 billion traces).
+pub const NO_TRACE_ID: u32 = std.math.maxInt(u32);
+
 /// Result of executing a trace.
 pub const ExecResult = struct {
     /// Number of loop iterations that committed cleanly.
@@ -63,6 +70,13 @@ pub const ExecResult = struct {
     /// failure). `maxInt(u32)` means the trace ran to completion with no
     /// failure (completed > 0).
     exit_instr: u32,
+    /// P-B (doc 17): the stable `Trace.id` of the trace that performed the FINAL
+    /// exit of the (possibly chained) native run. Native bakes this per exit stub;
+    /// tier-1a leaves it at `NO_TRACE_ID` (a single `execute` call always belongs to
+    /// the entered trace). Defaulted so the ~40 tier-1a construction sites are
+    /// untouched. The dispatcher maps `(final_trace_id, exit_instr)` → the final
+    /// trace; with no linking yet this is always the entered trace.
+    final_trace_id: u32 = NO_TRACE_ID,
 };
 
 /// Commit the final numeric-`for` iteration at a loop-done side exit so a linked

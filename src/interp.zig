@@ -2585,6 +2585,16 @@ pub const Vm = struct {
                                 // per-guard PC debugging even on productive exits.
                                 self.trace.last_exit_instr = result.exit_instr;
 
+                                // P-B (doc 17): resolve the FINAL trace in the chain
+                                // from the id baked into the native exit stub. With no
+                                // linking armed yet, every exit bakes its own `ct.id`,
+                                // so `final == ct` always holds — the assert validates
+                                // the baked-id round-trip end-to-end (id → stub imm32 →
+                                // NativeResult → traceById). 2.3 routes consumers
+                                // through `final` once child links populate a real id.
+                                const final: *const trace.Trace = self.trace.traceById(result.final_trace_id) orelse ct;
+                                if (ran_native) std.debug.assert(final == ct);
+
                                 // --- guard-failure counting (step 4) ---
                                 // Count guard failures on zero-iteration exits
                                 // (type mismatches that passed the fingerprint

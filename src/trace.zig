@@ -588,6 +588,14 @@ pub const InputSeed = struct {
 /// connect it back to tier-0 register slots. Immutable once committed (Phase 5a
 /// never invalidates a cached trace — see the lifecycle doc).
 pub const Trace = struct {
+    /// Stable, monotonically-assigned identity (P-B, doc 17). Unlike the cache
+    /// index (`traceIndex`, which `swapRemove` shuffles), this is assigned once at
+    /// finalize from `TraceState.next_trace_id` and NEVER reused — so it can be
+    /// baked into native exit code as `final_trace_id` and resolved back via
+    /// `traceById` even after unrelated traces retire. Default 0 for hand-built test
+    /// traces that never go through finalize (they don't chain, so id collisions are
+    /// harmless — the dispatcher's id path only runs for real recorded traces).
+    id: u32 = 0,
     anchor: AnchorKey,
     /// The straight-line IR, terminated by a `loop` instruction.
     instrs: []IrInstr,
@@ -855,6 +863,10 @@ pub const TraceState = struct {
     /// Committed traces. A linear scan is fine — the cache is small in Phase 5a
     /// and never invalidated.
     cache: std.ArrayListUnmanaged(*Trace) = .empty,
+    /// Next stable `Trace.id` to hand out (P-B, doc 17). Monotonic; never decremented,
+    /// so a retired trace's id is never reassigned and a baked `final_trace_id` can
+    /// never alias a different live trace.
+    next_trace_id: u32 = 0,
     /// Anchors currently held off tier-1 with a doubling cooldown (`Gate`). Set
     /// when a recording aborts, a commit fails, or the low-yield re-entry penalty
     /// maxes out. Unlike the old permanent blacklist, an anchor here is *retried*
@@ -1116,6 +1128,17 @@ pub const TraceState = struct {
     pub fn traceIndex(self: *const TraceState, t: *const Trace) ?u32 {
         for (self.cache.items, 0..) |c, i| {
             if (c == t) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// Resolve a stable `Trace.id` (P-B, doc 17 — baked into native exit code as
+    /// `final_trace_id`) to its live `*Trace`, or null if no cached trace carries it
+    /// (the trace retired, or the id is the `NO_TRACE_ID` sentinel). Linear scan,
+    /// mirroring `traceIndex`; ids are unique, so at most one match.
+    pub fn traceById(self: *const TraceState, id: u32) ?*Trace {
+        for (self.cache.items) |c| {
+            if (c.id == id) return c;
         }
         return null;
     }
@@ -2183,7 +2206,13 @@ pub const TraceState = struct {
 
         const t = try self.gpa.create(Trace);
         errdefer self.gpa.destroy(t);
+        // Stable id (P-B): assigned once, never reused. A bump before a failed
+        // `cache.append` leaves a harmless gap in the id space (ids need only be
+        // unique, not contiguous).
+        const new_id = self.next_trace_id;
+        self.next_trace_id += 1;
         t.* = .{
+            .id = new_id,
             .anchor = self.rec.anchor,
             .instrs = fields.instrs,
             .consts = fields.consts,
