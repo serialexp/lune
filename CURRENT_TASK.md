@@ -1,89 +1,106 @@
-# CURRENT_TASK — Exit-branch patching (faithful LuaJIT port)
+# CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
-## Where we are (2026-07-11)
+## Status 2026-07-11
 
-Bart chose the **faithful port**: re-architect lune's native traces toward
-LuaJIT's frameless shared-arena model so a trace→trace transition is a bare `jmp`
-(no ~600 ns Zig dispatcher re-entry), which is the only thing that flips nsieve's
-tiny linked clusters from neutral to a win. Design is in
-`docs/design/17-exit-branch-patching.md` (grounded against LuaJIT
-`lj_mcode.c` + `vm_x86.dasc`; committed `bf55370`).
+- **Increment 1 (P-D, shared mcode arena): LANDED** — commit `a970da4`.
+- **Increment 2: DESIGNED + PEER-REVIEWED + DECIDED** — commits `4b2c9b0`, `b588fb8`.
+  Concrete design in `docs/design/17-exit-branch-patching.md`
+  (§"Increment 2 — detailed design"). Reviewed by gpt-5.6-sol: pure-memory
+  handoff premise is sound; 3 showstoppers + must-fixes folded in. **Coding not
+  started.**
 
-### Committed this session (all LOCAL, unpushed — Rule #15)
-- `5ba4048` fix: don't penalize shared anchor on successful coherent chain bursts
-- `62d619b` docs: correct the false "untraceable init loop" nsieve diagnosis
-- `911fbaf` fix: select native tier for zero-exit coherent chain under --jit-native (task #38)
-- `01ece13` docs: add design 17 (investigation + peer review)
-- `bf55370` docs: ground design 17 port architecture against LuaJIT
+### Unpushed local commits (Rule #15 — don't push unless asked)
+`5ba4048 62d619b 911fbaf 01ece13 bf55370 a970da4 4b2c9b0 b588fb8` — master ahead
+of origin/master by 8.
 
-### Tasks
-#41 P-D arena · #42 P-A frameless ABI (blocked by 41) · #43 P-B result (by 42) ·
-#44 P-C exit-kind (by 42) · #45 P-E lifetime (by 41) · #46 P-F determinism ·
-#47 P-G eligibility+fallback. Three ordered increments in doc 17 §Phasing.
+## The Increment 2 design in one breath
 
-## Key facts established (de-risk Increment 1)
-- **All runtime helper calls are absolute** (`movRegImm64 rax, &fn; call rax`,
-  e.g. nativegen.zig:2804-2806); all jmp/jcc are trace-local labels. **No rel32
-  cross-region refs exist today** → the arena's ±2GiB window is NOT load-bearing
-  until Increment 2 (bare jmps). So Increment 1 is pure co-location.
-- Usage surface is tiny: `ExecPage`/`mapExecutable`/`CompiledTrace` live in
-  nativegen.zig; `nativeFor` (trace.zig:1795) is the only production consumer.
+Make trace→trace transitions happen in machine code (kill the ~600 ns Zig
+round-trip). Load-bearing fact: the ONLY state crossing a transition is `regs[]`
+(SoA tags/payloads memory), `rbx` (counter), `rsp` (constant when frameless) —
+register homes are flushed to `regs[]` at every exit and reloaded by the child's
+hoisted prologue. So: one shared **trampoline** owns the C frame (saves all
+callee-saved once, reserves one generous 16-aligned spill area, `jmp`s into a
+**frameless** body); bodies drop their own push/sub/pop/ret; exits `jmp` a
+**link slot** (default `&shared_exit` = today's behaviour; armed by driveChain →
+child body = native handoff). No code patching in Inc 2 (that's Inc 3).
 
-## Increment 1 — Shared arena, keep per-trace C ABI (task #41) — ✅ LANDED
+### P-F DECIDED (Bart): replicate-but-inert
+Per-hop accounting is carried in a transition record **gated by a config flag**
+(like `record_exec_log`): ON for the 10-mode matrix/goldens (assert byte-identical
+tiering metadata across modes), OFF in production (skip it, keep the handoff cheap).
 
-Implemented `McodeArena` in nativegen.zig (bump cursor + first-fit free-list,
-mcprot RW↔RX toggle). `ExecPage` is now a view (`.owned` mmap for the test path,
-`.arena` slot for production). `compile(gpa,t)` (tests) + `compileInto(gpa,arena,t)`
-(production, via `nativeFor`) share `compileImpl`. Arena owned by `TraceState`,
-deinited after the cache. main.zig dumpNative reads `ct.page.code`.
-Per-trace reclaim KEPT (Bart: try reclaim first, revisit if worse than pure bump).
-Gate met: `just test` green; nsieve byte-identical tier-0/tier-1a/native; bench
-unchanged (nsieve jit 93.3ms, nsieve-bit 52.5ms, fp 276.5ms — matches baseline).
-NOT committed yet.
+### Review showstoppers already folded into the doc (MUST honour when coding)
+1. Loop-done dual materialization: default slot must NOT commit the final
+   iteration — select ordinary-deopt-stub vs linked-materialize-stub BEFORE
+   materializing, don't put the snapshot before a shared tail.
+2. Dangling code links: P-E lifetime is NOT deferrable — `removeTrace`→arena
+   free-list reuse + widen-eviction make code-UAF reachable in normal operation.
+   Reset inbound slots before destroy (backlinks / refcount / generation check).
+3. Child prologue-fail must carry cumulative progress + distinct reason, not
+   `completed=0`.
+Plus must-fixes: `completed` ≠ raw cumulative rbx (nested roll-up is +1/inner
+run); every exit consumer must index the FINAL trace not the parent; stable
+never-reassigned trace id (cache index is swapRemove'd); 16-byte frame rounding
+incl. callout-save region; slot reachability/W^X (nearby RW page or imm64+`jmp
+[rax]`); safepoint blackout bound (unarm when observation hooks active);
+`body_entry` = child guards/reloads/preheader, NOT loop_top.
 
-### Original plan (kept for reference)
+## NEXT: Increment 2 sub-step 2.1 — trampoline + frameless bodies (turnkey plan)
 
-**Goal:** replace per-trace `mmap` with one arena; traces become *slices* of it.
-Keep the per-trace `call`/`ret` C ABI unchanged (still C functions, just
-co-located). Byte-identical *behavior*; independently testable.
+Pure ABI move, **byte-identical**, NO linking / NO ChainResult yet (keep
+`NativeResult`). This isolates the risky stack-discipline change.
 
-**Lifecycle today (all in nativegen.zig unless noted):**
-- `ExecPage {mem: []align u8, len}` — owns an mmap; `deinit()` munmaps (:84-100).
-- `mapExecutable(code) -> ExecPage` (:104) — mmap RW, memcpy, mprotect RX.
-- `CompiledTrace {page}` (:348); `compile(gpa,t)` (:414) calls mapExecutable (:443).
-- `CompiledTrace.deinit` → `page.deinit()` (:380).
-- `NativeState.compiled` union (trace.zig:390); set in nativeFor (:1801).
-- `Trace.destroy` → `self.native.deinit()` (trace.zig:623).
-- `TraceState.deinit` frees all traces (trace.zig:~992 `for cache |t| t.destroy`).
-- Two TEST-ONLY standalone `mapExecutable` at nativegen.zig:5247,5280 (runNative
-  helpers) — keep a standalone path for these or give them a throwaway arena.
+Key code (all nativegen.zig unless noted), verified 2026-07-11:
+- `NativeResult` :502; `CompiledTrace`/`EntryFn`/`run`/`runWithLinkedLoopDone`
+  :513-542 (builds result, calls `page.entry(EntryFn)(tags,payloads,&result)`).
+- `emitTeardown(a, frame, callee)` :2875 — `add rsp,frame; pop callee…; pop rbx;
+  ret`. Called at EACH exit (deopt :4051-area, `.link` :3989, linked-loop-done
+  :4038, prologue_fail :4065).
+- Prologue :3163-3181 — computes `callee[]` (used callee-saved), `frame`
+  (16-aligned via `pushes = 1+callee_len`), then `push rbx; push callee…;
+  xor rbx,rbx; sub rsp,frame`.
+- Hoisted body prologue (guards+loads) :3191-3216+ — this is `body_entry`; KEEP.
+- Spill place is `[rsp + idx*8]` (`.mem => idx*8`, ~:2186); callout save area is
+  part of `alloc.spill_count`, callout does transient `sub rsp,8;call;add rsp,8`
+  (:2981) assuming body `rsp%16==8`.
 
-**Design decided (faithful LuaJIT):**
-- `McodeArena` owned by `TraceState` (lifetime ≥ all traces). Chain of mmap'd
-  regions (~1 MB each); bump cursor; chain a new region when full.
-- `arena.alloc(code) -> ExecPage`: ensure region RW, memcpy at cursor, advance,
-  mprotect RX (mcprot-style; ~2 mprotects/trace, negligible — compile is rare).
-- `ExecPage` becomes a *slice view* (base ptr + len into a region); `deinit()`
-  → **no-op**. `CompiledTrace.deinit` → no-op. `Trace.destroy` stops munmapping.
-  Arena munmaps all regions at `TraceState.deinit`.
-- **Reclamation policy = LuaJIT's: NO per-trace free.** Retired traces' mcode
-  becomes dead space until arena deinit. Fine for bench/test (rare retirement).
-  **Flush-all-on-full deferred** → note in TODO.md when implemented.
-- Placement: mmap with a hint near a runtime fn addr (best-effort centering) so
-  Increment 2's rel32 jmps land in range. **Strict in-range check + abort-trace
-  (LuaJIT `LJ_TRERR_MCODEAL`) DEFERRED to Increment 2** (nothing needs rel32 yet).
-- Thread the arena into `compile` (add param) from `nativeFor`.
+Plan:
+1. Add `pub const SPILL_MAX` (comptime, e.g. 512 slots = 4 KiB). In `lower`/
+   `analyze`, **bail compile** (return null) if `alloc.spill_count > SPILL_MAX`.
+2. Emit the trampoline ONCE into the arena (lazily, store entry+shared_exit
+   absolute addrs on `McodeArena` or `TraceState`). Trampoline is C-callable
+   `fn(rdi=tags, rsi=payloads, rdx=*result, rcx=body_entry)`:
+   `push rbx;push rbp;push r12;push r13;push r14;push r15; sub rsp,SPILL_MAX*8
+   (16-aligned: 6 pushes keep %16==8, so SPILL_MAX*8 multiple of 16 → body
+   rsp%16==8 ✓); xor rbx,rbx; jmp rcx`. `shared_exit:` `add rsp,SPILL_MAX*8;
+   pop r15;pop r14;pop r13;pop r12;pop rbp;pop rbx; ret`.
+   NB: trampoline saves ALL of rbp/r12-r15 unconditionally (bodies then clobber
+   freely); needs its own tiny Assembler + arena.alloc, or hand-assemble bytes.
+3. In `lower`: DELETE the per-trace prologue push/sub (:3178-3181) and the
+   `callee[]`/`frame` computation used for it. Body starts at the hoisted
+   guards. rbx no longer zeroed here (trampoline does it).
+4. Replace every `emitTeardown(a, frame, callee…)` with `jmp shared_exit` —
+   absolute: `movabs rax, shared_exit_addr; jmp rax` (rax scratch post-flush).
+   The exit SITE still writes completed/exit_instr to [rdx] and does its flush;
+   only the frame teardown moves to shared_exit.
+5. `CompiledTrace` stores `body_entry` (= page.code.ptr) + the trampoline ptr;
+   `runWithLinkedLoopDone` calls `trampoline(tags,payloads,&result,body_entry)`.
+   Need a Zig fn-ptr type `fn([*]u8,[*]u64,*NativeResult, *const anyopaque)
+   callconv(.c) void` for the trampoline.
+6. Gate: `just test`; nsieve byte-identical tier-0/tier-1a/native; bench flat.
 
-**Gate:** `just test` green; 10-mode matrix nsieve byte-identical (single unique
-block: `./zig-out/bin/lune [--trace [--jit-native]] nsieve.lua 9 | sort -u`).
+Watch: `.loop` stays local `jmp loop_top`. The two standalone exec-memory tests
+(:5247,:5280) + `compile(gpa,t)` test path build owned pages and call
+`page.entry` directly — they DON'T use the trampoline. Decide: either give the
+test path its own trampoline, or keep `compile` emitting the old self-framed ABI
+and only `compileInto` (production) uses the trampoline. Simplest: keep the old
+self-framed prologue/epilogue behind an `arena==null` flag in `compileImpl`, new
+frameless path when `arena!=null`. (Slightly more code but keeps ~60 tests
+untouched and gives a built-in A/B of the two ABIs.)
 
-## SEMANTIC CHANGE to flag to Bart before/at commit
-Increment 1 makes trace retirement stop freeing mcode immediately (faithful to
-LuaJIT; flush-all deferred). If Bart wants per-trace reclaim kept, the arena
-needs a free-list instead — ask before relying on the no-reclaim policy.
-
-## Then: Increment 2 (frameless trampoline + bare-jmp links) → Increment 3
-(port lj_asm_patchexit + unpatch-on-retire). See doc 17 §Phasing.
+Then 2.2 ChainResult+stable-id, 2.3 link-slot population (.link → guard →
+loop-done), 2.4 P-F flag verification. Increment 3 = patchexit + P-E.
 
 ## Untracked files that belong to OTHER agents — do NOT stage
 `CURRENT_TASK_E3.md`, `bench/results/*.tsv`, and similar.
