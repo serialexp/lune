@@ -869,6 +869,13 @@ pub const Assembler = struct {
         self.labels.items[l.id] = self.code.items.len;
     }
 
+    /// The byte offset a bound label resolves to (its position in `code`). Valid
+    /// after `bind`; `resolve()` never moves bound labels, so the value is final
+    /// once bound. Used to recover a secondary entry point's address after mapping.
+    pub fn labelOffset(self: *const Assembler, l: Label) usize {
+        return self.labels.items[l.id].?;
+    }
+
     fn recordFixup(self: *Assembler, l: Label) !void {
         try self.fixups.append(self.gpa, .{ .at = self.code.items.len, .label = l.id });
         try self.imm32(0); // rel32 placeholder, patched in resolve()

@@ -613,6 +613,16 @@ pub const CompiledTrace = struct {
     /// The allocator that owns `slots` (needed at `deinit`, which has no other handle
     /// to a gpa — the page frees itself through its own owner).
     gpa: std.mem.Allocator = undefined,
+    /// Secondary entry point (doc 17 Increment 2.3b-0): absolute address of the
+    /// `linked_entry` stub, which presets `NativeResult.linked_loop_done = 1` then
+    /// falls through to `body_entry`. When a native parent arms a `.link`-terminal
+    /// handoff into this trace (2.3b-1), the slot targets THIS address, not
+    /// `page.code.ptr`, so the child materializes its numeric-for loop-done in linked
+    /// mode (commit the final iteration) exactly as `runLinkedLoopDone` would — a bare
+    /// jump to the body would leave `linked_loop_done = 0` and mis-deopt. `null` for
+    /// self-framed test pages (never chained) and non-frameless builds. Points into
+    /// the same owned `page`, so it needs no separate free.
+    linked_entry: ?usize = null,
 
     pub const EntryFn = fn ([*]u8, [*]u64, *NativeResult) callconv(.c) void;
     /// The shared frameless trampoline's C-ABI type: SoA lanes + result out-param,
@@ -764,7 +774,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit, slots) catch {
+    const linked_entry_off = lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit, slots) catch {
         if (slots.len > 0) gpa.free(slots);
         return null;
     };
@@ -780,7 +790,18 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
             if (slots.len > 0) gpa.free(slots);
             return null;
         };
-    return .{ .page = page, .trampoline_entry = tramp_entry, .slots = slots, .gpa = gpa };
+    // Resolve the linked-entry stub's absolute address (base + its byte offset). It
+    // lives in the same mapped `page`, so it is freed with the page — no extra owner.
+    const linked_entry: ?usize = if (linked_entry_off) |off|
+        @intFromPtr(page.code.ptr) + off
+    else
+        null;
+    // Wiring invariant (2.3b-0): a frameless production body (arena present ⟺
+    // shared_exit set) ALWAYS emits a linked_entry stub; a self-framed test page never
+    // does. Pins that the mechanism produces a real secondary entry before 2.3b-1
+    // arms a slot to it.
+    std.debug.assert((arena != null) == (linked_entry != null));
+    return .{ .page = page, .trampoline_entry = tramp_entry, .slots = slots, .gpa = gpa, .linked_entry = linked_entry };
 }
 
 /// Forward type-proof over the linear SSA. Fills `kinds` (and `slot_of`, the
@@ -3346,7 +3367,7 @@ fn emitLinkedLoopDoneSnapshot(
 /// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
 /// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
 /// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
-fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize) !void {
+fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize) !?usize {
     const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(exit_labels);
     @memset(exit_labels, null);
@@ -3386,15 +3407,19 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         if (frame > 0) try a.subRegImm32(.rsp, frame);
     }
 
-    // 2.3b-0 (doc 17): snapshot the entry value of the `rbx` iteration counter into
-    // the result so the Zig wrapper can recover this body's OWN committed count as
+    // 2.3b-0 (doc 17): `body_entry` — the trace's real entry, reached fresh from the
+    // trampoline (`page.code.ptr`) OR fallen-through from the `linked_entry` stub
+    // emitted at the end (which presets `linked_loop_done` for a chained handoff).
+    const body_entry = try a.label();
+    a.bind(body_entry);
+    // Snapshot the entry value of the `rbx` iteration counter into the result so the
+    // Zig wrapper can recover this body's OWN committed count as
     // `completed − entry_rbx`. This is the first body instruction (rbx is already
-    // zeroed — trampoline for frameless, the `xor` above for self-framed), so it also
-    // marks `body_entry`: a chained parent (2.3b-1) jumps into the linked-entry stub,
-    // which presets `linked_loop_done` then falls through to here, and a child entered
-    // that way inherits the parent's cumulative `rbx` — recorded here, subtracted out
-    // by the wrapper. rdx holds `*NativeResult` for the whole body. Un-fused, rbx = 0,
-    // so this stores 0 and the result's `local_completed == completed` (asserted).
+    // zeroed — trampoline for frameless, the `xor` above for self-framed). A child
+    // entered via `linked_entry` (2.3b-1) inherits the parent's cumulative `rbx` —
+    // recorded here, subtracted out by the wrapper. rdx holds `*NativeResult` for the
+    // whole body. Un-fused, rbx = 0, so this stores 0 and `local_completed ==
+    // completed` (asserted in the wrapper).
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "entry_rbx"), .rbx);
 
     const loop_top = try a.label();
@@ -4307,6 +4332,27 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), -1);
     try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
+
+    // LINKED_ENTRY (doc 17, 2.3b-0): a secondary entry point for an armed native
+    // `.link`-terminal handoff. A parent whose slot is armed into THIS trace targets
+    // this stub instead of `body_entry` so a numeric-for loop-done inside this body
+    // materializes in linked mode (commit the final iteration + phi snapshot, then
+    // hand to its continuation) exactly as `runLinkedLoopDone` sets up. It presets
+    // `linked_loop_done = 1` — a plain dword store to the low half suffices: the
+    // wrapper inits the full u64 to 0/1 so the high half is already 0, and the reader
+    // (`cmpQwordMemImm8 … , 0; jne`) only tests non-zero — then falls through to
+    // `body_entry` (which snapshots `entry_rbx` and runs the hoisted guards). Emitted
+    // only on the frameless production path; self-framed test pages never chain, so
+    // their `linked_entry` stays `null`. INERT until 2.3b-1 arms a slot to it.
+    var linked_entry_off: ?usize = null;
+    if (shared_exit != null) {
+        const linked_entry = try a.label();
+        a.bind(linked_entry);
+        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 1);
+        try a.jmp(body_entry);
+        linked_entry_off = a.labelOffset(linked_entry);
+    }
+    return linked_entry_off;
 }
 
 // ---------------------------------------------------------------------------
