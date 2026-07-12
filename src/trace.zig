@@ -1611,16 +1611,19 @@ pub const TraceState = struct {
                         // here; both were once `true` and both produced phantom iterations
                         // whose inner body never ran (stranding that iteration's work when
                         // tier-0 resumed post-inner):
-                        //  - `exit_instr == maxInt`: native `prologue_fail` (nativegen bakes
-                        //    `exit_instr = -1` when a hoisted entry guard fails before the
-                        //    body commits any of ITS own iterations). Under fusion the child
-                        //    inherits the parent's cumulative `rbx`, so `local_completed == 0`
-                        //    — the child ran zero inner trips, NOT a completion.
+                        //  - `.prologue_fail` reason (2.3c-0b): a hoisted entry guard failed
+                        //    before the child body committed any of ITS own iterations, so
+                        //    `local_completed == 0` — zero inner trips, NOT a completion. Keyed
+                        //    on the explicit reason now rather than the `exit_instr == maxInt`
+                        //    artifact; the `maxInt` disjunct is retained purely as OOB
+                        //    protection for the `dinner.instrs[exit_instr]` index below (on
+                        //    native the two always coincide, so this is byte-identical).
                         //  - `guardExitPc == null`: an ARRAY guard (`guard_fits`/`guard_lane`/
                         //    `guard_bounds`, which repurpose `aux` as a lane ordinal, not a
                         //    PC) — a mid-loop grow/bounds deopt (the `guard_fits` first-trip
                         //    deopt that surfaced this whole class).
-                        const fdone = if (cresult.exit_instr == std.math.maxInt(u32))
+                        const fdone = if (cresult.exit_reason == .prologue_fail or
+                            cresult.exit_instr == std.math.maxInt(u32))
                             false
                         else if (guardExitPc(dinner.instrs[cresult.exit_instr])) |fpc|
                             fpc >= 1 and proto.code[fpc - 1].op == .for_loop

@@ -62,6 +62,27 @@ const Trace = trace.Trace;
 /// records 4 billion traces).
 pub const NO_TRACE_ID: u32 = std.math.maxInt(u32);
 
+/// Why a (possibly chained) native run left its final body. Distinct from
+/// `exit_instr` because `exit_instr == maxInt` is overloaded: on tier-1a it means
+/// "ran to natural completion" (a real, productive exit), while on native it is ALSO
+/// baked by `prologue_fail` (a hoisted entry-type guard failed BEFORE the body
+/// committed any of its own iterations — no guard identity, zero local progress).
+/// 2.3c-0b (doc 17) splits those apart so the dispatcher/`driveChain` can model a
+/// chained child that prologue-fails after the parent committed as three independent
+/// facts (final = child, `local_completed == 0`, chain `completed > 0`) instead of
+/// re-deriving intent from the `maxInt` artifact. Backed `u32` so it matches the
+/// JIT-emitted `movMemImm32` store into `NativeResult`.
+pub const ExitReason = enum(u32) {
+    /// A guard / terminal / loop-done exit with a valid `exit_instr`, OR a tier-1a
+    /// clean loop completion (`exit_instr == maxInt`, `completed > 0`). In every case
+    /// `exit_instr`/`completed` mean exactly what they say.
+    normal = 0,
+    /// Native only: a hoisted entry-type guard failed pre-commit. `exit_instr` carries
+    /// no guard identity (`maxInt`); `local_completed == 0` even when the enclosing
+    /// chain holds nonzero cumulative progress in `completed`.
+    prologue_fail = 1,
+};
+
 /// Result of executing a trace.
 pub const ExecResult = struct {
     /// Number of loop iterations that committed cleanly.
@@ -91,6 +112,13 @@ pub const ExecResult = struct {
     /// `completed` directly (a single `execute` is never fused, so its local count IS
     /// its `completed`).
     local_completed: usize = 0,
+    /// 2.3c-0b (doc 17): why the final body exited, disambiguating the overloaded
+    /// `exit_instr == maxInt`. Native marshals it from `NativeResult.exit_reason`;
+    /// tier-1a leaves it `.normal` (a single `execute` either takes a real guard exit
+    /// or completes cleanly — it has no hoisted-entry-guard prologue to fail).
+    /// Defaulted so the ~40 tier-1a construction sites are untouched; only ever READ on
+    /// the native chained path (`driveChain`, `tier == .native_only`).
+    exit_reason: ExitReason = .normal,
 };
 
 /// Commit the final numeric-`for` iteration at a loop-done side exit so a linked

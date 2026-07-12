@@ -586,6 +586,13 @@ const NativeResult = extern struct {
     /// (each body's entry overwrites it), so the returned value always describes the
     /// final trace. Not consumed by the host — pure scratch that rides in the result.
     entry_rbx: usize,
+    /// 2.3c-0b (doc 17): why the final body exited — `irinterp.ExitReason` as a raw
+    /// `u32`. The wrapper inits it to `.normal` (0); ONLY the `prologue_fail` stub
+    /// overwrites it (to 1) via `movMemImm32`, so it splits a native prologue-fail from
+    /// the tier-1a "ran to completion" meaning of `exit_instr == maxInt`. Written by
+    /// whichever body performs the FINAL exit (each exit path either leaves it 0 or, at
+    /// prologue_fail, sets 1), so the returned value describes the final trace.
+    exit_reason: u32,
 };
 
 /// A compiled trace: an executable page whose entry is
@@ -664,6 +671,7 @@ pub const CompiledTrace = struct {
             .linked_loop_done = if (linked_loop_done) 1 else 0,
             .final_trace_id = irinterp.NO_TRACE_ID,
             .entry_rbx = 0,
+            .exit_reason = @intFromEnum(irinterp.ExitReason.normal),
         };
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
@@ -685,6 +693,7 @@ pub const CompiledTrace = struct {
             .exit_instr = result.exit_instr,
             .final_trace_id = result.final_trace_id,
             .local_completed = local,
+            .exit_reason = @enumFromInt(result.exit_reason),
         };
     }
 
@@ -4359,6 +4368,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     a.bind(prologue_fail);
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), -1);
+    // 2.3c-0b: stamp the reason so a consumer distinguishes THIS (native prologue-fail,
+    // no local progress) from a tier-1a clean completion — both otherwise show
+    // `exit_instr == maxInt`. Only this stub writes a non-`.normal` reason.
+    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(irinterp.ExitReason.prologue_fail));
     try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
 
     // LINKED_ENTRY (doc 17, 2.3b-0): a secondary entry point for an armed native
