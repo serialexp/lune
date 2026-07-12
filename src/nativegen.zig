@@ -589,6 +589,19 @@ pub const CompiledTrace = struct {
     /// directly as `EntryFn`. Non-null → the page is a frameless body; run it by
     /// calling this shared trampoline with `page.code.ptr` as the body_entry arg.
     trampoline_entry: ?usize = null,
+    /// Link-slot table (doc 17 Increment 2.3), one 8-byte absolute target per IR
+    /// instruction index. A chainable exit (`.link` terminal / linked-loop-done stub)
+    /// jumps through `jmp qword [&slots[i]]`; the default value is the shared
+    /// trampoline teardown (`shared_exit`), so an unarmed slot behaves exactly like
+    /// 2.1's direct `jmp shared_exit`. `driveChain` arms a slot (2.3b+) by storing a
+    /// child's frameless body entry into it — a plain data write (the array is
+    /// ordinary GPA heap memory, always RW; no `mprotect`, no rel32 constraint since
+    /// the exit loads the slot address as a full imm64). Empty for self-framed test
+    /// pages (`trampoline_entry == null`). Owned; freed in `deinit` via `gpa`.
+    slots: []usize = &.{},
+    /// The allocator that owns `slots` (needed at `deinit`, which has no other handle
+    /// to a gpa — the page frees itself through its own owner).
+    gpa: std.mem.Allocator = undefined,
 
     pub const EntryFn = fn ([*]u8, [*]u64, *NativeResult) callconv(.c) void;
     /// The shared frameless trampoline's C-ABI type: SoA lanes + result out-param,
@@ -630,6 +643,7 @@ pub const CompiledTrace = struct {
 
     pub fn deinit(self: *CompiledTrace) void {
         self.page.deinit();
+        if (self.slots.len > 0) self.gpa.free(self.slots);
         self.* = undefined;
     }
 };
@@ -705,6 +719,13 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
     // built-in A/B of the two ABIs over the same lowered trace.
     var shared_exit: ?usize = null;
     var tramp_entry: ?usize = null;
+    // Link-slot table (doc 17 Increment 2.3), one usize per IR instr index. Allocated
+    // only on the frameless production path (the self-framed test page has no shared
+    // trampoline to default to and never chains). Every slot defaults to `shared_exit`,
+    // so an unarmed exit behaves exactly like 2.1's direct jump — the table is inert
+    // until `driveChain` arms a slot. Its address must be stable *before* `lower` bakes
+    // `&slots[i]` as an imm64, so it is allocated here and handed in.
+    var slots: []usize = &.{};
     if (arena) |ar| {
         // A frameless body may only address SPILL_MAX spill slots (the trampoline
         // reserves exactly that many). Beyond it → bail to tier-1a.
@@ -712,18 +733,29 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
         const tr = ar.ensureTrampoline() catch return null;
         shared_exit = tr.shared_exit;
         tramp_entry = tr.entry;
+        slots = gpa.alloc(usize, n) catch return null;
+        @memset(slots, tr.shared_exit);
     }
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit) catch return null;
+    lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit, slots) catch {
+        if (slots.len > 0) gpa.free(slots);
+        return null;
+    };
     asm_buf.resolve();
 
     const page = if (arena) |a|
-        a.alloc(asm_buf.code.items) catch return null
+        a.alloc(asm_buf.code.items) catch {
+            if (slots.len > 0) gpa.free(slots);
+            return null;
+        }
     else
-        mapExecutable(asm_buf.code.items) catch return null;
-    return .{ .page = page, .trampoline_entry = tramp_entry };
+        mapExecutable(asm_buf.code.items) catch {
+            if (slots.len > 0) gpa.free(slots);
+            return null;
+        };
+    return .{ .page = page, .trampoline_entry = tramp_entry, .slots = slots, .gpa = gpa };
 }
 
 /// Forward type-proof over the linear SSA. Fills `kinds` (and `slot_of`, the
@@ -2986,20 +3018,43 @@ fn emitTeardown(a: *x64.Assembler, frame: i32, callee: []const Reg) !void {
 
 /// Emit a trace's return path. Self-framed (`shared_exit == null`, test path): tear
 /// down the per-trace frame + callee-saved and `ret`. Frameless (`shared_exit` set,
-/// production path): the shared trampoline owns the frame, so just jump to its
-/// teardown at the absolute address. rax is dead scratch at every exit site (the
-/// slot flush + result writes are already done), so it is free to hold the target.
-fn emitReturn(a: *x64.Assembler, frame: i32, callee: []const Reg, shared_exit: ?usize, trace_id: u32) !void {
+/// production path): the shared trampoline owns the frame, so just leave to its
+/// teardown. rax is dead scratch at every exit site (the slot flush + result writes
+/// are already done), so it is free to hold the target address.
+///
+/// `slot_addr` (doc 17 Increment 2.3) is the absolute address of this exit's link
+/// slot when the exit is *chainable* (the `.link` terminal / a linked-loop-done
+/// stub). When set (frameless only), the exit becomes an indirect
+/// `movabs rax, slot_addr; jmp qword [rax]` — the slot holds `shared_exit` by default
+/// (byte-identical to the direct jump) and a child body entry once `driveChain` arms
+/// it. When null, the exit jumps directly to `shared_exit` as in 2.1 (used by the
+/// non-chainable `deopt_exit` fallback and `prologue_fail`).
+fn emitReturn(a: *x64.Assembler, frame: i32, callee: []const Reg, shared_exit: ?usize, trace_id: u32, slot_addr: ?usize) !void {
     // P-B (doc 17): stamp the final trace's stable id into the result. rdx still holds
     // the *NativeResult at every exit site (it is reserved for the whole body). Baked
     // as an imm32 (the trace's own id here; a linked child overwrites it in 2.3).
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(trace_id));
     if (shared_exit) |se| {
-        try a.movRegImm64(.rax, @bitCast(@as(u64, se)));
-        try a.jmpReg(.rax);
+        if (slot_addr) |sa| {
+            // Indirect through the link slot: load the slot's absolute address, jump
+            // through its current target (default `shared_exit`, or an armed child).
+            try a.movRegImm64(.rax, @bitCast(@as(u64, sa)));
+            try a.jmpMem(.rax, 0);
+        } else {
+            try a.movRegImm64(.rax, @bitCast(@as(u64, se)));
+            try a.jmpReg(.rax);
+        }
     } else {
         try emitTeardown(a, frame, callee);
     }
+}
+
+/// Absolute address of the link slot for IR instruction `idx`, or null when there is
+/// no slot table (self-framed test page). Baked into the exit as an imm64 so the
+/// `jmp qword [rax]` reaches the slot regardless of where the heap array lives.
+fn slotAddr(slots: []usize, idx: usize) ?usize {
+    if (slots.len == 0) return null;
+    return @intFromPtr(&slots[idx]);
 }
 
 fn nativeExitLabel(a: *x64.Assembler, exit_labels: []?x64.Label, instr_idx: usize) !x64.Label {
@@ -3266,7 +3321,7 @@ fn emitLinkedLoopDoneSnapshot(
 /// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
 /// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
 /// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
-fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize) !void {
+fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize) !void {
     const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(exit_labels);
     @memset(exit_labels, null);
@@ -4123,7 +4178,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 }
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
                 try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
-                try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id);
+                // Chainable: the `.link` terminal is a single-contract hand-off, so
+                // its exit jumps through slot[i] (default `shared_exit`, armed → child).
+                try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, slotAddr(slots, i));
             },
             // A φ emits no code in the body: a slot-bound φ's writeback is driven by
             // its slot's `.carried`/`.write_only` class above (the back-edge shuffle /
@@ -4170,7 +4227,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             a.bind(l);
             try emitLinkedLoopDoneSnapshot(a, t, kinds, alloc, ei);
             try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
-            try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id);
+            // Chainable: the linked-loop-done stub commits the post-guard state, then
+            // hands off through slot[ei] (default `shared_exit`, armed → continuation).
+            try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, slotAddr(slots, ei));
         }
     }
 
@@ -4186,15 +4245,19 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
     }
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
-    try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id);
+    // Non-chainable fallback: the shared deopt flush is the destination of every
+    // ordinary guard's mini-stub; it always returns to the dispatcher (`shared_exit`).
+    // Ordinary-guard arming (2.3c) intercepts at the per-guard mini-stub, not here.
+    try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
 
     // PROLOGUE_FAIL: a hoisted type guard failed before any commit. Return 0 with
     // regs[] untouched and no per-body guard identity (the cut-1 EXIT would have
-    // flushed half-initialized homes).
+    // flushed half-initialized homes). Never chainable (no child makes sense before
+    // the first committed iteration), so it jumps straight to `shared_exit`.
     a.bind(prologue_fail);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "completed"), 0);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), -1);
-    try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id);
+    try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
 }
 
 // ---------------------------------------------------------------------------

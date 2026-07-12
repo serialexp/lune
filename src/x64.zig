@@ -839,6 +839,17 @@ pub const Assembler = struct {
         try self.b(0xFF);
         try self.modrmReg(4, reg.lo());
     }
+    /// `jmp qword [base + disp]` — FF /4 with a memory operand. Absolute indirect
+    /// near jump: the 64-bit target is *loaded from memory* at `[base+disp]`. This is
+    /// the frameless link-slot handoff (doc 17 Increment 2.3): a side-exit loads its
+    /// per-exit slot (default = the shared trampoline teardown, or an armed child body
+    /// entry) into an address register and jumps through it. Mirrors `jmpReg` but with
+    /// a `[base+disp]` ModRM instead of a register-direct one.
+    pub fn jmpMem(self: *Assembler, base: Reg, disp: i32) !void {
+        if (base.hi()) try self.b(0x41);
+        try self.b(0xFF);
+        try self.modrmMem(4, base, disp);
+    }
     /// `ret` — C3.
     pub fn ret(self: *Assembler) !void {
         try self.b(0xC3);
@@ -1519,6 +1530,23 @@ test "enc: sar reg, cl / sar reg, imm8" {
     try expectEnc(&.{ 0x41, 0xFF, 0xE7 }, struct { // jmp r15 (REX.B)
         fn f(a: *Assembler) !void {
             try a.jmpReg(.r15);
+        }
+    }.f);
+
+    // jmp qword [mem] — FF /4 (memory form, the link-slot handoff)
+    try expectEnc(&.{ 0xFF, 0x20 }, struct { // jmp qword [rax]
+        fn f(a: *Assembler) !void {
+            try a.jmpMem(.rax, 0);
+        }
+    }.f);
+    try expectEnc(&.{ 0xFF, 0x60, 0x08 }, struct { // jmp qword [rax+8] (disp8)
+        fn f(a: *Assembler) !void {
+            try a.jmpMem(.rax, 8);
+        }
+    }.f);
+    try expectEnc(&.{ 0x41, 0xFF, 0x20 }, struct { // jmp qword [r8] (REX.B)
+        fn f(a: *Assembler) !void {
+            try a.jmpMem(.r8, 0);
         }
     }.f);
 }

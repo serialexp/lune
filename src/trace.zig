@@ -831,6 +831,12 @@ inline fn hotIndex(proto: *const Proto, pc: u32) usize {
     return h & (HOTCOUNT_SIZE - 1);
 }
 
+/// One armed native link (P-E, doc 17 Increment 2.3): `parent`'s frameless exit slot
+/// at `slot_index` currently jumps straight into `child`'s body. Keyed by trace
+/// identity (not a raw slot address) so lifetime resets stay valid no matter which
+/// end retires first — the slot address is re-derived from the live `parent` at reset.
+pub const NativeLink = struct { parent: *Trace, slot_index: u32, child: *Trace };
+
 /// All recorder state owned by a `Vm`: the hotness counters, the cache of
 /// committed traces, and the single in-progress `Recorder`.
 pub const TraceState = struct {
@@ -867,6 +873,17 @@ pub const TraceState = struct {
     /// so a retired trace's id is never reassigned and a baked `final_trace_id` can
     /// never alias a different live trace.
     next_trace_id: u32 = 0,
+    /// Armed native links (P-E, doc 17 Increment 2.3). Each record is a `parent`
+    /// trace whose frameless exit slot `parent.native.compiled.slots[slot_index]` has
+    /// been written to jump directly into `child`'s body. Kept so a retiring trace can
+    /// be made lifetime-safe: when `child` is destroyed its arena slot returns to the
+    /// reuse free-list and could be overwritten by unrelated code, so every parent
+    /// slot pointing at it must first be reset to `shared_exit`; and when `parent` is
+    /// destroyed its slot array is freed, so its records must be dropped before any
+    /// child-retire tries to write through them. `resetLinksTouching` handles both
+    /// directions by trace *identity* (never a raw slot pointer), so it is correct
+    /// regardless of retire order. Empty until arming lands (2.3b) → inert in 2.3a.
+    armed_links: std.ArrayListUnmanaged(NativeLink) = .empty,
     /// Anchors currently held off tier-1 with a doubling cooldown (`Gate`). Set
     /// when a recording aborts, a commit fails, or the low-yield re-entry penalty
     /// maxes out. Unlike the old permanent blacklist, an anchor here is *retried*
@@ -1006,6 +1023,7 @@ pub const TraceState = struct {
         self.exec_logs.deinit(self.gpa);
         self.abort_log.deinit(self.gpa);
         if (self.exec_recorder) |*r| r.deinit();
+        self.armed_links.deinit(self.gpa);
         // Free each trace (its `native.deinit()` returns mcode slots to the arena's
         // free-list) *before* tearing down the arena those slots live in.
         for (self.cache.items) |t| t.destroy(self.gpa);
@@ -1777,10 +1795,67 @@ pub const TraceState = struct {
     /// never invalidates pointers to the others — but the caller must NOT be
     /// mid-iteration over the cache through this trace (see the dispatch loop,
     /// which defers eviction until after its same-anchor walk completes).
+    /// Arm a native link (P-E, doc 17 Increment 2.3): point `parent`'s frameless exit
+    /// slot at `slot_index` to the absolute `target` (a child body entry), and record
+    /// the dependency so the link can be reset if either end retires. Re-arming the
+    /// same slot supersedes the prior record. No-op (returns) if `parent` is not a
+    /// compiled frameless trace or the slot index is out of range. The registry append
+    /// happens *before* the slot write so an OOM can never leave an armed-but-untracked
+    /// slot (which would dangle on the child's retire).
+    pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, target: usize) !void {
+        const c = switch (parent.native) {
+            .compiled => |*cc| cc,
+            else => return,
+        };
+        if (slot_index >= c.slots.len) return;
+        // A re-arm of this exact slot supersedes any prior child it pointed at.
+        var i: usize = self.armed_links.items.len;
+        while (i > 0) {
+            i -= 1;
+            const l = self.armed_links.items[i];
+            if (l.parent == parent and l.slot_index == slot_index) _ = self.armed_links.swapRemove(i);
+        }
+        try self.armed_links.append(self.gpa, .{ .parent = parent, .slot_index = slot_index, .child = child });
+        c.slots[slot_index] = target;
+    }
+
+    /// Lifetime-safe teardown of every armed link touching `t` (P-E, doc 17). Called
+    /// *before* `t.destroy` in `removeTrace`. Two directions, both keyed by trace
+    /// identity so the result is independent of which end retires first:
+    ///   - `t` is a link *target* (child): reset each surviving parent's slot back to
+    ///     `shared_exit`, so once `t`'s arena slot returns to the reuse free-list no
+    ///     parent still jumps into what may become foreign code.
+    ///   - `t` is a link *source* (parent): its slot array is about to be freed, so
+    ///     just drop the record (no slot to preserve) — a later child-retire must not
+    ///     write through the freed slot.
+    /// The slot address is re-derived from the live `parent` here, never cached, so it
+    /// is always valid at the moment of the write.
+    pub fn resetLinksTouching(self: *TraceState, t: *Trace) void {
+        const shared_exit = self.mcode_arena.trampoline_exit orelse 0;
+        var i: usize = self.armed_links.items.len;
+        while (i > 0) {
+            i -= 1;
+            const link = self.armed_links.items[i];
+            if (link.child != t and link.parent != t) continue;
+            if (link.child == t and link.parent != t) {
+                switch (link.parent.native) {
+                    .compiled => |*c| if (link.slot_index < c.slots.len) {
+                        c.slots[link.slot_index] = shared_exit;
+                    },
+                    else => {},
+                }
+            }
+            _ = self.armed_links.swapRemove(i);
+        }
+    }
+
     pub fn removeTrace(self: *TraceState, t: *Trace) void {
         for (self.cache.items, 0..) |c, idx| {
             if (c == t) {
                 const anchor = t.anchor;
+                // P-E: reset/drop every armed native link touching `t` before its
+                // mcode slot can be freed and reused (see `resetLinksTouching`).
+                self.resetLinksTouching(t);
                 _ = self.cache.swapRemove(idx);
                 t.destroy(self.gpa);
                 // Reopen the anchor for re-recording. `onBackEdge` only arms when
@@ -4803,6 +4878,90 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
     // are stack memory, so skip those fields by not calling destroy).
     gpa.destroy(trace_a);
     gpa.destroy(trace_b);
+}
+
+test "armNativeLink / resetLinksTouching: P-E registry directionality" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    // No trampoline is built in this unit test, so the value a reset restores
+    // (the "unarmed" slot) is `trampoline_exit orelse 0` == 0.
+    const SHARED_EXIT: usize = 0;
+    try testing.expectEqual(@as(?usize, null), state.mcode_arena.trampoline_exit);
+
+    // Two compiled-trace stubs. Only `.slots` is touched by the registry, so the
+    // `.page` may stay undefined and we never call `destroy` on these.
+    const parent_slots = try gpa.alloc(usize, 3);
+    defer gpa.free(parent_slots);
+    @memset(parent_slots, SHARED_EXIT);
+    const child_slots = try gpa.alloc(usize, 1);
+    defer gpa.free(child_slots);
+    @memset(child_slots, SHARED_EXIT);
+
+    var parent: Trace = .{
+        .anchor = undefined,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = parent_slots, .gpa = gpa } },
+    };
+    var child: Trace = .{
+        .anchor = undefined,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = child_slots, .gpa = gpa } },
+    };
+
+    const CHILD_BODY: usize = 0xDEAD_BEEF;
+
+    // Arm: slot 1 of parent points at the child body; exactly one record tracked.
+    try state.armNativeLink(&parent, 1, &child, CHILD_BODY);
+    try testing.expectEqual(CHILD_BODY, parent_slots[1]);
+    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+
+    // Re-arming the SAME slot supersedes the prior record (no duplicate).
+    const CHILD_BODY2: usize = 0xF00D;
+    try state.armNativeLink(&parent, 1, &child, CHILD_BODY2);
+    try testing.expectEqual(CHILD_BODY2, parent_slots[1]);
+    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+
+    // Child retires (target side): parent's slot resets to shared_exit, record dropped.
+    state.resetLinksTouching(&child);
+    try testing.expectEqual(SHARED_EXIT, parent_slots[1]);
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+
+    // Out-of-range slot index is a no-op (no OOB write, no record appended).
+    try state.armNativeLink(&parent, 99, &child, CHILD_BODY);
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+
+    // A non-compiled parent is a no-op.
+    var unsup: Trace = .{
+        .anchor = undefined,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .unsupported,
+    };
+    try state.armNativeLink(&unsup, 0, &child, CHILD_BODY);
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+
+    // Parent-retire direction: re-arm, then reset touching the PARENT (source).
+    // The record is dropped WITHOUT writing through the (about-to-be-freed) slot,
+    // and a subsequent child-retire must find no record — no write, no crash.
+    try state.armNativeLink(&parent, 2, &child, CHILD_BODY);
+    try testing.expectEqual(CHILD_BODY, parent_slots[2]);
+    state.resetLinksTouching(&parent);
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    // A parent-side reset leaves the slot value untouched (its array is freed anyway).
+    try testing.expectEqual(CHILD_BODY, parent_slots[2]);
+    // Later child-retire is a clean no-op now that the record is gone.
+    state.resetLinksTouching(&child);
+    try testing.expectEqual(CHILD_BODY, parent_slots[2]);
 }
 
 test "driveChain ordinary_header: chains at the anchor, not a guard's lane ordinal" {

@@ -1,8 +1,8 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
-Status: partial — Increment 1 (shared mcode arena, P-D), Increment 2.1 (frameless chain-entry ABI, P-A) and Increment 2.2 (chain-wide result contract, P-B) landed; all byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies now run frameless under one shared trampoline (`ensureTrampoline`); every native exit stub bakes the final trace's stable id into `NativeResult.final_trace_id`, resolved by the dispatcher via `traceById` (asserts `final == ct` while no link is armed). Next: Increment 2.3 link-slot population (P-C/P-G) — populate the id/link handoff from `driveChain` and route dispatcher consumers through `final`; then 2.4 P-F verification.
+Status: partial — Increment 1 (shared mcode arena, P-D), Increment 2.1 (frameless chain-entry ABI, P-A), Increment 2.2 (chain-wide result contract, P-B) and Increment 2.3a (indirect exit + link-slot table + P-E registry scaffolding) landed; all byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies now run frameless under one shared trampoline (`ensureTrampoline`); every native exit stub jumps through a per-exit heap-resident link slot (`jmp qword [&slots[i]]`, default = `shared_exit`) and bakes the final trace's stable id into `NativeResult.final_trace_id`, resolved by the dispatcher via `traceById` (asserts `final == ct` while no slot is armed). The P-E backlink registry (`armed_links` + `armNativeLink`/`resetLinksTouching`, reset before `destroy` in `removeTrace`) is wired but inert — nothing arms a slot yet. Next: Increment 2.3b — arm `.link`-terminal handoffs from `driveChain` (single-contract kind, no S1), drop the `final == ct` assert, route dispatcher consumers through `final`.
 Owner: Bart
-Last updated: 2026-07-11 (Increment 2.2 landed — chain-wide result contract, P-B; stable `Trace.id` + `NativeResult.final_trace_id` baked at every exit + `traceById` dispatcher resolve/assert; nsieve/nsieve-bit/fannkuch/mandelbrot/nbody/spectral-norm tier-0==native byte-identical, Debug asserts pass)
+Last updated: 2026-07-12 (Increment 2.3a landed — indirect `jmp [slot]` exit + per-trace heap-owned link-slot table defaulting to `shared_exit` + inert P-E backlink registry with a focused directionality unit test; nsieve/nsieve-bit/fannkuch/mandelbrot/nbody/spectral-norm tier-0==tier-1a==native byte-identical, `just bench --filter nsieve` flat within noise, Debug asserts pass — `final == ct` still holds since nothing is armed)
 
 Coherent-state chaining (doc 16) proved *correct* but *performance-neutral* on
 nsieve: the JIT compiles every hot loop to native code, chaining hands control
@@ -86,6 +86,33 @@ land; move whole sections to Done once everything inside is checked.
   `final` once child links populate a real id. (nsieve/nsieve-bit/fannkuch/
   mandelbrot/nbody/spectral-norm all tier-0==native; Debug asserts pass.)
 
+- [x] **Increment 2.3a — indirect exit + link-slot table + P-E registry
+  (byte-identical, nothing armed).** The direct `movabs rax, shared_exit; jmp rax`
+  exit becomes an indirect `movabs rax, &slot; jmp qword [rax]` (`x64.zig` gains
+  `jmpMem` (FF /4 memory form) + golden-byte tests). `CompiledTrace` gains an owned,
+  heap-allocated `slots: []usize` (one per IR instruction index) plus a `gpa` handle
+  for `deinit`; `compileImpl` allocates it *before* `lower` (so `&slot` is a stable
+  imm64) and default-fills every entry with `shared_exit`, so an unarmed slot is
+  behaviourally identical to 2.1's direct jump. `emitReturn` takes a `slot_addr:
+  ?usize` and bakes the indirect form when set (the `.link` terminal and loop-done
+  stub pass their slot; `deopt_exit`/`prologue_fail` pass `null` → unchanged, still
+  direct to `shared_exit`). The **P-E backlink registry** lands here as inert
+  scaffolding: `TraceState.armed_links: ArrayList(NativeLink{parent, slot_index,
+  child})`; `armNativeLink(parent, slot, child, target)` records the dependency (and
+  supersedes a prior same-slot record) then writes the slot; `resetLinksTouching(t)`
+  — called in `removeTrace` **before** `t.destroy` — resets each surviving parent's
+  slot back to `shared_exit` when `t` is a link *target* (child retires) and drops
+  the record when `t` is a link *source* (parent retires, slot array about to be
+  freed), re-deriving the slot address from the live parent so it's never a cached
+  dangling pointer. A focused unit test pins both retire directions, re-arm
+  supersede, and OOB/non-compiled no-ops. Chosen a flat trace-identity-keyed list
+  over the plan's `AutoHashMap(*Trace, ArrayList(*usize))` because keying on trace
+  identity (not cached slot pointers) makes reset correct regardless of retire order.
+  Nothing arms a slot yet, so `armed_links` is always empty and `final == ct` still
+  holds — provably inert. (nsieve/nsieve-bit/fannkuch/mandelbrot/nbody/spectral-norm
+  tier-0==tier-1a==native byte-identical; `just bench --filter nsieve` flat within
+  noise — one extra load per exit.)
+
 ### Outstanding
 
 **Blocking prerequisites — must be designed before any patch is safe** (peer
@@ -105,6 +132,10 @@ review, 2026-07-11; see §Blocking prerequisites for the argument):
   parent still patched to it would `jmp` into foreign code. Need dependency tracking
   + unpatch-on-retire before a freed slot may be reused (or pin patched-into slots
   out of the free-list / use trampolines). Strictly required once patching exists.
+  *Registry scaffolding landed in 2.3a* (`armed_links` + `armNativeLink`/
+  `resetLinksTouching`, reset before `destroy`); inert until 2.3b arms the first
+  slot. Still outstanding: exercise the reset under a real retire-then-reuse (widen
+  eviction) end-to-end — the 2.3d lifetime stress test.
 - [ ] **P-F — Determinism replication.** The patched path *skips*
   `onSideExit`/`hit_count`/penalty/gate/prime-side arming/lane-widen eviction
   (`interp.zig:2588,2605,2763`) — all of which steer *future* recording. Skipping
