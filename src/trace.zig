@@ -1802,21 +1802,41 @@ pub const TraceState = struct {
     /// compiled frameless trace or the slot index is out of range. The registry append
     /// happens *before* the slot write so an OOM can never leave an armed-but-untracked
     /// slot (which would dangle on the child's retire).
-    pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, target: usize) !void {
+    /// Returns `true` iff the link was actually armed (slot written + record kept).
+    /// Returns `false` for the no-op cases — `parent` is not a compiled frameless
+    /// trace, or `slot_index` is out of range — so the caller (2.3b `driveChain`)
+    /// can keep its accounting identical across modes (P-F): a slot that did not
+    /// arm must leave the dispatcher path unchanged.
+    ///
+    /// INVARIANT: this is the *only* place `CompiledTrace.slots[i]` is ever written
+    /// to a non-`shared_exit` value. The entire P-E lifetime argument (a retiring
+    /// child resets every parent slot pointing into it) depends on the registry
+    /// seeing every armed slot — a direct `c.slots[i] = target` elsewhere would
+    /// strand an untracked slot and reintroduce the S2 use-after-reuse.
+    pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, target: usize) !bool {
         const c = switch (parent.native) {
             .compiled => |*cc| cc,
-            else => return,
+            else => return false,
         };
-        if (slot_index >= c.slots.len) return;
+        if (slot_index >= c.slots.len) return false;
         // A re-arm of this exact slot supersedes any prior child it pointed at.
-        var i: usize = self.armed_links.items.len;
-        while (i > 0) {
-            i -= 1;
-            const l = self.armed_links.items[i];
-            if (l.parent == parent and l.slot_index == slot_index) _ = self.armed_links.swapRemove(i);
+        // Mutate the existing record IN PLACE (no allocation) — the earlier
+        // remove-then-append ordering could OOM after dropping the old record,
+        // stranding the slot armed-but-untracked (2.3a review BUG-1). Because at
+        // most one record exists per (parent, slot_index) — this loop guarantees
+        // it — the first match is the only match.
+        for (self.armed_links.items) |*l| {
+            if (l.parent == parent and l.slot_index == slot_index) {
+                l.child = child;
+                c.slots[slot_index] = target;
+                return true;
+            }
         }
+        // Fresh slot: append the record BEFORE writing the slot, so a failed append
+        // leaves the slot at its prior `shared_exit` value with no dangling record.
         try self.armed_links.append(self.gpa, .{ .parent = parent, .slot_index = slot_index, .child = child });
         c.slots[slot_index] = target;
+        return true;
     }
 
     /// Lifetime-safe teardown of every armed link touching `t` (P-E, doc 17). Called
@@ -4919,13 +4939,14 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
     const CHILD_BODY: usize = 0xDEAD_BEEF;
 
     // Arm: slot 1 of parent points at the child body; exactly one record tracked.
-    try state.armNativeLink(&parent, 1, &child, CHILD_BODY);
+    try testing.expect(try state.armNativeLink(&parent, 1, &child, CHILD_BODY));
     try testing.expectEqual(CHILD_BODY, parent_slots[1]);
     try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
 
-    // Re-arming the SAME slot supersedes the prior record (no duplicate).
+    // Re-arming the SAME slot supersedes the prior record IN PLACE (no duplicate,
+    // no realloc — the record count stays 1 and the new target is written).
     const CHILD_BODY2: usize = 0xF00D;
-    try state.armNativeLink(&parent, 1, &child, CHILD_BODY2);
+    try testing.expect(try state.armNativeLink(&parent, 1, &child, CHILD_BODY2));
     try testing.expectEqual(CHILD_BODY2, parent_slots[1]);
     try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
 
@@ -4934,11 +4955,11 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
     try testing.expectEqual(SHARED_EXIT, parent_slots[1]);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
 
-    // Out-of-range slot index is a no-op (no OOB write, no record appended).
-    try state.armNativeLink(&parent, 99, &child, CHILD_BODY);
+    // Out-of-range slot index is a no-op → returns false, no OOB write, no record.
+    try testing.expect(!try state.armNativeLink(&parent, 99, &child, CHILD_BODY));
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
 
-    // A non-compiled parent is a no-op.
+    // A non-compiled parent is a no-op → returns false.
     var unsup: Trace = .{
         .anchor = undefined,
         .instrs = &.{},
@@ -4947,13 +4968,13 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
         .entry_guards = &.{},
         .native = .unsupported,
     };
-    try state.armNativeLink(&unsup, 0, &child, CHILD_BODY);
+    try testing.expect(!try state.armNativeLink(&unsup, 0, &child, CHILD_BODY));
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
 
     // Parent-retire direction: re-arm, then reset touching the PARENT (source).
     // The record is dropped WITHOUT writing through the (about-to-be-freed) slot,
     // and a subsequent child-retire must find no record — no write, no crash.
-    try state.armNativeLink(&parent, 2, &child, CHILD_BODY);
+    try testing.expect(try state.armNativeLink(&parent, 2, &child, CHILD_BODY));
     try testing.expectEqual(CHILD_BODY, parent_slots[2]);
     state.resetLinksTouching(&parent);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);

@@ -119,22 +119,58 @@ its own `ct.id`, so `final == ct` holds and output is byte-identical.
 - `just bench --filter nsieve --reps 5`: jit ms flat (nsieve 94.2 vs 2.1's 91.5;
   nsieve-bit 53.8 vs 53.3; within noise — one extra load per exit is perf-neutral).
 
-## NEXT: Increment 2.3b — arm `.link`-terminal handoffs (P-C partial / P-G / P-F)
+## 2.3a foundation review (two independent models) — DONE, hardening landed
+
+Reviewed the `b8fc3fa` foundation with codex gpt-5.6-sol + a fable
+technical-architect pass (Bart's call: review the foundation now, not just at the
+end). Both returned **"approve with changes"** and converged: byte-identical holds,
+S2 reset ordering correct both directions, slot addressing sound, and the flat
+identity-keyed registry is genuinely *better* than the plan's pointer-map (which
+would dangle its cached `*usize` on parent-retire).
+
+**Hardening landed as a follow-up commit (still inert / byte-identical):**
+- **BUG-1 (real latent OOM-only UAF, mine):** `armNativeLink` re-arm did
+  `swapRemove(old)` then `try append(new)`; a failed append stranded the slot armed
+  but untracked → S2 UAF on the old child's retire. Fixed: mutate the record in
+  place on supersede (no allocation on the re-arm path). Doc comment corrected.
+- `armNativeLink` now returns `bool` (armed vs no-op) for P-F accounting; pinned
+  "only writer of `slots[i]`" invariant; unit test updated.
+- doc 17: recorded the `rdi`/`rsi` liveness contract (P-A) and the
+  slot-index-vs-exit-kind collision open question (P-C, blocks 2.3c).
+
+**Bart's decisions from the review:**
+- `armNativeLink` **keeps** the explicit `target` param + gets a Debug
+  bounds-assert (`target` within `child`'s page). Deferred to 2.3b because the
+  assert reads `child.page` → needs real compiled children (= fable's real
+  retire-then-reuse test, item 6).
+- **Pull S3 forward into 2.3b:** fix the chain-safe result contract (child
+  prologue-fail must carry cumulative `rbx` + a distinct reason, never
+  `completed=0`) BEFORE arming any slot, so the first arm is unconditionally
+  chain-safe. codex flagged this as a hard prerequisite to the first real arm.
+
+## NEXT: Increment 2.3b — arm `.link`-terminal handoffs (now incl. S3)
 
 Slot table + P-E registry exist but nothing arms a slot. 2.3b makes `driveChain`
 store a child's frameless body entry into the parent's slot for the **single-contract
 `.link` terminal only** (avoids S1 loop-done dual materialization):
+- **S3 result contract FIRST (pulled forward):** split `prologue_fail` so a child
+  whose entry guard fails *after* the parent committed writes cumulative `rbx` +
+  `final_trace_id=child` + a distinct reason, never `exit_instr=-1`/`completed=0`.
+- **Bounds-assert + BUG-2:** add the Debug `target`-within-`child`-page assert in
+  `armNativeLink` and the missing-trampoline assert in `resetLinksTouching`; add a
+  real retire-then-reuse lifetime test (arm, force `removeTrace`, assert parent slot
+  reset before the arena slot can be reused).
 - **Eligibility (P-G):** child `.compiled`, `inputs.len == 0`, exit kind `.link`.
 - **Arming point (P-F):** inside `driveChain` *after* the existing per-hop
   `onSideExit`/counters run, so every accounting side effect still happens; then
-  `armNativeLink(&parent, E, child, child.page.code.ptr)`.
+  `armNativeLink(&parent, E, child, child.page.code.ptr)` (now returns bool).
 - **Safepoint blackout:** do NOT arm when `suspend_ctl`/replay-line/exec-log active.
 - **Dispatcher (P-B payoff):** DROP `assert(final == ct)`; route consumers through
   `final` not `ct` — `last_exit_instr`, guard-fail counting
   (`final.instrs[exit_instr]`), `onSideExit(final,…)`, `maybeArmContinuation`,
   productive-branch counting, source-branch discrimination (interp.zig ~2586–2807).
-Then 2.3c (ordinary guards + loop-done, S1/S3), 2.3d (P-E retire-then-reuse stress
-test + lane-widen end-to-end + peer-review full diff). Increment 3 = full
+Then 2.3c (ordinary guards + loop-done, S1; slot-identity collision decision), 2.3d
+(P-E lane-widen end-to-end + peer-review full diff). Increment 3 = full
 `lj_asm_patchexit` port (guard-jump rel32 patching, no runtime re-entry).
 
 ## Unpushed local commits (Rule #15 — don't push unless asked)

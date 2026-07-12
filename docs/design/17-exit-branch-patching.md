@@ -69,6 +69,18 @@ land; move whole sections to Done once everything inside is checked.
   yet: exits still land on `shared_exit`, so behaviour is byte-identical (10-mode
   matrix green; nsieve + nsieve-bit + field_hash/grid/array all tier-0==native;
   nsieve jit ms flat vs the pre-change baseline).
+  - **ABI invariant made explicit (2.3a review, fable item 5).** When a slot is
+    armed (2.3b+) an exit becomes a bare `jmp` into a child body under the shared
+    frame, inheriting the parent's exit-time register state. That is only safe
+    because at every *chainable* exit the SoA lane registers `rdi` (tags) / `rsi`
+    (payloads) are guaranteed live-and-correct — the `.link` terminal and
+    linked-loop-done stub both flush φ/snapshot state through them immediately
+    before `emitReturn`. `rdx` (`*NativeResult`) and `rsp` (trampoline frame) are
+    body-reserved; `rbx` is the cumulative iteration counter carried *across* the
+    hop (its chain-wide meaning is P-B/P-G). This liveness is a **contract**, not an
+    accident: any new chainable exit kind must re-establish `rdi`/`rsi` before it
+    hands off. `rax` is dead scratch at every exit (used only to load the slot
+    address).
 - [x] **P-B — Chain-wide result contract (Increment 2.2).** `NativeResult` gains
   `final_trace_id: u32` — the stable id of the *final* trace in the chain, baked as
   an imm32 into every native exit stub (`emitReturn` writes it to
@@ -111,7 +123,18 @@ land; move whole sections to Done once everything inside is checked.
   Nothing arms a slot yet, so `armed_links` is always empty and `final == ct` still
   holds — provably inert. (nsieve/nsieve-bit/fannkuch/mandelbrot/nbody/spectral-norm
   tier-0==tier-1a==native byte-identical; `just bench --filter nsieve` flat within
-  noise — one extra load per exit.)
+  noise — one extra load per exit.) **Hardened post-landing** per an independent
+  two-model review (codex gpt-5.6-sol + a fable technical-architect pass, both
+  "approve with changes"): fixed a latent OOM-only re-arm UAF (BUG-1 — the
+  supersede path now mutates the record in place instead of remove-then-append, so a
+  failed append can never strand an armed-but-untracked slot); `armNativeLink` now
+  returns `bool` (armed vs no-op) for P-F accounting; pinned "`armNativeLink` is the
+  only writer of `slots[i]`" as an invariant. Deferred to 2.3b (need real compiled
+  pages / a live trampoline to exercise): the Debug `target`-within-`child`-page
+  bounds assert, the missing-trampoline assert (BUG-2), and a real
+  retire-then-reuse lifetime test (fable item 6). The slot-identity-vs-exit-kind
+  collision (2.3c) and the `rdi`/`rsi` liveness contract are recorded under P-C and
+  P-A above.
 
 ### Outstanding
 
@@ -124,6 +147,19 @@ review, 2026-07-11; see §Blocking prerequisites for the argument):
   return/materialization paths and post-loop coherent PCs. Each transition kind in
   nsieve's chain needs its own patch/link rule; patching only ordinary guards
   leaves most hops re-entering Zig.
+  - **OPEN QUESTION (2.3a review — decide before 2.3c arms ordinary guards):**
+    the slot table is indexed by *IR instruction index*, but that is an exit
+    *instruction* identity, not an exit *kind* identity. A numeric-for loop-done
+    guard at index `ei` has **two** logical exits sharing that index — the ordinary
+    deopt (chain to same-anchor sibling) and the linked-loop-done (materialize final
+    iteration, chain to continuation). 2.3a arms neither (only the `.link` terminal,
+    at the distinct terminal index), so there is no collision today. But if 2.3c
+    routes ordinary-guard failures through `slots[ei]` it collides with the
+    linked-loop-done target already using `slots[ei]`. Resolve by either (a) keying
+    physical slots on `(instr_index, exit_kind)` rather than raw index, or
+    (b) explicitly forbidding ordinary-link arming on numeric-loop-done guards and
+    documenting that it loses no required chain. Decide before 2.3b bakes consumers
+    around `exit_instr → slot index`.
 - [ ] **P-E — Patched-target lifetime / unpatching.** Since Increment 1 the arena
   keeps regions mapped for the whole run, so a stale patch is no longer a raw
   use-after-*unmap* — but it is now use-after-*reuse*: `removeTrace`→`destroy`
