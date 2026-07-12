@@ -1,8 +1,8 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
-Status: partial — Increment 1 (shared mcode arena, P-D), Increment 2.1 (frameless chain-entry ABI, P-A), Increment 2.2 (chain-wide result contract, P-B), Increment 2.3a (indirect exit + link-slot table + P-E registry scaffolding), and Increment 2.3b (2.3b-0 inert scaffolding + 2.3b-1 flip arming on) landed; all byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies run frameless under one shared trampoline (`ensureTrampoline`); every native exit stub jumps through a per-exit heap-resident link slot (`jmp qword [&slots[i]]`, default = `shared_exit`) and bakes the final trace's stable id into `NativeResult.final_trace_id`. As of 2.3b-1, `driveChain` ARMS the continuation's `.link`-terminal slot → `inner.linked_entry`, so a native run of the continuation fuses straight into the inner root under the shared frame (no ~600ns Zig re-entry per hop). The dispatcher resolves `final = traceById(final_trace_id)` STRICTLY on the native path (`@panic` on null, no `ct` fallback), and `final != ct` is now expected. `driveChain` drains fused results by resolving each child strictly by `final_trace_id` + `isInnerLoopRoot` shape check (unresolvable/mis-shaped ⇒ `@panic`, no unsafe resume). The P-E backlink registry (`armed_links` + `armNativeLink`/`resetLinksTouching`, reset before `destroy` in `removeTrace`) is now LIVE for `.link` slots. Next: Increment 2.3c — arm ordinary source-branch guards + loop-done (S1 dual materialization, S3 prologue-fail split). See §Implementation status → Outstanding.
+Status: partial — Increment 1 (shared mcode arena, P-D), Increment 2.1 (frameless chain-entry ABI, P-A), Increment 2.2 (chain-wide result contract, P-B), Increment 2.3a (indirect exit + link-slot table + P-E registry scaffolding), Increment 2.3b (2.3b-0 inert scaffolding + 2.3b-1 flip arming on), and Increment 2.3c-0 (inert contracts a–f + post-review blocker fixes: memory-staged `exit_target`, reserved-cell removal, `final`-first exclusion) landed; all byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies run frameless under one shared trampoline (`ensureTrampoline`); every native exit stub jumps through a per-exit heap-resident link slot (`jmp qword [&slots[i]]`, default = `shared_exit`) and bakes the final trace's stable id into `NativeResult.final_trace_id`. As of 2.3c-0f/blocker-fix, ordinary/loop-done-ordinary guards route through the shared `deopt_exit` flush, which dispatches the RESOLVED target via the flush-immune `NativeResult.exit_target` memory field (`jmp qword [rdx+exit_target]`) — no reserved slot cell, no rax-staged holder. As of 2.3b-1, `driveChain` ARMS the continuation's `.link`-terminal slot → `inner.linked_entry`, so a native run of the continuation fuses straight into the inner root under the shared frame (no ~600ns Zig re-entry per hop). The dispatcher resolves `final = traceById(final_trace_id)` STRICTLY on the native path (`@panic` on null, no `ct` fallback), and `final != ct` is now expected. `driveChain` drains fused results by resolving each child strictly by `final_trace_id` + `isInnerLoopRoot` shape check (unresolvable/mis-shaped ⇒ `@panic`, no unsafe resume). The P-E backlink registry (`armed_links` + `armNativeLink`/`resetLinksTouching`, reset before `destroy` in `removeTrace`) is now LIVE for `.link` slots. Next: Increment 2.3c — arm ordinary source-branch guards + loop-done (S1 dual materialization, S3 prologue-fail split). See §Implementation status → Outstanding.
 Owner: Bart
-Last updated: 2026-07-12 (Increment 2.3b-1 landed — flip `.link` arming on. `driveChain` arms the continuation's `.link` slot → `inner.linked_entry` (eligibility: `inner.compiled`, `inputs.len == 0`, terminal `.link` with `aux == inner_pc` re-read after the driver swap; `safe_to_arm` gate on `suspend_ctl`/`record_safepoint_lines`). Fused `snt.run` results drained by strict `traceById(final_trace_id)` + `isInnerLoopRoot` resolution — unresolvable/mis-shaped ⇒ `@panic` (no unsafe resume); loop-done vs. mid-loop classified via `guardExitPc` following `for_loop`; steering on the child's own `local_completed`. Dropped `assert(final == ct)` and the `entry_rbx == 0` assert; native dispatcher resolution strict (`@panic` on null, release too), tier-1a still uses `ct`. New `native_link_arms` counter. Peer-reviewed codex gpt-5.6-sol across 3 rounds — closed, no correctness blocker. `just test` green; 8-value N-sweep + 5 benchmarks byte-identical across tier-0/tier-1a/native. Deferred: native 9-completion bound reconcile (Issue 4), observation-window unpatching (Issue 5 → P-F).)
+Last updated: 2026-07-12 (Increment 2.3c-0 landed — inert contracts a–f, each its own byte-identical commit, then a codex gpt-5.6-sol contract review found 3 blockers, all closed: (1) the shared ordinary-guard flush staged its dispatch holder in rax, which `flushSlot`'s spilled-carried-home path clobbers — re-architected to stage the resolved target in a flush-immune `NativeResult.exit_target` and dispatch `jmp qword [rdx+exit_target]`; (2) that removed the reserved `slots[n]` "direct cell" entirely, so `slots.len == instrs.len` and no off-table cell is arm-addressable; (3) the dispatcher's sibling-retry exclusion now orders `final` FIRST so `driveChain`'s own 8-entry cap can't truncate the just-failed child. Proven load-bearing by a negative control (revert the tail to `jmp rax` → only the frameless carried-spill regression crashes). codex re-review: all closed, no new blocker. `just test` green; 6 benchmarks byte-identical tier-0/tier-1a/native. — earlier that day, Increment 2.3b-1: `driveChain` arms the continuation's `.link` slot → `inner.linked_entry` (eligibility: `inner.compiled`, `inputs.len == 0`, terminal `.link` with `aux == inner_pc` re-read after the driver swap; `safe_to_arm` gate on `suspend_ctl`/`record_safepoint_lines`). Fused `snt.run` results drained by strict `traceById(final_trace_id)` + `isInnerLoopRoot` resolution — unresolvable/mis-shaped ⇒ `@panic` (no unsafe resume); loop-done vs. mid-loop classified via `guardExitPc` following `for_loop`; steering on the child's own `local_completed`. Dropped `assert(final == ct)` and the `entry_rbx == 0` assert; native dispatcher resolution strict (`@panic` on null, release too), tier-1a still uses `ct`. New `native_link_arms` counter. Peer-reviewed codex gpt-5.6-sol across 3 rounds — closed, no correctness blocker. `just test` green; 8-value N-sweep + 5 benchmarks byte-identical across tier-0/tier-1a/native. Deferred: native 9-completion bound reconcile (Issue 4), observation-window unpatching (Issue 5 → P-F).)
 
 Coherent-state chaining (doc 16) proved *correct* but *performance-neutral* on
 nsieve: the JIT compiles every hot loop to native code, chaining hands control
@@ -135,6 +135,29 @@ land; move whole sections to Done once everything inside is checked.
   retire-then-reuse lifetime test (fable item 6). The slot-identity-vs-exit-kind
   collision (2.3c) and the `rdi`/`rsi` liveness contract are recorded under P-C and
   P-A above.
+- [x] **Increment 2.3c-0 — inert contracts (byte-identical, nothing armed).** Six
+  sub-steps, each its own commit + byte-identity sweep: (a) P-C option (b) invariant
+  enforced at emission (nativegen) + arming (`armNativeLink` + `ArmKind` + the
+  `isLoopDoneGuardIndex` classifier); (b) distinct `ExitReason.prologue_fail`
+  discriminator so `exit_instr == maxInt` no longer conflates "no guard identity" with
+  "prologue failed"; (c) `ordinary_entry` (mode 0) vs `linked_entry` (mode 1) secondary
+  entry-point contract; (d) routed the remaining `final != ct` consumers (widen-
+  eviction, `visited` exclusion, materialization class) through `final`; (e) disarm-on-
+  unsafe (`disarmAllLinks`, wired inert, load-bearing at 2.3c-2); (f) shared ordinary-
+  guard flush + default-slot tail — all slots default `shared_exit`, so byte-identical.
+  **Post-landing hardening (codex gpt-5.6-sol contract review → 3 blockers, all
+  closed):** (1) the 0f shared flush staged the dispatch holder in rax, which
+  `flushSlot`'s spilled-carried-home `.mem` path clobbers before the jump — re-architected
+  to stage the RESOLVED target in a flush-immune `NativeResult.exit_target` memory field
+  (`jmp qword [rdx+exit_target]`); this also (2) let the reserved trailing `slots[n]`
+  "direct cell" be DELETED (`slots.len == n == instrs.len` again, so `armNativeLink`'s
+  bound rejects index n — no off-table cell is arm-addressable); (3) the dispatcher's
+  `excl` buffer now orders `final` FIRST so `driveChain`'s own 8-entry cap never truncates
+  the just-failed child away. A frameless carried-spill regression (`buildCarriedSpillLoop`,
+  13 carried > 9 GP homes) was proven load-bearing by a negative control (revert the tail
+  to `jmp rax` → only that test crashes). codex re-review: all three blockers closed, no
+  new correctness blocker. (nsieve/nested-loop/nbody/mandelbrot/fannkuch/spectral-norm
+  tier-0==tier-1a==native byte-identical.)
 
 ### Outstanding
 
@@ -247,38 +270,6 @@ mode selection already picks correctly; armedness ≠ requested materialization)
 that ordinary guards keep ONE shared flush (don't duplicate the carried-home flush
 per guard). Split into three:
 
-- [ ] **Increment 2.3c-0 — inert contracts (byte-identical, nothing armed).**
-  - **(a) P-C option (b) invariant.** `slot[ei]` of a numeric-for loop-done guard is
-    exclusively its linked-materialized exit; its ordinary deopt never slot-armed.
-    Enforce at emission (nativegen) + arming (trace.zig).
-  - **(b) Distinct prologue-fail exit reason.** Stop overloading `exit_instr=maxInt`
-    to mean both "no guard identity" and "prologue failed". Add an explicit reason
-    discriminator so the dispatcher can model three independent facts: final = child,
-    child-local commits = 0, chain/global progress > 0. (`completed=rbx` is a raw
-    cumulative native counter — "prior native progress exists", NOT the enclosing-chain
-    progress count; keep that distinction.)
-  - **(c) `ordinary_entry`/`linked_entry` entry contracts.** Add an `ordinary_entry`
-    secondary entry presetting `linked_loop_done=0` then falling into `body_entry`,
-    mirroring `linked_entry` (mode 1). inner→continuation (2.3c-2) targets
-    `ordinary_entry`.
-  - **(d) Route remaining `final != ct` consumers.** 2.3b-1 left these keyed on the
-    entered `ct`: widen-eviction `laneWidenedPast(ct)` / retire `ct`
-    (`interp.zig:2823`); the `visited` list holds `ct` not the final child (child
-    prologue-fail could immediately rerun the failed child); `ran_native_link_mode`
-    computed from `ct` but materialization can belong to a fused child. Route eviction
-    + guard-shape + materialization classification through `final`; exclude both entered
-    `ct` and final child from immediate sibling retry on prologue-fail.
-  - **(e) Disarm-on-unsafe (Bart's chosen cycle bound).** When observation/suspend/
-    replay mode becomes unsafe, actively reset all relevant armed slots to
-    `shared_exit` via the P-E `armed_links` registry, so the next handoff returns to
-    the dispatcher and re-establishes the safepoint/GC boundary. Wired inert now (no
-    armed slots yet); becomes load-bearing in 2.3c-2 when the cycle closes.
-  - **(f) Shared ordinary-guard flush + default-slot tail.** Per-guard mini-stub
-    writes `exit_instr` then jumps the SHARED deopt flush, which flushes carried homes
-    + `completed=rbx` then dispatches through `slot[exit_instr]` (default
-    `shared_exit`) — do NOT duplicate the flush per guard (code-size blowup on
-    branch-heavy traces). Loop-done ordinary exits bypass slot dispatch → `shared_exit`
-    (P-C invariant). All slots still default `shared_exit` → byte-identical.
 - [ ] **Increment 2.3c-1 — arm skip→prime-side only (no cycle).** `driveChain` arms
   the ordinary source-branch guard slot → prime-side child (`ordinary_entry`).
   Exercises shared-flush correctness, ordinary child entry mode, child prologue-fail

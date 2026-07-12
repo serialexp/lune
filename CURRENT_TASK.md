@@ -1,5 +1,28 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-12 (latest)
+
+- **Increment 2.3c-0 (inert contracts + post-review blocker fixes): LANDED.** Six
+  inert sub-steps a–f (commits `7523d1e` re-scope, `094ff89` 0b, `c295586` 0c,
+  `131bc10` 0d, `bebbd48` 0e, `fd3c42e` 0f, `d276353` 0a), each byte-identical.
+  Then a **codex gpt-5.6-sol contract review found 3 blockers, now all closed**
+  (commit `e6b618c` fix + `5411105` test-strengthen):
+  1. **Blocker 1 (broke correctness on a spilled carried home).** 0f's shared
+     `deopt_exit` staged the dispatch holder in rax, but `flushSlot`'s spilled-
+     carried-home `.mem` path scratches rax — clobbering the holder before the jump.
+     Fix: stage the RESOLVED target in a new flush-immune `NativeResult.exit_target`
+     memory field; `deopt_exit` ends `jmp qword [rdx+exit_target]`. Proven load-
+     bearing by a negative control (revert tail to `jmp rax` → only the frameless
+     carried-spill regression crashes).
+  2. **Blocker 2 (reserved cell arm-addressable).** The exit_target fix let the
+     reserved `slots[n]` "direct cell" be DELETED → `slots.len == instrs.len`, so
+     `armNativeLink`'s `slot_index >= slots.len` bound rejects index n.
+  3. **Blocker 3 (`final` dropped under driveChain's 8-cap).** Dispatcher `excl`
+     buffer now orders `final` FIRST so driveChain's own `[8]` copy retains it.
+  codex re-review: all closed, no new correctness blocker. `just test` green; 6
+  benchmarks byte-identical tier-0/tier-1a/native. **NEXT: 2.3c-1** (task #55) — arm
+  skip→prime-side ordinary source-branch guard (no cycle).
+
 ## Status 2026-07-12
 
 - **Increment 1 (P-D, shared mcode arena): LANDED** — commit `a970da4`.
@@ -20,7 +43,8 @@
 - **Increment 2.3b-1 (flip `.link` arming on): LANDED** — Step B (dispatcher routes
   through `final`) committed `66107a7`; Step A (driveChain persistent arming +
   unified fusion drain) is THIS commit. See the 2.3b-1 section below.
-- **Increment 2.3c+ : DESIGNED + PEER-REVIEWED + DECIDED** — see
+- **Increment 2.3c-0: LANDED** (see the latest-status block at the top).
+- **Increment 2.3c-1 / 2.3c-2 : DESIGNED + PEER-REVIEWED + DECIDED** — see
   `docs/design/17-exit-branch-patching.md` (Done/Outstanding) and the plan file.
 
 ## What 2.2 changed (the chain-wide result contract, P-B)
