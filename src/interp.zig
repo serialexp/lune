@@ -2592,8 +2592,19 @@ pub const Vm = struct {
                                 // the baked-id round-trip end-to-end (id → stub imm32 →
                                 // NativeResult → traceById). 2.3 routes consumers
                                 // through `final` once child links populate a real id.
-                                const final: *const trace.Trace = self.trace.traceById(result.final_trace_id) orelse ct;
-                                if (ran_native) std.debug.assert(final == ct);
+                                // Fail closed (2.3b-0): a native exit ALWAYS bakes a
+                                // live trace id (P-B), so under `ran_native` the id must
+                                // resolve — the bare `orelse ct` would silently mask a
+                                // missing/retired id as `final == ct` and hide exactly the
+                                // dangling-link bug P-E guards against. Assert resolution
+                                // *before* the fallback. `resolved.? == ct` still holds
+                                // until 2.3b-1 arms the first link (dropped there).
+                                const resolved: ?*trace.Trace = self.trace.traceById(result.final_trace_id);
+                                const final: *const trace.Trace = resolved orelse ct;
+                                if (ran_native) {
+                                    std.debug.assert(resolved != null);
+                                    std.debug.assert(final == ct);
+                                }
 
                                 // --- guard-failure counting (step 4) ---
                                 // Count guard failures on zero-iteration exits

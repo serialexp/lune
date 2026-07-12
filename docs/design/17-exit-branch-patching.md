@@ -1,6 +1,6 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
-Status: partial — Increment 1 (shared mcode arena, P-D), Increment 2.1 (frameless chain-entry ABI, P-A), Increment 2.2 (chain-wide result contract, P-B) and Increment 2.3a (indirect exit + link-slot table + P-E registry scaffolding) landed; all byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies now run frameless under one shared trampoline (`ensureTrampoline`); every native exit stub jumps through a per-exit heap-resident link slot (`jmp qword [&slots[i]]`, default = `shared_exit`) and bakes the final trace's stable id into `NativeResult.final_trace_id`, resolved by the dispatcher via `traceById` (asserts `final == ct` while no slot is armed). The P-E backlink registry (`armed_links` + `armNativeLink`/`resetLinksTouching`, reset before `destroy` in `removeTrace`) is wired but inert — nothing arms a slot yet. Next: Increment 2.3b — arm `.link`-terminal handoffs from `driveChain` (single-contract kind, no S1), drop the `final == ct` assert, route dispatcher consumers through `final`.
+Status: partial — Increment 1 (shared mcode arena, P-D), Increment 2.1 (frameless chain-entry ABI, P-A), Increment 2.2 (chain-wide result contract, P-B) and Increment 2.3a (indirect exit + link-slot table + P-E registry scaffolding) landed; all byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies now run frameless under one shared trampoline (`ensureTrampoline`); every native exit stub jumps through a per-exit heap-resident link slot (`jmp qword [&slots[i]]`, default = `shared_exit`) and bakes the final trace's stable id into `NativeResult.final_trace_id`, resolved by the dispatcher via `traceById` (asserts `final == ct` while no slot is armed). The P-E backlink registry (`armed_links` + `armNativeLink`/`resetLinksTouching`, reset before `destroy` in `removeTrace`) is wired but inert — nothing arms a slot yet. Next: Increment 2.3b — arm `.link`-terminal handoffs from `driveChain`. A 2026-07-12 codex contract review re-scoped it (the `.link` terminal is not single-contract on the child side — the inner root needs `linked_loop_done` mode propagation; and cumulative `rbx` must not drive `onSideExit`), so 2.3b is split into 2.3b-0 (inert scaffolding: `linked_entry` mode-propagation stub, `NativeResult.local_completed`, fail-closed `traceById`; byte-identical, reviewed) then 2.3b-1 (flip arming on + driveChain accounting split). See §Implementation status → Outstanding.
 Owner: Bart
 Last updated: 2026-07-12 (Increment 2.3a landed — indirect `jmp [slot]` exit + per-trace heap-owned link-slot table defaulting to `shared_exit` + inert P-E backlink registry with a focused directionality unit test; nsieve/nsieve-bit/fannkuch/mandelbrot/nbody/spectral-norm tier-0==tier-1a==native byte-identical, `just bench --filter nsieve` flat within noise, Debug asserts pass — `final == ct` still holds since nothing is armed)
 
@@ -137,6 +137,57 @@ land; move whole sections to Done once everything inside is checked.
   P-A above.
 
 ### Outstanding
+
+**Increment 2.3b — arm `.link`-terminal handoffs (ACTIVE; re-scoped after the
+2026-07-12 codex contract review).** The review found the original one-commit
+2.3b under-scoped on two counts, so it is split into an inert-scaffolding step
+(2.3b-0, byte-identical, reviewed) and an arming step (2.3b-1). The armed hop is
+**Hop A**: a `.link` continuation reaching its terminal → the inner-loop root it
+names (run today via `runLinkedLoopDone`, trace.zig:1369). Findings:
+
+  1. *The `.link` terminal is NOT single-contract on the CHILD side.* The inner
+     root `I` is run in linked mode (`runLinkedLoopDone` sets
+     `NativeResult.linked_loop_done = 1`; `I`'s loop-done guard reads it at
+     nativegen ~4213 to pick linked-completion materialization). A bare armed
+     `jmp I.page.code.ptr` never sets the flag → `I` takes ordinary `deopt_exit`,
+     never commits its final iteration → wrong state. **Fix (2.3b-0): a second
+     entry point `linked_entry` on every frameless body** that presets the flag
+     then falls into `body_entry`; the armed slot targets `linked_entry`, not the
+     bare body. Emitted after `prologue_fail`, inert until targeted.
+  2. *Cumulative `rbx` ≠ the child's local count.* Once fused, `I` is entered under
+     the shared frame WITHOUT `xor rbx,rbx`, so `I`'s exit would report the chain's
+     cumulative count, not `I`'s own — and `driveChain` feeds that count to
+     `onSideExit(I, …)`, which decides penalty/gate/`hit_count` (steers future
+     recording). Feeding cumulative `rbx` can flip a low-yield event to "useful" →
+     different later traces → non-byte-identical across modes. **Fix (2.3b-0):
+     `NativeResult.local_completed`** = `rbx − entry_rbx`, where `entry_rbx` is
+     snapshotted into a `NativeResult` scratch field at `body_entry` (rdx-relative,
+     uniform for both ABIs; no frame-slot reservation). Unchained, `entry_rbx == 0`
+     so `local_completed == completed` — pinned by a Debug invariant in
+     `runWithLinkedLoopDone` while nothing is armed.
+  3. *`traceById(id) orelse ct` masks a missing id.* Once linking is live a child
+     exit must resolve to the child, never silently fall back to the parent.
+     **Fix (2.3b-0): fail closed** — when `ran_native`, assert the baked id actually
+     resolved (`resolved != null`) before the `orelse ct`; keep `resolved.? == ct`
+     until 2.3b-1 drops it.
+
+- [ ] **Increment 2.3b-0 — inert scaffolding (byte-identical).** (a) fail-closed
+  `traceById` in the dispatcher; (b) `linked_entry` stub + `CompiledTrace.linked_entry`
+  (emitted, nothing targets it); (c) `NativeResult.local_completed` + `entry_rbx`
+  scratch with the `local_completed == completed` invariant. Each a separate
+  byte-identical commit; reviewed before 2.3b-1. S3 prep (prologue_fail commits
+  cumulative `rbx`) already landed (`9d16711`).
+- [ ] **Increment 2.3b-1 — flip arming on.** In `driveChain`, after Hop A is
+  accounted, `armNativeLink(current_link, terminal_idx, inner, inner.linked_entry)`
+  (eligibility: `inner.compiled`, `inputs.len == 0`, `.link` terminal; safepoint
+  blackout when `record_exec_log`/`record_safepoint_lines`/`suspend_ctl` active).
+  Rewrite the burst loop to handle a FUSED `snt.run` result whose `final_trace_id ==
+  inner.id` (continuation linked straight into inner): reproduce the hop's logical
+  accounting (`onSideExit(inner, max(local_completed,1))` + `linked_completed += 1`)
+  from the aggregate result instead of the separate `runLinkedLoopDone` call. Drop
+  `assert(final == ct)`; route exit IDENTITY (`exit_instr`/guard/resume PC) through
+  `final`, steering-accounting through the reproduced hop events. Verify 10-mode
+  byte-identical + arm counter > 0 + bench.
 
 **Blocking prerequisites — must be designed before any patch is safe** (peer
 review, 2026-07-11; see §Blocking prerequisites for the argument):

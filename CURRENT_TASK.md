@@ -173,6 +173,48 @@ Then 2.3c (ordinary guards + loop-done, S1; slot-identity collision decision), 2
 (P-E lane-widen end-to-end + peer-review full diff). Increment 3 = full
 `lj_asm_patchexit` port (guard-jump rel32 patching, no runtime re-entry).
 
+## 2.3b CONTRACT REVIEW (codex gpt-5.6-sol) — planned scope is WRONG, re-plan pending
+
+Ran the arming contract past codex before coding the dispatcher rewire. Verdict:
+**"do NOT implement 2.3b as 'arm the slot, drop `final==ct`, route everything
+through `final`'."** Two substantive findings the plan missed:
+
+- **BLOCKER — the `.link` terminal is NOT single-contract on the child side.**
+  The L→I hop (a `.link` continuation reaching its terminal, handing off to the
+  inner-loop root `I`) is run today via `int_native.runLinkedLoopDone(regs)`, which
+  sets `NativeResult.linked_loop_done = 1`; `I`'s inner loop-done guard READS that
+  flag (nativegen ~4213) to pick linked-completion materialization vs ordinary
+  deopt. A bare armed `jmp I.page.code.ptr` does **not** set the flag → `I` takes
+  ordinary `deopt_exit`, never commits its final iteration → wrong state. So arming
+  `.link`→inner drags in the S1 mode-propagation that was supposed to be deferred to
+  2.3c. Fix needs one of: (a) a second entry point on `I` (`linked_entry`) that
+  presets the flag then falls into the body — armed slot targets that; (b) a per-arm
+  stub that sets the flag then jumps; (c) enter armed parents with the flag already
+  set. (a) is cleanest (compile-time, no runtime thunk, `I` codegen unchanged).
+- **DETERMINISM TRAP — "route consumers through `final`" is unsafe as-is.** Exit
+  IDENTITY (`exit_instr`, guard lookup, exit PC, resume PC) must use `final`. But
+  the recording-STEERING accounting (`onSideExit`, `maybeArmContinuation`,
+  `countProductiveBranchExit`) must reproduce driveChain's *logical* per-hop events,
+  which are specific (validate loop-done → `onSideExit(I, max(local,1))` → +1
+  enclosing progress; NO `maybeArmContinuation`/`countProductiveBranchExit` on that
+  hop). Calling the dispatcher's whole productive-exit block against `final` invents
+  accounting the unarmed chain never did → different penalties/gates → different
+  later trace recording → **non-byte-identical across modes.** Worse,
+  `NativeResult.completed` is cumulative `rbx`, NOT `I`'s LOCAL count nor
+  `ChainResult.completed`; feeding cumulative `rbx` to `onSideExit` can flip a
+  low-yield event to "useful". Needs a WIDER result contract: final identity + final
+  exit reason + final's **local** committed count + enclosing-chain progress — the
+  current 4 `NativeResult` fields are insufficient.
+- Minor: once linking is live, `traceById(id) orelse ct` (interp ~2595) should
+  **fail closed** (assert), not silently reinterpret a child exit as the parent's.
+
+Net: the first real arm needs (i) child linked-entry mode propagation, (ii) a wider
+`NativeResult` (local completed + enclosing progress), (iii) a driveChain-faithful
+accounting split (identity via `final`, steering-accounting replicates the hop's
+logical events), (iv) fail-closed `traceById`. That's materially bigger than the
+one-commit 2.3b in the plan. **Landed so far:** S3 prep (`9d16711`, byte-identical,
+codex-confirmed correct). **Awaiting Bart's call on how to re-scope/sequence.**
+
 ## Unpushed local commits (Rule #15 — don't push unless asked)
 master is well ahead of origin/master; do NOT push without Bart's say-so.
 
