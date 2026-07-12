@@ -2638,11 +2638,24 @@ pub const Vm = struct {
                                 // exclusion set once = `visited ∪ {final}`. Byte-identical
                                 // now: `final == ct`, and `ct ∈ visited`, so the union adds
                                 // nothing.
+                                //
+                                // ORDER `final` FIRST (blocker-3 fix): `driveChain` copies
+                                // `initially_excluded` into its OWN `[8]` visited and breaks
+                                // at 8 (trace.zig). When the walk already visited 8 traces,
+                                // a trailing `final` (excl[8]) would be truncated away and
+                                // driveChain could re-pick the just-failed child. Placing
+                                // `final` at excl[0] guarantees it survives the copy; a later
+                                // already-visited sibling is dropped instead — harmless, as
+                                // driveChain bounds its own hops regardless.
                                 var excl: [visited.len + 1]*trace.Trace = undefined;
-                                @memcpy(excl[0..nvisited], visited[0..nvisited]);
-                                var nexcl = nvisited;
-                                if (final != ct and nexcl < excl.len) {
+                                var nexcl: usize = 0;
+                                if (final != ct) {
                                     excl[nexcl] = final;
+                                    nexcl += 1;
+                                }
+                                for (visited[0..nvisited]) |v| {
+                                    if (nexcl >= excl.len) break;
+                                    excl[nexcl] = v;
                                     nexcl += 1;
                                 }
 

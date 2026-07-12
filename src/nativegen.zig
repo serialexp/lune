@@ -593,6 +593,19 @@ const NativeResult = extern struct {
     /// whichever body performs the FINAL exit (each exit path either leaves it 0 or, at
     /// prologue_fail, sets 1), so the returned value describes the final trace.
     exit_reason: u32,
+    /// 2.3c-0 (doc 17): the resolved absolute dispatch target for the shared
+    /// `deopt_exit` flush. Each ordinary / loop-done-ordinary mini-stub RESOLVES its
+    /// dispatch target and stashes it HERE, in memory, BEFORE the carried-home flush
+    /// runs — an ordinary guard derefs its own `slot[ei]` (holds `shared_exit` while
+    /// unarmed, a child body entry once 2.3c-1 arms it); a loop-done ordinary deopt uses
+    /// `shared_exit` directly (its `slot[ei]` is the EXCLUSIVE linked exit, P-C option
+    /// (b)). `deopt_exit` ends with `jmp qword [rdx+exit_target]`. Why a memory field
+    /// and not a register: `flushSlot`'s spilled-payload path clobbers rax, so a
+    /// register-staged holder would be destroyed by any spilled carried home before the
+    /// jump; a `*NativeResult` field is flush-immune. Frameless production path only
+    /// (the self-framed test page tears down + `ret`, never reading this). Pure scratch,
+    /// not host-consumed; the wrapper inits it to 0 and every deopt exit overwrites it.
+    exit_target: usize,
 };
 
 /// A compiled trace: an executable page whose entry is
@@ -672,6 +685,7 @@ pub const CompiledTrace = struct {
             .final_trace_id = irinterp.NO_TRACE_ID,
             .entry_rbx = 0,
             .exit_reason = @intFromEnum(irinterp.ExitReason.normal),
+            .exit_target = 0,
         };
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
@@ -775,18 +789,17 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
     // built-in A/B of the two ABIs over the same lowered trace.
     var shared_exit: ?usize = null;
     var tramp_entry: ?usize = null;
-    // Link-slot table (doc 17 Increment 2.3), one usize per IR instr index PLUS one
-    // reserved trailing "direct cell" (index `n`, 2.3c-0f). Allocated only on the
-    // frameless production path (the self-framed test page has no shared trampoline to
-    // default to and never chains). Every entry defaults to `shared_exit`, so an unarmed
-    // exit behaves exactly like 2.1's direct jump — the table is inert until `driveChain`
-    // arms a slot. Its address must be stable *before* `lower` bakes `&slots[i]` as an
-    // imm64, so it is allocated here and handed in. The reserved `slots[n]` is the
-    // immutable dispatch target for loop-done ORDINARY exits: a numeric-for loop-done
-    // guard's `slot[ei]` is exclusively its linked-materialized exit (P-C option (b)
-    // invariant), so its ordinary deopt must bypass `slot[ei]` and reach `shared_exit`
-    // via this never-armed cell (arming is keyed by IR index `< n`, so `slots[n]` is
-    // never touched).
+    // Link-slot table (doc 17 Increment 2.3), exactly one usize per IR instr index.
+    // Allocated only on the frameless production path (the self-framed test page has no
+    // shared trampoline to default to and never chains). Every entry defaults to
+    // `shared_exit`, so an unarmed exit behaves exactly like 2.1's direct jump — the
+    // table is inert until `driveChain` arms a slot. Its address must be stable *before*
+    // `lower` bakes `&slots[i]` as an imm64, so it is allocated here and handed in.
+    // No reserved trailing cell: the loop-done ORDINARY deopt reaches `shared_exit`
+    // through the memory-staged `NativeResult.exit_target` (it must bypass its own
+    // `slot[ei]`, which is the EXCLUSIVE linked-materialized exit — P-C option (b)),
+    // so `slots.len == n` and every index is a real IR exit slot that `armNativeLink`
+    // may legitimately arm.
     var slots: []usize = &.{};
     if (arena) |ar| {
         // A frameless body may only address SPILL_MAX spill slots (the trampoline
@@ -795,7 +808,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
         const tr = ar.ensureTrampoline() catch return null;
         shared_exit = tr.shared_exit;
         tramp_entry = tr.entry;
-        slots = gpa.alloc(usize, n + 1) catch return null;
+        slots = gpa.alloc(usize, n) catch return null;
         @memset(slots, tr.shared_exit);
     }
 
@@ -4308,18 +4321,20 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         }
     }
 
-    // Per-guard side-exit stubs. Each writes the deterministic failing IR index, then
-    // loads the dispatch-target HOLDER into rax and jumps to the shared single-snapshot
-    // flush (`deopt_exit`), which flushes carried homes, writes `completed`, and jumps
-    // `qword [rax]` (2.3c-0f). rax is dead scratch at the exit (flush not yet run reads
-    // no rax), so the mini-stub may stage the holder here and it survives the flush.
+    // Per-guard side-exit stubs. Each writes the deterministic failing IR index, RESOLVES
+    // its dispatch target into the memory-staged `NativeResult.exit_target`, then jumps to
+    // the shared single-snapshot flush (`deopt_exit`), which flushes carried homes, writes
+    // `completed`, and jumps `qword [rdx+exit_target]` (2.3c-0). The resolved target lives
+    // in a `*NativeResult` field (not a register) because `flushSlot`'s spilled-payload
+    // path clobbers rax — a register-staged holder would not survive the flush.
     //
-    // Ordinary guard: dispatch through its OWN `slot[ei]` — default `shared_exit`
-    // (byte-identical to 2.1's direct jump), armed to a child body entry in 2.3c-1.
-    // Loop-done guard: the `linked_loop_done != 0` case jumps to the linked-materialized
-    // stub (mode 1); the ORDINARY fallthrough (mode 0) must bypass `slot[ei]` — that
-    // slot is EXCLUSIVELY the linked exit (P-C option (b) invariant) — so it dispatches
-    // through the reserved never-armed direct cell `slots[n]` (= `shared_exit`).
+    // Ordinary guard: resolve THROUGH its OWN `slot[ei]` (deref it now — arming only
+    // happens between native runs, so the value is stable across the flush) — default
+    // `shared_exit` (byte-identical to 2.1's direct jump), armed to a child body entry in
+    // 2.3c-1. Loop-done guard: the `linked_loop_done != 0` case jumps to the linked-
+    // materialized stub (mode 1); the ORDINARY fallthrough (mode 0) must bypass `slot[ei]`
+    // — that slot is EXCLUSIVELY the linked exit (P-C option (b) invariant) — so it
+    // resolves directly to `shared_exit`.
     for (exit_labels, 0..) |maybe_l, ei| {
         if (maybe_l) |l| {
             a.bind(l);
@@ -4327,12 +4342,16 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             if (isNumericForLoopDoneGuard(t, ei)) {
                 try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
                 try a.jcc(.ne, try nativeLinkedLoopDoneLabel(a, linked_loop_done_labels, ei));
-                // mode 0 (ordinary loop-done deopt): bypass slot[ei] → direct cell.
-                if (shared_exit != null)
-                    try a.movRegImm64(.rax, @bitCast(@as(u64, slotAddr(slots, t.instrs.len).?)));
+                // mode 0 (ordinary loop-done deopt): bypass slot[ei] → `shared_exit`.
+                if (shared_exit) |se| {
+                    try a.movRegImm64(.rax, @bitCast(@as(u64, se)));
+                    try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
+                }
             } else if (shared_exit != null) {
-                // ordinary guard: dispatch through its own slot[ei].
+                // ordinary guard: resolve through its own slot[ei] (deref → stage).
                 try a.movRegImm64(.rax, @bitCast(@as(u64, slotAddr(slots, ei).?)));
+                try a.movRegMem(.rax, .rax, 0);
+                try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
             }
             try a.jmp(deopt_exit);
         }
@@ -4366,18 +4385,21 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     }
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
     // P-B: stamp the final trace id. `emitReturn` normally does this, but here the
-    // dispatch target is the HOLDER already staged in rax by the mini-stub (its own
-    // `slot[ei]`, or the reserved direct cell for a loop-done ordinary exit), not a
-    // fixed address baked in this shared block — so inline the id stamp + dispatch.
+    // dispatch target is the resolved value the mini-stub already staged into
+    // `exit_target` (its own `slot[ei]`'s value, or `shared_exit` for a loop-done
+    // ordinary exit), not a fixed address baked in this shared block — so inline the id
+    // stamp + dispatch.
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(t.id));
     if (shared_exit) |_| {
-        // 2.3c-0f: frameless — dispatch through the mini-stub's target holder. An
-        // unarmed `slot[ei]` holds `shared_exit` (byte-identical to 2.1's direct jump);
-        // 2.3c-1 arms it to a child body entry. rax is dead scratch here (flush done).
-        try a.jmpMem(.rax, 0);
+        // 2.3c-0: frameless — dispatch through the memory-staged resolved target. The
+        // mini-stub wrote `exit_target` BEFORE the flush ran, so the flush's rax clobber
+        // (spilled-payload path) cannot destroy it. An unarmed ordinary `slot[ei]` holds
+        // `shared_exit` (byte-identical to 2.1's direct jump); 2.3c-1 arms it to a child
+        // body entry.
+        try a.jmpMem(.rdx, @offsetOf(NativeResult, "exit_target"));
     } else {
         // Self-framed test page: no slot table, no shared trampoline — tear down the
-        // per-trace frame and `ret` exactly as before (mini-stubs staged no rax here).
+        // per-trace frame and `ret` exactly as before (mini-stubs staged nothing here).
         try emitTeardown(a, frame, callee[0..callee_len]);
     }
 
@@ -4495,6 +4517,38 @@ fn expectMatch(t: *const Trace, regs_init: []const Value) !void {
     defer ct.deinit();
     const nregs = try testing.allocator.dupe(Value, regs_init);
     defer testing.allocator.free(nregs);
+    const nresult = try runNative(ct, nregs);
+
+    try testing.expectEqual(iresult.completed, nresult.completed);
+    try expectRegsEqual(iregs, nregs);
+}
+
+/// Like `expectMatch`, but drives the FRAMELESS production path (`compileInto` an
+/// `McodeArena` + the shared trampoline), not the self-framed standalone page. This is
+/// the ONLY path that dispatches an ordinary guard exit through the memory-staged
+/// `NativeResult.exit_target` (2.3c-0). A regression here — e.g. staging the dispatch
+/// target in rax, which `flushSlot` clobbers on a spilled carried home — would jump
+/// through a corrupt address and crash, so a clean match is the guard against blocker-1.
+fn expectMatchFrameless(t: *const Trace, regs_init: []const Value) !void {
+    const gpa = testing.allocator;
+    // Oracle: the tier-1a IR-interpreter.
+    const iregs = try gpa.dupe(Value, regs_init);
+    defer gpa.free(iregs);
+    const values = try gpa.alloc(Value, t.instrs.len);
+    defer gpa.free(values);
+    const iresult = irinterp.executeValues(t, iregs, values);
+
+    // Native, frameless: compile into a real arena so the shared trampoline + link-slot
+    // table + indirect exit dispatch are all live (arena.deinit must outlive ct, which
+    // holds an arena-slot page — defer LIFO runs ct.deinit first).
+    var arena = McodeArena.init(gpa);
+    defer arena.deinit();
+    var ct = compileInto(gpa, &arena, t) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    try testing.expect(ct.trampoline_entry != null); // really the frameless path
+
+    const nregs = try gpa.dupe(Value, regs_init);
+    defer gpa.free(nregs);
     const nresult = try runNative(ct, nregs);
 
     try testing.expectEqual(iresult.completed, nresult.completed);
@@ -5640,13 +5694,13 @@ test "nativegen: operand-chain reuses one register across a left-folded sum" {
     try expectMatch(&t, &.{ Value.int(2), Value.int(2), Value.int(7) }); // zero iters
 }
 
-test "nativegen: more carried+invariant slots than registers forces spilled homes" {
-    if (comptime !is_x64_linux) return error.SkipZigTest;
-    const gpa = testing.allocator;
-    // acc = acc + i + (x0..x9), with 10 invariant slots → 13 homes > 11 GPRs ⇒ spills.
-    var ins: std.ArrayListUnmanaged(I) = .empty;
-    defer ins.deinit(gpa);
-
+/// Build a spill-forcing counting loop into `ins`: `acc = acc + i + (x0..x9)` with 10
+/// invariant slots → 13 homes > 11 GPRs, guaranteeing spilled carried homes. Every guard
+/// carries `aux == 0`, so the loop-exit `guard_true` classifies as an ORDINARY guard
+/// (`isNumericForLoopDoneGuard` short-circuits on `exit_pc == 0` before touching the
+/// undefined anchor). Register layout: r0=i (carried), r1=limit (invariant), r2=acc
+/// (carried), r3..r12 = x0..x9 (invariant).
+fn buildSpillLoop(gpa: std.mem.Allocator, ins: *std.ArrayListUnmanaged(I)) !void {
     const r_i: u16 = @intCast(ins.items.len);
     try ins.append(gpa, .{ .op = .slot_load, .aux = 0 });
     try ins.append(gpa, .{ .op = .guard_int, .a = r_i });
@@ -5687,18 +5741,63 @@ test "nativegen: more carried+invariant slots than registers forces spilled home
     try ins.append(gpa, .{ .op = .phi, .b = sum, .aux = 2 }); // acc
     try ins.append(gpa, .{ .op = .phi, .b = r_inc, .aux = 0 }); // i
     try ins.append(gpa, .{ .op = .loop });
+}
+
+/// Fill a 13-Value register file for the spill loop: i=0, limit, acc=0, x0..x9 = 1..10.
+fn spillLoopRegs(regs: *[13]Value, limit: i64) void {
+    regs[0] = Value.int(0); // i
+    regs[1] = Value.int(limit); // limit
+    regs[2] = Value.int(0); // acc
+    var j: usize = 0;
+    while (j < 10) : (j += 1) regs[3 + j] = Value.int(@intCast(j + 1)); // x0..x9 = 1..10
+}
+
+test "nativegen: more carried+invariant slots than registers forces spilled homes" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var ins: std.ArrayListUnmanaged(I) = .empty;
+    defer ins.deinit(gpa);
+    try buildSpillLoop(gpa, &ins);
 
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
     const t = Trace{ .anchor = undefined, .instrs = ins.items, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
     var regs: [13]Value = undefined;
-    regs[0] = Value.int(0); // i
-    regs[1] = Value.int(4); // limit
-    regs[2] = Value.int(0); // acc
-    var j: usize = 0;
-    while (j < 10) : (j += 1) regs[3 + j] = Value.int(@intCast(j + 1)); // x0..x9 = 1..10
+    spillLoopRegs(&regs, 4);
     try expectMatch(&t, &regs);
+}
+
+test "nativegen: frameless spilled carried homes dispatch the ordinary guard exit cleanly (blocker-1)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // 2.3c-0 blocker-1 regression. The spill loop forces spilled carried homes; its
+    // loop-exit `guard_true` (aux == 0) is an ORDINARY guard, so on the frameless path
+    // it dispatches through the shared `deopt_exit` flush. That flush re-boxes each
+    // carried home — and `flushSlot`'s spilled-payload branch uses rax as scratch. The
+    // old design staged the dispatch holder in rax, which a spilled home therefore
+    // clobbered before `jmp [rax]`, jumping through a corrupt address. Now the resolved
+    // target rides in the flush-immune `NativeResult.exit_target` and the flush cannot
+    // touch it. If it regressed, this run would jump into garbage and crash; a clean
+    // byte-for-byte match against the tier-1a oracle is the proof it survives.
+    const gpa = testing.allocator;
+    var ins: std.ArrayListUnmanaged(I) = .empty;
+    defer ins.deinit(gpa);
+    try buildSpillLoop(gpa, &ins);
+
+    var consts = [_]Value{Value.int(1)};
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = ins.items, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    // limit=4 → commits 4 iterations, then the `i < limit` guard fails and the ORDINARY
+    // exit fires with all 13 (spilled) homes live. limit=0 → the guard fails on the very
+    // first check (zero committed iterations), exercising the exit before any back-edge.
+    var regs4: [13]Value = undefined;
+    spillLoopRegs(&regs4, 4);
+    try expectMatchFrameless(&t, &regs4);
+
+    var regs0: [13]Value = undefined;
+    spillLoopRegs(&regs0, 0);
+    try expectMatchFrameless(&t, &regs0);
 }
 
 test "nativegen: analyze classifies slots and pins disjoint homes" {

@@ -473,8 +473,8 @@ pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
 /// (doc 17, 2.3c-0a): a numeric-for loop-done guard's `slot[ei]` is EXCLUSIVELY its
 /// linked-materialized exit. So only a `.loop_done_linked` arm may target a loop-done
 /// guard slot, and conversely `.link_terminal` / `.ordinary_guard` arms must never
-/// land on one (their ordinary deopt reaches `shared_exit` via the reserved direct
-/// cell, never through `slot[ei]`).
+/// land on one (a loop-done ordinary deopt reaches `shared_exit` through the memory-
+/// staged `NativeResult.exit_target`, never through `slot[ei]`).
 pub const ArmKind = enum {
     /// `.link`-terminal handoff (2.3b-1). The terminal is a `.link` op, never a guard.
     link_terminal,
@@ -5292,19 +5292,21 @@ test "armNativeLink: P-C option (b) invariant — arm kind matches slot guard sh
     var state = TraceState.init(gpa);
     defer state.deinit();
 
-    // A proto whose code[0] is a `for_loop`, so a `guard_true` deopting to pc 1
-    // (== the instruction AFTER the for_loop) is a numeric-for loop-done guard.
-    const proto = Proto{ .code = &.{Instr.op0(.for_loop)}, .name = "t", .num_registers = 2 };
+    // A proto whose code[0] is a `for_loop` and code[1] is not: a `guard_true` deopting
+    // to pc 1 (== the instruction AFTER the for_loop) is a numeric-for loop-done guard,
+    // while one deopting to pc 2 (after a non-for_loop) is an ordinary guard.
+    const proto = Proto{ .code = &.{ Instr.op0(.for_loop), Instr.op0(.ret) }, .name = "t", .num_registers = 2 };
 
-    const parent_slots = try gpa.alloc(usize, 2);
-    defer gpa.free(parent_slots);
-    @memset(parent_slots, 0);
-
-    // instr 0 = loop-done guard (guard_true, exit_pc = 1); instr 1 is out of range for
-    // the slot table's index 1, which is therefore a non-loop-done slot.
-    const pinstrs = try gpa.alloc(IrInstr, 1);
+    // Production shape: exactly one slot per IR instr (no reserved trailing cell — the
+    // loop-done ordinary deopt reaches `shared_exit` via `NativeResult.exit_target`, not
+    // a slot). instr 0 = loop-done guard (exit_pc 1); instr 1 = ordinary guard (exit_pc 2).
+    const pinstrs = try gpa.alloc(IrInstr, 2);
     defer gpa.free(pinstrs);
     pinstrs[0] = .{ .op = .guard_true, .aux = 1 };
+    pinstrs[1] = .{ .op = .guard_true, .aux = 2 };
+    const parent_slots = try gpa.alloc(usize, pinstrs.len);
+    defer gpa.free(parent_slots);
+    @memset(parent_slots, 0);
     var parent: Trace = .{
         .anchor = .{ .proto = &proto, .pc = 0 },
         .instrs = pinstrs,
@@ -5322,7 +5324,7 @@ test "armNativeLink: P-C option (b) invariant — arm kind matches slot guard sh
         .native = .{ .compiled = .{ .page = undefined, .slots = &.{}, .gpa = gpa } },
     };
 
-    // Classifier: slot 0 IS a loop-done guard; slot 1 (no IR instr) is not.
+    // Classifier: slot 0 IS a loop-done guard; slot 1 (ordinary guard) is not.
     try testing.expect(isLoopDoneGuardIndex(&parent, 0));
     try testing.expect(!isLoopDoneGuardIndex(&parent, 1));
 
@@ -5334,6 +5336,12 @@ test "armNativeLink: P-C option (b) invariant — arm kind matches slot guard sh
     // The non-loop-done slot accepts an ordinary-guard arm (and never a loop-done one).
     try testing.expect(try state.armNativeLink(&parent, 1, &child, BODY, .ordinary_guard));
     try testing.expectEqual(BODY, parent_slots[1]);
+
+    // An index at/past `slots.len` (== instrs.len) is out of range for EVERY arm kind —
+    // there is no reserved off-table cell to accidentally address (blocker-2 fix).
+    try testing.expect(!try state.armNativeLink(&parent, 2, &child, BODY, .ordinary_guard));
+    try testing.expect(!try state.armNativeLink(&parent, 2, &child, BODY, .link_terminal));
+    try testing.expect(!try state.armNativeLink(&parent, 2, &child, BODY, .loop_done_linked));
 
     // Reset so the leak-checked registry is empty at deinit.
     state.resetLinksTouching(&child);
