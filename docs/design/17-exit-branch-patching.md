@@ -1,8 +1,8 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
-Status: partial — Increment 1 (shared mcode arena, P-D), Increment 2.1 (frameless chain-entry ABI, P-A), Increment 2.2 (chain-wide result contract, P-B) and Increment 2.3a (indirect exit + link-slot table + P-E registry scaffolding) landed; all byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies now run frameless under one shared trampoline (`ensureTrampoline`); every native exit stub jumps through a per-exit heap-resident link slot (`jmp qword [&slots[i]]`, default = `shared_exit`) and bakes the final trace's stable id into `NativeResult.final_trace_id`, resolved by the dispatcher via `traceById` (asserts `final == ct` while no slot is armed). The P-E backlink registry (`armed_links` + `armNativeLink`/`resetLinksTouching`, reset before `destroy` in `removeTrace`) is wired but inert — nothing arms a slot yet. Next: Increment 2.3b — arm `.link`-terminal handoffs from `driveChain`. A 2026-07-12 codex contract review re-scoped it (the `.link` terminal is not single-contract on the child side — the inner root needs `linked_loop_done` mode propagation; and cumulative `rbx` must not drive `onSideExit`), so 2.3b is split into 2.3b-0 (inert scaffolding: `linked_entry` mode-propagation stub, `NativeResult.local_completed`, fail-closed `traceById`; byte-identical, reviewed) then 2.3b-1 (flip arming on + driveChain accounting split). See §Implementation status → Outstanding.
+Status: partial — Increment 1 (shared mcode arena, P-D), Increment 2.1 (frameless chain-entry ABI, P-A), Increment 2.2 (chain-wide result contract, P-B), Increment 2.3a (indirect exit + link-slot table + P-E registry scaffolding), and Increment 2.3b (2.3b-0 inert scaffolding + 2.3b-1 flip arming on) landed; all byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies run frameless under one shared trampoline (`ensureTrampoline`); every native exit stub jumps through a per-exit heap-resident link slot (`jmp qword [&slots[i]]`, default = `shared_exit`) and bakes the final trace's stable id into `NativeResult.final_trace_id`. As of 2.3b-1, `driveChain` ARMS the continuation's `.link`-terminal slot → `inner.linked_entry`, so a native run of the continuation fuses straight into the inner root under the shared frame (no ~600ns Zig re-entry per hop). The dispatcher resolves `final = traceById(final_trace_id)` STRICTLY on the native path (`@panic` on null, no `ct` fallback), and `final != ct` is now expected. `driveChain` drains fused results by resolving each child strictly by `final_trace_id` + `isInnerLoopRoot` shape check (unresolvable/mis-shaped ⇒ `@panic`, no unsafe resume). The P-E backlink registry (`armed_links` + `armNativeLink`/`resetLinksTouching`, reset before `destroy` in `removeTrace`) is now LIVE for `.link` slots. Next: Increment 2.3c — arm ordinary source-branch guards + loop-done (S1 dual materialization, S3 prologue-fail split). See §Implementation status → Outstanding.
 Owner: Bart
-Last updated: 2026-07-12 (Increment 2.3b-0 landed — inert arming scaffolding across four byte-identical commits: S3 prologue_fail cumulative-`rbx` prep, fail-closed `traceById`, `NativeResult.entry_rbx`→`local_completed`, and the `linked_entry` secondary-entry stub + `x64.labelOffset`. Nothing armed; `final == ct` still holds. Peer-reviewed codex gpt-5.6-sol + fable: SOUND / behavior-neutral today, correct foundation — rbx provably 0 at every body/prologue-fail entry, `linked_entry` inert and 1:1-mapped, one misleading comment fixed. Two arming-time musts recorded on the 2.3b-1 item: drop the `entry_rbx==0` assert, classify productivity via `local_completed`. nsieve 3-mode + 6-benchmark differential green.)
+Last updated: 2026-07-12 (Increment 2.3b-1 landed — flip `.link` arming on. `driveChain` arms the continuation's `.link` slot → `inner.linked_entry` (eligibility: `inner.compiled`, `inputs.len == 0`, terminal `.link` with `aux == inner_pc` re-read after the driver swap; `safe_to_arm` gate on `suspend_ctl`/`record_safepoint_lines`). Fused `snt.run` results drained by strict `traceById(final_trace_id)` + `isInnerLoopRoot` resolution — unresolvable/mis-shaped ⇒ `@panic` (no unsafe resume); loop-done vs. mid-loop classified via `guardExitPc` following `for_loop`; steering on the child's own `local_completed`. Dropped `assert(final == ct)` and the `entry_rbx == 0` assert; native dispatcher resolution strict (`@panic` on null, release too), tier-1a still uses `ct`. New `native_link_arms` counter. Peer-reviewed codex gpt-5.6-sol across 3 rounds — closed, no correctness blocker. `just test` green; 8-value N-sweep + 5 benchmarks byte-identical across tier-0/tier-1a/native. Deferred: native 9-completion bound reconcile (Issue 4), observation-window unpatching (Issue 5 → P-F).)
 
 Coherent-state chaining (doc 16) proved *correct* but *performance-neutral* on
 nsieve: the JIT compiles every hot loop to native code, chaining hands control
@@ -186,34 +186,52 @@ names (run today via `runLinkedLoopDone`, trace.zig:1369). Findings:
   rel32 in place, `McodeArena.alloc` `@memcpy`s verbatim). Nit fixed: the
   `movMemImm32(linked_loop_done,1)` comment wrongly said "dword store to the low
   half" — it is REX.W `C7 /0`, a full-u64 store.
-- [ ] **Increment 2.3b-1 — flip arming on.** In `driveChain`, after Hop A is
-  accounted, `armNativeLink(current_link, terminal_idx, inner, inner.linked_entry)`
-  (eligibility: `inner.compiled`, `inputs.len == 0`, `.link` terminal; safepoint
-  blackout when `record_exec_log`/`record_safepoint_lines`/`suspend_ctl` active).
-  Rewrite the burst loop to handle a FUSED `snt.run` result whose `final_trace_id ==
-  inner.id` (continuation linked straight into inner): reproduce the hop's logical
-  accounting (`onSideExit(inner, max(local_completed,1))` + `linked_completed += 1`)
-  from the aggregate result instead of the separate `runLinkedLoopDone` call. Drop
-  `assert(final == ct)`; route exit IDENTITY (`exit_instr`/guard/resume PC) through
-  `final`, steering-accounting through the reproduced hop events. Verify 10-mode
-  byte-identical + arm counter > 0 + bench.
-  - **MUST (both 2.3b-0 reviewers, arming-time correctness):**
-    1. **Drop `assert(result.entry_rbx == 0)`** in `runWithLinkedLoopDone`
-       (nativegen ~669) when arming activates. In ReleaseFast the assert is an LLVM
-       *assume*, folding `completed -% entry_rbx` → `completed` — silently
-       resurrecting the exact cumulative-count `onSideExit` bug `local_completed`
-       exists to kill, visible only as cross-mode release divergence.
-    2. **Classify final-trace productivity by `local_completed`, NOT cumulative
-       `completed`.** The surrounding `if (result.completed > 0)` branch
-       (interp.zig ~2626) must switch to `local_completed`; a chained child that
-       fails its prologue returns `completed = parent-cumulative` (nonzero) but
-       `local_completed == 0` — the old test would misclassify it productive. Keep
-       field meanings rigid: `completed` = aggregate/resume; `local_completed` =
-       final-trace productivity/penalty; `final_trace_id`+`exit_instr` = identity.
+- [x] **Increment 2.3b-1 — flip arming on (LANDED, byte-identical).** `driveChain`
+  now arms the continuation's `.link`-terminal slot → `inner.linked_entry`
+  (`armNativeLink(current_link, len-1, inner, le)`; eligibility gated on
+  `inner.compiled`, `inputs.len == 0`, terminal `.link` with `aux == inner_pc`,
+  re-read AFTER the driver swap; `safe_to_arm = suspend_ctl == null and
+  !record_safepoint_lines`, threaded from the dispatcher). A FUSED `snt.run` whose
+  `final_trace_id != current_link.id` is drained in a dedicated loop that resolves
+  the child STRICTLY by `traceById(final_trace_id)` + `isInnerLoopRoot` shape
+  validation (never `findLoopTrace` substitution — a previously-armed slot can target
+  a sibling `findLoopTrace` no longer picks), classifies loop-done vs. mid-loop via
+  `guardExitPc(child.instrs[exit_instr])` following a `for_loop`, and steers on the
+  child's OWN `local_completed`. An unresolvable/mis-shaped fused id is a hard
+  invariant failure (`@panic`) — the child's exit leaves `regs[]` with no
+  known-coherent resume PC, so bailing could re-run a committed inner loop. Dropped
+  `assert(final == ct)`; native dispatcher resolution is strict (`@panic` on null,
+  release builds too), tier-1a still uses `ct`. New counter `native_link_arms`.
+  Peer-reviewed codex gpt-5.6-sol (3 rounds): closed, no correctness blocker.
+  Verified `just test` green, 8-value N-sweep + 5 benchmarks byte-identical across
+  tier-0/tier-1a/native.
+  - **MUST (both 2.3b-0 reviewers, arming-time correctness) — DONE:**
+    1. **Dropped `assert(result.entry_rbx == 0)`** in `runWithLinkedLoopDone`
+       (nativegen ~669): a fused child inherits the parent's cumulative rbx, so
+       `entry_rbx > 0` is expected steady state. `local = completed -% entry_rbx`
+       kept.
+    2. **Productivity classified by `local_completed`.** The final-trace productivity
+       check routes through `local_completed`, not cumulative `completed`; a chained
+       child that prologue-fails returns `completed = parent-cumulative` (nonzero) but
+       `local_completed == 0` and is correctly non-productive.
   - **Note (fable):** `linked_loop_done` is sticky once the stub sets it — every
     later body in the native run sees 1. Correct for Hop A (continuation + inner both
     want linked mode); a hazard only if 2.3c ever arms an exit into a body that must
     materialize *unlinked* loop-done — flag under P-C.
+  - **Outstanding within 2.3b-1's mechanism (non-blocking, deferred):**
+    - **Native completion bound (Issue 4).** The native drain permits up to
+      `visited.len + 1` (9) completions per burst; the tier-1a path caps at 8. This
+      is a heuristic burst maximum, **not** a correctness contract — accounting is
+      exact regardless of where the burst stops. The "8-hop" phrasing at doc §… and
+      in the `trace.zig`/`interp.zig` comments should be reconciled to this 9 vs. 8
+      native/tier-1a split.
+    - **Previously-armed-slot unpatching under active observation (Issue 5 → P-F).**
+      Once armed, a slot keeps fusing on later bursts even when `safe_to_arm` becomes
+      false (safepoint/replay recording active). This is now always CORRECTLY
+      accounted (the drain resolves + classifies every child by `final_trace_id`), so
+      it is not a correctness bug — but it widens the observation blackout window
+      beyond the driveChain hop bound. Resetting/declining armed slots when
+      observation activates is deferred to **P-F** as the observation-window concern.
 
 **Blocking prerequisites — must be designed before any patch is safe** (peer
 review, 2026-07-11; see §Blocking prerequisites for the argument):
@@ -255,6 +273,14 @@ review, 2026-07-11; see §Blocking prerequisites for the argument):
   them changes which traces get recorded/selected later, so byte-identity is **not**
   free. Either replicate the accounting on the patched path or prove it inert; and
   handle the exec-log mode that picks tier-1a before native (`interp.zig:2567`).
+  - **Observation-window unpatching (raised 2.3b-1, Issue 5).** A slot armed by
+    `driveChain` keeps fusing on later bursts even after `safe_to_arm` goes false
+    (safepoint/replay-line recording active). The fused hop is still exactly
+    accounted (the drain classifies every child by `final_trace_id`), so this is a
+    determinism-*window* concern, not a correctness bug: it widens the observation
+    blackout past the driveChain hop bound. P-F must reset/decline armed slots when
+    observation activates (or prove the widened window inert), landed alongside the
+    replicate-or-prove-inert work above.
 - [ ] **P-G — Child eligibility + prologue-failure fallback.** A direct patch
   bypasses `driveChain`'s guards (zero synthetic inputs — `seedTraceInputs` is
   mandatory for `inputs.len != 0`, `interp.zig:2551`; native availability; terminal

@@ -920,6 +920,13 @@ pub const TraceState = struct {
     /// but only increment when both linked traces execute through native pages.
     native_link_exits: u64 = 0,
     native_link_follow_count: u64 = 0,
+    /// 2.3b-1 (doc 17): count of `.link`-terminal slots actually armed in
+    /// `driveChain` — a continuation `C`'s `.link` slot pointed straight at its inner
+    /// root `I`'s `linked_entry`, so the next `C.run` fuses into `I` under the shared
+    /// frame with no Zig re-entry. `> 0` is the "the arm actually fires" signal the
+    /// 2.3b-1 differential test asserts (stdout equality alone cannot prove the slot
+    /// path, only that the fused and unfused runs agree).
+    native_link_arms: u64 = 0,
     /// **Coherent-state chaining (doc 16, Phase 2) diagnostics.** `prime_side_arms`
     /// counts outer-header prime side-traces armed (a productive branch-guard went
     /// hot and we switched to `.full` to record the current prime iteration).
@@ -1077,6 +1084,21 @@ pub const TraceState = struct {
     /// Highest-hit cached root trace at `(proto, pc)`. Link hand-offs are only
     /// sound to a real loop-root terminal; a continuation at the same bytecode PC
     /// is not an entry target for `.link`.
+    /// A `t` resolved from a fused exit's `final_trace_id` is only safe to consume
+    /// as "the inner root that just ran under fusion at `pc`" when it has the exact
+    /// shape `findLoopTrace` requires: a zero-input `.loop`-terminated root anchored
+    /// at `(proto, pc)`. Used to FAIL CLOSED — a fused result must be interpreted as
+    /// the trace whose id it baked, never substituted by a same-PC sibling; if the id
+    /// resolves to the wrong shape/location the child's exit left `regs[]` with no
+    /// known-coherent resume PC, so callers `@panic` (hard invariant failure) rather
+    /// than indexing a foreign trace's `instrs` (OOB / misclassified exit /
+    /// mis-accounting) or silently resuming at a PC that re-runs a committed loop.
+    fn isInnerLoopRoot(t: *const Trace, proto: *const Proto, pc: u32) bool {
+        return t.anchor.proto == proto and t.anchor.pc == pc and
+            t.inputs.len == 0 and
+            t.instrs.len != 0 and t.instrs[t.instrs.len - 1].op == .loop;
+    }
+
     pub fn findLoopTrace(self: *const TraceState, proto: *const Proto, pc: u32) ?*Trace {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
@@ -1243,6 +1265,13 @@ pub const TraceState = struct {
         comptime tier: ChainTier,
         materialization: ExitMaterialization,
         initially_excluded: []const *Trace,
+        // 2.3b-1 (doc 17): may this burst persistently arm a `.link` slot? False when
+        // the caller has a safepoint-line/suspend recording active — an mcode fusion
+        // removes the 8-hop `driveChain` observation boundary and would widen the
+        // blackout (doc 17 must-fix). The flag is only consulted on the native path;
+        // tier-1a never arms. Threaded from the dispatcher's Vm flags because those
+        // live on `*Vm`, not visible here.
+        safe_to_arm: bool,
     ) ?ChainResult {
         const exit_instr = result.exit_instr;
         if (exit_instr == std.math.maxInt(u32)) return null;
@@ -1330,7 +1359,18 @@ pub const TraceState = struct {
 
             // --- linked burst: the continuation ran to its `.link` terminator, so
             // ping-pong continuation ⇄ inner-root for a bounded number of hops. ---
-            if (is_link and sresult.exit_instr == sct.instrs.len - 1) {
+            // 2.3b-1: a *previous* burst may have persistently armed `sct`'s `.link`
+            // slot → an inner root's `linked_entry`, so this initial run FUSED — `sct`
+            // advanced its enclosing loop, hit the armed `.link`, and jumped straight
+            // into the inner root, which ran and stamped the FINAL `final_trace_id` with
+            // ITS id (≠ sct.id). That result never exits at `sct`'s own `.link` terminal
+            // (its `exit_instr` indexes the inner), so recognize the fusion directly and
+            // enter the burst with the inner result pre-loaded (`fused_inner`) — exactly
+            // as if the continuation had reached its `.link` and we had then run inner.
+            const sresult_fused = tier == .native_only and
+                sresult.final_trace_id != irinterp.NO_TRACE_ID and
+                sresult.final_trace_id != sct.id;
+            if (is_link and (sresult.exit_instr == sct.instrs.len - 1 or sresult_fused)) {
                 if (tier == .native_only) {
                     self.native_link_exits +|= 1;
                 } else {
@@ -1353,18 +1393,67 @@ pub const TraceState = struct {
                 // The design's `coherent_pc` cursor: where tier-0 resumes when the
                 // burst yields. Starts at the inner-root PC named by the `.link`.
                 var resume_pc: u32 = @intCast(current_link.instrs[current_link.instrs.len - 1].aux);
+                // 2.3b-1: carries an inner loop-done/mid result produced by a *fused*
+                // continuation run (armed `.link` slot jumped straight into inner). The
+                // loop top consumes it as this hop's inner result WITHOUT re-running
+                // inner (which would double-commit its loop). Seeded from a fused initial
+                // `sresult`; refilled by each fused `cresult` at the loop bottom. Only
+                // ever non-null on the native path.
+                var fused_inner: ?irinterp.ExecResult = if (sresult_fused) sresult else null;
                 var hops: usize = 0;
+                // BURST BOUND (native drain caveat): tier-1a commits at most `visited.len`
+                // (8) enclosing iterations per burst. The native drain permits ONE more —
+                // up to `visited.len + 1` (9) — because a hop's FIRST loop-done (the one
+                // that arms) increments `linked_completed` without incrementing `hops`, and
+                // the drain then runs up to `visited.len` further fused completions. The
+                // extra completion is semantically insignificant (one more real iteration
+                // committed natively vs. via tier-0) and the burst stays strictly bounded;
+                // it only means the observation/safepoint blackout can span 9 native inner
+                // loops rather than 8 (a heuristic maximum, not a correctness contract).
                 while (hops < visited.len) : (hops += 1) {
                     const link_term = current_link.instrs[current_link.instrs.len - 1];
                     const inner_pc: u32 = @intCast(link_term.aux);
-                    const inner = self.findLoopTrace(proto, inner_pc) orelse break;
+                    // Resolve THIS hop's inner root. When we hold a fused result (an armed
+                    // `current_link` slot `jmp`ed straight into a child), the child that
+                    // actually ran is the one whose id the exit baked — NOT necessarily the
+                    // current highest-hit trace at `inner_pc`. Under sibling traces at one
+                    // `inner_pc` (branch specialization / lane-widening) the armed slot may
+                    // target a trace `findLoopTrace` no longer picks; consuming that fused
+                    // result as a different sibling would index the wrong `instrs`
+                    // (out-of-bounds / misclassified exit) and mis-account. So a fused hop
+                    // resolves the runner STRICTLY by `final_trace_id` and validates its
+                    // shape — never substitutes another trace. A fused id always resolves
+                    // (P-B bakes a live id; nothing retires mid-burst); if it does NOT
+                    // resolve, or resolves to a non-inner-root shape, the child's exit
+                    // left `regs[]` in a state we can't map to any safe resume PC (neither
+                    // the inner header nor the post-inner continuation is known to be
+                    // coherent). `break` here would resume at `inner_pc` and re-run an
+                    // already-committed inner loop — silent double-count. So this is a
+                    // hard invariant failure, not a recoverable bail: panic.
+                    var inner: *Trace = undefined;
+                    if (fused_inner) |fr| {
+                        inner = self.traceById(fr.final_trace_id) orelse
+                            @panic("driveChain: fused final_trace_id did not resolve");
+                        if (!isInnerLoopRoot(inner, proto, inner_pc))
+                            @panic("driveChain: fused final trace is not the expected inner root");
+                    } else {
+                        inner = self.findLoopTrace(proto, inner_pc) orelse break;
+                    }
                     if (inner.inputs.len != 0) break;
                     if (tier == .native_only) self.native_link_follow_count +|= 1;
                     self.link_follow_count +|= 1;
 
                     var iresult: irinterp.ExecResult = undefined;
                     var ibuf: []Value = &.{};
-                    if (tier == .native_only) {
+                    if (fused_inner) |fr| {
+                        // A fused continuation run already executed `inner` under the
+                        // shared frame; its result IS this hop's inner result. Re-running
+                        // `inner` here would double-commit its loop, so consume the
+                        // carried result and skip the round-trip.
+                        std.debug.assert(tier == .native_only);
+                        iresult = fr;
+                        fused_inner = null;
+                    } else if (tier == .native_only) {
                         const int_native = self.nativeFor(inner) orelse break;
                         iresult = int_native.runLinkedLoopDone(regs);
                     } else {
@@ -1372,6 +1461,16 @@ pub const TraceState = struct {
                         iresult = irinterp.execute(inner, regs, ibuf);
                     }
                     if (iresult.exit_instr == std.math.maxInt(u32)) break;
+                    // `iresult.completed` is the chain-cumulative counter (`rbx`), which a
+                    // fused inner INHERITS from its parent — inflated. All inner-recording
+                    // accounting must steer on the inner's OWN iteration count, so use
+                    // `local_completed` on the native path (== `completed` when unfused,
+                    // since a fresh trampoline entry zeroes `rbx`). Tier-1a never fuses, so
+                    // its `completed` already IS local (its `local_completed` is 0).
+                    const inner_local: usize = if (tier == .native_only)
+                        iresult.local_completed
+                    else
+                        iresult.completed;
 
                     const inner_exit_pc = guardExitPc(inner.instrs[iresult.exit_instr]) orelse break;
                     // The inner root reached its numeric loop-done ⟺ its exit PC
@@ -1386,10 +1485,10 @@ pub const TraceState = struct {
                     const loop_done = inner_exit_pc >= 1 and
                         proto.code[inner_exit_pc - 1].op == .for_loop;
                     if (!loop_done) {
-                        if (iresult.completed > 0) {
-                            self.onSideExit(inner, iresult.completed);
+                        if (inner_local > 0) {
+                            self.onSideExit(inner, inner_local);
                             return .{
-                                .completed = if (linked_completed > 0) linked_completed else iresult.completed,
+                                .completed = if (linked_completed > 0) linked_completed else inner_local,
                                 .resume_pc = resume_pc,
                             };
                         }
@@ -1412,12 +1511,12 @@ pub const TraceState = struct {
                     // NOT at the inner header — so the inner loop is not re-run.
                     if (current_link.anchor.pc != inner_exit_pc) {
                         const cont = self.findLinkTrace(proto, inner_exit_pc) orelse {
-                            self.onSideExit(inner, if (iresult.completed > 0) iresult.completed else 1);
+                            self.onSideExit(inner, if (inner_local > 0) inner_local else 1);
                             return .{ .completed = linked_completed + 1, .resume_pc = inner_exit_pc };
                         };
                         if (tier == .native_only) {
                             snt = self.nativeFor(cont) orelse {
-                                self.onSideExit(inner, if (iresult.completed > 0) iresult.completed else 1);
+                                self.onSideExit(inner, if (inner_local > 0) inner_local else 1);
                                 return .{ .completed = linked_completed + 1, .resume_pc = inner_exit_pc };
                             };
                         }
@@ -1429,8 +1528,43 @@ pub const TraceState = struct {
                     // exit completes exactly one enclosing-loop iteration — true even
                     // when it reports `completed == 0` (a one-trip inner loop). It is
                     // a successful hand-off, not a low-yield entry to penalize.
-                    self.onSideExit(inner, if (iresult.completed > 0) iresult.completed else 1);
+                    self.onSideExit(inner, if (inner_local > 0) inner_local else 1);
                     linked_completed += 1;
+
+                    // 2.3b-1: arm `current_link`'s `.link`-terminal slot → `inner`'s
+                    // `linked_entry`, so the NEXT run of `current_link` `jmp`s straight
+                    // into `inner` under the shared frame — the continuation→inner hop
+                    // fuses into one native call, no ~600 ns Zig re-entry. Gated on:
+                    //  - native tier (tier-1a has no slots);
+                    //  - `safe_to_arm` (no safepoint-line/suspend recording — an armed
+                    //    hop erases the 8-hop observation boundary, doc 17 must-fix);
+                    //  - `inner.inputs.len == 0` (a bare `jmp` can't seed inputs);
+                    //  - fail-closed same-inner check: the terminal slot we arm must
+                    //    actually name THIS inner's root PC, else stay unarmed.
+                    // CRITICAL: read the terminal from `current_link` HERE, AFTER the
+                    // possible driver swap above (prime-side ramp → continuation). The
+                    // hop-top `link_term` is the *ramp's* terminal; arming `current_link`'s
+                    // (now the continuation's) slot while validating the ramp's `aux` would
+                    // point the continuation's slot at a root its own `.link` doesn't name.
+                    // `findLinkTrace` only proved the continuation ends in `.link`, not that
+                    // its `aux == inner_pc`, so we must re-check the trace we actually arm.
+                    // The `.link` terminal is the last IR instr, so its slot index is
+                    // `instrs.len - 1` (slots are indexed by IR instr index). Persisted via
+                    // `armNativeLink` (registers the P-E backlink so a retiring `inner`
+                    // resets the slot before its mcode is reused).
+                    const arm_term = current_link.instrs[current_link.instrs.len - 1];
+                    if (tier == .native_only and safe_to_arm and inner.inputs.len == 0 and
+                        arm_term.op == .link and @as(u32, @intCast(arm_term.aux)) == inner_pc)
+                    {
+                        if (self.nativeFor(inner)) |inat| {
+                            if (inat.linked_entry) |le| {
+                                const slot: u32 = @intCast(current_link.instrs.len - 1);
+                                if (self.armNativeLink(current_link, slot, inner, le) catch false) {
+                                    self.native_link_arms +|= 1;
+                                }
+                            }
+                        }
+                    }
 
                     var cresult: irinterp.ExecResult = undefined;
                     if (tier == .native_only) {
@@ -1438,6 +1572,92 @@ pub const TraceState = struct {
                     } else {
                         const cbuf = self.valuesScratch(current_link.instrs.len) catch break;
                         cresult = irinterp.execute(current_link, regs, cbuf);
+                    }
+                    // 2.3b-1: drain fused continuation runs. An armed `current_link.link`
+                    // slot makes `snt.run` jump straight into a child inner root under the
+                    // shared frame, so `cresult` belongs to that CHILD (its baked
+                    // `final_trace_id != current_link.id`) and represents "outer advanced +
+                    // inner ran" — the same work the unfused [cont-run, inner-run] pair does,
+                    // collapsed into one native call. Key the drain on "not current_link's own
+                    // exit" and resolve the child STRICTLY by `final_trace_id` — NOT the
+                    // top-of-hop `inner`: a previously-armed slot (armed a prior burst, not
+                    // rearmed this burst because `safe_to_arm` was false) can target a sibling
+                    // that `findLoopTrace` no longer picks, so `inner` and the fused runner
+                    // can diverge. Classify + account the resolved child HERE, never by
+                    // re-entering the loop top (which would run inner a SECOND time and
+                    // double-commit its loop), then run the still-armed continuation again
+                    // until the hop budget, a mid-loop inner exit, or it stops fusing.
+                    while (tier == .native_only and cresult.final_trace_id != irinterp.NO_TRACE_ID and
+                        cresult.final_trace_id != current_link.id)
+                    {
+                        // A fused child-owned id that fails to resolve, or resolves to a
+                        // non-inner-root shape, is the SAME hard invariant failure as the
+                        // hop-0 seed: the child's exit left `regs[]` in a state with no
+                        // known-coherent resume PC, so bailing (`break` → fall to the
+                        // child-owned `continue` → re-enter the loop top) could re-run an
+                        // already-committed inner loop. Panic instead of silently bailing.
+                        const dinner = self.traceById(cresult.final_trace_id) orelse
+                            @panic("driveChain: drained fused final_trace_id did not resolve");
+                        if (!isInnerLoopRoot(dinner, proto, inner_pc))
+                            @panic("driveChain: drained fused final trace is not the expected inner root");
+                        self.native_link_exits +|= 1;
+                        // Fused inner inherits the parent's cumulative `rbx`; steer on its
+                        // OWN count (`local_completed`), never the inflated `completed`.
+                        const flocal = cresult.local_completed;
+                        // Loop-done ⟺ the inner exit PC follows a `for_loop` (the static
+                        // discriminator the loop top uses). Every other exit is a mid-loop
+                        // deopt that resumes tier-0 at the inner header WITHOUT counting an
+                        // enclosing iteration. TWO non-loop-done cases both default `false`
+                        // here; both were once `true` and both produced phantom iterations
+                        // whose inner body never ran (stranding that iteration's work when
+                        // tier-0 resumed post-inner):
+                        //  - `exit_instr == maxInt`: native `prologue_fail` (nativegen bakes
+                        //    `exit_instr = -1` when a hoisted entry guard fails before the
+                        //    body commits any of ITS own iterations). Under fusion the child
+                        //    inherits the parent's cumulative `rbx`, so `local_completed == 0`
+                        //    — the child ran zero inner trips, NOT a completion.
+                        //  - `guardExitPc == null`: an ARRAY guard (`guard_fits`/`guard_lane`/
+                        //    `guard_bounds`, which repurpose `aux` as a lane ordinal, not a
+                        //    PC) — a mid-loop grow/bounds deopt (the `guard_fits` first-trip
+                        //    deopt that surfaced this whole class).
+                        const fdone = if (cresult.exit_instr == std.math.maxInt(u32))
+                            false
+                        else if (guardExitPc(dinner.instrs[cresult.exit_instr])) |fpc|
+                            fpc >= 1 and proto.code[fpc - 1].op == .for_loop
+                        else
+                            false;
+                        if (!fdone) {
+                            // Mid-loop inner exit inside the fusion: the deopt flushed the
+                            // child's snapshot, so regs are coherent at the inner header —
+                            // tier-0 resumes at `inner_pc`. (`linked_completed` is ≥1 here,
+                            // this burst having already committed the hop that armed.)
+                            self.onSideExit(dinner, flocal);
+                            return .{
+                                .completed = if (linked_completed > 0) linked_completed else flocal,
+                                .resume_pc = inner_pc,
+                            };
+                        }
+                        // Inner loop-done: one more enclosing iteration committed natively.
+                        // Coherent state is post-inner, at the continuation's anchor.
+                        self.onSideExit(dinner, if (flocal > 0) flocal else 1);
+                        linked_completed += 1;
+                        resume_pc = current_link.anchor.pc;
+                        hops += 1;
+                        if (hops >= visited.len) break;
+                        cresult = snt.run(regs);
+                    }
+                    if (tier == .native_only and cresult.final_trace_id != irinterp.NO_TRACE_ID and
+                        cresult.final_trace_id != current_link.id)
+                    {
+                        // The drain left a still-fused (child-owned) `cresult`: the ONLY way
+                        // to reach here is the hop-budget `break` (line ~1636) with the last
+                        // child already committed + accounted and `resume_pc` post-inner —
+                        // the drain's resolution failures now panic rather than break, so
+                        // there is no unresolved-id path into this arm. This `cresult` is a
+                        // child's, not `current_link`'s own, so `continue` rather than fall
+                        // into the `.link`/completed checks below, which would misread a
+                        // child-owned result as the continuation's.
+                        continue;
                     }
                     if (cresult.exit_instr == current_link.instrs.len - 1) {
                         if (tier == .native_only) self.native_link_exits +|= 1;
@@ -4884,7 +5104,7 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
     // Fake a guard failure in Trace A at instr index 1 (the guard_int), and
     // exclude A (the dispatcher's `visited` set) so the driver walks to B.
     var tr_regs = TestRegs{ .regs = &regs };
-    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a});
+    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false);
     tr_regs.commit(); // the chained side trace mutated the window — reflect it back
     try testing.expect(chained != null);
     try testing.expectEqual(@as(usize, 3), chained.?.completed); // Trace B ran 3 iters
@@ -5045,7 +5265,7 @@ test "driveChain ordinary_header: chains at the anchor, not a guard's lane ordin
     // Exclude A (the dispatcher's `visited` set). The driver walks A's anchor
     // (pc 10), finds no other sibling there, and must NOT reach the decoy at pc 2.
     var tr_regs = TestRegs{ .regs = &regs };
-    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a});
+    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false);
     tr_regs.commit(); // commit so a (buggy) decoy mutation would surface — keeps the test's teeth
     try testing.expect(chained == null);
     try testing.expectEqual(@as(i64, 0), regs[0].asInt()); // r0 untouched — no decoy ran

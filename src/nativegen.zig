@@ -660,13 +660,14 @@ pub const CompiledTrace = struct {
         } else {
             self.page.entry(EntryFn)(regs.tags, regs.payloads, &result);
         }
-        // 2.3b-0: the final trace's OWN committed count = cumulative rbx − the rbx it
-        // inherited at entry. `-%` because a spurious wrap is never worse than the old
-        // behaviour and there is no valid case where entry_rbx > completed. Nothing is
-        // armed yet, so every body is entered fresh (rbx = 0 → entry_rbx = 0); this
-        // invariant PINS that the snapshot mechanism is wired correctly before 2.3b-1
-        // starts feeding cumulative rbx across a chain.
-        std.debug.assert(result.entry_rbx == 0);
+        // 2.3b-0/2.3b-1: the final trace's OWN committed count = cumulative rbx − the
+        // rbx it inherited at entry. `-%` because a spurious wrap is never worse than the
+        // old behaviour and there is no valid case where entry_rbx > completed. Before
+        // 2.3b-1 armed a slot, every body was entered fresh (rbx = 0 → entry_rbx = 0) and
+        // this equalled `completed`; now that a parent `.link` slot can `jmp` straight
+        // into a child under the shared frame, the fused child inherits the parent's
+        // cumulative `rbx`, so `entry_rbx > 0` is the expected steady state and the old
+        // `assert(entry_rbx == 0)` no longer holds.
         const local: usize = result.completed -% result.entry_rbx;
         return .{
             .completed = result.completed,

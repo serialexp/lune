@@ -9,13 +9,18 @@
   Stable `Trace.id` + `NativeResult.final_trace_id` baked at every native exit +
   `traceById` dispatcher resolve/assert. No linking yet; every exit bakes its own
   `ct.id`, so `final == ct` and behaviour is byte-identical.
-- **Increment 2.3a (indirect exit + link-slot table + P-E registry): LANDED
-  (uncommitted at time of writing this note — commit next).** Indirect
-  `jmp qword [&slot]` exit; per-trace heap-owned `slots: []usize` defaulting to
-  `shared_exit`; inert P-E backlink registry (`armed_links` +
-  `armNativeLink`/`resetLinksTouching`, reset before `destroy`). Nothing arms a
-  slot, so `armed_links` stays empty and `final == ct` still holds — byte-identical.
-- **Increment 2.3b+ : DESIGNED + PEER-REVIEWED + DECIDED** — see
+- **Increment 2.3a (indirect exit + link-slot table + P-E registry): LANDED** —
+  commit `b8fc3fa` (+ hardening `286b145`). Indirect `jmp qword [&slot]` exit;
+  per-trace heap-owned `slots: []usize` defaulting to `shared_exit`; inert P-E
+  backlink registry. Byte-identical.
+- **Increment 2.3b-0 (inert arming scaffolding): LANDED** — commits `9d16711`,
+  `963bdbb`, `319da11`, `954ea89` (+ review `e658d07`). S3 cumulative-rbx prep,
+  fail-closed `traceById`, `entry_rbx`→`local_completed`, `linked_entry` stub.
+  Nothing armed; `final == ct`; byte-identical.
+- **Increment 2.3b-1 (flip `.link` arming on): LANDED** — Step B (dispatcher routes
+  through `final`) committed `66107a7`; Step A (driveChain persistent arming +
+  unified fusion drain) is THIS commit. See the 2.3b-1 section below.
+- **Increment 2.3c+ : DESIGNED + PEER-REVIEWED + DECIDED** — see
   `docs/design/17-exit-branch-patching.md` (Done/Outstanding) and the plan file.
 
 ## What 2.2 changed (the chain-wide result contract, P-B)
@@ -235,7 +240,69 @@ Four inert commits, each `just test` green + nsieve 3-mode byte-identical + tier
   `x64.Assembler.labelOffset`). Wiring invariant `arena ⟺ linked_entry`. Inert —
   nothing targets it until 2.3b-1.
 
-NEXT: peer-review 2.3b-0 (codex gpt-5.6-sol + fable), then 2.3b-1 arming.
+## 2.3b-1 — flip `.link` arming ON: LANDED (byte-identical)
+
+Two commits. **Step B (`66107a7`, committed):** dispatcher routes exit consumers
+through `final = traceById(final_trace_id)` (strict on native — `@panic` on null,
+release too; tier-1a still `ct`), productivity via `local_completed`.
+**Step A (THIS commit):** `driveChain` actually arms + drains fused hops.
+
+- **Arming** (`trace.zig`): after a hop is accounted, arm the continuation's
+  `.link`-terminal slot → `inner.linked_entry` via `armNativeLink(current_link,
+  len-1, inner, le)`. Eligibility: `tier == .native_only`, `safe_to_arm`,
+  `inner.inputs.len == 0`, and the terminal (re-read AFTER the driver swap) is
+  `.link` with `aux == inner_pc`. `safe_to_arm = suspend_ctl == null and
+  !record_safepoint_lines`, computed in the dispatcher and threaded into
+  `driveChain` (all 6 call sites). New counter `native_link_arms`.
+- **Fused drain** (`trace.zig`): a `snt.run(current_link)` whose `final_trace_id !=
+  current_link.id` fused straight into a child inner root. The drain resolves that
+  child **STRICTLY** by `traceById(final_trace_id)` + `isInnerLoopRoot` shape check
+  (never `findLoopTrace` substitution — a previously-armed slot can target a sibling
+  `findLoopTrace` no longer picks). Loop-done vs. mid-loop is classified by
+  `guardExitPc(child.instrs[exit_instr])` following a `for_loop`; steering uses the
+  child's OWN `local_completed` (it inherits the parent's cumulative rbx). Same
+  strict resolution seeds hop-0.
+- **Hard-fail on identity break:** an unresolvable/mis-shaped fused id is a `@panic`,
+  NOT a bail — the child's exit leaves `regs[]` with no known-coherent resume PC, so
+  a `break`+resume could re-run a committed inner loop (silent double-count). Applies
+  to hop-0 seed, the drain, and the dispatcher's native resolution.
+- **Asserts dropped:** `assert(final == ct)` (interp.zig) and `assert(entry_rbx ==
+  0)` (nativegen `runWithLinkedLoopDone`) — both false once fusion is live (a fused
+  child inherits the parent's cumulative rbx and performs the final exit ≠ ct).
+
+### Bug fixed during 2.3b-1 (under-count, native 2346810 vs 2406000)
+A `guard_fits` array-guard mid-loop deopt on the fused inner's first trip
+(`local_completed == 0`) was misclassified as loop-done, because `guardExitPc`
+returns null for array guards and the drain's `fdone` defaulted null → `true`,
+counting a phantom outer iteration and stranding iteration i=N. FIX: default the
+null-`guardExitPc` and `exit_instr == maxInt` (prologue_fail) cases to `false`
+(mid-loop → resume inner header, don't count).
+
+### Peer review (codex gpt-5.6-sol, 3 rounds) — CLOSED
+Round 1: 5 issues (prologue_fail maxInt phantom, fused-consumed-as-findLoopTrace,
+pre-swap terminal validation, leftover `final==ct`, within-burst identity hole) —
+all fixed. Round 2: demanded strict fail-closed identity resolution (no
+substitution) — applied. Round 3: the fail-closed bails must `@panic` not `break`
+(no safe resume PC), + strict native dispatcher resolution in release — applied.
+Verdict: **no correctness blocker**; two doc nits (bail-comment wording, mirror the
+9-completion bound into doc 17) — both addressed.
+
+### Verification done for 2.3b-1
+- `just test` green (EXIT=0; Debug asserts + link-counter tests).
+- N-sweep 22/23/24/25/30/50/100/400: tier-0 == tier-1a == native byte-identical.
+- Differential tier-0 == tier-1a == native OK on: nsieve, nbody, mandelbrot,
+  fannkuch (spectralnorm.lua absent locally).
+
+### Deferred out of 2.3b-1 (non-blocking, recorded in doc 17)
+- **Issue 4:** native drain permits ≤ `visited.len + 1` (9) completions vs tier-1a's
+  8 — a heuristic burst max, not a correctness contract; the "8-hop" comments should
+  be reconciled to the 9-vs-8 split.
+- **Issue 5 → P-F:** a slot stays armed and keeps fusing after `safe_to_arm` goes
+  false; always correctly accounted, but widens the observation blackout window.
+  Reset/decline-on-observation deferred to P-F.
+
+NEXT: Increment 2.3c — arm ordinary source-branch guards + loop-done (S1 dual
+materialization, S3 prologue-fail split, slot-identity collision decision).
 
 ## Unpushed local commits (Rule #15 — don't push unless asked)
 master is well ahead of origin/master; do NOT push without Bart's say-so.

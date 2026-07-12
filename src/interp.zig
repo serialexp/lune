@@ -2564,6 +2564,12 @@ pub const Vm = struct {
                                 self.trace.entries +%= 1;
                                 var ran_native = false;
                                 var ran_native_link_mode = false;
+                                // 2.3b-1 (doc 17): a `driveChain` burst may persistently
+                                // arm a `.link` slot only when no safepoint-line/suspend
+                                // recording is active — an mcode fusion collapses the
+                                // 8-hop observation boundary and would widen the blackout.
+                                // (record_exec_log already precludes the native path.)
+                                const safe_to_arm = self.suspend_ctl == null and !self.record_safepoint_lines;
                                 const result = if (self.trace.config.record_exec_log) blk: {
                                     const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, trace_regs, buf);
                                     const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, trace_regs, buf);
@@ -2586,25 +2592,28 @@ pub const Vm = struct {
                                 self.trace.last_exit_instr = result.exit_instr;
 
                                 // P-B (doc 17): resolve the FINAL trace in the chain
-                                // from the id baked into the native exit stub. With no
-                                // linking armed yet, every exit bakes its own `ct.id`,
-                                // so `final == ct` always holds — the assert validates
-                                // the baked-id round-trip end-to-end (id → stub imm32 →
-                                // NativeResult → traceById). 2.3 routes consumers
-                                // through `final` once child links populate a real id.
-                                // Fail closed (2.3b-0): a native exit ALWAYS bakes a
-                                // live trace id (P-B), so under `ran_native` the id must
-                                // resolve — the bare `orelse ct` would silently mask a
-                                // missing/retired id as `final == ct` and hide exactly the
-                                // dangling-link bug P-E guards against. Assert resolution
-                                // *before* the fallback. `resolved.? == ct` still holds
-                                // until 2.3b-1 arms the first link (dropped there).
+                                // from the id baked into the native exit stub. The
+                                // consumers below route through `final` — the trace that
+                                // performed the final native exit — which for a directly-
+                                // entered UNARMED trace is `ct`, but for an ARMED parent
+                                // whose slot fused into a child is the CHILD (a distinct
+                                // id ≠ ct.id). 2.3b-1 arms the first `.link` slot, so
+                                // `final == ct` no longer holds and its assert is dropped
+                                // (as this comment always promised: "dropped there").
+                                // Fail closed (2.3b-1): a native exit ALWAYS bakes a live
+                                // trace id (P-B), and under an ARMED slot that id can be a
+                                // fused child ≠ ct. Native resolution is therefore STRICT —
+                                // a null here means the baked id is missing/retired (the
+                                // dangling-link bug P-E guards against) and there is no safe
+                                // `ct` substitute (routing a child's exit through `ct`'s
+                                // instrs would misclassify the guard / resume PC). Panic
+                                // rather than silently fall back, in release builds too.
+                                // tier-1a never arms, so its `final` is unconditionally `ct`.
                                 const resolved: ?*trace.Trace = self.trace.traceById(result.final_trace_id);
-                                const final: *trace.Trace = resolved orelse ct;
-                                if (ran_native) {
-                                    std.debug.assert(resolved != null);
-                                    std.debug.assert(final == ct);
-                                }
+                                const final: *trace.Trace = if (ran_native)
+                                    (resolved orelse @panic("dispatcher: native final_trace_id did not resolve"))
+                                else
+                                    ct;
 
                                 // 2.3b-1 (doc 17): every EXIT consumer below routes
                                 // through `final` (the trace that performed the final
@@ -2726,13 +2735,13 @@ pub const Vm = struct {
                                     // for a bounded burst, and tells us where
                                     // tier-0 should resume when it yields.
                                     if (ran_native and ran_native_link_mode) {
-                                        if (self.trace.driveChain(final, result, proto, trace_regs, .native_only, .native_numeric_for_done, &.{})) |chain| {
+                                        if (self.trace.driveChain(final, result, proto, trace_regs, .native_only, .native_numeric_for_done, &.{}, safe_to_arm)) |chain| {
                                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                             for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                             continue :outer;
                                         }
                                     } else if (!ran_native) {
-                                        if (self.trace.driveChain(final, result, proto, trace_regs, .ir, .{ .ir_numeric_for_done = buf }, &.{})) |chain| {
+                                        if (self.trace.driveChain(final, result, proto, trace_regs, .ir, .{ .ir_numeric_for_done = buf }, &.{}, safe_to_arm)) |chain| {
                                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                             for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                             continue :outer;
@@ -2771,13 +2780,13 @@ pub const Vm = struct {
                                     // trace expects.
                                     if (self.trace.isSourceBranchGuardExit(final, result.exit_instr, proto)) {
                                         if (ran_native) {
-                                            if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, visited[0..nvisited])) |chain| {
+                                            if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, visited[0..nvisited], safe_to_arm)) |chain| {
                                                 if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                                 for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                                 continue :outer;
                                             }
                                         } else {
-                                            if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited])) |chain| {
+                                            if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited], safe_to_arm)) |chain| {
                                                 if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                                 for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                                 continue :outer;
@@ -2840,13 +2849,13 @@ pub const Vm = struct {
                                 // into two literal-tier calls (as the branch-guard site
                                 // above does) rather than a runtime tier value.
                                 if (ran_native) {
-                                    if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, visited[0..nvisited])) |chain| {
+                                    if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, visited[0..nvisited], safe_to_arm)) |chain| {
                                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                         for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                         continue :outer;
                                     }
                                 } else {
-                                    if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited])) |chain| {
+                                    if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited], safe_to_arm)) |chain| {
                                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                         for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                         continue :outer;
