@@ -775,12 +775,18 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
     // built-in A/B of the two ABIs over the same lowered trace.
     var shared_exit: ?usize = null;
     var tramp_entry: ?usize = null;
-    // Link-slot table (doc 17 Increment 2.3), one usize per IR instr index. Allocated
-    // only on the frameless production path (the self-framed test page has no shared
-    // trampoline to default to and never chains). Every slot defaults to `shared_exit`,
-    // so an unarmed exit behaves exactly like 2.1's direct jump — the table is inert
-    // until `driveChain` arms a slot. Its address must be stable *before* `lower` bakes
-    // `&slots[i]` as an imm64, so it is allocated here and handed in.
+    // Link-slot table (doc 17 Increment 2.3), one usize per IR instr index PLUS one
+    // reserved trailing "direct cell" (index `n`, 2.3c-0f). Allocated only on the
+    // frameless production path (the self-framed test page has no shared trampoline to
+    // default to and never chains). Every entry defaults to `shared_exit`, so an unarmed
+    // exit behaves exactly like 2.1's direct jump — the table is inert until `driveChain`
+    // arms a slot. Its address must be stable *before* `lower` bakes `&slots[i]` as an
+    // imm64, so it is allocated here and handed in. The reserved `slots[n]` is the
+    // immutable dispatch target for loop-done ORDINARY exits: a numeric-for loop-done
+    // guard's `slot[ei]` is exclusively its linked-materialized exit (P-C option (b)
+    // invariant), so its ordinary deopt must bypass `slot[ei]` and reach `shared_exit`
+    // via this never-armed cell (arming is keyed by IR index `< n`, so `slots[n]` is
+    // never touched).
     var slots: []usize = &.{};
     if (arena) |ar| {
         // A frameless body may only address SPILL_MAX spill slots (the trampoline
@@ -789,7 +795,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
         const tr = ar.ensureTrampoline() catch return null;
         shared_exit = tr.shared_exit;
         tramp_entry = tr.entry;
-        slots = gpa.alloc(usize, n) catch return null;
+        slots = gpa.alloc(usize, n + 1) catch return null;
         @memset(slots, tr.shared_exit);
     }
 
@@ -4302,8 +4308,18 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         }
     }
 
-    // Per-guard side-exit stubs. Each writes the deterministic failing IR index,
-    // then jumps to the shared single-snapshot flush.
+    // Per-guard side-exit stubs. Each writes the deterministic failing IR index, then
+    // loads the dispatch-target HOLDER into rax and jumps to the shared single-snapshot
+    // flush (`deopt_exit`), which flushes carried homes, writes `completed`, and jumps
+    // `qword [rax]` (2.3c-0f). rax is dead scratch at the exit (flush not yet run reads
+    // no rax), so the mini-stub may stage the holder here and it survives the flush.
+    //
+    // Ordinary guard: dispatch through its OWN `slot[ei]` — default `shared_exit`
+    // (byte-identical to 2.1's direct jump), armed to a child body entry in 2.3c-1.
+    // Loop-done guard: the `linked_loop_done != 0` case jumps to the linked-materialized
+    // stub (mode 1); the ORDINARY fallthrough (mode 0) must bypass `slot[ei]` — that
+    // slot is EXCLUSIVELY the linked exit (P-C option (b) invariant) — so it dispatches
+    // through the reserved never-armed direct cell `slots[n]` (= `shared_exit`).
     for (exit_labels, 0..) |maybe_l, ei| {
         if (maybe_l) |l| {
             a.bind(l);
@@ -4311,6 +4327,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             if (isNumericForLoopDoneGuard(t, ei)) {
                 try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
                 try a.jcc(.ne, try nativeLinkedLoopDoneLabel(a, linked_loop_done_labels, ei));
+                // mode 0 (ordinary loop-done deopt): bypass slot[ei] → direct cell.
+                if (shared_exit != null)
+                    try a.movRegImm64(.rax, @bitCast(@as(u64, slotAddr(slots, t.instrs.len).?)));
+            } else if (shared_exit != null) {
+                // ordinary guard: dispatch through its own slot[ei].
+                try a.movRegImm64(.rax, @bitCast(@as(u64, slotAddr(slots, ei).?)));
             }
             try a.jmp(deopt_exit);
         }
@@ -4343,10 +4365,21 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
     }
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
-    // Non-chainable fallback: the shared deopt flush is the destination of every
-    // ordinary guard's mini-stub; it always returns to the dispatcher (`shared_exit`).
-    // Ordinary-guard arming (2.3c) intercepts at the per-guard mini-stub, not here.
-    try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
+    // P-B: stamp the final trace id. `emitReturn` normally does this, but here the
+    // dispatch target is the HOLDER already staged in rax by the mini-stub (its own
+    // `slot[ei]`, or the reserved direct cell for a loop-done ordinary exit), not a
+    // fixed address baked in this shared block — so inline the id stamp + dispatch.
+    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(t.id));
+    if (shared_exit) |_| {
+        // 2.3c-0f: frameless — dispatch through the mini-stub's target holder. An
+        // unarmed `slot[ei]` holds `shared_exit` (byte-identical to 2.1's direct jump);
+        // 2.3c-1 arms it to a child body entry. rax is dead scratch here (flush done).
+        try a.jmpMem(.rax, 0);
+    } else {
+        // Self-framed test page: no slot table, no shared trampoline — tear down the
+        // per-trace frame and `ret` exactly as before (mini-stubs staged no rax here).
+        try emitTeardown(a, frame, callee[0..callee_len]);
+    }
 
     // PROLOGUE_FAIL: a hoisted type guard failed before this body committed any
     // iteration of its OWN loop. regs[] is untouched (the cut-1 EXIT would have
