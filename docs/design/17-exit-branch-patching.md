@@ -233,6 +233,63 @@ names (run today via `runLinkedLoopDone`, trace.zig:1369). Findings:
       beyond the driveChain hop bound. Resetting/declining armed slots when
       observation activates is deferred to **P-F** as the observation-window concern.
 
+**Increment 2.3c — arm the remaining nsieve hops (ACTIVE; re-scoped 2026-07-12 by a
+codex gpt-5.6-sol contract review that caught two blockers the plan missed).** The
+skip→prime-side (ordinary source-branch guard) and inner→continuation (numeric-for
+loop-done guard) hops. The review found: (i) arming inner→continuation closes a
+persistent native cycle `continuation↔inner` that escapes the `hops<8` bound AND
+`driveChain`'s safepoint/GC/replay observation boundary — `safe_to_arm` only blocks
+*new* arms, never resets a slot armed earlier; (ii) `linked_entry` sets
+`linked_loop_done=1` and nothing clears it, so inner→continuation would make the
+continuation inherit mode 1 (wrong if it has its own loop-done guard). It also
+settled that S1's slot-selected-materialization rewrite is **unnecessary** (runtime
+mode selection already picks correctly; armedness ≠ requested materialization) and
+that ordinary guards keep ONE shared flush (don't duplicate the carried-home flush
+per guard). Split into three:
+
+- [ ] **Increment 2.3c-0 — inert contracts (byte-identical, nothing armed).**
+  - **(a) P-C option (b) invariant.** `slot[ei]` of a numeric-for loop-done guard is
+    exclusively its linked-materialized exit; its ordinary deopt never slot-armed.
+    Enforce at emission (nativegen) + arming (trace.zig).
+  - **(b) Distinct prologue-fail exit reason.** Stop overloading `exit_instr=maxInt`
+    to mean both "no guard identity" and "prologue failed". Add an explicit reason
+    discriminator so the dispatcher can model three independent facts: final = child,
+    child-local commits = 0, chain/global progress > 0. (`completed=rbx` is a raw
+    cumulative native counter — "prior native progress exists", NOT the enclosing-chain
+    progress count; keep that distinction.)
+  - **(c) `ordinary_entry`/`linked_entry` entry contracts.** Add an `ordinary_entry`
+    secondary entry presetting `linked_loop_done=0` then falling into `body_entry`,
+    mirroring `linked_entry` (mode 1). inner→continuation (2.3c-2) targets
+    `ordinary_entry`.
+  - **(d) Route remaining `final != ct` consumers.** 2.3b-1 left these keyed on the
+    entered `ct`: widen-eviction `laneWidenedPast(ct)` / retire `ct`
+    (`interp.zig:2823`); the `visited` list holds `ct` not the final child (child
+    prologue-fail could immediately rerun the failed child); `ran_native_link_mode`
+    computed from `ct` but materialization can belong to a fused child. Route eviction
+    + guard-shape + materialization classification through `final`; exclude both entered
+    `ct` and final child from immediate sibling retry on prologue-fail.
+  - **(e) Disarm-on-unsafe (Bart's chosen cycle bound).** When observation/suspend/
+    replay mode becomes unsafe, actively reset all relevant armed slots to
+    `shared_exit` via the P-E `armed_links` registry, so the next handoff returns to
+    the dispatcher and re-establishes the safepoint/GC boundary. Wired inert now (no
+    armed slots yet); becomes load-bearing in 2.3c-2 when the cycle closes.
+  - **(f) Shared ordinary-guard flush + default-slot tail.** Per-guard mini-stub
+    writes `exit_instr` then jumps the SHARED deopt flush, which flushes carried homes
+    + `completed=rbx` then dispatches through `slot[exit_instr]` (default
+    `shared_exit`) — do NOT duplicate the flush per guard (code-size blowup on
+    branch-heavy traces). Loop-done ordinary exits bypass slot dispatch → `shared_exit`
+    (P-C invariant). All slots still default `shared_exit` → byte-identical.
+- [ ] **Increment 2.3c-1 — arm skip→prime-side only (no cycle).** `driveChain` arms
+  the ordinary source-branch guard slot → prime-side child (`ordinary_entry`).
+  Exercises shared-flush correctness, ordinary child entry mode, child prologue-fail
+  fallback, final-child dispatcher routing, P-E reset for guard slots. Does not close
+  the continuation↔inner cycle. Same eligibility + safepoint gate + accounting as 2.3b.
+- [ ] **Increment 2.3c-2 — arm loop-done inner→continuation (closes the cycle).** Arm
+  the existing linked-loop-done `slot[ei]` → continuation's `ordinary_entry`. Lands
+  ONLY after 2.3c-0e's disarm-on-unsafe is proven load-bearing (this is the step that
+  closes the persistent native cycle). S1 slot-selected materialization rewrite is
+  explicitly NOT part of this — runtime mode selection kept.
+
 **Blocking prerequisites — must be designed before any patch is safe** (peer
 review, 2026-07-11; see §Blocking prerequisites for the argument):
 
@@ -242,19 +299,26 @@ review, 2026-07-11; see §Blocking prerequisites for the argument):
   return/materialization paths and post-loop coherent PCs. Each transition kind in
   nsieve's chain needs its own patch/link rule; patching only ordinary guards
   leaves most hops re-entering Zig.
-  - **OPEN QUESTION (2.3a review — decide before 2.3c arms ordinary guards):**
-    the slot table is indexed by *IR instruction index*, but that is an exit
-    *instruction* identity, not an exit *kind* identity. A numeric-for loop-done
-    guard at index `ei` has **two** logical exits sharing that index — the ordinary
-    deopt (chain to same-anchor sibling) and the linked-loop-done (materialize final
-    iteration, chain to continuation). 2.3a arms neither (only the `.link` terminal,
-    at the distinct terminal index), so there is no collision today. But if 2.3c
-    routes ordinary-guard failures through `slots[ei]` it collides with the
-    linked-loop-done target already using `slots[ei]`. Resolve by either (a) keying
-    physical slots on `(instr_index, exit_kind)` rather than raw index, or
-    (b) explicitly forbidding ordinary-link arming on numeric-loop-done guards and
-    documenting that it loses no required chain. Decide before 2.3b bakes consumers
-    around `exit_instr → slot index`.
+  - **RESOLVED (2026-07-12, Bart) — option (b) + hard invariant.** The slot table is
+    keyed by *IR instruction index*. A numeric-for loop-done guard at index `ei` has
+    **two** logical exits sharing that index — the linked-materialized exit (mode 1,
+    `linked_loop_done=1` → `slot[ei]` → continuation) and the ordinary deopt (mode 0,
+    → `shared_exit`/tier-0). **Decision: `slot[ei]` of a numeric-for loop-done guard
+    is EXCLUSIVELY its linked-materialized exit; the ordinary deopt path never
+    consults a slot and is never eligible for ordinary-guard arming.** Enforced as an
+    invariant at BOTH the emission site (nativegen) and the arming site (trace.zig),
+    so the collision is impossible by construction — no `(index, kind)` slot keying,
+    no doubled P-E bookkeeping. Analysis (do-it-right-now check): option (a)'s
+    capability — two independently-armable successors from one IR instruction — is
+    needed by **nothing** on the roadmap. nsieve's mode-0 and mode-1 loop-done exits
+    target the *same* continuation, so they never diverge; and the full
+    `lj_asm_patchexit` port is one-side-trace-per-exit-snapshot (LuaJIT never attaches
+    two side traces to one exit — linked vs standalone would be *different*
+    snapshots). The "one instruction, two exits" is purely a lune *folding* artifact.
+    If the exotic divergent case (same inner trace hot both fused and standalone with
+    different post-exit targets) ever appears, the correct fix is to **unfold that one
+    guard into two IR instructions** (each getting its own natural slot) — a localized
+    change, strictly better than taxing every exit with `(index, kind)` keying now.
 - [ ] **P-E — Patched-target lifetime / unpatching.** Since Increment 1 the arena
   keeps regions mapped for the whole run, so a stale patch is no longer a raw
   use-after-*unmap* — but it is now use-after-*reuse*: `removeTrace`→`destroy`
