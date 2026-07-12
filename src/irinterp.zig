@@ -77,6 +77,20 @@ pub const ExecResult = struct {
     /// untouched. The dispatcher maps `(final_trace_id, exit_instr)` → the final
     /// trace; with no linking yet this is always the entered trace.
     final_trace_id: u32 = NO_TRACE_ID,
+    /// 2.3b-0 (doc 17): iterations committed by the FINAL trace's OWN loop, as
+    /// opposed to `completed` which is the chain-cumulative count (`rbx`). Native
+    /// derives it as `completed − entry_rbx`, where `entry_rbx` is the value the
+    /// counter held when the final trace's body was entered. Unchained the two are
+    /// equal (a fresh trampoline entry zeroes `rbx`), so today `local_completed ==
+    /// completed` always; once a parent `jmp`s into a child under the shared frame
+    /// (2.3b-1) the child inherits the parent's `rbx`, and the accounting that steers
+    /// recording (`onSideExit`) must use this local count, never the inflated
+    /// cumulative one. Defaulted to 0 so the ~40 tier-1a construction sites are
+    /// untouched; `local_completed` is only ever READ on the native chained path
+    /// (`driveChain`, `tier == .native_only`) — the tier-1a chain path reads
+    /// `completed` directly (a single `execute` is never fused, so its local count IS
+    /// its `completed`).
+    local_completed: usize = 0,
 };
 
 /// Commit the final numeric-`for` iteration at a loop-done side exit so a linked

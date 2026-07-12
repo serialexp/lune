@@ -575,6 +575,17 @@ const NativeResult = extern struct {
     /// child (2.3), the child's exit stub overwrites it, so the dispatcher can map
     /// the result back to the correct final trace instead of assuming the parent.
     final_trace_id: u32,
+    /// 2.3b-0 (doc 17): the value of the `rbx` iteration counter at the moment this
+    /// body was entered, snapshotted by the first body instruction
+    /// (`mov [rdx+entry_rbx], rbx`). A fresh trampoline entry zeroes `rbx`, so for an
+    /// un-fused run this is 0 and `local_completed == completed`. Once a native parent
+    /// `jmp`s into a child under the shared frame (2.3b-1) `rbx` already holds the
+    /// parent's cumulative count, so the child's body records that baseline here and
+    /// the Zig wrapper recovers the child's OWN committed count as
+    /// `completed − entry_rbx`. Written by whichever body performs the FINAL exit
+    /// (each body's entry overwrites it), so the returned value always describes the
+    /// final trace. Not consumed by the host — pure scratch that rides in the result.
+    entry_rbx: usize,
 };
 
 /// A compiled trace: an executable page whose entry is
@@ -631,6 +642,7 @@ pub const CompiledTrace = struct {
             .exit_instr = std.math.maxInt(u32),
             .linked_loop_done = if (linked_loop_done) 1 else 0,
             .final_trace_id = irinterp.NO_TRACE_ID,
+            .entry_rbx = 0,
         };
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
@@ -638,7 +650,20 @@ pub const CompiledTrace = struct {
         } else {
             self.page.entry(EntryFn)(regs.tags, regs.payloads, &result);
         }
-        return .{ .completed = result.completed, .exit_instr = result.exit_instr, .final_trace_id = result.final_trace_id };
+        // 2.3b-0: the final trace's OWN committed count = cumulative rbx − the rbx it
+        // inherited at entry. `-%` because a spurious wrap is never worse than the old
+        // behaviour and there is no valid case where entry_rbx > completed. Nothing is
+        // armed yet, so every body is entered fresh (rbx = 0 → entry_rbx = 0); this
+        // invariant PINS that the snapshot mechanism is wired correctly before 2.3b-1
+        // starts feeding cumulative rbx across a chain.
+        std.debug.assert(result.entry_rbx == 0);
+        const local: usize = result.completed -% result.entry_rbx;
+        return .{
+            .completed = result.completed,
+            .exit_instr = result.exit_instr,
+            .final_trace_id = result.final_trace_id,
+            .local_completed = local,
+        };
     }
 
     pub fn deinit(self: *CompiledTrace) void {
@@ -3360,6 +3385,17 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         try a.xorRegReg(.rbx, .rbx);
         if (frame > 0) try a.subRegImm32(.rsp, frame);
     }
+
+    // 2.3b-0 (doc 17): snapshot the entry value of the `rbx` iteration counter into
+    // the result so the Zig wrapper can recover this body's OWN committed count as
+    // `completed − entry_rbx`. This is the first body instruction (rbx is already
+    // zeroed — trampoline for frameless, the `xor` above for self-framed), so it also
+    // marks `body_entry`: a chained parent (2.3b-1) jumps into the linked-entry stub,
+    // which presets `linked_loop_done` then falls through to here, and a child entered
+    // that way inherits the parent's cumulative `rbx` — recorded here, subtracted out
+    // by the wrapper. rdx holds `*NativeResult` for the whole body. Un-fused, rbx = 0,
+    // so this stores 0 and the result's `local_completed == completed` (asserted).
+    try a.movMemReg(.rdx, @offsetOf(NativeResult, "entry_rbx"), .rbx);
 
     const loop_top = try a.label();
     const deopt_exit = try a.label();
