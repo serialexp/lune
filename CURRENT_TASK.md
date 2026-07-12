@@ -212,8 +212,30 @@ Net: the first real arm needs (i) child linked-entry mode propagation, (ii) a wi
 `NativeResult` (local completed + enclosing progress), (iii) a driveChain-faithful
 accounting split (identity via `final`, steering-accounting replicates the hop's
 logical events), (iv) fail-closed `traceById`. That's materially bigger than the
-one-commit 2.3b in the plan. **Landed so far:** S3 prep (`9d16711`, byte-identical,
-codex-confirmed correct). **Awaiting Bart's call on how to re-scope/sequence.**
+one-commit 2.3b in the plan.
+
+**Bart's decision:** split into 2.3b-0 (inert scaffolding, reviewed) then 2.3b-1
+(flip arming on + accounting split).
+
+## 2.3b-0 — inert scaffolding: LANDED (byte-identical, awaiting peer review)
+
+Four inert commits, each `just test` green + nsieve 3-mode byte-identical + tier-0
+== `--jit-native` on the 6-benchmark differential. Nothing armed yet.
+- **`9d16711`** — S3 prep: `prologue_fail` commits cumulative `rbx`, not literal 0.
+  Byte-identical unchained (rbx provably 0); preserves progress once chained.
+- **`963bdbb`** — fail-closed `traceById`: under `ran_native` assert the baked id
+  resolves BEFORE `orelse ct` (kills the P-E dangling-link mask); keep `== ct`.
+- **`319da11`** — `NativeResult.entry_rbx` snapshot (first body instr) → wrapper
+  derives `ExecResult.local_completed = completed − entry_rbx`. Invariant
+  `entry_rbx == 0` while unchained pins the mechanism; `local_completed` defaulted 0
+  on tier-1a sites, read only on the native chained path (2.3b-1).
+- **`954ea89`** — `linked_entry` stub (Trap-1 fix): every frameless body emits a
+  secondary entry that presets `linked_loop_done=1` then falls through to
+  `body_entry`; `CompiledTrace.linked_entry` = its abs addr (new
+  `x64.Assembler.labelOffset`). Wiring invariant `arena ⟺ linked_entry`. Inert —
+  nothing targets it until 2.3b-1.
+
+NEXT: peer-review 2.3b-0 (codex gpt-5.6-sol + fable), then 2.3b-1 arming.
 
 ## Unpushed local commits (Rule #15 — don't push unless asked)
 master is well ahead of origin/master; do NOT push without Bart's say-so.

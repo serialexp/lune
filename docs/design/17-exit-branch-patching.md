@@ -2,7 +2,7 @@
 
 Status: partial — Increment 1 (shared mcode arena, P-D), Increment 2.1 (frameless chain-entry ABI, P-A), Increment 2.2 (chain-wide result contract, P-B) and Increment 2.3a (indirect exit + link-slot table + P-E registry scaffolding) landed; all byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies now run frameless under one shared trampoline (`ensureTrampoline`); every native exit stub jumps through a per-exit heap-resident link slot (`jmp qword [&slots[i]]`, default = `shared_exit`) and bakes the final trace's stable id into `NativeResult.final_trace_id`, resolved by the dispatcher via `traceById` (asserts `final == ct` while no slot is armed). The P-E backlink registry (`armed_links` + `armNativeLink`/`resetLinksTouching`, reset before `destroy` in `removeTrace`) is wired but inert — nothing arms a slot yet. Next: Increment 2.3b — arm `.link`-terminal handoffs from `driveChain`. A 2026-07-12 codex contract review re-scoped it (the `.link` terminal is not single-contract on the child side — the inner root needs `linked_loop_done` mode propagation; and cumulative `rbx` must not drive `onSideExit`), so 2.3b is split into 2.3b-0 (inert scaffolding: `linked_entry` mode-propagation stub, `NativeResult.local_completed`, fail-closed `traceById`; byte-identical, reviewed) then 2.3b-1 (flip arming on + driveChain accounting split). See §Implementation status → Outstanding.
 Owner: Bart
-Last updated: 2026-07-12 (Increment 2.3a landed — indirect `jmp [slot]` exit + per-trace heap-owned link-slot table defaulting to `shared_exit` + inert P-E backlink registry with a focused directionality unit test; nsieve/nsieve-bit/fannkuch/mandelbrot/nbody/spectral-norm tier-0==tier-1a==native byte-identical, `just bench --filter nsieve` flat within noise, Debug asserts pass — `final == ct` still holds since nothing is armed)
+Last updated: 2026-07-12 (Increment 2.3b-0 landed — inert arming scaffolding across four byte-identical commits: S3 prologue_fail cumulative-`rbx` prep, fail-closed `traceById`, `NativeResult.entry_rbx`→`local_completed`, and the `linked_entry` secondary-entry stub + `x64.labelOffset`. Nothing armed; `final == ct` still holds. Peer-reviewed codex gpt-5.6-sol + fable: SOUND / behavior-neutral today, correct foundation — rbx provably 0 at every body/prologue-fail entry, `linked_entry` inert and 1:1-mapped, one misleading comment fixed. Two arming-time musts recorded on the 2.3b-1 item: drop the `entry_rbx==0` assert, classify productivity via `local_completed`. nsieve 3-mode + 6-benchmark differential green.)
 
 Coherent-state chaining (doc 16) proved *correct* but *performance-neutral* on
 nsieve: the JIT compiles every hot loop to native code, chaining hands control
@@ -171,12 +171,21 @@ names (run today via `runLinkedLoopDone`, trace.zig:1369). Findings:
      resolved (`resolved != null`) before the `orelse ct`; keep `resolved.? == ct`
      until 2.3b-1 drops it.
 
-- [ ] **Increment 2.3b-0 — inert scaffolding (byte-identical).** (a) fail-closed
-  `traceById` in the dispatcher; (b) `linked_entry` stub + `CompiledTrace.linked_entry`
-  (emitted, nothing targets it); (c) `NativeResult.local_completed` + `entry_rbx`
-  scratch with the `local_completed == completed` invariant. Each a separate
-  byte-identical commit; reviewed before 2.3b-1. S3 prep (prologue_fail commits
-  cumulative `rbx`) already landed (`9d16711`).
+- [x] **Increment 2.3b-0 — inert scaffolding (byte-identical).** (a) fail-closed
+  `traceById` in the dispatcher (`963bdbb`); (b) `linked_entry` stub +
+  `CompiledTrace.linked_entry` + `x64.labelOffset` (`954ea89`, emitted, nothing
+  targets it); (c) `NativeResult.entry_rbx` scratch → `ExecResult.local_completed`
+  with the `entry_rbx == 0` / `local_completed == completed` invariant (`319da11`).
+  S3 prep (prologue_fail commits cumulative `rbx`) landed first (`9d16711`). Four
+  separate byte-identical commits; nsieve 3-mode + 6-benchmark tier-0==`--jit-native`
+  differential green. **Peer-reviewed (codex gpt-5.6-sol + fable), 2026-07-12:**
+  SOUND / behavior-neutral today, correct foundation. rbx provably 0 at every
+  `body_entry`/`prologue_fail` reach (trampoline + self-framed both `xor rbx,rbx`
+  before entry; sole `inc rbx` is the back-edge → `loop_top`, never before entry);
+  `linked_entry` inert (no consumer) and its address maps 1:1 (`resolve()` patches
+  rel32 in place, `McodeArena.alloc` `@memcpy`s verbatim). Nit fixed: the
+  `movMemImm32(linked_loop_done,1)` comment wrongly said "dword store to the low
+  half" — it is REX.W `C7 /0`, a full-u64 store.
 - [ ] **Increment 2.3b-1 — flip arming on.** In `driveChain`, after Hop A is
   accounted, `armNativeLink(current_link, terminal_idx, inner, inner.linked_entry)`
   (eligibility: `inner.compiled`, `inputs.len == 0`, `.link` terminal; safepoint
@@ -188,6 +197,23 @@ names (run today via `runLinkedLoopDone`, trace.zig:1369). Findings:
   `assert(final == ct)`; route exit IDENTITY (`exit_instr`/guard/resume PC) through
   `final`, steering-accounting through the reproduced hop events. Verify 10-mode
   byte-identical + arm counter > 0 + bench.
+  - **MUST (both 2.3b-0 reviewers, arming-time correctness):**
+    1. **Drop `assert(result.entry_rbx == 0)`** in `runWithLinkedLoopDone`
+       (nativegen ~669) when arming activates. In ReleaseFast the assert is an LLVM
+       *assume*, folding `completed -% entry_rbx` → `completed` — silently
+       resurrecting the exact cumulative-count `onSideExit` bug `local_completed`
+       exists to kill, visible only as cross-mode release divergence.
+    2. **Classify final-trace productivity by `local_completed`, NOT cumulative
+       `completed`.** The surrounding `if (result.completed > 0)` branch
+       (interp.zig ~2626) must switch to `local_completed`; a chained child that
+       fails its prologue returns `completed = parent-cumulative` (nonzero) but
+       `local_completed == 0` — the old test would misclassify it productive. Keep
+       field meanings rigid: `completed` = aggregate/resume; `local_completed` =
+       final-trace productivity/penalty; `final_trace_id`+`exit_instr` = identity.
+  - **Note (fable):** `linked_loop_done` is sticky once the stub sets it — every
+    later body in the native run sees 1. Correct for Hop A (continuation + inner both
+    want linked mode); a hazard only if 2.3c ever arms an exit into a body that must
+    materialize *unlinked* loop-done — flag under P-C.
 
 **Blocking prerequisites — must be designed before any patch is safe** (peer
 review, 2026-07-11; see §Blocking prerequisites for the argument):

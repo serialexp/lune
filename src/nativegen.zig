@@ -4338,9 +4338,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     // this stub instead of `body_entry` so a numeric-for loop-done inside this body
     // materializes in linked mode (commit the final iteration + phi snapshot, then
     // hand to its continuation) exactly as `runLinkedLoopDone` sets up. It presets
-    // `linked_loop_done = 1` — a plain dword store to the low half suffices: the
-    // wrapper inits the full u64 to 0/1 so the high half is already 0, and the reader
-    // (`cmpQwordMemImm8 … , 0; jne`) only tests non-zero — then falls through to
+    // `linked_loop_done = 1` — `movMemImm32` is REX.W `C7 /0` (`mov qword …, imm32`,
+    // sign-extended), so it stores the FULL u64 = 1, matching the reader
+    // (`cmpQwordMemImm8 … , 0; jne`, a full-width nonzero test) — then falls through to
     // `body_entry` (which snapshots `entry_rbx` and runs the hoisted guards). Emitted
     // only on the frameless production path; self-framed test pages never chain, so
     // their `linked_entry` stays `null`. INERT until 2.3b-1 arms a slot to it.
