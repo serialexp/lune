@@ -2600,11 +2600,32 @@ pub const Vm = struct {
                                 // *before* the fallback. `resolved.? == ct` still holds
                                 // until 2.3b-1 arms the first link (dropped there).
                                 const resolved: ?*trace.Trace = self.trace.traceById(result.final_trace_id);
-                                const final: *const trace.Trace = resolved orelse ct;
+                                const final: *trace.Trace = resolved orelse ct;
                                 if (ran_native) {
                                     std.debug.assert(resolved != null);
                                     std.debug.assert(final == ct);
                                 }
+
+                                // 2.3b-1 (doc 17): every EXIT consumer below routes
+                                // through `final` (the trace that performed the final
+                                // native exit), not `ct` (the trace we entered). With no
+                                // link armed yet they are the same object, so this is
+                                // byte-identical; once `driveChain` arms a `C.link →
+                                // I.linked_entry` handoff, a direct native run of the
+                                // continuation `C` can fuse straight into the inner root
+                                // `I` and return `final == I ≠ ct`, and the exit identity
+                                // (guard PC, resume, side-exit accounting) belongs to `I`.
+                                //
+                                // `local_done` is the FINAL trace's OWN committed count:
+                                // on the native path `result.local_completed`
+                                // (= completed − entry_rbx), which equals `completed` for
+                                // an un-fused run but is the child's local count once
+                                // fused (never the cumulative `rbx`); on the tier-1a path
+                                // `local_completed` is defaulted 0 and unused, so fall
+                                // back to `completed`. Every productivity/guard-failure
+                                // decision uses `local_done`; only chain-cumulative
+                                // resume accounting (inside `driveChain`) uses `completed`.
+                                const local_done: usize = if (ran_native) result.local_completed else result.completed;
 
                                 // --- guard-failure counting (step 4) ---
                                 // Count guard failures on zero-iteration exits
@@ -2613,19 +2634,19 @@ pub const Vm = struct {
                                 // Resolve the PC through `guardExitPc`: array guards
                                 // store a lane ordinal in `aux`, not a PC, and must
                                 // not be counted as guard-PC failures.
-                                if (result.completed == 0) {
+                                if (local_done == 0) {
                                     if (result.exit_instr != std.math.maxInt(u32)) {
-                                        if (trace.guardExitPc(ct.instrs[result.exit_instr])) |exit_pc| {
+                                        if (trace.guardExitPc(final.instrs[result.exit_instr])) |exit_pc| {
                                             if (exit_pc > 0) {
-                                                self.trace.countGuardFailure(ct.anchor, exit_pc);
+                                                self.trace.countGuardFailure(final.anchor, exit_pc);
                                             }
                                         }
                                     }
                                 }
 
-                                if (result.completed > 0) {
+                                if (local_done > 0) {
                                     // This trace did useful work — keep its result.
-                                    self.trace.onSideExit(ct, result.completed);
+                                    self.trace.onSideExit(final, local_done);
                                     // Nested-loop linking (Phase 1): if this is an
                                     // inner numeric-`for` running to completion (its
                                     // terminal loop guard failed) and the exit lands
@@ -2634,7 +2655,7 @@ pub const Vm = struct {
                                     // outer body forward; Phase 2 links it back here.
                                     // Output-neutral (the recording aborts at the
                                     // inner `for_prep` until Phase 2).
-                                    self.trace.maybeArmContinuation(ct, result.exit_instr, proto);
+                                    self.trace.maybeArmContinuation(final, result.exit_instr, proto);
                                     // Coherent-state chaining (doc 16, Phase 2): a
                                     // *productive* source-level branch-guard exit (e.g.
                                     // nsieve's `guard_false(p[i])` firing when a
@@ -2644,7 +2665,7 @@ pub const Vm = struct {
                                     // numeric-for loop-done guards (handled above by
                                     // `maybeArmContinuation`). Inert until the
                                     // productive chain call consumes `wants_prime_side`.
-                                    self.trace.countProductiveBranchExit(ct, result.exit_instr, proto);
+                                    self.trace.countProductiveBranchExit(final, result.exit_instr, proto);
                                     // Retire any dead-marked traces before leaving the
                                     // walk so a stale narrow-lane trace doesn't linger
                                     // in a slot just because a later trace succeeded.
@@ -2680,14 +2701,14 @@ pub const Vm = struct {
                                     // and `countTracesAt >= 2` stops re-arming once the
                                     // prime side-trace exists.
                                     if (self.trace.wants_prime_side) |want| {
-                                        if (want.proto == ct.anchor.proto and want.pc == ct.anchor.pc and
+                                        if (want.proto == final.anchor.proto and want.pc == final.anchor.pc and
                                             !self.trace.isRecording() and
                                             self.trace.pending_replay_anchor == null and
-                                            !self.trace.isGated(ct.anchor))
+                                            !self.trace.isGated(final.anchor))
                                         {
-                                            self.trace.pending_replay_anchor = ct.anchor;
+                                            self.trace.pending_replay_anchor = final.anchor;
                                             self.trace.wants_prime_side = null;
-                                            self.trace.clearPrimeExits(ct.anchor);
+                                            self.trace.clearPrimeExits(final.anchor);
                                             self.trace.prime_side_arms +|= 1;
                                             for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                             if (mode == .fast) {
@@ -2705,13 +2726,13 @@ pub const Vm = struct {
                                     // for a bounded burst, and tells us where
                                     // tier-0 should resume when it yields.
                                     if (ran_native and ran_native_link_mode) {
-                                        if (self.trace.driveChain(ct, result, proto, trace_regs, .native_only, .native_numeric_for_done, &.{})) |chain| {
+                                        if (self.trace.driveChain(final, result, proto, trace_regs, .native_only, .native_numeric_for_done, &.{})) |chain| {
                                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                             for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                             continue :outer;
                                         }
                                     } else if (!ran_native) {
-                                        if (self.trace.driveChain(ct, result, proto, trace_regs, .ir, .{ .ir_numeric_for_done = buf }, &.{})) |chain| {
+                                        if (self.trace.driveChain(final, result, proto, trace_regs, .ir, .{ .ir_numeric_for_done = buf }, &.{})) |chain| {
                                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                             for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                             continue :outer;
@@ -2748,15 +2769,15 @@ pub const Vm = struct {
                                     // remapping to thread, so the live regs are
                                     // exactly the coherent state each entered
                                     // trace expects.
-                                    if (self.trace.isSourceBranchGuardExit(ct, result.exit_instr, proto)) {
+                                    if (self.trace.isSourceBranchGuardExit(final, result.exit_instr, proto)) {
                                         if (ran_native) {
-                                            if (self.trace.driveChain(ct, result, proto, regs, .native_only, .ordinary_header, visited[0..nvisited])) |chain| {
+                                            if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, visited[0..nvisited])) |chain| {
                                                 if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                                 for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                                 continue :outer;
                                             }
                                         } else {
-                                            if (self.trace.driveChain(ct, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited])) |chain| {
+                                            if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited])) |chain| {
                                                 if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                                 for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                                 continue :outer;
@@ -2783,7 +2804,7 @@ pub const Vm = struct {
                                 }
                                 // Zero iterations: apply the penalty, then try
                                 // the next trace at this anchor.
-                                self.trace.onSideExit(ct, 0);
+                                self.trace.onSideExit(final, 0);
 
                                 // Widen-eviction: if this trace's array lane guard
                                 // can never pass again (the live array widened past
@@ -2819,13 +2840,13 @@ pub const Vm = struct {
                                 // into two literal-tier calls (as the branch-guard site
                                 // above does) rather than a runtime tier value.
                                 if (ran_native) {
-                                    if (self.trace.driveChain(ct, result, proto, regs, .native_only, .ordinary_header, visited[0..nvisited])) |chain| {
+                                    if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, visited[0..nvisited])) |chain| {
                                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                         for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                         continue :outer;
                                     }
                                 } else {
-                                    if (self.trace.driveChain(ct, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited])) |chain| {
+                                    if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited])) |chain| {
                                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                         for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                         continue :outer;
