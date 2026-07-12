@@ -5695,11 +5695,14 @@ test "nativegen: operand-chain reuses one register across a left-folded sum" {
 }
 
 /// Build a spill-forcing counting loop into `ins`: `acc = acc + i + (x0..x9)` with 10
-/// invariant slots → 13 homes > 11 GPRs, guaranteeing spilled carried homes. Every guard
-/// carries `aux == 0`, so the loop-exit `guard_true` classifies as an ORDINARY guard
-/// (`isNumericForLoopDoneGuard` short-circuits on `exit_pc == 0` before touching the
-/// undefined anchor). Register layout: r0=i (carried), r1=limit (invariant), r2=acc
-/// (carried), r3..r12 = x0..x9 (invariant).
+/// invariant slots → 13 homes > 9 GP homes (`ALLOC_ORDER`), so homes spill. Because slot
+/// homes are pinned in first-`slot_load` order and i/limit/acc load first, the CARRIED
+/// homes (i, acc) keep registers and the later INVARIANT homes (x0..x9) are what spill —
+/// enough to exercise the register allocator's spill path, but not the carried-home flush
+/// (see `buildCarriedSpillLoop` for that). Every guard carries `aux == 0`, so the loop-
+/// exit `guard_true` classifies as an ORDINARY guard (`isNumericForLoopDoneGuard` short-
+/// circuits on `exit_pc == 0` before touching the undefined anchor). Register layout:
+/// r0=i (carried), r1=limit (invariant), r2=acc (carried), r3..r12 = x0..x9 (invariant).
 fn buildSpillLoop(gpa: std.mem.Allocator, ins: *std.ArrayListUnmanaged(I)) !void {
     const r_i: u16 = @intCast(ins.items.len);
     try ins.append(gpa, .{ .op = .slot_load, .aux = 0 });
@@ -5752,6 +5755,64 @@ fn spillLoopRegs(regs: *[13]Value, limit: i64) void {
     while (j < 10) : (j += 1) regs[3 + j] = Value.int(@intCast(j + 1)); // x0..x9 = 1..10
 }
 
+/// Number of carried accumulators in `buildCarriedSpillLoop`. i + N accumulators are all
+/// CARRIED homes; with N = 12 that is 13 carried homes > 9 GP homes (`ALLOC_ORDER`), so
+/// several carried homes are guaranteed to spill regardless of allocation order.
+const CARRIED_SPILL_N = 12;
+
+/// Build an ALL-CARRIED spill loop into `ins`: `for (i < limit) { acc_k += i for k in
+/// 0..N }`. Unlike `buildSpillLoop` (whose spills land on invariants), EVERY spilled home
+/// here is a loop-CARRIED accumulator, so at the ordinary loop-exit guard the shared
+/// `deopt_exit` flush re-boxes a spilled carried home through `flushSlot`'s `.mem` branch
+/// — the exact rax-scratch path that the old rax-staged dispatch holder collided with
+/// (blocker-1). Guards carry `aux == 0` → the exit `guard_true` is an ORDINARY guard.
+/// Slot layout: r0 = i (carried), r1..rN = acc_0..acc_{N-1} (carried), r(N+1) = limit
+/// (invariant). Register file length is N + 2.
+fn buildCarriedSpillLoop(gpa: std.mem.Allocator, ins: *std.ArrayListUnmanaged(I)) !void {
+    const N = CARRIED_SPILL_N;
+    const r_i: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .slot_load, .aux = 0 });
+    try ins.append(gpa, .{ .op = .guard_int, .a = r_i });
+    const r_lim: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .slot_load, .aux = N + 1 });
+    try ins.append(gpa, .{ .op = .guard_int, .a = r_lim });
+    const r_lt: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .lt, .a = r_i, .b = r_lim });
+    try ins.append(gpa, .{ .op = .guard_true, .a = r_lt });
+
+    var accrefs: [N]u16 = undefined;
+    var k: usize = 0;
+    while (k < N) : (k += 1) {
+        const r: u16 = @intCast(ins.items.len);
+        try ins.append(gpa, .{ .op = .slot_load, .aux = @intCast(1 + k) });
+        try ins.append(gpa, .{ .op = .guard_int, .a = r });
+        accrefs[k] = r;
+    }
+    // acc_k += i for each accumulator.
+    var newrefs: [N]u16 = undefined;
+    k = 0;
+    while (k < N) : (k += 1) {
+        const r: u16 = @intCast(ins.items.len);
+        try ins.append(gpa, .{ .op = .add, .a = accrefs[k], .b = r_i });
+        newrefs[k] = r;
+    }
+    const r_one: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .konst, .aux = 0 });
+    const r_inc: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .add, .a = r_i, .b = r_one });
+    // slot-bound φs: acc_k ← new_k (slot 1+k), i ← inc (slot 0).
+    k = 0;
+    while (k < N) : (k += 1) try ins.append(gpa, .{ .op = .phi, .b = newrefs[k], .aux = @intCast(1 + k) });
+    try ins.append(gpa, .{ .op = .phi, .b = r_inc, .aux = 0 });
+    try ins.append(gpa, .{ .op = .loop });
+}
+
+/// Fill a carried-spill register file: i=0, acc_0..acc_{N-1}=0, limit at slot N+1.
+fn carriedSpillRegs(regs: *[CARRIED_SPILL_N + 2]Value, limit: i64) void {
+    for (regs) |*v| v.* = Value.int(0);
+    regs[CARRIED_SPILL_N + 1] = Value.int(limit);
+}
+
 test "nativegen: more carried+invariant slots than registers forces spilled homes" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -5770,33 +5831,35 @@ test "nativegen: more carried+invariant slots than registers forces spilled home
 
 test "nativegen: frameless spilled carried homes dispatch the ordinary guard exit cleanly (blocker-1)" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
-    // 2.3c-0 blocker-1 regression. The spill loop forces spilled carried homes; its
-    // loop-exit `guard_true` (aux == 0) is an ORDINARY guard, so on the frameless path
-    // it dispatches through the shared `deopt_exit` flush. That flush re-boxes each
-    // carried home — and `flushSlot`'s spilled-payload branch uses rax as scratch. The
-    // old design staged the dispatch holder in rax, which a spilled home therefore
-    // clobbered before `jmp [rax]`, jumping through a corrupt address. Now the resolved
-    // target rides in the flush-immune `NativeResult.exit_target` and the flush cannot
-    // touch it. If it regressed, this run would jump into garbage and crash; a clean
-    // byte-for-byte match against the tier-1a oracle is the proof it survives.
+    // 2.3c-0 blocker-1 regression. `buildCarriedSpillLoop` spills loop-CARRIED homes
+    // (13 carried > 9 GP homes), so at the ordinary loop-exit `guard_true` (aux == 0)
+    // the shared `deopt_exit` flush re-boxes a spilled carried home through `flushSlot`'s
+    // `.mem` branch — which scratches rax. The old design staged the dispatch holder in
+    // rax, so that spilled-home flush clobbered it before `jmp [rax]`, jumping through a
+    // corrupt address. Now the resolved target rides in the flush-immune
+    // `NativeResult.exit_target`, so the flush cannot touch it. If it regressed, this run
+    // would jump into garbage and crash; a clean match against the tier-1a oracle proves
+    // it survives. (buildSpillLoop's spills land on invariants, which the flush skips —
+    // it would exercise the exit but NOT the carried-home rax path, so use this loop.)
     const gpa = testing.allocator;
     var ins: std.ArrayListUnmanaged(I) = .empty;
     defer ins.deinit(gpa);
-    try buildSpillLoop(gpa, &ins);
+    try buildCarriedSpillLoop(gpa, &ins);
 
     var consts = [_]Value{Value.int(1)};
     var es = [_]u16{};
     const t = Trace{ .anchor = undefined, .instrs = ins.items, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
 
     // limit=4 → commits 4 iterations, then the `i < limit` guard fails and the ORDINARY
-    // exit fires with all 13 (spilled) homes live. limit=0 → the guard fails on the very
-    // first check (zero committed iterations), exercising the exit before any back-edge.
-    var regs4: [13]Value = undefined;
-    spillLoopRegs(&regs4, 4);
+    // exit fires with all (spilled) carried homes live. limit=0 → the guard fails on the
+    // very first check (zero committed iterations), exercising the exit before any
+    // back-edge. The oracle covers the exact flushed values.
+    var regs4: [CARRIED_SPILL_N + 2]Value = undefined;
+    carriedSpillRegs(&regs4, 4);
     try expectMatchFrameless(&t, &regs4);
 
-    var regs0: [13]Value = undefined;
-    spillLoopRegs(&regs0, 0);
+    var regs0: [CARRIED_SPILL_N + 2]Value = undefined;
+    carriedSpillRegs(&regs0, 0);
     try expectMatchFrameless(&t, &regs0);
 }
 
