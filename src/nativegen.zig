@@ -4250,12 +4250,25 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     // Ordinary-guard arming (2.3c) intercepts at the per-guard mini-stub, not here.
     try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
 
-    // PROLOGUE_FAIL: a hoisted type guard failed before any commit. Return 0 with
-    // regs[] untouched and no per-body guard identity (the cut-1 EXIT would have
-    // flushed half-initialized homes). Never chainable (no child makes sense before
-    // the first committed iteration), so it jumps straight to `shared_exit`.
+    // PROLOGUE_FAIL: a hoisted type guard failed before this body committed any
+    // iteration of its OWN loop. regs[] is untouched (the cut-1 EXIT would have
+    // flushed half-initialized homes) and there is no per-body guard identity, so
+    // `exit_instr = -1`. Not chainable outward (no child makes sense before the first
+    // committed iteration), so it jumps straight to `shared_exit`.
+    //
+    // S3 (doc 17, 2.3b): write `completed = rbx`, NOT the literal 0. When this body
+    // is entered fresh via the trampoline (`xor rbx,rbx`) — the only way it is
+    // reached today, since nothing arms a link — rbx is provably 0 here (no `.loop`
+    // back-edge `inc rbx` runs before the hoisted guards), so this is byte-identical
+    // to the old `completed = 0`. Once a native parent `jmp`s into this body under
+    // the shared frame (armed link, 2.3b), rbx already holds the PARENT's cumulative
+    // iteration count; committing `rbx` here preserves that progress instead of
+    // erasing it, so `completed = 0` at a chained child's entry-guard failure can no
+    // longer wipe the chain's committed work. `movMemReg` is a full 64-bit store
+    // (matching `deopt_exit`), so the `usize` field is fully written, not just its
+    // low half.
     a.bind(prologue_fail);
-    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "completed"), 0);
+    try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), -1);
     try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
 }
