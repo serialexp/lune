@@ -623,6 +623,17 @@ pub const CompiledTrace = struct {
     /// self-framed test pages (never chained) and non-frameless builds. Points into
     /// the same owned `page`, so it needs no separate free.
     linked_entry: ?usize = null,
+    /// Secondary entry point (doc 17 Increment 2.3c-0): the dual of `linked_entry`.
+    /// Presets `NativeResult.linked_loop_done = 0` then falls through to `body_entry`.
+    /// A FUSED handoff inherits whatever `linked_loop_done` sits in the shared
+    /// `NativeResult` (rdx) — and `linked_entry` leaves it stuck at 1. The
+    /// inner→continuation hop (2.3c-2) arms the inner's linked-loop-done slot into a
+    /// continuation that must run in ORDINARY mode, so it targets THIS entry to clear
+    /// the inherited flag; a bare jump to `body_entry` would let the continuation's own
+    /// numeric-for loop-done guard wrongly take the linked-materialization path. `null`
+    /// on the same builds as `linked_entry` (frameless production only). Points into
+    /// the same owned `page`; no separate free. INERT until 2.3c-2 arms a slot to it.
+    ordinary_entry: ?usize = null,
 
     pub const EntryFn = fn ([*]u8, [*]u64, *NativeResult) callconv(.c) void;
     /// The shared frameless trampoline's C-ABI type: SoA lanes + result out-param,
@@ -775,7 +786,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    const linked_entry_off = lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit, slots) catch {
+    const entry_stubs = lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit, slots) catch {
         if (slots.len > 0) gpa.free(slots);
         return null;
     };
@@ -791,18 +802,25 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
             if (slots.len > 0) gpa.free(slots);
             return null;
         };
-    // Resolve the linked-entry stub's absolute address (base + its byte offset). It
-    // lives in the same mapped `page`, so it is freed with the page — no extra owner.
-    const linked_entry: ?usize = if (linked_entry_off) |off|
-        @intFromPtr(page.code.ptr) + off
-    else
-        null;
-    // Wiring invariant (2.3b-0): a frameless production body (arena present ⟺
-    // shared_exit set) ALWAYS emits a linked_entry stub; a self-framed test page never
-    // does. Pins that the mechanism produces a real secondary entry before 2.3b-1
-    // arms a slot to it.
+    // Resolve the secondary-entry stubs' absolute addresses (base + byte offset). Both
+    // live in the same mapped `page`, so they are freed with it — no extra owner.
+    const base = @intFromPtr(page.code.ptr);
+    const linked_entry: ?usize = if (entry_stubs.linked_entry) |off| base + off else null;
+    const ordinary_entry: ?usize = if (entry_stubs.ordinary_entry) |off| base + off else null;
+    // Wiring invariant (2.3b-0/2.3c-0): a frameless production body (arena present ⟺
+    // shared_exit set) ALWAYS emits BOTH secondary entries; a self-framed test page
+    // never does. Pins that the mechanism produces real secondary entries before an
+    // increment arms a slot to them.
     std.debug.assert((arena != null) == (linked_entry != null));
-    return .{ .page = page, .trampoline_entry = tramp_entry, .slots = slots, .gpa = gpa, .linked_entry = linked_entry };
+    std.debug.assert((linked_entry != null) == (ordinary_entry != null));
+    return .{
+        .page = page,
+        .trampoline_entry = tramp_entry,
+        .slots = slots,
+        .gpa = gpa,
+        .linked_entry = linked_entry,
+        .ordinary_entry = ordinary_entry,
+    };
 }
 
 /// Forward type-proof over the linear SSA. Fills `kinds` (and `slot_of`, the
@@ -3363,12 +3381,21 @@ fn emitLinkedLoopDoneSnapshot(
     }
 }
 
+/// Byte offsets (from `page.code.ptr`) of the two frameless secondary entry stubs a
+/// production body emits after its exit tables. Both `null` on the self-framed test
+/// path (no shared trampoline → no chaining). `compileImpl` resolves them to absolute
+/// addresses against the mapped page.
+const EntryStubs = struct {
+    linked_entry: ?usize = null,
+    ordinary_entry: ?usize = null,
+};
+
 /// Lower a proven trace to machine code (cut-2). ABI: rdi = tags base, rsi = payloads
 /// base (the SoA register file's two lanes), rdx = native result out-param, rbx =
 /// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
 /// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
 /// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
-fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize) !?usize {
+fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize) !EntryStubs {
     const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(exit_labels);
     @memset(exit_labels, null);
@@ -4345,15 +4372,28 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     // `body_entry` (which snapshots `entry_rbx` and runs the hoisted guards). Emitted
     // only on the frameless production path; self-framed test pages never chain, so
     // their `linked_entry` stays `null`. INERT until 2.3b-1 arms a slot to it.
-    var linked_entry_off: ?usize = null;
+    var stubs = EntryStubs{};
     if (shared_exit != null) {
         const linked_entry = try a.label();
         a.bind(linked_entry);
         try a.movMemImm32(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 1);
         try a.jmp(body_entry);
-        linked_entry_off = a.labelOffset(linked_entry);
+        stubs.linked_entry = a.labelOffset(linked_entry);
+
+        // ORDINARY_ENTRY (doc 17, 2.3c-0): the dual of `linked_entry`. Presets
+        // `linked_loop_done = 0` then falls into `body_entry`. A fused handoff inherits
+        // the shared `NativeResult.linked_loop_done`, which `linked_entry` may have left
+        // at 1; the inner→continuation slot (2.3c-2) targets THIS entry so the
+        // continuation runs in ordinary mode regardless of the flag it inherited.
+        // `movMemImm32` is REX.W (`C7 /0`, sign-extended) → full u64 = 0, matching the
+        // full-width reader. INERT until 2.3c-2 arms a slot to it.
+        const ordinary_entry = try a.label();
+        a.bind(ordinary_entry);
+        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
+        try a.jmp(body_entry);
+        stubs.ordinary_entry = a.labelOffset(ordinary_entry);
     }
-    return linked_entry_off;
+    return stubs;
 }
 
 // ---------------------------------------------------------------------------
