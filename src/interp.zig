@@ -2615,6 +2615,26 @@ pub const Vm = struct {
                                 else
                                     ct;
 
+                                // 2.3c-0d (doc 17): the sibling-retry `driveChain`s below
+                                // seed `initially_excluded` with the walk's `visited` set so
+                                // they neither re-run the trace we entered nor a sibling
+                                // already tried this back-edge. `visited` holds only the
+                                // `ct`s trial-entered at THIS anchor — it does NOT contain a
+                                // fused child (`final != ct`), which lives at its own anchor.
+                                // Once a slot is armed a child prologue-fail can surface
+                                // `final` here; without excluding it a sibling retry could
+                                // immediately re-pick the just-failed child. Build the
+                                // exclusion set once = `visited ∪ {final}`. Byte-identical
+                                // now: `final == ct`, and `ct ∈ visited`, so the union adds
+                                // nothing.
+                                var excl: [visited.len + 1]*trace.Trace = undefined;
+                                @memcpy(excl[0..nvisited], visited[0..nvisited]);
+                                var nexcl = nvisited;
+                                if (final != ct and nexcl < excl.len) {
+                                    excl[nexcl] = final;
+                                    nexcl += 1;
+                                }
+
                                 // 2.3b-1 (doc 17): every EXIT consumer below routes
                                 // through `final` (the trace that performed the final
                                 // native exit), not `ct` (the trace we entered). With no
@@ -2780,13 +2800,13 @@ pub const Vm = struct {
                                     // trace expects.
                                     if (self.trace.isSourceBranchGuardExit(final, result.exit_instr, proto)) {
                                         if (ran_native) {
-                                            if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, visited[0..nvisited], safe_to_arm)) |chain| {
+                                            if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm)) |chain| {
                                                 if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                                 for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                                 continue :outer;
                                             }
                                         } else {
-                                            if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited], safe_to_arm)) |chain| {
+                                            if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl[0..nexcl], safe_to_arm)) |chain| {
                                                 if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                                 for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                                 continue :outer;
@@ -2820,7 +2840,17 @@ pub const Vm = struct {
                                 // it, monotonically), mark it for retirement so its
                                 // anchor slot frees for the stabilised wider-lane
                                 // trace. Deferred to after the walk (see `dead`).
-                                if (ndead < dead.len and self.trace.laneWidenedPast(ct, regs)) {
+                                //
+                                // 2.3c-0d (doc 17): eviction retires the trace we ENTERED at
+                                // this anchor (`ct`). `dead ⊆ visited` (both capped at 8), and
+                                // a fused child (`final != ct`) is not a member of this
+                                // anchor's walk — it lives at its own anchor and widen-evicts
+                                // itself there (P-E then resets `ct`'s arm). So eviction stays
+                                // a `ct`-slot question even though the failing lane-guard shape
+                                // is a `final` fact; gate on `final == ct` to keep a fused
+                                // child out of this anchor's `dead` list. Byte-identical now
+                                // (`final == ct` always).
+                                if (final == ct and ndead < dead.len and self.trace.laneWidenedPast(ct, regs)) {
                                     dead[ndead] = ct;
                                     ndead += 1;
                                 }
@@ -2849,13 +2879,13 @@ pub const Vm = struct {
                                 // into two literal-tier calls (as the branch-guard site
                                 // above does) rather than a runtime tier value.
                                 if (ran_native) {
-                                    if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, visited[0..nvisited], safe_to_arm)) |chain| {
+                                    if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm)) |chain| {
                                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                         for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                         continue :outer;
                                     }
                                 } else {
-                                    if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, visited[0..nvisited], safe_to_arm)) |chain| {
+                                    if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl[0..nexcl], safe_to_arm)) |chain| {
                                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                         for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                         continue :outer;
