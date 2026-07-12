@@ -2570,6 +2570,17 @@ pub const Vm = struct {
                                 // 8-hop observation boundary and would widen the blackout.
                                 // (record_exec_log already precludes the native path.)
                                 const safe_to_arm = self.suspend_ctl == null and !self.record_safepoint_lines;
+                                // 2.3c-0e (doc 17): disarm-on-unsafe. We're about to
+                                // (possibly) run native; if an observation/suspend/replay
+                                // window is active, first reset every patched slot to
+                                // `shared_exit` so no native→native handoff fires through it
+                                // and skips this dispatcher's safepoint/GC boundary. The
+                                // handoff then re-enters here and re-establishes the boundary.
+                                // Inert until 2.3c arms slots (empty registry → single length
+                                // check); load-bearing once the continuation↔inner cycle
+                                // closes in 2.3c-2. exec-log is not gated here: it takes the
+                                // non-native branch below, so no slot can fire under it.
+                                if (!safe_to_arm) self.trace.disarmAllLinks();
                                 const result = if (self.trace.config.record_exec_log) blk: {
                                     const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, trace_regs, buf);
                                     const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, trace_regs, buf);

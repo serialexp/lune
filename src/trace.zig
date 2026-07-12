@@ -2092,6 +2092,33 @@ pub const TraceState = struct {
         }
     }
 
+    /// Disarm-on-unsafe (2.3c-0e, doc 17; Bart's chosen cycle bound). Reset EVERY
+    /// armed native link's parent slot back to `shared_exit` and clear the registry.
+    /// Called from the dispatcher when it is about to run native while an
+    /// observation/suspend/replay window is active (`safe_to_arm == false`), so no
+    /// native→native handoff fires through a patched slot and skips the dispatcher's
+    /// safepoint/GC boundary. The next handoff attempt then returns to the dispatcher,
+    /// which re-establishes the boundary and — once safe again — may re-arm.
+    ///
+    /// Inert while nothing is armed (the guard makes it a single length check).
+    /// Idempotent: after a call the registry is empty, so a second call is a no-op —
+    /// which edge-triggers it in practice (disarm once on entering the unsafe window,
+    /// then nothing until arming resumes). The slot address is re-derived from the
+    /// live `parent`, never cached, exactly as `resetLinksTouching` does.
+    pub fn disarmAllLinks(self: *TraceState) void {
+        if (self.armed_links.items.len == 0) return;
+        const shared_exit = self.mcode_arena.trampoline_exit orelse 0;
+        for (self.armed_links.items) |link| {
+            switch (link.parent.native) {
+                .compiled => |*c| if (link.slot_index < c.slots.len) {
+                    c.slots[link.slot_index] = shared_exit;
+                },
+                else => {},
+            }
+        }
+        self.armed_links.clearRetainingCapacity();
+    }
+
     pub fn removeTrace(self: *TraceState, t: *Trace) void {
         for (self.cache.items, 0..) |c, idx| {
             if (c == t) {
