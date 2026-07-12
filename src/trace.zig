@@ -454,6 +454,36 @@ pub fn guardExitPc(ins: IrInstr) ?u32 {
     };
 }
 
+/// Whether IR instruction `idx` of `t` is a numeric-for loop-done guard: a
+/// `guard_true` whose deopt PC lands immediately after a `for_loop` bytecode op.
+/// Mirrors nativegen's `isNumericForLoopDoneGuard`, kept here so the arming side can
+/// enforce the P-C option (b) invariant (2.3c-0a) without reaching into codegen.
+/// Returns before touching `t.anchor` when `idx` is out of range, so it is safe on
+/// synthetic traces with an undefined anchor and empty `instrs`.
+pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
+    if (idx >= t.instrs.len) return false;
+    const g = t.instrs[idx];
+    if (g.op != .guard_true) return false;
+    const exit_pc = guardExitPc(g) orelse return false;
+    if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
+    return t.anchor.proto.code[exit_pc - 1].op == .for_loop;
+}
+
+/// Caller-declared intent for `armNativeLink`, enforcing the P-C option (b) invariant
+/// (doc 17, 2.3c-0a): a numeric-for loop-done guard's `slot[ei]` is EXCLUSIVELY its
+/// linked-materialized exit. So only a `.loop_done_linked` arm may target a loop-done
+/// guard slot, and conversely `.link_terminal` / `.ordinary_guard` arms must never
+/// land on one (their ordinary deopt reaches `shared_exit` via the reserved direct
+/// cell, never through `slot[ei]`).
+pub const ArmKind = enum {
+    /// `.link`-terminal handoff (2.3b-1). The terminal is a `.link` op, never a guard.
+    link_terminal,
+    /// Ordinary source-branch guard slot (2.3c-1). Must not be a loop-done guard.
+    ordinary_guard,
+    /// The loop-done linked-materialized exit (2.3c-2). Must be a loop-done guard.
+    loop_done_linked,
+};
+
 /// A loop-carried writeback: at the back-edge, tier-0 register `slot` holds the
 /// value produced by IR `ref`. The set of these is the trace's exit snapshot —
 /// what a future executor copies back into the register file each iteration.
@@ -1559,7 +1589,7 @@ pub const TraceState = struct {
                         if (self.nativeFor(inner)) |inat| {
                             if (inat.linked_entry) |le| {
                                 const slot: u32 = @intCast(current_link.instrs.len - 1);
-                                if (self.armNativeLink(current_link, slot, inner, le) catch false) {
+                                if (self.armNativeLink(current_link, slot, inner, le, .link_terminal) catch false) {
                                     self.native_link_arms +|= 1;
                                 }
                             }
@@ -2036,12 +2066,30 @@ pub const TraceState = struct {
     /// child resets every parent slot pointing into it) depends on the registry
     /// seeing every armed slot — a direct `c.slots[i] = target` elsewhere would
     /// strand an untracked slot and reintroduce the S2 use-after-reuse.
-    pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, target: usize) !bool {
+    pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, target: usize, kind: ArmKind) !bool {
         const c = switch (parent.native) {
             .compiled => |*cc| cc,
             else => return false,
         };
         if (slot_index >= c.slots.len) return false;
+        // P-C option (b) invariant (2.3c-0a): a numeric-for loop-done guard's slot is
+        // exclusively its linked-materialized exit. Enforce that the arm's declared kind
+        // matches the slot's guard shape — a mismatch is a wiring bug (assert in debug),
+        // and fail closed (leave the slot unarmed) in release. The emission half (0f)
+        // already routes a loop-done ordinary deopt around `slot[ei]`; this closes the
+        // arming half so no ordinary/link arm can ever write a loop-done slot (and no
+        // loop-done arm can land on a non-loop-done slot).
+        const is_loopdone = isLoopDoneGuardIndex(parent, slot_index);
+        switch (kind) {
+            .loop_done_linked => {
+                std.debug.assert(is_loopdone);
+                if (!is_loopdone) return false;
+            },
+            .link_terminal, .ordinary_guard => {
+                std.debug.assert(!is_loopdone);
+                if (is_loopdone) return false;
+            },
+        }
         // A re-arm of this exact slot supersedes any prior child it pointed at.
         // Mutate the existing record IN PLACE (no allocation) — the earlier
         // remove-then-append ordering could OOM after dropping the old record,
@@ -5189,14 +5237,14 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
     const CHILD_BODY: usize = 0xDEAD_BEEF;
 
     // Arm: slot 1 of parent points at the child body; exactly one record tracked.
-    try testing.expect(try state.armNativeLink(&parent, 1, &child, CHILD_BODY));
+    try testing.expect(try state.armNativeLink(&parent, 1, &child, CHILD_BODY, .link_terminal));
     try testing.expectEqual(CHILD_BODY, parent_slots[1]);
     try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
 
     // Re-arming the SAME slot supersedes the prior record IN PLACE (no duplicate,
     // no realloc — the record count stays 1 and the new target is written).
     const CHILD_BODY2: usize = 0xF00D;
-    try testing.expect(try state.armNativeLink(&parent, 1, &child, CHILD_BODY2));
+    try testing.expect(try state.armNativeLink(&parent, 1, &child, CHILD_BODY2, .link_terminal));
     try testing.expectEqual(CHILD_BODY2, parent_slots[1]);
     try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
 
@@ -5206,7 +5254,7 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
 
     // Out-of-range slot index is a no-op → returns false, no OOB write, no record.
-    try testing.expect(!try state.armNativeLink(&parent, 99, &child, CHILD_BODY));
+    try testing.expect(!try state.armNativeLink(&parent, 99, &child, CHILD_BODY, .link_terminal));
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
 
     // A non-compiled parent is a no-op → returns false.
@@ -5218,13 +5266,13 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
         .entry_guards = &.{},
         .native = .unsupported,
     };
-    try testing.expect(!try state.armNativeLink(&unsup, 0, &child, CHILD_BODY));
+    try testing.expect(!try state.armNativeLink(&unsup, 0, &child, CHILD_BODY, .link_terminal));
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
 
     // Parent-retire direction: re-arm, then reset touching the PARENT (source).
     // The record is dropped WITHOUT writing through the (about-to-be-freed) slot,
     // and a subsequent child-retire must find no record — no write, no crash.
-    try testing.expect(try state.armNativeLink(&parent, 2, &child, CHILD_BODY));
+    try testing.expect(try state.armNativeLink(&parent, 2, &child, CHILD_BODY, .link_terminal));
     try testing.expectEqual(CHILD_BODY, parent_slots[2]);
     state.resetLinksTouching(&parent);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
@@ -5233,6 +5281,63 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
     // Later child-retire is a clean no-op now that the record is gone.
     state.resetLinksTouching(&child);
     try testing.expectEqual(CHILD_BODY, parent_slots[2]);
+}
+
+test "armNativeLink: P-C option (b) invariant — arm kind matches slot guard shape" {
+    // 2.3c-0a: a numeric-for loop-done guard's slot is EXCLUSIVELY its linked-
+    // materialized exit. `armNativeLink` enforces that the caller's declared `ArmKind`
+    // matches the slot's guard shape: only `.loop_done_linked` may target a loop-done
+    // slot, and `.ordinary_guard`/`.link_terminal` may target a non-loop-done one.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    // A proto whose code[0] is a `for_loop`, so a `guard_true` deopting to pc 1
+    // (== the instruction AFTER the for_loop) is a numeric-for loop-done guard.
+    const proto = Proto{ .code = &.{Instr.op0(.for_loop)}, .name = "t", .num_registers = 2 };
+
+    const parent_slots = try gpa.alloc(usize, 2);
+    defer gpa.free(parent_slots);
+    @memset(parent_slots, 0);
+
+    // instr 0 = loop-done guard (guard_true, exit_pc = 1); instr 1 is out of range for
+    // the slot table's index 1, which is therefore a non-loop-done slot.
+    const pinstrs = try gpa.alloc(IrInstr, 1);
+    defer gpa.free(pinstrs);
+    pinstrs[0] = .{ .op = .guard_true, .aux = 1 };
+    var parent: Trace = .{
+        .anchor = .{ .proto = &proto, .pc = 0 },
+        .instrs = pinstrs,
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = parent_slots, .gpa = gpa } },
+    };
+    var child: Trace = .{
+        .anchor = undefined,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = &.{}, .gpa = gpa } },
+    };
+
+    // Classifier: slot 0 IS a loop-done guard; slot 1 (no IR instr) is not.
+    try testing.expect(isLoopDoneGuardIndex(&parent, 0));
+    try testing.expect(!isLoopDoneGuardIndex(&parent, 1));
+
+    // The loop-done slot accepts only a `.loop_done_linked` arm.
+    const BODY: usize = 0x1234;
+    try testing.expect(try state.armNativeLink(&parent, 0, &child, BODY, .loop_done_linked));
+    try testing.expectEqual(BODY, parent_slots[0]);
+
+    // The non-loop-done slot accepts an ordinary-guard arm (and never a loop-done one).
+    try testing.expect(try state.armNativeLink(&parent, 1, &child, BODY, .ordinary_guard));
+    try testing.expectEqual(BODY, parent_slots[1]);
+
+    // Reset so the leak-checked registry is empty at deinit.
+    state.resetLinksTouching(&child);
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
 }
 
 test "driveChain ordinary_header: chains at the anchor, not a guard's lane ordinal" {
