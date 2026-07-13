@@ -83,6 +83,18 @@ pub const ExitReason = enum(u32) {
     prologue_fail = 1,
 };
 
+/// 2.3c-2a (doc 17): capacity of the per-transition native ledger carried in
+/// `NativeResult`. A fused native span (`C→I→C→…` chained under the shared frame)
+/// returns ONE result whose scalar fields describe only the TERMINAL body; every
+/// intermediate exit is otherwise unrecoverable. Each exit-materialization appends
+/// one entry so `runLinkedBurst` can replay the hops it never re-entered Zig to
+/// observe. Sized to cover the burst-hop bound (≤9 enclosing iterations × 2
+/// transitions/iteration = 18) in a single native span so the common closed-cycle
+/// case never forces an early yield; the native append is bounds-guarded, so an
+/// over-long span drops the overflow entry (2.3c-2a/b, no cycle → never reached) or,
+/// once 2.3c-2c closes the cycle, a chain-source forces a yield to `shared_exit`.
+pub const LEDGER_CAP: usize = 32;
+
 /// Result of executing a trace.
 pub const ExecResult = struct {
     /// Number of loop iterations that committed cleanly.
@@ -119,6 +131,14 @@ pub const ExecResult = struct {
     /// Defaulted so the ~40 tier-1a construction sites are untouched; only ever READ on
     /// the native chained path (`driveChain`, `tier == .native_only`).
     exit_reason: ExitReason = .normal,
+    /// 2.3c-2a (doc 17): number of exit-materializations the (possibly fused) native
+    /// span recorded in `NativeResult`'s per-transition ledger. 1 for an un-fused run;
+    /// >1 when an armed slot chained bodies under the shared frame (a `C→I` `.link`
+    /// fusion records 2 — C's terminal exit then I's). In 2.3c-2a the ledger ENTRIES
+    /// are not carried here (the drain still reads scalar fields); `runLinkedBurst`
+    /// consumes them in 2.3c-2b. Native only — tier-1a leaves it 0 (defaulted, so the
+    /// ~40 tier-1a construction sites are untouched).
+    ledger_len: usize = 0,
 };
 
 /// Commit the final numeric-`for` iteration at a loop-done side exit so a linked

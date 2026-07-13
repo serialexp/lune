@@ -1,6 +1,52 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
-## Status 2026-07-13 (latest) — 2.3c-1 M1 half-fusion LANDED (green, byte-identical)
+## Status 2026-07-13 (latest) — 2.3c-2a per-transition ledger ABI + emission LANDED (green, byte-identical)
+
+First sub-step of 2.3c-2 (task #56). Bart's decision: **"Promote the M2 ledger"** — the
+inner→continuation arm (2.3c-2c) closes a `C→I→C→I…` cycle in ONE trampoline entry whose
+scalar `NativeResult` fields describe only the terminal hop, so the intermediate hops are
+unrecoverable and the dispatcher drain can't account them. The M2 per-transition ledger,
+previously "rejected/deferred", is therefore promoted and built here first — ABI + emission
+only, with NO accounting change yet (that's 2.3c-2b) and NO cycle-closing arm yet (2.3c-2c).
+
+- **irinterp.zig.** `pub const LEDGER_CAP: usize = 32` (covers the burst-hop bound: ≤9
+  iterations × 2 transitions = 18 in one span; native append is bounds-guarded). `ExecResult`
+  gains a defaulted `ledger_len: usize = 0` → the ~40 tier-1a `ExecResult{…}` sites untouched;
+  read only on the native path.
+- **nativegen.zig NativeResult.** Appended AT THE TAIL (keeps all existing `@offsetOf` baked
+  into exit stubs byte-identical): `ledger_len: usize`, `ledger_cum: [LEDGER_CAP]usize`
+  (scale-8), `ledger_id`/`ledger_exit`/`ledger_reason: [LEDGER_CAP]u32` (scale-4).
+- **nativegen.zig `emitLedgerAppend(a, trace_id)`.** New helper emitted at all FOUR
+  exit-materialization sites (`.link` terminal, linked_loop_done stub, shared `deopt_exit`,
+  `prologue_fail`). Bounds-guarded drop-if-full (`cmp ledger_len, LEDGER_CAP; jae full`),
+  then SIB-indexed stores `ledger_cum[len]=rbx` (cum counter), `ledger_id[len]=trace_id`
+  (imm), `ledger_exit[len]=exit_instr` (reloaded from memory), `ledger_reason[len]=exit_reason`
+  (reloaded), `inc len`. Scratch: rax=index, rcx=staging, rbx=cum — all dead at exits.
+- **nativegen.zig `runWithLinkedLoopDone` wrapper.** `runtime_safety` tripwire asserts the
+  TERMINAL ledger entry matches the scalar result (`ledger_cum[n-1]==completed`, id/exit/reason
+  match, `1≤n≤CAP`); threads `ledger_len` into the returned `ExecResult`.
+- **Byte-identity argument.** Appends write ONLY `NativeResult` scratch (never `regs[]` or
+  program state); the drop-if-full branch is never taken pre-cycle. Control flow + scalar
+  result fields unchanged → identical stdout across all modes.
+- **Verify.** `just test` green — the terminal-consistency assert held across EVERY native run
+  in the Debug suite (single-trace hot path AND the fused C→I spans, which already emit 2 ledger
+  entries per 2.3b-1: C's `.link` exit + I's loop-done exit; the scalar drain only ever sees
+  the terminal `final_trace_id==I.id`). nsieve/nbody/mandelbrot tier-0==tier-1a==native
+  byte-identical; `just bench` nsieve flat (jit_execns 89.7M vs 95.9M baseline `1f39d8a`,
+  nsieve-bit 50.9M vs 52.7M, nsieve-bit-fp 276M vs 279M — no regression).
+
+**NEXT:** commit 2.3c-2a (conventional, local only, bundled: irinterp.zig + nativegen.zig +
+doc 17 + CURRENT_TASK.md). Then **2.3c-2b** — route `runLinkedBurst`'s native drain through a
+ledger replay (resolve each entry's owner strictly by trace_id; per-segment local =
+`cum[i]-cum[i-1]`; reproduce `onSideExit`/`linked_completed`/`native_link_exits` identically),
+byte-identical. Then **2.3c-2c** — replace chain-source drop-if-full with a forced yield to
+`shared_exit`, arm `I.loopdone-slot[ei]→C.ordinary_entry` (`.loop_done_linked`,
+`isLoopDoneGuardIndex` gate), add a load-bearing disarm-on-unsafe test, peer-review the full
+2.3c-2 diff with codex gpt-5.6-sol before final commit.
+
+---
+
+## Status 2026-07-13 — 2.3c-1 M1 half-fusion LANDED (green, byte-identical)
 
 Implemented the reviewed M1 contract end-to-end:
 
