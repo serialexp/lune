@@ -625,6 +625,13 @@ const NativeResult = extern struct {
     ledger_id: [irinterp.LEDGER_CAP]u32,
     ledger_exit: [irinterp.LEDGER_CAP]u32,
     ledger_reason: [irinterp.LEDGER_CAP]u32,
+    /// 2.3c-2c (doc 17): parallel `LedgerKind` lane — the exit-materialization SITE
+    /// that appended each hop (one static constant per `emitLedgerAppend` caller).
+    /// The generic `replayLedger` reads it to classify a hop's coherent-resume
+    /// contract without re-deriving it from the trace IR. Like the other ledger
+    /// lanes, appended AFTER the scalar fields so every baked scalar `@offsetOf` in
+    /// the exit stubs stays byte-identical.
+    ledger_kind: [irinterp.LEDGER_CAP]u32,
 };
 
 /// A compiled trace: an executable page whose entry is
@@ -724,6 +731,7 @@ pub const CompiledTrace = struct {
             .ledger_id = undefined,
             .ledger_exit = undefined,
             .ledger_reason = undefined,
+            .ledger_kind = undefined,
         };
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
@@ -755,6 +763,15 @@ pub const CompiledTrace = struct {
             std.debug.assert(result.ledger_id[n - 1] == result.final_trace_id);
             std.debug.assert(result.ledger_exit[n - 1] == result.exit_instr);
             std.debug.assert(result.ledger_reason[n - 1] == result.exit_reason);
+            // 2.3c-2c: the site tag must agree with the scalar reason on the only
+            // axis the scalar fields expose — a `.prologue_fail` reason ⟺ a
+            // `prologue_fail` site, and vice-versa. (link_terminal / loop_done_linked /
+            // deopt all carry reason `.normal`, so the ledger `kind` is what tells them
+            // apart; nothing scalar cross-checks those three yet — the generic replay
+            // validates them structurally in 2.3c-2c.)
+            const term_kind: irinterp.LedgerKind = @enumFromInt(result.ledger_kind[n - 1]);
+            std.debug.assert((result.exit_reason == @intFromEnum(irinterp.ExitReason.prologue_fail)) ==
+                (term_kind == .prologue_fail));
         }
         // 2.3c-2b: decode the per-transition ledger for the caller's replay. Only
         // `[0..ledger_len]` is meaningful; the append fully writes every counted slot.
@@ -767,6 +784,7 @@ pub const CompiledTrace = struct {
                     .id = result.ledger_id[k],
                     .exit = result.ledger_exit[k],
                     .reason = @enumFromInt(result.ledger_reason[k]),
+                    .kind = @enumFromInt(result.ledger_kind[k]),
                 };
             }
         }
@@ -3238,7 +3256,7 @@ fn slotAddr(slots: []usize, idx: usize) ?usize {
 /// handful of hops, far below the cap — and 2.3c-2c replaces the drop at chain-SOURCE
 /// sites with a forced yield to `shared_exit` so a closed cycle can never silently lose
 /// a hop.
-fn emitLedgerAppend(a: *x64.Assembler, trace_id: u32) !void {
+fn emitLedgerAppend(a: *x64.Assembler, trace_id: u32, kind: irinterp.LedgerKind) !void {
     const full = try a.label();
     // rax = ledger_len; drop the entry if already at capacity (unreachable pre-cycle).
     try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "ledger_len"));
@@ -3255,6 +3273,9 @@ fn emitLedgerAppend(a: *x64.Assembler, trace_id: u32) !void {
     // ledger_reason[rax] = NativeResult.exit_reason
     try a.movRegMem(.rcx, .rdx, @offsetOf(NativeResult, "exit_reason"));
     try a.storeMemSibReg(.rdx, .rax, 4, @offsetOf(NativeResult, "ledger_reason"), .rcx);
+    // 2.3c-2c: ledger_kind[rax] = kind  (u32 lane; per-site compile-time constant).
+    try a.movRegImm64(.rcx, @intCast(@intFromEnum(kind)));
+    try a.storeMemSibReg(.rdx, .rax, 4, @offsetOf(NativeResult, "ledger_kind"), .rcx);
     // ledger_len = rax + 1
     try a.incReg(.rax);
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "ledger_len"), .rax);
@@ -4409,7 +4430,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 // 2.3c-2a: record this `.link` transition (chain source C→I) before the
                 // handoff. `exit_instr` = i is now in memory; `exit_reason` is the inherited
                 // `.normal`.
-                try emitLedgerAppend(a, t.id);
+                try emitLedgerAppend(a, t.id, .link_terminal);
                 // Chainable: the `.link` terminal is a single-contract hand-off, so
                 // its exit jumps through slot[i] (default `shared_exit`, armed → child).
                 try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, slotAddr(slots, i));
@@ -4484,7 +4505,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // 2.3c-2a: record this loop-done transition (chain source I→C once 2.3c-2c
             // arms slot[ei]) before the handoff. `exit_instr` = ei was written into memory
             // by the mini-stub (its `jne` reached here); `exit_reason` is `.normal`.
-            try emitLedgerAppend(a, t.id);
+            try emitLedgerAppend(a, t.id, .loop_done_linked);
             // Chainable: the linked-loop-done stub commits the post-guard state, then
             // hands off through slot[ei] (default `shared_exit`, armed → continuation).
             try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, slotAddr(slots, ei));
@@ -4509,7 +4530,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     // `.normal`. The append clobbers rax/rcx but not the memory-staged `exit_target` the
     // dispatch below reads. Precedes the final_trace_id stamp — harmless, `t.id` is the
     // same value we pass as the ledger id.
-    try emitLedgerAppend(a, t.id);
+    try emitLedgerAppend(a, t.id, .deopt);
     // P-B: stamp the final trace id. `emitReturn` normally does this, but here the
     // dispatch target is the resolved value the mini-stub already staged into
     // `exit_target` (its own `slot[ei]`'s value, or `shared_exit` for a loop-done
@@ -4558,7 +4579,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     // after the parent committed thus shows up in the ledger with its own `trace_id` and
     // zero local progress. Terminal (jumps to `shared_exit`), so it is always the LAST
     // ledger entry — never a chain source, no cap needed.
-    try emitLedgerAppend(a, t.id);
+    try emitLedgerAppend(a, t.id, .prologue_fail);
     try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
 
     // LINKED_ENTRY (doc 17, 2.3b-0): a secondary entry point for an armed native

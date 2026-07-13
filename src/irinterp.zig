@@ -141,6 +141,35 @@ pub const ExecResult = struct {
     ledger_len: usize = 0,
 };
 
+/// 2.3c-2c (doc 17): which exit-materialization SITE appended a ledger entry —
+/// the static discriminator the generic `replayLedger` needs to classify a hop's
+/// coherent-resume contract without re-deriving it from the trace IR. There is
+/// exactly one value per native exit-materialization site (see `emitLedgerAppend`
+/// callers in `nativegen.zig`); the append bakes the site's compile-time constant.
+/// Finer distinctions WITHIN `.deopt` (ordinary source-branch guard vs. ordinary
+/// numeric-for loop-done vs. plain mid-loop guard) stay derived from `exit` + the
+/// trace IR (`guardExitPc` + `for_loop`) exactly as the ≤2-entry drain does today —
+/// they all share one emit site and one resume contract (tier-0 at the exit PC), so
+/// they need no separate kind.
+pub const LedgerKind = enum(u32) {
+    /// `.link` terminal hand-off (single-contract). Chain source when its slot is
+    /// armed; the linked child is the inner root at `.link.aux`. Regs coherent at
+    /// that inner PC.
+    link_terminal = 0,
+    /// Numeric-`for` loop-done, LINKED materialization (mode 1): the final iteration's
+    /// post-guard stores + phi snapshot were committed, so regs are coherent at the
+    /// continuation anchor PC. Chain source when its `slot[ei]` is armed (2.3c-2c).
+    loop_done_linked = 1,
+    /// The shared `deopt_exit` flush: an ordinary per-guard side exit, an ordinary
+    /// (mode 0) numeric-`for` loop-done deopt, or a plain mid-loop guard. Regs coherent
+    /// at the guard's exit PC for tier-0 replay. Chain source when the mini-stub's
+    /// `slot[ei]` is armed (2.3c-1, source-branch guards).
+    deopt = 2,
+    /// A hoisted entry-type guard failed pre-commit (`exit_instr = -1`,
+    /// `reason = .prologue_fail`). Always terminal — never a chain source.
+    prologue_fail = 3,
+};
+
 /// 2.3c-2b (doc 17): one decoded entry from the native per-transition ledger. A
 /// fused native span returns ONE `NativeResult` whose scalar fields describe only
 /// the TERMINAL body; `runLinkedBurst` copies the parallel `ledger_*[0..ledger_len]`
@@ -157,6 +186,10 @@ pub const LedgerEntry = struct {
     exit: u32,
     /// Why the body exited (`.normal` / `.prologue_fail`).
     reason: ExitReason,
+    /// 2.3c-2c: the exit-materialization site that appended this entry. Written by
+    /// `emitLedgerAppend` from a per-site compile-time constant; only READ by the
+    /// generic `replayLedger` (2.3c-2c) — inert until then.
+    kind: LedgerKind = .deopt,
 };
 
 /// Commit the final numeric-`for` iteration at a loop-done side exit so a linked
