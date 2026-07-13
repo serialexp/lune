@@ -632,6 +632,12 @@ const NativeResult = extern struct {
     /// lanes, appended AFTER the scalar fields so every baked scalar `@offsetOf` in
     /// the exit stubs stays byte-identical.
     ledger_kind: [irinterp.LEDGER_CAP]u32,
+    /// 2.3c-2c (doc 17): parallel `LedgerOutcome` lane — `.normal` for every entry by
+    /// default (written by `emitLedgerAppend`), rewritten to `.yielded` by
+    /// `emitForcedYieldCheck` when an armed chain source hits a full ledger. Lets
+    /// `replayLedger` tell a forced yield apart from a natural terminal at the last
+    /// entry. Appended last (after `ledger_kind`), same byte-identity rationale.
+    ledger_outcome: [irinterp.LEDGER_CAP]u32,
 };
 
 /// A compiled trace: an executable page whose entry is
@@ -732,6 +738,7 @@ pub const CompiledTrace = struct {
             .ledger_exit = undefined,
             .ledger_reason = undefined,
             .ledger_kind = undefined,
+            .ledger_outcome = undefined,
         };
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
@@ -785,6 +792,7 @@ pub const CompiledTrace = struct {
                     .exit = result.ledger_exit[k],
                     .reason = @enumFromInt(result.ledger_reason[k]),
                     .kind = @enumFromInt(result.ledger_kind[k]),
+                    .outcome = @enumFromInt(result.ledger_outcome[k]),
                 };
             }
         }
@@ -3216,10 +3224,15 @@ fn emitReturn(a: *x64.Assembler, frame: i32, callee: []const Reg, shared_exit: ?
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(trace_id));
     if (shared_exit) |se| {
         if (slot_addr) |sa| {
-            // Indirect through the link slot: load the slot's absolute address, jump
-            // through its current target (default `shared_exit`, or an armed child).
+            // Indirect through the link slot: load the slot's current target VALUE
+            // (default `shared_exit`, or an armed child body entry) into rax, apply the
+            // 2.3c-2c forced-yield cap (redirects an armed dispatch to `shared_exit` when
+            // the ledger is full), then jump. Loading the value (vs. the old `jmp [slot]`
+            // through memory) is what lets the cap inspect and, if needed, override it.
             try a.movRegImm64(.rax, @bitCast(@as(u64, sa)));
-            try a.jmpMem(.rax, 0);
+            try a.movRegMem(.rax, .rax, 0);
+            try emitForcedYieldCheck(a, se);
+            try a.jmpReg(.rax);
         } else {
             try a.movRegImm64(.rax, @bitCast(@as(u64, se)));
             try a.jmpReg(.rax);
@@ -3276,10 +3289,51 @@ fn emitLedgerAppend(a: *x64.Assembler, trace_id: u32, kind: irinterp.LedgerKind)
     // 2.3c-2c: ledger_kind[rax] = kind  (u32 lane; per-site compile-time constant).
     try a.movRegImm64(.rcx, @intCast(@intFromEnum(kind)));
     try a.storeMemSibReg(.rdx, .rax, 4, @offsetOf(NativeResult, "ledger_kind"), .rcx);
+    // 2.3c-2c: ledger_outcome[rax] = .normal (0). A chain-source forced yield
+    // (`emitForcedYieldCheck`) overwrites this entry to `.yielded` when the ledger is
+    // full; otherwise it stays `.normal` (dispatched-or-terminal, positionally resolved).
+    try a.movRegImm64(.rcx, @intCast(@intFromEnum(irinterp.LedgerOutcome.normal)));
+    try a.storeMemSibReg(.rdx, .rax, 4, @offsetOf(NativeResult, "ledger_outcome"), .rcx);
     // ledger_len = rax + 1
     try a.incReg(.rax);
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "ledger_len"), .rax);
     a.bind(full);
+}
+
+/// 2.3c-2c (doc 17): the forced-yield cap. Emitted at every frameless chain-source
+/// dispatch, AFTER `emitLedgerAppend` and BEFORE the `jmp`. On entry `rax` holds the
+/// resolved dispatch target — an armed child body entry, or `shared_exit` when the
+/// slot is unarmed. Contract:
+///   * unarmed (`rax == shared_exit`)         → leave `rax`, fall through (natural terminal / plain deopt);
+///   * armed + ledger has room (`len < CAP`)  → leave `rax`, fall through (dispatch into the child);
+///   * armed + ledger FULL (`len == CAP`)     → mark the just-appended terminal entry
+///       `.yielded` and rewrite `rax = shared_exit`, so a closed native cycle returns to
+///       the driver instead of running an unrecordable hop.
+/// Leaves `rax` = the (possibly rewritten) jmp target; the caller does `jmp rax`.
+/// Clobbers `rcx` (dead scratch — `emitLedgerAppend` just clobbered it). `rbx` (live
+/// cumulative counter) and `rdx` (`*NativeResult`) are untouched.
+///
+/// DEAD until 2.3c-2e closes the `I→C` cycle: pre-cycle every span is ≤2 entries « CAP
+/// (32), so the ledger never fills and the yield branch never executes — byte-identical.
+fn emitForcedYieldCheck(a: *x64.Assembler, shared_exit: usize) !void {
+    const do_jmp = try a.label();
+    // rcx = shared_exit. Unarmed target (rax == shared_exit) → nothing to cap.
+    try a.movRegImm64(.rcx, @bitCast(@as(u64, shared_exit)));
+    try a.cmpRegReg(.rax, .rcx);
+    try a.jcc(.e, do_jmp);
+    // Armed. Room left in the ledger (ledger_len < CAP) → dispatch into the child.
+    try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "ledger_len"), @intCast(irinterp.LEDGER_CAP));
+    try a.jcc(.b, do_jmp);
+    // Armed AND full → forced yield. Mark the just-appended terminal entry (index
+    // ledger_len − 1) `.yielded`, then redirect the dispatch to `shared_exit`.
+    try a.movRegMem(.rcx, .rdx, @offsetOf(NativeResult, "ledger_len"));
+    try a.subRegImm32(.rcx, 1);
+    // Stage the `.yielded` code in rax (free — reloaded with shared_exit right after),
+    // store it into ledger_outcome[rcx] (u32 lane, scale 4).
+    try a.movRegImm64(.rax, @intCast(@intFromEnum(irinterp.LedgerOutcome.yielded)));
+    try a.storeMemSibReg(.rdx, .rcx, 4, @offsetOf(NativeResult, "ledger_outcome"), .rax);
+    try a.movRegImm64(.rax, @bitCast(@as(u64, shared_exit)));
+    a.bind(do_jmp);
 }
 
 fn nativeExitLabel(a: *x64.Assembler, exit_labels: []?x64.Label, instr_idx: usize) !x64.Label {
@@ -4537,13 +4591,17 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     // ordinary exit), not a fixed address baked in this shared block — so inline the id
     // stamp + dispatch.
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(t.id));
-    if (shared_exit) |_| {
+    if (shared_exit) |se| {
         // 2.3c-0: frameless — dispatch through the memory-staged resolved target. The
         // mini-stub wrote `exit_target` BEFORE the flush ran, so the flush's rax clobber
         // (spilled-payload path) cannot destroy it. An unarmed ordinary `slot[ei]` holds
         // `shared_exit` (byte-identical to 2.1's direct jump); 2.3c-1 arms it to a child
-        // body entry.
-        try a.jmpMem(.rdx, @offsetOf(NativeResult, "exit_target"));
+        // body entry. 2.3c-2c: load the resolved target into rax and apply the forced-yield
+        // cap (redirects an armed source-branch dispatch to `shared_exit` when the ledger is
+        // full) before jumping.
+        try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "exit_target"));
+        try emitForcedYieldCheck(a, se);
+        try a.jmpReg(.rax);
     } else {
         // Self-framed test page: no slot table, no shared trampoline — tear down the
         // per-trace frame and `ret` exactly as before (mini-stubs staged nothing here).

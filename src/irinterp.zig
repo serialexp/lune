@@ -170,6 +170,26 @@ pub const LedgerKind = enum(u32) {
     prologue_fail = 3,
 };
 
+/// 2.3c-2c (doc 17): what a chain-source exit DID with its (possibly armed) slot —
+/// the signal the generic `replayLedger` needs to tell a forced yield apart from a
+/// natural terminal, which position alone cannot (both are the LAST ledger entry).
+/// Only `.yielded` is stamped at runtime (in the static forced-yield branch of
+/// `emitForcedYieldCheck`); `.normal` is the default every append writes.
+/// `.normal` is deliberately two-in-one — a non-final `.normal` entry DISPATCHED
+/// (an armed slot carried control into the successor recorded next), a final
+/// `.normal` entry is a natural TERMINAL (unarmed → `shared_exit`, or a plain
+/// deopt/prologue-fail). Replay disambiguates those two by position; the successor-
+/// adjacency validation (2.3c-2c) is what makes the positional inference sound.
+pub const LedgerOutcome = enum(u32) {
+    /// Dispatched into a successor (non-final) OR a natural terminal (final).
+    normal = 0,
+    /// Forced yield: an ARMED chain source hit a full ledger (`ledger_len == CAP`)
+    /// and jumped to `shared_exit` instead of its child, bounding the closed cycle.
+    /// The cycle may not be finished — the driver re-enters at the coherent resume
+    /// PC to continue it.
+    yielded = 1,
+};
+
 /// 2.3c-2b (doc 17): one decoded entry from the native per-transition ledger. A
 /// fused native span returns ONE `NativeResult` whose scalar fields describe only
 /// the TERMINAL body; `runLinkedBurst` copies the parallel `ledger_*[0..ledger_len]`
@@ -190,6 +210,10 @@ pub const LedgerEntry = struct {
     /// `emitLedgerAppend` from a per-site compile-time constant; only READ by the
     /// generic `replayLedger` (2.3c-2c) — inert until then.
     kind: LedgerKind = .deopt,
+    /// 2.3c-2c: whether this exit force-yielded. Default `.normal`; the forced-yield
+    /// branch stamps `.yielded`. Only READ by the generic `replayLedger` — inert
+    /// until the cycle can fill the ledger (2.3c-2e).
+    outcome: LedgerOutcome = .normal,
 };
 
 /// Commit the final numeric-`for` iteration at a loop-done side exit so a linked
