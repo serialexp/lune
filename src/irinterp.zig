@@ -141,6 +141,24 @@ pub const ExecResult = struct {
     ledger_len: usize = 0,
 };
 
+/// 2.3c-2b (doc 17): one decoded entry from the native per-transition ledger. A
+/// fused native span returns ONE `NativeResult` whose scalar fields describe only
+/// the TERMINAL body; `runLinkedBurst` copies the parallel `ledger_*[0..ledger_len]`
+/// arrays into a `TraceState`-owned scratch of these (via `runCapturingLedger`) and
+/// replays each recorded hop instead of reading the terminal-only scalars. `cum` is
+/// the cumulative `rbx` at that exit; the per-segment local of entry `i` is
+/// `cum[i] − cum[i-1]` (`cum[-1] = 0`, the trampoline-zeroed call-start `rbx`).
+pub const LedgerEntry = struct {
+    /// Cumulative `rbx` (enclosing-iteration counter) at this exit.
+    cum: usize,
+    /// `Trace.id` whose body performed this exit.
+    id: u32,
+    /// That exit's `exit_instr` (`maxInt(u32)` for a prologue fail).
+    exit: u32,
+    /// Why the body exited (`.normal` / `.prologue_fail`).
+    reason: ExitReason,
+};
+
 /// Commit the final numeric-`for` iteration at a loop-done side exit so a linked
 /// continuation can start at the post-loop PC without tier-0 replaying that
 /// iteration. This is deliberately not part of ordinary `execute`: normal deopt

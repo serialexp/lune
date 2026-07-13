@@ -685,7 +685,7 @@ pub const CompiledTrace = struct {
     /// lanes are passed as the SysV first two args (rdi=tags, rsi=payloads); the
     /// result pointer is the third (rdx), reserved out of the allocator pools.
     pub fn run(self: CompiledTrace, regs: RegWindow) irinterp.ExecResult {
-        return self.runWithLinkedLoopDone(regs, false);
+        return self.runWithLinkedLoopDone(regs, false, null);
     }
 
     /// Run in the chain-consumed loop-done mode. Numeric-for loop-done exits commit
@@ -693,10 +693,21 @@ pub const CompiledTrace = struct {
     /// so the native nested-loop chainer can jump to the `.link` continuation
     /// without tier-0 replay.
     pub fn runLinkedLoopDone(self: CompiledTrace, regs: RegWindow) irinterp.ExecResult {
-        return self.runWithLinkedLoopDone(regs, true);
+        return self.runWithLinkedLoopDone(regs, true, null);
     }
 
-    fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool) irinterp.ExecResult {
+    /// 2.3c-2b (doc 17): like `run` (ordinary mode, `linked_loop_done = 0`) but ALSO
+    /// decodes the native per-transition ledger into `ledger_out[0..ledger_len]`, so
+    /// `runLinkedBurst` replays each fused `C→I` hop the terminal-only scalar fields
+    /// hide instead of re-reading them. `ledger_out` must have room for `LEDGER_CAP`
+    /// entries (the native append is bounds-guarded at that cap). The borrow is
+    /// consumed immediately by the caller's replay — no native call / resize / nested
+    /// replay may intervene between this capture and its consumption.
+    pub fn runCapturingLedger(self: CompiledTrace, regs: RegWindow, ledger_out: []irinterp.LedgerEntry) irinterp.ExecResult {
+        return self.runWithLinkedLoopDone(regs, false, ledger_out);
+    }
+
+    fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool, ledger_out: ?[]irinterp.LedgerEntry) irinterp.ExecResult {
         var result = NativeResult{
             .completed = 0,
             .exit_instr = std.math.maxInt(u32),
@@ -744,6 +755,20 @@ pub const CompiledTrace = struct {
             std.debug.assert(result.ledger_id[n - 1] == result.final_trace_id);
             std.debug.assert(result.ledger_exit[n - 1] == result.exit_instr);
             std.debug.assert(result.ledger_reason[n - 1] == result.exit_reason);
+        }
+        // 2.3c-2b: decode the per-transition ledger for the caller's replay. Only
+        // `[0..ledger_len]` is meaningful; the append fully writes every counted slot.
+        if (ledger_out) |out| {
+            std.debug.assert(out.len >= result.ledger_len);
+            var k: usize = 0;
+            while (k < result.ledger_len) : (k += 1) {
+                out[k] = .{
+                    .cum = result.ledger_cum[k],
+                    .id = result.ledger_id[k],
+                    .exit = result.ledger_exit[k],
+                    .reason = @enumFromInt(result.ledger_reason[k]),
+                };
+            }
         }
         return .{
             .completed = result.completed,

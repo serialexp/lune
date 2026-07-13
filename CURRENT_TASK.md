@@ -1,6 +1,55 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
-## Status 2026-07-13 (latest) — 2.3c-2a per-transition ledger ABI + emission LANDED (green, byte-identical)
+## Status 2026-07-13 (latest) — 2.3c-2b native call-B drain rerouted through ledger replay LANDED (green, byte-identical)
+
+Second sub-step of 2.3c-2 (task #56), per Bart's "Ok, 2b next :)". Reroute ONLY the native
+continuation drain (call B) of `runLinkedBurst` through the 2.3c-2a ledger; call A (hop-top
+inner), the driver swap, burst-entry accounting, and the tier-1a scalar path stay UNCHANGED.
+Byte-identical: nothing new armed I→C, so every call-B ledger is ≤2 entries whose terminal ==
+the old scalar result.
+
+- **nativegen.zig.** `runWithLinkedLoopDone` gained a `ledger_out: ?[]irinterp.LedgerEntry`
+  out-param; `run`/`runLinkedLoopDone` pass `null`. New `pub fn runCapturingLedger(regs,
+  ledger_out)` = ordinary mode + copies `NativeResult.ledger_*[0..ledger_len]` into `ledger_out`
+  (asserts `out.len ≥ ledger_len`). Option (b): the 32-slot arrays never enter the by-value
+  `ExecResult`; only the caller's borrowed scratch is filled.
+- **irinterp.zig.** New `pub const LedgerEntry = struct { cum: usize, id: u32, exit: u32, reason:
+  ExitReason }` — one decoded ledger row.
+- **trace.zig.** `TraceState.ledger_scratch: [LEDGER_CAP]LedgerEntry` (borrowed capture→replay
+  window, not a GC root). New `ContinuationReplay` directive union + `replayContinuationLedger`
+  phase-machine (starts in `continuation` phase): resolves the first entry's owner strictly
+  (`traceById`, assert==current_link), branches on `.link`-terminal vs continuation-own-deopt;
+  charges `native_link_exits` ONCE on the `C.link` marker (replaces the old per-span 1726 +
+  standalone-`.link` 1789 bumps — identical count); resolves the fused inner strictly by id +
+  `isInnerLoopRoot`, `flocal = cum[1]-cum[0]`, loop-done via `guardExitPc`+`for_loop`. Directives:
+  `run_continuation` (re-run `snt.runCapturingLedger`), `run_inner` (`continue :hop`),
+  `return_result` (yield/finish), `break_burst` (`break :hop` → penalty-neutral tail). The old
+  scalar `while (final != current_link.id)` drain + standalone/`completed>0`/break tail are gone
+  on the native path; the `hop:` while is now labeled. Tier-1a keeps the scalar single-exit path.
+- **codex BLOCKER fix.** `entries.len ≤ 2` is RELEASE-enforced with `@panic` (not a debug assert):
+  a `C.link→I.guard→R.link` composition — an inner whose OWN ordinary source guard is armed to a
+  ramp (2.3c-1) — could yield 3 entries; a debug-only assert would let ReleaseFast silently drop
+  R's hop and misresume. The panic aborts loudly in every build, matching the old scalar drain's
+  "unexpected fused shape" hard-stop. Not reachable in the test suite (assert never fired);
+  2.3c-2c's full-ledger replay lifts the cap.
+- **Verify.** `just test` green; the 6-benchmark matrix (nsieve, nsieve-bit, fannkuch, mandelbrot,
+  nbody, spectral-norm) tier-0==tier-1a==native byte-identical; `just bench --filter nsieve` flat
+  (`cross ok`, jit 92.9ms). Post-impl codex gpt-5.6-sol review confirmed exact accounting parity
+  for every ≤2-entry shape (native_link_exits count, resume_pc, completed, onSideExit args,
+  hops/break-continue-return mapping) — the hop-budget `hops==max` vs old `max+1` is dead-after-tail
+  (not observable).
+
+**NEXT:** commit 2.3c-2b (conventional, local only, bundled: irinterp.zig + nativegen.zig +
+trace.zig + doc 17 + CURRENT_TASK.md; do NOT stage other-agent files). Then **2.3c-2c** — replace
+chain-source drop-if-full with a forced yield to `shared_exit`, arm
+`I.loopdone-slot[ei]→C.ordinary_entry` (`.loop_done_linked`, `isLoopDoneGuardIndex` gate), route
+call A + seed receipts through the now-tested `replayContinuationLedger` (lifting the ≤2 cap),
+normalize follow-counters, add a load-bearing disarm-on-unsafe test (two-phase same-VM + negative
+control), peer-review the full 2.3c-2 diff with codex gpt-5.6-sol before final commit.
+
+---
+
+## Status 2026-07-13 — 2.3c-2a per-transition ledger ABI + emission LANDED (green, byte-identical)
 
 First sub-step of 2.3c-2 (task #56). Bart's decision: **"Promote the M2 ledger"** — the
 inner→continuation arm (2.3c-2c) closes a `C→I→C→I…` cycle in ONE trampoline entry whose
