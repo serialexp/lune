@@ -2680,6 +2680,88 @@ pub const Vm = struct {
                                 // resume accounting (inside `driveChain`) uses `completed`.
                                 const local_done: usize = if (ran_native) result.local_completed else result.completed;
 
+                                // 2.3c-1 (M1 half-fusion, doc 17): fused top-level
+                                // `.link` consumer. When `driveChain` armed `ct`'s
+                                // source-branch guard slot → a prime-side ramp's
+                                // `ordinary_entry`, a native run of `ct` (the skip
+                                // trace) can fuse straight into that ramp under the
+                                // shared frame: skip commits its composites, hits the
+                                // armed guard, jumps into the ramp, which runs to its
+                                // `.link` terminal committing ZERO of its OWN
+                                // iterations. The receipt is then `final = ramp`,
+                                // `result.completed == entry_rbx ==` skip's own count
+                                // (so `local_done == 0`), and regs are coherent at the
+                                // ramp's INNER-loop PC — NOT the outer header. The plain
+                                // dispatcher below would misread `local_done == 0` as a
+                                // skip zero-exit, call `onSideExit(final, 0)`, and drive
+                                // `.ordinary_header` off `final.anchor.pc` (the outer
+                                // header) — a semantic misresume from the wrong coherent
+                                // PC (doc 17 §Increment 2.3c). Recognize the fusion by
+                                // ARMED-EDGE PROVENANCE (not the `.link` opcode, which
+                                // OOBs on a fused prologue-fail and false-positives on
+                                // 2.3c-2's inner→continuation), replay the root's
+                                // steering `onSideExit(ct, skip_local)` that `final`
+                                // cannot reproduce (P-F), then continue the burst from
+                                // the already-run ramp result WITHOUT re-running the ramp
+                                // (which would redo its `for_prep`).
+                                if (ran_native and final != ct and result.exit_reason == .normal and
+                                    result.exit_instr < final.instrs.len)
+                                {
+                                    if (self.trace.fusedSourceBranchLinkSlot(ct, final, proto)) |slot| {
+                                        self.trace.native_source_link_fused +|= 1;
+                                        // The ramp commits 0 of its own iterations, so
+                                        // `result.completed` IS the skip trace's own
+                                        // committed count (`entry_rbx`, `local_completed
+                                        // == 0`) — no new `NativeResult` field needed.
+                                        const skip_local: usize = result.completed;
+                                        // Replay the root's productive source-branch
+                                        // steering on `ct` (skip). The other two
+                                        // productive-exit hooks are statically inert for
+                                        // this exit shape: `maybeArmContinuation` is a
+                                        // no-op on a source-branch guard (its exit PC does
+                                        // not follow a `for_loop` — the recognizer proved
+                                        // `slot` is `isSourceBranchGuardExit`), and
+                                        // `countProductiveBranchExit` returns early once
+                                        // the prime side coexists (`countTracesAt >= 2`,
+                                        // guaranteed here: we armed skip→ramp, so both
+                                        // live at this anchor).
+                                        std.debug.assert(self.trace.isSourceBranchGuardExit(ct, slot, proto));
+                                        std.debug.assert(self.trace.countTracesAt(ct.anchor) >= 2);
+                                        self.trace.onSideExit(ct, skip_local);
+                                        if (final.instrs[result.exit_instr].op == .link) {
+                                            // Sub-case (a): the ramp reached its `.link`
+                                            // terminal → continue the burst (inner root,
+                                            // then continuation⇄inner) exactly as the
+                                            // unarmed `driveChain` does after
+                                            // `snt.run(ramp)`. `sresult_fused = false`:
+                                            // the ramp's OWN `.link` slot is unarmed in M1
+                                            // (only the continuation's is armed, 2.3b-1),
+                                            // so `runLinkedBurst` IGNORES the seed result
+                                            // entirely and re-derives everything from the
+                                            // ramp's `.link.aux` — byte-identical to the
+                                            // unarmed seed whose `sresult.completed` was 0.
+                                            const nt = self.trace.nativeFor(final) orelse
+                                                @panic("2.3c-1: fused ramp has no native code");
+                                            const chain = self.trace.runLinkedBurst(final, result, false, nt, .native_only, .ordinary_header, proto, regs, safe_to_arm);
+                                            if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                                            for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                            continue :outer;
+                                        }
+                                        // Sub-case (b): the ramp deopted at an internal
+                                        // guard BEFORE its `.link` (rare — prime_side's
+                                        // own guards are coherent at the fused entry).
+                                        // Byte-identical to the unarmed path, whose
+                                        // `driveChain` runs the ramp, gets a non-`.link`
+                                        // result, and returns `{completed: 0, resume_pc:
+                                        // walk_pc = anchor.pc}` after `onSideExit(ramp,
+                                        // 0)`.
+                                        self.trace.onSideExit(final, 0);
+                                        pc = @intCast(ct.anchor.pc);
+                                        for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                        continue :outer;
+                                    }
+                                }
+
                                 // --- guard-failure counting (step 4) ---
                                 // Count guard failures on zero-iteration exits
                                 // (type mismatches that passed the fingerprint
@@ -9915,6 +9997,16 @@ test "coherent-state chaining (doc 16, Phase 2): nsieve prime path chains, not t
     // than tier-0 runs the outer body. Self-relative so it's robust to warm-up
     // length and threshold changes.
     try testing.expect(native_vm.trace.prime_side_chain_follows > native_vm.trace.tier0_outer_body_entries);
+
+    // 2.3c-1 (M1 half-fusion, doc 17): the skip trace's source-branch guard slot was
+    // armed → the prime-side ramp's `ordinary_entry` (arm), and on a subsequent
+    // productive exit skip fused straight into the ramp under the shared frame and the
+    // dispatcher's M1 fused-`.link` consumer drained the receipt (fused). Output
+    // equality above already proves the fused receipt is drained byte-identically; these
+    // two counters prove the arm path AND the consumer path are exercised at all (either
+    // staying 0 would mean the M1 mechanism silently never fired).
+    try testing.expect(native_vm.trace.native_source_link_arms > 0);
+    try testing.expect(native_vm.trace.native_source_link_fused > 0);
 }
 
 test "coherent-state chaining (doc 16, Phase 2): TraceKind link-permission (root loops, continuation links)" {

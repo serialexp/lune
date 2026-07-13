@@ -1,6 +1,79 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
-## Status 2026-07-12 (latest)
+## Status 2026-07-13 (latest) — 2.3c-1 M1 half-fusion LANDED (green, byte-identical)
+
+Implemented the reviewed M1 contract end-to-end:
+
+- **trace.zig arm.** `driveChain` now arms the failing skip trace's source-branch guard
+  slot → the prime-side ramp's `ordinary_entry`
+  (`armNativeLink(failed, exit_instr, sct, oe, .ordinary_guard)`), gated
+  `tier == .native_only ∧ safe_to_arm ∧ materialization == .ordinary_header ∧
+  sct.inputs.len == 0 ∧ isSourceBranchGuardExit(failed, exit_instr, proto)`. `failed` is
+  now `*Trace` (mutable, `armNativeLink` needs it). New counter `native_source_link_arms`.
+- **trace.zig `runLinkedBurst`.** Extracted the ping-pong burst body out of `driveChain`
+  into a now-`pub` method so both `driveChain` and the dispatcher consumer enter it with
+  an already-run ramp result. Verified it reads `sresult` ONLY via
+  `fused_inner = if (sresult_fused) sresult else null` — with `sresult_fused == false`
+  (M1 seed) the seed result is entirely unused, so passing the fused `result`
+  (`completed == skip_local`) is byte-identical to the unarmed seed (`completed == 0`).
+- **trace.zig `fusedSourceBranchLinkSlot`.** Provenance recognizer: returns `ct`'s
+  source-branch guard slot if an armed record `{parent==ct, child==final}` exists whose
+  slot is `isSourceBranchGuardExit` and `final.anchor == ct.anchor`; else null. Excludes
+  the 2.3b-1 `.link_terminal` continuation→inner edge (its slot is a `.link` op, not a
+  guard) and, once 2.3c-2 lands, the persistently-armed inner→continuation.
+- **interp.zig fused-`.link` consumer.** Inserted after `local_done`, before guard-
+  failure counting. Gated `ran_native ∧ final != ct ∧ result.exit_reason == .normal ∧
+  result.exit_instr < final.instrs.len`; on provenance match: `native_source_link_fused`
+  bump, `onSideExit(ct, skip_local = result.completed)`, two inert-hook asserts, then
+  split — ramp `.link` → `runLinkedBurst(final, result, false, nt, .native_only,
+  .ordinary_header, …)`; internal-guard deopt → `onSideExit(final, 0)` + resume at
+  `ct.anchor.pc` (byte-identical to the unarmed `driveChain` seed's `{0, walk_pc}`).
+  Fused prologue-fail (`exit_reason != .normal`, unreachable in practice — value-branch
+  guards fire with types coherent) falls through to normal handling per the reviewed gate.
+- **Verify.** `just test` green (incl. the 10-mode differential/keyframe goldens + two
+  new `> 0` counter asserts in the Phase-2 nsieve chain test). 6 benchmarks
+  tier-0==tier-1a==native byte-identical; nsieve `--emit-keyframe` tier-0==native
+  byte-identical. Perf expected ~neutral on nsieve tiny clusters (consistent with
+  2.3b-1) — value is completing native chain coverage + de-risking Increment 3, not a
+  standalone speedup.
+
+**NEXT:** commit (conventional, local only), then Increment 2.3c-2 (arm loop-done
+inner→continuation — closes the native cycle; land only after 2.3c-0e disarm-on-unsafe
+is proven load-bearing).
+
+---
+
+## Status 2026-07-13 — 2.3c fused-transition contract DESIGNED + review-clean
+
+- **2.3c-1 re-scoped to M1 half-fusion (design only, not yet coded).** A codex
+  gpt-5.6-sol pre-implementation review found the terse "arm skip→prime-side" scope
+  *incoherent*: the prime-side is a `.link` **entry ramp** (no numeric-for back-edge),
+  so arming `skip.guard` alone lands the fused run at the ramp's `.link` terminal with
+  regs coherent at the **inner** PC while the dispatcher misreads it as an outer-header
+  zero-exit → semantic **misresume**. Wrote `docs/design/17` §"Increment 2.3c —
+  fused-transition contract" choosing **M1 (half-fusion)**: arm ONLY
+  `skip.guard → prime_side.ordinary_entry`; decode the root's own count as
+  `result.completed` (ramp commits 0 iterations → **no new NativeResult field**); add a
+  dispatcher *fused top-level `.link` consumer* that replays `onSideExit(ct, skip_local)`
+  + continues the burst via a `driveChain` seed of the already-run ramp result WITHOUT
+  re-running the ramp. Rejected **M2** (full single-call skip→ramp→inner fusion) as
+  needing the deferred P-F per-hop ledger nothing on the roadmap requires.
+- **codex round-2 review of the written M1 design: confirmed + 1 BLOCKER + 1 SHOULD-FIX,
+  both folded into the doc.** Confirmed: receipt decode (ramp never `inc rbx` between
+  `ordinary_entry` and its `.link`), register coherence, inert-hook asserts, `onSideExit`
+  ordering. BLOCKER: the fused-`.link` recognizer must discriminate on **P-E armed-edge
+  provenance** (`parent==ct ∧ child==final ∧ slot_index` a source-branch guard) with a
+  `exit_reason==.normal ∧ exit_instr<len` bounds gate — NOT the bare
+  `final.instrs[exit_instr].op==.link` opcode, which OOBs on a fused prologue-fail
+  (`exit_instr==maxInt`) and false-positives once 2.3c-2 persistently arms the
+  inner→continuation slot (a directly-entered inner can return `final==continuation`,
+  `final[exit_instr].op==.link`). SHOULD-FIX: the driveChain seed must consume a
+  `current_link`-owned `.link` receipt at trace.zig:~1390, NOT initialize `fused_inner`
+  from the ramp result (that field means the result already belongs to an inner root,
+  resolved via `isInnerLoopRoot` → would panic/misclassify).
+- **NEXT: implement 2.3c-1 M1** (task #55) now that the design is review-clean.
+
+## Status 2026-07-12 (previous latest)
 
 - **Increment 2.3c-0 (inert contracts + post-review blocker fixes): LANDED.** Six
   inert sub-steps a–f (commits `7523d1e` re-scope, `094ff89` 0b, `c295586` 0c,
