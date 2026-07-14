@@ -994,7 +994,26 @@ pub const Vm = struct {
         return n;
     }
 
+    /// 2c-F (doc 17): a fresh top-level execution epoch must not inherit armed
+    /// native links from a prior completed run on this VM. An armed exit slot left
+    /// over from a previous epoch could still point at a live, in-cache child body
+    /// and fire a native→native handoff on this run's first hot entry — bypassing
+    /// the dispatcher's safepoint/GC boundary with fresh-run register/stack state
+    /// the handoff never established. That is the layout-dependent rerun hazard the
+    /// codex `gpt-5.6-sol` review flagged as a blocker: the exit-slot hardening
+    /// (`armNativeLink` derive-not-trust + `compileImpl` in-page validation) proves
+    /// address provenance but NOT dynamic-entry validity across an epoch, so a
+    /// stale-but-in-bounds link can still fire. Reset every armed slot to
+    /// `shared_exit` here; links re-arm from observations made during THIS run.
+    /// Applies ONLY to the fresh `run`/`start` entry — NOT `exec()` resume after a
+    /// `.suspended` (a continuation of the SAME epoch, where the dispatcher's
+    /// observation-window disarm, 2.3c-0e, governs) and not nested function calls.
+    fn beginTopLevelEpoch(self: *Vm) void {
+        self.trace.disarmAllLinks();
+    }
+
     pub fn run(self: *Vm, proto: *const Proto) Error!Value {
+        self.beginTopLevelEpoch();
         self.seedProtoIds(proto);
         if (proto.num_registers > self.regCapacity()) return Error.StackOverflow;
         self.fillNil(0, proto.num_registers);
@@ -1015,6 +1034,7 @@ pub const Vm = struct {
     /// chunk's frame exactly as `run` does. Resume after a `.suspended` by
     /// calling `exec()` again (the cursor is parked in `frames[depth-1]`).
     pub fn start(self: *Vm, proto: *const Proto) Error!ExecOutcome {
+        self.beginTopLevelEpoch();
         self.seedProtoIds(proto);
         if (proto.num_registers > self.regCapacity()) return Error.StackOverflow;
         self.fillNil(0, proto.num_registers);
@@ -10043,22 +10063,28 @@ test "2c-E (doc 17): native one-trip linked loop-done is productive, not a guard
     }
 }
 
-test "2c-F (doc 17): an observation window disarms a LIVE armed native cycle on the same VM" {
+test "2c-F (doc 17): a fresh top-level run disarms the prior epoch's LIVE armed cycle" {
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
-    // The load-bearing disarm-on-unsafe integration test (the same-VM two-phase
-    // scenario the unit test at trace.zig can't reach). Phase A arms + fuses the
-    // native `C↔I` cycle on a real VM with NO observation window — the negative
-    // control: on the safe path `disarmAllLinks` must NEVER fire
-    // (`native_link_disarms == 0`) even though slots are live. Phase B RE-RUNS the
-    // exact same proto on the SAME VM with a replay-line observation window open; on
-    // the first hot dispatcher entry `safe_to_arm` is false, so the dispatcher tears
-    // the LIVE cycle down (`disarmAllLinks` resets both slots to `shared_exit`
-    // BEFORE any native→native handoff can skip a safepoint) and re-enters the
-    // dispatcher per hop. The decisive facts: (1) Phase B output is byte-identical to
-    // the tier-0 oracle with the window active, and (2) the tear-down actually
-    // happened over a non-empty registry — provable only by the counter, since a
-    // correct byte-identical run under an open window looks the same whether the
-    // registry held zero or two links.
+    // The load-bearing epoch-containment integration test (the same-VM two-phase
+    // scenario the `disarmAllLinks` unit test at trace.zig can't reach). Phase A arms
+    // + fuses the native `C↔I` cycle on a real VM and asserts the NEGATIVE CONTROL:
+    // within a single execution epoch `disarmAllLinks` NEVER fires
+    // (`native_link_disarms == 0`) even though slots are live and fused. Phase B
+    // starts a FRESH top-level run of the SAME proto on the SAME VM: `Vm.run`'s
+    // `beginTopLevelEpoch` (2c-F containment) tears the prior epoch's live cycle down
+    // (`disarmAllLinks` resets both slots to `shared_exit`) BEFORE the first hot
+    // dispatcher entry, so no armed exit left over from Phase A can fire a
+    // native→native handoff into this run's fresh frame/register state. This is the
+    // fix for the codex-flagged rerun blocker: the exit-slot hardening proves address
+    // provenance but not dynamic-entry validity across an epoch — only the
+    // fresh-run disarm restores the dispatcher boundary. The decisive facts: (1)
+    // Phase B is byte-identical to tier-0 with NO observation window (the containment
+    // is unconditional, not window-gated), and (2) the tear-down actually happened
+    // over a non-empty registry — provable only by the counter, since a correct
+    // byte-identical run looks the same whether the registry held zero or two links.
+    // (The dispatcher's observation-window disarm, 2.3c-0e, remains reachable on the
+    // SAME-epoch suspend/resume path, which `beginTopLevelEpoch` deliberately does
+    // NOT touch; it is unit-covered by the `disarmAllLinks` test.)
     const source =
         \\local s = 0
         \\for i = 1, 400 do
@@ -10078,7 +10104,7 @@ test "2c-F (doc 17): an observation window disarms a LIVE armed native cycle on 
     var vm = try Vm.init(gpa);
     defer vm.deinit();
 
-    // Phase A — arm + fuse the cycle with NO window (negative control for disarm).
+    // Phase A — arm + fuse the cycle (negative control: no disarm within one epoch).
     var phaseA_buf: [64]u8 = undefined;
     var phaseA = io.Writer.fixed(&phaseA_buf);
     var chunk = try runNativeForTrace(&vm, gpa, source, &phaseA);
@@ -10087,24 +10113,22 @@ test "2c-F (doc 17): an observation window disarms a LIVE armed native cycle on 
     // The cycle is live: it was armed and fused …
     try testing.expect(vm.trace.native_loopdone_link_arms > 0);
     try testing.expect(vm.trace.native_loopdone_link_fused > 0);
-    // … and the safe path NEVER disarmed (the negative control — `safe_to_arm` was
-    // true throughout, so `disarmAllLinks` was never reached).
+    // … and nothing disarmed within the epoch (the negative control).
     try testing.expectEqual(@as(u64, 0), vm.trace.native_link_disarms);
 
-    // Phase B — RE-RUN the same proto on the same VM behind a replay-line window.
-    // The traces (and their armed slots) from Phase A persist on `vm.trace`; opening
-    // the window flips `safe_to_arm` to false on the next hot dispatcher entry.
-    vm.source = source;
-    vm.record_safepoint_lines = true;
+    // Phase B — a FRESH top-level run of the same proto on the same VM, with NO
+    // observation window. `beginTopLevelEpoch` must reset the still-armed Phase-A
+    // cycle before any hot entry.
     var phaseB_buf: [64]u8 = undefined;
     var phaseB = io.Writer.fixed(&phaseB_buf);
     vm.out = &phaseB;
     _ = try vm.run(chunk.proto);
 
-    // (1) Correctness under the open window: byte-identical to tier-0.
+    // (1) Correctness across the epoch boundary: byte-identical to tier-0 with no
+    // window in play — the containment is unconditional.
     try testing.expectEqualStrings(tier0.buffered(), phaseB.buffered());
-    // (2) The blackout actually tore down the LIVE cycle armed in Phase A — the
-    // load-bearing signal a byte-identical run alone can't provide.
+    // (2) The fresh-run epoch boundary actually tore down the LIVE cycle armed in
+    // Phase A — the load-bearing signal a byte-identical run alone can't provide.
     try testing.expect(vm.trace.native_link_disarms > 0);
 }
 

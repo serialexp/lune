@@ -941,8 +941,24 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
     // Resolve the secondary-entry stubs' absolute addresses (base + byte offset). Both
     // live in the same mapped `page`, so they are freed with it — no extra owner.
     const base = @intFromPtr(page.code.ptr);
-    const linked_entry: ?usize = if (entry_stubs.linked_entry) |off| base + off else null;
-    const ordinary_entry: ?usize = if (entry_stubs.ordinary_entry) |off| base + off else null;
+    const linked_entry: ?usize = if (entry_stubs.linked_entry) |off| blk: {
+        if (off >= page.code.len) {
+            var invalid_page = page;
+            invalid_page.deinit();
+            if (slots.len > 0) gpa.free(slots);
+            return null;
+        }
+        break :blk base + off;
+    } else null;
+    const ordinary_entry: ?usize = if (entry_stubs.ordinary_entry) |off| blk: {
+        if (off >= page.code.len) {
+            var invalid_page = page;
+            invalid_page.deinit();
+            if (slots.len > 0) gpa.free(slots);
+            return null;
+        }
+        break :blk base + off;
+    } else null;
     // Wiring invariant (2.3b-0/2.3c-0): a frameless production body (arena present ⟺
     // shared_exit set) ALWAYS emits BOTH secondary entries; a self-framed test page
     // never does. Pins that the mechanism produces real secondary entries before an

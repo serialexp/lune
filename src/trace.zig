@@ -1501,12 +1501,8 @@ pub const TraceState = struct {
                     if (safe_to_arm and materialization == .ordinary_header and
                         sct.inputs.len == 0 and self.isSourceBranchGuardExit(failed, exit_instr, proto))
                     {
-                        if (self.nativeFor(sct)) |snat| {
-                            if (snat.ordinary_entry) |oe| {
-                                if (self.armNativeLink(failed, exit_instr, sct, oe, .ordinary_guard) catch false) {
-                                    self.native_source_link_arms +|= 1;
-                                }
-                            }
+                        if (self.armNativeLink(failed, exit_instr, sct, .ordinary_guard) catch false) {
+                            self.native_source_link_arms +|= 1;
                         }
                     }
                     // 2c-E site 2 (deep-span variant): under the loop-done
@@ -1567,12 +1563,8 @@ pub const TraceState = struct {
                 if (tier == .native_only and safe_to_arm and materialization == .ordinary_header and
                     sct.inputs.len == 0 and self.isSourceBranchGuardExit(failed, exit_instr, proto))
                 {
-                    if (self.nativeFor(sct)) |snat| {
-                        if (snat.ordinary_entry) |oe| {
-                            if (self.armNativeLink(failed, exit_instr, sct, oe, .ordinary_guard) catch false) {
-                                self.native_source_link_arms +|= 1;
-                            }
-                        }
+                    if (self.armNativeLink(failed, exit_instr, sct, .ordinary_guard) catch false) {
+                        self.native_source_link_arms +|= 1;
                     }
                 }
                 // 2c-E site 2 (loop-done hop-0): `failed`'s numeric-for loop-done
@@ -2372,13 +2364,9 @@ pub const TraceState = struct {
                 if (tier == .native_only and safe_to_arm and inner.inputs.len == 0 and
                     arm_term.op == .link and @as(u32, @intCast(arm_term.aux)) == inner_pc)
                 {
-                    if (self.nativeFor(inner)) |inat| {
-                        if (inat.linked_entry) |le| {
-                            const slot: u32 = @intCast(current_link.instrs.len - 1);
-                            if (self.armNativeLink(current_link, slot, inner, le, .link_terminal) catch false) {
-                                self.native_link_arms +|= 1;
-                            }
-                        }
+                    const slot: u32 = @intCast(current_link.instrs.len - 1);
+                    if (self.armNativeLink(current_link, slot, inner, .link_terminal) catch false) {
+                        self.native_link_arms +|= 1;
                     }
                 }
                 // 2c-E site 1 (the REVERSE edge): arm `inner`'s loop-done slot →
@@ -2988,24 +2976,28 @@ pub const TraceState = struct {
     /// mid-iteration over the cache through this trace (see the dispatch loop,
     /// which defers eviction until after its same-anchor walk completes).
     /// Arm a native link (P-E, doc 17 Increment 2.3): point `parent`'s frameless exit
-    /// slot at `slot_index` to the absolute `target` (a child body entry), and record
+    /// slot at `slot_index` to the entry selected from `child` by `kind`, and record
     /// the dependency so the link can be reset if either end retires. Re-arming the
-    /// same slot supersedes the prior record. No-op (returns) if `parent` is not a
-    /// compiled frameless trace or the slot index is out of range. The registry append
-    /// happens *before* the slot write so an OOM can never leave an armed-but-untracked
-    /// slot (which would dangle on the child's retire).
+    /// same slot supersedes the prior record. The registry append happens *before*
+    /// the slot write so an OOM can never leave an armed-but-untracked slot (which
+    /// would dangle on the child's retire).
     /// Returns `true` iff the link was actually armed (slot written + record kept).
-    /// Returns `false` for the no-op cases — `parent` is not a compiled frameless
-    /// trace, or `slot_index` is out of range — so the caller (2.3b `driveChain`)
-    /// can keep its accounting identical across modes (P-F): a slot that did not
-    /// arm must leave the dispatcher path unchanged.
+    /// Returns `false` (a clean no-op — no slot write, no record) for EVERY reject
+    /// case, so the caller (2.3b `driveChain`) keeps its accounting identical across
+    /// modes (P-F): `parent` is not a compiled frameless trace; `slot_index` is out
+    /// of range; the arm `kind` does not match the slot's guard shape (loop-done vs.
+    /// non-loop-done, the P-C option-(b) invariant); `child` is not a compiled trace;
+    /// or `child` lacks the entry `kind` selects (`.link_terminal`→`linked_entry`,
+    /// `.ordinary_guard`/`.loop_done_linked`→`ordinary_entry`). Deriving the target
+    /// from `child`+`kind` here (never trusting a caller-supplied address) is what
+    /// makes the S2 provenance argument hold by construction.
     ///
     /// INVARIANT: this is the *only* place `CompiledTrace.slots[i]` is ever written
     /// to a non-`shared_exit` value. The entire P-E lifetime argument (a retiring
     /// child resets every parent slot pointing into it) depends on the registry
     /// seeing every armed slot — a direct `c.slots[i] = target` elsewhere would
     /// strand an untracked slot and reintroduce the S2 use-after-reuse.
-    pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, target: usize, kind: ArmKind) !bool {
+    pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, kind: ArmKind) !bool {
         const c = switch (parent.native) {
             .compiled => |*cc| cc,
             else => return false,
@@ -3029,6 +3021,20 @@ pub const TraceState = struct {
                 if (is_loopdone) return false;
             },
         }
+        // The child/target association is derived here, never trusted from a caller.
+        // A `.link` terminal must enter linked loop-done mode; both ordinary guard
+        // and linked loop-done handoffs must clear that mode at `ordinary_entry`.
+        // These are the only two valid cross-trace entry points. `compileImpl`
+        // release-validates that each stored address lies inside this child's live
+        // mcode page before publishing the CompiledTrace.
+        const child_c = switch (child.native) {
+            .compiled => |*cc| cc,
+            else => return false,
+        };
+        const target = switch (kind) {
+            .link_terminal => child_c.linked_entry orelse return false,
+            .ordinary_guard, .loop_done_linked => child_c.ordinary_entry orelse return false,
+        };
         // A re-arm of this exact slot supersedes any prior child it pointed at.
         // Mutate the existing record IN PLACE (no allocation) — the earlier
         // remove-then-append ordering could OOM after dropping the old record,
@@ -3087,9 +3093,8 @@ pub const TraceState = struct {
         if (!(cont.anchor.proto == inner.anchor.proto and cont.anchor.pc == post_pc)) return;
         // `ordinary_entry` is optional — a missing entry (e.g. a test stub or an
         // unsupported compile) leaves the slot unarmed, never `.?`-traps.
-        const cnat = self.nativeFor(cont) orelse return;
-        const oe = cnat.ordinary_entry orelse return;
-        const armed = self.armNativeLink(inner, guard_idx, cont, oe, .loop_done_linked) catch false;
+        _ = self.nativeFor(cont) orelse return;
+        const armed = self.armNativeLink(inner, guard_idx, cont, .loop_done_linked) catch false;
         if (armed) self.native_loopdone_link_arms +|= 1;
     }
 
@@ -6219,30 +6224,41 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
         .consts = &.{},
         .entry_slots = &.{},
         .entry_guards = &.{},
-        .native = .{ .compiled = .{ .page = undefined, .slots = child_slots, .gpa = gpa } },
+        .native = .{ .compiled = .{ .page = undefined, .slots = child_slots, .gpa = gpa, .linked_entry = 0xDEAD_BEEF } },
+    };
+    const CHILD_BODY: usize = 0xDEAD_BEEF;
+    const CHILD_BODY2: usize = 0xF00D;
+    var child2: Trace = .{
+        .anchor = undefined,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .linked_entry = CHILD_BODY2 } },
     };
 
-    const CHILD_BODY: usize = 0xDEAD_BEEF;
-
     // Arm: slot 1 of parent points at the child body; exactly one record tracked.
-    try testing.expect(try state.armNativeLink(&parent, 1, &child, CHILD_BODY, .link_terminal));
+    try testing.expect(try state.armNativeLink(&parent, 1, &child, .link_terminal));
     try testing.expectEqual(CHILD_BODY, parent_slots[1]);
     try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
 
     // Re-arming the SAME slot supersedes the prior record IN PLACE (no duplicate,
     // no realloc — the record count stays 1 and the new target is written).
-    const CHILD_BODY2: usize = 0xF00D;
-    try testing.expect(try state.armNativeLink(&parent, 1, &child, CHILD_BODY2, .link_terminal));
+    try testing.expect(try state.armNativeLink(&parent, 1, &child2, .link_terminal));
     try testing.expectEqual(CHILD_BODY2, parent_slots[1]);
     try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
 
-    // Child retires (target side): parent's slot resets to shared_exit, record dropped.
+    // Retiring the superseded child does not touch the re-armed slot.
     state.resetLinksTouching(&child);
+    try testing.expectEqual(CHILD_BODY2, parent_slots[1]);
+    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    // Current child retires (target side): parent resets and the record is dropped.
+    state.resetLinksTouching(&child2);
     try testing.expectEqual(SHARED_EXIT, parent_slots[1]);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
 
     // Out-of-range slot index is a no-op → returns false, no OOB write, no record.
-    try testing.expect(!try state.armNativeLink(&parent, 99, &child, CHILD_BODY, .link_terminal));
+    try testing.expect(!try state.armNativeLink(&parent, 99, &child, .link_terminal));
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
 
     // A non-compiled parent is a no-op → returns false.
@@ -6254,13 +6270,13 @@ test "armNativeLink / resetLinksTouching: P-E registry directionality" {
         .entry_guards = &.{},
         .native = .unsupported,
     };
-    try testing.expect(!try state.armNativeLink(&unsup, 0, &child, CHILD_BODY, .link_terminal));
+    try testing.expect(!try state.armNativeLink(&unsup, 0, &child, .link_terminal));
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
 
     // Parent-retire direction: re-arm, then reset touching the PARENT (source).
     // The record is dropped WITHOUT writing through the (about-to-be-freed) slot,
     // and a subsequent child-retire must find no record — no write, no crash.
-    try testing.expect(try state.armNativeLink(&parent, 2, &child, CHILD_BODY, .link_terminal));
+    try testing.expect(try state.armNativeLink(&parent, 2, &child, .link_terminal));
     try testing.expectEqual(CHILD_BODY, parent_slots[2]);
     state.resetLinksTouching(&parent);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
@@ -6297,7 +6313,7 @@ test "disarmAllLinks (2c-E / 2.3c-0e): resets EVERY armed slot on entering the o
         .consts = &.{},
         .entry_slots = &.{},
         .entry_guards = &.{},
-        .native = .{ .compiled = .{ .page = undefined, .slots = inner_slots, .gpa = gpa } },
+        .native = .{ .compiled = .{ .page = undefined, .slots = inner_slots, .gpa = gpa, .linked_entry = 0xBBBB } },
     };
     var cont: Trace = .{
         .anchor = undefined,
@@ -6305,7 +6321,7 @@ test "disarmAllLinks (2c-E / 2.3c-0e): resets EVERY armed slot on entering the o
         .consts = &.{},
         .entry_slots = &.{},
         .entry_guards = &.{},
-        .native = .{ .compiled = .{ .page = undefined, .slots = cont_slots, .gpa = gpa } },
+        .native = .{ .compiled = .{ .page = undefined, .slots = cont_slots, .gpa = gpa, .linked_entry = 0xAAAA } },
     };
 
     const I_TO_C: usize = 0xAAAA;
@@ -6313,8 +6329,8 @@ test "disarmAllLinks (2c-E / 2.3c-0e): resets EVERY armed slot on entering the o
     // Arm both edges of the cycle (kinds are `.link_terminal` here — the guard-shape
     // invariant is exercised elsewhere; these stubs have empty instrs so no slot is
     // a loop-done). inner.slot[0] → C, cont.slot[0] → I.
-    try testing.expect(try state.armNativeLink(&inner, 0, &cont, I_TO_C, .link_terminal));
-    try testing.expect(try state.armNativeLink(&cont, 0, &inner, C_TO_I, .link_terminal));
+    try testing.expect(try state.armNativeLink(&inner, 0, &cont, .link_terminal));
+    try testing.expect(try state.armNativeLink(&cont, 0, &inner, .link_terminal));
     try testing.expectEqual(I_TO_C, inner_slots[0]);
     try testing.expectEqual(C_TO_I, cont_slots[0]);
     try testing.expectEqual(@as(usize, 2), state.armed_links.items.len);
@@ -6372,7 +6388,7 @@ test "armNativeLink: P-C option (b) invariant — arm kind matches slot guard sh
         .consts = &.{},
         .entry_slots = &.{},
         .entry_guards = &.{},
-        .native = .{ .compiled = .{ .page = undefined, .slots = &.{}, .gpa = gpa } },
+        .native = .{ .compiled = .{ .page = undefined, .slots = &.{}, .gpa = gpa, .linked_entry = 0x5678, .ordinary_entry = 0x1234 } },
     };
 
     // Classifier: slot 0 IS a loop-done guard; slot 1 (ordinary guard) is not.
@@ -6380,19 +6396,19 @@ test "armNativeLink: P-C option (b) invariant — arm kind matches slot guard sh
     try testing.expect(!isLoopDoneGuardIndex(&parent, 1));
 
     // The loop-done slot accepts only a `.loop_done_linked` arm.
-    const BODY: usize = 0x1234;
-    try testing.expect(try state.armNativeLink(&parent, 0, &child, BODY, .loop_done_linked));
-    try testing.expectEqual(BODY, parent_slots[0]);
+    const ORDINARY_ENTRY: usize = 0x1234;
+    try testing.expect(try state.armNativeLink(&parent, 0, &child, .loop_done_linked));
+    try testing.expectEqual(ORDINARY_ENTRY, parent_slots[0]);
 
     // The non-loop-done slot accepts an ordinary-guard arm (and never a loop-done one).
-    try testing.expect(try state.armNativeLink(&parent, 1, &child, BODY, .ordinary_guard));
-    try testing.expectEqual(BODY, parent_slots[1]);
+    try testing.expect(try state.armNativeLink(&parent, 1, &child, .ordinary_guard));
+    try testing.expectEqual(ORDINARY_ENTRY, parent_slots[1]);
 
     // An index at/past `slots.len` (== instrs.len) is out of range for EVERY arm kind —
     // there is no reserved off-table cell to accidentally address (blocker-2 fix).
-    try testing.expect(!try state.armNativeLink(&parent, 2, &child, BODY, .ordinary_guard));
-    try testing.expect(!try state.armNativeLink(&parent, 2, &child, BODY, .link_terminal));
-    try testing.expect(!try state.armNativeLink(&parent, 2, &child, BODY, .loop_done_linked));
+    try testing.expect(!try state.armNativeLink(&parent, 2, &child, .ordinary_guard));
+    try testing.expect(!try state.armNativeLink(&parent, 2, &child, .link_terminal));
+    try testing.expect(!try state.armNativeLink(&parent, 2, &child, .loop_done_linked));
 
     // Reset so the leak-checked registry is empty at deinit.
     state.resetLinksTouching(&child);
@@ -6447,12 +6463,13 @@ test "replayLedger M1 sub-case (c): fused [skip.deopt, ramp.prologue_fail] repla
         .consts = &.{},
         .entry_slots = &.{},
         .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xBEEF } },
     };
     try state.cache.append(gpa, &skip);
     try state.cache.append(gpa, &ramp);
 
     // Establish the M1 armed-edge provenance the fused `.deopt` validation demands.
-    try testing.expect(try state.armNativeLink(&skip, 0, &ramp, 0xBEEF, .ordinary_guard));
+    try testing.expect(try state.armNativeLink(&skip, 0, &ramp, .ordinary_guard));
 
     // The fused receipt: skip committed 9 iterations then its armed guard fired
     // (`.deopt`, non-last), the ramp's prologue failed pre-commit (cum unchanged).

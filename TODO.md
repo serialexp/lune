@@ -2,37 +2,49 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
-## RARE, layout-dependent: fused native cycle re-entered COLD from a fresh top-level frame (2c-F, July 2026)
+## RESOLVED (2c-F, July 2026): fused native cycle re-entered COLD from a fresh top-level epoch
 
 Found while writing the 2c-F disarm integration test. Re-running a **completed
 top-level proto** a second time via `vm.run(chunk.proto)` on the **same VM**, when
-that proto's inner `C↔I` native cycle is already fully armed+fused from the first
-run and **no observation window is open**, once produced a spurious `TypeError`
+that proto's inner `C↔I` native cycle was already fully armed+fused from the first
+run and **no observation window was open**, once produced a spurious `TypeError`
 from the fused native→native handoff (the arith `isNumber` guard). It reproduced
 **exactly once in ~25 runs** and vanished when the set of compiled tests changed —
-i.e. it is **address-/mcode-arena-layout dependent** (the classic S2 "fused handoff
-jumps through a slot whose correctness depends on memory layout" signature).
+address-/mcode-arena-layout dependent (the S2 "fused handoff jumps through a slot
+whose correctness depends on memory layout" signature). Could not be reproduced
+again in 1600 in-process reruns nor in codex's 64-layout + forced-retire/reuse
+harness — extremely elusive.
 
-**What is NOT affected (verified deterministic across many ASLR layouts):**
-- The **supported** cold-re-entry shape — a hot armed cycle inside a function called
-  repeatedly (fresh frame each call, slots already live) — is byte-identical to
-  tier-0 every run. Permanent regression guard added:
-  `interp.zig` test *"2c-F … a hot armed cycle inside a repeatedly-called function
-  stays correct on re-entry"*.
-- The **observation-window** path (`suspend_ctl`/`record_safepoint_lines`) disarms
-  the live cycle on the next dispatcher entry *before* any handoff can fire, so it is
-  robust; the 2c-F integration test asserts `native_link_disarms > 0` + byte-identity.
+**Root cause + fix (two codex `gpt-5.6-sol` reviews).** The arc's supported paths
+all reviewed sound; the one blocker was this unconfined rerun failure. Two layers
+landed:
+1. **Hardening (codex, root-cause route):** `armNativeLink` now DERIVES its target
+   from `child`+`kind` (never trusts a caller-supplied address), and `compileImpl`
+   release-validates each secondary-entry offset lies in the child's live mcode page
+   before publishing. Reviewed defensive-only — it proves address *provenance* but
+   not dynamic-entry validity across an epoch.
+2. **Epoch containment (the actual fix):** `Vm.beginTopLevelEpoch` calls
+   `disarmAllLinks()` at every fresh `run`/`start` entry (NOT `exec()` resume — that
+   is the same epoch, governed by the 2.3c-0e dispatcher window-disarm — and NOT
+   nested calls). A stale link can pass both hardening checks (valid in-page address,
+   correct live child) yet still fire into a fresh-epoch frame; the fresh-run disarm
+   restores the dispatcher boundary before any old edge can fire. Links re-arm from
+   observations made during the new run.
 
-**Why deferred, not fixed now:** re-running a *completed top-level chunk* twice on one
-VM is not a shape lune ships (scripts run once; a REPL compiles a fresh proto per
-line; functions are the re-entry mechanism and are clean). So this is a latent
-robustness gap in an unsupported usage, not a live-path bug — but it IS a real
-address-dependent hazard worth a proper root-cause before P-E lifetime work closes
-out. **Flag it explicitly in the codex `gpt-5.6-sol` review** of the 2c arc: the
-question for the reviewer is whether any *supported* path can re-enter a fused cycle
-with stale per-run register/stack state the handoff assumes fresh. Repro recipe:
-add a top-level-rerun test (see git history of this TODO's companion diag) and loop
-`just test` ~30× under ASLR.
+**Tests (all green, both default and `-Djit-debug` builds):**
+- Containment integration test *"a fresh top-level run disarms the prior epoch's LIVE
+  armed cycle"* — Phase A negative control (`native_link_disarms == 0` within one
+  epoch) + Phase B fresh run disarms the live cycle (`> 0`, byte-identical, no window).
+  Proven load-bearing (disabling `beginTopLevelEpoch` fails exactly this test).
+- Supported cold-re-entry guard *"a hot armed cycle inside a repeatedly-called
+  function stays correct on re-entry"* (nested calls, byte-identical across ASLR).
+- `disarmAllLinks` unit test + `native_link_disarms` counter idempotence.
+
+**Follow-up (nice-to-have, not blocking):** a suspend/resume-with-active-window
+integration test for the 2.3c-0e dispatcher window-disarm specifically (currently
+unit-covered by the `disarmAllLinks` test; the containment test exercises the same
+`disarmAllLinks` end-to-end via the epoch boundary). The keyframeser suspend/resume
+harness (keyframeser.zig:2069/2175) is the vehicle if this is ever built out.
 
 ## Hash-field (string-keyed) tracing — H0+H1 LANDED (June 2026, uncommitted, pending approval)
 
