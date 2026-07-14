@@ -1,6 +1,313 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
-## Status 2026-07-14 (latest) — 2.3c-2d COMPLETE (#62): D1 + D2a + D2b-i + D2b-ii all LANDED (green, byte-identical); 2c-E NEXT (arm I→C)
+## Status 2026-07-14 (LATEST) — 2c-E (#63): E1 LANDED (d4d82d9); E2 spec finalized (codex-approved), implementation next
+
+**Where we are.** 2c-E splits into E1/E2/E3 per two codex `gpt-5.6-sol` rulings (thread
+`019f5f48-98ba-73b3-90c8-89ded74aae92`; the rulings are in the session transcript
+`~/.claude/projects/-home-bart-Projects-lune/9a281686-...jsonl` lines 21264 + 21272, already
+fully distilled below — do NOT re-read the transcript).
+
+- **E1 — DONE, commit `d4d82d9`** ("feat(jit): 2c-E1 — model deep fused receipts,
+  prologue-fail grammars, and call-B handover (nothing armed)"). All control-flow wiring for
+  the armed `C↔I` cycle, with NOTHING armed: call-A drain in `driveBurstCore`
+  (`ledger_len>1` → `replayLedger(.inner_call)`), `BurstCursor.start_at_continuation` +
+  `call_a:` labeled block (a `run_continuation` handover enters call B without re-running the
+  inner), `driveSeedLedger` (hop-0 >2-entry drain, private), `driveDispatcherLedger` maps
+  `run_continuation` → cursor, replayLedger M1 sub-case (c) (fused `[skip.deopt,
+  ramp.prologue_fail]`) + terminal-loop-done continuation release-validation, dispatcher gate
+  widened to `if (ran_native and result.ledger_len > 1)` (interp.zig ~2738). Plus 4 blocking
+  unit tests (M1 sub-case c; dispatcher `[I.loop_done_linked, C.prologue_fail]`; deep hop-0
+  seed ledger single-charge; real-native `start_at_continuation` no-double-run).
+- **E2 — NEXT (spec below, codex-approved).** The intentional behavior changes: persistent
+  I→C arming (3 sites), terminal-replay arming convergence, non-last link-follow accounting,
+  native one-trip linked-loop-done correction, + 5 blocking tests.
+- **E3 — after E2:** byte-identity sweep (6 benchmarks × tier-0/tier-1a/native, stdout +
+  keyframe/replay goldens), doc 17 + this file updated, then codex full-diff review.
+
+### E2 implementation progress (2026-07-14, this session)
+
+**Code items 1–6 are ALL IMPLEMENTED and green** (`just test` exit 0, 756 tests; nsieve 9
+byte-identical tier-0 == tier-1a == native with the cycle LIVE). What landed:
+- Counters `native_loopdone_link_arms` / `native_loopdone_link_fused` (trace.zig ~977–988).
+- `armLoopDoneLink` helper right after `armNativeLink` (trace.zig ~2990): all gates as spec'd.
+- `safe_to_arm` threaded into `replayLedger` (last param) + all 4 call sites.
+- Site 1 (scalar call-A, after the `arm_term` block), site 2 (driveChain: both the `>2`
+  driveSeedLedger branch AND the is_link classify branch, gated
+  `materialization == .native_numeric_for_done`), site 3 (replayLedger terminal
+  `.loop_done_linked`, before the hop-budget check).
+- Follow bumps in non-last `.link_terminal` (trace.zig ~1753) + fused counter in non-last
+  `.loop_done_linked` (~1823).
+- One-trip fix in interp.zig: `linked_one_trip` computed after `local_done` (~2713); guard-fail
+  gate `and !linked_one_trip`; productive gate `or linked_one_trip` with
+  `onSideExit(final, if (linked_one_trip) 1 else local_done)`.
+- **E1 test D expectation updated** (was the one red test): the new non-last `.link_terminal`
+  follow bump makes `native_link_follow_count == 2` (fused C→I edge + physical post-C hop),
+  and `native_loopdone_link_fused == 1` (entry 0→1 edge) — both now asserted.
+
+**⚠️ TREE STATE (2026-07-14, second pass): RESTORED — nothing left to restore.**
+1. ~~One-trip fix temporarily disabled~~ — DONE: the `false and` is removed; the
+   fix is LIVE and the full suite is green (`just test`, 759 tests).
+2. ~~Temporary debug scaffolding to DELETE~~ — DONE (2026-07-14): every ad-hoc DBG
+   print was removed and replaced by the permanent **jitdbg facility** (Bart's ask):
+   `src/jitdbg.zig` (new) + `-Djit-debug=true` build option + `--jit-debug` CLI flag
+   + `vm.trace.config.debug_log` runtime gate + `TraceState.dbg()` /
+   `dbgDumpGuardFailures()` / `dbgDumpCache()` + permanent call sites (dispatcher
+   receipt in interp.zig, arm/re-arm in armNativeLink, disarmAllLinks,
+   retire-reset in resetLinksTouching). Compiled out entirely by default; both
+   `just test` and `zig build test -Djit-debug=true` green; smoke run shows
+   receipts + the 2c-E loop-done arm event live. Documented in project CLAUDE.md
+   (Build section). Touches build.zig, src/jitdbg.zig, root.zig, trace.zig,
+   interp.zig, main.zig — NOT yet committed (rides with the E2 commit; interp.zig
+   holds both changes and can't be split, Rule #13).
+3. Everything else in the tree is final E2 code (items 1–6 of the spec, all landed).
+4. Side discovery: `zig build wasm` is broken at HEAD (pre-existing 64-bit
+   assumptions in `hotIndex` + `rowViewParent`, nothing gates it) — TODO.md has
+   the details; my build_options wiring for wasm is fine.
+
+**Test status:**
+- Test (ii) "2c-E (doc 17): loop-done inner→continuation arm fires…" — WRITTEN + GREEN
+  (arms>0 ∧ fused>0 fire on a plain 400×30 nested loop via `runNativeForTrace`).
+- Test (i) "2c-E (doc 17): native one-trip linked loop-done…" — **GREEN + PROVEN
+  LOAD-BEARING (2026-07-14, second pass)**, with a MAJOR upgrade to what it proves:
+  after setting `native_vm.trace.config.min_trip_entry = 0;` before
+  `runNativeForTrace` (the reachability fix — default 24 + EXACT `forRemainingTrips`
+  makes one-trip dispatcher receipts unreachable otherwise), disabling the fix
+  (`false and`) makes the test fail on **BYTE-IDENTITY, not the guard-count
+  assertion**: native prints 2253 vs tier-0's 2252. So the scalar zero path on a
+  one-trip linked receipt is an actual **MISRESUME / correctness bug** — the linked
+  snapshot already committed the final iteration into regs, and the zero path
+  re-runs it (double-commit, +1). `linked_one_trip` is a *correctness* fix, not
+  just accounting; at default config only the `min_trip_entry` heuristic keeps the
+  broken path unreachable. Test comment updated to say exactly this. The `%`-in-
+  outer-body trick works as designed (continuation records `.link`, inputs=0, but
+  nativegen-bails → armLoopDoneLink fails closed → slot unarmed → receipts stay
+  scalar). Secondary assertion: every guard_failures value < 4.
+- Tests (iii)/(iv)/(v) — **ALL WRITTEN + GREEN (2026-07-14)**. Key realization that
+  made them cheap: they DON'T need real nativegen compilation. `replayLedger` only
+  READS trace shape and accounts/arms — it never executes native code — so:
+  - **(iii) convergence arm** "replayLedger convergence (2c-E site 3): a TERMINAL
+    loop_done_linked arms the I→C slot" (trace.zig, before "driveChain
+    ordinary_header"). Calls `replayLedger` DIRECTLY (isolates the arm from the
+    risky native execution tail of driveDispatcherLedger). Uses hand-built
+    `.compiled` stubs (`page = undefined`, heap `slots`, cont's `ordinary_entry` =
+    sentinel `0xC0FFEE_1234`) — same trick as the P-E registry test — so NO
+    x86_64 gate. Ledger `[I.done(fused), C.link, I.done(terminal)]`, safe_to_arm=
+    true → asserts `native_loopdone_link_arms == 1`, `inner_slots[0] ==
+    ordinary_entry sentinel`, the armed_links record {parent=inner, slot=0,
+    child=cont}, `native_loopdone_link_fused == 1` (the interior k=0 fused),
+    directive == `.run_continuation(cont)`. Frees slots manually + clears cache/
+    armed_links before deinit (undefined page must never be destroyed).
+  - **(iv) forced yield at LEDGER_CAP** "replayLedger forced yield (2c-B/2c-E): a
+    CAP-length ledger ending .yielded replays cleanly" (trace.zig, before (iii)).
+    Plain non-compiled traces (terminal is a `.link`, never arms → no compile
+    needed). Runtime-filled 32-entry alternating `[I.loop_done_linked, C.link]`
+    ledger, last `.link` stamped `.yielded`. Asserts replayLedger ACCEPTS it (no
+    panic on the last-of-full guard), `linked_completed == 16`, directive
+    `.run_inner_from(cont)`, `resume_pc == 5`, `native_link_exits == 16`.
+  - **(v) disarm-on-unsafe** "disarmAllLinks (2c-E / 2.3c-0e): resets EVERY armed
+    slot on entering the observation blackout" (trace.zig, before the P-C-invariant
+    test). Hand-built compiled stubs, arm a full C↔I cycle (2 links via
+    armNativeLink), one `disarmAllLinks` → BOTH slots back to shared_exit(0) +
+    registry empty; asserts idempotence (second call no-op).
+- **Pre-existing bug found (recorded in TODO.md, NOT mine — reproduced at HEAD
+  d4d82d9):** `--trace` (tier-1a) panics "invalid enum value" in regwindow.get via
+  `driveChain .ir` entering the `%`-continuation on the probe program (see TODO.md
+  for repro). tier-0 + native fine.
+
+**After tests: E3** — byte-identity sweep (nsieve DONE this session: 3 modes
+byte-identical, md5 0c22770a…336; still owed: nsieve-bit/fannkuch/mandelbrot/nbody/
+spectral-norm + keyframe/replay goldens), `just bench --filter nsieve`, doc 17
+Done/Outstanding update, commit E2 (conventional, co-author trailer, bundle
+src/trace.zig + src/interp.zig + doc 17 + CURRENT_TASK.md + TODO.md; do NOT stage
+CURRENT_TASK_E3.md / bench/results/*.tsv), then codex gpt-5.6-sol diff review
+(thread 019f5f48-98ba-73b3-89ded74aae92 — NB correct id is
+019f5f48-98ba-73b3-90c8-89ded74aae92).
+
+**Discoveries needed for writing the remaining tests:**
+- `hasNativeLoopDoneLink` (trace.zig:2597) = "a zero-input `.link` continuation EXISTS at
+  some loop-done exit PC of this trace" — NOT "slot armed". So linked-mode dispatcher entry
+  happens pre-arm whenever the continuation trace exists.
+- **One-trip reachability (test i) — CORRECTED (the first version of this bullet was
+  wrong):** a 1-iteration inner NEVER enters via the dispatcher (entry is on back-edges; a
+  1-trip loop takes none). A **2-trip inner** enters at the first back-edge (j=2) and hits
+  loop-done LINKED with `local_completed == 0` (final linked snapshot commits WITHOUT the
+  back-edge rbx increment, nativegen:4567) — **BUT only if `min_trip_entry` allows it**:
+  the default (24) makes the dispatcher decline any numeric-for entry with < 24 exact
+  remaining trips (interp.zig:2455–2461 + forRemainingTrips:3661), so the scalar one-trip
+  path is unreachable at default config and the test must set
+  `vm.trace.config.min_trip_entry = 0` before the harness call. Program shape: warm with a
+  wide inner (`m=30`), flip to `m=2`, keep `s = s % 100000007` in the outer body so the
+  continuation is nativegen-unsupported (→ slot never arms → receipts stay scalar).
+- **Penalty nuance:** productivity 1 still bumps `penalty` (`onSideExit` clears only at
+  `completed >= min_useful=8`) — the one-trip fix does NOT change penalty accumulation
+  (replayLedger's `max(local,1)` has the same property; E1 tests pin penalty==1 per
+  one-trip). Load-bearing observables for the fix are instead: countGuardFailure SKIPPED,
+  the `.native_numeric_for_done` driveChain FIRING (→ `native_link_exits`), and resume
+  steering. Verify a test is load-bearing by temporarily reverting the fix and watching it
+  fail.
+- Counter-asserting end-to-end pattern: see interp.zig ~9860–10021 (`runNativeForTrace`
+  harness at 10103 with lowered hotloop=4; the doc-16 nsieve test at 9931 uses the inline
+  default-threshold harness instead — copy THAT for chain-shape-sensitive programs).
+
+### E2 spec (recovered + codex-ruled; implement exactly this)
+
+1. **Two new `TraceState` counters** next to `native_source_link_fused` (trace.zig ~976):
+   `native_loopdone_link_arms: u64 = 0` (bumped by the helper on a successful arm) and
+   `native_loopdone_link_fused: u64 = 0` (bumped in replayLedger's NON-last
+   `.loop_done_linked` branch — proves the armed edge actually fired).
+2. **Shared fail-closed helper** `armLoopDoneLink(self, inner: *Trace, guard_idx: u32,
+   cont: *Trace, safe_to_arm: bool) void`. Gates, each `return` (never panic — arming is
+   opportunistic): `safe_to_arm`; `guard_idx != maxInt(u32)` + `< inner.instrs.len`;
+   `isLoopDoneGuardIndex(inner, guard_idx)` (explicit — armNativeLink's kind/shape invariant
+   is a *debug* assert + release fail-close, don't rely on it); `post_pc =
+   guardExitPc(inner.instrs[guard_idx]) orelse return`; `cont.inputs.len == 0`; cont ends
+   `.link`; `cont.anchor.proto == inner.anchor.proto and cont.anchor.pc == post_pc`; then
+   `nativeFor(cont)` → `.ordinary_entry` **optional, never `.?`** (missing entry leaves slot
+   unarmed) → `armNativeLink(inner, guard_idx, cont, oe, .loop_done_linked) catch false` →
+   on true bump `native_loopdone_link_arms`. armNativeLink already fail-closes on
+   non-compiled `inner` / OOB slot, supersedes same-slot in place, and appends to the P-E
+   registry BEFORE the slot write.
+3. **Thread `safe_to_arm: bool` into `replayLedger`** (new param). Call sites to update (all
+   already have `safe_to_arm` in scope): call-A drain in driveBurstCore, call-B loop in
+   driveBurstCore, `driveDispatcherLedger`, `driveSeedLedger`.
+4. **Arm at 3 sites** (target = `ordinary_entry` NOT `linked_entry`: the continuation is a
+   `.link` trace with no numeric-for loop-done of its own; nativegen.zig:4675 —
+   `ordinary_entry` clears inherited linked mode):
+   - **Site 1, scalar call-A loop-done** (driveBurstCore): right after the existing 2.3b-1
+     `C.link→I.linked_entry` arm block (`arm_term`), post driver-swap + roll-up:
+     `armLoopDoneLink(inner, iresult.exit_instr, current_link, safe_to_arm)` gated
+     `tier == .native_only` (`current_link` is post-swap = the continuation at the inner's
+     exit PC; `iresult.exit_instr` already validated loop-done by the scalar classify).
+   - **Site 2, driveChain hop-0** under `materialization == .native_numeric_for_done`
+     (inner=`failed`, guard=`exit_instr`, cont=`sct`): mirror the M1
+     `native_source_link_arms` arm placement — BOTH the is_link classify branch AND the
+     `ledger_len > 2` branch (arm before routing to driveSeedLedger). In
+     `.native_numeric_for_done`, `failed` = the inner I, `walk_pc` = post-loop pc from
+     guardExitPc, `sct` = continuation C.
+   - **Site 3, replayLedger terminal `.loop_done_linked` is_last branch** (inner=owner,
+     guard=`e.exit`, cont=`cont`): this is the *convergence* arm — a terminal unarmed
+     `I.loop_done_linked` arms the edge for its next occurrence. Decision made: is_last
+     branch only (non-last means the edge already fused → already armed). Arming on a
+     forced-yield terminal is harmless (in-place supersede). Place it so it runs even when
+     the hop budget then breaks the burst (scalar parity: scalar site arms on the last hop
+     too).
+5. **Follow-count bumps** in replayLedger's NON-last `.link_terminal` branch (after
+   validation, next to `cont = owner`): `native_link_follow_count +|= 1` AND
+   `link_follow_count +|= 1` — mirrors the physical call-A top so the
+   `start_at_continuation` skip is accounting-exact. And `native_loopdone_link_fused +|= 1`
+   in the NON-last `.loop_done_linked` branch.
+6. **Native one-trip linked-loop-done fix (interp.zig, native-only).** A linked-mode native
+   receipt commits its final linked snapshot (nativegen.zig:4567) even at
+   `local_completed == 0` (a one-iteration inner: loop-done fires before any back-edge rbx
+   increment) — regs ARE coherent at the post-loop pc, but the scalar dispatcher takes the
+   `local_done == 0` path (countGuardFailure + `onSideExit(final, 0)` zero path) while
+   replayLedger uses `max(local,1)`. Fix: compute
+   `linked_one_trip = ran_native and ran_native_link_mode and result.exit_reason == .normal
+   and exit_instr-in-bounds and trace.isLoopDoneGuardIndex(final, result.exit_instr) and
+   local_done == 0` (bounds check BEFORE isLoopDoneGuardIndex; exit==maxInt excluded by it);
+   then (a) skip the guard-failure counting block (`if (local_done == 0 and
+   !linked_one_trip)`), (b) enter the productive block (`if (local_done > 0 or
+   linked_one_trip)`) with `onSideExit(final, if (linked_one_trip) 1 else local_done)`,
+   (c) pass the ORIGINAL `result` to driveChain (real exit identity, no fabricated count).
+   `maybeArmContinuation`/`countProductiveBranchExit` stay — inert (former sees the cached
+   continuation, latter rejects loop-done guards). **Tier-1a unchanged** (it hasn't committed
+   the final iteration; assigning count 1 there would be wrong — would need
+   flushNumericForLoopDone).
+7. **Five E2-blocking tests:** (i) native one-trip linked loop-done (local_completed==0 →
+   productivity 1, no guard-failure count); (ii) actual I→C arm + `native_loopdone_link_fused`
+   assertion (armed edge fires); (iii) replay-terminal arming convergence (terminal unarmed
+   sibling I becomes armed for its next occurrence); (iv) forced yield at LEDGER_CAP via a
+   CONSTRUCTED native cycle — non-deferrable, it's the only bound on the newly-live cycle;
+   don't rely on nsieve; (v) minimal deterministic disarm-on-unsafe proving BOTH halves of an
+   armed C↔I cycle reset (`resetLinksTouching` covers both directions).
+
+Then: `just test` green + nsieve byte-identity across the 3 modes → commit E2 → E3.
+
+### Verified code map (line numbers as of d4d82d9 — saves re-reading trace.zig)
+
+- **`LedgerEntry`** (irinterp.zig:200): `{cum: usize, id: u32, exit: u32 (maxInt =
+  prologue-fail), reason: ExitReason (.normal/.prologue_fail), kind: LedgerKind = .deopt,
+  outcome: LedgerOutcome = .normal}`; `LedgerKind = {link_terminal=0, loop_done_linked=1,
+  deopt=2, prologue_fail=3}`; `LEDGER_CAP=32`; forced yield (`.yielded`) only as LAST entry
+  of a FULL (==CAP) ledger; per-segment local = `cum[i]−cum[i-1]`, `cum[-1]==0`.
+  `ExecResult.exit_reason: ExitReason = .normal` (irinterp.zig:133).
+- **`replayLedger`** (trace.zig:1626, signature at 1626–1637): the single authoritative
+  graph-walk drain. Branch geography: `.link_terminal` non-last validation+`cont=owner` at
+  1710–1722 (**follow-bump goes here**), is_last `run_inner_from` 1700–1708;
+  `.loop_done_linked` 1724–1777 — `onSideExit(owner, max(local,1))` 1741, `first_inner`
+  no-hop rule 1749, is_last budget check 1755 + terminal cont release-validation 1761 +
+  `run_continuation` 1765 (**site-3 arm + fused-counter go around here**), non-last succ
+  validation 1770–1776; `.deopt` M1 non-last 1795–1884 (sub-case b 1835, c 1856, a
+  fall-through 1880–1884), terminal (a)/(b) 1900–1926; `.prologue_fail` 1928–1956.
+- **`driveChain`** (trace.zig:1314): native path sets `flushed_resume_pc = walk_pc` before
+  every candidate (~1407) → a prologue-fail short-circuits at the "Not a completed link run"
+  tail with `onSideExit(sct,0)`, never retries (retry tail is tier-1a-only). Hop-0 capture
+  ~1412; `ledger_len > 2` branch ~1423 arms M1 then routes to `driveSeedLedger`; `==2` stays
+  on the scalar `fused_inner` seam. **M1 arm pattern to mirror for site 2** (~1424–1434 and
+  ~1483–1493): gates safe_to_arm + `.ordinary_header` + inputs empty +
+  isSourceBranchGuardExit, `nativeFor(sct).ordinary_entry` optional,
+  `armNativeLink(failed, exit_instr, sct, oe, .ordinary_guard)`,
+  `native_source_link_arms+1`.
+- **`driveBurstCore`**: hop loop `hop: while (hops < max_hops=8)`; `call_a: {}` labeled block
+  consumes `start_at_continuation` once via `break :call_a`; scalar call-A loop-done
+  classify → tier-1a flush → driver swap via findLinkTrace → roll-up
+  `onSideExit(inner, max(local,1))` + `linked_completed++` → **2.3b-1 arm block
+  (`arm_term`) — site 1 goes right after it**. Call B: `snt.runCapturingLedger` + while-loop
+  over `replayLedger(.continuation_call)` directives. Tail: `linked_completed>0`
+  penalty-neutral, else `onSideExit(seed,0)`.
+- **`driveSeedLedger`** (trace.zig:~2464, private): hop-0 >2 drain; release checks (len≥3,
+  seed ends `.link`, e0=={seed.id,.link_terminal,exit==len-1}); NO wrapper
+  `native_link_exits` precharge; origin `.continuation_call`.
+- **`driveDispatcherLedger`** (trace.zig:~2380, pub): origin `.dispatcher_root`; `inner_pc =
+  seed.anchor.pc` placeholder; `run_continuation` → cursor `start_at_continuation=true`.
+- **`armNativeLink(parent, slot_index, child, target, kind) !bool`** (trace.zig:~2882):
+  fail-closed non-compiled parent/OOB slot; kind-vs-slot-shape invariant (loop-done slots
+  exclusively `.loop_done_linked`) is debug assert + release fail-close; in-place same-slot
+  supersede; registry-append-before-slot-write. `resetLinksTouching` (~2937) both directions.
+- **Helpers:** `guardExitPc` (450 — only guard_int/float/number/true/false/int_of_float
+  carry a PC in aux); `isLoopDoneGuardIndex` (463 — guard_true + `code[exit_pc-1]==.for_loop`,
+  safe on OOB idx); `isInnerLoopRoot` (1151 — anchor match + inputs empty + ends `.loop`);
+  `isSourceBranchGuardExit` (2714); `fusedSourceBranchLinkSlot` (2750); `traceById` (1234);
+  `nativeFor` (3032 — lazy compileInto, memoizes `.compiled`/`.unsupported`);
+  `onSideExit` (1256 — completed ≥ min_useful(8) → hit; else penalty++ → gate at 8).
+  `ArmKind` (478) = {link_terminal, ordinary_guard, loop_done_linked}.
+- **interp.zig dispatcher exit consumer (E2-6 target), ~2692–3001:** `local_done = if
+  (ran_native) result.local_completed else result.completed` (2692); ledger-drain gate
+  2738–2743; guard-failure block `if (local_done == 0)` 2752–2760 (**skip when
+  linked_one_trip**); productive block `if (local_done > 0)` 2762 with
+  `onSideExit(final, local_done)`, maybeArmContinuation 2773, countProductiveBranchExit
+  2783, `.native_numeric_for_done` driveChain call 2843–2848 (gated `ran_native and
+  ran_native_link_mode`); zero path `onSideExit(final, 0)` 2922. `ran_native_link_mode` set
+  from hasNativeLoopDoneLink at entry (~2593).
+- **nativegen facts:** compile bails (returns null) for terminal not `.loop`/`.link` (879);
+  slot_load without covering guard_int bails; add on unproven operands bails (→ easy way to
+  make a trace deliberately uncompilable in tests); `ordinary_entry` clears inherited linked
+  mode (4675); linked snapshot commits at 4567 even at local_completed==0; forced yield
+  validated at 3331; `CompiledTrace.runCapturingLedger` (719) /
+  `runLinkedLoopDoneCapturing` (732); `NativeState.deinit()` frees page/slots.
+- **Test patterns that work** (see the four E1 tests, inserted after "armNativeLink: P-C
+  option (b) invariant"): stack `var t: Trace` + `state.cache.append(gpa, &t)` + `defer
+  state.cache.clearRetainingCapacity()` registered AFTER `defer state.deinit()` (LIFO →
+  clear first); compiled stubs `.native = .{ .compiled = .{ .page = undefined, .slots =
+  heap_slots, .gpa = gpa } }` with defer-freed slots; real native compile via
+  `nativeFor` + `defer t.native.deinit()`, gate on x86_64-linux via local `const builtin =
+  @import("builtin");` + `error.SkipZigTest`; protos via `Proto{ .code = &.{
+  Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = N }`;
+  `TestRegs{.regs = &regs}` + `.view()` + `.commit()`. Reference trace.zig NOT as
+  `NativeState.x` — use `t.native == .unsupported` style tag checks.
+- **Codex lifecycle confirmations (no work needed):** capture→replay has no intervening
+  mutation (single-threaded); same-slot rearm supersedes in place; removeTrace resets links
+  before mcode reuse; widen-eviction retires a fused child at its own anchor.
+
+### Deferred to 2c-F (#65)
+Full sibling cross-link topology; full two-phase same-VM disarm negative control;
+widen-eviction integration both directions; broader prologue-fail coverage; extra
+forced-yield stress; full codex diff review of the 2.3c-2 arc; flag the 2-valued
+LedgerOutcome deviation and the terminal-continuation @panic-vs-swap choice.
+
+---
+
+## Status 2026-07-14 (prev) — 2.3c-2d COMPLETE (#62): D1 + D2a + D2b-i + D2b-ii all LANDED (green, byte-identical); 2c-E NEXT (arm I→C)
 
 Task #62 (2c-D, "capture everywhere") is DONE. All four native-entry sites now capture the
 per-transition ledger and drain it through the single authoritative `replayLedger`; the bespoke

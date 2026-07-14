@@ -961,3 +961,46 @@ trace number, per-trace details, frame walking) so external profilers don't
 disassemble the VM. That's the introspection surface our trace visualiser /
 time-travel replay already owns natively. Worth lurking as a gap-check on what a
 tracing JIT "should" expose.
+
+## Pre-existing tier-1a crash: driveChain .ir on a `%`-in-outer-body nested loop (found 2026-07-14 during 2c-E)
+
+Repro (crashes at HEAD d4d82d9 too — NOT introduced by 2c-E; tier-0 and
+`--jit-native` both print 2552):
+
+```lua
+-- /tmp/probe1.lua ; ./zig-out/bin/lune --trace /tmp/probe1.lua
+local s = 0
+local m = 30
+for i = 1, 300 do
+  if i == 60 then m = 2 end
+  for j = 1, m do s = s + 1 end
+  s = s % 100000007 + 1
+end
+print(s)
+```
+
+Panic: `invalid enum value` in `regwindow.get` (reading a register tag), from
+`irinterp.execute(sct, …)` called by `driveChain` tier `.ir` at trace.zig:1469
+(the `.ir_numeric_for_done` dispatcher chain, interp.zig:2878). The sct being
+entered is presumably the `%`-containing continuation (it also nativegen-bails:
+`--dump-native` says "trace #1: unsupported"). Looks like the tier-1a chain
+enters a continuation whose trace reads a register slot the window never wrote
+(uninitialized tag). Reduce + fix separately.
+
+## Pre-existing: `zig build wasm` is broken (64-bit assumptions on wasm32; found 2026-07-14)
+
+Discovered while wiring the `build_options` module into the wasm module tree for
+jitdbg (which itself compiles fine there). Three errors, all at HEAD before that
+change too:
+
+- `src/trace.zig:859` (`hotIndex`): `@as(usize, pc) *% 0x9E3779B97F4A7C15` — the
+  64-bit golden-ratio constant can't fit `usize` on wasm32. Needs `u64` math (or
+  a 32-bit mixer) with a truncate to index width. From the direct-mapped
+  hotcount arc.
+- `src/value.zig:132` (`rowViewParent`): `payload.bits & row_view_ptr_mask` is
+  `u64`, `@ptrFromInt` wants `usize` — needs `@intCast`/`@truncate` on 32-bit
+  targets. From the RowView arc.
+- (third error is a duplicate of the hotIndex one via a second reference path)
+
+Nothing gates `zig build wasm` in `just test`, so it rotted silently. Fix +
+consider adding the wasm build to CI/justfile as a compile-only gate.

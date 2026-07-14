@@ -60,6 +60,10 @@ const usage =
     \\                       print an aggregated table (anchor, reason, opcode, how
     \\                       far it got, recurrence count) to stderr after the run —
     \\                       diagnoses why a hot loop never tiers up.
+    \\  --jit-debug          stream live JIT telemetry (dispatcher receipts, link
+    \\                       arm/disarm events) to stderr as the program runs. Only
+    \\                       compiled in with `zig build -Djit-debug=true`; a plain
+    \\                       binary warns and ignores the flag.
     \\  --trace-hotguard <N>  imply --trace and override the guard-failure threshold
     \\                       for side-trace recording (default 50).  When a specific
     \\                       guard fails this many times, the next back-edge records
@@ -117,6 +121,10 @@ const TraceOpts = struct {
     /// abort log (`config.record_aborts`), and print the aggregated table to stderr
     /// after the run — which loop dies on which opcode/reason, and how far it got.
     dump_aborts: bool = false,
+    /// `--jit-debug`: enable the live JIT debug log (`config.debug_log`). Only
+    /// prints anything in a `-Djit-debug=true` build (the call sites are compiled
+    /// out otherwise); a plain build warns to stderr and continues.
+    jit_debug: bool = false,
 };
 
 pub fn main(init: std.process.Init) u8 {
@@ -159,6 +167,11 @@ pub fn main(init: std.process.Init) u8 {
         } else if (std.mem.eql(u8, arg, "--dump-aborts")) {
             topts.enabled = true;
             topts.dump_aborts = true;
+        } else if (std.mem.eql(u8, arg, "--jit-debug")) {
+            topts.jit_debug = true;
+            if (!lune.jitdbg.enabled) {
+                lune.io.eprint("lune: warning: --jit-debug has no effect in this binary; rebuild with `zig build -Djit-debug=true`\n", .{});
+            }
         } else if (std.mem.eql(u8, arg, "--trace-hotguard")) {
             topts.enabled = true;
             const val = it.next() orelse {
@@ -255,6 +268,7 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     vm.trace.config.optimize = topts.optimize;
     vm.trace.config.native_codegen = topts.native_codegen;
     vm.trace.config.record_aborts = topts.dump_aborts;
+    vm.trace.config.debug_log = topts.jit_debug;
     if (topts.hotguard) |v| vm.trace.config.hotguard = v;
     // The source backs located error messages: `error(msg, level)` prefixes
     // `chunk:line:` and `synthErrorValue`/`describeFault` read spans against it.

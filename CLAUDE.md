@@ -91,6 +91,17 @@ the `zig build` invocations and, for benchmarks, guarantee the right binary.
   timing anything afterward (a plain `zig build`, `zig build test`, or this
   recipe leaves a Debug binary that benchmarks ~20× slow).
 
+**Live JIT debugging — never hand-add `std.debug.print` scaffolding.** The
+permanent facility is `src/jitdbg.zig`: build with `zig build -Djit-debug=true`
+(tests: `zig build test -Djit-debug=true`), then enable at runtime with the CLI
+`--jit-debug` flag or `vm.trace.config.debug_log = true` in a test (per-VM, so
+parallel VMs stay quiet). You get dispatcher receipts and link arm/disarm/
+retire events on stderr, plus on-demand `trace.dbgDumpGuardFailures()` /
+`trace.dbgDumpCache()`. In a normal build every call site is comptime-false and
+compiles to nothing, so `self.trace.dbg(...)` call sites are free to leave in
+permanently — when you need a new probe, add it as one of those, not as
+throwaway scaffolding.
+
 ## LuaJIT is dedication, not magic — and not a talent ceiling
 
 When lune is N× slower than LuaJIT, that gap is **not** innate genius and it is

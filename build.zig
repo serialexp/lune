@@ -20,6 +20,21 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
     checkZigVersion(enforce_zig_version);
 
+    // Live JIT debug logging (src/jitdbg.zig). Default off: every jitdbg call
+    // site is comptime-gated on this option and compiles to nothing — zero
+    // branches, zero format strings in the binary. Build with
+    // `-Djit-debug=true` to compile the telemetry in, then enable it at run
+    // time with the CLI `--jit-debug` flag (or `vm.trace.config.debug_log` in
+    // a test) — both gates must be open before anything prints.
+    const jit_debug = b.option(
+        bool,
+        "jit-debug",
+        "Compile in live JIT debug logging (src/jitdbg.zig); enable at runtime with --jit-debug.",
+    ) orelse false;
+    const build_opts = b.addOptions();
+    build_opts.addOption(bool, "jit_debug", jit_debug);
+    const build_opts_mod = build_opts.createModule();
+
     // The vendored binschema runtime (src/gen/binschema/). The generated trace
     // serializer (src/gen/trace_schema.zig) imports this as the "binschema"
     // module; the lune module re-exports the import so any src/ file can reach
@@ -35,6 +50,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .imports = &.{
             .{ .name = "binschema", .module = binschema_mod },
+            .{ .name = "build_options", .module = build_opts_mod },
         },
     });
 
@@ -127,6 +143,7 @@ pub fn build(b: *std.Build) void {
         .target = wasm_target,
         .imports = &.{
             .{ .name = "binschema", .module = wasm_binschema_mod },
+            .{ .name = "build_options", .module = build_opts_mod },
         },
     });
     const wasm_exe = b.addExecutable(.{

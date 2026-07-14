@@ -57,6 +57,9 @@ pub const stdlib_pattern = @import("stdlib/pattern.zig");
 /// Phase 5 — hot-path detection + trace recorder (records IR; tier-0 executes).
 pub const trace = @import("trace.zig");
 
+/// Compile-gated live JIT debug logging (`-Djit-debug` + `--jit-debug`).
+pub const jitdbg = @import("jitdbg.zig");
+
 /// Phase 6 — tier-1a trace IR-interpreter (executes recorded traces; deopts to
 /// tier-0 on a guard failure).
 pub const irinterp = @import("irinterp.zig");
@@ -127,6 +130,7 @@ test {
     _ = compiler;
     _ = interp;
     _ = trace;
+    _ = jitdbg;
     _ = irinterp;
     _ = x64;
     _ = nativegen;

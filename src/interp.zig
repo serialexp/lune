@@ -2691,6 +2691,33 @@ pub const Vm = struct {
                                 // resume accounting (inside `driveChain`) uses `completed`.
                                 const local_done: usize = if (ran_native) result.local_completed else result.completed;
 
+                                // 2c-E: native ONE-TRIP linked loop-done. A linked-mode
+                                // native entry commits its final-iteration snapshot at
+                                // the loop-done exit even when `local_completed == 0`
+                                // (a one-iteration inner: the loop-done guard fires
+                                // before any back-edge `rbx` increment) — regs ARE
+                                // coherent at the post-loop PC and one enclosing
+                                // iteration completed, exactly the event `replayLedger`
+                                // accounts as `onSideExit(I, max(local, 1))`. The scalar
+                                // zero path below would misread it as a failed entry
+                                // (guard-failure count + penalty + no chain). Recognize
+                                // it and route it through the PRODUCTIVE path with an
+                                // effective productivity of 1, passing the ORIGINAL
+                                // `result` to `driveChain` (real exit identity — the
+                                // chain classifies the loop-done itself; no fabricated
+                                // count). Native-only: tier-1a has NOT committed the
+                                // final iteration at this point (it still owes
+                                // `flushNumericForLoopDone`), so counting 1 there would
+                                // charge phantom progress. Bounds-check `exit_instr`
+                                // BEFORE the guard-shape probe (maxInt = prologue-fail).
+                                if (ran_native) self.trace.dbg("receipt: pc={d} link_mode={} local={d} exit={d} ledger_len={d} completed={d}", .{ ct.anchor.pc, ran_native_link_mode, local_done, result.exit_instr, result.ledger_len, result.completed });
+                                const linked_one_trip = ran_native and ran_native_link_mode and
+                                    local_done == 0 and
+                                    result.exit_reason == .normal and
+                                    result.exit_instr != std.math.maxInt(u32) and
+                                    result.exit_instr < final.instrs.len and
+                                    trace.isLoopDoneGuardIndex(final, result.exit_instr);
+
                                 // 2.3c-1 (M1 half-fusion, doc 17): fused top-level
                                 // `.link` consumer. When `driveChain` armed `ct`'s
                                 // source-branch guard slot → a prime-side ramp's
@@ -2749,7 +2776,7 @@ pub const Vm = struct {
                                 // Resolve the PC through `guardExitPc`: array guards
                                 // store a lane ordinal in `aux`, not a PC, and must
                                 // not be counted as guard-PC failures.
-                                if (local_done == 0) {
+                                if (local_done == 0 and !linked_one_trip) {
                                     if (result.exit_instr != std.math.maxInt(u32)) {
                                         if (trace.guardExitPc(final.instrs[result.exit_instr])) |exit_pc| {
                                             if (exit_pc > 0) {
@@ -2759,9 +2786,11 @@ pub const Vm = struct {
                                     }
                                 }
 
-                                if (local_done > 0) {
+                                if (local_done > 0 or linked_one_trip) {
                                     // This trace did useful work — keep its result.
-                                    self.trace.onSideExit(final, local_done);
+                                    // (`linked_one_trip`: the committed loop-done IS one
+                                    // enclosing iteration, replayLedger's `max(local, 1)`.)
+                                    self.trace.onSideExit(final, if (linked_one_trip) 1 else local_done);
                                     // Nested-loop linking (Phase 1): if this is an
                                     // inner numeric-`for` running to completion (its
                                     // terminal loop guard failed) and the exit lands
@@ -9898,6 +9927,120 @@ test "nested-loop: native linked array stores commit exactly once (Phase 4)" {
     try testing.expectEqualStrings(tier0.buffered(), native.buffered());
     try testing.expect(native_vm.trace.native_link_exits > 0);
     try testing.expect(native_vm.trace.native_link_follow_count > 0);
+}
+
+test "2c-E (doc 17): loop-done inner→continuation arm fires and closes the native cycle" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // A plain hot nested loop: the doc-15 chain (continuation ⇄ inner) runs every
+    // outer iteration. 2c-E arms the inner's loop-done slot → the continuation's
+    // `ordinary_entry` on the first accounted loop-done hop; every later native
+    // loop-done then fuses `I→C` in ONE trampoline entry and the multi-entry
+    // ledger drains through `replayLedger`.
+    const source =
+        \\local s = 0
+        \\for i = 1, 400 do
+        \\  for j = 1, 30 do
+        \\    s = s + i
+        \\  end
+        \\  s = s + 1
+        \\end
+        \\print(s)
+    ;
+
+    var tier0_buf: [64]u8 = undefined;
+    var tier0 = io.Writer.fixed(&tier0_buf);
+    try runCaptured(testing.allocator, source, &tier0, false, .off);
+
+    const gpa = testing.allocator;
+    var native_vm = try Vm.init(gpa);
+    defer native_vm.deinit();
+    var native_buf: [64]u8 = undefined;
+    var native = io.Writer.fixed(&native_buf);
+    var native_chunk = try runNativeForTrace(&native_vm, gpa, source, &native);
+    defer native_chunk.deinit();
+
+    // Primary gate: byte-identical output with the cycle live.
+    try testing.expectEqualStrings(tier0.buffered(), native.buffered());
+    // The `I.loopdone → C.ordinary_entry` slot was actually armed (any of the
+    // three arm sites) …
+    try testing.expect(native_vm.trace.native_loopdone_link_arms > 0);
+    // … and a subsequent native run actually FUSED through it — the consumer-side
+    // proof (`replayLedger`'s non-last `.loop_done_linked` arm). Output equality
+    // alone cannot distinguish the fused cycle from the unfused ping-pong.
+    try testing.expect(native_vm.trace.native_loopdone_link_fused > 0);
+}
+
+test "2c-E (doc 17): native one-trip linked loop-done is productive, not a guard failure" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // One-trip reachability: a 2-trip inner loop's dispatcher entry happens on the
+    // FIRST back-edge (tier-0 ran iteration 1), so the native trace runs exactly
+    // one iteration and hits its loop-done LINKED with `local_completed == 0` (the
+    // final linked snapshot commits WITHOUT the back-edge rbx increment). The warm
+    // phase (m=30) records the inner root + continuation and compiles them native;
+    // the m=2 phase then produces a one-trip linked receipt on every outer
+    // iteration. Without the `linked_one_trip` fix each such receipt takes the
+    // zero path and `countGuardFailure` charges the loop-done exit PC — at a PC
+    // where the trace just SUCCEEDED (the linked snapshot committed).
+    //
+    // The `%` in the outer body is LOAD-BEARING twice over: it makes the
+    // continuation nativegen-unsupported, so (a) `armLoopDoneLink` fails closed at
+    // `nativeFor(cont).ordinary_entry` and the loop-done slot stays UNARMED — every
+    // m=2 receipt therefore reaches the scalar dispatcher path instead of fusing
+    // through the armed slot into the multi-entry ledger drain; and (b) the burst
+    // never runs the continuation natively, so the one-trip receipts keep coming
+    // via the dispatcher for the whole phase (gate-cooldown cycles re-admit them).
+    const source =
+        \\local s = 0
+        \\local m = 30
+        \\for i = 1, 300 do
+        \\  if i == 60 then m = 2 end
+        \\  for j = 1, m do s = s + 1 end
+        \\  s = s % 100000007
+        \\end
+        \\print(s)
+    ;
+
+    var tier0_buf: [64]u8 = undefined;
+    var tier0 = io.Writer.fixed(&tier0_buf);
+    try runCaptured(testing.allocator, source, &tier0, false, .off);
+
+    const gpa = testing.allocator;
+    var native_vm = try Vm.init(gpa);
+    defer native_vm.deinit();
+    // One-trip receipts are UNREACHABLE at the default `min_trip_entry` (24): the
+    // dispatcher declines numeric-for entry when the EXACT remaining trip count
+    // (`forRemainingTrips`) is below it, and the m=2 inner has 1 remaining trip at
+    // its first back-edge. Disable the heuristic so the dispatcher actually enters
+    // the trace and produces the one-trip linked receipts under test (same
+    // precedent as the min_trip_entry=0 tests above; `runNativeForTrace` leaves
+    // pre-set config keys alone).
+    native_vm.trace.config.min_trip_entry = 0;
+    var native_buf: [64]u8 = undefined;
+    var native = io.Writer.fixed(&native_buf);
+    var native_chunk = try runNativeForTrace(&native_vm, gpa, source, &native);
+    defer native_chunk.deinit();
+
+    // Primary gate — and the load-bearing one: byte-identical output. Verified by
+    // disabling the fix (`false and` on `linked_one_trip`): without it the scalar
+    // zero path MISRESUMES a one-trip linked receipt — the linked snapshot already
+    // committed the final iteration into regs, and the zero path re-runs it —
+    // printing 2253 vs tier-0's 2252. So the fix is a *correctness* fix, not just
+    // accounting; at default config only `min_trip_entry` (24) keeps the broken
+    // path unreachable (the dispatcher declines <24-remaining-trip entries).
+    try testing.expectEqualStrings(tier0.buffered(), native.buffered());
+    // Secondary gate (accounting): no guard-failure key was charged repeatedly.
+    // Without the fix every one-trip linked receipt is misclassified as a
+    // zero-yield entry and `countGuardFailure` charges the loop-done exit PC once
+    // per dispatcher entry — bounded by the `max_penalty` (8) gate, so assert < 4,
+    // not < hotguard. With the fix the one-trip receipts are productive and the
+    // key never appears.
+    // (Live diagnostics for this scenario: build with `-Djit-debug=true`, set
+    // `native_vm.trace.config.debug_log = true` above, and use
+    // `native_vm.trace.dbgDumpGuardFailures()` / `dbgDumpCache()` here.)
+    var it = native_vm.trace.guard_failures.valueIterator();
+    while (it.next()) |count| {
+        try testing.expect(count.* < 4);
+    }
 }
 
 test "coherent-state chaining (doc 16, Phase 2): nsieve prime path chains, not tier-0" {
