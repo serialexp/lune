@@ -2706,70 +2706,33 @@ pub const Vm = struct {
                                 // skip zero-exit, call `onSideExit(final, 0)`, and drive
                                 // `.ordinary_header` off `final.anchor.pc` (the outer
                                 // header) — a semantic misresume from the wrong coherent
-                                // PC (doc 17 §Increment 2.3c). Recognize the fusion by
-                                // ARMED-EDGE PROVENANCE (not the `.link` opcode, which
-                                // OOBs on a fused prologue-fail and false-positives on
-                                // 2.3c-2's inner→continuation), replay the root's
-                                // steering `onSideExit(ct, skip_local)` that `final`
-                                // cannot reproduce (P-F), then continue the burst from
-                                // the already-run ramp result WITHOUT re-running the ramp
-                                // (which would redo its `for_prep`).
-                                if (ran_native and final != ct and result.exit_reason == .normal and
-                                    result.exit_instr < final.instrs.len)
-                                {
-                                    if (self.trace.fusedSourceBranchLinkSlot(ct, final, proto)) |slot| {
-                                        self.trace.native_source_link_fused +|= 1;
-                                        // The ramp commits 0 of its own iterations, so
-                                        // `result.completed` IS the skip trace's own
-                                        // committed count (`entry_rbx`, `local_completed
-                                        // == 0`) — no new `NativeResult` field needed.
-                                        const skip_local: usize = result.completed;
-                                        // Replay the root's productive source-branch
-                                        // steering on `ct` (skip). The other two
-                                        // productive-exit hooks are statically inert for
-                                        // this exit shape: `maybeArmContinuation` is a
-                                        // no-op on a source-branch guard (its exit PC does
-                                        // not follow a `for_loop` — the recognizer proved
-                                        // `slot` is `isSourceBranchGuardExit`), and
-                                        // `countProductiveBranchExit` returns early once
-                                        // the prime side coexists (`countTracesAt >= 2`,
-                                        // guaranteed here: we armed skip→ramp, so both
-                                        // live at this anchor).
-                                        std.debug.assert(self.trace.isSourceBranchGuardExit(ct, slot, proto));
-                                        std.debug.assert(self.trace.countTracesAt(ct.anchor) >= 2);
-                                        self.trace.onSideExit(ct, skip_local);
-                                        if (final.instrs[result.exit_instr].op == .link) {
-                                            // Sub-case (a): the ramp reached its `.link`
-                                            // terminal → continue the burst (inner root,
-                                            // then continuation⇄inner) exactly as the
-                                            // unarmed `driveChain` does after
-                                            // `snt.run(ramp)`. `sresult_fused = false`:
-                                            // the ramp's OWN `.link` slot is unarmed in M1
-                                            // (only the continuation's is armed, 2.3b-1),
-                                            // so `runLinkedBurst` IGNORES the seed result
-                                            // entirely and re-derives everything from the
-                                            // ramp's `.link.aux` — byte-identical to the
-                                            // unarmed seed whose `sresult.completed` was 0.
-                                            const nt = self.trace.nativeFor(final) orelse
-                                                @panic("2.3c-1: fused ramp has no native code");
-                                            const chain = self.trace.runLinkedBurst(final, result, false, nt, .native_only, .ordinary_header, proto, regs, safe_to_arm);
-                                            if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
-                                            for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
-                                            continue :outer;
-                                        }
-                                        // Sub-case (b): the ramp deopted at an internal
-                                        // guard BEFORE its `.link` (rare — prime_side's
-                                        // own guards are coherent at the fused entry).
-                                        // Byte-identical to the unarmed path, whose
-                                        // `driveChain` runs the ramp, gets a non-`.link`
-                                        // result, and returns `{completed: 0, resume_pc:
-                                        // walk_pc = anchor.pc}` after `onSideExit(ramp,
-                                        // 0)`.
-                                        self.trace.onSideExit(final, 0);
-                                        pc = @intCast(ct.anchor.pc);
-                                        for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
-                                        continue :outer;
-                                    }
+                                // PC (doc 17 §Increment 2.3c). Through 2.3c-1 a bespoke
+                                // scalar recognizer (armed-edge provenance) handled it
+                                // here; 2.3c-2d folds that steering into `replayLedger`.
+                                //
+                                // 2.3c-2d (D2b-ii, doc 17): a dispatcher native entry that
+                                // fused forward through an armed slot returns a MULTI-ENTRY
+                                // per-transition ledger (`ledger_len > 1`) describing the
+                                // whole fused span. Drain it through the authoritative
+                                // `replayLedger` graph-walk (origin `.dispatcher_root`) —
+                                // the same drain the in-burst continuation call uses —
+                                // instead of the bespoke scalar M1 recognizer this
+                                // replaces. `replayLedger`'s `.deopt` non-last arm
+                                // reproduces the old `onSideExit(ct, skip_local)` +
+                                // sub-case (a)/(b) steering byte-for-byte. Gated on
+                                // `exit_reason == .normal`: a fused span that terminated in
+                                // `.prologue_fail` (`exit_instr == maxInt`) keeps its old
+                                // scalar handling below — the old gate excluded it via
+                                // `exit_instr < final.instrs.len`, the new gate via the
+                                // reason, and both routes are identical. Pre-2c-E the only
+                                // `ledger_len > 1` dispatcher shape is the M1 fusion, so
+                                // this gate is equivalent to the old `fusedSourceBranchLinkSlot`
+                                // recognizer for every case it fired on.
+                                if (ran_native and result.ledger_len > 1 and result.exit_reason == .normal) {
+                                    const chain = self.trace.driveDispatcherLedger(ct, self.trace.ledger_scratch[0..result.ledger_len], proto, regs, safe_to_arm);
+                                    if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                                    for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                    continue :outer;
                                 }
 
                                 // --- guard-failure counting (step 4) ---

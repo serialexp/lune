@@ -1739,8 +1739,56 @@ pub const TraceState = struct {
                     // silent mis-walk.
                     if (e.reason != .normal)
                         @panic("replayLedger: .deopt entry has a non-normal reason");
-                    if (!is_last)
-                        @panic("replayLedger: fused .deopt→successor (M1 shape) not modeled until 2.3c-2d");
+                    if (!is_last) {
+                        // 2.3c-2d (D2b-ii): the fused ordinary-guard→successor M1 shape
+                        // — `owner` (the skip trace) hit its ARMED source-branch guard
+                        // and jumped straight into a prime-side entry ramp (`succ`).
+                        // This is the ONLY non-last `.deopt` grammar modeled; validate
+                        // it strictly by armed-edge provenance (never the `.link` opcode,
+                        // which OOBs on a fused prologue-fail) and replay the exact
+                        // steering the old scalar dispatcher M1 recognizer did.
+                        if (e.outcome != .normal)
+                            @panic("replayLedger: fused M1 .deopt is a forced yield");
+                        if (e.exit >= owner.instrs.len)
+                            @panic("replayLedger: fused M1 .deopt exit index out of range");
+                        if (!self.isSourceBranchGuardExit(owner, e.exit, proto))
+                            @panic("replayLedger: fused M1 .deopt exit is not a source-branch guard");
+                        const succ = self.traceById(entries[k + 1].id) orelse
+                            @panic("replayLedger: fused M1 successor id did not resolve");
+                        if ((self.fusedSourceBranchLinkSlot(owner, succ, proto) orelse
+                            @panic("replayLedger: fused M1 successor is not an armed source-branch ramp")) != e.exit)
+                            @panic("replayLedger: fused M1 armed slot does not match the exit guard");
+                        std.debug.assert(self.countTracesAt(owner.anchor) >= 2);
+                        // The ramp commits ZERO of its OWN iterations, so its `cum`
+                        // equals the skip's (`entry_rbx == skip_local`). `local` here is
+                        // therefore the skip trace's own committed count, and
+                        // `onSideExit(owner, local)` below reproduces the old
+                        // `onSideExit(ct, skip_local)` exactly.
+                        if (entries[k + 1].cum != e.cum)
+                            @panic("replayLedger: fused M1 ramp committed its own iterations (cum advanced)");
+                        self.native_source_link_fused +|= 1;
+                        self.onSideExit(owner, local);
+                        // Sub-case (b): the ramp deopted at an internal guard BEFORE its
+                        // `.link` — terminal. Replay the old dispatcher steering
+                        // `onSideExit(ramp, 0); resume ct.anchor.pc`. (`succ.cum ==
+                        // owner.cum`, so `succ`'s own `local` is 0 regardless.)
+                        if (entries[k + 1].kind == .deopt) {
+                            self.onSideExit(succ, 0);
+                            return .{ .return_result = .{
+                                .completed = linked_completed.*,
+                                .resume_pc = seed_owner.anchor.pc,
+                            } };
+                        }
+                        // Sub-case (a): the ramp reached its `.link` terminal. Fall
+                        // through — the next iteration's `.link_terminal` arm charges the
+                        // one `native_link_exits`, sets `resume_pc` to the ramp's
+                        // inner-root PC, and returns `run_inner_from(ramp)`. Any other
+                        // successor kind is an unmodeled grammar → hard-stop.
+                        if (entries[k + 1].kind != .link_terminal)
+                            @panic("replayLedger: fused M1 successor is neither .link_terminal (a) nor .deopt (b)");
+                        prev_cum = e.cum;
+                        continue;
+                    }
                     // The exit must name an interior deopt-producing instruction on
                     // `owner`. The set of ops that deopt is BROADER than `guardExitPc`'s
                     // `guard_*`/`int_of_float` (it includes array-bounds / store-type
@@ -2170,6 +2218,78 @@ pub const TraceState = struct {
         // A burst that committed nothing hasn't advanced `resume_pc` past its
         // initial inner-root PC, so this is the coherent resume target.
         return .{ .completed = 0, .resume_pc = resume_pc };
+    }
+
+    /// 2.3c-2d D2b-ii: the dispatcher's direct-native-entry ledger drain. When a
+    /// dispatcher native entry at `seed` (an ordinarily-dispatched trace — e.g. the
+    /// nsieve skip trace) fuses forward through an armed slot, its `NativeResult`
+    /// carries a MULTI-ENTRY per-transition ledger describing the whole fused span.
+    /// This drains that span through the SAME `replayLedger` graph-walk the in-burst
+    /// continuation call uses (origin `.dispatcher_root`), then maps the terminal
+    /// directive onto the shared `driveBurstCore`. It replaces the bespoke scalar M1
+    /// recognizer the dispatcher used through 2.3c-1: `replayLedger` reproduces its
+    /// `onSideExit(ct, skip_local)` + sub-case (a)/(b) steering exactly (see the
+    /// `.deopt` non-last arm), and — because it owns per-transition accounting — the
+    /// only entry counter left for THIS caller is the coherent-anchor firing signal
+    /// (`prime_side_chain_follows`, the old `runLinkedBurst(.ordinary_header)` bump).
+    /// `entries` must be the captured `ledger_scratch[0..ledger_len]`; the caller has
+    /// already gated on `ran_native and ledger_len > 1 and exit_reason == .normal`.
+    pub fn driveDispatcherLedger(
+        self: *TraceState,
+        seed: *Trace,
+        entries: []const irinterp.LedgerEntry,
+        proto: *const Proto,
+        regs: RegWindow,
+        safe_to_arm: bool,
+    ) ChainResult {
+        const max_hops: usize = 8;
+        var linked_completed: usize = 0;
+        var resume_pc: u32 = seed.anchor.pc;
+        var hops: usize = 0;
+        // The seed is a directly-dispatched trace (never a `.link`), so it has no
+        // inner-root PC of its own; `inner_pc` only seeds `replayLedger`'s `link_pc`
+        // fallback for an inner mid-loop-deopt before any `.link` marker — which the
+        // modeled M1 grammar never reaches (its first `.link` sets the real cursor).
+        // Pass the seed anchor as an inert placeholder.
+        const inner_pc: u32 = seed.anchor.pc;
+        switch (self.replayLedger(entries, seed, inner_pc, proto, &linked_completed, &resume_pc, &hops, max_hops, .dispatcher_root)) {
+            // M1 sub-case (a): the replayed ramp reached `.link`. Its `.link_terminal`
+            // arm already charged the one `native_link_exits`; charge the
+            // coherent-anchor firing signal here (the wrapper's `.ordinary_header`
+            // bump) and continue the burst from the inner root the ramp names.
+            .run_inner_from => |d| {
+                self.prime_side_chain_follows +|= 1;
+                const snt = self.nativeFor(d) orelse
+                    @panic("driveDispatcherLedger: run_inner_from target has no native code");
+                const cursor = BurstCursor{
+                    .current_link = d,
+                    .linked_completed = linked_completed,
+                    .resume_pc = resume_pc,
+                    .hops = hops,
+                };
+                return self.driveBurstCore(d, cursor, null, snt, .native_only, proto, regs, safe_to_arm);
+            },
+            // A closed `I→C` cycle drained to a re-runnable continuation (2.3c-2e):
+            // continue the burst from it. Unreachable until `I→C` is armed; wired for
+            // completeness so the persistent-arm step is a one-line flip, not a hole.
+            .run_continuation => |c| {
+                const snt = self.nativeFor(c) orelse
+                    @panic("driveDispatcherLedger: run_continuation target has no native code");
+                const cursor = BurstCursor{
+                    .current_link = c,
+                    .linked_completed = linked_completed,
+                    .resume_pc = resume_pc,
+                    .hops = hops,
+                };
+                return self.driveBurstCore(c, cursor, null, snt, .native_only, proto, regs, safe_to_arm);
+            },
+            // M1 sub-case (b) (ramp deopted before `.link`) and every other terminal
+            // shape: `replayLedger` already applied the transition accounting and
+            // baked the coherent resume PC into the directive — return it verbatim.
+            .return_result => |cr| return cr,
+            // Zero-progress / hop-budget terminal → penalty-neutral tail.
+            .break_burst => return .{ .completed = linked_completed, .resume_pc = resume_pc },
+        }
     }
 
     /// True when a native trace has a link-terminated continuation waiting at one
