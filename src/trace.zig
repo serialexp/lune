@@ -1531,6 +1531,23 @@ pub const TraceState = struct {
     /// `hops`. `dispatcher_root` (2.3c-2d D2) is the dispatcher's direct native entry.
     const ReplayOrigin = enum { continuation_call, inner_call, dispatcher_root };
 
+    /// 2.3c-2d D2b-i: the mutable hop-loop state shared by every burst entry. The
+    /// fresh-entry wrapper (`runLinkedBurst`) builds a zero-progress cursor; the
+    /// dispatcher's replayed-M1 handoff (2.3c-2d D2b-ii) hands over an
+    /// already-accounted cursor after `replayLedger` has drained the M1 prefix. Both
+    /// then run the SAME `driveBurstCore` hop loop + tail from this state, so the
+    /// core has exactly one implementation of the continuation⇄inner ping-pong.
+    ///   `current_link`   — the `.link` driver this hop dispatches (mutated on swap).
+    ///   `linked_completed` — cumulative outer-loop iterations committed so far.
+    ///   `resume_pc`      — where tier-0 resumes when the burst yields.
+    ///   `hops`           — hops taken (bounded by `max_hops`).
+    const BurstCursor = struct {
+        current_link: *Trace,
+        linked_completed: usize,
+        resume_pc: u32,
+        hops: usize,
+    };
+
     /// 2.3c-2c: the single authoritative drain of ONE native call's per-transition
     /// ledger. A fused native span (`C→I→C→…` chained under the shared frame) returns
     /// ONE `NativeResult` whose scalar fields describe only the TERMINAL body; the
@@ -1806,6 +1823,13 @@ pub const TraceState = struct {
         @panic("replayLedger: ledger ended on a chain source with no terminal");
     }
 
+    /// Fresh-entry wrapper: a burst that STARTS at `sct` (a doc-15 continuation or a
+    /// doc-16 prime-side entry ramp). Charges the one-time burst-entry counters
+    /// (`native_link_exits`/`link_ir_exits` and, for the coherent-anchor path,
+    /// `prime_side_chain_follows`), then enters the shared `driveBurstCore` from a
+    /// zero-progress cursor. The dispatcher's 2.3c-2d replayed-M1 entry enters the
+    /// SAME core from an already-accounted cursor WITHOUT this preamble (the replayed
+    /// ramp `.link` already charged `native_link_exits` inside `replayLedger`).
     pub fn runLinkedBurst(
         self: *TraceState,
         sct: *Trace,
@@ -1818,10 +1842,6 @@ pub const TraceState = struct {
         regs: RegWindow,
         safe_to_arm: bool,
     ) ChainResult {
-        // Burst hop bound: matches the old `visited: [8]*Trace` cap (see the BURST BOUND
-        // note below). A named const now that the walk's `visited` array is out of scope.
-        const max_hops: usize = 8;
-        var snt = snt_in;
         if (tier == .native_only) {
             self.native_link_exits +|= 1;
         } else {
@@ -1831,27 +1851,55 @@ pub const TraceState = struct {
         // coherent-anchor (outer-header prime side-trace) path, not a
         // loop-done continuation. Bump regardless of tier.
         if (materialization == .ordinary_header) self.prime_side_chain_follows +|= 1;
-        var linked_completed: usize = 0;
+        const cursor = BurstCursor{
+            .current_link = sct,
+            .linked_completed = 0,
+            // The design's `coherent_pc` cursor: where tier-0 resumes when the
+            // burst yields. Starts at the inner-root PC named by the `.link`.
+            .resume_pc = @intCast(sct.instrs[sct.instrs.len - 1].aux),
+            .hops = 0,
+        };
+        // 2.3b-1: a *fused* continuation run (armed `.link` slot jumped straight into
+        // inner) hands the inner loop-done/mid result forward so the core consumes it
+        // WITHOUT re-running inner. Only ever non-null on the native path.
+        const fused_inner: ?irinterp.ExecResult = if (sresult_fused) sresult else null;
+        return self.driveBurstCore(sct, cursor, fused_inner, snt_in, tier, proto, regs, safe_to_arm);
+    }
+
+    /// The shared continuation⇄inner-root ping-pong core. Runs from an already-built
+    /// `cursor` — fresh zero-progress from `runLinkedBurst`, or an already-accounted
+    /// cursor the dispatcher hands over after a `replayLedger` M1 drain (2.3c-2d
+    /// D2b-ii). `seed` is the burst's origin trace, used only by the zero-progress
+    /// tail's `onSideExit(seed, 0)`. This function owns NO one-time entry counters —
+    /// its caller charges those before handing over the cursor.
+    fn driveBurstCore(
+        self: *TraceState,
+        seed: *Trace,
+        cursor: BurstCursor,
+        fused_inner_in: ?irinterp.ExecResult,
+        snt_in: *const nativegen.CompiledTrace,
+        comptime tier: ChainTier,
+        proto: *const Proto,
+        regs: RegWindow,
+        safe_to_arm: bool,
+    ) ChainResult {
+        // Burst hop bound: matches the old `visited: [8]*Trace` cap (see the BURST BOUND
+        // note below). A named const now that the walk's `visited` array is out of scope.
+        const max_hops: usize = 8;
+        var snt = snt_in;
+        var linked_completed: usize = cursor.linked_completed;
         // The ping-pong *driver*: a `.link` trace anchored at the post-inner
         // PC that advances the enclosing loop and links back to the inner
-        // root. Seeded with `sct` — which for a doc-15 continuation IS the
+        // root. Seeded from the cursor — for a doc-15 continuation IS the
         // driver, but for a doc-16 prime side-trace is only the *entry ramp*
         // (anchored at the outer header, not the post-inner PC). After the
         // first inner loop-done we swap to the real continuation (below), so
         // the burst advances the outer loop natively instead of dropping to
         // tier-0. Mutable for exactly that swap.
-        var current_link = sct;
-        // The design's `coherent_pc` cursor: where tier-0 resumes when the
-        // burst yields. Starts at the inner-root PC named by the `.link`.
-        var resume_pc: u32 = @intCast(current_link.instrs[current_link.instrs.len - 1].aux);
-        // 2.3b-1: carries an inner loop-done/mid result produced by a *fused*
-        // continuation run (armed `.link` slot jumped straight into inner). The
-        // loop top consumes it as this hop's inner result WITHOUT re-running
-        // inner (which would double-commit its loop). Seeded from a fused initial
-        // `sresult`; refilled by each fused `cresult` at the loop bottom. Only
-        // ever non-null on the native path.
-        var fused_inner: ?irinterp.ExecResult = if (sresult_fused) sresult else null;
-        var hops: usize = 0;
+        var current_link = cursor.current_link;
+        var resume_pc: u32 = cursor.resume_pc;
+        var fused_inner: ?irinterp.ExecResult = fused_inner_in;
+        var hops: usize = cursor.hops;
         // BURST BOUND (native drain caveat): tier-1a commits at most `visited.len`
         // (8) enclosing iterations per burst. The native drain permits ONE more —
         // up to `visited.len + 1` (9) — because a hop's FIRST loop-done (the one
@@ -2118,7 +2166,7 @@ pub const TraceState = struct {
             // tier-1a/native, so no mode records a different penalty here.
             return .{ .completed = linked_completed, .resume_pc = resume_pc };
         }
-        self.onSideExit(sct, 0);
+        self.onSideExit(seed, 0);
         // A burst that committed nothing hasn't advanced `resume_pc` past its
         // initial inner-root PC, so this is the coherent resume target.
         return .{ .completed = 0, .resume_pc = resume_pc };
