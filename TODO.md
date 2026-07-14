@@ -2,6 +2,38 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## RARE, layout-dependent: fused native cycle re-entered COLD from a fresh top-level frame (2c-F, July 2026)
+
+Found while writing the 2c-F disarm integration test. Re-running a **completed
+top-level proto** a second time via `vm.run(chunk.proto)` on the **same VM**, when
+that proto's inner `C↔I` native cycle is already fully armed+fused from the first
+run and **no observation window is open**, once produced a spurious `TypeError`
+from the fused native→native handoff (the arith `isNumber` guard). It reproduced
+**exactly once in ~25 runs** and vanished when the set of compiled tests changed —
+i.e. it is **address-/mcode-arena-layout dependent** (the classic S2 "fused handoff
+jumps through a slot whose correctness depends on memory layout" signature).
+
+**What is NOT affected (verified deterministic across many ASLR layouts):**
+- The **supported** cold-re-entry shape — a hot armed cycle inside a function called
+  repeatedly (fresh frame each call, slots already live) — is byte-identical to
+  tier-0 every run. Permanent regression guard added:
+  `interp.zig` test *"2c-F … a hot armed cycle inside a repeatedly-called function
+  stays correct on re-entry"*.
+- The **observation-window** path (`suspend_ctl`/`record_safepoint_lines`) disarms
+  the live cycle on the next dispatcher entry *before* any handoff can fire, so it is
+  robust; the 2c-F integration test asserts `native_link_disarms > 0` + byte-identity.
+
+**Why deferred, not fixed now:** re-running a *completed top-level chunk* twice on one
+VM is not a shape lune ships (scripts run once; a REPL compiles a fresh proto per
+line; functions are the re-entry mechanism and are clean). So this is a latent
+robustness gap in an unsupported usage, not a live-path bug — but it IS a real
+address-dependent hazard worth a proper root-cause before P-E lifetime work closes
+out. **Flag it explicitly in the codex `gpt-5.6-sol` review** of the 2c arc: the
+question for the reviewer is whether any *supported* path can re-enter a fused cycle
+with stale per-run register/stack state the handoff assumes fresh. Repro recipe:
+add a top-level-rerun test (see git history of this TODO's companion diag) and loop
+`just test` ~30× under ASLR.
+
 ## Hash-field (string-keyed) tracing — H0+H1 LANDED (June 2026, uncommitted, pending approval)
 
 `obj.field` get/set now records a trace (`href`/`hload`/`hstore`/`guard_hash`) and

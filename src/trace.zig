@@ -993,6 +993,14 @@ pub const TraceState = struct {
     /// into its continuation without Zig re-entry. Distinct from the arm counter (an
     /// arm can happen without ever firing); `> 0` proves the fused edge is exercised.
     native_loopdone_link_fused: u64 = 0,
+    /// 2c-F (2c-E, doc 17): count of armed slots RESET by `disarmAllLinks` when the
+    /// dispatcher opens an observation/suspend/replay window over a VM that already
+    /// holds a live armed native cycle (`!safe_to_arm`). Bumped by the number of
+    /// slots each `disarmAllLinks` returns to `shared_exit`; `> 0` is the "the
+    /// blackout actually tore down a live cycle" signal for the disarm integration
+    /// test (a byte-identical run under an open window cannot, by itself, prove a
+    /// non-empty registry was torn down — the counter can).
+    native_link_disarms: u64 = 0,
     /// **Coherent-state chaining (doc 16, Phase 2) diagnostics.** `prime_side_arms`
     /// counts outer-header prime side-traces armed (a productive branch-guard went
     /// hot and we switched to `.full` to record the current prime iteration).
@@ -3134,6 +3142,7 @@ pub const TraceState = struct {
     pub fn disarmAllLinks(self: *TraceState) void {
         if (self.armed_links.items.len == 0) return;
         self.dbg("disarmAllLinks: resetting {d} armed links", .{self.armed_links.items.len});
+        self.native_link_disarms +|= @intCast(self.armed_links.items.len);
         const shared_exit = self.mcode_arena.trampoline_exit orelse 0;
         for (self.armed_links.items) |link| {
             switch (link.parent.native) {
@@ -6310,15 +6319,19 @@ test "disarmAllLinks (2c-E / 2.3c-0e): resets EVERY armed slot on entering the o
     try testing.expectEqual(C_TO_I, cont_slots[0]);
     try testing.expectEqual(@as(usize, 2), state.armed_links.items.len);
 
-    // One disarm resets BOTH slots and empties the registry.
+    // One disarm resets BOTH slots and empties the registry, and the tear-down
+    // counter reflects exactly the two slots reset.
     state.disarmAllLinks();
     try testing.expectEqual(SHARED_EXIT, inner_slots[0]);
     try testing.expectEqual(SHARED_EXIT, cont_slots[0]);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(u64, 2), state.native_link_disarms);
 
-    // Idempotent: a second call on the now-empty registry is a clean no-op.
+    // Idempotent: a second call on the now-empty registry is a clean no-op — and
+    // the counter does NOT advance (the early `len == 0` return fires first).
     state.disarmAllLinks();
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(u64, 2), state.native_link_disarms);
 }
 
 test "armNativeLink: P-C option (b) invariant — arm kind matches slot guard shape" {

@@ -10043,6 +10043,117 @@ test "2c-E (doc 17): native one-trip linked loop-done is productive, not a guard
     }
 }
 
+test "2c-F (doc 17): an observation window disarms a LIVE armed native cycle on the same VM" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // The load-bearing disarm-on-unsafe integration test (the same-VM two-phase
+    // scenario the unit test at trace.zig can't reach). Phase A arms + fuses the
+    // native `C↔I` cycle on a real VM with NO observation window — the negative
+    // control: on the safe path `disarmAllLinks` must NEVER fire
+    // (`native_link_disarms == 0`) even though slots are live. Phase B RE-RUNS the
+    // exact same proto on the SAME VM with a replay-line observation window open; on
+    // the first hot dispatcher entry `safe_to_arm` is false, so the dispatcher tears
+    // the LIVE cycle down (`disarmAllLinks` resets both slots to `shared_exit`
+    // BEFORE any native→native handoff can skip a safepoint) and re-enters the
+    // dispatcher per hop. The decisive facts: (1) Phase B output is byte-identical to
+    // the tier-0 oracle with the window active, and (2) the tear-down actually
+    // happened over a non-empty registry — provable only by the counter, since a
+    // correct byte-identical run under an open window looks the same whether the
+    // registry held zero or two links.
+    const source =
+        \\local s = 0
+        \\for i = 1, 400 do
+        \\  for j = 1, 30 do
+        \\    s = s + i
+        \\  end
+        \\  s = s + 1
+        \\end
+        \\print(s)
+    ;
+
+    var tier0_buf: [64]u8 = undefined;
+    var tier0 = io.Writer.fixed(&tier0_buf);
+    try runCaptured(testing.allocator, source, &tier0, false, .off);
+
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+
+    // Phase A — arm + fuse the cycle with NO window (negative control for disarm).
+    var phaseA_buf: [64]u8 = undefined;
+    var phaseA = io.Writer.fixed(&phaseA_buf);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &phaseA);
+    defer chunk.deinit();
+    try testing.expectEqualStrings(tier0.buffered(), phaseA.buffered());
+    // The cycle is live: it was armed and fused …
+    try testing.expect(vm.trace.native_loopdone_link_arms > 0);
+    try testing.expect(vm.trace.native_loopdone_link_fused > 0);
+    // … and the safe path NEVER disarmed (the negative control — `safe_to_arm` was
+    // true throughout, so `disarmAllLinks` was never reached).
+    try testing.expectEqual(@as(u64, 0), vm.trace.native_link_disarms);
+
+    // Phase B — RE-RUN the same proto on the same VM behind a replay-line window.
+    // The traces (and their armed slots) from Phase A persist on `vm.trace`; opening
+    // the window flips `safe_to_arm` to false on the next hot dispatcher entry.
+    vm.source = source;
+    vm.record_safepoint_lines = true;
+    var phaseB_buf: [64]u8 = undefined;
+    var phaseB = io.Writer.fixed(&phaseB_buf);
+    vm.out = &phaseB;
+    _ = try vm.run(chunk.proto);
+
+    // (1) Correctness under the open window: byte-identical to tier-0.
+    try testing.expectEqualStrings(tier0.buffered(), phaseB.buffered());
+    // (2) The blackout actually tore down the LIVE cycle armed in Phase A — the
+    // load-bearing signal a byte-identical run alone can't provide.
+    try testing.expect(vm.trace.native_link_disarms > 0);
+}
+
+test "2c-F (doc 17): a hot armed cycle inside a repeatedly-called function stays correct on re-entry" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // The supported cold-re-entry regression guard. The armed `C↔I` cycle lives
+    // inside `f`, which is called 20 times: after the first call fuses and arms the
+    // slots, every later call is a FRESH frame that re-enters the very anchors whose
+    // slots are already live — a cold re-entry of an armed cycle. This is the common
+    // real-world shape (a hot-loop helper called in a loop) and it must be
+    // deterministically byte-identical to tier-0. (A live cycle re-entered from a new
+    // frame is precisely the state the disarm-on-unsafe path guards for the
+    // observation window; here, on the ordinary path, the fused handoff must simply
+    // be correct — verified across many ASLR layouts.)
+    const source =
+        \\local function f(base)
+        \\  local s = 0
+        \\  for i = 1, 400 do
+        \\    for j = 1, 30 do
+        \\      s = s + i
+        \\    end
+        \\    s = s + base
+        \\  end
+        \\  return s
+        \\end
+        \\local total = 0
+        \\for c = 1, 20 do total = total + f(c) end
+        \\print(total)
+    ;
+    var t0_buf: [64]u8 = undefined;
+    var t0 = io.Writer.fixed(&t0_buf);
+    try runCaptured(testing.allocator, source, &t0, false, .off);
+
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var nb: [64]u8 = undefined;
+    var n = io.Writer.fixed(&nb);
+    var chunk = try runNativeForTrace(&vm, gpa, source, &n);
+    defer chunk.deinit();
+
+    // Byte-identical to tier-0 …
+    try testing.expectEqualStrings(t0.buffered(), n.buffered());
+    // … with the cycle genuinely armed AND fused (so the re-entries above really did
+    // exercise the live fused handoff, not a degraded ping-pong).
+    try testing.expect(vm.trace.native_loopdone_link_arms > 0);
+    try testing.expect(vm.trace.native_loopdone_link_fused > 0);
+}
+
 test "coherent-state chaining (doc 16, Phase 2): nsieve prime path chains, not tier-0" {
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     // Faithful nsieve shape: an outer loop whose body branches on a boolean
