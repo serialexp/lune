@@ -30,8 +30,29 @@ panics at nativegen call site) and exercise `driveBurstCore`'s `.run_continuatio
   `replayLedger`, so the nsieve native test's `> 0` assertion proves the new path fires.
 
 **Verify (D2b):** `just test` green; nsieve/fannkuch/nbody/spectral-norm stdout byte-identical
-across tier-0 / tier-1a / native. Codex `gpt-5.6-sol` checkpoint review of the D2b diff pending
-before 2c-E.
+across tier-0 / tier-1a / native.
+
+**Codex `gpt-5.6-sol` checkpoint review of D2b — DONE (thread 019f5edc), all blockers resolved:**
+- Blocker 1 (a `[C.link, I.x]` dispatcher receipt would misroute through the widened `ledger_len>1`
+  gate) — **false positive**, confirmed by codex: the dispatcher walk skips `.link` traces
+  (interp.zig:2526) BEFORE fingerprint/native entry, so a continuation is never a dispatcher seed,
+  and a non-`.link` seed can't emit a `.link_terminal` first ledger entry. Pre-2c-E `entries[0]` of
+  a `ledger_len>1` dispatcher receipt is therefore ALWAYS the M1 source-branch `.deopt` → the new
+  gate is equivalent to the old `fusedSourceBranchLinkSlot` recognizer for every case it fired on.
+- Blocker 2 + 3 — **hardened** (commit 2f0f457, byte-identical): M1 sub-case (b) resumes at
+  `owner.anchor.pc` (not `seed_owner`) and requires the ramp deopt to be the LAST entry;
+  `prime_side_chain_follows` moved into replayLedger's M1 `.deopt` sub-case (a) fall-through (tied to
+  source-guard provenance) instead of driveDispatcherLedger's generic `run_inner_from` mapping.
+
+**Codex ruling: D2b is sound; safe to build 2c-E on it.** One ACTIVATION CONSTRAINT for 2c-E (already
+in #63 scope, do NOT skip): arming `I→C` makes call A (nativegen.zig `runLinkedLoopDoneCapturing`,
+trace.zig ~2031) immediately return `[I.loop_done_linked, C.…]` and hit the existing
+`if (iresult.ledger_len > 1) @panic(...)`. So 2c-E is NOT arm-only — it must FIRST/ALSO route call-A
+multi-entry receipts through `replayLedger(..., .inner_call)` and map the directive WITHOUT re-running
+the already-executed inner body, then flip the `I.loopdone → C.ordinary_entry` arm. The dispatcher's
+`run_continuation` mapping is already wired (dormant); call A is the remaining dormant path.
+
+D2b commits: 1e8141d (D2b-i refactor), 7875dac (D2b-ii live fold), 2f0f457 (codex hardening).
 
 ### Prior 2c-D detail (D1 + D2a)
 
