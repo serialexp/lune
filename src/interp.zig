@@ -2510,7 +2510,8 @@ pub const Vm = struct {
                         while (t) |ct| : (t = if (nvisited < visited.len)
                             self.trace.nextTraceExcluding(proto, @intCast(pc), visited[0..nvisited])
                         else
-                            null) {
+                            null)
+                        {
                             // Mark visited *before* the body so the loop continuation
                             // excludes `ct` (and everything tried so far) — this is
                             // what makes the walk finite.
@@ -2719,16 +2720,22 @@ pub const Vm = struct {
                                 // instead of the bespoke scalar M1 recognizer this
                                 // replaces. `replayLedger`'s `.deopt` non-last arm
                                 // reproduces the old `onSideExit(ct, skip_local)` +
-                                // sub-case (a)/(b) steering byte-for-byte. Gated on
-                                // `exit_reason == .normal`: a fused span that terminated in
-                                // `.prologue_fail` (`exit_instr == maxInt`) keeps its old
-                                // scalar handling below — the old gate excluded it via
-                                // `exit_instr < final.instrs.len`, the new gate via the
-                                // reason, and both routes are identical. Pre-2c-E the only
-                                // `ledger_len > 1` dispatcher shape is the M1 fusion, so
-                                // this gate is equivalent to the old `fusedSourceBranchLinkSlot`
-                                // recognizer for every case it fired on.
-                                if (ran_native and result.ledger_len > 1 and result.exit_reason == .normal) {
+                                // sub-case (a)/(b) steering byte-for-byte.
+                                //
+                                // 2c-E: gated on bare `ledger_len > 1` — a fused span that
+                                // TERMINATED in `.prologue_fail` must also drain (the
+                                // scalar code below only knows the final body: it would
+                                // read `local_done == 0` off the failing successor, drop
+                                // the span's committed prefix on the floor, and misroute
+                                // the zero-exit path). `replayLedger` models both
+                                // prologue-fail-terminated grammars: `[skip.deopt(M1),
+                                // ramp.prologue_fail]` (sub-case (c): `onSideExit(skip,
+                                // local)` + `onSideExit(ramp, 0)` + resume at the skip's
+                                // anchor — exactly the unarmed native steering) and
+                                // `[I.loop_done_linked, C.prologue_fail]` (the committed
+                                // loop-done accounts, the fail breaks the burst at the
+                                // post-loop PC).
+                                if (ran_native and result.ledger_len > 1) {
                                     const chain = self.trace.driveDispatcherLedger(ct, self.trace.ledger_scratch[0..result.ledger_len], proto, regs, safe_to_arm);
                                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                                     for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
@@ -5279,7 +5286,6 @@ test "errmsg: select() with float arguments handles conversion and bounds checks
     );
 }
 
-
 test "errmsg: an unconverted (pure) native still names the function, located" {
     try expectProgram(
         "print(pcall(function() return math.floor(\"x\") end))\n",
@@ -7366,10 +7372,12 @@ test "S-B: a recorded non-UTF-8 argv replays byte-identically (validate-after-lo
 
 test "S-B: loadfile of non-UTF-8 file content raises a catchable error" {
     const gpa = testing.allocator;
-    var ffs = FakeFs{ .entries = &.{
-        .{ .path = "good.lua", .content = "return 1" },
-        .{ .path = "bad.lua", .content = "\xFF\xFE" }, // not valid UTF-8
-    } };
+    var ffs = FakeFs{
+        .entries = &.{
+            .{ .path = "good.lua", .content = "return 1" },
+            .{ .path = "bad.lua", .content = "\xFF\xFE" }, // not valid UTF-8
+        },
+    };
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     var sink_buf: [256]u8 = undefined;
@@ -7829,9 +7837,11 @@ test "P3: require of a missing module raises the accumulated not-found message" 
 
 test "P3: a module that returns nothing caches as true" {
     const gpa = testing.allocator;
-    var ffs = FakeFs{ .entries = &.{
-        .{ .path = "./m.lua", .content = "local x = 1" }, // returns no value
-    } };
+    var ffs = FakeFs{
+        .entries = &.{
+            .{ .path = "./m.lua", .content = "local x = 1" }, // returns no value
+        },
+    };
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     var sink_buf: [64]u8 = undefined;
