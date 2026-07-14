@@ -2590,10 +2590,20 @@ pub const Vm = struct {
                                         if (self.trace.nativeFor(ct)) |nt| {
                                             ran_native = true;
                                             ran_native_link_mode = self.trace.hasNativeLoopDoneLink(ct, proto);
+                                            // 2.3c-2d (D2a): capture the per-transition
+                                            // ledger, preserving the materialization mode
+                                            // (linked → `runLinkedLoopDoneCapturing`,
+                                            // ordinary → `runCapturingLedger`). Pre-2c-E
+                                            // `ct` never fuses forward, so this yields the
+                                            // SAME scalar `result` as the old non-capturing
+                                            // calls and the scalar/M1 consumer below reads
+                                            // only those fields — byte-identical; the
+                                            // `ledger_scratch` fill is inert until D2b
+                                            // activates the `ledger_len > 1` replay.
                                             break :blk if (ran_native_link_mode)
-                                                nt.runLinkedLoopDone(trace_regs)
+                                                nt.runLinkedLoopDoneCapturing(trace_regs, &self.trace.ledger_scratch)
                                             else
-                                                nt.run(trace_regs);
+                                                nt.runCapturingLedger(trace_regs, &self.trace.ledger_scratch);
                                         }
                                     }
                                     break :blk irinterp.execute(ct, trace_regs, buf);
