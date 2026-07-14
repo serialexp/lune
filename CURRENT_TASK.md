@@ -1,8 +1,41 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
-## Status 2026-07-14 (latest) — 2.3c-2d D1 + D2a LANDED (green, byte-identical); D2b NEXT (the LIVE M1 fold)
+## Status 2026-07-14 (latest) — 2.3c-2d COMPLETE (#62): D1 + D2a + D2b-i + D2b-ii all LANDED (green, byte-identical); 2c-E NEXT (arm I→C)
 
-Progress on task #62 (2c-D, "capture everywhere"). Landed since 2c-C:
+Task #62 (2c-D, "capture everywhere") is DONE. All four native-entry sites now capture the
+per-transition ledger and drain it through the single authoritative `replayLedger`; the bespoke
+scalar M1 recognizer is gone. Next: **2c-E (#63)** — persistently arm `I.loopdone →
+C.ordinary_entry` (the `.loop_done_linked` / `isLoopDoneGuardIndex` gate), closing the native
+`C↔I` cycle so `ledger_len>1` fused spans appear at call A and the dispatcher's `run_continuation`
+path (both already wired, dormant). Also wire call-A's dormant `ledger_len>1` drain (currently
+panics at nativegen call site) and exercise `driveBurstCore`'s `.run_continuation` re-run.
+
+**D2b landed since D2a:**
+- **2c-D D2b-i** (commit 1e8141d, pure refactor, byte-identical): extracted `BurstCursor
+  { current_link, linked_completed, resume_pc, hops }` + a shared `driveBurstCore` hop-loop core
+  from `runLinkedBurst`. The wrapper keeps the one-time entry counters
+  (`native_link_exits`/`link_ir_exits`, `prime_side_chain_follows`), builds a zero-progress cursor,
+  and hands off. The core owns NO entry counters, so a caller with an already-accounted cursor can
+  enter the same ping-pong. Tail `onSideExit` now takes the explicit `seed`.
+- **2c-D D2b-ii** (commit 7875dac, the LIVE change): folded the M1 fused-guard drain into
+  `replayLedger`'s `.deopt` non-last arm (armed-edge provenance validation + `native_source_link_fused`
+  + `onSideExit(skip, skip_local)`; sub-case (a) `.link_terminal` fall-through → `run_inner_from`,
+  sub-case (b) inline `onSideExit(ramp,0)` + `return_result{resume_pc: skip.anchor.pc}`). New public
+  `trace.driveDispatcherLedger` drains a dispatcher-entry ledger via `replayLedger(.dispatcher_root)`
+  and maps the directive onto `driveBurstCore`, charging `prime_side_chain_follows` on the
+  `run_inner_from` path (the one counter replayLedger does not own). The old ~60-line scalar M1 block
+  in interp.zig is replaced by a thin gate `if (ran_native and ledger_len>1 and exit_reason==.normal)`.
+  Routing by reason keeps a prologue-fail-terminal fused span on the old scalar path (byte-identical
+  to the old `exit_instr < instrs.len` gate). `native_source_link_fused` is now bumped ONLY inside
+  `replayLedger`, so the nsieve native test's `> 0` assertion proves the new path fires.
+
+**Verify (D2b):** `just test` green; nsieve/fannkuch/nbody/spectral-norm stdout byte-identical
+across tier-0 / tier-1a / native. Codex `gpt-5.6-sol` checkpoint review of the D2b diff pending
+before 2c-E.
+
+### Prior 2c-D detail (D1 + D2a)
+
+Landed since 2c-C:
 
 - **2c-B forced-yield cap** (#64, committed): chain-source exit sites reload `ledger_len` after
   the append and `jmp shared_exit` (stamping the terminal `.yielded`) at CAP, bounding a closed
