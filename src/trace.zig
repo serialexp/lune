@@ -1487,132 +1487,289 @@ pub const TraceState = struct {
     /// `pub` because the dispatcher's M1 fused-`.link` consumer (interp.zig) enters it
     /// directly with the already-run ramp receipt (see `fusedSourceBranchLinkSlot`).
     ///
-    /// 2.3c-2b: outcome of replaying ONE native continuation call's per-transition
-    /// ledger (`replayContinuationLedger`). Drives `runLinkedBurst`'s native call-B
-    /// drain in place of the old scalar-field reads.
-    const ContinuationReplay = union(enum) {
-        /// The continuation reached its `.link` terminal, a fused inner ran to
-        /// loop-done, and the hop budget remains → re-run the (still-armed)
-        /// continuation for the next fused span.
+    /// 2.3c-2c: terminal disposition of draining ONE native call's per-transition
+    /// ledger (`replayLedger`). The drain OWNS all per-transition accounting
+    /// (`onSideExit`, `native_link_exits`, the `linked_completed`/`resume_pc`/`hops`
+    /// cursors); this union only tells the caller what TERMINAL steering to apply
+    /// once the whole ledger is walked (Q-arch-3: replay does accounting, caller does
+    /// terminal steering). The four variants are the call-B set; 2.3c-2d extends it
+    /// with dispatcher-steering variants when the dispatcher also captures.
+    const LedgerReplay = union(enum) {
+        /// The last entry was an inner loop-done that materialized LINKED and whose
+        /// `I→C` edge is NOT fused in THIS ledger (unarmed at that exit, or a forced
+        /// yield), and the hop budget remains → re-run the (still-armed) continuation
+        /// for the next fused span. `resume_pc` set to the continuation anchor.
         run_continuation,
-        /// Standalone `.link` (slot un-armed): the continuation advanced the
-        /// enclosing loop but no inner fused → resume by running inner fresh next
-        /// hop (`continue :hop`). `resume_pc` already set to the inner-root PC.
+        /// The last entry was a `.link` terminal whose slot is un-armed (standalone
+        /// `.link`) or force-yielded: the continuation advanced the enclosing loop but
+        /// no inner fused → resume by running inner fresh next hop (`continue :hop`).
+        /// `resume_pc` set to the inner-root PC that `.link` names.
         run_inner,
         /// Yield / finish: return this `ChainResult` to the dispatcher.
         return_result: ChainResult,
-        /// Zero-progress continuation deopt (its own guard, no completion): break the
-        /// hop loop and fall to the penalty-neutral post-loop tail.
+        /// Zero-progress continuation deopt (its own guard, no completion), or the hop
+        /// budget is spent after a linked loop-done: break the hop loop and fall to the
+        /// penalty-neutral post-loop tail.
         break_burst,
     };
 
-    /// 2.3c-2b: replay ONE native continuation call's decoded ledger, reproducing the
-    /// accounting the old scalar-field drain performed. Phase machine starting in the
-    /// `continuation` phase. In 2.3c-2b nothing `I→C` is armed, so a single native
-    /// continuation call fuses at most ONE inner and the ledger is ≤2 entries:
+    /// 2.3c-2c: the single authoritative drain of ONE native call's per-transition
+    /// ledger. A fused native span (`C→I→C→…` chained under the shared frame) returns
+    /// ONE `NativeResult` whose scalar fields describe only the TERMINAL body; the
+    /// ledger records every intermediate exit so we can replay the hops we never
+    /// re-entered Zig to observe. This walks `entries[0..n]` as a GRAPH — each entry is
+    /// classified by `(owner, exit, kind)`, its transition accounted, and only the
+    /// LAST entry produces a terminal `LedgerReplay`. It does not hard-code `C/I`
+    /// alternation — successor edges are validated by shape, not position — but at
+    /// 2.3c-2c it models exactly ONE fused grammar: the `C.link → I.loop_done_linked
+    /// → C.link → …` cycle that 2.3c-2e arms. Every other multi-entry shape is an
+    /// unmodeled call-B grammar and release-`@panic`s at its emit-site kind arm (the
+    /// fused ordinary-guard `.deopt→ramp` M1 shape is deferred to 2.3c-2d; an armed
+    /// `C.link→I.guard→R.link` inner-to-sibling chain to a later sub-step). Panicking
+    /// is deliberate: a mis-mapped resume PC would silently double-count an
+    /// already-committed loop, so an unclassifiable entry MUST hard-stop, never walk on.
+    ///
+    /// Accounting ownership (Q-arch-3): this function owns EVERY per-transition side
+    /// effect — `native_link_exits` on each `.link` marker, `onSideExit` on each body's
+    /// productive/zero exit, and the `linked_completed`/`resume_pc`/`hops` cursors. The
+    /// caller only applies the returned terminal directive. Per the Q1/Q2 rulings we
+    /// account every entry BEFORE any re-run bound; `hops >= max_hops` may only decline
+    /// the NEXT re-run at span end (the `run_continuation`→`break_burst` swap on the
+    /// last entry), never early-return mid-ledger.
+    ///
+    /// Seeded at `seed_owner` (call B: the continuation `current_link`) with
+    /// `inner_pc` = the inner-root PC that seed's `.link` names. On the ≤2-entry
+    /// ledgers that exist before `I→C` is armed (2.3c-2e) this reproduces the old
+    /// scalar drain byte-for-byte:
     ///   `[C.link]`          un-armed slot: standalone `.link`     → `run_inner`
     ///   `[C.<guard>]`       continuation's OWN deopt (no `.link`) → productive / break
     ///   `[C.link, I.exit]`  armed slot fused into the inner root  → drain the inner
-    /// (2.3c-2c arms `I.loopdone→C`, closing the cycle into a longer ledger; the
-    /// `entries.len <= 2` assert pins the current invariant so a stray arm trips loudly.)
-    /// Mutates the burst cursors (`linked_completed`, `resume_pc`, `hops`) in place and
-    /// charges `native_link_exits` on the `C.link` marker (replacing the old per-span
-    /// and standalone-`.link` bumps). Resolution failures panic — the SAME hard
-    /// invariant the scalar drain enforced (an unresolvable/mis-shaped fused id means
-    /// `regs[]` has no known-coherent resume PC).
-    fn replayContinuationLedger(
+    fn replayLedger(
         self: *TraceState,
         entries: []const irinterp.LedgerEntry,
-        current_link: *Trace,
+        seed_owner: *Trace,
         inner_pc: u32,
         proto: *const Proto,
         linked_completed: *usize,
         resume_pc: *u32,
         hops: *usize,
         max_hops: usize,
-    ) ContinuationReplay {
-        // 2.3c-2b models ≤2-entry ledgers only (one continuation exit + at most one
-        // fused inner). A longer ledger means a FURTHER fused hop — the closed
-        // `C→I→C…` cycle 2.3c-2c arms, whose full-ledger replay handles it. Until
-        // then a >2 ledger is an unmodeled composition (e.g. `C.link→I.guard→R.link`
-        // when an inner's own ordinary source guard is itself armed to a ramp):
-        // replaying only entries 0-1 would DROP R's hop and misresume. Abort loudly in
-        // EVERY build rather than silently mis-account — this is the same
-        // "unexpected fused shape" hard-stop the old scalar drain took (it panicked on
-        // a terminal that is not the expected inner root). `ledger_len` is always ≥1
-        // (every native exit appends), release-guarded here so `entries[0]` can never
-        // be OOB even if that invariant were ever violated.
-        if (entries.len == 0 or entries.len > 2)
-            @panic("replayContinuationLedger: ledger length outside the 2.3c-2b ≤2 model (2.3c-2c lifts this)");
-        const e0 = entries[0];
-        const c_owner = self.traceById(e0.id) orelse
-            @panic("replayContinuationLedger: continuation id did not resolve");
-        // 2.3b-1: call B is `snt.run(current_link)`; nothing routes a different
-        // continuation into this call yet, so the first entry is current_link's own.
-        std.debug.assert(c_owner == current_link);
-        const c_is_link_terminal = e0.exit == current_link.instrs.len - 1 and
-            current_link.instrs[current_link.instrs.len - 1].op == .link;
-        if (!c_is_link_terminal) {
-            // The continuation took its OWN guard/prologue exit before reaching
-            // `.link` (matches the old scalar `completed>0 ? onSideExit+return :
-            // break`). A fresh trampoline call zeroes `rbx`, so the continuation's
-            // local == `cum[0]` == the old scalar `cresult.completed`.
-            const c_local = e0.cum;
-            if (c_local > 0) {
-                self.onSideExit(current_link, c_local);
-                return .{ .return_result = .{
-                    .completed = linked_completed.* + c_local,
-                    .resume_pc = resume_pc.*,
-                } };
+    ) LedgerReplay {
+        // `ledger_len` is always ≥1 (every native exit appends exactly once) and ≤CAP
+        // (the append is bounds-guarded; the forced-yield cap keeps a closed cycle
+        // under CAP). Release-guard both so `entries[k]` is never OOB even if that
+        // invariant were ever violated upstream.
+        if (entries.len == 0 or entries.len > irinterp.LEDGER_CAP)
+            @panic("replayLedger: ledger length outside [1, LEDGER_CAP]");
+
+        // Running cursors as the graph is walked:
+        //   `cont`    — the continuation whose anchor is the coherent resume for a
+        //               terminal inner loop-done (init: the seed; updated when a fused
+        //               `I→C` edge dispatches into the next continuation).
+        //   `link_pc` — the inner-root PC named by the most-recent `.link` marker, i.e.
+        //               where tier-0 resumes if an inner mid-loop-deopts (init: the
+        //               seed's `inner_pc`).
+        //   `prev_cum`— `cum` of the previous entry, for per-segment `local` deltas
+        //               (`cum[-1] == 0`, the trampoline-zeroed call-start `rbx`).
+        var cont: *Trace = seed_owner;
+        var link_pc: u32 = inner_pc;
+        var prev_cum: usize = 0;
+
+        var k: usize = 0;
+        while (k < entries.len) : (k += 1) {
+            const e = entries[k];
+            const is_last = k + 1 == entries.len;
+            const owner = self.traceById(e.id) orelse
+                @panic("replayLedger: entry owner id did not resolve");
+            // First owner must be the seed (call B enters `seed_owner` directly).
+            if (k == 0 and owner != seed_owner)
+                @panic("replayLedger: first ledger owner is not the seed");
+            // `cum` is monotonic non-decreasing (the enclosing counter only grows).
+            if (e.cum < prev_cum)
+                @panic("replayLedger: ledger cum decreased");
+            // A forced yield can only be the LAST entry of a FULL ledger — an armed
+            // chain source that saw `ledger_len >= LEDGER_CAP` jumped to `shared_exit`
+            // instead of its successor, so nothing follows it AND the ledger is exactly
+            // at CAP (the append is bounds-guarded, so it never exceeds CAP).
+            if (e.outcome == .yielded and !(is_last and entries.len == irinterp.LEDGER_CAP))
+                @panic("replayLedger: forced-yield entry is not the last of a full ledger");
+            const local = e.cum - prev_cum;
+
+            // Static owner shape: a continuation ends in `.link`, an inner root in
+            // `.loop`. Used per-kind to reject a kind on the wrong owner shape.
+            const ends_link = owner.instrs.len != 0 and
+                owner.instrs[owner.instrs.len - 1].op == .link;
+            const ends_loop = owner.instrs.len != 0 and
+                owner.instrs[owner.instrs.len - 1].op == .loop;
+
+            // Classify STRICTLY by the static emit-site `kind` (never re-derive the
+            // materialization contract from the exit PC — an ordinary `.deopt` whose PC
+            // happens to follow a `for_loop` has a DIFFERENT resume contract than a
+            // `.loop_done_linked`, so kind is authoritative). Each arm validates its own
+            // static contract; any mismatch is a release-`@panic` rather than a silent
+            // mis-walk that could double-count an already-committed loop.
+            switch (e.kind) {
+                .link_terminal => {
+                    // A continuation reached its single-contract `.link` terminal.
+                    if (!(e.reason == .normal and ends_link and e.exit == owner.instrs.len - 1))
+                        @panic("replayLedger: link_terminal entry is not owner's .link");
+                    // One `native_link_exits` bump per `.link` marker — this replaces
+                    // BOTH the old per-fused-span bump and the standalone-`.link` bump.
+                    self.native_link_exits +|= 1;
+                    const owner_inner_pc: u32 = @intCast(owner.instrs[owner.instrs.len - 1].aux);
+                    if (is_last) {
+                        // Standalone `.link` (slot un-armed) OR a forced yield: the
+                        // continuation advanced the enclosing loop but no inner fused
+                        // here. Resume by running inner fresh at the PC `.link` names.
+                        resume_pc.* = owner_inner_pc;
+                        return .run_inner;
+                    }
+                    // Armed → dispatched into the linked inner root (entries[k+1]).
+                    // Validate the successor is that inner root; a fused id always
+                    // resolves (P-B bakes a live id, nothing retires mid-span). This is
+                    // the same strict "resolve by baked id + shape, never substitute
+                    // `findLoopTrace`'s pick" invariant the old scalar drain enforced.
+                    const succ = self.traceById(entries[k + 1].id) orelse
+                        @panic("replayLedger: fused successor id did not resolve");
+                    if (!isInnerLoopRoot(succ, proto, owner_inner_pc))
+                        @panic("replayLedger: fused successor is not the expected inner root");
+                    // Advance the link cursor; the `.link` marker itself takes no
+                    // `onSideExit` (only the bodies that commit iterations do).
+                    cont = owner;
+                    link_pc = owner_inner_pc;
+                },
+                .loop_done_linked => {
+                    // An inner root reached its numeric-`for` loop-done in LINKED
+                    // materialization: the final iteration's stores + phi snapshot are
+                    // committed, so regs are coherent at the continuation anchor. Owner
+                    // must be an inner root and the exit must be a loop-done guard.
+                    if (!(e.reason == .normal and ends_loop and isLoopDoneGuardIndex(owner, e.exit)))
+                        @panic("replayLedger: loop_done_linked entry is not a linked inner loop-done");
+                    // One more enclosing iteration committed natively. Account BEFORE
+                    // the re-run bound (Q1/Q2: never early-return mid-ledger).
+                    self.onSideExit(owner, if (local > 0) local else 1);
+                    linked_completed.* += 1;
+                    resume_pc.* = cont.anchor.pc;
+                    hops.* += 1;
+                    if (is_last) {
+                        // `I→C` NOT fused in this ledger (unarmed at this exit, or a
+                        // forced yield) → the burst may re-run the still-armed
+                        // continuation. The hop budget only declines THIS next re-run.
+                        if (hops.* >= max_hops) return .break_burst;
+                        return .run_continuation;
+                    }
+                    // `I→C` fused (2.3c-2e): the next entry is the continuation reached
+                    // via the loop-done→ordinary_entry arm. Validate the successor is a
+                    // `.link` continuation anchored at this inner's post-loop PC.
+                    const post_pc = guardExitPc(owner.instrs[e.exit]) orelse
+                        @panic("replayLedger: fused loop-done has no exit PC");
+                    const succ = self.traceById(entries[k + 1].id) orelse
+                        @panic("replayLedger: fused continuation id did not resolve");
+                    if (!(succ.inputs.len == 0 and succ.instrs.len != 0 and
+                        succ.instrs[succ.instrs.len - 1].op == .link and
+                        succ.anchor.proto == proto and succ.anchor.pc == post_pc))
+                        @panic("replayLedger: fused successor is not the expected continuation");
+                    cont = succ;
+                },
+                .deopt => {
+                    // The shared `deopt_exit` flush: an ordinary per-guard side exit.
+                    // Two modeled shapes at 2.3c-2c, BOTH terminal:
+                    //   (a) the seed continuation's OWN source-branch guard before it
+                    //       reached `.link` (owner ends `.link`) → the enclosing loop
+                    //       ended; resume at the running cursor.
+                    //   (b) an inner mid-loop body guard (owner ends `.loop`, exit NOT a
+                    //       loop-done guard) → regs coherent at the inner header.
+                    // A NON-last `.deopt` is a fused ordinary-guard→successor hop (the M1
+                    // `source-branch→ramp` shape). Its per-transition accounting is the
+                    // dispatcher's `fusedSourceBranchLinkSlot` steering, folded into this
+                    // drain only when the dispatcher itself captures (2.3c-2d). Until
+                    // then it is an unmodeled call-B grammar → loud release-panic (the
+                    // same hard-stop the old ≤2 drain took on any >2 ledger), never a
+                    // silent mis-walk.
+                    if (e.reason != .normal)
+                        @panic("replayLedger: .deopt entry has a non-normal reason");
+                    if (!is_last)
+                        @panic("replayLedger: fused .deopt→successor (M1 shape) not modeled until 2.3c-2d");
+                    // The exit must name an interior deopt-producing instruction on
+                    // `owner`. The set of ops that deopt is BROADER than `guardExitPc`'s
+                    // `guard_*`/`int_of_float` (it includes array-bounds / store-type
+                    // guards, etc.), so we validate the way the dispatcher does
+                    // (interp.zig:2708 trusts `exit_instr < instrs.len`) — by bounds —
+                    // and additionally exclude the `.link`/`.loop` TERMINATOR ops, which
+                    // are the successful-completion path and never a deopt source. This
+                    // rejects an out-of-range index and `exit == maxInt` (which belongs
+                    // to `.prologue_fail`) without over-rejecting a legitimate guard.
+                    if (e.exit >= owner.instrs.len)
+                        @panic("replayLedger: .deopt exit index out of range");
+                    const exit_op = owner.instrs[e.exit].op;
+                    if (exit_op == .link or exit_op == .loop)
+                        @panic("replayLedger: .deopt exit names a terminator, not a guard");
+                    if (ends_link) {
+                        // (a) continuation own guard — terminal.
+                        if (local > 0) {
+                            self.onSideExit(owner, local);
+                            return .{ .return_result = .{
+                                .completed = linked_completed.* + local,
+                                .resume_pc = resume_pc.*,
+                            } };
+                        }
+                        return .break_burst;
+                    }
+                    if (!ends_loop)
+                        @panic("replayLedger: .deopt owner is neither continuation nor inner root");
+                    // (b) inner body guard. An ordinary-materialization loop-done deopt
+                    // (exit PC after `for_loop`) has a DIFFERENT resume contract (tier-0
+                    // at the post-loop PC, final iteration uncommitted) and cannot occur
+                    // in a linked call-B fusion (the inner is entered at `linked_entry`,
+                    // so its loop-done materializes `.loop_done_linked`). Reject it loudly
+                    // rather than mis-resume at the inner header (which would re-run the
+                    // whole inner loop).
+                    if (isLoopDoneGuardIndex(owner, e.exit))
+                        @panic("replayLedger: ordinary-mode inner loop-done in a linked fusion is unmodeled");
+                    self.onSideExit(owner, local);
+                    return .{ .return_result = .{
+                        .completed = if (linked_completed.* > 0) linked_completed.* else local,
+                        .resume_pc = link_pc,
+                    } };
+                },
+                .prologue_fail => {
+                    // A hoisted entry-type guard failed pre-commit: `exit = -1`,
+                    // `reason = .prologue_fail`, `outcome = .normal`, and — because the
+                    // guard fails BEFORE any `.loop` back-edge — the cumulative counter
+                    // is unchanged across this segment, so `local == 0`. Always terminal
+                    // (never a chain source) and never a forced yield. A nonzero `local`
+                    // would contradict "no iteration committed": release-panic rather
+                    // than silently charge phantom progress.
+                    if (!(e.reason == .prologue_fail and e.exit == std.math.maxInt(u32) and
+                        e.outcome == .normal and local == 0))
+                        @panic("replayLedger: prologue_fail entry violates its static contract");
+                    if (!is_last)
+                        @panic("replayLedger: prologue_fail is terminal but not last");
+                    if (ends_link) {
+                        // Seed continuation prologue-fail (local == 0): nothing committed
+                        // here → break the burst (matches old scalar `c_local == 0 →
+                        // break_burst`).
+                        return .break_burst;
+                    }
+                    if (!ends_loop)
+                        @panic("replayLedger: prologue_fail owner is neither continuation nor inner root");
+                    // Inner prologue-fail (local == 0): matches the old `fdone == false`
+                    // mid-loop path — record the zero-progress side exit and resume
+                    // tier-0 at the inner header, carrying any earlier chain progress.
+                    self.onSideExit(owner, 0);
+                    return .{ .return_result = .{
+                        .completed = if (linked_completed.* > 0) linked_completed.* else 0,
+                        .resume_pc = link_pc,
+                    } };
+                },
             }
-            return .break_burst;
+            prev_cum = e.cum;
         }
-        // `C.link` marker: the continuation advanced the enclosing loop and (if the
-        // slot is armed) handed to inner. Charge `native_link_exits` here — this one
-        // bump replaces BOTH the old per-fused-span bump and the standalone-`.link`
-        // bump (byte-identical count; see doc 17 2.3c-2b).
-        self.native_link_exits +|= 1;
-        if (entries.len == 1) {
-            // Standalone `.link` (slot un-armed): resume by running inner fresh.
-            resume_pc.* = inner_pc;
-            return .run_inner;
-        }
-        // Fused inner (entries[1]). Resolve STRICTLY by baked id + shape, exactly as
-        // the old scalar drain — never substitute `findLoopTrace`'s current pick.
-        const e1 = entries[1];
-        const dinner = self.traceById(e1.id) orelse
-            @panic("replayContinuationLedger: fused inner id did not resolve");
-        if (!isInnerLoopRoot(dinner, proto, inner_pc))
-            @panic("replayContinuationLedger: fused inner is not the expected inner root");
-        // Per-segment local of entry 1 = `cum[1] − cum[0]` (== old `local_completed`).
-        const flocal = e1.cum -% e0.cum;
-        // Loop-done ⟺ the inner exit PC follows a `for_loop` (the static
-        // discriminator; prologue-fail / array-guard / not-after-`for_loop` default
-        // false, exactly as the scalar drain at the old lines 1748-1754).
-        const fdone = if (e1.reason == .prologue_fail or e1.exit == std.math.maxInt(u32))
-            false
-        else if (guardExitPc(dinner.instrs[e1.exit])) |fpc|
-            fpc >= 1 and proto.code[fpc - 1].op == .for_loop
-        else
-            false;
-        if (!fdone) {
-            // Mid-loop inner deopt: regs coherent at the inner header → resume tier-0
-            // at `inner_pc`. (`linked_completed` is ≥1 here — this burst already
-            // committed the hop that armed.)
-            self.onSideExit(dinner, flocal);
-            return .{ .return_result = .{
-                .completed = if (linked_completed.* > 0) linked_completed.* else flocal,
-                .resume_pc = inner_pc,
-            } };
-        }
-        // Inner loop-done: one more enclosing iteration committed natively; coherent
-        // state is post-inner at the continuation's anchor.
-        self.onSideExit(dinner, if (flocal > 0) flocal else 1);
-        linked_completed.* += 1;
-        resume_pc.* = current_link.anchor.pc;
-        hops.* += 1;
-        if (hops.* >= max_hops) return .break_burst;
-        return .run_continuation;
+        // Every entry is either terminal (returns above) or a validated chain source
+        // whose successor is the next entry — so the loop always returns before it
+        // runs out of entries. Reaching here means the LAST entry was a chain source
+        // with no successor, i.e. an unmodeled grammar.
+        @panic("replayLedger: ledger ended on a chain source with no terminal");
     }
 
     pub fn runLinkedBurst(
@@ -1838,7 +1995,7 @@ pub const TraceState = struct {
             if (tier == .native_only) {
                 var cresult = snt.runCapturingLedger(regs, &self.ledger_scratch);
                 while (true) {
-                    switch (self.replayContinuationLedger(
+                    switch (self.replayLedger(
                         self.ledger_scratch[0..cresult.ledger_len],
                         current_link,
                         inner_pc,
