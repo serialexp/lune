@@ -720,6 +720,19 @@ pub const CompiledTrace = struct {
         return self.runWithLinkedLoopDone(regs, false, ledger_out);
     }
 
+    /// 2.3c-2d (D1): the LINKED-mode counterpart of `runCapturingLedger`. Call A
+    /// (`runLinkedBurst`'s first inner drive, trace.zig) needs the chain-consumed
+    /// loop-done materialization (`linked_loop_done = 1`: the final inner iteration's
+    /// post-guard stores + phi snapshot are committed so regs are coherent at the
+    /// continuation anchor) AND the per-transition ledger. A literal `runCapturingLedger`
+    /// swap would flip the mode to ordinary (0) and leave the final iteration for tier-0
+    /// replay, corrupting the coherent resume — so capture MUST preserve the mode. Same
+    /// borrow contract as `runCapturingLedger`: `ledger_out` holds `LEDGER_CAP` entries
+    /// and is consumed immediately, with no intervening native call.
+    pub fn runLinkedLoopDoneCapturing(self: CompiledTrace, regs: RegWindow, ledger_out: []irinterp.LedgerEntry) irinterp.ExecResult {
+        return self.runWithLinkedLoopDone(regs, true, ledger_out);
+    }
+
     fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool, ledger_out: ?[]irinterp.LedgerEntry) irinterp.ExecResult {
         var result = NativeResult{
             .completed = 0,

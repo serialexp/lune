@@ -1497,14 +1497,21 @@ pub const TraceState = struct {
     const LedgerReplay = union(enum) {
         /// The last entry was an inner loop-done that materialized LINKED and whose
         /// `I→C` edge is NOT fused in THIS ledger (unarmed at that exit, or a forced
-        /// yield), and the hop budget remains → re-run the (still-armed) continuation
-        /// for the next fused span. `resume_pc` set to the continuation anchor.
-        run_continuation,
+        /// yield), and the hop budget remains → re-run the carried continuation for the
+        /// next fused span. `resume_pc` set to the continuation anchor (= the loop-done
+        /// guard's post-loop PC). 2.3c-2d (P1a): carries the EXACT continuation to run
+        /// (`cont`), so a `C1 → I → C2` sibling-continuation transition re-runs `C2`,
+        /// not the seed — the caller must `nativeFor()` this trace, never reuse the old
+        /// `snt`.
+        run_continuation: *Trace,
         /// The last entry was a `.link` terminal whose slot is un-armed (standalone
         /// `.link`) or force-yielded: the continuation advanced the enclosing loop but
         /// no inner fused → resume by running inner fresh next hop (`continue :hop`).
-        /// `resume_pc` set to the inner-root PC that `.link` names.
-        run_inner,
+        /// `resume_pc` set to the inner-root PC that `.link` names. 2.3c-2d (P1a):
+        /// carries the `.link` DRIVER (the continuation whose `.link.aux` names the
+        /// inner); the caller sets `current_link` to it and lets the hop top re-resolve
+        /// the inner from `.link.aux`, preserving sibling-selection.
+        run_inner_from: *Trace,
         /// Yield / finish: return this `ChainResult` to the dispatcher.
         return_result: ChainResult,
         /// Zero-progress continuation deopt (its own guard, no completion), or the hop
@@ -1512,6 +1519,17 @@ pub const TraceState = struct {
         /// penalty-neutral post-loop tail.
         break_burst,
     };
+
+    /// 2.3c-2d: which native-entry site seeded the ledger being replayed. Governs the
+    /// ONE origin-dependent decision in `replayLedger`: whether the FIRST entry consumes
+    /// a re-run hop. A `continuation_call` (call B) seed is a continuation whose first
+    /// entry is its own `.link`/guard and every inner loop-done consumes a hop. An
+    /// `inner_call` (call A) seed is an inner root whose FIRST entry is its loop-done —
+    /// that completion is the "free" first hop the native burst-bound note already
+    /// grants (it increments `linked_completed` without a hop), so it must NOT consume
+    /// the re-run cursor, else a trailing `run_inner_from → continue :hop` double-counts
+    /// `hops`. `dispatcher_root` (2.3c-2d D2) is the dispatcher's direct native entry.
+    const ReplayOrigin = enum { continuation_call, inner_call, dispatcher_root };
 
     /// 2.3c-2c: the single authoritative drain of ONE native call's per-transition
     /// ledger. A fused native span (`C→I→C→…` chained under the shared frame) returns
@@ -1554,6 +1572,7 @@ pub const TraceState = struct {
         resume_pc: *u32,
         hops: *usize,
         max_hops: usize,
+        origin: ReplayOrigin,
     ) LedgerReplay {
         // `ledger_len` is always ≥1 (every native exit appends exactly once) and ≤CAP
         // (the append is bounds-guarded; the forced-yield cap keeps a closed cycle
@@ -1621,8 +1640,11 @@ pub const TraceState = struct {
                         // Standalone `.link` (slot un-armed) OR a forced yield: the
                         // continuation advanced the enclosing loop but no inner fused
                         // here. Resume by running inner fresh at the PC `.link` names.
+                        // P1a: carry the `.link` DRIVER (this owner) so the caller sets
+                        // `current_link` to it and the hop top re-resolves the inner from
+                        // `.link.aux` — preserving sibling-selection.
                         resume_pc.* = owner_inner_pc;
-                        return .run_inner;
+                        return .{ .run_inner_from = owner };
                     }
                     // Armed → dispatched into the linked inner root (entries[k+1]).
                     // Validate the successor is that inner root; a fused id always
@@ -1645,24 +1667,36 @@ pub const TraceState = struct {
                     // must be an inner root and the exit must be a loop-done guard.
                     if (!(e.reason == .normal and ends_loop and isLoopDoneGuardIndex(owner, e.exit)))
                         @panic("replayLedger: loop_done_linked entry is not a linked inner loop-done");
+                    // The loop-done guard's post-loop PC: where regs are coherent after
+                    // the final iteration committed LINKED. Compute BEFORE accounting so
+                    // the resume is always the continuation anchor (P1a fix: an inner-seed
+                    // `[I.loop_done_linked, …]` where `cont` still == the seed `I` would
+                    // otherwise resume at `I.anchor.pc`, wrong; `post_pc` == the following
+                    // continuation's anchor in every modeled shape).
+                    const post_pc = guardExitPc(owner.instrs[e.exit]) orelse
+                        @panic("replayLedger: fused loop-done has no exit PC");
                     // One more enclosing iteration committed natively. Account BEFORE
                     // the re-run bound (Q1/Q2: never early-return mid-ledger).
                     self.onSideExit(owner, if (local > 0) local else 1);
                     linked_completed.* += 1;
-                    resume_pc.* = cont.anchor.pc;
-                    hops.* += 1;
+                    resume_pc.* = post_pc;
+                    // A `.inner_call` seed's FIRST entry is its own loop-done — that
+                    // completion is the "free" first hop the native burst-bound already
+                    // grants (it bumps `linked_completed` without a hop). It must NOT
+                    // consume the re-run cursor, else a trailing `run_inner_from →
+                    // continue :hop` double-increments `hops` (codex D1 ruling).
+                    const first_inner = (origin == .inner_call and k == 0);
+                    if (!first_inner) hops.* += 1;
                     if (is_last) {
                         // `I→C` NOT fused in this ledger (unarmed at this exit, or a
                         // forced yield) → the burst may re-run the still-armed
                         // continuation. The hop budget only declines THIS next re-run.
                         if (hops.* >= max_hops) return .break_burst;
-                        return .run_continuation;
+                        return .{ .run_continuation = cont };
                     }
                     // `I→C` fused (2.3c-2e): the next entry is the continuation reached
                     // via the loop-done→ordinary_entry arm. Validate the successor is a
                     // `.link` continuation anchored at this inner's post-loop PC.
-                    const post_pc = guardExitPc(owner.instrs[e.exit]) orelse
-                        @panic("replayLedger: fused loop-done has no exit PC");
                     const succ = self.traceById(entries[k + 1].id) orelse
                         @panic("replayLedger: fused continuation id did not resolve");
                     if (!(succ.inputs.len == 0 and succ.instrs.len != 0 and
@@ -1872,7 +1906,21 @@ pub const TraceState = struct {
                 fused_inner = null;
             } else if (tier == .native_only) {
                 const int_native = self.nativeFor(inner) orelse break;
-                iresult = int_native.runLinkedLoopDone(regs);
+                // 2.3c-2d (D1): capture the per-transition ledger in LINKED mode (the
+                // linked counterpart of call B's `runCapturingLedger` — a literal
+                // `runCapturingLedger` swap would flip mode 1→0 and stop committing the
+                // final inner iteration, corrupting coherent resume). Pre-2.3c-2e the
+                // inner root's loop-done slot is NEVER armed, so `I` cannot fuse forward
+                // and this always does exactly ONE exit ⇒ `ledger_len == 1`; the scalar
+                // path below is then byte-identical to the old `runLinkedLoopDone`. A
+                // `ledger_len > 1` here means `I→C` fused (2.3c-2e armed it): the ledger
+                // holds the whole `[I.done, C.link, …]` span and the scalar path can no
+                // longer classify the terminal body. Draining that span is wired in D2b
+                // (the factored burst core) — dormant/unreachable until then, so a
+                // release-panic guards the invariant rather than silently mis-walking.
+                iresult = int_native.runLinkedLoopDoneCapturing(regs, &self.ledger_scratch);
+                if (iresult.ledger_len > 1)
+                    @panic("driveChain: fused call-A ledger (I→C armed) not drained until 2.3c-2d D2b");
             } else {
                 ibuf = self.valuesScratch(inner.instrs.len) catch break;
                 iresult = irinterp.execute(inner, regs, ibuf);
@@ -2004,11 +2052,25 @@ pub const TraceState = struct {
                         &resume_pc,
                         &hops,
                         max_hops,
+                        .continuation_call,
                     )) {
-                        // Re-run the still-armed continuation for the next fused span.
-                        .run_continuation => cresult = snt.runCapturingLedger(regs, &self.ledger_scratch),
-                        // Standalone `.link`: resume inner fresh next hop.
-                        .run_inner => continue :hop,
+                        // Re-run the carried continuation for the next fused span.
+                        // P1a: re-resolve its native compilation (a `C1 → I → C2`
+                        // sibling swap makes `c != current_link`); never reuse the old
+                        // `snt`. On the same-C nsieve cycle `c == current_link` and
+                        // `nativeFor(c) == snt`, so this is byte-identical.
+                        .run_continuation => |c| {
+                            current_link = c;
+                            snt = self.nativeFor(c) orelse break :hop;
+                            cresult = snt.runCapturingLedger(regs, &self.ledger_scratch);
+                        },
+                        // Standalone `.link`: carry the `.link` DRIVER as the running
+                        // link cursor and resume inner fresh next hop (the hop top
+                        // re-resolves the inner from its `.link.aux`).
+                        .run_inner_from => |d| {
+                            current_link = d;
+                            continue :hop;
+                        },
                         .return_result => |cr| return cr,
                         // Hop budget / zero-progress deopt → penalty-neutral tail.
                         .break_burst => break :hop,
