@@ -1,6 +1,49 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
-## Status 2026-07-13 (latest) — 2.3c-2b native call-B drain rerouted through ledger replay LANDED (green, byte-identical)
+## Status 2026-07-14 (latest) — 2.3c-2d D1 + D2a LANDED (green, byte-identical); D2b NEXT (the LIVE M1 fold)
+
+Progress on task #62 (2c-D, "capture everywhere"). Landed since 2c-C:
+
+- **2c-B forced-yield cap** (#64, committed): chain-source exit sites reload `ledger_len` after
+  the append and `jmp shared_exit` (stamping the terminal `.yielded`) at CAP, bounding a closed
+  cycle to ≤CAP entries per trampoline entry. Byte-identical/inert pre-cycle.
+- **2c-C generic replayLedger** (#61, commit 0aac370): four per-kind validated arms
+  (`.link_terminal` / `.loop_done_linked` / `.deopt` / `.prologue_fail`), each release-`@panic`s
+  on a contract mismatch. Call B (`runLinkedBurst` continuation drain) rerouted through it; the
+  `.deopt` NON-last (M1) arm still panics "not modeled until 2.3c-2d".
+- **2c-D D1** (commit 7f3cac2): `nativegen.runLinkedLoopDoneCapturing` (LINKED-mode counterpart
+  of `runCapturingLedger` — a literal swap flips mode 1→0 and corrupts coherent resume). P1a:
+  `run_continuation`/`run_inner_from` now carry the exact `*Trace` (continuation `cont`, resp.
+  `.link` driver) so a `C1→I→C2` sibling swap re-runs C2, caller `nativeFor()`s the carried
+  trace. `ReplayOrigin` + cursor fix: `.loop_done_linked` computes `post_pc` before accounting
+  and always resumes there; an `.inner_call` seed's first loop-done does NOT consume a re-run hop
+  (else a trailing `run_inner_from→continue :hop` double-increments `hops`). Call A routed through
+  the capturing wrapper; `ledger_len>1` (fused I→C, 2c-E only) release-panic-guarded until D2b.
+- **2c-D D2a** (commit dcacf7d): dispatcher native entry routed through the capturing wrappers
+  (preserving `ran_native_link_mode`), while RETAINING the existing scalar/M1 consumer. Inert:
+  scalar `result` unchanged pre-cycle, consumer reads only scalar fields, `ledger_scratch` fill
+  unread until D2b.
+
+**Verify (D1+D2a):** `just test` green; nsieve/fannkuch/nbody/spectral-norm stdout byte-identical
+across tier-0 / tier-1a / native.
+
+**NEXT — 2c-D D2b (the LIVE one):** activate `ledger_len>1` replay seeded at `ct` in the
+dispatcher; FOLD the M1 fused-`.link` consumer (`fusedSourceBranchLinkSlot`, interp.zig:2717-2773)
+into replayLedger's `.deopt` NON-last arm; factor a burst CORE so a replayed M1 terminal
+`run_inner_from(ramp)` continues the ping-pong from already-accounted state; remove the old
+consumer. This is NOT inert — it changes the live `ledger_len==2` M1 path (`[skip.deopt,
+ramp.link]` continue-burst AND `[skip.deopt, ramp.deopt/prologue]` resume-at-`ct.anchor.pc`), so
+it must be proven byte-identical against the current consumer. Two M1 sub-shapes to preserve:
+sub-case (a) ramp reached `.link` → continue burst; sub-case (b) ramp deopted pre-`.link` →
+`onSideExit(ct,skip_local); onSideExit(ramp,0); resume ct.anchor.pc` (NOT the generic `.deopt`
+`link_pc`). Most-likely regression (codex): treating a replayed M1 terminal link as a FRESH
+`runLinkedBurst` entry (resets `linked_completed`/`hops`, double `native_link_exits`). Get codex
+gpt-5.6-sol to review the concrete D2b design before writing it. Then 2c-E (arm I→C persistently)
++ 2c-F (disarm load-bearing test + docs + full-diff review).
+
+---
+
+## Status 2026-07-13 (prev) — 2.3c-2b native call-B drain rerouted through ledger replay LANDED (green, byte-identical)
 
 Second sub-step of 2.3c-2 (task #56), per Bart's "Ok, 2b next :)". Reroute ONLY the native
 continuation drain (call B) of `runLinkedBurst` through the 2.3c-2a ledger; call A (hop-top
