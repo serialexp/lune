@@ -737,8 +737,8 @@ table.replay-vars td {
   padding: 0.2rem 0.75rem 0.2rem 0;
   vertical-align: top;
 }
-.cov-num-h,
-.cov-num {
+.coverage-table th.cov-num-h,
+.coverage-table td.cov-num {
   text-align: right;
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   white-space: nowrap;
