@@ -76,7 +76,7 @@ export default function CoveragePanel() {
                 <tr>
                   <th>class</th>
                   <th class="cov-num-h">iterations</th>
-                  <th class="cov-num-h">time <span class="muted">(of run)</span></th>
+                  <th class="cov-num-h">time <span class="muted">(cycles, of run)</span></th>
                 </tr>
               </thead>
               <tbody>
