@@ -1020,7 +1020,7 @@ pub const Vm = struct {
         const cov_run_start = if (self.trace.config.coverage) trace.readCycles() else 0;
         if (self.trace.config.coverage) self.trace.last_event_tsc = cov_run_start;
         defer if (self.trace.config.coverage) {
-            self.trace.run_cycles +|= trace.readCycles() -% cov_run_start;
+            self.trace.run_cycles +|= trace.cycleDelta(trace.readCycles(), cov_run_start);
         };
         self.beginTopLevelEpoch();
         self.seedProtoIds(proto);
@@ -2467,7 +2467,7 @@ pub const Vm = struct {
                 // tier-0 redoes on side-exit), so there is no double count.
                 if (self.trace.config.coverage) {
                     const now = trace.readCycles();
-                    self.trace.noteInterpIter(proto, anchor_pc, now -% self.trace.last_event_tsc);
+                    self.trace.noteInterpIter(proto, anchor_pc, trace.cycleDelta(now, self.trace.last_event_tsc));
                     self.trace.last_event_tsc = now;
                 }
                 // Cheap direct-mapped hot-count pre-filter. A gated/dead loop (the
@@ -2617,7 +2617,7 @@ pub const Vm = struct {
                                 const cov_ts0 = if (self.trace.config.coverage) trace.readCycles() else 0;
                                 defer if (self.trace.config.coverage) {
                                     const cov_end = trace.readCycles();
-                                    self.trace.noteTracedCycles(.{ .proto = proto, .pc = anchor_pc }, cov_end -% cov_ts0);
+                                    self.trace.noteTracedCycles(.{ .proto = proto, .pc = anchor_pc }, trace.cycleDelta(cov_end, cov_ts0));
                                     self.trace.last_event_tsc = cov_end;
                                 };
                                 var ran_native = false;

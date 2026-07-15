@@ -839,12 +839,17 @@ pub const TraceConfig = struct {
     /// only — stderr, never program output.
     debug_log: bool = false,
     /// Runtime gate for JIT execution-coverage accounting (native-vs-tier-0 loop
-    /// iterations, per anchor). Off by default (the back-edge hot path pays only
-    /// one already-predicted branch); the CLI `--jit-stats`/`--time` flags set it,
-    /// and the WASM entry forces it on (the viz always instruments). When on, each
-    /// interpreted back-edge is classified (covered/uncovered via `findTrace`) and
-    /// native runs add their committed iteration count. Diagnostic only — never
-    /// affects tiering or output; the report goes to stderr.
+    /// iterations + TSC time, per anchor). Off by default; when off the added cost is
+    /// a handful of predictable, well-predicted branches (at the back-edge, trace-exec
+    /// entry/exit, and each `onSideExit`) that skip all the counting — no map op,
+    /// counter, or `rdtsc` runs. Set by the CLI `--jit-coverage`/`--jit-stats` flags
+    /// (NOT `--time`, which stays uninstrumented so its timing is clean) and forced on
+    /// by the WASM entry (the viz always instruments). When on, each interpreted
+    /// back-edge is classified covered/uncovered via the per-anchor `has_trace` flag
+    /// (O(1), no `findTrace` scan) and charged its cycles, and trace runs add their
+    /// committed iteration count + bracketed cycles. Diagnostic only — never affects
+    /// tiering, hot-counts, gating, snapshots, replay, or output; the report and the
+    /// nondeterministic TSC values go only to stderr.
     coverage: bool = false,
 };
 
@@ -894,13 +899,17 @@ pub const NativeLink = struct { parent: *Trace, slot_index: u32, child: *Trace }
 /// `*_cycles` are the TSC (`readCycles`) time attribution, so the report can weigh
 /// iterations by cost — a traced iteration is ~10-20× cheaper than a tier-0 one, so
 /// iteration% badly overstates JIT effectiveness. `traced_cycles` = cycles inside
-/// trace runs entered at this anchor (bracketed around the dispatcher's trace-exec
-/// region — exact for this anchor). `interp_cycles` = cycles of the tier-0 body
-/// iterations charged at this anchor's back-edge. NB: `interp_cycles` is *self time*
-/// for an innermost loop but leaks the outer-body-head into the innermost loop at a
-/// nesting boundary (one small span per outer iteration) — good enough for a
-/// diagnostic, and the aggregate split (`TraceState.cycles_*`) stays exact. Zero on
-/// non-x86_64 (no TSC).
+/// the trace-exec region entered at this anchor's back-edge. NB: this charges the
+/// WHOLE region to the *entry* anchor — including any `driveChain` chaining or fused
+/// hop into inner/continuation traces at other anchors, which get their *iterations*
+/// (via each hop's `onSideExit`) but not their *cycles*. It also includes the tail
+/// of dispatcher accounting inside the `|buf|` scope. So per-anchor `traced_cycles`
+/// is "time spent under traces entered here", not strictly this anchor's compiled
+/// code. `interp_cycles` = cycles of the tier-0 body iterations charged at this
+/// anchor's back-edge — *self time* for an innermost loop, but it leaks the
+/// outer-body-head into the innermost loop at a nesting boundary (one small span per
+/// outer iteration). Both are approximate per anchor; only the aggregate split
+/// (`TraceState.cycles_*` vs `run_cycles`) is exact. Zero on non-x86_64 (no TSC).
 pub const AnchorCoverage = struct {
     traced: u64 = 0,
     interp: u64 = 0,
@@ -926,6 +935,17 @@ pub inline fn readCycles() u64 {
           [hi] "={edx}" (hi),
     );
     return (@as(u64, hi) << 32) | @as(u64, lo);
+}
+
+/// Cycle delta `now - prev`, clamped to 0 when `now < prev`. `rdtsc` is not
+/// serializing and, across a core/vCPU migration on a non-invariant-TSC box, a
+/// later read can come back *smaller* than an earlier one. A raw wrapping subtract
+/// would then yield a delta near `maxInt(u64)` and, through the saturating adds,
+/// permanently pin the cycle totals near the maximum — corrupting the whole report.
+/// Dropping the odd backward span to 0 keeps the diagnostic robust (at worst a
+/// single mis-measured span is lost, not the entire run).
+pub inline fn cycleDelta(now: u64, prev: u64) u64 {
+    return if (now > prev) now - prev else 0;
 }
 
 /// All recorder state owned by a `Vm`: the hotness counters, the cache of
@@ -1088,19 +1108,27 @@ pub const TraceState = struct {
     /// **Cycle (time) attribution** for the same three classes, via `readCycles`
     /// (x86_64 TSC; 0 elsewhere). Iteration counts flatter the JIT — a traced
     /// iteration is ~10-20× cheaper than a tier-0 one — so these weigh each class by
-    /// actual cost. `cycles_traced` = cycles spent inside trace runs (bracketed
-    /// around the dispatcher's trace-exec region); `cycles_tier0_covered` /
+    /// actual cost. `cycles_traced` = cycles inside the dispatcher's trace-exec
+    /// bracket (native/tier-1a run + chaining); `cycles_tier0_covered` /
     /// `cycles_tier0_uncovered` = cycles of tier-0 body iterations charged at their
-    /// back-edge, split by whether a trace exists at the anchor. These three plus
-    /// `cycles_other` (straight-line / non-loop code, = `run_cycles` minus the three)
-    /// partition the run. All exact in aggregate; the per-anchor split has a small
-    /// nesting-boundary leak (see `AnchorCoverage`).
+    /// back-edge, split by whether a trace exists at the anchor. The report's
+    /// `cycles_other` is the residual `run_cycles - (the three)`: it is genuinely
+    /// non-loop straight-line code PLUS the small per-trace-entry work that falls
+    /// between a back-edge stamp and the trace bracket (trace lookup, fingerprint,
+    /// input seeding) — a slop term, not pure non-loop time. The three classes are
+    /// disjoint and, being sub-intervals of the run bracket, sum to ≤ `run_cycles`,
+    /// so the partition with `cycles_other` holds; only the class *labels* carry the
+    /// documented slop, and the per-anchor split additionally has a nesting-boundary
+    /// leak (see `AnchorCoverage`). Backward-TSC spans are dropped to 0 (`cycleDelta`).
     cycles_traced: u64 = 0,
     cycles_tier0_covered: u64 = 0,
     cycles_tier0_uncovered: u64 = 0,
-    /// Total run cycles (TSC), stamped by the CLI/host around the whole `vm.run`
-    /// (0 if never set, e.g. coverage off or non-x86_64). The denominator for the
-    /// time-based percentages; `cycles_other = run_cycles - traced - tier0_*`.
+    /// Total run cycles (TSC), stamped around the whole `Vm.run` (0 if never set:
+    /// coverage off, non-x86_64, or a run driven via the `start()`/`exec()` resume
+    /// path, which is NOT instrumented — coverage timing assumes the one-shot `run()`
+    /// entry the CLI uses). The denominator for the time-based percentages;
+    /// `cycles_other = run_cycles - traced - tier0_*`. When 0 the report shows time
+    /// as n/a rather than dividing by zero.
     run_cycles: u64 = 0,
     /// TSC of the last coverage "event" (back-edge hook, or trace-region exit) — the
     /// start of the current tier-0 span. `noteInterpIter` charges `now - last_event_tsc`
@@ -3355,6 +3383,15 @@ pub const TraceState = struct {
                 // value←i64←i32←i16←i8 / boolean / f64 times before it stabilises.
                 if (self.countTracesAt(anchor) == 0) {
                     if (self.counters.getPtr(anchor)) |cnt| cnt.* = 0;
+                    // Coverage (gated): the anchor no longer has a trace, so tier-0
+                    // back-edges taken during the re-recording window must classify
+                    // as *uncovered* again, not "fallback despite a trace". Clear the
+                    // flag; `markAnchorTraced`/`noteTraceIters` re-set it if a fresh
+                    // trace commits here. (Total iteration count is unaffected either
+                    // way — only the covered/uncovered split.)
+                    if (self.config.coverage) {
+                        if (self.coverage.getPtr(anchor)) |cov| cov.has_trace = false;
+                    }
                 }
                 return;
             }
@@ -5526,6 +5563,10 @@ fn pctOf(x: u64, total: u64) f64 {
 /// (time) attribution so the table can weigh loops by cost, not just count.
 const CoverageRow = struct {
     name: []const u8,
+    /// Stable serialization id of the anchor's proto — the sort tiebreak, so two
+    /// distinct protos that share a name (and pc) still order deterministically
+    /// (a `Proto` pointer would order by ASLR-dependent address).
+    proto_id: u32,
     pc: u32,
     traced: u64,
     interp: u64,
@@ -5610,8 +5651,11 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         try w.writeAll("  coverage by time: n/a (no TSC on this target)\n");
     }
 
-    // Per-anchor table, sorted (proto name, pc) for reproducibility. Fixed buffer:
-    // real programs have a handful of hot loops; note if it ever overflows.
+    // Per-anchor table, sorted (proto name, pc, proto id) for reproducibility. Fixed
+    // buffer: real programs have a handful of hot loops, so it never fills. If it
+    // ever DID overflow, the kept subset is the first 256 in hash-map order (which is
+    // layout-dependent) — only then is *which* rows survive nondeterministic; the
+    // shown rows are always sorted. A `truncated` note flags the (unrealistic) case.
     var rows: [256]CoverageRow = undefined;
     var n: usize = 0;
     var truncated = false;
@@ -5623,6 +5667,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         }
         rows[n] = .{
             .name = e.key_ptr.proto.name,
+            .proto_id = e.key_ptr.proto.id,
             .pc = e.key_ptr.pc,
             .traced = e.value_ptr.traced,
             .interp = e.value_ptr.interp,
@@ -5635,7 +5680,8 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         fn lt(_: void, a: CoverageRow, b: CoverageRow) bool {
             const c = std.mem.order(u8, a.name, b.name);
             if (c != .eq) return c == .lt;
-            return a.pc < b.pc;
+            if (a.pc != b.pc) return a.pc < b.pc;
+            return a.proto_id < b.proto_id;
         }
     }.lt);
     if (n > 0) {
