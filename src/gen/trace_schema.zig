@@ -1245,3 +1245,185 @@ pub const ExecLogFile = struct {
         return result;
     }
 };
+
+pub const JitCounters = struct {
+    entries: u64,
+    native_link_arms: u64,
+    native_source_link_arms: u64,
+    native_loopdone_link_arms: u64,
+    native_source_link_fused: u64,
+    native_loopdone_link_fused: u64,
+    native_link_disarms: u64,
+    native_link_exits: u64,
+    native_link_follow_count: u64,
+    link_ir_exits: u64,
+    link_follow_count: u64,
+    prime_side_arms: u64,
+    prime_side_chain_follows: u64,
+    tier0_outer_body_entries: u64,
+
+    pub fn encode(self: JitCounters, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: JitCounters, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        _ = ctx;
+        try enc.writeUint64(self.entries, .little_endian);
+        try enc.writeUint64(self.native_link_arms, .little_endian);
+        try enc.writeUint64(self.native_source_link_arms, .little_endian);
+        try enc.writeUint64(self.native_loopdone_link_arms, .little_endian);
+        try enc.writeUint64(self.native_source_link_fused, .little_endian);
+        try enc.writeUint64(self.native_loopdone_link_fused, .little_endian);
+        try enc.writeUint64(self.native_link_disarms, .little_endian);
+        try enc.writeUint64(self.native_link_exits, .little_endian);
+        try enc.writeUint64(self.native_link_follow_count, .little_endian);
+        try enc.writeUint64(self.link_ir_exits, .little_endian);
+        try enc.writeUint64(self.link_follow_count, .little_endian);
+        try enc.writeUint64(self.prime_side_arms, .little_endian);
+        try enc.writeUint64(self.prime_side_chain_follows, .little_endian);
+        try enc.writeUint64(self.tier0_outer_body_entries, .little_endian);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!JitCounters {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!JitCounters {
+        _ = allocator;
+        _ = root;
+        var result: JitCounters = undefined;
+        result.entries = try dec.readUint64(.little_endian);
+        result.native_link_arms = try dec.readUint64(.little_endian);
+        result.native_source_link_arms = try dec.readUint64(.little_endian);
+        result.native_loopdone_link_arms = try dec.readUint64(.little_endian);
+        result.native_source_link_fused = try dec.readUint64(.little_endian);
+        result.native_loopdone_link_fused = try dec.readUint64(.little_endian);
+        result.native_link_disarms = try dec.readUint64(.little_endian);
+        result.native_link_exits = try dec.readUint64(.little_endian);
+        result.native_link_follow_count = try dec.readUint64(.little_endian);
+        result.link_ir_exits = try dec.readUint64(.little_endian);
+        result.link_follow_count = try dec.readUint64(.little_endian);
+        result.prime_side_arms = try dec.readUint64(.little_endian);
+        result.prime_side_chain_follows = try dec.readUint64(.little_endian);
+        result.tier0_outer_body_entries = try dec.readUint64(.little_endian);
+        return result;
+    }
+};
+
+pub const CoverageAnchor = struct {
+    proto_id: u32,
+    pc: u32,
+    traced_iters: u64,
+    interp_iters: u64,
+    traced_cycles: u64,
+    interp_cycles: u64,
+    has_trace: u8,
+
+    pub fn encode(self: CoverageAnchor, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: CoverageAnchor, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        _ = ctx;
+        try enc.writeUint32(self.proto_id, .little_endian);
+        try enc.writeUint32(self.pc, .little_endian);
+        try enc.writeUint64(self.traced_iters, .little_endian);
+        try enc.writeUint64(self.interp_iters, .little_endian);
+        try enc.writeUint64(self.traced_cycles, .little_endian);
+        try enc.writeUint64(self.interp_cycles, .little_endian);
+        try enc.writeUint8(self.has_trace);
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!CoverageAnchor {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!CoverageAnchor {
+        _ = allocator;
+        _ = root;
+        var result: CoverageAnchor = undefined;
+        result.proto_id = try dec.readUint32(.little_endian);
+        result.pc = try dec.readUint32(.little_endian);
+        result.traced_iters = try dec.readUint64(.little_endian);
+        result.interp_iters = try dec.readUint64(.little_endian);
+        result.traced_cycles = try dec.readUint64(.little_endian);
+        result.interp_cycles = try dec.readUint64(.little_endian);
+        result.has_trace = try dec.readUint8();
+        return result;
+    }
+};
+
+pub const CoverageFile = struct {
+    version: u32,
+    iters_traced: u64,
+    iters_tier0_covered: u64,
+    iters_tier0_uncovered: u64,
+    cycles_traced: u64,
+    cycles_tier0_covered: u64,
+    cycles_tier0_uncovered: u64,
+    run_cycles: u64,
+    counters: JitCounters,
+    anchors: []const CoverageAnchor,
+
+    pub fn encode(self: CoverageFile, allocator: std.mem.Allocator) binschema.Error![]u8 {
+        var enc = binschema.BitStreamEncoder.init(allocator, .lsb_first);
+        errdefer enc.deinit();
+        var ctx = binschema.EncodeContext.init(allocator);
+        defer ctx.deinit();
+        try self.encodeInto(&enc, &ctx);
+        return enc.finish();
+    }
+
+    pub fn encodeInto(self: CoverageFile, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
+        try enc.writeUint32(self.version, .little_endian);
+        try enc.writeUint64(self.iters_traced, .little_endian);
+        try enc.writeUint64(self.iters_tier0_covered, .little_endian);
+        try enc.writeUint64(self.iters_tier0_uncovered, .little_endian);
+        try enc.writeUint64(self.cycles_traced, .little_endian);
+        try enc.writeUint64(self.cycles_tier0_covered, .little_endian);
+        try enc.writeUint64(self.cycles_tier0_uncovered, .little_endian);
+        try enc.writeUint64(self.run_cycles, .little_endian);
+        try self.counters.encodeInto(enc, ctx);
+        try enc.writeUint32(@intCast(self.anchors.len), .little_endian);
+        for (self.anchors) |_item_0| {
+            try _item_0.encodeInto(enc, ctx);
+        }
+    }
+
+    pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) binschema.Error!CoverageFile {
+        var dec = binschema.BitStreamDecoder.init(bytes, .lsb_first);
+        return decodeWith(allocator, &dec, null);
+    }
+
+    pub fn decodeWith(allocator: std.mem.Allocator, dec: *binschema.BitStreamDecoder, root: ?*anyopaque) binschema.Error!CoverageFile {
+        var result: CoverageFile = undefined;
+        result.version = try dec.readUint32(.little_endian);
+        result.iters_traced = try dec.readUint64(.little_endian);
+        result.iters_tier0_covered = try dec.readUint64(.little_endian);
+        result.iters_tier0_uncovered = try dec.readUint64(.little_endian);
+        result.cycles_traced = try dec.readUint64(.little_endian);
+        result.cycles_tier0_covered = try dec.readUint64(.little_endian);
+        result.cycles_tier0_uncovered = try dec.readUint64(.little_endian);
+        result.run_cycles = try dec.readUint64(.little_endian);
+        result.counters = try JitCounters.decodeWith(allocator, dec, root);
+        const _len_4 = try dec.readUint32(.little_endian);
+        const _buf_5 = try allocator.alloc(CoverageAnchor, @as(usize, _len_4));
+        for (0.._buf_5.len) |_i_2| {
+            _buf_5[_i_2] = try CoverageAnchor.decodeWith(allocator, dec, root);
+        }
+        result.anchors = _buf_5;
+        return result;
+    }
+};

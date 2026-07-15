@@ -4210,3 +4210,583 @@ export class ExecLogFileDecoder extends SeekableBitStreamDecoder {
   }
 }
 
+/**
+ * The raw JIT event counters (TraceState, src/trace.zig), mirroring the '--jit-stats' event-counter block. Always live regardless of the coverage gate — they cost nothing on the hot path. link arm/fuse/disarm track the native chaining machinery; the *link_exits/*follow* pairs count exit-chaining hops; prime_side_* the coherent-state-chaining source arming.
+ */
+export interface JitCountersInput {
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  entries: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_link_arms: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_source_link_arms: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_loopdone_link_arms: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_source_link_fused: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_loopdone_link_fused: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_link_disarms: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_link_exits: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_link_follow_count: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  link_ir_exits: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  link_follow_count: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  prime_side_arms: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  prime_side_chain_follows: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  tier0_outer_body_entries: bigint;
+}
+
+/**
+ * The raw JIT event counters (TraceState, src/trace.zig), mirroring the '--jit-stats' event-counter block. Always live regardless of the coverage gate — they cost nothing on the hot path. link arm/fuse/disarm track the native chaining machinery; the *link_exits/*follow* pairs count exit-chaining hops; prime_side_* the coherent-state-chaining source arming.
+ */
+export interface JitCountersOutput {
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  entries: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_link_arms: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_source_link_arms: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_loopdone_link_arms: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_source_link_fused: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_loopdone_link_fused: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_link_disarms: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_link_exits: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  native_link_follow_count: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  link_ir_exits: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  link_follow_count: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  prime_side_arms: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  prime_side_chain_follows: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  tier0_outer_body_entries: bigint;
+}
+
+export type JitCounters = JitCountersOutput;
+
+export class JitCountersEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: JitCountersInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint64(value.entries, "little_endian");
+    this.writeUint64(value.native_link_arms, "little_endian");
+    this.writeUint64(value.native_source_link_arms, "little_endian");
+    this.writeUint64(value.native_loopdone_link_arms, "little_endian");
+    this.writeUint64(value.native_source_link_fused, "little_endian");
+    this.writeUint64(value.native_loopdone_link_fused, "little_endian");
+    this.writeUint64(value.native_link_disarms, "little_endian");
+    this.writeUint64(value.native_link_exits, "little_endian");
+    this.writeUint64(value.native_link_follow_count, "little_endian");
+    this.writeUint64(value.link_ir_exits, "little_endian");
+    this.writeUint64(value.link_follow_count, "little_endian");
+    this.writeUint64(value.prime_side_arms, "little_endian");
+    this.writeUint64(value.prime_side_chain_follows, "little_endian");
+    this.writeUint64(value.tier0_outer_body_entries, "little_endian");
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a JitCounters value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: JitCounters): number {
+    return 112; // entries + native_link_arms + native_source_link_arms + native_loopdone_link_arms + native_source_link_fused + native_loopdone_link_fused + native_link_disarms + native_link_exits + native_link_follow_count + link_ir_exits + link_follow_count + prime_side_arms + prime_side_chain_follows + tier0_outer_body_entries
+  }
+}
+
+export class JitCountersDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): JitCountersOutput {
+    const value: any = {};
+
+    value.entries = this.readUint64("little_endian");
+    value.native_link_arms = this.readUint64("little_endian");
+    value.native_source_link_arms = this.readUint64("little_endian");
+    value.native_loopdone_link_arms = this.readUint64("little_endian");
+    value.native_source_link_fused = this.readUint64("little_endian");
+    value.native_loopdone_link_fused = this.readUint64("little_endian");
+    value.native_link_disarms = this.readUint64("little_endian");
+    value.native_link_exits = this.readUint64("little_endian");
+    value.native_link_follow_count = this.readUint64("little_endian");
+    value.link_ir_exits = this.readUint64("little_endian");
+    value.link_follow_count = this.readUint64("little_endian");
+    value.prime_side_arms = this.readUint64("little_endian");
+    value.prime_side_chain_follows = this.readUint64("little_endian");
+    value.tier0_outer_body_entries = this.readUint64("little_endian");
+    return value;
+  }
+}
+
+/**
+ * Per-loop-header JIT execution coverage (AnchorCoverage, src/trace.zig), keyed by the anchor's stable proto id (never the *const Proto pointer) plus loop-header pc. `traced_iters`/`interp_iters` are back-edge counts (ran-as-trace vs fell-back-to-tier-0); `traced_cycles`/`interp_cycles` are the per-hop TSC attribution (0 on a target without rdtsc). `has_trace` = a compiled trace exists at this anchor — so an anchor with has_trace=1 and traced_iters=0 is the smell: it has a trace but ran fully interpreted.
+ */
+export interface CoverageAnchorInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  proto_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  pc: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  traced_iters: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  interp_iters: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  traced_cycles: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  interp_cycles: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_trace: number;
+}
+
+/**
+ * Per-loop-header JIT execution coverage (AnchorCoverage, src/trace.zig), keyed by the anchor's stable proto id (never the *const Proto pointer) plus loop-header pc. `traced_iters`/`interp_iters` are back-edge counts (ran-as-trace vs fell-back-to-tier-0); `traced_cycles`/`interp_cycles` are the per-hop TSC attribution (0 on a target without rdtsc). `has_trace` = a compiled trace exists at this anchor — so an anchor with has_trace=1 and traced_iters=0 is the smell: it has a trace but ran fully interpreted.
+ */
+export interface CoverageAnchorOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  proto_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  pc: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  traced_iters: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  interp_iters: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  traced_cycles: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  interp_cycles: bigint;
+  /**
+   * 8-bit Unsigned Integer
+   * Fixed-width 8-bit unsigned integer (0-255). Single byte, no endianness concerns.
+   */
+  has_trace: number;
+}
+
+export type CoverageAnchor = CoverageAnchorOutput;
+
+export class CoverageAnchorEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: CoverageAnchorInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.proto_id, "little_endian");
+    this.writeUint32(value.pc, "little_endian");
+    this.writeUint64(value.traced_iters, "little_endian");
+    this.writeUint64(value.interp_iters, "little_endian");
+    this.writeUint64(value.traced_cycles, "little_endian");
+    this.writeUint64(value.interp_cycles, "little_endian");
+    this.writeUint8(value.has_trace);
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a CoverageAnchor value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: CoverageAnchor): number {
+    return 41; // proto_id + pc + traced_iters + interp_iters + traced_cycles + interp_cycles + has_trace
+  }
+}
+
+export class CoverageAnchorDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): CoverageAnchorOutput {
+    const value: any = {};
+
+    value.proto_id = this.readUint32("little_endian");
+    value.pc = this.readUint32("little_endian");
+    value.traced_iters = this.readUint64("little_endian");
+    value.interp_iters = this.readUint64("little_endian");
+    value.traced_cycles = this.readUint64("little_endian");
+    value.interp_cycles = this.readUint64("little_endian");
+    value.has_trace = this.readUint8();
+    return value;
+  }
+}
+
+/**
+ * The top-level JIT-coverage artifact (Phase 2): the aggregate native-vs-tier-0 execution split by iterations AND by TSC time, the raw event counters, and the per-anchor breakdown. Its own `version` word — a FIFTH record family sharing the binschema encoding, never fused (docs/design/04 'two artifacts, one substrate'). An *observation* artifact, not a replay input. `cycles_*`/`run_cycles` are 0 on a target without rdtsc (the wasm VM), in which case the visualizer shows time as n/a and weighs by iterations only. `anchors` is sorted (proto_id, pc) for a reproducible artifact.
+ */
+export interface CoverageFileInput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  version: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  iters_traced: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  iters_tier0_covered: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  iters_tier0_uncovered: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  cycles_traced: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  cycles_tier0_covered: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  cycles_tier0_uncovered: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  run_cycles: bigint;
+  /**
+   * The raw JIT event counters (TraceState, src/trace.zig), mirroring the '--jit-stats' event-counter block. Always live regardless of the coverage gate — they cost nothing on the hot path. link arm/fuse/disarm track the native chaining machinery; the *link_exits/*follow* pairs count exit-chaining hops; prime_side_* the coherent-state-chaining source arming.
+   */
+  counters: JitCountersInput;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  anchors: CoverageAnchorInput[];
+}
+
+/**
+ * The top-level JIT-coverage artifact (Phase 2): the aggregate native-vs-tier-0 execution split by iterations AND by TSC time, the raw event counters, and the per-anchor breakdown. Its own `version` word — a FIFTH record family sharing the binschema encoding, never fused (docs/design/04 'two artifacts, one substrate'). An *observation* artifact, not a replay input. `cycles_*`/`run_cycles` are 0 on a target without rdtsc (the wasm VM), in which case the visualizer shows time as n/a and weighs by iterations only. `anchors` is sorted (proto_id, pc) for a reproducible artifact.
+ */
+export interface CoverageFileOutput {
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  version: number;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  iters_traced: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  iters_tier0_covered: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  iters_tier0_uncovered: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  cycles_traced: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  cycles_tier0_covered: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  cycles_tier0_uncovered: bigint;
+  /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  run_cycles: bigint;
+  /**
+   * The raw JIT event counters (TraceState, src/trace.zig), mirroring the '--jit-stats' event-counter block. Always live regardless of the coverage gate — they cost nothing on the hot path. link arm/fuse/disarm track the native chaining machinery; the *link_exits/*follow* pairs count exit-chaining hops; prime_side_* the coherent-state-chaining source arming.
+   */
+  counters: JitCountersOutput;
+  /**
+   * Array
+   * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
+   *
+   * @remarks
+   *
+   * Array kind: length_prefixed
+   * Length prefix type: uint32
+   */
+  anchors: CoverageAnchorOutput[];
+}
+
+export type CoverageFile = CoverageFileOutput;
+
+export class CoverageFileEncoder extends BitStreamEncoder {
+  private compressionDict: Map<string, number> = new Map();
+
+  constructor() {
+    super("lsb_first");
+  }
+
+  encode(value: CoverageFileInput): Uint8Array {
+    // Reset compression dictionary for each encode
+    this.compressionDict.clear();
+
+    this.writeUint32(value.version, "little_endian");
+    this.writeUint64(value.iters_traced, "little_endian");
+    this.writeUint64(value.iters_tier0_covered, "little_endian");
+    this.writeUint64(value.iters_tier0_uncovered, "little_endian");
+    this.writeUint64(value.cycles_traced, "little_endian");
+    this.writeUint64(value.cycles_tier0_covered, "little_endian");
+    this.writeUint64(value.cycles_tier0_uncovered, "little_endian");
+    this.writeUint64(value.run_cycles, "little_endian");
+    const encoder_counters = new JitCountersEncoder();
+    const encoded_counters = encoder_counters.encode(value.counters);
+    for (const byte of encoded_counters) {
+      this.writeUint8(byte);
+    }
+    this.writeUint32(value.anchors.length, "little_endian");
+    for (let value_anchors__iter_index = 0; value_anchors__iter_index < value.anchors.length; value_anchors__iter_index++) {
+      const value_anchors__iter = value.anchors[value_anchors__iter_index];
+      const encoder_value_anchors__iter = new CoverageAnchorEncoder();
+      const encoded_value_anchors__iter = encoder_value_anchors__iter.encode(value_anchors__iter);
+      for (const byte of encoded_value_anchors__iter) {
+        this.writeUint8(byte);
+      }
+    }
+    return this.finish();
+  }
+
+  /**
+   * Calculate the encoded size of a CoverageFile value.
+   * Used for from_after_field computed lengths and buffer pre-allocation.
+   */
+  calculateSize(value: CoverageFile): number {
+    let size = 0;
+    size += 60; // version + iters_traced + iters_tier0_covered + iters_tier0_uncovered + cycles_traced + cycles_tier0_covered + cycles_tier0_uncovered + run_cycles
+    // counters: custom type (JitCounters)
+    const counters_encoder = new JitCountersEncoder();
+    size += counters_encoder.calculateSize(value.counters);
+    // anchors: array (kind: length_prefixed)
+    for (const item of value.anchors) {
+      const anchors_itemEncoder = new CoverageAnchorEncoder();
+      size += anchors_itemEncoder.calculateSize(item);
+    }
+    size += 4; // length prefix (uint32)
+    return size;
+  }
+}
+
+export class CoverageFileDecoder extends SeekableBitStreamDecoder {
+  constructor(input: Uint8Array | number[] | string, private context?: any) {
+    const reader = createReader(input);
+    super(reader, "lsb_first");
+  }
+
+  decode(): CoverageFileOutput {
+    const value: any = {};
+
+    value.version = this.readUint32("little_endian");
+    value.iters_traced = this.readUint64("little_endian");
+    value.iters_tier0_covered = this.readUint64("little_endian");
+    value.iters_tier0_uncovered = this.readUint64("little_endian");
+    value.cycles_traced = this.readUint64("little_endian");
+    value.cycles_tier0_covered = this.readUint64("little_endian");
+    value.cycles_tier0_uncovered = this.readUint64("little_endian");
+    value.run_cycles = this.readUint64("little_endian");
+    value.counters = {};
+    value.counters.entries = this.readUint64("little_endian");
+    value.counters.native_link_arms = this.readUint64("little_endian");
+    value.counters.native_source_link_arms = this.readUint64("little_endian");
+    value.counters.native_loopdone_link_arms = this.readUint64("little_endian");
+    value.counters.native_source_link_fused = this.readUint64("little_endian");
+    value.counters.native_loopdone_link_fused = this.readUint64("little_endian");
+    value.counters.native_link_disarms = this.readUint64("little_endian");
+    value.counters.native_link_exits = this.readUint64("little_endian");
+    value.counters.native_link_follow_count = this.readUint64("little_endian");
+    value.counters.link_ir_exits = this.readUint64("little_endian");
+    value.counters.link_follow_count = this.readUint64("little_endian");
+    value.counters.prime_side_arms = this.readUint64("little_endian");
+    value.counters.prime_side_chain_follows = this.readUint64("little_endian");
+    value.counters.tier0_outer_body_entries = this.readUint64("little_endian");
+    value.anchors = [];
+    const anchors_length = this.readUint32("little_endian");
+    for (let i = 0; i < anchors_length; i++) {
+      let anchors__iter: any;
+      anchors__iter = {};
+      anchors__iter.proto_id = this.readUint32("little_endian");
+      anchors__iter.pc = this.readUint32("little_endian");
+      anchors__iter.traced_iters = this.readUint64("little_endian");
+      anchors__iter.interp_iters = this.readUint64("little_endian");
+      anchors__iter.traced_cycles = this.readUint64("little_endian");
+      anchors__iter.interp_cycles = this.readUint64("little_endian");
+      anchors__iter.has_trace = this.readUint8();
+      value.anchors.push(anchors__iter);
+    }
+    return value;
+  }
+}
+

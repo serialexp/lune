@@ -103,6 +103,12 @@ pub const effectser = @import("effectser.zig");
 /// on-disk form (fourth record family; shares the generated binschema codec).
 pub const execlogser = @import("execlogser.zig");
 
+/// JIT coverage serialization: maps `trace.TraceState`'s execution-coverage
+/// accounting (aggregate native-vs-tier-0 split by iterations + TSC time, event
+/// counters, per-anchor breakdown) to its on-disk form (fifth record family;
+/// shares the generated binschema codec). An observation artifact for the viz.
+pub const coverageser = @import("coverageser.zig");
+
 /// Re-exports for ergonomic access.
 pub const Value = value.Value;
 pub const GcHeader = object.GcHeader;
@@ -141,4 +147,5 @@ test {
     _ = keyframeser;
     _ = effectser;
     _ = execlogser;
+    _ = coverageser;
 }

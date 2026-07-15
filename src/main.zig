@@ -87,6 +87,11 @@ const usage =
     \\                       record the run's nondeterministic-input effect log
     \\                       (e.g. clock() results) and serialize it to <file>
     \\                       (binschema wire format) after the run.
+    \\  --emit-coverage <file>
+    \\                       imply --trace + JIT coverage accounting and serialize
+    \\                       the coverage artifact (native-vs-tier-0 split by
+    \\                       iterations + time, event counters, per-anchor) to
+    \\                       <file> (binschema wire format) after the run.
     \\  --time               print VM execute-only wall time to stderr after the
     \\                       run (the run alone, excluding parse/compile/emit). Kept
     \\                       free of JIT coverage accounting so the timing is clean;
@@ -117,6 +122,9 @@ const TraceOpts = struct {
     /// `--emit-effects <file>`: record the nondeterministic-input effect log and
     /// serialize it here after the run (puts the VM in effect `record` mode).
     effects_path: ?[]const u8 = null,
+    /// `--emit-coverage <file>`: serialize the JIT execution-coverage artifact here
+    /// after the run. Implies `--trace` + `coverage` (the accounting must be on).
+    coverage_path: ?[]const u8 = null,
     /// `--time`: print the VM execute-only wall time (the `vm.run` call alone) to
     /// stderr after the run. Mirrors the browser's execute-only timing readout.
     time: bool = false,
@@ -231,6 +239,13 @@ pub fn main(init: std.process.Init) u8 {
         } else if (std.mem.eql(u8, arg, "--emit-effects")) {
             topts.effects_path = it.next() orelse {
                 lune.io.eprint("lune: error: --emit-effects requires a <file> argument\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--emit-coverage")) {
+            topts.enabled = true;
+            topts.coverage = true;
+            topts.coverage_path = it.next() orelse {
+                lune.io.eprint("lune: error: --emit-coverage requires a <file> argument\n", .{});
                 return 2;
             };
         } else if (std.mem.eql(u8, arg, "--time")) {
@@ -468,6 +483,15 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
             return 1;
         };
     }
+
+    // --- emit the JIT coverage artifact (--emit-coverage <file>) --- the VM ran
+    // with `config.coverage` on, so the aggregate/per-anchor accounting is live.
+    if (topts.coverage_path) |path| {
+        emitCoverage(gpa, io, path, &vm) catch |err| {
+            lune.io.eprint("lune: error: --emit-coverage '{s}': {s}\n", .{ path, @errorName(err) });
+            return 1;
+        };
+    }
     return 0;
 }
 
@@ -569,6 +593,16 @@ fn emitEffects(gpa: std.mem.Allocator, io: lune.io.Io, path: []const u8, vm: *lu
     defer gpa.free(bytes);
     try lune.io.writeFile(io, path, bytes);
     lune.io.eprint("lune: wrote effect log, {d} effect(s), {d} bytes → {s}\n", .{ vm.effect_log.items.len, bytes.len, path });
+}
+
+/// Serialize the JIT execution-coverage artifact to `path` (binschema wire format).
+/// Mirrors `emitTraces`; the VM must have run with `config.coverage` on (implied by
+/// `--emit-coverage`), else the aggregates/anchors are all zero.
+fn emitCoverage(gpa: std.mem.Allocator, io: lune.io.Io, path: []const u8, vm: *lune.interp.Vm) !void {
+    const bytes = try lune.coverageser.encodeState(gpa, &vm.trace);
+    defer gpa.free(bytes);
+    try lune.io.writeFile(io, path, bytes);
+    lune.io.eprint("lune: wrote JIT coverage, {d} anchor(s), {d} bytes → {s}\n", .{ vm.trace.coverage.count(), bytes.len, path });
 }
 
 /// Serialize the recorded trace cache to `path` (binschema wire format).
