@@ -88,7 +88,7 @@ for (const { name, src } of integerCorpus) {
 }
 
 test("clock() program: effect-log divergence is expected, not a failure", () => {
-  const src = "local t = clock()\nlocal x = 0\nfor i = 1, 10 do x = x + i end\nprint(x)\n";
+  const src = "local t = os.clock()\nlocal x = 0\nfor i = 1, 10 do x = x + i end\nprint(x)\n";
   const wasm = runWasm(src);
   const native = runNative(src);
   const report = diffRuns(wasm, native);

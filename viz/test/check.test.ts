@@ -74,7 +74,9 @@ test("a global assigned elsewhere does not warn", () => {
 });
 
 test("reading a builtin global does not warn", () => {
-  expect(mod.check("print(clock())\n")).toEqual([]);
+  // `os` is the builtin global here; `clock` was renamed to `os.clock`/`os.nsclock`
+  // when the base-host tier landed (commit ee6a821), so a bare `clock` now warns.
+  expect(mod.check("print(os.clock())\n")).toEqual([]);
 });
 
 test("a forward reference to a later global function does not warn", () => {

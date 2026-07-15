@@ -21,10 +21,128 @@
 //     the verdict. Such a program's determinism is verified by *replay*, not by
 //     this cross-engine record-vs-record comparison.
 //
-// This module is decode-free on purpose: it reads only the effect-count prefix
-// (a plain u32), never the per-effect payload — the vendored TS snapshot/effect
-// decoders have a generator bug (they branch on the wrong discriminator field;
-// see TODO.md), so a full structural diff is deferred until that codec is fixed.
+// Effect counts are read decode-free (a plain u32 prefix). The keyframe, however,
+// is normalized through the snapshot decoder before comparison to exclude the
+// global `arg` table: the native CLI populates `arg[0]` = the script path (a
+// nondeterministic temp path, commit 94cf36e), while the wasm embedding has no
+// argv and leaves `arg` empty. That divergence is an *embedding* difference, not a
+// language-determinism one, so `keyframeSansArg` empties `arg` and mark-sweeps the
+// now-orphaned path string from both sides before the structural compare. (The
+// trace/effects artifacts stay byte-compared.)
+
+import { SnapshotFileDecoder } from "./gen/generated";
+
+const td = new TextDecoder();
+
+/** True when a decoded SnapValue is a heap reference. */
+function svId(sv: any): number | null {
+  return sv && sv.tag === 4 ? Number(sv.body.value.id) : null;
+}
+
+const jsonReplacer = (_k: string, v: any) =>
+  typeof v === "bigint" ? Number(v) : v instanceof Uint8Array ? Array.from(v) : v;
+
+/**
+ * Decode a keyframe, empty the global `arg` table, and return a canonical
+ * structural string in which every object is relabelled by its first-visit order
+ * in a deterministic walk from the roots (globals → string metatable → stack →
+ * frames → open upvalues, each object's edges in a fixed order). Absolute object
+ * ids are never emitted — only these traversal-relative indices — so the id SHIFT
+ * that native introduces by allocating `arg[0]` = script path mid-sequence (which
+ * bumps every later object's id by one vs the wasm embedding, and interns extra
+ * global-name strings) cancels out. Two embeddings that agree on everything except
+ * `arg` then compare equal. Returns a distinct fallback string if the buffer can't
+ * be decoded, so a malformed keyframe surfaces as a mismatch rather than throwing.
+ */
+export function keyframeSansArg(bytes: Uint8Array): string {
+  let kf: any;
+  try {
+    kf = new SnapshotFileDecoder(bytes).decode().keyframe;
+  } catch {
+    return `undecodable:${bytes.length}`;
+  }
+  const byId = new Map<number, any>();
+  for (const o of kf.objects) byId.set(Number(o.id), o);
+
+  // Empty the `arg` table (globals["arg"]) so its script-path contents drop out.
+  const globals = byId.get(Number(kf.globals_id));
+  if (globals && globals.obj_type === 1) {
+    for (const e of globals.body.value.entries) {
+      const keyId = svId(e.key);
+      if (keyId === null) continue;
+      const keyObj = byId.get(keyId);
+      if (keyObj && keyObj.obj_type === 0 && td.decode(new Uint8Array(keyObj.body.value.bytes)) === "arg") {
+        const argId = svId(e.val);
+        const argTable = argId !== null ? byId.get(argId) : null;
+        if (argTable && argTable.obj_type === 1) {
+          argTable.body.value.array = [];
+          argTable.body.value.entries = [];
+        }
+      }
+    }
+  }
+
+  // Assign each reachable object a canonical index in BFS-from-roots order. `visit`
+  // returns the (stable) index, enqueueing the object the first time it's seen; a
+  // strict FIFO walk means dequeue order == index order, so the emitted list lines
+  // up with the indices the edges reference.
+  const canon = new Map<number, number>();
+  const queue: number[] = [];
+  const visit = (id: number | null): number | null => {
+    if (id === null || !byId.has(id)) return null;
+    const existing = canon.get(id);
+    if (existing !== undefined) return existing;
+    const idx = canon.size;
+    canon.set(id, idx);
+    queue.push(id);
+    return idx;
+  };
+  // A SnapValue → canonical form: a heap ref becomes {ref: idx}, a scalar its body.
+  const canonSv = (sv: any) => (sv.tag === 4 ? { ref: visit(Number(sv.body.value.id)) } : { tag: sv.tag, body: sv.body });
+
+  const roots = {
+    globals: visit(Number(kf.globals_id)),
+    string_metatable: Number(kf.string_metatable_id) > 0 ? visit(Number(kf.string_metatable_id) - 1) : -1,
+    stack: kf.stack.map(canonSv),
+    frames: kf.frames.map((fr: any) => ({ closure: visit(Number(fr.closure_id)), pc: fr.pc, base: fr.base, ret_dest: fr.ret_dest, ret_count: fr.ret_count })),
+    open_upvalues: kf.open_upvalues.map((uv: any) => ({ stack_index: uv.stack_index, upvalue: visit(Number(uv.upvalue_id)) })),
+  };
+
+  const objects: any[] = [];
+  for (let i = 0; i < queue.length; i++) {
+    const o = byId.get(queue[i]);
+    if (!o) continue;
+    let body: any;
+    switch (o.obj_type) {
+      case 0: // string
+        body = { str: Array.from(new Uint8Array(o.body.value.bytes)) };
+        break;
+      case 1: { // table
+        const t = o.body.value;
+        body = {
+          array: t.array.map(canonSv),
+          entries: t.entries.map((e: any) => ({ key: canonSv(e.key), val: canonSv(e.val) })),
+          metatable: Number(t.metatable_id) > 0 ? visit(Number(t.metatable_id) - 1) : -1,
+        };
+        break;
+      }
+      case 2: // closure
+        body = { proto_id: o.body.value.proto_id, upvalues: o.body.value.upvalue_ids.map((u: any) => visit(Number(u))) };
+        break;
+      case 3: // native
+        body = { name: Array.from(new Uint8Array(o.body.value.name)) };
+        break;
+      case 4: // upvalue
+        body = { closed: o.body.value.closed, value: canonSv(o.body.value.value) };
+        break;
+      default:
+        body = { unknown: o.obj_type };
+    }
+    objects.push({ obj_type: o.obj_type, body });
+  }
+
+  return JSON.stringify({ roots, objects }, jsonReplacer);
+}
 
 /** One engine's run output (wasm or native), artifacts as raw bytes. */
 export interface RunArtifacts {
@@ -95,7 +213,16 @@ export function diffRuns(wasm: RunArtifacts, native: RunArtifacts): DiffReport {
   const artifacts: ArtifactDiff[] = order.map((name) => {
     const w = wasm[name];
     const n = native[name];
-    const firstDiffByte = compareBytes(w, n);
+    // The keyframe is compared structurally with the global `arg` table excluded
+    // (see the module header): native's `arg[0]` = script path never byte-matches
+    // wasm's empty arg, but that's an embedding difference, not a determinism one.
+    // effects/trace stay byte-exact.
+    let firstDiffByte: number | null;
+    if (name === "keyframe") {
+      firstDiffByte = keyframeSansArg(w) === keyframeSansArg(n) ? null : 0;
+    } else {
+      firstDiffByte = compareBytes(w, n);
+    }
     const match = firstDiffByte === null;
 
     let expectedNote: string | null = null;
