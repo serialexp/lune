@@ -2606,19 +2606,21 @@ pub const Vm = struct {
                             const trace_regs = self.seedTraceInputs(ct, base, closure, proto, regs, &native_eligible) orelse continue;
                             if (self.trace.valuesScratch(ct.instrs.len)) |buf| {
                                 self.trace.entries +%= 1;
-                                // JIT coverage time attribution (gated): bracket this
-                                // whole trace-exec region (the native/tier-1a run + any
-                                // `driveChain` chaining) so its cycles are charged to
-                                // this anchor as "traced" time — the time counterpart of
-                                // the iteration count `onSideExit` sums. `defer` catches
-                                // every exit, including the productive `continue :outer`
-                                // paths below. Also re-stamps `last_event_tsc` so the
-                                // next tier-0 span's cycles don't include trace time.
-                                const cov_ts0 = if (self.trace.config.coverage) trace.readCycles() else 0;
+                                // JIT coverage time attribution (gated): open the
+                                // trace-exec region. `last_hop_tsc` marks the first
+                                // hop's start; each `onSideExit` (per hop, inc. every
+                                // `driveChain` hop) charges its span to its OWN anchor
+                                // and advances the boundary — so per-anchor traced time
+                                // follows the hops, not the entry anchor. The `defer`
+                                // then re-stamps `last_event_tsc` (catching every exit,
+                                // incl. the productive `continue :outer` paths) so the
+                                // next tier-0 span's cycles start after the region and
+                                // don't count trace time. The prep between the back-edge
+                                // and here (seeding, scratch) falls into neither bucket
+                                // (residual "other"), not misattributed.
+                                if (self.trace.config.coverage) self.trace.last_hop_tsc = trace.readCycles();
                                 defer if (self.trace.config.coverage) {
-                                    const cov_end = trace.readCycles();
-                                    self.trace.noteTracedCycles(.{ .proto = proto, .pc = anchor_pc }, trace.cycleDelta(cov_end, cov_ts0));
-                                    self.trace.last_event_tsc = cov_end;
+                                    self.trace.last_event_tsc = trace.readCycles();
                                 };
                                 var ran_native = false;
                                 var ran_native_link_mode = false;

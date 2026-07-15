@@ -898,14 +898,16 @@ pub const NativeLink = struct { parent: *Trace, slot_index: u32, child: *Trace }
 ///
 /// `*_cycles` are the TSC (`readCycles`) time attribution, so the report can weigh
 /// iterations by cost — a traced iteration is ~10-20× cheaper than a tier-0 one, so
-/// iteration% badly overstates JIT effectiveness. `traced_cycles` = cycles inside
-/// the trace-exec region entered at this anchor's back-edge. NB: this charges the
-/// WHOLE region to the *entry* anchor — including any `driveChain` chaining or fused
-/// hop into inner/continuation traces at other anchors, which get their *iterations*
-/// (via each hop's `onSideExit`) but not their *cycles*. It also includes the tail
-/// of dispatcher accounting inside the `|buf|` scope. So per-anchor `traced_cycles`
-/// is "time spent under traces entered here", not strictly this anchor's compiled
-/// code. `interp_cycles` = cycles of the tier-0 body iterations charged at this
+/// iteration% badly overstates JIT effectiveness. `traced_cycles` = cycles spent
+/// running trace code committed *at this anchor*, attributed per hop: every trace
+/// run (direct dispatch or a `driveChain` hop) charges the span since the previous
+/// hop boundary (`last_hop_tsc`) to *its own* anchor in `onSideExit`, so a chain hop
+/// into an inner/continuation trace bills the inner anchor — cycles now mirror
+/// iterations per anchor, not lumped onto the entry anchor. The one residual: a
+/// *fused* native run that executes several hops in one mcode burst replays them
+/// through `onSideExit` back-to-back after the burst, so the whole burst's cycles
+/// land on the first replayed hop's anchor (genuinely unsplittable without per-hop
+/// TSC reads inside mcode). `interp_cycles` = cycles of the tier-0 body iterations charged at this
 /// anchor's back-edge — *self time* for an innermost loop, but it leaks the
 /// outer-body-head into the innermost loop at a nesting boundary (one small span per
 /// outer iteration). Both are approximate per anchor; only the aggregate split
@@ -1130,11 +1132,21 @@ pub const TraceState = struct {
     /// `cycles_other = run_cycles - traced - tier0_*`. When 0 the report shows time
     /// as n/a rather than dividing by zero.
     run_cycles: u64 = 0,
-    /// TSC of the last coverage "event" (back-edge hook, or trace-region exit) — the
-    /// start of the current tier-0 span. `noteInterpIter` charges `now - last_event_tsc`
-    /// to the anchor. Seeded to the run-start TSC so the first span isn't a huge
-    /// bogus delta. Scratch, not reported.
+    /// TSC of the last tier-0 coverage "event" (back-edge hook, or trace-region exit)
+    /// — the start of the current tier-0 span. `noteInterpIter` charges
+    /// `now - last_event_tsc` to the anchor. Seeded to the run-start TSC so the first
+    /// span isn't a huge bogus delta. Scratch, not reported.
     last_event_tsc: u64 = 0,
+    /// TSC of the last trace-hop boundary — the start of the current hop's execution
+    /// span. Stamped at trace-region entry (dispatcher `|buf|` block) and re-stamped
+    /// by every `onSideExit`, which charges `now - last_hop_tsc` of *this hop's*
+    /// execution to *this hop's own anchor* (`t.anchor`). This is what makes per-anchor
+    /// traced time mirror the per-anchor iteration count: a chain hop into an inner
+    /// trace bills its cycles to the inner anchor, not the outer entry anchor. Scratch,
+    /// not reported. (A fused native span that replays several hops in one mcode run is
+    /// the one residual: the whole span lands on the first replayed hop — genuinely
+    /// unsplittable, since they ran as one instruction stream.)
+    last_hop_tsc: u64 = 0,
     /// Per-anchor breakdown of the same accounting, keyed by loop-header anchor, so
     /// the report (and the viz) can attribute traced/interpreted iterations + cycles
     /// to a specific source region. Populated only when `config.coverage`; freed in
@@ -1331,9 +1343,8 @@ pub const TraceState = struct {
     /// double-count-free. Also flips `has_trace` (a run implies a trace exists — a
     /// belt-and-suspenders guard beside the commit-time `markAnchorTraced`). Caller
     /// gates on `config.coverage`. OOM on the per-anchor map is swallowed (the
-    /// aggregate `iters_traced` still holds). Time is attributed separately in
-    /// `noteTracedCycles` (the dispatcher brackets the whole trace-exec region once,
-    /// not per side-exit).
+    /// aggregate `iters_traced` still holds). Time is attributed alongside in
+    /// `noteTracedCycles`, also from `onSideExit` — per hop, to this same anchor.
     pub fn noteTraceIters(self: *TraceState, anchor: AnchorKey, n: u64) void {
         self.iters_traced +|= n;
         const gop = self.coverage.getOrPut(self.gpa, anchor) catch return;
@@ -1343,12 +1354,12 @@ pub const TraceState = struct {
     }
 
     /// Charge `cycles` (a `readCycles` delta) of trace-execution time to `anchor`, for
-    /// the time-based coverage split. Called once per trace-exec region the dispatcher
-    /// brackets (covering the native/tier-1a run and any `driveChain` chaining entered
-    /// at this back-edge), so it is the time counterpart of the iteration count that
-    /// `onSideExit` sums. Bumps the aggregate `cycles_traced` and the per-anchor
-    /// `traced_cycles`. Caller gates on `config.coverage`; OOM on the per-anchor map is
-    /// swallowed (the aggregate still holds).
+    /// the time-based coverage split. Called from `onSideExit` once per hop with the
+    /// span since the previous hop boundary (`last_hop_tsc`), so time is attributed to
+    /// the hop's own anchor — the exact time counterpart of the iteration count that
+    /// `noteTraceIters` sums per hop. Bumps the aggregate `cycles_traced` and the
+    /// per-anchor `traced_cycles`. Caller gates on `config.coverage`; OOM on the
+    /// per-anchor map is swallowed (the aggregate still holds).
     pub fn noteTracedCycles(self: *TraceState, anchor: AnchorKey, cycles: u64) void {
         self.cycles_traced +|= cycles;
         const gop = self.coverage.getOrPut(self.gpa, anchor) catch return;
@@ -1529,10 +1540,21 @@ pub const TraceState = struct {
         const key = t.anchor;
         // JIT coverage (gated): this is the single per-trace-commit hook — every
         // trace run (tier-1a/1b, direct dispatch or a `driveChain` hop) reaches here
-        // exactly once with its OWN committed count. Summing `completed` is the
-        // "ran as a trace, not tier-0" total, disjoint from the interpreted-back-edge
-        // count in the dispatcher (Rule #3: accounting stays self-consistent).
-        if (self.config.coverage and completed > 0) self.noteTraceIters(key, completed);
+        // exactly once with its OWN committed count AND its own anchor. Summing
+        // `completed` is the "ran as a trace, not tier-0" iteration total; charging
+        // the cycle span since the last hop boundary attributes this hop's *time* to
+        // *its own anchor* — so a chain hop into an inner trace bills the inner anchor,
+        // never the outer entry anchor. Both are disjoint from the interpreted
+        // back-edge accounting in the dispatcher (Rule #3: self-consistent).
+        if (self.config.coverage) {
+            if (completed > 0) self.noteTraceIters(key, completed);
+            // Even a zero-progress hop executed trace code (it side-exited), so it is
+            // charged too; a bookkeeping-only `onSideExit` merely charges ~0 (the
+            // boundary was just advanced by the prior real hop).
+            const now = readCycles();
+            self.noteTracedCycles(key, cycleDelta(now, self.last_hop_tsc));
+            self.last_hop_tsc = now;
+        }
         if (completed >= self.config.min_useful) {
             t.hit_count +|= 1;
             _ = self.penalty.remove(key);
@@ -6999,6 +7021,85 @@ test "driveSeedLedger: a deep hop-0 ledger [C.link, I.done, C.deopt] charges eac
     // onSideExit(inner, 1) and onSideExit(cont, 2), one penalty each (both < min_useful).
     try testing.expectEqual(@as(u32, 1), state.penalty.get(.{ .proto = &proto, .pc = 7 }).?);
     try testing.expectEqual(@as(u32, 1), state.penalty.get(.{ .proto = &proto, .pc = 2 }).?);
+}
+
+test "jit coverage: per-hop cycles bill each hop's own anchor, never the entry anchor" {
+    // The load-bearing anti-misattribution guarantee. A chain runs several hops
+    // through `onSideExit`, each with its OWN anchor. Before the per-hop fix the
+    // whole trace-exec span was charged to the *entry* anchor, so inner/continuation
+    // anchors got iterations but zero cycles — the time split was untrustworthy.
+    // This drives two hops at DISTINCT anchors with a cycle-burning spin *between*
+    // them and asserts each anchor is billed its own span (both strictly > 0) and
+    // the aggregate is exactly the sum — proving hop B's cycles land on anchor B,
+    // not lumped onto entry anchor A.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.config.coverage = true;
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 1 };
+
+    // Minimal traces: `onSideExit` touches only `t.anchor` and `t.hit_count`.
+    var entry = [_]u16{0};
+    const instrs = [_]IrInstr{.{ .op = .loop }};
+    const consts = [_]Value{};
+    const trace_a = try gpa.create(Trace);
+    defer gpa.destroy(trace_a);
+    trace_a.* = .{
+        .anchor = .{ .proto = &proto, .pc = 10 },
+        .instrs = @constCast(&instrs),
+        .consts = @constCast(&consts),
+        .entry_slots = &entry,
+        .entry_guards = &.{},
+    };
+    const trace_b = try gpa.create(Trace);
+    defer gpa.destroy(trace_b);
+    trace_b.* = .{
+        .anchor = .{ .proto = &proto, .pc = 20 }, // DISTINCT anchor
+        .instrs = @constCast(&instrs),
+        .consts = @constCast(&consts),
+        .entry_slots = &entry,
+        .entry_guards = &.{},
+    };
+
+    const is_x86 = @import("builtin").target.cpu.arch == .x86_64;
+    // Spin until rdtsc has advanced by `min` cycles — guarantees a strictly
+    // positive span on x86_64; a no-op elsewhere (readCycles is 0 there).
+    const spin = struct {
+        fn burn(min: u64) void {
+            if (@import("builtin").target.cpu.arch != .x86_64) return;
+            const start = readCycles();
+            while (readCycles() -% start < min) {}
+        }
+    }.burn;
+
+    // Establish the hop boundary; the span up to onSideExit(A) bills anchor A.
+    state.last_hop_tsc = readCycles();
+    spin(4000);
+    state.onSideExit(trace_a, 5);
+    // The span between the two commits bills anchor B, not A.
+    spin(4000);
+    state.onSideExit(trace_b, 3);
+
+    const cov_a = state.coverage.get(.{ .proto = &proto, .pc = 10 }).?;
+    const cov_b = state.coverage.get(.{ .proto = &proto, .pc = 20 }).?;
+
+    // Iterations: each hop bills its OWN committed count to its OWN anchor.
+    try testing.expectEqual(@as(u64, 5), cov_a.traced);
+    try testing.expectEqual(@as(u64, 3), cov_b.traced);
+    try testing.expectEqual(@as(u64, 8), state.iters_traced);
+
+    if (is_x86) {
+        // Anti-misattribution: hop B's cycles landed on anchor B, not on entry A.
+        // Both anchors carry a strictly positive, independently-earned span.
+        try testing.expect(cov_a.traced_cycles > 0);
+        try testing.expect(cov_b.traced_cycles > 0);
+        // No cycles leaked or double-charged: aggregate == sum of per-anchor.
+        try testing.expectEqual(
+            state.cycles_traced,
+            cov_a.traced_cycles + cov_b.traced_cycles,
+        );
+    }
 }
 
 test "driveBurstCore start_at_continuation: a run_continuation handover does not re-run the inner (real native)" {
