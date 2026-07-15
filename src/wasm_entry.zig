@@ -167,6 +167,13 @@ const Result = extern struct {
     /// and their per-iteration events. Empty when no trace executed (no hot loop).
     /// Appended last so prior JS field offsets stay stable.
     exec_log: Buf = .{},
+    /// JIT execution-**coverage** artifact (`coverageser.CoverageFile`): the
+    /// aggregate native-vs-tier-0 split (by iterations; time is n/a in wasm — no
+    /// rdtsc) plus the event counters and per-anchor breakdown. The playground run
+    /// forces `config.coverage = true`, so this is always present after a
+    /// successful run with at least one back-edge. Appended last so prior JS field
+    /// offsets stay stable.
+    coverage: Buf = .{},
 };
 
 /// One compile diagnostic, flattened for JS (24 bytes; see file header). `start`/
@@ -307,6 +314,7 @@ export fn lune_free_result(res: ?*Result) void {
     freeBuf(r.safepoint_lines);
     freeBuf(r.disasm);
     freeBuf(r.exec_log);
+    freeBuf(r.coverage);
     gpa.destroy(r);
 }
 
@@ -541,6 +549,12 @@ fn run(res: *Result, source: []const u8) !void {
     // (every entry/exit-ramp, capped detail). Off the JIT fast path; this is the
     // instrumented playground run.
     vm.trace.config.record_exec_log = true;
+    // JIT execution-coverage accounting for the coverage view (native-vs-tier-0
+    // split + per-anchor). Always on in the playground — the timing-purity concern
+    // that keeps it opt-in on the CLI doesn't apply here (this run is already fully
+    // instrumented). Time attribution is n/a in wasm (no rdtsc), so the artifact
+    // carries iteration counts only.
+    vm.trace.config.coverage = true;
     vm.effect_mode = .record;
     vm.clock_source = .{ .ctx = &clock_ctx, .nowNs = &wasmClockNs };
     vm.random_seed_source = .{ .ctx = &rng_ctx, .seed = &wasmRandomSeed };
@@ -597,6 +611,7 @@ fn run(res: *Result, source: []const u8) !void {
     res.effects = bufFromSlice(try lune.effectser.encodeFile(gpa, vm.effect_log.items));
     res.trace = bufFromSlice(try lune.traceser.encodeFile(gpa, vm.trace.cache.items));
     res.exec_log = bufFromSlice(try lune.execlogser.encodeFile(gpa, vm.trace.exec_logs.items));
+    res.coverage = bufFromSlice(try lune.coverageser.encodeState(gpa, &vm.trace));
     res.status = 0;
 
     // Build the step-debugger index from the just-recorded effect log. This is a

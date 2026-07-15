@@ -19,6 +19,7 @@ import { ExecEventKind } from "../src/exec";
 import { viewsOf } from "../src/disasm";
 import { decodeSnapshot } from "../src/snapshot";
 import { diffRuns } from "../src/diff";
+import { CoverageFileDecoder } from "../src/gen/generated";
 
 const wasmPath = fileURLToPath(new URL("../../zig-out/bin/lune.wasm", import.meta.url));
 
@@ -90,6 +91,38 @@ test("a non-looping program records an empty execution log", () => {
   expect(result.status).toBe(0);
   const logs = decodeExecLogFile(result.executionLog).logs;
   expect(logs.length).toBe(0);
+});
+
+test("records a decodable JIT coverage artifact for a hot loop", () => {
+  // The playground forces coverage accounting on; a hot loop should report its
+  // back-edges as traced, with a per-anchor row flagged has_trace. Time is n/a
+  // under wasm (no rdtsc), so run_cycles is 0 and the split is iteration-only.
+  const result = mod.runSource("local s = 0\nfor i = 1, 200000 do s = s + i end\nprint(s)\n");
+  expect(result.status).toBe(0);
+
+  expect(result.coverage.length).toBeGreaterThan(0);
+  const cov = new CoverageFileDecoder(result.coverage).decode();
+  expect(cov.version).toBe(1);
+  // The loop tiered up: the vast majority of back-edges ran as a trace.
+  expect(Number(cov.iters_traced)).toBeGreaterThan(0);
+  expect(Number(cov.iters_traced)).toBeGreaterThan(Number(cov.iters_tier0_uncovered));
+  // No TSC under wasm → time attribution is zeroed, not garbage.
+  expect(Number(cov.run_cycles)).toBe(0);
+  expect(Number(cov.cycles_traced)).toBe(0);
+  // At least one anchor, and the hot one carries a compiled trace.
+  expect(cov.anchors.length).toBeGreaterThan(0);
+  const hot = cov.anchors.find((a) => Number(a.traced_iters) > 0);
+  expect(hot).toBeDefined();
+  expect(hot!.has_trace).toBe(1);
+});
+
+test("a non-looping program's coverage artifact has no traced iterations", () => {
+  const result = mod.runSource("print(1 + 2)\n");
+  expect(result.status).toBe(0);
+  const cov = new CoverageFileDecoder(result.coverage).decode();
+  expect(cov.version).toBe(1);
+  expect(Number(cov.iters_traced)).toBe(0);
+  expect(cov.anchors.length).toBe(0);
 });
 
 test("a successful run reports execute-only and total timing", () => {
