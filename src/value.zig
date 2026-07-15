@@ -129,7 +129,10 @@ pub const Value = extern struct {
     /// The parent grid table's header for a `row_view` (low 48 bits of payload).
     pub fn rowViewParent(self: Value) *GcHeader {
         std.debug.assert(self.tag == .row_view);
-        return @ptrFromInt(self.payload.bits & row_view_ptr_mask);
+        // `@ptrFromInt` wants `usize`; the payload is a fixed u64. On a 64-bit
+        // target the `@intCast` is a no-op; on wasm32 a live pointer is always
+        // <2^32, so the masked value fits u32 at runtime.
+        return @ptrFromInt(@as(usize, @intCast(self.payload.bits & row_view_ptr_mask)));
     }
 
     /// The 0-based row index for a `row_view` (high 16 bits of payload).

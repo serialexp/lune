@@ -875,10 +875,14 @@ const GATE_SKIP: u16 = 64;
 /// serialized) and traces are output-transparent (== tier-0). A collision only
 /// changes *which* back-edges take the slow path, never the result.
 inline fn hotIndex(proto: *const Proto, pc: u32) usize {
-    var h: usize = @intFromPtr(proto);
-    h ^= @as(usize, pc) *% 0x9E3779B97F4A7C15;
+    // Mix in u64 explicitly: the golden-ratio constant is 64-bit, so a `usize`
+    // accumulator overflows on a 32-bit target (wasm32). On a 64-bit target this is
+    // byte-identical to the old `usize` math (usize == u64); the final mask keeps
+    // the result within `HOTCOUNT_SIZE`, so the `@intCast` back to usize is safe.
+    var h: u64 = @intFromPtr(proto);
+    h ^= @as(u64, pc) *% 0x9E3779B97F4A7C15;
     h ^= h >> 29;
-    return h & (HOTCOUNT_SIZE - 1);
+    return @intCast(h & (HOTCOUNT_SIZE - 1));
 }
 
 /// One armed native link (P-E, doc 17 Increment 2.3): `parent`'s frameless exit slot
