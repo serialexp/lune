@@ -22,13 +22,15 @@
 //     this cross-engine record-vs-record comparison.
 //
 // Effect counts are read decode-free (a plain u32 prefix). The keyframe, however,
-// is normalized through the snapshot decoder before comparison to exclude the
-// global `arg` table: the native CLI populates `arg[0]` = the script path (a
-// nondeterministic temp path, commit 94cf36e), while the wasm embedding has no
-// argv and leaves `arg` empty. That divergence is an *embedding* difference, not a
-// language-determinism one, so `keyframeSansArg` empties `arg` and mark-sweeps the
-// now-orphaned path string from both sides before the structural compare. (The
-// trace/effects artifacts stay byte-compared.)
+// is normalized through the snapshot decoder before comparison to neutralize the
+// one host-injected difference: the native CLI populates `arg[0]` = the script
+// path (a nondeterministic temp path, commit 94cf36e), while the wasm embedding
+// has no argv and leaves it unset. That is an *embedding* difference, not a
+// language-determinism one, so `keyframeSansArg` drops integer key `0` from the
+// global `arg` table on both sides. Every OTHER part of the reachable state is
+// preserved with full fidelity — i64 globals as exact decimals, float64s by raw
+// bits, and the `loaded_chunks` list — so a genuine cross-engine divergence still
+// surfaces. (The trace/effects artifacts stay byte-compared.)
 
 import { SnapshotFileDecoder } from "./gen/generated";
 
@@ -39,20 +41,35 @@ function svId(sv: any): number | null {
   return sv && sv.tag === 4 ? Number(sv.body.value.id) : null;
 }
 
+// Lossless JSON scalarization: a bigint is emitted as its exact decimal string (a
+// `Number` cast would silently collapse any i64/u64 above 2^53), and raw bytes as
+// a numeric array.
 const jsonReplacer = (_k: string, v: any) =>
-  typeof v === "bigint" ? Number(v) : v instanceof Uint8Array ? Array.from(v) : v;
+  typeof v === "bigint" ? `i64:${v.toString()}` : v instanceof Uint8Array ? Array.from(v) : v;
+
+// A float64's exact 8-byte little-endian bit pattern as hex. Comparing the bits
+// (not the JS `number`) preserves the divergences JSON.stringify would erase: NaN
+// payloads, ±Infinity (both → `null`), and −0 (→ `0`).
+function f64Bits(v: number): string {
+  const dv = new DataView(new ArrayBuffer(8));
+  dv.setFloat64(0, v, true);
+  return dv.getBigUint64(0, true).toString(16).padStart(16, "0");
+}
 
 /**
- * Decode a keyframe, empty the global `arg` table, and return a canonical
- * structural string in which every object is relabelled by its first-visit order
- * in a deterministic walk from the roots (globals → string metatable → stack →
- * frames → open upvalues, each object's edges in a fixed order). Absolute object
- * ids are never emitted — only these traversal-relative indices — so the id SHIFT
- * that native introduces by allocating `arg[0]` = script path mid-sequence (which
- * bumps every later object's id by one vs the wasm embedding, and interns extra
- * global-name strings) cancels out. Two embeddings that agree on everything except
- * `arg` then compare equal. Returns a distinct fallback string if the buffer can't
- * be decoded, so a malformed keyframe surfaces as a mismatch rather than throwing.
+ * Decode a keyframe, drop `arg[0]`, and return a canonical structural string in
+ * which every object is relabelled by its first-visit order in a deterministic
+ * walk from the roots (globals → string metatable → stack → frames → open
+ * upvalues, each object's edges in a fixed order). Absolute object ids are never
+ * emitted — only these traversal-relative indices — so the id SHIFT that native
+ * introduces by allocating `arg[0]` = script path mid-sequence (which bumps every
+ * later object's id by one vs the wasm embedding, and interns extra global-name
+ * strings) cancels out. Scalars keep full fidelity: i64 as an exact decimal,
+ * float64 by raw bits (NaN/±Inf/−0 distinguished), and `loaded_chunks` is emitted
+ * in load order — so the ONLY thing this normalization hides is the host-injected
+ * `arg[0]`; any real divergence elsewhere still yields a different string. Returns
+ * a distinct fallback string if the buffer can't be decoded, so a malformed
+ * keyframe surfaces as a mismatch rather than throwing.
  */
 export function keyframeSansArg(bytes: Uint8Array): string {
   let kf: any;
@@ -64,7 +81,14 @@ export function keyframeSansArg(bytes: Uint8Array): string {
   const byId = new Map<number, any>();
   for (const o of kf.objects) byId.set(Number(o.id), o);
 
-  // Empty the `arg` table (globals["arg"]) so its script-path contents drop out.
+  // Neutralize the single host-injected slot globals["arg"][0]. The native CLI
+  // sets arg[0] = the script path (a nondeterministic temp path); the wasm
+  // embedding has no argv and leaves it unset. We drop integer key 0 from `arg` on
+  // BOTH sides — symmetric, so a user-set arg[0] cancels too — and leave every
+  // other slot (arg[1..], arg.foo, the array part) intact, so a genuine divergence
+  // there still surfaces. Key 0 is never in the array part (that holds keys 1..n),
+  // so it always lives in the hash `entries`. The now-orphaned path string simply
+  // isn't reached by the traversal below and drops out on its own.
   const globals = byId.get(Number(kf.globals_id));
   if (globals && globals.obj_type === 1) {
     for (const e of globals.body.value.entries) {
@@ -75,8 +99,9 @@ export function keyframeSansArg(bytes: Uint8Array): string {
         const argId = svId(e.val);
         const argTable = argId !== null ? byId.get(argId) : null;
         if (argTable && argTable.obj_type === 1) {
-          argTable.body.value.array = [];
-          argTable.body.value.entries = [];
+          argTable.body.value.entries = argTable.body.value.entries.filter(
+            (ae: any) => !(ae.key.tag === 2 && ae.key.body.value.v === 0n),
+          );
         }
       }
     }
@@ -97,8 +122,21 @@ export function keyframeSansArg(bytes: Uint8Array): string {
     queue.push(id);
     return idx;
   };
-  // A SnapValue → canonical form: a heap ref becomes {ref: idx}, a scalar its body.
-  const canonSv = (sv: any) => (sv.tag === 4 ? { ref: visit(Number(sv.body.value.id)) } : { tag: sv.tag, body: sv.body });
+  // A SnapValue → canonical form. Heap ref → traversal index; int64 → exact decimal
+  // (lossless past 2^53); float64 → raw bits (NaN/±Inf/−0 distinguished); nil/bool
+  // pass through their scalar body.
+  const canonSv = (sv: any): any => {
+    switch (sv.tag) {
+      case 4:
+        return { ref: visit(Number(sv.body.value.id)) };
+      case 2:
+        return { i64: sv.body.value.v.toString() };
+      case 3:
+        return { f64: f64Bits(sv.body.value.v) };
+      default:
+        return { tag: sv.tag, body: sv.body };
+    }
+  };
 
   const roots = {
     globals: visit(Number(kf.globals_id)),
@@ -141,7 +179,15 @@ export function keyframeSansArg(bytes: Uint8Array): string {
     objects.push({ obj_type: o.obj_type, body });
   }
 
-  return JSON.stringify({ roots, objects }, jsonReplacer);
+  // Runtime-`load`ed chunks are order-significant metadata with no object ids to
+  // relabel — emit them verbatim (in load order) so differing loaded source/name
+  // is not masked (finding: keyframeSansArg previously omitted them entirely).
+  const loaded_chunks = kf.loaded_chunks.map((c: any) => ({
+    source: Array.from(new Uint8Array(c.source)),
+    name: Array.from(new Uint8Array(c.name)),
+  }));
+
+  return JSON.stringify({ roots, objects, loaded_chunks }, jsonReplacer);
 }
 
 /** One engine's run output (wasm or native), artifacts as raw bytes. */
