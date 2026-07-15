@@ -3,7 +3,7 @@
 // the actions here.
 
 import { createStore } from "solid-js/store";
-import { decodeTraceFile, decodeExecLogFile, type TraceExecLogOutput } from "./decode";
+import { decodeTraceFile, decodeExecLogFile, decodeCoverageFile, type TraceExecLogOutput, type CoverageFileOutput, type CoverageAnchorOutput } from "./decode";
 import { viewsOf, type TraceView } from "./disasm";
 import { flattenExec, type ExecStep } from "./exec";
 import { loadLune, type LuneModule, type LuneRunResult, type LuneReplayResult, type LuneDiagnostic, type BacktraceFrame, type ProtoDisasm } from "./wasm/lune";
@@ -90,6 +90,44 @@ interface VizState {
   /** Animation slider position: an index into the selected trace's flattened
    *  event stream (`traceExecSteps()`). Reset to 0 on run / trace change. */
   traceExecPos: number;
+
+  // --- JIT execution coverage (fifth record family) ---
+  /** Decoded coverage artifact from the last wasm run: the aggregate
+   *  native-vs-tier-0 iteration split, the raw JIT event counters, and the
+   *  per-anchor breakdown. Null until a run produces one (a run that never
+   *  reached a back-edge yields no anchors, but the aggregate is still present).
+   *  Under wasm the `cycles_*`/`run_cycles` fields are 0 (no rdtsc) — the UI
+   *  weighs by iterations only. */
+  coverage: CoverageFileOutput | null;
+}
+
+/** The coverage class of a source line, from the last run's per-anchor data.
+ *  `native` = the loop's back-edges predominantly ran on compiled native code;
+ *  `covered-interpreted` = a trace exists for the loop but it predominantly fell
+ *  back to the tier-0 interpreter (the smell — traced yet not native);
+ *  `uncovered` = no trace exists, the loop ran purely interpreted. */
+export type CoverageClass = "native" | "covered-interpreted" | "uncovered";
+
+/** Per-source-line coverage tally (loop-header anchors resolved to their line).
+ *  Counts are back-edge iterations. `cls` is the dominant bucket. */
+export interface LineCoverage {
+  cls: CoverageClass;
+  /** Iterations that ran as native compiled code. */
+  native: number;
+  /** Interpreted iterations at an anchor that HAS a trace (the smell bucket). */
+  coveredInterp: number;
+  /** Interpreted iterations at an anchor with no trace at all. */
+  uncovered: number;
+}
+
+/** Pick the dominant bucket. Ties resolve toward the more interesting signal:
+ *  native > covered-interpreted (smell) > uncovered. */
+function classifyLine(c: LineCoverage): CoverageClass {
+  if (c.native >= c.coveredInterp && c.native >= c.uncovered && c.native > 0) return "native";
+  if (c.coveredInterp >= c.uncovered && c.coveredInterp > 0) return "covered-interpreted";
+  if (c.uncovered > 0) return "uncovered";
+  // All-zero anchor (has_trace set but never iterated): treat as the smell.
+  return "covered-interpreted";
 }
 
 /** The safepoint indices the slider steps through for a grain. `instr` is every
@@ -152,6 +190,7 @@ const [state, setState] = createStore<VizState>({
   disasm: [],
   execLogs: [],
   traceExecPos: 0,
+  coverage: null,
 });
 
 export { state };
@@ -209,6 +248,17 @@ function applyWasmResult(result: LuneRunResult, fileName: string, source: string
       execLogs = [];
     }
   }
+  // The JIT coverage artifact (fifth record family) — the native-vs-tier-0
+  // execution split + per-anchor breakdown. A decode failure degrades to no
+  // coverage view (the rest of the run still renders), never throws it away.
+  let coverage: CoverageFileOutput | null = null;
+  if (result.coverage.length > 0) {
+    try {
+      coverage = decodeCoverageFile(result.coverage);
+    } catch {
+      coverage = null;
+    }
+  }
   setState({
     fileName,
     version,
@@ -242,6 +292,7 @@ function applyWasmResult(result: LuneRunResult, fileName: string, source: string
     disasm: result.disasm,
     execLogs,
     traceExecPos: 0,
+    coverage,
   });
 }
 
@@ -367,6 +418,8 @@ export function loadBytes(name: string, bytes: Uint8Array): void {
       traces,
       selected: traces.length > 0 ? 0 : -1,
       error: null,
+      // A loaded .lunetrace carries no coverage — drop any stale run panel.
+      coverage: null,
     });
   } catch (e) {
     setState({
@@ -439,6 +492,84 @@ export function setTraceExecPos(pos: number): void {
 /** Step the animation one event backward / forward (no wrap). */
 export function stepTraceExec(delta: number): void {
   setTraceExecPos(state.traceExecPos + delta);
+}
+
+/** The aggregate coverage split, as raw counts + total + percentages. */
+export interface CoverageAggregate {
+  native: number;
+  coveredInterp: number;
+  uncovered: number;
+  total: number;
+  nativePct: number;
+  coveredInterpPct: number;
+  uncoveredPct: number;
+}
+
+/** Pure resolver: map per-anchor coverage `(proto_id, pc)` to source lines using
+ *  the static disasm (`disasm[proto_id].instrs[pc].line`). Anchors landing on the
+ *  same line are summed and the line's dominant class computed. Anchors the
+ *  disasm can't place (no proto, out-of-range pc, or line 0) are dropped. Pure —
+ *  no store access — so it's unit-testable directly. Mirrors `replayDisasm`'s
+ *  proto-by-id lookup. */
+export function resolveCoverageLines(
+  anchors: CoverageAnchorOutput[],
+  disasm: ProtoDisasm[],
+): Map<number, LineCoverage> {
+  const map = new Map<number, LineCoverage>();
+  for (const a of anchors) {
+    const proto = disasm.find((p) => p.id === a.proto_id);
+    const line = proto?.instrs[a.pc]?.line ?? 0;
+    if (line <= 0) continue;
+    let e = map.get(line);
+    if (e === undefined) {
+      e = { cls: "uncovered", native: 0, coveredInterp: 0, uncovered: 0 };
+      map.set(line, e);
+    }
+    // Iteration counts are exact small integers here (back-edge tallies); Number
+    // is lossless well past any realistic loop-trip count.
+    e.native += Number(a.traced_iters);
+    if (a.has_trace !== 0) e.coveredInterp += Number(a.interp_iters);
+    else e.uncovered += Number(a.interp_iters);
+  }
+  for (const e of map.values()) e.cls = classifyLine(e);
+  return map;
+}
+
+/** Pure aggregate: the native / covered-interpreted / uncovered iteration split
+ *  from a coverage artifact. The three buckets mirror `CoverageFile`'s
+ *  `iters_traced` / `iters_tier0_covered` / `iters_tier0_uncovered`. Pure — no
+ *  store access. */
+export function aggregateCoverage(cov: CoverageFileOutput): CoverageAggregate {
+  const native = Number(cov.iters_traced);
+  const coveredInterp = Number(cov.iters_tier0_covered);
+  const uncovered = Number(cov.iters_tier0_uncovered);
+  const total = native + coveredInterp + uncovered;
+  const p = (n: number): number => (total > 0 ? (n / total) * 100 : 0);
+  return {
+    native,
+    coveredInterp,
+    uncovered,
+    total,
+    nativePct: p(native),
+    coveredInterpPct: p(coveredInterp),
+    uncoveredPct: p(uncovered),
+  };
+}
+
+/** Resolve the last run's per-anchor coverage to source lines (store wrapper over
+ *  {@link resolveCoverageLines}). Empty when there's no coverage. */
+export function coverageByLine(): Map<number, LineCoverage> {
+  const cov = state.coverage;
+  if (cov === null) return new Map();
+  return resolveCoverageLines(cov.anchors, state.disasm);
+}
+
+/** The last run's aggregate coverage split (store wrapper over
+ *  {@link aggregateCoverage}). Null when there's no coverage. */
+export function coverageAggregate(): CoverageAggregate | null {
+  const cov = state.coverage;
+  if (cov === null) return null;
+  return aggregateCoverage(cov);
 }
 
 /** The bytecode view at the current replay step: the disassembly of the proto

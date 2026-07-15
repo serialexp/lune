@@ -654,6 +654,123 @@ table.replay-vars td {
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
+/* --- JIT-coverage line shading (Phase 3) --- */
+/* Loop-header anchors only, so a handful of lines light up: green = ran on
+   native compiled code, amber = a trace exists but it ran interpreted (the
+   smell), red = no trace, purely tier-0. A left rule keeps them legible even
+   over the active-line background. */
+.cm-cov-native {
+  background: #4fd6be1a;
+  box-shadow: inset 3px 0 0 #4fd6be;
+}
+.cm-cov-covered-interp {
+  background: #e0af681f;
+  box-shadow: inset 3px 0 0 #e0af68;
+}
+.cm-cov-uncovered {
+  background: #f7768e14;
+  box-shadow: inset 3px 0 0 #f7768e99;
+}
+
+/* --- JIT-coverage stats panel (Phase 3) --- */
+.coverage {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.6rem;
+  background: var(--panel2);
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.coverage-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+}
+
+.coverage-title {
+  font-weight: 600;
+}
+
+.coverage-empty {
+  font-size: 0.82rem;
+}
+
+/* Stacked proportion bar. Segments share these colours with the editor line
+   shading: green native / amber covered-interpreted / red uncovered. */
+.coverage-bar {
+  display: flex;
+  height: 0.6rem;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--border);
+}
+.coverage-bar .seg {
+  height: 100%;
+}
+.seg-native {
+  background: #4fd6be;
+}
+.seg-covered {
+  background: #e0af68;
+}
+.seg-uncovered {
+  background: #f7768e;
+}
+
+.coverage-legend {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-size: 0.82rem;
+}
+.coverage-legend .swatch {
+  display: inline-block;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 2px;
+  vertical-align: middle;
+  margin-right: 0.3rem;
+}
+.sw-native {
+  background: #4fd6be;
+}
+.sw-covered {
+  background: #e0af68;
+}
+.sw-uncovered {
+  background: #f7768e;
+}
+.coverage-hint {
+  font-size: 0.78rem;
+}
+
+.coverage-counters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.76rem;
+}
+.counter-chip {
+  display: inline-flex;
+  gap: 0.3rem;
+  padding: 0.1rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel);
+}
+.counter-name {
+  color: var(--muted);
+}
+.counter-val {
+  color: var(--fg);
+}
+
 /* --- step-replay bytecode listing (Phase 7 v9) --- */
 .bc-panel {
   border: 1px solid var(--border);

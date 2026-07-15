@@ -13,10 +13,15 @@ import {
   type TraceExecLogOutput,
   type TraceEntryOutput,
   type ExecEventOutput,
+  CoverageFileDecoder,
+  type CoverageFileOutput,
+  type CoverageAnchorOutput,
+  type JitCountersOutput,
 } from "./gen/generated";
 
 export type { TraceFileOutput, TraceOutput };
 export type { ExecLogFileOutput, TraceExecLogOutput, TraceEntryOutput, ExecEventOutput };
+export type { CoverageFileOutput, CoverageAnchorOutput, JitCountersOutput };
 
 /** A single decoded const: a discriminated union tagged by `body.type`. */
 export type DecodedConst = TraceOutput["consts"][number];
@@ -31,4 +36,12 @@ export function decodeTraceFile(bytes: Uint8Array): TraceFileOutput {
  *  stream the IR-interpreter recorded. Mirrors `decodeTraceFile`. */
 export function decodeExecLogFile(bytes: Uint8Array): ExecLogFileOutput {
   return new ExecLogFileDecoder(bytes).decode();
+}
+
+/** Decode a JIT **coverage** blob (the fifth record family) into its structural
+ *  form: the aggregate native-vs-tier-0 iteration split, the raw JIT event
+ *  counters, and the per-anchor (loop-header) breakdown. Mirrors
+ *  `decodeTraceFile`. */
+export function decodeCoverageFile(bytes: Uint8Array): CoverageFileOutput {
+  return new CoverageFileDecoder(bytes).decode();
 }

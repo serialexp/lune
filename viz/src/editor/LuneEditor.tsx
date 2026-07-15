@@ -9,7 +9,7 @@ import { EditorState, StateField, StateEffect } from "@codemirror/state";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { indentOnInput, bracketMatching } from "@codemirror/language";
 import { lintGutter, lintKeymap } from "@codemirror/lint";
-import { state, setSource, checkSource } from "../store";
+import { state, setSource, checkSource, coverageByLine, type CoverageClass } from "../store";
 import { luneLanguage, luneHighlighting } from "./luneLanguage";
 import { luneLinter, byteToUtf16 } from "./luneLinter";
 
@@ -63,6 +63,44 @@ const replayLineField = StateField.define<DecorationSet>({
   provide: (f) => EditorView.decorations.from(f),
 });
 
+// JIT-coverage line shading — a fourth decoration channel, independent of the
+// compile linter, runtime-error squiggle, and replay-line highlight (all can be
+// live at once). Only loop-header lines (the coverage anchors) are shaded, so
+// this colours a handful of lines, not the whole file: green = ran native, amber
+// = has a trace but ran interpreted (the smell), red = no trace / purely
+// interpreted. Cleared on any edit (line numbers would drift off the run).
+const COVERAGE_CLASS: Record<CoverageClass, string> = {
+  native: "cm-cov-native",
+  "covered-interpreted": "cm-cov-covered-interp",
+  uncovered: "cm-cov-uncovered",
+};
+
+const setCoverage = StateEffect.define<{ line: number; cls: CoverageClass }[] | null>();
+
+const coverageField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(deco, tr) {
+    for (const e of tr.effects) {
+      if (e.is(setCoverage)) {
+        if (e.value === null || e.value.length === 0) return Decoration.none;
+        const lines = tr.state.doc.lines;
+        // Line decorations must be added in document order — sort by line.
+        const ranges = e.value
+          .filter((c) => c.line >= 1 && c.line <= lines)
+          .sort((a, b) => a.line - b.line)
+          .map((c) =>
+            Decoration.line({ class: COVERAGE_CLASS[c.cls] }).range(tr.state.doc.line(c.line).from),
+          );
+        return Decoration.set(ranges);
+      }
+    }
+    // Any edit invalidates the last run's coverage — clear the shading.
+    if (tr.docChanged) return Decoration.none;
+    return deco;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
+
 /** Editor chrome theme matching the dark viz palette. Token colors live in the
  *  HighlightStyle (luneHighlighting); this is gutter/cursor/selection only. */
 const luneTheme = EditorView.theme(
@@ -102,6 +140,7 @@ export default function LuneEditor() {
           luneLinter(checkSource),
           runtimeErrorField,
           replayLineField,
+          coverageField,
           lintGutter(),
           luneTheme,
           EditorView.updateListener.of((u) => {
@@ -155,6 +194,18 @@ export default function LuneEditor() {
     const rs = state.replayState;
     const line = active && rs && !rs.finished && rs.currentLine > 0 ? rs.currentLine : null;
     view.dispatch({ effects: setReplayLine.of(line) });
+  });
+
+  // Mirror the last run's JIT coverage into the editor as per-line shading.
+  // Reactive on `coverageByLine()` (which reads `state.coverage` + `state.disasm`).
+  // The editor source may have been edited since the run; the coverage refers to
+  // the run's line numbers, so the field clears itself on any docChange — here we
+  // only (re)apply when a fresh map arrives. Empty map → clear.
+  createEffect(() => {
+    if (!view) return;
+    const byLine = coverageByLine();
+    const entries = Array.from(byLine, ([line, c]) => ({ line, cls: c.cls }));
+    view.dispatch({ effects: setCoverage.of(entries.length > 0 ? entries : null) });
   });
 
   onCleanup(() => view?.destroy());

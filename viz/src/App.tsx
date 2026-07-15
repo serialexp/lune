@@ -4,6 +4,7 @@ import LuneEditor from "./editor/LuneEditor";
 import TraceList from "./components/TraceList";
 import TraceView from "./components/TraceView";
 import ReplayPanel from "./components/ReplayPanel";
+import CoveragePanel from "./components/CoveragePanel";
 
 /** Format a byte count for the run readout: plain bytes under 1 KiB, else KiB. */
 function fmtBytes(n: number): string {
@@ -122,6 +123,10 @@ export default function App() {
               <pre class="run-stdout">{state.stdout}</pre>
             </Show>
           </div>
+        </Show>
+
+        <Show when={state.coverage}>
+          <CoveragePanel />
         </Show>
 
         <Show when={state.diff} keyed>
