@@ -64,6 +64,15 @@ const usage =
     \\                       arm/disarm events) to stderr as the program runs. Only
     \\                       compiled in with `zig build -Djit-debug=true`; a plain
     \\                       binary warns and ignores the flag.
+    \\  --jit-coverage       imply --trace and enable JIT execution-coverage
+    \\                       accounting, then print a one-line native-vs-tier-0
+    \\                       loop-iteration summary to stderr after the run. Combine
+    \\                       with --jit-native to measure the native path. NB: the
+    \\                       per-back-edge accounting is not free, so do not use it
+    \\                       when timing with --time.
+    \\  --jit-stats          imply --trace + --jit-coverage and print the FULL JIT
+    \\                       stats block to stderr after the run: event counters + the
+    \\                       native-vs-tier-0 coverage split + a per-anchor table.
     \\  --trace-hotguard <N>  imply --trace and override the guard-failure threshold
     \\                       for side-trace recording (default 50).  When a specific
     \\                       guard fails this many times, the next back-edge records
@@ -79,7 +88,9 @@ const usage =
     \\                       (e.g. clock() results) and serialize it to <file>
     \\                       (binschema wire format) after the run.
     \\  --time               print VM execute-only wall time to stderr after the
-    \\                       run (the run alone, excluding parse/compile/emit).
+    \\                       run (the run alone, excluding parse/compile/emit). Kept
+    \\                       free of JIT coverage accounting so the timing is clean;
+    \\                       add --jit-coverage explicitly if you also want the split.
     \\  -h, --help           show this help
     \\
 ;
@@ -125,6 +136,20 @@ const TraceOpts = struct {
     /// prints anything in a `-Djit-debug=true` build (the call sites are compiled
     /// out otherwise); a plain build warns to stderr and continues.
     jit_debug: bool = false,
+    /// `--jit-coverage` / `--jit-stats`: enable JIT execution-coverage accounting
+    /// (`config.coverage`) — native-vs-tier-0 loop-iteration split, per anchor.
+    /// Deliberately NOT implied by `--time`: the per-back-edge accounting is not
+    /// free (a hashmap probe per interpreted iteration), so `--time` stays clean
+    /// for benchmark timing and you opt into coverage explicitly.
+    coverage: bool = false,
+    /// `--jit-coverage`: after the run, print the ONE-LINE JIT coverage summary to
+    /// stderr. Implies `--trace` + `coverage`. Subsumed by `--jit-stats` (which
+    /// prints the full block), so the one-liner is skipped when `jit_stats` is set.
+    jit_coverage: bool = false,
+    /// `--jit-stats`: after the run, print the full JIT stats block (event counters
+    /// + coverage split + per-anchor table) to stderr. Implies `--trace` +
+    /// `coverage`; combine with `--jit-native` to measure the native path.
+    jit_stats: bool = false,
 };
 
 pub fn main(init: std.process.Init) u8 {
@@ -172,6 +197,16 @@ pub fn main(init: std.process.Init) u8 {
             if (!lune.jitdbg.enabled) {
                 lune.io.eprint("lune: warning: --jit-debug has no effect in this binary; rebuild with `zig build -Djit-debug=true`\n", .{});
             }
+        } else if (std.mem.eql(u8, arg, "--jit-coverage")) {
+            topts.enabled = true;
+            topts.execute = true;
+            topts.coverage = true;
+            topts.jit_coverage = true;
+        } else if (std.mem.eql(u8, arg, "--jit-stats")) {
+            topts.enabled = true;
+            topts.execute = true;
+            topts.coverage = true;
+            topts.jit_stats = true;
         } else if (std.mem.eql(u8, arg, "--trace-hotguard")) {
             topts.enabled = true;
             const val = it.next() orelse {
@@ -269,6 +304,7 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     vm.trace.config.native_codegen = topts.native_codegen;
     vm.trace.config.record_aborts = topts.dump_aborts;
     vm.trace.config.debug_log = topts.jit_debug;
+    vm.trace.config.coverage = topts.coverage;
     if (topts.hotguard) |v| vm.trace.config.hotguard = v;
     // The source backs located error messages: `error(msg, level)` prefixes
     // `chunk:line:` and `synthErrorValue`/`describeFault` read spans against it.
@@ -364,8 +400,24 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     };
 
     // --- execute-only timing (--time) --- to stderr, never interleaving stdout.
+    // Deliberately free of coverage accounting so the number is a clean measure of
+    // the run (add --jit-coverage explicitly to also get the split).
     if (topts.time) {
         lune.io.eprint("lune: executed in {d} ns ({d:.3} ms)\n", .{ exec_ns, @as(f64, @floatFromInt(exec_ns)) / 1e6 });
+    }
+
+    // --- JIT coverage output --- to stderr. `--jit-stats` prints the full block
+    // (event counters + iteration split + per-anchor table); `--jit-coverage`
+    // prints just the one-line summary, unless --jit-stats already covers it. The
+    // chunk is still alive, so every anchor's `proto.name` is valid.
+    if (topts.jit_stats) {
+        const w = lune.io.stderrWriter();
+        lune.trace.writeJitStats(w, &vm.trace, true) catch {};
+        w.flush() catch {};
+    } else if (topts.jit_coverage) {
+        const w = lune.io.stderrWriter();
+        lune.trace.writeJitStats(w, &vm.trace, false) catch {};
+        w.flush() catch {};
     }
 
     // --- dump recorded traces (--dump-traces) --- to stderr, so they never

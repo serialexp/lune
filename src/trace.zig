@@ -838,6 +838,14 @@ pub const TraceConfig = struct {
     /// sets it; tests set it on exactly the VM under investigation. Diagnostic
     /// only — stderr, never program output.
     debug_log: bool = false,
+    /// Runtime gate for JIT execution-coverage accounting (native-vs-tier-0 loop
+    /// iterations, per anchor). Off by default (the back-edge hot path pays only
+    /// one already-predicted branch); the CLI `--jit-stats`/`--time` flags set it,
+    /// and the WASM entry forces it on (the viz always instruments). When on, each
+    /// interpreted back-edge is classified (covered/uncovered via `findTrace`) and
+    /// native runs add their committed iteration count. Diagnostic only — never
+    /// affects tiering or output; the report goes to stderr.
+    coverage: bool = false,
 };
 
 /// Direct-mapped hot-count table size (a power of two). A back-edge hashes its
@@ -873,6 +881,16 @@ inline fn hotIndex(proto: *const Proto, pc: u32) usize {
 /// identity (not a raw slot address) so lifetime resets stay valid no matter which
 /// end retires first — the slot address is re-derived from the live `parent` at reset.
 pub const NativeLink = struct { parent: *Trace, slot_index: u32, child: *Trace };
+
+/// Per-anchor JIT execution-coverage tally (`TraceState.coverage` value). `traced`
+/// = loop iterations committed by trace runs (tier-1b native, or tier-1a IR-interp)
+/// anchored here; `interp` = interpreted (tier-0) back-edges taken at this anchor.
+/// `has_trace` flips true once a trace is committed at this anchor (at commit, and
+/// defensively on any trace run), so `noteInterpIter` can classify each interpreted
+/// back-edge covered-vs-uncovered in O(1) — a single map probe it already does —
+/// with no `findTrace` cache scan on the hot path. Accumulated only when
+/// `config.coverage`.
+pub const AnchorCoverage = struct { traced: u64 = 0, interp: u64 = 0, has_trace: bool = false };
 
 /// All recorder state owned by a `Vm`: the hotness counters, the cache of
 /// committed traces, and the single in-progress `Recorder`.
@@ -1017,6 +1035,26 @@ pub const TraceState = struct {
     /// there). This is the Phase-2-specific "the prime chain fired, not merely
     /// recorded" signal the design demands — output equality alone can't prove it.
     prime_side_chain_follows: u64 = 0,
+    /// **JIT execution-coverage accounting** (gated on `config.coverage`). Measures
+    /// the gap between what the JIT *traces* and what actually runs *as a trace*, in
+    /// the natural unit of a trace JIT — loop iterations (back-edges). `iters_traced`
+    /// = iterations committed by a trace run (tier-1b native, or tier-1a IR-interp
+    /// when native is off/unavailable — either way NOT the tier-0 bytecode
+    /// interpreter), summed in `onSideExit`; `iters_tier0_covered` = interpreted
+    /// back-edges at an anchor that HAS a compiled trace (the smell: covered code
+    /// that keeps falling back to tier-0); `iters_tier0_uncovered` = interpreted
+    /// back-edges at an anchor with no trace. Total loop iterations = the sum of the
+    /// three; "covered by a trace" = traced + tier0_covered; "ran as a trace" =
+    /// traced / total.
+    iters_traced: u64 = 0,
+    iters_tier0_covered: u64 = 0,
+    iters_tier0_uncovered: u64 = 0,
+    /// Per-anchor breakdown of the same accounting, keyed by loop-header anchor, so
+    /// the report (and the viz) can attribute traced/interpreted iterations to a
+    /// specific source region. Populated only when `config.coverage`; freed in
+    /// `deinit`. `AnchorCoverage.traced`/`.interp` mirror the aggregates above,
+    /// partitioned by anchor.
+    coverage: std.AutoHashMapUnmanaged(AnchorKey, AnchorCoverage) = .empty,
     /// The in-progress recording (at most one at a time in Phase 5a).
     rec: Recorder = .{},
     /// Reusable SSA-value scratch for the tier-1a executor (`irinterp.execute`),
@@ -1163,12 +1201,61 @@ pub const TraceState = struct {
         self.abort_log.deinit(self.gpa);
         if (self.exec_recorder) |*r| r.deinit();
         self.armed_links.deinit(self.gpa);
+        self.coverage.deinit(self.gpa);
         // Free each trace (its `native.deinit()` returns mcode slots to the arena's
         // free-list) *before* tearing down the arena those slots live in.
         for (self.cache.items) |t| t.destroy(self.gpa);
         self.cache.deinit(self.gpa);
         self.mcode_arena.deinit();
         self.rec.deinit(self.gpa);
+    }
+
+    /// Record one interpreted (tier-0) loop back-edge at `(proto, pc)` for coverage
+    /// accounting. Classifies it covered (a trace has been committed at this anchor —
+    /// the "has a trace but ran interpreted" fallback smell) vs uncovered via the
+    /// per-anchor `has_trace` flag — an O(1) map probe, NOT a `findTrace` cache scan,
+    /// so this stays cheap on the 10M-back-edge hot path (it must, since `--time`
+    /// enables it and the bench harness times under `--time`). Caller gates on
+    /// `config.coverage`. On OOM the per-anchor row is lost but an aggregate is still
+    /// bumped (counted uncovered — no map entry means no known trace).
+    pub fn noteInterpIter(self: *TraceState, proto: *const Proto, pc: u32) void {
+        const gop = self.coverage.getOrPut(self.gpa, .{ .proto = proto, .pc = pc }) catch {
+            self.iters_tier0_uncovered +|= 1;
+            return;
+        };
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.interp +|= 1;
+        if (gop.value_ptr.has_trace) {
+            self.iters_tier0_covered +|= 1;
+        } else {
+            self.iters_tier0_uncovered +|= 1;
+        }
+    }
+
+    /// Record `n` loop iterations committed by a trace run anchored at `anchor`, for
+    /// coverage accounting. Called from `onSideExit` — the single per-trace-commit
+    /// hook every trace run (tier-1a and tier-1b, direct and every `driveChain` hop)
+    /// funnels through exactly once with its OWN committed count, so summing here is
+    /// double-count-free. Also flips `has_trace` (a run implies a trace exists — a
+    /// belt-and-suspenders guard beside the commit-time `markAnchorTraced`). Caller
+    /// gates on `config.coverage`. OOM on the per-anchor map is swallowed (the
+    /// aggregate `iters_traced` still holds).
+    pub fn noteTraceIters(self: *TraceState, anchor: AnchorKey, n: u64) void {
+        self.iters_traced +|= n;
+        const gop = self.coverage.getOrPut(self.gpa, anchor) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.traced +|= n;
+        gop.value_ptr.has_trace = true;
+    }
+
+    /// Mark `anchor` as having a committed trace, for coverage classification. Called
+    /// once per trace commit (gated on `config.coverage`), so interpreted back-edges
+    /// taken after the commit are classified covered (fallback-despite-a-trace) while
+    /// warmup back-edges before it stay uncovered. O(1). OOM swallowed.
+    pub fn markAnchorTraced(self: *TraceState, anchor: AnchorKey) void {
+        const gop = self.coverage.getOrPut(self.gpa, anchor) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.has_trace = true;
     }
 
     /// The `ExecLogRecorder` re-targeted at the execution log for `trace_id` (the
@@ -1332,6 +1419,12 @@ pub const TraceState = struct {
     /// off with a doubling cooldown (`gateAnchor`).
     pub fn onSideExit(self: *TraceState, t: *Trace, completed: usize) void {
         const key = t.anchor;
+        // JIT coverage (gated): this is the single per-trace-commit hook — every
+        // trace run (tier-1a/1b, direct dispatch or a `driveChain` hop) reaches here
+        // exactly once with its OWN committed count. Summing `completed` is the
+        // "ran as a trace, not tier-0" total, disjoint from the interpreted-back-edge
+        // count in the dispatcher (Rule #3: accounting stays self-consistent).
+        if (self.config.coverage and completed > 0) self.noteTraceIters(key, completed);
         if (completed >= self.config.min_useful) {
             t.hit_count +|= 1;
             _ = self.penalty.remove(key);
@@ -3607,6 +3700,9 @@ pub const TraceState = struct {
             .inputs = inputs_owned,
         };
         try self.cache.append(self.gpa, t);
+        // Coverage (gated): a trace now exists at this anchor, so subsequent
+        // interpreted back-edges here are "fallback despite a trace."
+        if (self.config.coverage) self.markAnchorTraced(t.anchor);
     }
 
     /// Debug-only structural verifier for the invariants the tier-1a executor
@@ -5335,6 +5431,92 @@ pub fn writeAborts(w: *io.Writer, rows: []AbortRecord) io.Writer.Error!void {
             @tagName(r.op),
             r.proto.name,
         });
+    }
+}
+
+/// Percentage `x / total * 100` as an `f64`, or 0 when `total == 0`.
+fn pctOf(x: u64, total: u64) f64 {
+    if (total == 0) return 0;
+    return @as(f64, @floatFromInt(x)) * 100.0 / @as(f64, @floatFromInt(total));
+}
+
+/// One per-anchor coverage row, materialized from the `coverage` map for sorted
+/// display (a hashmap has no stable iteration order; the report must be
+/// reproducible — Rule Z-3).
+const CoverageRow = struct { name: []const u8, pc: u32, traced: u64, interp: u64 };
+
+/// Render the JIT stats report to `w` (stderr, via `--jit-stats`/`--time`). Reads
+/// only — never mutates `ts`. `full = false` prints just the one-line coverage
+/// summary (for `--time`); `full = true` prints the whole block: the event
+/// counters, the aggregate native-vs-tier-0 iteration split, and a per-anchor
+/// table. All numbers are loop iterations (back-edges) unless labeled otherwise.
+/// Requires `ts.config.coverage` to have been on during the run, else the
+/// iteration counts are all zero (the event counters are always live).
+pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer.Error!void {
+    const traced = ts.iters_traced;
+    const covered_interp = ts.iters_tier0_covered;
+    const uncovered = ts.iters_tier0_uncovered;
+    const total = traced +| covered_interp +| uncovered;
+    // "covered by a trace" = a compiled trace exists at the anchor = ran-as-trace
+    // plus fell-back-despite-a-trace.
+    const covered = traced +| covered_interp;
+
+    if (!full) {
+        // One-liner for --time. `fallback` = the smell: had a trace, ran tier-0.
+        try w.print(
+            "lune: jit coverage — traced {d:.1}% / covered {d:.1}% / fallback {d:.1}% (iters traced={d} cov-interp={d} uncov={d} total={d})\n",
+            .{ pctOf(traced, total), pctOf(covered, total), pctOf(covered_interp, total), traced, covered_interp, uncovered, total },
+        );
+        return;
+    }
+
+    try w.writeAll("lune: JIT stats\n");
+    try w.writeAll("  event counters:\n");
+    try w.print("    trace entries:        {d}\n", .{ts.entries});
+    try w.print("    link arms:            native={d} source={d} loopdone={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms });
+    try w.print("    link fused:           source={d} loopdone={d}\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused });
+    try w.print("    link disarms:         {d}\n", .{ts.native_link_disarms});
+    try w.print("    native link exits:    {d} (follows={d})\n", .{ ts.native_link_exits, ts.native_link_follow_count });
+    try w.print("    ir link exits:        {d} (follows={d})\n", .{ ts.link_ir_exits, ts.link_follow_count });
+    try w.print("    prime-side:           arms={d} chain-follows={d} tier0-body-entries={d}\n", .{ ts.prime_side_arms, ts.prime_side_chain_follows, ts.tier0_outer_body_entries });
+
+    try w.writeAll("  coverage (loop iterations):\n");
+    try w.print("    traced (ran as trace):  {d:>12}  ({d:.1}%)\n", .{ traced, pctOf(traced, total) });
+    try w.print("    tier-0, has-trace:      {d:>12}  ({d:.1}%)   <- fallback despite a trace\n", .{ covered_interp, pctOf(covered_interp, total) });
+    try w.print("    tier-0, no-trace:       {d:>12}  ({d:.1}%)\n", .{ uncovered, pctOf(uncovered, total) });
+    try w.print("    total:                  {d:>12}\n", .{total});
+    try w.print("    covered by a trace:     {d:.1}%   ran as a trace: {d:.1}%\n", .{ pctOf(covered, total), pctOf(traced, total) });
+
+    // Per-anchor table, sorted (proto name, pc) for reproducibility. Fixed buffer:
+    // real programs have a handful of hot loops; note if it ever overflows.
+    var rows: [256]CoverageRow = undefined;
+    var n: usize = 0;
+    var truncated = false;
+    var it = ts.coverage.iterator();
+    while (it.next()) |e| {
+        if (n == rows.len) {
+            truncated = true;
+            break;
+        }
+        rows[n] = .{ .name = e.key_ptr.proto.name, .pc = e.key_ptr.pc, .traced = e.value_ptr.traced, .interp = e.value_ptr.interp };
+        n += 1;
+    }
+    std.mem.sort(CoverageRow, rows[0..n], {}, struct {
+        fn lt(_: void, a: CoverageRow, b: CoverageRow) bool {
+            const c = std.mem.order(u8, a.name, b.name);
+            if (c != .eq) return c == .lt;
+            return a.pc < b.pc;
+        }
+    }.lt);
+    if (n > 0) {
+        try w.writeAll("  per-anchor (loop header → iterations):\n");
+        try w.print("    {s:<20}  {s:>12}  {s:>12}  {s:>7}\n", .{ "anchor", "traced", "interp", "trace%" });
+        for (rows[0..n]) |r| {
+            var name_pc_buf: [64]u8 = undefined;
+            const label = std.fmt.bufPrint(&name_pc_buf, "{s}:{d}", .{ r.name, r.pc }) catch "?";
+            try w.print("    {s:<20}  {d:>12}  {d:>12}  {d:>6.1}%\n", .{ label, r.traced, r.interp, pctOf(r.traced, r.traced +| r.interp) });
+        }
+        if (truncated) try w.writeAll("    … (per-anchor table truncated at 256 anchors)\n");
     }
 }
 

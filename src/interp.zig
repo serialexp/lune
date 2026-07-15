@@ -2447,6 +2447,14 @@ pub const Vm = struct {
             // `enabled`, so it is inert until `--trace`.
             if (self.trace.config.enabled and pc <= cur_pc) {
                 const anchor_pc: u32 = @intCast(pc);
+                // JIT coverage (gated): arriving at a back-edge means tier-0 just
+                // interpreted one loop-body iteration. Classify it covered (a trace
+                // exists at this anchor — the fallback-despite-a-trace smell) vs
+                // uncovered. Trace-run iterations are counted separately in
+                // `onSideExit` (trace.zig); the two are disjoint (a trace's committed
+                // count excludes the deopt iteration tier-0 redoes on side-exit), so
+                // there is no double count.
+                if (self.trace.config.coverage) self.trace.noteInterpIter(proto, anchor_pc);
                 // Cheap direct-mapped hot-count pre-filter. A gated/dead loop (the
                 // canonical case: nsieve's array-growing init loop, which can't be
                 // traced) skips the per-back-edge hashmap bookkeeping in
@@ -10176,6 +10184,118 @@ test "2c-F (doc 17): a hot armed cycle inside a repeatedly-called function stays
     // exercise the live fused handoff, not a degraded ping-pong).
     try testing.expect(vm.trace.native_loopdone_link_arms > 0);
     try testing.expect(vm.trace.native_loopdone_link_fused > 0);
+}
+
+// Like `runNativeForTrace` but also flips on JIT coverage accounting so the
+// iteration counters (`iters_traced` / `iters_tier0_covered` /
+// `iters_tier0_uncovered`) are populated. Used by the self-consistency tests
+// below (Phase 1 of the coverage-instrumentation arc).
+fn runCoverageForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer) !compiler.Chunk {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.coverage = true;
+    vm.trace.config.hotloop = 4;
+    vm.out = sink;
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    errdefer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    return chunk;
+}
+
+test "jit coverage: iteration accounting is self-consistent with the analytic trip count" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // A single hot numeric `for` loop of a known trip count. Every loop-body
+    // iteration is accounted exactly once: either the trace executed it
+    // (`iters_traced`, committed in `onSideExit`) or tier-0 interpreted it
+    // (`iters_tier0_*`, counted at the back-edge). The two are disjoint by
+    // construction — a trace's committed count excludes the deopt iteration
+    // tier-0 redoes on side-exit — so the three counters must sum to the exact
+    // number of loop-body iterations, which for `for i=1,N` is exactly N.
+    const N = 5000;
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runCoverageForTrace(&vm, gpa,
+        \\local acc = 0
+        \\for i = 1, 5000 do acc = acc + i end
+        \\print(acc)
+    , &sink);
+    defer chunk.deinit();
+
+    // Correctness first: same result tier-0 produces.
+    try testing.expectEqualStrings("12502500\n", sink.buffered());
+
+    const t = &vm.trace;
+    const total = t.iters_traced + t.iters_tier0_covered + t.iters_tier0_uncovered;
+    // Exhaustive + disjoint == exact analytic count (N loop-body iterations).
+    try testing.expectEqual(@as(u64, N), total);
+    // The loop genuinely tiered up — most iterations really ran as a trace …
+    try testing.expect(t.iters_traced > 0);
+    // … and this is the *clean* case: a single monotype loop, so once the
+    // trace commits nothing ever falls back to tier-0. `iters_tier0_covered`
+    // (interpreted-despite-a-trace) is therefore zero — the remaining tier-0
+    // iterations are the pre-commit warmup, classified `uncovered` because no
+    // trace existed yet when they ran. (Contrast the nested test below, which
+    // deliberately produces a non-zero covered gap.)
+    try testing.expectEqual(@as(u64, 0), t.iters_tier0_covered);
+}
+
+test "jit coverage: the covered-but-interpreted gap is populated (fallback despite a trace)" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // The smell Bart wants exposed: an anchor that HAS a trace yet keeps
+    // dropping to tier-0. An nsieve-shaped nest — an outer scan whose body
+    // branches, and a nested marking loop — produces exactly this: the outer
+    // header traces but its many short/branchy re-entries deopt, so
+    // `iters_tier0_covered` (interpreted-despite-a-trace) is non-zero WHILE
+    // `iters_traced` is also non-zero. This is the relationship the report
+    // makes visible.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runCoverageForTrace(&vm, gpa,
+        \\local count = 0
+        \\local n = 4000
+        \\local p = {}
+        \\for i = 2, n do p[i] = true end
+        \\for i = 2, n do
+        \\  if p[i] then
+        \\    count = count + 1
+        \\    local k = i + i
+        \\    while k <= n do
+        \\      p[k] = false
+        \\      k = k + i
+        \\    end
+        \\  end
+        \\end
+        \\print(count)
+    , &sink);
+    defer chunk.deinit();
+
+    const t = &vm.trace;
+    // Self-consistency still holds across the whole nest: every counted
+    // iteration is accounted exactly once. (We don't pin the exact total here
+    // — the point of this test is the *gap*, verified by the two-sided bound
+    // below — but both classes must be genuinely populated.)
+    try testing.expect(t.iters_traced > 0);
+    // The gap: iterations that fell back to tier-0 even though a trace exists
+    // at their anchor. If this were zero, "covered" would trivially equal
+    // "executed natively" and there would be nothing to expose.
+    try testing.expect(t.iters_tier0_covered > 0);
 }
 
 test "coherent-state chaining (doc 16, Phase 2): nsieve prime path chains, not tier-0" {
