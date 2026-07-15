@@ -6,7 +6,7 @@
 // are pure (no store singleton), so we drive them with hand-built fixtures.
 
 import { test, expect } from "bun:test";
-import { resolveCoverageLines, aggregateCoverage } from "../src/store";
+import { resolveCoverageLines, aggregateCoverage, timeSplitOf } from "../src/store";
 import type { CoverageAnchorOutput, CoverageFileOutput } from "../src/decode";
 import type { ProtoDisasm } from "../src/wasm/lune";
 
@@ -98,17 +98,24 @@ test("drops anchors the disasm can't place (bad proto, out-of-range pc, or line 
   expect([...m.keys()]).toEqual([5]);
 });
 
-/** A CoverageFile carrying just the aggregate counts (anchors/counters empty). */
-function covWith(traced: bigint, covered: bigint, uncovered: bigint): CoverageFileOutput {
+/** A CoverageFile carrying just the aggregate counts (anchors/counters empty).
+ *  Optional `cycles` sets the time split `[traced, covered, uncovered, run]`. */
+function covWith(
+  traced: bigint,
+  covered: bigint,
+  uncovered: bigint,
+  cycles?: [bigint, bigint, bigint, bigint],
+): CoverageFileOutput {
+  const [ct, cc, cu, run] = cycles ?? [0n, 0n, 0n, 0n];
   return {
     version: 1,
     iters_traced: traced,
     iters_tier0_covered: covered,
     iters_tier0_uncovered: uncovered,
-    cycles_traced: 0n,
-    cycles_tier0_covered: 0n,
-    cycles_tier0_uncovered: 0n,
-    run_cycles: 0n,
+    cycles_traced: ct,
+    cycles_tier0_covered: cc,
+    cycles_tier0_uncovered: cu,
+    run_cycles: run,
     counters: {
       entries: 0n,
       native_link_arms: 0n,
@@ -143,4 +150,23 @@ test("aggregate with no iterations reports zero percentages, not NaN", () => {
   expect(a.nativePct).toBe(0);
   expect(a.coveredInterpPct).toBe(0);
   expect(a.uncoveredPct).toBe(0);
+});
+
+test("timeSplitOf is null without cycle data (a wasm run — no rdtsc)", () => {
+  expect(timeSplitOf(covWith(100n, 50n, 0n))).toBeNull(); // run_cycles == 0
+});
+
+test("timeSplitOf gives the honest time split — % of run, with a non-loop remainder", () => {
+  // The nsieve shape: iterations flatter the JIT (traced dominates), but by TIME
+  // the traced fraction is tiny and tier-0-has-trace dominates. run > loop sum, so
+  // there's a non-loop remainder.
+  //   iterations: 60% traced; cycles: 10 traced / 970 covered / 5 uncovered of 1000 run.
+  const t = timeSplitOf(covWith(600n, 400n, 0n, [10n, 970n, 5n, 1000n]))!;
+  expect(t).not.toBeNull();
+  expect(t.run).toBe(1000);
+  expect(t.nativePct).toBeCloseTo(1.0); // ~1% of run ran as a trace — the honest number
+  expect(t.coveredInterpPct).toBeCloseTo(97.0);
+  expect(t.uncoveredPct).toBeCloseTo(0.5);
+  expect(t.other).toBe(15); // 1000 - 10 - 970 - 5 = non-loop
+  expect(t.otherPct).toBeCloseTo(1.5);
 });

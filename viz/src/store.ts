@@ -106,6 +106,12 @@ interface VizState {
    *  Under wasm the `cycles_*`/`run_cycles` fields are 0 (no rdtsc) — the UI
    *  weighs by iterations only. */
   coverage: CoverageFileOutput | null;
+  /** The honest, time-weighted coverage from the NATIVE binary (real TSC cycles),
+   *  fetched via the dev-server `/run` endpoint during "Run both + diff". Null on a
+   *  plain wasm run (the panel's time column then reads "run native"). The native
+   *  run is `--jit-native`, so `cycles_traced` is genuine native-machine-code time
+   *  — the number the wasm iteration split can't show. */
+  nativeCoverage: CoverageFileOutput | null;
 }
 
 /** The coverage class of a source line, from the last run's per-anchor data.
@@ -200,6 +206,7 @@ const [state, setState] = createStore<VizState>({
   execLogs: [],
   traceExecPos: 0,
   coverage: null,
+  nativeCoverage: null,
 });
 
 export { state };
@@ -409,7 +416,9 @@ export async function runWasm(): Promise<void> {
     const src = state.source;
     const result = mod.runSource(src, wasmArgv());
     applyWasmResult(result, "(wasm run)", src);
-    setState({ running: false });
+    // A wasm-only run has no cycle counter — drop any prior native time split so
+    // the panel's time column reverts to "run native".
+    setState({ running: false, nativeCoverage: null });
   } catch (e) {
     setState({
       running: false,
@@ -439,7 +448,17 @@ export async function runBoth(): Promise<void> {
       runNative(src, userArgs),
     ]);
     applyWasmResult(wasm, "(wasm + native diff)", src);
-    setState({ diff: diffRuns(wasm, native), running: false });
+    // The native run carries the honest time-weighted coverage (real TSC cycles).
+    // Decode best-effort — a failure just leaves the time column grayed.
+    let nativeCoverage: CoverageFileOutput | null = null;
+    if (native.coverage.length > 0) {
+      try {
+        nativeCoverage = decodeCoverageFile(native.coverage);
+      } catch {
+        nativeCoverage = null;
+      }
+    }
+    setState({ diff: diffRuns(wasm, native), running: false, nativeCoverage });
   } catch (e) {
     setState({
       running: false,
@@ -461,6 +480,7 @@ export function loadBytes(name: string, bytes: Uint8Array): void {
       error: null,
       // A loaded .lunetrace carries no coverage — drop any stale run panel.
       coverage: null,
+      nativeCoverage: null,
     });
   } catch (e) {
     setState({
@@ -595,6 +615,53 @@ export function aggregateCoverage(cov: CoverageFileOutput): CoverageAggregate {
     coveredInterpPct: p(coveredInterp),
     uncoveredPct: p(uncovered),
   };
+}
+
+/** The time-weighted coverage split, in TSC cycles + percentage of the whole
+ *  run. The three loop buckets mirror the iteration split; `other` is non-loop
+ *  time (call overhead, allocation, the parts that never hit a back-edge). */
+export interface CoverageTimeSplit {
+  native: number;
+  coveredInterp: number;
+  uncovered: number;
+  other: number;
+  run: number;
+  nativePct: number;
+  coveredInterpPct: number;
+  uncoveredPct: number;
+  otherPct: number;
+}
+
+/** Pure time split from a coverage artifact carrying real cycles. Percentages are
+ *  of `run_cycles` (the honest denominator the CLI uses — "% of run"), so the
+ *  three loop buckets + `other` sum to 100%. Returns null when the artifact has no
+ *  cycle data (`run_cycles == 0`, i.e. a wasm run — no rdtsc). Pure. */
+export function timeSplitOf(cov: CoverageFileOutput): CoverageTimeSplit | null {
+  const run = Number(cov.run_cycles);
+  if (run <= 0) return null;
+  const native = Number(cov.cycles_traced);
+  const coveredInterp = Number(cov.cycles_tier0_covered);
+  const uncovered = Number(cov.cycles_tier0_uncovered);
+  const other = Math.max(0, run - native - coveredInterp - uncovered);
+  const p = (n: number): number => (n / run) * 100;
+  return {
+    native,
+    coveredInterp,
+    uncovered,
+    other,
+    run,
+    nativePct: p(native),
+    coveredInterpPct: p(coveredInterp),
+    uncoveredPct: p(uncovered),
+    otherPct: p(other),
+  };
+}
+
+/** The honest native time split from the last "Run both" (store wrapper over
+ *  {@link timeSplitOf}). Null on a wasm-only run — the panel then grays the time
+ *  column and prompts "run native". */
+export function nativeTimeSplit(): CoverageTimeSplit | null {
+  return state.nativeCoverage ? timeSplitOf(state.nativeCoverage) : null;
 }
 
 /** Resolve the last run's per-anchor coverage to source lines (store wrapper over

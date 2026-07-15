@@ -37,6 +37,7 @@ function runNative(source: string, args: string[]): {
   keyframe: string;
   effects: string;
   trace: string;
+  coverage: string;
 } {
   const dir = mkdtempSync(join(tmpdir(), "lune-diff-"));
   try {
@@ -44,7 +45,15 @@ function runNative(source: string, args: string[]): {
     const kf = join(dir, "k.lunesnap");
     const ef = join(dir, "e.luneeff");
     const tr = join(dir, "t.lunetrace");
+    const cov = join(dir, "c.lunecov");
     writeFileSync(src, source);
+    const b64 = (p: string): string => {
+      try {
+        return readFileSync(p).toString("base64");
+      } catch {
+        return "";
+      }
+    };
     // Script args go AFTER the source path — the native CLI fills `arg[1..]` from
     // them (arg[0] is the src path). The wasm run gets the same arg[1..] (its
     // arg[0] is the in-browser script name); the differential validator cancels
@@ -55,13 +64,18 @@ function runNative(source: string, args: string[]): {
       ["--emit-traces", tr, "--emit-keyframe", kf, "--emit-effects", ef, src, ...args],
       { encoding: "buffer", timeout: 15_000 },
     );
-    const b64 = (p: string): string => {
-      try {
-        return readFileSync(p).toString("base64");
-      } catch {
-        return "";
-      }
-    };
+    // A SECOND, separate run purely to capture the honest native coverage split
+    // (real TSC cycles): `--jit-native` so traces run as native machine code (the
+    // wasm playground can't — no codegen), `--emit-coverage` for the artifact. Its
+    // keyframe/effects/trace are irrelevant here; only the diff run above feeds the
+    // determinism compare, which stays a pure tier-0 check untouched by this
+    // observation run. Best-effort: a failure just leaves coverage empty (the
+    // panel keeps its wasm iteration split, time column grayed).
+    spawnSync(
+      nativeBin,
+      ["--jit-native", "--emit-coverage", cov, src, ...args],
+      { encoding: "buffer", timeout: 15_000 },
+    );
     return {
       status: r.status === 0 ? 0 : 1,
       stdout: (r.stdout ?? Buffer.alloc(0)).toString("utf8"),
@@ -69,6 +83,7 @@ function runNative(source: string, args: string[]): {
       keyframe: b64(kf),
       effects: b64(ef),
       trace: b64(tr),
+      coverage: b64(cov),
     };
   } finally {
     rmSync(dir, { recursive: true, force: true });

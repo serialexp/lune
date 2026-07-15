@@ -13,6 +13,7 @@ interface NativeRunResponse {
   keyframe: string; // base64
   effects: string; // base64
   trace: string; // base64
+  coverage: string; // base64 — the honest native coverage (real TSC cycles)
   error?: string;
 }
 
@@ -27,7 +28,7 @@ function fromBase64(b64: string): Uint8Array {
 /** Run `source` (with optional script `args` → `arg[1..]`) through the native
  *  binary via the dev server. Throws if the endpoint is unavailable (e.g. running
  *  against a static build, not `vite dev`). */
-export async function runNative(source: string, args: string[] = []): Promise<RunArtifacts & { diagnostics: string }> {
+export async function runNative(source: string, args: string[] = []): Promise<RunArtifacts & { diagnostics: string; coverage: Uint8Array }> {
   const resp = await fetch("/run", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -45,5 +46,6 @@ export async function runNative(source: string, args: string[] = []): Promise<Ru
     keyframe: fromBase64(data.keyframe),
     effects: fromBase64(data.effects),
     trace: fromBase64(data.trace),
+    coverage: fromBase64(data.coverage ?? ""),
   };
 }
