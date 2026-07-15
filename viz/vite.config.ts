@@ -30,7 +30,7 @@ function readBody(req: import("node:http").IncomingMessage): Promise<string> {
 // Run `source` through the native binary with all three emit flags and collect
 // the artifact bytes (base64) + the program's stdout. Mirrors the flag set the
 // wasm entry uses internally, so the two are comparable.
-function runNative(source: string): {
+function runNative(source: string, args: string[]): {
   status: number;
   stdout: string;
   diagnostics: string;
@@ -45,9 +45,14 @@ function runNative(source: string): {
     const ef = join(dir, "e.luneeff");
     const tr = join(dir, "t.lunetrace");
     writeFileSync(src, source);
+    // Script args go AFTER the source path — the native CLI fills `arg[1..]` from
+    // them (arg[0] is the src path). The wasm run gets the same arg[1..] (its
+    // arg[0] is the in-browser script name); the differential validator cancels
+    // the arg[0] divergence structurally (keyframeSansArg), so arg[1..] must
+    // match for the keyframe compare to pass.
     const r = spawnSync(
       nativeBin,
-      ["--emit-traces", tr, "--emit-keyframe", kf, "--emit-effects", ef, src],
+      ["--emit-traces", tr, "--emit-keyframe", kf, "--emit-effects", ef, src, ...args],
       { encoding: "buffer", timeout: 15_000 },
     );
     const b64 = (p: string): string => {
@@ -93,8 +98,21 @@ function luneWasm(): Plugin {
         if (req.method !== "POST") return next();
         void (async () => {
           try {
-            const source = await readBody(req);
-            const result = runNative(source);
+            const body = await readBody(req);
+            // Body is JSON `{ source, args }`. Tolerate a bare string body (older
+            // clients / manual POSTs) as source with no args.
+            let source = body;
+            let args: string[] = [];
+            try {
+              const parsed = JSON.parse(body) as { source?: string; args?: string[] };
+              if (parsed && typeof parsed === "object" && typeof parsed.source === "string") {
+                source = parsed.source;
+                args = Array.isArray(parsed.args) ? parsed.args.map(String) : [];
+              }
+            } catch {
+              // not JSON — treat the whole body as source
+            }
+            const result = runNative(source, args);
             res.setHeader("Content-Type", "application/json");
             res.end(JSON.stringify(result));
           } catch (e) {

@@ -5,7 +5,7 @@
 import { test, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { state, loadBytes, selectTrace, selectedTrace } from "../src/store";
+import { state, loadBytes, selectTrace, selectedTrace, parseArgsString, loadSourceText, setScriptArgs } from "../src/store";
 
 const fixturePath = fileURLToPath(new URL("../fixtures/counting-loop.lunetrace", import.meta.url));
 const bytes = new Uint8Array(readFileSync(fixturePath));
@@ -36,4 +36,25 @@ test("selectTrace updates the selection", () => {
   selectTrace(0);
   expect(state.selected).toBe(0);
   expect(selectedTrace()!.anchorProtoId).toBe(0);
+});
+
+test("parseArgsString splits on whitespace and drops empties", () => {
+  expect(parseArgsString("9")).toEqual(["9"]);
+  expect(parseArgsString("9 hello 42")).toEqual(["9", "hello", "42"]);
+  expect(parseArgsString("  9\t hello \n")).toEqual(["9", "hello"]);
+  expect(parseArgsString("")).toEqual([]);
+  expect(parseArgsString("   ")).toEqual([]);
+});
+
+test("loadSourceText loads text into the editor and sets the script name", () => {
+  loadSourceText("nsieve.lune", "print(arg[1])\n");
+  expect(state.source).toBe("print(arg[1])\n");
+  expect(state.scriptName).toBe("nsieve.lune");
+});
+
+test("setScriptArgs updates the raw args string", () => {
+  setScriptArgs("9");
+  expect(state.scriptArgs).toBe("9");
+  setScriptArgs("");
+  expect(state.scriptArgs).toBe("");
 });

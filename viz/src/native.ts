@@ -24,13 +24,14 @@ function fromBase64(b64: string): Uint8Array {
   return out;
 }
 
-/** Run `source` through the native binary via the dev server. Throws if the
- *  endpoint is unavailable (e.g. running against a static build, not `vite dev`). */
-export async function runNative(source: string): Promise<RunArtifacts & { diagnostics: string }> {
+/** Run `source` (with optional script `args` → `arg[1..]`) through the native
+ *  binary via the dev server. Throws if the endpoint is unavailable (e.g. running
+ *  against a static build, not `vite dev`). */
+export async function runNative(source: string, args: string[] = []): Promise<RunArtifacts & { diagnostics: string }> {
   const resp = await fetch("/run", {
     method: "POST",
-    headers: { "Content-Type": "text/plain" },
-    body: source,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source, args }),
   });
   if (!resp.ok) {
     throw new Error(`POST /run: ${resp.status} ${resp.statusText} (is the dev server running?)`);

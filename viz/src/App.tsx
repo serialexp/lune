@@ -1,5 +1,5 @@
 import { For, Show, onMount } from "solid-js";
-import { state, loadBytes, loadFromUrl, runWasm, runBoth, canReplay, openReplay } from "./store";
+import { state, loadBytes, loadFromUrl, runWasm, runBoth, canReplay, openReplay, loadSourceText, setScriptArgs } from "./store";
 import LuneEditor from "./editor/LuneEditor";
 import TraceList from "./components/TraceList";
 import TraceView from "./components/TraceView";
@@ -12,14 +12,26 @@ function fmtBytes(n: number): string {
   return `${(n / 1024).toFixed(1)} KiB`;
 }
 
-/** Read a picked/dropped File into the store. */
+/** Read a picked/dropped File into the store. `.lunetrace` decodes into the trace
+ *  view; any other extension is treated as source text and loaded into the editor
+ *  (drag-drop stays convenient for both). */
 async function ingest(file: File) {
-  const buf = new Uint8Array(await file.arrayBuffer());
-  loadBytes(file.name, buf);
+  if (file.name.endsWith(".lunetrace")) {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    loadBytes(file.name, buf);
+  } else {
+    loadSourceText(file.name, await file.text());
+  }
+}
+
+/** Read a picked source File into the editor. */
+async function ingestSource(file: File) {
+  loadSourceText(file.name, await file.text());
 }
 
 export default function App() {
   let inputRef: HTMLInputElement | undefined;
+  let sourceInputRef: HTMLInputElement | undefined;
 
   // Deep link: `?src=<url>` auto-loads a trace on open (no file picker needed).
   onMount(() => {
@@ -64,8 +76,36 @@ export default function App() {
           below exactly as a loaded .lunetrace would. */}
       <section class="editor">
         <div class="editor-head">
-          <span class="muted">Author &amp; run in-browser (wasm)</span>
+          <span class="muted">Author &amp; run in-browser (wasm) <span class="editor-file">· {state.scriptName}</span></span>
           <div class="editor-actions">
+            <button
+              type="button"
+              class="secondary"
+              title="Load a local .lua/.lune source file into the editor (e.g. a benchmark like nsieve)"
+              onClick={() => sourceInputRef?.click()}
+            >
+              Open source…
+            </button>
+            <input
+              ref={sourceInputRef}
+              type="file"
+              accept=".lua,.lune,.luau,.txt,text/plain"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const file = e.currentTarget.files?.[0];
+                if (file) void ingestSource(file);
+                e.currentTarget.value = ""; // allow re-picking the same file
+              }}
+            />
+            <input
+              type="text"
+              class="args-input"
+              placeholder="args (e.g. 9)"
+              title="Script arguments → arg[1], arg[2], … (whitespace-separated; no shell quoting). nsieve reads arg[1] as its workload size N."
+              value={state.scriptArgs}
+              disabled={state.running}
+              onInput={(e) => setScriptArgs(e.currentTarget.value)}
+            />
             <button type="button" disabled={state.running} onClick={() => void runWasm()}>
               {state.running ? "Running…" : "Run (wasm)"}
             </button>

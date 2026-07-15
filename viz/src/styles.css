@@ -395,6 +395,29 @@ table.ir tr.ir-exit .op {
 .editor-actions {
   display: flex;
   gap: 0.5rem;
+  align-items: center;
+}
+
+/* Script-args input in the editor toolbar — narrow, monospace, matches the
+   button chrome. Feeds arg[1..] (e.g. nsieve's N). */
+.args-input {
+  width: 8rem;
+  padding: 0.25rem 0.5rem;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  color: var(--fg);
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.args-input::placeholder {
+  color: var(--muted);
+}
+
+/* The active script name (used as arg[0]) shown beside the editor heading. */
+.editor-file {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8rem;
 }
 
 button.secondary {

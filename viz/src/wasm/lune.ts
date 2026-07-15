@@ -12,7 +12,7 @@ interface LuneExports {
   memory: WebAssembly.Memory;
   lune_alloc(len: number): number;
   lune_free(ptr: number, len: number): void;
-  lune_run(srcPtr: number, srcLen: number): number;
+  lune_run(srcPtr: number, srcLen: number, argsPtr: number, argsLen: number): number;
   lune_free_result(resPtr: number): void;
   lune_check(srcPtr: number, srcLen: number): number;
   lune_free_check_result(resPtr: number): void;
@@ -158,8 +158,11 @@ export interface LuneDiagnostic {
 
 /** A ready-to-use VM instance. */
 export interface LuneModule {
-  /** Parse, compile, and run a source chunk; returns its artifacts. */
-  runSource(src: string): LuneRunResult;
+  /** Parse, compile, and run a source chunk; returns its artifacts. `argv`, when
+   *  given, fills the global `arg` table (`argv[0]` = script name, `argv[1..]` =
+   *  user args) exactly as the CLI does — so a script reading `arg[1]` (e.g.
+   *  nsieve's workload size) sees it. Omitted/empty ⇒ `arg` stays an empty table. */
+  runSource(src: string, argv?: string[]): LuneRunResult;
   /** Parse + compile a source chunk and return its diagnostics WITHOUT running
    *  it — the editor's live linter. An empty array means a clean compile. */
   check(src: string): LuneDiagnostic[];
@@ -199,6 +202,27 @@ const DIAG_BYTES = 4 * 4 + 8;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+
+/** Pack an argv into the blob `lune_run` decodes (see `parseArgv` in
+ *  wasm_entry.zig): little-endian `u32 count`, then per arg `{ u32 len; utf8 }`.
+ *  Empty argv → empty blob (the caller then passes len 0 and the VM leaves `arg`
+ *  an empty table). */
+function encodeArgv(argv: string[]): Uint8Array {
+  if (argv.length === 0) return new Uint8Array(0);
+  const parts = argv.map((a) => encoder.encode(a));
+  const total = 4 + parts.reduce((n, p) => n + 4 + p.length, 0);
+  const buf = new Uint8Array(total);
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(0, argv.length, true);
+  let off = 4;
+  for (const p of parts) {
+    dv.setUint32(off, p.length, true);
+    off += 4;
+    buf.set(p, off);
+    off += p.length;
+  }
+  return buf;
+}
 
 /** Build the import object the module needs. `host_now_ns` and `host_random_seed`
  *  are the injected nondeterministic inputs that can cross into the VM. */
@@ -293,19 +317,28 @@ function decodeDisasm(blob: Uint8Array): ProtoDisasm[] {
 }
 
 function wrap(exports: LuneExports): LuneModule {
-  const runSource = (src: string): LuneRunResult => {
+  const runSource = (src: string, argv: string[] = []): LuneRunResult => {
     const bytes = encoder.encode(src);
     const srcPtr = bytes.length === 0 ? 0 : exports.lune_alloc(bytes.length);
     if (bytes.length !== 0) {
       new Uint8Array(exports.memory.buffer, srcPtr, bytes.length).set(bytes);
     }
+    // Pack argv AFTER writing the source. A grow here would detach the source
+    // view, but the bytes are already in place and pointers survive as offsets
+    // (same ordering discipline as `replay`'s src-then-effects alloc).
+    const argsBlob = encodeArgv(argv);
+    const argsPtr = argsBlob.length === 0 ? 0 : exports.lune_alloc(argsBlob.length);
+    if (argsBlob.length !== 0) {
+      new Uint8Array(exports.memory.buffer, argsPtr, argsBlob.length).set(argsBlob);
+    }
 
     // Total wall-clock brackets the whole wasm call (parse + compile + execute +
     // artifact serialization). The execute-only subset comes back as `exec_ns`.
     const t0 = performance.now();
-    const resPtr = exports.lune_run(srcPtr, bytes.length);
+    const resPtr = exports.lune_run(srcPtr, bytes.length, argsPtr, argsBlob.length);
     const totalMs = performance.now() - t0;
     if (srcPtr !== 0) exports.lune_free(srcPtr, bytes.length);
+    if (argsPtr !== 0) exports.lune_free(argsPtr, argsBlob.length);
     if (resPtr === 0) {
       throw new Error("lune_run returned null (wasm allocation failure)");
     }

@@ -42,6 +42,49 @@ test("runs a counting loop end-to-end and prints the sum", () => {
   expect(result.stdout).toBe("5050\n");
 });
 
+test("runSource threads argv into the global arg table (arg[0..])", () => {
+  // argv[0] is the script name, argv[1..] the user args — exactly the CLI's
+  // `arg` convention. A script (e.g. nsieve) reads its workload from arg[1].
+  const src = "print(arg[0])\nprint(arg[1])\nprint(arg[2])\n";
+  const result = mod.runSource(src, ["nsieve.lune", "9", "hello world"]);
+  expect(result.status).toBe(0);
+  expect(result.diagnostics).toBe("");
+  expect(result.stdout).toBe("nsieve.lune\n9\nhello world\n");
+});
+
+test("runSource with no argv leaves arg an empty table (arg[1] == nil)", () => {
+  const result = mod.runSource("print(arg[1])\n");
+  expect(result.status).toBe(0);
+  expect(result.stdout).toBe("nil\n");
+});
+
+test("runs the nsieve benchmark with a workload arg[1]", () => {
+  // The actual nsieve shape: reads N from arg[1], loops with io.write +
+  // string.format. Proves a real benchmark file runs in the playground with args.
+  const nsieve = [
+    "local function nsieve(p, m)",
+    "  for i=2,m do p[i] = true end",
+    "  local count = 0",
+    "  for i=2,m do",
+    "    if p[i] then",
+    "      for k=i+i,m,i do p[k] = false end",
+    "      count = count + 1",
+    "    end",
+    "  end",
+    "  return count",
+    "end",
+    "local N = tonumber(arg and arg[1]) or 1",
+    "if N < 2 then N = 2 end",
+    "local primes = {}",
+    "local m = (2^N)*1000",
+    'io.write(string.format("primes up to %d: %d\\n", m, nsieve(primes, m)))',
+  ].join("\n");
+  const result = mod.runSource(nsieve, ["nsieve.lune", "4"]);
+  expect(result.status).toBe(0);
+  // N=4 → m = 16000; π(16000) = 1862.
+  expect(result.stdout).toBe("primes up to 16000: 1862\n");
+});
+
 test("records a decodable trace for a hot loop", () => {
   // A loop hot enough to be traced (the recorder's threshold is well under 1k).
   const result = mod.runSource("local s = 0\nfor i = 1, 1000 do s = s + i end\nprint(s)\n");

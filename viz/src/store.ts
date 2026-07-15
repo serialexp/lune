@@ -24,6 +24,13 @@ interface VizState {
   // --- authoring + in-browser execution (Phase 7 v3) ---
   /** The editable source for the in-browser VM. */
   source: string;
+  /** The script name used as `arg[0]` and shown as the loaded-file label. Set
+   *  when a local source file is opened; a plain default otherwise. `arg[0]` is
+   *  cancelled by the differential validator, so its exact value is cosmetic. */
+  scriptName: string;
+  /** Raw script-args string from the args input (whitespace-separated). Fills
+   *  `arg[1..]` for the run — e.g. nsieve's workload size. Empty ⇒ no user args. */
+  scriptArgs: string;
   /** True while a wasm run is in flight. */
   running: boolean;
   /** The program's stdout from the last wasm run (null = never run). */
@@ -168,6 +175,8 @@ const [state, setState] = createStore<VizState>({
   selected: -1,
   error: null,
   source: DEFAULT_SOURCE,
+  scriptName: "playground.lune",
+  scriptArgs: "",
   running: false,
   stdout: null,
   runError: null,
@@ -209,6 +218,34 @@ function lune(): Promise<LuneModule> {
 /** Update the editable source (does not run). */
 export function setSource(src: string): void {
   setState("source", src);
+}
+
+/** Load a local source file's text into the editor (does not run). Sets the
+ *  script name (used as `arg[0]` and the loaded-file label). Distinct from
+ *  `loadBytes`, which decodes a binary `.lunetrace` artifact into the trace view. */
+export function loadSourceText(name: string, text: string): void {
+  setState({ source: text, scriptName: name });
+}
+
+/** Update the raw script-args string (does not run). */
+export function setScriptArgs(args: string): void {
+  setState("scriptArgs", args);
+}
+
+/** Split a raw args string into an argv, on runs of whitespace, dropping empties.
+ *  Deliberately simple — no shell quoting or escapes (documented in the UI); a
+ *  single token per whitespace-separated word. Pure, so it's unit-testable. */
+export function parseArgsString(s: string): string[] {
+  return s.split(/\s+/).filter((w) => w.length > 0);
+}
+
+/** The argv handed to the wasm VM for the current source + args: `[scriptName,
+ *  ...userArgs]` when there are user args, else `[]` (leaving `arg` an empty
+ *  table, the historical default). The native side receives only `userArgs`
+ *  (`runNative`) — it supplies `arg[0]` = the temp source path itself. */
+function wasmArgv(): string[] {
+  const userArgs = parseArgsString(state.scriptArgs);
+  return userArgs.length > 0 ? [state.scriptName, ...userArgs] : [];
 }
 
 /**
@@ -370,7 +407,7 @@ export async function runWasm(): Promise<void> {
   try {
     const mod = await lune();
     const src = state.source;
-    const result = mod.runSource(src);
+    const result = mod.runSource(src, wasmArgv());
     applyWasmResult(result, "(wasm run)", src);
     setState({ running: false });
   } catch (e) {
@@ -393,9 +430,13 @@ export async function runBoth(): Promise<void> {
   try {
     const mod = await lune();
     const src = state.source;
+    // wasm gets `[scriptName, ...userArgs]`; native gets the raw userArgs and
+    // prepends the temp source path as its own arg[0]. Both see the same
+    // arg[1..], which is what the keyframe compare requires (arg[0] is cancelled).
+    const userArgs = parseArgsString(state.scriptArgs);
     const [wasm, native] = await Promise.all([
-      Promise.resolve(mod.runSource(src)),
-      runNative(src),
+      Promise.resolve(mod.runSource(src, wasmArgv())),
+      runNative(src, userArgs),
     ]);
     applyWasmResult(wasm, "(wasm + native diff)", src);
     setState({ diff: diffRuns(wasm, native), running: false });

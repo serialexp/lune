@@ -279,7 +279,7 @@ export fn lune_free(ptr: u32, len: u32) void {
 /// catastrophic allocation failure before a Result exists). The source bytes at
 /// `[src_ptr, src_ptr+src_len)` are read but not freed — JS still owns that
 /// buffer and frees it with `lune_free`.
-export fn lune_run(src_ptr: u32, src_len: u32) ?*Result {
+export fn lune_run(src_ptr: u32, src_len: u32, args_ptr: u32, args_len: u32) ?*Result {
     const res = gpa.create(Result) catch return null;
     res.* = .{};
 
@@ -289,7 +289,17 @@ export fn lune_run(src_ptr: u32, src_len: u32) ?*Result {
         break :blk p[0..@as(usize, src_len)];
     };
 
-    run(res, src) catch |err| {
+    // The packed argv blob (may be empty). Decoded into a `[][]const u8` inside
+    // `run`, which owns the freeing; the blob memory itself is borrowed (freed by
+    // the JS caller after `lune_run` returns), so `populateArgs` must intern (it
+    // does) before we return.
+    const args_blob: []const u8 = blk: {
+        if (args_len == 0) break :blk &[_]u8{};
+        const p: [*]const u8 = @ptrFromInt(@as(usize, args_ptr));
+        break :blk p[0..@as(usize, args_len)];
+    };
+
+    run(res, src, args_blob) catch |err| {
         // Best-effort: surface the error name as diagnostics text. If even that
         // allocation fails, leave diag null; status still flags the failure.
         res.status = 1;
@@ -507,7 +517,32 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
 
 // --- the run path (mirrors main.zig runSource, host-free) ------------------
 
-fn run(res: *Result, source: []const u8) !void {
+/// Decode the packed argv blob the JS host builds (see `runSource` in
+/// `viz/src/wasm/lune.ts`): a little-endian `u32 count`, then `count` records of
+/// `{ u32 len; u8[len] }`. Returns a gpa-owned slice of borrowed sub-slices that
+/// point into `blob` (no string copies — `populateArgs` interns them). The caller
+/// frees the returned outer slice; `blob` stays owned by the FFI caller. An empty
+/// blob yields an empty argv. Any length that overruns the blob is `Malformed`.
+fn parseArgv(blob: []const u8) ![]const []const u8 {
+    if (blob.len == 0) return &[_][]const u8{};
+    if (blob.len < 4) return error.Malformed;
+    const count = std.mem.readInt(u32, blob[0..4], .little);
+    var argv = try gpa.alloc([]const u8, count);
+    errdefer gpa.free(argv);
+    var off: usize = 4;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        if (off + 4 > blob.len) return error.Malformed;
+        const len = std.mem.readInt(u32, blob[off..][0..4], .little);
+        off += 4;
+        if (off + len > blob.len) return error.Malformed;
+        argv[i] = blob[off .. off + len];
+        off += len;
+    }
+    return argv;
+}
+
+fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
     // The lexer wants a NUL-terminated `[:0]const u8`. Copy the borrowed source
     // into an owned, sentinel-terminated buffer.
     const src0 = try gpa.allocSentinel(u8, source.len, 0);
@@ -577,6 +612,17 @@ fn run(res: *Result, source: []const u8) !void {
         res.diag = bufFromSlice(try renderDiagnostics(&diags));
         return;
     }
+
+    // Fill the global `arg` table from the host-supplied argv (load-time input,
+    // like the CLI at main.zig:350 — the exec core never reads it mid-run, so
+    // determinism holds). `argv[0]` is the script name, `argv[1..]` the user args;
+    // a program reads its workload from `arg[1]` etc. Empty blob → arg stays the
+    // empty table `installBaseLib` created (unchanged playground default). The
+    // `argc()`/`argv()` *effect* natives remain null here (host_env is null) — this
+    // only populates the deterministic `arg` table, which is what scripts use.
+    const argv = try parseArgv(args_blob);
+    defer gpa.free(argv);
+    if (argv.len > 0) try vm.populateArgs(argv);
 
     // --- run --- (bracket the VM execution alone with the host clock for an
     // execute-only timing; parse/compile above and serialization below are
