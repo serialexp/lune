@@ -1136,6 +1136,13 @@ pub const TraceState = struct {
     /// `cycles_other = run_cycles - traced - tier0_*`. When 0 the report shows time
     /// as n/a rather than dividing by zero.
     run_cycles: u64 = 0,
+    /// Monotonic wall-clock nanoseconds over the same `Vm.run` bracket as
+    /// `run_cycles` (stamped by the CLI from its host clock — the VM core holds no
+    /// platform clock). Pairs with `run_cycles` so a consumer can recover the TSC
+    /// frequency (`run_cycles / run_nanos`) and convert the per-class cycle counts to
+    /// real time. 0 whenever `run_cycles` is (coverage off, non-x86_64, wasm, or the
+    /// resume path) — the visualizer then shows time as n/a. Diagnostic only.
+    run_nanos: u64 = 0,
     /// TSC of the last tier-0 coverage "event" (back-edge hook, or trace-region exit)
     /// — the start of the current tier-0 span. `noteInterpIter` charges
     /// `now - last_event_tsc` to the anchor. Seeded to the run-start TSC so the first
@@ -5672,6 +5679,13 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         try w.print("    tier-0, no-trace:       {d:>12}  ({d:.1}% of run)\n", .{ c_unc, pctOf(c_unc, run) });
         try w.print("    other (non-loop):       {d:>12}  ({d:.1}% of run)\n", .{ c_other, pctOf(c_other, run) });
         try w.print("    run total:              {d:>12}\n", .{run});
+        if (ts.run_nanos > 0) {
+            // Wall time pairs with the TSC total to recover the effective clock
+            // (cycles/ns = GHz), turning the cycle percentages above into real time.
+            const ns: f64 = @floatFromInt(ts.run_nanos);
+            const ghz = @as(f64, @floatFromInt(run)) / ns;
+            try w.print("    run wall time:          {d:>9.3} ms   (~{d:.2} GHz effective)\n", .{ ns / 1_000_000.0, ghz });
+        }
         try w.print("    ran as a trace: {d:.1}% of run   ({d:.1}% of loop time)\n", .{ pctOf(c_traced, run), pctOf(c_traced, c_loop) });
     } else {
         try w.writeAll("  coverage by time: n/a (no TSC on this target)\n");

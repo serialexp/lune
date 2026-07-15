@@ -617,9 +617,14 @@ export function aggregateCoverage(cov: CoverageFileOutput): CoverageAggregate {
   };
 }
 
-/** The time-weighted coverage split, in TSC cycles + percentage of the whole
- *  run. The three loop buckets mirror the iteration split; `other` is non-loop
- *  time (call overhead, allocation, the parts that never hit a back-edge). */
+/** The time-weighted coverage split, in TSC cycles, real nanoseconds, and
+ *  percentage of the whole run. The three loop buckets mirror the iteration split;
+ *  `other` is non-loop time (call overhead, allocation, the parts that never hit a
+ *  back-edge). The `*Ns` fields convert the cycle counts to wall time via the run's
+ *  measured `run_nanos / run_cycles` (the effective clock), so the UI can show a
+ *  real time unit — cycles are a count, not a duration. `runNanos` is the whole-run
+ *  wall time; 0 if the artifact carried cycles but no wall clock (shouldn't happen
+ *  for a native run, but the `*Ns` fields are then all 0). */
 export interface CoverageTimeSplit {
   native: number;
   coveredInterp: number;
@@ -630,6 +635,11 @@ export interface CoverageTimeSplit {
   coveredInterpPct: number;
   uncoveredPct: number;
   otherPct: number;
+  runNanos: number;
+  nativeNs: number;
+  coveredInterpNs: number;
+  uncoveredNs: number;
+  otherNs: number;
 }
 
 /** Pure time split from a coverage artifact carrying real cycles. Percentages are
@@ -644,6 +654,10 @@ export function timeSplitOf(cov: CoverageFileOutput): CoverageTimeSplit | null {
   const uncovered = Number(cov.cycles_tier0_uncovered);
   const other = Math.max(0, run - native - coveredInterp - uncovered);
   const p = (n: number): number => (n / run) * 100;
+  // Convert cycles → real nanoseconds via the measured effective clock
+  // (`run_nanos / run_cycles`). Guard `run_nanos == 0` (no wall clock) → 0 ns.
+  const runNanos = Number(cov.run_nanos);
+  const ns = (cycles: number): number => (runNanos > 0 ? (cycles / run) * runNanos : 0);
   return {
     native,
     coveredInterp,
@@ -654,6 +668,11 @@ export function timeSplitOf(cov: CoverageFileOutput): CoverageTimeSplit | null {
     coveredInterpPct: p(coveredInterp),
     uncoveredPct: p(uncovered),
     otherPct: p(other),
+    runNanos,
+    nativeNs: ns(native),
+    coveredInterpNs: ns(coveredInterp),
+    uncoveredNs: ns(uncovered),
+    otherNs: ns(other),
   };
 }
 

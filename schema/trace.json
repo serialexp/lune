@@ -316,6 +316,7 @@
         { "name": "cycles_tier0_covered",   "type": "uint64" },
         { "name": "cycles_tier0_uncovered", "type": "uint64" },
         { "name": "run_cycles",             "type": "uint64" },
+        { "name": "run_nanos",              "type": "uint64" },
         { "name": "counters",               "type": "JitCounters" },
         { "name": "anchors", "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "CoverageAnchor" } }
       ]

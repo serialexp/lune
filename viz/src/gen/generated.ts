@@ -4607,6 +4607,11 @@ export interface CoverageFileInput {
    */
   run_cycles: bigint;
   /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  run_nanos: bigint;
+  /**
    * The raw JIT event counters (TraceState, src/trace.zig), mirroring the '--jit-stats' event-counter block. Always live regardless of the coverage gate — they cost nothing on the hot path. link arm/fuse/disarm track the native chaining machinery; the *link_exits/*follow* pairs count exit-chaining hops; prime_side_* the coherent-state-chaining source arming.
    */
   counters: JitCountersInput;
@@ -4667,6 +4672,11 @@ export interface CoverageFileOutput {
    */
   run_cycles: bigint;
   /**
+   * 64-bit Unsigned Integer
+   * Fixed-width 64-bit unsigned integer (0-18446744073709551615). Respects endianness configuration.
+   */
+  run_nanos: bigint;
+  /**
    * The raw JIT event counters (TraceState, src/trace.zig), mirroring the '--jit-stats' event-counter block. Always live regardless of the coverage gate — they cost nothing on the hot path. link arm/fuse/disarm track the native chaining machinery; the *link_exits/*follow* pairs count exit-chaining hops; prime_side_* the coherent-state-chaining source arming.
    */
   counters: JitCountersOutput;
@@ -4703,6 +4713,7 @@ export class CoverageFileEncoder extends BitStreamEncoder {
     this.writeUint64(value.cycles_tier0_covered, "little_endian");
     this.writeUint64(value.cycles_tier0_uncovered, "little_endian");
     this.writeUint64(value.run_cycles, "little_endian");
+    this.writeUint64(value.run_nanos, "little_endian");
     const encoder_counters = new JitCountersEncoder();
     const encoded_counters = encoder_counters.encode(value.counters);
     for (const byte of encoded_counters) {
@@ -4726,7 +4737,7 @@ export class CoverageFileEncoder extends BitStreamEncoder {
    */
   calculateSize(value: CoverageFile): number {
     let size = 0;
-    size += 60; // version + iters_traced + iters_tier0_covered + iters_tier0_uncovered + cycles_traced + cycles_tier0_covered + cycles_tier0_uncovered + run_cycles
+    size += 68; // version + iters_traced + iters_tier0_covered + iters_tier0_uncovered + cycles_traced + cycles_tier0_covered + cycles_tier0_uncovered + run_cycles + run_nanos
     // counters: custom type (JitCounters)
     const counters_encoder = new JitCountersEncoder();
     size += counters_encoder.calculateSize(value.counters);
@@ -4757,6 +4768,7 @@ export class CoverageFileDecoder extends SeekableBitStreamDecoder {
     value.cycles_tier0_covered = this.readUint64("little_endian");
     value.cycles_tier0_uncovered = this.readUint64("little_endian");
     value.run_cycles = this.readUint64("little_endian");
+    value.run_nanos = this.readUint64("little_endian");
     value.counters = {};
     value.counters.entries = this.readUint64("little_endian");
     value.counters.native_link_arms = this.readUint64("little_endian");

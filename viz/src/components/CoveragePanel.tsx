@@ -11,13 +11,14 @@ function pct(n: number): string {
   return `${n.toFixed(1)}%`;
 }
 
-/** Compact cycle count (K/M/G/T). Cycles span many orders of magnitude. */
-function fmtCyc(n: number): string {
-  if (n < 1e3) return `${n}`;
-  if (n < 1e6) return `${(n / 1e3).toFixed(1)}K`;
-  if (n < 1e9) return `${(n / 1e6).toFixed(1)}M`;
-  if (n < 1e12) return `${(n / 1e9).toFixed(2)}G`;
-  return `${(n / 1e12).toFixed(2)}T`;
+/** Human-readable duration from nanoseconds (ns → µs → ms → s). Cycles are a
+ *  count, not a time unit; the store converts them to real ns via the run's
+ *  measured effective clock, and this renders that as a proper duration. */
+function fmtDur(ns: number): string {
+  if (ns < 1e3) return `${ns.toFixed(0)} ns`;
+  if (ns < 1e6) return `${(ns / 1e3).toFixed(1)} µs`;
+  if (ns < 1e9) return `${(ns / 1e6).toFixed(2)} ms`;
+  return `${(ns / 1e9).toFixed(3)} s`;
 }
 
 /**
@@ -50,9 +51,9 @@ export default function CoveragePanel() {
     if (a === null) return [];
     const t = time();
     return [
-      { label: "native", sw: "sw-native", iter: a.native, iterPct: a.nativePct, time: t?.native ?? null, timePct: t?.nativePct ?? null, hint: null as string | null },
-      { label: "covered-interpreted", sw: "sw-covered", iter: a.coveredInterp, iterPct: a.coveredInterpPct, time: t?.coveredInterp ?? null, timePct: t?.coveredInterpPct ?? null, hint: "has a trace but ran tier-0" },
-      { label: "uncovered", sw: "sw-uncovered", iter: a.uncovered, iterPct: a.uncoveredPct, time: t?.uncovered ?? null, timePct: t?.uncoveredPct ?? null, hint: "no trace" },
+      { label: "native", sw: "sw-native", iter: a.native, iterPct: a.nativePct, timeNs: t?.nativeNs ?? null, timePct: t?.nativePct ?? null, hint: null as string | null },
+      { label: "covered-interpreted", sw: "sw-covered", iter: a.coveredInterp, iterPct: a.coveredInterpPct, timeNs: t?.coveredInterpNs ?? null, timePct: t?.coveredInterpPct ?? null, hint: "has a trace but ran tier-0" },
+      { label: "uncovered", sw: "sw-uncovered", iter: a.uncovered, iterPct: a.uncoveredPct, timeNs: t?.uncoveredNs ?? null, timePct: t?.uncoveredPct ?? null, hint: "no trace" },
     ];
   };
 
@@ -76,7 +77,7 @@ export default function CoveragePanel() {
                 <tr>
                   <th>class</th>
                   <th class="cov-num-h">iterations</th>
-                  <th class="cov-num-h">time <span class="muted">(cycles, of run)</span></th>
+                  <th class="cov-num-h">time <span class="muted">(of run)</span></th>
                 </tr>
               </thead>
               <tbody>
@@ -105,7 +106,7 @@ export default function CoveragePanel() {
                         }
                       >
                         <td class="cov-num">
-                          {fmtCyc(r.time!)} <span class="muted">{pct(r.timePct!)}</span>
+                          {fmtDur(r.timeNs!)} <span class="muted">{pct(r.timePct!)}</span>
                         </td>
                       </Show>
                     </tr>
@@ -117,7 +118,7 @@ export default function CoveragePanel() {
                       <td class="cov-class muted">other (non-loop)</td>
                       <td class="cov-num muted">—</td>
                       <td class="cov-num muted">
-                        {fmtCyc(t.other)} {pct(t.otherPct)}
+                        {fmtDur(t.otherNs)} {pct(t.otherPct)}
                       </td>
                     </tr>
                   )}

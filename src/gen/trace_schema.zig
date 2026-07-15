@@ -1390,6 +1390,7 @@ pub const CoverageFile = struct {
     cycles_tier0_covered: u64,
     cycles_tier0_uncovered: u64,
     run_cycles: u64,
+    run_nanos: u64,
     counters: JitCounters,
     anchors: []const CoverageAnchor,
 
@@ -1411,6 +1412,7 @@ pub const CoverageFile = struct {
         try enc.writeUint64(self.cycles_tier0_covered, .little_endian);
         try enc.writeUint64(self.cycles_tier0_uncovered, .little_endian);
         try enc.writeUint64(self.run_cycles, .little_endian);
+        try enc.writeUint64(self.run_nanos, .little_endian);
         try self.counters.encodeInto(enc, ctx);
         try enc.writeUint32(@intCast(self.anchors.len), .little_endian);
         for (self.anchors) |_item_0| {
@@ -1433,6 +1435,7 @@ pub const CoverageFile = struct {
         result.cycles_tier0_covered = try dec.readUint64(.little_endian);
         result.cycles_tier0_uncovered = try dec.readUint64(.little_endian);
         result.run_cycles = try dec.readUint64(.little_endian);
+        result.run_nanos = try dec.readUint64(.little_endian);
         result.counters = try JitCounters.decodeWith(allocator, dec, root);
         const _len_4 = try dec.readUint32(.little_endian);
         const _buf_5 = try allocator.alloc(CoverageAnchor, @as(usize, _len_4));

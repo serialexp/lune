@@ -99,6 +99,7 @@ pub fn encodeState(gpa: std.mem.Allocator, ts: *const trace.TraceState) ![]u8 {
         .cycles_tier0_covered = ts.cycles_tier0_covered,
         .cycles_tier0_uncovered = ts.cycles_tier0_uncovered,
         .run_cycles = ts.run_cycles,
+        .run_nanos = ts.run_nanos,
         .counters = toSchemaCounters(ts),
         .anchors = anchors[0..n],
     };
@@ -144,6 +145,7 @@ fn seedState(ts: *trace.TraceState, gpa: std.mem.Allocator, pa: *const bytecode.
     ts.cycles_tier0_covered = 40_000_000;
     ts.cycles_tier0_uncovered = 500;
     ts.run_cycles = 45_000_000;
+    ts.run_nanos = 15_000_000;
     ts.entries = 12;
     ts.native_link_arms = 3;
     ts.prime_side_chain_follows = 40_291;
@@ -182,6 +184,7 @@ test "coverage artifact round-trips struct-exact (aggregates, counters, per-anch
     try testing.expectEqual(ts.cycles_tier0_covered, file.cycles_tier0_covered);
     try testing.expectEqual(ts.cycles_tier0_uncovered, file.cycles_tier0_uncovered);
     try testing.expectEqual(ts.run_cycles, file.run_cycles);
+    try testing.expectEqual(ts.run_nanos, file.run_nanos);
 
     try testing.expectEqual(ts.entries, file.counters.entries);
     try testing.expectEqual(ts.native_link_arms, file.counters.native_link_arms);
@@ -254,6 +257,7 @@ test "a wrong-version coverage file is rejected" {
         .cycles_tier0_covered = 0,
         .cycles_tier0_uncovered = 0,
         .run_cycles = 0,
+        .run_nanos = 0,
         .counters = std.mem.zeroes(schema.JitCounters),
         .anchors = &.{},
     };

@@ -99,12 +99,14 @@ test("drops anchors the disasm can't place (bad proto, out-of-range pc, or line 
 });
 
 /** A CoverageFile carrying just the aggregate counts (anchors/counters empty).
- *  Optional `cycles` sets the time split `[traced, covered, uncovered, run]`. */
+ *  Optional `cycles` sets the time split `[traced, covered, uncovered, run]`;
+ *  `runNanos` is the whole-run wall time that turns cycles into real ns. */
 function covWith(
   traced: bigint,
   covered: bigint,
   uncovered: bigint,
   cycles?: [bigint, bigint, bigint, bigint],
+  runNanos: bigint = 0n,
 ): CoverageFileOutput {
   const [ct, cc, cu, run] = cycles ?? [0n, 0n, 0n, 0n];
   return {
@@ -116,6 +118,7 @@ function covWith(
     cycles_tier0_covered: cc,
     cycles_tier0_uncovered: cu,
     run_cycles: run,
+    run_nanos: runNanos,
     counters: {
       entries: 0n,
       native_link_arms: 0n,
@@ -169,4 +172,17 @@ test("timeSplitOf gives the honest time split — % of run, with a non-loop rema
   expect(t.uncoveredPct).toBeCloseTo(0.5);
   expect(t.other).toBe(15); // 1000 - 10 - 970 - 5 = non-loop
   expect(t.otherPct).toBeCloseTo(1.5);
+  // No wall clock supplied → the real-time fields are all 0 (cycles aren't a unit).
+  expect(t.runNanos).toBe(0);
+  expect(t.nativeNs).toBe(0);
+});
+
+test("timeSplitOf converts cycles to real ns via run_nanos (the effective clock)", () => {
+  // 1000 run cycles measured over 2000 ns wall → 0.5 GHz effective, so ns = 2× cycles.
+  const t = timeSplitOf(covWith(600n, 400n, 0n, [10n, 970n, 5n, 1000n], 2000n))!;
+  expect(t.runNanos).toBe(2000);
+  expect(t.nativeNs).toBeCloseTo(20); // 10 cyc × (2000/1000)
+  expect(t.coveredInterpNs).toBeCloseTo(1940); // 970 × 2
+  expect(t.uncoveredNs).toBeCloseTo(10); // 5 × 2
+  expect(t.otherNs).toBeCloseTo(30); // 15 × 2
 });

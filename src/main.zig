@@ -389,6 +389,12 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     const exec_t0 = nativeClockNs(&clock_ctx);
     const run_outcome = vm.run(chunk.proto);
     const exec_ns: u64 = @intCast(nativeClockNs(&clock_ctx) - exec_t0);
+    // Pair the wall-clock run duration with `run_cycles` (stamped inside `run`) so a
+    // coverage consumer can recover the TSC frequency and render the per-class cycle
+    // counts as real time. The two brackets differ only by a few call instructions —
+    // negligible against a whole-program run. Harmless when coverage is off (the field
+    // is only emitted with the artifact, which needs `--emit-coverage`).
+    vm.trace.run_nanos = exec_ns;
     _ = run_outcome catch |err| {
         // Located, Lua-style message + call chain from the un-popped frame stack.
         var fault_arena = std.heap.ArenaAllocator.init(gpa);
