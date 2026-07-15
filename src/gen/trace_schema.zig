@@ -307,18 +307,21 @@ pub const Trace = struct {
         result.anchor_pc = try dec.readUint32(.little_endian);
         const _len_6 = try dec.readUint16(.little_endian);
         const _buf_7 = try allocator.alloc(IrInstr, @as(usize, _len_6));
+        errdefer allocator.free(_buf_7);
         for (0.._buf_7.len) |_i_4| {
             _buf_7[_i_4] = try IrInstr.decodeWith(allocator, dec, root);
         }
         result.instrs = _buf_7;
         const _len_11 = try dec.readUint16(.little_endian);
         const _buf_12 = try allocator.alloc(ConstValue, @as(usize, _len_11));
+        errdefer allocator.free(_buf_12);
         for (0.._buf_12.len) |_i_9| {
             _buf_12[_i_9] = try ConstValue.decodeWith(allocator, dec, root);
         }
         result.consts = _buf_12;
         const _len_16 = try dec.readUint16(.little_endian);
         const _buf_17 = try allocator.alloc(u16, @as(usize, _len_16));
+        errdefer allocator.free(_buf_17);
         for (0.._buf_17.len) |_i_14| {
             _buf_17[_i_14] = try dec.readUint16(.little_endian);
         }
@@ -358,6 +361,7 @@ pub const TraceFile = struct {
         result.version = try dec.readUint32(.little_endian);
         const _len_4 = try dec.readUint32(.little_endian);
         const _buf_5 = try allocator.alloc(Trace, @as(usize, _len_4));
+        errdefer allocator.free(_buf_5);
         for (0.._buf_5.len) |_i_2| {
             _buf_5[_i_2] = try Trace.decodeWith(allocator, dec, root);
         }
@@ -550,12 +554,14 @@ pub const HeapTable = struct {
         var result: HeapTable = undefined;
         const _len_5 = try dec.readUint32(.little_endian);
         const _buf_6 = try allocator.alloc(SnapValue, @as(usize, _len_5));
+        errdefer allocator.free(_buf_6);
         for (0.._buf_6.len) |_i_3| {
             _buf_6[_i_3] = try SnapValue.decodeWith(allocator, dec, root);
         }
         result.array = _buf_6;
         const _len_10 = try dec.readUint32(.little_endian);
         const _buf_11 = try allocator.alloc(TableEntry, @as(usize, _len_10));
+        errdefer allocator.free(_buf_11);
         for (0.._buf_11.len) |_i_8| {
             _buf_11[_i_8] = try TableEntry.decodeWith(allocator, dec, root);
         }
@@ -598,6 +604,7 @@ pub const HeapClosure = struct {
         result.proto_id = try dec.readUint32(.little_endian);
         const _len_4 = try dec.readUint16(.little_endian);
         const _buf_5 = try allocator.alloc(u32, @as(usize, _len_4));
+        errdefer allocator.free(_buf_5);
         for (0.._buf_5.len) |_i_2| {
             _buf_5[_i_2] = try dec.readUint32(.little_endian);
         }
@@ -896,30 +903,35 @@ pub const Keyframe = struct {
         result.string_metatable_id = try dec.readUint32(.little_endian);
         const _len_8 = try dec.readUint32(.little_endian);
         const _buf_9 = try allocator.alloc(HeapObject, @as(usize, _len_8));
+        errdefer allocator.free(_buf_9);
         for (0.._buf_9.len) |_i_6| {
             _buf_9[_i_6] = try HeapObject.decodeWith(allocator, dec, root);
         }
         result.objects = _buf_9;
         const _len_13 = try dec.readUint32(.little_endian);
         const _buf_14 = try allocator.alloc(SnapValue, @as(usize, _len_13));
+        errdefer allocator.free(_buf_14);
         for (0.._buf_14.len) |_i_11| {
             _buf_14[_i_11] = try SnapValue.decodeWith(allocator, dec, root);
         }
         result.stack = _buf_14;
         const _len_18 = try dec.readUint16(.little_endian);
         const _buf_19 = try allocator.alloc(FrameRef, @as(usize, _len_18));
+        errdefer allocator.free(_buf_19);
         for (0.._buf_19.len) |_i_16| {
             _buf_19[_i_16] = try FrameRef.decodeWith(allocator, dec, root);
         }
         result.frames = _buf_19;
         const _len_23 = try dec.readUint16(.little_endian);
         const _buf_24 = try allocator.alloc(OpenUpvalueRef, @as(usize, _len_23));
+        errdefer allocator.free(_buf_24);
         for (0.._buf_24.len) |_i_21| {
             _buf_24[_i_21] = try OpenUpvalueRef.decodeWith(allocator, dec, root);
         }
         result.open_upvalues = _buf_24;
         const _len_28 = try dec.readUint32(.little_endian);
         const _buf_29 = try allocator.alloc(LoadedChunk, @as(usize, _len_28));
+        errdefer allocator.free(_buf_29);
         for (0.._buf_29.len) |_i_26| {
             _buf_29[_i_26] = try LoadedChunk.decodeWith(allocator, dec, root);
         }
@@ -1075,6 +1087,7 @@ pub const EffectFile = struct {
         result.version = try dec.readUint32(.little_endian);
         const _len_4 = try dec.readUint32(.little_endian);
         const _buf_5 = try allocator.alloc(Effect, @as(usize, _len_4));
+        errdefer allocator.free(_buf_5);
         for (0.._buf_5.len) |_i_2| {
             _buf_5[_i_2] = try Effect.decodeWith(allocator, dec, root);
         }
@@ -1157,6 +1170,7 @@ pub const TraceEntry = struct {
         result.capped = try dec.readUint8();
         const _len_4 = try dec.readUint32(.little_endian);
         const _buf_5 = try allocator.alloc(ExecEvent, @as(usize, _len_4));
+        errdefer allocator.free(_buf_5);
         for (0.._buf_5.len) |_i_2| {
             _buf_5[_i_2] = try ExecEvent.decodeWith(allocator, dec, root);
         }
@@ -1199,6 +1213,7 @@ pub const TraceExecLog = struct {
         result.entries_capped = try dec.readUint8();
         const _len_4 = try dec.readUint32(.little_endian);
         const _buf_5 = try allocator.alloc(TraceEntry, @as(usize, _len_4));
+        errdefer allocator.free(_buf_5);
         for (0.._buf_5.len) |_i_2| {
             _buf_5[_i_2] = try TraceEntry.decodeWith(allocator, dec, root);
         }
@@ -1238,6 +1253,7 @@ pub const ExecLogFile = struct {
         result.version = try dec.readUint32(.little_endian);
         const _len_4 = try dec.readUint32(.little_endian);
         const _buf_5 = try allocator.alloc(TraceExecLog, @as(usize, _len_4));
+        errdefer allocator.free(_buf_5);
         for (0.._buf_5.len) |_i_2| {
             _buf_5[_i_2] = try TraceExecLog.decodeWith(allocator, dec, root);
         }
@@ -1420,6 +1436,7 @@ pub const CoverageFile = struct {
         result.counters = try JitCounters.decodeWith(allocator, dec, root);
         const _len_4 = try dec.readUint32(.little_endian);
         const _buf_5 = try allocator.alloc(CoverageAnchor, @as(usize, _len_4));
+        errdefer allocator.free(_buf_5);
         for (0.._buf_5.len) |_i_2| {
             _buf_5[_i_2] = try CoverageAnchor.decodeWith(allocator, dec, root);
         }

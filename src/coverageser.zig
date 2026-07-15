@@ -220,6 +220,29 @@ test "an empty coverage artifact round-trips" {
     try testing.expectEqual(@as(u64, 0), file.iters_traced);
 }
 
+test "a truncated anchor array is rejected without leaking the partial slice" {
+    // Encode a real 3-anchor artifact, then lop bytes off the tail so the anchor
+    // array's length prefix still says 3 but the buffer ends mid-third-anchor. The
+    // generated decoder allocates the 3-slot slice, decodes the first two, then
+    // faults on the truncated third — and must free the slice on that error path.
+    // testing.allocator leak-checks, so a missing errdefer fails this test.
+    const gpa = testing.allocator;
+    var ts = trace.TraceState.init(gpa);
+    defer ts.deinit();
+
+    const pa = bytecode.Proto{ .code = &.{}, .name = "a", .num_registers = 1, .id = 2 };
+    const pb = bytecode.Proto{ .code = &.{}, .name = "b", .num_registers = 1, .id = 5 };
+    try seedState(&ts, gpa, &pa, &pb);
+
+    const bytes = try encodeState(gpa, &ts);
+    defer gpa.free(bytes);
+    // Drop the last 5 bytes: enough to leave the final CoverageAnchor (41 bytes)
+    // incomplete while keeping the length prefix and the first two anchors intact.
+    try testing.expect(bytes.len > 5);
+    const truncated = bytes[0 .. bytes.len - 5];
+    try testing.expectError(error.Malformed, decodeFile(gpa, truncated));
+}
+
 test "a wrong-version coverage file is rejected" {
     const gpa = testing.allocator;
     const file: schema.CoverageFile = .{
