@@ -890,7 +890,43 @@ pub const NativeLink = struct { parent: *Trace, slot_index: u32, child: *Trace }
 /// back-edge covered-vs-uncovered in O(1) — a single map probe it already does —
 /// with no `findTrace` cache scan on the hot path. Accumulated only when
 /// `config.coverage`.
-pub const AnchorCoverage = struct { traced: u64 = 0, interp: u64 = 0, has_trace: bool = false };
+///
+/// `*_cycles` are the TSC (`readCycles`) time attribution, so the report can weigh
+/// iterations by cost — a traced iteration is ~10-20× cheaper than a tier-0 one, so
+/// iteration% badly overstates JIT effectiveness. `traced_cycles` = cycles inside
+/// trace runs entered at this anchor (bracketed around the dispatcher's trace-exec
+/// region — exact for this anchor). `interp_cycles` = cycles of the tier-0 body
+/// iterations charged at this anchor's back-edge. NB: `interp_cycles` is *self time*
+/// for an innermost loop but leaks the outer-body-head into the innermost loop at a
+/// nesting boundary (one small span per outer iteration) — good enough for a
+/// diagnostic, and the aggregate split (`TraceState.cycles_*`) stays exact. Zero on
+/// non-x86_64 (no TSC).
+pub const AnchorCoverage = struct {
+    traced: u64 = 0,
+    interp: u64 = 0,
+    traced_cycles: u64 = 0,
+    interp_cycles: u64 = 0,
+    has_trace: bool = false,
+};
+
+/// Read the CPU cycle counter (x86_64 `rdtsc`) for coverage time attribution.
+/// Non-serializing — fine for coarse ratios over millions of samples, and we avoid
+/// `rdtscp`/`cpuid` fences (too slow for a per-back-edge hook). Returns 0 on
+/// non-x86_64 (e.g. the wasm VM), which makes every cycle delta 0 → the report shows
+/// n/a time rather than garbage. Diagnostic only: the value is gated on
+/// `config.coverage`, lives solely in the stderr/report path, and never feeds
+/// tiering, hot-counts, snapshots, replay, or program output — so its inherent
+/// nondeterminism can't leak into anything observable (docs/design/02).
+pub inline fn readCycles() u64 {
+    if (@import("builtin").target.cpu.arch != .x86_64) return 0;
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+    );
+    return (@as(u64, hi) << 32) | @as(u64, lo);
+}
 
 /// All recorder state owned by a `Vm`: the hotness counters, the cache of
 /// committed traces, and the single in-progress `Recorder`.
@@ -1049,11 +1085,33 @@ pub const TraceState = struct {
     iters_traced: u64 = 0,
     iters_tier0_covered: u64 = 0,
     iters_tier0_uncovered: u64 = 0,
+    /// **Cycle (time) attribution** for the same three classes, via `readCycles`
+    /// (x86_64 TSC; 0 elsewhere). Iteration counts flatter the JIT — a traced
+    /// iteration is ~10-20× cheaper than a tier-0 one — so these weigh each class by
+    /// actual cost. `cycles_traced` = cycles spent inside trace runs (bracketed
+    /// around the dispatcher's trace-exec region); `cycles_tier0_covered` /
+    /// `cycles_tier0_uncovered` = cycles of tier-0 body iterations charged at their
+    /// back-edge, split by whether a trace exists at the anchor. These three plus
+    /// `cycles_other` (straight-line / non-loop code, = `run_cycles` minus the three)
+    /// partition the run. All exact in aggregate; the per-anchor split has a small
+    /// nesting-boundary leak (see `AnchorCoverage`).
+    cycles_traced: u64 = 0,
+    cycles_tier0_covered: u64 = 0,
+    cycles_tier0_uncovered: u64 = 0,
+    /// Total run cycles (TSC), stamped by the CLI/host around the whole `vm.run`
+    /// (0 if never set, e.g. coverage off or non-x86_64). The denominator for the
+    /// time-based percentages; `cycles_other = run_cycles - traced - tier0_*`.
+    run_cycles: u64 = 0,
+    /// TSC of the last coverage "event" (back-edge hook, or trace-region exit) — the
+    /// start of the current tier-0 span. `noteInterpIter` charges `now - last_event_tsc`
+    /// to the anchor. Seeded to the run-start TSC so the first span isn't a huge
+    /// bogus delta. Scratch, not reported.
+    last_event_tsc: u64 = 0,
     /// Per-anchor breakdown of the same accounting, keyed by loop-header anchor, so
-    /// the report (and the viz) can attribute traced/interpreted iterations to a
-    /// specific source region. Populated only when `config.coverage`; freed in
-    /// `deinit`. `AnchorCoverage.traced`/`.interp` mirror the aggregates above,
-    /// partitioned by anchor.
+    /// the report (and the viz) can attribute traced/interpreted iterations + cycles
+    /// to a specific source region. Populated only when `config.coverage`; freed in
+    /// `deinit`. `AnchorCoverage` fields mirror the aggregates above, partitioned by
+    /// anchor.
     coverage: std.AutoHashMapUnmanaged(AnchorKey, AnchorCoverage) = .empty,
     /// The in-progress recording (at most one at a time in Phase 5a).
     rec: Recorder = .{},
@@ -1210,25 +1268,31 @@ pub const TraceState = struct {
         self.rec.deinit(self.gpa);
     }
 
-    /// Record one interpreted (tier-0) loop back-edge at `(proto, pc)` for coverage
-    /// accounting. Classifies it covered (a trace has been committed at this anchor —
-    /// the "has a trace but ran interpreted" fallback smell) vs uncovered via the
-    /// per-anchor `has_trace` flag — an O(1) map probe, NOT a `findTrace` cache scan,
-    /// so this stays cheap on the 10M-back-edge hot path (it must, since `--time`
-    /// enables it and the bench harness times under `--time`). Caller gates on
-    /// `config.coverage`. On OOM the per-anchor row is lost but an aggregate is still
-    /// bumped (counted uncovered — no map entry means no known trace).
-    pub fn noteInterpIter(self: *TraceState, proto: *const Proto, pc: u32) void {
+    /// Record one interpreted (tier-0) loop back-edge at `(proto, pc)`, plus the
+    /// `cycles` the just-completed tier-0 body iteration took (a `readCycles` delta;
+    /// 0 on non-x86_64), for coverage accounting. Classifies it covered (a trace has
+    /// been committed at this anchor — the "has a trace but ran interpreted" fallback
+    /// smell) vs uncovered via the per-anchor `has_trace` flag — an O(1) map probe,
+    /// NOT a `findTrace` cache scan, so this stays cheap on the 10M-back-edge hot path
+    /// (coverage is opt-in via `--jit-coverage`/`--jit-stats`, never on the timed
+    /// `--time`/bench path). Caller gates on `config.coverage`. On OOM the per-anchor
+    /// row is lost but the aggregates are still bumped (counted uncovered — no map
+    /// entry means no known trace).
+    pub fn noteInterpIter(self: *TraceState, proto: *const Proto, pc: u32, cycles: u64) void {
         const gop = self.coverage.getOrPut(self.gpa, .{ .proto = proto, .pc = pc }) catch {
             self.iters_tier0_uncovered +|= 1;
+            self.cycles_tier0_uncovered +|= cycles;
             return;
         };
         if (!gop.found_existing) gop.value_ptr.* = .{};
         gop.value_ptr.interp +|= 1;
+        gop.value_ptr.interp_cycles +|= cycles;
         if (gop.value_ptr.has_trace) {
             self.iters_tier0_covered +|= 1;
+            self.cycles_tier0_covered +|= cycles;
         } else {
             self.iters_tier0_uncovered +|= 1;
+            self.cycles_tier0_uncovered +|= cycles;
         }
     }
 
@@ -1239,13 +1303,29 @@ pub const TraceState = struct {
     /// double-count-free. Also flips `has_trace` (a run implies a trace exists — a
     /// belt-and-suspenders guard beside the commit-time `markAnchorTraced`). Caller
     /// gates on `config.coverage`. OOM on the per-anchor map is swallowed (the
-    /// aggregate `iters_traced` still holds).
+    /// aggregate `iters_traced` still holds). Time is attributed separately in
+    /// `noteTracedCycles` (the dispatcher brackets the whole trace-exec region once,
+    /// not per side-exit).
     pub fn noteTraceIters(self: *TraceState, anchor: AnchorKey, n: u64) void {
         self.iters_traced +|= n;
         const gop = self.coverage.getOrPut(self.gpa, anchor) catch return;
         if (!gop.found_existing) gop.value_ptr.* = .{};
         gop.value_ptr.traced +|= n;
         gop.value_ptr.has_trace = true;
+    }
+
+    /// Charge `cycles` (a `readCycles` delta) of trace-execution time to `anchor`, for
+    /// the time-based coverage split. Called once per trace-exec region the dispatcher
+    /// brackets (covering the native/tier-1a run and any `driveChain` chaining entered
+    /// at this back-edge), so it is the time counterpart of the iteration count that
+    /// `onSideExit` sums. Bumps the aggregate `cycles_traced` and the per-anchor
+    /// `traced_cycles`. Caller gates on `config.coverage`; OOM on the per-anchor map is
+    /// swallowed (the aggregate still holds).
+    pub fn noteTracedCycles(self: *TraceState, anchor: AnchorKey, cycles: u64) void {
+        self.cycles_traced +|= cycles;
+        const gop = self.coverage.getOrPut(self.gpa, anchor) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.traced_cycles +|= cycles;
     }
 
     /// Mark `anchor` as having a committed trace, for coverage classification. Called
@@ -5442,16 +5522,26 @@ fn pctOf(x: u64, total: u64) f64 {
 
 /// One per-anchor coverage row, materialized from the `coverage` map for sorted
 /// display (a hashmap has no stable iteration order; the report must be
-/// reproducible — Rule Z-3).
-const CoverageRow = struct { name: []const u8, pc: u32, traced: u64, interp: u64 };
+/// reproducible — Rule Z-3). Carries both the iteration counts and the cycle
+/// (time) attribution so the table can weigh loops by cost, not just count.
+const CoverageRow = struct {
+    name: []const u8,
+    pc: u32,
+    traced: u64,
+    interp: u64,
+    traced_cycles: u64,
+    interp_cycles: u64,
+};
 
-/// Render the JIT stats report to `w` (stderr, via `--jit-stats`/`--time`). Reads
-/// only — never mutates `ts`. `full = false` prints just the one-line coverage
-/// summary (for `--time`); `full = true` prints the whole block: the event
-/// counters, the aggregate native-vs-tier-0 iteration split, and a per-anchor
-/// table. All numbers are loop iterations (back-edges) unless labeled otherwise.
-/// Requires `ts.config.coverage` to have been on during the run, else the
-/// iteration counts are all zero (the event counters are always live).
+/// Render the JIT stats report to `w` (stderr, via `--jit-coverage`/`--jit-stats`).
+/// Reads only — never mutates `ts`. `full = false` prints just the one-line coverage
+/// summary (for `--jit-coverage`); `full = true` prints the whole block: the event
+/// counters, the aggregate native-vs-tier-0 split by BOTH iterations and time, and a
+/// per-anchor table. Iteration% flatters the JIT (a traced iteration is ~10-20×
+/// cheaper than a tier-0 one), so the time split — present only on x86_64, where
+/// `readCycles` returns a real TSC — is the one to trust. Requires `ts.config.coverage`
+/// to have been on during the run, else the counts are all zero (the event counters
+/// are always live).
 pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer.Error!void {
     const traced = ts.iters_traced;
     const covered_interp = ts.iters_tier0_covered;
@@ -5461,12 +5551,33 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     // plus fell-back-despite-a-trace.
     const covered = traced +| covered_interp;
 
+    // Time attribution (TSC cycles). `run` is the whole-run denominator so the three
+    // loop classes plus `other` (straight-line / non-loop code) partition it.
+    const c_traced = ts.cycles_traced;
+    const c_cov = ts.cycles_tier0_covered;
+    const c_unc = ts.cycles_tier0_uncovered;
+    const c_loop = c_traced +| c_cov +| c_unc;
+    const run = ts.run_cycles;
+    const has_time = run > 0;
+    // Clamp: TSC skew across the per-region brackets can make the loop sum slightly
+    // exceed the single outer bracket; never report negative "other".
+    const c_other = if (run > c_loop) run - c_loop else 0;
+
     if (!full) {
-        // One-liner for --time. `fallback` = the smell: had a trace, ran tier-0.
+        // One-liner for --jit-coverage. `fallback` = the smell: had a trace, ran
+        // tier-0. The time fragment is what de-misleads the iteration percentages.
         try w.print(
-            "lune: jit coverage — traced {d:.1}% / covered {d:.1}% / fallback {d:.1}% (iters traced={d} cov-interp={d} uncov={d} total={d})\n",
-            .{ pctOf(traced, total), pctOf(covered, total), pctOf(covered_interp, total), traced, covered_interp, uncovered, total },
+            "lune: jit coverage — iters: traced {d:.1}% / fallback {d:.1}%",
+            .{ pctOf(traced, total), pctOf(covered_interp, total) },
         );
+        if (has_time) {
+            try w.print(
+                "  |  time: traced {d:.1}% / tier-0 {d:.1}% (covered-fallback {d:.1}%)\n",
+                .{ pctOf(c_traced, run), pctOf(c_cov +| c_unc, run), pctOf(c_cov, run) },
+            );
+        } else {
+            try w.writeAll("  (time: n/a on this target)\n");
+        }
         return;
     }
 
@@ -5480,12 +5591,24 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.print("    ir link exits:        {d} (follows={d})\n", .{ ts.link_ir_exits, ts.link_follow_count });
     try w.print("    prime-side:           arms={d} chain-follows={d} tier0-body-entries={d}\n", .{ ts.prime_side_arms, ts.prime_side_chain_follows, ts.tier0_outer_body_entries });
 
-    try w.writeAll("  coverage (loop iterations):\n");
+    try w.writeAll("  coverage by loop iterations (count — flatters the JIT):\n");
     try w.print("    traced (ran as trace):  {d:>12}  ({d:.1}%)\n", .{ traced, pctOf(traced, total) });
     try w.print("    tier-0, has-trace:      {d:>12}  ({d:.1}%)   <- fallback despite a trace\n", .{ covered_interp, pctOf(covered_interp, total) });
     try w.print("    tier-0, no-trace:       {d:>12}  ({d:.1}%)\n", .{ uncovered, pctOf(uncovered, total) });
     try w.print("    total:                  {d:>12}\n", .{total});
     try w.print("    covered by a trace:     {d:.1}%   ran as a trace: {d:.1}%\n", .{ pctOf(covered, total), pctOf(traced, total) });
+
+    if (has_time) {
+        try w.writeAll("  coverage by time (TSC cycles — the honest split):\n");
+        try w.print("    traced (ran as trace):  {d:>12}  ({d:.1}% of run)\n", .{ c_traced, pctOf(c_traced, run) });
+        try w.print("    tier-0, has-trace:      {d:>12}  ({d:.1}% of run)   <- fallback despite a trace\n", .{ c_cov, pctOf(c_cov, run) });
+        try w.print("    tier-0, no-trace:       {d:>12}  ({d:.1}% of run)\n", .{ c_unc, pctOf(c_unc, run) });
+        try w.print("    other (non-loop):       {d:>12}  ({d:.1}% of run)\n", .{ c_other, pctOf(c_other, run) });
+        try w.print("    run total:              {d:>12}\n", .{run});
+        try w.print("    ran as a trace: {d:.1}% of run   ({d:.1}% of loop time)\n", .{ pctOf(c_traced, run), pctOf(c_traced, c_loop) });
+    } else {
+        try w.writeAll("  coverage by time: n/a (no TSC on this target)\n");
+    }
 
     // Per-anchor table, sorted (proto name, pc) for reproducibility. Fixed buffer:
     // real programs have a handful of hot loops; note if it ever overflows.
@@ -5498,7 +5621,14 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
             truncated = true;
             break;
         }
-        rows[n] = .{ .name = e.key_ptr.proto.name, .pc = e.key_ptr.pc, .traced = e.value_ptr.traced, .interp = e.value_ptr.interp };
+        rows[n] = .{
+            .name = e.key_ptr.proto.name,
+            .pc = e.key_ptr.pc,
+            .traced = e.value_ptr.traced,
+            .interp = e.value_ptr.interp,
+            .traced_cycles = e.value_ptr.traced_cycles,
+            .interp_cycles = e.value_ptr.interp_cycles,
+        };
         n += 1;
     }
     std.mem.sort(CoverageRow, rows[0..n], {}, struct {
@@ -5509,12 +5639,27 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         }
     }.lt);
     if (n > 0) {
-        try w.writeAll("  per-anchor (loop header → iterations):\n");
-        try w.print("    {s:<20}  {s:>12}  {s:>12}  {s:>7}\n", .{ "anchor", "traced", "interp", "trace%" });
+        // Columns: iteration split (traced/interp + trace%), then the time view —
+        // this anchor's share of the whole run and how much of ITS OWN time was
+        // traced. `run%`/`traced%time` are the ones that expose a hot loop that
+        // "has a trace" yet spends its time interpreted. Time cols blank when no TSC.
+        try w.writeAll("  per-anchor (loop header):\n");
+        try w.print("    {s:<18}  {s:>11}  {s:>11}  {s:>6}   {s:>6}  {s:>8}\n", .{ "anchor", "traced-it", "interp-it", "trc%it", "run%", "trc%time" });
         for (rows[0..n]) |r| {
             var name_pc_buf: [64]u8 = undefined;
             const label = std.fmt.bufPrint(&name_pc_buf, "{s}:{d}", .{ r.name, r.pc }) catch "?";
-            try w.print("    {s:<20}  {d:>12}  {d:>12}  {d:>6.1}%\n", .{ label, r.traced, r.interp, pctOf(r.traced, r.traced +| r.interp) });
+            const anchor_cycles = r.traced_cycles +| r.interp_cycles;
+            if (has_time) {
+                try w.print("    {s:<18}  {d:>11}  {d:>11}  {d:>5.1}%   {d:>5.1}%  {d:>7.1}%\n", .{
+                    label,                              r.traced,
+                    r.interp,                           pctOf(r.traced, r.traced +| r.interp),
+                    pctOf(anchor_cycles, run),          pctOf(r.traced_cycles, anchor_cycles),
+                });
+            } else {
+                try w.print("    {s:<18}  {d:>11}  {d:>11}  {d:>5.1}%   {s:>6}  {s:>8}\n", .{
+                    label, r.traced, r.interp, pctOf(r.traced, r.traced +| r.interp), "n/a", "n/a",
+                });
+            }
         }
         if (truncated) try w.writeAll("    … (per-anchor table truncated at 256 anchors)\n");
     }

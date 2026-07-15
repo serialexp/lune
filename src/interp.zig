@@ -1013,6 +1013,15 @@ pub const Vm = struct {
     }
 
     pub fn run(self: *Vm, proto: *const Proto) Error!Value {
+        // JIT coverage time attribution (gated): bracket the whole run for the
+        // denominator (`run_cycles`) and seed `last_event_tsc` so the first tier-0
+        // span isn't a bogus delta-from-zero. Host TSC only (0 on wasm). See
+        // `trace.readCycles` for the determinism argument (diagnostic, report-only).
+        const cov_run_start = if (self.trace.config.coverage) trace.readCycles() else 0;
+        if (self.trace.config.coverage) self.trace.last_event_tsc = cov_run_start;
+        defer if (self.trace.config.coverage) {
+            self.trace.run_cycles +|= trace.readCycles() -% cov_run_start;
+        };
         self.beginTopLevelEpoch();
         self.seedProtoIds(proto);
         if (proto.num_registers > self.regCapacity()) return Error.StackOverflow;
@@ -2450,11 +2459,17 @@ pub const Vm = struct {
                 // JIT coverage (gated): arriving at a back-edge means tier-0 just
                 // interpreted one loop-body iteration. Classify it covered (a trace
                 // exists at this anchor — the fallback-despite-a-trace smell) vs
-                // uncovered. Trace-run iterations are counted separately in
-                // `onSideExit` (trace.zig); the two are disjoint (a trace's committed
-                // count excludes the deopt iteration tier-0 redoes on side-exit), so
-                // there is no double count.
-                if (self.trace.config.coverage) self.trace.noteInterpIter(proto, anchor_pc);
+                // uncovered, and charge the cycles that body iteration took (the span
+                // since the last coverage event — another back-edge or a trace-region
+                // exit) to this anchor. Trace-run iterations/cycles are counted
+                // separately (`onSideExit` + the trace-exec bracket below); the two
+                // are disjoint (a trace's committed count excludes the deopt iteration
+                // tier-0 redoes on side-exit), so there is no double count.
+                if (self.trace.config.coverage) {
+                    const now = trace.readCycles();
+                    self.trace.noteInterpIter(proto, anchor_pc, now -% self.trace.last_event_tsc);
+                    self.trace.last_event_tsc = now;
+                }
                 // Cheap direct-mapped hot-count pre-filter. A gated/dead loop (the
                 // canonical case: nsieve's array-growing init loop, which can't be
                 // traced) skips the per-back-edge hashmap bookkeeping in
@@ -2591,6 +2606,20 @@ pub const Vm = struct {
                             const trace_regs = self.seedTraceInputs(ct, base, closure, proto, regs, &native_eligible) orelse continue;
                             if (self.trace.valuesScratch(ct.instrs.len)) |buf| {
                                 self.trace.entries +%= 1;
+                                // JIT coverage time attribution (gated): bracket this
+                                // whole trace-exec region (the native/tier-1a run + any
+                                // `driveChain` chaining) so its cycles are charged to
+                                // this anchor as "traced" time — the time counterpart of
+                                // the iteration count `onSideExit` sums. `defer` catches
+                                // every exit, including the productive `continue :outer`
+                                // paths below. Also re-stamps `last_event_tsc` so the
+                                // next tier-0 span's cycles don't include trace time.
+                                const cov_ts0 = if (self.trace.config.coverage) trace.readCycles() else 0;
+                                defer if (self.trace.config.coverage) {
+                                    const cov_end = trace.readCycles();
+                                    self.trace.noteTracedCycles(.{ .proto = proto, .pc = anchor_pc }, cov_end -% cov_ts0);
+                                    self.trace.last_event_tsc = cov_end;
+                                };
                                 var ran_native = false;
                                 var ran_native_link_mode = false;
                                 // 2.3b-1 (doc 17): a `driveChain` burst may persistently
@@ -10251,6 +10280,15 @@ test "jit coverage: iteration accounting is self-consistent with the analytic tr
     // trace existed yet when they ran. (Contrast the nested test below, which
     // deliberately produces a non-zero covered gap.)
     try testing.expectEqual(@as(u64, 0), t.iters_tier0_covered);
+
+    // Time attribution (x86_64 TSC): the exact cycle values are nondeterministic,
+    // so assert only structural invariants. The run was bracketed (`run_cycles`
+    // populated), the loop really ran as a trace for a while (`cycles_traced > 0`),
+    // and traced time is a subset of the whole run (its brackets nest inside the
+    // run bracket, so the bound holds regardless of TSC skew).
+    try testing.expect(t.run_cycles > 0);
+    try testing.expect(t.cycles_traced > 0);
+    try testing.expect(t.cycles_traced <= t.run_cycles);
 }
 
 test "jit coverage: the covered-but-interpreted gap is populated (fallback despite a trace)" {
