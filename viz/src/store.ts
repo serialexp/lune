@@ -6,7 +6,8 @@ import { createStore } from "solid-js/store";
 import { decodeTraceFile, decodeExecLogFile, decodeCoverageFile, type TraceExecLogOutput, type CoverageFileOutput, type CoverageAnchorOutput } from "./decode";
 import { viewsOf, type TraceView } from "./disasm";
 import { flattenExec, type ExecStep } from "./exec";
-import { loadLune, type LuneModule, type LuneRunResult, type LuneReplayResult, type LuneDiagnostic, type BacktraceFrame, type ProtoDisasm } from "./wasm/lune";
+import { type LuneRunResult, type LuneReplayResult, type LuneDiagnostic, type BacktraceFrame, type ProtoDisasm } from "./wasm/lune";
+import { luneWorker } from "./wasm/lune-client";
 import { runNative } from "./native";
 import { diffRuns, type DiffReport } from "./diff";
 import { decodeSnapshot, type SnapshotView } from "./snapshot";
@@ -211,17 +212,6 @@ const [state, setState] = createStore<VizState>({
 
 export { state };
 
-/** Lazily-instantiated singleton wasm VM. The module is ~2 MiB; load it once on
- *  first run, then reuse. */
-let lunePromise: Promise<LuneModule> | null = null;
-function lune(): Promise<LuneModule> {
-  if (lunePromise === null) {
-    const base = import.meta.env?.BASE_URL ?? "./";
-    lunePromise = loadLune(`${base}lune.wasm`);
-  }
-  return lunePromise;
-}
-
 /** Update the editable source (does not run). */
 export function setSource(src: string): void {
   setState("source", src);
@@ -264,8 +254,7 @@ function wasmArgv(): string[] {
  */
 export async function checkSource(src: string): Promise<LuneDiagnostic[]> {
   try {
-    const mod = await lune();
-    return mod.check(src);
+    return await luneWorker().check(src);
   } catch {
     return [];
   }
@@ -385,8 +374,7 @@ export function setReplayPos(pos: number): void {
   const k = stops[clamped];
   void (async () => {
     try {
-      const mod = await lune();
-      const rs = mod.replay(state.replaySource, state.replayEffects!, k);
+      const rs = await luneWorker().replay(state.replaySource, state.replayEffects!, k);
       setState({ replayPos: clamped, replayState: rs, replayView: decodeSnapshot(rs.keyframe) });
     } catch (e) {
       setState({
@@ -412,9 +400,8 @@ export function stepReplay(delta: number): void {
 export async function runWasm(): Promise<void> {
   setState({ running: true, runError: null, runErrorSpan: null, runBacktrace: null, diff: null });
   try {
-    const mod = await lune();
     const src = state.source;
-    const result = mod.runSource(src, wasmArgv());
+    const result = await luneWorker().runSource(src, wasmArgv());
     applyWasmResult(result, "(wasm run)", src);
     // A wasm-only run has no cycle counter — drop any prior native time split so
     // the panel's time column reverts to "run native".
@@ -437,14 +424,13 @@ export async function runWasm(): Promise<void> {
 export async function runBoth(): Promise<void> {
   setState({ running: true, runError: null, runErrorSpan: null, runBacktrace: null, diff: null });
   try {
-    const mod = await lune();
     const src = state.source;
     // wasm gets `[scriptName, ...userArgs]`; native gets the raw userArgs and
     // prepends the temp source path as its own arg[0]. Both see the same
     // arg[1..], which is what the keyframe compare requires (arg[0] is cancelled).
     const userArgs = parseArgsString(state.scriptArgs);
     const [wasm, native] = await Promise.all([
-      Promise.resolve(mod.runSource(src, wasmArgv())),
+      luneWorker().runSource(src, wasmArgv()),
       runNative(src, userArgs),
     ]);
     applyWasmResult(wasm, "(wasm + native diff)", src);
