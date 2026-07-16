@@ -1,0 +1,6 @@
+# lune bench suite  rev=f293e68  stamp=20260622-104739  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	lune_t0_ms	lune_jit_ms	luajit_ms	lune_t0_execns	lune_jit_execns
+scimark-fft	500	-	ok	ok	967.497	689.626	15.779	1009685899	690630642
+scimark-lu	80	-	ok	ok	1144.357	190.032	14.767	1171938659	188617070
+scimark-sor	1000	-	ok	ok	954.878	90.593	20.779	959122660	90673486
+scimark-sparse	3000	-	ok	ok	859.621	936.182	27.151	860437835	1001864434

@@ -1,0 +1,4 @@
+# lune bench suite  rev=956c253  stamp=20260627-091646  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	lune_t0_ms	lune_jit_ms	luajit_ms	lune_t0_execns	lune_jit_execns
+grid_matmul	200	-	ok	ok	308.777	34.080	8.892	326111844	32696573
+grid_matmul_f64	200	-	ok	ok	343.008	58.643	14.114	438537693	47876821

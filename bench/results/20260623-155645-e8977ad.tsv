@@ -1,0 +1,3 @@
+# lune bench suite  rev=e8977ad  stamp=20260623-155645  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	lune_t0_ms	lune_jit_ms	luajit_ms	lune_t0_execns	lune_jit_execns
+field_hash	20000000	-	ok	ok	1534.175	22.316	8.479	2070512347	23122561

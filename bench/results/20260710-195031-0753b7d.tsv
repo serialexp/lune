@@ -1,0 +1,5 @@
+# lune bench suite  rev=0753b7d  stamp=20260710-195031  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	lune_t0_ms	lune_jit_ms	luajit_ms	lune_t0_execns	lune_jit_execns
+nsieve-bit-fp	6	-	ok	ok	267.461	277.789	15.737	273373857	282647432
+nsieve-bit	6	-	ok	ok	131.071	53.405	5.695	129809669	54738924
+nsieve	7	-	ok	ok	150.536	92.798	11.435	151899928	93120319
