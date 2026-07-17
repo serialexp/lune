@@ -852,6 +852,7 @@ pub const LoadedChunk = struct {
 pub const Keyframe = struct {
     globals_id: u32,
     string_metatable_id: u32,
+    next_obj_id: u32,
     objects: []const HeapObject,
     stack: []const SnapValue,
     frames: []const FrameRef,
@@ -870,6 +871,7 @@ pub const Keyframe = struct {
     pub fn encodeInto(self: Keyframe, enc: *binschema.BitStreamEncoder, ctx: *binschema.EncodeContext) binschema.Error!void {
         try enc.writeUint32(self.globals_id, .little_endian);
         try enc.writeUint32(self.string_metatable_id, .little_endian);
+        try enc.writeUint32(self.next_obj_id, .little_endian);
         try enc.writeUint32(@intCast(self.objects.len), .little_endian);
         for (self.objects) |_item_0| {
             try _item_0.encodeInto(enc, ctx);
@@ -901,6 +903,7 @@ pub const Keyframe = struct {
         var result: Keyframe = undefined;
         result.globals_id = try dec.readUint32(.little_endian);
         result.string_metatable_id = try dec.readUint32(.little_endian);
+        result.next_obj_id = try dec.readUint32(.little_endian);
         const _len_8 = try dec.readUint32(.little_endian);
         const _buf_9 = try allocator.alloc(HeapObject, @as(usize, _len_8));
         errdefer allocator.free(_buf_9);

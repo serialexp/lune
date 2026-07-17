@@ -56,7 +56,12 @@ pub const schema = @import("gen/trace_schema.zig");
 /// runtime-`load`ed chunk, in load order. Restore re-compiles each (compile is
 /// deterministic) so a live `load` closure survives snapshot→restore without
 /// serializing bytecode.
-pub const snapshot_format_version: u32 = 4;
+/// v5 (H-2): `Keyframe` gained `next_obj_id` — the heap's monotonic allocation
+/// counter, serialized so restore reproduces the id timeline EXACTLY even after
+/// pre-cut garbage (an object allocated then dropped before the cut bumps the
+/// counter but leaves no `objects` entry, so reconstructing it as max(id)+1 drifts
+/// it low and diverges subsequent ids, which are observable via table/pairs order).
+pub const snapshot_format_version: u32 = 5;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -317,6 +322,12 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
             // (a bare VM that never built metatable support — only hand-built test
             // snapshots) — id 0 is a real object, so it cannot be the sentinel.
             .string_metatable_id = if (vm.string_metatable) |s| s.header.id + 1 else 0,
+            // The heap's monotonic allocation counter (H-2, v5): the NEXT id to
+            // hand out. Serialized verbatim so restore reproduces the id timeline
+            // exactly — a pre-cut allocation that was GC'd before the cut bumped
+            // this but left no `objects` entry, so reconstructing it as max(id)+1
+            // would drift it low and diverge every post-restore id.
+            .next_obj_id = vm.heap.next_obj_id,
             .objects = objects,
             .stack = stack,
             .frames = frames,
@@ -348,6 +359,7 @@ const RestoreError = error{
     DuplicateId, // two HeapObjects share an id (corrupt snapshot)
     DuplicateInternedString, // two HeapStrings carry identical bytes (corrupt snapshot — breaks interning)
     IdSpaceExhausted, // restored ids fill the u32 space, leaving no room for recompiled chunk literals
+    NextObjIdBelowObjects, // serialized next_obj_id sits at/below a restored id (corrupt — a live object can't hold an unallocated id)
     UnresolvedHeapRef, // a HeapRef / root id has no matching object
     UnknownProto, // a HeapClosure.proto_id is not in the program's proto tree
     LoadedChunkRecompileFailed, // a recorded `load` source no longer parses/compiles (corrupt snapshot)
@@ -541,7 +553,15 @@ pub fn restoreSnapshot(
     // a snapshot both names the top id AND carries loaded chunks to recompile.)
     if (max_id == gc.reserved_grid_id_base - 1 and kf.loaded_chunks.len > 0)
         return error.IdSpaceExhausted;
-    vm.heap.adoptNextId(max_id +| 1);
+    // Restore the counter from the serialized `next_obj_id` (v5, H-2), NOT from
+    // `max_id + 1`: the two are equal only when no object was allocated-then-dropped
+    // before the cut. Pre-cut garbage bumps `next_obj_id` but leaves no `objects`
+    // entry, so `max_id + 1` would drift the counter LOW and every post-restore id
+    // would diverge (ids are observable via table/pairs order). The serialized
+    // counter must sit strictly above every restored non-reserved id — a live
+    // object with `id >= next_obj_id` is impossible, so reject it as corrupt.
+    if (kf.next_obj_id < max_id +| 1) return error.NextObjIdBelowObjects;
+    vm.heap.adoptNextId(kf.next_obj_id);
 
     // --- Pass 1a: create every object shell EXCEPT closures, stamped with its
     // original id. Strings are interned first so the recompile below reuses them
@@ -762,6 +782,7 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
         .keyframe = .{
             .globals_id = 2,
             .string_metatable_id = 0,
+            .next_obj_id = 8,
             .objects = &.{
                 .{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a\x00b\xff\xfe" } } },
                 .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "" } } },
@@ -1220,9 +1241,12 @@ test "restore rebuilds globals, ids, and a reachable value graph" {
         gpa.destroy(vm2);
     }
 
-    // Id space is reproduced exactly; the counter is parked past the max.
+    // Id space is reproduced exactly; the counter is restored VERBATIM from the
+    // serialized `next_obj_id` (v5, H-2), and parked strictly past the max id. For
+    // this garbage-free program the two coincide (`next_obj_id == max_id + 1`).
     try testing.expectEqual(@as(usize, decoded.keyframe.objects.len), vm2.heap.object_count);
-    try testing.expectEqual(max_id + 1, vm2.heap.next_obj_id);
+    try testing.expectEqual(decoded.keyframe.next_obj_id, vm2.heap.next_obj_id);
+    try testing.expect(vm2.heap.next_obj_id >= max_id + 1);
     try testing.expectEqual(decoded.keyframe.globals_id, vm2.globals.header.id);
 
     // Walk globals → g → name == "lune"; interning an already-present key resolves
@@ -1250,6 +1274,63 @@ test "restore rebuilds globals, ids, and a reachable value graph" {
     const print_val = vm2.globals.get(try vm2.heap.internValue("print"));
     try testing.expect(print_val.isHeap() and print_val.heapType() == .native);
     try testing.expectEqualStrings("print", function.Native.fromHeader(print_val.asHeap()).name);
+}
+
+test "H-2: next_obj_id survives pre-cut garbage (restored verbatim, not reconstructed from max id)" {
+    const gpa = testing.allocator;
+    // Under gc_stress the collector runs at every safepoint, so a dropped table is
+    // swept before the next allocation. We allocate the survivors FIRST, then 20
+    // throwaway tables that are all collected — each bumped `next_obj_id` (1:1 with
+    // allocation) but left NO `objects` entry. This is the "pre-cut garbage" case
+    // the serialized counter (v5, H-2) exists for: reconstructing it as max(id)+1
+    // would drift it low and diverge every subsequent id (ids are observable via
+    // table/`pairs` order), so restore must take the counter VERBATIM from the wire.
+    const source =
+        \\g = {}
+        \\g.n = 42
+        \\for i = 1, 20 do local junk = {} end
+        \\for i = 1, 5 do end
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.heap.gc_stress = true; // collect at every safepoint → the junk is really swept
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    const sf = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(sf);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const decoded = try schema.SnapshotFile.decode(arena.allocator(), sf);
+
+    // Garbage really happened: allocation bumps the counter 1:1 and this program
+    // makes no grid rows, so `next_obj_id == object_count` would hold with NO frees.
+    // A counter strictly above the live count is the drift the fix captures.
+    try testing.expect(decoded.keyframe.next_obj_id > decoded.keyframe.objects.len);
+
+    // Restore reproduces the counter VERBATIM (a `max_id + 1` reconstruction would
+    // land BELOW this), and the whole snapshot round-trips byte-identical.
+    const vm2 = try restore(gpa, sf, chunk.proto, NativeRegistry.base());
+    defer {
+        vm2.deinit();
+        gpa.destroy(vm2);
+    }
+    try testing.expectEqual(decoded.keyframe.next_obj_id, vm2.heap.next_obj_id);
+    const sf2 = try encodeSnapshot(gpa, vm2);
+    defer gpa.free(sf2);
+    try testing.expectEqualSlices(u8, sf, sf2);
 }
 
 test "restore reanimates the package/require module system (searchers rebind, cache survives)" {
@@ -1446,6 +1527,7 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
         .keyframe = .{
             .globals_id = 2,
             .string_metatable_id = 0,
+            .next_obj_id = 8,
             .objects = &.{
                 .{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a\x00b\xff\xfe" } } },
                 .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "" } } },
@@ -1535,6 +1617,7 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .next_obj_id = 1,
         .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{},
             .entries = &.{.{ .key = sInt(1), .val = sRef(77) }},
@@ -1550,6 +1633,7 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .next_obj_id = 1,
         .objects = &.{.{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = 99, .upvalue_ids = &.{} } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1561,6 +1645,7 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .next_obj_id = 1,
         .objects = &.{.{ .id = 0, .obj_type = 3, .body = .{ .HeapNative = .{ .name = "nope" } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1572,6 +1657,7 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .next_obj_id = 1,
         .objects = &.{.{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "x" } } }},
         .stack = &.{},
         .frames = &.{},
@@ -1583,6 +1669,7 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 5,
         .string_metatable_id = 0,
+        .next_obj_id = 6,
         .objects = &.{
             .{ .id = 5, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "a" } } },
             .{ .id = 5, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "b" } } },
@@ -1597,6 +1684,7 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version + 1, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .next_obj_id = 1,
         .objects = &.{},
         .stack = &.{},
         .frames = &.{},
@@ -1610,6 +1698,7 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .next_obj_id = 2,
         .objects = &.{
             .{ .id = 0, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "dup" } } },
             .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "dup" } } },
@@ -1627,6 +1716,7 @@ test "restore surfaces specific errors for malformed snapshots" {
     try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 0,
         .string_metatable_id = 0,
+        .next_obj_id = gc.reserved_grid_id_base,
         .objects = &.{.{ .id = gc.reserved_grid_id_base - 1, .obj_type = 1, .body = .{ .HeapTable = .{
             .array = &.{},
             .entries = &.{},
@@ -1637,6 +1727,25 @@ test "restore surfaces specific errors for malformed snapshots" {
         .open_upvalues = &.{},
         .loaded_chunks = &.{.{ .source = "return 1", .name = "(load)" }},
     } }, &rootp, error.IdSpaceExhausted);
+
+    // H-2 (v5): `next_obj_id` at/below a restored id is corrupt — a live object
+    // cannot hold an id the counter has not handed out yet. Here object id 5 sits
+    // above `next_obj_id == 3`, so restore must reject rather than mint a counter
+    // that would re-issue id 5 to a fresh allocation.
+    try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
+        .globals_id = 5,
+        .string_metatable_id = 0,
+        .next_obj_id = 3,
+        .objects = &.{.{ .id = 5, .obj_type = 1, .body = .{ .HeapTable = .{
+            .array = &.{},
+            .entries = &.{},
+            .metatable_id = 0,
+        } } }},
+        .stack = &.{},
+        .frames = &.{},
+        .open_upvalues = &.{},
+        .loaded_chunks = &.{},
+    } }, &rootp, error.NextObjIdBelowObjects);
 }
 
 // ---------------------------------------------------------------------------
@@ -1951,6 +2060,7 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
     const bad: schema.SnapshotFile = .{ .version = snapshot_format_version, .keyframe = .{
         .globals_id = 9,
         .string_metatable_id = 0,
+        .next_obj_id = 10,
         .objects = &.{
             .{ .id = 9, .obj_type = 1, .body = .{ .HeapTable = .{ .array = &.{}, .entries = &.{}, .metatable_id = 0 } } },
             .{ .id = 0, .obj_type = 2, .body = .{ .HeapClosure = .{ .proto_id = rootp.id, .upvalue_ids = &.{} } } },

@@ -1,6 +1,6 @@
 # lune — Snapshot & Replay Schema
 
-Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; guard-snapshots outstanding
+Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; keyframe now **v5** (H-2: `next_obj_id` serialized so restore reproduces the id timeline across pre-cut garbage); guard-snapshots outstanding
 Owner: Bart
 Last updated: 2026-06-15
 
@@ -49,8 +49,9 @@ schema follows; this is that schema's home.
       schema (`schema/trace.json`) gains an **additive** record family alongside
       the `Trace*`/`Const*` types, headed by its **own** version word so the trace
       format (`traceser.format_version` = 1) is untouched: `SnapshotFile { version,
-      keyframe }`; `Keyframe { globals_id, objects[], stack[], frames[],
-      open_upvalues[] }`; `HeapObject { id, obj_type, body }` — a flat array keyed
+      keyframe }`; `Keyframe { globals_id, string_metatable_id, next_obj_id,
+      objects[], stack[], frames[], open_upvalues[], loaded_chunks[] }`;
+      `HeapObject { id, obj_type, body }` — a flat array keyed
       by `GcHeader.id`, `body` a discriminated union on `obj_type` (mirroring the
       `ObjectType` ordinals: `HeapString`=0 / `HeapTable`=1 / `HeapClosure`=2 /
       `HeapNative`=3 / `HeapUpvalue`=4; `typed_array`/`host` have no variant yet and
@@ -101,7 +102,17 @@ schema follows; this is that schema's home.
       keyed on `GcHeader.id`, re-stamping the original ids makes a restored VM
       re-serialize **byte-for-byte identical** to the snapshot it came from — the
       verification headline (`encodeSnapshot ∘ restore == identity`, proven over the
-      VM-driven corpus + the run-twice determinism programs). Plus restore-specific
+      VM-driven corpus + the run-twice determinism programs). **v5 (H-2):** the heap's
+      monotonic allocation counter `next_obj_id` is now **serialized** and restored
+      verbatim, not reconstructed as `max(id) + 1`. The old reconstruction was only
+      correct when a run left **no pre-cut garbage** (an object allocated then GC'd
+      before the cut bumps the counter but leaves no `objects` entry, so `max(id)+1`
+      drifts the counter low → every subsequent id diverges, and ids are observable
+      via table/`pairs` order). Restore validates `next_obj_id >= max(id)+1` (a live
+      object holding an unallocated id is corrupt → `NextObjIdBelowObjects`). This
+      also unblocks the later JIT-under-snapshot work (doc 17 H-2): dropping a
+      trace-only object from the snapshot only stays determinism-safe once the id
+      timeline is independent of *which* objects survive. Plus restore-specific
       structural assertions, a full restore of the hand-built edge corpus (cycles,
       open+closed upvalues, 0/N-upvalue closures, non-empty stack/frames/open
       upvalues), and failure-mode tests (`UnresolvedHeapRef` / `UnknownProto` /

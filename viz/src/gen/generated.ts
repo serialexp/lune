@@ -2548,7 +2548,7 @@ export class LoadedChunkDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated-then-dropped before the cut (pre-cut garbage bumps the counter but leaves no object in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
  */
 export interface KeyframeInput {
   /**
@@ -2561,6 +2561,11 @@ export interface KeyframeInput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   string_metatable_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  next_obj_id: number;
   /**
    * Array
    * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
@@ -2614,7 +2619,7 @@ export interface KeyframeInput {
 }
 
 /**
- * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+ * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated-then-dropped before the cut (pre-cut garbage bumps the counter but leaves no object in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
  */
 export interface KeyframeOutput {
   /**
@@ -2627,6 +2632,11 @@ export interface KeyframeOutput {
    * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
    */
   string_metatable_id: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  next_obj_id: number;
   /**
    * Array
    * Collection of elements of the same type. Supports fixed-length, length-prefixed, byte-length-prefixed, field-referenced, and null-terminated arrays.
@@ -2694,6 +2704,7 @@ export class KeyframeEncoder extends BitStreamEncoder {
 
     this.writeUint32(value.globals_id, "little_endian");
     this.writeUint32(value.string_metatable_id, "little_endian");
+    this.writeUint32(value.next_obj_id, "little_endian");
     this.writeUint32(value.objects.length, "little_endian");
     for (let value_objects__iter_index = 0; value_objects__iter_index < value.objects.length; value_objects__iter_index++) {
       const value_objects__iter = value.objects[value_objects__iter_index];
@@ -2748,7 +2759,7 @@ export class KeyframeEncoder extends BitStreamEncoder {
    */
   calculateSize(value: Keyframe): number {
     let size = 0;
-    size += 8; // globals_id + string_metatable_id
+    size += 12; // globals_id + string_metatable_id + next_obj_id
     // objects: array (kind: length_prefixed)
     for (const item of value.objects) {
       const objects_itemEncoder = new HeapObjectEncoder();
@@ -2794,6 +2805,7 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
 
     value.globals_id = this.readUint32("little_endian");
     value.string_metatable_id = this.readUint32("little_endian");
+    value.next_obj_id = this.readUint32("little_endian");
     value.objects = [];
     const objects_length = this.readUint32("little_endian");
     for (let i = 0; i < objects_length; i++) {
@@ -2931,7 +2943,7 @@ export interface SnapshotFileInput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated-then-dropped before the cut (pre-cut garbage bumps the counter but leaves no object in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
    */
   keyframe: KeyframeInput;
 }
@@ -2946,7 +2958,7 @@ export interface SnapshotFileOutput {
    */
   version: number;
   /**
-   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
+   * A whole-VM state snapshot at one moment (docs/design/04-snapshot-replay-schema.md). The heap is a flat array of objects keyed by id; roots are the globals table id, the shared string-metatable id (1-based optional id: header.id + 1, or 0 = none), the live register window, the active frame closures, and the open upvalues. F2a captures the final state (empty stack/frames/open_upvalues); F2b adds mid-execution capture. `next_obj_id` is the heap's monotonic allocation counter (the next `GcHeader.id` to hand out): serialized so restore reproduces the id timeline EXACTLY even when objects were allocated-then-dropped before the cut (pre-cut garbage bumps the counter but leaves no object in `objects`, so reconstructing the counter as max(id)+1 would drift it low and diverge subsequent ids — which are observable via table/pairs ordering). `loaded_chunks` (L-2) carries every runtime-`load`ed chunk's source + name in load order: restore RE-COMPILES each (compile is deterministic) to regenerate identical protos/ids, so a live `load` closure survives snapshot→restore without serializing bytecode.
    */
   keyframe: KeyframeOutput;
 }
@@ -3000,6 +3012,7 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
     value.keyframe = {};
     value.keyframe.globals_id = this.readUint32("little_endian");
     value.keyframe.string_metatable_id = this.readUint32("little_endian");
+    value.keyframe.next_obj_id = this.readUint32("little_endian");
     value.keyframe.objects = [];
     const keyframe_objects_length = this.readUint32("little_endian");
     for (let i = 0; i < keyframe_objects_length; i++) {
