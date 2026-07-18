@@ -1,5 +1,32 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-18 (LATEST-12) — H-5 GROUNDED (both hazards) + COMMITTED. Going-in hypothesis "discharge as N/A" REFUTED by gpt-5.6-sol; both hazards are REAL, tree-verified. Doc-only (no code). The grounding's value: it found two real issues and correctly folded each into an existing tracked blocker.
+
+**Bart's steer:** pick up H-5 (both "needs grounding" round-8 items) as a small-scoped, non-breaking piece.
+
+**Outcome — both REAL, neither independently closeable:**
+- **H-5(ii) (metadata id leakage) ⊆ H-2.** No *direct* leak — trace metadata is `gpa`/mmap and never
+  calls `gc.link` (the only `next_obj_id` bumper). BUT cached/in-progress trace consts are GC roots
+  (`interp.zig:1560/1583`), so a trace-rooted interned string survives a sweep tier-0 would collect
+  (`gc.zig:531/542`); a later re-intern allocates fresh under tier-0 (bumps counter) but reuses the
+  rooted original under the JIT (no bump) → tier-dependent counter + intern identity + snapshot
+  reachability (`keyframeser.zig:268`). That IS H-2's hard half. Also corrected a stale premise:
+  `new_table`/`concat`/`closure` **abort recording** (`.nyi_opcode`, `trace.zig:4093`) — traces
+  materialize no such guest objects today.
+- **H-5(i) (dead-register poisoning) ⊆ F-5.** Confirmed safe on the cut side: suspend checked only in
+  tier-0 `step` (`interp.zig:1716`), native is a synchronous trampoline returning via `shared_exit`,
+  links disarmed under `suspend_ctl != null` (`interp.zig:2632/2643`), F2c serializes only after
+  `.suspended` — **no cut is ever taken mid-native-frame**. BUT register coherence is FALSE: numeric-`for`
+  traces omit dead expression temporaries from the exit snapshot (`trace.zig:3761`, permanent proof
+  `interp.zig:9180`), so those physical slots hold stale pre-entry values after a native run while
+  tier-0 overwrote them. A post-native-exit mid-execution cut serializes the full window
+  (`keyframeser.zig:279`) → **divergent bytes vs tier-0**. Unreachable today ONLY because F2c's
+  mid-execution harness is tier-0-only (`keyframeser.zig:1972/2014`) = the F-5 gap. This upgrades F-5
+  from "unverified obligation" to "has a concrete coherence bug to catch," and makes the native-F2c
+  test **mandatory before** any native mid-execution cut lands.
+- Files: `docs/design/17-exit-branch-patching.md` (H-5 grounding subsection + finding cross-ref +
+  header). **COMMITTED** (doc-only). No Antigravity round — counterexamples concrete + tree-verified.
+
 ## Status 2026-07-18 (LATEST-11) — FOUNDATIONAL PIECE 2 (H-1b) LANDED + COMMITTED. Named the source-opcode PC distinctly from the resume/exit PC via a canonical `guardSourcePc` accessor; centralized the 8 open-coded `guardExitPc(g)-1` derivations; fixed conflated docs. Non-breaking (no `aux`/wire/control-flow value changed). `gpt-5.6-sol` review = NEEDS-CHANGE→clean (design-only fixes). `just test` green (772, default + `-Djit-debug`), nsieve byte-identical, test proven load-bearing.
 
 **Bart's steer (this session):** pick up **H-1b** next ("split source-opcode PC from resume PC in guard
