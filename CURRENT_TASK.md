@@ -1,5 +1,33 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-18 (LATEST-13) — H-1a GROUNDED + COMMITTED. Design-only (no code). Pinned exactly what the recorder stores for inlining vs what GuardProvenance needs, so the round-9 provenance landing is turnkey. gpt-5.6-sol = CONFIRMED directional + 3 sharpenings, all folded in.
+
+**Bart's steer:** keep working through the known small-scope pieces. H-1a is the next H-1 sub-part.
+
+**Outcome — the inline call-site path the recorder must carry:**
+- **Gap (confirmed, real collision):** `InlineFrame = {base_off, ret_dest, ret_count}` (`trace.zig:5324`)
+  stores neither the caller proto id nor the `.call` PC. `recCall` has both (`proto.id` + the call's
+  source PC) but discards them (`trace.zig:5095-5099`). So `f(a); f(b)` both inlined → every guard in `f`
+  gets identical `{callee_proto, source_pc, inline_depth}` AND identical `base_off` (base_off is a
+  function of caller frame layout, not the call opcode) → genuine collision. Unrecoverable from *recorder*
+  state (though present in the live VM call stack — `frame.pc-1` + caller `proto.id` — which recCall sees).
+- **Fix:** extend `InlineFrame` with `{caller_proto_id: u32, call_pc: u32}` set in `recCall`; provenance
+  path = `[(caller_proto_id, call_pc) per open frame] ++ (source_proto_id, source_pc)`. Ordered (multiset
+  unsafe — recursion to depth 3 is reachable, `recCall` has no "already-inlined" check, contra doc-10).
+  Deterministic: `proto.id` replay-stable (preorder compile ids, disjoint load ranges, reconstructed on
+  restore), `call_pc = cur_pc-1`. Precondition: proto-id uniqueness holds for the canonical one-image +
+  `load` model, not for hand-built/default-0 protos.
+- **Necessary but NOT sufficient:** the ordered path is the static-inline-context PREFIX only — the
+  recorder can unroll (`skipBackEdge`, `trace.zig:3580`), so the same path+leaf can emit repeatedly →
+  full GuardProvenance still needs H-1c's role/operand/occurrence. H-1a delivers the prefix.
+- **Cost:** +8B × 3 = +24B recorder-only; `InlineFrame`/`Recorder` are serialized nowhere (confirmed) →
+  purely additive, no wire/behaviour change.
+- **Land-now vs defer (Bart's call):** unlike H-1b (which replaced 8 existing derivations), these fields
+  have NO consumer until GuardProvenance is built, so landing now adds 2 unread fields. Recommend **defer**
+  to the GuardProvenance landing (its consumer, will co-design the tag layout); grounding spec stands.
+- Files: `docs/design/17-exit-branch-patching.md` (H-1a grounding subsection + finding cross-ref +
+  header). **COMMITTED** (doc-only).
+
 ## Status 2026-07-18 (LATEST-12) — H-5 GROUNDED (both hazards) + COMMITTED. Going-in hypothesis "discharge as N/A" REFUTED by gpt-5.6-sol; both hazards are REAL, tree-verified. Doc-only (no code). The grounding's value: it found two real issues and correctly folded each into an existing tracked blocker.
 
 **Bart's steer:** pick up H-5 (both "needs grounding" round-8 items) as a small-scoped, non-breaking piece.
