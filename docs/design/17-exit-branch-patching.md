@@ -188,9 +188,6 @@ land; move whole sections to Done once everything inside is checked.
 
 ### Outstanding
 
-- [ ] **Round-9 landing — 9-A (small/safe).** `pure ⇒ !effect` assert at the builtin-install choke
-  point (`interp.zig:916`) + a `depth==0` clean-entry precondition before `beginTopLevelEpoch`'s
-  disarm. Sub-fork open: `depth != 0` behaviour (fail-closed assert vs skip-reset). Behind `just test`.
 - [ ] **Round-9 landing — 9-B (GuardProvenance IR extension). DEFER — to co-design with its consumer
   (Bart, 2026-07-18).** The design is review-clean, but 9-B is large, touches the *optimizer* (`tropt`
   must remap the side table via `new_index` + `dupe` copy it — emission-index keys are stale at commit),
