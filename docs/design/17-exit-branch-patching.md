@@ -4089,6 +4089,23 @@ and a restore-time `dynamic == true` assertion for the `keyframeser.zig:466` sta
 reviewer would approve. Tree-verified all cites before folding (`basic.zig` `bToString`, `io.zig:164`,
 `load.zig:115`, `collectgarbage` absent).
 
+**Part (1) — LANDED (2026-07-18).** `Proto.dynamic` (`bytecode.zig`) stamped by `assignProtoIds` via
+`Options.dynamic` (`compiler.zig`); set `true` at the `load`/`loadfile`/`dofile` compile site
+(`stdlib/load.zig`) and the keyframe recompile site (`keyframeser.zig`). Four gates in `trace.zig`:
+`arm` (root + side arming), `maybeStartContinuation`/`maybeStartReplaySide` (guard after the pending-anchor
+null-clear), and `recCall` → `abort(.dynamic_proto)` (new `AbortReason`). Tests: (A) dynamic loop records
+zero traces / static records one; (B) static caller inlining a fixed-arity dynamic callee aborts
+`.dynamic_proto`; (C) restored load-chunk protos are `dynamic == true` (whole tree); and the **end-to-end
+cross-mode determinism regression** — a dropped load-chunk's `"victim"` re-interns to a divergent id under
+record-vs-`.off` *without* the gate, so its `pairs` order diverges; `expectProgram` (all 10 modes) asserts
+byte-identical `"marker victim"` *with* it. All four verified load-bearing by negative control (each
+gate/stamp reverted reddens exactly its test; the e2e reddens at both CLI and unit level, both gc_stress
+values). `just test` (779) + `-Djit-debug` green. Gates (2)/(3) are defensive — unreachable once `arm`
+blocks a dynamic anchor from acquiring an initial trace, so they carry no dedicated test (belt-and-braces).
+**gpt-5.6-sol implementation review = APPROVE** ("production implementation and its determinism argument
+are approved"; no change to production hunks required). **Remaining: part (3) — the `beginTopLevelEpoch`
+trace-cache clear.**
+
 #### Foundational piece 2 — H-1b design: name the source-opcode PC distinctly from the resume/exit PC (Bart, 2026-07-18)
 
 **Scope (Bart's call):** land the **H-1b** sub-part of the H-1 guard-provenance blocker as

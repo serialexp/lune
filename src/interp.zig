@@ -8894,6 +8894,131 @@ test "trace toggle gates back-edge counting" {
     }
 }
 
+test "H-2 part 1: a hot loop inside a load-chunk is never traced (dynamic-proto gate)" {
+    // The core regression guard for docs/design/17 H-2 part 1. An identical hot loop
+    // records a trace when it lives in the STATIC main chunk, but records NOTHING when
+    // it lives in a `load`ed chunk — because a `load`/`loadfile`/`dofile` chunk's sole
+    // closure is not retained durably (`vm.loaded_chunks` holds only `{chunk, source}`),
+    // so a trace over it could become the sole GC root of its proto-literal string
+    // konsts and diverge string-intern ids between `.off` and record modes. The gate
+    // (arm/maybeStart*/recCall check `Proto.dynamic`) refuses to record it.
+    // Load-bearing: removing the `if (proto.dynamic) return;` in `arm` reddens the
+    // dynamic case (it would record exactly one trace, like the static case).
+    const gpa = testing.allocator;
+    // STATIC: the loop is in the main chunk → records.
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var chunk = try runForTrace(&vm, gpa,
+            \\local t = { victim = 1 }
+            \\local s = 0
+            \\for i = 1, 200 do s = s + t.victim end
+            \\print(s)
+        , true);
+        defer chunk.deinit();
+        try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    }
+    // DYNAMIC: the same loop, compiled at runtime via `load` → never recorded.
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var chunk = try runForTrace(&vm, gpa,
+            \\local f = load([[
+            \\  local t = { victim = 1 }
+            \\  local s = 0
+            \\  for i = 1, 200 do s = s + t.victim end
+            \\  return s
+            \\]])
+            \\print(f())
+        , true);
+        defer chunk.deinit();
+        try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    }
+}
+
+test "H-2 part 1: dropped load-chunk string id is byte-identical across all modes (end-to-end)" {
+    // The end-to-end determinism regression the gate exists to prevent (docs/design/17
+    // H-2 part 1). A `load`ed chunk's hot loop reads a proto-literal string key
+    // `t.victim` (interned at id A). The closure is dropped, a runtime-built marker
+    // string is interned at id B (> A), a GC cycle is forced, then `"victim"` is
+    // *re-interned at runtime* (`"vic".."tim"` — a *static* `"victim"` literal in the
+    // main chunk would root it and defeat the test) and its id is observed through the
+    // `pairs` order of a fresh table.
+    //   * WITHOUT the gate, a record mode traces the dynamic loop; the trace konst
+    //     keeps "victim" alive at id A, so it re-interns to A (< B) and sorts BEFORE
+    //     the marker — while `.off` sweeps it, re-interns to a fresh id C (> B), and
+    //     the marker sorts first. Divergent `pairs` order ⇒ divergent output.
+    //   * WITH the gate, the dynamic loop is never traced, so "victim" is swept in
+    //     EVERY mode alike and all 10 modes print the same order.
+    // The 3000-table garbage loop forces a real collection even under `gc_stress=false`
+    // (`collectgarbage` is unimplemented; the GC threshold starts at 1024 live objects),
+    // so the non-stress half of the matrix actually sweeps too. Verified load-bearing at
+    // the CLI: disabling the `arm` gate flips record modes to "victim marker ".
+    try expectProgram(
+        \\local f = load("local t = {victim=1} local s=0 for i=1,200 do s=s+t.victim end return s")
+        \\local _ = f()
+        \\f = nil
+        \\local marker = "mar" .. "ker"
+        \\for i = 1, 3000 do local junk = {} end
+        \\local vic = "vic" .. "tim"
+        \\local tt = {}
+        \\tt[vic] = 1
+        \\tt[marker] = 2
+        \\local order = ""
+        \\for k in pairs(tt) do order = order .. k .. " " end
+        \\print(order)
+        \\
+    ,
+        "marker victim \n",
+    );
+}
+
+test "H-2 part 1: a static trace inlining a dynamic callee aborts with .dynamic_proto (gate 4)" {
+    // Covers the recCall inlining gate: a trace anchored in a STATIC proto that
+    // inline-calls a `load`ed callee each iteration must abort (embedding the dynamic
+    // callee's proto-literal konsts into a static trace is the same H-2 hazard). The
+    // callee must be a fixed-arity NESTED function — a directly-loaded root is vararg
+    // (`load.zig` `vararg_root = true`) and already aborts at `cp.is_vararg`, which
+    // would not prove the new gate fired. Load-bearing: removing the recCall
+    // `if (cp.dynamic) return self.abort(.dynamic_proto);` lets the callee inline
+    // (the abort row disappears / turns into a recorded trace).
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local g = load("return function(x) return x + 1 end")()
+        \\local s = 0
+        \\for i = 1, 300 do s = g(s) end
+        \\print(s)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = false;
+    vm.trace.config.optimize = false;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.record_aborts = true; // populate abort_log so we can read the reason
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    // No trace survives (the static anchor keeps aborting on the dynamic callee)...
+    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    // ...and the abort log carries a `.dynamic_proto` row (not `.cross_frame`).
+    var saw_dynamic_proto = false;
+    for (vm.trace.abort_log.items) |row| {
+        if (row.reason == .dynamic_proto) saw_dynamic_proto = true;
+    }
+    try testing.expect(saw_dynamic_proto);
+}
+
 /// Run `source` with tier-1a execution **and** exec-log recording on (small
 /// `hotloop` so test loops go hot), capturing `print` output into `sink`. Returns
 /// the compiled chunk so the caller can inspect `vm.trace.exec_logs` while the

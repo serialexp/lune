@@ -113,6 +113,9 @@ pub fn compileToClosure(vm: *Vm, src_bytes: []const u8, chunk_name: []const u8, 
         .id_base = vm.next_proto_id,
         // Lua loaded chunks are vararg: `load("return ...")(1, 2)` yields 1, 2.
         .vararg_root = true,
+        // Dynamically-compiled: the tracing JIT must never record over this chunk
+        // (docs/design/17 H-2 part 1) — its closure is not retained durably.
+        .dynamic = true,
     }) catch {
         return loadError(vm, owned, chunk_name, &diags, out);
     };

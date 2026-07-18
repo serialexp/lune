@@ -465,6 +465,10 @@ fn recompileLoadedChunks(vm: *Vm, root: *const Proto, loaded: []const schema.Loa
             .known_globals = &interp.builtin_global_names,
             .id_base = vm.next_proto_id,
             .vararg_root = true,
+            // Restored load-chunks stay dynamic so the JIT keeps refusing to trace
+            // them post-restore (docs/design/17 H-2 part 1); the bit is a pure
+            // compile-time property, re-derived identically here, never serialized.
+            .dynamic = true,
         }) catch {
             vm.gpa.free(owned);
             return error.LoadedChunkRecompileFailed;
@@ -1468,6 +1472,58 @@ test "restore reanimates the package/require module system (searchers rebind, ca
     try testing.expectEqualStrings("A:a", string.String.fromHeader(out[0].asHeap()).bytes());
     _ = try vm2.callValue(require_val, &.{try vm2.heap.internValue("b")}, out[0..]);
     try testing.expectEqualStrings("B:b", string.String.fromHeader(out[0].asHeap()).bytes());
+}
+
+test "H-2 part 1: recompiled load-chunk protos are stamped dynamic after restore" {
+    // Covers the keyframe recompile-site stamp (`recompileLoadedChunks` passes
+    // `.dynamic = true`). None of the live-run gate tests would catch forgetting this:
+    // a restored `load`ed chunk must keep `Proto.dynamic == true` on its whole proto
+    // tree so the JIT keeps refusing to trace it post-restore (docs/design/17 H-2 p1).
+    // Load-bearing: dropping `.dynamic = true` at `keyframeser.zig`'s recompile site
+    // leaves the restored protos `false` and reddens this.
+    const gpa = testing.allocator;
+    // Keep the loaded closure alive across the snapshot by binding it to a global, so
+    // the chunk is retained in `vm.loaded_chunks` and recompiled on restore. The chunk
+    // has a NESTED function so we can check the recursive stamp, not just the root.
+    const source =
+        \\f = load("local g = function(x) return x + 1 end return g(41)")
+        \\answer = f()
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    // Pre-condition: the live VM already has the chunk loaded and stamped dynamic.
+    try testing.expect(vm.loaded_chunks.items.len >= 1);
+
+    const b0 = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(b0);
+    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+    defer {
+        vm2.deinit();
+        gpa.destroy(vm2);
+    }
+
+    // The recompiled chunk(s) and their whole proto trees must be `dynamic == true`.
+    try testing.expect(vm2.loaded_chunks.items.len >= 1);
+    const Check = struct {
+        fn allDynamic(proto: *const Proto) !void {
+            try testing.expect(proto.dynamic);
+            for (proto.protos) |child| try allDynamic(child);
+        }
+    };
+    for (vm2.loaded_chunks.items) |lc| try Check.allDynamic(lc.chunk.proto);
 }
 
 test "metatable edge to the id-0 object survives round-trip (1-based encoding)" {
