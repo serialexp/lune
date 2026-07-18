@@ -37,7 +37,21 @@ consumer machinery exists.
    guard `emit` helper with per-site `(role, operand)`.
 
 - Files: `docs/design/17-exit-branch-patching.md` (§"Round-9 landing plan" + review outcome + header +
-  Outstanding bullets). CURRENT_TASK.md. **NEXT: commit doc-only, then land 9-A (small), then 9-B.**
+  Outstanding bullets). CURRENT_TASK.md. Committed `9acebc1` (doc-only).
+
+**9-A LANDED (code) — `pure ⇒ !effect` + `depth==0` fail-closed:**
+- `pure ⇒ !effect`: a `comptime` block over the whole static `base_natives` registry (`interp.zig`,
+  after `base_natives`) `@compileError`s if any builtin sets both — structural, covers `manual` entries,
+  no install-site bypass. Restore path (`keyframeser.zig:~611`) gets a `std.debug.assert` for a
+  caller-supplied `NativeRegistry` (defense-in-depth; the static tables are comptime-proven).
+- `depth==0`: `beginTopLevelEpoch` now returns `Error!void` and rejects `depth != 0` with a new
+  `Error.DirtyTopLevelEntry` BEFORE `disarmAllLinks` (release-enforced — a returned error, not an
+  assert). `run`/`start` `try` it; `catchable()` classifies the new tag not-catchable (unreachable in
+  `pcall`). Doc-comment marks where the future region-clear goes (after the same guard).
+- Test: "top-level re-entry on a suspended (dirty) VM fails closed" — suspends at depth 3, asserts both
+  `start`/`run` return `DirtyTopLevelEntry`, then resumes via `exec()` to completion. **Negative control:
+  neutralizing the check fails exactly this test (772 pass / 1 fail), silent `.suspended` misuse.**
+- Gate: `just test` green (default + `-Djit-debug`); nsieve tier-0≡native byte-identical. **NEXT: 9-B.**
 
 ## Status 2026-07-18 (LATEST-15) — H-3 + H-4 GROUNDED + COMMITTED. Design-only (no code). The two mechanics blockers, grounded against the tree. gpt-5.6-sol = NEEDS-CHANGE (both); all corrections tree-verified + folded.
 

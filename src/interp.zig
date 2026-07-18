@@ -59,6 +59,15 @@ pub const Error = error{
     Unimplemented,
     /// Call/register stack exhausted, or tier-0's native-recursion guard tripped.
     StackOverflow,
+    /// A fresh top-level `run`/`start` was entered on a VM whose call stack is not
+    /// empty (`depth != 0`) — a **dirty** entry. `run`/`start` allocate and push a
+    /// fresh top-level frame; they never continue a live stack (suspension resume
+    /// goes through `exec()`, not `start()`). So a non-empty stack at entry is caller
+    /// misuse: a suspended or faulted VM re-driven through the wrong door. Rejected
+    /// fail-closed BEFORE any epoch mutation (doc 17, H-3 / 9-A(ii)) so the dirty
+    /// entry can't corrupt the resumable epoch. Release-enforced (an assert would
+    /// vanish under ReleaseFast).
+    DirtyTopLevelEntry,
     /// A native (host) function failed with an error outside the known set.
     HostError,
     /// Replay consumed the whole effect log but the program asked for another
@@ -229,6 +238,20 @@ pub const lune_version = "lune 0.0.0";
 pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++
     stdbase.natives ++ stdbasic.natives ++ stdstring.natives ++ stderrors.natives ++
     stddebug.natives ++ stdload.natives ++ stdpackage.natives;
+
+comptime {
+    // `pure ⇒ !effect` (doc 17, H-4 / 9-A(i)). `pure` and `effect` are independent
+    // nullable fields (`function.zig`), and a JIT `recCall` inlines a `pure` builtin
+    // as a leaf op — so a builtin that set BOTH would inline a host effect past the
+    // `.host_barrier`, silently committing it on-trace. Enforce the invariant
+    // structurally over the whole static registry (covers `manual` entries, which
+    // carry the fields even without an install slot) — this catches it at compile
+    // time, not one install-site assert `manual`/restore/package paths would bypass.
+    for (base_natives) |bn| {
+        if (bn.pure != null and bn.effect != null)
+            @compileError("builtin '" ++ bn.name ++ "' sets both `pure` and `effect`; pure ⇒ !effect must hold (doc 17 H-4)");
+    }
+}
 
 /// The interpreter's own natives. `print` is pure output; `clock` is the first
 /// nondeterministic input.
@@ -1008,7 +1031,15 @@ pub const Vm = struct {
     /// Applies ONLY to the fresh `run`/`start` entry — NOT `exec()` resume after a
     /// `.suspended` (a continuation of the SAME epoch, where the dispatcher's
     /// observation-window disarm, 2.3c-0e, governs) and not nested function calls.
-    fn beginTopLevelEpoch(self: *Vm) void {
+    /// Begin a fresh top-level tiering epoch (every `run`/`start`). Fail-closed on a
+    /// dirty entry (`depth != 0`) BEFORE mutating any epoch state — see
+    /// `Error.DirtyTopLevelEntry`. A genuine fresh entry always has `depth == 0`
+    /// (init 0; a successful top-level return decrements back to 0; suspend/error
+    /// deliberately leave frames live, and those resume via `exec()`, never here).
+    /// When the region-accounting map lands (doc 17, H-3 / Increment 3) its
+    /// `clearRetainingCapacity()` goes here too, after this same guard.
+    fn beginTopLevelEpoch(self: *Vm) Error!void {
+        if (self.depth != 0) return error.DirtyTopLevelEntry;
         self.trace.disarmAllLinks();
     }
 
@@ -1022,7 +1053,7 @@ pub const Vm = struct {
         defer if (self.trace.config.coverage) {
             self.trace.run_cycles +|= trace.cycleDelta(trace.readCycles(), cov_run_start);
         };
-        self.beginTopLevelEpoch();
+        try self.beginTopLevelEpoch();
         self.seedProtoIds(proto);
         if (proto.num_registers > self.regCapacity()) return Error.StackOverflow;
         self.fillNil(0, proto.num_registers);
@@ -1043,7 +1074,7 @@ pub const Vm = struct {
     /// chunk's frame exactly as `run` does. Resume after a `.suspended` by
     /// calling `exec()` again (the cursor is parked in `frames[depth-1]`).
     pub fn start(self: *Vm, proto: *const Proto) Error!ExecOutcome {
-        self.beginTopLevelEpoch();
+        try self.beginTopLevelEpoch();
         self.seedProtoIds(proto);
         if (proto.num_registers > self.regCapacity()) return Error.StackOverflow;
         self.fillNil(0, proto.num_registers);
@@ -3795,6 +3826,10 @@ pub fn catchable(e: Error) bool {
         Error.EnvUnavailable,
         Error.FsUnavailable,
         Error.UnicodeVersionMismatch,
+        // A top-level `run`/`start` contract violation — it can never surface inside
+        // a `pcall`/`xpcall` (those don't re-enter top-level), so it is unreachable
+        // here; classified not-catchable for completeness (doc 17, H-3 / 9-A(ii)).
+        Error.DirtyTopLevelEntry,
         => false,
     };
 }
@@ -8240,6 +8275,54 @@ test "replay: backtraceFrames reports a deepest-first chain at a suspend inside 
     try testing.expectEqualStrings("inner", frames[0].name);
     try testing.expectEqualStrings("outer", frames[1].name);
     try testing.expectEqualStrings("main", frames[2].name);
+}
+
+test "top-level re-entry on a suspended (dirty) VM fails closed (doc 17 H-3 / 9-A(ii))" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    const source =
+        \\local function inner() return 1 end
+        \\local function outer() return inner() end
+        \\print(outer())
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.suspend_ctl = .{ .min_depth = 3, .after_safepoints = 0 };
+
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    // Suspend mid-execution: frames stay live, so `depth != 0`.
+    const outcome = try vm.start(chunk.proto);
+    try testing.expect(outcome == .suspended);
+    try testing.expect(vm.depth != 0);
+
+    // A fresh top-level entry through the wrong door (`start`/`run` rather than
+    // resuming via `exec()`) must be rejected BEFORE mutating any epoch state — a
+    // bare assert would vanish under ReleaseFast, so this is a returned error.
+    try testing.expectError(error.DirtyTopLevelEntry, vm.start(chunk.proto));
+    try testing.expectError(error.DirtyTopLevelEntry, vm.run(chunk.proto));
+
+    // The suspended epoch is still intact and resumes normally to completion
+    // (clear the trigger first, else it re-suspends at the same depth).
+    vm.suspend_ctl = null;
+    switch (try vm.exec()) {
+        .finished => {},
+        .suspended => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqualStrings("1\n", sink.buffered());
 }
 
 test "e2e: recursion, loop, locals — fib and a summing loop" {
