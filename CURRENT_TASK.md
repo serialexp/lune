@@ -1,5 +1,52 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-18 (LATEST-15) — H-3 + H-4 GROUNDED + COMMITTED. Design-only (no code). The two mechanics blockers, grounded against the tree. gpt-5.6-sol = NEEDS-CHANGE (both); all corrections tree-verified + folded.
+
+**Bart's steer:** defer H-1a landing until GuardProvenance is relevant; do the small independent H-3/H-4 first.
+
+**H-3 — region-map cap bound + `beginTopLevelEpoch` clean-entry:**
+- **Scope fact:** the `region_profit` accounting map does NOT exist in the tree yet (unlanded round-3/4/5
+  Part-A design) — so this grounds a *contract* the round-9 map must satisfy, plus today's epoch entry.
+- **(i) Live set bounded ⇒ fail-closed/lifetime-scoped safe, SILENT evict-live banned.** `max_call_depth
+  = 200` is hard (`interp.zig:119`, fixed `frames[200]`, `pushFrame` guard `:1347`). BUT `regions_per_frame
+  ≤ static anchor count` was OVERSTATED (review) — regions have distinct RegionIds + can share an anchor;
+  round 9 must state an explicit per-`(activation,anchor)` cardinality invariant. No global
+  `max_anchors_per_proto` (dynamic load) ⇒ leans toward the lifetime-scoped (uncapped-over-live-set)
+  option. Only *silent* eviction of a live armed region is banned (atomic disarm-to-fail-closed eviction
+  could be safe).
+- **(ii) Clean-entry gap REAL and broader than framed.** `depth` has no reset-to-zero; `pcall`/`xpcall`
+  restore it directly (`errors.zig:101/109/117`), keyframe-restore assigns it (`keyframeser.zig:710`) —
+  so "moved only by ±1" was wrong. The load-bearing invariant: *any* uncaught error leaves frames live
+  (explicit `interp.zig:1454`; `StackOverflow` is CATCHABLE contra my draft, but catchability is beside
+  the point). Second dirty-entry case the finding missed: a **suspended** VM (no fault needed). Corruption
+  worse than "push above stale" — top-level `stop_depth==1` can resume a stale frame. Round 9 needs a
+  **`depth==0` precondition checked BEFORE `disarmAllLinks`/map-clear** (else rejecting a run on a
+  suspended VM corrupts its resumable epoch). `beginTopLevelEpoch` today only `disarmAllLinks()` (`:1012`).
+
+**H-4 — the only implementable F2c logical cut:**
+- **Mechanism:** `suspend_ctl{min_depth, after_safepoints}` (`interp.zig:418`) checked at ONE tier-0 site
+  (`:1716`), safepoint-counted (`:1704`); native runs bursts and doesn't advance `safepoint_seq` ⇒ a
+  safepoint cut is tier-dependent (G-4). (`suspend_ctl != null` doesn't stop native *running* — only
+  disables fusion, `:2627`.)
+- **Effect boundary = the one implementable tier-independent cut.** Host effects abort the trace
+  (`.host_barrier` `trace.zig:5046`; only `PureBuiltin` sqrt inlines, no effect) ⇒ no effect ever commits
+  on-trace ⇒ the tier-0 boundary after the Nth effect is always reached. BUT (review) the barrier isn't
+  structural: `pure`/`effect` are independent fields (`function.zig:229/238`), `recCall` checks pure
+  first ⇒ round 9 must **enforce `pure != null ⇒ effect == null`**.
+- **"Iteration K" not implementable** (effect-free loop, native overshoots to burst end) without a new
+  native logical-yield.
+- **Immediate post-effect boundary NOT always suspendable** (review): multret producer sets
+  `reg_top_pending` which the suspend gate refuses (`:1719/3685`); a faulting effect has no next boundary.
+  ⇒ cut at "first snapshot-eligible boundary after `effect_cursor == N`" on a successful fixed-result
+  effect. `SuspendCtl` has no effect-count field ⇒ harness steps one eligible boundary at a time.
+- **Assertion = full semantic keyframe** (stack + frames{closure,pc,base,return-wiring,varargs} + heap +
+  object-id counter + open upvalues, `keyframeser.zig:279`) **+ replay-driver** (effect log + cursor,
+  OMITTED from keyframe `:2090`) **+ output prefix** — not `effect_cursor` alone. Cut after result install
+  (`:2272`), never inside `logEffect`. Dovetails with H-5(i)'s omitted dead-temporary bug.
+
+- Files: `docs/design/17-exit-branch-patching.md` (H-3 + H-4 grounding subsections + finding cross-refs +
+  header). **COMMITTED** (doc-only).
+
 ## Status 2026-07-18 (LATEST-14) — H-1c GROUNDED + COMMITTED. Design-only (no code). Pinned the per-opcode guard-site vocabulary that completes GuardProvenance. gpt-5.6-sol = NEEDS-CHANGE; all corrections tree-verified + folded. The identity shrinks from G-1's 4 axes to **3**.
 
 **Bart's steer:** keep working through the known small-scope pieces. H-1c is the last H-1 sub-part.
