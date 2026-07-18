@@ -1,5 +1,44 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-18 (LATEST-16) — ROUND-9 LANDING PLAN written + reviewed + COMMITTED. Design-only (no code). Bart: "go back to bigger increments" → chose the round-9 landing track. gpt-5.6-sol = BLOCKER (6 defects), all tree-verified + folded.
+
+**Bart's steer:** back to bigger increments; picked "Round-9 landing" over H-2 hard half / GuardProvenance-only.
+
+**Plan (doc-17 §"Round-9 landing plan"):** sequences the grounded blockers into code, split by whether the
+consumer machinery exists.
+- **9-A (small/safe/immediate):** (i) `pure ⇒ !effect` — the H-4 barrier made structural; (ii) `depth==0`
+  clean-entry precondition before `beginTopLevelEpoch`'s disarm (H-3).
+- **9-B (foundational plumbing, NO consumer yet):** the `GuardProvenance` IR extension as a **transient
+  side table** keyed by the **committed** instr index (NOT a field on `IrInstr`). Tag = `{path:[3]call-edges,
+  source_proto_id, source_pc, role, operand}`.
+- **Deferred to Increment-3 machinery** (NOT round 9): F2c native-cut harness (H-4 cut) + region cap (H-3
+  cap) — need `region_profit`/native-F2c.
+
+**gpt-5.6-sol review = BLOCKER → resolved (design only); 6 defects, ALL tree-verified before folding:**
+1. **‡ THE damaging one — emission-time instr-index key is STALE at commit.** `tropt.optimize` renumbers
+   (`new_index` `tropt.zig:535`), drops duplicate/always-pass guards (`:299-312`), inserts `.preheader`
+   (`:530`) → a side table copied unchanged points at the wrong instrs. **Fix: provenance is remapped by
+   the optimizer via `new_index` + copied by `dupe`, keyed by the COMMITTED index.** Guard-dedup survivor
+   keeps its own tag (H-1c many-to-one).
+2. **Tag dropped leaf `source_proto_id`** (cross-leaf-proto collision) + mis-sized path. Fix: leaf
+   `(source_proto_id, source_pc)` are separate tag fields; `path:[MAX_INLINE_DEPTH=3]` holds **edges only**.
+3. **"IrInstr field forces schema bump" was WRONG** — `traceser.toSchemaTrace` maps 6 fields explicitly
+   (`traceser.zig:66`). Side table chosen for the 16-byte `IrInstr` budget (`trace.zig:5849`) + minority-of-
+   ops, not serialization.
+4. **`pure⇒!effect` at `interp.zig:916` alone insufficient** — `.manual` early-returns (`:914`), restore
+   (`keyframeser.zig:606`), package (`package.zig:434`), synthetic `.pure` sets (`trace.zig:6501/6534`)
+   bypass it. Fix: comptime-over-static-tables + restore-path assert.
+5. **`depth!=0` "skip-reset" option UNSOUND** — `run`/`start` push a FRESH top-level frame
+   (`interp.zig:1025-1035/1046-1052`), never continue; resume is via `exec()`. Fix: fail-closed only,
+   **release-enforced** (error/panic, not `std.debug.assert`).
+6. **Stamping list incomplete + errors** — omitted `recArrayGet` (`4277`), `recHashGet` (`4698`),
+   `recForPrepLink` (`4939`); `source_pc = cur_pc−1` not `cur_pc` (post-increment `trace.zig:5394`); lane
+   ordinal must NOT be an `operand` (observed input breaks determinism). Fix: stamp structurally in the
+   guard `emit` helper with per-site `(role, operand)`.
+
+- Files: `docs/design/17-exit-branch-patching.md` (§"Round-9 landing plan" + review outcome + header +
+  Outstanding bullets). CURRENT_TASK.md. **NEXT: commit doc-only, then land 9-A (small), then 9-B.**
+
 ## Status 2026-07-18 (LATEST-15) — H-3 + H-4 GROUNDED + COMMITTED. Design-only (no code). The two mechanics blockers, grounded against the tree. gpt-5.6-sol = NEEDS-CHANGE (both); all corrections tree-verified + folded.
 
 **Bart's steer:** defer H-1a landing until GuardProvenance is relevant; do the small independent H-3/H-4 first.
