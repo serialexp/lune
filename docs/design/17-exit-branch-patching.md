@@ -4106,6 +4106,111 @@ blocks a dynamic anchor from acquiring an initial trace, so they carry no dedica
 are approved"; no change to production hunks required). **Remaining: part (3) — the `beginTopLevelEpoch`
 trace-cache clear.**
 
+##### Part (3) — design: clear the trace cache at `beginTopLevelEpoch` (the cross-epoch facet) (2026-07-18)
+
+**What (3) closes.** Parts (1)+(2) handle dynamic protos and the *snapshot* walk. The last facet is
+**static-tree trace consts surviving across a top-level epoch boundary.** A lune VM can run more than one
+top-level epoch (`vm.run`/`vm.start` called again — REPL, embedder, restore-then-continue). `run` calls
+`beginTopLevelEpoch` at a *clean* entry (`depth == 0`, `interp.zig:1041`). At `depth == 0` **no frame
+closure roots the static proto tree** — `forEachRootHeader` roots only `frames[0..depth]` closures, and
+`markProtoConstants` recurses only from a *live* closure (`gc.zig:512`). So between epochs a static proto
+literal (e.g. a string key `"foo"`) is rooted by **nothing except a cached trace's const**. In a
+`record_execute*` mode that trace (recorded in epoch N) keeps `"foo"` interned across the boundary; under
+`.off` there is no trace and `"foo"` is swept. Epoch N+1 re-interning `"foo"` then gets a **different**
+`next_obj_id` between the modes → the same cross-mode `pairs`/id divergence as part (1), but triggered at
+the epoch boundary rather than by a dropped dynamic closure. Part (1)'s gate does not help (these are
+*static* protos, legitimately traced within their epoch); part (2)'s snapshot split does not help (this is
+GC liveness, not serialization). The only determinism-preserving fix is to **not carry a trace's
+GC-rooting across an epoch boundary** — free the trace cache at `beginTopLevelEpoch`.
+
+**The mechanism: a mid-life `clearCache()` on `TraceState`, called from `beginTopLevelEpoch` after the
+existing `disarmAllLinks()`.** This is a *mid-VM-life* free (the VM keeps running — NOT `deinit`, which
+also tears down `mcode_arena`). Reuse the safe-free discipline already proven by `removeTrace`
+(`trace.zig:3431`) and `deinit` (`trace.zig:1341`):
+- **Ordering makes link-cleanup trivial.** `beginTopLevelEpoch` already calls `disarmAllLinks()` first,
+  which resets every armed parent slot to `shared_exit` **and** empties `armed_links`
+  (`clearRetainingCapacity`, `trace.zig:3428`). So by the time `clearCache()` runs there are **no inbound
+  native links** to any cached trace — no per-trace `resetLinksTouching` needed.
+- **Free + clear:** `for (self.cache.items) |t| t.destroy(self.gpa);` (each `destroy` returns its mcode
+  slots to the *retained* `mcode_arena` free-list, exactly as `deinit` does — the arena is reused, not torn
+  down) then `self.cache.clearRetainingCapacity();`.
+- **Reset the anchor-keyed tiering state** so epoch N+1 re-warms cleanly and no stale entry references a
+  freed trace or suppresses re-recording: `counters`, `hotcount` (`@memset` to 0), `gate`, `penalty`,
+  `guard_failures`, `prime_exits` (all `clearRetainingCapacity`), and null the epoch-local "already hot"
+  scalars `wants_side_trace`, **`wants_prime_side`** (`trace.zig:1250` — parallel to `wants_side_trace`,
+  populated from `prime_exits`/guard failures at `trace.zig:3168`; clearing `prime_exits` without nulling
+  this leaves a stale `AnchorKey` that address reuse could make epoch N+1 arm on), `pending_exit_anchor`,
+  and `pending_replay_anchor`. This mirrors the counter reset `removeTrace` does per anchor, wholesale.
+- **Clear the trace-index-keyed and `*Proto`-borrowing diagnostic state** (gpt-5.6-sol — these are *not*
+  safe to retain across the boundary):
+  - **`exec_logs` + the recorder.** Execution logs are keyed by `trace_id`, and `trace_id` **is the cache
+    index** (`traceIndex`, `trace.zig:1550`; `execLogFor`, `trace.zig:1539`). After the cache is cleared,
+    epoch N+1 reuses index 0 and would append its events to epoch N's log (`trace.zig:1432`). Worse, log
+    events can hold string `Value`s and `exec_logs` is **absent from the GC root walk** (`interp.zig:1635`),
+    so once the trace-const root is gone a later sweep leaves dangling string values in a retained log.
+    Fix: `for (self.exec_logs.items) |*l| l.deinit(self.gpa)`, `exec_logs.clearRetainingCapacity()`, and
+    null the recorder's current log target (`exec_recorder.?.log`).
+  - **`coverage` map.** `AnchorCoverage.has_trace` means "a trace currently exists" and classifies later
+    tier-0 iterations (`trace.zig:919,1366`); leaving it true after bulk retirement corrupts the report.
+    More seriously the map key borrows a `*Proto` that reporters dereference (`coverageser.zig:77`,
+    `trace.zig:5756`), which conflicts with `Vm.run`'s contract that a proto is only valid *during* its
+    call (`interp.zig:1060`) — a chunk freed between epochs would dangle. Fix: `coverage.clearRetainingCapacity()`
+    at the boundary; keep only the **scalar lifetime aggregates** (`iters_traced`, `cycles_traced`,
+    `run_cycles`, … — pure `u64`s, no borrowed pointers).
+  - **`abort_log`.** `AbortRecord` explicitly borrows a `*Proto` (`trace.zig:749`) and rendering
+    dereferences `r.proto.name` (`trace.zig:5621`); retaining it across independently-owned chunks is a
+    diagnostic UAF. Fix: `abort_log.clearRetainingCapacity()` per epoch.
+- **Left untouched (deliberately):** `mcode_arena` (reused — `Trace.destroy` returns each slot to its
+  free-list, `nativegen.zig:312`), `next_trace_id` (monotonic — prevents old native/result/log identities
+  from aliasing later traces), `tick` (monotonic; safe because `gate` is cleared, so no surviving retry
+  deadline depends on its old value), and the scalar coverage/lifetime `u64` aggregates. `values_scratch`,
+  ledger scratch, and the inactive `Recorder` hold no persistent `*Trace` and need no reset.
+
+**Why entry/arming stays self-consistent after the free.** Trace *entry* and *re-arm* both scan `cache`
+(via `findTrace`/`hasTrace`), never a cached "already traced" flag — so an empty `cache` is authoritatively
+"no trace here" for every consumer. Freeing the traces and clearing `cache` in one step can't leave a path
+that enters a freed trace.
+
+**Determinism argument.** `beginTopLevelEpoch` is **mode-independent** — every mode (including `.off`, whose
+cache is always empty so the clear is a no-op) reaches it at the same deterministic point (a fresh
+`run`/`start` with `depth == 0`). Clearing there means trace-const GC-rooting **never crosses an epoch
+boundary in any mode**, so between epochs the interned-string liveness of a record mode matches `.off`
+(neither holds a live trace root), making every cross-epoch re-intern id identical across all 10 modes. No
+nondeterministic input is introduced; the clear is unconditional and its *position* (epoch entry) is the
+determinism boundary. It only ever touches JIT scratch state, never `Value` / heap semantics.
+
+**Interaction with suspend/resume.** `beginTopLevelEpoch` runs **only** on the fresh `run`/`start` entry,
+never on `exec()` resume after a `.suspended` (`interp.zig:1031-1033`) — so clearing there cannot discard a
+trace mid-continuation of the *same* epoch. Safe by the existing clean-entry contract.
+
+**Cost.** Multi-epoch embedders/REPL re-warm the JIT each epoch (LuaJIT persists traces across a REPL; lune
+cannot, by the determinism-over-speed asterisk). Single-epoch CLI runs are unaffected — the clear is a
+no-op at the one `beginTopLevelEpoch` of a one-shot `run` (cache still empty). This is the intended trade.
+
+**Tests.**
+- **Cross-epoch id parity** (the core regression): a custom two-epoch harness (like the `keyframeser`
+  restore tests — `expectProgram` is single-`run`). On **one** VM: epoch 1 runs a hot loop reading a static
+  string key `t.foo` (records a trace whose const is `"foo"`); epoch 1 returns (`depth==0`); epoch 2
+  (`vm.run` of a second chunk on the same VM) allocates a marker string, forces GC, re-interns `"foo"` at
+  runtime (`"f".."oo"`), and reports the `pairs` order. Assert byte-identical order for a recording mode
+  vs `.off`, both `gc_stress` values. Negative control: skipping the `clearCache()` reddens it (the epoch-1
+  trace keeps `"foo"` at its old id in the record mode).
+- **Clear is a no-op for a single run**: an ordinary static-loop program still records exactly one trace
+  and prints correctly (guard against the clear firing mid-useful-run — it must only fire at entry, when
+  the cache is empty).
+- **Multi-epoch still JITs**: after the epoch-1 clear, an epoch-2 hot loop still records a fresh trace
+  (guard against the counter/gate reset accidentally wedging re-recording).
+- **Direct `clearCache()` reset assertion** (gpt-5.6-sol): after a run that populates traces + exec logs +
+  coverage + abort rows, assert every field in the reset set is empty/null — `cache`, `counters`, `gate`,
+  `penalty`, `guard_failures`, `prime_exits`, `exec_logs`, `coverage`, `abort_log` empty; `wants_side_trace`,
+  `wants_prime_side`, `pending_*` null; `hotcount` all-zero — so a future field added to the recorder isn't
+  silently missed.
+
+**Sequence:** design (this) → `gpt-5.6-sol` review (**done — BLOCKER: reset set was incomplete; folded
+`wants_prime_side`, `exec_logs`+recorder, `coverage` map, and `abort_log` above, all cross-epoch
+`*Proto`-borrow / cache-index-reuse hazards**) → land behind `just test` (default + `-Djit-debug`).
+This completes the three-part H-2 hard-half fix.
+
 #### Foundational piece 2 — H-1b design: name the source-opcode PC distinctly from the resume/exit PC (Bart, 2026-07-18)
 
 **Scope (Bart's call):** land the **H-1b** sub-part of the H-1 guard-provenance blocker as
