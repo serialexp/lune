@@ -1041,6 +1041,13 @@ pub const Vm = struct {
     fn beginTopLevelEpoch(self: *Vm) Error!void {
         if (self.depth != 0) return error.DirtyTopLevelEntry;
         self.trace.disarmAllLinks();
+        // Retire the whole trace cache at the epoch boundary (doc 17 H-2 part 3): a
+        // trace's proto-literal string konsts must not root interned strings across a
+        // top-level run, or a record mode carries a static literal alive into the next
+        // epoch while `.off` sweeps it, diverging the re-interned id. Runs AFTER
+        // `disarmAllLinks` (which empties `armed_links`) so no inbound native link
+        // touches a freed trace. A no-op for the common single-`run` case (empty cache).
+        self.trace.clearCache();
     }
 
     pub fn run(self: *Vm, proto: *const Proto) Error!Value {
@@ -8858,6 +8865,201 @@ fn runForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, enabled: b
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
     return chunk;
+}
+
+/// Configure `vm.trace` for `mode` (mirrors `runCaptured`'s mode wiring) with a small
+/// `hotloop` so short test loops go hot. Shared by the two-epoch H-2 part-3 tests.
+fn configTraceMode(vm: *Vm, mode: TraceMode) void {
+    vm.trace.config.enabled = mode != .off;
+    vm.trace.config.execute = mode == .record_execute or mode == .record_execute_noopt or mode == .record_execute_native;
+    vm.trace.config.optimize = mode == .record_execute or mode == .record_execute_native;
+    vm.trace.config.native_codegen = mode == .record_execute_native;
+    vm.trace.config.hotloop = 4;
+}
+
+test "H-2 part 3: a trace const does not survive a top-level epoch boundary (cross-epoch id parity)" {
+    // The end-to-end determinism regression for docs/design/17 H-2 part 3. On ONE VM:
+    //   * epoch 1 runs a hot loop reading a *static* string key `t.foo` — recording a
+    //     trace whose const pool holds the interned "foo" (id A). Epoch 1 returns, so at
+    //     `depth==0` the static proto tree is unrooted; "foo" is now rooted ONLY by that
+    //     cached trace's const.
+    //   * epoch 2 (a second `vm.run` on the same VM) interns a marker at id B (> A),
+    //     forces GC, re-interns "foo" AT RUNTIME (`"f".."oo"`), and reports the `pairs`
+    //     order of {foo, marker}.
+    // WITHOUT the `clearCache()` at the epoch boundary, a record mode keeps "foo" alive
+    // at id A across the boundary, so it re-interns to A (< B) and sorts BEFORE the
+    // marker — while `.off` sweeps it and re-interns to a fresh id C (> B). Divergent
+    // `pairs` order. WITH the clear, the epoch-1 trace is retired before epoch 2 runs,
+    // so "foo" is swept in every mode alike and all modes agree ("marker foo ").
+    const gpa = testing.allocator;
+    const s1: [:0]const u8 =
+        \\local t = { foo = 1 }
+        \\local s = 0
+        \\for i = 1, 200 do s = s + t.foo end
+        \\print(s)
+    ;
+    const s2: [:0]const u8 =
+        \\local marker = "mar" .. "ker"
+        \\for i = 1, 3000 do local junk = {} end
+        \\local foo2 = "f" .. "oo"
+        \\local tt = {}
+        \\tt[foo2] = 1
+        \\tt[marker] = 2
+        \\local order = ""
+        \\for k in pairs(tt) do order = order .. k .. " " end
+        \\print(order)
+    ;
+    const H = struct {
+        // Run s1 then s2 on ONE VM; return epoch-2's printed output (heap-owned).
+        // NB: compile c2 *after* epoch 1 runs. String literals intern weakly (only
+        // rooted via a live closure), so compiling c2 up front would let epoch 1's GC
+        // (esp. under gc_stress) sweep c2's not-yet-live constants → dangling loads in
+        // epoch 2. Interleaving compile+run keeps each chunk's constants live from the
+        // moment they exist. (This models a real REPL: parse+compile+run per statement.)
+        fn twoEpoch(a: std.mem.Allocator, src1: [:0]const u8, src2: [:0]const u8, mode: TraceMode, stress: bool) ![]u8 {
+            const parser = @import("parser.zig");
+            const diag = @import("diag.zig");
+            var diags = diag.Diagnostics.init(a);
+            defer diags.deinit();
+
+            var vm = try Vm.init(a);
+            defer vm.deinit();
+            vm.heap.gc_stress = stress;
+            configTraceMode(&vm, mode);
+
+            // Epoch 1 — records the t.foo trace.
+            var sink1_buf: [64]u8 = undefined;
+            var sink1 = io.Writer.fixed(&sink1_buf);
+            vm.out = &sink1;
+            var t1 = try parser.parse(a, src1, &diags);
+            defer t1.deinit();
+            var c1 = try compiler.compile(a, &vm.heap, src1, t1.root, &diags);
+            defer c1.deinit();
+            try testing.expect(!diags.hasErrors());
+            _ = try vm.run(c1.proto);
+
+            // Epoch 2 — beginTopLevelEpoch clears epoch-1's cache first.
+            var sink2_buf: [64]u8 = undefined;
+            var sink2 = io.Writer.fixed(&sink2_buf);
+            vm.out = &sink2;
+            var t2 = try parser.parse(a, src2, &diags);
+            defer t2.deinit();
+            var c2 = try compiler.compile(a, &vm.heap, src2, t2.root, &diags);
+            defer c2.deinit();
+            try testing.expect(!diags.hasErrors());
+            _ = try vm.run(c2.proto);
+            return a.dupe(u8, sink2.buffered());
+        }
+    };
+    inline for (.{ false, true }) |stress| {
+        const off = try H.twoEpoch(gpa, s1, s2, .off, stress);
+        defer gpa.free(off);
+        // Every record mode's epoch-2 output must match `.off` (and the fixed order).
+        inline for (.{ .record_only, .record_execute_noopt, .record_execute, .record_execute_native }) |mode| {
+            const rec = try H.twoEpoch(gpa, s1, s2, mode, stress);
+            defer gpa.free(rec);
+            try testing.expectEqualStrings(off, rec);
+        }
+        try testing.expectEqualStrings("marker foo \n", off);
+    }
+}
+
+test "H-2 part 3: clearCache retires every trace + resets all derived tiering/diagnostic state" {
+    // The direct guard on `clearCache`'s reset set (docs/design/17 H-2 part 3): run a
+    // program that populates the trace cache + exec logs + the abort log, then call
+    // `clearCache` and assert EVERY field in the reset set is empty/null — so a future
+    // field added to the recorder that clearCache forgets is caught here rather than as
+    // a cross-epoch use-after-free or a stale-index diagnostic corruption.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local t = { k = 1 }
+        \\local s = 0
+        \\for i = 1, 200 do s = s + t.k end
+        \\local u = 0
+        \\for i = 1, 200 do u = u + #tostring(i) end
+        \\print(s + u)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.record_exec_log = true; // populate exec_logs
+    vm.trace.config.record_aborts = true; // populate abort_log (the tostring loop is a host barrier)
+    vm.trace.config.coverage = true; // populate the coverage map (so its clear is load-bearing)
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    // Sanity: the run actually populated the structures we care about (so the post-clear
+    // assertions below aren't trivially satisfied by an already-empty state).
+    try testing.expect(vm.trace.cache.items.len >= 1);
+    try testing.expect(vm.trace.exec_logs.items.len >= 1);
+    try testing.expect(vm.trace.abort_log.items.len >= 1);
+    try testing.expect(vm.trace.coverage.count() >= 1);
+
+    vm.trace.clearCache();
+
+    // Everything in the reset set is empty/null after the clear.
+    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.counters.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.penalty.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.guard_failures.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.prime_exits.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.exec_logs.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.coverage.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.abort_log.items.len);
+    try testing.expect(vm.trace.wants_side_trace == null);
+    try testing.expect(vm.trace.wants_prime_side == null);
+    try testing.expect(vm.trace.pending_exit_anchor == null);
+    try testing.expect(vm.trace.pending_replay_anchor == null);
+    if (vm.trace.exec_recorder) |*r| try testing.expect(r.log == null);
+    for (vm.trace.hotcount) |h| try testing.expectEqual(@as(u16, 0), h);
+}
+
+test "H-2 part 3: the JIT still records fresh traces in a second epoch after the cache clear" {
+    // Guard against the counter/gate reset in `clearCache` accidentally wedging
+    // re-recording: after the epoch-1 clear, an epoch-2 hot loop must still record.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const src: [:0]const u8 =
+        \\local s = 0
+        \\for i = 1, 200 do s = s + i end
+        \\print(s)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, src, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, &vm.heap, src, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    _ = try vm.run(chunk.proto); // epoch 1
+    try testing.expect(vm.trace.cache.items.len >= 1);
+    _ = try vm.run(chunk.proto); // epoch 2 — beginTopLevelEpoch cleared the cache first
+    // A fresh trace was recorded in epoch 2 (not left wedged by the reset).
+    try testing.expect(vm.trace.cache.items.len >= 1);
 }
 
 test "trace toggle gates back-edge counting" {

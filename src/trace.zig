@@ -3465,6 +3465,57 @@ pub const TraceState = struct {
         }
     }
 
+    /// Retire the entire trace cache mid-VM-life, freeing every trace and resetting
+    /// all derived tiering + diagnostic state — WITHOUT tearing down `mcode_arena`
+    /// (the VM keeps running; each `destroy` returns its mcode slots to the arena's
+    /// free-list for reuse). Called from `Vm.beginTopLevelEpoch` at a fresh
+    /// `run`/`start` entry (docs/design/17 H-2 part 3), *after* `disarmAllLinks`, so a
+    /// trace's proto-literal string konsts stop rooting interned strings across the
+    /// epoch boundary — otherwise a record mode carries a static literal alive into
+    /// the next epoch while `.off` sweeps it, diverging the re-interned id.
+    ///
+    /// Precondition: `disarmAllLinks` has already reset every armed parent slot and
+    /// emptied `armed_links`, so no inbound native link touches any cached trace and
+    /// no per-trace `resetLinksTouching` is needed here.
+    pub fn clearCache(self: *TraceState) void {
+        for (self.cache.items) |t| t.destroy(self.gpa);
+        self.cache.clearRetainingCapacity();
+
+        // Anchor-keyed tiering state: reset so the next epoch re-warms cleanly and no
+        // stale entry references a freed trace or blocks re-recording. (Mirrors the
+        // per-anchor reset `removeTrace` does, applied wholesale.)
+        self.counters.clearRetainingCapacity();
+        @memset(&self.hotcount, 0);
+        self.gate.clearRetainingCapacity();
+        self.penalty.clearRetainingCapacity();
+        self.guard_failures.clearRetainingCapacity();
+        self.prime_exits.clearRetainingCapacity();
+        self.wants_side_trace = null;
+        self.wants_prime_side = null;
+        self.pending_exit_anchor = null;
+        self.pending_replay_anchor = null;
+
+        // Trace-index-keyed and `*Proto`-borrowing diagnostic state — unsafe to retain
+        // across the boundary (docs/design/17 H-2 part 3):
+        //  * `exec_logs` are keyed by `trace_id` == cache index, so a cleared cache
+        //    would alias epoch N's log at index 0; and log events can hold string
+        //    `Value`s that are NOT in the GC root walk, so a later sweep would dangle
+        //    them once the trace-const root is gone. Free them and drop the recorder's
+        //    current log target.
+        for (self.exec_logs.items) |*l| l.deinit(self.gpa);
+        self.exec_logs.clearRetainingCapacity();
+        if (self.exec_recorder) |*r| r.log = null;
+        //  * `coverage` keys borrow a `*Proto` that reporters dereference, and
+        //    `has_trace` classifies later iterations — both wrong once the owning
+        //    chunk may be freed / the trace retired. Scalar lifetime aggregates
+        //    (`iters_traced`, `cycles_traced`, `run_cycles`, …) are pure `u64`s and
+        //    stay.
+        self.coverage.clearRetainingCapacity();
+        //  * `abort_log` rows borrow a `*Proto` (rendered as `r.proto.name`) — a
+        //    diagnostic UAF across independently-owned chunks. Drop them.
+        self.abort_log.clearRetainingCapacity();
+    }
+
     /// Remove all guard-failure entries for `anchor`. Called after a side
     /// trace is armed so the counter resets and doesn't re-trigger infinitely.
     fn clearGuardFailures(self: *TraceState, anchor: AnchorKey) void {
