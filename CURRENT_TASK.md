@@ -51,7 +51,17 @@ consumer machinery exists.
 - Test: "top-level re-entry on a suspended (dirty) VM fails closed" — suspends at depth 3, asserts both
   `start`/`run` return `DirtyTopLevelEntry`, then resumes via `exec()` to completion. **Negative control:
   neutralizing the check fails exactly this test (772 pass / 1 fail), silent `.suspended` misuse.**
-- Gate: `just test` green (default + `-Djit-debug`); nsieve tier-0≡native byte-identical. **NEXT: 9-B.**
+- Gate: `just test` green (default + `-Djit-debug`); nsieve tier-0≡native byte-identical. Commit `9fcc2c4`.
+
+**9-B DEFERRED (Bart, 2026-07-18).** The round-9 landing stops after 9-A. The GuardProvenance IR extension
+is design-clean but large, must touch the optimizer (`tropt` remap of the side table — emission-index keys
+are stale at commit), and has **no consumer** — so per H-1a's grounding it waits until region accounting /
+Increment 3 is built and can co-design the exact tag layout it will read. Design of record is preserved in
+doc-17 §"Round-9 landing plan" + the deferred Outstanding bullet. **No open round-9 work remains.**
+
+**Remaining doc-17 candidates (not directed):** H-2 hard half (weak-intern id-timeline reconciliation +
+`{gc,snapshot}` root-walk split; piece 1 `next_obj_id` v4→v5 landed) — the scope/architecture call Bart
+reserved; and, eventually, the Increment-3 machinery that 9-B + the F2c-cut/region-cap pieces attach to.
 
 ## Status 2026-07-18 (LATEST-15) — H-3 + H-4 GROUNDED + COMMITTED. Design-only (no code). The two mechanics blockers, grounded against the tree. gpt-5.6-sol = NEEDS-CHANGE (both); all corrections tree-verified + folded.
 
