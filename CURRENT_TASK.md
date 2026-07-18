@@ -1,5 +1,44 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-18 (LATEST-14) — H-1c GROUNDED + COMMITTED. Design-only (no code). Pinned the per-opcode guard-site vocabulary that completes GuardProvenance. gpt-5.6-sol = NEEDS-CHANGE; all corrections tree-verified + folded. The identity shrinks from G-1's 4 axes to **3**.
+
+**Bart's steer:** keep working through the known small-scope pieces. H-1c is the last H-1 sub-part.
+
+**Outcome — the closed guard-site vocabulary (`role`/`operand`, and why `occurrence` dies):**
+- **Load-bearing finding:** the IR op kind is a *runtime-varying attribute* of a guard site, not its
+  identity — `guardNum`→`guard_int`/`guard_float` by observed value (`trace.zig:4187`); `recBranch`→
+  `guard_true`/`guard_false` by taken path (`4834`). So `role` must be a **structural label**, exactly the
+  reason `exit_ordinal` was killed, restated one level down.
+- **The vocabulary** (closed set of `role`s, corrected against the tree after review) is a per-opcode
+  ordered list of `(role, operand)` guard slots — full table in the doc. Review REFUTED my first draft on:
+  `set_index` container is `a` not `b`; `for_loop`/`for_prep` guard THREE operand-types (a, a+1, a+2)
+  first; hash-set guards the value type FIRST; grid guards row+col types; pure-call guards its arg
+  (a+1); +a missing `get_upval`/`get_global`→`guard_func` row. `guard_fits` is every-narrow-lane, not
+  int-only (`4480`).
+- **`role` is a closed vocab with a RUNTIME-SELECTED realized subset** (not a static function of the
+  opcode): `get_index`/`set_index` route array-vs-hash by observed key type (`4052/4063`), `call` routes
+  closure-vs-pure (`5033`), `get_upval` emits `guard_func` only if the input is a closure. Not fatal:
+  identity must be *non-shifting under sibling elision* (the real G-1 requirement), and structural labels
+  are; a differently-shaped re-recording legitimately has different guards.
+- **`operand`** must be a register *designator* covering a/b/c + derived a+1/a+2 (numeric-for) + register-
+  valued `aux` (grid) — not just instr.b/instr.c. Static bytecode field ⇒ stable. (`recCompare` gt/ge
+  swap is AFTER guard emission, so operand tracks the source register — confirmed.)
+- **`occurrence` REFUTED → DROPPED (decisive).** Recording-order is a *dynamic* ordinal (branch
+  truthiness, inner-loop trip counts via `onBackEdge` peel `3588`, `for_prep` link-vs-loop by cache state)
+  → it *slides*, the `exit_ordinal` failure again. Within one opcode-execution `(role,operand)` is already
+  unique; duplicates arise ONLY from unrolling, whose copy-index is inherently dynamic ⇒ no stable value.
+  **Resolution:** provenance keys the guest-static site `{source_pc, call-path, role, operand}`; unrolled
+  physical copies **share** one tag (physical-exit→provenance is many-to-one, correct: same guest check,
+  same anchor/counter). `guarded_refs` dedup makes it many-to-one the other way too (a static slot may
+  emit no guard) — and my "fresh ref per unrolled iter" claim was false (invariant/konst/pure-callee refs
+  stay shared).
+- **Follow-on for round 9:** fused native exits aren't all `guard_*` — `hload`/`aload`/`href` side-exit at
+  the producer node (`nativegen.zig:4022/4120/3517`); they need `role`s + source-PC stamps too (extends
+  H-1b's stamp-every-exit obligation past the 6 PC-carrying ops).
+- **Scope:** inseparable from the GuardProvenance IR extension → lands *with* it in round 9, not
+  standalone (no non-speculative early subset). Files: `docs/design/17-exit-branch-patching.md` (H-1c
+  grounding subsection + finding cross-ref + header). **COMMITTED** (doc-only).
+
 ## Status 2026-07-18 (LATEST-13) — H-1a GROUNDED + COMMITTED. Design-only (no code). Pinned exactly what the recorder stores for inlining vs what GuardProvenance needs, so the round-9 provenance landing is turnkey. gpt-5.6-sol = CONFIRMED directional + 3 sharpenings, all folded in.
 
 **Bart's steer:** keep working through the known small-scope pieces. H-1a is the next H-1 sub-part.
