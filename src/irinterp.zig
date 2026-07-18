@@ -226,7 +226,7 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
     if (guard.op != .guard_true) return false;
     const exit_pc = trace.guardExitPc(guard) orelse return false;
     if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
-    const for_ins = t.anchor.proto.code[exit_pc - 1];
+    const for_ins = t.anchor.proto.code[trace.guardSourcePc(guard).?];
     if (for_ins.op != .for_loop) return false;
 
     var si: usize = @intCast(exit_instr + 1);

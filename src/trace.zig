@@ -439,20 +439,39 @@ pub const IrInstr = struct {
     snap: SnapIdx = 0,
 };
 
-/// The bytecode PC recorded in a guard's `aux`, or null if this op doesn't carry
-/// one. ONLY `guard_int/float/number/true/false` stamp their recording PC into
-/// `aux` (see `emit`); the array guards (`guard_lane`, `guard_fits`) reuse `aux`
-/// for lane ordinals, and the rest leave it zero — so reading `aux` as a PC there
-/// is a category error that can mis-key a guard-failure counter or, worse, chain
-/// to an unrelated trace. Exit-PC chaining (`driveChain`) and guard-failure
+/// The **post-increment resume/exit PC** recorded in a guard's `aux`, or null if
+/// this op doesn't carry one. ONLY the SIX ops
+/// `guard_int/float/number/true/false` + `int_of_float` stamp their recording PC
+/// into `aux` (see `emit`); the array guards (`guard_lane`, `guard_fits`) reuse
+/// `aux` for lane ordinals, and the rest leave it zero — so reading `aux` as a PC
+/// there is a category error that can mis-key a guard-failure counter or, worse,
+/// chain to an unrelated trace. Exit-PC chaining (`driveChain`) and guard-failure
 /// counting MUST resolve the exit PC through this accessor — never read `.aux`
-/// directly. Returns the PC for the five PC-carrying guards (which may legitimately
-/// be 0); callers treat 0 as "no usable PC" since no loop-body guard sits at PC 0.
+/// directly. This is the *resume/exit* PC (the fall-through / continuation
+/// target), NOT the source-opcode index — for the latter use `guardSourcePc`.
+/// Returns the PC for the six PC-carrying guards (which may legitimately be 0);
+/// callers treat 0 as "no usable PC" since no loop-body guard sits at PC 0.
 pub fn guardExitPc(ins: IrInstr) ?u32 {
     return switch (ins.op) {
         .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float => @intCast(ins.aux),
         else => null,
     };
+}
+
+/// The **source-opcode PC** (guest bytecode index) that OWNS a guard — the single
+/// canonical definition of "which bytecode op does this guard belong to", i.e. the
+/// `source_pc` a future `GuardProvenance` tag keys on (doc 17, H-1b). Distinct in
+/// *meaning* from `guardExitPc` (the post-increment resume/exit PC): every guard is
+/// recorded with `aux = source_pc + 1` because the tier-0 fetch advances the PC by
+/// exactly one fixed-width `Instr` before the recording mirror runs and jumps are
+/// applied only *after* recording (`interp.zig` `step`), so the source opcode is the
+/// slot immediately before the exit PC. Returns null exactly when `guardExitPc`
+/// does (non-PC-carrying op, or the 0 sentinel). Callers that previously derived the
+/// source opcode as `code[guardExitPc(g).? - 1]` MUST route through this accessor so
+/// the "+1" fetch convention has one owner, not eight open-coded copies.
+pub fn guardSourcePc(ins: IrInstr) ?u32 {
+    const exit_pc = guardExitPc(ins) orelse return null;
+    return if (exit_pc == 0) null else exit_pc - 1;
 }
 
 /// Whether IR instruction `idx` of `t` is a numeric-for loop-done guard: a
@@ -467,7 +486,7 @@ pub fn isLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
     if (g.op != .guard_true) return false;
     const exit_pc = guardExitPc(g) orelse return false;
     if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
-    return t.anchor.proto.code[exit_pc - 1].op == .for_loop;
+    return t.anchor.proto.code[guardSourcePc(g).?].op == .for_loop;
 }
 
 /// Caller-declared intent for `armNativeLink`, enforcing the P-C option (b) invariant
@@ -2514,7 +2533,8 @@ pub const TraceState = struct {
                 else
                     iresult.completed;
 
-                const inner_exit_pc = guardExitPc(inner.instrs[iresult.exit_instr]) orelse break;
+                const inner_guard = inner.instrs[iresult.exit_instr];
+                const inner_exit_pc = guardExitPc(inner_guard) orelse break;
                 // The inner root reached its numeric loop-done ⟺ its exit PC
                 // follows a `for_loop` (mode-invariant static bytecode; the same
                 // discriminator `isSourceBranchGuardExit` uses inverted). This
@@ -2525,7 +2545,7 @@ pub const TraceState = struct {
                 // inner loop as a mid-loop side-exit and resume tier-0 back at the
                 // inner header, re-running the whole (idempotent) marking loop.
                 const loop_done = inner_exit_pc >= 1 and
-                    proto.code[inner_exit_pc - 1].op == .for_loop;
+                    proto.code[guardSourcePc(inner_guard).?].op == .for_loop;
                 if (!loop_done) {
                     if (inner_local > 0) {
                         self.onSideExit(inner, inner_local);
@@ -2886,7 +2906,7 @@ pub const TraceState = struct {
             if (ins.op != .guard_true) continue;
             const exit_pc = guardExitPc(ins) orelse continue;
             if (exit_pc == 0 or exit_pc == failed.anchor.pc or exit_pc > proto.code.len) continue;
-            if (proto.code[exit_pc - 1].op != .for_loop) continue;
+            if (proto.code[guardSourcePc(ins).?].op != .for_loop) continue;
 
             var visited: [8]*Trace = undefined;
             var nvisited: usize = 0;
@@ -2937,7 +2957,7 @@ pub const TraceState = struct {
         const exit_pc = guardExitPc(ins) orelse return;
         if (exit_pc == 0 or exit_pc == failed.anchor.pc) return;
         if (exit_pc >= proto.code.len) return;
-        if (proto.code[exit_pc - 1].op != .for_loop) return;
+        if (proto.code[guardSourcePc(ins).?].op != .for_loop) return;
         if (!continuationReachesEnclosingBackEdge(proto, exit_pc, failed.anchor.pc)) return;
         const key = AnchorKey{ .proto = proto, .pc = exit_pc };
         // Don't fight the normal machinery: a trace already cached here, or a gated
@@ -3066,7 +3086,7 @@ pub const TraceState = struct {
         if (ins.op != .guard_true and ins.op != .guard_false) return false;
         const exit_pc = guardExitPc(ins) orelse return false;
         if (exit_pc == 0 or exit_pc == failed.anchor.pc) return false;
-        if (exit_pc <= proto.code.len and proto.code[exit_pc - 1].op == .for_loop) return false;
+        if (exit_pc <= proto.code.len and proto.code[guardSourcePc(ins).?].op == .for_loop) return false;
         return true;
     }
 
@@ -3117,7 +3137,7 @@ pub const TraceState = struct {
     /// iteration. Symmetric with `countGuardFailure`, but on the *productive* path
     /// and in its own `prime_exits` map (no cross-talk with the zero-exit side-trace
     /// counters). Mode-invariant: keys only off the caller's `completed > 0` gate and
-    /// guard identity (`exit_instr` → `guardExitPc` → `proto.code[exit_pc-1]`), all
+    /// guard identity (`exit_instr` → `guardSourcePc` → `proto.code[source_pc]`), all
     /// reported identically by tier-1a and native.
     pub fn countProductiveBranchExit(self: *TraceState, failed: *const Trace, exit_instr: u32, proto: *const Proto) void {
         if (!self.isSourceBranchGuardExit(failed, exit_instr, proto)) return;
@@ -4081,9 +4101,11 @@ pub const TraceState = struct {
 
     /// Append an IR instruction, returning its SSA ref (its index).
     /// For simple type-guard ops (`guard_int`, `guard_float`, `guard_number`,
-    /// `guard_true`, `guard_false`), the current bytecode PC is stored in
-    /// `aux` so the executor can report which guard failed (per-guard PC
-    /// recording for exit-PC chaining). Other ops keep their caller-set `aux`.
+    /// `guard_true`, `guard_false`), the current **post-increment resume/exit PC**
+    /// (`rec.cur_pc`, = source-opcode PC + 1) is stored in `aux` so the executor
+    /// can report which guard failed and chain to the exit PC. `guardExitPc` reads
+    /// it back; `guardSourcePc` recovers the owning source opcode. Other ops keep
+    /// their caller-set `aux`.
     fn emit(self: *TraceState, ins: IrInstr) !Ref {
         var ins_mut = ins;
         switch (ins_mut.op) {
@@ -5369,10 +5391,12 @@ pub const Recorder = struct {
     /// (`.side`); reset to `.root` by `reset` (every `arm`). `recForPrepLink`
     /// permits a `.link` close for `.side`/`.continuation` but never `.root`.
     kind: TraceKind = .root,
-    /// Bytecode PC of the instruction currently being recorded. Set by
-    /// `recordInstr` before `recordOne`; `emit` stores it in the `aux`
-    /// field of guard instructions so the executor can report *which*
-    /// guard failed (per-guard PC recording for exit-PC chaining).
+    /// **Post-increment resume/exit PC** of the instruction currently being
+    /// recorded (= its source-opcode PC + 1; the tier-0 fetch advances one
+    /// fixed-width `Instr` before the recording mirror). Set by `recordInstr`
+    /// before `recordOne`; `emit` stores it in the `aux` field of guard
+    /// instructions so the executor can report *which* guard failed and chain to
+    /// the exit PC. NOT the source-opcode index — `guardSourcePc` recovers that.
     cur_pc: u32 = 0,
     /// Tier-0 opcode of the instruction currently being recorded. Set alongside
     /// `cur_pc` in `recordInstr`; read by `logAbort` (when `config.record_aborts`)
@@ -5942,6 +5966,65 @@ test "recArrayGet: t[k] on a bool lane records the full guarded read sequence" {
     try testing.expectEqual(IrOp.aload, ops[8].op);
     try testing.expectEqual(@as(Ref, 5), ops[8].a); // loads through the aref
     try testing.expectEqual(ObsType.boolean, ops[8].ty); // bool lane → boolean
+}
+
+test "guardSourcePc: source-opcode PC is exit PC − 1 (H-1b), pinned independently" {
+    const gpa = testing.allocator;
+
+    // (1) Recorded path. Record a real `get_index` as if its opcode sat at a known
+    // bytecode index N: the tier-0 dispatch loop hands `recordInstr` the
+    // POST-INCREMENT pc (N+1) (interp.zig:1762), so the emitted `guard_int` must
+    // report source-opcode N and resume/exit N+1. We assert against the
+    // INDEPENDENTLY chosen N — not `source+1 == exit`, which is tautological given
+    // `guardSourcePc := exit − 1`.
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 2;
+    while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    const N: u32 = 5; // chosen known source-opcode index
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3) };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, N + 1, Value.nil());
+    try testing.expect(state.isRecording());
+
+    var saw_guard = false;
+    for (state.rec.instrs.items) |ins| {
+        if (guardExitPc(ins)) |exit_pc| {
+            try testing.expectEqual(@as(u32, N + 1), exit_pc); // stamped post-increment pc
+            try testing.expectEqual(@as(u32, N), guardSourcePc(ins).?); // owning opcode
+            saw_guard = true;
+        }
+    }
+    try testing.expect(saw_guard); // the bool-lane get_index emits a PC-carrying guard_int
+
+    // (2) emit-fixture for the two ops a simple recorded op can't reach:
+    // `guard_number` (the production `guardNum` only ever picks int/float,
+    // trace.zig ~4165) and `int_of_float`. Set the recorder's post-increment pc to a
+    // known M+1 and emit each directly; both must stamp `aux` and report source M /
+    // exit M+1.
+    var st2 = TraceState.init(gpa);
+    defer st2.deinit();
+    try st2.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    const M: u32 = 11;
+    st2.rec.cur_pc = M + 1;
+    inline for (.{ IrOp.guard_number, IrOp.int_of_float }) |op| {
+        const ref = try st2.emit(.{ .op = op, .a = 0 });
+        const ins = st2.rec.instrs.items[ref];
+        try testing.expectEqual(@as(u32, M + 1), guardExitPc(ins).?);
+        try testing.expectEqual(@as(u32, M), guardSourcePc(ins).?);
+    }
+
+    // (3) a non-PC-carrying op yields null from BOTH accessors (never a category error).
+    try testing.expectEqual(@as(?u32, null), guardExitPc(.{ .op = .aload, .a = 0 }));
+    try testing.expectEqual(@as(?u32, null), guardSourcePc(.{ .op = .aload, .a = 0 }));
+
+    // (4) the 0 sentinel ("no usable PC") maps to null through the source accessor too.
+    try testing.expectEqual(@as(?u32, null), guardSourcePc(.{ .op = .guard_true, .a = 0, .aux = 0 }));
 }
 
 test "recArrayGet aborts: non-table container, non-int key, hole, and out-of-bounds" {

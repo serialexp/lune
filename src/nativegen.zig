@@ -3393,7 +3393,7 @@ fn isNumericForLoopDoneGuard(t: *const Trace, instr_idx: usize) bool {
     if (guard.op != .guard_true) return false;
     const exit_pc = trace.guardExitPc(guard) orelse return false;
     if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
-    return t.anchor.proto.code[exit_pc - 1].op == .for_loop;
+    return t.anchor.proto.code[trace.guardSourcePc(guard).?].op == .for_loop;
 }
 
 /// Emit the per-iteration hash-cell resolution call-out for a `.heap`-rooted href.
@@ -3614,8 +3614,7 @@ fn emitLinkedLoopDoneSnapshot(
     }
 
     const guard = t.instrs[exit_instr];
-    const exit_pc = trace.guardExitPc(guard).?;
-    const for_ins = t.anchor.proto.code[exit_pc - 1];
+    const for_ins = t.anchor.proto.code[trace.guardSourcePc(guard).?];
     const visible_var_slot: i32 = @as(i32, @intCast(for_ins.a)) + 3;
     for (t.instrs) |p| {
         if (p.op != .phi or p.aux == trace.PHI_INTERNAL) continue;
