@@ -267,7 +267,7 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
 
     // 1. Enumerate the reachable heap graph from the VM roots.
     var walk = Walk{ .a = a };
-    vm.forEachRootHeader(&walk, Walk.push);
+    vm.forEachRootHeader(.snapshot, &walk, Walk.push);
     var i: usize = 0;
     while (i < walk.order.items.len) : (i += 1) walk.enumerateChildren(walk.order.items[i]);
     if (walk.err) |e| return e;
@@ -1335,6 +1335,76 @@ test "H-2: next_obj_id survives pre-cut garbage (restored verbatim, not reconstr
     const sf2 = try encodeSnapshot(gpa, vm2);
     defer gpa.free(sf2);
     try testing.expectEqualSlices(u8, sf, sf2);
+}
+
+test "H-2/G-2: snapshot bytes are identical whether or not the JIT recorded (trace consts excluded from the snapshot walk)" {
+    const gpa = testing.allocator;
+    // A hot loop reads a constant string key `t.k`; the recorder captures the
+    // interned "k" as a LIVE trace const (it is the key operand of `get_index`). `t`
+    // is block-scoped and gone before the program ends, so at the FINAL snapshot
+    // (`depth==0` — no frame closure roots the proto tree, `interp.zig:1612`) the
+    // string "k" is rooted ONLY by the cached trace in a recording mode, and by
+    // nothing at all under `.off`. Before the {gc,snapshot} split (doc 17 H-2/G-2)
+    // the record-mode snapshot serialized "k" while `.off` did not → divergent
+    // restored heaps. The split excludes trace consts from the snapshot walk, so the
+    // serialized heap is byte-identical regardless of what the JIT recorded.
+    // The hot loop lives inside `run` (a nested static proto) with all-local state —
+    // a *global* accumulator would abort recording on the per-iteration store. After
+    // `run` returns and then main returns, neither `run`'s closure nor `t` is
+    // reachable, so at the final snapshot "k" is rooted only by the cached trace.
+    const source =
+        \\local function run()
+        \\  local t = { k = 7 }
+        \\  local sum = 0
+        \\  for i = 1, 200 do sum = sum + t.k end
+        \\  return sum
+        \\end
+        \\result = run()
+    ;
+    const H = struct {
+        fn snap(a: std.mem.Allocator, src: [:0]const u8, jit: bool, stress: bool) ![]u8 {
+            var diags = Diagnostics.init(a);
+            defer diags.deinit();
+            var tree = try lune_parser.parse(a, src, &diags);
+            defer tree.deinit();
+            var vm = try Vm.init(a);
+            defer vm.deinit();
+            vm.heap.gc_stress = stress;
+            vm.trace.config.enabled = jit;
+            vm.trace.config.execute = jit;
+            vm.trace.config.optimize = jit;
+            vm.trace.config.hotloop = 4; // trace the short test loop
+            var sink_buf: [64]u8 = undefined;
+            var sink = io.Writer.fixed(&sink_buf);
+            vm.out = &sink;
+            var chunk = try lune_compiler.compile(a, &vm.heap, src, tree.root, &diags);
+            defer chunk.deinit();
+            try testing.expect(!diags.hasErrors());
+            _ = try vm.run(chunk.proto);
+            // Sanity: a recording mode must actually have committed a trace with "k"
+            // in its const pool — otherwise this test proves nothing.
+            if (jit) {
+                var found_k = false;
+                for (vm.trace.cache.items) |t| {
+                    for (t.consts) |v| {
+                        if (v.isHeap() and v.heapType() == .string and
+                            std.mem.eql(u8, string.String.fromHeader(v.asHeap()).bytes(), "k")) found_k = true;
+                    }
+                }
+                try testing.expect(found_k);
+            }
+            return encodeSnapshot(a, &vm);
+        }
+    };
+    inline for (.{ false, true }) |stress| {
+        const off = try H.snap(gpa, source, false, stress);
+        defer gpa.free(off);
+        const rec = try H.snap(gpa, source, true, stress);
+        defer gpa.free(rec);
+        // Byte-identical snapshots ⇒ the trace-only "k" is NOT serialized in record
+        // mode. (Load-bearing: reverting the `.snapshot` split to `.gc` reddens this.)
+        try testing.expectEqualSlices(u8, off, rec);
+    }
 }
 
 test "restore reanimates the package/require module system (searchers rebind, cache survives)" {

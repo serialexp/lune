@@ -1568,7 +1568,7 @@ pub const Vm = struct {
         self.heap.beginCollect() catch return;
         // The root set is defined once in `forEachRootHeader`; marking is just
         // "call `markHeader` on each root".
-        self.forEachRootHeader(&self.heap, gc.Heap.markHeader);
+        self.forEachRootHeader(.gc, &self.heap, gc.Heap.markHeader);
         self.heap.traceAll();
         self.heap.sweep();
     }
@@ -1588,16 +1588,35 @@ pub const Vm = struct {
     ///   3. the closures executing in each active frame (`frames[0..depth]` —
     ///      keeps their proto constants reachable).
     ///   4. open upvalue cells (live by construction — about to be closed).
-    ///   5. trace constants — a cached trace (or the in-progress recording) may
-    ///      hold heap values in its const pool (e.g. a string `load_const`). A
-    ///      cached trace can outlive its proto's reachability, so its consts must
-    ///      be roots in their own right (docs/design/03-gc-memory.md).
+    ///   5. trace constants (**`.gc` kind ONLY** — see `RootKind`) — a cached trace
+    ///      (or the in-progress recording) may hold heap values in its const pool
+    ///      (e.g. a string `load_const`). A cached trace can outlive its proto's
+    ///      reachability, so its consts must be GC-liveness roots in their own right
+    ///      (docs/design/03-gc-memory.md). They are DELIBERATELY excluded from the
+    ///      `.snapshot` walk (doc 17, H-2 / G-2): a heap object reachable *only* via
+    ///      a trace const is (a) unnamable by the restored guest (no other
+    ///      reference), and (b) tiering-dependent — a `.off`/tier-0 run never
+    ///      records the trace, so the object is collected there. Serializing it
+    ///      would make snapshot bytes differ by JIT mode. Excluding it makes the
+    ///      snapshot JIT-independent by construction and cannot dangle (a sole-root
+    ///      object has no other pointer in the serialized graph).
     ///   6. effect-log heap results — a string-valued effect (`getenv`/`argv`)
     ///      parked in `effect_log` must outlive collection until it is serialized
     ///      (record) or fed back to the program (replay). Without this root, the
     ///      sweep would de-intern and free an otherwise-unreferenced result string.
+    pub const RootKind = enum {
+        /// The collector's root set: every live pointer, including trace-const
+        /// GC-liveness roots (a cached trace's const must not be swept while the
+        /// trace can still execute).
+        gc,
+        /// The snapshot's *semantic* root set: what the restored guest can name.
+        /// Excludes trace consts (transient JIT state; see item 5) so snapshot
+        /// bytes are identical whether or not the JIT recorded anything.
+        snapshot,
+    };
     pub fn forEachRootHeader(
         self: *Vm,
+        comptime kind: RootKind,
         ctx: anytype,
         comptime cb: fn (@TypeOf(ctx), *object.GcHeader) void,
     ) void {
@@ -1611,11 +1630,15 @@ pub const Vm = struct {
         }
         for (self.frames[0..self.depth]) |f| cb(ctx, @constCast(&f.closure.header));
         for (self.open_upvalues.items) |ou| cb(ctx, &ou.cell.header);
-        for (self.trace.cache.items) |t| {
-            for (t.consts) |v| if (v.isHeap()) cb(ctx, v.asHeap());
-        }
-        if (self.trace.isRecording()) {
-            for (self.trace.rec.consts.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
+        // Trace consts are GC-liveness roots ONLY — never snapshot semantic roots
+        // (doc 17 H-2/G-2). See the item-5 note above.
+        if (kind == .gc) {
+            for (self.trace.cache.items) |t| {
+                for (t.consts) |v| if (v.isHeap()) cb(ctx, v.asHeap());
+            }
+            if (self.trace.isRecording()) {
+                for (self.trace.rec.consts.items) |v| if (v.isHeap()) cb(ctx, v.asHeap());
+            }
         }
         for (self.effect_log.items) |e| if (e.result.isHeap()) cb(ctx, e.result.asHeap());
         // 7. the in-flight Lua error value — rooted while parked between a raise and

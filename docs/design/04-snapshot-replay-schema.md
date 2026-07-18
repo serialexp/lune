@@ -63,8 +63,15 @@ schema follows; this is that schema's home.
       `closed` + the captured `SnapValue`. `src/keyframeser.zig` maps a live VM
       onto these structs (its object-dispatch mirrors `gc.blacken` exactly, so it
       is provably complete against the GC's own edge set) and the reachable-set
-      walk is seeded from the **same** roots `Vm.collect` marks — both drive one
-      `Vm.forEachRootHeader` helper, so capture and GC can never drift. The CLI's
+      walk is seeded from one shared `Vm.forEachRootHeader` helper — the same root
+      inventory `Vm.collect` marks, with **one intentional policy split** (its
+      `RootKind` param): trace-constant roots (`trace.cache[].consts`,
+      `trace.rec.consts`) are `.gc`-only GC-liveness roots and are **excluded from
+      the `.snapshot` semantic-root walk** (doc 17 H-2 / G-2), so a heap object
+      reachable only via a cached trace — transient, tiering-dependent JIT state —
+      never lands in the snapshot and capture bytes are identical regardless of what
+      the JIT recorded. Every other root is shared, so capture and GC can't drift
+      on semantic state. The CLI's
       `--emit-keyframe <file>` drops a snapshot after a run (independent of
       tracing). Round-trip is proven byte/struct-exact for a hand-built edge corpus
       (empty + array/hash tables, NUL/high-byte strings, 0- and N-upvalue closures,

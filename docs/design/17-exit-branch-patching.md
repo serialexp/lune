@@ -3939,7 +3939,23 @@ root-walk split** (closes the `depth==0` / final-snapshot facet for static *and*
 (3) **clear/retire the trace cache at `beginTopLevelEpoch`** (closes the cross-epoch GC-liveness facet).
 Within a single run, static consts are safe mid-flight (main closure live) and dynamic consts are handled
 by (1); the `depth==0` exposure (snapshot + next epoch) is what (2)+(3) close. **Escalated to Bart:** this
-is larger than the single "don't trace load chunks" mechanism first approved.
+is larger than the single "don't trace load chunks" mechanism first approved. **Bart's call: land the 3
+parts, split first.**
+
+**Part (2) — `{gc,snapshot}` root-walk split — LANDED (2026-07-18).** `Vm.forEachRootHeader` gained a
+`comptime kind: RootKind` (`.gc` | `.snapshot`); the two trace-const loops (`trace.cache[].consts`,
+`trace.rec.consts`) are gated `if (kind == .gc)`. GC marking passes `.gc` (behaviour byte-identical —
+still visits trace consts); the snapshot walk (`keyframeser.zig:270`) passes `.snapshot` and excludes them.
+Load-bearing test `"H-2/G-2: snapshot bytes are identical whether or not the JIT recorded"`: a hot loop
+makes a string key ("k") a trace-only const at the final (`depth==0`) snapshot; asserts `.off` and a
+recording mode produce byte-identical snapshots (gc_stress off+on) + a `found_k` sanity check that a trace
+with "k" actually committed. Negative-control proven (reverting the walk to `.gc` reddens exactly it,
+774/775). `just test` green (default + `-Djit-debug`). **gpt-5.6-sol implementation review = APPROVE**
+(no blocker): split correctly placed; `effect_log` is genuine record/replay state (correctly kept in both
+walks — excluding it would risk the post-cut object-id timeline, `effectser.zig:102/121`); exclusion is
+sound (every heap konst is a proto literal, traces aren't serialized, re-recording re-obtains it); test
+adequate. Folded its one non-blocking doc nit (`04-snapshot-replay-schema.md`). **Remaining: (1) the
+dynamic-proto gate, (3) the `beginTopLevelEpoch` trace-cache clear.**
 
 #### Foundational piece 2 — H-1b design: name the source-opcode PC distinctly from the resume/exit PC (Bart, 2026-07-18)
 
