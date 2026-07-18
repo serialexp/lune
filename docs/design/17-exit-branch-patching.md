@@ -3957,6 +3957,138 @@ sound (every heap konst is a proto literal, traces aren't serialized, re-recordi
 adequate. Folded its one non-blocking doc nit (`04-snapshot-replay-schema.md`). **Remaining: (1) the
 dynamic-proto gate, (3) the `beginTopLevelEpoch` trace-cache clear.**
 
+##### Part (1) — design: gate trace recording out of the dynamic proto tree (2026-07-18)
+
+**What (1) closes.** Part (2) stops a live trace const from *leaking into a snapshot*. It does nothing
+about the *mid-run GC* facet: a `load`/`loadfile`/`dofile` chunk compiles a **separate** proto tree whose
+sole closure is **not** retained anywhere durable (`vm.loaded_chunks` holds only `{chunk, source}`,
+`stdlib/load.zig:145,154`; the closure is an ordinary GC value that dies when the caller drops it). Because
+traces never retire, a trace recorded over that dynamic chunk keeps its proto-literal string konsts alive
+(via the `.gc` walk) *after the closure is gone* — so under `record_execute*` the string survives and
+under `.off` it is swept, and a subsequent re-intern gets a **different** `next_obj_id` between the two
+modes. That is a live cross-mode `pairs`/id divergence with **no** `depth==0` requirement. (2) can't touch
+it — it's genuine GC liveness, correctly kept in the `.gc` walk — the only fix is to **never record a trace
+that can be sole-rooted by a dropped dynamic closure.** Bart's chosen direction: never anchor a recording
+in, nor inline a call into, a **dynamic** proto.
+
+**The predicate: an explicit `Proto.dynamic` bit** (gpt-5.6-sol's preference over the id-boundary
+`id >= static_count`). Add `dynamic: bool = false` to `bytecode.Proto` (`bytecode.zig:238`). It is stamped
+by the existing pre-order id pass `assignProtoIds` (`compiler.zig:174`), which already walks the whole
+tree once and touches every proto — thread a `dynamic: bool` through it (default `false`), driven by a new
+`Options.dynamic` field (`compiler.zig:67`, default `false`). Static main-chunk compiles keep the default;
+the two dynamic-proto sources set it `true`: the runtime `load`/`loadfile`/`dofile` path
+(`stdlib/load.zig`, the `id_base = vm.next_proto_id` compile) and the keyframe **recompile** path
+(`keyframeser.zig:466`, same `id_base` idiom). Stamping it in the recompile path is what keeps a *restored*
+load-chunk gated — the bit is a pure compile-time property, re-derived identically on every recompile, so
+it is not serialized. Preferred over the id-boundary because it survives a keyframe restore (where
+`next_proto_id` is re-seeded from the static root, `keyframeser.zig:441`) with no separate `static_count`
+to store and stay in sync; the bit *is* the predicate — checked inline as `proto.dynamic`, no helper.
+(The id-boundary *could* recompute the static count from the root — `seedProtoIds` (`interp.zig:1009`)
+already does exactly that — so "necessarily requires serialized `static_count`" was overstated; the
+explicit bit is still cleaner: no ambient boundary threaded into `TraceState`, and it works uniformly for
+an inlined callee. Zig note: `assignProtoIds` takes the flag as an explicit parameter, not a defaulted one
+— Zig has no default function arguments; the `false` default lives on `Options.dynamic` and `Proto.dynamic`
+only. Mutating each child via the existing `@constCast` in `assignProtoIds` is sound under the
+allocation-arena invariant already documented at `compiler.zig:159`.)
+
+**The gate points (four, all determined by grounding the reset/inline sites):**
+
+1. **`arm()` (`trace.zig:3656`)** — the single choke point for *both* root arming (from `onBackEdge`,
+   `:3649`) and side-trace arming (from the `wants_side_trace` path, `:3606`), since both call
+   `self.arm(proto, target_pc)`. Add `if (proto.dynamic) return;` at the top → a dynamic anchor never
+   starts a root or side recording.
+2. **`maybeStartContinuation()` (`trace.zig:2992`)** — arms a `.full` continuation via `rec.reset`
+   directly (not through `arm`). Insert the guard **after** the pending field is cleared, not at entry:
+   ```zig
+   const key = self.pending_exit_anchor orelse return;
+   if (self.rec.active) return;
+   if (key.proto != proto or key.pc != cur_pc) return;
+   self.pending_exit_anchor = null;   // consume the pending arm FIRST
+   if (key.proto.dynamic) return;     // then decline to record
+   self.rec.reset(...) catch return;
+   ```
+   Placing `if (proto.dynamic) return;` at entry (or before the null-clear) would leave a *matching
+   dynamic* pending arm set, permanently forcing `.full` dispatch through `runFastPath` (`interp.zig:1720`)
+   until execution unwinds (gpt-5.6-sol). Consume, then decline.
+3. **`maybeStartReplaySide()` (`trace.zig:3013`)** — arms a prime side-trace via `rec.reset` directly.
+   Same ordering: clear `pending_replay_anchor` first, then `if (key.proto.dynamic) return;` before reset.
+4. **`recCall()` (`trace.zig:5059`, after resolving the callee proto `cp`)** — a recording *anchored in a
+   static proto* can still inline-call a dynamic callee (e.g. a static loop calling a `load`ed closure each
+   iteration), which would embed the dynamic proto's literal konsts into a static trace. Add
+   `if (cp.dynamic) return self.abort(.dynamic_proto);` — a new `AbortReason.dynamic_proto`
+   (`trace.zig:716`). This is the only new abort; it fails the recording cleanly (tier-0 unaffected) and
+   gates the static anchor with the normal backoff.
+
+**Why four and not one:** (1) covers root+side arming (shared `arm`); (2)/(3) are the two `.full`-pinning
+arms that bypass `arm` and reset the recorder themselves; (4) is the *inlining* direction — a static trace
+reaching into a dynamic callee. Miss any one and a dynamic proto's konst can still enter the trace-const
+set. There is no fifth `rec.reset` production site (the remaining `rec.reset` calls in `trace.zig` are all
+in `test` blocks).
+
+**Determinism argument.** Whether to record is a JIT-tiering decision; determinism requires it be a pure
+function of deterministic state. `proto.dynamic` is a **static compile-time property**, identical across
+all 10 modes and re-derived identically on every keyframe recompile. So every mode makes the *same*
+decision — dynamic-proto code is never traced in any mode — which means the trace-const set never contains
+a dynamic proto's literals in *any* record mode, and `.off` (which has no traces at all) trivially agrees.
+The mid-run GC facet is closed: no trace can be the sole root of a dropped-dynamic-closure's string,
+because no such trace is ever recorded. No new nondeterministic input is introduced (the bit is not a
+clock, RNG, or address).
+
+**Cost.** One bool per `Proto` (compile-time, cold). Four branch checks, all on cold arm/abort paths — the
+hot dispatch loop is untouched. Dynamic chunks lose JIT coverage; this is the intended trade (correctness
+over speculative speed on rarely-hot `load`ed code, and LuaJIT itself does not persist traces across the
+proto lifetimes we're protecting here).
+
+**Tests** — the naive "intern a fresh string, compare its id" is **not** load-bearing (gpt-5.6-sol,
+tree-verified); a genuinely fresh string gets the same new id in both modes regardless (keeping a stale
+literal alive consumes no id — its allocation already happened identically in both). And `tostring`/`print`
+of a **string** emits raw bytes (`basic.zig` `bToString`, `io.zig:164`), never its id — so id must be
+observed through `pairs` **order** of string keys, not `tostring` of the string. The correct construction:
+- **Cross-mode id parity over a dropped load-chunk** (the core regression). `load` a chunk whose hot loop
+  reads a string literal *inside the loop* as a table field (`t.victim`, so it is a `load_const` trace
+  konst, **not** a pre-loop `slot_load`). Run it hot enough to record; **then**, in this id order:
+  1. dynamic literal `"victim"` → interned at id **A** (inside the loaded chunk);
+  2. drop the loaded closure and allocate a retained **marker** string → id **B** (`B > A`);
+  3. force real collection, then reconstruct the *same literal content* `"victim"` and put both it and the
+     marker as keys in a fresh table and `print` the `pairs` order.
+  - **traced (pre-fix, `record_execute*`):** the konst kept id **A** alive, so `"victim"` re-interns to the
+    live A and sorts **before** the marker B.
+  - **`.off`:** `"victim"` was swept, re-interns to a fresh id **C** (`C > B`), so the marker sorts first.
+  → divergent `pairs` order ⇒ `expectProgram` reddens pre-fix; with the gate the dynamic loop is never
+  traced, `"victim"` is swept in every mode alike, and all modes agree.
+  - **Non-stress half needs real GC pressure:** `collectgarbage` is **unimplemented**, so the test can't
+    force a cycle directly — the non-stress modes must allocate enough throwaway objects to cross the actual
+    GC threshold, or half the 10-mode matrix (gc_stress off) never sweeps and stays trivially green.
+- **Static caller inlining a dynamic callee aborts** (covers gate 4). The `load`ed callee must be a
+  **fixed-arity nested function** — `load("return function(x) ... end")()` — because a *directly* loaded
+  root is `vararg_root = true` (`load.zig:115`) and `recCall` already aborts it at `cp.is_vararg`
+  (`trace.zig:5061`); only a non-vararg dynamic callee proves gate 4 is what fired. Assert the abort reason
+  is `.dynamic_proto` (jit-debug `--dump-aborts` / abort-log probe), not `.cross_frame`.
+- **Restore keeps the bit** (covers the `keyframeser.zig:466` stamp — none of the live-run tests would
+  catch forgetting it): restore a snapshot containing a live loaded closure and assert its root **and**
+  nested protos have `dynamic == true` (or run it hot post-restore and assert no trace records). Without
+  this, dropping the recompile-site stamp passes every live-run test.
+- **Static tracing is unaffected**: an equivalent all-static program still records and runs native (guard
+  against over-gating — `proto.dynamic` must be `false` for the main tree).
+
+**Sequence:** design (this) → `gpt-5.6-sol` review (**done — BLOCKER, corrections folded above**) → land
+behind `just test` (default + `-Djit-debug`).
+Part (3) (the `beginTopLevelEpoch` trace-cache clear, closing the *cross-epoch* `depth==0` facet) follows.
+
+**Review outcome — Part (1) design, `gpt-5.6-sol`, 2026-07-18: BLOCKER (on design/tests), mechanism
+APPROVED.** Confirmed the four-gate set is *complete* for the mid-run facet — the only production
+`rec.reset` sites are `maybeStartContinuation`/`maybeStartReplaySide`/`arm` (rest are `test` blocks),
+`arm` covers both root and `wants_side_trace` arming (`trace.zig:3603`), the only heap-capable konst is
+`load_const(proto.constants[b])` (`trace.zig:3992`), and `recCall` (`trace.zig:5033`) is the only
+proto-crossing point. Approved the explicit `Proto.dynamic` bit. The BLOCKER was two-fold and both are
+folded above: **(a)** the two `maybeStart*` guards must be placed *after* the pending-anchor null-clear or
+a dynamic pending arm permanently pins `.full` dispatch; **(b)** the proposed regression test was not
+load-bearing — fixed to the marker/`pairs`-order construction, `t.victim` in-loop konst, real GC pressure
+for the non-stress half (`collectgarbage` unimplemented), a non-vararg nested-function callee for gate 4,
+and a restore-time `dynamic == true` assertion for the `keyframeser.zig:466` stamp. With those, the
+reviewer would approve. Tree-verified all cites before folding (`basic.zig` `bToString`, `io.zig:164`,
+`load.zig:115`, `collectgarbage` absent).
+
 #### Foundational piece 2 — H-1b design: name the source-opcode PC distinctly from the resume/exit PC (Bart, 2026-07-18)
 
 **Scope (Bart's call):** land the **H-1b** sub-part of the H-1 guard-provenance blocker as
