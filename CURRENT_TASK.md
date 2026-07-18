@@ -1,5 +1,30 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-18 (LATEST-11) — FOUNDATIONAL PIECE 2 (H-1b) LANDED + COMMITTED. Named the source-opcode PC distinctly from the resume/exit PC via a canonical `guardSourcePc` accessor; centralized the 8 open-coded `guardExitPc(g)-1` derivations; fixed conflated docs. Non-breaking (no `aux`/wire/control-flow value changed). `gpt-5.6-sol` review = NEEDS-CHANGE→clean (design-only fixes). `just test` green (772, default + `-Djit-debug`), nsieve byte-identical, test proven load-bearing.
+
+**Bart's steer (this session):** pick up **H-1b** next ("split source-opcode PC from resume PC in guard
+metadata") — a foundational, non-breaking piece of the H-1 guard-provenance blocker that shrinks
+round-9 scope.
+
+**Piece 2 LANDED — H-1b source/resume PC split.** The recorder conflated two PCs: `recordInstr` gets
+the *post-increment* pc (`interp.zig:1762` = `cur+1`), guards stamp it into `aux`, so a committed
+guard only carried the **resume/exit** PC — while `GuardProvenance` (G-1) needs the **source-opcode**
+index. Landing (recommended derived-accessor shape; heavier stored-field alt deferred to G-1):
+- New `pub fn guardSourcePc(ins) ?u32` in `trace.zig` = `guardExitPc − 1` (null on the 0 sentinel) — the
+  single canonical "which bytecode op owns this guard" definition.
+- Rerouted the 8 open-coded `code[guardExitPc(g)-1]` source derivations through it: `irinterp.zig:229`;
+  `trace.zig:489/2548/2909/2960/3089`; `nativegen.zig:3396/3617` (last drops a now-dead `exit_pc`).
+- Fixed the 3 conflated doc comments (`RecState.cur_pc`, `emit`, `guardExitPc` "five"→"six") + a stale
+  `countProductiveBranchExit` identity comment.
+- Test `"guardSourcePc: source-opcode PC is exit PC − 1 (H-1b), pinned independently"`: review-mandated
+  *independent known-index* assertion (recorded `get_index` at chosen N ⇒ `guardSourcePc==N`,
+  `guardExitPc==N+1`) + `emit`-fixture for `guard_number`/`int_of_float` (never recorder-emitted) + null
+  cases. Load-bearing: dropping the `−1` reddens 16 tests (10 fail + 6 crash).
+- Non-breaking: no `exit_pc`/`aux` value, control-flow target, IR layout, or serialized byte changed;
+  10-mode-invariant by construction. `gpt-5.6-sol` confirmed soundness + all 8 `.?` unwraps safe.
+- **COMMITTED** (see below). H-1's remaining round-9 scope: `source_pc` is now a named, tested,
+  single-owner accessor `GuardProvenance` reads directly.
+
 ## Status 2026-07-17 (LATEST-10) — BART DECIDED + FOUNDATIONAL PIECE 1 LANDED. H-2 fix = keyframe schema bump (reverses the "v4 stays" reshaping insight). Bart: land the safe foundational pieces first to shrink scope. Piece 1 (`next_obj_id` serialization, v4→v5) DONE — `just test` green (default + `-Djit-debug`), viz builds.
 
 **Bart's two decisions (this session):**
