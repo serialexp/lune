@@ -5040,7 +5040,8 @@ optimizer-integrated remapping; the plan now says so. No code landed — this is
 
 #### Part A — CONSOLIDATED buildable design (2026-07-19): the single contract to build
 
-Status: **design, pending a fresh `gpt-5.6-sol` pre-impl review.** This section assembles
+Status: **design — round-1 `gpt-5.6-sol` pre-impl review = BLOCKER, all six folded (see §A9 review
+log); pending a round-2 re-review before code.** This section assembles
 the final resolved contract from rounds 3–8 + the H-series groundings + the 2026-07-18
 landings into **one buildable spec**. For implementation it **supersedes** the scattered
 round-N Part-A subsections above; those stay as the historical derivation (why each choice
@@ -5211,7 +5212,10 @@ genuinely cold regions (< `min_useful` traversals) in the same gate. `AnchorKey(
 retained **only** as the gate/penalty blast-radius key (gating `(proto,14)` ungates its siblings
 uniformly), read by `accountRegionProfit` at flush — never the accumulator key.
 
-**A3.3 Identity keys.** `RegionId` = per-discovered-region identity (its edge set *is* its identity).
+**A3.3 Identity keys.** `RegionId` = a **canonical id of the region's *sorted* structural-edge set** —
+the `StructuralEdgeId`s put in a fixed total order and hashed, **NOT** discovery/insertion order
+(round-1 review, BLOCKER 2: discovery order varies by recording sequence and would make the region
+identity — hence the gate key — mode-dependent). The edge set *is* the identity, but canonicalized.
 `StructuralEdgeId = { anchor_proto_id, anchor_pc, GuardProvenance(exit), succ_anchor_pc }` — the
 persistent def key, **guest-logical** so a re-recorded logically-identical edge (new `Trace.id`)
 computes the same id and rebinds to the same def; the `GuardProvenance(exit)` component (§A4) replaces
@@ -5225,8 +5229,8 @@ the active region is a genuine exit even under PC overlap).
 
 **A3.4 `call_seq` (D-3c = β).** A per-VM monotonic `call_seq: u64` on `CallFrame`, drawn from a
 VM-level `next_call_seq`, bumped at the **single physical frame-push choke point `pushFrameVararg`
-(`interp.zig:1346`)** — which catches both the bytecode `.call` handler and the host-reentrant
-`callValue` path. `RegionKey.activation = root_call_seq`, snapshotted from the anchor frame at window
+(`interp.zig:1439`; anchor refreshed per the round-1 review, was 1346)** — which catches both the
+bytecode `.call` handler and the host-reentrant `callValue` path. `RegionKey.activation = root_call_seq`, snapshotted from the anchor frame at window
 open. **Tier-invariant** because traces *inline* Lua callees by register renaming and push no physical
 `CallFrame` (`recCall` emits only `guard_func`; `recReturn` emits nothing), so the anchor frame's
 `call_seq` is assigned by tier-0 before tier-up and **nothing on-trace ever writes `call_seq`** →
@@ -5235,25 +5239,54 @@ stream, same class as the direct-mapped hotcount). **Fail-closed:** an armed reg
 exact physically-current frame `frames[depth-1]` (by index + closure identity + anchor relation),
 never a trace-inlined/elided callee; else decline to arm. `next_call_seq` gets a checked-increment /
 u64-exhaustion contract (fail-closed on wrap). **Restore re-key (F-2):** `restoreSnapshot` writes
-`vm.frames[i]` directly (`keyframeser.zig:671`), bypassing `pushFrameVararg`, so restore **re-keys each
-live frame by index — `frames[i].call_seq = i`, `next_call_seq = vm.depth`** — giving each restored
+`vm.frames[i]` directly (`keyframeser.zig:699`; anchor refreshed per the round-1 review, was 671),
+bypassing `pushFrameVararg`, so restore **re-keys each live frame by index — `frames[i].call_seq = i`,
+`next_call_seq = vm.depth`** — giving each restored
 frame (incl. several live instances of one recursive proto) a distinct key. No wire field; `call_seq`
 stays unserialized (the v5 bump was `next_obj_id` only). Single physical stack `frames[0..depth]`
 (G-5); a future coroutine feature would make this a global-flat monotonic assignment.
 
-**A3.5 The logical window.** `accountRegionProfit` flushes when `outer_traversals − window_base ≥ N`
-with **`N = min_useful = 8`**, advancing `while (outer_traversals − window_base ≥ N) { flush one
-window; window_base += N; }` — the remainder `< N` is **carried, never dropped**. `N` is
-**tier-independent** (it is `min_useful`, NOT native `LEDGER_CAP`, NOT tier-1a's 8-hop, NOT the
-unlinked per-segment count). A **genuine region exit** (drops the accumulator, reclaims `RegionKey`)
-is: current PC outside the region's membership PC-set **AND** current stack depth `≤
-captured_anchor_depth` (F-6 polarity — a *deeper* re-entrant host call, e.g. a `table.sort`
-comparator re-entering via `native_reentry_depth`, means the anchor is still live → do NOT close). It
-**never** fires on `LEDGER_CAP`/hop exhaustion + re-entry, native-call return, **GC-safepoint exit**
-(explicitly excluded — the `gc_stress` corollary), or trace retirement. Region membership is
-discovered from the recorded trace graph in every tier (native *arming* consumes a discovered region,
-never creates it). P-EBP-2 equivalence is assertable across the **6 `record+exec-* × gc_stress`**
-modes.
+**A3.5 The accounting state machine (round-1 review, BLOCKER 2 — now a complete contract).** A
+region's accumulator is driven by a **deterministic per-transition `outer_delta`**, a window flush,
+and a region-exit flush. The three are specified so a lone/cold region and a hot region reach the
+gate through the *same* code, and so nothing is tier-dependent.
+
+*Per-transition `outer_delta` (the classifier's second output, keyed by the exit's structural role
+§A3.3/§A4).* Each accounted transition credits a fixed logical amount, independent of physical tier
+or inner iteration count:
+- outer composite back-edge / `skip.loop` completion → `+= local` (one skip segment's committed
+  composite iterations — the "work" unit);
+- inner loop-done (`inner.loopdone`) → `+= 1` (one outer traversal, regardless of the inner loop's
+  large local `k` count, `trace.zig:2595`);
+- link / bridge / source-branch control edges (edges 1–4 as *transitions*, not work) → `+= 0`;
+- `null`-keyed synthetic events (§A3.3) → `+= 0`, **credit-neutral** — but see the exit rule: a
+  null event may not *credit*, yet it must not *suppress* a required region-exit close either.
+
+`outer_traversals += outer_delta` on every accounted transition. **Full-window flush:** `while
+(outer_traversals − window_base ≥ N) { accountRegionProfit(owner, N /*a full, ≥min_useful window*/);
+window_base += N; }` with **`N = min_useful = 8`**, tier-independent (NOT native `LEDGER_CAP`, NOT
+tier-1a's 8-hop, NOT the unlinked per-segment count). A full window clears penalty/ungates the anchor.
+
+*Region exit (drops the accumulator, reclaims `RegionKey`) — and flushes the remainder as ONE
+low-yield window.* On a genuine exit the carried remainder `r = outer_traversals − window_base`
+(`0 ≤ r < N`) is flushed **once** as `accountRegionProfit(owner, r)` *before* deletion — so a region
+that repeatedly runs 1–7 traversals and exits is charged a low-yield event each time and **still
+retires** (this is the cold-region retirement gate B keeps; without the exit-flush a sub-`N` region
+would silently escape both ungating and penalty). A genuine exit is: **a tier-0 PC transition to a
+PC outside the region's membership PC-set** (detected in the dispatch loop where `onSideExit`/anchor
+dispatch already runs — the same site that opens/credits regions, so no new hook) **AND** current
+stack depth `≤ captured_anchor_depth` (F-6 polarity — a *deeper* re-entrant host call, e.g. a
+`table.sort` comparator re-entering via `native_reentry_depth`, keeps the anchor live → do NOT
+close). It **never** fires on `LEDGER_CAP`/hop exhaustion + re-entry, native-call return,
+**GC-safepoint exit** (excluded — the `gc_stress` corollary), or trace retirement. A `null`-keyed
+event participates in exit detection (it can observe the PC/depth leaving the region) but contributes
+no credit.
+
+Region membership is discovered from the recorded trace graph in every tier (native *arming* consumes
+a discovered region, never creates it). P-EBP-2 equivalence is assertable across the **6 `record+exec-*
+× gc_stress`** modes: the `(outer_delta, window flush, exit flush)` sequence is a pure function of the
+executed transition stream, identical whether the transitions were native hops, tier-1a hops, or
+unlinked per-segment `onSideExit`s.
 
 ##### A4 — Mechanism 3: GuardProvenance (9-B), un-deferred (Part A is the consumer)
 
@@ -5282,6 +5315,16 @@ CallEdge = { caller_proto_id: u32, call_pc: u32 }
   arg; `get_upval/get_global → guard_func`; `guard_fits` is every-narrow-lane). `operand` is a
   **static register designator** (`a/b/c/a+1/a+2/aux`); the **lane ordinal is NOT an operand**
   (observed runtime representation → would inject an observed input).
+- **‡ Branch polarity is part of the identity (round-1 review, BLOCKER 1).** `recBranch` emits
+  `guard_true` *or* `guard_false` by the taken path (`trace.zig:4900/4905`), and these are **opposite
+  CFG edges** of the region — the true-exit and the false-exit of one `if` are different transitions
+  (edge 1 = `skip.guard_false`, edge 4 = `cont.guard_true`-fail — literally the two polarities of the
+  outer `if p[i]`). So a branch guard's tag carries an explicit **`polarity` / exit-CFG-edge
+  discriminator** (which structural exit this is: taken-branch vs fall-through). This is **guest-static
+  edge selection** (which of the branch's two out-edges the recording committed to), *not* an observed
+  value — omitting it lets `StructuralEdgeId` rebind an opposite-polarity re-record onto a stale
+  logical edge (worse because `region_defs` outlives physical retirement). Add an **opposite-polarity
+  re-record collision test** to §A4's test list. (Non-branch guards leave `polarity` neutral.)
 - **`source_pc = cur_pc − 1`** (`cur_pc` is the post-increment resume PC); `= guardSourcePc(ins)` for
   the 6 PC-carrying guards (H-1b, landed), **explicitly stamped** via a `currentSourcePc()` helper for
   the 13 non-PC guards + the **3 fused native producer-exits** (`hload` `nativegen.zig:4022`, `.value`
@@ -5307,22 +5350,30 @@ cur_pc−1` / no-observed-lane.
 
 ##### A5 — Mechanism 4: region-cap contract (H-3)
 
-`region_profit` live entries are bounded by live recursion depth (`max_call_depth = 200`,
-`interp.zig:119`, fixed `frames` array). **Activation-scoped deletion is MANDATORY** (G-3, not a
-memory optimization): an entry is removed at normal frame pop (`.ret/.halt`, `interp.zig:2345/2364/
-2395`) **and** all three `protectedCall` error-unwind depth restores (`errors.zig:100/108/117`) — so
-entry lifetime = activation lifetime ⇒ **the map can never hold a dead entry to evict.** Part A must
-state an explicit **per-`(activation, anchor)` live-region cardinality invariant** (e.g. at most one
-live accumulator per `(activation, anchor)`) — the earlier "regions ≤ static anchor count" was
-overstated (siblings can share an anchor). **Silent evict-live is BANNED** (un-accounting an armed
-region corrupts the gate, P-EBP-2). **Design fork (internal, flag for the reviewer):** either
-**(a)** a fixed cap that **fails closed** (refuse to arm a new region when full — never evict), or
-**(c)** an **uncapped map bounded purely by the mandatory activation-scoped deletion** (no static
-`max_anchors_per_proto` exists, protos load with varying `code.len`, which favours (c)). *Recommended:
-(c)* — the lifetime discipline already guarantees the bound, and it needs no arbitrary constant.
-`region_profit` is cleared at `beginTopLevelEpoch` (already guarded by the **landed** `depth == 0`
-`Error.DirtyTopLevelEntry` precondition, 9-A) — clear it *after* that check passes, alongside the
-existing `disarmAllLinks`.
+**Fork resolved (round-1 review, BLOCKER 5): option (c), no cap.** `region_profit` is an **uncapped
+map bounded purely by mandatory activation-scoped deletion** — no fixed cap, no eviction path at all
+(there is no static `max_anchors_per_proto`; protos load with varying `code.len`, so any constant
+would be arbitrary). Live entries are bounded because live *activations* are bounded (`max_call_depth
+= 200`, `interp.zig:119`, fixed `frames` array) **and** an entry is deleted the instant its activation
+ends. **Activation-scoped deletion is MANDATORY** (G-3): an entry is removed at every normal frame
+pop (`.ret/.halt`, `interp.zig:2469/2488/2519` — anchors refreshed per the round-1 review; the
+consolidated draft's 2345/2364/2395 were stale) **and** all three `protectedCall` error-unwind depth
+restores (`errors.zig:100/108/117`). Entry lifetime = activation lifetime ⇒ **the map never holds a
+dead entry, so there is nothing to evict** and **silent evict-live cannot arise** (it is banned
+anyway — un-accounting an armed region corrupts the gate, P-EBP-2).
+
+**Release-enforced cardinality invariant:** **at most one active accumulator per `(call_seq, owner
+AnchorKey)`** (`call_seq` = the anchor frame's activation id, §A3.4). Depth alone does *not* bound the
+number of distinct sibling `RegionId`s one frame could open at one anchor, so the invariant is stated
+and *enforced*, not merely hoped. **Replacement rule:** if a *different* `RegionId` is opened for a
+`(call_seq, AnchorKey)` that already has a live accumulator, **close+flush the old accumulator** (the
+§A3.5 region-exit remainder flush) **before** installing the new one — never silently overwrite, and
+never keep two. (This is the natural encoding: the frame moved from one region to another at the same
+anchor; the old region genuinely exited.) A release assert pins "≤ 1 live entry per `(call_seq,
+AnchorKey)`."
+
+`region_profit` is cleared wholesale at `beginTopLevelEpoch` — **after** the **landed** `depth == 0`
+`Error.DirtyTopLevelEntry` precondition passes (9-A) and alongside the existing `disarmAllLinks`.
 
 ##### A6 — Mechanism 5: native-F2c logical cut + test (H-4)
 
@@ -5331,19 +5382,35 @@ burst without advancing `safepoint_seq`, so a safepoint-count cut is tier-depend
 **every host effect aborts recording** (`.host_barrier`, `trace.zig:5046`; the only inlined natives
 are effect-free `PureBuiltin`s), **no effect ever commits on-trace** — so the **tier-0 boundary after
 the Nth committed effect is the only implementable tier-independent cut.** (`pure ⇒ !effect` is landed,
-9-A, so the barrier is structural.) Cut at the **first snapshot-eligible tier-0 boundary at or after
-`effect_cursor == N`**, not the immediate next instruction: an effect used as a multret producer sets
-`reg_top_pending` (`interp.zig:3685`) and the suspend check refuses while it's set (`:1719`), and a
-faulting effect has no successful next boundary — so the harness selects a successful fixed-result
-effect (e.g. `local t = os.clock()`) and steps eligible boundaries until `effect_cursor == N`. The
-cut assertion is **full semantic keyframe** (live stack + every frame's `{closure,pc,base,return-
-wiring,varargs}`, heap/globals + object-id counter, open upvalues) **PLUS** the replay-driver state
-the keyframe omits (`effect_log` prefix + `effect_cursor`, output prefix, PRNG state) — **not
-`effect_cursor` alone** (a coarse clock). The **native-F2c test (F-5)** must (a) cut at the tier-0
-boundary immediately after a post-native-burst effect and (b) assert full-state identity; it also
-catches H-5(i) — numeric-`for` traces omit dead expression temporaries from the exit snapshot
-(`trace.zig:3761`), so a post-native-exit cut could serialize a stale temporary. Do **NOT** introduce
-a snapshot call inside `logEffect`/`performEffect`.
+9-A, so the barrier is structural.)
+
+**The cut counter must be mode-independent: `committed_effect_seq`, not `effect_cursor` (round-1
+review, BLOCKER 6).** `effect_cursor` only advances in **replay** (`interp.zig:4004`); in record mode
+the effect is appended but the cursor does not move (`interp.zig:3976/3994`) — so `effect_cursor == N`
+is *not* the same logical event across modes. Introduce a **`committed_effect_seq`** incremented once
+**after** a successful effect result is committed, in *every* mode, and cut on it. Cut at the **first
+snapshot-eligible tier-0 boundary at or after `committed_effect_seq == N`**, not the immediate next
+instruction: an effect used as a multret producer sets `reg_top_pending` (`interp.zig:3685`) and the
+suspend check refuses while it's set (`:1719`), and a faulting effect has no successful next boundary —
+so the harness selects a successful fixed-result effect (e.g. `local t = os.clock()`) and steps
+eligible boundaries until the count is reached.
+
+**The keyframe is not yet "full" — vararg cursors are missing (round-1 review, BLOCKER 6).** The
+claimed full-semantic-keyframe includes each frame's vararg state, but the wire schema **omits**
+`varargs_base`/`varargs_count` (`schema/trace.json:163`; `keyframeser.zig:288/709` construct/restore a
+`FrameRef` without them), so restore silently leaves them at defaults and a cut **inside a live vararg
+frame is not semantically complete.** Resolution, pick per the F2c harness's needs at landing:
+**(a)** add `varargs_base`/`varargs_count` to `FrameRef`, bump the snapshot schema, serialize +
+validate + restore them (the thorough fix), **or (b)** scope the native-F2c harness to **non-vararg
+live frames** and *drop* the "full semantic keyframe" wording for it. Either way the cut assertion is
+**semantic keyframe (as serialized) + the replay-driver state the keyframe omits** (`effect_log`
+prefix + `committed_effect_seq`, output prefix, PRNG state) — **not the effect counter alone** (a
+coarse clock that a heap-heavy/few-effect loop advances too slowly to catch a diverged heap). The
+**native-F2c test (F-5)** must (a) cut at the tier-0 boundary immediately after a post-native-burst
+effect and (b) assert this full-state identity; it also catches H-5(i) — numeric-`for` traces omit
+dead expression temporaries from the exit snapshot (`trace.zig:3761`), so a post-native-exit cut
+could serialize a stale temporary. Do **NOT** introduce a snapshot call inside
+`logEffect`/`performEffect`.
 
 ##### A7 — Determinism inheritance + the sharp open question
 
@@ -5351,22 +5418,43 @@ a snapshot call inside `logEffect`/`performEffect`.
 `{gc,snapshot}` split). Part A's obligation is to **stay in that lane**: `region_defs`/`region_profit`/
 `call_seq` are transient, `.gc`-only-or-non-root, **never a `.snapshot` root**, and **reset on
 restore** (`region_profit`/`call_seq` re-keyed per §A3.4; `region_defs` rebuilt from the trace graph)
-— so they are structurally incapable of appearing in serialized bytes. P-EBP-1/2: the drain must
-reproduce edge 4's `onSideExit` order and the skip-anchor accounting exactly across the 10-mode matrix,
-and the newly-non-gated `nsieve:14` must not change **which** later traces record (only where its own
-iterations run).
+— so they are structurally incapable of appearing in serialized bytes.
 
-**The sharpest open question — the composite-gap no-yield safe-point hole.** `skip`'s own composite
-back-edges (`%023 loop`) do **not** append to the ledger, so in nsieve's sparse tail a single burst
-can run *millions* of composite back-edges between two ledger appends **with no forced yield** — edge
-4 risks an unbounded no-safe-point region (a suspend/interrupt-responsiveness + P-EBP-4 hazard). The
-round-3 review graded this APPROVE-WITH-CHANGES ("native back-edge poll only if async latency
-needed"). **Proposed resolution (for the reviewer to confirm or reject):** add a lightweight native
-back-edge safepoint poll on the *closed outer region* (a counter-gated check that yields to
-`shared_exit` — the same mechanism `emitForcedYieldCheck` uses — so the region stays interruptible and
-`suspend_ctl` still fires within a bounded number of back-edges), gated so it is compiled only for a
-bridge-armed composite loop. The alternative (declare it acceptable because lune has no async
-preemption requirement today) must be argued explicitly, not assumed.
+**P-EBP-1/2 — the correctness property is OUTPUT identity, not trace-selection identity (round-1
+review, BLOCKER 3, retraction).** An earlier draft required "`nsieve:14` must not change *which* later
+traces record." That is **false and not needed.** Every interpreted back-edge advances the global
+tiering tick / direct-mapped hotcount (`trace.zig:3598`) and gate-retry cooldown keys on it
+(`:3586`), but a **native** back-edge only bumps `rbx` and jumps locally (`nativegen.zig:4498`) — it
+does *not* reproduce the tick. So closing edge 4 removes dispatcher-visible outer back-edges and
+**does** shift tick/cooldown timing for unrelated gated anchors — exactly as tier selection *already*
+differs across the 10 modes today (that is the premise: `record_execute_native` and `off` pick
+different traces yet print identically). The replay/determinism contract is **byte-identical program
+output + snapshot bytes**, resting on **native ≡ tier-0 semantic equivalence + H-2 snapshot
+JIT-independence** — NOT on identical trace selection. What Part A *must* preserve is (a) the
+`accountTraceRun` *selection* inputs are unchanged **per transition** (so a given executed transition
+stream selects the same way — the split keeps `hit_count`/coverage identical for the *same* stream),
+and (b) no accounting path re-roots a heap object into the `.snapshot` walk (§A7/Q5). It must **not**
+promise the stronger "same later traces" property, which native tiering never provided. This is the
+honest contract; the 10-mode matrix + keyframe-restore equality is the test, not trace-cache
+equality.
+
+**The composite-gap no-yield safe-point hole — RESOLVED as contract (i): synchronous, cooperative
+suspend; no new poll (round-1 review, BLOCKER 4).** `skip`'s composite back-edges (`%023 loop`) do
+not append to the ledger, so a burst can run millions of native composite back-edges with no forced
+yield. The round-1 review established the decisive facts: (1) this is **not unique to edge 4** — the
+already-shipped `inner(24)` armed cycle *already* runs unbounded native self-loops (`nativegen.zig:
+4498`, a native `.loop` has no poll), so edge 4 introduces no new *class* of hazard; (2) `suspend_ctl`
+is only ever set **synchronously** by the replay/suspend driver *before* a run, and is checked only
+in the tier-0 instruction prologue (`interp.zig:1820-1847`); (3) **when a suspend is armed,
+`safe_to_arm` is false and every link is disarmed before native execution** (`interp.zig:2751`), so
+the native cycle collapses to tier-0 (which polls every instruction) exactly when a suspend is
+pending. lune has **no asynchronous preemption requirement** (no signals/interrupts drive
+`suspend_ctl` mid-native). Therefore the supported contract is: **suspension is cooperative and
+disarm-on-observation is the mechanism** — `safe_to_arm` gates arming and an observation/replay window
+disarms the outer cycle just as it does `inner(24)`'s. **No back-edge poll is added**, and A-viii no
+longer carries one; the 2c-F-style disarm test is extended to the outer cycle to prove the collapse
+(§A8). If lune ever grows async preemption, a *general* native back-edge budget/poll (for all native
+self-loops, not edge 4 alone) is the right design then — out of scope now, recorded as a future note.
 
 ##### A8 — Landing sequence (each sub-step: design-confirmed → land behind `just test`, 10-mode byte-identical)
 
@@ -5388,23 +5476,40 @@ byte-identical across the 10 modes and provable by negative control:
 7. **A-vii — FLIP: arm edge 4 + gate B consumes `region_profit`.** The single behaviour-changing
    step. `accountRegionProfit` now gates; `armNativeLink(.region_bridge)` fires under `safe_to_arm`.
    Measure nsieve honestly (before/after, per-anchor `--jit-stats`); report even if flat.
-8. **A-viii — disarm coverage + safepoint.** Extend the 2c-F disarm test to the **outer** cycle
-   (`skip→…→cont→skip`) with a negative control; land the §A7 back-edge safepoint poll if the review
-   requires it.
+8. **A-viii — disarm coverage.** Extend the 2c-F disarm test to the **outer** cycle
+   (`skip→…→cont→skip`) with a negative control, proving an observation/replay window collapses it to
+   tier-0. **No back-edge poll** (§A7 contract (i): suspension is synchronous/cooperative and
+   disarm-on-observation is the supported mechanism, as for `inner(24)` today).
 
-##### A9 — Open questions for the review
+##### A9 — Review log + residual questions
 
-- **(Q1, sharpest)** The composite-gap no-yield safe-point hole (§A7): add the native back-edge
-  safepoint poll, or argue it's unneeded? This is the one that overturned prior rounds' assumptions.
-- **(Q2)** H-3 cap fork (§A5): uncapped-lifetime-bounded (recommended) vs fixed-fail-closed.
-- **(Q3)** `min_useful = 8` (§A3.5): closing the region may itself change the right break-even; is a
-  retune a Part-A obligation or strictly Part-B (cheap rel32 transitions)?
-- **(Q4)** Edge-4 coherence (§A2.1/A2.2): confirm `cont`'s composite exit leaves `regs[]` coherent for
-  `skip.ordinary_entry` after the bridge commits `E` — this is the exact class of claim 2.3c-1's
-  review overturned (the ramp landed regs at the inner PC, not the header). Prove, don't assume.
-- **(Q5)** Confirm H-2's closure genuinely makes Part A's transient region state snapshot-irrelevant
-  (§A7) — i.e. that `.gc`-only/non-root + reset-on-restore is sufficient and nothing in the accounting
-  path can re-root a heap object into the `.snapshot` walk.
+**Round-1 `gpt-5.6-sol` pre-impl review (2026-07-19) = BLOCKER → all six folded above.** Verified
+**sound** and unchanged: H-2 genuinely closed (`.snapshot` walk excludes trace consts,
+`keyframeser.zig:270` / split at `interp.zig:1703`; scalar region metadata can't re-root a GC object
+unless implementation adds it to the walk — a coding rule, §A7); the edge-4 bridge set `{r2,r3,r6}` +
+`skip.ordinary_entry` re-run of tag/table/metatable/lane guards + reload (`nativegen.zig:3699`) is
+coherent, including live-through `r2`; `pushFrameVararg` (`interp.zig:1439`) is the single physical
+push choke and restore re-key by stack index is sufficient for multiple live recursive frames; the
+unarmed A-v stub is state-equivalent. **Folded blockers:** (1) GuardProvenance gains a branch-polarity
+discriminator (§A4); (2) the accounting state machine is now complete — per-transition `outer_delta`,
+window flush, **region-exit remainder flush as one low-yield window**, canonical sorted-edge-set
+`RegionId` (§A3.3/§A3.5); (3) the trace-selection-identity requirement is **retracted** — correctness
+is output+snapshot identity via native≡tier-0 + H-2, not trace-cache identity (§A7); (4) the
+safepoint hole is resolved as **contract (i)** (synchronous cooperative suspend, no poll; §A7); (5)
+H-3 collapses to **option (c)** with a release-enforced ≤1-accumulator-per-`(call_seq, AnchorKey)`
+invariant + close-then-replace rule + refreshed cleanup anchors (§A5); (6) H-4 uses a mode-independent
+`committed_effect_seq` and the vararg-cursor keyframe gap is called out (schema add *or* scope the
+harness; §A6). Stale anchors refreshed (`pushFrameVararg` 1439, restore 699, frame pops
+2469/2488/2519, suspend 1820-1847).
+
+**Residual for the round-2 re-review:**
+
+- **(Q3)** `min_useful = 8` (§A3.5): does closing the region itself shift the right break-even, or is
+  the retune strictly a Part-B obligation (cheap rel32 transitions)? Leaning Part-B; confirm.
+- **(Q6, new)** The H-4 vararg-cursor fork (§A6): schema-bump `FrameRef` vs scope the native-F2c
+  harness to non-vararg frames — which does the reviewer prefer given F2c is deferred machinery?
+- General: is anything in the completed accounting state machine (§A3.5) still under-specified enough
+  to build wrong (the `outer_delta` table, the exit-detection site, the close-then-replace rule)?
 
 ### Later — Register-level coherence (defer; measure first)
 
