@@ -1341,6 +1341,108 @@ test "H-2: next_obj_id survives pre-cut garbage (restored verbatim, not reconstr
     try testing.expectEqualSlices(u8, sf, sf2);
 }
 
+test "chunk rooting: retained-chunk constants survive a snapshot straddle iff the host re-retains in the same order" {
+    const gpa = testing.allocator;
+    // docs/design/03 §"Chunk-constant rooting", restore path A. Three host chunks
+    // X/Y/Z are compiled and RETAINED but never run — their only reachability is the
+    // borrow list, so their distinctive literals "olx"/"oly"/"olz" enter the snapshot
+    // via the .snapshot root walk (rooting retained chunks in BOTH walks is what makes
+    // the ids survive). Because the snapshot serializes in root-DISCOVERY order and
+    // that order is the retain order, byte-identity across the straddle requires the
+    // host to re-compile + re-retain in the SAME order on restore. Re-retaining in a
+    // different order re-serializes the same objects in different positions → the
+    // bytes differ, which is exactly why `releaseChunk` uses `orderedRemove`.
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+
+    const main_src: [:0]const u8 = "x = 1\n";
+    const sx: [:0]const u8 = "print(\"olx\")\n";
+    const sy: [:0]const u8 = "print(\"oly\")\n";
+    const sz: [:0]const u8 = "print(\"olz\")\n";
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+
+    var tm = try lune_parser.parse(gpa, main_src, &diags);
+    defer tm.deinit();
+    var cm = try lune_compiler.compile(gpa, &vm.heap, main_src, tm.root, &diags);
+    defer cm.deinit();
+    var tx = try lune_parser.parse(gpa, sx, &diags);
+    defer tx.deinit();
+    var cx = try lune_compiler.compile(gpa, &vm.heap, sx, tx.root, &diags);
+    defer cx.deinit();
+    var ty = try lune_parser.parse(gpa, sy, &diags);
+    defer ty.deinit();
+    var cy = try lune_compiler.compile(gpa, &vm.heap, sy, ty.root, &diags);
+    defer cy.deinit();
+    var tz = try lune_parser.parse(gpa, sz, &diags);
+    defer tz.deinit();
+    var cz = try lune_compiler.compile(gpa, &vm.heap, sz, tz.root, &diags);
+    defer cz.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    _ = try vm.run(cm.proto);
+    try vm.retainChunk(cx.proto);
+    try vm.retainChunk(cy.proto);
+    try vm.retainChunk(cz.proto);
+
+    const b0 = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(b0);
+
+    // Restore path A: the host re-supplies its program image. We re-compile the three
+    // chunks against the restored heap (interning reuses the reconstructed same-id
+    // strings) and re-retain them. SAME order → byte-identical re-encode.
+    {
+        const vm2 = try restore(gpa, b0, cm.proto, NativeRegistry.base());
+        defer {
+            vm2.deinit();
+            gpa.destroy(vm2);
+        }
+        var d2 = Diagnostics.init(gpa);
+        defer d2.deinit();
+        var rx = try lune_compiler.compile(gpa, &vm2.heap, sx, tx.root, &d2);
+        defer rx.deinit();
+        var ry = try lune_compiler.compile(gpa, &vm2.heap, sy, ty.root, &d2);
+        defer ry.deinit();
+        var rz = try lune_compiler.compile(gpa, &vm2.heap, sz, tz.root, &d2);
+        defer rz.deinit();
+        try testing.expect(!d2.hasErrors());
+        try vm2.retainChunk(rx.proto);
+        try vm2.retainChunk(ry.proto);
+        try vm2.retainChunk(rz.proto);
+
+        const b1 = try encodeSnapshot(gpa, vm2);
+        defer gpa.free(b1);
+        try testing.expectEqualSlices(u8, b0, b1);
+    }
+
+    // Re-retaining in REVERSED order re-serializes the same constants in different
+    // discovery positions → the bytes must differ (guards the ordering contract).
+    {
+        const vm3 = try restore(gpa, b0, cm.proto, NativeRegistry.base());
+        defer {
+            vm3.deinit();
+            gpa.destroy(vm3);
+        }
+        var d3 = Diagnostics.init(gpa);
+        defer d3.deinit();
+        var rx = try lune_compiler.compile(gpa, &vm3.heap, sx, tx.root, &d3);
+        defer rx.deinit();
+        var ry = try lune_compiler.compile(gpa, &vm3.heap, sy, ty.root, &d3);
+        defer ry.deinit();
+        var rz = try lune_compiler.compile(gpa, &vm3.heap, sz, tz.root, &d3);
+        defer rz.deinit();
+        try testing.expect(!d3.hasErrors());
+        try vm3.retainChunk(rz.proto); // reversed
+        try vm3.retainChunk(ry.proto);
+        try vm3.retainChunk(rx.proto);
+
+        const b2 = try encodeSnapshot(gpa, vm3);
+        defer gpa.free(b2);
+        try testing.expect(!std.mem.eql(u8, b0, b2));
+    }
+}
+
 test "H-2/G-2: snapshot bytes are identical whether or not the JIT recorded (trace consts excluded from the snapshot walk)" {
     const gpa = testing.allocator;
     // A hot loop reads a constant string key `t.k`; the recorder captures the

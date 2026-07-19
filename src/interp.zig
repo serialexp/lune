@@ -672,12 +672,64 @@ pub const Vm = struct {
     /// ids). 0 until seeded.
     next_proto_id: u32 = 0,
 
+    /// Host-registered proto trees kept GC-alive across the **compile→run window**
+    /// (docs/design/03 §"Chunk-constant rooting"). A compiled `Chunk`'s interned
+    /// string constants are otherwise rooted only transitively via a live closure
+    /// (`gc.markProtoConstants`, reached from a frame closure) — so a host that
+    /// compiles chunk B, then runs chunk A (which GCs), then runs B would have B's
+    /// literals swept before B ever runs, dangling its `load_const`s. `retainChunk`
+    /// adds B's root proto here; `forEachRootHeader` roots its whole tree's heap
+    /// constants in BOTH the `.gc` and `.snapshot` walks (the latter so their ids
+    /// survive a snapshot straddle — retained chunks are host-authored program
+    /// image, re-supplied on restore like the main `root`).
+    ///
+    /// **Borrows only** (non-owning): the host still owns each `Chunk` and frees it.
+    /// Contract: `releaseChunk(proto)` BEFORE the host `Chunk.deinit()`s the tree,
+    /// and one `retainChunk` per `releaseChunk`. The snapshot guarantee is scoped to
+    /// UNRUN chunks (once run, a closure roots the constants → `releaseChunk`).
+    retained_chunks: std.ArrayList(*const Proto) = .empty,
+
     /// A runtime-compiled chunk owned by the VM: the `Chunk` (whose arena owns the
     /// proto tree) and the NUL-terminated source the protos borrow.
     pub const LoadedChunk = struct {
         chunk: compiler.Chunk,
         source: [:0]u8,
     };
+
+    /// Keep a host-compiled proto tree's constants GC-rooted across the compile→run
+    /// window (see `retained_chunks`). Borrow only — the caller keeps ownership and
+    /// MUST `releaseChunk` before freeing the `Chunk`.
+    pub fn retainChunk(self: *Vm, proto: *const Proto) Error!void {
+        try self.retained_chunks.append(self.gpa, proto);
+    }
+
+    /// Drop a `retainChunk` root. `orderedRemove` (NOT `swapRemove`) so surviving
+    /// borrows keep their relative order — retained constants serialize in
+    /// root-discovery order, so reordering survivors would change snapshot bytes
+    /// (docs/design/03). A pointer not currently retained is a no-op.
+    pub fn releaseChunk(self: *Vm, proto: *const Proto) void {
+        for (self.retained_chunks.items, 0..) |p, i| {
+            if (p == proto) {
+                _ = self.retained_chunks.orderedRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Root every heap constant in a proto tree through `cb` (mirrors
+    /// `gc.markProtoConstants`, but emits headers so it serves both the collector and
+    /// the snapshot walk). Compiler-produced protos only (the `retainChunk` contract):
+    /// the compiler emits exactly interned-string and scalar constants, never a
+    /// `row_view` fat value — so `isHeap → asHeap` is complete, matching the item-5
+    /// trace-const loop.
+    fn rootProtoConsts(
+        proto: *const Proto,
+        ctx: anytype,
+        comptime cb: fn (@TypeOf(ctx), *object.GcHeader) void,
+    ) void {
+        for (proto.constants) |v| if (v.isHeap()) cb(ctx, v.asHeap());
+        for (proto.protos) |child| rootProtoConsts(child, ctx, cb);
+    }
 
     pub fn init(gpa: std.mem.Allocator) Error!Vm {
         var vm = try initBare(gpa);
@@ -763,6 +815,9 @@ pub const Vm = struct {
             self.gpa.free(lc.source);
         }
         self.loaded_chunks.deinit(self.gpa);
+        // Borrows only — free the list, never the borrowed chunks (the host owns
+        // those and must have released them before its own `Chunk.deinit`).
+        self.retained_chunks.deinit(self.gpa);
         self.heap.deinit();
         self.gpa.free(self.tags);
         self.gpa.free(self.payloads);
@@ -1637,6 +1692,14 @@ pub const Vm = struct {
         }
         for (self.frames[0..self.depth]) |f| cb(ctx, @constCast(&f.closure.header));
         for (self.open_upvalues.items) |ou| cb(ctx, &ou.cell.header);
+        // Host-retained chunks (docs/design/03 §"Chunk-constant rooting"): keep a
+        // compiled-but-not-yet-run chunk's interned constants alive across the
+        // compile→run window. Rooted in BOTH walks (unlike trace consts, item 5):
+        // membership is a mode-invariant host action, so serializing their ids in the
+        // `.snapshot` walk is byte-identical across all modes and lets a snapshot
+        // straddle preserve constant-id continuity (the host re-supplies + re-retains
+        // on restore, like the main `root`). Discovery order = retain order.
+        for (self.retained_chunks.items) |proto| rootProtoConsts(proto, ctx, cb);
         // Trace consts are GC-liveness roots ONLY — never snapshot semantic roots
         // (doc 17 H-2/G-2). See the item-5 note above.
         if (kind == .gc) {
@@ -9060,6 +9123,200 @@ test "H-2 part 3: the JIT still records fresh traces in a second epoch after the
     _ = try vm.run(chunk.proto); // epoch 2 — beginTopLevelEpoch cleared the cache first
     // A fresh trace was recorded in epoch 2 (not left wedged by the reset).
     try testing.expect(vm.trace.cache.items.len >= 1);
+}
+
+test "chunk rooting: a host-compiled retained chunk survives GC before it runs" {
+    // docs/design/03 §"Chunk-constant rooting" — the regression. A host compiles chunk
+    // B (whose distinctive literal is a `load_const`), retains it, runs chunk A (which
+    // GCs at every safepoint under stress), then runs B. WITHOUT `retainChunk`, B's
+    // "compdeferlit" is swept during A's run (B has no closure yet → its constants are
+    // unrooted) and B's `load_const` dangles. WITH it, the retain roots B's whole tree
+    // so the literal survives and B prints it. (Negative control: removing the
+    // `retained_chunks` loop in `forEachRootHeader` reddens/UAFs this.)
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+
+    const src_a: [:0]const u8 = "for i = 1, 3000 do local junk = {} end\n";
+    const src_b: [:0]const u8 = "print(\"compdeferlit\")\n";
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.heap.gc_stress = true; // sweep at every safepoint during A's run
+
+    // Compile B first (interns "compdeferlit"), then A. Neither is run yet.
+    var tb = try parser.parse(gpa, src_b, &diags);
+    defer tb.deinit();
+    var cb = try compiler.compile(gpa, &vm.heap, src_b, tb.root, &diags);
+    defer cb.deinit();
+    var ta = try parser.parse(gpa, src_a, &diags);
+    defer ta.deinit();
+    var ca = try compiler.compile(gpa, &vm.heap, src_a, ta.root, &diags);
+    defer ca.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    try vm.retainChunk(cb.proto); // keep B alive across A's GC-heavy run — the fix
+
+    var sink_a: [16]u8 = undefined;
+    var wa = io.Writer.fixed(&sink_a);
+    vm.out = &wa;
+    _ = try vm.run(ca.proto); // GCs repeatedly; "compdeferlit" rooted only by the retain
+
+    var sink_b: [32]u8 = undefined;
+    var wb = io.Writer.fixed(&sink_b);
+    vm.out = &wb;
+    _ = try vm.run(cb.proto); // B's `load_const` must still resolve
+    vm.releaseChunk(cb.proto);
+
+    try testing.expectEqualStrings("compdeferlit\n", wb.buffered());
+}
+
+test "chunk rooting: releaseChunk unroots a retained chunk's constants" {
+    // Retain roots the constants (survive a stress GC); release unroots them (swept by
+    // the next stress GC). B is never run, so its only reference is the retain.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+
+    const src_b: [:0]const u8 = "print(\"releaselit\")\n"; // never run; literal is a constant
+    const src_c: [:0]const u8 = "for i = 1, 100 do local j = {} end\n"; // GC driver
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.heap.gc_stress = true;
+    var sink: [16]u8 = undefined;
+    var w = io.Writer.fixed(&sink);
+    vm.out = &w;
+
+    var tb = try parser.parse(gpa, src_b, &diags);
+    defer tb.deinit();
+    var cb = try compiler.compile(gpa, &vm.heap, src_b, tb.root, &diags);
+    defer cb.deinit();
+    var tc = try parser.parse(gpa, src_c, &diags);
+    defer tc.deinit();
+    var cc = try compiler.compile(gpa, &vm.heap, src_c, tc.root, &diags);
+    defer cc.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    try vm.retainChunk(cb.proto);
+    _ = try vm.run(cc.proto); // stress GC — "releaselit" rooted by the retain
+    try testing.expect(vm.heap.interned.get("releaselit") != null);
+
+    vm.releaseChunk(cb.proto);
+    _ = try vm.run(cc.proto); // stress GC — now unrooted
+    try testing.expect(vm.heap.interned.get("releaselit") == null);
+}
+
+test "chunk rooting: releaseChunk preserves survivor order (orderedRemove, not swapRemove)" {
+    // Root-discovery order = retain order (docs/design/03), so releasing a NON-last
+    // borrow must keep the survivors' relative order: releasing X from [X,Y,Z] leaves
+    // [Y,Z]. A `swapRemove` would leave [Z,Y] and shift snapshot bytes.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+
+    const sx: [:0]const u8 = "print(\"olx\")\n";
+    const sy: [:0]const u8 = "print(\"oly\")\n";
+    const sz: [:0]const u8 = "print(\"olz\")\n";
+    var tx = try parser.parse(gpa, sx, &diags);
+    defer tx.deinit();
+    var cx = try compiler.compile(gpa, &vm.heap, sx, tx.root, &diags);
+    defer cx.deinit();
+    var ty = try parser.parse(gpa, sy, &diags);
+    defer ty.deinit();
+    var cy = try compiler.compile(gpa, &vm.heap, sy, ty.root, &diags);
+    defer cy.deinit();
+    var tz = try parser.parse(gpa, sz, &diags);
+    defer tz.deinit();
+    var cz = try compiler.compile(gpa, &vm.heap, sz, tz.root, &diags);
+    defer cz.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    try vm.retainChunk(cx.proto);
+    try vm.retainChunk(cy.proto);
+    try vm.retainChunk(cz.proto);
+    vm.releaseChunk(cx.proto); // remove the FIRST — the case that distinguishes the two
+
+    try testing.expectEqual(@as(usize, 2), vm.retained_chunks.items.len);
+    try testing.expectEqual(@as(*const Proto, cy.proto), vm.retained_chunks.items[0]);
+    try testing.expectEqual(@as(*const Proto, cz.proto), vm.retained_chunks.items[1]);
+
+    vm.releaseChunk(cy.proto);
+    vm.releaseChunk(cz.proto);
+}
+
+test "chunk rooting: retained-chunk output is byte-identical across all 10 modes" {
+    // Rooting retained chunks is a mode-invariant host action (unlike trace consts), so
+    // a program that retains + runs a deferred chunk produces identical output in every
+    // mode. B's literal `"alit"` is interned at B's compile (early), rooted across A's
+    // GC-heavy run by the retain, and sorts BEFORE the runtime-built marker in `pairs`.
+    const gpa = testing.allocator;
+    const src_a: [:0]const u8 = "for i = 1, 3000 do local junk = {} end\n";
+    const src_b: [:0]const u8 =
+        \\local s = 0
+        \\for i = 1, 200 do s = s + i end
+        \\local marker = "mar" .. "ker"
+        \\local tt = {}
+        \\tt["alit"] = 1
+        \\tt[marker] = 2
+        \\local order = ""
+        \\for k in pairs(tt) do order = order .. k .. " " end
+        \\print(order)
+    ;
+    const H = struct {
+        fn run(a: std.mem.Allocator, sa: [:0]const u8, sb: [:0]const u8, mode: TraceMode, stress: bool) ![]u8 {
+            const parser = @import("parser.zig");
+            const diag = @import("diag.zig");
+            var diags = diag.Diagnostics.init(a);
+            defer diags.deinit();
+            var vm = try Vm.init(a);
+            defer vm.deinit();
+            vm.heap.gc_stress = stress;
+            configTraceMode(&vm, mode);
+
+            var tbb = try parser.parse(a, sb, &diags);
+            defer tbb.deinit();
+            var cbb = try compiler.compile(a, &vm.heap, sb, tbb.root, &diags);
+            defer cbb.deinit();
+            var taa = try parser.parse(a, sa, &diags);
+            defer taa.deinit();
+            var caa = try compiler.compile(a, &vm.heap, sa, taa.root, &diags);
+            defer caa.deinit();
+            try testing.expect(!diags.hasErrors());
+
+            try vm.retainChunk(cbb.proto);
+            var dump: [16]u8 = undefined;
+            var wd = io.Writer.fixed(&dump);
+            vm.out = &wd;
+            _ = try vm.run(caa.proto);
+
+            var sink: [64]u8 = undefined;
+            var w = io.Writer.fixed(&sink);
+            vm.out = &w;
+            _ = try vm.run(cbb.proto);
+            vm.releaseChunk(cbb.proto);
+            return a.dupe(u8, w.buffered());
+        }
+    };
+    inline for (.{ false, true }) |stress| {
+        const off = try H.run(gpa, src_a, src_b, .off, stress);
+        defer gpa.free(off);
+        inline for (.{ .record_only, .record_execute_noopt, .record_execute, .record_execute_native }) |mode| {
+            const rec = try H.run(gpa, src_a, src_b, mode, stress);
+            defer gpa.free(rec);
+            try testing.expectEqualStrings(off, rec);
+        }
+        try testing.expectEqualStrings("alit marker \n", off);
+    }
 }
 
 test "trace toggle gates back-edge counting" {

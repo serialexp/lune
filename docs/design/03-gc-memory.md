@@ -2,7 +2,7 @@
 
 Status: partial — GC v1 (Phase 4) + lane-packed array storage landed; generational upgrade, typed-array payload + buffer lease (Phase 9b), and trace rooting outstanding
 Owner: Bart
-Last updated: 2026-07-19 (added §"Chunk-constant rooting — the compile→run window": DESIGN for a `retained_chunks` borrow list + root loop in both `forEachRootHeader` walks, closing the embedding compile-then-defer GC hole surfaced by the doc-17 H-2 part-3 harness. gpt-5.6-sol round-1 = BLOCKER, folded: option A "host re-supplies" restore path (retained chunks are host-authored program image like the main `root`, so `.snapshot` rooting + host re-compile/re-retain preserves constant-id continuity across a snapshot straddle), the borrow lifetime contract (release before `Chunk.deinit`), and the `compileToClosure`/`row_view`/stable-id-test/`append` nits. Pending re-review → land.)
+Last updated: 2026-07-19 (LANDED §"Chunk-constant rooting — the compile→run window": `Vm.retained_chunks` borrow list + `retainChunk`/`releaseChunk` (`orderedRemove`) + `rootProtoConsts` rooted in BOTH `forEachRootHeader` walks, closing the embedding compile-then-defer GC hole surfaced by the doc-17 H-2 part-3 harness. Design went gpt-5.6-sol rounds 1–5 to APPROVE: option A "host re-supplies" restore path (retained chunks are host-authored program image like the main `root`, so `.snapshot` rooting + host re-compile/re-retain preserves constant-id continuity across a snapshot straddle) + borrow lifetime contract (release before `Chunk.deinit`) + same-order re-retain contract. Landed with 4 interp tests + 1 keyframeser snapshot-straddle test, all 4 negative controls verified load-bearing, green under `just test` + `-Djit-debug`.)
 
 Prerequisite for **Phase 1** (object header + GC-root model), **Phase 3**
 (write-barrier call sites), and **Phase 4** (the collector). Both reviewers
@@ -87,6 +87,21 @@ ownership, write barriers, and trace rooting.
       timing / addresses / memory are non-observable per `02-determinism.md`), so a
       lane that diverges across a snapshot→restore changes no program-visible state;
       capture/restore stays byte-identical and run-twice determinism holds.
+- [x] **Chunk-constant rooting (compile→run window).** LANDED (`src/interp.zig`
+      `Vm.retained_chunks` borrow list + `retainChunk`/`releaseChunk` +
+      `rootProtoConsts`, rooted in BOTH walks of `forEachRootHeader`; `releaseChunk`
+      uses `orderedRemove` to preserve survivor/discovery order). A host-compiled-but-
+      not-yet-run chunk's interned constants now survive a GC driven by another
+      execution AND keep their ids across a snapshot straddle (restore path A — host
+      re-compiles + re-retains the chunk in the same order, like the main `root`). Design
+      of record is §"Chunk-constant rooting — the compile→run window" below (gpt-5.6-sol
+      rounds 1–5, round 5 = APPROVE). Tests: 4 in `interp.zig` (regression survival under
+      `gc_stress`, `releaseChunk` unroot via `interned.get`, `orderedRemove` survivor order
+      with 3 chunks, 10-mode byte-identity) + 1 in `keyframeser.zig` (snapshot straddle:
+      same-order re-retain → byte-identical, reversed → differs); all four negative controls
+      verified load-bearing. Snapshot guarantee scoped to UNRUN retained chunks (multi-host-
+      chunk live-closure snapshot remains a pre-existing resolver follow-up, noted below).
+      Surfaced by the doc-17 H-2 part-3 harness.
 
 ### Outstanding
 - [x] **Object header.** ✅ Shape settled in Phase 1 (`src/object.zig`):
@@ -114,14 +129,6 @@ ownership, write barriers, and trace rooting.
       closures, open upvalues). Still outstanding for the later executors —
       recorder, IR-interpreter, native codegen — where snapshot metadata must
       coordinate with liveness.
-- [ ] **Chunk-constant rooting (compile→run window).** DESIGN written + gpt-5.6-sol
-      round-1 BLOCKER folded (option A, `.snapshot` rooting + host-re-supply restore
-      contract, borrow lifetime contract); pending re-review → land. A `retained_chunks`
-      borrow list on `Vm` + `retainChunk`/`releaseChunk` + a root loop in BOTH walks of
-      `forEachRootHeader`, so a host-compiled-but-not-yet-run chunk's interned constants
-      survive a GC driven by another execution AND keep their ids across a snapshot straddle
-      (host re-supplies the chunk on restore, like the main `root`). Surfaced by the doc-17
-      H-2 part-3 harness.
 - [ ] **Safepoints in long-running traces** so a hot loop can't block collection.
 - [ ] **Trace-constant rooting + invalidation.** Traces embed object refs
       (constants, shape pointers) → GC roots; collecting a referenced prototype
