@@ -2,7 +2,7 @@
 
 Status: partial — GC v1 (Phase 4) + lane-packed array storage landed; generational upgrade, typed-array payload + buffer lease (Phase 9b), and trace rooting outstanding
 Owner: Bart
-Last updated: 2026-06-16
+Last updated: 2026-07-19 (added §"Chunk-constant rooting — the compile→run window": DESIGN for a `retained_chunks` borrow list + root loop in both `forEachRootHeader` walks, closing the embedding compile-then-defer GC hole surfaced by the doc-17 H-2 part-3 harness. gpt-5.6-sol round-1 = BLOCKER, folded: option A "host re-supplies" restore path (retained chunks are host-authored program image like the main `root`, so `.snapshot` rooting + host re-compile/re-retain preserves constant-id continuity across a snapshot straddle), the borrow lifetime contract (release before `Chunk.deinit`), and the `compileToClosure`/`row_view`/stable-id-test/`append` nits. Pending re-review → land.)
 
 Prerequisite for **Phase 1** (object header + GC-root model), **Phase 3**
 (write-barrier call sites), and **Phase 4** (the collector). Both reviewers
@@ -114,6 +114,14 @@ ownership, write barriers, and trace rooting.
       closures, open upvalues). Still outstanding for the later executors —
       recorder, IR-interpreter, native codegen — where snapshot metadata must
       coordinate with liveness.
+- [ ] **Chunk-constant rooting (compile→run window).** DESIGN written + gpt-5.6-sol
+      round-1 BLOCKER folded (option A, `.snapshot` rooting + host-re-supply restore
+      contract, borrow lifetime contract); pending re-review → land. A `retained_chunks`
+      borrow list on `Vm` + `retainChunk`/`releaseChunk` + a root loop in BOTH walks of
+      `forEachRootHeader`, so a host-compiled-but-not-yet-run chunk's interned constants
+      survive a GC driven by another execution AND keep their ids across a snapshot straddle
+      (host re-supplies the chunk on restore, like the main `root`). Surfaced by the doc-17
+      H-2 part-3 harness.
 - [ ] **Safepoints in long-running traces** so a hot loop can't block collection.
 - [ ] **Trace-constant rooting + invalidation.** Traces embed object refs
       (constants, shape pointers) → GC roots; collecting a referenced prototype
@@ -175,6 +183,205 @@ The zero-copy path hands the host a **lease**, not a pointer:
 - [ ] Generational upgrade: remembered-set representation; nursery design.
 - [ ] Large-object / off-heap space layout for typed-array payloads.
 - [ ] Lease revocation semantics if the host outlives the VM or vice-versa.
+
+## Chunk-constant rooting — the compile→run window (2026-07-19)
+
+**Status: DESIGN — pending `gpt-5.6-sol` review.** Surfaced by the doc-17 H-2 part-3 test
+harness; gpt-5.6-sol confirmed it as a real latent product concern deserving its own fix.
+
+**The hole.** A compiled `compiler.Chunk` owns its proto tree (an arena) and each proto's
+`constants: []const Value`. Heap-valued constants are **interned string literals** — the
+only heap constant kind the compiler emits (`compiler.zig:362`, `internValue`) — and each
+is an ordinary GC object on the sweep list. They are kept alive **only transitively**:
+`blacken` reaches `markProtoConstants` from a live **closure** (`gc.zig:512`), and
+`forEachRootHeader` roots closures only via `frames[0..depth]` + live registers/globals
+(`interp.zig:1638`). A `Chunk` with **no live closure over its tree** therefore has
+**unrooted** constants.
+
+Collection fires at exactly one point — the dispatch-loop safepoint (`interp.zig:1761`,
+gated on `shouldCollect`) — i.e. only **while a VM is executing**, never during
+compilation or inside a straight-line native (allocation merely arms `shouldCollect` for
+the *next* safepoint; it never sweeps in place). So the exposure is precisely:
+
+> a `Chunk` is compiled, then a **different** execution runs (and GCs) before any closure
+> over that chunk's tree exists.
+
+The shipped paths are safe today:
+- **CLI main** (`main.zig`): compiles one chunk, then `vm.run(proto)` creates and pushes
+  the main closure **before the first safepoint** — no GC window.
+- **`load`/`loadfile`/`dofile`**: the native is atomic w.r.t. safepoints (a collection
+  cannot fire mid-native), and it returns a closure that roots the tree; after the guest
+  drops that closure the loaded chunk's constants are swept — *intended*, and
+  mode-consistent post-H-2 (part 1 ensures no trace roots them either).
+
+The **unsafe** path is the **embedding compile-then-defer pattern**: a host compiles
+chunk B, then runs chunk A (which GCs under memory pressure or `gc_stress`), then runs B —
+B's literals are swept before B ever runs, dangling its `load_const`s. This is exactly
+what the H-2 part-3 test harness hit (worked around there by interleaving compile+run per
+epoch, so each chunk's constants are live from the moment they exist).
+
+**The fix (Bart's call — root host-retained chunks in the existing root-walk authority,
+option A "host re-supplies" for the restore path).** Add a VM-side **non-owning** list of
+proto trees the host has asked the VM to keep alive, and root their constants in
+`forEachRootHeader`:
+
+- `Vm.retained_chunks: std.ArrayList(*const bytecode.Proto)` — **borrows only**; the host
+  still owns the `Chunk` and frees it. A `*const Proto` is the minimal handle; the whole
+  tree is reachable from the root via `proto.protos`. Deinited (`retained_chunks.deinit(self.gpa)`,
+  list only, no frees) in `Vm.deinit`.
+- `pub fn retainChunk(self: *Vm, proto: *const bytecode.Proto) !void` —
+  `self.retained_chunks.append(self.gpa, proto)` (pinned-stdlib `ArrayList.append` takes
+  the allocator explicitly). Contract: one `retainChunk` per `releaseChunk`. (A stray
+  double-retain double-roots harmlessly — marking is idempotent — but the balanced
+  contract is what keeps `releaseChunk`'s first-match removal correct.)
+- `pub fn releaseChunk(self: *Vm, proto: *const bytecode.Proto) void` — **`orderedRemove`**
+  the first pointer match (a borrow, so no free), NOT `swapRemove` (gpt-5.6-sol round-3
+  blocker): a swap-remove would reorder the surviving borrows (`release A` from `[A,B,C]`
+  leaves `[C,B]`), and since retained constants are serialized in root-**discovery** order,
+  a reordered survivor list changes snapshot bytes — breaking the same-ordered-retain
+  contract below. `orderedRemove` preserves survivors' relative insertion order.
+  Idempotent-safe: a missing entry is a no-op.
+- In `forEachRootHeader`, in **BOTH** the `.gc` and `.snapshot` walks (see "Restore
+  contract" below), walk each retained proto tree's constants and `cb` the heap ones via a
+  recursive helper:
+  ```zig
+  fn rootProtoConsts(proto: *const bytecode.Proto, ctx: anytype,
+                     comptime cb: fn (@TypeOf(ctx), *object.GcHeader) void) void {
+      // Compiler-produced protos only (retainChunk's contract): the compiler emits
+      // exactly interned-string and scalar constants (compiler.zig:361), never a
+      // `row_view` fat value — so `isHeap → asHeap` is complete here (no `markValue`
+      // row_view-parent special case needed, matching the item-5 trace-const loop).
+      for (proto.constants) |v| if (v.isHeap()) cb(ctx, v.asHeap());
+      for (proto.protos) |child| rootProtoConsts(child, ctx, cb);
+  }
+  ```
+
+**Lifetime contract (gpt-5.6-sol blocker — borrows must not dangle).** `retained_chunks`
+holds raw `*const Proto` borrows into a host-owned `Chunk` arena (`Chunk.deinit` frees that
+arena, `compiler.zig:58`). The root walk dereferences them at every GC safepoint. The
+embedding contract is therefore explicit:
+- the host MUST `releaseChunk(proto)` **before** `Chunk.deinit()`;
+- the whole proto tree + its arena MUST stay alive from a successful `retainChunk` through
+  its `releaseChunk`;
+- no VM execution/collection may run after a retained borrow is invalidated but before its
+  release (which the two rules above already guarantee);
+- VM teardown may discard outstanding borrows only because `Vm.deinit` performs no further
+  root walk. (A debug assert that `retained_chunks` is empty at `deinit` is a reasonable
+  balance-check, but not required for safety.)
+
+**Restore contract — option A ("host re-supplies", like the main `root` chunk).** A
+snapshot is heap + execution state, **not** the program image: `restore(bytes, root,
+natives)` takes the program's root proto from the caller (`keyframeser.zig:501`). Retained
+chunks are **host-authored program image** — the same category as `root`/main — so the
+host re-supplies (re-compiles + re-retains) them on restore, exactly as it re-supplies
+`root`. For their already-consumed constant **ids** to line up across the cut:
+- retained constants are rooted in the **`.snapshot`** walk too, so they serialize *as
+  objects with their ids* (identical to a *reachable* `loaded_chunk`, `keyframeser.zig:541`);
+- on restore the objects are reconstructed with those ids; when the host re-compiles + re-
+  retains the chunk, `internValue` finds the reconstructed object and **reuses it** (no
+  fresh allocation) → the literal keeps its original id → `pairs`/id timeline is identical
+  to the uninterrupted run.
+- **`encodeSnapshot ∘ restore == identity`** holds *given the host re-establishes its
+  program state* — which is already a restore precondition (a bare restore can't even
+  resolve closures without `root`). The host re-retains before any execution or re-encode;
+  restore itself never runs the VM, so the reconstructed constants can't be swept in the
+  gap. This is NOT the trace-const case (item 5, `.gc`-only): trace consts are **mode-
+  dependent** (present under record, absent under `.off`) so serializing them would make
+  snapshot bytes vary by JIT mode; retained-chunk membership is a **host action, mode-
+  invariant**, so rooting it in `.snapshot` is byte-identical across all 10 modes.
+- **Order, not just membership, is the deterministic input (gpt-5.6-sol round-2 blocker).**
+  Snapshot objects serialize in **root-discovery order**, not sorted by id (`Walk.order`,
+  `keyframeser.zig:170`, seeded via `forEachRootHeader(.snapshot, …)`, `:268`). So the host
+  must re-retain the pending chunks in the **same order** it originally retained them —
+  retaining `[X, Y]` before the cut but `[Y, X]` after would reorder their otherwise-
+  unreachable constants and change the snapshot bytes even though the *set* is identical.
+  The contract is: same ordered `retainChunk` sequence across the cut (duplicate
+  multiplicity is irrelevant after the serializer's dedup; order of first-appearance is
+  what matters).
+
+**Scope restriction — the snapshot guarantee is for UNRUN retained chunks only
+(gpt-5.6-sol round-2 blocker).** Option A's cross-cut id continuity holds only for a chunk
+that is **pending/unrun with no guest-reachable closure over its proto tree** — which is
+exactly the compile→run window `retainChunk` exists for (a retained chunk is unrun by
+definition; the instant it runs, a closure roots its constants and the host should
+`releaseChunk`). If a retained host chunk has *already run* and left a live closure in a
+global/table at snapshot time, restore fails **before the host can re-supply the chunk**:
+serialized closures carry only `proto_id` (`keyframeser.zig:149`), and `resolveProto`
+searches **only** the supplied `root` tree + `vm.loaded_chunks` (`keyframeser.zig:429`),
+resolved during pass 1b *before* `restoreSnapshot` returns (`keyframeser.zig:634`). A
+secondary host chunk's proto is in neither set → `error.UnknownProto`. This is a
+**pre-existing** limitation of the resolver (independent of this fix — it already can't
+snapshot a live closure over any non-`root`, non-`loaded` host chunk), and host chunks
+compiled with the default `id_base = 0` (`compiler.zig:61`) also collide proto ids with the
+static tree. **Out of scope here; noted as a follow-up:** supporting snapshots of live
+closures over multiple host-authored program images needs restore to accept a *list* of
+program images (not one `root`) as its resolver set, plus a disjoint proto-id contract for
+host chunks (mirroring `load`'s `id_base = next_proto_id`). Until then, `retainChunk`'s
+snapshot guarantee is documented as unrun-only, and the correct host discipline is: retain
+before first run, `releaseChunk` at/after first run (the closure takes over rooting).
+
+**Why not option B (VM owns + auto-recompiles, the `loaded_chunks` machinery).**
+`loaded_chunks` are serialized+recompiled *because the host cannot re-supply guest-authored
+`load` code*. Host-retained chunks are host-authored, so that reason doesn't apply —
+option B would duplicate the load/L-2 subsystem (schema list, recompile path, proto-id
+disjointness, ownership transfer) to buy a capability the host already has. A is the
+architecturally consistent choice.
+
+**Determinism.** `retained_chunks` membership is a **host action**, identical across all
+10 JIT modes and independent of GC timing → rooting the set (in both walks) is
+mode-invariant. No new nondeterministic input is introduced; the root steers only object
+liveness, never a `Value` a program computes on.
+
+**Considered and excluded — rooting `loaded_chunks`.** `load`ed chunks need no rooting:
+`compileToClosure` performs no VM re-entry or safepoint (collection can only fire at the
+dispatch-loop safepoint, never mid-native — note this is narrower than "a native is
+atomic": `pcall`/comparators DO re-enter dispatch via `callValue`, but `load`'s compile
+path does not), and the returned closure roots the tree; after the closure drops we *want*
+them swept (mode-consistent, and recompiled deterministically on restore). Rooting
+`loaded_chunks` would resurrect intentionally-dead dropped-`load`-chunk literals and hold
+them until VM deinit — a memory-retention change with no correctness upside.
+
+**`run`/`start` need no auto-register.** The main-chunk window is closed by construction
+(the closure is pushed before the first safepoint), so `retainChunk` is purely opt-in for
+the compile-then-defer host pattern.
+
+**Tests.**
+1. **Embedding compile-then-defer survives GC (the regression).** On one VM, `gc_stress`
+   on: compile chunk B (whose distinctive string literal is used *inside* it as a
+   `load_const`), `retainChunk(B.proto)`, run chunk A (allocates → forces sweeps), then run
+   B and assert its output byte-identical to a no-stress reference run. Negative control:
+   with `retainChunk` skipped (or the new root removed) B's `load_const` dangles → the
+   test reddens.
+2. **Snapshot straddle preserves constant ids AND root order (the option-A guarantee).**
+   Following the H-2-part-3 construction (stable ids via `pairs` order, **not** a
+   dangling-memory probe). Use **three** pending chunks so ordering — and specifically
+   `orderedRemove` vs `swapRemove` — is actually exercised (gpt-5.6-sol rounds 3–4; with
+   only two chunks, releasing the first leaves a single-element list identical under both
+   removals). Compile X, Y, Z, each with a distinct otherwise-unreachable literal, and
+   `retainChunk` them in order (compile precedes retain); snapshot; restore into a fresh VM
+   (re-supplying `root`), re-compile X/Y/Z and re-retain **in the same order**, and
+   **re-encode + assert byte equality with the original snapshot**. Sub-assertions:
+   (a) reversed re-retain order (`[Z, Y, X]`) produces *different* bytes (order is the
+   deterministic input); (b) `releaseChunk(X)` from `[X, Y, Z]` must leave `[Y, Z]` (ordered)
+   — a `swapRemove` would leave `[Z, Y]`, changing root-discovery order and thus the
+   re-encoded bytes; (c) a downstream `pairs`-order check over a literal + a later-interned
+   marker matches the uninterrupted run (id continuity). Negative controls: `.gc`-only
+   rooting reddens (c); `swapRemove` in `releaseChunk` reddens (b)'s byte assertion.
+3. **`releaseChunk` unroots.** After `releaseChunk`, the chunk's now-unrooted constants
+   are swept by the next stress GC (the retain is not sticky).
+4. **10-mode determinism** over a program that retains + runs a deferred chunk — output
+   byte-identical across all modes (mode-invariance of the new root in both walks).
+
+**Sequence:** design (this) → `gpt-5.6-sol` review (round 1 = BLOCKER, folded: option-A
+`.snapshot` rooting + host-re-supply restore contract, the borrow lifetime contract, the
+`compileToClosure`/`row_view`/stable-id-test/`append` nits; round 2 = BLOCKER, folded:
+same-ordered re-retain across the cut + re-encode/byte-identity in test 2, and the
+unrun-only snapshot scope restriction with the pre-existing multi-host-chunk resolver
+limitation noted as a follow-up; round 3 = BLOCKER, folded: `releaseChunk` uses
+`orderedRemove` not `swapRemove` (survivor-order preservation); round 4 = BLOCKER, folded:
+test 2 uses **three** pending chunks so `orderedRemove` vs `swapRemove` is distinguishable
+(two collapse to one survivor); round 5 = **APPROVE**) → land behind `just test` (default +
+`-Djit-debug`).
 
 ## References
 
