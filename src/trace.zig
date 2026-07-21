@@ -591,6 +591,13 @@ fn exitProvEntryLess(_: void, a: ExitProvEntry, b: ExitProvEntry) bool {
 /// until A-iv threads it per-site — §A8-ii).
 pub const ExitKey = struct { trace_id: u32, exit_instr: u32 };
 
+/// A recorded guest program-point `{proto_id, source_pc}` (doc 17 §A3.5 / §A8-ii,
+/// A-ii.3). `Trace.rec_path` is the ordered sequence captured one-per-`recordInstr`;
+/// A-ii.4 unions member traces' paths into each `RegionDef`'s membership set. Keyed
+/// by `proto.id` (guest-logical), `source_pc = recording pc − 1` (post-increment,
+/// matching `guardSourcePc` / the A-i `cur_pc −| 1` discipline).
+pub const ProgramPoint = struct { proto_id: u32, source_pc: u32 };
+
 /// The persistent, guest-logical identity of a structural trace-graph edge (doc 17
 /// §A3.3 / §A8-ii, A-ii.2): a source anchor `{proto_id, pc}`, the exit's
 /// `ExitProvenance` (A-i), and the successor anchor `{proto_id, pc}`. Keyed by
@@ -1016,6 +1023,11 @@ pub const Trace = struct {
     /// JIT-tiering metadata, never serialized, never a `.snapshot` root. Read by the
     /// Part-A region classifier via `provAt`; freed in `destroy`.
     exit_prov: []ExitProvEntry = &.{},
+    /// Ordered recorded guest program-points (doc 17 §A8-ii, A-ii.3), dup'd from the
+    /// recorder at commit; the membership-set basis A-ii.4 unions per region. Empty
+    /// when membership was *unavailable* (a recorder-path OOM flipped `rec_path_ok`)
+    /// or for hand-built test traces. Owned; freed in `destroy`. Not serialized.
+    rec_path: []ProgramPoint = &.{},
 
     /// The exit provenance at committed instruction index `idx`, or `null` if that
     /// instruction is not a tracked exit. Binary search over the sorted table.
@@ -1040,6 +1052,7 @@ pub const Trace = struct {
         gpa.free(self.entry_guards);
         if (self.inputs.len != 0) gpa.free(self.inputs);
         if (self.exit_prov.len != 0) gpa.free(self.exit_prov);
+        if (self.rec_path.len != 0) gpa.free(self.rec_path); // A-ii.3
         gpa.destroy(self);
     }
 
@@ -4366,6 +4379,15 @@ pub const TraceState = struct {
         const exit_prov_owned = try buildExitProv(self.gpa, self.rec.exit_prov.items, fields.old_to_new, link_term);
         errdefer if (exit_prov_owned.len != 0) self.gpa.free(exit_prov_owned);
 
+        // A-ii.3: dup the recorder's ordered program-point path into the committed
+        // trace (empty if membership was unavailable — a recorder-path OOM). Owned;
+        // freed in `destroy`.
+        const rec_path_owned: []ProgramPoint = if (self.rec.rec_path_ok and self.rec.rec_path.items.len != 0)
+            try self.gpa.dupe(ProgramPoint, self.rec.rec_path.items)
+        else
+            &.{};
+        errdefer if (rec_path_owned.len != 0) self.gpa.free(rec_path_owned);
+
         // S3 (cross-frame tracing): pin the verifier's register-window bound to the
         // executor's *real* window (`anchor_num_registers`), not the grown
         // `reg_map.len` (which includes the callee scratch tail). A `slot_load`/`phi`
@@ -4436,6 +4458,7 @@ pub const TraceState = struct {
             .entry_guards = guards_owned,
             .inputs = inputs_owned,
             .exit_prov = exit_prov_owned,
+            .rec_path = rec_path_owned,
         };
         try self.cache.append(self.gpa, t);
         // Coverage (gated): a trace now exists at this anchor, so subsequent
@@ -4553,6 +4576,14 @@ pub const TraceState = struct {
         self.rec.cur_pc = pc;
         self.rec.cur_op = instr.op;
         self.rec.cur_proto_id = proto.id; // leaf proto for GuardProvenance (A-i.3)
+        // A-ii.3: capture the recorded program-point for region membership. Fail-soft
+        // — an OOM here marks membership unavailable and continues; it must NEVER
+        // abort the trace (that would change trace selection → non-byte-identical).
+        if (self.rec.rec_path_ok) {
+            self.rec.rec_path.append(self.gpa, .{ .proto_id = proto.id, .source_pc = pc -| 1 }) catch {
+                self.rec.rec_path_ok = false;
+            };
+        }
         self.recordOne(instr, regs, proto, pc, resolved) catch self.abort(.alloc);
     }
 
@@ -6043,6 +6074,14 @@ pub const Recorder = struct {
     /// map into the committed, compact `Trace.exit_prov`. Recorder scratch —
     /// cleared/retained like `instrs`.
     exit_prov: std.ArrayListUnmanaged(?ExitProvenance) = .empty,
+    /// Ordered recorded guest program-points (doc 17 §A8-ii, A-ii.3): one
+    /// `{proto_id, source_pc}` per `recordInstr`, the membership-set basis A-ii.4
+    /// unions per region. Recorder scratch — dup'd into `Trace.rec_path` at commit,
+    /// cleared/retained like `instrs`. **Fail-soft:** if an append OOMs, `rec_path_ok`
+    /// flips false and the recording continues (membership becomes *unavailable* for
+    /// this trace, `Trace.rec_path` commits empty) — it must NEVER abort the trace.
+    rec_path: std.ArrayListUnmanaged(ProgramPoint) = .empty,
+    rec_path_ok: bool = true,
     /// Refs already covered by a type guard, so we emit each at most once.
     guarded_refs: std.AutoHashMapUnmanaged(Ref, void) = .empty,
     /// Interns constants: a recurring literal reuses its `konst` instruction's
@@ -6184,6 +6223,7 @@ pub const Recorder = struct {
         self.consts.deinit(gpa);
         self.entry_slots.deinit(gpa);
         self.exit_prov.deinit(gpa);
+        self.rec_path.deinit(gpa);
         self.guarded_refs.deinit(gpa);
         self.konst_map.deinit(gpa);
         if (self.reg_map.len != 0) gpa.free(self.reg_map);
@@ -6197,6 +6237,8 @@ pub const Recorder = struct {
         self.consts.clearRetainingCapacity();
         self.entry_slots.clearRetainingCapacity();
         self.exit_prov.clearRetainingCapacity();
+        self.rec_path.clearRetainingCapacity();
+        self.rec_path_ok = true;
         self.guarded_refs.clearRetainingCapacity();
         self.konst_map.clearRetainingCapacity();
         self.input_seeds.clearRetainingCapacity();
@@ -8689,4 +8731,64 @@ test "A-ii.2 canonicalEql/order: field-wise, ignores the dead path tail and the 
     try testing.expect(ea.order(el) == .lt);
     try testing.expect(el.order(ea) == .gt);
     try testing.expect(!ea.eql(el));
+}
+
+test "A-ii.3 rec_path: recordInstr captures {proto_id, pc−1}; reset clears (re-record stable)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = 42, .name = "t", .num_registers = 2 };
+    var regs = [_]Value{ Value.int(0), Value.int(0) };
+
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    // Two safe guest ops (load_int: define a reg from an immediate, no guard, no abort)
+    // recorded at post-increment pcs 3 and 4 → source_pc 2 and 3.
+    state.recordInstr(Instr.opAx(.load_int, 0, 1), winRO(&regs), &proto, 3, Value.nil());
+    state.recordInstr(Instr.opAx(.load_int, 1, 2), winRO(&regs), &proto, 4, Value.nil());
+    try testing.expect(state.rec.rec_path_ok);
+    try testing.expectEqual(@as(usize, 2), state.rec.rec_path.items.len);
+    try testing.expectEqual(ProgramPoint{ .proto_id = 42, .source_pc = 2 }, state.rec.rec_path.items[0]);
+    try testing.expectEqual(ProgramPoint{ .proto_id = 42, .source_pc = 3 }, state.rec.rec_path.items[1]);
+
+    // Re-record stability: a fresh reset clears the path and re-arms availability.
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    try testing.expectEqual(@as(usize, 0), state.rec.rec_path.items.len);
+    try testing.expect(state.rec.rec_path_ok);
+}
+
+test "A-ii.3 rec_path: a committed trace carries its recorded path (freed on destroy)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    var committed: ?*Trace = null;
+    defer state.deinit();
+    defer {
+        if (committed) |ct| ct.destroy(gpa);
+        state.cache.clearRetainingCapacity();
+    }
+
+    // Same recForPrepLink→commit harness as the A-i.4 test: a continuation that
+    // re-reaches an inner `for_prep` commits a `.link` trace. Its rec_path captures
+    // the single recorded for_prep at source_pc 4 (post-increment pc 5 − 1).
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.load_nil);
+    code[7] = Instr.opJ(.for_loop, -3);
+    const proto = Proto{ .code = &code, .id = 9, .name = "t", .num_registers = 4 };
+    const inner_instrs = [_]IrInstr{.{ .op = .loop }};
+    var inner: Trace = .{ .id = 900, .anchor = .{ .proto = &proto, .pc = 5 }, .instrs = @constCast(&inner_instrs), .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try state.cache.append(gpa, &inner);
+
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 2 }, proto.num_registers);
+    state.rec.kind = .continuation;
+    var regs = [_]Value{ Value.int(1), Value.int(10), Value.int(1), Value.nil() };
+    state.recordInstr(Instr.opAx(.for_prep, 0, 2), winRO(&regs), &proto, 5, Value.nil());
+
+    try testing.expect(!state.isRecording());
+    const t = state.cache.items[state.cache.items.len - 1];
+    committed = t;
+    try testing.expect(t.id != 900);
+    try testing.expectEqual(@as(usize, 1), t.rec_path.len);
+    try testing.expectEqual(ProgramPoint{ .proto_id = 9, .source_pc = 4 }, t.rec_path[0]);
 }

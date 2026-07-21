@@ -287,9 +287,14 @@ land; move whole sections to Done once everything inside is checked.
     `countTracesAt>0`; succ proto = `t.anchor.proto` (same-proto, cross-proto deferred). Anchor-keyed graph,
     NOT `findTrace`-selected identity. Read by nothing. Tests: 2-anchor cont↔inner cycle; retire empties;
     `eql`/`order` field-wise.
-  - [ ] **A-ii.3 — recorded `{proto_id, source_pc}` membership substrate (inert).** Capture the per-trace
-    ordered recorded program-point path (transient per-trace metadata) via a `recordInstr` hook; freed on
-    retire/flush. Read by nothing.
+  - [x] **A-ii.3 — recorded `{proto_id, source_pc}` membership substrate (inert). LANDED 2026-07-21.**
+    `just test` green (default + `-Djit-debug`); nsieve/nbody/mandelbrot tier-0 ≡ native. `ProgramPoint
+    {proto_id, source_pc}`; `Recorder.rec_path` + `rec_path_ok` accumulate one `{proto.id, pc −| 1}` per
+    `recordInstr` (fail-soft: an append OOM flips `rec_path_ok` false and continues — NEVER aborts the
+    trace). Dup'd into owned `Trace.rec_path` at commit (empty when unavailable), freed in `Trace.destroy`,
+    cleared/re-armed in `Recorder.reset`, freed in `Recorder.deinit`. Read by nothing. Tests: recorder-level
+    `{proto_id, pc−1}` capture + reset re-record stability; committed-trace `rec_path` via the recForPrepLink
+    harness (freed on destroy, leak-checked).
   - [ ] **A-ii.4 — `region_defs` discovery + `RegionId` interning + classification indices +
     `classifyExit` (inert).** Tarjan-SCC region discovery over the structural edges; `region_intern`
     (hash-bucketed, full-sorted-set equality); `region_defs` (Proto/VM-lifetime, never
