@@ -255,7 +255,12 @@ land; move whole sections to Done once everything inside is checked.
     `.link` index, `source_pc = 4`, `inline_depth = 0`).
   **A-i COMPLETE (all four sub-steps landed 2026-07-21).** The GuardProvenance substrate is fully in the
   tree and inert — populated at every guard + fused producer-exit + `.link` terminal, unread until the
-  Part-A region classifier (A-ii) consumes it. Next: A-ii per §A8.
+  Part-A region classifier (A-ii) consumes it. **Post-landing `gpt-5.6-sol` implementation review = clean
+  mechanics (lockstep storage, `tropt` remap, `.link` index+lifecycle, `cur_pc −| 1`, ownership all sound),
+  2 inert provenance-data defects folded:** (1) `recBranch` polarity was keyed on raw truthiness (backwards
+  for `jmp_if_false`, which jumps when falsy) → now keyed on the opcode's jump-taken edge; (2)
+  `recInputGet`'s `guard_func` operand `none` → `.a` (the `dest` register per H-1c). Both would have
+  mis-keyed A-ii; neither altered behaviour (byte-identity held before and after). Next: A-ii per §A8.
 - [ ] **Deferred to Increment-3 machinery.** F2c native-cut harness (H-4 cut) + region-map cap
   contract (H-3 cap) land WITH `region_profit`/native-F2c, not in round 9.
 **Increment 2.3b — arm `.link`-terminal handoffs (ACTIVE; re-scoped after the
