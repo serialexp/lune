@@ -474,6 +474,152 @@ pub fn guardSourcePc(ins: IrInstr) ?u32 {
     return if (exit_pc == 0) null else exit_pc - 1;
 }
 
+// ---------------------------------------------------------------------------
+// GuardProvenance (doc 17, §A4 / landing step A-i / 9-B)
+//
+// The guest-logical identity of a trace exit, stamped at emission and remapped
+// through `tropt` to committed-instruction indices. The Part-A region-accounting
+// classifier keys on this, NOT on IR position: recording is guest-value-dependent
+// (`guardNum` picks int/float by observed value, `recBranch` picks true/false by
+// taken path, the realized guard subset varies by heap shape, LICM/CSE shift
+// positions) and `guardExitPc` cannot even supply a PC for array/table/grid
+// guards. See the H-1c grounding for the closed role/operand vocabulary and why
+// `occurrence` was dropped (the physical exit → provenance map is many-to-one).
+// This is transient JIT-tiering metadata: a side table, never an `IrInstr` field
+// (which would bump the wire schema, `traceser.zig`), never a `.snapshot` root.
+// ---------------------------------------------------------------------------
+
+/// One inlined call edge in a guard's inline-path prefix (H-1a). `path` is an
+/// ordered *sequence* (recursion to `MAX_INLINE_DEPTH` is reachable), so the two
+/// guards from `f(a); f(b)` inlined at distinct call sites get distinct identity.
+pub const CallEdge = struct { caller_proto_id: u32, call_pc: u32 };
+
+/// Which of a branch guard's two out-edges the recording committed to. A *static*
+/// property of the recorded trace (not an observed value): `recBranch` emits
+/// `guard_true`/`guard_false` by the taken path, and those are opposite CFG edges
+/// of the region (nsieve's edge 1 = `skip.guard_false`, edge 4 = `cont.guard_true`
+/// fail). `.neutral` for every non-branch guard. (Round-1 review, BLOCKER 1.)
+pub const Polarity = enum(u8) { neutral, taken, fallthrough };
+
+/// Closed structural vocabulary of guard *roles* (H-1c). NOT the IR op enum — the
+/// op is a runtime *view* of the same site (`guard_int`/`guard_float` are both
+/// `operand_type`; `guard_true`/`guard_false` are both `branch_cond`). A recording
+/// realizes a runtime-selected *subset* of an opcode's static slot list, but each
+/// realized role is stable across re-recording of the same-shaped trace.
+pub const GuardRole = enum(u8) {
+    operand_type, // arith/compare/eq/bitwise/neg/bnot operand; numeric-for control reg
+    branch_cond, // jmp_if_true/false condition
+    limit_int, // for_loop/for_prep float-limit → int specialization (int_of_float)
+    loop_done, // for_loop / for_prep-first-iter continuation test (guard_true)
+    container_type, // get/set_index container tag (guard_table)
+    container_lane, // array element-lane (guard_lane)
+    key_type, // array/grid index type (guard_int on the key)
+    bounds, // array/grid bounds check (guard_bounds)
+    present, // array/grid presence (guard_present / guard_gpresent)
+    element_type, // .value-lane loaded element (fused: guard_table on the load)
+    append_precond, // array append precondition (guard_append)
+    value_fits, // narrow-lane store fits (guard_fits)
+    hash_struct, // const-key hash table structure (guard_hash)
+    value_type, // hash store value / hload'd field type
+    field_type, // fused native hload producer-exit
+    grid_shape, // grid table shape (guard_grid)
+    grid_stride, // grid stride (guard_stride)
+    row_type, // grid row index type
+    col_type, // grid column index type / column resolution (guard_gcol)
+    callee_identity, // closure identity (call / get_upval / get_global — guard_func)
+    callee_pure, // pure-builtin identity (guard_pure)
+};
+
+/// Static register designator for the guarded operand (H-1c). Covers `a`/`b`/`c`,
+/// the derived numeric-for control offsets `a+1`/`a+2`, register-valued `aux`
+/// (grid col/value), the loaded value of a fused producer-exit, and `none` for
+/// guards with no register operand (bounds/present/loop_done). Re-recording-stable:
+/// it tracks the *source* register, not the normalized IR operand (the `recCompare`
+/// gt/ge swap happens after emission, so `operand` still names the source reg).
+pub const OperandDesig = enum(u8) { none, a, b, c, a1, a2, aux, loaded };
+
+/// The guest-static identity of a materialized guard exit (H-1c: `occurrence`
+/// dropped — unrolled physical copies deliberately share one tag, which is correct
+/// for the consumer: every copy is the same guest check, exits to the same guest PC).
+/// `path[0..inline_depth]` is the inline call-edge prefix; the leaf is
+/// `{source_proto_id, source_pc}` (`source_pc = cur_pc − 1`).
+pub const GuardProvenance = struct {
+    path: [MAX_INLINE_DEPTH]CallEdge = undefined,
+    inline_depth: u8 = 0,
+    source_proto_id: u32,
+    source_pc: u32,
+    role: GuardRole,
+    operand: OperandDesig,
+    polarity: Polarity = .neutral,
+};
+
+/// The inline-path leaf of a `.link` terminal (edge 2). Same shape as a guard's
+/// path prefix + leaf, minus role/operand/polarity — a `.link` is not a guard.
+pub const LinkTerminalProvenance = struct {
+    path: [MAX_INLINE_DEPTH]CallEdge = undefined,
+    inline_depth: u8 = 0,
+    source_proto_id: u32,
+    source_pc: u32,
+};
+
+/// Provenance of a trace exit. Most exits are guards; edge 2 exits through a
+/// `.link` terminal (not a guard — synthesized at commit from `recForPrepLink`,
+/// `trace.zig` §3.3, round-6/7), so that variant carries only the path + leaf.
+pub const ExitProvenance = union(enum) {
+    guard: GuardProvenance,
+    link_terminal: LinkTerminalProvenance,
+};
+
+/// A committed-trace exit-provenance entry: the *committed* instruction index the
+/// exit is at, plus its provenance. `Trace.exit_prov` is a slice of these sorted
+/// by `index` (alloc-once at commit; guards are a minority of instrs), queried via
+/// `Trace.provAt`. Built by remapping the recorder's dense lockstep table through
+/// `tropt`'s compaction map (A-i.1).
+pub const ExitProvEntry = struct { index: u32, prov: ExitProvenance };
+
+fn exitProvEntryLess(_: void, a: ExitProvEntry, b: ExitProvEntry) bool {
+    return a.index < b.index;
+}
+
+/// Remap the recorder's dense, emission-indexed exit-provenance table (A-i.1) into
+/// the committed trace's compact, sorted `[]ExitProvEntry`, keyed by committed
+/// instruction index. `old_to_new` is `tropt`'s compaction map (emission index →
+/// committed index, `null` for a dropped instr); pass `null` for the identity map
+/// (the `dupe` path — link + unoptimized traces preserve indices 1:1). Only
+/// non-`null` provenance whose instruction survived compaction is carried over
+/// (the many-to-one dedup already happened at stamp time). Returns a static empty
+/// slice when there is nothing to carry (no alloc). Caller owns the result.
+pub fn buildExitProv(
+    gpa: std.mem.Allocator,
+    rec_exit_prov: []const ?ExitProvenance,
+    old_to_new: ?[]const ?Ref,
+) ![]ExitProvEntry {
+    if (old_to_new) |m| std.debug.assert(m.len >= rec_exit_prov.len);
+    var count: usize = 0;
+    for (rec_exit_prov, 0..) |p, i| {
+        if (p == null) continue;
+        const survived = if (old_to_new) |m| m[i] != null else true;
+        if (survived) count += 1;
+    }
+    if (count == 0) return &.{};
+    const out = try gpa.alloc(ExitProvEntry, count);
+    errdefer gpa.free(out);
+    var k: usize = 0;
+    for (rec_exit_prov, 0..) |p, i| {
+        const prov = p orelse continue;
+        const committed: u32 = if (old_to_new) |m| (m[i] orelse continue) else @intCast(i);
+        out[k] = .{ .index = committed, .prov = prov };
+        k += 1;
+    }
+    std.debug.assert(k == count);
+    // Committed indices are already ascending for guards/fused producers (neither is
+    // hoisted into the preheader, so compaction preserves their relative order), but
+    // sort defensively so `Trace.provAt`'s binary search is correct regardless of any
+    // future LICM change.
+    std.mem.sort(ExitProvEntry, out, {}, exitProvEntryLess);
+    return out;
+}
+
 /// Whether IR instruction `idx` of `t` is a numeric-for loop-done guard: a
 /// `guard_true` whose deopt PC lands immediately after a `for_loop` bytecode op.
 /// Mirrors nativegen's `isNumericForLoopDoneGuard`, kept here so the arming side can
@@ -676,6 +822,28 @@ pub const Trace = struct {
     /// priority that does not thrash on alternating types.
     hit_count: u64 = 0,
 
+    /// Exit provenance (doc 17, A-i / 9-B): the guest-logical identity of each
+    /// side-exit / `.link` terminal, keyed by *committed* instruction index, sorted
+    /// by index (alloc-once at commit — guards are a minority of instrs). Empty for
+    /// hand-built test traces and until A-i.3 stamps sites. Runtime-only — transient
+    /// JIT-tiering metadata, never serialized, never a `.snapshot` root. Read by the
+    /// Part-A region classifier via `provAt`; freed in `destroy`.
+    exit_prov: []ExitProvEntry = &.{},
+
+    /// The exit provenance at committed instruction index `idx`, or `null` if that
+    /// instruction is not a tracked exit. Binary search over the sorted table.
+    pub fn provAt(self: *const Trace, idx: u32) ?ExitProvenance {
+        var lo: usize = 0;
+        var hi: usize = self.exit_prov.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const e = self.exit_prov[mid];
+            if (e.index == idx) return e.prov;
+            if (e.index < idx) lo = mid + 1 else hi = mid;
+        }
+        return null;
+    }
+
     /// Free a heap-allocated trace and its arrays.
     pub fn destroy(self: *Trace, gpa: std.mem.Allocator) void {
         self.native.deinit();
@@ -684,6 +852,7 @@ pub const Trace = struct {
         gpa.free(self.entry_slots);
         gpa.free(self.entry_guards);
         if (self.inputs.len != 0) gpa.free(self.inputs);
+        if (self.exit_prov.len != 0) gpa.free(self.exit_prov);
         gpa.destroy(self);
     }
 
@@ -3867,6 +4036,15 @@ pub const TraceState = struct {
             self.gpa.free(fields.consts);
             self.gpa.free(fields.entry_slots);
         }
+        // The `tropt` compaction map is transient — used only to remap the exit
+        // provenance below, never stored in the `Trace`. Free it on every exit path.
+        defer fields.freeMap(self.gpa);
+
+        // Remap the recorder's emission-indexed exit provenance (A-i.1) into the
+        // committed, compact `Trace.exit_prov`, keyed by committed instr index. The
+        // `dupe` path (link + unoptimized traces) hands back a null map ⇒ identity.
+        const exit_prov_owned = try buildExitProv(self.gpa, self.rec.exit_prov.items, fields.old_to_new);
+        errdefer if (exit_prov_owned.len != 0) self.gpa.free(exit_prov_owned);
 
         // S3 (cross-frame tracing): pin the verifier's register-window bound to the
         // executor's *real* window (`anchor_num_registers`), not the grown
@@ -3937,6 +4115,7 @@ pub const TraceState = struct {
             .entry_slots = fields.entry_slots,
             .entry_guards = guards_owned,
             .inputs = inputs_owned,
+            .exit_prov = exit_prov_owned,
         };
         try self.cache.append(self.gpa, t);
         // Coverage (gated): a trace now exists at this anchor, so subsequent
@@ -4188,6 +4367,13 @@ pub const TraceState = struct {
         }
         const ref: Ref = @intCast(self.rec.instrs.items.len);
         try self.rec.instrs.append(self.gpa, ins_mut);
+        // Grow the exit-provenance table in lockstep (A-i.1): one `null` per append,
+        // so `exit_prov.items[ref]` is always addressable. Guard / fused-producer
+        // sites overwrite their slot via `stampProv` (A-i.3); everything else stays
+        // `null`. If this append OOMs, `emit` returns the error → the recording
+        // aborts → `reset` clears both lists back to equal length, so a transient
+        // length skew never outlives the failed recording.
+        try self.rec.exit_prov.append(self.gpa, null);
         return ref;
     }
 
@@ -5423,6 +5609,19 @@ pub const Recorder = struct {
     instrs: std.ArrayListUnmanaged(IrInstr) = .empty,
     consts: std.ArrayListUnmanaged(Value) = .empty,
     entry_slots: std.ArrayListUnmanaged(u16) = .empty,
+    /// Exit provenance (doc 17, A-i / 9-B), grown in **lockstep with every `emit`**:
+    /// `emit` appends one `null` per IR append, and guard / fused-producer sites
+    /// overwrite their slot via `stampProv` (A-i.3). So `exit_prov.items[ref]` is the
+    /// provenance (if any) of the instruction at emission index `ref`, for every
+    /// `emit`-appended instr. The φ writeback block and the `.link`/`.loop` terminal
+    /// are appended to `instrs` *directly at commit* (after recording), NOT via
+    /// `emit`, so they have no lockstep slot — the array covers exactly the
+    /// `emit`-appended prefix, which is where all guards and fused producers live.
+    /// The `.link` terminal's provenance rides `pending_link_provenance` instead
+    /// (A-i.4). At commit the whole table is remapped through `tropt`'s compaction
+    /// map into the committed, compact `Trace.exit_prov`. Recorder scratch —
+    /// cleared/retained like `instrs`.
+    exit_prov: std.ArrayListUnmanaged(?ExitProvenance) = .empty,
     /// Refs already covered by a type guard, so we emit each at most once.
     guarded_refs: std.AutoHashMapUnmanaged(Ref, void) = .empty,
     /// Interns constants: a recurring literal reuses its `konst` instruction's
@@ -5452,6 +5651,13 @@ pub const Recorder = struct {
     /// unoptimized (link traces skip `tropt`). `null` for every ordinary
     /// root/continuation trace (closes with `.loop`). Reset to `null` by `reset`.
     link_target: ?u32 = null,
+    /// Transport for the `.link` terminal's exit provenance (doc 17, A-i.4 / edge 2):
+    /// the `.link` op is synthesized at COMMIT (not at `recForPrepLink`, and link
+    /// traces bypass `tropt.optimize`), so `recForPrepLink` stashes the terminal's
+    /// `.link_terminal` provenance here and `commit` consumes it when it appends the
+    /// `.link`. Release invariant: `link_target != null ⇔ pending_link_provenance !=
+    /// null`. Reset to `null` by `reset` (every abort/re-arm) alongside `link_target`.
+    pending_link_provenance: ?ExitProvenance = null,
     /// Nested-loop trace linking (doc 15, Phase 2): true iff this recording is a
     /// *continuation* — armed at a non-header exit pc by `maybeStartContinuation`,
     /// recording the outer body after an inner loop's loop-done exit. Only a
@@ -5549,6 +5755,7 @@ pub const Recorder = struct {
         self.instrs.deinit(gpa);
         self.consts.deinit(gpa);
         self.entry_slots.deinit(gpa);
+        self.exit_prov.deinit(gpa);
         self.guarded_refs.deinit(gpa);
         self.konst_map.deinit(gpa);
         if (self.reg_map.len != 0) gpa.free(self.reg_map);
@@ -5561,6 +5768,7 @@ pub const Recorder = struct {
         self.instrs.clearRetainingCapacity();
         self.consts.clearRetainingCapacity();
         self.entry_slots.clearRetainingCapacity();
+        self.exit_prov.clearRetainingCapacity();
         self.guarded_refs.clearRetainingCapacity();
         self.konst_map.clearRetainingCapacity();
         self.input_seeds.clearRetainingCapacity();
@@ -5580,6 +5788,7 @@ pub const Recorder = struct {
         self.abort_reason = null;
         self.locals_watermark = std.math.maxInt(u32);
         self.link_target = null;
+        self.pending_link_provenance = null;
         self.kind = .root;
         self.pending_store_count = 0;
         self.anchor_num_registers = num_registers;
@@ -7735,4 +7944,50 @@ test "matchesFingerprint: guard_table" {
     const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = @constCast(&entry_guards) };
     try testing.expect(!t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.int(1)}))));
     try testing.expect(!t.matchesFingerprint(winRO(@constCast(&[_]Value{Value.float(1.0)}))));
+}
+
+fn testGuardProv(pc: u32, role: GuardRole, operand: OperandDesig) ExitProvenance {
+    return .{ .guard = .{ .source_proto_id = 7, .source_pc = pc, .role = role, .operand = operand } };
+}
+
+test "buildExitProv: remap through a compaction map, drop non-survivors, sort (A-i.1)" {
+    const gpa = testing.allocator;
+    const a = testGuardProv(10, .operand_type, .b);
+    const b = testGuardProv(20, .branch_cond, .a);
+    // %0 no prov; %1 = A → committed 1; %2 = B → DROPPED (map null); %3 no prov.
+    const rec = [_]?ExitProvenance{ null, a, b, null };
+    const map = [_]?Ref{ 0, 1, null, 2 };
+    const out = try buildExitProv(gpa, &rec, &map);
+    defer if (out.len != 0) gpa.free(out);
+    try testing.expectEqual(@as(usize, 1), out.len);
+    try testing.expectEqual(@as(u32, 1), out[0].index);
+    try testing.expectEqual(@as(u32, 10), out[0].prov.guard.source_pc);
+}
+
+test "buildExitProv: null map is the identity (dupe path), result stays sorted (A-i.1)" {
+    const gpa = testing.allocator;
+    const a = testGuardProv(10, .operand_type, .b);
+    const b = testGuardProv(20, .branch_cond, .a);
+    const rec = [_]?ExitProvenance{ null, a, null, b }; // committed == emission (identity)
+    const out = try buildExitProv(gpa, &rec, null);
+    defer if (out.len != 0) gpa.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqual(@as(u32, 1), out[0].index);
+    try testing.expectEqual(@as(u32, 3), out[1].index);
+    // Sorted ascending → binary search via provAt works.
+    const t = Trace{ .anchor = undefined, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = @constCast(out) };
+    try testing.expect(t.provAt(0) == null);
+    try testing.expectEqual(@as(u32, 10), t.provAt(1).?.guard.source_pc);
+    try testing.expect(t.provAt(2) == null);
+    try testing.expectEqual(@as(u32, 20), t.provAt(3).?.guard.source_pc);
+    try testing.expect(t.provAt(4) == null);
+}
+
+test "buildExitProv: empty when nothing survives → static slice, no alloc (A-i.1)" {
+    const gpa = testing.allocator;
+    const a = testGuardProv(10, .operand_type, .b);
+    const rec = [_]?ExitProvenance{ null, a, null };
+    const map = [_]?Ref{ 0, null, 1 }; // the only prov is dropped
+    const out = try buildExitProv(gpa, &rec, &map);
+    try testing.expectEqual(@as(usize, 0), out.len); // static empty; no free needed
 }

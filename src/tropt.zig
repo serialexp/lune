@@ -59,6 +59,20 @@ pub const Optimized = struct {
     instrs: []IrInstr,
     consts: []Value,
     entry_slots: []u16,
+    /// Compaction map from *emission* instruction index → *committed* index, for
+    /// remapping the recorder's dense exit-provenance side table at commit (doc 17,
+    /// A-i.1). `optimize` fills it: `new_index[i]` for each emitted survivor, `null`
+    /// for any instr dropped by DCE / guard-dedup / const-fold / CSE-merge. `dupe`
+    /// (link + unoptimized traces) leaves it `null`, which `commit` reads as the
+    /// identity map (indices preserved 1:1). Owned by the caller (`commit`), which
+    /// frees it via `freeMap` after remapping — it is never stored in the `Trace`.
+    old_to_new: ?[]?Ref = null,
+
+    /// Free the transient compaction map, if any. Idempotent-safe on the `dupe`
+    /// (null) case.
+    pub fn freeMap(self: Optimized, gpa: std.mem.Allocator) void {
+        if (self.old_to_new) |m| gpa.free(m);
+    }
 };
 
 const OpKind = enum { konst, slot_load, binary, unary, cvt, guard, aref, aload, astore, loop, phi, preheader };
@@ -494,6 +508,14 @@ pub fn optimize(
     const new_index = try gpa.alloc(Ref, n);
     defer gpa.free(new_index);
 
+    // Exit-provenance compaction map (A-i.1): emission index → committed index, or
+    // `null` for any instr not emitted (dead/deduped/folded/CSE-merged). Filled in
+    // the emit loop below; returned to `commit`, which frees it after remapping the
+    // provenance side table. Freed here on any failure before the struct is returned.
+    const old_to_new = try gpa.alloc(?Ref, n);
+    errdefer gpa.free(old_to_new);
+    @memset(old_to_new, null);
+
     var out_instrs: std.ArrayListUnmanaged(IrInstr) = .empty;
     defer out_instrs.deinit(gpa);
     var out_entry: std.ArrayListUnmanaged(u16) = .empty;
@@ -535,6 +557,7 @@ pub fn optimize(
         const i = entry;
         const ins = instrs[i];
         new_index[i] = @intCast(out_instrs.items.len);
+        old_to_new[i] = @intCast(out_instrs.items.len); // A-i.1: emitted survivor
         var out = ins;
         if (fold_aux[i]) |aux| {
             out = .{ .op = .konst, .aux = aux, .ty = ins.ty };
@@ -572,7 +595,7 @@ pub fn optimize(
     const final_consts = try out_consts.toOwnedSlice(gpa);
     errdefer gpa.free(final_consts);
     const final_entry = try out_entry.toOwnedSlice(gpa);
-    return .{ .instrs = final_instrs, .consts = final_consts, .entry_slots = final_entry };
+    return .{ .instrs = final_instrs, .consts = final_consts, .entry_slots = final_entry, .old_to_new = old_to_new };
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +613,7 @@ fn freeOpt(gpa: std.mem.Allocator, o: *Optimized) void {
     gpa.free(o.instrs);
     gpa.free(o.consts);
     gpa.free(o.entry_slots);
+    o.freeMap(gpa);
 }
 
 fn countOp(instrs: []const IrInstr, op: IrOp) usize {
@@ -598,6 +622,52 @@ fn countOp(instrs: []const IrInstr, op: IrOp) usize {
         if (ins.op == op) c += 1;
     }
     return c;
+}
+
+test "tropt: old_to_new compaction map — survivors mapped, dropped instrs null (A-i.1)" {
+    // A duplicate guard is DCE-dropped and a CSE'd binary is merged; the compaction
+    // map must map every emitted survivor to its committed index and null out both
+    // kinds of drop. This is the exact map `commit` remaps exit provenance through.
+    const gpa = testing.allocator;
+    const instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0 = r0 (loop-variant input)
+        .{ .op = .guard_int, .a = 0 }, // %1 kept
+        .{ .op = .guard_int, .a = 0 }, // %2 duplicate guard → dead, dropped
+        .{ .op = .add, .a = 0, .b = 0, .ty = .int }, // %3 = r0 + r0
+        .{ .op = .add, .a = 0, .b = 0, .ty = .int }, // %4 = r0 + r0 → CSE-merged onto %3
+        .{ .op = .phi, .a = 0, .b = 3, .aux = 0, .ty = .int }, // %5 slot-bound φ → r0
+        .{ .op = .loop }, // %6
+    };
+    var opt = try optimize(gpa, &instrs, &.{});
+    defer freeOpt(gpa, &opt);
+
+    const m = opt.old_to_new orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(instrs.len, m.len);
+    // Survivors: slot_load, guard_int, add, φ, loop (5 instrs).
+    try testing.expectEqual(@as(usize, 5), opt.instrs.len);
+    try testing.expect(m[0] != null); // slot_load survives
+    try testing.expect(m[1] != null); // kept guard survives
+    try testing.expectEqual(@as(?Ref, null), m[2]); // duplicate guard dropped
+    try testing.expect(m[3] != null); // canonical add survives
+    try testing.expectEqual(@as(?Ref, null), m[4]); // CSE-merged add dropped
+    try testing.expect(m[6] != null); // loop survives
+    // Every non-null target names a real committed instruction of the matching op.
+    try testing.expectEqual(IrOp.guard_int, opt.instrs[m[1].?].op);
+    try testing.expectEqual(IrOp.add, opt.instrs[m[3].?].op);
+    try testing.expectEqual(IrOp.loop, opt.instrs[m[6].?].op);
+}
+
+test "tropt: dupe leaves a null compaction map (identity) (A-i.1)" {
+    const gpa = testing.allocator;
+    const instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_int, .a = 0 },
+        .{ .op = .loop },
+    };
+    var opt = try dupe(gpa, &instrs, &.{}, &.{});
+    defer freeOpt(gpa, &opt);
+    try testing.expectEqual(@as(?[]?Ref, null), opt.old_to_new); // identity
+    try testing.expectEqual(instrs.len, opt.instrs.len); // 1:1 preserved
 }
 
 test "tropt: a constant subexpression folds to one konst and its operands die" {

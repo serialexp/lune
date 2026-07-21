@@ -208,7 +208,9 @@ land; move whole sections to Done once everything inside is checked.
   classifier, A-ii) is now fully specified, so the exact tag layout it reads is pinned. Lands in four
   green sub-steps, each byte-identical across the 10 modes (no consumer yet ⇒ inert), gated by
   `just test` + `-Djit-debug`:
-  - [ ] **A-i.1 — types + storage + `tropt` remap (inert).** Add `GuardRole`/`OperandDesig`/`Polarity`/
+  - [x] **A-i.1 — types + storage + `tropt` remap (inert). LANDED 2026-07-21.** `just test` green
+    (default + `-Djit-debug`); nsieve tier-0 ≡ native byte-identical (inert: nothing stamps yet). Add
+    `GuardRole`/`OperandDesig`/`Polarity`/
     `CallEdge`/`GuardProvenance`/`ExitProvenance` (union: `guard | link_terminal`) near `IrInstr` in
     `trace.zig`. Emission-time storage = a dense lockstep `Recorder.exit_prov: []?ExitProvenance` grown
     one-`null`-per-append in `emit` (4178) — the single IR-append choke; committed storage = a compact,
