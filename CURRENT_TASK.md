@@ -1,5 +1,44 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-21 (LATEST-22) — **A-i `exit_prov` fail-soft parity + F5/F6 folded → re-APPROVED (checkpoint boundary still holds).** NEXT = A-iii (`call_seq` plumbing) per §A8 step 3.
+
+Second review arc on the A-ii landing. Bart approved extending the F1-style fail-soft treatment to the
+**earlier-phase (A-i) `exit_prov` dup at commit**, and the reviewer (gpt-5.6-sol) surfaced two more blockers
+(F5, F6) on the way. All folded, re-certified **APPROVE**:
+
+- **A-i `exit_prov` fail-soft parity** (Bart-approved extension). The commit-time `exit_prov` dup
+  (`buildExitProv`, A-i / GuardProvenance scope) shared the same `try`-can-abort → `closeTrace`'s
+  `commit() catch { gateAnchor }` pattern as F1. Made fail-soft: `if (buildExitProv(...)) |ok| {...} else |_| {
+  exit_prov_complete = false; }`, published into new `Trace.exit_prov_complete: bool = true`. Unlike `rec_path`,
+  a truncated `exit_prov` drops that trace's structural EDGES — and a lost *boundary* edge could shrink an
+  owner's competing-entry count and spuriously ARM. So the gate is graph-wide, not per-region: at the top of
+  `rebuildRegionsFallible`, any cached trace with `!exit_prov_complete` bails the whole pass (retain logical
+  `region_defs`, mint nothing, empty physical via `clearPhysicalRegionIndices`).
+- **F5 — wrong-arm on boundary-edge evolution (pre-existing bug, Rule #0.5).** The rebind path folded only
+  `stored.armable`, never the CURRENT `cand.armable_owner`. A boundary-only graph change flips `both_count`
+  1→2 while re-interning the SAME `RegionId` (identity = internal edge set, boundary excluded) → the stale
+  `stored.armable=true` wrong-arms an ambiguous owner. Fixed: `eff_armable and= cand.armable_owner` (pure
+  tightening — can only disarm, auto-recovers when unambiguous again) + refresh the stored `owner` via
+  `staged_owner_updates` (the unique external entry can move while id stays stable).
+- **F6 — `.retain` disposition unsafe.** F5's insight voids F2's "prior physical snapshot is still coherent"
+  premise: a new commit can invalidate a prior owner, so retaining a physical snapshot on a rebuild OOM can
+  keep a stale arm. Removed the `RegionOom` enum entirely; `rebuildEdgeCache` and `rebuildRegions` now take no
+  disposition arg and ALWAYS fail CLOSED to empty (`catch self.clearPhysicalRegionIndices()` /
+  `catch self.edge_cache.clearRetainingCapacity()`) — arm nothing, auto-recover next rebuild. All 28 call
+  sites converted to no-arg.
+
+New tests: exit_prov fail-soft 3-phase (complete→armed, taint one trace→disarmed + logical retained,
+clear→re-armed); F5 boundary-flip (ext2→inner@7 flips `both_count` 1→2, same id disarmed, owner refreshed to
+placeholder); F6 FailingAllocator (region-rebuild OOM empties physical, retains logical). `just test` **813**
+green (default + `-Djit-debug`); nsieve 9 / nbody 20000 / sieve_int / pi_leibniz / grid_matmul / field_hash
+tier-0 ≡ `--trace --jit-native` byte-identical (ReleaseFast).
+
+**Commits:** `59501e2` exit_prov fail-soft + graph-completeness gate · `9029aac` F5 rebind armable_owner + owner
+refresh · `6ffb3aa` F6 remove RegionOom / always fail-closed. A-i + A-ii remain inert, byte-identical across the
+10 replay modes. Piece boundary (APPROVE) reached — pausing for go-ahead on A-iii.
+
+---
+
 ## Status 2026-07-21 (LATEST-21) — **A-ii COMPLETE + APPROVED (checkpoint boundary reached).** A-i + A-ii both landed, inert, reviewer-certified. NEXT = A-iii (`call_seq` plumbing) per §A8 step 3.
 
 **A-ii checkpoint review = gpt-5.6-sol APPROVE + antigravity LGTM.** The post-landing review (mirrors A-i)
