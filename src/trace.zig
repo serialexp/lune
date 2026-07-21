@@ -3914,18 +3914,16 @@ pub const TraceState = struct {
     /// and every retirement (never surgically mutated). **Inert: read by nothing in A-ii ⇒
     /// byte-identical.**
     ///
-    /// **Transactional** (round-12 finding 2): the whole rebuild allocates its capacity
-    /// BEFORE clearing the prior snapshot, so an OOM leaves the previously-published `edge_cache` untouched
-    /// rather than emptying it. `on_oom` picks the disposition when the (pre-clear)
-    /// reservation fails — `.retain` keeps the prior coherent snapshot (commit path),
-    /// `.empty` fails-closed to an empty (region-neutral) cache (retirement path, where the
-    /// prior snapshot references a now-dead trace). On the happy path the publish loop is
-    /// infallible (`putAssumeCapacity`), so the cache is never left half-applied.
-    fn rebuildEdgeCache(self: *TraceState, on_oom: RegionOom) void {
-        self.rebuildEdgeCacheFallible() catch switch (on_oom) {
-            .retain => {}, // prior snapshot still coherent — leave it published
-            .empty => self.edge_cache.clearRetainingCapacity(), // fail-closed → empty
-        };
+    /// **Transactional + fail-closed** (round-12 finding 2, round-14 finding 6): the rebuild
+    /// reserves capacity BEFORE clearing (so the happy-path publish loop is infallible), but
+    /// on ANY OOM it fails CLOSED to an EMPTY cache — never retains the prior snapshot. The
+    /// retain option was removed because it is not safe: a boundary edge (excluded from
+    /// `RegionId`) added by the very commit that triggers this rebuild can invalidate a prior
+    /// region's owner (`both_count` 1→2), so a retained snapshot is not merely "the new trace
+    /// stays unclassified" — it can keep a now-stale region armed. Empty is region-neutral
+    /// (arm nothing) and auto-recovers on the next successful rebuild.
+    fn rebuildEdgeCache(self: *TraceState) void {
+        self.rebuildEdgeCacheFallible() catch self.edge_cache.clearRetainingCapacity();
     }
 
     fn rebuildEdgeCacheFallible(self: *TraceState) !void {
@@ -3937,7 +3935,7 @@ pub const TraceState = struct {
         // `ceilPowerOfTwo(u32, ...) catch unreachable` past ~1.7e9 — would PANIC, and below
         // the `@intCast` u32 cast's own trap point (round-14 review finding 4). An
         // over-large graph is turned into a SOFT OOM here so it flows through
-        // `rebuildEdgeCache`'s `catch switch (on_oom)` instead of trapping — preserving the
+        // `rebuildEdgeCache`'s fail-closed `catch` instead of trapping — preserving the
         // inert/fail-soft contract. Unreachable in practice: a billion trace exits is many
         // GB of metadata, so we'd OOM in the append loops long before reaching it.
         const max_edges: usize = 1 << 30;
@@ -3960,21 +3958,6 @@ pub const TraceState = struct {
         }
     }
 
-    /// Which OOM disposition a `rebuildRegions` pass uses for the PHYSICAL indices
-    /// (doc 17 §A8-ii, round-12 finding 2). The LOGICAL maps (`region_defs`/
-    /// `region_intern`) are never left half-applied either way — all their mutation is
-    /// in the post-reserve infallible publish, so an OOM leaves them exactly as they
-    /// were. Only the physical snapshot's fate differs by call site.
-    const RegionOom = enum {
-        /// Commit: the prior published physical snapshot is still coherent (a new trace
-        /// merely stays unclassified), so retain it.
-        retain,
-        /// Retirement: the prior physical snapshot references a now-dead trace, so a
-        /// failed rebuild must fail-closed to EMPTY (an empty `classifyExit` is
-        /// region-neutral, hence inert).
-        empty,
-    };
-
     fn clearPhysicalRegionIndices(self: *TraceState) void {
         freeRegionSetMap(ExitKey, &self.source_exit_regions, self.gpa);
         freeRegionSetMap(u32, &self.dest_entry_regions, self.gpa);
@@ -3985,20 +3968,18 @@ pub const TraceState = struct {
     /// Rebuild the region model from the current trace graph (doc 17 §A8-ii, A-ii.4):
     /// discover the strongly-connected cycles of the `StructuralEdgeId` graph, intern
     /// each to a stable `RegionId`, accumulate persistent `RegionDef`s, and rebuild the
-    /// physical classification indices wholesale. **Transactional + fail-soft:** all
-    /// fallible allocation completes in scratch before any live map is touched; the
-    /// publish phase is infallible. An OOM never propagates through `commit`/`removeTrace`
-    /// and never leaves half-applied state (`RegionOom` picks the physical disposition).
+    /// physical classification indices wholesale. **Transactional + fail-closed:** all
+    /// fallible allocation completes in scratch before any live map is touched; the publish
+    /// phase is infallible. An OOM never propagates through `commit`/`removeTrace` and never
+    /// leaves half-applied state — the LOGICAL maps (`region_defs`/`region_intern`) are
+    /// untouched (all their mutation is post-reserve infallible publish) and the PHYSICAL
+    /// indices fail CLOSED to EMPTY (round-14 finding 6: retaining the prior physical
+    /// snapshot is unsafe — the commit that triggers this rebuild can add a boundary edge
+    /// that invalidates a prior region's owner, so a retained snapshot could keep a stale
+    /// region armed; empty is region-neutral and auto-recovers on the next successful pass).
     /// **Inert in A-ii** (read by nothing on the selection path) ⇒ byte-identical.
-    fn rebuildRegions(self: *TraceState, on_oom: RegionOom) void {
-        self.rebuildRegionsFallible() catch {
-            // Scratch is freed by the fallible fn's own defers/errdefers; the LOGICAL
-            // maps were never mutated (all mutation is post-reserve infallible publish).
-            switch (on_oom) {
-                .retain => {},
-                .empty => self.clearPhysicalRegionIndices(),
-            }
-        };
+    fn rebuildRegions(self: *TraceState) void {
+        self.rebuildRegionsFallible() catch self.clearPhysicalRegionIndices();
     }
 
     fn rebuildRegionsFallible(self: *TraceState) !void {
@@ -4735,13 +4716,12 @@ pub const TraceState = struct {
                 }
                 // A-ii.2: a retired trace changes which edges remain resolvable for
                 // SURVIVING traces (not just its own), so rebuild the whole edge cache
-                // from the surviving cache — never a surgical key delete. Retirement OOM
-                // fail-closes to EMPTY (the prior snapshot references the now-dead trace).
-                self.rebuildEdgeCache(.empty);
+                // from the surviving cache — never a surgical key delete. Any OOM fails
+                // closed to EMPTY (region-neutral).
+                self.rebuildEdgeCache();
                 // A-ii.4: rebuild the physical region indices from the surviving graph
-                // (region_defs persists). Retirement OOM fail-closes to EMPTY physical
-                // indices (the prior set references the now-dead trace).
-                self.rebuildRegions(.empty);
+                // (region_defs persists; the physical indices fail closed to EMPTY on OOM).
+                self.rebuildRegions();
                 return;
             }
         }
@@ -5299,12 +5279,13 @@ pub const TraceState = struct {
         if (self.config.coverage) self.markAnchorTraced(t.anchor);
         // A-ii.2: refresh the structural-edge cache — the new trace may add edges
         // FROM itself AND make pre-existing traces' exits newly resolvable. Fail-soft
-        // (never fails the commit); commit OOM RETAINS the prior coherent snapshot.
-        self.rebuildEdgeCache(.retain);
-        // A-ii.4: rediscover regions over the refreshed graph. Commit OOM RETAINS the
-        // prior physical snapshot (still coherent; the new trace just stays
-        // unclassified). Fail-soft; inert (read by nothing in A-ii).
-        self.rebuildRegions(.retain);
+        // (never fails the commit); any OOM fails CLOSED to an empty cache (round-14
+        // finding 6 — this new trace can add a boundary edge that invalidates a prior
+        // region's owner, so retaining the prior snapshot could keep a stale arm).
+        self.rebuildEdgeCache();
+        // A-ii.4: rediscover regions over the refreshed graph. Fail-soft; inert (read by
+        // nothing in A-ii); any OOM fails CLOSED to empty physical indices (arm nothing).
+        self.rebuildRegions();
     }
 
     /// Debug-only structural verifier for the invariants the tier-1a executor
@@ -9527,7 +9508,7 @@ test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural 
 
     try state.cache.append(gpa, &cont);
     try state.cache.append(gpa, &inner);
-    state.rebuildEdgeCache(.retain);
+    state.rebuildEdgeCache();
 
     // Both structural edges present: cont --link--> inner(pc7), inner --loop_done--> cont(pc2).
     try testing.expectEqual(@as(usize, 2), state.edge_cache.count());
@@ -9544,7 +9525,7 @@ test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural 
     // has no inner root bound, and inner's own edge is gone → empty. (Simulate the
     // retirement rebuild path without `destroy` on a stack trace.)
     _ = state.cache.swapRemove(1); // drop &inner
-    state.rebuildEdgeCache(.retain);
+    state.rebuildEdgeCache();
     try testing.expectEqual(@as(usize, 0), state.edge_cache.count());
 }
 
@@ -9678,8 +9659,8 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
 
     for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
-    state.rebuildEdgeCache(.retain);
-    state.rebuildRegions(.retain);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
 
     // 5 structural edges (4 internal cycle + 1 incoming boundary), one discovered region.
     try testing.expectEqual(@as(usize, 5), state.edge_cache.count());
@@ -9744,8 +9725,8 @@ test "A-ii.4 finding-3: a member with an incomplete recorded path mints the regi
     var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
 
     for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
-    state.rebuildEdgeCache(.retain);
-    state.rebuildRegions(.retain);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
 
     // The region is still discovered (structural identity is unaffected by rec_path).
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
@@ -9799,8 +9780,8 @@ test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whol
     for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
 
     // Phase 1 — complete graph: region armed.
-    state.rebuildEdgeCache(.retain);
-    state.rebuildRegions(.retain);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
     var kit = state.region_defs.keyIterator();
     const rid = kit.next().?.*;
@@ -9809,8 +9790,8 @@ test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whol
 
     // Phase 2 — taint one trace's exit_prov: the pass arms NOTHING, but keeps the def.
     ext.exit_prov_complete = false;
-    state.rebuildEdgeCache(.retain);
-    state.rebuildRegions(.retain);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_defs.count()); // logical retained
     try testing.expect(state.region_defs.get(rid).?.armable); // logical bit intrinsic, untouched
     try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
@@ -9819,8 +9800,8 @@ test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whol
 
     // Phase 3 — clear the taint: the region re-arms (same id), physical indices repopulate.
     ext.exit_prov_complete = true;
-    state.rebuildEdgeCache(.retain);
-    state.rebuildRegions(.retain);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
     var kit3 = state.region_defs.keyIterator();
     try testing.expectEqual(rid, kit3.next().?.*);
@@ -9868,8 +9849,8 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
     var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
 
     for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
-    state.rebuildEdgeCache(.retain);
-    state.rebuildRegions(.retain);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
     var kit = state.region_defs.keyIterator();
     const rid = kit.next().?.*;
@@ -9882,8 +9863,8 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
     var ext2_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(39, .branch_cond) }};
     var ext2: Trace = .{ .id = 6, .anchor = .{ .proto = &proto, .pc = 40 }, .instrs = &ext2_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext2_p };
     try state.cache.append(gpa, &ext2);
-    state.rebuildEdgeCache(.retain);
-    state.rebuildRegions(.retain);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
 
     // SAME region id (internal edge set unchanged), but disarmed by the current owner
     // analysis, and no member exit is classified. The stored owner is refreshed away from
@@ -9895,6 +9876,67 @@ test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, 
     try testing.expectEqual(@as(u32, 0), state.source_exit_regions.count());
     try testing.expectEqual(@as(u32, 0), state.dest_entry_regions.count());
     try testing.expectEqual(@as(u32, 2), state.region_defs.get(rid).?.owner.pc); // placeholder = smallest anchor (ramp@2)
+}
+
+test "A-ii.4 finding-6: a region-rebuild OOM fails CLOSED — physical indices emptied, logical defs retained" {
+    // A `FailingAllocator` forces `rebuildRegionsFallible` to OOM on a SECOND pass after a
+    // good first pass armed a region. The disposition must NOT retain the prior physical
+    // snapshot (which a graph-changing commit could have made stale) — it fails CLOSED to
+    // EMPTY physical indices, while the LOGICAL defs (untouched by the aborted pass) survive.
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = fa.allocator();
+    var state = TraceState.init(gpa);
+    defer {
+        fa.fail_index = std.math.maxInt(usize); // let teardown allocate freely
+        state.deinit();
+    }
+    defer state.cache.clearRetainingCapacity();
+
+    const P_ID: u32 = 7;
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+    var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
+    var skip: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 14 }, .instrs = &skip_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &skip_p };
+    var ramp_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+    var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
+    var ramp: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ramp_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ramp_p };
+    var inner_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
+    var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+    var inner: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_p };
+    var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+    var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
+    var cont: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p };
+    var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+    var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
+    var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
+
+    // Phase 1 — good pass: region armed, physical indices populated.
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    var kit = state.region_defs.keyIterator();
+    const rid = kit.next().?.*;
+    try testing.expect(state.source_exit_regions.count() > 0);
+    try testing.expect(state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len == 1);
+
+    // Phase 2 — arm the allocator to fail the NEXT allocation, then re-discover regions over
+    // the (still-valid, phase-1) edge cache. The region rebuild OOMs on its first scratch
+    // alloc → fail-closed. (We call ONLY rebuildRegions so the failure is in the region pass,
+    // not the edge-cache pass.)
+    fa.fail_index = fa.alloc_index; // next alloc returns error.OutOfMemory
+    state.rebuildRegions();
+
+    // Physical indices emptied (fail-closed), logical defs retained (untouched).
+    try testing.expectEqual(@as(u32, 0), state.source_exit_regions.count());
+    try testing.expectEqual(@as(u32, 0), state.dest_entry_regions.count());
+    try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    var kit2 = state.region_defs.keyIterator();
+    try testing.expectEqual(rid, kit2.next().?.*);
 }
 
 test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) re-interns to the SAME RegionId" {
@@ -9926,8 +9968,8 @@ test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) r
     }.go;
 
     try buildCycle(&state, gpa, &proto, 1, 2);
-    state.rebuildEdgeCache(.retain);
-    state.rebuildRegions(.retain);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
     var kit = state.region_defs.keyIterator();
     const rid1 = kit.next().?.*;
@@ -9935,8 +9977,8 @@ test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) r
     // Retire both (heap traces → real destroy), then re-record with fresh ids.
     while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
     try buildCycle(&state, gpa, &proto, 11, 12);
-    state.rebuildEdgeCache(.retain);
-    state.rebuildRegions(.retain);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
     // Still ONE region, and the SAME id (not a second def).
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
     try testing.expect(state.region_defs.get(rid1) != null);
@@ -10003,8 +10045,8 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
     var tx: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 40 }, .instrs = &x_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &x_p };
 
     for ([_]*Trace{ &ta, &tb, &tas, &tc, &tx }) |t| try state.cache.append(gpa, t);
-    state.rebuildEdgeCache(.retain);
-    state.rebuildRegions(.retain);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
 
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
     var kit = state.region_defs.keyIterator();
@@ -10056,8 +10098,8 @@ test "A-ii.4 rebind tombstone: same edge set, incompatible member_points → arm
     }.go;
 
     try buildArmable(&state, gpa, &proto, .{ 1, 2, 3 }, .{ .proto_id = P_ID, .source_pc = 100 });
-    state.rebuildEdgeCache(.retain);
-    state.rebuildRegions(.retain);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
     var kit = state.region_defs.keyIterator();
     const rid = kit.next().?.*;
@@ -10067,8 +10109,8 @@ test "A-ii.4 rebind tombstone: same edge set, incompatible member_points → arm
     // Re-record with a DIFFERENT A.rec_path (source_pc 200) → incompatible membership.
     while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
     try buildArmable(&state, gpa, &proto, .{ 11, 12, 13 }, .{ .proto_id = P_ID, .source_pc = 200 });
-    state.rebuildEdgeCache(.retain);
-    state.rebuildRegions(.retain);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
     // Same id (edge set unchanged), but tombstoned + purged from the physical index.
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
     try testing.expect(!state.region_defs.get(rid).?.armable);
@@ -10097,8 +10139,8 @@ test "A-ii.4 lifetime: removeTrace preserves region_defs (logical); clearCache e
     b.* = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = b_i, .consts = try gpa.alloc(Value, 0), .entry_slots = try gpa.alloc(u16, 0), .entry_guards = try gpa.alloc(EntryGuard, 0), .exit_prov = try gpa.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .branch_cond) }}) };
     try state.cache.append(gpa, a);
     try state.cache.append(gpa, b);
-    state.rebuildEdgeCache(.retain);
-    state.rebuildRegions(.retain);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
 
     // removeTrace breaks the cycle but must NOT clean region_defs (logical persistence).
