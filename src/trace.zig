@@ -1216,6 +1216,16 @@ pub const Trace = struct {
     /// JIT-tiering metadata, never serialized, never a `.snapshot` root. Read by the
     /// Part-A region classifier via `provAt`; freed in `destroy`.
     exit_prov: []ExitProvEntry = &.{},
+    /// Whether `exit_prov` is the COMPLETE exit table (doc 17 §A8-ii, A-ii.4 fail-soft).
+    /// `false` iff the commit-time `buildExitProv` OOM'd and this trace was committed with
+    /// an EMPTY exit table rather than aborting the commit (same fail-soft rationale as
+    /// `rec_path_complete` — a `commit` error gates the anchor and perturbs tiering, and
+    /// `exit_prov` is inert region metadata read by nothing on the selection path). A
+    /// truncated table means this trace contributes NO structural edges, so the whole edge
+    /// graph is missing edges; region discovery then arms/mints NOTHING that pass (a
+    /// dropped *boundary* edge could otherwise shrink an owner's competing-entry count and
+    /// spuriously flip a region armable). Default `true`. Runtime-only — not serialized.
+    exit_prov_complete: bool = true,
     /// Ordered recorded guest program-points (doc 17 §A8-ii, A-ii.3), dup'd from the
     /// recorder at commit; the membership-set basis A-ii.4 unions per region. Empty
     /// when membership was *unavailable* (a recorder-path OOM flipped `rec_path_ok`)
@@ -3994,6 +4004,22 @@ pub const TraceState = struct {
     fn rebuildRegionsFallible(self: *TraceState) !void {
         const gpa = self.gpa;
 
+        // A-i exit_prov fail-soft (graph completeness): if ANY cached trace committed a
+        // truncated `exit_prov` (a `buildExitProv` OOM), the structural edge graph is
+        // missing that trace's edges, so the SCCs / owners discovered this pass could
+        // differ from the complete graph — a dropped *boundary* edge can spuriously flip a
+        // region armable. Conservatively bail: RETAIN the prior LOGICAL defs (`region_defs`
+        // / `region_intern` — untouched, so a stable prior classification survives) and
+        // publish EMPTY physical indices (`classifyExit` region-neutral ⇒ arm nothing). We
+        // also mint NOTHING new here, so no def is ever built from a sparse graph. The
+        // first COMPLETE pass after the incomplete trace retires re-discovers and re-arms.
+        for (self.cache.items) |t| {
+            if (!t.exit_prov_complete) {
+                self.clearPhysicalRegionIndices();
+                return;
+            }
+        }
+
         // Guest-logical anchor node identity {proto_id, pc} — NOT a concrete `Trace`
         // pointer (round-11 finding 1: node identity must not depend on mutable
         // `hit_count` / `findTrace` selection).
@@ -5139,7 +5165,20 @@ pub const TraceState = struct {
             .{ .index = @intCast(fields.instrs.len - 1), .prov = lp }
         else
             null;
-        const exit_prov_owned = try buildExitProv(self.gpa, self.rec.exit_prov.items, fields.old_to_new, link_term);
+        // **FAIL-SOFT (round-14 review, A-i exit_prov parity with `rec_path`):** an OOM in
+        // `buildExitProv` must NOT abort the commit — `closeTrace` gates the anchor on a
+        // commit error, perturbing tiering, and `exit_prov` is inert region metadata (read
+        // only by `provAt` + the A-ii region classifier, nothing on the selection path). On
+        // OOM commit an EMPTY exit table and mark `exit_prov_complete = false` so region
+        // discovery treats the edge graph as incomplete and arms/mints nothing that pass.
+        // `buildExitProv`'s single alloc is `errdefer`-guarded, so a failure leaks nothing.
+        var exit_prov_complete = true;
+        var exit_prov_owned: []ExitProvEntry = &.{};
+        if (buildExitProv(self.gpa, self.rec.exit_prov.items, fields.old_to_new, link_term)) |ok| {
+            exit_prov_owned = ok;
+        } else |_| {
+            exit_prov_complete = false;
+        }
         errdefer if (exit_prov_owned.len != 0) self.gpa.free(exit_prov_owned);
 
         // A-ii.3/A-ii.4: dup the recorder's ordered program-point path into the
@@ -5230,6 +5269,7 @@ pub const TraceState = struct {
             .entry_guards = guards_owned,
             .inputs = inputs_owned,
             .exit_prov = exit_prov_owned,
+            .exit_prov_complete = exit_prov_complete,
             .rec_path = rec_path_owned,
             .rec_path_complete = rec_path_complete,
         };
@@ -9697,6 +9737,76 @@ test "A-ii.4 finding-3: a member with an incomplete recorded path mints the regi
     try testing.expect(state.dest_entry_regions.get(1) == null);
     try testing.expectEqual(@as(u32, 0), state.source_exit_regions.count());
     try testing.expectEqual(@as(u32, 0), state.dest_entry_regions.count());
+}
+
+test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whole pass, logical defs retained, auto-recovers" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    // The armable 5-trace graph again. Phase 1: fully complete → region armed. Phase 2:
+    // taint the graph by marking one cached trace's `exit_prov` INCOMPLETE (as a
+    // commit-time `buildExitProv` OOM would) — the whole discovery pass must arm nothing
+    // (physical indices empty) yet RETAIN the logical def, and mint no new def. Phase 3:
+    // clear the taint → the region re-arms (auto-recovery). We flip only the flag (leaving
+    // `exit_prov` populated) to exercise the graph-completeness gate in isolation.
+    const P_ID: u32 = 7;
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+    var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
+    var skip: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 14 }, .instrs = &skip_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &skip_p };
+
+    var ramp_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+    var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
+    var ramp: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ramp_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ramp_p };
+
+    var inner_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
+    var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+    var inner: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_p };
+
+    var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+    var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
+    var cont: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p };
+
+    var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+    var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
+    var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
+
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
+
+    // Phase 1 — complete graph: region armed.
+    state.rebuildEdgeCache(.retain);
+    state.rebuildRegions(.retain);
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    var kit = state.region_defs.keyIterator();
+    const rid = kit.next().?.*;
+    try testing.expect(state.region_defs.get(rid).?.armable);
+    try testing.expectEqual(@as(usize, 1), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
+
+    // Phase 2 — taint one trace's exit_prov: the pass arms NOTHING, but keeps the def.
+    ext.exit_prov_complete = false;
+    state.rebuildEdgeCache(.retain);
+    state.rebuildRegions(.retain);
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count()); // logical retained
+    try testing.expect(state.region_defs.get(rid).?.armable); // logical bit intrinsic, untouched
+    try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
+    try testing.expectEqual(@as(u32, 0), state.source_exit_regions.count());
+    try testing.expectEqual(@as(u32, 0), state.dest_entry_regions.count());
+
+    // Phase 3 — clear the taint: the region re-arms (same id), physical indices repopulate.
+    ext.exit_prov_complete = true;
+    state.rebuildEdgeCache(.retain);
+    state.rebuildRegions(.retain);
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    var kit3 = state.region_defs.keyIterator();
+    try testing.expectEqual(rid, kit3.next().?.*);
+    const regs = state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 });
+    try testing.expectEqual(@as(usize, 1), regs.len);
+    try testing.expectEqual(rid, regs[0]);
 }
 
 test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) re-interns to the SAME RegionId" {
