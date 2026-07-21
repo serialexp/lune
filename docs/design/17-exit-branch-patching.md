@@ -261,6 +261,29 @@ land; move whole sections to Done once everything inside is checked.
   for `jmp_if_false`, which jumps when falsy) → now keyed on the opcode's jump-taken edge; (2)
   `recInputGet`'s `guard_func` operand `none` → `.a` (the `dest` register per H-1c). Both would have
   mis-keyed A-ii; neither altered behaviour (byte-identity held before and after). Next: A-ii per §A8.
+- [ ] **A-ii — region discovery + classifier, inert (IN PROGRESS 2026-07-21; §A8 step 2, landing plan
+  in §A8-ii).** Build `region_defs` from the recorded trace graph, the `StructuralEdgeId` ephemeral
+  cache, the physical classification indices, and the `accountTraceRun`/`accountRegionProfit` split with
+  `accountRegionProfit` a **no-op**. Selection unchanged ⇒ byte-identical (nsieve/nbody/mandelbrot
+  tier-0 ≡ native negative control). First *consumer* of the A-i `ExitProvenance` substrate (for
+  discovery/classification only, never selection). Four green sub-steps, each `just test` +
+  `-Djit-debug`:
+  - [ ] **A-ii.1 — `accountTraceRun`/`accountRegionProfit` split (inert).** Rename `onSideExit`'s body
+    to `accountTraceRun` verbatim; `onSideExit` calls it then no-op `accountRegionProfit(null)`. Zero
+    call-site changes (per-site `?ExitKey` threading deferred to A-iv). Byte-identical by construction.
+  - [ ] **A-ii.2 — `StructuralEdgeId` + ephemeral `edge_cache` + successor resolution (inert).** Type +
+    canonical total order; build `(Trace.id,exit_instr)→StructuralEdgeId` at commit via
+    `guardExitPc`→`findTrace`/link-terminal; drop in `removeTrace`/`clearCache`. Read by nothing.
+  - [ ] **A-ii.3 — recorded `{proto_id, source_pc}` membership substrate (inert).** Capture the per-trace
+    ordered recorded program-point path (transient per-trace metadata) via a `recordInstr` hook; freed on
+    retire/flush. Read by nothing.
+  - [ ] **A-ii.4 — `region_defs` discovery + `RegionId` interning + classification indices +
+    `classifyExit` (inert).** Tarjan-SCC region discovery over the structural edges; `region_intern`
+    (hash-bucketed, full-sorted-set equality); `region_defs` (Proto/VM-lifetime, never
+    retirement-cleaned); `source_exit_regions`/`dest_entry_regions` (physical, transient); `classifyExit`
+    pure query (unread, unit-tested); `clearCache`/`removeTrace`/`deinit`/`interp.zig:9030` wiring.
+    `accountRegionProfit` stays no-op. Sibling-trace + re-record-stability + collision + boundary-edge
+    tests mandatory.
 - [ ] **Deferred to Increment-3 machinery.** F2c native-cut harness (H-4 cut) + region-map cap
   contract (H-3 cap) land WITH `region_profit`/native-F2c, not in round 9.
 **Increment 2.3b — arm `.link`-terminal handoffs (ACTIVE; re-scoped after the
@@ -5805,6 +5828,280 @@ byte-identical across the 10 modes and provable by negative control:
    dispatcher-mediated native trace entries. **No back-edge poll** (§A7 contract (i): suspension is
    synchronous/cooperative and disarm-on-observation is the supported mechanism, as for `inner(24)`
    today; the lone native self-loop poll-freedom is a pre-existing limitation edge 4 does not worsen).
+
+##### A8-ii — A-ii landing design (region discovery + classifier, inert) (2026-07-21)
+
+This subsection is the build plan for §A8 step 2, derived from §A3 (the design of record) and grounded
+in the current tree. **Everything here is INERT:** it builds `region_defs`, the `StructuralEdgeId`
+ephemeral cache, the physical classification indices, the recorded-path membership substrate, and the
+`accountTraceRun`/`accountRegionProfit` split — but `accountRegionProfit` is a **no-op**, nothing reads
+the new tables on the selection path, and `accountTraceRun` is the old `onSideExit` body **verbatim**.
+So every sub-step is byte-identical across the 10 modes, provable by the nsieve/nbody/mandelbrot
+tier-0 ≡ native negative control (as A-i was). The A-i `ExitProvenance`/`GuardProvenance` types are the
+exit component of `StructuralEdgeId` — already in the tree and populated, so A-ii is the first
+*consumer* of that substrate (consuming only for discovery/classification, not for selection).
+
+**Scope boundary (what A-ii is NOT).** `call_seq` is A-iii. The `region_profit` accumulator, the
+window/flush, and the whole §A3.5 accounting **state machine** are A-iv — A-ii's `accountRegionProfit`
+neither accumulates nor gates. The bridge stub is A-v. The *gate/penalty* `invalidateRegion`
+tombstoning fires from A-iv+. **But A-ii is NOT tombstone-free** (round-11 review, finding 3): the
+**def-consistency** tombstone — a re-recorded region rebinding to an existing `RegionId` with
+**incompatible membership** — is a pure-structural fact and fires in A-ii.4 (§A3.5 "rebinding confirms
+compatible membership or fails closed"). So `armable` is minted `true` and can flip to `false` on an
+incompatible rebind, independent of the A-iv gate. A-ii lands only the *pure-structural* half: a region
+definition is a pure function of the recorded trace graph, and that graph is fully available at commit.
+
+**Concrete Zig (near `IrInstr`/`Trace` in `trace.zig`, alongside the A-i `ExitProvenance`):**
+```zig
+// The persistent, guest-logical def key (§A3.3). `exit` is the A-i union — already in-tree.
+pub const StructuralEdgeId = struct {
+    anchor_proto_id: u32,      // source trace anchor {proto,pc} (trace.zig:722 AnchorKey)
+    anchor_pc: u32,
+    exit: ExitProvenance,      // A-i: guard | link_terminal (guest-logical, remapped through tropt)
+    succ_anchor_proto_id: u32, // successor trace anchor {proto,pc}
+    succ_anchor_pc: u32,
+    // canonical total order (§A3.3): NOT discovery order, and NOT raw object bytes (round-11 review,
+    // finding 5). `ExitProvenance` is a tagged union with padding + an inactive-arm and a fixed
+    // `[MAX_INLINE_DEPTH]CallEdge path` array of which only `path[0..inline_depth]` is live — so
+    // `std.mem.asBytes`/full-union `eql` would compare garbage. Define an explicit field-wise
+    // `canonicalLessThan`/`canonicalEql`/`canonicalHash` over: (anchor_proto_id, anchor_pc, exit-tag,
+    // then the active arm's fields — for `.guard`: role, operand, polarity, source_proto_id, source_pc,
+    // inline_depth, then path[0..inline_depth]; for `.link_terminal`: source_proto_id, source_pc,
+    // inline_depth, path[0..inline_depth]), then (succ_anchor_proto_id, succ_anchor_pc).
+};
+
+pub const RegionId = enum(u64) { _ };   // opaque interned handle; NEVER a bare hash
+
+pub const RegionClassifier = struct {    // minimal in A-ii; A-vii reads it to pick arm strategy
+    kind: enum { self_loop, cross_trace_cycle },
+    member_count: u32,
+};
+
+pub const RegionDef = struct {
+    members: []StructuralEdgeId,          // the region's INTERNAL edges only, canonical-sorted (owned)
+    member_points: []ProgramPoint,        // membership program-point set: {proto_id, source_pc}, sorted (owned)
+    owner: AnchorKey,                     // gate/penalty blast-radius key = loop-root {proto, root_pc}
+    classifier: RegionClassifier,
+    armable: bool,                        // minted true; flipped false by the A-ii incompatible-rebind tombstone (§A3.5) AND the A-iv+ gate tombstone. read by classification-index build (excludes false)
+};
+
+pub const ProgramPoint = struct { proto_id: u32, source_pc: u32 };
+
+// The classifier key threaded to accountRegionProfit (§A3.3): real receipts carry it, synthetic null.
+pub const ExitKey = struct { trace_id: u32, exit_instr: u32 };
+```
+
+**New `TraceState` fields (all initialised `.empty`; §A3.1 lifetimes):**
+```zig
+region_defs:         std.AutoHashMapUnmanaged(RegionId, RegionDef) = .empty,   // Proto/VM lifetime — NEVER retirement-cleaned; rebuilt only on cache flush
+region_intern:       RegionInternMap = .empty,                                 // sorted-edge-SET → RegionId; hash-bucketed, full-set equality resolves collisions
+// physical, transient (WHOLESALE-rebuilt per discovery pass AND per removeTrace from the surviving cache — never surgical; retirement-rebuild OOM ⇒ published EMPTY; exclude armable==false):
+source_exit_regions: std.AutoHashMapUnmanaged(ExitKey, []RegionId) = .empty,   // {this trace's physical exit} → regions it belongs to (incl. boundary exits that LEAVE R)
+dest_entry_regions:  std.AutoHashMapUnmanaged(u32, []RegionId)     = .empty,   // trace_id → regions entered by landing in it
+edge_cache:          std.AutoHashMapUnmanaged(ExitKey, StructuralEdgeId) = .empty, // pure ephemeral (Trace.id,exit_instr)→edge; rebuilt on commit, dropped on retire
+```
+`RegionInternMap` is a hand-written map (not `AutoHashMap`) because the key is a **variable-length
+sorted `StructuralEdgeId` slice** and equality is full-slice equality with the 64-bit hash only
+selecting the bucket (§A3.3): a hash hit is confirmed by **element-wise `canonicalEql`** over the sorted
+edge set (NOT `std.mem.eql`, which would compare the padded-union bytes — round-12 review), and a genuine
+collision mints a distinct `RegionId`. Interning owns a copy of the sorted slice.
+
+**Region-discovery algorithm — pure function of the trace graph, run at commit (after `cache.append`,
+`trace.zig:~4148`), full-cache O(V+E), TRANSACTIONAL + FAIL-SOFT (round-11 findings 1/2/4, round-12
+findings 1/2).** Discovery builds **everything** in scratch — the anchor graph, the *new* intern
+entries, the *new/updated* `RegionDef`s + tombstone flips, AND the physical indices — completing all
+fallible allocation first. It then reserves capacity on the live maps (`ensureUnusedCapacity` for the
+intern/def deltas and the physical maps) and **publishes in one infallible apply phase**. Any OOM during
+the scratch/reserve phase **discards all scratch and leaves every previously-published map
+(`region_intern`, `region_defs`, physical indices) exactly as it was** — never a half-applied intern or a
+def without its physical bindings. Discovery **never propagates OOM through `commit`, never gates the
+anchor, never leaves half-rebuilt state**; commit succeeds regardless (best-effort JIT-tiering metadata).
+**Two OOM outcomes differ by call site (round-12 finding 2):** at **commit** the prior published snapshot
+is still coherent (a new trace merely stays unclassified), so retain it; at **retirement** the prior
+physical indices reference a now-dead trace, so a failed rebuild must **publish EMPTY physical indices**
+(fail-closed), never retain the broken set — an empty `classifyExit` is region-neutral, hence inert.
+`region_defs`/`region_intern` stay logical and coherent across a retire regardless (no dead-trace refs).
+
+**The SCC graph is keyed by guest-logical ANCHORS `{proto_id, pc}`, NOT concrete `Trace` pointers**
+(round-11 finding 1). Concrete-trace nodes would make identity depend on `findTrace`/`findLoopTrace`,
+which select by *mutable* `hit_count` and (for `findTrace`) the dispatcher's sibling/fingerprint trial —
+so the same guest region would get different graphs at different times, and the sibling problem (multiple
+traces at one anchor) would corrupt the topology. The cache is consulted **only to establish that a
+compatible destination anchor is currently bound**, never as node identity.
+1. **Structural edges.** Walk each committed trace `T`'s `exit_prov`. For each keyed exit `e`
+   (`exit_instr = e.index`), resolve the successor **anchor** `{succ_proto, succ_pc}`:
+   `guardExitPc(T.instrs[e])` gives the guest resume PC; a `.link_terminal` targets the named inner root
+   (via `aux`/`link_target`). **Validate a compatible trace is bound at that anchor** — a plain lookup
+   for existence, and for a `.link_terminal` destination additionally `isInnerLoopRoot` (the loop-root
+   shape + `inputs.len == 0` check `findLoopTrace` omits). Form
+   `StructuralEdgeId{ T.anchor, e.prov, {succ_proto, succ_pc} }`; record it in scratch
+   `edge_cache[{T.id, exit_instr}]`. An exit with no compatibly-bound successor contributes no edge.
+2. **Find cycles.** Run Tarjan SCC over **(anchors = nodes, `StructuralEdgeId`s = edges)**. Every SCC
+   that contains a cycle — size ≥ 2, or a self-edge — is a region candidate.
+3. **Per candidate SCC:** partition its edges into **internal** (both anchor endpoints in the SCC) and
+   **boundary** (leaving the SCC). Sort the internal `StructuralEdgeId`s by `canonicalLessThan`;
+   **boundary edges are kept OUT** (an exit edge would corrupt the topology identity — §A3.5). Intern
+   the sorted internal set → `RegionId`. `getOrPut` into `region_defs`:
+   - **first sight:** build `RegionDef{ members = sorted internal set, member_points = union of member
+     traces' recorded `{proto_id, source_pc}` paths (A-ii.3) **+ validated handoff endpoints** (A-ii.4
+     validates+adds them BEFORE interning/publishing — round-11 finding 6), owner = **the executable
+     predicate** (round-12 finding 4): compute the SCC's **incoming boundary edges** (structural edges
+     from an anchor *outside* the SCC to one *inside*); an **external-entry anchor** is any SCC anchor
+     that is such an edge's destination; a **loop-root anchor** is an SCC anchor at which a bound trace
+     has loop-root shape (`isInnerLoopRoot`). If **exactly one** anchor is both external-entry and
+     loop-root, that is `owner` (for nsieve: `skip@14`, the outer-header — matches §A2.6). Otherwise
+     (zero or ≥2) the region is ambiguous: store a **deterministic placeholder** `owner` = the
+     canonically-smallest SCC anchor by `{proto.id, pc}` and mint **`armable = false`**. classifier =
+     {self_loop|cross_trace_cycle, member_count}, armable }`. Anchors compared by `{proto.id, pc}`,
+     never pointer order.
+   - **rebind (existing `RegionId`):** **compare canonical `member_points` (+ handoff endpoints)**
+     against the stored def (§A3.5 fail-closed). On **mismatch** ⇒ **tombstone** (`armable = false`) and
+     exclude it from the physical indices — the A-ii def-consistency tombstone (round-11 finding 3),
+     distinct from the A-iv gate tombstone.
+   An unchanged region re-interns to the same id (idempotent); a grown/shrunk edge set legitimately mints
+   a new id and the old `RegionDef` persists (harmless, for re-record rebinding).
+4. **Classification indices (scratch, then publish).** Since the SCC nodes are anchors, "member trace"
+   must be defined **physically** (round-12 finding 3): a live trace `T` is a **physical member** of `R`
+   iff `T.anchor` is one of `R`'s anchor nodes **and** `T` actually *realizes* at least one of `R`'s
+   internal edges — i.e. `T` has a keyed exit `e` whose `StructuralEdgeId` (with `T`'s own provenance) is
+   in `R`'s member set. A sibling at a member anchor that realizes **none** of `R`'s internal edges is
+   **not** a member. Then, for each **physical member** `T` and each keyed exit `e`:
+   `source_exit_regions[{T.id, e}] ∋ RegionId` — for `e`'s edge if internal, **and** for a boundary exit
+   that leaves `R` *from a member anchor of `R` realized by `T`* (§A3.5's "incl. edges that leave `R`",
+   now scoped to members, not any sibling). `dest_entry_regions[T'.id] ∋ RegionId` **only for physical
+   members `T'`** that are the destination of an internal edge — never every sibling sharing the
+   destination anchor. Both **exclude** `armable == false` ids, keyed by the concrete `Trace.id`
+   (round-8 review; the mandatory sibling test). **The whole physical set (`edge_cache`,
+   `source_exit_regions`, `dest_entry_regions`) is cleared and rebuilt wholesale each pass** — never
+   incrementally mutated — so SCC growth cannot leave stale old-`RegionId` bindings attached alongside
+   the new ones (round-11 finding 2).
+
+**`classifyExit(key: ExitKey) -> []RegionId`** — a pure query returning `source_exit_regions[key]` (or
+empty). Unread by production in A-ii (`accountRegionProfit` is a no-op) but unit-tested directly so the
+whole classifier is exercised inertly, exactly as A-i's `provAt` was queryable-but-unread.
+
+**Lifetimes / teardown wiring (§A3.1, §A7):**
+- `region_defs` + `region_intern`: **never** touched by `removeTrace` (`trace.zig:3615`) — cleaning
+  them on a GC-physical retire would diverge `gc_stress on/off`. Cleared **only** wholesale in
+  `clearCache` (`trace.zig:3664`), added to its transient-reset list next to the existing maps, and to
+  the `interp.zig:9030` "cache actually empty after flush" guard test.
+- `source_exit_regions` / `dest_entry_regions` / `edge_cache`: **physical + transient.** `removeTrace`
+  **rebuilds the whole physical set from the surviving cache** (round-11 finding 2) — NOT a surgical
+  delete of the retiring trace's keys — because dropping one SCC member changes which edges remain
+  internal and so invalidates *surviving* traces' bindings, not just the retiring one's. (Simplest: drop
+  the trace, then re-run the fail-soft physical-rebuild pass; region_defs/region_intern untouched.)
+  **On a rebuild OOM, publish EMPTY physical indices** (fail-closed — the prior set references the dead
+  trace, round-12 finding 2), never retain the broken set. `clearCache` clears all; `deinit` frees all.
+  The retiring trace's *membership* in a persistent `RegionDef` is untouched (that's logical).
+- recorded program-point paths (A-ii.3): transient per-trace metadata, freed on retire and flush.
+
+**The `accountTraceRun` / `accountRegionProfit` split (§A3.2), inert form:** `onSideExit`
+(`trace.zig:1759`) keeps its exact `(self, t, completed)` signature; its body becomes
+```zig
+self.accountTraceRun(t, completed);   // the OLD body, verbatim — selection/coverage/hit_count UNCHANGED
+self.accountRegionProfit(null);       // no-op in A-ii (§A8 step 2)
+```
+Mark the wrapper, the verbatim `accountTraceRun`, and the empty `accountRegionProfit` **`inline`**
+(round-11 finding 4): the extra call boundary is then compiled away, keeping even the `--jit-coverage`
+`readCycles` attribution span (`trace.zig:1144`) identical. **Byte-identity across the 10 modes does not
+actually rest on this** — `readCycles` is `rdtsc`, gated on `--jit-coverage`/`--jit-stats` (off by
+default), lives solely in the stderr/report path, and never feeds selection (`trace.zig:1136-1144`) — but
+`inline` makes the split literally transparent rather than argued.
+`accountRegionProfit(key: ?ExitKey) void` is an empty function in A-ii. **Per-site `?ExitKey` threading
+is deferred to A-iv** (where the profit half first reads it): a no-op consumer makes the key dead, and
+threading a real `{Trace.id, exit_instr}` through all ~9 real-receipt sites (each must have `exit_instr`
+in hand) is exactly the wiring A-iv needs — doing it here would be churn against a no-op. The synthetic
+`onSideExit(seed, 0)` sites (`trace.zig:2918/3083`, and the `(succ,0)`/`(inner,0)`/`(owner,0)` control
+receipts) already pass no key and stay null. So A-ii.1 is a zero-call-site-change internal rename ⇒
+provably byte-identical; the classifier is exercised by testing `classifyExit` directly.
+
+**A-ii sub-steps (mirroring A-i; each green + byte-identical, gated by `just test` default +
+`-Djit-debug`, with nsieve/nbody/mandelbrot tier-0 ≡ native):**
+- **A-ii.1 — `accountTraceRun`/`accountRegionProfit` split (inert).** Rename `onSideExit`'s body to
+  `accountTraceRun` verbatim; `onSideExit` calls it then the no-op `accountRegionProfit(null)`. No
+  call-site changes. Test: a `accountTraceRun` receipt-equivalence test + the negative control.
+- **A-ii.2 — `StructuralEdgeId` + ephemeral `edge_cache` + successor resolution (inert).** Define the
+  type + field-wise `canonicalLessThan`/`canonicalEql`/`canonicalHash`; build `edge_cache` at commit by
+  resolving each keyed exit to a successor **anchor** `{succ_proto, succ_pc}` (`guardExitPc` for the
+  resume PC; `.link_terminal` → named inner root validated by `isInnerLoopRoot`), confirming a compatible
+  trace is bound there. `clearCache` clears all; `removeTrace` **rebuilds the physical set from the
+  surviving cache** (not surgical deletion), fail-closed to empty on OOM (round-12). Read by nothing.
+  Tests: cache built correctly on a hand-built 2-anchor graph incl. a `.link_terminal` edge; wholesale
+  rebuild on retire; canonical-order total-order property.
+- **A-ii.3 — recorded `{proto_id, source_pc}` membership substrate (inert).** Capture the per-trace
+  ordered recorded program-point path (transient per-trace metadata) — a hook in `recordInstr`
+  (`trace.zig:4255`) collecting `{proto_id: proto.id, source_pc = pc -| 1}` for every recorded guest op
+  (the `pc` there is post-increment, matching A-i's `cur_pc -| 1` — round-11 finding 6; only
+  guard/producer sites stamp today, membership needs the full path). **Fail-soft:** an alloc failure in
+  the hook marks membership *unavailable* for that trace and continues recording — it must **NOT**
+  introduce a new `.alloc` trace abort (round-11 finding 4). Freed on retire/flush. Read by nothing.
+  Tests: path captured for a small recorded loop (`source_pc = pc − 1`); re-record stability; freed on
+  retire (leak-checked).
+- **A-ii.4 — `region_defs` discovery + `RegionId` interning + classification indices + `classifyExit`
+  (inert).** The discovery algorithm above; `region_intern` (hash-bucketed, full-sorted-set equality);
+  `region_defs` (Proto/VM-lifetime); `source_exit_regions`/`dest_entry_regions` (physical, transient);
+  `classifyExit` pure query; `clearCache`/`removeTrace`/`deinit`/`interp.zig:9030` wiring.
+  `accountRegionProfit` stays no-op. Tests: discovery on a synthetic `skip→ramp→inner→cont→skip` graph
+  **that includes the outer-loop incoming boundary edge into `skip@14`** → asserts `owner == skip@14`
+  **and `armable == true`** (load-bearing for the owner predicate — round-13 review; a missing boundary
+  edge would silently classify the region ambiguous/unarmable); mints one stable `RegionId`;
+  **re-record** the same graph (new `Trace.id`s) → **same** `RegionId`
+  (guest-logical rebinding); forced hash **collision** (equal hash, unequal set) mints a **distinct**
+  id; **sibling-trace** boundary-edge test (two traces at one anchor share a boundary `StructuralEdgeId`,
+  only one is a member → assert the **candidate SETS**: `source_exit_regions`/`dest_entry_regions`
+  contain `R` for the member's keys and not the non-member's — NOT "credit/opening," which is A-iv
+  behaviour that does not exist yet, round-11 finding 6); **rebind-mismatch tombstone** (same edge set,
+  incompatible `member_points` → `armable` flips `false`, purged from physical indices);
+  `clearCache` empties the physical indices + `region_intern` **and** `region_defs` (the
+  flush case) while `removeTrace` leaves `region_defs` intact; boundary edges excluded from the intern
+  set.
+
+**Resolved by the round-11 `gpt-5.6-sol` review (2026-07-21) = BLOCKER, 6 findings + 4 calls, all folded
+above:**
+1. **Discovery trigger + cost — full-cache O(V+E) rebuild per commit, made transactional + fail-soft; no
+   incremental algorithm.** (Folded into the discovery-algorithm header + finding-4 fail-soft rules.)
+2. **`owner` — NOT an arbitrary canonical minimum.** The unique structural outer/external-entry loop
+   root; if no unique owner is provable, mint the region **`armable = false`**. Anchors compared by
+   `{proto.id, pc}`, never pointer order. (Folded into discovery step 3.)
+3. **`?ExitKey` threading — defer to A-iv.** Null-only, `inline` no-op wiring is the stronger inert
+   landing. (Confirmed; A-ii.1 keeps `onSideExit`'s signature.)
+4. **`member_points` — capture paths in A-ii.3, but A-ii.4 MUST add + validate handoff endpoints before
+   interning/publishing the def** (deferring would publish an incomplete persistent `RegionDef`). (Folded
+   into discovery step 3 first-sight + A-ii.4 tests.)
+
+The six BLOCKER findings folded: (1) SCC graph keyed by guest-logical `{proto_id,pc}` anchors, not
+concrete `Trace` pointers / `findTrace`-selected successors (identity must not depend on mutable
+`hit_count`); (2) physical indices cleared+rebuilt wholesale each pass, and `removeTrace` rebuilds from
+the surviving cache (not surgical key deletion) since dropping an SCC member invalidates survivors'
+bindings; (3) the def-consistency rebind tombstone (`armable=false` on incompatible-membership rebind)
+lands in A-ii.4, so `armable` *can* flip in A-ii; (4) discovery + the recorded-path hook are fail-soft
+(OOM never propagates through `commit`/gates the anchor/leaves half-rebuilt state, never a new `.alloc`
+abort), and the split is `inline`; (5) `StructuralEdgeId` canonical order/hash/eql are **field-wise**
+honoring `inline_depth` (compare `path[0..inline_depth]`), never `std.mem.asBytes`/full-union `eql` on
+the padded tagged union; (6) `source_pc = pc − 1` in the A-ii.3 hook, sibling test asserts candidate
+sets (not A-iv credit), handoff endpoints validated in A-ii.4, and the "~9 receipt sites" count is
+re-inventoried fresh when A-iv threads keys.
+
+**Round-12 `gpt-5.6-sol` re-review (2026-07-21) = BLOCKER, 5 findings, all folded above:** (1)
+transactionality now covers the **logical** maps too — `region_intern`/`region_defs`/tombstones are
+staged in scratch and published in one infallible `ensureUnusedCapacity`-then-apply phase, so an OOM
+never half-applies an intern or a def without its physical bindings; (2) the two OOM outcomes split by
+site — **commit** retains the prior coherent snapshot, **retirement** fail-closes to **empty** physical
+indices (the prior set references a dead trace); (3) "member trace" is now defined **physically** — a
+live trace that *realizes* ≥1 of the region's internal edges — and `dest_entry_regions` is populated
+only for such physical members, not every sibling at the destination anchor; (4) `owner` is now an
+**executable predicate** (unique SCC anchor that is both external-entry — destination of an incoming
+boundary edge — and loop-root by `isInnerLoopRoot`; else deterministic placeholder + `armable=false`);
+(5) the two stale contradictions fixed — `RegionInternMap` uses element-wise `canonicalEql` (not
+`std.mem.eql`), and A-ii.2 reflects anchor-node resolution + wholesale surviving-cache rebuild.
+
+**Round-13 `gpt-5.6-sol` re-review (2026-07-21) = BLOCKER, 2 findings, folded:** (1) two stale
+code-sketch comments corrected — `RegionDef.armable` now names both the A-ii incompatible-rebind
+tombstone and the A-iv gate tombstone; the physical-field comment now says wholesale rebuild per
+discovery/retirement with retirement-OOM → empty (not "drop the retiring trace's entries"); (2) the
+owner predicate gets a load-bearing test — the synthetic target graph includes the incoming boundary
+edge into `skip@14` and asserts `owner == skip@14 ∧ armable == true`, so an accidental
+ambiguous/unarmable classification of the intended region is caught.
 
 ##### A9 — Review log + residual questions
 
