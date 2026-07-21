@@ -583,6 +583,14 @@ fn exitProvEntryLess(_: void, a: ExitProvEntry, b: ExitProvEntry) bool {
     return a.index < b.index;
 }
 
+/// Physical classification key for the region-accounting layer (doc 17 §A3.3): a
+/// concrete trace exit = `{Trace.id, exit_instr}`. `accountRegionProfit` receives
+/// an `?ExitKey` — real guard/`.link_terminal` receipts carry the key; synthetic
+/// scalar-burst / prologue-fail events with no real instruction index pass `null`.
+/// Inert in A-ii (the profit half is a no-op; nothing constructs a non-null key
+/// until A-iv threads it per-site — §A8-ii).
+pub const ExitKey = struct { trace_id: u32, exit_instr: u32 };
+
 /// Remap the recorder's dense, emission-indexed exit-provenance table (A-i.1) into
 /// the committed trace's compact, sorted `[]ExitProvEntry`, keyed by committed
 /// instruction index. `old_to_new` is `tropt`'s compaction map (emission index →
@@ -1756,7 +1764,38 @@ pub const TraceState = struct {
     /// bumps the trace's `hit_count` (frequency-based trace prioritisation); a
     /// low-yield one bumps the penalty, and at `max_penalty` the anchor is gated
     /// off with a doubling cooldown (`gateAnchor`).
-    pub fn onSideExit(self: *TraceState, t: *Trace, completed: usize) void {
+    /// The tier-side-exit accounting hook (doc 17 §A3.2). Split into two halves as
+    /// of A-ii.1:
+    ///   • `accountTraceRun` — per-segment SELECTION accounting (coverage / penalty /
+    ///     gate / `hit_count`), which steers future trace recording. **Unchanged from
+    ///     the pre-split body**, so trace selection stays byte-identical across the 10
+    ///     replay modes.
+    ///   • `accountRegionProfit` — the region-profit / gate-B half (§A3.5). A **no-op**
+    ///     in A-ii; it will consume the `?ExitKey` classifier + `region_profit`
+    ///     accumulator from A-iv onward. Per-site key threading is deferred to A-iv
+    ///     (a no-op consumer makes the key dead), so every caller keeps `onSideExit`'s
+    ///     3-arg signature and this wrapper passes `null`.
+    /// The wrapper + both halves are `inline`, so the split compiles to the same code
+    /// the single body did (keeping even the `--jit-coverage` `readCycles` attribution
+    /// boundary identical — byte-identity does not rest on it, but the split is then
+    /// literally transparent rather than argued).
+    pub inline fn onSideExit(self: *TraceState, t: *Trace, completed: usize) void {
+        self.accountTraceRun(t, completed);
+        self.accountRegionProfit(null);
+    }
+
+    /// Region-profit / gate-B accounting half (§A3.5). **No-op in A-ii** (A-iv fills
+    /// the body: classify the exit via `?ExitKey`, drive the per-activation
+    /// `region_profit` accumulator, flush every `N`-window, gate on the region owner).
+    pub inline fn accountRegionProfit(self: *TraceState, key: ?ExitKey) void {
+        _ = self;
+        _ = key;
+    }
+
+    /// Per-segment SELECTION accounting — the pre-A-ii-split `onSideExit` body,
+    /// verbatim. Keeps trace selection (coverage / penalty / gate / `hit_count`)
+    /// byte-identical.
+    pub inline fn accountTraceRun(self: *TraceState, t: *Trace, completed: usize) void {
         const key = t.anchor;
         // JIT coverage (gated): this is the single per-trace-commit hook — every
         // trace run (tier-1a/1b, direct dispatch or a `driveChain` hop) reaches here
@@ -8289,4 +8328,43 @@ test "A-i.4 transport: recForPrepLink commits a .link trace carrying .link_termi
     try testing.expect(prov == .link_terminal);
     try testing.expectEqual(@as(u32, 4), prov.link_terminal.source_pc); // cur_pc 5 − 1
     try testing.expectEqual(@as(u8, 0), prov.link_terminal.inline_depth); // never inlined
+}
+
+test "A-ii.1 split: onSideExit ≡ accountTraceRun (accountRegionProfit is a no-op)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    // Two distinct anchors under one proto; drive one through the public `onSideExit`
+    // wrapper and the other through `accountTraceRun` directly, with the SAME
+    // completed-count sequence, then assert byte-identical selection state. Since
+    // `accountRegionProfit(null)` is a no-op in A-ii, the wrapper must leave exactly
+    // the state the bare selection half does.
+    var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil) };
+    const proto = Proto{ .code = &code, .name = "t", .num_registers = 1 };
+    var t_wrap: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var t_bare: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 1 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+
+    // A run of low-yield exits (< min_useful) accumulates penalty and, at max_penalty,
+    // gates the anchor. Feed exactly max_penalty low-yield events.
+    var i: u32 = 0;
+    while (i < state.config.max_penalty) : (i += 1) {
+        state.onSideExit(&t_wrap, 0);
+        state.accountTraceRun(&t_bare, 0);
+    }
+    // Both anchors gated identically; hit_count untouched (never reached min_useful).
+    try testing.expect(state.isGated(t_wrap.anchor));
+    try testing.expect(state.isGated(t_bare.anchor));
+    try testing.expectEqual(@as(u64, 0), t_wrap.hit_count);
+    try testing.expectEqual(@as(u64, 0), t_bare.hit_count);
+
+    // A useful exit (>= min_useful) bumps hit_count and clears penalty for both.
+    state.onSideExit(&t_wrap, state.config.min_useful);
+    state.accountTraceRun(&t_bare, state.config.min_useful);
+    try testing.expectEqual(@as(u64, 1), t_wrap.hit_count);
+    try testing.expectEqual(@as(u64, 1), t_bare.hit_count);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(t_wrap.anchor));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(t_bare.anchor));
+    // Both anchors' penalty entries cleared by the useful exit → map empty (no stray
+    // key left by either half).
+    try testing.expectEqual(@as(usize, 0), state.penalty.count());
 }

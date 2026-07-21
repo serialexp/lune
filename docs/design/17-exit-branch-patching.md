@@ -268,9 +268,15 @@ land; move whole sections to Done once everything inside is checked.
   tier-0 ≡ native negative control). First *consumer* of the A-i `ExitProvenance` substrate (for
   discovery/classification only, never selection). Four green sub-steps, each `just test` +
   `-Djit-debug`:
-  - [ ] **A-ii.1 — `accountTraceRun`/`accountRegionProfit` split (inert).** Rename `onSideExit`'s body
-    to `accountTraceRun` verbatim; `onSideExit` calls it then no-op `accountRegionProfit(null)`. Zero
-    call-site changes (per-site `?ExitKey` threading deferred to A-iv). Byte-identical by construction.
+  - [x] **A-ii.1 — `accountTraceRun`/`accountRegionProfit` split (inert). LANDED 2026-07-21.** `just
+    test` green (default + `-Djit-debug`); nsieve/nbody/mandelbrot tier-0 ≡ native byte-identical.
+    `onSideExit` (`trace.zig:1759`) is now an `inline` wrapper calling `accountTraceRun` (the old body
+    verbatim — selection/coverage/penalty/gate/`hit_count` unchanged) then the no-op
+    `accountRegionProfit(?ExitKey)` (both `inline` → same codegen). Added the `ExitKey{trace_id,
+    exit_instr}` type (inert; nothing constructs a non-null key until A-iv). Zero call-site changes
+    (per-site key threading deferred to A-iv). Test: `onSideExit ≡ accountTraceRun` equivalence over a
+    low-yield-then-useful sequence (identical penalty/gate/`hit_count`), since `accountRegionProfit(null)`
+    is a no-op.
   - [ ] **A-ii.2 — `StructuralEdgeId` + ephemeral `edge_cache` + successor resolution (inert).** Type +
     canonical total order; build `(Trace.id,exit_instr)→StructuralEdgeId` at commit via
     `guardExitPc`→`findTrace`/link-terminal; drop in `removeTrace`/`clearCache`. Read by nothing.
