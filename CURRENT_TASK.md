@@ -1,5 +1,59 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-21 (LATEST-19) — A-i COMPLETE; A-ii DESIGNED+APPROVED; A-ii.1/2/3 LANDED+COMMITTED+green; A-ii.4 (the big one) remaining, fully grounded.
+
+**Landed this session (all green: `just test` default + `-Djit-debug`; nsieve/nbody/mandelbrot tier-0≡native):**
+- `ac276da` A-ii.1 split (onSideExit → accountTraceRun + no-op accountRegionProfit; ExitKey type).
+- `7b0c500` A-ii.2 StructuralEdgeId + field-wise order/eql/hash + edge_cache + rebuildEdgeCache
+  (resolveSuccessorAnchor faithful to driveChain; hasInnerRootAt; wired commit/removeTrace/clearCache/deinit).
+- `2c4de54` A-ii.3 ProgramPoint + Recorder.rec_path/rec_path_ok (fail-soft recordInstr hook) →
+  owned Trace.rec_path at commit; freed in destroy; reset/deinit wired.
+
+**NEXT: A-ii.4 — region_defs discovery + RegionId interning + classification indices + classifyExit
+(inert).** Full spec = doc 17 §A8-ii discovery algorithm (steps 1-4) + the round-11/12/13 folds. Concrete
+build list (all on TraceState; edge_cache/StructuralEdgeId/ProgramPoint/rec_path already exist):
+- Types: `RegionId = enum(u64){_}`; `RegionClassifier{kind: {self_loop,cross_trace_cycle}, member_count:u32}`;
+  `RegionDef{members:[]StructuralEdgeId (sorted internal), member_points:[]ProgramPoint (sorted union),
+  owner:AnchorKey, classifier, armable:bool}`.
+- `RegionInternMap`: hand-written (key = variable-length sorted []StructuralEdgeId; hash-bucketed via
+  StructuralEdgeId.hash fold; a hit confirmed by element-wise `StructuralEdgeId.eql`; collision mints a
+  distinct RegionId). Owns a copy of the sorted slice.
+- Fields: `region_defs: AutoHashMap(RegionId, RegionDef)` (Proto/VM-lifetime, NEVER removeTrace-cleaned;
+  cleared ONLY in clearCache); `region_intern` (same lifetime); `source_exit_regions: AutoHashMap(ExitKey,
+  []RegionId)`, `dest_entry_regions: AutoHashMap(u32 trace_id, []RegionId)` (physical, wholesale rebuilt).
+- Discovery (`rebuildRegions`, called right after `rebuildEdgeCache` at commit + removeTrace):
+  1. Build anchor-node graph from edge_cache (nodes = {proto_id,pc} anchors, edges = StructuralEdgeId).
+  2. Tarjan SCC; each SCC with a cycle (size≥2 or self-edge) = region candidate.
+  3. Internal vs boundary edge partition (boundary = leaves SCC; EXCLUDED from intern set). Sort internal
+     by StructuralEdgeId.lessThan → intern → RegionId. getOrPut region_defs: first-sight build; rebind →
+     compare canonical member_points → mismatch tombstones (armable=false) + exclude from physical indices.
+  4. owner = UNIQUE anchor that is external-entry (dest of an incoming boundary edge from OUTSIDE the SCC)
+     AND loop-root (hasInnerRootAt / a bound trace isInnerLoopRoot); else placeholder = canonically-smallest
+     SCC anchor {proto.id,pc} + armable=false.
+  5. Physical member = live trace realizing ≥1 internal edge (has the keyed exit whose StructuralEdgeId ∈
+     members). source_exit_regions[{T.id,e}]∋R incl. boundary-leave from a member anchor realized by T;
+     dest_entry_regions[T'.id]∋R only for physical-member successors. Exclude armable==false.
+  - **TRANSACTIONAL + FAIL-SOFT** (round-12 findings 1/2): stage ALL (new interns, new/updated defs,
+    tombstones, physical indices) in scratch, `ensureUnusedCapacity` on the live maps for the delta, then
+    ONE infallible apply. OOM in staging → discard scratch, leave prior maps intact. **Commit-OOM retains
+    prior snapshot; retirement-OOM publishes EMPTY physical indices** (prior refs a dead trace).
+- `classifyExit(key: ExitKey) []RegionId` → source_exit_regions[key] or empty (pure query, unread, unit-tested).
+- Teardown: clearCache clears region_defs+region_intern+source_exit_regions+dest_entry_regions (+ the
+  interp.zig:9030 "empty after flush" guard test — ADD these maps to it); removeTrace rebuilds physical
+  indices wholesale (region_defs untouched); deinit frees all (RegionDef.members/member_points owned;
+  region_intern owns slices; the []RegionId values in the physical maps owned).
+- Tests (mandatory): synthetic skip→ramp→inner→cont→skip graph WITH the outer incoming boundary edge into
+  skip@14 → owner==skip@14 ∧ armable==true; stable RegionId; re-record (new Trace.ids) → same RegionId;
+  forced hash collision → distinct id; sibling boundary-edge → candidate SETS correct (member vs non-member);
+  rebind-mismatch tombstone; boundary edges excluded from intern set; clearCache empties all incl region_defs
+  while removeTrace leaves region_defs intact.
+- accountRegionProfit STAYS no-op (A-ii is inert end-to-end). After A-ii.4: request post-landing gpt-5.6-sol
+  review of the whole A-ii implementation (the checkpoint-APPROVE), mirroring A-i.
+
+**Watch:** Rule Z-1 `**` array-repeat needs the explicit-loop form (bit us twice). AutoHashMap value slices
+([]RegionId) must be freed per-entry on clear/rebuild/deinit (iterate valueIterator) — no leak.
+
+---
 ## Status 2026-07-21 (LATEST-18) — A-i COMPLETE; A-ii DESIGNED+APPROVED; A-ii.1 LANDED+COMMITTED; A-ii.2 grounded, ready to code.
 
 **Cadence (Bart):** "First fix the current task, then design it first, then ask gpt-5.6-sol for a review,
