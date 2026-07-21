@@ -708,6 +708,9 @@ pub fn restoreSnapshot(
         if (fr.base != expected_base) return error.FrameWindowMismatch;
         vm.frames[i] = .{
             .closure = cl,
+            // `call_seq` is transient JIT-tiering state, not a wire field. Re-key
+            // the restored live stack deterministically by physical frame order.
+            .call_seq = @intCast(i),
             .base = fr.base,
             .pc = fr.pc,
             .ret_dest = fr.ret_dest,
@@ -716,6 +719,9 @@ pub fn restoreSnapshot(
         expected_base += cl.proto.num_registers;
     }
     vm.depth = @intCast(kf.frames.len);
+    // Park the next key strictly above the restored live range. A later physical
+    // push goes through `pushFrameVararg`, including its checked-exhaustion guard.
+    vm.next_call_seq = @intCast(vm.depth);
 
     for (kf.open_upvalues) |ou| {
         const uh = idmap.get(ou.upvalue_id) orelse return error.UnresolvedHeapRef;
@@ -2275,6 +2281,91 @@ test "F2c: independent VMs suspended at the same cut produce byte-identical keyf
         // the mid-execution extension of the run-twice determinism property.
         try testing.expectEqualSlices(u8, mid_a, mid_b);
     }
+}
+
+test "A-iii: recursive live frames re-key deterministically across keyframe restore and re-record" {
+    const gpa = testing.allocator;
+    const source =
+        \\local function descend(n)
+        \\  if n == 0 then
+        \\    local x = 0
+        \\    while x < 4 do x = x + 1 end
+        \\    return x
+        \\  end
+        \\  return descend(n - 1)
+        \\end
+        \\print(descend(5))
+    ;
+
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    // Consume an earlier epoch first, so the suspended stack's live keys do not
+    // happen to equal their indices. This makes restore-time re-keying observable
+    // and proves capture did not smuggle the old values through a wire field.
+    _ = try vm.run(chunk.proto);
+    const prior_next = vm.next_call_seq;
+    try testing.expect(prior_next > 0);
+
+    vm.suspend_ctl = .{ .min_depth = 5, .after_safepoints = 0 };
+    try testing.expect((try vm.start(chunk.proto)) == .suspended);
+    try testing.expect(vm.depth >= 5);
+    try testing.expectEqual(prior_next + vm.depth, vm.next_call_seq);
+    for (vm.frames[0..vm.depth], 0..) |frame, i| {
+        try testing.expectEqual(prior_next + i, frame.call_seq);
+    }
+    // Main is frame 0; the remaining live frames are several activations of the
+    // same recursive proto, and must still have distinct activation identities.
+    const recursive_proto = vm.frames[1].closure.proto;
+    for (vm.frames[1..vm.depth]) |frame| {
+        try testing.expectEqual(recursive_proto, frame.closure.proto);
+    }
+
+    const mid = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(mid);
+    const restored = try restore(gpa, mid, chunk.proto, NativeRegistry.base());
+    defer {
+        restored.deinit();
+        gpa.destroy(restored);
+    }
+    try testing.expectEqual(vm.depth, restored.depth);
+    for (restored.frames[0..restored.depth], 0..) |frame, i| {
+        try testing.expectEqual(@as(u64, @intCast(i)), frame.call_seq);
+    }
+    try testing.expectEqual(@as(u64, @intCast(restored.depth)), restored.next_call_seq);
+
+    // Re-recording and restoring the same live keyframe produces the same
+    // index-ordered transient keys. The bytes remain identical because call_seq
+    // is intentionally absent from FrameRef.
+    const rerecorded = try encodeSnapshot(gpa, restored);
+    defer gpa.free(rerecorded);
+    try testing.expectEqualSlices(u8, mid, rerecorded);
+    const restored_again = try restore(gpa, rerecorded, chunk.proto, NativeRegistry.base());
+    defer {
+        restored_again.deinit();
+        gpa.destroy(restored_again);
+    }
+    for (restored_again.frames[0..restored_again.depth], 0..) |frame, i| {
+        try testing.expectEqual(@as(u64, @intCast(i)), frame.call_seq);
+    }
+
+    // A subsequent physical push takes the first key above the restored range.
+    const old_depth = restored.depth;
+    const top_closure = restored.frames[old_depth - 1].closure;
+    try restored.pushFrame(top_closure, restored.stack_top, 0, 0);
+    try testing.expectEqual(@as(u64, @intCast(old_depth)), restored.frames[old_depth].call_seq);
+    try testing.expectEqual(@as(u64, @intCast(old_depth + 1)), restored.next_call_seq);
 }
 
 test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMismatch)" {

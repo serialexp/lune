@@ -350,6 +350,10 @@ pub const OpenUpvalue = struct { index: usize, cell: *function.Upvalue };
 pub const CallFrame = struct {
     /// The closure executing in this frame (its proto = code/constants/upvalues).
     closure: *const Closure,
+    /// Transient activation identity for JIT-tiering state. Assigned exactly once
+    /// at the physical frame-push choke point; traces never read or mutate it in
+    /// A-iii. Keyframes deliberately omit it and restore re-keys live frames.
+    call_seq: u64,
     /// Register-window start: this frame's registers are `stack[base .. base+nreg]`.
     base: usize,
     /// Resumable cursor: index of the next instruction in `closure.proto.code`.
@@ -552,6 +556,9 @@ pub const Vm = struct {
     /// frame's prototype constants alive) and the keyframe serializer captures for
     /// mid-execution resume. Sized to the call-depth bound, so it never allocates.
     frames: [max_call_depth]CallFrame = undefined,
+    /// Next transient activation identity. Monotonic for this VM run; exhaustion
+    /// is checked at frame push so a wrapped/duplicate identity is never exposed.
+    next_call_seq: u64 = 0,
     /// Current native→VM reentry nesting (`callValue`). Bounded by
     /// `max_native_reentry` to keep a `pcall`/comparator chain from overflowing the
     /// Zig host stack. Incremented around each nested `execWith`, restored after.
@@ -1440,8 +1447,12 @@ pub const Vm = struct {
         if (self.depth >= max_call_depth) return Error.StackOverflow;
         const nreg = closure.proto.num_registers;
         if (base + nreg > self.regCapacity()) return Error.StackOverflow;
+        const call_seq = self.next_call_seq;
+        if (call_seq == std.math.maxInt(u64)) @panic("VM call_seq space exhausted");
+        self.next_call_seq = call_seq + 1;
         self.frames[self.depth] = .{
             .closure = closure,
+            .call_seq = call_seq,
             .base = base,
             .pc = 0,
             .ret_dest = ret_dest,

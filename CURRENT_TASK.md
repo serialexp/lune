@@ -1,5 +1,23 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-21 (LATEST-23) — **A-iii `call_seq` plumbing LANDED, inert + green. NEXT = A-iv (`region_profit` accumulator) per §A8 step 4.**
+
+Added transient `CallFrame.call_seq: u64` and per-VM monotonic `next_call_seq`. The single physical
+frame-push choke point `pushFrameVararg` assigns the current key and advances it; verified both bytecode
+`.call` and host-reentrant `callValue` funnel through it, with no bypass except keyframe restore. Counter
+exhaustion is release-enforced by a pre-publication `@panic` at `maxInt(u64)`, so silent wrap and key reuse
+are impossible. Restore deterministically re-keys the live physical stack by index and parks the next key
+above it (`frames[i].call_seq = i`, `next_call_seq = depth`). No wire field and no schema bump (the tree's
+existing H-2 schema remains v5); no production path reads `call_seq`, and `accountRegionProfit` stays a
+no-op.
+
+Guard coverage advances the counter in a prior epoch, suspends with several simultaneous recursive-proto
+activations, proves pre-restore monotonic assignment, then proves restore + re-record index ordering and a
+subsequent push at `depth`. `just test` green default + `-Djit-debug`; ReleaseFast nsieve 9 / nbody 20000 /
+sieve_int / pi_leibniz / grid_matmul / field_hash tier-0 ≡ `--trace --jit-native` byte-identical.
+
+---
+
 ## Status 2026-07-21 (LATEST-22) — **A-i `exit_prov` fail-soft parity + F5/F6 folded → re-APPROVED (checkpoint boundary still holds).** NEXT = A-iii (`call_seq` plumbing) per §A8 step 3.
 
 Second review arc on the A-ii landing. Bart approved extending the F1-style fail-soft treatment to the
