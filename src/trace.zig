@@ -1221,6 +1221,15 @@ pub const Trace = struct {
     /// when membership was *unavailable* (a recorder-path OOM flipped `rec_path_ok`)
     /// or for hand-built test traces. Owned; freed in `destroy`. Not serialized.
     rec_path: []ProgramPoint = &.{},
+    /// Whether `rec_path` is the COMPLETE recorded membership (doc 17 §A8-ii, A-ii.4
+    /// fail-soft — round-14 review finding 3). `false` iff a recorder-path OOM
+    /// (`rec_path_ok` flipped) OR the commit-time `rec_path` dup OOM'd truncated it, so
+    /// the two "empty" cases (unavailable vs legitimately empty) are distinguishable.
+    /// Region discovery fails any region containing an incomplete member CLOSED
+    /// (`armable = false`) rather than minting it on truncated membership. Default
+    /// `true` (a legitimately-empty path — incl. hand-built test traces — is complete).
+    /// Runtime-only — not serialized.
+    rec_path_complete: bool = true,
 
     /// The exit provenance at committed instruction index `idx`, or `null` if that
     /// instruction is not a tracked exit. Binary search over the sorted table.
@@ -1605,8 +1614,9 @@ pub const TraceState = struct {
     /// cache at every commit AND every retirement (never surgically mutated), dropped
     /// in `clearCache`, freed in `deinit`. NOT a source of truth — the region
     /// classifier (A-ii.4) will consume it. **Inert: read by nothing in A-ii ⇒
-    /// byte-identical.** A rebuild OOM leaves it EMPTY (fail-closed, safe since
-    /// read-by-nothing / region-neutral).
+    /// byte-identical.** A rebuild reserves capacity BEFORE clearing the prior snapshot,
+    /// so a commit-path OOM RETAINS it and a retirement-path OOM fail-closes to EMPTY
+    /// (both region-neutral while read-by-nothing).
     edge_cache: std.AutoHashMapUnmanaged(ExitKey, StructuralEdgeId) = .empty,
     /// Discovered region definitions keyed by interned `RegionId` (doc 17 §A3.1 /
     /// §A8-ii, A-ii.4). **Proto/VM-lifetime**: accumulated as traces commit, NEVER
@@ -3889,12 +3899,32 @@ pub const TraceState = struct {
     }
 
     /// Rebuild the ephemeral `edge_cache` WHOLESALE from the current cache (doc 17
-    /// §A8-ii, A-ii.2): clear it, then for every keyed exit of every cached trace with
-    /// a compatibly-bound successor, record `{Trace.id, exit_instr} → StructuralEdgeId`.
-    /// Called at every commit and every retirement (never surgically mutated). **Inert:
-    /// read by nothing in A-ii ⇒ byte-identical.** Fail-soft: an OOM leaves the cache
-    /// EMPTY (region-neutral for the not-yet-existing consumer), never propagating.
-    fn rebuildEdgeCache(self: *TraceState) void {
+    /// §A8-ii, A-ii.2): for every keyed exit of every cached trace with a compatibly-bound
+    /// successor, record `{Trace.id, exit_instr} → StructuralEdgeId`. Called at every commit
+    /// and every retirement (never surgically mutated). **Inert: read by nothing in A-ii ⇒
+    /// byte-identical.**
+    ///
+    /// **Transactional** (round-12 finding 2): the whole rebuild allocates its capacity
+    /// BEFORE clearing the
+    /// prior snapshot, so an OOM leaves the previously-published `edge_cache` untouched
+    /// rather than emptying it. `on_oom` picks the disposition when the (pre-clear)
+    /// reservation fails — `.retain` keeps the prior coherent snapshot (commit path),
+    /// `.empty` fails-closed to an empty (region-neutral) cache (retirement path, where the
+    /// prior snapshot references a now-dead trace). On the happy path the publish loop is
+    /// infallible (`putAssumeCapacity`), so the cache is never left half-applied.
+    fn rebuildEdgeCache(self: *TraceState, on_oom: RegionOom) void {
+        self.rebuildEdgeCacheFallible() catch switch (on_oom) {
+            .retain => {}, // prior snapshot still coherent — leave it published
+            .empty => self.edge_cache.clearRetainingCapacity(), // fail-closed → empty
+        };
+    }
+
+    fn rebuildEdgeCacheFallible(self: *TraceState) !void {
+        // Upper bound on live edges: one per recorded exit across every cached trace.
+        var upper: usize = 0;
+        for (self.cache.items) |t| upper += t.exit_prov.len;
+        // Reserve BEFORE clearing so an OOM here retains the prior published snapshot.
+        try self.edge_cache.ensureTotalCapacity(self.gpa, @intCast(upper));
         self.edge_cache.clearRetainingCapacity();
         for (self.cache.items) |t| {
             for (t.exit_prov) |e| {
@@ -3906,10 +3936,7 @@ pub const TraceState = struct {
                     .succ_anchor_proto_id = succ.proto_id,
                     .succ_anchor_pc = succ.pc,
                 };
-                self.edge_cache.put(self.gpa, .{ .trace_id = t.id, .exit_instr = e.index }, eid) catch {
-                    self.edge_cache.clearRetainingCapacity(); // fail-closed → empty
-                    return;
-                };
+                self.edge_cache.putAssumeCapacity(.{ .trace_id = t.id, .exit_instr = e.index }, eid);
             }
         }
     }
@@ -4110,6 +4137,13 @@ pub const TraceState = struct {
             owner: AnchorKey,
             classifier: RegionClassifier,
             armable_owner: bool,
+            /// Finding 3 (recorder-path completeness): true iff every physical member
+            /// trace was found by id AND carries a complete recorded path
+            /// (`rec_path_complete`). A truncated/absent membership must never mint or keep
+            /// an armable region — the discovered `member_points` would be a subset of the
+            /// real footprint, so arming on it could patch an exit whose region the def
+            /// under-describes. Gates `armable` on first-sight AND forces a rebind tombstone.
+            membership_complete: bool,
         };
         var candidates: std.ArrayListUnmanaged(Candidate) = .empty;
         defer {
@@ -4165,9 +4199,16 @@ pub const TraceState = struct {
                 try mp_list.append(gpa, .{ .proto_id = eid.anchor_proto_id, .source_pc = eid.anchor_pc });
                 try mp_list.append(gpa, .{ .proto_id = eid.succ_anchor_proto_id, .source_pc = eid.succ_anchor_pc });
             }
+            // membership_complete (finding 3): every member trace must be findable AND
+            // carry a complete recorded path, else the collected `member_points` are a
+            // subset of the true footprint and the region must not be armable.
+            var membership_complete = true;
             for (member_trace_ids) |tid| {
                 if (self.traceById(tid)) |t| {
+                    if (!t.rec_path_complete) membership_complete = false;
                     for (t.rec_path) |pp| try mp_list.append(gpa, pp);
+                } else {
+                    membership_complete = false;
                 }
             }
             std.mem.sort(ProgramPoint, mp_list.items, {}, programPointLess);
@@ -4220,6 +4261,7 @@ pub const TraceState = struct {
                     .member_count = comp_size[c],
                 },
                 .armable_owner = both_count == 1,
+                .membership_complete = membership_complete,
             });
         }
 
@@ -4277,13 +4319,18 @@ pub const TraceState = struct {
                 // Rebind: confirm compatible membership or fail closed (§A3.5).
                 const stored = self.region_defs.getPtr(existing_id) orelse return error.RegionGraphInconsistent;
                 const compatible = programPointsEqual(stored.member_points, cand.member_points);
-                if (!compatible) staged_tombstones.appendAssumeCapacity(existing_id);
-                const eff_armable = stored.armable and compatible;
+                // Finding 3: an incomplete membership tombstones the region too — the
+                // stored def may have been minted from a complete pass and must not stay
+                // armable once a truncated pass appears (fail-closed, sticky).
+                if (!compatible or !cand.membership_complete) staged_tombstones.appendAssumeCapacity(existing_id);
+                const eff_armable = stored.armable and compatible and cand.membership_complete;
                 const mt_copy = try gpa.dupe(u32, cand.member_trace_ids);
                 active_regions.appendAssumeCapacity(.{ .id = existing_id, .comp = cand.comp, .armable = eff_armable, .member_trace_ids = mt_copy });
             } else {
                 // First sight: mint an id and stage the intern + def (armable per owner).
                 const new_id: RegionId = @enumFromInt(new_id_counter);
+                // Finding 3: an incomplete membership can never mint an armable region.
+                const first_armable = cand.armable_owner and cand.membership_complete;
                 const edges_copy = try gpa.dupe(StructuralEdgeId, cand.sorted_internal);
                 errdefer gpa.free(edges_copy);
                 const members_copy = try gpa.dupe(StructuralEdgeId, cand.sorted_internal);
@@ -4298,9 +4345,9 @@ pub const TraceState = struct {
                     .member_points = points_copy,
                     .owner = cand.owner,
                     .classifier = cand.classifier,
-                    .armable = cand.armable_owner,
+                    .armable = first_armable,
                 } });
-                active_regions.appendAssumeCapacity(.{ .id = new_id, .comp = cand.comp, .armable = cand.armable_owner, .member_trace_ids = mt_copy });
+                active_regions.appendAssumeCapacity(.{ .id = new_id, .comp = cand.comp, .armable = first_armable, .member_trace_ids = mt_copy });
                 new_id_counter += 1;
             }
         }
@@ -4633,8 +4680,9 @@ pub const TraceState = struct {
                 }
                 // A-ii.2: a retired trace changes which edges remain resolvable for
                 // SURVIVING traces (not just its own), so rebuild the whole edge cache
-                // from the surviving cache — never a surgical key delete. Fail-soft.
-                self.rebuildEdgeCache();
+                // from the surviving cache — never a surgical key delete. Retirement OOM
+                // fail-closes to EMPTY (the prior snapshot references the now-dead trace).
+                self.rebuildEdgeCache(.empty);
                 // A-ii.4: rebuild the physical region indices from the surviving graph
                 // (region_defs persists). Retirement OOM fail-closes to EMPTY physical
                 // indices (the prior set references the now-dead trace).
@@ -5085,11 +5133,20 @@ pub const TraceState = struct {
         const exit_prov_owned = try buildExitProv(self.gpa, self.rec.exit_prov.items, fields.old_to_new, link_term);
         errdefer if (exit_prov_owned.len != 0) self.gpa.free(exit_prov_owned);
 
-        // A-ii.3: dup the recorder's ordered program-point path into the committed
-        // trace (empty if membership was unavailable — a recorder-path OOM). Owned;
-        // freed in `destroy`.
+        // A-ii.3/A-ii.4: dup the recorder's ordered program-point path into the
+        // committed trace. **FAIL-SOFT (round-14 review finding 1):** an OOM here must
+        // NOT abort the commit — `closeTrace` gates the anchor on a commit error, which
+        // would perturb tiering, and `rec_path` is inert region metadata. On ANY
+        // unavailability (recorder-path OOM flipped `rec_path_ok`, OR this dup OOMs)
+        // commit an empty path and mark membership INCOMPLETE (finding 3), so region
+        // discovery fails any region containing this trace CLOSED (`armable = false`)
+        // rather than minting on truncated membership. Owned; freed in `destroy`.
+        var rec_path_complete = self.rec.rec_path_ok;
         const rec_path_owned: []ProgramPoint = if (self.rec.rec_path_ok and self.rec.rec_path.items.len != 0)
-            try self.gpa.dupe(ProgramPoint, self.rec.rec_path.items)
+            (self.gpa.dupe(ProgramPoint, self.rec.rec_path.items) catch blk: {
+                rec_path_complete = false;
+                break :blk &.{};
+            })
         else
             &.{};
         errdefer if (rec_path_owned.len != 0) self.gpa.free(rec_path_owned);
@@ -5165,6 +5222,7 @@ pub const TraceState = struct {
             .inputs = inputs_owned,
             .exit_prov = exit_prov_owned,
             .rec_path = rec_path_owned,
+            .rec_path_complete = rec_path_complete,
         };
         try self.cache.append(self.gpa, t);
         // Coverage (gated): a trace now exists at this anchor, so subsequent
@@ -5172,8 +5230,8 @@ pub const TraceState = struct {
         if (self.config.coverage) self.markAnchorTraced(t.anchor);
         // A-ii.2: refresh the structural-edge cache — the new trace may add edges
         // FROM itself AND make pre-existing traces' exits newly resolvable. Fail-soft
-        // (never fails the commit); inert (read by nothing until A-ii.4).
-        self.rebuildEdgeCache();
+        // (never fails the commit); commit OOM RETAINS the prior coherent snapshot.
+        self.rebuildEdgeCache(.retain);
         // A-ii.4: rediscover regions over the refreshed graph. Commit OOM RETAINS the
         // prior physical snapshot (still coherent; the new trace just stays
         // unclassified). Fail-soft; inert (read by nothing in A-ii).
@@ -9400,7 +9458,7 @@ test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural 
 
     try state.cache.append(gpa, &cont);
     try state.cache.append(gpa, &inner);
-    state.rebuildEdgeCache();
+    state.rebuildEdgeCache(.retain);
 
     // Both structural edges present: cont --link--> inner(pc7), inner --loop_done--> cont(pc2).
     try testing.expectEqual(@as(usize, 2), state.edge_cache.count());
@@ -9417,7 +9475,7 @@ test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural 
     // has no inner root bound, and inner's own edge is gone → empty. (Simulate the
     // retirement rebuild path without `destroy` on a stack trace.)
     _ = state.cache.swapRemove(1); // drop &inner
-    state.rebuildEdgeCache();
+    state.rebuildEdgeCache(.retain);
     try testing.expectEqual(@as(usize, 0), state.edge_cache.count());
 }
 
@@ -9551,7 +9609,7 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
 
     for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
-    state.rebuildEdgeCache();
+    state.rebuildEdgeCache(.retain);
     state.rebuildRegions(.retain);
 
     // 5 structural edges (4 internal cycle + 1 incoming boundary), one discovered region.
@@ -9578,6 +9636,58 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     // dest_entry: the four cycle members are entries; the external trace is not.
     try testing.expect(state.dest_entry_regions.get(1) != null);
     try testing.expect(state.dest_entry_regions.get(5) == null);
+}
+
+test "A-ii.4 finding-3: a member with an incomplete recorded path mints the region NON-armable" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    // Same owner-bearing 5-trace graph as the armable test above, but one physical member
+    // (`skip`) carries a TRUNCATED recorded path (rec_path_complete=false, as a recorder-
+    // path OOM or a commit-time dup OOM would leave it). The region must still be
+    // discovered — its structural identity is unaffected — but must NOT be armable, and no
+    // member exit may be classified (the def's member_points under-describe the footprint).
+    const P_ID: u32 = 7;
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+    var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
+    var skip: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 14 }, .instrs = &skip_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &skip_p, .rec_path_complete = false };
+
+    var ramp_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+    var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
+    var ramp: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ramp_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ramp_p };
+
+    var inner_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
+    var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+    var inner: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_p };
+
+    var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+    var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
+    var cont: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p };
+
+    var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+    var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
+    var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
+
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
+    state.rebuildEdgeCache(.retain);
+    state.rebuildRegions(.retain);
+
+    // The region is still discovered (structural identity is unaffected by rec_path).
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    var kit = state.region_defs.keyIterator();
+    const def = state.region_defs.get(kit.next().?.*).?;
+    // …but incomplete membership forces it CLOSED, and no member exit is classified.
+    try testing.expect(!def.armable);
+    try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
+    try testing.expect(state.dest_entry_regions.get(1) == null);
+    try testing.expectEqual(@as(u32, 0), state.source_exit_regions.count());
+    try testing.expectEqual(@as(u32, 0), state.dest_entry_regions.count());
 }
 
 test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) re-interns to the SAME RegionId" {
@@ -9609,7 +9719,7 @@ test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) r
     }.go;
 
     try buildCycle(&state, gpa, &proto, 1, 2);
-    state.rebuildEdgeCache();
+    state.rebuildEdgeCache(.retain);
     state.rebuildRegions(.retain);
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
     var kit = state.region_defs.keyIterator();
@@ -9618,7 +9728,7 @@ test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) r
     // Retire both (heap traces → real destroy), then re-record with fresh ids.
     while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
     try buildCycle(&state, gpa, &proto, 11, 12);
-    state.rebuildEdgeCache();
+    state.rebuildEdgeCache(.retain);
     state.rebuildRegions(.retain);
     // Still ONE region, and the SAME id (not a second def).
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
@@ -9686,7 +9796,7 @@ test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credite
     var tx: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 40 }, .instrs = &x_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &x_p };
 
     for ([_]*Trace{ &ta, &tb, &tas, &tc, &tx }) |t| try state.cache.append(gpa, t);
-    state.rebuildEdgeCache();
+    state.rebuildEdgeCache(.retain);
     state.rebuildRegions(.retain);
 
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
@@ -9739,7 +9849,7 @@ test "A-ii.4 rebind tombstone: same edge set, incompatible member_points → arm
     }.go;
 
     try buildArmable(&state, gpa, &proto, .{ 1, 2, 3 }, .{ .proto_id = P_ID, .source_pc = 100 });
-    state.rebuildEdgeCache();
+    state.rebuildEdgeCache(.retain);
     state.rebuildRegions(.retain);
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
     var kit = state.region_defs.keyIterator();
@@ -9750,7 +9860,7 @@ test "A-ii.4 rebind tombstone: same edge set, incompatible member_points → arm
     // Re-record with a DIFFERENT A.rec_path (source_pc 200) → incompatible membership.
     while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
     try buildArmable(&state, gpa, &proto, .{ 11, 12, 13 }, .{ .proto_id = P_ID, .source_pc = 200 });
-    state.rebuildEdgeCache();
+    state.rebuildEdgeCache(.retain);
     state.rebuildRegions(.retain);
     // Same id (edge set unchanged), but tombstoned + purged from the physical index.
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
@@ -9780,7 +9890,7 @@ test "A-ii.4 lifetime: removeTrace preserves region_defs (logical); clearCache e
     b.* = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = b_i, .consts = try gpa.alloc(Value, 0), .entry_slots = try gpa.alloc(u16, 0), .entry_guards = try gpa.alloc(EntryGuard, 0), .exit_prov = try gpa.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .branch_cond) }}) };
     try state.cache.append(gpa, a);
     try state.cache.append(gpa, b);
-    state.rebuildEdgeCache();
+    state.rebuildEdgeCache(.retain);
     state.rebuildRegions(.retain);
     try testing.expectEqual(@as(usize, 1), state.region_defs.count());
 
