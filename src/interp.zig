@@ -1462,6 +1462,21 @@ pub const Vm = struct {
         };
         self.depth += 1;
         self.stack_top = base + nreg;
+        self.trace.setRegionContext(self.depth, call_seq);
+    }
+
+    /// Drop transient region accounting for every physical activation destroyed
+    /// by an explicit depth restore (pcall/xpcall unwind). Call before publishing
+    /// the smaller depth so the dying frames' activation ids are still available.
+    pub fn dropRegionActivationsFromDepth(self: *Vm, new_depth: u32) void {
+        if (new_depth > self.depth) @panic("region activation unwind raised depth");
+        var i = self.depth;
+        while (i > new_depth) {
+            i -= 1;
+            self.trace.dropRegionActivation(self.frames[i].call_seq);
+        }
+        if (new_depth > 0)
+            self.trace.setRegionContext(new_depth, self.frames[new_depth - 1].call_seq);
     }
 
     /// Call a lune callable from native (host) code, run it to completion, write up
@@ -1861,6 +1876,11 @@ pub const Vm = struct {
 
         const cur = pc.*;
         cur_pc.* = cur;
+        // A-iv logical-region departure observer. The empty-map common path does
+        // not call into the observer and cannot allocate; activation context is
+        // refreshed only on frame reload (execImpl/push/pop), not per instruction.
+        if (self.trace.regionProfitCount() != 0)
+            self.trace.observeRegionProgramPoint(proto.id, @intCast(cur), self.depth, frame.call_seq);
         // Keep the faulting location recoverable (see the old loop's note).
         frame.pc = cur;
         const i = code[cur];
@@ -1908,6 +1928,7 @@ pub const Vm = struct {
         var base = frame.base;
         var regs = self.frameWindow(base, proto.num_registers);
         var pc = frame.pc;
+        self.trace.setRegionContext(self.depth, frame.call_seq);
         // Threaded-dispatch loop locals. `step` writes `cur_pc`/`instr`/`a` and
         // advances `pc` on every fetch; declared here so each opcode arm can
         // re-dispatch with `continue :sw`. Always set by `step` before any use.
@@ -2369,6 +2390,7 @@ pub const Vm = struct {
                             base = frame.base;
                             regs = self.frameWindow(base, proto.num_registers);
                             pc = frame.pc;
+                            self.trace.setRegionContext(self.depth, frame.call_seq);
                             // Reloaded onto the callee frame; re-enter the outer
                             // loop so `step` fetches the callee's first instruction
                             // with a full prologue (GC/seq/suspend/recording).
@@ -2496,6 +2518,7 @@ pub const Vm = struct {
                         // in this frame's window (at `base + result.reg`) until the
                         // caller copies them out — `stack_top` is not shrunk here, so
                         // the live-register scan still roots them.
+                        self.trace.dropRegionActivation(frame.call_seq);
                         self.depth -= 1;
                         return .{ .finished = result };
                     }
@@ -2527,6 +2550,7 @@ pub const Vm = struct {
                     }
                     // Pop and reload locals onto the parent (its `pc` is already past
                     // the call), shrinking `stack_top` to the parent's window.
+                    self.trace.dropRegionActivation(frame.call_seq);
                     self.depth -= 1;
                     frame = &self.frames[self.depth - 1];
                     closure = frame.closure;
@@ -2535,6 +2559,7 @@ pub const Vm = struct {
                     base = frame.base;
                     regs = self.frameWindow(base, proto.num_registers);
                     pc = frame.pc;
+                    self.trace.setRegionContext(self.depth, frame.call_seq);
                     self.stack_top = base + proto.num_registers;
                     // Reloaded onto the parent frame; re-enter the outer loop so
                     // `step` fetches the parent's next instruction with a full
@@ -2984,7 +3009,13 @@ pub const Vm = struct {
                                     // This trace did useful work — keep its result.
                                     // (`linked_one_trip`: the committed loop-done IS one
                                     // enclosing iteration, replayLedger's `max(local, 1)`.)
-                                    self.trace.onSideExit(final, if (linked_one_trip) 1 else local_done);
+                                    self.trace.onSideExitReceipt(
+                                        final,
+                                        if (linked_one_trip) 1 else local_done,
+                                        result.exit_instr,
+                                        if (linked_one_trip or trace.isLoopDoneGuardIndex(final, result.exit_instr)) 1 else local_done,
+                                        .deferred,
+                                    );
                                     // Nested-loop linking (Phase 1): if this is an
                                     // inner numeric-`for` running to completion (its
                                     // terminal loop guard failed) and the exit lands
@@ -3142,7 +3173,7 @@ pub const Vm = struct {
                                 }
                                 // Zero iterations: apply the penalty, then try
                                 // the next trace at this anchor.
-                                self.trace.onSideExit(final, 0);
+                                self.trace.onSideExitReceipt(final, 0, result.exit_instr, 0, .deferred);
 
                                 // Widen-eviction: if this trace's array lane guard
                                 // can never pass again (the live array widened past

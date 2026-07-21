@@ -1,5 +1,39 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-22 (LATEST-24) — **A-iv `region_profit` accumulator LANDED, inert + green (reverse-authored by Codex). NEXT = A-v (edge-4 bridge stub, unarmed) per §A8 step 5.**
+
+`accountRegionProfit` now ACCUMULATES (was a no-op) per-activation `RegionKey{region_id, activation:call_seq}
+→ RegionAccum{outer_traversals, window_base, root_frame_depth, root_call_seq}` windows into a VM-persistent
+`region_profit` map, but does NOT gate: `onSideExitReceipt = accountTraceRun` (byte-for-byte the legacy
+tiering path) `+ accountRegionProfit`, whose full-`min_useful` windows flush into diagnostic-only counters
+(`region_profit_flushes/_flushed_work`) that no selection/tiering/penalty path reads (A-vii swaps that sink
+for the real gate). `observeRegionProgramPoint(proto_id, pc, depth, call_seq)` runs in the dispatch loop
+behind an `if regionProfitCount() != 0` guard (no per-op call/alloc on the common path; account fns return
+`void` + `getOrPut … catch return null`, so no OOM propagates into execution). Activation-scoped cleanup
+drops entries at EVERY frame-destroy site — normal pop ×2 (`dropRegionActivation`) and pcall/xpcall unwind ×3
+(`dropRegionActivationsFromDepth`, before the depth restore); lune has **no coroutines**, so that set is
+complete. `region_profit` is transient (NOT serialized; keyframe schema stays v5) and reset at restore +
+every `beginTopLevelEpoch` (`clearCache → resetRegionProfit`). §A5 cardinality (≤1 accumulator per
+`(activation, owner-anchor)`) is release-`@panic`-enforced and unreachable by construction.
+
+**Reverse-setup workflow (per Bart):** Codex designed + implemented; Claude + antigravity reviewed. The codex
+MCP run overran the 30-min idle timeout (A-iv is large) and the client aborted mid-run, but the detached
+subprocess left a compiling, green tree; after it went quiet I reviewed the dirty tree cold. **antigravity
+returned BLOCKER (2 findings), both adjudicated N/A against lune's actual code/design:** (F4) tail-call frame
+reuse — lune has no Lua-level TAILCALL opcode, every call/return is balanced through push/drop, so no orphan;
+(F5) release `@panic` in `openRegion` — §A5 *mandates* a release-enforced invariant (same as A-iii's
+`call_seq` exhaustion panic), and it's unreachable by construction, so downgrading to `std.debug.assert` would
+violate the design. Claude verdict = APPROVE.
+
+Guards codex added: window-persist-across-re-entry, activation-cleanup-drops-only-dying, same-activation
+collision-flush, pcall-unwind-drops-entry, restore-doesn't-persist (seeds an entry pre-snapshot, asserts it
+neither changes v5 bytes nor survives restore). `just test` + `-Djit-debug` green; ReleaseFast nsieve 9 /
+nbody 20000 / sieve_int / pi_leibniz / grid_matmul / field_hash tier-0 ≡ `--trace --jit-native`
+byte-identical (SAME hashes as the A-iii baseline ⇒ inert). Files: src/trace.zig (+428), src/interp.zig
+(+35), src/keyframeser.zig (+17), src/stdlib/errors.zig (+42, pcall-unwind hook + test).
+
+---
+
 ## Status 2026-07-21 (LATEST-23) — **A-iii `call_seq` plumbing LANDED, inert + green. NEXT = A-iv (`region_profit` accumulator) per §A8 step 4.**
 
 Added transient `CallFrame.call_seq: u64` and per-VM monotonic `next_call_seq`. The single physical

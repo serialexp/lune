@@ -767,10 +767,9 @@ fn hashExit(h: *std.hash.Wyhash, exit: ExitProvenance) void {
 //
 // A *region* is a strongly-connected component of the structural trace graph
 // (`StructuralEdgeId` edges over `{proto_id, pc}` anchor nodes) that contains a
-// cycle — the guest-logical unit the exit-branch-patching gate reasons about. All
-// of this is INERT in A-ii: `region_defs` is built and `classifyExit` is queryable,
-// but nothing on the selection path reads it (`accountRegionProfit` is a no-op), so
-// it is byte-identical across the 10 replay modes.
+// cycle — the guest-logical unit the exit-branch-patching gate reasons about. A-ii
+// made discovery/classification queryable; A-iv consumes it only into transient
+// `region_profit`. No selection/gating path reads that accumulator yet.
 // ---------------------------------------------------------------------------
 
 /// Opaque interned handle for a region (doc 17 §A3.3): assigned sequentially by the
@@ -778,6 +777,35 @@ fn hashExit(h: *std.hash.Wyhash, exit: ExitProvenance) void {
 /// `StructuralEdgeId` set, so a re-recorded logically-identical region (new
 /// `Trace.id`s) re-interns to the SAME id.
 pub const RegionId = enum(u64) { _ };
+
+/// Per-activation identity and accounting payload for doc 17 A-iv. The map is
+/// transient tiering state: it is never serialized and no selection/gating path
+/// reads it in this increment.
+pub const RegionKey = struct {
+    region_id: RegionId,
+    activation: u64,
+};
+
+pub const RegionAccum = struct {
+    outer_traversals: u64 = 0,
+    window_base: u64 = 0,
+    root_frame_depth: u32,
+    root_call_seq: u64,
+};
+
+/// Destination knowledge carried by a concrete trace receipt. A selected trace
+/// is classified through `dest_entry_regions`; `.deferred` deliberately retains
+/// the source accumulator until a later receipt/program-point resolves departure.
+pub const RegionDestination = union(enum) {
+    deferred,
+    known_trace: u32,
+    terminal_outside,
+};
+
+const RegionContext = struct {
+    depth: u32,
+    call_seq: u64,
+};
 
 fn regionIdLess(_: void, a: RegionId, b: RegionId) bool {
     return @intFromEnum(a) < @intFromEnum(b);
@@ -1655,6 +1683,16 @@ pub const TraceState = struct {
     /// regions entered by landing in it (destination of an internal edge; physical
     /// members only). Same lifetime/rebuild/ownership rules as `source_exit_regions`.
     dest_entry_regions: std.AutoHashMapUnmanaged(u32, []RegionId) = .empty,
+    /// A-iv: persistent across physical trace retirement/re-arm, bounded by live
+    /// activation lifetime and cleared on activation death / restore / epoch end.
+    /// Opening a logical region is the only operation that may grow this map;
+    /// the per-op observer only probes/removes existing entries.
+    region_profit: std.AutoHashMapUnmanaged(RegionKey, RegionAccum) = .empty,
+    region_context: ?RegionContext = null,
+    /// Inert diagnostics used by the A-iv guards to prove full-window and
+    /// remainder flushes occurred. No tiering path consumes either counter.
+    region_profit_flushes: u64 = 0,
+    region_profit_flushed_work: u64 = 0,
     /// Total trace entries executed (incremented in the dispatch loop before each
     /// `irinterp.execute`/native run). Diagnostic only — used to confirm the gate
     /// entry-check actually halts re-entry on a thrashing anchor, and a cheap
@@ -1965,6 +2003,7 @@ pub const TraceState = struct {
         self.region_intern.deinit(self.gpa);
         freeRegionSetMap(ExitKey, &self.source_exit_regions, self.gpa);
         freeRegionSetMap(u32, &self.dest_entry_regions, self.gpa);
+        self.region_profit.deinit(self.gpa);
         // Free each trace (its `native.deinit()` returns mcode slots to the arena's
         // free-list) *before* tearing down the arena those slots live in.
         for (self.cache.items) |t| t.destroy(self.gpa);
@@ -2207,26 +2246,236 @@ pub const TraceState = struct {
     ///     gate / `hit_count`), which steers future trace recording. **Unchanged from
     ///     the pre-split body**, so trace selection stays byte-identical across the 10
     ///     replay modes.
-    ///   • `accountRegionProfit` — the region-profit / gate-B half (§A3.5). A **no-op**
-    ///     in A-ii; it will consume the `?ExitKey` classifier + `region_profit`
-    ///     accumulator from A-iv onward. Per-site key threading is deferred to A-iv
-    ///     (a no-op consumer makes the key dead), so every caller keeps `onSideExit`'s
-    ///     3-arg signature and this wrapper passes `null`.
+    ///   • `accountRegionProfit` — the region-profit half (§A3.5). A-iv consumes
+    ///     concrete receipts through `onSideExitReceipt`; this wrapper remains for
+    ///     genuinely synthetic/null-keyed events and selection-only tests.
     /// The wrapper + both halves are `inline`, so the split compiles to the same code
     /// the single body did (keeping even the `--jit-coverage` `readCycles` attribution
     /// boundary identical — byte-identity does not rest on it, but the split is then
     /// literally transparent rather than argued).
     pub inline fn onSideExit(self: *TraceState, t: *Trace, completed: usize) void {
         self.accountTraceRun(t, completed);
-        self.accountRegionProfit(null);
+        self.accountRegionProfit(null, 0, .deferred);
     }
 
-    /// Region-profit / gate-B accounting half (§A3.5). **No-op in A-ii** (A-iv fills
-    /// the body: classify the exit via `?ExitKey`, drive the per-activation
-    /// `region_profit` accumulator, flush every `N`-window, gate on the region owner).
-    pub inline fn accountRegionProfit(self: *TraceState, key: ?ExitKey) void {
-        _ = self;
-        _ = key;
+    /// Concrete receipt variant. Selection keeps its historical per-segment
+    /// `completed`; logical-region work is independent (`region_work`) because an
+    /// inner loop-done contributes one outer traversal even when its local loop
+    /// count is large.
+    pub inline fn onSideExitReceipt(
+        self: *TraceState,
+        t: *Trace,
+        completed: usize,
+        exit_instr: u32,
+        region_work: usize,
+        dest: RegionDestination,
+    ) void {
+        self.accountTraceRun(t, completed);
+        const key: ?ExitKey = if (exit_instr < t.instrs.len)
+            .{ .trace_id = t.id, .exit_instr = exit_instr }
+        else
+            null;
+        self.accountRegionProfit(key, region_work, dest);
+    }
+
+    fn sameAnchor(a: AnchorKey, b: AnchorKey) bool {
+        return a.proto == b.proto and a.pc == b.pc;
+    }
+
+    fn flushRegionWindow(self: *TraceState, work: u64) void {
+        if (work == 0) return;
+        // A-iv is deliberately inert: this receipt is recorded diagnostically but
+        // does not touch penalty/gate/hit-count or any selection state. A-vii will
+        // replace this sink with the profit gate.
+        self.region_profit_flushes +|= 1;
+        self.region_profit_flushed_work +|= work;
+    }
+
+    fn closeRegion(self: *TraceState, key: RegionKey) void {
+        const accum = self.region_profit.get(key) orelse return;
+        const remainder = accum.outer_traversals - accum.window_base;
+        self.flushRegionWindow(remainder);
+        _ = self.region_profit.remove(key);
+    }
+
+    fn activeRegionFor(self: *const TraceState, activation: u64) ?RegionKey {
+        var best: ?RegionKey = null;
+        var it = self.region_profit.keyIterator();
+        while (it.next()) |key| {
+            if (key.activation != activation) continue;
+            if (best == null or @intFromEnum(key.region_id) < @intFromEnum(best.?.region_id))
+                best = key.*;
+        }
+        return best;
+    }
+
+    fn openRegion(self: *TraceState, id: RegionId, ctx: RegionContext) ?RegionKey {
+        const def = self.region_defs.get(id) orelse return null;
+        if (!def.armable) return null;
+
+        // H-3 replacement: close a different live region at the same activation
+        // and owner before publishing the replacement. Scanning is activation-
+        // bounded (max physical call depth), and opening—not nextOp—is the cold path.
+        var collision: ?RegionKey = null;
+        var it = self.region_profit.keyIterator();
+        while (it.next()) |key| {
+            if (key.activation != ctx.call_seq or key.region_id == id) continue;
+            const old_def = self.region_defs.get(key.region_id) orelse continue;
+            if (sameAnchor(old_def.owner, def.owner)) {
+                if (collision != null) @panic("region_profit cardinality violated before replacement");
+                collision = key.*;
+            }
+        }
+        if (collision) |old| self.closeRegion(old);
+
+        const key: RegionKey = .{ .region_id = id, .activation = ctx.call_seq };
+        const gop = self.region_profit.getOrPut(self.gpa, key) catch return null;
+        if (!gop.found_existing) gop.value_ptr.* = .{
+            .root_frame_depth = ctx.depth,
+            .root_call_seq = ctx.call_seq,
+        };
+
+        var count: usize = 0;
+        var check = self.region_profit.keyIterator();
+        while (check.next()) |live| {
+            if (live.activation != ctx.call_seq) continue;
+            const live_def = self.region_defs.get(live.region_id) orelse continue;
+            if (sameAnchor(live_def.owner, def.owner)) count += 1;
+        }
+        if (count > 1) @panic("region_profit cardinality violated after replacement");
+        return key;
+    }
+
+    fn invalidateRegion(self: *TraceState, id: RegionId) void {
+        if (self.region_defs.getPtr(id)) |def| def.armable = false;
+        while (true) {
+            var victim: ?RegionKey = null;
+            var it = self.region_profit.keyIterator();
+            while (it.next()) |key| {
+                if (key.region_id == id) {
+                    victim = key.*;
+                    break;
+                }
+            }
+            if (victim) |key| self.closeRegion(key) else break;
+        }
+        self.disarmAllLinks();
+    }
+
+    fn chooseSource(self: *TraceState, candidates: []const RegionId, ctx: RegionContext) ?RegionKey {
+        const active = self.activeRegionFor(ctx.call_seq);
+        if (active) |a| {
+            for (candidates) |id| if (id == a.region_id) return a;
+            self.closeRegion(a);
+        }
+        if (candidates.len == 0) return null;
+        if (candidates.len == 1) return self.openRegion(candidates[0], ctx);
+        for (candidates) |id| self.invalidateRegion(id);
+        return null;
+    }
+
+    fn applyDestination(self: *TraceState, selected: ?RegionKey, dest: RegionDestination, ctx: RegionContext) void {
+        if (dest == .deferred) return;
+        const candidates: []const RegionId = switch (dest) {
+            .deferred => unreachable,
+            .known_trace => |trace_id| self.dest_entry_regions.get(trace_id) orelse &.{},
+            .terminal_outside => &.{},
+        };
+
+        if (selected) |source| {
+            for (candidates) |id| if (id == source.region_id) return;
+            self.closeRegion(source);
+            if (dest == .terminal_outside or candidates.len == 0) return;
+        }
+        if (candidates.len == 1) {
+            _ = self.openRegion(candidates[0], ctx);
+        } else if (candidates.len > 1) {
+            for (candidates) |id| self.invalidateRegion(id);
+        }
+    }
+
+    /// Region-profit receipt processor (doc 17 §A3.5). Null-keyed synthetic
+    /// events are region-neutral. Concrete events normalize/open the physical
+    /// source, credit its committed work, flush every complete min_useful window,
+    /// then apply destination classification. No gate/penalty/tiering state reads
+    /// this map in A-iv.
+    pub fn accountRegionProfit(self: *TraceState, key: ?ExitKey, work: usize, dest: RegionDestination) void {
+        const exit_key = key orelse return;
+        const ctx = self.region_context orelse return;
+        const selected = self.chooseSource(self.classifyExit(exit_key), ctx);
+        if (selected) |source| {
+            if (self.region_profit.getPtr(source)) |accum| {
+                accum.outer_traversals +|= @intCast(work);
+                const n: u64 = @intCast(self.config.min_useful);
+                if (n != 0) while (accum.outer_traversals - accum.window_base >= n) {
+                    self.flushRegionWindow(n);
+                    accum.window_base += n;
+                };
+            }
+        }
+        self.applyDestination(selected, dest, ctx);
+    }
+
+    /// Set the current physical activation and close accumulators whose recorded
+    /// membership no longer contains this tier-0 departure point. No allocation;
+    /// the common empty-map path is one count test.
+    pub fn observeRegionProgramPoint(self: *TraceState, proto_id: u32, pc: u32, depth: u32, call_seq: u64) void {
+        self.region_context = .{ .depth = depth, .call_seq = call_seq };
+        if (self.region_profit.count() == 0) return;
+        const point: ProgramPoint = .{ .proto_id = proto_id, .source_pc = pc };
+        while (true) {
+            var victim: ?RegionKey = null;
+            var it = self.region_profit.iterator();
+            while (it.next()) |entry| {
+                const accum = entry.value_ptr.*;
+                if (depth > accum.root_frame_depth) continue;
+                const def = self.region_defs.get(entry.key_ptr.region_id) orelse {
+                    victim = entry.key_ptr.*;
+                    break;
+                };
+                var inside = false;
+                for (def.member_points) |member| {
+                    if (member.proto_id == point.proto_id and member.source_pc == point.source_pc) {
+                        inside = true;
+                        break;
+                    }
+                }
+                if (!inside or (depth == accum.root_frame_depth and call_seq != accum.root_call_seq)) {
+                    victim = entry.key_ptr.*;
+                    break;
+                }
+            }
+            if (victim) |dead| self.closeRegion(dead) else break;
+        }
+    }
+
+    pub fn dropRegionActivation(self: *TraceState, call_seq: u64) void {
+        while (true) {
+            var victim: ?RegionKey = null;
+            var it = self.region_profit.keyIterator();
+            while (it.next()) |key| {
+                if (key.activation == call_seq) {
+                    victim = key.*;
+                    break;
+                }
+            }
+            if (victim) |dead| self.closeRegion(dead) else break;
+        }
+        if (self.region_context != null and self.region_context.?.call_seq == call_seq)
+            self.region_context = null;
+    }
+
+    pub fn resetRegionProfit(self: *TraceState) void {
+        self.region_profit.clearRetainingCapacity();
+        self.region_context = null;
+    }
+
+    pub inline fn regionProfitCount(self: *const TraceState) usize {
+        return self.region_profit.count();
+    }
+
+    pub inline fn setRegionContext(self: *TraceState, depth: u32, call_seq: u64) void {
+        self.region_context = .{ .depth = depth, .call_seq = call_seq };
     }
 
     /// Per-segment SELECTION accounting — the pre-A-ii-split `onSideExit` body,
@@ -2463,6 +2712,11 @@ pub const TraceState = struct {
                 sresult.final_trace_id != irinterp.NO_TRACE_ID and
                 sresult.final_trace_id != sct.id;
             if (is_link and (sresult.exit_instr == sct.instrs.len - 1 or sresult_fused)) {
+                if (!sresult_fused) self.accountRegionProfit(
+                    .{ .trace_id = sct.id, .exit_instr = sresult.exit_instr },
+                    0,
+                    .deferred,
+                );
                 // 2.3c-1 (M1 half-fusion, doc 17): arm the failing trace's source-branch
                 // guard slot -> this prime-side ramp's `ordinary_entry`, so the NEXT time
                 // that guard fires it jumps straight into the ramp under the shared frame
@@ -2500,14 +2754,14 @@ pub const TraceState = struct {
 
             // Not a completed link run.
             if (flushed_resume_pc) |target_pc| {
-                self.onSideExit(sct, 0);
+                self.onSideExitReceipt(sct, 0, sresult.exit_instr, 0, .deferred);
                 return .{ .completed = 0, .resume_pc = target_pc };
             }
             if (sresult.completed > 0) {
-                self.onSideExit(sct, sresult.completed);
+                self.onSideExitReceipt(sct, sresult.completed, sresult.exit_instr, sresult.completed, .deferred);
                 return .{ .completed = sresult.completed };
             }
-            self.onSideExit(sct, 0);
+            self.onSideExitReceipt(sct, 0, sresult.exit_instr, 0, .deferred);
             // Zero iterations, no flush owed (ordinary path): try the next candidate.
         }
         return null;
@@ -2686,6 +2940,26 @@ pub const TraceState = struct {
                 owner.instrs[owner.instrs.len - 1].op == .link;
             const ends_loop = owner.instrs.len != 0 and
                 owner.instrs[owner.instrs.len - 1].op == .loop;
+
+            // A-iv consumes the same per-transition ledger the steering machine
+            // validates below. Work and structural transition are orthogonal:
+            // loop-done is one outer traversal, deopt carries its segment-local
+            // committed work, and link/prologue receipts carry none. A concrete
+            // fused successor is known only when the next ledger row exists.
+            const region_key: ?ExitKey = if (e.kind != .prologue_fail and e.exit < owner.instrs.len)
+                .{ .trace_id = owner.id, .exit_instr = e.exit }
+            else
+                null;
+            const region_work: usize = switch (e.kind) {
+                .loop_done_linked => 1,
+                .deopt => local,
+                .link_terminal, .prologue_fail => 0,
+            };
+            const region_dest: RegionDestination = if (!is_last)
+                .{ .known_trace = entries[k + 1].id }
+            else
+                .deferred;
+            self.accountRegionProfit(region_key, region_work, region_dest);
 
             // Classify STRICTLY by the static emit-site `kind` (never re-derive the
             // materialization contract from the exit PC — an ordinary `.deopt` whose PC
@@ -3214,13 +3488,13 @@ pub const TraceState = struct {
                     proto.code[guardSourcePc(inner_guard).?].op == .for_loop;
                 if (!loop_done) {
                     if (inner_local > 0) {
-                        self.onSideExit(inner, inner_local);
+                        self.onSideExitReceipt(inner, inner_local, iresult.exit_instr, 0, .deferred);
                         return .{
                             .completed = if (linked_completed > 0) linked_completed else inner_local,
                             .resume_pc = resume_pc,
                         };
                     }
-                    self.onSideExit(inner, 0);
+                    self.onSideExitReceipt(inner, 0, iresult.exit_instr, 0, .deferred);
                     break;
                 }
                 // Native committed the loop-done inside `runLinkedLoopDone`; the
@@ -3239,12 +3513,12 @@ pub const TraceState = struct {
                 // NOT at the inner header — so the inner loop is not re-run.
                 if (current_link.anchor.pc != inner_exit_pc) {
                     const cont = self.findLinkTrace(proto, inner_exit_pc) orelse {
-                        self.onSideExit(inner, if (inner_local > 0) inner_local else 1);
+                        self.onSideExitReceipt(inner, if (inner_local > 0) inner_local else 1, iresult.exit_instr, 1, .deferred);
                         return .{ .completed = linked_completed + 1, .resume_pc = inner_exit_pc };
                     };
                     if (tier == .native_only) {
                         snt = self.nativeFor(cont) orelse {
-                            self.onSideExit(inner, if (inner_local > 0) inner_local else 1);
+                            self.onSideExitReceipt(inner, if (inner_local > 0) inner_local else 1, iresult.exit_instr, 1, .deferred);
                             return .{ .completed = linked_completed + 1, .resume_pc = inner_exit_pc };
                         };
                     }
@@ -3256,7 +3530,7 @@ pub const TraceState = struct {
                 // exit completes exactly one enclosing-loop iteration — true even
                 // when it reports `completed == 0` (a one-trip inner loop). It is
                 // a successful hand-off, not a low-yield entry to penalize.
-                self.onSideExit(inner, if (inner_local > 0) inner_local else 1);
+                self.onSideExitReceipt(inner, if (inner_local > 0) inner_local else 1, iresult.exit_instr, 1, .{ .known_trace = current_link.id });
                 linked_completed += 1;
 
                 // 2.3b-1: arm `current_link`'s `.link`-terminal slot → `inner`'s
@@ -3356,6 +3630,11 @@ pub const TraceState = struct {
                 const cbuf = self.valuesScratch(current_link.instrs.len) catch break;
                 const cresult = irinterp.execute(current_link, regs, cbuf);
                 if (cresult.exit_instr == current_link.instrs.len - 1) {
+                    self.accountRegionProfit(
+                        .{ .trace_id = current_link.id, .exit_instr = cresult.exit_instr },
+                        0,
+                        .deferred,
+                    );
                     // Standalone `.link` at the continuation's terminal: `inner_pc` is
                     // this hop's entry-link target (stable across a prime-side→cont
                     // swap; the next hop recomputes it from `current_link`).
@@ -3363,9 +3642,17 @@ pub const TraceState = struct {
                     continue;
                 }
                 if (cresult.completed > 0) {
-                    self.onSideExit(current_link, cresult.completed);
+                    self.onSideExitReceipt(current_link, cresult.completed, cresult.exit_instr, cresult.completed, .deferred);
                     return .{ .completed = linked_completed + cresult.completed, .resume_pc = resume_pc };
                 }
+                self.accountRegionProfit(
+                    if (cresult.exit_instr < current_link.instrs.len)
+                        .{ .trace_id = current_link.id, .exit_instr = cresult.exit_instr }
+                    else
+                        null,
+                    0,
+                    .deferred,
+                );
                 break;
             }
         }
@@ -4449,9 +4736,8 @@ pub const TraceState = struct {
     }
 
     /// Classify a physical trace exit to the regions it belongs to (doc 17 §A3.3 /
-    /// §A8-ii, A-ii.4): a pure query over `source_exit_regions`. **Unread by production
-    /// in A-ii** (`accountRegionProfit` is a no-op) — exercised only by tests, exactly
-    /// as A-i's `provAt` was queryable-but-unread.
+    /// §A8-ii, A-ii.4): a pure query over `source_exit_regions`. A-iv consumes it
+    /// only for inert accumulator updates; no tier-selection path reads the result.
     pub fn classifyExit(self: *const TraceState, key: ExitKey) []const RegionId {
         return self.source_exit_regions.get(key) orelse &.{};
     }
@@ -4792,6 +5078,9 @@ pub const TraceState = struct {
         self.region_defs.clearRetainingCapacity();
         self.region_intern.clear(self.gpa);
         self.clearPhysicalRegionIndices();
+        self.resetRegionProfit();
+        self.region_profit_flushes = 0;
+        self.region_profit_flushed_work = 0;
     }
 
     /// Remove all guard-failure entries for `anchor`. Called after a side
@@ -9447,7 +9736,7 @@ test "A-i.4 transport: recForPrepLink commits a .link trace carrying .link_termi
     try testing.expectEqual(@as(u8, 0), prov.link_terminal.inline_depth); // never inlined
 }
 
-test "A-ii.1 split: onSideExit ≡ accountTraceRun (accountRegionProfit is a no-op)" {
+test "A-ii.1 split: null receipt keeps onSideExit selection-equivalent to accountTraceRun" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
@@ -9484,6 +9773,87 @@ test "A-ii.1 split: onSideExit ≡ accountTraceRun (accountRegionProfit is a no-
     // Both anchors' penalty entries cleared by the useful exit → map empty (no stray
     // key left by either half).
     try testing.expectEqual(@as(usize, 0), state.penalty.count());
+}
+
+test "A-iv region_profit: windows persist across physical re-entry and observer closes only on departure" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = [_]Instr{Instr.op0(.load_nil)};
+    const proto = Proto{ .id = 41, .code = &code, .name = "region", .num_registers = 1 };
+    const rid: RegionId = @enumFromInt(7);
+    const points = try gpa.dupe(ProgramPoint, &.{.{ .proto_id = 41, .source_pc = 0 }});
+    const members = try gpa.dupe(StructuralEdgeId, &.{});
+    try state.region_defs.put(gpa, rid, .{
+        .members = members,
+        .member_points = points,
+        .owner = .{ .proto = &proto, .pc = 0 },
+        .classifier = .{ .kind = .self_loop, .member_count = 1 },
+        .armable = true,
+    });
+    const source_set = try gpa.dupe(RegionId, &.{rid});
+    try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, source_set);
+
+    state.setRegionContext(1, 99);
+    state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, 3, .deferred);
+    try testing.expectEqual(@as(usize, 1), state.regionProfitCount());
+    const key: RegionKey = .{ .region_id = rid, .activation = 99 };
+    try testing.expectEqual(@as(u64, 3), state.region_profit.get(key).?.outer_traversals);
+
+    // Physical retirement/re-arm does not touch region_profit: another receipt for
+    // the same logical id resumes the same window and crosses N=8 exactly once.
+    state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, 5, .deferred);
+    try testing.expectEqual(@as(u64, 8), state.region_profit.get(key).?.outer_traversals);
+    try testing.expectEqual(@as(u64, 8), state.region_profit.get(key).?.window_base);
+    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
+    state.observeRegionProgramPoint(41, 0, 1, 99);
+    try testing.expectEqual(@as(usize, 1), state.regionProfitCount());
+    state.observeRegionProgramPoint(41, 1, 1, 99);
+    try testing.expectEqual(@as(usize, 0), state.regionProfitCount());
+    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes); // exact-N exit: no zero remainder
+}
+
+test "A-iv region_profit: activation cleanup drops only the dying activation" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const a: RegionKey = .{ .region_id = @enumFromInt(1), .activation = 10 };
+    const b: RegionKey = .{ .region_id = @enumFromInt(1), .activation = 11 };
+    try state.region_profit.put(gpa, a, .{ .outer_traversals = 2, .root_frame_depth = 1, .root_call_seq = 10 });
+    try state.region_profit.put(gpa, b, .{ .outer_traversals = 4, .root_frame_depth = 2, .root_call_seq = 11 });
+    state.dropRegionActivation(11);
+    try testing.expectEqual(@as(usize, 1), state.regionProfitCount());
+    try testing.expect(state.region_profit.contains(a));
+    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
+    try testing.expectEqual(@as(u64, 4), state.region_profit_flushed_work);
+}
+
+test "A-iv region_profit: same-activation owner collision flushes old before replacement" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code = [_]Instr{Instr.op0(.load_nil)};
+    const proto = Proto{ .id = 55, .code = &code, .name = "cardinality", .num_registers = 1 };
+    const r1: RegionId = @enumFromInt(1);
+    const r2: RegionId = @enumFromInt(2);
+    inline for (.{ r1, r2 }) |rid| {
+        try state.region_defs.put(gpa, rid, .{
+            .members = try gpa.dupe(StructuralEdgeId, &.{}),
+            .member_points = try gpa.dupe(ProgramPoint, &.{.{ .proto_id = 55, .source_pc = 0 }}),
+            .owner = .{ .proto = &proto, .pc = 0 },
+            .classifier = .{ .kind = .self_loop, .member_count = 1 },
+            .armable = true,
+        });
+    }
+    const ctx: RegionContext = .{ .depth = 1, .call_seq = 77 };
+    const old = state.openRegion(r1, ctx).?;
+    state.region_profit.getPtr(old).?.outer_traversals = 3;
+    _ = state.openRegion(r2, ctx).?; // direct H-3 collision/replacement path
+    try testing.expectEqual(@as(usize, 1), state.regionProfitCount());
+    try testing.expect(state.region_profit.contains(.{ .region_id = r2, .activation = 77 }));
+    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
+    try testing.expectEqual(@as(u64, 3), state.region_profit_flushed_work);
 }
 
 test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural edges" {

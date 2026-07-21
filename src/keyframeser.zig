@@ -33,6 +33,7 @@ const key_order = @import("key_order.zig");
 const parser = @import("parser.zig");
 const compiler = @import("compiler.zig");
 const diag = @import("diag.zig");
+const trace = @import("trace.zig");
 
 const Value = value.Value;
 const GcHeader = object.GcHeader;
@@ -524,6 +525,10 @@ pub fn restoreSnapshot(
     errdefer gpa.destroy(vm);
     vm.* = try Vm.initBare(gpa);
     errdefer vm.deinit();
+    // A-iv transient JIT-tiering state is deliberately outside schema v5. A
+    // restore always starts with no live logical-region accumulator; execution
+    // rebuilds it from the re-keyed physical activations and receipt stream.
+    vm.trace.resetRegionProfit();
 
     // A bare VM is the contract: an empty heap means restored ids and interned
     // bytes cannot collide with pre-seeded state.
@@ -2071,6 +2076,17 @@ fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, r
     const out_before = try gpa.dupe(u8, sink.buffered());
     defer gpa.free(out_before);
 
+    // A-iv: seed transient profit state immediately at the suspended cut. It must
+    // not gain a wire field, affect schema v5 bytes, or survive restore.
+    const live_activation = vm.frames[vm.depth - 1].call_seq;
+    try vm.trace.region_profit.put(gpa, .{
+        .region_id = @as(trace.RegionId, @enumFromInt(901)),
+        .activation = live_activation,
+    }, .{
+        .outer_traversals = 3,
+        .root_frame_depth = vm.depth,
+        .root_call_seq = live_activation,
+    });
     const mid = try encodeSnapshot(gpa, &vm);
     errdefer gpa.free(mid);
 
@@ -2340,6 +2356,7 @@ test "A-iii: recursive live frames re-key deterministically across keyframe rest
         gpa.destroy(restored);
     }
     try testing.expectEqual(vm.depth, restored.depth);
+    try testing.expectEqual(@as(usize, 0), restored.trace.regionProfitCount());
     for (restored.frames[0..restored.depth], 0..) |frame, i| {
         try testing.expectEqual(@as(u64, @intCast(i)), frame.call_seq);
     }

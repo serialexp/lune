@@ -98,6 +98,7 @@ fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, hand
                 // upvalues so an escaped closure keeps a valid value (their slots
                 // fall above the restored `stack_top`, off the GC root scan).
                 vm.closeUpvaluesFrom(entry_top);
+                vm.dropRegionActivationsFromDepth(entry_depth);
                 vm.depth = entry_depth;
                 vm.stack_top = entry_top;
                 if (out.len > 1) out[1] = try vm.heap.internValue("error in error handling");
@@ -106,6 +107,7 @@ fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, hand
             // Handler returned — now unwind to the protected-call boundary,
             // closing the faulting frames' open upvalues first (see below).
             vm.closeUpvaluesFrom(entry_top);
+            vm.dropRegionActivationsFromDepth(entry_depth);
             vm.depth = entry_depth;
             vm.stack_top = entry_top;
             return @min(out.len, 1 + hn);
@@ -115,6 +117,7 @@ fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, hand
         // an escaped closure keeps a valid value once `stack_top` drops below their
         // slots (off the GC root scan).
         vm.closeUpvaluesFrom(entry_top);
+        vm.dropRegionActivationsFromDepth(entry_depth);
         vm.depth = entry_depth;
         vm.stack_top = entry_top;
         if (out.len > 1) out[1] = errval;
@@ -219,3 +222,42 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "error", .func = &nError },
     .{ .name = "assert", .func = &nAssert1, .multi = &nAssertN },
 };
+
+test "A-iv pcall unwind drops region_profit for the destroyed activation" {
+    const testing = std.testing;
+    const parser = @import("../parser.zig");
+    const compiler = @import("../compiler.zig");
+    const diag = @import("../diag.zig");
+    const trace = @import("../trace.zig");
+    const source = "return function() error('boom') end\n";
+
+    var diags = diag.Diagnostics.init(testing.allocator);
+    defer diags.deinit();
+    var tree = try parser.parse(testing.allocator, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    var chunk = try compiler.compile(testing.allocator, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    const failing = try vm.run(chunk.proto);
+
+    // The next physical push is the protected closure. Seed a nonzero remainder
+    // under that exact activation id; the only path that can remove it is the
+    // pcall catch's depth-restore cleanup hook.
+    const activation = vm.next_call_seq;
+    try vm.trace.region_profit.put(testing.allocator, .{
+        .region_id = @as(trace.RegionId, @enumFromInt(123)),
+        .activation = activation,
+    }, .{
+        .outer_traversals = 3,
+        .root_frame_depth = 1,
+        .root_call_seq = activation,
+    });
+    const baseline = vm.trace.regionProfitCount() - 1;
+    var out: [2]Value = undefined;
+    const n = try protectedCall(&vm, failing, &.{}, &out, null);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expect(!out[0].asBool());
+    try testing.expectEqual(baseline, vm.trace.regionProfitCount());
+}
