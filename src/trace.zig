@@ -3905,8 +3905,7 @@ pub const TraceState = struct {
     /// byte-identical.**
     ///
     /// **Transactional** (round-12 finding 2): the whole rebuild allocates its capacity
-    /// BEFORE clearing the
-    /// prior snapshot, so an OOM leaves the previously-published `edge_cache` untouched
+    /// BEFORE clearing the prior snapshot, so an OOM leaves the previously-published `edge_cache` untouched
     /// rather than emptying it. `on_oom` picks the disposition when the (pre-clear)
     /// reservation fails — `.retain` keeps the prior coherent snapshot (commit path),
     /// `.empty` fails-closed to an empty (region-neutral) cache (retirement path, where the
@@ -3920,9 +3919,19 @@ pub const TraceState = struct {
     }
 
     fn rebuildEdgeCacheFallible(self: *TraceState) !void {
-        // Upper bound on live edges: one per recorded exit across every cached trace.
+        // Upper bound on live edges: one per recorded exit across every cached trace
+        // (`resolveSuccessorAnchor` yields 0 or 1 edge per entry, never more).
         var upper: usize = 0;
         for (self.cache.items) |t| upper += t.exit_prov.len;
+        // Cap the reservation well below where the map's u32 `capacityForSize` — which does
+        // `ceilPowerOfTwo(u32, ...) catch unreachable` past ~1.7e9 — would PANIC, and below
+        // the `@intCast` u32 cast's own trap point (round-14 review finding 4). An
+        // over-large graph is turned into a SOFT OOM here so it flows through
+        // `rebuildEdgeCache`'s `catch switch (on_oom)` instead of trapping — preserving the
+        // inert/fail-soft contract. Unreachable in practice: a billion trace exits is many
+        // GB of metadata, so we'd OOM in the append loops long before reaching it.
+        const max_edges: usize = 1 << 30;
+        if (upper > max_edges) return error.OutOfMemory;
         // Reserve BEFORE clearing so an OOM here retains the prior published snapshot.
         try self.edge_cache.ensureTotalCapacity(self.gpa, @intCast(upper));
         self.edge_cache.clearRetainingCapacity();
