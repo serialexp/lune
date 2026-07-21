@@ -1,5 +1,47 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-21 (LATEST-21) — **A-ii COMPLETE + APPROVED (checkpoint boundary reached).** A-i + A-ii both landed, inert, reviewer-certified. NEXT = A-iii (`call_seq` plumbing) per §A8 step 3.
+
+**A-ii checkpoint review = gpt-5.6-sol APPROVE + antigravity LGTM.** The post-landing review (mirrors A-i)
+returned **BLOCKER with four findings, all folded and re-certified to APPROVE**:
+- **F1 — commit-abort tiering perturbation.** The commit-time `rec_path` dup (`src/trace.zig:~5145`) was
+  `try` → OOM propagated out of `commit` to `closeTrace`'s `commit() catch { gateAnchor }`, gating the
+  anchor and perturbing tiering. Made fail-soft: `catch blk: { rec_path_complete = false; break :blk &.{}; }`.
+- **F2 — `.retain` not honored on upstream OOM.** `rebuildEdgeCache` cleared-then-put, so a commit-path
+  OOM emptied `edge_cache` and the subsequent `rebuildRegions(.retain)` ran over an empty graph. Made
+  transactional: `rebuildEdgeCacheFallible` computes `upper = Σ exit_prov.len`, `ensureTotalCapacity(upper)`
+  BEFORE `clearRetainingCapacity`, then `putAssumeCapacity`; `rebuildEdgeCache(on_oom: RegionOom)` (commit
+  `.retain` / retire `.empty`).
+- **F3 — armable on truncated membership.** Added `Trace.rec_path_complete: bool = true` (false on a
+  recorder-path OOM OR the F1 commit-dup OOM). `rebuildRegionsFallible` computes per-candidate
+  `membership_complete` (all members found by `traceById` ∧ `rec_path_complete`); gates `armable` first-sight
+  AND rebind (sticky tombstone on `!compatible OR !membership_complete`). Region *identity* stays purely
+  structural (unaffected) → replay-stable.
+- **F4 — capacity trap.** `@intCast(upper)`→`ensureTotalCapacity` could panic (`ceilPowerOfTwo(u32,…) catch
+  unreachable`) past ~1.7e9. Added a `1<<30` soft-OOM guard so an over-large graph fails through `RegionOom`
+  instead of trapping (unreachable in practice; the inert path must never trap).
+
+New test: incomplete member path mints the region NON-armable, classifies nothing. `just test` **809** green
+(default + `-Djit-debug`); nsieve 9 / nbody 20000 / sieve_int / pi_leibniz / grid_matmul / field_hash tier-0 ≡
+`--trace --jit-native` byte-identical (ReleaseFast).
+
+**Commits:** `6ebceb6` A-ii.4 land · `5d6a5b3` fold F1/F2/F3 · `1dcf1ba` fold F4. (Earlier this session:
+`ac276da` A-ii.1 · `7b0c500` A-ii.2 · `2c4de54` A-ii.3.)
+
+**FLAG for Bart (Rule #17, not changed unilaterally):** the `exit_prov` dup at commit
+(`src/trace.zig:~5133`, `const exit_prov_owned = try buildExitProv(...)`) shares the SAME `try`-can-abort →
+`gateAnchor` pattern F1 fixed, but it is **A-i scope** (already approved/landed), so I left it as-is. If you
+want the commit path uniformly non-perturbing on OOM, that A-i site should get the same fail-soft treatment —
+your call.
+
+**NEXT:** A-iii (`call_seq` plumbing) per §A8 step 3. Then A-iv (`region_profit` accumulator + window +
+state machine; threads a real `?ExitKey` to `accountRegionProfit`, which stays a **no-op** until then).
+Subsequent: A-v (edge-4 bridge stub, unarmed) → A-vi (native-F2c harness) → A-vii (FLIP: arm edge 4 + gate B
+consumes `region_profit`) → A-viii (disarm coverage). Also the Q6 `FrameRef` varargs schema-bump ticket
+before F2c.
+
+---
+
 ## Status 2026-07-21 (LATEST-20) — A-i COMPLETE; A-ii CODE COMPLETE (A-ii.1–4 all LANDED+green+byte-identical); NEXT = post-landing gpt-5.6-sol review of the whole A-ii impl (the checkpoint-APPROVE, mirrors A-i).
 
 **A-ii.4 landed this session (uncommitted at time of writing → commit next):** `region_defs` discovery +
