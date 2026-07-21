@@ -589,15 +589,24 @@ fn exitProvEntryLess(_: void, a: ExitProvEntry, b: ExitProvEntry) bool {
 /// committed index, `null` for a dropped instr); pass `null` for the identity map
 /// (the `dupe` path — link + unoptimized traces preserve indices 1:1). Only
 /// non-`null` provenance whose instruction survived compaction is carried over
-/// (the many-to-one dedup already happened at stamp time). Returns a static empty
-/// slice when there is nothing to carry (no alloc). Caller owns the result.
+/// (the many-to-one dedup already happened at stamp time).
+///
+/// `link_terminal` (A-i.4) carries the `.link` terminal's provenance and its
+/// committed index. The `.link`/`.loop` terminal is appended directly to `instrs`
+/// at commit — it never went through `emit`, so it has NO lockstep `rec_exit_prov`
+/// slot; it is injected here as one extra entry. `null` for every non-link trace
+/// (a `.loop` terminal is a back-edge, not an exit).
+///
+/// Returns a static empty slice when there is nothing to carry (no alloc). Caller
+/// owns the result.
 pub fn buildExitProv(
     gpa: std.mem.Allocator,
     rec_exit_prov: []const ?ExitProvenance,
     old_to_new: ?[]const ?Ref,
+    link_terminal: ?ExitProvEntry,
 ) ![]ExitProvEntry {
     if (old_to_new) |m| std.debug.assert(m.len >= rec_exit_prov.len);
-    var count: usize = 0;
+    var count: usize = if (link_terminal != null) 1 else 0;
     for (rec_exit_prov, 0..) |p, i| {
         if (p == null) continue;
         const survived = if (old_to_new) |m| m[i] != null else true;
@@ -611,6 +620,10 @@ pub fn buildExitProv(
         const prov = p orelse continue;
         const committed: u32 = if (old_to_new) |m| (m[i] orelse continue) else @intCast(i);
         out[k] = .{ .index = committed, .prov = prov };
+        k += 1;
+    }
+    if (link_terminal) |lt| {
+        out[k] = lt;
         k += 1;
     }
     std.debug.assert(k == count);
@@ -4045,7 +4058,20 @@ pub const TraceState = struct {
         // Remap the recorder's emission-indexed exit provenance (A-i.1) into the
         // committed, compact `Trace.exit_prov`, keyed by committed instr index. The
         // `dupe` path (link + unoptimized traces) hands back a null map ⇒ identity.
-        const exit_prov_owned = try buildExitProv(self.gpa, self.rec.exit_prov.items, fields.old_to_new);
+        //
+        // A-i.4: the `.link` terminal (edge 2) carries its own provenance on
+        // `pending_link_provenance`. It is the trace's last instr — appended directly
+        // above, never through `emit`, so it has no lockstep slot — and a link trace
+        // always takes the `dupe` (identity) path, so its committed index is
+        // `fields.instrs.len − 1`. Release invariant (both set together only in
+        // `recForPrepLink`): a `.link` terminal ⇔ a pending link provenance.
+        if ((self.rec.link_target != null) != (self.rec.pending_link_provenance != null))
+            @panic("commit: link_target / pending_link_provenance invariant violated");
+        const link_term: ?ExitProvEntry = if (self.rec.pending_link_provenance) |lp|
+            .{ .index = @intCast(fields.instrs.len - 1), .prov = lp }
+        else
+            null;
+        const exit_prov_owned = try buildExitProv(self.gpa, self.rec.exit_prov.items, fields.old_to_new, link_term);
         errdefer if (exit_prov_owned.len != 0) self.gpa.free(exit_prov_owned);
 
         // S3 (cross-frame tracing): pin the verifier's register-window bound to the
@@ -5315,7 +5341,18 @@ pub const TraceState = struct {
 
         // Close with the `.link` terminator (commit reads `link_target`). closeTrace
         // commits + clears `active`; a build failure gates the anchor, like any abort.
+        // A-i.4: stamp the `.link` terminal's provenance (edge 2). `for_prep` is the
+        // owning guest opcode, so `source_pc = pc − 1` (= `cur_pc − 1`, this recorded
+        // op), and `inline_depth == 0` here (the guard at the top of this fn aborts any
+        // inlined `for_prep`), so the path prefix is empty. Set together with
+        // `link_target` so the commit-time ⇔ invariant holds by construction.
         self.rec.link_target = inner_anchor;
+        self.rec.pending_link_provenance = .{ .link_terminal = .{
+            .path = pathFromFrames(&self.rec.frames, self.rec.inline_depth),
+            .inline_depth = self.rec.inline_depth,
+            .source_proto_id = self.rec.cur_proto_id,
+            .source_pc = self.rec.cur_pc -| 1,
+        } };
         self.closeTrace(regs);
     }
 
@@ -8045,7 +8082,7 @@ test "buildExitProv: remap through a compaction map, drop non-survivors, sort (A
     // %0 no prov; %1 = A → committed 1; %2 = B → DROPPED (map null); %3 no prov.
     const rec = [_]?ExitProvenance{ null, a, b, null };
     const map = [_]?Ref{ 0, 1, null, 2 };
-    const out = try buildExitProv(gpa, &rec, &map);
+    const out = try buildExitProv(gpa, &rec, &map, null);
     defer if (out.len != 0) gpa.free(out);
     try testing.expectEqual(@as(usize, 1), out.len);
     try testing.expectEqual(@as(u32, 1), out[0].index);
@@ -8057,7 +8094,7 @@ test "buildExitProv: null map is the identity (dupe path), result stays sorted (
     const a = testGuardProv(10, .operand_type, .b);
     const b = testGuardProv(20, .branch_cond, .a);
     const rec = [_]?ExitProvenance{ null, a, null, b }; // committed == emission (identity)
-    const out = try buildExitProv(gpa, &rec, null);
+    const out = try buildExitProv(gpa, &rec, null, null);
     defer if (out.len != 0) gpa.free(out);
     try testing.expectEqual(@as(usize, 2), out.len);
     try testing.expectEqual(@as(u32, 1), out[0].index);
@@ -8094,7 +8131,7 @@ test "buildExitProv: empty when nothing survives → static slice, no alloc (A-i
     const a = testGuardProv(10, .operand_type, .b);
     const rec = [_]?ExitProvenance{ null, a, null };
     const map = [_]?Ref{ 0, null, 1 }; // the only prov is dropped
-    const out = try buildExitProv(gpa, &rec, &map);
+    const out = try buildExitProv(gpa, &rec, &map, null);
     try testing.expectEqual(@as(usize, 0), out.len); // static empty; no free needed
 }
 
@@ -8163,4 +8200,79 @@ test "A-i.3 stamp: branch polarity is part of identity (taken vs fallthrough), r
         try testing.expectEqual(@as(u32, 6), g.source_pc); // 7 − 1
         try testing.expectEqual(c[2], g.polarity);
     }
+}
+
+test "buildExitProv: a .link terminal entry is injected and sorts last (A-i.4)" {
+    const gpa = testing.allocator;
+    // A guard at emission %1 (survives as committed 1) plus the `.link` terminal at
+    // committed index 4 (appended directly at commit — no lockstep slot). The link
+    // entry must appear in the output, sorted after the guard.
+    const g = testGuardProv(10, .operand_type, .b);
+    const rec = [_]?ExitProvenance{ null, g, null };
+    const link = ExitProvEntry{ .index = 4, .prov = .{ .link_terminal = .{ .source_proto_id = 7, .source_pc = 41 } } };
+    const out = try buildExitProv(gpa, &rec, null, link);
+    defer if (out.len != 0) gpa.free(out);
+    try testing.expectEqual(@as(usize, 2), out.len);
+    try testing.expectEqual(@as(u32, 1), out[0].index); // guard first
+    try testing.expect(out[0].prov == .guard);
+    try testing.expectEqual(@as(u32, 4), out[1].index); // link terminal last
+    try testing.expect(out[1].prov == .link_terminal);
+    try testing.expectEqual(@as(u32, 41), out[1].prov.link_terminal.source_pc);
+}
+
+test "A-i.4 transport: recForPrepLink commits a .link trace carrying .link_terminal provenance" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    // The inner root below is stack-allocated (never heap-freed); the committed link
+    // trace IS heap-allocated. Free the committed one explicitly, then drop both cache
+    // pointers before `deinit` so it never calls `destroy` on the stack trace.
+    var committed: ?*Trace = null;
+    defer state.deinit();
+    defer {
+        if (committed) |ct| ct.destroy(gpa);
+        state.cache.clearRetainingCapacity();
+    }
+
+    // Bytecode shape: `for_prep` recorded at post-increment pc 5 (its guest opcode is
+    // at index 4), jumping +2 to the `for_loop` at index 7, whose back-edge (−3) lands
+    // on the inner-root anchor pc 5. Only code[7] is read by recForPrepLink.
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.load_nil);
+    code[7] = Instr.opJ(.for_loop, -3);
+    const proto = Proto{ .code = &code, .name = "t", .num_registers = 4 };
+
+    // A pre-existing inner `.loop` root at (proto, 5) — LINNER only links if one exists.
+    const inner_instrs = [_]IrInstr{.{ .op = .loop }};
+    var inner: Trace = .{
+        .id = 900,
+        .anchor = .{ .proto = &proto, .pc = 5 },
+        .instrs = @constCast(&inner_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    try state.cache.append(gpa, &inner);
+
+    // Arm a *continuation* recording (a `.root` recording aborts LINNER at for_prep).
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 2 }, proto.num_registers);
+    state.rec.kind = .continuation;
+
+    // for_prep a=0 aux=+2, control regs R[0..2] = init/limit/step (all int).
+    var regs = [_]Value{ Value.int(1), Value.int(10), Value.int(1), Value.nil() };
+    state.recordInstr(Instr.opAx(.for_prep, 0, 2), winRO(&regs), &proto, 5, Value.nil());
+
+    // Recording closed (committed a `.link` trace). The new trace is last in cache.
+    try testing.expect(!state.isRecording());
+    const t = state.cache.items[state.cache.items.len - 1];
+    committed = t; // hand to the cleanup defer
+    try testing.expect(t.id != 900); // not the pre-seeded inner root
+    const last = t.instrs.len - 1;
+    try testing.expectEqual(IrOp.link, t.instrs[last].op);
+    try testing.expectEqual(@as(i32, 5), t.instrs[last].aux); // links to inner anchor pc 5
+
+    // The `.link` terminal's provenance is present at the terminal's committed index.
+    const prov = t.provAt(@intCast(last)) orelse return error.MissingLinkProvenance;
+    try testing.expect(prov == .link_terminal);
+    try testing.expectEqual(@as(u32, 4), prov.link_terminal.source_pc); // cur_pc 5 − 1
+    try testing.expectEqual(@as(u8, 0), prov.link_terminal.inline_depth); // never inlined
 }
