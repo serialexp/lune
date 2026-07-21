@@ -4338,6 +4338,9 @@ pub const TraceState = struct {
         }
         var staged_tombstones: std.ArrayListUnmanaged(RegionId) = .empty;
         defer staged_tombstones.deinit(gpa);
+        const StagedOwnerUpdate = struct { id: RegionId, owner: AnchorKey };
+        var staged_owner_updates: std.ArrayListUnmanaged(StagedOwnerUpdate) = .empty;
+        defer staged_owner_updates.deinit(gpa);
         var active_regions: std.ArrayListUnmanaged(ActiveRegion) = .empty;
         defer {
             for (active_regions.items) |a| gpa.free(a.member_trace_ids);
@@ -4346,6 +4349,7 @@ pub const TraceState = struct {
         try staged_interns.ensureUnusedCapacity(gpa, candidates.items.len);
         try staged_defs.ensureUnusedCapacity(gpa, candidates.items.len);
         try staged_tombstones.ensureUnusedCapacity(gpa, candidates.items.len);
+        try staged_owner_updates.ensureUnusedCapacity(gpa, candidates.items.len);
         try active_regions.ensureUnusedCapacity(gpa, candidates.items.len);
 
         var new_id_counter: u64 = self.next_region_id;
@@ -4358,7 +4362,20 @@ pub const TraceState = struct {
                 // stored def may have been minted from a complete pass and must not stay
                 // armable once a truncated pass appears (fail-closed, sticky).
                 if (!compatible or !cand.membership_complete) staged_tombstones.appendAssumeCapacity(existing_id);
-                const eff_armable = stored.armable and compatible and cand.membership_complete;
+                // Finding 5 (review, boundary-edge evolution): the current owner analysis
+                // (`cand.armable_owner`) MUST re-gate arming on every rebind. Boundary edges
+                // are excluded from `RegionId`, so a graph change that adds a competing
+                // external-entry loop-root re-interns the SAME id but flips `both_count`
+                // 1→2 (owner no longer unique). Without this `and cand.armable_owner`, the
+                // stale `stored.armable=true` would wrong-arm. This is a pure tightening of
+                // the PHYSICAL arming (never a stale-true), so it can only disarm, never
+                // spuriously arm; a region first-seen armable that transiently loses its
+                // unique owner re-arms when `armable_owner` holds again.
+                const eff_armable = stored.armable and compatible and cand.membership_complete and cand.armable_owner;
+                // Keep the stored owner fresh: the unique external-entry loop-root can MOVE
+                // to a different anchor with the internal edge set (hence the id) unchanged,
+                // so the arm site must track the current owner, not the first-sight one.
+                staged_owner_updates.appendAssumeCapacity(.{ .id = existing_id, .owner = cand.owner });
                 const mt_copy = try gpa.dupe(u32, cand.member_trace_ids);
                 active_regions.appendAssumeCapacity(.{ .id = existing_id, .comp = cand.comp, .armable = eff_armable, .member_trace_ids = mt_copy });
             } else {
@@ -4437,6 +4454,9 @@ pub const TraceState = struct {
         staged_interns.clearRetainingCapacity(); // ownership moved into region_intern
         for (staged_defs.items) |s| self.region_defs.putAssumeCapacity(s.id, s.def);
         staged_defs.clearRetainingCapacity(); // ownership moved into region_defs
+        for (staged_owner_updates.items) |u| {
+            if (self.region_defs.getPtr(u.id)) |d| d.owner = u.owner;
+        }
         for (staged_tombstones.items) |id| {
             if (self.region_defs.getPtr(id)) |d| d.armable = false;
         }
@@ -9807,6 +9827,74 @@ test "A-ii.4 exit_prov fail-soft: an incomplete-exit_prov trace disarms the whol
     const regs = state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 });
     try testing.expectEqual(@as(usize, 1), regs.len);
     try testing.expectEqual(rid, regs[0]);
+}
+
+test "A-ii.4 finding-5: a boundary edge added on rebind flips both_count 1→2, re-gating armable off (same id)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    // Phase 1: the armable skip→ramp→inner→cont→skip cycle with ONE incoming boundary
+    // (ext→skip@14) → skip is the unique external-entry ∧ loop-root → both_count==1, armed.
+    // Phase 2: add a SECOND incoming boundary (ext2→inner@7) — inner@7 also ends `.loop`,
+    // so it too becomes external-entry ∧ loop-root → both_count==2. The INTERNAL edge set
+    // is unchanged, so the region re-interns to the SAME id, but the current owner analysis
+    // (`cand.armable_owner`) is now false, so the rebind must DISARM it despite the stored
+    // armable bit (finding 5). The owner is refreshed to the deterministic placeholder.
+    const P_ID: u32 = 7;
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+    var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
+    var skip: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 14 }, .instrs = &skip_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &skip_p };
+
+    var ramp_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+    var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
+    var ramp: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ramp_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ramp_p };
+
+    var inner_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
+    var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+    var inner: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_p };
+
+    var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+    var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
+    var cont: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p };
+
+    var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+    var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
+    var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
+
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
+    state.rebuildEdgeCache(.retain);
+    state.rebuildRegions(.retain);
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    var kit = state.region_defs.keyIterator();
+    const rid = kit.next().?.*;
+    try testing.expect(state.region_defs.get(rid).?.armable);
+    try testing.expectEqual(@as(u32, 14), state.region_defs.get(rid).?.owner.pc); // owner=skip@14
+    try testing.expectEqual(@as(usize, 1), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
+
+    // Phase 2: add ext2 → inner@7 (a second external-entry into a loop-root). both_count→2.
+    var ext2_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }};
+    var ext2_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(39, .branch_cond) }};
+    var ext2: Trace = .{ .id = 6, .anchor = .{ .proto = &proto, .pc = 40 }, .instrs = &ext2_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext2_p };
+    try state.cache.append(gpa, &ext2);
+    state.rebuildEdgeCache(.retain);
+    state.rebuildRegions(.retain);
+
+    // SAME region id (internal edge set unchanged), but disarmed by the current owner
+    // analysis, and no member exit is classified. The stored owner is refreshed away from
+    // skip@14 to the deterministic placeholder (canonically-smallest anchor of the SCC).
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    var kit2 = state.region_defs.keyIterator();
+    try testing.expectEqual(rid, kit2.next().?.*);
+    try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len);
+    try testing.expectEqual(@as(u32, 0), state.source_exit_regions.count());
+    try testing.expectEqual(@as(u32, 0), state.dest_entry_regions.count());
+    try testing.expectEqual(@as(u32, 2), state.region_defs.get(rid).?.owner.pc); // placeholder = smallest anchor (ramp@2)
 }
 
 test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) re-interns to the SAME RegionId" {
