@@ -5162,7 +5162,12 @@ pub const TraceState = struct {
         const gref = try self.emit(.{ .op = op, .a = ra });
         // Branch polarity IS part of the identity (A-i.3, round-1 BLOCKER 1): the
         // true-exit and false-exit of one `if` are opposite CFG edges of the region.
-        self.stampProv(gref, .branch_cond, .a, if (truthy) .taken else .fallthrough);
+        // Polarity names which guest CFG edge the RECORDED path took, keyed on the
+        // branch's *jump-taken* edge (opcode-relative), NOT raw truthiness: a
+        // `jmp_if_false` jumps when the value is falsy, a `jmp_if_true` when truthy.
+        // So the recorded path took the branch iff `(op == jmp_if_true) == truthy`.
+        const jumped = (instr.op == .jmp_if_true) == truthy;
+        self.stampProv(gref, .branch_cond, .a, if (jumped) .taken else .fallthrough);
     }
 
     /// `for_loop` (numeric-for back-edge): record the increment and the
@@ -5570,7 +5575,9 @@ pub const TraceState = struct {
         // ordinary operand guard wherever the trace consumes it.
         if (resolved.isHeap() and resolved.heapType() == .function) {
             const cl = function.Closure.fromHeader(resolved.asHeap());
-            self.stampProv(try self.emit(.{ .op = .guard_func, .a = ref, .aux = @bitCast(cl.proto.id) }), .callee_identity, .none, .neutral);
+            // Operand is the destination register `dest` (H-1c: `(callee_identity, dest)`),
+            // which `recInputGet` receives as `instr.a` of the get_upval/get_global.
+            self.stampProv(try self.emit(.{ .op = .guard_func, .a = ref, .aux = @bitCast(cl.proto.id) }), .callee_identity, .a, .neutral);
         }
         self.setReg(dest, ref);
     }
@@ -8181,24 +8188,31 @@ test "A-i.3 stamp: int↔float re-record keeps guard identity (only the IR op di
     }
 }
 
-test "A-i.3 stamp: branch polarity is part of identity (taken vs fallthrough), rest equal" {
+test "A-i.3 stamp: branch polarity keys on the guest jump-taken edge, not raw truthiness" {
     const gpa = testing.allocator;
-    // A truthy operand records guard_true (polarity taken); a falsy one records
-    // guard_false (polarity fallthrough). Everything else in the tag is identical —
-    // the two CFG edges of one `if` differ ONLY by polarity (round-1 BLOCKER 1).
-    inline for (.{ .{ Value.int(1), IrOp.guard_true, Polarity.taken }, .{ Value.boolean(false), IrOp.guard_false, Polarity.fallthrough } }) |c| {
+    // Polarity names which guest CFG edge the recorded path took, keyed on the
+    // opcode's *jump-taken* edge — NOT truthiness. `jmp_if_false` jumps when falsy;
+    // `jmp_if_true` jumps when truthy. So for one operand value the two opcodes give
+    // OPPOSITE polarity, while the guard op (true/false) tracks truthiness alone.
+    // { opcode, operand, expected guard op, expected polarity }.
+    inline for (.{
+        .{ bytecode.OpCode.jmp_if_false, Value.int(1), IrOp.guard_true, Polarity.fallthrough }, // truthy: doesn't jump
+        .{ bytecode.OpCode.jmp_if_false, Value.boolean(false), IrOp.guard_false, Polarity.taken }, // falsy: jumps
+        .{ bytecode.OpCode.jmp_if_true, Value.int(1), IrOp.guard_true, Polarity.taken }, // truthy: jumps
+        .{ bytecode.OpCode.jmp_if_true, Value.boolean(false), IrOp.guard_false, Polarity.fallthrough }, // falsy: doesn't jump
+    }) |c| {
         var state = TraceState.init(gpa);
         defer state.deinit();
         const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
         try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
-        var regs = [_]Value{ c[0], Value.nil() };
-        state.recordInstr(Instr.opABC(.jmp_if_false, 0, 0, 0), winRO(&regs), &proto, 7, Value.nil());
-        try testing.expectEqual(c[1], state.rec.instrs.items[1].op);
+        var regs = [_]Value{ c[1], Value.nil() };
+        state.recordInstr(Instr.opABC(c[0], 0, 0, 0), winRO(&regs), &proto, 7, Value.nil());
+        try testing.expectEqual(c[2], state.rec.instrs.items[1].op);
         const g = state.rec.exit_prov.items[1].?.guard;
         try testing.expectEqual(GuardRole.branch_cond, g.role);
         try testing.expectEqual(OperandDesig.a, g.operand);
         try testing.expectEqual(@as(u32, 6), g.source_pc); // 7 − 1
-        try testing.expectEqual(c[2], g.polarity);
+        try testing.expectEqual(c[3], g.polarity);
     }
 }
 
