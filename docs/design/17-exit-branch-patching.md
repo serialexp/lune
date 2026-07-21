@@ -277,9 +277,16 @@ land; move whole sections to Done once everything inside is checked.
     (per-site key threading deferred to A-iv). Test: `onSideExit ≡ accountTraceRun` equivalence over a
     low-yield-then-useful sequence (identical penalty/gate/`hit_count`), since `accountRegionProfit(null)`
     is a no-op.
-  - [ ] **A-ii.2 — `StructuralEdgeId` + ephemeral `edge_cache` + successor resolution (inert).** Type +
-    canonical total order; build `(Trace.id,exit_instr)→StructuralEdgeId` at commit via
-    `guardExitPc`→`findTrace`/link-terminal; drop in `removeTrace`/`clearCache`. Read by nothing.
+  - [x] **A-ii.2 — `StructuralEdgeId` + ephemeral `edge_cache` + successor resolution (inert). LANDED
+    2026-07-21.** `just test` green (default + `-Djit-debug`); nsieve/nbody/mandelbrot tier-0 ≡ native.
+    `StructuralEdgeId` + field-wise `order`/`eql`/`hash` (honoring `inline_depth`, union tag via
+    `@intFromEnum(activeTag)`; no `asBytes`). `edge_cache` rebuilt WHOLESALE by `rebuildEdgeCache` at commit
+    + `removeTrace` (surviving cache, fail-closed empty on OOM), cleared in `clearCache`, freed in `deinit`.
+    Successor resolution (`resolveSuccessorAnchor`, faithful to `driveChain`): `.link_terminal` →
+    `(t.proto, link.aux)` iff `hasInnerRootAt`; guard → `(t.proto, guardExitPc)` iff `wp∉{0, anchor.pc}` and
+    `countTracesAt>0`; succ proto = `t.anchor.proto` (same-proto, cross-proto deferred). Anchor-keyed graph,
+    NOT `findTrace`-selected identity. Read by nothing. Tests: 2-anchor cont↔inner cycle; retire empties;
+    `eql`/`order` field-wise.
   - [ ] **A-ii.3 — recorded `{proto_id, source_pc}` membership substrate (inert).** Capture the per-trace
     ordered recorded program-point path (transient per-trace metadata) via a `recordInstr` hook; freed on
     retire/flush. Read by nothing.

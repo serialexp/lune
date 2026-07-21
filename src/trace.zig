@@ -591,6 +591,170 @@ fn exitProvEntryLess(_: void, a: ExitProvEntry, b: ExitProvEntry) bool {
 /// until A-iv threads it per-site — §A8-ii).
 pub const ExitKey = struct { trace_id: u32, exit_instr: u32 };
 
+/// The persistent, guest-logical identity of a structural trace-graph edge (doc 17
+/// §A3.3 / §A8-ii, A-ii.2): a source anchor `{proto_id, pc}`, the exit's
+/// `ExitProvenance` (A-i), and the successor anchor `{proto_id, pc}`. Keyed by
+/// `proto.id` (guest-logical), never a `*Proto`, so a re-recorded logically-identical
+/// edge (new `Trace.id`) computes the same id. Anchors are `{proto, pc}` — a bare
+/// `succ_pc` would alias successors at the same PC in different protos.
+///
+/// `order`/`eql`/`hash` are **field-wise** honoring `inline_depth` (only
+/// `path[0..inline_depth]` is live): `ExitProvenance` is a padded tagged union with a
+/// fixed-size `path` array + an inactive arm, so `std.mem.asBytes`/full-union `eql`
+/// would compare garbage (round-11/12 review).
+pub const StructuralEdgeId = struct {
+    anchor_proto_id: u32,
+    anchor_pc: u32,
+    exit: ExitProvenance,
+    succ_anchor_proto_id: u32,
+    succ_anchor_pc: u32,
+
+    pub fn order(a: StructuralEdgeId, b: StructuralEdgeId) std.math.Order {
+        switch (std.math.order(a.anchor_proto_id, b.anchor_proto_id)) {
+            .eq => {},
+            else => |o| return o,
+        }
+        switch (std.math.order(a.anchor_pc, b.anchor_pc)) {
+            .eq => {},
+            else => |o| return o,
+        }
+        switch (exitOrder(a.exit, b.exit)) {
+            .eq => {},
+            else => |o| return o,
+        }
+        switch (std.math.order(a.succ_anchor_proto_id, b.succ_anchor_proto_id)) {
+            .eq => {},
+            else => |o| return o,
+        }
+        return std.math.order(a.succ_anchor_pc, b.succ_anchor_pc);
+    }
+
+    pub fn eql(a: StructuralEdgeId, b: StructuralEdgeId) bool {
+        return a.order(b) == .eq;
+    }
+
+    /// Strict-less-than for `std.sort` (context-free comparator form).
+    pub fn lessThan(_: void, a: StructuralEdgeId, b: StructuralEdgeId) bool {
+        return a.order(b) == .lt;
+    }
+
+    pub fn hash(e: StructuralEdgeId) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&e.anchor_proto_id));
+        h.update(std.mem.asBytes(&e.anchor_pc));
+        hashExit(&h, e.exit);
+        h.update(std.mem.asBytes(&e.succ_anchor_proto_id));
+        h.update(std.mem.asBytes(&e.succ_anchor_pc));
+        return h.final();
+    }
+};
+
+fn u32Order(a: u32, b: u32) std.math.Order {
+    return std.math.order(a, b);
+}
+
+/// Field-wise canonical order over the live inline path prefix (both depths already
+/// proven equal by the caller before it reaches here).
+fn pathOrder(a: []const CallEdge, b: []const CallEdge) std.math.Order {
+    for (a, b) |ae, be| {
+        switch (u32Order(ae.caller_proto_id, be.caller_proto_id)) {
+            .eq => {},
+            else => |o| return o,
+        }
+        switch (u32Order(ae.call_pc, be.call_pc)) {
+            .eq => {},
+            else => |o| return o,
+        }
+    }
+    return .eq;
+}
+
+fn exitOrder(a: ExitProvenance, b: ExitProvenance) std.math.Order {
+    const at: u8 = @intFromEnum(std.meta.activeTag(a));
+    const bt: u8 = @intFromEnum(std.meta.activeTag(b));
+    switch (std.math.order(at, bt)) {
+        .eq => {},
+        else => |o| return o,
+    }
+    switch (a) {
+        .guard => |ag| {
+            const bg = b.guard;
+            switch (u32Order(ag.source_proto_id, bg.source_proto_id)) {
+                .eq => {},
+                else => |o| return o,
+            }
+            switch (u32Order(ag.source_pc, bg.source_pc)) {
+                .eq => {},
+                else => |o| return o,
+            }
+            switch (std.math.order(@intFromEnum(ag.role), @intFromEnum(bg.role))) {
+                .eq => {},
+                else => |o| return o,
+            }
+            switch (std.math.order(@intFromEnum(ag.operand), @intFromEnum(bg.operand))) {
+                .eq => {},
+                else => |o| return o,
+            }
+            switch (std.math.order(@intFromEnum(ag.polarity), @intFromEnum(bg.polarity))) {
+                .eq => {},
+                else => |o| return o,
+            }
+            switch (std.math.order(ag.inline_depth, bg.inline_depth)) {
+                .eq => {},
+                else => |o| return o,
+            }
+            return pathOrder(ag.path[0..ag.inline_depth], bg.path[0..bg.inline_depth]);
+        },
+        .link_terminal => |al| {
+            const bl = b.link_terminal;
+            switch (u32Order(al.source_proto_id, bl.source_proto_id)) {
+                .eq => {},
+                else => |o| return o,
+            }
+            switch (u32Order(al.source_pc, bl.source_pc)) {
+                .eq => {},
+                else => |o| return o,
+            }
+            switch (std.math.order(al.inline_depth, bl.inline_depth)) {
+                .eq => {},
+                else => |o| return o,
+            }
+            return pathOrder(al.path[0..al.inline_depth], bl.path[0..bl.inline_depth]);
+        },
+    }
+}
+
+fn hashExit(h: *std.hash.Wyhash, exit: ExitProvenance) void {
+    const tag: u8 = @intFromEnum(std.meta.activeTag(exit));
+    h.update(std.mem.asBytes(&tag));
+    switch (exit) {
+        .guard => |g| {
+            h.update(std.mem.asBytes(&g.source_proto_id));
+            h.update(std.mem.asBytes(&g.source_pc));
+            const role: u8 = @intFromEnum(g.role);
+            const operand: u8 = @intFromEnum(g.operand);
+            const polarity: u8 = @intFromEnum(g.polarity);
+            h.update(std.mem.asBytes(&role));
+            h.update(std.mem.asBytes(&operand));
+            h.update(std.mem.asBytes(&polarity));
+            h.update(std.mem.asBytes(&g.inline_depth));
+            for (g.path[0..g.inline_depth]) |ce| {
+                h.update(std.mem.asBytes(&ce.caller_proto_id));
+                h.update(std.mem.asBytes(&ce.call_pc));
+            }
+        },
+        .link_terminal => |l| {
+            h.update(std.mem.asBytes(&l.source_proto_id));
+            h.update(std.mem.asBytes(&l.source_pc));
+            h.update(std.mem.asBytes(&l.inline_depth));
+            for (l.path[0..l.inline_depth]) |ce| {
+                h.update(std.mem.asBytes(&ce.caller_proto_id));
+                h.update(std.mem.asBytes(&ce.call_pc));
+            }
+        },
+    }
+}
+
 /// Remap the recorder's dense, emission-indexed exit-provenance table (A-i.1) into
 /// the committed trace's compact, sorted `[]ExitProvEntry`, keyed by committed
 /// instruction index. `old_to_new` is `tropt`'s compaction map (emission index →
@@ -1230,6 +1394,14 @@ pub const TraceState = struct {
     /// clears it; at `config.max_penalty` the anchor is gated off with a doubling
     /// cooldown (`onSideExit` → `gateAnchor`).
     penalty: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
+    /// Pure ephemeral structural-edge cache (doc 17 §A3.3 / §A8-ii, A-ii.2):
+    /// `{Trace.id, exit_instr} → StructuralEdgeId`. Rebuilt WHOLESALE from the current
+    /// cache at every commit AND every retirement (never surgically mutated), dropped
+    /// in `clearCache`, freed in `deinit`. NOT a source of truth — the region
+    /// classifier (A-ii.4) will consume it. **Inert: read by nothing in A-ii ⇒
+    /// byte-identical.** A rebuild OOM leaves it EMPTY (fail-closed, safe since
+    /// read-by-nothing / region-neutral).
+    edge_cache: std.AutoHashMapUnmanaged(ExitKey, StructuralEdgeId) = .empty,
     /// Total trace entries executed (incremented in the dispatch loop before each
     /// `irinterp.execute`/native run). Diagnostic only — used to confirm the gate
     /// entry-check actually halts re-entry on a thrashing anchor, and a cheap
@@ -1528,6 +1700,7 @@ pub const TraceState = struct {
         if (self.exec_recorder) |*r| r.deinit();
         self.armed_links.deinit(self.gpa);
         self.coverage.deinit(self.gpa);
+        self.edge_cache.deinit(self.gpa); // A-ii.2 (values are plain structs; no per-entry free)
         // Free each trace (its `native.deinit()` returns mcode slots to the arena's
         // free-list) *before* tearing down the arena those slots live in.
         for (self.cache.items) |t| t.destroy(self.gpa);
@@ -3425,6 +3598,78 @@ pub const TraceState = struct {
         return n;
     }
 
+    /// True iff some cached trace at `(proto, pc)` has inner-loop-root shape. Used by
+    /// `.link_terminal` successor resolution (A-ii.2) to confirm the named inner root
+    /// is bound — the `isInnerLoopRoot` shape (`inputs.len == 0` + `.loop` terminal)
+    /// that `findLoopTrace` omits.
+    fn hasInnerRootAt(self: *const TraceState, proto: *const Proto, pc: u32) bool {
+        for (self.cache.items) |t| {
+            if (isInnerLoopRoot(t, proto, pc)) return true;
+        }
+        return false;
+    }
+
+    const SuccAnchor = struct { proto_id: u32, pc: u32 };
+
+    /// Resolve the guest-logical successor **anchor** `{proto_id, pc}` of one keyed
+    /// exit `e` of trace `t` (doc 17 §A8-ii, A-ii.2), following `driveChain`'s
+    /// resolution faithfully but keyed by anchor, not the concrete successor trace:
+    ///   • `.link_terminal` → the named inner root at `(t.proto, link.aux)`, iff a
+    ///     trace of inner-root shape is bound there.
+    ///   • a guard exit → `(t.proto, wp)` where `wp = guardExitPc(...)` (non-null only
+    ///     for the numeric/branch guards `driveChain` chains on), iff `wp != 0`,
+    ///     `wp != t.anchor.pc`, and a trace is bound at `(t.proto, wp)`.
+    /// The successor proto is `t.anchor.proto` — the same-proto assumption
+    /// `driveChain` makes (it threads one `proto` into `nextTraceExcluding`); a
+    /// cross-proto inlined-callee resume is a known deferred refinement (§A8-ii).
+    /// Returns `null` (no structural edge) for any exit whose successor is not a
+    /// compatibly-bound trace, or a non-PC-carrying guard.
+    fn resolveSuccessorAnchor(self: *const TraceState, t: *const Trace, e: ExitProvEntry) ?SuccAnchor {
+        const proto = t.anchor.proto;
+        switch (e.prov) {
+            .link_terminal => {
+                const li = t.instrs[e.index];
+                if (li.op != .link) return null; // defensive: a .link_terminal must sit on a .link
+                if (li.aux < 0) return null;
+                const succ_pc: u32 = @intCast(li.aux);
+                if (!self.hasInnerRootAt(proto, succ_pc)) return null;
+                return .{ .proto_id = proto.id, .pc = succ_pc };
+            },
+            .guard => {
+                const wp = guardExitPc(t.instrs[e.index]) orelse return null;
+                if (wp == 0 or wp == t.anchor.pc) return null;
+                if (self.countTracesAt(.{ .proto = proto, .pc = wp }) == 0) return null;
+                return .{ .proto_id = proto.id, .pc = wp };
+            },
+        }
+    }
+
+    /// Rebuild the ephemeral `edge_cache` WHOLESALE from the current cache (doc 17
+    /// §A8-ii, A-ii.2): clear it, then for every keyed exit of every cached trace with
+    /// a compatibly-bound successor, record `{Trace.id, exit_instr} → StructuralEdgeId`.
+    /// Called at every commit and every retirement (never surgically mutated). **Inert:
+    /// read by nothing in A-ii ⇒ byte-identical.** Fail-soft: an OOM leaves the cache
+    /// EMPTY (region-neutral for the not-yet-existing consumer), never propagating.
+    fn rebuildEdgeCache(self: *TraceState) void {
+        self.edge_cache.clearRetainingCapacity();
+        for (self.cache.items) |t| {
+            for (t.exit_prov) |e| {
+                const succ = self.resolveSuccessorAnchor(t, e) orelse continue;
+                const eid: StructuralEdgeId = .{
+                    .anchor_proto_id = t.anchor.proto.id,
+                    .anchor_pc = t.anchor.pc,
+                    .exit = e.prov,
+                    .succ_anchor_proto_id = succ.proto_id,
+                    .succ_anchor_pc = succ.pc,
+                };
+                self.edge_cache.put(self.gpa, .{ .trace_id = t.id, .exit_instr = e.index }, eid) catch {
+                    self.edge_cache.clearRetainingCapacity(); // fail-closed → empty
+                    return;
+                };
+            }
+        }
+    }
+
     /// Widen-eviction predicate: is trace `t` permanently dead because the live
     /// array its `guard_lane` pins has monotonically widened past the trace's
     /// recorded lane?  A trace specialises on `tbl.array.lane == aux`; lanes only
@@ -3683,6 +3928,10 @@ pub const TraceState = struct {
                         if (self.coverage.getPtr(anchor)) |cov| cov.has_trace = false;
                     }
                 }
+                // A-ii.2: a retired trace changes which edges remain resolvable for
+                // SURVIVING traces (not just its own), so rebuild the whole edge cache
+                // from the surviving cache — never a surgical key delete. Fail-soft.
+                self.rebuildEdgeCache();
                 return;
             }
         }
@@ -3737,6 +3986,10 @@ pub const TraceState = struct {
         //  * `abort_log` rows borrow a `*Proto` (rendered as `r.proto.name`) — a
         //    diagnostic UAF across independently-owned chunks. Drop them.
         self.abort_log.clearRetainingCapacity();
+
+        // A-ii.2: the structural-edge cache is keyed by `Trace.id` and references a
+        // now-freed cache — drop it wholesale (rebuilt as fresh traces commit).
+        self.edge_cache.clearRetainingCapacity();
     }
 
     /// Remove all guard-failure entries for `anchor`. Called after a side
@@ -4188,6 +4441,10 @@ pub const TraceState = struct {
         // Coverage (gated): a trace now exists at this anchor, so subsequent
         // interpreted back-edges here are "fallback despite a trace."
         if (self.config.coverage) self.markAnchorTraced(t.anchor);
+        // A-ii.2: refresh the structural-edge cache — the new trace may add edges
+        // FROM itself AND make pre-existing traces' exits newly resolvable. Fail-soft
+        // (never fails the commit); inert (read by nothing until A-ii.4).
+        self.rebuildEdgeCache();
     }
 
     /// Debug-only structural verifier for the invariants the tier-1a executor
@@ -8367,4 +8624,69 @@ test "A-ii.1 split: onSideExit ≡ accountTraceRun (accountRegionProfit is a no-
     // Both anchors' penalty entries cleared by the useful exit → map empty (no stray
     // key left by either half).
     try testing.expectEqual(@as(usize, 0), state.penalty.count());
+}
+
+test "A-ii.2 edge_cache: a 2-anchor cont↔inner cycle resolves both structural edges" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity(); // traces are stack-allocated; drop pointers pre-deinit
+
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .name = "t", .num_registers = 1 };
+
+    // cont @pc2: a `.link` terminal (instrs[1], aux=7) to the inner root at pc7.
+    var cont_instrs = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 9 }, .{ .op = .link, .aux = 7 } };
+    var cont_prov = [_]ExitProvEntry{.{ .index = 1, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
+    var cont: Trace = .{ .id = 301, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &cont_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_prov };
+
+    // inner root @pc7: loop-done guard_true (instrs[0], aux=2 == cont anchor), ends `.loop`.
+    var inner_instrs = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+    var inner_prov = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .guard = .{ .source_proto_id = 0, .source_pc = 6, .role = .loop_done, .operand = .none } } }};
+    var inner: Trace = .{ .id = 302, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_prov };
+
+    try state.cache.append(gpa, &cont);
+    try state.cache.append(gpa, &inner);
+    state.rebuildEdgeCache();
+
+    // Both structural edges present: cont --link--> inner(pc7), inner --loop_done--> cont(pc2).
+    try testing.expectEqual(@as(usize, 2), state.edge_cache.count());
+    const e_link = state.edge_cache.get(.{ .trace_id = 301, .exit_instr = 1 }) orelse return error.MissingLinkEdge;
+    try testing.expect(e_link.exit == .link_terminal);
+    try testing.expectEqual(@as(u32, 2), e_link.anchor_pc);
+    try testing.expectEqual(@as(u32, 7), e_link.succ_anchor_pc);
+    const e_guard = state.edge_cache.get(.{ .trace_id = 302, .exit_instr = 0 }) orelse return error.MissingGuardEdge;
+    try testing.expect(e_guard.exit == .guard);
+    try testing.expectEqual(@as(u32, 7), e_guard.anchor_pc);
+    try testing.expectEqual(@as(u32, 2), e_guard.succ_anchor_pc);
+
+    // Wholesale rebuild from the SURVIVING cache after inner leaves: cont's `.link` now
+    // has no inner root bound, and inner's own edge is gone → empty. (Simulate the
+    // retirement rebuild path without `destroy` on a stack trace.)
+    _ = state.cache.swapRemove(1); // drop &inner
+    state.rebuildEdgeCache();
+    try testing.expectEqual(@as(usize, 0), state.edge_cache.count());
+}
+
+test "A-ii.2 canonicalEql/order: field-wise, ignores the dead path tail and the inactive arm" {
+    // Two guard edges identical in every LIVE field but with different garbage in
+    // path[inline_depth..] must be equal (field-wise, not raw bytes). And the exit-tag
+    // orders guard (0) before link_terminal (1), giving a strict total order.
+    var g_a: GuardProvenance = .{ .source_proto_id = 0, .source_pc = 6, .role = .loop_done, .operand = .none };
+    var g_b: GuardProvenance = .{ .source_proto_id = 0, .source_pc = 6, .role = .loop_done, .operand = .none };
+    g_a.path[0] = .{ .caller_proto_id = 111, .call_pc = 222 }; // dead (inline_depth == 0)
+    g_b.path[0] = .{ .caller_proto_id = 333, .call_pc = 444 }; // different dead garbage
+    const ea: StructuralEdgeId = .{ .anchor_proto_id = 0, .anchor_pc = 7, .exit = .{ .guard = g_a }, .succ_anchor_proto_id = 0, .succ_anchor_pc = 2 };
+    const eb: StructuralEdgeId = .{ .anchor_proto_id = 0, .anchor_pc = 7, .exit = .{ .guard = g_b }, .succ_anchor_proto_id = 0, .succ_anchor_pc = 2 };
+    try testing.expect(ea.eql(eb));
+    try testing.expectEqual(ea.hash(), eb.hash());
+    try testing.expect(ea.order(eb) == .eq);
+
+    // A link-terminal edge at the same anchors sorts AFTER a guard edge (tag order),
+    // and the order is antisymmetric.
+    const el: StructuralEdgeId = .{ .anchor_proto_id = 0, .anchor_pc = 7, .exit = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 6, .inline_depth = 0 } }, .succ_anchor_proto_id = 0, .succ_anchor_pc = 2 };
+    try testing.expect(ea.order(el) == .lt);
+    try testing.expect(el.order(ea) == .gt);
+    try testing.expect(!ea.eql(el));
 }
