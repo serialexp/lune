@@ -1,5 +1,38 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-21 (LATEST-20) — A-i COMPLETE; A-ii CODE COMPLETE (A-ii.1–4 all LANDED+green+byte-identical); NEXT = post-landing gpt-5.6-sol review of the whole A-ii impl (the checkpoint-APPROVE, mirrors A-i).
+
+**A-ii.4 landed this session (uncommitted at time of writing → commit next):** `region_defs` discovery +
+`RegionId` interning + classification indices + `classifyExit`, all inert. In `src/trace.zig`:
+- Types: `RegionId=enum(u64)`, `RegionClassifier`, `RegionDef{members,member_points,owner,classifier,armable}`,
+  hand-written `RegionInternMap` (bucket→intrusive-chain, element-wise `setsEqual`, collision-safe),
+  `RegionSetBuilder(K)` + `freeRegionSetMap` helpers, `programPointLess`/`programPointsEqual`/`regionIdLess`.
+- Fields on TraceState: `region_defs`, `region_intern`, `next_region_id`, `source_exit_regions`,
+  `dest_entry_regions`.
+- `rebuildRegions(on_oom)` → `rebuildRegionsFallible`: proto_by_id map → nodes/edges from edge_cache →
+  CSR + iterative Tarjan SCC → cycle-bearing candidates → sorted-set canonical order → intern/stage
+  (transactional: dupes with errdefers + pre-reserved staged lists so appends infallible) → physical
+  src/dst builders → finalize → `reserve` logical maps → INFALLIBLE publish (interns, defs, tombstones,
+  swap physical). OOM: commit `.retain` / retire `.empty` (`clearPhysicalRegionIndices`). `classifyExit`
+  pure query. Owner = unique external-entry ∧ loop-root else placeholder+armable=false. Rebind
+  tombstone on incompatible member_points.
+- Wired: commit (`.retain`), removeTrace (`.empty`), clearCache (clears logical+physical), deinit (frees
+  all), interp.zig:9030 flush-guard (asserts all 5 region/edge maps empty).
+- 6 tests (all green): owner target graph (skip→ramp→inner→cont→skip + boundary → owner==skip@14 ∧
+  armable), re-record RegionId stability, intern set-identity, sibling candidate sets, rebind tombstone,
+  removeTrace-preserves-vs-clearCache-empties lifetime. `just test` 808 pass default + `-Djit-debug`;
+  nsieve 9 / nbody 100000 / sieve_int / pi_leibniz / grid_matmul / field_hash tier-0 ≡ `--trace
+  --jit-native` byte-identical.
+
+**Prior sub-steps (committed earlier this session):**
+- `ac276da` A-ii.1 split; `7b0c500` A-ii.2 StructuralEdgeId+edge_cache; `2c4de54` A-ii.3 rec_path.
+
+**NEXT:** request the post-landing gpt-5.6-sol review of the whole A-ii implementation (the
+checkpoint-APPROVE). Then §A8 step 3 = A-iii (call_seq plumbing). accountRegionProfit stays no-op until
+A-iv (region_profit accumulator + window + state machine + threads real ?ExitKey).
+
+---
+
 ## Status 2026-07-21 (LATEST-19) — A-i COMPLETE; A-ii DESIGNED+APPROVED; A-ii.1/2/3 LANDED+COMMITTED+green; A-ii.4 (the big one) remaining, fully grounded.
 
 **Landed this session (all green: `just test` default + `-Djit-debug`; nsieve/nbody/mandelbrot tier-0≡native):**

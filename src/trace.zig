@@ -762,6 +762,199 @@ fn hashExit(h: *std.hash.Wyhash, exit: ExitProvenance) void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Region model (doc 17 §A3.3 / §A3.5 / §A8-ii, A-ii.4)
+//
+// A *region* is a strongly-connected component of the structural trace graph
+// (`StructuralEdgeId` edges over `{proto_id, pc}` anchor nodes) that contains a
+// cycle — the guest-logical unit the exit-branch-patching gate reasons about. All
+// of this is INERT in A-ii: `region_defs` is built and `classifyExit` is queryable,
+// but nothing on the selection path reads it (`accountRegionProfit` is a no-op), so
+// it is byte-identical across the 10 replay modes.
+// ---------------------------------------------------------------------------
+
+/// Opaque interned handle for a region (doc 17 §A3.3): assigned sequentially by the
+/// intern map, NEVER a bare hash. Interned on the region's canonical sorted INTERNAL
+/// `StructuralEdgeId` set, so a re-recorded logically-identical region (new
+/// `Trace.id`s) re-interns to the SAME id.
+pub const RegionId = enum(u64) { _ };
+
+fn regionIdLess(_: void, a: RegionId, b: RegionId) bool {
+    return @intFromEnum(a) < @intFromEnum(b);
+}
+
+/// Minimal region shape descriptor (doc 17 §A8-ii). A-vii reads `kind` to pick the
+/// arming strategy; `member_count` is the anchor-node count of the cycle.
+pub const RegionClassifier = struct {
+    kind: enum { self_loop, cross_trace_cycle },
+    member_count: u32,
+};
+
+/// A discovered region definition (doc 17 §A3.1 / §A3.5). Proto/VM-lifetime: kept in
+/// `region_defs`, NEVER retirement-cleaned, cleared only on `clearCache`. Owns its
+/// `members`/`member_points` slices.
+pub const RegionDef = struct {
+    /// The region's INTERNAL edges only (both endpoints in the SCC), canonical-sorted
+    /// and deduped — the identity basis interned to the `RegionId`. Owned.
+    members: []StructuralEdgeId,
+    /// Membership program-point SET (doc 17 §A3.5): the union of member traces'
+    /// recorded `{proto_id, source_pc}` paths (A-ii.3) plus each internal edge's
+    /// validated handoff endpoints, sorted + deduped. Owned. A-iv's tier-0 region
+    /// observer keys on this; A-ii uses it for the def-consistency rebind check.
+    member_points: []ProgramPoint,
+    /// Gate/penalty blast-radius key = the region's loop-root `{proto, root_pc}`
+    /// (doc 17 §A2.6). Borrows a `*Proto` that outlives the region (proto lifetime ≥
+    /// trace lifetime; both bounded by the `clearCache` epoch that frees `region_defs`).
+    owner: AnchorKey,
+    classifier: RegionClassifier,
+    /// Minted `true`; flipped `false` by BOTH the A-ii def-consistency rebind
+    /// tombstone (an existing `RegionId` re-bound with incompatible `member_points`,
+    /// §A3.5) AND the A-iv+ gate tombstone. The classification-index build excludes
+    /// `armable == false` regions.
+    armable: bool,
+};
+
+/// Interns a canonical-sorted `[]StructuralEdgeId` SET → a stable `RegionId`
+/// (doc 17 §A3.3 / §A8-ii, A-ii.4). Hand-written (not `AutoHashMap`) because the key
+/// is a variable-length slice compared by ELEMENT-WISE `StructuralEdgeId.eql` over the
+/// sorted set — `std.mem.eql` would compare the padded tagged-union bytes. The 64-bit
+/// fold of the per-edge hashes only selects the bucket; every hit is confirmed by set
+/// equality, and a genuine hash collision (equal fold, unequal set) mints a DISTINCT
+/// id. Owns a copy of each interned sorted slice. Buckets are `foldedHash → head entry
+/// index`, chained intrusively through `Entry.next`, so a `internAssumeCapacity` after
+/// `reserve(n)` is infallible (the transactional-publish requirement, §A8-ii).
+pub const RegionInternMap = struct {
+    pub const empty: RegionInternMap = .{};
+
+    const Entry = struct { edges: []StructuralEdgeId, id: RegionId, next: i64 = -1 };
+
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    buckets: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+
+    fn foldHash(edges: []const StructuralEdgeId) u64 {
+        var h = std.hash.Wyhash.init(0);
+        for (edges) |e| {
+            const eh = e.hash();
+            h.update(std.mem.asBytes(&eh));
+        }
+        return h.final();
+    }
+
+    fn setsEqual(a: []const StructuralEdgeId, b: []const StructuralEdgeId) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |ae, be| {
+            if (!ae.eql(be)) return false;
+        }
+        return true;
+    }
+
+    /// Read-only lookup: the interned id for this sorted set, or null if absent. Used
+    /// by discovery to distinguish rebind (existing id) from first-sight WITHOUT
+    /// mutating (mutation is deferred to the infallible publish phase).
+    fn lookup(self: *const RegionInternMap, edges: []const StructuralEdgeId) ?RegionId {
+        const h = foldHash(edges);
+        var idx: i64 = if (self.buckets.get(h)) |x| @intCast(x) else return null;
+        while (idx >= 0) {
+            const e = self.entries.items[@intCast(idx)];
+            if (setsEqual(e.edges, edges)) return e.id;
+            idx = e.next;
+        }
+        return null;
+    }
+
+    /// Reserve capacity for `n` new interns so the matching `internAssumeCapacity`
+    /// calls are infallible (transactional publish). `n` is an upper bound —
+    /// intra-pass hash collisions reuse a bucket slot.
+    fn reserve(self: *RegionInternMap, gpa: std.mem.Allocator, n: usize) !void {
+        try self.entries.ensureUnusedCapacity(gpa, n);
+        try self.buckets.ensureUnusedCapacity(gpa, @intCast(n));
+    }
+
+    /// Insert a NEW region (caller has confirmed via `lookup` that it is absent) with
+    /// a caller-owned duped edge slice + assigned id. Infallible after a covering
+    /// `reserve`. Takes ownership of `owned_edges`.
+    fn internAssumeCapacity(self: *RegionInternMap, owned_edges: []StructuralEdgeId, id: RegionId) void {
+        const h = foldHash(owned_edges);
+        const new_idx: u32 = @intCast(self.entries.items.len);
+        const head: i64 = if (self.buckets.get(h)) |x| @intCast(x) else -1;
+        self.entries.appendAssumeCapacity(.{ .edges = owned_edges, .id = id, .next = head });
+        self.buckets.putAssumeCapacity(h, new_idx);
+    }
+
+    fn clear(self: *RegionInternMap, gpa: std.mem.Allocator) void {
+        for (self.entries.items) |e| gpa.free(e.edges);
+        self.entries.clearRetainingCapacity();
+        self.buckets.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *RegionInternMap, gpa: std.mem.Allocator) void {
+        for (self.entries.items) |e| gpa.free(e.edges);
+        self.entries.deinit(gpa);
+        self.buckets.deinit(gpa);
+    }
+};
+
+fn programPointLess(_: void, a: ProgramPoint, b: ProgramPoint) bool {
+    if (a.proto_id != b.proto_id) return a.proto_id < b.proto_id;
+    return a.source_pc < b.source_pc;
+}
+
+fn programPointsEqual(a: []const ProgramPoint, b: []const ProgramPoint) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ae, be| {
+        if (ae.proto_id != be.proto_id or ae.source_pc != be.source_pc) return false;
+    }
+    return true;
+}
+
+/// A physical classification index `K → sorted []RegionId` (doc 17 §A3.1). Wholesale-
+/// rebuilt per discovery pass; owns each value slice. `freeRegionSetMap` releases the
+/// per-entry slices + the map backing.
+fn freeRegionSetMap(comptime K: type, map: *std.AutoHashMapUnmanaged(K, []RegionId), gpa: std.mem.Allocator) void {
+    var it = map.valueIterator();
+    while (it.next()) |v| gpa.free(v.*);
+    map.deinit(gpa);
+}
+
+/// Scratch accumulator for a physical classification index during discovery: appends
+/// `RegionId`s per key (deduped), then `finalize`s into an owned-slice map.
+fn RegionSetBuilder(comptime K: type) type {
+    return struct {
+        const Self = @This();
+        m: std.AutoHashMapUnmanaged(K, std.ArrayListUnmanaged(RegionId)) = .empty,
+
+        fn add(self: *Self, gpa: std.mem.Allocator, key: K, id: RegionId) !void {
+            const gop = try self.m.getOrPut(gpa, key);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            for (gop.value_ptr.items) |x| {
+                if (x == id) return; // dedup
+            }
+            try gop.value_ptr.append(gpa, id);
+        }
+
+        fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+            var it = self.m.valueIterator();
+            while (it.next()) |v| v.deinit(gpa);
+            self.m.deinit(gpa);
+        }
+
+        /// Materialize into an owned-slice map with each id list sorted. Fallible; the
+        /// caller's `errdefer freeRegionSetMap` covers a mid-materialize OOM.
+        fn finalize(self: *Self, gpa: std.mem.Allocator) !std.AutoHashMapUnmanaged(K, []RegionId) {
+            var out: std.AutoHashMapUnmanaged(K, []RegionId) = .empty;
+            errdefer freeRegionSetMap(K, &out, gpa);
+            try out.ensureUnusedCapacity(gpa, self.m.count());
+            var it = self.m.iterator();
+            while (it.next()) |e| {
+                std.mem.sort(RegionId, e.value_ptr.items, {}, regionIdLess);
+                const owned = try gpa.dupe(RegionId, e.value_ptr.items);
+                out.putAssumeCapacity(e.key_ptr.*, owned);
+            }
+            return out;
+        }
+    };
+}
+
 /// Remap the recorder's dense, emission-indexed exit-provenance table (A-i.1) into
 /// the committed trace's compact, sorted `[]ExitProvEntry`, keyed by committed
 /// instruction index. `old_to_new` is `tropt`'s compaction map (emission index →
@@ -1415,6 +1608,33 @@ pub const TraceState = struct {
     /// byte-identical.** A rebuild OOM leaves it EMPTY (fail-closed, safe since
     /// read-by-nothing / region-neutral).
     edge_cache: std.AutoHashMapUnmanaged(ExitKey, StructuralEdgeId) = .empty,
+    /// Discovered region definitions keyed by interned `RegionId` (doc 17 §A3.1 /
+    /// §A8-ii, A-ii.4). **Proto/VM-lifetime**: accumulated as traces commit, NEVER
+    /// cleaned by `removeTrace` (a GC-physical retire must not diverge
+    /// `gc_stress on/off`), cleared ONLY wholesale in `clearCache` (the epoch boundary
+    /// where protos may be freed). Owns each `RegionDef`'s `members`/`member_points`.
+    /// **Inert: read by nothing in A-ii ⇒ byte-identical.**
+    region_defs: std.AutoHashMapUnmanaged(RegionId, RegionDef) = .empty,
+    /// Interns a region's canonical sorted INTERNAL edge SET → its `RegionId` (same
+    /// Proto/VM lifetime as `region_defs`). Hash-bucketed; a hit confirmed by
+    /// element-wise set equality (collision mints a distinct id).
+    region_intern: RegionInternMap = .empty,
+    /// Next `RegionId` to mint (monotonic; mirrors `next_trace_id`). A discovery pass
+    /// that OOMs before publishing does NOT bump it — the tentative ids it staged are
+    /// simply never used (ids need only be unique, not contiguous).
+    next_region_id: u64 = 0,
+    /// Physical classification index (doc 17 §A3.1 / §A3.3): a concrete trace exit
+    /// `{Trace.id, exit_instr}` → the regions it belongs to (internal edges + boundary
+    /// exits that LEAVE the region from a member anchor). **Physical + transient**:
+    /// WHOLESALE-rebuilt per discovery pass AND per `removeTrace` from the surviving
+    /// cache; excludes `armable == false` regions. Owns each `[]RegionId`. Queried by
+    /// `classifyExit` (unread by production in A-ii). A retirement-rebuild OOM publishes
+    /// EMPTY (fail-closed — the prior set references a dead trace).
+    source_exit_regions: std.AutoHashMapUnmanaged(ExitKey, []RegionId) = .empty,
+    /// Physical classification index (doc 17 §A3.1): a concrete `Trace.id` → the
+    /// regions entered by landing in it (destination of an internal edge; physical
+    /// members only). Same lifetime/rebuild/ownership rules as `source_exit_regions`.
+    dest_entry_regions: std.AutoHashMapUnmanaged(u32, []RegionId) = .empty,
     /// Total trace entries executed (incremented in the dispatch loop before each
     /// `irinterp.execute`/native run). Diagnostic only — used to confirm the gate
     /// entry-check actually halts re-entry on a thrashing anchor, and a cheap
@@ -1714,6 +1934,17 @@ pub const TraceState = struct {
         self.armed_links.deinit(self.gpa);
         self.coverage.deinit(self.gpa);
         self.edge_cache.deinit(self.gpa); // A-ii.2 (values are plain structs; no per-entry free)
+        // A-ii.4: region model. `region_defs` values own members/member_points; the
+        // intern map owns its edge slices; the physical indices own their []RegionId.
+        var rd_it = self.region_defs.valueIterator();
+        while (rd_it.next()) |d| {
+            self.gpa.free(d.members);
+            self.gpa.free(d.member_points);
+        }
+        self.region_defs.deinit(self.gpa);
+        self.region_intern.deinit(self.gpa);
+        freeRegionSetMap(ExitKey, &self.source_exit_regions, self.gpa);
+        freeRegionSetMap(u32, &self.dest_entry_regions, self.gpa);
         // Free each trace (its `native.deinit()` returns mcode slots to the arena's
         // free-list) *before* tearing down the arena those slots live in.
         for (self.cache.items) |t| t.destroy(self.gpa);
@@ -3683,6 +3914,465 @@ pub const TraceState = struct {
         }
     }
 
+    /// Which OOM disposition a `rebuildRegions` pass uses for the PHYSICAL indices
+    /// (doc 17 §A8-ii, round-12 finding 2). The LOGICAL maps (`region_defs`/
+    /// `region_intern`) are never left half-applied either way — all their mutation is
+    /// in the post-reserve infallible publish, so an OOM leaves them exactly as they
+    /// were. Only the physical snapshot's fate differs by call site.
+    const RegionOom = enum {
+        /// Commit: the prior published physical snapshot is still coherent (a new trace
+        /// merely stays unclassified), so retain it.
+        retain,
+        /// Retirement: the prior physical snapshot references a now-dead trace, so a
+        /// failed rebuild must fail-closed to EMPTY (an empty `classifyExit` is
+        /// region-neutral, hence inert).
+        empty,
+    };
+
+    fn clearPhysicalRegionIndices(self: *TraceState) void {
+        freeRegionSetMap(ExitKey, &self.source_exit_regions, self.gpa);
+        freeRegionSetMap(u32, &self.dest_entry_regions, self.gpa);
+        self.source_exit_regions = .empty;
+        self.dest_entry_regions = .empty;
+    }
+
+    /// Rebuild the region model from the current trace graph (doc 17 §A8-ii, A-ii.4):
+    /// discover the strongly-connected cycles of the `StructuralEdgeId` graph, intern
+    /// each to a stable `RegionId`, accumulate persistent `RegionDef`s, and rebuild the
+    /// physical classification indices wholesale. **Transactional + fail-soft:** all
+    /// fallible allocation completes in scratch before any live map is touched; the
+    /// publish phase is infallible. An OOM never propagates through `commit`/`removeTrace`
+    /// and never leaves half-applied state (`RegionOom` picks the physical disposition).
+    /// **Inert in A-ii** (read by nothing on the selection path) ⇒ byte-identical.
+    fn rebuildRegions(self: *TraceState, on_oom: RegionOom) void {
+        self.rebuildRegionsFallible() catch {
+            // Scratch is freed by the fallible fn's own defers/errdefers; the LOGICAL
+            // maps were never mutated (all mutation is post-reserve infallible publish).
+            switch (on_oom) {
+                .retain => {},
+                .empty => self.clearPhysicalRegionIndices(),
+            }
+        };
+    }
+
+    fn rebuildRegionsFallible(self: *TraceState) !void {
+        const gpa = self.gpa;
+
+        // Guest-logical anchor node identity {proto_id, pc} — NOT a concrete `Trace`
+        // pointer (round-11 finding 1: node identity must not depend on mutable
+        // `hit_count` / `findTrace` selection).
+        const AnchorId = struct { proto_id: u32, pc: u32 };
+        const Edge = struct { from: u32, to: u32, eid: StructuralEdgeId, key: ExitKey };
+
+        // proto_id → *Proto (1:1 within an epoch), for the owner `AnchorKey` + the
+        // `hasInnerRootAt` loop-root predicate. Every graph node is an anchor of a bound
+        // trace, so every node's proto_id is present.
+        var proto_by_id: std.AutoHashMapUnmanaged(u32, *const Proto) = .empty;
+        defer proto_by_id.deinit(gpa);
+        for (self.cache.items) |t| try proto_by_id.put(gpa, t.anchor.proto.id, t.anchor.proto);
+
+        // 1. Nodes + edges from the ephemeral structural-edge cache.
+        var nodes: std.ArrayListUnmanaged(AnchorId) = .empty;
+        defer nodes.deinit(gpa);
+        var node_index: std.AutoHashMapUnmanaged(AnchorId, u32) = .empty;
+        defer node_index.deinit(gpa);
+        var edges: std.ArrayListUnmanaged(Edge) = .empty;
+        defer edges.deinit(gpa);
+
+        var ec_it = self.edge_cache.iterator();
+        while (ec_it.next()) |kv| {
+            const eid = kv.value_ptr.*;
+            const from_id = AnchorId{ .proto_id = eid.anchor_proto_id, .pc = eid.anchor_pc };
+            const to_id = AnchorId{ .proto_id = eid.succ_anchor_proto_id, .pc = eid.succ_anchor_pc };
+            const fi = blk: {
+                const gop = try node_index.getOrPut(gpa, from_id);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = @intCast(nodes.items.len);
+                    try nodes.append(gpa, from_id);
+                }
+                break :blk gop.value_ptr.*;
+            };
+            const ti = blk: {
+                const gop = try node_index.getOrPut(gpa, to_id);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = @intCast(nodes.items.len);
+                    try nodes.append(gpa, to_id);
+                }
+                break :blk gop.value_ptr.*;
+            };
+            try edges.append(gpa, .{ .from = fi, .to = ti, .eid = eid, .key = kv.key_ptr.* });
+        }
+        const nnodes = nodes.items.len;
+
+        // 2. CSR adjacency (edge indices per from-node), then iterative Tarjan SCC.
+        var offsets = try gpa.alloc(u32, nnodes + 1);
+        defer gpa.free(offsets);
+        @memset(offsets, 0);
+        for (edges.items) |e| offsets[e.from + 1] += 1;
+        for (1..nnodes + 1) |i| offsets[i] += offsets[i - 1];
+        var adj = try gpa.alloc(u32, edges.items.len);
+        defer gpa.free(adj);
+        {
+            var cursor = try gpa.alloc(u32, nnodes);
+            defer gpa.free(cursor);
+            for (0..nnodes) |i| cursor[i] = offsets[i];
+            for (edges.items, 0..) |e, ei| {
+                adj[cursor[e.from]] = @intCast(ei);
+                cursor[e.from] += 1;
+            }
+        }
+
+        const comp = try gpa.alloc(u32, nnodes);
+        defer gpa.free(comp);
+        var ncomp: u32 = 0;
+        {
+            const UNVISITED: i64 = -1;
+            const idx_of = try gpa.alloc(i64, nnodes);
+            defer gpa.free(idx_of);
+            @memset(idx_of, UNVISITED);
+            const lowlink = try gpa.alloc(i64, nnodes);
+            defer gpa.free(lowlink);
+            const on_stack = try gpa.alloc(bool, nnodes);
+            defer gpa.free(on_stack);
+            @memset(on_stack, false);
+            var tstack: std.ArrayListUnmanaged(u32) = .empty;
+            defer tstack.deinit(gpa);
+            const Frame = struct { v: u32, cursor: u32 };
+            var dfs: std.ArrayListUnmanaged(Frame) = .empty;
+            defer dfs.deinit(gpa);
+            var next_index: i64 = 0;
+
+            for (0..nnodes) |s| {
+                if (idx_of[s] != UNVISITED) continue;
+                idx_of[s] = next_index;
+                lowlink[s] = next_index;
+                next_index += 1;
+                try tstack.append(gpa, @intCast(s));
+                on_stack[s] = true;
+                try dfs.append(gpa, .{ .v = @intCast(s), .cursor = 0 });
+                while (dfs.items.len > 0) {
+                    const top = &dfs.items[dfs.items.len - 1];
+                    const v = top.v;
+                    const start = offsets[v];
+                    const end = offsets[v + 1];
+                    if (top.cursor < end - start) {
+                        const ei = adj[start + top.cursor];
+                        top.cursor += 1;
+                        const w = edges.items[ei].to;
+                        if (idx_of[w] == UNVISITED) {
+                            idx_of[w] = next_index;
+                            lowlink[w] = next_index;
+                            next_index += 1;
+                            try tstack.append(gpa, w);
+                            on_stack[w] = true;
+                            try dfs.append(gpa, .{ .v = w, .cursor = 0 });
+                        } else if (on_stack[w]) {
+                            lowlink[v] = @min(lowlink[v], idx_of[w]);
+                        }
+                    } else {
+                        if (lowlink[v] == idx_of[v]) {
+                            while (true) {
+                                const w = tstack.pop().?;
+                                on_stack[w] = false;
+                                comp[w] = ncomp;
+                                if (w == v) break;
+                            }
+                            ncomp += 1;
+                        }
+                        _ = dfs.pop();
+                        if (dfs.items.len > 0) {
+                            const parent = dfs.items[dfs.items.len - 1].v;
+                            lowlink[parent] = @min(lowlink[parent], lowlink[v]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Component sizes + self-edge flags → cycle-bearing candidates.
+        const comp_size = try gpa.alloc(u32, ncomp);
+        defer gpa.free(comp_size);
+        @memset(comp_size, 0);
+        for (0..nnodes) |n| comp_size[comp[n]] += 1;
+        const has_self = try gpa.alloc(bool, ncomp);
+        defer gpa.free(has_self);
+        @memset(has_self, false);
+        for (edges.items) |e| {
+            if (e.from == e.to) has_self[comp[e.from]] = true;
+        }
+
+        // 3. Gather one Candidate per cycle-bearing SCC (all scratch, fallible).
+        const Candidate = struct {
+            comp: u32,
+            sorted_internal: []StructuralEdgeId,
+            member_points: []ProgramPoint,
+            member_trace_ids: []u32,
+            owner: AnchorKey,
+            classifier: RegionClassifier,
+            armable_owner: bool,
+        };
+        var candidates: std.ArrayListUnmanaged(Candidate) = .empty;
+        defer {
+            for (candidates.items) |c| {
+                gpa.free(c.sorted_internal);
+                gpa.free(c.member_points);
+                gpa.free(c.member_trace_ids);
+            }
+            candidates.deinit(gpa);
+        }
+
+        for (0..ncomp) |cc| {
+            const c: u32 = @intCast(cc);
+            if (!(comp_size[c] >= 2 or has_self[c])) continue;
+
+            // 3a. Internal edges (both endpoints in c), sorted + deduped → identity set.
+            var internal_list: std.ArrayListUnmanaged(StructuralEdgeId) = .empty;
+            defer internal_list.deinit(gpa);
+            var mt_list: std.ArrayListUnmanaged(u32) = .empty;
+            defer mt_list.deinit(gpa);
+            for (edges.items) |e| {
+                if (comp[e.from] == c and comp[e.to] == c) {
+                    try internal_list.append(gpa, e.eid);
+                    try mt_list.append(gpa, e.key.trace_id);
+                }
+            }
+            std.mem.sort(StructuralEdgeId, internal_list.items, {}, StructuralEdgeId.lessThan);
+            var uniq_internal: std.ArrayListUnmanaged(StructuralEdgeId) = .empty;
+            defer uniq_internal.deinit(gpa);
+            for (internal_list.items) |eid| {
+                if (uniq_internal.items.len == 0 or !uniq_internal.items[uniq_internal.items.len - 1].eql(eid))
+                    try uniq_internal.append(gpa, eid);
+            }
+            const sorted_internal = try gpa.dupe(StructuralEdgeId, uniq_internal.items);
+            errdefer gpa.free(sorted_internal);
+
+            // 3b. Physical member trace ids = the realizers of the internal edges.
+            std.mem.sort(u32, mt_list.items, {}, std.sort.asc(u32));
+            var uniq_mt: std.ArrayListUnmanaged(u32) = .empty;
+            defer uniq_mt.deinit(gpa);
+            for (mt_list.items) |tid| {
+                if (uniq_mt.items.len == 0 or uniq_mt.items[uniq_mt.items.len - 1] != tid)
+                    try uniq_mt.append(gpa, tid);
+            }
+            const member_trace_ids = try gpa.dupe(u32, uniq_mt.items);
+            errdefer gpa.free(member_trace_ids);
+
+            // 3c. Membership program-points: internal-edge handoff endpoints ∪ member
+            // traces' recorded paths (A-ii.3), sorted + deduped.
+            var mp_list: std.ArrayListUnmanaged(ProgramPoint) = .empty;
+            defer mp_list.deinit(gpa);
+            for (uniq_internal.items) |eid| {
+                try mp_list.append(gpa, .{ .proto_id = eid.anchor_proto_id, .source_pc = eid.anchor_pc });
+                try mp_list.append(gpa, .{ .proto_id = eid.succ_anchor_proto_id, .source_pc = eid.succ_anchor_pc });
+            }
+            for (member_trace_ids) |tid| {
+                if (self.traceById(tid)) |t| {
+                    for (t.rec_path) |pp| try mp_list.append(gpa, pp);
+                }
+            }
+            std.mem.sort(ProgramPoint, mp_list.items, {}, programPointLess);
+            var uniq_mp: std.ArrayListUnmanaged(ProgramPoint) = .empty;
+            defer uniq_mp.deinit(gpa);
+            for (mp_list.items) |pp| {
+                if (uniq_mp.items.len == 0 or !(uniq_mp.items[uniq_mp.items.len - 1].proto_id == pp.proto_id and uniq_mp.items[uniq_mp.items.len - 1].source_pc == pp.source_pc))
+                    try uniq_mp.append(gpa, pp);
+            }
+            const member_points = try gpa.dupe(ProgramPoint, uniq_mp.items);
+            errdefer gpa.free(member_points);
+
+            // 3d. Owner predicate (round-12 finding 4): the unique SCC anchor that is
+            // both external-entry (dest of an incoming boundary edge) AND loop-root
+            // (a bound trace of inner-root shape); else a deterministic placeholder +
+            // armable=false.
+            var both_count: usize = 0;
+            var owner_node: u32 = 0;
+            var smallest: ?AnchorId = null;
+            for (0..nnodes) |n| {
+                if (comp[n] != c) continue;
+                const a = nodes.items[n];
+                if (smallest == null or a.proto_id < smallest.?.proto_id or (a.proto_id == smallest.?.proto_id and a.pc < smallest.?.pc))
+                    smallest = a;
+                var is_ext = false;
+                for (edges.items) |e| {
+                    if (e.to == @as(u32, @intCast(n)) and comp[e.from] != c) {
+                        is_ext = true;
+                        break;
+                    }
+                }
+                const proto = proto_by_id.get(a.proto_id) orelse return error.RegionGraphInconsistent;
+                if (is_ext and self.hasInnerRootAt(proto, a.pc)) {
+                    both_count += 1;
+                    owner_node = @intCast(n);
+                }
+            }
+            const owner_anchor: AnchorId = if (both_count == 1) nodes.items[owner_node] else (smallest orelse return error.RegionGraphInconsistent);
+            const owner_proto = proto_by_id.get(owner_anchor.proto_id) orelse return error.RegionGraphInconsistent;
+            const owner: AnchorKey = .{ .proto = owner_proto, .pc = owner_anchor.pc };
+
+            try candidates.append(gpa, .{
+                .comp = c,
+                .sorted_internal = sorted_internal,
+                .member_points = member_points,
+                .member_trace_ids = member_trace_ids,
+                .owner = owner,
+                .classifier = .{
+                    .kind = if (comp_size[c] == 1) .self_loop else .cross_trace_cycle,
+                    .member_count = comp_size[c],
+                },
+                .armable_owner = both_count == 1,
+            });
+        }
+
+        // Deterministic tentative-id assignment: sort candidates by their canonical
+        // internal edge set, so a pass that first-sees ≥2 NEW regions mints ids in a
+        // graph-order-independent order (replay-stable).
+        std.mem.sort(Candidate, candidates.items, {}, struct {
+            fn less(_: void, a: Candidate, b: Candidate) bool {
+                var i: usize = 0;
+                while (i < a.sorted_internal.len and i < b.sorted_internal.len) : (i += 1) {
+                    switch (a.sorted_internal[i].order(b.sorted_internal[i])) {
+                        .lt => return true,
+                        .gt => return false,
+                        .eq => {},
+                    }
+                }
+                return a.sorted_internal.len < b.sorted_internal.len;
+            }
+        }.less);
+
+        // 4. Intern + stage (all scratch, fallible). Reserve staged capacity up front so
+        // the per-candidate appends are infallible AFTER the ownership-transferring dupes
+        // (no half-transferred double-free window).
+        const StagedIntern = struct { edges: []StructuralEdgeId, id: RegionId };
+        const StagedDef = struct { id: RegionId, def: RegionDef };
+        const ActiveRegion = struct { id: RegionId, comp: u32, armable: bool, member_trace_ids: []u32 };
+        var staged_interns: std.ArrayListUnmanaged(StagedIntern) = .empty;
+        defer {
+            for (staged_interns.items) |s| gpa.free(s.edges);
+            staged_interns.deinit(gpa);
+        }
+        var staged_defs: std.ArrayListUnmanaged(StagedDef) = .empty;
+        defer {
+            for (staged_defs.items) |s| {
+                gpa.free(s.def.members);
+                gpa.free(s.def.member_points);
+            }
+            staged_defs.deinit(gpa);
+        }
+        var staged_tombstones: std.ArrayListUnmanaged(RegionId) = .empty;
+        defer staged_tombstones.deinit(gpa);
+        var active_regions: std.ArrayListUnmanaged(ActiveRegion) = .empty;
+        defer {
+            for (active_regions.items) |a| gpa.free(a.member_trace_ids);
+            active_regions.deinit(gpa);
+        }
+        try staged_interns.ensureUnusedCapacity(gpa, candidates.items.len);
+        try staged_defs.ensureUnusedCapacity(gpa, candidates.items.len);
+        try staged_tombstones.ensureUnusedCapacity(gpa, candidates.items.len);
+        try active_regions.ensureUnusedCapacity(gpa, candidates.items.len);
+
+        var new_id_counter: u64 = self.next_region_id;
+        for (candidates.items) |cand| {
+            if (self.region_intern.lookup(cand.sorted_internal)) |existing_id| {
+                // Rebind: confirm compatible membership or fail closed (§A3.5).
+                const stored = self.region_defs.getPtr(existing_id) orelse return error.RegionGraphInconsistent;
+                const compatible = programPointsEqual(stored.member_points, cand.member_points);
+                if (!compatible) staged_tombstones.appendAssumeCapacity(existing_id);
+                const eff_armable = stored.armable and compatible;
+                const mt_copy = try gpa.dupe(u32, cand.member_trace_ids);
+                active_regions.appendAssumeCapacity(.{ .id = existing_id, .comp = cand.comp, .armable = eff_armable, .member_trace_ids = mt_copy });
+            } else {
+                // First sight: mint an id and stage the intern + def (armable per owner).
+                const new_id: RegionId = @enumFromInt(new_id_counter);
+                const edges_copy = try gpa.dupe(StructuralEdgeId, cand.sorted_internal);
+                errdefer gpa.free(edges_copy);
+                const members_copy = try gpa.dupe(StructuralEdgeId, cand.sorted_internal);
+                errdefer gpa.free(members_copy);
+                const points_copy = try gpa.dupe(ProgramPoint, cand.member_points);
+                errdefer gpa.free(points_copy);
+                const mt_copy = try gpa.dupe(u32, cand.member_trace_ids);
+                errdefer gpa.free(mt_copy);
+                staged_interns.appendAssumeCapacity(.{ .edges = edges_copy, .id = new_id });
+                staged_defs.appendAssumeCapacity(.{ .id = new_id, .def = .{
+                    .members = members_copy,
+                    .member_points = points_copy,
+                    .owner = cand.owner,
+                    .classifier = cand.classifier,
+                    .armable = cand.armable_owner,
+                } });
+                active_regions.appendAssumeCapacity(.{ .id = new_id, .comp = cand.comp, .armable = cand.armable_owner, .member_trace_ids = mt_copy });
+                new_id_counter += 1;
+            }
+        }
+
+        // 5. Physical classification indices (scratch, fallible), then finalize.
+        var src_builder = RegionSetBuilder(ExitKey){};
+        defer src_builder.deinit(gpa);
+        var dst_builder = RegionSetBuilder(u32){};
+        defer dst_builder.deinit(gpa);
+
+        // source_exit: every RESOLVED exit of a physical member of an armable region —
+        // internal edges AND boundary exits that leave the region from a member anchor.
+        for (edges.items) |e| {
+            const c = comp[e.from];
+            var ar: ?ActiveRegion = null;
+            for (active_regions.items) |a| {
+                if (a.comp == c) {
+                    ar = a;
+                    break;
+                }
+            }
+            const R = ar orelse continue;
+            if (!R.armable) continue;
+            var is_member = false;
+            for (R.member_trace_ids) |tid| {
+                if (tid == e.key.trace_id) {
+                    is_member = true;
+                    break;
+                }
+            }
+            if (!is_member) continue; // sibling non-member exit at a member anchor
+            try src_builder.add(gpa, e.key, R.id);
+        }
+        // dest_entry: every physical member of an armable region (in a strongly-connected
+        // component every member anchor is the destination of an internal edge).
+        for (active_regions.items) |a| {
+            if (!a.armable) continue;
+            for (a.member_trace_ids) |tid| try dst_builder.add(gpa, tid, a.id);
+        }
+
+        var new_source = try src_builder.finalize(gpa);
+        errdefer freeRegionSetMap(ExitKey, &new_source, gpa);
+        var new_dest = try dst_builder.finalize(gpa);
+        errdefer freeRegionSetMap(u32, &new_dest, gpa);
+
+        // Reserve capacity on the live LOGICAL maps (last fallible step).
+        try self.region_intern.reserve(gpa, staged_interns.items.len);
+        try self.region_defs.ensureUnusedCapacity(gpa, @intCast(staged_defs.items.len));
+
+        // ======== PUBLISH (infallible) ========
+        for (staged_interns.items) |s| self.region_intern.internAssumeCapacity(s.edges, s.id);
+        staged_interns.clearRetainingCapacity(); // ownership moved into region_intern
+        for (staged_defs.items) |s| self.region_defs.putAssumeCapacity(s.id, s.def);
+        staged_defs.clearRetainingCapacity(); // ownership moved into region_defs
+        for (staged_tombstones.items) |id| {
+            if (self.region_defs.getPtr(id)) |d| d.armable = false;
+        }
+        self.next_region_id = new_id_counter;
+        freeRegionSetMap(ExitKey, &self.source_exit_regions, gpa);
+        freeRegionSetMap(u32, &self.dest_entry_regions, gpa);
+        self.source_exit_regions = new_source;
+        self.dest_entry_regions = new_dest;
+    }
+
+    /// Classify a physical trace exit to the regions it belongs to (doc 17 §A3.3 /
+    /// §A8-ii, A-ii.4): a pure query over `source_exit_regions`. **Unread by production
+    /// in A-ii** (`accountRegionProfit` is a no-op) — exercised only by tests, exactly
+    /// as A-i's `provAt` was queryable-but-unread.
+    pub fn classifyExit(self: *const TraceState, key: ExitKey) []const RegionId {
+        return self.source_exit_regions.get(key) orelse &.{};
+    }
+
     /// Widen-eviction predicate: is trace `t` permanently dead because the live
     /// array its `guard_lane` pins has monotonically widened past the trace's
     /// recorded lane?  A trace specialises on `tbl.array.lane == aux`; lanes only
@@ -3945,6 +4635,10 @@ pub const TraceState = struct {
                 // SURVIVING traces (not just its own), so rebuild the whole edge cache
                 // from the surviving cache — never a surgical key delete. Fail-soft.
                 self.rebuildEdgeCache();
+                // A-ii.4: rebuild the physical region indices from the surviving graph
+                // (region_defs persists). Retirement OOM fail-closes to EMPTY physical
+                // indices (the prior set references the now-dead trace).
+                self.rebuildRegions(.empty);
                 return;
             }
         }
@@ -4003,6 +4697,18 @@ pub const TraceState = struct {
         // A-ii.2: the structural-edge cache is keyed by `Trace.id` and references a
         // now-freed cache — drop it wholesale (rebuilt as fresh traces commit).
         self.edge_cache.clearRetainingCapacity();
+
+        // A-ii.4: the region model. This is the ONE place the Proto/VM-lifetime logical
+        // maps (region_defs/region_intern) are cleared — the epoch boundary where protos
+        // (borrowed by RegionDef.owner) may be freed. The physical indices go with them.
+        var rd_it = self.region_defs.valueIterator();
+        while (rd_it.next()) |d| {
+            self.gpa.free(d.members);
+            self.gpa.free(d.member_points);
+        }
+        self.region_defs.clearRetainingCapacity();
+        self.region_intern.clear(self.gpa);
+        self.clearPhysicalRegionIndices();
     }
 
     /// Remove all guard-failure entries for `anchor`. Called after a side
@@ -4468,6 +5174,10 @@ pub const TraceState = struct {
         // FROM itself AND make pre-existing traces' exits newly resolvable. Fail-soft
         // (never fails the commit); inert (read by nothing until A-ii.4).
         self.rebuildEdgeCache();
+        // A-ii.4: rediscover regions over the refreshed graph. Commit OOM RETAINS the
+        // prior physical snapshot (still coherent; the new trace just stays
+        // unclassified). Fail-soft; inert (read by nothing in A-ii).
+        self.rebuildRegions(.retain);
     }
 
     /// Debug-only structural verifier for the invariants the tier-1a executor
@@ -8791,4 +9501,297 @@ test "A-ii.3 rec_path: a committed trace carries its recorded path (freed on des
     try testing.expect(t.id != 900);
     try testing.expectEqual(@as(usize, 1), t.rec_path.len);
     try testing.expectEqual(ProgramPoint{ .proto_id = 9, .source_pc = 4 }, t.rec_path[0]);
+}
+
+// ---- A-ii.4 region discovery / interning / classification (inert) ----------
+//
+// Helpers build a synthetic trace graph over one proto with stack-allocated `Trace`s,
+// then call `rebuildEdgeCache` + `rebuildRegions` directly (as the commit/retire path
+// does) and assert on the discovered regions. `defer state.cache.clearRetainingCapacity`
+// drops the (stack) cache pointers before `deinit`, exactly as the A-ii.2 test does; the
+// region maps own HEAP copies independent of the stack traces, so `deinit` frees them
+// cleanly.
+
+fn guardProv(source_pc: u32, role: GuardRole) ExitProvenance {
+    return .{ .guard = .{ .source_proto_id = 0, .source_pc = source_pc, .role = role, .operand = .none } };
+}
+
+test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@14 ∧ armable, one stable RegionId" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const P_ID: u32 = 7;
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    // The 4-node cycle. `skip@14` and `inner@7` end `.loop` (loop-root shape); `cont@20`
+    // does not. `extern@30` supplies the incoming boundary edge into skip@14, so skip is
+    // the UNIQUE external-entry ∧ loop-root anchor → owner.
+    var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+    var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
+    var skip: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 14 }, .instrs = &skip_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &skip_p };
+
+    var ramp_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+    var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
+    var ramp: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ramp_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ramp_p };
+
+    var inner_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
+    var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+    var inner: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_p };
+
+    var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+    var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
+    var cont: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p };
+
+    var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+    var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
+    var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
+
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont, &ext }) |t| try state.cache.append(gpa, t);
+    state.rebuildEdgeCache();
+    state.rebuildRegions(.retain);
+
+    // 5 structural edges (4 internal cycle + 1 incoming boundary), one discovered region.
+    try testing.expectEqual(@as(usize, 5), state.edge_cache.count());
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+
+    var kit = state.region_defs.keyIterator();
+    const rid = kit.next().?.*;
+    const def = state.region_defs.get(rid).?;
+    // Owner predicate (round-13 load-bearing): skip@14, armable.
+    try testing.expectEqual(@as(*const Proto, &proto), def.owner.proto);
+    try testing.expectEqual(@as(u32, 14), def.owner.pc);
+    try testing.expect(def.armable);
+    try testing.expect(def.classifier.kind == .cross_trace_cycle);
+    try testing.expectEqual(@as(u32, 4), def.classifier.member_count);
+    try testing.expectEqual(@as(usize, 4), def.members.len); // 4 internal edges
+
+    // Classification: a member's internal exit is credited to R; the non-member
+    // external trace's exit is not (candidate SETS, not A-iv credit).
+    const skip_regions = state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 });
+    try testing.expectEqual(@as(usize, 1), skip_regions.len);
+    try testing.expectEqual(rid, skip_regions[0]);
+    try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 5, .exit_instr = 0 }).len);
+    // dest_entry: the four cycle members are entries; the external trace is not.
+    try testing.expect(state.dest_entry_regions.get(1) != null);
+    try testing.expect(state.dest_entry_regions.get(5) == null);
+}
+
+test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) re-interns to the SAME RegionId" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    const P_ID: u32 = 7;
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    // A minimal non-armable 2-node cycle A@2 ↔ B@7. Build it twice with DIFFERENT
+    // Trace.ids and assert the interned RegionId is unchanged (identity is guest-logical:
+    // StructuralEdgeId keys on proto_id/pc/provenance, never Trace.id).
+    const buildCycle = struct {
+        fn go(st: *TraceState, g: std.mem.Allocator, p: *const Proto, id_a: u32, id_b: u32) !void {
+            const a_i = try g.dupe(IrInstr, &[_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }});
+            const a_p = try g.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .branch_cond) }});
+            const a = try g.create(Trace);
+            a.* = .{ .id = id_a, .anchor = .{ .proto = p, .pc = 2 }, .instrs = a_i, .consts = try g.alloc(Value, 0), .entry_slots = try g.alloc(u16, 0), .entry_guards = try g.alloc(EntryGuard, 0), .exit_prov = a_p };
+            const b_i = try g.dupe(IrInstr, &[_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }});
+            const b_p = try g.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .branch_cond) }});
+            const b = try g.create(Trace);
+            b.* = .{ .id = id_b, .anchor = .{ .proto = p, .pc = 7 }, .instrs = b_i, .consts = try g.alloc(Value, 0), .entry_slots = try g.alloc(u16, 0), .entry_guards = try g.alloc(EntryGuard, 0), .exit_prov = b_p };
+            try st.cache.append(g, a);
+            try st.cache.append(g, b);
+        }
+    }.go;
+
+    try buildCycle(&state, gpa, &proto, 1, 2);
+    state.rebuildEdgeCache();
+    state.rebuildRegions(.retain);
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    var kit = state.region_defs.keyIterator();
+    const rid1 = kit.next().?.*;
+
+    // Retire both (heap traces → real destroy), then re-record with fresh ids.
+    while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
+    try buildCycle(&state, gpa, &proto, 11, 12);
+    state.rebuildEdgeCache();
+    state.rebuildRegions(.retain);
+    // Still ONE region, and the SAME id (not a second def).
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    try testing.expect(state.region_defs.get(rid1) != null);
+
+    while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
+}
+
+test "A-ii.4 intern identity is the edge SET (distinct sets → distinct ids; identical set → same id)" {
+    // White-box on RegionInternMap: identity is the element-wise-compared sorted set, not
+    // object bytes and not merely the 64-bit fold. (A genuine Wyhash fold collision is
+    // unforgeable, so the set-equality guard is validated by distinct-set / same-set
+    // behaviour: a different set never aliases an existing id, an identical one always does.)
+    const gpa = testing.allocator;
+    var m: RegionInternMap = .empty;
+    defer m.deinit(gpa);
+
+    const setA = [_]StructuralEdgeId{.{ .anchor_proto_id = 0, .anchor_pc = 2, .exit = guardProv(1, .branch_cond), .succ_anchor_proto_id = 0, .succ_anchor_pc = 7 }};
+    const setB = [_]StructuralEdgeId{.{ .anchor_proto_id = 0, .anchor_pc = 2, .exit = guardProv(1, .branch_cond), .succ_anchor_proto_id = 0, .succ_anchor_pc = 9 }}; // different succ pc
+
+    try testing.expect(m.lookup(&setA) == null);
+    try m.reserve(gpa, 2);
+    m.internAssumeCapacity(try gpa.dupe(StructuralEdgeId, &setA), @enumFromInt(100));
+    m.internAssumeCapacity(try gpa.dupe(StructuralEdgeId, &setB), @enumFromInt(200));
+
+    try testing.expectEqual(@as(RegionId, @enumFromInt(100)), m.lookup(&setA).?);
+    try testing.expectEqual(@as(RegionId, @enumFromInt(200)), m.lookup(&setB).?);
+    // A re-presented identical set (fresh slice, same contents) resolves to its id.
+    const setA2 = [_]StructuralEdgeId{setA[0]};
+    try testing.expectEqual(@as(RegionId, @enumFromInt(100)), m.lookup(&setA2).?);
+}
+
+test "A-ii.4 sibling boundary edge: only the physical MEMBER's exits are credited to R" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const P_ID: u32 = 7;
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    // Cycle A@2 ↔ B@7 made armable by an external entry X@40→A@2 with A loop-root. A
+    // SIBLING A'@2 realizes only a boundary edge A→C@30 (C outside the cycle) — it shares
+    // A's anchor but realizes NO internal edge, so it is NOT a physical member.
+    var a_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 7 }, .{ .op = .loop } };
+    var a_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .loop_done) }};
+    var ta: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &a_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &a_p };
+
+    var b_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }};
+    var b_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .branch_cond) }};
+    var tb: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &b_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &b_p };
+
+    var as_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 30 }}; // sibling at @2 → C@30
+    var as_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .branch_cond) }};
+    var tas: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &as_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &as_p };
+
+    var c_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 99 }}; // C@30 resolves to nothing
+    var c_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
+    var tc: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &c_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &c_p };
+
+    var x_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }}; // X@40 → A@2 (incoming boundary)
+    var x_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(39, .branch_cond) }};
+    var tx: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 40 }, .instrs = &x_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &x_p };
+
+    for ([_]*Trace{ &ta, &tb, &tas, &tc, &tx }) |t| try state.cache.append(gpa, t);
+    state.rebuildEdgeCache();
+    state.rebuildRegions(.retain);
+
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    var kit = state.region_defs.keyIterator();
+    const rid = kit.next().?.*;
+    const def = state.region_defs.get(rid).?;
+    try testing.expectEqual(@as(u32, 2), def.owner.pc); // A@2 is external-entry ∧ loop-root
+    try testing.expect(def.armable);
+
+    // Member A's internal exit → R; the SIBLING A''s boundary exit at the same anchor → ∅.
+    try testing.expectEqual(rid, state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 })[0]);
+    try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 3, .exit_instr = 0 }).len);
+    // dest_entry: members {A=1, B=2} only — never the sibling A'(3) or the outside X(5)/C(4).
+    try testing.expect(state.dest_entry_regions.get(1) != null);
+    try testing.expect(state.dest_entry_regions.get(2) != null);
+    try testing.expect(state.dest_entry_regions.get(3) == null);
+    try testing.expect(state.dest_entry_regions.get(5) == null);
+}
+
+test "A-ii.4 rebind tombstone: same edge set, incompatible member_points → armable flips false, purged from physical" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    const P_ID: u32 = 7;
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    // An armable 2-node cycle A@2 ↔ B@7 (X@40→A external entry, A loop-root), where A
+    // carries a recorded-path point. Re-record with the SAME edge set but a DIFFERENT
+    // A.rec_path → member_points mismatch → def-consistency tombstone.
+    const buildArmable = struct {
+        fn go(st: *TraceState, g: std.mem.Allocator, p: *const Proto, ids: [3]u32, a_pt: ProgramPoint) !void {
+            const a_i = try g.dupe(IrInstr, &[_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 7 }, .{ .op = .loop } });
+            const a_p = try g.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .loop_done) }});
+            const a_path = try g.dupe(ProgramPoint, &[_]ProgramPoint{a_pt});
+            const a = try g.create(Trace);
+            a.* = .{ .id = ids[0], .anchor = .{ .proto = p, .pc = 2 }, .instrs = a_i, .consts = try g.alloc(Value, 0), .entry_slots = try g.alloc(u16, 0), .entry_guards = try g.alloc(EntryGuard, 0), .exit_prov = a_p, .rec_path = a_path };
+            const b_i = try g.dupe(IrInstr, &[_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }});
+            const b_p = try g.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .branch_cond) }});
+            const b = try g.create(Trace);
+            b.* = .{ .id = ids[1], .anchor = .{ .proto = p, .pc = 7 }, .instrs = b_i, .consts = try g.alloc(Value, 0), .entry_slots = try g.alloc(u16, 0), .entry_guards = try g.alloc(EntryGuard, 0), .exit_prov = b_p };
+            const x_i = try g.dupe(IrInstr, &[_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }});
+            const x_p = try g.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(39, .branch_cond) }});
+            const x = try g.create(Trace);
+            x.* = .{ .id = ids[2], .anchor = .{ .proto = p, .pc = 40 }, .instrs = x_i, .consts = try g.alloc(Value, 0), .entry_slots = try g.alloc(u16, 0), .entry_guards = try g.alloc(EntryGuard, 0), .exit_prov = x_p };
+            for ([_]*Trace{ a, b, x }) |t| try st.cache.append(g, t);
+        }
+    }.go;
+
+    try buildArmable(&state, gpa, &proto, .{ 1, 2, 3 }, .{ .proto_id = P_ID, .source_pc = 100 });
+    state.rebuildEdgeCache();
+    state.rebuildRegions(.retain);
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    var kit = state.region_defs.keyIterator();
+    const rid = kit.next().?.*;
+    try testing.expect(state.region_defs.get(rid).?.armable);
+    try testing.expect(state.classifyExit(.{ .trace_id = 1, .exit_instr = 0 }).len == 1); // published
+
+    // Re-record with a DIFFERENT A.rec_path (source_pc 200) → incompatible membership.
+    while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
+    try buildArmable(&state, gpa, &proto, .{ 11, 12, 13 }, .{ .proto_id = P_ID, .source_pc = 200 });
+    state.rebuildEdgeCache();
+    state.rebuildRegions(.retain);
+    // Same id (edge set unchanged), but tombstoned + purged from the physical index.
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    try testing.expect(!state.region_defs.get(rid).?.armable);
+    try testing.expectEqual(@as(usize, 0), state.classifyExit(.{ .trace_id = 11, .exit_instr = 0 }).len);
+
+    while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
+}
+
+test "A-ii.4 lifetime: removeTrace preserves region_defs (logical); clearCache empties it" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    const P_ID: u32 = 7;
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    // A plain (non-armable) 2-node cycle on HEAP traces so removeTrace/clearCache can
+    // `destroy` them. region_defs still gets one entry (first-sight always defines).
+    const a_i = try gpa.dupe(IrInstr, &[_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 7 }});
+    const a = try gpa.create(Trace);
+    a.* = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = a_i, .consts = try gpa.alloc(Value, 0), .entry_slots = try gpa.alloc(u16, 0), .entry_guards = try gpa.alloc(EntryGuard, 0), .exit_prov = try gpa.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(1, .branch_cond) }}) };
+    const b_i = try gpa.dupe(IrInstr, &[_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 2 }});
+    const b = try gpa.create(Trace);
+    b.* = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = b_i, .consts = try gpa.alloc(Value, 0), .entry_slots = try gpa.alloc(u16, 0), .entry_guards = try gpa.alloc(EntryGuard, 0), .exit_prov = try gpa.dupe(ExitProvEntry, &[_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .branch_cond) }}) };
+    try state.cache.append(gpa, a);
+    try state.cache.append(gpa, b);
+    state.rebuildEdgeCache();
+    state.rebuildRegions(.retain);
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+
+    // removeTrace breaks the cycle but must NOT clean region_defs (logical persistence).
+    state.removeTrace(b);
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    // The physical index rebuilt from the surviving graph (cycle gone) → empty.
+    try testing.expectEqual(@as(usize, 0), state.source_exit_regions.count());
+
+    // clearCache is the ONE place the logical maps are cleared.
+    state.clearCache();
+    try testing.expectEqual(@as(usize, 0), state.region_defs.count());
+    try testing.expectEqual(@as(usize, 0), state.region_intern.entries.items.len);
 }

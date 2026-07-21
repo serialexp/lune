@@ -9090,6 +9090,13 @@ test "H-2 part 3: clearCache retires every trace + resets all derived tiering/di
     try testing.expect(vm.trace.pending_replay_anchor == null);
     if (vm.trace.exec_recorder) |*r| try testing.expect(r.log == null);
     for (vm.trace.hotcount) |h| try testing.expectEqual(@as(u16, 0), h);
+    // A-ii: the structural-edge cache + the whole region model (logical defs/intern
+    // AND the physical classification indices) all empty after the flush.
+    try testing.expectEqual(@as(usize, 0), vm.trace.edge_cache.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.region_defs.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.region_intern.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.source_exit_regions.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.dest_entry_regions.count());
 }
 
 test "H-2 part 3: the JIT still records fresh traces in a second epoch after the cache clear" {

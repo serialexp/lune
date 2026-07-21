@@ -261,13 +261,14 @@ land; move whole sections to Done once everything inside is checked.
   for `jmp_if_false`, which jumps when falsy) → now keyed on the opcode's jump-taken edge; (2)
   `recInputGet`'s `guard_func` operand `none` → `.a` (the `dest` register per H-1c). Both would have
   mis-keyed A-ii; neither altered behaviour (byte-identity held before and after). Next: A-ii per §A8.
-- [ ] **A-ii — region discovery + classifier, inert (IN PROGRESS 2026-07-21; §A8 step 2, landing plan
-  in §A8-ii).** Build `region_defs` from the recorded trace graph, the `StructuralEdgeId` ephemeral
-  cache, the physical classification indices, and the `accountTraceRun`/`accountRegionProfit` split with
-  `accountRegionProfit` a **no-op**. Selection unchanged ⇒ byte-identical (nsieve/nbody/mandelbrot
-  tier-0 ≡ native negative control). First *consumer* of the A-i `ExitProvenance` substrate (for
-  discovery/classification only, never selection). Four green sub-steps, each `just test` +
-  `-Djit-debug`:
+- [x] **A-ii — region discovery + classifier, inert (CODE LANDED 2026-07-21; §A8 step 2, landing plan
+  in §A8-ii; post-landing gpt-5.6-sol review PENDING).** Build `region_defs` from the recorded trace
+  graph, the `StructuralEdgeId` ephemeral cache, the physical classification indices, and the
+  `accountTraceRun`/`accountRegionProfit` split with `accountRegionProfit` a **no-op**. Selection
+  unchanged ⇒ byte-identical (nsieve/nbody + lune-bench tier-0 ≡ native negative control). First
+  *consumer* of the A-i `ExitProvenance` substrate (for discovery/classification only, never selection).
+  All four sub-steps green (`just test` 808 + `-Djit-debug`); the whole-A-ii checkpoint review is the
+  next step (mirrors A-i):
   - [x] **A-ii.1 — `accountTraceRun`/`accountRegionProfit` split (inert). LANDED 2026-07-21.** `just
     test` green (default + `-Djit-debug`); nsieve/nbody/mandelbrot tier-0 ≡ native byte-identical.
     `onSideExit` (`trace.zig:1759`) is now an `inline` wrapper calling `accountTraceRun` (the old body
@@ -295,13 +296,21 @@ land; move whole sections to Done once everything inside is checked.
     cleared/re-armed in `Recorder.reset`, freed in `Recorder.deinit`. Read by nothing. Tests: recorder-level
     `{proto_id, pc−1}` capture + reset re-record stability; committed-trace `rec_path` via the recForPrepLink
     harness (freed on destroy, leak-checked).
-  - [ ] **A-ii.4 — `region_defs` discovery + `RegionId` interning + classification indices +
-    `classifyExit` (inert).** Tarjan-SCC region discovery over the structural edges; `region_intern`
-    (hash-bucketed, full-sorted-set equality); `region_defs` (Proto/VM-lifetime, never
-    retirement-cleaned); `source_exit_regions`/`dest_entry_regions` (physical, transient); `classifyExit`
-    pure query (unread, unit-tested); `clearCache`/`removeTrace`/`deinit`/`interp.zig:9030` wiring.
-    `accountRegionProfit` stays no-op. Sibling-trace + re-record-stability + collision + boundary-edge
-    tests mandatory.
+  - [x] **A-ii.4 — `region_defs` discovery + `RegionId` interning + classification indices +
+    `classifyExit` (inert). LANDED 2026-07-21.** Iterative Tarjan-SCC region discovery over the
+    structural edges (anchor-keyed nodes, deterministic candidate order via canonical-sorted-set sort);
+    `RegionInternMap` (hash-bucketed intrusive chain, element-wise set equality — collision-safe);
+    `region_defs` (Proto/VM-lifetime, cleared ONLY in `clearCache`); `source_exit_regions`/
+    `dest_entry_regions` (physical, wholesale-rebuilt per commit + per retire); the owner executable
+    predicate (unique external-entry ∧ loop-root else placeholder + `armable=false`); the def-consistency
+    rebind tombstone; `classifyExit` pure query (unread by production, unit-tested).
+    **TRANSACTIONAL + FAIL-SOFT**: all fallible alloc in scratch, `reserve`-then-infallible-publish;
+    commit-OOM RETAINS the prior physical snapshot, retire-OOM fail-closes to EMPTY. `accountRegionProfit`
+    stays no-op. Wired at commit (`.retain`)/`removeTrace` (`.empty`)/`clearCache`/`deinit`/
+    `interp.zig:9030`. `just test` (808) green default + `-Djit-debug`; nsieve/nbody + 4 lune benches
+    tier-0 ≡ native byte-identical. 6 tests: owner==skip@14 ∧ armable target graph, re-record RegionId
+    stability, intern set-identity, sibling candidate sets, rebind tombstone, removeTrace-preserves vs
+    clearCache-empties lifetime.
 - [ ] **Deferred to Increment-3 machinery.** F2c native-cut harness (H-4 cut) + region-map cap
   contract (H-3 cap) land WITH `region_profit`/native-F2c, not in round 9.
 **Increment 2.3b — arm `.link`-terminal handoffs (ACTIVE; re-scoped after the
