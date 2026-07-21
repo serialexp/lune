@@ -226,15 +226,22 @@ land; move whole sections to Done once everything inside is checked.
     `{caller_proto_id: u32, call_pc: u32}`, set in `recCall`'s frame push (5169) — needs threading the
     call `pc` into `recCall` (currently absent). A `currentPath()` helper reads `frames[0..inline_depth]`
     into `[MAX_INLINE_DEPTH]CallEdge`. Read by nothing ⇒ byte-identical (a re-record-stability test guards it).
-  - [ ] **A-i.3 — stamp every guard + fused producer-exit site.** Per the current emit-site inventory
-    (§A4 H-1c table, refreshed 2026-07-21): `stampProv(ref, role, operand, polarity)` fills
-    `source_proto_id`/`source_pc = cur_pc−1`/path and writes `exit_prov[ref]`. Route the type-guard helper
-    `guard`/`guardNum`/`guardInt` to carry `(role, operand)`; stamp the raw-`emit` guard sites
-    (`recBranch`, array/hash/grid, `guard_func`, `guard_pure`, `int_of_float`) and the **3 fused
-    producer-exit nodes** (`hload`/`.value` `aload`/`href` — stamped on the producer IR node, `role =
-    element_type/field_type`, `operand = loaded`). Still inert (table populated, unread). Tests:
-    re-record stability (int↔float, taken↔fallthrough don't change identity), `f(a);f(b)` path collision,
-    optimizer-remap opt-ON vs OFF, max-inline-depth, no-observed-lane.
+  - [x] **A-i.3 — stamp every guard + fused producer-exit site. LANDED 2026-07-21.** `just test` green
+    (default + `-Djit-debug`); nsieve/nbody/mandelbrot tier-0 ≡ native byte-identical. Per the emit-site
+    inventory (§A4 H-1c table, refreshed 2026-07-21): `stampProv(ref, role, operand, polarity)` fills
+    `source_proto_id`/`source_pc = cur_pc −| 1` (saturating — `cur_pc ≥ 1` in production, `−|` only maps the
+    synthetic `pc=0` test sentinel to 0, matching `guardSourcePc`)/path and writes `exit_prov[ref]`. The
+    type-guard helper `guard`/`guardNum`/`guardInt` now carries `(role, operand)` and stamps only on a real
+    emit (deduped guards keep the first stamp — many-to-one, H-1c). Stamped the raw-`emit` guard sites
+    (`recBranch` branch_cond + taken/fallthrough polarity, `recArith`/`recBitwise`/`recNeg`/`recBnot`/
+    `recCompare`/`recEq` operand_type, `recForLoop`/`recForPrepLink` operand_type/limit_int/loop_done,
+    array/hash/grid, `guard_func` callee_identity, `guard_pure` callee_pure, `int_of_float` limit_int) and
+    the **3 fused producer-exit nodes** (`.value` `aload` → element_type/loaded; `hload` → field_type/loaded;
+    `href` → hash_struct — stamped on the producer IR node). Added two grid-specific roles `row_bounds`/
+    `col_bounds`. Still inert (table populated, unread). Tests added: arith operand identity + `source_pc =
+    pc−1`; int↔float re-record keeps identity (only IR op flips); branch polarity taken vs fallthrough
+    distinguishes the two CFG edges, rest equal. (`f(a);f(b)` path collision already covered by the A-i.2
+    `pathFromFrames` test; optimizer-remap opt-ON vs OFF by the A-i.1 `buildExitProv` remap test.)
   - [ ] **A-i.4 — `.link`-terminal provenance transport (inert).** `Recorder.pending_link_provenance`
     filled by `recForPrepLink` (5082, `source_pc = pc−1`, `.link_terminal` variant, neutral/no-operand),
     consumed where `.link` is synthesized at commit (3844), cleared on every abort/reset path; release

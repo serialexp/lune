@@ -525,7 +525,9 @@ pub const GuardRole = enum(u8) {
     grid_shape, // grid table shape (guard_grid)
     grid_stride, // grid stride (guard_stride)
     row_type, // grid row index type
-    col_type, // grid column index type / column resolution (guard_gcol)
+    col_type, // grid column index type
+    row_bounds, // grid row in [1,rows] (guard_bounds on garow)
+    col_bounds, // grid column resolution / in [1,stride] (guard_gcol)
     callee_identity, // closure identity (call / get_upval / get_global — guard_func)
     callee_pure, // pure-builtin identity (guard_pure)
 };
@@ -4228,6 +4230,7 @@ pub const TraceState = struct {
         if (self.rec.instrs.items.len >= self.config.maxrecord) return self.abort(.too_long);
         self.rec.cur_pc = pc;
         self.rec.cur_op = instr.op;
+        self.rec.cur_proto_id = proto.id; // leaf proto for GuardProvenance (A-i.3)
         self.recordOne(instr, regs, proto, pc, resolved) catch self.abort(.alloc);
     }
 
@@ -4428,19 +4431,46 @@ pub const TraceState = struct {
         return std.mem.indexOfScalar(u16, self.rec.entry_slots.items, slot) != null;
     }
 
-    /// Emit a type guard for `ref` (deduplicated — an SSA value has one type).
-    fn guard(self: *TraceState, ref: Ref, op: IrOp) !void {
+    /// Stamp the exit provenance (doc 17, A-i.3) of the guard / fused-producer just
+    /// emitted at emission index `ref` — the lockstep `exit_prov` slot already exists
+    /// (appended by `emit`). The leaf is the currently-recording opcode:
+    /// `source_proto_id = cur_proto_id`, `source_pc = cur_pc − 1` (`cur_pc` is the
+    /// post-increment resume PC), with the live inline-path prefix. Behaviour-neutral:
+    /// nothing reads `exit_prov` until Part A (A-ii).
+    fn stampProv(self: *TraceState, ref: Ref, role: GuardRole, operand: OperandDesig, polarity: Polarity) void {
+        self.rec.exit_prov.items[ref] = .{ .guard = .{
+            .path = pathFromFrames(&self.rec.frames, self.rec.inline_depth),
+            .inline_depth = self.rec.inline_depth,
+            .source_proto_id = self.rec.cur_proto_id,
+            // `cur_pc` is the post-increment resume PC (= source-opcode PC + 1), so the
+            // owning guest opcode is `cur_pc − 1` (same convention as `guardSourcePc`).
+            // In production `cur_pc ≥ 1` always; saturating subtraction is identical for
+            // every real input and only maps the synthetic `pc = 0` test sentinel to 0
+            // (which `guardSourcePc` likewise treats as "no loop-body guard PC").
+            .source_pc = self.rec.cur_pc -| 1,
+            .role = role,
+            .operand = operand,
+            .polarity = polarity,
+        } };
+    }
+
+    /// Emit a type guard for `ref` (deduplicated — an SSA value has one type). Stamps
+    /// its provenance `(role, operand)` (A-i.3) only when it actually emits: a deduped
+    /// guard (already covered) emits nothing, and the existing guard keeps its own
+    /// stamp (the many-to-one static-slot → guard map, H-1c).
+    fn guard(self: *TraceState, ref: Ref, op: IrOp, role: GuardRole, operand: OperandDesig) !void {
         if (self.rec.guarded_refs.contains(ref)) return;
         try self.rec.guarded_refs.put(self.gpa, ref, {});
-        _ = try self.emit(.{ .op = op, .a = ref });
+        const gref = try self.emit(.{ .op = op, .a = ref });
+        self.stampProv(gref, role, operand, .neutral);
     }
 
-    fn guardInt(self: *TraceState, ref: Ref) !void {
-        try self.guard(ref, .guard_int);
+    fn guardInt(self: *TraceState, ref: Ref, role: GuardRole, operand: OperandDesig) !void {
+        try self.guard(ref, .guard_int, role, operand);
     }
 
-    fn guardNum(self: *TraceState, ref: Ref, v: Value) !void {
-        try self.guard(ref, if (v.isInt()) IrOp.guard_int else IrOp.guard_float);
+    fn guardNum(self: *TraceState, ref: Ref, v: Value, role: GuardRole, operand: OperandDesig) !void {
+        try self.guard(ref, if (v.isInt()) IrOp.guard_int else IrOp.guard_float, role, operand);
     }
 
     fn recArith(self: *TraceState, op: IrOp, instr: Instr, regs: RegWindow) !void {
@@ -4449,8 +4479,8 @@ pub const TraceState = struct {
         if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
         const rb = try self.refOf(instr.b);
         const rc = try self.refOf(instr.c);
-        try self.guardNum(rb, vb);
-        try self.guardNum(rc, vc);
+        try self.guardNum(rb, vb, .operand_type, .b);
+        try self.guardNum(rc, vc, .operand_type, .c);
         const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = arithResultType(op, vb, vc) });
         self.setReg(instr.a, r);
     }
@@ -4461,8 +4491,8 @@ pub const TraceState = struct {
         if (!vb.isInt() or !vc.isInt()) return self.abort(.bad_type);
         const rb = try self.refOf(instr.b);
         const rc = try self.refOf(instr.c);
-        try self.guardInt(rb);
-        try self.guardInt(rc);
+        try self.guardInt(rb, .operand_type, .b);
+        try self.guardInt(rc, .operand_type, .c);
         const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .int });
         self.setReg(instr.a, r);
     }
@@ -4471,7 +4501,7 @@ pub const TraceState = struct {
         const vb = regs.get(instr.b);
         if (!vb.isNumber()) return self.abort(.bad_type);
         const rb = try self.refOf(instr.b);
-        try self.guardNum(rb, vb);
+        try self.guardNum(rb, vb, .operand_type, .b);
         const r = try self.emit(.{ .op = .neg, .a = rb, .ty = if (vb.isInt()) .int else .float });
         self.setReg(instr.a, r);
     }
@@ -4488,7 +4518,7 @@ pub const TraceState = struct {
         const vb = regs.get(instr.b);
         if (!vb.isInt()) return self.abort(.bad_type);
         const rb = try self.refOf(instr.b);
-        try self.guardInt(rb);
+        try self.guardInt(rb, .operand_type, .b);
         const r = try self.emit(.{ .op = .bnot, .a = rb, .ty = .int });
         self.setReg(instr.a, r);
     }
@@ -4499,8 +4529,8 @@ pub const TraceState = struct {
         if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
         var rb = try self.refOf(instr.b);
         var rc = try self.refOf(instr.c);
-        try self.guardNum(rb, vb);
-        try self.guardNum(rc, vc);
+        try self.guardNum(rb, vb, .operand_type, .b);
+        try self.guardNum(rc, vc, .operand_type, .c);
         if (swap) {
             const t = rb;
             rb = rc;
@@ -4562,33 +4592,37 @@ pub const TraceState = struct {
 
             const lane_ord: i32 = @intFromEnum(lane); // 0 for .value
             const rtab = try self.refOf(instr.b);
-            _ = try self.emit(.{ .op = .guard_table, .a = rtab });
-            _ = try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord });
+            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .b, .neutral);
+            self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .b, .neutral);
             const rkey = try self.refOf(instr.c);
-            try self.guardInt(rkey);
+            try self.guardInt(rkey, .key_type, .c);
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
-            _ = try self.emit(.{ .op = .guard_bounds, .a = ref });
+            self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
             // No guard_present: the `.value` lane has no presence bitmap — nil is
             // encoded in-band (tag == .nil). A nil element fails the guard_table
             // below (nil is not a heap_ref) and side-exits to tier-0. Correct.
             const rload = try self.emit(.{ .op = .aload, .a = ref, .aux = lane_ord, .ty = obsTypeOf(loaded) });
+            // Fused native producer-exit (A-i.3): native `.value` `aload` side-exits at
+            // the load when the loaded tag is non-heap (`nativegen.zig`), with no
+            // `guard_*` node — so the exit identity rides the `aload` itself.
+            self.stampProv(rload, .element_type, .loaded, .neutral);
             // Guard the loaded value is a table with no metatable. This is the type
             // guard analogous to guard_int/guard_float for scalar loads — it side-exits
-            // when the element's type changes between iterations.
-            _ = try self.emit(.{ .op = .guard_table, .a = rload });
+            // when the element's type changes between iterations. (tier-1a path.)
+            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rload }), .element_type, .loaded, .neutral);
             self.setReg(instr.a, rload);
             return;
         }
 
         const lane_ord: i32 = @intFromEnum(lane);
         const rtab = try self.refOf(instr.b);
-        _ = try self.emit(.{ .op = .guard_table, .a = rtab });
-        _ = try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord });
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .b, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .b, .neutral);
         const rkey = try self.refOf(instr.c);
-        try self.guardInt(rkey);
+        try self.guardInt(rkey, .key_type, .c);
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
-        _ = try self.emit(.{ .op = .guard_bounds, .a = ref });
-        _ = try self.emit(.{ .op = .guard_present, .a = ref });
+        self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_present, .a = ref }), .present, .none, .neutral);
         const rload = try self.emit(.{ .op = .aload, .a = ref, .aux = lane_ord, .ty = obsTypeOf(loaded) });
         self.setReg(instr.a, rload);
     }
@@ -4671,18 +4705,18 @@ pub const TraceState = struct {
             const rval = try self.refOf(instr.c);
             const lane_ord: i32 = @intFromEnum(lane);
             const rtab = try self.refOf(instr.a);
-            _ = try self.emit(.{ .op = .guard_table, .a = rtab });
-            _ = try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord });
+            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .a, .neutral);
+            self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .a, .neutral);
             const rkey = try self.refOf(instr.b);
-            try self.guardInt(rkey);
+            try self.guardInt(rkey, .key_type, .b);
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
             // guard_append: hash-empty + `idx==len+1` + `len<cap`. The grow analogue
             // of guard_bounds — side-exits to tier-0 (which reallocs/migrates) when
             // any precondition fails, so the on-trace append never allocates.
-            _ = try self.emit(.{ .op = .guard_append, .a = ref });
+            self.stampProv(try self.emit(.{ .op = .guard_append, .a = ref }), .append_precond, .none, .neutral);
             // guard_fits: the value still fits the narrow lane (the oracle re-checks a
             // free-variable store; native bool already proves `.bool`). Same as astore.
-            _ = try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord });
+            self.stampProv(try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord }), .value_fits, .c, .neutral);
             _ = try self.emit(.{ .op = .astore_append, .a = ref, .b = rval, .aux = lane_ord });
             return;
         }
@@ -4714,12 +4748,12 @@ pub const TraceState = struct {
 
         const lane_ord: i32 = @intFromEnum(lane);
         const rtab = try self.refOf(instr.a);
-        _ = try self.emit(.{ .op = .guard_table, .a = rtab });
-        _ = try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord });
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .a, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .a, .neutral);
         const rkey = try self.refOf(instr.b);
-        try self.guardInt(rkey);
+        try self.guardInt(rkey, .key_type, .b);
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
-        _ = try self.emit(.{ .op = .guard_bounds, .a = ref });
+        self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
         // Guard at runtime that the value still fits the recorded narrow lane: a
         // later iteration storing an out-of-lane value (an out-of-range/non-int int
         // into an int lane, a non-bool into the bool lane, a non-float into f64)
@@ -4732,7 +4766,7 @@ pub const TraceState = struct {
         // above, so `lane` here is always narrow.) For the bool lane native lowers
         // this to nothing — the value is already proven `.bool` at analysis time —
         // but the oracle, which runs the raw trace, still needs the runtime check.
-        _ = try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord });
+        self.stampProv(try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord }), .value_fits, .c, .neutral);
         // No `guard_present`: `astore` *creates* presence (the slot is in-bounds by
         // `guard_bounds`; storing a non-nil value sets the presence bit). The store
         // is effectful and not register-defining, so nothing is `setReg`'d.
@@ -4782,19 +4816,19 @@ pub const TraceState = struct {
         const ge: i32 = @intFromEnum(ap.grid_elem);
         const stride_aux: i32 = @intCast(ap.stride);
         const rtab = try self.refOf(instr.b);
-        _ = try self.emit(.{ .op = .guard_grid, .a = rtab, .aux = ge });
-        _ = try self.emit(.{ .op = .guard_stride, .a = rtab, .aux = stride_aux });
+        self.stampProv(try self.emit(.{ .op = .guard_grid, .a = rtab, .aux = ge }), .grid_shape, .b, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_stride, .a = rtab, .aux = stride_aux }), .grid_stride, .b, .neutral);
         const rrow = try self.refOf(instr.c);
-        try self.guardInt(rrow);
+        try self.guardInt(rrow, .row_type, .c);
         const rcol = try self.refOf(col_reg);
-        try self.guardInt(rcol);
+        try self.guardInt(rcol, .col_type, .aux);
         const garow = try self.emit(.{ .op = .garow, .a = rtab, .b = rrow, .aux = ge });
-        _ = try self.emit(.{ .op = .guard_bounds, .a = garow }); // row in [1,rows] (grid len == rows)
+        self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = garow }), .row_bounds, .none, .neutral); // row in [1,rows]
         const gcell = try self.emit(.{ .op = .gcell, .a = garow, .b = rcol, .aux = ge });
         // guard_gcol carries the column ref in `.b` (col in [1,stride]); native keeps
         // it live for the range-compare, the oracle re-reads gcell.b instead.
-        _ = try self.emit(.{ .op = .guard_gcol, .a = gcell, .b = rcol });
-        _ = try self.emit(.{ .op = .guard_gpresent, .a = gcell });
+        self.stampProv(try self.emit(.{ .op = .guard_gcol, .a = gcell, .b = rcol }), .col_bounds, .none, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_gpresent, .a = gcell }), .present, .none, .neutral);
         const rload = try self.emit(.{ .op = .gload, .a = gcell, .aux = ge, .ty = obsTypeOf(loaded) });
         self.setReg(instr.a, rload);
     }
@@ -4838,17 +4872,17 @@ pub const TraceState = struct {
         const stride_aux: i32 = @intCast(ap.stride);
         const rval = try self.refOf(val_reg);
         const rtab = try self.refOf(instr.a);
-        _ = try self.emit(.{ .op = .guard_grid, .a = rtab, .aux = ge });
-        _ = try self.emit(.{ .op = .guard_stride, .a = rtab, .aux = stride_aux });
+        self.stampProv(try self.emit(.{ .op = .guard_grid, .a = rtab, .aux = ge }), .grid_shape, .a, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_stride, .a = rtab, .aux = stride_aux }), .grid_stride, .a, .neutral);
         const rrow = try self.refOf(instr.b);
-        try self.guardInt(rrow);
+        try self.guardInt(rrow, .row_type, .b);
         const rcol = try self.refOf(instr.c);
-        try self.guardInt(rcol);
+        try self.guardInt(rcol, .col_type, .c);
         const garow = try self.emit(.{ .op = .garow, .a = rtab, .b = rrow, .aux = ge });
-        _ = try self.emit(.{ .op = .guard_bounds, .a = garow });
+        self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = garow }), .row_bounds, .none, .neutral);
         const gcell = try self.emit(.{ .op = .gcell, .a = garow, .b = rcol, .aux = ge });
-        _ = try self.emit(.{ .op = .guard_gcol, .a = gcell, .b = rcol });
-        _ = try self.emit(.{ .op = .guard_fits, .a = rval, .aux = ge });
+        self.stampProv(try self.emit(.{ .op = .guard_gcol, .a = gcell, .b = rcol }), .col_bounds, .none, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_fits, .a = rval, .aux = ge }), .value_fits, .aux, .neutral);
         // No guard_gpresent: gstore *creates* presence (mirrors astore).
         _ = try self.emit(.{ .op = .gstore, .a = gcell, .b = rval, .aux = ge });
     }
@@ -4980,22 +5014,29 @@ pub const TraceState = struct {
         if (self.rec.instrs.items[@intCast(rkey)].op != .konst) return self.abort(.bad_type);
 
         const rtab = try self.refOf(instr.b);
-        _ = try self.emit(.{ .op = .guard_table, .a = rtab });
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .b, .neutral);
         // Seed the loop-invariant cell pointer for native (H1); `href.aux` carries
         // the synthetic slab slot, or `-1` to mark "not seeded → native declines".
         // The tier-1a oracle ignores `aux`, so a `null` seed leaves H0 untouched.
         const count: u32 = @intCast(tbl.hash.count());
         const seed_slot = try self.seedHashCell(rtab, rkey, count);
         const ref = try self.emit(.{ .op = .href, .a = rtab, .b = rkey, .aux = if (seed_slot) |s| @as(i32, s) else -1 });
-        _ = try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(count) });
+        // Fused native producer-exit (A-i.3): native `href` side-exits at the address
+        // node on cell-resolution failure (`nativegen.zig`), no `guard_*` — same guest
+        // hash access as `guard_hash`, so it shares `(hash_struct, b)`.
+        self.stampProv(ref, .hash_struct, .b, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(count) }), .hash_struct, .b, .neutral);
         const rload = try self.emit(.{ .op = .hload, .a = ref, .ty = obsTypeOf(fv) });
+        // Fused native producer-exit (A-i.3): native `hload` side-exits at the load on
+        // a field-type change, no `guard_*` node — same site as the consumer guardNum.
+        self.stampProv(rload, .field_type, .loaded, .neutral);
         self.setReg(instr.a, rload);
         // Decompose the tagged-cell load into a typed load + the existing consumer
         // type-guard (mirrors `slot_load` + `guardNum`): native lowers `hload` to a
         // tag-check + payload load of the guarded kind. The oracle returns the whole
         // `Value`, so this guard is what makes the two agree on the side-exit
         // iteration (and pins the field type — int→float etc. side-exits).
-        try self.guardNum(rload, fv);
+        try self.guardNum(rload, fv, .field_type, .loaded);
     }
 
     /// Record `t.field = v` (`set_index`, `a=table b=key c=value`, key an interned
@@ -5047,15 +5088,17 @@ pub const TraceState = struct {
         // guards (truthiness `guard_true`/`guard_false` are emitted raw, never
         // registered), so a prior guard on this ref is necessarily a matching
         // `guard_int`/`guard_float`.
-        try self.guardNum(rval, vval);
+        try self.guardNum(rval, vval, .value_type, .c);
         const rtab = try self.refOf(instr.a);
-        _ = try self.emit(.{ .op = .guard_table, .a = rtab });
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .a, .neutral);
         // Seed the cell pointer for native (H1) — see `recHashGet`. An RMW's read and
         // write `href`s dedup onto the same slot via `seedHashCell`.
         const count: u32 = @intCast(tbl.hash.count());
         const seed_slot = try self.seedHashCell(rtab, rkey, count);
         const ref = try self.emit(.{ .op = .href, .a = rtab, .b = rkey, .aux = if (seed_slot) |s| @as(i32, s) else -1 });
-        _ = try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(count) });
+        // Fused native producer-exit (A-i.3): native `href` cell-resolution failure.
+        self.stampProv(ref, .hash_struct, .a, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(count) }), .hash_struct, .a, .neutral);
         // `hstore` is effectful (overwrites the present cell in place) and defines no
         // register. A present-key overwrite never grows the map, so `guard_hash`
         // (population) stays sufficient. The store value's type is pinned by the
@@ -5077,8 +5120,8 @@ pub const TraceState = struct {
         if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
         const rb = try self.refOf(instr.b);
         const rc = try self.refOf(instr.c);
-        try self.guardNum(rb, vb);
-        try self.guardNum(rc, vc);
+        try self.guardNum(rb, vb, .operand_type, .b);
+        try self.guardNum(rc, vc, .operand_type, .c);
         const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
         self.setReg(instr.a, r);
     }
@@ -5088,8 +5131,12 @@ pub const TraceState = struct {
     /// is what keeps the straight-line trace valid.
     fn recBranch(self: *TraceState, instr: Instr, regs: RegWindow) !void {
         const ra = try self.refOf(instr.a);
-        const op: IrOp = if (regs.get(instr.a).isTruthy()) .guard_true else .guard_false;
-        _ = try self.emit(.{ .op = op, .a = ra });
+        const truthy = regs.get(instr.a).isTruthy();
+        const op: IrOp = if (truthy) .guard_true else .guard_false;
+        const gref = try self.emit(.{ .op = op, .a = ra });
+        // Branch polarity IS part of the identity (A-i.3, round-1 BLOCKER 1): the
+        // true-exit and false-exit of one `if` are opposite CFG edges of the region.
+        self.stampProv(gref, .branch_cond, .a, if (truthy) .taken else .fallthrough);
     }
 
     /// `for_loop` (numeric-for back-edge): record the increment and the
@@ -5122,9 +5169,9 @@ pub const TraceState = struct {
         const ridx = try self.refOf(a);
         const rlimit = try self.refOf(a + 1);
         const rstep = try self.refOf(a + 2);
-        try self.guardNum(ridx, vidx);
-        try self.guardNum(rlimit, vlimit);
-        try self.guardNum(rstep, vstep);
+        try self.guardNum(ridx, vidx, .operand_type, .a);
+        try self.guardNum(rlimit, vlimit, .operand_type, .a1);
+        try self.guardNum(rstep, vstep, .operand_type, .a2);
 
         // idx_next = idx + step
         const all_int = vidx.isInt() and vstep.isInt();
@@ -5142,10 +5189,11 @@ pub const TraceState = struct {
         // entries. The limit is never written by the loop, so the exit snapshot is
         // unchanged. Only fires for an integral, in-range limit (else stays mixed,
         // bails to tier-1a as before).
-        const rlimit_cmp = if (all_int and vlimit.isFloat() and value.floatAsExactInt(vlimit.asFloat()) != null)
-            try self.emit(.{ .op = .int_of_float, .a = rlimit, .ty = .int })
-        else
-            rlimit;
+        const rlimit_cmp = if (all_int and vlimit.isFloat() and value.floatAsExactInt(vlimit.asFloat()) != null) blk: {
+            const iof = try self.emit(.{ .op = .int_of_float, .a = rlimit, .ty = .int });
+            self.stampProv(iof, .limit_int, .a1, .neutral); // float-limit → int side-exit
+            break :blk iof;
+        } else rlimit;
 
         // loop continues while (ascending) idx_next <= limit, else limit <= idx_next.
         const ascending = vstep.toFloat() >= 0;
@@ -5153,7 +5201,8 @@ pub const TraceState = struct {
             try self.emit(.{ .op = .le, .a = rnext, .b = rlimit_cmp, .ty = .boolean })
         else
             try self.emit(.{ .op = .le, .a = rlimit_cmp, .b = rnext, .ty = .boolean });
-        _ = try self.emit(.{ .op = .guard_true, .a = cmp });
+        const done_g = try self.emit(.{ .op = .guard_true, .a = cmp });
+        self.stampProv(done_g, .loop_done, .none, .neutral); // loop-continuation test
 
         // publish the stepped index and the loop variable (R[a+3]).
         self.setReg(a, rnext);
@@ -5236,9 +5285,9 @@ pub const TraceState = struct {
         const rinit = try self.refOf(a);
         const rlimit = try self.refOf(a + 1);
         const rstep = try self.refOf(a + 2);
-        try self.guardNum(rinit, vinit);
-        try self.guardNum(rlimit, vlimit);
-        try self.guardNum(rstep, vstep);
+        try self.guardNum(rinit, vinit, .operand_type, .a);
+        try self.guardNum(rlimit, vlimit, .operand_type, .a1);
+        try self.guardNum(rstep, vstep, .operand_type, .a2);
 
         // First-iteration bounds test, mirroring `recForLoop`'s compare (incl. the
         // float-limit → int specialization so a mixed int/float compare stays lowerable
@@ -5246,16 +5295,17 @@ pub const TraceState = struct {
         // = init` against `limit`, so we compare `init` directly. On failure the inner
         // loop runs zero times → side-exit to tier-0 instead of entering the inner root.
         const all_int = vinit.isInt() and vstep.isInt();
-        const rlimit_cmp = if (all_int and vlimit.isFloat() and value.floatAsExactInt(vlimit.asFloat()) != null)
-            try self.emit(.{ .op = .int_of_float, .a = rlimit, .ty = .int })
-        else
-            rlimit;
+        const rlimit_cmp = if (all_int and vlimit.isFloat() and value.floatAsExactInt(vlimit.asFloat()) != null) blk: {
+            const iof = try self.emit(.{ .op = .int_of_float, .a = rlimit, .ty = .int });
+            self.stampProv(iof, .limit_int, .a1, .neutral);
+            break :blk iof;
+        } else rlimit;
         const ascending = vstep.toFloat() >= 0;
         const cmp = if (ascending)
             try self.emit(.{ .op = .le, .a = rinit, .b = rlimit_cmp, .ty = .boolean })
         else
             try self.emit(.{ .op = .le, .a = rlimit_cmp, .b = rinit, .ty = .boolean });
-        _ = try self.emit(.{ .op = .guard_true, .a = cmp });
+        self.stampProv(try self.emit(.{ .op = .guard_true, .a = cmp }), .loop_done, .none, .neutral);
 
         // Publish the inner root's entry state: the control index `R[a]` and the visible
         // loop var `R[a+3]` both start at `init`. (limit `R[a+1]` / step `R[a+2]` are
@@ -5334,7 +5384,7 @@ pub const TraceState = struct {
         // carries `Proto.id` (a `u32`, NOT a pointer — pointers change across a
         // keyframe restore and would break replay). Fails closed in the executor.
         const callee_ref = try self.refOf(instr.a);
-        _ = try self.emit(.{ .op = .guard_func, .a = callee_ref, .aux = @bitCast(cp.id) });
+        self.stampProv(try self.emit(.{ .op = .guard_func, .a = callee_ref, .aux = @bitCast(cp.id) }), .callee_identity, .a, .neutral);
 
         // (2) S1: seed every callee slot `.def`. Param slots (`i < num_params` and
         // an arg was actually passed) take the caller arg's SSA ref; everything else
@@ -5391,10 +5441,10 @@ pub const TraceState = struct {
         const callee_ref = try self.refOf(instr.a);
         if (!self.rec.guarded_refs.contains(callee_ref)) {
             try self.rec.guarded_refs.put(self.gpa, callee_ref, {});
-            _ = try self.emit(.{ .op = .guard_pure, .a = callee_ref, .aux = @intFromEnum(function.PureBuiltin.sqrt) });
+            self.stampProv(try self.emit(.{ .op = .guard_pure, .a = callee_ref, .aux = @intFromEnum(function.PureBuiltin.sqrt) }), .callee_pure, .a, .neutral);
         }
         const arg_ref = try self.refOf(@intCast(@as(usize, instr.a) + 1));
-        try self.guard(arg_ref, .guard_float);
+        try self.guard(arg_ref, .guard_float, .operand_type, .a1);
         const r = try self.emit(.{ .op = .fsqrt, .a = arg_ref, .ty = .float });
         self.setReg(instr.a, r);
     }
@@ -5483,7 +5533,7 @@ pub const TraceState = struct {
         // ordinary operand guard wherever the trace consumes it.
         if (resolved.isHeap() and resolved.heapType() == .function) {
             const cl = function.Closure.fromHeader(resolved.asHeap());
-            _ = try self.emit(.{ .op = .guard_func, .a = ref, .aux = @bitCast(cl.proto.id) });
+            self.stampProv(try self.emit(.{ .op = .guard_func, .a = ref, .aux = @bitCast(cl.proto.id) }), .callee_identity, .none, .neutral);
         }
         self.setReg(dest, ref);
     }
@@ -5714,6 +5764,13 @@ pub const Recorder = struct {
     /// to name the opcode that triggered an abort. `.halt` is a harmless initial
     /// placeholder — overwritten before any abort can reference it.
     cur_op: OpCode = .halt,
+    /// Globally-unique id of the proto whose opcode is currently being recorded —
+    /// the *leaf* proto (the anchor proto, or an inlined callee's proto once
+    /// `recCall` descends). Set alongside `cur_pc`/`cur_op` in `recordInstr`. Read by
+    /// `stampProv` (A-i.3) as a guard's `source_proto_id`, so a guard from an inlined
+    /// callee is attributed to the callee, not the anchor. Default 0 (harmless before
+    /// the first `recordInstr`).
+    cur_proto_id: u32 = 0,
     /// Deferred (sunk) array stores: in-bounds `astore`s that follow an `aload` (a
     /// read-modify-write). Rather than abort the trace (the old C1 rule),
     /// `recArraySet` records each store's address + guards inline but stashes the
@@ -8039,4 +8096,71 @@ test "buildExitProv: empty when nothing survives → static slice, no alloc (A-i
     const map = [_]?Ref{ 0, null, 1 }; // the only prov is dropped
     const out = try buildExitProv(gpa, &rec, &map);
     try testing.expectEqual(@as(usize, 0), out.len); // static empty; no free needed
+}
+
+test "A-i.3 stamp: arith operand guards carry (operand_type, b/c) and source_pc = pc−1" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    var regs = [_]Value{ Value.nil(), Value.int(10), Value.int(20) };
+    // add r0,r1,r2 at guest PC 42 → post-increment cur_pc, so source_pc == 41.
+    state.recordInstr(Instr.opABC(.add, 0, 1, 2), winRO(&regs), &proto, 42, Value.nil());
+    const prov = state.rec.exit_prov.items;
+    // instrs: slot_load, slot_load, guard_int(r1)=#2, guard_int(r2)=#3, add → lockstep len 5.
+    try testing.expectEqual(state.rec.instrs.items.len, prov.len);
+    const g1 = prov[2].?.guard;
+    try testing.expectEqual(GuardRole.operand_type, g1.role);
+    try testing.expectEqual(OperandDesig.b, g1.operand);
+    try testing.expectEqual(@as(u32, 41), g1.source_pc); // cur_pc − 1
+    try testing.expectEqual(Polarity.neutral, g1.polarity);
+    const g2 = prov[3].?.guard;
+    try testing.expectEqual(OperandDesig.c, g2.operand);
+    try testing.expectEqual(@as(u32, 41), g2.source_pc);
+    // Non-guard nodes (loads, the arith result) carry no provenance.
+    try testing.expect(prov[0] == null);
+    try testing.expect(prov[1] == null);
+    try testing.expect(prov[4] == null);
+}
+
+test "A-i.3 stamp: int↔float re-record keeps guard identity (only the IR op differs)" {
+    const gpa = testing.allocator;
+    // Re-recording the same guest site with a float operand must yield the SAME
+    // (role, operand, source_pc) — the identity keys on the guest site, not the
+    // observed type. Only the emitted IR op flips guard_int → guard_float.
+    inline for (.{ .{ Value.int(10), Value.int(20), IrOp.guard_int }, .{ Value.float(1.5), Value.float(2.5), IrOp.guard_float } }) |c| {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ Value.nil(), c[0], c[1] };
+        state.recordInstr(Instr.opABC(.add, 0, 1, 2), winRO(&regs), &proto, 42, Value.nil());
+        try testing.expectEqual(c[2], state.rec.instrs.items[2].op); // op differs by type
+        const g = state.rec.exit_prov.items[2].?.guard;
+        try testing.expectEqual(GuardRole.operand_type, g.role); // identity does NOT
+        try testing.expectEqual(OperandDesig.b, g.operand);
+        try testing.expectEqual(@as(u32, 41), g.source_pc);
+    }
+}
+
+test "A-i.3 stamp: branch polarity is part of identity (taken vs fallthrough), rest equal" {
+    const gpa = testing.allocator;
+    // A truthy operand records guard_true (polarity taken); a falsy one records
+    // guard_false (polarity fallthrough). Everything else in the tag is identical —
+    // the two CFG edges of one `if` differ ONLY by polarity (round-1 BLOCKER 1).
+    inline for (.{ .{ Value.int(1), IrOp.guard_true, Polarity.taken }, .{ Value.boolean(false), IrOp.guard_false, Polarity.fallthrough } }) |c| {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ c[0], Value.nil() };
+        state.recordInstr(Instr.opABC(.jmp_if_false, 0, 0, 0), winRO(&regs), &proto, 7, Value.nil());
+        try testing.expectEqual(c[1], state.rec.instrs.items[1].op);
+        const g = state.rec.exit_prov.items[1].?.guard;
+        try testing.expectEqual(GuardRole.branch_cond, g.role);
+        try testing.expectEqual(OperandDesig.a, g.operand);
+        try testing.expectEqual(@as(u32, 6), g.source_pc); // 7 − 1
+        try testing.expectEqual(c[2], g.polarity);
+    }
 }
