@@ -221,7 +221,8 @@ land; move whole sections to Done once everything inside is checked.
     provenance through that map into `Trace.exit_prov`. Nothing stamps yet ⇒ table empty ⇒ byte-identical.
     Tests: `optimize` compaction-map correctness on a hand-built trace (dead-drop + CSE-merge + survive);
     pure remap-and-compact round-trip.
-  - [ ] **A-i.2 — inline call-edge path capture (inert).** Extend `InlineFrame` (5398) with
+  - [x] **A-i.2 — inline call-edge path capture (inert). LANDED 2026-07-21.** `just test` green;
+    nbody/mandelbrot/nsieve tier-0 ≡ native. Extend `InlineFrame` (5398) with
     `{caller_proto_id: u32, call_pc: u32}`, set in `recCall`'s frame push (5169) — needs threading the
     call `pc` into `recCall` (currently absent). A `currentPath()` helper reads `frames[0..inline_depth]`
     into `[MAX_INLINE_DEPTH]CallEdge`. Read by nothing ⇒ byte-identical (a re-record-stability test guards it).

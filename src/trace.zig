@@ -5351,11 +5351,15 @@ pub const TraceState = struct {
             self.rec.reg_map[callee_base_off + i] = .{ .ref = seed, .state = .def };
         }
 
-        // (3) push the recorder frame and descend into the callee window.
+        // (3) push the recorder frame and descend into the callee window. Record the
+        // inline call edge (A-i.2): `proto` is the caller here, and `cur_pc` is the
+        // `.call`'s post-increment PC, so the source `.call` opcode is at `cur_pc − 1`.
         self.rec.frames[self.rec.inline_depth] = .{
             .base_off = self.rec.base_off,
             .ret_dest = instr.a,
             .ret_count = instr.c,
+            .caller_proto_id = proto.id,
+            .call_pc = self.rec.cur_pc - 1,
         };
         self.rec.inline_depth += 1;
         self.rec.base_off = callee_base_off;
@@ -5581,7 +5585,34 @@ const MAX_TRACE_INPUTS = 8;
 /// `.ret`. `base_off` is the caller frame's absolute slot offset (relative to the
 /// anchor frame's base); `ret_dest`/`ret_count` mirror the call's `instr.a`/
 /// `instr.c` (where results land in the caller, and how many it wants).
-const InlineFrame = struct { base_off: u32, ret_dest: u16, ret_count: u16 };
+const InlineFrame = struct {
+    base_off: u32,
+    ret_dest: u16,
+    ret_count: u16,
+    /// The inline call *edge* that opened this frame (doc 17, A-i.2 / H-1a): the
+    /// caller proto's globally-unique id and the `.call` opcode's PC. Together with
+    /// the sibling frames on `Recorder.frames[0..inline_depth]` these form a guard's
+    /// ordered inline-path prefix (`currentPath`), so the two guards from `f(a);
+    /// f(b)` inlined at distinct call sites get distinct `GuardProvenance`. Set in
+    /// `recCall`'s push; read by `currentPath`. Behaviour-neutral (recorder-only).
+    caller_proto_id: u32,
+    call_pc: u32,
+};
+
+/// Build a guard's ordered inline-path prefix (doc 17, A-i.2) from the recorder's
+/// live inline-frame stack: `path[i]` is the call edge that opened frame `i`.
+/// `depth` (= `Recorder.inline_depth`, ≤ `MAX_INLINE_DEPTH`) is the meaningful
+/// length; entries `[depth, MAX_INLINE_DEPTH)` are left undefined (a
+/// `GuardProvenance` carries its own `inline_depth`, so consumers only read the
+/// prefix). Pure — the identity substrate `stampProv` (A-i.3) reads.
+fn pathFromFrames(frames: []const InlineFrame, depth: u8) [MAX_INLINE_DEPTH]CallEdge {
+    var path: [MAX_INLINE_DEPTH]CallEdge = undefined;
+    for (0..depth) |i| path[i] = .{
+        .caller_proto_id = frames[i].caller_proto_id,
+        .call_pc = frames[i].call_pc,
+    };
+    return path;
+}
 
 /// Disposition of an in-flight recording, deciding whether it may close with a
 /// `.link` terminator (doc 16). Only the *anchor* — where the recording started
@@ -7981,6 +8012,24 @@ test "buildExitProv: null map is the identity (dupe path), result stays sorted (
     try testing.expect(t.provAt(2) == null);
     try testing.expectEqual(@as(u32, 20), t.provAt(3).?.guard.source_pc);
     try testing.expect(t.provAt(4) == null);
+}
+
+test "pathFromFrames: f(a);f(b) at distinct call sites give distinct inline paths (A-i.2)" {
+    // Same callee proto inlined at two different `.call` PCs must yield distinct
+    // provenance — the collision H-1a fixes. `pathFromFrames` distinguishes them by
+    // `call_pc` even though `caller_proto_id` is identical.
+    const frames = [_]InlineFrame{
+        .{ .base_off = 0, .ret_dest = 0, .ret_count = 0, .caller_proto_id = 3, .call_pc = 11 },
+        .{ .base_off = 8, .ret_dest = 0, .ret_count = 0, .caller_proto_id = 3, .call_pc = 42 },
+    };
+    const p1 = pathFromFrames(&frames, 1);
+    try testing.expectEqual(@as(u32, 3), p1[0].caller_proto_id);
+    try testing.expectEqual(@as(u32, 11), p1[0].call_pc);
+    const p2 = pathFromFrames(&frames, 2);
+    try testing.expectEqual(@as(u32, 11), p2[0].call_pc);
+    try testing.expectEqual(@as(u32, 42), p2[1].call_pc); // second edge is the distinguisher
+    // Depth-0 (anchor frame, no inlining) reads no edges.
+    _ = pathFromFrames(&frames, 0);
 }
 
 test "buildExitProv: empty when nothing survives → static slice, no alloc (A-i.1)" {
