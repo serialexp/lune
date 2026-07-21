@@ -1,5 +1,60 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-21 (LATEST-18) — A-i COMPLETE; A-ii DESIGNED+APPROVED; A-ii.1 LANDED+COMMITTED; A-ii.2 grounded, ready to code.
+
+**Cadence (Bart):** "First fix the current task, then design it first, then ask gpt-5.6-sol for a review,
+and maybe antigravity too. Autonomous, checkpoint per piece — the piece boundary being an APPROVE."
+
+**Where we are in §A8 landing sequence:** A-i (GuardProvenance) DONE. Now on **A-ii — region discovery +
+classifier, inert** (§A8 step 2). Design note = doc 17 **§A8-ii** (search "A8-ii"), reviewer-certified:
+gpt-5.6-sol rounds 11–13 BLOCKER (all folded) → **APPROVE**. Four inert sub-steps A-ii.1–A-ii.4; each
+green + byte-identical (nsieve/nbody/mandelbrot tier-0≡native, `just test` default + `-Djit-debug`).
+
+**Commits (branch master, NOT pushed):**
+- `121e22a` docs(17): A-ii landing design (§A8-ii)
+- `ac276da` feat(trace): **A-ii.1** accountTraceRun/accountRegionProfit split (inert) — LANDED, green.
+  onSideExit (trace.zig:1759) is now an `inline` wrapper → `accountTraceRun` (old body verbatim) +
+  no-op `accountRegionProfit(?ExitKey)`; added `ExitKey{trace_id,exit_instr}` (trace.zig:592). Zero
+  call-site changes. Equivalence test appended after the A-i.4 test.
+
+**NEXT: A-ii.2 — StructuralEdgeId + ephemeral edge_cache + anchor successor resolution (inert).** Fully
+grounded (do not re-derive):
+- `StructuralEdgeId = {anchor_proto_id, anchor_pc, exit: ExitProvenance, succ_anchor_proto_id,
+  succ_anchor_pc}`. Needs **field-wise** `canonicalLessThan`/`canonicalEql`/`canonicalHash` honoring
+  `inline_depth` (compare `path[0..inline_depth]` only; NO `std.mem.asBytes`/full-union `eql` — the union
+  has padding + an inactive arm). Types near ExitProvenance (trace.zig:548/570), ExitKey at 592.
+- **edge_cache** `AutoHashMapUnmanaged(ExitKey, StructuralEdgeId) = .empty` on TraceState; built at commit
+  (after cache.append ~4148), cleared in clearCache (3664), WHOLESALE-rebuilt from surviving cache in
+  removeTrace (3615, fail-closed empty on OOM), freed in deinit (1510). Read by nothing ⇒ byte-identical.
+- **Successor resolution** (per driveChain, trace.zig:1893-1934, faithfully): for each **keyed** exit e
+  of trace T (`T.provAt(e)` non-null):
+  - `.link_terminal`: succ anchor = `{T.anchor.proto, aux}` where `aux` = the `.link` instr's aux (inner
+    root pc); validate a trace bound at (proto,aux) is `isInnerLoopRoot` (1654). Else no edge.
+  - guard: `wp = guardExitPc(T.instrs[e])` (454; only guard_int/float/number/true/false/int_of_float →
+    non-null). Require `wp != null`, `wp != 0`, `wp != T.anchor.pc`, AND a trace bound at
+    `{T.anchor.proto, wp}` (existence scan of cache — NOT findTrace's selected identity). succ =
+    `{T.anchor.proto, wp}`. Else no edge.
+  - succ_proto = **T.anchor.proto** (same-proto; matches driveChain's single `proto` threading).
+    Cross-proto resume-proto is a known deferred refinement (nsieve doesn't exercise it). NOTE this in code.
+  - **Self-loop worry was UNFOUNDED:** ordinary same-anchor deopts have `guardExitPc` null or
+    `wp==anchor.pc`, so they form NO edge. Only numeric/branch guards + `.link_terminal` do.
+- Tests: cache built on a hand-built 2-anchor graph incl. a `.link_terminal` edge; wholesale rebuild on
+  retire; canonical-order total-order property. `Trace.id` is u32 (ExitKey.trace_id).
+
+**Then A-ii.3** (recordInstr hook @4257 capturing `{proto.id, source_pc = pc -| 1}` per recorded op,
+transient per-trace, fail-soft no-`.alloc`-abort) **and A-ii.4** (Tarjan-SCC over anchors; region_intern
+w/ canonicalEql; region_defs Proto/VM-lifetime; physical member-scoped classification indices;
+executable owner predicate = unique external-entry loop root else armable=false; def-consistency rebind
+tombstone; transactional+fail-soft: stage-all→ensureUnusedCapacity→infallible publish, commit-OOM
+retains / retire-OOM empties; classifyExit pure query; interp.zig:9030 empty-after-flush guard test).
+accountRegionProfit stays no-op through all of A-ii.
+
+**Rules kept in mind:** #13 (per-file/ bundled commits, never `add -p`), CLAUDE.md+TODO.md never staged,
+#15 git allowlist, Z-1 (verify stdlib), Z-3 (green+tested), Z-6 (no single-benchmark opt), design-doc
+skill (status header + checklist ticked as work lands). Monitor tool NOT used. Review model = gpt-5.6-sol
+(never pin gpt-5.2*).
+
+---
 ## Status 2026-07-18 (LATEST-16) — ROUND-9 LANDING PLAN written + reviewed + COMMITTED. Design-only (no code). Bart: "go back to bigger increments" → chose the round-9 landing track. gpt-5.6-sol = BLOCKER (6 defects), all tree-verified + folded.
 
 **Bart's steer:** back to bigger increments; picked "Round-9 landing" over H-2 hard half / GuardProvenance-only.
