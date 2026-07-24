@@ -1063,7 +1063,14 @@ pub const ArmKind = enum {
     ordinary_guard,
     /// The loop-done linked-materialized exit (2.3c-2). Must be a loop-done guard.
     loop_done_linked,
+    /// Part A edge-4 bridge: a composite ordinary guard whose stub commits the
+    /// dominance-scoped phi snapshot before entering the child's ordinary entry.
+    region_bridge,
 };
+
+/// A-v emits bridge-capable stubs but does not publish an edge into any of them.
+/// A-vii flips this only after the arm-time S⊆E validation and replay grammar land.
+const region_bridge_arming_enabled = false;
 
 /// A loop-carried writeback: at the back-edge, tier-0 register `slot` holds the
 /// value produced by IR `ref`. The set of these is the trace's exit snapshot —
@@ -1970,8 +1977,8 @@ pub const TraceState = struct {
             for (self.cache.items, 0..) |t, i| {
                 const term: IrOp = if (t.instrs.len != 0) t.instrs[t.instrs.len - 1].op else .loop;
                 jitdbg.log("  [{d}] id={d} anchor pc={d} instrs={d} inputs={d} term={s} native={s} hits={d}", .{
-                    i,                  t.id,          t.anchor.pc,
-                    t.instrs.len,       t.inputs.len,  @tagName(term),
+                    i,                  t.id,         t.anchor.pc,
+                    t.instrs.len,       t.inputs.len, @tagName(term),
                     @tagName(t.native), t.hit_count,
                 });
             }
@@ -2953,7 +2960,7 @@ pub const TraceState = struct {
             const region_work: usize = switch (e.kind) {
                 .loop_done_linked => 1,
                 .deopt => local,
-                .link_terminal, .prologue_fail => 0,
+                .link_terminal, .prologue_fail, .region_bridge => 0,
             };
             const region_dest: RegionDestination = if (!is_last)
                 .{ .known_trace = entries[k + 1].id }
@@ -2968,6 +2975,12 @@ pub const TraceState = struct {
             // static contract; any mismatch is a release-`@panic` rather than a silent
             // mis-walk that could double-count an already-committed loop.
             switch (e.kind) {
+                .region_bridge => {
+                    // A-v emits bridge-capable stubs but leaves every slot at
+                    // shared_exit, so observing this kind before A-vii arms and
+                    // implements its replay contract is an internal wiring bug.
+                    @panic("replayLedger: region_bridge reached before A-vii");
+                },
                 .link_terminal => {
                     // A continuation reached its single-contract `.link` terminal.
                     if (!(e.reason == .normal and ends_link and e.exit == owner.instrs.len - 1))
@@ -4824,7 +4837,19 @@ pub const TraceState = struct {
                 std.debug.assert(is_loopdone);
                 if (!is_loopdone) return false;
             },
-            .link_terminal, .ordinary_guard => {
+            .link_terminal => {
+                std.debug.assert(!is_loopdone);
+                if (is_loopdone) return false;
+            },
+            .ordinary_guard => {
+                std.debug.assert(!is_loopdone);
+                if (is_loopdone) return false;
+                // A-v bridge candidates must remain at shared_exit. In particular,
+                // the older M1 ordinary-source arm must not accidentally publish a
+                // composite back-edge into the new armed body.
+                if (nativegen.isCompositeBridgeCandidate(parent, slot_index)) return false;
+            },
+            .region_bridge => {
                 std.debug.assert(!is_loopdone);
                 if (is_loopdone) return false;
             },
@@ -4842,6 +4867,16 @@ pub const TraceState = struct {
         const target = switch (kind) {
             .link_terminal => child_c.linked_entry orelse return false,
             .ordinary_guard, .loop_done_linked => child_c.ordinary_entry orelse return false,
+            // A-vii is the first increment allowed to call this arm. Missing the
+            // required re-guarding entry is therefore a wiring bug, not ordinary
+            // ineligibility: fail loudly before publishing an unsafe bare jump.
+            .region_bridge => blk: {
+                const entry = child_c.ordinary_entry orelse
+                    @panic("armNativeLink(.region_bridge): child has no ordinary_entry");
+                if (!region_bridge_arming_enabled)
+                    @panic("armNativeLink(.region_bridge): A-v stub is intentionally unarmed");
+                break :blk entry;
+            },
         };
         // A re-arm of this exact slot supersedes any prior child it pointed at.
         // Mutate the existing record IN PLACE (no allocation) — the earlier
@@ -5898,20 +5933,22 @@ pub const TraceState = struct {
     /// post-increment resume PC), with the live inline-path prefix. Behaviour-neutral:
     /// nothing reads `exit_prov` until Part A (A-ii).
     fn stampProv(self: *TraceState, ref: Ref, role: GuardRole, operand: OperandDesig, polarity: Polarity) void {
-        self.rec.exit_prov.items[ref] = .{ .guard = .{
-            .path = pathFromFrames(&self.rec.frames, self.rec.inline_depth),
-            .inline_depth = self.rec.inline_depth,
-            .source_proto_id = self.rec.cur_proto_id,
-            // `cur_pc` is the post-increment resume PC (= source-opcode PC + 1), so the
-            // owning guest opcode is `cur_pc − 1` (same convention as `guardSourcePc`).
-            // In production `cur_pc ≥ 1` always; saturating subtraction is identical for
-            // every real input and only maps the synthetic `pc = 0` test sentinel to 0
-            // (which `guardSourcePc` likewise treats as "no loop-body guard PC").
-            .source_pc = self.rec.cur_pc -| 1,
-            .role = role,
-            .operand = operand,
-            .polarity = polarity,
-        } };
+        self.rec.exit_prov.items[ref] = .{
+            .guard = .{
+                .path = pathFromFrames(&self.rec.frames, self.rec.inline_depth),
+                .inline_depth = self.rec.inline_depth,
+                .source_proto_id = self.rec.cur_proto_id,
+                // `cur_pc` is the post-increment resume PC (= source-opcode PC + 1), so the
+                // owning guest opcode is `cur_pc − 1` (same convention as `guardSourcePc`).
+                // In production `cur_pc ≥ 1` always; saturating subtraction is identical for
+                // every real input and only maps the synthetic `pc = 0` test sentinel to 0
+                // (which `guardSourcePc` likewise treats as "no loop-body guard PC").
+                .source_pc = self.rec.cur_pc -| 1,
+                .role = role,
+                .operand = operand,
+                .polarity = polarity,
+            },
+        };
     }
 
     /// Emit a type guard for `ref` (deduplicated — an SSA value has one type). Stamps
@@ -7621,9 +7658,9 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
             const anchor_cycles = r.traced_cycles +| r.interp_cycles;
             if (has_time) {
                 try w.print("    {s:<18}  {d:>11}  {d:>11}  {d:>5.1}%   {d:>5.1}%  {d:>7.1}%\n", .{
-                    label,                              r.traced,
-                    r.interp,                           pctOf(r.traced, r.traced +| r.interp),
-                    pctOf(anchor_cycles, run),          pctOf(r.traced_cycles, anchor_cycles),
+                    label,                     r.traced,
+                    r.interp,                  pctOf(r.traced, r.traced +| r.interp),
+                    pctOf(anchor_cycles, run), pctOf(r.traced_cycles, anchor_cycles),
                 });
             } else {
                 try w.print("    {s:<18}  {d:>11}  {d:>11}  {d:>5.1}%   {s:>6}  {s:>8}\n", .{

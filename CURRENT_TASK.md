@@ -1,5 +1,39 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-24 (LATEST-25) — **A-v edge-4 bridge stub emission LANDED, unarmed + inert. NEXT = A-vi (native-F2c harness + H-3/H-4 tests) per §A8 step 6.**
+
+Every composite ordinary guard accepted by the trace-local classifier now emits the
+§A2.4 bridge head and dead armed body: `slot[ei] == shared_exit → ordinary_mini`,
+cap-check-first at `ledger_len > LEDGER_CAP-2`, dominance-scoped phi snapshot `E`,
+`.region_bridge` ledger append, and staged indirect handoff. `ordinary_mini` is shared
+by unarmed and ledger-full cases and preserves today's `exit_instr → deopt_exit`
+behaviour; the bridge writes no `final_trace_id` and has no forced-yield check.
+
+Classifier/arming decisions: committed `GuardProvenance` must be a same-anchor-proto
+`.branch_cond` whose source PC matches the IR guard and whose exit precedes the trace
+anchor; `E` is every slot-bound phi with `update_ref < guard_index`, excluding internal
+and post-guard updates. Existing `.ordinary_guard` arming rejects bridge candidates.
+`ArmKind.region_bridge` derives `child.ordinary_entry` but is release-fail-fast behind
+`region_bridge_arming_enabled = false`, so A-v has no publishing call site and every
+bridge slot stays unarmed until A-vii.
+
+Files touched for A-v: `src/nativegen.zig` (classifier, E snapshot, stub emission,
+machine-prefix/unarmed test), `src/trace.zig` (`ArmKind`, derive-not-trust target,
+inert arm guards), `src/irinterp.zig` (`LedgerKind.region_bridge` plus pre-A-vii replay
+tripwire), this file, and `docs/design/17-exit-branch-patching.md`. Inertness proof:
+`zig build` after each of the three requested sub-steps; `just test` green;
+`zig build test -Djit-debug=true` green. ReleaseFast tier-0 output was byte-identical
+to `--trace --jit-native` for all six controls, with committed SHA-256 prefixes:
+nsieve `4053ed86223d7060`, nbody `9dcd7fa2f7e9e93e`, sieve_int
+`db55c0f98f98851b`, pi_leibniz `f57ace5316c0fd19`, grid_matmul
+`395ff5566b31eb18`, field_hash `89b64d3d25ae188f`.
+
+Reviewer risks to check: the classifier's `exit_pc < anchor.pc` definition of outer
+re-test, the slot-bound-phi-as-successor-live interpretation of `E`, and the deliberate
+A-vii flip point (`region_bridge_arming_enabled` plus replay panic).
+
+---
+
 ## Status 2026-07-22 (LATEST-24) — **A-iv `region_profit` accumulator LANDED, inert + green (reverse-authored by Codex). NEXT = A-v (edge-4 bridge stub, unarmed) per §A8 step 5.**
 
 `accountRegionProfit` now ACCUMULATES (was a no-op) per-activation `RegionKey{region_id, activation:call_seq}

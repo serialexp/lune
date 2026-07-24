@@ -168,6 +168,11 @@ pub const LedgerKind = enum(u32) {
     /// A hoisted entry-type guard failed pre-commit (`exit_instr = -1`,
     /// `reason = .prologue_fail`). Always terminal — never a chain source.
     prologue_fail = 3,
+    /// Part A-v (doc 17): a composite-guard bridge committed the parent trace's
+    /// dominating phi updates before handing off to an outer-loop successor.
+    /// A-v emits this site but never arms it, so no runtime ledger can contain
+    /// this kind until A-vii lands the arm and replay contract.
+    region_bridge = 4,
 };
 
 /// 2.3c-2c (doc 17): what a chain-source exit DID with its (possibly armed) slot —
@@ -963,7 +968,8 @@ fn runScan(t: *Table, start: i64) struct { completed: usize, regs: [3]Value } {
         .anchor = undefined,
         .instrs = &instrs,
         .consts = @constCast(scan_consts[0..]),
-        .entry_slots = &[_]u16{}, .entry_guards = &.{},
+        .entry_slots = &[_]u16{},
+        .entry_guards = &.{},
     };
     var regs = [3]Value{ Value.heap(&t.header), Value.int(start), Value.nil() };
     var values: [13]Value = undefined;
@@ -1063,7 +1069,8 @@ test "B2 read path: guard_table side-exits when the slot is not a table" {
         .anchor = undefined,
         .instrs = &instrs,
         .consts = @constCast(scan_consts[0..]),
-        .entry_slots = &[_]u16{}, .entry_guards = &.{},
+        .entry_slots = &[_]u16{},
+        .entry_guards = &.{},
     };
     // r0 is an int, not a table → guard_table fails on the first iteration.
     var regs = [3]Value{ Value.int(99), Value.int(1), Value.nil() };
@@ -1086,7 +1093,8 @@ test "per-guard PC: ExecResult.exit_instr points to the failing guard" {
         .anchor = undefined,
         .instrs = &instrs,
         .consts = @constCast(consts[0..]),
-        .entry_slots = &[_]u16{}, .entry_guards = &.{},
+        .entry_slots = &[_]u16{},
+        .entry_guards = &.{},
     };
     var regs = [_]Value{ Value.int(1), Value.float(3.14) };
     var values: [5]Value = undefined;
@@ -1115,7 +1123,8 @@ test "per-guard PC: ExecResult.exit_instr on arith error (divide by zero)" {
         .anchor = undefined,
         .instrs = &instrs,
         .consts = @constCast(consts[0..]),
-        .entry_slots = &[_]u16{}, .entry_guards = &.{},
+        .entry_slots = &[_]u16{},
+        .entry_guards = &.{},
     };
     var regs = [_]Value{ Value.nil(), Value.nil(), Value.int(1) };
     var values: [7]Value = undefined;

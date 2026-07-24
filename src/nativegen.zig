@@ -3396,6 +3396,47 @@ fn isNumericForLoopDoneGuard(t: *const Trace, instr_idx: usize) bool {
     return t.anchor.proto.code[trace.guardSourcePc(guard).?].op == .for_loop;
 }
 
+/// Part A-v (doc 17 §A2.1/§A2.3): true for a trace-local composite outer-loop
+/// re-test whose bridge has at least one dominance-safe slot update to commit.
+///
+/// "Same-proto outer re-test" is represented without region metadata: committed
+/// guard provenance must identify a source-level branch condition owned by the
+/// anchor proto, and its post-fetch PC must precede this continuation's anchor.
+/// This excludes inlined-callee guards, forward branches, and numeric-for
+/// loop-done guards. The dominance-scoped set E is the slot-bound phi set whose
+/// update ref was defined before the guard; a slot-bound phi is precisely a value
+/// live at the trace successor/back-edge. Internal phis do not name VM slots and
+/// are excluded.
+pub fn isCompositeBridgeCandidate(t: *const Trace, instr_idx: usize) bool {
+    if (instr_idx >= t.instrs.len) return false;
+    const guard = t.instrs[instr_idx];
+    if (guard.op != .guard_true and guard.op != .guard_false) return false;
+    if (isNumericForLoopDoneGuard(t, instr_idx)) return false;
+
+    const exit_pc = trace.guardExitPc(guard) orelse return false;
+    const source_pc = trace.guardSourcePc(guard) orelse return false;
+    if (exit_pc >= t.anchor.pc or source_pc >= t.anchor.proto.code.len) return false;
+    const prov = t.provAt(@intCast(instr_idx)) orelse return false;
+    const guard_prov = switch (prov) {
+        .guard => |g| g,
+        .link_terminal => return false,
+    };
+    if (guard_prov.role != .branch_cond or
+        guard_prov.source_proto_id != t.anchor.proto.id or
+        guard_prov.source_pc != source_pc)
+        return false;
+    switch (t.anchor.proto.code[source_pc].op) {
+        .jmp_if_true, .jmp_if_false => {},
+        else => return false,
+    }
+
+    for (t.instrs) |p| {
+        if (p.op == .phi and p.aux != trace.PHI_INTERNAL and p.b < instr_idx)
+            return true;
+    }
+    return false;
+}
+
 /// Emit the per-iteration hash-cell resolution call-out for a `.heap`-rooted href.
 /// The sequence saves all live caller-saved homes (rdi/rsi SoA bases + GP + XMM)
 /// into the pre-reserved frame area, sets up SysV ABI arguments, calls
@@ -3620,6 +3661,28 @@ fn emitLinkedLoopDoneSnapshot(
         if (p.op != .phi or p.aux == trace.PHI_INTERNAL) continue;
         if (p.aux == visible_var_slot) continue;
         try flushSlot(a, @as(i32, @intCast(p.aux)), kinds[@intCast(p.b)], placeOfRef(alloc, @intCast(p.b)));
+    }
+}
+
+/// Part A-v (doc 17 §A2.1): materialize the bridge's compile-time set E.
+/// Slot-bound phis are the trace successor's live VM-slot writebacks; only an
+/// update defined before `exit_instr` dominates that guard. Post-guard phis and
+/// internal optimizer phis are deliberately excluded.
+fn emitCompositeBridgeSnapshot(
+    a: *x64.Assembler,
+    t: *const Trace,
+    kinds: []const Kind,
+    alloc: *const Alloc,
+    exit_instr: usize,
+) !void {
+    for (t.instrs) |p| {
+        if (p.op != .phi or p.aux == trace.PHI_INTERNAL or p.b >= exit_instr) continue;
+        try flushSlot(
+            a,
+            @as(i32, @intCast(p.aux)),
+            kinds[@intCast(p.b)],
+            placeOfRef(alloc, @intCast(p.b)),
+        );
     }
 }
 
@@ -4142,43 +4205,43 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
                     const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
                     if (ins.aux == F64_LANE) {
-                    // f64 lane: load the raw 8-byte double at `[data + idx0*8]` into
-                    // the aload's float home (an xmm reg or a spill cell). No decode —
-                    // tier-0's `array.decode` for `.f64` is a raw `@bitCast`, so `movsd`
-                    // moves byte-identical bits (no FP rounding in a load → 8-mode
-                    // parity inherited). `lea` the element address (datareg + idx0*8)
-                    // into rax, then `movsd` from `[rax]`.
-                    try a.leaRegMemSib(.rax, datareg, ireg, 8, 0); // rax = &data[idx0]
-                    switch (placeOfRef(alloc, i)) {
-                        .xmm => |x| try a.movsdRegMem(x, .rax, 0),
-                        .mem => |d| {
-                            try a.movsdRegMem(XMM_SCRATCH0, .rax, 0);
-                            try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
-                        },
-                        .reg => unreachable, // a float never homes in a GP register
-                    }
-                } else {
-                    if (ins.aux == BOOL_LANE) {
-                        // bool lane: load the in-band byte (1=false, 2=true) and decode
-                        // to a clean 0/1 boolean with `byte - 1`. The dominating
-                        // guard_present already proved the byte is non-zero (a hole
-                        // would be 0), so the result is exactly 0 or 1.
-                        try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
-                        try a.subRegImm32(.rax, 1); // 1→0 (false), 2→1 (true)
-                    } else if (ins.aux == U8_LANE) {
-                        // u8 lane: zero-extend the byte element at `[data + idx0]` into a
-                        // full 64-bit int (range 0..255). `movzx` (signed=false), no
-                        // `sub` — this is the only point u8 diverges from the signed int
-                        // lanes, and it matches `array.decode`'s zero-extend exactly.
-                        try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
+                        // f64 lane: load the raw 8-byte double at `[data + idx0*8]` into
+                        // the aload's float home (an xmm reg or a spill cell). No decode —
+                        // tier-0's `array.decode` for `.f64` is a raw `@bitCast`, so `movsd`
+                        // moves byte-identical bits (no FP rounding in a load → 8-mode
+                        // parity inherited). `lea` the element address (datareg + idx0*8)
+                        // into rax, then `movsd` from `[rax]`.
+                        try a.leaRegMemSib(.rax, datareg, ireg, 8, 0); // rax = &data[idx0]
+                        switch (placeOfRef(alloc, i)) {
+                            .xmm => |x| try a.movsdRegMem(x, .rax, 0),
+                            .mem => |d| {
+                                try a.movsdRegMem(XMM_SCRATCH0, .rax, 0);
+                                try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
+                            },
+                            .reg => unreachable, // a float never homes in a GP register
+                        }
                     } else {
-                        // int lane (i8…i64): sign-extend the width-byte element at
-                        // `[data + idx0*w]` into a full 64-bit int.
-                        const w = intLaneWidth(ins.aux);
-                        try a.loadRegMemSib(.rax, datareg, ireg, w, true, 0);
+                        if (ins.aux == BOOL_LANE) {
+                            // bool lane: load the in-band byte (1=false, 2=true) and decode
+                            // to a clean 0/1 boolean with `byte - 1`. The dominating
+                            // guard_present already proved the byte is non-zero (a hole
+                            // would be 0), so the result is exactly 0 or 1.
+                            try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
+                            try a.subRegImm32(.rax, 1); // 1→0 (false), 2→1 (true)
+                        } else if (ins.aux == U8_LANE) {
+                            // u8 lane: zero-extend the byte element at `[data + idx0]` into a
+                            // full 64-bit int (range 0..255). `movzx` (signed=false), no
+                            // `sub` — this is the only point u8 diverges from the signed int
+                            // lanes, and it matches `array.decode`'s zero-extend exactly.
+                            try a.loadRegMemSib(.rax, datareg, ireg, 1, false, 0); // movzx rax, byte [data+idx0]
+                        } else {
+                            // int lane (i8…i64): sign-extend the width-byte element at
+                            // `[data + idx0*w]` into a full 64-bit int.
+                            const w = intLaneWidth(ins.aux);
+                            try a.loadRegMemSib(.rax, datareg, ireg, w, true, 0);
+                        }
+                        try regToPlace(a, placeOfRef(alloc, i), .rax);
                     }
-                    try regToPlace(a, placeOfRef(alloc, i), .rax);
-                }
                 } // close outer `else` for scalar lanes
             },
             // guard_fits (B4b): range-check the int value (`a`) against the lane's
@@ -4565,11 +4628,50 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     try a.movRegImm64(.rax, @bitCast(@as(u64, se)));
                     try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
                 }
-            } else if (shared_exit != null) {
-                // ordinary guard: resolve through its own slot[ei] (deref → stage).
-                try a.movRegImm64(.rax, @bitCast(@as(u64, slotAddr(slots, ei).?)));
-                try a.movRegMem(.rax, .rax, 0);
-                try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
+            } else if (shared_exit) |se| {
+                if (isCompositeBridgeCandidate(t, ei)) {
+                    // Part A-v: generic edge-4 bridge stub. The slot remains
+                    // `shared_exit` throughout A-v, so execution always branches to
+                    // `ordinary_mini`; the armed body is dead scaffolding until A-vii.
+                    const ordinary_mini = try a.label();
+
+                    // Stub head: unarmed slots take today's ordinary deopt path.
+                    try a.movRegImm64(.rax, @bitCast(@as(u64, slotAddr(slots, ei).?)));
+                    try a.movRegMem(.rax, .rax, 0);
+                    try a.movRegImm64(.rcx, @bitCast(@as(u64, se)));
+                    try a.cmpRegReg(.rax, .rcx);
+                    try a.jcc(.e, ordinary_mini);
+
+                    // Cap check FIRST, before any VM-state or result mutation beyond
+                    // the legacy exit_instr write above. Reserve two ledger cells:
+                    // this bridge receipt and the successor's terminal receipt.
+                    try a.movRegMem(.rax, .rdx, @offsetOf(NativeResult, "ledger_len"));
+                    try a.cmpRegImm32(.rax, @intCast(irinterp.LEDGER_CAP - 2));
+                    try a.jcc(.a, ordinary_mini);
+
+                    try emitCompositeBridgeSnapshot(a, t, kinds, alloc, ei);
+                    try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+                    try emitLedgerAppend(a, t.id, .region_bridge);
+
+                    // Re-resolve after the snapshot/append clobbered scratch regs,
+                    // stage in the flush-immune result field, then hand off directly.
+                    try a.movRegImm64(.rax, @bitCast(@as(u64, slotAddr(slots, ei).?)));
+                    try a.movRegMem(.rax, .rax, 0);
+                    try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
+                    try a.jmpMem(.rdx, @offsetOf(NativeResult, "exit_target"));
+
+                    // Shared fallback for BOTH unarmed and ledger-full cases. This is
+                    // VM-state/output-equivalent to the pre-A-v mini-stub.
+                    a.bind(ordinary_mini);
+                    try a.movRegImm64(.rax, @bitCast(@as(u64, se)));
+                    try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
+                } else {
+                    // Non-candidate ordinary guard: preserve the exact pre-A-v
+                    // emission — resolve through its own slot (deref → stage).
+                    try a.movRegImm64(.rax, @bitCast(@as(u64, slotAddr(slots, ei).?)));
+                    try a.movRegMem(.rax, .rax, 0);
+                    try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
+                }
             }
             try a.jmp(deopt_exit);
         }
@@ -6100,6 +6202,108 @@ test "nativegen: frameless spilled carried homes dispatch the ordinary guard exi
     var regs0: [CARRIED_SPILL_N + 2]Value = undefined;
     carriedSpillRegs(&regs0, 0);
     try expectMatchFrameless(&t, &regs0);
+}
+
+test "nativegen A-v: composite bridge prefix emits but unarmed exit takes ordinary_mini" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    // A continuation anchored at PC 29 re-tests the same proto's outer branch at
+    // PC 13 (post-fetch exit PC 14). The slot-0 phi update is defined before the
+    // guard, so E={r0}; the phi node itself remains post-guard, as in the recorded
+    // edge-4 shape.
+    var code: [30]bytecode.Instr = undefined;
+    @memset(code[0..], bytecode.Instr.op0(.halt));
+    code[13] = bytecode.Instr.opAx(.jmp_if_true, 0, 0);
+    var proto = bytecode.Proto{ .code = &code, .name = "a-v-bridge", .id = 41 };
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4: outer re-test
+        .{ .op = .konst, .aux = 0 }, // 5: 1
+        .{ .op = .add, .a = 0, .b = 5, .ty = .int }, // 6: next i (dominates guard)
+        .{ .op = .guard_true, .a = 4, .aux = 14 }, // 7: edge-4 composite guard
+        .{ .op = .phi, .b = 6, .aux = 0 }, // 8: post-guard node, pre-guard update
+        .{ .op = .loop }, // 9
+    };
+    var consts = [_]Value{Value.int(1)};
+    var exit_prov = [_]trace.ExitProvEntry{.{
+        .index = 7,
+        .prov = .{ .guard = .{
+            .source_proto_id = proto.id,
+            .source_pc = 13,
+            .role = .branch_cond,
+            .operand = .a,
+            .polarity = .taken,
+        } },
+    }};
+    var es = [_]u16{};
+    const t = Trace{
+        .id = 73,
+        .anchor = .{ .proto = &proto, .pc = 29 },
+        .instrs = &instrs,
+        .consts = &consts,
+        .entry_slots = &es,
+        .entry_guards = &.{},
+        .exit_prov = &exit_prov,
+    };
+    try testing.expect(isCompositeBridgeCandidate(&t, 7));
+
+    var arena = McodeArena.init(gpa);
+    defer arena.deinit();
+    var ct = compileInto(gpa, &arena, &t) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    const shared_exit = arena.trampoline_exit.?;
+    try testing.expectEqual(shared_exit, ct.slots[7]); // A-v publishes no bridge arm.
+
+    // Pin the emitted head through the conditional-branch opcode. The rel32
+    // displacement itself is deliberately excluded because ordinary_mini follows
+    // the entire dead armed body; the two embedded addresses make this sequence
+    // unique within the trace page.
+    var prefix = x64.Assembler.init(gpa);
+    defer prefix.deinit();
+    const ordinary_mini = try prefix.label();
+    try prefix.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&ct.slots[7]))));
+    try prefix.movRegMem(.rax, .rax, 0);
+    try prefix.movRegImm64(.rcx, @bitCast(@as(u64, shared_exit)));
+    try prefix.cmpRegReg(.rax, .rcx);
+    try prefix.jcc(.e, ordinary_mini);
+    prefix.bind(ordinary_mini);
+    prefix.resolve();
+    try testing.expect(prefix.code.items.len > 4);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        ct.page.code,
+        prefix.code.items[0 .. prefix.code.items.len - 4],
+    ) != null);
+
+    // Fail the composite guard immediately. The unarmed prefix must select
+    // ordinary_mini → deopt_exit → shared_exit: one terminal `.deopt` receipt,
+    // no `.region_bridge`, unchanged registers, and the legacy exit index.
+    var tags = [_]u8{
+        @intFromEnum(Value.int(5).tag),
+        @intFromEnum(Value.int(3).tag),
+    };
+    var payloads = [_]u64{
+        Value.int(5).payload.bits,
+        Value.int(3).payload.bits,
+    };
+    var ledger: [irinterp.LEDGER_CAP]irinterp.LedgerEntry = undefined;
+    const result = ct.runCapturingLedger(
+        RegWindow.of(tags[0..], payloads[0..]),
+        ledger[0..],
+    );
+    try testing.expectEqual(@as(usize, 0), result.completed);
+    try testing.expectEqual(@as(u32, 7), result.exit_instr);
+    try testing.expectEqual(@as(usize, 1), result.ledger_len);
+    try testing.expectEqual(irinterp.LedgerKind.deopt, ledger[0].kind);
+    try testing.expectEqual(irinterp.LedgerOutcome.normal, ledger[0].outcome);
+    try testing.expectEqual(@intFromEnum(Value.int(5).tag), tags[0]);
+    try testing.expectEqual(Value.int(5).payload.bits, payloads[0]);
+    try testing.expectEqual(@intFromEnum(Value.int(3).tag), tags[1]);
+    try testing.expectEqual(Value.int(3).payload.bits, payloads[1]);
 }
 
 test "nativegen: analyze classifies slots and pins disjoint homes" {
