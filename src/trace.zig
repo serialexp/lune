@@ -2976,10 +2976,61 @@ pub const TraceState = struct {
             // mis-walk that could double-count an already-committed loop.
             switch (e.kind) {
                 .region_bridge => {
-                    // A-v emits bridge-capable stubs but leaves every slot at
-                    // shared_exit, so observing this kind before A-vii arms and
-                    // implements its replay contract is an internal wiring bug.
-                    @panic("replayLedger: region_bridge reached before A-vii");
+                    // A bridge commits its distinct cross-anchor snapshot before
+                    // entering the successor. It is therefore never terminal or a
+                    // forced yield, and any provenance mismatch is unrecoverable:
+                    // falling back would replay from the wrong register image.
+                    if (!(e.reason == .normal and e.outcome == .normal and !is_last))
+                        @panic("replayLedger: region_bridge is terminal, yielded, or non-normal");
+                    if (!nativegen.isCompositeBridgeCandidate(owner, e.exit))
+                        @panic("replayLedger: region_bridge exit is not a composite guard");
+                    const succ = self.traceById(entries[k + 1].id) orelse
+                        @panic("replayLedger: region_bridge successor id did not resolve");
+
+                    // The physical armed-link registry proves that this exact
+                    // parent slot entered this exact successor. Composite guards
+                    // cannot alias M1: `.ordinary_guard` refuses to arm them.
+                    var armed = false;
+                    for (self.armed_links.items) |link| {
+                        if (link.parent == owner and link.slot_index == e.exit and link.child == succ) {
+                            armed = true;
+                            break;
+                        }
+                    }
+                    if (!armed)
+                        @panic("replayLedger: region_bridge has no armed provenance");
+
+                    // Resolve the one persistent structural edge bound to this
+                    // committed exit. Do not trust guardExitPc or the next row as
+                    // the resume source: RegionDef owns the validated skip anchor.
+                    const prov = owner.provAt(e.exit) orelse
+                        @panic("replayLedger: region_bridge exit has no provenance");
+                    var registered: ?StructuralEdgeId = null;
+                    var defs = self.region_defs.valueIterator();
+                    while (defs.next()) |def| {
+                        for (def.members) |edge| {
+                            if (edge.anchor_proto_id != owner.anchor.proto.id or
+                                edge.anchor_pc != owner.anchor.pc or
+                                exitOrder(edge.exit, prov) != .eq)
+                                continue;
+                            if (!def.armable)
+                                @panic("replayLedger: region_bridge edge is tombstoned");
+                            if (registered != null)
+                                @panic("replayLedger: duplicate region_bridge edge");
+                            registered = edge;
+                        }
+                    }
+                    const edge = registered orelse
+                        @panic("replayLedger: region_bridge edge is not registered");
+                    if (edge.succ_anchor_proto_id != succ.anchor.proto.id or
+                        edge.succ_anchor_pc != succ.anchor.pc)
+                        @panic("replayLedger: region_bridge successor mismatches registered edge");
+
+                    // Selection sees the parent's actual committed segment (with a
+                    // synthetic minimum of one); region-profit above independently
+                    // receives structural work zero and the concrete successor.
+                    self.accountTraceRun(owner, @max(local, 1));
+                    resume_pc.* = edge.succ_anchor_pc;
                 },
                 .link_terminal => {
                     // A continuation reached its single-contract `.link` terminal.
@@ -9193,6 +9244,116 @@ test "driveBurstCore start_at_continuation: a run_continuation handover does not
     try testing.expect(inner.native == .unsupported);
     // Both inner loop-dones charged low-yield entries on the inner anchor.
     try testing.expectEqual(@as(u32, 2), state.penalty.get(.{ .proto = &proto, .pc = 7 }).?);
+}
+
+test "replayLedger A-vii-a: region_bridge validates registered cross-anchor edge and accounts selection" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity(); // traces are stack-owned
+    state.config.min_useful = 3;
+
+    // The composite guard names bytecode exit PC 14, deliberately distinct from
+    // the registered skip anchor PC 20. A successful result at 20 therefore proves
+    // replay derived its coherent cursor from RegionDef, not guardExitPc.
+    var code: [30]Instr = undefined;
+    @memset(code[0..], Instr.op0(.halt));
+    code[13] = Instr.opAx(.jmp_if_true, 0, 0);
+    const proto = Proto{ .id = 41, .code = &code, .name = "region-bridge-replay", .num_registers = 1 };
+    const guard_prov: ExitProvenance = .{ .guard = .{
+        .source_proto_id = proto.id,
+        .source_pc = 13,
+        .role = .branch_cond,
+        .operand = .a,
+        .polarity = .taken,
+    } };
+    var cont_prov = [_]ExitProvEntry{.{ .index = 3, .prov = guard_prov }};
+    var cont_instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 0, .b = 1, .ty = .int },
+        .{ .op = .guard_true, .a = 0, .aux = 14 },
+        .{ .op = .phi, .b = 2, .aux = 0 },
+        .{ .op = .link, .aux = 7 },
+    };
+    var cont: Trace = .{
+        .id = 601,
+        .anchor = .{ .proto = &proto, .pc = 29 },
+        .instrs = &cont_instrs,
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .exit_prov = &cont_prov,
+    };
+    var skip_instrs = [_]IrInstr{
+        .{ .op = .guard_int, .a = 0 },
+        .{ .op = .link, .aux = 7 },
+    };
+    var skip: Trace = .{
+        .id = 602,
+        .anchor = .{ .proto = &proto, .pc = 20 },
+        .instrs = &skip_instrs,
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    try testing.expect(nativegen.isCompositeBridgeCandidate(&cont, 3));
+    try state.cache.append(gpa, &cont);
+    try state.cache.append(gpa, &skip);
+
+    // Synthesize the otherwise-unreachable A-vii-a inputs directly: the physical
+    // backlink and the persistent registered edge. Missing, duplicate, tombstoned,
+    // or successor-mismatched variants are explicit release-@panic branches in the
+    // replay arm; this Zig stdlib has no in-process panic-expectation test helper.
+    try state.armed_links.append(gpa, .{ .parent = &cont, .slot_index = 3, .child = &skip });
+    const rid: RegionId = @enumFromInt(91);
+    try state.region_defs.put(gpa, rid, .{
+        .members = try gpa.dupe(StructuralEdgeId, &.{.{
+            .anchor_proto_id = proto.id,
+            .anchor_pc = cont.anchor.pc,
+            .exit = guard_prov,
+            .succ_anchor_proto_id = proto.id,
+            .succ_anchor_pc = skip.anchor.pc,
+        }}),
+        .member_points = try gpa.dupe(ProgramPoint, &.{}),
+        .owner = cont.anchor,
+        .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
+        .armable = true,
+    });
+
+    const entries = [_]irinterp.LedgerEntry{
+        .{ .cum = 3, .id = cont.id, .exit = 3, .reason = .normal, .kind = .region_bridge, .outcome = .normal },
+        .{ .cum = 5, .id = skip.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+    };
+    var linked_completed: usize = 0;
+    var resume_pc: u32 = 999;
+    var hops: usize = 0;
+    const dir = state.replayLedger(
+        &entries,
+        &cont,
+        7,
+        &proto,
+        &linked_completed,
+        &resume_pc,
+        &hops,
+        8,
+        .dispatcher_root,
+        false,
+    );
+
+    const result = switch (dir) {
+        .return_result => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(u32, 20), result.resume_pc);
+    try testing.expectEqual(@as(usize, 2), result.completed);
+    try testing.expectEqual(@as(u32, 20), resume_pc);
+    // local=3 is nonzero and reaches accountTraceRun(cont, 3): at N=3 it is a
+    // useful selection completion, so the owner gains exactly one hit and no
+    // low-yield penalty. The terminal skip's own local=2 remains independently low.
+    try testing.expectEqual(@as(u64, 1), cont.hit_count);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(cont.anchor));
+    try testing.expectEqual(@as(u32, 1), state.penalty.get(skip.anchor).?);
 }
 
 test "replayLedger forced yield (2c-B/2c-E): a CAP-length ledger ending .yielded replays cleanly" {

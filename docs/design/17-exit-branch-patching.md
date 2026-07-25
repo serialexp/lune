@@ -6447,10 +6447,17 @@ is that the reviewer must not apply the byte-identity oracle to A-vii-c the way
 it applied to a/b. A-vii-d then adds the actual native behaviour (arming +
 firing) under the same determinism matrix.
 
-1. **A-vii-a — replay, unreachable:** implement strict `.region_bridge` replay
-   and tests while `region_bridge_arming_enabled == false`. Gate: `just test`
-   **+ six-workload byte-identity** (still inert — replay arm is unreachable);
-   existing M1/zero-progress tests unchanged.
+1. **A-vii-a — replay, unreachable (LANDED 2026-07-25):** strict
+   `.region_bridge` replay validates the composite guard, exact `armed_links`
+   provenance, and the unique live `RegionDef` edge; it derives the coherent
+   cross-anchor cursor from the registered child anchor and sends
+   `max(local, 1)` through selection accounting. The synthetic
+   `[cont.region_bridge, skip.deopt]` guard uses increasing `cum`, a stored child
+   anchor distinct from `guardExitPc`, and proves both cursor and hit accounting.
+   Missing/duplicate/tombstoned/mismatched edges release-`@panic`.
+   `region_bridge_arming_enabled` remains false. `just test`, `-Djit-debug`, and
+   all six workload byte-identity controls are green; existing M1/zero-progress
+   tests are unchanged. **This does not complete §A8 step 7.**
 2. **A-vii-b — descriptor/validator, still unarmed:** add discovery-owned
    `S`/invariant descriptors, shared `E` query, child resolution, and rejection
    tests. The helper returns a decision but cannot publish. Gate: `just test`,

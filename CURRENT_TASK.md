@@ -1,5 +1,40 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-25 (LATEST-27) — **A-vii-a strict bridge replay LANDED, unreachable + byte-identical-inert. NEXT = A-vii-b descriptor/validator.**
+
+Replaced only `replayLedger`'s `.region_bridge` tripwire with the additive
+A-vii.3 grammar. Replay now requires a normal, non-yielded, non-final composite
+guard; resolves the next owner; proves the exact `{parent, slot, child}` backlink
+in `armed_links`; and resolves exactly one live `RegionDef.members` edge from the
+owner anchor plus committed `ExitProvenance`. Missing, duplicate, tombstoned, or
+successor-mismatched edges release-`@panic`. The coherent resume cursor comes
+from the stored child anchor, never merely `guardExitPc` or the next ledger row.
+The bridge accepts nonzero cumulative progress and sends `max(local, 1)` through
+`accountTraceRun`; its already-separate region-profit receipt remains structural
+work zero with the known successor.
+
+The synthetic replay guard constructs
+`[cont.region_bridge(cum=3), skip.deopt(cum=5)]`, the armed backlink, and an
+owned registered region edge directly. Its stored skip PC deliberately differs
+from the guard exit PC, proving the returned cursor is region-owned; `N=3`
+proves the bridge's synthesized selection completion increments the continuation
+hit exactly once while the skip's local work remains independently low-yield.
+The pinned Zig stdlib has no in-process panic-expectation helper, so the four
+release-panic negative paths are explicit in the arm and documented by the test.
+All allocations use `std.testing.allocator`; `TraceState.deinit` owns the copied
+region slices and the stack-owned trace cache is detached before teardown.
+
+Gates: `just test` green; `zig build test -Djit-debug=true` green. ReleaseFast
+tier-0 and `--trace --jit-native` both match the expected SHA-256 prefix for all
+six controls: nsieve `4053ed86223d7060`, nbody `9dcd7fa2f7e9e93e`,
+sieve_int `db55c0f98f98851b`, pi_leibniz `f57ace5316c0fd19`, grid_matmul
+`395ff5566b31eb18`, field_hash `89b64d3d25ae188f`.
+`region_bridge_arming_enabled` remains `false`; no driveChain arm site,
+descriptor/validator, gate-consumption, M1 `.deopt`, monotonic-cumulative, or
+zero-progress/terminal rule changed. §A8 step 7 remains unticked.
+
+---
+
 ## Status 2026-07-25 (LATEST-26) — **A-vi native-F2c logical-cut harness LANDED, inert + green. NEXT = A-vii (arm edge 4 + region-profit gate) per §A8 step 7.**
 
 A-vi landed in three ordered pieces. Piece 0 bumps keyframes to schema v6:
