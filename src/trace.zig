@@ -818,9 +818,18 @@ pub const RegionClassifier = struct {
     member_count: u32,
 };
 
+/// Discovery-owned arm-time proof for one bridge-capable internal region edge.
+/// The descriptor and both slot sets are canonical-sorted and owned by RegionDef.
+pub const RegionBridgeDef = struct {
+    edge: StructuralEdgeId,
+    successor: AnchorKey,
+    required_slots: []u16,
+    invariant_slots: []u16,
+};
+
 /// A discovered region definition (doc 17 §A3.1 / §A3.5). Proto/VM-lifetime: kept in
 /// `region_defs`, NEVER retirement-cleaned, cleared only on `clearCache`. Owns its
-/// `members`/`member_points` slices.
+/// `members`/`member_points`/`bridges` slices.
 pub const RegionDef = struct {
     /// The region's INTERNAL edges only (both endpoints in the SCC), canonical-sorted
     /// and deduped — the identity basis interned to the `RegionId`. Owned.
@@ -835,12 +844,48 @@ pub const RegionDef = struct {
     /// trace lifetime; both bounded by the `clearCache` epoch that frees `region_defs`).
     owner: AnchorKey,
     classifier: RegionClassifier,
+    /// Bridge-capable internal edges and their whole-cycle liveness proofs. Owned;
+    /// rebuilt on every successful discovery pass, including a same-id re-record.
+    bridges: []RegionBridgeDef = &.{},
     /// Minted `true`; flipped `false` by BOTH the A-ii def-consistency rebind
     /// tombstone (an existing `RegionId` re-bound with incompatible `member_points`,
     /// §A3.5) AND the A-iv+ gate tombstone. The classification-index build excludes
     /// `armable == false` regions.
     armable: bool,
 };
+
+fn freeRegionBridges(gpa: std.mem.Allocator, bridges: []RegionBridgeDef) void {
+    for (bridges) |b| {
+        gpa.free(b.required_slots);
+        gpa.free(b.invariant_slots);
+    }
+    gpa.free(bridges);
+}
+
+fn cloneRegionBridges(gpa: std.mem.Allocator, src: []const RegionBridgeDef) ![]RegionBridgeDef {
+    const out = try gpa.alloc(RegionBridgeDef, src.len);
+    errdefer gpa.free(out);
+    var initialized: usize = 0;
+    errdefer for (out[0..initialized]) |b| {
+        gpa.free(b.required_slots);
+        gpa.free(b.invariant_slots);
+    };
+    for (src, out) |s, *d| {
+        const required = try gpa.dupe(u16, s.required_slots);
+        const invariants = gpa.dupe(u16, s.invariant_slots) catch |err| {
+            gpa.free(required);
+            return err;
+        };
+        d.* = .{
+            .edge = s.edge,
+            .successor = s.successor,
+            .required_slots = required,
+            .invariant_slots = invariants,
+        };
+        initialized += 1;
+    }
+    return out;
+}
 
 /// Interns a canonical-sorted `[]StructuralEdgeId` SET → a stable `RegionId`
 /// (doc 17 §A3.3 / §A8-ii, A-ii.4). Hand-written (not `AutoHashMap`) because the key
@@ -932,6 +977,12 @@ fn programPointsEqual(a: []const ProgramPoint, b: []const ProgramPoint) bool {
     for (a, b) |ae, be| {
         if (ae.proto_id != be.proto_id or ae.source_pc != be.source_pc) return false;
     }
+    return true;
+}
+
+fn appendUniqueSlot(list: *std.ArrayListUnmanaged(u16), gpa: std.mem.Allocator, slot: u16) !bool {
+    for (list.items) |s| if (s == slot) return false;
+    try list.append(gpa, slot);
     return true;
 }
 
@@ -2005,6 +2056,7 @@ pub const TraceState = struct {
         while (rd_it.next()) |d| {
             self.gpa.free(d.members);
             self.gpa.free(d.member_points);
+            freeRegionBridges(self.gpa, d.bridges);
         }
         self.region_defs.deinit(self.gpa);
         self.region_intern.deinit(self.gpa);
@@ -2367,6 +2419,101 @@ pub const TraceState = struct {
             if (victim) |key| self.closeRegion(key) else break;
         }
         self.disarmAllLinks();
+    }
+
+    const RegionBridgeDecision = struct {
+        child: *Trace,
+        bridge: *const RegionBridgeDef,
+    };
+
+    fn traceInRegion(self: *const TraceState, trace_id: u32, id: RegionId) bool {
+        for (self.dest_entry_regions.get(trace_id) orelse &.{}) |candidate| {
+            if (candidate == id) return true;
+        }
+        return false;
+    }
+
+    /// Arm-only child lookup for an already-discovered bridge edge. Selection is
+    /// identical to `findTrace`: highest hit_count, stable first-on-tie, with the
+    /// additional physical-membership proof that excludes same-anchor siblings.
+    fn resolveRegionBridgeChild(
+        self: *const TraceState,
+        id: RegionId,
+        bridge: *const RegionBridgeDef,
+    ) ?*Trace {
+        var best: ?*Trace = null;
+        var best_hits: u64 = 0;
+        for (self.cache.items) |t| {
+            if (t.anchor.proto != bridge.successor.proto or t.anchor.pc != bridge.successor.pc)
+                continue;
+            if (!self.traceInRegion(t.id, id)) continue;
+            if (best == null or t.hit_count > best_hits) {
+                best = t;
+                best_hits = t.hit_count;
+            }
+        }
+        return best;
+    }
+
+    fn slotInSortedSet(slots: []const u16, wanted: u16) bool {
+        for (slots) |slot| {
+            if (slot == wanted) return true;
+            if (slot > wanted) return false;
+        }
+        return false;
+    }
+
+    /// A-vii-b's allocation-free, publish-incapable arm-time validator. It resolves
+    /// a physical member child and returns only a decision; it cannot install a
+    /// NativeLink. Any failed proof tombstones the region and globally disarms the
+    /// existing link registry through the established invalidation path.
+    fn validateRegionBridge(
+        self: *TraceState,
+        id: RegionId,
+        parent: *const Trace,
+        exit_instr: u32,
+    ) ?RegionBridgeDecision {
+        const def = self.region_defs.getPtr(id) orelse return null;
+        if (!def.armable) return null;
+        const edge = self.edge_cache.get(.{
+            .trace_id = parent.id,
+            .exit_instr = exit_instr,
+        }) orelse {
+            self.invalidateRegion(id);
+            return null;
+        };
+        var bridge: ?*const RegionBridgeDef = null;
+        for (def.bridges) |*candidate| {
+            if (candidate.edge.eql(edge)) {
+                if (bridge != null) {
+                    self.invalidateRegion(id);
+                    return null;
+                }
+                bridge = candidate;
+            }
+        }
+        const b = bridge orelse {
+            self.invalidateRegion(id);
+            return null;
+        };
+        const child = self.resolveRegionBridgeChild(id, b) orelse {
+            self.invalidateRegion(id);
+            return null;
+        };
+
+        for (b.required_slots) |slot| {
+            if (!nativegen.compositeBridgeEmitsSlot(parent, exit_instr, slot) and
+                !slotInSortedSet(b.invariant_slots, slot))
+            {
+                self.invalidateRegion(id);
+                return null;
+            }
+        }
+        if (child.inputs.len != 0) {
+            self.invalidateRegion(id);
+            return null;
+        }
+        return .{ .child = child, .bridge = b };
     }
 
     fn chooseSource(self: *TraceState, candidates: []const RegionId, ctx: RegionContext) ?RegionKey {
@@ -4501,6 +4648,7 @@ pub const TraceState = struct {
             sorted_internal: []StructuralEdgeId,
             member_points: []ProgramPoint,
             member_trace_ids: []u32,
+            bridges: []RegionBridgeDef,
             owner: AnchorKey,
             classifier: RegionClassifier,
             armable_owner: bool,
@@ -4518,6 +4666,7 @@ pub const TraceState = struct {
                 gpa.free(c.sorted_internal);
                 gpa.free(c.member_points);
                 gpa.free(c.member_trace_ids);
+                freeRegionBridges(gpa, c.bridges);
             }
             candidates.deinit(gpa);
         }
@@ -4588,7 +4737,104 @@ pub const TraceState = struct {
             const member_points = try gpa.dupe(ProgramPoint, uniq_mp.items);
             errdefer gpa.free(member_points);
 
-            // 3d. Owner predicate (round-12 finding 4): the unique SCC anchor that is
+            // 3d. Whole-cycle backward liveness.  Seed each anchor with the union of
+            // its physical member traces' entry slots, then propagate successor live-in
+            // sets backwards over every internal edge until stable. A dominating
+            // slot-bound phi defines (kills) that slot on the edge; the shared A-v E
+            // query is the one definition of that dominance fact. Thus live_in[to] is
+            // exactly successor entry_slots union values live through later cycle edges.
+            const live_in = try gpa.alloc(std.ArrayListUnmanaged(u16), nnodes);
+            defer {
+                for (live_in) |*set| set.deinit(gpa);
+                gpa.free(live_in);
+            }
+            for (live_in) |*set| set.* = .empty;
+            for (member_trace_ids) |tid| {
+                const t = self.traceById(tid) orelse continue;
+                const ni = node_index.get(.{ .proto_id = t.anchor.proto.id, .pc = t.anchor.pc }) orelse
+                    return error.RegionGraphInconsistent;
+                for (t.entry_slots) |slot| _ = try appendUniqueSlot(&live_in[ni], gpa, slot);
+            }
+            var changed = true;
+            while (changed) {
+                changed = false;
+                for (edges.items) |e| {
+                    if (comp[e.from] != c or comp[e.to] != c) continue;
+                    const parent = self.traceById(e.key.trace_id) orelse continue;
+                    for (live_in[e.to].items) |slot| {
+                        if (nativegen.compositeBridgeEmitsSlot(parent, e.key.exit_instr, slot)) continue;
+                        if (try appendUniqueSlot(&live_in[e.from], gpa, slot)) changed = true;
+                    }
+                }
+            }
+            for (live_in) |*set| std.mem.sort(u16, set.items, {}, std.sort.asc(u16));
+
+            // Retain one canonical descriptor per bridge-capable structural edge.
+            // `required_slots` is the successor fixed-point set. A required slot is
+            // edge-invariant iff no realization of this structural edge emits it.
+            var bridge_list: std.ArrayListUnmanaged(RegionBridgeDef) = .empty;
+            defer bridge_list.deinit(gpa);
+            errdefer for (bridge_list.items) |b| {
+                gpa.free(b.required_slots);
+                gpa.free(b.invariant_slots);
+            };
+            for (edges.items) |e| {
+                if (comp[e.from] != c or comp[e.to] != c) continue;
+                const parent = self.traceById(e.key.trace_id) orelse continue;
+                if (!nativegen.isCompositeBridgeCandidate(parent, e.key.exit_instr)) continue;
+
+                var existing: ?*RegionBridgeDef = null;
+                for (bridge_list.items) |*b| {
+                    if (b.edge.eql(e.eid)) {
+                        existing = b;
+                        break;
+                    }
+                }
+                if (existing) |b| {
+                    // Multiple physical realizations of one logical edge: retain only
+                    // invariants proven unchanged by every realization.
+                    var common: std.ArrayListUnmanaged(u16) = .empty;
+                    defer common.deinit(gpa);
+                    for (b.invariant_slots) |slot| {
+                        if (!nativegen.compositeBridgeEmitsSlot(parent, e.key.exit_instr, slot))
+                            try common.append(gpa, slot);
+                    }
+                    const replacement = try gpa.dupe(u16, common.items);
+                    gpa.free(b.invariant_slots);
+                    b.invariant_slots = replacement;
+                    continue;
+                }
+
+                const required = try gpa.dupe(u16, live_in[e.to].items);
+                errdefer gpa.free(required);
+                var inv_list: std.ArrayListUnmanaged(u16) = .empty;
+                defer inv_list.deinit(gpa);
+                for (required) |slot| {
+                    if (!nativegen.compositeBridgeEmitsSlot(parent, e.key.exit_instr, slot))
+                        try inv_list.append(gpa, slot);
+                }
+                const invariants = try gpa.dupe(u16, inv_list.items);
+                errdefer gpa.free(invariants);
+                const succ_node = nodes.items[e.to];
+                const succ_proto = proto_by_id.get(succ_node.proto_id) orelse
+                    return error.RegionGraphInconsistent;
+                try bridge_list.append(gpa, .{
+                    .edge = e.eid,
+                    .successor = .{ .proto = succ_proto, .pc = succ_node.pc },
+                    .required_slots = required,
+                    .invariant_slots = invariants,
+                });
+            }
+            std.mem.sort(RegionBridgeDef, bridge_list.items, {}, struct {
+                fn less(_: void, a: RegionBridgeDef, b: RegionBridgeDef) bool {
+                    return a.edge.order(b.edge) == .lt;
+                }
+            }.less);
+            const bridges = try gpa.dupe(RegionBridgeDef, bridge_list.items);
+            bridge_list.clearRetainingCapacity();
+            errdefer freeRegionBridges(gpa, bridges);
+
+            // 3e. Owner predicate (round-12 finding 4): the unique SCC anchor that is
             // both external-entry (dest of an incoming boundary edge) AND loop-root
             // (a bound trace of inner-root shape); else a deterministic placeholder +
             // armable=false.
@@ -4622,6 +4868,7 @@ pub const TraceState = struct {
                 .sorted_internal = sorted_internal,
                 .member_points = member_points,
                 .member_trace_ids = member_trace_ids,
+                .bridges = bridges,
                 .owner = owner,
                 .classifier = .{
                     .kind = if (comp_size[c] == 1) .self_loop else .cross_trace_cycle,
@@ -4665,8 +4912,15 @@ pub const TraceState = struct {
             for (staged_defs.items) |s| {
                 gpa.free(s.def.members);
                 gpa.free(s.def.member_points);
+                freeRegionBridges(gpa, s.def.bridges);
             }
             staged_defs.deinit(gpa);
+        }
+        const StagedBridgeUpdate = struct { id: RegionId, bridges: []RegionBridgeDef };
+        var staged_bridge_updates: std.ArrayListUnmanaged(StagedBridgeUpdate) = .empty;
+        defer {
+            for (staged_bridge_updates.items) |s| freeRegionBridges(gpa, s.bridges);
+            staged_bridge_updates.deinit(gpa);
         }
         var staged_tombstones: std.ArrayListUnmanaged(RegionId) = .empty;
         defer staged_tombstones.deinit(gpa);
@@ -4682,6 +4936,7 @@ pub const TraceState = struct {
         try staged_defs.ensureUnusedCapacity(gpa, candidates.items.len);
         try staged_tombstones.ensureUnusedCapacity(gpa, candidates.items.len);
         try staged_owner_updates.ensureUnusedCapacity(gpa, candidates.items.len);
+        try staged_bridge_updates.ensureUnusedCapacity(gpa, candidates.items.len);
         try active_regions.ensureUnusedCapacity(gpa, candidates.items.len);
 
         var new_id_counter: u64 = self.next_region_id;
@@ -4708,6 +4963,8 @@ pub const TraceState = struct {
                 // to a different anchor with the internal edge set (hence the id) unchanged,
                 // so the arm site must track the current owner, not the first-sight one.
                 staged_owner_updates.appendAssumeCapacity(.{ .id = existing_id, .owner = cand.owner });
+                const bridge_copy = try cloneRegionBridges(gpa, cand.bridges);
+                staged_bridge_updates.appendAssumeCapacity(.{ .id = existing_id, .bridges = bridge_copy });
                 const mt_copy = try gpa.dupe(u32, cand.member_trace_ids);
                 active_regions.appendAssumeCapacity(.{ .id = existing_id, .comp = cand.comp, .armable = eff_armable, .member_trace_ids = mt_copy });
             } else {
@@ -4721,6 +4978,8 @@ pub const TraceState = struct {
                 errdefer gpa.free(members_copy);
                 const points_copy = try gpa.dupe(ProgramPoint, cand.member_points);
                 errdefer gpa.free(points_copy);
+                const bridge_copy = try cloneRegionBridges(gpa, cand.bridges);
+                errdefer freeRegionBridges(gpa, bridge_copy);
                 const mt_copy = try gpa.dupe(u32, cand.member_trace_ids);
                 errdefer gpa.free(mt_copy);
                 staged_interns.appendAssumeCapacity(.{ .edges = edges_copy, .id = new_id });
@@ -4729,6 +4988,7 @@ pub const TraceState = struct {
                     .member_points = points_copy,
                     .owner = cand.owner,
                     .classifier = cand.classifier,
+                    .bridges = bridge_copy,
                     .armable = first_armable,
                 } });
                 active_regions.appendAssumeCapacity(.{ .id = new_id, .comp = cand.comp, .armable = first_armable, .member_trace_ids = mt_copy });
@@ -4789,6 +5049,13 @@ pub const TraceState = struct {
         for (staged_owner_updates.items) |u| {
             if (self.region_defs.getPtr(u.id)) |d| d.owner = u.owner;
         }
+        for (staged_bridge_updates.items) |u| {
+            if (self.region_defs.getPtr(u.id)) |d| {
+                freeRegionBridges(gpa, d.bridges);
+                d.bridges = u.bridges;
+            }
+        }
+        staged_bridge_updates.clearRetainingCapacity();
         for (staged_tombstones.items) |id| {
             if (self.region_defs.getPtr(id)) |d| d.armable = false;
         }
@@ -5160,6 +5427,7 @@ pub const TraceState = struct {
         while (rd_it.next()) |d| {
             self.gpa.free(d.members);
             self.gpa.free(d.member_points);
+            freeRegionBridges(self.gpa, d.bridges);
         }
         self.region_defs.clearRetainingCapacity();
         self.region_intern.clear(self.gpa);
@@ -10552,6 +10820,153 @@ test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) r
     try testing.expect(state.region_defs.get(rid1) != null);
 
     while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
+}
+
+test "A-vii-b discovered bridge descriptor validates inertly and rejects incomplete proofs or seeded children" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    var code: [41]Instr = undefined;
+    for (&code) |*ins| ins.* = Instr.op0(.ret);
+    code[13] = Instr.opAx(.jmp_if_true, 0, 0);
+    code[28] = Instr.opAx(.jmp_if_true, 0, 0);
+    code[39] = Instr.opAx(.jmp_if_true, 0, 0);
+    const proto = Proto{ .code = &code, .id = 77, .name = "a-vii-b", .num_registers = 4 };
+
+    // cont@29 --composite--> skip@14 --ordinary--> cont@29.  skip's direct
+    // entry set is {r0,r1}; cont additionally needs r2, so the cycle fixed point
+    // makes the bridge descriptor S={r0,r1,r2}. E={r0}, invariants={r1,r2}.
+    var cont_i = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .slot_load, .aux = 2 },
+        .{ .op = .guard_true, .a = 0, .aux = 14 },
+        .{ .op = .phi, .b = 0, .aux = 0 },
+        .{ .op = .loop },
+    };
+    var cont_p = [_]ExitProvEntry{.{ .index = 3, .prov = .{ .guard = .{
+        .source_proto_id = proto.id,
+        .source_pc = 13,
+        .role = .branch_cond,
+        .operand = .a,
+        .polarity = .taken,
+    } } }};
+    const parent_slots = try gpa.alloc(usize, cont_i.len);
+    defer gpa.free(parent_slots);
+    @memset(parent_slots, 0); // no trampoline in this unit test: shared_exit == 0
+    var cont: Trace = .{
+        .id = 1,
+        .anchor = .{ .proto = &proto, .pc = 29 },
+        .instrs = &cont_i,
+        .consts = &.{},
+        .entry_slots = @constCast(&[_]u16{2}),
+        .entry_guards = &.{},
+        .exit_prov = &cont_p,
+        .native = .{ .compiled = .{ .page = undefined, .slots = parent_slots, .gpa = gpa } },
+    };
+
+    var skip_i = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_true, .a = 0, .aux = 29 },
+        .{ .op = .loop },
+    };
+    var skip_p = [_]ExitProvEntry{.{ .index = 2, .prov = .{ .guard = .{
+        .source_proto_id = proto.id,
+        .source_pc = 28,
+        .role = .branch_cond,
+        .operand = .a,
+        .polarity = .taken,
+    } } }};
+    var skip: Trace = .{
+        .id = 2,
+        .anchor = .{ .proto = &proto, .pc = 14 },
+        .instrs = &skip_i,
+        .consts = &.{},
+        .entry_slots = @constCast(&[_]u16{ 0, 1 }),
+        .entry_guards = &.{},
+        .exit_prov = &skip_p,
+        .hit_count = 9,
+    };
+    // Same-anchor decoy has a higher hit count but is not a physical region member.
+    var sibling: Trace = .{
+        .id = 3,
+        .anchor = skip.anchor,
+        .instrs = &skip_i,
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .hit_count = 100,
+    };
+    var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+    var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .guard = .{
+        .source_proto_id = proto.id,
+        .source_pc = 39,
+        .role = .branch_cond,
+        .operand = .a,
+        .polarity = .taken,
+    } } }};
+    var ext: Trace = .{
+        .id = 4,
+        .anchor = .{ .proto = &proto, .pc = 40 },
+        .instrs = &ext_i,
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .exit_prov = &ext_p,
+    };
+    for ([_]*Trace{ &cont, &skip, &sibling, &ext }) |t| try state.cache.append(gpa, t);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    var ids = state.region_defs.keyIterator();
+    const rid = ids.next().?.*;
+    var def = state.region_defs.getPtr(rid).?;
+    try testing.expect(def.armable);
+    try testing.expectEqual(@as(usize, 1), def.bridges.len);
+    try testing.expectEqualSlices(u16, &.{ 0, 1, 2 }, def.bridges[0].required_slots);
+    try testing.expectEqualSlices(u16, &.{ 1, 2 }, def.bridges[0].invariant_slots);
+
+    const decision = state.validateRegionBridge(rid, &cont, 3) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(decision.child == &skip); // member filter defeats higher-hit sibling
+    try testing.expect(def.armable);
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), parent_slots[3]);
+
+    // Re-discovery with fresh physical ids must replace, not retain, descriptor
+    // storage. Corrupt the old proof first; the rebuilt same logical RegionId restores it.
+    def.bridges[0].invariant_slots[1] = 99;
+    cont.id = 11;
+    skip.id = 12;
+    sibling.id = 13;
+    ext.id = 14;
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    def = state.region_defs.getPtr(rid).?;
+    try testing.expectEqualSlices(u16, &.{ 1, 2 }, def.bridges[0].invariant_slots);
+    try testing.expect(state.dest_entry_regions.get(skip.id) != null);
+
+    // Rejection A: S still contains live-through r2, but neither E nor the
+    // (deliberately damaged) invariant proof contains it.
+    def.bridges[0].invariant_slots[1] = 99;
+    try testing.expect(state.validateRegionBridge(rid, &cont, 3) == null);
+    try testing.expect(!def.armable);
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), parent_slots[3]);
+
+    // Rejection B is independent of S/E: restore the discovered proof/armable bit,
+    // then make the selected physical child require dispatcher input seeding.
+    def.armable = true;
+    def.bridges[0].invariant_slots[1] = 2;
+    skip.inputs = @constCast(&[_]InputSeed{undefined});
+    try testing.expect(state.validateRegionBridge(rid, &cont, 3) == null);
+    try testing.expect(!def.armable);
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), parent_slots[3]);
 }
 
 test "A-ii.4 intern identity is the edge SET (distinct sets → distinct ids; identical set → same id)" {

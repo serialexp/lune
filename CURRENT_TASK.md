@@ -1,5 +1,48 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-25 (LATEST-28) — **A-vii-b descriptor/validator LANDED, unarmed + byte-identical-inert. NEXT = A-vii-c gate-consumption flip.**
+
+`RegionDef` now owns canonical-sorted per-bridge descriptors containing the exact
+`StructuralEdgeId`, successor `AnchorKey`, `required_slots = S`, and proven
+edge-invariant slots. Discovery computes `S` by a backward-liveness fixed point
+over the entire SCC: each anchor starts with the union of its physical member
+traces' `entry_slots`; successor live-ins propagate backward over every internal
+edge until stable, with a dominance-safe slot phi defining the slot on that
+edge. A bridge therefore retains its successor entry slots plus values that stay
+live through later region edges, rather than approximating `S` from child
+inputs. All descriptor and nested slot slices are allocator-owned, staged before
+infallible publish, replaced on same-`RegionId` re-record, and freed from staged
+rollback, `TraceState.deinit`, and `clearCache`.
+
+`nativegen.compositeBridgeEmissions` is the sole immutable-IR query for A-v's
+emitted set `E` (slot-bound phi, non-internal, `p.b < exit_instr`).
+`emitCompositeBridgeSnapshot` and the arm-time `compositeBridgeEmitsSlot`
+predicate both consume that query. The new resolver preserves existing stable
+highest-`hit_count` selection while requiring the physical child to be listed
+for the same `RegionId` in `dest_entry_regions`, excluding same-anchor siblings.
+`validateRegionBridge` is allocation-free and publish-incapable: it resolves the
+stored exact edge, proves every `S` slot is in `E ∪ invariants`, independently
+requires `child.inputs.len == 0`, and returns only `{child, bridge}`. Failure
+uses `invalidateRegion`; success and failure install no `NativeLink`.
+
+The focused discovered-cycle test proves `S={r0,r1,r2}` from child
+`entry_slots={r0,r1}` plus live-through `r2`, `E={r0}`, and
+`invariants={r1,r2}`. It covers the positive decision, higher-hit non-member
+sibling exclusion, missing-live-through-proof tombstoning, seeded-child
+tombstoning, same-logical-region descriptor replacement after fresh physical
+trace IDs, owned-slice leak checking, zero `armed_links`, and the parent slot
+remaining `shared_exit`.
+
+Gates: `just test` green; `zig build test -Djit-debug=true` green. ReleaseFast
+tier-0 and `--trace --jit-native` both match all expected SHA-256 prefixes:
+nsieve `4053ed86223d7060`, nbody `9dcd7fa2f7e9e93e`, sieve_int
+`db55c0f98f98851b`, pi_leibniz `f57ace5316c0fd19`, grid_matmul
+`395ff5566b31eb18`, field_hash `89b64d3d25ae188f`.
+`region_bridge_arming_enabled` remains `false`; there is no `driveChain` caller,
+no `.region_bridge` publish path, and §A8 step 7 remains unticked.
+
+---
+
 ## Status 2026-07-25 (LATEST-27) — **A-vii-a strict bridge replay LANDED, unreachable + byte-identical-inert. NEXT = A-vii-b descriptor/validator.**
 
 Replaced only `replayLedger`'s `.region_bridge` tripwire with the additive
