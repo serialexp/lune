@@ -2337,7 +2337,7 @@ export class OpenUpvalueRefDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * One active call frame, with the execution cursor needed to RESUME it mid-execution (F2c): the executing closure's id, the resumable program counter, the register-window base on the shared stack, and the return-wiring (where this frame's results land in its parent, and how many the parent wants). Windows stack contiguously: frames[i+1].base == frames[i].base + frames[i].closure.proto.num_registers. The bottom (main) frame leaves ret_dest/ret_count unused.
+ * One active call frame, with the execution cursor needed to RESUME it mid-execution (F2c): the executing closure's id, the resumable program counter, the register-window base on the shared stack, the return-wiring (where this frame's results land in its parent, and how many the parent wants), and the live vararg cursor. Windows stack contiguously: frames[i+1].base == frames[i].base + frames[i].closure.proto.num_registers. A non-empty vararg range lies below its frame base inside the live stack prefix; an empty range is encoded as base/count zero. The bottom (main) frame leaves ret_dest/ret_count unused.
  */
 export interface FrameRefInput {
   /**
@@ -2365,10 +2365,20 @@ export interface FrameRefInput {
    * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
    */
   ret_count: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  varargs_base: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  varargs_count: number;
 }
 
 /**
- * One active call frame, with the execution cursor needed to RESUME it mid-execution (F2c): the executing closure's id, the resumable program counter, the register-window base on the shared stack, and the return-wiring (where this frame's results land in its parent, and how many the parent wants). Windows stack contiguously: frames[i+1].base == frames[i].base + frames[i].closure.proto.num_registers. The bottom (main) frame leaves ret_dest/ret_count unused.
+ * One active call frame, with the execution cursor needed to RESUME it mid-execution (F2c): the executing closure's id, the resumable program counter, the register-window base on the shared stack, the return-wiring (where this frame's results land in its parent, and how many the parent wants), and the live vararg cursor. Windows stack contiguously: frames[i+1].base == frames[i].base + frames[i].closure.proto.num_registers. A non-empty vararg range lies below its frame base inside the live stack prefix; an empty range is encoded as base/count zero. The bottom (main) frame leaves ret_dest/ret_count unused.
  */
 export interface FrameRefOutput {
   /**
@@ -2396,6 +2406,16 @@ export interface FrameRefOutput {
    * Fixed-width 16-bit unsigned integer (0-65535). Respects endianness configuration (big-endian or little-endian).
    */
   ret_count: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  varargs_base: number;
+  /**
+   * 32-bit Unsigned Integer
+   * Fixed-width 32-bit unsigned integer (0-4294967295). Respects endianness configuration.
+   */
+  varargs_count: number;
 }
 
 export type FrameRef = FrameRefOutput;
@@ -2416,6 +2436,8 @@ export class FrameRefEncoder extends BitStreamEncoder {
     this.writeUint32(value.base, "little_endian");
     this.writeUint16(value.ret_dest, "little_endian");
     this.writeUint16(value.ret_count, "little_endian");
+    this.writeUint32(value.varargs_base, "little_endian");
+    this.writeUint32(value.varargs_count, "little_endian");
     return this.finish();
   }
 
@@ -2424,7 +2446,7 @@ export class FrameRefEncoder extends BitStreamEncoder {
    * Used for from_after_field computed lengths and buffer pre-allocation.
    */
   calculateSize(value: FrameRef): number {
-    return 16; // closure_id + pc + base + ret_dest + ret_count
+    return 24; // closure_id + pc + base + ret_dest + ret_count + varargs_base + varargs_count
   }
 }
 
@@ -2442,6 +2464,8 @@ export class FrameRefDecoder extends SeekableBitStreamDecoder {
     value.base = this.readUint32("little_endian");
     value.ret_dest = this.readUint16("little_endian");
     value.ret_count = this.readUint16("little_endian");
+    value.varargs_base = this.readUint32("little_endian");
+    value.varargs_count = this.readUint32("little_endian");
     return value;
   }
 }
@@ -2897,6 +2921,8 @@ export class KeyframeDecoder extends SeekableBitStreamDecoder {
       frames__iter.base = this.readUint32("little_endian");
       frames__iter.ret_dest = this.readUint16("little_endian");
       frames__iter.ret_count = this.readUint16("little_endian");
+      frames__iter.varargs_base = this.readUint32("little_endian");
+      frames__iter.varargs_count = this.readUint32("little_endian");
       value.frames.push(frames__iter);
     }
     value.open_upvalues = [];
@@ -3104,6 +3130,8 @@ export class SnapshotFileDecoder extends SeekableBitStreamDecoder {
       keyframe_frames__iter.base = this.readUint32("little_endian");
       keyframe_frames__iter.ret_dest = this.readUint16("little_endian");
       keyframe_frames__iter.ret_count = this.readUint16("little_endian");
+      keyframe_frames__iter.varargs_base = this.readUint32("little_endian");
+      keyframe_frames__iter.varargs_count = this.readUint32("little_endian");
       value.keyframe.frames.push(keyframe_frames__iter);
     }
     value.keyframe.open_upvalues = [];

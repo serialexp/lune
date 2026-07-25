@@ -161,13 +161,15 @@
     },
 
     "FrameRef": {
-      "description": "One active call frame, with the execution cursor needed to RESUME it mid-execution (F2c): the executing closure's id, the resumable program counter, the register-window base on the shared stack, and the return-wiring (where this frame's results land in its parent, and how many the parent wants). Windows stack contiguously: frames[i+1].base == frames[i].base + frames[i].closure.proto.num_registers. The bottom (main) frame leaves ret_dest/ret_count unused.",
+      "description": "One active call frame, with the execution cursor needed to RESUME it mid-execution (F2c): the executing closure's id, the resumable program counter, the register-window base on the shared stack, the return-wiring (where this frame's results land in its parent, and how many the parent wants), and the live vararg cursor. Windows stack contiguously: frames[i+1].base == frames[i].base + frames[i].closure.proto.num_registers. A non-empty vararg range lies below its frame base inside the live stack prefix; an empty range is encoded as base/count zero. The bottom (main) frame leaves ret_dest/ret_count unused.",
       "sequence": [
-        { "name": "closure_id", "type": "uint32" },
-        { "name": "pc",         "type": "uint32" },
-        { "name": "base",       "type": "uint32" },
-        { "name": "ret_dest",   "type": "uint16" },
-        { "name": "ret_count",  "type": "uint16" }
+        { "name": "closure_id",   "type": "uint32" },
+        { "name": "pc",           "type": "uint32" },
+        { "name": "base",         "type": "uint32" },
+        { "name": "ret_dest",     "type": "uint16" },
+        { "name": "ret_count",    "type": "uint16" },
+        { "name": "varargs_base", "type": "uint32" },
+        { "name": "varargs_count","type": "uint32" }
       ]
     },
 

@@ -62,7 +62,10 @@ pub const schema = @import("gen/trace_schema.zig");
 /// pre-cut garbage (an object allocated then dropped before the cut bumps the
 /// counter but leaves no `objects` entry, so reconstructing it as max(id)+1 drifts
 /// it low and diverges subsequent ids, which are observable via table/pairs order).
-pub const snapshot_format_version: u32 = 5;
+/// v6 (A-vi foundation): `FrameRef` gained the live vararg cursor
+/// (`varargs_base`/`varargs_count`), making a keyframe captured inside an active
+/// vararg callee semantically complete.
+pub const snapshot_format_version: u32 = 6;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -293,6 +296,8 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
         .base = @intCast(f.base),
         .ret_dest = f.ret_dest,
         .ret_count = f.ret_count,
+        .varargs_base = @intCast(f.varargs_base),
+        .varargs_count = @intCast(f.varargs_count),
     };
 
     const open = try a.alloc(schema.OpenUpvalueRef, vm.open_upvalues.items.len);
@@ -369,6 +374,7 @@ const RestoreError = error{
     MetatableNotATable, // a HeapTable.metatable_id resolves to a non-table object
     FrameNotAClosure, // a frame's closure_id resolves to a non-closure
     FrameWindowMismatch, // a frame's base != the running sum of prior register windows
+    InvalidFrameVarargs, // a frame's vararg cursor is non-canonical or outside its live prefix
     UpvalueNotAnUpvalue, // a closure/open-upvalue id resolves to a non-upvalue
     StackTooLarge, // the snapshot stack exceeds the VM's register window
     TooManyFrames, // the snapshot frame count exceeds max_call_depth
@@ -711,22 +717,35 @@ pub fn restoreSnapshot(
         // running sum of prior frames' register counts is a corrupt/incompatible
         // snapshot (and would make resume read the wrong registers).
         if (fr.base != expected_base) return error.FrameWindowMismatch;
-        vm.frames[i] = .{
-            .closure = cl,
-            // `call_seq` is transient JIT-tiering state, not a wire field. Re-key
-            // the restored live stack deterministically by physical frame order.
-            .call_seq = @intCast(i),
-            .base = fr.base,
-            .pc = fr.pc,
-            .ret_dest = fr.ret_dest,
-            .ret_count = fr.ret_count,
-        };
+        if (fr.varargs_count == 0) {
+            if (fr.varargs_base != 0) return error.InvalidFrameVarargs;
+        } else {
+            if (!cl.proto.is_vararg) return error.InvalidFrameVarargs;
+            const varargs_end = std.math.add(u32, fr.varargs_base, fr.varargs_count) catch
+                return error.InvalidFrameVarargs;
+            if (varargs_end > fr.base or varargs_end > kf.stack.len)
+                return error.InvalidFrameVarargs;
+        }
+        // Restore through the same physical-frame choke point as live calls, so
+        // the vararg cursor, stack window, call_seq, and region context cannot
+        // drift from normal frame construction. Only the resumable pc is a
+        // restore-specific overwrite.
+        vm.pushFrameVararg(
+            cl,
+            fr.base,
+            fr.ret_dest,
+            fr.ret_count,
+            fr.varargs_base,
+            fr.varargs_count,
+        ) catch return error.TooManyFrames;
+        vm.frames[i].pc = fr.pc;
         expected_base += cl.proto.num_registers;
     }
-    vm.depth = @intCast(kf.frames.len);
-    // Park the next key strictly above the restored live range. A later physical
-    // push goes through `pushFrameVararg`, including its checked-exhaustion guard.
-    vm.next_call_seq = @intCast(vm.depth);
+    // `pushFrameVararg` raises this to each physical window end. The serialized
+    // live prefix may additionally contain caller-owned argument/vararg slots
+    // (and structural test snapshots can use zero-register frames), so restore
+    // the authoritative captured top after all frame pushes.
+    vm.stack_top = kf.stack.len;
 
     for (kf.open_upvalues) |ou| {
         const uh = idmap.get(ou.upvalue_id) orelse return error.UnresolvedHeapRef;
@@ -822,8 +841,8 @@ test "hand-built snapshot edge corpus round-trips byte-exact" {
             },
             .stack = &.{ sRef(2), sInt(-1) },
             .frames = &.{
-                .{ .closure_id = 3, .pc = 7, .base = 0, .ret_dest = 0, .ret_count = 0 },
-                .{ .closure_id = 6, .pc = 2, .base = 5, .ret_dest = 1, .ret_count = 1 },
+                .{ .closure_id = 3, .pc = 7, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
+                .{ .closure_id = 6, .pc = 2, .base = 5, .ret_dest = 1, .ret_count = 1, .varargs_base = 0, .varargs_count = 0 },
             },
             .open_upvalues = &.{.{ .stack_index = 0, .upvalue_id = 5 }},
             .loaded_chunks = &.{},
@@ -1792,8 +1811,8 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
             // Both stub protos have num_registers == 0, so contiguity wants base 0
             // for both frames (this corpus exercises structural restore, not resume).
             .frames = &.{
-                .{ .closure_id = 3, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0 },
-                .{ .closure_id = 6, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0 },
+                .{ .closure_id = 3, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
+                .{ .closure_id = 6, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
             },
             .open_upvalues = &.{.{ .stack_index = 0, .upvalue_id = 5 }},
             .loaded_chunks = &.{},
@@ -2299,6 +2318,35 @@ test "F2c: independent VMs suspended at the same cut produce byte-identical keyf
     }
 }
 
+test "F2c: live vararg frame cursor round-trips through a keyframe" {
+    const gpa = testing.allocator;
+    const source =
+        \\local function consume(head, ...)
+        \\  local n = 0
+        \\  while n < 20 do n = n + 1 end
+        \\  return head + ... + select(2, ...)
+        \\end
+        \\print(consume(10, 20, 30, 40))
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+
+    const mid = try expectResume(gpa, source, .{
+        .min_depth = 2,
+        .after_safepoints = 1,
+    }, ref);
+    defer gpa.free(mid);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const decoded = try schema.SnapshotFile.decode(arena.allocator(), mid);
+    try testing.expect(decoded.keyframe.frames.len >= 2);
+    const live = decoded.keyframe.frames[decoded.keyframe.frames.len - 1];
+    try testing.expectEqual(@as(u32, 3), live.varargs_count);
+    try testing.expect(live.varargs_base > 0);
+    try testing.expect(live.varargs_base + live.varargs_count <= live.base);
+}
+
 test "A-iii: recursive live frames re-key deterministically across keyframe restore and re-record" {
     const gpa = testing.allocator;
     const source =
@@ -2408,8 +2456,8 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
         },
         .stack = &.{ sNil(), sNil(), sNil() },
         .frames = &.{
-            .{ .closure_id = 0, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0 },
-            .{ .closure_id = 1, .pc = 0, .base = 2, .ret_dest = 0, .ret_count = 0 }, // gap: expected base 1
+            .{ .closure_id = 0, .pc = 0, .base = 0, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 },
+            .{ .closure_id = 1, .pc = 0, .base = 2, .ret_dest = 0, .ret_count = 0, .varargs_base = 0, .varargs_count = 0 }, // gap: expected base 1
         },
         .open_upvalues = &.{},
         .loaded_chunks = &.{},
@@ -2551,6 +2599,203 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
     try testing.expectEqualStrings(ref.out, combined[0 .. out_before.len + sink_r.buffered().len]);
     // The whole log was consumed exactly once across the cut (no effect lost or replayed twice).
     try testing.expectEqual(ref.log.len, vm_r.effect_cursor);
+}
+
+const NativeF2cCut = struct {
+    keyframe: []u8,
+    effects: []u8,
+    output_prefix: []u8,
+    rng_state: [4]u64,
+    effect_cursor: usize,
+    committed_effect_seq: u64,
+    traced_iters: u64,
+    compiled_native_traces: usize,
+
+    fn deinit(self: NativeF2cCut, gpa: std.mem.Allocator) void {
+        gpa.free(self.keyframe);
+        gpa.free(self.effects);
+        gpa.free(self.output_prefix);
+    }
+};
+
+/// Capture the first snapshot-eligible tier-0 boundary at/after the first
+/// committed effect. With `native=true`, the numeric-for immediately before the
+/// effect must have executed as native code; the effect is a host barrier, so the
+/// cut itself remains a coherent tier-0 boundary.
+fn captureNativeF2cCut(gpa: std.mem.Allocator, source: [:0]const u8, native: bool) !NativeF2cCut {
+    const effectser = @import("effectser.zig");
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var out_buf: [512]u8 = undefined;
+    var sink = io.Writer.fixed(&out_buf);
+    vm.out = &sink;
+    vm.effect_mode = .record;
+    var clock = TestClock{ .next = 1000 };
+    vm.clock_source = clock.source();
+    vm.trace.config.enabled = native;
+    vm.trace.config.execute = native;
+    vm.trace.config.optimize = native;
+    vm.trace.config.native_codegen = native;
+    vm.trace.config.coverage = native;
+    vm.trace.config.hotloop = 4;
+    vm.suspend_ctl = .{
+        .min_depth = 2,
+        .after_safepoints = 0,
+        .after_committed_effects = 1,
+    };
+
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    try testing.expect((try vm.start(chunk.proto)) == .suspended);
+    try testing.expectEqual(@as(u64, 1), vm.committed_effect_seq);
+    try testing.expect(vm.rng != null);
+
+    var compiled_native_traces: usize = 0;
+    for (vm.trace.cache.items) |tr| if (tr.native == .compiled) {
+        compiled_native_traces += 1;
+    };
+    return .{
+        .keyframe = try encodeSnapshot(gpa, &vm),
+        .effects = try effectser.encodeFile(gpa, vm.effect_log.items),
+        .output_prefix = try gpa.dupe(u8, sink.buffered()),
+        .rng_state = vm.rng.?.s,
+        .effect_cursor = vm.effect_cursor,
+        .committed_effect_seq = vm.committed_effect_seq,
+        .traced_iters = vm.trace.iters_traced,
+        .compiled_native_traces = compiled_native_traces,
+    };
+}
+
+test "A-vi F-5: native post-burst effect cut has full-state identity and resumes from an empty trace cache" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const effectser = @import("effectser.zig");
+    // The expression creates numeric-for temporaries above the locals watermark.
+    // They used to be omitted from the exit snapshot, leaving stale physical
+    // registers after native execution; byte-identical keyframes make that bug
+    // observable at the post-native-burst effect cut.
+    const source: [:0]const u8 =
+        \\local function work()
+        \\  math.randomseed(123456)
+        \\  local before = math.random()
+        \\  local acc = 0
+        \\  for i = 1, 400 do
+        \\    acc = acc + ((i + 1) * (i + 2) + (i + 3) * (i + 4))
+        \\      * ((i + 5) * (i + 6) + (i + 7) * (i + 8))
+        \\  end
+        \\  local t = os.clock()
+        \\  local after = math.random()
+        \\  print(acc, before, after, t)
+        \\end
+        \\work()
+    ;
+
+    const tier0 = try captureNativeF2cCut(gpa, source, false);
+    defer tier0.deinit(gpa);
+    const native = try captureNativeF2cCut(gpa, source, true);
+    defer native.deinit(gpa);
+    try testing.expect(native.traced_iters > 0); // genuine native burst before cut
+    try testing.expect(native.compiled_native_traces > 0);
+
+    // F-5 full-state oracle: semantic keyframe plus every replay-driver facet the
+    // keyframe deliberately omits. No coarse counter-only shortcut is accepted.
+    try testing.expectEqualSlices(u8, tier0.keyframe, native.keyframe);
+    try testing.expectEqualSlices(u8, tier0.effects, native.effects);
+    try testing.expectEqualStrings(tier0.output_prefix, native.output_prefix);
+    try testing.expectEqualSlices(u64, &tier0.rng_state, &native.rng_state);
+    try testing.expectEqual(tier0.effect_cursor, native.effect_cursor);
+    try testing.expectEqual(tier0.committed_effect_seq, native.committed_effect_seq);
+
+    // Recreate the native cut with its program image kept alive, then restore into
+    // a fresh VM. The restored trace cache is empty; replay-driver state is
+    // reattached explicitly before execution continues.
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var cut_vm = try Vm.init(gpa);
+    defer cut_vm.deinit();
+    var cut_out_buf: [512]u8 = undefined;
+    var cut_sink = io.Writer.fixed(&cut_out_buf);
+    cut_vm.out = &cut_sink;
+    cut_vm.effect_mode = .record;
+    var cut_clock = TestClock{ .next = 1000 };
+    cut_vm.clock_source = cut_clock.source();
+    cut_vm.trace.config.enabled = true;
+    cut_vm.trace.config.execute = true;
+    cut_vm.trace.config.optimize = true;
+    cut_vm.trace.config.native_codegen = true;
+    cut_vm.trace.config.coverage = true;
+    cut_vm.trace.config.hotloop = 4;
+    cut_vm.suspend_ctl = .{ .min_depth = 2, .after_committed_effects = 1 };
+    var chunk = try lune_compiler.compile(gpa, &cut_vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    try testing.expect((try cut_vm.start(chunk.proto)) == .suspended);
+    const mid = try encodeSnapshot(gpa, &cut_vm);
+    defer gpa.free(mid);
+    try testing.expectEqualSlices(u8, native.keyframe, mid);
+    const cut_effects = try effectser.encodeFile(gpa, cut_vm.effect_log.items);
+    defer gpa.free(cut_effects);
+
+    const resumed = try restore(gpa, mid, chunk.proto, NativeRegistry.base());
+    defer {
+        resumed.deinit();
+        gpa.destroy(resumed);
+    }
+    try testing.expectEqual(@as(usize, 0), resumed.trace.cache.items.len);
+    const replay_log = try effectser.decodeFile(gpa, &resumed.heap, cut_effects);
+    defer gpa.free(replay_log);
+    try resumed.effect_log.appendSlice(gpa, replay_log);
+    resumed.effect_mode = .record;
+    resumed.effect_cursor = cut_vm.effect_cursor;
+    resumed.committed_effect_seq = cut_vm.committed_effect_seq;
+    resumed.rng = cut_vm.rng;
+    resumed.trace.config.enabled = true;
+    resumed.trace.config.execute = true;
+    resumed.trace.config.optimize = true;
+    resumed.trace.config.native_codegen = true;
+    resumed.trace.config.hotloop = 4;
+    var resumed_out_buf: [512]u8 = undefined;
+    var resumed_sink = io.Writer.fixed(&resumed_out_buf);
+    resumed.out = &resumed_sink;
+    resumed.suspend_ctl = null;
+    try testing.expect((try resumed.exec()) == .finished);
+
+    // Uninterrupted tier-0 reference with the same deterministic clock.
+    var ref_vm = try Vm.init(gpa);
+    defer ref_vm.deinit();
+    var ref_out_buf: [512]u8 = undefined;
+    var ref_sink = io.Writer.fixed(&ref_out_buf);
+    ref_vm.out = &ref_sink;
+    ref_vm.effect_mode = .record;
+    var ref_clock = TestClock{ .next = 1000 };
+    ref_vm.clock_source = ref_clock.source();
+    var ref_chunk = try lune_compiler.compile(gpa, &ref_vm.heap, source, tree.root, &diags);
+    defer ref_chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try ref_vm.run(ref_chunk.proto);
+
+    var combined: [1024]u8 = undefined;
+    @memcpy(combined[0..cut_sink.buffered().len], cut_sink.buffered());
+    @memcpy(combined[cut_sink.buffered().len..][0..resumed_sink.buffered().len], resumed_sink.buffered());
+    try testing.expectEqualStrings(
+        ref_sink.buffered(),
+        combined[0 .. cut_sink.buffered().len + resumed_sink.buffered().len],
+    );
+    const resumed_final = try encodeSnapshot(gpa, resumed);
+    defer gpa.free(resumed_final);
+    const ref_final = try encodeSnapshot(gpa, &ref_vm);
+    defer gpa.free(ref_final);
+    try testing.expectEqualSlices(u8, ref_final, resumed_final);
+    try testing.expectEqual(ref_vm.committed_effect_seq, resumed.committed_effect_seq);
+    try testing.expectEqualSlices(u64, &ref_vm.rng.?.s, &resumed.rng.?.s);
 }
 
 // ---------------------------------------------------------------------------

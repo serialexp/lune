@@ -442,7 +442,13 @@ pub const CallSite = struct {
 /// **and** the live call depth is `>= min_depth`. The depth gate lets a test
 /// capture *inside a nested call* (`min_depth = 2`) rather than at an arbitrary
 /// point; the safepoint count lets it capture mid-loop in a single frame.
-pub const SuspendCtl = struct { min_depth: u32 = 0, after_safepoints: u64 = 0 };
+pub const SuspendCtl = struct {
+    min_depth: u32 = 0,
+    after_safepoints: u64 = 0,
+    /// Optional tier-independent logical cut: suspend at the first otherwise
+    /// eligible tier-0 boundary at or after this many effects have committed.
+    after_committed_effects: ?u64 = null,
+};
 
 /// The tier-0 virtual machine. Owns the resources a running program needs that
 /// outlive a single frame: the object heap, the global table, and the shared
@@ -608,6 +614,11 @@ pub const Vm = struct {
     effect_log: std.ArrayList(Effect) = .empty,
     /// Replay read position into `effect_log` (next effect to feed back).
     effect_cursor: usize = 0,
+    /// Mode-independent logical count of successfully committed host effects.
+    /// Unlike `effect_cursor` (replay-only), this advances once in off, record,
+    /// and replay through `onEffectCommitted`. It is replay-driver state rather
+    /// than semantic keyframe state and is not serialized.
+    committed_effect_seq: u64 = 0,
     /// S-C: whether this session has already pinned its Unicode version (logged in
     /// `record` / consumed in `replay`) at the first `upper`/`lower`. In-memory
     /// only — deliberately NOT serialized: on a snapshot-resume it is re-derived
@@ -1866,7 +1877,13 @@ pub const Vm = struct {
         // Mid-execution suspend point — an instruction boundary. `.full` only.
         if (mode == .full) {
             if (self.suspend_ctl) |sc| {
-                if (!self.reg_top_pending and self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth) {
+                const effect_cut_reached = if (sc.after_committed_effects) |n|
+                    self.committed_effect_seq >= n
+                else
+                    true;
+                if (!self.reg_top_pending and effect_cut_reached and
+                    self.safepoint_seq >= sc.after_safepoints and self.depth >= sc.min_depth)
+                {
                     std.debug.assert(self.pending_error == null);
                     frame.pc = pc.*;
                     return null;
@@ -4030,7 +4047,16 @@ fn performEffect(self: *Vm, kind: EffectKind, nat: *const function.Native, args:
     // both modes hold the identical bytes here and raise (or pass) identically.
     // `clock`/`argc`/`random_seed` return ints → `validateHostText` no-ops.
     try self.validateHostText(result);
+    onEffectCommitted(self);
     return result;
+}
+
+/// The single definition of a successfully committed host effect. Every effect
+/// family calls this only after its own result/shape/version validation passes.
+fn onEffectCommitted(self: *Vm) void {
+    if (self.committed_effect_seq == std.math.maxInt(u64))
+        @panic("VM committed effect sequence exhausted");
+    self.committed_effect_seq += 1;
 }
 
 /// Append one effect result to the ordered log (record mode). Shared by
@@ -4057,18 +4083,20 @@ fn nextLoggedEffect(self: *Vm, kind: EffectKind) Error!Value {
 /// change). In `replay` it reads the seed back from the log. Called lazily by
 /// `nativeRandom` the first time `random()` runs; subsequent draws need no effect.
 fn obtainRandomSeed(self: *Vm) Error!u64 {
-    switch (self.effect_mode) {
-        .off, .record => {
+    const seed = switch (self.effect_mode) {
+        .off, .record => blk: {
             const src = self.random_seed_source orelse return Error.RandomUnavailable;
             const seed = src.seed(src.ctx);
             if (self.effect_mode == .record) try logEffect(self, .random_seed, Value.int(@bitCast(seed)));
-            return seed;
+            break :blk seed;
         },
-        .replay => {
+        .replay => blk: {
             const v = try nextLoggedEffect(self, .random_seed);
-            return @bitCast(v.asInt());
+            break :blk @as(u64, @bitCast(v.asInt()));
         },
-    }
+    };
+    onEffectCommitted(self);
+    return seed;
 }
 
 /// Has a `.unicode_version` effect already been consumed earlier this session?
@@ -4099,13 +4127,16 @@ fn versionAlreadyConsumed(self: *Vm) bool {
 /// `effect_log`/`effect_cursor`), not a partial fix here.
 pub fn noteUnicodeVersion(self: *Vm) Error!void {
     if (self.unicode_version_pinned) return;
+    var committed = true;
     switch (self.effect_mode) {
         .off => {},
         .record => try logEffect(self, .unicode_version, Value.int(unicode_case.unicode_version_packed)),
         .replay => {
             // On a snapshot-resume the version may have been pinned before the cut;
             // its effect then sits behind the cursor — don't consume a second one.
-            if (!versionAlreadyConsumed(self)) {
+            if (versionAlreadyConsumed(self)) {
+                committed = false;
+            } else {
                 const v = try nextLoggedEffect(self, .unicode_version);
                 // The shared scalar shape-gate (effectser.checkResultShape) accepts
                 // *either* int or float, so a corrupt log could park a float here;
@@ -4118,6 +4149,7 @@ pub fn noteUnicodeVersion(self: *Vm) Error!void {
         },
     }
     self.unicode_version_pinned = true;
+    if (committed) onEffectCommitted(self);
 }
 
 /// Read a file's content through the `file_read` record/replay boundary, for
@@ -4145,6 +4177,7 @@ pub fn obtainFileRead(self: *Vm, path: []const u8) Error!Value {
     // non-string `nil` → no-op). Validated after logging for the same record/replay
     // lockstep reason as `performEffect`.
     try self.validateHostText(result);
+    onEffectCommitted(self);
     return result;
 }
 
@@ -7848,6 +7881,96 @@ const FakeFs = struct {
     }
 };
 
+test "A-vi: committed effect sequence is mode-independent across all four commit families" {
+    const gpa = testing.allocator;
+    const effectser = @import("effectser.zig");
+    const source: [:0]const u8 =
+        \\local c = os.clock()
+        \\local r = math.random()
+        \\local u = string.upper("x")
+        \\local v = string.lower("Y")
+        \\local f = loadfile("effect.lua")
+        \\print(c, r, u, v, f())
+    ;
+    var ffs = FakeFs{ .entries = &.{
+        .{ .path = "effect.lua", .content = "return 42" },
+    } };
+
+    // Off mode commits the same four logical families without producing a log.
+    {
+        var clock = CounterClock{ .next = 1000 };
+        var seed = FixedSeed{ .value = 0x1234 };
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var out_buf: [256]u8 = undefined;
+        var sink = io.Writer.fixed(&out_buf);
+        vm.out = &sink;
+        vm.clock_source = clock.source();
+        vm.random_seed_source = seed.source();
+        vm.fs_source = ffs.source();
+        try compileRun(gpa, &vm, source);
+        try testing.expectEqual(@as(u64, 4), vm.committed_effect_seq);
+        try testing.expectEqual(@as(usize, 0), vm.effect_log.items.len);
+    }
+
+    // Record produces clock, random_seed, unicode_version, file_read in order.
+    var log_bytes: []u8 = undefined;
+    {
+        var clock = CounterClock{ .next = 1000 };
+        var seed = FixedSeed{ .value = 0x1234 };
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var out_buf: [256]u8 = undefined;
+        var sink = io.Writer.fixed(&out_buf);
+        vm.out = &sink;
+        vm.effect_mode = .record;
+        vm.clock_source = clock.source();
+        vm.random_seed_source = seed.source();
+        vm.fs_source = ffs.source();
+        try compileRun(gpa, &vm, source);
+        try testing.expectEqual(@as(u64, 4), vm.committed_effect_seq);
+        try testing.expectEqual(@as(usize, 4), vm.effect_log.items.len);
+        try testing.expectEqual(EffectKind.clock, vm.effect_log.items[0].kind);
+        try testing.expectEqual(EffectKind.random_seed, vm.effect_log.items[1].kind);
+        try testing.expectEqual(EffectKind.unicode_version, vm.effect_log.items[2].kind);
+        try testing.expectEqual(EffectKind.file_read, vm.effect_log.items[3].kind);
+        log_bytes = try effectser.encodeFile(gpa, vm.effect_log.items);
+    }
+    defer gpa.free(log_bytes);
+
+    // Replay commits the identical four events with all host sources detached.
+    // Re-entering the already-consumed Unicode pin models snapshot resume: no
+    // new log entry is consumed, so the logical commit counter must not move.
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var out_buf: [256]u8 = undefined;
+        var sink = io.Writer.fixed(&out_buf);
+        vm.out = &sink;
+        const log = try effectser.decodeFile(gpa, &vm.heap, log_bytes);
+        defer gpa.free(log);
+        try vm.effect_log.appendSlice(gpa, log);
+        vm.effect_mode = .replay;
+        try compileRun(gpa, &vm, source);
+        try testing.expectEqual(@as(u64, 4), vm.committed_effect_seq);
+        try testing.expectEqual(vm.effect_log.items.len, vm.effect_cursor);
+        vm.unicode_version_pinned = false;
+        try noteUnicodeVersion(&vm);
+        try testing.expectEqual(@as(u64, 4), vm.committed_effect_seq);
+        try testing.expectEqual(vm.effect_log.items.len, vm.effect_cursor);
+    }
+
+    // A host failure occurs before commitment and leaves the counter untouched.
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        try testing.expectError(error.ClockUnavailable, compileRun(gpa, &vm,
+            \\local t = os.clock()
+        ));
+        try testing.expectEqual(@as(u64, 0), vm.committed_effect_seq);
+    }
+}
+
 test "L-3: loadfile reads + compiles a file via the file_read effect (record)" {
     const gpa = testing.allocator;
     var ffs = FakeFs{ .entries = &.{
@@ -8443,12 +8566,22 @@ test "top-level re-entry on a suspended (dirty) VM fails closed (doc 17 H-3 / 9-
     const outcome = try vm.start(chunk.proto);
     try testing.expect(outcome == .suspended);
     try testing.expect(vm.depth != 0);
+    const sentinel: trace.RegionKey = .{
+        .region_id = @enumFromInt(0xA603),
+        .activation = 999_999,
+    };
+    try vm.trace.region_profit.put(gpa, sentinel, .{
+        .outer_traversals = 3,
+        .root_frame_depth = vm.depth,
+        .root_call_seq = sentinel.activation,
+    });
 
     // A fresh top-level entry through the wrong door (`start`/`run` rather than
     // resuming via `exec()`) must be rejected BEFORE mutating any epoch state — a
     // bare assert would vanish under ReleaseFast, so this is a returned error.
     try testing.expectError(error.DirtyTopLevelEntry, vm.start(chunk.proto));
     try testing.expectError(error.DirtyTopLevelEntry, vm.run(chunk.proto));
+    try testing.expect(vm.trace.region_profit.contains(sentinel));
 
     // The suspended epoch is still intact and resumes normally to completion
     // (clear the trigger first, else it re-suspends at the same depth).
@@ -8458,6 +8591,37 @@ test "top-level re-entry on a suspended (dirty) VM fails closed (doc 17 H-3 / 9-
         .suspended => return error.TestUnexpectedResult,
     }
     try testing.expectEqualStrings("1\n", sink.buffered());
+}
+
+test "H-3: a clean fresh top-level epoch clears region_profit wholesale" {
+    const gpa = testing.allocator;
+    const source: [:0]const u8 = "return 1";
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqual(@as(u32, 0), vm.depth);
+    try vm.trace.region_profit.put(gpa, .{
+        .region_id = @enumFromInt(0xA604),
+        .activation = 42,
+    }, .{
+        .outer_traversals = 5,
+        .root_frame_depth = 1,
+        .root_call_seq = 42,
+    });
+    try testing.expectEqual(@as(usize, 1), vm.trace.regionProfitCount());
+
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqual(@as(usize, 0), vm.trace.regionProfitCount());
 }
 
 test "e2e: recursion, loop, locals — fib and a summing loop" {

@@ -1,5 +1,54 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-07-25 (LATEST-26) — **A-vi native-F2c logical-cut harness LANDED, inert + green. NEXT = A-vii (arm edge 4 + region-profit gate) per §A8 step 7.**
+
+A-vi landed in three ordered pieces. Piece 0 bumps keyframes to schema v6:
+`FrameRef` now carries `varargs_base`/`varargs_count`, generated Zig/TypeScript
+codecs were regenerated, capture serializes them, and restore validates their
+canonical/range/proto shape before rebuilding frames through `pushFrameVararg`.
+The live-vararg suspend/resume guard proves byte-identical mid-keyframe
+round-trip plus identical forward output/final state.
+
+Piece 1 adds VM-local `committed_effect_seq` and the single
+`onEffectCommitted()` hook. Its four post-validation call sites are normal
+native effects, lazy random-seed materialization, a genuinely new Unicode pin
+(already-consumed replay re-entry does not advance), and validated file reads.
+All four families are mode-identical across off/record/replay; a fault commits
+nothing. No selection/gating path reads the counter.
+
+Piece 2 adds the optional logical `SuspendCtl.after_committed_effects` trigger:
+the existing tier-0 suspend boundary walks until `seq >= N` while retaining the
+`reg_top_pending` and depth eligibility gates. F-5 executes a real compiled
+native numeric-for burst, commits a fixed-result clock effect, and compares the
+serialized semantic keyframe plus serialized effect prefix/cursor/counter,
+output prefix, and Xoshiro256 state against tier-0. It restores into an empty
+trace cache, reattaches the omitted driver facets, resumes, and matches the
+uninterrupted final output/keyframe/PRNG state. H-3 coverage now explicitly
+proves clean-epoch wholesale clear and dirty-entry non-mutation; A-iv already
+covers activation cleanup and one-per-owner cardinality.
+
+Files touched: `schema/trace.json`, regenerated `src/gen/trace_schema.zig` and
+`viz/src/gen/generated.ts`, `src/keyframeser.zig`, `src/interp.zig`, this file,
+and `docs/design/17-exit-branch-patching.md`. Inertness/soundness: no arming flag
+or gate changed; the new counter has test/harness consumers only; the logical
+suspend field defaults null; schema v6 closes a pre-existing restore hole.
+Piece-local `zig build` gates, `just test` (823/823), and
+`zig build test -Djit-debug=true` (823/823) are green. ReleaseFast tier-0 stdout
+is byte-identical to `--trace --jit-native` for all six controls, matching the
+committed SHA-256 prefixes: nsieve `4053ed86223d7060`, nbody
+`9dcd7fa2f7e9e93e`, sieve_int `db55c0f98f98851b`, pi_leibniz
+`f57ace5316c0fd19`, grid_matmul `395ff5566b31eb18`, field_hash
+`89b64d3d25ae188f`.
+
+Reviewer risks: validate that `varargs_end <= frame.base` covers both bytecode
+calls and host re-entry layouts; confirm every effect hook remains downstream of
+its family-specific validation; stress the logical cut with multret
+`reg_top_pending`; and verify the F-5 expression-temporary shape continues to
+compile and execute natively (the test asserts both traced iterations and a
+compiled native trace).
+
+---
+
 ## Status 2026-07-24 (LATEST-25) — **A-v edge-4 bridge stub emission LANDED, unarmed + inert. NEXT = A-vi (native-F2c harness + H-3/H-4 tests) per §A8 step 6.**
 
 Every composite ordinary guard accepted by the trace-local classifier now emits the
