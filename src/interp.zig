@@ -11969,6 +11969,80 @@ test "executor: a thrashing anchor that later stabilizes recovers from the gate"
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
 }
 
+test "A-vii-c: a region-forming sieve shape stays byte-identical across all 10 modes" {
+    // The gate-consumption flip (doc 17 §A8-iii, A-vii.1) is the FIRST
+    // selection-diverging change: region-member traces' penalty/gate now comes
+    // from region window flushes keyed on the OWNER anchor, so trace selection
+    // for genuine cross-anchor cycles may differ from the pre-flip machine. The
+    // contract is output identity, not selection identity (P-EBP-1) — so pin the
+    // 10-mode matrix on a program SHAPED to mint a cross-trace-cycle region
+    // (branchy outer scan whose taken arm runs an inner while: the
+    // skip/ramp/inner/cont shape). π(80) = 22 primes.
+    try expectProgram(
+        \\local count = 0
+        \\local flags = {}
+        \\for j = 1, 5 do
+        \\  count = 0
+        \\  for i = 2, 80 do flags[i] = true end
+        \\  for i = 2, 80 do
+        \\    if flags[i] then
+        \\      count = count + 1
+        \\      for k = i + i, 80, i do flags[k] = false end
+        \\    end
+        \\  end
+        \\end
+        \\print(count)
+    , "22\n");
+}
+
+test "A-vii-c: the sieve shape actually mints a live region (matrix companion introspection)" {
+    // Without this companion the matrix test above could silently stop exercising
+    // the flipped gate path (e.g. a discovery regression leaving the program
+    // regionless would make it a plain output test). With side traces recording
+    // early (hotguard=3, like the side-trace half of the type-instability test)
+    // the branchy scan + inner while forms the cross-anchor cycle; assert the
+    // executed shape really discovers at least one region so the divergent
+    // region-gate path is live, and that output still matches tier-0.
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const gpa = testing.allocator;
+    const source =
+        \\local count = 0
+        \\local flags = {}
+        \\for j = 1, 5 do
+        \\  count = 0
+        \\  for i = 2, 80 do flags[i] = true end
+        \\  for i = 2, 80 do
+        \\    if flags[i] then
+        \\      count = count + 1
+        \\      for k = i + i, 80, i do flags[k] = false end
+        \\    end
+        \\  end
+        \\end
+        \\print(count)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotguard = 3; // record side traces early so the cycle closes
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("22\n", sink.buffered());
+    try testing.expect(vm.trace.region_defs.count() >= 1);
+}
+
 test "e2e (executor): a long hot loop stays correct across every trace + gc mode" {
     // Long enough to record, execute, side-exit at the loop close, and clear its
     // penalty — run under gc_stress too (record_execute × stress is in the matrix).

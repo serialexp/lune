@@ -1,5 +1,62 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-11 (LATEST-29) — **A-vii-c gate-consumption flip LANDED with the regionless fallback (first selection-diverging step). NEXT = codex review verdict → Bart APPROVE → A-vii-d arm-site flip.**
+
+The flip: `accountTraceRun` is now selection-only (coverage/cycle receipts +
+`hit_count`; the per-trace penalty/gate block is gone). The authoritative gate
+machine is `flushRegionWindow(key, work)`, owner-keyed per `RegionDef.owner`:
+`work >= min_useful` clears the owner's penalty+gate; `0 < work < min_useful`
+strikes; at `max_penalty` → `gateAnchor(owner)` + `disarmAllLinks()`.
+`accountRegionProfit` is the only full-window consumer and latches
+`RegionAccum.useful_window_seen` (the A-vii-d qualification seam); `closeRegion`
+routes its nonzero remainder through the same machine (zero-remainder closes are
+silent). `region_bridge_arming_enabled` stays `false` — no behavior-changing arm
+yet.
+
+**Design-gap discovery (the important part).** The design's premise that
+"self-loop/lone-trace regions reproduce the old useful/low-yield decision" is
+FALSE: discovery mints regions only for cycle-bearing SCCs of the cross-anchor
+structural-edge graph (`resolveSuccessorAnchor` rejects `wp == t.anchor.pc` for
+guards; `rebuildRegionsFallible` needs `comp_size >= 2 or has_self`). Plain loop
+traces and same-anchor sibling groups get NO region, so a spec-faithful flip
+left them entirely ungated — measured: parity loop `if i % 2 == 0` → two sibling
+traces at `main:5`, **961 trace entries / 2000 iterations, no gate** (old
+machine gated after 8); 7 pre-existing tests broke. Escalated to Bart;
+**his call = the regionless fallback**: receipts of a physical member of a live
+(armable) region — membership via `dest_entry_regions.get(trace_id)` + per-id
+`def.armable` recheck (`traceHasRegion`), so tombstones bite immediately — are
+penalty-neutral on the selection side; every other trace keeps the exact
+pre-flip per-trace machine (`accountLegacyThrash`, keyed by its own anchor,
+driven by `completed`), on both `onSideExit` and `onSideExitReceipt` paths.
+Consequence: selection is byte-identical for ALL non-region shapes (the entire
+pre-existing suite passed unchanged); the divergence surface is exactly
+region-member traces. Doc 17 has the full addendum ("A-vii-c correction at
+landing") + corrected byte-identity boundary note; sub-step 3 ticked; §A8
+step 7 stays UNTICKED (d/e remain).
+
+Tests: rewrote the A-ii.1 split pin as "regionless onSideExit keeps the legacy
+gate; bare accountTraceRun is selection-only"; new trace.zig gate-machine test
+(N=8 windows qualify+clear owner, sub-N remainders strike, max_penalty gates +
+disarms an armed link, tombstoned member reverts to legacy); new interp.zig
+10-mode matrix test on a region-forming mini-sieve (numeric-for inner loop —
+a while inner does NOT close the cycle) + an introspection companion pinning
+`region_defs.count() >= 1` at hotguard=3 (at default hotguard the shape mints
+no region and the matrix test would silently not exercise the flip).
+
+Gates: `just test` green (828 tests); `zig build test -Djit-debug=true` green;
+ReleaseFast six-workload tier-0≡native output-identity control ALL-PASS
+(nsieve `4053ed86223d7060`, nbody `9dcd7fa2f7e9e93e`, sieve_int
+`db55c0f98f98851b`, pi_leibniz `f57ace5316c0fd19`, grid_matmul
+`395ff5566b31eb18`, field_hash `89b64d3d25ae188f`).
+
+Process note: codex is REVIEW-ONLY now (usage limits); Claude implements.
+Codex review of this diff requested by Bart — run via `mcp__codex__codex`
+(read-only sandbox, no model pin). A-vii-d next: arm-site flip
+(`tryArmRegionBridge` in `driveChain` beside the M1 `.ordinary_guard` arms,
+`region_bridge_arming_enabled = true`), must confirm the `invariant_slots =
+S \ E` soundness assumption flagged at A-vii-b; then A-vii-e measurement per
+the frozen protocol.
+
 ## Status 2026-07-25 (LATEST-28) — **A-vii-b descriptor/validator LANDED, unarmed + byte-identical-inert. NEXT = A-vii-c gate-consumption flip.**
 
 `RegionDef` now owns canonical-sorted per-bridge descriptors containing the exact
