@@ -1,5 +1,69 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-13 (LATEST-40) — **Part S designed + twice-reviewed, ready for S-a. The whole 50% seam is TWO exit sites; the fix is a native sibling handoff compiled into the deopt stub.**
+
+**Bart's mandate (verbatim intent):** "every single program will eventually hit
+this problem we have on nsieve … do whatever we need until we have part B and
+that 50% is eliminated." Standing autonomy: fix codex findings with best
+judgement and proceed.
+
+**What landed (3c17238):**
+1. **Burst-terminal telemetry probe** (`dbgNoteBurst`/`dbgDumpBurstStats`,
+   jitdbg-only, permanent). nsieve N=9: **641,431 bursts, ALL terminating at
+   t=4 ei=9 (337k) or ei=16 (304k)** — two deopt exits of the prime-found
+   continuation at anchor pc=14. One runtime turnstile visit per prime.
+2. **doc 17 §Part S** — the design, with two codex `gpt-5.6-sol` REJECT rounds
+   folded in and recorded inline. Round 1's central finding SIMPLIFIED the
+   design: a zero-progress pre-effect deopt is coherent at the ANCHOR
+   (interp.zig:3224) — no gap to record, no stitch traces, no per-exit
+   snapshots; the sibling trace already IS the alternate path; doc 16's
+   runtime coherent-anchor chain just needs compiling into the exit stub.
+
+**The S-a implementation contract (round-2-pinned, START HERE):**
+- Pre-effect eligibility bitset per trace (pattern: §T.9 `bridge_cand` memo) —
+  exit index eligible iff no effectful op precedes it (anchor-coherent at any
+  iteration count; verified nativegen.zig:4554-4592/4729-4739/2397-2425).
+- New counter keyed `(parent Trace.id, exit_instr)` charged EXACTLY ONCE per
+  receipt: replayLedger's terminal normal-deopt arm ∪ interp's scalar
+  zero-exit branch (mutually exclusive — interp.zig:3010 returns before 3017).
+  Parity test required. `guard_failures` is NOT reusable (aliases by
+  (anchor,exit_pc), stops at 2 traces, blind to ledger terminals).
+- `ArmKind.sibling_handoff` + **separate slot namespace** (slot[ei] is
+  loop_done_linked-reserved, trace.zig:1211/6511; ordinary loop-done deopts
+  bypass to shared_exit, nativegen.zig:4653).
+- Stub (S-b, but emitted inert in S-a with slot hard-wired to shared exit):
+  load slot → armed test → armed: append `.sibling_handoff`, forced-yield
+  check (target in rax, may rewrite + stamp `.yielded`), `jmp rax` (precedent:
+  loop-done-linked site nativegen.zig:4762, NOT A2.4); unarmed: append
+  `.deopt`, shared exit — byte-identical today's row.
+- Zero-input siblings only (`inputs.len == 0` — ordinary_entry cannot seed;
+  interp.zig:885-929, trace.zig:3697/4265/6650).
+- S-b arm: one-shot pending `(parent, exit)` set at terminal consumption;
+  armed at the dispatcher's ACTUAL successful sibling entry
+  (nextTraceExcluding site, interp.zig:2737-2762); safe_to_arm at slot write;
+  cleared on departure/frame death/epoch.
+- Ledger: `LedgerKind.sibling_handoff` — non-final: next row same-anchor;
+  final: `.yielded` only. Accounting: `region_work = local`, one
+  `accountLedgerRow`, destination **`.deferred`** (never `.known_trace` — the
+  generic rule at trace.zig:4051 would let applyDestination reproduce the
+  §A8-v cross-credit pathology).
+- **Freeze DEFERRED to v2** (would remove the barren decay detector,
+  trace.zig:3328; design v2 after S-b's measurement, with close-remainder
+  policy trace.zig:2748 explicit).
+
+**Pre-registered expectation:** dispatcher entries ÷≈9 (avg burst 3.58 rows →
+LEDGER_CAP=32); per-row pricing (~26% of wall) SURVIVES until freeze v2. Six
+workload hashes must stay: nsieve=4053ed86223d7060, nbody=9dcd7fa2f7e9e93e,
+sieve_int=db55c0f98f98851b, pi_leibniz=f57ace5316c0fd19,
+grid_matmul=395ff5566b31eb18, field_hash=89b64d3d25ae188f (ReleaseFast,
+`--trace --jit-native`, run each command individually).
+
+**Also this session:** Part T formally superseded (twice-rejected; §Part T
+kept as review record); §T.9 seam profile; bridge-candidate memo (a0cedc8,
+nsieve −6.3%, sieve_int −8.9%); codex full-suite finding parked: SciMark = 53%
+of suite runtime with ZERO coverage (dynamic-proto gate, `arm()` trace.zig
+~7037 + load.zig:118) — separate lever, H-2 hard half, NOT part of this arc.
+
 ## Status 2026-08-13 (LATEST-39) — **Part T rejected TWICE pre-implementation; profiling the seam it targets changed the plan. First "free" memoization landed: nsieve −6.3%, sieve_int −8.9%, zero contract change.**
 
 **What happened.** Bart's lever ("LuaJIT does the B part right — not having to
