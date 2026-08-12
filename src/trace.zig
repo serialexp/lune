@@ -2595,13 +2595,21 @@ pub const TraceState = struct {
                 base = @min(base, points[j].source_pc);
                 max_pc = @max(max_pc, points[j].source_pc);
             }
-            if (max_pc == std.math.maxInt(u32)) { // limit would wrap; stay on the slow path
+            // Size the bitset in u64 (codex e.1 review, MAJOR): `(limit - base) + 63`
+            // in u32 overflows for a near-maxInt(u32) pc range, and even a
+            // non-overflowing pathological range (hand-built defs; real member pcs
+            // are bounded by proto code length) would allocate an absurd bitset.
+            // Cap the per-proto range; over the cap (or at the u32 wrap point) the
+            // cache stays null and the slow path runs — same verdicts either way.
+            const range: u64 = @as(u64, max_pc) - base + 1;
+            const observer_span_max_range: u64 = 1 << 22; // 4M pcs → 512 KiB bitset, far above any real proto
+            if (range > observer_span_max_range or max_pc == std.math.maxInt(u32)) {
                 for (spans[0..filled]) |s| self.gpa.free(s.words);
                 self.gpa.free(spans);
                 return;
             }
             const limit = max_pc + 1;
-            const nwords = ((limit - base) + 63) / 64;
+            const nwords: usize = @intCast((range + 63) / 64);
             const words = self.gpa.alloc(u64, nwords) catch {
                 for (spans[0..filled]) |s| self.gpa.free(s.words);
                 self.gpa.free(spans);
@@ -11888,6 +11896,72 @@ test "A-vii-e.1 observer fast path: built on open, survive verdicts match the sl
     try testing.expect(!state.region_profit.contains(key));
     try testing.expect(state.observer_fast == null);
     try testing.expectEqual(@as(u64, 2), state.region_profit_flushes);
+
+    // (5) Shallower frames (codex e.1 review, MINOR): the accumulator opened at
+    // depth 3 — a MEMBER point in a shallower frame survives (call_seq may
+    // differ below the root; only equal-depth activations compete), while a
+    // shallower NON-member point is a departure and closes.
+    state.setRegionContext(3, 5);
+    _ = state.accountRegionProfit(exit, 3, .deferred);
+    try testing.expect(state.observer_fast != null);
+    state.observeRegionProgramPoint(83, 5, 2, 999); // member, depth 2 < 3: survives
+    try testing.expect(state.region_profit.contains(.{ .region_id = rid, .activation = 5 }));
+    state.observeRegionProgramPoint(83, 4, 2, 999); // non-member, depth 2 < 3: closes
+    try testing.expect(!state.region_profit.contains(.{ .region_id = rid, .activation = 5 }));
+    try testing.expectEqual(@as(u64, 3), state.region_profit_flushes);
+
+    // (6) Multi-accumulator disables the fast path: a second live accumulator
+    // (direct insert, the test-only shape) must leave any subsequent refresh
+    // null so the slow loop owns multi-victim ordering.
+    state.setRegionContext(1, 5);
+    _ = state.accountRegionProfit(exit, 3, .deferred);
+    try testing.expect(state.observer_fast != null);
+    try state.region_profit.put(gpa, .{ .region_id = rid, .activation = 77 }, .{ .root_frame_depth = 1, .root_call_seq = 77 });
+    state.closeRegion(.{ .region_id = rid, .activation = 77 }); // any funnel refresh with count!=1 nulls…
+    try testing.expect(state.observer_fast != null); // …count is back to 1 here, so it rebuilt
+    try state.region_profit.put(gpa, .{ .region_id = rid, .activation = 78 }, .{ .root_frame_depth = 1, .root_call_seq = 78 });
+    state.closeRegion(.{ .region_id = rid, .activation = 5 }); // count 2→1 via a funnel: rebuilds for the survivor
+    const f2 = state.observer_fast orelse return error.MissingObserverFast;
+    try testing.expectEqual(@as(u64, 78), f2.key.activation);
+    state.closeRegion(.{ .region_id = rid, .activation = 78 });
+    try testing.expect(state.observer_fast == null);
+}
+
+test "A-vii-e.1 observer fast path: an over-cap pc range declines the cache; the slow path still closes" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    // Member pcs 4M+ apart: the per-proto span exceeds the bitset range cap, so
+    // refreshObserverFast must decline (no giant allocation, no u32 overflow) and
+    // the slow scan must still deliver both verdicts.
+    var code = [_]Instr{Instr.op0(.load_nil)};
+    const proto = Proto{ .id = 84, .code = &code, .name = "sparse", .num_registers = 1 };
+    const rid: RegionId = @enumFromInt(12);
+    try state.region_defs.put(gpa, rid, .{
+        .members = try gpa.dupe(StructuralEdgeId, &.{}),
+        .member_points = try gpa.dupe(ProgramPoint, &.{
+            .{ .proto_id = 84, .source_pc = 0 },
+            .{ .proto_id = 84, .source_pc = (1 << 22) + 1 },
+        }),
+        .owner = .{ .proto = &proto, .pc = 0 },
+        .classifier = .{ .kind = .self_loop, .member_count = 1 },
+        .armable = true,
+    });
+    try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
+    const exit: ExitKey = .{ .trace_id = 9, .exit_instr = 0 };
+    const key: RegionKey = .{ .region_id = rid, .activation = 5 };
+
+    state.setRegionContext(1, 5);
+    _ = state.accountRegionProfit(exit, 3, .deferred);
+    try testing.expect(state.region_profit.contains(key));
+    try testing.expect(state.observer_fast == null); // declined, not mis-built
+
+    state.observeRegionProgramPoint(84, (1 << 22) + 1, 1, 5); // member via slow path: survives
+    try testing.expect(state.region_profit.contains(key));
+    state.observeRegionProgramPoint(84, 1, 1, 5); // non-member via slow path: closes
+    try testing.expect(!state.region_profit.contains(key));
+    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
 }
 
 test "A-iv region_profit: windows persist across physical re-entry and observer closes only on departure" {
