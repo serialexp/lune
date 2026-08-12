@@ -7158,6 +7158,42 @@ receipts are owned, not anything nsieve-shaped.
    `-Djit-debug` green throughout, re-checked after every one of the four
    changes.
 
+   **Post-landing review (codex gpt-5.6-sol, 2026-08-12): 2 BLOCKER + 2 MAJOR
+   → all four fixed → re-measured BETTER.** (1) BLOCKER: the unclassified
+   fallback credited the live activation but left `selected == null`, so
+   `applyDestination` could open a foreign `.known_trace` region without
+   closing the source — two accumulators at one `call_seq`,
+   `activeRegionFor` picking the lowest `RegionId`, cross-crediting. Fixed by
+   threading the fallback's activation through as the *effective* source —
+   which ALSO removed the per-receipt no-op `openRegion` call entirely
+   (dest-candidates now early-return on the effective source), worth a
+   further −12% on nsieve. (2) BLOCKER: qualification permanently exempted
+   zero-work thrash — after one useful window an activation could spin
+   forever on consumed barren receipts nothing priced (close-time remainder
+   indefinitely postponable). Fixed with `RegionAccum.barren_run` +
+   `config.max_barren_run = 64`: a streak of that many consumed barren
+   receipts with no intervening credit flushes one synthetic 1-work
+   low-yield verdict through the window gate machine and restarts; any real
+   credit resets the streak. Pure function of receipt counts — replay-safe.
+   (3) MAJOR: qualified ownership suppressed legacy *clears* on member
+   anchors while region windows clear only the owner — a stale
+   pre-qualification member penalty stayed latent forever and re-gated on
+   the first low receipt after close. Fixed with qualification amnesty:
+   the first useful window (`useful_window_seen` latch) removes legacy
+   penalty+gate state for every anchor inside the region's
+   `member_points` footprint (`clearMemberAnchorState`). (4) MAJOR:
+   a physical rebuild could un-arm/tombstone a def while its accumulator
+   stayed live (consuming receipts until the next keyed receipt noticed),
+   and an `armable false→true` recomputation could resurrect it with the
+   qualification bit still latched. Fixed with a publish-phase sweep
+   (`closeNonArmableAccumulators`, runs after
+   `disarmStaleRegionBridgeLinks`). All pinned in the extended
+   "gate-fix consumption boundary" test (barren-streak strike + reset,
+   qualification amnesty). Re-measured after the round: nsieve
+   **83.0 → 73.2 ms** (total −29% from the 103.2 baseline), sieve_int
+   **30.5 → 25.7 ms** (total −37%), all six output hashes still identical,
+   both test gates green.
+
    **Where this leaves nsieve (profile on file, N=9):** the accounting IS now
    the bottleneck — `accountRegionProfit` 17.8% self, hashing ~11%,
    `replayLedger` 8.1%, `runCapturingLedger` 4.0% vs `Vm.execImpl` 17+8%

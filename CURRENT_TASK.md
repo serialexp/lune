@@ -1,6 +1,20 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
-## Status 2026-08-12 (LATEST-38) — **The region-profit gate FIX landed: the gate was condemning its own region. nsieve −19.6%, sieve_int −25.9%, links persist for whole sieves, nsieve:14 coverage 2.4% → 91.5%.**
+## Status 2026-08-12 (LATEST-38) — **The region-profit gate FIX landed: the gate was condemning its own region. After the codex review round: nsieve −29% (103.2 → 73.2ms), sieve_int −37% (41.1 → 25.7ms), links persist for whole sieves, nsieve:14 coverage 2.4% → 91.5%.**
+
+**Codex post-landing review: 2 BLOCKER + 2 MAJOR, all four fixed same-session
+(doc 17 §A8-v has the full record):** (1) fallback receipts now thread the live
+activation through to `applyDestination` as the effective source (was: foreign
+dest could open a second accumulator at one call_seq; the fix also killed the
+per-receipt no-op `openRegion`, worth a further −12% on nsieve); (2)
+`barren_run` + `max_barren_run=64` — a consumed-barren streak with no credit
+flushes a synthetic low-yield strike, so a qualified activation that decays is
+still priced (the post-qualification thrash hole); (3) qualification amnesty —
+the first useful window clears legacy penalty/gate on every member anchor
+(`clearMemberAnchorState`), killing the latent stale-penalty re-gate; (4)
+publish-phase `closeNonArmableAccumulators` — a rebuild that un-arms/tombstones
+a def closes its live accumulators (no resurrection with `useful_window_seen`
+latched). All re-measured + hashes verified after the round.
 
 Bart's mandate: "the only thing the fix set out to do failed… try to fix it
 again — maybe now constantly checking soundness *and* profitability." Both
