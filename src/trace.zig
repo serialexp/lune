@@ -1315,6 +1315,16 @@ pub const Gate = struct {
 /// side-trace recording (step 4) can be triggered at the right threshold.
 pub const GuardKey = struct { anchor: AnchorKey, exit_pc: u32 };
 
+/// Key of one burst-TERMINAL exit site (jitdbg telemetry, doc 17 Part B): the
+/// (trace, exit instruction, materialization kind, outcome) whose ledger row was
+/// the last of a burst — i.e. the exact site that returned control to the runtime.
+pub const DbgTerminalKey = struct {
+    trace_id: u32,
+    exit_instr: u32,
+    kind: irinterp.LedgerKind,
+    outcome: irinterp.LedgerOutcome,
+};
+
 /// The kind of type a trace's entry guard enforces on a register.
 pub const EntryGuardType = enum(u8) {
     int,
@@ -2148,6 +2158,14 @@ pub const TraceState = struct {
     /// in traces at `anchor` has failed.  When a counter crosses `hotguard`,
     /// `wants_side_trace` is set and the next back-edge records a side trace.
     guard_failures: std.AutoHashMapUnmanaged(GuardKey, u32) = .empty,
+    /// Burst-terminal telemetry (jitdbg builds only — never touched otherwise).
+    /// One record per `driveDispatcherLedger` entry: burst ledger length histogram
+    /// plus a per-(trace,exit,kind) count of the TERMINAL row — i.e. exactly the
+    /// exits that hand control back to the runtime. This is the target list for
+    /// exit-branch patching (doc 17 Part B): every entry here is a runtime
+    /// round-trip that a patched transition or freeze could eliminate.
+    dbg_burst_len_hist: [irinterp.LEDGER_CAP + 1]u64 = @splat(0),
+    dbg_burst_terminals: std.AutoHashMapUnmanaged(DbgTerminalKey, u64) = .empty,
     /// When non-null, the next back-edge to this anchor will arm a side-trace
     /// recording (even if a trace already exists there).  Set by
     /// `countGuardFailure` when a guard-failure crosses `hotguard`; cleared
@@ -2225,6 +2243,51 @@ pub const TraceState = struct {
     /// Dump the `guard_failures` map (one line per `(anchor, exit_pc)` key with
     /// its count). The on-demand version of the ad-hoc iterator loops we used to
     /// paste into tests. Same double gate as `dbg`.
+    /// Record one dispatcher burst's ledger for the Part-B terminal telemetry
+    /// (jitdbg builds only; comptime-false → zero cost in normal builds). Called
+    /// from `driveDispatcherLedger` with the full burst ledger.
+    pub fn dbgNoteBurst(self: *TraceState, entries: []const irinterp.LedgerEntry) void {
+        if (comptime jitdbg.enabled) {
+            if (!self.config.debug_log) return;
+            const len = @min(entries.len, self.dbg_burst_len_hist.len - 1);
+            self.dbg_burst_len_hist[len] += 1;
+            if (entries.len == 0) return;
+            const t = entries[entries.len - 1];
+            const gop = self.dbg_burst_terminals.getOrPut(self.gpa, .{
+                .trace_id = t.id,
+                .exit_instr = t.exit,
+                .kind = t.kind,
+                .outcome = t.outcome,
+            }) catch return; // telemetry: drop on OOM, never fail the burst
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+        }
+    }
+
+    /// Dump the burst-terminal telemetry: ledger-length histogram + every terminal
+    /// site sorted is left to the reader (use sort(1)). Same double gate as the
+    /// other dbgDump* helpers. This is the Part-B patch target list: each line is
+    /// "this exit site handed control back to the runtime N times".
+    pub fn dbgDumpBurstStats(self: *TraceState) void {
+        if (comptime jitdbg.enabled) {
+            if (!self.config.debug_log) return;
+            var total: u64 = 0;
+            for (self.dbg_burst_len_hist) |c| total += c;
+            jitdbg.log("burst stats: {d} dispatcher bursts", .{total});
+            for (self.dbg_burst_len_hist, 0..) |c, len| {
+                if (c != 0) jitdbg.log("  burst-len {d}: {d}", .{ len, c });
+            }
+            var it = self.dbg_burst_terminals.iterator();
+            while (it.next()) |e| {
+                const k = e.key_ptr.*;
+                jitdbg.log("  terminal t={d} ei={d} kind={s} outcome={s}: {d}", .{
+                    k.trace_id,       k.exit_instr,      @tagName(k.kind),
+                    @tagName(k.outcome), e.value_ptr.*,
+                });
+            }
+        }
+    }
+
     pub fn dbgDumpGuardFailures(self: *TraceState) void {
         if (comptime jitdbg.enabled) {
             if (!self.config.debug_log) return;
@@ -2258,6 +2321,8 @@ pub const TraceState = struct {
     }
 
     pub fn deinit(self: *TraceState) void {
+        self.dbgDumpBurstStats(); // jitdbg-only burst-terminal telemetry (Part B)
+        self.dbg_burst_terminals.deinit(self.gpa);
         self.counters.deinit(self.gpa);
         self.gate.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
@@ -4907,6 +4972,7 @@ pub const TraceState = struct {
         regs: RegWindow,
         safe_to_arm: bool,
     ) ChainResult {
+        self.dbgNoteBurst(entries); // Part-B terminal telemetry (jitdbg only)
         const max_hops: usize = 8;
         var linked_completed: usize = 0;
         var resume_pc: u32 = seed.anchor.pc;
