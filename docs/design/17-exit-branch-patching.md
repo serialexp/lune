@@ -1,7 +1,7 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
-Status: partial — A-vii-c (gate-consumption flip, first selection-diverging step) landed 2026-08-11 and was corrected on review 2026-08-12 to the consumption-keyed boundary (a region window owns the gate for exactly the receipts it consumes; every other receipt keeps the pre-flip per-trace machine). A-vii-d.0 (2026-08-12) then resolved why no measured region reached `armable`: armability was frozen at first sight, which necessarily precedes the external-entry side trace; discovery now recomputes it per rebind (only the new `tombstoned` bit is sticky), nsieve's region arms, and the matrix runs the exercised region-gate oracle. A-vii-a replay and A-vii-b descriptors/validator landed byte-identical-inert 2026-07-25; the behavior-changing edge-4 arm (A-vii-d) and measurement (A-vii-e) remain unimplemented.
-Last updated: 2026-08-12 (A-vii-d.0 armability recomputation — region gate machine now LIVE on real shapes; §A8 step 7 remains unticked pending A-vii-d arm + A-vii-e).
+Status: partial — A-vii-d + A-vii-d.1 (the edge-4 FLIP: `region_bridge_arming_enabled=true`, composite-overlay successor resolution with the crossed-for_loop continue proof, closed-SCC `enclosing` owner election, receipt-sited two-phase arming, exact-region replay validation + stale-region disarm sweep, and the mid-walk disarm deferral) landed 2026-08-12 — edge 4 arms AND fires on nsieve (bridge fused 25k/run), six-workload output identity holds. Earlier: A-vii-c gate-consumption flip (2026-08-11, corrected to the consumption-keyed boundary), A-vii-d.0 armability recomputation, A-vii-a/b inert replay grammar + descriptors (2026-07-25). ONLY A-vii-e (measure/report) remains; §A8 step 7 stays unticked until it lands.
+Last updated: 2026-08-12 (A-vii-d/d.1 landed — the composite bridge is armed and firing; pending A-vii-e measurement).
 
 Status: partial — A-v (edge-4 bridge stub emission, unarmed/inert) landed 2026-07-24; A-iv (`region_profit` accumulator, inert) landed 2026-07-22; A-iii (`call_seq` plumbing, inert) landed 2026-07-21; Increment 1 (shared mcode arena, P-D), Increment 2.1 (frameless chain-entry ABI, P-A), Increment 2.2 (chain-wide result contract, P-B), Increment 2.3a (indirect exit + link-slot table + P-E registry scaffolding), Increment 2.3b (2.3b-0 inert scaffolding + 2.3b-1 flip arming on), Increment 2.3c-0 (inert contracts a–f + post-review blocker fixes: memory-staged `exit_target`, reserved-cell removal, `final`-first exclusion), Increment 2.3c-1 (M1 half-fusion: arm skip→prime-side ordinary source-branch guard + dispatcher fused-`.link` consumer), Increment 2.3c-2a (per-transition ledger ABI + native emission at all four exit sites + terminal-consistency assert, no accounting change), and Increment 2.3c-2b (route `runLinkedBurst`'s native call-B drain through ledger replay — `runCapturingLedger` + phase-machine `replayContinuationLedger`, ≤2-entry release-enforced, no accounting change) landed; all byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies run frameless under one shared trampoline (`ensureTrampoline`); every native exit stub jumps through a per-exit heap-resident link slot (`jmp qword [&slots[i]]`, default = `shared_exit`) and bakes the final trace's stable id into `NativeResult.final_trace_id`. As of 2.3c-0f/blocker-fix, ordinary/loop-done-ordinary guards route through the shared `deopt_exit` flush, which dispatches the RESOLVED target via the flush-immune `NativeResult.exit_target` memory field (`jmp qword [rdx+exit_target]`) — no reserved slot cell, no rax-staged holder. As of 2.3b-1, `driveChain` ARMS the continuation's `.link`-terminal slot → `inner.linked_entry`, so a native run of the continuation fuses straight into the inner root under the shared frame (no ~600ns Zig re-entry per hop). The dispatcher resolves `final = traceById(final_trace_id)` STRICTLY on the native path (`@panic` on null, no `ct` fallback), and `final != ct` is now expected. `driveChain` drains fused results by resolving each child strictly by `final_trace_id` + `isInnerLoopRoot` shape check (unresolvable/mis-shaped ⇒ `@panic`, no unsafe resume). The P-E backlink registry (`armed_links` + `armNativeLink`/`resetLinksTouching`, reset before `destroy` in `removeTrace`) is now LIVE for `.link` slots AND (2.3c-1) `.ordinary_guard` source-branch slots. As of 2.3c-1, `driveChain` also arms the skip trace's source-branch guard → the prime-side ramp's `ordinary_entry`, and the dispatcher gained a fused top-level `.link` consumer (`fusedSourceBranchLinkSlot` provenance recognizer → `onSideExit(ct, skip_local)` replay → `runLinkedBurst`) so skip→ramp fuses into one native call. Next: Increment 2.3c-2c — persistent loop-done inner→continuation, closing the native cycle. Re-scoped 2026-07-14 after a codex pre-impl BLOCKER + a follow-up APPROVE-WITH-CHANGES review: because a persistently-armed I→C cycle is also entered where no ledger is captured (call A, dispatcher native runs), the safe path is capture-everywhere — a 6-sub-step sequence (2c-A ledger disambiguation ABI → 2c-B forced-yield cap → 2c-C single generic `replayLedger` returning a terminal directive → 2c-D capture at call A + dispatcher with exact M1 parity → 2c-E arm I→C persistently → 2c-F disarm load-bearing test + review). The ledger ABI (2.3c-2a) and the ≤2-entry call-B replay (2.3c-2b) are the foundation; 2c-C/2c-D generalize the drain and 2c-E flips the cycle-closing arm. **As of 2026-07-14, 2c-A through 2c-E have all LANDED byte-identical — the native `continuation↔inner` cycle is CLOSED** (`armLoopDoneLink` at 3 sites incl. the `replayLedger` convergence arm; a native one-trip correctness fix; 5 blocking tests green; nsieve/mandelbrot/nbody/spectral-norm tier-0==tier-1a==native). A permanent compile-gated JIT debug facility (`src/jitdbg.zig`, `-Djit-debug`/`--jit-debug`) replaced the ad-hoc `std.debug.print` scaffolding used through this arc. **2c-F COMPLETE (2026-07-14)** — the two-phase same-VM disarm integration test + negative control + supported cold-re-entry guard landed, and the full codex `gpt-5.6-sol` review of the arc ran: every supported path sound, one rerun blocker raised and resolved by exit-slot hardening (derive-not-trust target + in-page entry validation) plus `Vm.run`/`start` epoch containment (`beginTopLevelEpoch` → `disarmAllLinks`). Increment 2.3c-2c closes; the native continuation↔inner cycle is closed and its lifetime hardened. See §Implementation status → Outstanding for the per-sub-step record. **Increment 3 DESIGN landed 2026-07-17** (pre-impl review pending): re-scoped after a fresh `--jit-stats` profile + a decisive throwaway A/B (disabling the gate lifts nsieve:14 from 5.0%→92.8% traced but moves wall time only ~1%) proved the wall is **per-transition Zig re-entry on the still-open branch-loop region, not codegen or the indirect-slot load**. Two sequenced parts: **3A** arms the one missing edge — `cont(29).composite-guard → skip(14).ordinary_entry` (the mirror of M1/2.3c-1) — closing `skip→ramp→inner→cont→skip` as one `LEDGER_CAP`-bounded native region so `onSideExit(nsieve:14, …)` clears ≥ `min_useful` and the anchor never gates; **3B** is the faithful `lj_asm_patchexit` rel32 port + the in-place-patch P-E hardening, measure-gated. Four blocking review questions on 3A (edge-4 header coherence, the composite-back-edge no-yield safe-point hole, `safe_to_arm`/disarm coverage of the new cycle, P-EBP accounting parity). **codex `gpt-5.6-sol` pre-impl review (2026-07-17) = BLOCKER**: two Part-A claims unsound — (1) edge-4 coherence (cont's composite guard is coherent at cont's anchor, not skip's header → needs its own materialization contract, not `.ordinary_guard` reuse); (2) the "summed composite count → never gates" mechanism is retracted (`replayLedger` bills per-segment local deltas; the M1 grammar is same-anchor-only and panics on an `rbx`-advancing successor). Gate-clear now hinges on a Bart fork: (a) per-segment accounting + armed entry bypassing `isGated`, then measure; or (b) region-level accounting as a P-EBP-2 redesign. Part B: "co-location ⇒ rel32 reaches" is false (arena defers cross-region reachability), a raw rel32 bypasses the forced-yield cap, ordinary guards lack a per-exit patch point, discovery needs a cross-anchor PC map. Antigravity (gemini-3.1-pro) review = confirms both blockers + adds option (c) exempt-armed + a mid-burst-gate correction + a "fix trace selection" reframe. **RESOLVED 2026-07-17 (Bart):** trace-selection investigated and RULED OUT — doc 15 + the recorder (`recForPrepLink` LINNER) + `luajit -jdump=t` on the same nsieve (3 self-loop roots + 8 side traces patched into roots) all show lune fragments **byte-for-byte identically to LuaJIT**, so "record as one trace" is the exact thing both tried-and-rejected; arming/patching (Increment 3) is confirmed the LuaJIT-faithful path. **Part A design of record** (§Part A (RESOLVED)): edge-4 gets its own bridge/materialization (`asm_head_side`-style, commits cont's outer-back-edge phis — NOT `.ordinary_guard` reuse) + **gate strategy B (region-level accounting)** chosen over (c) exempt-armed (B measures the right unit, correct regardless of transition cost, retains cold-region retirement; C is "trust arming ⇒ profitable", valid only post-patching + needs a separate flush). New cross-anchor replay grammar + region-membership map. `min_useful` retune is a Part-B-landing obligation; B→C hybrid for proven regions is a measure-gated future opt. See §Increment 3 → Review outcome + §Part A (RESOLVED). **ROUND-3 DESIGN WRITTEN 2026-07-17** (§Part A — round-3 design): all nine round-2 blocker items now have concrete code-grounded contracts — bridge dominance snapshot (filtered by `update_index < 23` + successor-liveness) via `flushSlot`/`placeOfRef`, enter `skip.ordinary_entry` (guard re-run resolves the invariant-bypass hazard), `inputs.len==0`, an **in-page bridge stub** (parallel to `linked_loop_done_labels`, lifetime covered by the existing registry for free) + `ArmKind.region_bridge`; `onSideExit` split into `accountTraceRun` (per-segment, preserves `hit_count` selection) vs `accountRegionProfit` (penalty/gate, a lone trace = degenerate 1-member region → identical to today), normalized outer-traversal unit, identity `RegionKey` owned by `AnchorKey(proto,14)`, one persistent accumulator on **logical** (not physical `LEDGER_CAP`/hop) windows with GC-safepoint exclusion; additive `.region_bridge` ledger arm that leaves the same-anchor `.deopt` provenance (3098)/zero-progress (2159) invariants intact. Reframe correction: an armed ordinary guard is already a native in-page handoff (edge 4 is the *only* per-iteration Zig re-entry), and edge 4's coherence gap is exact (cont's `count+1`/`next i` dominate `%023` but their phi writebacks are post-guard, so the shared `deopt_exit` flush commits stale values). **ROUND-3 REVIEW (codex `gpt-5.6-sol` + Antigravity) = BLOCKER (both)** — sound sub-parts confirmed (A.1.1–1.3, A.2.1–2.3, A.3); 9 converging fixes for a **round-4 pass** (§Review outcome — round 3): B-1 forced-yield must cap-check-first→ordinary-deopt (commit-then-yield breaks the terminal-consistency assert + replay); B-2 unarmed stub must stage `exit_target`; B-3 the compile-time bridge classifier is temporally impossible (native lowering has no region map; pages memoized) → an emission-strategy fork (precompute / generic stubs / recompile) = Bart's call; B-4 the logical-window accumulator must be a persistent VM-level region table (NOT trace state, NOT flushed on GC-physical retirement) with stack-depth-gated region-exit + tier-independent membership; B-5..B-9 smaller precisions. No code until round-4 is clean. **ROUND-4 DESIGN WRITTEN 2026-07-17** (§Part A — round-4 design): all nine resolved — Bart's B-3 fork = **(b) generic stubs, armed later** (trace-local bridge stub at every composite guard, no region map at lowering); cap-check-FIRST then commit, reusing the `ordinary_mini` path for both unarmed and ledger-full (B-1/B-2, byte-identical when unarmed); a **persistent VM-level region table** (proto/VM lifetime, NOT trace state, NOT flushed on retirement) with a stack-depth-gated region-exit + activation-keyed `RegionKey` + logical window `N = min_useful` (B-4); a tier-independent `(proto, exit_pc)` classifier at all three accounting sites (B-6); successor live-in ∪ live-through set (B-5); replay-owned resume PC via the edge map (B-7); synthesized `completed` preserved in `accountTraceRun` (B-8); stub-free/map-explicit split lifetimes (B-9). **ROUND-4 REVIEW (codex `gpt-5.6-sol` + Antigravity) = BLOCKER (both)** — direction reconfirmed sound, most of B-1..B-9 resolved; five converging round-5 must-fixes (D-1..D-5) unified by "the LOGICAL region layer persists at Proto/VM lifetime + is identity/edge-keyed; only the PHYSICAL armed-edge slot layer is retirement-cleaned": D-1 cap-check reserve-2-cells off-by-one (`>= CAP-1`); D-2 compile-time set E vs arm-time set S (drop `final_trace_id`, child `inputs.len==0` is arm-time); D-3 accounting-state (window `+=N`, identity `region_id`, no invented `FrameId`, membership from the recorded trace graph in every tier); D-4 classifier keyed `(trace_id, exit_instr)` + split at every `onSideExit` site; D-5 ‡ logical map never retirement-cleaned. One scope fork (D-3c recursion handling) = Bart's call. See §Review outcome — round 4. No code until round-5 is clean. **ROUND-5 DESIGN WRITTEN 2026-07-17** (§Part A — round-5 design): all resolved with Bart's D-3c = **(β) build activation discrimination** (deterministic per-VM monotonic `call_seq` on `CallFrame`, gc_stress-invariant); D-1 two-cell cap reservation + unreachable-`CAP` invariant; D-2 compile-time set E vs arm-time set S (drop `final_trace_id`, child `inputs.len==0` at arm time); D-3 three-map split + identity `RegionId` + window `+= N` + `call_seq` activation identity + discovery from the trace graph in every tier; D-4 `(trace_id, exit_instr)` classifier + split at every site; D-5 logical maps Proto/VM-owned, only `armed_links` retirement-cleaned; D-6 precisions. **ROUND-5 REVIEW (codex `gpt-5.6-sol` + Antigravity) = BLOCKER (both)** — edge-4 bridge (D-1/D-2/D-6) now SOUND; surviving blockers are integration surfaces (E-1..E-7): E-1 `RegionDef` keyed by ephemeral `Trace.id` (need stable structural edge id); E-2 `call_seq` can't be a physical `CallFrame` counter under trace inlining; E-3 classifier key absent at synthetic scalar `onSideExit` sites; E-4 overlapping-PC region exit; E-5 keyframe schema v4→v5; E-6 coroutine thread-scoped depth; E-7 error-unwind cleanup. The review re-weights D-3c=β (E-2 + `call_seq` half of E-5 are β-only; α avoids them) — **α/β RE-CALL surfaced to Bart** before round 6. See §Review outcome — round 5. **ROUND-6 DESIGN WRITTEN 2026-07-17** (§Part A — round-6 design), preceded by three parallel tree-grounding sweeps (trace inlining+deopt / keyframe schema / coroutine+error-unwind): all E-1..E-7 resolved, with **one reshaping insight ‡** — `region_profit` + `call_seq` are **transient JIT-tiering state, NOT replay-serialized** (same category as the trace cache / `safepoint_seq` / `effect_cursor`, none of which ride the keyframe), because they steer only *which tier* runs and never *what it computes* (native ≡ tier-0). That **collapses E-5 to no schema bump** (keyframe stays v4; reset-on-restore, which is the reviewers' own "logical region reset" alternative made rigorous — strictly safer for `encodeSnapshot∘restore==identity`) and **collapses E-2** (the activation key is the *anchor* frame's `call_seq`, assigned in tier-0 at `pushFrameVararg` `interp.zig:1346` before tier-up and never mutated on-trace since inlined callees push no physical frame — tier-invariant, no new IR op, no loop-carried commit discipline). E-1 stable `StructuralEdgeId{anchor_proto_id,anchor_pc,exit_pc,succ_anchor_pc}` + ephemeral `(Trace.id,exit_instr)` cache; E-3 optional `?ExitKey` (synthetic sites region-neutral); E-4 identity-transition exit under PC overlap; E-6 no coroutines exist (host-reentrancy `native_reentry_depth` handled instead); E-7 two teardown hooks (`.ret`/`.halt` pop + `protectedCall` `entry_depth` restore), `__gc` moot (finalizer-free GC). β fully preserved (one `u64` on `CallFrame` + one choke-point bump). **E-5 deviation from the round-5 v4→v5 resolution is flagged in-doc for Bart + round-6 reviewers to veto.** **ROUND-6 REVIEW (codex `gpt-5.6-sol` + Antigravity) 2026-07-17 = reshaping insight SURVIVES / BLOCKER on restore path.** codex confirms it directly ("a v4→v5 schema bump is not inherently required") → **the E-5 deviation is VINDICATED, keyframe stays v4**; Antigravity returned UNSOUND but its sharpest counterexamples (address-dependent `pairs()`, side-exit callee-frame reconstruction, `__gc` finalizers, background compilation) are all defused by lune facts codex verified (id-monotonic address-independent iteration, resume-at-loop-header deopt, finalizer-free GC, synchronous compilation). Surviving round-7 items (F-1..F-8): F-1 ‡ `StructuralEdgeId` can collide (multiple guards share `cur_pc`) → needs a stable guard-ordinal/role discriminator; **F-2 ‡ restore is a physical-frame construction path** (`keyframeser.zig:671`) → "reset call_seq=0" is WRONG, must **re-key each restored live frame with a fresh transient `call_seq` by frame order** (still no wire field, v4 holds); F-3 exact-current-frame (`frames[depth-1]`) invariant, not proto-match + `next_call_seq` exhaustion contract; F-4 JIT/VM share the allocator → post-restore tiering divergence could OOM one timeline (fork: exclude/isolate/fail-closed); F-5 current F2c harness is tier-0-only → owe a native-F2c test; F-6 E-6 exit-test polarity was backwards (`current_depth <= captured_anchor_depth`); F-7 host-abort boundary (non-catchable faults don't guarantee VM teardown; fork) + centralize cleanup with `protectedCall`'s 3-site depth restore; F-8 ground (not assert) that tier-dependent `safepoint_seq` can't perturb effect-log cuts. Both reviewers agree the layering is right; the work is restore-path precision. Two forks (F-4, F-7) for Bart. No code until round-7 clean. **ROUND-7 DESIGN WRITTEN 2026-07-17** (§Part A — round-7 design), grounded in two more tree sweeps (allocator arch; effect-log drivers): F-1..F-8 all resolved and **both forks collapsed** — F-4 (mcode is a separate `mmap`, `gpa` unbounded by default → OOM-divergence is pre-existing to native tiering and outside replay equivalence; JIT-allocator isolation flagged as optional Bart tightening) and F-7 (monotonic `call_seq` keys ⇒ no correctness hazard; extend the existing `beginTopLevelEpoch` to clear `region_profit` + the existing cap). F-2 ‡ restore re-keys each live frame `call_seq=i` by index (keyframe stays **v4**, no wire field); F-1 structural key gains a recording-stable `exit_ordinal`; F-3 exact-`frames[depth-1]` + exhaustion contract; F-5 native-F2c test obligation; F-6 exit polarity fixed; F-8 grounded non-issue (effect log logical-order-keyed/tier-independent). **ROUND-7 REVIEW (codex `gpt-5.6-sol` + Antigravity) = BLOCKER (both) — two deep new findings on the JIT↔snapshot boundary.** F-3/F-4/F-5/F-6 resolved (F-4 reworded: replay-equivalence is conditional on no allocator/mcode exhaustion). Surviving/new (G-n): **G-1 ‡** `exit_ordinal` by IR position is NOT re-recording-stable (recording is guest-value-dependent — `guardNum` int/float, array-guard variance, guard elision/LICM) AND `guardExitPc` (`trace.zig:451`) can't supply `exit_pc` for array/table/grid guards at all → need a canonical guest-logical guard identity carried as new IR metadata; **G-2 ‡ (the deep one, CONFIRMED against the tree)** the transient trace cache roots heap objects INTO the serialized snapshot — `keyframeser.zig:265` seeds its walk from the shared `forEachRootHeader`, whose item 5 roots trace/recording consts (which may be the sole ref to an otherwise-dead heap object) → a tiering-dependent `region_profit` history can change snapshot bytes (latent only because the F2c harness is tier-0-only) → need JIT-independent snapshot reachability; **G-3** a bounded/LRU cap can evict LIVE activation accounting + no enforced clean-entry rule; **G-4** a native F2c cut selected by safepoint count is tier-dependent → define the cut by a tier-independent logical event; **G-5** Antigravity's coroutine cross-stack re-key collision (grounded N/A — lune has a single physical stack; invariant pinned). **ROUND-8 DESIGN WRITTEN 2026-07-17** (§Part A — round-8 design): G-1 replaces the IR-position ordinal with a guest-logical `GuardProvenance{source_proto_id,source_pc,inline_depth,role,operand,occurrence}` tag stamped at emission for ALL guard kinds (an IR extension); **G-2 splits `forEachRootHeader` into `{gc, snapshot}` kinds — trace/recording consts are GC-liveness roots only, excluded from the snapshot semantic-root walk**, with a case-1/case-2 proof (every trace const is either semantic-reachable ⇒ unchanged, or trace-only-and-semantically-dead ⇒ correctly dropped because deopt recomputes it at the loop header) — the general fix, making ALL snapshotting JIT-independent by construction; G-3 makes activation-scoped cleanup MANDATORY (entry lifetime = activation lifetime ⇒ cap can never evict live) + unconditional `beginTopLevelEpoch` region-clear; G-4 tier-independent logical cut + effect-cursor assertion; G-5 single-stack re-key invariant pinned. Keyframe stays **v4**. Two new impl obligations: the `GuardProvenance` IR extension + the `{gc,snapshot}` root-walk split. **ROUND-8 REVIEW (codex `gpt-5.6-sol` + Antigravity) = BLOCKER (both) — a FOUNDATIONAL finding, both reviewers built the SAME counterexample.** **H-2 ‡‡ (escalated to Bart):** the `{gc,snapshot}` split is necessary but NOT sufficient — dropping a **trace-only interned** const changes the observable heap-**id** timeline (uninterrupted VM re-finds the interned obj → same id; restored VM re-allocates → different id), and ids are semantic (equality `value.zig:197`, table hash `table.zig:545`, `pairs` order `key_order.zig:21`, `tostring` `io.zig:166`); `next_obj_id` is unserialized (`keyframeser.zig:521`) and the F2c test already only supports programs with no discarded pre-cut objects (`keyframeser.zig:1755`). This is **broader than Increment 3** and likely **forces serializing `next_obj_id` → keyframe schema bump, reversing the reshaping insight** — OR restricting when snapshots may be cut. Mechanics blockers survive: **H-1** `GuardProvenance` collides (`inline_depth` ≠ call-path; `source_pc` is post-increment resume-PC; derived-value guards under-defined → need per-opcode `GuardSite` vocab + inline call-site path); **H-3** cap-eviction bound unproven + `beginTopLevelEpoch` clean-entry not enforced; **H-4** only "after Nth committed effect" cut is implementable (native overshoots iterations). **G-5 RESOLVED.** **H-2 escalated to Bart for a scope/architecture call before round 9; no code.**
 Owner: Bart
@@ -6428,6 +6428,18 @@ Implement this as a narrow helper such as `tryArmRegionBridge`, called from
 The final A-vii sub-step flips `region_bridge_arming_enabled` at
 `trace.zig:1073` to `true`.
 
+> **CORRECTED by A-vii-d.1 (2026-08-12) — the call site and step 1's
+> preconditions were grounded wrong; the helper and steps 1–3 stand.** As
+> measured on the target topology, (a) the composite guard's owner (the
+> continuation) never reaches `driveChain`'s head as `failed` — its deopts
+> surface in the chain-run and as fused-span `.deopt` ledger rows — and (b)
+> `source_exit_regions` can never hold the composite exit because the landed
+> A-ii.2 successor resolution cannot discover the `cont→skip` structural edge
+> (a branch guard's committed exit pc is the re-execute pc `source_pc+1`, not
+> the opposite path's landing anchor). See the **A-vii-d.1** entry in the
+> sub-step list below for the grounding probes and the corrected design
+> (branch-guard successor resolution + receipt-sited arm).
+
 **Arm-time §A2.6 obligations.** Discovery retains, per armable bridge edge in
 `RegionDef`, a sorted owned descriptor: exact `StructuralEdgeId`, successor
 anchor, `required_slots = S`, and proven edge-invariant slots. `S` is the
@@ -6642,6 +6654,176 @@ determinism matrix.
    `.region_bridge` selection-only exception (no owner penalty accrues from a
    productive armed region's bridge transitions), and confirmation of the
    `invariant_slots = S \ E` soundness assumption flagged at A-vii-b.
+
+   **A-vii-d.1 — SECOND grounding round (2026-08-12): the §A-vii.2 arm site as
+   written can never fire on the target topology. Two gaps, both measured, both
+   general.** The arm-site helper (`tryArmRegionBridge`), the
+   `.region_bridge` counters, and the `region_bridge_arming_enabled = true`
+   flip were implemented exactly per §A-vii.2 and instrumented with permanent
+   jitdbg decline probes; on nsieve the helper is never even REACHED. Root
+   causes, from the probes:
+
+   - **Gap 1 — the cont→skip structural edge is undiscoverable by the landed
+     A-ii.2 successor resolution, so the designed outer region does not
+     exist.** `isCompositeBridgeCandidate` correctly identifies exactly one
+     candidate on nsieve (`t=cont anchor=29 ei=23`, the A-v stub emits), but
+     the guard's committed `aux` is `source_pc + 1 = 18` (the post-increment
+     fetch convention, H-1b) — the deopt path re-executes the source
+     `jmp_if_false` at 17, it does not resume at 18. No trace anchors at 18,
+     so `resolveSuccessorAnchor`'s `.guard` arm (`guardExitPc` + a bound trace
+     at that pc) drops the exit entirely: the edge cache holds only `24↔29`
+     and `14→24` (the ramp's `.link`), the SCC is the INNER cycle `{24,29}`
+     (`mint … members=2 … bridges=0`), and `skip@14` never joins. The region
+     that A-vii-d.0 made armable is the inner `C↔I` cycle — whose edges 2/3
+     are already armed by 2.3b-1/2c-E — NOT the outer 4-edge cycle edge 4
+     belongs to. `RegionBridgeDef` construction only considers INTERNAL edges,
+     so `bridges == 0` and `validateRegionBridge` can never resolve a
+     descriptor. The A-ii.4 synthetic discovery tests hand-built the
+     `cont→skip` edge with the exit pc equal to the skip anchor, which is why
+     this was invisible until now: no RECORDED branch guard can produce that
+     shape, because a branch guard's committed exit pc is always
+     `source_pc + 1`, never the opposite path's landing anchor.
+
+   - **Gap 2 — composite deopts never reach `driveChain`'s head as
+     `(failed, exit_instr)`.** The continuation is never dispatcher-entered
+     (dispatcher receipts on nsieve: pc 14/24/4 only). Its composite guard
+     failure surfaces (a) inside `driveChain`'s chain-run — the "not a
+     completed link run" exits where `sct == cont` ran natively and
+     `sresult.exit_instr` is the composite index — and (b) as `.deopt` ledger
+     rows with `owner == cont` drained by `replayLedger` in the fused steady
+     state. §A-vii.2's "immediately after `exit_instr` is accepted" placement
+     keys on the dispatcher-entered trace and observes neither.
+
+   **A-vii-d.1 design (general, Z-6-clean — no nsieve special case), as
+   corrected by the gpt-5.6-sol design review (2026-08-12; verdict: direction
+   sound, five blockers, all folded below):**
+
+   1. **Composite-scoped overlay successor resolution, with the continue proof
+      GATING discovery.** Do not widen `resolveSuccessorAnchor` for every
+      `branch_cond` exit (their deopt semantics keep the H-1b re-execute
+      convention); add an overlay used only when the ordinary resolution fails
+      AND `nativegen.isCompositeBridgeCandidate(t, e.index)` holds. The
+      overlay requires non-inlined same-proto branch provenance
+      (`inline_depth == 0`, `source_proto_id == t.anchor.proto.id`,
+      `polarity != .neutral`, source op exactly `jmp_if_true/false`), takes
+      the **opposite-polarity static target** (jump target if recorded
+      `.fallthrough`, else `source_pc + 1`; targets computed with the
+      interpreter's post-fetch `applyJump` convention), then walks the static
+      CFG across ONLY unconditional `jmp` ops and **at most one numeric
+      `for_loop` continue edge** (bounded steps, no pc revisits; any other op
+      declines) to the first pc with a bound trace. Review blocker 1: a
+      crossed `for_loop` has TWO successors (continue/exit), so the exact
+      continue-edge proof (item 2) is a PRECONDITION of publishing the edge
+      into `edge_cache` — an unproven edge would corrupt SCC construction,
+      owner election, and gate keying, not merely the arm.
+   2. **Exact dataflow proof per crossed `for_loop` (review blocker 2:
+      provenance-tag matching is many-to-one and insufficient).** For the
+      crossed `for_loop` at pc `P` writing `{a (idx), a+3 (var)}`, require in
+      the parent IR the exact `recForLoop` shape, related by refs, all
+      dominating the composite guard (`< composite_ei`): a committed
+      `.loop_done` guard `g` with `guardSourcePc == P`, non-inlined, whose
+      guarded compare consumes an `add` ref `R`; and the dominance-scoped
+      emitted set `E` must flush **that exact ref** for both written slots —
+      slot-bound phis for `a` and `a+3` with `update == R`. Limit/step are
+      not written by `for_loop` and may legitimately classify invariant; this
+      is what gives `invariant_slots = S \ E` its missing soundness
+      (`invariant = required ∧ ¬emitted ∧ ¬written-by-any-crossed-op`, with
+      the crossed-write ⊆ E-with-exact-ref requirement enforced by the
+      overlay before the edge exists). The passed `.loop_done` guard also
+      soundly excludes the loop-EXIT edge: on the native execution that
+      reaches the composite guard, the continue condition was already proven.
+   3. **Stale-region lifecycle (review blocker 3).** SCC enlargement mints a
+      NEW `RegionId` (identity = canonical internal-edge set) while the old
+      inner region's logical def persists for the epoch. So: `NativeLink`
+      records gain `{kind, region_id}`; `replayLedger`'s `.region_bridge` arm
+      validates through the armed link's exact `region_id` (def live +
+      armable + edge registered in THAT def), never a global historical
+      `region_defs` scan; and every discovery rebuild disarms any armed
+      `.region_bridge` link whose `region_id` is no longer live-armable
+      (fail-closed on topology transitions). The old accumulator's transition
+      is already handled: `chooseSource` closes an active region absent from
+      the new candidate set (a deterministic remainder flush, not an error).
+   4. **Receipt-sited arm, complete coverage, two-phase in replay (review
+      blockers 4–5).** `tryArmRegionBridge` keeps the §A-vii.2 step-1..3
+      gates unchanged. Call sites: (a) the existing `driveChain`-head site
+      STAYS (dispatcher-entered composite parents are topology-legal even if
+      nsieve never produces one); (b) `driveChain`'s "not a completed link
+      run" chain-run exits; (c) the scalar one-entry-ledger call-A exit in
+      `runLinkedBurst`; (d) `replayLedger` — but NEVER mid-walk:
+      `invalidateRegion → disarmAllLinks` inside the walk could erase the
+      armed provenance later `.region_bridge` rows validate against, so
+      replay records at most one pending `{owner, exit_instr}` request when
+      it sees a terminal composite `.deopt` row and the ledger DRIVERS invoke
+      the helper after `replayLedger` returns. Arm attempts run AFTER the
+      row's region accounting so the receipt that first latches
+      `useful_window_seen` can qualify its own arm.
+
+   The already-landed pieces (helper, counters, flag flip, decline probes)
+   are correct per the original spec and carry over; d.1 changes WHERE the
+   helper is called and WHAT discovery can see, not the qualification or
+   validation chain.
+
+   **A-vii-d.1 LANDED (2026-08-12).** Items 1–4 implemented as designed
+   (`resolveCompositeBridgeSuccessor` + `compositeContinueProof` overlay
+   gating `edge_cache` publication; `NativeLink.{kind, region_id}` +
+   exact-region replay validation + rebuild-time
+   `disarmStaleRegionBridgeLinks` sweep, fail-closed on every
+   empty-physical-indices path; receipt-sited `maybeArmCompositeExit` at the
+   `driveChain` head, the chain-run "not a completed link run" exits, and
+   two-phase `pending_bridge_arm`/`drainPendingBridgeArm` for the ledger
+   walks). Landing surfaced THREE additional grounded gaps, all fixed and
+   test-pinned:
+
+   - **Owner election for fully-closed SCCs (discovery-side).** A closed SCC
+     has NO incoming boundary edge (dispatcher entry creates no structural
+     edge), so the `ext_entry ∧ inner_root` owner rule can never elect and
+     the enlarged 3-member region stayed `owner_unique=false`. Fix: an
+     `enclosing` predicate — a member is enclosing when its numeric loop's
+     body span `[anchor_pc, forLoopEndFor(proto, pc)]` contains every other
+     same-proto member — and the owner condition becomes
+     `(ext_entry ∨ enclosing) ∧ inner_root`. Measured on nsieve:
+     `region: mint id=1 kind=cross_trace_cycle members=3 armable=true
+     (owner_unique=true membership_complete=true bridges=1)`.
+   - **`driveChain` hop-0 scalar seam misreads a bridge-headed ledger
+     (consumer-side).** The armed bridge firing mid-run yields a 2-row
+     `[C.region_bridge, S.term]` ledger; the scalar `sresult_fused` seam
+     models only `[C.link, I.x]` and consumed the bridged successor as a
+     fused INNER (measured panic: "fused final trace is not the expected
+     inner root"). Fix: bridge-headed hop-0 ledgers route to
+     `driveSeedLedger`, whose head grammar now accepts a `.region_bridge`
+     first row (≥2 rows, `isCompositeBridgeCandidate(seed, e0.exit)`).
+   - **Bridged-successor terminal contract in `replayLedger`.** A successor
+     entered through the bridge runs mode 0 (`ordinary_entry`) and follows
+     the coherent-anchor discipline, NOT the linked C⇄I grammar: its
+     terminal `.deopt` / `.prologue_fail` resumes at ITS OWN anchor (the
+     value the `.region_bridge` row published into `resume_pc`;
+     hard-verified equal), and an ordinary-mode loop-done deopt is
+     legitimate (mode 0 bypasses the linked slot). The prior sub-case (b)
+     `link_pc` resume applies only to linked inners.
+   - **The mid-walk disarm hazard generalizes review blocker 5 beyond the
+     arm path.** `flushRegionWindow` (low-yield strike reaching
+     `max_penalty`) and `invalidateRegion` both run per ledger row inside
+     `replayLedger` and called `disarmAllLinks` MID-WALK — erasing the
+     armed-edge provenance the SAME ledger's fused rows validate against
+     (measured panic on the fused M1 row the moment the new region armed the
+     gate machinery). `disarmAllLinks` now defers while
+     `replay_walk_depth > 0` (`pending_disarm_all`); every ledger driver
+     calls `applyPendingDisarms()` immediately after the walk, BEFORE
+     `drainPendingBridgeArm` and before acting on the directive, and a
+     deferred disarm also drops the walk's pending bridge-arm request
+     (fail-closed — never disarm-then-re-arm into a complex the gate just
+     condemned).
+
+   Measured after landing (ReleaseFast, nsieve 9, `--jit-stats`): bridge
+   arms 961, bridge fused 25 186 — edge 4 is live at scale. Six-workload
+   output-identity control (nsieve/nbody/sieve_int/pi_leibniz/grid_matmul/
+   field_hash): native == tier-0 == the frozen control hashes. Gates:
+   `just test` and `zig build test -Djit-debug=true` green (835 tests).
+   Tests pinning d.1: overlay polarity/jmp-walk/self-edge; crossed-for_loop
+   continue proof (pass + both violation shapes); bridged `.loop`-ending
+   successor terminal (incl. ordinary loop-done); disarm deferral;
+   stale-region rebuild sweep; two-phase pending arm (record + cross-ledger
+   clear).
 5. **A-vii-e — measure/report:** run the frozen before/after protocol and record
    results without tuning to them. §A8 step 7 remains unticked until implementation,
    determinism evidence, measurements, and review are accepted.

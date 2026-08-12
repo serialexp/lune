@@ -1,5 +1,69 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-12 (LATEST-32) — **A-vii-d + A-vii-d.1 LANDED: edge 4 is ARMED AND FIRING (bridge fused ~25k/run on nsieve). NEXT = commit → codex post-landing review → A-vii-e measurement.**
+
+The flip is live end-to-end. A-vii-d proper (flag flip, `tryArmRegionBridge`
+with the §A-vii.2 gates + permanent decline probes, arm/fused counters +
+jit-stats lines) landed first; grounding then showed the spec'd arm site was
+unreachable (two gaps, doc 17 A-vii-d.1 entry), and the corrected design —
+gpt-5.6-sol design-reviewed, five blockers folded — landed on top:
+
+- **Gap 1 (discovery):** a branch guard's committed exit pc is the H-1b
+  re-execute pc, never the opposite path's landing anchor, so the cont→skip
+  edge never entered `edge_cache`. Fix: `resolveCompositeBridgeSuccessor`
+  overlay — opposite-polarity static-CFG target, walk across `jmp` + at most
+  ONE numeric `for_loop` continue edge, with `compositeContinueProof` (exact
+  recForLoop dataflow: both written slots {a, a+3} phi-bound to the same add
+  ref R, a dominating `.loop_done` guard whose `le` consumes R) GATING
+  publication. Plus the closed-SCC owner fix: no boundary edge exists into a
+  fully-closed SCC, so owner = `(ext_entry ∨ enclosing) ∧ inner_root` where
+  `enclosing` = the member whose for_loop body span contains all other
+  members. nsieve now mints `id=1 members=3 armable=true owner_unique=true
+  bridges=1`.
+- **Gap 2 (receipts):** composite deopts never surface at driveChain's head
+  on nsieve. Arm sites now: driveChain head (kept), the chain-run "not a
+  completed link run" exits, and — two-phase — `pending_bridge_arm` recorded
+  by replayLedger's terminal composite `.deopt` row, drained by all four
+  ledger drivers AFTER the walk.
+- **Landing surfaced 3 more consumer gaps, all fixed + test-pinned:**
+  (i) driveChain's hop-0 scalar seam misread the 2-row `[C.region_bridge,
+  S.term]` ledger as the `[C.link, I.x]` fused shape → bridge-headed ledgers
+  route to driveSeedLedger (head grammar now accepts a `.region_bridge` first
+  row). (ii) A bridged successor runs mode 0 → its terminal `.deopt`/
+  `.prologue_fail` resumes at ITS OWN anchor (the bridge row published it
+  into resume_pc; hard-verified), ordinary loop-done legal — never link_pc.
+  (iii) The mid-walk disarm hazard generalizes review blocker 5:
+  `flushRegionWindow` strikes / `invalidateRegion` run per ledger row and
+  called `disarmAllLinks` MID-WALK, erasing the armed provenance the same
+  ledger's fused M1 rows validate (measured panic the moment the region gate
+  went live). `disarmAllLinks` defers under `replay_walk_depth`; drivers
+  `applyPendingDisarms()` right after the walk, before the bridge-arm drain
+  (a deferred disarm also drops the pending arm, fail-closed).
+- **Stale-region lifecycle (review blocker 3):** `NativeLink.{kind,
+  region_id}`; `.region_bridge` replay rows validate through the armed
+  link's EXACT region (def live + armable + edge in THAT def, no global
+  scan); every rebuild ends with `disarmStaleRegionBridgeLinks(live_armable)`
+  and every fail-closed empty-physical path disarms all bridge links.
+
+Measured (ReleaseFast, nsieve 9): `link arms: … bridge=961`, `link fused: …
+bridge=25186`. Six-workload output-identity control ALL-PASS against the
+frozen hashes (nsieve 4053ed86223d7060, nbody 9dcd7fa2f7e9e93e, sieve_int
+db55c0f98f98851b, pi_leibniz f57ace5316c0fd19, grid_matmul 395ff5566b31eb18,
+field_hash 89b64d3d25ae188f), native ≡ tier-0. Gates: `just test` green (835),
+`zig build test -Djit-debug=true` green. New tests: overlay polarity/jmp/
+self-edge; continue proof (pass + 2 violation shapes); bridged `.loop`-ending
+successor terminal incl. ordinary loop-done; disarm deferral; stale-region
+rebuild sweep; two-phase pending arm. Doc 17 A-vii-d.1 entry + status header
+updated.
+
+Remaining: commit, codex post-landing review (fix findings on own judgment
+per Bart's standing mandate), then **A-vii-e** per the frozen protocol
+(`just bench --filter nsieve --reps 7`, per-anchor `--jit-stats` both trees,
+output equality first, report flat/negative honestly, Z-6 no special-casing).
+§A8 step 7 ticks only after e. NB for A-viii: the observation-window disarm
+churn (~2k disarms/run) now interacts with bridge arm persistence — bridges
+re-arm each round trip (961 arms/run), worth revisiting there.
+
 ## Status 2026-08-12 (LATEST-31) — **A-vii-d.0 LANDED: armability recomputed per rebind; the region gate machine is LIVE on real shapes. NEXT = A-vii-d proper (the driveChain arm + region_bridge_arming_enabled=true).**
 
 The A-vii-d opening question is answered. A permanent `region: owner-scan`

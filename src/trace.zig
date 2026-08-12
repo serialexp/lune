@@ -1137,9 +1137,14 @@ pub const ArmKind = enum {
     region_bridge,
 };
 
-/// A-v emits bridge-capable stubs but does not publish an edge into any of them.
-/// A-vii flips this only after the arm-time S⊆E validation and replay grammar land.
-const region_bridge_arming_enabled = false;
+/// A-v emitted bridge-capable stubs without publishing an edge into any of them.
+/// A-vii-d flipped this to true once the full chain landed: the replay grammar
+/// (A-vii-a), the arm-time S⊆E validator (A-vii-b), the consumption-keyed profit
+/// gate (A-vii-c/c.1/c.2), reachable armability (A-vii-d.0), and the
+/// `tryArmRegionBridge` arm site in `driveChain`. Flipping it back to false
+/// restores the pre-A-vii world: stubs still emit, but every `.region_bridge`
+/// arm attempt release-panics in `armNativeLink` (deliberate tripwire).
+const region_bridge_arming_enabled = true;
 
 /// A loop-carried writeback: at the back-edge, tier-0 register `slot` holds the
 /// value produced by IR `ref`. The set of these is the trace's exit snapshot —
@@ -1599,7 +1604,19 @@ inline fn hotIndex(proto: *const Proto, pc: u32) usize {
 /// at `slot_index` currently jumps straight into `child`'s body. Keyed by trace
 /// identity (not a raw slot address) so lifetime resets stay valid no matter which
 /// end retires first — the slot address is re-derived from the live `parent` at reset.
-pub const NativeLink = struct { parent: *Trace, slot_index: u32, child: *Trace };
+pub const NativeLink = struct {
+    parent: *Trace,
+    slot_index: u32,
+    child: *Trace,
+    /// A-vii-d.1: the arm kind is part of the record so replay can validate a
+    /// `.region_bridge` row against the exact provenance that armed it (review
+    /// blocker 3: never a global historical `region_defs` scan).
+    kind: ArmKind,
+    /// Set only for `.region_bridge` arms: the exact live region the arm was
+    /// proven against. Every discovery rebuild disarms region-bridge links whose
+    /// region is no longer live-armable (fail-closed on topology transitions).
+    region_id: ?RegionId = null,
+};
 
 /// Per-anchor JIT execution-coverage tally (`TraceState.coverage` value). `traced`
 /// = loop iterations committed by trace runs (tier-1b native, or tier-1a IR-interp)
@@ -1711,6 +1728,30 @@ pub const TraceState = struct {
     /// directions by trace *identity* (never a raw slot pointer), so it is correct
     /// regardless of retire order. Empty until arming lands (2.3b) → inert in 2.3a.
     armed_links: std.ArrayListUnmanaged(NativeLink) = .empty,
+    /// A-vii-d.1: at most one bridge-arm request recorded by `replayLedger` when
+    /// it walks a terminal composite `.deopt` row, drained by the ledger DRIVERS
+    /// via `drainPendingBridgeArm` after the replay returns (never mid-walk —
+    /// review blocker 5: a mid-ledger `invalidateRegion → disarmAllLinks` could
+    /// erase the armed provenance later `.region_bridge` rows validate against).
+    /// Cleared at every `replayLedger` entry so a stale request can never leak
+    /// across ledgers.
+    pending_bridge_arm: ?ExitKey = null,
+    /// A-vii-d.1: nonzero while a `replayLedger` walk is in progress. While set,
+    /// `disarmAllLinks` DEFERS (records `pending_disarm_all`) instead of
+    /// mutating the armed-link registry: later rows of the very ledger being
+    /// walked validate their transitions against that registry (armed-edge
+    /// provenance — fused M1 / loop-done / bridge rows all prove "this jump was
+    /// armed" by finding the record), and a mid-walk disarm erases the proof of
+    /// transitions that already physically happened. Measured on nsieve: the
+    /// region gate's `flushRegionWindow` striking to `max_penalty` on row 0 of
+    /// a fused `[skip.deopt(M1), ramp.link]` ledger disarmed everything and
+    /// panicked row 0's own "armed source-branch ramp" validation. The ledger
+    /// DRIVERS apply the deferred disarm via `applyPendingDisarms` immediately
+    /// after the walk returns, BEFORE acting on the directive — so no native
+    /// code ever runs between the deferral and its application.
+    replay_walk_depth: u32 = 0,
+    /// The deferred `disarmAllLinks` request (see `replay_walk_depth`).
+    pending_disarm_all: bool = false,
     /// Anchors currently held off tier-1 with a doubling cooldown (`Gate`). Set
     /// when a recording aborts, a commit fails, or the low-yield re-entry penalty
     /// maxes out. Unlike the old permanent blacklist, an anchor here is *retried*
@@ -1837,6 +1878,20 @@ pub const TraceState = struct {
     /// test (a byte-identical run under an open window cannot, by itself, prove a
     /// non-empty registry was torn down — the counter can).
     native_link_disarms: u64 = 0,
+    /// A-vii-d (doc 17 §A-vii.2): count of composite bridge slots actually armed by
+    /// `tryArmRegionBridge` — a region member's composite ordinary guard slot pointed
+    /// at the registered successor's `ordinary_entry`, so the next time that guard
+    /// fires natively the stub commits the dominance-scoped phi snapshot and jumps
+    /// STRAIGHT into the cross-anchor child (edge 4, no Zig re-entry). `> 0` is the
+    /// "the region-profit gate qualified a region and the arm actually happened"
+    /// signal for the A-vii-d differential tests.
+    native_region_bridge_arms: u64 = 0,
+    /// A-vii-d: count of `.region_bridge` ledger rows DRAINED by `replayLedger` —
+    /// i.e. the arm above actually took effect and a native run fused through the
+    /// composite bridge stub into the cross-anchor successor. Distinct from the arm
+    /// counter (an arm can happen without ever firing: the parent may retire, or the
+    /// guard may never fail again); `> 0` proves the fused edge-4 hop is exercised.
+    native_region_bridge_fused: u64 = 0,
     /// **Coherent-state chaining (doc 16, Phase 2) diagnostics.** `prime_side_arms`
     /// counts outer-header prime side-traces armed (a productive branch-guard went
     /// hot and we switched to `.full` to record the current prime iteration).
@@ -2425,9 +2480,14 @@ pub const TraceState = struct {
     ///     penalty and gate.
     ///   • `0 < work < N` (a remainder) — a low-yield strike: bump the owner's
     ///     penalty; at `max_penalty`, gate the owner AND conservatively
-    ///     `disarmAllLinks()` (a `NativeLink` carries no `RegionId`, so targeted
-    ///     teardown would be unsound — same fail-closed choice as
-    ///     `invalidateRegion`).
+    ///     `disarmAllLinks()` (deliberate whole-registry blast radius, same
+    ///     fail-closed choice as `invalidateRegion`; A-vii-d.1 gave
+    ///     `NativeLink` a `region_id`, but only `.region_bridge` links carry
+    ///     it — M1/loop-done links still have no region identity, so targeted
+    ///     teardown remains unsound here). NB: this can fire MID-`replayLedger`
+    ///     walk (the accounting runs per ledger row) — `disarmAllLinks` defers
+    ///     under `replay_walk_depth` so the walk's own armed-edge validations
+    ///     stay sound, and the ledger driver applies it right after.
     ///   • `work == 0` — no-op (R2-1: a zero-work flush must never strike).
     /// A region whose def has vanished (observer-closed after a logical-map wipe)
     /// has no owner anchor to gate; its work still counts in the diagnostics.
@@ -2619,6 +2679,144 @@ pub const TraceState = struct {
             return null;
         }
         return .{ .child = child, .bridge = b };
+    }
+
+    /// A-vii-d (doc 17 §A-vii.2): the region-bridge arm site. Called from
+    /// `driveChain`'s native-only path when a composite bridge candidate deopts —
+    /// BESIDE the M1 `.ordinary_guard` arms, never inside them (a composite
+    /// candidate is exactly the shape `.ordinary_guard` refuses; the two arm
+    /// kinds have disjoint slot populations by construction). Arm-only: it never
+    /// steers this deopt, so the surrounding chain walk proceeds unchanged either
+    /// way — an armed slot pays off on the NEXT native composite exit, matching
+    /// the M1 arm timing.
+    ///
+    /// Step 1 resolves the unique live source region for this exact exit and
+    /// requires the PROFITABILITY qualification on top of structural armability:
+    /// the activation's accumulator must have latched `useful_window_seen` (at
+    /// least one complete `min_useful` window flushed through the gate machine).
+    /// Structural eligibility alone (`RegionDef.armable`) is not profit — both
+    /// are required, per the §A8-iii seam. Zero region candidates decline
+    /// silently (not a member exit); ambiguity tombstones every candidate, same
+    /// verdict `chooseSource` renders. Steps 2–3 delegate the structural proof to
+    /// `validateRegionBridge` (unique registered edge, membership-proven child,
+    /// S⊆E∪invariants, zero-input child — each failure tombstones + disarms) and
+    /// then publish through `armNativeLink(.region_bridge)`.
+    ///
+    /// The compiled-child/`ordinary_entry` pre-checks exist because
+    /// `armNativeLink`'s `.region_bridge` arm treats a missing re-guarding entry
+    /// as a wiring bug (release-`@panic`): at THIS call site an uncompiled or
+    /// entry-less child is ordinary ineligibility (its compile may simply be
+    /// pending), so decline silently and keep the panic as a backstop.
+    fn tryArmRegionBridge(self: *TraceState, failed: *Trace, exit_instr: u32) void {
+        // Step 1 — unique live region for {failed, exit_instr}.
+        const candidates = self.classifyExit(.{ .trace_id = failed.id, .exit_instr = exit_instr });
+        if (candidates.len == 0) {
+            self.dbg("bridge-arm: decline t={d} ei={d} (no region candidate)", .{ failed.id, exit_instr });
+            return;
+        }
+        if (candidates.len > 1) {
+            self.dbg("bridge-arm: decline t={d} ei={d} (ambiguous {d} candidates, invalidating)", .{ failed.id, exit_instr, candidates.len });
+            for (candidates) |id| self.invalidateRegion(id);
+            return;
+        }
+        const id = candidates[0];
+        const def = self.region_defs.get(id) orelse return;
+        if (!def.armable or def.classifier.kind != .cross_trace_cycle) {
+            self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (armable={} kind={s})", .{ failed.id, exit_instr, @intFromEnum(id), def.armable, @tagName(def.classifier.kind) });
+            return;
+        }
+        // Profitability: the ACTIVE accumulator for the current activation must
+        // belong to this region and have committed a full min_useful window.
+        const ctx = self.region_context orelse {
+            self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (no activation context)", .{ failed.id, exit_instr, @intFromEnum(id) });
+            return;
+        };
+        const active = self.activeRegionFor(ctx.call_seq) orelse {
+            self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (no active region for seq={d})", .{ failed.id, exit_instr, @intFromEnum(id), ctx.call_seq });
+            return;
+        };
+        if (active.region_id != id) {
+            self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (active region is rid={d})", .{ failed.id, exit_instr, @intFromEnum(id), @intFromEnum(active.region_id) });
+            return;
+        }
+        const accum = self.region_profit.get(active) orelse return;
+        if (!accum.useful_window_seen) {
+            self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (no useful window yet, traversals={d})", .{ failed.id, exit_instr, @intFromEnum(id), accum.outer_traversals });
+            return;
+        }
+        // Steps 2–3 — structural proof, then publish.
+        const decision = self.validateRegionBridge(id, failed, exit_instr) orelse {
+            self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (structural proof failed, region invalidated)", .{ failed.id, exit_instr, @intFromEnum(id) });
+            return;
+        };
+        const child = decision.child;
+        const child_c = switch (child.native) {
+            .compiled => |*cc| cc,
+            else => {
+                self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (child id={d} not compiled)", .{ failed.id, exit_instr, @intFromEnum(id), child.id });
+                return;
+            },
+        };
+        if (child_c.ordinary_entry == null) {
+            self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (child id={d} has no ordinary_entry)", .{ failed.id, exit_instr, @intFromEnum(id), child.id });
+            return;
+        }
+        const armed = self.armNativeLink(failed, exit_instr, child, .region_bridge) catch false;
+        if (armed) {
+            // Stamp the exact region the arm was proven against on the record
+            // (A-vii-d.1 review blocker 3): `replayLedger`'s `.region_bridge`
+            // arm validates through THIS id, and discovery rebuilds disarm the
+            // link the moment the region stops being live-armable.
+            for (self.armed_links.items) |*l| {
+                if (l.parent == failed and l.slot_index == exit_instr) {
+                    l.region_id = id;
+                    break;
+                }
+            }
+            self.native_region_bridge_arms +|= 1;
+        }
+    }
+
+    /// A-vii-d.1: the shared receipt-sited arm entry. Every place a native
+    /// composite-candidate deopt is OBSERVED with `safe_to_arm` in hand funnels
+    /// through here — the dispatcher-entered `driveChain` head, the chain-run
+    /// exits, and the post-replay pending drain. Cheap and fail-closed: every
+    /// gate declines silently.
+    fn maybeArmCompositeExit(self: *TraceState, t: *Trace, exit_instr: u32, safe_to_arm: bool) void {
+        if (!safe_to_arm) return;
+        if (exit_instr == std.math.maxInt(u32) or exit_instr >= t.instrs.len) return;
+        if (!nativegen.isCompositeBridgeCandidate(t, exit_instr)) return;
+        self.tryArmRegionBridge(t, exit_instr);
+    }
+
+    /// A-vii-d.1 (review blocker 5): drain the at-most-one pending bridge-arm
+    /// request `replayLedger` recorded for a terminal composite `.deopt` row.
+    /// Arming (and its failure path, `invalidateRegion → disarmAllLinks`) must
+    /// never run MID-ledger — it could erase the armed provenance later
+    /// `.region_bridge` rows validate against — so the ledger drivers call this
+    /// immediately after `replayLedger` returns, before acting on its directive.
+    fn drainPendingBridgeArm(self: *TraceState, safe_to_arm: bool) void {
+        const key = self.pending_bridge_arm orelse return;
+        self.pending_bridge_arm = null;
+        const t = self.traceById(key.trace_id) orelse return;
+        self.maybeArmCompositeExit(t, key.exit_instr, safe_to_arm);
+    }
+
+    /// A-vii-d.1: apply a `disarmAllLinks` that was deferred because it fired
+    /// mid-`replayLedger` walk (see `replay_walk_depth`). Every ledger DRIVER
+    /// calls this immediately after the walk returns, BEFORE the pending
+    /// bridge-arm drain (a disarm-then-re-arm re-validates all its gates;
+    /// arm-then-disarm would silently erase the fresh arm) and before acting
+    /// on the directive, so the disarm lands before any native re-entry.
+    fn applyPendingDisarms(self: *TraceState) void {
+        if (!self.pending_disarm_all) return;
+        self.pending_disarm_all = false;
+        // Fail-closed: a walk that struck the gate arms nothing this round —
+        // drop any pending bridge-arm request rather than disarm-then-re-arm
+        // into a complex the gate just condemned. It can re-arm on the next
+        // composite observation, gates permitting.
+        self.pending_bridge_arm = null;
+        self.disarmAllLinks();
     }
 
     fn chooseSource(self: *TraceState, candidates: []const RegionId, ctx: RegionContext) ?RegionKey {
@@ -2854,6 +3052,12 @@ pub const TraceState = struct {
     ) ?ChainResult {
         const exit_instr = result.exit_instr;
         if (exit_instr == std.math.maxInt(u32)) return null;
+        // A-vii-d (doc 17 §A-vii.2): region-bridge arm site — beside the M1
+        // `.ordinary_guard` arms below, never inside them. Native path only,
+        // observation-blackout gated (`safe_to_arm`, same rule as every other
+        // persistent arm), and only for the composite-guard shape the M1 arm
+        // refuses. Arm-only: steering below is unaffected this deopt.
+        if (tier == .native_only) self.maybeArmCompositeExit(failed, exit_instr, safe_to_arm);
         const walk_pc = switch (materialization) {
             // Coherent-anchor chaining (doc 16): after an *ordinary* guard deopt the
             // registers are coherent at the failed trace's **anchor**, not the
@@ -2941,7 +3145,15 @@ pub const TraceState = struct {
                 // `native_link_exits`). Arm the M1 half-fusion first under exactly
                 // the gates the ≤2 path below uses — the `failed→sct` edge is valid
                 // regardless of how deep `sct`'s own span fused.
-                if (sresult.ledger_len > 2) {
+                // A-vii-d.1: a hop-0 ledger OPENED by the seed's armed composite
+                // bridge (`[C.region_bridge, S.…]`, exactly 2 rows) is replay-owned
+                // too — the scalar `sresult_fused` seam below models only the
+                // `[C.link, I.x]` shape and would consume the bridged successor as
+                // a fused INNER (wrong anchor, wrong resume — measured panic on
+                // nsieve the moment the bridge armed).
+                const bridge_headed = sresult.ledger_len >= 2 and
+                    self.ledger_scratch[0].kind == .region_bridge;
+                if (sresult.ledger_len > 2 or bridge_headed) {
                     if (safe_to_arm and materialization == .ordinary_header and
                         sct.inputs.len == 0 and self.isSourceBranchGuardExit(failed, exit_instr, proto))
                     {
@@ -3029,6 +3241,11 @@ pub const TraceState = struct {
             }
 
             // Not a completed link run.
+            // A-vii-d.1 (review blocker 4, gap 2): composite deopts on nsieve
+            // surface HERE — inside the chain-run, on the chained trace `sct` —
+            // not at `driveChain`'s head (measured: "not a completed link run",
+            // sct=cont). Arm-only; the receipt/steering below is unaffected.
+            if (tier == .native_only) self.maybeArmCompositeExit(sct, sresult.exit_instr, safe_to_arm);
             if (flushed_resume_pc) |target_pc| {
                 self.onSideExitReceipt(sct, 0, sresult.exit_instr, 0, .deferred);
                 return .{ .completed = 0, .resume_pc = target_pc };
@@ -3176,6 +3393,12 @@ pub const TraceState = struct {
         // invariant were ever violated upstream.
         if (entries.len == 0 or entries.len > irinterp.LEDGER_CAP)
             @panic("replayLedger: ledger length outside [1, LEDGER_CAP]");
+        // A-vii-d.1: never inherit a bridge-arm request from a previous ledger.
+        self.pending_bridge_arm = null;
+        // A-vii-d.1: defer any `disarmAllLinks` for the duration of the walk
+        // (see `replay_walk_depth`); the driver applies it right after.
+        self.replay_walk_depth += 1;
+        defer self.replay_walk_depth -= 1;
 
         // Running cursors as the graph is walked:
         //   `cont`    — the continuation whose anchor is the coherent resume for a
@@ -3194,6 +3417,13 @@ pub const TraceState = struct {
         while (k < entries.len) : (k += 1) {
             const e = entries[k];
             const is_last = k + 1 == entries.len;
+            // A-vii-d.1: this row's owner was entered through an armed composite
+            // bridge (`.region_bridge` — the PREVIOUS row). A bridged successor
+            // runs mode 0 (`ordinary_entry`), so its terminal contract differs
+            // from the linked C⇄I grammar: coherent at its OWN anchor (which the
+            // bridge row published into `resume_pc`), ordinary-mode loop-done
+            // included — never `link_pc`.
+            const entered_via_bridge = k > 0 and entries[k - 1].kind == .region_bridge;
             const owner = self.traceById(e.id) orelse
                 @panic("replayLedger: entry owner id did not resolve");
             // First owner must be the seed (call B enters `seed_owner` directly).
@@ -3267,35 +3497,43 @@ pub const TraceState = struct {
                     // The physical armed-link registry proves that this exact
                     // parent slot entered this exact successor. Composite guards
                     // cannot alias M1: `.ordinary_guard` refuses to arm them.
-                    var armed = false;
+                    // A-vii-d.1 (review blocker 3): the armed link carries the
+                    // EXACT region it was armed under; validate through that one
+                    // def — never a global scan over historical `region_defs`,
+                    // which could match a stale tombstoned region whose edge
+                    // happens to share this (anchor, exit) shape.
+                    var armed_region: ?RegionId = null;
                     for (self.armed_links.items) |link| {
                         if (link.parent == owner and link.slot_index == e.exit and link.child == succ) {
-                            armed = true;
+                            if (link.kind != .region_bridge)
+                                @panic("replayLedger: region_bridge row matched a non-bridge armed link");
+                            armed_region = link.region_id orelse
+                                @panic("replayLedger: region_bridge armed link has no region provenance");
                             break;
                         }
                     }
-                    if (!armed)
+                    const region_id = armed_region orelse
                         @panic("replayLedger: region_bridge has no armed provenance");
 
                     // Resolve the one persistent structural edge bound to this
-                    // committed exit. Do not trust guardExitPc or the next row as
-                    // the resume source: RegionDef owns the validated skip anchor.
+                    // committed exit — in the armed region's def ONLY. Do not
+                    // trust guardExitPc or the next row as the resume source:
+                    // RegionDef owns the validated skip anchor.
                     const prov = owner.provAt(e.exit) orelse
                         @panic("replayLedger: region_bridge exit has no provenance");
+                    const def = self.region_defs.getPtr(region_id) orelse
+                        @panic("replayLedger: region_bridge armed region no longer exists");
+                    if (!def.armable)
+                        @panic("replayLedger: region_bridge edge is tombstoned");
                     var registered: ?StructuralEdgeId = null;
-                    var defs = self.region_defs.valueIterator();
-                    while (defs.next()) |def| {
-                        for (def.members) |edge| {
-                            if (edge.anchor_proto_id != owner.anchor.proto.id or
-                                edge.anchor_pc != owner.anchor.pc or
-                                exitOrder(edge.exit, prov) != .eq)
-                                continue;
-                            if (!def.armable)
-                                @panic("replayLedger: region_bridge edge is tombstoned");
-                            if (registered != null)
-                                @panic("replayLedger: duplicate region_bridge edge");
-                            registered = edge;
-                        }
+                    for (def.members) |edge| {
+                        if (edge.anchor_proto_id != owner.anchor.proto.id or
+                            edge.anchor_pc != owner.anchor.pc or
+                            exitOrder(edge.exit, prov) != .eq)
+                            continue;
+                        if (registered != null)
+                            @panic("replayLedger: duplicate region_bridge edge");
+                        registered = edge;
                     }
                     const edge = registered orelse
                         @panic("replayLedger: region_bridge edge is not registered");
@@ -3321,10 +3559,12 @@ pub const TraceState = struct {
                     // `max_penalty == min_useful == 8`), so a hop-dense region would
                     // reach the gate before its window ever cleared it: precisely the
                     // productive regions this arc exists to build. So this site stays
-                    // selection-only. It is unreachable until A-vii-d enables arming;
-                    // A-vii-d owes it a firing test that pins "a productive armed region
-                    // accrues no owner penalty from its bridge transitions".
+                    // selection-only. REACHABLE since A-vii-d/d.1 (arming live); the
+                    // A-vii-a replay test pins the no-owner-penalty contract
+                    // (`penalty.get(cont.anchor) == null` after a bridge row) and the
+                    // bridged-successor test pins the `.loop`-ending successor shape.
                     self.accountTraceRun(owner, @max(local, 1));
+                    self.native_region_bridge_fused +|= 1;
                     resume_pc.* = edge.succ_anchor_pc;
                 },
                 .link_terminal => {
@@ -3554,6 +3794,12 @@ pub const TraceState = struct {
                     const exit_op = owner.instrs[e.exit].op;
                     if (exit_op == .link or exit_op == .loop)
                         @panic("replayLedger: .deopt exit names a terminator, not a guard");
+                    // A-vii-d.1: a terminal composite-candidate deopt is the fused-span
+                    // observation of the edge-4 exit. Record the at-most-one pending
+                    // arm request; the ledger DRIVER drains it after this replay
+                    // returns (never mid-walk — review blocker 5).
+                    if (e.outcome == .normal and nativegen.isCompositeBridgeCandidate(owner, e.exit))
+                        self.pending_bridge_arm = .{ .trace_id = owner.id, .exit_instr = e.exit };
                     if (ends_link) {
                         // (a) continuation own guard — terminal.
                         if (local > 0) {
@@ -3567,6 +3813,25 @@ pub const TraceState = struct {
                     }
                     if (!ends_loop)
                         @panic("replayLedger: .deopt owner is neither continuation nor inner root");
+                    // A-vii-d.1: (b') bridged successor — an ordinary-mode
+                    // (`ordinary_entry`) body entered through the composite
+                    // bridge. Its deopts follow the coherent-anchor discipline
+                    // (regs coherent at its OWN loop header, the H-1b re-execute
+                    // convention), NOT the linked-inner `link_pc` contract — and
+                    // an ordinary-mode loop-done deopt is legitimate here (mode 0
+                    // bypasses the linked slot), unlike in the linked fusion
+                    // below. The bridge row already published the successor's
+                    // validated anchor into `resume_pc`; hard-verify the two
+                    // agree rather than trusting either alone.
+                    if (entered_via_bridge) {
+                        if (resume_pc.* != owner.anchor.pc)
+                            @panic("replayLedger: bridged successor deopt resume mismatches its anchor");
+                        self.accountLedgerRow(owner, local, region_consumed);
+                        return .{ .return_result = .{
+                            .completed = linked_completed.* + local,
+                            .resume_pc = resume_pc.*,
+                        } };
+                    }
                     // (b) inner body guard. An ordinary-materialization loop-done deopt
                     // (exit PC after `for_loop`) has a DIFFERENT resume contract (tier-0
                     // at the post-loop PC, final iteration uncommitted) and cannot occur
@@ -3603,6 +3868,21 @@ pub const TraceState = struct {
                     }
                     if (!ends_loop)
                         @panic("replayLedger: prologue_fail owner is neither continuation nor inner root");
+                    // A-vii-d.1: bridged successor prologue-fail — the bridge
+                    // committed its cross-anchor snapshot, then the successor's
+                    // hoisted entry guards failed PRE-commit, so regs are still
+                    // coherent at the successor's anchor (which the bridge row
+                    // published into `resume_pc`). Zero-progress charge; resume
+                    // there, never at the stale `link_pc`.
+                    if (entered_via_bridge) {
+                        if (resume_pc.* != owner.anchor.pc)
+                            @panic("replayLedger: bridged successor prologue-fail resume mismatches its anchor");
+                        self.accountLedgerRow(owner, 0, region_consumed);
+                        return .{ .return_result = .{
+                            .completed = linked_completed.*,
+                            .resume_pc = resume_pc.*,
+                        } };
+                    }
                     // Inner prologue-fail (local == 0): matches the old `fdone == false`
                     // mid-loop path — record the zero-progress side exit and resume
                     // tier-0 at the inner header, carrying any earlier chain progress.
@@ -3791,7 +4071,7 @@ pub const TraceState = struct {
                     //   return_result    → the burst is done, hand the receipt up,
                     //   break_burst      → penalty-neutral tail.
                     if (iresult.ledger_len > 1) {
-                        switch (self.replayLedger(
+                        const call_a_directive = self.replayLedger(
                             self.ledger_scratch[0..iresult.ledger_len],
                             inner,
                             inner_pc,
@@ -3802,7 +4082,12 @@ pub const TraceState = struct {
                             max_hops,
                             .inner_call,
                             safe_to_arm,
-                        )) {
+                        );
+                        // A-vii-d.1: drain the pending bridge-arm request AFTER the
+                        // walk, BEFORE acting on the directive (review blocker 5).
+                        self.applyPendingDisarms();
+                        self.drainPendingBridgeArm(safe_to_arm);
+                        switch (call_a_directive) {
                             .run_continuation => |c| {
                                 current_link = c;
                                 snt = self.nativeFor(c) orelse break :hop;
@@ -3948,7 +4233,7 @@ pub const TraceState = struct {
             if (tier == .native_only) {
                 var cresult = snt.runCapturingLedger(regs, &self.ledger_scratch);
                 while (true) {
-                    switch (self.replayLedger(
+                    const call_b_directive = self.replayLedger(
                         self.ledger_scratch[0..cresult.ledger_len],
                         current_link,
                         inner_pc,
@@ -3959,7 +4244,12 @@ pub const TraceState = struct {
                         max_hops,
                         .continuation_call,
                         safe_to_arm,
-                    )) {
+                    );
+                    // A-vii-d.1: drain the pending bridge-arm request AFTER the
+                    // walk, BEFORE acting on the directive (review blocker 5).
+                    self.applyPendingDisarms();
+                    self.drainPendingBridgeArm(safe_to_arm);
+                    switch (call_b_directive) {
                         // Re-run the carried continuation for the next fused span.
                         // P1a: re-resolve its native compilation (a `C1 → I → C2`
                         // sibling swap makes `c != current_link`); never reuse the old
@@ -4075,7 +4365,12 @@ pub const TraceState = struct {
         // modeled M1 grammar never reaches (its first `.link` sets the real cursor).
         // Pass the seed anchor as an inert placeholder.
         const inner_pc: u32 = seed.anchor.pc;
-        switch (self.replayLedger(entries, seed, inner_pc, proto, &linked_completed, &resume_pc, &hops, max_hops, .dispatcher_root, safe_to_arm)) {
+        const dispatcher_directive = self.replayLedger(entries, seed, inner_pc, proto, &linked_completed, &resume_pc, &hops, max_hops, .dispatcher_root, safe_to_arm);
+        // A-vii-d.1: drain the pending bridge-arm request AFTER the walk,
+        // BEFORE acting on the directive (review blocker 5).
+        self.applyPendingDisarms();
+        self.drainPendingBridgeArm(safe_to_arm);
+        switch (dispatcher_directive) {
             // M1 sub-case (a): the replayed ramp reached `.link`. `replayLedger` has
             // already charged both counters this burst owns — `native_link_exits` (its
             // `.link_terminal` arm) and `prime_side_chain_follows` (its M1 `.deopt`
@@ -4154,22 +4449,50 @@ pub const TraceState = struct {
         // the ledger must have been captured from THIS seed and must open with the
         // seed's own `.link` terminal — every armed slot a hop-0 `.link` candidate
         // can fire first is that terminal (its ordinary guards would classify as M1
-        // `.deopt`, which is a dispatcher-root grammar, not a chain-candidate one).
-        if (entries.len < 3)
-            @panic("driveSeedLedger: expected a deep (>2-entry) hop-0 ledger");
-        if (!(seed.instrs.len != 0 and seed.instrs[seed.instrs.len - 1].op == .link))
-            @panic("driveSeedLedger: seed does not end in .link");
+        // `.deopt`, which is a dispatcher-root grammar, not a chain-candidate one)
+        // — OR (A-vii-d.1) with the seed's armed composite bridge: the seed's
+        // composite branch guard fired mid-run and jumped straight into the
+        // registered successor's `ordinary_entry`, so the span starts at that
+        // `.region_bridge` receipt (2 rows minimum: bridge + successor terminal).
         const e0 = entries[0];
-        if (e0.id != seed.id or e0.kind != .link_terminal or e0.exit != seed.instrs.len - 1)
-            @panic("driveSeedLedger: first entry is not the seed's .link terminal");
+        if (e0.id != seed.id)
+            @panic("driveSeedLedger: first entry does not belong to the seed");
+        switch (e0.kind) {
+            .link_terminal => {
+                if (entries.len < 3)
+                    @panic("driveSeedLedger: expected a deep (>2-entry) hop-0 ledger");
+                if (!(seed.instrs.len != 0 and seed.instrs[seed.instrs.len - 1].op == .link))
+                    @panic("driveSeedLedger: seed does not end in .link");
+                if (e0.exit != seed.instrs.len - 1)
+                    @panic("driveSeedLedger: first entry is not the seed's .link terminal");
+            },
+            .region_bridge => {
+                if (entries.len < 2)
+                    @panic("driveSeedLedger: bridge-headed ledger has no successor row");
+                if (!nativegen.isCompositeBridgeCandidate(seed, e0.exit))
+                    @panic("driveSeedLedger: bridge-headed first entry is not a composite guard of the seed");
+            },
+            else => @panic("driveSeedLedger: first entry is neither the seed's .link terminal nor its composite bridge"),
+        }
         // Coherent-anchor firing signal, mirroring `runLinkedBurst`'s wrapper.
         if (materialization == .ordinary_header) self.prime_side_chain_follows +|= 1;
         const max_hops: usize = 8;
         var linked_completed: usize = 0;
-        const seed_inner_pc: u32 = @intCast(seed.instrs[seed.instrs.len - 1].aux);
+        // For a bridge-headed span the seed's `.link` never fired, so there is no
+        // inner-root cursor to seed — pass the seed anchor as an inert placeholder
+        // (the bridged terminal contract resumes via `resume_pc`, never `link_pc`).
+        const seed_inner_pc: u32 = if (seed.instrs.len != 0 and seed.instrs[seed.instrs.len - 1].op == .link)
+            @intCast(seed.instrs[seed.instrs.len - 1].aux)
+        else
+            seed.anchor.pc;
         var resume_pc: u32 = seed_inner_pc;
         var hops: usize = 0;
-        switch (self.replayLedger(entries, seed, seed_inner_pc, proto, &linked_completed, &resume_pc, &hops, max_hops, .continuation_call, safe_to_arm)) {
+        const seed_directive = self.replayLedger(entries, seed, seed_inner_pc, proto, &linked_completed, &resume_pc, &hops, max_hops, .continuation_call, safe_to_arm);
+        // A-vii-d.1: drain the pending bridge-arm request AFTER the walk,
+        // BEFORE acting on the directive (review blocker 5).
+        self.applyPendingDisarms();
+        self.drainPendingBridgeArm(safe_to_arm);
+        switch (seed_directive) {
             // Terminal inner loop-done, un-fused: enter the burst at call B with the
             // carried continuation (the drained span already ran the inner).
             .run_continuation => |c| {
@@ -4519,6 +4842,24 @@ pub const TraceState = struct {
         return false;
     }
 
+    /// A-vii-d.1: the closing `for_loop` pc of the numeric loop whose body starts
+    /// at anchor `pc` — i.e. the unique `for_loop` op whose back-edge target is
+    /// `pc`. Null when none or ambiguous (fail-closed: the anchor then cannot be
+    /// elected as a closed region's enclosing owner). Static bytecode only; the
+    /// body span of the loop is `[pc, result]`.
+    fn forLoopEndFor(proto: *const Proto, pc: u32) ?u32 {
+        var found: ?u32 = null;
+        for (proto.code, 0..) |ins, i| {
+            if (ins.op != .for_loop) continue;
+            const target: i64 = @as(i64, @intCast(i)) + 1 + ins.aux;
+            if (target == pc) {
+                if (found != null) return null; // ambiguous
+                found = @intCast(i);
+            }
+        }
+        return found;
+    }
+
     const SuccAnchor = struct { proto_id: u32, pc: u32 };
 
     /// Resolve the guest-logical successor **anchor** `{proto_id, pc}` of one keyed
@@ -4546,12 +4887,149 @@ pub const TraceState = struct {
                 return .{ .proto_id = proto.id, .pc = succ_pc };
             },
             .guard => {
-                const wp = guardExitPc(t.instrs[e.index]) orelse return null;
-                if (wp == 0 or wp == t.anchor.pc) return null;
-                if (self.countTracesAt(.{ .proto = proto, .pc = wp }) == 0) return null;
-                return .{ .proto_id = proto.id, .pc = wp };
+                if (guardExitPc(t.instrs[e.index])) |wp| {
+                    if (wp != 0 and wp != t.anchor.pc and
+                        self.countTracesAt(.{ .proto = proto, .pc = wp }) != 0)
+                        return .{ .proto_id = proto.id, .pc = wp };
+                }
+                // A-vii-d.1 overlay: composite bridge candidates get the
+                // opposite-polarity static-CFG successor (with the crossed
+                // for_loop continue proof gating publication). Every other
+                // guard keeps the ordinary rule above — their deopt semantics
+                // use the H-1b re-execute convention and their exits stay out
+                // of the structural graph unless a trace anchors at the exit pc.
+                return self.resolveCompositeBridgeSuccessor(t, e);
             },
         }
+    }
+
+    /// A-vii-d.1 (doc 17): overlay structural-successor resolution for a composite
+    /// bridge candidate exit. A branch guard's committed exit pc is the H-1b
+    /// re-execute pc (`source_pc + 1`), never the opposite path's landing anchor,
+    /// so the ordinary `resolveSuccessorAnchor` rule can never discover the
+    /// cont→skip edge-4 transition. This overlay derives the successor from the
+    /// static CFG instead: take the OPPOSITE-polarity target of the source
+    /// `jmp_if_*` (the deopt re-executes the branch and, by construction of the
+    /// guard, takes the edge the recording did not), then walk across ONLY
+    /// unconditional `jmp` ops and at most ONE numeric `for_loop` continue edge
+    /// (bounded, no revisits — any other op declines: the handoff would not be a
+    /// clean anchor-to-anchor transition) until a pc with a bound trace.
+    ///
+    /// **The continue proof gates discovery** (d.1 review blocker 1): a crossed
+    /// `for_loop` has TWO successors, and publishing the continue edge without
+    /// proof would corrupt SCC construction / owner election / gate keying, not
+    /// merely the arm. `compositeContinueProof` demands the exact `recForLoop`
+    /// dataflow shape in the parent IR, dominating the composite guard — which
+    /// simultaneously proves the loop-exit edge is excluded (the continue guard
+    /// PASSED on every native execution that reaches the composite guard) and
+    /// that the crossed op's written slots `{a, a+3}` are re-materialized by the
+    /// bridge snapshot with the exact stepped value.
+    fn resolveCompositeBridgeSuccessor(self: *const TraceState, t: *const Trace, e: ExitProvEntry) ?SuccAnchor {
+        const g = switch (e.prov) {
+            .guard => |gp| gp,
+            .link_terminal => return null,
+        };
+        // Non-inlined, same-proto, polarity-carrying branch provenance only
+        // (d.1 review blocker: never widen an inlined exit using the parent
+        // proto's bytecode).
+        if (g.inline_depth != 0) return null;
+        if (g.role != .branch_cond or g.polarity == .neutral) return null;
+        const proto = t.anchor.proto;
+        if (g.source_proto_id != proto.id) return null;
+        if (!nativegen.isCompositeBridgeCandidate(t, e.index)) return null;
+        if (g.source_pc >= proto.code.len) return null;
+        const bop = proto.code[g.source_pc];
+        switch (bop.op) {
+            .jmp_if_true, .jmp_if_false => {},
+            else => return null,
+        }
+        // Post-fetch jump convention (`applyJump(source_pc + 1, aux)`): the
+        // interpreter applies branch offsets to the already-incremented pc.
+        const fallthrough_pc: i64 = @as(i64, g.source_pc) + 1;
+        const jump_pc: i64 = fallthrough_pc + bop.aux;
+        // The guard fails ⇒ the deopt takes the CFG edge the recording did NOT:
+        // recorded `.fallthrough` fails onto the jump edge and vice versa.
+        var pc_i: i64 = if (g.polarity == .fallthrough) jump_pc else fallthrough_pc;
+
+        var crossed_for_loop: ?u32 = null;
+        var steps: usize = 0;
+        while (steps < 16) : (steps += 1) {
+            if (pc_i < 0 or pc_i >= proto.code.len) return null;
+            const pc: u32 = @intCast(pc_i);
+            // Landing back on the source's own anchor is a self-edge, not a
+            // cross-anchor handoff — decline (same rule as the ordinary arm).
+            if (pc == t.anchor.pc) return null;
+            if (self.countTracesAt(.{ .proto = proto, .pc = pc }) != 0) {
+                if (crossed_for_loop) |flp| {
+                    if (!compositeContinueProof(t, e.index, flp)) return null;
+                }
+                return .{ .proto_id = proto.id, .pc = pc };
+            }
+            const ins = proto.code[pc];
+            switch (ins.op) {
+                .jmp => pc_i = pc_i + 1 + ins.aux,
+                .for_loop => {
+                    if (crossed_for_loop != null) return null; // at most one
+                    crossed_for_loop = pc;
+                    pc_i = pc_i + 1 + ins.aux; // continue edge = the back-edge target
+                },
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// The exact-dataflow continue proof for one crossed numeric `for_loop` at
+    /// bytecode pc `flp` (d.1 review blocker 2: provenance-tag matching is
+    /// many-to-one and insufficient — the proof is relational, tied by IR refs).
+    /// Requires, all with committed indices `< composite_ei`:
+    ///   - the dominance-scoped emitted set E holds slot-bound phis for BOTH
+    ///     slots the crossed `for_loop` writes — `a` (idx) and `a+3` (var) —
+    ///     with the SAME update ref `R`, and `t.instrs[R]` is the `add` that
+    ///     steps the index (`recForLoop` publishes the one `rnext` to both);
+    ///   - a committed `.loop_done` guard (non-inlined, same proto, source pc
+    ///     == `flp`) whose guarded `le` compare CONSUMES `R` — i.e. the loop
+    ///     continue condition over exactly the value the bridge will commit
+    ///     passed before the composite guard could fire.
+    /// Limit/step are not written by `for_loop`, so they may legitimately remain
+    /// edge-invariant; this proof is what gives `invariant = S \ E` its
+    /// soundness for the crossed-op slots (doc 17 A-vii-d.1 item 2).
+    fn compositeContinueProof(t: *const Trace, composite_ei: u32, flp: u32) bool {
+        const proto = t.anchor.proto;
+        if (flp >= proto.code.len or proto.code[flp].op != .for_loop) return false;
+        const base: u16 = proto.code[flp].a;
+
+        // Fetch the dominance-scoped phi update refs for idx and var.
+        var idx_ref: ?u16 = null;
+        var var_ref: ?u16 = null;
+        var emitted = nativegen.compositeBridgeEmissions(t, composite_ei);
+        while (emitted.next()) |p| {
+            if (p.aux == @as(i32, @intCast(base))) idx_ref = p.b;
+            if (p.aux == @as(i32, @intCast(base)) + 3) var_ref = p.b;
+        }
+        const r = idx_ref orelse return false;
+        if (var_ref != r) return false;
+        if (r >= t.instrs.len or t.instrs[r].op != .add) return false;
+
+        // Find a dominating loop-continue guard for THIS for_loop whose compare
+        // consumes exactly `r`.
+        for (t.exit_prov) |ep| {
+            if (ep.index >= composite_ei) break; // sorted ascending
+            const gp = switch (ep.prov) {
+                .guard => |gg| gg,
+                .link_terminal => continue,
+            };
+            if (gp.role != .loop_done or gp.inline_depth != 0) continue;
+            if (gp.source_proto_id != proto.id or gp.source_pc != flp) continue;
+            const gi = t.instrs[ep.index];
+            if (gi.op != .guard_true) continue;
+            const cmp_ref = gi.a;
+            if (cmp_ref >= t.instrs.len) continue;
+            const cmp = t.instrs[cmp_ref];
+            if (cmp.op != .le) continue;
+            if (cmp.a == r or cmp.b == r) return true;
+        }
+        return false;
     }
 
     /// Rebuild the ephemeral `edge_cache` WHOLESALE from the current cache (doc 17
@@ -4625,7 +5103,13 @@ pub const TraceState = struct {
     /// region armed; empty is region-neutral and auto-recovers on the next successful pass).
     /// **Inert in A-ii** (read by nothing on the selection path) ⇒ byte-identical.
     fn rebuildRegions(self: *TraceState) void {
-        self.rebuildRegionsFallible() catch self.clearPhysicalRegionIndices();
+        self.rebuildRegionsFallible() catch {
+            self.clearPhysicalRegionIndices();
+            // A-vii-d.1 (review blocker 3): the physical indices failed closed
+            // to empty, so no region is live-armable — every armed bridge
+            // link's provenance is now unvalidatable. Disarm them all.
+            self.disarmStaleRegionBridgeLinks(&.{});
+        };
     }
 
     fn rebuildRegionsFallible(self: *TraceState) !void {
@@ -4643,6 +5127,10 @@ pub const TraceState = struct {
         for (self.cache.items) |t| {
             if (!t.exit_prov_complete) {
                 self.clearPhysicalRegionIndices();
+                // A-vii-d.1 (review blocker 3): fail closed on the truncated
+                // graph — no region is live-armable this pass, so no armed
+                // bridge link's provenance can be re-validated. Disarm all.
+                self.disarmStaleRegionBridgeLinks(&.{});
                 return;
             }
         }
@@ -5003,10 +5491,30 @@ pub const TraceState = struct {
                 }
                 const proto = proto_by_id.get(a.proto_id) orelse return error.RegionGraphInconsistent;
                 const has_root = self.hasInnerRootAt(proto, a.pc);
-                self.dbg("region: owner-scan comp={d} node proto={d} pc={d} ext_entry={} inner_root={}", .{
-                    c, a.proto_id, a.pc, is_ext, has_root,
+                // A-vii-d.1: a fully-CLOSED cycle (the whole traced kernel is one
+                // SCC — exactly what closing edge 4 produces) has NO incoming
+                // boundary edge at all: the region is entered by the DISPATCHER,
+                // which creates no structural edge. Generalize "external entry"
+                // with a static enclosure test: a member is dispatcher-entry-
+                // shaped if its numeric loop's body span contains every other
+                // same-proto member (the outermost loop root of the cycle).
+                // Cross-proto members and non-numeric (while) roots conservatively
+                // fail the test — the region then simply stays unarmable, the
+                // pre-d.1 status quo.
+                const enclosing = !is_ext and blk: {
+                    const flp = forLoopEndFor(proto, a.pc) orelse break :blk false;
+                    for (0..nnodes) |m| {
+                        if (comp[m] != c or m == n) continue;
+                        const b = nodes.items[m];
+                        if (b.proto_id != a.proto_id) break :blk false;
+                        if (b.pc <= a.pc or b.pc > flp) break :blk false;
+                    }
+                    break :blk true;
+                };
+                self.dbg("region: owner-scan comp={d} node proto={d} pc={d} ext_entry={} enclosing={} inner_root={}", .{
+                    c, a.proto_id, a.pc, is_ext, enclosing, has_root,
                 });
-                if (is_ext and has_root) {
+                if ((is_ext or enclosing) and has_root) {
                     both_count += 1;
                     owner_node = @intCast(n);
                 }
@@ -5125,13 +5633,14 @@ pub const TraceState = struct {
                 const eff_armable = compatible and cand.membership_complete and
                     cand.armable_owner and !stored.tombstoned;
                 if (eff_armable != stored.armable)
-                    self.dbg("region: rebind id={d} armable {}->{} (owner_unique={} membership_complete={} tombstoned={})", .{
+                    self.dbg("region: rebind id={d} armable {}->{} (owner_unique={} membership_complete={} tombstoned={} bridges={d})", .{
                         @intFromEnum(existing_id),
                         stored.armable,
                         eff_armable,
                         cand.armable_owner,
                         cand.membership_complete,
                         stored.tombstoned,
+                        cand.bridges.len,
                     });
                 staged_armable_updates.appendAssumeCapacity(.{ .id = existing_id, .armable = eff_armable });
                 // Keep the stored owner fresh: the unique external-entry loop-root can MOVE
@@ -5167,13 +5676,14 @@ pub const TraceState = struct {
                     .armable = first_armable,
                 } });
                 active_regions.appendAssumeCapacity(.{ .id = new_id, .comp = cand.comp, .armable = first_armable, .member_trace_ids = mt_copy });
-                self.dbg("region: mint id={d} kind={s} members={d} armable={} (owner_unique={} membership_complete={})", .{
+                self.dbg("region: mint id={d} kind={s} members={d} armable={} (owner_unique={} membership_complete={} bridges={d})", .{
                     @intFromEnum(new_id),
                     @tagName(cand.classifier.kind),
                     cand.classifier.member_count,
                     first_armable,
                     cand.armable_owner,
                     cand.membership_complete,
+                    cand.bridges.len,
                 });
                 new_id_counter += 1;
             }
@@ -5220,6 +5730,18 @@ pub const TraceState = struct {
         var new_dest = try dst_builder.finalize(gpa);
         errdefer freeRegionSetMap(u32, &new_dest, gpa);
 
+        // A-vii-d.1 (review blocker 3): the live-armable region-id set for the
+        // stale-bridge disarm sweep in the publish phase (fallible scratch).
+        // `active_regions[i].armable` already reflects this pass's tombstones —
+        // `eff_armable` conjoins `compatible ∧ membership_complete`, the exact
+        // tombstone conditions — so this set equals post-publish armability.
+        var live_armable_ids: std.ArrayListUnmanaged(RegionId) = .empty;
+        defer live_armable_ids.deinit(gpa);
+        try live_armable_ids.ensureUnusedCapacity(gpa, active_regions.items.len);
+        for (active_regions.items) |a| {
+            if (a.armable) live_armable_ids.appendAssumeCapacity(a.id);
+        }
+
         // Reserve capacity on the live LOGICAL maps (last fallible step).
         try self.region_intern.reserve(gpa, staged_interns.items.len);
         try self.region_defs.ensureUnusedCapacity(gpa, @intCast(staged_defs.items.len));
@@ -5257,6 +5779,10 @@ pub const TraceState = struct {
         freeRegionSetMap(u32, &self.dest_entry_regions, gpa);
         self.source_exit_regions = new_source;
         self.dest_entry_regions = new_dest;
+        // A-vii-d.1 (review blocker 3): disarm every `.region_bridge` link
+        // whose armed region did not survive this pass live + armable. Runs
+        // LAST in the publish phase, against the just-published state.
+        self.disarmStaleRegionBridgeLinks(live_armable_ids.items);
     }
 
     /// Classify a physical trace exit to the regions it belongs to (doc 17 §A3.3 /
@@ -5398,6 +5924,8 @@ pub const TraceState = struct {
         for (self.armed_links.items) |*l| {
             if (l.parent == parent and l.slot_index == slot_index) {
                 l.child = child;
+                l.kind = kind;
+                l.region_id = null; // a `.region_bridge` caller re-stamps after arming
                 c.slots[slot_index] = target;
                 self.dbg("arm (re-arm): parent id={d} pc={d} slot={d} -> child id={d} pc={d} kind={s}", .{
                     parent.id, parent.anchor.pc, slot_index, child.id, child.anchor.pc, @tagName(kind),
@@ -5407,7 +5935,7 @@ pub const TraceState = struct {
         }
         // Fresh slot: append the record BEFORE writing the slot, so a failed append
         // leaves the slot at its prior `shared_exit` value with no dangling record.
-        try self.armed_links.append(self.gpa, .{ .parent = parent, .slot_index = slot_index, .child = child });
+        try self.armed_links.append(self.gpa, .{ .parent = parent, .slot_index = slot_index, .child = child, .kind = kind });
         c.slots[slot_index] = target;
         self.dbg("arm: parent id={d} pc={d} slot={d} -> child id={d} pc={d} kind={s}", .{
             parent.id, parent.anchor.pc, slot_index, child.id, child.anchor.pc, @tagName(kind),
@@ -5499,6 +6027,13 @@ pub const TraceState = struct {
     /// then nothing until arming resumes). The slot address is re-derived from the
     /// live `parent`, never cached, exactly as `resetLinksTouching` does.
     pub fn disarmAllLinks(self: *TraceState) void {
+        // A-vii-d.1: never mutate the registry mid-`replayLedger` walk — later
+        // rows validate against it (see `replay_walk_depth`). Defer; the ledger
+        // driver applies it right after the walk, before any native re-entry.
+        if (self.replay_walk_depth > 0) {
+            self.pending_disarm_all = true;
+            return;
+        }
         if (self.armed_links.items.len == 0) return;
         self.dbg("disarmAllLinks: resetting {d} armed links", .{self.armed_links.items.len});
         self.native_link_disarms +|= @intCast(self.armed_links.items.len);
@@ -5512,6 +6047,56 @@ pub const TraceState = struct {
             }
         }
         self.armed_links.clearRetainingCapacity();
+    }
+
+    /// A-vii-d.1 (review blocker 3): disarm ONE armed link by registry index —
+    /// reset its parent's physical slot to the shared trampoline exit, count the
+    /// disarm, and drop the record. Infallible (publish-phase safe). Uses
+    /// `swapRemove`, so callers iterating the registry must walk BACKWARDS.
+    fn disarmLinkAt(self: *TraceState, idx: usize) void {
+        const link = self.armed_links.items[idx];
+        self.native_link_disarms +|= 1;
+        const shared_exit = self.mcode_arena.trampoline_exit orelse 0;
+        switch (link.parent.native) {
+            .compiled => |*c| if (link.slot_index < c.slots.len) {
+                c.slots[link.slot_index] = shared_exit;
+            },
+            else => {},
+        }
+        _ = self.armed_links.swapRemove(idx);
+    }
+
+    /// A-vii-d.1 (review blocker 3) — the stale-region lifecycle rule: a
+    /// `.region_bridge` link is only valid while the exact region it was armed
+    /// under stays live AND armable. Disarm every bridge link whose armed
+    /// `region_id` is not in `live_armable` (the region ids the pass that just
+    /// published considers live and armable; pass `&.{}` to fail closed and
+    /// disarm ALL bridge links). Fail-closed is mandatory, not tidy-up:
+    /// `replayLedger`'s `.region_bridge` arm `@panic`s on a row whose armed
+    /// region no longer validates, so the physical slot must be reset the
+    /// moment the region dies. Infallible (publish-phase safe).
+    fn disarmStaleRegionBridgeLinks(self: *TraceState, live_armable: []const RegionId) void {
+        var i = self.armed_links.items.len;
+        while (i > 0) {
+            i -= 1;
+            const link = self.armed_links.items[i];
+            if (link.kind != .region_bridge) continue;
+            const keep = blk: {
+                const rid = link.region_id orelse {
+                    // An un-stamped bridge link is a broken arm-path
+                    // invariant; fail closed rather than leaving an
+                    // unvalidatable slot armed.
+                    self.dbg("bridge-disarm: un-stamped region_bridge link parent={d} ei={d}", .{ link.parent.id, link.slot_index });
+                    break :blk false;
+                };
+                for (live_armable) |lid| {
+                    if (lid == rid) break :blk true;
+                }
+                self.dbg("bridge-disarm: stale region id={d} parent={d} ei={d}", .{ @intFromEnum(rid), link.parent.id, link.slot_index });
+                break :blk false;
+            };
+            if (!keep) self.disarmLinkAt(i);
+        }
     }
 
     pub fn removeTrace(self: *TraceState, t: *Trace) void {
@@ -8091,8 +8676,8 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.writeAll("lune: JIT stats\n");
     try w.writeAll("  event counters:\n");
     try w.print("    trace entries:        {d}\n", .{ts.entries});
-    try w.print("    link arms:            native={d} source={d} loopdone={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms });
-    try w.print("    link fused:           source={d} loopdone={d}\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused });
+    try w.print("    link arms:            native={d} source={d} loopdone={d} bridge={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms, ts.native_region_bridge_arms });
+    try w.print("    link fused:           source={d} loopdone={d} bridge={d}\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused, ts.native_region_bridge_fused });
     try w.print("    link disarms:         {d}\n", .{ts.native_link_disarms});
     try w.print("    native link exits:    {d} (follows={d})\n", .{ ts.native_link_exits, ts.native_link_follow_count });
     try w.print("    ir link exits:        {d} (follows={d})\n", .{ ts.link_ir_exits, ts.link_follow_count });
@@ -9852,8 +10437,8 @@ test "replayLedger A-vii-a: region_bridge validates registered cross-anchor edge
     // backlink and the persistent registered edge. Missing, duplicate, tombstoned,
     // or successor-mismatched variants are explicit release-@panic branches in the
     // replay arm; this Zig stdlib has no in-process panic-expectation test helper.
-    try state.armed_links.append(gpa, .{ .parent = &cont, .slot_index = 3, .child = &skip });
     const rid: RegionId = @enumFromInt(91);
+    try state.armed_links.append(gpa, .{ .parent = &cont, .slot_index = 3, .child = &skip, .kind = .region_bridge, .region_id = rid });
     try state.region_defs.put(gpa, rid, .{
         .members = try gpa.dupe(StructuralEdgeId, &.{.{
             .anchor_proto_id = proto.id,
@@ -9901,6 +10486,345 @@ test "replayLedger A-vii-a: region_bridge validates registered cross-anchor edge
     try testing.expectEqual(@as(u64, 1), cont.hit_count);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(cont.anchor));
     try testing.expectEqual(@as(u32, 1), state.penalty.get(skip.anchor).?);
+}
+
+test "A-vii-d.1 overlay: composite guard resolves the opposite-polarity CFG successor (jmp walk, polarity flip, self-edge decline)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    // Static CFG: jmp_if_true at 5 (jump target 6+4=10); fallthrough pc 6 is an
+    // unconditional jmp to 8. A recorded-`.taken` composite guard therefore fails
+    // onto the FALLTHROUGH edge (6 → jmp → 8); a recorded-`.fallthrough` one onto
+    // the JUMP edge (10). No trace is bound at the H-1b exit pc 6, so the
+    // ordinary `guardExitPc` rule yields nothing — only the overlay resolves.
+    var code: [32]Instr = undefined;
+    @memset(code[0..], Instr.op0(.halt));
+    code[5] = Instr.opAx(.jmp_if_true, 0, 4);
+    code[6] = Instr.opAx(.jmp, 0, 1);
+    const proto = Proto{ .id = 51, .code = &code, .name = "overlay", .num_registers = 1 };
+
+    const mkProv = struct {
+        fn f(p: Polarity) ExitProvenance {
+            return .{ .guard = .{
+                .source_proto_id = 51,
+                .source_pc = 5,
+                .role = .branch_cond,
+                .operand = .a,
+                .polarity = p,
+            } };
+        }
+    }.f;
+    var taken_prov = [_]ExitProvEntry{.{ .index = 3, .prov = mkProv(.taken) }};
+    var ft_prov = [_]ExitProvEntry{.{ .index = 3, .prov = mkProv(.fallthrough) }};
+    var cont_instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 0, .b = 1, .ty = .int },
+        .{ .op = .guard_true, .a = 0, .aux = 6 }, // exit pc 6 → source jmp_if at 5
+        .{ .op = .phi, .b = 2, .aux = 0 },
+        .{ .op = .link, .aux = 7 },
+    };
+    var cont: Trace = .{ .id = 701, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &taken_prov };
+    try testing.expect(nativegen.isCompositeBridgeCandidate(&cont, 3));
+
+    // No successor trace bound anywhere yet → both polarities decline.
+    try testing.expectEqual(@as(?TraceState.SuccAnchor, null), state.resolveSuccessorAnchor(&cont, cont.exit_prov[0]));
+
+    // Bind skip@8 (reached from the fallthrough edge via the jmp at 6).
+    var skip_instrs = [_]IrInstr{ .{ .op = .guard_int, .a = 0 }, .{ .op = .loop } };
+    var skip: Trace = .{ .id = 702, .anchor = .{ .proto = &proto, .pc = 8 }, .instrs = &skip_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try state.cache.append(gpa, &skip);
+    const succ_taken = state.resolveSuccessorAnchor(&cont, cont.exit_prov[0]) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 51), succ_taken.proto_id);
+    try testing.expectEqual(@as(u32, 8), succ_taken.pc);
+
+    // Recorded `.fallthrough` fails onto the JUMP edge (pc 10) instead.
+    var other_instrs = [_]IrInstr{ .{ .op = .guard_int, .a = 0 }, .{ .op = .loop } };
+    var other: Trace = .{ .id = 703, .anchor = .{ .proto = &proto, .pc = 10 }, .instrs = &other_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try state.cache.append(gpa, &other);
+    cont.exit_prov = &ft_prov;
+    const succ_ft = state.resolveSuccessorAnchor(&cont, cont.exit_prov[0]) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 10), succ_ft.pc);
+
+    // Self-edge decline: the same shape anchored at 8 walks 6 → jmp → 8 == its
+    // own anchor — never a cross-anchor handoff.
+    var selfy: Trace = .{ .id = 704, .anchor = .{ .proto = &proto, .pc = 8 }, .instrs = &cont_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &taken_prov };
+    try testing.expect(nativegen.isCompositeBridgeCandidate(&selfy, 3));
+    try testing.expectEqual(@as(?TraceState.SuccAnchor, null), state.resolveSuccessorAnchor(&selfy, selfy.exit_prov[0]));
+}
+
+test "A-vii-d.1 overlay: a crossed for_loop is published ONLY under the exact-dataflow continue proof" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    // jmp_if_true at 5; the fallthrough pc 6 is a numeric for_loop whose
+    // continue edge lands at 6+1+2 = 9, where the successor trace is bound.
+    var code: [32]Instr = undefined;
+    @memset(code[0..], Instr.op0(.halt));
+    code[5] = Instr.opAx(.jmp_if_true, 0, 10);
+    code[6] = Instr.opAx(.for_loop, 0, 2); // base register a=0; continue target 9
+    const proto = Proto{ .id = 52, .code = &code, .name = "overlay-forloop", .num_registers = 8 };
+
+    const branch_prov: ExitProvenance = .{ .guard = .{
+        .source_proto_id = 52,
+        .source_pc = 5,
+        .role = .branch_cond,
+        .operand = .a,
+        .polarity = .taken,
+    } };
+    const loopdone_prov: ExitProvenance = .{ .guard = .{
+        .source_proto_id = 52,
+        .source_pc = 6,
+        .role = .loop_done,
+        .operand = .a,
+        .polarity = .neutral,
+    } };
+
+    // The exact recForLoop shape (proof-satisfying): one add (R=2) stepping the
+    // index, a dominating loop-continue guard whose `le` consumes R, and
+    // slot-bound phis for BOTH for_loop-written slots {a=0, a+3=3} sharing R.
+    var good_prov = [_]ExitProvEntry{
+        .{ .index = 4, .prov = loopdone_prov },
+        .{ .index = 7, .prov = branch_prov },
+    };
+    var good_instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0
+        .{ .op = .konst, .aux = 0 }, // %1
+        .{ .op = .add, .a = 0, .b = 1, .ty = .int }, // %2 = R
+        .{ .op = .le, .a = 2, .b = 1 }, // %3 consumes R
+        .{ .op = .guard_true, .a = 3, .aux = 7 }, // %4 loop-done (source pc 6)
+        .{ .op = .phi, .b = 2, .aux = 0 }, // idx slot
+        .{ .op = .phi, .b = 2, .aux = 3 }, // var slot, same R
+        .{ .op = .guard_true, .a = 0, .aux = 6 }, // %7 composite (source pc 5)
+        .{ .op = .link, .aux = 9 },
+    };
+    var good: Trace = .{ .id = 711, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &good_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &good_prov };
+    try testing.expect(nativegen.isCompositeBridgeCandidate(&good, 7));
+
+    var skip_instrs = [_]IrInstr{ .{ .op = .guard_int, .a = 0 }, .{ .op = .loop } };
+    var skip: Trace = .{ .id = 712, .anchor = .{ .proto = &proto, .pc = 9 }, .instrs = &skip_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try state.cache.append(gpa, &skip);
+
+    const succ = state.resolveSuccessorAnchor(&good, good.exit_prov[1]) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 9), succ.pc);
+
+    // Proof violation 1: the var slot's phi is missing (bound to a different
+    // slot) — the crossed op's written set is not fully re-materialized.
+    var noval_instrs = good_instrs;
+    noval_instrs[6] = .{ .op = .phi, .b = 2, .aux = 4 }; // not base+3
+    var noval: Trace = .{ .id = 713, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &noval_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &good_prov };
+    try testing.expect(nativegen.isCompositeBridgeCandidate(&noval, 7));
+    try testing.expectEqual(@as(?TraceState.SuccAnchor, null), state.resolveSuccessorAnchor(&noval, noval.exit_prov[1]));
+
+    // Proof violation 2: no dominating loop-continue guard consuming R (the
+    // le compares a different ref) — the continue edge is unproven.
+    var nocmp_instrs = good_instrs;
+    nocmp_instrs[3] = .{ .op = .le, .a = 0, .b = 1 }; // consumes %0, not R
+    var nocmp: Trace = .{ .id = 714, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &nocmp_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &good_prov };
+    try testing.expect(nativegen.isCompositeBridgeCandidate(&nocmp, 7));
+    try testing.expectEqual(@as(?TraceState.SuccAnchor, null), state.resolveSuccessorAnchor(&nocmp, nocmp.exit_prov[1]));
+}
+
+test "A-vii-d.1 bridged successor terminal: a loop-body successor deopt resumes at ITS anchor, ordinary loop-done included" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+    state.config.min_useful = 3;
+
+    // Same wiring as the A-vii-a replay test, but the bridged successor ends
+    // `.loop` — the REAL nsieve shape (an outer-header body trace), not the
+    // synthetic `.link` skip. Its terminal deopt must resume at its OWN anchor
+    // (the coherent-anchor discipline for ordinary-mode runs), never `link_pc`,
+    // and an ordinary-mode loop-done deopt is legitimate (mode 0 bypasses the
+    // linked slot).
+    var code: [30]Instr = undefined;
+    @memset(code[0..], Instr.op0(.halt));
+    code[13] = Instr.opAx(.jmp_if_true, 0, 0);
+    code[19] = Instr.opAx(.for_loop, 0, 2); // makes skip's guard a loop-done index
+    const proto = Proto{ .id = 42, .code = &code, .name = "bridged-loop-succ", .num_registers = 1 };
+    const guard_prov: ExitProvenance = .{ .guard = .{
+        .source_proto_id = proto.id,
+        .source_pc = 13,
+        .role = .branch_cond,
+        .operand = .a,
+        .polarity = .taken,
+    } };
+    var cont_prov = [_]ExitProvEntry{.{ .index = 3, .prov = guard_prov }};
+    var cont_instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 0, .b = 1, .ty = .int },
+        .{ .op = .guard_true, .a = 0, .aux = 14 },
+        .{ .op = .phi, .b = 2, .aux = 0 },
+        .{ .op = .link, .aux = 7 },
+    };
+    var cont: Trace = .{ .id = 621, .anchor = .{ .proto = &proto, .pc = 29 }, .instrs = &cont_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_prov };
+    // skip@25 ends `.loop`; its guard's exit pc 20 sits right after the
+    // for_loop at 19 → `isLoopDoneGuardIndex` is TRUE for exit 0.
+    var skip_instrs = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
+    var skip: Trace = .{ .id = 622, .anchor = .{ .proto = &proto, .pc = 25 }, .instrs = &skip_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try testing.expect(nativegen.isCompositeBridgeCandidate(&cont, 3));
+    try testing.expect(isLoopDoneGuardIndex(&skip, 0));
+    try state.cache.append(gpa, &cont);
+    try state.cache.append(gpa, &skip);
+
+    const rid: RegionId = @enumFromInt(92);
+    try state.armed_links.append(gpa, .{ .parent = &cont, .slot_index = 3, .child = &skip, .kind = .region_bridge, .region_id = rid });
+    try state.region_defs.put(gpa, rid, .{
+        .members = try gpa.dupe(StructuralEdgeId, &.{.{
+            .anchor_proto_id = proto.id,
+            .anchor_pc = cont.anchor.pc,
+            .exit = guard_prov,
+            .succ_anchor_proto_id = proto.id,
+            .succ_anchor_pc = skip.anchor.pc,
+        }}),
+        .member_points = try gpa.dupe(ProgramPoint, &.{}),
+        .owner = cont.anchor,
+        .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
+        .armable = true,
+    });
+
+    const entries = [_]irinterp.LedgerEntry{
+        .{ .cum = 3, .id = cont.id, .exit = 3, .reason = .normal, .kind = .region_bridge, .outcome = .normal },
+        .{ .cum = 5, .id = skip.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+    };
+    var linked_completed: usize = 0;
+    var resume_pc: u32 = 999;
+    var hops: usize = 0;
+    const dir = state.replayLedger(&entries, &cont, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false);
+    const result = switch (dir) {
+        .return_result => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    // Resume at skip's OWN anchor (25) — the bridge row published it — with the
+    // successor's committed local rolled up; `link_pc` (7) must never surface.
+    try testing.expectEqual(@as(u32, 25), result.resume_pc);
+    try testing.expectEqual(@as(usize, 2), result.completed);
+    try testing.expectEqual(@as(u64, 1), state.native_region_bridge_fused);
+}
+
+test "A-vii-d.1 disarm deferral: disarmAllLinks defers mid-replay-walk; applyPendingDisarms applies it and drops the pending arm" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "t", .num_registers = 1 };
+    var p_i = [_]IrInstr{.{ .op = .loop }};
+    var parent: Trace = .{ .id = 801, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &p_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var c_i = [_]IrInstr{.{ .op = .loop }};
+    var child: Trace = .{ .id = 802, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &c_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try state.armed_links.append(gpa, .{ .parent = &parent, .slot_index = 0, .child = &child, .kind = .ordinary_guard });
+
+    // Mid-walk: the registry must stay intact (later rows of the ledger being
+    // walked validate against it) and the request must be recorded.
+    state.replay_walk_depth = 1;
+    state.disarmAllLinks();
+    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    try testing.expect(state.pending_disarm_all);
+    try testing.expectEqual(@as(u64, 0), state.native_link_disarms);
+
+    // Driver-side application: registry cleared, counter charged, and any
+    // pending bridge-arm request from the same walk dropped (fail-closed —
+    // never disarm-then-re-arm into a complex the gate just condemned).
+    state.replay_walk_depth = 0;
+    state.pending_bridge_arm = .{ .trace_id = 801, .exit_instr = 0 };
+    state.applyPendingDisarms();
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expect(!state.pending_disarm_all);
+    try testing.expectEqual(@as(?ExitKey, null), state.pending_bridge_arm);
+    try testing.expectEqual(@as(u64, 1), state.native_link_disarms);
+
+    // Idempotent when nothing is pending.
+    state.applyPendingDisarms();
+    try testing.expectEqual(@as(u64, 1), state.native_link_disarms);
+}
+
+test "A-vii-d.1 stale-region lifecycle: a rebuild disarms region_bridge links whose region is no longer live-armable; other kinds survive" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "t", .num_registers = 1 };
+    var p_i = [_]IrInstr{.{ .op = .loop }};
+    var parent: Trace = .{ .id = 811, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &p_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var c_i = [_]IrInstr{.{ .op = .loop }};
+    var child: Trace = .{ .id = 812, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &c_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+
+    // One bridge link armed under a region this pass will NOT re-discover
+    // (empty cache → empty live-armable set) and one M1 link, which the
+    // targeted sweep must never touch.
+    try state.armed_links.append(gpa, .{ .parent = &parent, .slot_index = 0, .child = &child, .kind = .region_bridge, .region_id = @enumFromInt(9) });
+    try state.armed_links.append(gpa, .{ .parent = &parent, .slot_index = 1, .child = &child, .kind = .ordinary_guard });
+
+    state.rebuildRegions();
+    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    try testing.expect(state.armed_links.items[0].kind == .ordinary_guard);
+    try testing.expectEqual(@as(u64, 1), state.native_link_disarms);
+}
+
+test "A-vii-d.1 two-phase arming: a terminal composite deopt records ONE pending arm request, never arms mid-walk" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    var code: [32]Instr = undefined;
+    @memset(code[0..], Instr.op0(.halt));
+    code[5] = Instr.opAx(.jmp_if_true, 0, 4);
+    const proto = Proto{ .id = 53, .code = &code, .name = "pending-arm", .num_registers = 1 };
+    const guard_prov: ExitProvenance = .{ .guard = .{
+        .source_proto_id = proto.id,
+        .source_pc = 5,
+        .role = .branch_cond,
+        .operand = .a,
+        .polarity = .taken,
+    } };
+    var cont_prov = [_]ExitProvEntry{.{ .index = 3, .prov = guard_prov }};
+    var cont_instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 0, .b = 1, .ty = .int },
+        .{ .op = .guard_true, .a = 0, .aux = 6 },
+        .{ .op = .phi, .b = 2, .aux = 0 },
+        .{ .op = .link, .aux = 7 },
+    };
+    var cont: Trace = .{ .id = 821, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_prov };
+    try testing.expect(nativegen.isCompositeBridgeCandidate(&cont, 3));
+    try state.cache.append(gpa, &cont);
+
+    // A terminal composite `.deopt` (the seed's OWN guard) must record the
+    // pending request and change nothing else — the armed-link registry stays
+    // untouched until a DRIVER drains the request after the walk.
+    const entries = [_]irinterp.LedgerEntry{
+        .{ .cum = 2, .id = cont.id, .exit = 3, .reason = .normal, .kind = .deopt, .outcome = .normal },
+    };
+    var linked_completed: usize = 0;
+    var resume_pc: u32 = 999;
+    var hops: usize = 0;
+    _ = state.replayLedger(&entries, &cont, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false);
+    const pending = state.pending_bridge_arm orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 821), pending.trace_id);
+    try testing.expectEqual(@as(u32, 3), pending.exit_instr);
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+
+    // A later walk with a non-composite terminal clears the stale request
+    // (never inherited across ledgers).
+    var plain_prov = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .guard = .{ .source_proto_id = proto.id, .source_pc = 1, .role = .operand_type, .operand = .a } } }};
+    var plain_instrs = [_]IrInstr{ .{ .op = .guard_int, .a = 0 }, .{ .op = .link, .aux = 7 } };
+    var plain: Trace = .{ .id = 822, .anchor = .{ .proto = &proto, .pc = 21 }, .instrs = &plain_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &plain_prov };
+    try state.cache.append(gpa, &plain);
+    const entries2 = [_]irinterp.LedgerEntry{
+        .{ .cum = 1, .id = plain.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+    };
+    _ = state.replayLedger(&entries2, &plain, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false);
+    try testing.expectEqual(@as(?ExitKey, null), state.pending_bridge_arm);
 }
 
 test "replayLedger forced yield (2c-B/2c-E): a CAP-length ledger ending .yielded replays cleanly" {
