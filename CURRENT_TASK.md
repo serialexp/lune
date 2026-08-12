@@ -51,9 +51,17 @@ Full narrative in doc 17 §A8-iii item 5. The short version:
    in-page handoff (§A2.4) removes the per-firing `driveChain` seam —
    that's where the 94.9% coverage converts to wall-clock.
 
-Remaining: commit (trace.zig + doc 17 + this file), codex post-landing
-review of e.1 (fix findings on own judgment per the standing mandate),
-then A-viii per §A8 step 8.
+Codex post-landing review of e.1 (thread continues the d/d.1 one): MAJOR
+(bitset sizing u32 overflow for near-maxInt pc ranges → u64 arithmetic +
+4M-pc per-proto range cap, f84d9c4) + MINOR (test gaps → shallower-frame
+verdicts, funnel-exercised multi-accumulator disabling, over-cap decline
+test; 92eb5ee) → re-review = **APPROVE**. Commits this arc: daed882
+(e.1 + measurement docs), f84d9c4, 92eb5ee.
+
+Remaining: A-viii per §A8 step 8 (outer-cycle disarm coverage +
+negative control; note the ~700 disarmAllLinks/run churn × bridge re-arm
+interaction), and — the real payoff — the §A2.4 native in-page handoff to
+convert nsieve:24's 94.9% coverage into wall-clock.
 
 ## Status 2026-08-12 (LATEST-32) — **A-vii-d + A-vii-d.1 LANDED: edge 4 is ARMED AND FIRING (bridge fused ~25k/run on nsieve). NEXT = commit → codex post-landing review → A-vii-e measurement.**
 

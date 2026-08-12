@@ -6891,10 +6891,19 @@ determinism matrix.
      disarm churn (~700 `disarmAllLinks`/run at N=7) still forces full chain
      re-arm cycles.
 
+   - **e.1 post-landing review (codex, 2026-08-12): MAJOR + MINOR → fixed →
+     APPROVE.** MAJOR: the bitset sizing `(limit - base) + 63` in u32
+     overflows for a near-maxInt pc range — now computed in u64 with a
+     4M-pc per-proto range cap (over-cap or u32-wrap declines the cache
+     with cleanup; slow path owns the verdicts) (f84d9c4). MINOR: tests
+     extended to shallower-frame verdicts, multi-accumulator disabling
+     exercised THROUGH the openRegion funnel at count 2 with
+     rebuild-for-survivor (92eb5ee), and an over-cap decline test.
+
    §A8 step 7 is ticked on this basis: implementation, determinism evidence
    (six-workload identity + bit-identical stats counters), measurements
-   (reported flat-to-modest, honestly), and review (BLOCKER→fix→APPROVE) are
-   all in.
+   (reported flat-to-modest, honestly), and reviews (d/d.1 BLOCKER→fix→
+   APPROVE; e.1 MAJOR+MINOR→fix→APPROVE) are all in.
 
 ##### A9 — Review log + residual questions
 
