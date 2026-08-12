@@ -3800,6 +3800,35 @@ pub const TraceState = struct {
                     // returns (never mid-walk — review blocker 5).
                     if (e.outcome == .normal and nativegen.isCompositeBridgeCandidate(owner, e.exit))
                         self.pending_bridge_arm = .{ .trace_id = owner.id, .exit_instr = e.exit };
+                    // A-vii-d.1: (b') bridged successor — an ordinary-mode
+                    // (`ordinary_entry`) body entered through the composite
+                    // bridge. Checked BEFORE the `ends_link` split (codex
+                    // post-landing blocker): bridge validation requires zero
+                    // inputs + `ordinary_entry` but not a `.loop` terminator,
+                    // so a `.link`-ending successor is legal — routing it to
+                    // the legacy seed-continuation path would drop its
+                    // zero-progress receipt and let the hop-0 tail charge the
+                    // BRIDGE PARENT a second time (`onSideExit(seed, 0)`),
+                    // even though the `.region_bridge` row already accounted
+                    // it. Bridged deopts follow the coherent-anchor discipline
+                    // (regs coherent at the successor's OWN anchor, the H-1b
+                    // re-execute convention), NOT the linked-inner `link_pc`
+                    // contract — and an ordinary-mode loop-done deopt is
+                    // legitimate here (mode 0 bypasses the linked slot). The
+                    // bridge row already published the successor's validated
+                    // anchor into `resume_pc`; hard-verify the two agree
+                    // rather than trusting either alone.
+                    if (entered_via_bridge) {
+                        if (!(ends_link or ends_loop))
+                            @panic("replayLedger: bridged successor deopt on a non-body owner shape");
+                        if (resume_pc.* != owner.anchor.pc)
+                            @panic("replayLedger: bridged successor deopt resume mismatches its anchor");
+                        self.accountLedgerRow(owner, local, region_consumed);
+                        return .{ .return_result = .{
+                            .completed = linked_completed.* + local,
+                            .resume_pc = resume_pc.*,
+                        } };
+                    }
                     if (ends_link) {
                         // (a) continuation own guard — terminal.
                         if (local > 0) {
@@ -3813,25 +3842,6 @@ pub const TraceState = struct {
                     }
                     if (!ends_loop)
                         @panic("replayLedger: .deopt owner is neither continuation nor inner root");
-                    // A-vii-d.1: (b') bridged successor — an ordinary-mode
-                    // (`ordinary_entry`) body entered through the composite
-                    // bridge. Its deopts follow the coherent-anchor discipline
-                    // (regs coherent at its OWN loop header, the H-1b re-execute
-                    // convention), NOT the linked-inner `link_pc` contract — and
-                    // an ordinary-mode loop-done deopt is legitimate here (mode 0
-                    // bypasses the linked slot), unlike in the linked fusion
-                    // below. The bridge row already published the successor's
-                    // validated anchor into `resume_pc`; hard-verify the two
-                    // agree rather than trusting either alone.
-                    if (entered_via_bridge) {
-                        if (resume_pc.* != owner.anchor.pc)
-                            @panic("replayLedger: bridged successor deopt resume mismatches its anchor");
-                        self.accountLedgerRow(owner, local, region_consumed);
-                        return .{ .return_result = .{
-                            .completed = linked_completed.* + local,
-                            .resume_pc = resume_pc.*,
-                        } };
-                    }
                     // (b) inner body guard. An ordinary-materialization loop-done deopt
                     // (exit PC after `for_loop`) has a DIFFERENT resume contract (tier-0
                     // at the post-loop PC, final iteration uncommitted) and cannot occur
@@ -3860,21 +3870,21 @@ pub const TraceState = struct {
                         @panic("replayLedger: prologue_fail entry violates its static contract");
                     if (!is_last)
                         @panic("replayLedger: prologue_fail is terminal but not last");
-                    if (ends_link) {
-                        // Seed continuation prologue-fail (local == 0): nothing committed
-                        // here → break the burst (matches old scalar `c_local == 0 →
-                        // break_burst`).
-                        return .break_burst;
-                    }
-                    if (!ends_loop)
-                        @panic("replayLedger: prologue_fail owner is neither continuation nor inner root");
-                    // A-vii-d.1: bridged successor prologue-fail — the bridge
-                    // committed its cross-anchor snapshot, then the successor's
-                    // hoisted entry guards failed PRE-commit, so regs are still
+                    // A-vii-d.1: bridged successor prologue-fail — checked
+                    // BEFORE the `ends_link` split (codex post-landing
+                    // blocker; same reasoning as the bridged `.deopt` arm: a
+                    // `.link`-ending successor is bridge-legal and must not
+                    // fall into the seed-continuation `break_burst`, which
+                    // drops its zero-progress receipt and double-charges the
+                    // bridge parent in the hop-0 tail). The bridge committed
+                    // its cross-anchor snapshot, then the successor's hoisted
+                    // entry guards failed PRE-commit, so regs are still
                     // coherent at the successor's anchor (which the bridge row
-                    // published into `resume_pc`). Zero-progress charge; resume
-                    // there, never at the stale `link_pc`.
+                    // published into `resume_pc`). Zero-progress charge;
+                    // resume there, never at the stale `link_pc`.
                     if (entered_via_bridge) {
+                        if (!(ends_link or ends_loop))
+                            @panic("replayLedger: bridged successor prologue-fail on a non-body owner shape");
                         if (resume_pc.* != owner.anchor.pc)
                             @panic("replayLedger: bridged successor prologue-fail resume mismatches its anchor");
                         self.accountLedgerRow(owner, 0, region_consumed);
@@ -3883,6 +3893,14 @@ pub const TraceState = struct {
                             .resume_pc = resume_pc.*,
                         } };
                     }
+                    if (ends_link) {
+                        // Seed continuation prologue-fail (local == 0): nothing committed
+                        // here → break the burst (matches old scalar `c_local == 0 →
+                        // break_burst`).
+                        return .break_burst;
+                    }
+                    if (!ends_loop)
+                        @panic("replayLedger: prologue_fail owner is neither continuation nor inner root");
                     // Inner prologue-fail (local == 0): matches the old `fdone == false`
                     // mid-loop path — record the zero-progress side exit and resume
                     // tier-0 at the inner header, carrying any earlier chain progress.
@@ -10706,6 +10724,100 @@ test "A-vii-d.1 bridged successor terminal: a loop-body successor deopt resumes 
     try testing.expectEqual(@as(u32, 25), result.resume_pc);
     try testing.expectEqual(@as(usize, 2), result.completed);
     try testing.expectEqual(@as(u64, 1), state.native_region_bridge_fused);
+}
+
+test "A-vii-d.1 bridged .link successor (codex blocker): zero-progress deopt and prologue-fail return the bridged contract, never break_burst" {
+    // A bridged successor ending `.link` is legal (bridge validation requires
+    // zero inputs + ordinary_entry, not a `.loop` terminator). Its
+    // zero-progress terminal rows must take the bridged contract — charge the
+    // SUCCESSOR and resume at its anchor — never the seed-continuation
+    // `break_burst`, whose hop-0 tail would charge the BRIDGE PARENT a second
+    // time on top of the `.region_bridge` row's own accounting.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+    state.config.min_useful = 3;
+
+    var code: [30]Instr = undefined;
+    @memset(code[0..], Instr.op0(.halt));
+    code[13] = Instr.opAx(.jmp_if_true, 0, 0);
+    const proto = Proto{ .id = 43, .code = &code, .name = "bridged-link-succ", .num_registers = 1 };
+    const guard_prov: ExitProvenance = .{ .guard = .{
+        .source_proto_id = proto.id,
+        .source_pc = 13,
+        .role = .branch_cond,
+        .operand = .a,
+        .polarity = .taken,
+    } };
+    var cont_prov = [_]ExitProvEntry{.{ .index = 3, .prov = guard_prov }};
+    var cont_instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 0, .b = 1, .ty = .int },
+        .{ .op = .guard_true, .a = 0, .aux = 14 },
+        .{ .op = .phi, .b = 2, .aux = 0 },
+        .{ .op = .link, .aux = 7 },
+    };
+    var cont: Trace = .{ .id = 631, .anchor = .{ .proto = &proto, .pc = 29 }, .instrs = &cont_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_prov };
+    var skip_instrs = [_]IrInstr{ .{ .op = .guard_int, .a = 0 }, .{ .op = .link, .aux = 7 } };
+    var skip: Trace = .{ .id = 632, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &skip_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try state.cache.append(gpa, &cont);
+    try state.cache.append(gpa, &skip);
+    const rid: RegionId = @enumFromInt(93);
+    try state.armed_links.append(gpa, .{ .parent = &cont, .slot_index = 3, .child = &skip, .kind = .region_bridge, .region_id = rid });
+    try state.region_defs.put(gpa, rid, .{
+        .members = try gpa.dupe(StructuralEdgeId, &.{.{
+            .anchor_proto_id = proto.id,
+            .anchor_pc = cont.anchor.pc,
+            .exit = guard_prov,
+            .succ_anchor_proto_id = proto.id,
+            .succ_anchor_pc = skip.anchor.pc,
+        }}),
+        .member_points = try gpa.dupe(ProgramPoint, &.{}),
+        .owner = cont.anchor,
+        .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
+        .armable = true,
+    });
+
+    // (a) Zero-progress deopt (cum unchanged across the successor segment).
+    {
+        const entries = [_]irinterp.LedgerEntry{
+            .{ .cum = 3, .id = cont.id, .exit = 3, .reason = .normal, .kind = .region_bridge, .outcome = .normal },
+            .{ .cum = 3, .id = skip.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+        };
+        var linked_completed: usize = 0;
+        var resume_pc: u32 = 999;
+        var hops: usize = 0;
+        const dir = state.replayLedger(&entries, &cont, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false);
+        const result = switch (dir) {
+            .return_result => |r| r,
+            else => return error.TestUnexpectedResult, // break_burst = the bug
+        };
+        try testing.expectEqual(@as(u32, 20), result.resume_pc);
+        try testing.expectEqual(@as(usize, 0), result.completed);
+    }
+    // (b) Prologue-fail (pre-commit, exit = maxInt, local == 0).
+    {
+        const entries = [_]irinterp.LedgerEntry{
+            .{ .cum = 3, .id = cont.id, .exit = 3, .reason = .normal, .kind = .region_bridge, .outcome = .normal },
+            .{ .cum = 3, .id = skip.id, .exit = std.math.maxInt(u32), .reason = .prologue_fail, .kind = .prologue_fail, .outcome = .normal },
+        };
+        var linked_completed: usize = 0;
+        var resume_pc: u32 = 999;
+        var hops: usize = 0;
+        const dir = state.replayLedger(&entries, &cont, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false);
+        const result = switch (dir) {
+            .return_result => |r| r,
+            else => return error.TestUnexpectedResult, // break_burst = the bug
+        };
+        try testing.expectEqual(@as(u32, 20), result.resume_pc);
+        try testing.expectEqual(@as(usize, 0), result.completed);
+    }
+    // The bridge parent was charged ONLY by its `.region_bridge` rows (useful
+    // at N=3): no penalty ever lands on the parent anchor from the successor's
+    // zero-progress terminals.
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(cont.anchor));
 }
 
 test "A-vii-d.1 disarm deferral: disarmAllLinks defers mid-replay-walk; applyPendingDisarms applies it and drops the pending arm" {
