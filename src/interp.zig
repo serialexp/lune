@@ -12506,3 +12506,136 @@ test "array-of-structs: single-field read accumulation across element tables" {
         \\print(total)
     , "1275\n");
 }
+
+/// A-viii (doc 17 §A8 step 8): the sieve shape that closes the OUTER cycle
+/// `skip → … → cont → skip` — the A-vii-c region shape, scaled until the
+/// region-profit gate qualifies the region and `tryArmRegionBridge` actually
+/// arms edge 4 (measured: 39 bridge arms / 156 fused bridge hops, peak 3
+/// simultaneously-armed links). π(600) = 109.
+const aviii_outer_cycle_source: [:0]const u8 =
+    \\local count = 0
+    \\local flags = {}
+    \\for j = 1, 40 do
+    \\  count = 0
+    \\  for i = 2, 600 do flags[i] = true end
+    \\  for i = 2, 600 do
+    \\    if flags[i] then
+    \\      count = count + 1
+    \\      for k = i + i, 600, i do flags[k] = false end
+    \\    end
+    \\  end
+    \\end
+    \\print(count)
+;
+
+/// What one A-viii leg observed. Counters are lifetime totals for the run
+/// except `peak`, which is the simultaneous high-water mark.
+const OuterCycleRun = struct {
+    out: [16]u8,
+    out_len: usize,
+    bridge_arms: u64,
+    bridge_fused: u64,
+    loopdone_fused: u64,
+    disarms: u64,
+    peak: usize,
+    entries: u64,
+    fn output(self: *const OuterCycleRun) []const u8 {
+        return self.out[0..self.out_len];
+    }
+};
+
+/// Run the outer-cycle sieve on a fresh native-JIT VM, with the observation
+/// window (`record_safepoint_lines` — the same `!safe_to_arm` predicate a
+/// suspend arms) either open for the whole run or closed.
+fn runOuterCycle(gpa: std.mem.Allocator, window_open: bool) !OuterCycleRun {
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, aviii_outer_cycle_source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [16]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    vm.source = aviii_outer_cycle_source;
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotguard = 3; // close the cross-anchor cycle inside a short run
+    vm.record_safepoint_lines = window_open;
+
+    var chunk = try compiler.compile(gpa, &vm.heap, aviii_outer_cycle_source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    var result: OuterCycleRun = .{
+        .out = undefined,
+        .out_len = sink.buffered().len,
+        .bridge_arms = vm.trace.native_region_bridge_arms,
+        .bridge_fused = vm.trace.native_region_bridge_fused,
+        .loopdone_fused = vm.trace.native_loopdone_link_fused,
+        .disarms = vm.trace.native_link_disarms,
+        .peak = vm.trace.native_link_peak,
+        .entries = vm.trace.entries,
+    };
+    @memcpy(result.out[0..result.out_len], sink.buffered());
+    return result;
+}
+
+test "A-viii (doc 17 §A8 step 8): the OUTER cycle arms as a closed cycle and fires; an open observation window contains it" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // §A8 step 8's oracle (round-3 review finding 4), in the terms the tree can
+    // actually observe. The 2c-F test covers the INNER cycle (`C↔I`) across an
+    // epoch boundary; this covers the OUTER cycle `skip → … → cont → skip`,
+    // whose closing edge is A-vii's composite bridge (edge 4).
+    //
+    // The pair of legs is the test:
+    //  * **Window closed (the positive leg):** the outer cycle must actually
+    //    close and fire — a `.region_bridge` arm, fused bridge hops, fused
+    //    loop-done hops, and a simultaneous-arm peak of ≥3 (the per-kind
+    //    counters are lifetime totals and cannot tell a standing closed cycle
+    //    from three edges armed and torn down in turn; the peak can).
+    //  * **Window open (the containment leg / negative control):** with
+    //    `!safe_to_arm` the dispatcher must leave the whole registry empty —
+    //    NOTHING arms (peak 0, zero bridge arms) — so no native→native handoff
+    //    can fire through a patched slot and skip the dispatcher's
+    //    safepoint/GC boundary. Per R2-4 that is NOT a collapse to tier-0
+    //    bodies: traces still run, reached through the dispatcher every time,
+    //    which is what `entries > 0` on this leg pins.
+    // Both legs print the same answer, so containment is output-transparent.
+    const gpa = testing.allocator;
+    const armed = try runOuterCycle(gpa, false);
+    const contained = try runOuterCycle(gpa, true);
+
+    // (1) Output identity: containment cannot change what the program computes.
+    try testing.expectEqualStrings("109\n", armed.output());
+    try testing.expectEqualStrings("109\n", contained.output());
+
+    // (2) Positive leg: the outer cycle is real, closed, and hot.
+    try testing.expect(armed.bridge_arms > 0); // edge 4 armed at least once
+    try testing.expect(armed.bridge_fused > 0); // …and a fused bridge hop ran
+    try testing.expect(armed.loopdone_fused > 0); // …as did the inner loop-done edge
+    try testing.expect(armed.peak >= 3); // …all three edges live SIMULTANEOUSLY
+    try testing.expect(armed.entries > 0);
+
+    // (3) Containment leg: an open window keeps the registry empty for the whole
+    // run — nothing armed, so nothing could fire through a stale slot.
+    try testing.expectEqual(@as(u64, 0), contained.bridge_arms);
+    try testing.expectEqual(@as(u64, 0), contained.bridge_fused);
+    try testing.expectEqual(@as(u64, 0), contained.loopdone_fused);
+    try testing.expectEqual(@as(usize, 0), contained.peak);
+    // Nothing to tear down, so the disarm path never charges a slot either.
+    try testing.expectEqual(@as(u64, 0), contained.disarms);
+
+    // (4) …and the contained run is still trace-driven, NOT collapsed to tier-0
+    // bodies (R2-4): it enters traces at least as often as the armed run, since
+    // every exit that the armed run fused through now returns to the dispatcher.
+    try testing.expect(contained.entries >= armed.entries);
+}

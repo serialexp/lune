@@ -1913,6 +1913,15 @@ pub const TraceState = struct {
     /// test (a byte-identical run under an open window cannot, by itself, prove a
     /// non-empty registry was torn down — the counter can).
     native_link_disarms: u64 = 0,
+    /// A-viii (doc 17 §A8 step 8): the high-water mark of `armed_links.len` — the
+    /// most handoff edges ever armed SIMULTANEOUSLY. The per-kind arm counters are
+    /// lifetime totals, so they cannot distinguish "the three edges of the outer
+    /// cycle were live at once" (a closed armed cycle, which is what the disarm
+    /// path must be able to tear down) from "three edges each armed and torn down
+    /// in turn". This peak can: `>= 3` with a `.region_bridge` among the kinds is
+    /// the outer cycle `skip→…→cont→skip` standing complete. Diagnostic only — no
+    /// selection path reads it, so it cannot perturb the 10-mode equivalence.
+    native_link_peak: usize = 0,
     /// A-vii-d (doc 17 §A-vii.2): count of composite bridge slots actually armed by
     /// `tryArmRegionBridge` — a region member's composite ordinary guard slot pointed
     /// at the registered successor's `ordinary_entry`, so the next time that guard
@@ -6090,6 +6099,7 @@ pub const TraceState = struct {
         // Fresh slot: append the record BEFORE writing the slot, so a failed append
         // leaves the slot at its prior `shared_exit` value with no dangling record.
         try self.armed_links.append(self.gpa, .{ .parent = parent, .slot_index = slot_index, .child = child, .kind = kind });
+        if (self.armed_links.items.len > self.native_link_peak) self.native_link_peak = self.armed_links.items.len;
         c.slots[slot_index] = target;
         self.dbg("arm: parent id={d} pc={d} slot={d} -> child id={d} pc={d} kind={s}", .{
             parent.id, parent.anchor.pc, slot_index, child.id, child.anchor.pc, @tagName(kind),
@@ -8832,7 +8842,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.print("    trace entries:        {d}\n", .{ts.entries});
     try w.print("    link arms:            native={d} source={d} loopdone={d} bridge={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms, ts.native_region_bridge_arms });
     try w.print("    link fused:           source={d} loopdone={d} bridge={d}\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused, ts.native_region_bridge_fused });
-    try w.print("    link disarms:         {d}\n", .{ts.native_link_disarms});
+    try w.print("    link disarms:         {d} (peak simultaneous arms: {d})\n", .{ ts.native_link_disarms, ts.native_link_peak });
     try w.print("    native link exits:    {d} (follows={d})\n", .{ ts.native_link_exits, ts.native_link_follow_count });
     try w.print("    ir link exits:        {d} (follows={d})\n", .{ ts.link_ir_exits, ts.link_follow_count });
     try w.print("    prime-side:           arms={d} chain-follows={d} tier0-body-entries={d}\n", .{ ts.prime_side_arms, ts.prime_side_chain_follows, ts.tier0_outer_body_entries });
@@ -9992,6 +10002,101 @@ test "disarmAllLinks (2c-E / 2.3c-0e): resets EVERY armed slot on entering the o
     state.disarmAllLinks();
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
     try testing.expectEqual(@as(u64, 2), state.native_link_disarms);
+}
+
+test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle, bridge edge included" {
+    // The teardown half of §A8 step 8's oracle, at the unit level: EVERY handoff
+    // slot of the outer cycle returns to its default. The 2c-E test above covers
+    // the inner `C↔I` pair (two `.link_terminal` links); the outer cycle
+    // `skip → … → cont → skip` is three edges of THREE DIFFERENT kinds, and the
+    // one A-vii added — `.region_bridge`, whose slot is a composite ordinary
+    // guard pointed at a cross-anchor successor's `ordinary_entry` — is the one
+    // that did not exist when the disarm path was written. A kind-sensitive
+    // teardown (e.g. one that skipped bridge links because they carry a
+    // `region_id`, or that only walked link_terminal records) would leave a live
+    // native→native handoff behind after the dispatcher declared the blackout;
+    // that is precisely the hazard this pins.
+    //
+    // The stale-region sweep (`disarmStaleRegionBridgeLinks`) is deliberately NOT
+    // the mechanism under test here: it is selective by design. `disarmAllLinks`
+    // is the blackout hammer and must be exhaustive.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const SHARED_EXIT: usize = 0;
+    try testing.expectEqual(@as(?usize, null), state.mcode_arena.trampoline_exit);
+
+    // Three parents, one armed slot each — the three edges of the outer cycle.
+    const skip_slots = try gpa.alloc(usize, 1);
+    defer gpa.free(skip_slots);
+    @memset(skip_slots, SHARED_EXIT);
+    const inner_slots = try gpa.alloc(usize, 1);
+    defer gpa.free(inner_slots);
+    @memset(inner_slots, SHARED_EXIT);
+    const cont_slots = try gpa.alloc(usize, 1);
+    defer gpa.free(cont_slots);
+    @memset(cont_slots, SHARED_EXIT);
+
+    var skip: Trace = .{
+        .id = 1,
+        .anchor = undefined,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = skip_slots, .gpa = gpa, .linked_entry = 0x5111, .ordinary_entry = 0x6111 } },
+    };
+    var inner: Trace = .{
+        .id = 2,
+        .anchor = undefined,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = inner_slots, .gpa = gpa, .linked_entry = 0x5222, .ordinary_entry = 0x6222 } },
+    };
+    var cont: Trace = .{
+        .id = 3,
+        .anchor = undefined,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = cont_slots, .gpa = gpa, .linked_entry = 0x5333, .ordinary_entry = 0x6333 } },
+    };
+
+    // skip --ordinary_guard--> inner --link_terminal--> cont --region_bridge--> skip.
+    // `armNativeLink` derives each target from `child` + `kind`, never from the
+    // caller: an ordinary/bridge handoff enters the child's `ordinary_entry`, a
+    // `.link` terminal its `linked_entry`. The bridge record is appended directly
+    // because the arm-time validator additionally requires a real composite guard
+    // shape at the slot (`isCompositeBridgeCandidate`), which these instr-less
+    // stubs cannot present — but it is byte-identical to the record the A-vii arm
+    // site publishes, and that record is what the teardown walks.
+    try testing.expect(try state.armNativeLink(&skip, 0, &inner, .ordinary_guard));
+    try testing.expect(try state.armNativeLink(&inner, 0, &cont, .link_terminal));
+    try state.armed_links.append(gpa, .{
+        .parent = &cont,
+        .slot_index = 0,
+        .child = &skip,
+        .kind = .region_bridge,
+        .region_id = @enumFromInt(4),
+    });
+    cont_slots[0] = skip.native.compiled.ordinary_entry.?;
+
+    // The cycle stands closed: all three slots point at their successor's entry.
+    try testing.expectEqual(@as(usize, 0x6222), skip_slots[0]); // → inner.ordinary_entry
+    try testing.expectEqual(@as(usize, 0x5333), inner_slots[0]); // → cont.linked_entry
+    try testing.expectEqual(@as(usize, 0x6111), cont_slots[0]); // → skip.ordinary_entry
+    try testing.expectEqual(@as(usize, 3), state.armed_links.items.len);
+
+    // One blackout tears down the WHOLE cycle — including the bridge edge.
+    state.disarmAllLinks();
+    try testing.expectEqual(SHARED_EXIT, skip_slots[0]);
+    try testing.expectEqual(SHARED_EXIT, inner_slots[0]);
+    try testing.expectEqual(SHARED_EXIT, cont_slots[0]); // the A-vii edge, reset too
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(u64, 3), state.native_link_disarms);
 }
 
 test "armNativeLink: P-C option (b) invariant — arm kind matches slot guard shape" {

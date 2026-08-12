@@ -1,5 +1,55 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-12 (LATEST-34) — **A-viii LANDED: §A8 step 8 ticked, ALL EIGHT §A8 STEPS COMPLETE. NEXT = the §A2.4 native in-page handoff (the real payoff), or Part B (rel32).**
+
+Full record in doc 17 §A8-iv. What landed and what it cost:
+
+1. **Integration test (`interp.zig`): the OUTER cycle arms as a CLOSED cycle
+   and fires.** Scaled the A-vii-c region shape (`for j=1,40` over a 600-flag
+   sieve, hotloop=4, hotguard=3) until the gate qualifies: 39 bridge arms,
+   156 fused bridge hops, 430 fused loop-done hops. Added
+   `native_link_peak` (high-water mark of `armed_links.len`, diagnostic-only)
+   because the per-kind counters are LIFETIME TOTALS and can't tell a standing
+   closed cycle from three edges armed and torn down in turn. Pins `peak >= 3`
+   (nsieve measures 4). Also printed in `--jit-stats`.
+2. **The finding that reshaped the step: containment is by PREVENTION, not
+   teardown.** `safe_to_arm = suspend_ctl == null and !record_safepoint_lines`;
+   both flags are only writable by the host BETWEEN `exec()` calls, and parking
+   requires `suspend_ctl` to already be set — which already blocks arming. So
+   **no host-reachable sequence opens a window mid-epoch over a live
+   registry.** Measured: window open for the whole run ⇒ `peak == 0`, bridge
+   arms 0, `native_link_disarms == 0` (nothing to charge). The
+   `disarmAllLinks`-on-unsafe call is correct but currently
+   unreachable-by-construction; it goes live when a debugger hook can arm a
+   suspend on a RUNNING VM. Hence the teardown half is unit-level by necessity.
+   **Bart's call, deliberately not assumed:** whether to make the mid-epoch
+   window reachable so that path gets end-to-end coverage.
+3. **R2-4 pinned:** the contained leg asserts `entries >= armed.entries`
+   (measured 540 vs 460) — with the window open, exits that used to fuse now
+   return to the dispatcher and RE-ENTER traces. Not a collapse to tier-0
+   bodies. Both legs print `109`, so containment is output-transparent.
+4. **Unit test (`trace.zig`): one `disarmAllLinks` tears down the whole outer
+   cycle, bridge edge included** — `skip --ordinary_guard--> inner
+   --link_terminal--> cont --region_bridge--> skip`, all three slots back to
+   `shared_exit`. The bridge kind is the one that postdates the disarm path;
+   a kind-sensitive teardown (like the deliberately-selective
+   `disarmStaleRegionBridgeLinks` sweep) would strand a live handoff.
+5. **Dead ends worth not repeating.** (a) "Safepoint-sequence identity vs
+   tier-0" is NOT a valid window oracle — native trace iterations legitimately
+   emit no per-iteration safepoints (measured 320 333 under the window vs
+   516 251 tier-0). (b) The A-vii-c shape at its original size (80 flags, j=1..5)
+   arms loop-done links but NO bridge; scale is what qualifies the region gate.
+   (c) A bridge-arming run ends with an EMPTY registry (final gate flush
+   disarms), so "still armed at end of Phase A" is not a usable negative
+   control — hence the peak counter.
+
+Gates: `just test` + `-Djit-debug=true` green; six-workload output identity
+holds; nsieve N=9 389 ms / N=7 102 ms (unchanged — the peak counter sits in
+`armNativeLink`, not a hot path).
+
+Remaining: codex post-landing review of A-viii, then the §A2.4 native in-page
+handoff — where nsieve:24's 94.9% coverage finally converts to wall-clock.
+
 ## Status 2026-08-12 (LATEST-33) — **A-vii-e MEASURED + A-vii-e.1 observer fast path LANDED: §A8 step 7 COMPLETE. NEXT = A-viii (outer-cycle disarm coverage) and/or the native in-page handoff (§A2.4).**
 
 Full narrative in doc 17 §A8-iii item 5. The short version:
