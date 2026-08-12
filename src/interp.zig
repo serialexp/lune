@@ -2826,6 +2826,7 @@ pub const Vm = struct {
                                     if (native_eligible) {
                                         if (self.trace.nativeFor(ct)) |nt| {
                                             ran_native = true;
+                                            self.trace.native_entries +%= 1;
                                             ran_native_link_mode = self.trace.hasNativeLoopDoneLink(ct, proto);
                                             // 2.3c-2d (D2a): capture the per-transition
                                             // ledger, preserving the materialization mode
@@ -12625,12 +12626,12 @@ const AviiiMidEpoch = struct {
     /// `(parent.id, child.id)` of every link live at open (capped; the cycle is 3–4).
     edges_at_open: [16][2]u32 = undefined,
     disarms_at_open: u64 = 0,
-    entries_at_open: u64 = 0,
+    native_entries_at_open: u64 = 0,
     /// Phase 1 observations, refreshed on every post-open probe call.
     post_calls: u64 = 0,
     armed_after: usize = 0,
     disarms_after: u64 = 0,
-    entries_after: u64 = 0,
+    native_entries_after: u64 = 0,
 
     fn kindBit(k: trace.ArmKind) u8 {
         return @as(u8, 1) << @intCast(@intFromEnum(k));
@@ -12645,29 +12646,37 @@ const AviiiMidEpoch = struct {
 threadlocal var aviii_mid: AviiiMidEpoch = .{};
 
 /// Does the captured `(parent.id, child.id)` edge list contain a directed cycle?
-/// Bounded-step reachability: with ≤16 edges, `edges.len` hops is a complete
-/// search, so no visited set is needed.
+/// Visited-set BFS from each edge's head, asking whether it can reach that
+/// edge's tail. With ≤16 edges there are ≤32 distinct node ids, so a visited
+/// set bounds the search and makes it manifestly complete — an earlier
+/// path-frontier version could drop endpoints on a branching graph and report a
+/// false negative.
 fn capturedGraphHasCycle(edges: []const [2]u32) bool {
     for (edges) |seed| {
-        var frontier: [16]u32 = undefined;
-        var n: usize = 1;
-        frontier[0] = seed[1];
-        var step: usize = 0;
-        while (step <= edges.len) : (step += 1) {
-            var next: [16]u32 = undefined;
-            var m: usize = 0;
-            for (frontier[0..n]) |node| {
-                if (node == seed[0]) return true; // walked back to the seed's parent
-                for (edges) |e| {
-                    if (e[0] == node and m < next.len) {
-                        next[m] = e[1];
-                        m += 1;
-                    }
+        var visited: [32]u32 = undefined;
+        var nvisited: usize = 0;
+        var queue: [32]u32 = undefined;
+        var head: usize = 0;
+        var tail: usize = 0;
+        queue[tail] = seed[1];
+        tail += 1;
+        while (head < tail) {
+            const node = queue[head];
+            head += 1;
+            if (node == seed[0]) return true; // walked back to the seed's parent
+            var seen = false;
+            for (visited[0..nvisited]) |v| {
+                if (v == node) seen = true;
+            }
+            if (seen) continue;
+            visited[nvisited] = node;
+            nvisited += 1;
+            for (edges) |e| {
+                if (e[0] == node and tail < queue.len) {
+                    queue[tail] = e[1];
+                    tail += 1;
                 }
             }
-            if (m == 0) break;
-            @memcpy(frontier[0..m], next[0..m]);
-            n = m;
         }
     }
     return false;
@@ -12695,7 +12704,7 @@ fn aviiiProbe(ctx: *anyopaque, args: []const Value) anyerror!Value {
         m.kinds_at_open = kinds;
         for (links, 0..) |l, i| m.edges_at_open[i] = .{ l.parent.id, l.child.id };
         m.disarms_at_open = vm.trace.native_link_disarms;
-        m.entries_at_open = vm.trace.entries;
+        m.native_entries_at_open = vm.trace.native_entries;
         m.opened = true;
         // THE EVENT: open the observation window over a live armed registry.
         vm.record_safepoint_lines = true;
@@ -12704,7 +12713,7 @@ fn aviiiProbe(ctx: *anyopaque, args: []const Value) anyerror!Value {
     m.post_calls += 1;
     m.armed_after = vm.trace.armed_links.items.len;
     m.disarms_after = vm.trace.native_link_disarms;
-    m.entries_after = vm.trace.entries;
+    m.native_entries_after = vm.trace.native_entries;
     return Value.nil();
 }
 
@@ -12798,11 +12807,26 @@ test "A-viii (doc 17 §A8 step 8): opening the window MID-EPOCH over a live arme
     // Real hot work ran after the flip — the teardown is not being read off an
     // immediately-terminating program.
     try testing.expect(m.post_calls >= 2);
-    // (2) the whole registry is gone, and every captured edge was charged.
+    // (2) the whole registry is gone, and EXACTLY the captured edges were
+    // charged: once the window is open `safe_to_arm` is false forever after, so
+    // nothing can re-arm and the first blackout charges the captured set and
+    // nothing else. An inequality here would tolerate a re-arm/re-disarm churn
+    // that the invariant forbids.
     try testing.expectEqual(@as(usize, 0), m.armed_after);
-    try testing.expect(m.disarms_after - m.disarms_at_open >= m.armed_at_open);
-    // (3) still trace-driven under the open window, through the dispatcher.
-    try testing.expect(m.entries_after > m.entries_at_open);
+    try testing.expectEqual(@as(u64, m.armed_at_open), m.disarms_after - m.disarms_at_open);
+    // (3) still running NATIVE trace bodies under the open window, entered
+    // through the dispatcher every time. `entries` alone would not carry this:
+    // it is bumped before the native-vs-tier-1a choice, so a run that fell back
+    // to the IR interpreter for every entry would still advance it. R2-4's claim
+    // is specifically that the blackout removes the native→native handoffs, not
+    // the native bodies — hence `native_entries`.
+    try testing.expect(m.native_entries_after > m.native_entries_at_open);
+    // (4) the documented scope boundary, pinned rather than only asserted in
+    // prose: the probe's presence really does keep edge 4 from arming in this
+    // variant, which is why the live set above has no `.region_bridge` in it.
+    // If a future change makes the bridge survive a probed region, this fails
+    // and the comment above must be revisited (a good failure to get).
+    try testing.expectEqual(@as(u64, 0), vm.trace.native_region_bridge_arms);
 }
 
 test "A-viii (doc 17 §A8 step 8): the OUTER cycle arms as a closed cycle and fires; an open observation window contains it" {

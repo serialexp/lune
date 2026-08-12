@@ -1,6 +1,55 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
-## Status 2026-08-12 (LATEST-35) — **A-viii REVISED per codex review. §A8 step 8 stays ticked; three of LATEST-34's claims below were WRONG and are corrected here. NEXT = the §A2.4 native in-page handoff (the real payoff), or Part B (rel32).**
+## Status 2026-08-12 (LATEST-36) — **A-viii round-2 revision (codex round 2 = CHANGES REQUIRED: 3 MAJOR + 1 MINOR). §A8 step 8 stays ticked; the bridge residual is now its OWN Outstanding bullet in doc 17 instead of being absorbed into a ticked step.**
+
+1. **MAJOR — `entries` cannot carry R2-4.** True: it's bumped at
+   `interp.zig:2785` BEFORE the dispatcher chooses native vs tier-1a, so a run
+   that fell back to the IR interpreter every time would still advance it.
+   Added **`TraceState.native_entries`**, bumped only where `nativeFor(ct)`
+   resolves and `ran_native` is set; the mid-epoch test now pins THAT advancing
+   across the window-open event. Also printed in `--jit-stats` next to
+   `entries`.
+2. **MAJOR — the unit test's physical slot shapes were still fake.** All three
+   traces shared one guard array, so the "bridge" slot was physically a
+   loop-done guard and the "terminal" slot a `guard_true`. Rebuilt with a
+   per-trace IR array: genuine numeric-for loop-done guard for `inner`, terminal
+   `.link` op for the C⇄I back edge, a real `isCompositeBridgeCandidate` guard
+   (full `recForLoop` shape: dominating loop-continue guard consuming the
+   stepped index + slot-bound phis for both `for_loop`-written slots) for edge
+   4, plain non-composite guard for the ramp. All four now arm **through
+   `armNativeLink`** — every kind's validator runs for real, nothing is
+   hand-appended to `armed_links`.
+3. **MAJOR — the bridge residual vs "A-viii complete".** Resolved by tracking:
+   the residual is now its own `- [ ]` bullet in doc 17's Outstanding list,
+   phrased "not achieved in this workload", NOT "impossible" (codex's point:
+   a different workload, a cold-path placement, or a non-perturbing debug hook
+   at the dispatcher/bridge-publication boundary would each close it).
+4. **MINOR — two unpinned premises.** The mid-epoch test now asserts
+   `native_region_bridge_arms == 0` (so the documented scope boundary fails
+   loudly if it ever moves) and the disarm delta EXACTLY (`==`, not `>=`):
+   once the window is open nothing can re-arm, so the first blackout charges
+   the captured set and nothing else.
+5. **`capturedGraphHasCycle` rewritten** as a visited-set BFS over the ≤32
+   endpoint ids. The earlier path-frontier version could truncate a branching
+   frontier at 16 and report a false negative (codex confirmed no false
+   positives, but the completeness comment was overstated).
+
+Codex also confirmed: the `threadlocal` capture is sound (synchronous callback
+on the same thread + TLS; the "all tests run in order on one thread" comment was
+stronger than needed), and no false positives in the cycle check.
+
+**Still open (doc 17 Outstanding):** observe a live `.region_bridge` link at a
+mid-epoch window-open instant. Also unpinned, and worth knowing: WHAT empties
+the registry between outer iterations. A region activation is keyed to the
+frame's `call_seq`, not to one scan-loop invocation, and `closeRegion` drops
+profitability state without itself disarming the physical link — so the actual
+teardown trigger hasn't been identified, and identifying it may reveal a
+workable probe placement.
+
+Gates: `just test` + `zig build test -Djit-debug=true` green; six-workload
+output identity holds (same six hashes as LATEST-35).
+
+## Status 2026-08-12 (LATEST-35) — **A-viii REVISED per codex review (round 1). §A8 step 8 stays ticked; three of LATEST-34's claims below were WRONG and are corrected here. NEXT = the §A2.4 native in-page handoff (the real payoff), or Part B (rel32).**
 
 Codex returned CHANGES REQUIRED on 5cf93e8 (1 BLOCKER + 4 MAJORs). All fixed;
 full corrected record in doc 17 §A8-iv. What changed:

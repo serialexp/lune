@@ -1851,6 +1851,18 @@ pub const TraceState = struct {
     /// signal for benchmark analysis (entries ≫ committed-iterations means a
     /// low-yield loop the JIT can't amortize).
     entries: u64 = 0,
+    /// The subset of `entries` where the dispatcher actually committed to running
+    /// **native** code (`nativeFor(ct)` resolved and `ran_native` was set), as
+    /// opposed to falling back to the tier-1a IR interpreter or the exec-log
+    /// recorder. Diagnostic only — no tiering path reads it.
+    ///
+    /// `entries` alone cannot carry R2-4's claim ("an open observation window
+    /// removes the native→native handoffs, not the traces"): it is bumped before
+    /// the native-vs-IR choice is made, so a run that silently fell back to
+    /// tier-1a for every entry would still advance it. This counter is the one
+    /// that says native trace bodies are still being entered *through the
+    /// dispatcher*, which is exactly the post-blackout state R2-4 describes.
+    native_entries: u64 = 0,
     /// Diagnostic/test counters for nested-loop link execution. `link_ir_exits`
     /// counts continuations that actually reached the irinterp `.link` arm;
     /// `link_follow_count` counts those links being followed into the inner root.
@@ -8839,7 +8851,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
 
     try w.writeAll("lune: JIT stats\n");
     try w.writeAll("  event counters:\n");
-    try w.print("    trace entries:        {d}\n", .{ts.entries});
+    try w.print("    trace entries:        {d} (native bodies: {d})\n", .{ ts.entries, ts.native_entries });
     try w.print("    link arms:            native={d} source={d} loopdone={d} bridge={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms, ts.native_region_bridge_arms });
     try w.print("    link fused:           source={d} loopdone={d} bridge={d}\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused, ts.native_region_bridge_fused });
     try w.print("    link disarms:         {d} (peak simultaneous arms: {d})\n", .{ ts.native_link_disarms, ts.native_link_peak });
@@ -10024,35 +10036,84 @@ test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle �
     // deliberately-*selective* `disarmStaleRegionBridgeLinks` sweep does — would
     // strand a live native→native handoff after the dispatcher declared the
     // blackout. `disarmAllLinks` is the blackout hammer and must be exhaustive.
+    // Each parent gets its OWN IR array whose armed slot carries the physical
+    // shape that kind really has in production — a genuine numeric-for loop-done
+    // guard for `inner`, a terminal `.link` op for the C⇄I back edge, a real
+    // `isCompositeBridgeCandidate` guard for edge 4, and a plain non-composite
+    // guard for the source-branch ramp. All four are armed through
+    // `armNativeLink` itself, so every kind's validator (the P-C option-(b)
+    // shape check, the `.ordinary_guard` composite-exclusion, the
+    // `.region_bridge` entry requirement) runs for real; nothing is hand-poked
+    // into `armed_links`.
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
     const SHARED_EXIT: usize = 0;
     try testing.expectEqual(@as(?usize, null), state.mcode_arena.trampoline_exit);
 
-    // `code[0]` is a `for_loop`, so a `guard_true` deopting to pc 1 is a numeric-for
-    // loop-done guard; one deopting to pc 2 (after the non-`for_loop` at code[1]) is
-    // an ordinary guard. Two IR slots per parent: [0] loop-done, [1] ordinary.
-    const proto = Proto{ .code = &.{ Instr.op0(.for_loop), Instr.op0(.ret) }, .name = "outer", .num_registers = 2 };
-    const guards = try gpa.alloc(IrInstr, 2);
-    defer gpa.free(guards);
-    guards[0] = .{ .op = .guard_true, .aux = 1 }; // loop-done (exit pc 1, after for_loop)
-    guards[1] = .{ .op = .guard_true, .aux = 2 }; // ordinary  (exit pc 2)
+    // pc 5 = `jmp_if_true` (the composite branch's source), pc 6 = `for_loop`
+    // (the numeric-for whose loop-done guard the P-C invariant governs); the
+    // continue edge lands at 6+1+2 = 9, where `skip` is anchored.
+    var code: [32]Instr = undefined;
+    @memset(code[0..], Instr.op0(.halt));
+    code[5] = Instr.opAx(.jmp_if_true, 0, 10);
+    code[6] = Instr.opAx(.for_loop, 0, 2);
+    const proto = Proto{ .id = 88, .code = &code, .name = "aviii-outer", .num_registers = 8 };
 
-    const skip_slots = try gpa.alloc(usize, 2);
+    const branch_prov: ExitProvenance = .{ .guard = .{
+        .source_proto_id = 88,
+        .source_pc = 5,
+        .role = .branch_cond,
+        .operand = .a,
+        .polarity = .taken,
+    } };
+    const loopdone_prov: ExitProvenance = .{ .guard = .{
+        .source_proto_id = 88,
+        .source_pc = 6,
+        .role = .loop_done,
+        .operand = .a,
+        .polarity = .neutral,
+    } };
+    var prov = [_]ExitProvEntry{
+        .{ .index = 4, .prov = loopdone_prov },
+        .{ .index = 7, .prov = branch_prov },
+    };
+
+    // The `recForLoop` shape a composite bridge candidate must present: a
+    // dominating loop-continue guard consuming the stepped index `R = %2`, and
+    // slot-bound phis for both `for_loop`-written slots sharing `R`. %4 is the
+    // loop-done guard, %7 the composite branch guard, %8 the `.link` terminal.
+    var cont_instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0
+        .{ .op = .konst, .aux = 0 }, // %1
+        .{ .op = .add, .a = 0, .b = 1, .ty = .int }, // %2 = R
+        .{ .op = .le, .a = 2, .b = 1 }, // %3 consumes R
+        .{ .op = .guard_true, .a = 3, .aux = 7 }, // %4 loop-done (source pc 6)
+        .{ .op = .phi, .b = 2, .aux = 0 }, // idx slot
+        .{ .op = .phi, .b = 2, .aux = 3 }, // var slot, same R
+        .{ .op = .guard_true, .a = 0, .aux = 6 }, // %7 composite (source pc 5)
+        .{ .op = .link, .aux = 9 }, // %8 terminal
+    };
+    var inner_instrs = cont_instrs; // same shape, distinct storage
+    var skip_instrs = [_]IrInstr{
+        .{ .op = .guard_int, .a = 0 }, // %0 a plain guard: not loop-done, not composite
+        .{ .op = .loop },
+    };
+
+    const skip_slots = try gpa.alloc(usize, skip_instrs.len);
     defer gpa.free(skip_slots);
     @memset(skip_slots, SHARED_EXIT);
-    const inner_slots = try gpa.alloc(usize, 2);
+    const inner_slots = try gpa.alloc(usize, inner_instrs.len);
     defer gpa.free(inner_slots);
     @memset(inner_slots, SHARED_EXIT);
-    const cont_slots = try gpa.alloc(usize, 2);
+    const cont_slots = try gpa.alloc(usize, cont_instrs.len);
     defer gpa.free(cont_slots);
     @memset(cont_slots, SHARED_EXIT);
 
     var skip: Trace = .{
         .id = 1,
-        .anchor = .{ .proto = &proto, .pc = 0 },
-        .instrs = guards,
+        .anchor = .{ .proto = &proto, .pc = 9 },
+        .instrs = &skip_instrs,
         .consts = &.{},
         .entry_slots = &.{},
         .entry_guards = &.{},
@@ -10060,62 +10121,61 @@ test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle �
     };
     var inner: Trace = .{
         .id = 2,
-        .anchor = .{ .proto = &proto, .pc = 0 },
-        .instrs = guards,
+        .anchor = .{ .proto = &proto, .pc = 20 },
+        .instrs = &inner_instrs,
         .consts = &.{},
         .entry_slots = &.{},
         .entry_guards = &.{},
+        .exit_prov = &prov,
         .native = .{ .compiled = .{ .page = undefined, .slots = inner_slots, .gpa = gpa, .linked_entry = 0x5222, .ordinary_entry = 0x6222 } },
     };
     var cont: Trace = .{
         .id = 3,
-        .anchor = .{ .proto = &proto, .pc = 0 },
-        .instrs = guards,
+        .anchor = .{ .proto = &proto, .pc = 20 },
+        .instrs = &cont_instrs,
         .consts = &.{},
         .entry_slots = &.{},
         .entry_guards = &.{},
+        .exit_prov = &prov,
         .native = .{ .compiled = .{ .page = undefined, .slots = cont_slots, .gpa = gpa, .linked_entry = 0x5333, .ordinary_entry = 0x6333 } },
     };
-    // The shape the P-C invariant keys on, as the arm path will see it.
-    try testing.expect(isLoopDoneGuardIndex(&inner, 0));
-    try testing.expect(!isLoopDoneGuardIndex(&skip, 1));
+    // The three distinct shapes, as the arm path's validators will classify them.
+    try testing.expect(isLoopDoneGuardIndex(&inner, 4)); // loop-done slot
+    try testing.expect(nativegen.isCompositeBridgeCandidate(&cont, 7)); // bridge slot
+    try testing.expect(!isLoopDoneGuardIndex(&skip, 0)); // plain ordinary slot
+    try testing.expect(!nativegen.isCompositeBridgeCandidate(&skip, 0));
 
     // Arm the cycle. `armNativeLink` derives every target from `child` + `kind`,
     // never from the caller: a loop-done / ordinary / bridge handoff enters the
     // child's `ordinary_entry`, a `.link` terminal its `linked_entry`.
-    try testing.expect(try state.armNativeLink(&inner, 0, &cont, .loop_done_linked));
-    try testing.expect(try state.armNativeLink(&cont, 1, &inner, .link_terminal));
-    try testing.expect(try state.armNativeLink(&skip, 1, &inner, .ordinary_guard));
-    // The bridge record is appended directly: the arm-time validator additionally
-    // requires a real composite guard shape at the slot
-    // (`isCompositeBridgeCandidate`), which these hand-built guards cannot
-    // present. The record is field-for-field what the A-vii arm site publishes,
-    // and the record is what the teardown walks.
-    try state.armed_links.append(gpa, .{
-        .parent = &cont,
-        .slot_index = 0,
-        .child = &skip,
-        .kind = .region_bridge,
-        .region_id = @enumFromInt(4),
-    });
-    cont_slots[0] = skip.native.compiled.ordinary_entry.?;
+    try testing.expect(try state.armNativeLink(&inner, 4, &cont, .loop_done_linked));
+    try testing.expect(try state.armNativeLink(&cont, 8, &inner, .link_terminal));
+    try testing.expect(try state.armNativeLink(&cont, 7, &skip, .region_bridge));
+    try testing.expect(try state.armNativeLink(&skip, 0, &inner, .ordinary_guard));
+    // The A-vii arm site re-stamps the proven region onto the record right after
+    // arming (`armNativeLink` deliberately clears it); mirror that here so the
+    // teardown walks a record shaped exactly like the production one.
+    for (state.armed_links.items) |*l| {
+        if (l.kind == .region_bridge) l.region_id = @enumFromInt(4);
+    }
 
     // The cycle stands closed: every slot points at its successor's entry.
-    try testing.expectEqual(@as(usize, 0x6333), inner_slots[0]); // loop-done → cont.ordinary
-    try testing.expectEqual(@as(usize, 0x5222), cont_slots[1]); // terminal  → inner.linked
-    try testing.expectEqual(@as(usize, 0x6111), cont_slots[0]); // bridge    → skip.ordinary
-    try testing.expectEqual(@as(usize, 0x6222), skip_slots[1]); // ordinary  → inner.ordinary
+    try testing.expectEqual(@as(usize, 0x6333), inner_slots[4]); // loop-done → cont.ordinary
+    try testing.expectEqual(@as(usize, 0x5222), cont_slots[8]); // terminal  → inner.linked
+    try testing.expectEqual(@as(usize, 0x6111), cont_slots[7]); // bridge    → skip.ordinary
+    try testing.expectEqual(@as(usize, 0x6222), skip_slots[0]); // ordinary  → inner.ordinary
     try testing.expectEqual(@as(usize, 4), state.armed_links.items.len);
 
     // One blackout tears down the WHOLE cycle — every kind, every slot.
     state.disarmAllLinks();
-    try testing.expectEqual(SHARED_EXIT, inner_slots[0]);
-    try testing.expectEqual(SHARED_EXIT, cont_slots[1]);
-    try testing.expectEqual(SHARED_EXIT, cont_slots[0]); // the A-vii edge, reset too
-    try testing.expectEqual(SHARED_EXIT, skip_slots[1]);
-    // Nothing else was touched (the untouched sibling slots stay at their default).
+    try testing.expectEqual(SHARED_EXIT, inner_slots[4]);
+    try testing.expectEqual(SHARED_EXIT, cont_slots[8]);
+    try testing.expectEqual(SHARED_EXIT, cont_slots[7]); // the A-vii edge, reset too
     try testing.expectEqual(SHARED_EXIT, skip_slots[0]);
-    try testing.expectEqual(SHARED_EXIT, inner_slots[1]);
+    // Nothing else was touched: every non-armed slot is still at its default.
+    for (skip_slots) |s| try testing.expectEqual(SHARED_EXIT, s);
+    for (inner_slots) |s| try testing.expectEqual(SHARED_EXIT, s);
+    for (cont_slots) |s| try testing.expectEqual(SHARED_EXIT, s);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
     try testing.expectEqual(@as(u64, 4), state.native_link_disarms);
 }
