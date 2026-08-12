@@ -10004,43 +10004,55 @@ test "disarmAllLinks (2c-E / 2.3c-0e): resets EVERY armed slot on entering the o
     try testing.expectEqual(@as(u64, 2), state.native_link_disarms);
 }
 
-test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle, bridge edge included" {
+test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle — all four production edge kinds" {
     // The teardown half of §A8 step 8's oracle, at the unit level: EVERY handoff
     // slot of the outer cycle returns to its default. The 2c-E test above covers
-    // the inner `C↔I` pair (two `.link_terminal` links); the outer cycle
-    // `skip → … → cont → skip` is three edges of THREE DIFFERENT kinds, and the
-    // one A-vii added — `.region_bridge`, whose slot is a composite ordinary
-    // guard pointed at a cross-anchor successor's `ordinary_entry` — is the one
-    // that did not exist when the disarm path was written. A kind-sensitive
-    // teardown (e.g. one that skipped bridge links because they carry a
-    // `region_id`, or that only walked link_terminal records) would leave a live
-    // native→native handoff behind after the dispatcher declared the blackout;
-    // that is precisely the hazard this pins.
+    // the inner `C↔I` pair as two `.link_terminal` stand-ins; this reproduces the
+    // MEASURED production topology of the outer cycle instead (nsieve 9 under
+    // `--jit-debug`, anchors inner=24 / cont=29 / skip=14):
     //
-    // The stale-region sweep (`disarmStaleRegionBridgeLinks`) is deliberately NOT
-    // the mechanism under test here: it is selective by design. `disarmAllLinks`
-    // is the blackout hammer and must be exhaustive.
+    //   inner --loop_done_linked--> cont      (slot is a real numeric-for loop-done guard)
+    //   cont  --link_terminal-----> inner     (the C⇄I back edge)
+    //   cont  --region_bridge-----> skip      (A-vii edge 4 — the outer closing edge)
+    //   skip  --ordinary_guard----> inner     (the source-branch ramp back in)
+    //
+    // All four `ArmKind`s appear, including `.loop_done_linked`, whose slot is
+    // subject to the P-C option-(b) invariant and is therefore the one an
+    // index-shape bug is most likely to mis-handle. `.region_bridge` is the kind
+    // that POSTDATES the disarm path: a kind-sensitive teardown — e.g. one that
+    // skipped bridge links because they carry a `region_id`, the way the
+    // deliberately-*selective* `disarmStaleRegionBridgeLinks` sweep does — would
+    // strand a live native→native handoff after the dispatcher declared the
+    // blackout. `disarmAllLinks` is the blackout hammer and must be exhaustive.
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
     const SHARED_EXIT: usize = 0;
     try testing.expectEqual(@as(?usize, null), state.mcode_arena.trampoline_exit);
 
-    // Three parents, one armed slot each — the three edges of the outer cycle.
-    const skip_slots = try gpa.alloc(usize, 1);
+    // `code[0]` is a `for_loop`, so a `guard_true` deopting to pc 1 is a numeric-for
+    // loop-done guard; one deopting to pc 2 (after the non-`for_loop` at code[1]) is
+    // an ordinary guard. Two IR slots per parent: [0] loop-done, [1] ordinary.
+    const proto = Proto{ .code = &.{ Instr.op0(.for_loop), Instr.op0(.ret) }, .name = "outer", .num_registers = 2 };
+    const guards = try gpa.alloc(IrInstr, 2);
+    defer gpa.free(guards);
+    guards[0] = .{ .op = .guard_true, .aux = 1 }; // loop-done (exit pc 1, after for_loop)
+    guards[1] = .{ .op = .guard_true, .aux = 2 }; // ordinary  (exit pc 2)
+
+    const skip_slots = try gpa.alloc(usize, 2);
     defer gpa.free(skip_slots);
     @memset(skip_slots, SHARED_EXIT);
-    const inner_slots = try gpa.alloc(usize, 1);
+    const inner_slots = try gpa.alloc(usize, 2);
     defer gpa.free(inner_slots);
     @memset(inner_slots, SHARED_EXIT);
-    const cont_slots = try gpa.alloc(usize, 1);
+    const cont_slots = try gpa.alloc(usize, 2);
     defer gpa.free(cont_slots);
     @memset(cont_slots, SHARED_EXIT);
 
     var skip: Trace = .{
         .id = 1,
-        .anchor = undefined,
-        .instrs = &.{},
+        .anchor = .{ .proto = &proto, .pc = 0 },
+        .instrs = guards,
         .consts = &.{},
         .entry_slots = &.{},
         .entry_guards = &.{},
@@ -10048,8 +10060,8 @@ test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle, 
     };
     var inner: Trace = .{
         .id = 2,
-        .anchor = undefined,
-        .instrs = &.{},
+        .anchor = .{ .proto = &proto, .pc = 0 },
+        .instrs = guards,
         .consts = &.{},
         .entry_slots = &.{},
         .entry_guards = &.{},
@@ -10057,24 +10069,28 @@ test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle, 
     };
     var cont: Trace = .{
         .id = 3,
-        .anchor = undefined,
-        .instrs = &.{},
+        .anchor = .{ .proto = &proto, .pc = 0 },
+        .instrs = guards,
         .consts = &.{},
         .entry_slots = &.{},
         .entry_guards = &.{},
         .native = .{ .compiled = .{ .page = undefined, .slots = cont_slots, .gpa = gpa, .linked_entry = 0x5333, .ordinary_entry = 0x6333 } },
     };
+    // The shape the P-C invariant keys on, as the arm path will see it.
+    try testing.expect(isLoopDoneGuardIndex(&inner, 0));
+    try testing.expect(!isLoopDoneGuardIndex(&skip, 1));
 
-    // skip --ordinary_guard--> inner --link_terminal--> cont --region_bridge--> skip.
-    // `armNativeLink` derives each target from `child` + `kind`, never from the
-    // caller: an ordinary/bridge handoff enters the child's `ordinary_entry`, a
-    // `.link` terminal its `linked_entry`. The bridge record is appended directly
-    // because the arm-time validator additionally requires a real composite guard
-    // shape at the slot (`isCompositeBridgeCandidate`), which these instr-less
-    // stubs cannot present — but it is byte-identical to the record the A-vii arm
-    // site publishes, and that record is what the teardown walks.
-    try testing.expect(try state.armNativeLink(&skip, 0, &inner, .ordinary_guard));
-    try testing.expect(try state.armNativeLink(&inner, 0, &cont, .link_terminal));
+    // Arm the cycle. `armNativeLink` derives every target from `child` + `kind`,
+    // never from the caller: a loop-done / ordinary / bridge handoff enters the
+    // child's `ordinary_entry`, a `.link` terminal its `linked_entry`.
+    try testing.expect(try state.armNativeLink(&inner, 0, &cont, .loop_done_linked));
+    try testing.expect(try state.armNativeLink(&cont, 1, &inner, .link_terminal));
+    try testing.expect(try state.armNativeLink(&skip, 1, &inner, .ordinary_guard));
+    // The bridge record is appended directly: the arm-time validator additionally
+    // requires a real composite guard shape at the slot
+    // (`isCompositeBridgeCandidate`), which these hand-built guards cannot
+    // present. The record is field-for-field what the A-vii arm site publishes,
+    // and the record is what the teardown walks.
     try state.armed_links.append(gpa, .{
         .parent = &cont,
         .slot_index = 0,
@@ -10084,19 +10100,24 @@ test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle, 
     });
     cont_slots[0] = skip.native.compiled.ordinary_entry.?;
 
-    // The cycle stands closed: all three slots point at their successor's entry.
-    try testing.expectEqual(@as(usize, 0x6222), skip_slots[0]); // → inner.ordinary_entry
-    try testing.expectEqual(@as(usize, 0x5333), inner_slots[0]); // → cont.linked_entry
-    try testing.expectEqual(@as(usize, 0x6111), cont_slots[0]); // → skip.ordinary_entry
-    try testing.expectEqual(@as(usize, 3), state.armed_links.items.len);
+    // The cycle stands closed: every slot points at its successor's entry.
+    try testing.expectEqual(@as(usize, 0x6333), inner_slots[0]); // loop-done → cont.ordinary
+    try testing.expectEqual(@as(usize, 0x5222), cont_slots[1]); // terminal  → inner.linked
+    try testing.expectEqual(@as(usize, 0x6111), cont_slots[0]); // bridge    → skip.ordinary
+    try testing.expectEqual(@as(usize, 0x6222), skip_slots[1]); // ordinary  → inner.ordinary
+    try testing.expectEqual(@as(usize, 4), state.armed_links.items.len);
 
-    // One blackout tears down the WHOLE cycle — including the bridge edge.
+    // One blackout tears down the WHOLE cycle — every kind, every slot.
     state.disarmAllLinks();
-    try testing.expectEqual(SHARED_EXIT, skip_slots[0]);
     try testing.expectEqual(SHARED_EXIT, inner_slots[0]);
+    try testing.expectEqual(SHARED_EXIT, cont_slots[1]);
     try testing.expectEqual(SHARED_EXIT, cont_slots[0]); // the A-vii edge, reset too
+    try testing.expectEqual(SHARED_EXIT, skip_slots[1]);
+    // Nothing else was touched (the untouched sibling slots stay at their default).
+    try testing.expectEqual(SHARED_EXIT, skip_slots[0]);
+    try testing.expectEqual(SHARED_EXIT, inner_slots[1]);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
-    try testing.expectEqual(@as(u64, 3), state.native_link_disarms);
+    try testing.expectEqual(@as(u64, 4), state.native_link_disarms);
 }
 
 test "armNativeLink: P-C option (b) invariant — arm kind matches slot guard shape" {

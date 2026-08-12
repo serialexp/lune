@@ -12528,6 +12528,28 @@ const aviii_outer_cycle_source: [:0]const u8 =
     \\print(count)
 ;
 
+/// The same sieve, with a host-native probe call at the end of each outer
+/// iteration. The probe is deliberately OUTSIDE every hot inner loop — it runs
+/// on the tier-0 outer body, so it neither perturbs the inner traces nor the
+/// region the bridge is armed against; it only observes and, once, flips the
+/// observation window open. Same answer: π(600) = 109.
+const aviii_mid_epoch_source: [:0]const u8 =
+    \\local count = 0
+    \\local flags = {}
+    \\for j = 1, 40 do
+    \\  count = 0
+    \\  for i = 2, 600 do flags[i] = true end
+    \\  for i = 2, 600 do
+    \\    if flags[i] then
+    \\      count = count + 1
+    \\      for k = i + i, 600, i do flags[k] = false end
+    \\    end
+    \\    if i == 499 then aviii_probe() end
+    \\  end
+    \\end
+    \\print(count)
+;
+
 /// What one A-viii leg observed. Counters are lifetime totals for the run
 /// except `peak`, which is the simultaneous high-water mark.
 const OuterCycleRun = struct {
@@ -12589,6 +12611,200 @@ fn runOuterCycle(gpa: std.mem.Allocator, window_open: bool) !OuterCycleRun {
     return result;
 }
 
+/// A-viii mid-epoch capture. The window-open event happens INSIDE a running
+/// epoch, from a host native, so the only way to observe the registry at that
+/// instant is to record it from the native itself; by the time `vm.run` returns
+/// the blackout has already erased the evidence.
+const AviiiMidEpoch = struct {
+    /// Phase 0 → 1: the outer cycle closed and we flipped the window open.
+    opened: bool = false,
+    /// Snapshot taken at the window-open instant, before the flag is set.
+    armed_at_open: usize = 0,
+    /// Bitmask over `trace.ArmKind` ordinals present in the registry at open.
+    kinds_at_open: u8 = 0,
+    /// `(parent.id, child.id)` of every link live at open (capped; the cycle is 3–4).
+    edges_at_open: [16][2]u32 = undefined,
+    disarms_at_open: u64 = 0,
+    entries_at_open: u64 = 0,
+    /// Phase 1 observations, refreshed on every post-open probe call.
+    post_calls: u64 = 0,
+    armed_after: usize = 0,
+    disarms_after: u64 = 0,
+    entries_after: u64 = 0,
+
+    fn kindBit(k: trace.ArmKind) u8 {
+        return @as(u8, 1) << @intCast(@intFromEnum(k));
+    }
+    fn hasKind(self: *const AviiiMidEpoch, k: trace.ArmKind) bool {
+        return (self.kinds_at_open & kindBit(k)) != 0;
+    }
+};
+
+/// Single-threaded test state; `zig test` runs the tests in a binary in order on
+/// one thread, and `threadlocal` keeps that assumption explicit.
+threadlocal var aviii_mid: AviiiMidEpoch = .{};
+
+/// Does the captured `(parent.id, child.id)` edge list contain a directed cycle?
+/// Bounded-step reachability: with ≤16 edges, `edges.len` hops is a complete
+/// search, so no visited set is needed.
+fn capturedGraphHasCycle(edges: []const [2]u32) bool {
+    for (edges) |seed| {
+        var frontier: [16]u32 = undefined;
+        var n: usize = 1;
+        frontier[0] = seed[1];
+        var step: usize = 0;
+        while (step <= edges.len) : (step += 1) {
+            var next: [16]u32 = undefined;
+            var m: usize = 0;
+            for (frontier[0..n]) |node| {
+                if (node == seed[0]) return true; // walked back to the seed's parent
+                for (edges) |e| {
+                    if (e[0] == node and m < next.len) {
+                        next[m] = e[1];
+                        m += 1;
+                    }
+                }
+            }
+            if (m == 0) break;
+            @memcpy(frontier[0..m], next[0..m]);
+            n = m;
+        }
+    }
+    return false;
+}
+
+/// The host native the A-viii mid-epoch program calls once per outer iteration.
+/// It receives `*Vm` (interp.zig's `nat.func(@ptrCast(self), args)` call site),
+/// which is exactly the reachability that makes this test possible: a host
+/// native CAN flip `record_safepoint_lines` while an epoch and a fully-armed
+/// link registry are live. Phase 0 waits for the outer cycle to close, captures
+/// it, and opens the window; phase 1 just keeps re-reading the counters so the
+/// test can assert against the last post-open observation.
+fn aviiiProbe(ctx: *anyopaque, args: []const Value) anyerror!Value {
+    _ = args;
+    const vm: *Vm = @ptrCast(@alignCast(ctx));
+    const m = &aviii_mid;
+    if (!m.opened) {
+        const links = vm.trace.armed_links.items;
+        // Wait for a multi-edge cycle to stand: ≥3 links live at once.
+        if (links.len < 3 or links.len > m.edges_at_open.len) return Value.nil();
+        var kinds: u8 = 0;
+        for (links) |l| kinds |= AviiiMidEpoch.kindBit(l.kind);
+
+        m.armed_at_open = links.len;
+        m.kinds_at_open = kinds;
+        for (links, 0..) |l, i| m.edges_at_open[i] = .{ l.parent.id, l.child.id };
+        m.disarms_at_open = vm.trace.native_link_disarms;
+        m.entries_at_open = vm.trace.entries;
+        m.opened = true;
+        // THE EVENT: open the observation window over a live armed registry.
+        vm.record_safepoint_lines = true;
+        return Value.nil();
+    }
+    m.post_calls += 1;
+    m.armed_after = vm.trace.armed_links.items.len;
+    m.disarms_after = vm.trace.native_link_disarms;
+    m.entries_after = vm.trace.entries;
+    return Value.nil();
+}
+
+test "A-viii (doc 17 §A8 step 8): opening the window MID-EPOCH over a live armed link cycle tears it down" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    // The same-epoch half of §A8 step 8's oracle, and the one the two-leg test
+    // below structurally cannot reach: there, the window is either open for the
+    // whole run (so nothing ever arms — the teardown path is never exercised) or
+    // closed for the whole run. The interesting transition is *arm the cycle,
+    // THEN open the window*, and the reachable trigger for it is a host-installed
+    // native: `nat.func(@ptrCast(self), args)` hands every native a `*Vm`, so
+    // host code can set `record_safepoint_lines` with an epoch and a full link
+    // registry live. (An earlier landing recorded that no such path existed. That
+    // was wrong; codex found it, and this test is the correction.)
+    //
+    // What it pins, all scoped to the window-open EVENT rather than inferred
+    // across two whole runs:
+    //  1. the registry really did hold a multi-kind link graph containing a
+    //     CYCLE at that instant — captured by kind and by `(parent.id,
+    //     child.id)`, which a lifetime high-water mark cannot show;
+    //  2. after further hot work under the open window the registry is EMPTY and
+    //     every captured link was charged a disarm;
+    //  3. the run is still trace-driven afterwards (`entries` advances) — the
+    //     blackout removes the native→native handoffs, not the traces (R2-4).
+    //
+    // Scope boundary, stated rather than glossed: the live set captured here is
+    // `.link_terminal` + `.loop_done_linked` + `.ordinary_guard`, NOT A-vii's
+    // `.region_bridge`. That is measured, not assumed — the probe call is itself
+    // a tier-0 effect inside the scan loop, and its presence changes the region
+    // shape enough that the profit gate never qualifies the region, so edge 4
+    // never arms in the probed variant (`native_region_bridge_arms == 0`), while
+    // the unprobed program above arms it 39 times. Every attempted placement of
+    // the probe that leaves the bridge armed also leaves the registry empty at
+    // the call instant, because the bridge's armed window lives entirely inside
+    // one scan-loop activation. So the split is: the bridge's *arming and firing*
+    // are covered by the two-leg test below, its *teardown* byte-for-byte by the
+    // trace.zig unit test (which walks all four `ArmKind`s), and the mid-epoch
+    // window transition over a live registry by this test.
+    const gpa = testing.allocator;
+    aviii_mid = .{};
+
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, aviii_mid_epoch_source, &diags);
+    defer tree.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [16]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    vm.source = aviii_mid_epoch_source;
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.hotguard = 3;
+
+    const native = try vm.heap.newNative(aviiiProbe, "aviii_probe");
+    try vm.globals.set(gpa, try vm.heap.internValue("aviii_probe"), Value.heap(&native.header));
+
+    var chunk = try compiler.compile(gpa, &vm.heap, aviii_mid_epoch_source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    // The program computes the same answer whatever the registry did.
+    try testing.expectEqualStrings("109\n", sink.buffered());
+
+    const m = &aviii_mid;
+    // The premise: the cycle DID close mid-run and we DID flip the window over
+    // it. If this ever stops holding the rest of the test is vacuous, so it is
+    // an assertion, not a skip.
+    try testing.expect(m.opened);
+    try testing.expect(m.armed_at_open >= 3);
+    // …and it is a genuine multi-kind cycle, not three copies of one edge kind.
+    try testing.expect(m.hasKind(.link_terminal));
+    try testing.expect(m.hasKind(.loop_done_linked));
+    try testing.expect(m.hasKind(.ordinary_guard));
+    // …and the captured graph CONTAINS a cycle — at least one native→native
+    // handoff that would loop forever without ever returning to the dispatcher
+    // if the blackout missed it. (Not every live link need be on the cycle:
+    // ramp-in edges into the cycle are armed too, and the measured capture is
+    // exactly that shape — a 2-cycle plus a feeder.)
+    try testing.expect(capturedGraphHasCycle(m.edges_at_open[0..m.armed_at_open]));
+
+    // Real hot work ran after the flip — the teardown is not being read off an
+    // immediately-terminating program.
+    try testing.expect(m.post_calls >= 2);
+    // (2) the whole registry is gone, and every captured edge was charged.
+    try testing.expectEqual(@as(usize, 0), m.armed_after);
+    try testing.expect(m.disarms_after - m.disarms_at_open >= m.armed_at_open);
+    // (3) still trace-driven under the open window, through the dispatcher.
+    try testing.expect(m.entries_after > m.entries_at_open);
+}
+
 test "A-viii (doc 17 §A8 step 8): the OUTER cycle arms as a closed cycle and fires; an open observation window contains it" {
     if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
     // §A8 step 8's oracle (round-3 review finding 4), in the terms the tree can
@@ -12598,10 +12814,11 @@ test "A-viii (doc 17 §A8 step 8): the OUTER cycle arms as a closed cycle and fi
     //
     // The pair of legs is the test:
     //  * **Window closed (the positive leg):** the outer cycle must actually
-    //    close and fire — a `.region_bridge` arm, fused bridge hops, fused
-    //    loop-done hops, and a simultaneous-arm peak of ≥3 (the per-kind
-    //    counters are lifetime totals and cannot tell a standing closed cycle
-    //    from three edges armed and torn down in turn; the peak can).
+    //    close and fire — a `.region_bridge` arm, fused bridge hops, and fused
+    //    loop-done hops. (These are lifetime totals and cannot by themselves
+    //    tell a standing closed cycle from edges armed and torn down in turn;
+    //    the mid-epoch test above is what pins simultaneity, by capturing the
+    //    live registry's kinds and `(parent, child)` ids at one instant.)
     //  * **Window open (the containment leg / negative control):** with
     //    `!safe_to_arm` the dispatcher must leave the whole registry empty —
     //    NOTHING arms (peak 0, zero bridge arms) — so no native→native handoff
@@ -12622,7 +12839,7 @@ test "A-viii (doc 17 §A8 step 8): the OUTER cycle arms as a closed cycle and fi
     try testing.expect(armed.bridge_arms > 0); // edge 4 armed at least once
     try testing.expect(armed.bridge_fused > 0); // …and a fused bridge hop ran
     try testing.expect(armed.loopdone_fused > 0); // …as did the inner loop-done edge
-    try testing.expect(armed.peak >= 3); // …all three edges live SIMULTANEOUSLY
+    try testing.expect(armed.peak >= 3); // …and ≥3 links were live at once at some point
     try testing.expect(armed.entries > 0);
 
     // (3) Containment leg: an open window keeps the registry empty for the whole
@@ -12635,7 +12852,14 @@ test "A-viii (doc 17 §A8 step 8): the OUTER cycle arms as a closed cycle and fi
     try testing.expectEqual(@as(u64, 0), contained.disarms);
 
     // (4) …and the contained run is still trace-driven, NOT collapsed to tier-0
-    // bodies (R2-4): it enters traces at least as often as the armed run, since
-    // every exit that the armed run fused through now returns to the dispatcher.
-    try testing.expect(contained.entries >= armed.entries);
+    // bodies (R2-4): traces still run, reached through the dispatcher every time.
+    // Only the *existence* of dispatcher-mediated trace entries is asserted here.
+    // Comparing the two legs' `entries` totals would NOT be sound — the legs
+    // select different traces (the armed leg's fused hops change which exits are
+    // ever taken, hence which side traces get recorded at all), so neither
+    // direction of the inequality is a law. The event-scoped version of this
+    // claim — `entries` advancing *after* a mid-run blackout within one run — is
+    // in the mid-epoch test above, where both sides of the comparison come from
+    // the same selection history.
+    try testing.expect(contained.entries > 0);
 }

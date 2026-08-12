@@ -1,6 +1,63 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
-## Status 2026-08-12 (LATEST-34) — **A-viii LANDED: §A8 step 8 ticked, ALL EIGHT §A8 STEPS COMPLETE. NEXT = the §A2.4 native in-page handoff (the real payoff), or Part B (rel32).**
+## Status 2026-08-12 (LATEST-35) — **A-viii REVISED per codex review. §A8 step 8 stays ticked; three of LATEST-34's claims below were WRONG and are corrected here. NEXT = the §A2.4 native in-page handoff (the real payoff), or Part B (rel32).**
+
+Codex returned CHANGES REQUIRED on 5cf93e8 (1 BLOCKER + 4 MAJORs). All fixed;
+full corrected record in doc 17 §A8-iv. What changed:
+
+1. **BLOCKER — "the mid-epoch window is host-unreachable" is FALSE.** Natives
+   are invoked as `nat.func(@ptrCast(self), args)` (`interp.zig:2466`) — every
+   native receives the `*Vm`. So a host-installed native called from Lua CAN
+   set `record_safepoint_lines` with an epoch and a full armed registry live.
+   LATEST-34 item 2 was wrong, and the "containment by prevention / teardown is
+   unit-level by necessity" framing built on it was wrong too.
+   **New third test** (`interp.zig`, "…MID-EPOCH…"): a test-installed
+   `aviii_probe()` native, called from the sieve's scan loop, waits until
+   `armed_links` holds a ≥3-link multi-kind graph, records it BY KIND and BY
+   `(parent.id, child.id)`, flips the window open, and is re-called for the
+   rest of the run. Measured at the event: 3 links (`.link_terminal` +
+   `.loop_done_linked` + `.ordinary_guard`, containing a directed cycle —
+   asserted by a bounded-reachability check, since the captured graph is a
+   2-cycle plus a feeder, NOT every-child-is-a-parent); `native_link_disarms`
+   0 → 3; `armed_links.len` → 0; `entries` 20 → 40.
+2. **MAJOR — `peak >= 3` doesn't prove the CYCLE was simultaneous.** True: it's
+   a lifetime high-water mark over any kinds. Kept as a coarse assertion +
+   `--jit-stats` diagnostic, but the real simultaneity claim now rests on the
+   mid-epoch capture's kinds + `(parent, child)` pairs.
+3. **MAJOR — `contained.entries >= armed.entries` is unsound.** Withdrawn. The
+   two legs select DIFFERENT traces (the armed leg's fused hops change which
+   exits are ever taken, so which side traces get recorded at all), so neither
+   direction is a law. The whole-run leg now asserts only `entries > 0`; the
+   event-scoped version (`entries` advancing after a mid-run blackout, both
+   sides from ONE selection history) lives in the new test.
+4. **MAJOR — the unit topology was fictional.** LATEST-34's three-edge shape had
+   no `.loop_done_linked`. Rebuilt to the topology measured on nsieve 9 under
+   `--jit-debug` (inner=24 / cont=29 / skip=14): `inner --loop_done_linked-->
+   cont`, `cont --link_terminal--> inner`, `cont --region_bridge--> skip`,
+   `skip --ordinary_guard--> inner` — all four `ArmKind`s, the loop-done slot
+   built on a real numeric-for guard (`isLoopDoneGuardIndex` asserted at
+   construction), one `disarmAllLinks` resetting all four and touching nothing
+   else.
+5. **MAJOR — the containment leg never exercised teardown.** It still doesn't
+   (nothing arms, so there's nothing to tear down — that's the leg's point);
+   the teardown-with-a-live-registry demand is met by the new mid-epoch test.
+
+**Residual, stated not glossed:** no test observes a live `.region_bridge` link
+at a window-open instant. The probe call is itself a tier-0 effect inside the
+scan loop and perturbs the region shape enough that the profit gate never
+qualifies it (`native_region_bridge_arms == 0` probed vs 39 unprobed); every
+placement that keeps the bridge armed leaves the registry empty at the call,
+because the bridge's armed window lives inside one scan-loop activation. Edge
+4's arming/firing is covered by the two-leg test, its teardown byte-for-byte by
+the unit test. Closing the residual needs an observation hook that isn't a
+Lua-visible effect inside the region.
+
+Gates: `just test` + `zig build test -Djit-debug=true` green; six-workload
+output identity holds (nsieve `4053ed86223d7060`, nbody `9dcd7fa2f7e9e93e`,
+sieve_int `db55c0f98f98851b`, pi_leibniz `f57ace5316c0fd19`, grid_matmul
+`395ff5566b31eb18`, field_hash `89b64d3d25ae188f`).
+
+## Status 2026-08-12 (LATEST-34) — **SUPERSEDED IN PART BY LATEST-35: items 2, 3 and 4 below are WRONG (mid-epoch window IS host-reachable; the cross-run `entries` comparison is unsound; the unit topology was fictional). A-viii LANDED: §A8 step 8 ticked, ALL EIGHT §A8 STEPS COMPLETE. NEXT = the §A2.4 native in-page handoff (the real payoff), or Part B (rel32).**
 
 Full record in doc 17 §A8-iv. What landed and what it cost:
 
