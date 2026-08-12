@@ -12647,15 +12647,17 @@ threadlocal var aviii_mid: AviiiMidEpoch = .{};
 
 /// Does the captured `(parent.id, child.id)` edge list contain a directed cycle?
 /// Visited-set BFS from each edge's head, asking whether it can reach that
-/// edge's tail. With ≤16 edges there are ≤32 distinct node ids, so a visited
-/// set bounds the search and makes it manifestly complete — an earlier
-/// path-frontier version could drop endpoints on a branching graph and report a
-/// false negative.
+/// edge's tail. With ≤16 edges there are ≤32 distinct node ids, so a queue of 32
+/// suffices — but ONLY because a node is marked visited when it is *enqueued*,
+/// never when it is dequeued: marking on dequeue lets duplicate endpoints of a
+/// branching graph fill the queue before every distinct node is in it, which
+/// silently drops reachable nodes and reports a false negative. (Marking on
+/// enqueue makes each node enter the queue at most once, so `tail` can never
+/// exceed the number of distinct ids.) Neither variant can produce a false
+/// positive: every enqueued node sits at the end of a real directed path.
 fn capturedGraphHasCycle(edges: []const [2]u32) bool {
     for (edges) |seed| {
-        var visited: [32]u32 = undefined;
-        var nvisited: usize = 0;
-        var queue: [32]u32 = undefined;
+        var queue: [32]u32 = undefined; // doubles as the visited set: queue[0..tail]
         var head: usize = 0;
         var tail: usize = 0;
         queue[tail] = seed[1];
@@ -12664,18 +12666,15 @@ fn capturedGraphHasCycle(edges: []const [2]u32) bool {
             const node = queue[head];
             head += 1;
             if (node == seed[0]) return true; // walked back to the seed's parent
-            var seen = false;
-            for (visited[0..nvisited]) |v| {
-                if (v == node) seen = true;
-            }
-            if (seen) continue;
-            visited[nvisited] = node;
-            nvisited += 1;
             for (edges) |e| {
-                if (e[0] == node and tail < queue.len) {
-                    queue[tail] = e[1];
-                    tail += 1;
+                if (e[0] != node) continue;
+                var enqueued = false;
+                for (queue[0..tail]) |q| {
+                    if (q == e[1]) enqueued = true;
                 }
+                if (enqueued or tail == queue.len) continue;
+                queue[tail] = e[1];
+                tail += 1;
             }
         }
     }
@@ -12746,9 +12745,12 @@ test "A-viii (doc 17 §A8 step 8): opening the window MID-EPOCH over a live arme
     // shape enough that the profit gate never qualifies the region, so edge 4
     // never arms in the probed variant (`native_region_bridge_arms == 0`), while
     // the unprobed program above arms it 39 times. Every attempted placement of
-    // the probe that leaves the bridge armed also leaves the registry empty at
-    // the call instant, because the bridge's armed window lives entirely inside
-    // one scan-loop activation. So the split is: the bridge's *arming and firing*
+    // the probe that leaves the bridge armed also finds the registry empty at
+    // the call instant — an empirical result, not a causal one: what actually
+    // empties it between outer iterations is not pinned down (a region
+    // activation is keyed to the frame's `call_seq`, not to one scan-loop
+    // invocation, and `closeRegion` drops profitability state without itself
+    // disarming a physical link). So the split is: the bridge's *arming and firing*
     // are covered by the two-leg test below, its *teardown* byte-for-byte by the
     // trace.zig unit test (which walks all four `ArmKind`s), and the mid-epoch
     // window transition over a live registry by this test.

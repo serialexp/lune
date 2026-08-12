@@ -96,7 +96,8 @@ at a window-open instant. The probe call is itself a tier-0 effect inside the
 scan loop and perturbs the region shape enough that the profit gate never
 qualifies it (`native_region_bridge_arms == 0` probed vs 39 unprobed); every
 placement that keeps the bridge armed leaves the registry empty at the call,
-because the bridge's armed window lives inside one scan-loop activation. Edge
+(an empirical result — see LATEST-36, the actual emptying mechanism is not
+pinned down). Edge
 4's arming/firing is covered by the two-leg test, its teardown byte-for-byte by
 the unit test. Closing the residual needs an observation hook that isn't a
 Lua-visible effect inside the region.

@@ -6966,12 +6966,13 @@ where each half can be tested. What landed:
    effect inside the scan loop and perturbs the region shape enough that the
    profit gate never qualifies it (`native_region_bridge_arms == 0` in the
    probed variant — asserted in the test, so the boundary fails loudly if it
-   ever moves — vs 39 in the unprobed one); every placement that leaves the
-   bridge armed leaves the registry empty at the call instant, because the
-   bridge's armed window lives entirely inside one scan-loop activation. So
-   edge 4's arming and firing are covered by finding 1, its teardown
-   byte-for-byte by finding 4, and the mid-epoch window transition by this
-   finding.
+   ever moves — vs 39 in the unprobed one); and every placement tried that
+   leaves the bridge armed finds the registry empty at the call instant. That
+   second half is an **empirical** result, not a causal one — see the residual
+   note below: what actually empties the registry between outer iterations is
+   not pinned down. So edge 4's arming and firing are covered by finding 1, its
+   teardown byte-for-byte by finding 4, and the mid-epoch window transition by
+   this finding.
 3. **R2-4's "not a collapse to tier-0 bodies", and the counter that can
    actually carry it.** Two corrections here. (a) The whole-run contained leg
    asserts only `entries > 0`. Comparing the two legs' `entries` totals is
