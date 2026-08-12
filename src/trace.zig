@@ -2388,6 +2388,18 @@ pub const TraceState = struct {
         }
     }
 
+    /// A-vii-c.1: the selection receipt for a ledger row whose REGION receipt was
+    /// already accounted at the top of `replayLedger`'s per-entry loop. This is
+    /// deliberately not `onSideExit`: that wrapper would (a) send a second,
+    /// null-keyed region receipt for a row the region machine has already seen and
+    /// (b) unconditionally apply the legacy verdict, so a row the region window
+    /// consumed would be charged by BOTH machines. The row's own `region_consumed`
+    /// is the boundary, exactly as at `onSideExitReceipt`.
+    inline fn accountLedgerRow(self: *TraceState, t: *Trace, completed: usize, region_consumed: bool) void {
+        self.accountTraceRun(t, completed);
+        if (!region_consumed) self.accountLegacyThrash(t, completed);
+    }
+
     fn sameAnchor(a: AnchorKey, b: AnchorKey) bool {
         return a.proto == b.proto and a.pc == b.pc;
     }
@@ -3208,13 +3220,15 @@ pub const TraceState = struct {
                 .{ .known_trace = entries[k + 1].id }
             else
                 .deferred;
-            // A-vii-c.1: this is a pure region receipt — the per-transition ledger
-            // never runs per-trace selection accounting here (the dispatcher's own
-            // `onSideExitReceipt` does that after the burst), so there is no legacy
-            // verdict to pair with consumption. The single exception is the
-            // `.region_bridge` arm below, which DOES call `accountTraceRun`.
+            // A-vii-c.1: this row's region receipt. The kind arms below pair their
+            // per-trace SELECTION receipt with this verdict via `accountLedgerRow`
+            // — never via `onSideExit`, which would both re-enter the region machine
+            // with a second null-keyed receipt and charge the legacy machine for a
+            // row the region window already consumed. (Receipts the arms raise for a
+            // DIFFERENT trace than this row's owner — the `succ` zero-exits — keep
+            // `onSideExit`: they have no region row of their own, so they are
+            // unconsumed by construction and legacy owns them.)
             const region_consumed = self.accountRegionProfit(region_key, region_work, region_dest);
-            _ = region_consumed;
 
             // Classify STRICTLY by the static emit-site `kind` (never re-derive the
             // materialization contract from the exit PC — an ordinary `.deopt` whose PC
@@ -3286,7 +3300,11 @@ pub const TraceState = struct {
                     // here by the replay grammar above — an armed backlink plus a
                     // unique live registered edge, @panic on anything less. Running the
                     // legacy machine on it would strike the owner once per intra-region
-                    // hop at roughly the rate windows complete, gating exactly the
+                    // HOP, while the region window that clears those strikes completes
+                    // only once per `min_useful` traversals — two independently
+                    // configurable rates (they coincide only because the defaults make
+                    // `max_penalty == min_useful == 8`), so a hop-dense region would
+                    // reach the gate before its window ever cleared it: precisely the
                     // productive regions this arc exists to build. So this site stays
                     // selection-only. It is unreachable until A-vii-d enables arming;
                     // A-vii-d owes it a firing test that pins "a productive armed region
@@ -3350,7 +3368,7 @@ pub const TraceState = struct {
                         @panic("replayLedger: fused loop-done has no exit PC");
                     // One more enclosing iteration committed natively. Account BEFORE
                     // the re-run bound (Q1/Q2: never early-return mid-ledger).
-                    self.onSideExit(owner, if (local > 0) local else 1);
+                    self.accountLedgerRow(owner, if (local > 0) local else 1, region_consumed);
                     linked_completed.* += 1;
                     resume_pc.* = post_pc;
                     // A `.inner_call` seed's FIRST entry is its own loop-done — that
@@ -3444,7 +3462,7 @@ pub const TraceState = struct {
                         if (entries[k + 1].cum != e.cum)
                             @panic("replayLedger: fused M1 ramp committed its own iterations (cum advanced)");
                         self.native_source_link_fused +|= 1;
-                        self.onSideExit(owner, local);
+                        self.accountLedgerRow(owner, local, region_consumed);
                         // Sub-case (b): the ramp deopted at an internal guard BEFORE its
                         // `.link` — terminal. Replay the old dispatcher steering
                         // `onSideExit(ramp, 0); resume owner.anchor.pc`. (`succ.cum ==
@@ -3524,7 +3542,7 @@ pub const TraceState = struct {
                     if (ends_link) {
                         // (a) continuation own guard — terminal.
                         if (local > 0) {
-                            self.onSideExit(owner, local);
+                            self.accountLedgerRow(owner, local, region_consumed);
                             return .{ .return_result = .{
                                 .completed = linked_completed.* + local,
                                 .resume_pc = resume_pc.*,
@@ -3543,7 +3561,7 @@ pub const TraceState = struct {
                     // whole inner loop).
                     if (isLoopDoneGuardIndex(owner, e.exit))
                         @panic("replayLedger: ordinary-mode inner loop-done in a linked fusion is unmodeled");
-                    self.onSideExit(owner, local);
+                    self.accountLedgerRow(owner, local, region_consumed);
                     return .{ .return_result = .{
                         .completed = if (linked_completed.* > 0) linked_completed.* else local,
                         .resume_pc = link_pc,
@@ -3573,7 +3591,7 @@ pub const TraceState = struct {
                     // Inner prologue-fail (local == 0): matches the old `fdone == false`
                     // mid-loop path — record the zero-progress side exit and resume
                     // tier-0 at the inner header, carrying any earlier chain progress.
-                    self.onSideExit(owner, 0);
+                    self.accountLedgerRow(owner, 0, region_consumed);
                     return .{ .return_result = .{
                         .completed = if (linked_completed.* > 0) linked_completed.* else 0,
                         .resume_pc = link_pc,
@@ -9392,6 +9410,92 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.prologue_fail] com
     try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
     // No `.link` marker in this grammar.
     try testing.expectEqual(@as(u64, 0), state.native_link_exits);
+}
+
+test "replayLedger A-vii-c.1: rows a live region CONSUMES take no legacy strike (no double charge)" {
+    // The A-vii-c.1 re-review blocker: `replayLedger` accounts a region receipt per
+    // row and then, in the kind arms, took a per-trace selection receipt through
+    // `onSideExit` — which unconditionally applies the legacy verdict. Once an
+    // armable region exists, a consumed row would be charged by BOTH machines. The
+    // arms now go through `accountLedgerRow`, which honours the row's own
+    // `region_consumed`. This is the positive control; the
+    // `[I.loop_done_linked, C.prologue_fail]` grammar test above is the negative one
+    // (no region ⇒ the identical shape still strikes).
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const proto = Proto{ .id = 77, .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
+    const inner_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .a = 0, .aux = 2 }, // loop-done guard, post-loop pc 2
+        .{ .op = .loop },
+    };
+    var inner: Trace = .{
+        .id = 201,
+        .anchor = .{ .proto = &proto, .pc = 5 },
+        .instrs = @constCast(&inner_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    const cont_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .a = 0, .aux = 9 }, // an own guard: the `.deopt` exit
+        .{ .op = .link, .aux = 5 },
+    };
+    var cont: Trace = .{
+        .id = 202,
+        .anchor = .{ .proto = &proto, .pc = 2 },
+        .instrs = @constCast(&cont_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    try state.cache.append(gpa, &inner);
+    try state.cache.append(gpa, &cont);
+
+    // A live ARMABLE region owning both anchors' exits. Both rows must classify to
+    // the SAME region (a different one would close the active accumulator), and the
+    // first row's destination (202) must be indexed too or `applyDestination` closes
+    // the region as a departure.
+    const owner: AnchorKey = .{ .proto = &proto, .pc = 5 };
+    const rid: RegionId = @enumFromInt(11);
+    try state.region_defs.put(gpa, rid, .{
+        .members = try gpa.dupe(StructuralEdgeId, &.{}),
+        .member_points = try gpa.dupe(ProgramPoint, &.{ .{ .proto_id = 77, .source_pc = 5 }, .{ .proto_id = 77, .source_pc = 2 } }),
+        .owner = owner,
+        .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
+        .armable = true,
+    });
+    try state.source_exit_regions.put(gpa, .{ .trace_id = 201, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
+    try state.source_exit_regions.put(gpa, .{ .trace_id = 202, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
+    try state.dest_entry_regions.put(gpa, 202, try gpa.dupe(RegionId, &.{rid}));
+    state.setRegionContext(1, 5);
+
+    // [I.loop_done_linked (work 1), C.deopt local=3 (work 3)] — both sub-min_useful,
+    // so the PRE-flip machine would have struck both anchors.
+    const entries = [_]irinterp.LedgerEntry{
+        .{ .cum = 1, .id = 201, .exit = 0, .reason = .normal, .kind = .loop_done_linked, .outcome = .normal },
+        .{ .cum = 4, .id = 202, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+    };
+    var regs = [_]Value{Value.int(0)};
+    var tr_regs = TestRegs{ .regs = &regs };
+    const r = state.driveDispatcherLedger(&inner, &entries, &proto, tr_regs.view(), false);
+    try testing.expectEqual(@as(usize, 4), r.completed);
+
+    // Both rows were consumed by the region window machine, so NEITHER anchor took a
+    // legacy strike — the double-charge the re-review caught.
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
+    try testing.expectEqual(@as(usize, 0), state.penalty.count());
+    // ...and the work really landed on the region: 1 + 3 traversals, still short of
+    // the N=8 window, so no flush yet.
+    const key: RegionKey = .{ .region_id = rid, .activation = 5 };
+    try testing.expectEqual(@as(u64, 4), state.region_profit.get(key).?.outer_traversals);
+    try testing.expectEqual(@as(u64, 0), state.region_profit_flushes);
+    // Selection still moved per segment on both traces.
+    try testing.expectEqual(@as(u64, 0), inner.hit_count); // 1 < min_useful
+    try testing.expectEqual(@as(u64, 0), cont.hit_count); // 3 < min_useful
 }
 
 test "driveSeedLedger: a deep hop-0 ledger [C.link, I.done, C.deopt] charges each transition exactly once" {

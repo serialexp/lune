@@ -11997,20 +11997,28 @@ test "executor: a thrashing anchor that later stabilizes recovers from the gate"
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
 }
 
-/// Post-run oracle for the A-vii-c matrix, and a deliberate TRIPWIRE.
+/// Post-run oracle for the A-vii-c matrix: a deliberate DORMANCY TRIPWIRE. Note
+/// what it asserts — that this program's region gate machine never ran — which is
+/// the opposite of what the review asked for, and the reason why follows.
 ///
 /// The A-vii-c review asked this test to prove its legs really exercise the
 /// flipped gate. Measuring that (jitdbg `region: mint` probe) turned up the more
 /// interesting fact: discovery mints this shape's cross-trace cycle with
 /// `armable = false` — `armable_owner` requires exactly one component node that
 /// is BOTH externally entered and carries an inner root (`both_count == 1`), and
-/// no shape we can currently build satisfies it. nsieve, the actual target
-/// workload, reports the same (`members=2 armable=false owner_unique=false
+/// this shape does not satisfy it. nsieve, the actual target workload, reports
+/// the same (`members=2 armable=false owner_unique=false
 /// membership_complete=true`). A non-armable region can never be opened
-/// (`openRegion` refuses), so it never accumulates, never flushes, and the
-/// region gate machine is dormant on every real program today. A-vii-c is
-/// therefore inert IN PRACTICE — its divergence surface is currently empty —
+/// (`openRegion` refuses), so it never accumulates, never flushes, and the region
+/// gate machine does not run on either program. A-vii-c is therefore inert on
+/// every workload measured so far — its divergence surface is empty for them —
 /// even though the machine and its boundary are live in code.
+///
+/// Scope that honestly: this is two observations plus a synthetic
+/// `both_count == 1` graph that discovery DOES accept in trace.zig's unit tests.
+/// It is evidence that the shapes we care about do not reach armability, NOT a
+/// proof that no source program can. Establishing the recorder-level invariant
+/// (or finding the shape that breaks it) is A-vii-d's opening question.
 ///
 /// So this asserts the measured truth rather than a hoped-for one, and fails
 /// loudly the moment it stops holding: when A-vii-d makes an armable owner
@@ -12019,7 +12027,7 @@ test "executor: a thrashing anchor that later stabilizes recovers from the gate"
 /// one authoritative window flush) instead of quietly passing. The gate machine
 /// itself and the consumption boundary are covered directly by the synthetic
 /// trace.zig unit tests, which do not depend on discovery reaching armability.
-fn assertRegionGateExercised(vm: *Vm, mode: TraceMode) anyerror!void {
+fn assertRegionGateDormant(vm: *Vm, mode: TraceMode) anyerror!void {
     // Only the executing legs can form the region at all: the cross-anchor cycle
     // closes through SIDE traces, and side-trace recording is driven by guard
     // failures during trace EXECUTION. With `.off` there is no recorder, and with
@@ -12037,7 +12045,7 @@ fn assertRegionGateExercised(vm: *Vm, mode: TraceMode) anyerror!void {
     while (defs.next()) |def| {
         if (def.armable) armable += 1;
     }
-    // TRIPWIRE (see above): no armable region is reachable today, so the region
+    // TRIPWIRE (see above): this shape does not reach armability, so the region
     // gate machine must be provably dormant on this leg.
     try testing.expectEqual(@as(usize, 0), armable);
     try testing.expectEqual(@as(u64, 0), vm.trace.region_profit_flushes);
@@ -12054,11 +12062,13 @@ test "A-vii-c: a region-forming sieve shape stays byte-identical across all 10 m
     // skip/ramp/inner/cont shape; a `while` inner does NOT close the cycle).
     // π(80) = 22 primes.
     //
-    // A-vii-c.1: every leg additionally proves it really exercised the flipped
-    // gate (`assertRegionGateExercised`) — otherwise a discovery regression would
-    // quietly turn this into an ordinary output test. `hotguard = 3` records side
-    // traces early enough for the cross-anchor cycle to close inside the matrix's
-    // short loops.
+    // A-vii-c.1: every execute leg additionally pins what the flipped gate
+    // actually does here — nothing, because this shape never reaches an armable
+    // region (see `assertRegionGateDormant`). That both stops a discovery
+    // regression from quietly turning this into an ordinary output test and makes
+    // the test fail the moment armability becomes reachable. `hotguard = 3`
+    // records side traces early enough for the cross-anchor cycle to close inside
+    // the matrix's short loops.
     try expectProgramTuned(
         \\local count = 0
         \\local flags = {}
@@ -12073,7 +12083,7 @@ test "A-vii-c: a region-forming sieve shape stays byte-identical across all 10 m
         \\  end
         \\end
         \\print(count)
-    , "22\n", .{ .hotguard = 3, .inspect = &assertRegionGateExercised });
+    , "22\n", .{ .hotguard = 3, .inspect = &assertRegionGateDormant });
 }
 
 test "e2e (executor): a long hot loop stays correct across every trace + gc mode" {

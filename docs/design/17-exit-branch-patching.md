@@ -6333,9 +6333,28 @@ most recent evidence. **One deliberate exception:** `replayLedger`'s
 traversal is billed by the `.loop_done_linked` rows) so it never consumes, but
 its region ownership is *proven right there* by the replay grammar (armed
 backlink + unique live registered edge, `@panic` on anything less); running the
-legacy machine on it would strike the owner once per intra-region hop at roughly
-the rate windows complete, gating exactly the productive regions this arc exists
-to build. It is unreachable until A-vii-d, which owes it a firing test.
+legacy machine on it would strike the owner once per intra-region **hop**, while
+the window that clears those strikes completes only once per `min_useful`
+traversals — two independently configurable rates (they coincide today only
+because the defaults make `max_penalty == min_useful == 8`), so a hop-dense
+region would reach the gate before its window ever cleared it: exactly the
+productive regions this arc exists to build. It is unreachable until A-vii-d,
+which owes it a firing test.
+
+**A-vii-c.1 second-round fix (same review, re-review BLOCKER):** the first
+consumption-keyed pass fixed `onSideExit`/`onSideExitReceipt` but left
+`replayLedger` discarding its per-row `region_consumed` while its kind arms took
+their per-trace selection receipt through `onSideExit` — which re-enters the
+region machine with a second null-keyed receipt AND applies the legacy verdict
+unconditionally. Once an armable region exists, a consumed `.loop_done_linked`
+or `.deopt` row would have been charged by **both** machines. The arms now use
+`accountLedgerRow(owner, completed, region_consumed)`. Receipts an arm raises for
+a trace other than the row's owner (the `succ` zero-exits) keep `onSideExit`:
+they have no region row of their own, so they are unconsumed by construction.
+A positive-control replay test pins a consumed `[I.loop_done_linked, C.deopt]`
+pair taking no legacy strike on either anchor while the region accumulates 4
+traversals; the pre-existing `[I.loop_done_linked, C.prologue_fail]` grammar test
+is the negative control.
 
 Consequences: (a) selection stays byte-identical for **all** non-region shapes —
 the entire pre-existing suite passed unchanged, including the branchy-blacklist
@@ -6350,26 +6369,32 @@ side, since an unconsumed useful receipt clears the trace's own anchor.
 A-vii-d's arm site is unaffected: qualification still reads
 `RegionAccum.useful_window_seen`.
 
-**Measured while closing that blocker: the region gate machine is DORMANT on
-every real program today, so A-vii-c is inert in practice.** Hardening the
+**Measured while closing that blocker: on every workload measured so far the
+region gate machine is DORMANT, so A-vii-c is inert on them.** Hardening the
 10-mode matrix to prove it exercises the flip (the review's second finding)
-showed it does not, and cannot: a `region: mint` jitdbg probe reports that both
-the test sieve shape and **nsieve itself** mint their cross-trace cycle with
+showed it does not: a `region: mint` jitdbg probe reports that both the test
+sieve shape and **nsieve itself** mint their cross-trace cycle with
 `armable = false` — `members=2 armable=false owner_unique=false
 membership_complete=true`. `armable_owner` requires exactly one component node
 that is both externally entered and carries an inner root (`both_count == 1`),
-and no shape currently reachable satisfies it. A non-armable region is refused
-by `openRegion`, so it never accumulates, never flushes, and
-`flushRegionWindow` is never reached outside unit tests. Two consequences worth
-carrying into A-vii-d: the divergence surface A-vii-c opens is presently
-**empty** (which is why the six-workload byte-identity control still passes
-unchanged), and **the A-vii-d arm site would never fire** until `armable_owner`
-is satisfiable — making "why is `both_count == 1` unreachable?" the first
-question A-vii-d has to answer, ahead of the arm itself. The matrix test now
-pins that dormancy as an explicit tripwire (`armable == 0 and
-region_profit_flushes == 0`) so the moment A-vii-d changes it, the test fails
-and forces the coverage to be upgraded to the exercised form rather than
-silently passing.
+and neither shape satisfies it. A non-armable region is refused by `openRegion`,
+so it never accumulates, never flushes, and `flushRegionWindow` is not reached
+outside unit tests.
+
+Scope that precisely (re-review finding 2): this is **two observations**, not a
+recorder-level invariant. Discovery *does* accept a synthetic `both_count == 1`
+graph in trace.zig's unit tests, so nothing here proves a source program cannot
+produce one — only that the shapes we care about, including the target workload,
+do not. Two consequences carry into A-vii-d: the divergence surface A-vii-c
+opens is empty for the measured controls (which is why the six-workload
+byte-identity control still passes unchanged — dormancy, not a contract), and
+**the A-vii-d arm site would never fire on those workloads** until
+`armable_owner` is satisfied — making "why does no recorded shape reach
+`both_count == 1`, and is that the right predicate?" the first question A-vii-d
+has to answer, ahead of the arm itself. The matrix test pins the dormancy of its
+own shape as an explicit tripwire (`armable == 0 and region_profit_flushes == 0`)
+so the moment that changes, the test fails and forces the coverage to be
+upgraded to the exercised form rather than silently passing.
 
 **A-vii.2 — the concrete edge-4 arm site.** The arm belongs in `driveChain`,
 beside—not inside—the M1 `.ordinary_guard` arm blocks at

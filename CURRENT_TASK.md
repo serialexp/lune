@@ -26,18 +26,33 @@ documented in code and doc: `replayLedger`'s `.region_bridge` arm stays
 selection-only — its ownership is *proven* by the replay grammar, and legacy
 striking there would gate productive regions once per intra-region hop.
 
-**Measured while hardening the matrix (codex finding 2): the region gate machine
-is DORMANT on every real program — A-vii-c is inert in practice.** A new
-permanent `region: mint` jitdbg probe shows the test sieve shape AND nsieve both
-mint their cross-trace cycle with `armable=false`
+**Measured while hardening the matrix (codex finding 2): on every workload
+measured so far the region gate machine is DORMANT — A-vii-c is inert on them.**
+A new permanent `region: mint` jitdbg probe shows the test sieve shape AND
+nsieve both mint their cross-trace cycle with `armable=false`
 (`members=2 owner_unique=false membership_complete=true`): `armable_owner` wants
 exactly one component node that is both externally entered and carries an inner
-root (`both_count == 1`), and nothing reachable satisfies it. `openRegion`
-refuses non-armable defs, so no accumulator ever opens and `flushRegionWindow`
-is unreachable outside unit tests. Hence the byte-identity control still passes
-unchanged — dormancy, not a contract. **This blocks A-vii-d**: the arm site
-could never fire. First question for that piece is "why is `both_count == 1`
-unreachable, and is it the right predicate?", ahead of writing the arm.
+root (`both_count == 1`), and neither shape satisfies it. `openRegion` refuses
+non-armable defs, so no accumulator opens and `flushRegionWindow` is not reached
+outside unit tests. Hence the byte-identity control still passes unchanged —
+dormancy, not a contract. Scope it honestly (re-review finding 2): two
+observations, NOT a recorder invariant — discovery does accept a synthetic
+`both_count == 1` graph in the unit tests. **This blocks A-vii-d** on those
+workloads: the arm site could never fire. First question for that piece is "why
+does no recorded shape reach `both_count == 1`, and is it the right predicate?",
+ahead of writing the arm.
+
+Second-round fix (re-review BLOCKER, same session): `replayLedger` was
+discarding its per-row `region_consumed` while its kind arms took their
+selection receipt through `onSideExit` — re-entering the region machine with a
+second null-keyed receipt AND applying the legacy verdict unconditionally, so a
+consumed `.loop_done_linked`/`.deopt` row would be charged by BOTH machines once
+armability exists. The arms now use `accountLedgerRow(owner, completed,
+region_consumed)`; the `succ` zero-exit receipts keep `onSideExit` (no region row
+of their own ⇒ unconsumed by construction). New positive-control replay test:
+a consumed `[I.loop_done_linked, C.deopt]` pair takes no legacy strike on either
+anchor while the region accumulates 4 traversals; the pre-existing
+`[I.loop_done_linked, C.prologue_fail]` grammar test is the negative control.
 
 Tests: the 10-mode matrix now runs at `hotguard=3` through a new
 `expectProgramTuned`/`CapturedOpts` harness (post-run `inspect` hook against the
