@@ -1132,6 +1132,31 @@ fn RegionSetBuilder(comptime K: type) type {
 ///
 /// Returns a static empty slice when there is nothing to carry (no alloc). Caller
 /// owns the result.
+/// Populate `t.bridge_cand` / `t.bridge_cand_built` by evaluating the pure
+/// `nativegen.isCompositeBridgeCandidate` oracle once per instruction index
+/// (doc 17 §T.9). Call once, at commit, after `t` is fully populated.
+///
+/// FAIL-SOFT by design: on OOM the memo is simply left unbuilt and
+/// `Trace.isBridgeCandidate` falls back to the oracle. There is deliberately no
+/// error return — a commit must never fail because an accelerator could not be
+/// allocated.
+pub fn buildBridgeCandMemo(gpa: std.mem.Allocator, t: *Trace) void {
+    if (t.instrs.len == 0) {
+        // Nothing to memoize, but mark it built: the oracle returns false for every
+        // index on an empty trace, which an empty bitset reproduces exactly.
+        t.bridge_cand_built = true;
+        return;
+    }
+    const bytes = gpa.alloc(u8, (t.instrs.len + 7) / 8) catch return;
+    @memset(bytes, 0);
+    for (0..t.instrs.len) |i| {
+        if (nativegen.isCompositeBridgeCandidate(t, i))
+            bytes[i >> 3] |= @as(u8, 1) << @intCast(i & 7);
+    }
+    t.bridge_cand = bytes;
+    t.bridge_cand_built = true;
+}
+
 pub fn buildExitProv(
     gpa: std.mem.Allocator,
     rec_exit_prov: []const ?ExitProvenance,
@@ -1414,6 +1439,30 @@ pub const Trace = struct {
     /// Runtime-only — not serialized.
     rec_path_complete: bool = true,
 
+    /// Memoized `nativegen.isCompositeBridgeCandidate` (doc 17 §T.9), one bit per
+    /// committed instruction index, LSB-first. That oracle is a PURE function of
+    /// immutable recorded data (`instrs`, `anchor.proto.code`, `provAt`) that ends in
+    /// an O(`instrs`) scan, and the seam calls it once per receipt from eight sites —
+    /// 4.68% of nsieve N=9 wall-clock spent recomputing a constant. Alloc-once at
+    /// commit; owned; freed in `destroy`; never serialized.
+    ///
+    /// `bridge_cand_built` distinguishes "not built" from "built and all-zero" — the
+    /// build is FAIL-SOFT (an OOM must not abort the commit, same rationale as
+    /// `exit_prov`), and hand-built test traces never go through commit at all. When
+    /// false, `isBridgeCandidate` falls back to calling the oracle, so the memo is a
+    /// pure accelerator: results are identical either way, by construction.
+    bridge_cand: []const u8 = &.{},
+    bridge_cand_built: bool = false,
+
+    /// Memoized `nativegen.isCompositeBridgeCandidate(self, idx)` — see `bridge_cand`.
+    /// Falls back to the oracle when the memo was not built.
+    pub fn isBridgeCandidate(self: *const Trace, idx: usize) bool {
+        if (!self.bridge_cand_built)
+            return nativegen.isCompositeBridgeCandidate(self, idx);
+        if (idx >= self.instrs.len) return false; // oracle's own bound
+        return (self.bridge_cand[idx >> 3] >> @intCast(idx & 7)) & 1 != 0;
+    }
+
     /// The exit provenance at committed instruction index `idx`, or `null` if that
     /// instruction is not a tracked exit. Binary search over the sorted table.
     pub fn provAt(self: *const Trace, idx: u32) ?ExitProvenance {
@@ -1438,6 +1487,7 @@ pub const Trace = struct {
         if (self.inputs.len != 0) gpa.free(self.inputs);
         if (self.exit_prov.len != 0) gpa.free(self.exit_prov);
         if (self.rec_path.len != 0) gpa.free(self.rec_path); // A-ii.3
+        if (self.bridge_cand.len != 0) gpa.free(self.bridge_cand); // §T.9 memo
         gpa.destroy(self);
     }
 
@@ -2998,7 +3048,7 @@ pub const TraceState = struct {
     fn maybeArmCompositeExit(self: *TraceState, t: *Trace, exit_instr: u32, safe_to_arm: bool) void {
         if (!safe_to_arm) return;
         if (exit_instr == std.math.maxInt(u32) or exit_instr >= t.instrs.len) return;
-        if (!nativegen.isCompositeBridgeCandidate(t, exit_instr)) return;
+        if (!t.isBridgeCandidate(exit_instr)) return;
         self.tryArmRegionBridge(t, exit_instr);
     }
 
@@ -3961,7 +4011,7 @@ pub const TraceState = struct {
                     // falling back would replay from the wrong register image.
                     if (!(e.reason == .normal and e.outcome == .normal and !is_last))
                         @panic("replayLedger: region_bridge is terminal, yielded, or non-normal");
-                    if (!nativegen.isCompositeBridgeCandidate(owner, e.exit))
+                    if (!owner.isBridgeCandidate(e.exit))
                         @panic("replayLedger: region_bridge exit is not a composite guard");
                     const succ = self.traceById(entries[k + 1].id) orelse
                         @panic("replayLedger: region_bridge successor id did not resolve");
@@ -4282,7 +4332,7 @@ pub const TraceState = struct {
                     // observation of the edge-4 exit. Record the at-most-one pending
                     // arm request; the ledger DRIVER drains it after this replay
                     // returns (never mid-walk — review blocker 5).
-                    if (e.outcome == .normal and nativegen.isCompositeBridgeCandidate(owner, e.exit))
+                    if (e.outcome == .normal and owner.isBridgeCandidate(e.exit))
                         self.pending_bridge_arm = .{ .trace_id = owner.id, .exit_instr = e.exit };
                     // A-vii-d.1: (b') bridged successor — an ordinary-mode
                     // (`ordinary_entry`) body entered through the composite
@@ -4971,7 +5021,7 @@ pub const TraceState = struct {
             .region_bridge => {
                 if (entries.len < 2)
                     @panic("driveSeedLedger: bridge-headed ledger has no successor row");
-                if (!nativegen.isCompositeBridgeCandidate(seed, e0.exit))
+                if (!seed.isBridgeCandidate(e0.exit))
                     @panic("driveSeedLedger: bridge-headed first entry is not a composite guard of the seed");
             },
             else => @panic("driveSeedLedger: first entry is neither the seed's .link terminal nor its composite bridge"),
@@ -5438,7 +5488,7 @@ pub const TraceState = struct {
         if (g.role != .branch_cond or g.polarity == .neutral) return null;
         const proto = t.anchor.proto;
         if (g.source_proto_id != proto.id) return null;
-        if (!nativegen.isCompositeBridgeCandidate(t, e.index)) return null;
+        if (!t.isBridgeCandidate(e.index)) return null;
         if (g.source_pc >= proto.code.len) return null;
         const bop = proto.code[g.source_pc];
         switch (bop.op) {
@@ -5919,7 +5969,7 @@ pub const TraceState = struct {
             for (edges.items) |e| {
                 if (comp[e.from] != c or comp[e.to] != c) continue;
                 const parent = self.traceById(e.key.trace_id) orelse continue;
-                if (!nativegen.isCompositeBridgeCandidate(parent, e.key.exit_instr)) continue;
+                if (!parent.isBridgeCandidate(e.key.exit_instr)) continue;
 
                 var existing: ?*RegionBridgeDef = null;
                 for (bridge_list.items) |*b| {
@@ -6415,7 +6465,7 @@ pub const TraceState = struct {
                 // A-v bridge candidates must remain at shared_exit. In particular,
                 // the older M1 ordinary-source arm must not accidentally publish a
                 // composite back-edge into the new armed body.
-                if (nativegen.isCompositeBridgeCandidate(parent, slot_index)) return false;
+                if (parent.isBridgeCandidate(slot_index)) return false;
             },
             .region_bridge => {
                 std.debug.assert(!is_loopdone);
@@ -7260,6 +7310,13 @@ pub const TraceState = struct {
             .rec_path = rec_path_owned,
             .rec_path_complete = rec_path_complete,
         };
+        // §T.9: memoize the pure `isCompositeBridgeCandidate` oracle over this trace's
+        // instruction indices. Must run AFTER `t.*` is populated — the oracle reads the
+        // finished trace (`instrs`, `anchor`, `provAt`). FAIL-SOFT: on OOM leave the memo
+        // unbuilt, and `isBridgeCandidate` transparently falls back to the oracle, so a
+        // failure costs speed and never correctness.
+        buildBridgeCandMemo(self.gpa, t);
+        errdefer if (t.bridge_cand.len != 0) self.gpa.free(t.bridge_cand);
         try self.cache.append(self.gpa, t);
         // Coverage (gated): a trace now exists at this anchor, so subsequent
         // interpreted back-edges here are "fallback despite a trace."
@@ -12051,6 +12108,68 @@ test "buildExitProv: null map is the identity (dupe path), result stays sorted (
     try testing.expect(t.provAt(2) == null);
     try testing.expectEqual(@as(u32, 20), t.provAt(3).?.guard.source_pc);
     try testing.expect(t.provAt(4) == null);
+}
+
+test "§T.9 bridge-candidate memo: bit-identical to the oracle at every index, unbuilt falls back" {
+    // The memo is only legitimate if it is indistinguishable from the pure oracle it
+    // replaces. Assert that directly, at EVERY index (including out of bounds), in
+    // all three states: unbuilt (fallback), built-with-a-true-bit, built-all-false.
+    const gpa = testing.allocator;
+    var code: [30]Instr = undefined;
+    @memset(code[0..], Instr.op0(.halt));
+    code[13] = Instr.opAx(.jmp_if_true, 0, 0);
+    code[19] = Instr.opAx(.for_loop, 0, 2);
+    const proto = Proto{ .id = 42, .code = &code, .name = "memo", .num_registers = 1 };
+    const guard_prov: ExitProvenance = .{ .guard = .{
+        .source_proto_id = proto.id,
+        .source_pc = 13,
+        .role = .branch_cond,
+        .operand = .a,
+        .polarity = .taken,
+    } };
+    var cont_prov = [_]ExitProvEntry{.{ .index = 3, .prov = guard_prov }};
+    var cont_instrs = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 0, .b = 1, .ty = .int },
+        .{ .op = .guard_true, .a = 0, .aux = 14 },
+        .{ .op = .phi, .b = 2, .aux = 0 },
+        .{ .op = .link, .aux = 7 },
+    };
+    var cont: Trace = .{ .id = 900, .anchor = .{ .proto = &proto, .pc = 29 }, .instrs = &cont_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_prov };
+
+    // (a) Unbuilt — hand-built test traces never go through commit; the accessor
+    // must BE the oracle.
+    try testing.expect(!cont.bridge_cand_built);
+    for (0..cont_instrs.len + 4) |i|
+        try testing.expectEqual(nativegen.isCompositeBridgeCandidate(&cont, i), cont.isBridgeCandidate(i));
+    try testing.expect(cont.isBridgeCandidate(3)); // known bridge slot
+
+    // (b) Built — still bit-identical everywhere, in and out of bounds.
+    buildBridgeCandMemo(gpa, &cont);
+    defer if (cont.bridge_cand.len != 0) gpa.free(cont.bridge_cand);
+    try testing.expect(cont.bridge_cand_built);
+    for (0..cont_instrs.len + 4) |i|
+        try testing.expectEqual(nativegen.isCompositeBridgeCandidate(&cont, i), cont.isBridgeCandidate(i));
+    try testing.expect(cont.isBridgeCandidate(3));
+
+    // (c) An all-false trace: a built memo must not invent a candidate.
+    var skip_instrs = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
+    var skip: Trace = .{ .id = 901, .anchor = .{ .proto = &proto, .pc = 25 }, .instrs = &skip_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    buildBridgeCandMemo(gpa, &skip);
+    defer if (skip.bridge_cand.len != 0) gpa.free(skip.bridge_cand);
+    try testing.expect(skip.bridge_cand_built);
+    for (0..skip_instrs.len + 2) |i| {
+        try testing.expect(!skip.isBridgeCandidate(i));
+        try testing.expectEqual(nativegen.isCompositeBridgeCandidate(&skip, i), skip.isBridgeCandidate(i));
+    }
+
+    // (d) Empty trace: marked built, allocates nothing, every index false.
+    var empty: Trace = .{ .id = 902, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    buildBridgeCandMemo(gpa, &empty);
+    try testing.expect(empty.bridge_cand_built);
+    try testing.expectEqual(@as(usize, 0), empty.bridge_cand.len);
+    try testing.expect(!empty.isBridgeCandidate(0));
 }
 
 test "pathFromFrames: f(a);f(b) at distinct call sites give distinct inline paths (A-i.2)" {
