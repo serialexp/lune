@@ -1,5 +1,59 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-12 (LATEST-38) — **The region-profit gate FIX landed: the gate was condemning its own region. nsieve −19.6%, sieve_int −25.9%, links persist for whole sieves, nsieve:14 coverage 2.4% → 91.5%.**
+
+Bart's mandate: "the only thing the fix set out to do failed… try to fix it
+again — maybe now constantly checking soundness *and* profitability." Both
+gates (`just test`, `zig build test -Djit-debug=true`) plus counters + raw
+wall-clock + output hashes were re-run after **every** change. Four fixes, all
+in src/trace.zig, all general mechanisms (Z-6) — full record in doc 17 §A8-v:
+
+1. **`chooseSource` no longer closes the live accumulator on UNCLASSIFIED
+   exits** (ephemeral-edge-cache miss = "no information", not "we left").
+   Tombstoned/vanished defs still close immediately (positive evidence; pins
+   test (5e)). Window strikes 3,603 → 0, mid-run `disarmAllLinks` 703 → 0.
+2. **`armLinkTerminal` (arm site 4)** — the `.link`-terminal edition of site 3's
+   loop-done convergence; previously 6,931 spans/run died unarmed at the prime
+   ramp's `.link`, one runtime seam per prime.
+3. **Consumption boundary revised** (the big one): (i) zero-work member
+   receipts of a QUALIFIED activation (`useful_window_seen`) are consumed —
+   they're polarity-flip transitions, not thrash; unqualified activations keep
+   full pre-flip legacy gating (A-vii-c blocker shape stays gated); (ii)
+   unclassified nonzero-work receipts from traces anchored in the live
+   activation's `member_points` footprint credit the accumulator
+   (`regionMemberTraceAnchor`); (iii) null-keyed synthetic steering charges
+   (`onSideExit(ramp,0)`/`(seed,0)`) on member anchors of a live qualified
+   activation are region-owned (`qualifiedActiveRegionOwns`). Before: 94k
+   `completed=0` legacy strikes/run kept re-gating (exponential backoff →
+   permanent abandonment) the scan anchor the region machine had just
+   qualified. Pinned by the new "gate-fix consumption boundary" test (a–g).
+4. **`openRegion` refreshes the observer cache only on real map mutation.**
+   THE PROFITABILITY TRAP OF THE ARC: after 1–3, coverage exploded (91.5%
+   traced, fused source ≈ every prime, disarms 0) and wall-clock got *WORSE*
+   (+12% N=9) — `applyDestination` no-op re-opens the active region once per
+   fused receipt, and each re-open freed + reallocated the observer bitset and
+   killed `ObserverHot` (9.6% of wall). Coverage converted only after this fix.
+
+**Measured** (interleaved A/B vs /tmp/lune-fast2 = 182cb87+49f3984): nsieve N=9
+0.32 → 0.30–0.31s raw; full suite nsieve −19.6% (103.2 → 83.0ms), sieve_int
+−25.9% (41.1 → 30.5ms), all else within ±3.3%. Six-workload output hashes ≡
+frozen controls. New permanent dbg probes: gateAnchor, legacy-strike,
+window-strike, close-reason (chooseSource/applyDestination/openRegion/drop),
+unclassified-exit, barren-*, openRegion.
+
+**Where nsieve stands NOW (profile on file, §A8-v):** per-receipt accounting is
+the bottleneck — `accountRegionProfit` 17.8% self + hashing ~11% +
+`replayLedger` 8.1% + `runCapturingLedger` 4.0%; 91% native coverage buys only
+−20% wall because every fused receipt runs classify/choose/apply-destination
+with several hashmap ops. Next levers, in order: (a) steady-state receipt fast
+path (one-entry cache in the e.1/e.2 mold, pure accelerator); (b) §A2.4/Part B
+exit-branch patching, which removes the runtime from steady-state transitions
+entirely. Residuals: 51 strikes/run at pc=14 remain (inter-activation,
+pre-qualification) → 7 transient gates; anchor pc=29 gets gated 545× (t=2
+continuation receipts arriving with no live activation) — worth a look in the
+next arc; the "region decays after qualifying" shape is priced only at close
+(remainder flush) — noted in §A8-v as an accepted weak spot.
+
 ## Status 2026-08-12 (LATEST-37) — **A-vii-e.2: the region observer's per-instruction CALL is gone. nsieve −27%, sieve_int −28%, everything else flat. Started as "do the §A2.4 native in-page handoff"; the profile said otherwise.**
 
 Bart asked for the §A2.4 native in-page handoff (doc 17's stated payoff for the

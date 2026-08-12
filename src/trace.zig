@@ -2489,8 +2489,18 @@ pub const TraceState = struct {
     /// per-trace behaviour.
     pub inline fn onSideExit(self: *TraceState, t: *Trace, completed: usize) void {
         self.accountTraceRun(t, completed);
-        if (!self.accountRegionProfit(null, 0, .deferred))
-            self.accountLegacyThrash(t, completed);
+        if (self.accountRegionProfit(null, 0, .deferred)) return;
+        // Gate-fix arc (2026-08-12): a synthetic steering charge fired while a
+        // live QUALIFIED activation's footprint contains `t`'s anchor is an
+        // intra-complex transition — the region window/close verdicts own its
+        // profitability, exactly as for keyed member receipts. Without this the
+        // fused dispatcher's own zero-progress charges (`onSideExit(ramp, 0)`,
+        // `onSideExit(seed, 0)`) re-condemn the complex through the legacy
+        // machine (measured on nsieve: 83,940 `completed=0` strikes/run on the
+        // scan anchor, all from these sites, gating the anchor the region
+        // machine had just qualified).
+        if (self.qualifiedActiveRegionOwns(t.anchor.proto, t.anchor.pc)) return;
+        self.accountLegacyThrash(t, completed);
     }
 
     /// Concrete receipt variant. Selection keeps its historical per-segment
@@ -2536,7 +2546,10 @@ pub const TraceState = struct {
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
         if (gop.value_ptr.* >= self.config.max_penalty) {
+            self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d} -> gate", .{ key.pc, completed, gop.value_ptr.* });
             self.gateAnchor(key);
+        } else {
+            self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d}/{d}", .{ key.pc, completed, gop.value_ptr.*, self.config.max_penalty });
         }
     }
 
@@ -2591,8 +2604,11 @@ pub const TraceState = struct {
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
         if (gop.value_ptr.* >= self.config.max_penalty) {
+            self.dbg("disarm-reason: window gate-strike owner pc={d} work={d}", .{ owner.pc, work });
             self.gateAnchor(owner);
             self.disarmAllLinks();
+        } else {
+            self.dbg("window-strike: owner pc={d} work={d} penalty={d}/{d}", .{ owner.pc, work, gop.value_ptr.*, self.config.max_penalty });
         }
     }
 
@@ -2713,7 +2729,10 @@ pub const TraceState = struct {
                 collision = key.*;
             }
         }
-        if (collision) |old| self.closeRegion(old);
+        if (collision) |old| {
+            self.dbg("close-reason: openRegion same-owner replacement rid={d} -> rid={d}", .{ @intFromEnum(old.region_id), @intFromEnum(id) });
+            self.closeRegion(old);
+        }
 
         const key: RegionKey = .{ .region_id = id, .activation = ctx.call_seq };
         const gop = self.region_profit.getOrPut(self.gpa, key) catch return null;
@@ -2721,6 +2740,7 @@ pub const TraceState = struct {
             .root_frame_depth = ctx.depth,
             .root_call_seq = ctx.call_seq,
         };
+        self.dbg("openRegion: rid={d} seq={d} found_existing={}", .{ @intFromEnum(id), ctx.call_seq, gop.found_existing });
 
         var count: usize = 0;
         var check = self.region_profit.keyIterator();
@@ -2730,7 +2750,13 @@ pub const TraceState = struct {
             if (sameAnchor(live_def.owner, def.owner)) count += 1;
         }
         if (count > 1) @panic("region_profit cardinality violated after replacement");
-        self.refreshObserverFast();
+        // Rebuild the observer cache only when the map actually mutated. The
+        // common steady-state call here is `applyDestination` re-selecting the
+        // ALREADY-open region (found_existing, no collision) — one per fused
+        // chain receipt — and unconditionally freeing + reallocating the bitset
+        // spans (and killing the e.2 inline hot cache) measured 9.6% of nsieve
+        // wall time. A no-op open leaves the cache exactly as valid as it was.
+        if (collision != null or !gop.found_existing) self.refreshObserverFast();
         return key;
     }
 
@@ -2751,6 +2777,7 @@ pub const TraceState = struct {
             }
             if (victim) |key| self.closeRegion(key) else break;
         }
+        self.dbg("disarm-reason: region invalidate id={d}", .{@intFromEnum(id)});
         self.disarmAllLinks();
     }
 
@@ -2984,14 +3011,38 @@ pub const TraceState = struct {
         // into a complex the gate just condemned. It can re-arm on the next
         // composite observation, gates permitting.
         self.pending_bridge_arm = null;
+        self.dbg("disarm-reason: pending walk-deferred gate strike", .{});
         self.disarmAllLinks();
     }
 
     fn chooseSource(self: *TraceState, candidates: []const RegionId, ctx: RegionContext) ?RegionKey {
         const active = self.activeRegionFor(ctx.call_seq);
         if (active) |a| {
-            for (candidates) |id| if (id == a.region_id) return a;
-            self.closeRegion(a);
+            // A tombstoned (or vanished) def is positive evidence the region is
+            // condemned — close its live accumulator immediately rather than let
+            // it keep consuming receipts a re-open would refuse.
+            const live = if (self.region_defs.get(a.region_id)) |d| d.armable else false;
+            if (!live) {
+                self.dbg("close-reason: chooseSource active rid={d} tombstoned", .{@intFromEnum(a.region_id)});
+                self.closeRegion(a);
+            } else {
+                for (candidates) |id| if (id == a.region_id) return a;
+                // An UNCLASSIFIED exit (empty candidate set) is "no information",
+                // not "we left the region" — member traces routinely exit through
+                // guards that are not registered structural edges (measured on
+                // nsieve: the skip trace's zero-work bridge-cycle receipt, once
+                // per traversal, so closing here capped every activation at ONE
+                // traversal and turned every window flush into a low-yield gate
+                // strike — the A-vii-e "flat wall-clock" in one line). Real
+                // departures are owned by the tier-0 observer (non-member pc),
+                // dropRegionActivation (frame death), and the tombstone check
+                // above; only positive evidence of a transition INTO a different
+                // region (non-empty candidates excluding the active one) closes
+                // here.
+                if (candidates.len == 0) return null;
+                self.dbg("close-reason: chooseSource active rid={d} not in {d} candidates", .{ @intFromEnum(a.region_id), candidates.len });
+                self.closeRegion(a);
+            }
         }
         if (candidates.len == 0) return null;
         if (candidates.len == 1) return self.openRegion(candidates[0], ctx);
@@ -3009,6 +3060,7 @@ pub const TraceState = struct {
 
         if (selected) |source| {
             for (candidates) |id| if (id == source.region_id) return;
+            self.dbg("close-reason: applyDestination rid={d} dest={s} candidates={d}", .{ @intFromEnum(source.region_id), @tagName(dest), candidates.len });
             self.closeRegion(source);
             if (dest == .terminal_outside or candidates.len == 0) return;
         }
@@ -3027,40 +3079,137 @@ pub const TraceState = struct {
     /// authoritative `flushRegionWindow` gate machine and latches the
     /// activation's `useful_window_seen` qualification bit (§A8-iii seam).
     ///
-    /// **Returns whether this receipt was CONSUMED** — i.e. whether nonzero work
-    /// was credited to a live region accumulator, so that the region window
-    /// machine has taken ownership of its profitability verdict. This is the
-    /// A-vii-c.1 accounting boundary: a caller that also runs per-trace selection
-    /// accounting applies the legacy per-trace gate (`accountLegacyThrash`) iff
-    /// the region machine did NOT consume. Every trace-run receipt is therefore
-    /// accounted by exactly one machine, by construction rather than by inference
-    /// from a membership index. Non-consumption covers every shape the region
-    /// machine cannot gate: a null key (synthetic scalar site), no live activation
-    /// context, an exit absent from the edge cache, an ambiguous/tombstoned
-    /// candidate set, and a structurally zero-work receipt (R2-1 keeps zero-work
-    /// flushes silent, so a member's repeated zero-work exits must stay legacy-
-    /// gated or nothing would ever gate them).
+    /// **Returns whether this receipt was CONSUMED** — i.e. whether the region
+    /// window machine has taken ownership of its profitability verdict. This is
+    /// the A-vii-c.1 accounting boundary: a caller that also runs per-trace
+    /// selection accounting applies the legacy per-trace gate
+    /// (`accountLegacyThrash`) iff the region machine did NOT consume. Every
+    /// trace-run receipt is therefore accounted by exactly one machine.
+    ///
+    /// Consumption (revised 2026-08-12 — the gate-fix arc): a receipt is
+    /// consumed when it belongs to the LIVE activation, in either of two forms:
+    ///   • **Nonzero work, classified or member-unclassified** — credited to the
+    ///     accumulator and windows flushed. The unclassified half is new: the
+    ///     edge cache is EPHEMERAL, so a member trace's real traversals used to
+    ///     be dropped on a cache miss AND handed to the legacy machine as a
+    ///     "short segment" strike (measured on nsieve: ~4k real-work receipts/run
+    ///     lost this way).
+    ///   • **Zero work from a member of a QUALIFIED activation**
+    ///     (`useful_window_seen`) — an intra-region transition (a branchy
+    ///     complex exits between members on every polarity flip by design), not
+    ///     thrash. Before this rule the legacy machine priced every such
+    ///     transition as a strike (measured on nsieve: 10,749 `completed=0`
+    ///     strikes/run on the scan anchor vs 6,923 clears — the anchor gated
+    ///     with exponential backoff, capping the fused complex at ~5% of scan
+    ///     iterations; the whole July diagnosis, reintroduced through the
+    ///     accounting boundary).
+    ///
+    /// Non-consumption still covers every shape the region machine cannot gate:
+    /// a null key (synthetic scalar site), no live activation context, a
+    /// non-member trace, an ambiguous/tombstoned candidate set, and — the
+    /// A-vii-c review-blocker shape — zero-work receipts of an activation that
+    /// has NOT yet produced a useful window (R2-1 keeps zero-work flushes
+    /// silent, so an activation that never qualifies keeps full pre-flip legacy
+    /// gating on its barren receipts).
     pub fn accountRegionProfit(self: *TraceState, key: ?ExitKey, work: usize, dest: RegionDestination) bool {
         const exit_key = key orelse return false;
         const ctx = self.region_context orelse return false;
         var consumed = false;
-        const selected = self.chooseSource(self.classifyExit(exit_key), ctx);
+        const candidates = self.classifyExit(exit_key);
+        if (candidates.len == 0 and self.region_profit.count() != 0)
+            self.dbg("unclassified-exit: t={d} ei={d} work={d}", .{ exit_key.trace_id, exit_key.exit_instr, work });
+        const selected = self.chooseSource(candidates, ctx);
         if (selected) |source| {
             if (self.region_profit.getPtr(source)) |accum| {
                 if (work != 0) {
                     consumed = true;
-                    accum.outer_traversals +|= @intCast(work);
-                    const n: u64 = @intCast(self.config.min_useful);
-                    if (n != 0) while (accum.outer_traversals - accum.window_base >= n) {
-                        self.flushRegionWindow(source, n);
-                        accum.useful_window_seen = true;
-                        accum.window_base += n;
-                    };
+                    self.creditRegionWork(source, accum, work);
+                } else if (accum.useful_window_seen) {
+                    consumed = true;
                 }
+            }
+        } else if (candidates.len == 0) {
+            // Unclassified receipt with a live activation: if the receipt's
+            // trace anchors inside the activation's membership footprint, this
+            // is an intra-region event the ephemeral edge cache merely failed
+            // to classify — the region machine owns it (credit any work; barren
+            // ones consumed once qualified, exactly as above).
+            if (self.activeRegionFor(ctx.call_seq)) |a| {
+                if (self.region_profit.getPtr(a)) |accum| {
+                    if (self.regionMemberTraceAnchor(a.region_id, exit_key.trace_id)) {
+                        if (work != 0) {
+                            consumed = true;
+                            self.creditRegionWork(a, accum, work);
+                        } else if (accum.useful_window_seen) {
+                            consumed = true;
+                        } else {
+                            self.dbg("barren-unqualified: t={d} ei={d}", .{ exit_key.trace_id, exit_key.exit_instr });
+                        }
+                    } else {
+                        self.dbg("barren-nonmember: t={d} ei={d}", .{ exit_key.trace_id, exit_key.exit_instr });
+                    }
+                }
+            } else {
+                self.dbg("barren-noactive: t={d} ei={d} work={d}", .{ exit_key.trace_id, exit_key.exit_instr, work });
             }
         }
         self.applyDestination(selected, dest, ctx);
         return consumed;
+    }
+
+    /// Credit `work` outer traversals to a live accumulator and flush every
+    /// complete `min_useful` window through the authoritative gate machine,
+    /// latching the activation's qualification bit. Factored out of
+    /// `accountRegionProfit` so the classified and member-unclassified credit
+    /// paths cannot drift. `flushRegionWindow` never mutates `region_profit`,
+    /// so `accum` stays valid across the loop.
+    fn creditRegionWork(self: *TraceState, key: RegionKey, accum: *RegionAccum, work: usize) void {
+        accum.outer_traversals +|= @intCast(work);
+        const n: u64 = @intCast(self.config.min_useful);
+        if (n != 0) while (accum.outer_traversals - accum.window_base >= n) {
+            self.flushRegionWindow(key, n);
+            accum.useful_window_seen = true;
+            accum.window_base += n;
+        };
+    }
+
+    /// Does `trace_id` resolve to a cached trace whose anchor program point lies
+    /// inside `rid`'s membership footprint? This is the same point-set the tier-0
+    /// observer keys survival on (`RegionDef.member_points`), applied to the
+    /// TRACE side: a trace anchored inside the region is a region member for
+    /// receipt-ownership purposes even when the ephemeral edge cache cannot
+    /// classify its exit. Fail-closed on every miss (unknown id, freed def,
+    /// tombstoned def, point outside the footprint).
+    fn regionMemberTraceAnchor(self: *const TraceState, rid: RegionId, trace_id: u32) bool {
+        const t = self.traceById(trace_id) orelse return false;
+        return self.regionMemberPoint(rid, t.anchor.proto.id, t.anchor.pc);
+    }
+
+    /// Point-in-footprint test against a region's `member_points`, fail-closed
+    /// (freed or tombstoned defs own nothing).
+    fn regionMemberPoint(self: *const TraceState, rid: RegionId, proto_id: u32, pc: u32) bool {
+        const def = self.region_defs.get(rid) orelse return false;
+        if (!def.armable) return false;
+        for (def.member_points) |p| {
+            if (p.proto_id == proto_id and p.source_pc == pc) return true;
+        }
+        return false;
+    }
+
+    /// The live-QUALIFIED-activation ownership test for events the edge cache
+    /// cannot key (the synthetic zero-progress steering charges in `onSideExit`):
+    /// true iff the current region context has a live activation whose region
+    /// has produced at least one useful window AND whose membership footprint
+    /// contains `(proto, pc)`. Qualification is the load-bearing half — an
+    /// activation that never proves a useful window keeps full pre-flip legacy
+    /// gating on its barren events, so the A-vii-c review-blocker shape (member
+    /// thrash that no window would ever price) stays gated.
+    fn qualifiedActiveRegionOwns(self: *const TraceState, proto: *const Proto, pc: u32) bool {
+        const ctx = self.region_context orelse return false;
+        const a = self.activeRegionFor(ctx.call_seq) orelse return false;
+        const accum = self.region_profit.get(a) orelse return false;
+        if (!accum.useful_window_seen) return false;
+        return self.regionMemberPoint(a.region_id, proto.id, pc);
     }
 
     /// A-vii-e.2: the inline half of the tier-0 departure observer. Returns true
@@ -3123,6 +3272,7 @@ pub const TraceState = struct {
                     }
                 }
             }
+            self.dbg("observer-close: fast, departure proto={d} pc={d} depth={d} seq={d} (root depth={d} seq={d})", .{ proto_id, pc, depth, call_seq, f.root_frame_depth, f.root_call_seq });
             self.closeRegion(f.key); // count → 0; refresh nulls the cache
             return;
         }
@@ -3163,7 +3313,10 @@ pub const TraceState = struct {
                     break;
                 }
             }
-            if (victim) |dead| self.closeRegion(dead) else break;
+            if (victim) |dead| {
+                self.dbg("close-reason: dropRegionActivation seq={d} rid={d}", .{ call_seq, @intFromEnum(dead.region_id) });
+                self.closeRegion(dead);
+            } else break;
         }
         if (self.region_context != null and self.region_context.?.call_seq == call_seq)
             self.region_context = null;
@@ -3808,6 +3961,18 @@ pub const TraceState = struct {
                         // P1a: carry the `.link` DRIVER (this owner) so the caller sets
                         // `current_link` to it and the hop top re-resolves the inner from
                         // `.link.aux` — preserving sibling-selection.
+                        //
+                        // 2c-E site 4 (arming convergence, `.link` edition): mirror
+                        // site 3's terminal loop-done arm — a terminal `.link` means
+                        // this C→I edge was NOT fused, so arm it now and the next
+                        // occurrence dispatches natively. Resolve the inner by the
+                        // SAME `findLoopTrace` pick the hop top re-resolution uses, so
+                        // the armed target is the sibling selection would choose; every
+                        // shape/eligibility gate lives in the fail-closed helper. On a
+                        // forced yield the slot is already armed and the re-arm is an
+                        // in-place supersede, harmless (site-3 precedent).
+                        if (self.findLoopTrace(proto, owner_inner_pc)) |inner_pick|
+                            self.armLinkTerminal(owner, inner_pick, safe_to_arm);
                         resume_pc.* = owner_inner_pc;
                         return .{ .run_inner_from = owner };
                     }
@@ -6199,6 +6364,39 @@ pub const TraceState = struct {
     /// Target contract: `ordinary_entry`, NOT `linked_entry` — the continuation is a
     /// `.link` trace with no numeric-for loop-done of its own, and `ordinary_entry`
     /// clears any inherited linked mode (entry-stub contract, 2.3c-0c).
+    /// 2c-E site 4 (arming convergence, `.link` edition — 2026-08-12): fail-closed
+    /// arm of a continuation/ramp's `.link` terminal slot → the inner root its
+    /// `aux` names. The `.loop_done_linked` twin of this convergence has existed
+    /// since 2c-E (site 3, `armLoopDoneLink` above); without the `.link` side, a
+    /// `.link` trace reached ONLY through ledger replay never armed — the scalar
+    /// call-A arm site reads `current_link` AFTER the driver swap, so it only
+    /// ever arms post-loop continuations, never entry ramps. Measured on nsieve
+    /// N=7 before this site landed: 6931 of ~7000 native spans per run ended at
+    /// the prime ramp's unarmed `.link` (one runtime seam per prime), capping the
+    /// fused region complex at ~5% of primes. Every gate mirrors the scalar site
+    /// + `replayLedger`'s own fused-successor validation, so an armed slot can
+    /// only dispatch a successor the replay grammar would accept.
+    fn armLinkTerminal(self: *TraceState, cont: *Trace, inner: *Trace, safe_to_arm: bool) void {
+        // Observation blackout (2.3c-0e): never widen an armed cycle while suspend /
+        // replay-line recording is active.
+        if (!safe_to_arm) return;
+        // The parent must end in a `.link` terminal whose aux names the inner root.
+        if (cont.instrs.len == 0) return;
+        const term = cont.instrs[cont.instrs.len - 1];
+        if (term.op != .link) return;
+        // The child must be the shape `replayLedger`'s fused `.link_terminal`
+        // successor validation release-panics on anything but: a zero-input inner
+        // loop root in the same proto at exactly the `.link`-named PC.
+        if (!isInnerLoopRoot(inner, cont.anchor.proto, @intCast(term.aux))) return;
+        // Both ends need native code: the parent for its slot table, the child for
+        // the `linked_entry` the arm derives (`armNativeLink` re-checks; missing
+        // native on either side must no-op silently, not assert).
+        if (self.nativeFor(cont) == null or self.nativeFor(inner) == null) return;
+        const slot: u32 = @intCast(cont.instrs.len - 1);
+        const armed = self.armNativeLink(cont, slot, inner, .link_terminal) catch false;
+        if (armed) self.native_link_arms +|= 1;
+    }
+
     fn armLoopDoneLink(self: *TraceState, inner: *Trace, guard_idx: u32, cont: *Trace, safe_to_arm: bool) void {
         // Observation blackout (2.3c-0e): never widen an armed cycle while suspend /
         // replay-line recording is active.
@@ -6529,6 +6727,7 @@ pub const TraceState = struct {
         g.strikes +|= 1;
         g.retry_at = self.tick +| g.window;
         g.window = @min(g.window *| 2, self.config.backoff_max);
+        self.dbg("gate: anchor pc={d} strikes={d} window={d} retry_at={d} tick={d}", .{ anchor.pc, g.strikes, g.window, g.retry_at, self.tick });
     }
 
     /// Back-edge count recorded for an anchor (0 if never seen). A loop is "hot"
@@ -12084,6 +12283,83 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     state.setRegionContext(1, 5);
     state.onSideExitReceipt(&member, 0, 0, 1, .deferred);
     try testing.expectEqual(@as(u32, 1), state.penalty.get(member.anchor).?);
+}
+
+test "gate-fix consumption boundary: qualified activations own member barren receipts, unclassified member work credits, synthetic charges region-owned" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    // A live region whose membership footprint covers pcs {0, 1} of proto 62.
+    var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil) };
+    const proto = Proto{ .id = 62, .code = &code, .name = "boundary", .num_registers = 1 };
+    const rid: RegionId = @enumFromInt(4);
+    try state.region_defs.put(gpa, rid, .{
+        .members = try gpa.dupe(StructuralEdgeId, &.{}),
+        .member_points = try gpa.dupe(ProgramPoint, &.{
+            .{ .proto_id = 62, .source_pc = 0 },
+            .{ .proto_id = 62, .source_pc = 1 },
+        }),
+        .owner = .{ .proto = &proto, .pc = 0 },
+        .classifier = .{ .kind = .self_loop, .member_count = 1 },
+        .armable = true,
+    });
+    try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
+    var member_instrs = [_]IrInstr{ .{ .op = .slot_load, .aux = 0 }, .{ .op = .loop } };
+    var member: Trace = .{ .id = 9, .anchor = .{ .proto = &proto, .pc = 1 }, .instrs = &member_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try state.cache.append(gpa, &member); // traceById must resolve it (membership test)
+    defer state.cache.clearRetainingCapacity(); // stack-backed traces: never destroy()
+    var nonmember: Trace = .{ .id = 10, .anchor = .{ .proto = &proto, .pc = 5 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    const key: RegionKey = .{ .region_id = rid, .activation = 7 };
+
+    // (a) UNQUALIFIED: classified zero-work receipt of the live member still
+    // strikes legacy — an activation that never proves a useful window keeps
+    // full pre-flip gating on its barren receipts (the A-vii-c blocker shape).
+    state.setRegionContext(1, 7);
+    _ = state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, 1, .deferred); // open, 1 traversal
+    try testing.expect(!state.region_profit.get(key).?.useful_window_seen);
+    state.onSideExitReceipt(&member, 0, 0, 0, .deferred);
+    try testing.expectEqual(@as(u32, 1), state.penalty.get(member.anchor).?);
+
+    // (a') UNQUALIFIED: a synthetic zero charge on the member anchor strikes too.
+    state.onSideExit(&member, 0);
+    try testing.expectEqual(@as(u32, 2), state.penalty.get(member.anchor).?);
+
+    // (b) Unclassified NONZERO-work member receipt (exit 1 absent from the edge
+    // cache): credited to the LIVE accumulator instead of being dropped + struck.
+    state.onSideExitReceipt(&member, 0, 1, 3, .deferred);
+    try testing.expectEqual(@as(u64, 4), state.region_profit.get(key).?.outer_traversals);
+    try testing.expectEqual(@as(u32, 2), state.penalty.get(member.anchor).?); // no new strike
+
+    // (c) Qualify: enough credited work to flush a full window clears the owner's
+    // penalty (owner == (proto,0), distinct from member anchor) and latches the bit.
+    _ = state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, state.config.min_useful, .deferred);
+    try testing.expect(state.region_profit.get(key).?.useful_window_seen);
+
+    // (d) QUALIFIED: classified zero-work member receipt is now CONSUMED — an
+    // intra-complex transition priced by the window/close verdicts, not legacy.
+    state.onSideExitReceipt(&member, 0, 0, 0, .deferred);
+    try testing.expectEqual(@as(u32, 2), state.penalty.get(member.anchor).?); // unchanged
+
+    // (d') QUALIFIED: unclassified zero-work member receipt likewise consumed.
+    state.onSideExitReceipt(&member, 0, 1, 0, .deferred);
+    try testing.expectEqual(@as(u32, 2), state.penalty.get(member.anchor).?);
+
+    // (e) QUALIFIED: the synthetic steering charge (`onSideExit(member, 0)`) is
+    // region-owned — no legacy strike, no legacy clear.
+    state.onSideExit(&member, 0);
+    try testing.expectEqual(@as(u32, 2), state.penalty.get(member.anchor).?);
+
+    // (f) A trace anchored OUTSIDE the footprint stays legacy-gated even while
+    // the qualified activation is live.
+    state.onSideExit(&nonmember, 0);
+    try testing.expectEqual(@as(u32, 1), state.penalty.get(nonmember.anchor).?);
+
+    // (g) Departure close still prices the remainder against the owner.
+    const flushes_before = state.region_profit_flushes;
+    state.observeRegionProgramPoint(62, 5, 1, 7); // pc 5 ∉ footprint → close
+    try testing.expectEqual(@as(usize, 0), state.regionProfitCount());
+    try testing.expect(state.region_profit_flushes > flushes_before);
 }
 
 test "A-vii-e.1 observer fast path: built on open, survive verdicts match the slow predicate, cleared on close" {
