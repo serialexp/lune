@@ -5045,6 +5045,26 @@ const TraceMode = enum { off, record_only, record_execute_noopt, record_execute,
 /// so even short test loops go hot) — used to assert the JIT stays transparent:
 /// recording, and now *executing* traces, must not change a program's output.
 fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, stress: bool, mode: TraceMode) !void {
+    return runCapturedTuned(gpa, source, sink, stress, mode, .{});
+}
+
+/// Knobs for a `runCaptured` pass that needs more than the default wiring.
+/// `inspect` runs against the live VM after the program completes and before it
+/// is destroyed — the only way for a matrix leg to assert on transient JIT state
+/// (region discovery, window flushes) that does not survive `deinit`.
+const CapturedOpts = struct {
+    hotguard: ?u32 = null,
+    inspect: ?*const fn (*Vm, TraceMode) anyerror!void = null,
+};
+
+fn runCapturedTuned(
+    gpa: std.mem.Allocator,
+    source: [:0]const u8,
+    sink: *io.Writer,
+    stress: bool,
+    mode: TraceMode,
+    opts: CapturedOpts,
+) !void {
     const parser = @import("parser.zig");
     const diag = @import("diag.zig");
 
@@ -5065,12 +5085,14 @@ fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, s
     vm.trace.config.optimize = mode == .record_execute or mode == .record_execute_native;
     vm.trace.config.native_codegen = mode == .record_execute_native;
     vm.trace.config.hotloop = 4; // record short test loops
+    if (opts.hotguard) |hg| vm.trace.config.hotguard = hg;
 
     var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
     _ = try vm.run(chunk.proto);
+    if (opts.inspect) |inspect| try inspect(&vm, mode);
 }
 
 /// Run `source` across the full matrix of GC discipline × trace mode and assert
@@ -5082,11 +5104,17 @@ fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer, s
 ///    IR-interpreter must produce byte-identical output to tier-0 — a wrong arith
 ///    mapping, a bad guard, a deopt mistake, or an exit-store error all diverge here.
 fn expectProgram(source: [:0]const u8, expected: []const u8) !void {
+    return expectProgramTuned(source, expected, .{});
+}
+
+/// `expectProgram` with harness knobs — same ten legs, same output oracle, plus
+/// whatever per-leg configuration and post-run assertions `opts` carries.
+fn expectProgramTuned(source: [:0]const u8, expected: []const u8, opts: CapturedOpts) !void {
     inline for (.{ false, true }) |stress| {
         inline for (.{ .off, .record_only, .record_execute_noopt, .record_execute, .record_execute_native }) |mode| {
             var buf: [256]u8 = undefined;
             var sink = io.Writer.fixed(&buf);
-            try runCaptured(testing.allocator, source, &sink, stress, mode);
+            try runCapturedTuned(testing.allocator, source, &sink, stress, mode, opts);
             try testing.expectEqualStrings(expected, sink.buffered());
         }
     }
@@ -11969,6 +11997,52 @@ test "executor: a thrashing anchor that later stabilizes recovers from the gate"
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
 }
 
+/// Post-run oracle for the A-vii-c matrix, and a deliberate TRIPWIRE.
+///
+/// The A-vii-c review asked this test to prove its legs really exercise the
+/// flipped gate. Measuring that (jitdbg `region: mint` probe) turned up the more
+/// interesting fact: discovery mints this shape's cross-trace cycle with
+/// `armable = false` — `armable_owner` requires exactly one component node that
+/// is BOTH externally entered and carries an inner root (`both_count == 1`), and
+/// no shape we can currently build satisfies it. nsieve, the actual target
+/// workload, reports the same (`members=2 armable=false owner_unique=false
+/// membership_complete=true`). A non-armable region can never be opened
+/// (`openRegion` refuses), so it never accumulates, never flushes, and the
+/// region gate machine is dormant on every real program today. A-vii-c is
+/// therefore inert IN PRACTICE — its divergence surface is currently empty —
+/// even though the machine and its boundary are live in code.
+///
+/// So this asserts the measured truth rather than a hoped-for one, and fails
+/// loudly the moment it stops holding: when A-vii-d makes an armable owner
+/// reachable, `armable`/`flushes` go nonzero here and this test MUST be upgraded
+/// to the exercised form (live member indexed against an armable def + at least
+/// one authoritative window flush) instead of quietly passing. The gate machine
+/// itself and the consumption boundary are covered directly by the synthetic
+/// trace.zig unit tests, which do not depend on discovery reaching armability.
+fn assertRegionGateExercised(vm: *Vm, mode: TraceMode) anyerror!void {
+    // Only the executing legs can form the region at all: the cross-anchor cycle
+    // closes through SIDE traces, and side-trace recording is driven by guard
+    // failures during trace EXECUTION. With `.off` there is no recorder, and with
+    // `.record_only` the roots are recorded but never entered, so no guard fails
+    // and discovery sees no cycle (measured: `region_defs.count() == 0`). Those
+    // legs still carry the output oracle.
+    if (mode == .off or mode == .record_only) return;
+
+    // The shape does discover its cycle — without this the matrix would silently
+    // degrade into an ordinary output test on a discovery regression.
+    try testing.expect(vm.trace.region_defs.count() >= 1);
+
+    var armable: usize = 0;
+    var defs = vm.trace.region_defs.valueIterator();
+    while (defs.next()) |def| {
+        if (def.armable) armable += 1;
+    }
+    // TRIPWIRE (see above): no armable region is reachable today, so the region
+    // gate machine must be provably dormant on this leg.
+    try testing.expectEqual(@as(usize, 0), armable);
+    try testing.expectEqual(@as(u64, 0), vm.trace.region_profit_flushes);
+}
+
 test "A-vii-c: a region-forming sieve shape stays byte-identical across all 10 modes" {
     // The gate-consumption flip (doc 17 §A8-iii, A-vii.1) is the FIRST
     // selection-diverging change: region-member traces' penalty/gate now comes
@@ -11976,9 +12050,16 @@ test "A-vii-c: a region-forming sieve shape stays byte-identical across all 10 m
     // for genuine cross-anchor cycles may differ from the pre-flip machine. The
     // contract is output identity, not selection identity (P-EBP-1) — so pin the
     // 10-mode matrix on a program SHAPED to mint a cross-trace-cycle region
-    // (branchy outer scan whose taken arm runs an inner while: the
-    // skip/ramp/inner/cont shape). π(80) = 22 primes.
-    try expectProgram(
+    // (branchy outer scan whose taken arm runs an inner numeric-for: the
+    // skip/ramp/inner/cont shape; a `while` inner does NOT close the cycle).
+    // π(80) = 22 primes.
+    //
+    // A-vii-c.1: every leg additionally proves it really exercised the flipped
+    // gate (`assertRegionGateExercised`) — otherwise a discovery regression would
+    // quietly turn this into an ordinary output test. `hotguard = 3` records side
+    // traces early enough for the cross-anchor cycle to close inside the matrix's
+    // short loops.
+    try expectProgramTuned(
         \\local count = 0
         \\local flags = {}
         \\for j = 1, 5 do
@@ -11992,55 +12073,7 @@ test "A-vii-c: a region-forming sieve shape stays byte-identical across all 10 m
         \\  end
         \\end
         \\print(count)
-    , "22\n");
-}
-
-test "A-vii-c: the sieve shape actually mints a live region (matrix companion introspection)" {
-    // Without this companion the matrix test above could silently stop exercising
-    // the flipped gate path (e.g. a discovery regression leaving the program
-    // regionless would make it a plain output test). With side traces recording
-    // early (hotguard=3, like the side-trace half of the type-instability test)
-    // the branchy scan + inner while forms the cross-anchor cycle; assert the
-    // executed shape really discovers at least one region so the divergent
-    // region-gate path is live, and that output still matches tier-0.
-    const parser = @import("parser.zig");
-    const diag = @import("diag.zig");
-    const gpa = testing.allocator;
-    const source =
-        \\local count = 0
-        \\local flags = {}
-        \\for j = 1, 5 do
-        \\  count = 0
-        \\  for i = 2, 80 do flags[i] = true end
-        \\  for i = 2, 80 do
-        \\    if flags[i] then
-        \\      count = count + 1
-        \\      for k = i + i, 80, i do flags[k] = false end
-        \\    end
-        \\  end
-        \\end
-        \\print(count)
-    ;
-    var diags = diag.Diagnostics.init(gpa);
-    defer diags.deinit();
-    var tree = try parser.parse(gpa, source, &diags);
-    defer tree.deinit();
-    try testing.expect(!diags.hasErrors());
-
-    var vm = try Vm.init(gpa);
-    defer vm.deinit();
-    vm.trace.config.enabled = true;
-    vm.trace.config.execute = true;
-    vm.trace.config.hotloop = 4;
-    vm.trace.config.hotguard = 3; // record side traces early so the cycle closes
-    var buf: [64]u8 = undefined;
-    var sink = io.Writer.fixed(&buf);
-    vm.out = &sink;
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
-    defer chunk.deinit();
-    _ = try vm.run(chunk.proto);
-    try testing.expectEqualStrings("22\n", sink.buffered());
-    try testing.expect(vm.trace.region_defs.count() >= 1);
+    , "22\n", .{ .hotguard = 3, .inspect = &assertRegionGateExercised });
 }
 
 test "e2e (executor): a long hot loop stays correct across every trace + gc mode" {

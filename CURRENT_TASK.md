@@ -1,6 +1,58 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
-## Status 2026-08-11 (LATEST-29) — **A-vii-c gate-consumption flip LANDED with the regionless fallback (first selection-diverging step). NEXT = codex review verdict → Bart APPROVE → A-vii-d arm-site flip.**
+## Status 2026-08-12 (LATEST-30) — **A-vii-c.1 consumption-keyed accounting boundary LANDED (closes the codex BLOCKER on A-vii-c) + region-dormancy tripwire. NEXT = codex re-review → Bart APPROVE → A-vii-d (which is itself blocked on the `armable_owner` question below).**
+
+Codex `gpt-5.6-sol` reviewed the A-vii-c commit and returned **BLOCKER**,
+correctly: membership-keyed suppression assumed physical membership in a live
+region implies the region machine can gate that trace's receipts. It does not.
+A member's prologue failure has no valid `ExitKey`; an exit absent from
+`edge_cache` resolves to no candidate; and a structurally zero-work receipt is
+deliberately silent (R2-1). The dispatcher sends exactly that last shape on its
+zero-iteration path (`interp.zig`, comment: *"Zero iterations: apply the
+penalty"*), so a member failing its guard on every entry was gated by NEITHER
+machine — and the landed unit test pinned half of that unsafe state as if it
+were the contract. Verified in the tree before acting.
+
+**Fix (Bart's call, option (a) taken further): the boundary is CONSUMPTION, not
+membership.** `accountRegionProfit` now returns whether it consumed the receipt
+(nonzero work credited to a live accumulator); callers that also run selection
+accounting apply `accountLegacyThrash` iff it did not. `traceHasRegion` is
+deleted. Exactly one machine accounts every trace-run receipt, provable from the
+call site rather than inferred from an index, and every shape the region machine
+cannot gate falls back to pre-flip behaviour by construction. Null-keyed
+`onSideExit` never consumes ⇒ that path is pre-flip verbatim. Ordering is
+region-first then legacy (receipt-local verdict last). One deliberate exception,
+documented in code and doc: `replayLedger`'s `.region_bridge` arm stays
+selection-only — its ownership is *proven* by the replay grammar, and legacy
+striking there would gate productive regions once per intra-region hop.
+
+**Measured while hardening the matrix (codex finding 2): the region gate machine
+is DORMANT on every real program — A-vii-c is inert in practice.** A new
+permanent `region: mint` jitdbg probe shows the test sieve shape AND nsieve both
+mint their cross-trace cycle with `armable=false`
+(`members=2 owner_unique=false membership_complete=true`): `armable_owner` wants
+exactly one component node that is both externally entered and carries an inner
+root (`both_count == 1`), and nothing reachable satisfies it. `openRegion`
+refuses non-armable defs, so no accumulator ever opens and `flushRegionWindow`
+is unreachable outside unit tests. Hence the byte-identity control still passes
+unchanged — dormancy, not a contract. **This blocks A-vii-d**: the arm site
+could never fire. First question for that piece is "why is `both_count == 1`
+unreachable, and is it the right predicate?", ahead of writing the arm.
+
+Tests: the 10-mode matrix now runs at `hotguard=3` through a new
+`expectProgramTuned`/`CapturedOpts` harness (post-run `inspect` hook against the
+live VM) and asserts the measured truth as a **tripwire** — region discovered,
+`armable == 0`, `flushes == 0` — so the moment A-vii-d makes armability
+reachable this test FAILS and forces an upgrade to the exercised form instead of
+silently passing. The redundant single-mode companion is deleted. The
+gate-machine unit test's member half is rewritten to pin consumed (no strike) vs
+unconsumed-zero-work / unconsumed-unclassified (strike) / unconsumed-useful
+(clears) / tombstoned (reverts to legacy).
+
+Gates: `just test` green; `zig build test -Djit-debug=true` green; ReleaseFast
+six-workload tier-0≡native control ALL-PASS (same six prefixes as LATEST-29).
+
+## Status 2026-08-11 (LATEST-29) — **A-vii-c gate-consumption flip LANDED with the regionless fallback (first selection-diverging step).**
 
 The flip: `accountTraceRun` is now selection-only (coverage/cycle receipts +
 `hit_count`; the per-trace penalty/gate block is gone). The authoritative gate

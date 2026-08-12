@@ -2311,24 +2311,34 @@ pub const TraceState = struct {
     ///     the owner's penalty and gate; low-yield remainders strike, and at
     ///     `max_penalty` gate the owner with the doubling cooldown (`gateAnchor`)
     ///     and conservatively disarm all links.
-    /// **A-vii-c regionless fallback (Bart's decision, 2026-08-11).** The region
-    /// machine can only gate what discovery describes, and discovery mints regions
-    /// exclusively for cycle-bearing SCCs of the CROSS-ANCHOR structural-edge
-    /// graph — a plain loop trace or a same-anchor sibling group has no region at
-    /// all, so moving the whole penalty machine to region windows would leave
-    /// exactly the thrash shapes the gate exists for (sibling ping-pong committing
-    /// ~1 iteration per entry, measured 961 entries/2000 iterations on the parity
-    /// loop) permanently ungated. So the ownership boundary is per TRACE:
-    /// receipts of a trace that is a physical member of a live (armable) region
-    /// are penalty-neutral here — the region window flush owns their gate — while
-    /// receipts of every other trace keep the exact pre-flip per-trace machine
-    /// (`accountLegacyThrash`). Selection therefore stays byte-identical for all
-    /// non-region shapes; only genuine multi-trace regions diverge (§A8-iii
-    /// byte-identity boundary).
+    /// **A-vii-c regionless fallback, A-vii-c.1 consumption form (Bart's decision,
+    /// 2026-08-11/12).** The region machine can only gate what discovery
+    /// describes, and discovery mints regions exclusively for cycle-bearing SCCs
+    /// of the CROSS-ANCHOR structural-edge graph — a plain loop trace or a
+    /// same-anchor sibling group has no region at all, so moving the whole penalty
+    /// machine to region windows would leave exactly the thrash shapes the gate
+    /// exists for (sibling ping-pong committing ~1 iteration per entry, measured
+    /// 961 entries/2000 iterations on the parity loop) permanently ungated.
+    ///
+    /// The ownership boundary is therefore per RECEIPT, keyed on *consumption*:
+    /// `accountRegionProfit` reports whether it credited nonzero work to a live
+    /// region accumulator, and the legacy per-trace machine runs iff it did not.
+    /// Exactly one machine accounts every trace-run receipt, provable from these
+    /// three lines rather than inferred from a membership index — which is what
+    /// closes the A-vii-c review blocker: physical membership does NOT imply the
+    /// region machine can gate a given receipt (a member's prologue failure,
+    /// unresolved-guard exit, or any structurally zero-work exit reaches no
+    /// window, and R2-1 keeps zero-work flushes silent), so membership-keyed
+    /// suppression left those shapes ungated by both machines. Consumption-keyed
+    /// suppression cannot: whatever the region machine does not take, the pre-flip
+    /// machine still handles.
+    ///
+    /// This path is null-keyed, so it never consumes and is exactly the pre-flip
+    /// per-trace behaviour.
     pub inline fn onSideExit(self: *TraceState, t: *Trace, completed: usize) void {
         self.accountTraceRun(t, completed);
-        if (!self.traceHasRegion(t.id)) self.accountLegacyThrash(t, completed);
-        self.accountRegionProfit(null, 0, .deferred);
+        if (!self.accountRegionProfit(null, 0, .deferred))
+            self.accountLegacyThrash(t, completed);
     }
 
     /// Concrete receipt variant. Selection keeps its historical per-segment
@@ -2344,36 +2354,25 @@ pub const TraceState = struct {
         dest: RegionDestination,
     ) void {
         self.accountTraceRun(t, completed);
-        if (!self.traceHasRegion(t.id)) self.accountLegacyThrash(t, completed);
         const key: ?ExitKey = if (exit_instr < t.instrs.len)
             .{ .trace_id = t.id, .exit_instr = exit_instr }
         else
             null;
-        self.accountRegionProfit(key, region_work, dest);
+        // A-vii-c.1: region-first, then legacy iff unconsumed. The two verdicts can
+        // only ever touch the same anchor when this receipt's own region closed and
+        // flushed against an owner that happens to be `t.anchor`; applying the
+        // receipt-local verdict last keeps the most recent evidence authoritative.
+        if (!self.accountRegionProfit(key, region_work, dest))
+            self.accountLegacyThrash(t, completed);
     }
 
-    /// A-vii-c ownership predicate: is `trace_id` a physical member of any LIVE
-    /// (armable) region? `dest_entry_regions` holds every member trace of every
-    /// armable region (rebuilt wholesale per commit/retirement); the per-id
-    /// `armable` recheck makes a tombstone effective IMMEDIATELY — an invalidated
-    /// region's members revert to the legacy machine without waiting for the next
-    /// physical-index rebuild.
-    fn traceHasRegion(self: *const TraceState, trace_id: u32) bool {
-        const set = self.dest_entry_regions.get(trace_id) orelse return false;
-        for (set) |id| {
-            const def = self.region_defs.get(id) orelse continue;
-            if (def.armable) return true;
-        }
-        return false;
-    }
-
-    /// The pre-A-vii-c per-trace profitability machine, verbatim — applied ONLY to
-    /// receipts of regionless traces (see `onSideExit`). A useful segment
+    /// The pre-A-vii-c per-trace profitability machine, verbatim — applied to every
+    /// receipt the region machine did not consume (see `onSideExit`). A useful segment
     /// (`completed >= min_useful`) clears the anchor's penalty and gate; a
     /// low-yield one strikes, and at `max_penalty` the anchor is gated off with
-    /// the doubling cooldown (`gateAnchor`). Region-member traces never reach
-    /// this: their gate is owned by the region window flush keyed on the owner
-    /// anchor (`flushRegionWindow`).
+    /// the doubling cooldown (`gateAnchor`). A receipt the region machine DID
+    /// consume never reaches this: the region window flush owns that verdict,
+    /// keyed on the owner anchor (`flushRegionWindow`).
     inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize) void {
         const key = t.anchor;
         if (completed >= self.config.min_useful) {
@@ -2484,6 +2483,7 @@ pub const TraceState = struct {
     }
 
     fn invalidateRegion(self: *TraceState, id: RegionId) void {
+        self.dbg("region: invalidate id={d} (runtime tombstone)", .{@intFromEnum(id)});
         if (self.region_defs.getPtr(id)) |def| def.armable = false;
         while (true) {
             var victim: ?RegionKey = null;
@@ -2633,22 +2633,41 @@ pub const TraceState = struct {
     /// full-window consumer: each complete `N` window flows through the
     /// authoritative `flushRegionWindow` gate machine and latches the
     /// activation's `useful_window_seen` qualification bit (§A8-iii seam).
-    pub fn accountRegionProfit(self: *TraceState, key: ?ExitKey, work: usize, dest: RegionDestination) void {
-        const exit_key = key orelse return;
-        const ctx = self.region_context orelse return;
+    ///
+    /// **Returns whether this receipt was CONSUMED** — i.e. whether nonzero work
+    /// was credited to a live region accumulator, so that the region window
+    /// machine has taken ownership of its profitability verdict. This is the
+    /// A-vii-c.1 accounting boundary: a caller that also runs per-trace selection
+    /// accounting applies the legacy per-trace gate (`accountLegacyThrash`) iff
+    /// the region machine did NOT consume. Every trace-run receipt is therefore
+    /// accounted by exactly one machine, by construction rather than by inference
+    /// from a membership index. Non-consumption covers every shape the region
+    /// machine cannot gate: a null key (synthetic scalar site), no live activation
+    /// context, an exit absent from the edge cache, an ambiguous/tombstoned
+    /// candidate set, and a structurally zero-work receipt (R2-1 keeps zero-work
+    /// flushes silent, so a member's repeated zero-work exits must stay legacy-
+    /// gated or nothing would ever gate them).
+    pub fn accountRegionProfit(self: *TraceState, key: ?ExitKey, work: usize, dest: RegionDestination) bool {
+        const exit_key = key orelse return false;
+        const ctx = self.region_context orelse return false;
+        var consumed = false;
         const selected = self.chooseSource(self.classifyExit(exit_key), ctx);
         if (selected) |source| {
             if (self.region_profit.getPtr(source)) |accum| {
-                accum.outer_traversals +|= @intCast(work);
-                const n: u64 = @intCast(self.config.min_useful);
-                if (n != 0) while (accum.outer_traversals - accum.window_base >= n) {
-                    self.flushRegionWindow(source, n);
-                    accum.useful_window_seen = true;
-                    accum.window_base += n;
-                };
+                if (work != 0) {
+                    consumed = true;
+                    accum.outer_traversals +|= @intCast(work);
+                    const n: u64 = @intCast(self.config.min_useful);
+                    if (n != 0) while (accum.outer_traversals - accum.window_base >= n) {
+                        self.flushRegionWindow(source, n);
+                        accum.useful_window_seen = true;
+                        accum.window_base += n;
+                    };
+                }
             }
         }
         self.applyDestination(selected, dest, ctx);
+        return consumed;
     }
 
     /// Set the current physical activation and close accumulators whose recorded
@@ -2942,7 +2961,7 @@ pub const TraceState = struct {
                 sresult.final_trace_id != irinterp.NO_TRACE_ID and
                 sresult.final_trace_id != sct.id;
             if (is_link and (sresult.exit_instr == sct.instrs.len - 1 or sresult_fused)) {
-                if (!sresult_fused) self.accountRegionProfit(
+                if (!sresult_fused) _ = self.accountRegionProfit(
                     .{ .trace_id = sct.id, .exit_instr = sresult.exit_instr },
                     0,
                     .deferred,
@@ -3189,7 +3208,13 @@ pub const TraceState = struct {
                 .{ .known_trace = entries[k + 1].id }
             else
                 .deferred;
-            self.accountRegionProfit(region_key, region_work, region_dest);
+            // A-vii-c.1: this is a pure region receipt — the per-transition ledger
+            // never runs per-trace selection accounting here (the dispatcher's own
+            // `onSideExitReceipt` does that after the burst), so there is no legacy
+            // verdict to pair with consumption. The single exception is the
+            // `.region_bridge` arm below, which DOES call `accountTraceRun`.
+            const region_consumed = self.accountRegionProfit(region_key, region_work, region_dest);
+            _ = region_consumed;
 
             // Classify STRICTLY by the static emit-site `kind` (never re-derive the
             // materialization contract from the exit PC — an ordinary `.deopt` whose PC
@@ -3252,6 +3277,20 @@ pub const TraceState = struct {
                     // Selection sees the parent's actual committed segment (with a
                     // synthetic minimum of one); region-profit above independently
                     // receives structural work zero and the concrete successor.
+                    //
+                    // A-vii-c.1 boundary note — the ONE deliberate exception to
+                    // "unconsumed ⇒ legacy". A `.region_bridge` transition always
+                    // carries `region_work == 0` (the outer traversal is billed by the
+                    // `.loop_done_linked` rows), so it never consumes; but unlike every
+                    // other unconsumed receipt, its region ownership is PROVEN right
+                    // here by the replay grammar above — an armed backlink plus a
+                    // unique live registered edge, @panic on anything less. Running the
+                    // legacy machine on it would strike the owner once per intra-region
+                    // hop at roughly the rate windows complete, gating exactly the
+                    // productive regions this arc exists to build. So this site stays
+                    // selection-only. It is unreachable until A-vii-d enables arming;
+                    // A-vii-d owes it a firing test that pins "a productive armed region
+                    // accrues no owner penalty from its bridge transitions".
                     self.accountTraceRun(owner, @max(local, 1));
                     resume_pc.* = edge.succ_anchor_pc;
                 },
@@ -3917,7 +3956,7 @@ pub const TraceState = struct {
                 const cbuf = self.valuesScratch(current_link.instrs.len) catch break;
                 const cresult = irinterp.execute(current_link, regs, cbuf);
                 if (cresult.exit_instr == current_link.instrs.len - 1) {
-                    self.accountRegionProfit(
+                    _ = self.accountRegionProfit(
                         .{ .trace_id = current_link.id, .exit_instr = cresult.exit_instr },
                         0,
                         .deferred,
@@ -3932,7 +3971,7 @@ pub const TraceState = struct {
                     self.onSideExitReceipt(current_link, cresult.completed, cresult.exit_instr, cresult.completed, .deferred);
                     return .{ .completed = linked_completed + cresult.completed, .resume_pc = resume_pc };
                 }
-                self.accountRegionProfit(
+                _ = self.accountRegionProfit(
                     if (cresult.exit_instr < current_link.instrs.len)
                         .{ .trace_id = current_link.id, .exit_instr = cresult.exit_instr }
                     else
@@ -5068,6 +5107,14 @@ pub const TraceState = struct {
                     .armable = first_armable,
                 } });
                 active_regions.appendAssumeCapacity(.{ .id = new_id, .comp = cand.comp, .armable = first_armable, .member_trace_ids = mt_copy });
+                self.dbg("region: mint id={d} kind={s} members={d} armable={} (owner_unique={} membership_complete={})", .{
+                    @intFromEnum(new_id),
+                    @tagName(cand.classifier.kind),
+                    cand.classifier.member_count,
+                    first_armable,
+                    cand.armable_owner,
+                    cand.membership_complete,
+                });
                 new_id_counter += 1;
             }
         }
@@ -5133,6 +5180,7 @@ pub const TraceState = struct {
         }
         staged_bridge_updates.clearRetainingCapacity();
         for (staged_tombstones.items) |id| {
+            self.dbg("region: tombstone id={d} at physical rebuild", .{@intFromEnum(id)});
             if (self.region_defs.getPtr(id)) |d| d.armable = false;
         }
         self.next_region_id = new_id_counter;
@@ -10344,7 +10392,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
 
     // (1) Seven traversals: no complete window — no flush, no qualification, no strike.
     state.setRegionContext(1, 5);
-    state.accountRegionProfit(exit, 7, .deferred);
+    _ = state.accountRegionProfit(exit, 7, .deferred);
     try testing.expect(!state.region_profit.get(key).?.useful_window_seen);
     try testing.expectEqual(@as(u64, 0), state.region_profit_flushes);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
@@ -10356,7 +10404,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
 
     // (2) The eighth traversal completes exactly one N window: one useful flush,
     // qualification latched, owner penalty and gate both removed.
-    state.accountRegionProfit(exit, 1, .deferred);
+    _ = state.accountRegionProfit(exit, 1, .deferred);
     try testing.expect(state.region_profit.get(key).?.useful_window_seen);
     try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
@@ -10400,7 +10448,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     var j: u32 = 0;
     while (j < state.config.max_penalty) : (j += 1) {
         state.setRegionContext(1, 5);
-        state.accountRegionProfit(exit, 1, .deferred);
+        _ = state.accountRegionProfit(exit, 1, .deferred);
         state.observeRegionProgramPoint(61, 1, 1, 5); // departure → r=1 remainder strike
     }
     try testing.expectEqual(@as(u32, state.config.max_penalty), state.penalty.get(owner).?);
@@ -10408,17 +10456,51 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
     try testing.expectEqual(SHARED_EXIT, parent_slots[0]);
 
-    // (5) A region MEMBER trace's receipt is legacy-neutral on the selection side:
-    // hit_count still moves per segment, penalty does not — and the moment its
-    // region is tombstoned the legacy machine takes back over (fallback boundary).
-    var member: Trace = .{ .id = 9, .anchor = .{ .proto = &proto, .pc = 1 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    // (5) A-vii-c.1: the accounting boundary is CONSUMPTION, not membership. This
+    // is the contract the A-vii-c review blocker turned on — physical membership
+    // in a live region does NOT imply the region machine can gate a given receipt,
+    // so suppressing the legacy machine on membership left a member's zero-work
+    // and unclassified exits ungated by BOTH machines (measured shape: the
+    // dispatcher's zero-iteration path at interp.zig, whose own comment reads
+    // "apply the penalty"). Exactly one machine must account every receipt.
+    var member_instrs = [_]IrInstr{ .{ .op = .slot_load, .aux = 0 }, .{ .op = .loop } };
+    var member: Trace = .{ .id = 9, .anchor = .{ .proto = &proto, .pc = 1 }, .instrs = &member_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
     try state.dest_entry_regions.put(gpa, 9, try gpa.dupe(RegionId, &.{rid}));
-    state.onSideExitReceipt(&member, 0, 0, 0, .deferred); // low-yield, member → no strike
+    state.penalty.clearRetainingCapacity();
+    state.gate.clearRetainingCapacity();
+
+    // (5a) CONSUMED — exit 0 is classified into the live region and carries nonzero
+    // work, so the region window owns the verdict and the member anchor is untouched
+    // even though the segment itself was low-yield.
+    state.setRegionContext(1, 5);
+    state.onSideExitReceipt(&member, 0, 0, 1, .deferred);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(member.anchor));
-    state.onSideExitReceipt(&member, state.config.min_useful, 0, 0, .deferred);
-    try testing.expectEqual(@as(u64, 1), member.hit_count); // selection half still per segment
-    state.region_defs.getPtr(rid).?.armable = false; // tombstone → immediate fallback
+    try testing.expectEqual(@as(u64, 1), state.region_profit.get(key).?.outer_traversals);
+
+    // (5b) NOT consumed — same classified exit of the same live member, but zero
+    // structural work. R2-1 keeps zero-work flushes silent, so if this did not fall
+    // through to the legacy machine nothing would ever gate it: it must strike.
     state.onSideExitReceipt(&member, 0, 0, 0, .deferred);
+    try testing.expectEqual(@as(u32, 1), state.penalty.get(member.anchor).?);
+
+    // (5c) NOT consumed — nonzero work, but exit 1 is absent from the edge cache,
+    // so no accumulator receives it. Also a strike.
+    state.onSideExitReceipt(&member, 0, 1, 4, .deferred);
+    try testing.expectEqual(@as(u32, 2), state.penalty.get(member.anchor).?);
+
+    // (5d) An unconsumed USEFUL segment still recovers the anchor the legacy way,
+    // and the selection half bumps hit_count on every useful receipt regardless of
+    // which machine took the profitability verdict.
+    state.onSideExitReceipt(&member, state.config.min_useful, 1, 0, .deferred);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(member.anchor));
+    try testing.expectEqual(@as(u64, 1), member.hit_count);
+
+    // (5e) Tombstoning the region makes even a nonzero-work classified exit
+    // unconsumable (`openRegion` refuses a non-armable def) — so the member reverts
+    // to the legacy machine immediately, without waiting for a physical rebuild.
+    state.region_defs.getPtr(rid).?.armable = false;
+    state.setRegionContext(1, 5);
+    state.onSideExitReceipt(&member, 0, 0, 1, .deferred);
     try testing.expectEqual(@as(u32, 1), state.penalty.get(member.anchor).?);
 }
 
@@ -10443,14 +10525,14 @@ test "A-iv region_profit: windows persist across physical re-entry and observer 
     try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, source_set);
 
     state.setRegionContext(1, 99);
-    state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, 3, .deferred);
+    _ = state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, 3, .deferred);
     try testing.expectEqual(@as(usize, 1), state.regionProfitCount());
     const key: RegionKey = .{ .region_id = rid, .activation = 99 };
     try testing.expectEqual(@as(u64, 3), state.region_profit.get(key).?.outer_traversals);
 
     // Physical retirement/re-arm does not touch region_profit: another receipt for
     // the same logical id resumes the same window and crosses N=8 exactly once.
-    state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, 5, .deferred);
+    _ = state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, 5, .deferred);
     try testing.expectEqual(@as(u64, 8), state.region_profit.get(key).?.outer_traversals);
     try testing.expectEqual(@as(u64, 8), state.region_profit.get(key).?.window_base);
     try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
