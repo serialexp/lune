@@ -1,5 +1,42 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-12 (LATEST-31) — **A-vii-d.0 LANDED: armability recomputed per rebind; the region gate machine is LIVE on real shapes. NEXT = A-vii-d proper (the driveChain arm + region_bridge_arming_enabled=true).**
+
+The A-vii-d opening question is answered. A permanent `region: owner-scan`
+jitdbg probe on nsieve showed the owner predicate is RIGHT — `both_count`
+evolves 0→0→1 across rebuilds as the external-entry side trace records — but
+armability was frozen at first sight (`eff_armable = stored.armable ∧ …`,
+monotone-decreasing), and first sight NECESSARILY precedes the entry edge: the
+internal cycle is what triggers minting, and the entry source is a guard-hot
+side trace recorded later. So every real region was first-seen unarmable and
+could never rise. Fix (general, Z-6-clean): discovery recomputes
+`armable = owner-unique ∧ membership-complete ∧ !tombstoned` on EVERY rebind, in
+both directions, via a staged armable-update list; the fail-closed stickiness
+moved to a new `RegionDef.tombstoned` bit (set by `invalidateRegion` and by
+incompatible/truncated rebinds, never cleared). "Graph incomplete when we
+looked" is now recoverable; "misbehaved" stays permanent.
+
+Measured: nsieve arms on the entry-edge rebind (`rebind id=0 armable
+false→true owner_unique=true`); the matrix sieve shape arms in the harness; the
+A-vii-c dormancy tripwire fired exactly as designed and is upgraded to the
+EXERCISED oracle (renamed back to `assertRegionGateExercised`: ≥1 armable
+region, ≥1 live indexed member, ≥1 authoritative window flush on every execute
+leg). The consumption boundary and the replayLedger double-charge fix are now
+exercised by the matrix, not only by synthetic unit tests. New trace.zig unit
+test pins the lifecycle: first-sight unarmable (excluded from physical
+indices) → entry-edge rebind arms + indexes → invalidateRegion tombstone sticky
+across an identical rebind.
+
+Gates: `just test` green (829); `-Djit-debug` green; six-workload tier-0≡native
+output control ALL-PASS (output contract — selection now genuinely diverges on
+region shapes, and that is the designed A-vii-c surface finally non-empty).
+
+Remaining for A-vii-d proper: the driveChain arm site (§A-vii.2 steps 1-3,
+beside the M1 `.ordinary_guard` arms), `region_bridge_arming_enabled = true`,
+arm/handoff integration tests, the `.region_bridge` no-owner-penalty firing
+test, confirm `invariant_slots = S \ E` soundness, keyframe restore equality.
+Then A-vii-e measurement per the frozen protocol.
+
 ## Status 2026-08-12 (LATEST-30) — **A-vii-c.1 consumption-keyed accounting boundary LANDED (closes the codex BLOCKER on A-vii-c) + region-dormancy tripwire. NEXT = codex re-review → Bart APPROVE → A-vii-d (which is itself blocked on the `armable_owner` question below).**
 
 Codex `gpt-5.6-sol` reviewed the A-vii-c commit and returned **BLOCKER**,

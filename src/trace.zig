@@ -853,11 +853,23 @@ pub const RegionDef = struct {
     /// Bridge-capable internal edges and their whole-cycle liveness proofs. Owned;
     /// rebuilt on every successful discovery pass, including a same-id re-record.
     bridges: []RegionBridgeDef = &.{},
-    /// Minted `true`; flipped `false` by BOTH the A-ii def-consistency rebind
-    /// tombstone (an existing `RegionId` re-bound with incompatible `member_points`,
-    /// §A3.5) AND the A-iv+ gate tombstone. The classification-index build excludes
+    /// Live arming eligibility, RECOMPUTED at every discovery rebind (A-vii-d.0):
+    /// `armable = owner-unique ∧ membership-complete ∧ !tombstoned`. Recomputation
+    /// is what makes armability reachable at all — a cycle is necessarily minted
+    /// BEFORE its external-entry side trace records (the cycle triggers minting;
+    /// the entry arrives later by hotguard), so first sight is always
+    /// owner-not-unique and a frozen first-sight bit could never rise. Only
+    /// `tombstoned` is sticky. The classification-index build excludes
     /// `armable == false` regions.
     armable: bool,
+    /// The fail-closed sticky bit (split out of `armable` by A-vii-d.0): set by the
+    /// runtime tombstone (`invalidateRegion` — validation failure, classification
+    /// ambiguity, gate) AND by a def-inconsistent or truncated rebind (§A3.5
+    /// finding 3). Never cleared for the lifetime of the `RegionId`; while set,
+    /// recomputation can never re-arm the region. Distinguishes "the graph was
+    /// incomplete when we looked" (recoverable) from "this region misbehaved"
+    /// (permanent).
+    tombstoned: bool = false,
 };
 
 fn freeRegionBridges(gpa: std.mem.Allocator, bridges: []RegionBridgeDef) void {
@@ -2496,7 +2508,10 @@ pub const TraceState = struct {
 
     fn invalidateRegion(self: *TraceState, id: RegionId) void {
         self.dbg("region: invalidate id={d} (runtime tombstone)", .{@intFromEnum(id)});
-        if (self.region_defs.getPtr(id)) |def| def.armable = false;
+        if (self.region_defs.getPtr(id)) |def| {
+            def.armable = false;
+            def.tombstoned = true; // fail-closed: recomputation must never re-arm
+        }
         while (true) {
             var victim: ?RegionKey = null;
             var it = self.region_profit.keyIterator();
@@ -4987,7 +5002,11 @@ pub const TraceState = struct {
                     }
                 }
                 const proto = proto_by_id.get(a.proto_id) orelse return error.RegionGraphInconsistent;
-                if (is_ext and self.hasInnerRootAt(proto, a.pc)) {
+                const has_root = self.hasInnerRootAt(proto, a.pc);
+                self.dbg("region: owner-scan comp={d} node proto={d} pc={d} ext_entry={} inner_root={}", .{
+                    c, a.proto_id, a.pc, is_ext, has_root,
+                });
+                if (is_ext and has_root) {
                     both_count += 1;
                     owner_node = @intCast(n);
                 }
@@ -5060,6 +5079,11 @@ pub const TraceState = struct {
         const StagedOwnerUpdate = struct { id: RegionId, owner: AnchorKey };
         var staged_owner_updates: std.ArrayListUnmanaged(StagedOwnerUpdate) = .empty;
         defer staged_owner_updates.deinit(gpa);
+        // A-vii-d.0: rebind-recomputed armability, staged like the owner updates so
+        // a fallible mid-pass failure publishes nothing.
+        const StagedArmableUpdate = struct { id: RegionId, armable: bool };
+        var staged_armable_updates: std.ArrayListUnmanaged(StagedArmableUpdate) = .empty;
+        defer staged_armable_updates.deinit(gpa);
         var active_regions: std.ArrayListUnmanaged(ActiveRegion) = .empty;
         defer {
             for (active_regions.items) |a| gpa.free(a.member_trace_ids);
@@ -5069,6 +5093,7 @@ pub const TraceState = struct {
         try staged_defs.ensureUnusedCapacity(gpa, candidates.items.len);
         try staged_tombstones.ensureUnusedCapacity(gpa, candidates.items.len);
         try staged_owner_updates.ensureUnusedCapacity(gpa, candidates.items.len);
+        try staged_armable_updates.ensureUnusedCapacity(gpa, candidates.items.len);
         try staged_bridge_updates.ensureUnusedCapacity(gpa, candidates.items.len);
         try active_regions.ensureUnusedCapacity(gpa, candidates.items.len);
 
@@ -5082,16 +5107,33 @@ pub const TraceState = struct {
                 // stored def may have been minted from a complete pass and must not stay
                 // armable once a truncated pass appears (fail-closed, sticky).
                 if (!compatible or !cand.membership_complete) staged_tombstones.appendAssumeCapacity(existing_id);
-                // Finding 5 (review, boundary-edge evolution): the current owner analysis
-                // (`cand.armable_owner`) MUST re-gate arming on every rebind. Boundary edges
-                // are excluded from `RegionId`, so a graph change that adds a competing
-                // external-entry loop-root re-interns the SAME id but flips `both_count`
-                // 1→2 (owner no longer unique). Without this `and cand.armable_owner`, the
-                // stale `stored.armable=true` would wrong-arm. This is a pure tightening of
-                // the PHYSICAL arming (never a stale-true), so it can only disarm, never
-                // spuriously arm; a region first-seen armable that transiently loses its
-                // unique owner re-arms when `armable_owner` holds again.
-                const eff_armable = stored.armable and compatible and cand.membership_complete and cand.armable_owner;
+                // Finding 5 (review, boundary-edge evolution) + A-vii-d.0 correction:
+                // armability is RECOMPUTED from the current graph on every rebind, in
+                // BOTH directions. Boundary edges are excluded from `RegionId`, so a
+                // graph change flips `both_count` without changing the id: 1→2 must
+                // disarm (a stale `stored.armable=true` would wrong-arm — finding 5's
+                // original point), and 0→1 must ARM — the case the original
+                // `stored.armable and …` conjunction made unreachable. A cycle is
+                // necessarily first seen BEFORE its external-entry side trace records
+                // (the internal cycle is what triggers minting; the entry source is a
+                // guard-hot side trace recorded later), so first sight is always
+                // owner-not-unique and a monotone-decreasing bit could never rise:
+                // measured on nsieve, `both_count` goes 0→0→1 across rebuilds while
+                // the frozen bit stayed false. Only `tombstoned` is sticky — an
+                // incompatible or truncated rebind, or any runtime `invalidateRegion`,
+                // permanently pins the region off regardless of what the graph says.
+                const eff_armable = compatible and cand.membership_complete and
+                    cand.armable_owner and !stored.tombstoned;
+                if (eff_armable != stored.armable)
+                    self.dbg("region: rebind id={d} armable {}->{} (owner_unique={} membership_complete={} tombstoned={})", .{
+                        @intFromEnum(existing_id),
+                        stored.armable,
+                        eff_armable,
+                        cand.armable_owner,
+                        cand.membership_complete,
+                        stored.tombstoned,
+                    });
+                staged_armable_updates.appendAssumeCapacity(.{ .id = existing_id, .armable = eff_armable });
                 // Keep the stored owner fresh: the unique external-entry loop-root can MOVE
                 // to a different anchor with the internal edge set (hence the id) unchanged,
                 // so the arm site must track the current owner, not the first-sight one.
@@ -5190,6 +5232,12 @@ pub const TraceState = struct {
         for (staged_owner_updates.items) |u| {
             if (self.region_defs.getPtr(u.id)) |d| d.owner = u.owner;
         }
+        // A-vii-d.0: publish recomputed armability BEFORE the tombstones so a
+        // rebind that both recomputed and tombstoned stays fail-closed (the
+        // tombstone below re-clears armable and sets the sticky bit).
+        for (staged_armable_updates.items) |u| {
+            if (self.region_defs.getPtr(u.id)) |d| d.armable = u.armable;
+        }
         for (staged_bridge_updates.items) |u| {
             if (self.region_defs.getPtr(u.id)) |d| {
                 freeRegionBridges(gpa, d.bridges);
@@ -5199,7 +5247,10 @@ pub const TraceState = struct {
         staged_bridge_updates.clearRetainingCapacity();
         for (staged_tombstones.items) |id| {
             self.dbg("region: tombstone id={d} at physical rebuild", .{@intFromEnum(id)});
-            if (self.region_defs.getPtr(id)) |d| d.armable = false;
+            if (self.region_defs.getPtr(id)) |d| {
+                d.armable = false;
+                d.tombstoned = true;
+            }
         }
         self.next_region_id = new_id_counter;
         freeRegionSetMap(ExitKey, &self.source_exit_regions, gpa);
@@ -10889,6 +10940,80 @@ test "A-ii.4 discovery: skip→ramp→inner→cont→skip cycle — owner==skip@
     // dest_entry: the four cycle members are entries; the external trace is not.
     try testing.expect(state.dest_entry_regions.get(1) != null);
     try testing.expect(state.dest_entry_regions.get(5) == null);
+}
+
+test "A-vii-d.0 armability recovery: first-sight unarmable arms on the rebind that brings the entry edge; tombstone is sticky" {
+    // The reason no recorded shape ever armed (A-vii-d.0): the internal cycle is
+    // what triggers minting, and its external-entry side trace records LATER (by
+    // hotguard), so first sight is always owner-not-unique. Armability must
+    // therefore be recomputed per rebind — frozen-at-first-sight can never rise
+    // (measured on nsieve: both_count 0→0→1 across rebuilds). Only the tombstone
+    // is sticky.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const P_ID: u32 = 8;
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    const proto = Proto{ .code = &code, .id = P_ID, .name = "t", .num_registers = 1 };
+
+    // The same 4-node cycle as the discovery pin above, but WITHOUT the external
+    // trace: skip@14 is a loop-root yet nothing outside the component enters it.
+    var skip_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 2 }, .{ .op = .loop } };
+    var skip_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(13, .loop_done) }};
+    var skip: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 14 }, .instrs = &skip_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &skip_p };
+
+    var ramp_i = [_]IrInstr{.{ .op = .link, .aux = 7 }};
+    var ramp_p = [_]ExitProvEntry{.{ .index = 0, .prov = .{ .link_terminal = .{ .source_proto_id = 0, .source_pc = 1, .inline_depth = 0 } } }};
+    var ramp: Trace = .{ .id = 2, .anchor = .{ .proto = &proto, .pc = 2 }, .instrs = &ramp_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ramp_p };
+
+    var inner_i = [_]IrInstr{ .{ .op = .guard_true, .a = 0, .aux = 20 }, .{ .op = .loop } };
+    var inner_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(6, .loop_done) }};
+    var inner: Trace = .{ .id = 3, .anchor = .{ .proto = &proto, .pc = 7 }, .instrs = &inner_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &inner_p };
+
+    var cont_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+    var cont_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(19, .branch_cond) }};
+    var cont: Trace = .{ .id = 4, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &cont_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &cont_p };
+
+    for ([_]*Trace{ &skip, &ramp, &inner, &cont }) |t| try state.cache.append(gpa, t);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+
+    // (1) First sight: cycle discovered, but no external entry yet ⇒ NOT armable,
+    // NOT tombstoned, and excluded from the physical indices.
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count());
+    var kit = state.region_defs.keyIterator();
+    const rid = kit.next().?.*;
+    try testing.expect(!state.region_defs.get(rid).?.armable);
+    try testing.expect(!state.region_defs.get(rid).?.tombstoned);
+    try testing.expect(state.dest_entry_regions.get(1) == null);
+
+    // (2) The external-entry side trace records (the guard-hot side trace that in
+    // real programs always arrives AFTER the cycle): the rebind re-interns the
+    // SAME RegionId and armability recovers.
+    var ext_i = [_]IrInstr{.{ .op = .guard_true, .a = 0, .aux = 14 }};
+    var ext_p = [_]ExitProvEntry{.{ .index = 0, .prov = guardProv(29, .branch_cond) }};
+    var ext: Trace = .{ .id = 5, .anchor = .{ .proto = &proto, .pc = 30 }, .instrs = &ext_i, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_prov = &ext_p };
+    try state.cache.append(gpa, &ext);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    try testing.expectEqual(@as(usize, 1), state.region_defs.count()); // same logical region
+    try testing.expect(state.region_defs.get(rid).?.armable);
+    try testing.expect(!state.region_defs.get(rid).?.tombstoned);
+    try testing.expect(state.dest_entry_regions.get(1) != null); // members indexed again
+
+    // (3) A runtime tombstone is STICKY: the identical graph rebinding afterwards
+    // must not re-arm (fail-closed for cause, per invalidateRegion).
+    state.invalidateRegion(rid);
+    try testing.expect(!state.region_defs.get(rid).?.armable);
+    try testing.expect(state.region_defs.get(rid).?.tombstoned);
+    state.rebuildEdgeCache();
+    state.rebuildRegions();
+    try testing.expect(!state.region_defs.get(rid).?.armable);
+    try testing.expect(state.region_defs.get(rid).?.tombstoned);
+    try testing.expect(state.dest_entry_regions.get(1) == null);
 }
 
 test "A-ii.4 finding-3: a member with an incomplete recorded path mints the region NON-armable" {
