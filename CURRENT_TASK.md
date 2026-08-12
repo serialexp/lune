@@ -1,5 +1,60 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-13 (LATEST-39) — **Part T rejected TWICE pre-implementation; profiling the seam it targets changed the plan. First "free" memoization landed: nsieve −6.3%, sieve_int −8.9%, zero contract change.**
+
+**What happened.** Bart's lever ("LuaJIT does the B part right — not having to
+go through the runtime is the single highest lever") became Part T:
+commit-once transitions, LuaJIT `SNAPCOUNT_DONE` semantics. He chose
+"commit-once first, then patching." Two codex `gpt-5.6-sol` pre-implementation
+reviews **rejected** it (3 BLOCKER + 3 MAJOR each round). The two corrections
+that mattered — both were my errors, recorded inline in doc 17 §Part T rather
+than edited away:
+
+1. *"Worst case is mis-tiering"* was **false**. A terminal `.loop_done_linked`
+   returns a specific sibling `*Trace`, and fused M1 sub-cases (b)/(c) resume at
+   the **predecessor's** anchor — so a lossy summary can double-commit
+   iterations and **corrupt `regs[]`**.
+2. *"Qualified hop receipts are accounting no-ops"* was **false**. Consumed ≠
+   no-op: they still credit work, reset `barren_run`, flush windows, drive
+   `applyDestination`, update coverage/`hit_count`.
+
+Round 2 still REJECT (barren interleavings vs a bulk aggregate; terminal
+`ChainResult.completed`; the bridge two-cell reservation at nativegen.zig:4675;
+per-receipt `hit_count`). **Part T has NOT proceeded to T-a.**
+
+**The thing I should have done first (doc 17 §T.9).** Two designs rejected on a
+mechanism whose payoff split was never measured — against this project's own
+"profile FIRST" rule. Per-symbol attribution of the 50.1% seam says it is *not*
+mostly "walking rows": ~**15%** of wall-clock is pure lookup/validation that is
+memoizable with **no contract change, no determinism argument, no
+accounting-equivalence proof**, and only ~20% is what Part T's contested
+contract buys. Bart chose **"take the free 15% first."**
+
+**Landed (a0cedc8).** `isCompositeBridgeCandidate` — a pure function of
+immutable recorded data ending in an O(`instrs`) scan, called per receipt from
+seven hot sites, 4.68% of wall — is now a per-trace bitset built at commit
+(`buildBridgeCandMemo`), read via `Trace.isBridgeCandidate`. The oracle remains
+the definition: unbuilt memo falls back to it, the build is fail-soft, codegen
+and all existing tests still call it directly, and a new differential test
+asserts memo == oracle at *every* index across unbuilt/true-bit/all-false/empty.
+Measured ReleaseFast best-of-15 A/B: nsieve 9 **−6.3%**, nsieve 10 −3.4%,
+sieve_int **−8.9%**, pi_leibniz +0.1% (correct negative control — one tight
+loop, no bridge traffic). Six workload hashes identical to the frozen controls.
+Both gates green. `perf` confirms the symbol is gone from the profile.
+
+**Next (task #72, not started).** Remaining memoizable pool ≈ 9%: hashing 6.44%
+(`wyhash` 4.11 + `auto_hash` 2.33, essentially all per-receipt map lookups —
+`classifyExit` = one `source_exit_regions.get(ExitKey)`, plus
+`region_profit.getPtr`) and `qualifiedActiveMember` 2.44%. The shape is an
+ObserverHot-style inline cache, but `classifyExit` returns a **slice into map
+storage** and `getPtr` a **map-interior pointer**, so it needs a generation
+counter bumped on every mutation of those maps — start fresh, that hazard class
+deserves its own careful increment. `accountRegionProfit` now reads 20.18% (was
+16.04%) purely from the shrinking denominator, not a regression.
+
+**Do not commit** `bench/results/20260813-050325-44da392.tsv` as-is: the harness
+stamped it with the baseline commit while measuring the uncommitted memo build.
+
 ## Status 2026-08-12 (LATEST-38) — **The region-profit gate FIX landed: the gate was condemning its own region. After the codex review round: nsieve −29% (103.2 → 73.2ms), sieve_int −37% (41.1 → 25.7ms), links persist for whole sieves, nsieve:14 coverage 2.4% → 91.5%.**
 
 **Codex post-landing review: 2 BLOCKER + 2 MAJOR, all four fixed same-session
