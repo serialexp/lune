@@ -1896,7 +1896,15 @@ pub const Vm = struct {
         // A-iv logical-region departure observer. The empty-map common path does
         // not call into the observer and cannot allocate; activation context is
         // refreshed only on frame reload (execImpl/push/pop), not per instruction.
-        if (self.trace.regionProfitCount() != 0)
+        // A-vii-e.2: with a region live, `observeFast` answers the overwhelmingly
+        // common survive verdict inline (bit test against the cached hot span) so
+        // the loop never pays the observer's call frame; anything it cannot answer
+        // falls through to the pre-e.2 call, unchanged. The empty-map test stays
+        // FIRST and stays the only unconditional work: probing the hot cache ahead
+        // of it would touch a second `TraceState` line on every instruction of
+        // every region-free program, which measured +11% on scimark-sor tier-0.
+        if (self.trace.regionProfitCount() != 0 and
+            !self.trace.observeFast(proto.id, @intCast(cur), self.depth, frame.call_seq))
             self.trace.observeRegionProgramPoint(proto.id, @intCast(cur), self.depth, frame.call_seq);
         // Keep the faulting location recoverable (see the old loop's note).
         frame.pc = cur;

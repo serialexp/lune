@@ -1,5 +1,49 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-12 (LATEST-37) — **A-vii-e.2: the region observer's per-instruction CALL is gone. nsieve −27%, sieve_int −28%, everything else flat. Started as "do the §A2.4 native in-page handoff"; the profile said otherwise.**
+
+Bart asked for the §A2.4 native in-page handoff (doc 17's stated payoff for the
+A-vii bridge). Profiled first, per the project recipe — and the handoff is not
+where nsieve's time is:
+
+1. **`observeRegionProgramPoint` was 43.5% of nsieve N=9**, more than the whole
+   interpreter dispatch (`Vm.execImpl`, 31.7%). A-vii-e.1 removed the hashmap
+   walk but left a real *call* per interpreted instruction; `perf annotate` puts
+   ~70% of that 43.5% in the call's own prologue/epilogue (`push rbp` + five
+   callee-saved pushes + `sub rsp, 0x68` — a frame sized by the cold slow path).
+2. **Fix = `ObserverHot`**, a one-entry inline cache over e.1's spans: the span
+   that answered the last survive verdict, keyed by the *whole* query
+   (`proto_id`, `depth`, `call_seq`) + precomputed `base_pc`/`span_pcs`. Only a
+   `true` must be sound; a `false` defers to the real observer, which still owns
+   every close. Invalidated wholesale in `freeObserverFast` (sole owner of the
+   borrowed bitset), so it cannot dangle or outlive its `ObserverFast`.
+3. **Call-site ORDER is load-bearing** — the first attempt probed the hot cache
+   *before* the `region_profit.count()` test and touched a second `TraceState`
+   cache line on every instruction of every region-free program: a uniform
+   **+11%** on scimark-sor tier-0 (interleaved A/B). Empty-map test stays first.
+4. **Measured** (min of two interleaved full-suite runs per binary): nsieve
+   −27%, sieve_int −28%, all others within ±4%, tier-0 flat. Raw nsieve N=9
+   0.43s → 0.31s.
+5. **Determinism**: six workload hashes unchanged, tier-0 ≡ native, and every
+   `--jit-stats` event counter bit-identical (33662 entries; arms
+   335/1320/2282/2267; fused 5824/12630/14724; 6204 disarms; peak 4) — the
+   accelerator changes no tiering decision. Tests: an inline-cache boundary test
+   plus a **differential** test (one query stream through the interp.zig call
+   site vs the bare observer on two identical states → equal accumulator state
+   and flush history). `just test` + `-Djit-debug` green.
+
+**Where nsieve stands now** (this is the honest next-lever list, and it is NOT
+the in-page handoff): the observer is gone from the profile; the run is 70.6%
+`Vm.execImpl` + ~16% out-of-line arith helpers (`arith.lt`/`le`,
+`value.compareNumeric`). Per-anchor, **nsieve:14 — the branchy outer scan — is
+63.7% of the run at 0.7% traced iterations** (8.9M interpreted iterations), while
+nsieve:24 is already 94.9% traced and costs 21.5% of its anchor's time. So the
+gap is (a) tier-0 dispatch + arith, and (b) why the outer scan trace almost never
+runs. Also worth noting for §A2.4 itself: the bridge stub at `nativegen.zig:4691`
+**already** ends in `jmp qword [rdx+exit_target]` — an in-page native→native
+handoff to `skip.ordinary_entry`. Doc 17's "each bridge firing still crosses the
+runtime seam" line needs re-grounding against that before any §A2.4 work starts.
+
 ## Status 2026-08-12 (LATEST-36) — **A-viii round-2 revision (codex round 2 = CHANGES REQUIRED: 3 MAJOR + 1 MINOR). §A8 step 8 stays ticked; the bridge residual is now its OWN Outstanding bullet in doc 17 instead of being absorbed into a ticked step.**
 
 1. **MAJOR — `entries` cannot carry R2-4.** True: it's bumped at

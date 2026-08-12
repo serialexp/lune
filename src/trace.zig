@@ -846,6 +846,32 @@ const ObserverFast = struct {
     spans: []ObserverSpan,
 };
 
+/// A-vii-e.2: the INLINE half of the observer fast path. `ObserverFast` removed
+/// the hashmap walk but left the per-instruction *call*, and on nsieve that call
+/// is the dominant cost of the whole run — `perf annotate` attributes ~70% of
+/// `observeRegionProgramPoint`'s 43.5% to its prologue/epilogue (`push rbp` + five
+/// callee-saved pushes + `sub rsp, 0x68`, sized by the cold slow path), not to the
+/// verdict, which is a few compares and a `btq`.
+///
+/// So cache the ONE span the last survive verdict resolved through, keyed by the
+/// exact query that produced it (`proto_id`, `depth`, `call_seq`). `observeFast`
+/// re-checks all three plus the membership bit inline; the predicate in
+/// `observeRegionProgramPoint` is a pure function of those inputs and the
+/// `ObserverFast` cache, so identical inputs re-derive the identical verdict.
+/// Only a `true` needs to be sound — a `false` merely falls through to the real
+/// observer, which decides. Invalidated wholesale by `freeObserverFast` (the sole
+/// owner of the borrowed `words`), so it can neither dangle nor go stale.
+const ObserverHot = struct {
+    /// Borrowed from the owning `ObserverFast` span; null = cache cold.
+    words: ?[*]const u64 = null,
+    proto_id: u32 = 0,
+    base_pc: u32 = 0,
+    /// `limit_pc - base_pc`, precomputed so the probe is one unsigned compare.
+    span_pcs: u32 = 0,
+    depth: u32 = 0,
+    call_seq: u64 = 0,
+};
+
 fn regionIdLess(_: void, a: RegionId, b: RegionId) bool {
     return @intFromEnum(a) < @intFromEnum(b);
 }
@@ -1841,6 +1867,8 @@ pub const TraceState = struct {
     region_context: ?RegionContext = null,
     /// A-vii-e.1: single-accumulator observer fast path (see `ObserverFast`).
     observer_fast: ?ObserverFast = null,
+    /// A-vii-e.2: inline hot-span cache over `observer_fast` (see `ObserverHot`).
+    observer_hot: ObserverHot = .{},
     /// Inert diagnostics used by the A-iv guards to prove full-window and
     /// remainder flushes occurred. No tiering path consumes either counter.
     region_profit_flushes: u64 = 0,
@@ -2577,6 +2605,10 @@ pub const TraceState = struct {
     }
 
     fn freeObserverFast(self: *TraceState) void {
+        // The inline cache borrows a span's `words`, so it dies with the owner —
+        // unconditionally, even when there is nothing to free (a null
+        // `observer_fast` still means "no valid hot span").
+        self.observer_hot = .{};
         if (self.observer_fast) |f| {
             for (f.spans) |s| self.gpa.free(s.words);
             self.gpa.free(f.spans);
@@ -3031,6 +3063,29 @@ pub const TraceState = struct {
         return consumed;
     }
 
+    /// A-vii-e.2: the inline half of the tier-0 departure observer. Returns true
+    /// iff this program point provably SURVIVES — i.e. `observeRegionProgramPoint`
+    /// would have taken its `ObserverFast` member-hit branch and returned without
+    /// closing anything. The caller must fall through to the real observer on
+    /// false; a false is never a verdict, only "the inline cache can't answer".
+    ///
+    /// Soundness rests on the hot cache being keyed by the whole query — the
+    /// member-hit branch is a pure function of `(proto_id, pc, depth, call_seq)`
+    /// and the `ObserverFast` cache, and the hot entry dies with that cache — so a
+    /// matching key over an identical span re-derives the identical verdict. The
+    /// only side effect that branch has is refreshing `region_context`, which this
+    /// reproduces.
+    pub inline fn observeFast(self: *TraceState, proto_id: u32, pc: u32, depth: u32, call_seq: u64) bool {
+        const h = &self.observer_hot;
+        const words = h.words orelse return false;
+        if (h.proto_id != proto_id or h.depth != depth or h.call_seq != call_seq) return false;
+        const off = pc -% h.base_pc;
+        if (off >= h.span_pcs) return false;
+        if ((words[off >> 6] >> @intCast(off & 63)) & 1 == 0) return false;
+        self.region_context = .{ .depth = depth, .call_seq = call_seq };
+        return true;
+    }
+
     /// Set the current physical activation and close accumulators whose recorded
     /// membership no longer contains this tier-0 departure point. No allocation;
     /// the common empty-map path is one count test.
@@ -3050,7 +3105,21 @@ pub const TraceState = struct {
                     if (s.proto_id != proto_id) continue;
                     if (pc >= s.base_pc and pc < s.limit_pc) {
                         const off = pc - s.base_pc;
-                        if ((s.words[off >> 6] >> @intCast(off & 63)) & 1 != 0) return; // member → survives
+                        if ((s.words[off >> 6] >> @intCast(off & 63)) & 1 != 0) {
+                            // Member → survives. Warm the inline cache (A-vii-e.2)
+                            // with the span that produced this verdict, keyed by the
+                            // exact query, so the next instruction at the same
+                            // proto/activation never re-enters this function.
+                            self.observer_hot = .{
+                                .words = s.words.ptr,
+                                .proto_id = s.proto_id,
+                                .base_pc = s.base_pc,
+                                .span_pcs = s.limit_pc - s.base_pc,
+                                .depth = depth,
+                                .call_seq = call_seq,
+                            };
+                            return;
+                        }
                     }
                 }
             }
@@ -12112,6 +12181,178 @@ test "A-vii-e.1 observer fast path: built on open, survive verdicts match the sl
     try testing.expectEqual(@as(u64, 78), f2.key.activation);
     state.closeRegion(.{ .region_id = rid, .activation = 78 });
     try testing.expect(state.observer_fast == null);
+}
+
+test "A-vii-e.2 observer inline cache: only survive verdicts answer inline, and the key is the whole query" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    // Same shape as the e.1 test: members {2, 5} of proto 83, root activation
+    // (depth 1, call_seq 5). e.2 adds the INLINE probe over that cache, so what
+    // this pins is the boundary between "answered without a call" and "deferred
+    // to the real observer" — a false is always safe, a true never is.
+    var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil) };
+    const proto = Proto{ .id = 83, .code = &code, .name = "inline-fastpath", .num_registers = 1 };
+    const rid: RegionId = @enumFromInt(11);
+    try state.region_defs.put(gpa, rid, .{
+        .members = try gpa.dupe(StructuralEdgeId, &.{}),
+        .member_points = try gpa.dupe(ProgramPoint, &.{
+            .{ .proto_id = 83, .source_pc = 2 },
+            .{ .proto_id = 83, .source_pc = 5 },
+        }),
+        .owner = .{ .proto = &proto, .pc = 2 },
+        .classifier = .{ .kind = .self_loop, .member_count = 1 },
+        .armable = true,
+    });
+    try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
+    const exit: ExitKey = .{ .trace_id = 9, .exit_instr = 0 };
+    const key: RegionKey = .{ .region_id = rid, .activation = 5 };
+
+    state.setRegionContext(1, 5);
+    _ = state.accountRegionProfit(exit, 3, .deferred);
+    try testing.expect(state.region_profit.contains(key));
+
+    // (1) A freshly built `observer_fast` leaves the inline cache COLD — it is
+    // warmed by a survive verdict, never by the rebuild, so the first instruction
+    // after any refresh always goes through the real observer.
+    try testing.expect(state.observer_fast != null);
+    try testing.expect(state.observer_hot.words == null);
+    try testing.expect(!state.observeFast(83, 2, 1, 5));
+
+    // (2) One slow survive verdict warms it; the identical query then answers
+    // inline, as does the region's OTHER member point (same span, same key).
+    state.observeRegionProgramPoint(83, 2, 1, 5);
+    try testing.expect(state.observer_hot.words != null);
+    try testing.expect(state.observeFast(83, 2, 1, 5));
+    try testing.expect(state.observeFast(83, 5, 1, 5));
+
+    // (3) Everything the slow predicate would answer differently is DECLINED
+    // inline, so the real observer keeps ownership of every close decision:
+    //   - a non-member pc inside the span bounds (pc 3 ∈ [2,6), bit clear),
+    //   - a pc outside the span, on both sides (the `-%` wrap must not alias),
+    //   - a different proto, a sibling activation, a different depth.
+    try testing.expect(!state.observeFast(83, 3, 1, 5));
+    try testing.expect(!state.observeFast(83, 9, 1, 5));
+    try testing.expect(!state.observeFast(83, 0, 1, 5));
+    try testing.expect(!state.observeFast(84, 2, 1, 5));
+    try testing.expect(!state.observeFast(83, 2, 1, 6));
+    try testing.expect(!state.observeFast(83, 2, 2, 5));
+    // None of those declines touched the accumulator — declining is not closing.
+    try testing.expect(state.region_profit.contains(key));
+    try testing.expectEqual(@as(u64, 0), state.region_profit_flushes);
+
+    // (4) A survive verdict answered inline must still refresh the activation
+    // context, exactly as the observer's own member-hit branch does.
+    state.region_context = null;
+    try testing.expect(state.observeFast(83, 5, 1, 5));
+    try testing.expectEqual(@as(u32, 1), state.region_context.?.depth);
+    try testing.expectEqual(@as(u64, 5), state.region_context.?.call_seq);
+
+    // (5) The hot entry borrows the owning span's bitset, so it must die with it.
+    // Closing the region frees those words; a stale `words` pointer here would be
+    // a use-after-free on the very next instruction.
+    state.observeRegionProgramPoint(83, 3, 1, 5); // non-member → close
+    try testing.expect(!state.region_profit.contains(key));
+    try testing.expect(state.observer_fast == null);
+    try testing.expect(state.observer_hot.words == null);
+    try testing.expect(!state.observeFast(83, 2, 1, 5));
+
+    // (6) …and so must the multi-accumulator disable: with two live accumulators
+    // the slow loop owns victim ordering, so the inline cache may not answer.
+    state.setRegionContext(1, 5);
+    _ = state.accountRegionProfit(exit, 3, .deferred);
+    state.observeRegionProgramPoint(83, 2, 1, 5); // warm
+    try testing.expect(state.observeFast(83, 2, 1, 5));
+    state.setRegionContext(1, 78);
+    _ = state.accountRegionProfit(exit, 3, .deferred);
+    try testing.expectEqual(@as(usize, 2), state.regionProfitCount());
+    try testing.expect(state.observer_hot.words == null);
+    try testing.expect(!state.observeFast(83, 2, 1, 5));
+    state.closeRegion(.{ .region_id = rid, .activation = 5 });
+    state.closeRegion(.{ .region_id = rid, .activation = 78 });
+}
+
+test "A-vii-e.2 observer inline cache: differential — the accelerated call site is state-identical to the bare observer" {
+    const gpa = testing.allocator;
+    // The accelerator's whole contract is "the interpreter's call site behaves
+    // exactly as it did before". Prove it differentially: two identically-built
+    // states driven by the same query stream, one through the interp.zig call
+    // site (`observeFast` first, real observer on a decline) and one through the
+    // bare observer, must end in the same accumulator state with the same flush
+    // history. A cache that answered even one verdict wrongly diverges here.
+    var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil) };
+    const proto = Proto{ .id = 83, .code = &code, .name = "differential", .num_registers = 1 };
+    const rid: RegionId = @enumFromInt(11);
+    const exit: ExitKey = .{ .trace_id = 9, .exit_instr = 0 };
+
+    // {proto_id, pc, depth, call_seq}; a null entry re-opens the region instead.
+    const Query = ?struct { u32, u32, u32, u64 };
+    const stream = [_]Query{
+        .{ 83, 2, 1, 5 }, // member at the root activation — the warm case
+        .{ 83, 5, 1, 5 }, // the span's other member
+        .{ 83, 2, 1, 5 },
+        .{ 99, 1234, 2, 77 }, // deeper frame: survives whatever the pc
+        .{ 83, 5, 1, 5 },
+        .{ 83, 5, 2, 5 }, // deeper frame at a member pc
+        .{ 83, 3, 1, 5 }, // non-member INSIDE the span bounds → close
+        .{ 83, 2, 1, 5 }, // nothing live: both are no-ops
+        null, // re-open
+        .{ 83, 5, 1, 5 },
+        .{ 84, 5, 1, 5 }, // member pc, wrong proto → close
+        null,
+        .{ 83, 2, 1, 5 },
+        .{ 83, 2, 1, 6 }, // sibling activation at the root depth → close
+        null,
+        .{ 83, 5, 1, 5 },
+        .{ 83, 0, 1, 5 }, // below the span base (the `-%` wrap case) → close
+        null,
+        .{ 83, 2, 1, 5 },
+        .{ 83, 9, 1, 5 }, // past the span limit → close
+    };
+
+    var states: [2]TraceState = .{ TraceState.init(gpa), TraceState.init(gpa) };
+    defer for (&states) |*s| s.deinit();
+    for (&states, 0..) |*state, which| {
+        try state.region_defs.put(gpa, rid, .{
+            .members = try gpa.dupe(StructuralEdgeId, &.{}),
+            .member_points = try gpa.dupe(ProgramPoint, &.{
+                .{ .proto_id = 83, .source_pc = 2 },
+                .{ .proto_id = 83, .source_pc = 5 },
+            }),
+            .owner = .{ .proto = &proto, .pc = 2 },
+            .classifier = .{ .kind = .self_loop, .member_count = 1 },
+            .armable = true,
+        });
+        try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
+        state.setRegionContext(1, 5);
+        _ = state.accountRegionProfit(exit, 3, .deferred);
+
+        for (stream) |maybe_q| {
+            const q = maybe_q orelse {
+                state.setRegionContext(1, 5);
+                _ = state.accountRegionProfit(exit, 3, .deferred);
+                continue;
+            };
+            // which == 0: the interp.zig call site, verbatim. which == 1: bare.
+            if (which == 0) {
+                if (state.regionProfitCount() != 0 and !state.observeFast(q[0], q[1], q[2], q[3]))
+                    state.observeRegionProgramPoint(q[0], q[1], q[2], q[3]);
+            } else {
+                if (state.regionProfitCount() != 0)
+                    state.observeRegionProgramPoint(q[0], q[1], q[2], q[3]);
+            }
+        }
+    }
+
+    try testing.expectEqual(states[1].regionProfitCount(), states[0].regionProfitCount());
+    try testing.expectEqual(states[1].region_profit_flushes, states[0].region_profit_flushes);
+    try testing.expectEqual(states[1].region_profit_flushed_work, states[0].region_profit_flushed_work);
+    try testing.expectEqual(states[1].region_context.?.depth, states[0].region_context.?.depth);
+    try testing.expectEqual(states[1].region_context.?.call_seq, states[0].region_context.?.call_seq);
+    // The stream ends on a close, and it must be the same close on both sides.
+    try testing.expectEqual(@as(usize, 0), states[0].regionProfitCount());
+    try testing.expect(states[1].region_profit_flushes > 0);
 }
 
 test "A-vii-e.1 observer fast path: an over-cap pc range declines the cache; the slow path still closes" {
