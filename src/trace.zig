@@ -11910,17 +11910,18 @@ test "A-vii-e.1 observer fast path: built on open, survive verdicts match the sl
     try testing.expect(!state.region_profit.contains(.{ .region_id = rid, .activation = 5 }));
     try testing.expectEqual(@as(u64, 3), state.region_profit_flushes);
 
-    // (6) Multi-accumulator disables the fast path: a second live accumulator
-    // (direct insert, the test-only shape) must leave any subsequent refresh
-    // null so the slow loop owns multi-victim ordering.
+    // (6) Multi-accumulator disables the fast path AT the funnel: opening a
+    // second activation through openRegion takes count 1→2 and the refresh
+    // there must NULL the cache (the slow loop owns multi-victim ordering);
+    // a funnel close back to one rebuilds it for the SURVIVOR.
     state.setRegionContext(1, 5);
     _ = state.accountRegionProfit(exit, 3, .deferred);
     try testing.expect(state.observer_fast != null);
-    try state.region_profit.put(gpa, .{ .region_id = rid, .activation = 77 }, .{ .root_frame_depth = 1, .root_call_seq = 77 });
-    state.closeRegion(.{ .region_id = rid, .activation = 77 }); // any funnel refresh with count!=1 nulls…
-    try testing.expect(state.observer_fast != null); // …count is back to 1 here, so it rebuilt
-    try state.region_profit.put(gpa, .{ .region_id = rid, .activation = 78 }, .{ .root_frame_depth = 1, .root_call_seq = 78 });
-    state.closeRegion(.{ .region_id = rid, .activation = 5 }); // count 2→1 via a funnel: rebuilds for the survivor
+    state.setRegionContext(1, 78);
+    _ = state.accountRegionProfit(exit, 3, .deferred);
+    try testing.expectEqual(@as(usize, 2), state.regionProfitCount());
+    try testing.expect(state.observer_fast == null);
+    state.closeRegion(.{ .region_id = rid, .activation = 5 }); // count 2→1: rebuilds for 78
     const f2 = state.observer_fast orelse return error.MissingObserverFast;
     try testing.expectEqual(@as(u64, 78), f2.key.activation);
     state.closeRegion(.{ .region_id = rid, .activation = 78 });
