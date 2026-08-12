@@ -813,6 +813,39 @@ const RegionContext = struct {
     call_seq: u64,
 };
 
+/// A-vii-e.1: one proto's membership bitset for the observer fast path. Bit
+/// `pc - base_pc` of `words` is set iff `{proto_id, pc}` is a member point of
+/// the cached region. `words` is owned by TraceState (copied out of the def's
+/// `member_points` at refresh time — never borrows def memory, so a later
+/// `clearCache` def free cannot dangle it).
+const ObserverSpan = struct {
+    proto_id: u32,
+    base_pc: u32,
+    /// Exclusive pc bound (`base_pc + range`); pcs outside [base, limit) are
+    /// non-members without touching `words`.
+    limit_pc: u32,
+    words: []u64,
+};
+
+/// A-vii-e.1: the single-accumulator fast path for `observeRegionProgramPoint`.
+/// The observer runs PER INTERPRETED INSTRUCTION whenever `region_profit` is
+/// non-empty — with A-vii-d's armable regions that is essentially the whole
+/// run, and the original hashmap-iterator + linear `member_points` scan
+/// measured 49% of nsieve wall time. This cache turns the survive verdict
+/// (the overwhelmingly common one) into two integer compares and a bit test.
+/// Valid only while `region_profit.count() == 1`; rebuilt by
+/// `refreshObserverFast` at every map mutation (openRegion / closeRegion /
+/// resetRegionProfit — the three funnels; clearCache resets via the third).
+/// Pure accelerator: any refresh failure leaves it null and the observer takes
+/// the original slow scan with identical semantics, so an OOM here cannot
+/// diverge replay.
+const ObserverFast = struct {
+    key: RegionKey,
+    root_frame_depth: u32,
+    root_call_seq: u64,
+    spans: []ObserverSpan,
+};
+
 fn regionIdLess(_: void, a: RegionId, b: RegionId) bool {
     return @intFromEnum(a) < @intFromEnum(b);
 }
@@ -1806,6 +1839,8 @@ pub const TraceState = struct {
     /// the per-op observer only probes/removes existing entries.
     region_profit: std.AutoHashMapUnmanaged(RegionKey, RegionAccum) = .empty,
     region_context: ?RegionContext = null,
+    /// A-vii-e.1: single-accumulator observer fast path (see `ObserverFast`).
+    observer_fast: ?ObserverFast = null,
     /// Inert diagnostics used by the A-iv guards to prove full-window and
     /// remainder flushes occurred. No tiering path consumes either counter.
     region_profit_flushes: u64 = 0,
@@ -2136,6 +2171,7 @@ pub const TraceState = struct {
         freeRegionSetMap(ExitKey, &self.source_exit_regions, self.gpa);
         freeRegionSetMap(u32, &self.dest_entry_regions, self.gpa);
         self.region_profit.deinit(self.gpa);
+        self.freeObserverFast(); // A-vii-e.1: owned bitset copies
         // Free each trace (its `native.deinit()` returns mcode slots to the arena's
         // free-list) *before* tearing down the arena those slots live in.
         for (self.cache.items) |t| t.destroy(self.gpa);
@@ -2516,6 +2552,76 @@ pub const TraceState = struct {
         const remainder = accum.outer_traversals - accum.window_base;
         self.flushRegionWindow(key, remainder);
         _ = self.region_profit.remove(key);
+        self.refreshObserverFast();
+    }
+
+    fn freeObserverFast(self: *TraceState) void {
+        if (self.observer_fast) |f| {
+            for (f.spans) |s| self.gpa.free(s.words);
+            self.gpa.free(f.spans);
+            self.observer_fast = null;
+        }
+    }
+
+    /// A-vii-e.1: rebuild the observer fast path from the current single
+    /// accumulator (null it otherwise). Cold path — runs only when the
+    /// `region_profit` map mutates. See `ObserverFast` for the contract.
+    fn refreshObserverFast(self: *TraceState) void {
+        self.freeObserverFast();
+        if (self.region_profit.count() != 1) return;
+        var it = self.region_profit.iterator();
+        const entry = it.next().?;
+        const def = self.region_defs.get(entry.key_ptr.region_id) orelse return; // slow path closes it
+        const points = def.member_points; // sorted by (proto_id, source_pc), deduped
+        if (points.len == 0) return;
+        // Group by consecutive proto_id runs. Discovery publishes member_points
+        // sorted by (proto_id, source_pc), but hand-built test defs may not be —
+        // so take min/max per run instead of first/last, and let the probe below
+        // check every span (a non-contiguous proto grouping just yields more
+        // spans, never a wrong verdict).
+        var nspans: usize = 1;
+        for (points[1..], points[0 .. points.len - 1]) |cur, prev| {
+            if (cur.proto_id != prev.proto_id) nspans += 1;
+        }
+        const spans = self.gpa.alloc(ObserverSpan, nspans) catch return;
+        var filled: usize = 0;
+        var i: usize = 0;
+        while (i < points.len) {
+            const pid = points[i].proto_id;
+            var j = i;
+            var base = points[i].source_pc;
+            var max_pc = base;
+            while (j < points.len and points[j].proto_id == pid) : (j += 1) {
+                base = @min(base, points[j].source_pc);
+                max_pc = @max(max_pc, points[j].source_pc);
+            }
+            if (max_pc == std.math.maxInt(u32)) { // limit would wrap; stay on the slow path
+                for (spans[0..filled]) |s| self.gpa.free(s.words);
+                self.gpa.free(spans);
+                return;
+            }
+            const limit = max_pc + 1;
+            const nwords = ((limit - base) + 63) / 64;
+            const words = self.gpa.alloc(u64, nwords) catch {
+                for (spans[0..filled]) |s| self.gpa.free(s.words);
+                self.gpa.free(spans);
+                return;
+            };
+            @memset(words, 0);
+            for (points[i..j]) |pp| {
+                const off = pp.source_pc - base;
+                words[off >> 6] |= @as(u64, 1) << @intCast(off & 63);
+            }
+            spans[filled] = .{ .proto_id = pid, .base_pc = base, .limit_pc = limit, .words = words };
+            filled += 1;
+            i = j;
+        }
+        self.observer_fast = .{
+            .key = entry.key_ptr.*,
+            .root_frame_depth = entry.value_ptr.root_frame_depth,
+            .root_call_seq = entry.value_ptr.root_call_seq,
+            .spans = spans,
+        };
     }
 
     fn activeRegionFor(self: *const TraceState, activation: u64) ?RegionKey {
@@ -2563,6 +2669,7 @@ pub const TraceState = struct {
             if (sameAnchor(live_def.owner, def.owner)) count += 1;
         }
         if (count > 1) @panic("region_profit cardinality violated after replacement");
+        self.refreshObserverFast();
         return key;
     }
 
@@ -2901,6 +3008,26 @@ pub const TraceState = struct {
     pub fn observeRegionProgramPoint(self: *TraceState, proto_id: u32, pc: u32, depth: u32, call_seq: u64) void {
         self.region_context = .{ .depth = depth, .call_seq = call_seq };
         if (self.region_profit.count() == 0) return;
+        // A-vii-e.1 fast path: the per-instruction survive verdict for the
+        // single-accumulator common case, without touching the hashmap. Exactly
+        // the slow loop's predicate below, accelerated:
+        //   depth > root                          → survives
+        //   depth == root and call_seq != seq     → close
+        //   otherwise                             → close iff point ∉ members
+        if (self.observer_fast) |f| {
+            if (depth > f.root_frame_depth) return;
+            if (depth < f.root_frame_depth or call_seq == f.root_call_seq) {
+                for (f.spans) |s| {
+                    if (s.proto_id != proto_id) continue;
+                    if (pc >= s.base_pc and pc < s.limit_pc) {
+                        const off = pc - s.base_pc;
+                        if ((s.words[off >> 6] >> @intCast(off & 63)) & 1 != 0) return; // member → survives
+                    }
+                }
+            }
+            self.closeRegion(f.key); // count → 0; refresh nulls the cache
+            return;
+        }
         const point: ProgramPoint = .{ .proto_id = proto_id, .source_pc = pc };
         while (true) {
             var victim: ?RegionKey = null;
@@ -2947,6 +3074,7 @@ pub const TraceState = struct {
     pub fn resetRegionProfit(self: *TraceState) void {
         self.region_profit.clearRetainingCapacity();
         self.region_context = null;
+        self.freeObserverFast();
     }
 
     pub inline fn regionProfitCount(self: *const TraceState) usize {
@@ -11693,6 +11821,73 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     state.setRegionContext(1, 5);
     state.onSideExitReceipt(&member, 0, 0, 1, .deferred);
     try testing.expectEqual(@as(u32, 1), state.penalty.get(member.anchor).?);
+}
+
+test "A-vii-e.1 observer fast path: built on open, survive verdicts match the slow predicate, cleared on close" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    // A live region spanning two member points; open it via the canonical path
+    // (accountRegionProfit → openRegion) so refreshObserverFast runs.
+    var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil), Instr.op0(.load_nil) };
+    const proto = Proto{ .id = 83, .code = &code, .name = "fastpath", .num_registers = 1 };
+    const rid: RegionId = @enumFromInt(11);
+    try state.region_defs.put(gpa, rid, .{
+        .members = try gpa.dupe(StructuralEdgeId, &.{}),
+        .member_points = try gpa.dupe(ProgramPoint, &.{
+            .{ .proto_id = 83, .source_pc = 2 },
+            .{ .proto_id = 83, .source_pc = 5 },
+        }),
+        .owner = .{ .proto = &proto, .pc = 2 },
+        .classifier = .{ .kind = .self_loop, .member_count = 1 },
+        .armable = true,
+    });
+    try state.source_exit_regions.put(gpa, .{ .trace_id = 9, .exit_instr = 0 }, try gpa.dupe(RegionId, &.{rid}));
+    const exit: ExitKey = .{ .trace_id = 9, .exit_instr = 0 };
+    const key: RegionKey = .{ .region_id = rid, .activation = 5 };
+
+    state.setRegionContext(1, 5);
+    _ = state.accountRegionProfit(exit, 3, .deferred);
+    try testing.expect(state.region_profit.contains(key));
+
+    // (1) The cache is live and mirrors the accumulator's root context, with the
+    // membership bitset holding exactly {2, 5} of the [2, 6) span.
+    const f = state.observer_fast orelse return error.MissingObserverFast;
+    try testing.expectEqual(key, f.key);
+    try testing.expectEqual(@as(u32, 1), f.root_frame_depth);
+    try testing.expectEqual(@as(u64, 5), f.root_call_seq);
+    try testing.expectEqual(@as(usize, 1), f.spans.len);
+    try testing.expectEqual(@as(u32, 83), f.spans[0].proto_id);
+    try testing.expectEqual(@as(u32, 2), f.spans[0].base_pc);
+    try testing.expectEqual(@as(u32, 6), f.spans[0].limit_pc);
+    try testing.expectEqual(@as(u64, 0b1001), f.spans[0].words[0]);
+
+    // (2) Survive verdicts, all through the fast path: a member point at the root
+    // frame, a member point again (idempotent), and ANY point in a deeper frame.
+    state.observeRegionProgramPoint(83, 2, 1, 5);
+    state.observeRegionProgramPoint(83, 5, 1, 5);
+    state.observeRegionProgramPoint(99, 1234, 2, 77); // deeper frame: never a departure
+    try testing.expect(state.region_profit.contains(key));
+    try testing.expectEqual(@as(u64, 0), state.region_profit_flushes);
+
+    // (3) A non-member pc closes even INSIDE the span bounds: pc 3 is in [2, 6)
+    // but its bit is clear — remainder flush, cache cleared.
+    state.observeRegionProgramPoint(83, 3, 1, 5);
+    try testing.expect(!state.region_profit.contains(key));
+    try testing.expect(state.observer_fast == null);
+    try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
+
+    // (4) Re-open, then a sibling activation at the root depth (same depth,
+    // different call_seq) closes even AT a member point — the activation-identity
+    // half of the predicate.
+    state.setRegionContext(1, 5);
+    _ = state.accountRegionProfit(exit, 3, .deferred);
+    try testing.expect(state.observer_fast != null);
+    state.observeRegionProgramPoint(83, 2, 1, 6);
+    try testing.expect(!state.region_profit.contains(key));
+    try testing.expect(state.observer_fast == null);
+    try testing.expectEqual(@as(u64, 2), state.region_profit_flushes);
 }
 
 test "A-iv region_profit: windows persist across physical re-entry and observer closes only on departure" {

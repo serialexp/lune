@@ -1,5 +1,60 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-12 (LATEST-33) — **A-vii-e MEASURED + A-vii-e.1 observer fast path LANDED: §A8 step 7 COMPLETE. NEXT = A-viii (outer-cycle disarm coverage) and/or the native in-page handoff (§A2.4).**
+
+Full narrative in doc 17 §A8-iii item 5. The short version:
+
+1. **Codex post-landing review of d/d.1 closed:** one BLOCKER (bridged
+   `.link`-ending successors bypassed the bridged terminal contract — the
+   `ends_link` split was tested first, so a zero-progress deopt dropped the
+   successor's receipt and double-charged the parent via hop-0's
+   `onSideExit(seed, 0)`). Fixed in fcee9b7 (`entered_via_bridge` first in
+   both terminal arms, requiring `ends_link or ends_loop`) + regression
+   test; re-review = APPROVE.
+2. **A-vii-e frozen protocol run (before = 9ee7d4b, after = flip tree).**
+   Raw flip: nsieve ~2× WALL REGRESSION (N=7 102→203 ms, N=9 429→795 ms;
+   an earlier "flat at N=9" read was --jit-stats TSC overhead masking it)
+   despite coverage moving right (nsieve:24 56.7%→94.9% traced, bridge
+   fused 14 724/run at N=9). Comptime ablation (arm site declines, all else
+   live) timed IDENTICAL → the bridge is cost-neutral; the regression was
+   elsewhere. perf (profile-first recipe): `observeRegionProgramPoint` =
+   49.1% of runtime — the A-iv per-instruction departure observer's
+   empty-map guard stopped guarding once d.1 made nsieve mint an armable
+   region whose accumulator is open for ~the whole run (hashmap-iterator +
+   linear member_points scan per interpreted instruction; general, not
+   nsieve-specific).
+3. **A-vii-e.1 fix:** `ObserverFast` — when exactly one accumulator is
+   live, the survive verdict is two integer compares + a per-proto bitset
+   test on OWNED COPIES of `member_points` (never borrows def memory).
+   Rebuilt at the three region_profit mutation funnels
+   (openRegion/closeRegion/resetRegionProfit; clearCache resets via the
+   third). Any refresh failure ⇒ cache null ⇒ original slow scan, identical
+   semantics — OOM cannot diverge replay. --jit-stats event counters are
+   bit-identical with/without it. Gotchas hit: (a) `zig build
+   -Djit-debug=true` overwrites zig-out with a DEBUG binary — the first
+   "after" timings were 20× garbage until `just release` was re-run (the
+   documented stale-binary trap, again); (b) a hand-built test RegionDef
+   has UNSORTED member_points — the span builder now takes min/max per
+   proto run and the probe checks every span; (c) the frozen pi_leibniz
+   control hash was for a NO-ARGS invocation (bench @bench args=5000000
+   differs) — with matching args all six workloads are byte-identical.
+4. **Final numbers (before → after+e.1):** nsieve N=9 436→396 ms (−9%),
+   N=7 105→99 ms (−6%); `just bench --filter nsieve --reps 7` jit
+   101.0→102.9 ms (noise); full suite: no lune-side flags (str_manip
+   luajit=ERR is the LuaJIT binary failing that bench, unrelated). Gates:
+   `just test` (836) + `-Djit-debug=true` green. Doc 17 §A8 step 7 TICKED;
+   status header updated.
+5. **Honest residuals for A-viii+:** (i) nsieve:14's standalone-trace share
+   fell 10.9%→0.7% at N=7 (wall-neutral today; revisit with churn work);
+   (ii) ~700 `disarmAllLinks`/run at N=7 window churn still forces full
+   chain re-arm cycles; (iii) the flip's win stays modest until the native
+   in-page handoff (§A2.4) removes the per-firing `driveChain` seam —
+   that's where the 94.9% coverage converts to wall-clock.
+
+Remaining: commit (trace.zig + doc 17 + this file), codex post-landing
+review of e.1 (fix findings on own judgment per the standing mandate),
+then A-viii per §A8 step 8.
+
 ## Status 2026-08-12 (LATEST-32) — **A-vii-d + A-vii-d.1 LANDED: edge 4 is ARMED AND FIRING (bridge fused ~25k/run on nsieve). NEXT = commit → codex post-landing review → A-vii-e measurement.**
 
 The flip is live end-to-end. A-vii-d proper (flag flip, `tryArmRegionBridge`
