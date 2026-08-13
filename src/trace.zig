@@ -2288,6 +2288,17 @@ pub const TraceState = struct {
     cycles_traced: u64 = 0,
     cycles_tier0_covered: u64 = 0,
     cycles_tier0_uncovered: u64 = 0,
+    /// Steering-seam time: TSC cycles spent inside the OUTERMOST `replayLedger`
+    /// walk (per-receipt ledger validation + steering), and how many such walks
+    /// ran. The walk executes inside the dispatcher's trace-exec bracket, so this
+    /// is a sub-interval of `cycles_traced` — the report subtracts it to split
+    /// "traced" into native execution proper vs runtime seam (the split perf
+    /// attributes to `replayLedger` self-time vs `[JIT]`). Gated on
+    /// `config.coverage` exactly like every other TSC read; nested walks
+    /// (`replay_walk_depth > 0` at entry) are not re-bracketed, so no
+    /// double-counting. x86_64 only (0 elsewhere).
+    cycles_seam: u64 = 0,
+    seam_walks: u64 = 0,
     /// Total run cycles (TSC), stamped around the whole `Vm.run` (0 if never set:
     /// coverage off, non-x86_64, or a run driven via the `start()`/`exec()` resume
     /// path, which is NOT instrumented — coverage timing assumes the one-shot `run()`
@@ -4468,10 +4479,24 @@ pub const TraceState = struct {
             @panic("replayLedger: ledger length outside [1, LEDGER_CAP]");
         // A-vii-d.1: never inherit a bridge-arm request from a previous ledger.
         self.pending_bridge_arm = null;
+        // Seam timing (diagnostic, `--jit-stats` only): bracket the OUTERMOST walk
+        // so `cycles_seam` splits the traced bucket into native-vs-steering. A
+        // `seam_t0` of 0 doubles as the "not bracketed" sentinel (coverage off,
+        // nested walk, or no TSC on this target — all cases where we skip).
+        const seam_t0: u64 = if (self.config.coverage and self.replay_walk_depth == 0)
+            readCycles()
+        else
+            0;
         // A-vii-d.1: defer any `disarmAllLinks` for the duration of the walk
         // (see `replay_walk_depth`); the driver applies it right after.
         self.replay_walk_depth += 1;
-        defer self.replay_walk_depth -= 1;
+        defer {
+            self.replay_walk_depth -= 1;
+            if (seam_t0 != 0) {
+                self.cycles_seam +|= cycleDelta(readCycles(), seam_t0);
+                self.seam_walks +|= 1;
+            }
+        }
 
         // Running cursors as the graph is walked:
         //   `cont`    — the continuation whose anchor is the coherent resume for a
@@ -10221,6 +10246,12 @@ fn pctOf(x: u64, total: u64) f64 {
     return @as(f64, @floatFromInt(x)) * 100.0 / @as(f64, @floatFromInt(total));
 }
 
+/// Cycles-per-iteration for the stats report; 0 when there were no iterations.
+fn cyclesPerIter(cycles: u64, iters: u64) f64 {
+    if (iters == 0) return 0;
+    return @as(f64, @floatFromInt(cycles)) / @as(f64, @floatFromInt(iters));
+}
+
 /// One per-anchor coverage row, materialized from the `coverage` map for sorted
 /// display (a hashmap has no stable iteration order; the report must be
 /// reproducible — Rule Z-3). Carries both the iteration counts and the cycle
@@ -10304,12 +10335,44 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.print("    covered by a trace:     {d:.1}%   ran as a trace: {d:.1}%\n", .{ pctOf(covered, total), pctOf(traced, total) });
 
     if (has_time) {
+        // The seam is a sub-interval of the traced bracket (`cycles_seam` doc);
+        // clamp so TSC skew can never report negative native time.
+        const c_seam = if (ts.cycles_seam < c_traced) ts.cycles_seam else c_traced;
+        const c_native = c_traced - c_seam;
+        const c_tier0 = c_cov +| c_unc;
         try w.writeAll("  coverage by time (TSC cycles — the honest split):\n");
         try w.print("    traced (ran as trace):  {d:>12}  ({d:.1}% of run)\n", .{ c_traced, pctOf(c_traced, run) });
-        try w.print("    tier-0, has-trace:      {d:>12}  ({d:.1}% of run)   <- fallback despite a trace\n", .{ c_cov, pctOf(c_cov, run) });
-        try w.print("    tier-0, no-trace:       {d:>12}  ({d:.1}% of run)\n", .{ c_unc, pctOf(c_unc, run) });
+        try w.print("      native execution:     {d:>12}  ({d:.1}% of run)\n", .{ c_native, pctOf(c_native, run) });
+        if (ts.seam_walks > 0) {
+            try w.print("      steering seam:        {d:>12}  ({d:.1}% of run)   replayLedger: {d} walks, ~{d} cyc/walk\n", .{
+                c_seam, pctOf(c_seam, run), ts.seam_walks, ts.cycles_seam / ts.seam_walks,
+            });
+        } else {
+            try w.print("      steering seam:        {d:>12}  ({d:.1}% of run)   replayLedger: 0 walks\n", .{ c_seam, pctOf(c_seam, run) });
+        }
+        try w.print("    tier-0 (Vm.exec bodies):{d:>12}  ({d:.1}% of run)\n", .{ c_tier0, pctOf(c_tier0, run) });
+        try w.print("      tier-0, has-trace:    {d:>12}  ({d:.1}% of run)   <- fallback despite a trace\n", .{ c_cov, pctOf(c_cov, run) });
+        try w.print("      tier-0, no-trace:     {d:>12}  ({d:.1}% of run)\n", .{ c_unc, pctOf(c_unc, run) });
         try w.print("    other (non-loop):       {d:>12}  ({d:.1}% of run)\n", .{ c_other, pctOf(c_other, run) });
         try w.print("    run total:              {d:>12}\n", .{run});
+        // Per-iteration / per-entry costs — the numbers that expose transition
+        // amortization (few iters per native entry = the seam dominates) and let
+        // the native c/it be compared against another VM's whole-run c/it without
+        // hand arithmetic.
+        if (traced > 0 or covered_interp +| uncovered > 0) {
+            try w.writeAll("    cycles/iter:           ");
+            if (traced > 0) {
+                try w.print(" traced ~{d:.1} (native ~{d:.1} + seam ~{d:.1})", .{
+                    cyclesPerIter(c_traced, traced), cyclesPerIter(c_native, traced), cyclesPerIter(c_seam, traced),
+                });
+            }
+            const t0_iters = covered_interp +| uncovered;
+            if (t0_iters > 0)
+                try w.print("   tier-0 ~{d:.1}", .{cyclesPerIter(c_tier0, t0_iters)});
+            try w.writeAll("\n");
+            if (traced > 0 and ts.entries > 0)
+                try w.print("    iters/native-entry:     ~{d}\n", .{traced / ts.entries});
+        }
         if (ts.run_nanos > 0) {
             // Wall time pairs with the TSC total to recover the effective clock
             // (cycles/ns = GHz), turning the cycle percentages above into real time.
@@ -10361,16 +10424,17 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         // traced. `run%`/`traced%time` are the ones that expose a hot loop that
         // "has a trace" yet spends its time interpreted. Time cols blank when no TSC.
         try w.writeAll("  per-anchor (loop header):\n");
-        try w.print("    {s:<18}  {s:>11}  {s:>11}  {s:>6}   {s:>6}  {s:>8}\n", .{ "anchor", "traced-it", "interp-it", "trc%it", "run%", "trc%time" });
+        try w.print("    {s:<18}  {s:>11}  {s:>11}  {s:>6}   {s:>6}  {s:>8}  {s:>8}  {s:>8}\n", .{ "anchor", "traced-it", "interp-it", "trc%it", "run%", "trc%time", "trc-c/it", "t0-c/it" });
         for (rows[0..n]) |r| {
             var name_pc_buf: [64]u8 = undefined;
             const label = std.fmt.bufPrint(&name_pc_buf, "{s}:{d}", .{ r.name, r.pc }) catch "?";
             const anchor_cycles = r.traced_cycles +| r.interp_cycles;
             if (has_time) {
-                try w.print("    {s:<18}  {d:>11}  {d:>11}  {d:>5.1}%   {d:>5.1}%  {d:>7.1}%\n", .{
-                    label,                     r.traced,
-                    r.interp,                  pctOf(r.traced, r.traced +| r.interp),
-                    pctOf(anchor_cycles, run), pctOf(r.traced_cycles, anchor_cycles),
+                try w.print("    {s:<18}  {d:>11}  {d:>11}  {d:>5.1}%   {d:>5.1}%  {d:>7.1}%  {d:>8.1}  {d:>8.1}\n", .{
+                    label,                              r.traced,
+                    r.interp,                           pctOf(r.traced, r.traced +| r.interp),
+                    pctOf(anchor_cycles, run),          pctOf(r.traced_cycles, anchor_cycles),
+                    cyclesPerIter(r.traced_cycles, r.traced), cyclesPerIter(r.interp_cycles, r.interp),
                 });
             } else {
                 try w.print("    {s:<18}  {d:>11}  {d:>11}  {d:>5.1}%   {s:>6}  {s:>8}\n", .{
