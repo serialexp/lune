@@ -1,7 +1,7 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
 Status: **all eight §A8 steps are landed as of 2026-08-12** — step 8 (A-viii, outer-cycle disarm coverage) closed the sequence: the outer cycle is pinned as a *simultaneously* armed closed cycle (`native_link_peak >= 3`; nsieve 4) that fires, an open observation window is pinned to contain it (nothing arms, output-transparent, still dispatcher-mediated native entries per R2-4), the **mid-epoch** transition is driven end-to-end through a host-installed native (which measures a live 3-link multi-kind cycle at the window-open instant, its complete teardown, and continued dispatcher-mediated trace entries afterward), and `disarmAllLinks` is pinned exhaustive over all four production edge kinds incl. `.loop_done_linked` and `.region_bridge`. A-viii's first landing was corrected over two codex review rounds — the "mid-epoch window is host-unreachable" claim (false: natives receive the `*Vm`), a fictional unit topology (now four kinds on genuinely distinct physical slot shapes, all armed through `armNativeLink`), an unsound cross-run `entries` comparison, and `entries` being the wrong counter for R2-4 at all (new `native_entries`, bumped only when the dispatcher commits to a native body) — see §A8-iv. One residual, tracked as its own Outstanding bullet: no test observes a live `.region_bridge` link at a window-open instant, since any probe placement that leaves the bridge armed leaves the registry empty at the call — not achieved in this workload, not shown impossible. Earlier: **§A8 step 7 (A-vii, the edge-4 FLIP) COMPLETE 2026-08-12**: landed (A-vii-c/c.1 gate consumption, A-vii-d/d.1 arming + successor overlay + receipt-sited two-phase arm + codex-blocker fix fcee9b7), reviewed (codex BLOCKER→fix→APPROVE), and measured per the frozen A-vii-e protocol — which surfaced and fixed a 2× per-instruction observer overhead (A-vii-e.1 `ObserverFast` bitset fast path; the raw flip regressed nsieve ~2× with the observer scan at 49% of runtime, the bridge itself measured cost-neutral by ablation). Final vs pre-flip: nsieve N=9 −9%, N=7 −6%, nsieve:24 coverage 56.7%→94.9% traced, six-workload output identity + bit-identical stats counters. Remaining in §A8: step 8 (A-viii disarm coverage), then the native in-page handoff (§A2.4) to convert the coverage gain to wall-clock.
-Last updated: 2026-08-13 (**Part S LANDED, SOUND and ARMED + freeze-after-qualify LANDED — the traces fuse and the per-row pricing seam is dead.** The A-viii 108-vs-109 scare briefly had Part S declared unsound; the real bug was `replayLedger`'s terminal arm resuming at a stale `link_pc` when a burst mixed `.link_terminal` rows with a later handoff row — fixed by entry-provenance (`next_via_handoff`, the `entered_via_bridge` precedent generalized). Eligibility hardened: the armed guard's source opcode must be a real conditional branch (`jmp_if_*`; a `for_prep`-sourced zero-trip guard ping-pongs to LEDGER_CAP, measured +128%). The §S.4 "freeze deferred to v2" item shipped as **freeze-after-qualify**: `RegionAccum.frozen` latches after `config.freeze_windows` consecutive useful windows and `replayLedger` prices member→member rows through a direct-credit fast path (per-trace `region_memo_*` membership memo keyed on `region_defs_gen`; any strike unfreezes) — `accountRegionProfit` fell 18.1% → 0.0% of nsieve wall-clock. Recorder frontier also closed: **zero-trip `for_prep` record-through** (`recForPrepLink` decides the direction with tier-0's own value ops; `recForLoop` is polarity-aware, `guard_false` on the continue test), so the third nsieve:14 shape records and compiles. Plus ledger-path `countGuardFailure` charging, `consumeSideTraceWantAtResume` (resume-timed side recording), `max_traces_per_anchor` → config (4), `noteSiblingTerminal` single-slot reject memo, `qualifiedActiveMember` activation cache. Net vs pre-S baseline (min-of-21): nsieve 9/10 −14…−26%, sieve_int −23…−42%, board otherwise within noise; suite green, six-workload hashes identical; nsieve is now 3.6× LuaJIT (was ~5×), sieve_int 2.7×. Earlier framing: **Part S designed and twice-reviewed — native sibling handoff, the Part B mandate.** New burst-terminal telemetry probe reduced the whole 50% nsieve seam to TWO exit sites of one trace. Review round 1 (REJECT) killed the stitch-recording draft with a simplifying finding: a zero-progress pre-effect deopt is coherent at the ANCHOR, so there is no gap to record — the fix is compiling doc 16's coherent-anchor chain into the exit stub. Round 2 (REJECT) pinned six mechanical contracts, all folded in (§S.4); freeze deferred to v2 pending S-b measurement. Ready for S-a. Earlier framing: Burst-terminal telemetry (new permanent jitdbg probe) reduced the whole 50% nsieve seam to TWO exit sites of one trace — same-anchor sibling transitions that the static-proof successor machinery rejects for three independent reasons. §Part S replaces proofs with LuaJIT's real mechanism: exit-anchored stitch recordings that capture the gap as IR and link to the sibling, plus a terminal FROZEN gate state so surviving receipts go unpriced — which dissolves Part T's twice-rejected accounting-reproduction problem instead of answering it. Sequenced S-a…S-e; Part B's literal rel32 patch demoted to a measured remainder. Earlier same day: Part T review round 2 = still REJECT; §T.9 seam profile; bridge-candidate memo landed (nsieve −6.3%, sieve_int −8.9%). Previous: **Part T designed, reviewed BLOCKER, and revised — terminal linkage / commit-once transitions**, new §Part T + Outstanding bullet 3T, sequenced AHEAD of 3B. The first draft was rejected pre-implementation by codex `gpt-5.6-sol` (BLOCKER ×3 + MAJOR ×3) and rewritten: the four-scalar summary became an **overwrite-in-place chain record** carrying the full terminal directive (the walk's `cont` sibling identity, `link_pc` and bridge-adjacency are not projections of the terminal row — getting them wrong corrupts `regs[]`, not just tiering), three distinct counters instead of one conflated `chain_hops`, accounting-equivalent aggregates instead of the false premise that qualified receipts are no-ops, structural intra-region eligibility instead of merely-qualified, and a full shadow-replay differential oracle instead of a four-field projection check. Corrections are recorded inline, not edited away. Post-gate-fix profiling puts 50.1% of nsieve N=9 in the runtime seam against 11.1% in native code: the in-page handoff works and `LEDGER_CAP` never binds, but every hop leaves a ledger row the runtime then walks, re-validates and re-prices — for a qualified region, to recompute "no change." LuaJIT pays that once (`SNAPCOUNT_DONE`, verified in `lj_trace.c:535` / `lj_asm_x86.h:3126`: a patched exit reaches no stub, no `ExitState`, no counter, ever). Part T ports that *semantics*; 3B ports the instruction and is re-scoped to coverage. Earlier: **the region-profit gate FIX** — the A-vii gate was measured condemning its own region through three holes (unclassified exits closing live accumulators; no arm site for a ramp's `.link` terminal; the consumption boundary handing every zero-work member receipt + synthetic steering charge back to the legacy machine, 94k `completed=0` strikes/run re-gating the just-qualified scan anchor), plus one profitability trap (`openRegion` rebuilding the observer bitset on every steady-state no-op re-open, 9.6% of wall — coverage exploded to 91.5% while wall-clock got WORSE until this was fixed). nsieve −19.6%, sieve_int −25.9%, board otherwise within noise, six-workload hashes identical, links now persist for whole sieves (mid-run disarms 703 → 0). Full record in §A8-v, including the profile showing per-receipt accounting is now the bottleneck and the two next levers. Earlier same day: A-vii-e.2 `ObserverHot` inline cache (§A8-iii), A-viii landed + revised per codex review (§A8-iv)).
+Last updated: 2026-08-13b (**Part B landing design written (§Part B — landing design; checklist 3B-cur): post-S burst telemetry puts 92% of remaining walks on ONE `for_prep` zero-trip exit that the hotexit router misroutes (B-1, grounded on a probe build — the side trace records and compiles) and nothing arms (B-2, hotexit-provenance sibling-handoff arm = the patch in slot form). rel32 stays deferred (B-3).** Earlier same day: Part S LANDED, SOUND and ARMED + freeze-after-qualify LANDED — the traces fuse and the per-row pricing seam is dead.** The A-viii 108-vs-109 scare briefly had Part S declared unsound; the real bug was `replayLedger`'s terminal arm resuming at a stale `link_pc` when a burst mixed `.link_terminal` rows with a later handoff row — fixed by entry-provenance (`next_via_handoff`, the `entered_via_bridge` precedent generalized). Eligibility hardened: the armed guard's source opcode must be a real conditional branch (`jmp_if_*`; a `for_prep`-sourced zero-trip guard ping-pongs to LEDGER_CAP, measured +128%). The §S.4 "freeze deferred to v2" item shipped as **freeze-after-qualify**: `RegionAccum.frozen` latches after `config.freeze_windows` consecutive useful windows and `replayLedger` prices member→member rows through a direct-credit fast path (per-trace `region_memo_*` membership memo keyed on `region_defs_gen`; any strike unfreezes) — `accountRegionProfit` fell 18.1% → 0.0% of nsieve wall-clock. Recorder frontier also closed: **zero-trip `for_prep` record-through** (`recForPrepLink` decides the direction with tier-0's own value ops; `recForLoop` is polarity-aware, `guard_false` on the continue test), so the third nsieve:14 shape records and compiles. Plus ledger-path `countGuardFailure` charging, `consumeSideTraceWantAtResume` (resume-timed side recording), `max_traces_per_anchor` → config (4), `noteSiblingTerminal` single-slot reject memo, `qualifiedActiveMember` activation cache. Net vs pre-S baseline (min-of-21): nsieve 9/10 −14…−26%, sieve_int −23…−42%, board otherwise within noise; suite green, six-workload hashes identical; nsieve is now 3.6× LuaJIT (was ~5×), sieve_int 2.7×. Earlier framing: **Part S designed and twice-reviewed — native sibling handoff, the Part B mandate.** New burst-terminal telemetry probe reduced the whole 50% nsieve seam to TWO exit sites of one trace. Review round 1 (REJECT) killed the stitch-recording draft with a simplifying finding: a zero-progress pre-effect deopt is coherent at the ANCHOR, so there is no gap to record — the fix is compiling doc 16's coherent-anchor chain into the exit stub. Round 2 (REJECT) pinned six mechanical contracts, all folded in (§S.4); freeze deferred to v2 pending S-b measurement. Ready for S-a. Earlier framing: Burst-terminal telemetry (new permanent jitdbg probe) reduced the whole 50% nsieve seam to TWO exit sites of one trace — same-anchor sibling transitions that the static-proof successor machinery rejects for three independent reasons. §Part S replaces proofs with LuaJIT's real mechanism: exit-anchored stitch recordings that capture the gap as IR and link to the sibling, plus a terminal FROZEN gate state so surviving receipts go unpriced — which dissolves Part T's twice-rejected accounting-reproduction problem instead of answering it. Sequenced S-a…S-e; Part B's literal rel32 patch demoted to a measured remainder. Earlier same day: Part T review round 2 = still REJECT; §T.9 seam profile; bridge-candidate memo landed (nsieve −6.3%, sieve_int −8.9%). Previous: **Part T designed, reviewed BLOCKER, and revised — terminal linkage / commit-once transitions**, new §Part T + Outstanding bullet 3T, sequenced AHEAD of 3B. The first draft was rejected pre-implementation by codex `gpt-5.6-sol` (BLOCKER ×3 + MAJOR ×3) and rewritten: the four-scalar summary became an **overwrite-in-place chain record** carrying the full terminal directive (the walk's `cont` sibling identity, `link_pc` and bridge-adjacency are not projections of the terminal row — getting them wrong corrupts `regs[]`, not just tiering), three distinct counters instead of one conflated `chain_hops`, accounting-equivalent aggregates instead of the false premise that qualified receipts are no-ops, structural intra-region eligibility instead of merely-qualified, and a full shadow-replay differential oracle instead of a four-field projection check. Corrections are recorded inline, not edited away. Post-gate-fix profiling puts 50.1% of nsieve N=9 in the runtime seam against 11.1% in native code: the in-page handoff works and `LEDGER_CAP` never binds, but every hop leaves a ledger row the runtime then walks, re-validates and re-prices — for a qualified region, to recompute "no change." LuaJIT pays that once (`SNAPCOUNT_DONE`, verified in `lj_trace.c:535` / `lj_asm_x86.h:3126`: a patched exit reaches no stub, no `ExitState`, no counter, ever). Part T ports that *semantics*; 3B ports the instruction and is re-scoped to coverage. Earlier: **the region-profit gate FIX** — the A-vii gate was measured condemning its own region through three holes (unclassified exits closing live accumulators; no arm site for a ramp's `.link` terminal; the consumption boundary handing every zero-work member receipt + synthetic steering charge back to the legacy machine, 94k `completed=0` strikes/run re-gating the just-qualified scan anchor), plus one profitability trap (`openRegion` rebuilding the observer bitset on every steady-state no-op re-open, 9.6% of wall — coverage exploded to 91.5% while wall-clock got WORSE until this was fixed). nsieve −19.6%, sieve_int −25.9%, board otherwise within noise, six-workload hashes identical, links now persist for whole sieves (mid-run disarms 703 → 0). Full record in §A8-v, including the profile showing per-receipt accounting is now the bottleneck and the two next levers. Earlier same day: A-vii-e.2 `ObserverHot` inline cache (§A8-iii), A-viii landed + revised per codex review (§A8-iv)).
 
 Status: partial — A-v (edge-4 bridge stub emission, unarmed/inert) landed 2026-07-24; A-iv (`region_profit` accumulator, inert) landed 2026-07-22; A-iii (`call_seq` plumbing, inert) landed 2026-07-21; Increment 1 (shared mcode arena, P-D), Increment 2.1 (frameless chain-entry ABI, P-A), Increment 2.2 (chain-wide result contract, P-B), Increment 2.3a (indirect exit + link-slot table + P-E registry scaffolding), Increment 2.3b (2.3b-0 inert scaffolding + 2.3b-1 flip arming on), Increment 2.3c-0 (inert contracts a–f + post-review blocker fixes: memory-staged `exit_target`, reserved-cell removal, `final`-first exclusion), Increment 2.3c-1 (M1 half-fusion: arm skip→prime-side ordinary source-branch guard + dispatcher fused-`.link` consumer), Increment 2.3c-2a (per-transition ledger ABI + native emission at all four exit sites + terminal-consistency assert, no accounting change), and Increment 2.3c-2b (route `runLinkedBurst`'s native call-B drain through ledger replay — `runCapturingLedger` + phase-machine `replayContinuationLedger`, ≤2-entry release-enforced, no accounting change) landed; all byte-identical. Direction chosen (faithful port; re-architect lune's native traces toward LuaJIT's frameless shared-arena model). Native trace bodies run frameless under one shared trampoline (`ensureTrampoline`); every native exit stub jumps through a per-exit heap-resident link slot (`jmp qword [&slots[i]]`, default = `shared_exit`) and bakes the final trace's stable id into `NativeResult.final_trace_id`. As of 2.3c-0f/blocker-fix, ordinary/loop-done-ordinary guards route through the shared `deopt_exit` flush, which dispatches the RESOLVED target via the flush-immune `NativeResult.exit_target` memory field (`jmp qword [rdx+exit_target]`) — no reserved slot cell, no rax-staged holder. As of 2.3b-1, `driveChain` ARMS the continuation's `.link`-terminal slot → `inner.linked_entry`, so a native run of the continuation fuses straight into the inner root under the shared frame (no ~600ns Zig re-entry per hop). The dispatcher resolves `final = traceById(final_trace_id)` STRICTLY on the native path (`@panic` on null, no `ct` fallback), and `final != ct` is now expected. `driveChain` drains fused results by resolving each child strictly by `final_trace_id` + `isInnerLoopRoot` shape check (unresolvable/mis-shaped ⇒ `@panic`, no unsafe resume). The P-E backlink registry (`armed_links` + `armNativeLink`/`resetLinksTouching`, reset before `destroy` in `removeTrace`) is now LIVE for `.link` slots AND (2.3c-1) `.ordinary_guard` source-branch slots. As of 2.3c-1, `driveChain` also arms the skip trace's source-branch guard → the prime-side ramp's `ordinary_entry`, and the dispatcher gained a fused top-level `.link` consumer (`fusedSourceBranchLinkSlot` provenance recognizer → `onSideExit(ct, skip_local)` replay → `runLinkedBurst`) so skip→ramp fuses into one native call. Next: Increment 2.3c-2c — persistent loop-done inner→continuation, closing the native cycle. Re-scoped 2026-07-14 after a codex pre-impl BLOCKER + a follow-up APPROVE-WITH-CHANGES review: because a persistently-armed I→C cycle is also entered where no ledger is captured (call A, dispatcher native runs), the safe path is capture-everywhere — a 6-sub-step sequence (2c-A ledger disambiguation ABI → 2c-B forced-yield cap → 2c-C single generic `replayLedger` returning a terminal directive → 2c-D capture at call A + dispatcher with exact M1 parity → 2c-E arm I→C persistently → 2c-F disarm load-bearing test + review). The ledger ABI (2.3c-2a) and the ≤2-entry call-B replay (2.3c-2b) are the foundation; 2c-C/2c-D generalize the drain and 2c-E flips the cycle-closing arm. **As of 2026-07-14, 2c-A through 2c-E have all LANDED byte-identical — the native `continuation↔inner` cycle is CLOSED** (`armLoopDoneLink` at 3 sites incl. the `replayLedger` convergence arm; a native one-trip correctness fix; 5 blocking tests green; nsieve/mandelbrot/nbody/spectral-norm tier-0==tier-1a==native). A permanent compile-gated JIT debug facility (`src/jitdbg.zig`, `-Djit-debug`/`--jit-debug`) replaced the ad-hoc `std.debug.print` scaffolding used through this arc. **2c-F COMPLETE (2026-07-14)** — the two-phase same-VM disarm integration test + negative control + supported cold-re-entry guard landed, and the full codex `gpt-5.6-sol` review of the arc ran: every supported path sound, one rerun blocker raised and resolved by exit-slot hardening (derive-not-trust target + in-page entry validation) plus `Vm.run`/`start` epoch containment (`beginTopLevelEpoch` → `disarmAllLinks`). Increment 2.3c-2c closes; the native continuation↔inner cycle is closed and its lifetime hardened. See §Implementation status → Outstanding for the per-sub-step record. **Increment 3 DESIGN landed 2026-07-17** (pre-impl review pending): re-scoped after a fresh `--jit-stats` profile + a decisive throwaway A/B (disabling the gate lifts nsieve:14 from 5.0%→92.8% traced but moves wall time only ~1%) proved the wall is **per-transition Zig re-entry on the still-open branch-loop region, not codegen or the indirect-slot load**. Two sequenced parts: **3A** arms the one missing edge — `cont(29).composite-guard → skip(14).ordinary_entry` (the mirror of M1/2.3c-1) — closing `skip→ramp→inner→cont→skip` as one `LEDGER_CAP`-bounded native region so `onSideExit(nsieve:14, …)` clears ≥ `min_useful` and the anchor never gates; **3B** is the faithful `lj_asm_patchexit` rel32 port + the in-place-patch P-E hardening, measure-gated. Four blocking review questions on 3A (edge-4 header coherence, the composite-back-edge no-yield safe-point hole, `safe_to_arm`/disarm coverage of the new cycle, P-EBP accounting parity). **codex `gpt-5.6-sol` pre-impl review (2026-07-17) = BLOCKER**: two Part-A claims unsound — (1) edge-4 coherence (cont's composite guard is coherent at cont's anchor, not skip's header → needs its own materialization contract, not `.ordinary_guard` reuse); (2) the "summed composite count → never gates" mechanism is retracted (`replayLedger` bills per-segment local deltas; the M1 grammar is same-anchor-only and panics on an `rbx`-advancing successor). Gate-clear now hinges on a Bart fork: (a) per-segment accounting + armed entry bypassing `isGated`, then measure; or (b) region-level accounting as a P-EBP-2 redesign. Part B: "co-location ⇒ rel32 reaches" is false (arena defers cross-region reachability), a raw rel32 bypasses the forced-yield cap, ordinary guards lack a per-exit patch point, discovery needs a cross-anchor PC map. Antigravity (gemini-3.1-pro) review = confirms both blockers + adds option (c) exempt-armed + a mid-burst-gate correction + a "fix trace selection" reframe. **RESOLVED 2026-07-17 (Bart):** trace-selection investigated and RULED OUT — doc 15 + the recorder (`recForPrepLink` LINNER) + `luajit -jdump=t` on the same nsieve (3 self-loop roots + 8 side traces patched into roots) all show lune fragments **byte-for-byte identically to LuaJIT**, so "record as one trace" is the exact thing both tried-and-rejected; arming/patching (Increment 3) is confirmed the LuaJIT-faithful path. **Part A design of record** (§Part A (RESOLVED)): edge-4 gets its own bridge/materialization (`asm_head_side`-style, commits cont's outer-back-edge phis — NOT `.ordinary_guard` reuse) + **gate strategy B (region-level accounting)** chosen over (c) exempt-armed (B measures the right unit, correct regardless of transition cost, retains cold-region retirement; C is "trust arming ⇒ profitable", valid only post-patching + needs a separate flush). New cross-anchor replay grammar + region-membership map. `min_useful` retune is a Part-B-landing obligation; B→C hybrid for proven regions is a measure-gated future opt. See §Increment 3 → Review outcome + §Part A (RESOLVED). **ROUND-3 DESIGN WRITTEN 2026-07-17** (§Part A — round-3 design): all nine round-2 blocker items now have concrete code-grounded contracts — bridge dominance snapshot (filtered by `update_index < 23` + successor-liveness) via `flushSlot`/`placeOfRef`, enter `skip.ordinary_entry` (guard re-run resolves the invariant-bypass hazard), `inputs.len==0`, an **in-page bridge stub** (parallel to `linked_loop_done_labels`, lifetime covered by the existing registry for free) + `ArmKind.region_bridge`; `onSideExit` split into `accountTraceRun` (per-segment, preserves `hit_count` selection) vs `accountRegionProfit` (penalty/gate, a lone trace = degenerate 1-member region → identical to today), normalized outer-traversal unit, identity `RegionKey` owned by `AnchorKey(proto,14)`, one persistent accumulator on **logical** (not physical `LEDGER_CAP`/hop) windows with GC-safepoint exclusion; additive `.region_bridge` ledger arm that leaves the same-anchor `.deopt` provenance (3098)/zero-progress (2159) invariants intact. Reframe correction: an armed ordinary guard is already a native in-page handoff (edge 4 is the *only* per-iteration Zig re-entry), and edge 4's coherence gap is exact (cont's `count+1`/`next i` dominate `%023` but their phi writebacks are post-guard, so the shared `deopt_exit` flush commits stale values). **ROUND-3 REVIEW (codex `gpt-5.6-sol` + Antigravity) = BLOCKER (both)** — sound sub-parts confirmed (A.1.1–1.3, A.2.1–2.3, A.3); 9 converging fixes for a **round-4 pass** (§Review outcome — round 3): B-1 forced-yield must cap-check-first→ordinary-deopt (commit-then-yield breaks the terminal-consistency assert + replay); B-2 unarmed stub must stage `exit_target`; B-3 the compile-time bridge classifier is temporally impossible (native lowering has no region map; pages memoized) → an emission-strategy fork (precompute / generic stubs / recompile) = Bart's call; B-4 the logical-window accumulator must be a persistent VM-level region table (NOT trace state, NOT flushed on GC-physical retirement) with stack-depth-gated region-exit + tier-independent membership; B-5..B-9 smaller precisions. No code until round-4 is clean. **ROUND-4 DESIGN WRITTEN 2026-07-17** (§Part A — round-4 design): all nine resolved — Bart's B-3 fork = **(b) generic stubs, armed later** (trace-local bridge stub at every composite guard, no region map at lowering); cap-check-FIRST then commit, reusing the `ordinary_mini` path for both unarmed and ledger-full (B-1/B-2, byte-identical when unarmed); a **persistent VM-level region table** (proto/VM lifetime, NOT trace state, NOT flushed on retirement) with a stack-depth-gated region-exit + activation-keyed `RegionKey` + logical window `N = min_useful` (B-4); a tier-independent `(proto, exit_pc)` classifier at all three accounting sites (B-6); successor live-in ∪ live-through set (B-5); replay-owned resume PC via the edge map (B-7); synthesized `completed` preserved in `accountTraceRun` (B-8); stub-free/map-explicit split lifetimes (B-9). **ROUND-4 REVIEW (codex `gpt-5.6-sol` + Antigravity) = BLOCKER (both)** — direction reconfirmed sound, most of B-1..B-9 resolved; five converging round-5 must-fixes (D-1..D-5) unified by "the LOGICAL region layer persists at Proto/VM lifetime + is identity/edge-keyed; only the PHYSICAL armed-edge slot layer is retirement-cleaned": D-1 cap-check reserve-2-cells off-by-one (`>= CAP-1`); D-2 compile-time set E vs arm-time set S (drop `final_trace_id`, child `inputs.len==0` is arm-time); D-3 accounting-state (window `+=N`, identity `region_id`, no invented `FrameId`, membership from the recorded trace graph in every tier); D-4 classifier keyed `(trace_id, exit_instr)` + split at every `onSideExit` site; D-5 ‡ logical map never retirement-cleaned. One scope fork (D-3c recursion handling) = Bart's call. See §Review outcome — round 4. No code until round-5 is clean. **ROUND-5 DESIGN WRITTEN 2026-07-17** (§Part A — round-5 design): all resolved with Bart's D-3c = **(β) build activation discrimination** (deterministic per-VM monotonic `call_seq` on `CallFrame`, gc_stress-invariant); D-1 two-cell cap reservation + unreachable-`CAP` invariant; D-2 compile-time set E vs arm-time set S (drop `final_trace_id`, child `inputs.len==0` at arm time); D-3 three-map split + identity `RegionId` + window `+= N` + `call_seq` activation identity + discovery from the trace graph in every tier; D-4 `(trace_id, exit_instr)` classifier + split at every site; D-5 logical maps Proto/VM-owned, only `armed_links` retirement-cleaned; D-6 precisions. **ROUND-5 REVIEW (codex `gpt-5.6-sol` + Antigravity) = BLOCKER (both)** — edge-4 bridge (D-1/D-2/D-6) now SOUND; surviving blockers are integration surfaces (E-1..E-7): E-1 `RegionDef` keyed by ephemeral `Trace.id` (need stable structural edge id); E-2 `call_seq` can't be a physical `CallFrame` counter under trace inlining; E-3 classifier key absent at synthetic scalar `onSideExit` sites; E-4 overlapping-PC region exit; E-5 keyframe schema v4→v5; E-6 coroutine thread-scoped depth; E-7 error-unwind cleanup. The review re-weights D-3c=β (E-2 + `call_seq` half of E-5 are β-only; α avoids them) — **α/β RE-CALL surfaced to Bart** before round 6. See §Review outcome — round 5. **ROUND-6 DESIGN WRITTEN 2026-07-17** (§Part A — round-6 design), preceded by three parallel tree-grounding sweeps (trace inlining+deopt / keyframe schema / coroutine+error-unwind): all E-1..E-7 resolved, with **one reshaping insight ‡** — `region_profit` + `call_seq` are **transient JIT-tiering state, NOT replay-serialized** (same category as the trace cache / `safepoint_seq` / `effect_cursor`, none of which ride the keyframe), because they steer only *which tier* runs and never *what it computes* (native ≡ tier-0). That **collapses E-5 to no schema bump** (keyframe stays v4; reset-on-restore, which is the reviewers' own "logical region reset" alternative made rigorous — strictly safer for `encodeSnapshot∘restore==identity`) and **collapses E-2** (the activation key is the *anchor* frame's `call_seq`, assigned in tier-0 at `pushFrameVararg` `interp.zig:1346` before tier-up and never mutated on-trace since inlined callees push no physical frame — tier-invariant, no new IR op, no loop-carried commit discipline). E-1 stable `StructuralEdgeId{anchor_proto_id,anchor_pc,exit_pc,succ_anchor_pc}` + ephemeral `(Trace.id,exit_instr)` cache; E-3 optional `?ExitKey` (synthetic sites region-neutral); E-4 identity-transition exit under PC overlap; E-6 no coroutines exist (host-reentrancy `native_reentry_depth` handled instead); E-7 two teardown hooks (`.ret`/`.halt` pop + `protectedCall` `entry_depth` restore), `__gc` moot (finalizer-free GC). β fully preserved (one `u64` on `CallFrame` + one choke-point bump). **E-5 deviation from the round-5 v4→v5 resolution is flagged in-doc for Bart + round-6 reviewers to veto.** **ROUND-6 REVIEW (codex `gpt-5.6-sol` + Antigravity) 2026-07-17 = reshaping insight SURVIVES / BLOCKER on restore path.** codex confirms it directly ("a v4→v5 schema bump is not inherently required") → **the E-5 deviation is VINDICATED, keyframe stays v4**; Antigravity returned UNSOUND but its sharpest counterexamples (address-dependent `pairs()`, side-exit callee-frame reconstruction, `__gc` finalizers, background compilation) are all defused by lune facts codex verified (id-monotonic address-independent iteration, resume-at-loop-header deopt, finalizer-free GC, synchronous compilation). Surviving round-7 items (F-1..F-8): F-1 ‡ `StructuralEdgeId` can collide (multiple guards share `cur_pc`) → needs a stable guard-ordinal/role discriminator; **F-2 ‡ restore is a physical-frame construction path** (`keyframeser.zig:671`) → "reset call_seq=0" is WRONG, must **re-key each restored live frame with a fresh transient `call_seq` by frame order** (still no wire field, v4 holds); F-3 exact-current-frame (`frames[depth-1]`) invariant, not proto-match + `next_call_seq` exhaustion contract; F-4 JIT/VM share the allocator → post-restore tiering divergence could OOM one timeline (fork: exclude/isolate/fail-closed); F-5 current F2c harness is tier-0-only → owe a native-F2c test; F-6 E-6 exit-test polarity was backwards (`current_depth <= captured_anchor_depth`); F-7 host-abort boundary (non-catchable faults don't guarantee VM teardown; fork) + centralize cleanup with `protectedCall`'s 3-site depth restore; F-8 ground (not assert) that tier-dependent `safepoint_seq` can't perturb effect-log cuts. Both reviewers agree the layering is right; the work is restore-path precision. Two forks (F-4, F-7) for Bart. No code until round-7 clean. **ROUND-7 DESIGN WRITTEN 2026-07-17** (§Part A — round-7 design), grounded in two more tree sweeps (allocator arch; effect-log drivers): F-1..F-8 all resolved and **both forks collapsed** — F-4 (mcode is a separate `mmap`, `gpa` unbounded by default → OOM-divergence is pre-existing to native tiering and outside replay equivalence; JIT-allocator isolation flagged as optional Bart tightening) and F-7 (monotonic `call_seq` keys ⇒ no correctness hazard; extend the existing `beginTopLevelEpoch` to clear `region_profit` + the existing cap). F-2 ‡ restore re-keys each live frame `call_seq=i` by index (keyframe stays **v4**, no wire field); F-1 structural key gains a recording-stable `exit_ordinal`; F-3 exact-`frames[depth-1]` + exhaustion contract; F-5 native-F2c test obligation; F-6 exit polarity fixed; F-8 grounded non-issue (effect log logical-order-keyed/tier-independent). **ROUND-7 REVIEW (codex `gpt-5.6-sol` + Antigravity) = BLOCKER (both) — two deep new findings on the JIT↔snapshot boundary.** F-3/F-4/F-5/F-6 resolved (F-4 reworded: replay-equivalence is conditional on no allocator/mcode exhaustion). Surviving/new (G-n): **G-1 ‡** `exit_ordinal` by IR position is NOT re-recording-stable (recording is guest-value-dependent — `guardNum` int/float, array-guard variance, guard elision/LICM) AND `guardExitPc` (`trace.zig:451`) can't supply `exit_pc` for array/table/grid guards at all → need a canonical guest-logical guard identity carried as new IR metadata; **G-2 ‡ (the deep one, CONFIRMED against the tree)** the transient trace cache roots heap objects INTO the serialized snapshot — `keyframeser.zig:265` seeds its walk from the shared `forEachRootHeader`, whose item 5 roots trace/recording consts (which may be the sole ref to an otherwise-dead heap object) → a tiering-dependent `region_profit` history can change snapshot bytes (latent only because the F2c harness is tier-0-only) → need JIT-independent snapshot reachability; **G-3** a bounded/LRU cap can evict LIVE activation accounting + no enforced clean-entry rule; **G-4** a native F2c cut selected by safepoint count is tier-dependent → define the cut by a tier-independent logical event; **G-5** Antigravity's coroutine cross-stack re-key collision (grounded N/A — lune has a single physical stack; invariant pinned). **ROUND-8 DESIGN WRITTEN 2026-07-17** (§Part A — round-8 design): G-1 replaces the IR-position ordinal with a guest-logical `GuardProvenance{source_proto_id,source_pc,inline_depth,role,operand,occurrence}` tag stamped at emission for ALL guard kinds (an IR extension); **G-2 splits `forEachRootHeader` into `{gc, snapshot}` kinds — trace/recording consts are GC-liveness roots only, excluded from the snapshot semantic-root walk**, with a case-1/case-2 proof (every trace const is either semantic-reachable ⇒ unchanged, or trace-only-and-semantically-dead ⇒ correctly dropped because deopt recomputes it at the loop header) — the general fix, making ALL snapshotting JIT-independent by construction; G-3 makes activation-scoped cleanup MANDATORY (entry lifetime = activation lifetime ⇒ cap can never evict live) + unconditional `beginTopLevelEpoch` region-clear; G-4 tier-independent logical cut + effect-cursor assertion; G-5 single-stack re-key invariant pinned. Keyframe stays **v4**. Two new impl obligations: the `GuardProvenance` IR extension + the `{gc,snapshot}` root-walk split. **ROUND-8 REVIEW (codex `gpt-5.6-sol` + Antigravity) = BLOCKER (both) — a FOUNDATIONAL finding, both reviewers built the SAME counterexample.** **H-2 ‡‡ (escalated to Bart):** the `{gc,snapshot}` split is necessary but NOT sufficient — dropping a **trace-only interned** const changes the observable heap-**id** timeline (uninterrupted VM re-finds the interned obj → same id; restored VM re-allocates → different id), and ids are semantic (equality `value.zig:197`, table hash `table.zig:545`, `pairs` order `key_order.zig:21`, `tostring` `io.zig:166`); `next_obj_id` is unserialized (`keyframeser.zig:521`) and the F2c test already only supports programs with no discarded pre-cut objects (`keyframeser.zig:1755`). This is **broader than Increment 3** and likely **forces serializing `next_obj_id` → keyframe schema bump, reversing the reshaping insight** — OR restricting when snapshots may be cut. Mechanics blockers survive: **H-1** `GuardProvenance` collides (`inline_depth` ≠ call-path; `source_pc` is post-increment resume-PC; derived-value guards under-defined → need per-opcode `GuardSite` vocab + inline call-site path); **H-3** cap-eviction bound unproven + `beginTopLevelEpoch` clean-entry not enforced; **H-4** only "after Nth committed effect" cut is implementable (native overshoots iterations). **G-5 RESOLVED.** **H-2 escalated to Bart for a scope/architecture call before round 9; no code.**
 Owner: Bart
@@ -889,7 +889,32 @@ awaits Bart.
   one `chain_hops` conflates three bounds; "qualified receipts are no-ops" is false).
   Corrections are recorded inline in §T.3/T.4/T.6/T.7/T.8 rather than edited away.
   Open questions in §Part T.8.
-- [ ] **3B — Faithful `lj_asm_patchexit` port + in-place-patch P-E. [BLOCKER — depends
+- [ ] **3B-cur — Part B landing design (2026-08-13): hotexit-provenance side-trace
+  arming — the CURRENT Part B plan, superseding the rel32-first framing below for
+  sequencing.** See §Part B — landing design. Post-S telemetry: 92% of walks are ONE
+  exit (t=4 ei=18, `for_prep` zero-trip guard) that can never tier up because the
+  hotexit router misroutes it (prime-side want, population-capped). Two steps:
+  - [ ] **B-1 — hotexit routing fix.** `noteTakenExit` routes on the POSITIVE branch
+    property (`jmp_if_*` source), mirroring `siblingHandoffEligible`'s hardening;
+    zero-trip guards feed the generic side want. Grounded on a probe build: the want
+    fires, the resume-timed recording commits exactly the skip trace (self-loop,
+    native 1,271 B) — and telemetry does NOT move (dispatcher selects only at
+    back-edge arrival), so B-1 alone is the substrate, not the win.
+  - [ ] **B-2 — provenance arm (the patch, slot form). [round-1 review = REJECT on the
+    first framing; REVISED to the `ProvenanceEdge` model, §B.5]** A persistent
+    `ProvenanceEdge {parent_id, exit, child_id}` relation created at side-trace commit
+    (side_src captured pre-clear, post-registration, never on abort) + a disposable
+    physical arm re-published at the dispatcher safe point through a SHARED
+    `publishSiblingArm` helper (arm + `sibling_arms` + watch reset — Part S refactors
+    onto it). Survives observation windows/child recompile (retry, never clear on
+    "not compiled yet"); deleted on condemnation / unresolvable ids /
+    zero-progress-cycle strikes (`max_edge_strikes`, receipt-stream-pure, pinned
+    test). `local > 0` handoff rows pinned to non-final `.deopt` accounting + grammar
+    tests. Lands as B-2a (substrate + helper refactor, flip OFF, byte-identical) then
+    B-2b (the flip, measured). Expected: dispatcher entries ÷~7 at nsieve N=9.
+  - [ ] **B-3 — rel32 in-place patch: deferred, measure after B-2** (S.8 stands).
+- [ ] **3B — Faithful `lj_asm_patchexit` port + in-place-patch P-E. [historical
+  framing; B-3 territory now — depends
   on 3A + new patch contracts; and now sequenced AFTER 3T, whose measurement shows 3B's
   own stated target — the `jmp [slot]` load — is worth 1–2 cycles against a ~200 ns
   seam. 3B's real value is coverage: patching hot deopt exits into side traces, which
@@ -2299,6 +2324,287 @@ sub-step; a step that does not move wall stops the arc for re-profiling.
   per transition; measure after S-d.
 - **Freeze v2** (per round-2 change 5) and whether `driveChain`'s runtime chaining
   shrinks once the native handoff covers its hot cases.
+
+#### Part B — landing design (2026-08-13): hotexit-provenance side-trace arming (the patch, slot form)
+
+This is S-d's outcome, grounded live on the tree at 8527b1f (seam round 2). It
+supersedes the "rel32 remainder" framing: the remaining seam is not the slot
+load, it is that the dominant burst terminal has **no side trace to patch to and
+no way to ever get one** — a hotexit routing defect — and that even with the
+side trace recorded, nothing arms the exit to it. Two steps, each general
+(Rule Z-6: both are classification/arming corrections that apply to any
+zero-trip-guard workload, nsieve is just the instrument).
+
+##### B.0 — The measurement that scopes it (burst telemetry, post-Part-S, N=9)
+
+```
+burst stats: 330,204 dispatcher bursts
+  burst-len  2: 304,168      burst-len 32: 25,980     (56 others)
+  terminal t=4 ei=18 kind=deopt outcome=normal: 304,168
+  terminal t=4 ei=23 kind=link_terminal outcome=yielded: 25,979
+```
+
+92% of all walks are one exit site: t=4 (the pc=14 prime-found continuation,
+`.link → 24`) failing ei=18 = `guard_true` over `le i+i, m` — `recForPrepLink`'s
+zero-trip bounds guard. Semantics: prime found but `k = 2i > m`, so the mark
+loop is skipped, the outer `for_loop` advances `i`, and control lands back at
+pc=14. That path is taken for **every prime in the upper half of the range**
+(`i > m/2`). The 32-row yields are the healthy fused cycle hitting `LEDGER_CAP`.
+
+##### B.1 — Root cause: the hotexit router misclassifies zero-trip guards
+
+`noteTakenExit` routes on `isSourceBranchGuardExit`, which only *excludes*
+`for_loop`-sourced guards — a `for_prep`-sourced zero-trip check passes it and
+is routed to the **prime-side** want, where `anchorPopulation >= 2` (scan +
+continuation already exist) refuses forever. The generic side-trace route
+(`completed == 0`, cap `max_traces_per_anchor = 4`) never gets a chance: 304k
+receipts/run accrue zero hotness. `siblingHandoffEligible` was already hardened
+against this exact misclassification (its +128% ping-pong comment); the router
+was not. A zero-trip guard's alternate path is **new code** (skip the loop
+body), i.e. side-trace territory — not a branch alternation between existing
+siblings.
+
+**B-1 (the fix): route on the positive branch property** — the guard's source
+opcode is a real conditional branch (`jmp_if_false/true/not_nil`), the same
+test `siblingHandoffEligible` uses. Everything else with `completed == 0`
+feeds the generic side want.
+
+**Grounded (probe build):** with B-1 applied, `hotexit: trace id=4 exit=18 →
+want side at pc=14` fires, `consumeSideTraceWantAtResume` arms the replay-side
+recording at the resume, and the recording commits exactly the desired third
+sibling at pc=14 — `guard_true p[i]` → `k=i+i` → `guard_false k≤m` →
+`count+=1` → `i+=step` → `loop` (a self-loop over consecutive too-big primes;
+compiles to 1,271 B of x86-64). **And the telemetry does not move**: 304,168
+ei=18 terminals remain, because the dispatcher only selects traces at
+back-edge arrival, by which time tier-0 has already executed the skip path and
+the (prime ∧ too-big) entry state is gone. The recorded trace is the thing to
+patch to; B-1 alone patches nothing.
+
+##### B.2 — The patch: arm the exit to its provenance child
+
+LuaJIT's model: the side trace compiled for `(parent, exitno)` is patched into
+that exact exit (`lj_asm_patchexit`), and the parent snapshot is marked
+`SNAPCOUNT_DONE`. lune already has both halves of the bookkeeping — the
+recording carries `rec.side_src = {parent_trace_id, exit_instr}` (hotexit
+provenance, used today only to DONE-latch `exit_counts` at commit), and the
+Part-S sibling-handoff slot machinery is the in-slot form of the patch. What is
+missing is the arm itself:
+
+**B-2: at side-trace commit with `rec.side_src = (parent, exit)`, request a
+provenance arm `{parent_id, exit_instr, child_id}`; drain it at the
+dispatcher's existing safe point (alongside `drainPendingBridgeArm`), arming
+`ArmKind.sibling_handoff` on `parent.slot[exit] → child.ordinary_entry`.**
+
+Eligibility at drain — the existing sibling-handoff predicate set **minus the
+branch-positivity rule, which the provenance replaces**:
+
+- `exitIsPreEffect(parent, exit)` — the §S.4 anchor-coherence proof, reviewed
+  sound at any iteration count (back-edge rotation + deopt flush);
+- same anchor (`child.anchor == parent.anchor`), `child.inputs.len == 0`,
+  child native-compiled, slot exists, `!isBridgeCandidate(parent, exit)`,
+  `!isLoopDoneGuardIndex(parent, exit)` (a `for_prep` guard is not one — the
+  `.loop_done_linked` namespace is untouched);
+- `safe_to_arm` at the drain (pending survives an observation window, same as
+  the bridge arm); parent/child resolved by id, fail-soft if either retired.
+
+**Why the ping-pong hazard does not apply.** The branch-only rule exists
+because arming an *arbitrary existing* sibling at a non-branch guard says
+nothing about which path holds — the sibling re-fails its own guard and the
+pair spins to the cap (+128% measured). The provenance child is different by
+construction: it was recorded from **this exit's own resume state**, so its
+entry guards pass on exactly the state that fails the parent's exit. If the
+state ever drifts, `prologue_fail` is state-safe (P-G) and the runtime
+services the receipt as today — one extra modeled ledger row
+(`[parent.deopt, child.prologue_fail]` is an existing grammar), not a spin.
+
+**Ledger/replay: no new productions.** The armed edge is a
+`LedgerKind.sibling_handoff` row exactly as Part S defined it (`.deferred`
+region destination, `region_work = local`, selection accounting via
+`accountLedgerRow`); the replay grammar, forced-yield cap, and P-E registry
+(`armNativeLink`/`resetLinksTouching`) apply unchanged.
+
+**Determinism.** Commit instants are deterministic; the pending request is a
+pure function of the receipt stream (the same class as the bridge arm and the
+Part-S pending); the DONE-latch at commit already stops further counting on
+the patched exit. Keyframe restore starts unarmed (epoch disarm) as today.
+
+**Expected effect (pre-registered).** The dominant transition chain becomes
+scan →(M1) cont →(B-2 handoff) skip-trace →(its `p[i]` branch guard, Part-S
+eligible) scan — fully native until `LEDGER_CAP`. Dispatcher entries at N=9
+should fall from ~330k toward the cap-bounded ~45k ((304k×2 + 26k×32) / 32);
+the seam bucket and the tier-0 turnstile shrink with them. Measured per the
+frozen protocol: burst telemetry + `--jit-stats` buckets + interleaved
+min-of-21 wall on nsieve 3/7/9, nsieve-bit, sieve_int + the full board.
+
+##### B.3 — Landing plan
+
+- **B-1 — hotexit routing fix.** Positive `jmp_if_*` test in `noteTakenExit`.
+  Gates: `just test` both builds, seven hashes, aviii/floatlink repros.
+  Selection changes (a new trace records) ⇒ NOT byte-identical by
+  construction; hash gate is the oracle that output equivalence holds.
+- **B-2 — provenance arm.** Pending request at commit + drain + arm; the
+  eligibility list above; a test that the armed chain replays (grammar) and a
+  negative control (no arm without provenance; no arm when ineligible).
+  Measure everything; stopping rule unchanged.
+- **B-3 — rel32 in-place patch of the slot load: still deferred** (S.8
+  stands — one L1 load per transition, measure after B-2).
+
+##### B.4 — Review round 1 (codex `gpt-5.6-sol`, 2026-08-13): REJECT — two blockers, four majors; B-1 approved
+
+B-1 was approved outright (no non-`jmp_if_*` source class should remain
+prime-side; numeric `for_loop` is already excluded at call sites, generic
+`tfor_loop` is unrecordable; `.jmp_if_not_nil` is future-facing — the recorder
+does not currently reach it). The B-2 findings, kept verbatim-in-spirit
+(§S-style: corrections recorded, not edited away):
+
+1. **[BLOCKER] Missing `sibling_arms` bookkeeping.** `armNativeLink` alone
+   writes only slot + registry; replay fast-rejects handoff recognition when
+   `parent.sibling_arms == 0` (trace.zig:2506) and would fall into M1
+   validation, where a `for_prep` guard **panics**. Any B-2 arm must go
+   through a single shared publish helper (arm + `sibling_arms` increment +
+   watch/reject reset + counters) used by Part S and B-2 alike.
+2. **[BLOCKER] DONE + disarm makes the arm one-shot-and-lost.** Commit
+   DONE-latches the exit (noteTakenExit returns immediately forever);
+   observation windows / region invalidation / epoch resets erase every
+   physical link; Part S can rediscover branch arms via its terminal watch but
+   the non-branch provenance exit cannot re-qualify — the first
+   `disarmAllLinks` permanently loses B-2 coverage. → the **`ProvenanceEdge`
+   model** below.
+3. **[MAJOR] Drain not viable for a freshly committed child**: the dispatcher
+   arms before lazy native compilation, and `armNativeLink` rejects an
+   uncompiled child (trace.zig:7471). Pending must SURVIVE "not compiled yet"
+   and retry; clearing on first failure makes B-2 inert.
+4. **[MAJOR] The ping-pong argument was too strong.** `prologue_fail` is safe
+   and terminal — but a state that PASSES the child's prologue can fail an
+   *internal* child branch guard that has a Part-S handoff BACK to the parent:
+   `parent(non-branch, local=0) → child(branch, local=0) → parent → …` spins
+   to `LEDGER_CAP` per burst, and legacy gating does not disarm links. B-2
+   needs an explicit zero-progress-cycle retirement rule + pinned test.
+5. **[MAJOR] B.2's grammar wording was wrong.** There is no
+   `LedgerKind.sibling_handoff` — the physical row is `.deopt`, handoff status
+   is REGISTRY-derived (`hasArmedSiblingHandoff`, trace.zig:4702); the landed
+   production assumes `local == 0` and calls `accountTraceRun`, not
+   `accountLedgerRow`. B-2 (which can fire after `completed > 0`) must pin
+   `local > 0` behaviour explicitly and test it. (The register-coherence half
+   is fine: the review confirmed pre-effect exits are anchor-coherent at any
+   iteration count — zero-progress in Part-S discovery is a
+   progress/selection restriction, not a coherence requirement. And no
+   replay-side validation requires the armed exit to be branch-sourced —
+   recognition is by exact armed-link record only.)
+6. **[MAJOR] Pending/disarm ordering needs distinct policies** (condemnation
+   vs observation), and **[MINOR]** the design's "like the bridge arm" claim
+   was wrong — `drainPendingBridgeArm` clears before checking `safe_to_arm`;
+   Part S's pending is the one that survives. Also: capture `rec.side_src`
+   BEFORE the commit-site clear (trace.zig:8428); publish only after the child
+   is registered in cache + id lookup; never on abort/commit failure.
+
+##### B.5 — Revised B-2: the `ProvenanceEdge` relation + disposable physical arm
+
+The committed fact and the physical optimization are separated:
+
+- **`ProvenanceEdge {parent_id, exit_instr, child_id}`** — a persistent,
+  deterministic relation created at side-trace commit (side_src captured
+  before the clear; only after the child is fully registered; never on
+  abort). It survives every physical disarm. Storage: a small list/map on
+  `TraceState`; entries deleted only by (a) parent-anchor **condemnation**
+  (gate/region strike teardown — no blind re-arm after a conservative
+  teardown), (b) either id failing to resolve at drain (retire fail-soft), or
+  (c) the zero-progress-cycle retirement below.
+- **The physical arm is a cache of the edge.** At the dispatcher safe point
+  (after `applyPendingDisarms`, ordered per the review: disarms → cancel
+  condemned edges → compile check → revalidate predicates → publish), any
+  edge whose parent slot is unarmed is re-published through the **shared
+  helper `publishSiblingArm(parent, exit, child)`** (blocker 1: armNativeLink
+  + `sibling_arms` increment + watch/reject reset + counters — Part S's
+  `tryArmSiblingHandoff` refactors onto the same helper). Child not yet
+  native-compiled → edge stays, retry next drain (major 3). Observation-only
+  `safe_to_arm == false` → physical links go, edges stay, re-published when
+  the window closes (Part-S pending semantics, blocker 2 resolved).
+- **Predicates at every publish** (not just creation): `exitIsPreEffect`,
+  same anchor, `child.inputs.len == 0`, child native, slot exists,
+  `!isBridgeCandidate`, `!isLoopDoneGuardIndex`, slot not already armed.
+- **Zero-progress-cycle retirement (major 4).** Each edge carries a small
+  strike counter, a pure function of the receipt stream: when a serviced
+  burst's ledger shows the edge's `parent.exit → child` row with
+  `local == 0` AND the burst made zero cumulative progress through the
+  alternation (the walk already computes per-row locals), the edge takes a
+  strike; any productive service resets it. At `max_edge_strikes` (small,
+  e.g. 3) the edge is DELETED and the slot disarmed — the exit is DONE, so
+  the pair returns to today's walk behaviour permanently. Pinned test:
+  a hand-built parent/child pair that alternates without progress retires the
+  edge within the bound; a productive pair never does.
+- **`local > 0` grammar/accounting (major 5).** The handoff row stays
+  physical `.deopt`, registry-recognized; the production's `local == 0`
+  restriction is relaxed for provenance-armed rows with accounting pinned to
+  the existing non-final `.deopt` treatment (`accountTraceRun(owner, local)`;
+  region receipt `.deferred` + `region_work = local`). Tests enumerate:
+  `[parent.deopt(local>0), child.prologue_fail]`, `[…, child.deopt]`,
+  `[…, child.link_terminal, …]`, and forced-yield after such a handoff.
+
+Landing order: **B-2a** — `ProvenanceEdge` substrate + shared publish helper,
+with Part S refactored onto the helper and the flip OFF (byte-identical);
+**B-2b** — the flip: edge creation at commit + drain publication + `local>0`
+grammar relaxation + cycle-retirement, measured per the frozen protocol.
+
+##### B.6 — Review round 2 (codex `gpt-5.6-sol`, 2026-08-13): APPROVE WITH CHANGES — the pinned lifecycle
+
+No remaining blocker. Two MAJORs + one MINOR pinned here as the implementation
+contract:
+
+1. **Condemnation is EVENT-level, never inferred from `isGated`** (gates are
+   temporary and arise from unrelated causes — legacy thrash, native-
+   unsupported, recording aborts — and useful work later clears them; a
+   drain-time gate check could permanently delete a healthy edge). Explicit
+   wrappers, with relation deletion immediate at the source while physical
+   registry mutation stays replay-deferred:
+   - observation/suspend window (interp.zig:2828): physical links only,
+     **preserve every edge**;
+   - fresh epoch / cache clear: **clear all edges** with the cache;
+   - region low-yield gate (flushRegionWindow strike → `gateAnchor` +
+     `disarmAllLinks`): **delete edges whose parent anchor is the condemned
+     owner** only;
+   - `invalidateRegion`: delete only edges whose parent lies in the
+     invalidated footprint — never a blind global delete;
+   - ordinary temporary gates / native-unsupported gates / recorder-failure
+     gates: **preserve**;
+   - parent/child retirement: delete (immediately or at next drain via failed
+     id resolution).
+2. **Cycle retirement is applied AFTER replay, never mid-walk** (replay
+   validates executed transitions against the live registry; `disarmLinkAt`
+   does not defer). The detector records a pending edge-retirement verdict
+   over the COMPLETE captured ledger; the driver applies it after
+   `replayLedger` returns, alongside `applyPendingDisarms`.
+3. **Exact strike rule (completed-alternation formulation).** A serviced
+   burst strikes edge P→C iff: the ledger contains the registry-recognized
+   P→C row with `local == 0`; chaining later re-enters P after ≥1 intervening
+   child row; cumulative `cum` did not increase between the P→C row and that
+   return; and no later row in the edge's service interval makes progress
+   before the terminal. At most one strike per edge per burst; any productive
+   service resets; an edge that did not fire leaves its counter unchanged.
+   Explicit NON-strikes: repeated safe `prologue_fail`s; a one-way zero-local
+   child terminal — neither demonstrates the cycle.
+4. **[MINOR] `ChainResult.completed` convention pinned:** the handoff arm
+   sets `prev_cum = e.cum` (the parent's local delta is already-accounted
+   work), so terminal directives return `linked_completed + child.local` —
+   matching the existing M1 precedent (a parent local of 9 with child
+   prologue-fail intentionally returns `completed = 0`, trace.zig:11996).
+   Provenance handoffs retain this; the `local > 0` tests assert the exact
+   directive AND `completed` for `.dispatcher_root` plus one in-burst origin.
+   Also: correct the stale production comment claiming `local == 0` follows
+   from coherence (coherence permits any iteration count).
+5. **Edge-storage failure policy:** avoid DONE-without-edge — if the relation
+   insert fails at commit, do not latch DONE (the exit keeps accruing
+   evidence and can retry). Permanently native-unsupported child: delete the
+   edge (or explicitly mark dormant); never rescan forever.
+
+The round-2 test list (helper-refactor differential; edge creation only after
+registered commit, none on abort/failed commit/missing side_src; OOM policy;
+uncompiled-child retry; observation-disarm→republish with exit DONE;
+condemnation permanence; unrelated-gate preservation; both retirements; exact
+zero-cycle strike accounting incl. the two non-strike shapes; post-replay
+application; the four `local>0` grammars with directive+completed asserts;
+forced-yield with a provenance row earlier in the ledger; leak-checked epoch
+clear) is the B-2b gate.
 
 #### Part B — Faithful `lj_asm_patchexit` port + in-place-patch lifetime (P-E)
 

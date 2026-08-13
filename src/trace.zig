@@ -6198,7 +6198,23 @@ pub const TraceState = struct {
         // each route feeds: the prime side keeps its historical one-ramp bound
         // (`countTracesAt >= 2` — once skip + ramp coexist, arming stops and
         // never re-fires); generic siblings stop at `max_traces_per_anchor`.
-        const branch = self.isSourceBranchGuardExit(t, exit_instr, proto);
+        // Route on the POSITIVE branch property (source opcode is a real
+        // conditional branch), mirroring `siblingHandoffEligible`'s hardening:
+        // `isSourceBranchGuardExit` alone only excludes `for_loop`-sourced
+        // guards, so a `for_prep`-sourced zero-trip check (nsieve t=4 ei=18)
+        // was misrouted to the prime-side want, hit its 2-trace anchor cap,
+        // and never accrued side-trace hotness — 304k walks/run with no way
+        // to ever tier up the skip path. A zero-trip guard's alternate path
+        // is NEW code (skip the loop body), i.e. generic side-trace
+        // territory, not a branch alternation between existing siblings.
+        const branch = self.isSourceBranchGuardExit(t, exit_instr, proto) and blk: {
+            const src_pc = guardSourcePc(t.instrs[exit_instr]) orelse break :blk false;
+            if (src_pc >= proto.code.len) break :blk false;
+            break :blk switch (proto.code[src_pc].op) {
+                .jmp_if_false, .jmp_if_true, .jmp_if_not_nil => true,
+                else => false,
+            };
+        };
         if (branch) {
             if (self.wants_prime_side != null) return;
             if (self.anchorPopulation(t) >= 2) return;
