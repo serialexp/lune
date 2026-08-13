@@ -1,5 +1,69 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-13 (LATEST-43) — **Option A: guard-failure-aware gating. nsieve −48%, sieve_int −32%; nsieve now at/below LuaJIT wall-clock on this box (nsieve 9: lune 136ms vs LuaJIT 144ms; nsieve 10: 266ms vs 427ms; sieve_int parity 63ms vs 62ms). All green, all six hashes identical.**
+
+### The problem (diagnosed last arc)
+
+nsieve creates `local primes = {}` ONCE and reuses it across 3 sieve sizes. The
+first size records the init loop (`for i=2,m do p[i]=true end`) append-shaped
+(`guard_append`+`astore_append`). Sizes 2/3 hit in-bounds OVERWRITES →
+`guard_append` fails at i=2 → zero-progress receipts → the legacy 8-strike gate
+condemned the anchor before side-trace hotness (`hotguard=50`) could fire.
+Worse: array/shape guards store a lane ordinal in `aux`, not a PC, so
+`guardExitPc` returns null and they never charged `countGuardFailure` AT ALL —
+side-trace hotness was structurally impossible for shape mismatches. Result:
+~36% of the run (init loop, anchor nsieve:4) pure tier-0.
+
+Bart picked **Option A** (LuaJIT's model: a hot guard exit gets its own
+hotcount and spawns a side trace; the parent anchor is never blacklisted for
+it) over B (count shape-guard exits toward the existing per-PC hotness) and C
+(reset the strike counter on side-trace record).
+
+### What landed (this commit)
+
+1. **`shape_guard_exit_pc` sentinel (`maxInt(u32)`) + `isSideExitGuardOp`**
+   (trace.zig, next to `guardExitPc`) — the 19-op guard-family predicate.
+2. **Sentinel hotness charges** — both zero-progress charge sites (interp.zig
+   scalar step-4 + `driveDispatcherLedger`'s ledger terminal) gained an
+   else-branch: a side-exit guard WITHOUT a PC charges
+   `countGuardFailure(anchor, shape_guard_exit_pc)`. Shape mismatches can now
+   reach `hotguard` and trigger `wants_side_trace` → resume-timed side record.
+3. **Widened legacy gate under side headroom** — `accountLegacyThrash` takes
+   the receipt's `exit_instr`; when `completed == 0`, the exit is a side-exit
+   guard op, and `countTracesAt(anchor) < max_traces_per_anchor`, the gate
+   threshold becomes `max_penalty +| hotguard` (58) instead of 8 — the
+   side-trace machine wins the race. Genuinely thrashing anchors still gate
+   (bounded), and once the anchor is at trace capacity the plain threshold
+   applies. Threaded `exit_instr` through `onSideExit` (maxInt),
+   `onSideExitReceipt` (its param), `accountLedgerRow` (+param: `e.exit` on
+   `.deopt` arms, maxInt on loop-done/prologue-fail arms).
+
+Verified live (`--jit-debug`, nsieve 2): strikes climb `penalty=N/58`, at 51
+(one past hotguard) the next entry runs `local=19947` — the overwrite side
+trace recorded and completes the whole init loop natively; third size selects
+it after ONE strike. `--jit-stats` nsieve 9: anchor nsieve:4 went 3.9% → 53.9%
+traced-time, its run share 37.8% → 6.1%; whole-run traced time 69.1%.
+
+### Measurements (min-of-21 vs /tmp/lune-memo1 = prior commit, /tmp/lune-optA)
+
+nsieve 9 −47.8% (259.8→135.7ms), nsieve 10 −47.1% (503.0→266.2ms), sieve_int
+−31.8% (92.3→62.9ms), pi_leibniz +0.3%, grid_matmul −1.7%, nbody +2.7% (noise;
+no coverage there). LuaJIT same harness: nsieve 9 144.2ms, nsieve 10 426.8ms,
+sieve_int 62.1ms.
+
+### Gates
+
+`just test` green (also with `-Djit-debug=true`); A-viii repros print 109;
+floatlink prints 18135; all six output-identity hashes byte-identical.
+
+### Next levers (unchanged)
+
+nsieve:14 residual (96.1% it-traced but 73.6% time-traced — exits/seams);
+tier-0 dispatch (threaded/computed-goto); replayLedger walk self-time;
+dynamic-proto gate for scimark (53% of suite runtime, 0% coverage).
+
+---
+
 ## Status 2026-08-13 (LATEST-42) — **THE TRACES FUSE. Part S sound + armed, the third nsieve shape records (zero-trip for_prep record-through), and the per-row pricing seam is KILLED (freeze-after-qualify). nsieve/sieve_int ~14–27% faster than the pre-S baseline. All green, all six hashes identical.**
 
 LATEST-41 below is **stale in its central verdict**: the §S premise was NOT

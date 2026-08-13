@@ -3052,6 +3052,17 @@ pub const Vm = struct {
                                             if (exit_pc > 0) {
                                                 self.trace.countGuardFailure(final.anchor, exit_pc);
                                             }
+                                        } else if (trace.isSideExitGuardOp(final.instrs[result.exit_instr].op)) {
+                                            // Option A: a side-exit guard without a PC in
+                                            // `aux` (array/shape guards store a lane
+                                            // ordinal) still deserves side-trace hotness —
+                                            // charge it under the shared shape sentinel so
+                                            // a repeating shape mismatch (e.g. append
+                                            // trace hitting an in-bounds overwrite) can
+                                            // reach `hotguard` and record the missing
+                                            // shape, instead of being invisible to the
+                                            // side-trace machine entirely.
+                                            self.trace.countGuardFailure(final.anchor, trace.shape_guard_exit_pc);
                                         }
                                     }
                                 }

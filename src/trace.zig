@@ -459,6 +459,24 @@ pub fn guardExitPc(ins: IrInstr) ?u32 {
     };
 }
 
+/// Sentinel `exit_pc` for `countGuardFailure` when the failing exit is a SHAPE
+/// guard that carries no PC in `aux` (the array/hash/grid family reuses `aux`
+/// for lane ordinals). Shares the guard-failure counter namespace: `0` = a
+/// fingerprint miss, a real PC = a PC-carrying guard, `maxInt` = a shapeless
+/// guard exit. Only ever a map key + hotness bucket — nothing chains on it.
+pub const shape_guard_exit_pc: u32 = std.math.maxInt(u32);
+
+/// Every IR op whose runtime failure side-exits the trace — i.e. an exit that a
+/// SIDE TRACE could absorb by recording the alternate shape. This is the Option-A
+/// discriminator (see `accountLegacyThrash`): zero progress through one of these
+/// is side-trace evidence, not thrash.
+pub fn isSideExitGuardOp(op: IrOp) bool {
+    return switch (op) {
+        .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .guard_func, .guard_hash, .guard_pure, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent => true,
+        else => false,
+    };
+}
+
 /// The **source-opcode PC** (guest bytecode index) that OWNS a guard — the single
 /// canonical definition of "which bytecode op does this guard belong to", i.e. the
 /// `source_pc` a future `GuardProvenance` tag keys on (doc 17, H-1b). Distinct in
@@ -2943,7 +2961,7 @@ pub const TraceState = struct {
             self.noteBarrenConsumed(m.key, m.accum);
             return;
         }
-        self.accountLegacyThrash(t, completed);
+        self.accountLegacyThrash(t, completed, std.math.maxInt(u32));
     }
 
     /// Concrete receipt variant. Selection keeps its historical per-segment
@@ -2968,7 +2986,7 @@ pub const TraceState = struct {
         // flushed against an owner that happens to be `t.anchor`; applying the
         // receipt-local verdict last keeps the most recent evidence authoritative.
         if (!self.accountRegionProfit(key, region_work, dest))
-            self.accountLegacyThrash(t, completed);
+            self.accountLegacyThrash(t, completed, exit_instr);
     }
 
     /// The pre-A-vii-c per-trace profitability machine, verbatim — applied to every
@@ -2978,7 +2996,10 @@ pub const TraceState = struct {
     /// the doubling cooldown (`gateAnchor`). A receipt the region machine DID
     /// consume never reaches this: the region window flush owns that verdict,
     /// keyed on the owner anchor (`flushRegionWindow`).
-    inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize) void {
+    /// `exit_instr` is the failing IR exit when the caller knows it (a real
+    /// deopt receipt), `maxInt(u32)` otherwise. It feeds the Option-A rule
+    /// below and nothing else.
+    inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize, exit_instr: u32) void {
         const key = t.anchor;
         if (completed >= self.config.min_useful) {
             _ = self.penalty.remove(key);
@@ -2988,11 +3009,35 @@ pub const TraceState = struct {
         const gop = self.penalty.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
-        if (gop.value_ptr.* >= self.config.max_penalty) {
+        // Option A (LuaJIT's semantics: a hot guard exit has its own hotcount and
+        // spawns a side trace — the parent anchor is never blacklisted for it).
+        // Zero progress THROUGH A SHAPE GUARD, while this anchor can still take
+        // another side trace, is side-trace evidence, not thrash: widen the gate
+        // threshold by `hotguard` so the guard-failure counter can reach its own
+        // threshold and record the missing shape, instead of the `max_penalty`
+        // gate condemning the anchor first (with the defaults the gate won that
+        // race 8-vs-50 every time). Measured on nsieve: the shared `primes` table
+        // makes the init loop append-shaped on the first size and overwrite-shaped
+        // on the rest; guard_append zero-exits gated the anchor after 8 entries
+        // and ~36% of the run fell back to tier-0 despite full trace coverage.
+        // Still hard-bounded: a genuinely thrashing anchor gates at
+        // `max_penalty + hotguard`, and once the anchor holds
+        // `max_traces_per_anchor` traces the plain threshold applies again.
+        // Deterministic — a pure function of the receipt stream and cache size.
+        const side_headroom = completed == 0 and
+            exit_instr != std.math.maxInt(u32) and
+            exit_instr < t.instrs.len and
+            isSideExitGuardOp(t.instrs[exit_instr].op) and
+            self.countTracesAt(key) < self.config.max_traces_per_anchor;
+        const limit = if (side_headroom)
+            self.config.max_penalty +| self.config.hotguard
+        else
+            self.config.max_penalty;
+        if (gop.value_ptr.* >= limit) {
             self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d} -> gate", .{ key.pc, completed, gop.value_ptr.* });
             self.gateAnchor(key);
         } else {
-            self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d}/{d}", .{ key.pc, completed, gop.value_ptr.*, self.config.max_penalty });
+            self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d}/{d}", .{ key.pc, completed, gop.value_ptr.*, limit });
         }
     }
 
@@ -3003,9 +3048,12 @@ pub const TraceState = struct {
     /// (b) unconditionally apply the legacy verdict, so a row the region window
     /// consumed would be charged by BOTH machines. The row's own `region_consumed`
     /// is the boundary, exactly as at `onSideExitReceipt`.
-    inline fn accountLedgerRow(self: *TraceState, t: *Trace, completed: usize, region_consumed: bool) void {
+    /// `exit_instr`: the row's own exit index for `.deopt` rows (Option-A
+    /// evidence), `maxInt(u32)` for rows with no failing-guard identity
+    /// (loop-done, prologue-fail).
+    inline fn accountLedgerRow(self: *TraceState, t: *Trace, completed: usize, exit_instr: u32, region_consumed: bool) void {
         self.accountTraceRun(t, completed);
-        if (!region_consumed) self.accountLegacyThrash(t, completed);
+        if (!region_consumed) self.accountLegacyThrash(t, completed, exit_instr);
     }
 
     fn sameAnchor(a: AnchorKey, b: AnchorKey) bool {
@@ -4702,7 +4750,7 @@ pub const TraceState = struct {
                         @panic("replayLedger: fused loop-done has no exit PC");
                     // One more enclosing iteration committed natively. Account BEFORE
                     // the re-run bound (Q1/Q2: never early-return mid-ledger).
-                    self.accountLedgerRow(owner, if (local > 0) local else 1, region_consumed);
+                    self.accountLedgerRow(owner, if (local > 0) local else 1, std.math.maxInt(u32), region_consumed);
                     linked_completed.* += 1;
                     resume_pc.* = post_pc;
                     // A `.inner_call` seed's FIRST entry is its own loop-done — that
@@ -4835,7 +4883,7 @@ pub const TraceState = struct {
                         if (entries[k + 1].cum != e.cum)
                             @panic("replayLedger: fused M1 ramp committed its own iterations (cum advanced)");
                         self.native_source_link_fused +|= 1;
-                        self.accountLedgerRow(owner, local, region_consumed);
+                        self.accountLedgerRow(owner, local, e.exit, region_consumed);
                         // Sub-case (b): the ramp deopted at an internal guard BEFORE its
                         // `.link` — terminal. Replay the old dispatcher steering
                         // `onSideExit(ramp, 0); resume owner.anchor.pc`. (`succ.cum ==
@@ -4952,7 +5000,7 @@ pub const TraceState = struct {
                             @panic("replayLedger: bridged successor deopt on a non-body owner shape");
                         if (resume_pc.* != owner.anchor.pc)
                             @panic("replayLedger: bridged successor deopt resume mismatches its anchor");
-                        self.accountLedgerRow(owner, local, region_consumed);
+                        self.accountLedgerRow(owner, local, e.exit, region_consumed);
                         return .{ .return_result = .{
                             .completed = linked_completed.* + local,
                             .resume_pc = resume_pc.*,
@@ -4961,7 +5009,7 @@ pub const TraceState = struct {
                     if (ends_link) {
                         // (a) continuation own guard — terminal.
                         if (local > 0) {
-                            self.accountLedgerRow(owner, local, region_consumed);
+                            self.accountLedgerRow(owner, local, e.exit, region_consumed);
                             return .{ .return_result = .{
                                 .completed = linked_completed.* + local,
                                 .resume_pc = resume_pc.*,
@@ -4980,7 +5028,7 @@ pub const TraceState = struct {
                     // whole inner loop).
                     if (isLoopDoneGuardIndex(owner, e.exit))
                         @panic("replayLedger: ordinary-mode inner loop-done in a linked fusion is unmodeled");
-                    self.accountLedgerRow(owner, local, region_consumed);
+                    self.accountLedgerRow(owner, local, e.exit, region_consumed);
                     return .{ .return_result = .{
                         .completed = if (linked_completed.* > 0) linked_completed.* else local,
                         .resume_pc = link_pc,
@@ -5016,7 +5064,7 @@ pub const TraceState = struct {
                             @panic("replayLedger: bridged successor prologue-fail on a non-body owner shape");
                         if (resume_pc.* != owner.anchor.pc)
                             @panic("replayLedger: bridged successor prologue-fail resume mismatches its anchor");
-                        self.accountLedgerRow(owner, 0, region_consumed);
+                        self.accountLedgerRow(owner, 0, std.math.maxInt(u32), region_consumed);
                         return .{ .return_result = .{
                             .completed = linked_completed.*,
                             .resume_pc = resume_pc.*,
@@ -5033,7 +5081,7 @@ pub const TraceState = struct {
                     // Inner prologue-fail (local == 0): matches the old `fdone == false`
                     // mid-loop path — record the zero-progress side exit and resume
                     // tier-0 at the inner header, carrying any earlier chain progress.
-                    self.accountLedgerRow(owner, 0, region_consumed);
+                    self.accountLedgerRow(owner, 0, std.math.maxInt(u32), region_consumed);
                     return .{ .return_result = .{
                         .completed = if (linked_completed.* > 0) linked_completed.* else 0,
                         .resume_pc = link_pc,
@@ -5545,6 +5593,10 @@ pub const TraceState = struct {
                         if (guardExitPc(owner.instrs[term.exit])) |exit_pc| {
                             if (exit_pc > 0)
                                 self.countGuardFailure(owner.anchor, exit_pc);
+                        } else if (isSideExitGuardOp(owner.instrs[term.exit].op)) {
+                            // Option A: shape guards (no PC in `aux`) charge the
+                            // shared sentinel — same rule as the scalar site.
+                            self.countGuardFailure(owner.anchor, shape_guard_exit_pc);
                         }
                     }
                 }
