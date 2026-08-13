@@ -1,6 +1,65 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
-## Status 2026-08-13 (LATEST-41) — **Part S BUILT and MEASURED. The "50% = runtime re-entry" premise is DISPROVED, and the handoff is UNSOUND. Arming is off (`sibling_handoff_arming_enabled = false`); everything else is landed and green.**
+## Status 2026-08-13 (LATEST-42) — **THE TRACES FUSE. Part S sound + armed, the third nsieve shape records (zero-trip for_prep record-through), and the per-row pricing seam is KILLED (freeze-after-qualify). nsieve/sieve_int ~14–27% faster than the pre-S baseline. All green, all six hashes identical.**
+
+LATEST-41 below is **stale in its central verdict**: the §S premise was NOT
+falsified and the handoff is NOT unsound. The A-viii 108-vs-109 drop was
+`replayLedger`'s terminal arm resuming at a stale `link_pc` when a burst mixed
+`.link_terminal` rows with a later handoff row — fixed by entry-provenance
+(`next_via_handoff`, mirroring the `entered_via_bridge` precedent). Arming is
+back ON. Full story in the `sibling_handoff_arming_enabled` doc comment.
+
+### What landed this arc (all uncommitted → this commit)
+
+1. **Part S soundness fix** — entry-provenance in `replayLedger`: a handoff
+   successor terminal-resumes at its ANCHOR, never `link_pc`. A-viii prints 109.
+2. **Part S arming re-enabled** with hardened eligibility: the guard's source
+   opcode must be a real conditional branch (`jmp_if_*`) — a `for_prep`-sourced
+   zero-trip check ping-pongs to LEDGER_CAP (measured +128% before the rule).
+3. **Ledger-path guard-failure hotness** — `driveDispatcherLedger` charges
+   `countGuardFailure` for zero-progress normal deopt terminals (the scalar
+   step-4 site never runs for `ledger_len > 1`), so side traces can get hot
+   from fused bursts. Plus `max_traces_per_anchor` moved to config (default 4).
+4. **Resume-timed side recording** — `consumeSideTraceWantAtResume`: consume
+   `wants_side_trace` at the deopt RESUME (recording the failing iteration's
+   re-run), not the next back-edge (which records the wrong shape). Arms via
+   `pending_replay_anchor` + `.switch_mode` so the recorder actually runs.
+5. **Zero-trip `for_prep` record-through** (the recorder frontier): the
+   recorder no longer force-closes with `.link` at every `for_prep`. It decides
+   the direction with the SAME value ops tier-0 uses; a zero-tripping loop is
+   recorded as the plain `sub` + fall-through, and `recForLoop` is now
+   polarity-aware (`guard_false` on the continue test, `R[a+3]` NOT published,
+   recording continues straight-line). nsieve's third shape (prime with
+   `i+i > m`) records and compiles.
+6. **Freeze-after-qualify (the seam kill)** — `RegionAccum.frozen` latches
+   after `config.freeze_windows` consecutive useful windows; `replayLedger`
+   then prices member→member rows through a direct-credit fast path (no
+   classifyExit / chooseSource / destination hashing; membership via per-trace
+   `region_memo_*` keyed on `region_defs_gen`). Any strike unfreezes.
+   `accountRegionProfit` fell 18.1% → 0.0% of nsieve wall-clock.
+7. **`noteSiblingTerminal` reject memo** — single-slot ineligible-exit memo on
+   Trace (`sibling_reject_exit`); 84k/run eligibility re-scans → one compare.
+8. **`qualifiedActiveMember` activation cache** — single-slot (`act_cache_*`),
+   invalidated in `freeObserverFast` (every `region_profit` mutation funnels
+   there) + the qualification flip + `region_defs_gen`.
+
+### Measurements (min-of-21, vs /tmp/lune-memo1 pre-S baseline, noisy box)
+
+nsieve 9 −14…−23%, nsieve 10 −14…−26%, sieve_int −23…−42%, pi_leibniz ~0.
+Profile after: `accountRegionProfit` 0%, `replayLedger` self ~13%, tier-0
+`execImpl` ~25% — the next seam is tier-0 dispatch + the remaining ledger walk.
+
+### Gates
+
+`just test` green; A-viii repros (`/tmp/aviii.lua`, `/tmp/aviii-which.lua`,
+`--trace-hotguard 3`) print 109; all six output-identity hashes byte-identical
+(nsieve 4053ed86223d7060, nbody 9dcd7fa2f7e9e93e, sieve_int db55c0f98f98851b,
+pi_leibniz f57ace5316c0fd19, grid_matmul 395ff5566b31eb18, field_hash
+89b64d3d25ae188f).
+
+---
+
+## Status 2026-08-13 (LATEST-41) — STALE (kept for the diagnosis trail; central verdict disproved above) — **Part S BUILT and MEASURED. The "50% = runtime re-entry" premise is DISPROVED, and the handoff is UNSOUND. Arming is off (`sibling_handoff_arming_enabled = false`); everything else is landed and green.**
 
 ### 1. The premise behind Part B is wrong
 

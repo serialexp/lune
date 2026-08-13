@@ -3020,7 +3020,22 @@ pub const Vm = struct {
                                 if (ran_native and result.ledger_len > 1) {
                                     const chain = self.trace.driveDispatcherLedger(ct, self.trace.ledger_scratch[0..result.ledger_len], proto, regs, safe_to_arm);
                                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                                    // Side-trace precision: if this burst's terminal
+                                    // crossed the hotguard threshold, arm the recording
+                                    // AT the resume so it captures the failing
+                                    // iteration's re-run — the back-edge consumption is
+                                    // one iteration late and records the wrong shape on
+                                    // alternating loops (see the fn doc). Armed via the
+                                    // replay-side pending anchor, which the `.full`
+                                    // prologue consumes at the anchor pc — so a `.fast`
+                                    // dispatch must switch up, exactly as the
+                                    // `wants_prime_side` consumption below does.
+                                    const armed_side = self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc));
                                     for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                    if (armed_side and mode == .fast) {
+                                        frame.pc = pc;
+                                        return .switch_mode; // → .full
+                                    }
                                     continue :outer;
                                 }
 

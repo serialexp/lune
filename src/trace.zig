@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const bytecode = @import("bytecode.zig");
+const arith = @import("arith.zig");
 const value = @import("value.zig");
 const function = @import("function.zig");
 const regwindow = @import("regwindow.zig");
@@ -802,6 +803,17 @@ pub const RegionAccum = struct {
     /// synthetic low-yield verdict (`noteBarrenConsumed`) so a qualified
     /// activation that decays into barren-only execution is still priced.
     barren_run: u32 = 0,
+    /// Freeze-after-qualify (task #70): consecutive USEFUL window flushes since
+    /// the last strike. At `config.freeze_windows` the activation FREEZES —
+    /// `replayLedger` stops running the full classify/choose/destination
+    /// pipeline per ledger row for member→member transitions and just credits
+    /// this accumulator directly (see the frozen fast path there). Any strike
+    /// (`flushRegionWindow` low-yield, incl. the barren-run synthetic verdict)
+    /// unfreezes and zeroes the streak, so a decaying region drops straight
+    /// back to full pricing. Pure function of the receipt stream — every mode
+    /// freezes/unfreezes on the same receipt.
+    useful_streak: u32 = 0,
+    frozen: bool = false,
 };
 
 /// Destination knowledge carried by a concrete trace receipt. A selected trace
@@ -1244,38 +1256,39 @@ pub const ArmKind = enum {
 /// arm attempt release-panics in `armNativeLink` (deliberate tripwire).
 const region_bridge_arming_enabled = true;
 
-/// Part S (§S) — the native sibling handoff master switch. OFF, and it must stay off
-/// until the soundness hole below is closed.
+/// Part S (§S) — the native sibling handoff master switch. ON.
 ///
-/// The mechanism itself works and is a measured win: patching a hot ordinary-guard
-/// exit to jump straight into a same-anchor sibling fused 96% of nsieve N=9's
-/// dispatcher bursts and, once the accounting was corrected, ran 4–11% faster with
-/// byte-identical output. What it is NOT is semantics-preserving.
+/// The mechanism: patching a hot ordinary-guard exit to jump straight into a
+/// same-anchor sibling's ordinary entry, fusing skip⇄continuation ping-pong into
+/// one native call (on nsieve it fuses the majority of dispatcher bursts).
 ///
-/// `armNativeLink`'s `.sibling_handoff` validation checks that the successor shares
-/// the anchor, takes no inputs, and is neither a loop-done nor a bridge slot. It does
-/// NOT check that the parent's register file is actually coherent AT that anchor when
-/// the exit fires — and a native deopt flushes CARRIED HOMES ONLY, leaving invariants
-/// at their entry values and never flushing internal phis. So an exit taken after the
-/// back-edge rotation hands the sibling a register image that is one rotation stale.
-/// The A-viii outer-cycle test catches exactly this: with the handoff armed it prints
-/// 108 where the unfused run prints 109 — one iteration silently dropped.
+/// History of the soundness scare (2026-08-12/13), kept because the diagnosis
+/// path is instructive: an earlier revision of this comment declared the §S
+/// premise ("a zero-progress pre-effect deopt is coherent at the anchor")
+/// FALSIFIED, because the A-viii outer-cycle repro printed 108 where the unfused
+/// run prints 109 even after both premise halves (`exitIsPreEffect`, the
+/// `term_local == 0` charge filter) were in place. That verdict was wrong. The
+/// dropped iteration was never a register-coherence failure at the handoff at
+/// all — it was `replayLedger`'s TERMINAL arm resuming at the stale linked
+/// `link_pc` when a burst mixed `.link_terminal` rows with a later handoff row,
+/// so tier-0 resumed inside the previous prime's finished inner loop and the
+/// middle `for_loop` advanced past the in-flight iteration (the missing prime is
+/// 307, the first zero-trip). The fix is entry-PROVENANCE, not snapshots: a row
+/// whose owner was entered at its anchor (handoff successor, like a bridged
+/// successor) terminal-resumes at the anchor, never `link_pc` — see
+/// `next_via_handoff` in `replayLedger`. With that fix A-viii prints 109 with
+/// arming ON, the full suite is green, and all six output-identity controls
+/// hash byte-identical.
 ///
-/// This is the deferral in §S.8 ("true per-exit snapshots") turning out to be
-/// load-bearing rather than an optimisation. §S states the coherence condition as "a
-/// zero-progress pre-effect deopt is coherent at the anchor"; BOTH halves were then
-/// implemented and BOTH were insufficient — `exitIsPreEffect` (static: no heap
-/// mutation precedes the exit) and the runtime `term_local == 0` filter at the charge
-/// site each still leave A-viii printing 108 instead of 109. So the premise itself is
-/// falsified, not merely under-enforced: some state the sibling's anchor entry needs
-/// is NOT reconstructible from a carried-homes flush, and identifying it is the open
-/// work. Two exits happened to be safe on nsieve, which is why the first cut passed
-/// the suite — it only ever armed ONE of them.
-///
-/// Everything below (the watch, the arm-time validator, the replay production, the
-/// accounting split) is kept because it is the part that is right; the missing piece
-/// is the eligibility proof, not the machinery.
-const sibling_handoff_arming_enabled = false;
+/// The premise therefore stands as designed, with eligibility enforced at
+/// `siblingHandoffEligible`: compiled native, in-bounds, not a loop-done or
+/// bridge slot, not already armed, no preceding heap effect on the trace
+/// (`exitIsPreEffect`), and the guard must be sourced at a real conditional
+/// branch opcode (`jmp_if_*`) — a non-branch guard (e.g. a zero-trip loop-entry
+/// check sourced at `for_prep`) would ping-pong parent⇄sibling to LEDGER_CAP
+/// instead of committing an iteration per transition (measured: +128% on
+/// nsieve before the branch-source rule).
+const sibling_handoff_arming_enabled = true;
 
 /// A loop-carried writeback: at the back-edge, tier-0 register `slot` holds the
 /// value produced by IR `ref`. The set of these is the trace's exit snapshot —
@@ -1535,6 +1548,29 @@ pub const Trace = struct {
     sibling_watch_exit: u32 = std.math.maxInt(u32),
     sibling_watch_count: u32 = 0,
     sibling_arms: u32 = 0,
+    /// Single-slot INELIGIBLE-exit memo for `noteSiblingTerminal`: the last exit
+    /// whose `siblingHandoffEligible` came back false. Repeat receipts at that
+    /// exit are one `u32` compare instead of a full eligibility re-scan (measured:
+    /// nsieve terminated 84k bursts/run at one statically-ineligible exit, each
+    /// re-running the armed-links scan + bridge memo + branch-source test — ~5%
+    /// wall-clock). Sound because eligibility for a fixed `(trace, exit)` is
+    /// static EXCEPT for the armed-slot exclusion, so the memo is cleared wherever
+    /// the arm set touching this trace changes (`clearSiblingLatch`, a successful
+    /// sibling arm).
+    sibling_reject_exit: u32 = std.math.maxInt(u32),
+
+    /// Freeze-after-qualify membership memo (task #70, the runtime-seam kill): the
+    /// last `regionMemberPoint(rid, anchor)` answer for this trace, keyed by
+    /// `(region_defs_gen, rid)`. `replayLedger`'s frozen fast path asks "is this
+    /// row's owner anchored inside the live region's footprint" once per ROW; the
+    /// answer is a pure function of the trace anchor (immutable) and the region
+    /// def's `member_points`/`armable` (invalidated by bumping
+    /// `TraceState.region_defs_gen` at every `region_defs` mutation), so two
+    /// scalars + a bool replace a per-row footprint scan. Gen 0 never matches
+    /// (`region_defs_gen` starts at 1), so a fresh trace always recomputes.
+    region_memo_rid: u64 = std.math.maxInt(u64),
+    region_memo_gen: u32 = 0,
+    region_memo_member: bool = false,
 
     /// Memoized `nativegen.isCompositeBridgeCandidate(self, idx)` — see `bridge_cand`.
     /// Falls back to the oracle when the memo was not built.
@@ -1706,6 +1742,13 @@ pub const TraceConfig = struct {
     /// gated within `max_barren_run * max_penalty` receipts. Deterministic —
     /// a pure function of receipt counts.
     max_barren_run: u32 = 64,
+    /// Freeze-after-qualify (task #70): consecutive useful windows after which a
+    /// live activation FREEZES and `replayLedger` prices its member→member ledger
+    /// rows through the allocation-free direct-credit fast path instead of the
+    /// full classify/choose/destination hash pipeline. 2 = one window to qualify
+    /// (`useful_window_seen`), one more to prove it wasn't a fluke. Any strike
+    /// unfreezes. Heuristic — never affects output, only tiering cost.
+    freeze_windows: u32 = 2,
     /// Gate backoff (replaces the old permanent blacklist). When an anchor is
     /// gated (low-yield penalty maxed, a recording abort, or a commit failure) it
     /// is held off tier-1 for a *cooldown window* measured in back-edges, after
@@ -1727,6 +1770,16 @@ pub const TraceConfig = struct {
     /// at A fails this many times, the next back-edge to A arms a new
     /// recording that captures the alternate path through the loop body.
     hotguard: u32 = 50,
+    /// Maximum distinct traces cached per anchor before `countGuardFailure` /
+    /// `countFingerprintMiss` stop counting (i.e. before side-trace recording at
+    /// that anchor is refused). Was a hard-coded 2, which is exactly one branch
+    /// flip: an anchor whose loop body has THREE control-flow shapes (nsieve:14 —
+    /// composite-skip, prime-with-clearing, prime-past-m/2 whose clearing loop
+    /// zero-trips) permanently strands the third shape on the runtime turnstile,
+    /// one visit per iteration (304k/run on nsieve N=9). Bounded still — the
+    /// unbounded-growth concern on alternating-type loops stays addressed — just
+    /// not at the smallest possible value.
+    max_traces_per_anchor: usize = 4,
     /// Record a per-trace **execution log** (`execlog.zig`) for the visualizer's
     /// iteration animation. Off by default (zero cost on the JIT path — the executor
     /// is comptime-specialized); the wasm playground flips it on. Independent of
@@ -1990,6 +2043,24 @@ pub const TraceState = struct {
     /// where protos may be freed). Owns each `RegionDef`'s `members`/`member_points`.
     /// **Inert: read by nothing in A-ii ⇒ byte-identical.**
     region_defs: std.AutoHashMapUnmanaged(RegionId, RegionDef) = .empty,
+    /// Invalidation generation for `Trace.region_memo_*` (freeze-after-qualify,
+    /// task #70). Bumped at EVERY `region_defs` mutation — new/updated defs and
+    /// every `armable` flip — so per-trace footprint-membership memos never
+    /// outlive the def state they were computed against. Starts at 1 so a fresh
+    /// trace's memo gen 0 can never spuriously match.
+    region_defs_gen: u32 = 1,
+    /// Single-slot cache of the qualified-live-activation resolution inside
+    /// `qualifiedActiveMember` (task #70 seam work): the `activeRegionFor` map
+    /// iteration + `region_profit.getPtr` + qualification check for one
+    /// `call_seq`. `act_cache_gen == 0` means invalid; it is zeroed by
+    /// `refreshObserverFast` (the single hook every `region_profit` mutation
+    /// already runs through, so the cached `accum` pointer can never dangle) and
+    /// by the `useful_window_seen` flip (which changes the cached verdict without
+    /// mutating the map). The `region_defs_gen` half of the key covers footprint
+    /// changes.
+    act_cache_seq: u64 = 0,
+    act_cache_gen: u32 = 0,
+    act_cache: ?MemberAccum = null,
     /// Interns a region's canonical sorted INTERNAL edge SET → its `RegionId` (same
     /// Proto/VM lifetime as `region_defs`). Hash-bucketed; a hit confirmed by
     /// element-wise set equality (collision mints a distinct id).
@@ -2392,6 +2463,30 @@ pub const TraceState = struct {
         // The anchor-coherence proof. Without it the handoff is not
         // semantics-preserving — see `exitIsPreEffect`.
         if (!exitIsPreEffect(t, exit_instr)) return false;
+        // PROGRESS, not just soundness: only a SOURCE-BRANCH guard may arm. A branch
+        // guard failing means the program took the OTHER branch at the shared anchor
+        // decision — exactly the case the same-anchor sibling was recorded for, so the
+        // handoff completes the iteration natively. Any other guard kind (zero-trip
+        // loop-entry checks, bounds, type) says nothing about which branch holds:
+        // the sibling re-runs the iteration, its OWN branch guard fails, and the
+        // armed pair PING-PONGS until the ledger cap forces a yield. Measured on
+        // nsieve N=9: arming the zero-trip exit ei=16 turned 304k two-row bursts
+        // into 304k THIRTY-TWO-row yield bursts — +128% wall-clock from a mechanism
+        // that is a −7% win when it arms branch guards only.
+        //
+        // `isSourceBranchGuardExit` alone is NOT that test: it excludes only
+        // `for_loop`-sourced guards, so a `for_prep`-sourced zero-trip check (nsieve's
+        // ei=16, guard_true over `le i+i, m`) passes it while telling us nothing about
+        // the anchor branch. Require the POSITIVE property instead: the guard's source
+        // opcode is a conditional branch — the one bytecode shape where "this guard
+        // failed" and "the sibling's branch was taken" are the same statement.
+        if (!self.isSourceBranchGuardExit(t, exit_instr, t.anchor.proto)) return false;
+        const src_pc = guardSourcePc(t.instrs[exit_instr]) orelse return false;
+        if (src_pc >= t.anchor.proto.code.len) return false;
+        switch (t.anchor.proto.code[src_pc].op) {
+            .jmp_if_false, .jmp_if_true, .jmp_if_not_nil => {},
+            else => return false,
+        }
         return true;
     }
 
@@ -2402,6 +2497,10 @@ pub const TraceState = struct {
         // Steady state (a request already in flight): one optional load and out. See
         // `Trace.sibling_watch_exit` for why this path has to be free, not just cheap.
         if (self.pending_sibling_arm != null) return;
+        // Single-slot ineligible memo: a terminal at the last known-ineligible exit
+        // is one compare and out — never a re-scan. Cleared on any arm/disarm event
+        // touching this trace (the only non-static eligibility input).
+        if (t.sibling_reject_exit == exit_instr) return;
         if (t.sibling_watch_exit != exit_instr) {
             self.dbg("sibling-watch-move: t={d} ei={d} (from ei={d} count={d}) eligible={}", .{
                 t.id, exit_instr, t.sibling_watch_exit, t.sibling_watch_count,
@@ -2411,7 +2510,10 @@ pub const TraceState = struct {
             // (which touches `native.compiled`, the loop-done predicate and the
             // bridge memo) is therefore NOT on the per-receipt path. An ineligible
             // exit leaves the watch untouched, so it cannot starve the eligible one.
-            if (!self.siblingHandoffEligible(t, exit_instr)) return;
+            if (!self.siblingHandoffEligible(t, exit_instr)) {
+                t.sibling_reject_exit = exit_instr;
+                return;
+            }
             t.sibling_watch_exit = exit_instr;
             t.sibling_watch_count = 0;
         }
@@ -2435,7 +2537,10 @@ pub const TraceState = struct {
             return; // different anchor: this entry is not the one the request meant
         self.pending_sibling_arm = null;
         if (self.armNativeLink(parent, key.exit_instr, child, .sibling_handoff) catch false) {
-            self.dbg("sibling-arm: t={d} ei={d} -> t={d}", .{ parent.id, key.exit_instr, child.id });
+            self.dbg("sibling-arm: t={d} ei={d} op={s} -> t={d}", .{
+                parent.id, key.exit_instr,
+                @tagName(parent.instrs[key.exit_instr].op), child.id,
+            });
             self.sibling_handoff_arms +|= 1;
             // Fast-reject key for `hasArmedSiblingHandoff`; decremented by every
             // disarm path via `clearSiblingLatch`.
@@ -2938,6 +3043,13 @@ pub const TraceState = struct {
             _ = self.gate.remove(owner);
             return;
         }
+        // Freeze-after-qualify (task #70): any low-yield verdict unfreezes the
+        // activation and restarts the useful-window streak — a decaying region
+        // must fall back to full per-row pricing immediately.
+        if (self.region_profit.getPtr(key)) |accum| {
+            accum.frozen = false;
+            accum.useful_streak = 0;
+        }
         const gop = self.penalty.getOrPut(self.gpa, owner) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
@@ -2959,6 +3071,11 @@ pub const TraceState = struct {
     }
 
     fn freeObserverFast(self: *TraceState) void {
+        // Every `region_profit` mutation funnels through here (refreshObserverFast
+        // and resetRegionProfit both call it) — the cached `accum` pointer in
+        // `act_cache` must not survive any of them (see `act_cache_*`).
+        self.act_cache_gen = 0;
+        self.act_cache = null;
         // The inline cache borrows a span's `words`, so it dies with the owner —
         // unconditionally, even when there is nothing to free (a null
         // `observer_fast` still means "no valid hot span").
@@ -3103,6 +3220,7 @@ pub const TraceState = struct {
         if (self.region_defs.getPtr(id)) |def| {
             def.armable = false;
             def.tombstoned = true; // fail-closed: recomputation must never re-arm
+            self.region_defs_gen +%= 1; // invalidate Trace.region_memo_*
         }
         while (true) {
             var victim: ?RegionKey = null;
@@ -3524,9 +3642,23 @@ pub const TraceState = struct {
             // barren receipts (consumed, never legacy-cleared), so a stale
             // pre-qualification penalty would otherwise stay latent forever
             // and re-gate the anchor on the first low receipt after close.
-            if (!accum.useful_window_seen) self.clearMemberAnchorState(key.region_id);
+            if (!accum.useful_window_seen) {
+                self.clearMemberAnchorState(key.region_id);
+                // The qualification flip changes `qualifiedActiveMember`'s cached
+                // verdict without touching the map — invalidate the slot.
+                self.act_cache_gen = 0;
+                self.act_cache = null;
+            }
             accum.useful_window_seen = true;
             accum.window_base += n;
+            // Freeze-after-qualify (task #70): a full-window flush from this loop
+            // is always a USEFUL verdict (`work == n == min_useful` clears the
+            // penalty in `flushRegionWindow`). Enough of them in a row proves the
+            // activation is in steady state — freeze it so `replayLedger` stops
+            // paying the full pricing pipeline per ledger row. Any strike path
+            // (`flushRegionWindow` low-yield) zeroes the streak and unfreezes.
+            accum.useful_streak +|= 1;
+            if (accum.useful_streak >= self.config.freeze_windows) accum.frozen = true;
         };
     }
 
@@ -3593,6 +3725,22 @@ pub const TraceState = struct {
         return self.regionMemberPoint(rid, t.anchor.proto.id, t.anchor.pc);
     }
 
+    /// Memoized `regionMemberPoint(rid, t.anchor)` for the frozen fast path
+    /// (task #70): the answer is cached on the TRACE (`region_memo_*`), keyed by
+    /// `(region_defs_gen, rid)`, so the per-row cost in a frozen steady state is
+    /// two integer compares instead of a footprint scan. Every `region_defs`
+    /// mutation bumps the generation, so a stale answer can never be returned.
+    fn traceRegionMemberMemo(self: *const TraceState, t: *Trace, rid: RegionId) bool {
+        if (t.region_memo_gen == self.region_defs_gen and
+            t.region_memo_rid == @intFromEnum(rid))
+            return t.region_memo_member;
+        const member = self.regionMemberPoint(rid, t.anchor.proto.id, t.anchor.pc);
+        t.region_memo_gen = self.region_defs_gen;
+        t.region_memo_rid = @intFromEnum(rid);
+        t.region_memo_member = member;
+        return member;
+    }
+
     /// Point-in-footprint test against a region's `member_points`, fail-closed
     /// (freed or tombstoned defs own nothing).
     fn regionMemberPoint(self: *const TraceState, rid: RegionId, proto_id: u32, pc: u32) bool {
@@ -3618,11 +3766,22 @@ pub const TraceState = struct {
     /// (`noteBarrenConsumed` — codex BLOCKER 2).
     fn qualifiedActiveMember(self: *TraceState, proto: *const Proto, pc: u32) ?MemberAccum {
         const ctx = self.region_context orelse return null;
-        const a = self.activeRegionFor(ctx.call_seq) orelse return null;
-        const accum = self.region_profit.getPtr(a) orelse return null;
-        if (!accum.useful_window_seen) return null;
-        if (!self.regionMemberPoint(a.region_id, proto.id, pc)) return null;
-        return .{ .key = a, .accum = accum };
+        // Single-slot activation cache (see `act_cache_*`): the map iteration +
+        // hash lookup + qualification check only re-run when the activation, the
+        // `region_profit` map, or the region defs changed.
+        if (self.act_cache_gen != self.region_defs_gen or self.act_cache_seq != ctx.call_seq) {
+            self.act_cache = blk: {
+                const a = self.activeRegionFor(ctx.call_seq) orelse break :blk null;
+                const accum = self.region_profit.getPtr(a) orelse break :blk null;
+                if (!accum.useful_window_seen) break :blk null;
+                break :blk .{ .key = a, .accum = accum };
+            };
+            self.act_cache_gen = self.region_defs_gen;
+            self.act_cache_seq = ctx.call_seq;
+        }
+        const m = self.act_cache orelse return null;
+        if (!self.regionMemberPoint(m.key.region_id, proto.id, pc)) return null;
+        return m;
     }
 
     /// A-vii-e.2: the inline half of the tier-0 departure observer. Returns true
@@ -4204,6 +4363,35 @@ pub const TraceState = struct {
         var cont: *Trace = seed_owner;
         var link_pc: u32 = inner_pc;
         var prev_cum: usize = 0;
+        // Part S: set by the sibling-handoff production for the row that FOLLOWS a
+        // fused handoff — that row's owner was entered at its ordinary (anchor)
+        // entry, exactly like a bridged successor, so its terminal contract is the
+        // coherent-anchor discipline and NEVER the linked C⇄I grammar's `link_pc`.
+        // Measured before this existed: a burst that mixed `.link_terminal` rows
+        // with a later handoff ping-pong terminal-resumed at the stale inner-root
+        // `link_pc`, so tier-0 fell out of the finished inner loop and advanced the
+        // middle induction variable PAST the in-flight iteration — dropping exactly
+        // one count per sieve rep (A-viii 108 vs 109; the missing prime is 307, the
+        // first zero-trip of the inner loop).
+        var next_via_handoff: bool = false;
+
+        // Freeze-after-qualify (task #70): resolve the live activation ONCE per
+        // burst. If it is FROZEN (a run of useful windows with no strike), member→
+        // member ledger rows below are priced through the direct-credit fast path —
+        // no classifyExit, no chooseSource, no destination hashing. The `accum`
+        // pointer stays valid across the loop because the fast path never mutates
+        // `region_profit` (`flushRegionWindow` is documented not to), and the latch
+        // is dropped the moment any row takes the slow path (which may open/close
+        // activations) or a barren-run strike unfreezes the accumulator.
+        const FrozenFast = struct { key: RegionKey, accum: *RegionAccum };
+        var frozen_fast: ?FrozenFast = null;
+        if (self.region_context) |rctx| {
+            if (self.activeRegionFor(rctx.call_seq)) |akey| {
+                if (self.region_profit.getPtr(akey)) |accum| {
+                    if (accum.frozen) frozen_fast = .{ .key = akey, .accum = accum };
+                }
+            }
+        }
 
         var k: usize = 0;
         while (k < entries.len) : (k += 1) {
@@ -4216,6 +4404,11 @@ pub const TraceState = struct {
             // bridge row published into `resume_pc`), ordinary-mode loop-done
             // included — never `link_pc`.
             const entered_via_bridge = k > 0 and entries[k - 1].kind == .region_bridge;
+            // Part S: same discipline for a sibling-handoff successor (see
+            // `next_via_handoff` above). Consumed here so every other row kind
+            // (which never follows a handoff row) sees `false`.
+            const entered_via_handoff = next_via_handoff;
+            next_via_handoff = false;
             const owner = self.traceById(e.id) orelse
                 @panic("replayLedger: entry owner id did not resolve");
             // First owner must be the seed (call B enters `seed_owner` directly).
@@ -4282,7 +4475,46 @@ pub const TraceState = struct {
             // DIFFERENT trace than this row's owner — the `succ` zero-exits — keep
             // `onSideExit`: they have no region row of their own, so they are
             // unconsumed by construction and legacy owns them.)
-            const region_consumed = self.accountRegionProfit(region_key, region_work, region_dest);
+            // Freeze-after-qualify fast path (task #70): a frozen activation's
+            // member→member row is credited directly — the same accounting effects
+            // `accountRegionProfit`'s member paths would have applied (credit /
+            // barren-consume against the live accumulator), minus the per-row
+            // classify/choose/destination hash pipeline. Departure shapes (a
+            // successor outside the footprint, a terminal-outside destination, a
+            // keyless row) fall through to the full pipeline, which owns region
+            // lifecycle; after any slow row the burst latch is dropped because
+            // `applyDestination` may have mutated `region_profit`.
+            var region_consumed = false;
+            var fast_done = false;
+            if (frozen_fast) |ff| fast: {
+                if (region_key == null) break :fast;
+                if (!self.traceRegionMemberMemo(owner, ff.key.region_id)) break :fast;
+                switch (region_dest) {
+                    .deferred => {},
+                    .known_trace => |succ_id| {
+                        const succ = self.traceById(succ_id) orelse break :fast;
+                        if (!self.traceRegionMemberMemo(succ, ff.key.region_id)) break :fast;
+                    },
+                    .terminal_outside => break :fast,
+                }
+                region_consumed = true;
+                fast_done = true;
+                if (region_work != 0)
+                    self.creditRegionWork(ff.key, ff.accum, region_work)
+                else
+                    self.noteBarrenConsumed(ff.key, ff.accum);
+                // A barren-run strike inside `noteBarrenConsumed` unfreezes; stop
+                // fast-pathing the rest of the burst the moment that happens.
+                if (!ff.accum.frozen) frozen_fast = null;
+            }
+            if (!fast_done) {
+                region_consumed = self.accountRegionProfit(region_key, region_work, region_dest);
+                // A keyless receipt is a documented no-op (`key orelse return
+                // false`) — it cannot have touched `region_profit`, so the burst
+                // latch survives it. Any other slow row may have open/closed an
+                // activation through `applyDestination`; drop the latch.
+                if (region_key != null) frozen_fast = null;
+            }
 
             // Classify STRICTLY by the static emit-site `kind` (never re-derive the
             // materialization contract from the exit PC — an ordinary `.deopt` whose PC
@@ -4548,8 +4780,13 @@ pub const TraceState = struct {
                             // parent's iterations must leave the delta window here or
                             // the sibling's row re-counts them.
                             prev_cum = e.cum;
-                            // Regs are coherent at the shared anchor and the successor
-                            // row carries the rest of the burst: nothing to steer.
+                            // Publish the shared anchor as the coherent resume (the
+                            // exact move the `.region_bridge` arm makes) and mark the
+                            // successor row anchor-entered, so a terminal deopt or
+                            // prologue-fail on it resumes THERE — never at a `link_pc`
+                            // left behind by earlier linked rows in the same burst.
+                            resume_pc.* = owner.anchor.pc;
+                            next_via_handoff = true;
                             continue;
                         }
                         if (e.outcome != .normal)
@@ -4684,7 +4921,7 @@ pub const TraceState = struct {
                     // bridge row already published the successor's validated
                     // anchor into `resume_pc`; hard-verify the two agree
                     // rather than trusting either alone.
-                    if (entered_via_bridge) {
+                    if (entered_via_bridge or entered_via_handoff) {
                         if (!(ends_link or ends_loop))
                             @panic("replayLedger: bridged successor deopt on a non-body owner shape");
                         if (resume_pc.* != owner.anchor.pc)
@@ -4748,7 +4985,7 @@ pub const TraceState = struct {
                     // coherent at the successor's anchor (which the bridge row
                     // published into `resume_pc`). Zero-progress charge;
                     // resume there, never at the stale `link_pc`.
-                    if (entered_via_bridge) {
+                    if (entered_via_bridge or entered_via_handoff) {
                         if (!(ends_link or ends_loop))
                             @panic("replayLedger: bridged successor prologue-fail on a non-body owner shape");
                         if (resume_pc.* != owner.anchor.pc)
@@ -5266,7 +5503,25 @@ pub const TraceState = struct {
             if (term.kind == .deopt and term.reason == .normal and
                 term.outcome == .normal and term_local == 0)
             {
-                if (self.traceById(term.id)) |owner| self.noteSiblingTerminal(owner, term.exit);
+                if (self.traceById(term.id)) |owner| {
+                    self.noteSiblingTerminal(owner, term.exit);
+                    // Side-trace hotness must see LEDGER terminals too. The scalar
+                    // dispatch path charges `countGuardFailure` on zero-iteration
+                    // guard exits (interp step 4), but a `ledger_len > 1` burst
+                    // returns through here BEFORE that site — so an exit that only
+                    // ever terminates fused bursts never accumulated hotness and
+                    // its alternate path could never tier up. nsieve N=9: the
+                    // zero-trip exit ei=16 terminates 304k bursts per run (every
+                    // prime past m/2) and stayed permanently on the runtime
+                    // turnstile. Same filters as the scalar site: zero progress
+                    // (`term_local == 0` above), a real guard PC, PC nonzero.
+                    if (term.exit < owner.instrs.len) {
+                        if (guardExitPc(owner.instrs[term.exit])) |exit_pc| {
+                            if (exit_pc > 0)
+                                self.countGuardFailure(owner.anchor, exit_pc);
+                        }
+                    }
+                }
             }
         }
         const max_hops: usize = 8;
@@ -5590,10 +5845,10 @@ pub const TraceState = struct {
     /// the next back-edge records a side trace for the alternate path.
     /// Called from the dispatch loop after a zero-iteration guard failure.
     pub fn countGuardFailure(self: *TraceState, anchor: AnchorKey, exit_pc: u32) void {
-        // Don't bother counting if we already have multiple traces here —
+        // Don't bother counting if we already have several traces here —
         // additional side traces beyond the first few have diminishing returns
         // and cause unbounded cache growth on alternating-type loops.
-        if (self.countTracesAt(anchor) >= 2) return;
+        if (self.countTracesAt(anchor) >= self.config.max_traces_per_anchor) return;
 
         const key = GuardKey{ .anchor = anchor, .exit_pc = exit_pc };
         const gop = self.guard_failures.getOrPut(self.gpa, key) catch return;
@@ -5611,7 +5866,7 @@ pub const TraceState = struct {
     /// Called from the dispatch loop when all traces are skipped by
     /// fingerprint mismatch.
     pub fn countFingerprintMiss(self: *TraceState, anchor: AnchorKey) void {
-        if (self.countTracesAt(anchor) >= 2) return;
+        if (self.countTracesAt(anchor) >= self.config.max_traces_per_anchor) return;
         // exit_pc == 0 marks this as a fingerprint miss, not a specific
         // guard failure.  Shares the same counter namespace for the
         // hotguard threshold.
@@ -6689,6 +6944,10 @@ pub const TraceState = struct {
             }
         }
         self.next_region_id = new_id_counter;
+        // Freeze-after-qualify: every branch above may have mutated defs
+        // (new defs, armable recomputes, tombstones) — one bump per rebuild
+        // transaction invalidates all per-trace membership memos.
+        self.region_defs_gen +%= 1;
         freeRegionSetMap(ExitKey, &self.source_exit_regions, gpa);
         freeRegionSetMap(u32, &self.dest_entry_regions, gpa);
         self.source_exit_regions = new_source;
@@ -7057,6 +7316,9 @@ pub const TraceState = struct {
         link.parent.sibling_arms -|= 1;
         link.parent.sibling_watch_exit = std.math.maxInt(u32);
         link.parent.sibling_watch_count = 0;
+        // The arm set touching this trace changed — the ineligible memo may have
+        // been the armed-slot exclusion, so it must be re-derived.
+        link.parent.sibling_reject_exit = std.math.maxInt(u32);
     }
 
     /// A-vii-d.1 (review blocker 3): disarm ONE armed link by registry index —
@@ -7352,6 +7614,43 @@ pub const TraceState = struct {
     }
 
     // --- state machine -----------------------------------------------------
+
+    /// Part S / side-trace precision: consume a pending `wants_side_trace` at a
+    /// LEDGER-burst deopt resume instead of waiting for the next back-edge.
+    ///
+    /// The back-edge consumption in `onBackEdge` is one iteration too late for a
+    /// zero-progress deopt: the resume re-runs the FAILING iteration in tier-0, that
+    /// iteration's closing back-edge arms the recording, and recording then starts on
+    /// the iteration AFTER the failing one — which on an alternating-shape loop is
+    /// almost always the other (already-traced) shape. Measured on nsieve N=9: the
+    /// zero-trip exit crossed `hotguard`, and every recording it triggered captured
+    /// the composite-skip path again — two duplicate traces and the zero-trip shape
+    /// still stranded on the runtime turnstile. Arming AT the resume records the
+    /// re-run of the failing iteration itself, so the captured path is by
+    /// construction the one whose guard kept failing.
+    ///
+    /// Same guards as the back-edge consumption: gated anchors decline, and the
+    /// anchor's failure counters reset so the next crossing needs fresh evidence.
+    /// Returns true iff a recording was armed — the caller must then hand the
+    /// dispatch loop to `.full` (recording records via the `.full` prologue mirror;
+    /// arming from `.fast` and sailing on records NOTHING and commits an empty
+    /// trace at the next back-edge, which is exactly what the first cut did).
+    /// Arms via `pending_replay_anchor` → `maybeStartReplaySide`, the doc-16
+    /// replay-side machinery built for precisely this "record the re-run of the
+    /// current iteration from the coherent anchor" shape — not via a raw `arm()`,
+    /// which is a back-edge-site primitive.
+    pub fn consumeSideTraceWantAtResume(self: *TraceState, proto: *const Proto, resume_pc: u32) bool {
+        const wanted = self.wants_side_trace orelse return false;
+        if (wanted.proto != proto or wanted.pc != resume_pc) return false;
+        self.wants_side_trace = null;
+        const key = AnchorKey{ .proto = proto, .pc = resume_pc };
+        if (self.isRecording() or self.pending_replay_anchor != null or self.isGated(key))
+            return false;
+        self.dbg("side-want-at-resume: arming replay-side recording at pc={d}", .{resume_pc});
+        self.pending_replay_anchor = key;
+        self.clearGuardFailures(key);
+        return true;
+    }
 
     /// Called by the interpreter whenever a back-edge fires (a backward/self jump
     /// to `target_pc`). Drives the trace lifecycle:
@@ -8819,12 +9118,46 @@ pub const TraceState = struct {
             try self.emit(.{ .op = .le, .a = rnext, .b = rlimit_cmp, .ty = .boolean })
         else
             try self.emit(.{ .op = .le, .a = rlimit_cmp, .b = rnext, .ty = .boolean });
-        const done_g = try self.emit(.{ .op = .guard_true, .a = cmp });
-        self.stampProv(done_g, .loop_done, .none, .neutral); // loop-continuation test
 
-        // publish the stepped index and the loop variable (R[a+3]).
-        self.setReg(a, rnext);
-        self.setReg(a + 3, rnext);
+        // Polarity-aware continuation test (the zero-trip / loop-exit direction was
+        // previously unrecordable — the recorder unconditionally asserted `guard_true`,
+        // which contradicts the observed execution whenever tier-0 falls OUT of the
+        // loop here, e.g. a `.side` recording of a skip-shaped iteration whose inner
+        // loop zero-trips). Compute the observed decision with the SAME value-level
+        // ops tier-0 uses (`arith.add`/`lt`/`le` on the runtime values), so the
+        // recorded direction is byte-identical to the path tier-0 actually took —
+        // a pure function of deterministic register values, identical in every
+        // record/exec mode.
+        const vnext = arith.add(vidx, vstep) catch return self.abort(.bad_type);
+        const o_ascending = !(arith.lt(vstep, Value.int(0)) catch return self.abort(.bad_type));
+        const within = if (o_ascending)
+            arith.le(vnext, vlimit) catch return self.abort(.bad_type)
+        else
+            arith.le(vlimit, vnext) catch return self.abort(.bad_type);
+
+        if (within) {
+            // Loop-taken direction (the historical shape): assert the continue test,
+            // publish the stepped index and the loop variable (R[a+3]). The
+            // `guard_true` sourced at a `for_loop` is the loop-done guard — its
+            // failure is the committed post-loop exit (isNumericForLoopDoneGuard).
+            const done_g = try self.emit(.{ .op = .guard_true, .a = cmp });
+            self.stampProv(done_g, .loop_done, .none, .neutral); // loop-continuation test
+            self.setReg(a, rnext);
+            self.setReg(a + 3, rnext);
+        } else {
+            // Loop-exit direction (zero-trip skip / final fall-out): assert the
+            // continue test FAILED and keep recording straight-line past the loop.
+            // tier-0 writes the stepped index back to R[a] but does NOT publish the
+            // visible var R[a+3] on this path — mirror that exactly. A `guard_false`
+            // here is an ORDINARY guard everywhere (loop-done machinery keys on
+            // `guard_true`: isLoopDoneGuardIndex / isNumericForLoopDoneGuard /
+            // irinterp all short-circuit on the op), so its failure deopts under the
+            // H-1b re-execute convention — resume at the anchor with entry values,
+            // tier-0 re-runs the iteration and takes the loop normally.
+            const skip_g = try self.emit(.{ .op = .guard_false, .a = cmp });
+            self.stampProv(skip_g, .loop_done, .none, .neutral); // loop-exit test
+            self.setReg(a, rnext);
+        }
     }
 
     /// `for_prep` (numeric-for entry): the nested-loop **trace-link** site (doc 15,
@@ -8862,12 +9195,61 @@ pub const TraceState = struct {
         // A `for_prep` inside an inlined callee shares `recForLoop`'s cross-frame
         // hazard (raw-pc anchor comparison across protos); keep the historical abort.
         if (self.rec.inline_depth > 0) return self.abort(.nyi_opcode);
+        const a = instr.a;
+
+        // Read + type-check the numeric-for control values up front (both directions
+        // need them; tier-0 `for_prep` type-checks all three and raises TypeError on
+        // a non-number, so a non-number is not a numeric `for` we model — abort).
+        const vinit = regs.get(a);
+        const vlimit = regs.get(a + 1);
+        const vstep = regs.get(a + 2);
+        if (!vinit.isNumber() or !vlimit.isNumber() or !vstep.isNumber()) return self.abort(.bad_type);
+
+        // ZERO-TRIP RECORD-THROUGH. Decide which direction tier-0 is about to take,
+        // with the SAME value-level ops it uses: `for_prep` computes `R[a] = init −
+        // step`, jumps to the `for_loop`, which computes `(init − step) + step` and
+        // compares against the limit (direction by step sign). Note `(init−step)+step`
+        // is NOT always `init` for floats — compute it exactly, never shortcut.
+        // The decision is a pure function of deterministic register values, so it is
+        // identical in every record/exec mode.
+        //
+        // If the loop runs, fall through to the historical `.link` hand-off below.
+        // If it ZERO-TRIPS, the link is meaningless (the inner root assumes ≥1
+        // iteration) and force-closing with `.link` recorded the WRONG shape — the
+        // duplicate-continuation bug that made the skip direction unrecordable.
+        // Instead, record the `for_prep` as the plain arithmetic it is (`R[a] =
+        // init − step`, operands type-guarded) and keep recording: tier-0 jumps to
+        // the `for_loop`, whose recorder mirror (`recForLoop`) now records the
+        // observed loop-EXIT direction (`guard_false` on the continue test) and
+        // continues straight-line past the loop. This is sound for every recording
+        // kind — no link is taken, it is just straight-line code — so a `.root` may
+        // record through a zero-tripping inner `for_prep` too.
+        {
+            const pre = arith.sub(vinit, vstep) catch return self.abort(.bad_type);
+            const vnext = arith.add(pre, vstep) catch return self.abort(.bad_type);
+            const o_ascending = !(arith.lt(vstep, Value.int(0)) catch return self.abort(.bad_type));
+            const within = if (o_ascending)
+                arith.le(vnext, vlimit) catch return self.abort(.bad_type)
+            else
+                arith.le(vlimit, vnext) catch return self.abort(.bad_type);
+            if (!within) {
+                const rinit0 = try self.refOf(a);
+                const rlimit0 = try self.refOf(a + 1);
+                const rstep0 = try self.refOf(a + 2);
+                try self.guardNum(rinit0, vinit, .operand_type, .a);
+                try self.guardNum(rlimit0, vlimit, .operand_type, .a1);
+                try self.guardNum(rstep0, vstep, .operand_type, .a2);
+                const rsub = try self.emit(.{ .op = .sub, .a = rinit0, .b = rstep0, .ty = arithResultType(.sub, vinit, vstep) });
+                self.setReg(a, rsub);
+                return;
+            }
+        }
+
         // Only a *side* or *continuation* links (LuaJIT's model). A `.root` recording
         // that reaches an inner `for_prep` aborts LINNER — byte-identical to the
         // pre-Phase-2 behaviour — so it never anchors a link trace at a real
         // back-edge target.
         if (self.rec.kind == .root) return self.abort(.nyi_opcode);
-        const a = instr.a;
 
         // Locate the matching `for_loop` (the forward jump target) and verify the
         // shape. `pc` is the post-increment pc, so `pc + instr.aux` is the `for_loop`
@@ -8894,12 +9276,7 @@ pub const TraceState = struct {
         // Reconstruct the inner root's entry state (discharges P2 — see the doc
         // comment). Guard init/limit/step are numbers (all three — tier-0 `for_prep`
         // type-checks `limit` too, so a non-number limit must side-exit here rather
-        // than commit a bogus link); a non-number is not a numeric `for` we model, so
-        // fall back to the abort.
-        const vinit = regs.get(a);
-        const vlimit = regs.get(a + 1);
-        const vstep = regs.get(a + 2);
-        if (!vinit.isNumber() or !vlimit.isNumber() or !vstep.isNumber()) return self.abort(.bad_type);
+        // than commit a bogus link); already checked at the top of this fn.
         const rinit = try self.refOf(a);
         const rlimit = try self.refOf(a + 1);
         const rstep = try self.refOf(a + 2);
