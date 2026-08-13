@@ -139,6 +139,15 @@ pub const ExecResult = struct {
     /// consumes them in 2.3c-2b. Native only — tier-1a leaves it 0 (defaulted, so the
     /// ~40 tier-1a construction sites are untouched).
     ledger_len: usize = 0,
+    /// Doc 17 B-3 frozen silent-burst ABI. Tier-1a and B-3a native runs leave these
+    /// zero; B-3b will consume them through the universal native-result drain.
+    silent_active: u64 = 0,
+    silent_transitions: u64 = 0,
+    silent_budget: u64 = 0,
+    barren_budget: u64 = 0,
+    silent_cell: u64 = 0,
+    cur_zero_run: u64 = 0,
+    silent_cum: u64 = 0,
 };
 
 /// 2.3c-2c (doc 17): which exit-materialization SITE appended a ledger entry —

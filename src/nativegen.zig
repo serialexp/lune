@@ -79,6 +79,16 @@ pub const MapError = error{
     MprotectFailed,
 };
 
+pub const PatchError = MapError || error{
+    NotArenaOwned,
+    WrongArena,
+    StalePage,
+    OffsetOutOfBounds,
+    OpcodeMismatch,
+    OriginalBytesMismatch,
+    DisplacementOutOfRange,
+};
+
 /// A callable view of emitted machine code. `entry()` reinterprets its base as a
 /// function pointer; `deinit()` releases the backing memory.
 ///
@@ -102,6 +112,9 @@ pub const ExecPage = struct {
         /// The slot's *capacity* (16-aligned `code.len` at alloc time), returned to
         /// the free-list on `deinit` so a reused slot never shrinks.
         cap: usize,
+        /// Unique allocation incarnation. A free-list reuse gets a fresh value,
+        /// so a stale patch descriptor cannot rewrite unrelated replacement code.
+        generation: u64,
     };
 
     const Owner = union(enum) {
@@ -120,7 +133,7 @@ pub const ExecPage = struct {
     pub fn deinit(self: *ExecPage) void {
         switch (self.owner) {
             .owned => |mem| if (comptime is_x64_linux) std.posix.munmap(mem),
-            .arena => |slot| slot.arena.free(slot.region, slot.offset, slot.cap),
+            .arena => |slot| slot.arena.free(slot.region, slot.offset, slot.cap, slot.generation),
         }
         self.* = undefined;
     }
@@ -204,10 +217,13 @@ pub const McodeArena = struct {
 
     /// A returned slot available for reuse. `cap` is the slot's 16-aligned capacity.
     const FreeBlock = struct { region: u32, offset: usize, cap: usize };
+    const LivePage = struct { region: u32, offset: usize, generation: u64 };
 
     gpa: std.mem.Allocator,
     regions: std.ArrayListUnmanaged(Region) = .empty,
     free_list: std.ArrayListUnmanaged(FreeBlock) = .empty,
+    live_pages: std.ArrayListUnmanaged(LivePage) = .empty,
+    next_page_generation: u64 = 1,
     /// The shared frameless trampoline (P-A / doc 17 Increment 2), emitted lazily on
     /// the first `compileInto`. Absolute addresses into a permanent arena slot that is
     /// never freed — stable for the arena's lifetime (regions never move). `null`
@@ -275,6 +291,7 @@ pub const McodeArena = struct {
         }
         self.regions.deinit(self.gpa);
         self.free_list.deinit(self.gpa);
+        self.live_pages.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -324,11 +341,13 @@ pub const McodeArena = struct {
                 try protectRegion(region_mem, false);
                 @memcpy(region_mem[fb.offset..][0..code.len], code);
                 try protectRegion(region_mem, true);
+                const generation = self.takePageGeneration();
+                try self.live_pages.append(self.gpa, .{ .region = fb.region, .offset = fb.offset, .generation = generation });
                 _ = self.free_list.swapRemove(i);
                 return .{
                     .code = region_mem[fb.offset..][0..code.len],
                     // Keep the original slot capacity so a re-free never shrinks it.
-                    .owner = .{ .arena = .{ .arena = self, .region = fb.region, .offset = fb.offset, .cap = fb.cap } },
+                    .owner = .{ .arena = .{ .arena = self, .region = fb.region, .offset = fb.offset, .cap = fb.cap, .generation = generation } },
                 };
             }
         }
@@ -350,16 +369,102 @@ pub const McodeArena = struct {
         try protectRegion(region.mem, false);
         @memcpy(region.mem[off..][0..code.len], code);
         try protectRegion(region.mem, true);
+        const generation = self.takePageGeneration();
+        try self.live_pages.append(self.gpa, .{ .region = region_idx, .offset = off, .generation = generation });
         region.used += cap;
         return .{
             .code = region.mem[off..][0..code.len],
-            .owner = .{ .arena = .{ .arena = self, .region = region_idx, .offset = off, .cap = cap } },
+            .owner = .{ .arena = .{ .arena = self, .region = region_idx, .offset = off, .cap = cap, .generation = generation } },
         };
+    }
+
+    fn takePageGeneration(self: *McodeArena) u64 {
+        const generation = self.next_page_generation;
+        self.next_page_generation +%= 1;
+        if (self.next_page_generation == 0) self.next_page_generation = 1;
+        return generation;
+    }
+
+    fn validatePatchPage(self: *McodeArena, page: *const ExecPage, generation: u64, patch_off: usize) PatchError!*Region {
+        const slot = switch (page.owner) {
+            .arena => |s| s,
+            .owned => return error.NotArenaOwned,
+        };
+        if (slot.arena != self) return error.WrongArena;
+        if (slot.generation != generation) return error.StalePage;
+        var live = false;
+        for (self.live_pages.items) |allocation| {
+            if (allocation.region == slot.region and allocation.offset == slot.offset and allocation.generation == generation) {
+                live = true;
+                break;
+            }
+        }
+        if (!live) return error.StalePage;
+        if (slot.region >= self.regions.items.len) return error.StalePage;
+        if (patch_off > page.code.len or page.code.len - patch_off < 5) return error.OffsetOutOfBounds;
+        const region = &self.regions.items[slot.region];
+        if (slot.offset > region.used or page.code.len > region.used - slot.offset) return error.StalePage;
+        if (page.code.ptr != region.mem.ptr + slot.offset) return error.StalePage;
+        return region;
+    }
+
+    fn rel32Bytes(page: *const ExecPage, patch_off: usize, target: usize) PatchError![5]u8 {
+        const next = @intFromPtr(page.code.ptr) + patch_off + 5;
+        const delta: i128 = @as(i128, @intCast(target)) - @as(i128, @intCast(next));
+        if (delta < std.math.minInt(i32) or delta > std.math.maxInt(i32))
+            return error.DisplacementOutOfRange;
+        const disp: u32 = @bitCast(@as(i32, @intCast(delta)));
+        return .{ 0xE9, @truncate(disp), @truncate(disp >> 8), @truncate(disp >> 16), @truncate(disp >> 24) };
+    }
+
+    fn applyPatch(self: *McodeArena, region: *Region, dst: []u8, replacement: []const u8) PatchError!void {
+        try protectRegion(region.mem, false);
+        // Once RW is established there is no fallible apply step. RX restoration is
+        // a soundness boundary, not a recoverable compile miss.
+        @memcpy(dst, replacement);
+        protectRegion(region.mem, true) catch @panic("McodeArena: failed to restore RX after patch");
+        _ = self;
+    }
+
+    /// Swap only the rel32 operand of an existing `E9 rel32`. The opcode and live
+    /// page incarnation are validated before W^X is opened.
+    pub fn patchRel32(self: *McodeArena, page: *ExecPage, generation: u64, patch_off: usize, target: usize) PatchError!void {
+        const region = try self.validatePatchPage(page, generation, patch_off);
+        if (page.code[patch_off] != 0xE9) return error.OpcodeMismatch;
+        const replacement = try rel32Bytes(page, patch_off, target);
+        // Preserve the existing E9 byte: ordinary deopt patching changes its four-byte
+        // operand only, matching the accepted B3.13 contract.
+        try self.applyPatch(region, page.code[patch_off + 1 .. patch_off + 5], replacement[1..5]);
+    }
+
+    /// Promote/demote a canonical five-byte NOP window. Promotion requires the exact
+    /// recorded original bytes; demotion requires the exact E9-to-epilogue bytes and
+    /// restores all five original bytes.
+    pub fn patchWindow(self: *McodeArena, page: *ExecPage, generation: u64, patch_off: usize, original: [5]u8, epilogue: usize, promote: bool) PatchError!void {
+        const region = try self.validatePatchPage(page, generation, patch_off);
+        const patched = try rel32Bytes(page, patch_off, epilogue);
+        const expected = if (promote) original else patched;
+        if (!std.mem.eql(u8, page.code[patch_off..][0..5], &expected))
+            return if (promote) error.OriginalBytesMismatch else error.OpcodeMismatch;
+        const replacement = if (promote) patched else original;
+        try self.applyPatch(region, page.code[patch_off..][0..5], &replacement);
     }
 
     /// Return a slot to the free-list. Best-effort: on OOM the slot is simply leaked
     /// back into the region (dead space until arena deinit) — never fatal.
-    pub fn free(self: *McodeArena, region: u32, offset: usize, cap: usize) void {
+    pub fn free(self: *McodeArena, region: u32, offset: usize, cap: usize, generation: u64) void {
+        var i: usize = self.live_pages.items.len;
+        var removed = false;
+        while (i > 0) {
+            i -= 1;
+            const live = self.live_pages.items[i];
+            if (live.region == region and live.offset == offset and live.generation == generation) {
+                _ = self.live_pages.swapRemove(i);
+                removed = true;
+                break;
+            }
+        }
+        if (!removed) return;
         self.free_list.append(self.gpa, .{ .region = region, .offset = offset, .cap = cap }) catch {};
     }
 };
@@ -638,6 +743,67 @@ const NativeResult = extern struct {
     /// `replayLedger` tell a forced yield apart from a natural terminal at the last
     /// entry. Appended last (after `ledger_kind`), same byte-identity rationale.
     ledger_outcome: [irinterp.LEDGER_CAP]u32,
+    // Doc 17 B-3 frozen tail. These stay unreachable/zero in B-3a: only a future
+    // validated exit patch can enter a silent epilogue.
+    silent_active: u64,
+    silent_transitions: u64,
+    silent_budget: u64,
+    barren_budget: u64,
+    silent_cell: u64,
+    cur_zero_run: u64,
+    silent_cum: u64,
+};
+
+/// The pre-B-3 ABI prefix, retained solely as a compile-time layout oracle. Appending
+/// the silent tail must not move any existing ledger lane.
+const NativeResultLedgerLayout = extern struct {
+    completed: usize,
+    exit_instr: u32,
+    linked_loop_done: u64,
+    final_trace_id: u32,
+    entry_rbx: usize,
+    exit_reason: u32,
+    exit_target: usize,
+    ledger_len: usize,
+    ledger_cum: [irinterp.LEDGER_CAP]usize,
+    ledger_id: [irinterp.LEDGER_CAP]u32,
+    ledger_exit: [irinterp.LEDGER_CAP]u32,
+    ledger_reason: [irinterp.LEDGER_CAP]u32,
+    ledger_kind: [irinterp.LEDGER_CAP]u32,
+    ledger_outcome: [irinterp.LEDGER_CAP]u32,
+};
+
+comptime {
+    for (.{ "ledger_len", "ledger_cum", "ledger_id", "ledger_exit", "ledger_reason", "ledger_kind", "ledger_outcome" }) |field|
+        std.debug.assert(@offsetOf(NativeResult, field) == @offsetOf(NativeResultLedgerLayout, field));
+    std.debug.assert(@offsetOf(NativeResult, "silent_active") == @sizeOf(NativeResultLedgerLayout));
+    std.debug.assert(@offsetOf(NativeResult, "silent_cum") == @offsetOf(NativeResult, "silent_active") + 6 * @sizeOf(u64));
+}
+
+pub const SilentSummaryCell = extern struct {
+    region_work: u64,
+    selection_work: u64,
+    qualifying_rows: u64,
+};
+
+/// Runtime-owned payload addressed through a compile-time-owned pointer cell. B-3a
+/// freezes this transport; B-3b will allocate/populate instances before patching.
+pub const SilentExitMetadata = extern struct {
+    summary: *SilentSummaryCell,
+    slot: *usize,
+    min_useful: u64,
+};
+
+pub const ExitPatchKind = enum(u8) { deopt, link_terminal, loop_done_linked };
+pub const EXIT_NOP5 = [5]u8{ 0x0F, 0x1F, 0x44, 0x00, 0x00 };
+
+pub const ExitPatch = struct {
+    kind: ExitPatchKind,
+    exit_instr: u32,
+    patch_off: u32,
+    original: [5]u8,
+    epilogue_off: u32,
+    metadata_cell: *usize,
 };
 
 /// A compiled trace: an executable page whose entry is
@@ -686,6 +852,10 @@ pub const CompiledTrace = struct {
     /// on the same builds as `linked_entry` (frameless production only). Points into
     /// the same owned `page`; no separate free. INERT until 2.3c-2 arms a slot to it.
     ordinary_entry: ?usize = null,
+    /// B-3a patch descriptors and stable per-exit metadata pointer cells. The cells
+    /// remain null and every epilogue unreachable until B-3b publishes promotion.
+    exit_patches: []ExitPatch = &.{},
+    metadata_cells: []usize = &.{},
 
     pub const EntryFn = fn ([*]u8, [*]u64, *NativeResult) callconv(.c) void;
     /// The shared frameless trampoline's C-ABI type: SoA lanes + result out-param,
@@ -752,6 +922,13 @@ pub const CompiledTrace = struct {
             .ledger_reason = undefined,
             .ledger_kind = undefined,
             .ledger_outcome = undefined,
+            .silent_active = 0,
+            .silent_transitions = 0,
+            .silent_budget = 0,
+            .barren_budget = 0,
+            .silent_cell = 0,
+            .cur_zero_run = 0,
+            .silent_cum = 0,
         };
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
@@ -816,12 +993,28 @@ pub const CompiledTrace = struct {
             .local_completed = local,
             .exit_reason = @enumFromInt(result.exit_reason),
             .ledger_len = result.ledger_len,
+            .silent_active = result.silent_active,
+            .silent_transitions = result.silent_transitions,
+            .silent_budget = result.silent_budget,
+            .barren_budget = result.barren_budget,
+            .silent_cell = result.silent_cell,
+            .cur_zero_run = result.cur_zero_run,
+            .silent_cum = result.silent_cum,
+        };
+    }
+
+    pub fn pageGeneration(self: *const CompiledTrace) ?u64 {
+        return switch (self.page.owner) {
+            .arena => |slot| slot.generation,
+            .owned => null,
         };
     }
 
     pub fn deinit(self: *CompiledTrace) void {
         self.page.deinit();
         if (self.slots.len > 0) self.gpa.free(self.slots);
+        if (self.exit_patches.len > 0) self.gpa.free(self.exit_patches);
+        if (self.metadata_cells.len > 0) self.gpa.free(self.metadata_cells);
         self.* = undefined;
     }
 };
@@ -909,6 +1102,8 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
     // so `slots.len == n` and every index is a real IR exit slot that `armNativeLink`
     // may legitimately arm.
     var slots: []usize = &.{};
+    var metadata_cells: []usize = &.{};
+    var patch_emissions: []?PatchEmission = &.{};
     if (arena) |ar| {
         // A frameless body may only address SPILL_MAX spill slots (the trampoline
         // reserves exactly that many). Beyond it → bail to tier-1a.
@@ -918,23 +1113,82 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
         tramp_entry = tr.entry;
         slots = gpa.alloc(usize, n) catch return null;
         @memset(slots, tr.shared_exit);
+        metadata_cells = gpa.alloc(usize, n) catch {
+            gpa.free(slots);
+            return null;
+        };
+        @memset(metadata_cells, 0);
+        patch_emissions = gpa.alloc(?PatchEmission, n) catch {
+            gpa.free(metadata_cells);
+            gpa.free(slots);
+            return null;
+        };
+        @memset(patch_emissions, null);
     }
+    defer if (patch_emissions.len > 0) gpa.free(patch_emissions);
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    const entry_stubs = lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit, slots) catch {
+    const entry_stubs = lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit, slots, metadata_cells, patch_emissions) catch {
+        if (metadata_cells.len > 0) gpa.free(metadata_cells);
         if (slots.len > 0) gpa.free(slots);
         return null;
     };
     asm_buf.resolve();
 
+    var patch_count: usize = 0;
+    for (patch_emissions) |p| if (p != null) {
+        patch_count += 1;
+    };
+    var exit_patches: []ExitPatch = &.{};
+    if (patch_count > 0) {
+        exit_patches = gpa.alloc(ExitPatch, patch_count) catch {
+            gpa.free(metadata_cells);
+            gpa.free(slots);
+            return null;
+        };
+        var pi: usize = 0;
+        for (patch_emissions, 0..) |maybe, ei| if (maybe) |em| {
+            const off = em.patch_off;
+            if (off > asm_buf.code.items.len or asm_buf.code.items.len - off < 5) {
+                gpa.free(exit_patches);
+                gpa.free(metadata_cells);
+                gpa.free(slots);
+                return null;
+            }
+            var original: [5]u8 = undefined;
+            @memcpy(&original, asm_buf.code.items[off..][0..5]);
+            if ((em.kind == .deopt and original[0] != 0xE9) or
+                (em.kind != .deopt and !std.mem.eql(u8, &original, &EXIT_NOP5)))
+            {
+                gpa.free(exit_patches);
+                gpa.free(metadata_cells);
+                gpa.free(slots);
+                return null;
+            }
+            exit_patches[pi] = .{
+                .kind = em.kind,
+                .exit_instr = @intCast(ei),
+                .patch_off = @intCast(off),
+                .original = original,
+                .epilogue_off = @intCast(asm_buf.labelOffset(em.epilogue)),
+                .metadata_cell = &metadata_cells[ei],
+            };
+            pi += 1;
+        };
+    }
+
     const page = if (arena) |a|
         a.alloc(asm_buf.code.items) catch {
+            if (exit_patches.len > 0) gpa.free(exit_patches);
+            if (metadata_cells.len > 0) gpa.free(metadata_cells);
             if (slots.len > 0) gpa.free(slots);
             return null;
         }
     else
         mapExecutable(asm_buf.code.items) catch {
+            if (exit_patches.len > 0) gpa.free(exit_patches);
+            if (metadata_cells.len > 0) gpa.free(metadata_cells);
             if (slots.len > 0) gpa.free(slots);
             return null;
         };
@@ -945,6 +1199,8 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
         if (off >= page.code.len) {
             var invalid_page = page;
             invalid_page.deinit();
+            if (exit_patches.len > 0) gpa.free(exit_patches);
+            if (metadata_cells.len > 0) gpa.free(metadata_cells);
             if (slots.len > 0) gpa.free(slots);
             return null;
         }
@@ -954,6 +1210,8 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
         if (off >= page.code.len) {
             var invalid_page = page;
             invalid_page.deinit();
+            if (exit_patches.len > 0) gpa.free(exit_patches);
+            if (metadata_cells.len > 0) gpa.free(metadata_cells);
             if (slots.len > 0) gpa.free(slots);
             return null;
         }
@@ -972,6 +1230,8 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
         .gpa = gpa,
         .linked_entry = linked_entry,
         .ordinary_entry = ordinary_entry,
+        .exit_patches = exit_patches,
+        .metadata_cells = metadata_cells,
     };
 }
 
@@ -3365,6 +3625,95 @@ fn emitForcedYieldCheck(a: *x64.Assembler, shared_exit: usize) !void {
     a.bind(do_jmp);
 }
 
+/// B-3a's unreachable silent tail. `metadata_cell` is a stable compile-time-owned
+/// pointer cell; B-3b publishes a `*SilentExitMetadata` into it before patching.
+fn emitSilentEpilogue(a: *x64.Assembler, kind: ExitPatchKind, metadata_cell: *usize, shared_exit: usize, trace_id: u32) !void {
+    const owned = try a.label();
+    const qualified_done = try a.label();
+    const zero_done = try a.label();
+    const reset_zero = try a.label();
+    const exhausted = try a.label();
+
+    // Final round-5 ordering: kind-specific materialization is complete before this
+    // store, and every promoted epilogue publishes the exact cumulative rbx baseline.
+    try a.movMemReg(.rdx, @offsetOf(NativeResult, "silent_cum"), .rbx);
+    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "silent_active"), 1);
+
+    // rax = *SilentExitMetadata (the cell is null while unreachable in B-3a).
+    try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(metadata_cell))));
+    try a.movRegMem(.rax, .rax, 0);
+    // First-cell ownership: preserve the first promoted edge observed in this call.
+    try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "silent_cell"), 0);
+    try a.jcc(.ne, owned);
+    try a.movMemReg(.rdx, @offsetOf(NativeResult, "silent_cell"), .rax);
+    a.bind(owned);
+
+    // r8 = dynamic local = current rbx - this body's entry rbx; rcx = edge cell.
+    try a.movRegReg(.r8, .rbx);
+    try a.subRegMem(.r8, .rdx, @offsetOf(NativeResult, "entry_rbx"));
+    try a.movRegMem(.rcx, .rax, @offsetOf(SilentExitMetadata, "summary"));
+
+    switch (kind) {
+        .deopt => {
+            try a.addMemReg(.rcx, @offsetOf(SilentSummaryCell, "region_work"), .r8);
+            try a.addMemReg(.rcx, @offsetOf(SilentSummaryCell, "selection_work"), .r8);
+            try a.cmpRegMem(.r8, .rax, @offsetOf(SilentExitMetadata, "min_useful"));
+            try a.jcc(.b, qualified_done);
+            try a.incMemQword(.rcx, @offsetOf(SilentSummaryCell, "qualifying_rows"));
+            a.bind(qualified_done);
+            try a.cmpRegImm32(.r8, 0);
+            try a.jcc(.ne, reset_zero);
+            try a.incMemQword(.rdx, @offsetOf(NativeResult, "cur_zero_run"));
+            try a.jmp(zero_done);
+        },
+        .loop_done_linked => {
+            // region_work += 1; selection_work += max(local, 1).
+            try a.movRegImm64(.r9, 1);
+            try a.addMemReg(.rcx, @offsetOf(SilentSummaryCell, "region_work"), .r9);
+            try a.cmpRegImm32(.r8, 0);
+            const local_nonzero = try a.label();
+            try a.jcc(.ne, local_nonzero);
+            try a.movRegImm64(.r8, 1);
+            a.bind(local_nonzero);
+            try a.addMemReg(.rcx, @offsetOf(SilentSummaryCell, "selection_work"), .r8);
+            try a.cmpRegMem(.r8, .rax, @offsetOf(SilentExitMetadata, "min_useful"));
+            try a.jcc(.b, qualified_done);
+            try a.incMemQword(.rcx, @offsetOf(SilentSummaryCell, "qualifying_rows"));
+            a.bind(qualified_done);
+            try a.jmp(reset_zero);
+        },
+        .link_terminal => {
+            // Structural only: no work cells; a zero-work link advances the barren run.
+            try a.incMemQword(.rdx, @offsetOf(NativeResult, "cur_zero_run"));
+            try a.jmp(zero_done);
+        },
+    }
+    a.bind(reset_zero);
+    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "cur_zero_run"), 0);
+    a.bind(zero_done);
+
+    try a.incMemQword(.rdx, @offsetOf(NativeResult, "silent_transitions"));
+    try a.movRegMem(.r8, .rdx, @offsetOf(NativeResult, "silent_transitions"));
+    try a.cmpRegMem(.r8, .rdx, @offsetOf(NativeResult, "silent_budget"));
+    try a.jcc(.ae, exhausted);
+    try a.movRegMem(.r8, .rdx, @offsetOf(NativeResult, "cur_zero_run"));
+    // Final round-5 barren comparison is absolute: cur_zero_run >= max_barren_run,
+    // with max_barren_run staged directly in barren_budget.
+    try a.cmpRegMem(.r8, .rdx, @offsetOf(NativeResult, "barren_budget"));
+    try a.jcc(.ae, exhausted);
+
+    // Continue through the same per-exit slot as the reporting path.
+    try a.movRegMem(.rax, .rax, @offsetOf(SilentExitMetadata, "slot"));
+    try a.movRegMem(.rax, .rax, 0);
+    try a.jmpReg(.rax);
+
+    a.bind(exhausted);
+    try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+    try a.movMemImm32(.rdx, @offsetOf(NativeResult, "final_trace_id"), @bitCast(trace_id));
+    try a.movRegImm64(.rax, @bitCast(@as(u64, shared_exit)));
+    try a.jmpReg(.rax);
+}
+
 fn nativeExitLabel(a: *x64.Assembler, exit_labels: []?x64.Label, instr_idx: usize) !x64.Label {
     if (exit_labels[instr_idx]) |l| return l;
     const l = try a.label();
@@ -3725,12 +4074,18 @@ const EntryStubs = struct {
     ordinary_entry: ?usize = null,
 };
 
+const PatchEmission = struct {
+    kind: ExitPatchKind,
+    patch_off: usize,
+    epilogue: x64.Label,
+};
+
 /// Lower a proven trace to machine code (cut-2). ABI: rdi = tags base, rsi = payloads
 /// base (the SoA register file's two lanes), rdx = native result out-param, rbx =
 /// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
 /// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
 /// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
-fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize) !EntryStubs {
+fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, metadata_cells: []usize, patch_emissions: []?PatchEmission) !EntryStubs {
     const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(exit_labels);
     @memset(exit_labels, null);
@@ -4602,6 +4957,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 }
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
                 try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
+                if (shared_exit != null) {
+                    const silent = try a.label();
+                    patch_emissions[i] = .{ .kind = .link_terminal, .patch_off = a.code.items.len, .epilogue = silent };
+                    try a.nop5();
+                }
                 // 2.3c-2a: record this `.link` transition (chain source C→I) before the
                 // handoff. `exit_instr` = i is now in memory; `exit_reason` is the inherited
                 // `.normal`.
@@ -4703,6 +5063,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     try a.movMemReg(.rdx, @offsetOf(NativeResult, "exit_target"), .rax);
                 }
             }
+            if (shared_exit != null and !isNumericForLoopDoneGuard(t, ei) and !isCompositeBridgeCandidate(t, ei)) {
+                const silent = try a.label();
+                patch_emissions[ei] = .{ .kind = .deopt, .patch_off = a.code.items.len, .epilogue = silent };
+            }
             try a.jmp(deopt_exit);
         }
     }
@@ -4716,6 +5080,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             a.bind(l);
             try emitLinkedLoopDoneSnapshot(a, t, kinds, alloc, ei);
             try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+            if (shared_exit != null) {
+                const silent = try a.label();
+                patch_emissions[ei] = .{ .kind = .loop_done_linked, .patch_off = a.code.items.len, .epilogue = silent };
+                try a.nop5();
+            }
             // 2.3c-2a: record this loop-done transition (chain source I→C once 2.3c-2c
             // arms slot[ei]) before the handoff. `exit_instr` = ei was written into memory
             // by the mini-stub (its `jne` reached here); `exit_reason` is `.normal`.
@@ -4800,6 +5169,24 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     try emitLedgerAppend(a, t.id, .prologue_fail);
     try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
 
+    // B-3a: all silent epilogues live out of line in this same allocation. Their
+    // metadata cells are null and no patch targets them yet, so they are unreachable
+    // while the feature is off. Each kind's state materialization precedes its patch
+    // point; ordinary deopt duplicates the shared carried-home flush here.
+    if (shared_exit) |se| {
+        for (patch_emissions, 0..) |maybe, ei| if (maybe) |em| {
+            a.bind(em.epilogue);
+            if (em.kind == .deopt) {
+                for (alloc.slots) |s| {
+                    if (s.class != .carried) continue;
+                    try flushSlot(a, @as(i32, s.slot), s.kind, slotHomePlace(s));
+                }
+                try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+            }
+            try emitSilentEpilogue(a, em.kind, &metadata_cells[ei], se, t.id);
+        };
+    }
+
     // LINKED_ENTRY (doc 17, 2.3b-0): a secondary entry point for an armed native
     // `.link`-terminal handoff. A parent whose slot is armed into THIS trace targets
     // this stub instead of `body_entry` so a numeric-for loop-done inside this body
@@ -4871,6 +5258,137 @@ fn runNative(ct: CompiledTrace, regs: []Value) !irinterp.ExecResult {
     const result = ct.run(RegWindow.of(tags, pays));
     for (regs, 0..) |*v, i| v.* = .{ .tag = @enumFromInt(tags[i]), .payload = .{ .bits = pays[i] } };
     return result;
+}
+
+test "nativegen B-3a: NativeResult silent ABI tail preserves every ledger offset" {
+    try testing.expectEqual(@offsetOf(NativeResultLedgerLayout, "ledger_len"), @offsetOf(NativeResult, "ledger_len"));
+    try testing.expectEqual(@offsetOf(NativeResultLedgerLayout, "ledger_cum"), @offsetOf(NativeResult, "ledger_cum"));
+    try testing.expectEqual(@offsetOf(NativeResultLedgerLayout, "ledger_id"), @offsetOf(NativeResult, "ledger_id"));
+    try testing.expectEqual(@offsetOf(NativeResultLedgerLayout, "ledger_exit"), @offsetOf(NativeResult, "ledger_exit"));
+    try testing.expectEqual(@offsetOf(NativeResultLedgerLayout, "ledger_reason"), @offsetOf(NativeResult, "ledger_reason"));
+    try testing.expectEqual(@offsetOf(NativeResultLedgerLayout, "ledger_kind"), @offsetOf(NativeResult, "ledger_kind"));
+    try testing.expectEqual(@offsetOf(NativeResultLedgerLayout, "ledger_outcome"), @offsetOf(NativeResult, "ledger_outcome"));
+    try testing.expectEqual(@sizeOf(NativeResultLedgerLayout), @offsetOf(NativeResult, "silent_active"));
+}
+
+test "nativegen B-3a: McodeArena patchRel32 and patchWindow validate patch and restore" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    var arena = McodeArena.init(testing.allocator);
+    defer arena.deinit();
+
+    var original: [26]u8 = @splat(0xC3);
+    original[0..5].* = .{ 0xE9, 0, 0, 0, 0 };
+    original[5..10].* = EXIT_NOP5;
+    var page = try arena.alloc(&original);
+    defer page.deinit();
+    const generation = switch (page.owner) {
+        .arena => |slot| slot.generation,
+        .owned => unreachable,
+    };
+    const base = @intFromPtr(page.code.ptr);
+
+    try arena.patchRel32(&page, generation, 0, base + 24);
+    try testing.expectEqual(@as(u8, 0xE9), page.code[0]);
+    try testing.expect(!std.mem.eql(u8, page.code[1..5], original[1..5]));
+    try arena.patchRel32(&page, generation, 0, base + 5);
+    try testing.expectEqualSlices(u8, original[0..5], page.code[0..5]);
+
+    try arena.patchWindow(&page, generation, 5, EXIT_NOP5, base + 24, true);
+    try testing.expectEqual(@as(u8, 0xE9), page.code[5]);
+    try arena.patchWindow(&page, generation, 5, EXIT_NOP5, base + 24, false);
+    try testing.expectEqualSlices(u8, &EXIT_NOP5, page.code[5..10]);
+
+    try testing.expectError(error.StalePage, arena.patchRel32(&page, generation + 1, 0, base + 5));
+    try testing.expectError(error.OffsetOutOfBounds, arena.patchRel32(&page, generation, page.code.len - 4, base));
+    try testing.expectError(error.OpcodeMismatch, arena.patchRel32(&page, generation, 10, base));
+    try testing.expectError(error.OriginalBytesMismatch, arena.patchWindow(&page, generation, 5, .{ 1, 2, 3, 4, 5 }, base + 24, true));
+    try testing.expectError(error.OpcodeMismatch, arena.patchWindow(&page, generation, 5, EXIT_NOP5, base + 24, false));
+    try testing.expectError(error.DisplacementOutOfRange, arena.patchRel32(&page, generation, 0, std.math.maxInt(usize)));
+    try testing.expectEqualSlices(u8, original[0..10], page.code[0..10]);
+
+    var other = McodeArena.init(testing.allocator);
+    defer other.deinit();
+    try testing.expectError(error.WrongArena, other.patchRel32(&page, generation, 0, base + 5));
+
+    var owned = try mapExecutable(&.{ 0xE9, 0, 0, 0, 0 });
+    defer owned.deinit();
+    try testing.expectError(error.NotArenaOwned, arena.patchRel32(&owned, generation, 0, @intFromPtr(owned.code.ptr) + 5));
+
+    var retired = try arena.alloc(&.{ 0xE9, 0, 0, 0, 0 });
+    var stale = retired;
+    const stale_generation = switch (stale.owner) {
+        .arena => |slot| slot.generation,
+        .owned => unreachable,
+    };
+    retired.deinit();
+    var replacement = try arena.alloc(&.{ 0xE9, 0, 0, 0, 0 });
+    defer replacement.deinit();
+    try testing.expectError(error.StalePage, arena.patchRel32(&stale, stale_generation, 0, @intFromPtr(stale.code.ptr) + 5));
+}
+
+test "nativegen B-3a: link and linked-loop-done exits contain inert NOP windows" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var arena = McodeArena.init(gpa);
+    defer arena.deinit();
+
+    var link_code = [_]bytecode.Instr{bytecode.Instr.op0(.halt)};
+    var link_proto = bytecode.Proto{ .code = &link_code, .name = "b3-link", .id = 501 };
+    var link_instrs = [_]I{.{ .op = .link, .aux = 0 }};
+    var link_trace = Trace{ .id = 501, .anchor = .{ .proto = &link_proto, .pc = 0 }, .instrs = &link_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var link_ct = compileInto(gpa, &arena, &link_trace) orelse return error.NativeBailedUnexpectedly;
+    defer link_ct.deinit();
+    var saw_link = false;
+    for (link_ct.exit_patches) |p| if (p.kind == .link_terminal) {
+        saw_link = true;
+        try testing.expectEqualSlices(u8, &EXIT_NOP5, link_ct.page.code[p.patch_off..][0..5]);
+        try testing.expectEqual(@as(usize, 0), p.metadata_cell.*);
+    };
+    try testing.expect(saw_link);
+    var no_tags = [_]u8{};
+    var no_payloads = [_]u64{};
+    const unpatched = link_ct.run(RegWindow.of(&no_tags, &no_payloads));
+    try testing.expectEqual(@as(u64, 0), unpatched.silent_active);
+    try testing.expectEqual(@as(u64, 0), unpatched.silent_transitions);
+    try testing.expectEqual(@as(u64, 0), unpatched.silent_cell);
+    try testing.expectEqual(@as(u64, 0), unpatched.silent_cum);
+
+    var loop_code = [_]bytecode.Instr{ bytecode.Instr.op0(.halt), bytecode.Instr.opAx(.for_loop, 0, 0), bytecode.Instr.op0(.halt) };
+    var loop_proto = bytecode.Proto{ .code = &loop_code, .name = "b3-loopdone", .id = 502 };
+    var loop_instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_int, .a = 0 },
+        .{ .op = .guard_int, .a = 1 },
+        .{ .op = .lt, .a = 0, .b = 1 },
+        .{ .op = .guard_true, .a = 4, .aux = 2 },
+        .{ .op = .loop },
+    };
+    var loop_trace = Trace{ .id = 502, .anchor = .{ .proto = &loop_proto, .pc = 1 }, .instrs = &loop_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var loop_ct = compileInto(gpa, &arena, &loop_trace) orelse return error.NativeBailedUnexpectedly;
+    defer loop_ct.deinit();
+    var saw_loopdone = false;
+    for (loop_ct.exit_patches) |p| if (p.kind == .loop_done_linked) {
+        saw_loopdone = true;
+        try testing.expectEqualSlices(u8, &EXIT_NOP5, loop_ct.page.code[p.patch_off..][0..5]);
+        try testing.expectEqual(@as(usize, 0), p.metadata_cell.*);
+    };
+    try testing.expect(saw_loopdone);
+
+    var deopt_code = [_]bytecode.Instr{ bytecode.Instr.op0(.halt), bytecode.Instr.op0(.halt) };
+    var deopt_proto = bytecode.Proto{ .code = &deopt_code, .name = "b3-deopt", .id = 503 };
+    loop_instrs[5].aux = 1;
+    var deopt_trace = Trace{ .id = 503, .anchor = .{ .proto = &deopt_proto, .pc = 0 }, .instrs = &loop_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var deopt_ct = compileInto(gpa, &arena, &deopt_trace) orelse return error.NativeBailedUnexpectedly;
+    defer deopt_ct.deinit();
+    var saw_deopt = false;
+    for (deopt_ct.exit_patches) |p| if (p.kind == .deopt) {
+        saw_deopt = true;
+        try testing.expectEqual(@as(u8, 0xE9), p.original[0]);
+        try testing.expectEqualSlices(u8, &p.original, deopt_ct.page.code[p.patch_off..][0..5]);
+        try testing.expectEqual(@as(usize, 0), p.metadata_cell.*);
+    };
+    try testing.expect(saw_deopt);
 }
 
 /// Run `t` through both the IR-interpreter (the oracle) and the native compiler on

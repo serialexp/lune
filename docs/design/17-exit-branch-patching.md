@@ -982,8 +982,24 @@ awaits Bart.
     per-kind native summary cells + absolute-count barren budget +
     `silent_cum`, per-exit metadata-cell transport, static activation
     predicate + global pre-entry RegionKey sweep + closeRegion demotion,
-    two-phase slot-mutation funnel. B-3a implementation next; B-3b gated on
-    the ≥70% bridge-free seam-coverage telemetry.
+    two-phase slot-mutation funnel. **B-3a LANDED 2026-08-13** (reverse-
+    authored: Codex implemented, Claude reviewed + gated): per-kind patch
+    points (`E9` recorded for ordinary `.deopt` mini-stubs, excluding
+    loop-done guards + composite-bridge candidates; `nop5` windows at
+    `.link_terminal`/`.loop_done_linked`), out-of-line per-kind silent
+    epilogues (unreachable — null metadata cells, no patches),
+    generation-validated `patchRel32`/`patchWindow` with exact-bytes
+    restore, frozen `NativeResult`/`ExecResult` silent tail + comptime
+    offset oracle, `prepareSlotMutation`/`commitSlotMutation` funnel over
+    all five physical slot-write sites, `prepareNativeEntry` hooks at all
+    four native-call origins, `closeRegion` demotion hook, and the
+    `-Djit-debug` seam partition counter. Gates: 857 tests green both
+    builds; seven stdout hashes identical to ba29ff2 (and re-verified
+    genuine — nsieve/nbody live at `bench/luajit/`, hash stdout ONLY);
+    three soundness repros pass; flag-off timing neutral (sieve_int
+    min-of-60 +0.8%, nsieve 9 / pi_leibniz within noise); **seam coverage
+    73.5%** (1,872,025 bridge-free-closed of 2,547,824 rows at nsieve 9)
+    — the ≥70% B-3b gate PASSES. Next: B-3b runtime promotion.
   - [ ] **B-4 — deterministic trace-quality probation (nsieve-bit follow-up, §B.7).**
     Score native entries against committed work, normal-deopt frequency, exit
     dispersion, and trace size; gate or retire large low-yield root traces (the

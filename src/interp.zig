@@ -2856,6 +2856,7 @@ pub const Vm = struct {
                                             // only those fields — byte-identical; the
                                             // `ledger_scratch` fill is inert until D2b
                                             // activates the `ledger_len > 1` replay.
+                                            self.trace.prepareNativeEntry(); // B-3a direct-entry sweep hook
                                             break :blk if (ran_native_link_mode)
                                                 nt.runLinkedLoopDoneCapturing(trace_regs, &self.trace.ledger_scratch)
                                             else

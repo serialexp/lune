@@ -1,5 +1,47 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-13 (LATEST-49) — **B-3a substrate LANDED (flag off, all gates green, seam coverage 73.5% ≥ 70% gate). Next: B-3b runtime promotion.**
+
+B-3a reverse-authored (Codex implemented on thread
+019ffa90-924c-7520-85ae-05865ffded52, Claude reviewed the full diff + ran
+every gate). What landed: per-kind patch points (recorded `E9` for ordinary
+`.deopt` mini-stubs, excluding loop-done guards and composite-bridge
+candidates; `nop5` windows between materialization and reporting at
+`.link_terminal`/`.loop_done_linked`; nothing for `.region_bridge`),
+out-of-line per-kind silent epilogues implementing the §B3.11(1) summary
+transforms + §B3.13 absolute barren compare + `silent_cum` + first-cell
+ownership (UNREACHABLE: metadata cells null, no patch applied anywhere),
+`McodeArena.patchRel32`/`patchWindow` with page-generation validation
+(live-allocation records; free-list reuse gets a fresh generation), exact
+original-bytes restore, RX-restore-failure `@panic`; frozen
+`NativeResult`/`ExecResult` silent ABI tail appended after `ledger_outcome`
+with a comptime layout oracle (`NativeResultLedgerLayout`); the
+`prepareSlotMutation`/`commitSlotMutation` two-phase funnel over all five
+physical slot-write sites (armNativeLink fresh + re-arm,
+resetLinksTouching, disarmAllLinks, disarmLinkAt) preserving
+registry-before-slot ordering; `prepareNativeEntry` (B-3b sweep hook) at
+all four native-call origins; `closeRegion` → `demotePromotionsForRegion`
+hook; `dbgNoteReplayRow` seam partition counter.
+
+Gates: `just test` + `-Djit-debug` green (857 lib tests). Seven stdout
+hashes identical to ba29ff2 AND to the frozen references — after
+re-tripping the LATEST-47 trap myself: nsieve/nbody are at
+`bench/luajit/*.lua` (NOT `bench/*.lua`), and piping `2>&1` into sha256sum
+hashes the FileNotFound message, which "matches" across binaries. Hash
+stdout only, and confirm the program path exists first. Soundness repros
+109/109/18135. Flag-off timing: sieve_int min-of-60 +0.8% (earlier
+min-of-21 runs scattered +0.25…+4.5% — machine variance), nsieve 9 and
+pi_leibniz within noise → "identical modulo NOP" gate passes. Seam
+telemetry at nsieve 9: **bridge-free-closed = 1,872,025 of 2,547,824 rows
+= 73.5% ≥ 70%** — B-3b proceeds as designed, no re-scope.
+
+Review nits (fine for B-3a, revisit in B-3b): `movMemImm32` stores to u64
+silent fields (sound little-endian for the small staged values; worth a
+widening or comment); `dbgNoteReplayRow` does a per-row bounded DFS (64
+nodes) — double-gated behind jitdbg+debug_log so zero production cost.
+
+---
+
 ## Status 2026-08-13 (LATEST-48) — **B-3 design ACCEPTED after five codex review rounds (§B3.6–§B3.13 in doc 17). Next: B-3a substrate implementation.**
 
 Bart: "Ok, lets go for the full B-3 thing. It's the biggest lever we have for

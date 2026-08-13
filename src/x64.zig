@@ -855,6 +855,17 @@ pub const Assembler = struct {
         try self.b(0xC3);
     }
 
+    /// Canonical five-byte NOP — `0F 1F 44 00 00`. Doc 17 B-3 uses this exact
+    /// encoding as an in-place patch window: promotion replaces all five bytes
+    /// with `E9 rel32`, and demotion restores these exact bytes.
+    pub fn nop5(self: *Assembler) !void {
+        try self.b(0x0F);
+        try self.b(0x1F);
+        try self.b(0x44);
+        try self.b(0x00);
+        try self.b(0x00);
+    }
+
     // ---- labels & jumps ---------------------------------------------------------
 
     /// Allocate an unbound label.

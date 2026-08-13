@@ -2448,6 +2448,10 @@ pub const TraceState = struct {
     /// round-trip that a patched transition or freeze could eliminate.
     dbg_burst_len_hist: [irinterp.LEDGER_CAP + 1]u64 = @splat(0),
     dbg_burst_terminals: std.AutoHashMapUnmanaged(DbgTerminalKey, u64) = .empty,
+    /// B-3a seam gate input: every replay row is partitioned by whether its physical
+    /// armed edge belongs to any bridge-free closed directed subcycle.
+    dbg_patchable_cycle_rows: u64 = 0,
+    dbg_other_replay_rows: u64 = 0,
     /// When non-null, the next back-edge to this anchor will arm a side-trace
     /// recording (even if a trace already exists there).  Set by
     /// `countGuardFailure` when a guard-failure crosses `hotguard`; cleared
@@ -2723,6 +2727,55 @@ pub const TraceState = struct {
         }
     }
 
+    fn armedEdgeInBridgeFreeCycle(self: *const TraceState, parent: *const Trace, exit_instr: u32) bool {
+        var first_child: ?*Trace = null;
+        for (self.armed_links.items) |link| {
+            if (link.parent == parent and link.slot_index == exit_instr and link.kind != .region_bridge) {
+                first_child = link.child;
+                break;
+            }
+        }
+        const child = first_child orelse return false;
+        if (child == parent) return true;
+
+        var pending: [64]*Trace = undefined;
+        var seen: [64]*Trace = undefined;
+        var pending_len: usize = 1;
+        var seen_len: usize = 0;
+        pending[0] = child;
+        while (pending_len > 0) {
+            pending_len -= 1;
+            const cur = pending[pending_len];
+            if (cur == parent) return true;
+            var duplicate = false;
+            for (seen[0..seen_len]) |s| if (s == cur) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            if (seen_len == seen.len) return false;
+            seen[seen_len] = cur;
+            seen_len += 1;
+            for (self.armed_links.items) |link| {
+                if (link.parent != cur or link.kind == .region_bridge) continue;
+                if (pending_len == pending.len) return false;
+                pending[pending_len] = link.child;
+                pending_len += 1;
+            }
+        }
+        return false;
+    }
+
+    fn dbgNoteReplayRow(self: *TraceState, owner: *Trace, exit_instr: u32) void {
+        if (comptime jitdbg.enabled) {
+            if (!self.config.debug_log) return;
+            if (self.armedEdgeInBridgeFreeCycle(owner, exit_instr))
+                self.dbg_patchable_cycle_rows +|= 1
+            else
+                self.dbg_other_replay_rows +|= 1;
+        }
+    }
+
     /// Dump the burst-terminal telemetry: ledger-length histogram + every terminal
     /// site sorted is left to the reader (use sort(1)). Same double gate as the
     /// other dbgDump* helpers. This is the Part-B patch target list: each line is
@@ -2733,6 +2786,10 @@ pub const TraceState = struct {
             var total: u64 = 0;
             for (self.dbg_burst_len_hist) |c| total += c;
             jitdbg.log("burst stats: {d} dispatcher bursts", .{total});
+            const replay_total = self.dbg_patchable_cycle_rows +| self.dbg_other_replay_rows;
+            jitdbg.log("  B-3 seam rows: bridge-free-closed={d} rest={d} total={d}", .{
+                self.dbg_patchable_cycle_rows, self.dbg_other_replay_rows, replay_total,
+            });
             for (self.dbg_burst_len_hist, 0..) |c, len| {
                 if (c != 0) jitdbg.log("  burst-len {d}: {d}", .{ len, c });
             }
@@ -3282,8 +3339,24 @@ pub const TraceState = struct {
         const accum = self.region_profit.get(key) orelse return;
         const remainder = accum.outer_traversals - accum.window_base;
         self.flushRegionWindow(key, remainder);
+        // B-3a hook: physical exit patches owned by this activation must be restored
+        // before its accumulator disappears. Promotion storage arrives in B-3b.
+        self.demotePromotionsForRegion(key);
         _ = self.region_profit.remove(key);
         self.refreshObserverFast();
+    }
+
+    fn demotePromotionsForRegion(self: *TraceState, key: RegionKey) void {
+        // B-3b: registry lookup + restore patches + clear metadata cells.
+        _ = self;
+        _ = key;
+    }
+
+    /// B-3a hook at every native-call origin. B-3b performs the conservative global
+    /// activation sweep here, demoting every live promotion whose RegionKey differs
+    /// from the current active key before any patched code can run.
+    pub fn prepareNativeEntry(self: *TraceState) void {
+        _ = self;
     }
 
     fn freeObserverFast(self: *TraceState) void {
@@ -4539,6 +4612,7 @@ pub const TraceState = struct {
                 // hop-0 candidate can fire is its `.link` terminal or (M1) an
                 // ordinary source-branch guard, so a MULTI-entry ledger here starts
                 // at `sct`'s own exit and describes the whole fused span.
+                self.prepareNativeEntry(); // B-3a global sweep hook: driveChain seed
                 sresult = snt.runCapturingLedger(regs, &self.ledger_scratch);
                 // A ledger deeper than the ONE fused hop the scalar `fused_inner`
                 // mechanism models (`ledger_len == 2`, the `[C.link, I.x]` shape —
@@ -4884,6 +4958,7 @@ pub const TraceState = struct {
             next_via_handoff = false;
             const owner = self.traceById(e.id) orelse
                 @panic("replayLedger: entry owner id did not resolve");
+            self.dbgNoteReplayRow(owner, e.exit);
             self.dbg("  row k={d} id={d} kind={s} exit={d} cum={d} outcome={s}", .{
                 k, e.id, @tagName(e.kind), e.exit, e.cum, @tagName(e.outcome),
             });
@@ -5688,6 +5763,7 @@ pub const TraceState = struct {
                     // linked counterpart of call B's `runCapturingLedger` — a literal
                     // `runCapturingLedger` swap would flip mode 1→0 and stop committing the
                     // final inner iteration, corrupting coherent resume).
+                    self.prepareNativeEntry(); // B-3a global sweep hook: burst call A
                     iresult = int_native.runLinkedLoopDoneCapturing(regs, &self.ledger_scratch);
                     // 2c-E (call-A drain): `ledger_len > 1` means the inner FUSED forward
                     // through an armed slot — its loop-done → a continuation's
@@ -5868,6 +5944,7 @@ pub const TraceState = struct {
             // generalizes to the closed `C→I→C→…` cycle 2.3c-2c arms. Panics on an
             // unresolvable/mis-shaped fused id — the SAME hard invariant as before.
             if (tier == .native_only) {
+                self.prepareNativeEntry(); // B-3a global sweep hook: burst call B
                 var cresult = snt.runCapturingLedger(regs, &self.ledger_scratch);
                 while (true) {
                     const call_b_directive = self.replayLedger(
@@ -5896,6 +5973,7 @@ pub const TraceState = struct {
                         .run_continuation => |c| {
                             current_link = c;
                             snt = self.nativeFor(c) orelse break :hop;
+                            self.prepareNativeEntry(); // call-B rerun is another entry
                             cresult = snt.runCapturingLedger(regs, &self.ledger_scratch);
                         },
                         // Standalone `.link`: carry the `.link` DRIVER as the running
@@ -7644,11 +7722,30 @@ pub const TraceState = struct {
     /// from `child`+`kind` here (never trusting a caller-supplied address) is what
     /// makes the S2 provenance argument hold by construction.
     ///
-    /// INVARIANT: this is the *only* place `CompiledTrace.slots[i]` is ever written
-    /// to a non-`shared_exit` value. The entire P-E lifetime argument (a retiring
-    /// child resets every parent slot pointing into it) depends on the registry
-    /// seeing every armed slot — a direct `c.slots[i] = target` elsewhere would
-    /// strand an untracked slot and reintroduce the S2 use-after-reuse.
+    const SlotMutationReason = enum { arm, rearm, retire, disarm_all, disarm_one };
+    const PreparedSlotMutation = struct { compiled: *nativegen.CompiledTrace, exit: u32 };
+
+    /// Phase 1 of the sole physical slot-write funnel. B-3a validates ownership and
+    /// bounds; B-3b will demote a promotion owning this physical exit here.
+    fn prepareSlotMutation(self: *TraceState, parent: *Trace, exit: u32, reason: SlotMutationReason) !PreparedSlotMutation {
+        const compiled = switch (parent.native) {
+            .compiled => |*c| c,
+            else => return error.NativeTraceUnavailable,
+        };
+        if (exit >= compiled.slots.len) return error.InvalidNativeSlot;
+        // B-3b HOOK: promotion-registry lookup + demotion transaction.
+        _ = self;
+        _ = reason;
+        return .{ .compiled = compiled, .exit = exit };
+    }
+
+    /// Phase 2 is infallible and occurs only after the caller's registry mutation.
+    fn commitSlotMutation(_: *TraceState, prepared: PreparedSlotMutation, target: usize) void {
+        prepared.compiled.slots[prepared.exit] = target;
+    }
+
+    /// INVARIANT: every post-compilation `CompiledTrace.slots[i]` write goes through
+    /// `prepareSlotMutation` + `commitSlotMutation`.
     pub fn armNativeLink(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, kind: ArmKind) !bool {
         const c = switch (parent.native) {
             .compiled => |*cc| cc,
@@ -7736,6 +7833,7 @@ pub const TraceState = struct {
         // it — the first match is the only match.
         for (self.armed_links.items) |*l| {
             if (l.parent == parent and l.slot_index == slot_index) {
+                const prepared = self.prepareSlotMutation(parent, slot_index, .rearm) catch return false;
                 // A re-arm can displace a provenance-published sibling arm with
                 // a different kind/child — re-open publication so the drain can
                 // re-evaluate the surviving edges at the next safe point. And
@@ -7755,7 +7853,7 @@ pub const TraceState = struct {
                 l.armed_gen = 0;
                 l.bridge_edge = null; // drop the replay memo with the old child
                 l.bridge_edge_gen = 0;
-                c.slots[slot_index] = target;
+                self.commitSlotMutation(prepared, target);
                 self.dbg("arm (re-arm): parent id={d} pc={d} slot={d} -> child id={d} pc={d} kind={s}", .{
                     parent.id, parent.anchor.pc, slot_index, child.id, child.anchor.pc, @tagName(kind),
                 });
@@ -7764,9 +7862,10 @@ pub const TraceState = struct {
         }
         // Fresh slot: append the record BEFORE writing the slot, so a failed append
         // leaves the slot at its prior `shared_exit` value with no dangling record.
+        const prepared = self.prepareSlotMutation(parent, slot_index, .arm) catch return false;
         try self.armed_links.append(self.gpa, .{ .parent = parent, .slot_index = slot_index, .child = child, .kind = kind });
         if (self.armed_links.items.len > self.native_link_peak) self.native_link_peak = self.armed_links.items.len;
-        c.slots[slot_index] = target;
+        self.commitSlotMutation(prepared, target);
         self.dbg("arm: parent id={d} pc={d} slot={d} -> child id={d} pc={d} kind={s}", .{
             parent.id, parent.anchor.pc, slot_index, child.id, child.anchor.pc, @tagName(kind),
         });
@@ -7868,7 +7967,9 @@ pub const TraceState = struct {
             if (link.child == t and link.parent != t) {
                 switch (link.parent.native) {
                     .compiled => |*c| if (link.slot_index < c.slots.len) {
-                        c.slots[link.slot_index] = shared_exit;
+                        const prepared = self.prepareSlotMutation(link.parent, link.slot_index, .retire) catch
+                            @panic("resetLinksTouching: invalid native slot mutation");
+                        self.commitSlotMutation(prepared, shared_exit);
                     },
                     else => {},
                 }
@@ -7909,7 +8010,9 @@ pub const TraceState = struct {
             clearSiblingLatch(link);
             switch (link.parent.native) {
                 .compiled => |*c| if (link.slot_index < c.slots.len) {
-                    c.slots[link.slot_index] = shared_exit;
+                    const prepared = self.prepareSlotMutation(link.parent, link.slot_index, .disarm_all) catch
+                        @panic("disarmAllLinks: invalid native slot mutation");
+                    self.commitSlotMutation(prepared, shared_exit);
                 },
                 else => {},
             }
@@ -7945,7 +8048,9 @@ pub const TraceState = struct {
         const shared_exit = self.mcode_arena.trampoline_exit orelse 0;
         switch (link.parent.native) {
             .compiled => |*c| if (link.slot_index < c.slots.len) {
-                c.slots[link.slot_index] = shared_exit;
+                const prepared = self.prepareSlotMutation(link.parent, link.slot_index, .disarm_one) catch
+                    @panic("disarmLinkAt: invalid native slot mutation");
+                self.commitSlotMutation(prepared, shared_exit);
             },
             else => {},
         }
