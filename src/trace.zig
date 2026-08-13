@@ -1919,6 +1919,15 @@ pub const NativeLink = struct {
     /// proven against. Every discovery rebuild disarms region-bridge links whose
     /// region is no longer live-armable (fail-closed on topology transitions).
     region_id: ?RegionId = null,
+    /// `region_defs_gen` at the moment the `.region_bridge` arm pipeline last
+    /// fully validated this link (`tryArmRegionBridge` stamps it with
+    /// `region_id`). The already-armed early-out in `maybeArmCompositeExit`
+    /// honors the arm only while this gen is current: a discovery rebuild
+    /// replaces `def.bridges`/membership under the same region id without
+    /// touching the link (the stale-link sweep checks region LIVENESS, not the
+    /// exact bridge proof — codex review of f613c98), so a gen mismatch forces
+    /// one full re-validation instead of trusting obsolete provenance forever.
+    armed_gen: u32 = 0,
     /// Replay-walk memo for `.region_bridge` rows: the unique registered edge the
     /// slow resolution (provAt → def lookup → members scan, all release-panicking)
     /// produced, stamped with `region_defs_gen`. On a gen match the row grammar
@@ -2964,6 +2973,16 @@ pub const TraceState = struct {
     /// `final_trace_id`) to its live `*Trace`, or null if no cached trace carries it
     /// (the trace retired, or the id is the `NO_TRACE_ID` sentinel). Linear scan,
     /// mirroring `traceIndex`; ids are unique, so at most one match.
+    /// Bump a memo-invalidation generation, skipping the reserved 0 ("never
+    /// computed") on u32 wrap — otherwise, ~2^32 mutations in, a freshly
+    /// initialized memo (gen 0) would be trusted without ever computing (codex
+    /// review of f613c98; same hazard for both `cache_gen` and
+    /// `region_defs_gen`).
+    fn bumpGen(gen: *u32) void {
+        gen.* +%= 1;
+        if (gen.* == 0) gen.* = 1;
+    }
+
     pub fn traceById(self: *const TraceState, id: u32) ?*Trace {
         // O(1) fast path via the id index; a hit is authoritative. A null slot or
         // out-of-range id falls back to the linear scan — that covers hand-built
@@ -3372,7 +3391,7 @@ pub const TraceState = struct {
         if (self.region_defs.getPtr(id)) |def| {
             def.armable = false;
             def.tombstoned = true; // fail-closed: recomputation must never re-arm
-            self.region_defs_gen +%= 1; // invalidate Trace.region_memo_*
+            bumpGen(&self.region_defs_gen); // invalidate Trace.region_memo_*
         }
         while (true) {
             var victim: ?RegionKey = null;
@@ -3573,6 +3592,7 @@ pub const TraceState = struct {
             for (self.armed_links.items) |*l| {
                 if (l.parent == failed and l.slot_index == exit_instr) {
                     l.region_id = id;
+                    l.armed_gen = self.region_defs_gen; // full pipeline just validated
                     break;
                 }
             }
@@ -3589,18 +3609,22 @@ pub const TraceState = struct {
         if (!safe_to_arm) return;
         if (exit_instr == std.math.maxInt(u32) or exit_instr >= t.instrs.len) return;
         if (!t.isBridgeCandidate(exit_instr)) return;
-        // Already armed as a bridge → nothing to do. Without this, every burst
-        // whose terminal composite deopt drains through here re-ran the WHOLE
-        // arm pipeline (classifyExit → def/profit hash probes → the
-        // `validateRegionBridge` structural proof) only for `armNativeLink` to
-        // supersede an identical arm — a measured seam cost (validateRegionBridge
-        // alone was 2.4% of nsieve N=5). Soundness unchanged: an armed link's
-        // provenance is kept live by the existing invalidation paths (discovery
-        // rebuilds disarm bridge links whose region stops being live-armable;
-        // trace retirement resets links via `resetLinksTouching`), which is
-        // exactly what the `.region_bridge` replay grammar validates against.
+        // Already armed as a bridge AND the defs generation is unchanged since
+        // the arm pipeline last fully validated this link → nothing to do.
+        // Without this, every burst whose terminal composite deopt drains
+        // through here re-ran the WHOLE arm pipeline (classifyExit → def/profit
+        // hash probes → the `validateRegionBridge` structural proof) only for
+        // `armNativeLink` to supersede an identical arm — a measured seam cost
+        // (validateRegionBridge alone was 2.4% of nsieve N=5). The gen stamp is
+        // what makes the skip sound (codex review of f613c98): a discovery
+        // rebuild can replace the region's `bridges`/membership under the SAME
+        // region id without disarming the link (the stale-link sweep checks
+        // region liveness only), so between rebuilds the proof is unchanged by
+        // construction and after one the mismatched gen forces a full
+        // re-validation (which also re-picks the child by current `hit_count`).
         for (self.armed_links.items) |l| {
-            if (l.parent == t and l.slot_index == exit_instr and l.kind == .region_bridge) return;
+            if (l.parent == t and l.slot_index == exit_instr and l.kind == .region_bridge and
+                l.armed_gen == self.region_defs_gen) return;
         }
         self.tryArmRegionBridge(t, exit_instr);
     }
@@ -4759,9 +4783,14 @@ pub const TraceState = struct {
                     // memoized on the link stamped with `region_defs_gen`, so a
                     // steady-state row is two compares + the successor check. Any
                     // defs mutation bumps the gen and forces the full re-proof
-                    // (all release-panics intact on that path). The registry is
-                    // stable mid-walk (`replay_walk_depth` defers disarms), so the
-                    // memo write-through is safe.
+                    // (all release-panics intact on that path). Pointer safety:
+                    // disarms are deferred mid-walk (`replay_walk_depth`), but
+                    // OTHER row kinds' arm sites CAN append to `armed_links`
+                    // mid-walk (`armLoopDoneLink`/`armLinkTerminal`), which may
+                    // reallocate and move items — so the `*NativeLink` from the
+                    // scan above must be fully consumed inside THIS row (it is:
+                    // nothing arms between the scan and the memo write) and
+                    // never retained across rows.
                     const edge = memo: {
                         if (link.bridge_edge) |cached| {
                             if (link.bridge_edge_gen == self.region_defs_gen)
@@ -7215,7 +7244,7 @@ pub const TraceState = struct {
         // Freeze-after-qualify: every branch above may have mutated defs
         // (new defs, armable recomputes, tombstones) — one bump per rebuild
         // transaction invalidates all per-trace membership memos.
-        self.region_defs_gen +%= 1;
+        bumpGen(&self.region_defs_gen);
         freeRegionSetMap(ExitKey, &self.source_exit_regions, gpa);
         freeRegionSetMap(u32, &self.dest_entry_regions, gpa);
         self.source_exit_regions = new_source;
@@ -7415,6 +7444,7 @@ pub const TraceState = struct {
                 l.child = child;
                 l.kind = kind;
                 l.region_id = null; // a `.region_bridge` caller re-stamps after arming
+                l.armed_gen = 0;
                 l.bridge_edge = null; // drop the replay memo with the old child
                 l.bridge_edge_gen = 0;
                 c.slots[slot_index] = target;
@@ -7650,7 +7680,7 @@ pub const TraceState = struct {
                 // mcode slot can be freed and reused (see `resetLinksTouching`).
                 self.resetLinksTouching(t);
                 _ = self.cache.swapRemove(idx);
-                self.cache_gen +%= 1; // invalidate Trace.anchor_pop_* memos
+                bumpGen(&self.cache_gen); // invalidate Trace.anchor_pop_* memos
                 if (t.id < self.trace_by_id.items.len) self.trace_by_id.items[t.id] = null;
                 t.destroy(self.gpa);
                 // Reopen the anchor for re-recording. `onBackEdge` only arms when
@@ -7704,7 +7734,7 @@ pub const TraceState = struct {
     pub fn clearCache(self: *TraceState) void {
         for (self.cache.items) |t| t.destroy(self.gpa);
         self.cache.clearRetainingCapacity();
-        self.cache_gen +%= 1; // invalidate Trace.anchor_pop_* memos
+        bumpGen(&self.cache_gen); // invalidate Trace.anchor_pop_* memos
         @memset(self.trace_by_id.items, null); // every indexed trace was just destroyed
 
         // Anchor-keyed tiering state: reset so the next epoch re-warms cleanly and no
@@ -7757,6 +7787,12 @@ pub const TraceState = struct {
             freeRegionBridges(self.gpa, d.bridges);
         }
         self.region_defs.clearRetainingCapacity();
+        // Uphold the "every region_defs mutation bumps the gen" contract at the
+        // epoch boundary too (codex review of f613c98). Not currently load-
+        // bearing — every gen-stamped memo lives on traces/links that were just
+        // destroyed/disarmed above — but a future consumer must not find the
+        // invariant silently false here.
+        bumpGen(&self.region_defs_gen);
         self.region_intern.clear(self.gpa);
         self.clearPhysicalRegionIndices();
         self.resetRegionProfit();
@@ -8313,7 +8349,7 @@ pub const TraceState = struct {
         } else |_| {}
         errdefer if (t.exit_counts.len != 0) self.gpa.free(t.exit_counts);
         try self.cache.append(self.gpa, t);
-        self.cache_gen +%= 1; // invalidate Trace.anchor_pop_* memos
+        bumpGen(&self.cache_gen); // invalidate Trace.anchor_pop_* memos
         // Register in the O(1) id index (fail-soft: on grow-OOM the id stays
         // unindexed and `traceById` falls back to the cache scan).
         if (t.id >= self.trace_by_id.items.len) {
