@@ -4533,6 +4533,9 @@ pub const TraceState = struct {
             next_via_handoff = false;
             const owner = self.traceById(e.id) orelse
                 @panic("replayLedger: entry owner id did not resolve");
+            self.dbg("  row k={d} id={d} kind={s} exit={d} cum={d} outcome={s}", .{
+                k, e.id, @tagName(e.kind), e.exit, e.cum, @tagName(e.outcome),
+            });
             // First owner must be the seed (call B enters `seed_owner` directly).
             if (k == 0 and owner != seed_owner)
                 @panic("replayLedger: first ledger owner is not the seed");
@@ -4822,16 +4825,30 @@ pub const TraceState = struct {
                         // The burst may re-run the still-armed continuation. The hop
                         // budget only declines THIS next re-run.
                         if (hops.* >= max_hops) return .break_burst;
-                        // 2c-E: the directive EXECUTES `cont`, so an anchor/shape
-                        // mismatch is not merely "ineligible" — it is an invalid
-                        // steering directive (regs are coherent at `post_pc`; running
-                        // a continuation anchored elsewhere would misresume). Release-
-                        // validate the full continuation contract before handing it up.
-                        if (!(cont.inputs.len == 0 and cont.instrs.len != 0 and
+                        // 2c-E: the directive EXECUTES `cont`, so the full
+                        // continuation contract (zero-input `.link` trace anchored at
+                        // `post_pc` in this proto — the same P-G eligibility
+                        // `armLoopDoneLink` enforces) must hold before handing it up;
+                        // regs are coherent at `post_pc`, so running a continuation
+                        // anchored elsewhere would misresume. When the contract does
+                        // NOT hold this is a legitimately reachable shape, not a
+                        // wiring bug: since hotexit-armed prime sides, a burst can
+                        // enter the linked grammar through a guard-chained composite
+                        // (`.deopt → C'.link_terminal → I.loop_done_linked` where
+                        // `C'` is anchored at the guard PC, not the post-loop PC), so
+                        // the `cont` cursor is not a valid resume candidate and there
+                        // may be no continuation at `post_pc` at all. Fall back to
+                        // tier-0 at `post_pc` (`resume_pc` is already set) — the same
+                        // safe directive the hop-budget bound above takes; the site-3
+                        // arm above stays fail-closed via P-G.
+                        if (cont.inputs.len == 0 and cont.instrs.len != 0 and
                             cont.instrs[cont.instrs.len - 1].op == .link and
-                            cont.anchor.proto == proto and cont.anchor.pc == post_pc))
-                            @panic("replayLedger: terminal loop-done carries an invalid continuation");
-                        return .{ .run_continuation = cont };
+                            cont.anchor.proto == proto and cont.anchor.pc == post_pc)
+                            return .{ .run_continuation = cont };
+                        self.dbg("terminal loop-done: cont id={d} anchor_pc={d} fails contract at post_pc={d} -> break_burst", .{
+                            cont.id, cont.anchor.pc, post_pc,
+                        });
+                        return .break_burst;
                     }
                     // `I→C` fused (2.3c-2e): the next entry is the continuation reached
                     // via the loop-done→ordinary_entry arm. Validate the successor is a
@@ -6007,14 +6024,18 @@ pub const TraceState = struct {
         const c = &t.exit_counts[exit_instr];
         if (c.* == Trace.EXIT_COUNT_DONE) return;
         const branch = self.isSourceBranchGuardExit(t, exit_instr, proto);
+        // Count EVERY non-DONE taken exit (Pall: `trace_hotside` increments
+        // unconditionally) — capacity must suppress ARMING only, never
+        // accounting, else an anchor at cap stops accruing hotness and a later
+        // eviction restarts the exit cold (codex review of 84c86bc).
+        if (c.* < Trace.EXIT_COUNT_DONE - 1) c.* += 1;
+        if (c.* < self.config.hotexit) return;
         // Capacity refusals mirror the mechanisms each route feeds: the prime
         // side keeps its historical one-ramp bound (`countTracesAt >= 2` — once
-        // skip + ramp coexist, counting stops and never re-arms); generic
+        // skip + ramp coexist, arming stops and never re-fires); generic
         // siblings stop at `max_traces_per_anchor`.
         const cap: usize = if (branch) 2 else self.config.max_traces_per_anchor;
         if (self.countTracesAt(t.anchor) >= cap) return;
-        if (c.* < Trace.EXIT_COUNT_DONE - 1) c.* += 1;
-        if (c.* < self.config.hotexit) return;
         if (branch) {
             if (self.wants_prime_side == null) {
                 self.dbg("hotexit: trace id={d} exit={d} count={d} -> want PRIME side at pc={d}", .{ t.id, exit_instr, c.*, t.anchor.pc });
@@ -7893,6 +7914,10 @@ pub const TraceState = struct {
         self.rec.abort_reason = reason;
         if (self.config.record_aborts) self.logAbort(reason);
         self.rec.active = false;
+        // Drop hot-exit provenance with the recording: an abort must never leave
+        // `side_src` around to latch a parent exit DONE for a LATER, unrelated
+        // commit (Pall retries the exit; `gateAnchor` below is our `penalty_pc`).
+        self.rec.side_src = null;
         self.gateAnchor(self.rec.anchor);
     }
 
@@ -7930,6 +7955,9 @@ pub const TraceState = struct {
             self.gateAnchor(self.rec.anchor);
         };
         self.rec.active = false;
+        // A successful `commit` consumed `side_src` (DONE latch); a failed one
+        // must drop it too, so a stale key can never latch a later commit.
+        self.rec.side_src = null;
     }
 
     /// Copy the in-progress recording into an owned, cached `Trace`. The exit

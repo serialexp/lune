@@ -62,6 +62,31 @@ coverage starvation.
 `just test` green (also `-Djit-debug=true`); A-viii repros 109; floatlink
 18135; all six output-identity hashes byte-identical.
 
+### Fix-up commit (same arc): nsieve-bit panic + codex review findings
+
+The full board caught a panic the six-hash gate missed (nsieve-bit wasn't in
+it — it is now, hash 49601107e4d95035): `replayLedger: terminal loop-done
+carries an invalid continuation`. Ledger `[2.deopt/23 → 3.link_terminal/48 →
+0.loop_done_linked/33]` — a hotexit-armed prime-side composite (anchored at
+the GUARD pc, ends `.link`) enters the linked grammar via `.link_terminal`,
+which sets `cont = owner`; the inner's terminal loop-done then requires `cont`
+anchored at its post-loop pc and release-panicked. The shape is legitimately
+reachable (not a wiring bug) once prime sides arm at threshold 10; the old
+hotguard-50 machinery just never recorded one here before the run ended.
+Fix: the terminal validates the full continuation contract (same P-G
+eligibility `armLoopDoneLink` enforces) and on mismatch returns `.break_burst`
+— tier-0 resumes at `post_pc`, where regs are coherent regardless of `cont`
+(the same directive the hop-budget bound takes; the site-3 arm was already
+fail-closed via P-G, so no bogus native edge ever armed). Non-last fused
+successor validation stays a panic (arm-time-validated). Also from the codex
+84c86bc review: `noteTakenExit` now increments BEFORE the capacity check (Pall
+counts every non-DONE exit; cap suppresses arming only), and `abort()` /
+`closeTrace()` clear `rec.side_src` so a dropped recording can never latch a
+later commit's parent exit DONE. Plus two permanent jitdbg probes (per-row
+ledger dump, invalid-cont diagnostic). **nsieve-bit min-of-15: 58.9 → 31.9ms
+(−45.7%)** — the prime-side fusion the panic was blocking. nsieve/sieve_int/
+pi_leibniz unchanged (±2%).
+
 ### Follow-ups (noted, not started)
 
 - driveChain inner receipts (mid-chain deopts) still charge no exit hotness.
