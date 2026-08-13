@@ -1799,6 +1799,10 @@ pub const TraceConfig = struct {
     /// (`useful_window_seen`), one more to prove it wasn't a fluke. Any strike
     /// unfreezes. Heuristic — never affects output, only tiering cost.
     freeze_windows: u32 = 2,
+    /// Enables production discovery/publication of silent exit cycles. B-3b.2
+    /// deliberately leaves this off and has no production promotion call site;
+    /// focused tests invoke `promoteCycle` directly.
+    silent_promotion_enabled: bool = false,
     /// Gate backoff (replaces the old permanent blacklist). When an anchor is
     /// gated (low-yield penalty maxed, a recording abort, or a commit failure) it
     /// is held off tier-1 for a *cooldown window* measured in back-edges, after
@@ -1952,6 +1956,23 @@ pub const NativeLink = struct {
     bridge_edge_gen: u32 = 0,
 };
 
+const PromotedEdge = struct {
+    parent: *Trace,
+    exit: u32,
+    kind: nativegen.ExitPatchKind,
+    child: *Trace,
+    arm_kind: ArmKind,
+    resume_pc: u32,
+};
+
+const PromotedCycle = struct {
+    edges: []PromotedEdge,
+    summary: []nativegen.SilentSummaryCell,
+    metadata: []nativegen.SilentExitMetadata,
+    region_key: RegionKey,
+    id: u32,
+};
+
 /// Part B-2a (doc 17 §B.5): the persistent logical relation between the
 /// side exit that caused a side trace to be recorded and that committed child.
 /// The physical sibling-handoff arm is disposable; this relation survives it.
@@ -2081,6 +2102,15 @@ pub const TraceState = struct {
     /// directions by trace *identity* (never a raw slot pointer), so it is correct
     /// regardless of retire order. Empty until arming lands (2.3b) → inert in 2.3a.
     armed_links: std.ArrayListUnmanaged(NativeLink) = .empty,
+    /// B-3b.2 silent-cycle registry. `promoted_exit_owners` is the exclusive
+    /// physical-exit ownership index required by §B3.9(4); ids, rather than list
+    /// indices, remain stable across swap-removal.
+    promoted_cycles: std.ArrayListUnmanaged(PromotedCycle) = .empty,
+    promoted_exit_owners: std.AutoHashMapUnmanaged(ExitKey, u32) = .empty,
+    next_promoted_cycle_id: u32 = 1,
+    /// Cycle ids queued while replay is validating the armed-link registry.
+    /// Capacity is reserved before promotion publication, so queuing is infallible.
+    pending_demote: std.ArrayListUnmanaged(u32) = .empty,
     /// Part B-2b: persistent hotexit-provenance relations. Edges are expected to
     /// be few, so lifecycle operations deliberately use linear scans.
     provenance_edges: std.ArrayListUnmanaged(ProvenanceEdge) = .empty,
@@ -2298,6 +2328,9 @@ pub const TraceState = struct {
     /// test (a byte-identical run under an open window cannot, by itself, prove a
     /// non-empty registry was torn down — the counter can).
     native_link_disarms: u64 = 0,
+    silent_promotions: u64 = 0,
+    silent_demotions: u64 = 0,
+    silent_promotion_rejects: u64 = 0,
     /// A-viii (doc 17 §A8 step 8): the high-water mark of `armed_links.len` — the
     /// most handoff edges ever armed SIMULTANEOUSLY. The per-kind arm counters are
     /// lifetime totals, so they cannot distinguish "the three edges of the outer
@@ -2838,6 +2871,9 @@ pub const TraceState = struct {
 
     pub fn deinit(self: *TraceState) void {
         self.dbgDumpBurstStats(); // jitdbg-only burst-terminal telemetry (Part B)
+        self.demoteAllCycles();
+        if (self.pending_demote.items.len != 0)
+            @panic("TraceState.deinit: promotion demotion deferred during teardown");
         self.dbg_burst_terminals.deinit(self.gpa);
         self.counters.deinit(self.gpa);
         self.gate.deinit(self.gpa);
@@ -2849,6 +2885,9 @@ pub const TraceState = struct {
         self.abort_log.deinit(self.gpa);
         if (self.exec_recorder) |*r| r.deinit();
         self.armed_links.deinit(self.gpa);
+        self.pending_demote.deinit(self.gpa);
+        self.promoted_exit_owners.deinit(self.gpa);
+        self.promoted_cycles.deinit(self.gpa);
         self.provenance_edges.deinit(self.gpa);
         self.trace_by_id.deinit(self.gpa);
         self.coverage.deinit(self.gpa);
@@ -3347,16 +3386,28 @@ pub const TraceState = struct {
     }
 
     fn demotePromotionsForRegion(self: *TraceState, key: RegionKey) void {
-        // B-3b: registry lookup + restore patches + clear metadata cells.
-        _ = self;
-        _ = key;
+        var i = self.promoted_cycles.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.meta.eql(self.promoted_cycles.items[i].region_key, key))
+                self.demoteCycle(i);
+        }
     }
 
     /// B-3a hook at every native-call origin. B-3b performs the conservative global
     /// activation sweep here, demoting every live promotion whose RegionKey differs
     /// from the current active key before any patched code can run.
     pub fn prepareNativeEntry(self: *TraceState) void {
-        _ = self;
+        // This is on every native entry; preserve the empty-registry common case
+        // as one length branch before resolving activation state.
+        if (self.promoted_cycles.items.len == 0) return;
+        const active = if (self.region_context) |ctx| self.activeRegionFor(ctx.call_seq) else null;
+        var i = self.promoted_cycles.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (active == null or !std.meta.eql(self.promoted_cycles.items[i].region_key, active.?))
+                self.demoteCycle(i);
+        }
     }
 
     fn freeObserverFast(self: *TraceState) void {
@@ -3957,6 +4008,17 @@ pub const TraceState = struct {
     /// arm-then-disarm would silently erase the fresh arm) and before acting
     /// on the directive, so the disarm lands before any native re-entry.
     fn applyPendingDisarms(self: *TraceState) void {
+        // B-3b.2 transaction order: restored reporting code and cleared metadata
+        // must precede every deferred physical-slot disarm.
+        while (self.pending_demote.items.len > 0) {
+            const id = self.pending_demote.pop().?;
+            for (self.promoted_cycles.items, 0..) |cycle, i| {
+                if (cycle.id == id) {
+                    self.demoteCycle(i);
+                    break;
+                }
+            }
+        }
         if (!self.pending_disarm_all) return;
         self.pending_disarm_all = false;
         // Fail-closed: a walk that struck the gate arms nothing this round —
@@ -7796,6 +7858,329 @@ pub const TraceState = struct {
     /// from `child`+`kind` here (never trusting a caller-supplied address) is what
     /// makes the S2 provenance argument hold by construction.
     ///
+    const PROMOTED_CYCLE_CAP: usize = 16;
+
+    fn exitPatchFor(compiled: *nativegen.CompiledTrace, exit: u32) ?*nativegen.ExitPatch {
+        for (compiled.exit_patches) |*patch| if (patch.exit_instr == exit) return patch;
+        return null;
+    }
+
+    fn patchKindForArm(kind: ArmKind) ?nativegen.ExitPatchKind {
+        return switch (kind) {
+            .ordinary_guard, .sibling_handoff => .deopt,
+            .link_terminal => .link_terminal,
+            .loop_done_linked => .loop_done_linked,
+            .region_bridge => null,
+        };
+    }
+
+    /// Re-check the activation-local static shapes in release mode. The arm path
+    /// proved these once; promotion deliberately does not trust historical proof.
+    fn promotedEdgeFromLink(_: *TraceState, link: NativeLink) ?PromotedEdge {
+        const kind = patchKindForArm(link.kind) orelse return null;
+        const compiled = switch (link.parent.native) {
+            .compiled => |*c| c,
+            else => return null,
+        };
+        if (link.slot_index >= link.parent.instrs.len or link.slot_index >= compiled.slots.len)
+            return null;
+        if (link.slot_index >= compiled.metadata_cells.len) return null;
+        const patch = exitPatchFor(compiled, link.slot_index) orelse return null;
+        if (patch.kind != kind or patch.metadata_cell != &compiled.metadata_cells[link.slot_index] or
+            compiled.metadata_cells[link.slot_index] != 0) return null;
+
+        const child_compiled = switch (link.child.native) {
+            .compiled => |*c| c,
+            else => return null,
+        };
+        if (link.child.inputs.len != 0) return null;
+        const target = switch (link.kind) {
+            .link_terminal => child_compiled.linked_entry orelse return null,
+            .ordinary_guard, .loop_done_linked, .sibling_handoff => child_compiled.ordinary_entry orelse return null,
+            .region_bridge => return null,
+        };
+        if (compiled.slots[link.slot_index] != target) return null;
+
+        const resume_pc: u32 = switch (link.kind) {
+            .sibling_handoff => blk: {
+                if (link.parent.anchor.proto != link.child.anchor.proto or
+                    link.parent.anchor.pc != link.child.anchor.pc or
+                    !exitIsPreEffect(link.parent, link.slot_index)) return null;
+                break :blk link.child.anchor.pc;
+            },
+            .ordinary_guard => blk: {
+                if (link.parent.anchor.proto != link.child.anchor.proto or
+                    isLoopDoneGuardIndex(link.parent, link.slot_index) or
+                    link.parent.isBridgeCandidate(link.slot_index)) return null;
+                break :blk link.child.anchor.pc;
+            },
+            .link_terminal => blk: {
+                const ins = link.parent.instrs[link.slot_index];
+                if (ins.op != .link or ins.aux < 0 or
+                    link.parent.anchor.proto != link.child.anchor.proto or
+                    @as(u32, @intCast(ins.aux)) != link.child.anchor.pc) return null;
+                break :blk link.child.anchor.pc;
+            },
+            .loop_done_linked => blk: {
+                if (link.parent.anchor.proto != link.child.anchor.proto or
+                    !isLoopDoneGuardIndex(link.parent, link.slot_index)) return null;
+                const post_pc = guardExitPc(link.parent.instrs[link.slot_index]) orelse return null;
+                if (post_pc != link.child.anchor.pc) return null;
+                break :blk post_pc;
+            },
+            .region_bridge => return null,
+        };
+        return .{
+            .parent = link.parent,
+            .exit = link.slot_index,
+            .kind = kind,
+            .child = link.child,
+            .arm_kind = link.kind,
+            .resume_pc = resume_pc,
+        };
+    }
+
+    fn rejectPromotion(self: *TraceState) ?[]PromotedEdge {
+        self.silent_promotion_rejects +|= 1;
+        return null;
+    }
+
+    /// Detect a simple closed armed cycle rooted at one physical exit. V1 is
+    /// deliberately conservative when a successor trace has multiple armed
+    /// outgoing exits: the registry alone cannot prove which dynamic phase is
+    /// next, so ambiguous topology is rejected instead of guessed.
+    fn detectPromotableCycle(self: *TraceState, start_parent: *Trace, start_exit: u32) ?[]PromotedEdge {
+        var scratch: [PROMOTED_CYCLE_CAP]PromotedEdge = undefined;
+        var len: usize = 0;
+        var parent = start_parent;
+        var exit = start_exit;
+
+        while (true) {
+            if (len == PROMOTED_CYCLE_CAP) return self.rejectPromotion();
+            for (scratch[0..len]) |edge| {
+                if (edge.parent == parent and edge.exit == exit) return self.rejectPromotion();
+            }
+            if (self.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = exit }))
+                return self.rejectPromotion();
+
+            var found: ?NativeLink = null;
+            for (self.armed_links.items) |link| {
+                if (link.parent != parent or link.slot_index != exit) continue;
+                if (found != null) return self.rejectPromotion();
+                found = link;
+            }
+            const edge = self.promotedEdgeFromLink(found orelse return self.rejectPromotion()) orelse
+                return self.rejectPromotion();
+            scratch[len] = edge;
+            len += 1;
+            if (edge.child == start_parent) break;
+
+            var next: ?NativeLink = null;
+            for (self.armed_links.items) |link| {
+                if (link.parent != edge.child) continue;
+                if (next != null) return self.rejectPromotion();
+                next = link;
+            }
+            const next_link = next orelse return self.rejectPromotion();
+            parent = next_link.parent;
+            exit = next_link.slot_index;
+        }
+
+        // Returning to the member is only closure if the next registered phase is
+        // the exact starting physical exit.
+        var start_count: usize = 0;
+        for (self.armed_links.items) |link| {
+            if (link.parent == start_parent) {
+                start_count += 1;
+                if (link.slot_index != start_exit) return self.rejectPromotion();
+            }
+        }
+        if (start_count != 1) return self.rejectPromotion();
+
+        var first: usize = 0;
+        for (scratch[1..len], 1..) |edge, i| {
+            const best = scratch[first];
+            if (edge.parent.id < best.parent.id or
+                (edge.parent.id == best.parent.id and edge.exit < best.exit)) first = i;
+        }
+        const result = self.gpa.alloc(PromotedEdge, len) catch return self.rejectPromotion();
+        for (result, 0..) |*dst, i| dst.* = scratch[(first + i) % len];
+        return result;
+    }
+
+    fn originalRel32Target(compiled: *const nativegen.CompiledTrace, patch: *const nativegen.ExitPatch) usize {
+        const bits: u32 = @as(u32, patch.original[1]) |
+            (@as(u32, patch.original[2]) << 8) |
+            (@as(u32, patch.original[3]) << 16) |
+            (@as(u32, patch.original[4]) << 24);
+        const disp: i32 = @bitCast(bits);
+        const next = @intFromPtr(compiled.page.code.ptr) + patch.patch_off + 5;
+        return @intCast(@as(i128, @intCast(next)) + disp);
+    }
+
+    fn patchPromotedEdge(self: *TraceState, edge: PromotedEdge, promote: bool) nativegen.PatchError!void {
+        const compiled = switch (edge.parent.native) {
+            .compiled => |*c| c,
+            else => return error.StalePage,
+        };
+        const generation = compiled.pageGeneration() orelse return error.NotArenaOwned;
+        const patch = exitPatchFor(compiled, edge.exit) orelse return error.OffsetOutOfBounds;
+        if (patch.kind != edge.kind) return error.OpcodeMismatch;
+        const epilogue = @intFromPtr(compiled.page.code.ptr) + patch.epilogue_off;
+        switch (edge.kind) {
+            .deopt => try self.mcode_arena.patchRel32(
+                &compiled.page,
+                generation,
+                patch.patch_off,
+                if (promote) epilogue else originalRel32Target(compiled, patch),
+            ),
+            .link_terminal, .loop_done_linked => try self.mcode_arena.patchWindow(
+                &compiled.page,
+                generation,
+                patch.patch_off,
+                patch.original,
+                epilogue,
+                promote,
+            ),
+        }
+    }
+
+    fn promoteCycle(self: *TraceState, edges: []PromotedEdge, region_key: RegionKey) !void {
+        if (edges.len == 0 or edges.len > PROMOTED_CYCLE_CAP) return error.InvalidPromotionCycle;
+        if (self.next_promoted_cycle_id == std.math.maxInt(u32)) return error.PromotionIdExhausted;
+        for (edges) |edge| {
+            const validated = self.promotedEdgeFromLink(.{
+                .parent = edge.parent,
+                .slot_index = edge.exit,
+                .child = edge.child,
+                .kind = edge.arm_kind,
+            }) orelse return error.InvalidPromotionCycle;
+            if (validated.kind != edge.kind or validated.resume_pc != edge.resume_pc)
+                return error.InvalidPromotionCycle;
+            if (self.promoted_exit_owners.contains(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
+                return error.PromotionExitOwned;
+        }
+
+        const owned_edges = try self.gpa.dupe(PromotedEdge, edges);
+        errdefer self.gpa.free(owned_edges);
+        const summary = try self.gpa.alloc(nativegen.SilentSummaryCell, edges.len);
+        errdefer self.gpa.free(summary);
+        @memset(summary, .{ .region_work = 0, .selection_work = 0, .qualifying_rows = 0 });
+        const metadata = try self.gpa.alloc(nativegen.SilentExitMetadata, edges.len);
+        errdefer self.gpa.free(metadata);
+
+        for (owned_edges, 0..) |edge, i| {
+            const compiled = &edge.parent.native.compiled;
+            metadata[i] = .{
+                .summary = &summary[i],
+                .slot = &compiled.slots[edge.exit],
+                .min_useful = self.config.min_useful,
+            };
+        }
+
+        try self.promoted_cycles.ensureUnusedCapacity(self.gpa, 1);
+        try self.promoted_exit_owners.ensureUnusedCapacity(self.gpa, @intCast(edges.len));
+        // At most one queued id per live cycle. Reserve against the registry
+        // size (not the pending list's current length, normally zero), so a
+        // global sweep during replay can queue every cycle without allocation.
+        try self.pending_demote.ensureTotalCapacity(self.gpa, self.promoted_cycles.items.len + 1);
+
+        // Publication: initialized metadata first, then pointer cells, code last.
+        for (owned_edges, 0..) |edge, i| {
+            edge.parent.native.compiled.metadata_cells[edge.exit] = @intFromPtr(&metadata[i]);
+        }
+        var patched: usize = 0;
+        errdefer {
+            while (patched > 0) {
+                patched -= 1;
+                self.patchPromotedEdge(owned_edges[patched], false) catch
+                    @panic("promoteCycle: failed to restore reporting code during unwind");
+            }
+            for (owned_edges) |edge| edge.parent.native.compiled.metadata_cells[edge.exit] = 0;
+        }
+        for (owned_edges) |edge| {
+            try self.patchPromotedEdge(edge, true);
+            patched += 1;
+        }
+
+        const id = self.next_promoted_cycle_id;
+        self.next_promoted_cycle_id += 1;
+        self.promoted_cycles.appendAssumeCapacity(.{
+            .edges = owned_edges,
+            .summary = summary,
+            .metadata = metadata,
+            .region_key = region_key,
+            .id = id,
+        });
+        for (owned_edges) |edge| self.promoted_exit_owners.putAssumeCapacityNoClobber(
+            .{ .trace_id = edge.parent.id, .exit_instr = edge.exit },
+            id,
+        );
+        self.silent_promotions +|= 1;
+    }
+
+    fn queueDemote(self: *TraceState, id: u32) void {
+        for (self.pending_demote.items) |pending| if (pending == id) return;
+        self.pending_demote.appendAssumeCapacity(id);
+    }
+
+    fn demoteCycle(self: *TraceState, idx: usize) void {
+        const cycle = self.promoted_cycles.items[idx];
+        if (self.replay_walk_depth > 0) {
+            self.queueDemote(cycle.id);
+            return;
+        }
+        // Teardown order is the inverse publication order: code first, cells
+        // second, then ownership/storage. A failed restore intentionally leaves
+        // every cell and allocation live before terminating the process.
+        for (cycle.edges) |edge| self.patchPromotedEdge(edge, false) catch
+            @panic("demoteCycle: failed to restore reporting code");
+        for (cycle.edges) |edge| edge.parent.native.compiled.metadata_cells[edge.exit] = 0;
+        for (cycle.edges) |edge| {
+            if (!self.promoted_exit_owners.remove(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
+                @panic("demoteCycle: missing physical-exit ownership");
+        }
+        self.gpa.free(cycle.edges);
+        self.gpa.free(cycle.summary);
+        self.gpa.free(cycle.metadata);
+        _ = self.promoted_cycles.swapRemove(idx);
+        self.silent_demotions +|= 1;
+    }
+
+    fn demoteCyclesTouching(self: *TraceState, parent: *Trace, exit: u32) void {
+        const id = self.promoted_exit_owners.get(.{ .trace_id = parent.id, .exit_instr = exit }) orelse return;
+        for (self.promoted_cycles.items, 0..) |cycle, i| {
+            if (cycle.id == id) {
+                self.demoteCycle(i);
+                return;
+            }
+        }
+        @panic("demoteCyclesTouching: owner names no live cycle");
+    }
+
+    fn demoteCyclesTouchingTrace(self: *TraceState, trace: *Trace) void {
+        var i = self.promoted_cycles.items.len;
+        while (i > 0) {
+            i -= 1;
+            var touches = false;
+            for (self.promoted_cycles.items[i].edges) |edge| {
+                if (edge.parent == trace or edge.child == trace) {
+                    touches = true;
+                    break;
+                }
+            }
+            if (touches) self.demoteCycle(i);
+        }
+    }
+
+    fn demoteAllCycles(self: *TraceState) void {
+        var i = self.promoted_cycles.items.len;
+        while (i > 0) {
+            i -= 1;
+            self.demoteCycle(i);
+        }
+    }
+
     const SlotMutationReason = enum { arm, rearm, retire, disarm_all, disarm_one };
     const PreparedSlotMutation = struct { compiled: *nativegen.CompiledTrace, exit: u32 };
 
@@ -7807,8 +8192,9 @@ pub const TraceState = struct {
             else => return error.NativeTraceUnavailable,
         };
         if (exit >= compiled.slots.len) return error.InvalidNativeSlot;
-        // B-3b HOOK: promotion-registry lookup + demotion transaction.
-        _ = self;
+        self.demoteCyclesTouching(parent, exit);
+        if (self.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = exit }))
+            return error.DemotionDeferred;
         _ = reason;
         return .{ .compiled = compiled, .exit = exit };
     }
@@ -8028,6 +8414,7 @@ pub const TraceState = struct {
     /// The slot address is re-derived from the live `parent` here, never cached, so it
     /// is always valid at the moment of the write.
     pub fn resetLinksTouching(self: *TraceState, t: *Trace) void {
+        self.demoteCyclesTouchingTrace(t);
         const shared_exit = self.mcode_arena.trampoline_exit orelse 0;
         var i: usize = self.armed_links.items.len;
         while (i > 0) {
@@ -8234,6 +8621,7 @@ pub const TraceState = struct {
     /// emptied `armed_links`, so no inbound native link touches any cached trace and
     /// no per-trace `resetLinksTouching` is needed here.
     pub fn clearCache(self: *TraceState) void {
+        self.demoteAllCycles();
         self.clearProvenanceEdges();
         for (self.cache.items) |t| t.destroy(self.gpa);
         self.cache.clearRetainingCapacity();
@@ -12835,6 +13223,330 @@ test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle �
     for (cont_slots) |s| try testing.expectEqual(SHARED_EXIT, s);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
     try testing.expectEqual(@as(u64, 4), state.native_link_disarms);
+}
+
+fn makeB3LinkTrace(
+    gpa: std.mem.Allocator,
+    state: *TraceState,
+    proto: *const Proto,
+    id: u32,
+    pc: u32,
+    next_pc: u32,
+) !*Trace {
+    const t = try gpa.create(Trace);
+    errdefer gpa.destroy(t);
+    const instrs = try gpa.alloc(IrInstr, 1);
+    errdefer gpa.free(instrs);
+    instrs[0] = .{ .op = .link, .aux = @intCast(next_pc) };
+    const consts = try gpa.alloc(Value, 0);
+    errdefer gpa.free(consts);
+    const entry_slots = try gpa.alloc(u16, 0);
+    errdefer gpa.free(entry_slots);
+    const entry_guards = try gpa.alloc(EntryGuard, 0);
+    errdefer gpa.free(entry_guards);
+    t.* = .{
+        .id = id,
+        .anchor = .{ .proto = proto, .pc = pc },
+        .instrs = instrs,
+        .consts = consts,
+        .entry_slots = entry_slots,
+        .entry_guards = entry_guards,
+    };
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t) orelse
+        return error.NativeBailedUnexpectedly };
+    errdefer t.native.deinit();
+    try state.cache.append(gpa, t);
+    return t;
+}
+
+fn makeB3GuardTrace(
+    gpa: std.mem.Allocator,
+    state: *TraceState,
+    proto: *const Proto,
+    id: u32,
+    pc: u32,
+) !*Trace {
+    const t = try gpa.create(Trace);
+    errdefer gpa.destroy(t);
+    const instrs = try gpa.alloc(IrInstr, 7);
+    errdefer gpa.free(instrs);
+    instrs[0] = .{ .op = .slot_load, .aux = 0 };
+    instrs[1] = .{ .op = .slot_load, .aux = 1 };
+    instrs[2] = .{ .op = .guard_int, .a = 0 };
+    instrs[3] = .{ .op = .guard_int, .a = 1 };
+    instrs[4] = .{ .op = .lt, .a = 0, .b = 1 };
+    instrs[5] = .{ .op = .guard_true, .a = 4, .aux = 1 };
+    instrs[6] = .{ .op = .loop };
+    const consts = try gpa.alloc(Value, 0);
+    errdefer gpa.free(consts);
+    const entry_slots = try gpa.alloc(u16, 0);
+    errdefer gpa.free(entry_slots);
+    const entry_guards = try gpa.alloc(EntryGuard, 0);
+    errdefer gpa.free(entry_guards);
+    t.* = .{
+        .id = id,
+        .anchor = .{ .proto = proto, .pc = pc },
+        .instrs = instrs,
+        .consts = consts,
+        .entry_slots = entry_slots,
+        .entry_guards = entry_guards,
+    };
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t) orelse
+        return error.NativeBailedUnexpectedly };
+    errdefer t.native.deinit();
+    try state.cache.append(gpa, t);
+    return t;
+}
+
+fn makeB3LoopDoneTrace(
+    gpa: std.mem.Allocator,
+    state: *TraceState,
+    proto: *const Proto,
+    id: u32,
+    pc: u32,
+) !*Trace {
+    const t = try gpa.create(Trace);
+    errdefer gpa.destroy(t);
+    const instrs = try gpa.alloc(IrInstr, 7);
+    errdefer gpa.free(instrs);
+    instrs[0] = .{ .op = .slot_load, .aux = 0 };
+    instrs[1] = .{ .op = .slot_load, .aux = 1 };
+    instrs[2] = .{ .op = .guard_int, .a = 0 };
+    instrs[3] = .{ .op = .guard_int, .a = 1 };
+    instrs[4] = .{ .op = .lt, .a = 0, .b = 1 };
+    instrs[5] = .{ .op = .guard_true, .a = 4, .aux = 2 };
+    instrs[6] = .{ .op = .loop };
+    const consts = try gpa.alloc(Value, 0);
+    errdefer gpa.free(consts);
+    const entry_slots = try gpa.alloc(u16, 0);
+    errdefer gpa.free(entry_slots);
+    const entry_guards = try gpa.alloc(EntryGuard, 0);
+    errdefer gpa.free(entry_guards);
+    t.* = .{
+        .id = id,
+        .anchor = .{ .proto = proto, .pc = pc },
+        .instrs = instrs,
+        .consts = consts,
+        .entry_slots = entry_slots,
+        .entry_guards = entry_guards,
+    };
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t) orelse
+        return error.NativeBailedUnexpectedly };
+    errdefer t.native.deinit();
+    try state.cache.append(gpa, t);
+    return t;
+}
+
+fn expectB3Patched(edge: PromotedEdge, promoted: bool) !void {
+    const compiled = &edge.parent.native.compiled;
+    const patch = TraceState.exitPatchFor(compiled, edge.exit).?;
+    const bytes = compiled.page.code[patch.patch_off..][0..5];
+    if (!promoted) {
+        try testing.expectEqualSlices(u8, &patch.original, bytes);
+        try testing.expectEqual(@as(usize, 0), compiled.metadata_cells[edge.exit]);
+        return;
+    }
+    try testing.expectEqual(@as(u8, 0xE9), bytes[0]);
+    const bits: u32 = @as(u32, bytes[1]) | (@as(u32, bytes[2]) << 8) |
+        (@as(u32, bytes[3]) << 16) | (@as(u32, bytes[4]) << 24);
+    const disp: i32 = @bitCast(bits);
+    const target: usize = @intCast(@as(i128, @intCast(@intFromPtr(bytes.ptr) + 5)) + disp);
+    try testing.expectEqual(@intFromPtr(compiled.page.code.ptr) + patch.epilogue_off, target);
+    const cell = compiled.metadata_cells[edge.exit];
+    try testing.expect(cell != 0);
+    const metadata: *nativegen.SilentExitMetadata = @ptrFromInt(cell);
+    try testing.expectEqual(&compiled.slots[edge.exit], metadata.slot);
+}
+
+test "B-3b.2 detector accepts closed 2/3-edge cycles and canonicalizes every entry phase" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [8]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1701, .code = &code, .name = "b3-detector", .num_registers = 2 };
+
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 30, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 10, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const from_a = state.detectPromotableCycle(a, 0).?;
+    defer gpa.free(from_a);
+    const from_b = state.detectPromotableCycle(b, 0).?;
+    defer gpa.free(from_b);
+    try testing.expectEqual(@as(usize, 2), from_a.len);
+    try testing.expectEqual(@as(u32, 10), from_a[0].parent.id);
+    for (from_a, from_b) |ea, eb| {
+        try testing.expectEqual(ea.parent, eb.parent);
+        try testing.expectEqual(ea.exit, eb.exit);
+    }
+
+    state.disarmAllLinks();
+    const c = try makeB3LinkTrace(gpa, &state, &proto, 20, 3, 1);
+    a.instrs[0].aux = 2;
+    b.instrs[0].aux = 3;
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, c, .link_terminal));
+    try testing.expect(try state.armNativeLink(c, 0, a, .link_terminal));
+    const three_a = state.detectPromotableCycle(a, 0).?;
+    defer gpa.free(three_a);
+    const three_c = state.detectPromotableCycle(c, 0).?;
+    defer gpa.free(three_c);
+    try testing.expectEqual(@as(usize, 3), three_a.len);
+    try testing.expectEqual(@as(u32, 10), three_a[0].parent.id);
+    for (three_a, three_c) |ea, ec| try testing.expectEqual(ea.parent, ec.parent);
+}
+
+test "B-3b.2 detector rejects bridge, open, missing patch, over-cap, and owned exit" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [32]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1702, .code = &code, .name = "b3-reject", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(state.detectPromotableCycle(a, 0) == null); // open
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    state.armed_links.items[0].kind = .region_bridge;
+    try testing.expect(state.detectPromotableCycle(a, 0) == null);
+    state.armed_links.items[0].kind = .link_terminal;
+    const saved_patches = a.native.compiled.exit_patches;
+    a.native.compiled.exit_patches = &.{};
+    try testing.expect(state.detectPromotableCycle(a, 0) == null);
+    a.native.compiled.exit_patches = saved_patches;
+
+    const edges = state.detectPromotableCycle(a, 0).?;
+    defer gpa.free(edges);
+    const key: RegionKey = .{ .region_id = @enumFromInt(1), .activation = 9 };
+    try state.promoteCycle(edges, key);
+    try testing.expect(state.detectPromotableCycle(a, 0) == null); // owned
+    state.demoteAllCycles();
+    state.disarmAllLinks();
+
+    var long: [TraceState.PROMOTED_CYCLE_CAP + 1]*Trace = undefined;
+    for (&long, 0..) |*slot, i| slot.* = try makeB3LinkTrace(
+        gpa,
+        &state,
+        &proto,
+        @intCast(100 + i),
+        @intCast(10 + i),
+        @intCast(10 + ((i + 1) % long.len)),
+    );
+    for (long, 0..) |parent, i| try testing.expect(try state.armNativeLink(
+        parent,
+        0,
+        long[(i + 1) % long.len],
+        .link_terminal,
+    ));
+    try testing.expect(state.detectPromotableCycle(long[0], 0) == null);
+}
+
+test "B-3b.2 promotion publishes metadata and patches mixed deopt/NOP exits; demotion restores exact bytes" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    code[1] = Instr.op0(.for_loop);
+    const proto = Proto{ .id = 1703, .code = &code, .name = "b3-patch", .num_registers = 2 };
+    const guard = try makeB3GuardTrace(gpa, &state, &proto, 2, 0);
+    const done = try makeB3LoopDoneTrace(gpa, &state, &proto, 3, 1);
+    const link = try makeB3LinkTrace(gpa, &state, &proto, 1, 2, 0);
+    try testing.expect(try state.armNativeLink(guard, 5, done, .ordinary_guard));
+    try testing.expect(try state.armNativeLink(done, 5, link, .loop_done_linked));
+    try testing.expect(try state.armNativeLink(link, 0, guard, .link_terminal));
+    const edges = state.detectPromotableCycle(guard, 5).?;
+    defer gpa.free(edges);
+    const key: RegionKey = .{ .region_id = @enumFromInt(2), .activation = 11 };
+    try state.promoteCycle(edges, key);
+    try testing.expectEqual(@as(usize, 1), state.promoted_cycles.items.len);
+    for (edges) |edge| try expectB3Patched(edge, true);
+    try testing.expectEqual(@as(u64, 1), state.silent_promotions);
+    state.demoteAllCycles();
+    for (edges) |edge| try expectB3Patched(edge, false);
+    try testing.expectEqual(@as(u64, 1), state.silent_demotions);
+}
+
+test "B-3b.2 slot mutation and closeRegion demote before invalidation" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1704, .code = &code, .name = "b3-lifetime", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const edges = state.detectPromotableCycle(a, 0).?;
+    defer gpa.free(edges);
+    const key: RegionKey = .{ .region_id = @enumFromInt(3), .activation = 12 };
+    try state.promoteCycle(edges, key);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+    for (edges) |edge| try expectB3Patched(edge, false);
+
+    try state.promoteCycle(edges, key);
+    try state.region_profit.put(gpa, key, .{ .root_frame_depth = 1, .root_call_seq = key.activation });
+    state.closeRegion(key);
+    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+}
+
+test "B-3b.2 prepareNativeEntry retains same activation and demotes a different activation" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1705, .code = &code, .name = "b3-entry", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const edges = state.detectPromotableCycle(a, 0).?;
+    defer gpa.free(edges);
+    const same: RegionKey = .{ .region_id = @enumFromInt(4), .activation = 20 };
+    const other: RegionKey = .{ .region_id = @enumFromInt(5), .activation = 21 };
+    try state.region_profit.put(gpa, same, .{ .root_frame_depth = 1, .root_call_seq = same.activation });
+    state.region_context = .{ .depth = 1, .call_seq = same.activation };
+    try state.promoteCycle(edges, same);
+    state.prepareNativeEntry();
+    try testing.expectEqual(@as(usize, 1), state.promoted_cycles.items.len);
+    _ = state.region_profit.remove(same);
+    try state.region_profit.put(gpa, other, .{ .root_frame_depth = 1, .root_call_seq = other.activation });
+    state.region_context = .{ .depth = 1, .call_seq = other.activation };
+    state.prepareNativeEntry();
+    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+}
+
+test "B-3b.2 replay walk queues demotion and applies it before pending disarms" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1706, .code = &code, .name = "b3-deferred", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const edges = state.detectPromotableCycle(a, 0).?;
+    defer gpa.free(edges);
+    const key: RegionKey = .{ .region_id = @enumFromInt(6), .activation = 30 };
+    try state.promoteCycle(edges, key);
+    state.replay_walk_depth = 1;
+    state.demoteCyclesTouching(a, 0);
+    state.disarmAllLinks();
+    try testing.expectEqual(@as(usize, 1), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 1), state.pending_demote.items.len);
+    try testing.expect(state.pending_disarm_all);
+    state.replay_walk_depth = 0;
+    state.applyPendingDisarms();
+    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    for (edges) |edge| try expectB3Patched(edge, false);
 }
 
 test "armNativeLink: P-C option (b) invariant — arm kind matches slot guard shape" {
