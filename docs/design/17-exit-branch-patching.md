@@ -1,7 +1,42 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
 Status: **all eight §A8 steps are landed as of 2026-08-12** — step 8 (A-viii, outer-cycle disarm coverage) closed the sequence: the outer cycle is pinned as a *simultaneously* armed closed cycle (`native_link_peak >= 3`; nsieve 4) that fires, an open observation window is pinned to contain it (nothing arms, output-transparent, still dispatcher-mediated native entries per R2-4), the **mid-epoch** transition is driven end-to-end through a host-installed native (which measures a live 3-link multi-kind cycle at the window-open instant, its complete teardown, and continued dispatcher-mediated trace entries afterward), and `disarmAllLinks` is pinned exhaustive over all four production edge kinds incl. `.loop_done_linked` and `.region_bridge`. A-viii's first landing was corrected over two codex review rounds — the "mid-epoch window is host-unreachable" claim (false: natives receive the `*Vm`), a fictional unit topology (now four kinds on genuinely distinct physical slot shapes, all armed through `armNativeLink`), an unsound cross-run `entries` comparison, and `entries` being the wrong counter for R2-4 at all (new `native_entries`, bumped only when the dispatcher commits to a native body) — see §A8-iv. One residual, tracked as its own Outstanding bullet: no test observes a live `.region_bridge` link at a window-open instant, since any probe placement that leaves the bridge armed leaves the registry empty at the call — not achieved in this workload, not shown impossible. Earlier: **§A8 step 7 (A-vii, the edge-4 FLIP) COMPLETE 2026-08-12**: landed (A-vii-c/c.1 gate consumption, A-vii-d/d.1 arming + successor overlay + receipt-sited two-phase arm + codex-blocker fix fcee9b7), reviewed (codex BLOCKER→fix→APPROVE), and measured per the frozen A-vii-e protocol — which surfaced and fixed a 2× per-instruction observer overhead (A-vii-e.1 `ObserverFast` bitset fast path; the raw flip regressed nsieve ~2× with the observer scan at 49% of runtime, the bridge itself measured cost-neutral by ablation). Final vs pre-flip: nsieve N=9 −9%, N=7 −6%, nsieve:24 coverage 56.7%→94.9% traced, six-workload output identity + bit-identical stats counters. Remaining in §A8: step 8 (A-viii disarm coverage), then the native in-page handoff (§A2.4) to convert the coverage gain to wall-clock.
-Last updated: 2026-08-13c (**B-1 + B-2 LANDED — the hotexit misroute is fixed and
+Last updated: 2026-08-13e (**Part B-3 design ACCEPTED after five codex
+review rounds (§B3.6–§B3.13).** The round-1 draft's three load-bearing
+mistakes — a single shared patch tail (four exit kinds have different
+materialization shapes), a silent terminal routed through replayLedger's
+grammar, and accounting precomputed from observed locals (locals are NOT
+constants of a frozen composition) — were each replaced across rounds 2–5
+with: per-kind patch points (4-byte rel32 swap for ordinary `.deopt`;
+5-byte NOP window → `E9` for the fall-through `.link_terminal`/
+`.loop_done_linked`; `.region_bridge` ineligible in v1), a dedicated
+`driveSilentBurst` + `replayLedgerSuffix` over an explicit `ReplayCursor`
+(multi-row off-cycle suffixes, terminals owned end-to-end, release-panic
+on impossible grammar), dynamic per-kind native summaries
+(`{region_work, selection_work, qualifying_rows}` cells + absolute-count
+barren budget striking AT the boundary + `silent_cum` baseline), per-exit
+metadata-cell transport published before the patch, activation binding via
+a static promotion predicate over the v1 edge shapes + global pre-entry
+RegionKey sweep + `closeRegion` demotion hook, and a two-phase
+`prepareSlotMutation`/`commitSlotMutation` funnel for every physical slot
+write. Round-5 verdict: no BLOCKER/MAJOR remain; ACCEPT for B-3a. Landing:
+B-3a substrate (patch points, unreachable out-of-line silent epilogues,
+frozen ABI tail incl. `silent_cum`, patchRel32/patchWindow validation,
+flag off, identical-modulo-NOP bench gate, ≥70% bridge-free seam-coverage
+telemetry gate) → B-3b runtime promotion → B-3c budget sweep.**)
+Earlier: 2026-08-13d (**Part B-3 design drafted (§Part B-3): DONE-state
+cycles — dual exit tails, one in-page rel32 patch per promoted exit
+(promotion = reporting tail → silent tail, demotion = patch back; the slot
+stays authoritative in both, so disarm safety is untouched), budgeted silent
+yield (`rbx` bound replaces per-row LEDGER_CAP), and summary accounting
+(bulk region credit; per-member per-revolution accountTraceRun; terminal
+charging unchanged; promoted edges verdict-exempt). Grounded on the
+lj_asm_patchexit/SNAPCOUNT_DONE/asm_tail_fixup trio read from LuaJIT source
+and on a full survey of our exit emission + determinism contract: cross-mode
+byte-identity is stdout-only and LEDGER_CAP is already a legal
+tiering-observable knob, so a deterministic coarser receipt stream is legal.
+Target: the measured 46.2% Zig seam at nsieve N=9. Awaiting codex review.**)
+Earlier: (**B-1 + B-2 LANDED — the hotexit misroute is fixed and
 the provenance arm closes the full native cycle. nsieve N=9 walks 330,206 →
 53,746 (LEDGER_CAP-bound); nsieve 9 −21%, nsieve 7 −18%, sieve_int −20%; board
 nsieve now 1.9× LuaJIT (was 2.7×), sieve_int 1.5× (was 2.4×). §B.7 records the
@@ -931,7 +966,24 @@ awaits Bart.
     test). `local > 0` handoff rows pinned to non-final `.deopt` accounting + grammar
     tests. Lands as B-2a (substrate + helper refactor, flip OFF, byte-identical) then
     B-2b (the flip, measured). Expected: dispatcher entries ÷~7 at nsieve N=9.
-  - [ ] **B-3 — rel32 in-place patch: deferred, measure after B-2** (S.8 stands).
+  - [ ] **B-3 — DONE-state cycles (design drafted 2026-08-13, §Part B-3): dual exit
+    tails + one rel32 patch per promoted exit + budgeted silent yield + summary
+    accounting.** Post-B-2b profile: 46.2% of nsieve N=9 is the Zig seam re-pricing
+    ~1.7M identical frozen-cycle rows; LuaJIT's cost for the same steady state is
+    zero (`lj_asm_patchexit` + SNAPCOUNT_DONE + `asm_tail_fixup`, verified in
+    source). Determinism ruling grounded: cross-mode byte-identity is stdout-only,
+    tiering state is snapshot-excluded, LEDGER_CAP is already a legal
+    tiering-observable knob — a deterministic coarser receipt stream is equally
+    legal. Lands as B-3a (patch substrate, flag off) → B-3b (flip + summary
+    application, measured) → B-3c (budget tune). **Design ACCEPTED 2026-08-13
+    after five codex rounds (§B3.6–§B3.13)** — final shape: per-kind patch
+    points (rel32 swap / 5-byte NOP window; region-bridge ineligible v1),
+    `driveSilentBurst` + `replayLedgerSuffix`/`ReplayCursor`, dynamic
+    per-kind native summary cells + absolute-count barren budget +
+    `silent_cum`, per-exit metadata-cell transport, static activation
+    predicate + global pre-entry RegionKey sweep + closeRegion demotion,
+    two-phase slot-mutation funnel. B-3a implementation next; B-3b gated on
+    the ≥70% bridge-free seam-coverage telemetry.
   - [ ] **B-4 — deterministic trace-quality probation (nsieve-bit follow-up, §B.7).**
     Score native entries against committed work, normal-deopt frequency, exit
     dispersion, and trace size; gate or retire large low-yield root traces (the
@@ -2687,6 +2739,832 @@ The general follow-up is **deterministic trace-quality probation** — score
 native entries against committed work, normal-deopt frequency, exit
 dispersion, and size; gate or retire large low-yield roots (targets t=5 and
 every analogous unstable mega-trace, benchmark-agnostic per Rule Z-6).
+
+#### Part B-3 — landing design (2026-08-13): DONE-state cycles — patch out the reporting, not just the routing
+
+Status: design draft, for review. Mandate from Bart: "lets go for the full B-3
+thing. It's the biggest lever we have for parity."
+
+##### B3.0 — The measured gap and its decomposition
+
+Post-B-2b profile of nsieve N=9 (`--trace --jit-native`, ReleaseFast):
+**native [JIT] 43.0%, tier-0 Vm.exec 4.3%, Zig seam 46.2%** (replayLedger
+29.2% + driveDispatcherLedger 14.7% + capture/account remainder). The
+interpreter war is won; the remaining 2× vs LuaJIT is almost exactly the
+seam. Structure of the seam cost: 53,746 walks/run, ~every one a
+LEDGER_CAP=32 forced yield of the SAME frozen four-row cycle composition,
+each row re-priced and re-steered by the replay grammar — ~1.7M rows/run
+re-deriving "no change".
+
+LuaJIT's cost for the identical steady state is zero, by three mechanisms we
+verified in source (`~/Projects/LuaJIT/src`):
+- `lj_asm_patchexit` (lj_asm_x86.h:3127): at side-trace commit, every
+  `Jcc rel32` in the parent targeting that exit's stub is rewritten to jump
+  to the side trace's mcode; the tail `jmp` likewise.
+- `snap->count = SNAPCOUNT_DONE` (lj_trace.c:535, lj_jit.h:190): the exit's
+  hotcounter is retired forever; `trace_hotside` skips DONE.
+- `asm_tail_fixup(as, T->link)` (lj_asm.c:2632): a side trace ENDS by
+  jumping directly into its link trace. Root→exit→side→root is a closed
+  native cycle; no VM entry, no per-transition record of any kind.
+
+Our B-2b cycle is topologically the same closed cycle, but every transition
+still (a) appends a 7-store ledger row, (b) runs the forced-yield check, and
+(c) every 16 revolutions yields to Zig, which replays 32 rows through the
+full steering grammar. (a)+(b) are native micro-cost; (c) is the 46%.
+
+##### B3.1 — Why a coarser receipt stream is LEGAL (the determinism ruling)
+
+Grounded against docs 01/02/04 and the schema (2026-08-13 survey):
+
+1. The cross-mode byte-identity contract is **stdout only** (`Vm.out` bytes;
+   `expectProgram` ten-leg matrix, interp.zig:5156). No tiering artifact is
+   compared across modes.
+2. The snapshot/replay schema serializes **no ledger rows, no tiering
+   counters** — trace IR shape only; JIT state is explicitly excluded from
+   the `.snapshot` root walk (doc 04:68-73); replay-to-k runs pure tier-0
+   (doc 02:332). `CoverageFile` counters are "an observation artifact, not a
+   replay input" (schema/trace.json:312).
+3. The internal obligation is run-to-run: the tiering trajectory must be a
+   pure function of the executed transition stream (accountTraceRun doc,
+   RegionAccum doc: "pure function of the receipt stream").
+4. `LEDGER_CAP` is already a tiering-observable constant whose value legally
+   reshapes the entire receipt stream (bursts/run, terminal identity,
+   window boundaries). Precedent: changing CAP is legal; therefore a
+   promotion that deterministically changes WHEN a cycle yields — and what
+   granularity it reports at — is legal by the same rule, provided every
+   promotion/demotion decision is itself a pure function of deterministic
+   state (frozen latches, receipt counts, `rbx`), never of clocks or
+   addresses.
+
+So B-3 does NOT need to reconstruct per-row ledgers. It needs the coarser
+stream to keep feeding the counters that still matter, exactly and
+deterministically (§B3.3).
+
+##### B3.2 — The mechanism: dual exit tails + one rel32 patch per promoted exit
+
+Current emitted shape (nativegen survey, 2026-08-13): guard `Jcc` →
+per-guard mini-stub (stage `exit_instr`, resolve `slots[ei]` →
+`NativeResult.exit_target`) → `jmp deopt_exit` (rel32, same page) → shared
+`deopt_exit` tail: flush carried slots → `emitLedgerAppend` (7 stores) →
+`emitForcedYieldCheck` → `jmp rax`. The slot value already IS the routing
+(armed child entry or `trampoline_exit`); arming/disarming writes heap, not
+code.
+
+B-3 adds, at compile time, a second shared tail after the same flush:
+
+```
+deopt_exit:            ; unchanged reporting tail
+  <flush carried slots>
+  <ledger append> <forced-yield check> ; jmp rax
+silent_exit:           ; NEW, emitted once per trace, a few instructions
+  <jmp into deopt_exit's flush prefix, then:>
+  cmp rbx, [rdx + silent_budget]      ; ONE compare per transition
+  jae  yield_to_reporting             ; budget exhausted -> stage shared_exit, jmp
+  mov rax, [rdx + exit_target]
+  jmp rax
+```
+
+Concretely the flush is shared: `silent_exit` is a second ENTRY into the
+shared tail region, positioned so both tails run the identical flush and
+diverge only afterward. (Exact layout to be settled at implementation; the
+invariant is: flush identical, divergence = report-vs-silent.)
+
+**Promotion** of an armed exit = patch the mini-stub's final
+`jmp deopt_exit` rel32 to `jmp silent_exit` — 4-byte in-page rel32 write
+under the existing `protectRegion` RW/RX flip (single-threaded VM, no native
+code runs during runtime mutation; same argument as compile-time copy).
+**Demotion** = patch it back. The slot indirection stays live in BOTH tails,
+so every existing disarm path (slot := trampoline_exit) remains instantly
+effective even on a promoted exit — patching is an optimization state, never
+a correctness gate. This is `lj_asm_patchexit` adapted to our two-level
+(code + slot) scheme: Pall rewrites the branch target; we rewrite which TAIL
+the branch lands in, because our tails carry the flush that his
+register-coordinated side-trace entries don't need.
+
+**Budgeted yield replaces per-row CAP.** A promoted cycle cannot run
+unbounded (GC, interrupts, and the driver's safe points live at Zig
+re-entry). `silent_budget` is a per-call absolute `rbx` bound staged in
+`NativeResult` by the driver before entry: `entry_rbx + config.silent_iters`
+(deterministic; default proposal 4096 enclosing iterations ≈ 256× fewer
+walks than today's CAP-bound 16 revolutions). One compare per transition
+against a memory operand replaces: ledger append (7 stores) + forced-yield
+check (5 instrs) — strictly cheaper, and the walk count drops by the budget
+ratio.
+
+##### B3.3 — Accounting equivalence: what a silent burst reports and how it's applied
+
+A silent burst returns to Zig only at: (i) a real deopt through an
+UNPROMOTED exit (guard failure off the cycle — its mini-stub still jumps to
+the reporting tail, appends its row, and returns exactly as today), or
+(ii) budget exhaustion (stage `shared_exit`, return with a synthetic
+`.yielded`-style terminal). In both cases the ledger contains the rows of
+un-promoted transitions only — for a fully promoted cycle, exactly ONE
+terminal row — plus `cum`/`rbx`, which never stopped counting committed
+iterations (the flush and `entry_rbx` bookkeeping are unchanged).
+
+Per the counter survey (2026-08-13), in the frozen steady state the per-row
+effects reduce to exactly four families, and each survives summarization:
+
+1. **Region window credit** (`outer_traversals += region_work`): the window
+   is a function of the RUNNING SUM only (flush loop `while (total - base >=
+   min_useful)`) — the survey's one "sum suffices" counter. A silent burst
+   bulk-credits `terminal.cum - entry_rbx` to the frozen activation in one
+   call. `barren_run`: any bulk credit > 0 resets it (a promoted cycle that
+   commits zero work across a whole budget cannot exist — promotion requires
+   frozen, frozen requires useful windows; if it happens anyway the terminal
+   row is a zero-progress deopt and demotes).
+2. **`hit_count`** (`+1` per row with completed >= min_useful=8): in the
+   measured frozen cycles every row's local is 0 or 1 — zero increments
+   today. Rule: a silent burst applies `accountTraceRun(member,
+   per_revolution_local)` per member ONCE per burst with the member's
+   per-revolution local (0/1 — composition captured at promotion), i.e. the
+   same zero increments. NOT the bulk sum (the survey's explicit trap:
+   32×local-1 rows ≠ 1×completed-32 row).
+3. **`penalty`**: only reachable when `!region_consumed`; a promoted cycle
+   is frozen ⇒ consumed ⇒ untouched today AND under B-3. Demotion re-exposes.
+4. **Terminal charging** (hotexit `noteTakenExit`, sibling watch
+   `noteSiblingTerminal`): both are already once-per-burst functions of the
+   TERMINAL row + last cum delta — the silent burst still has a real
+   terminal row. Unchanged. (Fewer bursts ⇒ slower hotexit accumulation on
+   the cycle's own exits — acceptable: promoted exits are DONE-equivalent,
+   the exits still reporting are the un-promoted ones, which charge at full
+   fidelity on their own bursts.)
+
+**Provenance verdicts**: silent transitions are invisible to
+`captureProvenanceVerdicts`. Ruling: a promoted edge is verdict-EXEMPT while
+promoted (it earned promotion by sustained productive service; the
+zero-progress-cycle pathology the detector exists for cannot survive
+promotion's preconditions), and re-enters detection on demotion.
+
+##### B3.4 — Promotion/demotion lifecycle (all pure functions of deterministic state)
+
+Promote a closed armed cycle when ALL of, checked at the driver safe point
+(same site as drainProvenanceArms):
+- every member's frozen activation latch is set (freeze-after-qualify);
+- every cycle edge is an armed link whose exit's mini-stub is patchable
+  (in-page rel32 — always true today);
+- the last `config.promote_after` (proposal: 4) consecutive bursts seeded at
+  this anchor were LEDGER_CAP forced yields of IDENTICAL row composition
+  (pure receipt-stream function; detected from the ledger the driver already
+  holds, no new native work).
+
+Demote (unpatch every member exit) at, and BEFORE the state change lands:
+- any unfreeze (`flushRegionWindow` low-yield strike on the activation);
+- any disarm touching a member (`resetLinksTouching`/`disarmLinkAt`/
+  `disarmAllLinks` — these already own the invalidation discipline from
+  B-2b's `provenance_arms_pending`; demotion hooks the same sites);
+- `gateAnchor` on the owner anchor; epoch/`clearCache`; member retirement.
+Unpatching before the registry mutation preserves the current invariant
+that a disarmed slot is instantly authoritative (belt: the slot write is
+still sufficient on its own; the unpatch restores reporting so the NEXT
+burst's receipts feed the demoted machinery again — one silent burst racing
+a demotion event is benign because the slot already routes to
+trampoline_exit).
+
+##### B3.5 — Landing plan
+
+- **B-3a — patch substrate (flag off, byte-identical).** `McodeArena.
+  patchRel32(page, at_off, new_target_off)` under the RW/RX flip; dual-tail
+  emission in `lower` (silent tail + budget compare, unreachable while
+  unpatched); mini-stub patch-site offsets recorded per exit on
+  `CompiledTrace` (like `slots`); promote/demote functions wired to the
+  lifecycle sites but gated `cycle_promotion_enabled=false`; unit tests:
+  patch→run→unpatch→run byte-equality, budget-yield mechanics on a
+  hand-built page, demotion-before-disarm ordering.
+- **B-3b — the flip + summary application.** Promotion detector at the
+  driver safe point; bulk region credit + per-member accountTraceRun rule +
+  verdict exemption; the full gate suite (ten-leg matrix, seven hashes,
+  aviii/floatlink, nsieve-bit watch) + measurement per frozen protocol.
+- **B-3c — budget tune + spillover.** `silent_iters` sweep (1k/4k/16k) on
+  nsieve{3,7,9}/sieve_int/nsieve-bit; then re-profile: if the native
+  micro-cost (append gone, one compare) and walk count both collapsed as
+  predicted, the remaining gap vs LuaJIT is native codegen quality —
+  a different arc.
+
+Open questions for review: (1) silent-tail layout — second entry into the
+shared flush vs duplicated flush; (2) whether budget staging belongs in
+`NativeResult` or a baked imm32 re-patched at promotion; (3) demotion
+ordering vs the replay-deferred disarm discipline (walk-depth guard);
+(4) the promote_after composition-identity check — exact-row-match or
+(id, exit, kind) multiset; (5) interaction with B-4 trace-quality probation
+(a promoted cycle should be probation-exempt by the same argument as
+verdict exemption, or probation must demote first).
+
+##### B3.6 — Review round 1 (codex `gpt-5.6-sol`, 2026-08-13): REJECT — nine findings, kept verbatim in spirit
+
+The direction was judged credible and the W^X safe-point argument sound
+(finding 8), but the draft above is NOT implementable as written. Findings
+(B = blocker, M = major, m = minor), each answered in §B3.7:
+
+1. **[B] The patch point only covers ordinary deopt exits.** `.link_terminal`
+   (own φ snapshot + `emitReturn`, nativegen.zig:4589), `.loop_done_linked`
+   (linked snapshot + `emitReturn`, :4710), and `.region_bridge` (bridge
+   snapshot + direct child jump, :4668) never reach the shared
+   `deopt_exit` tail; only ordinary `.deopt` does (:4732). And the
+   "two entries into one shared flush" layout is not implementable — after
+   a shared linear flush nothing knows which tail to take without a
+   selector branch (taxing the reporting path), duplicated flush, or
+   per-site patch points placed after materialization and before reporting.
+2. **[B] A silent budget terminal has no valid result or replay grammar.**
+   `replayLedger` requires `.yielded` last-of-full-CAP (trace.zig:4898),
+   seed-owner first row, kind-specific terminal arms (panic at :5538); the
+   dispatcher routes on `ledger_len > 1` (interp.zig:3028); the native
+   wrapper's debug contract cross-checks the terminal row
+   (nativegen.zig:770). And budget exhaustion SUPPRESSES an armed
+   transition whose correct resumption is kind-specific (link_terminal →
+   inner root; loop_done_linked → post_pc continuation; region_bridge →
+   successor anchor; armed deopt → provenance-dependent). No single default
+   `resume_pc` exists; `seed.anchor.pc` is wrong for several.
+3. **[B] The four-family accounting reduction is incomplete AND
+   nsieve-shaped (Rule Z-6 violation).** Missing: link/cursor publication,
+   convergence re-arms (armLinkTerminal/armLoopDoneLink), hops,
+   linked_completed, driver-side terminal charging order, M1/sibling/
+   provenance sub-cases. `accountTraceRun` once-per-member-per-burst is not
+   equivalent (hit_count is per qualifying ROW; a general cycle can have
+   `local >= min_useful`); barren_run needs ordered zero/nonzero behavior
+   incl. the final suffix, not totals.
+4. **[M] Demotion must be a centralized transaction over EVERY slot
+   mutation** — the list missed `armNativeLink` in-place re-arm/supersede
+   (a still-silent patch would then serve an edge that never qualified),
+   provenance-verdict retirement, stale-bridge teardown, observation
+   disarm, region rebuild. Needs `pending_demote` paired with the
+   replay-deferred discipline; `applyPendingDisarms` is the natural
+   transaction boundary. ("Racing" wording corrected: single-threaded, the
+   real case is a completed burst whose receipts reveal an invalidation —
+   apply its summary first, then demote before re-entry.)
+5. **[M] Multiset composition identity is unsound** — order is load-bearing
+   (cursors, entered_via_handoff, hops, resume, barren, terminal). Exact
+   ordered physical-edge sequence canonically rotated by entry phase, with
+   an explicit CLOSURE proof (each nonterminal edge's registered child IS
+   the next member; final edge returns to start phase). Identity fields:
+   trace id, exit, kind, outcome, armed successor identity/kind, local
+   delta, region activation identity.
+6. **[M] `rbx` is not a universal residence budget** — it counts committed
+   back-edges, not silent transitions; a useful frozen cycle can advance
+   region work with `local == 0` rows and never exhaust it; and the
+   compare only runs at cross-trace exits (a same-trace native loop stays
+   unbounded). Use a dedicated silent-transition counter incremented at
+   promoted exits.
+7. **[M] GC story: currently safe for the narrow reason** that no native
+   trace op allocates (astore_append is capacity-bounded realloc-free;
+   grid growth exits) and GC runs at the interpreter dispatch safepoint
+   (interp.zig:1859). Document "no allocating native op" as a promotion
+   invariant that fails promotion if ever violated; async interruption /
+   bounded host latency unsupported until a back-edge poll exists.
+   Suspend/observation teardown (`safe_to_arm == false` →
+   `disarmAllLinks`, interp.zig:2817) must also demote.
+8. **[m] W^X flip at driver safe points is sound** (no native frame on the
+   stack, no reentrant trace-system callouts). `patchRel32` must validate:
+   arena/region ownership, offsets within the live page, opcode/restore
+   encoding, signed-32 displacement, page-generation (no retired/reused
+   page), RX restoration on every error path. No icache flush needed at
+   no-execution safe points. The 1 MiB region size is not the reach proof —
+   same-allocation locality is.
+9. **[m] Budget in a `NativeResult` field, not a re-patched imm32** — and
+   NOT based on `entry_rbx` (overwritten at every body entry). A dedicated
+   silent-transition counter staged per call is deterministic, avoids W^X
+   transitions, and decouples the budget from trace-local loop behavior.
+
+##### B3.7 — Revised model (round 2): per-kind patch points, the silent-burst protocol, and the ordered-cycle summary function
+
+Each numbered item discharges the same-numbered §B3.6 finding.
+
+**(1) Per-kind patch points; no shared-tail dual entry.** Every
+chain-source materialization site gets its OWN recorded patch point, placed
+after its kind-specific state materialization and before its reporting
+sequence (`emitLedgerAppend` + yield check / `emitReturn` preamble):
+
+- ordinary `.deopt` mini-stub: the existing `jmp deopt_exit` is preceded by
+  a recorded no-op-sized window; promotion patches the `jmp` to a per-trace
+  `silent_deopt` tail that DUPLICATES the flush (finding 1's option (b) —
+  measured code-size cost accepted; the flush is a store sequence, and
+  duplicating it once per trace beats a selector branch on the reporting
+  path, which stays byte-identical when unpromoted);
+- `.link_terminal` / `.loop_done_linked`: the reporting sequence between
+  materialization and `emitReturn`'s dispatch is bracketed by a recorded
+  patchable `jmp` — promotion patches it to the site's silent epilogue
+  (budget bump + counter + slot-resolved `jmp rax`), demotion restores;
+- `.region_bridge`: NOT promotable in v1 (its armed path already jumps
+  directly; its receipt is load-bearing for bridge validation). A cycle
+  containing a bridge edge is promotion-ineligible until a later increment.
+
+`CompiledTrace` records, per exit index: `{patch_off, reporting_rel32,
+silent_rel32}` — both displacements computed at emit time, so patching is a
+validated 4-byte swap either direction (finding 8's checklist implemented in
+`McodeArena.patchRel32`).
+
+**(2) The silent-burst protocol.** New `NativeResult` fields (appended
+before the ledger lanes to preserve the baked SoA offsets — layout note
+nativegen.zig:620 respected): `silent_active: usize` (0/1),
+`silent_transitions: usize` (the dedicated counter, finding 6),
+`silent_cycle: u32` (promoted-cycle id), `silent_phase: u32` (entry phase
+index). Every promoted exit's silent epilogue increments
+`silent_transitions` and compares it against `silent_budget` (staged per
+call by the driver — finding 9). On exhaustion it stages `shared_exit` and
+returns WITHOUT suppressing anything ambiguous: exhaustion is only checked
+AT a promoted exit, i.e. at a cycle edge whose successor and resume
+descriptor are compile-time-known members of the promotion record. The
+driver receives `{silent_active, cycle, phase, transitions, terminal row(s)
+of any unpromoted exits, cum}` and routes it to a NEW `driveSilentBurst`
+(finding 2): never `replayLedger`. `driveSilentBurst` owns the summary
+application (below) and derives the resume directive from the PROMOTION
+RECORD — `PromotedCycle` stores, per edge, the exact kind-specific resume
+contract captured at promotion time (link_terminal → inner root id + pc;
+loop_done_linked → post_pc + continuation id; deopt/sibling → anchor pc),
+so the suppressed-transition resume is a table lookup, not a grammar walk.
+A real off-cycle deopt returns with `silent_active=1` plus the ordinary
+terminal row; `driveSilentBurst` applies the silent prefix summary, then
+hands the terminal row to the EXISTING machinery as a fresh single-row
+burst (seeded at the terminal owner, satisfying replayLedger's seed
+invariant by construction, or routed through the scalar deopt path when
+`ledger_len == 1` exactly as today). The native debug contract
+(nativegen.zig:770) gains a `silent_active` branch.
+
+**(3) The ordered-cycle summary function.** `PromotedCycle` freezes at
+promotion time the exact ordered edge sequence (finding 5's identity:
+per edge {trace id, exit, kind, outcome, armed successor id+kind, local
+delta, region activation}) plus its per-revolution accounting image,
+PRECOMPUTED once: for each member, work per revolution and the count of
+rows with `local >= min_useful`; the revolution's ordered zero/nonzero
+credit pattern; hops per revolution. `driveSilentBurst` applies, per
+completed revolution batch: `outer_traversals += rev_work × revolutions`
+(window flush loop runs as normal — window boundaries are running-sum
+functions); `hit_count += qualifying_rows_per_rev × revolutions` per member
+(exact, because the per-row locals are FIXED by the frozen composition —
+this is what makes the general `local >= min_useful` case correct, not
+just nsieve's 0/1); barren_run is replayed from the precomputed ordered
+pattern for the FINAL partial revolution only and set from the pattern's
+final suffix for whole revolutions (the pattern is periodic; its
+end-of-revolution barren suffix is a constant of the composition —
+precompute it); convergence re-arms are NOT applied (promotion invariant:
+all cycle edges are armed by definition; demotion re-enters the arming
+machinery). Promotion is REFUSED (finding 3's last clause) if the
+precomputed image shows a revolution could flush a low-yield window
+(`0 < rev_work_in_window < min_useful` reachable) — computed once at
+promotion from min_useful, window base, and rev_work.
+
+**(4) Centralized demotion transaction.** New `TraceState.demoteCycles
+Touching(slot mutation descriptor)` called FIRST from every physical slot
+mutation path: `armNativeLink` (both fresh and in-place re-arm),
+`disarmLinkAt`, `resetLinksTouching`, `disarmAllLinks`,
+`disarmStaleRegionBridgeLinks`, provenance-verdict retirement, trace
+retirement, `clearCache`, observation/suspend teardown (interp.zig:2817),
+and `gateAnchor`/unfreeze. Inside replay, demotion is deferred exactly like
+disarms: `pending_demote` applied at `applyPendingDisarms` (the transaction
+boundary, finding 4), ordered summary-application → demote → disarm →
+re-entry. B-2b's `provenance_arms_pending` invalidation set is the
+checklist template; a shared helper owns "slot mutation ⇒ demote-first" so
+a future mutation site cannot forget it.
+
+**(5)–(7), (9)** as prescribed by the findings: exact-ordered-sequence
+promotion detector with closure proof against the armed-link registry (not
+burst observation alone); dedicated `silent_transitions` counter;
+"no allocating native op" documented as a promotion invariant with a
+compile-time assert hook where native callouts are registered; budget as a
+per-call `NativeResult` field.
+
+Revised landing plan: **B-3a** patch substrate + per-kind patch points +
+patchRel32 validation suite (flag off, byte-identical); **B-3b**
+`PromotedCycle` record + promotion detector + `driveSilentBurst` + summary
+function + demotion transaction (flag on, full gates + frozen measurement
+protocol); **B-3c** budget sweep + re-profile. Round-2 review gate before
+B-3a lands.
+
+##### B3.8 — Review round 2 (codex `gpt-5.6-sol`, 2026-08-13): REJECT — accepted topology, three new blockers
+
+Accepted from §B3.7: per-kind materialization + duplicated ordinary-deopt
+flush; dedicated transition counter; region-bridge exclusion; W^X patching
+at the driver safe points with the stated validation; no-allocating-native-
+op + synchronous-suspend contracts; exact ordered physical closure as the
+promotion identity. Remaining findings:
+
+1. **[B] Locals are NOT constants of the frozen composition.** `local` is
+   deliberately runtime-computed as `e.cum - prev_cum` (trace.zig:4896);
+   `entry_rbx` is overwritten at every body entry precisely because a
+   trace's contribution varies (nativegen.zig:580, 770). Four identical CAP
+   bursts do not prove future trip counts; if they change, precomputed
+   per-member work, qualifying-row counts, barren patterns all go wrong
+   while native state stays correct — a tiering divergence. Fix: collect
+   ACTUAL compact summaries in native code (epilogue computes dynamic
+   `local = rbx - entry_rbx`) — per member: accumulated work + count of
+   `local >= min_useful`; plus enough zero-run information to combine with
+   the activation's incoming `barren_run`. Repeated observation is not a
+   proof of constancy.
+2. **[B] Off-cycle terminals cannot be handed to existing replay via a
+   synthetic fresh seed.** The terminal row's `cum` includes all hidden
+   work; a fresh single-row `replayLedger` starts `prev_cum = 0`
+   (trace.zig:4838) and attributes the whole silent prefix to the terminal
+   owner. Seeding at the owner fixes only the first-owner assertion — not
+   `cont`/`link_pc`, `linked_completed`/`hops`, handoff-entry provenance,
+   cumulative baseline, origin-specific free-hop rule, or the region
+   destination of the preceding promoted edge. The scalar path's
+   terminal-local logic (`result.local_completed`, interp.zig:2947) is
+   inline dispatcher code, not reusable. Fix: `driveSilentBurst` owns
+   terminal processing; refactor scalar terminal behavior into an
+   authoritative helper; cover ordinary deopt, `.prologue_fail`, and any
+   ordinary loop-done terminal reachable after a silent prefix.
+3. **[B] Silent results must be consumed at EVERY native-call origin** —
+   `driveChain` seed (trace.zig:4532+), `driveBurstCore` call A (:5690+)
+   and call B incl. rerun loop (:5860+), and the direct dispatcher
+   (interp.zig:2845+). Patches are global to the compiled trace, so any of
+   them can enter a promoted edge. Fix: extend `ExecResult` with the silent
+   protocol; one common result-drain entry used by all call sites,
+   integrating with each origin's cursors or bubbling a complete
+   `ChainResult`. Pin tests for all four entry origins.
+4. **[M] `silent_cycle`/`silent_phase` have no machine-code transport** —
+   epilogues are emitted at compile time; `PromotedCycle` ids exist only at
+   runtime promotion. A rel32 swap cannot make precompiled code write a
+   later-assigned id. Also needs an ownership rule: one physical exit
+   cannot describe two promoted cycles. Fix options: epilogue stores its
+   compile-time physical `{trace_id, exit}` and the driver resolves cycle +
+   entry phase; or a per-exit metadata cell populated at promotion; or a
+   promotion-specific thunk with its own lifetime. Reject promotion when an
+   exit is already owned by another cycle.
+5. **[M] `.link_terminal`/`.loop_done_linked` fall through into
+   `emitLedgerAppend`** (nativegen.zig:4589, 4718) — there is no existing
+   `E9` to swap, and adding an always-taken `jmp reporting` breaks the
+   byte-identical claim and may regress the seam pre-promotion. Fix: emit a
+   5-byte NOP patch window, patched under W^X to `E9 rel32`, exact NOP
+   bytes restored on demotion (a patch-window API, not just `patchRel32`).
+   Ordinary `.deopt` keeps the 4-byte operand swap.
+6. **[M] Demotion-failure behavior + slot-write centralization
+   unspecified.** Disarm paths write `slots[]` directly at several sites
+   (trace.zig:7758, 7871, 7912, 7948) and are void/infallible; a manually
+   maintained call list permits future omissions. Fix: funnel EVERY
+   `CompiledTrace.slots[]` write through one physical slot-mutation helper
+   that demotes first; if demotion fails, leave slot+registry unchanged or
+   terminate loudly before native re-entry; RX-restore failure is fatal;
+   preserve `armNativeLink`'s registry-before-slot OOM ordering.
+   Transaction order: apply silent summary → pending demotions → disarms →
+   only then re-arm / native re-entry.
+7. **[M] Barren + hop semantics incomplete.** End-of-revolution suffix
+   suffices only if the cyclic maximum zero run cannot cross
+   `max_barren_run`; `noteBarrenConsumed` (trace.zig:4120) can strike
+   independently. `hops per revolution` is unclear: silent execution
+   deliberately exceeds `max_hops = 8` (trace.zig:6047) — either that bound
+   is superseded for promoted cycles or the driver must reproduce it. Fix:
+   handle zero-run tracking dynamically; refuse or deterministically
+   terminate BEFORE a synthetic barren strike; state explicitly that
+   `silent_budget` supersedes `max_hops` for promoted cycles; saturating
+   arithmetic on bulk updates; account coverage iteration totals normally
+   updated in `accountTraceRun` (trace.zig:4372) even with per-trace TSC
+   attribution redefined as diagnostic-only.
+8. **[m] NativeResult layout statement backwards + `silent_budget`
+   omitted.** Inserting before the ledger lanes CHANGES those offsets (safe
+   only because everything recompiles); to preserve them, append AFTER
+   `ledger_outcome`. List the complete ABI incl. `silent_budget`, extend
+   `ExecResult`, add offset/layout tests (`extern struct`).
+9. **[m] Measurement gate: prove the bridge-free subcycle carries the
+   seam.** The nsieve outer complex includes a live region-bridge edge;
+   before B-3b, telemetry must show the dominant ~1.7M rows contain a
+   bridge-free closed subcycle eligible under the closure rule — otherwise
+   B-3 is correct but moves little.
+
+##### B3.9 — Round-3 revision: dynamic native summaries, terminal ownership, universal drain
+
+Each item discharges the same-numbered §B3.8 finding.
+
+**(1) Dynamic native summaries — nothing precomputed from observation.**
+Promotion allocates a stable `SilentSummary` block per promoted cycle:
+per-edge cells `{work: u64, qualifying: u64}` plus global
+`{cur_zero_run: u64, max_seen: u64}` — see (4) for how precompiled code
+reaches it. The promoted epilogue computes the DYNAMIC
+`local = rbx - entry_rbx` (the same quantity the ledger lane carries
+today), then:
+`add [cell.work], local` ; `cmp local, min_useful` / conditional
+`inc [cell.qualifying]` ; zero-run update: `local == 0 ?
+(inc cur_zero_run) : (cur_zero_run = 0)`. `barren` becomes a SECOND budget
+(discharges (7)'s strike hazard): the exhaustion check is
+`transitions >= silent_budget || cur_zero_run >= barren_budget`, where
+`barren_budget = max_barren_run - incoming barren_run` staged per call —
+the silent burst deterministically ENDS before the point where the
+interpreted machinery would have struck, and the driver applies the strike
+(or not) through the existing `noteBarrenConsumed` path with exact
+zero-run state. u64 cells make native-side overflow unreachable in
+practice (asserted); driver-side application into the existing u32/usize
+counters uses the same saturating ops the row path uses today. The §B3.7
+"precomputed per-revolution image" and its promotion-refusal rule are
+WITHDRAWN — replaced entirely by measured summaries; the only static
+precomputation kept is the per-edge resume-contract table, which IS a
+compile-time-fixed property of the armed topology (not of trip counts).
+
+**(2) `driveSilentBurst` owns terminals.** The scalar terminal logic at
+interp.zig:2947 (terminal-local from `result.local_completed`, cursor and
+free-hop handling) is refactored into an authoritative helper
+`applyNativeTerminal(state, origin ctx, terminal desc)` used by BOTH the
+inline dispatcher path (unchanged behavior, pinned by existing tests) and
+`driveSilentBurst`. After a silent prefix, `driveSilentBurst` applies the
+summary FIRST (establishing cursors, region destination of the last
+promoted edge from the resume-contract table, hop/handoff provenance),
+then calls `applyNativeTerminal` with the terminal-local baseline
+(`local_completed`, never `cum - 0`). Covered terminal shapes: ordinary
+`.deopt`, `.prologue_fail`, ordinary loop-done — each with an explicit
+resume derivation in the doc'd table; anything else fails a runtime
+contract check (debug) / demotes the cycle (release).
+
+**(3) Universal drain.** `ExecResult` gains the silent fields; a single
+`drainSilentResult(state, origin, exec_result)` is called at ALL FOUR
+native-call origins (direct dispatcher, `driveChain` seed,
+`driveBurstCore` call A, call B + rerun loop). It returns either
+`none` (no silent activity — zero-cost check on `silent_active`) or a
+completed `ChainResult`-shaped outcome that each origin integrates exactly
+where it already integrates burst outcomes. Pinned tests: enter the same
+promoted cycle from each of the four origins.
+
+**(4) Transport: per-exit metadata cell, populated at promotion.** Each
+`CompiledTrace` allocates at COMPILE time one pointer-sized metadata cell
+per patchable exit (stable address, baked imm64 into the epilogue — the
+same technique as the existing `slots[]` cells). Unpromoted: cell is null
+(epilogue is unreachable then anyway — the patch is what routes into it).
+Promotion writes the cell → `{cycle summary block ptr, edge index, cycle
+id, phase}`; the epilogue loads it and stores `{trace_id, exit}` are
+implicit in the cell's identity. The driver resolves cycle + entry phase
+from the cell contents surfaced in `NativeResult`. Ownership rule: the
+promotion registry maps physical exit → owning cycle; promotion is
+REJECTED if any member exit is already owned (no merge in v1).
+
+**(5) NOP patch window for the fall-through kinds.** At compile time,
+`.link_terminal` and `.loop_done_linked` emit a canonical 5-byte NOP
+(`0F 1F 44 00 00`) between materialization and the reporting sequence,
+with its offset recorded. Promotion patches it under W^X to `E9 rel32`
+targeting the site's silent epilogue (emitted out-of-line in the same
+allocation); demotion restores the exact recorded NOP bytes. Unpromoted
+code is byte-identical to today except the 5-byte straight-line NOP —
+declared cost, gated by the B-3a flag-off benchmark run (accept threshold:
+no measurable regression on the frozen suite). New `McodeArena.patchWindow`
+API with the §B3.6(8) validation list plus recorded-original-bytes
+verification on restore. Ordinary `.deopt` keeps the 4-byte rel32 swap.
+
+**(6) One slot-write funnel; demotion failure is fatal.** All
+`CompiledTrace.slots[]` writes (the direct writes at trace.zig:7758, 7871,
+7912, 7948 included) move behind `setSlot(trace, exit, value, reason)`,
+which (a) checks the promotion registry and demotes first, (b) on
+demotion/mprotect failure leaves slot AND registry untouched and panics
+(`@panic` — a W^X flip failure means the process cannot guarantee sound
+native re-entry; RX-restore failure likewise fatal), (c) preserves
+`armNativeLink`'s registry-before-slot OOM ordering. Deferred transaction
+order inside replay: apply silent summary → apply `pending_demote` →
+apply pending disarms → then re-arms / native re-entry
+(`applyPendingDisarms` boundary).
+
+**(7) Hops + coverage.** Documented: `silent_budget` SUPERSEDES `max_hops`
+for promoted cycles — the steering bound exists to cap unproductive
+receipt-stream walks, which a promoted cycle by construction is not; the
+driver charges the cycle's transition count into the hop telemetry
+counters on drain so observability keeps its totals. Coverage iteration
+totals (the `accountTraceRun` path at trace.zig:4372) are applied from the
+per-member summary work sums; per-trace TSC attribution over a silent
+burst is redefined as diagnostic-only (the burst is one native span —
+per-member wall attribution inside it is undefined and documented as
+such). Barren handled in (1).
+
+**(8) ABI.** New fields APPENDED after `ledger_outcome` (existing lane
+offsets preserved): `silent_active: u64`, `silent_transitions: u64`,
+`silent_budget: u64` (staged per call), `barren_budget: u64` (staged),
+`silent_cell: u64` (metadata-cell contents / 0), `cur_zero_run: u64`
+(staged in, read out). `ExecResult` extended to match; offset/layout tests
+added for the `extern struct` (comptime `@offsetOf` asserts).
+
+**(9) B-3a exit gate: seam-coverage telemetry.** Before B-3b lands, a
+`-Djit-debug` counter partitions replay rows into "member of a bridge-free
+closed armed subcycle" vs rest, run on nsieve 9; the gate is that the
+dominant row mass (target: ≥70% of the ~1.7M rows) is promotable under the
+closure rule. If it fails, B-3b is re-scoped (e.g. bringing
+`.region_bridge` into v1 after all) BEFORE implementation, not after.
+
+Landing plan unchanged in shape (B-3a substrate flag-off + byte-identical-
+modulo-NOP gate + seam-coverage telemetry; B-3b promotion + drain + summary
++ demotion transaction, full gates; B-3c budget sweep), with round-3 review
+gate before B-3a.
+
+##### B3.10 — Review round 3 (codex `gpt-5.6-sol`, 2026-08-13): REJECT — accounting domains, suffix grammar, activation binding
+
+Accepted: the 5-byte NOP window resolves the fall-through patch problem;
+same-allocation rel32 reach; safe points still valid; the ≥70% gate is
+right. Plus a scoping correction: **B-3a must itself emit the (unreachable)
+silent epilogues and freeze the metadata/ABI shape**, so the interface must
+be final before the substrate lands. Findings:
+
+1. **[B] Wrong per-kind accounting quantity.** Replay deliberately uses
+   different quantities by kind: `region_work = switch (kind) {
+   .loop_done_linked => 1, .deopt => local, .link_terminal/.prologue_fail/
+   .region_bridge => 0 }` (trace.zig:4920); selection for loop-done is
+   `accountLedgerRow(owner, max(local,1), …)` (:5179); `.link_terminal`
+   never calls `accountTraceRun` (structural counters only); zero-run
+   follows `region_work == 0`, not `local == 0`. Uniform
+   `local = rbx - entry_rbx` misclassifies a one-trip loop-done as barren
+   and credits link terminals with work. Fix: per-edge cells
+   `{region_work, selection_work, qualifying_rows}`, per-KIND epilogue
+   transforms mirroring replayLedger; zero-run on consumed region work.
+2. **[B] The off-cycle suffix can be multi-row, not one scalar terminal.**
+   An armed unpromoted `.deopt` or a `.region_bridge` (unpromoted in v1,
+   armed path jumps directly into its successor, nativegen.zig:4668)
+   appends its row and CONTINUES; the successor appends more rows before
+   returning: `silent prefix → chain source → successor rows → terminal`.
+   `applyNativeTerminal` handles only the final row. Fix (preferred by
+   review): generalize replay into `replayLedgerSuffix` accepting cursor
+   state, `prev_cum`, handoff/bridge provenance, and linked-completion
+   state initialized by `driveSilentBurst` — avoids adding a
+   silent-active branch to every reporting exit.
+3. **[B] "Unexpected terminal → release demote" is invalid.** Demotion
+   affects FUTURE executions; it cannot define where the completed burst
+   resumes — continuing after demote can misresume or double-commit.
+   replayLedger release-panics on unrecognized grammar for exactly this
+   reason (trace.zig:5538). Every reachable shape gets a contract;
+   impossible shapes `@panic` in release too.
+4. **[B] Promotion is activation-local; the patch is global.** `RegionKey`
+   includes `activation`; frozen qualification belongs to a specific
+   `RegionAccum` (trace.zig:797); compiled traces + patch windows are
+   shared across activations; regions close on footprint exit / same-depth
+   `call_seq` / activation drop / rebuild (closeRegion, trace.zig:3281,
+   3375, 4250+). `barren_budget` is staged from the CURRENT activation's
+   incoming state — applying A's promotion under B is invalid even with
+   identical structure. Fix: bind promotion to its `RegionKey`; demote on
+   every close/drop/replace/reset/observer-close of that key; verify
+   current `region_context.call_seq` + active region against the promotion
+   before every native entry; recursion/multi-call test.
+5. **[M] `cur_zero_run` has two owners** (SilentSummary global vs
+   NativeResult field). Fix: per-call authoritative value in
+   `NativeResult` only; SilentSummary keeps per-edge aggregates; drop
+   `max_seen` (execution stops at first threshold). Strike semantics: the
+   row REACHING `barren_budget` executes and owns the strike (boundary,
+   not before); driver applies exactly one strike then resets as
+   `noteBarrenConsumed` does.
+6. **[M] `setSlot` can't both preserve registry ordering and leave the
+   registry untouched on failure** — fresh arm appends registry BEFORE the
+   slot write (trace.zig:7750+). Fix: two-phase —
+   `prepareSlotMutation` (validates + completes demotion, fallible, no
+   registry/slot change) → existing OOM-safe registry append/update →
+   `commitSlotMutation` (infallible plain store).
+7. **[M] Publication/lifetime ordering.** Promotion: allocate+init
+   metadata → publish cell pointer → patch code LAST. Demotion: restore
+   reporting code FIRST → clear cell → free storage; if restore fails,
+   cell + storage stay live (native code may still reach the epilogue).
+   `NativeResult.silent_cell` records the FIRST promoted edge's cell only;
+   later edges validate same owning cycle rather than overwrite; final
+   phase = first phase + `silent_transitions`.
+8. **[m] Barren wording: "at the strike boundary," not "before."** Pin
+   boundary tests: remaining budget 1, full `max_barren_run`, positive-
+   work reset immediately before threshold.
+9. **[m] Measurement + W^X plan otherwise sound.**
+
+##### B3.11 — Round-4 revision
+
+**(1) Per-kind summary transforms.** `SilentSummary` per-edge cells become
+`{region_work: u64, selection_work: u64, qualifying_rows: u64}`. The
+epilogue KIND is compile-time-known per exit, so each promoted epilogue
+hard-codes replayLedger's transform for its kind: `.deopt` — region_work
++= local, selection_work += local, qualifying += (local >= min_useful),
+zero-run driven by `local == 0`; `.loop_done_linked` — region_work += 1,
+selection_work += max(local, 1), qualifying += (max(local,1) >=
+min_useful), zero-run reset (region work 1 ≠ 0); `.link_terminal` — NO
+work cells touched (structural counters applied by the driver per
+transition from the frozen edge record: link/cursor publication is a pure
+function of the edge identity and repeats identically each revolution —
+per finding 1 it never enters accountTraceRun); zero-run driven by
+region_work == 0, i.e. link-terminal transitions DO advance the zero-run
+counter exactly as replay does today.
+**(2) `replayLedgerSuffix`.** The generalized-suffix option: refactor
+`replayLedger`'s row loop so its cursor/provenance/prev_cum state is an
+explicit struct (`ReplayCursor`) initializable either fresh (existing
+entry, byte-for-byte behavior, pinned by existing tests) or from
+`driveSilentBurst`'s summary application (cursors, prev_cum baseline =
+silent cum, handoff/bridge provenance of the last promoted edge,
+linked-completion state). After the silent prefix the driver hands the
+REMAINING rows (the native reporting path already appended them — the
+ledger lanes are untouched by promotion) to `replayLedgerSuffix`. No
+silent-active branch on any reporting exit; unpromoted exits behave
+exactly as today.
+**(3) Contract totality.** Every suffix shape reachable per the grammar is
+enumerated in the doc'd table; anything else `@panic`s in release as
+replayLedger does at trace.zig:5538. Demotion never substitutes for a
+resume contract.
+**(4) Activation binding.** `PromotedCycle` stores its qualifying
+`RegionKey` (incl. activation). Demotion hooks added to `closeRegion`,
+activation drop, region replace/rebuild/reset, observer-driven close for
+that key (via the (6) funnel where they touch slots; via a direct
+registry hook where they don't). `driveSilentBurst`-capable native entries
+verify `region_context.call_seq` + active region against the promotion
+record BEFORE entry; mismatch demotes first, then enters unpromoted…
+except the patch is physical — so the pre-entry check cannot merely "enter
+unpromoted": on mismatch the driver DEMOTES (restoring reporting code)
+before entering. Invariant, documented + asserted: a promoted cycle's
+edges never change call depth (an edge that would is region-closing by
+definition → the closeRegion demotion hook fires before any such entry),
+so no epilogue-side activation guard is needed; a recursion/multi-call
+pinned test proves a second activation of the same compiled trace runs
+unpromoted until it qualifies under its own key.
+**(5) Zero-run ownership.** `NativeResult.cur_zero_run` is the only
+mutable zero-run state (staged in from the activation's `barren_run`, read
+out); SilentSummary holds only per-edge aggregates; `max_seen` dropped.
+Exhaustion at the strike boundary: the row reaching `barren_budget`
+executes, is summarized, then the burst returns; the driver applies
+exactly one strike + reset per `noteBarrenConsumed`. Boundary tests as
+prescribed.
+**(6) Two-phase slot mutation.** `prepareSlotMutation(trace, exit, reason)`
+— registry lookup + demotion (code restore + cell clear), fallible, no
+slot/registry change on failure (failure is `@panic` for W^X errors, error
+return for OOM-free validation issues) → caller's existing OOM-safe
+registry append/update → `commitSlotMutation` — infallible store. All four
+direct slot-write sites (trace.zig:7758, 7871, 7912, 7948) plus
+armNativeLink migrate to the pair.
+**(7) Publication order** exactly as prescribed (metadata → cell → patch;
+restore → clear → free; restore-failure keeps cell+storage live and then
+panics per (6)); `silent_cell` = first promoted edge's cell, later edges
+validate ownership, final phase derived as first + transitions.
+**(8)** Wording fixed throughout: strike boundary. Tests pinned in B-3b
+list.
+**(9) B-3a scope corrected:** the substrate ALSO emits the out-of-line
+silent epilogues (unreachable until patched) and freezes the
+metadata-cell + NativeResult ABI, so B-3b only adds the runtime promotion
+machinery — no interface changes after B-3a.
+
+##### B3.12 — Review round 4 (codex `gpt-5.6-sol`, 2026-08-13): REJECT — two final blockers, activation question resolved
+
+Verified sound: per-kind transforms now match replayLedger; link-terminal
+zero-run; `ReplayCursor` refactor; release-panic on impossible grammar;
+two-phase slot mutation; metadata publication/teardown order; first-cell
+ownership; NOP window + W^X; `silent_budget` superseding `max_hops`.
+Remaining:
+
+1. **[B] `ReplayCursor.prev_cum` has no ABI source.** The suffix baseline
+   (cumulative `rbx` at the last silent edge) is not reconstructible from
+   final `completed` (multi-row suffix), first suffix `cum` (its owner may
+   contribute dynamic local), or `selection_work` (loop-done max(local,1),
+   link-terminal stores none). Fix: append `silent_cum: u64`; every
+   promoted epilogue writes current `rbx` after materialization; budget
+   returns use the same value as the committed cumulative. Pin a suffix
+   test whose first reporting row is nonterminal and advances rbx.
+2. **[B] Barren arithmetic double-counts incoming state.** Staging
+   `cur_zero_run = incoming` AND `barren_budget = max - incoming` strikes
+   after `max - 2×incoming` additional rows. Fix (recommended): stage
+   `cur_zero_run = incoming barren_run`, `barren_budget = max_barren_run`,
+   compare the ABSOLUTE running count — matches `noteBarrenConsumed`
+   directly. At threshold: set accumulator to `max_barren_run - 1`, invoke
+   the authoritative barren-consume helper once, verify single
+   strike+reset.
+3. **[M] Call-depth invariant VALID for v1, justification corrected.**
+   Verified: sibling handoffs need identical proto+anchor (trace.zig:2671);
+   `.link_terminal` inner root is in the continuation's proto (:7810);
+   `.loop_done_linked` shares proto + post-PC contract (:7820+); ordinary
+   source-guard arms stay in the current proto/anchor walk via
+   `nextTraceExcluding` (:4490+); region-bridge excluded; recorded calls
+   inline into IR without a physical CallFrame, non-inlined calls are
+   trace barriers. So no promoted v1 edge changes `Vm.depth`. BUT
+   "a depth-changing edge closes the region first" is NOT the proof —
+   native handoff runs without `nextOp`, so no observer could fire. The
+   proof is a STATIC promotion predicate over the allowed
+   `ArmKind`/trace shapes, release-asserted. No epilogue activation guard
+   needed in v1.
+4. **[M] Pre-entry activation check must cover ALL live promotions.** An
+   outer activation's region stays live during deeper execution
+   (`observeRegionProgramPoint` preserves it when `depth >
+   root_frame_depth`, trace.zig:4274), and an entered trace can follow
+   armed links into other traces — checking only the entry trace's own
+   promotions is insufficient. Fix: conservative global sweep — before
+   every native entry, demote every live promoted cycle whose `RegionKey`
+   differs from the current active key (reachability-based demotion is a
+   later refinement). Also demote DIRECTLY from `closeRegion`
+   (trace.zig:3281) — closing need not mutate any slot. Recursion test:
+   outer accumulator stays live while the nested activation attempts entry
+   into the same compiled complex.
+5. **[m] Phase arithmetic: name both results** — `last_edge_phase =
+   first + transitions - 1`, `next_phase = first + transitions` (mod cycle
+   length); pin one-transition + wraparound tests.
+
+Verdict: "Once those two blockers are folded in, the substrate is ready
+for implementation."
+
+##### B3.13 — Round-5 revision (final)
+
+**(1)** `silent_cum: u64` appended to the `NativeResult` tail block (and
+`ExecResult`); every promoted epilogue stores current `rbx` into it after
+materialization; `ReplayCursor.prev_cum` initializes from it; a budget
+return commits it as the cumulative result. Suffix test with a nonterminal
+first reporting row pinned in the B-3b list.
+**(2)** Absolute-count representation adopted: stage `cur_zero_run =
+incoming barren_run`, `barren_budget = max_barren_run`, epilogue compares
+the absolute running count. Drain at threshold: accumulator :=
+`max_barren_run - 1`, one call to the authoritative barren-consume helper,
+single strike+reset asserted.
+**(3)** The activation invariant is carried by a STATIC promotion
+predicate: promotion requires every edge to be one of the verified
+same-physical-activation shapes (sibling handoff same proto+anchor;
+link_terminal continuation-proto inner root; loop_done_linked shared
+proto+post-PC; ordinary arm within the proto/anchor walk) —
+release-asserted at promotion time. Region-close hooks remain as
+DEFENSE-IN-DEPTH demotion triggers, not as the proof.
+**(4)** Global pre-entry sweep: before every native entry, demote all live
+promoted cycles whose `RegionKey` ≠ current active key (the promotion
+registry is expected to hold ~1 cycle in practice; the sweep is O(live
+promotions)). Direct demotion hook in `closeRegion` itself. The nested-
+activation recursion test keeps the outer accumulator live.
+**(5)** `last_edge_phase` and `next_phase` both defined (mod cycle
+length); one-transition + wraparound tests pinned.
+
+Final ABI tail (appended after `ledger_outcome`, all u64): `silent_active`,
+`silent_transitions`, `silent_budget`, `barren_budget`, `silent_cell`,
+`cur_zero_run`, `silent_cum`.
 
 #### Part B — Faithful `lj_asm_patchexit` port + in-place-patch lifetime (P-E)
 

@@ -1,5 +1,59 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-13 (LATEST-48) — **B-3 design ACCEPTED after five codex review rounds (§B3.6–§B3.13 in doc 17). Next: B-3a substrate implementation.**
+
+Bart: "Ok, lets go for the full B-3 thing. It's the biggest lever we have for
+parity." Target: the measured 46.2% Zig seam at nsieve N=9 (replayLedger
+29.24% + driveDispatcherLedger 14.71%; native 43.0%, tier-0 4.3%).
+
+Design went through FIVE codex `gpt-5.6-sol` rounds (thread
+019ffa79-75fe-77a2-8972-470c49f2bd28), REJECT ×4 then ACCEPT. Every round is
+recorded verbatim-in-spirit in doc 17 (§B3.6/8/10/12 findings, §B3.7/9/11/13
+revisions). The three round-1 mistakes that shaped everything: (a) one shared
+patch tail — but the four chain-source kinds have different materialization
+shapes (ordinary `.deopt` has an existing `E9` to swap; `.link_terminal`/
+`.loop_done_linked` fall through into `emitLedgerAppend` and need a 5-byte
+NOP window; `.region_bridge` is v1-ineligible); (b) silent terminals routed
+through `replayLedger`'s grammar — replaced by `driveSilentBurst` +
+`replayLedgerSuffix` over an explicit `ReplayCursor`, with terminals owned
+end-to-end and release-panic on impossible grammar; (c) accounting
+precomputed from observed locals — WRONG, locals are runtime quantities
+(`e.cum - prev_cum`); replaced by dynamic per-kind native summary cells
+`{region_work, selection_work, qualifying_rows}` mirroring replayLedger's
+kind switch (trace.zig:4920), an absolute-count barren budget striking AT
+the boundary, and a `silent_cum` baseline for the suffix.
+
+Other load-bearing contracts pinned by review: per-exit metadata-cell
+transport (compile-time stable cell, promotion publishes metadata → cell →
+patch LAST; demotion restores code FIRST); activation binding — promotion is
+RegionKey-local while the patch is physical, so v1 carries a STATIC
+promotion predicate over the verified same-activation edge shapes
+(trace.zig:2671/7810/7820+/4490+), a conservative global pre-entry sweep
+demoting any promotion whose RegionKey ≠ active key, and a direct
+`closeRegion` demotion hook; ALL `CompiledTrace.slots[]` writes (incl.
+trace.zig:7758/7871/7912/7948) move behind two-phase
+`prepareSlotMutation`/`commitSlotMutation` preserving armNativeLink's
+registry-before-slot OOM order; drain at all FOUR native-call origins
+(direct dispatcher, driveChain seed, driveBurstCore call A/B); ABI tail
+appended after `ledger_outcome`: silent_active, silent_transitions,
+silent_budget, barren_budget, silent_cell, cur_zero_run, silent_cum (all
+u64, comptime @offsetOf asserts).
+
+Landing plan: **B-3a** substrate — per-kind patch points, out-of-line silent
+epilogues UNREACHABLE until patched, metadata cells, frozen ABI,
+patchRel32/patchWindow validation suite; flag off; gates = identical-
+modulo-NOP bench run + a `-Djit-debug` seam-coverage counter proving ≥70%
+of the ~1.7M rows sit in a bridge-free closed armed subcycle (if that fails,
+B-3b is re-scoped BEFORE implementation). **B-3b** runtime promotion:
+PromotedCycle + closure detector + driveSilentBurst + summaries + demotion
+transaction, full frozen measurement protocol. **B-3c** budget sweep.
+
+Still open for Bart (carried from LATEST-47): nsieve-bit +17% ship-vs-revert
+(B-4 filed); two seam-round-2 MINORs; stray untracked
+bench/results/20260813-140214-84c86bc.tsv.
+
+---
+
 ## Status 2026-08-13 (LATEST-47) — **Part B B-1 + B-2 LANDED: the hotexit misroute is fixed, the provenance arm closes the full native cycle. nsieve walks ÷6.1, nsieve 9 −21%, sieve_int −20% (board: nsieve 1.9× LJ was 2.7×, sieve_int 1.5× was 2.4×). KNOWN REGRESSION nsieve-bit +17% → follow-up B-4 (trace-quality probation).**
 
 ### What landed (Bart: "Ok, go and continue with B") — commits 5e5b7a4 (B-1), c8256fa (B-2a), this commit (B-2b)
