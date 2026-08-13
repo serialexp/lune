@@ -2864,6 +2864,14 @@ pub const Vm = struct {
                                     }
                                     break :blk irinterp.execute(ct, trace_regs, buf);
                                 } else irinterp.execute(ct, trace_regs, buf);
+                                // B-2b: `tryArmSiblingHandoff` is entry-sited above,
+                                // before lazy native compilation. This post-receipt
+                                // safe point lets a provenance edge publish as soon as
+                                // that child has compiled even when the result is the
+                                // scalar (`ledger_len <= 1`) path. Multi-row receipts
+                                // also drain after replay; the exact-arm fast reject
+                                // makes the second call inert.
+                                self.trace.drainProvenanceArms(safe_to_arm);
                                 // Always record the exit instruction — useful for
                                 // per-guard PC debugging even on productive exits.
                                 self.trace.last_exit_instr = result.exit_instr;
@@ -11405,14 +11413,24 @@ test "coherent-state chaining (doc 16, Phase 2): nsieve prime path chains, not t
     //     `.ordinary_header`-only follow counter isolates it from loop-done
     //     continuation bursts.
     try testing.expect(native_vm.trace.prime_side_arms > 0);
-    try testing.expect(native_vm.trace.prime_side_chain_follows > 0);
+    // B-2b's provenance arm can supersede the prime-side registry record before
+    // its first firing (relaxed sibling watch arms at a productive terminal);
+    // the identical native same-anchor entry then counts as a sibling-handoff
+    // fuse instead of a prime-side chain follow. Either form proves the
+    // coherent-anchor link-burst was entered.
+    try testing.expect(native_vm.trace.prime_side_chain_follows +
+        native_vm.trace.sibling_handoff_fused > 0);
 
     // The design's tier-0-outer-body signal: without chaining, every prime
     // iteration drops to tier-0 at the outer header (≈9592 of them). With the
     // prime chain the prime path stays native, so the chain fires far more often
     // than tier-0 runs the outer body. Self-relative so it's robust to warm-up
     // length and threshold changes.
-    try testing.expect(native_vm.trace.prime_side_chain_follows > native_vm.trace.tier0_outer_body_entries);
+    // B-2b may republish the same physical source slot through the shared
+    // `.sibling_handoff` funnel once its commit provenance exists, so count both
+    // registry-recognized forms of the native same-anchor transition.
+    try testing.expect(native_vm.trace.prime_side_chain_follows +
+        native_vm.trace.sibling_handoff_fused > native_vm.trace.tier0_outer_body_entries);
 
     // 2.3c-1 (M1 half-fusion, doc 17): the skip trace's source-branch guard slot was
     // armed → the prime-side ramp's `ordinary_entry` (arm), and on a subsequent
@@ -11421,8 +11439,14 @@ test "coherent-state chaining (doc 16, Phase 2): nsieve prime path chains, not t
     // equality above already proves the fused receipt is drained byte-identically; these
     // two counters prove the arm path AND the consumer path are exercised at all (either
     // staying 0 would mean the M1 mechanism silently never fired).
-    try testing.expect(native_vm.trace.native_source_link_arms > 0);
-    try testing.expect(native_vm.trace.native_source_link_fused > 0);
+    // B-2b's provenance publication can claim the physical source slot before
+    // the ordinary M1 registry record ever arms (same shared `publishSiblingArm`
+    // funnel); either arm counter proves a native same-anchor source-slot arm
+    // was published, and either fused counter proves the consumer drained it.
+    try testing.expect(native_vm.trace.native_source_link_arms +
+        native_vm.trace.sibling_handoff_arms > 0);
+    try testing.expect(native_vm.trace.native_source_link_fused +
+        native_vm.trace.sibling_handoff_fused > 0);
 }
 
 test "coherent-state chaining (doc 16, Phase 2): TraceKind link-permission (root loops, continuation links)" {
@@ -12861,7 +12885,9 @@ test "A-viii (doc 17 §A8 step 8): opening the window MID-EPOCH over a live arme
     // …and it is a genuine multi-kind cycle, not three copies of one edge kind.
     try testing.expect(m.hasKind(.link_terminal));
     try testing.expect(m.hasKind(.loop_done_linked));
-    try testing.expect(m.hasKind(.ordinary_guard));
+    // B-2b can republish the historical ordinary source arm as the equivalent
+    // registry-recognized sibling handoff from its persistent provenance edge.
+    try testing.expect(m.hasKind(.ordinary_guard) or m.hasKind(.sibling_handoff));
     // …and the captured graph CONTAINS a cycle — at least one native→native
     // handoff that would loop forever without ever returning to the dispatcher
     // if the blackout missed it. (Not every live link need be on the cycle:

@@ -1301,9 +1301,8 @@ const region_bridge_arming_enabled = true;
 /// nsieve before the branch-source rule).
 const sibling_handoff_arming_enabled = true;
 
-/// Part B-2a (doc 17 §B.5): inert provenance-edge substrate. B-2b flips this
-/// when edge creation, draining, replay accounting, and cycle retirement land.
-const provenance_arming_enabled = false;
+/// Part B-2b (doc 17 §B.5): hotexit-provenance relation and disposable arm ON.
+const provenance_arming_enabled = true;
 
 /// A loop-carried writeback: at the back-edge, tier-0 register `slot` holds the
 /// value produced by IR `ref`. The set of these is the trace's exit snapshot —
@@ -1781,6 +1780,9 @@ pub const TraceConfig = struct {
     /// `min_useful` iterations) an anchor is gated off so tier-0 owns the loop —
     /// the brake against re-entry thrash on type-unstable / branchy loops.
     max_penalty: u32 = 8,
+    /// Part B-2b: complete-ledger zero-progress alternations tolerated before
+    /// retiring the logical provenance edge and its disposable physical arm.
+    max_edge_strikes: u8 = 3,
     /// Gate-fix arc (2026-08-12, codex BLOCKER 2): a QUALIFIED activation's
     /// consumed zero-work receipts are intra-complex transitions, but a streak
     /// of this many with NO intervening credited work is decay — it flushes one
@@ -1953,12 +1955,20 @@ pub const NativeLink = struct {
 /// Part B-2a (doc 17 §B.5): the persistent logical relation between the
 /// side exit that caused a side trace to be recorded and that committed child.
 /// The physical sibling-handoff arm is disposable; this relation survives it.
-/// B-2a stores and retires these only — production creation starts in B-2b.
+/// B-2b creates these at registered side-trace commit and republishes their
+/// disposable physical arms at dispatcher safe points.
 pub const ProvenanceEdge = struct {
     parent_id: u32,
     exit_instr: u32,
     child_id: u32,
     strikes: u8 = 0,
+};
+
+const ProvenanceVerdict = struct {
+    parent_id: u32,
+    exit_instr: u32,
+    child_id: u32,
+    action: enum { strike, reset },
 };
 
 /// Per-anchor JIT execution-coverage tally (`TraceState.coverage` value). `traced`
@@ -2071,9 +2081,17 @@ pub const TraceState = struct {
     /// directions by trace *identity* (never a raw slot pointer), so it is correct
     /// regardless of retire order. Empty until arming lands (2.3b) → inert in 2.3a.
     armed_links: std.ArrayListUnmanaged(NativeLink) = .empty,
-    /// Part B-2a: persistent hotexit-provenance relations. Edges are expected to
+    /// Part B-2b: persistent hotexit-provenance relations. Edges are expected to
     /// be few, so lifecycle operations deliberately use linear scans.
     provenance_edges: std.ArrayListUnmanaged(ProvenanceEdge) = .empty,
+    /// Part B-2b drain gate: the physical sibling arms are a disposable cache,
+    /// but RE-publishing is only needed after an event that could have changed
+    /// what's publishable — a new edge, a disarm, or a trace retirement. The
+    /// drain runs at every dispatcher safe point (per walk), so without this
+    /// flag its edge×armed_links scan becomes a permanent per-walk tax
+    /// (measured 5.7% of nsieve-bit wall). Set at every invalidating event;
+    /// cleared by a drain pass that ends with nothing transiently deferred.
+    provenance_arms_pending: bool = false,
     /// Trace-cache mutation generation: bumped on every `cache` append/remove/clear.
     /// Keys the per-trace `anchor_pop_*` memo so hot-path anchor-population queries
     /// (`anchorPopulation`) are one compare in steady state instead of an O(cache)
@@ -3251,6 +3269,9 @@ pub const TraceState = struct {
         if (gop.value_ptr.* >= self.config.max_penalty) {
             self.dbg("disarm-reason: window gate-strike owner pc={d} work={d}", .{ owner.pc, work });
             self.gateAnchor(owner);
+            // B-2b / §B.6: only this explicit region-owner condemnation event
+            // deletes logical provenance. Ordinary temporary gates preserve it.
+            self.condemnProvenanceEdgesAt(owner);
             self.disarmAllLinks();
         } else {
             self.dbg("window-strike: owner pc={d} work={d} penalty={d}/{d}", .{ owner.pc, work, gop.value_ptr.*, self.config.max_penalty });
@@ -3673,6 +3694,187 @@ pub const TraceState = struct {
         self.pending_bridge_arm = null;
         const t = self.traceById(key.trace_id) orelse return;
         self.maybeArmCompositeExit(t, key.exit_instr, safe_to_arm);
+    }
+
+    /// B-2b: republish disposable physical sibling arms from persistent hotexit
+    /// provenance. Called only at dispatcher/runtime safe points. Observation
+    /// windows retain the logical edges and retry when arming becomes safe again.
+    pub fn drainProvenanceArms(self: *TraceState, safe_to_arm: bool) void {
+        if (!provenance_arming_enabled or self.provenance_edges.items.len == 0) return;
+        if (!safe_to_arm) return;
+        // Event-driven gate: the drain runs at every dispatcher safe point, so
+        // its edge×armed_links scan must be O(1) on the steady state (it was
+        // 5.7% of nsieve-bit wall as an unconditional per-walk scan). A pass
+        // that ends with nothing transiently deferred settles the cache; any
+        // publication-invalidating event (new edge, disarm, retire, re-arm
+        // displacement) re-opens it.
+        if (!self.provenance_arms_pending) return;
+        var deferred = false;
+        var i = self.provenance_edges.items.len;
+        while (i > 0) {
+            i -= 1;
+            const edge = self.provenance_edges.items[i];
+            const parent = self.traceById(edge.parent_id) orelse {
+                _ = self.provenance_edges.swapRemove(i);
+                continue;
+            };
+            const child = self.traceById(edge.child_id) orelse {
+                _ = self.provenance_edges.swapRemove(i);
+                continue;
+            };
+            const compiled = switch (parent.native) {
+                .compiled => |*c| c,
+                else => {
+                    // Transient: the parent compiles lazily on dispatcher
+                    // selection — keep the drain pending so this edge is
+                    // re-evaluated once it has.
+                    deferred = true;
+                    self.dbg("provenance-drain: t={d} ei={d} decline: parent not compiled", .{ edge.parent_id, edge.exit_instr });
+                    continue;
+                },
+            };
+            if (edge.exit_instr >= parent.instrs.len or edge.exit_instr >= compiled.slots.len) {
+                self.dbg("provenance-drain: t={d} ei={d} decline: slot bounds (slots={d})", .{ edge.parent_id, edge.exit_instr, compiled.slots.len });
+                continue;
+            }
+            if (!exitIsPreEffect(parent, edge.exit_instr)) {
+                self.dbg("provenance-drain: t={d} ei={d} decline: not pre-effect", .{ edge.parent_id, edge.exit_instr });
+                continue;
+            }
+            if (parent.anchor.proto != child.anchor.proto or parent.anchor.pc != child.anchor.pc) continue;
+            if (child.inputs.len != 0) {
+                self.dbg("provenance-drain: t={d} ei={d} decline: child inputs={d}", .{ edge.parent_id, edge.exit_instr, child.inputs.len });
+                continue;
+            }
+            if (parent.isBridgeCandidate(edge.exit_instr)) {
+                self.dbg("provenance-drain: t={d} ei={d} decline: bridge candidate", .{ edge.parent_id, edge.exit_instr });
+                continue;
+            }
+            if (isLoopDoneGuardIndex(parent, edge.exit_instr)) {
+                self.dbg("provenance-drain: t={d} ei={d} decline: loop-done guard", .{ edge.parent_id, edge.exit_instr });
+                continue;
+            }
+            // Compile on demand: compilation is LAZY (a trace compiles when the
+            // dispatcher first enters it natively), and a provenance child may
+            // never be dispatcher-selected at all — that non-selection is the
+            // very reason the edge exists (nsieve's skip trace is entered only
+            // through this arm). Waiting for `.compiled` would deadlock the
+            // publication forever; `nativeFor` compiles idempotently and caches
+            // `.unsupported`, which per §B.6(5) deletes the edge (never rescan
+            // a permanently-unsupported child).
+            if (self.nativeFor(child) == null) {
+                self.dbg("provenance-drain: t={d} ei={d} decline: child t={d} native-unsupported (edge deleted)", .{ edge.parent_id, edge.exit_instr, edge.child_id });
+                _ = self.provenance_edges.swapRemove(i);
+                continue;
+            }
+            var already_armed = false;
+            for (self.armed_links.items) |link| {
+                if (link.kind == .sibling_handoff and link.parent == parent and
+                    link.slot_index == edge.exit_instr and link.child == child)
+                {
+                    already_armed = true;
+                    break;
+                }
+            }
+            if (already_armed) continue;
+            // A failed publish (OOM in the registry append) is transient.
+            if (!self.publishSiblingArm(parent, edge.exit_instr, child)) deferred = true;
+        }
+        // Settle only when every edge is either armed or permanently declined
+        // for its current compiled parent; permanent declines re-open via the
+        // invalidating events above (retire/recompile), never by rescanning.
+        self.provenance_arms_pending = deferred;
+    }
+
+    /// Capture complete-ledger verdicts before replay can defer/disarm the
+    /// physical registry. The CAP-sized output is fixed storage: no allocation.
+    fn captureProvenanceVerdicts(
+        self: *const TraceState,
+        entries: []const irinterp.LedgerEntry,
+        out: *[irinterp.LEDGER_CAP]ProvenanceVerdict,
+    ) usize {
+        if (!provenance_arming_enabled or self.provenance_edges.items.len == 0) return 0;
+        var n: usize = 0;
+        for (self.provenance_edges.items) |edge| {
+            const parent = self.traceById(edge.parent_id) orelse continue;
+            const child = self.traceById(edge.child_id) orelse continue;
+            if (!self.hasArmedSiblingHandoff(parent, edge.exit_instr, child)) continue;
+            var saw_strike = false;
+            var saw_productive = false;
+            var k: usize = 0;
+            while (k + 1 < entries.len) : (k += 1) {
+                const e = entries[k];
+                if (e.id != edge.parent_id or e.exit != edge.exit_instr or
+                    e.kind != .deopt or e.reason != .normal or e.outcome != .normal or
+                    entries[k + 1].id != edge.child_id)
+                    continue;
+                const prior_cum: usize = if (k == 0) 0 else entries[k - 1].cum;
+                const local = e.cum - prior_cum;
+                var progressed = local != 0;
+                var returned_without_progress = false;
+                var j = k + 1;
+                while (j < entries.len) : (j += 1) {
+                    if (entries[j].cum > e.cum) progressed = true;
+                    // At least the child row must intervene before a return to P.
+                    if (j >= k + 2 and entries[j].id == edge.parent_id and
+                        entries[j].cum == e.cum and !progressed)
+                    {
+                        returned_without_progress = true;
+                    }
+                }
+                if (progressed) {
+                    saw_productive = true;
+                } else if (local == 0 and returned_without_progress) {
+                    saw_strike = true;
+                }
+            }
+            const verdict = if (saw_productive)
+                ProvenanceVerdict{ .parent_id = edge.parent_id, .exit_instr = edge.exit_instr, .child_id = edge.child_id, .action = .reset }
+            else if (saw_strike)
+                ProvenanceVerdict{ .parent_id = edge.parent_id, .exit_instr = edge.exit_instr, .child_id = edge.child_id, .action = .strike }
+            else
+                continue;
+            if (n == out.len) break;
+            out[n] = verdict;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Apply captured verdicts only after replay and deferred global disarms.
+    /// Retirement resets the exact physical arm through targeted P-E teardown.
+    fn applyProvenanceVerdicts(self: *TraceState, verdicts: []const ProvenanceVerdict) void {
+        for (verdicts) |verdict| {
+            var edge_idx: ?usize = null;
+            for (self.provenance_edges.items, 0..) |edge, i| {
+                if (edge.parent_id == verdict.parent_id and edge.exit_instr == verdict.exit_instr and
+                    edge.child_id == verdict.child_id)
+                {
+                    edge_idx = i;
+                    break;
+                }
+            }
+            const idx = edge_idx orelse continue;
+            switch (verdict.action) {
+                .reset => self.provenance_edges.items[idx].strikes = 0,
+                .strike => {
+                    const edge = &self.provenance_edges.items[idx];
+                    edge.strikes +|= 1;
+                    if (edge.strikes < self.config.max_edge_strikes) continue;
+                    var link_idx = self.armed_links.items.len;
+                    while (link_idx > 0) {
+                        link_idx -= 1;
+                        const link = self.armed_links.items[link_idx];
+                        if (link.kind == .sibling_handoff and link.parent.id == edge.parent_id and
+                            link.slot_index == edge.exit_instr and link.child.id == edge.child_id)
+                        {
+                            self.disarmLinkAt(link_idx);
+                        }
+                    }
+                    _ = self.provenance_edges.swapRemove(idx);
+                },
+            }
+        }
     }
 
     /// A-vii-d.1: apply a `disarmAllLinks` that was deferred because it fired
@@ -5075,10 +5277,11 @@ pub const TraceState = struct {
                             // Credit the parent's own committed iterations to its RUN
                             // counter — and nothing else. Emphatically NOT
                             // `accountLedgerRow`, whose legacy-thrash half applies the
-                            // per-segment profitability VERDICT: a handoff row is a
-                            // zero-progress TRANSITION (`local == 0` by the arm's
-                            // coherence precondition), so the verdict it would render is
-                            // "unproductive segment" — a penalty strike per fused hop.
+                            // per-segment profitability VERDICT. Coherence permits any
+                            // `local`; the historical zero-progress restriction belonged
+                            // only to Part-S discovery/selection. Charging the handoff
+                            // itself as an unproductive segment would add a penalty per
+                            // fused hop.
                             // Measured: that mis-charge drove `pc=14` to `max_penalty`
                             // within a handful of hops, gated the anchor, and collapsed
                             // nsieve's traced time from 51% to 7.2% (an 18% wall-clock
@@ -5520,6 +5723,7 @@ pub const TraceState = struct {
                         // walk, BEFORE acting on the directive (review blocker 5).
                         self.applyPendingDisarms();
                         self.drainPendingBridgeArm(safe_to_arm);
+                        self.drainProvenanceArms(safe_to_arm);
                         switch (call_a_directive) {
                             .run_continuation => |c| {
                                 current_link = c;
@@ -5682,6 +5886,7 @@ pub const TraceState = struct {
                     // walk, BEFORE acting on the directive (review blocker 5).
                     self.applyPendingDisarms();
                     self.drainPendingBridgeArm(safe_to_arm);
+                    self.drainProvenanceArms(safe_to_arm);
                     switch (call_b_directive) {
                         // Re-run the carried continuation for the next fused span.
                         // P1a: re-resolve its native compilation (a `C1 → I → C2`
@@ -5804,21 +6009,25 @@ pub const TraceState = struct {
         // three-scalar watch on the trace itself), not the resolve.
         if (entries.len != 0) {
             const term = entries[entries.len - 1];
-            // ZERO-PROGRESS is the other half of the coherence condition (§S: "a
-            // zero-progress pre-effect deopt is coherent at the anchor"), and it is a
-            // RUNTIME property — `exitIsPreEffect` proves the static half only. A
-            // terminal that committed iterations in this segment left the back-edge
-            // rotation applied, so its flushed image is not the image the sibling's
-            // anchor entry expects.
+            // `term_local` is kept for hotexit accounting/telemetry; it is NOT a
+            // coherence condition for the sibling watch (see the corrected
+            // comment below — zero-progress was §S's discovery heuristic only).
             const prev_cum = if (entries.len >= 2) entries[entries.len - 2].cum else 0;
             const term_local = term.cum -| prev_cum;
             if (term.kind == .deopt and term.reason == .normal and term.outcome == .normal) {
                 if (self.traceById(term.id)) |owner| {
-                    // Sibling-handoff watch keeps its zero-progress condition —
-                    // §S's coherence argument ("a zero-progress pre-effect deopt
-                    // is coherent at the anchor") is about handoff SOUNDNESS,
-                    // not hotness.
-                    if (term_local == 0) self.noteSiblingTerminal(owner, term.exit);
+                    // Sibling-handoff watch fires on ANY normal deopt terminal,
+                    // regardless of local iteration count. Pre-effect branch
+                    // exits preserve the next iteration's anchor image after the
+                    // back-edge rotation (the flushed regs[] IS what a sibling's
+                    // anchor entry expects), so coherence holds at any count —
+                    // §S's original zero-progress condition was a discovery
+                    // heuristic, not a coherence requirement, and it wrongly
+                    // suppressed productive, naturally closing handoffs
+                    // (B-2b: the skip trace's own branch-guard terminal at
+                    // local=1 could never arm its closing S-arm).
+                    // siblingHandoffEligible still vets the exit shape.
+                    self.noteSiblingTerminal(owner, term.exit);
                     // Hotexit (Pall's `trace_hotside`): EVERY normal deopt
                     // terminal charges its exit — productive or not. The scalar
                     // dispatch path charges at interp step 4, but a
@@ -5845,11 +6054,18 @@ pub const TraceState = struct {
         // modeled M1 grammar never reaches (its first `.link` sets the real cursor).
         // Pass the seed anchor as an inert placeholder.
         const inner_pc: u32 = seed.anchor.pc;
+        // B-2b: capture registry-recognized edge service over the COMPLETE ledger
+        // before replay can request a deferred physical disarm. Apply only after
+        // replay returns, per §B.6.
+        var provenance_verdicts: [irinterp.LEDGER_CAP]ProvenanceVerdict = undefined;
+        const provenance_verdicts_len = self.captureProvenanceVerdicts(entries, &provenance_verdicts);
         const dispatcher_directive = self.replayLedger(entries, seed, inner_pc, proto, &linked_completed, &resume_pc, &hops, max_hops, .dispatcher_root, safe_to_arm);
         // A-vii-d.1: drain the pending bridge-arm request AFTER the walk,
         // BEFORE acting on the directive (review blocker 5).
         self.applyPendingDisarms();
+        self.applyProvenanceVerdicts(provenance_verdicts[0..provenance_verdicts_len]);
         self.drainPendingBridgeArm(safe_to_arm);
+        self.drainProvenanceArms(safe_to_arm);
         switch (dispatcher_directive) {
             // M1 sub-case (a): the replayed ramp reached `.link`. `replayLedger` has
             // already charged both counters this burst owns — `native_link_exits` (its
@@ -5972,6 +6188,7 @@ pub const TraceState = struct {
         // BEFORE acting on the directive (review blocker 5).
         self.applyPendingDisarms();
         self.drainPendingBridgeArm(safe_to_arm);
+        self.drainProvenanceArms(safe_to_arm);
         switch (seed_directive) {
             // Terminal inner loop-done, un-fused: enter the burst at call B with the
             // carried continuation (the drained span already ran the inner).
@@ -7519,6 +7736,19 @@ pub const TraceState = struct {
         // it — the first match is the only match.
         for (self.armed_links.items) |*l| {
             if (l.parent == parent and l.slot_index == slot_index) {
+                // A re-arm can displace a provenance-published sibling arm with
+                // a different kind/child — re-open publication so the drain can
+                // re-evaluate the surviving edges at the next safe point. And
+                // when the OLD record was a `.sibling_handoff`, its parent-side
+                // latch must be released here exactly as on removal (codex
+                // post-landing blocker: without this, sibling_arms leaks +1 on
+                // every displace→republish cycle and the watch fast-reject
+                // stops being exact). `publishSiblingArm` re-increments if the
+                // new kind is again a sibling handoff.
+                if (l.kind == .sibling_handoff or kind == .sibling_handoff)
+                    self.provenance_arms_pending = true;
+                if (l.kind == .sibling_handoff)
+                    clearSiblingLatch(l.*);
                 l.child = child;
                 l.kind = kind;
                 l.region_id = null; // a `.region_bridge` caller re-stamps after arming
@@ -7644,6 +7874,9 @@ pub const TraceState = struct {
                 }
             }
             _ = self.armed_links.swapRemove(i);
+            // A removed arm may be re-publishable from a surviving provenance
+            // edge — let the drain re-evaluate at the next safe point.
+            self.provenance_arms_pending = true;
         }
     }
 
@@ -7682,6 +7915,8 @@ pub const TraceState = struct {
             }
         }
         self.armed_links.clearRetainingCapacity();
+        // See resetLinksTouching: removed arms re-open provenance publication.
+        self.provenance_arms_pending = true;
     }
 
     /// Part S: drop a `.sibling_handoff` link's parent-side latch. EVERY path that
@@ -7715,6 +7950,13 @@ pub const TraceState = struct {
             else => {},
         }
         _ = self.armed_links.swapRemove(idx);
+        // See resetLinksTouching: a removed arm re-opens provenance publication.
+        // Deliberately conservative: `.region_bridge` disarms (e.g. via
+        // disarmStaleRegionBridgeLinks) also pass through here and re-open
+        // publication even though no sibling arm changed — one wasted drain
+        // scan per stale-bridge teardown, accepted for a single invariant
+        // ("any physical disarm re-opens") instead of per-kind exceptions.
+        self.provenance_arms_pending = true;
     }
 
     /// A-vii-d.1 (review blocker 3) — the stale-region lifecycle rule: a
@@ -8225,6 +8467,36 @@ pub const TraceState = struct {
         self.rec.side_src = null;
     }
 
+    /// B-2b commit publication: preserve the logical hotexit provenance only
+    /// after the child is registered. A same-anchor relation OOM deliberately
+    /// leaves the parent counter live (no DONE-without-edge); cross-anchor side
+    /// traces retain the historical DONE latch but never create an arm relation.
+    fn finishSideTraceProvenance(self: *TraceState, child: *Trace) void {
+        const src = self.rec.side_src orelse return;
+        defer self.rec.side_src = null;
+        if (self.traceById(child.id) != child) return;
+        const parent = self.traceById(src.trace_id) orelse return;
+        var may_latch_done = true;
+        if (provenance_arming_enabled and
+            parent.anchor.proto == child.anchor.proto and parent.anchor.pc == child.anchor.pc and
+            src.exit_instr < parent.instrs.len)
+        {
+            self.provenance_edges.append(self.gpa, .{
+                .parent_id = parent.id,
+                .exit_instr = src.exit_instr,
+                .child_id = child.id,
+            }) catch {
+                may_latch_done = false;
+            };
+            if (may_latch_done) {
+                self.provenance_arms_pending = true;
+                self.dbg("provenance-edge: t={d} ei={d} -> t={d}", .{ parent.id, src.exit_instr, child.id });
+            }
+        }
+        if (may_latch_done and src.exit_instr < parent.exit_counts.len)
+            parent.exit_counts[src.exit_instr] = Trace.EXIT_COUNT_DONE;
+    }
+
     /// Copy the in-progress recording into an owned, cached `Trace`. The exit
     /// snapshot is every register the trace *defined* (its loop-carried writes).
     /// When `config.optimize`, the trace optimizer (`tropt.zig`) rewrites the IR
@@ -8481,13 +8753,7 @@ pub const TraceState = struct {
         // exit — it now has its side trace and must never count again. The parent
         // may have been evicted mid-recording (`traceById` miss) — then there is
         // nothing to latch.
-        if (self.rec.side_src) |src| {
-            if (self.traceById(src.trace_id)) |parent| {
-                if (src.exit_instr < parent.exit_counts.len)
-                    parent.exit_counts[src.exit_instr] = Trace.EXIT_COUNT_DONE;
-            }
-            self.rec.side_src = null;
-        }
+        self.finishSideTraceProvenance(t);
         // Coverage (gated): a trace now exists at this anchor, so subsequent
         // interpreted back-edges here are "fallback despite a trace."
         if (self.config.coverage) self.markAnchorTraced(t.anchor);
@@ -11673,6 +11939,63 @@ test "tryArmSiblingHandoff publishes complete Part-S bookkeeping" {
     try testing.expectEqual(@as(u64, 1), state.sibling_handoff_arms);
 }
 
+test "in-place re-arm releases the displaced sibling latch (sibling -> ordinary -> sibling -> disarm)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity(); // stack-backed traces
+
+    const proto = Proto{
+        .code = &.{Instr.op0(.ret)},
+        .name = "sibling-rearm-latch",
+        .num_registers = 1,
+    };
+    const parent_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .aux = 1 },
+        .{ .op = .loop },
+    };
+    const parent_slots = try gpa.alloc(usize, parent_instrs.len);
+    defer gpa.free(parent_slots);
+    @memset(parent_slots, 0);
+    var parent: Trace = .{
+        .id = 45,
+        .anchor = .{ .proto = &proto, .pc = 7 },
+        .instrs = @constCast(&parent_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = parent_slots, .gpa = gpa } },
+    };
+    var child: Trace = .{
+        .id = 46,
+        .anchor = parent.anchor,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xD00D } },
+    };
+    try state.cache.append(gpa, &parent);
+    try state.cache.append(gpa, &child);
+
+    // sibling: latch counts 1.
+    try testing.expect(state.publishSiblingArm(&parent, 0, &child));
+    try testing.expectEqual(@as(u32, 1), parent.sibling_arms);
+    // ordinary displaces the sibling arm in place: latch must drop to 0
+    // (codex post-landing blocker: without clearSiblingLatch here the count
+    // leaks +1 per displace→republish cycle).
+    try testing.expect(try state.armNativeLink(&parent, 0, &child, .ordinary_guard));
+    try testing.expectEqual(@as(u32, 0), parent.sibling_arms);
+    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    // sibling republish over the ordinary record: back to 1.
+    try testing.expect(state.publishSiblingArm(&parent, 0, &child));
+    try testing.expectEqual(@as(u32, 1), parent.sibling_arms);
+    // physical disarm: back to 0, not underflowed.
+    state.disarmLinkAt(0);
+    try testing.expectEqual(@as(u32, 0), parent.sibling_arms);
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+}
+
 test "B-2a provenance edge storage retires endpoints, condemns parents, and clears" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
@@ -11719,6 +12042,297 @@ test "B-2a provenance edge storage retires endpoints, condemns parents, and clea
 
     state.clearProvenanceEdges();
     try testing.expectEqual(@as(usize, 0), state.provenance_edges.items.len);
+}
+
+test "B-2b commit provenance creates same-anchor edge, skips null/cross-anchor, and latches DONE" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "commit-provenance", .num_registers = 1 };
+    var parent_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
+    var counts = [_]u8{ 7, 0 };
+    var parent: Trace = .{
+        .id = 51,
+        .anchor = .{ .proto = &proto, .pc = 4 },
+        .instrs = &parent_instrs,
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .exit_counts = &counts,
+    };
+    var child: Trace = .{
+        .id = 52,
+        .anchor = parent.anchor,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    var cross: Trace = .{
+        .id = 53,
+        .anchor = .{ .proto = &proto, .pc = 9 },
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    for ([_]*Trace{ &parent, &child, &cross }) |t| try state.cache.append(gpa, t);
+
+    state.rec.side_src = .{ .trace_id = parent.id, .exit_instr = 0 };
+    state.finishSideTraceProvenance(&child);
+    try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
+    try testing.expectEqual(parent.id, state.provenance_edges.items[0].parent_id);
+    try testing.expectEqual(child.id, state.provenance_edges.items[0].child_id);
+    try testing.expectEqual(Trace.EXIT_COUNT_DONE, counts[0]);
+    try testing.expectEqual(@as(?ExitKey, null), state.rec.side_src);
+
+    // No source is a strict no-op.
+    state.finishSideTraceProvenance(&child);
+    try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
+
+    // Cross-anchor side traces keep Pall's historical DONE latch but never arm.
+    counts[0] = 8;
+    state.rec.side_src = .{ .trace_id = parent.id, .exit_instr = 0 };
+    state.finishSideTraceProvenance(&cross);
+    try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
+    try testing.expectEqual(Trace.EXIT_COUNT_DONE, counts[0]);
+}
+
+test "B-2b commit provenance OOM does not latch DONE" {
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = fa.allocator();
+    var state = TraceState.init(gpa);
+    defer {
+        fa.fail_index = std.math.maxInt(usize);
+        fa.resize_fail_index = std.math.maxInt(usize);
+        state.cache.clearRetainingCapacity();
+        state.deinit();
+    }
+
+    const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "commit-provenance-oom", .num_registers = 1 };
+    var parent_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
+    var counts = [_]u8{ 9, 0 };
+    var parent: Trace = .{ .id = 61, .anchor = .{ .proto = &proto, .pc = 4 }, .instrs = &parent_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .exit_counts = &counts };
+    var child: Trace = .{ .id = 62, .anchor = parent.anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try state.cache.append(gpa, &parent);
+    try state.cache.append(gpa, &child);
+    state.rec.side_src = .{ .trace_id = parent.id, .exit_instr = 0 };
+    fa.fail_index = fa.alloc_index;
+    fa.resize_fail_index = fa.resize_index;
+
+    state.finishSideTraceProvenance(&child);
+    try testing.expectEqual(@as(usize, 0), state.provenance_edges.items.len);
+    try testing.expectEqual(@as(u8, 9), counts[0]);
+    try testing.expectEqual(@as(?ExitKey, null), state.rec.side_src);
+}
+
+test "B-2b provenance drain arms compiled children, deletes unsupported edges, preserves observation edges, drops unresolved ids" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "provenance-drain", .num_registers = 1 };
+    var parent_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
+    const slots = try gpa.alloc(usize, parent_instrs.len);
+    defer gpa.free(slots);
+    @memset(slots, 0);
+    var parent: Trace = .{
+        .id = 71,
+        .anchor = .{ .proto = &proto, .pc = 4 },
+        .instrs = &parent_instrs,
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = slots, .gpa = gpa } },
+        .sibling_watch_exit = 0,
+        .sibling_watch_count = 4,
+    };
+    // Child arrives pre-compiled: the drain's on-demand `nativeFor` returns the
+    // cached entry without attempting compilation (a real provenance child is
+    // compiled by the drain itself the first safe time it's seen; a child whose
+    // compilation fails caches `.unsupported` and the edge is deleted per
+    // §B.6(5) — covered below via `child_bad`).
+    var child: Trace = .{ .id = 72, .anchor = parent.anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xB2B2 } } };
+    var child_bad: Trace = .{ .id = 73, .anchor = parent.anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .native = .unsupported };
+    try state.cache.append(gpa, &parent);
+    try state.cache.append(gpa, &child);
+    try state.cache.append(gpa, &child_bad);
+    try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child.id });
+    try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child_bad.id });
+    state.provenance_arms_pending = true; // finishSideTraceProvenance sets this on append
+
+    state.drainProvenanceArms(false);
+    try testing.expectEqual(@as(usize, 2), state.provenance_edges.items.len);
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+
+    // Safe drain: the compiled child arms; the unsupported child's edge is
+    // deleted (never rescan a permanently-unsupported child) while the armed
+    // child's edge is PRESERVED as the observation record.
+    state.drainProvenanceArms(true);
+    try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
+    try testing.expectEqual(child.id, state.provenance_edges.items[0].child_id);
+    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    try testing.expectEqual(ArmKind.sibling_handoff, state.armed_links.items[0].kind);
+    try testing.expectEqual(@as(usize, 0xB2B2), slots[0]);
+    try testing.expectEqual(@as(u32, 1), parent.sibling_arms);
+    try testing.expectEqual(std.math.maxInt(u32), parent.sibling_watch_exit);
+    try testing.expectEqual(@as(u64, 1), state.sibling_handoff_arms);
+
+    try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = 9999 });
+    state.provenance_arms_pending = true;
+    state.drainProvenanceArms(true);
+    try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
+    try testing.expectEqual(child.id, state.provenance_edges.items[0].child_id);
+}
+
+test "B-2b region low-yield condemnation deletes only the owner provenance" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+    state.config.max_penalty = 1;
+
+    const proto = Proto{ .code = &.{}, .name = "provenance-condemn", .num_registers = 0 };
+    const owner = AnchorKey{ .proto = &proto, .pc = 10 };
+    var p1: Trace = .{ .id = 81, .anchor = owner, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    var p2: Trace = .{ .id = 82, .anchor = .{ .proto = &proto, .pc = 20 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try state.cache.append(gpa, &p1);
+    try state.cache.append(gpa, &p2);
+    try state.provenance_edges.append(gpa, .{ .parent_id = p1.id, .exit_instr = 0, .child_id = 91 });
+    try state.provenance_edges.append(gpa, .{ .parent_id = p2.id, .exit_instr = 0, .child_id = 92 });
+
+    const rid: RegionId = @enumFromInt(700);
+    try state.region_defs.put(gpa, rid, .{
+        .members = try gpa.alloc(StructuralEdgeId, 0),
+        .member_points = try gpa.alloc(ProgramPoint, 0),
+        .owner = owner,
+        .classifier = .{ .kind = .self_loop, .member_count = 1 },
+        .armable = true,
+        .bridges = try gpa.alloc(RegionBridgeDef, 0),
+    });
+    state.flushRegionWindow(.{ .region_id = rid, .activation = 1 }, 1);
+    try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
+    try testing.expectEqual(p2.id, state.provenance_edges.items[0].parent_id);
+}
+
+test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is neutral and progress resets" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "provenance-cycle", .num_registers = 1 };
+    var p_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
+    var c_instrs = [_]IrInstr{ .{ .op = .guard_false, .aux = 1 }, .{ .op = .loop } };
+    const p_slots = try gpa.alloc(usize, p_instrs.len);
+    defer gpa.free(p_slots);
+    @memset(p_slots, 0);
+    const c_slots = try gpa.alloc(usize, c_instrs.len);
+    defer gpa.free(c_slots);
+    @memset(c_slots, 0);
+    var parent: Trace = .{
+        .id = 101,
+        .anchor = .{ .proto = &proto, .pc = 4 },
+        .instrs = &p_instrs,
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = p_slots, .gpa = gpa, .ordinary_entry = 0xA101 } },
+    };
+    var child: Trace = .{
+        .id = 102,
+        .anchor = parent.anchor,
+        .instrs = &c_instrs,
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = c_slots, .gpa = gpa, .ordinary_entry = 0xA102 } },
+    };
+    try state.cache.append(gpa, &parent);
+    try state.cache.append(gpa, &child);
+    try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child.id, .strikes = 1 });
+    try testing.expect(state.publishSiblingArm(&parent, 0, &child));
+    try testing.expect(state.publishSiblingArm(&child, 0, &parent));
+    var regs_buf = [_]Value{Value.int(0)};
+    var regs = TestRegs{ .regs = &regs_buf };
+
+    // One-way prologue failure proves no completed alternation: no strike/reset.
+    const prologue = [_]irinterp.LedgerEntry{
+        .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+        .{ .cum = 0, .id = child.id, .exit = std.math.maxInt(u32), .reason = .prologue_fail, .kind = .prologue_fail, .outcome = .normal },
+    };
+    _ = state.driveDispatcherLedger(&parent, &prologue, &proto, regs.view(), true);
+    try testing.expectEqual(@as(u8, 1), state.provenance_edges.items[0].strikes);
+
+    // The relation fired and later service advanced cum: reset strikes to zero.
+    const productive = [_]irinterp.LedgerEntry{
+        .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+        .{ .cum = 1, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+        .{ .cum = 1, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+    };
+    _ = state.driveDispatcherLedger(&parent, &productive, &proto, regs.view(), true);
+    try testing.expectEqual(@as(u8, 0), state.provenance_edges.items[0].strikes);
+
+    // P→C, an intervening child row, then P again at unchanged cum: one strike
+    // per complete burst, applied only after replay. The third retires relation
+    // and exact physical P→C arm; the reverse Part-S arm remains live.
+    const zero_cycle = [_]irinterp.LedgerEntry{
+        .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+        .{ .cum = 0, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+        .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+    };
+    _ = state.driveDispatcherLedger(&parent, &zero_cycle, &proto, regs.view(), true);
+    try testing.expectEqual(@as(u8, 1), state.provenance_edges.items[0].strikes);
+    _ = state.driveDispatcherLedger(&parent, &zero_cycle, &proto, regs.view(), true);
+    try testing.expectEqual(@as(u8, 2), state.provenance_edges.items[0].strikes);
+    _ = state.driveDispatcherLedger(&parent, &zero_cycle, &proto, regs.view(), true);
+    try testing.expectEqual(@as(usize, 0), state.provenance_edges.items.len);
+    try testing.expect(!state.hasArmedSiblingHandoff(&parent, 0, &child));
+    try testing.expect(state.hasArmedSiblingHandoff(&child, 0, &parent));
+}
+
+test "B-2b local-positive provenance handoff replays child-only cursor and charges parent work" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+    state.config.min_useful = 5;
+
+    const proto = Proto{ .code = &.{Instr.op0(.ret)}, .name = "provenance-local", .num_registers = 1 };
+    var p_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
+    var c_instrs = [_]IrInstr{ .{ .op = .guard_false, .aux = 1 }, .{ .op = .loop } };
+    const p_slots = try gpa.alloc(usize, p_instrs.len);
+    defer gpa.free(p_slots);
+    @memset(p_slots, 0);
+    var parent: Trace = .{ .id = 111, .anchor = .{ .proto = &proto, .pc = 4 }, .instrs = &p_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .native = .{ .compiled = .{ .page = undefined, .slots = p_slots, .gpa = gpa, .ordinary_entry = 0xB111 } } };
+    var child: Trace = .{ .id = 112, .anchor = parent.anchor, .instrs = &c_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xB112 } } };
+    try state.cache.append(gpa, &parent);
+    try state.cache.append(gpa, &child);
+    try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child.id });
+    try testing.expect(state.publishSiblingArm(&parent, 0, &child));
+    var regs_buf = [_]Value{Value.int(0)};
+    var regs = TestRegs{ .regs = &regs_buf };
+
+    const prologue = [_]irinterp.LedgerEntry{
+        .{ .cum = 5, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+        .{ .cum = 5, .id = child.id, .exit = std.math.maxInt(u32), .reason = .prologue_fail, .kind = .prologue_fail, .outcome = .normal },
+    };
+    const r1 = state.driveDispatcherLedger(&parent, &prologue, &proto, regs.view(), true);
+    try testing.expectEqual(@as(usize, 0), r1.completed);
+    try testing.expectEqual(@as(?u32, parent.anchor.pc), r1.resume_pc);
+    try testing.expectEqual(@as(u64, 1), parent.hit_count); // parent's local=5 charged
+
+    const child_deopt = [_]irinterp.LedgerEntry{
+        .{ .cum = 5, .id = parent.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+        .{ .cum = 5, .id = child.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+    };
+    const r2 = state.driveDispatcherLedger(&parent, &child_deopt, &proto, regs.view(), true);
+    try testing.expectEqual(@as(usize, 0), r2.completed);
+    try testing.expectEqual(@as(?u32, parent.anchor.pc), r2.resume_pc);
+    try testing.expectEqual(@as(u64, 2), parent.hit_count);
 }
 
 test "armNativeLink / resetLinksTouching: P-E registry directionality" {

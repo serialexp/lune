@@ -1,5 +1,70 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-13 (LATEST-47) — **Part B B-1 + B-2 LANDED: the hotexit misroute is fixed, the provenance arm closes the full native cycle. nsieve walks ÷6.1, nsieve 9 −21%, sieve_int −20% (board: nsieve 1.9× LJ was 2.7×, sieve_int 1.5× was 2.4×). KNOWN REGRESSION nsieve-bit +17% → follow-up B-4 (trace-quality probation).**
+
+### What landed (Bart: "Ok, go and continue with B") — commits 5e5b7a4 (B-1), c8256fa (B-2a), this commit (B-2b)
+
+Full narrative + the five landing deltas are in doc 17 §B.7; short form:
+
+1. **B-1** — `noteTakenExit` routes on the POSITIVE branch property (`jmp_if_*`
+   source); zero-trip `for_prep` guards feed the generic side want. Substrate
+   only (telemetry unmoved until B-2).
+2. **B-2a** — ProvenanceEdge storage + shared `publishSiblingArm` + lifecycle
+   wrappers, flip OFF, byte-identical.
+3. **B-2b** — the flip + the deltas found while landing:
+   - drain compiles the child on demand via `nativeFor` (a provenance child is
+     never dispatcher-selected — waiting for lazy `.compiled` deadlocks
+     publication; `.unsupported` deletes the edge per §B.6(5));
+   - `noteSiblingTerminal` fires at ANY local count (zero-progress was §S's
+     discovery heuristic, not coherence; the gate blocked every cycle's
+     CLOSING arm — with it, nsieve walks did not move at all);
+   - `provenance_arms_pending` event-driven drain gate (the unconditional
+     per-walk edge×armed_links scan measured 5.7% of nsieve-bit wall; set at
+     edge append / any physical disarm / in-place sibling re-arm; settles
+     after a pass with no transient decline);
+   - `armNativeLink` in-place re-arm now releases the displaced sibling latch
+     (codex post-landing blocker; sibling→ordinary→sibling→disarm test pins
+     1→0→1→0);
+   - B-2b can supersede M1 discovery → doc-16 Phase-2 test signals generalize
+     to `prime_side_chain_follows + sibling_handoff_fused` and
+     `native_source_link_arms + sibling_handoff_arms`.
+4. **build.zig: `-Dtest-filter=<substr>`** wired into both test steps
+   (verified against the pinned stdlib `Build.TestOptions.filters`).
+
+### Measured (interleaved min-of-21, vs B-1 binary /tmp/lune-B1)
+
+nsieve 9: 109→86ms (−21%); nsieve 7 −18%; nsieve 3 −19%; sieve_int −20%;
+walks at N=9: 330,206 → 53,746 (53,625 at LEDGER_CAP — the full native cycle
+scan→cont→skip→scan formed; the ~45k prediction held). All SEVEN output
+hashes identical (NB: bench programs live at `bench/*.lua`, NOT
+`bench/programs/` — a wrong path hashes the error message and "matches" on
+all binaries); aviii/aviii-which=109, floatlink=18135; 853/853 tests both
+builds.
+
+### KNOWN REGRESSION — nsieve-bit 6: 31→36ms (+17%), commit shipped anyway (codex recommendation)
+
+Isolated: a relax-only build (arming off) is neutral — the arming causes both
+the wins and this. Mechanics (§B.7): the armed cycle halves nsieve-bit's walk
+count but (a) pushes more rows through the replayLedger steering grammar
+(~14% combined replay+drive in perf), and (b) a second-order hotness shift
+lets a low-quality 247-instr root continuation trace (t=5 at pc=58) record
+and link; it normal-deopts ~11.7k times at four scattered exits (ei
+56/98/140/182), each costing wasted native work + a tier-0 deopt-replay
+re-run. Codex verdict: the provenance edges are locally successful; disarming
+them for exposing a poor ROOT trace would misattribute the cost. **Follow-up
+= B-4 deterministic trace-quality probation** (score native entries against
+committed work / normal-deopt frequency / exit dispersion / size; gate or
+retire large low-yield roots — general, benchmark-agnostic).
+
+### Open for Bart
+
+- The nsieve-bit +17% ship-vs-block call above was made per the reviewer's
+  recommendation — say the word and B-2b flips off (`provenance_arming_enabled`,
+  one const) or reverts cleanly.
+- Still unanswered from LATEST-46: the two seam-round-2 MINORs (u32 cache_gen
+  wrap; hit_count dependence if max_traces_per_anchor >8) and the stray
+  untracked bench/results/20260813-140214-84c86bc.tsv.
+
 ## Status 2026-08-13 (LATEST-46) — **Seam round 2 closed: ldl memo kept (+inline credit), FrozenFast/act_cache consolidation tried and REVERTED (measured slower). Remaining seam self-time is structural → doc-17 Part B next.**
 
 ### What landed (Bart: "do the known things before B first")

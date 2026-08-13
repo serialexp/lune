@@ -83,11 +83,13 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // `zig build test` — run unit tests from both the library and the CLI module.
-    const mod_tests = b.addTest(.{ .root_module = mod });
+    // `-Dtest-filter=<substr>` narrows to matching test names (repeatable).
+    const test_filters = b.option([]const []const u8, "test-filter", "Only run tests whose names match the filter") orelse &.{};
+    const mod_tests = b.addTest(.{ .root_module = mod, .filters = test_filters });
     mod_tests.use_llvm = true; // tail-call smoke test needs LLVM (see above)
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    const exe_tests = b.addTest(.{ .root_module = exe.root_module, .filters = test_filters });
     exe_tests.use_llvm = true; // ditto
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
