@@ -1,5 +1,77 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-13 (LATEST-44) — **Pall-faithful hotexit landed: one per-(trace,exit) taken-exit counter (`snap->count`), threshold 10, DONE latch at side-trace commit, productive receipts never strike. Small-N warmup fixed (nsieve N=3: scan loop 0%→94.5% traced, −17.5% wall). All green, all six hashes identical.**
+
+### Why (Bart: "the most correct change — start with what Pall does")
+
+The N-sweep showed lune's small-N nsieve gap is not process startup (0.34ms vs
+LuaJIT 0.30ms empty script) but the scan loop never tiering up below N≈7: at
+N=3 its receipts are all `completed=1..5` (prime-gap segments, below
+`min_useful=8`), every one struck, the anchor gated within 8 receipts, and a
+gated anchor gets no dispatch, so exit hotness never accrued (38 traced vs
+140k interpreted iterations). Read the source (`~/Projects/LuaJIT/src/
+lj_trace.c`): `trace_hotside` (:798) counts EVERY taken exit
+(`++snap->count >= hotexit(10)` → side trace), `SNAPCOUNT_DONE=255` latches at
+side-trace link (:535), and `penalty_pc` fires ONLY on recording aborts.
+LuaJIT has NO per-segment productivity strike machine — ours was the non-Pall
+invention.
+
+### What landed (this commit)
+
+1. **`Trace.exit_counts: []u8`** — Pall's `snap->count`: one taken-exit counter
+   per committed instr, alloc-once at commit (fail-soft), one byte RMW per
+   receipt (no hashing — the Part S lesson). `EXIT_COUNT_DONE=255`.
+2. **`config.hotexit = 10`** (lj_jit.h `JIT_P_hotexit`).
+3. **`noteTakenExit(t, exit, completed, proto)`** — the single per-exit hotness
+   charge, called from interp step-4 (scalar) and the driveDispatcherLedger
+   terminal (bursts; now charges productive terminals too), loop-done exits
+   excluded (continuation territory). **Routing (the shape-fidelity rule —
+   found the hard way):** Pall records FROM the exit, so his side trace is the
+   right shape by construction; we route to whichever recorder captures the
+   right shape: source-branch guard → `wants_prime_side` (doc-16 immediate
+   replay of THIS iteration); other guard + zero-progress → `wants_side_trace`
+   (resume-timed replay of the failing iteration); other guard + productive →
+   count only, NO want (the back-edge recorder captures the NEXT iteration —
+   wrong shape; first cut routed branch exits there and collapsed nsieve's
+   entire fusion: bridge arms 25 940→0, +53% wall).
+4. **DONE latch** — want carries `(parent trace, exit)` provenance
+   (`side_want_src`/`prime_want_src` → `pending_replay_src` →
+   `Recorder.side_src`); commit latches the parent exit `EXIT_COUNT_DONE`.
+   Abort drops it (Pall retries; abort's own `gateAnchor` is our `penalty_pc`).
+5. **Productive receipts never strike** — `accountLegacyThrash` returns before
+   the penalty bump when `completed > 0`. Zero-progress strikes stay (our exits
+   re-enter the runtime, LuaJIT's are patched branches) with Option-A headroom,
+   now `max_penalty +| hotexit`.
+6. **Removed:** `countProductiveBranchExit` + `prime_exits` map +
+   `clearPrimeExits` (the hotguard-50 prime counter — redundant, one counter
+   now), `shape_guard_exit_pc` sentinel (subsumed by per-exit counting).
+7. Four tests re-pinned from "short productive segment strikes" to the Pall
+   semantics (null penalty).
+
+### Measurements (min-of-21 vs /tmp/lune-optA = prior commit, /tmp/lune-hotexit3)
+
+nsieve 3 −17.5%, nsieve 7 −4.4%, nsieve 9 −0.6%, nsieve 10 −1.9%; sieve_int/
+pi_leibniz/grid_matmul/nbody flat (±2%). N-sweep ratios vs LuaJIT: N=1 2.3×,
+N=3 3.3×, N=7 2.9×, N=9 1.1×. nsieve:14 at N=3: 0.0% → 94.5% traced-it;
+whole-run as-trace 5.9% → 60.9%. Remaining small-N gap is recording/compile
+warmup + per-transition overhead ("other (non-loop)" 18.6% at N=3), not
+coverage starvation.
+
+### Gates
+
+`just test` green (also `-Djit-debug=true`); A-viii repros 109; floatlink
+18135; all six output-identity hashes byte-identical.
+
+### Follow-ups (noted, not started)
+
+- driveChain inner receipts (mid-chain deopts) still charge no exit hotness.
+- `countFingerprintMiss` + sibling-watch still at hotguard=50 — candidates for
+  the hotexit threshold, measured separately.
+- The remaining `min_useful` uses (flushRegionWindow window verdict, hit_count
+  gating) are burst-level and stay.
+
+---
+
 ## Status 2026-08-13 (LATEST-43) — **Option A: guard-failure-aware gating. nsieve −48%, sieve_int −32%; nsieve now at/below LuaJIT wall-clock on this box (nsieve 9: lune 136ms vs LuaJIT 144ms; nsieve 10: 266ms vs 427ms; sieve_int parity 63ms vs 62ms). All green, all six hashes identical.**
 
 ### The problem (diagnosed last arc)

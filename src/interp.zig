@@ -3039,32 +3039,22 @@ pub const Vm = struct {
                                     continue :outer;
                                 }
 
-                                // --- guard-failure counting (step 4) ---
-                                // Count guard failures on zero-iteration exits
-                                // (type mismatches that passed the fingerprint
-                                // but failed a non-type guard, e.g. branch direction).
-                                // Resolve the PC through `guardExitPc`: array guards
-                                // store a lane ordinal in `aux`, not a PC, and must
-                                // not be counted as guard-PC failures.
-                                if (local_done == 0 and !linked_one_trip) {
-                                    if (result.exit_instr != std.math.maxInt(u32)) {
-                                        if (trace.guardExitPc(final.instrs[result.exit_instr])) |exit_pc| {
-                                            if (exit_pc > 0) {
-                                                self.trace.countGuardFailure(final.anchor, exit_pc);
-                                            }
-                                        } else if (trace.isSideExitGuardOp(final.instrs[result.exit_instr].op)) {
-                                            // Option A: a side-exit guard without a PC in
-                                            // `aux` (array/shape guards store a lane
-                                            // ordinal) still deserves side-trace hotness —
-                                            // charge it under the shared shape sentinel so
-                                            // a repeating shape mismatch (e.g. append
-                                            // trace hitting an in-bounds overwrite) can
-                                            // reach `hotguard` and record the missing
-                                            // shape, instead of being invisible to the
-                                            // side-trace machine entirely.
-                                            self.trace.countGuardFailure(final.anchor, trace.shape_guard_exit_pc);
-                                        }
-                                    }
+                                // --- hot-exit counting (step 4) ---
+                                // Pall's `trace_hotside` (lj_trace.c:798): EVERY
+                                // taken side exit — productive or not — charges
+                                // its own per-(trace, exit) counter; crossing
+                                // `hotexit` wants a side trace for the alternate
+                                // path. Loop-done exits are excluded: they are
+                                // productive completions owned by the
+                                // continuation machinery, not side-trace
+                                // candidates (`linked_one_trip` exits are
+                                // loop-done by construction and fall out of the
+                                // same check).
+                                if (result.exit_instr != std.math.maxInt(u32) and
+                                    result.exit_instr < final.instrs.len and
+                                    !trace.isLoopDoneGuardIndex(final, result.exit_instr))
+                                {
+                                    self.trace.noteTakenExit(final, result.exit_instr, local_done, proto);
                                 }
 
                                 if (local_done > 0 or linked_one_trip) {
@@ -3087,16 +3077,13 @@ pub const Vm = struct {
                                     // Output-neutral (the recording aborts at the
                                     // inner `for_prep` until Phase 2).
                                     self.trace.maybeArmContinuation(final, result.exit_instr, proto);
-                                    // Coherent-state chaining (doc 16, Phase 2): a
-                                    // *productive* source-level branch-guard exit (e.g.
-                                    // nsieve's `guard_false(p[i])` firing when a
-                                    // composite-skipping outer trace finally hits a
-                                    // prime) counts toward arming a prime side-trace at
-                                    // this outer header. The function filters out
-                                    // numeric-for loop-done guards (handled above by
-                                    // `maybeArmContinuation`). Inert until the
-                                    // productive chain call consumes `wants_prime_side`.
-                                    self.trace.countProductiveBranchExit(final, result.exit_instr, proto);
+                                    // Coherent-state chaining (doc 16, Phase 2): the
+                                    // prime-side arm counter now lives in the unified
+                                    // hotexit charge above (`noteTakenExit` routes
+                                    // source-branch guard exits to `wants_prime_side`
+                                    // at the `hotexit` threshold), so no separate
+                                    // `countProductiveBranchExit` charge remains — one
+                                    // counter per exit, Pall's `snap->count`.
                                     // Retire any dead-marked traces before leaving the
                                     // walk so a stale narrow-lane trace doesn't linger
                                     // in a slot just because a later trace succeeded.
@@ -3128,9 +3115,10 @@ pub const Vm = struct {
                                     // `guard_true(p[i]) → inner for_prep → link`. Force
                                     // `.full` so the replay-side prologue hook fires; do
                                     // NOT advance pc (regs coherent at `ct.anchor`).
-                                    // Self-limiting: `clearPrimeExits` resets the counter
-                                    // and `countTracesAt >= 2` stops re-arming once the
-                                    // prime side-trace exists.
+                                    // Self-limiting: `countTracesAt >= 2` (in
+                                    // `noteTakenExit`'s branch route) stops re-arming
+                                    // once the prime side-trace exists, and the commit
+                                    // DONE-latches the parent exit.
                                     if (self.trace.wants_prime_side) |want| {
                                         if (want.proto == final.anchor.proto and want.pc == final.anchor.pc and
                                             !self.trace.isRecording() and
@@ -3138,8 +3126,11 @@ pub const Vm = struct {
                                             !self.trace.isGated(final.anchor))
                                         {
                                             self.trace.pending_replay_anchor = final.anchor;
+                                            // Hotexit provenance rides into the replay
+                                            // recording for the commit's DONE latch.
+                                            self.trace.pending_replay_src = self.trace.prime_want_src;
+                                            self.trace.prime_want_src = null;
                                             self.trace.wants_prime_side = null;
-                                            self.trace.clearPrimeExits(final.anchor);
                                             self.trace.prime_side_arms +|= 1;
                                             for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
                                             if (mode == .fast) {
@@ -9388,7 +9379,6 @@ test "H-2 part 3: clearCache retires every trace + resets all derived tiering/di
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
     try testing.expectEqual(@as(usize, 0), vm.trace.penalty.count());
     try testing.expectEqual(@as(usize, 0), vm.trace.guard_failures.count());
-    try testing.expectEqual(@as(usize, 0), vm.trace.prime_exits.count());
     try testing.expectEqual(@as(usize, 0), vm.trace.exec_logs.items.len);
     try testing.expectEqual(@as(usize, 0), vm.trace.coverage.count());
     try testing.expectEqual(@as(usize, 0), vm.trace.abort_log.items.len);

@@ -459,13 +459,6 @@ pub fn guardExitPc(ins: IrInstr) ?u32 {
     };
 }
 
-/// Sentinel `exit_pc` for `countGuardFailure` when the failing exit is a SHAPE
-/// guard that carries no PC in `aux` (the array/hash/grid family reuses `aux`
-/// for lane ordinals). Shares the guard-failure counter namespace: `0` = a
-/// fingerprint miss, a real PC = a PC-carrying guard, `maxInt` = a shapeless
-/// guard exit. Only ever a map key + hotness bucket — nothing chains on it.
-pub const shape_guard_exit_pc: u32 = std.math.maxInt(u32);
-
 /// Every IR op whose runtime failure side-exits the trace — i.e. an exit that a
 /// SIDE TRACE could absorb by recording the alternate shape. This is the Option-A
 /// discriminator (see `accountLegacyThrash`): zero progress through one of these
@@ -1537,6 +1530,19 @@ pub const Trace = struct {
     bridge_cand: []const u8 = &.{},
     bridge_cand_built: bool = false,
 
+    /// Pall's per-snapshot exit hotcount (`snap->count`, lj_trace.c
+    /// `trace_hotside`): one taken-exit counter per committed instruction index,
+    /// bumped by `noteTakenExit` on EVERY taken exit through that instruction.
+    /// `EXIT_COUNT_DONE` (255, LuaJIT's `SNAPCOUNT_DONE`) latches once a side
+    /// trace triggered by this exit commits — the exit is never counted again.
+    /// Alloc-once at commit (FAIL-SOFT: an OOM leaves it empty and
+    /// `noteTakenExit` bounds-checks, costing hotness, never correctness — same
+    /// rationale as `bridge_cand`); empty for hand-built test traces; owned;
+    /// freed in `destroy`; never serialized. Per-receipt cost is one direct
+    /// byte RMW — no hashing (the Part S lesson below: a per-receipt hashmap
+    /// probe was a measured 15% regression).
+    exit_counts: []u8 = &.{},
+
     /// Part S — the sibling-handoff watch, deliberately a THREE-SCALAR, one-slot,
     /// allocation-free counter rather than a `(trace, exit) -> u32` side map.
     ///
@@ -1614,6 +1620,11 @@ pub const Trace = struct {
     }
 
     /// Free a heap-allocated trace and its arrays.
+    /// LuaJIT's `SNAPCOUNT_DONE` (lj_jit.h): a side trace for this exit has been
+    /// committed — stop counting it. Saturation caps at `DONE - 1` so an exit can
+    /// never drift into DONE by counting alone.
+    pub const EXIT_COUNT_DONE: u8 = 255;
+
     pub fn destroy(self: *Trace, gpa: std.mem.Allocator) void {
         self.native.deinit();
         gpa.free(self.instrs);
@@ -1624,6 +1635,7 @@ pub const Trace = struct {
         if (self.exit_prov.len != 0) gpa.free(self.exit_prov);
         if (self.rec_path.len != 0) gpa.free(self.rec_path); // A-ii.3
         if (self.bridge_cand.len != 0) gpa.free(self.bridge_cand); // §T.9 memo
+        if (self.exit_counts.len != 0) gpa.free(self.exit_counts); // hotexit counters
         gpa.destroy(self);
     }
 
@@ -1788,6 +1800,15 @@ pub const TraceConfig = struct {
     /// at A fails this many times, the next back-edge to A arms a new
     /// recording that captures the alternate path through the loop body.
     hotguard: u32 = 50,
+    /// LuaJIT-faithful hot-exit threshold (lj_jit.h `JIT_P_hotexit` = 10, consumed
+    /// by `trace_hotside`, lj_trace.c:798): the number of TAKEN exits through one
+    /// `(trace, exit_instr)` — productive or not — before a side trace is wanted
+    /// there. This is Pall's model verbatim: every taken exit increments the
+    /// exit's own counter (`snap->count`); segment productivity is never
+    /// consulted; a successful side-trace commit latches the counter to DONE
+    /// (`SNAPCOUNT_DONE`) so the exit is never counted again. See
+    /// `noteTakenExit`.
+    hotexit: u8 = 10,
     /// Maximum distinct traces cached per anchor before `countGuardFailure` /
     /// `countFingerprintMiss` stop counting (i.e. before side-trace recording at
     /// that anchor is refused). Was a hard-coded 2, which is exactly one branch
@@ -2340,6 +2361,18 @@ pub const TraceState = struct {
     /// `countGuardFailure` when a guard-failure crosses `hotguard`; cleared
     /// by `onBackEdge` when the side trace is armed.
     wants_side_trace: ?AnchorKey = null,
+    /// Provenance of the pending `wants_side_trace` when it came from a hot exit
+    /// (`noteTakenExit`): the parent `(trace id, exit index)` to DONE-latch once
+    /// the side trace commits — Pall's `snap->count = SNAPCOUNT_DONE` at side-
+    /// trace link (lj_trace.c:535). Null for fingerprint-miss wants (those have
+    /// no single parent exit). Follows the want through consume →
+    /// `pending_replay_src` → `Recorder.side_src`; cleared wherever the want is
+    /// dropped, so `side_want_src != null ⇒ wants_side_trace != null`.
+    side_want_src: ?ExitKey = null,
+    /// `side_want_src` after `consumeSideTraceWantAtResume` moved the want into
+    /// `pending_replay_anchor`; transferred to `Recorder.side_src` by
+    /// `maybeStartReplaySide`, cleared with `pending_replay_anchor`.
+    pending_replay_src: ?ExitKey = null,
     /// **Nested-loop trace linking (Phase 1).** When non-null, a *continuation*
     /// recording is pending at this (non-header) anchor — the bytecode PC tier-0
     /// resumes at after an inner numeric-`for` loop runs to completion (the inner
@@ -2353,22 +2386,22 @@ pub const TraceState = struct {
     /// still aborts (LINNER) until Phase 2 turns it into a `.link`. See
     /// `docs/design/15-nested-loop-linking.md`.
     pending_exit_anchor: ?AnchorKey = null,
-    /// **Coherent-state chaining (doc 16, Phase 2).** Per-guard counters for
-    /// *productive* source-level branch-guard exits (e.g. nsieve's `guard_false(p[i])`
-    /// firing when a composite-skipping outer trace finally hits a prime). Kept in a
-    /// map separate from `guard_failures` so productive-branch counting never
-    /// cross-talks with the zero-exit side-trace machinery. Keyed by
-    /// `(anchor, exit_pc)`; crosses `config.hotguard` → `wants_prime_side`.
-    prime_exits: std.AutoHashMapUnmanaged(GuardKey, u32) = .empty,
-    /// **Coherent-state chaining (doc 16, Phase 2).** When non-null, a productive
+    /// **Coherent-state chaining (doc 16, Phase 2).** When non-null, a
     /// branch-guard at this outer-header anchor has gone hot: the next such exit
     /// should arm an *immediate* replay of the current (prime) iteration — recording
     /// the taken branch forward through the inner `for_prep` and closing with a
     /// `.link` to the inner root — rather than the *next* iteration (which the
     /// `wants_side_trace`/`onBackEdge` path would record, and which is ~93% a
-    /// composite in nsieve, the wrong path). Set by `countProductiveBranchExit`;
+    /// composite in nsieve, the wrong path). Set by `noteTakenExit` (the unified
+    /// hotexit counter routes source-branch guard exits here at the `hotexit`
+    /// threshold — the separate hotguard-50 per-anchor map is gone);
     /// consumed at the productive-exit site by handing off to `pending_replay_anchor`.
     wants_prime_side: ?AnchorKey = null,
+    /// Hotexit provenance for `wants_prime_side` (mirrors `side_want_src`): the
+    /// parent `(trace, exit)` to DONE-latch when the prime side trace commits.
+    /// Handed to `pending_replay_src` at the consumption site; cleared wherever
+    /// `wants_prime_side` is dropped.
+    prime_want_src: ?ExitKey = null,
     /// **Coherent-state chaining (doc 16, Phase 2).** When non-null, an outer-header
     /// prime side-trace recording is pending at this anchor. Unlike
     /// `pending_exit_anchor` (a *post-inner* continuation pc), this anchor is the
@@ -2655,7 +2688,6 @@ pub const TraceState = struct {
         self.gate.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
         self.guard_failures.deinit(self.gpa);
-        self.prime_exits.deinit(self.gpa);
         self.values_scratch.deinit(self.gpa);
         for (self.exec_logs.items) |*l| l.deinit(self.gpa);
         self.exec_logs.deinit(self.gpa);
@@ -3006,31 +3038,47 @@ pub const TraceState = struct {
             _ = self.gate.remove(key);
             return;
         }
+        // Pall's model (hotexit arc): a PRODUCTIVE segment is never a strike,
+        // however short. LuaJIT has no `min_useful` analog at all — a trace that
+        // commits 2 iterations and exits is fine; its hot exit just spawns a side
+        // trace within `hotexit` takes and coverage grows until exits are rare
+        // (`trace_hotside`, lj_trace.c:798; the only backoff machine,
+        // `penalty_pc`, fires exclusively on recording ABORTS). Our per-segment
+        // strike machine was the non-Pall invention, and it starved exactly the
+        // workloads the side-trace/chaining machinery exists for: nsieve's scan
+        // loop at small sieve sizes has prime-gap segments of 1–5 iterations —
+        // every receipt struck, the anchor gated within 8 entries, and a gated
+        // anchor gets no dispatch, so exit hotness never accrued (N=3: 38 traced
+        // vs 140k interpreted iterations, 88% of the run tier-0 WITH a trace).
+        // What remains below is the zero-progress half only: an entry that
+        // commits NOTHING is pure turnstile cost (our exits re-enter the runtime;
+        // LuaJIT's are patched branches), so repeated zero-yield entries still
+        // gate — with Option-A headroom for shape-guard exits so the side-trace
+        // machinery wins the race while capacity remains.
+        if (completed > 0) return;
         const gop = self.penalty.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
         // Option A (LuaJIT's semantics: a hot guard exit has its own hotcount and
         // spawns a side trace — the parent anchor is never blacklisted for it).
-        // Zero progress THROUGH A SHAPE GUARD, while this anchor can still take
-        // another side trace, is side-trace evidence, not thrash: widen the gate
-        // threshold by `hotguard` so the guard-failure counter can reach its own
+        // Zero progress THROUGH A SIDE-EXIT GUARD, while this anchor can still
+        // take another side trace, is side-trace evidence, not thrash: widen the
+        // gate threshold past `hotexit` so the exit counter can reach its own
         // threshold and record the missing shape, instead of the `max_penalty`
-        // gate condemning the anchor first (with the defaults the gate won that
-        // race 8-vs-50 every time). Measured on nsieve: the shared `primes` table
-        // makes the init loop append-shaped on the first size and overwrite-shaped
-        // on the rest; guard_append zero-exits gated the anchor after 8 entries
-        // and ~36% of the run fell back to tier-0 despite full trace coverage.
-        // Still hard-bounded: a genuinely thrashing anchor gates at
-        // `max_penalty + hotguard`, and once the anchor holds
+        // gate condemning the anchor first. Measured on nsieve: the shared
+        // `primes` table makes the init loop append-shaped on the first size and
+        // overwrite-shaped on the rest; guard_append zero-exits gated the anchor
+        // after 8 entries and ~36% of the run fell back to tier-0 despite full
+        // trace coverage. Still hard-bounded: a genuinely thrashing anchor gates
+        // at `max_penalty + hotexit`, and once the anchor holds
         // `max_traces_per_anchor` traces the plain threshold applies again.
         // Deterministic — a pure function of the receipt stream and cache size.
-        const side_headroom = completed == 0 and
-            exit_instr != std.math.maxInt(u32) and
+        const side_headroom = exit_instr != std.math.maxInt(u32) and
             exit_instr < t.instrs.len and
             isSideExitGuardOp(t.instrs[exit_instr].op) and
             self.countTracesAt(key) < self.config.max_traces_per_anchor;
         const limit = if (side_headroom)
-            self.config.max_penalty +| self.config.hotguard
+            self.config.max_penalty +| self.config.hotexit
         else
             self.config.max_penalty;
         if (gop.value_ptr.* >= limit) {
@@ -5574,30 +5622,25 @@ pub const TraceState = struct {
             // anchor entry expects.
             const prev_cum = if (entries.len >= 2) entries[entries.len - 2].cum else 0;
             const term_local = term.cum -| prev_cum;
-            if (term.kind == .deopt and term.reason == .normal and
-                term.outcome == .normal and term_local == 0)
-            {
+            if (term.kind == .deopt and term.reason == .normal and term.outcome == .normal) {
                 if (self.traceById(term.id)) |owner| {
-                    self.noteSiblingTerminal(owner, term.exit);
-                    // Side-trace hotness must see LEDGER terminals too. The scalar
-                    // dispatch path charges `countGuardFailure` on zero-iteration
-                    // guard exits (interp step 4), but a `ledger_len > 1` burst
-                    // returns through here BEFORE that site — so an exit that only
-                    // ever terminates fused bursts never accumulated hotness and
-                    // its alternate path could never tier up. nsieve N=9: the
-                    // zero-trip exit ei=16 terminates 304k bursts per run (every
-                    // prime past m/2) and stayed permanently on the runtime
-                    // turnstile. Same filters as the scalar site: zero progress
-                    // (`term_local == 0` above), a real guard PC, PC nonzero.
-                    if (term.exit < owner.instrs.len) {
-                        if (guardExitPc(owner.instrs[term.exit])) |exit_pc| {
-                            if (exit_pc > 0)
-                                self.countGuardFailure(owner.anchor, exit_pc);
-                        } else if (isSideExitGuardOp(owner.instrs[term.exit].op)) {
-                            // Option A: shape guards (no PC in `aux`) charge the
-                            // shared sentinel — same rule as the scalar site.
-                            self.countGuardFailure(owner.anchor, shape_guard_exit_pc);
-                        }
+                    // Sibling-handoff watch keeps its zero-progress condition —
+                    // §S's coherence argument ("a zero-progress pre-effect deopt
+                    // is coherent at the anchor") is about handoff SOUNDNESS,
+                    // not hotness.
+                    if (term_local == 0) self.noteSiblingTerminal(owner, term.exit);
+                    // Hotexit (Pall's `trace_hotside`): EVERY normal deopt
+                    // terminal charges its exit — productive or not. The scalar
+                    // dispatch path charges at interp step 4, but a
+                    // `ledger_len > 1` burst returns through here BEFORE that
+                    // site — so an exit that only ever terminates fused bursts
+                    // would never accumulate hotness and its alternate path
+                    // could never tier up. Loop-done exits are continuation
+                    // territory, not side-trace candidates.
+                    if (term.exit < owner.instrs.len and
+                        !isLoopDoneGuardIndex(owner, term.exit))
+                    {
+                        self.noteTakenExit(owner, term.exit, term_local, proto);
                     }
                 }
             }
@@ -5901,12 +5944,15 @@ pub const TraceState = struct {
         const key = self.pending_replay_anchor orelse return;
         if (self.rec.active) return; // never clobber an in-flight recording
         if (key.proto != proto or key.pc != cur_pc) return;
+        const src = self.pending_replay_src;
         self.pending_replay_anchor = null;
+        self.pending_replay_src = null;
         // Consume the pending arm FIRST, then decline a dynamic proto — same
         // `.full`-pinning hazard as `maybeStartContinuation` (docs/design/17 H-2 p1).
         if (key.proto.dynamic) return;
         self.rec.reset(self.gpa, key, proto.num_registers) catch return;
         self.rec.kind = .side;
+        self.rec.side_src = src;
     }
 
     /// Drop pending `.full`-pinning arms (continuation *and* prime-side replay).
@@ -5916,6 +5962,72 @@ pub const TraceState = struct {
     pub fn clearPendingExitAnchor(self: *TraceState) void {
         self.pending_exit_anchor = null;
         self.pending_replay_anchor = null;
+        self.pending_replay_src = null;
+    }
+
+    /// Pall's `trace_hotside` (lj_trace.c:798), the exit half of tiering: called
+    /// on EVERY taken side exit — productive or not — with the exiting trace and
+    /// its failing instruction index. `++count >= hotexit` wants a side trace at
+    /// the trace's anchor, carrying `(trace, exit)` provenance so the commit can
+    /// DONE-latch the exit (`SNAPCOUNT_DONE`). This replaces the old
+    /// zero-progress-only `countGuardFailure` charges: under Pall's model an
+    /// exit's hotness is a property of how often it is TAKEN, not of how little
+    /// the segment before it achieved — a short-but-productive segment whose
+    /// exit fires every entry is exactly a side-trace candidate (nsieve's scan
+    /// loop at small sieve sizes: prime-gap segments of 1–5 iterations, every
+    /// receipt below `min_useful`, the anchor gated before any hotness accrued
+    /// and 88% of the N=3 run stayed tier-0 with a trace available).
+    ///
+    /// Deterministic: a pure function of the receipt stream and cache state.
+    /// Loop-done exits are excluded AT THE CALL SITES — they are productive
+    /// completions owned by the continuation machinery (`maybeArmContinuation`),
+    /// not alternate paths.
+    ///
+    /// **Routing (the shape-fidelity rule).** Pall's side trace starts recording
+    /// AT the exit, so it captures the alternate path by construction. We cannot
+    /// record from an arbitrary mid-body exit, so a hot exit is routed to
+    /// whichever of our recorders captures the RIGHT shape:
+    ///   * **source-branch guard** (`isSourceBranchGuardExit`) → `wants_prime_side`
+    ///     — the doc-16 immediate replay: regs are coherent at the anchor on a
+    ///     branch exit, tier-0 re-enters there and records THIS iteration's taken
+    ///     branch. This is the faithful record-from-the-exit analog.
+    ///   * **any other guard, zero-progress receipt** → `wants_side_trace` —
+    ///     consumed at the deopt RESUME (`consumeSideTraceWantAtResume`), which
+    ///     records the re-run of the failing iteration: again the right shape by
+    ///     construction (this is what caught nsieve's append→overwrite flip).
+    ///   * **any other guard, productive receipt** → count only, no want. The
+    ///     only recorder we could offer is the next-back-edge one, which records
+    ///     the NEXT iteration — on an alternating loop that is ~always the
+    ///     already-traced shape, and the resulting duplicate siblings burn the
+    ///     anchor's trace capacity and lock out the chain machinery (measured:
+    ///     routing branch exits there collapsed nsieve's fusion entirely —
+    ///     bridge arms 25 940 → 0, +53% wall).
+    pub fn noteTakenExit(self: *TraceState, t: *Trace, exit_instr: u32, completed: usize, proto: *const Proto) void {
+        if (exit_instr >= t.exit_counts.len) return; // hand-built / fail-soft commit
+        const c = &t.exit_counts[exit_instr];
+        if (c.* == Trace.EXIT_COUNT_DONE) return;
+        const branch = self.isSourceBranchGuardExit(t, exit_instr, proto);
+        // Capacity refusals mirror the mechanisms each route feeds: the prime
+        // side keeps its historical one-ramp bound (`countTracesAt >= 2` — once
+        // skip + ramp coexist, counting stops and never re-arms); generic
+        // siblings stop at `max_traces_per_anchor`.
+        const cap: usize = if (branch) 2 else self.config.max_traces_per_anchor;
+        if (self.countTracesAt(t.anchor) >= cap) return;
+        if (c.* < Trace.EXIT_COUNT_DONE - 1) c.* += 1;
+        if (c.* < self.config.hotexit) return;
+        if (branch) {
+            if (self.wants_prime_side == null) {
+                self.dbg("hotexit: trace id={d} exit={d} count={d} -> want PRIME side at pc={d}", .{ t.id, exit_instr, c.*, t.anchor.pc });
+                self.wants_prime_side = t.anchor;
+                self.prime_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
+            }
+        } else if (completed == 0) {
+            if (self.wants_side_trace == null) {
+                self.dbg("hotexit: trace id={d} exit={d} count={d} -> want side at pc={d}", .{ t.id, exit_instr, c.*, t.anchor.pc });
+                self.wants_side_trace = t.anchor;
+                self.side_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
+            }
+        }
     }
 
     /// Count a guard failure at `exit_pc` within a trace anchored at `anchor`.
@@ -6014,58 +6126,6 @@ pub const TraceState = struct {
             return l.slot_index;
         }
         return null;
-    }
-
-    /// **Coherent-state chaining (doc 16, Phase 2).** Count a *productive*
-    /// (`completed > 0`, gated by the caller) source-level branch-guard exit for
-    /// prime-side-trace arming. A **source-level branch guard** is any
-    /// `guard_true`/`guard_false` whose exit PC is NOT immediately preceded by a
-    /// `for_loop` — that predecessor marks a numeric-`for` *loop-done* guard, which
-    /// is handled by continuations (doc 15), never a prime side-trace. When the
-    /// per-guard counter crosses `config.hotguard`, sets `wants_prime_side` so the
-    /// productive-exit site arms an immediate replay of the current (prime)
-    /// iteration. Symmetric with `countGuardFailure`, but on the *productive* path
-    /// and in its own `prime_exits` map (no cross-talk with the zero-exit side-trace
-    /// counters). Mode-invariant: keys only off the caller's `completed > 0` gate and
-    /// guard identity (`exit_instr` → `guardSourcePc` → `proto.code[source_pc]`), all
-    /// reported identically by tier-1a and native.
-    pub fn countProductiveBranchExit(self: *TraceState, failed: *const Trace, exit_instr: u32, proto: *const Proto) void {
-        if (!self.isSourceBranchGuardExit(failed, exit_instr, proto)) return;
-        // Same diminishing-returns cap as `countGuardFailure` — this also bounds
-        // prime side-traces to one per anchor: once the skip trace + prime side
-        // coexist (`countTracesAt == 2`), counting stops and never re-arms.
-        if (self.countTracesAt(failed.anchor) >= 2) return;
-
-        const exit_pc = guardExitPc(failed.instrs[exit_instr]).?; // checked by the discriminator
-        const key = GuardKey{ .anchor = failed.anchor, .exit_pc = exit_pc };
-        const gop = self.prime_exits.getOrPut(self.gpa, key) catch return;
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* +|= 1;
-        if (gop.value_ptr.* >= self.config.hotguard and self.wants_prime_side == null) {
-            self.wants_prime_side = failed.anchor;
-        }
-    }
-
-    /// Remove all productive-branch counters for `anchor`. Called after a prime
-    /// side-trace is armed so the counter resets and doesn't re-trigger. Mirrors
-    /// `clearGuardFailures`.
-    pub fn clearPrimeExits(self: *TraceState, anchor: AnchorKey) void {
-        var to_remove: std.ArrayListUnmanaged(GuardKey) = .empty;
-        var iter = self.prime_exits.keyIterator();
-        while (iter.next()) |k| {
-            if (k.anchor.proto == anchor.proto and k.anchor.pc == anchor.pc) {
-                // OOM here is benign: a counter left behind just means the
-                // per-anchor productive count keeps its value, and the
-                // `countTracesAt(anchor) >= 2` cap in countProductiveBranchExit
-                // already prevents re-arming once the prime side-trace exists.
-                // Worst case is a stale map entry, never a correctness issue.
-                to_remove.append(self.gpa, k.*) catch continue;
-            }
-        }
-        for (to_remove.items) |k| {
-            _ = self.prime_exits.remove(k);
-        }
-        to_remove.deinit(self.gpa);
     }
 
     /// How many cached traces are at this anchor? `pub` so the dispatcher's M1 fused
@@ -7519,11 +7579,13 @@ pub const TraceState = struct {
         self.gate.clearRetainingCapacity();
         self.penalty.clearRetainingCapacity();
         self.guard_failures.clearRetainingCapacity();
-        self.prime_exits.clearRetainingCapacity();
         self.wants_side_trace = null;
+        self.side_want_src = null;
         self.wants_prime_side = null;
+        self.prime_want_src = null;
         self.pending_exit_anchor = null;
         self.pending_replay_anchor = null;
+        self.pending_replay_src = null;
 
         // Trace-index-keyed and `*Proto`-borrowing diagnostic state — unsafe to retain
         // across the boundary (docs/design/17 H-2 part 3):
@@ -7720,12 +7782,15 @@ pub const TraceState = struct {
     pub fn consumeSideTraceWantAtResume(self: *TraceState, proto: *const Proto, resume_pc: u32) bool {
         const wanted = self.wants_side_trace orelse return false;
         if (wanted.proto != proto or wanted.pc != resume_pc) return false;
+        const src = self.side_want_src;
         self.wants_side_trace = null;
+        self.side_want_src = null;
         const key = AnchorKey{ .proto = proto, .pc = resume_pc };
         if (self.isRecording() or self.pending_replay_anchor != null or self.isGated(key))
             return false;
         self.dbg("side-want-at-resume: arming replay-side recording at pc={d}", .{resume_pc});
         self.pending_replay_anchor = key;
+        self.pending_replay_src = src;
         self.clearGuardFailures(key);
         return true;
     }
@@ -7757,11 +7822,17 @@ pub const TraceState = struct {
             if (wanted.proto == proto and wanted.pc == target_pc) {
                 if (!self.isGated(key)) {
                     self.arm(proto, target_pc);
+                    // Hotexit provenance rides into the recording so the commit
+                    // can DONE-latch the parent exit (`arm` may decline —
+                    // dynamic proto / OOM — in which case `rec.active` is false
+                    // and there is nothing to carry).
+                    if (self.rec.active) self.rec.side_src = self.side_want_src;
                     // Clear guard-failure counters for this anchor so we don't
                     // immediately re-trigger on the next outer-loop iteration.
                     self.clearGuardFailures(key);
                 }
                 self.wants_side_trace = null;
+                self.side_want_src = null;
                 return;
             }
         }
@@ -8090,7 +8161,28 @@ pub const TraceState = struct {
         // failure costs speed and never correctness.
         buildBridgeCandMemo(self.gpa, t);
         errdefer if (t.bridge_cand.len != 0) self.gpa.free(t.bridge_cand);
+        // Hotexit substrate (Pall's `snap->count`): one taken-exit counter per
+        // committed instruction. FAIL-SOFT on OOM (empty ⇒ `noteTakenExit`
+        // no-ops for this trace — hotness lost, correctness untouched).
+        if (self.gpa.alloc(u8, fields.instrs.len)) |counts| {
+            @memset(counts, 0);
+            t.exit_counts = counts;
+        } else |_| {}
+        errdefer if (t.exit_counts.len != 0) self.gpa.free(t.exit_counts);
         try self.cache.append(self.gpa, t);
+        // Pall's `snap->count = SNAPCOUNT_DONE` at side-trace link (lj_trace.c:535):
+        // this commit was triggered by a hot exit (`side_src` provenance followed
+        // the want through consume → pending → recorder), so latch the parent's
+        // exit — it now has its side trace and must never count again. The parent
+        // may have been evicted mid-recording (`traceById` miss) — then there is
+        // nothing to latch.
+        if (self.rec.side_src) |src| {
+            if (self.traceById(src.trace_id)) |parent| {
+                if (src.exit_instr < parent.exit_counts.len)
+                    parent.exit_counts[src.exit_instr] = Trace.EXIT_COUNT_DONE;
+            }
+            self.rec.side_src = null;
+        }
         // Coverage (gated): a trace now exists at this anchor, so subsequent
         // interpreted back-edges here are "fallback despite a trace."
         if (self.config.coverage) self.markAnchorTraced(t.anchor);
@@ -9856,6 +9948,14 @@ pub const Recorder = struct {
     /// (`.side`); reset to `.root` by `reset` (every `arm`). `recForPrepLink`
     /// permits a `.link` close for `.side`/`.continuation` but never `.root`.
     kind: TraceKind = .root,
+    /// Hotexit provenance: the parent `(trace id, exit index)` whose hot exit
+    /// triggered this recording (`noteTakenExit` → want → arm). Non-null only
+    /// for hotexit-sourced recordings; on successful commit the parent's exit
+    /// counter is latched `EXIT_COUNT_DONE` (Pall's `SNAPCOUNT_DONE` at
+    /// lj_trace.c:535). Cleared by `reset` and consumed by `commit`; an abort
+    /// simply drops it (Pall retries the exit — `snap->count` stays hot — and
+    /// the abort's own `gateAnchor` backoff is our `penalty_pc` analog).
+    side_src: ?ExitKey = null,
     /// **Post-increment resume/exit PC** of the instruction currently being
     /// recorded (= its source-opcode PC + 1; the tier-0 fetch advances one
     /// fixed-width `Instr` before the recording mirror). Set by `recordInstr`
@@ -9985,6 +10085,7 @@ pub const Recorder = struct {
         self.link_target = null;
         self.pending_link_provenance = null;
         self.kind = .root;
+        self.side_src = null;
         self.pending_store_count = 0;
         self.anchor_num_registers = num_registers;
         self.base_off = 0;
@@ -11688,8 +11789,10 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.prologue_fail] com
     // anchor (pc 2) — the prologue-fail must NOT erase that progress.
     try testing.expectEqual(@as(usize, 1), r.completed);
     try testing.expectEqual(@as(?u32, 2), r.resume_pc);
-    // onSideExit(inner, 1): low-yield → one penalty on the inner anchor.
-    try testing.expectEqual(@as(u32, 1), state.penalty.get(.{ .proto = &proto, .pc = 5 }).?);
+    // onSideExit(inner, 1): PRODUCTIVE (completed=1) — under the Pall hotexit
+    // model a productive segment is never a strike, however short (only
+    // zero-progress entries strike; hot exits spawn side traces instead).
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 5 }));
     // The continuation's pre-commit fail takes NO onSideExit (break_burst tail).
     try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
     // No `.link` marker in this grammar.
@@ -11847,9 +11950,10 @@ test "driveSeedLedger: a deep hop-0 ledger [C.link, I.done, C.deopt] charges eac
     try testing.expectEqual(@as(u64, 1), state.native_link_exits);
     // Not a coherent-anchor (prime-side) entry: no chain-follow firing signal.
     try testing.expectEqual(@as(u64, 0), state.prime_side_chain_follows);
-    // onSideExit(inner, 1) and onSideExit(cont, 2), one penalty each (both < min_useful).
-    try testing.expectEqual(@as(u32, 1), state.penalty.get(.{ .proto = &proto, .pc = 7 }).?);
-    try testing.expectEqual(@as(u32, 1), state.penalty.get(.{ .proto = &proto, .pc = 2 }).?);
+    // onSideExit(inner, 1) and onSideExit(cont, 2): both PRODUCTIVE — under the
+    // Pall hotexit model neither strikes (only zero-progress entries do).
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 7 }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
 }
 
 test "jit coverage: per-hop cycles bill each hop's own anchor, never the entry anchor" {
@@ -12022,8 +12126,9 @@ test "driveBurstCore start_at_continuation: a run_continuation handover does not
     try testing.expectEqual(@as(u64, 1), state.native_loopdone_link_fused);
     // The inner's codegen verdict memoized as unsupported (that's what ended the burst).
     try testing.expect(inner.native == .unsupported);
-    // Both inner loop-dones charged low-yield entries on the inner anchor.
-    try testing.expectEqual(@as(u32, 2), state.penalty.get(.{ .proto = &proto, .pc = 7 }).?);
+    // Both inner loop-dones were PRODUCTIVE receipts — under the Pall hotexit
+    // model neither strikes the inner anchor.
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 7 }));
 }
 
 test "replayLedger A-vii-a: region_bridge validates registered cross-anchor edge and accounts selection" {
@@ -12130,10 +12235,11 @@ test "replayLedger A-vii-a: region_bridge validates registered cross-anchor edge
     try testing.expectEqual(@as(u32, 20), resume_pc);
     // local=3 is nonzero and reaches accountTraceRun(cont, 3): at N=3 it is a
     // useful selection completion, so the owner gains exactly one hit and no
-    // low-yield penalty. The terminal skip's own local=2 remains independently low.
+    // low-yield penalty. The terminal skip's own local=2 is short but PRODUCTIVE
+    // — under the Pall hotexit model it does not strike either.
     try testing.expectEqual(@as(u64, 1), cont.hit_count);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(cont.anchor));
-    try testing.expectEqual(@as(u32, 1), state.penalty.get(skip.anchor).?);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(skip.anchor));
 }
 
 test "A-vii-d.1 overlay: composite guard resolves the opposite-polarity CFG successor (jmp walk, polarity flip, self-edge decline)" {
