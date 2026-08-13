@@ -1,5 +1,63 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-13 (LATEST-46) — **Seam round 2 closed: ldl memo kept (+inline credit), FrozenFast/act_cache consolidation tried and REVERTED (measured slower). Remaining seam self-time is structural → doc-17 Part B next.**
+
+### What landed (Bart: "do the known things before B first")
+
+1. **`hasNativeLoopDoneLink` memoized per-trace under `cache_gen`**
+   (`Trace.ldl_memo`/`ldl_memo_gen`; body split into
+   `computeNativeLoopDoneLink`). It ran per native dispatch
+   (interp.zig:2848) doing an O(instrs) scan + cache probes. Measured: native
+   bucket 51.2M→44.1M cycles at nsieve N=7 (−14%, repeatable via jit-stats).
+2. **`creditRegionWork` made `inline`** — called per credited ledger row from
+   the frozen fast path; perf annotate showed the call frame as a visible
+   slice. Neutral-to-slightly-better (nsieve 9 −1.1%, sieve_int ±0 at
+   min-of-41); walk cost unchanged (763 cyc/walk both sides).
+
+### What was tried and REVERTED (kept as a comment in replayLedger)
+
+Serving the FrozenFast walk-prelude from the shared `act_cache` slot via an
+extracted `refreshActCache(call_seq)` — replacing the per-walk
+`activeRegionFor` map iteration + `region_profit.getPtr` probe with two
+compares. **Measured slower**: +51 cyc/walk at N=7 (816→867), +2% wall. The
+map has 1–2 entries, so the direct iteration is already cheaper than the
+extra layout/branch cost the shared path added. The revert comment sits at
+the FrozenFast setup so nobody re-tries it blind. (`refreshActCache` itself
+was NOT kept — `qualifiedActiveMember` retains its original inline body.)
+
+NB an important measurement artifact found on the way: restructuring
+functions in trace.zig moves replayLedger's code layout enough to shift the
+seam bucket ±90 cyc/walk with ZERO functional change (the ldl memo — which
+never touches the walk — reproduced the "regression" alone). Judge seam
+changes by the native bucket + min run total + interleaved wall clock
+together, never by cyc/walk alone.
+
+### Where the remaining round-2 candidates went (profiled at nsieve 9)
+
+- `replayLedger` self 20.5%: **diffuse** — no instruction above 3.1%; it's the
+  per-row grammar itself. The lever is fewer walks/rows = Part B, not micro.
+- `driveDispatcherLedger` self 5.1%: **skid artifact** — 78% of its samples on
+  one unconditional `jmp` right after the `driveBurstCore` call return.
+- `wyhash` 1.2%: diffuse (tier-0 interpreter-side lookups mostly).
+- `memset` 1.9%: tier-0 array-part growth zero-fill (fresh-nil semantics),
+  compulsory work, not seam.
+
+### Gates (all green at this state)
+
+`zig build test` + `-Djit-debug=true` both OK; all SEVEN output hashes OK
+(incl. nsieve-bit 6 = 49601107e4d95035 — NB run `bench/luajit/nsieve-bit.lua`,
+the 5.4-syntax lune copy, not the LuaJIT-tree file which needs `bit`);
+aviii/aviii-which → 109, floatlink → 18135.
+
+### Next (agreed with Bart)
+
+**Doc-17 Part B: true exit-branch patching** — patch the guard to jump
+straight into the side trace/continuation, attacking walk COUNT (98,483
+walks at N=7) rather than walk cost. That's where the remaining ~40% seam
+share lives.
+
+---
+
 ## Status 2026-08-13 (LATEST-45) — **Seam-shrink arc, round 1: four measured memoizations, nsieve 5 −22% / nsieve 9 −18% / sieve_int −16% cumulative. Doc-17 Part B (true exit patching) is the agreed follow-up.**
 
 ### Why (Bart: "start with shrinking, B as follow-up")

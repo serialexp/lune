@@ -1536,6 +1536,14 @@ pub const Trace = struct {
     anchor_pop_gen: u32 = 0,
     anchor_pop: u32 = 0,
 
+    /// Memo for `TraceState.hasNativeLoopDoneLink` — a pure function of this
+    /// trace's instrs (fixed after commit), its dispatch proto (fixed: the
+    /// anchor proto), and the trace cache contents (covered by
+    /// `TraceState.cache_gen`). Ran per NATIVE DISPATCH before; now one gen
+    /// compare in steady state. Gen 0 = never computed.
+    ldl_memo_gen: u32 = 0,
+    ldl_memo: bool = false,
+
     /// Pall's per-snapshot exit hotcount (`snap->count`, lj_trace.c
     /// `trace_hotside`): one taken-exit counter per committed instruction index,
     /// bumped by `noteTakenExit` on EVERY taken exit through that instruction.
@@ -3819,7 +3827,10 @@ pub const TraceState = struct {
     /// `accountRegionProfit` so the classified and member-unclassified credit
     /// paths cannot drift. `flushRegionWindow` never mutates `region_profit`,
     /// so `accum` stays valid across the loop.
-    fn creditRegionWork(self: *TraceState, key: RegionKey, accum: *RegionAccum, work: usize) void {
+    // `inline`: called per credited ledger row from the frozen fast path —
+    // perf annotate showed the call frame (push/pop) as a visible slice of its
+    // self-time, and the frozen steady-state body is a handful of adds.
+    inline fn creditRegionWork(self: *TraceState, key: RegionKey, accum: *RegionAccum, work: usize) void {
         accum.barren_run = 0; // real work ends any barren streak
         accum.outer_traversals +|= @intCast(work);
         const n: u64 = @intCast(self.config.min_useful);
@@ -3972,22 +3983,32 @@ pub const TraceState = struct {
     /// (`noteBarrenConsumed` — codex BLOCKER 2).
     fn qualifiedActiveMember(self: *TraceState, proto: *const Proto, pc: u32) ?MemberAccum {
         const ctx = self.region_context orelse return null;
-        // Single-slot activation cache (see `act_cache_*`): the map iteration +
-        // hash lookup + qualification check only re-run when the activation, the
-        // `region_profit` map, or the region defs changed.
-        if (self.act_cache_gen != self.region_defs_gen or self.act_cache_seq != ctx.call_seq) {
-            self.act_cache = blk: {
-                const a = self.activeRegionFor(ctx.call_seq) orelse break :blk null;
-                const accum = self.region_profit.getPtr(a) orelse break :blk null;
-                if (!accum.useful_window_seen) break :blk null;
-                break :blk .{ .key = a, .accum = accum };
-            };
-            self.act_cache_gen = self.region_defs_gen;
-            self.act_cache_seq = ctx.call_seq;
-        }
+        self.refreshActCache(ctx.call_seq);
         const m = self.act_cache orelse return null;
         if (!self.regionMemberPoint(m.key.region_id, proto.id, pc)) return null;
         return m;
+    }
+
+    /// Single-slot activation cache refresh (see `act_cache_*`): the map
+    /// iteration + hash lookup + qualification check only re-run when the
+    /// activation, the `region_profit` map, or the region defs changed. Shared
+    /// by `qualifiedActiveMember` (per-receipt) and `replayLedger`'s
+    /// freeze-fast-path setup (per-walk) — before the share, the walk setup
+    /// re-iterated `region_profit` + re-hashed on EVERY walk (seam round 2).
+    /// After a refresh, `act_cache` holds the QUALIFIED (`useful_window_seen`)
+    /// active accumulator for `call_seq`, or null — a `frozen` accumulator is
+    /// always qualified (freeze-after-qualify), so a valid-cache null also
+    /// means "no frozen activation".
+    fn refreshActCache(self: *TraceState, call_seq: u64) void {
+        if (self.act_cache_gen == self.region_defs_gen and self.act_cache_seq == call_seq) return;
+        self.act_cache = blk: {
+            const a = self.activeRegionFor(call_seq) orelse break :blk null;
+            const accum = self.region_profit.getPtr(a) orelse break :blk null;
+            if (!accum.useful_window_seen) break :blk null;
+            break :blk .{ .key = a, .accum = accum };
+        };
+        self.act_cache_gen = self.region_defs_gen;
+        self.act_cache_seq = call_seq;
     }
 
     /// A-vii-e.2: the inline half of the tier-0 departure observer. Returns true
@@ -4603,6 +4624,11 @@ pub const TraceState = struct {
         // `region_profit` (`flushRegionWindow` is documented not to), and the latch
         // is dropped the moment any row takes the slow path (which may open/close
         // activations) or a barren-run strike unfreezes the accumulator.
+        // NOTE (seam round 2): serving this from the shared `act_cache` slot
+        // (refreshActCache) was tried and MEASURED SLOWER (~+50 cyc/walk on
+        // nsieve N=7, +2% wall) than the direct derivation below — the map has
+        // 1–2 entries, so the iteration is cheaper than the extra layout/branch
+        // cost the shared path added. Keep the direct form.
         const FrozenFast = struct { key: RegionKey, accum: *RegionAccum };
         var frozen_fast: ?FrozenFast = null;
         if (self.region_context) |rctx| {
@@ -5965,7 +5991,18 @@ pub const TraceState = struct {
     /// entry so the original run can commit the final iteration in linked mode;
     /// after a normal native deopt the pre-run snapshot needed for that commit is
     /// already gone.
-    pub fn hasNativeLoopDoneLink(self: *const TraceState, failed: *const Trace, proto: *const Proto) bool {
+    pub fn hasNativeLoopDoneLink(self: *const TraceState, failed: *Trace, proto: *const Proto) bool {
+        // Memoized under `cache_gen` (see `Trace.ldl_memo_*`): the answer only
+        // changes when the trace cache does (`nextTraceExcluding` reads it), and
+        // this runs once per native dispatch.
+        if (failed.ldl_memo_gen == self.cache_gen) return failed.ldl_memo;
+        const answer = self.computeNativeLoopDoneLink(failed, proto);
+        failed.ldl_memo = answer;
+        failed.ldl_memo_gen = self.cache_gen;
+        return answer;
+    }
+
+    fn computeNativeLoopDoneLink(self: *const TraceState, failed: *const Trace, proto: *const Proto) bool {
         for (failed.instrs) |ins| {
             if (ins.op != .guard_true) continue;
             const exit_pc = guardExitPc(ins) orelse continue;
