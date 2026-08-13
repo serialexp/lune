@@ -752,6 +752,14 @@ const NativeResult = extern struct {
     silent_cell: u64,
     cur_zero_run: u64,
     silent_cum: u64,
+    /// Round-6 exactness: the `*SilentExitMetadata` of the LAST promoted edge that
+    /// fired in this call, overwritten by every silent epilogue. `silent_cell` keeps
+    /// the FIRST (entry ownership); this keeps the terminal one. Zig derives the
+    /// resume contract from this instead of reconstructing it as
+    /// `(first_phase + transitions - 1) % len`, which silently assumed a strict
+    /// round-robin that neither a repeated-parent ring nor two concurrently live
+    /// promoted cycles obey.
+    silent_last_cell: u64,
 };
 
 /// Host-staged bounds/state for a native call that may enter a promoted silent
@@ -787,13 +795,37 @@ comptime {
         std.debug.assert(@offsetOf(NativeResult, field) == @offsetOf(NativeResultLedgerLayout, field));
     std.debug.assert(@offsetOf(NativeResult, "silent_active") == @sizeOf(NativeResultLedgerLayout));
     std.debug.assert(@offsetOf(NativeResult, "silent_cum") == @offsetOf(NativeResult, "silent_active") + 6 * @sizeOf(u64));
+    std.debug.assert(@offsetOf(NativeResult, "silent_last_cell") == @offsetOf(NativeResult, "silent_active") + 7 * @sizeOf(u64));
 }
 
 pub const SilentSummaryCell = extern struct {
     region_work: u64,
     selection_work: u64,
     qualifying_rows: u64,
+    productive_firings: u64,
+    /// Dynamic local of this edge's most recent firing in the native call.
+    last_local: u64,
+    /// One-based silent-transition ordinal of this edge's most recent
+    /// productive firing; zero means none in this call.
+    last_productive_ordinal: u64,
+    /// Round-6 exactness: how many times THIS edge fired in this call, counted by
+    /// the epilogue itself. Replaces the derived `transitions/len + …` round-robin
+    /// estimate, which is only valid when every trace owns exactly one phase of
+    /// exactly one live ring — a property the detector does not enforce.
+    firings: u64,
+    /// One-based silent-transition ordinal of this edge's most recent firing
+    /// (productive or not); zero means it never fired in this call.
+    last_ordinal: u64,
 };
+
+comptime {
+    std.debug.assert(@sizeOf(SilentSummaryCell) == 8 * @sizeOf(u64));
+    std.debug.assert(@offsetOf(SilentSummaryCell, "productive_firings") == 3 * @sizeOf(u64));
+    std.debug.assert(@offsetOf(SilentSummaryCell, "last_local") == 4 * @sizeOf(u64));
+    std.debug.assert(@offsetOf(SilentSummaryCell, "last_productive_ordinal") == 5 * @sizeOf(u64));
+    std.debug.assert(@offsetOf(SilentSummaryCell, "firings") == 6 * @sizeOf(u64));
+    std.debug.assert(@offsetOf(SilentSummaryCell, "last_ordinal") == 7 * @sizeOf(u64));
+}
 
 /// Runtime-owned payload addressed through a compile-time-owned pointer cell. B-3a
 /// freezes this transport; B-3b will allocate/populate instances before patching.
@@ -801,9 +833,10 @@ pub const SilentExitMetadata = extern struct {
     summary: *SilentSummaryCell,
     slot: *usize,
     min_useful: u64,
+    reporting_target: usize,
 };
 
-pub const ExitPatchKind = enum(u8) { deopt, link_terminal, loop_done_linked };
+pub const ExitPatchKind = enum(u8) { deopt, link_terminal, loop_done_linked, region_bridge };
 pub const EXIT_NOP5 = [5]u8{ 0x0F, 0x1F, 0x44, 0x00, 0x00 };
 
 pub const ExitPatch = struct {
@@ -938,6 +971,7 @@ pub const CompiledTrace = struct {
             .silent_cell = 0,
             .cur_zero_run = silent.cur_zero_run,
             .silent_cum = 0,
+            .silent_last_cell = 0,
         };
         if (self.trampoline_entry) |tramp| {
             const f: *const TrampolineFn = @ptrFromInt(tramp);
@@ -1012,6 +1046,7 @@ pub const CompiledTrace = struct {
             .silent_cell = result.silent_cell,
             .cur_zero_run = result.cur_zero_run,
             .silent_cum = result.silent_cum,
+            .silent_last_cell = result.silent_last_cell,
         };
     }
 
@@ -3640,20 +3675,30 @@ fn emitForcedYieldCheck(a: *x64.Assembler, shared_exit: usize) !void {
 /// B-3a's unreachable silent tail. `metadata_cell` is a stable compile-time-owned
 /// pointer cell; B-3b publishes a `*SilentExitMetadata` into it before patching.
 fn emitSilentEpilogue(a: *x64.Assembler, kind: ExitPatchKind, metadata_cell: *usize, shared_exit: usize, trace_id: u32) !void {
+    const can_silence = try a.label();
     const owned = try a.label();
     const qualified_done = try a.label();
     const zero_done = try a.label();
     const reset_zero = try a.label();
     const exhausted = try a.label();
 
+    // A reporting prefix cannot be represented by the silent ABI. Continue at the
+    // exact original reporting target whenever this span has emitted any row. This
+    // also prevents re-entering silence after an off-cycle reporting suffix begins.
+    try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(metadata_cell))));
+    try a.movRegMem(.rax, .rax, 0);
+    try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "ledger_len"), 0);
+    try a.jcc(.e, can_silence);
+    try a.movRegMem(.rax, .rax, @offsetOf(SilentExitMetadata, "reporting_target"));
+    try a.jmpReg(.rax);
+    a.bind(can_silence);
+
     // Final round-5 ordering: kind-specific materialization is complete before this
     // store, and every promoted epilogue publishes the exact cumulative rbx baseline.
     try a.movMemReg(.rdx, @offsetOf(NativeResult, "silent_cum"), .rbx);
     try a.movMemImm32(.rdx, @offsetOf(NativeResult, "silent_active"), 1);
 
-    // rax = *SilentExitMetadata (the cell is null while unreachable in B-3a).
-    try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(metadata_cell))));
-    try a.movRegMem(.rax, .rax, 0);
+    // rax = *SilentExitMetadata (loaded above).
     // First-cell ownership: preserve the first promoted edge observed in this call.
     try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "silent_cell"), 0);
     try a.jcc(.ne, owned);
@@ -3664,6 +3709,29 @@ fn emitSilentEpilogue(a: *x64.Assembler, kind: ExitPatchKind, metadata_cell: *us
     try a.movRegReg(.r8, .rbx);
     try a.subRegMem(.r8, .rdx, @offsetOf(NativeResult, "entry_rbx"));
     try a.movRegMem(.rcx, .rax, @offsetOf(SilentExitMetadata, "summary"));
+    try a.movMemReg(.rcx, @offsetOf(SilentSummaryCell, "last_local"), .r8);
+
+    // Round-6 exactness: every firing records ITSELF — its count, its ordinal, and
+    // that it was the most recent edge to fire. Zig then indexes the summary by
+    // measurement rather than by `(first_phase + t) % len` arithmetic, which is only
+    // sound for a single live ring in which every trace owns exactly one phase.
+    // r9 = this firing's one-based silent-transition ordinal (the counter at
+    // `silent_transitions` is bumped at the tail, after the kind switch).
+    try a.incMemQword(.rcx, @offsetOf(SilentSummaryCell, "firings"));
+    try a.movRegMem(.r9, .rdx, @offsetOf(NativeResult, "silent_transitions"));
+    try a.incReg(.r9);
+    try a.movMemReg(.rcx, @offsetOf(SilentSummaryCell, "last_ordinal"), .r9);
+    try a.movMemReg(.rdx, @offsetOf(NativeResult, "silent_last_cell"), .rax);
+
+    // Preserve dynamic progress evidence independently from aggregated work.
+    // Provenance verdict merging needs occurrence count, not merely a sum that
+    // could have come from a different number of firings.
+    const not_productive = try a.label();
+    try a.cmpRegImm32(.r8, 0);
+    try a.jcc(.e, not_productive);
+    try a.incMemQword(.rcx, @offsetOf(SilentSummaryCell, "productive_firings"));
+    try a.movMemReg(.rcx, @offsetOf(SilentSummaryCell, "last_productive_ordinal"), .r9);
+    a.bind(not_productive);
 
     switch (kind) {
         .deopt => {
@@ -3696,6 +3764,22 @@ fn emitSilentEpilogue(a: *x64.Assembler, kind: ExitPatchKind, metadata_cell: *us
         },
         .link_terminal => {
             // Structural only: no work cells; a zero-work link advances the barren run.
+            try a.incMemQword(.rdx, @offsetOf(NativeResult, "cur_zero_run"));
+            try a.jmp(zero_done);
+        },
+        .region_bridge => {
+            // Structural region work is zero, but selection charges max(local, 1).
+            // Zero region work advances the barren run even when local is nonzero.
+            try a.cmpRegImm32(.r8, 0);
+            const local_nonzero = try a.label();
+            try a.jcc(.ne, local_nonzero);
+            try a.movRegImm64(.r8, 1);
+            a.bind(local_nonzero);
+            try a.addMemReg(.rcx, @offsetOf(SilentSummaryCell, "selection_work"), .r8);
+            try a.cmpRegMem(.r8, .rax, @offsetOf(SilentExitMetadata, "min_useful"));
+            try a.jcc(.b, qualified_done);
+            try a.incMemQword(.rcx, @offsetOf(SilentSummaryCell, "qualifying_rows"));
+            a.bind(qualified_done);
             try a.incMemQword(.rdx, @offsetOf(NativeResult, "cur_zero_run"));
             try a.jmp(zero_done);
         },
@@ -5053,6 +5137,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
 
                     try emitCompositeBridgeSnapshot(a, t, kinds, alloc, ei);
                     try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+                    const silent = try a.label();
+                    patch_emissions[ei] = .{ .kind = .region_bridge, .patch_off = a.code.items.len, .epilogue = silent };
+                    try a.nop5();
                     try emitLedgerAppend(a, t.id, .region_bridge);
 
                     // Re-resolve after the snapshot/append clobbered scratch regs,

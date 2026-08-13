@@ -148,6 +148,10 @@ pub const ExecResult = struct {
     silent_cell: u64 = 0,
     cur_zero_run: u64 = 0,
     silent_cum: u64 = 0,
+    /// Address of the `SilentExitMetadata` of the LAST promoted edge that fired.
+    /// Round-6 exactness: the terminal edge is measured, never reconstructed from
+    /// the transition count (see `TraceState.silentCellOwner`).
+    silent_last_cell: u64 = 0,
 };
 
 /// 2.3c-2c (doc 17): which exit-materialization SITE appended a ledger entry —
