@@ -2858,13 +2858,25 @@ pub const Vm = struct {
                                             // activates the `ledger_len > 1` replay.
                                             self.trace.prepareNativeEntry(); // B-3a direct-entry sweep hook
                                             break :blk if (ran_native_link_mode)
-                                                nt.runLinkedLoopDoneCapturing(trace_regs, &self.trace.ledger_scratch)
+                                                nt.runLinkedLoopDoneCapturing(trace_regs, &self.trace.ledger_scratch, self.trace.silentStaging())
                                             else
-                                                nt.runCapturingLedger(trace_regs, &self.trace.ledger_scratch);
+                                                nt.runCapturingLedger(trace_regs, &self.trace.ledger_scratch, self.trace.silentStaging());
                                         }
                                     }
                                     break :blk irinterp.execute(ct, trace_regs, buf);
                                 } else irinterp.execute(ct, trace_regs, buf);
+                                if (ran_native) {
+                                    if (self.trace.driveDispatcherSilentResult(ct, result, proto, regs, safe_to_arm)) |chain| {
+                                        if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
+                                        const armed_side = self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc));
+                                        for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+                                        if (armed_side and mode == .fast) {
+                                            frame.pc = pc;
+                                            return .switch_mode;
+                                        }
+                                        continue :outer;
+                                    }
+                                }
                                 // B-2b: `tryArmSiblingHandoff` is entry-sited above,
                                 // before lazy native compilation. This post-receipt
                                 // safe point lets a provenance edge publish as soon as

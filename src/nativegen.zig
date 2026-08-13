@@ -754,6 +754,15 @@ const NativeResult = extern struct {
     silent_cum: u64,
 };
 
+/// Host-staged bounds/state for a native call that may enter a promoted silent
+/// cycle. Keeping these values together makes the wrapper initialization the
+/// single ABI staging point for every native-call origin.
+pub const SilentStaging = struct {
+    silent_budget: u64 = 0,
+    barren_budget: u64 = 0,
+    cur_zero_run: u64 = 0,
+};
+
 /// The pre-B-3 ABI prefix, retained solely as a compile-time layout oracle. Appending
 /// the silent tail must not move any existing ledger lane.
 const NativeResultLedgerLayout = extern struct {
@@ -868,7 +877,7 @@ pub const CompiledTrace = struct {
     /// lanes are passed as the SysV first two args (rdi=tags, rsi=payloads); the
     /// result pointer is the third (rdx), reserved out of the allocator pools.
     pub fn run(self: CompiledTrace, regs: RegWindow) irinterp.ExecResult {
-        return self.runWithLinkedLoopDone(regs, false, null);
+        return self.runWithLinkedLoopDone(regs, false, null, .{});
     }
 
     /// Run in the chain-consumed loop-done mode. Numeric-for loop-done exits commit
@@ -876,7 +885,7 @@ pub const CompiledTrace = struct {
     /// so the native nested-loop chainer can jump to the `.link` continuation
     /// without tier-0 replay.
     pub fn runLinkedLoopDone(self: CompiledTrace, regs: RegWindow) irinterp.ExecResult {
-        return self.runWithLinkedLoopDone(regs, true, null);
+        return self.runWithLinkedLoopDone(regs, true, null, .{});
     }
 
     /// 2.3c-2b (doc 17): like `run` (ordinary mode, `linked_loop_done = 0`) but ALSO
@@ -886,8 +895,8 @@ pub const CompiledTrace = struct {
     /// entries (the native append is bounds-guarded at that cap). The borrow is
     /// consumed immediately by the caller's replay — no native call / resize / nested
     /// replay may intervene between this capture and its consumption.
-    pub fn runCapturingLedger(self: CompiledTrace, regs: RegWindow, ledger_out: []irinterp.LedgerEntry) irinterp.ExecResult {
-        return self.runWithLinkedLoopDone(regs, false, ledger_out);
+    pub fn runCapturingLedger(self: CompiledTrace, regs: RegWindow, ledger_out: []irinterp.LedgerEntry, silent: SilentStaging) irinterp.ExecResult {
+        return self.runWithLinkedLoopDone(regs, false, ledger_out, silent);
     }
 
     /// 2.3c-2d (D1): the LINKED-mode counterpart of `runCapturingLedger`. Call A
@@ -899,11 +908,11 @@ pub const CompiledTrace = struct {
     /// replay, corrupting the coherent resume — so capture MUST preserve the mode. Same
     /// borrow contract as `runCapturingLedger`: `ledger_out` holds `LEDGER_CAP` entries
     /// and is consumed immediately, with no intervening native call.
-    pub fn runLinkedLoopDoneCapturing(self: CompiledTrace, regs: RegWindow, ledger_out: []irinterp.LedgerEntry) irinterp.ExecResult {
-        return self.runWithLinkedLoopDone(regs, true, ledger_out);
+    pub fn runLinkedLoopDoneCapturing(self: CompiledTrace, regs: RegWindow, ledger_out: []irinterp.LedgerEntry, silent: SilentStaging) irinterp.ExecResult {
+        return self.runWithLinkedLoopDone(regs, true, ledger_out, silent);
     }
 
-    fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool, ledger_out: ?[]irinterp.LedgerEntry) irinterp.ExecResult {
+    fn runWithLinkedLoopDone(self: CompiledTrace, regs: RegWindow, linked_loop_done: bool, ledger_out: ?[]irinterp.LedgerEntry, silent: SilentStaging) irinterp.ExecResult {
         var result = NativeResult{
             .completed = 0,
             .exit_instr = std.math.maxInt(u32),
@@ -924,10 +933,10 @@ pub const CompiledTrace = struct {
             .ledger_outcome = undefined,
             .silent_active = 0,
             .silent_transitions = 0,
-            .silent_budget = 0,
-            .barren_budget = 0,
+            .silent_budget = silent.silent_budget,
+            .barren_budget = silent.barren_budget,
             .silent_cell = 0,
-            .cur_zero_run = 0,
+            .cur_zero_run = silent.cur_zero_run,
             .silent_cum = 0,
         };
         if (self.trampoline_entry) |tramp| {
@@ -955,20 +964,23 @@ pub const CompiledTrace = struct {
         // `rbx`. Native only (tier-1a never enters this wrapper).
         if (std.debug.runtime_safety) {
             const n = result.ledger_len;
-            std.debug.assert(n >= 1 and n <= irinterp.LEDGER_CAP);
-            std.debug.assert(result.ledger_cum[n - 1] == result.completed);
-            std.debug.assert(result.ledger_id[n - 1] == result.final_trace_id);
-            std.debug.assert(result.ledger_exit[n - 1] == result.exit_instr);
-            std.debug.assert(result.ledger_reason[n - 1] == result.exit_reason);
-            // 2.3c-2c: the site tag must agree with the scalar reason on the only
-            // axis the scalar fields expose — a `.prologue_fail` reason ⟺ a
-            // `prologue_fail` site, and vice-versa. (link_terminal / loop_done_linked /
-            // deopt all carry reason `.normal`, so the ledger `kind` is what tells them
-            // apart; nothing scalar cross-checks those three yet — the generic replay
-            // validates them structurally in 2.3c-2c.)
-            const term_kind: irinterp.LedgerKind = @enumFromInt(result.ledger_kind[n - 1]);
-            std.debug.assert((result.exit_reason == @intFromEnum(irinterp.ExitReason.prologue_fail)) ==
-                (term_kind == .prologue_fail));
+            std.debug.assert(n <= irinterp.LEDGER_CAP);
+            std.debug.assert(result.silent_active != 0 or n >= 1);
+            if (n != 0) {
+                std.debug.assert(result.ledger_cum[n - 1] == result.completed);
+                std.debug.assert(result.ledger_id[n - 1] == result.final_trace_id);
+                std.debug.assert(result.ledger_exit[n - 1] == result.exit_instr);
+                std.debug.assert(result.ledger_reason[n - 1] == result.exit_reason);
+                // 2.3c-2c: the site tag must agree with the scalar reason on the only
+                // axis the scalar fields expose — a `.prologue_fail` reason ⟺ a
+                // `prologue_fail` site, and vice-versa. (link_terminal / loop_done_linked /
+                // deopt all carry reason `.normal`, so the ledger `kind` is what tells them
+                // apart; nothing scalar cross-checks those three yet — the generic replay
+                // validates them structurally in 2.3c-2c.)
+                const term_kind: irinterp.LedgerKind = @enumFromInt(result.ledger_kind[n - 1]);
+                std.debug.assert((result.exit_reason == @intFromEnum(irinterp.ExitReason.prologue_fail)) ==
+                    (term_kind == .prologue_fail));
+            }
         }
         // 2.3c-2b: decode the per-transition ledger for the caller's replay. Only
         // `[0..ledger_len]` is meaningful; the append fully writes every counted slot.
@@ -6842,6 +6854,7 @@ test "nativegen A-v: composite bridge prefix emits but unarmed exit takes ordina
     const result = ct.runCapturingLedger(
         RegWindow.of(tags[0..], payloads[0..]),
         ledger[0..],
+        .{},
     );
     try testing.expectEqual(@as(usize, 0), result.completed);
     try testing.expectEqual(@as(u32, 7), result.exit_instr);

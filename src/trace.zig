@@ -1799,10 +1799,16 @@ pub const TraceConfig = struct {
     /// (`useful_window_seen`), one more to prove it wasn't a fluke. Any strike
     /// unfreezes. Heuristic — never affects output, only tiering cost.
     freeze_windows: u32 = 2,
-    /// Enables production discovery/publication of silent exit cycles. B-3b.2
-    /// deliberately leaves this off and has no production promotion call site;
-    /// focused tests invoke `promoteCycle` directly.
-    silent_promotion_enabled: bool = false,
+    /// Enables production discovery/publication of silent exit cycles. Kept as
+    /// an explicit gate while B-3 coverage is measured and hardened.
+    silent_promotion_enabled: bool = true,
+    /// Maximum promoted transitions executed by one native call before the
+    /// universal silent drain regains control. This replaces the ordinary
+    /// eight-hop steering bound only while a promoted cycle is active.
+    silent_budget: usize = 4096,
+    /// Number of identical, consecutive full-ledger cycle detections required
+    /// before publishing a promotion.
+    promote_after: u32 = 4,
     /// Gate backoff (replaces the old permanent blacklist). When an anchor is
     /// gated (low-yield penalty maxed, a recording abort, or a commit failure) it
     /// is held off tier-1 for a *cooldown window* measured in back-edges, after
@@ -1973,6 +1979,23 @@ const PromotedCycle = struct {
     id: u32,
 };
 
+const PromotionRejects = struct {
+    bridge_member: u64 = 0,
+    open_chain: u64 = 0,
+    no_patch_point: u64 = 0,
+    child_mismatch: u64 = 0,
+    cap: u64 = 0,
+    already_owned: u64 = 0,
+};
+
+const PromotionDemotions = struct {
+    activation: u64 = 0,
+    region_close: u64 = 0,
+    slot_mutation: u64 = 0,
+    trace_invalidation: u64 = 0,
+    teardown: u64 = 0,
+};
+
 /// Part B-2a (doc 17 §B.5): the persistent logical relation between the
 /// side exit that caused a side trace to be recorded and that committed child.
 /// The physical sibling-handoff arm is disposable; this relation survives it.
@@ -2108,9 +2131,12 @@ pub const TraceState = struct {
     promoted_cycles: std.ArrayListUnmanaged(PromotedCycle) = .empty,
     promoted_exit_owners: std.AutoHashMapUnmanaged(ExitKey, u32) = .empty,
     next_promoted_cycle_id: u32 = 1,
+    promotion_candidate: []PromotedEdge = &.{},
+    promotion_candidate_run: u32 = 0,
+    promotion_candidate_region: ?RegionKey = null,
     /// Cycle ids queued while replay is validating the armed-link registry.
     /// Capacity is reserved before promotion publication, so queuing is infallible.
-    pending_demote: std.ArrayListUnmanaged(u32) = .empty,
+    pending_demote: std.ArrayListUnmanaged(PendingDemotion) = .empty,
     /// Part B-2b: persistent hotexit-provenance relations. Edges are expected to
     /// be few, so lifecycle operations deliberately use linear scans.
     provenance_edges: std.ArrayListUnmanaged(ProvenanceEdge) = .empty,
@@ -2331,6 +2357,15 @@ pub const TraceState = struct {
     silent_promotions: u64 = 0,
     silent_demotions: u64 = 0,
     silent_promotion_rejects: u64 = 0,
+    silent_promotion_candidates: u64 = 0,
+    silent_rejects: PromotionRejects = .{},
+    silent_demotion_reasons: PromotionDemotions = .{},
+    silent_bursts_drained: u64 = 0,
+    silent_transitions_total: u64 = 0,
+    silent_budget_exhaustions: u64 = 0,
+    silent_barren_exhaustions: u64 = 0,
+    silent_suffix_drains: u64 = 0,
+    silent_hops_total: u64 = 0,
     /// A-viii (doc 17 §A8 step 8): the high-water mark of `armed_links.len` — the
     /// most handoff edges ever armed SIMULTANEOUSLY. The per-kind arm counters are
     /// lifetime totals, so they cannot distinguish "the three edges of the outer
@@ -2823,6 +2858,28 @@ pub const TraceState = struct {
             jitdbg.log("  B-3 seam rows: bridge-free-closed={d} rest={d} total={d}", .{
                 self.dbg_patchable_cycle_rows, self.dbg_other_replay_rows, replay_total,
             });
+            jitdbg.log("  silent: candidates={d} promotions={d} demotions={d} bursts={d} transitions={d} hops={d} budget={d} barren={d} suffix={d}", .{
+                self.silent_promotion_candidates, self.silent_promotions,
+                self.silent_demotions,            self.silent_bursts_drained,
+                self.silent_transitions_total,    self.silent_hops_total,
+                self.silent_budget_exhaustions,   self.silent_barren_exhaustions,
+                self.silent_suffix_drains,
+            });
+            jitdbg.log("  silent rejects: bridge={d} open={d} child-mismatch={d} no-patch={d} cap={d} owned={d}", .{
+                self.silent_rejects.bridge_member,
+                self.silent_rejects.open_chain,
+                self.silent_rejects.child_mismatch,
+                self.silent_rejects.no_patch_point,
+                self.silent_rejects.cap,
+                self.silent_rejects.already_owned,
+            });
+            jitdbg.log("  silent demotions: activation={d} region-close={d} slot={d} trace={d} teardown={d}", .{
+                self.silent_demotion_reasons.activation,
+                self.silent_demotion_reasons.region_close,
+                self.silent_demotion_reasons.slot_mutation,
+                self.silent_demotion_reasons.trace_invalidation,
+                self.silent_demotion_reasons.teardown,
+            });
             for (self.dbg_burst_len_hist, 0..) |c, len| {
                 if (c != 0) jitdbg.log("  burst-len {d}: {d}", .{ len, c });
             }
@@ -2886,6 +2943,7 @@ pub const TraceState = struct {
         if (self.exec_recorder) |*r| r.deinit();
         self.armed_links.deinit(self.gpa);
         self.pending_demote.deinit(self.gpa);
+        if (self.promotion_candidate.len != 0) self.gpa.free(self.promotion_candidate);
         self.promoted_exit_owners.deinit(self.gpa);
         self.promoted_cycles.deinit(self.gpa);
         self.provenance_edges.deinit(self.gpa);
@@ -3317,6 +3375,36 @@ pub const TraceState = struct {
         if (!region_consumed) self.accountLegacyThrash(t, completed, exit_instr);
     }
 
+    /// Bulk image of sequential frozen-region ledger rows for one trace. Native
+    /// summaries retain exactly the two selection-domain aggregates those calls
+    /// mutate: total executed work and the number of qualifying rows. Because a
+    /// promoted cycle is bound to a consumed frozen region, the legacy
+    /// penalty/strike half is unreachable here; accepting an unconsumed image
+    /// would be inexact (row ordering is intentionally not present in the ABI),
+    /// so it is a release contract failure.
+    fn accountLedgerRowsBulk(
+        self: *TraceState,
+        t: *Trace,
+        completed: usize,
+        qualifying_rows: u64,
+        region_consumed: bool,
+    ) void {
+        if (!region_consumed)
+            @panic("driveSilentBurst: bulk selection row was not region-consumed");
+        if (self.config.coverage) {
+            if (completed > 0) self.noteTraceIters(t.anchor, completed);
+            // Iteration totals remain exact. Per-trace TSC attribution cannot be:
+            // the promoted cycle executed as one uninterrupted native span, so
+            // there is no per-member timestamp boundary to reconstruct here.
+            // Charge the drain-time span once per summarized member as diagnostic
+            // attribution only, matching doc 17's explicit redefinition.
+            const now = readCycles();
+            self.noteTracedCycles(t.anchor, cycleDelta(now, self.last_hop_tsc));
+            self.last_hop_tsc = now;
+        }
+        t.hit_count +|= qualifying_rows;
+    }
+
     fn sameAnchor(a: AnchorKey, b: AnchorKey) bool {
         return a.proto == b.proto and a.pc == b.pc;
     }
@@ -3381,6 +3469,7 @@ pub const TraceState = struct {
         // B-3a hook: physical exit patches owned by this activation must be restored
         // before its accumulator disappears. Promotion storage arrives in B-3b.
         self.demotePromotionsForRegion(key);
+        self.resetPromotionCandidate();
         _ = self.region_profit.remove(key);
         self.refreshObserverFast();
     }
@@ -3390,7 +3479,7 @@ pub const TraceState = struct {
         while (i > 0) {
             i -= 1;
             if (std.meta.eql(self.promoted_cycles.items[i].region_key, key))
-                self.demoteCycle(i);
+                self.demoteCycleReason(i, .region_close);
         }
     }
 
@@ -3406,8 +3495,25 @@ pub const TraceState = struct {
         while (i > 0) {
             i -= 1;
             if (active == null or !std.meta.eql(self.promoted_cycles.items[i].region_key, active.?))
-                self.demoteCycle(i);
+                self.demoteCycleReason(i, .activation);
         }
+    }
+
+    /// One authoritative staging image for every native-call origin. The barren
+    /// bound is absolute: `cur_zero_run` begins at the active activation's current
+    /// streak and native compares it directly with `max_barren_run`.
+    pub fn silentStaging(self: *TraceState) nativegen.SilentStaging {
+        var zero_run: u64 = 0;
+        if (self.region_context) |ctx| {
+            if (self.activeRegionFor(ctx.call_seq)) |key| {
+                if (self.region_profit.get(key)) |accum| zero_run = accum.barren_run;
+            }
+        }
+        return .{
+            .silent_budget = self.config.silent_budget,
+            .barren_budget = self.config.max_barren_run,
+            .cur_zero_run = zero_run,
+        };
     }
 
     fn freeObserverFast(self: *TraceState) void {
@@ -3565,6 +3671,7 @@ pub const TraceState = struct {
     }
 
     fn invalidateRegion(self: *TraceState, id: RegionId) void {
+        self.resetPromotionCandidate();
         self.dbg("region: invalidate id={d} (runtime tombstone)", .{@intFromEnum(id)});
         if (self.region_defs.getPtr(id)) |def| {
             def.armable = false;
@@ -4011,10 +4118,10 @@ pub const TraceState = struct {
         // B-3b.2 transaction order: restored reporting code and cleared metadata
         // must precede every deferred physical-slot disarm.
         while (self.pending_demote.items.len > 0) {
-            const id = self.pending_demote.pop().?;
+            const pending = self.pending_demote.pop().?;
             for (self.promoted_cycles.items, 0..) |cycle, i| {
-                if (cycle.id == id) {
-                    self.demoteCycle(i);
+                if (cycle.id == pending.id) {
+                    self.demoteCycleReason(i, pending.reason);
                     break;
                 }
             }
@@ -4484,6 +4591,7 @@ pub const TraceState = struct {
     }
 
     pub fn resetRegionProfit(self: *TraceState) void {
+        self.resetPromotionCandidate();
         self.region_profit.clearRetainingCapacity();
         self.region_context = null;
         self.freeObserverFast();
@@ -4675,7 +4783,9 @@ pub const TraceState = struct {
                 // ordinary source-branch guard, so a MULTI-entry ledger here starts
                 // at `sct`'s own exit and describes the whole fused span.
                 self.prepareNativeEntry(); // B-3a global sweep hook: driveChain seed
-                sresult = snt.runCapturingLedger(regs, &self.ledger_scratch);
+                sresult = snt.runCapturingLedger(regs, &self.ledger_scratch, self.silentStaging());
+                if (self.driveSeedSilentResult(sct, sresult, proto, regs, safe_to_arm, materialization)) |silent|
+                    return silent;
                 // A ledger deeper than the ONE fused hop the scalar `fused_inner`
                 // mechanism models (`ledger_len == 2`, the `[C.link, I.x]` shape —
                 // kept scalar as the byte-identical compatibility seam; do NOT
@@ -4801,6 +4911,68 @@ pub const TraceState = struct {
         return null;
     }
 
+    fn driveSeedSilentResult(
+        self: *TraceState,
+        seed: *Trace,
+        result: irinterp.ExecResult,
+        proto: *const Proto,
+        regs: RegWindow,
+        safe_to_arm: bool,
+        materialization: ExitMaterialization,
+    ) ?ChainResult {
+        var linked_completed: usize = 0;
+        const seed_inner_pc: u32 = if (seed.instrs.len != 0 and seed.instrs[seed.instrs.len - 1].op == .link)
+            @intCast(seed.instrs[seed.instrs.len - 1].aux)
+        else
+            seed.anchor.pc;
+        var resume_pc: u32 = seed_inner_pc;
+        var hops: usize = 0;
+        const directive = self.drainSilentResult(
+            result,
+            .continuation_call,
+            proto,
+            &linked_completed,
+            &resume_pc,
+            &hops,
+            8,
+            safe_to_arm,
+        ) orelse return null;
+        if (materialization == .ordinary_header) self.prime_side_chain_follows +|= 1;
+        self.applyPendingDisarms();
+        self.drainPendingBridgeArm(safe_to_arm);
+        self.drainProvenanceArms(safe_to_arm);
+        return switch (directive) {
+            .run_continuation => |c| blk: {
+                const snt = self.nativeFor(c) orelse
+                    @panic("driveSeedSilentResult: run_continuation target has no native code");
+                break :blk self.driveBurstCore(c, .{
+                    .current_link = c,
+                    .linked_completed = linked_completed,
+                    .resume_pc = resume_pc,
+                    .hops = hops,
+                    .start_at_continuation = true,
+                }, null, snt, .native_only, proto, regs, safe_to_arm);
+            },
+            .run_inner_from => |d| blk: {
+                const snt = self.nativeFor(d) orelse
+                    @panic("driveSeedSilentResult: run_inner_from target has no native code");
+                break :blk self.driveBurstCore(d, .{
+                    .current_link = d,
+                    .linked_completed = linked_completed,
+                    .resume_pc = resume_pc,
+                    .hops = hops,
+                }, null, snt, .native_only, proto, regs, safe_to_arm);
+            },
+            .return_result => |cr| cr,
+            .break_burst => blk: {
+                if (linked_completed > 0)
+                    break :blk .{ .completed = linked_completed, .resume_pc = resume_pc };
+                self.onSideExit(seed, 0);
+                break :blk .{ .completed = 0, .resume_pc = resume_pc };
+            },
+        };
+    }
+
     /// The linked ping-pong burst (doc 15/16), extracted from `driveChain` (2.3c-1) so
     /// the dispatcher's M1 fused-`.link` consumer can enter it directly with an
     /// already-run prime-side ramp result -- WITHOUT re-running the ramp (which would
@@ -4906,6 +5078,216 @@ pub const TraceState = struct {
         prev_cum: usize,
         next_via_handoff: bool,
     };
+
+    const SilentPhases = struct { last_edge_phase: usize, next_phase: usize };
+
+    fn silentPhases(first_phase: usize, transitions: u64, len: usize) SilentPhases {
+        if (len == 0 or first_phase >= len or transitions == 0)
+            @panic("driveSilentBurst: invalid phase arithmetic inputs");
+        const len64: u64 = @intCast(len);
+        const first64: u64 = @intCast(first_phase);
+        return .{
+            .last_edge_phase = @intCast((first64 + transitions - 1) % len64),
+            .next_phase = @intCast((first64 + transitions) % len64),
+        };
+    }
+
+    fn silentEdgeFireCount(first_phase: usize, transitions: u64, len: usize, phase: usize) u64 {
+        if (len == 0 or first_phase >= len or phase >= len)
+            @panic("driveSilentBurst: invalid edge-fire phase");
+        const len64: u64 = @intCast(len);
+        const offset: u64 = @intCast((phase + len - first_phase) % len);
+        return transitions / len64 + @intFromBool(offset < transitions % len64);
+    }
+
+    /// Apply the exact accounting image produced by promoted epilogues, then
+    /// either replay an off-cycle reporting suffix or return the compile-time
+    /// resume contract of the edge where the silent budget stopped.
+    fn driveSilentBurst(
+        self: *TraceState,
+        result: irinterp.ExecResult,
+        proto: *const Proto,
+        linked_completed: *usize,
+        resume_pc: *u32,
+        hops: *usize,
+        max_hops: usize,
+        origin: ReplayOrigin,
+        safe_to_arm: bool,
+    ) LedgerReplay {
+        if (!self.config.silent_promotion_enabled)
+            @panic("driveSilentBurst: silent result while promotion is disabled");
+        if (result.silent_active == 0 or result.silent_transitions == 0 or result.silent_cell == 0)
+            @panic("driveSilentBurst: incomplete silent result contract");
+        // Preserve the same two-phase mutation boundary as replayLedger: a
+        // summary-triggered strike may request disarm/demotion, but promotion
+        // storage must remain live until this drain has consumed every cell and
+        // derived the terminal resume contract. The origin applies queued work
+        // immediately after this returns.
+        const seam_t0: u64 = if (self.config.coverage and self.replay_walk_depth == 0)
+            readCycles()
+        else
+            0;
+        self.replay_walk_depth += 1;
+        defer {
+            self.replay_walk_depth -= 1;
+            if (seam_t0 != 0) {
+                self.cycles_seam +|= cycleDelta(readCycles(), seam_t0);
+                self.seam_walks +|= 1;
+            }
+        }
+
+        var cycle_ptr: ?*PromotedCycle = null;
+        var first_phase: usize = 0;
+        for (self.promoted_cycles.items) |*cycle| {
+            for (cycle.metadata, 0..) |*metadata, phase| {
+                if (@intFromPtr(metadata) != result.silent_cell) continue;
+                if (cycle_ptr != null)
+                    @panic("driveSilentBurst: silent metadata cell is ambiguous");
+                cycle_ptr = cycle;
+                first_phase = phase;
+            }
+        }
+        const cycle = cycle_ptr orelse
+            @panic("driveSilentBurst: silent metadata cell has no live promotion");
+        if (cycle.edges.len == 0 or cycle.edges.len != cycle.summary.len or
+            cycle.edges.len != cycle.metadata.len)
+            @panic("driveSilentBurst: promoted cycle storage is inconsistent");
+        const phases = silentPhases(first_phase, result.silent_transitions, cycle.edges.len);
+
+        const active = if (self.region_context) |ctx| self.activeRegionFor(ctx.call_seq) else null;
+        if (active == null or !std.meta.eql(active.?, cycle.region_key))
+            @panic("driveSilentBurst: promoted cycle activation is not active");
+        const accum = self.region_profit.getPtr(cycle.region_key) orelse
+            @panic("driveSilentBurst: promoted cycle accumulator is missing");
+        if (!accum.frozen)
+            @panic("driveSilentBurst: promoted cycle accumulator is not frozen");
+
+        var region_work: u64 = 0;
+        var loop_done_count: u64 = 0;
+        for (cycle.edges, 0..) |edge, phase| {
+            const cell = cycle.summary[phase];
+            region_work +|= cell.region_work;
+            if (cell.selection_work > std.math.maxInt(usize))
+                @panic("driveSilentBurst: selection summary exceeds usize");
+            if (edge.arm_kind != .link_terminal) {
+                self.accountLedgerRowsBulk(
+                    edge.parent,
+                    @intCast(cell.selection_work),
+                    cell.qualifying_rows,
+                    true,
+                );
+            } else if (cell.selection_work != 0 or cell.qualifying_rows != 0) {
+                @panic("driveSilentBurst: link-terminal summary contains selection work");
+            }
+            const fires = silentEdgeFireCount(first_phase, result.silent_transitions, cycle.edges.len, phase);
+            // A rowless budget/barren return suppresses the final edge's jump to
+            // its successor. Its materialization/work still happened, but replay
+            // would not charge a fused/follow counter for that terminal row.
+            const followed = fires - @intFromBool(result.ledger_len == 0 and phase == phases.last_edge_phase);
+            switch (edge.arm_kind) {
+                .link_terminal => {
+                    self.native_link_exits +|= fires;
+                    self.native_link_follow_count +|= followed;
+                    self.link_follow_count +|= followed;
+                },
+                .loop_done_linked => {
+                    self.native_loopdone_link_fused +|= followed;
+                    loop_done_count +|= fires;
+                },
+                .sibling_handoff => self.sibling_handoff_fused +|= followed,
+                .ordinary_guard => self.native_source_link_fused +|= followed,
+                .region_bridge => @panic("driveSilentBurst: promoted cycle contains a bridge edge"),
+            }
+        }
+        if (region_work > std.math.maxInt(usize))
+            @panic("driveSilentBurst: region summary exceeds usize");
+        if (region_work != 0) self.creditRegionWork(cycle.region_key, accum, @intCast(region_work));
+        if (loop_done_count > std.math.maxInt(usize) - linked_completed.*)
+            linked_completed.* = std.math.maxInt(usize)
+        else
+            linked_completed.* += @intCast(loop_done_count);
+
+        const barren_exhausted = result.cur_zero_run >= result.barren_budget;
+        const budget_exhausted = result.silent_transitions >= result.silent_budget;
+        if (barren_exhausted) {
+            if (self.config.max_barren_run == 0)
+                @panic("driveSilentBurst: zero barren budget");
+            accum.barren_run = self.config.max_barren_run - 1;
+            self.noteBarrenConsumed(cycle.region_key, accum);
+            self.silent_barren_exhaustions +|= 1;
+        } else {
+            if (result.cur_zero_run > std.math.maxInt(u32))
+                @panic("driveSilentBurst: returned zero-run exceeds u32");
+            accum.barren_run = @intCast(result.cur_zero_run);
+        }
+
+        // Summary cells are a per-call mailbox. Native only adds; the driver
+        // clears after consuming the complete image.
+        @memset(cycle.summary, .{ .region_work = 0, .selection_work = 0, .qualifying_rows = 0 });
+        self.silent_bursts_drained +|= 1;
+        self.silent_transitions_total +|= result.silent_transitions;
+        self.silent_hops_total +|= result.silent_transitions;
+
+        const last_edge = cycle.edges[phases.last_edge_phase];
+        if (cycle.edges[phases.next_phase].parent != last_edge.child)
+            @panic("driveSilentBurst: next phase does not match the last edge successor");
+        if (result.silent_cum > std.math.maxInt(usize))
+            @panic("driveSilentBurst: silent cumulative count exceeds usize");
+        if (result.ledger_len > 0) {
+            if (result.ledger_len > irinterp.LEDGER_CAP)
+                @panic("driveSilentBurst: suffix ledger exceeds cap");
+            self.silent_suffix_drains +|= 1;
+            return self.replayLedgerSuffix(
+                self.ledger_scratch[0..result.ledger_len],
+                .{
+                    .cont = last_edge.child,
+                    .link_pc = last_edge.resume_pc,
+                    .prev_cum = @intCast(result.silent_cum),
+                    .next_via_handoff = last_edge.arm_kind == .sibling_handoff,
+                },
+                proto,
+                linked_completed,
+                resume_pc,
+                hops,
+                max_hops,
+                origin,
+                safe_to_arm,
+            );
+        }
+        if (!budget_exhausted and !barren_exhausted)
+            @panic("driveSilentBurst: rowless silent result exhausted no budget");
+        if (budget_exhausted) self.silent_budget_exhaustions +|= 1;
+        resume_pc.* = last_edge.resume_pc;
+        return .{ .return_result = .{
+            .completed = @intCast(result.silent_cum),
+            .resume_pc = last_edge.resume_pc,
+        } };
+    }
+
+    /// Universal single-branch drain used immediately after every native call.
+    fn drainSilentResult(
+        self: *TraceState,
+        result: irinterp.ExecResult,
+        origin: ReplayOrigin,
+        proto: *const Proto,
+        linked_completed: *usize,
+        resume_pc: *u32,
+        hops: *usize,
+        max_hops: usize,
+        safe_to_arm: bool,
+    ) ?LedgerReplay {
+        if (result.silent_active == 0) return null;
+        return self.driveSilentBurst(
+            result,
+            proto,
+            linked_completed,
+            resume_pc,
+            hops,
+            max_hops,
+            origin,
+            safe_to_arm,
+        );
+    }
 
     /// 2.3c-2c: the single authoritative drain of ONE native call's per-transition
     /// ledger. A fused native span (`C→I→C→…` chained under the shared frame) returns
@@ -5900,7 +6282,34 @@ pub const TraceState = struct {
                     // `runCapturingLedger` swap would flip mode 1→0 and stop committing the
                     // final inner iteration, corrupting coherent resume).
                     self.prepareNativeEntry(); // B-3a global sweep hook: burst call A
-                    iresult = int_native.runLinkedLoopDoneCapturing(regs, &self.ledger_scratch);
+                    iresult = int_native.runLinkedLoopDoneCapturing(regs, &self.ledger_scratch, self.silentStaging());
+                    if (self.drainSilentResult(
+                        iresult,
+                        .inner_call,
+                        proto,
+                        &linked_completed,
+                        &resume_pc,
+                        &hops,
+                        max_hops,
+                        safe_to_arm,
+                    )) |call_a_directive| {
+                        self.applyPendingDisarms();
+                        self.drainPendingBridgeArm(safe_to_arm);
+                        self.drainProvenanceArms(safe_to_arm);
+                        switch (call_a_directive) {
+                            .run_continuation => |c| {
+                                current_link = c;
+                                snt = self.nativeFor(c) orelse break :hop;
+                                break :call_a;
+                            },
+                            .run_inner_from => |d| {
+                                current_link = d;
+                                continue :hop;
+                            },
+                            .return_result => |cr| return cr,
+                            .break_burst => break :hop,
+                        }
+                    }
                     // 2c-E (call-A drain): `ledger_len > 1` means the inner FUSED forward
                     // through an armed slot — its loop-done → a continuation's
                     // `ordinary_entry` (the 2c-E arm), or an M1-armed mid-loop
@@ -6081,9 +6490,18 @@ pub const TraceState = struct {
             // unresolvable/mis-shaped fused id — the SAME hard invariant as before.
             if (tier == .native_only) {
                 self.prepareNativeEntry(); // B-3a global sweep hook: burst call B
-                var cresult = snt.runCapturingLedger(regs, &self.ledger_scratch);
+                var cresult = snt.runCapturingLedger(regs, &self.ledger_scratch, self.silentStaging());
                 while (true) {
-                    const call_b_directive = self.replayLedger(
+                    const call_b_directive = self.drainSilentResult(
+                        cresult,
+                        .continuation_call,
+                        proto,
+                        &linked_completed,
+                        &resume_pc,
+                        &hops,
+                        max_hops,
+                        safe_to_arm,
+                    ) orelse self.replayLedger(
                         self.ledger_scratch[0..cresult.ledger_len],
                         current_link,
                         inner_pc,
@@ -6110,7 +6528,7 @@ pub const TraceState = struct {
                             current_link = c;
                             snt = self.nativeFor(c) orelse break :hop;
                             self.prepareNativeEntry(); // call-B rerun is another entry
-                            cresult = snt.runCapturingLedger(regs, &self.ledger_scratch);
+                            cresult = snt.runCapturingLedger(regs, &self.ledger_scratch, self.silentStaging());
                         },
                         // Standalone `.link`: carry the `.link` DRIVER as the running
                         // link cursor and resume inner fresh next hop (the hop top
@@ -6199,6 +6617,24 @@ pub const TraceState = struct {
     /// (`prime_side_chain_follows`, the old `runLinkedBurst(.ordinary_header)` bump).
     /// `entries` must be the captured `ledger_scratch[0..ledger_len]`; the caller has
     /// already gated on `ran_native and ledger_len > 1 and exit_reason == .normal`.
+    fn noteDispatcherLedgerTerminal(
+        self: *TraceState,
+        entries: []const irinterp.LedgerEntry,
+        first_prev_cum: usize,
+        proto: *const Proto,
+    ) void {
+        self.dbgNoteBurst(entries);
+        if (entries.len == 0) return;
+        const term = entries[entries.len - 1];
+        const prev_cum = if (entries.len >= 2) entries[entries.len - 2].cum else first_prev_cum;
+        const term_local = term.cum -| prev_cum;
+        if (term.kind != .deopt or term.reason != .normal or term.outcome != .normal) return;
+        const owner = self.traceById(term.id) orelse return;
+        self.noteSiblingTerminal(owner, term.exit);
+        if (term.exit < owner.instrs.len and !isLoopDoneGuardIndex(owner, term.exit))
+            self.noteTakenExit(owner, term.exit, term_local, proto);
+    }
+
     pub fn driveDispatcherLedger(
         self: *TraceState,
         seed: *Trace,
@@ -6207,7 +6643,7 @@ pub const TraceState = struct {
         regs: RegWindow,
         safe_to_arm: bool,
     ) ChainResult {
-        self.dbgNoteBurst(entries); // Part-B terminal telemetry (jitdbg only)
+        self.noteDispatcherLedgerTerminal(entries, 0, proto);
         // Part S: charge the burst's terminal ordinary deopt, exactly once per burst.
         //
         // This has to be the DRIVER, not `replayLedger`: a walk can return a directive
@@ -6221,43 +6657,6 @@ pub const TraceState = struct {
         // trace cache. It was never the expense: what made the first cut of Part S a
         // 15% REGRESSION was the per-receipt `AutoHashMap` probe it fed (now a
         // three-scalar watch on the trace itself), not the resolve.
-        if (entries.len != 0) {
-            const term = entries[entries.len - 1];
-            // `term_local` is kept for hotexit accounting/telemetry; it is NOT a
-            // coherence condition for the sibling watch (see the corrected
-            // comment below — zero-progress was §S's discovery heuristic only).
-            const prev_cum = if (entries.len >= 2) entries[entries.len - 2].cum else 0;
-            const term_local = term.cum -| prev_cum;
-            if (term.kind == .deopt and term.reason == .normal and term.outcome == .normal) {
-                if (self.traceById(term.id)) |owner| {
-                    // Sibling-handoff watch fires on ANY normal deopt terminal,
-                    // regardless of local iteration count. Pre-effect branch
-                    // exits preserve the next iteration's anchor image after the
-                    // back-edge rotation (the flushed regs[] IS what a sibling's
-                    // anchor entry expects), so coherence holds at any count —
-                    // §S's original zero-progress condition was a discovery
-                    // heuristic, not a coherence requirement, and it wrongly
-                    // suppressed productive, naturally closing handoffs
-                    // (B-2b: the skip trace's own branch-guard terminal at
-                    // local=1 could never arm its closing S-arm).
-                    // siblingHandoffEligible still vets the exit shape.
-                    self.noteSiblingTerminal(owner, term.exit);
-                    // Hotexit (Pall's `trace_hotside`): EVERY normal deopt
-                    // terminal charges its exit — productive or not. The scalar
-                    // dispatch path charges at interp step 4, but a
-                    // `ledger_len > 1` burst returns through here BEFORE that
-                    // site — so an exit that only ever terminates fused bursts
-                    // would never accumulate hotness and its alternate path
-                    // could never tier up. Loop-done exits are continuation
-                    // territory, not side-trace candidates.
-                    if (term.exit < owner.instrs.len and
-                        !isLoopDoneGuardIndex(owner, term.exit))
-                    {
-                        self.noteTakenExit(owner, term.exit, term_local, proto);
-                    }
-                }
-            }
-        }
         const max_hops: usize = 8;
         var linked_completed: usize = 0;
         var resume_pc: u32 = seed.anchor.pc;
@@ -6280,6 +6679,7 @@ pub const TraceState = struct {
         self.applyProvenanceVerdicts(provenance_verdicts[0..provenance_verdicts_len]);
         self.drainPendingBridgeArm(safe_to_arm);
         self.drainProvenanceArms(safe_to_arm);
+        self.considerSilentPromotion(entries);
         switch (dispatcher_directive) {
             // M1 sub-case (a): the replayed ramp reached `.link`. `replayLedger` has
             // already charged both counters this burst owns — `native_link_exits` (its
@@ -6321,6 +6721,99 @@ pub const TraceState = struct {
             // Zero-progress / hop-budget terminal → penalty-neutral tail.
             .break_burst => return .{ .completed = linked_completed, .resume_pc = resume_pc },
         }
+    }
+
+    fn finishDispatcherDirective(
+        self: *TraceState,
+        directive: LedgerReplay,
+        linked_completed: usize,
+        resume_pc: u32,
+        hops: usize,
+        proto: *const Proto,
+        regs: RegWindow,
+        safe_to_arm: bool,
+    ) ChainResult {
+        return switch (directive) {
+            .run_inner_from => |d| blk: {
+                const snt = self.nativeFor(d) orelse
+                    @panic("silent drain: run_inner_from target has no native code");
+                break :blk self.driveBurstCore(d, .{
+                    .current_link = d,
+                    .linked_completed = linked_completed,
+                    .resume_pc = resume_pc,
+                    .hops = hops,
+                }, null, snt, .native_only, proto, regs, safe_to_arm);
+            },
+            .run_continuation => |c| blk: {
+                const snt = self.nativeFor(c) orelse
+                    @panic("silent drain: run_continuation target has no native code");
+                break :blk self.driveBurstCore(c, .{
+                    .current_link = c,
+                    .linked_completed = linked_completed,
+                    .resume_pc = resume_pc,
+                    .hops = hops,
+                    .start_at_continuation = true,
+                }, null, snt, .native_only, proto, regs, safe_to_arm);
+            },
+            .return_result => |cr| cr,
+            .break_burst => .{ .completed = linked_completed, .resume_pc = resume_pc },
+        };
+    }
+
+    /// Direct-dispatch origin adapter. The universal drain remains the only
+    /// `silent_active` consumer; this wrapper merely preserves the dispatcher's
+    /// established post-replay transaction order and directive integration.
+    pub fn driveDispatcherSilentResult(
+        self: *TraceState,
+        seed: *Trace,
+        result: irinterp.ExecResult,
+        proto: *const Proto,
+        regs: RegWindow,
+        safe_to_arm: bool,
+    ) ?ChainResult {
+        var linked_completed: usize = 0;
+        var resume_pc: u32 = seed.anchor.pc;
+        var hops: usize = 0;
+        const max_hops: usize = 8;
+        if (result.silent_active != 0 and result.ledger_len != 0) {
+            if (result.ledger_len > irinterp.LEDGER_CAP)
+                @panic("driveDispatcherSilentResult: suffix ledger exceeds cap");
+            if (result.silent_cum > std.math.maxInt(usize))
+                @panic("driveDispatcherSilentResult: silent cumulative count exceeds usize");
+            self.noteDispatcherLedgerTerminal(
+                self.ledger_scratch[0..result.ledger_len],
+                @intCast(result.silent_cum),
+                proto,
+            );
+        }
+        const directive = self.drainSilentResult(
+            result,
+            .dispatcher_root,
+            proto,
+            &linked_completed,
+            &resume_pc,
+            &hops,
+            max_hops,
+            safe_to_arm,
+        ) orelse return null;
+        var provenance_verdicts: [irinterp.LEDGER_CAP]ProvenanceVerdict = undefined;
+        const verdict_len = self.captureProvenanceVerdicts(
+            self.ledger_scratch[0..result.ledger_len],
+            &provenance_verdicts,
+        );
+        self.applyPendingDisarms();
+        self.applyProvenanceVerdicts(provenance_verdicts[0..verdict_len]);
+        self.drainPendingBridgeArm(safe_to_arm);
+        self.drainProvenanceArms(safe_to_arm);
+        return self.finishDispatcherDirective(
+            directive,
+            linked_completed,
+            resume_pc,
+            hops,
+            proto,
+            regs,
+            safe_to_arm,
+        );
     }
 
     /// 2c-E: the hop-0 deep-fusion drain. `driveChain`'s FIRST candidate run
@@ -7940,62 +8433,103 @@ pub const TraceState = struct {
         };
     }
 
-    fn rejectPromotion(self: *TraceState) ?[]PromotedEdge {
+    const PromotionRejectReason = enum {
+        bridge_member,
+        open_chain,
+        child_mismatch,
+        no_patch_point,
+        cap,
+        already_owned,
+    };
+
+    fn rejectPromotion(self: *TraceState, reason: PromotionRejectReason) ?[]PromotedEdge {
         self.silent_promotion_rejects +|= 1;
+        switch (reason) {
+            .bridge_member => self.silent_rejects.bridge_member +|= 1,
+            .open_chain => self.silent_rejects.open_chain +|= 1,
+            .child_mismatch => self.silent_rejects.child_mismatch +|= 1,
+            .no_patch_point => self.silent_rejects.no_patch_point +|= 1,
+            .cap => self.silent_rejects.cap +|= 1,
+            .already_owned => self.silent_rejects.already_owned +|= 1,
+        }
         return null;
     }
 
-    /// Detect a simple closed armed cycle rooted at one physical exit. V1 is
-    /// deliberately conservative when a successor trace has multiple armed
-    /// outgoing exits: the registry alone cannot prove which dynamic phase is
-    /// next, so ambiguous topology is rejected instead of guessed.
-    fn detectPromotableCycle(self: *TraceState, start_parent: *Trace, start_exit: u32) ?[]PromotedEdge {
-        var scratch: [PROMOTED_CYCLE_CAP]PromotedEdge = undefined;
-        var len: usize = 0;
-        var parent = start_parent;
-        var exit = start_exit;
+    fn rowPatchKind(kind: irinterp.LedgerKind) ?nativegen.ExitPatchKind {
+        return switch (kind) {
+            .deopt => .deopt,
+            .link_terminal => .link_terminal,
+            .loop_done_linked => .loop_done_linked,
+            .region_bridge, .prologue_fail => null,
+        };
+    }
 
-        while (true) {
-            if (len == PROMOTED_CYCLE_CAP) return self.rejectPromotion();
-            for (scratch[0..len]) |edge| {
-                if (edge.parent == parent and edge.exit == exit) return self.rejectPromotion();
+    /// Observation proposes one ordered physical-edge ring; the armed-link
+    /// registry proves every transition and the wraparound. A trace may have any
+    /// number of other armed exits: only the observed `(trace id, exit)` sites are
+    /// patched, and taking another exit naturally terminates silence into a suffix.
+    fn detectPromotableCycle(self: *TraceState, entries: []const irinterp.LedgerEntry) ?[]PromotedEdge {
+        if (entries.len < 2) return self.rejectPromotion(.open_chain);
+
+        var owners: [irinterp.LEDGER_CAP]*Trace = undefined;
+        if (entries.len > owners.len) return self.rejectPromotion(.cap);
+        for (entries, 0..) |row, i| {
+            owners[i] = self.traceById(row.id) orelse return self.rejectPromotion(.open_chain);
+        }
+
+        // The first repeated physical exit fixes both the observed ring start and
+        // its length. Everything outside that slice must still be a phase-correct
+        // prefix/suffix of the same ring; otherwise observation never established a
+        // single closed composition.
+        var ring_start: ?usize = null;
+        var repeat_at: ?usize = null;
+        outer: for (entries, 0..) |row, i| {
+            for (entries[0..i], 0..) |prior, j| {
+                if (prior.id == row.id and prior.exit == row.exit) {
+                    ring_start = j;
+                    repeat_at = i;
+                    break :outer;
+                }
             }
-            if (self.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = exit }))
-                return self.rejectPromotion();
+        }
+        const start = ring_start orelse return self.rejectPromotion(.open_chain);
+        const end = repeat_at.?;
+        const len = end - start;
+        if (len == 0) return self.rejectPromotion(.open_chain);
+        if (len > PROMOTED_CYCLE_CAP) return self.rejectPromotion(.cap);
+
+        for (entries, 0..) |row, i| {
+            const phase = (i + len - (start % len)) % len;
+            const expected = entries[start + phase];
+            if (row.id != expected.id or row.exit != expected.exit)
+                return self.rejectPromotion(.open_chain);
+        }
+
+        var scratch: [PROMOTED_CYCLE_CAP]PromotedEdge = undefined;
+        for (0..len) |phase| {
+            const row = entries[start + phase];
+            const parent = owners[start + phase];
+            const next_parent = owners[start + ((phase + 1) % len)];
+            if (self.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = row.exit }))
+                return self.rejectPromotion(.already_owned);
+            if (row.kind == .region_bridge) return self.rejectPromotion(.bridge_member);
+            const observed_kind = rowPatchKind(row.kind) orelse
+                return self.rejectPromotion(.no_patch_point);
 
             var found: ?NativeLink = null;
             for (self.armed_links.items) |link| {
-                if (link.parent != parent or link.slot_index != exit) continue;
-                if (found != null) return self.rejectPromotion();
+                if (link.parent != parent or link.slot_index != row.exit) continue;
+                if (found != null) return self.rejectPromotion(.child_mismatch);
                 found = link;
             }
-            const edge = self.promotedEdgeFromLink(found orelse return self.rejectPromotion()) orelse
-                return self.rejectPromotion();
-            scratch[len] = edge;
-            len += 1;
-            if (edge.child == start_parent) break;
-
-            var next: ?NativeLink = null;
-            for (self.armed_links.items) |link| {
-                if (link.parent != edge.child) continue;
-                if (next != null) return self.rejectPromotion();
-                next = link;
-            }
-            const next_link = next orelse return self.rejectPromotion();
-            parent = next_link.parent;
-            exit = next_link.slot_index;
+            const link = found orelse return self.rejectPromotion(.open_chain);
+            if (link.kind == .region_bridge) return self.rejectPromotion(.bridge_member);
+            if (link.child != next_parent) return self.rejectPromotion(.child_mismatch);
+            const edge = self.promotedEdgeFromLink(link) orelse
+                return self.rejectPromotion(.no_patch_point);
+            if (edge.kind != observed_kind) return self.rejectPromotion(.no_patch_point);
+            scratch[phase] = edge;
         }
-
-        // Returning to the member is only closure if the next registered phase is
-        // the exact starting physical exit.
-        var start_count: usize = 0;
-        for (self.armed_links.items) |link| {
-            if (link.parent == start_parent) {
-                start_count += 1;
-                if (link.slot_index != start_exit) return self.rejectPromotion();
-            }
-        }
-        if (start_count != 1) return self.rejectPromotion();
 
         var first: usize = 0;
         for (scratch[1..len], 1..) |edge, i| {
@@ -8003,7 +8537,7 @@ pub const TraceState = struct {
             if (edge.parent.id < best.parent.id or
                 (edge.parent.id == best.parent.id and edge.exit < best.exit)) first = i;
         }
-        const result = self.gpa.alloc(PromotedEdge, len) catch return self.rejectPromotion();
+        const result = self.gpa.alloc(PromotedEdge, len) catch return self.rejectPromotion(.cap);
         for (result, 0..) |*dst, i| dst.* = scratch[(first + i) % len];
         return result;
     }
@@ -8119,15 +8653,92 @@ pub const TraceState = struct {
         self.silent_promotions +|= 1;
     }
 
-    fn queueDemote(self: *TraceState, id: u32) void {
-        for (self.pending_demote.items) |pending| if (pending == id) return;
-        self.pending_demote.appendAssumeCapacity(id);
+    fn resetPromotionCandidate(self: *TraceState) void {
+        if (self.promotion_candidate.len != 0) self.gpa.free(self.promotion_candidate);
+        self.promotion_candidate = &.{};
+        self.promotion_candidate_run = 0;
+        self.promotion_candidate_region = null;
+    }
+
+    fn samePromotionEdges(a: []const PromotedEdge, b: []const PromotedEdge) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| {
+            if (x.parent.id != y.parent.id or x.exit != y.exit or x.child.id != y.child.id or
+                x.kind != y.kind or x.arm_kind != y.arm_kind or x.resume_pc != y.resume_pc)
+                return false;
+        }
+        return true;
+    }
+
+    /// Production promotion gate: only a full forced-yield ledger from a frozen
+    /// activation is evidence, and the same canonical physical edge sequence must
+    /// be detected on consecutive observations.
+    fn considerSilentPromotion(self: *TraceState, entries: []const irinterp.LedgerEntry) void {
+        if (!self.config.silent_promotion_enabled) return;
+        if (entries.len != irinterp.LEDGER_CAP or entries[entries.len - 1].outcome != .yielded) {
+            self.resetPromotionCandidate();
+            return;
+        }
+        const ctx = self.region_context orelse {
+            self.resetPromotionCandidate();
+            return;
+        };
+        const key = self.activeRegionFor(ctx.call_seq) orelse {
+            self.resetPromotionCandidate();
+            return;
+        };
+        const accum = self.region_profit.get(key) orelse {
+            self.resetPromotionCandidate();
+            return;
+        };
+        if (!accum.frozen) {
+            self.resetPromotionCandidate();
+            return;
+        }
+        const detected = self.detectPromotableCycle(entries) orelse {
+            self.resetPromotionCandidate();
+            return;
+        };
+        self.silent_promotion_candidates +|= 1;
+        if (self.promotion_candidate_region != null and
+            std.meta.eql(self.promotion_candidate_region.?, key) and
+            samePromotionEdges(self.promotion_candidate, detected))
+        {
+            self.gpa.free(detected);
+            self.promotion_candidate_run +|= 1;
+        } else {
+            self.resetPromotionCandidate();
+            self.promotion_candidate = detected;
+            self.promotion_candidate_run = 1;
+            self.promotion_candidate_region = key;
+        }
+        const threshold = @max(self.config.promote_after, 1);
+        if (self.promotion_candidate_run < threshold) return;
+        self.promoteCycle(self.promotion_candidate, key) catch {
+            self.silent_rejects.no_patch_point +|= 1;
+            self.silent_promotion_rejects +|= 1;
+            self.resetPromotionCandidate();
+            return;
+        };
+        self.resetPromotionCandidate();
+    }
+
+    const DemotionReason = enum { activation, region_close, slot_mutation, trace_invalidation, teardown };
+    const PendingDemotion = struct { id: u32, reason: DemotionReason };
+
+    fn queueDemote(self: *TraceState, id: u32, reason: DemotionReason) void {
+        for (self.pending_demote.items) |pending| if (pending.id == id) return;
+        self.pending_demote.appendAssumeCapacity(.{ .id = id, .reason = reason });
     }
 
     fn demoteCycle(self: *TraceState, idx: usize) void {
+        self.demoteCycleReason(idx, .trace_invalidation);
+    }
+
+    fn demoteCycleReason(self: *TraceState, idx: usize, reason: DemotionReason) void {
         const cycle = self.promoted_cycles.items[idx];
         if (self.replay_walk_depth > 0) {
-            self.queueDemote(cycle.id);
+            self.queueDemote(cycle.id, reason);
             return;
         }
         // Teardown order is the inverse publication order: code first, cells
@@ -8145,13 +8756,21 @@ pub const TraceState = struct {
         self.gpa.free(cycle.metadata);
         _ = self.promoted_cycles.swapRemove(idx);
         self.silent_demotions +|= 1;
+        switch (reason) {
+            .activation => self.silent_demotion_reasons.activation +|= 1,
+            .region_close => self.silent_demotion_reasons.region_close +|= 1,
+            .slot_mutation => self.silent_demotion_reasons.slot_mutation +|= 1,
+            .trace_invalidation => self.silent_demotion_reasons.trace_invalidation +|= 1,
+            .teardown => self.silent_demotion_reasons.teardown +|= 1,
+        }
+        self.resetPromotionCandidate();
     }
 
     fn demoteCyclesTouching(self: *TraceState, parent: *Trace, exit: u32) void {
         const id = self.promoted_exit_owners.get(.{ .trace_id = parent.id, .exit_instr = exit }) orelse return;
         for (self.promoted_cycles.items, 0..) |cycle, i| {
             if (cycle.id == id) {
-                self.demoteCycle(i);
+                self.demoteCycleReason(i, .slot_mutation);
                 return;
             }
         }
@@ -8159,6 +8778,7 @@ pub const TraceState = struct {
     }
 
     fn demoteCyclesTouchingTrace(self: *TraceState, trace: *Trace) void {
+        self.resetPromotionCandidate();
         var i = self.promoted_cycles.items.len;
         while (i > 0) {
             i -= 1;
@@ -8169,7 +8789,7 @@ pub const TraceState = struct {
                     break;
                 }
             }
-            if (touches) self.demoteCycle(i);
+            if (touches) self.demoteCycleReason(i, .trace_invalidation);
         }
     }
 
@@ -8177,7 +8797,7 @@ pub const TraceState = struct {
         var i = self.promoted_cycles.items.len;
         while (i > 0) {
             i -= 1;
-            self.demoteCycle(i);
+            self.demoteCycleReason(i, .teardown);
         }
     }
 
@@ -8187,6 +8807,10 @@ pub const TraceState = struct {
     /// Phase 1 of the sole physical slot-write funnel. B-3a validates ownership and
     /// bounds; B-3b will demote a promotion owning this physical exit here.
     fn prepareSlotMutation(self: *TraceState, parent: *Trace, exit: u32, reason: SlotMutationReason) !PreparedSlotMutation {
+        switch (reason) {
+            .retire, .disarm_all, .disarm_one => self.resetPromotionCandidate(),
+            .arm, .rearm => {}, // caller distinguishes identical convergence re-arms
+        }
         const compiled = switch (parent.native) {
             .compiled => |*c| c,
             else => return error.NativeTraceUnavailable,
@@ -8195,7 +8819,6 @@ pub const TraceState = struct {
         self.demoteCyclesTouching(parent, exit);
         if (self.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = exit }))
             return error.DemotionDeferred;
-        _ = reason;
         return .{ .compiled = compiled, .exit = exit };
     }
 
@@ -8293,6 +8916,11 @@ pub const TraceState = struct {
         // it — the first match is the only match.
         for (self.armed_links.items) |*l| {
             if (l.parent == parent and l.slot_index == slot_index) {
+                // Convergence sites re-publish an identical relation on every
+                // terminal observation. Keep that from breaking the consecutive
+                // detection streak; a changed relation invalidates the candidate.
+                if (l.child != child or l.kind != kind or c.slots[slot_index] != target)
+                    self.resetPromotionCandidate();
                 const prepared = self.prepareSlotMutation(parent, slot_index, .rearm) catch return false;
                 // A re-arm can displace a provenance-published sibling arm with
                 // a different kind/child — re-open publication so the drain can
@@ -8322,6 +8950,7 @@ pub const TraceState = struct {
         }
         // Fresh slot: append the record BEFORE writing the slot, so a failed append
         // leaves the slot at its prior `shared_exit` value with no dangling record.
+        self.resetPromotionCandidate();
         const prepared = self.prepareSlotMutation(parent, slot_index, .arm) catch return false;
         try self.armed_links.append(self.gpa, .{ .parent = parent, .slot_index = slot_index, .child = child, .kind = kind });
         if (self.armed_links.items.len > self.native_link_peak) self.native_link_peak = self.armed_links.items.len;
@@ -13358,6 +13987,10 @@ fn expectB3Patched(edge: PromotedEdge, promoted: bool) !void {
     try testing.expectEqual(&compiled.slots[edge.exit], metadata.slot);
 }
 
+fn b3ObservedRow(t: *Trace, exit: u32, kind: irinterp.LedgerKind) irinterp.LedgerEntry {
+    return .{ .cum = 0, .id = t.id, .exit = exit, .reason = .normal, .kind = kind, .outcome = .normal };
+}
+
 test "B-3b.2 detector accepts closed 2/3-edge cycles and canonicalizes every entry phase" {
     if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -13370,9 +14003,19 @@ test "B-3b.2 detector accepts closed 2/3-edge cycles and canonicalizes every ent
     const b = try makeB3LinkTrace(gpa, &state, &proto, 10, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
-    const from_a = state.detectPromotableCycle(a, 0).?;
+    const observed_a = [_]irinterp.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const observed_b = [_]irinterp.LedgerEntry{
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+    };
+    const from_a = state.detectPromotableCycle(&observed_a).?;
     defer gpa.free(from_a);
-    const from_b = state.detectPromotableCycle(b, 0).?;
+    const from_b = state.detectPromotableCycle(&observed_b).?;
     defer gpa.free(from_b);
     try testing.expectEqual(@as(usize, 2), from_a.len);
     try testing.expectEqual(@as(u32, 10), from_a[0].parent.id);
@@ -13388,13 +14031,37 @@ test "B-3b.2 detector accepts closed 2/3-edge cycles and canonicalizes every ent
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try testing.expect(try state.armNativeLink(b, 0, c, .link_terminal));
     try testing.expect(try state.armNativeLink(c, 0, a, .link_terminal));
-    const three_a = state.detectPromotableCycle(a, 0).?;
+    const observed_three_a = [_]irinterp.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(c, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const observed_three_c = [_]irinterp.LedgerEntry{
+        b3ObservedRow(c, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(c, 0, .link_terminal),
+    };
+    const three_a = state.detectPromotableCycle(&observed_three_a).?;
     defer gpa.free(three_a);
-    const three_c = state.detectPromotableCycle(c, 0).?;
+    const three_c = state.detectPromotableCycle(&observed_three_c).?;
     defer gpa.free(three_c);
     try testing.expectEqual(@as(usize, 3), three_a.len);
     try testing.expectEqual(@as(u32, 10), three_a[0].parent.id);
     for (three_a, three_c) |ea, ec| try testing.expectEqual(ea.parent, ec.parent);
+
+    // A second armed outgoing exit on a member is irrelevant: only the
+    // observed physical exit is part of the proposed ring.
+    try state.armed_links.append(gpa, .{
+        .parent = a,
+        .slot_index = 1,
+        .child = c,
+        .kind = .ordinary_guard,
+    });
+    const multi_armed = state.detectPromotableCycle(&observed_three_a).?;
+    gpa.free(multi_armed);
+    _ = state.armed_links.pop();
 }
 
 test "B-3b.2 detector rejects bridge, open, missing patch, over-cap, and owned exit" {
@@ -13407,21 +14074,34 @@ test "B-3b.2 detector rejects bridge, open, missing patch, over-cap, and owned e
     const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
     const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
-    try testing.expect(state.detectPromotableCycle(a, 0) == null); // open
+    const open = [_]irinterp.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+    };
+    const closed = [_]irinterp.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    try testing.expect(state.detectPromotableCycle(&open) == null); // no repeat
     try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
     state.armed_links.items[0].kind = .region_bridge;
-    try testing.expect(state.detectPromotableCycle(a, 0) == null);
+    try testing.expect(state.detectPromotableCycle(&closed) == null);
     state.armed_links.items[0].kind = .link_terminal;
     const saved_patches = a.native.compiled.exit_patches;
     a.native.compiled.exit_patches = &.{};
-    try testing.expect(state.detectPromotableCycle(a, 0) == null);
+    try testing.expect(state.detectPromotableCycle(&closed) == null);
     a.native.compiled.exit_patches = saved_patches;
+    const saved_child = state.armed_links.items[0].child;
+    state.armed_links.items[0].child = a;
+    try testing.expect(state.detectPromotableCycle(&closed) == null);
+    state.armed_links.items[0].child = saved_child;
 
-    const edges = state.detectPromotableCycle(a, 0).?;
+    const edges = state.detectPromotableCycle(&closed).?;
     defer gpa.free(edges);
     const key: RegionKey = .{ .region_id = @enumFromInt(1), .activation = 9 };
     try state.promoteCycle(edges, key);
-    try testing.expect(state.detectPromotableCycle(a, 0) == null); // owned
+    try testing.expect(state.detectPromotableCycle(&closed) == null); // owned
     state.demoteAllCycles();
     state.disarmAllLinks();
 
@@ -13440,7 +14120,16 @@ test "B-3b.2 detector rejects bridge, open, missing patch, over-cap, and owned e
         long[(i + 1) % long.len],
         .link_terminal,
     ));
-    try testing.expect(state.detectPromotableCycle(long[0], 0) == null);
+    var observed_long: [long.len + 1]irinterp.LedgerEntry = undefined;
+    for (long, 0..) |t, i| observed_long[i] = b3ObservedRow(t, 0, .link_terminal);
+    observed_long[long.len] = b3ObservedRow(long[0], 0, .link_terminal);
+    try testing.expect(state.detectPromotableCycle(&observed_long) == null);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.bridge_member);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.open_chain);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.no_patch_point);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.child_mismatch);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.cap);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.already_owned);
 }
 
 test "B-3b.2 promotion publishes metadata and patches mixed deopt/NOP exits; demotion restores exact bytes" {
@@ -13457,7 +14146,13 @@ test "B-3b.2 promotion publishes metadata and patches mixed deopt/NOP exits; dem
     try testing.expect(try state.armNativeLink(guard, 5, done, .ordinary_guard));
     try testing.expect(try state.armNativeLink(done, 5, link, .loop_done_linked));
     try testing.expect(try state.armNativeLink(link, 0, guard, .link_terminal));
-    const edges = state.detectPromotableCycle(guard, 5).?;
+    const observed = [_]irinterp.LedgerEntry{
+        b3ObservedRow(guard, 5, .deopt),
+        b3ObservedRow(done, 5, .loop_done_linked),
+        b3ObservedRow(link, 0, .link_terminal),
+        b3ObservedRow(guard, 5, .deopt),
+    };
+    const edges = state.detectPromotableCycle(&observed).?;
     defer gpa.free(edges);
     const key: RegionKey = .{ .region_id = @enumFromInt(2), .activation = 11 };
     try state.promoteCycle(edges, key);
@@ -13480,7 +14175,12 @@ test "B-3b.2 slot mutation and closeRegion demote before invalidation" {
     const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
-    const edges = state.detectPromotableCycle(a, 0).?;
+    const observed = [_]irinterp.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const edges = state.detectPromotableCycle(&observed).?;
     defer gpa.free(edges);
     const key: RegionKey = .{ .region_id = @enumFromInt(3), .activation = 12 };
     try state.promoteCycle(edges, key);
@@ -13505,7 +14205,12 @@ test "B-3b.2 prepareNativeEntry retains same activation and demotes a different 
     const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
-    const edges = state.detectPromotableCycle(a, 0).?;
+    const observed = [_]irinterp.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const edges = state.detectPromotableCycle(&observed).?;
     defer gpa.free(edges);
     const same: RegionKey = .{ .region_id = @enumFromInt(4), .activation = 20 };
     const other: RegionKey = .{ .region_id = @enumFromInt(5), .activation = 21 };
@@ -13532,7 +14237,12 @@ test "B-3b.2 replay walk queues demotion and applies it before pending disarms" 
     const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
-    const edges = state.detectPromotableCycle(a, 0).?;
+    const observed = [_]irinterp.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const edges = state.detectPromotableCycle(&observed).?;
     defer gpa.free(edges);
     const key: RegionKey = .{ .region_id = @enumFromInt(6), .activation = 30 };
     try state.promoteCycle(edges, key);
@@ -13547,6 +14257,229 @@ test "B-3b.2 replay walk queues demotion and applies it before pending disarms" 
     try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
     for (edges) |edge| try expectB3Patched(edge, false);
+}
+
+test "B-3b.3 phase arithmetic pins one transition and wraparound" {
+    const one = TraceState.silentPhases(2, 1, 3);
+    try testing.expectEqual(@as(usize, 2), one.last_edge_phase);
+    try testing.expectEqual(@as(usize, 0), one.next_phase);
+    try testing.expectEqual(@as(u64, 1), TraceState.silentEdgeFireCount(2, 1, 3, 2));
+    try testing.expectEqual(@as(u64, 0), TraceState.silentEdgeFireCount(2, 1, 3, 0));
+
+    const wrap = TraceState.silentPhases(2, 5, 3);
+    try testing.expectEqual(@as(usize, 0), wrap.last_edge_phase);
+    try testing.expectEqual(@as(usize, 1), wrap.next_phase);
+    try testing.expectEqual(@as(u64, 2), TraceState.silentEdgeFireCount(2, 5, 3, 2));
+    try testing.expectEqual(@as(u64, 2), TraceState.silentEdgeFireCount(2, 5, 3, 0));
+    try testing.expectEqual(@as(u64, 1), TraceState.silentEdgeFireCount(2, 5, 3, 1));
+}
+
+test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.config.min_useful = 1;
+    state.config.silent_budget = irinterp.LEDGER_CAP;
+    state.config.max_barren_run = 64;
+    state.config.promote_after = 2;
+
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    code[1] = Instr.op0(.for_loop);
+    const proto = Proto{ .id = 1710, .code = &code, .name = "b3-silent-e2e", .num_registers = 2 };
+    const cont = try makeB3LinkTrace(gpa, &state, &proto, 1, 2, 1);
+    const inner = try makeB3LoopDoneTrace(gpa, &state, &proto, 2, 1);
+    try testing.expect(try state.armNativeLink(cont, 0, inner, .link_terminal));
+    try testing.expect(try state.armNativeLink(inner, 5, cont, .loop_done_linked));
+
+    const rid: RegionId = @enumFromInt(1710);
+    const key: RegionKey = .{ .region_id = rid, .activation = 77 };
+    try state.region_defs.put(gpa, rid, .{
+        .members = try gpa.alloc(StructuralEdgeId, 0),
+        .member_points = try gpa.dupe(ProgramPoint, &.{
+            .{ .proto_id = proto.id, .source_pc = inner.anchor.pc },
+            .{ .proto_id = proto.id, .source_pc = cont.anchor.pc },
+        }),
+        .owner = cont.anchor,
+        .classifier = .{ .kind = .cross_trace_cycle, .member_count = 2 },
+        .armable = true,
+        .bridges = try gpa.alloc(RegionBridgeDef, 0),
+    });
+    const initial_accum = RegionAccum{
+        .root_frame_depth = 1,
+        .root_call_seq = key.activation,
+        .useful_window_seen = true,
+        .useful_streak = state.config.freeze_windows,
+        .frozen = true,
+    };
+    try state.region_profit.put(gpa, key, initial_accum);
+    state.region_context = .{ .depth = 1, .call_seq = key.activation };
+
+    // The unpromoted oracle executes the same armed C↔I workload until the
+    // reporting ledger cap forces a yield, then replays every row normally.
+    var tags = [_]u8{ @intFromEnum(value.Tag.int), @intFromEnum(value.Tag.int) };
+    var payloads = [_]u64{ @bitCast(@as(i64, 2)), @bitCast(@as(i64, 1)) };
+    const regs = RegWindow.of(&tags, &payloads);
+    const ordinary = cont.native.compiled.runCapturingLedger(
+        regs,
+        &state.ledger_scratch,
+        state.silentStaging(),
+    );
+    try testing.expectEqual(@as(usize, irinterp.LEDGER_CAP), ordinary.ledger_len);
+    try testing.expectEqual(irinterp.LedgerOutcome.yielded, state.ledger_scratch[ordinary.ledger_len - 1].outcome);
+    const evidence = state.ledger_scratch;
+    var ordinary_completed: usize = 0;
+    var ordinary_resume: u32 = cont.anchor.pc;
+    var ordinary_hops: usize = 0;
+    _ = state.replayLedger(
+        state.ledger_scratch[0..ordinary.ledger_len],
+        cont,
+        1,
+        &proto,
+        &ordinary_completed,
+        &ordinary_resume,
+        &ordinary_hops,
+        8,
+        .continuation_call,
+        true,
+    );
+    state.applyPendingDisarms();
+    state.drainPendingBridgeArm(true);
+    state.drainProvenanceArms(true);
+    const ordinary_accum = state.region_profit.get(key).?;
+    const ordinary_cont_hits = cont.hit_count;
+    const ordinary_inner_hits = inner.hit_count;
+    const ordinary_link_exits = state.native_link_exits;
+    const ordinary_link_follows = state.native_link_follow_count;
+    const ordinary_all_follows = state.link_follow_count;
+    const ordinary_loopdone_fused = state.native_loopdone_link_fused;
+    const ordinary_flushes = state.region_profit_flushes;
+    const ordinary_flushed_work = state.region_profit_flushed_work;
+
+    // Reset only fields the oracle replay moved, then require two identical
+    // successful detections before the production promotion gate publishes.
+    state.region_profit.getPtr(key).?.* = initial_accum;
+    cont.hit_count = 0;
+    inner.hit_count = 0;
+    state.native_link_exits = 0;
+    state.native_link_follow_count = 0;
+    state.link_follow_count = 0;
+    state.native_loopdone_link_fused = 0;
+    state.region_profit_flushes = 0;
+    state.region_profit_flushed_work = 0;
+    state.config.silent_promotion_enabled = true;
+    _ = state.driveDispatcherLedger(cont, &evidence, &proto, regs, true);
+    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+    _ = state.driveDispatcherLedger(cont, &evidence, &proto, regs, true);
+    try testing.expectEqual(@as(usize, 1), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(u64, 2), state.silent_promotion_candidates);
+
+    // Detection replays are evidence, not part of the differential workload.
+    // Reset the fields they moved before executing the promoted comparison span.
+    state.region_profit.getPtr(key).?.* = initial_accum;
+    cont.hit_count = 0;
+    inner.hit_count = 0;
+    state.native_link_exits = 0;
+    state.native_link_follow_count = 0;
+    state.link_follow_count = 0;
+    state.native_loopdone_link_fused = 0;
+    state.region_profit_flushes = 0;
+    state.region_profit_flushed_work = 0;
+
+    state.prepareNativeEntry();
+    const silent = cont.native.compiled.runCapturingLedger(
+        regs,
+        &state.ledger_scratch,
+        state.silentStaging(),
+    );
+    try testing.expectEqual(@as(u64, 1), silent.silent_active);
+    try testing.expect(silent.silent_transitions > 1);
+    try testing.expectEqual(@as(usize, 0), silent.ledger_len);
+    var silent_completed: usize = 0;
+    var silent_resume: u32 = cont.anchor.pc;
+    var silent_hops: usize = 0;
+    const silent_dir = state.drainSilentResult(
+        silent,
+        .continuation_call,
+        &proto,
+        &silent_completed,
+        &silent_resume,
+        &silent_hops,
+        8,
+        true,
+    ) orelse return error.TestUnexpectedResult;
+    try testing.expect(silent_dir == .return_result);
+
+    // Differential equivalence over every deterministic field replayLedger's
+    // row accounting moved. Coverage/TSC is deliberately disabled here: one
+    // native span cannot be attributed per member in the promoted mode.
+    const silent_accum = state.region_profit.get(key).?;
+    try testing.expectEqual(ordinary_accum.outer_traversals, silent_accum.outer_traversals);
+    try testing.expectEqual(ordinary_accum.window_base, silent_accum.window_base);
+    try testing.expectEqual(ordinary_accum.useful_window_seen, silent_accum.useful_window_seen);
+    try testing.expectEqual(ordinary_accum.barren_run, silent_accum.barren_run);
+    try testing.expectEqual(ordinary_accum.useful_streak, silent_accum.useful_streak);
+    try testing.expectEqual(ordinary_accum.frozen, silent_accum.frozen);
+    try testing.expectEqual(ordinary_cont_hits, cont.hit_count);
+    try testing.expectEqual(ordinary_inner_hits, inner.hit_count);
+    try testing.expectEqual(ordinary_link_exits, state.native_link_exits);
+    try testing.expectEqual(ordinary_link_follows, state.native_link_follow_count);
+    try testing.expectEqual(ordinary_all_follows, state.link_follow_count);
+    try testing.expectEqual(ordinary_loopdone_fused, state.native_loopdone_link_fused);
+    try testing.expectEqual(ordinary_flushes, state.region_profit_flushes);
+    try testing.expectEqual(ordinary_flushed_work, state.region_profit_flushed_work);
+
+    // Synthetic off-cycle reporting suffix: one silent C.link transition enters
+    // inner, then inner reports an ordinary guard with cumulative rbx advanced by
+    // two. The suffix must subtract silent_cum=7 and account exactly local=2.
+    const cycle = &state.promoted_cycles.items[0];
+    var cont_phase: usize = 0;
+    for (cycle.edges, 0..) |edge, phase| if (edge.parent == cont) {
+        cont_phase = phase;
+        break;
+    };
+    state.ledger_scratch[0] = .{
+        .cum = 9,
+        .id = inner.id,
+        .exit = 2,
+        .reason = .normal,
+        .kind = .deopt,
+        .outcome = .normal,
+    };
+    const suffix_result = irinterp.ExecResult{
+        .completed = 9,
+        .exit_instr = 2,
+        .final_trace_id = inner.id,
+        .local_completed = 2,
+        .ledger_len = 1,
+        .silent_active = 1,
+        .silent_transitions = 1,
+        .silent_budget = state.config.silent_budget,
+        .barren_budget = state.config.max_barren_run,
+        .silent_cell = @intFromPtr(&cycle.metadata[cont_phase]),
+        .cur_zero_run = 1,
+        .silent_cum = 7,
+    };
+    var suffix_completed: usize = 0;
+    var suffix_resume: u32 = 0;
+    var suffix_hops: usize = 0;
+    const suffix_dir = state.drainSilentResult(
+        suffix_result,
+        .continuation_call,
+        &proto,
+        &suffix_completed,
+        &suffix_resume,
+        &suffix_hops,
+        8,
+        true,
+    ) orelse return error.TestUnexpectedResult;
+    const suffix_chain = switch (suffix_dir) {
+        .return_result => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(@as(usize, 2), suffix_chain.completed);
+    try testing.expectEqual(@as(u32, 1), suffix_chain.resume_pc);
+    try testing.expectEqual(@as(u64, 1), state.silent_suffix_drains);
 }
 
 test "armNativeLink: P-C option (b) invariant — arm kind matches slot guard shape" {
