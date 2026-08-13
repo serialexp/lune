@@ -5286,6 +5286,35 @@ test "nested-loop: a linked 2-deep numeric-for nest is byte-identical across all
     );
 }
 
+test "nested-loop link: a float for_prep hand-off uses (init−step)+step, not init" {
+    // Regression for the codex-flagged BLOCKER in `recForPrepLink`: the link
+    // hand-off's first-iteration bounds test and published entry state must be
+    // `(init−step)+step` — computed with the SAME float rounding tier-0's
+    // `for_prep` + `for_loop` pair applies — not `init` (the "(init−step)+step =
+    // init" shortcut only holds for ints). The inner loop gets hot with a benign
+    // float step (1.0), so the continuation records a link with float-typed
+    // control guards; the LAST outer iteration re-enters that link with
+    // `step = 1e16`, where `(1.0 − 1e16) + 1e16 = 0.0 ≠ 1.0`. tier-0 runs that
+    // inner loop once with `j = 0.0`; the pre-fix trace handed the inner root
+    // `j = 1.0` and printed 18136 instead of 18135. The step comes from an array
+    // (not a branch) so no branch guard side-exits before the link is reached.
+    try expectProgram(
+        \\local steps = {}
+        \\for i = 1, 40 do steps[i] = 1.0 end
+        \\steps[40] = 1e16
+        \\local s = 0
+        \\for i = 1, 40 do
+        \\  for j = 1.0, 30.0, steps[i] do
+        \\    s = s + j
+        \\  end
+        \\end
+        \\print(s)
+        \\
+    ,
+        "18135\n",
+    );
+}
+
 // --- hash-field (string-keyed) tracing (8-mode parity) -----------------------
 // `obj.field` get/set on the hash part records a trace via href/guard_hash/hload/
 // hstore (doc 11). These prove the recorded trace is byte-identical to tier-0

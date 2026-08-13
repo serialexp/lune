@@ -3190,6 +3190,15 @@ pub const TraceState = struct {
         }
 
         const key: RegionKey = .{ .region_id = id, .activation = ctx.call_seq };
+        // Codex-flagged BLOCKER: the pinned stdlib's `getOrPut` calls
+        // `growIfNeeded(1)` BEFORE the lookup, so it can reallocate the map even
+        // when `found_existing` — and the `found_existing` path below skips
+        // `refreshObserverFast`, which is what normally invalidates `act_cache`.
+        // A cached `*RegionAccum` would then dangle into freed map storage while
+        // its generation key still matches. Invalidate unconditionally before any
+        // potentially-growing `getOrPut`.
+        self.act_cache_gen = 0;
+        self.act_cache = null;
         const gop = self.region_profit.getOrPut(self.gpa, key) catch return null;
         if (!gop.found_existing) gop.value_ptr.* = .{
             .root_frame_depth = ctx.depth,
@@ -3637,10 +3646,15 @@ pub const TraceState = struct {
         if (n != 0) while (accum.outer_traversals - accum.window_base >= n) {
             // Freeze-after-qualify: a FROZEN activation's full window is a useful
             // verdict whose only effects in `flushRegionWindow` are two hash-map
-            // removes of keys the qualification amnesty already cleared — pure
-            // no-ops paid per `min_useful` traversals. Keep the counters (they are
-            // telemetry the stats block reports) and skip the map touches.
-            if (accum.frozen) {
+            // removes of the owner's `penalty`/`gate` entries. Those can be
+            // recreated AFTER qualification (recording aborts, commit failures,
+            // unconsumed receipts on the owner anchor), and a useful window is
+            // exactly the recovery signal that clears them — so the shortcut is
+            // only sound when both maps are EMPTY (codex-flagged MAJOR: skipping
+            // unconditionally could strand a demonstrably useful region behind a
+            // re-created gate). Empty maps are the steady-state norm; whenever
+            // anything is gated anywhere, pay the two removes.
+            if (accum.frozen and self.penalty.count() == 0 and self.gate.count() == 0) {
                 self.region_profit_flushes +|= 1;
                 self.region_profit_flushed_work +|= n;
                 accum.useful_streak +|= 1;
@@ -9298,10 +9312,19 @@ pub const TraceState = struct {
 
         // First-iteration bounds test, mirroring `recForLoop`'s compare (incl. the
         // float-limit → int specialization so a mixed int/float compare stays lowerable
-        // and byte-identical to tier-0's `idx <= limit`). tier-0 tests `(init−step)+step
-        // = init` against `limit`, so we compare `init` directly. On failure the inner
-        // loop runs zero times → side-exit to tier-0 instead of entering the inner root.
+        // and byte-identical to tier-0's `idx <= limit`). tier-0 computes `(init−step)
+        // +step` and compares THAT — which is NOT always `init` for floats (e.g.
+        // `init=1.0, step=1e16` → tier-0's first index is `0.0`, not `1.0`), so the
+        // recorded IR must do the same `sub` then `add` and both compare and publish
+        // the result. (An earlier revision compared/published `init` directly on the
+        // "(init−step)+step = init" shortcut — codex-flagged BLOCKER: a float link
+        // handed the inner root a first index tier-0 never produced. Ints wrap back
+        // exactly, so this only ever differed for floats.) On failure the inner loop
+        // runs zero times → side-exit to tier-0 instead of entering the inner root.
         const all_int = vinit.isInt() and vstep.isInt();
+        const vpre = arith.sub(vinit, vstep) catch return self.abort(.bad_type);
+        const rpre = try self.emit(.{ .op = .sub, .a = rinit, .b = rstep, .ty = arithResultType(.sub, vinit, vstep) });
+        const rfirst = try self.emit(.{ .op = .add, .a = rpre, .b = rstep, .ty = arithResultType(.add, vpre, vstep) });
         const rlimit_cmp = if (all_int and vlimit.isFloat() and value.floatAsExactInt(vlimit.asFloat()) != null) blk: {
             const iof = try self.emit(.{ .op = .int_of_float, .a = rlimit, .ty = .int });
             self.stampProv(iof, .limit_int, .a1, .neutral);
@@ -9309,16 +9332,17 @@ pub const TraceState = struct {
         } else rlimit;
         const ascending = vstep.toFloat() >= 0;
         const cmp = if (ascending)
-            try self.emit(.{ .op = .le, .a = rinit, .b = rlimit_cmp, .ty = .boolean })
+            try self.emit(.{ .op = .le, .a = rfirst, .b = rlimit_cmp, .ty = .boolean })
         else
-            try self.emit(.{ .op = .le, .a = rlimit_cmp, .b = rinit, .ty = .boolean });
+            try self.emit(.{ .op = .le, .a = rlimit_cmp, .b = rfirst, .ty = .boolean });
         self.stampProv(try self.emit(.{ .op = .guard_true, .a = cmp }), .loop_done, .none, .neutral);
 
-        // Publish the inner root's entry state: the control index `R[a]` and the visible
-        // loop var `R[a+3]` both start at `init`. (limit `R[a+1]` / step `R[a+2]` are
-        // untouched by the loop and already flow through the exit snapshot.)
-        self.setReg(a, rinit);
-        self.setReg(a + 3, rinit);
+        // Publish the inner root's entry state: the control index `R[a]` and the
+        // visible loop var `R[a+3]` both hold tier-0's first index `(init−step)+step`.
+        // (limit `R[a+1]` / step `R[a+2]` are untouched by the loop and flow through
+        // the exit snapshot.)
+        self.setReg(a, rfirst);
+        self.setReg(a + 3, rfirst);
 
         // Close with the `.link` terminator (commit reads `link_target`). closeTrace
         // commits + clears `active`; a build failure gates the anchor, like any abort.
