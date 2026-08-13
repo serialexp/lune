@@ -1301,6 +1301,10 @@ const region_bridge_arming_enabled = true;
 /// nsieve before the branch-source rule).
 const sibling_handoff_arming_enabled = true;
 
+/// Part B-2a (doc 17 §B.5): inert provenance-edge substrate. B-2b flips this
+/// when edge creation, draining, replay accounting, and cycle retirement land.
+const provenance_arming_enabled = false;
+
 /// A loop-carried writeback: at the back-edge, tier-0 register `slot` holds the
 /// value produced by IR `ref`. The set of these is the trace's exit snapshot —
 /// what a future executor copies back into the register file each iteration.
@@ -1946,6 +1950,17 @@ pub const NativeLink = struct {
     bridge_edge_gen: u32 = 0,
 };
 
+/// Part B-2a (doc 17 §B.5): the persistent logical relation between the
+/// side exit that caused a side trace to be recorded and that committed child.
+/// The physical sibling-handoff arm is disposable; this relation survives it.
+/// B-2a stores and retires these only — production creation starts in B-2b.
+pub const ProvenanceEdge = struct {
+    parent_id: u32,
+    exit_instr: u32,
+    child_id: u32,
+    strikes: u8 = 0,
+};
+
 /// Per-anchor JIT execution-coverage tally (`TraceState.coverage` value). `traced`
 /// = loop iterations committed by trace runs (tier-1b native, or tier-1a IR-interp)
 /// anchored here; `interp` = interpreted (tier-0) back-edges taken at this anchor.
@@ -2056,6 +2071,9 @@ pub const TraceState = struct {
     /// directions by trace *identity* (never a raw slot pointer), so it is correct
     /// regardless of retire order. Empty until arming lands (2.3b) → inert in 2.3a.
     armed_links: std.ArrayListUnmanaged(NativeLink) = .empty,
+    /// Part B-2a: persistent hotexit-provenance relations. Edges are expected to
+    /// be few, so lifecycle operations deliberately use linear scans.
+    provenance_edges: std.ArrayListUnmanaged(ProvenanceEdge) = .empty,
     /// Trace-cache mutation generation: bumped on every `cache` append/remove/clear.
     /// Keys the per-trace `anchor_pop_*` memo so hot-path anchor-population queries
     /// (`anchorPopulation`) are one compare in steady state instead of an O(cache)
@@ -2610,7 +2628,7 @@ pub const TraceState = struct {
         if (t.sibling_reject_exit == exit_instr) return;
         if (t.sibling_watch_exit != exit_instr) {
             self.dbg("sibling-watch-move: t={d} ei={d} (from ei={d} count={d}) eligible={}", .{
-                t.id, exit_instr, t.sibling_watch_exit, t.sibling_watch_count,
+                t.id,                                       exit_instr, t.sibling_watch_exit, t.sibling_watch_count,
                 self.siblingHandoffEligible(t, exit_instr),
             });
             // The watch moves at most once per distinct eligible exit; eligibility
@@ -2643,21 +2661,27 @@ pub const TraceState = struct {
         if (child.anchor.proto != parent.anchor.proto or child.anchor.pc != parent.anchor.pc)
             return; // different anchor: this entry is not the one the request meant
         self.pending_sibling_arm = null;
-        if (self.armNativeLink(parent, key.exit_instr, child, .sibling_handoff) catch false) {
-            self.dbg("sibling-arm: t={d} ei={d} op={s} -> t={d}", .{
-                parent.id, key.exit_instr,
-                @tagName(parent.instrs[key.exit_instr].op), child.id,
-            });
-            self.sibling_handoff_arms +|= 1;
-            // Fast-reject key for `hasArmedSiblingHandoff`; decremented by every
-            // disarm path via `clearSiblingLatch`.
-            parent.sibling_arms +|= 1;
-            // Release the watch so this parent's NEXT hot exit can qualify. The
-            // just-armed exit is now rejected by `siblingHandoffEligible`, so the
-            // watch cannot simply land back on it.
-            parent.sibling_watch_exit = std.math.maxInt(u32);
-            parent.sibling_watch_count = 0;
-        }
+        _ = self.publishSiblingArm(parent, key.exit_instr, child);
+    }
+
+    /// Shared Part-S / Part-B publication funnel. On success only, publish the
+    /// physical sibling arm and perform the complete Part-S latch/counter update.
+    fn publishSiblingArm(self: *TraceState, parent: *Trace, exit_instr: u32, child: *Trace) bool {
+        if (!(self.armNativeLink(parent, exit_instr, child, .sibling_handoff) catch false))
+            return false;
+        self.dbg("sibling-arm: t={d} ei={d} op={s} -> t={d}", .{
+            parent.id, exit_instr, @tagName(parent.instrs[exit_instr].op), child.id,
+        });
+        self.sibling_handoff_arms +|= 1;
+        // Fast-reject key for `hasArmedSiblingHandoff`; decremented by every
+        // disarm path via `clearSiblingLatch`.
+        parent.sibling_arms +|= 1;
+        // Release the watch so this parent's NEXT hot exit can qualify. The
+        // just-armed exit is now rejected by `siblingHandoffEligible`, so the
+        // watch cannot simply land back on it.
+        parent.sibling_watch_exit = std.math.maxInt(u32);
+        parent.sibling_watch_count = 0;
+        return true;
     }
 
     /// Record one dispatcher burst's ledger for the Part-B terminal telemetry
@@ -2698,7 +2722,7 @@ pub const TraceState = struct {
             while (it.next()) |e| {
                 const k = e.key_ptr.*;
                 jitdbg.log("  terminal t={d} ei={d} kind={s} outcome={s}: {d}", .{
-                    k.trace_id,       k.exit_instr,      @tagName(k.kind),
+                    k.trace_id,          k.exit_instr,  @tagName(k.kind),
                     @tagName(k.outcome), e.value_ptr.*,
                 });
             }
@@ -2750,6 +2774,7 @@ pub const TraceState = struct {
         self.abort_log.deinit(self.gpa);
         if (self.exec_recorder) |*r| r.deinit();
         self.armed_links.deinit(self.gpa);
+        self.provenance_edges.deinit(self.gpa);
         self.trace_by_id.deinit(self.gpa);
         self.coverage.deinit(self.gpa);
         self.edge_cache.deinit(self.gpa); // A-ii.2 (values are plain structs; no per-entry free)
@@ -7729,6 +7754,9 @@ pub const TraceState = struct {
         for (self.cache.items, 0..) |c, idx| {
             if (c == t) {
                 const anchor = t.anchor;
+                // B-2a / §B.6: logical relation deletion is immediate at the
+                // retirement source; physical link teardown remains P-E's job.
+                self.retireProvenanceEdgesTouching(t.id);
                 // P-E: reset/drop every armed native link touching `t` before its
                 // mcode slot can be freed and reused (see `resetLinksTouching`).
                 self.resetLinksTouching(t);
@@ -7785,6 +7813,7 @@ pub const TraceState = struct {
     /// emptied `armed_links`, so no inbound native link touches any cached trace and
     /// no per-trace `resetLinksTouching` is needed here.
     pub fn clearCache(self: *TraceState) void {
+        self.clearProvenanceEdges();
         for (self.cache.items) |t| t.destroy(self.gpa);
         self.cache.clearRetainingCapacity();
         bumpGen(&self.cache_gen); // invalidate Trace.anchor_pop_* memos
@@ -7851,6 +7880,38 @@ pub const TraceState = struct {
         self.resetRegionProfit();
         self.region_profit_flushes = 0;
         self.region_profit_flushed_work = 0;
+    }
+
+    /// Part B-2a / §B.6: fresh-epoch teardown drops every logical provenance
+    /// relation along with the trace cache. Inert while B-2b has created none.
+    fn clearProvenanceEdges(self: *TraceState) void {
+        self.provenance_edges.clearRetainingCapacity();
+    }
+
+    /// Part B-2a / §B.6: retirement of either endpoint immediately deletes
+    /// its logical relations. Physical links are handled by `resetLinksTouching`.
+    fn retireProvenanceEdgesTouching(self: *TraceState, trace_id: u32) void {
+        var i = self.provenance_edges.items.len;
+        while (i > 0) {
+            i -= 1;
+            const edge = self.provenance_edges.items[i];
+            if (edge.parent_id == trace_id or edge.child_id == trace_id)
+                _ = self.provenance_edges.swapRemove(i);
+        }
+    }
+
+    /// Part B-2a / §B.6: delete relations owned by parent traces at `anchor`.
+    /// B-2b wires this event-level wrapper to region low-yield condemnation; it
+    /// must not be inferred from ordinary temporary gate state.
+    fn condemnProvenanceEdgesAt(self: *TraceState, anchor: AnchorKey) void {
+        var i = self.provenance_edges.items.len;
+        while (i > 0) {
+            i -= 1;
+            const edge = self.provenance_edges.items[i];
+            const parent = self.traceById(edge.parent_id) orelse continue;
+            if (parent.anchor.proto == anchor.proto and parent.anchor.pc == anchor.pc)
+                _ = self.provenance_edges.swapRemove(i);
+        }
     }
 
     /// Remove all guard-failure entries for `anchor`. Called after a side
@@ -10622,9 +10683,9 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
             const anchor_cycles = r.traced_cycles +| r.interp_cycles;
             if (has_time) {
                 try w.print("    {s:<18}  {d:>11}  {d:>11}  {d:>5.1}%   {d:>5.1}%  {d:>7.1}%  {d:>8.1}  {d:>8.1}\n", .{
-                    label,                              r.traced,
-                    r.interp,                           pctOf(r.traced, r.traced +| r.interp),
-                    pctOf(anchor_cycles, run),          pctOf(r.traced_cycles, anchor_cycles),
+                    label,                                    r.traced,
+                    r.interp,                                 pctOf(r.traced, r.traced +| r.interp),
+                    pctOf(anchor_cycles, run),                pctOf(r.traced_cycles, anchor_cycles),
                     cyclesPerIter(r.traced_cycles, r.traced), cyclesPerIter(r.interp_cycles, r.interp),
                 });
             } else {
@@ -11547,6 +11608,117 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
     // are stack memory, so skip those fields by not calling destroy).
     gpa.destroy(trace_a);
     gpa.destroy(trace_b);
+}
+
+test "tryArmSiblingHandoff publishes complete Part-S bookkeeping" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity(); // stack-backed traces
+
+    const proto = Proto{
+        .code = &.{Instr.op0(.ret)},
+        .name = "sibling-publish",
+        .num_registers = 1,
+    };
+    const parent_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .aux = 1 },
+        .{ .op = .loop },
+    };
+    const parent_slots = try gpa.alloc(usize, parent_instrs.len);
+    defer gpa.free(parent_slots);
+    @memset(parent_slots, 0);
+
+    var parent: Trace = .{
+        .id = 41,
+        .anchor = .{ .proto = &proto, .pc = 7 },
+        .instrs = @constCast(&parent_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = parent_slots, .gpa = gpa } },
+        .sibling_watch_exit = 0,
+        .sibling_watch_count = 9,
+    };
+    var child: Trace = .{
+        .id = 42,
+        .anchor = parent.anchor,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{
+            .page = undefined,
+            .gpa = gpa,
+            .ordinary_entry = 0xCAFE,
+        } },
+    };
+    try state.cache.append(gpa, &parent);
+    try state.cache.append(gpa, &child);
+    state.pending_sibling_arm = .{ .trace_id = parent.id, .exit_instr = 0 };
+
+    state.tryArmSiblingHandoff(&child, true);
+
+    try testing.expectEqual(@as(?ExitKey, null), state.pending_sibling_arm);
+    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    const link = state.armed_links.items[0];
+    try testing.expectEqual(ArmKind.sibling_handoff, link.kind);
+    try testing.expect(link.parent == &parent);
+    try testing.expectEqual(@as(u32, 0), link.slot_index);
+    try testing.expect(link.child == &child);
+    try testing.expectEqual(@as(usize, 0xCAFE), parent_slots[0]);
+    try testing.expectEqual(@as(u32, 1), parent.sibling_arms);
+    try testing.expectEqual(std.math.maxInt(u32), parent.sibling_watch_exit);
+    try testing.expectEqual(@as(u32, 0), parent.sibling_watch_count);
+    try testing.expectEqual(@as(u64, 1), state.sibling_handoff_arms);
+}
+
+test "B-2a provenance edge storage retires endpoints, condemns parents, and clears" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity(); // stack-backed traces
+
+    try state.provenance_edges.append(gpa, .{ .parent_id = 1, .exit_instr = 10, .child_id = 2 });
+    try state.provenance_edges.append(gpa, .{ .parent_id = 3, .exit_instr = 11, .child_id = 1, .strikes = 2 });
+    try state.provenance_edges.append(gpa, .{ .parent_id = 4, .exit_instr = 12, .child_id = 5 });
+
+    state.retireProvenanceEdgesTouching(1);
+    try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
+    try testing.expectEqual(@as(u32, 4), state.provenance_edges.items[0].parent_id);
+
+    try state.provenance_edges.append(gpa, .{ .parent_id = 6, .exit_instr = 13, .child_id = 5 });
+    state.retireProvenanceEdgesTouching(5);
+    try testing.expectEqual(@as(usize, 0), state.provenance_edges.items.len);
+
+    const proto = Proto{ .code = &.{}, .name = "provenance-lifecycle", .num_registers = 0 };
+    var condemned_parent: Trace = .{
+        .id = 7,
+        .anchor = .{ .proto = &proto, .pc = 20 },
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    var surviving_parent: Trace = .{
+        .id = 9,
+        .anchor = .{ .proto = &proto, .pc = 30 },
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    try state.cache.append(gpa, &condemned_parent);
+    try state.cache.append(gpa, &surviving_parent);
+    try state.provenance_edges.append(gpa, .{ .parent_id = 7, .exit_instr = 14, .child_id = 8 });
+    try state.provenance_edges.append(gpa, .{ .parent_id = 9, .exit_instr = 15, .child_id = 10 });
+
+    state.condemnProvenanceEdgesAt(condemned_parent.anchor);
+    try testing.expectEqual(@as(usize, 1), state.provenance_edges.items.len);
+    try testing.expectEqual(@as(u32, 9), state.provenance_edges.items[0].parent_id);
+
+    state.clearProvenanceEdges();
+    try testing.expectEqual(@as(usize, 0), state.provenance_edges.items.len);
 }
 
 test "armNativeLink / resetLinksTouching: P-E registry directionality" {
