@@ -1530,6 +1530,12 @@ pub const Trace = struct {
     bridge_cand: []const u8 = &.{},
     bridge_cand_built: bool = false,
 
+    /// Memo for `TraceState.anchorPopulation`: the `countTracesAt(anchor)` result as
+    /// of `TraceState.cache_gen == anchor_pop_gen`. Gen 0 = never computed (state
+    /// gens start at 1). Pure accelerator — recomputed on any cache mutation.
+    anchor_pop_gen: u32 = 0,
+    anchor_pop: u32 = 0,
+
     /// Pall's per-snapshot exit hotcount (`snap->count`, lj_trace.c
     /// `trace_hotside`): one taken-exit counter per committed instruction index,
     /// bumped by `noteTakenExit` on EVERY taken exit through that instruction.
@@ -1913,6 +1919,14 @@ pub const NativeLink = struct {
     /// proven against. Every discovery rebuild disarms region-bridge links whose
     /// region is no longer live-armable (fail-closed on topology transitions).
     region_id: ?RegionId = null,
+    /// Replay-walk memo for `.region_bridge` rows: the unique registered edge the
+    /// slow resolution (provAt → def lookup → members scan, all release-panicking)
+    /// produced, stamped with `region_defs_gen`. On a gen match the row grammar
+    /// validates the successor against this edge directly — the defs have not
+    /// changed since the full proof ran, so every slow-path verdict is unchanged
+    /// by construction. Gen 0 = never resolved (state gens start at 1).
+    bridge_edge: ?StructuralEdgeId = null,
+    bridge_edge_gen: u32 = 0,
 };
 
 /// Per-anchor JIT execution-coverage tally (`TraceState.coverage` value). `traced`
@@ -2025,6 +2039,20 @@ pub const TraceState = struct {
     /// directions by trace *identity* (never a raw slot pointer), so it is correct
     /// regardless of retire order. Empty until arming lands (2.3b) → inert in 2.3a.
     armed_links: std.ArrayListUnmanaged(NativeLink) = .empty,
+    /// Trace-cache mutation generation: bumped on every `cache` append/remove/clear.
+    /// Keys the per-trace `anchor_pop_*` memo so hot-path anchor-population queries
+    /// (`anchorPopulation`) are one compare in steady state instead of an O(cache)
+    /// `countTracesAt` scan per receipt. Starts at 1 so a fresh trace's memo (gen 0)
+    /// always recomputes; wrap-around collision would need 2^32 mutations inside one
+    /// trace's lifetime — not reachable.
+    cache_gen: u32 = 1,
+    /// O(1) `traceById` index: slot `id` holds the live committed trace with that
+    /// id, or null (retired / gap / never registered). Ids are monotonic and never
+    /// reused (P-B), so the array only grows with commits. Maintained fail-soft: a
+    /// grow-OOM at commit simply leaves the id unindexed and `traceById` falls back
+    /// to the linear cache scan (hand-built test traces appended straight to
+    /// `cache` take that fallback too), so results are identical by construction.
+    trace_by_id: std.ArrayListUnmanaged(?*Trace) = .empty,
     /// A-vii-d.1: at most one bridge-arm request recorded by `replayLedger` when
     /// it walks a terminal composite `.deopt` row, drained by the ledger DRIVERS
     /// via `drainPendingBridgeArm` after the replay returns (never mid-walk —
@@ -2705,6 +2733,7 @@ pub const TraceState = struct {
         self.abort_log.deinit(self.gpa);
         if (self.exec_recorder) |*r| r.deinit();
         self.armed_links.deinit(self.gpa);
+        self.trace_by_id.deinit(self.gpa);
         self.coverage.deinit(self.gpa);
         self.edge_cache.deinit(self.gpa); // A-ii.2 (values are plain structs; no per-entry free)
         // A-ii.4: region model. `region_defs` values own members/member_points; the
@@ -2936,6 +2965,13 @@ pub const TraceState = struct {
     /// (the trace retired, or the id is the `NO_TRACE_ID` sentinel). Linear scan,
     /// mirroring `traceIndex`; ids are unique, so at most one match.
     pub fn traceById(self: *const TraceState, id: u32) ?*Trace {
+        // O(1) fast path via the id index; a hit is authoritative. A null slot or
+        // out-of-range id falls back to the linear scan — that covers hand-built
+        // test traces appended straight to `cache` (never indexed) and any
+        // fail-soft grow-OOM at commit. For real retired ids both paths miss.
+        if (id < self.trace_by_id.items.len) {
+            if (self.trace_by_id.items[id]) |t| return t;
+        }
         for (self.cache.items) |c| {
             if (c.id == id) return c;
         }
@@ -3553,6 +3589,19 @@ pub const TraceState = struct {
         if (!safe_to_arm) return;
         if (exit_instr == std.math.maxInt(u32) or exit_instr >= t.instrs.len) return;
         if (!t.isBridgeCandidate(exit_instr)) return;
+        // Already armed as a bridge → nothing to do. Without this, every burst
+        // whose terminal composite deopt drains through here re-ran the WHOLE
+        // arm pipeline (classifyExit → def/profit hash probes → the
+        // `validateRegionBridge` structural proof) only for `armNativeLink` to
+        // supersede an identical arm — a measured seam cost (validateRegionBridge
+        // alone was 2.4% of nsieve N=5). Soundness unchanged: an armed link's
+        // provenance is kept live by the existing invalidation paths (discovery
+        // rebuilds disarm bridge links whose region stops being live-armable;
+        // trace retirement resets links via `resetLinksTouching`), which is
+        // exactly what the `.region_bridge` replay grammar validates against.
+        for (self.armed_links.items) |l| {
+            if (l.parent == t and l.slot_index == exit_instr and l.kind == .region_bridge) return;
+        }
         self.tryArmRegionBridge(t, exit_instr);
     }
 
@@ -4693,41 +4742,60 @@ pub const TraceState = struct {
                     // def — never a global scan over historical `region_defs`,
                     // which could match a stale tombstoned region whose edge
                     // happens to share this (anchor, exit) shape.
-                    var armed_region: ?RegionId = null;
-                    for (self.armed_links.items) |link| {
+                    var armed_link: ?*NativeLink = null;
+                    for (self.armed_links.items) |*link| {
                         if (link.parent == owner and link.slot_index == e.exit and link.child == succ) {
                             if (link.kind != .region_bridge)
                                 @panic("replayLedger: region_bridge row matched a non-bridge armed link");
-                            armed_region = link.region_id orelse
-                                @panic("replayLedger: region_bridge armed link has no region provenance");
+                            armed_link = link;
                             break;
                         }
                     }
-                    const region_id = armed_region orelse
+                    const link = armed_link orelse
                         @panic("replayLedger: region_bridge has no armed provenance");
 
-                    // Resolve the one persistent structural edge bound to this
-                    // committed exit — in the armed region's def ONLY. Do not
-                    // trust guardExitPc or the next row as the resume source:
-                    // RegionDef owns the validated skip anchor.
-                    const prov = owner.provAt(e.exit) orelse
-                        @panic("replayLedger: region_bridge exit has no provenance");
-                    const def = self.region_defs.getPtr(region_id) orelse
-                        @panic("replayLedger: region_bridge armed region no longer exists");
-                    if (!def.armable)
-                        @panic("replayLedger: region_bridge edge is tombstoned");
-                    var registered: ?StructuralEdgeId = null;
-                    for (def.members) |edge| {
-                        if (edge.anchor_proto_id != owner.anchor.proto.id or
-                            edge.anchor_pc != owner.anchor.pc or
-                            exitOrder(edge.exit, prov) != .eq)
-                            continue;
-                        if (registered != null)
-                            @panic("replayLedger: duplicate region_bridge edge");
-                        registered = edge;
-                    }
-                    const edge = registered orelse
-                        @panic("replayLedger: region_bridge edge is not registered");
+                    // Fast path (seam step 3): the slow resolution below is a pure
+                    // function of the armed link and `region_defs`; its result is
+                    // memoized on the link stamped with `region_defs_gen`, so a
+                    // steady-state row is two compares + the successor check. Any
+                    // defs mutation bumps the gen and forces the full re-proof
+                    // (all release-panics intact on that path). The registry is
+                    // stable mid-walk (`replay_walk_depth` defers disarms), so the
+                    // memo write-through is safe.
+                    const edge = memo: {
+                        if (link.bridge_edge) |cached| {
+                            if (link.bridge_edge_gen == self.region_defs_gen)
+                                break :memo cached;
+                        }
+                        const region_id = link.region_id orelse
+                            @panic("replayLedger: region_bridge armed link has no region provenance");
+
+                        // Resolve the one persistent structural edge bound to this
+                        // committed exit — in the armed region's def ONLY. Do not
+                        // trust guardExitPc or the next row as the resume source:
+                        // RegionDef owns the validated skip anchor.
+                        const prov = owner.provAt(e.exit) orelse
+                            @panic("replayLedger: region_bridge exit has no provenance");
+                        const def = self.region_defs.getPtr(region_id) orelse
+                            @panic("replayLedger: region_bridge armed region no longer exists");
+                        if (!def.armable)
+                            @panic("replayLedger: region_bridge edge is tombstoned");
+                        var registered: ?StructuralEdgeId = null;
+                        for (def.members) |member| {
+                            if (member.anchor_proto_id != owner.anchor.proto.id or
+                                member.anchor_pc != owner.anchor.pc or
+                                exitOrder(member.exit, prov) != .eq)
+                                continue;
+                            if (registered != null)
+                                @panic("replayLedger: duplicate region_bridge edge");
+                            registered = member;
+                        }
+                        const resolved = registered orelse
+                            @panic("replayLedger: region_bridge edge is not registered");
+                        link.bridge_edge = resolved;
+                        link.bridge_edge_gen = self.region_defs_gen;
+                        break :memo resolved;
+                    };
                     if (edge.succ_anchor_proto_id != succ.anchor.proto.id or
                         edge.succ_anchor_pc != succ.anchor.pc)
                         @panic("replayLedger: region_bridge successor mismatches registered edge");
@@ -6048,31 +6116,35 @@ pub const TraceState = struct {
         if (exit_instr >= t.exit_counts.len) return; // hand-built / fail-soft commit
         const c = &t.exit_counts[exit_instr];
         if (c.* == Trace.EXIT_COUNT_DONE) return;
-        const branch = self.isSourceBranchGuardExit(t, exit_instr, proto);
         // Count EVERY non-DONE taken exit (Pall: `trace_hotside` increments
         // unconditionally) — capacity must suppress ARMING only, never
         // accounting, else an anchor at cap stops accruing hotness and a later
         // eviction restarts the exit cold (codex review of 84c86bc).
         if (c.* < Trace.EXIT_COUNT_DONE - 1) c.* += 1;
         if (c.* < self.config.hotexit) return;
-        // Capacity refusals mirror the mechanisms each route feeds: the prime
-        // side keeps its historical one-ramp bound (`countTracesAt >= 2` — once
-        // skip + ramp coexist, arming stops and never re-fires); generic
-        // siblings stop at `max_traces_per_anchor`.
-        const cap: usize = if (branch) 2 else self.config.max_traces_per_anchor;
-        if (self.countTracesAt(t.anchor) >= cap) return;
+        // Everything below is arming-only, so it runs behind the cheapest
+        // possible gates: `isSourceBranchGuardExit` (provenance decode) and
+        // `countTracesAt` (an O(cache) scan) must NOT run per receipt on a
+        // saturated exit — the seam profile showed exactly that (2% of nsieve
+        // in this function, nearly all in the scan). Route first on the free
+        // checks (want occupancy, `completed`), then decode/scan only when a
+        // want could actually be set. Capacity refusals mirror the mechanisms
+        // each route feeds: the prime side keeps its historical one-ramp bound
+        // (`countTracesAt >= 2` — once skip + ramp coexist, arming stops and
+        // never re-fires); generic siblings stop at `max_traces_per_anchor`.
+        const branch = self.isSourceBranchGuardExit(t, exit_instr, proto);
         if (branch) {
-            if (self.wants_prime_side == null) {
-                self.dbg("hotexit: trace id={d} exit={d} count={d} -> want PRIME side at pc={d}", .{ t.id, exit_instr, c.*, t.anchor.pc });
-                self.wants_prime_side = t.anchor;
-                self.prime_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
-            }
+            if (self.wants_prime_side != null) return;
+            if (self.anchorPopulation(t) >= 2) return;
+            self.dbg("hotexit: trace id={d} exit={d} count={d} -> want PRIME side at pc={d}", .{ t.id, exit_instr, c.*, t.anchor.pc });
+            self.wants_prime_side = t.anchor;
+            self.prime_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
         } else if (completed == 0) {
-            if (self.wants_side_trace == null) {
-                self.dbg("hotexit: trace id={d} exit={d} count={d} -> want side at pc={d}", .{ t.id, exit_instr, c.*, t.anchor.pc });
-                self.wants_side_trace = t.anchor;
-                self.side_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
-            }
+            if (self.wants_side_trace != null) return;
+            if (self.anchorPopulation(t) >= self.config.max_traces_per_anchor) return;
+            self.dbg("hotexit: trace id={d} exit={d} count={d} -> want side at pc={d}", .{ t.id, exit_instr, c.*, t.anchor.pc });
+            self.wants_side_trace = t.anchor;
+            self.side_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
         }
     }
 
@@ -6182,6 +6254,18 @@ pub const TraceState = struct {
             if (t.anchor.proto == anchor.proto and t.anchor.pc == anchor.pc) n += 1;
         }
         return n;
+    }
+
+    /// Memoized `countTracesAt(t.anchor)` for per-receipt hot paths
+    /// (`noteTakenExit`): one gen compare in steady state, full scan only after a
+    /// cache mutation (`cache_gen` bump). Results are identical to the scan by
+    /// construction.
+    fn anchorPopulation(self: *const TraceState, t: *Trace) usize {
+        if (t.anchor_pop_gen != self.cache_gen) {
+            t.anchor_pop = @intCast(self.countTracesAt(t.anchor));
+            t.anchor_pop_gen = self.cache_gen;
+        }
+        return t.anchor_pop;
     }
 
     /// True iff some cached trace at `(proto, pc)` has inner-loop-root shape. Used by
@@ -7331,6 +7415,8 @@ pub const TraceState = struct {
                 l.child = child;
                 l.kind = kind;
                 l.region_id = null; // a `.region_bridge` caller re-stamps after arming
+                l.bridge_edge = null; // drop the replay memo with the old child
+                l.bridge_edge_gen = 0;
                 c.slots[slot_index] = target;
                 self.dbg("arm (re-arm): parent id={d} pc={d} slot={d} -> child id={d} pc={d} kind={s}", .{
                     parent.id, parent.anchor.pc, slot_index, child.id, child.anchor.pc, @tagName(kind),
@@ -7564,6 +7650,8 @@ pub const TraceState = struct {
                 // mcode slot can be freed and reused (see `resetLinksTouching`).
                 self.resetLinksTouching(t);
                 _ = self.cache.swapRemove(idx);
+                self.cache_gen +%= 1; // invalidate Trace.anchor_pop_* memos
+                if (t.id < self.trace_by_id.items.len) self.trace_by_id.items[t.id] = null;
                 t.destroy(self.gpa);
                 // Reopen the anchor for re-recording. `onBackEdge` only arms when
                 // its hot-counter *crosses* `hotloop` (a one-shot `==`), so an
@@ -7616,6 +7704,8 @@ pub const TraceState = struct {
     pub fn clearCache(self: *TraceState) void {
         for (self.cache.items) |t| t.destroy(self.gpa);
         self.cache.clearRetainingCapacity();
+        self.cache_gen +%= 1; // invalidate Trace.anchor_pop_* memos
+        @memset(self.trace_by_id.items, null); // every indexed trace was just destroyed
 
         // Anchor-keyed tiering state: reset so the next epoch re-warms cleanly and no
         // stale entry references a freed trace or blocks re-recording. (Mirrors the
@@ -8223,6 +8313,18 @@ pub const TraceState = struct {
         } else |_| {}
         errdefer if (t.exit_counts.len != 0) self.gpa.free(t.exit_counts);
         try self.cache.append(self.gpa, t);
+        self.cache_gen +%= 1; // invalidate Trace.anchor_pop_* memos
+        // Register in the O(1) id index (fail-soft: on grow-OOM the id stays
+        // unindexed and `traceById` falls back to the cache scan).
+        if (t.id >= self.trace_by_id.items.len) {
+            const old_len = self.trace_by_id.items.len;
+            if (self.trace_by_id.resize(self.gpa, t.id + 1)) {
+                @memset(self.trace_by_id.items[old_len..], null);
+                self.trace_by_id.items[t.id] = t;
+            } else |_| {}
+        } else {
+            self.trace_by_id.items[t.id] = t;
+        }
         // Pall's `snap->count = SNAPCOUNT_DONE` at side-trace link (lj_trace.c:535):
         // this commit was triggered by a hot exit (`side_src` provenance followed
         // the want through consume → pending → recorder), so latch the parent's

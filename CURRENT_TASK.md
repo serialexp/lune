@@ -1,5 +1,60 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-13 (LATEST-45) — **Seam-shrink arc, round 1: four measured memoizations, nsieve 5 −22% / nsieve 9 −18% / sieve_int −16% cumulative. Doc-17 Part B (true exit patching) is the agreed follow-up.**
+
+### Why (Bart: "start with shrinking, B as follow-up")
+
+The new `--jit-stats` seam split + perf agreed: at small N the run is dominated
+by the steering seam (`replayLedger` ~48% self at N=3, ~1,279 cyc/walk over
+1–3 row ledgers), NOT trace codegen (native bodies ~5 cyc/iter, already below
+LuaJIT's whole-run average). Profile-first recipe applied; each step A/B'd
+min-of-15 before the next.
+
+### What landed (each general, none benchmark-keyed)
+
+1. **`noteTakenExit` arming-gate reorder** — saturated exits no longer run
+   `isSourceBranchGuardExit` + `countTracesAt` per receipt; decode/scan only
+   when a want could actually be set.
+2. **`anchorPopulation` memo** — `cache_gen` (bumped on cache append/remove/
+   clear) + per-trace `anchor_pop_*`; steady-state anchor-population query is
+   one gen compare instead of an O(cache) scan per receipt.
+3. **`maybeArmCompositeExit` already-armed early-out** — every burst's
+   terminal composite deopt was re-running the whole arm pipeline
+   (classifyExit → def/profit hash probes → `validateRegionBridge` full
+   structural proof, 2.4% of N=5) to supersede an identical arm.
+4. **`.region_bridge` row memo** — the slow row resolution (provAt → def
+   lookup → members scan with `exitOrder` compares) is a pure function of the
+   armed link + `region_defs`; memoized on `NativeLink`
+   (`bridge_edge`/`bridge_edge_gen` stamped with `region_defs_gen`), dropped
+   on re-arm supersede; steady-state row = gen compare + succ check. All
+   release-panics intact on the slow path.
+5. **O(1) `traceById`** — `trace_by_id` id-indexed array (ids monotonic,
+   never reused); fail-soft (grow-OOM or hand-built test traces fall back to
+   the linear scan); nulled on remove, cleared wholesale on `clearCache`.
+
+### Measured (min-of-15, --trace --jit-native, vs pre-seam e3316c2 binary)
+
+nsieve 3: 3.5→3.0 (−15%); nsieve 5: 11.2→8.7 (−22%); nsieve 7: 38.0→30.6
+(−19%); nsieve 9: 142.8→116.6 (−18%, LuaJIT 144.2 same harness); sieve_int:
+64.4→54.3 (−16%); nsieve-bit: 31.5→31.6 (flat). Per-step deltas in the git
+log. N=3 seam: ~1279→~1132 cyc/walk, run total 24.8M→19.1M cycles.
+
+### Gates
+
+Tests green both builds; seven output-identity hashes byte-identical; A-viii
+109/109; floatlink 18135.
+
+### Still on the table (seam round 2 candidates, unstarted)
+
+- `replayLedger` self still ~20%: FrozenFast setup hash probes per walk
+  (consolidate with `qualifiedActiveMember`'s act_cache), per-row
+  `accountLedgerRow` residue, `driveDispatcherLedger` 6% self.
+- wyhash ~3%: remaining region_profit/defs probes.
+- Then: doc-17 Part B true exit-branch patching (the structural fix — longer
+  bursts, fewer walks).
+
+---
+
 ## Status 2026-08-13 (LATEST-44) — **Pall-faithful hotexit landed: one per-(trace,exit) taken-exit counter (`snap->count`), threshold 10, DONE latch at side-trace commit, productive receipts never strike. Small-N warmup fixed (nsieve N=3: scan loop 0%→94.5% traced, −17.5% wall). All green, all six hashes identical.**
 
 ### Why (Bart: "the most correct change — start with what Pall does")
