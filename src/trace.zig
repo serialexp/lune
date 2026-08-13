@@ -3635,6 +3635,18 @@ pub const TraceState = struct {
         accum.outer_traversals +|= @intCast(work);
         const n: u64 = @intCast(self.config.min_useful);
         if (n != 0) while (accum.outer_traversals - accum.window_base >= n) {
+            // Freeze-after-qualify: a FROZEN activation's full window is a useful
+            // verdict whose only effects in `flushRegionWindow` are two hash-map
+            // removes of keys the qualification amnesty already cleared — pure
+            // no-ops paid per `min_useful` traversals. Keep the counters (they are
+            // telemetry the stats block reports) and skip the map touches.
+            if (accum.frozen) {
+                self.region_profit_flushes +|= 1;
+                self.region_profit_flushed_work +|= n;
+                accum.useful_streak +|= 1;
+                accum.window_base += n;
+                continue;
+            }
             self.flushRegionWindow(key, n);
             // Codex review (MAJOR 1): the moment an activation first QUALIFIES,
             // clear the legacy penalty/gate on every anchor inside its
@@ -3730,7 +3742,7 @@ pub const TraceState = struct {
     /// `(region_defs_gen, rid)`, so the per-row cost in a frozen steady state is
     /// two integer compares instead of a footprint scan. Every `region_defs`
     /// mutation bumps the generation, so a stale answer can never be returned.
-    fn traceRegionMemberMemo(self: *const TraceState, t: *Trace, rid: RegionId) bool {
+    inline fn traceRegionMemberMemo(self: *const TraceState, t: *Trace, rid: RegionId) bool {
         if (t.region_memo_gen == self.region_defs_gen and
             t.region_memo_rid == @intFromEnum(rid))
             return t.region_memo_member;
