@@ -1,5 +1,66 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-50) — **B-3b LANDED: the seam is closed. nsieve 1.1× LuaJIT (was 1.9×), sieve_int 1.0× (was 1.5×). Commit 8942ef6.**
+
+Promoted cycles now transition trace→trace natively without appending ledger
+rows; Zig expands a per-kind summary that is accounting-equivalent to the
+row-by-row replay it replaced. Landed in four gated sub-steps (b.1 `ReplayCursor`
+extraction, b.2 promotion registry + patch lifetime, b.3 the flip, b.4 bridge
+promotion), then hardened over SIX adversarial review rounds.
+
+Measured (nsieve N=9): replay rows **2,547,824 → 394,179**; native `[JIT]`
+43.0% → 50.5%; the 46.2% Zig seam that motivated Part B is gone as a dominant
+cost. Board: **nsieve 24.4 → 16.2 ms (1.1× LuaJIT)**, **sieve_int 11.3 → 7.5 ms
+(1.0×)**. Telemetry: 16 candidates, 4 promotions, 2,205,469 silent transitions,
+12,824 bursts, 534 budget exhaustions, 0 barren, rejects all zero except
+`open=1`.
+
+Rounds 1–5 (codex `gpt-5.6-sol`) found eleven soundness defects, all fixed
+without weakening a check or disabling an edge kind. Round 6 ran on Antigravity
++ an independent agent (codex hit its usage limit until Aug 20) and found three,
+recorded in doc 17 §B3.14:
+
+1. **BLOCKER — burst endpoints were reconstructed, not measured.**
+   `(first_phase + transitions ± 1) mod len` assumes every silent transition is
+   the next phase of ONE ring where each trace owns exactly ONE phase. Neither
+   is enforced: `computeSiblingReturnDistances` explicitly supports
+   repeated-parent rings, and several rings can be live at once, all
+   incrementing the same call-global `silent_transitions`. A wrong terminal edge
+   ⇒ wrong tier-0 resume PC (the A-viii "missing prime 307" class) + wrong
+   committed count, silently. Fixed by making native publish what happened:
+   per-cell `firings`/`last_ordinal` + `NativeResult.silent_last_cell`, a
+   `silentCellOwner` resolver for both endpoints, a release-checked
+   `Σ firings == silent_transitions` invariant, and expansion/clearing over
+   every live cycle. This corrects §B3.13(5) of the accepted design.
+2. **Sibling evidence indexed an edge's FIRST firing**, so progress preceding a
+   final barren firing masked a strike. Now indexed to the most recent firing;
+   the return-to-parent bound moved to total transitions (a row is appended by
+   every materialized transition, including the unfollowed final one).
+3. **The ≤1-row provenance settle was in the wrong function** — double-settling
+   the driveChain seed while leaving `driveDispatcherSilentResult`, the origin
+   its own comment names, unsettled.
+
+Gates: 869 tests green in both the normal and `-Djit-debug` builds; all seven
+frozen stdout hashes + the three soundness repros match with
+`silent_promotion_enabled` **both ON and OFF**; telemetry byte-identical across
+round 6; interleaved min-of-11 ReleaseFast A/B neutral.
+
+**Two measurement traps that cost real time this session — read before timing
+anything.** (a) `just test` and `zig build test` leave a **Debug**
+`zig-out/bin/lune`; a binary copied after them times ~3× slow and produces
+garbage A/Bs (this fooled me twice — the tell was `-Djit-debug` telemetry being
+byte-identical, i.e. no tiering change could explain the delta). Always re-run
+`just release` before copying. (b) A single wall-clock board row can be an
+outlier: `pi_leibniz` read 39.3 ms on one board and 12.8 ms on the next while
+`lune_jit_execns` stayed at 38.8 M — identical work. Cross-check the exec-ns
+column before believing a wall delta.
+
+Open next: **B-3c** budget tune (534 of 12,824 bursts exhaust `silent_budget =
+4096`); **B-4** deterministic trace-quality probation (nsieve-bit still 36.3 ms,
+6.3× LuaJIT). Untracked bench boards remain in `bench/results/` (uncommitted by
+choice). The `str_manip` ok/ERR board flag is pre-existing and unrelated (the
+LuaJIT leg calls an unavailable `string.codepoint`).
+
 ## Status 2026-08-13 (LATEST-49) — **B-3a substrate LANDED (flag off, all gates green, seam coverage 73.5% ≥ 70% gate). Next: B-3b runtime promotion.**
 
 B-3a reverse-authored (Codex implemented on thread
