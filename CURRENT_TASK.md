@@ -1,5 +1,79 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-13 (LATEST-41) — **Part S BUILT and MEASURED. The "50% = runtime re-entry" premise is DISPROVED, and the handoff is UNSOUND. Arming is off (`sibling_handoff_arming_enabled = false`); everything else is landed and green.**
+
+### 1. The premise behind Part B is wrong
+
+Part B assumed the ~50% seam is the cost of *returning to the runtime* per burst,
+so fusing bursts would eliminate it. Built it; measured it. On nsieve N=9:
+
+| config | bursts | traced time | wall-clock |
+|---|---|---|---|
+| pre-Part-S | 641,431 | 51.0% | 243 ms |
+| handoff, first accounting | 25,595 (**−96%**) | 7.2% | 307 ms (**+18%**) |
+| handoff, accounting fixed | 330,000 (−48%) | 52.7% | 231 ms (−7.3%) |
+
+**96% fewer bursts made it 18% SLOWER.** Dispatcher re-entry is not the seam.
+What the seam actually is: per-ROW pricing (`accountRegionProfit` 15–18%,
+`replayLedger`, hashing) — and fusion does not remove rows, it only moves them
+between bursts. In the middle row above the seam *looks* eliminated
+(`accountRegionProfit` 17.7%→1.5%) purely because the JIT stopped running.
+
+Corollary for whoever picks this up: **the remaining lever is per-row pricing
+cost or the freeze, not burst count.** Task #72 (hoist the per-row hashmap
+lookups) is on the real critical path; Part B's fusion is not.
+
+### 2. Two accounting bugs found (both real, both fixed)
+
+- `accountLedgerRow` on a handoff row applied the legacy-thrash VERDICT to a
+  zero-progress TRANSITION → a penalty strike per fused hop → `pc=14` hit
+  `max_penalty`, the anchor gated, traced time collapsed 51%→7.2%. A fused
+  handoff never reaches the runtime and must be invisible to profitability;
+  it now charges `accountTraceRun` only.
+- The production never advanced `prev_cum`, so the sibling's row re-counted the
+  parent's committed iterations.
+- Also: the charge site must be `driveDispatcherLedger`, NOT `replayLedger` — a
+  walk can return a directive from an interior row and never visit the last one.
+  Sited in the walk it saw 25,939 of 330,000 terminals and the dominant exit
+  could never qualify.
+
+### 3. The handoff is not semantics-preserving — this is the blocker
+
+With the charge site fixed so every terminal is observed, **A-viii prints 108
+where the unfused run prints 109**: one iteration silently dropped. §S's stated
+coherence condition is "a zero-progress pre-effect deopt is coherent at the
+anchor". Both halves were then implemented, and **both are insufficient**:
+
+- static: `exitIsPreEffect` (no `astore`/`astore_append`/`hstore`/`gstore`
+  precedes the exit) — still 108.
+- runtime: `term_local == 0` at the charge site — still 108.
+
+So the premise is falsified, not under-enforced. Some state the sibling's
+`ordinary_entry` needs is not reconstructible from a carried-homes flush, and
+identifying it is the open work. This is §S.8's "true per-exit snapshots"
+deferral turning out to be load-bearing — which is what codex round 1 said.
+
+Note the first cut passed the suite only by luck: it armed exactly ONE exit.
+
+### 4. What is landed (green, arming off)
+
+`sibling_handoff_arming_enabled = false` in src/trace.zig. Kept because it is
+the part that is right: `ArmKind.sibling_handoff` + arm-time validator, the
+three-scalar allocation-free watch on `Trace` (`sibling_watch_exit/_count`,
+`sibling_arms`) replacing the hashmap whose per-receipt probe was itself worth
+15%, `clearSiblingLatch` on every disarm path, `exitIsPreEffect`, the replay
+production, and the M1 sub-case (b) interaction fix. Suite green; all six
+output-identity controls unchanged.
+
+### 5. Open question for Bart
+
+Three ways forward, no recommendation: (a) close the soundness hole with real
+per-exit snapshots (the original Part B, largest job); (b) drop fusion and go
+after per-row pricing cost directly, which is where the measurement now points;
+(c) leave Part S inert and pick a different lever entirely (e.g. the parked
+dynamic-proto gate blocking SciMark — 53.5% of suite runtime at 0% coverage).
+
+
 ## Status 2026-08-13 (LATEST-40) — **Part S designed + twice-reviewed, ready for S-a. The whole 50% seam is TWO exit sites; the fix is a native sibling handoff compiled into the deopt stub.**
 
 **Bart's mandate (verbatim intent):** "every single program will eventually hit

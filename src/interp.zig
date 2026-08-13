@@ -2826,6 +2826,16 @@ pub const Vm = struct {
                                 // closes in 2.3c-2. exec-log is not gated here: it takes the
                                 // non-native branch below, so no slot can fire under it.
                                 if (!safe_to_arm) self.trace.disarmAllLinks();
+                                // Part S (doc 17): the dispatcher has now SELECTED and
+                                // is about to ENTER `ct`. If a burst terminal recently
+                                // crossed the handoff threshold at a same-anchor
+                                // sibling's ordinary deopt exit, arm that exit to jump
+                                // straight here next time — the native compilation of
+                                // doc 16's coherent-anchor chain. Armed at the real
+                                // selection site precisely so the target is the trace
+                                // the deterministic dispatch actually runs, never a
+                                // hit-count guess made at receipt time.
+                                self.trace.tryArmSiblingHandoff(ct, safe_to_arm);
                                 const result = if (self.trace.config.record_exec_log) blk: {
                                     const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, trace_regs, buf);
                                     const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, trace_regs, buf);

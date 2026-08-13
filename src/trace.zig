@@ -1224,6 +1224,15 @@ pub const ArmKind = enum {
     /// Part A edge-4 bridge: a composite ordinary guard whose stub commits the
     /// dominance-scoped phi snapshot before entering the child's ordinary entry.
     region_bridge,
+    /// Part S (doc 17): native SIBLING HANDOFF. An anchor-coherent ordinary deopt
+    /// exit whose child is a trace at the SAME anchor as the parent — the native
+    /// compilation of doc 16's coherent-anchor chain. The parent's carried-home
+    /// flush leaves regs coherent at the shared anchor, so the child's ordinary
+    /// entry (its own compiled prologue guards re-validating types) is exactly the
+    /// state an ordinary dispatcher re-entry would have produced. Reuses the
+    /// ordinary-guard slot and stub verbatim; only the arm kind and the replay
+    /// production are new.
+    sibling_handoff,
 };
 
 /// A-v emitted bridge-capable stubs without publishing an edge into any of them.
@@ -1234,6 +1243,39 @@ pub const ArmKind = enum {
 /// restores the pre-A-vii world: stubs still emit, but every `.region_bridge`
 /// arm attempt release-panics in `armNativeLink` (deliberate tripwire).
 const region_bridge_arming_enabled = true;
+
+/// Part S (§S) — the native sibling handoff master switch. OFF, and it must stay off
+/// until the soundness hole below is closed.
+///
+/// The mechanism itself works and is a measured win: patching a hot ordinary-guard
+/// exit to jump straight into a same-anchor sibling fused 96% of nsieve N=9's
+/// dispatcher bursts and, once the accounting was corrected, ran 4–11% faster with
+/// byte-identical output. What it is NOT is semantics-preserving.
+///
+/// `armNativeLink`'s `.sibling_handoff` validation checks that the successor shares
+/// the anchor, takes no inputs, and is neither a loop-done nor a bridge slot. It does
+/// NOT check that the parent's register file is actually coherent AT that anchor when
+/// the exit fires — and a native deopt flushes CARRIED HOMES ONLY, leaving invariants
+/// at their entry values and never flushing internal phis. So an exit taken after the
+/// back-edge rotation hands the sibling a register image that is one rotation stale.
+/// The A-viii outer-cycle test catches exactly this: with the handoff armed it prints
+/// 108 where the unfused run prints 109 — one iteration silently dropped.
+///
+/// This is the deferral in §S.8 ("true per-exit snapshots") turning out to be
+/// load-bearing rather than an optimisation. §S states the coherence condition as "a
+/// zero-progress pre-effect deopt is coherent at the anchor"; BOTH halves were then
+/// implemented and BOTH were insufficient — `exitIsPreEffect` (static: no heap
+/// mutation precedes the exit) and the runtime `term_local == 0` filter at the charge
+/// site each still leave A-viii printing 108 instead of 109. So the premise itself is
+/// falsified, not merely under-enforced: some state the sibling's anchor entry needs
+/// is NOT reconstructible from a carried-homes flush, and identifying it is the open
+/// work. Two exits happened to be safe on nsieve, which is why the first cut passed
+/// the suite — it only ever armed ONE of them.
+///
+/// Everything below (the watch, the arm-time validator, the replay production, the
+/// accounting split) is kept because it is the part that is right; the missing piece
+/// is the eligibility proof, not the machinery.
+const sibling_handoff_arming_enabled = false;
 
 /// A loop-carried writeback: at the back-edge, tier-0 register `slot` holds the
 /// value produced by IR `ref`. The set of these is the trace's exit snapshot —
@@ -1463,6 +1505,36 @@ pub const Trace = struct {
     /// pure accelerator: results are identical either way, by construction.
     bridge_cand: []const u8 = &.{},
     bridge_cand_built: bool = false,
+
+    /// Part S — the sibling-handoff watch, deliberately a THREE-SCALAR, one-slot,
+    /// allocation-free counter rather than a `(trace, exit) -> u32` side map.
+    ///
+    /// The first cut of Part S kept a `sibling_counts` hashmap keyed by `ExitKey` and
+    /// resolved its owner with a `traceById` linear scan, both executed on EVERY
+    /// dispatcher burst terminal (472k times on nsieve N=9). Measured: the bookkeeping
+    /// cost more than the handoff saved — a 26% burst reduction that came out 15%
+    /// SLOWER on the clock. The counter therefore has to be free, not merely cheap:
+    ///
+    ///   * one watched exit at a time (`sibling_watch_exit`), so a receipt is a `u32`
+    ///     compare and an increment — no hashing, no probe, no allocation;
+    ///   * eligibility is only consulted when the watch MOVES, not per receipt;
+    ///   * `sibling_arms` is a COUNT, and its only per-receipt job is the `== 0` fast
+    ///     reject in `hasArmedSiblingHandoff`.
+    ///
+    /// A count rather than a bool because a trace can have several hot exits and each
+    /// deserves its own handoff. The first cut latched a bool on the first arm, which
+    /// silently capped nsieve at ONE arm: exit 9 fused, and exit 16 — still terminating
+    /// 304k bursts, half the remaining seam — could never be watched again. After the
+    /// arm the watch resets so the next exit can qualify; an exit that is already armed
+    /// is rejected by `siblingHandoffEligible`, so it cannot re-arm.
+    ///
+    /// Determinism is unchanged: all three are pure functions of the receipt stream,
+    /// in receipt order. The one-slot watch is *less* eager than a full per-exit map
+    /// (two co-hot exits qualify one after the other, not simultaneously), which can
+    /// only ever DELAY an arm — never arm something a map wouldn't have.
+    sibling_watch_exit: u32 = std.math.maxInt(u32),
+    sibling_watch_count: u32 = 0,
+    sibling_arms: u32 = 0,
 
     /// Memoized `nativegen.isCompositeBridgeCandidate(self, idx)` — see `bridge_cand`.
     /// Falls back to the oracle when the memo was not built.
@@ -1869,6 +1941,11 @@ pub const TraceState = struct {
     /// Cleared at every `replayLedger` entry so a stale request can never leak
     /// across ledgers.
     pending_bridge_arm: ?ExitKey = null,
+    /// Part S: one-shot arm request. Set when a `Trace.sibling_watch_count` crosses
+    /// `hotguard`; consumed by `tryArmSiblingHandoff` at the dispatcher's NEXT
+    /// successful same-anchor trace entry — so the armed child is the trace the
+    /// deterministic dispatch actually ran, never a hit-count guess made here.
+    pending_sibling_arm: ?ExitKey = null,
     /// A-vii-d.1: nonzero while a `replayLedger` walk is in progress. While set,
     /// `disarmAllLinks` DEFERS (records `pending_disarm_all`) instead of
     /// mutating the armed-link registry: later rows of the very ledger being
@@ -1999,6 +2076,9 @@ pub const TraceState = struct {
     /// 2.3b-1 continuation→inner `.link`-terminal arms) so the 2.3c-1 differential test
     /// can prove THIS arm fires; `> 0` is the "skip→ramp arm actually happened" signal.
     native_source_link_arms: u64 = 0,
+    /// Part S: how many sibling-handoff slots were armed / actually fired natively.
+    sibling_handoff_arms: u64 = 0,
+    sibling_handoff_fused: u64 = 0,
     /// 2.3c-1 (M1 half-fusion, doc 17): count of fused skip→prime-side receipts DRAINED
     /// by the dispatcher's M1 fused-`.link` consumer (interp.zig) — i.e. the arm above
     /// actually took effect and a native `ct.run` fused straight into the prime-side ramp
@@ -2243,6 +2323,131 @@ pub const TraceState = struct {
     /// Dump the `guard_failures` map (one line per `(anchor, exit_pc)` key with
     /// its count). The on-demand version of the ad-hoc iterator loops we used to
     /// paste into tests. Same double gate as `dbg`.
+    /// Part S: does an armed `.sibling_handoff` link exist for exactly this
+    /// (parent, exit) → child triple? The replay-side proof of the arm.
+    fn hasArmedSiblingHandoff(self: *const TraceState, parent: *const Trace, exit_instr: u32, child: *const Trace) bool {
+        // Fast reject: `sibling_arms` counts this parent's armed handoffs and is
+        // maintained by every arm/disarm path, so `== 0` is an exact necessary
+        // condition for the scan below to find anything. This runs once per non-final
+        // `.deopt` row in the hot replay walk; the registry scan must not.
+        if (parent.sibling_arms == 0) return false;
+        for (self.armed_links.items) |l| {
+            if (l.kind == .sibling_handoff and l.parent == parent and
+                l.slot_index == exit_instr and l.child == child) return true;
+        }
+        return false;
+    }
+
+    /// Part S / §S-a: the ANCHOR-COHERENCE proof for a handoff exit — does no
+    /// heap-mutating op precede `exit_instr` in the trace body?
+    ///
+    /// This is the eligibility check the first cut of Part S omitted, and omitting it
+    /// is not a subtlety: a native deopt flushes CARRIED HOMES only (invariants stay at
+    /// their entry values, internal phis are never flushed), so the flushed register
+    /// image is the anchor state OF THE CURRENT ITERATION. Handing that to a
+    /// same-anchor sibling therefore re-runs the current iteration from its top — sound
+    /// exactly when the iteration has not yet mutated the heap, and silently wrong
+    /// otherwise. Measured: without this check the A-viii outer-cycle test prints 108
+    /// where the unfused run prints 109, one iteration dropped.
+    ///
+    /// A linear scan rather than a `bridge_cand`-style per-trace bitset on purpose:
+    /// this is consulted only when the watch MOVES and again at arm time, both cold.
+    /// A memo here would buy nothing and cost a build/free/serialize lifecycle.
+    ///
+    /// The store ops are exactly `tropt.kindOf`'s `.astore` class. Guards (which
+    /// side-exit but mutate nothing) and `int_of_float` are deliberately fine.
+    fn exitIsPreEffect(t: *const Trace, exit_instr: u32) bool {
+        const n = @min(@as(usize, exit_instr), t.instrs.len);
+        for (t.instrs[0..n]) |ins| switch (ins.op) {
+            .astore, .astore_append, .hstore, .gstore => return false,
+            else => {},
+        };
+        return true;
+    }
+
+    /// Part S: is `exit_instr` of `t` an anchor-coherent ordinary deopt exit that
+    /// the sibling-handoff stub can drive? The stub is the existing ordinary-guard
+    /// path (resolve through `slot[ei]` → flush carried homes → append → forced-yield
+    /// → `jmp`), so eligibility is exactly the set of exits that path owns.
+    fn siblingHandoffEligible(self: *const TraceState, t: *Trace, exit_instr: u32) bool {
+        const c = switch (t.native) {
+            .compiled => |*cc| cc,
+            else => return false,
+        };
+        if (exit_instr >= c.slots.len or exit_instr >= t.instrs.len) return false;
+        // Already armed here: the slot is taken, so counting it again could only
+        // produce a redundant arm. Consulted on the watch-MOVE path only, never
+        // per receipt, so the registry scan stays off the hot path.
+        if (t.sibling_arms != 0) {
+            for (self.armed_links.items) |l| {
+                if (l.kind == .sibling_handoff and l.parent == t and l.slot_index == exit_instr)
+                    return false;
+            }
+        }
+        // Loop-done slots belong to `.loop_done_linked` (P-C option (b)), and the
+        // ordinary loop-done deopt bypasses `slot[ei]` entirely in emission.
+        if (isLoopDoneGuardIndex(t, exit_instr)) return false;
+        // Bridge candidates run the A-v bridge stub body, not the plain path.
+        if (t.isBridgeCandidate(exit_instr)) return false;
+        // The anchor-coherence proof. Without it the handoff is not
+        // semantics-preserving — see `exitIsPreEffect`.
+        if (!exitIsPreEffect(t, exit_instr)) return false;
+        return true;
+    }
+
+    /// Part S: charge one burst-terminal receipt to `(trace, exit)` and, on crossing
+    /// `hotguard`, request an arm. Pure function of the receipt stream.
+    fn noteSiblingTerminal(self: *TraceState, t: *Trace, exit_instr: u32) void {
+        if (!sibling_handoff_arming_enabled) return;
+        // Steady state (a request already in flight): one optional load and out. See
+        // `Trace.sibling_watch_exit` for why this path has to be free, not just cheap.
+        if (self.pending_sibling_arm != null) return;
+        if (t.sibling_watch_exit != exit_instr) {
+            self.dbg("sibling-watch-move: t={d} ei={d} (from ei={d} count={d}) eligible={}", .{
+                t.id, exit_instr, t.sibling_watch_exit, t.sibling_watch_count,
+                self.siblingHandoffEligible(t, exit_instr),
+            });
+            // The watch moves at most once per distinct eligible exit; eligibility
+            // (which touches `native.compiled`, the loop-done predicate and the
+            // bridge memo) is therefore NOT on the per-receipt path. An ineligible
+            // exit leaves the watch untouched, so it cannot starve the eligible one.
+            if (!self.siblingHandoffEligible(t, exit_instr)) return;
+            t.sibling_watch_exit = exit_instr;
+            t.sibling_watch_count = 0;
+        }
+        t.sibling_watch_count +|= 1;
+        if (t.sibling_watch_count == self.config.hotguard)
+            self.pending_sibling_arm = .{ .trace_id = t.id, .exit_instr = exit_instr };
+    }
+
+    /// Part S: consume a pending arm request now that the dispatcher has actually
+    /// selected and entered `child`. The armed target is therefore the trace the
+    /// deterministic dispatch ran — `hit_count` never enters the contract.
+    pub fn tryArmSiblingHandoff(self: *TraceState, child: *Trace, safe_to_arm: bool) void {
+        const key = self.pending_sibling_arm orelse return;
+        if (!safe_to_arm) return; // keep pending; observation window owns the slot
+        const parent = self.traceById(key.trace_id) orelse {
+            self.pending_sibling_arm = null; // parent retired: request is stale
+            return;
+        };
+        if (parent == child) return; // not a sibling handoff; wait for a real sibling
+        if (child.anchor.proto != parent.anchor.proto or child.anchor.pc != parent.anchor.pc)
+            return; // different anchor: this entry is not the one the request meant
+        self.pending_sibling_arm = null;
+        if (self.armNativeLink(parent, key.exit_instr, child, .sibling_handoff) catch false) {
+            self.dbg("sibling-arm: t={d} ei={d} -> t={d}", .{ parent.id, key.exit_instr, child.id });
+            self.sibling_handoff_arms +|= 1;
+            // Fast-reject key for `hasArmedSiblingHandoff`; decremented by every
+            // disarm path via `clearSiblingLatch`.
+            parent.sibling_arms +|= 1;
+            // Release the watch so this parent's NEXT hot exit can qualify. The
+            // just-armed exit is now rejected by `siblingHandoffEligible`, so the
+            // watch cannot simply land back on it.
+            parent.sibling_watch_exit = std.math.maxInt(u32);
+            parent.sibling_watch_count = 0;
+        }
+    }
+
     /// Record one dispatcher burst's ledger for the Part-B terminal telemetry
     /// (jitdbg builds only; comptime-false → zero cost in normal builds). Called
     /// from `driveDispatcherLedger` with the full burst ledger.
@@ -4048,7 +4253,24 @@ pub const TraceState = struct {
                 .deopt => local,
                 .link_terminal, .prologue_fail, .region_bridge => 0,
             };
-            const region_dest: RegionDestination = if (!is_last)
+            // Part S: is THIS row a fused sibling handoff? Resolved here, before the
+            // region receipt, because the handoff changes that receipt's destination
+            // (below) — and because the `.deopt` arm must agree with it exactly.
+            // Armed-edge provenance only, never position or opcode.
+            const sibling_succ: ?*Trace = if (!is_last and e.kind == .deopt and
+                e.reason == .normal and e.outcome == .normal and e.exit < owner.instrs.len)
+            blk: {
+                const sib = self.traceById(entries[k + 1].id) orelse break :blk null;
+                break :blk if (self.hasArmedSiblingHandoff(owner, e.exit, sib)) sib else null;
+            } else null;
+
+            // Destination `.deferred` for a handoff, NEVER `.known_trace`: this edge is
+            // deliberately absent from the structural graph (it is same-anchor), so
+            // letting `applyDestination` see the successor could close/open activations
+            // and reproduce the §A8-v cross-credit pathology.
+            const region_dest: RegionDestination = if (sibling_succ != null)
+                .deferred
+            else if (!is_last)
                 .{ .known_trace = entries[k + 1].id }
             else
                 .deferred;
@@ -4296,6 +4518,40 @@ pub const TraceState = struct {
                         // it strictly by armed-edge provenance (never the `.link` opcode,
                         // which OOBs on a fused prologue-fail) and replay the exact
                         // steering the old scalar dispatcher M1 recognizer did.
+                        // Part S: the SIBLING HANDOFF production, checked before M1.
+                        // Validated by armed-edge provenance exactly like
+                        // `.region_bridge` (never by position, never by opcode): an
+                        // armed `.sibling_handoff` link must exist for THIS
+                        // (parent, exit) whose child is THIS successor. Everything
+                        // the handoff needs is then implied by the arm's own
+                        // preconditions (same anchor, zero inputs, non-loop-done,
+                        // non-bridge slot), which `armNativeLink` enforced.
+                        if (sibling_succ != null) {
+                            self.sibling_handoff_fused +|= 1;
+                            // Credit the parent's own committed iterations to its RUN
+                            // counter — and nothing else. Emphatically NOT
+                            // `accountLedgerRow`, whose legacy-thrash half applies the
+                            // per-segment profitability VERDICT: a handoff row is a
+                            // zero-progress TRANSITION (`local == 0` by the arm's
+                            // coherence precondition), so the verdict it would render is
+                            // "unproductive segment" — a penalty strike per fused hop.
+                            // Measured: that mis-charge drove `pc=14` to `max_penalty`
+                            // within a handful of hops, gated the anchor, and collapsed
+                            // nsieve's traced time from 51% to 7.2% (an 18% wall-clock
+                            // REGRESSION from a mechanism that fused 96% of bursts).
+                            // A fused handoff never reaches the runtime, so — exactly
+                            // like a branch taken inside native code — it must be
+                            // invisible to profitability. The SIBLING's own rows carry
+                            // the work and the verdict.
+                            self.accountTraceRun(owner, local);
+                            // The successor's `cum` continues the same counter, so the
+                            // parent's iterations must leave the delta window here or
+                            // the sibling's row re-counts them.
+                            prev_cum = e.cum;
+                            // Regs are coherent at the shared anchor and the successor
+                            // row carries the rest of the burst: nothing to steer.
+                            continue;
+                        }
                         if (e.outcome != .normal)
                             @panic("replayLedger: fused M1 .deopt is a forced yield");
                         if (e.exit >= owner.instrs.len)
@@ -4329,6 +4585,17 @@ pub const TraceState = struct {
                         // itself followed by more entries is an unmodeled grammar, so
                         // hard-stop rather than silently drop the tail.
                         if (entries[k + 1].kind == .deopt) {
+                            // Part S: the ramp's OWN deopt may now be an armed
+                            // sibling-handoff source, in which case the burst
+                            // legitimately continues past it. Hand row k+1 to the
+                            // generic walk (its own production bills it) instead of
+                            // treating it as this M1's terminal.
+                            if (k + 2 < entries.len) {
+                                if (self.traceById(entries[k + 2].id)) |nxt| {
+                                    if (self.hasArmedSiblingHandoff(succ, entries[k + 1].exit, nxt))
+                                        continue;
+                                }
+                            }
                             if (k + 2 != entries.len)
                                 @panic("replayLedger: fused M1 sub-case (b) ramp deopt is not the last entry");
                             self.onSideExit(succ, 0);
@@ -4973,6 +5240,35 @@ pub const TraceState = struct {
         safe_to_arm: bool,
     ) ChainResult {
         self.dbgNoteBurst(entries); // Part-B terminal telemetry (jitdbg only)
+        // Part S: charge the burst's terminal ordinary deopt, exactly once per burst.
+        //
+        // This has to be the DRIVER, not `replayLedger`: a walk can return a directive
+        // (`run_inner_from`, `run_continuation`) from an interior row and never visit
+        // the last one. Siting the charge at the walk's terminal-`.deopt` arm looked
+        // cheaper — `owner` is already resolved there — but it silently missed the
+        // dominant exit: on nsieve N=9 it saw only 25,939 of the 330,000 terminals, so
+        // `t=4 ei=16` (304k bursts, half the remaining seam) could never qualify.
+        //
+        // The `traceById` scan here is a handful of pointer compares over the live
+        // trace cache. It was never the expense: what made the first cut of Part S a
+        // 15% REGRESSION was the per-receipt `AutoHashMap` probe it fed (now a
+        // three-scalar watch on the trace itself), not the resolve.
+        if (entries.len != 0) {
+            const term = entries[entries.len - 1];
+            // ZERO-PROGRESS is the other half of the coherence condition (§S: "a
+            // zero-progress pre-effect deopt is coherent at the anchor"), and it is a
+            // RUNTIME property — `exitIsPreEffect` proves the static half only. A
+            // terminal that committed iterations in this segment left the back-edge
+            // rotation applied, so its flushed image is not the image the sibling's
+            // anchor entry expects.
+            const prev_cum = if (entries.len >= 2) entries[entries.len - 2].cum else 0;
+            const term_local = term.cum -| prev_cum;
+            if (term.kind == .deopt and term.reason == .normal and
+                term.outcome == .normal and term_local == 0)
+            {
+                if (self.traceById(term.id)) |owner| self.noteSiblingTerminal(owner, term.exit);
+            }
+        }
         const max_hops: usize = 8;
         var linked_completed: usize = 0;
         var resume_pc: u32 = seed.anchor.pc;
@@ -6537,6 +6833,25 @@ pub const TraceState = struct {
                 std.debug.assert(!is_loopdone);
                 if (is_loopdone) return false;
             },
+            // Part S: same slot shape as `.ordinary_guard` (the stub is literally
+            // the same code path) — never a loop-done slot (that one is reserved
+            // for `.loop_done_linked`), never a bridge candidate (whose stub takes
+            // the A-v bridge body instead of the plain resolve-through-slot path).
+            .sibling_handoff => {
+                std.debug.assert(!is_loopdone);
+                if (is_loopdone) return false;
+                if (parent.isBridgeCandidate(slot_index)) return false;
+                // Re-proved at arm time, not merely trusted from the watch: this is
+                // the predicate that makes the handoff sound (`exitIsPreEffect`), and
+                // the validator is the last gate before a physical slot is patched.
+                if (!exitIsPreEffect(parent, slot_index)) return false;
+                // The defining property: parent and child share an anchor.
+                if (child.anchor.proto != parent.anchor.proto or
+                    child.anchor.pc != parent.anchor.pc) return false;
+                // `ordinary_entry` cannot seed synthetic inputs (that is
+                // dispatcher-side), so a child needing them is not stub-enterable.
+                if (child.inputs.len != 0) return false;
+            },
         }
         // The child/target association is derived here, never trusted from a caller.
         // A `.link` terminal must enter linked loop-done mode; both ordinary guard
@@ -6550,7 +6865,7 @@ pub const TraceState = struct {
         };
         const target = switch (kind) {
             .link_terminal => child_c.linked_entry orelse return false,
-            .ordinary_guard, .loop_done_linked => child_c.ordinary_entry orelse return false,
+            .ordinary_guard, .loop_done_linked, .sibling_handoff => child_c.ordinary_entry orelse return false,
             // A-vii is the first increment allowed to call this arm. Missing the
             // required re-guarding entry is therefore a wiring bug, not ordinary
             // ineligibility: fail loudly before publishing an unsafe bare jump.
@@ -6682,6 +6997,7 @@ pub const TraceState = struct {
             self.dbg("retire-reset: link parent id={d} slot={d} child id={d} (retiring id={d})", .{
                 link.parent.id, link.slot_index, link.child.id, t.id,
             });
+            clearSiblingLatch(link);
             if (link.child == t and link.parent != t) {
                 switch (link.parent.native) {
                     .compiled => |*c| if (link.slot_index < c.slots.len) {
@@ -6720,6 +7036,7 @@ pub const TraceState = struct {
         self.native_link_disarms +|= @intCast(self.armed_links.items.len);
         const shared_exit = self.mcode_arena.trampoline_exit orelse 0;
         for (self.armed_links.items) |link| {
+            clearSiblingLatch(link);
             switch (link.parent.native) {
                 .compiled => |*c| if (link.slot_index < c.slots.len) {
                     c.slots[link.slot_index] = shared_exit;
@@ -6730,6 +7047,18 @@ pub const TraceState = struct {
         self.armed_links.clearRetainingCapacity();
     }
 
+    /// Part S: drop a `.sibling_handoff` link's parent-side latch. EVERY path that
+    /// removes an armed link must call this, or `hasArmedSiblingHandoff`'s fast reject
+    /// stops being an exact necessary condition (it would keep saying "maybe" for a
+    /// parent with no link, costing a registry scan) and the watch could never
+    /// re-qualify. Cheap enough to call unconditionally on any link kind.
+    fn clearSiblingLatch(link: NativeLink) void {
+        if (link.kind != .sibling_handoff) return;
+        link.parent.sibling_arms -|= 1;
+        link.parent.sibling_watch_exit = std.math.maxInt(u32);
+        link.parent.sibling_watch_count = 0;
+    }
+
     /// A-vii-d.1 (review blocker 3): disarm ONE armed link by registry index —
     /// reset its parent's physical slot to the shared trampoline exit, count the
     /// disarm, and drop the record. Infallible (publish-phase safe). Uses
@@ -6737,6 +7066,7 @@ pub const TraceState = struct {
     fn disarmLinkAt(self: *TraceState, idx: usize) void {
         const link = self.armed_links.items[idx];
         self.native_link_disarms +|= 1;
+        clearSiblingLatch(link);
         const shared_exit = self.mcode_arena.trampoline_exit orelse 0;
         switch (link.parent.native) {
             .compiled => |*c| if (link.slot_index < c.slots.len) {
