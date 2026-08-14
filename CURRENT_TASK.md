@@ -24,10 +24,21 @@ The measurement protocol frozen in §B3.18 ran on the e56252f tree:
   LuaJIT side (same flag in both prior boards).
 - Tree restored to promotion ON, `just release` rebuilt, hashgate PASS.
 
-Remaining before B-3d final close: the owed codex `gpt-5.6-sol` review of
-the whole B-3d design+implementation (quota returns 2026-08-20). Recorded
-next candidates: B-4 trace-quality probation (nsieve-bit at 6.6×),
-grid_matmul 5.6×, scimark family (untraced, 23–73×).
+The owed codex `gpt-5.6-sol` review ran same day (quota returned early
+2026-08-14): **APPROVE**, zero BLOCKER/MAJOR/MINOR. It independently
+verified: every mutation path (membership growth, changed re-arms, disarms,
+trace retirement, defs mutation, region close, activation change, unfreeze,
+cache/state teardown) reaches demotion; identical non-sibling re-arms
+short-circuit while sibling re-arms keep latch balance; edges/summary/
+metadata transfer ownership only after successful publication and are freed
+exactly once; R1 one-set-per-region enforced plus exclusive physical-exit
+ownership; D4 sound from `emitSilentEpilogue`'s write order (terminal
+metadata + ordinal precede the `silent_transitions` bump, no route back
+into silence after reporting starts). One NIT — residual "cycle"
+locals/comments in the migrated code — fixed in 3f77f34 (42 lines, script
+/tmp/b3d_nit_rename.py dry-run first; tests both builds + hashgate PASS).
+**B-3d is CLOSED.** Recorded next candidates: B-4 trace-quality probation
+(nsieve-bit at 6.6×), grid_matmul 5.6×, scimark family (untraced, 23–73×).
 
 ## Status 2026-08-14 (LATEST-54) — **B-3d.2+.3 LANDED MERGED (e56252f): set candidacy + measured drain. Next: B-3d.4 frozen measurement.**
 

@@ -7,9 +7,13 @@ three predictions verified (suffix drains 3411→13 ≈ exhaustion count, seam
 residual time bucket being outer-loop warm-up attribution), budget sweep
 flat/byte-identical, full board both states — promotion is worth nsieve
 2.1×→**1.0× LuaJIT (parity, 13.6 vs 13.5 ms)**, sieve_int 2.1×→1.0×,
-pi_leibniz 3.7×→2.7×, no regressions. Owed before final close: codex
-`gpt-5.6-sol` review of the whole B-3d design+implementation when quota
-returns 2026-08-20. Earlier same day: B-3d.2+.3 set candidacy + measured
+pi_leibniz 3.7×→2.7×, no regressions. The owed codex `gpt-5.6-sol` review
+ran same day (quota returned early): **APPROVE**, zero BLOCKER/MAJOR/MINOR
+— it independently verified every demotion funnel reaches teardown, exactly-
+once ownership of the set allocations, R1 enforcement, and D4's soundness
+from the epilogue write order; the one NIT (residual "cycle" locals/comments
+in the migrated code) is fixed in 3f77f34. **B-3d is CLOSED.** Earlier same
+day: B-3d.2+.3 set candidacy + measured
 drain LANDED MERGED (e56252f): the promoted unit is now the frozen region's
 canonical
 armed-edge SET (`PromotedCycle`→`PromotedSet`, D1 region-total candidacy with
