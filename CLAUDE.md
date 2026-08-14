@@ -70,6 +70,22 @@ stdlib function, update its row in the **same change** — flip `status`, move t
 `tier`, or add the row — so the inventory never drifts from the tree (global
 Rule #3 spirit). It's the at-a-glance "what's left to replicate" for lune.
 
+### Rule Z-6: We are building a LANGUAGE, not a benchmark-optimiser. NEVER optimise for a single benchmark!!!
+
+**We do NOT optimise for benchmarks — we optimise for general language speed. The
+benchmarks are a MEANS TO AN END, never the end itself!!!** When you have a choice
+between something that helps a single test case / benchmark and something that
+helps all of them (or is otherwise more general), you pick the general thing —
+**ALWAYS**, even when the narrow fix looks cheaper or lands sooner. A change that
+speeds up `nsieve` (or any one benchmark) but does nothing for programs in general
+is the WRONG change; a change that makes the language faster across the board and
+*also* happens to help `nsieve` is the RIGHT one. If a design ever starts bending
+toward "what does this specific benchmark need," STOP — that's the smell of
+building an "nsieve-optimised language" instead of a fast language. A benchmark is
+just an instrument that tells us where general speed is missing; fix the general
+gap it reveals, not the instrument's reading. When in doubt, prefer the more
+general mechanism that still helps the benchmark at hand.
+
 ## Build
 
 Use the `just` recipes (`justfile`) as the canonical entry points — they wrap

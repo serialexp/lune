@@ -1048,3 +1048,27 @@ change too:
 
 Nothing gates `zig build wasm` in `just test`, so it rotted silently. Fix +
 consider adding the wasm build to CI/justfile as a compile-only gate.
+
+## Pre-existing: faulted-but-live VM can be re-run without resetting depth/stack_top (found 2026-07-17, doc-17 F-7 grounding)
+
+Non-catchable / uncaught errors deliberately leave `vm.frames`/`vm.depth`/`stack_top`
+raised so `describeFault` can read the live top frame (`interp.zig:1215-1223`,
+`callValue` `:1454-1457` — the "errors don't unwind frames" invariant). But there is
+NO error-exit hook and NO poisoned-VM guard: a host that calls `run`/`start` again on a
+faulted-but-live VM does NOT trip an assert, and `run` (`:1025`) only disarms native
+links (`beginTopLevelEpoch`) — it does NOT zero `depth`/`stack_top` before pushing the
+new main frame. So `pushFrame` (`:1350`) writes `frames[self.depth]` at the leftover
+nonzero depth → the new run's main frame lands on top of the faulted stack instead of
+index 0. Latent; only bites a host that reuses a VM after an uncaught error. Fix options:
+zero depth/stack_top in `beginTopLevelEpoch`, or a poisoned-VM precondition. Orthogonal
+to exit-branch patching (doc 17); noted here so it isn't lost.
+
+## nsieve historical drift: July baseline was ~60ms jit, now ~103ms (2026-08-12)
+
+The A-vii-e protocol compared against the immediate pre-flip commit (9ee7d4b,
+~101ms bench jit at N=7) — but the July full-suite baseline
+(bench/results/20260715-101717-0753b7d.tsv) had nsieve jit at 60.2ms. Something
+between 0753b7d (July 15) and 9ee7d4b (Aug 12) cost nsieve ~40ms — plausibly the
+A-vii-c gate-consumption flip or config changes, but unmeasured. Out of scope for
+the A-vii-e arc (its baseline was the pre-flip tree by design); worth a bisect
+before trusting "nsieve is at its historical best".
