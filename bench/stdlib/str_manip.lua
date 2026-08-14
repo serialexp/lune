@@ -14,7 +14,9 @@
 
 local sub, upper, lower = string.sub, string.upper, string.lower
 local reverse, len = string.reverse, string.len
-local byte, char, rep = string.codepoint, string.char, string.rep
+-- string.codepoint is lune's replacement for string.byte (doc 06 S-B); LuaJIT
+-- has only string.byte. The base string is all-ASCII, so they agree exactly.
+local byte, char, rep = string.codepoint or string.byte, string.char, string.rep
 
 local base = "The quick brown Fox jumps over the lazy Dog 0123456789"
 
