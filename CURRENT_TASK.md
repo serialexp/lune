@@ -1,5 +1,41 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-53) — **B-3d.1 funnel hygiene LANDED (63dd733). Next: B-3d.2 (set candidacy + promotion).**
+
+First gated sub-step of the accepted B-3d landing plan (doc §B3.18):
+
+- **R6 identical-re-arm short-circuit** in `armNativeLink`'s re-arm branch:
+  return true immediately when child, kind, AND slot target are all unchanged
+  — identical convergence re-arms (2c-E sites 3/4) no longer demote owned
+  sets via `prepareSlotMutation`. The target compare is load-bearing (a
+  recompiled child at a new address must still take the mutation path).
+  `.sibling_handoff` is excluded: `publishSiblingArm` bumps the latch +1
+  after a true return, balanced only by the re-arm branch's
+  `clearSiblingLatch` — the short-circuit would leak it (pinned by the
+  extended sibling-latch test asserting `sibling_arms` stays 1 on a double
+  publish).
+- **R2 demote-on-unfreeze** in `flushRegionWindow`: the low-yield unfreeze
+  now calls `demotePromotionsForRegionReason(key, .unfreeze)` in the same
+  act (new `DemotionReason.unfreeze` + counter + dump line), closing the
+  pre-existing Rule-#0.5 panic path (unfreeze with live patches →
+  `driveSilentBurst` frozen-accumulator panic on next drain). Covers both
+  the direct depth-0 path and the depth>0 queued/`applyPendingDisarms` path
+  (new test pins both).
+- Tests: slot-mutation test reworked (identical re-arm asserts NO demote;
+  changed-relation re-arm to a new trace still demotes + unpatches);
+  new "low-yield unfreeze demotes in the same act" test.
+
+Gates: `just test` green both builds; hashgate seven hashes + three repros
+PASS with promotion ON and OFF (default flipped for the OFF leg, restored).
+Telemetry (nsieve N=7, -Djit-debug): demotions re-attribute
+`region-close 3→1, unfreeze 0→2` (total still 4), every other counter
+byte-identical (candidates=16 promotions=4 bursts=3557 transitions=612900
+budget=146 barren=0 suffix=3411) — proof the R2 window was genuinely live
+at activation end, and that demoting earlier is behavior-equivalent here.
+
+Owed: codex `gpt-5.6-sol` review of the whole B-3d design+implementation
+when quota returns 2026-08-20, before the final landing gate (B-3d.4).
+
 ## Status 2026-08-14 (LATEST-52) — **B-3d set-promotion design ACCEPTED (doc §B3.16–§B3.18) after three adversarial rounds. Next: land B-3d.1 (funnel hygiene).**
 
 B-3d generalizes silent promotion from exact detected rings to the frozen

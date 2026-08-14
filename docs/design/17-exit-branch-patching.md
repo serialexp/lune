@@ -1,7 +1,14 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
 Status: **all eight §A8 steps are landed as of 2026-08-12** — step 8 (A-viii, outer-cycle disarm coverage) closed the sequence: the outer cycle is pinned as a *simultaneously* armed closed cycle (`native_link_peak >= 3`; nsieve 4) that fires, an open observation window is pinned to contain it (nothing arms, output-transparent, still dispatcher-mediated native entries per R2-4), the **mid-epoch** transition is driven end-to-end through a host-installed native (which measures a live 3-link multi-kind cycle at the window-open instant, its complete teardown, and continued dispatcher-mediated trace entries afterward), and `disarmAllLinks` is pinned exhaustive over all four production edge kinds incl. `.loop_done_linked` and `.region_bridge`. A-viii's first landing was corrected over two codex review rounds — the "mid-epoch window is host-unreachable" claim (false: natives receive the `*Vm`), a fictional unit topology (now four kinds on genuinely distinct physical slot shapes, all armed through `armNativeLink`), an unsound cross-run `entries` comparison, and `entries` being the wrong counter for R2-4 at all (new `native_entries`, bumped only when the dispatcher commits to a native body) — see §A8-iv. One residual, tracked as its own Outstanding bullet: no test observes a live `.region_bridge` link at a window-open instant, since any probe placement that leaves the bridge armed leaves the registry empty at the call — not achieved in this workload, not shown impossible. Earlier: **§A8 step 7 (A-vii, the edge-4 FLIP) COMPLETE 2026-08-12**: landed (A-vii-c/c.1 gate consumption, A-vii-d/d.1 arming + successor overlay + receipt-sited two-phase arm + codex-blocker fix fcee9b7), reviewed (codex BLOCKER→fix→APPROVE), and measured per the frozen A-vii-e protocol — which surfaced and fixed a 2× per-instruction observer overhead (A-vii-e.1 `ObserverFast` bitset fast path; the raw flip regressed nsieve ~2× with the observer scan at 49% of runtime, the bridge itself measured cost-neutral by ablation). Final vs pre-flip: nsieve N=9 −9%, N=7 −6%, nsieve:24 coverage 56.7%→94.9% traced, six-workload output identity + bit-identical stats counters. Remaining in §A8: step 8 (A-viii disarm coverage), then the native in-page handoff (§A2.4) to convert the coverage gain to wall-clock.
-Last updated: 2026-08-14 (**B-3d set-promotion design ACCEPTED after three
+Last updated: 2026-08-14 (**B-3d.1 funnel hygiene LANDED (63dd733): R6
+identical-re-arm short-circuit at the `armNativeLink` funnel (target compare
+load-bearing, `.sibling_handoff` excluded for latch balance) + R2
+demote-on-unfreeze in `flushRegionWindow` (`DemotionReason.unfreeze`). Gates
+PASS both builds, seven hashes + three repros, promotion ON and OFF; nsieve
+N=7 telemetry shows the R2 window was live (demotions re-attribute
+region-close 3→1 / unfreeze 0→2, all other counters byte-identical). Next:
+B-3d.2 set candidacy + promotion.** Design context: B-3d ACCEPTED after three
 review rounds — §B3.16 draft, §B3.17 round-2 revision (BLOCKER: the set
 growth/multiplicity knot → enforced one-set-per-region with demote-and-regrow;
 MAJORs: trigger visibility, barren-unfreeze live-patch panic, verdict-cap
@@ -4576,6 +4583,15 @@ seven hashes + three repros ON/OFF):**
   demote-on-unfreeze in `flushRegionWindow` (+ `DemotionReason.unfreeze`,
   counters/log plumbing); the D3-independent part of the false-strike fix
   is NOT split out — it lands with b-3d.3's evidence rewrite.
+  **LANDED (63dd733, 2026-08-14).** Gates: `just test` green both builds,
+  hashgate seven hashes + three repros PASS with promotion ON and OFF.
+  Telemetry proof the R2 window was live, not theoretical: nsieve N=7
+  demotions re-attribute `region-close 3→1, unfreeze 0→2` (total still 4)
+  with every other counter byte-identical (candidates=16 promotions=4
+  bursts=3557 transitions=612900 budget=146 barren=0 suffix=3411) — i.e.
+  low-yield unfreezes were occurring at activation end while promotions
+  were live; demotion now fires at the unfreeze instant instead of later
+  at region close, behavior-equivalent on this suite.
 - **B-3d.2 — set candidacy + promotion.** Replace `detectPhysicalCycle`'s
   ring grammar with the D1 set candidate (region-total armed-member edges,
   every-row-∈-candidate + per-adjacent-pair child-match, canonical sort,
