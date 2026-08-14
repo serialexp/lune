@@ -1,8 +1,17 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
 Status: **all eight §A8 steps are landed as of 2026-08-12** — step 8 (A-viii, outer-cycle disarm coverage) closed the sequence: the outer cycle is pinned as a *simultaneously* armed closed cycle (`native_link_peak >= 3`; nsieve 4) that fires, an open observation window is pinned to contain it (nothing arms, output-transparent, still dispatcher-mediated native entries per R2-4), the **mid-epoch** transition is driven end-to-end through a host-installed native (which measures a live 3-link multi-kind cycle at the window-open instant, its complete teardown, and continued dispatcher-mediated trace entries afterward), and `disarmAllLinks` is pinned exhaustive over all four production edge kinds incl. `.loop_done_linked` and `.region_bridge`. A-viii's first landing was corrected over two codex review rounds — the "mid-epoch window is host-unreachable" claim (false: natives receive the `*Vm`), a fictional unit topology (now four kinds on genuinely distinct physical slot shapes, all armed through `armNativeLink`), an unsound cross-run `entries` comparison, and `entries` being the wrong counter for R2-4 at all (new `native_entries`, bumped only when the dispatcher commits to a native body) — see §A8-iv. One residual, tracked as its own Outstanding bullet: no test observes a live `.region_bridge` link at a window-open instant, since any probe placement that leaves the bridge armed leaves the registry empty at the call — not achieved in this workload, not shown impossible. Earlier: **§A8 step 7 (A-vii, the edge-4 FLIP) COMPLETE 2026-08-12**: landed (A-vii-c/c.1 gate consumption, A-vii-d/d.1 arming + successor overlay + receipt-sited two-phase arm + codex-blocker fix fcee9b7), reviewed (codex BLOCKER→fix→APPROVE), and measured per the frozen A-vii-e protocol — which surfaced and fixed a 2× per-instruction observer overhead (A-vii-e.1 `ObserverFast` bitset fast path; the raw flip regressed nsieve ~2× with the observer scan at 49% of runtime, the bridge itself measured cost-neutral by ablation). Final vs pre-flip: nsieve N=9 −9%, N=7 −6%, nsieve:24 coverage 56.7%→94.9% traced, six-workload output identity + bit-identical stats counters. Remaining in §A8: step 8 (A-viii disarm coverage), then the native in-page handoff (§A2.4) to convert the coverage gain to wall-clock.
-Last updated: 2026-08-14 (**B-3d.2+.3 set candidacy + measured drain LANDED
-MERGED (e56252f): the promoted unit is now the frozen region's canonical
+Last updated: 2026-08-14 (**B-3d COMPLETE — .4 frozen measurement DONE: all
+three predictions verified (suffix drains 3411→13 ≈ exhaustion count, seam
+30.6%→6.2% of run, tier-0-has-trace 12,468→2,354 iterations with the
+residual time bucket being outer-loop warm-up attribution), budget sweep
+flat/byte-identical, full board both states — promotion is worth nsieve
+2.1×→**1.0× LuaJIT (parity, 13.6 vs 13.5 ms)**, sieve_int 2.1×→1.0×,
+pi_leibniz 3.7×→2.7×, no regressions. Owed before final close: codex
+`gpt-5.6-sol` review of the whole B-3d design+implementation when quota
+returns 2026-08-20. Earlier same day: B-3d.2+.3 set candidacy + measured
+drain LANDED MERGED (e56252f): the promoted unit is now the frozen region's
+canonical
 armed-edge SET (`PromotedCycle`→`PromotedSet`, D1 region-total candidacy with
 ledger-as-evidence, D3/D4 measurement-resolved sibling return + terminal,
 R1 one-set-per-region with `membership_growth` demote-and-regrow at the arm
@@ -4649,6 +4658,22 @@ seven hashes + three repros ON/OFF):**
   single digits, tier-0-has-trace ~0), re-sweep `--trace-silent-budget`
   (the knob goes live once bursts end mainly by budget), full board, both
   promotion states, telemetry sanity, doc + CURRENT_TASK records.
+  **DONE (2026-08-14).** All three predictions verified against nsieve 9
+  release jit-stats: (1) suffix drains 3411 → 13 vs exhaustions 174 —
+  bursts now end almost exclusively by budget; (2) steering seam 30.6% →
+  **6.2%** of run (replayLedger 12,427 → 780 walks); (3) tier-0-has-trace
+  by *iteration count* 12,468 → 2,354 — the residual ~13.8%-of-run *time*
+  bucket is 78 interpreted warm-up iterations of the outer `nsieve:4`
+  loop at ~370k cyc each (nested-work attribution), while the former
+  feedstock anchors `nsieve:14`/`nsieve:24` run 98.9–99.3% traced by
+  time. Budget re-sweep (1024 … 2^30, nsieve 11, best-of-5): flat within
+  noise, output byte-identical at every value — the knob stays a
+  non-lever, now because the seam it metered is gone. Full board both
+  states (TSVs 20260814-121953 ON / 20260814-122259 OFF): promotion is
+  worth nsieve 2.1×→**1.0× LuaJIT** (13.6ms vs 13.5ms — parity),
+  sieve_int 2.1×→1.0×, pi_leibniz 3.7×→2.7×; every other row within
+  noise, no regressions; the sole correctness flag (str_manip luajit=ERR)
+  is pre-existing on the LuaJIT side across prior boards.
 
 ##### A.1 — The edge-4 bridge (BLOCKER 1)
 

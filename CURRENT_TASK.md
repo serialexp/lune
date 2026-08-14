@@ -1,5 +1,34 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-55) — **B-3d.4 frozen measurement DONE → B-3d COMPLETE. nsieve is at LuaJIT PARITY (1.0×).**
+
+The measurement protocol frozen in §B3.18 ran on the e56252f tree:
+
+- **Predictions verified** (nsieve 9, release jit-stats): suffix drains
+  3411 → 13 against 174 budget exhaustions (bursts now end almost
+  exclusively by budget); steering seam 30.6% → 6.2% of run (replayLedger
+  12,427 → 780 walks, wall 72.2 → ~49–53 ms); tier-0-has-trace by
+  iteration count 12,468 → 2,354. The residual tier-0-has-trace *time*
+  bucket (~13.8% of run) is 78 interpreted warm-up iterations of the
+  outer `nsieve:4` loop at ~370k cyc each — nested-work attribution, not
+  a seam: the former feedstock anchors nsieve:14/24 run 98.9–99.3%
+  traced by time.
+- **Budget re-sweep** (`--trace-silent-budget` 1024…2^30, nsieve 11,
+  best-of-5): flat within noise, output byte-identical at every value.
+  The knob stays a non-lever — now because the seam it metered is gone.
+- **Full board, both promotion states** (bench/results/20260814-121953
+  ON, 20260814-122259 OFF): promotion is worth nsieve 2.1× → **1.0×
+  LuaJIT (13.6 vs 13.5 ms — parity)**, sieve_int 2.1× → 1.0×,
+  pi_leibniz 3.7× → 2.7×; every other row within noise, no regressions.
+  The one correctness flag (str_manip luajit=ERR) is pre-existing on the
+  LuaJIT side (same flag in both prior boards).
+- Tree restored to promotion ON, `just release` rebuilt, hashgate PASS.
+
+Remaining before B-3d final close: the owed codex `gpt-5.6-sol` review of
+the whole B-3d design+implementation (quota returns 2026-08-20). Recorded
+next candidates: B-4 trace-quality probation (nsieve-bit at 6.6×),
+grid_matmul 5.6×, scimark family (untraced, 23–73×).
+
 ## Status 2026-08-14 (LATEST-54) — **B-3d.2+.3 LANDED MERGED (e56252f): set candidacy + measured drain. Next: B-3d.4 frozen measurement.**
 
 The core of B-3d, landed as ONE gated change. The plan's .2/.3 split proved
