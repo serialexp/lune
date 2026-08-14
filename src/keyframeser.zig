@@ -25,6 +25,7 @@ const value = @import("value.zig");
 const object = @import("object.zig");
 const string = @import("string.zig");
 const table = @import("table.zig");
+const arr = @import("array.zig");
 const function = @import("function.zig");
 const bytecode = @import("bytecode.zig");
 const interp = @import("interp.zig");
@@ -65,7 +66,7 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v6 (A-vi foundation): `FrameRef` gained the live vararg cursor
 /// (`varargs_base`/`varargs_count`), making a keyframe captured inside an active
 /// vararg callee semantically complete.
-pub const snapshot_format_version: u32 = 6;
+pub const snapshot_format_version: u32 = 7;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -131,12 +132,12 @@ pub fn toSchemaHeapObject(a: std.mem.Allocator, vm: *Vm, h: *GcHeader) !schema.H
         .string => .{ .HeapString = .{ .bytes = string.String.fromHeader(h).bytes() } },
         .table => blk: {
             const t = table.Table.fromHeader(h);
-            const array = try a.alloc(schema.SnapValue, t.array.len);
+            const array = try a.alloc(schema.SnapValue, t.array.asize);
             // Capture emits *logical* Values via `array.get`, so the snapshot bytes
             // are independent of the in-memory lane (a packed bool/int array and an
             // unpacked `.value` array with the same logical contents serialize
             // identically). `get` is 1-based.
-            for (0..t.array.len) |i| array[i] = toSchemaValue(t.array.get(i + 1));
+            for (0..t.array.asize) |i| array[i] = toSchemaValue(t.array.get(i));
             const kvs = try sortedHashEntries(a, t);
             const entries = try a.alloc(schema.TableEntry, kvs.len);
             for (kvs, 0..) |kv, i| {
@@ -214,7 +215,7 @@ const Walk = struct {
             .string, .native => {},
             .table => {
                 const t = table.Table.fromHeader(h);
-                for (0..t.array.len) |i| self.pushValue(t.array.get(i + 1));
+                for (0..t.array.asize) |i| self.pushValue(t.array.get(i));
                 // Enumerate hash children in the same canonical key order the
                 // serializer uses, so BFS object-discovery order (and thus the
                 // `objects[]` array layout) is insertion-order-independent too.
@@ -372,6 +373,7 @@ const RestoreError = error{
     UnknownNative, // a HeapNative.name is not in the native registry
     GlobalsNotATable, // globals_id resolves to a non-table object
     MetatableNotATable, // a HeapTable.metatable_id resolves to a non-table object
+    ArrayResidentKeyInHash, // a hash entry's normalized integer key is array-covered (`inArray(k, asize)`, incl. float-spelled) — it would be shadowed by the array slot (corrupt/hand-forged snapshot)
     FrameNotAClosure, // a frame's closure_id resolves to a non-closure
     FrameWindowMismatch, // a frame's base != the running sum of prior register windows
     InvalidFrameVarargs, // a frame's vararg cursor is non-canonical or outside its live prefix
@@ -664,12 +666,40 @@ pub fn restoreSnapshot(
             .HeapString, .HeapNative => {},
             .HeapTable => |ht| {
                 const t = table.Table.fromHeader(h);
-                // Array part: append in order (faithfully round-trips nil holes).
+                // Array part: append in order — v7 is positional 0-based (doc 18
+                // D5): serialized entry `i` IS logical key / physical slot `i`,
+                // holes ride in-band as nils (the ubiquitous slot-0 hole
+                // included). Append starts at key 0 under identity mapping, so a
+                // plain in-order append reproduces the split exactly.
                 for (ht.array) |sv| try t.array.append(gpa, try fromSchemaValue(sv, &idmap));
-                // Hash part: straight into the hash, preserving the recorded split.
+                // Bulk lane rebuild (doc 18 D5): the appends above leave the part
+                // `.value`/unfrozen even for a homogeneous narrow run — a leading
+                // nil (e.g. the slot-0 hole) defeats append's eager first-value
+                // lane commit. Left that way, a restored sieve is untraceable
+                // (the recorder aborts on `.value`) and a restored deflated grid
+                // can never re-inflate (inflation requires packed numeric rows).
+                // Recompute the optimal lane over the present values exactly as
+                // rehash's one-shot commit does: narrow → repack + freeze
+                // (monotonic from here); `.value` → stay unfrozen so a later
+                // rehash may still narrow. In-memory only: invisible to logical
+                // values and to a re-capture, so determinism is untouched.
+                if (t.array.asize > 0 and !t.array.frozen) {
+                    const lane = t.array.optimalLane();
+                    if (lane.isNarrow()) {
+                        try t.array.repack(gpa, lane);
+                        t.array.frozen = true;
+                    }
+                }
+                // Hash part: straight into the hash, preserving the recorded
+                // split — but never an array-covered key (v7 validation): such an
+                // entry would be permanently shadowed by the array slot on every
+                // read, a state no capture can produce.
                 for (ht.entries) |e| {
                     const k = try fromSchemaValue(e.key, &idmap);
                     const v = try fromSchemaValue(e.val, &idmap);
+                    const nk = table.normalizeKey(k);
+                    if (nk.isInt() and arr.ArrayPart.inArray(nk.asInt(), t.array.asize))
+                        return error.ArrayResidentKeyInHash;
                     try t.restoreEntry(gpa, k, v);
                 }
                 // Metatable edge (chunk 2a): 1-based optional id — 0 = none,
@@ -1833,9 +1863,10 @@ test "restore the hand-built edge corpus (cycles, open+closed upvalues, frames)"
     try testing.expectEqual(@as(u32, 2), vm.globals.header.id);
     const self_ref = vm.globals.get(Value.int(7));
     try testing.expect(self_ref.isHeap() and self_ref.asHeap() == &vm.globals.header);
-    // Array part round-tripped (key 1 == 10, key 2 == 2.5, key 3 == true).
-    try testing.expectEqual(@as(i64, 10), vm.globals.get(Value.int(1)).asInt());
-    try testing.expectEqual(@as(f64, 2.5), vm.globals.get(Value.int(2)).asFloat());
+    // Array part round-tripped (v7 positional 0-based: key 0 == 10,
+    // key 1 == 2.5, key 2 == true).
+    try testing.expectEqual(@as(i64, 10), vm.globals.get(Value.int(0)).asInt());
+    try testing.expectEqual(@as(f64, 2.5), vm.globals.get(Value.int(1)).asFloat());
 
     // Frames rebound (depth 2; frame 0 = closure 3, frame 1 = closure 6, which
     // has zero upvalues — exercising both the N- and 0-upvalue closure shapes).
@@ -1869,6 +1900,129 @@ fn expectRestoreError(file: schema.SnapshotFile, root: *const Proto, want: Resto
         return error.TestUnexpectedSuccess;
     } else |err| {
         try testing.expectEqual(want, err);
+    }
+}
+
+test "v7 validation: an array-covered hash key (int or float-spelled) is rejected" {
+    var rootp = Proto{ .code = &.{}, .name = "root", .id = 0 };
+
+    // Integer key 0 while the array covers slots 0..1 → shadowed → reject.
+    try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
+        .globals_id = 0,
+        .string_metatable_id = 0,
+        .next_obj_id = 1,
+        .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
+            .array = &.{ sInt(10), sInt(11) },
+            .entries = &.{.{ .key = sInt(0), .val = sInt(99) }},
+            .metatable_id = 0,
+        } } }},
+        .stack = &.{},
+        .frames = &.{},
+        .open_upvalues = &.{},
+        .loaded_chunks = &.{},
+    } }, &rootp, error.ArrayResidentKeyInHash);
+
+    // Float-spelled 0.0 normalizes to integer 0 → same rejection.
+    try expectRestoreError(.{ .version = snapshot_format_version, .keyframe = .{
+        .globals_id = 0,
+        .string_metatable_id = 0,
+        .next_obj_id = 1,
+        .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
+            .array = &.{sInt(10)},
+            .entries = &.{.{ .key = sFloat(0.0), .val = sInt(99) }},
+            .metatable_id = 0,
+        } } }},
+        .stack = &.{},
+        .frames = &.{},
+        .open_upvalues = &.{},
+        .loaded_chunks = &.{},
+    } }, &rootp, error.ArrayResidentKeyInHash);
+
+    // A key just past the extent (== asize) is a legitimate hash resident.
+    {
+        const gpa = testing.allocator;
+        const vm = try restoreSnapshot(gpa, .{ .version = snapshot_format_version, .keyframe = .{
+            .globals_id = 0,
+            .string_metatable_id = 0,
+            .next_obj_id = 1,
+            .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
+                .array = &.{sInt(10)},
+                .entries = &.{.{ .key = sInt(1), .val = sInt(99) }},
+                .metatable_id = 0,
+            } } }},
+            .stack = &.{},
+            .frames = &.{},
+            .open_upvalues = &.{},
+            .loaded_chunks = &.{},
+        } }, &rootp, NativeRegistry.base());
+        defer {
+            vm.deinit();
+            gpa.destroy(vm);
+        }
+        try testing.expectEqual(@as(i64, 10), vm.globals.get(Value.int(0)).asInt());
+        try testing.expectEqual(@as(i64, 99), vm.globals.get(Value.int(1)).asInt());
+        try testing.expectEqual(@as(usize, 1), vm.globals.hash.count()); // split preserved
+    }
+}
+
+test "restore: bulk lane rebuild — a slot-0-hole narrow run repacks + freezes; heap-bearing stays .value" {
+    const gpa = testing.allocator;
+    var rootp = Proto{ .code = &.{}, .name = "root", .id = 0 };
+
+    // [nil, true, false, true]: a leading hole would defeat append's eager
+    // commit, so without the bulk rebuild this stays `.value` — untraceable.
+    {
+        const vm = try restoreSnapshot(gpa, .{ .version = snapshot_format_version, .keyframe = .{
+            .globals_id = 0,
+            .string_metatable_id = 0,
+            .next_obj_id = 1,
+            .objects = &.{.{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
+                .array = &.{ sNil(), sBool(true), sBool(false), sBool(true) },
+                .entries = &.{},
+                .metatable_id = 0,
+            } } }},
+            .stack = &.{},
+            .frames = &.{},
+            .open_upvalues = &.{},
+            .loaded_chunks = &.{},
+        } }, &rootp, NativeRegistry.base());
+        defer {
+            vm.deinit();
+            gpa.destroy(vm);
+        }
+        const arrp = &vm.globals.array;
+        try testing.expectEqual(@import("array.zig").Lane.boolean, arrp.lane);
+        try testing.expect(arrp.frozen); // monotonic from here (widen-only)
+        try testing.expect(arrp.get(0).isNil()); // the hole survived the repack
+        try testing.expectEqual(true, arrp.get(1).asBool());
+        try testing.expectEqual(false, arrp.get(2).asBool());
+    }
+    // A heap-bearing array must stay `.value` and unfrozen (a later rehash may
+    // still narrow if the contents settle).
+    {
+        const vm = try restoreSnapshot(gpa, .{ .version = snapshot_format_version, .keyframe = .{
+            .globals_id = 0,
+            .string_metatable_id = 0,
+            .next_obj_id = 2,
+            .objects = &.{
+                .{ .id = 0, .obj_type = 1, .body = .{ .HeapTable = .{
+                    .array = &.{ sNil(), sRef(1) },
+                    .entries = &.{},
+                    .metatable_id = 0,
+                } } },
+                .{ .id = 1, .obj_type = 0, .body = .{ .HeapString = .{ .bytes = "s" } } },
+            },
+            .stack = &.{},
+            .frames = &.{},
+            .open_upvalues = &.{},
+            .loaded_chunks = &.{},
+        } }, &rootp, NativeRegistry.base());
+        defer {
+            vm.deinit();
+            gpa.destroy(vm);
+        }
+        try testing.expectEqual(@import("array.zig").Lane.value, vm.globals.array.lane);
+        try testing.expect(!vm.globals.array.frozen);
     }
 }
 
@@ -2149,6 +2303,21 @@ fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, r
 // Corpus: nested calls + loops + closures/upvalues + tables. Each is replayed at
 // two cuts — one anywhere mid-run (depth gate off), one forced *inside a call*.
 const f2c_corpus = [_][:0]const u8{
+    // Doc 18 §T: a 0-indexed array fill + pairs walk (slot-0 array part). A
+    // mid-fill cut captures an array whose key 0 is array-resident (v7
+    // positional serialization incl. the identity slot 0); resume must
+    // continue the fill and the 0-first pairs order identically.
+    \\local function fill(n)
+    \\  local t = {}
+    \\  for i = 0, n do t[i] = i * 3 end
+    \\  return t
+    \\end
+    \\local t = fill(40)
+    \\local s = 0
+    \\for k, v in pairs(t) do s = s + k + v end
+    \\print(s)
+    \\print(#t)
+    ,
     // Loop inside a call, two host calls after it returns.
     \\local function sum(n)
     \\  local s = 0

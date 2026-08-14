@@ -2253,7 +2253,7 @@ pub const Vm = struct {
                             // A grid table's `t[i]` is a transient `row_view`, not a
                             // raw slot — skip the fast path and let `indexGet →
                             // Table.getInt` mint the handle. (Phase 3, doc 14.)
-                            if (!tbl.array.isGrid() and array.ArrayPart.inArray(i, tbl.array.len)) {
+                            if (!tbl.array.isGrid() and array.ArrayPart.inArray(i, tbl.array.asize)) {
                                 // A *present* (non-nil) in-bounds slot is a raw read
                                 // regardless of any metatable — Lua only consults
                                 // `__index` for an absent key. A hole (nil) falls
@@ -2287,7 +2287,7 @@ pub const Vm = struct {
                             // deflation trigger owned by `indexSet`; never raw-stored
                             // here (and `fits(nil)` is `true`, so without this guard a
                             // `nil` store would reach `array.get` on a grid).
-                            if (!tbl.array.isGrid() and array.ArrayPart.inArray(i, tbl.array.len) and tbl.array.fits(val)) {
+                            if (!tbl.array.isGrid() and array.ArrayPart.inArray(i, tbl.array.asize) and tbl.array.fits(val)) {
                                 // `__newindex` fires only for an *absent* key on a
                                 // metatable-bearing table. A metatable-free table
                                 // (the overwhelming common case — one predictable
@@ -11947,6 +11947,108 @@ test "astore_append (int lane): a widening int fill is byte-identical across all
         \\for i = 1, 5000 do c = c + t[i] end
         \\print(c)
     , "12502500\n");
+}
+
+// ---- doc 18 §T: slot-0 array part, cross-tier ----
+
+test "slot-0: a 0-indexed fill + read loop is byte-identical across all 8 modes" {
+    // The headline doc-18 behaviour: `t[0]` is a first-class array key and a
+    // 0-based loop appends/reads through the same guarded fast paths as a
+    // 1-based one — bounds (idx0 == key, no sub), append (key == asize), and
+    // the unsigned admit of key 0 must land identically in tier-0, tier-1a,
+    // and native. Boundary probes: key -1 (hash), one past the extent (nil),
+    // and `#t` (1-based border, unchanged by t[0]).
+    try expectProgram(
+        \\local t = {}
+        \\for i = 0, 5000 do t[i] = i end
+        \\local c = 0
+        \\for i = 0, 5000 do c = c + t[i] end
+        \\print(c)
+        \\print(#t)
+        \\print(t[-1] == nil)
+        \\print(t[5001] == nil)
+        \\t[-1] = 7
+        \\print(t[-1])
+        \\print(#t)
+    ,
+        \\12502500
+        \\5000
+        \\true
+        \\true
+        \\7
+        \\5000
+        \\
+    );
+}
+
+test "slot-0: pairs iterates key 0 first, then the 1-based run (all 8 modes)" {
+    // The one signed-off observable change: with key 0 array-resident, `pairs`
+    // yields it at the FRONT of the array walk (it used to come from the hash,
+    // after the array part).
+    try expectProgram(
+        \\local t = {}
+        \\t[2] = "b"
+        \\t[1] = "a"
+        \\t[0] = "z"
+        \\local out = ""
+        \\for k, v in pairs(t) do out = out .. tostring(k) .. "=" .. v .. ";" end
+        \\print(out)
+    , "0=z;1=a;2=b;\n");
+}
+
+test "slot-0: deleting key 0 mid-iteration resumes at key 1 (all 8 modes)" {
+    // Lua's `next` contract allows deleting the CURRENT key during traversal;
+    // key 0's slot becomes a hole and the walk resumes at 1 without re-yielding
+    // or crashing.
+    try expectProgram(
+        \\local t = {}
+        \\t[0] = 10
+        \\t[1] = 20
+        \\local k1 = next(t)
+        \\t[k1] = nil
+        \\local k2 = next(t, k1)
+        \\print(k1)
+        \\print(k2)
+        \\print(t[0] == nil)
+    , "0\n1\ntrue\n");
+}
+
+test "slot-0: fresh seeds at key 0 and key 1 read back exactly (all 8 modes)" {
+    // D2a's two seed shapes: `t[0] = v` (asize 1, no hole) and `t[1] = v`
+    // (asize 2, slot-0 hole). Back-filling the hole is an in-place store.
+    try expectProgram(
+        \\local a = {}
+        \\a[1] = 15
+        \\a[0] = 5
+        \\local b = {}
+        \\b[0] = true
+        \\print(a[0] + a[1])
+        \\print(b[0])
+        \\print(#a)
+        \\print(#b)
+    , "20\ntrue\n1\n0\n");
+}
+
+test "slot-0: grid-shaped matrix — bare key-0 access deflates and proceeds (all 8 modes)" {
+    // D6's key-0 policy, script-observable half: a bare `m[0]` read/write on a
+    // (possibly grid-flattened) matrix deflates first and then behaves like any
+    // nested table whose outer part covers key 0. Row values, `#m`, and the
+    // key-0 slot must agree across every tier and GC mode.
+    try expectProgram(
+        \\local m = {}
+        \\for i = 1, 3 do
+        \\  m[i] = {}
+        \\  for j = 1, 3 do m[i][j] = i * 10 + j end
+        \\end
+        \\local s = 0
+        \\for i = 1, 3 do for j = 1, 3 do s = s + m[i][j] end end
+        \\print(s)
+        \\print(m[0] == nil)
+        \\m[0] = 99
+        \\print(m[0])
+        \\print(m[1][1])
+        \\print(#m)
+    , "198\ntrue\n99\n11\n3\n");
 }
 
 test "executor: integer //-by-zero inside a hot loop side-exits; tier-0 re-raises identically" {

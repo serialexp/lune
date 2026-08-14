@@ -192,8 +192,15 @@ pub const Heap = struct {
         // matrix carrying a metatable simply stays nested (rare; deflated on
         // `setmetatable` regardless).
         if (parent.metatable != null) return false;
-        const rows = parent.array.len;
-        if (rows == 0) return false;
+        // Doc 18 D6: the field is `asize` (slot count incl. the key-0 slot) on a
+        // scalar parent, but grid rows are 1-based — so guard BEFORE subtracting
+        // (`asize == 0` underflows; `asize == 1` has no 1-based rows), and a
+        // populated key 0 cannot be represented in-grid, so it blocks inflation
+        // (conservative: costs only the optimization, deflation stays the
+        // escape hatch).
+        if (parent.array.asize <= 1) return false;
+        if (!parent.array.get(0).isNil()) return false;
+        const rows = parent.array.asize - 1;
 
         // --- scan rows: qualify each, unify the cell lane, measure the box ---
         var stride: usize = 0;
@@ -204,15 +211,22 @@ pub const Heap = struct {
 
         var r: usize = 0;
         while (r < rows) : (r += 1) {
-            const rv = parent.array.get(r + 1);
+            const rv = parent.array.get(r + 1); // outer keys 1..rows (identity slots)
             if (!rv.isHeap()) return false; // nil row or scalar ⇒ block
             const h = rv.asHeap();
             if (h.type != .table) return false; // typed_array/string/... ⇒ block
             const row = Table.fromHeader(h);
             if (row.metatable != null) return false;
             if (row.hash.count() != 0) return false;
-            const rl = row.array.len;
-            if (rl == 0) continue; // an empty row contributes no cells
+            // Doc 18: a row's array part covers keys 0..asize-1; its grid-able
+            // cells are keys 1..asize-1 (rowView is 1-based). A populated row
+            // key 0 cannot be represented in-grid ⇒ block (same conservative
+            // rule as the parent's slot 0 above).
+            if (row.array.isGrid()) return false; // nested grid ⇒ block (get() forbids grids)
+            if (row.array.asize == 0) continue; // an empty row contributes no cells
+            if (!row.array.get(0).isNil()) return false;
+            const rl = row.array.asize - 1; // cell count: keys 1..rl
+            if (rl == 0) continue; // only the slot-0 hole ⇒ no cells
             switch (row.array.lane) {
                 .i8, .u8, .i16, .i32, .i64, .f64 => {}, // numeric leaf ok
                 else => return false, // .value/.boolean/.grid ⇒ block
@@ -244,8 +258,10 @@ pub const Heap = struct {
         r = 0;
         while (r < rows) : (r += 1) {
             const row = Table.fromHeader(parent.array.get(r + 1).asHeap());
+            // Cells are keys 1..asize-1 (slot 0 is nil — verified in the scan).
+            const rl = if (row.array.asize == 0) 0 else row.array.asize - 1;
             var c: usize = 0;
-            while (c < row.array.len) : (c += 1) {
+            while (c < rl) : (c += 1) {
                 const v = row.array.get(c + 1);
                 if (!v.isNil()) grid.gridSet(r, c, v); // grid_elem fits every cell by construction
             }
@@ -292,6 +308,10 @@ pub const Heap = struct {
         // row Table is built, so an OOM leaves the grid untouched and retryable.
         var outer = arr.ArrayPart.empty;
         errdefer outer.deinit(gpa);
+        // Doc 18 D6: rows are keys 1..rows, but identity append would land the
+        // first row at KEY 0 and shift every row down by one. Seed the slot-0
+        // hole first so the appends below materialize keys 1..rows.
+        try outer.resize(gpa, 1);
 
         var r: usize = 0;
         while (r < rows) : (r += 1) {
@@ -484,7 +504,7 @@ pub const Heap = struct {
                 // lane can carry heap references. The hash part is always marked.
                 if (!t.array.isLeaf()) {
                     var i: usize = 0;
-                    while (i < t.array.len) : (i += 1) self.markValue(t.array.get(i + 1));
+                    while (i < t.array.asize) : (i += 1) self.markValue(t.array.get(i));
                 }
                 var it = t.hash.iterator();
                 while (it.next()) |entry| {
@@ -799,6 +819,84 @@ test "inflateToGrid: strict homogeneous int rows flatten; round-trip via deflate
             try testing.expectEqual(x, rt.get(Value.int(@intCast(ci + 1))).asInt());
         }
     }
+}
+
+test "inflateToGrid: a populated key 0 (outer or row) blocks; empty/asize<=1 outers decline without underflow" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    // Empty outer: asize == 0 must decline cleanly (doc 18 D6 — the `asize - 1`
+    // underflow guard; reachable via any fused store on a non-grid table).
+    {
+        const outer = try heap.newTable();
+        try testing.expect(!heap.inflateToGrid(outer));
+    }
+    // asize == 1 (only a slot-0 hole after t[1]-seed + delete): no 1-based rows.
+    {
+        const outer = try heap.newTable();
+        const row = try heap.newTable();
+        try row.set(heap.gpa, Value.int(1), Value.int(1));
+        try outer.set(heap.gpa, Value.int(1), Value.heap(&row.header));
+        try outer.array.resize(heap.gpa, 1); // shrink to just the slot-0 hole
+        try testing.expect(!heap.inflateToGrid(outer));
+    }
+    // Outer key 0 populated ⇒ block (a grid cannot represent outer key 0).
+    {
+        const outer = try heap.newTable();
+        const row = try heap.newTable();
+        try row.set(heap.gpa, Value.int(1), Value.int(1));
+        try outer.set(heap.gpa, Value.int(1), Value.heap(&row.header));
+        const row0 = try heap.newTable();
+        try row0.set(heap.gpa, Value.int(1), Value.int(9));
+        try outer.set(heap.gpa, Value.int(0), Value.heap(&row0.header));
+        try testing.expect(!heap.inflateToGrid(outer));
+        try testing.expect(!outer.array.isGrid());
+    }
+    // Row key 0 populated ⇒ block (rowView is 1-based; the cell would be lost).
+    {
+        const outer = try heap.newTable();
+        const row = try heap.newTable();
+        try row.set(heap.gpa, Value.int(0), Value.int(5));
+        try row.set(heap.gpa, Value.int(1), Value.int(6));
+        try outer.set(heap.gpa, Value.int(1), Value.heap(&row.header));
+        try testing.expect(!heap.inflateToGrid(outer));
+    }
+}
+
+test "deflateGrid: outer keys land at 1..rows with a slot-0 hole (no down-shift)" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const outer = try heap.newTable();
+    inline for (1..4) |ri| {
+        const row = try heap.newTable();
+        try row.set(heap.gpa, Value.int(1), Value.int(@intCast(ri * 100)));
+        try outer.set(heap.gpa, Value.int(@intCast(ri)), Value.heap(&row.header));
+    }
+    try testing.expect(heap.inflateToGrid(outer));
+    try heap.deflateGrid(outer);
+    try testing.expect(!outer.array.isGrid());
+    // Doc 18 D6: identity append would have landed row 1 at KEY 0; the seeded
+    // slot-0 hole keeps every row at its original 1-based key.
+    try testing.expectEqual(@as(usize, 4), outer.array.asize); // hole + 3 rows
+    try testing.expect(outer.array.get(0).isNil());
+    try testing.expect(outer.get(Value.int(0)).isNil());
+    inline for (1..4) |ri| {
+        const rt = Table.fromHeader(outer.get(Value.int(@intCast(ri))).asHeap());
+        try testing.expectEqual(@as(i64, @intCast(ri * 100)), rt.get(Value.int(1)).asInt());
+    }
+    try testing.expectEqual(@as(i64, 3), outer.length());
+}
+
+test "GC: a heap ref in slot 0 is marked (the 0-based mark walk covers it)" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    const outer = try heap.newTable();
+    const child = try heap.newTable();
+    try child.set(heap.gpa, Value.int(1), Value.int(77));
+    try outer.set(heap.gpa, Value.int(0), Value.heap(&child.header)); // key 0 = slot 0
+    try collectWithRoots(&heap, &.{&outer.header});
+    // The child must have survived through the slot-0 edge.
+    try testing.expectEqual(@as(i64, 77), Table.fromHeader(outer.get(Value.int(0)).asHeap()).get(Value.int(1)).asInt());
 }
 
 test "inflateToGrid: all-float rows unify to f64" {

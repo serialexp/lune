@@ -725,8 +725,7 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 // produced the operand. `.aref` (scalar array key) uses THE shared
                 // membership predicate `inArray`; `.garow` (grid row) keeps the
                 // grid-row rule (`1 <= row <= rows` — the layout field counts rows
-                // for grids, and grids stay 1-based outside). Today both formulas
-                // coincide; after the doc-18 flip only the `.aref` arm changes.
+                // for grids, and grids stay 1-based outside; doc 18 D6).
                 // `assertWellFormed` pins the producer to exactly these two ops;
                 // anything else fails closed as a guard exit.
                 .guard_bounds => {
@@ -734,8 +733,8 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                     const tbl = table.Table.fromHeader(values[ar.a].asHeap());
                     const idx = values[ar.b].asInt();
                     const ok = switch (ar.op) {
-                        .aref => arr.ArrayPart.inArray(idx, tbl.array.len),
-                        .garow => idx >= 1 and idx <= @as(i64, @intCast(tbl.array.len)),
+                        .aref => arr.ArrayPart.inArray(idx, tbl.array.asize),
+                        .garow => idx >= 1 and idx <= @as(i64, @intCast(tbl.array.gridRows())),
                         else => blk: {
                             std.debug.assert(false); // assertWellFormed pins the producer
                             break :blk false; // release: fail closed -> side-exit
@@ -775,15 +774,16 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 },
                 // The append precondition (grow analogue of guard_bounds): the hash
                 // part is empty (migrate is a no-op), the key is the exact append
-                // successor (`idx == len+1`), and there is capacity to grow without a
-                // realloc (`len < cap`). Any miss side-exits so tier-0 runs the
+                // successor (`idx == asize`, the doc-18 D2.3 identity), and there is
+                // capacity to grow without a realloc (`asize < cap`). Any miss
+                // side-exits so tier-0 runs the
                 // iteration (reallocating / migrating as needed) and the loop re-enters.
                 .guard_append => {
                     const ar = t.instrs[ins.a];
                     const tbl = table.Table.fromHeader(values[ar.a].asHeap());
                     const idx = values[ar.b].asInt();
-                    const len: i64 = @intCast(tbl.array.len);
-                    if (tbl.hash.count() == 0 and idx == len + 1 and tbl.array.len < tbl.array.cap) {
+                    const asize: i64 = @intCast(tbl.array.asize);
+                    if (tbl.hash.count() == 0 and idx == asize and tbl.array.asize < tbl.array.cap) {
                         if (record) rec.guardPass(i, values[ar.a]);
                     } else {
                         if (record) rec.exit(i, .guard, values[ar.a]);

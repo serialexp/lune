@@ -130,16 +130,21 @@ pub const Table = struct {
 
     /// `t[i]` for an integer key (array part fast path).
     pub fn getInt(self: *const Table, i: i64) Value {
-        if (arr.ArrayPart.inArray(i, self.array.len)) {
+        if (self.array.isGrid()) {
             // A grid table's rows are *virtual*: `t[i]` is a transient `row_view`
             // onto grid row `i-1` (a fat value, no heap object), not a stored
             // slot. The handle carries this table's header so an inner index
             // (`row[j]`) can forward into the flat cell buffer. (Phase 3, doc 14.)
+            // Doc 18 D6: for a grid the field means ROW COUNT and rows are keys
+            // `1..rows` — the unsigned `inArray` gate would admit `i == 0` and
+            // panic in the `i - 1` cast, so the grid arm keeps an explicit
+            // `i >= 1` gate; grid key 0 falls through to the hash part.
             // `@constCast`: the handle borrows the table mutably (an inner store
             // writes a cell); the table is genuinely heap-mutable — `*const` is
             // only this read path's view.
-            if (self.array.isGrid())
+            if (i >= 1 and i <= @as(i64, @intCast(self.array.gridRows())))
                 return Value.rowView(@constCast(&self.header), @intCast(i - 1));
+        } else if (arr.ArrayPart.inArray(i, self.array.asize)) {
             return self.array.get(@intCast(i));
         }
         // Out of array range: only the hash part can hold this key. Skip the
@@ -220,22 +225,29 @@ pub const Table = struct {
         const nk = normalizeKey(key);
         if (nk.isInt()) {
             const i = nk.asInt();
-            const n: i64 = @intCast(self.array.len);
-            if (arr.ArrayPart.inArray(i, self.array.len)) {
+            const asize: i64 = @intCast(self.array.asize);
+            if (arr.ArrayPart.inArray(i, self.array.asize)) {
                 try self.array.setInPlace(gpa, @intCast(i), val);
                 return;
             }
-            if (i == n + 1 and !val.isNil()) {
-                // Fresh part (doc 18 D2a): the first array-resident write goes
-                // through the seed primitive, which owns the eager lane commit.
-                // Established part: the ordinary contiguous append. Phase 1: the
-                // seedable key set is {1} and seedAt == append, so behaviour is
-                // identical; the flip widens the set to {0, 1}.
-                if (n == 0) {
+            if (i == asize and !val.isNil()) {
+                // Contiguous append at key == asize (doc 18 D1/D2.3). On a fresh
+                // part this is key 0 and routes through the seed primitive, which
+                // owns the eager lane commit (`seedAt(0)` IS append under
+                // identity mapping).
+                if (asize == 0) {
                     try self.array.seedAt(gpa, i, val);
                 } else {
                     try self.array.append(gpa, val);
                 }
+                try self.migrateFromHash(gpa);
+                return;
+            }
+            if (asize == 0 and i == 1 and !val.isNil()) {
+                // Fresh-part 1-based idiom (doc 18 D2a): seed `[hole, val]` with
+                // `asize = 2` so the ubiquitous `t = {}; t[1] = x` build stays
+                // array-resident from the first write.
+                try self.array.seedAt(gpa, i, val);
                 try self.migrateFromHash(gpa);
                 return;
             }
@@ -257,12 +269,11 @@ pub const Table = struct {
                 !self.hash.contains(nk))
             {
                 try self.rehash(gpa, i);
-                const n2: i64 = @intCast(self.array.len);
-                if (arr.ArrayPart.inArray(i, self.array.len)) {
+                if (arr.ArrayPart.inArray(i, self.array.asize)) {
                     try self.array.setInPlace(gpa, @intCast(i), val);
                     return;
                 }
-                if (i == n2 + 1) {
+                if (i == @as(i64, @intCast(self.array.asize)) and self.array.asize != 0) {
                     try self.array.append(gpa, val);
                     try self.migrateFromHash(gpa);
                     return;
@@ -301,7 +312,8 @@ pub const Table = struct {
         // guard keeps every such append off the non-inlined hashmap probe.
         if (self.hash.count() == 0) return;
         while (true) {
-            const next = Value.int(@as(i64, @intCast(self.array.len)) + 1);
+            // Doc 18 D2.3 identity: the contiguous successor key IS `asize`.
+            const next = Value.int(@as(i64, @intCast(self.array.asize)));
             const v = self.hash.get(next) orelse break;
             if (v.isNil()) break;
             try self.array.append(gpa, v);
@@ -318,21 +330,26 @@ pub const Table = struct {
     /// Histogram length: one bucket per `ceil(log2)` value in `[0, MAXABITS]`.
     const NBUCKETS: usize = @as(usize, MAXABITS) + 1;
 
-    /// `ceil(log2(k))` for `k >= 1` — the histogram bucket a positive key lands
-    /// in (bucket `b` covers keys in `(2^(b-1), 2^b]`; key 1 → bucket 0).
+    /// `ceil(log2(k))` for `k >= 1`. Binning uses `ceillog2(k + 1)` — the
+    /// smallest `b` with `2^b > k`, i.e. the smallest power-of-two extent whose
+    /// slot range `0..2^b-1` contains key `k` (doc 18 D7): key 0 → bin 0
+    /// (size 1), key 1 → bin 1 (size 2), keys 2–3 → bin 2 (size 4), keys 4–7 →
+    /// bin 3, … The `+1` shift also dissolves the `ceillog2(0)` hazard
+    /// structurally (`ceillog2(0 + 1) = 0`, no special case).
     fn ceillog2(k: u64) u6 {
         if (k <= 1) return 0;
         return @intCast(64 - @clz(k - 1));
     }
 
     /// Tally one integer key into the power-of-two histogram. Returns true iff
-    /// `k` is a valid *array index* (`1 <= k <= 2^MAXABITS`) — i.e. a candidate
-    /// for the array part. Mirrors Lua's `countint`/`arrayindex`.
+    /// `k` is a valid *array index* — array-eligible ⇔
+    /// `@bitCast(k) < 2^MAXABITS` (doc 18 D7: key 0 counts, negatives are
+    /// excluded by the unsigned wrap). Mirrors Lua's `countint`/`arrayindex`
+    /// shifted to the 0-based key range.
     fn countKey(k: i64, nums: *[NBUCKETS]u32) bool {
-        if (k < 1) return false;
-        const uk: u64 = @intCast(k);
-        if (uk > (@as(u64, 1) << MAXABITS)) return false;
-        nums[ceillog2(uk)] += 1;
+        const uk: u64 = @bitCast(k);
+        if (uk >= (@as(u64, 1) << MAXABITS)) return false;
+        nums[ceillog2(uk + 1)] += 1;
         return true;
     }
 
@@ -389,40 +406,42 @@ pub const Table = struct {
         }
 
         var idx: usize = 0;
-        while (idx < self.array.len) : (idx += 1) {
-            if (!self.array.get(idx + 1).isNil() and countKey(@intCast(idx + 1), &nums)) na_total += 1;
+        while (idx < self.array.asize) : (idx += 1) {
+            if (!self.array.get(idx).isNil() and countKey(@intCast(idx), &nums)) na_total += 1;
         }
 
-        // `asize` is bounded by `na_total*3` (density gate), hence by the live key
-        // count, so it always fits `usize` on every target.
-        const asize: usize = @intCast(computeArraySize(&nums, na_total));
-        const old_len = self.array.len;
+        // `new_asize` is bounded by `na_total*3` (density gate), hence by the live
+        // key count, so it always fits `usize` on every target.
+        const new_asize: usize = @intCast(computeArraySize(&nums, na_total));
+        const old_asize = self.array.asize;
 
         // Grow-only: a rehash is insert-driven, so the array never shrinks. When
-        // the density test declines to grow (`asize <= old_len`) there is nothing
-        // to migrate — but we still bump the threshold below so that repeated
-        // sparse inserts don't re-run this O(n) histogram on every one of them.
-        if (asize > old_len) {
-            // `resize` fills the new slots `[old_len, asize)` with holes for us.
-            try self.array.resize(gpa, asize);
+        // the density test declines to grow (`new_asize <= old_asize`) there is
+        // nothing to migrate — but we still bump the threshold below so that
+        // repeated sparse inserts don't re-run this O(n) histogram on every one.
+        if (new_asize > old_asize) {
+            // `resize` fills the new slots `[old_asize, new_asize)` with holes.
+            try self.array.resize(gpa, new_asize);
 
             // Drain dense integer keys now covered by the array out of the hash.
-            // Keys in `[1, old_len]` are already array-resident (set() keeps them
-            // there), so only `[old_len+1, asize]` can still be in the hash.
-            var k: usize = old_len + 1;
-            while (k <= asize) : (k += 1) {
+            // Keys `< old_asize` are already array-resident (set() keeps them
+            // there), so only keys `[old_asize, new_asize-1]` — the newly covered
+            // identity slots — can still be in the hash.
+            var k: usize = old_asize;
+            while (k < new_asize) : (k += 1) {
                 const key = Value.int(@intCast(k));
                 if (self.hash.get(key)) |val| {
                     // Write into the array part *before* evicting from the hash: a
                     // widening inside `setInPlace` can OOM, and a `fetchRemove`-first
                     // ordering would drop the entry on failure. On that OOM the keys
-                    // `[k, asize]` are still hash-resident, so trim the array extent
-                    // back to `k-1`: otherwise the freshly-resized nil holes at
-                    // `[k, asize]` would *shadow* those live hash entries on a later
-                    // `get` (which consults the array part for any index `<= len`).
-                    // Already-migrated keys `[old_len+1, k-1]` stay visible.
+                    // `[k, new_asize-1]` are still hash-resident, so trim the array
+                    // extent back to `k` — the first uncommitted physical slot (doc
+                    // 18 D7): the array then covers exactly the migrated keys
+                    // `< k`, and the freshly-resized nil holes at `[k, new_asize)`
+                    // can no longer *shadow* those live hash entries on a later
+                    // `get` (which consults the array part for any in-extent index).
                     self.array.setInPlace(gpa, k, val) catch |e| {
-                        self.array.len = k - 1;
+                        self.array.asize = k;
                         return e;
                     };
                     _ = self.hash.remove(key);
@@ -473,11 +492,15 @@ pub const Table = struct {
         // and a grid carries no hash-part border, so `#t` is exactly the row
         // count. (Phase 3, doc 14.)
         if (self.array.isGrid()) return @intCast(self.array.gridRows());
-        var n: usize = self.array.len;
+        // Doc 18: the extent covers keys 0..asize-1, but `#t` stays a 1-based
+        // border — the maximum candidate is key `asize - 1`, and key 0 never
+        // participates (the trim loop stops at n == 0 exactly as before).
+        var n: usize = if (self.array.asize == 0) 0 else self.array.asize - 1;
+        const max_key = n;
         // Trim trailing nils: if the array part ends in a nil, the border is the
         // last non-nil prefix and cannot extend past it.
         while (n > 0 and self.array.get(n).isNil()) n -= 1;
-        if (n < self.array.len) return @intCast(n);
+        if (n < max_key) return @intCast(n);
 
         // Array part is non-nil through its end; the border may continue into the
         // hash part. Unbound-then-binary search, as luaH_getn does.
@@ -680,6 +703,137 @@ test "ValueContext.hash is a pure function and distributes distinct scalar keys"
     try testing.expect(ctx.hash(Value.int(1)) != ctx.hash(Value.boolean(true)));
 }
 
+// ---- doc 18 §T: slot-0 array part ----
+
+test "set/get: key 0 is a first-class array key; negatives stay hash-resident" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    // Fresh t[0] = x is exactly the append seed: asize 1, no hole.
+    try t.set(gpa, Value.int(0), Value.int(100));
+    try testing.expectEqual(@as(usize, 1), t.array.asize);
+    try testing.expectEqual(@as(usize, 0), t.hash.count());
+    try testing.expectEqual(@as(i64, 100), t.get(Value.int(0)).asInt());
+    // The contiguous successor chain continues 1, 2, ... (key == asize).
+    try t.set(gpa, Value.int(1), Value.int(101));
+    try t.set(gpa, Value.int(2), Value.int(102));
+    try testing.expectEqual(@as(usize, 3), t.array.asize);
+    try testing.expectEqual(@as(usize, 0), t.hash.count());
+    // Negative keys can never be array-resident (unsigned wrap): hash only.
+    try t.set(gpa, Value.int(-1), Value.int(7));
+    try testing.expectEqual(@as(usize, 3), t.array.asize);
+    try testing.expectEqual(@as(usize, 1), t.hash.count());
+    try testing.expectEqual(@as(i64, 7), t.get(Value.int(-1)).asInt());
+    // Float-spelled 0.0 aliases integer key 0 (normalizeKey).
+    try testing.expectEqual(@as(i64, 100), t.get(Value.float(0.0)).asInt());
+    try t.set(gpa, Value.float(0.0), Value.int(200));
+    try testing.expectEqual(@as(i64, 200), t.get(Value.int(0)).asInt());
+    try testing.expectEqual(@as(usize, 3), t.array.asize); // in-place, no reshape
+}
+
+test "length: t[0] never changes #t (1-based border), incl. the deletion edge" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    try testing.expectEqual(@as(i64, 0), t.length());
+    try t.set(gpa, Value.int(0), Value.int(1));
+    try testing.expectEqual(@as(i64, 0), t.length()); // key 0 alone: #t == 0
+    try t.set(gpa, Value.int(1), Value.int(2));
+    try t.set(gpa, Value.int(2), Value.int(3));
+    try testing.expectEqual(@as(i64, 2), t.length());
+    // Deleting key 0 leaves the 1-based border untouched.
+    try t.set(gpa, Value.int(0), Value.nil());
+    try testing.expectEqual(@as(i64, 2), t.length());
+}
+
+test "set: fresh t[1] seeds [hole, v] and the append chain continues at 2" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    try t.set(gpa, Value.int(1), Value.int(10));
+    try testing.expectEqual(@as(usize, 2), t.array.asize); // [hole, 10]
+    try testing.expectEqual(@as(usize, 0), t.hash.count());
+    try testing.expect(t.get(Value.int(0)).isNil());
+    try testing.expectEqual(@as(i64, 10), t.get(Value.int(1)).asInt());
+    try t.set(gpa, Value.int(2), Value.int(20)); // key == asize: append
+    try testing.expectEqual(@as(usize, 3), t.array.asize);
+    try testing.expectEqual(@as(i64, 20), t.get(Value.int(2)).asInt());
+    // Back-filling the slot-0 hole is an in-place store, no reshape.
+    try t.set(gpa, Value.int(0), Value.int(5));
+    try testing.expectEqual(@as(usize, 3), t.array.asize);
+    try testing.expectEqual(@as(i64, 5), t.get(Value.int(0)).asInt());
+}
+
+test "computeArraySize: chosen power-of-two extent always contains the counted keys (63/64/65/127/128)" {
+    // Doc 18 D7: bin(k) = ceillog2(k+1) — the smallest power-of-two size whose
+    // slot range 0..2^b-1 contains key k. At exact power-of-two max keys the
+    // chosen size steps to the NEXT power (the accepted §R2 memory overshoot):
+    // a dense 2..64 run needs slot 64 → size 128, where the 1-based scheme could
+    // stop at 64.
+    const Case = struct { max_key: i64, want: u64 };
+    const cases = [_]Case{
+        .{ .max_key = 63, .want = 64 },
+        .{ .max_key = 64, .want = 128 },
+        .{ .max_key = 65, .want = 128 },
+        .{ .max_key = 127, .want = 128 },
+        .{ .max_key = 128, .want = 256 },
+    };
+    for (cases) |c| {
+        var nums: [Table.NBUCKETS]u32 = @splat(0);
+        var na: u64 = 0;
+        var k: i64 = 2;
+        while (k <= c.max_key) : (k += 1) {
+            if (Table.countKey(k, &nums)) na += 1;
+        }
+        const size = Table.computeArraySize(&nums, na);
+        try testing.expectEqual(c.want, size);
+        // The invariant the binning shift exists for: the chosen size CONTAINS
+        // every counted key (round-1's off-by-one is structurally impossible).
+        try testing.expect(size == 0 or size > @as(u64, @intCast(c.max_key)));
+    }
+    // Key 0 alone → bin 0 → size 1; key 1 alone → bin 1 → size 2.
+    {
+        var nums: [Table.NBUCKETS]u32 = @splat(0);
+        try testing.expect(Table.countKey(0, &nums));
+        try testing.expectEqual(@as(u64, 1), Table.computeArraySize(&nums, 1));
+    }
+    {
+        var nums: [Table.NBUCKETS]u32 = @splat(0);
+        try testing.expect(Table.countKey(1, &nums));
+        try testing.expectEqual(@as(u64, 2), Table.computeArraySize(&nums, 1));
+    }
+    // Negative keys are never array-eligible (unsigned wrap in countKey).
+    {
+        var nums: [Table.NBUCKETS]u32 = @splat(0);
+        try testing.expect(!Table.countKey(-1, &nums));
+        try testing.expect(!Table.countKey(std.math.minInt(i64), &nums));
+    }
+}
+
+test "rehash: a dense run from 0 (0-indexed build via hash) migrates incl. key 0" {
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    const gpa = testing.allocator;
+
+    // Insert descending so no key is ever the contiguous successor — everything
+    // lands in the hash until a rehash migrates the dense 0-based run.
+    var i: i64 = 32;
+    while (i >= 0) : (i -= 1) try t.set(gpa, Value.int(i), Value.int(i * 10));
+
+    // The dense run — including key 0 — migrated into the array part. (The
+    // topmost key can lag in the hash until the *next* rehash if the last
+    // migration's chosen size stopped just below it; that boundary straggler is
+    // pre-existing behaviour, not a slot-0 artifact.)
+    try testing.expect(t.array.asize >= 32);
+    try testing.expect(t.hash.count() <= 1);
+    try testing.expect(arr.ArrayPart.inArray(0, t.array.asize));
+    i = 0;
+    while (i <= 32) : (i += 1) try testing.expectEqual(i * 10, t.get(Value.int(i)).asInt());
+}
+
 test "rehash: a dense run from 2 (the nsieve pattern) packs into the array part" {
     const t = try Table.create(testing.allocator);
     defer t.destroy(testing.allocator);
@@ -700,9 +854,12 @@ test "rehash: a dense run from 2 (the nsieve pattern) packs into the array part"
     }
 
     // The regression guard: the keys live in the array part now, not the hash.
-    try testing.expect(t.array.len >= @as(usize, @intCast(K)));
+    // Doc 18: `asize` is a non-inclusive slot count, so covering key K needs
+    // `asize >= K + 1` (slots 0..K).
+    try testing.expect(t.array.asize >= @as(usize, @intCast(K + 1)));
     try testing.expectEqual(@as(usize, 0), t.hash.count());
-    try testing.expect(t.array.get(1).isNil()); // slot for key 1 is a nil hole
+    try testing.expect(t.array.get(0).isNil()); // slot-0 hole (key 0 never set)
+    try testing.expect(t.array.get(1).isNil()); // key 1 is a nil hole
 }
 
 test "rehash: sparse integer keys stay in the hash part (density gate)" {
@@ -710,13 +867,13 @@ test "rehash: sparse integer keys stay in the hash part (density gate)" {
     defer t.destroy(testing.allocator);
     const gpa = testing.allocator;
 
-    try t.set(gpa, Value.int(1), Value.int(1)); // array len 1
+    try t.set(gpa, Value.int(1), Value.int(1)); // fresh 1-based seed: asize 2, slot-0 hole
     // Four widely-spaced keys: enough inserts to trip the rehash trigger, but the
     // density test must decline to grow the array for them.
     const sparse = [_]i64{ 1_000_000, 2_000_000, 3_000_000, 4_000_000 };
     for (sparse) |k| try t.set(gpa, Value.int(k), Value.int(k));
 
-    try testing.expectEqual(@as(usize, 1), t.array.len); // array did NOT bloat
+    try testing.expectEqual(@as(usize, 2), t.array.asize); // array did NOT bloat
     try testing.expectEqual(@as(usize, sparse.len), t.hash.count());
     for (sparse) |k| try testing.expectEqual(k, t.get(Value.int(k)).asInt());
     try testing.expectEqual(@as(i64, 1), t.get(Value.int(1)).asInt());
@@ -756,13 +913,13 @@ test "rehash: updating an existing hash key never reshapes the table" {
     // these crosses the rehash trigger repeatedly (each declines to grow).
     var j: i64 = 1;
     while (j <= 20) : (j += 1) try t.set(gpa, Value.int(j * 1000), Value.int(j));
-    const len_before = t.array.len;
+    const asize_before = t.array.asize;
 
     // Re-setting keys that already live in the hash must NOT trigger a reshape
     // (no phantom histogram double-count) — it is a plain in-place value update.
     j = 1;
     while (j <= 20) : (j += 1) try t.set(gpa, Value.int(j * 1000), Value.int(j * 7));
-    try testing.expectEqual(len_before, t.array.len); // shape unchanged
+    try testing.expectEqual(asize_before, t.array.asize); // shape unchanged
     j = 1;
     while (j <= 20) : (j += 1) {
         try testing.expectEqual(j * 7, t.get(Value.int(j * 1000)).asInt());
@@ -898,7 +1055,7 @@ test "lane: a sparse-first table still narrows once a dense int run fills in" {
     var s: i64 = 0;
     while (s < 8) : (s += 1) try t.set(gpa, Value.int(1_000_000 + s * 1000), Value.int(1));
     try testing.expectEqual(arr.Lane.value, t.array.lane);
-    try testing.expectEqual(@as(usize, 0), t.array.len); // sparse keys did not grow the array
+    try testing.expectEqual(@as(usize, 0), t.array.asize); // sparse keys did not grow the array
 
     // Now fill a dense small-int run (hole at 1 routes through the hash and trips a
     // rehash that finds a homogeneous run → it must still commit to a narrow lane).

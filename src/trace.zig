@@ -11299,7 +11299,7 @@ pub const TraceState = struct {
         if (tbl.metatable != null) return self.abort(.has_metatable);
         const lane = tbl.array.lane;
         const idx = vkey.asInt();
-        if (!arr.ArrayPart.inArray(idx, tbl.array.len)) return self.abort(.bad_type);
+        if (!arr.ArrayPart.inArray(idx, tbl.array.asize)) return self.abort(.bad_type);
         const loaded = tbl.getInt(idx);
         if (loaded.isNil()) return self.abort(.bad_type); // hole — not a profitable trace
 
@@ -11399,7 +11399,9 @@ pub const TraceState = struct {
         if (lane == .value) return self.abort(.nyi_opcode); // unpacked path deferred
         const idx = vkey.asInt();
 
-        // Grow (append) store: `t[len+1] = v` extends the dense run by one. This is
+        // Grow (append) store: `t[asize] = v` extends the dense run by one (doc 18
+        // D2.3: under identity mapping the contiguous successor key IS `asize`).
+        // This is
         // the bulk of an array-fill loop (nsieve's `for i=2,m do p[i]=true end` after
         // its first rehash narrows to the boolean lane and drains the hash). Rather
         // than abort the whole trace (the historic behaviour — the fill then ran fully
@@ -11413,7 +11415,7 @@ pub const TraceState = struct {
         // int lane's runtime range check, and the value's static `.int` kind comes
         // from its producing ref (the loop slot) — same as the in-bounds int store.
         if ((lane == .boolean or lane.isInt()) and
-            idx == @as(i64, @intCast(tbl.array.len)) + 1 and
+            idx == @as(i64, @intCast(tbl.array.asize)) and
             tbl.hash.count() == 0 and
             tbl.array.fits(vval))
         {
@@ -11432,7 +11434,7 @@ pub const TraceState = struct {
             const rkey = try self.refOf(instr.b);
             try self.guardInt(rkey, .key_type, .b);
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
-            // guard_append: hash-empty + `idx==len+1` + `len<cap`. The grow analogue
+            // guard_append: hash-empty + `idx==asize` + `asize<cap`. The grow analogue
             // of guard_bounds — side-exits to tier-0 (which reallocs/migrates) when
             // any precondition fails, so the on-trace append never allocates.
             self.stampProv(try self.emit(.{ .op = .guard_append, .a = ref }), .append_precond, .none, .neutral);
@@ -11443,7 +11445,7 @@ pub const TraceState = struct {
             return;
         }
 
-        if (!arr.ArrayPart.inArray(idx, tbl.array.len)) return self.abort(.bad_type);
+        if (!arr.ArrayPart.inArray(idx, tbl.array.asize)) return self.abort(.bad_type);
         // The value must fit the current lane unchanged — an out-of-lane store
         // would widen the array (shape change / allocation) which the native ABI
         // cannot perform; the prologue `guard_lane` then stays sufficient.
@@ -13509,26 +13511,26 @@ test "recArraySet: t[k]=false on a bool lane records the full guarded write sequ
     try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[9].aux);
 }
 
-test "recArraySet: a bool-lane append (t[len+1]=true) records the guarded grow sequence" {
+test "recArraySet: a bool-lane append (t[asize]=true) records the guarded grow sequence" {
     const gpa = testing.allocator;
     const t = try table_mod.Table.create(gpa);
     defer t.destroy(gpa);
-    // Fill 2..32 (index 1 stays a hole) so the table rehashes to the boolean lane and
-    // drains its hash — exactly nsieve's init-loop steady state. len is the high-water
-    // mark (32); the next store t[33] is the append successor (idx == len+1).
+    // Fill 2..32 (keys 0 and 1 stay holes) so the table rehashes to the boolean
+    // lane and drains its hash — exactly nsieve's init-loop steady state. The next
+    // append-successor store is `t[asize]` (doc 18 D2.3: the key IS the extent).
     var i: i64 = 2;
     while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
     try testing.expectEqual(arr.Lane.boolean, t.array.lane);
     try testing.expectEqual(@as(usize, 0), t.hash.count()); // hash drained → migrate is a no-op
-    const len_before = t.array.len;
-    const append_key: i64 = @as(i64, @intCast(len_before)) + 1;
+    const len_before = t.array.asize;
+    const append_key: i64 = @intCast(len_before);
 
     var state = TraceState.init(gpa);
     defer state.deinit();
     const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
 
-    // r1 = table, r2 = key (len+1), r0 = value (true); `set_index a=1 b=2 c=0`.
+    // r1 = table, r2 = key (asize), r0 = value (true); `set_index a=1 b=2 c=0`.
     var regs = [_]Value{ Value.boolean(true), Value.heap(&t.header), Value.int(append_key) };
     state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0, Value.nil());
 
@@ -13549,7 +13551,7 @@ test "recArraySet: a bool-lane append (t[len+1]=true) records the guarded grow s
     try testing.expectEqual(@intFromEnum(arr.Lane.boolean), ops[9].aux);
 
     // The recorder must NOT have mutated the table — recording is side-effect free.
-    try testing.expectEqual(len_before, t.array.len);
+    try testing.expectEqual(len_before, t.array.asize);
 }
 
 test "recArraySet aborts: non-table, non-int key, OOB, out-of-lane value, .value lane" {

@@ -1,5 +1,6 @@
 //! The table **array part** — a lane-tagged, packed storage for the dense run of
-//! positive-integer keys `1..len` that every Lua list/array degenerates to.
+//! integer keys `0..asize-1` that every Lua list/array degenerates to
+//! (identity mapping, slot 0 included; doc 18).
 //!
 //! Motivation: a table whose array part holds only small integers or booleans
 //! pays a full 16-byte `Value` per slot in the naive representation, even though
@@ -202,11 +203,16 @@ pub const ArrayPart = extern struct {
     /// costs no bytes and does **not** move `len`/`cap`/`data`/`present` — the
     /// nativegen `Layout` offsets the JIT already encodes against are byte-identical.
     grid_elem: Lane = .value,
-    /// Logical slot count: keys `1..len` map to packed indices `0..len-1`. This
-    /// is the array part's extent, **not** `#t` (which trims trailing holes).
-    /// For a grid, this is the **row count**.
-    len: usize = 0,
-    /// Allocated slot capacity (`>= len`); growth amortises like `ArrayList`.
+    /// Non-inclusive slot count (doc 18 D1): keys `0..asize-1` map to packed
+    /// indices `0..asize-1` — physical slot == logical key (identity mapping,
+    /// LuaJIT's convention). This is the array part's extent, **not** `#t`
+    /// (which trims trailing holes and stays 1-based). A conventional sequence
+    /// `t[1..n]` has `asize = n+1` with slot 0 a hole.
+    /// For a grid, this field instead keeps its old meaning: the **row count**
+    /// (internal rows `0..rows-1` for outer keys `1..rows` — grids do not adopt
+    /// identity mapping; doc 18 D6).
+    asize: usize = 0,
+    /// Allocated slot capacity (`>= asize`); growth amortises like `ArrayList`.
     /// For a grid, this is the allocated **row capacity** (`data` holds
     /// `cap*stride` cells).
     cap: usize = 0,
@@ -234,7 +240,7 @@ pub const ArrayPart = extern struct {
         pub const lane = @offsetOf(ArrayPart, "lane");
         pub const frozen = @offsetOf(ArrayPart, "frozen");
         pub const grid_elem = @offsetOf(ArrayPart, "grid_elem");
-        pub const len = @offsetOf(ArrayPart, "len");
+        pub const asize = @offsetOf(ArrayPart, "asize");
         pub const cap = @offsetOf(ArrayPart, "cap");
         pub const data = @offsetOf(ArrayPart, "data");
         pub const present = @offsetOf(ArrayPart, "present");
@@ -267,19 +273,19 @@ pub const ArrayPart = extern struct {
         return self.lane.isNarrow();
     }
 
-    // ---- element access (1-based keys, like the rest of the table) ----
+    // ---- element access (0-based keys == physical slots; doc 18 D1) ----
 
     /// THE membership predicate for the array part: does logical key `k` have a
     /// slot? Defined exactly once so every tier and every routing site shares one
-    /// contract (doc 18 D1). Today's layout: keys `1..len`. After the doc-18 flip
-    /// this becomes the LuaJIT-style unsigned compare
-    /// `@as(u64, @bitCast(k)) < extent` (identity mapping, slot 0 included) — a
-    /// ONE-LINE change here, mirrored per tier, nowhere else.
+    /// contract (doc 18 D1): the LuaJIT-style unsigned compare — covers key 0,
+    /// rejects negative keys via two's-complement wrap (`@bitCast`, never
+    /// `@intCast`, which would trap), no `-1` anywhere. Native mirrors this as
+    /// `cmp key, asize; jae` (nativegen `.guard_bounds`).
     pub inline fn inArray(k: i64, extent: usize) bool {
-        return k >= 1 and k <= @as(i64, @intCast(extent));
+        return @as(u64, @bitCast(k)) < @as(u64, extent);
     }
 
-    /// `t[i]` for `1 <= i <= len`. Returns the logical `Value` (or `nil` for a
+    /// `t[i]` for `0 <= i < asize`. Returns the logical `Value` (or `nil` for a
     /// hole). Caller guarantees the index is in range.
     // `inline`: the tier-0 interpreter reads `t[i]` through this on its hottest path
     // (`.get_index` arm, interp.zig). Across the interp.zig→array.zig module boundary
@@ -288,23 +294,23 @@ pub const ArrayPart = extern struct {
     // lets the loop-invariant lane `switch` hoist and kills the call overhead.
     pub inline fn get(self: *const ArrayPart, i: usize) Value {
         std.debug.assert(self.lane != .grid); // a grid's element is a row, not a scalar (Phase 3)
-        std.debug.assert(i >= 1 and i <= self.len);
-        return self.decode(i - 1);
+        std.debug.assert(i < self.asize);
+        return self.decode(i);
     }
 
-    /// `t[i] = val` for `1 <= i <= len` (in-place). If `val` does not fit the
+    /// `t[i] = val` for `0 <= i < asize` (in-place). If `val` does not fit the
     /// current narrow lane, the array part widens **monotonically** up the lane
     /// lattice first (an out-of-range int steps to the next int lane; a
     /// type-incompatible value falls to `.value`) — O(n), but bounded to a handful
     /// of crossings over the array's life. Storing `nil` punches a hole.
     pub fn setInPlace(self: *ArrayPart, gpa: std.mem.Allocator, i: usize, val: Value) std.mem.Allocator.Error!void {
         std.debug.assert(self.lane != .grid); // grid stores go through gridSet (Phase 3/4)
-        std.debug.assert(i >= 1 and i <= self.len);
+        std.debug.assert(i < self.asize);
         if (!self.fits(val)) try self.widenFor(gpa, val);
-        self.encode(i - 1, val);
+        self.encode(i, val);
     }
 
-    /// `t[i] = val` for `1 <= i <= len`, where `val` is **already known to fit**
+    /// `t[i] = val` for `0 <= i < asize`, where `val` is **already known to fit**
     /// the current lane (the caller has guarded it) — so no allocation, no widen,
     /// no `gpa`. This is the JIT oracle's in-lane store (`astore`): the recorder
     /// only emits an `astore` for an in-bounds, in-lane value, so `irinterp` can
@@ -315,64 +321,73 @@ pub const ArrayPart = extern struct {
     // packed write, not a cross-module call.
     pub inline fn setInLane(self: *ArrayPart, i: usize, val: Value) void {
         std.debug.assert(self.lane != .grid); // grid stores go through gridSet (Phase 3/4)
-        std.debug.assert(i >= 1 and i <= self.len);
+        std.debug.assert(i < self.asize);
         std.debug.assert(self.fits(val));
-        self.encode(i - 1, val);
+        self.encode(i, val);
     }
 
-    /// Append `val` as the new key `len+1` **within the current capacity**, where
+    /// Append `val` as the new key `k == asize` **within the current capacity**, where
     /// `val` is already known to fit the lane and `len < cap` — so no allocator, no
     /// `ensureCapacity`, no widen, and (unlike `Table.set`'s append) no
     /// `migrateFromHash`. This is the JIT's grow-store oracle (`astore_append`): the
-    /// recorder only emits it behind a `guard_append` that proves `idx == len+1`,
-    /// `len < cap`, and an empty hash part (so migration would be a no-op), so
+    /// recorder only emits it behind a `guard_append` that proves `idx == asize`,
+    /// `asize < cap`, and an empty hash part (so migration would be a no-op), so
     /// `irinterp` reproduces the native grow-store byte-for-byte without touching
     /// the allocator or the hash. Asserts the room + fit so a recorder bug trips in
     /// debug rather than corrupting the array. The realloc itself stays a tier-0
     /// side-exit (the `guard_append` capacity check), keeping every mode identical.
     pub fn appendInCap(self: *ArrayPart, val: Value) void {
         std.debug.assert(self.lane != .grid); // grid growth is a reshape (Phase 4), not a scalar append
-        std.debug.assert(self.len < self.cap);
+        std.debug.assert(self.asize < self.cap);
         std.debug.assert(self.fits(val));
-        self.len += 1;
-        self.encode(self.len - 1, val);
+        self.asize += 1;
+        self.encode(self.asize - 1, val);
     }
 
-    /// Append `val` as the new key `len+1`, growing the storage. Widens the lane
+    /// Append `val` as the new key `k == asize`, growing the storage. Widens the lane
     /// monotonically (see `setInPlace`) if `val` does not fit the current lane.
     pub fn append(self: *ArrayPart, gpa: std.mem.Allocator, val: Value) std.mem.Allocator.Error!void {
         std.debug.assert(self.lane != .grid); // grid growth is a reshape (Phase 4), not a scalar append
-        // Eager narrow-lane commit on the first append into a fresh array. The
-        // append fast path never reaches `Table.rehash` (a dense-from-1 fill keeps
-        // the hash part empty), so without this a homogeneous bool/int/float fill
-        // would stay on `.value` and the JIT recorder would abort on a `.value`
-        // lane (`recArraySet` in trace.zig). Commit once, then `frozen` makes the
-        // lane monotonic — it only ever widens after, via the `widenFor` path
-        // below. Pure in-memory: the lane is never serialised, so it is invisible
-        // to keyframe snapshots and to `get()` (which round-trips logical Values on
-        // any lane). A from-scratch run evolves the lane purely as a function of the
-        // append sequence, so all 8 execution modes agree; and because the lane
-        // never escapes, a keyframe restore that arrives at a different lane (e.g. a
-        // rehash-narrowed table whose hole-at-1 replays as a nil-first append) is
-        // still observably identical.
-        if (self.lane == .value and !self.frozen and self.len == 0 and !val.isNil()) {
+        try self.commitFreshLane(gpa, val, 1);
+        try self.ensureCapacity(gpa, self.asize + 1);
+        if (!self.fits(val)) try self.widenFor(gpa, val);
+        self.asize += 1;
+        self.encode(self.asize - 1, val);
+    }
+
+    /// Eager narrow-lane commit on the first value stored into a fresh array
+    /// (factored from `append` so `seedAt` shares it; doc 18 D2a). The append
+    /// fast path never reaches `Table.rehash` (a dense fill keeps the hash part
+    /// empty), so without this a homogeneous bool/int/float fill would stay on
+    /// `.value` and the JIT recorder would abort on a `.value` lane
+    /// (`recArraySet` in trace.zig). Commit once, then `frozen` makes the lane
+    /// monotonic — it only ever widens after, via the `widenFor` path. Pure
+    /// in-memory: the lane is never serialised, so it is invisible to keyframe
+    /// snapshots and to `get()` (which round-trips logical Values on any lane).
+    /// A from-scratch run evolves the lane purely as a function of the write
+    /// sequence, so all 8 execution modes agree. No-op unless the part is truly
+    /// fresh (`.value`, unfrozen, `asize == 0`) and `val` is non-nil narrow.
+    /// OOM-atomic: on failure the part is left `.value`/unfrozen/empty.
+    fn commitFreshLane(self: *ArrayPart, gpa: std.mem.Allocator, val: Value, min_cap: usize) std.mem.Allocator.Error!void {
+        if (self.lane == .value and !self.frozen and self.asize == 0 and !val.isNil()) {
             const target = laneForValue(val);
             if (target.isNarrow()) {
                 if (self.data != null) {
                     // A previously-used buffer (e.g. after `resize(0)` or removal)
                     // is still `.value`-width — reallocate it at the narrow width.
-                    // `len == 0`, so the element-copy is a no-op. `convert` is
+                    // `asize == 0`, so the element-copy is a no-op. `convert` is
                     // OOM-atomic: on failure the array is left untouched (.value,
-                    // !frozen) and the append retries cleanly.
+                    // !frozen) and the caller retries cleanly.
                     try self.convert(gpa, target);
                 } else {
-                    // Truly fresh: commit the lane and secure narrow-width capacity
-                    // now. `ensureCapacity` allocates against `self.lane` and is
-                    // itself OOM-atomic, so on failure roll the speculative lane
-                    // back to `.value` — the array stays fresh (len 0, !frozen) and
-                    // retryable, never frozen onto a value that was never stored.
+                    // Truly fresh: commit the lane and secure narrow-width
+                    // capacity now. `ensureCapacity` allocates against
+                    // `self.lane` and is itself OOM-atomic, so on failure roll
+                    // the speculative lane back to `.value` — the array stays
+                    // fresh (asize 0, !frozen) and retryable, never frozen onto
+                    // a value that was never stored.
                     self.lane = target;
-                    self.ensureCapacity(gpa, 1) catch |e| {
+                    self.ensureCapacity(gpa, min_cap) catch |e| {
                         self.lane = .value;
                         return e;
                     };
@@ -381,10 +396,6 @@ pub const ArrayPart = extern struct {
                 self.frozen = true;
             }
         }
-        try self.ensureCapacity(gpa, self.len + 1);
-        if (!self.fits(val)) try self.widenFor(gpa, val);
-        self.len += 1;
-        self.encode(self.len - 1, val);
     }
 
     /// Seed a FRESH array part from its first array-resident write `t[k] = val`
@@ -395,17 +406,26 @@ pub const ArrayPart = extern struct {
     /// choice) with the same OOM-atomicity as `append`: on failure the part is
     /// left untouched (`len == 0`, `.value`, `!frozen`).
     ///
-    /// Phase 1 (current layout): only `k == 1` is seedable and seeding IS
-    /// `append(val)` — key 1 lands in physical slot 0, `len = 1`. After the
-    /// doc-18 flip the seedable set becomes `{0, 1}`, seeding creates
-    /// `asize = k + 1` with a slot-0 hole for `k == 1`, and presence is set for
-    /// slot `k` only.
+    /// Seedable keys are `{0, 1}` (doc 18 D2a): `k == 0` is exactly an append
+    /// (the first slot IS key 0 under identity mapping); `k == 1` creates
+    /// `asize = 2` with slot 0 a hole and presence set for slot 1 only. Both
+    /// commit the lane from `val` via the same eager-commit block `append` uses.
     pub fn seedAt(self: *ArrayPart, gpa: std.mem.Allocator, k: i64, val: Value) std.mem.Allocator.Error!void {
         std.debug.assert(self.lane != .grid);
-        std.debug.assert(self.len == 0);
+        std.debug.assert(self.asize == 0);
         std.debug.assert(!val.isNil());
-        std.debug.assert(k == 1); // Phase 1 seedable set; {0, 1} after the flip
-        try self.append(gpa, val);
+        std.debug.assert(k == 0 or k == 1);
+        if (k == 0) return self.append(gpa, val);
+        // k == 1: commit the lane eagerly from the first real value (holes never
+        // influence lane choice), then materialize [hole, val]. All allocation
+        // happens before `asize` mutates, so failure leaves the part untouched
+        // (OOM-atomic, same contract as `append`).
+        try self.commitFreshLane(gpa, val, 2);
+        try self.ensureCapacity(gpa, 2);
+        if (!self.fits(val)) try self.widenFor(gpa, val);
+        self.asize = 2;
+        self.encode(0, Value.nil()); // slot-0 hole (presence stays clear / in-band nil)
+        self.encode(1, val);
     }
 
     /// Resize the array part to exactly `n` slots. Growing fills the new slots
@@ -413,25 +433,25 @@ pub const ArrayPart = extern struct {
     pub fn resize(self: *ArrayPart, gpa: std.mem.Allocator, n: usize) std.mem.Allocator.Error!void {
         std.debug.assert(self.lane != .grid); // grid resize is a reshape (Phase 4)
         if (n > self.cap) try self.ensureCapacity(gpa, n);
-        if (n > self.len) {
+        if (n > self.asize) {
             // New slots are holes. The int/float lanes lean on the presence
             // bitmap (zeroed by the growth path); the boolean lane leans on its
             // in-band data bytes (zeroed by `allocData`, and re-zeroed on shrink
             // below) — both already read `[len, n)` as absent. Only `.value`, with
             // no out-of-band hole marker, must write explicit `nil`s.
             if (self.lane == .value) {
-                var k = self.len;
+                var k = self.asize;
                 while (k < n) : (k += 1) self.encode(k, Value.nil());
             }
-        } else if (n < self.len and self.lane.isNarrow()) {
+        } else if (n < self.asize and self.lane.isNarrow()) {
             // Shrinking: punch the dropped tail back to holes so a later regrow
             // doesn't resurrect stale values as "present". `encode(nil)` does the
             // right thing per lane — clears the presence bit for the bitmap lanes,
             // zeroes the in-band byte for the boolean lane.
             var k = n;
-            while (k < self.len) : (k += 1) self.encode(k, Value.nil());
+            while (k < self.asize) : (k += 1) self.encode(k, Value.nil());
         }
-        self.len = n;
+        self.asize = n;
     }
 
     // ---- lane selection (called from Table.rehash) ----
@@ -453,7 +473,7 @@ pub const ArrayPart = extern struct {
         var hi: i64 = std.math.minInt(i64);
 
         var i: usize = 0;
-        while (i < self.len) : (i += 1) {
+        while (i < self.asize) : (i += 1) {
             const v = self.decode(i);
             if (v.isNil()) continue; // hole
             any = true;
@@ -765,13 +785,13 @@ pub const ArrayPart = extern struct {
             // Copy the live payload. For bit-packed lanes the live byte count is
             // ceil(len/8); for byte lanes it's len*width. Copying `dataBytes(len)`
             // covers exactly the occupied prefix.
-            const live = dataBytes(self.lane, self.len);
+            const live = dataBytes(self.lane, self.asize);
             if (live > 0) @memcpy(new_data.?[0..live], old[0..live]);
             gpa.free(old[0..dataBytes(self.lane, self.cap)]);
         }
         if (new_present) |np| {
             if (self.present) |old| {
-                const live = presenceBytes(self.len);
+                const live = presenceBytes(self.asize);
                 if (live > 0) @memcpy(np[0..live], old[0..live]);
                 gpa.free(old[0..presenceBytes(self.cap)]);
             }
@@ -799,13 +819,13 @@ pub const ArrayPart = extern struct {
         var dst: ArrayPart = .{
             .lane = target,
             .frozen = self.frozen,
-            .len = self.len,
+            .asize = self.asize,
             .cap = cap,
             .data = new_data,
             .present = new_present,
         };
         var i: usize = 0;
-        while (i < self.len) : (i += 1) dst.encode(i, self.decode(i));
+        while (i < self.asize) : (i += 1) dst.encode(i, self.decode(i));
 
         // Free the old buffers and adopt the converted storage.
         if (self.data) |old| gpa.free(old[0..dataBytes(self.lane, self.cap)]);
@@ -917,7 +937,7 @@ pub const ArrayPart = extern struct {
             // rehash (`Table.rehash`, which only fires when `!frozen`) from ever
             // calling `optimalLane`/`repack` on it — both assert `lane != .grid`.
             .frozen = true,
-            .len = rows,
+            .asize = rows,
             .cap = rows,
             .stride = stride,
             .data = data,
@@ -929,19 +949,19 @@ pub const ArrayPart = extern struct {
     /// Number of rows in the grid (`= len`).
     pub inline fn gridRows(self: *const ArrayPart) usize {
         std.debug.assert(self.isGrid());
-        return self.len;
+        return self.asize;
     }
 
     /// Logical length (`#`-border high-water) of row `row` (0-based).
     pub inline fn gridRowLen(self: *const ArrayPart, row: usize) usize {
-        std.debug.assert(self.isGrid() and row < self.len);
+        std.debug.assert(self.isGrid() and row < self.asize);
         return if (self.row_len) |r| r[row] else 0;
     }
 
     /// `grid[row][col+1]` — read cell `(row, col)` (both 0-based) as a logical
     /// `Value` (or `nil` for a hole).
     pub inline fn gridGet(self: *const ArrayPart, row: usize, col: usize) Value {
-        std.debug.assert(self.isGrid() and row < self.len and col < self.stride);
+        std.debug.assert(self.isGrid() and row < self.asize and col < self.stride);
         return decodeGridCell(self.grid_elem, self.data.?, self.present.?, self.gridCellIndex(row, col));
     }
 
@@ -952,7 +972,7 @@ pub const ArrayPart = extern struct {
     /// `len` tracks its high-water slot; a `nil` store does not shrink it (Lua `#`
     /// is any border).
     pub inline fn gridSet(self: *ArrayPart, row: usize, col: usize, val: Value) void {
-        std.debug.assert(self.isGrid() and row < self.len and col < self.stride);
+        std.debug.assert(self.isGrid() and row < self.asize and col < self.stride);
         std.debug.assert(laneFits(self.grid_elem, val)); // fits the cell lane, or nil
         encodeGridCell(self.grid_elem, self.data.?, self.present.?, self.gridCellIndex(row, col), val);
         if (!val.isNil()) {
@@ -1120,7 +1140,7 @@ pub const ArrayPart = extern struct {
 
 const testing = std.testing;
 
-/// Build an array part by appending `vals` (keys 1..n).
+/// Build an array part by appending `vals` (keys 0..n-1, identity slots).
 fn fromSlice(gpa: std.mem.Allocator, vals: []const Value) !ArrayPart {
     var a: ArrayPart = .empty;
     for (vals) |v| try a.append(gpa, v);
@@ -1138,11 +1158,11 @@ test "value lane: round-trips every value kind incl. nil holes" {
     try a.append(gpa, Value.boolean(true));
 
     try testing.expectEqual(Lane.value, a.lane);
-    try testing.expectEqual(@as(usize, 4), a.len);
-    try testing.expectEqual(@as(i64, 7), a.get(1).asInt());
-    try testing.expect(a.get(2).isNil());
-    try testing.expectEqual(@as(f64, 2.5), a.get(3).asFloat());
-    try testing.expectEqual(true, a.get(4).asBool());
+    try testing.expectEqual(@as(usize, 4), a.asize);
+    try testing.expectEqual(@as(i64, 7), a.get(0).asInt());
+    try testing.expect(a.get(1).isNil());
+    try testing.expectEqual(@as(f64, 2.5), a.get(2).asFloat());
+    try testing.expectEqual(true, a.get(3).asBool());
 }
 
 test "boolean lane: repack packs true/false/hole at one byte/slot, presence in-band" {
@@ -1150,7 +1170,8 @@ test "boolean lane: repack packs true/false/hole at one byte/slot, presence in-b
     var a: ArrayPart = .empty;
     defer a.deinit(gpa);
 
-    // hole at 1, then alternating booleans — the nsieve shape.
+    // hole at key 0 (the doc-18 slot-0 hole), then alternating booleans at
+    // keys 1..64 — the nsieve shape.
     try a.append(gpa, Value.nil());
     var i: usize = 2;
     while (i <= 65) : (i += 1) try a.append(gpa, Value.boolean(i % 3 == 0));
@@ -1164,10 +1185,10 @@ test "boolean lane: repack packs true/false/hole at one byte/slot, presence in-b
     try testing.expect(!Lane.boolean.usesPresenceBitmap());
     try testing.expectEqual(a.cap, ArrayPart.dataBytes(.boolean, a.cap));
 
-    try testing.expect(a.get(1).isNil());
+    try testing.expect(a.get(0).isNil());
     i = 2;
     while (i <= 65) : (i += 1) {
-        try testing.expectEqual(i % 3 == 0, a.get(i).asBool());
+        try testing.expectEqual(i % 3 == 0, a.get(i - 1).asBool());
     }
 }
 
@@ -1209,11 +1230,11 @@ test "u8 lane: a byte array commits to u8 at 1 byte/slot and zero-extends on rea
     try testing.expectEqual(a.cap, ArrayPart.dataBytes(a.lane, a.cap));
     // High bytes decode by ZERO-extension: 200 reads back 200, not -56 (the i8
     // sign-extended value of byte 0xC8).
-    try testing.expectEqual(@as(i64, 0), a.get(1).asInt());
-    try testing.expectEqual(@as(i64, 127), a.get(2).asInt());
-    try testing.expectEqual(@as(i64, 128), a.get(3).asInt());
-    try testing.expectEqual(@as(i64, 200), a.get(4).asInt());
-    try testing.expectEqual(@as(i64, 255), a.get(5).asInt());
+    try testing.expectEqual(@as(i64, 0), a.get(0).asInt());
+    try testing.expectEqual(@as(i64, 127), a.get(1).asInt());
+    try testing.expectEqual(@as(i64, 128), a.get(2).asInt());
+    try testing.expectEqual(@as(i64, 200), a.get(3).asInt());
+    try testing.expectEqual(@as(i64, 255), a.get(4).asInt());
     try testing.expectEqual(Lane.u8, a.optimalLane());
 }
 
@@ -1227,10 +1248,10 @@ test "u8 lane: a value > 255 widens to i16, preserving every byte" {
     // [0,256], i.e. i16 (never i8, never back to u8). Existing bytes survive.
     try a.append(gpa, Value.int(256));
     try testing.expectEqual(Lane.i16, a.lane);
-    try testing.expectEqual(@as(i64, 10), a.get(1).asInt());
-    try testing.expectEqual(@as(i64, 200), a.get(2).asInt());
-    try testing.expectEqual(@as(i64, 255), a.get(3).asInt());
-    try testing.expectEqual(@as(i64, 256), a.get(4).asInt());
+    try testing.expectEqual(@as(i64, 10), a.get(0).asInt());
+    try testing.expectEqual(@as(i64, 200), a.get(1).asInt());
+    try testing.expectEqual(@as(i64, 255), a.get(2).asInt());
+    try testing.expectEqual(@as(i64, 256), a.get(3).asInt());
 }
 
 test "u8 lane: a negative store widens to i16 (not i8), preserving high bytes" {
@@ -1242,11 +1263,11 @@ test "u8 lane: a negative store widens to i16 (not i8), preserving high bytes" {
     // A -1 store: u8 already spans [0,255], so the smallest signed lane covering
     // [-1,255] is i16 — NOT i8 (which tops out at 127 and would drop the 200/255
     // bytes). This is the load-bearing combined-range widen.
-    try a.setInPlace(gpa, 2, Value.int(-1));
+    try a.setInPlace(gpa, 1, Value.int(-1));
     try testing.expectEqual(Lane.i16, a.lane);
-    try testing.expectEqual(@as(i64, 0), a.get(1).asInt());
-    try testing.expectEqual(@as(i64, -1), a.get(2).asInt());
-    try testing.expectEqual(@as(i64, 255), a.get(3).asInt());
+    try testing.expectEqual(@as(i64, 0), a.get(0).asInt());
+    try testing.expectEqual(@as(i64, -1), a.get(1).asInt());
+    try testing.expectEqual(@as(i64, 255), a.get(2).asInt());
 }
 
 test "int lane: values survive a repack and decode exactly" {
@@ -1260,7 +1281,7 @@ test "int lane: values survive a repack and decode exactly" {
     // widens up to i16 as the values grow past 255 — no manual repack needed.
     try testing.expectEqual(Lane.i16, a.lane);
     i = 1;
-    while (i <= 50) : (i += 1) try testing.expectEqual(i * 100, a.get(@intCast(i)).asInt());
+    while (i <= 50) : (i += 1) try testing.expectEqual(i * 100, a.get(@intCast(i - 1)).asInt());
 }
 
 test "f64 lane round-trips" {
@@ -1269,9 +1290,9 @@ test "f64 lane round-trips" {
     defer a.deinit(gpa);
     // fromSlice appends, so the first float eager-commits the f64 lane.
     try testing.expectEqual(Lane.f64, a.lane);
-    try testing.expectEqual(@as(f64, 1.5), a.get(1).asFloat());
-    try testing.expectEqual(@as(f64, -2.25), a.get(2).asFloat());
-    try testing.expectEqual(@as(f64, 3.0e10), a.get(3).asFloat());
+    try testing.expectEqual(@as(f64, 1.5), a.get(0).asFloat());
+    try testing.expectEqual(@as(f64, -2.25), a.get(1).asFloat());
+    try testing.expectEqual(@as(f64, 3.0e10), a.get(2).asFloat());
 }
 
 test "widening: an out-of-lane store reverts to the value lane, preserving slots" {
@@ -1283,11 +1304,11 @@ test "widening: an out-of-lane store reverts to the value lane, preserving slots
     try testing.expectEqual(Lane.boolean, a.lane); // eager-committed on first append
 
     // Store an int into a boolean lane → must widen to .value and keep the rest.
-    try a.setInPlace(gpa, 5, Value.int(42));
+    try a.setInPlace(gpa, 4, Value.int(42));
     try testing.expectEqual(Lane.value, a.lane);
-    try testing.expectEqual(@as(i64, 42), a.get(5).asInt());
-    try testing.expectEqual(true, a.get(1).asBool());
-    try testing.expectEqual(true, a.get(10).asBool());
+    try testing.expectEqual(@as(i64, 42), a.get(4).asInt());
+    try testing.expectEqual(true, a.get(0).asBool());
+    try testing.expectEqual(true, a.get(9).asBool());
 }
 
 test "widening on append of an out-of-lane value" {
@@ -1300,9 +1321,9 @@ test "widening on append of an out-of-lane value" {
 
     try a.append(gpa, Value.float(1.5)); // doesn't fit u8 → widen
     try testing.expectEqual(Lane.value, a.lane);
-    try testing.expectEqual(@as(usize, 11), a.len);
-    try testing.expectEqual(@as(i64, 1), a.get(1).asInt());
-    try testing.expectEqual(@as(f64, 1.5), a.get(11).asFloat());
+    try testing.expectEqual(@as(usize, 11), a.asize);
+    try testing.expectEqual(@as(i64, 1), a.get(0).asInt());
+    try testing.expectEqual(@as(f64, 1.5), a.get(10).asFloat());
 }
 
 test "monotonic widen: an int outgrowing its lane steps up the int ladder, not to value" {
@@ -1316,20 +1337,20 @@ test "monotonic widen: an int outgrowing its lane steps up the int ladder, not t
     try testing.expectEqual(Lane.u8, a.lane);
 
     // Store 1000 (out of u8, fits i16) → steps up to i16, NOT .value.
-    try a.setInPlace(gpa, 3, Value.int(1000));
+    try a.setInPlace(gpa, 2, Value.int(1000));
     try testing.expectEqual(Lane.i16, a.lane);
-    try testing.expectEqual(@as(i64, 1000), a.get(3).asInt());
-    try testing.expectEqual(@as(i64, 1), a.get(1).asInt()); // earlier slots intact
+    try testing.expectEqual(@as(i64, 1000), a.get(2).asInt());
+    try testing.expectEqual(@as(i64, 1), a.get(0).asInt()); // earlier slots intact
 
     // Append 100000 (out of i16, fits i32) → steps up to i32.
     try a.append(gpa, Value.int(100000));
     try testing.expectEqual(Lane.i32, a.lane);
-    try testing.expectEqual(@as(i64, 100000), a.get(11).asInt());
+    try testing.expectEqual(@as(i64, 100000), a.get(10).asInt());
 
     // Append 1<<40 (out of i32) → i64.
     try a.append(gpa, Value.int(1 << 40));
     try testing.expectEqual(Lane.i64, a.lane);
-    try testing.expectEqual(@as(i64, 1 << 40), a.get(12).asInt());
+    try testing.expectEqual(@as(i64, 1 << 40), a.get(11).asInt());
 }
 
 test "monotonic widen: a type-incompatible store still falls straight to value" {
@@ -1341,10 +1362,10 @@ test "monotonic widen: a type-incompatible store still falls straight to value" 
     try testing.expectEqual(Lane.u8, a.lane); // eager-committed on first append (bytes → u8)
 
     // A float into an int lane is a type mismatch → no int lane covers it → .value.
-    try a.setInPlace(gpa, 4, Value.float(1.5));
+    try a.setInPlace(gpa, 3, Value.float(1.5));
     try testing.expectEqual(Lane.value, a.lane);
-    try testing.expectEqual(@as(f64, 1.5), a.get(4).asFloat());
-    try testing.expectEqual(@as(i64, 1), a.get(1).asInt());
+    try testing.expectEqual(@as(f64, 1.5), a.get(3).asFloat());
+    try testing.expectEqual(@as(i64, 1), a.get(0).asInt());
 }
 
 test "monotonic: a frozen lane is preserved across a widening convert" {
@@ -1357,7 +1378,7 @@ test "monotonic: a frozen lane is preserved across a widening convert" {
     // no need to repack or set frozen by hand.
     try testing.expect(a.frozen);
 
-    try a.setInPlace(gpa, 3, Value.int(1000)); // u8 → i16 via widenFor/convert
+    try a.setInPlace(gpa, 2, Value.int(1000)); // u8 → i16 via widenFor/convert
     try testing.expectEqual(Lane.i16, a.lane);
     try testing.expect(a.frozen); // commitment survives the widen
 }
@@ -1408,15 +1429,15 @@ test "resize grows with holes and shrinks dropping the tail" {
     try a.append(gpa, Value.int(2));
     try testing.expectEqual(Lane.u8, a.lane); // eager-committed on first append (bytes → u8)
 
-    try a.resize(gpa, 6); // grow → slots 3..6 are holes
-    try testing.expectEqual(@as(usize, 6), a.len);
-    try testing.expectEqual(@as(i64, 2), a.get(2).asInt());
-    try testing.expect(a.get(3).isNil());
-    try testing.expect(a.get(6).isNil());
+    try a.resize(gpa, 6); // grow → slots 2..5 are holes
+    try testing.expectEqual(@as(usize, 6), a.asize);
+    try testing.expectEqual(@as(i64, 2), a.get(1).asInt());
+    try testing.expect(a.get(2).isNil());
+    try testing.expect(a.get(5).isNil());
 
     try a.resize(gpa, 1); // shrink
-    try testing.expectEqual(@as(usize, 1), a.len);
-    try testing.expectEqual(@as(i64, 1), a.get(1).asInt());
+    try testing.expectEqual(@as(usize, 1), a.asize);
+    try testing.expectEqual(@as(i64, 1), a.get(0).asInt());
 }
 
 test "empty / all-hole array stays in the value lane" {
@@ -1457,7 +1478,7 @@ test "eager commit: dense-from-1 boolean fill commits .boolean + frozen, no manu
     try testing.expect(a.frozen);
     try testing.expect(a.present == null); // boolean lane is in-band, no bitmap
     i = 1;
-    while (i <= 32) : (i += 1) try testing.expectEqual(i % 2 == 0, a.get(i).asBool());
+    while (i <= 32) : (i += 1) try testing.expectEqual(i % 2 == 0, a.get(i - 1).asBool());
 }
 
 test "eager commit: dense-from-1 int fill narrows then widens up the int ladder" {
@@ -1472,9 +1493,9 @@ test "eager commit: dense-from-1 int fill narrows then widens up the int ladder"
     try a.append(gpa, Value.int(100000)); // i16 → i32
     try testing.expectEqual(Lane.i32, a.lane);
     try testing.expect(a.frozen); // commitment survives every widen
-    try testing.expectEqual(@as(i64, 100), a.get(1).asInt());
-    try testing.expectEqual(@as(i64, 5000), a.get(2).asInt());
-    try testing.expectEqual(@as(i64, 100000), a.get(3).asInt());
+    try testing.expectEqual(@as(i64, 100), a.get(0).asInt());
+    try testing.expectEqual(@as(i64, 5000), a.get(1).asInt());
+    try testing.expectEqual(@as(i64, 100000), a.get(2).asInt());
 }
 
 test "eager commit: heterogeneous first-two (int then float) ends in the value lane" {
@@ -1486,8 +1507,8 @@ test "eager commit: heterogeneous first-two (int then float) ends in the value l
     try a.append(gpa, Value.float(1.5)); // float doesn't fit any int lane → .value
     try testing.expectEqual(Lane.value, a.lane);
     try testing.expect(a.frozen);
-    try testing.expectEqual(@as(i64, 7), a.get(1).asInt());
-    try testing.expectEqual(@as(f64, 1.5), a.get(2).asFloat());
+    try testing.expectEqual(@as(i64, 7), a.get(0).asInt());
+    try testing.expectEqual(@as(f64, 1.5), a.get(1).asFloat());
 }
 
 test "eager commit: heap-first append stays in the value lane, not frozen" {
@@ -1566,6 +1587,118 @@ test "presence bitmap is sized to whole 64-bit words (native bts can't run past 
     }
 }
 
+// ---- doc 18 §T: slot-0 array part ----
+
+test "inArray: unsigned membership — negatives wrap-fail, 0 and asize-1 in, asize out" {
+    // THE bounds contract (doc 18 D2.2): `@bitCast`, never `@intCast` — a negative
+    // key must wrap to a huge u64 and fail the compare, never trap.
+    try testing.expect(ArrayPart.inArray(0, 1));
+    try testing.expect(ArrayPart.inArray(0, 8));
+    try testing.expect(ArrayPart.inArray(7, 8));
+    try testing.expect(!ArrayPart.inArray(8, 8)); // == asize: append territory
+    try testing.expect(!ArrayPart.inArray(-1, 8));
+    try testing.expect(!ArrayPart.inArray(std.math.minInt(i64), 8));
+    try testing.expect(!ArrayPart.inArray(0, 0)); // empty part admits nothing
+    try testing.expect(!ArrayPart.inArray(-1, 0));
+}
+
+test "seedAt(0) is exactly append: asize 1, no hole, lane committed from the value" {
+    const gpa = testing.allocator;
+    var a: ArrayPart = .empty;
+    defer a.deinit(gpa);
+    try a.seedAt(gpa, 0, Value.int(7));
+    try testing.expectEqual(@as(usize, 1), a.asize);
+    try testing.expectEqual(Lane.u8, a.lane); // eager commit from the seeded value
+    try testing.expect(a.frozen);
+    try testing.expectEqual(@as(i64, 7), a.get(0).asInt());
+}
+
+test "seedAt(1) per lane: asize 2, slot-0 hole, lane committed from the first REAL value" {
+    const gpa = testing.allocator;
+    // bool → .boolean (in-band presence)
+    {
+        var a: ArrayPart = .empty;
+        defer a.deinit(gpa);
+        try a.seedAt(gpa, 1, Value.boolean(true));
+        try testing.expectEqual(@as(usize, 2), a.asize);
+        try testing.expectEqual(Lane.boolean, a.lane);
+        try testing.expect(a.frozen);
+        try testing.expect(a.get(0).isNil()); // the slot-0 hole
+        try testing.expectEqual(true, a.get(1).asBool());
+    }
+    // small int → u8 (presence bitmap: bit 0 clear, bit 1 set)
+    {
+        var a: ArrayPart = .empty;
+        defer a.deinit(gpa);
+        try a.seedAt(gpa, 1, Value.int(200));
+        try testing.expectEqual(Lane.u8, a.lane);
+        try testing.expect(a.frozen);
+        try testing.expect(!a.isPresent(0));
+        try testing.expect(a.isPresent(1));
+        try testing.expect(a.get(0).isNil());
+        try testing.expectEqual(@as(i64, 200), a.get(1).asInt());
+    }
+    // float → f64
+    {
+        var a: ArrayPart = .empty;
+        defer a.deinit(gpa);
+        try a.seedAt(gpa, 1, Value.float(2.5));
+        try testing.expectEqual(Lane.f64, a.lane);
+        try testing.expect(a.get(0).isNil());
+        try testing.expectEqual(@as(f64, 2.5), a.get(1).asFloat());
+    }
+    // heap value → stays .value, not frozen (no narrow lane to commit)
+    {
+        var a: ArrayPart = .empty;
+        defer a.deinit(gpa);
+        var hdr = object.GcHeader.init(.table); // tag-only; never dereferenced
+        try a.seedAt(gpa, 1, Value.heap(&hdr));
+        try testing.expectEqual(Lane.value, a.lane);
+        try testing.expect(!a.frozen);
+        try testing.expect(a.get(0).isNil());
+        try testing.expect(a.get(1).isHeap());
+    }
+}
+
+test "seedAt(1) is OOM-atomic: failure leaves the part fresh and retryable" {
+    const Inner = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var a: ArrayPart = .empty;
+            defer a.deinit(gpa);
+            try a.seedAt(gpa, 1, Value.int(42));
+            try testing.expectEqual(@as(usize, 2), a.asize);
+            try testing.expectEqual(@as(i64, 42), a.get(1).asInt());
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Inner.run, .{});
+}
+
+test "slot-0 hole + presence bits around the 63/64 word edge" {
+    const gpa = testing.allocator;
+    var a: ArrayPart = .empty;
+    defer a.deinit(gpa);
+    // Seed [hole, 1] then append up through key 70 — an int lane whose presence
+    // bitmap crosses the first 64-bit word boundary with bit 0 permanently clear.
+    try a.seedAt(gpa, 1, Value.int(1));
+    var k: i64 = 2;
+    while (k <= 70) : (k += 1) try a.append(gpa, Value.int(k));
+    try testing.expectEqual(@as(usize, 71), a.asize);
+    try testing.expect(a.get(0).isNil());
+    try testing.expect(!a.isPresent(0)); // the hole never gained a presence bit
+    // The word-rounding edge: slots 63 and 64 straddle two bitmap words.
+    try testing.expectEqual(@as(i64, 63), a.get(63).asInt());
+    try testing.expectEqual(@as(i64, 64), a.get(64).asInt());
+    try testing.expect(a.isPresent(63));
+    try testing.expect(a.isPresent(64));
+    // Punch a hole exactly at 64 (first bit of word 1), regrow it, both words sane.
+    try a.setInPlace(gpa, 64, Value.nil());
+    try testing.expect(!a.isPresent(64));
+    try testing.expect(a.isPresent(63));
+    try testing.expect(a.get(64).isNil());
+    try a.setInPlace(gpa, 64, Value.int(-64));
+    try testing.expectEqual(@as(i64, -64), a.get(64).asInt());
+}
+
 test "appendInCap on an int lane encodes the value and sets the presence bit" {
     // `appendInCap` is the on-trace `astore_append` oracle (tier-1a) that native
     // Phase-B int lowering must match byte-for-byte. Unlike the bool lane (in-band
@@ -1579,13 +1712,13 @@ test "appendInCap on an int lane encodes the value and sets the presence bit" {
     try testing.expectEqual(Lane.u8, a.lane);
     try testing.expect(a.lane.usesPresenceBitmap());
     // Secure room for an in-cap append, then drive the oracle directly (no realloc).
-    try a.ensureCapacity(gpa, a.len + 1);
-    const before = a.len; // 1 (logical len); the new slot's 0-based index is `before`
+    try a.ensureCapacity(gpa, a.asize + 1);
+    const before = a.asize; // 1; the new slot IS key/slot `before` (identity mapping)
     a.appendInCap(Value.int(42));
-    try testing.expectEqual(before + 1, a.len);
-    try testing.expectEqual(Value.int(42), a.get(before + 1)); // new slot round-trips (1-based)
-    try testing.expect(a.isPresent(before)); // its presence bit set (0-based slot index)
-    try testing.expectEqual(Value.int(7), a.get(1)); // earlier slot intact
+    try testing.expectEqual(before + 1, a.asize);
+    try testing.expectEqual(Value.int(42), a.get(before)); // new slot round-trips
+    try testing.expect(a.isPresent(before)); // its presence bit set
+    try testing.expectEqual(Value.int(7), a.get(0)); // earlier slot intact
 }
 
 test "Layout offsets are stable and lane is first" {
@@ -1602,8 +1735,8 @@ test "Layout offsets are stable and lane is first" {
     const word = @sizeOf(usize);
     try testing.expectEqual(@as(usize, 1), ArrayPart.Layout.frozen);
     try testing.expectEqual(@as(usize, 2), ArrayPart.Layout.grid_elem);
-    try testing.expectEqual(@alignOf(usize), ArrayPart.Layout.len);
-    try testing.expectEqual(ArrayPart.Layout.len + word, ArrayPart.Layout.cap);
+    try testing.expectEqual(@alignOf(usize), ArrayPart.Layout.asize);
+    try testing.expectEqual(ArrayPart.Layout.asize + word, ArrayPart.Layout.cap);
     try testing.expectEqual(ArrayPart.Layout.cap + word, ArrayPart.Layout.data);
     try testing.expectEqual(ArrayPart.Layout.data + word, ArrayPart.Layout.present);
     // The grid fields are appended after `present` (doc 14 Phase 2), so they land
@@ -1698,8 +1831,8 @@ test "grid: int leaf round-trips and a cell decodes identically to a scalar slot
     var scalar = try fromSlice(gpa, &.{ Value.int(-5), Value.int(100000) });
     defer scalar.deinit(gpa);
     try testing.expectEqual(Lane.i32, scalar.lane);
-    try testing.expectEqual(scalar.get(1), g.gridGet(0, 0));
-    try testing.expectEqual(scalar.get(2), g.gridGet(0, 1));
+    try testing.expectEqual(scalar.get(0), g.gridGet(0, 0));
+    try testing.expectEqual(scalar.get(1), g.gridGet(0, 1));
 }
 
 test "grid: jagged rows — row_len is the high-water column, nil store does not shrink it" {

@@ -134,14 +134,15 @@ fn hashSuccessorStep(gpa: std.mem.Allocator, t: *const Table, ctrl: Value) !Step
 /// The core of `next(t, ctrl)`: array part (ascending index, skipping nil holes)
 /// then hash part (canonical order).
 fn nextStep(gpa: std.mem.Allocator, t: *const Table, ctrl: Value) !Step {
-    const n: i64 = @intCast(t.array.len);
+    const n: i64 = @intCast(t.array.asize);
 
-    // Determine where to resume in the array part.
+    // Determine where to resume in the array part (doc 18: keys 0..asize-1,
+    // identity slots — so key 0 iterates FIRST when present).
     var start: i64 = undefined; // first array index to consider
     var in_array = true;
     if (ctrl.isNil()) {
-        start = 1;
-    } else if (ctrl.isInt() and arr.ArrayPart.inArray(ctrl.asInt(), t.array.len)) {
+        start = 0;
+    } else if (ctrl.isInt() and arr.ArrayPart.inArray(ctrl.asInt(), t.array.asize)) {
         start = ctrl.asInt() + 1;
     } else {
         in_array = false; // ctrl is a hash key (or an int beyond the array part)
@@ -149,7 +150,7 @@ fn nextStep(gpa: std.mem.Allocator, t: *const Table, ctrl: Value) !Step {
 
     if (in_array) {
         var i = start;
-        while (i <= n) : (i += 1) {
+        while (i < n) : (i += 1) {
             const v = t.array.get(@intCast(i));
             if (!v.isNil()) return .{ .found = true, .key = Value.int(i), .val = v };
         }

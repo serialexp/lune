@@ -37,7 +37,7 @@ const ArrLayout = struct {
     const array_base = table.Table.array_off;
     /// `ArrayPart` field offsets (from `array_base`).
     const lane = arr.ArrayPart.Layout.lane;
-    const len = arr.ArrayPart.Layout.len;
+    const asize = arr.ArrayPart.Layout.asize;
     const cap = arr.ArrayPart.Layout.cap;
     const data = arr.ArrayPart.Layout.data;
     const present = arr.ArrayPart.Layout.present;
@@ -61,7 +61,7 @@ comptime {
     // the assumptions the native address math (B2+) relies on.
     std.debug.assert(ArrLayout.array_base >= @sizeOf(@import("object.zig").GcHeader));
     std.debug.assert(ArrLayout.lane == 0);
-    std.debug.assert(ArrLayout.len % @alignOf(usize) == 0);
+    std.debug.assert(ArrLayout.asize % @alignOf(usize) == 0);
     std.debug.assert(ArrLayout.data % @alignOf(usize) == 0);
     std.debug.assert(ArrLayout.present % @alignOf(usize) == 0);
 }
@@ -2091,7 +2091,7 @@ const SlotInfo = struct {
     /// back to `regs[]` on exit.
     data_home: ?Reg = null, // [array_base + data]  (element pointer)
     present_home: ?Reg = null, // [array_base + present] (int-lane presence bitmap ptr)
-    len_home: ?Reg = null, // [array_base + len]   (element count, for guard_bounds)
+    len_home: ?Reg = null, // [array_base + asize]   (slot count / bounds limit, for guard_bounds)
 };
 
 /// The allocator's output — the sole input `lower` needs (later commits).
@@ -4372,7 +4372,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         const tb = try refHomeBaseReg(a, s, .rax);
         if (s.data_home) |r| try a.movRegMem(r, tb, ArrLayout.array_base + ArrLayout.data);
         if (s.present_home) |r| try a.movRegMem(r, tb, ArrLayout.array_base + ArrLayout.present);
-        if (s.len_home) |r| try a.movRegMem(r, tb, ArrLayout.array_base + ArrLayout.len);
+        if (s.len_home) |r| try a.movRegMem(r, tb, ArrLayout.array_base + ArrLayout.asize);
     }
 
     // Phase E1/E2: with a preheader marker the run-once region (instructions before
@@ -4596,27 +4596,25 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try emitHStore(a, kinds, alloc, ins);
             },
             // --- lane-aware array read path (B2, bool lane) ----------------------
-            // aref: materialize idx0 = index - 1 (the 0-based packed index) into the
-            // aref token's own location. The table pointer is reached lazily by each
-            // consumer through `aref.a` (the invariant table home), so aref itself
-            // touches only the index.
+            // aref: materialize idx0 = index (doc 18: identity mapping — logical key
+            // IS the physical slot, no `- 1`) into the aref token's own location.
+            // The table pointer is reached lazily by each consumer through `aref.a`
+            // (the invariant table home), so aref itself touches only the index.
             .aref => {
                 const dst = placeOfRef(alloc, i);
                 const idxp = placeOfRef(alloc, ins.b);
                 switch (dst) {
                     .reg => |R| {
                         try placeToReg(a, R, idxp);
-                        try a.subRegImm32(R, 1);
                     },
                     .mem => |D| {
                         try placeToReg(a, .rax, idxp);
-                        try a.subRegImm32(.rax, 1);
                         try a.movMemReg(.rsp, D, .rax);
                     },
                     .xmm => unreachable, // idx0 is an int (aref kind), never an XMM home
                 }
             },
-            // guard_bounds: idx0 <u len, else side-exit. [I3] the single idx0 from aref
+            // guard_bounds: idx0 <u asize, else side-exit. [I3] the single idx0 from aref
             // is shared by bounds/present/aload. [I4] precedes guard_present.
             .guard_bounds => {
                 const aref_ins = t.instrs[ins.a];
@@ -4629,9 +4627,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     try a.cmpRegReg(ireg, lr);
                 } else {
                     const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
-                    try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.len);
+                    try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.asize);
                 }
-                try jccNativeExit(a, exit_labels, i, .ae); // idx0 >=u len (covers negative/zero key too)
+                try jccNativeExit(a, exit_labels, i, .ae); // idx0 >=u asize (unsigned: covers negative keys)
             },
             // guard_present: the slot must hold a value; a hole would read as nil,
             // which the int/bool kind can't hold. The hole test is lane-specific:
@@ -4784,8 +4782,9 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // guard_append (B5-grow): the append precondition, the grow analogue of
             // guard_bounds. Three memory-relative checks, no extra register beyond the
             // two the array path already uses (idx0 in `ireg`, table in `tbreg`):
-            //   (1) idx0 == len   — the exact append successor (key tracks the extent).
-            //   (2) idx0 <u cap   — room without a realloc. `len == idx0` from (1), so
+            //   (1) idx0 == asize — the exact append successor (doc 18 D2.3: the key IS
+            //       the next slot under identity mapping).
+            //   (2) idx0 <u cap   — room without a realloc. `asize == idx0` from (1), so
             //       comparing idx0 (not a reloaded len) against cap is equivalent and
             //       needs no third register.
             //   (3) hash.size == 0 — the hash is empty, so tier-0's `migrateFromHash`
@@ -4798,15 +4797,15 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 const aref_ins = t.instrs[ins.a];
                 const ireg = try refBaseReg(a, alloc, ins.a, .rcx); // idx0
                 const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax); // table ptr
-                try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.len);
-                try jccNativeExit(a, exit_labels, i, .ne); // idx0 != len → not the append successor
+                try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.asize);
+                try jccNativeExit(a, exit_labels, i, .ne); // idx0 != asize → not the append successor
                 try a.cmpRegMem(ireg, tbreg, ArrLayout.array_base + ArrLayout.cap);
-                try jccNativeExit(a, exit_labels, i, .ae); // idx0 (==len) >=u cap → would realloc
+                try jccNativeExit(a, exit_labels, i, .ae); // idx0 (==asize) >=u cap → would realloc
                 try a.cmpDwordMemImm(tbreg, ArrLayout.hash_size, 0);
                 try jccNativeExit(a, exit_labels, i, .ne); // hash non-empty → migrate possible
             },
-            // astore_append (B5-grow): commit one boolean to `data[len]` and bump len.
-            // guard_append proved `idx0 == len < cap` and an empty hash, so this is the
+            // astore_append (B5-grow): commit one boolean to `data[asize]` and bump asize.
+            // guard_append proved `idx0 == asize < cap` and an empty hash, so this is the
             // bool-lane byte store (`1=false, 2=true`, value+1 — presence is in-band)
             // followed by an in-place `inc qword [tbl+len]`. len has NO register home
             // for an append trace (the home-reservation switch skips astore_append), so
@@ -4864,7 +4863,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 // identical for both lanes, and the single point any later guard's
                 // side-exit observes the append as already committed.
                 const tbreg = try refBaseReg(a, alloc, aref_ins.a, .rax);
-                try a.incMemQword(tbreg, ArrLayout.array_base + ArrLayout.len);
+                try a.incMemQword(tbreg, ArrLayout.array_base + ArrLayout.asize);
             },
             // --- flattened-grid cell path (doc 14, Phase 8) ---------------------
             // garow: materialize row0 = row - 1 (the 0-based row) into the garow token's
