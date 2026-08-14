@@ -1,7 +1,19 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
 Status: **all eight §A8 steps are landed as of 2026-08-12** — step 8 (A-viii, outer-cycle disarm coverage) closed the sequence: the outer cycle is pinned as a *simultaneously* armed closed cycle (`native_link_peak >= 3`; nsieve 4) that fires, an open observation window is pinned to contain it (nothing arms, output-transparent, still dispatcher-mediated native entries per R2-4), the **mid-epoch** transition is driven end-to-end through a host-installed native (which measures a live 3-link multi-kind cycle at the window-open instant, its complete teardown, and continued dispatcher-mediated trace entries afterward), and `disarmAllLinks` is pinned exhaustive over all four production edge kinds incl. `.loop_done_linked` and `.region_bridge`. A-viii's first landing was corrected over two codex review rounds — the "mid-epoch window is host-unreachable" claim (false: natives receive the `*Vm`), a fictional unit topology (now four kinds on genuinely distinct physical slot shapes, all armed through `armNativeLink`), an unsound cross-run `entries` comparison, and `entries` being the wrong counter for R2-4 at all (new `native_entries`, bumped only when the dispatcher commits to a native body) — see §A8-iv. One residual, tracked as its own Outstanding bullet: no test observes a live `.region_bridge` link at a window-open instant, since any probe placement that leaves the bridge armed leaves the registry empty at the call — not achieved in this workload, not shown impossible. Earlier: **§A8 step 7 (A-vii, the edge-4 FLIP) COMPLETE 2026-08-12**: landed (A-vii-c/c.1 gate consumption, A-vii-d/d.1 arming + successor overlay + receipt-sited two-phase arm + codex-blocker fix fcee9b7), reviewed (codex BLOCKER→fix→APPROVE), and measured per the frozen A-vii-e protocol — which surfaced and fixed a 2× per-instruction observer overhead (A-vii-e.1 `ObserverFast` bitset fast path; the raw flip regressed nsieve ~2× with the observer scan at 49% of runtime, the bridge itself measured cost-neutral by ablation). Final vs pre-flip: nsieve N=9 −9%, N=7 −6%, nsieve:24 coverage 56.7%→94.9% traced, six-workload output identity + bit-identical stats counters. Remaining in §A8: step 8 (A-viii disarm coverage), then the native in-page handoff (§A2.4) to convert the coverage gain to wall-clock.
-Last updated: 2026-08-14 (**B-3c is DONE (§B3.15, commit 2f3c929) — verdict:
+Last updated: 2026-08-14 (**B-3d set-promotion design ACCEPTED after three
+review rounds — §B3.16 draft, §B3.17 round-2 revision (BLOCKER: the set
+growth/multiplicity knot → enforced one-set-per-region with demote-and-regrow;
+MAJORs: trigger visibility, barren-unfreeze live-patch panic, verdict-cap
+arithmetic), §B3.18 round-3 revision + confirmation (convergent MAJOR: owned
+identical re-arms must short-circuit at the `armNativeLink` funnel;
+`.sibling_handoff` excluded for latch balance). Reviews ran on Antigravity +
+an independent agent with disagreements adjudicated against the source
+(Antigravity's round-1 O3 answer refuted); a codex `gpt-5.6-sol` pass is owed
+when quota returns 2026-08-20. Two pre-existing Rule-#0.5 bugs confirmed by
+both reviewers, fixed by construction in the design. Landing plan: B-3d.1
+funnel hygiene → .2 set candidacy → .3 drain generalization → .4 frozen
+measurement. Earlier: **B-3c DONE (§B3.15, commit 2f3c929) — verdict:
 the budget is a ~1% lever, and the remaining seam is the NON-RING sibling
 automaton.** The `silent_iters` sweep + re-profile prescribed by the accepted
 plan ran: 534 exhaustions ≈ 4% of ~12.9k drains; the other ~12.4k are
@@ -4185,6 +4197,402 @@ the sibling automaton run silent regardless of firing order and would convert
 equivalence for arbitrary interleavings, per-edge evidence without ring
 distances, terminal resume from `silent_last_cell` alone) and needs its own
 review rounds before any code.
+
+##### B3.16 — Part B-3d design DRAFT (2026-08-14, round 1): set-promotion — promote the frozen region's armed-edge SET, not exact rings
+
+Status: **draft, under adversarial review — do not implement from this
+revision.** Reviewers: Antigravity + independent general-purpose agent (codex
+quota-blocked until 2026-08-20; a codex pass is owed when it returns).
+
+**Why.** §B3.15: exact-ring promotion structurally cannot capture the
+nsieve:14 sibling automaton (t3.ei12/t4.ei18/t5.ei14, data-dependent firing
+order), whose materialized rows feed ~12.4k ledger-full suffix drains at ~10k
+cyc each (~40% of the nsieve run: the 30.6% seam bucket + the 9.0%
+tier-0-has-trace bucket). LuaJIT needs no ring: every patched side exit jumps
+to its side trace permanently and the whole trace graph self-sustains. Our
+ring requirement exists only because pre-round-6 accounting reconstructed
+burst structure by phase arithmetic. Round 6 replaced reconstruction with
+per-cell MEASUREMENT (`firings`, `last_ordinal`, `last_productive_ordinal`,
+`silent_cell`/`silent_last_cell`), so the ring is now load-bearing in exactly
+three places — metadata/storage grouping, `sibling_return_distance` evidence,
+and the terminal-resume successor assert — and each has a measured, order-free
+replacement. Sets subsume rings (a ring is a set whose automaton happens to be
+periodic); per global Rule #8 the ring machinery is REPLACED, not kept beside.
+
+**D1 — Candidate + trigger.** `considerSilentPromotion` keeps its safe point,
+freeze precondition, and consecutive-observation discipline. What changes is
+the candidate grammar: instead of `detectPhysicalCycle`'s
+exact-repeat-over-32-rows ring, the candidate is **every armed, patch-pointed,
+un-owned region-member edge of the frozen region at the observation instant**
+(same per-edge validation as today: unique armed link for (parent, exit),
+child match, `rowPatchKind` patch point, `promotedEdgeFromLink` identity), and
+the ledger evidence requirement is: a full forced-yield ledger in which
+**every row is one of the candidate's edges** — repetition structure is not
+required. Candidate identity for the consecutive-run compare is the canonical
+edge list sorted by (parent id, exit); `promote_after = 4` identical
+consecutive sets promotes, any mismatch resets, exactly as today. The
+candidate is a pure function of deterministic state (armed-link registry +
+region membership + ledger), so the promotion instant stays reproducible.
+
+**D2 — Storage.** `PromotedCycle` → `PromotedSet`: edges in the canonical
+sorted order (no ring order exists), `summary`/`metadata` per edge as today,
+`region_key`, `id`. `sibling_return_distance` and
+`computeSiblingReturnDistances` are DELETED. `PROMOTED_CYCLE_CAP = 16` →
+`PROMOTED_SET_CAP = 16` (nsieve's full automaton is 8 edges). At most one
+live set per region key — **round-1 review showed this was an unenforced
+assumption broken by the growth case; round 2 makes it an ENFORCED invariant
+with demote-and-regrow, see §B3.17 R1** — distinct regions may coexist, and
+the round-6 multi-cycle drain (validate all, sum all, clear all) carries over
+verbatim as multi-set.
+
+**D3 — Sibling evidence, fully measured (replaces return distances).** The
+per-edge verdict contract is unchanged: one verdict per fired
+`sibling_handoff` edge describing its MOST RECENT firing. `productive` is
+already order-free (`last_productive_ordinal >= cell.last_ordinal`,
+call-global ordinal space). `returned_to_parent` loses the ring bound and
+gains a measured one, exploiting that ordinals are call-global and monotonic:
+control was at trace P at ordinal k iff some edge with parent == P fired at
+k. So for edge e = (P → C) with most recent firing at `cell_e.last_ordinal`:
+
+    returned_to_parent :=
+        (max over live cells c' with c'.edge.parent.id == P.id
+             of c'.last_ordinal) > cell_e.last_ordinal
+        OR (suffix_ledger contains a row with id == P.id)
+
+The `> ` is sufficient (no `+2` slack needed): e's firing at k moves control
+INTO C, so the earliest possible later firing out of P is k+2 — the
+one-intervening-child-row requirement (j >= k+2) the ring distance encoded is
+implied by ordinal monotonicity. **(Round-1 correction: this argument holds
+only for parent != child; for self-edges D3 is stronger-not-equivalent, and
+the ring bound it replaces is itself latently wrong today — see §B3.17 R3.)** The suffix disjunct reuses the existing
+"every suffix row is later than every silent firing" fact that
+`stageSilentSuffixProvenance` already relies on; the arrival scan is one pass
+over the ≤32 suffix rows. Open question O2 below names the merge-order
+interaction with suffix verdict evidence.
+
+**D4 — Terminal resume.** Already measured: `silent_last_cell` names the last
+fired edge; resume contract = that edge's `resume_pc` +
+`applyEdgeCursorTransition` on its kind, unchanged. The ring-successor assert
+(`edges[(last_phase+1) % len].parent == last_edge.child`) is replaced by the
+STRONGER measured assert `last_set.summary[last_phase].last_ordinal ==
+result.silent_transitions` — the claimed terminal cell must literally own the
+final ordinal. (The ring assert validated reconstruction; this one validates
+the measurement itself and holds for any interleaving.)
+
+**D5 — Accounting equivalence.** No change of mechanism: the round-6
+expansion already iterates ALL live promotions × cells in storage order and
+is order-independent — additive counters (`native_link_exits`, fused
+counters, `loop_done_count`, `suppressed_hops`), additive region credit
+(`creditRegionWork` of summed `region_work`), additive
+`accountLedgerRowsBulk` (selection work + qualifying rows), the barren run
+carried as the natively-measured `cur_zero_run` scalar, and one
+most-recent-firing verdict per edge. The equivalence claim to be reviewed:
+for an ARBITRARY interleaving of set edges, sequential replay of the
+materialized rows commits (a) the same additive sums — row-order-independent
+by inspection — and (b) the same final per-edge verdicts — because reporting
+walks rows in order and the last observation stands, which is exactly
+"describe the most recent firing". The `origin == .inner_call` first-hop
+loop-done exception keys off the measured entry cell (`silent_cell`),
+unchanged. The `Σ firings == silent_transitions` release check, the
+first-cell-ownership rule, and the per-call mailbox clear (ALL live sets)
+carry over verbatim.
+
+**D6 — Lifecycle + nativegen.** Demotion triggers unchanged (slot mutation,
+trace invalidation, region close, teardown; `promoted_exit_owners` still maps
+each exit to ≤1 owner). nativegen is untouched: `emitSilentEpilogue`,
+`SilentExitMetadata`, first-cell ownership, the budget/barren compares, and
+the patch machinery are all edge-local and ring-blind already — B-3d is a
+trace.zig-only change plus tests.
+
+**Expected measurement (frozen protocol as B-3b).** With the full automaton
+silent, bursts end only at budget/barren exhaustion or genuine region exit,
+so suffix drains (~12.4k) should collapse toward the exhaustion count and the
+budget knob becomes live again (rowless budget returns skip the walk
+entirely; re-sweep after landing — §B3.15's ~1% verdict is conditioned on the
+ring model). Predicted: seam bucket 30.6% → single digits, tier-0-has-trace
+9.0% → ~0, nsieve at-or-below LuaJIT parity. Gates: full `just test` both
+builds, seven hashes + three repros with promotion ON and OFF, ten-leg
+replay-mode matrix, telemetry sanity.
+
+**Open questions for review.**
+- **O1**: D1's "every row ∈ candidate set" evidence bar — is a weaker bar
+  (e.g. ≥K of 32 rows) needed for automata whose ledgers mix member edges
+  with rare non-armable exits, or does that correctly stay unpromoted?
+- **O2**: D3's suffix-arrival disjunct vs `stageSilentSuffixProvenance`'s
+  per-relation verdict merge: confirm no double-count or missed strike when
+  the same relation has both a silent-prefix verdict and suffix rows.
+- **O3**: with one set per region, does a region whose armed-edge population
+  GROWS after promotion (new side trace recorded → new armable edge) need
+  re-candidacy (demote + re-promote), and is the demotion trigger for that
+  (trace invalidation on the parent) already sufficient?
+- **O4**: `PROMOTED_SET_CAP = 16` vs `PROVENANCE_VERDICT_CAP` sizing once a
+  set can stage up to `edges.len` sibling verdicts + 32 suffix verdicts.
+- **O5**: the D4 assert requires the terminal cell's `last_ordinal` to equal
+  the transition count — confirm no legal burst ends on a cell whose
+  `last_ordinal` was later overwritten by a re-firing recorded under a
+  DIFFERENT cell address for the same physical edge (metadata cells are
+  per-edge singletons, so this should be impossible — verify).
+
+##### B3.17 — B-3d round-1 review record + round-2 revision (2026-08-14)
+
+Round 1 ran on Antigravity (tool-enabled, full source access) and an
+independent general-purpose agent, in parallel. Verdicts: Antigravity
+effectively-accept (1 MAJOR, 2 MINOR); independent agent **REVISE** (1
+BLOCKER, 3 MAJOR, 7 MINOR). Where they disagreed, the disagreements were
+adjudicated against the source:
+
+- **Antigravity's O3 answer ("arming a new side trace demotes the owning set
+  via prepareSlotMutation") is WRONG**, verified directly:
+  `demoteCyclesTouching` (trace.zig:9337) no-ops unless the mutated
+  (parent, exit) is itself owned; arming a NEW exit demotes nothing. The
+  independent agent found the same hole and built the BLOCKER on it.
+- **Antigravity's MAJOR (TSC order-dependence in `accountLedgerRowsBulk`)
+  is adjudicated pre-existing and in-contract**: the landed round-6 code
+  already charges drain-time spans per summarized member, the code comment
+  explicitly redefines per-trace TSC attribution as diagnostic-only, and
+  `config.coverage` never runs in the replay-equivalence modes. No design
+  change; D5 gains a sentence naming it.
+- Both reviewers independently verified D3's formula core, D4's assert
+  (unconditionally true for any interleaving: the epilogue stamps
+  `last_ordinal = transitions+1` then increments `transitions`, and silence
+  cannot resume after a row), D5's per-counter additivity, and D6's
+  "nativegen untouched" claim (every silent epilogue reads only its own
+  metadata/summary cell, its slot, and the global budget fields).
+
+**R1 (BLOCKER: set growth/multiplicity knot — findings 1+2+4). Resolution:
+demote-and-regrow with ENFORCED one-set-per-region.** The chosen policy
+(over multi-set accretion, which would additionally require feeding suffix
+ledgers to the trigger and a cross-set cap discipline):
+
+- `promoteSet` REJECTS if the region already owns a live set (new reject
+  counter `region_owned`); one set per region key becomes an enforced
+  invariant, not an assumption.
+- **Growth trigger**: arming (or re-arming to a different relation) any
+  armable member edge of a region that owns a live set QUEUES demotion of
+  that set (new `DemotionReason.membership_growth`), through the existing
+  `pending_demote` machinery so mid-walk safety is inherited. Arming is
+  deterministic, so the demotion instant is reproducible. Candidacy then
+  restarts from fully-reporting windows with the GROWN region-total
+  candidate; `promote_after = 4` consecutive identical sets re-promotes.
+- **Trigger visibility (finding 2) is resolved by construction, and the
+  limitation is now stated**: candidacy evidence comes ONLY from full
+  forced-yield reporting ledgers at `driveDispatcherLedger`'s safe point —
+  which is exactly the state the region is in whenever promotion is
+  actually needed (before first promotion; after any demotion). While a
+  set is live there is never residue to observe: the set was region-total
+  at promotion and growth demotes first. Suffix ledgers stay invisible to
+  the trigger, deliberately.
+- **Child-match is specified per-adjacent-pair** (finding 2, second half):
+  for evidence rows i, i+1 the unique armed link of row i must satisfy
+  `link.child == owner(row i+1)`; the final (yielded) row's jump is
+  suppressed and is exempt. This preserves the old grammar's
+  successor-evidence strength without requiring periodicity.
+- **Cap (finding 4)**: with one set ≤ `PROMOTED_SET_CAP = 16` edges per
+  region and only the active region's set able to fire in one call
+  (cross-region execution deopts — `driveSilentBurst` release-checks
+  `region_key == active`), `PROVENANCE_VERDICT_CAP = 16 + 32 = 48` is
+  sound BY CONSTRUCTION, and a release assert pins Σ staged prefix
+  verdicts ≤ `PROMOTED_SET_CAP`. NB the reviewer showed today's RING code
+  does not enforce cycle-count-per-region and its cap comment assumes one
+  promotion — a latent pre-existing unsoundness (two 16-edge rings could
+  stage 63 > 48); R1 fixes it as a side effect of the enforced invariant.
+
+**R2 (MAJOR: barren-unfreeze → next-drain panic — finding 3). Resolution:
+demote-on-unfreeze.** `flushRegionWindow`'s low-yield unfreeze
+(trace.zig:3498-3501) additionally queues demotion of the region's live
+set (`DemotionReason.unfreeze`, via `pending_demote` — it can fire
+mid-walk). The `driveSilentBurst` frozen-accumulator panic (:5513) then
+remains a TRUE invariant instead of a latent crash: patches never outlive
+the frozen state that justified them. This closes a pre-existing hole
+(global Rule #0.5): today's rings can hit the same panic via the
+barren-exhaustion path (:5537-5542 → `noteBarrenConsumed` → synthetic
+low-yield flush → unfreeze, with the patches left live); it is unreached
+on the current suite (0 barren exhaustions) but reachable by construction,
+and sets widen it (structural `link_terminal`/`region_bridge` epilogues
+unconditionally advance `cur_zero_run`).
+
+**R3 (MINOR: D3 self-edge argument — finding 5).** The "k+2 is implied"
+justification is corrected: it holds only for `parent != child`. For a
+self-edge P→P every firing IS an arrival at P, and the measured rule
+(strictly-later P-parent firing, or suffix row at P) intentionally does
+NOT count the firing under judgment as its own return evidence — the
+verdict describes that firing, and return means control came back AFTER
+it. The design now states plainly: **D3 is stronger-not-equivalent to the
+ring bound for self-edge and repeated-parent shapes**, and the ring bound
+it replaces is itself latently WRONG today (pre-existing, Rule #0.5): 
+`cell.last_ordinal + distance <= transitions` (:5354) uses the CALL-GLOBAL
+transition count, so a second live cycle's firings can satisfy the bound
+with no actual return to P — a false strike D3 eliminates by measuring
+arrivals at P specifically. Verdicts steer tiering only, never output;
+the promotion-ON/OFF hash suite is the behavioral gate.
+
+**R4 (MINOR: suffix-arrival granularity — finding 6).** Merge order is
+now specified: sibling verdicts stage first (:5495), suffix provenance
+merges after (:5569), evidence bits are idempotent booleans with
+`saw_productive` dominant at capture — no double-count. "Arrival at P"
+for the D3 suffix disjunct is defined as a suffix row whose OWNER trace is
+P under the same row-ownership resolution `captureProvenanceVerdicts`
+uses (a failed-prologue row is an arrival at the trace that reported it,
+not at the trace it failed to enter); pinned with a unit test.
+
+**R5 (MINORs absorbed — findings 7, 8, 10, 11).** (a) A comment-assert in
+the drain names the invariant "all summary mutations must remain additive
+/ measurement-carried; storage-order iteration is only sound for such";
+(b) a comment pins "no promotion/demotion between native return and
+drain" (today guaranteed — drain is the first act at every origin,
+mid-walk demotion is queued — the comment guards future safe-point
+insertion against stale `silent_last_cell` resolution); (c) zero-evidence
+promotion of a candidate edge that appeared in no evidence ledger is an
+explicit accepted trade (registry proof — `promotedEdgeFromLink` slot/
+patch/entry identity — is what makes the jump target correct; firing
+evidence then arrives via summary cells); (d) demotion blast radius is
+named: one slot mutation (or growth, or unfreeze) demotes the entire set,
+and re-promotion needs 4 full-candidate windows — cheap on quiesced
+regions, measured on the board like everything else; (e) the unit-test
+migration inventory is part of the landing plan: the repeated-parent
+round-robin test (:15897), drain/suffix exactness (:15957), suffix
+baseline (:17311), and the `silentSiblingEvidence` fixtures (:14110-14330)
+are REPLACED by set-shaped equivalents (out-of-order automaton drain,
+growth-demotes-set, unfreeze-demotes-set, self-edge return semantics,
+per-adjacent-pair candidate validation), never deleted.
+
+**O1 is closed** (strict every-row-∈-candidate bar stays; both reviewers
+concur, and it matches ring behavior for non-member rows). **O2–O5 are
+closed** by R4, R1, R1, and R5(b) respectively.
+
+Round-2 review of this revision: see §B3.18. A codex `gpt-5.6-sol` pass is
+owed when quota returns (2026-08-20) before B-3d lands.
+
+##### B3.18 — B-3d round-2 review record + round-3 revision (2026-08-14)
+
+Round 2 (Antigravity + independent agent, both re-run on §B3.16+§B3.17)
+returned REVISE ×2 — but convergently: both found the SAME single MAJOR, and
+everything else is wording precision. Both also confirmed, independently and
+against the tree: R2's exactly-once drain discipline (summaries read → cleared
+→ queued demotions applied after the walk, `queueDemote` id-dedup +
+pre-reserved capacity making the no-allocation-mid-walk guarantee hold for the
+new demotion sources), the per-adjacent-pair child-match well-definedness
+(non-final rows are always `.normal`; a prologue-fail row can never match a
+candidate edge; the final-row exemption is forced by the `.yielded` gate +
+`emitForcedYieldCheck`'s suppressed jump), determinism of the growth/unfreeze
+demotion instants across the replay modes, and BOTH Rule #0.5 pre-existing-bug
+claims (the barren-unfreeze→panic path and the call-global ring
+returned-to-parent false strike).
+
+**R6 (the convergent MAJOR): identical re-arms of OWNED slots must
+short-circuit at the `armNativeLink` funnel, before `prepareSlotMutation`.**
+Today the re-arm branch (:9497-9524) calls `prepareSlotMutation(.rearm)`
+unconditionally; the identical-convergence check at :9502 spares only the
+promotion CANDIDATE, so an identical re-publication of an owned edge's
+relation would demote the whole set with reason `slot_mutation`. The
+reachable scenario (independent agent): silence is a strict prefix — once a
+suffix exists, owned member edges append reporting rows and dispatch through
+their slots; a suffix whose forced-yield TERMINAL row is an owned
+`loop_done_linked`/`link_terminal` row fires the `is_last` convergence arms
+(:6150-6151, :6212), whose "harmless in-place supersede" comments are stale
+since B-3b. Today's 5-ring escapes only because §B3.15 measured the suffix
+terminals as sibling deopts, whose provenance-drain arm path has an
+already-armed skip. Decision: `armNativeLink`'s re-arm branch returns `true`
+immediately when child, kind, AND slot target are all unchanged — no
+`prepareSlotMutation`, no demotion, no candidate reset (the candidate check
+at :9502 already treats identical re-publication as non-invalidating; this
+extends the same judgment to the promotion, which patches only the exit
+BRANCH and never the slot). The two stale comments are updated in the same
+change, and two unit tests pin it: owned-slot identical re-arm does NOT
+demote; changed-relation re-arm DOES.
+
+**R7 (wording + scope corrections, all adopted).**
+- `membership_growth` scope: needed ONLY for un-owned edges (an owned slot
+  can never take the fresh-arm branch, and a changed-relation owned re-arm
+  already demotes via `prepareSlotMutation`). The trigger evaluates at the
+  single `armNativeLink` funnel (every arm path provably routes through it:
+  sibling watch :2785, bridge :3933, driveChain :4940/:5016, scalar :6886,
+  convergence :9584/:9610), fires only after a SUCCESSFUL arm, and demotes
+  "via `demoteCycleReason` semantics" — queued mid-walk, immediate at
+  depth-0 — not "always queued" as §B3.17 loosely said. Implementation
+  notes from Antigravity: extend the demotion-reason counters/log fields
+  with the two new reasons, and any depth-0 multi-set demotion loop must
+  iterate backwards over `promoted_cycles` (swapRemove) or queue
+  unconditionally.
+- **One membership predicate, named once**: candidacy membership and the
+  growth trigger use the SAME function (`promotionBelongsToRegion`'s
+  per-edge core + patch-point validation); a narrower trigger predicate
+  would re-create trigger-invisible residue and reopen the mixed-suffix
+  scenario.
+- R4's failed-prologue parenthetical was backwards (the row's baked id IS
+  the trace whose prologue failed — nativegen.zig:3597); corrected to the
+  operative rule with no false distinction: **arrival ownership = `row.id`,
+  exactly as `captureProvenanceVerdicts` scans it**, and the pinned test
+  asserts owner == the prologue-failing trace's own id.
+- Churn costs stated on the board: one `membership_growth` round per
+  late-arming edge (a demote + 4 full-window regrow, ~4 × 10k cyc — bounded,
+  not sustained thrash, since promotion lags arming by construction); plus
+  one extra 4-window round when `promoteSet` rejects `region_owned` against
+  a queued-but-unapplied growth demote (the reject resets the candidate
+  streak — deterministic, accepted).
+- `queueDemote` reason dedup keeps the FIRST reason; multi-reason
+  misattribution is deterministic and diagnostic-only — pinned by comment.
+
+**Round-3 confirmation (both reviewers): ACCEPT.** Antigravity walked every
+side effect the R6 early return skips and confirmed each is either
+change-only (candidate reset, latch clear, memo drop) or caller-restamped
+(`region_id`/`armed_gen` — the `tryArmRegionBridge` restamp re-scans the
+registry AFTER the true return, so an identical `.region_bridge` re-arm via
+a defs-gen bump survives). The independent agent additionally verified the
+"slot target unchanged" compare is checkable at the short-circuit point
+(`c.slots[slot_index] != target` exists verbatim at :9502, and a surviving
+record implies the slot holds its target), that the target compare correctly
+forces the full re-arm path for a recompiled child (new `ordinary_entry`),
+and that the funnel enumeration is complete (the seven non-test
+`armNativeLink` call sites match R7's list exactly).
+
+**R6 amendment (the one conditioned finding, adopted): `.sibling_handoff`
+is EXCLUDED from the short-circuit.** `publishSiblingArm` increments
+`parent.sibling_arms` after a true return, balanced today by
+`clearSiblingLatch` inside the re-arm branch; a kind-agnostic early return
+would leak the latch +1 per identical sibling re-publication — the exact
+codex post-landing blocker the :9505-9513 comment memorializes. Identical
+sibling re-publication is unreachable today through both funnels
+(`siblingHandoffEligible` rejects already-armed exits; the provenance drain
+has an explicit already-armed skip), so excluding the kind keeps today's
+balanced path and, if those guards ever drift, degrades to a safe demote
+rather than a latch leak. A third pinned test covers it. Nit adopted with
+it: the short-circuit emits a distinct `dbg` receipt in jitdbg builds.
+
+**STATUS: B-3d design ACCEPTED (round 3, 2026-08-14)** — three review
+rounds (draft REVISE ×2 → revision REVISE ×2 convergent → confirmation
+ACCEPT ×2), one BLOCKER and five MAJORs found and resolved without
+weakening a check, two pre-existing Rule-#0.5 bugs surfaced and scheduled
+for fix-by-construction (barren-unfreeze live-patch panic → R2
+demote-on-unfreeze; call-global returned-to-parent false strike → D3
+measured arrival). A codex `gpt-5.6-sol` pass is owed when quota returns
+(2026-08-20) before the final landing gate.
+
+**Landing plan (gated sub-steps, each behind `just test` both builds +
+seven hashes + three repros ON/OFF):**
+- **B-3d.1 — funnel hygiene (independently landable, fixes latent bugs).**
+  The R6 identical-re-arm short-circuit (non-sibling kinds, dbg receipt,
+  three pinned tests, the two stale "harmless supersede" comments); R2
+  demote-on-unfreeze in `flushRegionWindow` (+ `DemotionReason.unfreeze`,
+  counters/log plumbing); the D3-independent part of the false-strike fix
+  is NOT split out — it lands with b-3d.3's evidence rewrite.
+- **B-3d.2 — set candidacy + promotion.** Replace `detectPhysicalCycle`'s
+  ring grammar with the D1 set candidate (region-total armed-member edges,
+  every-row-∈-candidate + per-adjacent-pair child-match, canonical sort,
+  `promote_after` streak on set identity); `promoteSet` with `region_owned`
+  reject + enforced one-set-per-region; `membership_growth` demotion at the
+  arm funnel (shared predicate with candidacy); storage rename
+  `PromotedCycle`→`PromotedSet`, `sibling_return_distance` deleted.
+- **B-3d.3 — drain generalization.** D3 measured `returned_to_parent`
+  (parent-latest-ordinal disjunct + suffix-arrival scan, self-edge
+  semantics), D4 measured terminal assert replacing the ring-successor
+  assert, R5 comment-asserts; unit-test migration per R5(e)+R6 (set-shaped
+  replacements for the ring fixtures, never deletions).
+- **B-3d.4 — measurement per the frozen protocol.** Re-profile nsieve
+  (predicted: suffix drains collapse toward exhaustion count, seam 30.6% →
+  single digits, tier-0-has-trace ~0), re-sweep `--trace-silent-budget`
+  (the knob goes live once bursts end mainly by budget), full board, both
+  promotion states, telemetry sanity, doc + CURRENT_TASK records.
 
 ##### A.1 — The edge-4 bridge (BLOCKER 1)
 

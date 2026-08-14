@@ -1,5 +1,42 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-52) — **B-3d set-promotion design ACCEPTED (doc §B3.16–§B3.18) after three adversarial rounds. Next: land B-3d.1 (funnel hygiene).**
+
+B-3d generalizes silent promotion from exact detected rings to the frozen
+region's armed-edge SET, so non-ring automata (the nsieve:14 sibling triangle)
+run silent regardless of firing order — the ~40%-of-run drain seam from
+LATEST-51. Round-6's per-cell measurement already de-ring-ified the
+accounting; the design closes the three remaining ring dependencies with
+measured, order-free replacements.
+
+Review history (Antigravity + independent general-purpose agent each round;
+codex quota-blocked until Aug 20, a gpt-5.6-sol pass owed before final
+landing): round 1 REVISE (BLOCKER: one-set-per-region unenforced/broken by
+growth; MAJORs: trigger can't see suffix ledgers, barren-unfreeze→live-patch
+panic, PROVENANCE_VERDICT_CAP arithmetic; Antigravity's O3 answer refuted
+against the source) → round 2 revision (R1 demote-and-regrow + enforced
+invariant, R2 demote-on-unfreeze, per-adjacent-pair child-match, D3 self-edge
+correction) → round 2 REVISE ×2 convergent (same MAJOR both reviewers: owned
+identical re-arms demote via prepareSlotMutation — the stale "harmless
+supersede" convergence arms) → round 3 revision (R6 short-circuit at the
+armNativeLink funnel, `.sibling_handoff` excluded for latch balance; R7
+wording/scope) → confirmation ACCEPT ×2.
+
+Two pre-existing bugs (Rule #0.5) confirmed by both reviewers, fixed by
+construction: (1) barren-exhaustion → `flushRegionWindow` unfreeze leaves
+patches live → next drain panics on the frozen check (unreached on the suite,
+reachable by construction); (2) ring `returned_to_parent` bounds against the
+CALL-GLOBAL transition count, so a second live cycle's firings can fake a
+return → false strike (D3's parent-specific measured arrival eliminates it).
+
+Landing plan (each sub-step behind full gates, both promotion states):
+**B-3d.1** funnel hygiene (R6 short-circuit + R2 demote-on-unfreeze —
+independently landable, fixes the latent bugs); **B-3d.2** set candidacy +
+promotion (D1 grammar, promoteSet, membership_growth, storage rename);
+**B-3d.3** drain generalization (D3/D4 measured evidence + test migration);
+**B-3d.4** frozen measurement (predicted: seam 30.6% → single digits,
+tier-0-has-trace ~0, budget knob live again).
+
 ## Status 2026-08-14 (LATEST-51) — **B-3c DONE (commit 2f3c929, doc §B3.15): the budget is a ~1% lever; the real seam feedstock is the NON-RING sibling automaton → proposed B-3d set-promotion.**
 
 The prescribed sweep + re-profile ran and answered B-3c's own question in the
