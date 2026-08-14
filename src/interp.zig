@@ -12713,6 +12713,30 @@ test "array-of-structs: read-only loop over .value-lane table array is byte-iden
     , "7575\t12625\n");
 }
 
+test "integral-float array keys narrow on-trace; fractional keys side-exit to hash semantics" {
+    // `j = (2*i)/2` is Lua float division: the key is an integral FLOAT, which
+    // tier-0's `normalizeKey` folds to the int slot. The recorder mirrors that
+    // with `guard_float` + `int_of_float` (`keyRefNarrowed`) instead of aborting
+    // — the fft_bitreverse shape. Every 10th iteration reads a genuinely
+    // FRACTIONAL key (`j + 0.5`), which must side-exit the narrow and resolve
+    // via tier-0's hash-part semantics (absent → nil → `or 1`). Byte-identical
+    // across the 10-mode matrix pins both the fast path and the deopt path.
+    try expectProgram(
+        \\local v = {}
+        \\for i = 1, 128 do v[i] = i end
+        \\local s = 0
+        \\for i = 1, 120 do
+        \\  local j = (2 * i) / 2
+        \\  s = s + v[j]
+        \\  v[j] = s
+        \\  if i % 10 == 0 then
+        \\    s = s + (v[j + 0.5] or 1)
+        \\  end
+        \\end
+        \\print(s)
+    , "7272\n");
+}
+
 test "array-of-structs: single-field read accumulation across element tables" {
     // A loop that reads one scalar field from each element table in an array,
     // accumulating the values. Exercises the aload(.value, ty=.heap) →

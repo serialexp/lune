@@ -525,7 +525,8 @@ pub const GuardRole = enum(u8) {
     loop_done, // for_loop / for_prep-first-iter continuation test (guard_true)
     container_type, // get/set_index container tag (guard_table)
     container_lane, // array element-lane (guard_lane)
-    key_type, // array/grid index type (guard_int on the key)
+    key_type, // array/grid index type (guard_int / guard_float on the key)
+    key_int, // get/set_index integral-float key → int narrowing (int_of_float)
     bounds, // array/grid bounds check (guard_bounds)
     present, // array/grid presence (guard_present / guard_gpresent)
     element_type, // .value-lane loaded element (fused: guard_table on the load)
@@ -11006,7 +11007,10 @@ pub const TraceState = struct {
             // path (Phase B; in-bounds dense narrow-lane slot only); a constant
             // STRING key takes the hash-field path (doc 11, `obj.field`); anything
             // else aborts cleanly. The key type is observed at record time.
-            .get_index => if (regs.get(instr.c).isInt())
+            // NUMBER covers the integral-float key (`v[j]` with `j` from float
+            // division) — `recArrayGet` narrows it via `keyRefNarrowed` or aborts
+            // `.bad_type` for a fractional float, same net abort as before.
+            .get_index => if (regs.get(instr.c).isNumber())
                 try self.recArrayGet(instr, regs)
             else if (isStringKey(regs.get(instr.c)))
                 try self.recHashGet(instr, regs)
@@ -11016,7 +11020,7 @@ pub const TraceState = struct {
             // Table write `t[k]=v`: INTEGER key → packed-array write (Phase B,
             // in-bounds in-lane, C1 deopt-replay rule); constant STRING key →
             // hash-field write (doc 11, present-key overwrite only); else abort.
-            .set_index => if (regs.get(instr.b).isInt())
+            .set_index => if (regs.get(instr.b).isNumber())
                 try self.recArraySet(instr, regs)
             else if (isStringKey(regs.get(instr.b)))
                 try self.recHashSet(instr, regs)
@@ -11177,6 +11181,42 @@ pub const TraceState = struct {
         try self.guard(ref, if (v.isInt()) IrOp.guard_int else IrOp.guard_float, role, operand);
     }
 
+    /// Record-time view of an array get/set KEY: the integer index tier-0's
+    /// `table.normalizeKey` resolves the key to, or null when the access is hash
+    /// territory (fractional float / non-number) and the caller must abort
+    /// `.bad_type`. The SAME `value.floatAsExactInt` predicate underpins
+    /// `normalizeKey`, tier-1a's `int_of_float`, and the native `cvttsd2si`
+    /// round-trip, so all four agree bit-for-bit.
+    fn keyIndexOf(vkey: Value) ?i64 {
+        if (vkey.isInt()) return vkey.asInt();
+        if (vkey.isFloat()) return value.floatAsExactInt(vkey.asFloat());
+        return null;
+    }
+
+    /// Emit the int-typed key ref for an array get/set whose record-time key
+    /// `keyIndexOf` already accepted. An int key type-guards as before
+    /// (`guard_int`, dedup'd). An integral-FLOAT key — e.g. fft_bitreverse's
+    /// `j`, made float by `k = k/2` float division — NARROWS: `guard_float` on
+    /// the operand, then `int_of_float`, the same guarded float→int op the
+    /// float-loop-limit specialization uses (all three tiers lower it; native
+    /// requires exactly this dominating `guard_float`, nativegen.zig ~1522).
+    /// This is the recorder mirror of tier-0's `normalizeKey` (LuaJIT:
+    /// `lj_opt_narrow` index narrowing): a later NON-integral float at the same
+    /// site side-exits `int_of_float` → tier-0 resumes with its exact hash-part
+    /// semantics, so the fractional case is never on-trace, just not fast.
+    fn keyRefNarrowed(self: *TraceState, key_reg: u16, operand: OperandDesig, vkey: Value) !Ref {
+        const rkey = try self.refOf(key_reg);
+        if (vkey.isInt()) {
+            try self.guardInt(rkey, .key_type, operand);
+            return rkey;
+        }
+        std.debug.assert(vkey.isFloat()); // caller gated on keyIndexOf != null
+        try self.guard(rkey, .guard_float, .key_type, operand);
+        const iof = try self.emit(.{ .op = .int_of_float, .a = rkey, .ty = .int });
+        self.stampProv(iof, .key_int, operand, .neutral);
+        return iof;
+    }
+
     fn recArith(self: *TraceState, op: IrOp, instr: Instr, regs: RegWindow) !void {
         const vb = regs.get(instr.b);
         const vc = regs.get(instr.c);
@@ -11273,14 +11313,13 @@ pub const TraceState = struct {
         const vtab = regs.get(instr.b);
         const vkey = regs.get(instr.c);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
-        if (!vkey.isInt()) return self.abort(.bad_type);
+        const idx = keyIndexOf(vkey) orelse return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         // A metatable means an absent slot could fire `__index` (chunk 2a). Even a
         // present slot today could become a hole on a later iteration, so the only
         // sound conservative choice is to bail the whole trace to tier-0.
         if (tbl.metatable != null) return self.abort(.has_metatable);
         const lane = tbl.array.lane;
-        const idx = vkey.asInt();
         if (!arr.ArrayPart.inArray(idx, tbl.array.asize)) return self.abort(.bad_type);
         const loaded = tbl.getInt(idx);
         if (loaded.isNil()) return self.abort(.bad_type); // hole — not a profitable trace
@@ -11298,8 +11337,7 @@ pub const TraceState = struct {
             const rtab = try self.refOf(instr.b);
             self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .b, .neutral);
             self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .b, .neutral);
-            const rkey = try self.refOf(instr.c);
-            try self.guardInt(rkey, .key_type, .c);
+            const rkey = try self.keyRefNarrowed(instr.c, .c, vkey);
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
             self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
             // No guard_present: the `.value` lane has no presence bitmap — nil is
@@ -11322,8 +11360,7 @@ pub const TraceState = struct {
         const rtab = try self.refOf(instr.b);
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .b, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .b, .neutral);
-        const rkey = try self.refOf(instr.c);
-        try self.guardInt(rkey, .key_type, .c);
+        const rkey = try self.keyRefNarrowed(instr.c, .c, vkey);
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_present, .a = ref }), .present, .none, .neutral);
@@ -11337,8 +11374,9 @@ pub const TraceState = struct {
     /// — the FIRST mid-iteration heap mutation in the system. Aborts (leaving
     /// tier-0 untouched) unless the store is a *present, in-bounds, in-lane*
     /// slot whose value is deopt-replay-safe:
-    ///   * non-table container or non-int key → `.bad_type` (hash-part / metatable
-    ///     territory, out of scope);
+    ///   * non-table container or non-integral key → `.bad_type` (hash-part /
+    ///     metatable territory, out of scope; an integral-FLOAT key narrows via
+    ///     `keyRefNarrowed`, mirroring tier-0's `normalizeKey`);
     ///   * `.value`-lane array → `.nyi_opcode` (unpacked 16-B path is deferred —
     ///     and a heap value would need a write barrier the native ABI lacks);
     ///   * out-of-bounds (`k>len` would *grow*, `k<1` is the hash part) → `.bad_type`;
@@ -11370,7 +11408,7 @@ pub const TraceState = struct {
         const vkey = regs.get(instr.b);
         const vval = regs.get(instr.c);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
-        if (!vkey.isInt()) return self.abort(.bad_type);
+        const idx = keyIndexOf(vkey) orelse return self.abort(.bad_type);
         if (vval.isNil()) return self.abort(.bad_type); // hole-punch — out of scope
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         // A metatable means an absent-key store could fire `__newindex` (chunk 2a);
@@ -11379,7 +11417,6 @@ pub const TraceState = struct {
         if (tbl.metatable != null) return self.abort(.has_metatable);
         const lane = tbl.array.lane;
         if (lane == .value) return self.abort(.nyi_opcode); // unpacked path deferred
-        const idx = vkey.asInt();
 
         // Grow (append) store: `t[asize] = v` extends the dense run by one (doc 18
         // D2.3: under identity mapping the contiguous successor key IS `asize`).
@@ -11413,8 +11450,7 @@ pub const TraceState = struct {
             const rtab = try self.refOf(instr.a);
             self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .a, .neutral);
             self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .a, .neutral);
-            const rkey = try self.refOf(instr.b);
-            try self.guardInt(rkey, .key_type, .b);
+            const rkey = try self.keyRefNarrowed(instr.b, .b, vkey);
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
             // guard_append: hash-empty + `idx==asize` + `asize<cap`. The grow analogue
             // of guard_bounds — side-exits to tier-0 (which reallocs/migrates) when
@@ -11456,8 +11492,7 @@ pub const TraceState = struct {
         const rtab = try self.refOf(instr.a);
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .a, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .a, .neutral);
-        const rkey = try self.refOf(instr.b);
-        try self.guardInt(rkey, .key_type, .b);
+        const rkey = try self.keyRefNarrowed(instr.b, .b, vkey);
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
         // Guard at runtime that the value still fits the recorded narrow lane: a
@@ -13209,6 +13244,74 @@ test "recArrayGet: t[k] on a bool lane records the full guarded read sequence" {
     try testing.expectEqual(ObsType.boolean, ops[8].ty); // bool lane → boolean
 }
 
+test "recArrayGet: an integral-FLOAT key narrows via guard_float + int_of_float (keyRefNarrowed)" {
+    // `t[3.0]` — the key a float division produces (fft_bitreverse's `j`). Tier-0's
+    // `normalizeKey` folds it to the int slot; the recorder must mirror that with a
+    // guarded narrow, not abort. Sequence: slot_load(table), guard_table, guard_lane,
+    // slot_load(key), guard_float, int_of_float, aref(key = the NARROWED ref),
+    // guard_bounds, guard_present, aload.
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 2;
+    while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.float(3.0) };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
+
+    try testing.expect(state.isRecording()); // narrows, does NOT abort
+    const ops = state.rec.instrs.items;
+    try testing.expectEqual(@as(usize, 10), ops.len);
+    try testing.expectEqual(IrOp.guard_float, ops[4].op); // key observed float
+    try testing.expectEqual(@as(Ref, 3), ops[4].a); // ...guards the key slot_load
+    try testing.expectEqual(IrOp.int_of_float, ops[5].op); // the narrow
+    try testing.expectEqual(@as(Ref, 3), ops[5].a);
+    try testing.expectEqual(ObsType.int, ops[5].ty);
+    try testing.expectEqual(IrOp.aref, ops[6].op);
+    try testing.expectEqual(@as(Ref, 5), ops[6].b); // aref keys on the NARROWED ref
+    try testing.expectEqual(IrOp.aload, ops[9].op);
+}
+
+test "recArraySet: an integral-FLOAT key narrows and stores through the narrowed ref" {
+    // `t[3.0] = false` on a bool lane: same narrow as the read side; the astore's
+    // aref must key on the int_of_float result.
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 2;
+    while (i <= 32) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // set_index: a=table b=key c=value
+    var regs = [_]Value{ Value.heap(&t.header), Value.float(3.0), Value.boolean(false) };
+    state.recordInstr(Instr.opABC(.set_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
+
+    try testing.expect(state.isRecording());
+    const ops = state.rec.instrs.items;
+    // slot_load(value), slot_load(table), guard_table, guard_lane, slot_load(key),
+    // guard_float, int_of_float, aref, guard_bounds, guard_fits, astore.
+    var saw_iof: ?Ref = null;
+    var aref_key: ?Ref = null;
+    var saw_astore = false;
+    for (ops, 0..) |ins, idx| {
+        if (ins.op == .int_of_float) saw_iof = @intCast(idx);
+        if (ins.op == .aref) aref_key = ins.b;
+        if (ins.op == .astore) saw_astore = true;
+    }
+    try testing.expect(saw_iof != null);
+    try testing.expectEqual(saw_iof.?, aref_key.?); // store keys on the narrowed ref
+    try testing.expect(saw_astore);
+}
+
 test "guardSourcePc: source-opcode PC is exit PC − 1 (H-1b), pinned independently" {
     const gpa = testing.allocator;
 
@@ -13281,6 +13384,7 @@ test "recArrayGet aborts: non-table container, non-int key, hole, and out-of-bou
     const cases = [_]Case{
         .{ .tab = Value.int(7), .key = Value.int(3), .why = .bad_type }, // not a table
         .{ .tab = Value.heap(&t.header), .key = Value.boolean(true), .why = .bad_type }, // non-int key
+        .{ .tab = Value.heap(&t.header), .key = Value.float(1.5), .why = .bad_type }, // FRACTIONAL float — hash territory, no narrow
         .{ .tab = Value.heap(&t.header), .key = Value.int(1), .why = .bad_type }, // hole at 1
         .{ .tab = Value.heap(&t.header), .key = Value.int(9999), .why = .bad_type }, // out of bounds
     };
