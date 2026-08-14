@@ -10394,9 +10394,9 @@ pub const TraceState = struct {
                 if (!self.isGated(key)) {
                     self.arm(proto, target_pc);
                     // Hotexit provenance rides into the recording so the commit
-                    // can DONE-latch the parent exit (`arm` may decline —
-                    // dynamic proto / OOM — in which case `rec.active` is false
-                    // and there is nothing to carry).
+                    // can DONE-latch the parent exit (`arm` may decline — OOM —
+                    // in which case `rec.active` is false and there is nothing
+                    // to carry).
                     if (self.rec.active) self.rec.side_src = self.side_want_src;
                     // Clear guard-failure counters for this anchor so we don't
                     // immediately re-trigger on the next outer-loop iteration.

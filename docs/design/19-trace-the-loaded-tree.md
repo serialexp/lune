@@ -1,6 +1,6 @@
 # Trace the loaded tree — root `loaded_chunks`, lift the H-2 dynamic-proto gate
 
-Status: complete — Phases 0–3 landed 2026-08-14 (design APPROVED codex gpt-5.6-sol round 2; post-landing review pending §R3)
+Status: complete — Phases 0–3 landed 2026-08-14 as `6516ea2` (design APPROVED codex gpt-5.6-sol §R2; post-landing implementation review APPROVED §R3)
 Owner: Bart + Claude
 Last updated: 2026-08-14
 
@@ -26,10 +26,20 @@ land; move to Done once everything inside them is checked.
       anchored in a LOADED proto post-restore). Docs 03/04/17 + code comments
       swept.
 - [x] **Phase 3 — measurement.** See "Measured results" below.
+- [x] **Post-landing codex review (§R3).** APPROVE, no blockers — see §R3.
+      NIT (stale `arm` comment) fixed in the follow-up commit.
 
 ### Outstanding
 
-- [ ] **Post-landing codex review (§R3).** House pattern.
+- [ ] **§R3 MINOR coverage hardening.** Two non-blocking test gaps the
+      post-landing review named: (a) a direct snapshot-*byte* comparison
+      across modes in the July sole-root scenario (it currently pins output +
+      observable string-id order, and the §R2 boundary test proves the
+      literal serializes, but no test diffs `.off` vs record/native snapshot
+      bytes directly); (b) loaded-proto-specific exercises of the two
+      formerly gated continuation/replay-side entry paths (predicates
+      removed, same rooted tree, no distinct hazard found — but a test would
+      prevent partial gate resurrection).
 - [ ] **scimark-sparse/fft follow-up frontier.** The unlock exposed the
       recorder's next abort reasons on these two (sparse ~flat at 22.9×, fft
       32.4×) — name them via `--dump-aborts` and lever them individually.
@@ -265,6 +275,29 @@ removal is behaviourally inert (stamping only fed the lifted predicate).
 version ≠ `snapshot_format_version` (keyframeser.zig:529). Four non-blocking
 cleanups (doc wording, doc 04 + version-comment sweep, §R2 boundary tests)
 folded into this doc.
+
+## §R3 — Post-landing implementation review (codex gpt-5.6-sol, 2026-08-14): APPROVE
+
+Fresh read-only thread over landed commit `6516ea2`, adversarial brief
+(root-walk placement/completeness, load-registration ordering windows, v8
+check soundness, version boundary, residue grep, test coverage, root-order
+determinism). "No correctness blocker found. The implementation faithfully
+realizes the approved design." Key verifications: the loaded-chunk loop sits
+after `retained_chunks` in the common walker so both `.gc` and `.snapshot`
+invocations get it, and `rootProtoConsts` recurses the full nested tree;
+`loaded_chunks` never removes entries, so no loaded proto can survive only
+via a closure or trace const; load.zig appends the chunk *before* creating or
+exposing its closure and no GC safepoint can run in between, so there is no
+unrooted window; `next_obj_id` is monotonic through recompile (every interned
+string passes the single `Heap.link` increment; arena/GPA scratch never
+touches it), so restore-counter-then-check detects every new heap object;
+traversal is append/load order + compiler preorder, both mode-independent —
+membership changes uniformly, order does not fork.
+
+Findings: 2 MINOR (test-coverage hardening, recorded in Outstanding above —
+snapshot-byte cross-mode diff; loaded-proto continuation/replay-side
+exercises) + 1 NIT (stale "`arm` may decline — dynamic proto / OOM" comment
+in trace.zig, fixed in the follow-up commit). VERDICT: APPROVE.
 
 ## References
 

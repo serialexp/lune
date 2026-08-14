@@ -22,7 +22,12 @@ Outstanding). 28/28 cross+luajit ok, hashgate PASS, both test builds green.
 Also this session: bench harness peak-RSS columns (ca99421, GNU-time
 trampoline — fork/posix_spawn floors ru_maxrss at the Python runner's RSS),
 str_manip LuaJIT fix (5de9c0a), history strip (00889ad). Post-landing codex
-review of the doc-19 implementation is the open item.
+review of the doc-19 implementation (commit 6516ea2): **APPROVE**, no
+blockers — 2 MINOR test-coverage hardenings recorded in doc 19 Outstanding
+(cross-mode snapshot-byte diff; loaded-proto continuation/replay-side
+exercises) + 1 NIT stale `arm` comment, fixed in the follow-up commit. Doc
+19 seam closed; named follow-ups: §R3 MINOR hardening, scimark-sparse/fft
+abort frontier, the 43%-overhead-with-zero-traces observation.
 
 ## Status 2026-08-14 (LATEST-60) — **B-5 post-landing codex review (REVISE) folded: two blockers fixed + two missing §R3 tests landed. Doc 18 fully closed.**
 
