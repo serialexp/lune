@@ -3204,6 +3204,74 @@ pub const TraceState = struct {
         return best;
     }
 
+    /// B-4 (doc 17 §B4.3 D1'–D4'): the ONE canonical loop-done continuation
+    /// selector every loop-done funnel shares — the drain's terminal directive
+    /// and the arm sites resolve through this, never through the replay
+    /// cursor's path history, so the armed relation per `(inner, exit)` is a
+    /// stable pure function of the cache and cannot alternate (§B4.7 MAJOR-2).
+    pub const LoopDoneCont = struct { arm: ?*Trace, run: ?*Trace };
+
+    pub fn resolveLoopDoneCont(self: *TraceState, proto: *const Proto, post_pc: u32, regs: ?RegWindow) LoopDoneCont {
+        // (1) Build the pure, canonically ordered candidate list FIRST — the
+        // `findLinkTrace` structural P-G predicate only (zero-input,
+        // `.link`-tailed, anchored at `(proto, post_pc)`); nothing in this pass
+        // triggers compilation. Ranking: `hit_count` desc, then LOWEST trace id
+        // (deterministic and stable across `cache.swapRemove` reshuffles —
+        // §B4.7 tie-break correction). Fixed buffer, allocation-free: this runs
+        // per terminal loop-done event. Overflow drops the lowest-ranked tail
+        // (a pc with more than 8 eligible continuations exceeds
+        // `max_traces_per_anchor` by 2× — unreachable today, bounded anyway).
+        var buf: [8]*Trace = undefined;
+        var n: usize = 0;
+        for (self.cache.items) |t| {
+            if (t.anchor.proto != proto or t.anchor.pc != post_pc) continue;
+            if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .link) continue;
+            if (t.inputs.len != 0) continue;
+            var pos: usize = n;
+            for (buf[0..n], 0..) |p, idx| {
+                if (t.hit_count > p.hit_count or (t.hit_count == p.hit_count and t.id < p.id)) {
+                    pos = idx;
+                    break;
+                }
+            }
+            if (pos >= buf.len) continue;
+            const limit = @min(n + 1, buf.len);
+            var j: usize = limit - 1;
+            while (j > pos) : (j -= 1) buf[j] = buf[j - 1];
+            buf[pos] = t;
+            n = limit;
+        }
+        // (2) ARM target: probe `nativeFor` strictly in ranking order and stop
+        // at the FIRST runnable candidate — an `.unsupported` (or
+        // compile-failing, memoized) high-hit candidate must skip, not shadow,
+        // a runnable sibling (§B4.7 BLOCKER). Probing here, before the run
+        // resolution, pins the canonical lazy-compile order (D4').
+        var arm_target: ?*Trace = null;
+        for (buf[0..n]) |t| {
+            if (self.nativeFor(t) != null) {
+                arm_target = t;
+                break;
+            }
+        }
+        // (3) RUN target, resolved AFTER the arm probe over the same list:
+        // when `regs` are provided, fingerprint-matching runnable candidates
+        // rank strictly above non-matching ones; otherwise (and when nothing
+        // matches) it falls back to the arm target — a mismatching candidate is
+        // safe to ATTEMPT (the native prologue fails closed pre-commit), just
+        // never preferred. The run choice never touches the armed slot.
+        var run: ?*Trace = arm_target;
+        if (regs) |r| {
+            for (buf[0..n]) |t| {
+                if (self.nativeFor(t) == null) continue;
+                if (t.matchesFingerprint(r)) {
+                    run = t;
+                    break;
+                }
+            }
+        }
+        return .{ .arm = arm_target, .run = run };
+    }
+
     /// Highest-`hit_count` trace at `(proto, pc)` that is not in `visited`, or
     /// null. Same-anchor walks (the dispatch trial loop and exit-PC chaining)
     /// use this with a growing `visited` set so they visit each candidate
@@ -4978,7 +5046,7 @@ pub const TraceState = struct {
                     // committed and `sct` the continuation at its post-loop PC — arm
                     // the reverse `I→C` edge before draining `sct`'s own fused span.
                     if (materialization == .native_numeric_for_done) {
-                        self.armLoopDoneLink(failed, exit_instr, sct, safe_to_arm);
+                        self.armLoopDoneLink(failed, exit_instr, safe_to_arm);
                     }
                     return self.driveSeedLedger(
                         sct,
@@ -5056,7 +5124,7 @@ pub const TraceState = struct {
                 // `sct`'s `ordinary_entry`; every shape gate lives in the fail-closed
                 // helper (`.native_numeric_for_done` only arises on the native tier).
                 if (tier == .native_only and materialization == .native_numeric_for_done) {
-                    self.armLoopDoneLink(failed, exit_instr, sct, safe_to_arm);
+                    self.armLoopDoneLink(failed, exit_instr, safe_to_arm);
                 }
                 return self.runLinkedBurst(sct, sresult, sresult_fused, snt, tier, materialization, proto, regs, safe_to_arm);
             }
@@ -5106,6 +5174,7 @@ pub const TraceState = struct {
             &hops,
             8,
             safe_to_arm,
+            regs,
         ) orelse return null;
         const provenance = self.captureNativeCallProvenance(
             .drive_chain_seed,
@@ -5408,6 +5477,7 @@ pub const TraceState = struct {
         max_hops: usize,
         origin: ReplayOrigin,
         safe_to_arm: bool,
+        regs: ?RegWindow,
     ) LedgerReplay {
         if (!self.config.silent_promotion_enabled)
             @panic("driveSilentBurst: silent result while promotion is disabled");
@@ -5659,6 +5729,7 @@ pub const TraceState = struct {
                 max_hops,
                 origin,
                 safe_to_arm,
+                regs,
             );
         }
         if (!budget_exhausted and !barren_exhausted)
@@ -5682,6 +5753,7 @@ pub const TraceState = struct {
         hops: *usize,
         max_hops: usize,
         safe_to_arm: bool,
+        regs: ?RegWindow,
     ) ?LedgerReplay {
         if (result.silent_active == 0) return null;
         return self.driveSilentBurst(
@@ -5693,6 +5765,7 @@ pub const TraceState = struct {
             max_hops,
             origin,
             safe_to_arm,
+            regs,
         );
     }
 
@@ -5816,6 +5889,7 @@ pub const TraceState = struct {
         max_hops: usize,
         origin: ReplayOrigin,
         safe_to_arm: bool,
+        regs: ?RegWindow,
     ) LedgerReplay {
         var frozen_fast: ?FrozenFast = null;
         if (self.region_context) |rctx| {
@@ -5833,7 +5907,7 @@ pub const TraceState = struct {
             .frozen_fast = frozen_fast,
             .check_seed = true,
         };
-        return self.replayLedgerFrom(entries, &cursor, seed_owner, proto, linked_completed, resume_pc, hops, max_hops, origin, safe_to_arm);
+        return self.replayLedgerFrom(entries, &cursor, seed_owner, proto, linked_completed, resume_pc, hops, max_hops, origin, safe_to_arm, regs);
     }
 
     fn replayLedgerSuffix(
@@ -5847,6 +5921,7 @@ pub const TraceState = struct {
         max_hops: usize,
         origin: ReplayOrigin,
         safe_to_arm: bool,
+        regs: ?RegWindow,
     ) LedgerReplay {
         const seed_owner = self.traceById(entries[0].id) orelse
             @panic("replayLedgerSuffix: first entry owner id did not resolve");
@@ -5866,7 +5941,7 @@ pub const TraceState = struct {
             .frozen_fast = frozen_fast,
             .check_seed = false,
         };
-        return self.replayLedgerFrom(entries, &cursor, seed_owner, proto, linked_completed, resume_pc, hops, max_hops, origin, safe_to_arm);
+        return self.replayLedgerFrom(entries, &cursor, seed_owner, proto, linked_completed, resume_pc, hops, max_hops, origin, safe_to_arm, regs);
     }
 
     fn replayLedgerFrom(
@@ -5881,6 +5956,7 @@ pub const TraceState = struct {
         max_hops: usize,
         origin: ReplayOrigin,
         safe_to_arm: bool,
+        regs: ?RegWindow,
     ) LedgerReplay {
         // `ledger_len` is always ≥1 (every native exit appends exactly once) and ≤CAP
         // (the append is bounds-guarded; the forced-yield cap keeps a closed cycle
@@ -6262,44 +6338,61 @@ pub const TraceState = struct {
                     const first_inner = (origin == .inner_call and k == 0);
                     if (!first_inner) hops.* += 1;
                     if (is_last) {
+                        // B-4 (§B4.3 D2'/D4'): ONE canonical positional selection
+                        // per terminal event. The burst's entry path (`cursor.cont`)
+                        // is irrelevant to coherence — regs are coherent at
+                        // `post_pc` because the final iteration's stores + phi
+                        // snapshot committed LINKED, so the ONLY sound question is
+                        // "which P-G-eligible, native-runnable continuation is
+                        // anchored there". Before B-4 this site (and the arm below)
+                        // considered only `cursor.cont`; a burst entering through a
+                        // guard-chained composite therefore break_burst'ed on EVERY
+                        // inner-loop completion (27,554/run on nsieve-bit 6) even
+                        // though an eligible continuation sat in the cache at
+                        // `post_pc`. The selector probes the arm-ranked candidate
+                        // first (canonical lazy-compile order, D4'), then the
+                        // regs-ranked run target over the same list.
+                        const sel = self.resolveLoopDoneCont(proto, post_pc, regs);
                         // 2c-E site 3 (arming CONVERGENCE): a TERMINAL loop-done means
                         // this `I→C` edge was NOT fused — the slot is unarmed (or a
                         // forced yield steered around it, in which case the identical
                         // re-arm SHORT-CIRCUITS at the `armNativeLink` funnel — B-3d.1
                         // R6, doc 17 §B3.18: no slot mutation, no demotion of a
-                        // promoted set that owns this exit). Arm it now so the NEXT
-                        // occurrence of this exit fuses; sibling inners reached only
-                        // through replay thereby converge to armed without ever
-                        // passing through a scalar arm site. Runs BEFORE the hop
-                        // budget check — the scalar site (call A) also arms on the
-                        // burst's last hop.
-                        self.armLoopDoneLink(owner, e.exit, cursor.cont, safe_to_arm);
+                        // promoted set that owns this exit). Arm the CANONICAL target
+                        // now so the NEXT occurrence of this exit fuses. Runs BEFORE
+                        // the hop budget check — the scalar site (call A) also arms
+                        // on the burst's last hop.
+                        if (safe_to_arm) if (sel.arm) |arm_target|
+                            self.armLoopDoneLinkTo(owner, e.exit, post_pc, arm_target);
                         // The burst may re-run the still-armed continuation. The hop
                         // budget only declines THIS next re-run.
                         if (hops.* >= max_hops) return .break_burst;
-                        // 2c-E: the directive EXECUTES `cont`, so the full
-                        // continuation contract (zero-input `.link` trace anchored at
-                        // `post_pc` in this proto — the same P-G eligibility
-                        // `armLoopDoneLink` enforces) must hold before handing it up;
-                        // regs are coherent at `post_pc`, so running a continuation
-                        // anchored elsewhere would misresume. When the contract does
-                        // NOT hold this is a legitimately reachable shape, not a
-                        // wiring bug: since hotexit-armed prime sides, a burst can
-                        // enter the linked grammar through a guard-chained composite
-                        // (`.deopt → C'.link_terminal → I.loop_done_linked` where
-                        // `C'` is anchored at the guard PC, not the post-loop PC), so
-                        // the `cont` cursor is not a valid resume candidate and there
-                        // may be no continuation at `post_pc` at all. Fall back to
-                        // tier-0 at `post_pc` (`resume_pc` is already set) — the same
-                        // safe directive the hop-budget bound above takes; the site-3
-                        // arm above stays fail-closed via P-G.
-                        if (cursor.cont.inputs.len == 0 and cursor.cont.instrs.len != 0 and
-                            cursor.cont.instrs[cursor.cont.instrs.len - 1].op == .link and
-                            cursor.cont.anchor.proto == proto and cursor.cont.anchor.pc == post_pc)
-                            return .{ .run_continuation = cursor.cont };
-                        self.dbg("terminal loop-done: cont id={d} anchor_pc={d} fails contract at post_pc={d} -> break_burst", .{
-                            cursor.cont.id, cursor.cont.anchor.pc, post_pc,
+                        // The directive EXECUTES the run target. Selection already
+                        // proved P-G eligibility AND native runnability (§B4.7
+                        // BLOCKER: an `.unsupported` candidate never reaches here),
+                        // and a fingerprint-mismatching target is safe to attempt —
+                        // the native prologue fails closed pre-commit with regs
+                        // still coherent at `post_pc`. No eligible runnable
+                        // continuation at all → fall back to tier-0 at `post_pc`
+                        // (`resume_pc` is already set) — the same safe directive
+                        // the hop-budget bound above takes.
+                        if (sel.run) |run_target|
+                            return .{ .run_continuation = run_target };
+                        self.dbg("terminal loop-done: no eligible continuation at post_pc={d} -> break_burst", .{
+                            post_pc,
                         });
+                        if (comptime jitdbg.enabled) {
+                            // Diagnostic sub-report: WHY each same-pc candidate was
+                            // rejected (anchored-here traces that failed the P-G
+                            // predicate or the runnability probe).
+                            for (self.cache.items) |t| {
+                                if (t.anchor.proto != proto or t.anchor.pc != post_pc) continue;
+                                const tail_link = t.instrs.len != 0 and t.instrs[t.instrs.len - 1].op == .link;
+                                self.dbg("  candidate id={d}: inputs={d} tail_link={} native={s}", .{
+                                    t.id, t.inputs.len, tail_link, @tagName(t.native),
+                                });
+                            }
+                        }
                         return .break_burst;
                     }
                     // `I→C` fused (2.3c-2e): the next entry is the continuation reached
@@ -6775,6 +6868,7 @@ pub const TraceState = struct {
                         &hops,
                         max_hops,
                         safe_to_arm,
+                        regs,
                     );
                     const call_a_entries = self.ledger_scratch[0..iresult.ledger_len];
                     const provenance = self.captureNativeCallProvenance(.inner_call, iresult, call_a_entries);
@@ -6823,6 +6917,7 @@ pub const TraceState = struct {
                             max_hops,
                             .inner_call,
                             safe_to_arm,
+                            regs,
                         );
                         // A-vii-d.1: drain the pending bridge-arm request AFTER the
                         // walk, BEFORE acting on the directive (review blocker 5).
@@ -6960,7 +7055,7 @@ pub const TraceState = struct {
                 // scalar path just classified. All shape/eligibility gates live in
                 // the fail-closed helper.
                 if (tier == .native_only) {
-                    self.armLoopDoneLink(inner, iresult.exit_instr, current_link, safe_to_arm);
+                    self.armLoopDoneLink(inner, iresult.exit_instr, safe_to_arm);
                 }
             }
 
@@ -6987,6 +7082,7 @@ pub const TraceState = struct {
                         &hops,
                         max_hops,
                         safe_to_arm,
+                        regs,
                     );
                     const entries = self.ledger_scratch[0..cresult.ledger_len];
                     // Ordinary capture happens before replay; silent capture happens
@@ -7003,6 +7099,7 @@ pub const TraceState = struct {
                         max_hops,
                         .continuation_call,
                         safe_to_arm,
+                        regs,
                     );
                     // A-vii-d.1: drain the pending bridge-arm request AFTER the
                     // walk, BEFORE acting on the directive (review blocker 5).
@@ -7164,7 +7261,7 @@ pub const TraceState = struct {
             .exit_instr = entries[entries.len - 1].exit,
             .ledger_len = entries.len,
         }, entries);
-        const dispatcher_directive = self.replayLedger(entries, seed, inner_pc, proto, &linked_completed, &resume_pc, &hops, max_hops, .dispatcher_root, safe_to_arm);
+        const dispatcher_directive = self.replayLedger(entries, seed, inner_pc, proto, &linked_completed, &resume_pc, &hops, max_hops, .dispatcher_root, safe_to_arm, regs);
         // A-vii-d.1: drain the pending bridge-arm request AFTER the walk,
         // BEFORE acting on the directive (review blocker 5).
         self.settleNativeCallProvenance(&provenance, safe_to_arm);
@@ -7284,6 +7381,7 @@ pub const TraceState = struct {
             &hops,
             max_hops,
             safe_to_arm,
+            regs,
         ) orelse {
             // Multi-row ordinary calls are captured by `driveDispatcherLedger`
             // immediately below the dispatcher. The scalar/short return never
@@ -7399,7 +7497,7 @@ pub const TraceState = struct {
             .exit_instr = entries[entries.len - 1].exit,
             .ledger_len = entries.len,
         }, entries);
-        const seed_directive = self.replayLedger(entries, seed, seed_inner_pc, proto, &linked_completed, &resume_pc, &hops, max_hops, .continuation_call, safe_to_arm);
+        const seed_directive = self.replayLedger(entries, seed, seed_inner_pc, proto, &linked_completed, &resume_pc, &hops, max_hops, .continuation_call, safe_to_arm, regs);
         // A-vii-d.1: drain the pending bridge-arm request AFTER the walk,
         // BEFORE acting on the directive (review blocker 5).
         self.settleNativeCallProvenance(&provenance, safe_to_arm);
@@ -9750,7 +9848,7 @@ pub const TraceState = struct {
         if (armed) self.native_link_arms +|= 1;
     }
 
-    fn armLoopDoneLink(self: *TraceState, inner: *Trace, guard_idx: u32, cont: *Trace, safe_to_arm: bool) void {
+    fn armLoopDoneLink(self: *TraceState, inner: *Trace, guard_idx: u32, safe_to_arm: bool) void {
         // Observation blackout (2.3c-0e): never widen an armed cycle while suspend /
         // replay-line recording is active.
         if (!safe_to_arm) return;
@@ -9762,6 +9860,23 @@ pub const TraceState = struct {
         if (guard_idx == std.math.maxInt(u32) or guard_idx >= inner.instrs.len) return;
         if (!isLoopDoneGuardIndex(inner, guard_idx)) return;
         const post_pc = guardExitPc(inner.instrs[guard_idx]) orelse return;
+        // B-4 (§B4.3 D3'): the arm target is CANONICAL — resolved positionally
+        // at `post_pc` through the shared selector, never taken from whatever
+        // continuation the caller happened to be holding. A caller-supplied
+        // candidate could alternate between eligible siblings across paths,
+        // and every changed relation is a slot mutation that resets promotion
+        // candidacy (§B4.7 MAJOR-2); the selector is a pure function of the
+        // cache, so the relation is stable and identical re-arms short-circuit
+        // at the `armNativeLink` funnel (B-3d.1 R6).
+        const target = self.resolveLoopDoneCont(inner.anchor.proto, post_pc, null).arm orelse return;
+        self.armLoopDoneLinkTo(inner, guard_idx, post_pc, target);
+    }
+
+    /// The targeted arm worker: `cont` is the canonical selector's choice (or
+    /// the terminal drain's already-resolved `sel.arm` — one selection per
+    /// event, D4'). P-G eligibility is re-validated fail-closed — cheap, and it
+    /// keeps the invariant local rather than trusting the caller.
+    fn armLoopDoneLinkTo(self: *TraceState, inner: *Trace, guard_idx: u32, post_pc: u32, cont: *Trace) void {
         // Continuation eligibility (P-G): a zero-input `.link` trace anchored exactly
         // at the guard's post-loop PC in the same proto — the shape `replayLedger`'s
         // `.loop_done_linked` successor validation release-panics on, so anything
@@ -15536,7 +15651,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
     var reporting_completed: usize = 0;
     var reporting_resume: u32 = bridge.anchor.pc;
     var reporting_hops: usize = 0;
-    _ = state.replayLedger(&reporting, bridge, succ.anchor.pc, &proto, &reporting_completed, &reporting_resume, &reporting_hops, 8, .continuation_call, true);
+    _ = state.replayLedger(&reporting, bridge, succ.anchor.pc, &proto, &reporting_completed, &reporting_resume, &reporting_hops, 8, .continuation_call, true, null);
     const oracle_accum = state.region_profit.get(key).?;
     const oracle_bridge_hits = bridge.hit_count;
     const oracle_bridge_fused = state.native_region_bridge_fused;
@@ -15592,7 +15707,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
         .cur_zero_run = oracle_accum.barren_run,
         .silent_cum = 3,
         .silent_last_cell = @intFromPtr(&set.metadata[link_phase]),
-    }, &proto, &silent_completed, &silent_resume, &silent_hops, 8, .continuation_call, true);
+    }, &proto, &silent_completed, &silent_resume, &silent_hops, 8, .continuation_call, true, null);
     const silent_accum = state.region_profit.get(key).?;
     try testing.expectEqual(oracle_bridge_hits, bridge.hit_count);
     try testing.expectEqual(oracle_bridge_fused, state.native_region_bridge_fused);
@@ -15689,7 +15804,7 @@ test "B-3b suffix preserves bridge materialization for child deopt and prologue 
     var completed: usize = 0;
     var resume_pc_value: u32 = 0;
     var hops: usize = 0;
-    const deopt_dir = state.drainSilentResult(deopt, .continuation_call, &proto, &completed, &resume_pc_value, &hops, 8, true) orelse
+    const deopt_dir = state.drainSilentResult(deopt, .continuation_call, &proto, &completed, &resume_pc_value, &hops, 8, true, null) orelse
         return error.TestUnexpectedResult;
     const deopt_result = switch (deopt_dir) {
         .return_result => |r| r,
@@ -15718,7 +15833,7 @@ test "B-3b suffix preserves bridge materialization for child deopt and prologue 
     completed = 0;
     resume_pc_value = 0;
     hops = 0;
-    const prologue_dir = state.drainSilentResult(prologue, .continuation_call, &proto, &completed, &resume_pc_value, &hops, 8, true) orelse
+    const prologue_dir = state.drainSilentResult(prologue, .continuation_call, &proto, &completed, &resume_pc_value, &hops, 8, true, null) orelse
         return error.TestUnexpectedResult;
     const prologue_result = switch (prologue_dir) {
         .return_result => |r| r,
@@ -15787,6 +15902,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         8,
         .dispatcher_root,
         true,
+        null,
     );
     const oracle_deopt_result = switch (oracle_deopt) {
         .return_result => |r| r,
@@ -15817,6 +15933,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         &hops,
         8,
         true,
+        null,
     ) orelse return error.TestUnexpectedResult;
     const silent_deopt_result = switch (silent_deopt_dir) {
         .return_result => |r| r,
@@ -15853,6 +15970,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         8,
         .dispatcher_root,
         true,
+        null,
     );
     const oracle_prologue_result = switch (oracle_prologue) {
         .return_result => |r| r,
@@ -15883,6 +16001,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         &hops,
         8,
         true,
+        null,
     ) orelse return error.TestUnexpectedResult;
     const silent_prologue_result = switch (silent_prologue_dir) {
         .return_result => |r| r,
@@ -15968,6 +16087,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         &hops,
         8,
         true,
+        null,
     ) orelse return error.TestUnexpectedResult;
     const handoff_driver = switch (handoff_dir) {
         .run_inner_from => |t| t,
@@ -16022,6 +16142,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         &hops,
         8,
         true,
+        null,
     ) orelse return error.TestUnexpectedResult;
     const link_driver = switch (link_dir) {
         .run_inner_from => |t| t,
@@ -16330,6 +16451,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
         8,
         .continuation_call,
         true,
+        null,
     );
     state.applyPendingDisarms();
     state.drainPendingBridgeArm(true);
@@ -16395,6 +16517,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
         &silent_hops,
         8,
         true,
+        null,
     ) orelse return error.TestUnexpectedResult;
     try testing.expect(silent_dir == .return_result);
 
@@ -16467,6 +16590,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
         &suffix_hops,
         8,
         true,
+        null,
     ) orelse return error.TestUnexpectedResult;
     const suffix_chain = switch (suffix_dir) {
         .return_result => |r| r,
@@ -16517,6 +16641,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
         &suffix_hops,
         8,
         true,
+        null,
     ) orelse return error.TestUnexpectedResult;
     const loop_done_cont = switch (loop_done_dir) {
         .run_continuation => |t| t,
@@ -16611,7 +16736,7 @@ test "B-3d.2 repeated-parent set promotes, zero-evidence edges included, and an 
         .cur_zero_run = 3,
         .silent_cum = 6,
         .silent_last_cell = @intFromPtr(&set.metadata[p5_phase]),
-    }, .continuation_call, &proto, &completed, &resume_pc_value, &hops, 8, true) orelse
+    }, .continuation_call, &proto, &completed, &resume_pc_value, &hops, 8, true, null) orelse
         return error.TestUnexpectedResult;
     const result = switch (dir) {
         .return_result => |r| r,
@@ -17261,6 +17386,7 @@ test "replayLedger A-vii-a: region_bridge validates registered cross-anchor edge
         8,
         .dispatcher_root,
         false,
+        null,
     );
 
     const result = switch (dir) {
@@ -17487,7 +17613,7 @@ test "A-vii-d.1 bridged successor terminal: a loop-body successor deopt resumes 
     var linked_completed: usize = 0;
     var resume_pc: u32 = 999;
     var hops: usize = 0;
-    const dir = state.replayLedger(&entries, &cont, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false);
+    const dir = state.replayLedger(&entries, &cont, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false, null);
     const result = switch (dir) {
         .return_result => |r| r,
         else => return error.TestUnexpectedResult,
@@ -17562,7 +17688,7 @@ test "A-vii-d.1 bridged .link successor (codex blocker): zero-progress deopt and
         var linked_completed: usize = 0;
         var resume_pc: u32 = 999;
         var hops: usize = 0;
-        const dir = state.replayLedger(&entries, &cont, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false);
+        const dir = state.replayLedger(&entries, &cont, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false, null);
         const result = switch (dir) {
             .return_result => |r| r,
             else => return error.TestUnexpectedResult, // break_burst = the bug
@@ -17579,7 +17705,7 @@ test "A-vii-d.1 bridged .link successor (codex blocker): zero-progress deopt and
         var linked_completed: usize = 0;
         var resume_pc: u32 = 999;
         var hops: usize = 0;
-        const dir = state.replayLedger(&entries, &cont, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false);
+        const dir = state.replayLedger(&entries, &cont, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false, null);
         const result = switch (dir) {
             .return_result => |r| r,
             else => return error.TestUnexpectedResult, // break_burst = the bug
@@ -17693,7 +17819,7 @@ test "A-vii-d.1 two-phase arming: a terminal composite deopt records ONE pending
     var linked_completed: usize = 0;
     var resume_pc: u32 = 999;
     var hops: usize = 0;
-    _ = state.replayLedger(&entries, &cont, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false);
+    _ = state.replayLedger(&entries, &cont, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false, null);
     const pending = state.pending_bridge_arm orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(u32, 821), pending.trace_id);
     try testing.expectEqual(@as(u32, 3), pending.exit_instr);
@@ -17708,7 +17834,7 @@ test "A-vii-d.1 two-phase arming: a terminal composite deopt records ONE pending
     const entries2 = [_]irinterp.LedgerEntry{
         .{ .cum = 1, .id = plain.id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
     };
-    _ = state.replayLedger(&entries2, &plain, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false);
+    _ = state.replayLedger(&entries2, &plain, 7, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false, null);
     try testing.expectEqual(@as(?ExitKey, null), state.pending_bridge_arm);
 }
 
@@ -17760,7 +17886,7 @@ test "replayLedgerSuffix honors the silent cumulative baseline and off-cycle fir
     var fresh_hops: usize = 0;
     const fresh_hits = inner.hit_count;
     const fresh_links = state.native_link_exits;
-    const fresh_dir = state.replayLedger(&fresh_entries, &inner, 5, &proto, &fresh_completed, &fresh_resume_pc, &fresh_hops, 8, .dispatcher_root, false);
+    const fresh_dir = state.replayLedger(&fresh_entries, &inner, 5, &proto, &fresh_completed, &fresh_resume_pc, &fresh_hops, 8, .dispatcher_root, false, null);
     const fresh_hit_delta = inner.hit_count - fresh_hits;
     const fresh_link_delta = state.native_link_exits - fresh_links;
 
@@ -17789,6 +17915,7 @@ test "replayLedgerSuffix honors the silent cumulative baseline and off-cycle fir
         8,
         .dispatcher_root,
         false,
+        null,
     );
 
     try testing.expectEqual(fresh_completed, suffix_completed);
@@ -17881,7 +18008,7 @@ test "replayLedger forced yield (2c-B/2c-E): a CAP-length ledger ending .yielded
     var hops: usize = 0;
     // safe_to_arm = false: the terminal is a `.link` (never arms), and this test
     // isolates the forced-yield ACCEPTANCE, not arming.
-    const dir = state.replayLedger(&entries, &inner, 5, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false);
+    const dir = state.replayLedger(&entries, &inner, 5, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, false, null);
 
     // Every one of the 16 loop-dones committed an enclosing iteration.
     try testing.expectEqual(@as(usize, 16), linked_completed);
@@ -17972,7 +18099,7 @@ test "replayLedger convergence (2c-E site 3): a TERMINAL loop_done_linked arms t
     var linked_completed: usize = 0;
     var resume_pc: u32 = 0;
     var hops: usize = 0;
-    const dir = state.replayLedger(&entries, &inner, 5, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, true);
+    const dir = state.replayLedger(&entries, &inner, 5, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, true, null);
 
     // The terminal loop-done armed the convergence edge EXACTLY once, writing the
     // continuation's `ordinary_entry` into the inner's loop-done slot (instr 0).
@@ -17999,6 +18126,153 @@ test "replayLedger convergence (2c-E site 3): a TERMINAL loop_done_linked arms t
     // record references the stack traces after the test frame unwinds. (Both slots
     // are freed by the earlier `defer gpa.free`; the stubs are never `destroy`d.)
     state.armed_links.clearRetainingCapacity();
+}
+
+test "B-4: terminal loop-done resolves positionally — unsupported never shadows, arm is canonical, run prefers fingerprint" {
+    // §B4.3 D1'–D4' + §B4.7 pins, in one automaton image. The burst's entry
+    // path seeds `cursor.cont = inner` (anchored pc 5 — NOT a valid resume
+    // candidate at the post-loop pc 2), which before B-4 meant break_burst on
+    // every terminal loop-done (27,554/run on nsieve-bit 6). The canonical
+    // selector must instead resolve the continuation POSITIONALLY at pc 2:
+    //   - cont_unsup: highest hit_count but native `.unsupported` — must be
+    //     SKIPPED, not shadow the runnable siblings (§B4.7 BLOCKER pin);
+    //   - cont_a / cont_b: equal hit_count → LOWEST id (cont_a) is the ARM
+    //     target (stable tie-break pin);
+    //   - regs carry a float in slot 0; cont_a's fingerprint demands int,
+    //     cont_b has no guards → the RUN target is cont_b (fingerprint
+    //     ranking), and the run choice does NOT touch the armed slot.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    // code[1] is a for_loop, so the inner's guard_true (exit_pc 2) is a loop-done.
+    const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
+
+    const inner_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .a = 0, .aux = 2 }, // loop-done guard, post-loop pc 2
+        .{ .op = .loop },
+    };
+    const inner_slots = try gpa.alloc(usize, inner_instrs.len);
+    defer gpa.free(inner_slots);
+    @memset(inner_slots, 0);
+    var inner: Trace = .{
+        .id = 401,
+        .anchor = .{ .proto = &proto, .pc = 5 },
+        .instrs = @constCast(&inner_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = inner_slots, .gpa = gpa } },
+    };
+    const link_instrs = [_]IrInstr{
+        .{ .op = .link, .aux = 5 },
+    };
+    // Highest-hit candidate at pc 2, but not native-runnable.
+    var cont_unsup: Trace = .{
+        .id = 399,
+        .anchor = .{ .proto = &proto, .pc = 2 },
+        .instrs = @constCast(&link_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .unsupported,
+        .hit_count = 100,
+    };
+    const A_ENTRY: usize = 0xA11CE_0001;
+    const a_slots = try gpa.alloc(usize, link_instrs.len);
+    defer gpa.free(a_slots);
+    @memset(a_slots, 0);
+    const a_guards = [_]EntryGuard{.{ .slot = 0, .ty = .int }};
+    var cont_a: Trace = .{
+        .id = 402,
+        .anchor = .{ .proto = &proto, .pc = 2 },
+        .instrs = @constCast(&link_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = @constCast(&a_guards),
+        .native = .{ .compiled = .{ .page = undefined, .slots = a_slots, .gpa = gpa, .ordinary_entry = A_ENTRY } },
+        .hit_count = 5,
+    };
+    const B_ENTRY: usize = 0xB0B_0002;
+    const b_slots = try gpa.alloc(usize, link_instrs.len);
+    defer gpa.free(b_slots);
+    @memset(b_slots, 0);
+    var cont_b: Trace = .{
+        .id = 403,
+        .anchor = .{ .proto = &proto, .pc = 2 },
+        .instrs = @constCast(&link_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = b_slots, .gpa = gpa, .ordinary_entry = B_ENTRY } },
+        .hit_count = 5,
+    };
+    try state.cache.append(gpa, &inner);
+    try state.cache.append(gpa, &cont_unsup);
+    try state.cache.append(gpa, &cont_a);
+    try state.cache.append(gpa, &cont_b);
+
+    var tags: [4]u8 = @splat(0);
+    var pays: [4]u64 = @splat(0);
+    const regs = RegWindow.of(&tags, &pays);
+    regs.setFloat(0, 1.5); // cont_a's int fingerprint MISSES, cont_b matches
+
+    // A single TERMINAL loop-done row: `cursor.cont` is the seed (inner) — the
+    // stale-cursor shape that used to break the burst unconditionally.
+    const entries = [_]irinterp.LedgerEntry{
+        .{ .cum = 1, .id = 401, .exit = 0, .reason = .normal, .kind = .loop_done_linked, .outcome = .normal },
+    };
+    var linked_completed: usize = 0;
+    var resume_pc: u32 = 0;
+    var hops: usize = 0;
+    const dir = state.replayLedger(&entries, &inner, 5, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, true, regs);
+
+    // ARM: canonical target is cont_a (unsup skipped, id tie-break), exactly one
+    // record, `ordinary_entry` written into the inner's loop-done slot.
+    try testing.expectEqual(@as(u64, 1), state.native_loopdone_link_arms);
+    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    try testing.expectEqual(@as(*Trace, &cont_a), state.armed_links.items[0].child);
+    try testing.expectEqual(A_ENTRY, inner_slots[0]);
+    // RUN: fingerprint-ranked target is cont_b; the run choice left the slot alone.
+    switch (dir) {
+        .run_continuation => |c| try testing.expectEqual(@as(*Trace, &cont_b), c),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 1), linked_completed);
+    try testing.expectEqual(@as(u32, 2), resume_pc);
+
+    // A/B no-realarm pin (§B4.7 MAJOR-2): a second burst reaching the same
+    // funnel re-selects the SAME canonical arm target; the identical re-arm
+    // short-circuits (B-3d.1 R6) — no second record, slot value unchanged.
+    linked_completed = 0;
+    resume_pc = 0;
+    hops = 0;
+    const dir2 = state.replayLedger(&entries, &inner, 5, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, true, regs);
+    switch (dir2) {
+        .run_continuation => |c| try testing.expectEqual(@as(*Trace, &cont_b), c),
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    try testing.expectEqual(@as(*Trace, &cont_a), state.armed_links.items[0].child);
+    try testing.expectEqual(A_ENTRY, inner_slots[0]);
+
+    // No eligible continuation at all → break_burst at post_pc (existing safe
+    // directive pinned). Drop every continuation from the cache first; the
+    // armed record must be cleared with them (it references stack stubs).
+    state.armed_links.clearRetainingCapacity();
+    inner_slots[0] = 0;
+    state.cache.clearRetainingCapacity();
+    try state.cache.append(gpa, &inner);
+    linked_completed = 0;
+    resume_pc = 0;
+    hops = 0;
+    const dir3 = state.replayLedger(&entries, &inner, 5, &proto, &linked_completed, &resume_pc, &hops, 8, .dispatcher_root, true, regs);
+    switch (dir3) {
+        .break_burst => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try testing.expectEqual(@as(u32, 2), resume_pc);
 }
 
 test "driveChain ordinary_header: chains at the anchor, not a guard's lane ordinal" {
