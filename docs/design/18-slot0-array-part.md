@@ -637,6 +637,11 @@ values. Pinned by a `checkAllAllocationFailures` test asserting
 value-preservation at every induced failure point. Round-1 repro
 paths re-verified closed; blockers 2/3 confirmed resolved.
 
+**Round 3** (same reviewer): **APPROVE**, no blocker findings. The
+accepted residue — a surviving frozen narrow lane with `asize == 0`
+after an unwound failure — confirmed harmless (no live values, invisible
+to GC/serialization, retryable, monotonic widening preserved).
+
 ## §R1 — Round-1 review record (codex `gpt-5.6-sol` + Antigravity, 2026-08-14): REVISE ×2, convergent
 
 Both reviewers independently confirmed the LuaJIT layout claims
