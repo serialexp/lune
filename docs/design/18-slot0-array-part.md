@@ -625,6 +625,18 @@ bounds, native `aref`, grid conditional `asize`, GC walks, D7 binning,
 length border logic, v7 validation (float-integer folding, −0.0, NaN),
 and the `--mem-stats` tracker lifetime.
 
+**Round 2** (same reviewer): the round-1 fix for the seed absorption
+was itself not OOM-atomic — it removed the hash entries *before* the
+slot-0 write, whose lane-widening (`{[0]=100000}` into a fresh u8
+lane) can allocate and fail, losing key 0. Fixed transactionally:
+PEEK the key-0 value (no removal), seed, do the possibly-widening
+slot-0 write — on failure unwind the seed via `resize(0)` (shrink:
+allocation-free, punches holes) so the untouched hash entries remain
+the truth — and drop the hash copies only after the array holds both
+values. Pinned by a `checkAllAllocationFailures` test asserting
+value-preservation at every induced failure point. Round-1 repro
+paths re-verified closed; blockers 2/3 confirmed resolved.
+
 ## §R1 — Round-1 review record (codex `gpt-5.6-sol` + Antigravity, 2026-08-14): REVISE ×2, convergent
 
 Both reviewers independently confirmed the LuaJIT layout claims

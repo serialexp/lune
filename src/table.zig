@@ -256,17 +256,31 @@ pub const Table = struct {
                 // Fresh-part 1-based idiom (doc 18 D2a): seed `[hole, val]` with
                 // `asize = 2` so the ubiquitous `t = {}; t[1] = x` build stays
                 // array-resident from the first write.
-                try self.array.seedAt(gpa, i, val);
                 // The seed covers keys {0, 1}, and either may already be
                 // hash-resident (both are valid hash keys while asize == 0, and a
                 // v7 restore reproduces such splits). Key 1's stale entry is
                 // superseded by `val`; key 0's value must land in slot 0 — the
-                // seed left a hole there, which would otherwise *shadow* the hash
-                // entry and lose it.
+                // seed leaves a hole there, which would otherwise *shadow* the
+                // hash entry and lose it. Transactionally (§R4 round 2): PEEK the
+                // key-0 value first, do every fallible step — the seed, then the
+                // possibly-widening slot-0 write — and only once the array holds
+                // both values drop the hash copies. If the slot-0 write OOMs,
+                // unwind the seed with `resize(0)` (a shrink: allocation-free,
+                // punches the tail back to holes) so the untouched hash entries
+                // remain the table's truth; the lane commit may survive the
+                // unwind, but lane state is never serialized and the part stays
+                // retryable.
+                const absorb0: ?Value = if (self.hash.count() != 0) self.hash.get(Value.int(0)) else null;
+                try self.array.seedAt(gpa, i, val);
+                if (absorb0) |v0| {
+                    self.array.setInPlace(gpa, 0, v0) catch |e| {
+                        self.array.resize(gpa, 0) catch unreachable; // shrink never allocates
+                        return e;
+                    };
+                }
                 if (self.hash.count() != 0) {
                     _ = self.hash.remove(nk);
-                    if (self.hash.fetchRemove(Value.int(0))) |kv|
-                        try self.array.setInPlace(gpa, 0, kv.value);
+                    _ = self.hash.remove(Value.int(0));
                 }
                 try self.migrateFromHash(gpa);
                 return;
@@ -1171,6 +1185,32 @@ test "set(): fresh-1 seed migrates hash-resident keys 0 and 1 into the new exten
     try testing.expectEqual(@as(i64, 7), t.get(Value.int(0)).asInt()); // hole filled, not shadowed
     try testing.expectEqual(@as(i64, 100), t.get(Value.int(1)).asInt()); // new value wins
     try testing.expectEqual(@as(usize, 0), t.hash.count());
+}
+
+test "set(): fresh-1 seed absorption is OOM-atomic (the widening slot-0 write can fail)" {
+    // §R4 round 2: `t = {[0]=100000, [1]=99}` hash-resident (asize == 0), then
+    // `set(1, 1)`. The seed commits a u8 lane from `1`; absorbing 100000 into
+    // slot 0 must WIDEN, and that allocation can fail. On any induced failure
+    // the hash copies must still be the table's truth (nothing lost, nothing
+    // shadowed by a published extent); on success both values are array-resident
+    // and the hash is empty. `checkAllAllocationFailures` also asserts no leak.
+    const Inner = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            const t = try Table.create(gpa);
+            defer t.destroy(gpa);
+            try t.restoreEntry(gpa, Value.int(0), Value.int(100000)); // out of u8 → absorb widens
+            try t.restoreEntry(gpa, Value.int(1), Value.int(99));
+            t.set(gpa, Value.int(1), Value.int(1)) catch |e| {
+                try testing.expectEqual(@as(i64, 100000), t.get(Value.int(0)).asInt());
+                try testing.expectEqual(@as(i64, 99), t.get(Value.int(1)).asInt());
+                return e;
+            };
+            try testing.expectEqual(@as(i64, 100000), t.get(Value.int(0)).asInt());
+            try testing.expectEqual(@as(i64, 1), t.get(Value.int(1)).asInt());
+            try testing.expectEqual(@as(usize, 0), t.hash.count());
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Inner.run, .{});
 }
 
 test "lane: value identity is preserved across a widening store" {
