@@ -1737,6 +1737,17 @@ pub const Vm = struct {
         // straddle preserve constant-id continuity (the host re-supplies + re-retains
         // on restore, like the main `root`). Discovery order = retain order.
         for (self.retained_chunks.items) |proto| rootProtoConsts(proto, ctx, cb);
+        // Loaded chunks (docs/design/19): a `load`/`loadfile`/`dofile`/`require`
+        // chunk's protos are VM-owned until deinit (`loaded_chunks` never shrinks),
+        // so their interned constants are rooted for the VM's lifetime too — in
+        // BOTH walks, like `retained_chunks` above: membership is deterministic
+        // guest behaviour, hence mode-invariant, so the `.snapshot` walk stays
+        // byte-identical across modes and restore preserves constant-id
+        // continuity (keyframe v8's zero-allocation recompile invariant). This
+        // makes a trace const over a loaded proto ALWAYS redundant, which is what
+        // licenses tracing the loaded tree (doc 17's H-2 dynamic-proto gate,
+        // lifted by doc 19).
+        for (self.loaded_chunks.items) |lc| rootProtoConsts(lc.chunk.proto, ctx, cb);
         // Trace consts are GC-liveness roots ONLY — never snapshot semantic roots
         // (doc 17 H-2/G-2). See the item-5 note above.
         if (kind == .gc) {
@@ -9679,16 +9690,16 @@ test "trace toggle gates back-edge counting" {
     }
 }
 
-test "H-2 part 1: a hot loop inside a load-chunk is never traced (dynamic-proto gate)" {
-    // The core regression guard for docs/design/17 H-2 part 1. An identical hot loop
-    // records a trace when it lives in the STATIC main chunk, but records NOTHING when
-    // it lives in a `load`ed chunk — because a `load`/`loadfile`/`dofile` chunk's sole
-    // closure is not retained durably (`vm.loaded_chunks` holds only `{chunk, source}`),
-    // so a trace over it could become the sole GC root of its proto-literal string
-    // konsts and diverge string-intern ids between `.off` and record modes. The gate
-    // (arm/maybeStart*/recCall check `Proto.dynamic`) refuses to record it.
-    // Load-bearing: removing the `if (proto.dynamic) return;` in `arm` reddens the
-    // dynamic case (it would record exactly one trace, like the static case).
+test "doc 19: a hot loop inside a load-chunk traces exactly like the static chunk" {
+    // Flipped from the H-2 part 1 gate test (docs/design/19): loaded chunks now
+    // trace. The identical hot loop records a trace whether it lives in the STATIC
+    // main chunk or in a `load`ed chunk — safe because the chunk's proto-literal
+    // konsts are rooted VM-lifetime via `loaded_chunks` in both root walks
+    // (`forEachRootHeader`), so a trace konst over them is always redundant and the
+    // old sole-root divergence is unreachable. Load-bearing: removing the
+    // `loaded_chunks` loop from `forEachRootHeader` re-opens the H-2 hazard (see
+    // the end-to-end determinism test below), while re-adding the old
+    // `Proto.dynamic` arm gate reddens the dynamic half here.
     const gpa = testing.allocator;
     // STATIC: the loop is in the main chunk → records.
     {
@@ -9703,7 +9714,7 @@ test "H-2 part 1: a hot loop inside a load-chunk is never traced (dynamic-proto 
         defer chunk.deinit();
         try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
     }
-    // DYNAMIC: the same loop, compiled at runtime via `load` → never recorded.
+    // LOADED: the same loop, compiled at runtime via `load` → records identically.
     {
         var vm = try Vm.init(gpa);
         defer vm.deinit();
@@ -9717,28 +9728,29 @@ test "H-2 part 1: a hot loop inside a load-chunk is never traced (dynamic-proto 
             \\print(f())
         , true);
         defer chunk.deinit();
-        try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+        try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
     }
 }
 
-test "H-2 part 1: dropped load-chunk string id is byte-identical across all modes (end-to-end)" {
-    // The end-to-end determinism regression the gate exists to prevent (docs/design/17
-    // H-2 part 1). A `load`ed chunk's hot loop reads a proto-literal string key
-    // `t.victim` (interned at id A). The closure is dropped, a runtime-built marker
-    // string is interned at id B (> A), a GC cycle is forced, then `"victim"` is
-    // *re-interned at runtime* (`"vic".."tim"` — a *static* `"victim"` literal in the
-    // main chunk would root it and defeat the test) and its id is observed through the
-    // `pairs` order of a fresh table.
-    //   * WITHOUT the gate, a record mode traces the dynamic loop; the trace konst
-    //     keeps "victim" alive at id A, so it re-interns to A (< B) and sorts BEFORE
-    //     the marker — while `.off` sweeps it, re-interns to a fresh id C (> B), and
-    //     the marker sorts first. Divergent `pairs` order ⇒ divergent output.
-    //   * WITH the gate, the dynamic loop is never traced, so "victim" is swept in
-    //     EVERY mode alike and all 10 modes print the same order.
-    // The 3000-table garbage loop forces a real collection even under `gc_stress=false`
-    // (`collectgarbage` is unimplemented; the GC threshold starts at 1024 live objects),
-    // so the non-stress half of the matrix actually sweeps too. Verified load-bearing at
-    // the CLI: disabling the `arm` gate flips record modes to "victim marker ".
+test "doc 19: dropped load-chunk string id is byte-identical across all modes (end-to-end)" {
+    // The July H-2 scenario, now pinned under the doc-19 rooting model. A `load`ed
+    // chunk's hot loop reads a proto-literal string key `t.victim` (interned at id
+    // A). The closure is dropped, a runtime-built marker string is interned at id
+    // B (> A), a GC cycle is forced, then `"victim"` is *re-interned at runtime*
+    // (`"vic".."tim"`) and its id observed through the `pairs` order of a fresh
+    // table.
+    //   * Pre-doc-19 the gate made every mode SWEEP "victim" (no trace kept it),
+    //     so it re-interned at C > B and the marker sorted first.
+    //   * Post-doc-19 the `loaded_chunks` root keeps "victim" alive at id A in
+    //     EVERY mode — including `.off`, which runs the same mark phase — so it
+    //     re-interns to A (< B) and sorts BEFORE the marker, in all 10 modes
+    //     alike. The determinism property is the same (one id timeline); only the
+    //     uniform timeline changed. Load-bearing: dropping the `loaded_chunks`
+    //     loop from `forEachRootHeader` diverges record modes (trace konst roots
+    //     "victim") from `.off` (sweeps it) — the original H-2 hole.
+    // The 3000-table garbage loop forces a real collection even under
+    // `gc_stress=false` (the GC threshold starts at 1024 live objects), so the
+    // non-stress half of the matrix actually sweeps too.
     try expectProgram(
         \\local f = load("local t = {victim=1} local s=0 for i=1,200 do s=s+t.victim end return s")
         \\local _ = f()
@@ -9754,19 +9766,19 @@ test "H-2 part 1: dropped load-chunk string id is byte-identical across all mode
         \\print(order)
         \\
     ,
-        "marker victim \n",
+        "victim marker \n",
     );
 }
 
-test "H-2 part 1: a static trace inlining a dynamic callee aborts with .dynamic_proto (gate 4)" {
-    // Covers the recCall inlining gate: a trace anchored in a STATIC proto that
-    // inline-calls a `load`ed callee each iteration must abort (embedding the dynamic
-    // callee's proto-literal konsts into a static trace is the same H-2 hazard). The
-    // callee must be a fixed-arity NESTED function — a directly-loaded root is vararg
-    // (`load.zig` `vararg_root = true`) and already aborts at `cp.is_vararg`, which
-    // would not prove the new gate fired. Load-bearing: removing the recCall
-    // `if (cp.dynamic) return self.abort(.dynamic_proto);` lets the callee inline
-    // (the abort row disappears / turns into a recorded trace).
+test "doc 19: a static trace inlines a loaded callee (flipped recCall gate)" {
+    // Flipped from the H-2 recCall gate test (docs/design/19): a trace anchored in
+    // a STATIC proto that inline-calls a `load`ed fixed-arity nested callee each
+    // iteration now inlines it and commits, exactly like a static callee — the
+    // callee's proto-literal konsts entering the trace const pool is safe because
+    // the `loaded_chunks` root makes them redundant in both walks. The callee must
+    // stay a fixed-arity NESTED function (a directly-loaded root is vararg via
+    // `vararg_root = true` and aborts at `cp.is_vararg`, which would mask the
+    // inline path this test pins).
     const gpa = testing.allocator;
     const parser = @import("parser.zig");
     const diag = @import("diag.zig");
@@ -9794,14 +9806,8 @@ test "H-2 part 1: a static trace inlining a dynamic callee aborts with .dynamic_
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
-    // No trace survives (the static anchor keeps aborting on the dynamic callee)...
-    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
-    // ...and the abort log carries a `.dynamic_proto` row (not `.cross_frame`).
-    var saw_dynamic_proto = false;
-    for (vm.trace.abort_log.items) |row| {
-        if (row.reason == .dynamic_proto) saw_dynamic_proto = true;
-    }
-    try testing.expect(saw_dynamic_proto);
+    // The static anchor records and commits, inlining the loaded callee.
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
 }
 
 /// Run `source` with tier-1a execution **and** exec-log recording on (small

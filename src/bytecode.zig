@@ -276,17 +276,6 @@ pub const Proto = struct {
     /// VM-owned source copy, so loaded code reports its *own* line numbers rather
     /// than the main chunk's. Borrows the buffer (which outlives the proto).
     source: []const u8 = "",
-    /// True iff this proto belongs to a **dynamically-compiled** chunk — one
-    /// produced at runtime by `load`/`loadfile`/`dofile` (or rebuilt by the
-    /// keyframe recompile path), as opposed to the static main chunk. The tracing
-    /// JIT refuses to record any trace anchored in — or inlining a call into — a
-    /// dynamic proto (docs/design/17 H-2 part 1): a `load`ed chunk's sole closure
-    /// is not retained durably, so a trace over it could become the sole GC root of
-    /// its proto-literal string konsts, diverging string-intern ids between `.off`
-    /// and record modes. A pure compile-time property (stamped by `assignProtoIds`),
-    /// re-derived identically on every recompile, hence never serialized. Default
-    /// `false` (the static tree and hand-built test protos).
-    dynamic: bool = false,
 };
 
 // ---------------------------------------------------------------------------

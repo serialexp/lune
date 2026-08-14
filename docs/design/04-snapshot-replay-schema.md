@@ -1,8 +1,8 @@
 # lune — Snapshot & Replay Schema
 
-Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; keyframe now **v7** (v5 = H-2 `next_obj_id`; v7 = doc 18 slot-0 array part: positional 0-based array serialization + restore-time validation and lane rebuild); guard-snapshots outstanding
+Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; keyframe now **v8** (v5 = H-2 `next_obj_id`; v7 = doc 18 slot-0 array part; v8 = doc 19 loaded-chunk constants in the `.snapshot` walk + zero-allocation recompile check); guard-snapshots outstanding
 Owner: Bart
-Last updated: 2026-06-15
+Last updated: 2026-08-14
 
 Prerequisite for **Phase 5b** (trace serialization format) and **Phase 7** (the
 visualiser). This doc owns the *concrete wire format* — the binschema schema that
@@ -141,6 +141,17 @@ schema follows; this is that schema's home.
       restore path, so a captured split — array holes included — is still reproduced
       verbatim by `restoreEntry` + direct array append, and `encodeSnapshot ∘ restore`
       remains byte-identical (the round-trip corpus includes a sieve-shaped table).
+      **v8 (doc 19):** loaded-chunk proto constants joined the `.snapshot` root
+      walk — a v8 snapshot always carries every loaded proto's string literal
+      (even when the guest dropped the chunk's closure), so
+      `recompileLoadedChunks` is guaranteed **zero-allocation** on restore
+      (enforced post-recompile via `next_obj_id`;
+      `LoadedChunkRecompileAllocated` = corrupt). Pre-v8 snapshots could
+      legitimately omit a dropped chunk's literals (restore minted them fresh
+      above the restored range) — accepting one post-v8 would fork the
+      allocation timeline, hence the version bump. This is the snapshot half of
+      lifting the H-2 dynamic-proto tracing gate: loaded code now traces like
+      static code.
       F2b proved the inverse property only for a **final-state** snapshot (empty
       stack/frames); the mid-execution case is F2c, below.
 

@@ -66,7 +66,18 @@ pub const schema = @import("gen/trace_schema.zig");
 /// v6 (A-vi foundation): `FrameRef` gained the live vararg cursor
 /// (`varargs_base`/`varargs_count`), making a keyframe captured inside an active
 /// vararg callee semantically complete.
-pub const snapshot_format_version: u32 = 7;
+/// v7 (B-5, doc 18): the table array part became slot-0/identity-mapped —
+/// `HeapTable` array entries are positional from key 0 (non-inclusive `asize`),
+/// and restore validation rejects an array-covered hash key
+/// (`ArrayResidentKeyInHash`-adjacent shapes; a key == asize hash resident is
+/// valid). (This history line was omitted when v7 landed; recorded here.)
+/// v8 (doc 19): loaded-chunk proto constants joined the `.snapshot` root walk,
+/// so every loaded proto's string literal is in `objects[]` and
+/// `recompileLoadedChunks` is guaranteed ZERO-allocation (enforced post-recompile
+/// via `next_obj_id`; trip = `LoadedChunkRecompileAllocated`, corrupt snapshot).
+/// Pre-v8 snapshots could legitimately omit a dropped loaded chunk's constants —
+/// accepting one would fork the allocation timeline, hence the bump.
+pub const snapshot_format_version: u32 = 8;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -370,6 +381,7 @@ const RestoreError = error{
     UnresolvedHeapRef, // a HeapRef / root id has no matching object
     UnknownProto, // a HeapClosure.proto_id is not in the program's proto tree
     LoadedChunkRecompileFailed, // a recorded `load` source no longer parses/compiles (corrupt snapshot)
+    LoadedChunkRecompileAllocated, // recompiling loaded chunks allocated a heap object — a v8 snapshot must carry every loaded-proto literal (doc 19), so a moved counter means a forked allocation timeline (corrupt snapshot)
     UnknownNative, // a HeapNative.name is not in the native registry
     GlobalsNotATable, // globals_id resolves to a non-table object
     MetatableNotATable, // a HeapTable.metatable_id resolves to a non-table object
@@ -474,10 +486,6 @@ fn recompileLoadedChunks(vm: *Vm, root: *const Proto, loaded: []const schema.Loa
             .known_globals = &interp.builtin_global_names,
             .id_base = vm.next_proto_id,
             .vararg_root = true,
-            // Restored load-chunks stay dynamic so the JIT keeps refusing to trace
-            // them post-restore (docs/design/17 H-2 part 1); the bit is a pure
-            // compile-time property, re-derived identically here, never serialized.
-            .dynamic = true,
         }) catch {
             vm.gpa.free(owned);
             return error.LoadedChunkRecompileFailed;
@@ -548,11 +556,12 @@ pub fn restoreSnapshot(
     try idmap.ensureTotalCapacity(@intCast(kf.objects.len));
 
     // Advance the id counter past every restored id BEFORE recompiling loaded
-    // chunks (L-2): a loaded chunk whose closure was collected has no string
-    // objects in the snapshot, so recompiling it re-interns those literals as
-    // fresh heap strings — which must take ids ABOVE the restored range, never
-    // collide with a restored id. (Reachable loaded chunks keep their literals in
-    // the snapshot; recompile reuses them via interning, allocating nothing new.)
+    // chunks (L-2). Under v8 (doc 19) every loaded chunk's string literals are
+    // rooted in the `.snapshot` walk, so a valid snapshot ALWAYS carries them and
+    // recompile re-interns to the restored objects, allocating nothing — enforced
+    // below (`LoadedChunkRecompileAllocated`). Advancing first still matters: it
+    // is what makes a corrupt snapshot's illegitimate recompile allocation land
+    // ABOVE the restored range (detectable) instead of colliding with it.
     // Phantom grid rows (doc 14, Phase 7) carry ids in the reserved high half
     // (`gc.reserved_grid_id_base`+) so capture timing can't shift them. They are
     // NOT genuine allocations and must not advance the counter — a post-restore
@@ -639,10 +648,18 @@ pub fn restoreSnapshot(
     }
 
     // Rebuild the runtime-`load`ed chunk image (L-2): recompile each recorded
-    // source so `resolveProto` can rebind a dynamic `HeapClosure.proto_id` in pass
+    // source so `resolveProto` can rebind a loaded `HeapClosure.proto_id` in pass
     // 1b. Deterministic recompile reproduces the same protos/ids the live VM had;
     // string literals resolve to the already-interned snapshot strings above.
     try recompileLoadedChunks(vm, root, kf.loaded_chunks);
+    // v8 integrity check (doc 19): the encoder roots every loaded proto's string
+    // constants in the `.snapshot` walk, and Pass 1a interned every restored
+    // string (byte-keyed) before the recompile — so a valid v8 recompile resolves
+    // every literal to a restored object and allocates NOTHING. A moved counter
+    // means the snapshot is missing a loaded-proto literal: its allocation
+    // timeline is already forked from the source VM's, so reject rather than
+    // diverge silently.
+    if (vm.heap.next_obj_id != kf.next_obj_id) return error.LoadedChunkRecompileAllocated;
 
     // --- Pass 1b: create closure shells now that all protos (static + loaded)
     // exist. linkRestored stamps the original id (the counter was already advanced
@@ -1636,20 +1653,25 @@ test "restore reanimates the package/require module system (searchers rebind, ca
     try testing.expectEqualStrings("B:b", string.String.fromHeader(out[0].asHeap()).bytes());
 }
 
-test "H-2 part 1: recompiled load-chunk protos are stamped dynamic after restore" {
-    // Covers the keyframe recompile-site stamp (`recompileLoadedChunks` passes
-    // `.dynamic = true`). None of the live-run gate tests would catch forgetting this:
-    // a restored `load`ed chunk must keep `Proto.dynamic == true` on its whole proto
-    // tree so the JIT keeps refusing to trace it post-restore (docs/design/17 H-2 p1).
-    // Load-bearing: dropping `.dynamic = true` at `keyframeser.zig`'s recompile site
-    // leaves the restored protos `false` and reddens this.
+test "doc 19 §R2: v8 schema boundary — version rejection + missing loaded literal trips the zero-allocation check" {
+    // Replaces the H-2 "stamped dynamic after restore" test (the stamp is gone —
+    // loaded chunks trace like static code). Pins the two v8 boundary properties:
+    //   (a) a snapshot claiming any other version is rejected (UnsupportedVersion) —
+    //       pre-rooting snapshots may legitimately omit dropped loaded-chunk
+    //       literals, so they must never enter the v8 invariant domain;
+    //   (b) a v8 snapshot that IS missing a loaded-proto literal (hand-corrupted
+    //       here by deleting the string object) makes `recompileLoadedChunks`
+    //       allocate — restore must reject it (`LoadedChunkRecompileAllocated`)
+    //       rather than silently fork the allocation timeline.
     const gpa = testing.allocator;
-    // Keep the loaded closure alive across the snapshot by binding it to a global, so
-    // the chunk is retained in `vm.loaded_chunks` and recompiled on restore. The chunk
-    // has a NESTED function so we can check the recursive stamp, not just the root.
+    // The loaded chunk's closure is DROPPED before the cut: post-doc-19 its literal
+    // ("victim") stays in the snapshot purely via the `loaded_chunks` root, with no
+    // other serialized edge — so deleting that one object yields exactly the
+    // pre-v8 "dropped closure" snapshot shape.
     const source =
-        \\f = load("local g = function(x) return x + 1 end return g(41)")
+        \\local f = load("local t = {victim=1} return t.victim")
         \\answer = f()
+        \\f = nil
     ;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
@@ -1666,26 +1688,134 @@ test "H-2 part 1: recompiled load-chunk protos are stamped dynamic after restore
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
-    // Pre-condition: the live VM already has the chunk loaded and stamped dynamic.
     try testing.expect(vm.loaded_chunks.items.len >= 1);
 
     const b0 = try encodeSnapshot(gpa, &vm);
     defer gpa.free(b0);
-    const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
-    defer {
-        vm2.deinit();
-        gpa.destroy(vm2);
+
+    // Sanity: the unmodified v8 snapshot restores, and the loaded-proto literal is
+    // present as an object (the `.snapshot` root put it there despite the dropped
+    // closure).
+    {
+        const vm2 = try restore(gpa, b0, chunk.proto, NativeRegistry.base());
+        defer {
+            vm2.deinit();
+            gpa.destroy(vm2);
+        }
+        try testing.expect(vm2.loaded_chunks.items.len >= 1);
     }
 
-    // The recompiled chunk(s) and their whole proto trees must be `dynamic == true`.
-    try testing.expect(vm2.loaded_chunks.items.len >= 1);
-    const Check = struct {
-        fn allDynamic(proto: *const Proto) !void {
-            try testing.expect(proto.dynamic);
-            for (proto.protos) |child| try allDynamic(child);
+    // (a) Version rejection: same bytes, version stamped 7.
+    {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var snap = try schema.SnapshotFile.decode(arena.allocator(), b0);
+        snap.version = 7;
+        try testing.expectError(error.UnsupportedVersion, restoreSnapshot(gpa, snap, chunk.proto, NativeRegistry.base()));
+    }
+
+    // (b) Zero-allocation check: same bytes, the "victim" string object deleted.
+    {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        var snap = try schema.SnapshotFile.decode(arena.allocator(), b0);
+        var kept = try arena.allocator().alloc(schema.HeapObject, snap.keyframe.objects.len);
+        var n: usize = 0;
+        var dropped: usize = 0;
+        for (snap.keyframe.objects) |o| {
+            const is_victim = o.body == .HeapString and std.mem.eql(u8, o.body.HeapString.bytes, "victim");
+            if (is_victim) {
+                dropped += 1;
+                continue;
+            }
+            kept[n] = o;
+            n += 1;
         }
-    };
-    for (vm2.loaded_chunks.items) |lc| try Check.allDynamic(lc.chunk.proto);
+        try testing.expectEqual(@as(usize, 1), dropped); // the literal WAS serialized
+        snap.keyframe.objects = kept[0..n];
+        try testing.expectError(error.LoadedChunkRecompileAllocated, restoreSnapshot(gpa, snap, chunk.proto, NativeRegistry.base()));
+    }
+}
+
+test "doc 19 §T3: restored load-driven program resumes with the JIT and traces its LOADED proto" {
+    // Doc 19 testing item 3 (extends the doc-18 §R3 pattern): a program whose hot
+    // loop lives in a `load`ed chunk is cut mid-run, restored (v8 recompiles the
+    // chunk zero-allocation), and resumed with tracing + native codegen. Pins:
+    //   (a) resumed output == uninterrupted tier-0 output;
+    //   (b) a trace ANCHORED IN THE LOADED PROTO commits and dispatches post-restore
+    //       (anchor proto id >= the static tree's proto_count) — the doc-19 unlock
+    //       working across a snapshot boundary, not just in a fresh VM.
+    const gpa = testing.allocator;
+    const source =
+        \\local f = load([[
+        \\  local t = { victim = 1 }
+        \\  local s = 0
+        \\  for i = 1, 400 do s = s + t.victim end
+        \\  return s
+        \\]])
+        \\local warm = f()
+        \\local total = 0
+        \\for r = 1, 40 do total = total + f() end
+        \\print(warm + total)
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    // Cut mid-way: after the chunk is loaded and warm, inside the repeat loop.
+    vm.suspend_ctl = .{ .min_depth = 1, .after_safepoints = ref.total_safepoints / 4 };
+    try testing.expect((try vm.start(chunk.proto)) == .suspended);
+    const out_before = try gpa.dupe(u8, sink.buffered());
+    defer gpa.free(out_before);
+    const mid = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(mid);
+
+    const vm_r = try restore(gpa, mid, chunk.proto, NativeRegistry.base());
+    defer {
+        vm_r.deinit();
+        gpa.destroy(vm_r);
+    }
+    try testing.expect(vm_r.loaded_chunks.items.len >= 1);
+
+    const native = @import("nativegen.zig").is_x64_linux;
+    vm_r.trace.config.enabled = true;
+    vm_r.trace.config.execute = true;
+    vm_r.trace.config.optimize = true;
+    vm_r.trace.config.native_codegen = native;
+    vm_r.trace.config.hotloop = 4;
+
+    var buf_r: [64]u8 = undefined;
+    var sink_r = io.Writer.fixed(&buf_r);
+    vm_r.out = &sink_r;
+    vm_r.suspend_ctl = null;
+    try testing.expect((try vm_r.exec()) == .finished);
+
+    // (a) output equivalence vs the uninterrupted tier-0 reference.
+    var combined: [128]u8 = undefined;
+    @memcpy(combined[0..out_before.len], out_before);
+    @memcpy(combined[out_before.len..][0..sink_r.buffered().len], sink_r.buffered());
+    try testing.expectEqualStrings(ref.full_out, combined[0 .. out_before.len + sink_r.buffered().len]);
+
+    // (b) a committed trace anchored in the LOADED tree (static ids are
+    // [0, chunk.proto_count); loaded protos sit above) that actually ran.
+    try testing.expect(vm_r.trace.entries > 0);
+    var saw_loaded_anchor = false;
+    for (vm_r.trace.cache.items) |t| {
+        if (t.anchor.proto.id >= chunk.proto_count) saw_loaded_anchor = true;
+    }
+    try testing.expect(saw_loaded_anchor);
 }
 
 test "metatable edge to the id-0 object survives round-trip (1-based encoding)" {

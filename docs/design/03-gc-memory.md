@@ -340,14 +340,20 @@ architecturally consistent choice.
 mode-invariant. No new nondeterministic input is introduced; the root steers only object
 liveness, never a `Value` a program computes on.
 
-**Considered and excluded — rooting `loaded_chunks`.** `load`ed chunks need no rooting:
-`compileToClosure` performs no VM re-entry or safepoint (collection can only fire at the
-dispatch-loop safepoint, never mid-native — note this is narrower than "a native is
-atomic": `pcall`/comparators DO re-enter dispatch via `callValue`, but `load`'s compile
-path does not), and the returned closure roots the tree; after the closure drops we *want*
-them swept (mode-consistent, and recompiled deterministically on restore). Rooting
-`loaded_chunks` would resurrect intentionally-dead dropped-`load`-chunk literals and hold
-them until VM deinit — a memory-retention change with no correctness upside.
+**Considered and excluded — rooting `loaded_chunks`.** *(SUPERSEDED by doc 19,
+2026-08-14 — kept for the historical reasoning.)* The original verdict: `load`ed chunks
+need no rooting for the compile→run window (`compileToClosure` performs no VM re-entry or
+safepoint — collection can only fire at the dispatch-loop safepoint, never mid-native —
+and the returned closure roots the tree), and after the closure drops we *wanted* them
+swept, so rooting looked like "a memory-retention change with no correctness upside".
+Doc 19 reversed this: the upside is **tracing the loaded tree**. Rooting
+`vm.loaded_chunks[].chunk.proto` constants in BOTH walks makes them mode-invariantly live
+for the VM's lifetime, which makes a trace konst over a loaded proto always redundant —
+unreachable H-2 sole-root state — and let the dynamic-proto tracing gate (which kept every
+`require`d module JIT-dark) be lifted. The retention cost is a strict subset of the
+`Chunk` + source text `loaded_chunks` already holds until deinit. Keyframe v8 pairs with
+this (encoder now always serializes loaded-proto literals; restore recompile is
+zero-allocation, enforced).
 
 **`run`/`start` need no auto-register.** The main-chunk window is closed by construction
 (the closure is pushed before the first safepoint), so `retainChunk` is purely opt-in for

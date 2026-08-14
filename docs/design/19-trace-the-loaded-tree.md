@@ -1,6 +1,6 @@
 # Trace the loaded tree — root `loaded_chunks`, lift the H-2 dynamic-proto gate
 
-Status: design APPROVED (codex gpt-5.6-sol round 2, 2026-08-14) — implementation not started
+Status: complete — Phases 0–3 landed 2026-08-14 (design APPROVED codex gpt-5.6-sol round 2; post-landing review pending §R3)
 Owner: Bart + Claude
 Last updated: 2026-08-14
 
@@ -11,36 +11,51 @@ land; move to Done once everything inside them is checked.
 
 ### Done
 
-_(nothing yet)_
+- [x] **Phase 0 — root `loaded_chunks` in both walks + schema bump.**
+      `forEachRootHeader` walks loaded protos via `rootProtoConsts` after
+      `retained_chunks`, both kinds; keyframe v8 with the
+      `LoadedChunkRecompileAllocated` post-recompile check.
+- [x] **Phase 1 — gates lifted, machinery removed.** Three anchor early-outs,
+      `recCall` abort, `.dynamic_proto`, `Proto.dynamic` + option + stamping +
+      `assignProtoIds` plumbing — all gone.
+- [x] **Phase 2 — tests flipped + doc sweep.** Gate tests → trace-parity tests
+      (loaded loop records like static; July scenario byte-identical with the
+      new uniform timeline "victim marker"→"victim first"; recCall inline
+      commits); new §R2 boundary test (v7 rejection + hand-corrupted v8 →
+      `LoadedChunkRecompileAllocated`); new §T3 restore-resume test (trace
+      anchored in a LOADED proto post-restore). Docs 03/04/17 + code comments
+      swept.
+- [x] **Phase 3 — measurement.** See "Measured results" below.
 
 ### Outstanding
 
-- [ ] **Phase 0 — root `loaded_chunks` in both walks + schema bump.**
-      `forEachRootHeader` walks `vm.loaded_chunks[].chunk.proto` through
-      `rootProtoConsts`, immediately after the `retained_chunks` loop, in BOTH
-      `.gc` and `.snapshot` kinds. Keyframe schema v7→v8 (§R1 blocker):
-      pre-rooting snapshots are rejected; restore gains the post-recompile
-      integrity check `heap.next_obj_id == kf.next_obj_id` (a v8 snapshot that
-      trips it is corrupt by definition, `LoadedChunkRecompileAllocated` or
-      similar).
-- [ ] **Phase 1 — lift the gates, remove the dead machinery.** Remove the three
-      anchor early-outs (`if (key.proto.dynamic) return;`), the `recCall`
-      `abort(.dynamic_proto)`, the `.dynamic_proto` `AbortReason` member, and
-      `Proto.dynamic` + its `compileWithOptions` option + both stamping sites
-      (§R1 confirmed: no other production reader exists).
-- [ ] **Phase 2 — flip the H-2 gate tests + doc sweep.** The "records ZERO
-      traces" and negative-control tests become "records normally +
-      byte-identical across modes"; the `.dynamic_proto` inline-abort test
-      becomes an inline-succeeds test. New test: the July sole-root scenario
-      itself (load, run hot loop, drop closure, collect, snapshot) is
-      byte-identical across modes. Doc sweep per §R1 Q3: doc 03 §Chunk-constant
-      rooting (currently *rejects* rooting `loaded_chunks`), `compiler.zig:80`,
-      `load.zig:116`, `keyframeser.zig:477` + `:551` comments, doc 04
-      (snapshot schema) + the version-history comment at `keyframeser.zig:45`
-      for the v8 bump, doc 17 gate sections marked superseded-by-doc-19 (not
-      rewritten).
-- [ ] **Phase 3 — measurement.** scimark family + full board + memory columns;
-      predictions P.1–P.4 below. Record results here.
+- [ ] **Post-landing codex review (§R3).** House pattern.
+- [ ] **scimark-sparse/fft follow-up frontier.** The unlock exposed the
+      recorder's next abort reasons on these two (sparse ~flat at 22.9×, fft
+      32.4×) — name them via `--dump-aborts` and lever them individually.
+
+## Measured results (Phase 3, 2026-08-14, board 20260814-202701-d75d6e3)
+
+All 28 programs `cross ok` + `luajit ok` (gate exit 0). scimark family
+(jit ms, vs the 20260814-191341 pre-unlock board):
+
+| program | jit before | jit after | jit/lj before | jit/lj after |
+|---|---|---|---|---|
+| scimark-lu | 1159.8 (jit *slower* than t0 810) | **216.8** | 73.5× | **13.6×** |
+| scimark-sor | 725.7 | **93.8** | 34.4× | **4.4×** |
+| scimark-fft | 904.6 | **531.8** | 53.9× | **32.4×** |
+| scimark-sparse | 700.8 | 649.7 | 24.4× | 22.9× |
+
+scimark-lu single-run: 0 traces / 1601 ms → 373,920 native trace entries,
+90.3% of loop iterations traced (94.3% covered), traced loops at 17.5 cyc/iter
+vs tier-0's 189.9, 247 ms wall. P.1/P.2 CONFIRMED (sparse is the named
+follow-up frontier). P.3 CONFIRMED: 7 frozen hashes + 3 repros byte-identical,
+both test builds green. P.4 CONFIRMED: memory board flat (scimark +0.2–0.7 MB
+jit-side from real trace/mcode state; repack unchanged 30.7/27.6 MB). Rest of
+the board within run-to-run noise.
+
+The prediction "P.1 …" list below is the pre-measurement contract; kept as
+written.
 
 ## Why this exists
 

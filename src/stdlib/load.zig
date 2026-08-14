@@ -112,10 +112,10 @@ pub fn compileToClosure(vm: *Vm, src_bytes: []const u8, chunk_name: []const u8, 
         .known_globals = &interp.builtin_global_names,
         .id_base = vm.next_proto_id,
         // Lua loaded chunks are vararg: `load("return ...")(1, 2)` yields 1, 2.
+        // (Loaded chunks trace like static code as of doc 19: their proto
+        // constants are rooted VM-lifetime via `loaded_chunks` in both root
+        // walks, so the old H-2 "never JIT loaded code" gate is gone.)
         .vararg_root = true,
-        // Dynamically-compiled: the tracing JIT must never record over this chunk
-        // (docs/design/17 H-2 part 1) — its closure is not retained durably.
-        .dynamic = true,
     }) catch {
         return loadError(vm, owned, chunk_name, &diags, out);
     };

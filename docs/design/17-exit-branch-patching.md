@@ -6854,6 +6854,16 @@ clean-entry), **H-4** (logical cut) are untouched by piece 1 and remain round-9 
 
 #### H-2 hard half — design (Bart, 2026-07-18): gate trace recording to the static proto tree
 
+> **SUPERSEDED (2026-08-14, doc 19 — trace the loaded tree).** The gate below and its
+> Part (1) implementation were LIFTED: `require` rides the same `loadChunk` path as
+> `load`, so the "rare, correctness-first" accepted cost actually kept every
+> module-structured program JIT-dark (scimark-lu 73.5× LuaJIT with zero traces). Doc 19
+> removes the *hazard* instead of gating the JIT: `vm.loaded_chunks` proto constants are
+> rooted in BOTH root walks (mode-invariant, VM-lifetime — the `retained_chunks`
+> precedent), making the sole-root state analyzed below unreachable and the static/
+> dynamic trees root-equivalent. Keyframe v8 pairs with it. The analysis below remains
+> the authoritative statement of the hazard; only the chosen mitigation changed.
+
 **Direction (Bart's call, from the three options presented):** do NOT build weak-intern identity
 reconciliation, and do NOT reverse the "never invalidate a committed trace" invariant. Instead
 **gate trace recording so the JIT never records a trace that touches a dynamically-`load`ed proto**

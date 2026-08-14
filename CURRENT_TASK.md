@@ -1,5 +1,29 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-61) — **Doc 19 LANDED: loaded tree traces — H-2 dynamic-proto gate lifted, keyframe v8. scimark-lu 1160→217ms (73.5×→13.6×).**
+
+Worst-board investigation (scimark-lu 73.5×, jit 43% SLOWER than t0) found the
+whole module system JIT-dark: `require` rides `loadChunk`, which stamped every
+proto `Proto.dynamic=true`, and the doc-17 H-2 gate refused to anchor/inline
+anything dynamic — zero traces, zero aborts, 92.2% of the run in one
+untraceable loop. Fix (doc 19, codex-approved round 2 after a v8-blocker round
+1): root `vm.loaded_chunks[].chunk.proto` constants via `rootProtoConsts` in
+BOTH `forEachRootHeader` walks (mode-invariant, `retained_chunks` precedent) →
+the H-2 sole-root state is unreachable → gates + `Proto.dynamic` + AbortReason
+`.dynamic_proto` removed entirely. Keyframe v7→v8: encoder now always carries
+loaded-proto literals, restore recompile is zero-allocation (enforced,
+`LoadedChunkRecompileAllocated`); pre-v8 snapshots rejected (timeline fork).
+Tests: gate tests flipped to trace-parity, July-scenario expectProgram now
+pins the uniform "victim first" timeline across all 10 modes, §R2 schema
+boundary (v7 reject + hand-corrupted v8 trip), §T3 restore-resume traces a
+LOADED proto anchor. Board 20260814-202701: lu 216.8ms/13.6×, sor 93.8/4.4×,
+fft 531.8/32.4×, sparse ~flat (next frontier: name its aborts — doc 19
+Outstanding). 28/28 cross+luajit ok, hashgate PASS, both test builds green.
+Also this session: bench harness peak-RSS columns (ca99421, GNU-time
+trampoline — fork/posix_spawn floors ru_maxrss at the Python runner's RSS),
+str_manip LuaJIT fix (5de9c0a), history strip (00889ad). Post-landing codex
+review of the doc-19 implementation is the open item.
+
 ## Status 2026-08-14 (LATEST-60) — **B-5 post-landing codex review (REVISE) folded: two blockers fixed + two missing §R3 tests landed. Doc 18 fully closed.**
 
 codex `gpt-5.6-sol` post-landing review of 838fd75/0829bb7/890c2c7 →

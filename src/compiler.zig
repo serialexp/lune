@@ -77,11 +77,6 @@ pub const Options = struct {
     /// The runtime `load` path sets this true to match Lua, where a loaded chunk
     /// is vararg and `load("return ...")(1, 2)` yields its arguments.
     vararg_root: bool = false,
-    /// Stamp every proto in this chunk `Proto.dynamic = true`. Set by the runtime
-    /// `load`/`loadfile`/`dofile` path and the keyframe recompile path so the
-    /// tracing JIT never records a trace over a dynamically-compiled chunk (docs/
-    /// design/17 H-2 part 1). Default `false` — the static main chunk.
-    dynamic: bool = false,
 };
 
 /// Compile a parsed chunk. String literals/names are interned into `heap`.
@@ -152,7 +147,7 @@ pub fn compileWithOptions(
     // the runtime-error path can resolve span offsets to lines against the chunk
     // this proto actually came from (load support).
     var next_id: u32 = opts.id_base;
-    assignProtoIds(proto, &next_id, source, opts.dynamic);
+    assignProtoIds(proto, &next_id, source);
 
     // Moving `arena` is safe: code/constants/proto live in arena *heap* buffers,
     // not in the struct, so the pointers stay valid; only the `c.arena` handle
@@ -176,12 +171,11 @@ pub fn lineFromOffset(source: []const u8, offset: u32) u32 {
     return line;
 }
 
-fn assignProtoIds(proto: *Proto, next: *u32, source: []const u8, dynamic: bool) void {
+fn assignProtoIds(proto: *Proto, next: *u32, source: []const u8) void {
     proto.id = next.*;
     proto.source = source;
-    proto.dynamic = dynamic;
     next.* += 1;
-    for (proto.protos) |child| assignProtoIds(@constCast(child), next, source, dynamic);
+    for (proto.protos) |child| assignProtoIds(@constCast(child), next, source);
 }
 
 /// One `get_global` site recorded during compilation, for the unknown-global

@@ -1707,12 +1707,6 @@ pub const AbortReason = enum {
     /// recorder's grown `reg_map` window. Abort rather than panic on an OOB slab
     /// read; tier-0 owns the loop. (Deep/unbounded recursion is Phase 3.)
     too_deep,
-    /// The recording tried to inline a call into a **dynamic** proto (a
-    /// `load`/`loadfile`/`dofile` chunk, `Proto.dynamic`). Never traced: its
-    /// closure isn't retained durably, so a trace over it could sole-root its
-    /// proto-literal konsts and diverge string-intern ids between `.off` and record
-    /// modes (docs/design/17 H-2 part 1). The static caller keeps running tier-0.
-    dynamic_proto,
 };
 
 /// One aggregated abort, accumulated in `TraceState.abort_log` when
@@ -7649,11 +7643,6 @@ pub const TraceState = struct {
         if (self.rec.active) return; // never clobber an in-flight recording
         if (key.proto != proto or key.pc != cur_pc) return;
         self.pending_exit_anchor = null;
-        // Consume the pending arm FIRST (above), then decline to record a dynamic
-        // proto (docs/design/17 H-2 part 1). Guarding before the null-clear would
-        // leave a matching dynamic pending arm set, permanently pinning `.full`
-        // dispatch (`runFastPath`) until execution unwinds.
-        if (key.proto.dynamic) return;
         self.rec.reset(self.gpa, key, proto.num_registers) catch return;
         // Mark this recording a continuation so `recForPrepLink` may close it with a
         // `.link` at the inner `for_prep` (a root recording, armed via `arm`, leaves
@@ -7677,9 +7666,6 @@ pub const TraceState = struct {
         const src = self.pending_replay_src;
         self.pending_replay_anchor = null;
         self.pending_replay_src = null;
-        // Consume the pending arm FIRST, then decline a dynamic proto — same
-        // `.full`-pinning hazard as `maybeStartContinuation` (docs/design/17 H-2 p1).
-        if (key.proto.dynamic) return;
         self.rec.reset(self.gpa, key, proto.num_registers) catch return;
         self.rec.kind = .side;
         self.rec.side_src = src;
@@ -10463,10 +10449,6 @@ pub const TraceState = struct {
     /// frame; recording proper begins at the next dispatch-loop iteration (which
     /// is the anchor instruction). On OOM we simply don't arm.
     fn arm(self: *TraceState, proto: *const Proto, target_pc: u32) void {
-        // Never anchor a recording in a dynamic proto (docs/design/17 H-2 part 1).
-        // This single choke point covers BOTH root arming (`onBackEdge`) and
-        // side-trace arming (`wants_side_trace`), which both funnel through `arm`.
-        if (proto.dynamic) return;
         self.rec.reset(self.gpa, .{ .proto = proto, .pc = target_pc }, proto.num_registers) catch return;
     }
 
@@ -12191,11 +12173,10 @@ pub const TraceState = struct {
 
         const cl = function.Closure.fromHeader(callee.asHeap());
         const cp = cl.proto;
-        // Never inline a call into a dynamic proto (docs/design/17 H-2 part 1): a
-        // static trace embedding a `load`ed callee's proto-literal konsts would
-        // sole-root them past the callee's lifetime and diverge intern ids across
-        // modes. Abort cleanly; the static caller keeps running tier-0.
-        if (cp.dynamic) return self.abort(.dynamic_proto);
+        // Loaded (`load`/`require`) callees inline like static ones (doc 19): their
+        // proto constants are rooted VM-lifetime via `loaded_chunks` in both root
+        // walks, so a trace konst over them is always redundant — the H-2
+        // sole-root hazard that used to force an abort here is unreachable.
         // A vararg callee's extra-args frame cursor isn't modelled on the trace.
         if (cp.is_vararg) return self.abort(.cross_frame);
         if (self.rec.inline_depth >= MAX_INLINE_DEPTH) return self.abort(.too_deep);
