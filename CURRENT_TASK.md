@@ -1,5 +1,45 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-63) — **Doc 20 (patched trace entry, the BC_JFORL analogue) design APPROVED round 8 — awaiting Bart's go for implementation.**
+
+Bart ruled option C ("no point skipping it for a win we'll overwrite —
+design doc time"). `docs/design/20-patched-trace-entry.md` written and driven
+through eight codex gpt-5.6-sol review rounds (§R1–§R8 recorded in the doc;
+rounds 1–7 REVISE with 9 BLOCKER + 8 MAJOR + 6 MINOR total, all folded;
+round 8 APPROVE with one §T10 wording MINOR, folded). The design that
+survived review:
+
+- **Copy-on-patch VM-local code images** — canonical `Proto.code` immutable
+  forever; only the dispatch fetch reads the image (`image orelse
+  proto.code` at frame entry + `image_gen: u64` re-resolution in the
+  back-edge epilogue); recorder/predicates/visualiser/keyframes read
+  canonical by construction. Images epoch-stable (freed only at
+  beginTopLevelEpoch depth==0 / deinit).
+- **`.jfor_loop`** opcode over qualified anchors; `.b` = slot index into a
+  stable-address free-list registry (tombstones, publish = opcode write,
+  `trace_id` + `Trace.entry_slot` back-ref so retirement never dangles —
+  drain resolves `traceById`, null = dropped).
+- **`enterSelectedTrace`** (Phase 0a): today's whole trial-walk
+  body factored into one directive-returning routine; ONE caller-owned
+  epilogue drains the ENTIRE pending set before acting on any directive
+  (covers the 2879/3052 early `continue :outer` exits). Patched entry skips
+  exactly the discovery/selection prefix, nothing else.
+- **Entry-patch state machine** per trace: eligible/pending/bound/
+  suppressed_incumbent/suppressed_capacity/suppressed_permanent; funnel
+  marks only (tag-inspection `native == .compiled`, never nativeFor);
+  drain revalidates (same-receipt gate can condemn the marked anchor) then
+  installs, unpatches-before-installs, one-live-slot-per-pc, lowest-id tie
+  break. Every unpatch drains same-turn (strike exhaustion converts to a
+  post-return mark; loop-exit never revisits the back-edge block —
+  pc <= cur_pc guard). Arm ordering: inspect held slot pre-drain → drain →
+  never touch pointer again (ABA).
+- Bypass = runFastPath `.full` set + coverage (live field reads); §P gates
+  (P.1 fft ≤360ms, P.2 board ≤3%, P.0 refactor-neutral); §T1–T18.
+
+Phases 0a (factor) / 0b (inert substrate) / 1 (flip) / 2 (measure) /
+3 (.jloop while/repeat) in the doc's Outstanding checklist. NOT started —
+next step is Bart's go.
+
 ## Status 2026-08-14 (LATEST-62) — **fft arc: float-key narrowing landed (318fa0d); nest-coverage hole grounded to min_trip_entry — awaiting Bart's pick.**
 
 Lever A landed: `keyRefNarrowed` (guard_float + int_of_float, mirror of
