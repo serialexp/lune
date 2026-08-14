@@ -2535,6 +2535,12 @@ pub const TraceState = struct {
     /// round-trip that a patched transition or freeze could eliminate.
     dbg_burst_len_hist: [irinterp.LEDGER_CAP + 1]u64 = @splat(0),
     dbg_burst_terminals: std.AutoHashMapUnmanaged(DbgTerminalKey, u64) = .empty,
+    /// B-3c telemetry: composition of silent-burst SUFFIX ledgers — every
+    /// materialized row a burst still produced despite live promotion, keyed
+    /// like the terminals. These rows are what end bursts (ledger-full) and
+    /// what the suffix replay walks, so they are the remaining seam feedstock:
+    /// any hot key here is a candidate for a further promoted cycle.
+    dbg_silent_suffix_rows: std.AutoHashMapUnmanaged(DbgTerminalKey, u64) = .empty,
     /// B-3a seam gate input: every replay row is partitioned by whether its physical
     /// armed edge belongs to any bridge-free closed directed subcycle.
     dbg_patchable_cycle_rows: u64 = 0,
@@ -2814,6 +2820,23 @@ pub const TraceState = struct {
         }
     }
 
+    /// B-3c: aggregate a silent burst's suffix-ledger rows (jitdbg builds only).
+    pub fn dbgNoteSuffixLedger(self: *TraceState, entries: []const irinterp.LedgerEntry) void {
+        if (comptime jitdbg.enabled) {
+            if (!self.config.debug_log) return;
+            for (entries) |row| {
+                const gop = self.dbg_silent_suffix_rows.getOrPut(self.gpa, .{
+                    .trace_id = row.id,
+                    .exit_instr = row.exit,
+                    .kind = row.kind,
+                    .outcome = row.outcome,
+                }) catch return; // telemetry: drop on OOM, never fail the drain
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += 1;
+            }
+        }
+    }
+
     fn armedEdgeInBridgeFreeCycle(self: *const TraceState, parent: *const Trace, exit_instr: u32) bool {
         var first_child: ?*Trace = null;
         for (self.armed_links.items) |link| {
@@ -2911,6 +2934,14 @@ pub const TraceState = struct {
                     @tagName(k.outcome), e.value_ptr.*,
                 });
             }
+            var sit = self.dbg_silent_suffix_rows.iterator();
+            while (sit.next()) |e| {
+                const k = e.key_ptr.*;
+                jitdbg.log("  suffix-row t={d} ei={d} kind={s} outcome={s}: {d}", .{
+                    k.trace_id,          k.exit_instr,  @tagName(k.kind),
+                    @tagName(k.outcome), e.value_ptr.*,
+                });
+            }
         }
     }
 
@@ -2952,6 +2983,7 @@ pub const TraceState = struct {
         if (self.pending_demote.items.len != 0)
             @panic("TraceState.deinit: promotion demotion deferred during teardown");
         self.dbg_burst_terminals.deinit(self.gpa);
+        self.dbg_silent_suffix_rows.deinit(self.gpa);
         self.counters.deinit(self.gpa);
         self.gate.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
@@ -5538,6 +5570,7 @@ pub const TraceState = struct {
                 self.ledger_scratch[0..result.ledger_len],
                 @intCast(result.silent_cum),
             );
+            self.dbgNoteSuffixLedger(self.ledger_scratch[0..result.ledger_len]);
             self.silent_suffix_drains +|= 1;
             var suffix_init = SuffixInit{
                 .cont = last_edge.parent,
@@ -9163,6 +9196,28 @@ pub const TraceState = struct {
             id,
         );
         self.silent_promotions +|= 1;
+        if (comptime jitdbg.enabled) {
+            if (self.config.debug_log) {
+                jitdbg.log("silent-promote: cycle={d} region={d} len={d}", .{
+                    id, region_key.region_id, owned_edges.len,
+                });
+                for (owned_edges, 0..) |edge, i| {
+                    jitdbg.log("  edge[{d}]: {s}:{d} t={d} ei={d} kind={s} arm={s} -> {s}:{d} t={d} resume={d}", .{
+                        i,
+                        edge.parent.anchor.proto.name,
+                        edge.parent.anchor.pc,
+                        edge.parent.id,
+                        edge.exit,
+                        @tagName(edge.kind),
+                        @tagName(edge.arm_kind),
+                        edge.child.anchor.proto.name,
+                        edge.child.anchor.pc,
+                        edge.child.id,
+                        edge.resume_pc,
+                    });
+                }
+            }
+        }
     }
 
     fn resetPromotionCandidate(self: *TraceState) void {

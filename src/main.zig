@@ -77,6 +77,11 @@ const usage =
     \\                       for side-trace recording (default 50).  When a specific
     \\                       guard fails this many times, the next back-edge records
     \\                       a side trace capturing the alternate path.
+    \\  --trace-silent-budget <N>  imply --trace and override the promoted-cycle
+    \\                       silent-transition budget (default 4096): the maximum
+    \\                       trace-to-trace transitions one native call executes
+    \\                       before the silent drain regains control. Tiering
+    \\                       heuristic only — never affects program output.
     \\  --emit-traces <file> imply --trace and serialize the recorded trace cache
     \\                       to <file> (binschema wire format) after the run.
     \\  --emit-keyframe <file>
@@ -136,6 +141,9 @@ const TraceOpts = struct {
     /// recording (default 50).  When a specific guard fails this many times, the
     /// next back-edge records a side trace.
     hotguard: ?u32 = null,
+    /// `--trace-silent-budget <N>`: override the promoted-cycle silent-transition
+    /// budget (default 4096). B-3c sweep knob; tiering heuristic, never output.
+    silent_budget: ?usize = null,
     /// `--dump-aborts`: imply `--trace`, record every abandoned recording into the
     /// abort log (`config.record_aborts`), and print the aggregated table to stderr
     /// after the run — which loop dies on which opcode/reason, and how far it got.
@@ -223,6 +231,16 @@ pub fn main(init: std.process.Init) u8 {
             };
             topts.hotguard = std.fmt.parseUnsigned(u32, val, 10) catch {
                 lune.io.eprint("lune: error: --trace-hotguard requires a numeric argument, got '{s}'\n", .{val});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--trace-silent-budget")) {
+            topts.enabled = true;
+            const val = it.next() orelse {
+                lune.io.eprint("lune: error: --trace-silent-budget requires a numeric argument\n", .{});
+                return 2;
+            };
+            topts.silent_budget = std.fmt.parseUnsigned(usize, val, 10) catch {
+                lune.io.eprint("lune: error: --trace-silent-budget requires a numeric argument, got '{s}'\n", .{val});
                 return 2;
             };
         } else if (std.mem.eql(u8, arg, "--emit-traces")) {
@@ -321,6 +339,7 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     vm.trace.config.debug_log = topts.jit_debug;
     vm.trace.config.coverage = topts.coverage;
     if (topts.hotguard) |v| vm.trace.config.hotguard = v;
+    if (topts.silent_budget) |v| vm.trace.config.silent_budget = v;
     // The source backs located error messages: `error(msg, level)` prefixes
     // `chunk:line:` and `synthErrorValue`/`describeFault` read spans against it.
     // Set unconditionally so a fault anywhere has a real location, not `""`.
