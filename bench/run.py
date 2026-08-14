@@ -9,7 +9,8 @@ against LuaJIT, and reports two things at once:
   * correctness — do all of lune's tiers agree byte-for-byte (the determinism
     property), and does lune match LuaJIT where parity is claimed; and
   * how far behind LuaJIT we are — best-of-N wall-clock per engine plus the
-    lune/LuaJIT slowdown ratio.
+    lune/LuaJIT slowdown ratio, and peak memory (kernel max RSS) per engine
+    from dedicated non-timed runs.
 
 Each run also appends a row-per-program TSV under bench/results/ (timestamped +
 git-rev stamped) so the suite accumulates a history.
@@ -46,6 +47,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -145,6 +147,42 @@ def time_best(cmd, reps, cwd=None):
     return best
 
 
+TIME_BIN = "/usr/bin/time"  # GNU time; `%M` = child peak RSS in KB
+
+
+def mem_best(cmd, reps, cwd=None):
+    """Best-of-N (min) peak RSS in KB via a GNU `/usr/bin/time -f %M` trampoline
+    — engine-agnostic, so lune and LuaJIT are measured identically. These are
+    dedicated runs, deliberately separate from the timing reps: memory numbers
+    never come from a timed process and vice versa.
+
+    Why the trampoline instead of os.wait4/posix_spawn on a direct child: a
+    child forked (or vforked) from this Python process briefly shares Python's
+    ~12 MB address space before exec, which floors its ru_maxrss at the parent's
+    RSS and makes every engine "cost" 12 MB. `time` execs first (tiny RSS) and
+    only then forks the benchmark, so its wait4 sees the true child peak.
+    `-o file` keeps the %M line out of the benchmark's own stderr. min-of-N
+    because peak RSS is near-deterministic and the rare upward excursions are
+    environment noise, same rationale as time_best. Returns None if GNU time is
+    unavailable or the output is unparseable."""
+    if not os.path.exists(TIME_BIN):
+        return None
+    best = None
+    for _ in range(reps):
+        tf = tempfile.NamedTemporaryFile(mode="r", suffix=".memrss", delete=False)
+        try:
+            subprocess.run([TIME_BIN, "-f", "%M", "-o", tf.name, "--", *cmd],
+                           capture_output=True, text=True, cwd=cwd)
+            line = tf.read().strip().splitlines()
+            kb = int(line[-1]) if line and line[-1].isdigit() else None
+        finally:
+            tf.close()
+            os.unlink(tf.name)
+        if kb is not None:
+            best = kb if best is None else min(best, kb)
+    return best
+
+
 def short(s, n=120):
     s = s.strip().replace("\n", " / ")
     return s if len(s) <= n else s[: n - 1] + "…"
@@ -163,6 +201,8 @@ def main():
     ap = argparse.ArgumentParser(description="lune benchmark-suite runner")
     ap.add_argument("--filter", default="", help="only run programs whose name contains this")
     ap.add_argument("--reps", type=int, default=5, help="best-of-N timing reps (default 5)")
+    ap.add_argument("--mem-reps", type=int, default=3,
+                    help="best-of-N dedicated memory (max-RSS) reps (default 3)")
     ap.add_argument("--scale", type=float, default=1.0, help="scale first integer arg")
     ap.add_argument("--lune", default=os.environ.get("LUNE", DEFAULT_LUNE))
     ap.add_argument("--luajit", default=os.environ.get("LUAJIT", DEFAULT_LUAJIT))
@@ -185,7 +225,8 @@ def main():
     print(f"luajit= {args.luajit if have_lj else '(disabled)'}")
     print(f"reps  = {args.reps}   scale = {args.scale}\n")
     hdr = (f"{'program':<16} {'cross':<7} {'luajit':<7} "
-           f"{'t0 ms':>9} {'jit ms':>9} {'lj ms':>9} {'jit/lj':>7} {'t0/lj':>7}")
+           f"{'t0 ms':>9} {'jit ms':>9} {'lj ms':>9} {'jit/lj':>7} {'t0/lj':>7} "
+           f"{'t0 MB':>7} {'jit MB':>7} {'lj MB':>7}")
     print(hdr)
     print("-" * len(hdr))
 
@@ -204,7 +245,8 @@ def main():
         if rc_bad:
             print(f"{b.name:<16} ERROR in {rc_bad[0]}: {rc_bad[1]}")
             rows.append(dict(name=b.name, cross="ERR", luajit="-", t0="", jit="", lj="",
-                             argv=" ".join(b.argv), execns_t0="", execns_jit=""))
+                             argv=" ".join(b.argv), execns_t0="", execns_jit="",
+                             mem_t0="", mem_jit="", mem_lj=""))
             continue
         cross_ok = outs["t0"] == outs["trace"] == outs["jit"]
 
@@ -229,12 +271,21 @@ def main():
         _, _, _, execns_t0 = run_once([args.lune, "--time", b.path, *b.argv], want_time=True, cwd=bench_dir)
         _, _, _, execns_jit = run_once([args.lune, "--time", "--jit-native", b.path, *b.argv], want_time=True, cwd=bench_dir)
 
+        # --- memory: dedicated (non-timed) runs, kernel max RSS per engine ---
+        mem_t0 = mem_best([args.lune, b.path, *b.argv], args.mem_reps, cwd=bench_dir)
+        mem_jit = mem_best([args.lune, "--jit-native", b.path, *b.argv], args.mem_reps, cwd=bench_dir)
+        mem_lj = None
+        if b.luajit == "compatible" and have_lj:
+            mem_lj = mem_best([args.luajit, b.lj_path(), *b.argv], args.mem_reps, cwd=bench_dir)
+
         jit_lj = f"{jit_ms / lj_ms:.1f}x" if lj_ms else "-"
         t0_lj = f"{t0_ms / lj_ms:.1f}x" if lj_ms else "-"
         cross_s = "ok" if cross_ok else "MISMATCH"
+        mb = lambda kb: f"{kb / 1024:.1f}" if kb is not None else "-"
         print(f"{b.name:<16} {cross_s:<7} {lj_status:<7} "
               f"{t0_ms:>9.1f} {jit_ms:>9.1f} "
-              f"{(f'{lj_ms:.1f}' if lj_ms else '-'):>9} {jit_lj:>7} {t0_lj:>7}")
+              f"{(f'{lj_ms:.1f}' if lj_ms else '-'):>9} {jit_lj:>7} {t0_lj:>7} "
+              f"{mb(mem_t0):>7} {mb(mem_jit):>7} {mb(mem_lj):>7}")
 
         rows.append(dict(
             name=b.name, cross=cross_s, luajit=lj_status,
@@ -242,6 +293,8 @@ def main():
             lj=(f"{lj_ms:.3f}" if lj_ms else ""),
             argv=" ".join(b.argv),
             execns_t0=(execns_t0 or ""), execns_jit=(execns_jit or ""),
+            mem_t0=mem_t0, mem_jit=mem_jit,
+            mem_lj=(mem_lj if mem_lj is not None else ""),
         ))
 
     # --- history TSV ---
@@ -251,7 +304,8 @@ def main():
         stamp = time.strftime("%Y%m%d-%H%M%S")
         path = os.path.join(ROOT, "bench", "results", f"{stamp}-{rev}.tsv")
         cols = ["program", "args", "luajit_mode", "cross", "luajit_match",
-                "lune_t0_ms", "lune_jit_ms", "luajit_ms", "lune_t0_execns", "lune_jit_execns"]
+                "lune_t0_ms", "lune_jit_ms", "luajit_ms", "lune_t0_execns", "lune_jit_execns",
+                "lune_t0_maxrss_kb", "lune_jit_maxrss_kb", "luajit_maxrss_kb"]
         with open(path, "w") as fh:
             fh.write(f"# lune bench suite  rev={rev}  stamp={stamp}  reps={args.reps}  scale={args.scale}\n")
             fh.write("\t".join(cols) + "\n")
@@ -259,6 +313,7 @@ def main():
                 fh.write("\t".join(str(x) for x in [
                     r["name"], r["argv"], "-", r["cross"], r["luajit"],
                     r["t0"], r["jit"], r["lj"], r["execns_t0"], r["execns_jit"],
+                    r["mem_t0"], r["mem_jit"], r["mem_lj"],
                 ]) + "\n")
         # latest.tsv mirror for easy diffing
         latest = os.path.join(ROOT, "bench", "results", "latest.tsv")

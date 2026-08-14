@@ -34,8 +34,8 @@ The runner exits non-zero if any program shows a correctness flag (cross-mode
 ### Reading the table
 
 ```
-program          cross   luajit      t0 ms    jit ms     lj ms  jit/lj   t0/lj
-str_format       ok      ok          521.8     523.5      28.8   18.2x   18.1x
+program          cross   luajit      t0 ms    jit ms     lj ms  jit/lj   t0/lj   t0 MB  jit MB   lj MB
+str_format       ok      ok          521.8     523.5      28.8   18.2x   18.1x     3.4     3.6     1.9
 ```
 
 | column   | meaning |
@@ -47,6 +47,7 @@ str_format       ok      ok          521.8     523.5      28.8   18.2x   18.1x
 | `lj ms`  | LuaJIT best-of-N wall time |
 | `jit/lj` | how many× slower lune's native tier is than LuaJIT |
 | `t0/lj`  | how many× slower lune's interpreter is than LuaJIT |
+| `t0 MB` / `jit MB` / `lj MB` | peak memory (kernel max RSS) per engine, best-of-N from **dedicated non-timed runs** (`--mem-reps`, default 3) — measured identically for lune and LuaJIT via per-child `rusage`, so the columns are directly comparable. Whole-process peak: includes code, stacks, allocator slack, and JIT pages, not just the Lua heap. For lune-internal exact heap-byte inspection use the CLI's `--mem-stats` flag instead; that never feeds the harness. |
 
 `jit ms ≈ t0 ms` on a stdlib-heavy program is expected and informative: the loop
 is dominated by native-call dispatch, which the tracing JIT does not accelerate
@@ -140,3 +141,7 @@ Each run appends a timestamped, git-rev-stamped TSV under `bench/results/`
 history. `bench/results/latest.tsv` is a volatile mirror of the most recent run
 and is git-ignored. Timings are machine- and load-dependent; compare ratios and
 trends, not absolute milliseconds across machines.
+
+Since 2026-08 each row also carries `lune_t0_maxrss_kb`, `lune_jit_maxrss_kb`,
+and `luajit_maxrss_kb` (peak RSS in KB, see "Reading the table" above). Older
+TSVs simply lack the columns.
