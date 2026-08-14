@@ -1,7 +1,19 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
 Status: **all eight §A8 steps are landed as of 2026-08-12** — step 8 (A-viii, outer-cycle disarm coverage) closed the sequence: the outer cycle is pinned as a *simultaneously* armed closed cycle (`native_link_peak >= 3`; nsieve 4) that fires, an open observation window is pinned to contain it (nothing arms, output-transparent, still dispatcher-mediated native entries per R2-4), the **mid-epoch** transition is driven end-to-end through a host-installed native (which measures a live 3-link multi-kind cycle at the window-open instant, its complete teardown, and continued dispatcher-mediated trace entries afterward), and `disarmAllLinks` is pinned exhaustive over all four production edge kinds incl. `.loop_done_linked` and `.region_bridge`. A-viii's first landing was corrected over two codex review rounds — the "mid-epoch window is host-unreachable" claim (false: natives receive the `*Vm`), a fictional unit topology (now four kinds on genuinely distinct physical slot shapes, all armed through `armNativeLink`), an unsound cross-run `entries` comparison, and `entries` being the wrong counter for R2-4 at all (new `native_entries`, bumped only when the dispatcher commits to a native body) — see §A8-iv. One residual, tracked as its own Outstanding bullet: no test observes a live `.region_bridge` link at a window-open instant, since any probe placement that leaves the bridge armed leaves the registry empty at the call — not achieved in this workload, not shown impossible. Earlier: **§A8 step 7 (A-vii, the edge-4 FLIP) COMPLETE 2026-08-12**: landed (A-vii-c/c.1 gate consumption, A-vii-d/d.1 arming + successor overlay + receipt-sited two-phase arm + codex-blocker fix fcee9b7), reviewed (codex BLOCKER→fix→APPROVE), and measured per the frozen A-vii-e protocol — which surfaced and fixed a 2× per-instruction observer overhead (A-vii-e.1 `ObserverFast` bitset fast path; the raw flip regressed nsieve ~2× with the observer scan at 49% of runtime, the bridge itself measured cost-neutral by ablation). Final vs pre-flip: nsieve N=9 −9%, N=7 −6%, nsieve:24 coverage 56.7%→94.9% traced, six-workload output identity + bit-identical stats counters. Remaining in §A8: step 8 (A-viii disarm coverage), then the native in-page handoff (§A2.4) to convert the coverage gain to wall-clock.
-Last updated: 2026-08-14 (**B-3d.1 funnel hygiene LANDED (63dd733): R6
+Last updated: 2026-08-14 (**B-3d.2+.3 set candidacy + measured drain LANDED
+MERGED (e56252f): the promoted unit is now the frozen region's canonical
+armed-edge SET (`PromotedCycle`→`PromotedSet`, D1 region-total candidacy with
+ledger-as-evidence, D3/D4 measurement-resolved sibling return + terminal,
+R1 one-set-per-region with `membership_growth` demote-and-regrow at the arm
+funnel, R7 shared `edgeMemberOfRegion` predicate). Merged because B-3d.2
+alone panics the old ring-successor drain asserts on the first set-shaped
+promotion — see the landing-plan bullet in §B3.18. Gates PASS both builds
+(871 tests), seven hashes + three repros, promotion ON and OFF. The seam
+thesis measured true: nsieve suffix drains 3411 → 13, steering seam 30.6% →
+5.7% of run, wall 72.2 → 53.4 ms (−26%). Next: B-3d.4 frozen measurement
+(budget re-sweep, full board, both states). Earlier: B-3d.1 funnel hygiene
+LANDED (63dd733): R6
 identical-re-arm short-circuit at the `armNativeLink` funnel (target compare
 load-bearing, `.sibling_handoff` excluded for latch balance) + R2
 demote-on-unfreeze in `flushRegionWindow` (`DemotionReason.unfreeze`). Gates
@@ -4604,6 +4616,34 @@ seven hashes + three repros ON/OFF):**
   semantics), D4 measured terminal assert replacing the ring-successor
   assert, R5 comment-asserts; unit-test migration per R5(e)+R6 (set-shaped
   replacements for the ring fixtures, never deletions).
+  **B-3d.2+.3 LANDED MERGED (e56252f, 2026-08-14).** The split above is
+  unlandable as written: the first set-shaped promotion panics
+  `driveSilentBurst`'s ring-successor assert and
+  `computeSiblingReturnDistances`' revolution proof, so B-3d.2 alone
+  crashes the nsieve hashgate. Grammar change and measured drain are one
+  coherent change; landed as such with the full gate battery (871 unit
+  tests both builds, seven hashes + three repros ON and OFF).
+  Implementation notes vs the design text: (a) the shared membership
+  predicate is `edgeMemberOfRegion(edge, region_id, require_bridge_stamp)`
+  — candidacy and `promoteSet` re-validation pass strict stamp, the
+  `membership_growth` trigger passes `false` because it runs at
+  `armNativeLink` *before* `tryArmRegionBridge` restamps (wider is safe:
+  worst case an extra demote-and-regrow); (b) the `already_owned` reject
+  is retired, not kept — owned edges are silently excluded from the
+  candidate so re-observation surfaces as `open_chain`, and `region_owned`
+  is counted at the `considerSilentPromotion` catch. New unit coverage:
+  set candidacy accept/reject matrix, repeated-parent measured-terminal
+  pins (R3 self-edge, R4 suffix arrival), and a 4-edge repeated-parent
+  set (P with two armable exits) promoted from partial evidence
+  (zero-evidence edges included per R5(c)) then drained from an
+  out-of-order rowless burst image that ring arithmetic cannot name.
+  Telemetry (nsieve N=7 dbg): promoted units become set-shaped (lens
+  6/7/8 vs 2-edge rings), suffix drains **3411 → 13**, bursts 3557 → 187
+  (~19× longer each), silent transitions 612900 → 721685 (+17.7%);
+  `growth=0` on this suite (regrowth happens via unfreeze/trace
+  demotions). nsieve 9 release: steering seam **30.6% → 5.7%** of run,
+  replayLedger walks 12,427 → 780, wall 72.2ms → 53.4ms (−26%), native
+  execution 57.2% → 73.8%.
 - **B-3d.4 — measurement per the frozen protocol.** Re-profile nsieve
   (predicted: suffix drains collapse toward exhaustion count, seam 30.6% →
   single digits, tier-0-has-trace ~0), re-sweep `--trace-silent-budget`

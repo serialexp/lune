@@ -1,5 +1,70 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-54) — **B-3d.2+.3 LANDED MERGED (e56252f): set candidacy + measured drain. Next: B-3d.4 frozen measurement.**
+
+The core of B-3d, landed as ONE gated change. The plan's .2/.3 split proved
+unlandable: the first set-shaped promotion panics `driveSilentBurst`'s
+ring-successor assert and `computeSiblingReturnDistances`' revolution proof,
+so .2 alone crashes the nsieve hashgate. Grammar and drain moved together.
+
+What changed (src/trace.zig only, +693/−407):
+
+- **D1 candidacy** — `detectPromotableSet` (replaces `detectPhysicalCycle`):
+  candidate = every armed, patch-pointed (`promotedEdgeFromLink`), un-owned,
+  region-member edge at the observation instant, insertion-sorted by
+  (parent id, exit); the forced-yield ledger is validated as *evidence*
+  (kind-exact via `rowPatchKind`, per-adjacent-pair child match, final row
+  exempt) but no longer defines the unit — zero-evidence member edges
+  promote on registry proof (R5(c)).
+- **D2 storage** — `PromotedCycle`→`PromotedSet` (mechanical sweep via
+  /tmp/b3d2_rename.py, 124 word-boundary hits); `sibling_return_distance`
+  deleted along with `computeSiblingReturnDistances`.
+- **D3 measurement** — `silentSiblingEvidence` is now a method: sibling
+  `returned_to_parent` := a strictly-later firing of any live cell with the
+  same parent id (R3: a self-edge's own firing does NOT count), OR a suffix
+  row with `row.id == parent id` (R4: arrival ownership is `row.id`).
+- **D4 terminal** — `driveSilentBurst` resolves entry/terminal cells by
+  measured ordinals; ring-successor assert replaced by a terminal assert
+  (`last_set` cell owns `silent_transitions`) that runs BEFORE the summary
+  mailbox clear; R5(a)/(b) comment-asserts at the expansion loop and the
+  two-phase drain boundary.
+- **R1 one-set-per-region** — `promoteSet` rejects
+  `error.PromotionRegionOwned` (counter `region_owned`; the dead
+  `already_owned` reject retired — owned edges are excluded from candidacy
+  and surface as `open_chain`); arming a NEW armable member edge of an
+  owning region demotes via `DemotionReason.membership_growth` at the
+  `armNativeLink` funnel (`noteMembershipGrowth`, both re-arm and fresh-arm
+  paths, after successful arm only).
+- **R7 shared predicate** — `edgeMemberOfRegion(edge, region_id,
+  require_bridge_stamp)` used by candidacy (strict), promoteSet
+  re-validation (strict), and the growth trigger (stamp=false: it runs
+  before `tryArmRegionBridge`'s restamp; wider is safe — worst case an
+  extra demote-and-regrow).
+- **Tests migrated set-shaped, never deleted** (871 green): candidacy
+  accept/reject matrix (rotation-independence, footprint shrink, foreign
+  region, non-member rows, kind mismatch, adjacent-pair break, over-cap,
+  region-owned), repeated-parent measured-terminal pins (R3/R4), M1 test
+  now also pins `membership_growth` firing on a sibling publish over a live
+  set, and a NEW 4-edge repeated-parent set (parent with two armable exits
+  — the shape ring grammar structurally cannot promote) promoted from
+  partial evidence then drained from an out-of-order rowless burst image,
+  resume contract from the measured terminal.
+
+Gates: `just test` green both builds; hashgate seven hashes + three repros
+PASS, promotion ON and OFF (default flip/restore). Telemetry (nsieve N=7,
+dbg): promoted units become set-shaped (lens 6/7/8 vs 2-edge rings),
+**suffix drains 3411 → 13**, bursts 3557 → 187 (~19× longer each),
+transitions 612900 → 721685 (+17.7%), budget exhaustions 146 → 174,
+`growth=0` on this suite (regrowth via unfreeze/trace demotions).
+nsieve 9 release: **steering seam 30.6% → 5.7% of run**, replayLedger
+walks 12,427 → 780, wall 72.2 → 53.4 ms (−26%), native execution 57.2% →
+73.8%. The B-3d seam thesis measured true.
+
+Remaining: **B-3d.4** frozen measurement (budget re-sweep now that bursts
+end mainly by budget, full `just bench` board, both promotion states,
+telemetry sanity, doc records). Owed: codex `gpt-5.6-sol` review of the
+whole B-3d design+implementation when quota returns 2026-08-20.
+
 ## Status 2026-08-14 (LATEST-53) — **B-3d.1 funnel hygiene LANDED (63dd733). Next: B-3d.2 (set candidacy + promotion).**
 
 First gated sub-step of the accepted B-3d landing plan (doc §B3.18):
