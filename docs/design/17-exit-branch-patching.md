@@ -1,7 +1,22 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
 Status: **all eight §A8 steps are landed as of 2026-08-12** — step 8 (A-viii, outer-cycle disarm coverage) closed the sequence: the outer cycle is pinned as a *simultaneously* armed closed cycle (`native_link_peak >= 3`; nsieve 4) that fires, an open observation window is pinned to contain it (nothing arms, output-transparent, still dispatcher-mediated native entries per R2-4), the **mid-epoch** transition is driven end-to-end through a host-installed native (which measures a live 3-link multi-kind cycle at the window-open instant, its complete teardown, and continued dispatcher-mediated trace entries afterward), and `disarmAllLinks` is pinned exhaustive over all four production edge kinds incl. `.loop_done_linked` and `.region_bridge`. A-viii's first landing was corrected over two codex review rounds — the "mid-epoch window is host-unreachable" claim (false: natives receive the `*Vm`), a fictional unit topology (now four kinds on genuinely distinct physical slot shapes, all armed through `armNativeLink`), an unsound cross-run `entries` comparison, and `entries` being the wrong counter for R2-4 at all (new `native_entries`, bumped only when the dispatcher commits to a native body) — see §A8-iv. One residual, tracked as its own Outstanding bullet: no test observes a live `.region_bridge` link at a window-open instant, since any probe placement that leaves the bridge armed leaves the registry empty at the call — not achieved in this workload, not shown impossible. Earlier: **§A8 step 7 (A-vii, the edge-4 FLIP) COMPLETE 2026-08-12**: landed (A-vii-c/c.1 gate consumption, A-vii-d/d.1 arming + successor overlay + receipt-sited two-phase arm + codex-blocker fix fcee9b7), reviewed (codex BLOCKER→fix→APPROVE), and measured per the frozen A-vii-e protocol — which surfaced and fixed a 2× per-instruction observer overhead (A-vii-e.1 `ObserverFast` bitset fast path; the raw flip regressed nsieve ~2× with the observer scan at 49% of runtime, the bridge itself measured cost-neutral by ablation). Final vs pre-flip: nsieve N=9 −9%, N=7 −6%, nsieve:24 coverage 56.7%→94.9% traced, six-workload output identity + bit-identical stats counters. Remaining in §A8: step 8 (A-viii disarm coverage), then the native in-page handoff (§A2.4) to convert the coverage gain to wall-clock.
-Last updated: 2026-08-14 (**Part B-3 is LANDED — B-3a substrate 2026-08-13,
+Last updated: 2026-08-14 (**B-3c is DONE (§B3.15, commit 2f3c929) — verdict:
+the budget is a ~1% lever, and the remaining seam is the NON-RING sibling
+automaton.** The `silent_iters` sweep + re-profile prescribed by the accepted
+plan ran: 534 exhaustions ≈ 4% of ~12.9k drains; the other ~12.4k are
+ledger-full suffix drains fed by the nsieve:14 sibling triangle
+(t3.ei12/t4.ei18/t5.ei14), whose data-dependent firing order exact-ring
+promotion structurally cannot capture. Each drain costs ~10k cyc (suffix walk
++ one tier-0 re-entry iteration — the 30.6% seam and the 9.0%
+tier-0-has-trace buckets are the same phenomenon, ~40% of the run). The
+nsieve:14 `trc-c/it 18.9` is this seam billed to the first replayed hop, not
+heavy codegen (its IR is ~10 tight ops; ~7.7 cyc/it native after subtracting
+the seam). Default budget stays 4096. The identified next general lever is
+B-3d set-promotion (promote the frozen region's armed-edge SET, not exact
+rings) — design-first, not yet mandated. Remaining in this arc: B-3d (if
+mandated), B-4 trace-quality probation.
+Earlier: **Part B-3 LANDED — B-3a substrate 2026-08-13,
 B-3b flip + bridge promotion 2026-08-14, commit 8942ef6; see §B3.14 for the
 landing record and the six adversarial audit rounds.** The seam that motivated
 Part B is closed: replay rows at nsieve 9 fell 2,547,824 → 394,179, native
@@ -9,7 +24,6 @@ Part B is closed: replay rows at nsieve 9 fell 2,547,824 → 394,179, native
 1.9×) and **sieve_int 1.0×** (was 1.5×). Round 6 corrected §B3.13(5): burst
 endpoints are now MEASURED per-cell, not reconstructed by round-robin phase
 arithmetic that a repeated-parent ring or a second live cycle would violate.
-Remaining in this arc: B-3c budget tune, then B-4 trace-quality probation.
 Earlier: **Part B-3 design ACCEPTED after five codex
 review rounds (§B3.6–§B3.13).** The round-1 draft's three load-bearing
 mistakes — a single shared patch tail (four exit kinds have different
@@ -2973,11 +2987,18 @@ trampoline_exit).
   driver safe point; bulk region credit + per-member accountTraceRun rule +
   verdict exemption; the full gate suite (ten-leg matrix, seven hashes,
   aviii/floatlink, nsieve-bit watch) + measurement per frozen protocol.
-- **B-3c — budget tune + spillover.** `silent_iters` sweep (1k/4k/16k) on
+- **B-3c — budget tune + spillover. DONE 2026-08-14 (§B3.15, commit
+  2f3c929).** `silent_iters` sweep (1k/4k/16k) on
   nsieve{3,7,9}/sieve_int/nsieve-bit; then re-profile: if the native
   micro-cost (append gone, one compare) and walk count both collapsed as
   predicted, the remaining gap vs LuaJIT is native codegen quality —
-  a different arc.
+  a different arc. *Outcome: the prediction's premise failed in an
+  informative way — walk count does NOT collapse with the budget (534 of
+  ~12.9k drains are exhaustions; ~1% wall-clock). The drains are ledger-full
+  suffix drains from the non-ring sibling automaton, and the remaining gap
+  is promotion-model expressiveness (→ B-3d set-promotion), not codegen
+  quality: the nsieve:14 IR is tight, ~7.7 cyc/it native after seam
+  subtraction.*
 
 Open questions for review: (1) silent-tail layout — second entry into the
 shared flush vs duplicated flush; (2) whether budget staging belongs in
@@ -4112,6 +4133,58 @@ iteration. Closing edge 4 removes that single re-entry and the outer loop self-s
 natively to the `LEDGER_CAP` cap. **But** edge 4 cannot simply reuse the ordinary-guard
 slot path, because the shared `deopt_exit` flush commits the *wrong values* for it (A.1.2)
 — which is the coherence blocker, now grounded to IR indices.
+
+##### B3.15 — B-3c budget sweep + nsieve:14 investigation (2026-08-14, commit 2f3c929): the budget is a ~1% lever; the seam feedstock is the non-ring sibling automaton
+
+B-3c ran per the accepted plan (sweep + re-profile) and answered its own
+question in the negative: the `silent_budget` knob is NOT where the remaining
+seam lives. Landed artifacts: a `--trace-silent-budget <N>` CLI override
+(`--trace-hotguard` pattern; output verified byte-identical at N=1, 1024,
+2^32, and default) and two permanent jitdbg probes — `silent-promote` (each
+promoted cycle's full edge list) and `suffix-row` (aggregate composition of
+every suffix ledger a burst still materializes despite live promotion).
+
+**Sweep result.** At nsieve N=9 the 534 budget exhaustions are only ~4% of the
+~12.9k drains; unbounding the budget (2^32) removes exactly them and moves
+wall-clock by ~1% (57.34 → 56.73 ms interleaved min-of-55, whole-run CLI
+timing). Walk count barely moves: 12,960 → 12,427. The other ~12.4k drains are
+**ledger-full suffix drains** — 32 materialized rows accumulated while a
+promoted cycle was live. Default stays 4096 (bounds drain latency, costs ~1%).
+
+**What the suffix rows are (the probes, nsieve N=7).** The scan loop
+`nsieve:14` is fragmented into three sibling traces t3/t4/t5 joined by
+`sibling_handoff` deopt edges. The four promotions cover two ring shapes: the
+5-ring `clear:24 →loopdone→ cont:29 →bridge→ scan(t4) →t3 →t4 →link→ clear:24`
+and (once, region 1 only) the sibling triangle `t3.ei12 → t4.ei18 → t5.ei14`.
+At steady state the suffix ledgers consist of exactly the triangle edges NOT
+owned by the live 5-ring: t3.ei12 ≈ 34.0k, t4.ei18 ≈ 37.4k, t5.ei14 ≈ 37.4k
+rows. The counts are UNEQUAL — the sibling automaton's firing sequence is
+data-dependent (prime gaps select which handoff fires next), i.e. it is **not
+a fixed ring**, so `detectPhysicalCycle`'s exact-repeat-over-32-rows grammar
+can structurally never capture it. This is not a tuning gap; it is the
+promotion model's expressiveness limit.
+
+**Full drain cost (closes the nsieve:14 question too).** Each drain pays the
+suffix walk (~7.8k cyc at N=9) PLUS one tier-0 re-entry iteration before the
+dispatcher re-commits to native: `tier-0, has-trace` = 12,468 iterations ≈
+the drain count exactly, at ~2.3k cyc each. Total ≈ 10k cyc × 12.4k drains ≈
+125M of a 317M-cycle run — **the seam (30.6%) and the tier-0-has-trace bucket
+(9.0%) are the same phenomenon**. The per-anchor `nsieve:14 trc-c/it = 18.9`
+is this seam billed to the first replayed hop, not heavy codegen: the
+composite-spin sibling's IR is ~10 tight ops (guard_table/aref/aload/
+guard_false/add/le/loop), and subtracting the seam leaves ~7.7 cyc/it native.
+
+**Consequence — the next general lever (B-3d, not yet mandated).** Round 6
+already replaced ring-arithmetic accounting with per-cell measurement
+(`firings`/`last_ordinal`/`silent_last_cell`), so the ring structure is now
+load-bearing only for (a) metadata/storage grouping, (b) sibling-evidence
+return distances, (c) the terminal-resume successor assert. Generalizing
+promotion from "exact ring" to "the frozen region's armed-edge SET" would let
+the sibling automaton run silent regardless of firing order and would convert
+~40% of the nsieve run into native time. That is a design arc (accounting
+equivalence for arbitrary interleavings, per-edge evidence without ring
+distances, terminal resume from `silent_last_cell` alone) and needs its own
+review rounds before any code.
 
 ##### A.1 — The edge-4 bridge (BLOCKER 1)
 

@@ -1,5 +1,44 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-51) — **B-3c DONE (commit 2f3c929, doc §B3.15): the budget is a ~1% lever; the real seam feedstock is the NON-RING sibling automaton → proposed B-3d set-promotion.**
+
+The prescribed sweep + re-profile ran and answered B-3c's own question in the
+negative. Landed: `--trace-silent-budget <N>` CLI override (output
+byte-identical at N=1/1024/2^32/default) + two permanent jitdbg probes
+(`silent-promote` edge lists, `suffix-row` suffix-ledger composition). Gates:
+`just test` green in normal and `-Djit-debug` builds; seven-hash + three-repro
+GATE PASS on ReleaseFast.
+
+Findings (all in doc 17 §B3.15):
+
+- **Budget: ~1%.** 534 exhaustions ≈ 4% of ~12.9k drains; unbounding removes
+  exactly them (walks 12,960 → 12,427; 57.34 → 56.73 ms interleaved
+  min-of-55 at nsieve 9). Default stays 4096. But note 534 × 4096 ≈ 99% of
+  all silent TRANSITIONS — the hot cycles always run to the cap; the other
+  12.3k bursts average ~1.5.
+- **What ends bursts: ledger-full suffix drains.** nsieve:14 is three sibling
+  traces t3/t4/t5 (sibling_handoff deopts). The live promotion covers the
+  5-ring clear→cont→t4→t3→t4→clear; the suffix rows are exactly the OTHER
+  triangle edges (t3.ei12 ≈34.0k, t4.ei18 ≈37.4k, t5.ei14 ≈37.4k at N=7).
+  Unequal counts ⇒ the firing order is data-dependent, NOT a fixed ring ⇒
+  `detectPhysicalCycle`'s exact-repeat grammar can structurally never promote
+  it. Expressiveness limit, not tuning.
+- **Drain cost ≈ 10k cyc each ≈ 40% of the run.** Suffix walk ~7.8k cyc PLUS
+  one tier-0 re-entry iteration ~2.3k cyc (`tier-0, has-trace` = 12,468 iters
+  ≈ drain count exactly). The 30.6% seam bucket and the 9.0% tier-0-has-trace
+  bucket are the same phenomenon.
+- **nsieve:14 "heavy codegen" (task #82) resolved: it isn't.** trc-c/it 18.9
+  is the seam billed to the first replayed hop; the composite-spin IR is ~10
+  tight ops, ~7.7 cyc/it native after seam subtraction.
+
+**Identified next general lever (NOT yet mandated): B-3d set-promotion** —
+promote the frozen region's armed-edge SET instead of exact rings. Round-6
+per-cell measurement (`firings`/`last_ordinal`/`silent_last_cell`) already
+de-ring-ified the accounting; the ring is still load-bearing for metadata
+grouping, sibling-evidence return distances, and the terminal-resume successor
+assert. Design-first with review rounds. Alternative smaller lever: cheapen
+the drain round-trip (skip the tier-0 re-entry iteration after a drain).
+
 ## Status 2026-08-14 (LATEST-50) — **B-3b LANDED: the seam is closed. nsieve 1.1× LuaJIT (was 1.9×), sieve_int 1.0× (was 1.5×). Commit 8942ef6.**
 
 Promoted cycles now transition trace→trace natively without appending ledger
