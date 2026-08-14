@@ -1999,6 +1999,11 @@ const PromotionDemotions = struct {
     slot_mutation: u64 = 0,
     trace_invalidation: u64 = 0,
     teardown: u64 = 0,
+    /// B-3d.1 (doc 17 §B3.17 R2): a low-yield window verdict unfroze the region's
+    /// accumulator, so its live promotion was demoted in the same act — patches
+    /// never outlive the frozen state that justified them, and the drain's
+    /// frozen-accumulator check stays a true invariant instead of a latent crash.
+    unfreeze: u64 = 0,
 };
 
 /// Part B-2a (doc 17 §B.5): the persistent logical relation between the
@@ -2916,12 +2921,13 @@ pub const TraceState = struct {
                 self.silent_rejects.cap,
                 self.silent_rejects.already_owned,
             });
-            jitdbg.log("  silent demotions: activation={d} region-close={d} slot={d} trace={d} teardown={d}", .{
+            jitdbg.log("  silent demotions: activation={d} region-close={d} slot={d} trace={d} teardown={d} unfreeze={d}", .{
                 self.silent_demotion_reasons.activation,
                 self.silent_demotion_reasons.region_close,
                 self.silent_demotion_reasons.slot_mutation,
                 self.silent_demotion_reasons.trace_invalidation,
                 self.silent_demotion_reasons.teardown,
+                self.silent_demotion_reasons.unfreeze,
             });
             for (self.dbg_burst_len_hist, 0..) |c, len| {
                 if (c != 0) jitdbg.log("  burst-len {d}: {d}", .{ len, c });
@@ -3499,6 +3505,16 @@ pub const TraceState = struct {
             accum.frozen = false;
             accum.useful_streak = 0;
         }
+        // B-3d.1 (doc 17 §B3.17 R2, both round-2 reviewers confirmed the hole):
+        // an unfreeze while this region owns a live promotion previously left the
+        // silent patches ARMED with their frozen precondition gone — the next
+        // same-region native call would fire a silent epilogue and the next drain
+        // would hit the frozen-accumulator release panic. Demote in the same act
+        // (queued mid-walk, immediate at depth 0 — this can fire per ledger row
+        // inside a walk, including from the drained burst's own barren-exhaustion
+        // path). Placed here rather than at any single caller so EVERY unfreeze
+        // entry point is covered.
+        self.demotePromotionsForRegionReason(key, .unfreeze);
         const gop = self.penalty.getOrPut(self.gpa, owner) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
@@ -3527,11 +3543,17 @@ pub const TraceState = struct {
     }
 
     fn demotePromotionsForRegion(self: *TraceState, key: RegionKey) void {
+        self.demotePromotionsForRegionReason(key, .region_close);
+    }
+
+    /// Backwards over `promoted_cycles` because `demoteCycleReason` swapRemoves at
+    /// depth 0 (mid-walk it queues instead) — forward iteration would skip entries.
+    fn demotePromotionsForRegionReason(self: *TraceState, key: RegionKey, reason: DemotionReason) void {
         var i = self.promoted_cycles.items.len;
         while (i > 0) {
             i -= 1;
             if (std.meta.eql(self.promoted_cycles.items[i].region_key, key))
-                self.demoteCycleReason(i, .region_close);
+                self.demoteCycleReason(i, reason);
         }
     }
 
@@ -6145,8 +6167,10 @@ pub const TraceState = struct {
                         // SAME `findLoopTrace` pick the hop top re-resolution uses, so
                         // the armed target is the sibling selection would choose; every
                         // shape/eligibility gate lives in the fail-closed helper. On a
-                        // forced yield the slot is already armed and the re-arm is an
-                        // in-place supersede, harmless (site-3 precedent).
+                        // forced yield the slot is already armed and the identical
+                        // re-arm SHORT-CIRCUITS at the `armNativeLink` funnel (B-3d.1
+                        // R6, doc 17 §B3.18): no slot mutation, and — decisive since
+                        // B-3b — no demotion of a promoted set that owns this exit.
                         if (self.findLoopTrace(proto, owner_inner_pc)) |inner_pick|
                             self.armLinkTerminal(owner, inner_pick, safe_to_arm);
                         resume_pc.* = owner_inner_pc;
@@ -6202,8 +6226,10 @@ pub const TraceState = struct {
                     if (is_last) {
                         // 2c-E site 3 (arming CONVERGENCE): a TERMINAL loop-done means
                         // this `I→C` edge was NOT fused — the slot is unarmed (or a
-                        // forced yield steered around it, in which case the re-arm is
-                        // an in-place supersede, harmless). Arm it now so the NEXT
+                        // forced yield steered around it, in which case the identical
+                        // re-arm SHORT-CIRCUITS at the `armNativeLink` funnel — B-3d.1
+                        // R6, doc 17 §B3.18: no slot mutation, no demotion of a
+                        // promoted set that owns this exit). Arm it now so the NEXT
                         // occurrence of this exit fuses; sibling inners reached only
                         // through replay thereby converge to armed without ever
                         // passing through a scalar arm site. Runs BEFORE the hop
@@ -9290,7 +9316,7 @@ pub const TraceState = struct {
         self.resetPromotionCandidate();
     }
 
-    const DemotionReason = enum { activation, region_close, slot_mutation, trace_invalidation, teardown };
+    const DemotionReason = enum { activation, region_close, slot_mutation, trace_invalidation, teardown, unfreeze };
     const PendingDemotion = struct { id: u32, reason: DemotionReason };
 
     fn queueDemote(self: *TraceState, id: u32, reason: DemotionReason) void {
@@ -9330,6 +9356,7 @@ pub const TraceState = struct {
             .slot_mutation => self.silent_demotion_reasons.slot_mutation +|= 1,
             .trace_invalidation => self.silent_demotion_reasons.trace_invalidation +|= 1,
             .teardown => self.silent_demotion_reasons.teardown +|= 1,
+            .unfreeze => self.silent_demotion_reasons.unfreeze +|= 1,
         }
         self.resetPromotionCandidate();
     }
@@ -9496,6 +9523,28 @@ pub const TraceState = struct {
         // it — the first match is the only match.
         for (self.armed_links.items) |*l| {
             if (l.parent == parent and l.slot_index == slot_index) {
+                // B-3d.1 R6 (doc 17 §B3.18, the convergent round-2 MAJOR): an
+                // IDENTICAL re-publication — same child, same kind, same slot
+                // target — is a no-op on the physical state and must not reach
+                // `prepareSlotMutation`, whose owned-exit demotion would tear a
+                // live promoted set down for a re-arm that changes nothing (the
+                // forced-yield `is_last` convergence arms re-publish exactly such
+                // relations). The target compare is load-bearing: a recompiled
+                // child has a NEW `ordinary_entry`, so its re-arm takes the full
+                // path below and correctly demotes. `.sibling_handoff` is
+                // EXCLUDED: `publishSiblingArm` increments the parent latch after
+                // every true return, balanced by `clearSiblingLatch` below —
+                // short-circuiting the clear would leak the latch +1 per
+                // identical republication (the codex post-landing blocker this
+                // branch's comment memorializes).
+                if (l.child == child and l.kind == kind and c.slots[slot_index] == target and
+                    kind != .sibling_handoff)
+                {
+                    self.dbg("arm (identical re-arm short-circuit): parent id={d} pc={d} slot={d} kind={s}", .{
+                        parent.id, parent.anchor.pc, slot_index, @tagName(kind),
+                    });
+                    return true;
+                }
                 // Convergence sites re-publish an identical relation on every
                 // terminal observation. Keep that from breaking the consecutive
                 // detection streak; a changed relation invalidates the candidate.
@@ -13767,6 +13816,13 @@ test "in-place re-arm releases the displaced sibling latch (sibling -> ordinary 
     // sibling republish over the ordinary record: back to 1.
     try testing.expect(state.publishSiblingArm(&parent, 0, &child));
     try testing.expectEqual(@as(u32, 1), parent.sibling_arms);
+    // B-3d.1 R6 (§B3.18): `.sibling_handoff` is EXCLUDED from the identical
+    // re-arm short-circuit precisely so this stays balanced — an IDENTICAL
+    // sibling republish must still route through the re-arm branch, whose
+    // clearSiblingLatch (-1) pairs with publishSiblingArm's +1. A
+    // short-circuited return would skip the clear and leak the latch to 2.
+    try testing.expect(state.publishSiblingArm(&parent, 0, &child));
+    try testing.expectEqual(@as(u32, 1), parent.sibling_arms);
     // physical disarm: back to 0, not underflowed.
     state.disarmLinkAt(0);
     try testing.expectEqual(@as(u32, 0), parent.sibling_arms);
@@ -15818,10 +15874,20 @@ test "B-3b.2 slot mutation and closeRegion demote before invalidation" {
     const key: RegionKey = .{ .region_id = @enumFromInt(3), .activation = 12 };
     try installB3PromotionRegion(&state, key, edges);
     try state.promoteCycle(edges, key);
+    // B-3d.1 R6 (§B3.18): an IDENTICAL re-arm — same child, kind, and slot
+    // target, exactly what the forced-yield convergence sites re-publish —
+    // short-circuits at the funnel and demotes NOTHING.
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expectEqual(@as(usize, 1), state.promoted_cycles.items.len);
+    for (edges) |edge| try expectB3Patched(edge, true);
+    // A CHANGED relation (different child) still demotes via prepareSlotMutation.
+    const c2 = try makeB3LinkTrace(gpa, &state, &proto, 3, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, c2, .link_terminal));
     try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
     for (edges) |edge| try expectB3Patched(edge, false);
 
+    // Restore the ring relation (changed again: c2 -> b) for the closeRegion leg.
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try state.promoteCycle(edges, key);
     try state.region_profit.put(gpa, key, .{ .root_frame_depth = 1, .root_call_seq = key.activation });
     state.closeRegion(key);
@@ -15891,6 +15957,58 @@ test "B-3b.2 replay walk queues demotion and applies it before pending disarms" 
     state.applyPendingDisarms();
     try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    for (edges) |edge| try expectB3Patched(edge, false);
+}
+
+test "B-3d.1 low-yield unfreeze demotes the region's promotion in the same act" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    var code: [4]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1707, .code = &code, .name = "b3d-unfreeze", .num_registers = 2 };
+    const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
+    const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
+    try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const observed = [_]irinterp.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+    };
+    const edges = state.detectPhysicalCycle(&observed).?;
+    defer gpa.free(edges);
+    const key: RegionKey = .{ .region_id = @enumFromInt(7), .activation = 40 };
+    try installB3PromotionRegion(&state, key, edges);
+    try state.promoteCycle(edges, key);
+    state.config.min_useful = 8;
+
+    // Depth 0: the low-yield verdict unfreezes AND demotes immediately —
+    // patches never outlive the frozen state that justified them (§B3.17 R2;
+    // pre-existing hole: the barren-exhaustion path could unfreeze with the
+    // patches live and panic the next drain on the frozen check).
+    state.flushRegionWindow(key, 1);
+    try testing.expect(!state.region_profit.get(key).?.frozen);
+    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(u64, 1), state.silent_demotion_reasons.unfreeze);
+    for (edges) |edge| try expectB3Patched(edge, false);
+
+    // Mid-walk: the same verdict QUEUES the demotion; the walk applies it at
+    // its exit, exactly like every other deferred demotion source.
+    {
+        const accum = state.region_profit.getPtr(key).?;
+        accum.frozen = true;
+        accum.useful_streak = state.config.freeze_windows;
+    }
+    try state.promoteCycle(edges, key);
+    state.replay_walk_depth = 1;
+    state.flushRegionWindow(key, 1);
+    try testing.expectEqual(@as(usize, 1), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 1), state.pending_demote.items.len);
+    state.replay_walk_depth = 0;
+    state.applyPendingDisarms();
+    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(u64, 2), state.silent_demotion_reasons.unfreeze);
     for (edges) |edge| try expectB3Patched(edge, false);
 }
 
