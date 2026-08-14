@@ -1,5 +1,57 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-56) — **B-4 REFRAMED, DESIGNED, LANDED (positional loop-done resolution); predictions failed on nsieve-bit; TRUE root cause found = B-5 (`idx < 1` recording abort).**
+
+Full arc in doc 17 §Part B-4 (§B4.1–§B4.8). The compressed story:
+
+1. **Original premise refuted by ablation.** B-4 was minted as "probation
+   for the nsieve-bit t=5 mega-trace". A maxrecord=100 ablation binary
+   (only t=5 aborts) is **+31.3% slower** — t=5 is the automaton's scan
+   segment (`.link -> 41`), net-profitable. The B-2b-era condemnation was
+   measured under `--jit-stats` accounting overhead (74.9 vs 36.0 ms).
+   Probation NOT built (Rule Z-6). §B4.1.
+2. **Reframed on measurement**: 27,554 `break_burst` events at the
+   terminal `.loop_done_linked` replay directive, which only consulted
+   `cursor.cont` and never looked up continuations positionally at
+   `post_pc`. Designed D1'–D4' (§B4.3/§B4.7): canonical selector
+   `resolveLoopDoneCont(proto, post_pc, regs_or_null)` over the P-G
+   predicate — ranking hit-count desc → lowest id, `.unsupported`
+   skip-not-shadow, canonical arm probe order (D4'), `regs` fingerprint
+   preference for the RUN target only (arm stays cache-pure).
+   Three codex `gpt-5.6-sol` rounds: REVISE (BLOCKER + 2 MAJOR) →
+   REVISE (new MAJOR = probe-order memoization hazard → D4') → ACCEPT.
+3. **Landed** (src/trace.zig): selector + `armLoopDoneLink` resolves
+   internally (`armLoopDoneLinkTo` keeps re-validation + arm) + terminal
+   positional fallback + `regs: ?RegWindow` threaded through
+   `replayLedgerFrom`/`replayLedger`/`replayLedgerSuffix`/
+   `driveSilentBurst`/`drainSilentResult` (/tmp/b4_thread_regs.py,
+   dry-run first). New unit test pins unsupported-skip, id tie-break,
+   arm-vs-run divergence, R6 no-re-arm, cleared-cache → break_burst.
+   Gates: `just test` both builds green; seven hashes + three repros PASS.
+4. **Measured: predictions 1–3 FAILED; wall NEUTRAL.** Still 27,554
+   terminal failures (now "no eligible continuation"); interleaved A/B
+   vs HEAD: nsieve-bit 36.9→36.7 ms (−0.4%), nsieve 9 50.3→50.7 ms
+   (+0.8%) — noise. A permanent jitdbg probe in the failure path proved
+   **zero traces anchored at post-PC 58 during all events** — the
+   mechanism is correct but had nothing to select. Landed anyway: it is
+   the general contract three reviewers accepted, neutral where it can't
+   fire, and removes avoidable break_bursts wherever a positional
+   continuation exists.
+5. **True root cause (open, doc 17 Outstanding bullet B-5).**
+   `--dump-aborts`: recorder aborts `.bad_type` at the `get_index`/
+   `set_index` bounds check `idx < 1` (trace.zig ~11290) — nsieve-bit's
+   `p[i>>6]` is `p[0]` for `i < 64` and its init loop is `for i=0,…`.
+   Every recording that captures a small-`i` iteration dies (24× anchor
+   :41, 5× :58, 6× :7, 1× :17); gate exponential backoff (128→65536,
+   max_strikes 6) then starves the pc-58 scan trace until log line
+   ~220k/349k — exactly where break_bursts stop. LuaJIT is immune (0-based
+   array part). **General gap: the recorder cannot trace index-0/hash-part
+   table access.** Options to ground next: hash-part recording, array-part
+   indexing revisit, softer gate escalation for data-transient aborts.
+
+Board unchanged: nsieve 1.0× LuaJIT, sieve_int 1.0×, pi_leibniz 2.7×,
+nsieve-bit 6.6× (blocked on B-5), grid_matmul 5.6×, scimark 23–73×.
+
 ## Status 2026-08-14 (LATEST-55) — **B-3d.4 frozen measurement DONE → B-3d COMPLETE. nsieve is at LuaJIT PARITY (1.0×).**
 
 The measurement protocol frozen in §B3.18 ran on the e56252f tree:

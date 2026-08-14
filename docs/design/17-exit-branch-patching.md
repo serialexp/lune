@@ -1,7 +1,20 @@
 # Exit-Branch Patching (Direct Side-Trace Linking) — Design
 
 Status: **all eight §A8 steps are landed as of 2026-08-12** — step 8 (A-viii, outer-cycle disarm coverage) closed the sequence: the outer cycle is pinned as a *simultaneously* armed closed cycle (`native_link_peak >= 3`; nsieve 4) that fires, an open observation window is pinned to contain it (nothing arms, output-transparent, still dispatcher-mediated native entries per R2-4), the **mid-epoch** transition is driven end-to-end through a host-installed native (which measures a live 3-link multi-kind cycle at the window-open instant, its complete teardown, and continued dispatcher-mediated trace entries afterward), and `disarmAllLinks` is pinned exhaustive over all four production edge kinds incl. `.loop_done_linked` and `.region_bridge`. A-viii's first landing was corrected over two codex review rounds — the "mid-epoch window is host-unreachable" claim (false: natives receive the `*Vm`), a fictional unit topology (now four kinds on genuinely distinct physical slot shapes, all armed through `armNativeLink`), an unsound cross-run `entries` comparison, and `entries` being the wrong counter for R2-4 at all (new `native_entries`, bumped only when the dispatcher commits to a native body) — see §A8-iv. One residual, tracked as its own Outstanding bullet: no test observes a live `.region_bridge` link at a window-open instant, since any probe placement that leaves the bridge armed leaves the registry empty at the call — not achieved in this workload, not shown impossible. Earlier: **§A8 step 7 (A-vii, the edge-4 FLIP) COMPLETE 2026-08-12**: landed (A-vii-c/c.1 gate consumption, A-vii-d/d.1 arming + successor overlay + receipt-sited two-phase arm + codex-blocker fix fcee9b7), reviewed (codex BLOCKER→fix→APPROVE), and measured per the frozen A-vii-e protocol — which surfaced and fixed a 2× per-instruction observer overhead (A-vii-e.1 `ObserverFast` bitset fast path; the raw flip regressed nsieve ~2× with the observer scan at 49% of runtime, the bridge itself measured cost-neutral by ablation). Final vs pre-flip: nsieve N=9 −9%, N=7 −6%, nsieve:24 coverage 56.7%→94.9% traced, six-workload output identity + bit-identical stats counters. Remaining in §A8: step 8 (A-viii disarm coverage), then the native in-page handoff (§A2.4) to convert the coverage gain to wall-clock.
-Last updated: 2026-08-14 (**B-3d COMPLETE — .4 frozen measurement DONE: all
+Last updated: 2026-08-14 (**B-4 LANDED — positional loop-done continuation
+resolution (D1'–D4', §B4.1–.8): `resolveLoopDoneCont` canonical selector
+(hit-count-desc → lowest-id ranking, `.unsupported` skipped-not-shadowing,
+canonical arm probe order, `regs`-fingerprint RUN preference),
+`armLoopDoneLink` resolves internally, terminal `.loop_done_linked` falls
+back positionally. Three codex review rounds → ACCEPT; gates green both
+builds + seven hashes + three repros. Measured outcome: §B4.4 predictions
+1–3 FAILED — wall neutral (nsieve-bit −0.4%, nsieve +0.8%, noise band); a
+permanent jitdbg probe proved ZERO candidates anchored at the post-PC
+during all 27,554 events. True root cause found one layer deeper and
+recorded as the new B-5 bullet: the recorder aborts `.bad_type` on
+`idx < 1` (`p[0]`/hash-part access — nsieve-bit's `p[i>>6]` and
+`for i=0,…` init), and gate backoff then starves the scan trace until the
+run tail. — earlier same day: **B-3d COMPLETE — .4 frozen measurement DONE: all
 three predictions verified (suffix drains 3411→13 ≈ exhaustion count, seam
 30.6%→6.2% of run, tier-0-has-trace 12,468→2,354 iterations with the
 residual time bucket being outer-loop warm-up attribution), budget sweep
@@ -59,7 +72,9 @@ heavy codegen (its IR is ~10 tight ops; ~7.7 cyc/it native after subtracting
 the seam). Default budget stays 4096. The identified next general lever is
 B-3d set-promotion (promote the frozen region's armed-edge SET, not exact
 rings) — design-first, not yet mandated. Remaining in this arc: B-3d (if
-mandated), B-4 trace-quality probation.
+mandated), B-4 trace-quality probation [both since closed: B-3d landed +
+codex-approved, B-4 reframed → landed §B4.8; open successor = B-5, the
+nsieve-bit `idx < 1` recording gap].
 Earlier: **Part B-3 LANDED — B-3a substrate 2026-08-13,
 B-3b flip + bridge promotion 2026-08-14, commit 8942ef6; see §B3.14 for the
 landing record and the six adversarial audit rounds.** The seam that motivated
@@ -1080,10 +1095,32 @@ awaits Bart.
     green both builds; seven hashes + three repros identical with promotion ON
     and OFF. Next: B-3c budget tune (534 of 12,824 bursts exhaust the 4096
     budget).
-  - [ ] **B-4 — deterministic trace-quality probation (nsieve-bit follow-up, §B.7).**
-    Score native entries against committed work, normal-deopt frequency, exit
-    dispersion, and trace size; gate or retire large low-yield root traces (the
-    nsieve-bit t=5 mega-continuation). General mechanism, benchmark-agnostic.
+  - [x] **B-4 — REFRAMED (2026-08-14, §Part B-4): terminal loop-done
+    positional-continuation lookup — LANDED 2026-08-14, outcome §B4.8.**
+    The original probation premise (retire the nsieve-bit t=5
+    mega-continuation) is REFUTED by ablation on the current tree (+31.3%
+    wall without t=5 — it is the automaton's scan segment, `.link -> 41`,
+    not a rogue root). The measured gap is 27,554 `break_burst` events at
+    the terminal `.loop_done_linked` contract site: the drain and
+    `armLoopDoneLink` only ever consider `cursor.cont`, never a positional
+    lookup at `post_pc`. Design D1'–D4' (§B4.1–.7, three review rounds →
+    ACCEPT) landed: `resolveLoopDoneCont` canonical selector, internal arm
+    resolution, positional terminal fallback, `regs`-aware RUN preference.
+    Gates green; wall NEUTRAL on nsieve-bit (−0.4%) because the jitdbg
+    diagnostic proved zero candidates exist at the post-PC during the
+    events — see §B4.8 for the corrected attribution.
+  - [ ] **B-5 — the nsieve-bit recording gap: `bad_type` abort on
+    `idx < 1` (`p[0]` / hash-part `get_index`/`set_index`).** The true
+    nsieve-bit bottleneck (§B4.8): any recording that captures a small-`i`
+    iteration (`p[i>>6]` = `p[0]` for `i < 64`; init loop `for i=0,…`)
+    aborts `.bad_type` at the recorder's array-bounds check
+    (trace.zig ~11290), the gate's exponential backoff
+    (128→65536, `max_strikes` 6) then starves the pc-58 scan trace until
+    ~2/3 through the run — no fusion, no promotion until the tail.
+    General gap: the recorder cannot trace index-0/hash-part table access
+    (LuaJIT's 0-based array part never hits this). Options to ground:
+    hash-part recording support, array-part indexing revisit, softer gate
+    escalation for data-transient aborts. Design-first, NOT yet mandated.
 - [ ] **3B — Faithful `lj_asm_patchexit` port + in-place-patch P-E. [historical
   framing; B-3 territory now — depends
   on 3A + new patch contracts; and now sequenced AFTER 3T, whose measurement shows 3B's
@@ -4678,6 +4715,344 @@ seven hashes + three repros ON/OFF):**
   sieve_int 2.1×→1.0×, pi_leibniz 3.7×→2.7×; every other row within
   noise, no regressions; the sole correctness flag (str_manip luajit=ERR)
   is pre-existing on the LuaJIT side across prior boards.
+
+#### Part B-4 — REFRAMED design (2026-08-14): the terminal loop-done positional-continuation gap, not trace-quality probation
+
+Status: design draft, for adversarial review (codex `gpt-5.6-sol` +
+Antigravity). Mandate from Bart: "lets continue with B-4" — the nsieve-bit
+gap (6.6× LuaJIT, 37.2 vs 5.6 ms on the 20260814 board).
+
+##### B4.1 — The B-2b hypothesis is REFUTED by ablation on the current tree
+
+B-4 was minted (§B.7, B-2b era, 2026-08-13) as *deterministic trace-quality
+probation*: score native entries against committed work / normal-deopt
+frequency / exit dispersion / size, and gate or retire large low-yield roots
+— target the nsieve-bit `t=5` 248-instr trace at `nsieve:58` that
+normal-deopts ~11.7k times per run (terminals at ei 56/98/140/182:
+2764+2757+4425+1769, unchanged on today's tree). Before designing that, the
+prescribed profile-first pass ran, and the ablation KILLS the premise:
+
+- **Ablation (maxrecord 2000 → 100, which aborts only t=5 — every other
+  nsieve-bit trace is ≤ 49 instrs): +31.3% wall** (interleaved best-of-21,
+  ReleaseFast, no stats: 36.0 → 47.3 ms). Retiring the "low-quality
+  mega-trace" makes the benchmark substantially SLOWER. Traced time-share
+  falls 47.8% → 23.3% and tier-0 rises 42.5% → 72.7%; t=5's unrolled scan
+  segments beat tier-0 by enough to carry its 11.7k deopts.
+- The B-2b-era condemnation was measured under `--jit-stats`, whose
+  per-entry accounting overhead scales with t=5's many short entries — the
+  same instrument error §B3.15 warns about (74.9 ms with stats vs 36.0 ms
+  without on today's tree). t=5 was never the disease.
+
+Probation as specified (retire large deopt-heavy roots) would have landed a
+regression. The mechanism may still earn its keep some day on a workload
+with a genuinely net-negative root, but there is now NO grounded example —
+it goes back to the icebox unbuilt (Rule Z-6: no mechanism without a
+general, measured target).
+
+##### B4.2 — What the gap actually is: 27,554 broken bursts at ONE contract site
+
+Today's nsieve-bit 6 decomposition (`--jit-stats`, ReleaseFast): native
+[JIT] 37.1%, steering seam 10.7% (39,504 walks), tier-0 42.5% — of which
+40.4%-of-run is *has-trace fallback* at `nsieve:17`/`nsieve:41` (358k + 85k
+interp iterations). `perf` agrees (tier-0 `Vm.exec` 38.1% is the single
+largest symbol). The trace population is the full sieve automaton:
+
+- `nsieve:41` ×2 (38 instrs) — the inner clear loop `for j = i+i, m, i`.
+- `nsieve:17` ×3 (49/49/36) — the outer scan shapes (composite skip /
+  prime / boundary), sibling-handoff armed.
+- `nsieve:58` t=5 (248 instrs) — anchored at the inner loop's post-loop PC,
+  scans forward a data-dependent number of outer iterations to the next
+  prime, and ends **`.link -> 41`**: it is the scan SEGMENT of the
+  automaton, not a rogue mega-root. The closed native cycle is
+  `41 →(loop-done)→ 58 →(t=5 scan)→ 41`.
+
+The cycle never closes. The jit-debug log shows **27,554** occurrences of
+
+    terminal loop-done: cont id=3 anchor_pc=17 fails contract at post_pc=58 -> break_burst
+
+i.e. ~every inner-loop completion. At `replayLedger`'s terminal
+`.loop_done_linked` directive (trace.zig ~6290) the burst wants to hand up a
+continuation, but it only ever considers **`cursor.cont`** — the
+continuation the burst's *entry path* established (id=3, anchored
+`nsieve:17`). The P-G contract (zero-input `.link` trace anchored at
+`post_pc` in the same proto) correctly rejects it — regs are coherent at
+pc 58, and running a trace anchored at 17 would misresume. The code then
+falls back to `break_burst` → tier-0 at `post_pc`. The in-code comment
+already recognises the shape ("since hotexit-armed prime sides, a burst can
+enter the linked grammar through a guard-chained composite … there may be no
+continuation at `post_pc` at all") — but it never LOOKS. A perfectly
+eligible continuation IS anchored at (proto, 58): t=5 itself, `.link`-tailed.
+`armLoopDoneLink` (the site-3 convergence arm two lines above) has the same
+blindness: it arms `cursor.cont` or nothing, so the `41.loop_done → 58` edge
+never arms either, the automaton never fuses, and every inner sieve pass
+pays a runtime walk + re-entry.
+
+The knock-on is worse than the per-event cost: the churn (each break_burst
+ends a burst; completed=0 re-entry strikes at :17/:41 — 42/43 in the log —
+feed the gate machine, 9/24 gate windows hand whole back-edge windows to
+tier-0) keeps the region's profit windows dirty, so the region does not
+FREEZE until the run is nearly over — the log's two silent promotions (both
+9-edge sets, both later demoted by low-yield unfreeze) occur at log lines
+304,603 and 349,463 of 349,522. The B-3d machinery that took nsieve to
+parity is sitting right there and starves: once promoted it runs 59,035
+silent transitions in 15 bursts (13 budget-exhausted at 4096 — healthy
+long bursts) — but only in the run's final percent.
+
+##### B4.3 — Design: positional continuation lookup at the loop-done funnel
+
+One new lookup + two consumers, both at existing funnels. No new state, no
+new heuristics, no scoring.
+
+- **D1 — `findLinkContinuation(proto, post_pc) ?*Trace`.** The `.link`
+  analogue of `findLoopTrace` / `isInnerLoopRoot`: highest-`hit_count`
+  cached trace with `anchor.proto == proto`, `anchor.pc == post_pc`,
+  `inputs.len == 0`, non-empty `instrs` ending `.link` — exactly the P-G
+  eligibility predicate `armLoopDoneLink` enforces and the fused-successor
+  release-panic validates, factored into one place all three sites share
+  (the B-3d R7 one-predicate lesson). Deterministic: `hit_count` is a pure
+  execution counter, and ties resolve to the first cache entry (stable
+  insertion order), same as `findTrace` today.
+- **D2 — terminal `.loop_done_linked` fallback.** At the contract site,
+  when `cursor.cont` fails P-G, look up `findLinkContinuation(proto,
+  post_pc)`. Found → (a) route the site-3 convergence arm at the SAME
+  found continuation (`armLoopDoneLink(owner, e.exit, found, safe_to_arm)`
+  — the existing call, better argument), (b) return
+  `.{ .run_continuation = found }`. Not found → `break_burst` exactly as
+  today. The directive's soundness argument is unchanged and positional:
+  regs are coherent at `post_pc` because the final iteration's stores + phi
+  snapshot committed LINKED; ANY trace satisfying P-G at `post_pc` is a
+  valid consumer — the cursor's path history is irrelevant to coherence.
+  (`resume_pc` is already `post_pc` before the check, so the not-found arm
+  needs no change.)
+- **D3 — the same lookup inside `armLoopDoneLink`.** When the PASSED `cont`
+  fails P-G eligibility, fall back to `findLinkContinuation` before giving
+  up, so scalar arm sites (call A) and the drain converge to the same edge.
+  Equivalent framing: the funnel arms "the eligible continuation at
+  `post_pc`", preferring the caller's candidate only because it is usually
+  already correct.
+
+Non-changes, stated for review: the fused (non-terminal) successor
+validation keeps its release-panic — a FUSED successor id was baked by the
+native code and must resolve exactly (fail-closed stays); no nativegen
+change; no accounting change (the terminal row's `accountLedgerRow` +
+`linked_completed` already ran before the directive); promotion/demotion
+machinery untouched — the expectation is that closing the cycle lets the
+EXISTING freeze + set-promotion machinery do its job early in the run.
+
+##### B4.4 — Predictions (frozen before implementation, B-3d.4 style)
+
+1. `break_burst` at the terminal loop-done site collapses from 27,554
+   toward 0 on nsieve-bit 6 (residual: shapes with genuinely no eligible
+   continuation).
+2. The `41 ↔ 58` cycle fuses and the region freezes EARLY: silent
+   promotions move from log-tail to run-start, bursts × budget dominate
+   transitions, tier-0-has-trace at `nsieve:17`/`:41` collapses by
+   iteration count.
+3. nsieve-bit 6 wall improves materially (feedstock: ~10% direct seam +
+   up to 40%-of-run tier-0 fallback; how much converts depends on how much
+   of the scan the promoted set captures). Board: no regressions elsewhere;
+   nsieve/sieve_int/pi_leibniz byte-stable (the seven-hash gate, promotion
+   ON and OFF).
+4. If (2) holds but (3) disappoints, the next lever is codegen quality of
+   t=5's scan segments (44 traced cyc/it today vs nsieve's ~4) — measured
+   separately, NOT folded into this change.
+
+##### B4.5 — Test plan
+
+- Unit: `findLinkContinuation` selection (eligibility rejects: inputs,
+  tail-op, proto, pc; hit-count preference; deterministic tie).
+- Unit: terminal loop-done with a stale cursor cont and an eligible
+  positional continuation → `.run_continuation` at the found trace + the
+  convergence arm targets it (extend the existing terminal-loop-done
+  fixture with a second continuation anchored at the true `post_pc`).
+- Unit: no eligible continuation → `break_burst` (existing behaviour pin).
+- Gates: `just test` both builds; seven hashes + three repros, promotion ON
+  and OFF; nsieve-bit dbg telemetry before/after (break_burst count,
+  promotion timing, burst/transition counters); full board.
+
+##### B4.6 — Open questions for review
+
+1. Is there any path where `cursor.cont` fails P-G but a positional lookup
+   returns a trace whose entry state contract is NOT satisfied by "regs
+   coherent at `post_pc`" (e.g. an entry-guard-carrying `.link` trace that
+   slipped past `inputs.len == 0`)? The claim is no — P-G eligibility IS
+   the entry contract — but this is the load-bearing soundness claim.
+2. Determinism: `findLinkContinuation` prefers `hit_count`; two traces at
+   one anchor with equal hit counts resolve by cache order. Same rule as
+   `findTrace`, so no NEW hazard — confirm.
+3. Does routing the site-3 arm at the found continuation interact with the
+   B-3d membership-growth demotion (arming a new member edge of an owning
+   region demotes the set)? Expected: yes, by design — the first arm of
+   `41→58` demotes any narrower live set and the region re-promotes with
+   the full membership (demote-and-regrow); confirm this converges rather
+   than thrashes given `promote_after = 4`.
+4. `run_continuation` executes t=5 (248 instrs) where the old path ran
+   tier-0 — any hop-budget/accounting asymmetry at the burst boundary?
+
+##### B4.7 — Round-1 review record (codex `gpt-5.6-sol` + Antigravity, 2026-08-14): REVISE ×2, convergent — and the round-2 revision
+
+Both reviewers independently confirmed the accounting/hop symmetry, trace
+lifetime, `safe_to_arm` scoping, and the B-3d demote-and-regrow convergence
+(under a stable arm target), and both said REVISE:
+
+- **BLOCKER (convergent):** a P-G-eligible positional candidate may have NO
+  native code (`.unsupported`, or lazy compile fails and memoizes) —
+  `driveDispatcherLedger`/`finishDispatcherDirective` consume
+  `.run_continuation` via `nativeFor(c) orelse @panic`. The cursor path
+  never exposed this (a cursor cont is already participating in a native
+  burst); an arbitrary cache lookup lacks that proof. **Fix (codex's
+  stronger form): native-runnability is part of SELECTION** — the selector
+  skips candidates with `nativeFor == null` and continues to the next
+  runnable one (an unsupported highest-hit candidate must not shadow a
+  runnable sibling). Arming success is NOT the proof (arming can decline
+  for `safe_to_arm`/alloc reasons while direct execution stays valid).
+- **MAJOR (codex): `inputs.len == 0` is not the full entry contract.**
+  `entry_guards`/`matchesFingerprint` bake record-time type assumptions;
+  a stale high-hit integer continuation can prologue-fail forever while a
+  float sibling would run. The native prologue fails CLOSED (pre-commit
+  `.prologue_fail`, regs stay coherent), so the corrected claim is "any
+  P-G + runnable candidate is safe to ATTEMPT", never "its entry
+  assumptions are satisfied". Fix folded into selection policy below.
+- **MAJOR (codex): caller-preference can alternate arm targets.** With two
+  eligible continuations A/B at one `post_pc`, D3-as-drafted re-arms the
+  slot A→B→A as different paths reach the funnel; every changed relation
+  is a slot mutation that resets promotion candidacy / demotes the owning
+  set — `promote_after = 4` cannot cure an alternating POLICY. Fix: ONE
+  canonical selector at every loop-done funnel; a caller's candidate is
+  only a fast-path when it EQUALS the canonical choice. (Antigravity's
+  convergence verdict assumed a stable target — consistent with this fix,
+  not a disagreement.)
+- **MINOR (convergent): the lookup already exists** — `findLinkTrace`
+  (trace.zig ~3186) implements exactly the P-G structural predicate +
+  highest-hit selection, and the scalar call-A path already uses it. Do
+  not add a parallel `findLinkContinuation`; extend/wrap `findLinkTrace`.
+  The cursor-only holes are precisely the terminal replay directive and
+  `armLoopDoneLink`.
+- **MINOR (codex): equal-hit ties are CURRENT-cache order** (`swapRemove`
+  reshuffles), not insertion order. Deterministic, but the design's
+  wording was wrong; and if stability across retirements matters, add an
+  explicit id tie-break.
+
+**Round-2 revision (supersedes D1–D3):**
+
+- **D1' — one canonical selector, `resolveLoopDoneCont(proto, post_pc,
+  regs_or_null)`.** Wraps the `findLinkTrace` predicate with the BLOCKER
+  fix: a candidate must be P-G eligible AND `nativeFor(t) != null`
+  (unsupported candidates are skipped, not shadowing). Ranking: when
+  `regs` are provided (the replay directive site), fingerprint-matching
+  candidates (`matchesFingerprint(regs)`) rank strictly above
+  non-matching ones (codex's advisable trial selection — a mismatching
+  candidate is still safe to attempt, fail-closed, but never preferred);
+  then `hit_count`; then LOWEST trace id (stable across `swapRemove`
+  reshuffles — determinism wording corrected). Arm sites pass `null`
+  (regs are not in scope at every arm funnel): ranking is (runnable,
+  hit_count, lowest id) — a pure function of the cache, so the armed
+  relation is stable and identical re-arms short-circuit (B-3d.1 R6);
+  a run-directive target that diverges from the armed target by
+  fingerprint does NOT touch the slot (no mutation, no thrash).
+- **D2' — terminal `.loop_done_linked` fallback** as D2, but through
+  D1': cursor.cont is accepted iff it equals the canonical choice
+  (fast-path); otherwise select; found → site-3 arm at the ARM-ranked
+  canonical target + `.run_continuation` at the regs-ranked target;
+  none → `break_burst` as today.
+- **D3' — `armLoopDoneLink` resolves through the same selector** (passed
+  cont used only when it equals the canonical choice), so every funnel
+  converges on one stable relation per `(inner, loop_done_exit)`.
+- Tests added to §B4.5: unsupported-highest-hit candidate must not shadow
+  a runnable sibling (BLOCKER pin); fingerprint-mismatch attempt
+  prologue-fails closed, resumes at `post_pc`, no double accounting;
+  A/B-alternation fixture pinning the slot is NOT re-armed when different
+  paths reach the funnel (MAJOR-2 pin); id tie-break stability.
+
+**Round-2 confirmation (codex): REVISE — one NEW MAJOR, folded as D4'.**
+The BLOCKER and both MAJORs are resolved in principle, and the
+run-vs-arm-target divergence is confirmed sound (no slot mutation,
+fail-closed entry). New finding: **`nativeFor` makes selector evaluation
+order load-bearing** — it lazily compiles and permanently memoizes failure
+as `.unsupported`, so probing candidates in different orders at the two
+ranking passes (arm-ranked vs regs-ranked) can, under constrained
+allocation, memoize-fail a candidate the other order would have compiled;
+the "cache-pure" armed relation would then depend on call order and
+allocator headroom.
+
+- **D4' — canonical probe order.** At the terminal site: (1) build the
+  pure, canonically ordered candidate list FIRST (P-G structural predicate
+  only — no compilation triggered); (2) resolve the ARM-ranked candidate
+  first, probing `nativeFor` strictly in ranking order and stopping at the
+  first runnable candidate; (3) only then resolve the regs-ranked RUN
+  target over the same list (fingerprint partition applied to the same
+  ranking; `nativeFor` results already memoized by step 2 where
+  overlapping) — and the run resolution must NOT retroactively change that
+  event's arm target; (4) pin the ordering with an injected
+  compile-failure test. Accepted trade recorded: the stable arm may hand a
+  fused jump to a fingerprint-mismatching sibling that prologue-fails
+  where a matching sibling existed — a performance trade, not a soundness
+  defect, measured by the §B4.4 protocol.
+
+**Round-3 confirmation (codex): ACCEPT.** D4' as written (pure canonical
+list → arm probe in ranking order → run partition over the same memoized
+list, arm never retro-changed) resolves the probe-order hazard; no new
+findings.
+
+##### B4.8 — Landing record + measured outcome (2026-08-14): mechanism LANDED, predictions 1–3 FAILED on nsieve-bit, true root cause found one layer deeper
+
+**What landed.** D1'–D4' exactly as accepted: `resolveLoopDoneCont(proto,
+post_pc, regs_or_null)` (canonical selector over `findLinkTrace`'s P-G
+predicate; ranking `hit_count` desc → lowest id; ARM = first
+`nativeFor`-runnable in ranking order, RUN = first runnable
+fingerprint-match when `regs` provided, else the arm target);
+`armLoopDoneLink` resolves internally via the selector (cont param
+removed; `armLoopDoneLinkTo` keeps the re-validation + arm);
+the terminal `.loop_done_linked` `is_last` branch resolves positionally
+with `regs`, arms canonically, and falls back to `break_burst` only when
+no eligible continuation exists at `post_pc`; `regs: ?RegWindow` threaded
+through `replayLedgerFrom`/`replayLedger`/`replayLedgerSuffix`/
+`driveSilentBurst`/`drainSilentResult` (test callers pass `null`). New
+unit test pins: `.unsupported` skipped-not-shadowing, id tie-break, RUN
+prefers fingerprint while ARM stays canonical, R6 no-re-arm, cache-cleared
+→ `break_burst`. Gates: `just test` both builds green, seven hashes +
+three repros PASS (promotion ON default; OFF spot-checked during
+development).
+
+**Measured outcome — §B4.4 predictions 1–3 FAILED; wall NEUTRAL.**
+nsieve-bit 6 still reports **27,554** terminal loop-done failures (now
+"no eligible continuation", previously `break_burst` at the stale
+cursor); promotions still arrive at the log tail; interleaved best-of-N
+A/B (HEAD e4a0b02 vs this change, release): nsieve-bit 36.9 → 36.7 ms
+(−0.4%), nsieve 9 50.3 → 50.7 ms (+0.8%) — noise band, neutral. A
+permanent jitdbg probe in the failure path (dumps every same-pc candidate
+with `inputs.len`/tail/native state) showed the design's premise was
+false *during the events*: there are **ZERO traces anchored at the
+post-PC (58)** while the bursts break. The mechanism is correct and
+review-accepted but has nothing to select on this workload.
+
+**The true root cause (one layer deeper — the next seam).**
+`--dump-aborts` on nsieve-bit: the recorder aborts `.bad_type` at the
+`get_index`/`set_index` array-bounds check (`idx < 1 or idx > len`,
+trace.zig ~11290) — nsieve-bit indexes `p[i>>6]`, which is `p[0]` for
+`i < 64`, and its init loop runs `for i=0,(m>>6)`; any recording that
+captures a small-`i` iteration dies (24× at anchor `nsieve:41` pc 47, 5×
+at `nsieve:58` pc 22, 6× at `:7`, 1× at `:17`). Each abort feeds the
+gate's exponential backoff (`backoff_base` 128 → `backoff_max` 65536,
+`max_strikes` 6), so the pc-58 scan-segment trace only records ~2/3
+through the run (log line ~220k/349k — exactly where the break_bursts
+stop) — no automaton fusion, no promotion until the tail. LuaJIT never
+sees this: its table array part is 0-based. nsieve (1.0× parity) never
+indexes below 1. **The general gap is "the recorder cannot trace
+hash-part / index-0 table access", not anything at the loop-done
+funnel** — that is the follow-up arc (support hash-part `get_index`/
+`set_index` recording, and/or reconsider array-part indexing, and/or
+softer gate escalation for data-transient aborts), to be grounded and
+designed on its own before any code (Rule Z-6: fix the general recording
+gap the benchmark revealed, not the instrument's reading).
+
+**Why the change still lands.** It replaces the cursor-only terminal
+contract with the canonical positional one (the general mechanism three
+reviewers accepted), removes a class of avoidable `break_burst` on any
+workload that *does* have a continuation at the post-PC, is
+performance-neutral where it cannot fire, and pins the semantics with
+unit tests. The nsieve-bit gap remains open and is now correctly
+attributed.
 
 ##### A.1 — The edge-4 bridge (BLOCKER 1)
 
