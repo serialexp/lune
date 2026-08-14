@@ -1,6 +1,6 @@
 # lune — Snapshot & Replay Schema
 
-Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; keyframe now **v5** (H-2: `next_obj_id` serialized so restore reproduces the id timeline across pre-cut garbage); guard-snapshots outstanding
+Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; keyframe now **v7** (v5 = H-2 `next_obj_id`; v7 = doc 18 slot-0 array part: positional 0-based array serialization + restore-time validation and lane rebuild); guard-snapshots outstanding
 Owner: Bart
 Last updated: 2026-06-15
 
@@ -116,7 +116,16 @@ schema follows; this is that schema's home.
       before the cut bumps the counter but leaves no `objects` entry, so `max(id)+1`
       drifts the counter low → every subsequent id diverges, and ids are observable
       via table/`pairs` order). Restore validates `next_obj_id >= max(id)+1` (a live
-      object holding an unallocated id is corrupt → `NextObjIdBelowObjects`). This
+      object holding an unallocated id is corrupt → `NextObjIdBelowObjects`).
+      **v7 (doc 18):** a `HeapTable.array` is positional **0-based** — entry `i`
+      IS logical key / physical slot `i`, holes (incl. the ubiquitous slot-0
+      hole) ride in-band as nils; restore appends from slot 0, then runs a
+      **bulk lane rebuild** (repack + freeze a homogeneous narrow run, exactly
+      rehash's one-shot commit — a leading hole would otherwise defeat append's
+      eager lane commit and leave restored sieves untraceable / deflated grids
+      un-reinflatable), and rejects any hash entry whose normalized integer key
+      is array-covered (`ArrayResidentKeyInHash`, incl. float-spelled `0.0` —
+      such an entry would be permanently shadowed). This
       also unblocks the later JIT-under-snapshot work (doc 17 H-2): dropping a
       trace-only object from the snapshot only stays determinism-safe once the id
       timeline is independent of *which* objects survive. Plus restore-specific

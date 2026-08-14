@@ -1,5 +1,43 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-58) — **B-5 Phases 1–3 LANDED: slot-0 array part is live (`81b73c2` inert prep, `838fd75` THE atomic flip, doc sweep follows). Phase 4 measurement outstanding.**
+
+Doc 18 implemented on Bart's go-ahead. The array part now covers keys
+`0..asize-1` identity-mapped (LuaJIT's layout): one unsigned bounds
+compare, `t[0]` array-resident, recorder's idx<1 `.bad_type` abort gone.
+
+- **Phase 1 (`81b73c2`)**: inert prep — shared `inArray` helper routed
+  through every non-native gate, producer-dispatched `guard_bounds`
+  (`.aref` vs `.garow`), `seedAt` wired at old semantics. Byte-identical.
+- **Phase 2 (`838fd75`)**: ONE atomic commit, 9 files. array.zig
+  `len`→`asize` + identity get/set + `commitFreshLane`-factored
+  seedAt{0,1}; table.zig getInt grid `i>=1` gate, set append at
+  `key == asize` + fresh {0,1} routing, D7 rehash (unsigned countKey,
+  `bin(k)=ceillog2(k+1)`, drain `[old_asize,new_asize)`, OOM rollback
+  `asize=k`), length() empty-extent guard; gc 0-based mark walk +
+  inflate guards (`asize<=1`, populated slot 0 blocks outer AND rows) +
+  deflate slot-0-hole seed (no row down-shift); recorder/tier-1a/native
+  append `idx == asize`; nativegen `.aref` drops `sub 1` (garow keeps
+  it); keyframe v7 (positional 0-based, restore bulk lane rebuild
+  repack+freeze, `ArrayResidentKeyInHash` validation incl. float-0.0);
+  pairs walks key 0 first (the signed-off observable change). Full §T
+  matrix: unit (bounds edges, seedAt per-lane + OOM, presence 63/64,
+  computeArraySize 63/64/65/127/128 boundary overshoot, grid key-0
+  blocks, deflation no-down-shift, slot-0 GC edge, v7 validation +
+  lane rebuild) + five 8-mode script tests + an f2c resume corpus
+  source. **Gate: both builds green (incl. -Djit-debug), seven hashes
+  + three repros UNCHANGED (GATE PASS), nsieve-bit --dump-aborts →
+  "no recording aborts".**
+- **Phase 3**: pins + doc sweep — doc 02 pairs-order pin, doc 03/05
+  extent wording, doc 04 v7 entry, doc 14 grid note, schema/trace.json
+  description, table.zig module docs, doc 18 checklist ticked.
+
+NEXT: **Phase 4 — measurement per doc 18 §P**: nsieve-bit promotion at
+run start + wall-clock, full board both promotion states vs the B-4
+baseline (36.7 ms nsieve-bit), memory deltas (append +1 slot; the
+accepted power-of-two boundary overshoot), then post-landing codex
+review. Then the deferred hash-int recording stays parked.
+
 ## Status 2026-08-14 (LATEST-57) — **B-5 REDIRECTED to slot-0 array part (Bart's call); design doc 18 written + ACCEPTED by both reviewers. Awaiting implementation go-ahead.**
 
 Bart's direction on the B-5 recording gap: instead of hash-part

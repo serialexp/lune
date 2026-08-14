@@ -2,8 +2,9 @@
 //! once shapes land in Phase 9, objects/structs).
 //!
 //! Classic Lua split storage: a contiguous **array part** for a dense run of
-//! positive-integer keys `1..n` (the common list case, and what makes `#t` and
-//! sequential access fast), plus a **hash part** for everything else. Keys are
+//! non-negative integer keys `0..asize-1` (identity-mapped, doc 18 — the common
+//! list case plus a first-class `t[0]`; `#t` stays a 1-based border), plus a
+//! **hash part** for everything else. Keys are
 //! normalised Lua-style — a float with an integral value maps to the same slot
 //! as the equivalent integer (`t[1] == t[1.0]`), and `nil`/`NaN` keys are
 //! rejected. String keys compare by pointer thanks to interning (`string.zig`).
@@ -33,7 +34,8 @@ const two_pow_63: f64 = 9223372036854775808.0;
 
 pub const Table = struct {
     header: GcHeader,
-    /// Dense array part for the contiguous key run `1..len`, stored in the
+    /// Dense array part for the contiguous key run `0..asize-1` (identity
+    /// mapping, doc 18; for a grid the extent field counts ROWS), stored in the
     /// narrowest **lane** the contents fit (a boolean bitmap, packed ints, packed
     /// floats, or full `Value`s) — see `array.zig`. The lane is an in-memory
     /// optimisation only: every reader goes through `array.get`/`set` and sees

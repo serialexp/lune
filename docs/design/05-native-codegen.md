@@ -378,14 +378,17 @@ transparently (≈ 1.0×).
 
 Phase B teaches the native backend to read and write a table's dense run directly,
 against the lane-packed `ArrayPart` (`src/array.zig`) frozen by Phase A. The native
-path handles `t[k]` exactly when `k ∈ 1..len` (the array part); sparse/string keys,
+path handles `t[k]` exactly when `k ∈ 0..asize-1` (the array part; unsigned
+membership, doc 18); sparse/string/negative keys,
 OOB, holes, and the heap-bearing `.value` lane all guard-bail to tier-1a. The
 fixed-width lanes — bool, i8…i64, u8, **and now f64 (Phase D Gap A, see §Phase D)** —
 all lower natively.
 
 **IR (recorder → oracle → native), `IrInstr` stays 16 B via the aref-pairing trick:**
-- `aref` (`a`=table, `b`=index, `aux`=lane) → addressing token carrying `idx0 = k-1`.
-  Loop-variant (never hoisted). New native `Kind.aref`.
+- `aref` (`a`=table, `b`=index, `aux`=lane) → addressing token carrying `idx0 = k`
+  (identity mapping, doc 18 — the historical `k-1` sub is gone; `garow` keeps its
+  `-1`, grids stay 1-based outside). Loop-variant (never hoisted). New native
+  `Kind.aref`.
 - `aload` (`a`=aref, `aux`=lane) → decode the slot to a `Value` (bool lane: `movzx`
   the in-band byte + `sub 1` → 0/1; int lanes i8/i16/i32/i64: `movsx`/`movsxd`/`mov`
   per width; **f64 lane: `lea` the element address + `movsd` the raw 8 bytes into the

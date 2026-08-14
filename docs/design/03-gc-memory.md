@@ -48,7 +48,8 @@ ownership, write barriers, and trace rooting.
       upgrade is future work (the barrier seams below are already in place).
 - [x] **Lane-packed table array part — monotonic narrow-lane storage**
       (`src/array.zig`, `src/table.zig`, `src/gc.zig`). A table's dense array run
-      (keys `1..n`) is stored in the narrowest **lane** its contents fit: `.value`
+      (keys `0..asize-1`, identity-mapped — slot == key, doc 18) is stored in the
+      narrowest **lane** its contents fit: `.value`
       (today's 16 B tagged `Value`, `nil` in-band — the heterogeneous/heap-bearing
       fallback) or a narrow lane (`boolean` 1 byte/slot, `i8/i16/i32/i64`, `f64`)
       of packed elements. The fixed-width int/float lanes carry a separate 1-bit/

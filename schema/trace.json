@@ -103,7 +103,7 @@
     },
 
     "HeapTable": {
-      "description": "A table object: the dense array part (keys 1..n, positionally) plus the hash part (every other key). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel.",
+      "description": "A table object: the dense array part (keys 0..asize-1, positionally — entry i IS logical key i, slot-0 hole included in-band; doc 18) plus the hash part (every other key; an array-covered integer key in the hash is invalid and rejected at restore). Edges are SnapValue heap_refs. metatable_id is the table's metatable as a 1-based optional id (header.id + 1), or 0 when it has none — id 0 IS a live object (the first allocation gets id 0), so a bare id cannot be the none sentinel.",
       "sequence": [
         { "name": "array",        "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "SnapValue" } },
         { "name": "entries",      "type": "array", "kind": "length_prefixed", "length_type": "uint32", "items": { "type": "TableEntry" } },

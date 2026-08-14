@@ -158,7 +158,12 @@ that for a time-travel debugger it *is* the architecture.
       sites, so snapshot bytes are a function of the key *set* and ids alone, never
       of insertion history or `std.HashMap`'s layout. Still not actionable at the
       *program* level until a `pairs`/`next` iterator exists; the deterministic
-      ordering rule lands fully with that iterator.
+      ordering rule lands fully with that iterator. **Pinned (doc 18):** the
+      array-part walk is ascending logical keys `0..asize-1` — an array-resident
+      key 0 iterates FIRST, before the 1-based run, then the hash part in
+      canonical order. This is the one signed-off observable change of the
+      slot-0 flip (a program keying on `pairs` order across it sees key 0 move
+      from the hash tail to the array front).
 - [~] **Floating-point determinism.** FP **mode is pinned**: every float-producing
       function in `src/arith.zig` sets `@setFloatMode(.strict)`, forbidding
       contraction/reassociation regardless of build mode (Zig's default is already

@@ -1,6 +1,6 @@
 # Slot-0 Array Part (LuaJIT-faithful 0-based storage) — Design
 
-Status: design ACCEPTED, not yet implemented — codex `gpt-5.6-sol` rounds 1–3 (REVISE → REVISE → APPROVE) + Antigravity rounds 1–2 (REVISE → CONFIRM), all findings folded; awaiting Bart's implementation go-ahead
+Status: partial — Phases 0–3 landed (`823f7ed` design, `81b73c2` Phase 1, `838fd75` Phase 2 THE flip, Phase 3 doc sweep in the same arc); Phase 4 measurement outstanding
 Owner: Bart / Claude
 Last updated: 2026-08-14
 
@@ -12,32 +12,34 @@ inside them is checked.
 
 ### Done
 
-_(nothing yet)_
+- [x] **Phase 0 — review to ACCEPT.** codex `gpt-5.6-sol` rounds 1–3
+  (REVISE → REVISE → APPROVE) + Antigravity rounds 1–2 (REVISE →
+  CONFIRM); all findings folded (§R1/§R2/§R3). Landed `823f7ed`.
+- [x] **Phase 1 — inert preparation (no behaviour change).**
+  Producer-dispatched `guard_bounds` in tier-1a, the shared
+  `inArray(k, extent)` helper routed through every non-native gate
+  site, and `ArrayPart.seedAt` wired at today's semantics. Gate held:
+  both builds green, seven hashes + repros byte-identical. Landed
+  `81b73c2`.
+- [x] **Phase 2 — THE atomic flip.** Layout (`asize`) + all three JIT
+  tiers + interpreter fast paths + GC walks + grid
+  inflate/deflate/getInt fixes + keyframe v7 (positional 0-based +
+  restore bulk lane rebuild + `ArrayResidentKeyInHash` validation) +
+  `pairs` walk, in ONE gated commit. Gate held: tests green in both
+  builds (`-Djit-debug` included), all seven stdout hashes + three
+  repros UNCHANGED (GATE PASS), the §T cross-tier matrix green
+  (unit + 8-mode script + f2c corpus coverage), and nsieve-bit
+  `--dump-aborts` reports **no recording aborts** — the motivating
+  idx<1 `.bad_type` abort is gone. (No byte-frozen keyframe goldens
+  existed to re-freeze; round-trip corpora are structural and the
+  version bump guards compatibility.) Landed `838fd75`.
+- [x] **Phase 3 — pins + docs.** `pairs`-order pin (doc 02), grid
+  key-0 policy pins (doc 14 note), doc sweep (02/03/04/05/14 +
+  `schema/trace.json` description + doc 04 v7 entry + `table.zig`
+  module docs).
 
 ### Outstanding
 
-- [ ] **Phase 0 — review to ACCEPT.** codex `gpt-5.6-sol` + Antigravity
-  adversarial review; fold findings until clean. Round 1 = REVISE ×2
-  (§R1); round 2 pending.
-- [ ] **Phase 1 — inert preparation (no behaviour change).**
-  (a) producer-dispatched `guard_bounds` semantics in tier-1a (dispatch
-  on `.aref` vs `.garow` producer, both arms keeping today's semantics);
-  (b) one `inArray(k, extent)` helper defined once and routed through
-  every non-native gate site (today's `1 <= k <= len` semantics);
-  (c) the fresh-seed primitive `ArrayPart.seedAt(k, v)` (creates the
-  part + commits the lane from the first real value atomically; wired
-  but semantically identical to today's append-at-1 for k==1).
-  Gate: `just test` both builds; seven hashes + repros byte-identical.
-- [ ] **Phase 2 — THE atomic flip.** Layout (`asize` convention) + all
-  three JIT tiers + interpreter fast paths + GC walks + grid
-  inflate/deflate/getInt fixes + keyframe v7 + `pairs` walk, in ONE
-  gated change (§R1 finding 1: any split executes old key math against
-  the new layout = wrong-address corruption). Gate: tests both builds;
-  seven stdout hashes UNCHANGED; keyframe goldens re-frozen
-  deliberately; the §T cross-tier matrix green; nsieve-bit
-  `--dump-aborts` shows zero index `.bad_type` aborts.
-- [ ] **Phase 3 — pins + docs.** `pairs`-order pin, grid key-0 policy
-  pins, doc sweep (02/03/04/05/14 + `schema/trace.json` description).
 - [ ] **Phase 4 — measurement per §P.** nsieve-bit + full board both
   promotion states.
 - [ ] **Deferred — hash-part integer-key recording.** Negative/sparse

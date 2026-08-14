@@ -1,5 +1,14 @@
 # Nested Numeric Array Flattening — Design
 
+> **Doc 18 note (2026-08-14, slot-0 array part).** Grids did NOT adopt identity
+> mapping: outer rows stay keys `1..rows` (`row = key - 1`, `rowView`
+> untouched), and for a grid the Layout field means **row count** — the
+> conditional field contract lives in doc 18 D1/D6. Consequences landed with the
+> flip: `inflateToGrid` guards `asize <= 1` and declines on a populated slot 0
+> (outer or row); `deflateGridImpl` seeds a slot-0 hole so rows keep their
+> 1-based keys; bare `a[0]` deflates (blanket bare-access policy), fused
+> `a[0][j]` faults through the outer miss.
+
 Status: complete (D) — Phases 0–8 landed on `master`. Live grids are
 produced at runtime: a homogeneous-numeric nested table inflates on its first
 fused `a[i][j]=v`, grows by **reshape-on-overflow** (stride / cell-lane), and
