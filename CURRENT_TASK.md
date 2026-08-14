@@ -1,5 +1,32 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-62) — **fft arc: float-key narrowing landed (318fa0d); nest-coverage hole grounded to min_trip_entry — awaiting Bart's pick.**
+
+Lever A landed: `keyRefNarrowed` (guard_float + int_of_float, mirror of
+`normalizeKey` / LuaJIT lj_opt_narrow) in recArrayGet/recArraySet + dispatch
+routes number keys; GuardRole.key_int; doc 17 vocabulary rows updated; recorder
++ 10-mode end-to-end tests. fft wall ~flat (bitreverse still dark behind the
+0-3-trip inner while + C1 sunk-store rule) but the mechanism is general and
+proven native on an isolated repro.
+
+Region B grounded — the ~73% fft coverage hole is ENTRY POLICY, not machinery:
+the doc-15/16 chain covers middle+inner stages natively (bursts completing
+341-472 iterations, ledger up to CAP=32), but `min_trip_entry=24` (interp.zig
+back-edge epilogue) declines trace entry for FFT's late stages (trips
+16/8/4/2/1), so no chain ever STARTS there; :131 stuck at 37.8% traced.
+EXPERIMENT min_trip_entry=0 (reverted, TSV deleted): full board 28/28 ok, fft
+535->351.5 ms (32.5x->21.5x), :131 78% traced, everything else in noise (the
+#69/#73 low-yield entry-penalty gate now provides the thrash brake that
+min_trip_entry originally supplied). LuaJIT ground truth (lj_trace.c:515,526):
+entry is a patched JFORL/JLOOP opcode — unconditional, free, no trip gate.
+
+Options for Bart: (A) drop/lower min_trip_entry default (proven -34% fft, board
+clean); (B) surgical: bypass the trip gate only when the anchor owns armed
+chain links (entry = chain doorway); (C) LuaJIT-faithful patched tier-0->native
+entry (extends B-3 patching to the entry edge; makes the gate moot). Remaining
+fft blockers after any of these: fft_bitreverse (~33% of run: short-trip while
++ C1 sunk-store abort), then residual interp share.
+
 ## Status 2026-08-14 (LATEST-61) — **Doc 19 LANDED: loaded tree traces — H-2 dynamic-proto gate lifted, keyframe v8. scimark-lu 1160→217ms (73.5×→13.6×).**
 
 Worst-board investigation (scimark-lu 73.5×, jit 43% SLOWER than t0) found the
