@@ -141,7 +141,7 @@ fn nextStep(gpa: std.mem.Allocator, t: *const Table, ctrl: Value) !Step {
     var in_array = true;
     if (ctrl.isNil()) {
         start = 1;
-    } else if (ctrl.isInt() and ctrl.asInt() >= 1 and ctrl.asInt() <= n) {
+    } else if (ctrl.isInt() and arr.ArrayPart.inArray(ctrl.asInt(), t.array.len)) {
         start = ctrl.asInt() + 1;
     } else {
         in_array = false; // ctrl is a hash key (or an int beyond the array part)

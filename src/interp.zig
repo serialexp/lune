@@ -2253,7 +2253,7 @@ pub const Vm = struct {
                             // A grid table's `t[i]` is a transient `row_view`, not a
                             // raw slot — skip the fast path and let `indexGet →
                             // Table.getInt` mint the handle. (Phase 3, doc 14.)
-                            if (!tbl.array.isGrid() and i >= 1 and i <= @as(i64, @intCast(tbl.array.len))) {
+                            if (!tbl.array.isGrid() and array.ArrayPart.inArray(i, tbl.array.len)) {
                                 // A *present* (non-nil) in-bounds slot is a raw read
                                 // regardless of any metatable — Lua only consults
                                 // `__index` for an absent key. A hole (nil) falls
@@ -2287,7 +2287,7 @@ pub const Vm = struct {
                             // deflation trigger owned by `indexSet`; never raw-stored
                             // here (and `fits(nil)` is `true`, so without this guard a
                             // `nil` store would reach `array.get` on a grid).
-                            if (!tbl.array.isGrid() and i >= 1 and i <= @as(i64, @intCast(tbl.array.len)) and tbl.array.fits(val)) {
+                            if (!tbl.array.isGrid() and array.ArrayPart.inArray(i, tbl.array.len) and tbl.array.fits(val)) {
                                 // `__newindex` fires only for an *absent* key on a
                                 // metatable-bearing table. A metatable-free table
                                 // (the overwhelming common case — one predictable

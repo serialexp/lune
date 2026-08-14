@@ -269,6 +269,16 @@ pub const ArrayPart = extern struct {
 
     // ---- element access (1-based keys, like the rest of the table) ----
 
+    /// THE membership predicate for the array part: does logical key `k` have a
+    /// slot? Defined exactly once so every tier and every routing site shares one
+    /// contract (doc 18 D1). Today's layout: keys `1..len`. After the doc-18 flip
+    /// this becomes the LuaJIT-style unsigned compare
+    /// `@as(u64, @bitCast(k)) < extent` (identity mapping, slot 0 included) — a
+    /// ONE-LINE change here, mirrored per tier, nowhere else.
+    pub inline fn inArray(k: i64, extent: usize) bool {
+        return k >= 1 and k <= @as(i64, @intCast(extent));
+    }
+
     /// `t[i]` for `1 <= i <= len`. Returns the logical `Value` (or `nil` for a
     /// hole). Caller guarantees the index is in range.
     // `inline`: the tier-0 interpreter reads `t[i]` through this on its hottest path
@@ -375,6 +385,27 @@ pub const ArrayPart = extern struct {
         if (!self.fits(val)) try self.widenFor(gpa, val);
         self.len += 1;
         self.encode(self.len - 1, val);
+    }
+
+    /// Seed a FRESH array part from its first array-resident write `t[k] = val`
+    /// (doc 18 D2a). Preconditions (asserted): empty part (`len == 0`, no grid),
+    /// non-nil `val` (a nil write to a fresh table is a no-op/hash-delete and must
+    /// never mint an extent), and `k` in the seedable key set. Commits the lane
+    /// eagerly from `val` (the first REAL value — hole slots never influence lane
+    /// choice) with the same OOM-atomicity as `append`: on failure the part is
+    /// left untouched (`len == 0`, `.value`, `!frozen`).
+    ///
+    /// Phase 1 (current layout): only `k == 1` is seedable and seeding IS
+    /// `append(val)` — key 1 lands in physical slot 0, `len = 1`. After the
+    /// doc-18 flip the seedable set becomes `{0, 1}`, seeding creates
+    /// `asize = k + 1` with a slot-0 hole for `k == 1`, and presence is set for
+    /// slot `k` only.
+    pub fn seedAt(self: *ArrayPart, gpa: std.mem.Allocator, k: i64, val: Value) std.mem.Allocator.Error!void {
+        std.debug.assert(self.lane != .grid);
+        std.debug.assert(self.len == 0);
+        std.debug.assert(!val.isNil());
+        std.debug.assert(k == 1); // Phase 1 seedable set; {0, 1} after the flip
+        try self.append(gpa, val);
     }
 
     /// Resize the array part to exactly `n` slots. Growing fills the new slots

@@ -10879,8 +10879,20 @@ pub const TraceState = struct {
                 // `aload` and the array-access guards read one prior node
                 // (the table value, or the `aref`). `guard_append` reads the `aref`.
                 // `hload`/`guard_hash` read the `href` (`a`).
-                .aload, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .hload, .guard_hash => {
+                .aload, .guard_table, .guard_lane, .guard_present, .guard_fits, .guard_append, .hload, .guard_hash => {
                     std.debug.assert(ins.a < i);
+                },
+                // `guard_bounds` carries producer-dispatched semantics (doc 18 D3):
+                // tier-1a selects the bounds rule from the producer op, so the
+                // producer must be one of exactly two memory ops — `aref` (scalar
+                // array key) or `garow` (grid row). Both are canonical-to-self in
+                // `tropt` (never folded/CSE'd) and `a` is remapped through
+                // compaction, so this holds post-optimization too; pin it so
+                // malformed IR fails closed here rather than mis-dispatching.
+                .guard_bounds => {
+                    std.debug.assert(ins.a < i);
+                    const producer = instrs[ins.a].op;
+                    std.debug.assert(producer == .aref or producer == .garow);
                 },
                 // φ: the init `a` is an ordinary backward ref (a < i); the update
                 // `b` is the back-edge value and may reference a *later* node, like
@@ -11287,7 +11299,7 @@ pub const TraceState = struct {
         if (tbl.metatable != null) return self.abort(.has_metatable);
         const lane = tbl.array.lane;
         const idx = vkey.asInt();
-        if (idx < 1 or idx > @as(i64, @intCast(tbl.array.len))) return self.abort(.bad_type);
+        if (!arr.ArrayPart.inArray(idx, tbl.array.len)) return self.abort(.bad_type);
         const loaded = tbl.getInt(idx);
         if (loaded.isNil()) return self.abort(.bad_type); // hole — not a profitable trace
 
@@ -11431,7 +11443,7 @@ pub const TraceState = struct {
             return;
         }
 
-        if (idx < 1 or idx > @as(i64, @intCast(tbl.array.len))) return self.abort(.bad_type);
+        if (!arr.ArrayPart.inArray(idx, tbl.array.len)) return self.abort(.bad_type);
         // The value must fit the current lane unchanged — an out-of-lane store
         // would widen the array (shape change / allocation) which the native ABI
         // cannot perform; the prologue `guard_lane` then stays sufficient.

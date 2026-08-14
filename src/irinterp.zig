@@ -721,12 +721,27 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                         break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                     }
                 },
-                // The index lands in the dense array part: `(index-1) <u len`.
+                // Producer-dispatched bounds (doc 18 D3): the rule depends on what
+                // produced the operand. `.aref` (scalar array key) uses THE shared
+                // membership predicate `inArray`; `.garow` (grid row) keeps the
+                // grid-row rule (`1 <= row <= rows` — the layout field counts rows
+                // for grids, and grids stay 1-based outside). Today both formulas
+                // coincide; after the doc-18 flip only the `.aref` arm changes.
+                // `assertWellFormed` pins the producer to exactly these two ops;
+                // anything else fails closed as a guard exit.
                 .guard_bounds => {
                     const ar = t.instrs[ins.a];
                     const tbl = table.Table.fromHeader(values[ar.a].asHeap());
                     const idx = values[ar.b].asInt();
-                    if (idx >= 1 and idx <= @as(i64, @intCast(tbl.array.len))) {
+                    const ok = switch (ar.op) {
+                        .aref => arr.ArrayPart.inArray(idx, tbl.array.len),
+                        .garow => idx >= 1 and idx <= @as(i64, @intCast(tbl.array.len)),
+                        else => blk: {
+                            std.debug.assert(false); // assertWellFormed pins the producer
+                            break :blk false; // release: fail closed -> side-exit
+                        },
+                    };
+                    if (ok) {
                         if (record) rec.guardPass(i, values[ar.a]);
                     } else {
                         if (record) rec.exit(i, .guard, values[ar.a]);

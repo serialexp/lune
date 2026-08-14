@@ -130,7 +130,7 @@ pub const Table = struct {
 
     /// `t[i]` for an integer key (array part fast path).
     pub fn getInt(self: *const Table, i: i64) Value {
-        if (i >= 1 and i <= @as(i64, @intCast(self.array.len))) {
+        if (arr.ArrayPart.inArray(i, self.array.len)) {
             // A grid table's rows are *virtual*: `t[i]` is a transient `row_view`
             // onto grid row `i-1` (a fat value, no heap object), not a stored
             // slot. The handle carries this table's header so an inner index
@@ -221,12 +221,21 @@ pub const Table = struct {
         if (nk.isInt()) {
             const i = nk.asInt();
             const n: i64 = @intCast(self.array.len);
-            if (i >= 1 and i <= n) {
+            if (arr.ArrayPart.inArray(i, self.array.len)) {
                 try self.array.setInPlace(gpa, @intCast(i), val);
                 return;
             }
             if (i == n + 1 and !val.isNil()) {
-                try self.array.append(gpa, val);
+                // Fresh part (doc 18 D2a): the first array-resident write goes
+                // through the seed primitive, which owns the eager lane commit.
+                // Established part: the ordinary contiguous append. Phase 1: the
+                // seedable key set is {1} and seedAt == append, so behaviour is
+                // identical; the flip widens the set to {0, 1}.
+                if (n == 0) {
+                    try self.array.seedAt(gpa, i, val);
+                } else {
+                    try self.array.append(gpa, val);
+                }
                 try self.migrateFromHash(gpa);
                 return;
             }
@@ -249,7 +258,7 @@ pub const Table = struct {
             {
                 try self.rehash(gpa, i);
                 const n2: i64 = @intCast(self.array.len);
-                if (i >= 1 and i <= n2) {
+                if (arr.ArrayPart.inArray(i, self.array.len)) {
                     try self.array.setInPlace(gpa, @intCast(i), val);
                     return;
                 }
