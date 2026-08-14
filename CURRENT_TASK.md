@@ -1,5 +1,51 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-57) — **B-5 REDIRECTED to slot-0 array part (Bart's call); design doc 18 written + ACCEPTED by both reviewers. Awaiting implementation go-ahead.**
+
+Bart's direction on the B-5 recording gap: instead of hash-part
+integer-key recording, extend the internal array part by one slot so
+key 0 is array-resident — LuaJIT's exact layout (`inarray = (MSize)key
+< asize`, non-inclusive sizes, slot 0 allocated; verified in
+`lj_tab.{h,c}`). General fix per Z-6: every 0-indexing program gets the
+fast path AND stops poisoning trace recording (the abort+backoff chain
+of §B4.8). Hash-int recording demoted to a deferred follow-up (only
+cover for negative/sparse keys).
+
+Work done this arc:
+
+- **Grounding**: very-thorough 8-group inventory of every 1-based
+  assumption (Explore agent; array.zig conversion layer, table.zig
+  routing/rehash, keyframeser positional wire format, recorder,
+  nativegen address math, irinterp, stdlib/base nextStep, gc walks,
+  rowView) — six cross-cutting surprises, the `len` multi-overload
+  being the crux. LuaJIT reference read (countint/countarray/
+  bestasize/rehashtab).
+- **docs/design/18-slot0-array-part.md** written per the design-doc
+  skill: D1 identity mapping + conditional field contract (scalar
+  `asize` vs grid row count) + exact `@bitCast` unsigned helper; D2
+  asize disambiguation incl. the five `get(i+1)` walk sites; D2a
+  `seedAt` fresh-seed primitive (non-nil keys {0,1} only); D3
+  producer-dispatched `guard_bounds` + atomic-flip mandate; D4
+  keyframe v6→v7 + restore bulk lane rebuild (repack+frozen) +
+  normalized-key validation; D5 pairs-order change (deterministic,
+  pinned); D6 grids stay 1-based, deflate-on-key-0, guarded inflation;
+  D7 complete sizing derivation (bin(k)=ceillog2(k+1), memory honesty
+  at power-of-two boundaries, drain rollback asize=k); §T cross-tier
+  test matrix; §P frozen predictions (stdout hashes UNCHANGED is a
+  prediction — any change is a defect).
+- **Reviews to acceptance**: codex gpt-5.6-sol rounds 1–3
+  (REVISE ×2 → APPROVE; 5 BLOCKER + 4 MAJOR + 4 MINOR + NIT across
+  rounds, all folded — §R1/§R2/§R3 records in doc 18) + Antigravity
+  rounds 1–2 (REVISE with 7 blockers → CONFIRM, re-verifying each).
+  Convergent round-1 finding worth remembering: the naive Phase split
+  would have been wrong-address CORRUPTION, not trace-shape drift —
+  the flip must be atomic across layout + all three tiers + walks.
+
+NEXT (pending Bart): implement per doc 18 phasing — Phase 1 inert prep
+(producer dispatch, inArray helper, seedAt), Phase 2 the atomic flip,
+Phase 3 pins/docs, Phase 4 measurement (§P: nsieve-bit aborts → 0,
+promotion at run start, wall toward LuaJIT scale; board within noise).
+
 ## Status 2026-08-14 (LATEST-56) — **B-4 REFRAMED, DESIGNED, LANDED (positional loop-done resolution); predictions failed on nsieve-bit; TRUE root cause found = B-5 (`idx < 1` recording abort).**
 
 Full arc in doc 17 §Part B-4 (§B4.1–§B4.8). The compressed story:
