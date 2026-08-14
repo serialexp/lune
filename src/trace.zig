@@ -1804,7 +1804,7 @@ pub const TraceConfig = struct {
     silent_promotion_enabled: bool = true,
     /// Maximum promoted transitions executed by one native call before the
     /// universal silent drain regains control. This replaces the ordinary
-    /// eight-hop steering bound only while a promoted cycle is active.
+    /// eight-hop steering bound only while a promoted set is active.
     silent_budget: usize = 4096,
     /// Number of identical, consecutive full-ledger cycle detections required
     /// before publishing a promotion.
@@ -1971,12 +1971,14 @@ const PromotedEdge = struct {
     resume_pc: u32,
 };
 
-const PromotedCycle = struct {
+/// B-3d (doc 17 §B3.16 D2): the promoted unit is the frozen region's armed-edge
+/// SET in canonical (parent id, exit) order — no ring order exists and none is
+/// stored. A ring is just a set whose automaton happens to be periodic; every
+/// per-edge fact reporting needs is MEASURED into `summary` by the epilogues
+/// (`firings`/`last_ordinal`/`last_productive_ordinal`), never reconstructed
+/// from position.
+const PromotedSet = struct {
     edges: []PromotedEdge,
-    /// Per phase, the first later row (distance >= 2) whose owner is the same
-    /// trace. Reporting provenance treats that arrival as a return to the
-    /// sibling parent even when it is a different physical exit of that trace.
-    sibling_return_distance: []u8,
     summary: []nativegen.SilentSummaryCell,
     metadata: []nativegen.SilentExitMetadata,
     region_key: RegionKey,
@@ -1990,7 +1992,10 @@ const PromotionRejects = struct {
     no_patch_point: u64 = 0,
     child_mismatch: u64 = 0,
     cap: u64 = 0,
-    already_owned: u64 = 0,
+    /// B-3d (§B3.17 R1): `promoteSet` refused because the region already owns a
+    /// live set — one set per region key is an ENFORCED invariant, and candidacy
+    /// must restart from fully-reporting windows after the owning set demotes.
+    region_owned: u64 = 0,
 };
 
 const PromotionDemotions = struct {
@@ -2004,6 +2009,10 @@ const PromotionDemotions = struct {
     /// never outlive the frozen state that justified them, and the drain's
     /// frozen-accumulator check stays a true invariant instead of a latent crash.
     unfreeze: u64 = 0,
+    /// B-3d (§B3.17 R1): a NEW armable member edge armed into a region that owns
+    /// a live set — the set no longer covers the region's armed-edge population,
+    /// so it demotes and candidacy regrows with the region-total candidate.
+    membership_growth: u64 = 0,
 };
 
 /// Part B-2a (doc 17 §B.5): the persistent logical relation between the
@@ -2148,9 +2157,9 @@ pub const TraceState = struct {
     /// B-3b.2 silent-cycle registry. `promoted_exit_owners` is the exclusive
     /// physical-exit ownership index required by §B3.9(4); ids, rather than list
     /// indices, remain stable across swap-removal.
-    promoted_cycles: std.ArrayListUnmanaged(PromotedCycle) = .empty,
+    promoted_sets: std.ArrayListUnmanaged(PromotedSet) = .empty,
     promoted_exit_owners: std.AutoHashMapUnmanaged(ExitKey, u32) = .empty,
-    next_promoted_cycle_id: u32 = 1,
+    next_promoted_set_id: u32 = 1,
     promotion_candidate: []PromotedEdge = &.{},
     promotion_candidate_run: u32 = 0,
     promotion_candidate_region: ?RegionKey = null,
@@ -2544,7 +2553,7 @@ pub const TraceState = struct {
     /// materialized row a burst still produced despite live promotion, keyed
     /// like the terminals. These rows are what end bursts (ledger-full) and
     /// what the suffix replay walks, so they are the remaining seam feedstock:
-    /// any hot key here is a candidate for a further promoted cycle.
+    /// any hot key here is a candidate for a further promoted set.
     dbg_silent_suffix_rows: std.AutoHashMapUnmanaged(DbgTerminalKey, u64) = .empty,
     /// B-3a seam gate input: every replay row is partitioned by whether its physical
     /// armed edge belongs to any bridge-free closed directed subcycle.
@@ -2912,22 +2921,23 @@ pub const TraceState = struct {
                 self.silent_budget_exhaustions,   self.silent_barren_exhaustions,
                 self.silent_suffix_drains,
             });
-            jitdbg.log("  silent rejects: bridge={d} region={d} open={d} child-mismatch={d} no-patch={d} cap={d} owned={d}", .{
+            jitdbg.log("  silent rejects: bridge={d} region={d} open={d} child-mismatch={d} no-patch={d} cap={d} region-owned={d}", .{
                 self.silent_rejects.bridge_member,
                 self.silent_rejects.region_mismatch,
                 self.silent_rejects.open_chain,
                 self.silent_rejects.child_mismatch,
                 self.silent_rejects.no_patch_point,
                 self.silent_rejects.cap,
-                self.silent_rejects.already_owned,
+                self.silent_rejects.region_owned,
             });
-            jitdbg.log("  silent demotions: activation={d} region-close={d} slot={d} trace={d} teardown={d} unfreeze={d}", .{
+            jitdbg.log("  silent demotions: activation={d} region-close={d} slot={d} trace={d} teardown={d} unfreeze={d} growth={d}", .{
                 self.silent_demotion_reasons.activation,
                 self.silent_demotion_reasons.region_close,
                 self.silent_demotion_reasons.slot_mutation,
                 self.silent_demotion_reasons.trace_invalidation,
                 self.silent_demotion_reasons.teardown,
                 self.silent_demotion_reasons.unfreeze,
+                self.silent_demotion_reasons.membership_growth,
             });
             for (self.dbg_burst_len_hist, 0..) |c, len| {
                 if (c != 0) jitdbg.log("  burst-len {d}: {d}", .{ len, c });
@@ -2985,7 +2995,7 @@ pub const TraceState = struct {
 
     pub fn deinit(self: *TraceState) void {
         self.dbgDumpBurstStats(); // jitdbg-only burst-terminal telemetry (Part B)
-        self.demoteAllCycles();
+        self.demoteAllSets();
         if (self.pending_demote.items.len != 0)
             @panic("TraceState.deinit: promotion demotion deferred during teardown");
         self.dbg_burst_terminals.deinit(self.gpa);
@@ -3003,7 +3013,7 @@ pub const TraceState = struct {
         self.pending_demote.deinit(self.gpa);
         if (self.promotion_candidate.len != 0) self.gpa.free(self.promotion_candidate);
         self.promoted_exit_owners.deinit(self.gpa);
-        self.promoted_cycles.deinit(self.gpa);
+        self.promoted_sets.deinit(self.gpa);
         self.provenance_edges.deinit(self.gpa);
         self.trace_by_id.deinit(self.gpa);
         self.coverage.deinit(self.gpa);
@@ -3436,7 +3446,7 @@ pub const TraceState = struct {
     /// Bulk image of sequential frozen-region ledger rows for one trace. Native
     /// summaries retain exactly the two selection-domain aggregates those calls
     /// mutate: total executed work and the number of qualifying rows. Because a
-    /// promoted cycle is bound to a consumed frozen region, the legacy
+    /// promoted set is bound to a consumed frozen region, the legacy
     /// penalty/strike half is unreachable here; accepting an unconsumed image
     /// would be inexact (row ordering is intentionally not present in the ABI),
     /// so it is a release contract failure.
@@ -3452,7 +3462,7 @@ pub const TraceState = struct {
         if (self.config.coverage) {
             if (completed > 0) self.noteTraceIters(t.anchor, completed);
             // Iteration totals remain exact. Per-trace TSC attribution cannot be:
-            // the promoted cycle executed as one uninterrupted native span, so
+            // the promoted set executed as one uninterrupted native span, so
             // there is no per-member timestamp boundary to reconstruct here.
             // Charge the drain-time span once per summarized member as diagnostic
             // attribution only, matching doc 17's explicit redefinition.
@@ -3546,14 +3556,14 @@ pub const TraceState = struct {
         self.demotePromotionsForRegionReason(key, .region_close);
     }
 
-    /// Backwards over `promoted_cycles` because `demoteCycleReason` swapRemoves at
+    /// Backwards over `promoted_sets` because `demoteSetReason` swapRemoves at
     /// depth 0 (mid-walk it queues instead) — forward iteration would skip entries.
     fn demotePromotionsForRegionReason(self: *TraceState, key: RegionKey, reason: DemotionReason) void {
-        var i = self.promoted_cycles.items.len;
+        var i = self.promoted_sets.items.len;
         while (i > 0) {
             i -= 1;
-            if (std.meta.eql(self.promoted_cycles.items[i].region_key, key))
-                self.demoteCycleReason(i, reason);
+            if (std.meta.eql(self.promoted_sets.items[i].region_key, key))
+                self.demoteSetReason(i, reason);
         }
     }
 
@@ -3563,13 +3573,13 @@ pub const TraceState = struct {
     pub fn prepareNativeEntry(self: *TraceState) void {
         // This is on every native entry; preserve the empty-registry common case
         // as one length branch before resolving activation state.
-        if (self.promoted_cycles.items.len == 0) return;
+        if (self.promoted_sets.items.len == 0) return;
         const active = if (self.region_context) |ctx| self.activeRegionFor(ctx.call_seq) else null;
-        var i = self.promoted_cycles.items.len;
+        var i = self.promoted_sets.items.len;
         while (i > 0) {
             i -= 1;
-            if (active == null or !std.meta.eql(self.promoted_cycles.items[i].region_key, active.?))
-                self.demoteCycleReason(i, .activation);
+            if (active == null or !std.meta.eql(self.promoted_sets.items[i].region_key, active.?))
+                self.demoteSetReason(i, .activation);
         }
     }
 
@@ -3585,7 +3595,7 @@ pub const TraceState = struct {
         // the A-vii-e.1 observer scan. Stage zeros behind one predictable branch;
         // the real staging cost is paid only while patched code exists, where it is
         // amortized across thousands of silent transitions.
-        if (self.promoted_cycles.items.len == 0) return .{};
+        if (self.promoted_sets.items.len == 0) return .{};
         var zero_run: u64 = 0;
         if (self.region_context) |ctx| {
             if (self.activeRegionFor(ctx.call_seq)) |key| {
@@ -3759,7 +3769,7 @@ pub const TraceState = struct {
         if (self.region_defs.getPtr(id)) |def| {
             def.armable = false;
             def.tombstoned = true; // fail-closed: recomputation must never re-arm
-            self.demoteCyclesForRegionDefsMutation();
+            self.demoteSetsForRegionDefsMutation();
             bumpGen(&self.region_defs_gen); // invalidate Trace.region_memo_*
         }
         while (true) {
@@ -4270,9 +4280,9 @@ pub const TraceState = struct {
         // must precede every deferred physical-slot disarm.
         while (self.pending_demote.items.len > 0) {
             const pending = self.pending_demote.pop().?;
-            for (self.promoted_cycles.items, 0..) |cycle, i| {
+            for (self.promoted_sets.items, 0..) |cycle, i| {
                 if (cycle.id == pending.id) {
-                    self.demoteCycleReason(i, pending.reason);
+                    self.demoteSetReason(i, pending.reason);
                     break;
                 }
             }
@@ -5239,7 +5249,7 @@ pub const TraceState = struct {
         next_entry: EntryMaterialization,
         frozen_fast: ?FrozenFast,
         /// false only for a silent-prefix suffix entry, where row 0's owner is the
-        /// promoted cycle's off-cycle successor, not the burst's seed owner.
+        /// promoted set's off-cycle successor, not the burst's seed owner.
         check_seed: bool = true,
     };
 
@@ -5284,7 +5294,7 @@ pub const TraceState = struct {
         resume_pc.* = edge_resume_pc;
     }
 
-    const SilentCellOwner = struct { cycle: *PromotedCycle, phase: usize };
+    const SilentCellOwner = struct { set: *PromotedSet, phase: usize };
 
     /// Resolve a `*SilentExitMetadata` address published by a silent epilogue back to
     /// the promoted edge that owns it.
@@ -5293,9 +5303,10 @@ pub const TraceState = struct {
     /// a silent burst used to be RECONSTRUCTED as `(first_phase + t) % len` from the
     /// call-global transition count. That arithmetic silently assumed every silent
     /// transition was the next phase of one ring in which every trace owns exactly one
-    /// phase — and nothing enforces either half. `computeSiblingReturnDistances`
-    /// explicitly supports a ring that repeats a parent, and `promoted_cycles` holds up
-    /// to `PROMOTED_CYCLE_CAP` concurrently live rings, so both assumptions are
+    /// phase — and nothing enforces either half. B-3d finished the job: a promoted
+    /// SET has no phase order at all (canonical storage order is (parent id, exit)),
+    /// may repeat a parent freely, and `promoted_sets` holds up
+    /// to `PROMOTED_SET_CAP` concurrently live sets, so both assumptions are
     /// violable by construction. The failure was silent and severe: a wrong terminal
     /// edge yields a wrong tier-0 resume PC (the A-viii "missing prime 307" class) and
     /// a wrong committed count, with no panic to catch it. Native now publishes what
@@ -5304,33 +5315,15 @@ pub const TraceState = struct {
     fn silentCellOwner(self: *TraceState, cell_addr: u64) ?SilentCellOwner {
         if (cell_addr == 0) return null;
         var found: ?SilentCellOwner = null;
-        for (self.promoted_cycles.items) |*cycle| {
-            for (cycle.metadata, 0..) |*metadata, phase| {
+        for (self.promoted_sets.items) |*set| {
+            for (set.metadata, 0..) |*metadata, phase| {
                 if (@intFromPtr(metadata) != cell_addr) continue;
                 if (found != null)
                     @panic("driveSilentBurst: silent metadata cell is ambiguous");
-                found = .{ .cycle = cycle, .phase = phase };
+                found = .{ .set = set, .phase = phase };
             }
         }
         return found;
-    }
-
-    fn computeSiblingReturnDistances(edges: []const PromotedEdge, out: []u8) void {
-        if (edges.len == 0 or edges.len > PROMOTED_CYCLE_CAP or out.len != edges.len)
-            @panic("promotion: invalid sibling return-distance storage");
-        for (edges, 0..) |edge, phase| {
-            const full_return = @max(edges.len, 2);
-            var distance: usize = 2;
-            while (distance < full_return and
-                edges[(phase + distance) % edges.len].parent.id != edge.parent.id) : (distance += 1)
-            {}
-            // A full revolution always arrives at this phase's own parent. A
-            // one-edge ring needs two revolutions because reporting requires at
-            // least one intervening child row (j >= k + 2).
-            if (distance > full_return)
-                @panic("promotion: sibling return-distance proof failed");
-            out[phase] = @intCast(distance);
-        }
     }
 
     const SilentSiblingEvidence = struct {
@@ -5348,33 +5341,57 @@ pub const TraceState = struct {
     /// productive on the strength of progress that happened before its final,
     /// barren firing — under-reporting strikes and letting an unproductive handoff
     /// escape demotion.
+    ///
+    /// B-3d (doc 17 §B3.16 D3, §B3.17 R3/R4): `returned_to_parent` is MEASURED, not
+    /// reconstructed from a ring return distance. Ordinals are call-global and
+    /// monotonic, so "control returned to P after e's most recent firing at k" is
+    /// exactly: some live cell whose edge's PARENT is P recorded a strictly later
+    /// firing (a firing out of P proves control was at P), OR the reporting suffix
+    /// contains a row whose owner is P (every suffix row is later than every silent
+    /// firing; arrival ownership = `row.id`, exactly as `captureProvenanceVerdicts`
+    /// scans it — a failed-prologue row's baked id IS the arriving trace). Strictly
+    /// `>` suffices: e's firing at k moves control INTO the child, so the earliest
+    /// later firing out of P is k+2 — the one-intervening-child-row requirement the
+    /// ring distance encoded is implied by monotonicity. For self-edges (P → P) and
+    /// repeated-parent sets this is STRONGER than the ring bound it replaces: the
+    /// firing under judgment never counts as its own return evidence, and the old
+    /// call-global bound `last_ordinal + distance <= transitions` could be satisfied
+    /// by a second live set's firings with no actual return to P (pre-existing false
+    /// strike, Rule #0.5 — eliminated by measuring arrivals at P specifically).
     fn silentSiblingEvidence(
+        self: *TraceState,
         cell: nativegen.SilentSummaryCell,
         followed: u64,
-        transitions: u64,
         last_productive_ordinal: u64,
-        return_distance: u8,
-        ring_len: usize,
+        parent_id: u32,
+        suffix_rows: []const irinterp.LedgerEntry,
     ) SilentSiblingEvidence {
-        if (return_distance < 2 or return_distance > @max(ring_len, 2))
-            @panic("driveSilentBurst: invalid sibling return distance");
         if (cell.last_ordinal == 0)
             @panic("driveSilentBurst: fired edge has no firing ordinal");
+        var returned = false;
+        for (self.promoted_sets.items) |*c| {
+            for (c.edges, c.summary) |other_edge, other_cell| {
+                if (other_edge.parent.id == parent_id and
+                    other_cell.last_ordinal > cell.last_ordinal)
+                {
+                    returned = true;
+                }
+            }
+        }
+        if (!returned) {
+            for (suffix_rows) |row| {
+                if (row.id == parent_id) {
+                    returned = true;
+                    break;
+                }
+            }
+        }
         return .{
             // Progress at or after this relation's most recent firing is service
             // for it; earlier progress belongs to an observation reporting already
             // closed.
             .productive = followed != 0 and last_productive_ordinal >= cell.last_ordinal,
-            // A zero-progress strike additionally needs a later arrival back at P.
-            // The evidence reporting uses is the ROW for that arrival, and a row is
-            // appended by every materialized transition — including the final one,
-            // whose jump a rowless budget stop suppresses. So this is bounded by the
-            // total transition count, not by how many were followed. (Pre-round-6
-            // this compared a 0-based offset against `followed_transitions`, which
-            // happened to agree only in the rowless case and was one too permissive
-            // whenever a suffix existed.)
-            .returned_to_parent = followed != 0 and
-                cell.last_ordinal + @as(u64, return_distance) <= transitions,
+            .returned_to_parent = followed != 0 and returned,
         };
     }
 
@@ -5401,6 +5418,14 @@ pub const TraceState = struct {
         // storage must remain live until this drain has consumed every cell and
         // derived the terminal resume contract. The origin applies queued work
         // immediately after this returns.
+        //
+        // COMMENT-ASSERT (§B3.18 R5(b)): no promotion or demotion may execute
+        // between the native call's return and this drain. Today that holds by
+        // construction — the drain is the FIRST act at every origin, and mid-walk
+        // demotion is queued — and it is load-bearing: `silent_cell` /
+        // `silent_last_cell` resolve against promotion storage as it was when
+        // native published them. Any future safe point inserted between return
+        // and drain would let those cell addresses go stale.
         const seam_t0: u64 = if (self.config.coverage and self.replay_walk_depth == 0)
             readCycles()
         else
@@ -5417,25 +5442,24 @@ pub const TraceState = struct {
         // Both endpoints of the burst are resolved by MEASUREMENT: `silent_cell` is
         // the first promoted edge that fired (first-cell ownership) and fixes the
         // entry phase; `silent_last_cell` is the last one and fixes the resume
-        // contract. They may belong to different live cycles, and neither survives
-        // reconstruction once a ring repeats a parent or two rings are live.
+        // contract. They may belong to different live sets, and neither survives
+        // reconstruction once a set repeats a parent or two sets are live.
         const entry_owner = self.silentCellOwner(result.silent_cell) orelse
             @panic("driveSilentBurst: silent metadata cell has no live promotion");
-        const cycle = entry_owner.cycle;
+        const entry_set = entry_owner.set;
         const first_phase = entry_owner.phase;
         const last_owner = self.silentCellOwner(result.silent_last_cell) orelse
             @panic("driveSilentBurst: silent terminal cell has no live promotion");
-        const last_cycle = last_owner.cycle;
+        const last_set = last_owner.set;
         const last_phase = last_owner.phase;
-        for (self.promoted_cycles.items) |*c| {
+        for (self.promoted_sets.items) |*c| {
             if (c.edges.len == 0 or c.edges.len != c.summary.len or
-                c.edges.len != c.metadata.len or
-                c.edges.len != c.sibling_return_distance.len)
-                @panic("driveSilentBurst: promoted cycle storage is inconsistent");
+                c.edges.len != c.metadata.len)
+                @panic("driveSilentBurst: promoted set storage is inconsistent");
         }
         if (result.ledger_len > irinterp.LEDGER_CAP)
             @panic("driveSilentBurst: suffix ledger exceeds cap");
-        const last_edge_local = last_cycle.summary[last_phase].last_local;
+        const last_edge_local = last_set.summary[last_phase].last_local;
         if (last_edge_local > std.math.maxInt(usize))
             @panic("driveSilentBurst: last edge local exceeds usize");
         self.silent_provenance_len = 0;
@@ -5444,7 +5468,7 @@ pub const TraceState = struct {
         // "did anything make progress at or after this firing" stays one comparison.
         var last_productive_ordinal: u64 = 0;
         var total_firings: u64 = 0;
-        for (self.promoted_cycles.items) |*c| {
+        for (self.promoted_sets.items) |*c| {
             for (c.summary) |cell| {
                 last_productive_ordinal = @max(last_productive_ordinal, cell.last_productive_ordinal);
                 total_firings +|= cell.firings;
@@ -5464,7 +5488,13 @@ pub const TraceState = struct {
 
         var loop_done_count: u64 = 0;
         var suppressed_hops: u64 = 0;
-        for (self.promoted_cycles.items) |*c| {
+        // COMMENT-ASSERT (§B3.18 R5(a)): this expansion iterates sets and cells in
+        // STORAGE order, which carries no information about firing order. That is
+        // sound only while every summary mutation below stays additive (saturating
+        // sums) or measurement-carried (per-cell ordinals; one most-recent-firing
+        // verdict per edge). Do not add order-sensitive derivation here — anything
+        // that needs sequence must be measured into the cells by the epilogues.
+        for (self.promoted_sets.items) |*c| {
             var region_work: u64 = 0;
             var fired = false;
             for (c.edges, 0..) |edge, phase| {
@@ -5478,7 +5508,7 @@ pub const TraceState = struct {
                 // A rowless budget/barren return suppresses the final edge's jump to
                 // its successor. Its materialization/work still happened, but replay
                 // would not charge a fused/follow counter for that terminal row.
-                const is_terminal = c == last_cycle and phase == last_phase;
+                const is_terminal = c == last_set and phase == last_phase;
                 const followed = fires - @intFromBool(result.ledger_len == 0 and is_terminal);
                 region_work +|= cell.region_work;
                 if (cell.selection_work > std.math.maxInt(usize))
@@ -5506,13 +5536,12 @@ pub const TraceState = struct {
                     },
                     .sibling_handoff => {
                         self.sibling_handoff_fused +|= followed;
-                        const evidence = silentSiblingEvidence(
+                        const evidence = self.silentSiblingEvidence(
                             cell,
                             followed,
-                            result.silent_transitions,
                             last_productive_ordinal,
-                            c.sibling_return_distance[phase],
-                            c.edges.len,
+                            edge.parent.id,
+                            self.ledger_scratch[0..result.ledger_len],
                         );
                         self.stageSilentSiblingProvenance(
                             edge,
@@ -5529,19 +5558,19 @@ pub const TraceState = struct {
             // Only a cycle that actually fired must be — and is — provably part of
             // the live activation it credits.
             if (!std.meta.eql(active.?, c.region_key))
-                @panic("driveSilentBurst: promoted cycle activation is not active");
+                @panic("driveSilentBurst: promoted set activation is not active");
             const c_accum = self.region_profit.getPtr(c.region_key) orelse
-                @panic("driveSilentBurst: promoted cycle accumulator is missing");
+                @panic("driveSilentBurst: promoted set accumulator is missing");
             if (!c_accum.frozen)
-                @panic("driveSilentBurst: promoted cycle accumulator is not frozen");
+                @panic("driveSilentBurst: promoted set accumulator is not frozen");
             if (region_work > std.math.maxInt(usize))
                 @panic("driveSilentBurst: region summary exceeds usize");
             if (region_work != 0) self.creditRegionWork(c.region_key, c_accum, @intCast(region_work));
         }
         // Every fired cycle proved `region_key == active`, so they all share one
         // accumulator; the entry cycle always fired, so its lookup names it.
-        const accum = self.region_profit.getPtr(cycle.region_key) orelse
-            @panic("driveSilentBurst: promoted cycle accumulator is missing");
+        const accum = self.region_profit.getPtr(entry_set.region_key) orelse
+            @panic("driveSilentBurst: promoted set accumulator is missing");
         if (loop_done_count > std.math.maxInt(usize) - linked_completed.*)
             linked_completed.* = std.math.maxInt(usize)
         else
@@ -5549,7 +5578,7 @@ pub const TraceState = struct {
         // Sequential replay charges one hop per loop-done except the first row of
         // an inner-call ledger. Preserve that exception when the first suppressed
         // transition is itself loop-done, then saturate at the caller's bound.
-        if (origin == .inner_call and cycle.edges[first_phase].arm_kind == .loop_done_linked and suppressed_hops > 0)
+        if (origin == .inner_call and entry_set.edges[first_phase].arm_kind == .loop_done_linked and suppressed_hops > 0)
             suppressed_hops -= 1;
         const hop_room = max_hops -| hops.*;
         hops.* += @intCast(@min(suppressed_hops, hop_room));
@@ -5560,7 +5589,7 @@ pub const TraceState = struct {
             if (self.config.max_barren_run == 0)
                 @panic("driveSilentBurst: zero barren budget");
             accum.barren_run = self.config.max_barren_run - 1;
-            self.noteBarrenConsumed(cycle.region_key, accum);
+            self.noteBarrenConsumed(entry_set.region_key, accum);
             self.silent_barren_exhaustions +|= 1;
         } else {
             if (result.cur_zero_run > std.math.maxInt(u32))
@@ -5568,20 +5597,29 @@ pub const TraceState = struct {
             accum.barren_run = @intCast(result.cur_zero_run);
         }
 
+        // B-3d (doc 17 §B3.16 D4): the terminal-resume check is MEASURED, and
+        // stronger than the ring-successor assert it replaced. The claimed terminal
+        // cell must literally own the final call-global ordinal: the epilogue stamps
+        // `last_ordinal = transitions + 1` and then increments the transition count,
+        // and silence cannot resume after a reporting row, so for ANY interleaving
+        // of set edges the last fired cell's ordinal equals the transition total.
+        // (The ring assert validated phase reconstruction; this validates the
+        // measurement the resume contract is actually derived from.) Must run
+        // BEFORE the mailbox clear below — it reads the summary image.
+        if (last_set.summary[last_phase].last_ordinal != result.silent_transitions)
+            @panic("driveSilentBurst: terminal cell does not own the final ordinal");
+
         // Summary cells are a per-call mailbox. Native only adds; the driver
-        // clears after consuming the complete image. EVERY live cycle is cleared,
-        // not just the entry one — a second live ring that fused into this call
+        // clears after consuming the complete image. EVERY live set is cleared,
+        // not just the entry one — a second live set that fused into this call
         // would otherwise re-apply its work on its own next drain.
-        for (self.promoted_cycles.items) |*c|
+        for (self.promoted_sets.items) |*c|
             @memset(c.summary, std.mem.zeroes(nativegen.SilentSummaryCell));
         self.silent_bursts_drained +|= 1;
         self.silent_transitions_total +|= result.silent_transitions;
         self.silent_hops_total +|= result.silent_transitions;
 
-        const last_edge = last_cycle.edges[last_phase];
-        const next_phase = (last_phase + 1) % last_cycle.edges.len;
-        if (last_cycle.edges[next_phase].parent != last_edge.child)
-            @panic("driveSilentBurst: next phase does not match the last edge successor");
+        const last_edge = last_set.edges[last_phase];
         if (result.silent_cum > std.math.maxInt(usize))
             @panic("driveSilentBurst: silent cumulative count exceeds usize");
         if (result.ledger_len > 0) {
@@ -8715,7 +8753,7 @@ pub const TraceState = struct {
         // Freeze-after-qualify: every branch above may have mutated defs
         // (new defs, armable recomputes, tombstones) — one bump per rebuild
         // transaction invalidates all per-trace membership memos.
-        self.demoteCyclesForRegionDefsMutation();
+        self.demoteSetsForRegionDefsMutation();
         bumpGen(&self.region_defs_gen);
         freeRegionSetMap(ExitKey, &self.source_exit_regions, gpa);
         freeRegionSetMap(u32, &self.dest_entry_regions, gpa);
@@ -8821,12 +8859,12 @@ pub const TraceState = struct {
     /// from `child`+`kind` here (never trusting a caller-supplied address) is what
     /// makes the S2 provenance argument hold by construction.
     ///
-    const PROMOTED_CYCLE_CAP: usize = 16;
+    const PROMOTED_SET_CAP: usize = 16;
     // At most 16 promoted phases can contribute prefix relations. A 32-row
     // reporting suffix can evidence at most 31 distinct parent→child relations
     // (each needs a following row), so the merged maximum is 47. Allocate 48 by
     // the natural component sum and keep every overflow path release-panicking.
-    const PROVENANCE_VERDICT_CAP: usize = PROMOTED_CYCLE_CAP + irinterp.LEDGER_CAP;
+    const PROVENANCE_VERDICT_CAP: usize = PROMOTED_SET_CAP + irinterp.LEDGER_CAP;
 
     fn exitPatchFor(compiled: *nativegen.CompiledTrace, exit: u32) ?*nativegen.ExitPatch {
         for (compiled.exit_patches) |*patch| if (patch.exit_instr == exit) return patch;
@@ -8967,7 +9005,7 @@ pub const TraceState = struct {
         child_mismatch,
         no_patch_point,
         cap,
-        already_owned,
+        region_owned,
     };
 
     fn rejectPromotion(self: *TraceState, reason: PromotionRejectReason) ?[]PromotedEdge {
@@ -8979,7 +9017,7 @@ pub const TraceState = struct {
             .child_mismatch => self.silent_rejects.child_mismatch +|= 1,
             .no_patch_point => self.silent_rejects.no_patch_point +|= 1,
             .cap => self.silent_rejects.cap +|= 1,
-            .already_owned => self.silent_rejects.already_owned +|= 1,
+            .region_owned => self.silent_rejects.region_owned +|= 1,
         }
         return null;
     }
@@ -8994,80 +9032,38 @@ pub const TraceState = struct {
         };
     }
 
-    /// Observation proposes one ordered physical-edge ring; the armed-link
-    /// registry proves every transition and the wraparound. A trace may have any
-    /// number of other armed exits: only the observed `(trace id, exit)` sites are
-    /// patched, and taking another exit naturally terminates silence into a suffix.
-    fn detectPhysicalCycle(self: *TraceState, entries: []const irinterp.LedgerEntry) ?[]PromotedEdge {
-        if (entries.len < 2) return self.rejectPromotion(.open_chain);
-
-        var owners: [irinterp.LEDGER_CAP]*Trace = undefined;
-        if (entries.len > owners.len) return self.rejectPromotion(.cap);
-        for (entries, 0..) |row, i| {
-            owners[i] = self.traceById(row.id) orelse return self.rejectPromotion(.open_chain);
-        }
-
-        // The first repeated physical exit fixes both the observed ring start and
-        // its length. Everything outside that slice must still be a phase-correct
-        // prefix/suffix of the same ring; otherwise observation never established a
-        // single closed composition.
-        var ring_start: ?usize = null;
-        var repeat_at: ?usize = null;
-        outer: for (entries, 0..) |row, i| {
-            for (entries[0..i], 0..) |prior, j| {
-                if (prior.id == row.id and prior.exit == row.exit) {
-                    ring_start = j;
-                    repeat_at = i;
-                    break :outer;
-                }
+    /// B-3d (doc 17 §B3.16 D1, §B3.18 R7): the ONE per-edge membership predicate
+    /// shared by candidacy (`detectPromotableSet`), promotion re-validation
+    /// (`promotionBelongsToRegion`), and the membership-growth trigger at the
+    /// `armNativeLink` funnel (`noteMembershipGrowth`). A narrower trigger
+    /// predicate would re-create trigger-invisible residue (rows only ever seen in
+    /// suffix ledgers, which candidacy deliberately never reads) and reopen the
+    /// mixed-suffix scenario R1 closed.
+    ///
+    /// `require_bridge_stamp`: candidacy and re-validation pass `true` — a
+    /// `.region_bridge` edge must have its unique armed link stamped with this
+    /// exact region (`tryArmRegionBridge`'s restamp). The growth trigger passes
+    /// `false` because it evaluates INSIDE the arm funnel, before the caller's
+    /// restamp runs — for a fresh bridge arm the stamp is still null there.
+    /// Skipping the stamp check widens the trigger, and wider is the safe
+    /// direction: the worst case is one extra demote-and-regrow round, whereas
+    /// requiring the stamp would make every fresh bridge arm invisible to growth.
+    fn edgeMemberOfRegion(self: *TraceState, edge: PromotedEdge, region_id: RegionId, require_bridge_stamp: bool) bool {
+        if (!self.regionMemberPoint(region_id, edge.parent.anchor.proto.id, edge.parent.anchor.pc) or
+            !self.regionMemberPoint(region_id, edge.child.anchor.proto.id, edge.child.anchor.pc))
+            return false;
+        if (edge.arm_kind == .region_bridge and require_bridge_stamp) {
+            var matching: ?*const NativeLink = null;
+            for (self.armed_links.items) |*link| {
+                if (link.parent != edge.parent or link.slot_index != edge.exit or
+                    link.child != edge.child or link.kind != .region_bridge) continue;
+                if (matching != null) return false;
+                matching = link;
             }
+            const link = matching orelse return false;
+            if (link.region_id == null or link.region_id.? != region_id) return false;
         }
-        const start = ring_start orelse return self.rejectPromotion(.open_chain);
-        const end = repeat_at.?;
-        const len = end - start;
-        if (len == 0) return self.rejectPromotion(.open_chain);
-        if (len > PROMOTED_CYCLE_CAP) return self.rejectPromotion(.cap);
-
-        for (entries, 0..) |row, i| {
-            const phase = (i + len - (start % len)) % len;
-            const expected = entries[start + phase];
-            if (row.id != expected.id or row.exit != expected.exit)
-                return self.rejectPromotion(.open_chain);
-        }
-
-        var scratch: [PROMOTED_CYCLE_CAP]PromotedEdge = undefined;
-        for (0..len) |phase| {
-            const row = entries[start + phase];
-            const parent = owners[start + phase];
-            const next_parent = owners[start + ((phase + 1) % len)];
-            if (self.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = row.exit }))
-                return self.rejectPromotion(.already_owned);
-            const observed_kind = rowPatchKind(row.kind) orelse
-                return self.rejectPromotion(.no_patch_point);
-
-            var found: ?NativeLink = null;
-            for (self.armed_links.items) |link| {
-                if (link.parent != parent or link.slot_index != row.exit) continue;
-                if (found != null) return self.rejectPromotion(.child_mismatch);
-                found = link;
-            }
-            const link = found orelse return self.rejectPromotion(.open_chain);
-            if (link.child != next_parent) return self.rejectPromotion(.child_mismatch);
-            const edge = self.promotedEdgeFromLink(link) orelse
-                return self.rejectPromotion(.no_patch_point);
-            if (edge.kind != observed_kind) return self.rejectPromotion(.no_patch_point);
-            scratch[phase] = edge;
-        }
-
-        var first: usize = 0;
-        for (scratch[1..len], 1..) |edge, i| {
-            const best = scratch[first];
-            if (edge.parent.id < best.parent.id or
-                (edge.parent.id == best.parent.id and edge.exit < best.exit)) first = i;
-        }
-        const result = self.gpa.alloc(PromotedEdge, len) catch return self.rejectPromotion(.cap);
-        for (result, 0..) |*dst, i| dst.* = scratch[(first + i) % len];
-        return result;
+        return true;
     }
 
     fn promotionBelongsToRegion(self: *TraceState, edges: []const PromotedEdge, key: RegionKey) bool {
@@ -9076,31 +9072,93 @@ pub const TraceState = struct {
         const accum = self.region_profit.get(key) orelse return false;
         if (!accum.frozen) return false;
         for (edges) |edge| {
-            if (!self.regionMemberPoint(key.region_id, edge.parent.anchor.proto.id, edge.parent.anchor.pc) or
-                !self.regionMemberPoint(key.region_id, edge.child.anchor.proto.id, edge.child.anchor.pc))
-                return false;
-            if (edge.arm_kind == .region_bridge) {
-                var matching: ?*const NativeLink = null;
-                for (self.armed_links.items) |*link| {
-                    if (link.parent != edge.parent or link.slot_index != edge.exit or
-                        link.child != edge.child or link.kind != .region_bridge) continue;
-                    if (matching != null) return false;
-                    matching = link;
-                }
-                const link = matching orelse return false;
-                if (link.region_id == null or link.region_id.? != key.region_id) return false;
-            }
+            if (!self.edgeMemberOfRegion(edge, key.region_id, true)) return false;
         }
         return true;
     }
 
-    fn detectPromotableCycle(self: *TraceState, entries: []const irinterp.LedgerEntry, key: RegionKey) ?[]PromotedEdge {
-        const edges = self.detectPhysicalCycle(entries) orelse return null;
-        if (!self.promotionBelongsToRegion(edges, key)) {
-            self.gpa.free(edges);
-            return self.rejectPromotion(.region_mismatch);
+    /// B-3d (doc 17 §B3.16 D1): the candidate is the REGION-TOTAL armed-edge set —
+    /// every armed, patch-pointed, un-owned region-member edge at the observation
+    /// instant, in canonical (parent id, exit) order. The forced-yield ledger is
+    /// evidence when every row is one of the candidate's edges, each row's patch
+    /// kind matches its edge, and each non-final row's armed child owns the next
+    /// row (per-adjacent-pair child-match — the successor-evidence strength of the
+    /// old ring grammar without requiring periodicity; the final `.yielded` row's
+    /// jump is suppressed by `emitForcedYieldCheck` and is exempt). Repetition
+    /// structure is NOT required: sets subsume rings (a ring is a set whose
+    /// automaton happens to be periodic), which is what lets a data-dependent
+    /// sibling automaton (the nsieve:14 triangle) promote at all.
+    ///
+    /// A candidate edge that appears in no evidence ledger still promotes — an
+    /// explicit accepted trade (§B3.18 R5(c)): registry proof
+    /// (`promotedEdgeFromLink` slot/patch/entry identity) is what makes the jump
+    /// target correct; firing evidence then arrives via summary cells. A trace may
+    /// have any number of other armed exits: only member edges are patched, and
+    /// taking any other exit naturally terminates silence into a reporting suffix.
+    /// The candidate is a pure function of deterministic state (armed-link
+    /// registry + region membership + ledger), so the promotion instant stays
+    /// reproducible across the replay modes.
+    fn detectPromotableSet(self: *TraceState, entries: []const irinterp.LedgerEntry, key: RegionKey) ?[]PromotedEdge {
+        const def = self.region_defs.get(key.region_id) orelse return self.rejectPromotion(.region_mismatch);
+        if (!def.armable) return self.rejectPromotion(.region_mismatch);
+        if (entries.len == 0) return self.rejectPromotion(.open_chain);
+
+        // Region-total candidate from the armed-link registry.
+        var scratch: [PROMOTED_SET_CAP]PromotedEdge = undefined;
+        var n: usize = 0;
+        for (self.armed_links.items) |link| {
+            const edge = self.promotedEdgeFromLink(link) orelse continue;
+            if (!self.edgeMemberOfRegion(edge, key.region_id, true)) continue;
+            if (self.promoted_exit_owners.contains(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
+                continue;
+            if (n == PROMOTED_SET_CAP) return self.rejectPromotion(.cap);
+            scratch[n] = edge;
+            n += 1;
         }
-        return edges;
+        if (n == 0) return self.rejectPromotion(.open_chain);
+
+        // Canonical order: (parent id, exit). Insertion sort; n <= 16.
+        for (1..n) |i| {
+            const e = scratch[i];
+            var j = i;
+            while (j > 0 and (scratch[j - 1].parent.id > e.parent.id or
+                (scratch[j - 1].parent.id == e.parent.id and scratch[j - 1].exit > e.exit))) : (j -= 1)
+            {
+                scratch[j] = scratch[j - 1];
+            }
+            scratch[j] = e;
+        }
+        // One record per (parent, slot) is an `armNativeLink` invariant; a
+        // duplicate here means the registry broke it. Fail closed.
+        for (1..n) |i| {
+            if (scratch[i].parent.id == scratch[i - 1].parent.id and
+                scratch[i].exit == scratch[i - 1].exit)
+                return self.rejectPromotion(.child_mismatch);
+        }
+
+        // Evidence: every row ∈ candidate, kind-exact, per-adjacent-pair
+        // child-match. Non-final rows are always `.normal`-outcome materialized
+        // transitions, and a `.prologue_fail` row can never match a candidate edge
+        // (`rowPatchKind` has no patch point for it), so the grammar is total.
+        for (entries, 0..) |row, i| {
+            const observed_kind = rowPatchKind(row.kind) orelse
+                return self.rejectPromotion(.no_patch_point);
+            var found: ?PromotedEdge = null;
+            for (scratch[0..n]) |edge| {
+                if (edge.parent.id == row.id and edge.exit == row.exit) {
+                    found = edge;
+                    break;
+                }
+            }
+            const edge = found orelse return self.rejectPromotion(.open_chain);
+            if (edge.kind != observed_kind) return self.rejectPromotion(.no_patch_point);
+            if (i + 1 < entries.len and edge.child.id != entries[i + 1].id)
+                return self.rejectPromotion(.child_mismatch);
+        }
+
+        const result = self.gpa.alloc(PromotedEdge, n) catch return self.rejectPromotion(.cap);
+        @memcpy(result, scratch[0..n]);
+        return result;
     }
 
     fn originalRel32Target(compiled: *const nativegen.CompiledTrace, patch: *const nativegen.ExitPatch) usize {
@@ -9140,9 +9198,19 @@ pub const TraceState = struct {
         }
     }
 
-    fn promoteCycle(self: *TraceState, edges: []PromotedEdge, region_key: RegionKey) !void {
-        if (edges.len == 0 or edges.len > PROMOTED_CYCLE_CAP) return error.InvalidPromotionCycle;
-        if (self.next_promoted_cycle_id == std.math.maxInt(u32)) return error.PromotionIdExhausted;
+    fn promoteSet(self: *TraceState, edges: []PromotedEdge, region_key: RegionKey) !void {
+        if (edges.len == 0 or edges.len > PROMOTED_SET_CAP) return error.InvalidPromotionSet;
+        if (self.next_promoted_set_id == std.math.maxInt(u32)) return error.PromotionIdExhausted;
+        // B-3d (§B3.17 R1): ONE live set per region key, enforced — not assumed.
+        // The reachable race this closes: a growth demote queued mid-walk has not
+        // applied yet when a promotion-eligible candidate arrives; accepting the
+        // second set would put two overlapping promotions on one region and break
+        // the PROVENANCE_VERDICT_CAP sizing argument. The reject resets the
+        // candidate streak (caller), costing one extra 4-window round —
+        // deterministic and accepted (§B3.18 R7 churn note).
+        for (self.promoted_sets.items) |s| {
+            if (std.meta.eql(s.region_key, region_key)) return error.PromotionRegionOwned;
+        }
         if (!self.promotionBelongsToRegion(edges, region_key)) return error.InvalidPromotionRegion;
         for (edges) |edge| {
             const validated = self.promotedEdgeFromLink(.{
@@ -9150,18 +9218,15 @@ pub const TraceState = struct {
                 .slot_index = edge.exit,
                 .child = edge.child,
                 .kind = edge.arm_kind,
-            }) orelse return error.InvalidPromotionCycle;
+            }) orelse return error.InvalidPromotionSet;
             if (validated.kind != edge.kind or validated.resume_pc != edge.resume_pc)
-                return error.InvalidPromotionCycle;
+                return error.InvalidPromotionSet;
             if (self.promoted_exit_owners.contains(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
                 return error.PromotionExitOwned;
         }
 
         const owned_edges = try self.gpa.dupe(PromotedEdge, edges);
         errdefer self.gpa.free(owned_edges);
-        const sibling_return_distance = try self.gpa.alloc(u8, edges.len);
-        errdefer self.gpa.free(sibling_return_distance);
-        computeSiblingReturnDistances(owned_edges, sibling_return_distance);
         const summary = try self.gpa.alloc(nativegen.SilentSummaryCell, edges.len);
         errdefer self.gpa.free(summary);
         @memset(summary, std.mem.zeroes(nativegen.SilentSummaryCell));
@@ -9182,12 +9247,12 @@ pub const TraceState = struct {
             };
         }
 
-        try self.promoted_cycles.ensureUnusedCapacity(self.gpa, 1);
+        try self.promoted_sets.ensureUnusedCapacity(self.gpa, 1);
         try self.promoted_exit_owners.ensureUnusedCapacity(self.gpa, @intCast(edges.len));
         // At most one queued id per live cycle. Reserve against the registry
         // size (not the pending list's current length, normally zero), so a
         // global sweep during replay can queue every cycle without allocation.
-        try self.pending_demote.ensureTotalCapacity(self.gpa, self.promoted_cycles.items.len + 1);
+        try self.pending_demote.ensureTotalCapacity(self.gpa, self.promoted_sets.items.len + 1);
 
         // Publication: initialized metadata first, then pointer cells, code last.
         for (owned_edges, 0..) |edge, i| {
@@ -9198,7 +9263,7 @@ pub const TraceState = struct {
             while (patched > 0) {
                 patched -= 1;
                 self.patchPromotedEdge(owned_edges[patched], false) catch
-                    @panic("promoteCycle: failed to restore reporting code during unwind");
+                    @panic("promoteSet: failed to restore reporting code during unwind");
             }
             for (owned_edges) |edge| edge.parent.native.compiled.metadata_cells[edge.exit] = 0;
         }
@@ -9207,11 +9272,10 @@ pub const TraceState = struct {
             patched += 1;
         }
 
-        const id = self.next_promoted_cycle_id;
-        self.next_promoted_cycle_id += 1;
-        self.promoted_cycles.appendAssumeCapacity(.{
+        const id = self.next_promoted_set_id;
+        self.next_promoted_set_id += 1;
+        self.promoted_sets.appendAssumeCapacity(.{
             .edges = owned_edges,
-            .sibling_return_distance = sibling_return_distance,
             .summary = summary,
             .metadata = metadata,
             .region_key = region_key,
@@ -9224,7 +9288,7 @@ pub const TraceState = struct {
         self.silent_promotions +|= 1;
         if (comptime jitdbg.enabled) {
             if (self.config.debug_log) {
-                jitdbg.log("silent-promote: cycle={d} region={d} len={d}", .{
+                jitdbg.log("silent-promote: set={d} region={d} len={d}", .{
                     id, region_key.region_id, owned_edges.len,
                 });
                 for (owned_edges, 0..) |edge, i| {
@@ -9288,7 +9352,7 @@ pub const TraceState = struct {
             self.resetPromotionCandidate();
             return;
         }
-        const detected = self.detectPromotableCycle(entries, key) orelse {
+        const detected = self.detectPromotableSet(entries, key) orelse {
             self.resetPromotionCandidate();
             return;
         };
@@ -9307,8 +9371,15 @@ pub const TraceState = struct {
         }
         const threshold = @max(self.config.promote_after, 1);
         if (self.promotion_candidate_run < threshold) return;
-        self.promoteCycle(self.promotion_candidate, key) catch {
-            self.silent_rejects.no_patch_point +|= 1;
+        self.promoteSet(self.promotion_candidate, key) catch |err| {
+            switch (err) {
+                // §B3.17 R1: the region already owns a live set (e.g. a growth
+                // demote is queued but not yet applied). Distinct counter so the
+                // churn is visible on the board; the candidate streak resets and
+                // regrows from fully-reporting windows after the demote lands.
+                error.PromotionRegionOwned => self.silent_rejects.region_owned +|= 1,
+                else => self.silent_rejects.no_patch_point +|= 1,
+            }
             self.silent_promotion_rejects +|= 1;
             self.resetPromotionCandidate();
             return;
@@ -9316,7 +9387,7 @@ pub const TraceState = struct {
         self.resetPromotionCandidate();
     }
 
-    const DemotionReason = enum { activation, region_close, slot_mutation, trace_invalidation, teardown, unfreeze };
+    const DemotionReason = enum { activation, region_close, slot_mutation, trace_invalidation, teardown, unfreeze, membership_growth };
     const PendingDemotion = struct { id: u32, reason: DemotionReason };
 
     fn queueDemote(self: *TraceState, id: u32, reason: DemotionReason) void {
@@ -9324,12 +9395,12 @@ pub const TraceState = struct {
         self.pending_demote.appendAssumeCapacity(.{ .id = id, .reason = reason });
     }
 
-    fn demoteCycle(self: *TraceState, idx: usize) void {
-        self.demoteCycleReason(idx, .trace_invalidation);
+    fn demoteSet(self: *TraceState, idx: usize) void {
+        self.demoteSetReason(idx, .trace_invalidation);
     }
 
-    fn demoteCycleReason(self: *TraceState, idx: usize, reason: DemotionReason) void {
-        const cycle = self.promoted_cycles.items[idx];
+    fn demoteSetReason(self: *TraceState, idx: usize, reason: DemotionReason) void {
+        const cycle = self.promoted_sets.items[idx];
         if (self.replay_walk_depth > 0) {
             self.queueDemote(cycle.id, reason);
             return;
@@ -9338,17 +9409,16 @@ pub const TraceState = struct {
         // second, then ownership/storage. A failed restore intentionally leaves
         // every cell and allocation live before terminating the process.
         for (cycle.edges) |edge| self.patchPromotedEdge(edge, false) catch
-            @panic("demoteCycle: failed to restore reporting code");
+            @panic("demoteSet: failed to restore reporting code");
         for (cycle.edges) |edge| edge.parent.native.compiled.metadata_cells[edge.exit] = 0;
         for (cycle.edges) |edge| {
             if (!self.promoted_exit_owners.remove(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
-                @panic("demoteCycle: missing physical-exit ownership");
+                @panic("demoteSet: missing physical-exit ownership");
         }
         self.gpa.free(cycle.edges);
-        self.gpa.free(cycle.sibling_return_distance);
         self.gpa.free(cycle.summary);
         self.gpa.free(cycle.metadata);
-        _ = self.promoted_cycles.swapRemove(idx);
+        _ = self.promoted_sets.swapRemove(idx);
         self.silent_demotions +|= 1;
         switch (reason) {
             .activation => self.silent_demotion_reasons.activation +|= 1,
@@ -9357,54 +9427,55 @@ pub const TraceState = struct {
             .trace_invalidation => self.silent_demotion_reasons.trace_invalidation +|= 1,
             .teardown => self.silent_demotion_reasons.teardown +|= 1,
             .unfreeze => self.silent_demotion_reasons.unfreeze +|= 1,
+            .membership_growth => self.silent_demotion_reasons.membership_growth +|= 1,
         }
         self.resetPromotionCandidate();
     }
 
-    fn demoteCyclesTouching(self: *TraceState, parent: *Trace, exit: u32) void {
+    fn demoteSetsTouching(self: *TraceState, parent: *Trace, exit: u32) void {
         const id = self.promoted_exit_owners.get(.{ .trace_id = parent.id, .exit_instr = exit }) orelse return;
-        for (self.promoted_cycles.items, 0..) |cycle, i| {
+        for (self.promoted_sets.items, 0..) |cycle, i| {
             if (cycle.id == id) {
-                self.demoteCycleReason(i, .slot_mutation);
+                self.demoteSetReason(i, .slot_mutation);
                 return;
             }
         }
-        @panic("demoteCyclesTouching: owner names no live cycle");
+        @panic("demoteSetsTouching: owner names no live cycle");
     }
 
-    fn demoteCyclesTouchingTrace(self: *TraceState, trace: *Trace) void {
+    fn demoteSetsTouchingTrace(self: *TraceState, trace: *Trace) void {
         self.resetPromotionCandidate();
-        var i = self.promoted_cycles.items.len;
+        var i = self.promoted_sets.items.len;
         while (i > 0) {
             i -= 1;
             var touches = false;
-            for (self.promoted_cycles.items[i].edges) |edge| {
+            for (self.promoted_sets.items[i].edges) |edge| {
                 if (edge.parent == trace or edge.child == trace) {
                     touches = true;
                     break;
                 }
             }
-            if (touches) self.demoteCycleReason(i, .trace_invalidation);
+            if (touches) self.demoteSetReason(i, .trace_invalidation);
         }
     }
 
-    fn demoteAllCycles(self: *TraceState) void {
-        var i = self.promoted_cycles.items.len;
+    fn demoteAllSets(self: *TraceState) void {
+        var i = self.promoted_sets.items.len;
         while (i > 0) {
             i -= 1;
-            self.demoteCycleReason(i, .teardown);
+            self.demoteSetReason(i, .teardown);
         }
     }
 
-    fn demoteCyclesForRegionDefsMutation(self: *TraceState) void {
+    fn demoteSetsForRegionDefsMutation(self: *TraceState) void {
         self.resetPromotionCandidate();
-        var i = self.promoted_cycles.items.len;
+        var i = self.promoted_sets.items.len;
         while (i > 0) {
             i -= 1;
             // Region membership is part of every promotion proof, and a bridge
             // additionally freezes its exact structural edge. Any defs mutation
-            // invalidates both facts, so no promoted cycle may survive the gen bump.
-            self.demoteCycleReason(i, .trace_invalidation);
+            // invalidates both facts, so no promoted set may survive the gen bump.
+            self.demoteSetReason(i, .trace_invalidation);
         }
     }
 
@@ -9423,7 +9494,7 @@ pub const TraceState = struct {
             else => return error.NativeTraceUnavailable,
         };
         if (exit >= compiled.slots.len) return error.InvalidNativeSlot;
-        self.demoteCyclesTouching(parent, exit);
+        self.demoteSetsTouching(parent, exit);
         if (self.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = exit }))
             return error.DemotionDeferred;
         return .{ .compiled = compiled, .exit = exit };
@@ -9574,6 +9645,7 @@ pub const TraceState = struct {
                 self.dbg("arm (re-arm): parent id={d} pc={d} slot={d} -> child id={d} pc={d} kind={s}", .{
                     parent.id, parent.anchor.pc, slot_index, child.id, child.anchor.pc, @tagName(kind),
                 });
+                self.noteMembershipGrowth(parent, slot_index, child, kind);
                 return true;
             }
         }
@@ -9587,7 +9659,51 @@ pub const TraceState = struct {
         self.dbg("arm: parent id={d} pc={d} slot={d} -> child id={d} pc={d} kind={s}", .{
             parent.id, parent.anchor.pc, slot_index, child.id, child.anchor.pc, @tagName(kind),
         });
+        self.noteMembershipGrowth(parent, slot_index, child, kind);
         return true;
+    }
+
+    /// B-3d (doc 17 §B3.17 R1, §B3.18 R7): the membership-growth trigger. A
+    /// successful fresh arm (or changed-relation re-arm) of an edge that would be
+    /// a candidate member of a region owning a live promoted set means that set no
+    /// longer covers the region's armed-edge population — its rows would surface
+    /// only in suffix ledgers, which candidacy deliberately never reads, so the
+    /// residue would be permanent. Demote the set; candidacy then regrows from
+    /// fully-reporting windows with the region-total candidate (`promote_after`
+    /// consecutive identical sets re-promotes). Evaluated at the single
+    /// `armNativeLink` funnel — every production arm path routes through it — and
+    /// only AFTER a successful arm. Growth is needed only for UN-owned edges: an
+    /// owned slot cannot take the fresh-arm branch, an identical owned re-arm
+    /// short-circuits above, and a changed-relation owned re-arm already demoted
+    /// via `prepareSlotMutation`. Arming is deterministic, so the demotion instant
+    /// is reproducible across the replay modes. Demotion follows `demoteSetReason`
+    /// semantics — queued mid-walk, immediate at depth 0 — and the backwards
+    /// iteration keeps the depth-0 `swapRemove` sound.
+    fn noteMembershipGrowth(self: *TraceState, parent: *Trace, slot_index: u32, child: *Trace, kind: ArmKind) void {
+        if (self.promoted_sets.items.len == 0) return;
+        if (self.promoted_exit_owners.contains(.{ .trace_id = parent.id, .exit_instr = slot_index }))
+            return;
+        // Not patch-pointed (or otherwise failing arm-shape validation) means the
+        // edge can never be a candidate member, so it cannot outgrow a set. Same
+        // per-edge core as candidacy below (§B3.18 R7: one membership predicate);
+        // the bridge stamp is not required here because the trigger runs before
+        // `tryArmRegionBridge`'s restamp — see `edgeMemberOfRegion`.
+        const edge = self.promotedEdgeFromLink(.{
+            .parent = parent,
+            .slot_index = slot_index,
+            .child = child,
+            .kind = kind,
+        }) orelse return;
+        var i = self.promoted_sets.items.len;
+        while (i > 0) {
+            i -= 1;
+            const s = self.promoted_sets.items[i];
+            if (!self.edgeMemberOfRegion(edge, s.region_key.region_id, false)) continue;
+            self.dbg("membership growth: parent id={d} slot={d} kind={s} demotes set={d} region={d}", .{
+                parent.id, slot_index, @tagName(kind), s.id, s.region_key.region_id,
+            });
+            self.demoteSetReason(i, .membership_growth);
+        }
     }
 
     /// 2.3c-2e (2c-E): the single shared arm point for the loop-done half of the
@@ -9672,7 +9788,7 @@ pub const TraceState = struct {
     /// The slot address is re-derived from the live `parent` here, never cached, so it
     /// is always valid at the moment of the write.
     pub fn resetLinksTouching(self: *TraceState, t: *Trace) void {
-        self.demoteCyclesTouchingTrace(t);
+        self.demoteSetsTouchingTrace(t);
         const shared_exit = self.mcode_arena.trampoline_exit orelse 0;
         var i: usize = self.armed_links.items.len;
         while (i > 0) {
@@ -9879,7 +9995,7 @@ pub const TraceState = struct {
     /// emptied `armed_links`, so no inbound native link touches any cached trace and
     /// no per-trace `resetLinksTouching` is needed here.
     pub fn clearCache(self: *TraceState) void {
-        self.demoteAllCycles();
+        self.demoteAllSets();
         self.clearProvenanceEdges();
         for (self.cache.items) |t| t.destroy(self.gpa);
         self.cache.clearRetainingCapacity();
@@ -9941,7 +10057,7 @@ pub const TraceState = struct {
         // bearing — every gen-stamped memo lives on traces/links that were just
         // destroyed/disarmed above — but a future consumer must not find the
         // invariant silently false here.
-        self.demoteCyclesForRegionDefsMutation();
+        self.demoteSetsForRegionDefsMutation();
         bumpGen(&self.region_defs_gen);
         self.region_intern.clear(self.gpa);
         self.clearPhysicalRegionIndices();
@@ -14209,7 +14325,7 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     state.ledger_scratch[0] = incomplete[1];
     var merged: [TraceState.PROVENANCE_VERDICT_CAP]ProvenanceVerdict = undefined;
     try testing.expectEqual(
-        TraceState.PROMOTED_CYCLE_CAP + irinterp.LEDGER_CAP,
+        TraceState.PROMOTED_SET_CAP + irinterp.LEDGER_CAP,
         state.silent_provenance.len,
     );
     var merged_len = state.captureSilentSuffixProvenance(.{
@@ -14241,7 +14357,9 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     // nor completed a revolution back to its parent.
     // Round-6: the cell IS the ordering image — this edge fired once, at ordinal 2,
     // never productively; the call's only productive transition was ordinal 1.
-    const earlier_evidence = TraceState.silentSiblingEvidence(
+    // B-3d (D3): `returned_to_parent` is measured — with no live cell firing out
+    // of P after ordinal 2 and no suffix arrival at P, no return happened.
+    const earlier_evidence = state.silentSiblingEvidence(
         .{
             .region_work = 0,
             .selection_work = 0,
@@ -14253,10 +14371,9 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
             .last_ordinal = 2,
         },
         1, // followed
-        2, // followed_transitions
         1, // call-global last productive ordinal
-        3, // return distance
-        3, // ring length
+        parent.id,
+        &.{}, // no reporting suffix
     );
     try testing.expect(!earlier_evidence.productive);
     try testing.expect(!earlier_evidence.returned_to_parent);
@@ -14297,36 +14414,50 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     const repeated_reporting_strikes = state.provenance_edges.items[0].strikes;
     try testing.expectEqual(@as(u8, 1), repeated_reporting_strikes);
 
-    const repeated_parent_ring = [_]PromotedEdge{
+    // B-3d (D3, §B3.17 R3): a return to P is MEASURED — either some live cell
+    // whose edge fires OUT of P recorded a strictly later ordinal (a repeated
+    // parent counts even via a different physical exit), or the reporting
+    // suffix contains a row owned by P. Fabricate the summary image the
+    // epilogues would have written for a repeated-parent set: P→C fired at
+    // ordinal 1, P.exit1→X fired at ordinal 3 — that later firing out of P IS
+    // the arrival evidence the ring's return distance used to reconstruct.
+    var fab_edges = [_]PromotedEdge{
         silent_edge,
-        .{ .parent = &child, .exit = 0, .kind = .deopt, .child = &parent, .arm_kind = .ordinary_guard, .resume_pc = parent.anchor.pc },
         .{ .parent = &parent, .exit = 1, .kind = .deopt, .child = &x, .arm_kind = .ordinary_guard, .resume_pc = x.anchor.pc },
-        .{ .parent = &x, .exit = 0, .kind = .deopt, .child = &parent, .arm_kind = .ordinary_guard, .resume_pc = parent.anchor.pc },
     };
-    var return_distances: [repeated_parent_ring.len]u8 = undefined;
-    TraceState.computeSiblingReturnDistances(&repeated_parent_ring, &return_distances);
-    try testing.expectEqual(@as(u8, 2), return_distances[0]);
-    // This edge fired once, at ordinal 1; the ring re-reaches its parent two
-    // transitions later (ordinal 3), which the three-transition burst did
-    // materialize — even though its final transition was never followed.
-    const repeated_evidence = TraceState.silentSiblingEvidence(
-        .{
-            .region_work = 0,
-            .selection_work = 0,
-            .qualifying_rows = 0,
-            .productive_firings = 0,
-            .last_local = 0,
-            .last_productive_ordinal = 0,
-            .firings = 1,
-            .last_ordinal = 1,
-        },
+    var fab_summary = [_]nativegen.SilentSummaryCell{
+        .{ .region_work = 0, .selection_work = 0, .qualifying_rows = 0, .productive_firings = 0, .last_local = 0, .last_productive_ordinal = 0, .firings = 1, .last_ordinal = 1 },
+        .{ .region_work = 0, .selection_work = 0, .qualifying_rows = 0, .productive_firings = 0, .last_local = 0, .last_productive_ordinal = 0, .firings = 1, .last_ordinal = 3 },
+    };
+    var fab_metadata: [2]nativegen.SilentExitMetadata = undefined;
+    try state.promoted_sets.append(gpa, .{
+        .edges = &fab_edges,
+        .summary = &fab_summary,
+        .metadata = &fab_metadata,
+        .region_key = .{ .region_id = @enumFromInt(0), .activation = 0 },
+        .id = 999,
+    });
+    const repeated_evidence = state.silentSiblingEvidence(
+        fab_summary[0],
         1, // followed
-        3, // transitions
         0, // no productive transition anywhere in the call
-        return_distances[0],
-        repeated_parent_ring.len,
+        parent.id,
+        &.{},
     );
     try testing.expect(repeated_evidence.returned_to_parent);
+    // Self-semantics (R3): the firing under judgment is never its own return
+    // evidence — the LATEST firing out of P (ordinal 3) has no later arrival.
+    const latest_evidence = state.silentSiblingEvidence(fab_summary[1], 1, 0, parent.id, &.{});
+    try testing.expect(!latest_evidence.returned_to_parent);
+    // Suffix disjunct + R4 arrival ownership: a suffix row owned by P counts as
+    // a return, and a `.prologue_fail` row's owner is `row.id` — the trace whose
+    // prologue failed — exactly as `captureProvenanceVerdicts` scans it.
+    const suffix_arrival = [_]irinterp.LedgerEntry{
+        .{ .cum = 0, .id = parent.id, .exit = 0, .reason = .normal, .kind = .prologue_fail, .outcome = .normal },
+    };
+    const suffix_evidence = state.silentSiblingEvidence(fab_summary[1], 1, 0, parent.id, &suffix_arrival);
+    try testing.expect(suffix_evidence.returned_to_parent);
+    _ = state.promoted_sets.pop();
     state.provenance_edges.items[0].strikes = 0;
     state.stageSilentSiblingProvenance(
         silent_edge,
@@ -15044,31 +15175,33 @@ fn b3ObservedRow(t: *Trace, exit: u32, kind: irinterp.LedgerKind) irinterp.Ledge
     return .{ .cum = 0, .id = t.id, .exit = exit, .reason = .normal, .kind = kind, .outcome = .normal };
 }
 
-fn installB3PromotionRegion(state: *TraceState, key: RegionKey, edges: []const PromotedEdge) !void {
+/// B-3d: set candidacy reads the region BEFORE any detection can run (the
+/// candidate IS the region's armed-edge population), so tests install the
+/// region from the participating traces' anchors rather than from a
+/// previously-detected edge list.
+fn installB3PromotionRegion(state: *TraceState, key: RegionKey, traces: []const *Trace) !void {
     const gpa = state.gpa;
-    var scratch: [TraceState.PROMOTED_CYCLE_CAP * 2]ProgramPoint = undefined;
+    var scratch: [TraceState.PROMOTED_SET_CAP * 2]ProgramPoint = undefined;
     var n: usize = 0;
-    for (edges) |edge| {
-        for ([_]*Trace{ edge.parent, edge.child }) |t| {
-            const point = ProgramPoint{ .proto_id = t.anchor.proto.id, .source_pc = t.anchor.pc };
-            var exists = false;
-            for (scratch[0..n]) |prior| {
-                if (prior.proto_id == point.proto_id and prior.source_pc == point.source_pc) {
-                    exists = true;
-                    break;
-                }
+    for (traces) |t| {
+        const point = ProgramPoint{ .proto_id = t.anchor.proto.id, .source_pc = t.anchor.pc };
+        var exists = false;
+        for (scratch[0..n]) |prior| {
+            if (prior.proto_id == point.proto_id and prior.source_pc == point.source_pc) {
+                exists = true;
+                break;
             }
-            if (!exists) {
-                scratch[n] = point;
-                n += 1;
-            }
+        }
+        if (!exists) {
+            scratch[n] = point;
+            n += 1;
         }
     }
     try state.region_defs.put(gpa, key.region_id, .{
         .members = try gpa.alloc(StructuralEdgeId, 0),
         .member_points = try gpa.dupe(ProgramPoint, scratch[0..n]),
-        .owner = edges[0].parent.anchor,
-        .classifier = .{ .kind = .cross_trace_cycle, .member_count = @intCast(edges.len) },
+        .owner = traces[0].anchor,
+        .classifier = .{ .kind = .cross_trace_cycle, .member_count = @intCast(traces.len) },
         .armable = true,
         .bridges = try gpa.alloc(RegionBridgeDef, 0),
     });
@@ -15092,7 +15225,7 @@ fn expectRegionAccumEqual(expected: RegionAccum, actual: RegionAccum) !void {
     try testing.expectEqual(expected.frozen, actual.frozen);
 }
 
-test "B-3b.2 detector accepts closed 2/3-edge cycles and canonicalizes every entry phase" {
+test "B-3d.2 set candidacy accepts 2/3-edge automata in canonical order from any observation rotation" {
     if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
@@ -15104,6 +15237,8 @@ test "B-3b.2 detector accepts closed 2/3-edge cycles and canonicalizes every ent
     const b = try makeB3LinkTrace(gpa, &state, &proto, 10, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const two_key: RegionKey = .{ .region_id = @enumFromInt(1700), .activation = 32 };
+    try installB3PromotionRegion(&state, two_key, &.{ a, b });
     const observed_a = [_]irinterp.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
@@ -15114,9 +15249,12 @@ test "B-3b.2 detector accepts closed 2/3-edge cycles and canonicalizes every ent
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
     };
-    const from_a = state.detectPhysicalCycle(&observed_a).?;
+    // The candidate is the region-total armed-edge set, so BOTH observation
+    // rotations resolve to the same canonical (parent id, exit) list — there
+    // is no entry phase to canonicalize away.
+    const from_a = state.detectPromotableSet(&observed_a, two_key).?;
     defer gpa.free(from_a);
-    const from_b = state.detectPhysicalCycle(&observed_b).?;
+    const from_b = state.detectPromotableSet(&observed_b, two_key).?;
     defer gpa.free(from_b);
     try testing.expectEqual(@as(usize, 2), from_a.len);
     try testing.expectEqual(@as(u32, 10), from_a[0].parent.id);
@@ -15132,6 +15270,8 @@ test "B-3b.2 detector accepts closed 2/3-edge cycles and canonicalizes every ent
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
     try testing.expect(try state.armNativeLink(b, 0, c, .link_terminal));
     try testing.expect(try state.armNativeLink(c, 0, a, .link_terminal));
+    const region_key: RegionKey = .{ .region_id = @enumFromInt(1701), .activation = 33 };
+    try installB3PromotionRegion(&state, region_key, &.{ a, b, c });
     const observed_three_a = [_]irinterp.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
@@ -15144,45 +15284,49 @@ test "B-3b.2 detector accepts closed 2/3-edge cycles and canonicalizes every ent
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(c, 0, .link_terminal),
     };
-    const three_a = state.detectPhysicalCycle(&observed_three_a).?;
+    const three_a = state.detectPromotableSet(&observed_three_a, region_key).?;
     defer gpa.free(three_a);
-    const three_c = state.detectPhysicalCycle(&observed_three_c).?;
+    const three_c = state.detectPromotableSet(&observed_three_c, region_key).?;
     defer gpa.free(three_c);
     try testing.expectEqual(@as(usize, 3), three_a.len);
     try testing.expectEqual(@as(u32, 10), three_a[0].parent.id);
     for (three_a, three_c) |ea, ec| try testing.expectEqual(ea.parent, ec.parent);
 
-    // A second armed outgoing exit on a member is irrelevant: only the
-    // observed physical exit is part of the proposed ring.
+    // A second armed outgoing exit that is NOT patch-pointed (out-of-range
+    // slot on a one-instruction link trace) is excluded from the candidate —
+    // the set grammar admits only edges `promotedEdgeFromLink` validates.
     try state.armed_links.append(gpa, .{
         .parent = a,
         .slot_index = 1,
         .child = c,
         .kind = .ordinary_guard,
     });
-    const multi_armed = state.detectPhysicalCycle(&observed_three_a).?;
+    const multi_armed = state.detectPromotableSet(&observed_three_a, region_key).?;
+    try testing.expectEqual(@as(usize, 3), multi_armed.len);
     gpa.free(multi_armed);
     _ = state.armed_links.pop();
 
-    // Promotion belongs to one exact live frozen region, not merely to a
-    // physically closed arm ring. Every parent/child anchor must be in its
-    // footprint, and the proof is repeated immediately before publication.
-    const region_key: RegionKey = .{ .region_id = @enumFromInt(1701), .activation = 33 };
-    try installB3PromotionRegion(&state, region_key, three_a);
-    const region_edges = state.detectPromotableCycle(&observed_three_a, region_key).?;
-    defer gpa.free(region_edges);
+    // Promotion belongs to one exact live frozen region. Shrinking the
+    // region's footprint excludes a member edge from the candidate, so its
+    // observed rows no longer match (open_chain); a missing/foreign region is
+    // its own reject; an unfrozen accumulator still refuses publication.
     const def = state.region_defs.getPtr(region_key.region_id).?;
     const complete_points = def.member_points;
     def.member_points = complete_points[0 .. complete_points.len - 1];
-    try testing.expect(state.detectPromotableCycle(&observed_three_a, region_key) == null);
-    try testing.expectEqual(@as(u64, 1), state.silent_rejects.region_mismatch);
+    try testing.expect(state.detectPromotableSet(&observed_three_a, region_key) == null);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.open_chain);
     def.member_points = complete_points;
+    try testing.expect(state.detectPromotableSet(
+        &observed_three_a,
+        .{ .region_id = @enumFromInt(4242), .activation = 33 },
+    ) == null);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.region_mismatch);
     state.region_profit.getPtr(region_key).?.frozen = false;
-    try testing.expectError(error.InvalidPromotionRegion, state.promoteCycle(region_edges, region_key));
+    try testing.expectError(error.InvalidPromotionRegion, state.promoteSet(three_a, region_key));
     state.region_profit.getPtr(region_key).?.frozen = true;
 }
 
-test "B-3b.2 detector rejects invalid bridge, open, missing patch, over-cap, and owned exit" {
+test "B-3d.2 set candidacy rejects non-member rows, kind mismatch, adjacent-pair break, over-cap; one set per region enforced" {
     if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
@@ -15192,39 +15336,67 @@ test "B-3b.2 detector rejects invalid bridge, open, missing patch, over-cap, and
     const a = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
     const b = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
-    const open = [_]irinterp.LedgerEntry{
+    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    const key: RegionKey = .{ .region_id = @enumFromInt(1), .activation = 9 };
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+
+    // The set grammar has no repetition requirement: a forward-only ledger
+    // whose every adjacent pair follows an armed edge is valid evidence.
+    const forward = [_]irinterp.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
     };
+    const forward_edges = state.detectPromotableSet(&forward, key).?;
+    try testing.expectEqual(@as(usize, 2), forward_edges.len);
+    gpa.free(forward_edges);
+
     const closed = [_]irinterp.LedgerEntry{
         b3ObservedRow(a, 0, .link_terminal),
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
     };
-    try testing.expect(state.detectPhysicalCycle(&open) == null); // no repeat
-    try testing.expect(try state.armNativeLink(b, 0, a, .link_terminal));
+    // An invalidated bridge kind fails `promotedEdgeFromLink`, dropping the
+    // edge from the candidate — its observed rows no longer match any member.
     state.armed_links.items[0].kind = .region_bridge;
-    try testing.expect(state.detectPhysicalCycle(&closed) == null);
+    try testing.expect(state.detectPromotableSet(&closed, key) == null);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.open_chain);
     state.armed_links.items[0].kind = .link_terminal;
+    // Same exclusion when the parent has no patch table.
     const saved_patches = a.native.compiled.exit_patches;
     a.native.compiled.exit_patches = &.{};
-    try testing.expect(state.detectPhysicalCycle(&closed) == null);
+    try testing.expect(state.detectPromotableSet(&closed, key) == null);
+    try testing.expectEqual(@as(u64, 2), state.silent_rejects.open_chain);
     a.native.compiled.exit_patches = saved_patches;
-    const saved_child = state.armed_links.items[0].child;
-    state.armed_links.items[0].child = a;
-    try testing.expect(state.detectPhysicalCycle(&closed) == null);
-    state.armed_links.items[0].child = saved_child;
+    // A row whose observed patch kind disagrees with the armed edge's kind.
+    const kind_mismatch = [_]irinterp.LedgerEntry{
+        b3ObservedRow(a, 0, .deopt),
+        b3ObservedRow(b, 0, .link_terminal),
+    };
+    try testing.expect(state.detectPromotableSet(&kind_mismatch, key) == null);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.no_patch_point);
+    // Per-adjacent-pair child-match: row i's armed child must own row i+1.
+    const pair_break = [_]irinterp.LedgerEntry{
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(a, 0, .link_terminal),
+        b3ObservedRow(b, 0, .link_terminal),
+    };
+    try testing.expect(state.detectPromotableSet(&pair_break, key) == null);
+    try testing.expectEqual(@as(u64, 1), state.silent_rejects.child_mismatch);
 
-    const edges = state.detectPhysicalCycle(&closed).?;
+    // One set per region is ENFORCED (§B3.17 R1): a second promotion attempt
+    // against an owning region is refused, and owned edges are excluded from
+    // candidacy so their rows cannot re-qualify.
+    const edges = state.detectPromotableSet(&closed, key).?;
     defer gpa.free(edges);
-    const key: RegionKey = .{ .region_id = @enumFromInt(1), .activation = 9 };
-    try installB3PromotionRegion(&state, key, edges);
-    try state.promoteCycle(edges, key);
-    try testing.expect(state.detectPhysicalCycle(&closed) == null); // owned
-    state.demoteAllCycles();
+    try state.promoteSet(edges, key);
+    try testing.expectError(error.PromotionRegionOwned, state.promoteSet(edges, key));
+    try testing.expect(state.detectPromotableSet(&closed, key) == null); // owned → excluded
+    try testing.expectEqual(@as(u64, 3), state.silent_rejects.open_chain);
+    state.demoteAllSets();
     state.disarmAllLinks();
 
-    var long: [TraceState.PROMOTED_CYCLE_CAP + 1]*Trace = undefined;
+    // Candidate over the cap: 17 armed member edges in one region.
+    var long: [TraceState.PROMOTED_SET_CAP + 1]*Trace = undefined;
     for (&long, 0..) |*slot, i| slot.* = try makeB3LinkTrace(
         gpa,
         &state,
@@ -15239,16 +15411,13 @@ test "B-3b.2 detector rejects invalid bridge, open, missing patch, over-cap, and
         long[(i + 1) % long.len],
         .link_terminal,
     ));
-    var observed_long: [long.len + 1]irinterp.LedgerEntry = undefined;
-    for (long, 0..) |t, i| observed_long[i] = b3ObservedRow(t, 0, .link_terminal);
-    observed_long[long.len] = b3ObservedRow(long[0], 0, .link_terminal);
-    try testing.expect(state.detectPhysicalCycle(&observed_long) == null);
-    try testing.expectEqual(@as(u64, 0), state.silent_rejects.bridge_member);
-    try testing.expectEqual(@as(u64, 1), state.silent_rejects.open_chain);
-    try testing.expectEqual(@as(u64, 2), state.silent_rejects.no_patch_point);
-    try testing.expectEqual(@as(u64, 1), state.silent_rejects.child_mismatch);
+    const key_cap: RegionKey = .{ .region_id = @enumFromInt(2), .activation = 10 };
+    try installB3PromotionRegion(&state, key_cap, &long);
+    const one_row = [_]irinterp.LedgerEntry{b3ObservedRow(long[0], 0, .link_terminal)};
+    try testing.expect(state.detectPromotableSet(&one_row, key_cap) == null);
     try testing.expectEqual(@as(u64, 1), state.silent_rejects.cap);
-    try testing.expectEqual(@as(u64, 1), state.silent_rejects.already_owned);
+    try testing.expectEqual(@as(u64, 0), state.silent_rejects.bridge_member);
+    try testing.expectEqual(@as(u64, 0), state.silent_rejects.region_mismatch);
 }
 
 test "B-3b.2 promotion publishes metadata and patches mixed deopt/NOP exits; demotion restores exact bytes" {
@@ -15271,15 +15440,15 @@ test "B-3b.2 promotion publishes metadata and patches mixed deopt/NOP exits; dem
         b3ObservedRow(link, 0, .link_terminal),
         b3ObservedRow(guard, 5, .deopt),
     };
-    const edges = state.detectPhysicalCycle(&observed).?;
-    defer gpa.free(edges);
     const key: RegionKey = .{ .region_id = @enumFromInt(2), .activation = 11 };
-    try installB3PromotionRegion(&state, key, edges);
-    try state.promoteCycle(edges, key);
-    try testing.expectEqual(@as(usize, 1), state.promoted_cycles.items.len);
+    try installB3PromotionRegion(&state, key, &.{ guard, done, link });
+    const edges = state.detectPromotableSet(&observed, key).?;
+    defer gpa.free(edges);
+    try state.promoteSet(edges, key);
+    try testing.expectEqual(@as(usize, 1), state.promoted_sets.items.len);
     for (edges) |edge| try expectB3Patched(edge, true);
     try testing.expectEqual(@as(u64, 1), state.silent_promotions);
-    state.demoteAllCycles();
+    state.demoteAllSets();
     for (edges) |edge| try expectB3Patched(edge, false);
     try testing.expectEqual(@as(u64, 1), state.silent_demotions);
 }
@@ -15329,7 +15498,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
         b3ObservedRow(succ, 0, .link_terminal),
         b3ObservedRow(bridge, 11, .region_bridge),
     };
-    const edges = state.detectPhysicalCycle(&observed).?;
+    const edges = state.detectPromotableSet(&observed, .{ .region_id = rid, .activation = 99 }).?;
     defer gpa.free(edges);
     var bridge_edge: ?PromotedEdge = null;
     for (edges) |edge| {
@@ -15354,7 +15523,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
     for (state.armed_links.items) |*link| if (link.kind == .region_bridge) {
         link.region_id = rid;
     };
-    try state.promoteCycle(edges, key);
+    try state.promoteSet(edges, key);
     try expectB3Patched(bridge_edge.?, true);
 
     // Reporting-mode oracle for one bridge firing followed by the structural
@@ -15377,7 +15546,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
     bridge.hit_count = 0;
     state.native_region_bridge_fused = 0;
     state.native_link_exits = 0;
-    const cycle = &state.promoted_cycles.items[0];
+    const cycle = &state.promoted_sets.items[0];
     var bridge_phase: usize = 0;
     for (cycle.edges, 0..) |edge, phase| {
         if (edge.arm_kind == .region_bridge) bridge_phase = phase;
@@ -15432,7 +15601,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
     try testing.expectEqual(oracle_accum.outer_traversals, silent_accum.outer_traversals);
 
     state.rebuildRegions();
-    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
     try expectB3Patched(bridge_edge.?, false);
 }
 
@@ -15491,9 +15660,9 @@ test "B-3b suffix preserves bridge materialization for child deopt and prologue 
         b3ObservedRow(child, 7, .deopt),
         b3ObservedRow(bridge, 11, .region_bridge),
     };
-    const edges = state.detectPromotableCycle(&observed, key).?;
+    const edges = state.detectPromotableSet(&observed, key).?;
     defer gpa.free(edges);
-    try state.promoteCycle(edges, key);
+    try state.promoteSet(edges, key);
 
     var tags = [_]u8{
         @intFromEnum(value.Tag.int),
@@ -15582,10 +15751,10 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         b3ObservedRow(ramp, 6, .link_terminal),
         b3ObservedRow(source, 5, .deopt),
     };
-    const physical = state.detectPhysicalCycle(&observed).?;
-    defer gpa.free(physical);
     const key: RegionKey = .{ .region_id = @enumFromInt(1716), .activation = 102 };
-    try installB3PromotionRegion(&state, key, physical);
+    try installB3PromotionRegion(&state, key, &.{ source, ramp });
+    const physical = state.detectPromotableSet(&observed, key).?;
+    defer gpa.free(physical);
     state.region_context = .{ .depth = 1, .call_seq = key.activation };
     const initial_accum = state.region_profit.get(key).?;
 
@@ -15631,7 +15800,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     source.hit_count = 0;
     ramp.hit_count = 0;
     state.region_profit.getPtr(key).?.* = initial_accum;
-    try state.promoteCycle(physical, key);
+    try state.promoteSet(physical, key);
     state.prepareNativeEntry();
     const silent_deopt = source.native.compiled.runCapturingLedger(regs, &state.ledger_scratch, state.silentStaging());
     try testing.expectEqual(@as(u64, 1), silent_deopt.silent_transitions);
@@ -15667,7 +15836,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     state.region_profit.getPtr(key).?.* = initial_accum;
     tags[2] = @intFromEnum(value.Tag.float);
     payloads[2] = @bitCast(@as(f64, 0.5));
-    state.demoteAllCycles();
+    state.demoteAllSets();
     const ordinary_prologue = source.native.compiled.runCapturingLedger(regs, &state.ledger_scratch, state.silentStaging());
     try testing.expectEqual(@as(usize, 2), ordinary_prologue.ledger_len);
     oracle_completed = 0;
@@ -15697,7 +15866,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     source.hit_count = 0;
     ramp.hit_count = 0;
     state.region_profit.getPtr(key).?.* = initial_accum;
-    try state.promoteCycle(physical, key);
+    try state.promoteSet(physical, key);
     state.prepareNativeEntry();
     const silent_prologue = source.native.compiled.runCapturingLedger(regs, &state.ledger_scratch, state.silentStaging());
     try testing.expectEqual(@as(u64, 1), silent_prologue.silent_transitions);
@@ -15732,7 +15901,17 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     payloads[2] = @bitCast(@as(i64, 1));
     const sibling = try makeB3LinkTrace(gpa, &state, &proto, 63, 10, 10);
     try testing.expect(state.publishSiblingArm(ramp, 5, sibling));
-    const cycle = &state.promoted_cycles.items[0];
+    // B-3d membership growth (§B3.17 R1): publishing the sibling arm created a
+    // NEW armable member edge of the owning region, so the live set demoted at
+    // the `armNativeLink` funnel — its coverage of the region's armed-edge
+    // population is stale. Production candidacy would regrow the region-total
+    // set; this leg instead re-promotes the original pair directly so the
+    // sibling edge stays UN-owned and its suffix row still exercises the
+    // Part-S handoff production below.
+    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
+    try testing.expectEqual(@as(u64, 1), state.silent_demotion_reasons.membership_growth);
+    try state.promoteSet(physical, key);
+    const cycle = &state.promoted_sets.items[0];
     var source_phase: usize = 0;
     for (cycle.edges, 0..) |edge, phase| if (edge.parent == source) {
         source_phase = phase;
@@ -15869,29 +16048,29 @@ test "B-3b.2 slot mutation and closeRegion demote before invalidation" {
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
     };
-    const edges = state.detectPhysicalCycle(&observed).?;
-    defer gpa.free(edges);
     const key: RegionKey = .{ .region_id = @enumFromInt(3), .activation = 12 };
-    try installB3PromotionRegion(&state, key, edges);
-    try state.promoteCycle(edges, key);
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+    const edges = state.detectPromotableSet(&observed, key).?;
+    defer gpa.free(edges);
+    try state.promoteSet(edges, key);
     // B-3d.1 R6 (§B3.18): an IDENTICAL re-arm — same child, kind, and slot
     // target, exactly what the forced-yield convergence sites re-publish —
     // short-circuits at the funnel and demotes NOTHING.
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
-    try testing.expectEqual(@as(usize, 1), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 1), state.promoted_sets.items.len);
     for (edges) |edge| try expectB3Patched(edge, true);
     // A CHANGED relation (different child) still demotes via prepareSlotMutation.
     const c2 = try makeB3LinkTrace(gpa, &state, &proto, 3, 2, 1);
     try testing.expect(try state.armNativeLink(a, 0, c2, .link_terminal));
-    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
     for (edges) |edge| try expectB3Patched(edge, false);
 
     // Restore the ring relation (changed again: c2 -> b) for the closeRegion leg.
     try testing.expect(try state.armNativeLink(a, 0, b, .link_terminal));
-    try state.promoteCycle(edges, key);
+    try state.promoteSet(edges, key);
     try state.region_profit.put(gpa, key, .{ .root_frame_depth = 1, .root_call_seq = key.activation });
     state.closeRegion(key);
-    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
 }
 
 test "B-3b.2 prepareNativeEntry retains same activation and demotes a different activation" {
@@ -15910,20 +16089,20 @@ test "B-3b.2 prepareNativeEntry retains same activation and demotes a different 
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
     };
-    const edges = state.detectPhysicalCycle(&observed).?;
-    defer gpa.free(edges);
     const same: RegionKey = .{ .region_id = @enumFromInt(4), .activation = 20 };
     const other: RegionKey = .{ .region_id = @enumFromInt(5), .activation = 21 };
-    try installB3PromotionRegion(&state, same, edges);
+    try installB3PromotionRegion(&state, same, &.{ a, b });
+    const edges = state.detectPromotableSet(&observed, same).?;
+    defer gpa.free(edges);
     state.region_context = .{ .depth = 1, .call_seq = same.activation };
-    try state.promoteCycle(edges, same);
+    try state.promoteSet(edges, same);
     state.prepareNativeEntry();
-    try testing.expectEqual(@as(usize, 1), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 1), state.promoted_sets.items.len);
     _ = state.region_profit.remove(same);
     try state.region_profit.put(gpa, other, .{ .root_frame_depth = 1, .root_call_seq = other.activation });
     state.region_context = .{ .depth = 1, .call_seq = other.activation };
     state.prepareNativeEntry();
-    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
 }
 
 test "B-3b.2 replay walk queues demotion and applies it before pending disarms" {
@@ -15942,20 +16121,20 @@ test "B-3b.2 replay walk queues demotion and applies it before pending disarms" 
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
     };
-    const edges = state.detectPhysicalCycle(&observed).?;
-    defer gpa.free(edges);
     const key: RegionKey = .{ .region_id = @enumFromInt(6), .activation = 30 };
-    try installB3PromotionRegion(&state, key, edges);
-    try state.promoteCycle(edges, key);
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+    const edges = state.detectPromotableSet(&observed, key).?;
+    defer gpa.free(edges);
+    try state.promoteSet(edges, key);
     state.replay_walk_depth = 1;
-    state.demoteCyclesTouching(a, 0);
+    state.demoteSetsTouching(a, 0);
     state.disarmAllLinks();
-    try testing.expectEqual(@as(usize, 1), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 1), state.promoted_sets.items.len);
     try testing.expectEqual(@as(usize, 1), state.pending_demote.items.len);
     try testing.expect(state.pending_disarm_all);
     state.replay_walk_depth = 0;
     state.applyPendingDisarms();
-    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
     for (edges) |edge| try expectB3Patched(edge, false);
 }
@@ -15976,11 +16155,11 @@ test "B-3d.1 low-yield unfreeze demotes the region's promotion in the same act" 
         b3ObservedRow(b, 0, .link_terminal),
         b3ObservedRow(a, 0, .link_terminal),
     };
-    const edges = state.detectPhysicalCycle(&observed).?;
-    defer gpa.free(edges);
     const key: RegionKey = .{ .region_id = @enumFromInt(7), .activation = 40 };
-    try installB3PromotionRegion(&state, key, edges);
-    try state.promoteCycle(edges, key);
+    try installB3PromotionRegion(&state, key, &.{ a, b });
+    const edges = state.detectPromotableSet(&observed, key).?;
+    defer gpa.free(edges);
+    try state.promoteSet(edges, key);
     state.config.min_useful = 8;
 
     // Depth 0: the low-yield verdict unfreezes AND demotes immediately —
@@ -15989,7 +16168,7 @@ test "B-3d.1 low-yield unfreeze demotes the region's promotion in the same act" 
     // patches live and panic the next drain on the frozen check).
     state.flushRegionWindow(key, 1);
     try testing.expect(!state.region_profit.get(key).?.frozen);
-    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
     try testing.expectEqual(@as(u64, 1), state.silent_demotion_reasons.unfreeze);
     for (edges) |edge| try expectB3Patched(edge, false);
 
@@ -16000,46 +16179,48 @@ test "B-3d.1 low-yield unfreeze demotes the region's promotion in the same act" 
         accum.frozen = true;
         accum.useful_streak = state.config.freeze_windows;
     }
-    try state.promoteCycle(edges, key);
+    try state.promoteSet(edges, key);
     state.replay_walk_depth = 1;
     state.flushRegionWindow(key, 1);
-    try testing.expectEqual(@as(usize, 1), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 1), state.promoted_sets.items.len);
     try testing.expectEqual(@as(usize, 1), state.pending_demote.items.len);
     state.replay_walk_depth = 0;
     state.applyPendingDisarms();
-    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
     try testing.expectEqual(@as(u64, 2), state.silent_demotion_reasons.unfreeze);
     for (edges) |edge| try expectB3Patched(edge, false);
 }
 
-test "B-3b.3 round-6: a repeated-parent ring firing out of round-robin order resolves exactly" {
+test "B-3d round-6: a repeated-parent SET firing out of order resolves its terminal by measurement" {
     if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
     var code: [16]Instr = @splat(Instr.op0(.halt));
     const proto = Proto{ .id = 1799, .code = &code, .name = "b3-round6", .num_registers = 2 };
-    // Ring [P.e0→C, C.e0→P, P.e1→D, D.e0→P]: P owns TWO phases, which
-    // `computeSiblingReturnDistances` explicitly supports. The exits are
-    // data-dependent guards, so nothing makes P alternate between them — the
-    // burst below fires P.e0/C.e0 repeatedly and never reaches P.e1 or D at all.
+    // Set {P.e0→C, C.e0→P, P.e1→D, D.e0→P}: P owns TWO member edges and the
+    // exits are data-dependent guards, so nothing makes P alternate between
+    // them — the burst below fires P.e0/C.e0 repeatedly and never reaches P.e1
+    // or D at all. No ring order exists; canonical storage order is
+    // (parent id, exit) and carries no firing information.
     const p = try makeB3LinkTrace(gpa, &state, &proto, 1, 1, 2);
     const c = try makeB3LinkTrace(gpa, &state, &proto, 2, 2, 1);
     const d = try makeB3LinkTrace(gpa, &state, &proto, 3, 3, 1);
-    const ring = [_]PromotedEdge{
+    const set = [_]PromotedEdge{
         .{ .parent = p, .exit = 0, .kind = .deopt, .child = c, .arm_kind = .loop_done_linked, .resume_pc = c.anchor.pc },
-        .{ .parent = c, .exit = 0, .kind = .deopt, .child = p, .arm_kind = .loop_done_linked, .resume_pc = p.anchor.pc },
         .{ .parent = p, .exit = 1, .kind = .deopt, .child = d, .arm_kind = .loop_done_linked, .resume_pc = d.anchor.pc },
+        .{ .parent = c, .exit = 0, .kind = .deopt, .child = p, .arm_kind = .loop_done_linked, .resume_pc = p.anchor.pc },
         .{ .parent = d, .exit = 0, .kind = .deopt, .child = p, .arm_kind = .loop_done_linked, .resume_pc = p.anchor.pc },
     };
-    var distances: [ring.len]u8 = undefined;
-    TraceState.computeSiblingReturnDistances(&ring, &distances);
 
-    // Three transitions, all on phases 0 and 1: P.e0, C.e0, P.e0.
-    // Round-robin arithmetic would have called the terminal edge
-    // `(0 + 3 - 1) % 4 == 2` — P.e1→D — and resumed at D's anchor, which the
-    // burst never entered. The measured terminal cell is phase 0 (P.e0→C).
-    var summary: [ring.len]nativegen.SilentSummaryCell = @splat(std.mem.zeroes(nativegen.SilentSummaryCell));
+    // Three transitions, all on edges 0 and 2: P.e0, C.e0, P.e0. Round-robin
+    // phase arithmetic over a 4-ring would have called the terminal edge
+    // "entry + 3 - 1" — P.e1→D — and resumed at D's anchor, which the burst
+    // never entered. The measured image identifies the terminal cell as the
+    // ONE cell whose `last_ordinal` equals the transition count (the D4
+    // assert `driveSilentBurst` enforces before handing back a resume
+    // contract), for ANY interleaving.
+    var summary: [set.len]nativegen.SilentSummaryCell = @splat(std.mem.zeroes(nativegen.SilentSummaryCell));
     summary[0] = .{
         .region_work = 2,
         .selection_work = 2,
@@ -16050,7 +16231,7 @@ test "B-3b.3 round-6: a repeated-parent ring firing out of round-robin order res
         .firings = 2,
         .last_ordinal = 3,
     };
-    summary[1] = .{
+    summary[2] = .{
         .region_work = 1,
         .selection_work = 1,
         .qualifying_rows = 0,
@@ -16060,16 +16241,25 @@ test "B-3b.3 round-6: a repeated-parent ring firing out of round-robin order res
         .firings = 1,
         .last_ordinal = 2,
     };
+    const transitions: u64 = 3;
     var total: u64 = 0;
     for (summary) |cell| total += cell.firings;
-    try testing.expectEqual(@as(u64, 3), total);
-    // Phases 2 and 3 never fired and must contribute nothing.
-    try testing.expectEqual(@as(u64, 0), summary[2].firings);
+    try testing.expectEqual(transitions, total);
+    // Unfired cells contribute nothing.
+    try testing.expectEqual(@as(u64, 0), summary[1].firings);
     try testing.expectEqual(@as(u64, 0), summary[3].firings);
-    // The successor of the measured terminal phase is the ring's phase 1, whose
-    // parent is the terminal edge's child — the invariant `driveSilentBurst`
-    // asserts before handing back a resume contract.
-    try testing.expectEqual(ring[1].parent, ring[0].child);
+    // Exactly one cell owns the final ordinal, and it is P.e0→C — not the
+    // edge any positional reconstruction would have produced.
+    var terminal: ?usize = null;
+    for (summary, 0..) |cell, i| {
+        if (cell.last_ordinal == transitions) {
+            try testing.expectEqual(@as(?usize, null), terminal);
+            terminal = i;
+        }
+    }
+    try testing.expectEqual(@as(?usize, 0), terminal);
+    try testing.expectEqual(c, set[terminal.?].child);
+    try testing.expectEqual(c.anchor.pc, set[terminal.?].resume_pc);
 }
 
 test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix" {
@@ -16167,9 +16357,9 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
     state.region_profit_flushed_work = 0;
     state.config.silent_promotion_enabled = true;
     _ = state.driveDispatcherLedger(cont, &evidence, &proto, regs, true);
-    try testing.expectEqual(@as(usize, 0), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
     _ = state.driveDispatcherLedger(cont, &evidence, &proto, regs, true);
-    try testing.expectEqual(@as(usize, 1), state.promoted_cycles.items.len);
+    try testing.expectEqual(@as(usize, 1), state.promoted_sets.items.len);
     try testing.expectEqual(@as(u64, 2), state.silent_promotion_candidates);
 
     // Detection replays are evidence, not part of the differential workload.
@@ -16230,7 +16420,7 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
     // Synthetic off-cycle reporting suffix: one silent C.link transition enters
     // inner, then inner reports an ordinary guard with cumulative rbx advanced by
     // two. The suffix must subtract silent_cum=7 and account exactly local=2.
-    const cycle = &state.promoted_cycles.items[0];
+    const cycle = &state.promoted_sets.items[0];
     const suffix_drains_before = state.silent_suffix_drains;
     var cont_phase: usize = 0;
     for (cycle.edges, 0..) |edge, phase| if (edge.parent == cont) {
@@ -16338,6 +16528,102 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
     try testing.expectEqual(@as(usize, 1), suffix_hops);
     try testing.expectEqual(suffix_drains_before + 2, state.silent_suffix_drains);
     state.applyPendingDisarms();
+}
+
+test "B-3d.2 repeated-parent set promotes, zero-evidence edges included, and an out-of-order burst drains by measurement" {
+    if (comptime !nativegen.is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.config.max_barren_run = 64;
+    var code: [32]Instr = @splat(Instr.op0(.halt));
+    const proto = Proto{ .id = 1720, .code = &code, .name = "b3d-set", .num_registers = 4 };
+    // P has TWO armable exits (5 and 7) — the sibling-automaton shape the ring
+    // grammar structurally could not promote: nothing makes P alternate
+    // between its exits, so no fixed rotation exists.
+    const p = try makeB3BridgeSuccessorTrace(gpa, &state, &proto, 71, 4, 8);
+    const c = try makeB3LinkTrace(gpa, &state, &proto, 72, 5, 4);
+    const d = try makeB3LinkTrace(gpa, &state, &proto, 73, 6, 4);
+    try testing.expect(try state.armNativeLink(p, 5, c, .ordinary_guard));
+    try testing.expect(try state.armNativeLink(p, 7, d, .ordinary_guard));
+    try testing.expect(try state.armNativeLink(c, 0, p, .link_terminal));
+    try testing.expect(try state.armNativeLink(d, 0, p, .link_terminal));
+    const key: RegionKey = .{ .region_id = @enumFromInt(1720), .activation = 55 };
+    try installB3PromotionRegion(&state, key, &.{ p, c, d });
+    state.region_context = .{ .depth = 1, .call_seq = key.activation };
+
+    // Evidence touches only the P.e5/C edges; the P.e7 and D edges promote on
+    // registry proof alone (§B3.18 R5(c): zero-evidence candidate edges are an
+    // accepted trade — firing evidence arrives later via summary cells).
+    const observed = [_]irinterp.LedgerEntry{
+        b3ObservedRow(p, 5, .deopt),
+        b3ObservedRow(c, 0, .link_terminal),
+        b3ObservedRow(p, 5, .deopt),
+    };
+    const edges = state.detectPromotableSet(&observed, key).?;
+    defer gpa.free(edges);
+    try testing.expectEqual(@as(usize, 4), edges.len);
+    try state.promoteSet(edges, key);
+    const set = &state.promoted_sets.items[0];
+    var p5_phase: usize = 0;
+    var c0_phase: usize = 0;
+    for (set.edges, 0..) |edge, phase| {
+        if (edge.parent == p and edge.exit == 5) p5_phase = phase;
+        if (edge.parent == c) c0_phase = phase;
+    }
+
+    // Rowless burst image P.e5 → C → P.e5 (ordinals 1..3): the terminal is the
+    // MEASURED owner of the final ordinal (P.e5, firings=2), while any
+    // positional reconstruction over the 4-edge storage order would walk off
+    // through the never-fired P.e7/D edges. Budget exhaustion ends the burst.
+    set.summary[p5_phase] = .{
+        .region_work = 0,
+        .selection_work = 2,
+        .qualifying_rows = 0,
+        .productive_firings = 0,
+        .last_local = 0,
+        .last_productive_ordinal = 0,
+        .firings = 2,
+        .last_ordinal = 3,
+    };
+    set.summary[c0_phase] = .{
+        .region_work = 0,
+        .selection_work = 0,
+        .qualifying_rows = 0,
+        .productive_firings = 0,
+        .last_local = 0,
+        .last_productive_ordinal = 0,
+        .firings = 1,
+        .last_ordinal = 2,
+    };
+    var completed: usize = 0;
+    var resume_pc_value: u32 = 0;
+    var hops: usize = 0;
+    const dir = state.drainSilentResult(.{
+        .completed = 6,
+        .exit_instr = 5,
+        .ledger_len = 0,
+        .silent_active = 1,
+        .silent_transitions = 3,
+        .silent_budget = 3,
+        .barren_budget = 64,
+        .silent_cell = @intFromPtr(&set.metadata[p5_phase]),
+        .cur_zero_run = 3,
+        .silent_cum = 6,
+        .silent_last_cell = @intFromPtr(&set.metadata[p5_phase]),
+    }, .continuation_call, &proto, &completed, &resume_pc_value, &hops, 8, true) orelse
+        return error.TestUnexpectedResult;
+    const result = switch (dir) {
+        .return_result => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    // The resume contract belongs to the measured terminal edge: an ordinary
+    // guard resumes at its SOURCE header (P's anchor), not at any successor a
+    // ring order would have predicted.
+    try testing.expectEqual(p.anchor.pc, result.resume_pc);
+    try testing.expectEqual(@as(usize, 6), result.completed);
+    try testing.expectEqual(@as(u64, 1), state.silent_budget_exhaustions);
+    state.demoteAllSets();
 }
 
 test "armNativeLink: P-C option (b) invariant — arm kind matches slot guard shape" {
