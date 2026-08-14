@@ -1,5 +1,29 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-60) — **B-5 post-landing codex review (REVISE) folded: two blockers fixed + two missing §R3 tests landed. Doc 18 fully closed.**
+
+codex `gpt-5.6-sol` post-landing review of 838fd75/0829bb7/890c2c7 →
+REVISE; all findings fixed (doc 18 §R4):
+
+1. **set() append over a hash-resident key** (valid state after D7 OOM
+   rollback or v7 restore) left an array/hash duplicate → next capture
+   failed `ArrayResidentKeyInHash`; the D2a fresh-1 seed variant was
+   worse — its slot-0 hole SHADOWED a hash-resident key 0 (value
+   silently lost). Both branches now absorb newly-covered hash keys
+   (count()!=0-guarded; sequential builds unaffected); 2 unit tests.
+2. **next() control key not normalized**: `next(t, 0.0)`/`-0.0` fell
+   into the hash arm and yielded nothing. `nextStep` +
+   `rowViewNextStep` now fold through `normalizeKey`; 8-mode test.
+3. **Missing §R3 coverage landed**: capture→restore→resume WITH
+   tracing+opt+native (asserts output + final snapshot equality,
+   post-restore trace record/dispatch incl. native entries, grid
+   re-inflation, narrow-lane residency) + failing-allocator restore
+   through the bulk lane repack (checkAllAllocationFailures).
+
+Gate: both builds green, hashes + repros GATE PASS. Review confirmed
+sound: identity mapping, unsigned bounds, native aref, GC walks, D7
+binning, v7 validation, --mem-stats lifetime.
+
 ## Status 2026-08-14 (LATEST-59) — **B-5 COMPLETE: Phase 4 measurement recorded in doc 18 §P; nsieve-bit 37.2 → 15.4 ms (LuaJIT gap 5.8× → 2.4×).**
 
 Phase 4 per doc 18 §P, all six frozen predictions CONFIRMED (full

@@ -242,6 +242,13 @@ pub const Table = struct {
                 } else {
                     try self.array.append(gpa, val);
                 }
+                // The appended key may already be hash-resident: key == asize in
+                // the hash is a *valid* table state (D7's OOM rollback leaves the
+                // failed key there; a v7 restore reproduces any captured split).
+                // The array copy now shadows it — drop the stale entry or the
+                // next capture violates `ArrayResidentKeyInHash`. Guarded so a
+                // sequential build (hash empty) pays nothing.
+                if (self.hash.count() != 0) _ = self.hash.remove(nk);
                 try self.migrateFromHash(gpa);
                 return;
             }
@@ -250,6 +257,17 @@ pub const Table = struct {
                 // `asize = 2` so the ubiquitous `t = {}; t[1] = x` build stays
                 // array-resident from the first write.
                 try self.array.seedAt(gpa, i, val);
+                // The seed covers keys {0, 1}, and either may already be
+                // hash-resident (both are valid hash keys while asize == 0, and a
+                // v7 restore reproduces such splits). Key 1's stale entry is
+                // superseded by `val`; key 0's value must land in slot 0 — the
+                // seed left a hole there, which would otherwise *shadow* the hash
+                // entry and lose it.
+                if (self.hash.count() != 0) {
+                    _ = self.hash.remove(nk);
+                    if (self.hash.fetchRemove(Value.int(0))) |kv|
+                        try self.array.setInPlace(gpa, 0, kv.value);
+                }
                 try self.migrateFromHash(gpa);
                 return;
             }
@@ -1121,6 +1139,38 @@ test "lane: a rehash drain that OOMs leaves the table consistent (no leak/bad-fr
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Inner.run, .{});
+}
+
+test "set(): append at key == asize absorbs a stale hash-resident copy of the key" {
+    // Key == asize in the hash part is a VALID state (D7's OOM rollback leaves
+    // the failed key there; a v7 restore reproduces any captured split). A
+    // subsequent append at that key must drop the hash entry, or the table
+    // carries an array/hash duplicate that a later capture rejects with
+    // `ArrayResidentKeyInHash` (codex post-landing review, blocker 1).
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    try t.set(testing.allocator, Value.int(0), Value.int(10)); // asize = 1
+    try t.restoreEntry(testing.allocator, Value.int(1), Value.int(99)); // hash[1], the rollback shape
+    try t.set(testing.allocator, Value.int(1), Value.int(100)); // append at key == asize
+    try testing.expectEqual(@as(usize, 2), t.array.asize);
+    try testing.expectEqual(@as(i64, 100), t.get(Value.int(1)).asInt());
+    try testing.expectEqual(@as(usize, 0), t.hash.count()); // stale copy gone
+}
+
+test "set(): fresh-1 seed migrates hash-resident keys 0 and 1 into the new extent" {
+    // The D2a fresh seed covers keys {0, 1} with a hole at slot 0. If key 0 was
+    // hash-resident (valid while asize == 0), the hole would SHADOW it — the
+    // value silently lost; a hash-resident key 1 would duplicate. Both must be
+    // absorbed (codex post-landing review, blocker 1, seed variant).
+    const t = try Table.create(testing.allocator);
+    defer t.destroy(testing.allocator);
+    try t.restoreEntry(testing.allocator, Value.int(0), Value.int(7));
+    try t.restoreEntry(testing.allocator, Value.int(1), Value.int(99));
+    try t.set(testing.allocator, Value.int(1), Value.int(100)); // fresh-1 seed path
+    try testing.expectEqual(@as(usize, 2), t.array.asize);
+    try testing.expectEqual(@as(i64, 7), t.get(Value.int(0)).asInt()); // hole filled, not shadowed
+    try testing.expectEqual(@as(i64, 100), t.get(Value.int(1)).asInt()); // new value wins
+    try testing.expectEqual(@as(usize, 0), t.hash.count());
 }
 
 test "lane: value identity is preserved across a widening store" {

@@ -12013,6 +12013,22 @@ test "slot-0: deleting key 0 mid-iteration resumes at key 1 (all 8 modes)" {
     , "0\n1\ntrue\n");
 }
 
+test "slot-0: next() folds a float-spelled integer control key (all 8 modes)" {
+    // Table keys identity-normalize (`0.0`, `-0.0`, and `0` are one key), so
+    // `next`'s control argument must fold the same way before classification —
+    // a float-spelled array-resident control used to fall into the hash arm
+    // and yield nothing (codex post-landing review, blocker 2).
+    try expectProgram(
+        \\local t = {}
+        \\t[0] = "z"
+        \\t[1] = "one"
+        \\local a = next(t, 0.0)
+        \\local b = next(t, -0.0)
+        \\local c = next(t, 0)
+        \\print(a == 1 and b == 1 and c == 1)
+    , "true\n");
+}
+
 test "slot-0: fresh seeds at key 0 and key 1 read back exactly (all 8 modes)" {
     // D2a's two seed shapes: `t[0] = v` (asize 1, no hole) and `t[1] = v`
     // (asize 2, slot-0 hole). Back-filling the hole is an in-place store.

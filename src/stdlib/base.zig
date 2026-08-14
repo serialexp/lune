@@ -136,14 +136,20 @@ fn hashSuccessorStep(gpa: std.mem.Allocator, t: *const Table, ctrl: Value) !Step
 fn nextStep(gpa: std.mem.Allocator, t: *const Table, ctrl: Value) !Step {
     const n: i64 = @intCast(t.array.asize);
 
+    // Table keys are identity-normalized (float-spelled integers and -0.0 fold
+    // to the integer key), so a user-supplied control like `next(t, 0.0)` must
+    // fold the same way before we classify it — otherwise a float-spelled
+    // array-resident key falls into the hash-successor arm and finds nothing.
+    const nctrl = table_mod.normalizeKey(ctrl);
+
     // Determine where to resume in the array part (doc 18: keys 0..asize-1,
     // identity slots — so key 0 iterates FIRST when present).
     var start: i64 = undefined; // first array index to consider
     var in_array = true;
-    if (ctrl.isNil()) {
+    if (nctrl.isNil()) {
         start = 0;
-    } else if (ctrl.isInt() and arr.ArrayPart.inArray(ctrl.asInt(), t.array.asize)) {
-        start = ctrl.asInt() + 1;
+    } else if (nctrl.isInt() and arr.ArrayPart.inArray(nctrl.asInt(), t.array.asize)) {
+        start = nctrl.asInt() + 1;
     } else {
         in_array = false; // ctrl is a hash key (or an int beyond the array part)
     }
@@ -157,7 +163,7 @@ fn nextStep(gpa: std.mem.Allocator, t: *const Table, ctrl: Value) !Step {
         // Array part exhausted → first hash key.
         return firstHashStep(gpa, t);
     }
-    return hashSuccessorStep(gpa, t, ctrl);
+    return hashSuccessorStep(gpa, t, nctrl);
 }
 
 /// `next` over a `row_view` (doc 14): ascending columns `1..stride`, skipping
@@ -167,8 +173,11 @@ fn rowViewNextStep(rv: Value, ctrl: Value) Step {
     const stride = Table.fromHeader(rv.rowViewParent()).array.stride;
     var j: i64 = 1;
     if (!ctrl.isNil()) {
-        if (!ctrl.isInt()) return .{ .found = false };
-        j = ctrl.asInt() + 1;
+        // Same normalization as `nextStep`: a float-spelled integer control
+        // (`next(row, 2.0)`) denotes the same column key.
+        const nctrl = table_mod.normalizeKey(ctrl);
+        if (!nctrl.isInt()) return .{ .found = false };
+        j = nctrl.asInt() + 1;
     }
     while (j <= @as(i64, @intCast(stride))) : (j += 1) {
         const v = Table.rowViewGet(rv, Value.int(j));

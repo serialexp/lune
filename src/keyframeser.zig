@@ -2471,6 +2471,146 @@ test "F2c: linking-shaped nested numeric-for resumes from a tier-0 keyframe" {
     }, ref));
 }
 
+test "§R3: capture→restore→resume with tracing+opt+native — restored narrow array traces, restored matrix re-inflates" {
+    // Doc 18 §T (§R3 additions): the F2c corpus is tier-0-only, so this is THE
+    // test where a restored VM resumes with the full JIT enabled. It pins:
+    //   (a) resumed output == uninterrupted output;
+    //   (b) final logical snapshots agree (trace consts are excluded from the
+    //       snapshot walk — the H-2/G-2 property — so bytes still compare);
+    //   (c) the restored narrow array records and DISPATCHES traces post-restore
+    //       (cache non-empty + trace entries > 0, native entries on x86-64);
+    //   (d) the restored matrix re-inflates to a grid on the fused store path;
+    //   (e) the restored dense array is narrow-lane resident at the end.
+    const gpa = testing.allocator;
+    const source =
+        \\a = {}
+        \\for i = 1, 64 do a[i] = i end
+        \\m = {{1,2,3},{4,5,6},{7,8,9}}
+        \\local s = 0
+        \\for r = 1, 400 do
+        \\  for i = 1, 64 do s = s + a[i] end
+        \\end
+        \\for r = 1, 200 do
+        \\  for i = 1, 3 do
+        \\    for j = 1, 3 do m[i][j] = m[i][j] + 1 end
+        \\  end
+        \\end
+        \\local g = 0
+        \\for i = 1, 3 do
+        \\  for j = 1, 3 do g = g + m[i][j] end
+        \\end
+        \\print(s)
+        \\print(g)
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    // Cut mid-way through the hot array loop: well after `a` and `m` exist,
+    // well before the grid store loop (builds are ~75 of ~27k safepoints).
+    vm.suspend_ctl = .{ .min_depth = 1, .after_safepoints = ref.total_safepoints / 4 };
+    try testing.expect((try vm.start(chunk.proto)) == .suspended);
+    const out_before = try gpa.dupe(u8, sink.buffered());
+    defer gpa.free(out_before);
+    const mid = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(mid);
+
+    const vm_r = try restore(gpa, mid, chunk.proto, NativeRegistry.base());
+    defer {
+        vm_r.deinit();
+        gpa.destroy(vm_r);
+    }
+
+    // THE §R3 requirement: resume with tracing + optimization + native codegen.
+    const native = @import("nativegen.zig").is_x64_linux;
+    vm_r.trace.config.enabled = true;
+    vm_r.trace.config.execute = true;
+    vm_r.trace.config.optimize = true;
+    vm_r.trace.config.native_codegen = native;
+    vm_r.trace.config.hotloop = 4; // trace the short test loops
+
+    var buf_r: [64]u8 = undefined;
+    var sink_r = io.Writer.fixed(&buf_r);
+    vm_r.out = &sink_r;
+    vm_r.suspend_ctl = null;
+    try testing.expect((try vm_r.exec()) == .finished);
+
+    // (a) output equivalence vs the uninterrupted tier-0 reference.
+    var combined: [128]u8 = undefined;
+    @memcpy(combined[0..out_before.len], out_before);
+    @memcpy(combined[out_before.len..][0..sink_r.buffered().len], sink_r.buffered());
+    try testing.expectEqualStrings(ref.full_out, combined[0 .. out_before.len + sink_r.buffered().len]);
+
+    // (c) traces recorded AND dispatched after restore.
+    try testing.expect(vm_r.trace.cache.items.len > 0);
+    try testing.expect(vm_r.trace.entries > 0);
+    if (native) try testing.expect(vm_r.trace.native_entries > 0);
+
+    // (d) the restored matrix re-inflated to a grid on the fused store path.
+    const mt = table.Table.fromHeader(vm_r.globals.get(try vm_r.heap.internValue("m")).asHeap());
+    try testing.expect(mt.array.isGrid());
+    // (e) the restored dense array is narrow-lane resident.
+    const at = table.Table.fromHeader(vm_r.globals.get(try vm_r.heap.internValue("a")).asHeap());
+    try testing.expect(at.array.lane.isNarrow());
+
+    // (b) final logical snapshots agree (trace-cache identity exempt; trace
+    // consts are excluded from the snapshot walk, so bytes compare directly).
+    const final_snap_r = try encodeSnapshot(gpa, vm_r);
+    defer gpa.free(final_snap_r);
+    try testing.expectEqualSlices(u8, ref.final_snap, final_snap_r);
+}
+
+test "§R3: failing-allocator restore during the bulk lane repack leaks nothing" {
+    // Doc 18 §T (§R3 additions): a mid-repack OOM must leak neither the original
+    // `.value` buffer nor the partial narrow buffers (the `errdefer` chain in
+    // the restore path). `checkAllAllocationFailures` fails every allocation in
+    // turn; `std.testing.allocator` then asserts no leak and no invalid free.
+    const gpa = testing.allocator;
+    const source =
+        \\t = {}
+        \\for i = 1, 64 do t[i] = i end
+        \\print(#t)
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    // The snapshot's `t` restores via the bulk narrow-lane rebuild (append as
+    // `.value`, then `optimalLane` → `repack` → frozen).
+    const snap = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(snap);
+
+    const Inner = struct {
+        fn run(fgpa: std.mem.Allocator, snap_: []const u8, proto: *const Proto) !void {
+            const vm_r = try restore(fgpa, snap_, proto, NativeRegistry.base());
+            vm_r.deinit();
+            fgpa.destroy(vm_r);
+        }
+    };
+    try testing.checkAllAllocationFailures(gpa, Inner.run, .{ snap, chunk.proto });
+}
+
 test "F2c: independent VMs suspended at the same cut produce byte-identical keyframes" {
     const gpa = testing.allocator;
     for (f2c_corpus) |source| {

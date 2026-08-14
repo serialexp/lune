@@ -46,6 +46,11 @@ inside them is checked.
   coverage / 91.2% of run cycles in traces, board otherwise within
   noise, memory board within noise (zero leaks), exact-2^i boundary
   overshoot confirmed at +48% peak on a targeted micro.
+- [x] **Post-landing review (§R4) + fixes.** codex `gpt-5.6-sol` REVISE:
+  append-over-hash-resident-key duplicate/shadow (set() absorbs
+  newly-covered hash keys), `next()` control-key normalization, and
+  the two missing §R3 tests (JIT-enabled restore-resume;
+  failing-allocator bulk-repack restore). All fixed + tested.
 
 ### Outstanding
 
@@ -581,6 +586,44 @@ post-flip ON `20260814-155221`, post-flip OFF `20260814-155531`.
    4.82 MB post (**+48%** — slot count 2^20+1 doubles the extent,
    inside the "up to ~2×" honesty bound); off-boundary N=10^6
    identical (−160 B), descending/hash-dominated fill identical.
+
+## §R4 — Post-landing implementation review (codex `gpt-5.6-sol`, 2026-08-14): REVISE → fixed
+
+Reviewed the landed 838fd75/0829bb7/890c2c7 against this doc. Verdict
+REVISE, two blockers + one §T coverage gap, all fixed in the follow-up
+commit:
+
+1. **Array/hash duplicate on append over a hash-resident key.**
+   Key `== asize` in the hash is a *valid* state (D7's OOM rollback
+   leaves the failed key there; a v7 restore reproduces any captured
+   split), but `set()`'s append branch never dropped it — the next
+   capture then failed `ArrayResidentKeyInHash`. Worse in the D2a
+   fresh-1 seed: a hash-resident key 0 was *shadowed by the seeded
+   hole* (value silently lost). Fix: both branches absorb
+   newly-covered hash keys after the array insert (`hash.count() != 0`
+   guarded, so sequential builds pay nothing); the seed variant writes
+   the absorbed key-0 value into slot 0. Unit tests pin both shapes.
+2. **`next()` control key not identity-normalized.** `next(t, 0.0)` /
+   `next(t, -0.0)` denote array-resident key 0 but fell into the
+   hash-successor arm and found nothing (pre-existing for any
+   float-spelled control; array-relevant now that key 0 is
+   array-resident). Fix: `nextStep` and `rowViewNextStep` fold the
+   control through `normalizeKey` before classification; 8-mode test.
+3. **§T (§R3 additions) coverage gap.** The required
+   capture→restore→resume test WITH tracing + optimization + native
+   codegen enabled after restore, and the failing-allocator
+   bulk-repack restore test, had not landed. Both added
+   (`keyframeser.zig`): the JIT-resume test asserts resumed output +
+   final snapshot equality, post-restore trace recording AND dispatch
+   (native entries on x86-64), grid re-inflation on the fused store
+   path, and narrow-lane residency; the OOM test drives
+   `checkAllAllocationFailures` through `restore` over a
+   narrow-rebuildable snapshot.
+
+Confirmed sound by the same review: scalar identity mapping, unsigned
+bounds, native `aref`, grid conditional `asize`, GC walks, D7 binning,
+length border logic, v7 validation (float-integer folding, −0.0, NaN),
+and the `--mem-stats` tracker lifetime.
 
 ## §R1 — Round-1 review record (codex `gpt-5.6-sol` + Antigravity, 2026-08-14): REVISE ×2, convergent
 
