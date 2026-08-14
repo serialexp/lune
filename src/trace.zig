@@ -4280,8 +4280,8 @@ pub const TraceState = struct {
         // must precede every deferred physical-slot disarm.
         while (self.pending_demote.items.len > 0) {
             const pending = self.pending_demote.pop().?;
-            for (self.promoted_sets.items, 0..) |cycle, i| {
-                if (cycle.id == pending.id) {
+            for (self.promoted_sets.items, 0..) |set, i| {
+                if (set.id == pending.id) {
                     self.demoteSetReason(i, pending.reason);
                     break;
                 }
@@ -5567,8 +5567,8 @@ pub const TraceState = struct {
                 @panic("driveSilentBurst: region summary exceeds usize");
             if (region_work != 0) self.creditRegionWork(c.region_key, c_accum, @intCast(region_work));
         }
-        // Every fired cycle proved `region_key == active`, so they all share one
-        // accumulator; the entry cycle always fired, so its lookup names it.
+        // Every fired edge proved `region_key == active`, so they all share one
+        // accumulator; the entry set always fired, so its lookup names it.
         const accum = self.region_profit.getPtr(entry_set.region_key) orelse
             @panic("driveSilentBurst: promoted set accumulator is missing");
         if (loop_done_count > std.math.maxInt(usize) - linked_completed.*)
@@ -9249,9 +9249,9 @@ pub const TraceState = struct {
 
         try self.promoted_sets.ensureUnusedCapacity(self.gpa, 1);
         try self.promoted_exit_owners.ensureUnusedCapacity(self.gpa, @intCast(edges.len));
-        // At most one queued id per live cycle. Reserve against the registry
+        // At most one queued id per live set. Reserve against the registry
         // size (not the pending list's current length, normally zero), so a
-        // global sweep during replay can queue every cycle without allocation.
+        // global sweep during replay can queue every set without allocation.
         try self.pending_demote.ensureTotalCapacity(self.gpa, self.promoted_sets.items.len + 1);
 
         // Publication: initialized metadata first, then pointer cells, code last.
@@ -9400,24 +9400,24 @@ pub const TraceState = struct {
     }
 
     fn demoteSetReason(self: *TraceState, idx: usize, reason: DemotionReason) void {
-        const cycle = self.promoted_sets.items[idx];
+        const set = self.promoted_sets.items[idx];
         if (self.replay_walk_depth > 0) {
-            self.queueDemote(cycle.id, reason);
+            self.queueDemote(set.id, reason);
             return;
         }
         // Teardown order is the inverse publication order: code first, cells
         // second, then ownership/storage. A failed restore intentionally leaves
         // every cell and allocation live before terminating the process.
-        for (cycle.edges) |edge| self.patchPromotedEdge(edge, false) catch
+        for (set.edges) |edge| self.patchPromotedEdge(edge, false) catch
             @panic("demoteSet: failed to restore reporting code");
-        for (cycle.edges) |edge| edge.parent.native.compiled.metadata_cells[edge.exit] = 0;
-        for (cycle.edges) |edge| {
+        for (set.edges) |edge| edge.parent.native.compiled.metadata_cells[edge.exit] = 0;
+        for (set.edges) |edge| {
             if (!self.promoted_exit_owners.remove(.{ .trace_id = edge.parent.id, .exit_instr = edge.exit }))
                 @panic("demoteSet: missing physical-exit ownership");
         }
-        self.gpa.free(cycle.edges);
-        self.gpa.free(cycle.summary);
-        self.gpa.free(cycle.metadata);
+        self.gpa.free(set.edges);
+        self.gpa.free(set.summary);
+        self.gpa.free(set.metadata);
         _ = self.promoted_sets.swapRemove(idx);
         self.silent_demotions +|= 1;
         switch (reason) {
@@ -9434,13 +9434,13 @@ pub const TraceState = struct {
 
     fn demoteSetsTouching(self: *TraceState, parent: *Trace, exit: u32) void {
         const id = self.promoted_exit_owners.get(.{ .trace_id = parent.id, .exit_instr = exit }) orelse return;
-        for (self.promoted_sets.items, 0..) |cycle, i| {
-            if (cycle.id == id) {
+        for (self.promoted_sets.items, 0..) |set, i| {
+            if (set.id == id) {
                 self.demoteSetReason(i, .slot_mutation);
                 return;
             }
         }
-        @panic("demoteSetsTouching: owner names no live cycle");
+        @panic("demoteSetsTouching: owner names no live set");
     }
 
     fn demoteSetsTouchingTrace(self: *TraceState, trace: *Trace) void {
@@ -15546,19 +15546,19 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
     bridge.hit_count = 0;
     state.native_region_bridge_fused = 0;
     state.native_link_exits = 0;
-    const cycle = &state.promoted_sets.items[0];
+    const set = &state.promoted_sets.items[0];
     var bridge_phase: usize = 0;
-    for (cycle.edges, 0..) |edge, phase| {
+    for (set.edges, 0..) |edge, phase| {
         if (edge.arm_kind == .region_bridge) bridge_phase = phase;
     }
     var link_phase: usize = 0;
-    for (cycle.edges, 0..) |edge, phase| {
+    for (set.edges, 0..) |edge, phase| {
         if (edge.arm_kind == .link_terminal) link_phase = phase;
     }
     // The native image the epilogues would have written: the bridge fired first
     // (ordinal 1, local 3), then the structural link back into the ring (ordinal
     // 2, no work). Both `firings` are explicit — the drain no longer infers them.
-    cycle.summary[bridge_phase] = .{
+    set.summary[bridge_phase] = .{
         .region_work = 0,
         .selection_work = 3,
         .qualifying_rows = 1,
@@ -15568,7 +15568,7 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
         .firings = 1,
         .last_ordinal = 1,
     };
-    cycle.summary[link_phase] = .{
+    set.summary[link_phase] = .{
         .region_work = 0,
         .selection_work = 0,
         .qualifying_rows = 0,
@@ -15588,10 +15588,10 @@ test "B-3b.4 region bridge promotes with frozen structural resume and rebuild de
         .silent_transitions = 2,
         .silent_budget = 2,
         .barren_budget = 64,
-        .silent_cell = @intFromPtr(&cycle.metadata[bridge_phase]),
+        .silent_cell = @intFromPtr(&set.metadata[bridge_phase]),
         .cur_zero_run = oracle_accum.barren_run,
         .silent_cum = 3,
-        .silent_last_cell = @intFromPtr(&cycle.metadata[link_phase]),
+        .silent_last_cell = @intFromPtr(&set.metadata[link_phase]),
     }, &proto, &silent_completed, &silent_resume, &silent_hops, 8, .continuation_call, true);
     const silent_accum = state.region_profit.get(key).?;
     try testing.expectEqual(oracle_bridge_hits, bridge.hit_count);
@@ -15911,13 +15911,13 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     try testing.expectEqual(@as(usize, 0), state.promoted_sets.items.len);
     try testing.expectEqual(@as(u64, 1), state.silent_demotion_reasons.membership_growth);
     try state.promoteSet(physical, key);
-    const cycle = &state.promoted_sets.items[0];
+    const set = &state.promoted_sets.items[0];
     var source_phase: usize = 0;
-    for (cycle.edges, 0..) |edge, phase| if (edge.parent == source) {
+    for (set.edges, 0..) |edge, phase| if (edge.parent == source) {
         source_phase = phase;
         break;
     };
-    cycle.summary[source_phase] = .{
+    set.summary[source_phase] = .{
         .region_work = 9,
         .selection_work = 9,
         .qualifying_rows = 1,
@@ -15951,9 +15951,9 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         .silent_transitions = 1,
         .silent_budget = state.config.silent_budget,
         .barren_budget = state.config.max_barren_run,
-        .silent_cell = @intFromPtr(&cycle.metadata[source_phase]),
+        .silent_cell = @intFromPtr(&set.metadata[source_phase]),
         .silent_cum = 9,
-        .silent_last_cell = @intFromPtr(&cycle.metadata[source_phase]),
+        .silent_last_cell = @intFromPtr(&set.metadata[source_phase]),
     };
     const ramp_hits_before = ramp.hit_count;
     completed = 0;
@@ -15979,7 +15979,7 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
     // A ramp `.link_terminal` is the other non-terminal M1 successor shape.
     // It keeps its ordinary row receipt and link/follow steering while consuming
     // the carried materialization without inventing ramp-local progress.
-    cycle.summary[source_phase] = .{
+    set.summary[source_phase] = .{
         .region_work = 9,
         .selection_work = 9,
         .qualifying_rows = 1,
@@ -16005,9 +16005,9 @@ test "B-3b silent ordinary guard preserves M1 ramp deopt and prologue contracts"
         .silent_transitions = 1,
         .silent_budget = state.config.silent_budget,
         .barren_budget = state.config.max_barren_run,
-        .silent_cell = @intFromPtr(&cycle.metadata[source_phase]),
+        .silent_cell = @intFromPtr(&set.metadata[source_phase]),
         .silent_cum = 9,
-        .silent_last_cell = @intFromPtr(&cycle.metadata[source_phase]),
+        .silent_last_cell = @intFromPtr(&set.metadata[source_phase]),
     };
     const prime_follows_before = state.prime_side_chain_follows;
     completed = 0;
@@ -16420,18 +16420,18 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
     // Synthetic off-cycle reporting suffix: one silent C.link transition enters
     // inner, then inner reports an ordinary guard with cumulative rbx advanced by
     // two. The suffix must subtract silent_cum=7 and account exactly local=2.
-    const cycle = &state.promoted_sets.items[0];
+    const set = &state.promoted_sets.items[0];
     const suffix_drains_before = state.silent_suffix_drains;
     var cont_phase: usize = 0;
-    for (cycle.edges, 0..) |edge, phase| if (edge.parent == cont) {
+    for (set.edges, 0..) |edge, phase| if (edge.parent == cont) {
         cont_phase = phase;
         break;
     };
     // One silent transition on cont's edge — the cell image its epilogue would
     // have written. The drain cross-checks summed `firings` against
     // `silent_transitions`, so a synthetic result must stage both.
-    cycle.summary[cont_phase].firings = 1;
-    cycle.summary[cont_phase].last_ordinal = 1;
+    set.summary[cont_phase].firings = 1;
+    set.summary[cont_phase].last_ordinal = 1;
     state.ledger_scratch[0] = .{
         .cum = 9,
         .id = inner.id,
@@ -16450,10 +16450,10 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
         .silent_transitions = 1,
         .silent_budget = state.config.silent_budget,
         .barren_budget = state.config.max_barren_run,
-        .silent_cell = @intFromPtr(&cycle.metadata[cont_phase]),
+        .silent_cell = @intFromPtr(&set.metadata[cont_phase]),
         .cur_zero_run = 1,
         .silent_cum = 7,
-        .silent_last_cell = @intFromPtr(&cycle.metadata[cont_phase]),
+        .silent_last_cell = @intFromPtr(&set.metadata[cont_phase]),
     };
     var suffix_completed: usize = 0;
     var suffix_resume: u32 = 0;
@@ -16481,8 +16481,8 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
     // as `cont` here would fail the post-PC contract and incorrectly break.
     // The previous drain consumed and cleared the mailbox; stage this call's own
     // single firing.
-    cycle.summary[cont_phase].firings = 1;
-    cycle.summary[cont_phase].last_ordinal = 1;
+    set.summary[cont_phase].firings = 1;
+    set.summary[cont_phase].last_ordinal = 1;
     state.ledger_scratch[0] = .{
         .cum = 7,
         .id = inner.id,
@@ -16500,10 +16500,10 @@ test "B-3b.3 promoted native cycle drains exact accounting and off-cycle suffix"
         .silent_transitions = 1,
         .silent_budget = state.config.silent_budget,
         .barren_budget = state.config.max_barren_run,
-        .silent_cell = @intFromPtr(&cycle.metadata[cont_phase]),
+        .silent_cell = @intFromPtr(&set.metadata[cont_phase]),
         .cur_zero_run = state.region_profit.get(key).?.barren_run,
         .silent_cum = 7,
-        .silent_last_cell = @intFromPtr(&cycle.metadata[cont_phase]),
+        .silent_last_cell = @intFromPtr(&set.metadata[cont_phase]),
     };
     suffix_completed = 0;
     suffix_resume = 0;
