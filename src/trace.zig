@@ -1361,6 +1361,47 @@ pub const ExitMaterialization = union(enum) {
 /// down properly.
 pub const AnchorKey = struct { proto: *const Proto, pc: u32 };
 
+/// Doc 20 (patched trace entry): one registry slot binding a `.jfor_loop`
+/// patched into a per-VM code image to its qualified root trace. Slots are
+/// **stable-address** (§R2-6): each is its own heap allocation, the index in
+/// `TraceState.entry_patches` is baked into the image instruction's `.b`, and
+/// tombstoned slots are reused via `entry_patch_free` — never compacted.
+pub const EntryPatch = struct {
+    /// The bound root. Valid to dereference ONLY while `live` (§R7-2):
+    /// `removeTrace` clears `live` through `Trace.entry_slot` BEFORE
+    /// `t.destroy` frees the allocation; the drain resolves `trace_id`
+    /// through `traceById` and never follows this pointer.
+    trace: *Trace,
+    /// Non-reused id for drain-time identity; `traceById` returning null
+    /// means the trace is already destroyed (§R7-2).
+    trace_id: u32,
+    proto: *const Proto,
+    /// Instruction index of the patched `.for_loop` inside the image.
+    patch_pc: u32,
+    /// Canonical content, restored on unpatch (debug-asserted identical to
+    /// `proto.code[patch_pc]`, which is the ground truth anyway).
+    orig: Instr,
+    /// Cleared by any unpatch mark; the arm inspects it BEFORE the
+    /// post-return drain, never after (§R2-4, §R7-1).
+    live: bool = true,
+    /// Set with `live = false` by `markEntryPatchPending`; consumed by the
+    /// safe-point drain (§R5-1 same-turn).
+    pending_unpatch: bool = false,
+    /// Slot is dead and on (or headed for) the free-list.
+    tombstone: bool = false,
+    /// Non-productive patched entries since the last productive one; at
+    /// `patch_strikes` the arm marks pending unpatch (§R6-1).
+    strikes: u8 = 0,
+    /// EntryPlan (§R1-4/6), the structural half of seeding memoized at patch
+    /// time. The input-slot → seed-source map already lives on the trace
+    /// (`Trace.inputs`); the only piece `seedTraceInputs` re-derives per entry
+    /// is the scratch-size high-water mark (`max(num_registers, max input
+    /// slot + 1)`) — memoized here. Seed VALUES are still re-resolved every
+    /// entry and every fail-closed check stays in `enterSelectedTrace`; the
+    /// plan is never claimed total.
+    seed_count: u32,
+};
+
 /// Per-anchor cooldown record for the gate (`TraceState.gate`). An anchor that
 /// thrashed (low-yield penalty maxed) or could not be traced (abort / commit
 /// failure) is held off until its back-edge counter reaches `retry_at`. On the
@@ -1457,6 +1498,11 @@ pub const Trace = struct {
     /// traces that never go through finalize (they don't chain, so id collisions are
     /// harmless — the dispatcher's id path only runs for real recorded traces).
     id: u32 = 0,
+    /// Doc 20 §R7-2: back-reference to this trace's entry-patch registry slot
+    /// while `.jfor_loop`-bound, else null. Lets `removeTrace` mark the slot
+    /// (clear `live`, set pending) in O(1) BEFORE destruction, and lets
+    /// qualification assert a trace never binds two slots.
+    entry_slot: ?u16 = null,
     anchor: AnchorKey,
     /// The straight-line IR, terminated by a `loop` instruction.
     instrs: []IrInstr,
@@ -2119,6 +2165,28 @@ pub const TraceState = struct {
     /// coarse (the pre-filter skips most of its back-edges), which is fine — the
     /// gate's own cooldown is driven by `tick`, not this.
     counters: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
+    /// Doc 20: per-VM copy-on-patch code images (§R1 fix). Canonical
+    /// `Proto.code` is NEVER mutated; the first patch into a proto clones its
+    /// code here and patches mutate only the clone. ONLY the dispatch fetch
+    /// reads images (`codeFor`); recorder/predicates/visualiser/keyframes
+    /// read canonical by construction. Lifetime is epoch-stable (§R2-2):
+    /// freed only in `dropEntryPatchState` (epoch clear / deinit), never on
+    /// last-unpatch. Empty forever on an unpatched run (§T7).
+    code_images: std.AutoHashMapUnmanaged(*const Proto, []Instr) = .empty,
+    /// Doc 20 §R2-1/§R3-4: monotone generation bumped on every image
+    /// create/publish; `execImpl` re-resolves its cached `code` local in the
+    /// back-edge epilogue when this differs from the generation it cached.
+    /// `u64` so wrap-aliasing is structurally unreachable.
+    image_gen: u64 = 0,
+    /// Doc 20 §R2-6: the entry-patch registry. Indexed by the `.b` operand of
+    /// patched `.jfor_loop` instructions; each slot is its own allocation
+    /// (stable addresses), tombstoned + reused via `entry_patch_free`.
+    entry_patches: std.ArrayListUnmanaged(*EntryPatch) = .empty,
+    entry_patch_free: std.ArrayListUnmanaged(u16) = .empty,
+    /// Count of pending-unpatch marks awaiting the safe-point drain. A bare
+    /// counter (not a list) so `markEntryPatchPending` cannot OOM mid-grammar
+    /// (§R2-4); the drain early-outs at 0 and scans slots only when dirty.
+    entry_patch_dirty: u32 = 0,
     /// Monotonic global back-edge tick. Incremented on *every* back-edge in the
     /// dispatch loop — including ones the hot-count pre-filter skips — so it is the
     /// one clock that never freezes. The gate's `retry_at` cooldown is measured in
@@ -3027,6 +3095,11 @@ pub const TraceState = struct {
         freeRegionSetMap(u32, &self.dest_entry_regions, self.gpa);
         self.region_profit.deinit(self.gpa);
         self.freeObserverFast(); // A-vii-e.1: owned bitset copies
+        // Doc 20 §R2-2: VM teardown is the other legal image-free point.
+        self.dropEntryPatchState();
+        self.code_images.deinit(self.gpa);
+        self.entry_patches.deinit(self.gpa);
+        self.entry_patch_free.deinit(self.gpa);
         // Free each trace (its `native.deinit()` returns mcode slots to the arena's
         // free-list) *before* tearing down the arena those slots live in.
         for (self.cache.items) |t| t.destroy(self.gpa);
@@ -7762,12 +7835,18 @@ pub const TraceState = struct {
             self.dbg("hotexit: trace id={d} exit={d} count={d} -> want PRIME side at pc={d}", .{ t.id, exit_instr, c.*, t.anchor.pc });
             self.wants_prime_side = t.anchor;
             self.prime_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
+            // Doc 20 unpatch trigger (same rationale as `wants_side_trace`):
+            // prime-side arming also runs through the virgin `onBackEdge` path.
+            self.markEntryPatchesAt(t.anchor);
         } else if (completed == 0) {
             if (self.wants_side_trace != null) return;
             if (self.anchorPopulation(t) >= self.config.max_traces_per_anchor) return;
             self.dbg("hotexit: trace id={d} exit={d} count={d} -> want side at pc={d}", .{ t.id, exit_instr, c.*, t.anchor.pc });
             self.wants_side_trace = t.anchor;
             self.side_want_src = .{ .trace_id = t.id, .exit_instr = exit_instr };
+            // Doc 20 unpatch trigger: side-arming needs the virgin `onBackEdge`
+            // path at this anchor next execution — mark any patch pending.
+            self.markEntryPatchesAt(t.anchor);
         }
     }
 
@@ -7787,6 +7866,7 @@ pub const TraceState = struct {
         gop.value_ptr.* +|= 1;
         if (gop.value_ptr.* >= self.config.hotguard and self.wants_side_trace == null) {
             self.wants_side_trace = anchor;
+            self.markEntryPatchesAt(anchor); // doc 20: side-arm needs virgin onBackEdge
         }
     }
 
@@ -7807,6 +7887,7 @@ pub const TraceState = struct {
         gop.value_ptr.* +|= 1;
         if (gop.value_ptr.* >= self.config.hotguard and self.wants_side_trace == null) {
             self.wants_side_trace = anchor;
+            self.markEntryPatchesAt(anchor); // doc 20: side-arm needs virgin onBackEdge
         }
     }
 
@@ -10046,6 +10127,11 @@ pub const TraceState = struct {
                 self.resetLinksTouching(t);
                 _ = self.cache.swapRemove(idx);
                 bumpGen(&self.cache_gen); // invalidate Trace.anchor_pop_* memos
+                // Doc 20 §R7-2: mark the entry patch BEFORE destroy — after it,
+                // `EntryPatch.trace` dangles and only `trace_id` (now resolving
+                // to null) remains valid. Allocation-free, drained at the next
+                // safe point.
+                if (t.entry_slot) |slot| self.markEntryPatchPending(slot);
                 if (t.id < self.trace_by_id.items.len) self.trace_by_id.items[t.id] = null;
                 t.destroy(self.gpa);
                 // Reopen the anchor for re-recording. `onBackEdge` only arms when
@@ -10096,7 +10182,184 @@ pub const TraceState = struct {
     /// Precondition: `disarmAllLinks` has already reset every armed parent slot and
     /// emptied `armed_links`, so no inbound native link touches any cached trace and
     /// no per-trace `resetLinksTouching` is needed here.
+    // ---- doc 20: copy-on-patch code images + entry-patch registry ----------
+
+    /// The code array the dispatch fetch must execute for `proto`: its
+    /// VM-local patched image when one exists, else canonical. The empty-map
+    /// early-out makes an unpatched program's cost one counter load per call.
+    pub fn codeFor(self: *const TraceState, proto: *const Proto) []const Instr {
+        if (self.code_images.count() == 0) return proto.code;
+        return self.code_images.get(proto) orelse proto.code;
+    }
+
+    /// Get-or-clone the VM-local image for `proto` (§R1 copy-on-patch). The
+    /// clone bumps `image_gen` so live frames re-resolve at their next
+    /// back-edge (§R2-1). Install path only — never called per entry.
+    fn ensureImage(self: *TraceState, proto: *const Proto) ![]Instr {
+        const gop = try self.code_images.getOrPut(self.gpa, proto);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = self.gpa.dupe(Instr, proto.code) catch |e| {
+                self.code_images.removeByPtr(gop.key_ptr);
+                return e;
+            };
+            self.image_gen +%= 1;
+        }
+        return gop.value_ptr.*;
+    }
+
+    /// §R3-1 patch-pc resolution, fail closed: the unique `.for_loop` whose
+    /// taken back-edge targets `anchor_pc` (target = pc + 1 + aux, matching
+    /// the dispatcher's post-fetch `applyJump`). Zero or multiple matches →
+    /// null (ambiguity is a property of the immutable bytecode — the caller
+    /// routes `.suppressed_permanent` in Phase 1).
+    pub fn resolvePatchPc(proto: *const Proto, anchor_pc: u32) ?u32 {
+        var found: ?u32 = null;
+        for (proto.code, 0..) |ins, i| {
+            if (ins.op != .for_loop) continue;
+            const target: i64 = @as(i64, @intCast(i + 1)) + ins.aux;
+            if (target == anchor_pc) {
+                if (found != null) return null; // ambiguous → fail closed
+                found = @intCast(i);
+            }
+        }
+        return found;
+    }
+
+    /// Install a `.jfor_loop` patch binding `t` at its anchor (§R2-6
+    /// publication order: initialize the slot COMPLETELY, then write the
+    /// image opcode — that write is the publication). Returns false (installs
+    /// nothing) when the patch pc is unresolvable/ambiguous, the pc already
+    /// holds a live patch (§R3-1 rule 2 — incumbent wins), the slot index
+    /// space is exhausted (§R6-2), or allocation fails — a missed
+    /// optimization, never an error. Phase 0b: exercised by tests only; the
+    /// Phase-1 qualify drain is the production caller.
+    pub fn installEntryPatch(self: *TraceState, t: *Trace) bool {
+        std.debug.assert(t.entry_slot == null);
+        const patch_pc = resolvePatchPc(t.anchor.proto, t.anchor.pc) orelse return false;
+        const img = self.ensureImage(t.anchor.proto) catch return false;
+        if (img[patch_pc].op == .jfor_loop) return false; // live incumbent wins
+        // Acquire a slot: reuse a tombstone, else append (fail closed at the
+        // u16 index ceiling — `.b` must hold the index).
+        const idx: u16 = if (self.entry_patch_free.pop()) |free_idx|
+            free_idx
+        else blk: {
+            if (self.entry_patches.items.len >= std.math.maxInt(u16)) return false;
+            const p = self.gpa.create(EntryPatch) catch return false;
+            self.entry_patches.append(self.gpa, p) catch {
+                self.gpa.destroy(p);
+                return false;
+            };
+            break :blk @intCast(self.entry_patches.items.len - 1);
+        };
+        // EntryPlan structural half (§R1-4/6): the scratch high-water mark
+        // `seedTraceInputs` re-derives per entry, memoized at patch time.
+        var seed_count: u32 = t.anchor.proto.num_registers;
+        for (t.inputs) |seed| seed_count = @max(seed_count, @as(u32, seed.slot) + 1);
+        const p = self.entry_patches.items[idx];
+        p.* = .{
+            .trace = t,
+            .trace_id = t.id,
+            .proto = t.anchor.proto,
+            .patch_pc = patch_pc,
+            .orig = t.anchor.proto.code[patch_pc],
+            .seed_count = seed_count,
+        };
+        t.entry_slot = idx;
+        // Publication: the opcode write, AFTER the slot is fully initialized.
+        var patched = p.orig;
+        patched.op = .jfor_loop;
+        patched.b = idx;
+        img[patch_pc] = patched;
+        self.image_gen +%= 1; // current frame reloads at its next back-edge
+        self.dbg("entry-patch install: pc={d} patch_pc={d} slot={d} trace={d}", .{ t.anchor.pc, patch_pc, idx, t.id });
+        return true;
+    }
+
+    /// Mark a slot for unpatch (§R2-4): clears `live` so no arm dereferences
+    /// the (possibly dying) trace pointer, defers the restore/tombstone to
+    /// the safe-point drain. Allocation-free — legal mid-grammar, including
+    /// from `removeTrace` immediately before `t.destroy` (§R7-2).
+    pub fn markEntryPatchPending(self: *TraceState, idx: u16) void {
+        const p = self.entry_patches.items[idx];
+        if (p.tombstone or p.pending_unpatch) return;
+        p.live = false;
+        p.pending_unpatch = true;
+        self.entry_patch_dirty += 1;
+    }
+
+    /// Mark every live slot whose bound trace anchors at `anchor` (doc 20
+    /// unpatch-trigger table: anchor gated / `wants_side_trace` at a patched
+    /// anchor). Identity goes through `traceById` — a dropped trace's slot was
+    /// already marked by the `removeTrace` hook. Linear over the registry,
+    /// which stays tiny (one live slot per patched loop); allocation-free.
+    pub fn markEntryPatchesAt(self: *TraceState, anchor: AnchorKey) void {
+        if (self.entry_patches.items.len == 0) return;
+        for (self.entry_patches.items, 0..) |p, i| {
+            if (p.tombstone or p.pending_unpatch) continue;
+            const t = self.traceById(p.trace_id) orelse continue;
+            if (t.anchor.proto == anchor.proto and t.anchor.pc == anchor.pc)
+                self.markEntryPatchPending(@intCast(i));
+        }
+    }
+
+    /// The safe-point drain (doc 20 §Safe-point-drain), called by the
+    /// caller-owned epilogue after every `enterSelectedTrace` return, before
+    /// acting on the directive. §R3-1 order: ALL pending unpatches first;
+    /// Phase 1 appends the revalidate-then-install pass for qualified marks.
+    /// Early-outs on the dirty counter, so a quiet turn costs one load.
+    pub fn drainEntryPatchWork(self: *TraceState) void {
+        if (self.entry_patch_dirty == 0) return;
+        self.entry_patch_dirty = 0;
+        for (self.entry_patches.items, 0..) |p, i| {
+            if (p.tombstone or !p.pending_unpatch) continue;
+            self.unpatchSlot(@intCast(i));
+        }
+    }
+
+    /// Restore-then-tombstone (§R2-6 unpatch order). In-place restore is
+    /// immediately visible to any frame still holding the image slice, and
+    /// the restored content is canonical-identical — no generation bump
+    /// needed. Resolves the trace through `traceById`, never `p.trace`
+    /// (§R7-2: the trace may already be destroyed).
+    fn unpatchSlot(self: *TraceState, idx: u16) void {
+        const p = self.entry_patches.items[idx];
+        if (self.code_images.get(p.proto)) |img| {
+            std.debug.assert(img[p.patch_pc].op == .jfor_loop and img[p.patch_pc].b == idx);
+            std.debug.assert(std.meta.eql(p.orig, p.proto.code[p.patch_pc]));
+            img[p.patch_pc] = p.orig;
+        }
+        if (self.traceById(p.trace_id)) |t| {
+            t.entry_slot = null;
+            // Phase 1: `.bound → .eligible` transition + suppressed wakes here.
+        }
+        p.live = false;
+        p.pending_unpatch = false;
+        p.tombstone = true;
+        self.dbg("entry-patch unpatch: patch_pc={d} slot={d} trace={d}", .{ p.patch_pc, idx, p.trace_id });
+        // OOM here loses the index for reuse (stays tombstoned forever) —
+        // safe: fail-closed capacity, reclaimed at the epoch drain anyway.
+        self.entry_patch_free.append(self.gpa, idx) catch {};
+    }
+
+    /// Epoch/deinit teardown (§R2-2: the ONLY points images are freed).
+    /// Restores nothing — the images are dropped whole, and canonical
+    /// `Proto.code` was never touched.
+    pub fn dropEntryPatchState(self: *TraceState) void {
+        var it = self.code_images.valueIterator();
+        while (it.next()) |img| self.gpa.free(img.*);
+        self.code_images.clearRetainingCapacity();
+        for (self.entry_patches.items) |p| self.gpa.destroy(p);
+        self.entry_patches.clearRetainingCapacity();
+        self.entry_patch_free.clearRetainingCapacity();
+        self.entry_patch_dirty = 0;
+        self.image_gen +%= 1; // any live frame re-resolves to canonical
+    }
+
     pub fn clearCache(self: *TraceState) void {
+        // Doc 20 §R2-2: drop images + registry BEFORE destroying traces so no
+        // slot outlives the epoch (traces are resolved by id, but the order
+        // keeps the invariant trivially visible).
+        self.dropEntryPatchState();
         self.demoteAllSets();
         self.clearProvenanceEdges();
         for (self.cache.items) |t| t.destroy(self.gpa);
@@ -10269,6 +10532,10 @@ pub const TraceState = struct {
         g.strikes +|= 1;
         g.retry_at = self.tick +| g.window;
         g.window = @min(g.window *| 2, self.config.backoff_max);
+        // Doc 20 unpatch trigger: a gated anchor must not keep a patched
+        // entry — mark pending; the caller-owned safe-point drain restores
+        // same-turn and warming re-decides after the cooldown.
+        self.markEntryPatchesAt(anchor);
         self.dbg("gate: anchor pc={d} strikes={d} window={d} retry_at={d} tick={d}", .{ anchor.pc, g.strikes, g.window, g.retry_at, self.tick });
     }
 
@@ -20366,4 +20633,175 @@ test "A-ii.4 lifetime: removeTrace preserves region_defs (logical); clearCache e
     state.clearCache();
     try testing.expectEqual(@as(usize, 0), state.region_defs.count());
     try testing.expectEqual(@as(usize, 0), state.region_intern.entries.items.len);
+}
+
+// ---- doc 20 Phase 0b: entry-patch substrate (inert) -------------------------
+
+/// Hand-assembled proto with one numeric-for loop: header/anchor at pc=2,
+/// `.for_loop` at pc=5 whose taken back-edge (target = 5 + 1 + (-4)) lands on
+/// the anchor. pc=7 holds a second `.for_loop` some tests retarget to make the
+/// anchor ambiguous.
+fn entryPatchTestCode() [8]Instr {
+    var code: [8]Instr = undefined;
+    for (&code) |*c| c.* = Instr.op0(.ret);
+    code[5] = .{ .op = .for_loop, .a = 3, .aux = -4 };
+    return code;
+}
+
+fn entryPatchTestTrace(gpa: std.mem.Allocator, id: u32, proto: *const Proto, pc: u32) !*Trace {
+    const t = try gpa.create(Trace);
+    t.* = .{
+        .id = id,
+        .anchor = .{ .proto = proto, .pc = pc },
+        .instrs = try gpa.alloc(IrInstr, 0),
+        .consts = try gpa.alloc(Value, 0),
+        .entry_slots = try gpa.alloc(u16, 0),
+        .entry_guards = try gpa.alloc(EntryGuard, 0),
+        .exit_prov = try gpa.alloc(ExitProvEntry, 0),
+    };
+    return t;
+}
+
+test "doc 20 §T7: no image → codeFor is canonical; resolvePatchPc unique/none/ambiguous" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = entryPatchTestCode();
+    const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
+
+    // No images: canonical slice, pointer-identical (the count()==0 early-out).
+    try testing.expectEqual(@as([*]const Instr, proto.code.ptr), state.codeFor(&proto).ptr);
+
+    // Unique back-edge onto pc=2 resolves to the for_loop at pc=5.
+    try testing.expectEqual(@as(?u32, 5), TraceState.resolvePatchPc(&proto, 2));
+    // No for_loop targets pc=3 → fail closed.
+    try testing.expectEqual(@as(?u32, null), TraceState.resolvePatchPc(&proto, 3));
+    // Second for_loop retargeted onto the same anchor → ambiguous → fail closed.
+    code[7] = .{ .op = .for_loop, .a = 3, .aux = -6 }; // 7 + 1 - 6 == 2
+    try testing.expectEqual(@as(?u32, null), TraceState.resolvePatchPc(&proto, 2));
+}
+
+test "doc 20 Phase 0b: install publishes a .jfor_loop image; canonical untouched; incumbent wins" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = entryPatchTestCode();
+    const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
+    const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
+    try state.cache.append(gpa, t);
+    const sibling = try entryPatchTestTrace(gpa, 2, &proto, 2);
+    try state.cache.append(gpa, sibling);
+
+    const gen0 = state.image_gen;
+    try testing.expect(state.installEntryPatch(t));
+    try testing.expect(state.image_gen != gen0); // frames re-resolve at back-edge
+    try testing.expectEqual(@as(?u16, 0), t.entry_slot);
+
+    // Image: `.jfor_loop` at the patch pc, operands preserved, `.b` = slot.
+    const img = state.codeFor(&proto);
+    try testing.expect(img.ptr != proto.code.ptr);
+    try testing.expectEqual(OpCode.jfor_loop, img[5].op);
+    try testing.expectEqual(@as(u16, 3), img[5].a);
+    try testing.expectEqual(@as(i32, -4), img[5].aux);
+    try testing.expectEqual(@as(u16, 0), img[5].b);
+    // Everything else byte-identical; canonical NEVER touched.
+    for (img, proto.code, 0..) |gi, ci, i| {
+        if (i == 5) continue;
+        try testing.expect(std.meta.eql(gi, ci));
+    }
+    try testing.expectEqual(OpCode.for_loop, proto.code[5].op);
+
+    // §R3-1 rule 2: a live incumbent wins — the sibling's install is refused.
+    try testing.expect(!state.installEntryPatch(sibling));
+    try testing.expectEqual(@as(?u16, null), sibling.entry_slot);
+
+    // Unpatch: mark (allocation-free) then drain restores in place + tombstones.
+    state.markEntryPatchPending(0);
+    try testing.expect(!state.entry_patches.items[0].live);
+    state.drainEntryPatchWork();
+    try testing.expectEqual(OpCode.for_loop, state.codeFor(&proto)[5].op);
+    try testing.expect(state.entry_patches.items[0].tombstone);
+    try testing.expectEqual(@as(?u16, null), t.entry_slot);
+
+    // The freed slot index is reused by the next install (free-list pop).
+    try testing.expect(state.installEntryPatch(sibling));
+    try testing.expectEqual(@as(?u16, 0), sibling.entry_slot);
+    try testing.expectEqual(@as(u16, 0), state.codeFor(&proto)[5].b);
+    try testing.expectEqual(@as(usize, 1), state.entry_patches.items.len);
+}
+
+test "doc 20 §R7-2: removeTrace marks the slot pre-destroy; drain survives the dropped trace" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = entryPatchTestCode();
+    const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
+    const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
+    try state.cache.append(gpa, t);
+    try testing.expect(state.installEntryPatch(t));
+
+    // removeTrace destroys `t`; the hook must have marked slot 0 first.
+    state.removeTrace(t);
+    const p = state.entry_patches.items[0];
+    try testing.expect(!p.live and p.pending_unpatch);
+    // Drain after destroy: traceById(1) → null (dropped), restore + tombstone,
+    // and `p.trace` is never dereferenced.
+    state.drainEntryPatchWork();
+    try testing.expect(p.tombstone);
+    try testing.expectEqual(OpCode.for_loop, state.codeFor(&proto)[5].op);
+}
+
+test "doc 20 §R2-2: clearCache drops images + registry wholesale (epoch boundary)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = entryPatchTestCode();
+    const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
+    const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
+    try state.cache.append(gpa, t);
+    try testing.expect(state.installEntryPatch(t));
+    try testing.expect(state.code_images.count() == 1);
+
+    const gen0 = state.image_gen;
+    state.clearCache();
+    try testing.expectEqual(@as(usize, 0), state.code_images.count());
+    try testing.expectEqual(@as(usize, 0), state.entry_patches.items.len);
+    try testing.expectEqual(@as(usize, 0), state.entry_patch_free.items.len);
+    try testing.expectEqual(@as(u32, 0), state.entry_patch_dirty);
+    try testing.expect(state.image_gen != gen0); // live frames re-resolve to canonical
+    try testing.expectEqual(@as([*]const Instr, proto.code.ptr), state.codeFor(&proto).ptr);
+}
+
+test "doc 20 triggers: anchor gate and side-arm want both mark the patch pending" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = entryPatchTestCode();
+    const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
+    const anchor = AnchorKey{ .proto = &proto, .pc = 2 };
+    const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
+    try state.cache.append(gpa, t);
+
+    // Gate trigger: gating the anchor marks its live slot pending.
+    try testing.expect(state.installEntryPatch(t));
+    state.gateNativeUnsupported(anchor);
+    try testing.expect(state.entry_patches.items[0].pending_unpatch);
+    state.drainEntryPatchWork();
+    try testing.expect(state.entry_patches.items[0].tombstone);
+    try testing.expectEqual(@as(?u16, null), t.entry_slot);
+
+    // Side-arm trigger: `wants_side_trace` crossing hotguard marks pending.
+    try testing.expect(state.installEntryPatch(t));
+    var i: u32 = 0;
+    while (i < state.config.hotguard) : (i += 1) state.countGuardFailure(anchor, 4);
+    try testing.expect(state.wants_side_trace != null);
+    const p = state.entry_patches.items[t.entry_slot.?];
+    try testing.expect(p.pending_unpatch);
+    state.drainEntryPatchWork();
+    try testing.expectEqual(OpCode.for_loop, state.codeFor(&proto)[5].op);
 }

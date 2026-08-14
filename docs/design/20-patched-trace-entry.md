@@ -1,7 +1,8 @@
 # lune — Patched trace entry (the `BC_JFORL` analogue) — Design
 
 Status: design APPROVED (codex gpt-5.6-sol round 8, 2026-08-14 — §R8 MINOR
-§T10-wording fold applied); implementation not started
+§T10-wording fold applied); Phase 0a landed (`d4fd70f`), Phase 0b landed
+(inert substrate); Phase 1 (the flip) next
 Owner: Bart + agents
 Last updated: 2026-08-14
 
@@ -12,30 +13,41 @@ as they land; move bullets to Done once everything inside them is checked.
 
 ### Done
 
-_(nothing yet)_
+- [x] **Phase 0a — factor the entry/receipt routine** (`d4fd70f`,
+      2026-08-14). Trial-walk body (529 lines) extracted into the
+      directive-returning `Vm.enterSelectedTrace` + `EntryDirective` +
+      `TrialWalkCtx`; the walk's directive switch is the caller-owned
+      epilogue (§R3-3 drain site). Gated: full matrix (both flavors) +
+      hashgate green; interleaved tier-0 A/B neutral (sieve_int, str_manip)
+      to faster (scimark-lu −40%, likely icache — the dispatch loop shed
+      529 cold lines).
 
 ### Outstanding
 
-- [ ] **Phase 0a — factor the entry/receipt routine.** Extract today's
-      trial-walk body (interp.zig ~2760–2900: seed resolution, scratch borrow,
-      coverage brackets, `safe_to_arm`, `disarmAllLinks`,
-      `tryArmSiblingHandoff`, `prepareNativeEntry`, `silentStaging`,
-      `ledger_scratch`, result driving incl. `driveDispatcherSilentResult`,
-      `consumeSideTraceWantAtResume`, dead-trace retirement,
-      `drainProvenanceArms`, the `.switch_mode` return) into one
-      `enterSelectedTrace` routine that returns a **directive** consumed by
-      one caller-owned epilogue (§R3-3 — the future drain site precedes every
-      `continue :outer`/`.switch_mode`/fall-through exit) — behaviour-
-      preserving refactor, gated by the full matrix + hashgate before
-      anything else lands.
-- [ ] **Phase 0b — inert patch substrate.** `.jfor_loop` opcode, per-VM
-      copy-on-patch code images with the `image_gen` reload protocol (§R2-1)
-      and epoch-stable lifetime (§R2-2), stable-address free-list patch
-      registry with tombstones + `live` flag + publication/unpatch ordering
-      (§R2-4/6), `EntryPlan`, every unpatch trigger wired as pending-mark +
-      safe-point drain (trace removal, widen-eviction, gate, epoch clear, VM
-      deinit). Nothing installs a patch; tests prove images never exist on an
-      unpatched run.
+- [ ] **§P.0 board confirmation** — the full-board neutrality run for Phase
+      0a still owed: the first attempt was invalidated by load-70 parallel
+      rust builds; re-run `just bench` on a quiet machine and compare vs
+      `20260814-210757-99204e8.tsv`.
+- [x] **Phase 0b — inert patch substrate** (2026-08-14). `.jfor_loop` opcode
+      (dispatch arm panics until Phase 1 arms installs), per-VM copy-on-patch
+      code images with the `image_gen` reload protocol (§R2-1: `codeFor` at
+      the three frame-(re)load sites + `code_gen` memo + epilogue re-resolve)
+      and epoch-stable lifetime (§R2-2: freed only in `clearCache` +
+      `deinit`), stable-address per-slot-heap free-list registry with
+      tombstones + `live` + publication/unpatch ordering (§R2-4/6), EntryPlan
+      memoized as `seed_count` (the map already lives on `Trace.inputs`),
+      `markEntryPatchPending`/`drainEntryPatchWork` (dirty-counter, §R2-4
+      no-OOM-mid-grammar) hooked at the caller-owned epilogue, and every
+      unpatch trigger wired as pending-mark: `removeTrace` (widen-eviction
+      retires through it) via the `entry_slot` back-ref pre-destroy (§R7-2),
+      `gateAnchor` (covers `gateNativeUnsupported` + low-yield), all
+      `wants_side_trace`/`wants_prime_side` set sites, epoch clear, VM
+      deinit. Strike exhaustion is the Phase-1 arm's own mark — substrate
+      (`strikes` field + mark/drain) in place. Nothing installs in
+      production (`installEntryPatch` is test-exercised only); §T7 pins
+      no-image ⇒ pointer-identical canonical `codeFor`, plus lifecycle,
+      incumbent-wins, dropped-trace drain, epoch, and trigger tests. Full
+      matrix (both flavors) + hashgate green.
 - [ ] **Phase 1 — THE flip.** Qualification transitions the per-trace
       `entry_patch` state machine in the receipt-accounting funnel (§R2-7,
       §R4-2); the caller-owned safe-point drain revalidates then installs

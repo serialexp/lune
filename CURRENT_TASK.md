@@ -1,5 +1,36 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-64) — **Doc 20 Phase 0a (d4fd70f) + Phase 0b (inert substrate) LANDED; Phase 1 (the flip) next.**
+
+Bart approved implementation ("if codex is satisfied i certainly am").
+
+- **Phase 0a (d4fd70f)**: the 529-line trial-walk per-candidate body factored
+  verbatim into directive-returning `Vm.enterSelectedTrace` (+ `EntryDirective`
+  {next_candidate, resume_tier0, switch_mode_at}, `TrialWalkCtx`); the walk's
+  directive switch is the caller-owned epilogue (§R3-3 drain site). Interleaved
+  A/B neutral-to-faster; the **full-board §P.0 confirmation is still owed** —
+  first run invalidated by load-70 parallel rust builds; re-run `just bench` on
+  a quiet machine vs `bench/results/20260814-210757-99204e8.tsv`.
+- **Phase 0b (this commit)**: `.jfor_loop` opcode (arm panics until Phase 1);
+  `TraceState.code_images` copy-on-patch + `image_gen` reload protocol
+  (`codeFor` at the three interp frame-(re)load sites, `code_gen` memo,
+  epilogue re-resolve after `drainEntryPatchWork`); `EntryPatch` per-slot-heap
+  stable-address free-list registry (tombstones, publish-last/restore-first
+  ordering, `maxInt(u16)` fail-closed, `seed_count` = the EntryPlan structural
+  memo — the map itself already lives on `Trace.inputs`); mark/drain with a
+  dirty counter (no OOM mid-grammar); triggers wired: `removeTrace` via
+  `entry_slot` back-ref BEFORE `t.destroy` (§R7-2), `gateAnchor`, all
+  `wants_side_trace`/`wants_prime_side` sets (`markEntryPatchesAt`), epoch
+  `clearCache` + `deinit` (`dropEntryPatchState`, the only image-free points).
+  `installEntryPatch` is production-uncalled (tests only). 6 new tests (§T7
+  no-image pointer-identity, lifecycle/incumbent/reuse, dropped-trace drain,
+  epoch, triggers). Full matrix (both flavors) + hashgate green.
+- **Phase 1 next** (task #98): state machine in the accountTraceRun funnel
+  (tag-inspection `native == .compiled`, NEVER nativeFor), drain
+  revalidate-then-install, the real `.jfor_loop` arm calling
+  `enterSelectedTrace` (§R2-3/5 exactly-once-step), `min_trip_entry` demoted.
+  Then Phase 2 §P measurement (P.1 fft ≤360ms, P.2 board ≤3%).
+
 ## Status 2026-08-14 (LATEST-63) — **Doc 20 (patched trace entry, the BC_JFORL analogue) design APPROVED round 8 — awaiting Bart's go for implementation.**
 
 Bart ruled option C ("no point skipping it for a win we'll overwrite —

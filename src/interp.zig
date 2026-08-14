@@ -2531,7 +2531,12 @@ pub const Vm = struct {
         var frame: *CallFrame = &self.frames[self.depth - 1];
         var closure = frame.closure;
         var proto = closure.proto;
-        var code = proto.code;
+        // Doc 20: dispatch fetches from the VM-local copy-on-patch image when
+        // one exists (canonical `proto.code` otherwise — the empty-map early-out
+        // makes that one counter load). `code_gen` memoizes the image
+        // generation; the back-edge epilogue re-resolves when it moves (§R2-1).
+        var code = self.trace.codeFor(proto);
+        var code_gen = self.trace.image_gen;
         var base = frame.base;
         var regs = self.frameWindow(base, proto.num_registers);
         var pc = frame.pc;
@@ -2797,6 +2802,11 @@ pub const Vm = struct {
                     if (self.trace.config.enabled and pc <= cur_pc) break :sw;
                     continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
+                // Doc 20 (patched trace entry): only ever present in a per-VM
+                // copy-on-patch code image over a qualified `.for_loop`.
+                // Phase 0b keeps the substrate inert — nothing installs a
+                // patch — so dispatching one is a bug, not a semantic.
+                .jfor_loop => @panic("jfor_loop dispatched before doc 20 Phase 1 armed installs"),
                 // generic-for test: the preceding `call` filled R[a+3..] with the
                 // iterator's results. Continue iff the first var is non-nil (Lua
                 // stops only on nil; `false` continues), publishing it as the next
@@ -2993,7 +3003,8 @@ pub const Vm = struct {
                             frame = &self.frames[self.depth - 1];
                             closure = frame.closure;
                             proto = closure.proto;
-                            code = proto.code;
+                            code = self.trace.codeFor(proto); // doc 20 image
+                            code_gen = self.trace.image_gen;
                             base = frame.base;
                             regs = self.frameWindow(base, proto.num_registers);
                             pc = frame.pc;
@@ -3162,7 +3173,8 @@ pub const Vm = struct {
                     frame = &self.frames[self.depth - 1];
                     closure = frame.closure;
                     proto = closure.proto;
-                    code = proto.code;
+                    code = self.trace.codeFor(proto); // doc 20 image
+                    code_gen = self.trace.image_gen;
                     base = frame.base;
                     regs = self.frameWindow(base, proto.num_registers);
                     pc = frame.pc;
@@ -3367,7 +3379,19 @@ pub const Vm = struct {
                                 .dead = &dead,
                                 .ndead = &ndead,
                             };
-                            switch (self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx)) {
+                            const directive = self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
+                            // Doc 20 safe-point drain: runs BEFORE acting on any
+                            // directive (§R3-1) — every unpatch-producing event
+                            // inside the entry routine is flushed here, same
+                            // turn. Then re-resolve the fetch image if its
+                            // generation moved (a Phase-1 install, or the first
+                            // clone of this proto's image).
+                            self.trace.drainEntryPatchWork();
+                            if (self.trace.image_gen != code_gen) {
+                                code = self.trace.codeFor(proto);
+                                code_gen = self.trace.image_gen;
+                            }
+                            switch (directive) {
                                 .next_candidate => {},
                                 .resume_tier0 => |npc| {
                                     pc = npc;

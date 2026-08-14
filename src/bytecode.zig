@@ -96,6 +96,16 @@ pub const OpCode = enum(u8) {
     ///             the loop variable R[a+3] and `pc += aux` (back-edge to the
     ///             body). Otherwise fall through (loop done).
     for_loop,
+    /// `a, aux, b` patched trace entry (doc 20, the LuaJIT `BC_JFORL`
+    ///             analogue). Written ONLY into a per-VM copy-on-patch code
+    ///             image over a qualified anchor's `.for_loop` — canonical
+    ///             `Proto.code` NEVER contains it. `.a`/`.aux` preserved
+    ///             verbatim from the patched `.for_loop`; `.b` carries the
+    ///             entry-patch slot index into the VM's registry. Executes
+    ///             the exact `.for_loop` step semantics, then (Phase 1)
+    ///             dispatches the bound trace via `enterSelectedTrace`,
+    ///             skipping the per-back-edge discovery/selection cascade.
+    jfor_loop,
     /// `a, aux`    generic-for test+continue. The preceding `call` has already
     ///             written the loop variables into R[a+3..]. If the first loop
     ///             variable R[a+3] is **not nil** (Lua stops only on nil; `false`
