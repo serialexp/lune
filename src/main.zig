@@ -97,6 +97,11 @@ const usage =
     \\                       the coverage artifact (native-vs-tier-0 split by
     \\                       iterations + time, event counters, per-anchor) to
     \\                       <file> (binschema wire format) after the run.
+    \\  --mem-stats          wrap the process allocator in mem.TrackingAllocator and
+    \\                       print byte-level accounting (peak/live/total bytes,
+    \\                       alloc/free counts) to stderr after the run. Small
+    \\                       constant per-allocation overhead; do not combine with
+    \\                       --time benchmarking.
     \\  --time               print VM execute-only wall time to stderr after the
     \\                       run (the run alone, excluding parse/compile/emit). Kept
     \\                       free of JIT coverage accounting so the timing is clean;
@@ -169,7 +174,24 @@ const TraceOpts = struct {
 };
 
 pub fn main(init: std.process.Init) u8 {
-    const gpa = init.gpa;
+    // `--mem-stats` swaps `gpa` for a TrackingAllocator wrapper over the process
+    // allocator (Rule Z-4: account at the boundary). The tracker must be declared
+    // here — stable address for the vtable handle, and alive past `runSource` so
+    // the deferred report sees final counts.
+    var mem_tracker = lune.mem.TrackingAllocator.init(init.gpa);
+    var mem_stats = false;
+    defer if (mem_stats) {
+        const s = mem_tracker.stats;
+        lune.io.eprint(
+            "lune: mem stats\n" ++
+                "  peak bytes:        {d}\n" ++
+                "  total bytes:       {d}\n" ++
+                "  alloc calls:       {d}\n" ++
+                "  free calls:        {d}\n" ++
+                "  leaked bytes:      {d} ({d} allocations)\n",
+            .{ s.peak_bytes, s.total_bytes, s.alloc_count, s.free_count, s.live_bytes, s.live_allocations },
+        );
+    };
 
     var it = init.minimal.args.iterate();
     defer it.deinit(); // no-op on Linux; correct on Windows/WASI
@@ -266,6 +288,8 @@ pub fn main(init: std.process.Init) u8 {
                 lune.io.eprint("lune: error: --emit-coverage requires a <file> argument\n", .{});
                 return 2;
             };
+        } else if (std.mem.eql(u8, arg, "--mem-stats")) {
+            mem_stats = true;
         } else if (std.mem.eql(u8, arg, "--time")) {
             topts.time = true;
         } else break arg;
@@ -273,6 +297,10 @@ pub fn main(init: std.process.Init) u8 {
         lune.io.eprint("{s}", .{usage});
         return 2;
     };
+
+    // Everything below allocates, so the gpa choice happens exactly here: after
+    // flag parsing (which only compares argv strings), before first use.
+    const gpa = if (mem_stats) mem_tracker.allocator() else init.gpa;
 
     if (std.mem.eql(u8, first, "-e")) {
         // argv strings are already NUL-terminated, so this is a `[:0]const u8`.

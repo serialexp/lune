@@ -1,5 +1,34 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-14 (LATEST-59) — **B-5 COMPLETE: Phase 4 measurement recorded in doc 18 §P; nsieve-bit 37.2 → 15.4 ms (LuaJIT gap 5.8× → 2.4×).**
+
+Phase 4 per doc 18 §P, all six frozen predictions CONFIRMED (full
+record in doc 18 "§P — Measured results"):
+
+- **P.1**: nsieve-bit `--dump-aborts` → no recording aborts;
+  `--jit-stats` → 100.0% of loop iterations traced, 91.2% of run
+  cycles (88.4% native), all four anchors ≥99.3% incl. the formerly
+  aborting init loop nsieve:7.
+- **P.2**: nsieve-bit 6 wall 37.2 → **15.4 ms** ON (LuaJIT 6.4 →
+  2.4× gap); OFF 38.5 → 23.1 — promotion was ~neutral pre-flip (no
+  material traces to promote), now buys a further −33%.
+- **P.5**: board otherwise within noise both states (four TSVs
+  20260814-{121953,122259,155221,155531}). Outliers cleared:
+  scimark-lu re-rep 1133 (noise); str_format +6–8% both tiers is a
+  code-layout artifact (no tables in the program; 81.8% of time in
+  untouched-logic `gc.Heap.internValue` whose alignment shifted).
+- **P.6**: NEW `--mem-stats` CLI flag (TrackingAllocator wrap in
+  main.zig, Rule Z-4 style) — 28-program board peak delta uniform
+  −288 B, zero leaks everywhere; nsieve-bit −5.4% peak; boundary
+  micro: exact-2^20 ascending fill +48% peak (inside the accepted
+  ~2× bound), off-boundary/descending identical. Pre-flip
+  comparison binary built from a `git archive 7b65d79` copy in /tmp
+  with the same --mem-stats patch.
+
+Doc 18 status → complete (Phases 0–4); only the deliberately-parked
+hash-part integer-key recording arc remains. Post-landing codex
+review of the Phase 2/4 commits is the remaining house-pattern step.
+
 ## Status 2026-08-14 (LATEST-58) — **B-5 Phases 1–3 LANDED: slot-0 array part is live (`81b73c2` inert prep, `838fd75` THE atomic flip, doc sweep follows). Phase 4 measurement outstanding.**
 
 Doc 18 implemented on Bart's go-ahead. The array part now covers keys

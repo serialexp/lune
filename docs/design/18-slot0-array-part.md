@@ -1,6 +1,6 @@
 # Slot-0 Array Part (LuaJIT-faithful 0-based storage) — Design
 
-Status: partial — Phases 0–3 landed (`823f7ed` design, `81b73c2` Phase 1, `838fd75` Phase 2 THE flip, Phase 3 doc sweep in the same arc); Phase 4 measurement outstanding
+Status: complete — Phases 0–4 landed (`823f7ed` design, `81b73c2` Phase 1, `838fd75` Phase 2 THE flip, `0829bb7` Phase 3 doc sweep, Phase 4 measurement recorded in §P below); only the deliberately-deferred hash-part integer-key recording arc remains open
 Owner: Bart / Claude
 Last updated: 2026-08-14
 
@@ -38,10 +38,17 @@ inside them is checked.
   `schema/trace.json` description + doc 04 v7 entry + `table.zig`
   module docs).
 
+- [x] **Phase 4 — measurement per §P.** nsieve-bit + full board both
+  promotion states, plus the §P.6 memory board via the new
+  `--mem-stats` CLI flag (TrackingAllocator wrap in `main.zig`).
+  Results recorded in §P ("Measured results") below. Headline:
+  nsieve-bit 37.2 → 15.4 ms (LuaJIT gap 5.8× → 2.4×), 100% loop
+  coverage / 91.2% of run cycles in traces, board otherwise within
+  noise, memory board within noise (zero leaks), exact-2^i boundary
+  overshoot confirmed at +48% peak on a targeted micro.
+
 ### Outstanding
 
-- [ ] **Phase 4 — measurement per §P.** nsieve-bit + full board both
-  promotion states.
 - [ ] **Deferred — hash-part integer-key recording.** Negative/sparse
   integer keys remain untraceable (abort, as today). Rare; own arc.
 
@@ -526,6 +533,54 @@ finding 12), Phase 2 lands with tests for, at minimum:
    TrackingAllocator deltas on the board measured and reported —
    expected within noise for the suite (its dense runs are
    append-built), any boundary-shape outlier called out explicitly.
+
+### Measured results (Phase 4, 2026-08-14, post-flip rev `0829bb7` vs pre-flip `7b65d79`)
+
+Boards: `just bench` (reps 5, ReleaseFast), both promotion states
+(`silent_promotion_enabled` flipped in source, rebuilt, restored).
+TSVs: pre-flip ON `20260814-121953`, pre-flip OFF `20260814-122259`,
+post-flip ON `20260814-155221`, post-flip OFF `20260814-155531`.
+
+1. **P.1 — CONFIRMED.** `--dump-aborts` on nsieve-bit 6 reports **"no
+   recording aborts"** — the whole idx<1 `.bad_type` population
+   (24×:41 / 5×:58 / 6×:7 / 1×:17) is gone. `--jit-stats`: **100.0%
+   of loop iterations run as traces** (4,129,873 traced vs 730
+   tier-0), 91.2% of run cycles traced (88.4% native + 2.9% seam);
+   all four anchors — nsieve:7 (the formerly-aborting init loop),
+   :17, :41, and the pc-58 scan loop — at ≥99.3% traced iterations.
+   273 trace entries, 13 native link arms, 50,043 loop-done +
+   50,027 bridge fused transitions, 1 disarm.
+2. **P.2 — CONFIRMED, large.** nsieve-bit 6 wall (promotion ON):
+   **37.2 → 15.4 ms** (−59%); LuaJIT 6.4 ms, so the gap closes
+   5.8× → **2.4×**. Promotion OFF: 38.5 → 23.1 ms — pre-flip the
+   promotion knob was ~neutral on this benchmark (37.2 vs 38.5)
+   because recording aborted before promotion had material traces
+   to promote; post-flip it buys a further −33% (23.1 → 15.4).
+3. **P.3 — CONFIRMED.** All seven stdout hashes + three repros
+   byte-identical (GATE PASS, recorded at the Phase 2 landing).
+4. **P.4 — CONFIRMED (vacuous).** No byte-frozen keyframe goldens
+   existed; corpora are structural and re-gated under v7.
+5. **P.5 — CONFIRMED.** Full board within noise in both states.
+   nsieve 12.9/13.6, sieve_int 6.4/6.6, pi_leibniz 12.0/12.0
+   (ON, post/pre). Two apparent outliers investigated: scimark-lu
+   ON 1221 vs 1136 re-repped at 1133 (reps 7) — noise; str_format
+   +6–8% on BOTH tiers (573→607 t0, 564→627 jit) — the program
+   touches no tables at all (pure `string.format` loop), and
+   `perf` shows 81.8% of its time in `gc.Heap.internValue`, whose
+   logic is untouched but whose code layout shifted with the
+   gc.zig edits — an alignment artifact, not a semantic
+   regression.
+6. **P.6 — CONFIRMED.** Measured via the new `--mem-stats` flag
+   (added to `main.zig` this phase; pre-flip binary patched
+   identically from a `git archive` copy). Whole 28-program board:
+   peak-bytes delta is a uniform **−288 B** (static structure
+   delta, −0.02% typical), zero leaked bytes/allocations on every
+   program under `--trace --jit-native`; nsieve-bit is −5.4% peak
+   (fewer aborted recordings → less recorder scratch). Boundary
+   shape: ascending fill to exactly N=2^20 peaks 3.24 MB pre vs
+   4.82 MB post (**+48%** — slot count 2^20+1 doubles the extent,
+   inside the "up to ~2×" honesty bound); off-boundary N=10^6
+   identical (−160 B), descending/hash-dominated fill identical.
 
 ## §R1 — Round-1 review record (codex `gpt-5.6-sol` + Antigravity, 2026-08-14): REVISE ×2, convergent
 
