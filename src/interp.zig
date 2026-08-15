@@ -2019,10 +2019,11 @@ pub const Vm = struct {
             // Doc 20 §R1-3: the mirror always records the CANONICAL
             // instruction. `i` came from the fetch `code` slice, which may be
             // a patched image — a recording crossing a patched pc (a sibling
-            // loop of the one being recorded) must see virgin `.for_loop` IR
-            // and virgin shape checks, byte-identical with or without the
-            // patch. `proto.code` is canonical by construction (§R1).
-            const mi = if (i.op == .jfor_loop) proto.code[cur] else i;
+            // loop of the one being recorded) must see the virgin loop closer
+            // (`.for_loop`, `.jmp`, or `.jmp_if_false`) and virgin shape checks,
+            // byte-identical with or without the patch. `proto.code` is
+            // canonical by construction (§R1).
+            const mi = recordingMirrorInstr(proto, cur, i);
             const resolved: Value = switch (mi.op) {
                 .get_upval => self.upvalGet(closure.upvalues[mi.b]),
                 .get_global => self.globals.get(proto.constants[mi.b]),
@@ -2604,6 +2605,50 @@ pub const Vm = struct {
         return .next_candidate;
     }
 
+    /// Doc 20 Phase 3: common patched-entry tail for `.jfor_loop` and
+    /// `.jloop`. The opcode arms own their exact canonical step semantics;
+    /// once a back-edge is taken they both enter through the one Phase-0a
+    /// `enterSelectedTrace` routine and share strike/unpatch accounting.
+    inline fn enterPatchedTrace(
+        self: *Vm,
+        comptime mode: ExecMode,
+        patch: *trace.EntryPatch,
+        slot: u16,
+        closure: *const function.Closure,
+        proto: *const Proto,
+        regs: RegWindow,
+        base: usize,
+        pc: usize,
+    ) EntryDirective {
+        const ct = patch.trace; // live pre-drain ⇒ valid (§R7-2)
+        var dead: [trial_visited_cap]*trace.Trace = undefined;
+        var ndead: usize = 0;
+        // The walk marks each candidate visited before entering. A patched
+        // entry has no walk, so seed the exclusion set with exactly `ct`.
+        var visited_ct = [1]*trace.Trace{ct};
+        var wctx: TrialWalkCtx = .{
+            .visited = visited_ct[0..1],
+            .dead = &dead,
+            .ndead = &ndead,
+        };
+        const directive = self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
+        // §R6-1/§R7-1 strict order: inspect the stable slot before the drain,
+        // mark strike exhaustion, retire dead traces, drain the entire pending
+        // set, then never touch `patch` again (the slot may have been reused).
+        if (patch.live) {
+            if (directive == .next_candidate) {
+                patch.strikes +|= 1;
+                if (patch.strikes >= self.trace.config.patch_strikes)
+                    self.trace.markEntryPatchPending(slot);
+            } else {
+                patch.strikes = 0;
+            }
+        }
+        for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
+        self.trace.drainEntryPatchWork();
+        return directive;
+    }
+
     fn execImpl(self: *Vm, comptime mode: ExecMode, stop_depth: u32) Error!ExecStep {
         // Hot top-frame state, reloaded from `frames[depth-1]` after every push/pop.
         var frame: *CallFrame = &self.frames[self.depth - 1];
@@ -2964,44 +3009,7 @@ pub const Vm = struct {
                     // prologue's fail-closed type check subsumes the
                     // fingerprint at entry, per the B-4 discipline) and run
                     // the identical entry/receipt routine the walk uses.
-                    const ct = patch.trace; // live pre-drain ⇒ valid (§R2-6)
-                    var dead: [trial_visited_cap]*trace.Trace = undefined;
-                    var ndead: usize = 0;
-                    // The walk marks each candidate visited BEFORE entering,
-                    // and its chain-exclusion invariant is `ct ∈ visited` —
-                    // `driveChain` must never re-pick the trace that just
-                    // failed (its armed slots would re-fuse a state the burst
-                    // machinery hard-panics on). No walk here, so seed the
-                    // set with exactly the entered trace.
-                    var visited_ct = [1]*trace.Trace{ct};
-                    var wctx: TrialWalkCtx = .{
-                        .visited = visited_ct[0..1],
-                        .dead = &dead,
-                        .ndead = &ndead,
-                    };
-                    const directive = self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
-                    // §R6-1/§R7-1 strict order. (1) Inspect the held slot
-                    // BEFORE the drain — pointer still valid by §R2-6 stable
-                    // storage: if the binding died mid-grammar, no strike;
-                    // else strike non-productive outcomes (seed decline,
-                    // prologue fail-closed, zero-progress exit all return
-                    // `.next_candidate`), clear on productive ones.
-                    if (patch.live) {
-                        if (directive == .next_candidate) {
-                            patch.strikes +|= 1;
-                            if (patch.strikes >= self.trace.config.patch_strikes)
-                                self.trace.markEntryPatchPending(slot);
-                        } else {
-                            patch.strikes = 0;
-                        }
-                    }
-                    // Retire widen-evicted dead traces (the walk does this
-                    // post-walk; their removal marks pending unpatches).
-                    for (dead[0..ndead]) |dt| self.trace.removeTrace(dt);
-                    // (2) Drain the ENTIRE pending set, same-turn (§R5-1).
-                    // (3) Never touch `patch` again — the slot may already be
-                    // reused for a different binding (§R7-1 ABA).
-                    self.trace.drainEntryPatchWork();
+                    const directive = self.enterPatchedTrace(mode, patch, slot, closure, proto, regs, base, pc);
                     if (self.trace.image_gen != code_gen) {
                         code = self.trace.codeFor(proto);
                         code_gen = self.trace.image_gen;
@@ -3011,6 +3019,68 @@ pub const Vm = struct {
                             // Fall through to the tier-0 body. Mirror the
                             // walk's T3 invariant: a recording must never run
                             // under `.fast` (its prologue elides the mirror).
+                            if (mode == .fast and self.trace.isRecording()) {
+                                frame.pc = pc;
+                                return .switch_mode;
+                            }
+                            continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                        },
+                        .resume_tier0 => |npc| {
+                            pc = npc;
+                            continue :outer;
+                        },
+                        .switch_mode_at => |npc| {
+                            frame.pc = npc;
+                            return .switch_mode;
+                        },
+                    }
+                },
+                // Doc 20 Phase 3: patched entry for the loop-closing jumps the
+                // compiler actually emits — `.jmp` for `while`, and
+                // `.jmp_if_false` for `repeat`. The slot's canonical `orig`
+                // selects the exact jump semantics; only a taken back-edge may
+                // enter native. All bypasses present `orig` to the ordinary
+                // back-edge epilogue, exactly like `.jfor_loop`.
+                .jloop => {
+                    const slot: u16 = instr.b;
+                    const patch = self.trace.entry_patches.items[slot];
+                    const live = patch.live;
+                    if (!live) {
+                        // Same load-bearing deferred-unpatch recovery as the
+                        // numeric-for arm: complete the transaction before
+                        // executing the canonical jump once.
+                        self.trace.unpatchSlot(slot);
+                    }
+                    instr = patch.orig;
+                    a = instr.a;
+                    switch (instr.op) {
+                        .jmp => pc = applyJump(pc, instr.aux),
+                        .jmp_if_false => if (!regs.get(a).isTruthy()) {
+                            pc = applyJump(pc, instr.aux);
+                        },
+                        else => unreachable, // install accepts only compiler loop closers
+                    }
+                    // A repeat condition that is true exits the loop. `while`'s
+                    // unconditional closer always takes its back-edge.
+                    if (!(pc <= cur_pc)) {
+                        continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
+                    }
+                    if (!live) break :sw; // restored virgin cascade
+                    if (self.trace.isRecording() or self.suspend_ctl != null or
+                        self.record_safepoint_lines or self.trace.config.record_exec_log or
+                        self.trace.pending_exit_anchor != null or
+                        self.trace.pending_replay_anchor != null or
+                        self.trace.config.coverage)
+                    {
+                        break :sw;
+                    }
+                    const directive = self.enterPatchedTrace(mode, patch, slot, closure, proto, regs, base, pc);
+                    if (self.trace.image_gen != code_gen) {
+                        code = self.trace.codeFor(proto);
+                        code_gen = self.trace.image_gen;
+                    }
+                    switch (directive) {
+                        .next_candidate => {
                             if (mode == .fast and self.trace.isRecording()) {
                                 frame.pc = pc;
                                 return .switch_mode;
@@ -4884,6 +4954,13 @@ pub fn lenOf(v: Value) Error!Value {
 inline fn applyJump(pc: usize, offset: i32) usize {
     const signed: i64 = @as(i64, @intCast(pc)) + offset;
     return @intCast(signed);
+}
+
+/// Doc 20 §R1-3 / Phase 3: patched opcodes are dispatch-image details, never
+/// recorder input. A recording that crosses a patched pc mirrors the immutable
+/// canonical instruction, so trace IR is byte-identical to an unpatched run.
+pub inline fn recordingMirrorInstr(proto: *const Proto, pc: usize, fetched: Instr) Instr {
+    return if (fetched.op == .jfor_loop or fetched.op == .jloop) proto.code[pc] else fetched;
 }
 
 // ---------------------------------------------------------------------------

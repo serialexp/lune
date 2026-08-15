@@ -79,6 +79,81 @@ test "doc 20 §T7: no image → codeFor is canonical; resolvePatchPc unique/none
     try testing.expectEqual(@as(?u32, null), TraceState.resolvePatchPc(&proto, 2));
 }
 
+test "doc 20 Phase 3: resolve and lifecycle cover compiler while/repeat closers only" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    // `compileWhile` closes with an unconditional backward `.jmp`.
+    var while_code = entryPatchTestCode();
+    while_code[5] = .{ .op = .jmp, .aux = -4 };
+    const while_proto = Proto{ .code = &while_code, .id = 8, .name = "while", .num_registers = 8 };
+    try testing.expectEqual(@as(?u32, 5), TraceState.resolvePatchPc(&while_proto, 2));
+    const wt = try entryPatchTestTrace(gpa, 10, &while_proto, 2);
+    try state.cache.append(gpa, wt);
+    try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(wt));
+    try testing.expectEqual(OpCode.jloop, state.codeFor(&while_proto)[5].op);
+    try testing.expectEqual(OpCode.jmp, while_proto.code[5].op); // canonical stays virgin
+    state.markEntryPatchPending(wt.entry_slot.?);
+    state.drainEntryPatchWork();
+    try testing.expectEqual(OpCode.jmp, state.codeFor(&while_proto)[5].op);
+    try testing.expect(state.entry_patches.items[0].tombstone);
+    while_code[7] = .{ .op = .jmp_if_false, .a = 1, .aux = -6 };
+    try testing.expectEqual(@as(?u32, null), TraceState.resolvePatchPc(&while_proto, 2)); // mixed closer ambiguity
+
+    // `compileRepeat` closes with a backward `.jmp_if_false`; `.a` (the
+    // condition register) and `.aux` survive the patch/unpatch transaction.
+    var repeat_code = entryPatchTestCode();
+    repeat_code[5] = .{ .op = .jmp_if_false, .a = 6, .aux = -4 };
+    const repeat_proto = Proto{ .code = &repeat_code, .id = 9, .name = "repeat", .num_registers = 8 };
+    try testing.expectEqual(@as(?u32, 5), TraceState.resolvePatchPc(&repeat_proto, 2));
+    const rt = try entryPatchTestTrace(gpa, 11, &repeat_proto, 2);
+    try state.cache.append(gpa, rt);
+    try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(rt));
+    const patched = state.codeFor(&repeat_proto)[5];
+    try testing.expectEqual(OpCode.jloop, patched.op);
+    try testing.expectEqual(@as(u16, 6), patched.a);
+    try testing.expectEqual(@as(i32, -4), patched.aux);
+    state.markEntryPatchPending(rt.entry_slot.?);
+    state.drainEntryPatchWork();
+    try testing.expect(std.meta.eql(repeat_proto.code[5], state.codeFor(&repeat_proto)[5]));
+
+    // The compiler does not close while/repeat with these conditional forms;
+    // deliberately leave them on the virgin cascade instead of broadening the
+    // patch surface to bytecode shapes with no language producer.
+    var skipped_code = entryPatchTestCode();
+    skipped_code[5] = .{ .op = .jmp_if_true, .a = 1, .aux = -4 };
+    const skipped_proto = Proto{ .code = &skipped_code, .id = 10, .name = "skipped", .num_registers = 8 };
+    try testing.expectEqual(@as(?u32, null), TraceState.resolvePatchPc(&skipped_proto, 2));
+    skipped_code[5].op = .jmp_if_not_nil;
+    try testing.expectEqual(@as(?u32, null), TraceState.resolvePatchPc(&skipped_proto, 2));
+}
+
+test "doc 20 Phase 3: jloop strike exhaustion policy restores canonical and cools to eligible" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = entryPatchTestCode();
+    code[5] = .{ .op = .jmp, .aux = -4 };
+    const proto = Proto{ .code = &code, .id = 11, .name = "strike", .num_registers = 8 };
+    const t = try entryPatchTestTrace(gpa, 12, &proto, 2);
+    try state.cache.append(gpa, t);
+    try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
+    t.entry_patch = .bound;
+
+    // The common patched-entry tail marks at `patch_strikes`; pin the policy's
+    // resulting transaction independently of trace-entry shape.
+    const slot = t.entry_slot.?;
+    state.entry_patches.items[slot].strikes = state.config.patch_strikes;
+    state.markEntryPatchPending(slot);
+    state.drainEntryPatchWork();
+    try testing.expectEqual(OpCode.jmp, state.codeFor(&proto)[5].op);
+    try testing.expect(state.entry_patches.items[slot].tombstone);
+    try testing.expectEqual(trace.EntryPatchState.eligible, t.entry_patch);
+    try testing.expectEqual(@as(?u16, null), t.entry_slot);
+}
+
 test "doc 20 Phase 0b: install publishes a .jfor_loop image; canonical untouched; incumbent wins" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);

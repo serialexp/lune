@@ -2,10 +2,10 @@
 
 Status: design APPROVED (codex gpt-5.6-sol round 8, 2026-08-14 — §R8 MINOR
 §T10-wording fold applied); Phase 0a landed (`d4fd70f`), Phase 0b landed
-(`272f75b`), Phase 1 (THE flip) landed, Phase 2 (§P measurement) complete;
-Phase 3 (`.jloop`) + Open Q2 outstanding
+(`272f75b`), Phase 1 (THE flip) landed, Phase 2 (§P measurement) complete,
+Phase 3 (`.jloop`) landed; Open Q2 outstanding
 Owner: Bart + agents
-Last updated: 2026-08-15
+Last updated: 2026-08-16
 
 ## Implementation status
 
@@ -91,6 +91,37 @@ as they land; move bullets to Done once everything inside them is checked.
       win; the remaining fft lever is Phase 3 `.jloop` (bitreverse `while`
       loops, 30.4% of run).
 
+- [x] **Phase 3 — `.jloop` analogue for while/repeat back-edges**
+      (2026-08-16). The compiler's actual loop-closing shapes — backward
+      `.jmp` for `while` and backward `.jmp_if_false` for `repeat` — now patch
+      to a shared `.jloop` image opcode at qualification. Its arm executes the
+      canonical jump/test exactly once, enters only on the taken back-edge,
+      and then uses the same factored `enterSelectedTrace` routine, common
+      strike accounting, pending-unpatch drain, and gate cooldown as
+      `.jfor_loop`; recorder mirroring canonicalizes both patched opcodes.
+      Copy-on-patch publication, per-VM image lifetime, and canonical-Proto
+      immutability are unchanged. `.jmp_if_true` / `.jmp_if_not_nil` remain
+      deliberately unpatched because the compiler emits neither as a
+      while/repeat closer; ambiguous mixed closer shapes still fail closed.
+      **Measured (2026-08-16): perf-NEUTRAL across the board** — full 28/28
+      board ok, six-hash + three-repro gate PASS, and a genuine interleaved
+      pre/post A/B (fft/lu jit + tier-0, pi_leibniz; 3 rounds min-of-5) all
+      within noise. The Phase-2 prediction that `.jloop` was "the remaining
+      fft lever" is **REFUTED**: `fft_bitreverse:9`/`:55` (13.4% + 19.8% of
+      the fft run) run **0% traced** pre AND post — `:9` never records a
+      trace at all, `:55` recorded once, aborted `bad_type` at a `get_index`
+      (the float-valued `j`/`k` swap indices from `k = k / 2`), and never
+      re-enters; zero `.jloop` installs occur on fft. Patched entry removes
+      the discovery cascade for loops that already have qualified traces —
+      it cannot help loops with no viable trace. The actual next fft lever
+      is making bitreverse *traceable* (the `bad_type get_index` abort and
+      the `:9` non-recording), a recorder/typing problem, not an entry
+      problem. A/B methodology note: a first "A/B" was invalidated because
+      the shadow tree's copied `.zig-cache` produced a post-source binary
+      (its consistent "+2% fft" was two-builds-of-identical-source layout
+      noise — a useful noise-floor datum); always `rm -rf .zig-cache
+      zig-out` in a `cp -r` shadow tree before building.
+
 - [x] **§P.0 board confirmation** — superseded: the Phase-0a-only board
       can no longer be isolated post-flip; the pre/post-flip A/B carries
       0a+0b on both sides, so a 0a regression would have surfaced there
@@ -98,9 +129,6 @@ as they land; move bullets to Done once everything inside them is checked.
 
 ### Outstanding
 
-- [ ] **Phase 3 — `.jloop` analogue for while/repeat back-edges.** Same
-      machinery on the backward `jmp`/`jmp_if_*`; separately measured (fft
-      does not need it; bitreverse's `while` and the string loops might).
 - [ ] **Open Q2 (§R1-8) — sibling rebind policy.** On strike exhaustion at a
       patched anchor with type-specialized siblings: rebind to the sibling the
       cold path selects, or unpatch and let warming re-decide. Default for

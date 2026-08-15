@@ -106,6 +106,15 @@ pub const OpCode = enum(u8) {
     ///             dispatches the bound trace via `enterSelectedTrace`,
     ///             skipping the per-back-edge discovery/selection cascade.
     jfor_loop,
+    /// `a, aux, b` patched trace entry for while/repeat loop-closing jumps
+    ///             (doc 20 Phase 3, the `.jloop` analogue). Written ONLY into
+    ///             a per-VM copy-on-patch image over a backward `.jmp`
+    ///             (while) or `.jmp_if_false` (repeat); canonical `Proto.code`
+    ///             NEVER contains it. `.a`/`.aux` retain the original jump's
+    ///             operands and `.b` carries the entry-patch slot index. The
+    ///             dispatch arm executes the original jump semantics first;
+    ///             only a taken back-edge enters the bound trace.
+    jloop,
     /// `a, aux`    generic-for test+continue. The preceding `call` has already
     ///             written the loop variables into R[a+3..]. If the first loop
     ///             variable R[a+3] is **not nil** (Lua stops only on nil; `false`

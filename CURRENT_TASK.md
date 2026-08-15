@@ -1,5 +1,40 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-16 (LATEST-69) — **Doc 20 Phase 3 LANDED (codex-authored, Claude-verified): `.jloop` patched entry for while/repeat closers. Perf-NEUTRAL; the fft bitreverse premise is REFUTED — those loops never trace at all.**
+
+- Codex (gpt-5.6-sol, thread `01a007a0-0529-71c0-a579-87b67fadff3c`)
+  implemented Phase 3 per doc 20: the compiler's actual loop closers —
+  backward `.jmp` (while) and backward `.jmp_if_false` (repeat) — patch to a
+  shared `.jloop` image opcode at qualification. The arm executes the
+  canonical jump once, enters only on a taken back-edge, and shares the
+  factored patched-entry tail (`enterPatchedTrace`, now `inline` to keep the
+  pre-Phase-3 code shape in the `.jfor_loop` arm) + strike/unpatch/drain
+  policy with `.jfor_loop`. `resolvePatchPc` generalized (backward-only,
+  fail-closed on ambiguity); recorder mirroring canonicalizes both patched
+  opcodes (`recordingMirrorInstr`). `.jmp_if_true`/`.jmp_if_not_nil`
+  deliberately unpatched (no language producer). Open Q2 untouched.
+- Gates: `just test` + `-Djit-debug` both green; six-hash gate PASS
+  (jit ≡ tier-0 ≡ frozen refs on all six workloads); repros 109/109/18135;
+  full board 28/28 cross+luajit ok. New pins: lifecycle/ambiguity/
+  skipped-opcode/strike-policy in `trace_entrypatch_test.zig`, ten-mode
+  determinism + recording-crosses-patched-pc + real prologue-strike
+  exhaustion in `interp_lanes_test.zig`.
+- **Measured: perf-NEUTRAL** (genuine interleaved pre/post A/B, 3 rounds
+  min-of-5: fft jit 293–296→291–293, lu jit 164→165–167, tier-0 legs equal).
+  The Phase-2 "remaining fft lever" prediction is REFUTED:
+  `fft_bitreverse:9`/`:55` (33% of the fft run) are 0% traced pre AND post —
+  `:9` never records, `:55` aborted once (`bad_type` on `get_index`, the
+  float-valued `j`/`k` from `k = k / 2`) and never re-enters; zero `.jloop`
+  installs on fft. **Next fft lever: make bitreverse traceable** (recorder
+  typing at the swap indices + why `:9` never records), not entry machinery.
+- **Measurement trap (new, cost an hour): a `cp -r` shadow tree inherits
+  `.zig-cache`/`zig-out`, and `zig build` there produced a POST-source
+  binary** — the first "A/B" was post-vs-post and its consistent "+2% fft"
+  was pure two-builds-of-identical-source layout noise (a useful noise-floor
+  datum: ~2% on fft). Always `rm -rf .zig-cache zig-out` in a shadow tree
+  before building; verify with `nm <bin> | grep <new-symbol>`.
+- Doc 20 status: Phases 0a/0b/1/2/3 all Done; Outstanding = Open Q2 only.
+
 ## Status 2026-08-15 (LATEST-68) — **Doc 21 Phase A LANDED: H-5(i) fixed, §R3 green with the full JIT, matrix 918/918.**
 
 - Bart chose option (b) (canonicalize dead slots at capture). Design doc 21

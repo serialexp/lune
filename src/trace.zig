@@ -1361,7 +1361,8 @@ pub const ExitMaterialization = union(enum) {
 /// down properly.
 pub const AnchorKey = struct { proto: *const Proto, pc: u32 };
 
-/// Doc 20 (patched trace entry): one registry slot binding a `.jfor_loop`
+/// Doc 20 (patched trace entry): one registry slot binding a `.jfor_loop` or
+/// `.jloop`
 /// patched into a per-VM code image to its qualified root trace. Slots are
 /// **stable-address** (§R2-6): each is its own heap allocation, the index in
 /// `TraceState.entry_patches` is baked into the image instruction's `.b`, and
@@ -1391,7 +1392,7 @@ pub const EntryPatch = struct {
     /// means the trace is already destroyed (§R7-2).
     trace_id: u32,
     proto: *const Proto,
-    /// Instruction index of the patched `.for_loop` inside the image.
+    /// Instruction index of the patched loop-closing instruction in the image.
     patch_pc: u32,
     /// Canonical content, restored on unpatch (debug-asserted identical to
     /// `proto.code[patch_pc]`, which is the ground truth anyway).
@@ -1514,7 +1515,7 @@ pub const Trace = struct {
     /// harmless — the dispatcher's id path only runs for real recorded traces).
     id: u32 = 0,
     /// Doc 20 §R7-2: back-reference to this trace's entry-patch registry slot
-    /// while `.jfor_loop`-bound, else null. Lets `removeTrace` mark the slot
+    /// while entry-patch-bound, else null. Lets `removeTrace` mark the slot
     /// (clear `live`, set pending) in O(1) BEFORE destruction, and lets
     /// qualification assert a trace never binds two slots.
     entry_slot: ?u16 = null,
@@ -2217,7 +2218,7 @@ pub const TraceState = struct {
     /// `u64` so wrap-aliasing is structurally unreachable.
     image_gen: u64 = 0,
     /// Doc 20 §R2-6: the entry-patch registry. Indexed by the `.b` operand of
-    /// patched `.jfor_loop` instructions; each slot is its own allocation
+    /// patched `.jfor_loop` / `.jloop` instructions; each slot is its own allocation
     /// (stable addresses), tombstoned + reused via `entry_patch_free`.
     entry_patches: std.ArrayListUnmanaged(*EntryPatch) = .empty,
     entry_patch_free: std.ArrayListUnmanaged(u16) = .empty,
@@ -10286,17 +10287,30 @@ pub const TraceState = struct {
         return gop.value_ptr.*;
     }
 
-    /// §R3-1 patch-pc resolution, fail closed: the unique `.for_loop` whose
-    /// taken back-edge targets `anchor_pc` (target = pc + 1 + aux, matching
-    /// the dispatcher's post-fetch `applyJump`). Zero or multiple matches →
-    /// null (ambiguity is a property of the immutable bytecode — the caller
-    /// routes `.suppressed_permanent` in Phase 1).
+    /// The image opcode corresponding to a canonical loop-closing instruction.
+    /// Numeric `for` uses `.jfor_loop`; compiler-emitted `while` and `repeat`
+    /// close with `.jmp` and `.jmp_if_false` respectively and share `.jloop`.
+    /// Other jump variants are not loop closers emitted by the compiler.
+    fn patchedEntryOp(op: OpCode) ?OpCode {
+        return switch (op) {
+            .for_loop => .jfor_loop,
+            .jmp, .jmp_if_false => .jloop,
+            else => null,
+        };
+    }
+
+    /// §R3-1 patch-pc resolution, fail closed: the unique supported loop-closing
+    /// instruction whose taken back-edge targets `anchor_pc` (target = pc + 1 +
+    /// aux, matching the dispatcher's post-fetch `applyJump`). This covers the
+    /// actual compiler shapes: numeric `for` (`.for_loop`), `while` (`.jmp`), and
+    /// `repeat` (`.jmp_if_false`). Zero or multiple matches → null (ambiguity is a
+    /// property of immutable bytecode; the caller routes `.suppressed_permanent`).
     pub fn resolvePatchPc(proto: *const Proto, anchor_pc: u32) ?u32 {
         var found: ?u32 = null;
         for (proto.code, 0..) |ins, i| {
-            if (ins.op != .for_loop) continue;
+            if (patchedEntryOp(ins.op) == null) continue;
             const target: i64 = @as(i64, @intCast(i + 1)) + ins.aux;
-            if (target == anchor_pc) {
+            if (target == anchor_pc and target <= @as(i64, @intCast(i))) {
                 if (found != null) return null; // ambiguous → fail closed
                 found = @intCast(i);
             }
@@ -10316,7 +10330,7 @@ pub const TraceState = struct {
         oom,
     };
 
-    /// Install a `.jfor_loop` patch binding `t` at its anchor (§R2-6
+    /// Install a `.jfor_loop` / `.jloop` patch binding `t` at its anchor (§R2-6
     /// publication order: initialize the slot COMPLETELY, then write the
     /// image opcode — that write is the publication). Declines (installing
     /// nothing) when the patch pc is unresolvable/ambiguous, the pc already
@@ -10328,7 +10342,10 @@ pub const TraceState = struct {
         std.debug.assert(t.entry_slot == null);
         const patch_pc = resolvePatchPc(t.anchor.proto, t.anchor.pc) orelse return .no_patch_pc;
         const img = self.ensureImage(t.anchor.proto) catch return .oom;
-        if (img[patch_pc].op == .jfor_loop) return .{ .incumbent = img[patch_pc].b }; // live incumbent wins
+        const orig = t.anchor.proto.code[patch_pc];
+        const patched_op = patchedEntryOp(orig.op) orelse unreachable;
+        if (img[patch_pc].op == .jfor_loop or img[patch_pc].op == .jloop)
+            return .{ .incumbent = img[patch_pc].b }; // live incumbent wins
         // Acquire a slot: reuse a tombstone, else append (fail closed at the
         // u16 index ceiling — `.b` must hold the index).
         const idx: u16 = if (self.entry_patch_free.pop()) |free_idx|
@@ -10355,13 +10372,13 @@ pub const TraceState = struct {
             .trace_id = t.id,
             .proto = t.anchor.proto,
             .patch_pc = patch_pc,
-            .orig = t.anchor.proto.code[patch_pc],
+            .orig = orig,
             .seed_count = seed_count,
         };
         t.entry_slot = idx;
         // Publication: the opcode write, AFTER the slot is fully initialized.
         var patched = p.orig;
-        patched.op = .jfor_loop;
+        patched.op = patched_op;
         patched.b = idx;
         img[patch_pc] = patched;
         self.image_gen +%= 1; // current frame reloads at its next back-edge
@@ -10470,13 +10487,13 @@ pub const TraceState = struct {
     /// needed. Resolves the trace through `traceById`, never `p.trace`
     /// (§R7-2: the trace may already be destroyed).
     /// Public for exactly one external caller besides the drain: the
-    /// `.jfor_loop` arm's §R6-1 defensive step-1 recovery, which runs OUTSIDE
+    /// patched dispatch arms' §R6-1 defensive step-1 recovery, which runs OUTSIDE
     /// any receipt grammar and is the sole slot-pointer holder — synchronous
     /// unpatch is safe there.
     pub fn unpatchSlot(self: *TraceState, idx: u16) void {
         const p = self.entry_patches.items[idx];
         if (self.code_images.get(p.proto)) |img| {
-            std.debug.assert(img[p.patch_pc].op == .jfor_loop and img[p.patch_pc].b == idx);
+            std.debug.assert(img[p.patch_pc].op == patchedEntryOp(p.orig.op).? and img[p.patch_pc].b == idx);
             std.debug.assert(std.meta.eql(p.orig, p.proto.code[p.patch_pc]));
             img[p.patch_pc] = p.orig;
         }

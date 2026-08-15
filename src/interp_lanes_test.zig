@@ -41,6 +41,8 @@ const Vm = interp.Vm;
 
 const util = @import("interp_testutil.zig");
 const expectProgram = util.expectProgram;
+const expectProgramTuned = util.expectProgramTuned;
+const TraceMode = util.TraceMode;
 
 // ---------------------------------------------------------------------------
 // array-of-structs (.value-lane table load) — the bodies[i].x pattern
@@ -566,4 +568,116 @@ test "doc 20 §T (Phase 1 e2e): a qualified hot loop actually installs and binds
         try testing.expectEqualStrings(sink.buffered(), out_jit[0..out_len]);
         try testing.expectEqualStrings("1010000\n", sink.buffered());
     }
+}
+
+test "doc 20 Phase 3: while/repeat jloop patches bind and stay byte-identical across all 10 modes" {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native or !@import("nativegen.zig").is_x64_linux) {
+                // Qualification is native-only; all other matrix legs keep the
+                // canonical code image and registry untouched.
+                try testing.expectEqual(@as(usize, 0), vm.trace.entry_patches.items.len);
+                return;
+            }
+            var saw_while = false;
+            var saw_repeat = false;
+            for (vm.trace.entry_patches.items) |p| {
+                if (p.tombstone or !p.live) continue;
+                try testing.expectEqual(bytecode.OpCode.jloop, vm.trace.codeFor(p.proto)[p.patch_pc].op);
+                switch (p.orig.op) {
+                    .jmp => saw_while = true,
+                    .jmp_if_false => saw_repeat = true,
+                    else => {},
+                }
+            }
+            try testing.expect(saw_while);
+            try testing.expect(saw_repeat);
+        }
+    };
+
+    // Long, general integer loops ensure each compiler-emitted closer records,
+    // compiles, qualifies, and remains bound long enough for inspection. The
+    // ten-mode matrix is the determinism/GC gate; the callback pins THE flip.
+    try expectProgramTuned(
+        \\local i = 0
+        \\local a = 0
+        \\while i < 300 do
+        \\  i = i + 1
+        \\  a = a + i
+        \\end
+        \\local j = 0
+        \\local b = 0
+        \\repeat
+        \\  j = j + 1
+        \\  b = b + j
+        \\until j >= 300
+        \\print(a, b)
+    , "45150\t45150\n", .{ .inspect = Inspect.run });
+}
+
+test "doc 20 Phase 3: a recording crossing a jloop pc mirrors the canonical jump" {
+    var code: [4]Instr = @splat(Instr.op0(.ret));
+    code[2] = .{ .op = .jmp_if_false, .a = 7, .aux = -3 };
+    const proto = bytecode.Proto{ .code = &code, .id = 77, .name = "mirror", .num_registers = 8 };
+    var fetched = code[2];
+    fetched.op = .jloop;
+    fetched.b = 42;
+
+    const mirrored = interp.recordingMirrorInstr(&proto, 2, fetched);
+    try testing.expect(std.meta.eql(code[2], mirrored));
+    try testing.expectEqual(bytecode.OpCode.jmp_if_false, mirrored.op);
+    // Ordinary instructions stay zero-copy/value-identical through the helper.
+    try testing.expect(std.meta.eql(code[0], interp.recordingMirrorInstr(&proto, 0, code[0])));
+}
+
+test "doc 20 Phase 3: jloop prologue strike exhaustion unpatches same-turn" {
+    if (comptime !@import("nativegen.zig").is_x64_linux) return error.SkipZigTest;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const gpa = testing.allocator;
+    const source: [:0]const u8 =
+        \\local function f(x, n)
+        \\  local i = 0
+        \\  while i < n do
+        \\    i = i + 1
+        \\    x = x + i
+        \\  end
+        \\  return x
+        \\end
+        \\print(f(0, 200))
+        \\print(f(0.5, 1))
+    ;
+
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var out: [32]u8 = undefined;
+    var sink = io.Writer.fixed(&out);
+    vm.out = &sink;
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.patch_strikes = 1;
+    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("20100\n1.5\n", sink.buffered());
+
+    // The int-specialized binding installed during the first call. The float
+    // second call fails its native prologue at the patched while closer; with
+    // a one-strike budget the common patched-entry tail must restore `.jmp`
+    // and tombstone the slot before the terminal condition exits the loop.
+    var saw_exhausted_while = false;
+    for (vm.trace.entry_patches.items) |p| {
+        if (p.orig.op != .jmp or !p.tombstone) continue;
+        try testing.expect(std.meta.eql(p.orig, vm.trace.codeFor(p.proto)[p.patch_pc]));
+        saw_exhausted_while = true;
+    }
+    try testing.expect(saw_exhausted_while);
 }
