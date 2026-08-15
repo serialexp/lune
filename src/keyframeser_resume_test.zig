@@ -614,3 +614,206 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
     };
     try expectRestoreError(bad, &rootp, error.FrameWindowMismatch);
 }
+
+// ---------------------------------------------------------------------------
+// Doc 21 §T-A — canonical final-state capture (the H-5(i) fix)
+// ---------------------------------------------------------------------------
+
+/// Compile + run `source` on a fresh VM with the full JIT enabled (tracing +
+/// opt + native where available), assert its output matches `ref`, and return
+/// its final snapshot (caller frees).
+fn jitFinalSnapshot(gpa: std.mem.Allocator, source: [:0]const u8, ref: RefRun) ![]u8 {
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [512]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+    vm.trace.config.hotloop = 4;
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(ref.full_out, sink.buffered());
+    return try encodeSnapshot(gpa, &vm);
+}
+
+test "doc 21 §T-A.2: cross-tier final snapshots byte-identical (the minimized H-5(i) g-loop shape)" {
+    // The exact divergence channel from the §R3 bisect, minimized: tier-0
+    // leaves the g-loop's final-iteration temps in dead slots; the native exit
+    // flush freezes pre-burst values there (the recorder's locals_watermark φ
+    // filter prunes never-read temps). The doc-21 final-cut mask must
+    // canonicalize both to nil, making the snapshots byte-compare.
+    const gpa = testing.allocator;
+    const source =
+        \\m = {{1,2,3},{4,5,6},{7,8,9}}
+        \\local g = 0
+        \\for r = 1, 200 do
+        \\  for i = 1, 3 do
+        \\    for j = 1, 3 do g = g + m[i][j] end
+        \\  end
+        \\end
+        \\print(g)
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    const snap = try jitFinalSnapshot(gpa, source, ref);
+    defer gpa.free(snap);
+    try testing.expectEqualSlices(u8, ref.final_snap, snap);
+}
+
+test "doc 21 §T-A.3: result span preserved; dead-slot-only garbage excluded from the snapshot walk" {
+    const gpa = testing.allocator;
+    // `hidden`'s only reference is a dead local at the final state — semantic
+    // garbage; the returned table rides the result span and must survive.
+    const source =
+        \\local hidden = {11, 22}
+        \\return {1, 2}
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    const fc = vm.final_cut orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 1), fc.result_count);
+
+    const snap = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(snap);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const file = try schema.SnapshotFile.decode(arena.allocator(), snap);
+    const kf = file.keyframe;
+
+    // The span slot is a heap ref; every other stack slot is canonical nil.
+    for (kf.stack, 0..) |sv, idx| {
+        if (idx == fc.result_base) {
+            try testing.expect(sv.body == .HeapRef);
+        } else {
+            try testing.expectEqual(@as(u8, 0), sv.tag); // nil
+        }
+    }
+    // The returned {1,2} is in the walk; hidden {11,22} is not.
+    var saw_returned = false;
+    for (kf.objects) |obj| {
+        if (obj.body != .HeapTable) continue;
+        const t = obj.body.HeapTable;
+        for (t.array) |av| {
+            if (av.body != .ConstInt) continue;
+            if (av.body.ConstInt.v == 1) saw_returned = true;
+            try testing.expect(av.body.ConstInt.v != 11); // hidden excluded
+        }
+    }
+    try testing.expect(saw_returned);
+}
+
+test "doc 21 §T-A.4: all_results finish — dynamic span past the static window is raised, rooted, captured (B-6)" {
+    const gpa = testing.allocator;
+    const source =
+        \\local function f() return 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 end
+        \\return f()
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    const fc = vm.final_cut orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 10), fc.result_count);
+    try testing.expectEqual(@as(u32, @intCast(vm.stack_top)), fc.stack_top);
+    // B-6: the dynamic span end is covered by the (possibly raised) stack_top.
+    try testing.expect(@as(usize, fc.result_base) + fc.result_count <= vm.stack_top);
+
+    const snap = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(snap);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const file = try schema.SnapshotFile.decode(arena.allocator(), snap);
+    const kf = file.keyframe;
+    try testing.expectEqual(@as(usize, vm.stack_top), kf.stack.len);
+    var k: u32 = 0;
+    while (k < fc.result_count) : (k += 1) {
+        const sv = kf.stack[fc.result_base + k];
+        try testing.expect(sv.body == .ConstInt);
+        try testing.expectEqual(@as(i64, k + 1), sv.body.ConstInt.v);
+    }
+    for (kf.stack, 0..) |sv, idx| {
+        if (idx >= fc.result_base and idx < fc.result_base + fc.result_count) continue;
+        try testing.expectEqual(@as(u8, 0), sv.tag); // nil outside the span
+    }
+}
+
+test "doc 21 §T-A.5: a depth-0 callValue invalidates the final cut (B-1 shape)" {
+    const gpa = testing.allocator;
+    const source =
+        \\function g() return 7 end
+        \\return 1
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expect(vm.final_cut != null);
+
+    // Host reentry at depth 0: the cut must not survive into a capture that
+    // would describe the callee's (re-used) stack as the old result span.
+    const gfn = vm.globals.get(try vm.heap.internValue("g"));
+    var out: [1]Value = undefined;
+    _ = try vm.callValue(gfn, &.{}, &out);
+    try testing.expectEqual(@as(i64, 7), out[0].asInt());
+    try testing.expect(vm.final_cut == null);
+    // Capture still succeeds — it just masks nothing (fail-safe path).
+    const snap = try encodeSnapshot(gpa, &vm);
+    gpa.free(snap);
+}
+
+test "doc 21 §T-A.6: pcall/xpcall unwind then finish — the cut reflects the finish" {
+    const gpa = testing.allocator;
+    const source =
+        \\local ok, err = pcall(function() error("boom") end)
+        \\local ok2 = xpcall(function() error("bam") end, function(e) return e end)
+        \\return ok, ok2
+    ;
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+
+    const fc = vm.final_cut orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 2), fc.result_count);
+    try testing.expectEqual(@as(u32, @intCast(vm.stack_top)), fc.stack_top);
+    const snap = try encodeSnapshot(gpa, &vm);
+    gpa.free(snap);
+}

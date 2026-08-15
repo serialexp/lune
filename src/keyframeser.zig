@@ -77,7 +77,15 @@ pub const schema = @import("gen/trace_schema.zig");
 /// via `next_obj_id`; trip = `LoadedChunkRecompileAllocated`, corrupt snapshot).
 /// Pre-v8 snapshots could legitimately omit a dropped loaded chunk's constants —
 /// accepting one would fork the allocation timeline, hence the bump.
-pub const snapshot_format_version: u32 = 8;
+///
+/// v9 (doc 21, the H-5(i) fix): final-state captures canonicalize every stack
+/// slot outside the top-level result span (`Vm.final_cut`) to nil, in BOTH the
+/// `.snapshot` root walk and the verbatim stack serialization — dead slots no
+/// longer leak tier-dependent garbage (tier-0's last-iteration temps vs the
+/// native exit flush's frozen pre-burst values) into the bytes or the reachable
+/// set. No structural schema change; the bump exists because two encoders must
+/// never emit different bytes for one logical state under one version number.
+pub const snapshot_format_version: u32 = 9;
 
 /// Map a live `Value` to its wire form. A `heap_ref` becomes a `HeapRef` holding
 /// the referenced object's stable id — **never** a pointer. Scalars carry inline.
@@ -281,9 +289,30 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     //    can be produced.
     try vm.heap.deflateAllGrids();
 
+    // 0b. Doc 21 Phase A capture policy, computed ONCE and passed to both
+    //     consumers (root walk + stack serialization) — neither re-derives VM
+    //     state. At a VALIDATED final state (depth 0, a published `final_cut`
+    //     whose `stack_top` still matches, in-bounds span, no open upvalues)
+    //     the only live stack content is the top-level result span; every
+    //     other slot is semantic garbage whose bytes are tier-dependent (the
+    //     H-5(i) divergence: tier-0's last-iteration temps vs the native exit
+    //     flush's frozen pre-burst values). Any validation miss → null → mask
+    //     nothing (fail-safe: exactly the pre-doc-21 capture).
+    const mask: ?interp.ResultSpan = blk: {
+        if (vm.depth != 0) break :blk null;
+        const fc = vm.final_cut orelse break :blk null;
+        if (fc.stack_top != vm.stack_top) break :blk null;
+        if (@as(usize, fc.result_base) + fc.result_count > vm.stack_top) break :blk null;
+        // All upvalues are closed before every pop, so this is empty at any
+        // genuine final state — treat a violation as invalid metadata (mask
+        // nothing) rather than risk serializing an open cell's slot as nil.
+        if (vm.open_upvalues.items.len != 0) break :blk null;
+        break :blk .{ .base = fc.result_base, .len = fc.result_count };
+    };
+
     // 1. Enumerate the reachable heap graph from the VM roots.
     var walk = Walk{ .a = a };
-    vm.forEachRootHeader(.snapshot, &walk, Walk.push);
+    vm.forEachRootHeader(.snapshot, mask, &walk, Walk.push);
     var i: usize = 0;
     while (i < walk.order.items.len) : (i += 1) walk.enumerateChildren(walk.order.items[i]);
     if (walk.err) |e| return e;
@@ -295,7 +324,12 @@ pub fn encodeSnapshot(gpa: std.mem.Allocator, vm: *Vm) ![]u8 {
     // 3. Capture the roots verbatim (the live register window, active frames, and
     //    open upvalues — empty at final-state capture; load-bearing in F2b).
     const stack = try a.alloc(schema.SnapValue, vm.stack_top);
-    for (stack, 0..) |*sv, idx| sv.* = toSchemaValue(vm.regGet(idx));
+    for (stack, 0..) |*sv, idx| {
+        // Doc 21: outside the validated final-state result span, serialize
+        // canonical nil — the slot is dead and its bytes are tier noise.
+        const live = if (mask) |m| (idx >= m.base and idx < @as(usize, m.base) + m.len) else true;
+        sv.* = toSchemaValue(if (live) vm.regGet(idx) else Value.nil());
+    }
 
     // Capture each frame's resumable cursor (pc/base/return-wiring), not just the
     // closure id — this is what makes a mid-execution snapshot re-executable (F2c).

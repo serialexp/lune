@@ -334,6 +334,15 @@ pub const builtin_global_names = blk: {
 /// `regs[reg .. reg + count]` of that frame's window (i.e. `stack[base + reg]`).
 const FrameResult = struct { reg: u16, count: u16 };
 
+/// Doc 21 Phase A: the top-level result span published at a genuine finish.
+/// `stack_top` is the (possibly B-6-raised) value the description is valid
+/// for — capture rejects the cut if the live `stack_top` no longer matches.
+pub const FinalCut = struct { result_base: u32, result_count: u32, stack_top: u32 };
+
+/// Doc 21 Phase A: the capture-policy mask handed to the `.snapshot` root
+/// walk — only stack slots inside `[base, base+len)` seed the walk.
+pub const ResultSpan = struct { base: u32, len: u32 };
+
 /// An open upvalue: a cell still pointing at the live stack slot `index`. Tracked
 /// so that two closures capturing the same variable share one cell, and so the
 /// cell can be *closed* (detached) when its slot is about to be freed. Public so
@@ -605,6 +614,18 @@ pub const Vm = struct {
     /// Mid-execution suspend trigger, or null (never suspend — the normal path).
     /// Armed by a test / future debugger to capture a resumable keyframe.
     suspend_ctl: ?SuspendCtl = null,
+    /// Doc 21 Phase A (the H-5(i) fix): absolute description of the only live
+    /// stack content after a genuine top-level finish — the returned result
+    /// span. Published by public `exec` alone (the single top-level authority;
+    /// a reentrant depth-0 `callValue` boundary pop must never stamp it),
+    /// VALIDATED — not trusted — by snapshot capture (`depth == 0`, matching
+    /// `stack_top`, in-bounds span), and invalidated by anything that reuses
+    /// the stack (`pushFrameVararg`, `beginTopLevelEpoch`, `callValue` entry,
+    /// the `protectedCall` manual unwind). Capture canonicalizes every final
+    /// stack slot OUTSIDE the span to nil in the `.snapshot` walk + stack
+    /// serialization, making the final snapshot a pure function of the
+    /// program's logical result regardless of which tier produced the state.
+    final_cut: ?FinalCut = null,
     /// Effect-log mode (F2d): `off` (default — natives run normally, nothing
     /// logged), `record` (run effects + append each result to `effect_log`), or
     /// `replay` (do NOT call effects — feed back the logged result in call order).
@@ -1113,6 +1134,7 @@ pub const Vm = struct {
     /// `clearRetainingCapacity()` goes here too, after this same guard.
     fn beginTopLevelEpoch(self: *Vm) Error!void {
         if (self.depth != 0) return error.DirtyTopLevelEntry;
+        self.final_cut = null; // doc 21: the previous run's cut is stale now
         self.trace.disarmAllLinks();
         // Retire the whole trace cache at the epoch boundary (doc 17 H-2 part 3): a
         // trace's proto-literal string konsts must not root interned strings across a
@@ -1456,6 +1478,8 @@ pub const Vm = struct {
     /// callees; everyone else uses the zero defaults via `pushFrame`).
     pub fn pushFrameVararg(self: *Vm, closure: *const Closure, base: usize, ret_dest: u16, ret_count: u16, varargs_base: usize, varargs_count: usize) Error!void {
         if (self.depth >= max_call_depth) return Error.StackOverflow;
+        self.final_cut = null; // doc 21: any frame push reuses the stack
+
         const nreg = closure.proto.num_registers;
         if (base + nreg > self.regCapacity()) return Error.StackOverflow;
         const call_seq = self.next_call_seq;
@@ -1520,6 +1544,7 @@ pub const Vm = struct {
         if (!callee.isHeap()) return Error.TypeError;
         std.debug.assert(!self.reg_top_pending);
         std.debug.assert(self.suspend_ctl == null);
+        self.final_cut = null; // doc 21: host reentry reuses the stack
         if (self.native_reentry_depth >= max_native_reentry) return Error.StackOverflow;
         self.native_reentry_depth += 1;
         defer self.native_reentry_depth -= 1;
@@ -1667,7 +1692,7 @@ pub const Vm = struct {
         self.heap.beginCollect() catch return;
         // The root set is defined once in `forEachRootHeader`; marking is just
         // "call `markHeader` on each root".
-        self.forEachRootHeader(.gc, &self.heap, gc.Heap.markHeader);
+        self.forEachRootHeader(.gc, null, &self.heap, gc.Heap.markHeader);
         self.heap.traceAll();
         self.heap.sweep();
     }
@@ -1716,13 +1741,22 @@ pub const Vm = struct {
     pub fn forEachRootHeader(
         self: *Vm,
         comptime kind: RootKind,
+        snapshot_mask: ?ResultSpan,
         ctx: anytype,
         comptime cb: fn (@TypeOf(ctx), *object.GcHeader) void,
     ) void {
+        // Doc 21 Phase A: at a validated final-state capture the `.snapshot`
+        // walk seeds ONLY from the top-level result span — a heap object whose
+        // only reference is a dead slot is semantic garbage, and excluding it
+        // makes the reachable SET (not just the stack bytes) a pure function
+        // of the program's logical state. The `.gc` walk never masks: the
+        // collector's view of liveness is not the snapshot's business.
+        if (kind == .gc) std.debug.assert(snapshot_mask == null);
         cb(ctx, &self.globals.header);
         {
-            var i: usize = 0;
-            while (i < self.stack_top) : (i += 1) {
+            var i: usize = if (snapshot_mask) |m| m.base else 0;
+            const hi: usize = if (snapshot_mask) |m| @as(usize, m.base) + m.len else self.stack_top;
+            while (i < hi) : (i += 1) {
                 const v = self.regGet(i);
                 if (v.isHeap()) cb(ctx, v.asHeap());
             }
@@ -1794,7 +1828,38 @@ pub const Vm = struct {
     /// mid-`.full` — re-enters under the other mode at the parked cursor; it never
     /// reaches a caller. Both modes share one opcode body, so they cannot diverge.
     pub fn exec(self: *Vm) Error!ExecOutcome {
-        return self.execWith(1);
+        // Doc 21 Phase A: public `exec` is the SINGLE publication authority for
+        // `final_cut` — `run`/`start` route through here, while a reentrant
+        // depth-0 `callValue` uses private `execWith` and therefore never
+        // stamps (codex doc-21 B-1: the stop-depth pop alone cannot tell the
+        // two apart). The root window base is 0 by construction for every
+        // sanctioned entry (`run`/`start` push at 0; restore enforces
+        // `frames[0].base == 0` via FrameWindowMismatch) — cache-and-validate
+        // it here rather than trusting it, and never read the popped frame's
+        // stale storage afterwards.
+        const root_base_ok = self.depth >= 1 and self.frames[0].base == 0;
+        const outcome = try self.execWith(1);
+        if (outcome == .finished and self.depth == 0 and root_base_ok) {
+            const fr = outcome.finished;
+            // Codex doc-21 B-6: an `all_results` return resolves its count from
+            // the dynamic `reg_top`, so the span can extend past the static
+            // root window that `stack_top` covers after the pop — and capture
+            // serializes only `stack[0..stack_top]`, which would silently drop
+            // the surplus results. Raise `stack_top` over the span BEFORE
+            // publishing so every returned value is rooted and capturable;
+            // an out-of-capacity span publishes nothing (fail-safe: capture
+            // then masks nothing, exactly today's behaviour).
+            const result_end = @as(usize, fr.reg) + fr.count;
+            if (result_end <= self.regCapacity()) {
+                if (result_end > self.stack_top) self.stack_top = result_end;
+                self.final_cut = .{
+                    .result_base = fr.reg,
+                    .result_count = fr.count,
+                    .stack_top = @intCast(self.stack_top),
+                };
+            }
+        }
+        return outcome;
     }
 
     /// `exec`, bounded by a stop depth. The dispatch loop returns `.finished` the

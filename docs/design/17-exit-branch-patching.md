@@ -7475,6 +7475,17 @@ When native-F2c mid-execution cuts land, the fix must either flush the omitted t
 cut-eligible native exit, exclude those physical slots from the snapshot, or forbid a cut immediately
 after a native exit — decided in that pass, not here.
 
+> **RESOLVED (2026-08-15, doc 21).** The predicted failure materialized exactly as described — the
+> doc-18 §R3 test's *final*-snapshot comparison diverged in dead stack slots only (bisected to the
+> test's own introducing commit `7f803a8`; decoded diff: 232/232 heap objects + `next_obj_id`
+> identical, dead slots 9–14 differ). Fixed by the second listed option, generalized: capture-time
+> canonicalization. `docs/design/21-canonical-snapshot-liveness.md` (codex-approved) lands
+> `Vm.final_cut` — the runtime top-level result span published by public `exec` at a genuine
+> finish — and final-state captures nil every slot outside it in BOTH the `.snapshot` root walk and
+> the stack serialization (keyframe v9). The snapshot becomes a pure function of the logical result,
+> robust against ANY current or future dead-store pruning; the JIT/recorder are untouched. §R3 is
+> green with the full JIT enabled.
+
 **Net:** neither H-5 item is independently closeable. **H-5(ii) folds into H-2** (do not re-derive it);
 **H-5(i) folds into F-5** and makes the native-F2c test *mandatory before* native mid-execution cuts,
 because it will fail on the omitted numeric-`for` temporaries unless they are reconciled. No Antigravity

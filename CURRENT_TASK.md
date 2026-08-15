@@ -1,5 +1,39 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-15 (LATEST-68) — **Doc 21 Phase A LANDED: H-5(i) fixed, §R3 green with the full JIT, matrix 918/918.**
+
+- Bart chose option (b) (canonicalize dead slots at capture). Design doc 21
+  (`docs/design/21-canonical-snapshot-liveness.md`) went through 3 codex
+  gpt-5.6-sol rounds (REVISE B-1..B-6 + M-1..M-4 → APPROVE). Key restructure
+  from review: the final-state mask derives from the **runtime result span**
+  (`Vm.final_cut`, published by public `exec` alone on a finish netting depth
+  0), NOT a compiler statement-frontier — stronger (robust to any future
+  dead-store pruning, handles `all_results`) and immune to the depth-0
+  `callValue` aliasing (B-1) and stamp-collision (B-2) holes. B-6 bonus fix:
+  a top-level `return f()` with more results than the root's static window
+  used to silently DROP the surplus from capture (`stack_top` never covered
+  them); publication now raises `stack_top` over the dynamic span first.
+- Implementation: `final_cut` validated-not-trusted at capture (depth 0 +
+  `stack_top` match + in-bounds + no open upvalues; any miss → mask nothing);
+  invalidated at `pushFrameVararg` / `beginTopLevelEpoch` / `callValue` entry
+  / all three `protectedCall` unwinds; one capture policy applied to BOTH the
+  `.snapshot` root walk (`forEachRootHeader` gained a `snapshot_mask` param;
+  `.gc` walk untouched, asserts null) and the stack serialization (dead slots
+  → canonical nil, dead-slot-only garbage excluded from the reachable set).
+  Keyframe v8 → v9 (encoding-identity contract; doc 04 updated). JIT/recorder
+  untouched — `locals_watermark` pruning stays.
+- Gates: **918/918** both flavors (the §R3 test passes UNMODIFIED with
+  tracing+opt+native — first time ever, incl. at its introducing commit
+  `7f803a8`) + hashgate + new §T-A.2–.6 pins in
+  `keyframeser_resume_test.zig` (cross-tier byte-identity on the minimized
+  g-loop, span preservation + garbage exclusion, B-6 all_results surplus,
+  depth-0 callValue invalidation, pcall/xpcall).
+- Doc 17's H-5(i) grounding closed with a RESOLVED pointer to doc 21.
+- **Owed**: quiet-machine perf sanity (the one hot-path delta is a single
+  null-store per frame push in `pushFrameVararg`) — machine was at load ~23
+  (parallel builds) at landing time. Doc 21 Phase B (mid-flight frontier
+  masking) deliberately deferred — no pin needs it.
+
 ## Status 2026-08-15 (LATEST-67) — **Test-suite extraction: the four biggest files split into thematic `*_test.zig` siblings. No production logic changed.**
 
 Pure file-organisation work at Bart's request, orthogonal to the doc-17/20 arc.

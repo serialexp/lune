@@ -1,6 +1,6 @@
 # lune — Snapshot & Replay Schema
 
-Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; keyframe now **v8** (v5 = H-2 `next_obj_id`; v7 = doc 18 slot-0 array part; v8 = doc 19 loaded-chunk constants in the `.snapshot` walk + zero-allocation recompile check); guard-snapshots outstanding
+Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; keyframe now **v9** (v5 = H-2 `next_obj_id`; v7 = doc 18 slot-0 array part; v8 = doc 19 loaded-chunk constants in the `.snapshot` walk + zero-allocation recompile check; v9 = doc 21 canonical final-state capture — dead slots outside the top-level result span nil'd in walk + stack); guard-snapshots outstanding
 Owner: Bart
 Last updated: 2026-08-14
 
@@ -152,6 +152,17 @@ schema follows; this is that schema's home.
       allocation timeline, hence the version bump. This is the snapshot half of
       lifting the H-2 dynamic-proto tracing gate: loaded code now traces like
       static code.
+      **v9 (doc 21):** final-state captures canonicalize every stack slot
+      outside the top-level result span (`Vm.final_cut`, published by public
+      `exec` at a genuine finish, validated at capture) to nil — in BOTH the
+      `.snapshot` root walk and the verbatim stack serialization. Dead slots
+      no longer leak tier-dependent garbage into the bytes or the reachable
+      set (the doc-17 H-5(i) divergence: tier-0's last-iteration temps vs the
+      native exit flush's frozen pre-burst values), so a final snapshot is a
+      pure function of the program's logical result across all tiers. No
+      structural schema change; the bump exists because two encoders must
+      never emit different bytes for one logical state under one version
+      number. The `.gc` walk is untouched.
       F2b proved the inverse property only for a **final-state** snapshot (empty
       stack/frames); the mid-execution case is F2c, below.
 

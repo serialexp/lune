@@ -101,6 +101,7 @@ fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, hand
                 vm.dropRegionActivationsFromDepth(entry_depth);
                 vm.depth = entry_depth;
                 vm.stack_top = entry_top;
+                vm.final_cut = null; // doc 21: manual unwind reuses the stack
                 if (out.len > 1) out[1] = try vm.heap.internValue("error in error handling");
                 return @min(out.len, @as(usize, 2));
             };
@@ -110,6 +111,7 @@ fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, hand
             vm.dropRegionActivationsFromDepth(entry_depth);
             vm.depth = entry_depth;
             vm.stack_top = entry_top;
+            vm.final_cut = null; // doc 21: manual unwind reuses the stack
             return @min(out.len, 1 + hn);
         }
         // `pcall` (no handler): nothing observes the live stack, so unwind now and
@@ -120,6 +122,7 @@ fn protectedCall(vm: *Vm, f: Value, call_args: []const Value, out: []Value, hand
         vm.dropRegionActivationsFromDepth(entry_depth);
         vm.depth = entry_depth;
         vm.stack_top = entry_top;
+        vm.final_cut = null; // doc 21: manual unwind reuses the stack
         if (out.len > 1) out[1] = errval;
         return @min(out.len, @as(usize, 2));
     };
