@@ -21,18 +21,27 @@ def main(argv):
     if len(argv) < 2:
         print(__doc__)
         return 2
+    lines = None
+
+    # `--members` also matches decls indented one level, i.e. methods and
+    # constants of a struct. Zig has no function-local `fn`, but it does have
+    # function-local `const`, so an indented `const` match must be eyeballed
+    # before applying — the dry run prints every one.
+    indent = r'(?:    )?' if '--members' in argv else ''
+    argv = [a for a in argv if a != '--members']
     path, names = argv[0], argv[1:]
     lines = open(path, encoding='utf8').read().split('\n')
 
     hits, missing, already = {}, [], []
     for name in names:
-        pat = re.compile(r'^(pub )?((?:inline )?(?:const|var|fn) ' + re.escape(name) + r'\b)')
+        pat = re.compile(r'^(' + indent + r')(pub )?((?:inline )?(?:const|var|fn) '
+                         + re.escape(name) + r'\b)')
         found = [i for i, L in enumerate(lines) if pat.match(L)]
         if not found:
             missing.append(name)
             continue
         i = found[0]
-        if lines[i].startswith('pub '):
+        if lines[i].lstrip().startswith('pub '):
             already.append(name)
             continue
         hits[name] = i
@@ -40,7 +49,8 @@ def main(argv):
     for name in sorted(hits):
         i = hits[name]
         print(f'  L{i+1:<6} {lines[i][:78]}')
-        print(f'       -> pub {lines[i][:74]}')
+        ws = re.match(r'\s*', lines[i]).group(0)
+        print(f'       -> {ws}pub {lines[i][len(ws):][:70]}')
     if already:
         print(f'  already pub (no-op): {", ".join(already)}')
     if missing:
@@ -50,7 +60,8 @@ def main(argv):
         print(f'\n({len(hits)} changes — dry run, pass --apply to write)')
         return 0
     for i in hits.values():
-        lines[i] = 'pub ' + lines[i]
+        ws = re.match(r'\s*', lines[i]).group(0)
+        lines[i] = ws + 'pub ' + lines[i][len(ws):]
     open(path, 'w', encoding='utf8').write('\n'.join(lines))
     print(f'\napplied {len(hits)} changes to {path}')
     return 0
