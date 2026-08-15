@@ -16,9 +16,17 @@ as they land; move bullets to Done once everything inside them is checked.
 - [x] **Phase A — final-state canonicalization (fixes §R3)** (2026-08-15).
       `Vm.final_cut` published by public `exec` alone on a `.finished` netting
       depth 0 (root base 0 cached-and-validated; B-6 dynamic-span raise of
-      `stack_top` before publication); invalidated at `pushFrameVararg`,
-      `beginTopLevelEpoch`, `callValue` entry, and all three `protectedCall`
-      unwind sites; validated — never trusted — by `encodeSnapshot`
+      `stack_top` before publication); invalidated at the COLD boundaries
+      only — `beginTopLevelEpoch`, `callValue` entry, and all three
+      `protectedCall` unwind sites. `pushFrameVararg` instead ASSERTS the cut
+      is already null: every execution path reaching a push starts at one of
+      those cold boundaries (an exec-resume implies a suspended VM that never
+      finished, so no cut exists), and the originally-landed per-push store
+      measured a reproducible **13–17% tier-0 regression** on call-heavy rows
+      (scimark-lu 748→880 ms, fft 685→775; interleaved quiet-machine A/B,
+      3 rounds) — removing it restored parity exactly, and the debug assert
+      keeps the invariant loud across the whole test matrix; validated —
+      never trusted — by `encodeSnapshot`
       (depth 0, matching `stack_top`, in-bounds span, no open upvalues; any
       miss masks nothing), which computes ONE `CapturePolicy` and applies it
       to BOTH the `.snapshot` root walk (`forEachRootHeader` gained the

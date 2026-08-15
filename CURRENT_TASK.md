@@ -29,10 +29,18 @@
   g-loop, span preservation + garbage exclusion, B-6 all_results surplus,
   depth-0 callValue invalidation, pcall/xpcall).
 - Doc 17's H-5(i) grounding closed with a RESOLVED pointer to doc 21.
-- **Owed**: quiet-machine perf sanity (the one hot-path delta is a single
-  null-store per frame push in `pushFrameVararg`) — machine was at load ~23
-  (parallel builds) at landing time. Doc 21 Phase B (mid-flight frontier
-  masking) deliberately deferred — no pin needs it.
+- **Perf sanity DONE — and it caught a real one.** The quiet-machine
+  interleaved A/B (3 rounds, load <2.5) showed the per-push
+  `final_cut = null` store in `pushFrameVararg` costing a reproducible
+  **13–17% tier-0** on call-heavy rows (scimark-lu 748→880 ms, scimark-fft
+  685→775) and ~+3% jit. Follow-up commit replaces it with a debug assert —
+  sound because every execution path reaching a push starts at a cold
+  boundary that already nulled the cut (`beginTopLevelEpoch` / `callValue`
+  entry; an exec-resume implies a suspended VM that never finished). A/B
+  re-run: parity restored exactly (lu 745/164 vs pre 748/164, fft 685/294 vs
+  690/293); full matrix (asserts active) + jit-debug + hashgate green — the
+  assert never fires. Doc 21 Phase B (mid-flight frontier masking)
+  deliberately deferred — no pin needs it.
 
 ## Status 2026-08-15 (LATEST-67) — **Test-suite extraction: the four biggest files split into thematic `*_test.zig` siblings. No production logic changed.**
 

@@ -1478,7 +1478,13 @@ pub const Vm = struct {
     /// callees; everyone else uses the zero defaults via `pushFrame`).
     pub fn pushFrameVararg(self: *Vm, closure: *const Closure, base: usize, ret_dest: u16, ret_count: u16, varargs_base: usize, varargs_count: usize) Error!void {
         if (self.depth >= max_call_depth) return Error.StackOverflow;
-        self.final_cut = null; // doc 21: any frame push reuses the stack
+        // Doc 21: a frame push implies the cut is already invalid — every
+        // execution path reaching here started at a cold boundary that nulled
+        // it (`beginTopLevelEpoch` for run/start, `callValue` entry for host
+        // reentry, and an exec-resume implies a suspended VM that never
+        // finished, so no cut was ever published). Assert the invariant
+        // instead of paying a per-call store in the dispatch hot path.
+        std.debug.assert(self.final_cut == null);
 
         const nreg = closure.proto.num_registers;
         if (base + nreg > self.regCapacity()) return Error.StackOverflow;
