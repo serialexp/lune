@@ -2,6 +2,46 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## DEFERRED (Aug 2026): further decomposition of trace.zig / interp.zig
+
+The test-suite extraction (LATEST-67) took the four biggest files down a lot,
+but stopped at moving tests. Bart explicitly chose to stop there; recording the
+mapping so it does not have to be re-derived.
+
+**trace.zig, still 13,542 lines.** `TraceState` alone is ~10,632 of them
+(~220 methods, 109 fields) — it *is* the file. Zig 0.17 removed
+`usingnamespace`, so nothing moves out without converting methods to free
+functions taking `*TraceState`. Known seams, in ascending difficulty:
+
+- *Pure value types + free functions, no `TraceState` dependency* — the IR
+  section (~444 lines), guard/exit provenance types + ordering/hashing (~289),
+  and the disassembler/stats printer (~330). Movable as-is, but `IrOp`/`IrInstr`
+  are referenced from 11 other files, so it needs re-export shims in trace.zig.
+  Total win only ~1,060 lines, which is why it was skipped.
+- *The recorder* (per-instruction recording, ~1,500 lines) touches only
+  `self.rec`, `self.gpa`, `self.config` and its own helpers — **zero** references
+  to region, link, promotion or gate state. `commit()` is the single bridge.
+  Strongest structural seam in the file.
+- *Region discovery + region profit* share `region_defs_gen` as an invalidation
+  clock; they move together or not at all.
+- *Dispatch/replay* (`driveChain`, `driveSilentBurst`, `replayLedgerFrom` — that
+  last one is 770 lines on its own) has the highest fan-in in the file. Least
+  separable; leave alone.
+
+**interp.zig, still 4,839 lines.** `Vm` is ~3,684 of them, and half of that is
+the exec dispatch loop. The free-function-taking-`*Vm` pattern is **already
+established** in this file (the effect/host-seam helpers use it), so extending it
+is not a new pattern. Candidates: error/fault reporting (~285 lines), stdlib
+install (~114 + the natives), metamethod dispatch (~218), table/grid indexing
+(~219), closures/upvalues (~71), GC rooting (~110), and `enterSelectedTrace`
+(~537, the biggest single move, but its `EntryDirective` contract with `execImpl`
+is currently implicit and would have to be made explicit).
+
+**Do NOT split** `execImpl` + `nextOp` + `runFastPath`. Cross-module `inline fn`
+plus the comptime `mode: ExecMode` specialisation make the dispatch loop's
+codegen fragile, and that is the hot tier-0 path — any change there needs a
+benchmark, not just a green test run.
+
 ## RESOLVED (2c-F, July 2026): fused native cycle re-entered COLD from a fresh top-level epoch
 
 Found while writing the 2c-F disarm integration test. Re-running a **completed

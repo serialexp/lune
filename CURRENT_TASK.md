@@ -1,5 +1,50 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-15 (LATEST-67) — **Test-suite extraction: the four biggest files split into thematic `*_test.zig` siblings. No production logic changed.**
+
+Pure file-organisation work at Bart's request, orthogonal to the doc-17/20 arc.
+A third of the tree (25,414 of 77,427 lines, 937 `test` blocks) was inline test
+code, clustered in trailing regions behind each file's own banner comments.
+
+| file | before | after |
+|---|---|---|
+| `interp.zig` | 13,464 | **4,839** |
+| `trace.zig` | 20,972 | **13,542** |
+| `nativegen.zig` | 8,332 | **5,338** |
+| `keyframeser.zig` | 3,348 | **839** |
+
+- **Test bodies are copied byte-for-byte**; each destination file gets a prelude
+  recreating the identifier namespace (the original import/alias block plus
+  `const X = <mod>.X;` bridges). The diff is a pure move.
+- **Discovery**: Zig only analyses a file reachable by import, so each source
+  keeps a `test { _ = @import("..._test.zig"); }` block. Without it the suite
+  silently stops running — that is the failure mode this work had to guard, and
+  the guard is a checked test count, not a green build.
+- **Counts, checked at every step**: 935 named tests across `src/` before and
+  after. `zig build test` 908 → 912, the +4 being exactly one anonymous
+  discovery block per split file.
+- **The §R3 red is untouched** — still failing deterministically at byte offset
+  5667, now reported from `keyframeser_resume_test.zig`. The H-5(i) decision
+  below is still open and was deliberately not touched.
+- **Visibility cost, and it is asymmetric**: `trace.zig` needed **53** widenings
+  to `pub` (47 of them `TraceState` members — `promoteSet`, `replayLedger`,
+  `openRegion`, `rebuildRegions`, `emit`, `refOf`, …), `interp.zig` needed
+  **6**. The difference is what the suites do: interp's tests are behavioural
+  (run Lua source, compare output); trace's white-box the recorder. Bart
+  reviewed this and chose to keep the wider surface rather than route it through
+  a `test_hooks` gateway. **Consequence to keep in mind: those 47 are now real
+  public API on the JIT's core type.**
+- **Gotcha worth remembering**: Zig does not care about declaration order inside
+  a container, so a test-region `const irinterp = @import(...)` was being used at
+  29 *production* sites in `nativegen.zig`. A test banner is not automatically a
+  dependency boundary. `tools/check-split.py` now catches this class up front.
+- Tooling: `tools/split-tests.py` (dry-run default, refuses to apply on a
+  test-count mismatch), `tools/check-split.py` (production leaks + cross-block
+  helpers), `tools/pubify.py` (reviewable visibility widenings).
+- **Rungs 2/3 deliberately NOT done** (Bart's call): extracting trace.zig's pure
+  value-type modules would move only ~1,060 lines, and the bulk — `TraceState`
+  at 10,632 lines — needs method→free-function conversion. See TODO.md.
+
 ## Status 2026-08-15 (LATEST-66) — **Doc 20 Phase 2 (§P measurement) COMPLETE. Outstanding: Phase 3 `.jloop`, Open Q2, and the H-5(i) keyframeser decision (Bart's call).**
 
 - **§P verdicts** (full detail in doc 20 "§P — Measured results"): P.1 PASS
