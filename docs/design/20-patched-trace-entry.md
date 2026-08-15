@@ -289,12 +289,18 @@ bypassed — reaches the **ordinary back-edge epilogue carrying the canonical
 §R2-5) and the recorder mirror behave identically to virgin code. There is
 no "jump straight to the body" shortcut and no rewind/refetch.
 
-1. **Defensive pre-step check (§R6-1).** With same-turn draining (§R5-1) and
-   strike exhaustion converted to a same-turn mark (step 6), a `.jfor_loop`
-   dispatch should never observe `!patch.live` — the drain restores the
-   opcode in the same turn the mark is made. If it happens anyway (debug
-   assert), the arm performs the **complete unpatch transaction
-   synchronously**: restore `orig`, tombstone, run the state transitions
+1. **Pre-step recovery (§R6-1).** *(Revised after the codex post-landing
+   review of Phase 1, 2026-08-15: originally framed as defensive-unreachable
+   with a debug assert. That premise was wrong — marks legitimately arise
+   outside any drained grammar: recorder aborts (`gateAnchor(rec.anchor)`)
+   fire mid-dispatch where a drain could install under a frame that cannot
+   re-resolve its image pointer, and the walk's post-epilogue
+   retire/miss/gate sites mark after their turn's drain (the latter now
+   drain again same-turn, but the recorder-abort ones cannot). So `!live`
+   dispatch is a defined deferred-unpatch state in ALL builds, not a bug
+   signal.)* On observing `!patch.live`, the arm performs the **complete
+   unpatch transaction synchronously**: restore `orig`, tombstone, run the
+   state transitions
    and `.suppressed_incumbent`/`.suppressed_capacity` wakes, push the
    free-list — safe here because the arm is outside any receipt grammar and
    is the only slot-pointer holder — then continues as the virgin
@@ -519,18 +525,23 @@ restore-and-tombstone happens at the caller-owned safe-point drain — the
 same drain that installs (§R2-4: triggers fire inside the receipt grammar or
 inside `enterSelectedTrace`, where mutating the image under a live arm or
 freeing the slot the arm holds a pointer to would be reentrant UAF). Timing
-is unambiguous (§R5-1, completed by §R6-1): **every mark drains same-turn.**
-Marks raised inside `enterSelectedTrace` — and the arm's own
-strike-exhaustion mark, made immediately after it returns — drain at the
-caller-owned epilogue before its directive is acted on, and the drain
-processes the **entire pending set**, not just the current anchor's slot
-(so a receipt that condemns a *different* anchor's patch also completes that
-unpatch this turn). No unpatch transaction ever waits for the patched
-instruction's next execution, which may never come (loop exit skips the
-back-edge block via `pc <= cur_pc`, interp.zig:2649; a gated cold anchor
-reaches only `afterBackEdge`). The arm's step-1 self-unpatch is a
-**defensive assert-and-recover path**, not a load-bearing mechanism
-(§R6-1).
+(§R5-1, revised by the codex Phase-1 post-landing review 2026-08-15):
+**marks raised inside a drained grammar drain same-turn; marks raised
+outside one are completed by the arm's §R6-1 recovery at the patched
+instruction's next dispatch.** Marks raised inside `enterSelectedTrace` —
+and the arm's own strike-exhaustion mark, made immediately after it
+returns — drain at the caller-owned epilogue before its directive is acted
+on; the walk's post-epilogue retire/miss/gate sites drain again before
+falling to tier-0; and the drain processes the **entire pending set**, not
+just the current anchor's slot (so a receipt that condemns a *different*
+anchor's patch also completes that unpatch this turn). The one class that
+CANNOT drain same-turn is recorder-abort gating (`gateAnchor(rec.anchor)`
+fires mid-dispatch, where an install could move `image_gen` under a frame
+with no epilogue to re-resolve it) — those marks clear `live` immediately
+(so no arm ever enters through the dying binding) and the arm's step-1
+self-unpatch completes the transaction at next dispatch. That recovery is
+therefore a **load-bearing deferred path in all builds** (§R6-1), no
+longer a defensive assert.
 
 | trigger | today's analogue | action |
 |---|---|---|

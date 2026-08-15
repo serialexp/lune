@@ -46,6 +46,15 @@
   upholds byte-identical); (b) mask dead slots at capture (needs liveness
   metadata, changes snapshot semantics); (c) relax the test to logical
   comparison. NOT decided unilaterally (Rule #17).
+- **Codex post-landing review of 7fa7e1a → REVISE, both findings fixed**:
+  (BLOCKER) the walk's post-epilogue retire/miss/gate sites marked bound
+  patches with no same-turn drain → added a second drain + image re-resolve
+  after them; AND the recorder-abort `gateAnchor(rec.anchor)` sites mark
+  mid-dispatch where draining is structurally impossible (no epilogue to
+  re-resolve the frame image) → the arm's `!live` §R6-1 recovery is now the
+  defined deferred-unpatch path in ALL builds (safety-panic removed; doc 20
+  §R6-1 + unpatch-trigger timing rewritten to match). (MINOR) slot-capacity
+  check off-by-one (`>=` → `>` maxInt(u16); index 65535 is valid).
 - **Next**: Phase 2 §P measurement (P.1 fft ≤360ms, P.2 board ≤3%); §P.0
   quiet-machine board still owed; Phase 3 `.jloop` + Open Q2 outstanding.
 

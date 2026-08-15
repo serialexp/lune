@@ -10329,7 +10329,10 @@ pub const TraceState = struct {
         const idx: u16 = if (self.entry_patch_free.pop()) |free_idx|
             free_idx
         else blk: {
-            if (self.entry_patches.items.len >= std.math.maxInt(u16)) return .capacity;
+            // Fail closed when the WOULD-BE index (current len) no longer
+            // fits `.b`'s u16 — index 65535 itself is valid (codex MINOR on
+            // 7fa7e1a: `>=` wasted the last representable slot).
+            if (self.entry_patches.items.len > std.math.maxInt(u16)) return .capacity;
             const p = self.gpa.create(EntryPatch) catch return .oom;
             self.entry_patches.append(self.gpa, p) catch {
                 self.gpa.destroy(p);

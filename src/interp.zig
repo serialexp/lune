@@ -2822,15 +2822,22 @@ pub const Vm = struct {
                     const patch = self.trace.entry_patches.items[slot];
                     const live = patch.live;
                     if (!live) {
-                        // §R6-1 defensive pre-step recovery. Same-turn
-                        // draining makes this unreachable (every mark drains
-                        // before its turn ends) — surface the bug in safe
-                        // builds; in ReleaseFast recover with the complete
-                        // synchronous unpatch transaction (safe here: outside
-                        // any receipt grammar, sole slot-pointer holder),
-                        // then continue as the virgin `.for_loop` arm below.
-                        if (std.debug.runtime_safety)
-                            @panic("jfor_loop dispatched on a dead slot (doc 20 §R6-1)");
+                        // §R6-1 pre-step recovery — a LEGITIMATE deferred-
+                        // unpatch state, not a defensive-unreachable one
+                        // (codex post-landing review of 7fa7e1a): marks can
+                        // originate outside any drained grammar — recorder
+                        // aborts (`gateAnchor(rec.anchor)`) fire mid-dispatch
+                        // where draining would install under a frame that
+                        // cannot re-resolve its image pointer, and the walk's
+                        // post-epilogue retire/miss/gate sites mark after
+                        // their turn's drain. This arm is the sole
+                        // slot-pointer holder and sits outside any receipt
+                        // grammar, so the complete synchronous unpatch
+                        // transaction is safe here; then continue as the
+                        // virgin `.for_loop` arm below (`break :sw` after the
+                        // step). `patch.orig` stays readable through the
+                        // tombstone: reuse only happens in a drain's install
+                        // pass, and none runs between here and the step.
                         self.trace.unpatchSlot(slot);
                     }
                     // §R2-5: everything downstream — the epilogue's
@@ -3568,6 +3575,21 @@ pub const Vm = struct {
                         // gate's backoff + `onSideExit` clear.
                         if (saw_native_unsupported) {
                             self.trace.gateNativeUnsupported(.{ .proto = proto, .pc = anchor_pc });
+                        }
+                        // Doc 20 §R5-1 (codex post-landing blocker on
+                        // 7fa7e1a): the three sites above — dead-trace
+                        // retirement, fingerprint-miss, native-unsupported
+                        // gating — all run AFTER this turn's epilogue drain
+                        // and can mark bound patches pending. Drain again so
+                        // the image and registry re-agree same-turn (the
+                        // `.jfor_loop` arm's §R6-1 recovery would self-heal a
+                        // missed one, but same-turn is the cheap, prompt
+                        // path), and re-resolve the fetch image if a drain
+                        // moved the generation.
+                        self.trace.drainEntryPatchWork();
+                        if (self.trace.image_gen != code_gen) {
+                            code = self.trace.codeFor(proto);
+                            code_gen = self.trace.image_gen;
                         }
                         // Coherent-state chaining (doc 16, Phase 2) diagnostic: tier-0
                         // is about to run this *traced* anchor's body because no trace
