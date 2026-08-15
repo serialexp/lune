@@ -2,7 +2,8 @@
 
 Status: design APPROVED (codex gpt-5.6-sol round 8, 2026-08-14 — §R8 MINOR
 §T10-wording fold applied); Phase 0a landed (`d4fd70f`), Phase 0b landed
-(`272f75b`), Phase 1 (THE flip) landed; Phase 2 (§P measurement) next
+(`272f75b`), Phase 1 (THE flip) landed, Phase 2 (§P measurement) complete;
+Phase 3 (`.jloop`) + Open Q2 outstanding
 Owner: Bart + agents
 Last updated: 2026-08-15
 
@@ -79,13 +80,24 @@ as they land; move bullets to Done once everything inside them is checked.
       final-iteration temps, native exit flush freezes pre-burst values).
       Not a doc-20 regression; tracked as its own follow-up.
 
+- [x] **Phase 2 — measurement per §P** (2026-08-15). All rows settled: P.1
+      fft 295.7 ms ≤ 360; P.2 no >3% regression (field_hash riser proven
+      board noise by quiet interleaved A/B); P.3 `fft_transform:131` 78.0%
+      of iterations traced (from 37.8%); P.4 sieve family unchanged; P.5
+      matrix + hashgate green throughout. Full verdicts + caveats in "§P —
+      Measured results" below. Key correction: the pre-flip fft baseline
+      reads 301.2 ms quiet — LATEST-62's 535 was load-inflated, so the
+      flip's wall-clock effect on fft is ≈ −2% with the +40 pp coverage
+      win; the remaining fft lever is Phase 3 `.jloop` (bitreverse `while`
+      loops, 30.4% of run).
+
+- [x] **§P.0 board confirmation** — superseded: the Phase-0a-only board
+      can no longer be isolated post-flip; the pre/post-flip A/B carries
+      0a+0b on both sides, so a 0a regression would have surfaced there
+      (see "§P — Measured results", P.0 entry).
+
 ### Outstanding
 
-- [ ] **§P.0 board confirmation** — the full-board neutrality run for Phase
-      0a still owed: the first attempt was invalidated by load-70 parallel
-      rust builds; re-run `just bench` on a quiet machine and compare vs
-      `20260814-210757-99204e8.tsv`.
-- [ ] **Phase 2 — measurement per §P.**
 - [ ] **Phase 3 — `.jloop` analogue for while/repeat back-edges.** Same
       machinery on the backward `jmp`/`jmp_if_*`; separately measured (fft
       does not need it; bitreverse's `while` and the string loops might).
@@ -625,11 +637,14 @@ so per-row P.2 deltas are read against the lj-column stability of each row.
   wall-clock delta was load inflation; the flip's own quiet-machine effect
   on fft is ≈ −2%, confirmed by a load-49 interleaved A/B where post ≤ pre
   in 6/7 pairs).
-- **P.2 PASS with caveats** — no credible >3% regression: rows with a stable
-  lj column are flat-to-better (fft −1.8%, grid_matmul −8.3%, nsieve-bit
-  −7.1%, str_* all improved); the one >3% jit-column riser, field_hash
-  13.5→15.6, sits next to a +3.7% lj drift and awaits the quiet interleaved
-  re-check recorded below.
+- **P.2 PASS** — no credible >3% regression: rows with a stable lj column
+  are flat-to-better (fft −1.8%, grid_matmul −8.3%, nsieve-bit −7.1%,
+  str_* all improved). The one >3% jit-column riser on the board,
+  field_hash 13.5→15.6, was settled by a quiet-machine (load < 2)
+  interleaved A/B (three alternating rounds, best-of-5 each): post-flip
+  13.4/13.0/13.0 ms vs pre-flip 13.1/13.1/15.5 ms — post ≈ pre, and the
+  15.x-class blip reproduced on the **pre-flip** binary, confirming the
+  board's 15.6 was transient scheduling noise, not a flip effect.
 - **P.3 PASS** — `--jit-stats` fft: `fft_transform:131` **78.0% of
   iterations traced** (the experiment's exact target, up from 37.8%
   gate-on), 61.6% of its time traced. Remaining fft tier-0 is
@@ -646,8 +661,9 @@ so per-row P.2 deltas are read against the lj-column stability of each row.
   measure it, but both sides already carried 0a at the P.2 comparison and
   0a/0b landed with interleaved-A/B neutrality gates); the pre/post-flip
   A/B above contains 0a+0b on both sides, so a 0a regression would surface
-  there. Owed follow-up: a quiet interleaved field_hash (and grid_matmul)
-  A/B to settle the last P.2 row.
+  there. (The formerly-owed quiet interleaved field_hash A/B is settled
+  under P.2 above; grid_matmul needed no re-check — its board delta was
+  −8.3% against a stable lj column.)
 
 ## §T — test matrix
 

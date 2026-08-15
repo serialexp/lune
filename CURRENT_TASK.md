@@ -1,5 +1,29 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-15 (LATEST-66) — **Doc 20 Phase 2 (§P measurement) COMPLETE. Outstanding: Phase 3 `.jloop`, Open Q2, and the H-5(i) keyframeser decision (Bart's call).**
+
+- **§P verdicts** (full detail in doc 20 "§P — Measured results"): P.1 PASS
+  (fft jit 295.7 ms ≤ 360, quiet board `20260815-131357-627f7f2.tsv`); P.2
+  PASS (no >3% regression; the board's field_hash 13.5→15.6 riser settled by
+  a quiet load<2 interleaved A/B — post 13.4/13.0/13.0 vs pre 13.1/13.1/15.5
+  ms, the 15.x blip reproduced on the PRE-flip binary, so it was scheduling
+  noise); P.3 PASS (`fft_transform:131` 78.0% of iterations traced, from
+  37.8%); P.4 PASS (sieve family unchanged); P.5 PASS (matrix both flavors
+  906/907 + hashgate at every phase commit; the 1 red is the pre-existing
+  H-5(i) §R3 keyframeser test, see LATEST-65); P.0 superseded (pre/post A/B
+  carries 0a+0b on both sides).
+- **Key measurement correction**: pre-flip fft reads **301.2 ms quiet** —
+  LATEST-62's 535 ms was load-inflated (load-70 era). The flip's own fft
+  wall-clock effect is ≈ −2% with the +40 pp trace-coverage win. The big
+  remaining fft lever is **Phase 3 `.jloop`**: `fft_bitreverse:9`/`:55`
+  `while` loops are 30.4% of the run and never tier up.
+- **Decision waiting on Bart** (Rule #17, options in LATEST-65): the H-5(i)
+  dead-slot exit-snapshot fix — (a) stop liveness-pruning written slots from
+  exit snapshots, (b) mask dead slots at capture, (c) relax §R3 to logical
+  comparison.
+- Shadow tree `/tmp/lune-preflip` removed after the A/B. Bench TSVs remain
+  untracked per standing rule.
+
 ## Status 2026-08-15 (LATEST-65) — **Doc 20 Phase 1 (THE flip) LANDED; Phase 2 (§P measurement) next. Pre-existing §R3 keyframeser red diagnosed (H-5(i)), NOT a doc-20 regression.**
 
 - **Phase 1 (this commit)**: the full flip per doc 20 —
