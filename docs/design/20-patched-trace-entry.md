@@ -2,9 +2,9 @@
 
 Status: design APPROVED (codex gpt-5.6-sol round 8, 2026-08-14 — §R8 MINOR
 §T10-wording fold applied); Phase 0a landed (`d4fd70f`), Phase 0b landed
-(inert substrate); Phase 1 (the flip) next
+(`272f75b`), Phase 1 (THE flip) landed; Phase 2 (§P measurement) next
 Owner: Bart + agents
-Last updated: 2026-08-14
+Last updated: 2026-08-15
 
 ## Implementation status
 
@@ -22,13 +22,7 @@ as they land; move bullets to Done once everything inside them is checked.
       to faster (scimark-lu −40%, likely icache — the dispatch loop shed
       529 cold lines).
 
-### Outstanding
-
-- [ ] **§P.0 board confirmation** — the full-board neutrality run for Phase
-      0a still owed: the first attempt was invalidated by load-70 parallel
-      rust builds; re-run `just bench` on a quiet machine and compare vs
-      `20260814-210757-99204e8.tsv`.
-- [x] **Phase 0b — inert patch substrate** (2026-08-14). `.jfor_loop` opcode
+- [x] **Phase 0b — inert patch substrate** (2026-08-14, `272f75b`). `.jfor_loop` opcode
       (dispatch arm panics until Phase 1 arms installs), per-VM copy-on-patch
       code images with the `image_gen` reload protocol (§R2-1: `codeFor` at
       the three frame-(re)load sites + `code_gen` memo + epilogue re-resolve)
@@ -48,13 +42,49 @@ as they land; move bullets to Done once everything inside them is checked.
       no-image ⇒ pointer-identical canonical `codeFor`, plus lifecycle,
       incumbent-wins, dropped-trace drain, epoch, and trigger tests. Full
       matrix (both flavors) + hashgate green.
-- [ ] **Phase 1 — THE flip.** Qualification transitions the per-trace
-      `entry_patch` state machine in the receipt-accounting funnel (§R2-7,
-      §R4-2); the caller-owned safe-point drain revalidates then installs
-      (§R3-1/3, §R4-1); the
-      `.jfor_loop` arm calls `enterSelectedTrace` under the §R2-3/5 exactly-
-      once-step / canonical-epilogue discipline. `min_trip_entry` demoted to
-      dead config (kept one release for A/B, then deleted).
+
+- [x] **Phase 1 — THE flip** (2026-08-15). Qualification transitions the
+      per-trace `entry_patch` state machine (`eligible → pending → bound /
+      suppressed_*`, §R4-2) inside `accountTraceRun`'s `min_useful` block
+      behind a single compare; the caller-owned `drainEntryPatchWork`
+      revalidates then installs ascending-trace-id (§R3-1/3, §R4-1:
+      not-`.compiled` / `.link`-close → `suppressed_permanent`, gated →
+      transient `.eligible`, incumbent/capacity → the matching suppressed
+      state with tombstone/incumbent wakes); the `.jfor_loop` arm steps the
+      canonical `for_loop` exactly once **including the internal-index
+      increment** (§R2-3 hazard — omitting that first line re-ran the final
+      iteration per strike cycle, guest corruption Δ=strikes×n, caught by
+      Δ-analysis + jitdbg receipts), substitutes `patch.orig` for all
+      downstream uses, bypasses (recording / suspend / safepoint-lines /
+      exec-log / pending-anchor / coverage) to the virgin path, and enters
+      via `enterSelectedTrace` with `visited = {ct}` (chain-exclusion
+      invariant) + strike accounting (`patch_strikes` = 4, exhaustion marks
+      pending-unpatch). Recorder mirror canonicalizes `.jfor_loop` fetches
+      to `proto.code[cur]` (§R1-3). `min_trip_entry` demoted to dead config
+      (default 0; kept one release for A/B). **Enablement fix in
+      `driveChain` hop-0** (pre-existing latent, exposed the moment patched
+      entry steered the chain): the scalar `sresult_fused` seam only models
+      a `[C.link_terminal, I.x]` head, but a fused span can open with a
+      sibling-handoff/M1 `.deopt` (or `.loop_done_linked`) dispatch — those
+      heads now route to `driveDispatcherLedger` (the drain that already
+      owns that grammar), generalizing the A-vii-d.1 `bridge_headed` special
+      case (measured panic on the A-viii cycle: hop-0 candidate t4's
+      handoff arm fired straight back into the excluded t3). Gates: full
+      matrix both flavors 906/907 + hashgate + A-viii/floatlink repros
+      green; the single red is the **pre-existing** `§R3
+      capture→restore→resume` keyframeser test — bisected to fail
+      deterministically at its own introducing commit (`7f803a8`, pre-doc-20
+      entirely); decoded diff isolates it to dead stack slots 9–14 (H-5(i)
+      dead-temporary omission from native exit snapshots: tier-0 leaves
+      final-iteration temps, native exit flush freezes pre-burst values).
+      Not a doc-20 regression; tracked as its own follow-up.
+
+### Outstanding
+
+- [ ] **§P.0 board confirmation** — the full-board neutrality run for Phase
+      0a still owed: the first attempt was invalidated by load-70 parallel
+      rust builds; re-run `just bench` on a quiet machine and compare vs
+      `20260814-210757-99204e8.tsv`.
 - [ ] **Phase 2 — measurement per §P.**
 - [ ] **Phase 3 — `.jloop` analogue for while/repeat back-edges.** Same
       machinery on the backward `jmp`/`jmp_if_*`; separately measured (fft

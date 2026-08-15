@@ -1,5 +1,54 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-15 (LATEST-65) — **Doc 20 Phase 1 (THE flip) LANDED; Phase 2 (§P measurement) next. Pre-existing §R3 keyframeser red diagnosed (H-5(i)), NOT a doc-20 regression.**
+
+- **Phase 1 (this commit)**: the full flip per doc 20 —
+  - `EntryPatchState` machine (`eligible → pending → bound / suppressed_{
+    incumbent,capacity,permanent}`) on `Trace`; qualify inside
+    `accountTraceRun`'s `min_useful` block behind ONE compare (tag-only
+    `native == .compiled`, no `nativeFor`); `drainEntryPatchWork` unpatches
+    first then installs ascending-trace-id with `installPending` revalidation
+    (not-compiled / `.link`-close → `suppressed_permanent`; gated → transient
+    `.eligible`; `InstallResult` routing installed/incumbent/capacity/oom);
+    `unpatchSlot` wakes (`suppressed_capacity` on ANY tombstone,
+    `suppressed_incumbent` on matching incumbent).
+  - The real `.jfor_loop` arm: steps the canonical `for_loop` exactly once
+    **including the internal-index increment** (the §R2-3 hazard — omitting
+    that first line corrupted guests by Δ=strikes×n, found via Δ-analysis +
+    jitdbg receipts), `instr = patch.orig` downstream, bypass set
+    (recording/suspend/safepoint-lines/exec-log/pending-anchors/coverage) →
+    virgin path, else `enterSelectedTrace` with `visited={ct}` + strike
+    accounting (`patch_strikes=4` → pending-unpatch). Recorder mirror
+    canonicalizes `.jfor_loop` → `proto.code[cur]` (§R1-3). `min_trip_entry`
+    demoted to dead config (default 0, kept one release for A/B).
+  - **driveChain hop-0 routing fix** (pre-existing latent, exposed by patched
+    entry steering): the scalar `sresult_fused` seam models only a
+    `[C.link_terminal, I.x]` head; sibling-handoff/M1 `.deopt` (and
+    `.loop_done_linked`) heads now route to `driveDispatcherLedger` (which
+    already owns that grammar) — generalizes A-vii-d.1's `bridge_headed`
+    special case. Repro was the A-viii cycle panic ("fused final trace is not
+    the expected inner root"): the chain excluded just-failed t3, picked
+    sibling t4, whose handoff arm fired straight back into t3.
+  - Gates: full matrix both flavors **906/907** + hashgate + all repros green.
+- **The 1 red is PRE-EXISTING**: `keyframeser §R3 capture→restore→resume with
+  tracing+opt+native` — bisected in a shadow tree (src byte-identical per
+  `git diff`) to fail **deterministically at its own introducing commit
+  `7f803a8`** (doc 18 §R4, pre-doc-20 entirely), despite LATEST-60's "green"
+  claim. Decoded-snapshot diff isolates it: all 232 heap objects +
+  `next_obj_id` identical; only dead stack slots 9–14 differ — exactly the
+  doc-17 **H-5(i) dead-temporary omission**: tier-0 rewrites dead expression
+  temporaries every iteration (final values 1845/1636/209 = g-loop i=3,j=3),
+  the native exit flush omits them (frozen pre-burst values 1221/1015/206 =
+  i=2). Doc 17's grounding already adjudicated this "a concrete bug the
+  mandatory native-F2c test must catch" — the test is right, the exit
+  snapshot is incomplete. Fix directions to put to Bart: (a) stop
+  liveness-pruning written slots from exit snapshots (extra exit stores,
+  upholds byte-identical); (b) mask dead slots at capture (needs liveness
+  metadata, changes snapshot semantics); (c) relax the test to logical
+  comparison. NOT decided unilaterally (Rule #17).
+- **Next**: Phase 2 §P measurement (P.1 fft ≤360ms, P.2 board ≤3%); §P.0
+  quiet-machine board still owed; Phase 3 `.jloop` + Open Q2 outstanding.
+
 ## Status 2026-08-14 (LATEST-64) — **Doc 20 Phase 0a (d4fd70f) + Phase 0b (inert substrate) LANDED; Phase 1 (the flip) next.**
 
 Bart approved implementation ("if codex is satisfied i certainly am").

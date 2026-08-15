@@ -1366,6 +1366,21 @@ pub const AnchorKey = struct { proto: *const Proto, pc: u32 };
 /// **stable-address** (§R2-6): each is its own heap allocation, the index in
 /// `TraceState.entry_patches` is baked into the image instruction's `.b`, and
 /// tombstoned slots are reused via `entry_patch_free` — never compacted.
+/// Doc 20 §R4-2: per-trace entry-patch lifecycle. Suppression is split by
+/// reason because the arms have different wake behaviour (§R5-2, §R6-2):
+/// `.suppressed_incumbent` is woken only by its recorded incumbent's
+/// tombstone; `.suppressed_capacity` by ANY tombstone; `.suppressed_permanent`
+/// (not-`.compiled`, ambiguous patch pc — properties that never change) is
+/// never woken, the trace simply keeps entering via the walk.
+pub const EntryPatchState = enum {
+    eligible,
+    pending,
+    bound,
+    suppressed_incumbent,
+    suppressed_capacity,
+    suppressed_permanent,
+};
+
 pub const EntryPatch = struct {
     /// The bound root. Valid to dereference ONLY while `live` (§R7-2):
     /// `removeTrace` clears `live` through `Trace.entry_slot` BEFORE
@@ -1503,6 +1518,17 @@ pub const Trace = struct {
     /// (clear `live`, set pending) in O(1) BEFORE destruction, and lets
     /// qualification assert a trace never binds two slots.
     entry_slot: ?u16 = null,
+    /// Doc 20 §R4-2: the per-trace entry-patch state machine. The receipt
+    /// funnel (`accountTraceRun`) may make exactly ONE transition —
+    /// `.eligible → .pending` — behind a single state compare, so a `.bound`
+    /// trace's productive receipts cost one never-taken branch. Every other
+    /// transition happens at the safe-point drain (`drainEntryPatchWork`) or
+    /// an unpatch (`unpatchSlot`), all deterministic events.
+    entry_patch: EntryPatchState = .eligible,
+    /// Valid ONLY while `entry_patch == .suppressed_incumbent`: the registry
+    /// slot index of the live incumbent that blocked this trace's install.
+    /// Its tombstone (and only its) wakes this trace back to `.eligible`.
+    entry_patch_incumbent: u16 = 0,
     anchor: AnchorKey,
     /// The straight-line IR, terminated by a `loop` instruction.
     instrs: []IrInstr,
@@ -1816,7 +1842,19 @@ pub const TraceConfig = struct {
     /// profitable long runs stay traced. Only applies to `for_loop` (a clean,
     /// computable trip count); while/repeat loops are entered as before. Set to 0
     /// to disable. Heuristic — never affects output, only tiering.
-    min_trip_entry: u32 = 24,
+    ///
+    /// DEMOTED to dead config by doc 20 Phase 1 (default 0 = disabled): the
+    /// trip gate was a symptom of the per-back-edge discovery/selection
+    /// cascade the patched entry removes, and the #69/#73 low-yield gate
+    /// machine is the real thrash brake (full-board experiment: fft −34%,
+    /// everything else in noise). Kept one release for A/B, then deleted.
+    min_trip_entry: u32 = 0,
+    /// Doc 20 §R6-1: consecutive non-productive patched entries (seed
+    /// decline, prologue fail-closed, zero-progress exit) tolerated before
+    /// the `.jfor_loop` arm marks its own slot pending unpatch — the anchor
+    /// then re-decides through the virgin warming cascade (Open Q2's rebind
+    /// policy is a measured follow-up). Productive entries reset the count.
+    patch_strikes: u8 = 4,
     /// After this many *low-yield* trace entries (each committing fewer than
     /// `min_useful` iterations) an anchor is gated off so tier-0 owns the loop —
     /// the brake against re-entry thrash on type-unstable / branchy loops.
@@ -4930,6 +4968,21 @@ pub const TraceState = struct {
         }
         if (completed >= self.config.min_useful) {
             t.hit_count +|= 1;
+            // Doc 20 qualify (§R1-7/§R2-7/§R4-2): T's OWN completed count in a
+            // single receipt (this funnel is per-trace-commit, never a fused
+            // child's cumulative sum). Mark only — this funnel runs INSIDE the
+            // receipt grammar and may run multiple times per fused walk; the
+            // install happens at the caller-owned safe-point drain. Tag
+            // inspection ONLY, never `nativeFor` (it compiles lazily —
+            // §R3-2); never under coverage (§R1-9: coverage measures the
+            // unpatched machine). The `.eligible` compare is the entire
+            // steady-state cost for `.bound`/`.suppressed_*` traces.
+            if (t.entry_patch == .eligible and !self.config.coverage and
+                self.config.native_codegen and t.native == .compiled)
+            {
+                t.entry_patch = .pending;
+                self.entry_patch_dirty += 1;
+            }
         }
     }
 
@@ -5093,15 +5146,21 @@ pub const TraceState = struct {
                 // `native_link_exits`). Arm the M1 half-fusion first under exactly
                 // the gates the ≤2 path below uses — the `failed→sct` edge is valid
                 // regardless of how deep `sct`'s own span fused.
-                // A-vii-d.1: a hop-0 ledger OPENED by the seed's armed composite
-                // bridge (`[C.region_bridge, S.…]`, exactly 2 rows) is replay-owned
-                // too — the scalar `sresult_fused` seam below models only the
-                // `[C.link, I.x]` shape and would consume the bridged successor as
-                // a fused INNER (wrong anchor, wrong resume — measured panic on
-                // nsieve the moment the bridge armed).
-                const bridge_headed = sresult.ledger_len >= 2 and
-                    self.ledger_scratch[0].kind == .region_bridge;
-                if (sresult.ledger_len > 2 or bridge_headed) {
+                // A-vii-d.1 (generalized): a hop-0 ledger OPENED by any armed slot
+                // that is NOT the seed's `.link` terminal is replay-owned too — the
+                // scalar `sresult_fused` seam below models only the `[C.link, I.x]`
+                // shape and would consume the dispatched successor as a fused INNER
+                // (wrong anchor, wrong resume). Measured twice: first as
+                // `[C.region_bridge, S.…]` (panic on nsieve the moment the bridge
+                // armed), then as `[C.deopt(sibling_handoff), S.…]` (panic on the
+                // A-viii cycle under doc-20 patched entry, where the chain's
+                // exclusion set steers hop-0 to a sibling whose handoff arm fires
+                // straight back into the excluded trace). `.loop_done_linked` heads
+                // are the same class. Only a `.link_terminal` head matches the
+                // scalar seam's model.
+                const nonlink_headed = sresult.ledger_len >= 2 and
+                    self.ledger_scratch[0].kind != .link_terminal;
+                if (sresult.ledger_len > 2 or nonlink_headed) {
                     if (safe_to_arm and materialization == .ordinary_header and
                         sct.inputs.len == 0 and self.isSourceBranchGuardExit(failed, exit_instr, proto))
                     {
@@ -5116,14 +5175,29 @@ pub const TraceState = struct {
                     if (materialization == .native_numeric_for_done) {
                         self.armLoopDoneLink(failed, exit_instr, safe_to_arm);
                     }
-                    return self.driveSeedLedger(
-                        sct,
-                        self.ledger_scratch[0..sresult.ledger_len],
-                        proto,
-                        regs,
-                        safe_to_arm,
-                        materialization,
-                    );
+                    // Route by HEAD kind: the seed-ledger drain models only spans
+                    // opened by the seed's own `.link` terminal or composite
+                    // bridge. Any other head (`.deopt` = sibling-handoff / M1
+                    // ordinary-guard dispatch, `.loop_done_linked`) is exactly the
+                    // grammar the dispatcher's direct-entry drain already walks —
+                    // hand the span to it wholesale.
+                    return switch (self.ledger_scratch[0].kind) {
+                        .link_terminal, .region_bridge => self.driveSeedLedger(
+                            sct,
+                            self.ledger_scratch[0..sresult.ledger_len],
+                            proto,
+                            regs,
+                            safe_to_arm,
+                            materialization,
+                        ),
+                        else => self.driveDispatcherLedger(
+                            sct,
+                            self.ledger_scratch[0..sresult.ledger_len],
+                            proto,
+                            regs,
+                            safe_to_arm,
+                        ),
+                    };
                 }
                 // The ≤2 scalar compatibility seam is still a complete native
                 // call. Capture its ordinary ledger before any steering and settle
@@ -10225,29 +10299,41 @@ pub const TraceState = struct {
         return found;
     }
 
+    /// Why `installEntryPatch` declined — routes the §R4-2 state machine at
+    /// the drain (`.no_patch_pc` → `.suppressed_permanent`; `.incumbent` →
+    /// `.suppressed_incumbent` recording the blocking slot; `.capacity` →
+    /// `.suppressed_capacity`; `.oom` → `.eligible`, transient §R5-2).
+    pub const InstallResult = union(enum) {
+        installed,
+        no_patch_pc,
+        incumbent: u16,
+        capacity,
+        oom,
+    };
+
     /// Install a `.jfor_loop` patch binding `t` at its anchor (§R2-6
     /// publication order: initialize the slot COMPLETELY, then write the
-    /// image opcode — that write is the publication). Returns false (installs
+    /// image opcode — that write is the publication). Declines (installing
     /// nothing) when the patch pc is unresolvable/ambiguous, the pc already
     /// holds a live patch (§R3-1 rule 2 — incumbent wins), the slot index
     /// space is exhausted (§R6-2), or allocation fails — a missed
-    /// optimization, never an error. Phase 0b: exercised by tests only; the
-    /// Phase-1 qualify drain is the production caller.
-    pub fn installEntryPatch(self: *TraceState, t: *Trace) bool {
+    /// optimization, never an error. Production caller: the Phase-1 install
+    /// pass of `drainEntryPatchWork`, which owns the state routing.
+    pub fn installEntryPatch(self: *TraceState, t: *Trace) InstallResult {
         std.debug.assert(t.entry_slot == null);
-        const patch_pc = resolvePatchPc(t.anchor.proto, t.anchor.pc) orelse return false;
-        const img = self.ensureImage(t.anchor.proto) catch return false;
-        if (img[patch_pc].op == .jfor_loop) return false; // live incumbent wins
+        const patch_pc = resolvePatchPc(t.anchor.proto, t.anchor.pc) orelse return .no_patch_pc;
+        const img = self.ensureImage(t.anchor.proto) catch return .oom;
+        if (img[patch_pc].op == .jfor_loop) return .{ .incumbent = img[patch_pc].b }; // live incumbent wins
         // Acquire a slot: reuse a tombstone, else append (fail closed at the
         // u16 index ceiling — `.b` must hold the index).
         const idx: u16 = if (self.entry_patch_free.pop()) |free_idx|
             free_idx
         else blk: {
-            if (self.entry_patches.items.len >= std.math.maxInt(u16)) return false;
-            const p = self.gpa.create(EntryPatch) catch return false;
+            if (self.entry_patches.items.len >= std.math.maxInt(u16)) return .capacity;
+            const p = self.gpa.create(EntryPatch) catch return .oom;
             self.entry_patches.append(self.gpa, p) catch {
                 self.gpa.destroy(p);
-                return false;
+                return .oom;
             };
             break :blk @intCast(self.entry_patches.items.len - 1);
         };
@@ -10272,7 +10358,7 @@ pub const TraceState = struct {
         img[patch_pc] = patched;
         self.image_gen +%= 1; // current frame reloads at its next back-edge
         self.dbg("entry-patch install: pc={d} patch_pc={d} slot={d} trace={d}", .{ t.anchor.pc, patch_pc, idx, t.id });
-        return true;
+        return .installed;
     }
 
     /// Mark a slot for unpatch (§R2-4): clears `live` so no arm dereferences
@@ -10304,8 +10390,11 @@ pub const TraceState = struct {
 
     /// The safe-point drain (doc 20 §Safe-point-drain), called by the
     /// caller-owned epilogue after every `enterSelectedTrace` return, before
-    /// acting on the directive. §R3-1 order: ALL pending unpatches first;
-    /// Phase 1 appends the revalidate-then-install pass for qualified marks.
+    /// acting on the directive. §R3-1 order: ALL pending unpatches first
+    /// (a T1-unpatch + T2-install at one pc is then a clean
+    /// unpatch-then-repatch; install-first would let T1's restore overwrite
+    /// T2), then the revalidate-then-install pass for `.pending` marks in
+    /// ascending trace-id order (§R3-1 rule 3 deterministic sibling ties).
     /// Early-outs on the dirty counter, so a quiet turn costs one load.
     pub fn drainEntryPatchWork(self: *TraceState) void {
         if (self.entry_patch_dirty == 0) return;
@@ -10314,6 +10403,57 @@ pub const TraceState = struct {
             if (p.tombstone or !p.pending_unpatch) continue;
             self.unpatchSlot(@intCast(i));
         }
+        // Install pass: pending marks live on traces, found by cache scan
+        // (drains are rare — only a dirty turn pays this). Ascending-id
+        // selection keeps sibling ties deterministic without allocating.
+        while (true) {
+            var best: ?*Trace = null;
+            for (self.cache.items) |t| {
+                if (t.entry_patch != .pending) continue;
+                if (best == null or t.id < best.?.id) best = t;
+            }
+            self.installPending(best orelse break);
+        }
+    }
+
+    /// §R4-1 revalidate-then-install for one `.pending` trace. `.pending` is
+    /// a claim made mid-receipt; the rest of that same receipt can invalidate
+    /// it (region accounting can gate the very anchor just marked, retirement
+    /// can drop the trace — a dropped trace never reaches here, the scan is
+    /// over the live cache). The drain has already applied this turn's
+    /// unpatches and gates, so the checks here are authoritative: still
+    /// `.compiled` by tag, anchor not gated, then the install's own
+    /// fail-closed checks. Failure routes per the §R4-2 state machine.
+    fn installPending(self: *TraceState, t: *Trace) void {
+        std.debug.assert(t.entry_patch == .pending);
+        if (t.native != .compiled) {
+            t.entry_patch = .suppressed_permanent;
+            return;
+        }
+        // A `.link`-closed continuation is never trial-entered through the
+        // anchor walk (interp.zig's walk skips them); a patched entry must
+        // not become the back door. Permanent — the close op never changes.
+        if (t.instrs.len != 0 and t.instrs[t.instrs.len - 1].op == .link) {
+            t.entry_patch = .suppressed_permanent;
+            return;
+        }
+        if (self.isGated(t.anchor)) {
+            // Transient (§R5-2): cooldown may lift; a condemned trace is
+            // never repatched past `isGated` (§T14). Re-qualifies at the next
+            // productive receipt after the gate clears.
+            t.entry_patch = .eligible;
+            return;
+        }
+        switch (self.installEntryPatch(t)) {
+            .installed => t.entry_patch = .bound,
+            .no_patch_pc => t.entry_patch = .suppressed_permanent,
+            .incumbent => |slot| {
+                t.entry_patch = .suppressed_incumbent;
+                t.entry_patch_incumbent = slot;
+            },
+            .capacity => t.entry_patch = .suppressed_capacity,
+            .oom => t.entry_patch = .eligible, // transient (§R5-2)
+        }
     }
 
     /// Restore-then-tombstone (§R2-6 unpatch order). In-place restore is
@@ -10321,7 +10461,11 @@ pub const TraceState = struct {
     /// the restored content is canonical-identical — no generation bump
     /// needed. Resolves the trace through `traceById`, never `p.trace`
     /// (§R7-2: the trace may already be destroyed).
-    fn unpatchSlot(self: *TraceState, idx: u16) void {
+    /// Public for exactly one external caller besides the drain: the
+    /// `.jfor_loop` arm's §R6-1 defensive step-1 recovery, which runs OUTSIDE
+    /// any receipt grammar and is the sole slot-pointer holder — synchronous
+    /// unpatch is safe there.
+    pub fn unpatchSlot(self: *TraceState, idx: u16) void {
         const p = self.entry_patches.items[idx];
         if (self.code_images.get(p.proto)) |img| {
             std.debug.assert(img[p.patch_pc].op == .jfor_loop and img[p.patch_pc].b == idx);
@@ -10330,11 +10474,29 @@ pub const TraceState = struct {
         }
         if (self.traceById(p.trace_id)) |t| {
             t.entry_slot = null;
-            // Phase 1: `.bound → .eligible` transition + suppressed wakes here.
+            // §R4-2 `.bound → .eligible`: the trace survives its unpatch; a
+            // later productive receipt may re-qualify (the gate cooldown is
+            // the thrash brake against ping-pong).
+            if (t.entry_patch == .bound) t.entry_patch = .eligible;
         }
         p.live = false;
         p.pending_unpatch = false;
         p.tombstone = true;
+        // §R4-2 wakes, deterministic at this tombstone: `.suppressed_capacity`
+        // is a capacity wait — ANY tombstone restores capacity; a
+        // `.suppressed_incumbent` wakes only when ITS recorded incumbent slot
+        // dies (this one). Wake = back to `.eligible`; the next productive
+        // receipt re-qualifies (no install this turn — the wake is not a
+        // `.pending` mark).
+        for (self.cache.items) |wt| {
+            switch (wt.entry_patch) {
+                .suppressed_capacity => wt.entry_patch = .eligible,
+                .suppressed_incumbent => if (wt.entry_patch_incumbent == idx) {
+                    wt.entry_patch = .eligible;
+                },
+                else => {},
+            }
+        }
         self.dbg("entry-patch unpatch: patch_pc={d} slot={d} trace={d}", .{ p.patch_pc, idx, p.trace_id });
         // OOM here loses the index for reuse (stays tombstoned forever) —
         // safe: fail-closed capacity, reclaimed at the epoch drain anyway.
@@ -20695,7 +20857,7 @@ test "doc 20 Phase 0b: install publishes a .jfor_loop image; canonical untouched
     try state.cache.append(gpa, sibling);
 
     const gen0 = state.image_gen;
-    try testing.expect(state.installEntryPatch(t));
+    try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
     try testing.expect(state.image_gen != gen0); // frames re-resolve at back-edge
     try testing.expectEqual(@as(?u16, 0), t.entry_slot);
 
@@ -20714,7 +20876,7 @@ test "doc 20 Phase 0b: install publishes a .jfor_loop image; canonical untouched
     try testing.expectEqual(OpCode.for_loop, proto.code[5].op);
 
     // §R3-1 rule 2: a live incumbent wins — the sibling's install is refused.
-    try testing.expect(!state.installEntryPatch(sibling));
+    try testing.expectEqual(TraceState.InstallResult{ .incumbent = 0 }, state.installEntryPatch(sibling));
     try testing.expectEqual(@as(?u16, null), sibling.entry_slot);
 
     // Unpatch: mark (allocation-free) then drain restores in place + tombstones.
@@ -20726,7 +20888,7 @@ test "doc 20 Phase 0b: install publishes a .jfor_loop image; canonical untouched
     try testing.expectEqual(@as(?u16, null), t.entry_slot);
 
     // The freed slot index is reused by the next install (free-list pop).
-    try testing.expect(state.installEntryPatch(sibling));
+    try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(sibling));
     try testing.expectEqual(@as(?u16, 0), sibling.entry_slot);
     try testing.expectEqual(@as(u16, 0), state.codeFor(&proto)[5].b);
     try testing.expectEqual(@as(usize, 1), state.entry_patches.items.len);
@@ -20741,7 +20903,7 @@ test "doc 20 §R7-2: removeTrace marks the slot pre-destroy; drain survives the 
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
     try state.cache.append(gpa, t);
-    try testing.expect(state.installEntryPatch(t));
+    try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
 
     // removeTrace destroys `t`; the hook must have marked slot 0 first.
     state.removeTrace(t);
@@ -20763,7 +20925,7 @@ test "doc 20 §R2-2: clearCache drops images + registry wholesale (epoch boundar
     const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
     const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
     try state.cache.append(gpa, t);
-    try testing.expect(state.installEntryPatch(t));
+    try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
     try testing.expect(state.code_images.count() == 1);
 
     const gen0 = state.image_gen;
@@ -20788,7 +20950,7 @@ test "doc 20 triggers: anchor gate and side-arm want both mark the patch pending
     try state.cache.append(gpa, t);
 
     // Gate trigger: gating the anchor marks its live slot pending.
-    try testing.expect(state.installEntryPatch(t));
+    try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
     state.gateNativeUnsupported(anchor);
     try testing.expect(state.entry_patches.items[0].pending_unpatch);
     state.drainEntryPatchWork();
@@ -20796,7 +20958,7 @@ test "doc 20 triggers: anchor gate and side-arm want both mark the patch pending
     try testing.expectEqual(@as(?u16, null), t.entry_slot);
 
     // Side-arm trigger: `wants_side_trace` crossing hotguard marks pending.
-    try testing.expect(state.installEntryPatch(t));
+    try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
     var i: u32 = 0;
     while (i < state.config.hotguard) : (i += 1) state.countGuardFailure(anchor, 4);
     try testing.expect(state.wants_side_trace != null);
