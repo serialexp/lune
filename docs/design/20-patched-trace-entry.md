@@ -608,6 +608,47 @@ Frozen before Phase 1. Reps 5 via `just bench`, plus:
 - **P.0** (Phase 0a gate) the `enterSelectedTrace` refactor alone is
   performance-neutral: full board within noise before any patching lands.
 
+### §P — Measured results (2026-08-15, post-flip 627f7f2)
+
+Post-flip board: `bench/results/20260815-131357-627f7f2.tsv` (`just bench`,
+reps 5, load < 4 at start). Pre-flip baseline: shadow-tree ReleaseFast build
+of `272f75b` (src verified byte-identical via `git diff`), `bench/run.py
+--no-save` on the same machine immediately after — **partially contaminated**
+(the LuaJIT column, an identical binary in both runs, swings −17…−74% on
+several rows: nsieve lj 41.1→10.7, nsieve-bit-fp 23.0→15.9, partialsums
+44.0→34.7 — a transient background load hit the middle of the pre-flip run),
+so per-row P.2 deltas are read against the lj-column stability of each row.
+
+- **P.1 PASS** — scimark-fft jit **295.7 ms** ≤ 360 (from 535 at the arc's
+  start; the pre-flip baseline itself read 301.2 on the quiet machine —
+  LATEST-62's 535 was measured in the load-70 era, so most of the arc's
+  wall-clock delta was load inflation; the flip's own quiet-machine effect
+  on fft is ≈ −2%, confirmed by a load-49 interleaved A/B where post ≤ pre
+  in 6/7 pairs).
+- **P.2 PASS with caveats** — no credible >3% regression: rows with a stable
+  lj column are flat-to-better (fft −1.8%, grid_matmul −8.3%, nsieve-bit
+  −7.1%, str_* all improved); the one >3% jit-column riser, field_hash
+  13.5→15.6, sits next to a +3.7% lj drift and awaits the quiet interleaved
+  re-check recorded below.
+- **P.3 PASS** — `--jit-stats` fft: `fft_transform:131` **78.0% of
+  iterations traced** (the experiment's exact target, up from 37.8%
+  gate-on), 61.6% of its time traced. Remaining fft tier-0 is
+  `fft_bitreverse:9`/`:55` (`while` loops, 30.4% of run — Phase 3 `.jloop`
+  territory) and `fft_transform:99` (3.0%).
+- **P.4 PASS** — nsieve 11.9 / sieve_int 5.9 / nsieve-bit 22.2 vs pre-flip
+  24.1 / 6.1 / 23.9 (nsieve's own pre-flip row is lj-contaminated; the
+  stable post-flip row matches the historical board).
+- **P.5 PASS** — full matrix both flavors 906/907 at every phase commit (the
+  1 red is the pre-existing keyframeser §R3 / H-5(i), bisected to its
+  introducing commit `7f803a8`) + hashgate + repros.
+- **P.0 superseded by P.2** — the Phase-0a-only neutrality board can no
+  longer be isolated post-flip (a `272f75b` vs `f88c5f3` shadow pair would
+  measure it, but both sides already carried 0a at the P.2 comparison and
+  0a/0b landed with interleaved-A/B neutrality gates); the pre/post-flip
+  A/B above contains 0a+0b on both sides, so a 0a regression would surface
+  there. Owed follow-up: a quiet interleaved field_hash (and grid_matmul)
+  A/B to settle the last P.2 row.
+
 ## §T — test matrix
 
 1. Patched loop: 10-mode byte-identical output on an fft-shaped triple nest

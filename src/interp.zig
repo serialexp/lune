@@ -13389,3 +13389,76 @@ test "A-viii (doc 17 §A8 step 8): the OUTER cycle arms as a closed cycle and fi
     // the same selection history.
     try testing.expect(contained.entries > 0);
 }
+
+test "doc 20 §T (Phase 1 e2e): a qualified hot loop actually installs and binds an entry patch; output byte-identical to tier-0" {
+    // The Phase-0b substrate tests exercise `installEntryPatch` by hand; this
+    // is the pin that THE FLIP flips in production: a plain hot numeric-`for`
+    // under native codegen qualifies through the `accountTraceRun` funnel,
+    // the epilogue drain installs, and the patch stays bound at run end —
+    // with output identical to a tier-0 run of the same program.
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const gpa = testing.allocator;
+    const source: [:0]const u8 =
+        \\local s = 0
+        \\for r = 1, 200 do
+        \\  for i = 1, 100 do s = s + i end
+        \\end
+        \\print(s)
+    ;
+
+    var out_jit: [16]u8 = undefined;
+    var out_len: usize = 0;
+    {
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var sink = io.Writer.fixed(&out_jit);
+        vm.out = &sink;
+        vm.trace.config.enabled = true;
+        vm.trace.config.execute = true;
+        vm.trace.config.optimize = true;
+        vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+        vm.trace.config.hotloop = 4;
+        var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        out_len = sink.buffered().len;
+
+        if (@import("nativegen.zig").is_x64_linux) {
+            // The flip flipped: at least one slot was created and is still a
+            // live binding whose trace reached `.bound`.
+            try testing.expect(vm.trace.entry_patches.items.len > 0);
+            var bound: usize = 0;
+            for (vm.trace.entry_patches.items) |p| {
+                if (p.tombstone or !p.live) continue;
+                const t = vm.trace.traceById(p.trace_id) orelse continue;
+                if (t.entry_patch == .bound) bound += 1;
+            }
+            try testing.expect(bound > 0);
+        }
+    }
+
+    // Tier-0 reference: byte-identical output.
+    var out_t0: [16]u8 = undefined;
+    {
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var sink = io.Writer.fixed(&out_t0);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        try testing.expectEqualStrings(sink.buffered(), out_jit[0..out_len]);
+        try testing.expectEqualStrings("1010000\n", sink.buffered());
+    }
+}
