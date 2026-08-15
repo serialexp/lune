@@ -34,6 +34,18 @@ check-version:
 bench *args: release
     python3 bench/run.py {{args}}
 
+# Copy this tree to DEST for an A/B shadow build (baseline binaries), stripping
+# .zig-cache/zig-out so the shadow build can never reuse THIS tree's artifacts.
+# A copied cache once made the "pre" baseline a post-source binary and burned an
+# hour on a phantom regression (CURRENT_TASK LATEST-69). After this, restore the
+# baseline sources in DEST (`git show HEAD:<file> > <file>`), build there, and
+# verify the binary is really the baseline: `nm DEST/zig-out/bin/lune | grep
+# <new-symbol>` must come up empty.
+shadow dest:
+    rm -rf {{dest}}
+    cp -r . {{dest}}
+    rm -rf {{dest}}/.zig-cache {{dest}}/zig-out
+
 # Regenerate src/gen/unicode_case.zig from the vendored UCD (design doc 06, S-C).
 # Pure + offline; only needed when re-vendoring a new pinned Unicode version.
 gen-unicode:

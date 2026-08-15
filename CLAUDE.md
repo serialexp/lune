@@ -106,6 +106,13 @@ the `zig build` invocations and, for benchmarks, guarantee the right binary.
   `zig-out/bin/lune` as **Debug**; re-run `just release`/`just bench` before
   timing anything afterward (a plain `zig build`, `zig build test`, or this
   recipe leaves a Debug binary that benchmarks ~20× slow).
+- `just shadow <dest>` — make an A/B shadow copy of the tree for baseline
+  binaries. **Never build in a bare `cp -r` copy: the copied `.zig-cache` can
+  hand you a binary built from THIS tree's sources as your "baseline"** (it
+  did — the phantom "+2% fft" of CURRENT_TASK LATEST-69). The recipe strips
+  `.zig-cache`/`zig-out` so that can't happen; after restoring the baseline
+  sources in the copy (`git show HEAD:<file> > <file>`) and building, verify
+  with `nm <bin> | grep <new-symbol>` (must be empty) before trusting any A/B.
 
 **Live JIT debugging — never hand-add `std.debug.print` scaffolding.** The
 permanent facility is `src/jitdbg.zig`: build with `zig build -Djit-debug=true`
