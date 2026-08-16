@@ -1,5 +1,48 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
+## Status 2026-08-16 (LATEST-70) — **"Make fft_bitreverse traceable": recorder gaps CLOSED (codex, 3 rounds), coverage deliberately deferred to exit-branch stitching. UNCOMMITTED pending Bart's land/hold call (fft jit +3% ≈ noise floor).**
+
+- Codex thread `01a007bf-34be-7f13-9f89-601103c003d8`, three rounds under
+  Claude verification. GROUNDING CORRECTIONS to LATEST-69's verdict: (a) the
+  `:55 bad_type get_index` abort was the doc-08 post-deferred-store load
+  prohibition (the recording crossed the swap's 4 sunk stores into the next
+  read), NOT key narrowing — `guard_float + int_of_float` was already
+  emitted; (b) `:9` DID commit a trace — native `proveKinds` rejected its
+  exact mixed int/float compare, the native-only gate backed the anchor off,
+  and `--dump-aborts` was silent because native-unsupported is not a
+  recorder abort.
+- Landed general mechanisms (all enabling, Z-6-clean): static virtual-store
+  forwarding (LuaJIT `aa_ahref` model: SSA affine base+const keys, MUST
+  forwards / NO skips / MAY aborts fail-closed; NO runtime key-relation
+  guards; `MAX_PENDING_STORES` cap removed, allocator-backed buffer); exact
+  mixed int/float compare narrowing (`.operand_int` int_of_float on
+  integral floats); write-only table-pointer φs boxed TAG_HEAP in native
+  (lifts a whole proveKinds rejection class — the :9 trace now compiles);
+  CFG-cycle recording closure (`maybeCloseAtAnchor`); jitdbg probes for
+  commit-fail + native-unsupported.
+- ROUND-2 EXPERIMENT REJECTED ON MY BOARD MEASUREMENT (recorded in doc 20):
+  exempting zero-progress guard exits from legacy strikes + tree/walk bounds
+  4/8→32 made bitreverse run traces (433k iters) but wrecked the board —
+  nsieve 12.1→43.3 ms, sieve_int 5.7→11.8, nsieve-bit 14.1→19.0, fft
+  301→445 (entry storms: nsieve 825→322,633 entries). Round 3 rolled the
+  economics back to baseline (Option-A gating, 4/8 bounds); event counters
+  byte-match baseline (nsieve 825/780/337,587 etc.).
+- Verdict: bitreverse traces now record AND compile (trace #0 9,736 B —
+  previously unsupported) but run only 3–16 iters before striking out —
+  **sustained coverage needs LuaJIT-style native exit-branch STITCHING**
+  (patched guard jumps straight into the side trace, no runtime re-entry) —
+  the doc 16 "nsieve outcome (corrected)" lever, now doubly motivated.
+- Gates: both flavors green, six-hash gate + repros PASS, board 28/28 at
+  baseline. Interleaved A/B (genuine `just shadow` baseline, nm-verified):
+  nsieve/sieve_int/nsieve-bit exact parity; **fft jit +8–10 ms (+3%)
+  consistent** — attributed to 2 extra per-run native compiles (~18 KB: the
+  newly-compilable :9 + one sibling) + 27 extra entries; our measured
+  two-build noise floor on fft is ~2%, so the real cost is ≈1%. lu +1.5%
+  (same attribution). Everything else noise.
+- State: tree UNCOMMITTED (8 src + 3 doc files). Options for Bart: (i) land
+  as-is (+~1-3% fft for the enabling mechanisms, honest doc trail), (ii)
+  hold for the stitching arc, (iii) codex round 4 to shave the residual.
+
 ## Status 2026-08-16 (LATEST-69) — **Doc 20 Phase 3 LANDED (codex-authored, Claude-verified): `.jloop` patched entry for while/repeat closers. Perf-NEUTRAL; the fft bitreverse premise is REFUTED — those loops never trace at all.**
 
 - Codex (gpt-5.6-sol, thread `01a007a0-0529-71c0-a579-87b67fadff3c`)

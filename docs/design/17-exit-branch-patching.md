@@ -7632,11 +7632,11 @@ is the corrected version:
 
 | guest opcode (`recFn`) | ordered `(role, operand)` guard slots | tree ref |
 |---|---|---|
-| `add/sub/mul/div/idiv/mod/pow` (`recArith`), `eq/ne` (`recEq`), `lt/le/gt/ge` (`recCompare`) | `(operand_type, b)`, `(operand_type, c)` | `4197-4198`, `4247-4248` |
+| `add/sub/mul/div/idiv/mod/pow` (`recArith`), `eq/ne` (`recEq`), `lt/le/gt/ge` (`recCompare`) | `(operand_type, b)`, `(operand_type, c)`, then `(operand_int, b/c)` *(relational compare only, when an observed mixed numeric operand is an exact integral float; 2026-08-16)* | `recArith`, `recEq`, `recCompare` |
 | `neg` (`recNeg`), `bnot` (`recBnot`), binary bitwise `band/bor/bxor/shl/shr/sar` (`recBitwise`) | `(operand_type, b)` [+ `(operand_type, c)` for binary bitwise] | `4219`, `4236`, `4209-4210` |
 | `jmp_if_false/jmp_if_true` (`recBranch`) | `(branch_cond, a)` | `4834` |
 | `for_loop` (`recForLoop`), `for_prep` (`recForPrepLink`) | `(operand_type, a)`, `(operand_type, a+1)`, `(operand_type, a+2)`, then `(limit_int, a+1)` *(float-limit only)*, `(loop_done, ·)` | `4870-4872`, `4890`, `4901` (mirror `4977/4993/5003`) |
-| `get_index` array read (`recArrayGet`) | `(container_type, b)`, `(container_lane, b)`, `(key_type, c)` *(guard_int, or guard_float for an integral-float key)*, `(key_int, c)` *(int_of_float narrow — float key only, 2026-08-14)*, `(bounds, ·)`, then `(present, ·)` *(narrow lane)* **or** `(element_type, loaded)` *(.value lane)* | `4308`, `4315`, `4319`, `4328` |
+| `get_index` array read (`recArrayGet`) | `(container_type, b)`, `(container_lane, b)`, `(key_type, c)` *(guard_int, or guard_float for an integral-float key)*, `(key_int, c)` *(int_of_float narrow — float key only, 2026-08-14)*, `(bounds, ·)`, then `(present, ·)` *(narrow lane)* **or** `(element_type, loaded)` *(.value lane)*. Deferred-store aliasing is classified statically (`MUST/NO/MAY`), so it emits no guard role. | `recArrayGet`, `forwardPendingArrayLoad` |
 | `set_index` array write (`recArraySet`) | `(container_type, a)`, `(container_lane, a)`, `(key_type, b)` *(guard_int, or guard_float for an integral-float key)*, `(key_int, b)` *(int_of_float narrow — float key only, 2026-08-14)*, `(bounds, ·)` **or** `(append_precond, ·)`, `(value_fits, c)` *(every narrow lane)* | `4376`, `4462-4480`, `4424` |
 | `get_index` const-key hash (`recHashGet`) | `(container_type, a)`, `(hash_struct, a)`, + consumer `(field_type, loaded)` on the `hload` result | `4727-4735` |
 | `set_index` const-key hash (`recHashSet`) | `(value_type, c)` **first**, `(container_type, a)`, `(hash_struct, a)` | `4795`, `4797` |

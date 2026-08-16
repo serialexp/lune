@@ -527,6 +527,7 @@ pub const GuardRole = enum(u8) {
     container_lane, // array element-lane (guard_lane)
     key_type, // array/grid index type (guard_int / guard_float on the key)
     key_int, // get/set_index integral-float key → int narrowing (int_of_float)
+    operand_int, // mixed numeric compare: integral float narrowed to exact int
     bounds, // array/grid bounds check (guard_bounds)
     present, // array/grid presence (guard_present / guard_gpresent)
     element_type, // .value-lane loaded element (fused: guard_table on the load)
@@ -1921,13 +1922,8 @@ pub const TraceConfig = struct {
     hotexit: u8 = 10,
     /// Maximum distinct traces cached per anchor before `countGuardFailure` /
     /// `countFingerprintMiss` stop counting (i.e. before side-trace recording at
-    /// that anchor is refused). Was a hard-coded 2, which is exactly one branch
-    /// flip: an anchor whose loop body has THREE control-flow shapes (nsieve:14 —
-    /// composite-skip, prime-with-clearing, prime-past-m/2 whose clearing loop
-    /// zero-trips) permanently strands the third shape on the runtime turnstile,
-    /// one visit per iteration (304k/run on nsieve N=9). Bounded still — the
-    /// unbounded-growth concern on alternating-type loops stays addressed — just
-    /// not at the smallest possible value.
+    /// that anchor is refused). Four remains the economic bound until native exit
+    /// branches can jump directly into side traces without a runtime sibling walk.
     max_traces_per_anchor: usize = 4,
     /// Record a per-trace **execution log** (`execlog.zig`) for the visualizer's
     /// iteration animation. Off by default (zero cost on the JIT path — the executor
@@ -3573,20 +3569,10 @@ pub const TraceState = struct {
         const gop = self.penalty.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
-        // Option A (LuaJIT's semantics: a hot guard exit has its own hotcount and
-        // spawns a side trace — the parent anchor is never blacklisted for it).
-        // Zero progress THROUGH A SIDE-EXIT GUARD, while this anchor can still
-        // take another side trace, is side-trace evidence, not thrash: widen the
-        // gate threshold past `hotexit` so the exit counter can reach its own
-        // threshold and record the missing shape, instead of the `max_penalty`
-        // gate condemning the anchor first. Measured on nsieve: the shared
-        // `primes` table makes the init loop append-shaped on the first size and
-        // overwrite-shaped on the rest; guard_append zero-exits gated the anchor
-        // after 8 entries and ~36% of the run fell back to tier-0 despite full
-        // trace coverage. Still hard-bounded: a genuinely thrashing anchor gates
-        // at `max_penalty + hotexit`, and once the anchor holds
-        // `max_traces_per_anchor` traces the plain threshold applies again.
-        // Deterministic — a pure function of the receipt stream and cache size.
+        // Option A: give a real side-exit counter enough deterministic headroom to
+        // reach `hotexit`, but retain the finite legacy gate. Without direct
+        // native exit-branch stitching, permanently exempting zero-progress guard
+        // exits creates an enter/exit runtime turnstile on variable loop shapes.
         const side_headroom = exit_instr != std.math.maxInt(u32) and
             exit_instr < t.instrs.len and
             isSideExitGuardOp(t.instrs[exit_instr].op) and
@@ -10680,6 +10666,26 @@ pub const TraceState = struct {
                     t.native = .{ .compiled = ct };
                     return &t.native.compiled;
                 }
+                if (comptime jitdbg.enabled) if (self.config.debug_log) {
+                    diag: {
+                        const kinds = self.gpa.alloc(nativegen.Kind, t.instrs.len) catch break :diag;
+                        defer self.gpa.free(kinds);
+                        const slots = self.gpa.alloc(i32, t.instrs.len) catch break :diag;
+                        defer self.gpa.free(slots);
+                        const proved = nativegen.proveKinds(self.gpa, t, kinds, slots);
+                        if (proved) {
+                            if (nativegen.analyze(self.gpa, t, kinds, slots)) |alloc_value| {
+                                var alloc = alloc_value;
+                                defer alloc.deinit(self.gpa);
+                                self.dbg("native unsupported after analyze: trace={d} anchor={d} spill_count={d}", .{ t.id, t.anchor.pc, alloc.spill_count });
+                            } else {
+                                self.dbg("native unsupported in analyze: trace={d} anchor={d}", .{ t.id, t.anchor.pc });
+                            }
+                        } else {
+                            self.dbg("native unsupported in proveKinds: trace={d} anchor={d}", .{ t.id, t.anchor.pc });
+                        }
+                    }
+                };
                 t.native = .unsupported;
                 return null;
             },
@@ -10821,6 +10827,20 @@ pub const TraceState = struct {
         return true;
     }
 
+    /// Close an in-flight recording when dispatch reaches its anchor again through
+    /// any control-flow edge. `onBackEdge` handles the common backward edge, but a
+    /// nested loop may leave its anchor and later re-enter it through forward flow
+    /// after an enclosing back-edge. Waiting for another matching back-edge then
+    /// records multiple logical iterations, over-specialising every intervening
+    /// branch and heap relation. Called before the dispatch mirror, so the anchor
+    /// instruction belongs to the next iteration, not the one being committed.
+    pub fn maybeCloseAtAnchor(self: *TraceState, proto: *const Proto, cur_pc: u32, regs: RegWindow) void {
+        if (!self.rec.active or self.rec.instrs.items.len == 0) return;
+        if (self.rec.anchor.proto == proto and self.rec.anchor.pc == cur_pc) {
+            self.closeTrace(regs);
+        }
+    }
+
     /// Called by the interpreter whenever a back-edge fires (a backward/self jump
     /// to `target_pc`). Drives the trace lifecycle:
     ///  * **recording, this anchor** → the iteration closed cleanly: commit.
@@ -10952,7 +10972,12 @@ pub const TraceState = struct {
     /// is treated like an abort (discard + gate-with-backoff) so we never thrash.
     fn closeTrace(self: *TraceState, regs: RegWindow) void {
         _ = regs; // reserved: a richer exit snapshot will read live values here.
-        self.commit() catch {
+        self.commit() catch |err| {
+            self.dbg("commit failed: anchor pc={d} error={s} ir_len={d}", .{
+                self.rec.anchor.pc,
+                @errorName(err),
+                self.rec.instrs.items.len,
+            });
             self.gateAnchor(self.rec.anchor);
         };
         self.rec.active = false;
@@ -11023,7 +11048,7 @@ pub const TraceState = struct {
         // This is exactly where inline (non-deferred) `astore`s sit — the body — so
         // the φ block stays contiguous before `.loop`. Gap B (doc 07) was the single
         // store; Gap C (doc 08) generalizes to an ordered set.
-        for (self.rec.pending_stores[0..self.rec.pending_store_count]) |ps| {
+        for (self.rec.pending_stores.items) |ps| {
             // `ps.op` is `.astore` for a packed-array RMW or `.hstore` for a
             // hash-field RMW (doc 11); both flush below every guard, in recorded
             // order, just before `.loop`. `lane_ord` is the array `Lane` ordinal
@@ -11729,6 +11754,18 @@ pub const TraceState = struct {
         var rc = try self.refOf(instr.c);
         try self.guardNum(rb, vb, .operand_type, .b);
         try self.guardNum(rc, vc, .operand_type, .c);
+        // Native exact mixed int/float comparison cannot round the int through f64
+        // (`compareIntFloat` deliberately does not). When the observed float is
+        // integral, narrow only that operand and compare two ints. A later
+        // fractional float exits at `int_of_float` before any sunk store executes,
+        // and tier-0 replays with the full exact mixed-number semantics.
+        if (vb.isInt() and vc.isFloat() and value.floatAsExactInt(vc.asFloat()) != null) {
+            rc = try self.emit(.{ .op = .int_of_float, .a = rc, .ty = .int });
+            self.stampProv(rc, .operand_int, .c, .neutral);
+        } else if (vb.isFloat() and vc.isInt() and value.floatAsExactInt(vb.asFloat()) != null) {
+            rb = try self.emit(.{ .op = .int_of_float, .a = rb, .ty = .int });
+            self.stampProv(rb, .operand_int, .b, .neutral);
+        }
         if (swap) {
             const t = rb;
             rb = rc;
@@ -11758,12 +11795,6 @@ pub const TraceState = struct {
     ///     `.nyi_opcode` (different guard/native path needed);
     ///   * element table has a metatable → `.has_metatable`.
     fn recArrayGet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
-        // Deferred (sunk) stores must be the LAST array accesses in the trace: an
-        // `aload` after any of them would read the pre-store value on-trace while
-        // tier-0's deopt-replay (store-then-read) reads the post-store value —
-        // divergence. Abort, exactly as the old C1 rule did (no regression). See
-        // `docs/design/08-multi-store-sinking.md` §mechanism (and doc 07 §3.2).
-        if (self.rec.pending_store_count > 0) return self.abort(.bad_type);
         const vtab = regs.get(instr.b);
         const vkey = regs.get(instr.c);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
@@ -11792,6 +11823,7 @@ pub const TraceState = struct {
             self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .b, .neutral);
             self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .b, .neutral);
             const rkey = try self.keyRefNarrowed(instr.c, .c, vkey);
+            if (try self.forwardPendingArrayLoad(instr.a, rtab, rkey, idx)) return;
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
             self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
             // No guard_present: the `.value` lane has no presence bitmap — nil is
@@ -11815,11 +11847,87 @@ pub const TraceState = struct {
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .b, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .b, .neutral);
         const rkey = try self.keyRefNarrowed(instr.c, .c, vkey);
+        if (try self.forwardPendingArrayLoad(instr.a, rtab, rkey, idx)) return;
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_present, .a = ref }), .present, .none, .neutral);
         const rload = try self.emit(.{ .op = .aload, .a = ref, .aux = lane_ord, .ty = obsTypeOf(loaded) });
         self.setReg(instr.a, rload);
+    }
+
+    /// Resolve an array load against the recorder's deferred-store buffer using
+    /// LuaJIT's `aa_ahref` rule: forward only on a statically must-alias key, skip
+    /// only on a statically no-alias key, and abort on ambiguity. In particular we
+    /// never guard the record-time equality of two loop-varying keys — that pins an
+    /// incidental per-iteration relation and makes a valid trace a turnstile.
+    /// Walking newest-to-oldest preserves last-writer-wins.
+    fn forwardPendingArrayLoad(self: *TraceState, dst: u16, rtab: Ref, rkey: Ref, idx: i64) !bool {
+        _ = idx; // observed values never decide aliasing
+        var n = self.rec.pending_stores.items.len;
+        while (n > 0) {
+            n -= 1;
+            const ps = self.rec.pending_stores.items[n];
+            if (ps.op != .astore) continue; // a present hash overwrite cannot change an array slot
+            const addr = self.rec.instrs.items[ps.aref];
+            std.debug.assert(addr.op == .aref);
+            if (addr.a != rtab) {
+                self.abort(.bad_type);
+                return true;
+            }
+            switch (self.classifyArrayKeyAlias(rkey, addr.b)) {
+                .must => {
+                    self.setReg(dst, ps.value);
+                    return true;
+                },
+                .no => continue,
+                .may => {
+                    self.abort(.bad_type);
+                    return true;
+                },
+            }
+        }
+        return false;
+    }
+
+    fn classifyArrayKeyAlias(self: *const TraceState, lhs: Ref, rhs: Ref) AliasClass {
+        if (lhs == rhs) return .must;
+        const lc = self.intKonstRef(lhs);
+        const rc = self.intKonstRef(rhs);
+        if (lc != null and rc != null) return if (lc.? == rc.?) .must else .no;
+        const la = self.affineIntKey(lhs, 0) orelse return .may;
+        const ra = self.affineIntKey(rhs, 0) orelse return .may;
+        if (la.base != ra.base) return .may;
+        return if (la.offset == ra.offset) .must else .no;
+    }
+
+    fn intKonstRef(self: *const TraceState, ref: Ref) ?i64 {
+        if (ref >= self.rec.instrs.items.len) return null;
+        const ins = self.rec.instrs.items[ref];
+        if (ins.op != .konst or ins.aux < 0) return null;
+        const ci: usize = @intCast(ins.aux);
+        if (ci >= self.rec.consts.items.len) return null;
+        const v = self.rec.consts.items[ci];
+        return if (v.isInt()) v.asInt() else null;
+    }
+
+    /// Canonicalise integer `base + constant` chains. Distinct offsets from the
+    /// same SSA base cannot alias; unrelated bases remain MAY. The recursion is
+    /// bounded defensively even though SSA operands point backward.
+    fn affineIntKey(self: *const TraceState, ref: Ref, depth: u8) ?AffineIntKey {
+        if (depth == 16 or ref >= self.rec.instrs.items.len) return null;
+        const ins = self.rec.instrs.items[ref];
+        if (ins.op != .add or ins.ty != .int) return .{ .base = ref, .offset = 0 };
+        if (self.intKonstRef(ins.a)) |c| {
+            var key = self.affineIntKey(ins.b, depth + 1) orelse return null;
+            key.offset +%= c;
+            return key;
+        }
+        if (self.intKonstRef(ins.b)) |c| {
+            var key = self.affineIntKey(ins.a, depth + 1) orelse return null;
+            key.offset +%= c;
+            return key;
+        }
+        return .{ .base = ref, .offset = 0 };
     }
 
     /// Record `t[k]=v` (`set_index`, `a=table b=key c=value`) as a lane-aware
@@ -11855,7 +11963,7 @@ pub const TraceState = struct {
         // stores are already deferred is NOT blanket-aborted here. An in-bounds RMW
         // store appends to `pending_stores` (the in-bounds path below); an *append*
         // store (which changes `len`) must still abort — handled in the append branch.
-        // The `pending_store_count` checks live at those two sites, not at the top,
+        // The pending-store checks live at those two sites, not at the top,
         // because we cannot tell append-vs-in-bounds until we know `idx`/`len` below.
         // See `docs/design/08-multi-store-sinking.md`.
         const vtab = regs.get(instr.a);
@@ -11931,15 +12039,12 @@ pub const TraceState = struct {
         // + guards inline here, but stash the `astore` node and flush it at trace
         // close (`commit`) below every guard — incl. the `for_loop` continuation
         // guard — so every side-exit leaves the store un-executed and replay stores
-        // exactly once. Gap C sinks up to `MAX_PENDING_STORES` such stores (the FFT
-        // butterfly writes four), flushed in recorded order; a trace wanting more
-        // aborts cleanly here. The post-store invariant (no later `aload`/append, in
-        // `recArrayGet` and the append branch) keeps the sunk stores the trace's last
-        // array accesses. A pure-write store (no prior `aload`) is deopt-idempotent on
-        // its own and emits inline as before. See `docs/design/08-multi-store-sinking.md`.
+        // exactly once. The virtual store buffer grows only within `maxrecord`, and
+        // flushes in recorded order. A later array load either forwards from it or
+        // proves non-aliasing with fail-closed guards; append remains unsupported
+        // because it changes shape. A pure-write store (no prior `aload`) is
+        // deopt-idempotent and emits inline as before.
         const defer_store = self.traceHasHeapLoad();
-        if (defer_store and self.rec.pending_store_count >= MAX_PENDING_STORES)
-            return self.abort(.bad_type);
         const rval = try self.refOf(instr.c);
 
         const lane_ord: i32 = @intFromEnum(lane);
@@ -11969,10 +12074,12 @@ pub const TraceState = struct {
             // Read-modify-write: stash the store; `commit()` flushes it (and any
             // siblings) below every guard, just before `.loop`, in this recorded
             // order. The guards above (table/lane/int/bounds/fits) stay inline and
-            // continue to dominate the sunk store. The cap was checked above.
-            self.rec.pending_stores[self.rec.pending_store_count] =
-                .{ .aref = ref, .value = rval, .lane_ord = lane_ord };
-            self.rec.pending_store_count += 1;
+            // continue to dominate the sunk store.
+            try self.rec.pending_stores.append(self.gpa, .{
+                .aref = ref,
+                .value = rval,
+                .lane_ord = lane_ord,
+            });
         } else {
             _ = try self.emit(.{ .op = .astore, .a = ref, .b = rval, .aux = lane_ord });
         }
@@ -11988,7 +12095,7 @@ pub const TraceState = struct {
     /// tier-0.
     fn recGridGet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
         // Like recArrayGet: a grid load after a sunk store would read stale on-trace.
-        if (self.rec.pending_store_count > 0) return self.abort(.bad_type);
+        if (self.rec.pending_stores.items.len > 0) return self.abort(.bad_type);
         const col_reg: u16 = @intCast(instr.aux);
         const vtab = regs.get(instr.b);
         const vrow = regs.get(instr.c);
@@ -12183,7 +12290,7 @@ pub const TraceState = struct {
         // Same post-store invariant as `recArrayGet`: a deferred store must be the
         // trace's last heap access (doc 08 §mechanism). A hash load after one would
         // diverge on deopt-replay. Array and hash loads/stores share the pool.
-        if (self.rec.pending_store_count > 0) return self.abort(.bad_type);
+        if (self.rec.pending_stores.items.len > 0) return self.abort(.bad_type);
         const vtab = regs.get(instr.b);
         const vkey = regs.get(instr.c);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
@@ -12246,7 +12353,7 @@ pub const TraceState = struct {
     ///   * `tbl.metatable != null` → `.has_metatable` (`__newindex` territory);
     ///   * key absent at record time → `.bad_type` (insert — out of v1 scope);
     ///   * computed (non-`konst`) key → `.bad_type`;
-    ///   * deferred-store cap (`MAX_PENDING_STORES`) exceeded → `.bad_type`.
+    ///   * recorder allocation failure → `.alloc` (ordinary recording abort).
     fn recHashSet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
         const vtab = regs.get(instr.a);
         const vkey = regs.get(instr.b);
@@ -12269,8 +12376,6 @@ pub const TraceState = struct {
         // read is a read-modify-write that must be deferred below every guard so a
         // side-exit leaves it un-executed and deopt-replay applies it exactly once.
         const defer_store = self.traceHasHeapLoad();
-        if (defer_store and self.rec.pending_store_count >= MAX_PENDING_STORES)
-            return self.abort(.bad_type);
         const rval = try self.refOf(instr.c);
         // Pin the **store value's** type (int/float). A hash cell holds a full tagged
         // `Value` with no lane to constrain it, so this guard is the analogue of the
@@ -12299,9 +12404,12 @@ pub const TraceState = struct {
         // (population) stays sufficient. The store value's type is pinned by the
         // `guardNum` above (native declines a heap value at H1).
         if (defer_store) {
-            self.rec.pending_stores[self.rec.pending_store_count] =
-                .{ .aref = ref, .value = rval, .lane_ord = 0, .op = .hstore };
-            self.rec.pending_store_count += 1;
+            try self.rec.pending_stores.append(self.gpa, .{
+                .aref = ref,
+                .value = rval,
+                .lane_ord = 0,
+                .op = .hstore,
+            });
         } else {
             _ = try self.emit(.{ .op = .hstore, .a = ref, .b = rval });
         }
@@ -12902,14 +13010,15 @@ fn konstKey(v: Value) KonstKey {
 /// close. `aref`/`value` are IR refs already emitted inline (the address node and
 /// the value to store); `lane_ord` is the packed-array `Lane` ordinal (the
 /// `astore`'s `aux`). See `Recorder.pending_stores`.
-const PendingStore = struct { aref: Ref, value: Ref, lane_ord: i32, op: IrOp = .astore };
+const PendingStore = struct {
+    aref: Ref,
+    value: Ref,
+    lane_ord: i32,
+    op: IrOp = .astore,
+};
 
-/// Maximum number of read-modify-write stores a single trace may sink (Gap C,
-/// `docs/design/08-multi-store-sinking.md`). Caps the simultaneously-live value
-/// registers the store-sinking holds from computation to the trace-close flush —
-/// bounding native XMM/GP pressure. 4 covers the FFT butterfly (`v[i],v[i+1]` and
-/// `v[j],v[j+1]` per iteration) exactly; a trace that wants more aborts cleanly.
-pub const MAX_PENDING_STORES = 4;
+const AliasClass = enum { must, no, may };
+const AffineIntKey = struct { base: Ref, offset: i64 };
 
 /// Maximum nesting of inlined Lua calls a single trace may carry (cross-frame
 /// tracing). Bounds the recorder's grown `reg_map` window and the depth of leaf
@@ -13100,14 +13209,12 @@ pub const Recorder = struct {
     /// stores alias. See `docs/design/08-multi-store-sinking.md` (Gap C); doc 07 is
     /// the single-store original (Gap B).
     ///
-    /// While `pending_store_count > 0`, any further *read* (`aload`) or *append*
-    /// (`astore_append`) aborts the trace — the sunk stores must be the trace's last
-    /// array accesses (no store-then-read divergence; append changes `len`). A further
-    /// in-bounds RMW `astore` instead *appends* here, up to `MAX_PENDING_STORES`;
-    /// exceeding the cap aborts. `count == 0` ⇒ no deferred store (the common case:
-    /// pure-write loops emit inline as before).
-    pending_stores: [MAX_PENDING_STORES]PendingStore = undefined,
-    pending_store_count: usize = 0,
+    /// A later array read consults this virtual store buffer newest-to-oldest:
+    /// must-alias loads forward the pending value, proven-non-alias loads read the
+    /// heap behind guards, and ambiguous table identity aborts fail-closed. Appends
+    /// still abort because they mutate array shape. The list is naturally bounded
+    /// by `maxrecord`; native register pressure spills or rejects the completed trace.
+    pending_stores: std.ArrayListUnmanaged(PendingStore) = .empty,
 
     // --- cross-frame tracing (inlined Lua calls) ---------------------------
     /// The anchor (outermost) frame's register count. The grown `reg_map` may be
@@ -13153,6 +13260,7 @@ pub const Recorder = struct {
     next_input_slot: u16 = 0,
 
     pub fn deinit(self: *Recorder, gpa: std.mem.Allocator) void {
+        self.pending_stores.deinit(gpa);
         self.input_seeds.deinit(gpa);
         self.input_dedup.deinit(gpa);
         self.hash_cell_dedup.deinit(gpa);
@@ -13181,6 +13289,7 @@ pub const Recorder = struct {
         self.input_seeds.clearRetainingCapacity();
         self.input_dedup.clearRetainingCapacity();
         self.hash_cell_dedup.clearRetainingCapacity();
+        self.pending_stores.clearRetainingCapacity();
         // Size the register map for the anchor frame **plus** reserved windows for
         // inlined callee frames (cross-frame tracing). The executor only ever
         // touches `[0, anchor_num_registers)`; the tail is scratch the recorder
@@ -13198,7 +13307,6 @@ pub const Recorder = struct {
         self.pending_link_provenance = null;
         self.kind = .root;
         self.side_src = null;
-        self.pending_store_count = 0;
         self.anchor_num_registers = num_registers;
         self.base_off = 0;
         self.inline_depth = 0;

@@ -94,6 +94,61 @@ test "integral-float array keys narrow on-trace; fractional keys side-exit to ha
     , "7272\n");
 }
 
+test "bit-reversal store/load regions record, compile, and execute natively" {
+    const Inspect = struct {
+        fn run(vm: *Vm, mode: TraceMode) !void {
+            if (mode != .record_execute_native) return;
+            var saw_compiled = false;
+            var traced: u64 = 0;
+            var interpreted: u64 = 0;
+            for (vm.trace.cache.items) |t| {
+                if (!std.mem.eql(u8, t.anchor.proto.name, "bitreverse")) continue;
+                switch (t.native) {
+                    .compiled => {
+                        saw_compiled = true;
+                    },
+                    else => {},
+                }
+            }
+            var it = vm.trace.coverage.iterator();
+            while (it.next()) |entry| {
+                if (!std.mem.eql(u8, entry.key_ptr.proto.name, "bitreverse")) continue;
+                traced +|= entry.value_ptr.traced;
+                interpreted +|= entry.value_ptr.interp;
+            }
+            // In native mode unsupported traces are declined rather than run by
+            // tier-1a. Therefore compiled bitreverse nodes + bitreverse-attributed
+            // traced iterations prove that this function actually entered native.
+            try testing.expect(saw_compiled);
+            try testing.expect(traced > 0);
+            try testing.expect(interpreted > 0); // warmup/deopt remains tier-0
+        }
+    };
+
+    // The recorder may begin at the short inner while and cross the outer body:
+    // float-derived indices, four sunk stores, then another swap's loads/stores.
+    // This pins the general virtual-store forwarding + alias guards, mixed numeric
+    // compare narrowing, and write-only heap temporary boxing as one e2e shape.
+    try expectProgramTuned(
+        \\local v = {}
+        \\local n = 32
+        \\for i = 1, 2 * n do v[i] = i end
+        \\local function bitreverse()
+        \\  local j = 0
+        \\  for i = 0, 2 * n - 4, 2 do
+        \\    if i < j then
+        \\      v[i+1], v[i+2], v[j+1], v[j+2] = v[j+1], v[j+2], v[i+1], v[i+2]
+        \\    end
+        \\    local k = n
+        \\    while k <= j do j = j - k; k = k / 2 end
+        \\    j = j + k
+        \\  end
+        \\end
+        \\for rep = 1, 100 do bitreverse() end
+        \\print(v[1], v[2 * n])
+    , "1\t64\n", .{ .hotguard = 3, .coverage = true, .inspect = Inspect.run });
+}
+
 test "array-of-structs: single-field read accumulation across element tables" {
     // A loop that reads one scalar field from each element table in an array,
     // accumulating the values. Exercises the aload(.value, ty=.heap) →

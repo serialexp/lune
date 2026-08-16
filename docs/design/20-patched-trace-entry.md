@@ -108,19 +108,57 @@ as they land; move bullets to Done once everything inside them is checked.
       pre/post A/B (fft/lu jit + tier-0, pi_leibniz; 3 rounds min-of-5) all
       within noise. The Phase-2 prediction that `.jloop` was "the remaining
       fft lever" is **REFUTED**: `fft_bitreverse:9`/`:55` (13.4% + 19.8% of
-      the fft run) run **0% traced** pre AND post — `:9` never records a
-      trace at all, `:55` recorded once, aborted `bad_type` at a `get_index`
-      (the float-valued `j`/`k` swap indices from `k = k / 2`), and never
-      re-enters; zero `.jloop` installs occur on fft. Patched entry removes
+      the fft run) run **0% traced** pre AND post. **Grounding correction
+      (2026-08-16):** `:9` did commit a trace; native `proveKinds` rejected its
+      exact mixed int/float comparison, the native-only execution gate backed the
+      anchor off, and `--dump-aborts` was silent because it reports recorder aborts,
+      not native-unsupported gating. The `:55` recording crossed the outer swap and
+      aborted at the next `get_index` because the recorder still prohibited an array
+      load after deferred stores—not because its float-valued `j` key failed to
+      narrow (`guard_float + int_of_float` was already present). Doc 08's
+      2026-08-16 virtual-store-forwarding extension and exact mixed-compare narrowing
+      close those general gaps; write-only table temporaries are now boxable by native
+      lowering as `TAG_HEAP`. Zero `.jloop` installs in the Phase-3 measurement remains
+      correct. Patched entry removes
       the discovery cascade for loops that already have qualified traces —
       it cannot help loops with no viable trace. The actual next fft lever
-      is making bitreverse *traceable* (the `bad_type get_index` abort and
-      the `:9` non-recording), a recorder/typing problem, not an entry
-      problem. A/B methodology note: a first "A/B" was invalidated because
+      was making bitreverse *traceable*, a recorder/typing problem rather than an
+      entry problem. A/B methodology note: a first "A/B" was invalidated because
       the shadow tree's copied `.zig-cache` produced a post-source binary
       (its consistent "+2% fft" was two-builds-of-identical-source layout
       noise — a useful noise-floor datum); always `rm -rf .zig-cache
       zig-out` in a `cp -r` shadow tree before building.
+
+      **Follow-up — traces that never ran (2026-08-16).** `--dump-traces` mapped
+      `:9` exits 60/65/70/75 to successive recorded `while k <= j` trip-shape
+      guards (with exit 12 the independent `i < j` direction); `:55` exit 5 is
+      the inner-while continuation guard. The integral-float guards were passing.
+      The lifecycle pooled zero-progress exits into the anchor penalty and gated
+      before the variable trip shapes became useful side paths. An experiment that
+      exempted guard exits, routed barren branch exits through generic side replay,
+      and raised the tree/walk bounds from 4/8 to 32 made bitreverse execute traces,
+      but was rejected on whole-board economics: runtime-mediated sibling entry is
+      not LuaJIT's patched native exit branch. On `nsieve 9` it changed 825 entries /
+      780 ledger walks into 322,633 / 322,574; on `sieve_int 1000000`, 249 / 203 into
+      41,607 / 41,558; on fft, 1,015,050 entries and 8,469 native link exits became
+      1,997,154 and 80,435. A separate consume-after-sibling-exhaustion path stranded
+      3,840,014 reused-table initialization iterations in tier 0.
+
+      Side traces were also experimentally linked back to their root on CFG-cycle
+      closure; finite retirement exposed an incoherent-state `TypeError` in the
+      low-yield branch regression, so that link synthesis was rejected while the
+      general CFG-cycle close itself remains.
+
+      The accepted change therefore keeps the enabling recorder work (static
+      virtual-store aliasing, exact mixed-number narrowing, heap-valued write-only
+      phis, and CFG-cycle closure) but retains finite Option-A legacy gating, the
+      4-node population bound, the 8-node trial walk, and source-branch routing.
+      Final diagnostic counts return to the old economic regime: nsieve 825 entries /
+      780 walks, sieve_int 249 / 203, and fft 1,015,077 entries / 8,469 link exits.
+      Bitreverse records and compiles, but sustained coverage is deliberately
+      deferred until exit-branch stitching can transfer directly native-to-native.
+      `barren-noactive` still means no structural region owned the receipt; it is not
+      sufficient reason to make runtime re-entry unbounded.
 
 - [x] **§P.0 board confirmation** — superseded: the Phase-0a-only board
       can no longer be isolated post-flip; the pre/post-flip A/B carries

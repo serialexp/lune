@@ -1,9 +1,9 @@
 # lune — multi-store sinking (FFT butterfly) — Design
 
-Status: implemented (2026-06-22) — recorder generalized to a bounded ordered store
-set, flushed front-to-back below every guard at trace close; gate green (8-mode
-determinism inherited), scimark-fft moved off 0 % native (t0 993.9 ms → jit 715.7 ms,
-1.39× tier-0 speedup; `cross=ok`). The mandatory constraint both reviewers converged
+Status: implemented (2026-06-22), extended 2026-08-16 — recorder generalized to an
+ordered virtual store buffer, flushed front-to-back below every guard at trace close;
+post-store array loads now forward or prove non-aliasing statically; the mode-equivalence
+gate is green. The mandatory constraint both reviewers converged
 on — `commit()` flushes the pending stores **front-to-back in bytecode-execution
 order** (§mechanism, §7.2) — is implemented and Codex's three doc-accuracy tightenings
 are folded in below (recorded order = tier-0 bytecode order; the side-exit invariant
@@ -12,14 +12,46 @@ are sound only because in-bounds `astore` cannot change what they guard). Gap B
 (doc 07, single-store) is the landed prerequisite. Implementation review (Codex +
 Antigravity) pending before Bart's commit approval.
 Owner: Bart
-Last updated: 2026-06-22
+Last updated: 2026-08-16
 
 Prerequisite reading: `07-rmw-store-sinking.md` (Gap B — single-store sinking, the
 mechanism this generalizes) and `01-trace-lifecycle.md` §"Loop-header re-entry
 deopt" (the deopt model the soundness argument rests on). This doc extends Gap B's
-single deferred `astore` to a **bounded, ordered set** of deferred stores, so loops
+single deferred `astore` to an **ordered set** of deferred stores, so loops
 that write several array slots per iteration — the FFT butterfly — record and run
 native.
+
+## 2026-08-16 extension — guarded virtual-store forwarding
+
+The original implementation deliberately rejected every array load after the first
+deferred store and capped the fixed buffer at four entries. `fft_bitreverse` exposed
+that as a general trace-region boundary: a recording anchored at its inner `while`
+crosses the outer swap, defers four stores, then reaches the next swap's reads. The
+reported `bad_type get_index` was this post-store-load rejection, **not** failure of
+integral-float key narrowing. `keyRefNarrowed` had already emitted
+`guard_float + int_of_float` for the arithmetic-derived `j` key.
+
+The recorder now models an ordered virtual store buffer, following LuaJIT's general
+`aa_ahref` / `fwd_ahload` technique (`lj_opt_mem.c`):
+
+- `pending_stores` is allocator-backed and naturally bounded by the trace's
+  `maxrecord` budget rather than an FFT-sized constant.
+- A later load scans pending array stores newest-to-oldest. The key IR is classified
+  `MUST`/`NO`/`MAY`: identical refs and the same integer base plus equal constant
+  offsets must-alias; distinct integer constants or the same base plus distinct
+  offsets cannot alias. `MUST` forwards, `NO` continues scanning, and `MAY` aborts
+  recording fail-closed. No runtime equality guard pins an incidental relation
+  between loop-varying keys. Last-writer-wins therefore stays exact.
+- Distinct table SSA refs remain ambiguous—two refs may hold the same table at
+  runtime—so that case aborts recording fail-closed. Hash/grid reads and appends retain
+  their conservative boundaries; appends change array shape.
+- If an `int_of_float` key ceases to be integral, native exits before mutation and
+  tier-0 replays the source operation with its normal array/hash and metamethod
+  semantics. Store flush order is unchanged.
+
+This section supersedes the fixed-cap and “no post-store read” scope statements in
+the original June design below; those passages are retained as the historical v1
+argument.
 
 ## Implementation status
 
@@ -29,16 +61,15 @@ checked.
 
 ### Done
 
-- [x] **C1 — recorder: `pending_store` → bounded `pending_stores` list (`trace.zig`).**
-  Replaced the single optional with `pending_stores: [MAX_PENDING_STORES]PendingStore`
-  + `pending_store_count`; `recArraySet` appends each deferred store; `commit()` flushes
+- [x] **C1 — recorder: `pending_store` → ordered `pending_stores` list (`trace.zig`).**
+  Replaced the single optional, then the v1 fixed array, with an allocator-backed list;
+  `recArraySet` appends each deferred store; `commit()` flushes
   all front-to-back (recorded bytecode order) below every guard, before the φ writebacks
   + `.loop`.
-- [x] **C2 — recorder: post-store read guard + capacity cap (`trace.zig`).** Any
-  `aload`/`astore_append` after the first deferred store still aborts (no read after
-  any store — the §3.2 invariant, unchanged; `recArrayGet` checks
-  `pending_store_count > 0`). A second/third *store* now defers instead of aborting, up
-  to `MAX_PENDING_STORES = 4`; exceeding the cap aborts `.bad_type` cleanly.
+- [x] **C2 — recorder: post-store load forwarding (`trace.zig`).** Array loads now
+  forward a statically must-alias pending value or skip a statically non-aliasing
+  key before reading the heap. Ambiguous keys/table identity and shape-changing appends abort
+  fail-closed. The trace budget replaces the v1 fixed capacity cap.
 - [x] **C3 — consumers handle N sunk stores (`tropt`/`irinterp`/`nativegen`).** Confirmed
   no change needed: `tropt` already classifies every `astore` as an effectful,
   never-DCE'd root with no single-store invariant; `irinterp` runs IR positionally;
@@ -46,8 +77,9 @@ checked.
   result doubles live to the flush (the 2-store nativegen unit + fft `cross=ok` confirm
   no miscompile under pressure).
 - [x] **C4 — tests.** Recorder units: a 2-store butterfly records with both stores sunk
-  (distinct arefs, no `astore` in-stream pre-commit); a store-then-read still aborts;
-  >cap aborts. Nativegen unit: a 2-store f64 RMW to two distinct indices matches the
+  (distinct arefs, no `astore` in-stream pre-commit); must-alias reads forward,
+  statically distinct keys read the heap, and ambiguous keys abort. The buffer grows
+  past the historical four-store cap. Nativegen unit: a 2-store f64 RMW to two distinct indices matches the
   oracle bit-for-bit. `interp.zig` 8-mode e2e: a two-store butterfly loop
   byte-identical across all 8 determinism modes (the load-bearing idempotence test).
 - [x] **C5 — measure + docs.** `just bench --filter scimark`: scimark-fft t0 993.9 ms →
@@ -55,9 +87,9 @@ checked.
   jit/lj 54.3× → 39.1×. Remaining LuaJIT gap is structural FFT *coverage* (bit-reversal
   + non-butterfly work still tier-0), not this mechanism. Docs updated: this doc,
   `05-native-codegen.md`, `07`'s §6, `TODO.md`.
-- [x] **Open question — `MAX_PENDING_STORES` value.** §7.1. Resolved: **4** (covers the
-  butterfly exactly; bounds XMM live-range pressure). No spilling observed for the
-  butterfly (fft `cross=ok`, real speedup).
+- [x] **Open question — `MAX_PENDING_STORES` value.** Superseded by the 2026-08-16
+  allocator-backed buffer; `maxrecord` bounds it and native allocation spills or
+  rejects a completed trace normally.
 - [x] **Open question — aliasing among the N stores.** §7.2. Resolved: `commit()` flushes
   front-to-back in recorded order and never reorders, so trace and tier-0 agree on
   last-writer-wins regardless of aliasing.
@@ -122,7 +154,7 @@ the end of the body and flushing them in source order yields byte-identical resu
 - Keep all 8 determinism modes byte-identical; keep the tier-1a oracle valid.
 - Land behind `zig build test` + 8-mode determinism, reviewed before commit.
 
-## Non-goals (v1)
+## Non-goals (historical v1; superseded where noted above)
 
 - **Store-then-read in the same trace.** Still aborts. Needs store→load forwarding
   (read the pending value, not the heap) — a larger change, unchanged from Gap B.
@@ -134,7 +166,7 @@ the end of the body and flushing them in source order yields byte-identical resu
   attempt to coalesce or eliminate stores to the same slot.
 - **`__newindex` / hash-part / `.value`-lane stores.** Unchanged — still abort.
 
-## The mechanism: defer an ordered set, flush all below the last guard
+## The original v1 mechanism: defer an ordered set, flush all below the last guard
 
 Gap B's insight (doc 07 §3) is unchanged and is what makes this a small change: an
 `astore` is **effectful but not value-producing** — nothing in the trace reads its

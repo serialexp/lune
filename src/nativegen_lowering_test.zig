@@ -83,6 +83,36 @@ test "nativegen(F3): float division is bit-exact vs the strict-FP oracle, incl. 
     try expectFloatDiv(0.0, 0.0); // nan — exact payload bits must match divsd's QNaN
 }
 
+test "nativegen: a write-only table temporary is boxed as a heap value" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const tb = try table.Table.create(gpa);
+    defer tb.destroy(gpa);
+
+    // slot 2 is not read at trace entry; the loop body assigns it from the
+    // guarded table in slot 1. This is the compiler-temporary shape produced when
+    // a recording crosses a while header. Native must flush TAG_HEAP, not reject
+    // the trace or mis-box the raw pointer as an integer.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_int, .a = 0 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .lt, .a = 0, .b = 2 },
+        .{ .op = .guard_true, .a = 3 },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_table, .a = 5 },
+        .{ .op = .konst, .aux = 1 },
+        .{ .op = .add, .a = 0, .b = 7 },
+        .{ .op = .phi, .b = 5, .aux = 2 },
+        .{ .op = .phi, .b = 8, .aux = 0 },
+        .{ .op = .loop },
+    };
+    var consts = [_]Value{ Value.int(1), Value.int(1) };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+    try expectMatch(&tr, &.{ Value.int(0), Value.heap(&tb.header), Value.nil() });
+}
+
 test "nativegen(F3): a float-accumulate loop dividing by a constant matches (carried divsd)" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     // while (i < limit) { acc = acc / 3.0; i += 1 }  — acc carried in an XMM home,

@@ -1995,6 +1995,12 @@ pub const Vm = struct {
         instr.* = i;
         a.* = i.a;
 
+        // A recording is one CFG cycle, not necessarily one syntactic back-edge.
+        // Close before mirroring when forward flow re-enters its anchor (nested
+        // loops can do this after an enclosing back-edge). The ordinary matching
+        // back-edge already closed in `onBackEdge`, making this a cheap no-op.
+        if (mode == .full and self.trace.isRecording())
+            self.trace.maybeCloseAtAnchor(proto, @intCast(cur), regs);
         // Nested-loop continuation (Phase 1): a continuation recording armed by a
         // hot inner loop-done exit begins at its (non-header) anchor pc, which
         // tier-0 reaches here — *before* the mirror below, so the anchor
@@ -2631,7 +2637,16 @@ pub const Vm = struct {
             .dead = &dead,
             .ndead = &ndead,
         };
-        const directive = self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
+        var directive = self.enterSelectedTrace(mode, ct, closure, proto, regs, base, pc, &wctx);
+        // A patched entry has no sibling walk. If its zero-progress exit made a
+        // side want hot, consume it at the coherent header now; otherwise the
+        // back-edge arm is one iteration late and records the old shape again.
+        if (directive == .next_candidate and self.trace.consumeSideTraceWantAtResume(proto, @intCast(pc))) {
+            directive = if (mode == .fast)
+                .{ .switch_mode_at = pc }
+            else
+                .{ .resume_tier0 = pc };
+        }
         // §R6-1/§R7-1 strict order: inspect the stable slot before the drain,
         // mark strike exhaustion, retire dead traces, drain the entire pending
         // set, then never touch `patch` again (the slot may have been reused).

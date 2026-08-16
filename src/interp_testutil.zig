@@ -68,6 +68,7 @@ pub fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Write
 /// (region discovery, window flushes) that does not survive `deinit`.
 pub const CapturedOpts = struct {
     hotguard: ?u32 = null,
+    coverage: bool = false,
     inspect: ?*const fn (*Vm, TraceMode) anyerror!void = null,
 };
 
@@ -99,6 +100,7 @@ pub fn runCapturedTuned(
     vm.trace.config.optimize = mode == .record_execute or mode == .record_execute_native;
     vm.trace.config.native_codegen = mode == .record_execute_native;
     vm.trace.config.hotloop = 4; // record short test loops
+    vm.trace.config.coverage = opts.coverage;
     if (opts.hotguard) |hg| vm.trace.config.hotguard = hg;
 
     var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);

@@ -27,7 +27,6 @@ const testing = std.testing;
 
 const AbortReason = trace.AbortReason;
 const IrOp = trace.IrOp;
-const MAX_PENDING_STORES = trace.MAX_PENDING_STORES;
 const ObsType = trace.ObsType;
 const Ref = trace.Ref;
 const TraceState = trace.TraceState;
@@ -145,6 +144,28 @@ test "recArraySet: an integral-FLOAT key narrows and stores through the narrowed
     try testing.expect(saw_iof != null);
     try testing.expectEqual(saw_iof.?, aref_key.?); // store keys on the narrowed ref
     try testing.expect(saw_astore);
+}
+
+test "recCompare narrows an observed integral float in a mixed numeric comparison" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "mixed_compare", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // r0 = r1 < r2, with the arithmetic-derived operand observed as 3.0.
+    // The comparison must consume the int_of_float result, not the float ref.
+    var regs = [_]Value{ Value.nil(), Value.int(2), Value.float(3.0) };
+    state.recordInstr(Instr.opABC(.lt, 0, 1, 2), winRO(&regs), &proto, 7, Value.nil());
+
+    try testing.expect(state.isRecording());
+    const ops = state.rec.instrs.items;
+    try testing.expectEqual(IrOp.guard_int, ops[2].op);
+    try testing.expectEqual(IrOp.guard_float, ops[3].op);
+    try testing.expectEqual(IrOp.int_of_float, ops[4].op);
+    try testing.expectEqual(IrOp.lt, ops[5].op);
+    try testing.expectEqual(@as(Ref, 0), ops[5].a);
+    try testing.expectEqual(@as(Ref, 4), ops[5].b);
 }
 
 test "guardSourcePc: source-opcode PC is exit PC − 1 (H-1b), pinned independently" {
@@ -544,16 +565,71 @@ test "recArraySet defers an RMW store (store-sinking) instead of aborting" {
     regs[0] = Value.boolean(true); // r0 = t[3], a boolean
     state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording());
-    try testing.expectEqual(@as(usize, 1), state.rec.pending_store_count);
-    try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.boolean)), state.rec.pending_stores[0].lane_ord);
+    try testing.expectEqual(@as(usize, 1), state.rec.pending_stores.items.len);
+    try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.boolean)), state.rec.pending_stores.items[0].lane_ord);
     // The store is deferred — NOT yet in the instruction stream (it lands at commit).
     for (state.rec.instrs.items) |ins| try testing.expect(ins.op != .astore);
 
-    // A subsequent packed read must abort: the sunk store has to be the LAST array
-    // access (else on-trace store-then-read would diverge from tier-0 replay).
+    // A subsequent must-alias read forwards the newest pending value. The trace
+    // remains live and no physical `aload` is emitted after the deferred store.
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
+    try testing.expect(state.isRecording());
+    try testing.expectEqual(state.rec.pending_stores.items[0].value, state.rec.reg_map[0].ref);
+}
+
+test "post-store array load proves constant non-aliasing without a runtime relation guard" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 16) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.boolean(true) };
+    state.recordInstr(.{ .op = .load_int, .a = 2, .aux = 3 }, winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0, Value.nil());
+    try testing.expectEqual(@as(usize, 1), state.rec.pending_stores.items.len);
+
+    regs[2] = Value.int(4);
+    state.recordInstr(.{ .op = .load_int, .a = 2, .aux = 4 }, winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
+    try testing.expect(state.isRecording());
+    var saw_relation = false;
+    var saw_aload = false;
+    for (state.rec.instrs.items) |ins| {
+        if (ins.op == .eq or ins.op == .ne) saw_relation = true;
+        if (ins.op == .aload) saw_aload = true;
+    }
+    try testing.expect(!saw_relation);
+    try testing.expect(saw_aload);
+}
+
+test "post-store array load aborts on ambiguous loop-varying key alias" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 16) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "ambiguous_alias", .num_registers = 5 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // r2 and r3 are unrelated loop inputs. Their observed 3 != 4 relation is not
+    // a proof that survives another iteration, so no runtime `ne` guard may pin it.
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.int(4), Value.boolean(true) };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 4), winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 3), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
+    for (state.rec.instrs.items) |ins| try testing.expect(ins.op != .eq and ins.op != .ne);
 }
 
 test "recArraySet sinks a read-steered const store (control channel) instead of aborting" {
@@ -582,13 +658,13 @@ test "recArraySet sinks a read-steered const store (control channel) instead of 
     state.recordInstr(Instr.opABC(.jmp_if_true, 0, 0, 0), winRO(&regs), &proto, 0, Value.nil());
     state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording());
-    try testing.expectEqual(@as(usize, 1), state.rec.pending_store_count);
+    try testing.expectEqual(@as(usize, 1), state.rec.pending_stores.items.len);
 }
 
 test "recArraySet sinks multiple RMW stores (Gap C: butterfly shape)" {
     // All reads precede all stores (the FFT butterfly shape): read t[3], read t[4],
     // then store t[3], store t[4]. Both stores are RMW (follow reads) → both defer
-    // and sink, so `pending_store_count == 2` and neither `astore` is in the stream
+    // and sink, so the pending list has 2 entries and neither `astore` is in the stream
     // yet (they flush at commit, in this recorded order). Under Gap B's single-store
     // rule the SECOND store aborted; Gap C records it. See `docs/design/08-...`.
     const gpa = testing.allocator;
@@ -620,17 +696,17 @@ test "recArraySet sinks multiple RMW stores (Gap C: butterfly shape)" {
     state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0, Value.nil());
     state.recordInstr(Instr.opABC(.set_index, 1, 3, 4), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording());
-    try testing.expectEqual(@as(usize, 2), state.rec.pending_store_count);
+    try testing.expectEqual(@as(usize, 2), state.rec.pending_stores.items.len);
     // Recorded order preserved: store #0 → key 3's aref, store #1 → key 4's aref.
-    try testing.expect(state.rec.pending_stores[0].aref != state.rec.pending_stores[1].aref);
+    try testing.expect(state.rec.pending_stores.items[0].aref != state.rec.pending_stores.items[1].aref);
     // Neither store is in the stream yet — they flush at commit.
     for (state.rec.instrs.items) |ins| try testing.expect(ins.op != .astore);
 }
 
-test "recArraySet aborts when sunk stores exceed MAX_PENDING_STORES" {
-    // One read arms deferral; then MAX_PENDING_STORES in-bounds RMW stores defer, and
-    // the next one exceeds the cap and aborts cleanly (no regression — it aborted
-    // under Gap B too, just one store sooner). Guards the bounded buffer.
+test "recArraySet virtual store buffer grows past the legacy four-store cap" {
+    // One read arms deferral; eight in-bounds stores then remain buffered. The
+    // recorder's `maxrecord` budget is the bound now, rather than an FFT-sized
+    // fixed array that rejected otherwise-valid store/load regions.
     const gpa = testing.allocator;
     const t = try table_mod.Table.create(gpa);
     defer t.destroy(gpa);
@@ -647,20 +723,14 @@ test "recArraySet aborts when sunk stores exceed MAX_PENDING_STORES" {
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(state.isRecording());
 
-    // MAX_PENDING_STORES deferred stores (distinct in-bounds keys 3..3+MAX-1) record.
+    const store_count = 8;
     var k: i64 = 3;
-    while (k < 3 + @as(i64, MAX_PENDING_STORES)) : (k += 1) {
+    while (k < 3 + store_count) : (k += 1) {
         regs[2] = Value.int(k);
         state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(state.isRecording());
     }
-    try testing.expectEqual(@as(usize, MAX_PENDING_STORES), state.rec.pending_store_count);
-
-    // One more store exceeds the cap → abort.
-    regs[2] = Value.int(3 + @as(i64, MAX_PENDING_STORES));
-    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0, Value.nil());
-    try testing.expect(!state.isRecording());
-    try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
+    try testing.expectEqual(@as(usize, store_count), state.rec.pending_stores.items.len);
 }
 
 // --- pure-builtin tracing (math.sqrt → guard_pure/fsqrt, doc 12) --------------

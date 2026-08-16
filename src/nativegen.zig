@@ -1997,16 +1997,16 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
         }
     }
 
-    // Every loop-carried writeback must reference a *boxable scalar* (int/bool/float)
-    // so the deopt flush knows its tag. [C2] A `.ptr` (raw table pointer) or `.aref`
-    // (addressing token) carried as a φ's back-edge update would be flushed as a
-    // bogus TAG_INT and corrupt the slot — reject both here, not just `.none`. This
-    // runs after Pass B so a φ's forward-referencing `b` has its kind assigned.
+    // Every loop-carried writeback must reference a boxable value. A raw table
+    // pointer is boxable as TAG_HEAP and is needed for compiler temporaries that
+    // are write-only at a while-loop header. An `.aref` is only an addressing
+    // token and must never escape into the VM register file. This runs after Pass B
+    // so a φ's forward-referencing `b` has its kind assigned.
     for (t.instrs) |p| {
         if (p.op != .phi) continue;
         if (p.b >= n) return false;
         const k = kinds[p.b];
-        if (k != .int and k != .bool and k != .float) return false;
+        if (k != .int and k != .bool and k != .float and k != .ptr) return false;
     }
     return true;
 }
@@ -2360,6 +2360,7 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
     // path's validity regardless of lane.
     for (slots.items) |*s| {
         if (s.kind != .ptr) continue;
+        if (s.class == .write_only) continue;
         const lr: u16 = @intCast(s.load_ref);
         // An aref on this slot REQUIRES a guard_lane (the recorder always emits both);
         // a malformed trace with array access but no lane would miscompile, so track it.
@@ -2378,6 +2379,7 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
     // lane (set above) here is malformed; bail rather than miscompile.
     for (slots.items) |*s| {
         if (s.kind != .ptr) continue;
+        if (s.class == .write_only) continue;
         const lr: u16 = @intCast(s.load_ref);
         var has_garow = false;
         var ge: i32 = -1;
@@ -3408,6 +3410,7 @@ fn flushSlot(a: *x64.Assembler, slot: i32, kind: Kind, payload: Place) !void {
     const tag: u8 = switch (kind) {
         .bool => TAG_BOOL,
         .float => TAG_FLOAT,
+        .ptr => TAG_HEAP,
         else => TAG_INT,
     };
     const poff: i32 = slot * 8;
