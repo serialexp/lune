@@ -1,6 +1,6 @@
 # CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
 
-## Status 2026-08-16 (LATEST-70) — **"Make fft_bitreverse traceable": recorder gaps CLOSED (codex, 3 rounds), coverage deliberately deferred to exit-branch stitching. UNCOMMITTED pending Bart's land/hold call (fft jit +3% ≈ noise floor).**
+## Status 2026-08-16 (LATEST-70) — **"Make fft_bitreverse traceable": recorder gaps CLOSED (codex, 3 rounds), coverage deliberately deferred to exit-branch stitching. LANDED `0e311f9` (Bart: commit as-is; fft jit +3% ≈ noise floor accepted).**
 
 - Codex thread `01a007bf-34be-7f13-9f89-601103c003d8`, three rounds under
   Claude verification. GROUNDING CORRECTIONS to LATEST-69's verdict: (a) the
