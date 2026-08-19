@@ -254,6 +254,225 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.prologue_fail] com
     try testing.expectEqual(@as(u64, 0), state.native_link_exits);
 }
 
+test "replayLedger M1 sub-case (d): fused [skip.deopt, ramp.seed_capacity_decline] resumes with NO strike" {
+    // Doc 22 §B.2 (B-iv.2, codex Q2): the same fused M1 shape as sub-case (c)
+    // above, but the ramp is a SEEDED page whose entry seeding DECLINED
+    // (capacity) after the armed jump — pre-commit, cum unchanged. The contract
+    // is "resume deterministic selection at the source's anchor" with NO
+    // receipt, strike, side-exit accounting, or chain source for the decline.
+    // The decisive difference from (c): its `onSideExit(ramp, 0)` puts one
+    // penalty on the shared anchor; a decline must leave the penalty map EMPTY.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity(); // stack-backed traces: never destroy()
+
+    // proto.code[1] is NOT a for_loop → skip's guard_true (exit_pc 2) is a
+    // source-branch guard.
+    const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.ret) }, .name = "t", .num_registers = 1 };
+
+    const skip_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .a = 0, .aux = 2 }, // source-branch guard, exit_pc 2
+        .{ .op = .loop },
+    };
+    const skip_slots = try gpa.alloc(usize, skip_instrs.len);
+    defer gpa.free(skip_slots);
+    @memset(skip_slots, 0);
+    var skip: Trace = .{
+        .id = 111,
+        .anchor = .{ .proto = &proto, .pc = 10 },
+        .instrs = @constCast(&skip_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = skip_slots, .gpa = gpa } },
+    };
+    const ramp_instrs = [_]IrInstr{
+        .{ .op = .link, .aux = 5 },
+    };
+    var ramp: Trace = .{
+        .id = 112,
+        .anchor = .{ .proto = &proto, .pc = 10 },
+        .instrs = @constCast(&ramp_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xBEEF } },
+    };
+    try state.cache.append(gpa, &skip);
+    try state.cache.append(gpa, &ramp);
+
+    try testing.expect(try state.armNativeLink(&skip, 0, &ramp, .ordinary_guard));
+
+    // skip committed 9 iterations, its armed guard fired, the ramp's SEEDED
+    // entry declined pre-commit (cum unchanged, exit == maxInt sentinel).
+    const entries = [_]irinterp.LedgerEntry{
+        .{ .cum = 9, .id = 111, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal },
+        .{ .cum = 9, .id = 112, .exit = std.math.maxInt(u32), .reason = .seed_capacity_decline, .kind = .seed_capacity_decline, .outcome = .normal },
+    };
+    var regs = [_]Value{Value.int(0)};
+    var tr_regs = TestRegs{ .regs = &regs };
+    const r = state.driveDispatcherLedger(&skip, &entries, &proto, tr_regs.view(), false);
+
+    // Terminal receipt: nothing chain-committed, resume at the skip's own header.
+    try testing.expectEqual(@as(usize, 0), r.completed);
+    try testing.expectEqual(@as(?u32, 10), r.resume_pc);
+    // The skip's OWN 9 committed iterations still account (accountLedgerRow):
+    // 9 >= min_useful(8) → useful entry, hit_count bumped.
+    try testing.expectEqual(@as(u64, 1), skip.hit_count);
+    // NO strike anywhere: the decline suppresses (c)'s `onSideExit(ramp, 0)`.
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 10 }));
+    try testing.expectEqual(@as(usize, 0), state.penalty.count());
+    // The fused M1 recognition fired exactly once; no `.link` marker replayed.
+    try testing.expectEqual(@as(u64, 1), state.native_source_link_fused);
+    try testing.expectEqual(@as(u64, 0), state.native_link_exits);
+}
+
+test "replayLedger dispatcher grammar: [I.loop_done_linked, C.seed_hash_decline] commits the loop-done, breaks the burst chargeless" {
+    // Doc 22 §B.2 (B-iv.2): the seeded continuation analog of the
+    // `[I.loop_done_linked, C.prologue_fail]` grammar above — the fused
+    // continuation's SEEDED entry declined (hash mismatch) pre-commit. The
+    // committed loop-done must survive (completed == 1, coherent at the
+    // continuation anchor) and the decline must charge NOTHING (the
+    // prologue-fail variant is also chargeless via break_burst; here the
+    // chargelessness is the decline arm's own contract).
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    // code[1] IS a for_loop: the inner's guard_true (exit_pc 2) is a loop-done guard.
+    const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
+
+    const inner_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .a = 0, .aux = 2 }, // loop-done guard, post-loop pc 2
+        .{ .op = .loop },
+    };
+    var inner: Trace = .{
+        .id = 211,
+        .anchor = .{ .proto = &proto, .pc = 5 },
+        .instrs = @constCast(&inner_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    const cont_instrs = [_]IrInstr{
+        .{ .op = .link, .aux = 5 },
+    };
+    var cont: Trace = .{
+        .id = 212,
+        .anchor = .{ .proto = &proto, .pc = 2 },
+        .instrs = @constCast(&cont_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    try state.cache.append(gpa, &inner);
+    try state.cache.append(gpa, &cont);
+
+    // One committed enclosing iteration (cum 0→1), then the fused continuation's
+    // seeded entry declined pre-commit (cum unchanged).
+    const entries = [_]irinterp.LedgerEntry{
+        .{ .cum = 1, .id = 211, .exit = 0, .reason = .normal, .kind = .loop_done_linked, .outcome = .normal },
+        .{ .cum = 1, .id = 212, .exit = std.math.maxInt(u32), .reason = .seed_hash_decline, .kind = .seed_hash_decline, .outcome = .normal },
+    };
+    var regs = [_]Value{Value.int(0)};
+    var tr_regs = TestRegs{ .regs = &regs };
+    const r = state.driveDispatcherLedger(&inner, &entries, &proto, tr_regs.view(), false);
+
+    // The loop-done committed; the decline must not erase that progress.
+    try testing.expectEqual(@as(usize, 1), r.completed);
+    try testing.expectEqual(@as(?u32, 2), r.resume_pc);
+    // Chargeless end to end: no strike on either anchor.
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 5 }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
+    try testing.expectEqual(@as(usize, 0), state.penalty.count());
+    // The fused `I.loopdone → C` edge still drained through the non-last arm.
+    try testing.expectEqual(@as(u64, 1), state.native_loopdone_link_fused);
+    // No `.link` marker in this grammar.
+    try testing.expectEqual(@as(u64, 0), state.native_link_exits);
+}
+
+test "replayLedger terminal seed-decline: [C.link_terminal, I.seed_hash_decline] resumes at the decliner's own anchor" {
+    // Doc 22 §B.2 (B-iv.2): a hop-0 fused span — C reached its `.link` terminal
+    // (fused into the inner root), and the SEEDED inner's entry declined
+    // pre-commit. The linked-inner decline arm resumes tier-0 at the decliner's
+    // OWN anchor (== the `.link` target the cursor carries; the arm
+    // release-asserts the two agree), zero progress, no strike on either anchor.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
+
+    // The seed continuation at pc 2: a bare `.link` terminal to the inner root
+    // at pc 7 (exit index 0 == instrs.len - 1, the link_terminal contract).
+    const cont_instrs = [_]IrInstr{
+        .{ .op = .link, .aux = 7 },
+    };
+    var cont: Trace = .{
+        .id = 311,
+        .anchor = .{ .proto = &proto, .pc = 2 },
+        .instrs = @constCast(&cont_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    // The inner root at pc 7: zero inputs, ends `.loop` (isInnerLoopRoot).
+    const inner_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .a = 0, .aux = 2 }, // loop-done guard, post-loop pc 2
+        .{ .op = .loop },
+    };
+    var inner: Trace = .{
+        .id = 312,
+        .anchor = .{ .proto = &proto, .pc = 7 },
+        .instrs = @constCast(&inner_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    try state.cache.append(gpa, &cont);
+    try state.cache.append(gpa, &inner);
+
+    // C's `.link` fused into I (cum 0), whose seeded entry then declined
+    // pre-commit (cum unchanged).
+    const entries = [_]irinterp.LedgerEntry{
+        .{ .cum = 0, .id = 311, .exit = 0, .reason = .normal, .kind = .link_terminal, .outcome = .normal },
+        .{ .cum = 0, .id = 312, .exit = std.math.maxInt(u32), .reason = .seed_hash_decline, .kind = .seed_hash_decline, .outcome = .normal },
+    };
+    var linked_completed: usize = 0;
+    var resume_pc: u32 = 999;
+    var hops: usize = 0;
+    const dir = state.replayLedger(
+        &entries,
+        &cont,
+        7,
+        &proto,
+        &linked_completed,
+        &resume_pc,
+        &hops,
+        8,
+        .dispatcher_root,
+        false,
+        null,
+    );
+
+    const result = switch (dir) {
+        .return_result => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    // Zero progress, coherent at the decliner's own anchor (the inner root).
+    try testing.expectEqual(@as(usize, 0), result.completed);
+    try testing.expectEqual(@as(u32, 7), result.resume_pc);
+    // Exactly one `.link` marker (the link_terminal arm's bump) and one fused
+    // C→I follow — the walk itself stays accounting-exact.
+    try testing.expectEqual(@as(u64, 1), state.native_link_exits);
+    try testing.expectEqual(@as(u64, 1), state.native_link_follow_count);
+    // The decline itself charges nothing on either anchor.
+    try testing.expectEqual(@as(usize, 0), state.penalty.count());
+}
+
 test "replayLedger A-vii-c.1: rows a live region CONSUMES take no legacy strike (no double charge)" {
     // The A-vii-c.1 re-review blocker: `replayLedger` accounts a region receipt per
     // row and then, in the kind arms, took a per-trace selection receipt through

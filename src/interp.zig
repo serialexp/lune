@@ -2336,19 +2336,27 @@ pub const Vm = struct {
             // declined BEFORE its body ran (nothing committed, regs untouched at
             // this anchor). Neither decline charges a strike or feeds the receipt
             // funnel — the decline is an entry-condition mismatch, not a guard
-            // failure. Direct entries only until B-iv: every arm/link site today
-            // requires `inputs.len == 0`, so no fused span can reach a seeded
-            // page's prologue (a fused decline row panics in `replayLedger`), and
-            // a direct decline is always a scalar `ledger_len == 1` result the
-            // silent drain above returned null for.
-            if (ran_native and result.exit_reason == .seed_capacity_decline) {
+            // failure. B-iv: these direct handlers own ONLY the scalar
+            // `ledger_len <= 1` case (the directly-entered trace itself
+            // declined). A FUSED span that reaches a seeded successor's
+            // prologue stamps the same shared `exit_reason` but carries a
+            // committed prefix in its multi-row ledger — it must flow to the
+            // `driveDispatcherLedger` consumer below, whose replay walks the
+            // prefix and applies the §B.2 fused-decline directive; rerunning
+            // `ct` (the ENTERED trace, not the decliner) here would discard
+            // that prefix.
+            if (ran_native and result.ledger_len <= 1 and
+                result.exit_reason == .seed_capacity_decline)
+            {
                 // The native twin of `seedTraceInputs` returning null (the seed
                 // slots don't fit the register slab): the candidate itself is
                 // unusable at this depth — same directive as the VM-side wall.
                 self.trace.dbg("seed-capacity-decline: trace={d} anchor={d}", .{ ct.id, ct.anchor.pc });
                 return .next_candidate;
             }
-            if (ran_native and result.exit_reason == .seed_hash_decline) {
+            if (ran_native and result.ledger_len <= 1 and
+                result.exit_reason == .seed_hash_decline)
+            {
                 // The native twin of the pre-B-ii `native_eligible = false`
                 // downgrade (H1): a hash_cell seed failed validation, so THIS
                 // entry runs on tier-1a. The prologue's seeding twin already
@@ -2525,6 +2533,17 @@ pub const Vm = struct {
             // `[I.loop_done_linked, C.prologue_fail]` (the committed
             // loop-done accounts, the fail breaks the burst at the
             // post-loop PC).
+            //
+            // Doc 22 §B.2 (B-iv): fused SEED-DECLINE terminals drain
+            // here too — the direct handlers above are gated to
+            // `ledger_len <= 1`, so a span like `[T.link_terminal,
+            // U.seed_hash_decline]` reaches `replayLedger`'s decline
+            // arms, which walk the committed prefix and resume
+            // deterministic selection at the DECLINER's coherent
+            // anchor (no strike, no receipt — a decline is an
+            // entry-condition mismatch, not a guard failure). The
+            // hash rerun/downgrade happens on re-selection via the
+            // direct-entry H1 path, never in-drain.
             if (ran_native and result.ledger_len > 1) {
                 const chain = self.trace.driveDispatcherLedger(ct, self.trace.ledger_scratch[0..result.ledger_len], proto, regs, safe_to_arm);
                 if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);

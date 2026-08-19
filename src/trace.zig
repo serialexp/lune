@@ -5369,6 +5369,33 @@ pub const TraceState = struct {
                     self.ledger_scratch[0..sresult.ledger_len],
                 );
                 self.settleNativeCallProvenance(&provenance, safe_to_arm);
+                // B-iv.2 (doc 22 §B.2, codex Q2): a hop-0 SCALAR seed decline —
+                // `sct`'s own direct entry declined at the seed prologue before
+                // any body ran (`final == sct`, exit == maxInt, the ledger holds
+                // only the decline row). `regs` are untouched, so the walk state
+                // is exactly what it was before this candidate was tried. The
+                // agreed dispositions, and NO receipt, strike, side-exit
+                // accounting, or chain source — which is why this steers BEFORE
+                // the composite-exit arm and the receipt tail below (the
+                // capture/settle bracket above is decline-inert: verdict capture
+                // matches only `.deopt` rows, and a declined entry stages no
+                // pending bridge arm):
+                //   capacity → try the next walk candidate (identical to the
+                //              pre-B-iv "unenterable candidate" filter);
+                //   hash     → end the walk and redispatch at `walk_pc`; the
+                //              dispatcher's direct-entry H1 downgrade owns the
+                //              tier-1a hash rerun on re-selection.
+                // A FUSED span ending in a decline (`final != sct`: the terminal
+                // decliner is a linked child) is NOT handled here — it rides
+                // `sresult_fused` into `runLinkedBurst`, whose call-A consumes
+                // the carried decline coherently.
+                if (sresult.final_trace_id == sct.id and
+                    (sresult.exit_reason == .seed_hash_decline or
+                        sresult.exit_reason == .seed_capacity_decline))
+                {
+                    if (sresult.exit_reason == .seed_capacity_decline) continue;
+                    return .{ .completed = 0, .resume_pc = walk_pc };
+                }
             } else {
                 const sbuf = self.valuesScratch(sct.instrs.len) catch continue;
                 if (loop_done_values) |vals| {
@@ -6426,6 +6453,28 @@ pub const TraceState = struct {
                         .resume_pc = m1.parent.anchor.pc,
                     } };
                 },
+                // Doc 22 §B.2 (B-iv): the silent M1 ramp is a seeded page whose
+                // entry seeding declined pre-commit. Same routing as the ramp
+                // prologue-fail above MINUS all accounting (no `onSideExit`, no
+                // strike, no receipt): a decline is an entry-condition mismatch,
+                // not a guard failure. Selection resumes at the M1 parent's
+                // anchor exactly like the prologue-fail replay; a re-selection
+                // of the decliner takes the dispatcher's direct-entry decline
+                // handlers (H1 downgrade / next-candidate).
+                .seed_hash_decline, .seed_capacity_decline => {
+                    const reason_matches = (e.kind == .seed_hash_decline and
+                        e.reason == .seed_hash_decline) or
+                        (e.kind == .seed_capacity_decline and
+                            e.reason == .seed_capacity_decline);
+                    if (!(is_last and ends_link and reason_matches and
+                        e.exit == std.math.maxInt(u32) and e.outcome == .normal and row_local == 0))
+                        @panic("replayLedger: silent M1 ramp seed-decline violates terminal contract");
+                    resume_pc.* = m1.parent.anchor.pc;
+                    return .{ .return_result = .{
+                        .completed = linked_completed.*,
+                        .resume_pc = m1.parent.anchor.pc,
+                    } };
+                },
                 .link_terminal => {},
                 else => @panic("replayLedger: silent M1 successor has an invalid row kind"),
             };
@@ -6863,6 +6912,35 @@ pub const TraceState = struct {
                                 .resume_pc = owner.anchor.pc,
                             } };
                         }
+                        // Sub-case (d) (doc 22 §B.2, B-iv): the ramp is a seeded
+                        // page whose entry seeding declined after the armed jump
+                        // — pre-commit, so the cumulative counter is unchanged
+                        // (validated above) and regs are coherent at the source
+                        // trace's guard exit exactly as in sub-case (c). Same
+                        // routing as (c) MINUS the `onSideExit` (no strike, no
+                        // receipt, never a chain source): resume deterministic
+                        // selection at the source's anchor; re-selecting the
+                        // decliner takes the dispatcher's direct decline path.
+                        if (entries[k + 1].kind == .seed_hash_decline or
+                            entries[k + 1].kind == .seed_capacity_decline)
+                        {
+                            if (k + 2 != entries.len)
+                                @panic("replayLedger: fused M1 sub-case (d) ramp seed-decline is not the last entry");
+                            const se = entries[k + 1];
+                            const reason_matches = (se.kind == .seed_hash_decline and
+                                se.reason == .seed_hash_decline) or
+                                (se.kind == .seed_capacity_decline and
+                                    se.reason == .seed_capacity_decline);
+                            if (!(reason_matches and se.exit == std.math.maxInt(u32) and
+                                se.outcome == .normal))
+                                @panic("replayLedger: fused M1 sub-case (d) entry violates the seed-decline contract");
+                            if (!(succ.instrs.len != 0 and succ.instrs[succ.instrs.len - 1].op == .link))
+                                @panic("replayLedger: fused M1 sub-case (d) ramp does not end in .link");
+                            return .{ .return_result = .{
+                                .completed = linked_completed.*,
+                                .resume_pc = owner.anchor.pc,
+                            } };
+                        }
                         // Sub-case (a): the ramp reached its `.link` terminal. This is a
                         // coherent-anchor (prime-side) burst entry — charge the firing
                         // signal HERE, tied to confirmed M1 source-guard provenance (the
@@ -6873,7 +6951,7 @@ pub const TraceState = struct {
                         // PC, and returns `run_inner_from(ramp)`. Any other successor kind
                         // is an unmodeled grammar → hard-stop.
                         if (entries[k + 1].kind != .link_terminal)
-                            @panic("replayLedger: fused M1 successor is not .link_terminal (a), .deopt (b), or .prologue_fail (c)");
+                            @panic("replayLedger: fused M1 successor is not .link_terminal (a), .deopt (b), .prologue_fail (c), or seed-decline (d)");
                         self.prime_side_chain_follows +|= 1;
                         cursor.prev_cum = e.cum;
                         continue;
@@ -7008,13 +7086,64 @@ pub const TraceState = struct {
                         .resume_pc = cursor.link_pc,
                     } };
                 },
-                // Doc 22 §B.2: statically impossible until B-iv opens the arm
-                // gates — every arm/link site today requires `inputs.len == 0`,
-                // so no fused span can reach a seeded page's prologue. B-iv
-                // replaces this with the §B.2 fused directive.
-                .seed_hash_decline, .seed_capacity_decline => @panic(
-                    "replayLedger: seed decline in a fused span is unmodeled until doc 22 B-iv",
-                ),
+                // Doc 22 §B.2 (B-iv): a fused successor's entry seeding declined
+                // pre-commit. Mirrors the `.prologue_fail` arm's provenance
+                // routing exactly, MINUS all accounting (`accountLedgerRow`/
+                // `onSideExit` suppressed): a decline is an entry-condition
+                // mismatch, never a guard failure — no strike, no receipt, no
+                // chain source. The contract (codex-reviewed deviation from the
+                // original §B.2 sketch) is "resume deterministic selection at
+                // the decliner's coherent anchor", NOT "rerun the exact decliner
+                // on tier-1a in-drain": the committed prefix is preserved in
+                // `linked_completed`, tier-0 resumes at the decliner's anchor,
+                // and if selection re-picks the decliner the dispatcher's
+                // direct-entry handlers apply the H1 downgrade (hash) or
+                // next-candidate (capacity) there.
+                .seed_hash_decline, .seed_capacity_decline => {
+                    const reason_matches = (e.kind == .seed_hash_decline and
+                        e.reason == .seed_hash_decline) or
+                        (e.kind == .seed_capacity_decline and
+                            e.reason == .seed_capacity_decline);
+                    if (!(reason_matches and e.exit == std.math.maxInt(u32) and
+                        e.outcome == .normal and local == 0))
+                        @panic("replayLedger: seed-decline entry violates its static contract");
+                    if (!is_last)
+                        @panic("replayLedger: seed-decline is terminal but not last");
+                    // Bridged/handoff successor decline: the bridge/handoff row
+                    // published the successor's validated anchor into
+                    // `resume_pc` and regs are still coherent there (the
+                    // decline fires before the body commits anything). Same
+                    // validation as the bridged prologue-fail; zero-progress,
+                    // resume there — never at a stale `link_pc`.
+                    if (entered_via_bridge or entered_via_handoff) {
+                        if (!(ends_link or ends_loop))
+                            @panic("replayLedger: bridged successor seed-decline on a non-body owner shape");
+                        if (resume_pc.* != owner.anchor.pc)
+                            @panic("replayLedger: bridged successor seed-decline resume mismatches its anchor");
+                        return .{ .return_result = .{
+                            .completed = linked_completed.*,
+                            .resume_pc = resume_pc.*,
+                        } };
+                    }
+                    if (ends_link) {
+                        // Seed continuation decline (local == 0): nothing
+                        // committed here → break the burst, mirroring the
+                        // continuation prologue-fail.
+                        return .break_burst;
+                    }
+                    if (!ends_loop)
+                        @panic("replayLedger: seed-decline owner is neither continuation nor inner root");
+                    // Linked inner decline: resume at the decliner's own anchor.
+                    // For the linked C⇄I grammar the most-recent `.link` names
+                    // exactly that PC — release-assert the two agree so any
+                    // future grammar drift fails loudly instead of misresuming.
+                    if (cursor.link_pc != owner.anchor.pc)
+                        @panic("replayLedger: linked inner seed-decline link_pc mismatches the decliner's anchor");
+                    return .{ .return_result = .{
+                        .completed = linked_completed.*,
+                        .resume_pc = owner.anchor.pc,
+                    } };
+                },
             }
             cursor.prev_cum = e.cum;
         }
@@ -7269,6 +7398,26 @@ pub const TraceState = struct {
                 } else {
                     ibuf = self.valuesScratch(inner.instrs.len) catch break;
                     iresult = irinterp.execute(inner, regs, ibuf);
+                }
+                // B-iv.2 (doc 22 §B.2, codex Q2): a scalar seed decline at call A —
+                // the inner's direct entry (or the carried fused hop's linked
+                // entry, consumed above) declined at its seed prologue before any
+                // body ran. The last committed state is "outer advanced, about to
+                // enter the inner at `inner_pc`", and the decline left `regs`
+                // untouched — so end the burst coherently at the decliner's
+                // anchor, preserving the cumulative `linked_completed`. NO
+                // receipt, strike, side-exit accounting, or chain source; in
+                // particular this must NOT reach the zero-progress tail's
+                // `onSideExit(seed, 0)` (the decline is not the seed's failure).
+                // Fused spans DEEPER than the carried scalar (`ledger_len > 1`)
+                // never reach here — the call-A drain above hands them to
+                // `replayLedger`, whose terminal seed-decline arm owns them.
+                // (Tier-1a never takes this: its seeding happens at the hop-top
+                // `seedForTier1a`, and its hash guards side-exit in-body.)
+                if (iresult.exit_reason == .seed_hash_decline or
+                    iresult.exit_reason == .seed_capacity_decline)
+                {
+                    return .{ .completed = linked_completed, .resume_pc = inner_pc };
                 }
                 if (iresult.exit_instr == std.math.maxInt(u32)) break;
                 // `iresult.completed` is the chain-cumulative counter (`rbx`), which a
