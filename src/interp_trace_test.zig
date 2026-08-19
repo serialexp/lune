@@ -1583,3 +1583,268 @@ test "recorder (hash field): a computed (non-konst) key aborts (const-key rule)"
     try testing.expect(vm.trace.gate.count() >= 1);
     try testing.expect(!vm.trace.isRecording());
 }
+
+// --- hash-cell alias classification after deferred stores (doc 08 §2026-08-20) --
+// A hash-field load with hstores pending in the deferred-store buffer used to be a
+// blanket abort. It now classifies each pending store against the load's (table
+// ref, key konst): NO (different key, or an astore — a hash cell and an in-bounds
+// array slot can never alias) keeps scanning and falls through to the heap read;
+// MUST (same key konst + same table SSA ref) forwards the pending value with no
+// re-emitted load chain; MAY (same key, *different* table refs) aborts fail-closed
+// — never guard a runtime identity relation between loop-varying refs.
+
+test "recorder (hash alias): different keys on one table classify NO — both RMWs record, neither load forwarded" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `t.b`'s read runs with `t.a`'s hstore still pending. Different key konst →
+    // NO alias: the read falls through to a real heap load chain, both stores sink.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = {a = 0, b = 0}
+        \\for i = 1, 50 do
+        \\  t.a = t.a + 1
+        \\  t.b = t.b + 2
+        \\end
+        \\print(t.a + t.b)
+    , true);
+    defer chunk.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = try dumpTrace(&buf, &vm);
+    // Two heap reads (nothing forwarded), two sunk stores.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "hload"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "hstore"));
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
+}
+
+test "recorder (hash alias): same cell forwards MUST with last-writer-wins and no re-emitted load chain" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // Three reads of `t.x`, but only the FIRST touches the heap: the second RMW's
+    // read forwards the first pending store's value, and `s = s + t.x` forwards the
+    // *newest* pending store (last-writer-wins — the buffer is walked newest→oldest).
+    // Both stores stay in the buffer and flush in source order at trace close.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = {x = 1}
+        \\local s = 0
+        \\for i = 1, 50 do
+        \\  t.x = t.x + 1
+        \\  t.x = t.x * 2
+        \\  s = s + t.x
+        \\end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = try dumpTrace(&buf, &vm);
+    // Structural: exactly ONE hload (the first read); the two forwarded reads emit
+    // no href/guard_hash/hload of their own. The store side keeps its two hstores.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "hload"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "hstore"));
+    // Ordered flush: the sunk stores appear after the load, in source order.
+    const i_load = std.mem.indexOf(u8, text, "hload").?;
+    const i_store = std.mem.indexOf(u8, text, "hstore").?;
+    try testing.expect(i_load < i_store);
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
+}
+
+test "recorder (hash alias): every sunk hstore's VALUE ref carries its own numeric guard (the store-side type pin)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // The load-bearing structural assertion behind the type-drift e2e tests: the
+    // upstream operand guards (recArith's) pin the store value in most reachable
+    // shapes, so an e2e test alone cannot detect the loss of `recHashSet`'s
+    // `guardNum` on the store VALUE — the pin that makes a drifted value side-exit
+    // *before* the sunk write lands (and that keeps a MUST-forwarded read's type
+    // honest). Assert it directly on the raw IR: each hstore's value operand (.b)
+    // must be guarded by an earlier guard_int/guard_float ON THAT SAME REF.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = {n = 0}
+        \\for i = 1, 50 do t.n = t.n + 1 end
+        \\print(t.n)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    const t = vm.trace.cache.items[0];
+    var n_hstore: usize = 0;
+    for (t.instrs, 0..) |ins, i| {
+        if (ins.op != .hstore) continue;
+        n_hstore += 1;
+        var pinned = false;
+        for (t.instrs[0..i]) |prior| {
+            if ((prior.op == .guard_int or prior.op == .guard_float) and prior.a == ins.b) {
+                pinned = true;
+                break;
+            }
+        }
+        try testing.expect(pinned);
+    }
+    try testing.expect(n_hstore >= 1); // the loop above must have checked something
+}
+
+test "recorder (hash alias): same key through two table refs classifies MAY and aborts (fail-closed)" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `t` and `u` hold the SAME table at runtime, but they are different slots, so
+    // the recorder materializes two distinct slot_load refs — it cannot prove they
+    // alias (MUST) or don't (NO). Forwarding would need a guard on a runtime
+    // identity *relation* between two loop-varying refs; the rule is abort instead.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local t = {x = 0}
+        \\local u = t
+        \\local s = 0
+        \\for i = 1, 50 do
+        \\  t.x = t.x + 1
+        \\  s = s + u.x
+        \\end
+        \\print(s)
+    , true);
+    defer chunk.deinit();
+
+    try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
+    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(!vm.trace.isRecording());
+}
+
+test "recorder (hash alias): a pending astore never aliases a hash load (NO) — mixed loop records" {
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    // `t.x`'s read runs with `q[1]`'s astore pending. An in-bounds astore can't
+    // grow/migrate the table, and a hash cell is never an array slot, so the
+    // classification is airtight NO: the hash read falls through and both record.
+    var chunk = try runForTrace(&vm, gpa,
+        \\local q = {0}
+        \\local t = {x = 5}
+        \\local s = 0
+        \\for i = 1, 50 do
+        \\  q[1] = q[1] + 1
+        \\  s = s + t.x
+        \\end
+        \\print(s + q[1])
+    , true);
+    defer chunk.deinit();
+
+    var buf: [8192]u8 = undefined;
+    const text = try dumpTrace(&buf, &vm);
+    try testing.expect(std.mem.indexOf(u8, text, "astore") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "hload") != null);
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
+}
+
+test "hash alias e2e: nbody-shaped multi-field RMW loop is byte-identical across all legs" {
+    // The type specimen this classification unblocks: nbody's `advance` defers
+    // `bj.vx`'s hstore, then immediately reads `bj.vy` — pre-classification that
+    // read was a blanket abort, so the whole O(n²) inner loop never traced. The
+    // expected text is pinned from tier-0; every GC×trace-mode leg must reproduce
+    // it exactly.
+    try expectProgram(
+        \\local b1 = {x = 0.0, vx = 1.0, vy = 2.0}
+        \\local b2 = {x = 5.0, vx = -1.0, vy = 0.5}
+        \\for i = 1, 100 do
+        \\  local d = b2.x - b1.x
+        \\  b1.vx = b1.vx + d * 0.01
+        \\  b1.vy = b1.vy + d * 0.02
+        \\  b2.vx = b2.vx - d * 0.01
+        \\  b2.vy = b2.vy - d * 0.02
+        \\  b1.x = b1.x + b1.vx * 0.001
+        \\  b2.x = b2.x + b2.vx * 0.001
+        \\end
+        \\print(b1.x)
+        \\print(b2.x)
+        \\print(b1.vy)
+    ,
+        "0.34497907760571167\n4.655020922394289\n11.475260731016911\n",
+    );
+}
+
+test "hash alias e2e: type drift on a MUST-forwarded cell side-exits cleanly" {
+    // `t.x` is int while the trace records; iteration 60 stores a float off-trace
+    // (the `i == 60` branch side-exits first). On re-entry the load's guard_int
+    // fails and deopts — the forwarded reads must not have weakened the type pin.
+    try expectProgram(
+        \\local t = {x = 0}
+        \\local s = 0
+        \\for i = 1, 100 do
+        \\  t.x = t.x + 1
+        \\  s = s + t.x
+        \\  if i == 60 then t.x = 0.5 end
+        \\end
+        \\print(s)
+        \\print(t.x)
+    ,
+        "2670\n40.5\n",
+    );
+}
+
+test "hash alias e2e: a side exit after a NO-classified read flushes the deferred store exactly once" {
+    // The astore is pending when `t.x`'s NO-classified read records; the `i % 30`
+    // branch side-exits mid-iteration. Deopt must replay the deferred store exactly
+    // once — a double flush or a lost store diverges `q[1]` or `s` in some mode.
+    try expectProgram(
+        \\local q = {0}
+        \\local t = {x = 1}
+        \\local s = 0
+        \\for i = 1, 100 do
+        \\  q[1] = q[1] + 1
+        \\  s = s + t.x
+        \\  if i % 30 == 0 then s = s + 1000 end
+        \\end
+        \\print(s)
+        \\print(q[1])
+    ,
+        "3100\n100\n",
+    );
+}
+
+test "hash alias e2e: same-cell double store + forwarded read executes last-writer-wins in every leg" {
+    // The executable counterpart of the structural last-writer-wins test: two
+    // successive stores to `t.x` per iteration (the second RMW's read MUST-forwards
+    // the first pending store; `s`'s read MUST-forwards the second), then both
+    // pending hstores flush in source order at trace close. A wrong walk direction
+    // (oldest→newest) or a wrong flush order diverges `s` and the final `t.x`.
+    try expectProgram(
+        \\local t = {x = 1}
+        \\local s = 0
+        \\for i = 1, 100 do
+        \\  t.x = t.x + 1
+        \\  t.x = t.x + i
+        \\  s = s + t.x
+        \\end
+        \\print(s)
+        \\print(t.x)
+    ,
+        "176850\n5151\n",
+    );
+}
+
+test "hash alias e2e: store-VALUE type drift is caught before the forwarded read uses it" {
+    // Complements the cell-drift test above: here `t.x` is still an int at loop
+    // entry on the drift iteration — it is the freshly *stored* value (`t.x + inc`)
+    // whose type flips when `inc` becomes float. The guards recorded up-stream of
+    // the store (the operand type pins / the store-side `guardNum`) must side-exit
+    // BEFORE the forwarded read (`s = s + t.x`) consumes a wrongly-typed pending
+    // value; tier-0 then re-runs the whole iteration, keeping every leg identical.
+    try expectProgram(
+        \\local t = {x = 0}
+        \\local s = 0
+        \\local inc = 1
+        \\for i = 1, 100 do
+        \\  t.x = t.x + inc
+        \\  s = s + t.x
+        \\  if i == 60 then inc = 0.5 end
+        \\end
+        \\print(s)
+        \\print(t.x)
+    ,
+        "4640\n80\n",
+    );
+}

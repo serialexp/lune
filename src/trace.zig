@@ -11889,6 +11889,54 @@ pub const TraceState = struct {
         return false;
     }
 
+    /// Resolve a hash load against the deferred-store buffer (doc 08 §2026-08-20,
+    /// LuaJIT's `aa_href`). Every key that reaches the hash recorders is an
+    /// interned-string `.konst` (dispatch routes numeric keys to the array path),
+    /// so key identity is exactly konst-ref equality — interning + `konst()`'s
+    /// `(tag, bits)` dedup make equal content ⇔ the same ref. Walks newest→oldest
+    /// (last-writer-wins; `commit()` flushes oldest→newest — the pair keeps
+    /// repeated same-cell stores exact). Returns `true` when the load was resolved
+    /// (value forwarded or recording aborted); `false` → caller emits the heap read.
+    fn forwardPendingHashLoad(self: *TraceState, dst: u16, rtab: Ref, rkey: Ref) bool {
+        var n = self.rec.pending_stores.items.len;
+        while (n > 0) {
+            n -= 1;
+            const ps = self.rec.pending_stores.items[n];
+            switch (ps.op) {
+                // An in-bounds array store (the only array op ever buffered —
+                // `astore_append` is emitted inline) can neither grow the array nor
+                // migrate a hash cell, and every recordable hash key is a string:
+                // NO alias, keep scanning.
+                .astore => continue,
+                .hstore => {},
+                // Fail closed on any store op this classifier wasn't written for.
+                else => {
+                    self.abort(.bad_type);
+                    return true;
+                },
+            }
+            const addr = self.rec.instrs.items[ps.aref];
+            std.debug.assert(addr.op == .href);
+            // Distinct interned-string keys are distinct cells regardless of which
+            // table each ref holds → NO.
+            if (addr.b != rkey) continue;
+            // Same key + same table SSA ref → MUST: forward the newest pending
+            // value. Its type is already pinned by the store-side `guardNum`, and
+            // at record time tier-0 has executed the store, so the observed loaded
+            // value IS the stored value.
+            if (addr.a == rtab) {
+                self.setReg(dst, ps.value);
+                return true;
+            }
+            // Same key, unproven table identity (two SSA refs may hold the same
+            // table at runtime) → MAY: abort fail-closed. Never guard a runtime
+            // identity relation between loop-varying refs.
+            self.abort(.bad_type);
+            return true;
+        }
+        return false;
+    }
+
     fn classifyArrayKeyAlias(self: *const TraceState, lhs: Ref, rhs: Ref) AliasClass {
         if (lhs == rhs) return .must;
         const lc = self.intKonstRef(lhs);
@@ -12283,14 +12331,12 @@ pub const TraceState = struct {
     ///     key rule is what keeps the hoisted cell from dangling);
     ///   * computed (non-`konst`) key → `.bad_type` (a runtime-varying key cannot be
     ///     pinned to one cell — v1 scope; `t[expr]` stays tier-0);
-    ///   * a pending (sunk) store precedes this load → `.bad_type` (same post-store
-    ///     no-load rule as `recArrayGet`: a load after a deferred store would read
-    ///     the pre-store value on-trace but the post-store value on deopt-replay).
+    ///   * a pending (sunk) store that MAY-aliases this load → `.bad_type` (doc 08
+    ///     §2026-08-20): the deferred-store buffer is consulted first via
+    ///     `forwardPendingHashLoad` — a MUST-alias forwards the pending value, a
+    ///     proven NO falls through to the heap read, and only the ambiguous
+    ///     same-key/different-table-ref case aborts fail-closed.
     fn recHashGet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
-        // Same post-store invariant as `recArrayGet`: a deferred store must be the
-        // trace's last heap access (doc 08 §mechanism). A hash load after one would
-        // diverge on deopt-replay. Array and hash loads/stores share the pool.
-        if (self.rec.pending_stores.items.len > 0) return self.abort(.bad_type);
         const vtab = regs.get(instr.b);
         const vkey = regs.get(instr.c);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
@@ -12316,6 +12362,12 @@ pub const TraceState = struct {
         if (self.rec.instrs.items[@intCast(rkey)].op != .konst) return self.abort(.bad_type);
 
         const rtab = try self.refOf(instr.b);
+        // Resolve against the deferred-store buffer BEFORE emitting the load chain
+        // (doc 08 §2026-08-20): a MUST-alias forwards the pending value (the store
+        // side already emitted `guard_table`/`href`/`guard_hash`/`guardNum` on this
+        // same table ref + key konst, so no chain is re-emitted here), NO keeps
+        // scanning / falls through to the heap read, MAY aborts fail-closed.
+        if (self.forwardPendingHashLoad(instr.a, rtab, rkey)) return;
         self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .b, .neutral);
         // Seed the loop-invariant cell pointer for native (H1); `href.aux` carries
         // the synthetic slab slot, or `-1` to mark "not seeded → native declines".
@@ -13006,10 +13058,12 @@ fn konstKey(v: Value) KonstKey {
 /// mutation through its own methods (`emit`/`refOf`/`recordInstr`/…); this struct
 /// is just storage + cleanup. While `active` is false the interpreter never calls
 /// into it.
-/// A deferred read-modify-write array store, sunk below every guard at trace
-/// close. `aref`/`value` are IR refs already emitted inline (the address node and
-/// the value to store); `lane_ord` is the packed-array `Lane` ordinal (the
-/// `astore`'s `aux`). See `Recorder.pending_stores`.
+/// A deferred read-modify-write store (`op` = `.astore` for an in-bounds array
+/// slot, `.hstore` for a present hash cell), sunk below every guard at trace
+/// close. `aref`/`value` are IR refs already emitted inline (the address node —
+/// `aref`/`href` — and the value to store); `lane_ord` is the packed-array
+/// `Lane` ordinal (the `astore`'s `aux`; 0 and unused for `.hstore`). See
+/// `Recorder.pending_stores`.
 const PendingStore = struct {
     aref: Ref,
     value: Ref,
@@ -13196,10 +13250,11 @@ pub const Recorder = struct {
     /// callee is attributed to the callee, not the anchor. Default 0 (harmless before
     /// the first `recordInstr`).
     cur_proto_id: u32 = 0,
-    /// Deferred (sunk) array stores: in-bounds `astore`s that follow an `aload` (a
-    /// read-modify-write). Rather than abort the trace (the old C1 rule),
-    /// `recArraySet` records each store's address + guards inline but stashes the
-    /// `astore` node itself here; `commit()` flushes them — *front-to-back, in the
+    /// Deferred (sunk) stores: in-bounds `astore`s that follow an `aload` and
+    /// present-cell `hstore`s that follow an `hload` (read-modify-writes). Rather
+    /// than abort the trace (the old C1 rule), `recArraySet`/`recHashSet` record
+    /// each store's address + guards inline but stash the store node itself here;
+    /// `commit()` flushes them — *front-to-back, in the
     /// recorded (tier-0 bytecode) order* — *after* every guard (incl. the `for_loop`
     /// continuation guard), just before the `.loop` terminator. Sinking them below
     /// all side-exits makes deopt-replay idempotent: any guard failure leaves *all*
@@ -13209,7 +13264,8 @@ pub const Recorder = struct {
     /// stores alias. See `docs/design/08-multi-store-sinking.md` (Gap C); doc 07 is
     /// the single-store original (Gap B).
     ///
-    /// A later array read consults this virtual store buffer newest-to-oldest:
+    /// A later array or hash read consults this virtual store buffer
+    /// newest-to-oldest (`forwardPendingArrayLoad`/`forwardPendingHashLoad`):
     /// must-alias loads forward the pending value, proven-non-alias loads read the
     /// heap behind guards, and ambiguous table identity aborts fail-closed. Appends
     /// still abort because they mutate array shape. The list is naturally bounded

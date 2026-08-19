@@ -1,18 +1,19 @@
 # lune — multi-store sinking (FFT butterfly) — Design
 
-Status: implemented (2026-06-22), extended 2026-08-16 — recorder generalized to an
+Status: complete — implemented (2026-06-22), extended 2026-08-16 (array-load
+forwarding, `0e311f9`) and 2026-08-20 (hash-load classification, §below; codex
+APPROVE after 3 review rounds) — recorder generalized to an
 ordered virtual store buffer, flushed front-to-back below every guard at trace close;
-post-store array loads now forward or prove non-aliasing statically; the mode-equivalence
-gate is green. The mandatory constraint both reviewers converged
+post-store array AND hash loads now forward or prove non-aliasing statically; the
+mode-equivalence gate is green. The mandatory constraint both reviewers converged
 on — `commit()` flushes the pending stores **front-to-back in bytecode-execution
 order** (§mechanism, §7.2) — is implemented and Codex's three doc-accuracy tightenings
 are folded in below (recorded order = tier-0 bytecode order; the side-exit invariant
 is "trace applies none, replay applies the source-path's stores"; later store guards
 are sound only because in-bounds `astore` cannot change what they guard). Gap B
-(doc 07, single-store) is the landed prerequisite. Implementation review (Codex +
-Antigravity) pending before Bart's commit approval.
+(doc 07, single-store) is the landed prerequisite.
 Owner: Bart
-Last updated: 2026-08-16
+Last updated: 2026-08-20
 
 Prerequisite reading: `07-rmw-store-sinking.md` (Gap B — single-store sinking, the
 mechanism this generalizes) and `01-trace-lifecycle.md` §"Loop-header re-entry
@@ -52,6 +53,71 @@ The recorder now models an ordered virtual store buffer, following LuaJIT's gene
 This section supersedes the fixed-cap and “no post-store read” scope statements in
 the original June design below; those passages are retained as the historical v1
 argument.
+
+## 2026-08-20 extension — hash-cell alias classification (`aa_href` for `hload`)
+
+The 2026-08-16 extension fixed post-store **array** loads but left `recHashGet`'s
+blanket rejection in place: any `hload` while `pending_stores` is non-empty aborted
+`.bad_type`. That is the exact same trace-region boundary one storage class over, and
+it kills the canonical OO field-mutation loop. nbody's inner loop is the type
+specimen: `bj.vx = bj.vx + …` defers an `hstore("vx")`, and the very next statement's
+`hload("vy")` hits the blanket abort — the whole 38.8× benchmark records two opcodes
+per attempt. LuaJIT disambiguates these with `aa_href` (`lj_opt_mem.c`): hash
+references to *different constant keys* can never alias, same key + same table
+must-alias, same key + unproven-distinct tables may alias.
+
+Our recorder makes this classification **exact, with no MAY case beyond table
+identity**, because of the invariants already in the tree (codex-verified 2026-08-20):
+
+1. Both `recHashGet` and `recHashSet` require the key ref to be a `.konst` (computed
+   hash keys abort — v1 scope, unchanged here).
+2. **Every key that reaches the hash recorders is an interned string.** Dispatch
+   routes all numeric keys to `recArrayGet`/`recArraySet` (trace.zig ~11485), and
+   `recArrayGet` rejects an out-of-array numeric key rather than falling through —
+   so `t[1.0]`-vs-`t[1]` normalization (`table.normalizeKey`) can never produce an
+   `hstore`/`hload` pair today. If numeric hash access is ever recorded, the
+   classifier must compare `konstKey(normalizeKey(k))` and `seedHashCell`'s
+   `(table_reg, key_const)` dedup must be normalized too; both are explicitly
+   future-facing, not part of this extension.
+3. Interned strings + `konst()` dedup on `(tag, bits)` (heap bits = pointer) ⇒ for
+   these keys, equal content ⇔ same string object ⇔ the **same konst ref**. Key
+   comparison is therefore konst-ref equality.
+
+The rules, mirrored on the array classifier and walked newest→oldest so
+last-writer-wins stays exact:
+
+- Pending `.hstore` vs new `hload`:
+  - key konst refs **differ** → **NO** alias (different interned-string keys are
+    different cells regardless of which table each ref holds) → keep scanning.
+  - key refs **equal**, same table SSA ref → **MUST** → forward the pending
+    store's value ref (no `href`/`guard_hash`/`hload` emitted; the forwarded ref
+    already carries the store-side `guardNum` type pin plus the store's own
+    `guard_table`/`href`/`guard_hash` structure chain, and at record time tier-0 has
+    already executed the store, so the observed loaded value *is* the stored value).
+  - key refs equal, different table refs → **MAY** → abort fail-closed (two SSA
+    refs may hold the same table).
+- Pending `.astore` vs new `hload`: **NO**, airtight. Only in-bounds `.astore`s and
+  `.hstore`s are ever buffered (`astore_append` is emitted inline, never deferred,
+  and its `guard_append` requires an empty hash part), an in-bounds array store
+  neither grows the array nor migrates hash cells, and every recordable `hload` key
+  is a string. LuaJIT's migration warning (`lj_opt_mem.c` aa_ahref/NEWREF) concerns
+  insertion/rehash, which the deferred-store IR cannot express.
+- The reverse direction (`aload` after pending `.hstore`) keeps its existing skip:
+  `recHashSet` only lands on a *present* hash cell, present hash keys are today
+  string-only, and in any valid VM state no hash cell key lies inside the array
+  range (maintained by `table.set`/append/rehash; `restoreEntry` can transiently
+  violate it but only mid-restore, never at record time).
+
+Everything else is untouched: `guard_hash` population pins stay sufficient (deferred
+`hstore`s are present-key overwrites, population never changes), flush order at
+`commit()` is unchanged (scan newest→oldest, flush oldest→newest — the pair that
+makes repeated same-cell stores exact), and a NO-classified `hload` reading the heap
+mid-buffer is sound because the pending stores provably don't touch its cell — on-trace
+the read happens before the sunk stores execute, and the cell's value is identical
+either way; on a side exit, deopt-replay applies the source path's stores exactly as
+before. Forwarding removes an `hload` exec-log event, but every execution mode runs
+the same forwarded SSA graph and the value stays scalar and guarded, so the scalar
+exec-log oracle is unaffected.
 
 ## Implementation status
 
@@ -93,12 +159,52 @@ checked.
 - [x] **Open question — aliasing among the N stores.** §7.2. Resolved: `commit()` flushes
   front-to-back in recorded order and never reorders, so trace and tier-0 agree on
   last-writer-wins regardless of aliasing.
+- [x] **H1 — hash-load classifier (`trace.zig`).** Landed 2026-08-20:
+  `forwardPendingHashLoad` in `recHashGet`, replacing the blanket
+  `pending_stores.len > 0 → abort` with the §2026-08-20 rules — newest→oldest walk,
+  `.astore` → NO (skip), different key konst → NO (keep scanning), same key + same
+  table ref → MUST (forward the pending value ref, no re-emitted load chain), same
+  key + different table refs → MAY (abort `.bad_type`, fail-closed).
+- [x] **H2 — tests** (codex-augmented list), in `interp_trace_test.zig` ("hash
+  alias" family — hash keys need genuine interned-konst `load_const`s, so these
+  drive real Lua source): (a) NO different-key RMW chain, both stores sunk, 2
+  hloads; (b)+(d)+(e) last-writer-wins MUST — exactly 1 `hload`, 2 `hstore`s in
+  source order, distinct `.x` literal sites deduping to one konst, no re-emitted
+  chain; (c) same key via two table refs (same runtime table, two slots → two
+  slot_load refs) aborts MAY; (f) hload after pending astore is NO, mixed loop
+  records. e2e (`expectProgram`, every GC×trace-mode leg): nbody-shaped
+  multi-field RMW loop byte-identical; MUST-forwarded cell whose type drifts
+  mid-run side-exits cleanly; side exit after a NO-classified read flushes the
+  deferred store exactly once; plus the codex post-landing blockers —
+  executable same-cell double-store last-writer-wins (wrong walk/flush order
+  diverges), store-VALUE type drift (cell still int at entry) caught by the
+  up-stream guards before the forwarded read consumes it, and the load-bearing
+  structural pin: every sunk hstore's VALUE ref must carry its own
+  guard_int/guard_float in the raw IR (verified to FAIL when `recHashSet`'s
+  `guardNum` is removed — no e2e test can detect that loss, since upstream
+  operand guards mask it in every reachable drift shape).
+- [x] **H3 — measure.** Gate battery green (both test builds, six output hashes,
+  three soundness repros, full board 28/28 `cross=ok`). nbody wall-clock is
+  **unchanged** (182 ms, 38.5×) — expected: the classifier removes the recording
+  blocker (the `bad_type get_index` abort at advance:114 is gone; the inner j-loop
+  now records and compiles), but `--jit-stats` shows it runs ~1 iteration per
+  native entry (n=5 bodies → inner trips of 1–4), so coverage stays ~0.6%. The
+  remaining nbody lever is outer-loop linking: `advance:4`'s root recording still
+  aborts `.nyi_opcode for_prep` at the inner header (`recForPrepLink`'s
+  `.root`-kind restriction). This arc is the prerequisite; the win ships with the
+  root-LINNER arc.
+
+- [x] **Implementation review.** The 2026-08-16 array-forwarding recorder change
+  went through 3 codex rounds and Bart approved the commit as-is (`0e311f9`). The
+  2026-08-20 hash-classification extension went through codex post-landing review
+  (gpt-5.6-sol, thread `01a01abe-1850-7032-903a-822bdfb4babb`), 3 rounds → APPROVE
+  (round 2 added the executable last-writer-wins + store-VALUE-drift e2e; round 3
+  added the structural store-side `guardNum` pin test, verified load-bearing).
+  Committed under the 2026-08-20 campaign mandate (codex reviews, commit, continue).
 
 ### Outstanding
 
-- [ ] **Implementation review.** Codex + Antigravity pass on the landed `trace.zig`
-  recorder change (the determinism-sensitive store-ordering path), then Bart's commit
-  approval (Rule #15).
+_(nothing — this design is fully landed)_
 
 ## Why this exists
 

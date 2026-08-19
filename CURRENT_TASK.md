@@ -1,4 +1,50 @@
-# CURRENT_TASK — Exit-branch patching (faithful LuaJIT port), doc 17
+# CURRENT_TASK — Campaign: every benchmark ≤1.2× LuaJIT (Bart 2026-08-20 mandate)
+
+Loop: profile → worst *general* gap (Z-6) → design → codex (gpt-5.6-sol) review →
+Claude implements → gate battery + board → commit → next arc. No per-arc reports
+to Bart; this file + the design docs are the record.
+
+Campaign map (from --dump-aborts across the board, 2026-08-20): (1) builtin
+recording breadth — ffrecord beyond math.sqrt (scalar 37.6×, partialsums 6.9×,
+str_format 18.5× host_barrier call); (2) root-recording linkage at inner loops —
+`recForPrepLink` aborts `.nyi_opcode` when `rec.kind == .root` even when an inner
+root trace exists (nbody 38.5×, scimark-sparse 19.9×, euler14-bit 18.4×,
+grid_matmul-family outer nests); (3) return tracing / up-recursion + call-site
+hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
+(4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
+method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
+
+## Status 2026-08-20 (LATEST-71) — **Arc 1 (hash-cell alias classification, doc 08 §2026-08-20) LANDED: `recHashGet` classifies pending stores instead of blanket-aborting. nbody's recording blocker is gone; wall-clock unchanged as predicted — the win ships with the root-LINNER arc.**
+
+- H1: `forwardPendingHashLoad` (trace.zig, before the guard_table emit in
+  `recHashGet`): newest→oldest walk of `pending_stores`; `.astore` → NO
+  (airtight: only in-bounds astores buffer, astore_append is inline-only);
+  different key konst → NO (interning + konst dedup ⇒ konst-ref equality is
+  exact key identity — numeric keys never reach the hash recorders, dispatch
+  routes them to the array path); same key + same table SSA ref → MUST
+  (forward `ps.value`; the store side already emitted
+  guard_table/href/guard_hash/guardNum on the same refs, so NO chain is
+  re-emitted); same key + different table refs → MAY, abort `.bad_type`
+  fail-closed (never guard a runtime identity relation).
+- H2: 10 new tests in `interp_trace_test.zig` ("hash alias" family) — 5
+  recorder/structural: NO different-key (2 hloads + 2 hstores), MUST
+  last-writer-wins (exactly 1 hload, 2 hstores, order pinned), MAY two-refs
+  abort, astore-vs-hload NO, and (codex round 3) every sunk hstore's VALUE
+  ref carries its own guard_int/guard_float — the raw-IR pin an e2e can't
+  detect losing; 5 `expectProgram` e2e (every GC×trace-mode leg):
+  nbody-shaped multi-field RMW; cell type drift side-exits cleanly;
+  side exit after a NO-read flushes the deferred store exactly once;
+  (codex round 2) executable same-cell double-store last-writer-wins;
+  store-VALUE type drift with the cell still int at entry.
+- H3 gates: `just test` + `-Djit-debug` green; six-hash gate PASS (all six
+  jit≡t0≡frozen); repros 109/109/18135; board 28/28 cross=ok, no
+  regressions (sieve_int 1.1×✓, nsieve 1.2×✓).
+- nbody diagnosis (jit-stats, N=1000): inner j-loop advance:34 now records
+  AND compiles, but runs ~1 iter/native-entry (n=5 bodies → trips 1–4), so
+  traced time is 0.6%; advance:4 root recording still aborts `.nyi_opcode
+  for_prep` at the inner header (`recForPrepLink` `.root` restriction).
+  **Next arc: root-recording LINNER linkage** — that's mechanism (2) and it
+  gates nbody, sparse, euler14, and the matmul outers.
 
 ## Status 2026-08-16 (LATEST-70) — **"Make fft_bitreverse traceable": recorder gaps CLOSED (codex, 3 rounds), coverage deliberately deferred to exit-branch stitching. LANDED `0e311f9` (Bart: commit as-is; fft jit +3% ≈ noise floor accepted).**
 
