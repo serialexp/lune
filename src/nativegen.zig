@@ -1999,14 +1999,17 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
 
     // Every loop-carried writeback must reference a boxable value. A raw table
     // pointer is boxable as TAG_HEAP and is needed for compiler temporaries that
-    // are write-only at a while-loop header. An `.aref` is only an addressing
-    // token and must never escape into the VM register file. This runs after Pass B
-    // so a φ's forward-referencing `b` has its kind assigned.
+    // are write-only at a while-loop header. A `.heap` value (a per-iteration
+    // table from a VALUE_LANE aload) is likewise TAG_HEAP-boxable and is the
+    // carried-heap writeback of doc 22 §A.1 (`bi = b[i]`-shaped outer bodies) —
+    // `analyze` classifies the slot and decides admissibility. An `.aref` is only
+    // an addressing token and must never escape into the VM register file. This
+    // runs after Pass B so a φ's forward-referencing `b` has its kind assigned.
     for (t.instrs) |p| {
         if (p.op != .phi) continue;
         if (p.b >= n) return false;
         const k = kinds[p.b];
-        if (k != .int and k != .bool and k != .float and k != .ptr) return false;
+        if (k != .int and k != .bool and k != .float and k != .ptr and k != .heap) return false;
     }
     return true;
 }
@@ -2015,6 +2018,115 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
 /// float arithmetic op (an int is `cvtsi2sd`'d at its use site).
 fn isNumKind(k: Kind) bool {
     return k == .int or k == .float;
+}
+
+// ---------------------------------------------------------------------------
+// doc 22 §A.1b: carried-heap roots and per-iteration table facts
+//
+// A *carried-heap* slot (class == .carried, kind == .heap) holds a table whose
+// identity changes at every back-edge (`bi = b[i]`-shaped φ writeback). Any
+// entry-time fact about that table — the seeded hash cell, the prologue's
+// type/metatable/lane checks, a hoisted array base — describes only the FIRST
+// iteration's table, so every table-rooted op on such a slot must use its
+// dynamic in-body form (exactly the forms the `.heap`-kind aload roots already
+// use). These predicates are the single decision point, shared by analysis
+// (liveness, coalescing safety, save-area sizing) and lowering.
+
+/// True iff `ref` is the slot_load of a carried-heap slot.
+fn isCarriedHeapRoot(slots: []const SlotInfo, slot_id_of_ref: []const i32, ref: u16) bool {
+    const sid = slot_id_of_ref[ref];
+    if (sid < 0) return false;
+    const s = slots[@intCast(sid)];
+    return s.class == .carried and s.kind == .heap;
+}
+
+/// True iff a table-rooted op at `ref` cannot rely on entry-time facts: the root
+/// is a per-iteration `.heap` value (VALUE_LANE aload result) or a carried-heap
+/// slot. An href on such a root needs the `resolveHashCell` callout; its
+/// guard_table/guard_hash need their dynamic in-body forms.
+fn isDynTableRoot(kinds: []const Kind, slots: []const SlotInfo, slot_id_of_ref: []const i32, ref: u16) bool {
+    return kinds[ref] == .heap or isCarriedHeapRoot(slots, slot_id_of_ref, ref);
+}
+
+/// Does lowering emit a mid-body side-exit for instruction `idx`? Home
+/// coalescing must not order an in-place carried-home update before ANY of
+/// these — the single-snapshot deopt flush would commit a partial iteration
+/// (see the coalescing block in `analyzeInner`). This is the closed inventory
+/// of every `jccNativeExit`/`jmpNativeExit` the body emitter can produce; when
+/// adding a new side-exiting lowering, extend this switch in the same change.
+///
+/// [Rule #0.5] This replaces a hand-kept op list that had gone stale: it was
+/// blind to the href-callout miss exit, the dynamic guard_table/guard_hash
+/// forms, the VALUE_LANE aload heap-tag check, and the grid guards
+/// guard_gcol/guard_gpresent — any of which, ordered after the last inventoried
+/// guard, would have let a coalesced in-place update commit early.
+fn opMayExitInBody(
+    t: *const Trace,
+    kinds: []const Kind,
+    slots: []const SlotInfo,
+    slot_id_of_ref: []const i32,
+    idx: usize,
+) bool {
+    const ins = t.instrs[idx];
+    return switch (ins.op) {
+        .guard_true,
+        .guard_false,
+        .guard_bounds,
+        .guard_present,
+        .guard_fits,
+        .guard_append,
+        .int_of_float,
+        .hload,
+        .guard_gcol,
+        .guard_gpresent,
+        => true,
+        // A VALUE_LANE aload tag-checks TAG_HEAP and side-exits on mismatch;
+        // scalar-lane aloads are exit-free (guard_present/guard_bounds dominate).
+        .aload => ins.aux == VALUE_LANE,
+        // The dynamic (per-iteration) table checks side-exit; the `.ptr` forms
+        // are prologue-hoisted / seed-validated and emit nothing in the body.
+        .guard_table => isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a),
+        // A dynamically-resolved href side-exits on callout miss (cell == 0).
+        .href => isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a),
+        .guard_hash => isDynTableRoot(kinds, slots, slot_id_of_ref, t.instrs[ins.a].a),
+        else => false,
+    };
+}
+
+// doc 22 §A.2 (HelperCaps): a heap φ keeps a raw `*GcHeader` in a register or
+// spill cell across the whole body with no GC root. That is sound only while
+// nothing in the body can trigger a collection — so every runtime helper the
+// body may call out to is enumerated here with an explicit can-GC capability,
+// and heap-φ admission refuses the trace if any callout could allocate. A new
+// callout MUST add a row (the exhaustive switch enforces it at compile time);
+// claiming `false` for a helper that allocates would be a soundness bug.
+
+/// Every runtime helper a native body can call mid-iteration.
+const BodyCallout = enum {
+    /// `resolveHashCell`: pure hash-chain walk over an existing table — reads
+    /// the key, hashes, follows cells; allocates nothing.
+    resolve_hash_cell,
+};
+
+fn calloutMayGc(c: BodyCallout) bool {
+    return switch (c) {
+        .resolve_hash_cell => false,
+    };
+}
+
+/// Which helper (if any) does instruction `idx` call out to in the body?
+fn bodyCalloutOf(
+    t: *const Trace,
+    kinds: []const Kind,
+    slots: []const SlotInfo,
+    slot_id_of_ref: []const i32,
+    idx: usize,
+) ?BodyCallout {
+    const ins = t.instrs[idx];
+    return switch (ins.op) {
+        .href => if (isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a)) .resolve_hash_cell else null,
+        else => null,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -2329,17 +2441,34 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             // from int to {int, float}; bool/ptr/aref carried still bail.
             const lk = kinds[@intCast(s.load_ref)];
             const sk = kinds[@intCast(s.store_ref)];
-            // [RV-4 / review P0] The *load* class fixes the prologue tag-check and the
-            // home's register class. A `.ptr` load (guard_table-covered table) carried
-            // would skip the table/lane checks and reinterpret an int/float payload as a
-            // `*GcHeader` → type confusion; only a boxable scalar may be carried.
-            if (lk != .int and lk != .float) return error.Bail;
-            // [RV-3] type-stability: the store class must match the load class. A slot
-            // loaded int but stored float (or vice versa) would pass our once-hoisted
-            // prologue guard forever while the oracle re-checks every iteration and
-            // deopts — and the home's register class (GP vs XMM) would be wrong. Bail.
-            if (sk != lk) return error.Bail;
-            s.kind = lk;
+            if (lk == .ptr and (sk == .ptr or sk == .heap)) {
+                // [doc 22 §A.1] Carried-heap: a guard_table-covered table slot whose φ
+                // writeback is itself a table (`bi = b[i]` — a VALUE_LANE aload result,
+                // or another table slot_load). The slot's kind becomes `.heap`, NOT
+                // `.ptr`: every `.ptr`-keyed analysis and prologue hoist (lane/grid
+                // pinning, C2 type+metatable checks, array-base homes) then skips it by
+                // kind mismatch, because those entry-time facts describe only the first
+                // iteration's table. The home is a GP register/spill holding the current
+                // `*GcHeader`, refreshed by the back-edge φ shuffle; in-body table facts
+                // come from the DYNAMIC forms (per-iteration guard_table/guard_hash, the
+                // resolveHashCell href callout) via `isCarriedHeapRoot`, and both the
+                // entry tag-check and every flush use TAG_HEAP. Structural bails below
+                // refuse anything this cut cannot check per-iteration (array/grid roots).
+                s.kind = .heap;
+            } else {
+                // [RV-4 / review P0] The *load* class fixes the prologue tag-check and the
+                // home's register class. Outside the carried-heap case above, a `.ptr`
+                // load carried would skip the table/lane checks and reinterpret an
+                // int/float payload as a `*GcHeader` → type confusion; only a boxable
+                // scalar may be carried.
+                if (lk != .int and lk != .float) return error.Bail;
+                // [RV-3] type-stability: the store class must match the load class. A slot
+                // loaded int but stored float (or vice versa) would pass our once-hoisted
+                // prologue guard forever while the oracle re-checks every iteration and
+                // deopts — and the home's register class (GP vs XMM) would be wrong. Bail.
+                if (sk != lk) return error.Bail;
+                s.kind = lk;
+            }
         } else if (loaded) {
             s.class = .invariant;
             // int OR ptr (a guard_table-covered table slot, read-only loop-invariant).
@@ -2347,6 +2476,51 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         } else {
             s.class = .write_only;
             s.kind = kinds[@intCast(s.store_ref)];
+        }
+    }
+    // [doc 22 §A.1, fail closed] Structural bails for carried-heap slots. The
+    // `.ptr`-keyed lane/grid analyses below skip a carried-heap slot by kind
+    // mismatch — which means an aref/garow rooted at one would otherwise compile
+    // SILENTLY with no lane pin and a first-iteration-only base. Refuse instead:
+    // this cut supports exactly the hash-path ops (href/guard_table/guard_hash),
+    // whose dynamic in-body forms re-check the CURRENT table each iteration. And
+    // those dynamic forms are only per-iteration if they sit in the body — a
+    // placement before the preheader marker would run once, checking iteration
+    // 1's table only, so that too is refused.
+    for (slots.items) |s| {
+        if (s.class != .carried or s.kind != .heap) continue;
+        const lr: u16 = @intCast(s.load_ref);
+        const ms: usize = marker_idx orelse 0;
+        for (t.instrs, 0..) |g, gi| {
+            switch (g.op) {
+                // No entry-hoisted per-table fact may root at a per-iteration table.
+                .aref, .garow, .guard_lane, .guard_grid, .guard_stride => {
+                    if (g.a == lr) return error.Bail;
+                },
+                .guard_table, .href => if (g.a == lr and gi < ms) return error.Bail,
+                .guard_hash => if (t.instrs[g.a].a == lr and gi < ms) return error.Bail,
+                else => {},
+            }
+        }
+    }
+    // [doc 22 §A.2] Heap-φ GC admission: a `.heap`-kind slot (carried OR
+    // write-only) keeps a raw `*GcHeader` unrooted in a register/spill across the
+    // body, sound only while no body callout can trigger a collection. Check every
+    // callout against the HelperCaps table; refuse the trace if any may GC.
+    {
+        var has_heap_phi = false;
+        for (slots.items) |s| {
+            if (s.kind == .heap) {
+                has_heap_phi = true;
+                break;
+            }
+        }
+        if (has_heap_phi) {
+            for (0..n) |ci| {
+                if (bodyCalloutOf(t, kinds, slots.items, slot_id_of_ref, ci)) |c| {
+                    if (calloutMayGc(c)) return error.Bail;
+                }
+            }
         }
     }
     // A `.ptr` (table) invariant slot accessed as an ARRAY needs the lane its
@@ -2467,18 +2641,22 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         if (ins.op != .phi) continue;
         if (last_use[ins.b] < n - 1) last_use[ins.b] = @intCast(n - 1);
     }
-    // A `.heap`-rooted href reads ins.a (the per-iteration *GcHeader from an aload)
-    // but `operandReads(.href)` returns {false, false} (the loop-invariant path reads
-    // from the seeded slab slot, not from operand refs). Extend the aload result's
+    // A dynamically-rooted href reads ins.a (the per-iteration *GcHeader — a
+    // VALUE_LANE aload result, or a carried-heap slot_load) but
+    // `operandReads(.href)` returns {false, false} (the loop-invariant path reads
+    // from the seeded slab slot, not from operand refs). Extend the root's
     // liveness here so it survives to the href and the guard_hash that follows it.
-    // guard_hash also reads href_ins.a (the same aload) to check hash population.
+    // guard_hash also reads href_ins.a (the same root) to check hash population.
+    // (For a carried-heap slot_load the extension is a no-op — its loc IS the
+    // pinned slot home — but routing both roots through the one predicate keeps
+    // analysis and lowering deciding identically.)
     for (t.instrs, 0..) |ins, i| {
-        if (ins.op == .href and kinds[ins.a] == .heap) {
+        if (ins.op == .href and isDynTableRoot(kinds, slots.items, slot_id_of_ref, ins.a)) {
             if (last_use[ins.a] < i) last_use[ins.a] = @intCast(i);
         }
         if (ins.op == .guard_hash) {
             const href_ins = t.instrs[ins.a];
-            if (kinds[href_ins.a] == .heap) {
+            if (isDynTableRoot(kinds, slots.items, slot_id_of_ref, href_ins.a)) {
                 if (last_use[href_ins.a] < i) last_use[href_ins.a] = @intCast(i);
             }
         }
@@ -2704,22 +2882,18 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
     defer gpa.free(is_coalesced_home);
     @memset(is_coalesced_home, false);
     {
-        // The last side-exiting instruction. Mid-iteration exits are guard_true/
-        // guard_false AND the array read guards guard_bounds/guard_present (guard_int/
-        // guard_table/guard_lane are hoisted to the prologue, so they never side-exit
-        // mid-body). `hload` ALSO side-exits mid-body: it lowers to a tag-check against
-        // the guarded field type and jumps to deopt_exit on mismatch (guard_hash is the
-        // one hash op that's hoisted to the seed and never side-exits). An in-place home
-        // update that PRECEDES any of these would be committed by the deopt flush even
-        // though the iteration aborted — so home coalescing must be blocked past the
-        // last of them. Trace order is straight-line, so index order == dominance:
-        // "after" == strictly greater index.
+        // The last side-exiting instruction. An in-place home update that PRECEDES
+        // any mid-body side-exit would be committed by the deopt flush even though
+        // the iteration aborted — so home coalescing must be blocked past the last
+        // of them. `opMayExitInBody` is the closed inventory of every exit the body
+        // emitter can produce (the hoisted guards — guard_int/guard_lane and the
+        // `.ptr` forms of guard_table/guard_hash — never exit mid-body; their
+        // dynamic per-iteration forms and the href callout DO). Trace order is
+        // straight-line, so index order == dominance: "after" == strictly greater
+        // index.
         var last_body_guard: i64 = -1;
-        for (t.instrs, 0..) |ins, idx| {
-            switch (ins.op) {
-                .guard_true, .guard_false, .guard_bounds, .guard_present, .guard_fits, .guard_append, .int_of_float, .hload => last_body_guard = @intCast(idx),
-                else => {},
-            }
+        for (0..n) |idx| {
+            if (opMayExitInBody(t, kinds, slots.items, slot_id_of_ref, idx)) last_body_guard = @intCast(idx);
         }
         for (slots.items, 0..) |*s, sid| {
             if (s.class != .carried) continue;
@@ -2928,16 +3102,17 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         }
     }
 
-    // --- callout save area (Phase 2, .heap-rooted href) ---
-    // If any href in this trace operates on a `.heap`-kind table (per-iteration
-    // hash-cell resolution via `resolveHashCell`), the callout clobbers all SysV
-    // caller-saved registers. Reserve frame slots to save/restore live homes.
+    // --- callout save area (Phase 2, dynamically-rooted href) ---
+    // If any href in this trace operates on a per-iteration table (a `.heap`-kind
+    // aload result OR a carried-heap slot — hash-cell resolution via
+    // `resolveHashCell`), the callout clobbers all SysV caller-saved registers.
+    // Reserve frame slots to save/restore live homes.
     var callout_save_base: u32 = 0;
     var callout_save_count: u32 = 0;
     {
         var needs_callout = false;
         for (t.instrs) |ins| {
-            if (ins.op == .href and kinds[ins.a] == .heap) {
+            if (ins.op == .href and isDynTableRoot(kinds, slots.items, slot_id_of_ref, ins.a)) {
                 needs_callout = true;
                 break;
             }
@@ -3410,7 +3585,10 @@ fn flushSlot(a: *x64.Assembler, slot: i32, kind: Kind, payload: Place) !void {
     const tag: u8 = switch (kind) {
         .bool => TAG_BOOL,
         .float => TAG_FLOAT,
-        .ptr => TAG_HEAP,
+        // `.ptr` (invariant table) and `.heap` (per-iteration table — a carried-heap
+        // slot's current value or a write-only VALUE_LANE aload result) both hold a
+        // raw *GcHeader payload and re-box as a heap ref.
+        .ptr, .heap => TAG_HEAP,
         else => TAG_INT,
     };
     const poff: i32 = slot * 8;
@@ -4252,6 +4430,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         if (s.class == .write_only) continue;
         const tag: u8 = switch (s.kind) {
             .ptr, .func, .native => TAG_HEAP, // all invariant heap pointers
+            // A carried-heap slot enters holding a table (TAG_HEAP). Its table-type/
+            // metatable facts are NOT hoisted here — the dynamic in-body guard_table
+            // re-checks the CURRENT table every iteration (doc 22 §A.1).
+            .heap => TAG_HEAP,
             .float => TAG_FLOAT,
             else => TAG_INT,
         };
@@ -4414,11 +4596,13 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // the prologue grid-elem/stride checks (invariant within a native run) —
             // nothing here, exactly like guard_table/guard_lane.
             .slot_load, .guard_int, .guard_float, .guard_lane, .guard_func, .guard_pure, .guard_grid, .guard_stride => {},
-            // guard_table: hoisted no-op for .ptr-kind operands (prologue checks).
-            // For .heap-kind operands (Phase 2, per-iteration element tables from
-            // .value-lane aload), emit per-iteration type + metatable checks.
+            // guard_table: hoisted no-op for invariant `.ptr` operands (prologue
+            // checks). For per-iteration roots — a `.heap`-kind VALUE_LANE aload
+            // result, or a carried-heap slot whose home the back-edge φ shuffle
+            // refreshes (doc 22 §A.1) — emit per-iteration type + metatable checks
+            // against the CURRENT table.
             .guard_table => {
-                if (kinds[ins.a] == .heap) {
+                if (isDynTableRoot(kinds, alloc.slots, alloc.slot_id_of_ref, ins.a)) {
                     const tbl_reg = try refBaseReg(a, alloc, ins.a, .rax);
                     // Check GcHeader.type == TABLE_TYPE
                     try a.cmpByteMemImm(tbl_reg, HEADER_TYPE_OFF, TABLE_TYPE);
@@ -4430,11 +4614,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 }
                 // else: .ptr → prologue-hoisted, no-op
             },
-            // guard_hash: for .ptr-rooted href, the seed validation covers it (no-op).
-            // For .heap-rooted href (Phase 2), emit per-iteration hash.count() check.
+            // guard_hash: for an invariant `.ptr`-rooted href, the seed validation
+            // covers it (no-op). For a dynamically-rooted href (`.heap` aload result
+            // or carried-heap slot), emit the per-iteration hash.count() check.
             .guard_hash => {
                 const href_ins = t.instrs[ins.a];
-                if (kinds[href_ins.a] == .heap) {
+                if (isDynTableRoot(kinds, alloc.slots, alloc.slot_id_of_ref, href_ins.a)) {
                     // Load the element table's *GcHeader (the href's table operand).
                     const tbl_reg = try refBaseReg(a, alloc, href_ins.a, .rax);
                     // Compare hash.count() (u32) against the recorded population.
@@ -4549,10 +4734,13 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // payload slot `ins.aux` tagged TAG_INT); the body reads it instead of
             // recomputing the hash lookup, exactly as `aref` reads an invariant base.
             .href => {
-                if (kinds[ins.a] == .heap) {
-                    // Phase 2: per-iteration hash-cell resolution via call-out.
-                    // Save rdi/rsi (SoA bases) and all live caller-saved homes,
-                    // call resolveHashCell, restore, check result.
+                if (isDynTableRoot(kinds, alloc.slots, alloc.slot_id_of_ref, ins.a)) {
+                    // Per-iteration hash-cell resolution via call-out (the root is a
+                    // `.heap`-kind aload result, or a carried-heap slot whose current
+                    // table the seed cannot describe — its recorded seed, if any, is
+                    // ignored). Save rdi/rsi (SoA bases) and all live caller-saved
+                    // homes, call resolveHashCell, restore, check result.
+                    std.debug.assert(alloc.callout_save_count != 0); // save area must be reserved
                     try emitHrefCallout(a, t, alloc, kinds, ins, i, exit_labels);
                 } else {
                     // Loop-invariant: load seeded cell pointer from slab.
@@ -5338,4 +5526,5 @@ test {
     _ = @import("nativegen_lowering_test.zig");
     _ = @import("nativegen_arrayread_test.zig");
     _ = @import("nativegen_arraywrite_test.zig");
+    _ = @import("nativegen_carriedheap_test.zig");
 }

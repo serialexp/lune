@@ -6,13 +6,77 @@ to Bart; this file + the design docs are the record.
 
 Campaign map (from --dump-aborts across the board, 2026-08-20): (1) builtin
 recording breadth — ffrecord beyond math.sqrt (scalar 37.6×, partialsums 6.9×,
-str_format 18.5× host_barrier call); (2) root-recording linkage at inner loops —
-`recForPrepLink` aborts `.nyi_opcode` when `rec.kind == .root` even when an inner
-root trace exists (nbody 38.5×, scimark-sparse 19.9×, euler14-bit 18.4×,
-grid_matmul-family outer nests); (3) return tracing / up-recursion + call-site
+str_format 18.5× host_barrier call); (2) **[REFRAMED, see LATEST-72]**
+Pall-shape nest coverage — NOT "root-recording linkage" (the `.root` LINNER
+abort is Pall-faithful, lj_record.c 605–700); the real gaps are backend:
+heap φ writeback + seeded-trace seams + inner-root owner election (nbody
+38.5×; sparse/euler14/matmul outers abort earlier — recheck after);
+(3) return tracing / up-recursion + call-site
 hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
+
+## Status 2026-08-20 (LATEST-72) — **Arc 2 grounded + design written (doc 22, `docs/design/22-pall-shape-nest-coverage.md`): the LATEST-71 "root-recording LINNER linkage" framing was WRONG — LuaJIT also LINNER-aborts a root at an interpreted inner loop; the side-trace tree ALREADY EXISTS on nbody and three general backend gaps keep it from running.**
+
+- Evidence (nbody, --jit-debug + --dump-native + --dump-traces at 3bcc337):
+  advance:34 (inner j-loop root, `.loop`) compiles native, 17149 B;
+  advance:132 (outer-body bridge, `.link -> 34` — Pall's side trace exactly)
+  records but is `unsupported`; region machinery mints the {34,132} cycle
+  (`kind=cross_trace_cycle members=2`) but `armable=false owner_unique=false`;
+  all anchors legacy-strike-gate (completed=0 → windows 256→8192); run is
+  0.6% traced / 50.1% tier-0-with-fallback.
+- The three general blockers (doc 22 phases): **A** proveKinds rejects `.heap`
+  φ writebacks (nativegen.zig:2009) while `.ptr` already boxes TAG_HEAP —
+  kills any array-of-objects continuation (132's `%122 phi update=%72` is the
+  per-iteration bodies[i] table); **B** ~15 `inputs.len != 0` sites in
+  trace.zig lock any InputSeed-carrying trace (34 has ONE upvalue seed:
+  `local sqrt = math.sqrt`) out of links/regions/arming — fix = native
+  prologue seeding + driveChain seedTraceInputs + audited gate relaxation
+  (site table in doc 22 §B.4); **C** closed cycle entered at an inner root
+  elects no owner (no ext edge, no enclosing member — outer root correctly
+  never traces) — extend A-vii-d.1 with cycle-entry election.
+- Doc 16's corrected verdict is the reason C matters: tier-1a/driveChain
+  chaining is NEUTRAL on 1–4-trip clusters (nbody n=5); only the frozen
+  native↔native patched cycle (B-3) pays.
+- Sequencing A → B → C, each gated + measured vs `just shadow` baseline.
+- Doc 22 APPROVED by codex (round 5, thread 01a01ae1-bba9-7be2-a197-fc093d179c24).
+- NEXT: implement Phase B (seeded-trace seams, doc 22 §B) → C → D.
+
+## Status 2026-08-20 (LATEST-73) — **Doc 22 Phase A LANDED: carried-heap slot class (heap φ writeback) in nativegen.zig + §A.3 test matrix. Wall-clock neutral as designed — the payoff ships with B (seams) + C (owner election).**
+
+- nativegen.zig: carried-heap classification (`class=.carried, kind=.heap`
+  when load kind `.ptr` ∧ store kind ∈ {`.ptr`,`.heap`}); Pass-C admits
+  `.heap` φ.b; `flushSlot` + entry-tag switch grew `.heap → TAG_HEAP` arms;
+  guard_table/href/guard_hash lowering keys on `isDynTableRoot` (per-iteration
+  `.heap` value OR carried-heap root) → in-body dynamic guard_table +
+  guard_hash + `resolveHashCell` callout, seed `aux` ignored (option (b):
+  seedTraceInputs still redundantly seeds; a seed-validation failure only
+  declines native entry → tier-1a, never misexecutes); fail-closed structural
+  bails (aref/garow/guard_lane/guard_grid/guard_stride rooted at a carried-heap
+  slot; pre-marker placement of the dynamic forms); §A.2 HelperCaps table
+  (BodyCallout enum, `calloutMayGc`, heap-φ admission refuses GC-capable
+  callouts — resolve_hash_cell is the only row, non-allocating).
+- [Rule #0.5] PRE-EXISTING BUG fixed: the `last_body_guard` coalescing
+  inventory was a hand-kept op list missing SIX mid-body exit classes
+  (dynamic guard_table, href callout miss, dynamic guard_hash, VALUE_LANE
+  aload tag check, guard_gcol, guard_gpresent) — a coalesced in-place φ
+  update ordered before any of them committed early on that exit. Replaced
+  with `opMayExitInBody` (single predicate, doc 22 §A.1b).
+- Tests: `src/nativegen_carriedheap_test.zig` (registered in nativegen.zig's
+  test block): carried-heap read loop expectMatch ×4 entry states (incl.
+  entry-tag-mismatch decline + mid-loop TAG_HEAP flush) + frameless variant;
+  dual-universe hstore-through-carried-root (field-by-field + corresponding-
+  element pointer check); Rule-0.5 coalescing pin; fail-closed array-op bail.
+  BOTH pins mutation-verified (reverting each guard makes exactly that test
+  fail: "expected 4, found 5" / bail-test compiles).
+- Gate battery green: `just test`, `zig build test -Djit-debug=true`,
+  six-hash × both tiers, three repros (109/109/18135), `just bench` 28/28
+  cross=ok, board within noise (nbody 40.7× ≈ baseline — expected: in a live
+  run the advance:132 bridge is never recorded/entered, link arms=0, until
+  Phase B seeds the seams).
+- NEXT: Phase B — seeded-trace seams (NativeSeedCtx, prologue seeding
+  tri-state, SEED_DECLINE exit + ledger row, driveChain seeding callback,
+  audited `inputs.len != 0` relaxation behind `stubEnterable`, §B.4/§B.5).
 
 ## Status 2026-08-20 (LATEST-71) — **Arc 1 (hash-cell alias classification, doc 08 §2026-08-20) LANDED: `recHashGet` classifies pending stores instead of blanket-aborting. nbody's recording blocker is gone; wall-clock unchanged as predicted — the win ships with the root-LINNER arc.**
 
