@@ -1856,3 +1856,191 @@ test "driveChain ordinary_header: chains at the anchor, not a guard's lane ordin
     gpa.destroy(trace_a);
     gpa.destroy(trace_b);
 }
+
+// ---------------------------------------------------------------------------
+// Doc 22 §B.5 (Phase B-iv.3): the widened replayLedger fused-successor asserts,
+// POSITIVE paths. Zero-input successors keep the pre-B-iv shape-only contract
+// (the grammar tests above); a SEEDED fused successor is newly admitted iff it
+// is stub-enterable at drain time — which real fused rows guarantee (the span
+// dispatched into the successor's self-seeding entry within this same frame).
+// These pin that a seeded, enterable successor drains identically to its
+// zero-input twin instead of tripping the widened panic.
+// ---------------------------------------------------------------------------
+
+/// Inert seed twin for the seeded-successor fixtures below — `stubEnterable`
+/// never calls it, but `NativeSeedCtx.seed_fn` has no default.
+fn seededReplayDummySeed(
+    ctx: *const trace.NativeSeedCtx,
+    t: *const Trace,
+    plan_bits: u64,
+) callconv(.c) u64 {
+    _ = ctx;
+    _ = t;
+    _ = plan_bits;
+    return trace.NativeSeedCtx.SEED_OK;
+}
+
+test "B-iv.3 (doc 22 §B.5): [I.loop_done_linked, C.prologue_fail] with a SEEDED enterable continuation drains like the zero-input twin" {
+    // Mirror of the zero-input `[I.loop_done_linked, C.prologue_fail]` grammar
+    // test above, but the fused continuation is a SEEDED page (plan/prologue
+    // agreeing, fresh episode ctx). The widened `.ordinary` assert must accept
+    // it; every directive/accounting outcome matches the zero-input twin.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
+
+    const inner_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .a = 0, .aux = 2 }, // loop-done guard, post-loop pc 2
+        .{ .op = .loop },
+    };
+    var inner: Trace = .{
+        .id = 221,
+        .anchor = .{ .proto = &proto, .pc = 5 },
+        .instrs = @constCast(&inner_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    const cont_instrs = [_]IrInstr{
+        .{ .op = .link, .aux = 5 },
+    };
+    var seed_inputs = [_]trace.InputSeed{undefined};
+    var cont: Trace = .{
+        .id = 222,
+        .anchor = .{ .proto = &proto, .pc = 2 },
+        .instrs = @constCast(&cont_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .inputs = &seed_inputs,
+        .native = .{ .compiled = .{
+            .page = undefined,
+            .gpa = gpa,
+            .ordinary_entry = 0xCAFE,
+            .seed_plan = .{ .bits = 1 },
+            .seed_prologue = true,
+        } },
+    };
+    try state.cache.append(gpa, &inner);
+    try state.cache.append(gpa, &cont);
+
+    // Fresh episode ctx: the fused span just dispatched into the continuation's
+    // self-seeding entry within this frame, so drain-time freshness holds.
+    const ctx = try gpa.create(trace.NativeSeedCtx);
+    ctx.* = .{ .seed_fn = seededReplayDummySeed };
+    state.native_seed_ctx = ctx; // state.deinit() destroys it
+    ctx.proto = @ptrCast(&proto);
+    ctx.call_seq = 7;
+    state.region_context = .{ .depth = 0, .call_seq = 7 };
+
+    const entries = [_]irinterp.LedgerEntry{
+        .{ .cum = 1, .id = 221, .exit = 0, .reason = .normal, .kind = .loop_done_linked, .outcome = .normal },
+        .{ .cum = 1, .id = 222, .exit = std.math.maxInt(u32), .reason = .prologue_fail, .kind = .prologue_fail, .outcome = .normal },
+    };
+    var regs = [_]Value{Value.int(0)};
+    var tr_regs = TestRegs{ .regs = &regs };
+    const r = state.driveDispatcherLedger(&inner, &entries, &proto, tr_regs.view(), false);
+
+    // Identical to the zero-input twin: the committed loop-done survives,
+    // coherent at the continuation anchor, and nothing charges.
+    try testing.expectEqual(@as(usize, 1), r.completed);
+    try testing.expectEqual(@as(?u32, 2), r.resume_pc);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 5 }));
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
+    try testing.expectEqual(@as(u64, 0), state.native_link_exits);
+}
+
+test "B-iv.3 (doc 22 §B.5): [C.link_terminal, I.seed_hash_decline] with a SEEDED enterable inner drains like the zero-input twin" {
+    // Mirror of the zero-input terminal seed-decline grammar test above, but
+    // the fused inner root is genuinely SEEDED — the shape the decline row
+    // actually implies in production (a hash decline happens INSIDE a seeded
+    // page's entry, with the episode ctx necessarily fresh). Pins both B-iv.3
+    // widenings on the `.link_terminal` arm: `isInnerLoopRoot` no longer
+    // rejects the seeded successor's shape, and the widened `.linked` assert
+    // accepts the enterable page.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
+
+    const cont_instrs = [_]IrInstr{
+        .{ .op = .link, .aux = 7 },
+    };
+    var cont: Trace = .{
+        .id = 321,
+        .anchor = .{ .proto = &proto, .pc = 2 },
+        .instrs = @constCast(&cont_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    const inner_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .a = 0, .aux = 2 }, // loop-done guard, post-loop pc 2
+        .{ .op = .loop },
+    };
+    var seed_inputs = [_]trace.InputSeed{undefined};
+    var inner: Trace = .{
+        .id = 322,
+        .anchor = .{ .proto = &proto, .pc = 7 },
+        .instrs = @constCast(&inner_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .inputs = &seed_inputs,
+        .native = .{ .compiled = .{
+            .page = undefined,
+            .gpa = gpa,
+            .linked_entry = 0xBEEF,
+            .ordinary_entry = 0xCAFE,
+            .seed_plan = .{ .bits = 1 },
+            .seed_prologue = true,
+        } },
+    };
+    try state.cache.append(gpa, &cont);
+    try state.cache.append(gpa, &inner);
+
+    const ctx = try gpa.create(trace.NativeSeedCtx);
+    ctx.* = .{ .seed_fn = seededReplayDummySeed };
+    state.native_seed_ctx = ctx; // state.deinit() destroys it
+    ctx.proto = @ptrCast(&proto);
+    ctx.call_seq = 7;
+    state.region_context = .{ .depth = 0, .call_seq = 7 };
+
+    const entries = [_]irinterp.LedgerEntry{
+        .{ .cum = 0, .id = 321, .exit = 0, .reason = .normal, .kind = .link_terminal, .outcome = .normal },
+        .{ .cum = 0, .id = 322, .exit = std.math.maxInt(u32), .reason = .seed_hash_decline, .kind = .seed_hash_decline, .outcome = .normal },
+    };
+    var linked_completed: usize = 0;
+    var resume_pc: u32 = 999;
+    var hops: usize = 0;
+    const dir = state.replayLedger(
+        &entries,
+        &cont,
+        7,
+        &proto,
+        &linked_completed,
+        &resume_pc,
+        &hops,
+        8,
+        .dispatcher_root,
+        false,
+        null,
+    );
+
+    const result = switch (dir) {
+        .return_result => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    // Identical to the zero-input twin: zero progress, coherent at the
+    // decliner's own anchor, one `.link` marker + one fused follow, chargeless.
+    try testing.expectEqual(@as(usize, 0), result.completed);
+    try testing.expectEqual(@as(u32, 7), result.resume_pc);
+    try testing.expectEqual(@as(u64, 1), state.native_link_exits);
+    try testing.expectEqual(@as(u64, 1), state.native_link_follow_count);
+    try testing.expectEqual(@as(usize, 0), state.penalty.count());
+}

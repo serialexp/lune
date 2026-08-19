@@ -616,7 +616,21 @@ test "A-ii.4 re-record stability: the same guest-logical graph (new Trace.ids) r
     while (state.cache.items.len > 0) state.removeTrace(state.cache.items[0]);
 }
 
-test "A-vii-b discovered bridge descriptor validates inertly and rejects incomplete proofs or seeded children" {
+/// B-iv.3: inert seed twin for the seeded-child bridge fixture below —
+/// `stubEnterable` never calls it (freshness is ctx-stamp comparison only),
+/// but `NativeSeedCtx.seed_fn` has no default.
+fn regionBridgeDummySeed(
+    ctx: *const trace.NativeSeedCtx,
+    t: *const Trace,
+    plan_bits: u64,
+) callconv(.c) u64 {
+    _ = ctx;
+    _ = t;
+    _ = plan_bits;
+    return trace.NativeSeedCtx.SEED_OK;
+}
+
+test "A-vii-b discovered bridge descriptor validates inertly and rejects incomplete proofs or seeded children (B-iv.3: transiently, no tombstone)" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
@@ -752,15 +766,41 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
     try testing.expectEqual(@as(usize, 0), parent_slots[3]);
 
-    // Rejection B is independent of S/E: restore the discovered proof/armable bit,
-    // then make the selected physical child require dispatcher input seeding.
+    // B-iv.3 (doc 22 §B.5) replaces the old "Rejection B" (seeded child ⇒
+    // structural disproof ⇒ tombstone). A seeded child is now bridgeable when
+    // its page is stub-enterable; a NOT-enterable one declines TRANSIENTLY —
+    // null decision, no arm, and the region stays ARMABLE (its compile may be
+    // pending / the episode ctx stale; a later probe under a fresh episode may
+    // succeed, unlike the S/E disproof above which is a property of the proof).
     def.armable = true;
     def.bridges[0].invariant_slots[1] = 2;
     skip.inputs = @constCast(&[_]InputSeed{undefined});
     try testing.expect(state.validateRegionBridge(rid, &cont, 3) == null);
-    try testing.expect(!def.armable);
+    try testing.expect(def.armable); // transient decline — NOT invalidated
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
     try testing.expectEqual(@as(usize, 0), parent_slots[3]);
+
+    // ...and the positive flip: give the seeded child a stub-enterable page
+    // (compiled ordinary entry, §B.4 plan⟺prologue agreeing) under a FRESH
+    // episode ctx (ctx.proto == frame proto == anchor proto, call_seq tokens
+    // agreeing) — the same bridge decision now validates.
+    skip.native = .{ .compiled = .{
+        .page = undefined,
+        .gpa = gpa,
+        .ordinary_entry = 0xCAFE,
+        .seed_plan = .{ .bits = 1 },
+        .seed_prologue = true,
+    } };
+    const seed_ctx = try gpa.create(trace.NativeSeedCtx);
+    seed_ctx.* = .{ .seed_fn = regionBridgeDummySeed };
+    state.native_seed_ctx = seed_ctx; // state.deinit() destroys it
+    seed_ctx.proto = @ptrCast(&proto);
+    seed_ctx.call_seq = 7;
+    state.region_context = .{ .depth = 0, .call_seq = 7 };
+    const seeded_decision = state.validateRegionBridge(rid, &cont, 3) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(seeded_decision.child == &skip);
+    try testing.expect(def.armable);
 }
 
 test "A-ii.4 intern identity is the edge SET (distinct sets → distinct ids; identical set → same id)" {

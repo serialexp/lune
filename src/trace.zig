@@ -3334,16 +3334,17 @@ pub const TraceState = struct {
     /// is not an entry target for `.link`.
     /// A `t` resolved from a fused exit's `final_trace_id` is only safe to consume
     /// as "the inner root that just ran under fusion at `pc`" when it has the exact
-    /// shape `findLoopTrace` requires: a zero-input `.loop`-terminated root anchored
-    /// at `(proto, pc)`. Used to FAIL CLOSED — a fused result must be interpreted as
+    /// shape `findLoopTrace` requires: a `.loop`-terminated root anchored at
+    /// `(proto, pc)`. Used to FAIL CLOSED — a fused result must be interpreted as
     /// the trace whose id it baked, never substituted by a same-PC sibling; if the id
     /// resolves to the wrong shape/location the child's exit left `regs[]` with no
     /// known-coherent resume PC, so callers `@panic` (hard invariant failure) rather
     /// than indexing a foreign trace's `instrs` (OOB / misclassified exit /
     /// mis-accounting) or silently resuming at a PC that re-runs a committed loop.
+    /// B-iv.3 (doc 22 §B.5): seeded roots pass — shape is anchor + `.loop`
+    /// terminal only; enterability is `stubEnterable`'s job, not shape's.
     fn isInnerLoopRoot(t: *const Trace, proto: *const Proto, pc: u32) bool {
         return t.anchor.proto == proto and t.anchor.pc == pc and
-            t.inputs.len == 0 and
             t.instrs.len != 0 and t.instrs[t.instrs.len - 1].op == .loop;
     }
 
@@ -3373,7 +3374,10 @@ pub const TraceState = struct {
         for (self.cache.items) |t| {
             if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
             if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .link) continue;
-            if (t.inputs.len != 0) continue;
+            // B-iv.3 (doc 22 §B.5): seeded continuations are selectable — the
+            // tier-1a seams seed via §B.3 and a native page seeds itself at
+            // entry (§B.4 prologue), declining cleanly through the B-iv.2
+            // directives when stale.
             if (best == null or t.hit_count > best_hits) {
                 best = t;
                 best_hits = t.hit_count;
@@ -3391,8 +3395,9 @@ pub const TraceState = struct {
 
     pub fn resolveLoopDoneCont(self: *TraceState, proto: *const Proto, post_pc: u32, regs: ?RegWindow) LoopDoneCont {
         // (1) Build the pure, canonically ordered candidate list FIRST — the
-        // `findLinkTrace` structural P-G predicate only (zero-input,
-        // `.link`-tailed, anchored at `(proto, post_pc)`); nothing in this pass
+        // `findLinkTrace` structural P-G predicate only (`.link`-tailed,
+        // anchored at `(proto, post_pc)`; B-iv.3 admits seeded candidates —
+        // enterability is probed downstream); nothing in this pass
         // triggers compilation. Ranking: `hit_count` desc, then LOWEST trace id
         // (deterministic and stable across `cache.swapRemove` reshuffles —
         // §B4.7 tie-break correction). Fixed buffer, allocation-free: this runs
@@ -3404,7 +3409,6 @@ pub const TraceState = struct {
         for (self.cache.items) |t| {
             if (t.anchor.proto != proto or t.anchor.pc != post_pc) continue;
             if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .link) continue;
-            if (t.inputs.len != 0) continue;
             var pos: usize = n;
             for (buf[0..n], 0..) |p, idx| {
                 if (t.hit_count > p.hit_count or (t.hit_count == p.hit_count and t.id < p.id)) {
@@ -4111,8 +4115,16 @@ pub const TraceState = struct {
                 return null;
             }
         }
-        if (child.inputs.len != 0) {
-            self.invalidateRegion(id);
+        // B-iv.3 (doc 22 §B.5): a seeded child is bridgeable when its page is
+        // stub-enterable (compiled + `ordinary_entry` + fresh episode ctx).
+        // Enterability is TRANSIENT (fail-closed on a not-yet-compiled page or
+        // a stale ctx), unlike every structural disproof above — so decline the
+        // arm WITHOUT tombstoning the region; a later validation under a fresh
+        // episode may succeed. (Pre-B-iv a seeded child was structurally
+        // barred, which is what justified the invalidate.)
+        if (child.inputs.len != 0 and
+            !self.stubEnterable(child, .ordinary, child.anchor.proto))
+        {
             return null;
         }
         return .{ .child = child, .bridge = b };
@@ -4303,10 +4315,9 @@ pub const TraceState = struct {
                 continue;
             }
             if (parent.anchor.proto != child.anchor.proto or parent.anchor.pc != child.anchor.pc) continue;
-            if (child.inputs.len != 0) {
-                self.dbg("provenance-drain: t={d} ei={d} decline: child inputs={d}", .{ edge.parent_id, edge.exit_instr, child.inputs.len });
-                continue;
-            }
+            // B-iv.3 (doc 22 §B.5): seeded children are drainable — the arm
+            // funnel's validator (`armNativeLink`) gates enterability via
+            // `stubEnterable`, so no separate input filter here.
             if (parent.isBridgeCandidate(edge.exit_instr)) {
                 self.dbg("provenance-drain: t={d} ei={d} decline: bridge candidate", .{ edge.parent_id, edge.exit_instr });
                 continue;
@@ -5267,13 +5278,13 @@ pub const TraceState = struct {
             // (doc 22 §B.3): the TIER-1A walk seeds it right here via the episode
             // ctx's seeding twin — hash-decline included (tier-1a re-derives hash
             // cells from `href` operands and side-exits at the same guard); only
-            // a capacity decline (or a missing ctx, fail closed) skips it. The
-            // NATIVE walk still requires an input-free candidate until B-iv
-            // (stubEnterable + the fused seed-decline directives) — it still runs
-            // via the dispatcher's own seeded entry. Ordered AFTER the shape
-            // filters so a filtered-out candidate is never spuriously seeded.
-            if (sct.inputs.len != 0) {
-                if (tier == .native_only) continue;
+            // a capacity decline (or a missing ctx, fail closed) skips it.
+            // B-iv.3 (doc 22 §B.5): the NATIVE walk accepts a seeded candidate
+            // outright — its page seeds itself at entry (§B.4 prologue) and a
+            // stale seed declines through the B-iv.2 hop-0 directives (no
+            // strike, no receipt). Ordered AFTER the shape filters so a
+            // filtered-out candidate is never spuriously seeded.
+            if (sct.inputs.len != 0 and tier != .native_only) {
                 if (!self.seedForTier1a(sct, proto)) continue;
             }
 
@@ -5323,7 +5334,8 @@ pub const TraceState = struct {
                     self.ledger_scratch[0].kind != .link_terminal;
                 if (sresult.ledger_len > 2 or nonlink_headed) {
                     if (safe_to_arm and materialization == .ordinary_header and
-                        sct.inputs.len == 0 and self.isSourceBranchGuardExit(failed, exit_instr, proto))
+                        self.stubEnterable(sct, .ordinary, proto) and
+                        self.isSourceBranchGuardExit(failed, exit_instr, proto))
                     {
                         if (self.armNativeLink(failed, exit_instr, sct, .ordinary_guard) catch false) {
                             self.native_source_link_arms +|= 1;
@@ -5441,7 +5453,8 @@ pub const TraceState = struct {
                 // continuation's), so the fused call stops at the ramp's `.link` = the M1
                 // receipt, never skip->ramp->inner (= M2, which needs the deferred ledger).
                 if (tier == .native_only and safe_to_arm and materialization == .ordinary_header and
-                    sct.inputs.len == 0 and self.isSourceBranchGuardExit(failed, exit_instr, proto))
+                    self.stubEnterable(sct, .ordinary, proto) and
+                    self.isSourceBranchGuardExit(failed, exit_instr, proto))
                 {
                     if (self.armNativeLink(failed, exit_instr, sct, .ordinary_guard) catch false) {
                         self.native_source_link_arms +|= 1;
@@ -6659,6 +6672,17 @@ pub const TraceState = struct {
                         @panic("replayLedger: fused successor id did not resolve");
                     if (!isInnerLoopRoot(succ, proto, owner_inner_pc))
                         @panic("replayLedger: fused successor is not the expected inner root");
+                    // B-iv.3 (doc 22 §B.5): seeded successors are newly admitted
+                    // (isInnerLoopRoot no longer rejects them), but only under the
+                    // rule — the fused span DID dispatch into this successor's
+                    // `linked_entry`, so a seeded page must be stub-enterable right
+                    // now (it just self-seeded this frame; a hash/capacity decline
+                    // leaves enterability intact). Zero-input successors keep the
+                    // pre-B-iv shape-only contract (widened with the rule, never
+                    // narrowed: real fused rows always have compiled successors,
+                    // but the seed-freshness proof only exists for seeded pages).
+                    if (succ.inputs.len != 0 and !self.stubEnterable(succ, .linked, proto))
+                        @panic("replayLedger: fused seeded successor is not stub-enterable");
                     // 2c-E: a fused `C.link → I` edge IS a continuation→inner follow —
                     // the same event the physical call-A hop top charges via its
                     // follow counters. Charge it here so a `run_continuation` handover
@@ -6760,10 +6784,19 @@ pub const TraceState = struct {
                     // `.link` continuation anchored at this inner's post-loop PC.
                     const succ = self.traceById(entries[k + 1].id) orelse
                         @panic("replayLedger: fused continuation id did not resolve");
-                    if (!(succ.inputs.len == 0 and succ.instrs.len != 0 and
+                    if (!(succ.instrs.len != 0 and
                         succ.instrs[succ.instrs.len - 1].op == .link and
                         succ.anchor.proto == proto and succ.anchor.pc == post_pc))
                         @panic("replayLedger: fused successor is not the expected continuation");
+                    // B-iv.3 (doc 22 §B.5): seeded continuations are newly admitted
+                    // (the `inputs.len == 0` shape clause is gone), but only under
+                    // the rule — the loop-done arm dispatched into this
+                    // continuation's `ordinary_entry`, so a seeded page must be
+                    // stub-enterable right now (it just self-seeded this frame).
+                    // Zero-input continuations keep the pre-B-iv shape-only
+                    // contract (widened with the rule, never narrowed).
+                    if (succ.inputs.len != 0 and !self.stubEnterable(succ, .ordinary, proto))
+                        @panic("replayLedger: fused seeded continuation is not stub-enterable");
                     // 2c-E: the armed `I.loopdone → C.ordinary_entry` edge actually
                     // fired in native code — the consumer-side proof of the arm.
                     self.native_loopdone_link_fused +|= 1;
@@ -7287,10 +7320,12 @@ pub const TraceState = struct {
                 // B-iii (doc 22 §B.3): a seeded inner is enterable on tier-1a
                 // after per-entry seeding through the episode ctx (capacity
                 // decline / missing ctx → end the burst, as an unenterable
-                // child). The NATIVE burst stays input-free until B-iv. A fused
-                // result never reaches the seeding call: fusion is native-only.
-                if (inner.inputs.len != 0) {
-                    if (tier == .native_only) break;
+                // child). B-iv.3 (doc 22 §B.5): the NATIVE burst accepts a
+                // seeded inner — its page seeds itself at entry (§B.4) and a
+                // stale seed declines through the B-iv.2 call-A directive. A
+                // fused result never reaches the seeding call: fusion is
+                // native-only.
+                if (inner.inputs.len != 0 and tier != .native_only) {
                     if (!self.seedForTier1a(inner, proto)) break;
                 }
                 if (tier == .native_only) self.native_link_follow_count +|= 1;
@@ -7498,7 +7533,10 @@ pub const TraceState = struct {
                 //  - native tier (tier-1a has no slots);
                 //  - `safe_to_arm` (no safepoint-line/suspend recording — an armed
                 //    hop erases the 8-hop observation boundary, doc 17 must-fix);
-                //  - `inner.inputs.len == 0` (a bare `jmp` can't seed inputs);
+                //  - `stubEnterable(inner, .linked)` (B-iv.3: the page prologue
+                //    owns the seeding, so a seeded inner is armable when its
+                //    episode ctx is fresh — the bare `jmp` lands on a
+                //    self-seeding entry);
                 //  - fail-closed same-inner check: the terminal slot we arm must
                 //    actually name THIS inner's root PC, else stay unarmed.
                 // CRITICAL: read the terminal from `current_link` HERE, AFTER the
@@ -7513,7 +7551,8 @@ pub const TraceState = struct {
                 // `armNativeLink` (registers the P-E backlink so a retiring `inner`
                 // resets the slot before its mcode is reused).
                 const arm_term = current_link.instrs[current_link.instrs.len - 1];
-                if (tier == .native_only and safe_to_arm and inner.inputs.len == 0 and
+                if (tier == .native_only and safe_to_arm and
+                    self.stubEnterable(inner, .linked, proto) and
                     arm_term.op == .link and @as(u32, @intCast(arm_term.aux)) == inner_pc)
                 {
                     const slot: u32 = @intCast(current_link.instrs.len - 1);
@@ -8056,7 +8095,6 @@ pub const TraceState = struct {
                     visited[nvisited] = sct;
                     nvisited += 1;
                 }
-                if (sct.inputs.len != 0) continue;
                 if (sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link) return true;
             }
         }
@@ -9528,7 +9566,15 @@ pub const TraceState = struct {
             .compiled => |*c| c,
             else => return null,
         };
-        if (link.child.inputs.len != 0) return null;
+        // B-iv.3 (doc 22 §B.5): promotion re-proves enterability through the
+        // shared predicate — a seeded child promotes only while its episode ctx
+        // is fresh (the frozen cycle re-seeds on every entry via the §B.4
+        // prologue, and the ctx is re-stamped at each frame's
+        // `prepareNativeEpisode`). Entry kind mirrors the target switch below.
+        if (!self.stubEnterable(link.child, switch (link.kind) {
+            .link_terminal => .linked,
+            .ordinary_guard, .loop_done_linked, .sibling_handoff, .region_bridge => .ordinary,
+        }, link.child.anchor.proto)) return null;
         const target = switch (link.kind) {
             .link_terminal => child_compiled.linked_entry orelse return null,
             .ordinary_guard, .loop_done_linked, .sibling_handoff => child_compiled.ordinary_entry orelse return null,
@@ -10139,9 +10185,11 @@ pub const TraceState = struct {
                 // The defining property: parent and child share an anchor.
                 if (child.anchor.proto != parent.anchor.proto or
                     child.anchor.pc != parent.anchor.pc) return false;
-                // `ordinary_entry` cannot seed synthetic inputs (that is
-                // dispatcher-side), so a child needing them is not stub-enterable.
-                if (child.inputs.len != 0) return false;
+                // B-iv.3 (doc 22 §B.5): the page prologue owns the seeding
+                // (§B.4), so a seeded child IS stub-enterable when its episode
+                // ctx is fresh — consult the shared predicate instead of the
+                // pre-B-iv "ordinary_entry cannot seed" blanket rule.
+                if (!self.stubEnterable(child, .ordinary, child.anchor.proto)) return false;
             },
         }
         // The child/target association is derived here, never trusted from a caller.
@@ -10320,13 +10368,17 @@ pub const TraceState = struct {
         const term = cont.instrs[cont.instrs.len - 1];
         if (term.op != .link) return;
         // The child must be the shape `replayLedger`'s fused `.link_terminal`
-        // successor validation release-panics on anything but: a zero-input inner
-        // loop root in the same proto at exactly the `.link`-named PC.
+        // successor validation release-panics on anything but: an inner loop
+        // root in the same proto at exactly the `.link`-named PC (B-iv.3:
+        // seeded roots included — enterability checked below).
         if (!isInnerLoopRoot(inner, cont.anchor.proto, @intCast(term.aux))) return;
         // Both ends need native code: the parent for its slot table, the child for
         // the `linked_entry` the arm derives (`armNativeLink` re-checks; missing
         // native on either side must no-op silently, not assert).
         if (self.nativeFor(cont) == null or self.nativeFor(inner) == null) return;
+        // B-iv.3 (doc 22 §B.5): mirror the scalar call-A arm site's widened
+        // gate — a seeded inner arms only while stub-enterable (fresh ctx).
+        if (!self.stubEnterable(inner, .linked, cont.anchor.proto)) return;
         const slot: u32 = @intCast(cont.instrs.len - 1);
         const armed = self.armNativeLink(cont, slot, inner, .link_terminal) catch false;
         if (armed) self.native_link_arms +|= 1;
@@ -10361,16 +10413,18 @@ pub const TraceState = struct {
     /// event, D4'). P-G eligibility is re-validated fail-closed — cheap, and it
     /// keeps the invariant local rather than trusting the caller.
     fn armLoopDoneLinkTo(self: *TraceState, inner: *Trace, guard_idx: u32, post_pc: u32, cont: *Trace) void {
-        // Continuation eligibility (P-G): a zero-input `.link` trace anchored exactly
-        // at the guard's post-loop PC in the same proto — the shape `replayLedger`'s
+        // Continuation eligibility (P-G): a `.link` trace anchored exactly at
+        // the guard's post-loop PC in the same proto — the shape `replayLedger`'s
         // `.loop_done_linked` successor validation release-panics on, so anything
-        // else must stay unarmed.
-        if (cont.inputs.len != 0) return;
+        // else must stay unarmed. B-iv.3 (doc 22 §B.5): seeded continuations
+        // qualify when stub-enterable — checked AFTER `nativeFor` (the predicate
+        // never compiles), mirroring the widened replay assert.
         if (!(cont.instrs.len != 0 and cont.instrs[cont.instrs.len - 1].op == .link)) return;
         if (!(cont.anchor.proto == inner.anchor.proto and cont.anchor.pc == post_pc)) return;
         // `ordinary_entry` is optional — a missing entry (e.g. a test stub or an
         // unsupported compile) leaves the slot unarmed, never `.?`-traps.
         _ = self.nativeFor(cont) orelse return;
+        if (!self.stubEnterable(cont, .ordinary, inner.anchor.proto)) return;
         const armed = self.armNativeLink(inner, guard_idx, cont, .loop_done_linked) catch false;
         if (armed) self.native_loopdone_link_arms +|= 1;
     }

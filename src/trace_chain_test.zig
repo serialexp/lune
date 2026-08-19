@@ -498,3 +498,137 @@ test "B-iv.1 stubEnterable (doc 22 §B.4): entry presence, unseeded pass, seeded
     state.region_context = null;
     try testing.expect(!state.stubEnterable(&seeded, .ordinary, &proto));
 }
+
+// ---------------------------------------------------------------------------
+// Doc 22 §B.5 (Phase B-iv.3): the seeded-entry gate flips. Selection sites
+// (findLinkTrace / resolveLoopDoneCont) admit seeded candidates outright —
+// enterability is probed downstream — and the arm/validator sites consult
+// `stubEnterable` with the entry kind they target instead of the pre-B-iv
+// blanket `inputs.len == 0` bar. Each test here is the regression net for a
+// §B.5 table row; the driveChain-internal seams (side-walk seed-accept,
+// call-A follow, armLinkTerminal/armLoopDoneLinkTo, promotedEdgeFromLink)
+// are covered end-to-end by the §B.6 battery.
+// ---------------------------------------------------------------------------
+
+test "B-iv.3 (doc 22 §B.5): findLinkTrace + resolveLoopDoneCont admit a seeded continuation" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity(); // stack-backed traces
+
+    const proto = Proto{
+        .code = &.{Instr.op0(.ret)},
+        .name = "biv3-select",
+        .num_registers = 1,
+    };
+    // A SEEDED `.link` continuation at the post-loop pc 2: dispatcher inputs
+    // non-empty AND a compiled page whose §B.4 plan/prologue agree. Pre-B-iv.3
+    // both selectors skipped it on `inputs.len != 0`.
+    var seed_inputs = [_]trace.InputSeed{undefined};
+    const cont_instrs = [_]IrInstr{
+        .{ .op = .link, .aux = 7 },
+    };
+    var cont: Trace = .{
+        .id = 71,
+        .anchor = .{ .proto = &proto, .pc = 2 },
+        .instrs = @constCast(&cont_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .inputs = &seed_inputs,
+        .native = .{ .compiled = .{
+            .page = undefined,
+            .gpa = gpa,
+            .ordinary_entry = 0xCAFE,
+            .seed_plan = .{ .bits = 1 },
+            .seed_prologue = true,
+        } },
+    };
+    try state.cache.append(gpa, &cont);
+
+    // Pure selection: seeded is selectable, no episode ctx required.
+    try testing.expect(state.findLinkTrace(&proto, 2) == &cont);
+
+    // The canonical loop-done continuation selector: the positional buffer
+    // admits the seeded candidate and the arm probe (nativeFor, already
+    // compiled here) resolves it as both the arm and run target.
+    const sel = state.resolveLoopDoneCont(&proto, 2, null);
+    try testing.expect(sel.arm == &cont);
+    try testing.expect(sel.run == &cont);
+}
+
+test "B-iv.3 (doc 22 §B.5): armNativeLink .sibling_handoff arms a seeded child only under a fresh episode ctx" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity(); // stack-backed traces
+
+    const proto = Proto{
+        .code = &.{Instr.op0(.ret)},
+        .name = "biv3-sibling",
+        .num_registers = 1,
+    };
+    const parent_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .aux = 1 },
+        .{ .op = .loop },
+    };
+    const parent_slots = try gpa.alloc(usize, parent_instrs.len);
+    defer gpa.free(parent_slots);
+    @memset(parent_slots, 0);
+    var parent: Trace = .{
+        .id = 81,
+        .anchor = .{ .proto = &proto, .pc = 7 },
+        .instrs = @constCast(&parent_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = parent_slots, .gpa = gpa } },
+    };
+    // The SEEDED same-anchor sibling: pre-B-iv.3 the `.sibling_handoff` arm
+    // refused it unconditionally on `inputs.len != 0`.
+    var seed_inputs = [_]trace.InputSeed{undefined};
+    var child: Trace = .{
+        .id = 82,
+        .anchor = parent.anchor,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .inputs = &seed_inputs,
+        .native = .{ .compiled = .{
+            .page = undefined,
+            .gpa = gpa,
+            .ordinary_entry = 0xCAFE,
+            .seed_plan = .{ .bits = 1 },
+            .seed_prologue = true,
+        } },
+    };
+    try state.cache.append(gpa, &parent);
+    try state.cache.append(gpa, &child);
+
+    // (1) No episode ctx at all → stubEnterable fail-closed → arm refused,
+    // slot untouched (the pre-B-iv disposition).
+    try testing.expect(!try state.armNativeLink(&parent, 0, &child, .sibling_handoff));
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), parent_slots[0]);
+
+    // (2) Stale ctx (frame token drifted since the episode stamp) → refused.
+    const ctx = try gpa.create(trace.NativeSeedCtx);
+    ctx.* = .{ .seed_fn = stubEnterableDummySeed };
+    state.native_seed_ctx = ctx; // state.deinit() destroys it
+    ctx.proto = @ptrCast(&proto);
+    ctx.call_seq = 7;
+    state.region_context = .{ .depth = 0, .call_seq = 8 };
+    try testing.expect(!try state.armNativeLink(&parent, 0, &child, .sibling_handoff));
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expectEqual(@as(usize, 0), parent_slots[0]);
+
+    // (3) Fresh ctx (tokens agree) → the seeded child ARMS: the page prologue
+    // owns the seeding at entry (§B.4), so the bare jump is safe.
+    state.region_context = .{ .depth = 0, .call_seq = 7 };
+    try testing.expect(try state.armNativeLink(&parent, 0, &child, .sibling_handoff));
+    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    try testing.expectEqual(ArmKind.sibling_handoff, state.armed_links.items[0].kind);
+    try testing.expect(state.armed_links.items[0].child == &child);
+    try testing.expectEqual(@as(usize, 0xCAFE), parent_slots[0]);
+}
