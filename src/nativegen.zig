@@ -849,6 +849,39 @@ pub const ExitPatch = struct {
     metadata_cell: *usize,
 };
 
+/// Doc 22 §A.1b/§B.4: the page-owned seed plan — which of `t.inputs` this
+/// compiled page actually consumes at entry. A committed `Trace` is immutable
+/// (its `inputs` cannot be edited at analysis time), and the carried-heap
+/// rewrite makes some recorded `hash_cell` seeds redundant: an `href` rooted at
+/// a carried-heap slot re-resolves the CURRENT table's cell per iteration via
+/// the `resolveHashCell` callout and never reads the entry-seeded slab slot.
+/// Processing such a seed normally is worse than wasteful — its entry-table
+/// validation could hash-decline the whole entry even though the emitted body
+/// deliberately re-resolves per iteration. So compilation *deactivates* it here
+/// instead. The Phase-B seeding helper (`NativeSeedCtx.seed_fn`) resolves only
+/// active seeds (inactive slab slots stay unwritten), and "does this page seed
+/// at entry" is defined as `plan.nonEmpty()` — never raw `inputs.len`.
+/// Computed by `computeSeedPlan` for every compile; consumed by the Phase-B
+/// entry prologue (inert until B-ii emits it).
+pub const SeedPlan = struct {
+    /// LSB-first bitmap over `t.inputs` indices; bit set ⇒ the seed is active.
+    /// 64 bits bounds `inputs.len` for seeded pages (`computeSeedPlan` bails
+    /// beyond it, fail closed — real traces carry a handful of inputs).
+    bits: u64 = 0,
+
+    pub fn nonEmpty(self: SeedPlan) bool {
+        return self.bits != 0;
+    }
+
+    pub fn isActive(self: SeedPlan, i: usize) bool {
+        return i < 64 and (self.bits >> @intCast(i)) & 1 != 0;
+    }
+
+    fn activate(self: *SeedPlan, i: usize) void {
+        self.bits |= @as(u64, 1) << @intCast(i);
+    }
+};
+
 /// A compiled trace: an executable page whose entry is
 /// `fn(tags: [*]u8, payloads: [*]u64, result: *NativeResult) callconv(.c) void` —
 /// the SoA register file's two base pointers (tags in rdi, payloads in rsi), plus
@@ -899,6 +932,12 @@ pub const CompiledTrace = struct {
     /// remain null and every epilogue unreachable until B-3b publishes promotion.
     exit_patches: []ExitPatch = &.{},
     metadata_cells: []usize = &.{},
+    /// Doc 22 §B.4: which of the trace's `inputs` this page consumes at entry
+    /// (see `SeedPlan`). Set by `compileImpl` for every page; "this page seeds
+    /// at entry" is `seed_plan.nonEmpty()`, never raw `inputs.len`. The Phase-B
+    /// invariant (release-asserted once the prologue lands in B-ii):
+    /// `seed_plan.nonEmpty() == prologue-present`.
+    seed_plan: SeedPlan = .{},
 
     pub const EntryFn = fn ([*]u8, [*]u64, *NativeResult) callconv(.c) void;
     /// The shared frameless trampoline's C-ABI type: SoA lanes + result out-param,
@@ -1132,6 +1171,11 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
     var alloc = analyze(gpa, t, kinds, slot_of) orelse return null;
     defer alloc.deinit(gpa);
 
+    // Doc 22 §A.1b/§B.4: the page-owned seed plan. Needs the slot classes
+    // (carried-heap discrimination), so it runs after `analyze`. `null` ⇒ more
+    // inputs than the plan can name ⇒ bail (fail closed).
+    const seed_plan = computeSeedPlan(t, kinds, alloc.slots, alloc.slot_id_of_ref) orelse return null;
+
     // Frameless production path (arena present): reserve the shared trampoline and
     // emit a body that `jmp`s to its shared_exit. Test path (arena == null) keeps the
     // self-framed ABI so the standalone-page unit tests are untouched — and gives a
@@ -1280,6 +1324,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
         .ordinary_entry = ordinary_entry,
         .exit_patches = exit_patches,
         .metadata_cells = metadata_cells,
+        .seed_plan = seed_plan,
     };
 }
 
@@ -2106,11 +2151,19 @@ const BodyCallout = enum {
     /// `resolveHashCell`: pure hash-chain walk over an existing table — reads
     /// the key, hashes, follows cells; allocates nothing.
     resolve_hash_cell,
+    /// `NativeSeedCtx.seed_fn` (doc 22 §B.2): the entry-prologue seeding
+    /// callout — resolves upvalue/global/hash-cell inputs into the trace's
+    /// slab slots before the first iteration. Resolution + validation only
+    /// (upvalue reads, global-table lookups, hash-chain walks); allocates
+    /// nothing. Never returned by `bodyCalloutOf` — it runs once at entry,
+    /// before any heap φ is live, not mid-iteration.
+    seed_trace_inputs,
 };
 
 fn calloutMayGc(c: BodyCallout) bool {
     return switch (c) {
         .resolve_hash_cell => false,
+        .seed_trace_inputs => false,
     };
 }
 
@@ -2127,6 +2180,47 @@ fn bodyCalloutOf(
         .href => if (isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a)) .resolve_hash_cell else null,
         else => null,
     };
+}
+
+/// Doc 22 §A.1b: compute the page's `SeedPlan` — which of `t.inputs` the
+/// emitted body actually consumes at entry.
+///
+/// - `.upvalue` / `.global` seeds are always active: their slab slots are read
+///   by ordinary `slot_load`s in the body.
+/// - A `.hash_cell` seed is active iff some `href` names its slot (`aux ==
+///   seed.slot`) AND that href's table root is *not* dynamic (`isDynTableRoot`
+///   false). A dynamic-rooted href lowers to the per-iteration
+///   `resolveHashCell` callout (aux forced to -1) and never reads the seeded
+///   slab slot — seeding it would be dead work whose entry validation could
+///   spuriously hash-decline the whole entry.
+/// - `null` ⇒ compile bail (fail closed): more inputs than the 64-bit plan can
+///   name. Real traces carry a handful; this is a structural bound, not a
+///   tuning knob.
+fn computeSeedPlan(
+    t: *const Trace,
+    kinds: []const Kind,
+    slots: []const SlotInfo,
+    slot_id_of_ref: []const i32,
+) ?SeedPlan {
+    if (t.inputs.len > 64) return null;
+    var plan = SeedPlan{};
+    for (t.inputs, 0..) |seed, i| {
+        switch (seed.kind) {
+            .upvalue, .global => plan.activate(i),
+            .hash_cell => {
+                for (t.instrs) |ins| {
+                    if (ins.op != .href) continue;
+                    if (ins.aux < 0) continue;
+                    if (@as(u32, @intCast(ins.aux)) != seed.slot) continue;
+                    if (!isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a)) {
+                        plan.activate(i);
+                        break;
+                    }
+                }
+            },
+        }
+    }
+    return plan;
 }
 
 // ---------------------------------------------------------------------------

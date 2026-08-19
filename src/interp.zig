@@ -28,6 +28,7 @@ const table = @import("table.zig");
 const array = @import("array.zig");
 const function = @import("function.zig");
 const trace = @import("trace.zig");
+const nativegen = @import("nativegen.zig");
 const irinterp = @import("irinterp.zig");
 const execlog = @import("execlog.zig");
 const compiler = @import("compiler.zig");
@@ -830,7 +831,15 @@ pub const Vm = struct {
         errdefer gpa.free(payloads);
         const boundary_scratch = try gpa.alloc(Value, stack_slots);
         errdefer gpa.free(boundary_scratch);
-        return Vm{
+        // Doc 22 §B.1: the native seeding ctx. Heap-allocated so compiled pages
+        // can bake its address as an imm64 (`Vm` is by-value and may move; this
+        // may not). Created here rather than in `TraceState.init` to keep that
+        // init infallible for its ~120 hand-built test call sites; ownership
+        // (the free) lives in `TraceState.deinit`.
+        const seed_ctx = try gpa.create(trace.NativeSeedCtx);
+        errdefer gpa.destroy(seed_ctx);
+        seed_ctx.* = .{ .seed_fn = &nativeSeedFn };
+        var vm = Vm{
             .gpa = gpa,
             .heap = gc.Heap.init(gpa),
             .globals = undefined,
@@ -839,6 +848,8 @@ pub const Vm = struct {
             .boundary_scratch = boundary_scratch,
             .trace = trace.TraceState.init(gpa),
         };
+        vm.trace.native_seed_ctx = seed_ctx;
+        return vm;
     }
 
     /// Frees the heap (and every object on it, including globals) and the
@@ -962,6 +973,82 @@ pub const Vm = struct {
             self.regSet(base + seed.slot, v);
         }
         return self.frameWindow(base, count);
+    }
+
+    /// Doc 22 §B.2: the C-ABI seeding twin of `seedTraceInputs`, installed once
+    /// into `NativeSeedCtx.seed_fn` at VM init. Called from a seeded page's
+    /// entry prologue (B-ii) and from `driveChain`'s tier-1a seeding (B-iii),
+    /// where no `*Vm` argument exists — everything comes through the ctx the VM
+    /// filled at episode start (`prepareNativeEpisode`).
+    ///
+    /// Differences from the tier-0 original, by design:
+    /// - Resolves only the plan's ACTIVE seeds (§A.1b): a seed the carried-heap
+    ///   rewrite made redundant is skipped entirely — its slab slot stays
+    ///   unwritten and its validation cannot spuriously decline the entry.
+    /// - Returns the tri-state decline grammar instead of (null, *bool):
+    ///   `SEED_CAPACITY_DECLINE` before ANY slab write if the seed slots don't
+    ///   fit, `SEED_HASH_DECLINE` if a hash_cell seed failed validation (the
+    ///   0-bits slot is still written, exactly like the original, so tier-1a
+    ///   sees the same slab state), else `SEED_OK`.
+    /// - HelperCaps: `.seed_trace_inputs`, can_gc = false — resolution +
+    ///   validation only (upvalue reads, global lookups, hash-chain walks);
+    ///   allocates nothing.
+    fn nativeSeedFn(
+        ctx: *const trace.NativeSeedCtx,
+        ct: *const trace.Trace,
+        plan: *const nativegen.SeedPlan,
+    ) callconv(.c) u64 {
+        const self: *Vm = @ptrCast(@alignCast(ctx.vm));
+        const closure: *const function.Closure = @ptrCast(@alignCast(ctx.closure));
+        const proto: *const Proto = @ptrCast(@alignCast(ctx.proto.?));
+        // Capacity over ACTIVE seeds only — an inactive seed's slot is never
+        // written, so it cannot demand slab room.
+        var count: usize = proto.num_registers;
+        for (ct.inputs, 0..) |seed, i| {
+            if (!plan.isActive(i)) continue;
+            count = @max(count, @as(usize, seed.slot) + 1);
+        }
+        if (ctx.base + count > ctx.reg_capacity) return trace.NativeSeedCtx.SEED_CAPACITY_DECLINE;
+        var ok = true;
+        for (ct.inputs, 0..) |seed, i| {
+            if (!plan.isActive(i)) continue;
+            const v = switch (seed.kind) {
+                .upvalue => self.upvalGet(closure.upvalues[seed.source]),
+                .global => self.globals.get(proto.constants[seed.source]),
+                .hash_cell => blk: {
+                    const vtab = self.regGet(ctx.base + seed.table_reg);
+                    var cell_bits: u64 = 0;
+                    if (vtab.isHeap() and vtab.heapType() == .table) {
+                        const tbl = table.Table.fromHeader(vtab.asHeap());
+                        if (tbl.metatable == null) {
+                            if (tbl.fieldPtr(ct.consts[seed.source])) |cell| {
+                                if (tbl.hash.count() == seed.expected_count)
+                                    cell_bits = @intFromPtr(cell);
+                            }
+                        }
+                    }
+                    if (cell_bits == 0) ok = false;
+                    break :blk Value{ .tag = .int, .payload = .{ .bits = cell_bits } };
+                },
+            };
+            self.regSet(ctx.base + seed.slot, v);
+        }
+        return if (ok) trace.NativeSeedCtx.SEED_OK else trace.NativeSeedCtx.SEED_HASH_DECLINE;
+    }
+
+    /// Doc 22 §B.1: publish the current activation into the per-VM seeding ctx
+    /// at native-episode start, so a seeded page's baked `&ctx` (B-ii) and
+    /// `driveChain`'s tier-1a seeding (B-iii) describe THIS entry. `proto` +
+    /// `call_seq` are the freshness stamp consumers check (`stubEnterable`,
+    /// B-iv). No-op when the ctx is absent (hand-built test TraceStates).
+    fn prepareNativeEpisode(self: *Vm, closure: *const function.Closure, proto: *const Proto, base: usize) void {
+        const ctx = self.trace.native_seed_ctx orelse return;
+        ctx.vm = self;
+        ctx.closure = closure;
+        ctx.base = base;
+        ctx.reg_capacity = self.regCapacity();
+        ctx.proto = proto;
+        ctx.call_seq = self.frames[self.depth - 1].call_seq;
     }
 
     // ---- native / callValue boundary scratch --------------------------------
@@ -2114,6 +2201,12 @@ pub const Vm = struct {
             defer if (self.trace.config.coverage) {
                 self.trace.last_event_tsc = trace.readCycles();
             };
+            // Doc 22 §B.1: publish this activation into the seeding ctx once
+            // per episode. This single funnel covers every consumer — the
+            // direct-native run below (its seeded prologue, B-ii), the tier-1a
+            // `driveChain` path (its seeding twin, B-iii), and patched entries
+            // (`enterPatchedTrace` funnels through here too).
+            self.prepareNativeEpisode(closure, proto, base);
             var ran_native = false;
             var ran_native_link_mode = false;
             // 2.3b-1 (doc 17): a `driveChain` burst may persistently

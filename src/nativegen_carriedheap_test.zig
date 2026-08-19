@@ -366,3 +366,109 @@ test "nativegen(doc22 A): array op rooted at a carried-heap slot bails (fail-clo
     const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectBail(&tr);
 }
+
+// ---------------------------------------------------------------------------
+// Doc 22 §A.1b/§B.4 (Phase B-i): the page-owned SeedPlan.
+// ---------------------------------------------------------------------------
+
+test "nativegen(doc22 B-i): dynamic-rooted href DEACTIVATES its hash_cell seed; upvalue/global stay active" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    // The carried-heap READ shape: its href (idx 8, aux=4) roots at the carried
+    // slot 2, so it lowers to the per-iteration resolveHashCell callout and never
+    // reads seeded slab slot 4 — the matching hash_cell seed must be INACTIVE.
+    // An upvalue seed on the same trace is consumed by ordinary slot_loads and
+    // stays active regardless.
+    const key = try string.String.create(gpa, "v");
+    defer key.destroy(gpa);
+
+    var consts: [2]Value = undefined;
+    var full: [CARRIED_READ_LEN]I = undefined;
+    carriedReadIr(&consts, &full);
+    consts[0] = Value.heap(&key.header);
+    var es = [_]u16{};
+
+    // (a) hash_cell seed alone → an EMPTY plan (this page seeds nothing at entry,
+    //     even though `inputs.len == 1` — the §B.4 "never raw inputs.len" pin).
+    var ins_hash = [_]trace.InputSeed{
+        .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 2, .expected_count = 1 },
+    };
+    const tr_hash = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins_hash };
+    var ct_hash = compile(gpa, &tr_hash) orelse return error.NativeBailedUnexpectedly;
+    defer ct_hash.deinit();
+    try testing.expect(!ct_hash.seed_plan.isActive(0));
+    try testing.expect(!ct_hash.seed_plan.nonEmpty());
+
+    // (b) hash_cell + upvalue → only the upvalue bit set.
+    var ins_mixed = [_]trace.InputSeed{
+        .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 2, .expected_count = 1 },
+        .{ .kind = .upvalue, .source = 0, .slot = 30 },
+    };
+    const tr_mixed = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins_mixed };
+    var ct_mixed = compile(gpa, &tr_mixed) orelse return error.NativeBailedUnexpectedly;
+    defer ct_mixed.deinit();
+    try testing.expect(!ct_mixed.seed_plan.isActive(0));
+    try testing.expect(ct_mixed.seed_plan.isActive(1));
+    try testing.expect(ct_mixed.seed_plan.nonEmpty());
+}
+
+test "nativegen(doc22 B-i): static-rooted href keeps its hash_cell seed ACTIVE" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    // The classic H1 static shape (lowering-test win2(H1)): the href roots at a
+    // guard_table-covered, non-φ'd slot 0 (`.ptr`, loop-invariant), so it lowers
+    // to the seeded slab read `[rsi + aux*8]` — the matching seed must be ACTIVE.
+    const kt = try table.Table.create(gpa);
+    defer kt.destroy(gpa);
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table (static root)
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .konst, .aux = 0 }, // 2: key
+        .{ .op = .slot_load, .aux = 1 }, // 3: acc
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .konst, .aux = 1 }, // 5: 1
+        .{ .op = .add, .a = 3, .b = 5, .ty = .int }, // 6: acc + 1
+        .{ .op = .href, .a = 0, .b = 2, .aux = 3 }, // 7: STATIC → seeded slot 3
+        .{ .op = .guard_hash, .a = 7 }, // 8
+        .{ .op = .hload, .a = 7, .ty = .int }, // 9
+        .{ .op = .phi, .b = 6, .aux = 1 }, // acc carry
+        .{ .op = .phi, .b = 9, .aux = 2 }, // lastseen carry
+        .{ .op = .loop }, // 12
+    };
+    var consts = [_]Value{ Value.heap(&kt.header), Value.int(1) };
+    var es = [_]u16{};
+    var ins = [_]trace.InputSeed{
+        .{ .kind = .hash_cell, .source = 0, .slot = 3, .table_reg = 0, .expected_count = 0 },
+    };
+    const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins };
+    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    try testing.expect(ct.seed_plan.isActive(0));
+    try testing.expect(ct.seed_plan.nonEmpty());
+}
+
+test "nativegen(doc22 B-i): more inputs than the plan can name bails the compile (fail closed)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    const kt = try table.Table.create(gpa);
+    defer kt.destroy(gpa);
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .konst, .aux = 0 }, // 2: key
+        .{ .op = .href, .a = 0, .b = 2, .aux = 3 }, // 3
+        .{ .op = .guard_hash, .a = 3 }, // 4
+        .{ .op = .hload, .a = 3, .ty = .int }, // 5
+        .{ .op = .phi, .b = 5, .aux = 1 },
+        .{ .op = .loop },
+    };
+    var consts = [_]Value{Value.heap(&kt.header)};
+    var es = [_]u16{};
+    var ins: [65]trace.InputSeed = undefined;
+    for (&ins) |*seed| seed.* = .{ .kind = .upvalue, .source = 0, .slot = 30 };
+    const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins };
+    try testing.expect(compile(gpa, &tr) == null);
+}

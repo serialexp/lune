@@ -1503,6 +1503,53 @@ pub const InputSeed = struct {
     expected_count: u32 = 0,
 };
 
+/// Doc 22 §B.1: the per-VM native seeding context. A seeded trace's entry
+/// prologue (B-ii) and `driveChain`'s tier-1a seeding twin (B-iii) resolve
+/// entry inputs *from native/chain code*, where no `*Vm` argument exists — so
+/// the VM publishes everything the seeding helper needs into this struct once
+/// per episode (`Vm.prepareNativeEpisode`), and compiled pages bake `&ctx` as
+/// an imm64. Hence it MUST be heap-allocated with a stable address: `Vm` is a
+/// by-value struct that may move; this ctx may not. Owned by `TraceState`
+/// (created by `Vm.initBare`, freed in `TraceState.deinit`).
+///
+/// Freshness: a baked `&ctx` outlives episodes, so consumers must check that
+/// the ctx describes the CURRENT activation before trusting it — `proto` and
+/// `call_seq` are the stamp (`stubEnterable`, B-iv). `proto == null` means "no
+/// episode prepared yet" and can never read as fresh.
+///
+/// All pointers are `anyopaque` because trace.zig cannot name `Vm`/`Closure`/
+/// `Proto` (interp.zig imports trace.zig, not vice versa); `seed_fn` (installed
+/// once by `Vm.initBare`, pointing at interp.zig's C-ABI seeding twin) casts
+/// them back.
+pub const NativeSeedCtx = struct {
+    /// `seed_fn` result grammar (u64 for C-ABI simplicity; doc 22 §B.2).
+    pub const SEED_OK: u64 = 1;
+    /// A hash_cell seed failed validation (metatable appeared, key vanished,
+    /// `hash.count()` drifted): the entry must not run natively this episode.
+    pub const SEED_HASH_DECLINE: u64 = 2;
+    /// The seed slots don't fit the register slab (`base + count > capacity`):
+    /// nothing was written; the candidate itself is unusable at this depth.
+    pub const SEED_CAPACITY_DECLINE: u64 = 3;
+
+    /// `*Vm`, valid for the prepared episode only.
+    vm: *anyopaque = undefined,
+    /// `*const function.Closure` of the anchor frame (upvalue seeds).
+    closure: *const anyopaque = undefined,
+    /// Anchor frame base into the register slab.
+    base: usize = 0,
+    /// `Vm.regCapacity()` at episode start (capacity-decline check).
+    reg_capacity: usize = 0,
+    /// `*const Proto` of the anchor frame — half the freshness stamp, and the
+    /// constant pool for global/hash_cell key resolution. `null` ⇒ never fresh.
+    proto: ?*const anyopaque = null,
+    /// The anchor frame's activation token — the other half of the stamp.
+    call_seq: u64 = 0,
+    /// The C-ABI seeding twin (interp.zig `nativeSeedFn`): resolves the plan's
+    /// ACTIVE seeds into the slab, returns SEED_OK / SEED_HASH_DECLINE /
+    /// SEED_CAPACITY_DECLINE. Installed once at VM init; never reassigned.
+    seed_fn: *const fn (ctx: *const NativeSeedCtx, t: *const Trace, plan: *const nativegen.SeedPlan) callconv(.c) u64,
+};
+
 /// A completed, cached trace: the recorded IR plus the entry/exit snapshots that
 /// connect it back to tier-0 register slots. Immutable once committed (Phase 5a
 /// never invalidates a cached trace — see the lifecycle doc).
@@ -2193,6 +2240,13 @@ pub const TraceState = struct {
     /// `mmap`-per-trace model so a future increment can link trace→trace with a bare
     /// `rel32` jump. Lifetime ≥ every trace (deinited *after* the cache is freed).
     mcode_arena: nativegen.McodeArena,
+    /// Doc 22 §B.1: the per-VM native seeding context (see `NativeSeedCtx`).
+    /// Created by `Vm.initBare` (NOT `TraceState.init`, which stays infallible —
+    /// its ~120 call sites are hand-built test states that never run native
+    /// seeded entries and leave this null); freed here in `deinit`. Compiled
+    /// pages bake the pointer as an imm64, so it is assigned once and never
+    /// reallocated for the VM's lifetime.
+    native_seed_ctx: ?*NativeSeedCtx = null,
     /// Back-edge counters keyed by loop-header anchor. Only touched on the *slow*
     /// path (when the hot-count pre-filter trips), so for a non-gated anchor it
     /// still counts every back-edge (the pre-filter leaves un-gated slots at 0),
@@ -3140,6 +3194,10 @@ pub const TraceState = struct {
         for (self.cache.items) |t| t.destroy(self.gpa);
         self.cache.deinit(self.gpa);
         self.mcode_arena.deinit();
+        // Doc 22 §B.1: the seeding ctx outlives every compiled page (pages bake
+        // `&ctx` as an imm64), so it is freed only after the cache + arena are
+        // gone. Null for hand-built test states (see the field doc).
+        if (self.native_seed_ctx) |ctx| self.gpa.destroy(ctx);
         self.rec.deinit(self.gpa);
     }
 
