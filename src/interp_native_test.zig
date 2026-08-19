@@ -1176,3 +1176,116 @@ test "grid e2e: table.sort over rows by a key deflates and orders correctly" {
         "1\t2\t3\t10\t30\n",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Doc 22 §B.6 (Phase B-v): the seeded-seam e2e battery — structural upvalue-
+// seed chaining, the ten-leg upvalue-builtin nest, and hash-drift decline
+// determinism. Output identity alone cannot prove these paths fired, so the
+// native leg additionally asserts the B-iv/B-v internal witnesses.
+// ---------------------------------------------------------------------------
+
+fn assertSeededChainExercised(vm: *Vm, mode: TraceMode) anyerror!void {
+    // Only the native leg compiles pages; the other legs carry the oracle.
+    if (mode != .record_execute_native) return;
+
+    // The inner loop's trace carries the upvalue seed (`A` reached through
+    // `get_upval`) and must have compiled as a SEEDED page — the §B.4
+    // "seeds_at_entry" invariant: plan non-empty ⇔ prologue present.
+    var seeded_compiled: usize = 0;
+    for (vm.trace.cache.items) |t| {
+        if (t.inputs.len == 0) continue;
+        if (t.native != .compiled) continue;
+        const c = &t.native.compiled;
+        try testing.expectEqual(c.seed_plan.nonEmpty(), c.seed_prologue);
+        if (!c.seed_plan.nonEmpty()) continue;
+        var has_upvalue = false;
+        for (t.inputs) |seed| {
+            if (seed.kind == .upvalue) has_upvalue = true;
+        }
+        try testing.expect(has_upvalue);
+        seeded_compiled += 1;
+    }
+    try testing.expect(seeded_compiled >= 1);
+
+    // The chain seams armed AROUND the seeded page (B-iv.3: seeded traces are
+    // admitted at `findLinkTrace`/`armNativeLink`/loop-done selection), and
+    // native entry really happened.
+    try testing.expect(vm.trace.native_entries >= 1);
+    const arms = vm.trace.native_link_arms + vm.trace.native_loopdone_link_arms +
+        vm.trace.native_source_link_arms + vm.trace.sibling_handoff_arms;
+    try testing.expect(arms >= 1);
+    // Upvalue seeds have no hash cell to drift — nothing may have declined.
+    try testing.expectEqual(@as(u64, 0), vm.trace.seed_hash_declines);
+    try testing.expectEqual(@as(u64, 0), vm.trace.seed_capacity_declines);
+}
+
+test "B-v (doc 22 §B.6): structural — an upvalue-seeded inner loop chains through its .link continuation (all legs byte-identical)" {
+    // The §B.6 structural row: `run`'s inner numeric-for calls `A` through an
+    // upvalue, so its trace records exactly the upvalue InputSeed shape
+    // (interp_trace_test "callee reached through an upvalue"); the outer
+    // back-edge (`acc = acc + 1`) is its `.link` continuation. Before B-iv the
+    // chain seams skipped every seeded trace; the inspect hook pins that the
+    // seeded page compiles WITH its prologue (§B.4), enters natively, and the
+    // link/loop-done arms actually fire around it.
+    try expectProgramTuned(
+        \\local function A(i, j) return i * 3 + j end
+        \\local function run()
+        \\  local acc = 0
+        \\  for j = 1, 8 do
+        \\    for i = 1, 40 do acc = acc + A(i, j) end
+        \\    acc = acc + 1
+        \\  end
+        \\  return acc
+        \\end
+        \\print(run())
+    , "21128\n", .{ .hotguard = 3, .inspect = &assertSeededChainExercised });
+}
+
+test "B-v (doc 22 §B.6): e2e ten-leg — a nest whose inner loop calls an upvalue builtin stays byte-identical with chaining live" {
+    // The §B.6 e2e row: the `local sqrt = math.sqrt` shape from the doc —
+    // an upvalue BUILTIN in the hot inner loop of a nest, across the full
+    // stress × mode matrix. Output identity is the whole contract here (the
+    // structural test above owns the internal witnesses).
+    try expectProgramTuned(
+        \\local sqrt = math.sqrt
+        \\local function run()
+        \\  local acc = 0
+        \\  for j = 1, 6 do
+        \\    for i = 1, 40 do acc = acc + sqrt(i * i) end
+        \\    acc = acc + 1
+        \\  end
+        \\  return acc
+        \\end
+        \\print(run())
+    , "4926\n", .{ .hotguard = 3 });
+}
+
+fn assertHashDriftDeclined(vm: *Vm, mode: TraceMode) anyerror!void {
+    // Only the native leg has a seed prologue to decline; the tier-1a legs
+    // take the pre-B-ii `native_eligible = false` downgrade instead.
+    if (mode != .record_execute_native) return;
+    // Round 2 re-enters the round-1 page after `t.w = 5` drifted the hash
+    // count (1 → 2), so the entry seed validation MUST have declined at least
+    // once — the B-v diagnostic is the only witness (output stays identical
+    // by construction, the H1 tier-1a rerun).
+    try testing.expect(vm.trace.seed_hash_declines >= 1);
+    try testing.expectEqual(@as(u64, 0), vm.trace.seed_capacity_declines);
+}
+
+test "B-v (doc 22 §B.6): decline determinism — a hash-cell seed invalidated between activations declines and stays byte-identical" {
+    // The §B.6 decline-determinism row, e2e half (the ledger-grammar halves
+    // are unit-pinned in trace_replay_test): round 1 compiles the inner loop
+    // with a hash_cell seed (`t.v`, expected_count 1); `t.w = 5` drifts the
+    // count; round 2's native entry fails seed validation → seed_hash_decline
+    // → the dispatcher reruns THE DECLINER on tier-1a → tier-0, output
+    // byte-identical across all ten legs, no strike charged.
+    try expectProgramTuned(
+        \\local t = { v = 3 }
+        \\local acc = 0
+        \\for round = 1, 2 do
+        \\  for i = 1, 40 do acc = acc + t.v end
+        \\  if round == 1 then t.w = 5 end
+        \\end
+        \\print(acc)
+    , "240\n", .{ .hotguard = 3, .inspect = &assertHashDriftDeclined });
+}

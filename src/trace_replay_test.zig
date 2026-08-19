@@ -1951,6 +1951,9 @@ test "B-iv.3 (doc 22 §B.5): [I.loop_done_linked, C.prologue_fail] with a SEEDED
     try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 5 }));
     try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
     try testing.expectEqual(@as(u64, 0), state.native_link_exits);
+    // Nothing declined on this path — the B-v diagnostic counters stay zero.
+    try testing.expectEqual(@as(u64, 0), state.seed_hash_declines);
+    try testing.expectEqual(@as(u64, 0), state.seed_capacity_declines);
 }
 
 test "B-iv.3 (doc 22 §B.5): [C.link_terminal, I.seed_hash_decline] with a SEEDED enterable inner drains like the zero-input twin" {
@@ -2043,4 +2046,92 @@ test "B-iv.3 (doc 22 §B.5): [C.link_terminal, I.seed_hash_decline] with a SEEDE
     try testing.expectEqual(@as(u64, 1), state.native_link_exits);
     try testing.expectEqual(@as(u64, 1), state.native_link_follow_count);
     try testing.expectEqual(@as(usize, 0), state.penalty.count());
+    // B-v diagnostic witness: the terminal hash-decline row bumped exactly its
+    // own counter at the replay seam.
+    try testing.expectEqual(@as(u64, 1), state.seed_hash_declines);
+    try testing.expectEqual(@as(u64, 0), state.seed_capacity_declines);
+}
+
+test "B-v (doc 22 §B.6): terminal seed-decline placement pin — a fused decliner preserves the predecessors' committed rbx" {
+    // §B.6 row 8 (`entry_rbx`-ordering pin): a three-row fused span
+    //   [I.loop_done_linked cum=5, C.link_terminal cum=5, I.seed_hash_decline cum=5]
+    // where the FIRST leg committed a full inner loop (cum 5 region-locally,
+    // ONE outer-iteration grant to `linked_completed`), the continuation
+    // linked back to the (seeded) inner root, and the re-entry declined at
+    // the seed prologue. The pin: the decline row is chargeless AND
+    // placement-inert — the returned `completed` is exactly the predecessor's
+    // grant (the decliner's `entry_rbx` snapshot ordering never lets the
+    // maxInt exit or the 0-local row erode it to 0), resumption is coherent
+    // at the decliner's own anchor, and only the hash-decline diagnostic
+    // increments.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
+
+    const inner_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .a = 0, .aux = 2 }, // loop-done guard, post-loop pc 2
+        .{ .op = .loop },
+    };
+    var seed_inputs = [_]trace.InputSeed{undefined};
+    var inner: Trace = .{
+        .id = 421,
+        .anchor = .{ .proto = &proto, .pc = 7 },
+        .instrs = @constCast(&inner_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .inputs = &seed_inputs,
+        .native = .{ .compiled = .{
+            .page = undefined,
+            .gpa = gpa,
+            .linked_entry = 0xBEEF,
+            .ordinary_entry = 0xCAFE,
+            .seed_plan = .{ .bits = 1 },
+            .seed_prologue = true,
+        } },
+    };
+    const cont_instrs = [_]IrInstr{
+        .{ .op = .link, .aux = 7 },
+    };
+    var cont: Trace = .{
+        .id = 422,
+        .anchor = .{ .proto = &proto, .pc = 2 },
+        .instrs = @constCast(&cont_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    try state.cache.append(gpa, &inner);
+    try state.cache.append(gpa, &cont);
+
+    const ctx = try gpa.create(trace.NativeSeedCtx);
+    ctx.* = .{ .seed_fn = seededReplayDummySeed };
+    state.native_seed_ctx = ctx; // state.deinit() destroys it
+    ctx.proto = @ptrCast(&proto);
+    ctx.call_seq = 7;
+    state.region_context = .{ .depth = 0, .call_seq = 7 };
+
+    const entries = [_]irinterp.LedgerEntry{
+        .{ .cum = 5, .id = 421, .exit = 0, .reason = .normal, .kind = .loop_done_linked, .outcome = .normal },
+        .{ .cum = 5, .id = 422, .exit = 0, .reason = .normal, .kind = .link_terminal, .outcome = .normal },
+        .{ .cum = 5, .id = 421, .exit = std.math.maxInt(u32), .reason = .seed_hash_decline, .kind = .seed_hash_decline, .outcome = .normal },
+    };
+    var regs = [_]Value{Value.int(0)};
+    var tr_regs = TestRegs{ .regs = &regs };
+    const r = state.driveDispatcherLedger(&inner, &entries, &proto, tr_regs.view(), false);
+
+    // The predecessor's committed grant survives the terminal decline
+    // untouched (placement pin: 1, not 0 — the decliner's local_completed is
+    // 0 and never erodes the grant), resumption is at the decliner's own
+    // anchor, and the decline row itself is chargeless.
+    try testing.expectEqual(@as(usize, 1), r.completed);
+    try testing.expectEqual(@as(?u32, 7), r.resume_pc);
+    try testing.expectEqual(@as(usize, 0), state.penalty.count());
+    try testing.expectEqual(@as(u64, 1), state.native_loopdone_link_fused);
+    try testing.expectEqual(@as(u64, 1), state.native_link_follow_count);
+    try testing.expectEqual(@as(u64, 1), state.seed_hash_declines);
+    try testing.expectEqual(@as(u64, 0), state.seed_capacity_declines);
 }

@@ -2352,6 +2352,7 @@ pub const Vm = struct {
                 // slots don't fit the register slab): the candidate itself is
                 // unusable at this depth — same directive as the VM-side wall.
                 self.trace.dbg("seed-capacity-decline: trace={d} anchor={d}", .{ ct.id, ct.anchor.pc });
+                self.trace.seed_capacity_declines +|= 1;
                 return .next_candidate;
             }
             if (ran_native and result.ledger_len <= 1 and
@@ -2367,6 +2368,7 @@ pub const Vm = struct {
                 // `ran_native = false` — byte-identical to the old route (the
                 // oracle side-exits at the same `guard_table`/`guard_hash`).
                 self.trace.dbg("seed-hash-decline: trace={d} anchor={d} -> tier-1a rerun", .{ ct.id, ct.anchor.pc });
+                self.trace.seed_hash_declines +|= 1;
                 trace_regs = self.seedTraceInputs(ct, base, closure, proto, regs, &native_eligible) orelse return .next_candidate;
                 result = irinterp.execute(ct, trace_regs, buf);
                 ran_native = false;

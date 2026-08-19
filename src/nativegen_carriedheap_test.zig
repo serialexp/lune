@@ -700,3 +700,110 @@ test "nativegen(doc22 B-ii): SEED_CAPACITY_DECLINE — and any out-of-grammar re
     try testing.expectEqual(irinterp.ExitReason.seed_capacity_decline, rg.exit_reason);
     try testing.expectEqual(@as(usize, 0), rg.completed);
 }
+
+test "nativegen(doc22 B-v §B.6): redundant-seed deactivation — a STALE hash seed excluded by the plan never blocks native entry, its slot stays unwritten" {
+    // §B.6 row 7 ("redundant-seed deactivation"): the carried-heap READ shape
+    // carries a hash_cell seed whose `expected_count` (99) can NEVER validate
+    // (every element table has exactly one field). A page that CONSUMED the
+    // seed would decline at every entry; `computeSeedPlan` deactivates it
+    // instead (the href roots at the CARRIED slot), so the page must enter
+    // natively, run to the oracle result, and leave the inactive slab slot
+    // bit-for-bit at its entry value — the run-time proof of the compile-time
+    // release-assert that the emitted body never reads an inactive seed slot.
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    const key = try string.String.create(gpa, "v");
+    defer key.destroy(gpa);
+    const key_val = Value.heap(&key.header);
+
+    const N: usize = 8;
+    var elems: [N]*table.Table = undefined;
+    var built: usize = 0;
+    defer for (elems[0..built]) |e| e.destroy(gpa);
+    const container = try buildUniverse(gpa, key_val, &elems, &built);
+    defer container.destroy(gpa);
+
+    var consts: [2]Value = undefined;
+    var full: [CARRIED_READ_LEN]I = undefined;
+    carriedReadIr(&consts, &full);
+    consts[0] = key_val;
+    var es = [_]u16{};
+
+    // (a) The stale seed ALONE → an EMPTY plan: no prologue, no callout, the
+    // page enters unconditionally. `seed_env` stays null-laned so a spurious
+    // callout would crash rather than pass silently.
+    var ins_stale = [_]trace.InputSeed{
+        .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 2, .expected_count = 99 },
+    };
+    const tr_a = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins_stale };
+    var ct_a = nativegen.compileSeeded(gpa, &tr_a, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
+    defer ct_a.deinit();
+    try testing.expect(!ct_a.seed_plan.nonEmpty());
+
+    const regs_a = [_]Value{ Value.heap(&container.header), Value.int(1), Value.heap(&elems[N - 1].header), Value.int(0), Value.int(0) };
+    const iregs_a = try gpa.dupe(Value, &regs_a);
+    defer gpa.free(iregs_a);
+    const ivalues = try gpa.alloc(Value, full.len);
+    defer gpa.free(ivalues);
+    const iresult_a = irinterp.executeValues(&tr_a, iregs_a, ivalues);
+    try testing.expectEqual(@as(usize, N), iresult_a.completed); // sanity: the loop really runs
+
+    const tags_a = try gpa.alloc(u8, regs_a.len);
+    defer gpa.free(tags_a);
+    const pays_a = try gpa.alloc(u64, regs_a.len);
+    defer gpa.free(pays_a);
+    for (regs_a, 0..) |v, i| {
+        tags_a[i] = @intFromEnum(v.tag);
+        pays_a[i] = v.payload.bits;
+    }
+    seed_env = .{};
+    const nresult_a = ct_a.run(RegWindow.of(tags_a, pays_a));
+    try testing.expectEqual(@as(usize, 0), seed_env.calls); // no prologue emitted
+    try testing.expectEqual(iresult_a.completed, nresult_a.completed);
+    for (0..4) |i| {
+        try testing.expectEqual(@intFromEnum(iregs_a[i].tag), tags_a[i]);
+        try testing.expectEqual(iregs_a[i].payload.bits, pays_a[i]);
+    }
+    // The inactive seed's slot: bit-for-bit the entry value — never written.
+    try testing.expectEqual(@intFromEnum(regs_a[4].tag), tags_a[4]);
+    try testing.expectEqual(regs_a[4].payload.bits, pays_a[4]);
+
+    // (b) Stale seed + an active upvalue seed → a PARTIAL plan: the prologue
+    // runs once with only the upvalue bit, the twin writes only the ACTIVE
+    // slot, and the stale seed's slot again stays untouched.
+    var ins_mixed = [_]trace.InputSeed{
+        .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 2, .expected_count = 99 },
+        .{ .kind = .upvalue, .source = 0, .slot = 5 },
+    };
+    const tr_b = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins_mixed };
+    var ct_b = nativegen.compileSeeded(gpa, &tr_b, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
+    defer ct_b.deinit();
+    try testing.expect(!ct_b.seed_plan.isActive(0));
+    try testing.expect(ct_b.seed_plan.isActive(1));
+
+    const regs_b = [_]Value{ Value.heap(&container.header), Value.int(1), Value.heap(&elems[N - 1].header), Value.int(0), Value.int(0), Value.int(0) };
+    const tags_b = try gpa.alloc(u8, regs_b.len);
+    defer gpa.free(tags_b);
+    const pays_b = try gpa.alloc(u64, regs_b.len);
+    defer gpa.free(pays_b);
+    for (regs_b, 0..) |v, i| {
+        tags_b[i] = @intFromEnum(v.tag);
+        pays_b[i] = v.payload.bits;
+    }
+    seed_env = .{ .tags = tags_b.ptr, .pays = pays_b.ptr, .slot = 5, .cell_bits = 1234 };
+    const nresult_b = ct_b.run(RegWindow.of(tags_b, pays_b));
+    try testing.expectEqual(@as(usize, 1), seed_env.calls);
+    try testing.expectEqual(ct_b.seed_plan.bits, seed_env.last_plan_bits); // bit 0 excluded
+    try testing.expectEqual(iresult_a.completed, nresult_b.completed);
+    for (0..4) |i| {
+        try testing.expectEqual(@intFromEnum(iregs_a[i].tag), tags_b[i]);
+        try testing.expectEqual(iregs_a[i].payload.bits, pays_b[i]);
+    }
+    // Inactive stale-seed slot 4: entry bits. Active upvalue slot 5: the
+    // twin's write landed (proves the callout serviced the partial plan).
+    try testing.expectEqual(@intFromEnum(regs_b[4].tag), tags_b[4]);
+    try testing.expectEqual(regs_b[4].payload.bits, pays_b[4]);
+    try testing.expectEqual(@intFromEnum(value.Tag.int), tags_b[5]);
+    try testing.expectEqual(@as(u64, 1234), pays_b[5]);
+}

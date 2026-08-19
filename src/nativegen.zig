@@ -1199,6 +1199,28 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, see
     // definitional: `lower` emits the prologue iff `seed_plan.nonEmpty()`, and this
     // bail guarantees the ctx it bakes exists.
     if (seed_plan.nonEmpty() and seed_ctx == null) return null;
+    // B-v (doc 22 §A.1b + §B.6 redundant-seed row): release-assert the
+    // inactive-slot contract. The seeding helper skips a plan-inactive seed,
+    // so its slab slot stays UNWRITTEN at entry — the emitted body must
+    // therefore never read it. `.hash_cell` is the only deactivatable kind
+    // and its slot is only ever consumed through `href.aux` (`seedHashCell`
+    // stamps aux, never a `slot_load`); a non-dynamic-rooted href naming the
+    // slot would have activated the plan bit in `computeSeedPlan`. Any body
+    // read of an inactive slot is a computeSeedPlan/lowering disagreement:
+    // panic loudly rather than emit a page that reads entry garbage.
+    for (t.inputs, 0..) |seed, i| {
+        if (seed_plan.isActive(i)) continue;
+        for (t.instrs) |ins| {
+            const reads_slot = switch (ins.op) {
+                .slot_load => ins.aux >= 0 and @as(u32, @intCast(ins.aux)) == seed.slot,
+                .href => ins.aux >= 0 and @as(u32, @intCast(ins.aux)) == seed.slot and
+                    !isDynTableRoot(kinds, alloc.slots, alloc.slot_id_of_ref, ins.a),
+                else => false,
+            };
+            if (reads_slot)
+                @panic("compileImpl: emitted body reads an inactive seed's slab slot");
+        }
+    }
 
     // Frameless production path (arena present): reserve the shared trampoline and
     // emit a body that `jmp`s to its shared_exit. Test path (arena == null) keeps the

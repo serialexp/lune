@@ -2505,6 +2505,14 @@ pub const TraceState = struct {
     /// but only increment when both linked traces execute through native pages.
     native_link_exits: u64 = 0,
     native_link_follow_count: u64 = 0,
+    /// Doc 22 §B.2/§B.6 diagnostics: seed-prologue declines observed at any
+    /// drain seam — the dispatcher's direct-entry handlers (interp.zig, scalar
+    /// `ledger_len <= 1`), `replayLedger`'s fused/silent decline rows, and
+    /// `driveChain`'s tier-1a chain seams. Output equality alone cannot prove
+    /// a decline path actually fired (the §B.6 decline-determinism tests need
+    /// the witness), and no tiering path reads them.
+    seed_hash_declines: u64 = 0,
+    seed_capacity_declines: u64 = 0,
     /// 2.3b-1 (doc 17): count of `.link`-terminal slots actually armed in
     /// `driveChain` — a continuation `C`'s `.link` slot pointed straight at its inner
     /// root `I`'s `linked_entry`, so the next `C.run` fuses into `I` under the shared
@@ -5405,7 +5413,11 @@ pub const TraceState = struct {
                     (sresult.exit_reason == .seed_hash_decline or
                         sresult.exit_reason == .seed_capacity_decline))
                 {
-                    if (sresult.exit_reason == .seed_capacity_decline) continue;
+                    if (sresult.exit_reason == .seed_capacity_decline) {
+                        self.seed_capacity_declines +|= 1;
+                        continue;
+                    }
+                    self.seed_hash_declines +|= 1;
                     return .{ .completed = 0, .resume_pc = walk_pc };
                 }
             } else {
@@ -6482,6 +6494,10 @@ pub const TraceState = struct {
                     if (!(is_last and ends_link and reason_matches and
                         e.exit == std.math.maxInt(u32) and e.outcome == .normal and row_local == 0))
                         @panic("replayLedger: silent M1 ramp seed-decline violates terminal contract");
+                    if (e.kind == .seed_hash_decline)
+                        self.seed_hash_declines +|= 1
+                    else
+                        self.seed_capacity_declines +|= 1;
                     resume_pc.* = m1.parent.anchor.pc;
                     return .{ .return_result = .{
                         .completed = linked_completed.*,
@@ -7142,6 +7158,10 @@ pub const TraceState = struct {
                         @panic("replayLedger: seed-decline entry violates its static contract");
                     if (!is_last)
                         @panic("replayLedger: seed-decline is terminal but not last");
+                    if (e.kind == .seed_hash_decline)
+                        self.seed_hash_declines +|= 1
+                    else
+                        self.seed_capacity_declines +|= 1;
                     // Bridged/handoff successor decline: the bridge/handoff row
                     // published the successor's validated anchor into
                     // `resume_pc` and regs are still coherent there (the
