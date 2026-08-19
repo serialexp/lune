@@ -1,6 +1,6 @@
 # Pall-shape nest coverage — heap φ writeback, seeded-trace seams, inner-root owners
 
-Status: partial — Phase A landed (2026-08-20), Phases B–D outstanding
+Status: partial — Phase A + Phase B substrate/flip (B-i, B-ii) landed (2026-08-20), B-iii–B-v + Phases C–D outstanding
 Owner: Claude (campaign arc 2; Bart 2026-08-20 mandate: every benchmark ≤1.2× LuaJIT)
 Last updated: 2026-08-20
 
@@ -30,18 +30,48 @@ inside them is checked.
   §D "advance:132 compiles AND runs native" criterion is NOT yet checkable
   e2e — in a live nbody run the bridge is never recorded/entered because the
   seams aren't seeded (link arms = 0); that observation moves with Phase B.
+- [x] **Phase B-i — inert seed substrate.** `NativeSeedCtx` (§B.1) in stable
+  heap storage (recorded deviation: heap-allocated by `Vm.initBare`, not
+  owned inline by `TraceState`; `proto` is `?*const anyopaque = null` until
+  driveChain needs it), per-episode refresh (`prepareNativeEpisode`),
+  `SeedPlan` derivation at compile time, `compileSeeded`/`compileInto` ctx
+  plumbing, and the two new exit reasons + ledger kinds
+  (`seed_hash_decline`, `seed_capacity_decline`) — all inert: no prologue
+  emitted, no gate flipped. Landed 2026-08-20 (f037529) with plan-derivation
+  pins in `nativegen_carriedheap_test.zig`.
+- [x] **Phase B-ii — prologue seeding + the DIRECT-entry decline flip.**
+  §B.2 for direct entries: the compiled page's entry prologue calls the
+  baked `seed_fn` (recorded deviation: the plan crosses the ABI as
+  `plan_bits: u64` BY VALUE, not `*const SeedPlan` — `CompiledTrace` is
+  returned by value so `&ct.seed_plan` cannot be baked as an imm64;
+  `t`/`ctx` are stable and bake fine) with fail-closed tri-state dispatch:
+  SEED_OK falls through to the body, hash-decline exits with a terminal
+  `seed_hash_decline` row (completed = rbx = 0, regs untouched) and the
+  dispatcher reruns the entry on tier-1a through the unchanged ordinary
+  grammar, capacity-decline steps to the next candidate with no strike; any
+  out-of-grammar seed_fn return routes to the capacity exit. Fused declines
+  are statically impossible until B-iv (every arm site still requires
+  `inputs.len == 0`) and `replayLedger` panics loudly on one. Both new
+  ledger kinds are inert for region accounting (0 work) and exit patching
+  (null). `compileImpl` fails closed when the plan is non-empty and ctx is
+  null. Landed 2026-08-20 with §B.6-shape pins (SEED_OK oracle bit-match,
+  both declines terminal + regs byte-untouched, fail-closed routing) in
+  `nativegen_carriedheap_test.zig`; six-hash gate + 3 repros + 28/28 bench
+  cross=ok on the flip.
 
 ### Outstanding
 
-- [ ] **Phase B — seeded-trace seams.** A dynamic seed context
-  (`NativeSeedCtx` in stable heap storage owned by `TraceState`, vm+closure+
-  base refreshed per episode), a prologue seeding helper (tri-state:
-  ok / hash-decline / capacity-decline) called from the entry stubs after
-  the `entry_rbx` stamp, a dedicated `SEED_DECLINE` exit reason + ledger row
-  kind with cumulative `completed = rbx` semantics and a
-  drain-silent-prefix-then-tier-1a retry directive, tier-1a chain seeding
-  via an installed callback, and the audited relaxation of every
-  `inputs.len != 0` gate behind one shared `stubEnterable` predicate (§B.5).
+- [ ] **Phase B-iii — tier-1a chain seeding (§B.3).** driveChain's
+  link-follow and side-walk seed successors via the episode ctx before
+  `irinterp.execute`, with the §B.4 chained hash-drift pin.
+- [ ] **Phase B-iv — `stubEnterable` + the ~15-site gate audit (§B.5).**
+  One shared predicate replaces every `inputs.len != 0` hard-decline;
+  replaces the B-ii `replayLedger` fused-decline panic with the §B.2 fused
+  directive (drain silent prefix, then tier-1a retry from the decline row).
+- [ ] **Phase B-v — §B.6 tests + Phase-B measurement.** Remaining §B.6
+  matrix (chained hash-drift, redundant-seed, fused-decline) + A/B vs
+  `just shadow` baseline; check nbody advance:132 bridge records/compiles/
+  runs natively and link arms > 0.
 - [ ] **Phase C — canonical owner election + gate reopening.** Elect the
   unique inner-root-shaped member of a closed cycle as the *canonical
   accounting owner* (not a proven entry point — the region must accept

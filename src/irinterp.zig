@@ -81,6 +81,20 @@ pub const ExitReason = enum(u32) {
     /// no guard identity (`maxInt`); `local_completed == 0` even when the enclosing
     /// chain holds nonzero cumulative progress in `completed`.
     prologue_fail = 1,
+    /// Doc 22 §B.2, native only: a seeded page's entry prologue called the seeding
+    /// twin (`nativeSeedFn`) and a `hash_cell` seed failed validation (metatable
+    /// appeared, key vanished, population drifted). The slab holds exactly the state
+    /// VM-side seeding leaves on the same failure (the 0-bits cell slot IS written),
+    /// so the dispatcher reruns THIS entry on tier-1a — same shape as the pre-B-ii
+    /// `native_eligible = false` route. Like `prologue_fail`: no guard identity
+    /// (`exit_instr == maxInt`), zero local progress. No strike is charged.
+    seed_hash_decline = 2,
+    /// Doc 22 §B.2, native only: the seeding twin declined before ANY slab write
+    /// because the seed slots don't fit the register slab (`base + count >
+    /// capacity`). The candidate itself is unusable at this depth — the dispatcher
+    /// moves to the next candidate (the native analogue of `seedTraceInputs`
+    /// returning null). No guard identity, zero local progress, no strike.
+    seed_capacity_decline = 3,
 };
 
 /// 2.3c-2a (doc 17): capacity of the per-transition native ledger carried in
@@ -186,6 +200,14 @@ pub const LedgerKind = enum(u32) {
     /// A-v emits this site but never arms it, so no runtime ledger can contain
     /// this kind until A-vii lands the arm and replay contract.
     region_bridge = 4,
+    /// Doc 22 §B.2: a seeded page's entry prologue declined on `hash_cell`
+    /// validation (`reason = .seed_hash_decline`, `exit_instr = -1`). Always
+    /// terminal — the decline happens before the body runs, never a chain source.
+    seed_hash_decline = 5,
+    /// Doc 22 §B.2: a seeded page's entry prologue declined on slab capacity
+    /// (`reason = .seed_capacity_decline`, `exit_instr = -1`, nothing written).
+    /// Always terminal.
+    seed_capacity_decline = 6,
 };
 
 /// 2.3c-2c (doc 17): what a chain-source exit DID with its (possibly armed) slot —

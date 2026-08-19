@@ -1547,7 +1547,14 @@ pub const NativeSeedCtx = struct {
     /// The C-ABI seeding twin (interp.zig `nativeSeedFn`): resolves the plan's
     /// ACTIVE seeds into the slab, returns SEED_OK / SEED_HASH_DECLINE /
     /// SEED_CAPACITY_DECLINE. Installed once at VM init; never reassigned.
-    seed_fn: *const fn (ctx: *const NativeSeedCtx, t: *const Trace, plan: *const nativegen.SeedPlan) callconv(.c) u64,
+    ///
+    /// The plan travels BY VALUE (`plan_bits`, the `SeedPlan.bits` bitmap): the
+    /// caller is JIT-emitted prologue code that bakes its arguments as imm64s at
+    /// compile time, and `&CompiledTrace.seed_plan` has no stable address to bake
+    /// (`compileImpl` returns the struct by value). `&t` and `&ctx` bake fine —
+    /// committed traces are heap-allocated and immutable, the ctx is heap-allocated
+    /// by design. (Recorded deviation from doc 22 §B.1's `*const SeedPlan` sketch.)
+    seed_fn: *const fn (ctx: *const NativeSeedCtx, t: *const Trace, plan_bits: u64) callconv(.c) u64,
 };
 
 /// A completed, cached trace: the recorded IR plus the entry/exit snapshots that
@@ -6320,6 +6327,8 @@ pub const TraceState = struct {
                 .loop_done_linked => 1,
                 .deopt => local,
                 .link_terminal, .prologue_fail, .region_bridge => 0,
+                // Doc 22 §B.2: declines happen before the body runs — zero work.
+                .seed_hash_decline, .seed_capacity_decline => 0,
             };
 
             // Destination `.deferred` for a handoff, NEVER `.known_trace`: this edge is
@@ -6889,6 +6898,13 @@ pub const TraceState = struct {
                         .resume_pc = cursor.link_pc,
                     } };
                 },
+                // Doc 22 §B.2: statically impossible until B-iv opens the arm
+                // gates — every arm/link site today requires `inputs.len == 0`,
+                // so no fused span can reach a seeded page's prologue. B-iv
+                // replaces this with the §B.2 fused directive.
+                .seed_hash_decline, .seed_capacity_decline => @panic(
+                    "replayLedger: seed decline in a fused span is unmodeled until doc 22 B-iv",
+                ),
             }
             cursor.prev_cum = e.cum;
         }
@@ -9319,6 +9335,9 @@ pub const TraceState = struct {
             .loop_done_linked => .loop_done_linked,
             .region_bridge => .region_bridge,
             .prologue_fail => null,
+            // Doc 22 §B.2: seed declines are entry-condition mismatches, not
+            // guard failures — there is no exit branch to patch.
+            .seed_hash_decline, .seed_capacity_decline => null,
         };
     }
 
@@ -10720,7 +10739,7 @@ pub const TraceState = struct {
             .compiled => return &t.native.compiled,
             .unsupported => return null,
             .unattempted => {
-                if (nativegen.compileInto(self.gpa, &self.mcode_arena, t)) |ct| {
+                if (nativegen.compileInto(self.gpa, &self.mcode_arena, t, self.native_seed_ctx)) |ct| {
                     t.native = .{ .compiled = ct };
                     return &t.native.compiled;
                 }

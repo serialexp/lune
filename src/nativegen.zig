@@ -1046,14 +1046,19 @@ pub const CompiledTrace = struct {
                 std.debug.assert(result.ledger_exit[n - 1] == result.exit_instr);
                 std.debug.assert(result.ledger_reason[n - 1] == result.exit_reason);
                 // 2.3c-2c: the site tag must agree with the scalar reason on the only
-                // axis the scalar fields expose — a `.prologue_fail` reason ⟺ a
-                // `prologue_fail` site, and vice-versa. (link_terminal / loop_done_linked /
+                // axis the scalar fields expose — each non-`.normal` reason ⟺ its
+                // matching terminal site (prologue_fail, and doc 22 §B.2's two seed
+                // declines), and vice-versa. (link_terminal / loop_done_linked /
                 // deopt all carry reason `.normal`, so the ledger `kind` is what tells them
                 // apart; nothing scalar cross-checks those three yet — the generic replay
                 // validates them structurally in 2.3c-2c.)
                 const term_kind: irinterp.LedgerKind = @enumFromInt(result.ledger_kind[n - 1]);
                 std.debug.assert((result.exit_reason == @intFromEnum(irinterp.ExitReason.prologue_fail)) ==
                     (term_kind == .prologue_fail));
+                std.debug.assert((result.exit_reason == @intFromEnum(irinterp.ExitReason.seed_hash_decline)) ==
+                    (term_kind == .seed_hash_decline));
+                std.debug.assert((result.exit_reason == @intFromEnum(irinterp.ExitReason.seed_capacity_decline)) ==
+                    (term_kind == .seed_capacity_decline));
             }
         }
         // 2.3c-2b: decode the per-transition ledger for the caller's replay. Only
@@ -1135,19 +1140,28 @@ pub const NativeState = union(enum) {
 /// back to the tier-1a IR-interpreter. Success transfers ownership of an executable
 /// page to the returned `CompiledTrace` (free it with `deinit`).
 pub fn compile(gpa: std.mem.Allocator, t: *const Trace) ?CompiledTrace {
-    return compileImpl(gpa, t, null);
+    return compileImpl(gpa, t, null, null);
+}
+
+/// Test entry point for SEEDED traces (doc 22 §B.2): like `compile` but with a
+/// seeding ctx to bake into the entry prologue. A trace whose seed plan is
+/// non-empty cannot compile without one (fail closed, §B.4).
+pub fn compileSeeded(gpa: std.mem.Allocator, t: *const Trace, seed_ctx: *const trace.NativeSeedCtx) ?CompiledTrace {
+    return compileImpl(gpa, t, null, seed_ctx);
 }
 
 /// Production entry point: compile `t` and co-locate its code in the shared `arena`
 /// (P-D). Same bail semantics as `compile`; the only difference is where the mcode
-/// lives (an arena slot vs a standalone `mmap`).
-pub fn compileInto(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace) ?CompiledTrace {
-    return compileImpl(gpa, t, arena);
+/// lives (an arena slot vs a standalone `mmap`). `seed_ctx` is the per-VM seeding
+/// context (doc 22 §B.1) a seeded trace's entry prologue bakes; nullable because
+/// hand-built test TraceStates carry none — a seeded trace then bails to tier-1a.
+pub fn compileInto(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, seed_ctx: ?*const trace.NativeSeedCtx) ?CompiledTrace {
+    return compileImpl(gpa, t, arena, seed_ctx);
 }
 
 /// Shared compile body. `arena == null` maps a standalone owned page (test path);
 /// non-null co-locates the code as an arena slot (production path).
-fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?CompiledTrace {
+fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, seed_ctx: ?*const trace.NativeSeedCtx) ?CompiledTrace {
     if (comptime !is_x64_linux) return null;
 
     const n = t.instrs.len;
@@ -1175,6 +1189,12 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
     // (carried-heap discrimination), so it runs after `analyze`. `null` ⇒ more
     // inputs than the plan can name ⇒ bail (fail closed).
     const seed_plan = computeSeedPlan(t, kinds, alloc.slots, alloc.slot_id_of_ref) orelse return null;
+    // Doc 22 §B.2/§B.4 fail-closed: an active plan needs a seeding ctx to bake into
+    // the entry prologue. No ctx (hand-built test TraceState) ⇒ the seeded trace
+    // cannot self-seed ⇒ bail to tier-1a. This is also what makes the §B.4 invariant
+    // definitional: `lower` emits the prologue iff `seed_plan.nonEmpty()`, and this
+    // bail guarantees the ctx it bakes exists.
+    if (seed_plan.nonEmpty() and seed_ctx == null) return null;
 
     // Frameless production path (arena present): reserve the shared trampoline and
     // emit a body that `jmp`s to its shared_exit. Test path (arena == null) keeps the
@@ -1221,7 +1241,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena) ?Co
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    const entry_stubs = lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit, slots, metadata_cells, patch_emissions) catch {
+    const entry_stubs = lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit, slots, metadata_cells, patch_emissions, seed_ctx, seed_plan) catch {
         if (metadata_cells.len > 0) gpa.free(metadata_cells);
         if (slots.len > 0) gpa.free(slots);
         return null;
@@ -4457,7 +4477,7 @@ const PatchEmission = struct {
 /// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
 /// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
 /// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
-fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, metadata_cells: []usize, patch_emissions: []?PatchEmission) !EntryStubs {
+fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, metadata_cells: []usize, patch_emissions: []?PatchEmission, seed_ctx: ?*const trace.NativeSeedCtx, seed_plan: SeedPlan) !EntryStubs {
     const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(exit_labels);
     @memset(exit_labels, null);
@@ -4515,6 +4535,60 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     const loop_top = try a.label();
     const deopt_exit = try a.label();
     const prologue_fail = try a.label();
+
+    // Doc 22 §B.2: the SEED PROLOGUE. A seeded page resolves its own entry inputs
+    // (upvalue / global / hash_cell seeds) by calling the VM's C-ABI seeding twin
+    // (`NativeSeedCtx.seed_fn` → interp.zig `nativeSeedFn`) before anything reads
+    // the slab — the hoisted tag guards below ([RV-1]) read `tags[slot]` for the
+    // seeded slots, so the callout MUST precede them. Emitted iff the plan is
+    // non-empty (`compileImpl` bailed when the ctx was missing, so `seed_ctx.?` is
+    // guaranteed here — the §B.4 invariant `plan.nonEmpty() ⟺ prologue-present` is
+    // definitional). Every entry runs it: fresh trampoline entries AND fused hops
+    // through LINKED_ENTRY/ORDINARY_ENTRY (both fall into `body_entry`) — inert for
+    // the latter until B-iv opens the arm gates to seeded pages.
+    //
+    // Register bracket: at `body_entry` only rdi (tags), rsi (payloads) and rdx
+    // (*NativeResult) are live caller-saved regs — no home is loaded yet, all XMM
+    // are dead, and rbx (the cumulative counter) is callee-saved so the C call
+    // preserves it. Three pushes take rsp from ≡8 (mod 16, the body's invariant —
+    // see emitHrefCallout) to ≡0, so the call site is aligned with no fixup.
+    var seed_hash_exit: ?x64.Label = null;
+    var seed_capacity_exit: ?x64.Label = null;
+    if (seed_plan.nonEmpty()) {
+        const ctx = seed_ctx.?;
+        const hash_l = try a.label();
+        const cap_l = try a.label();
+        const seed_ok = try a.label();
+        try a.push(.rdi);
+        try a.push(.rsi);
+        try a.push(.rdx);
+        // SysV args: rdi = &ctx (per-VM, heap-stable), rsi = &t (committed traces
+        // are heap-allocated + immutable), rdx = the plan bitmap BY VALUE (the
+        // returned CompiledTrace has no stable address to bake — see
+        // `NativeSeedCtx.seed_fn`).
+        try a.movRegImm64(.rdi, @bitCast(@as(u64, @intFromPtr(ctx))));
+        try a.movRegImm64(.rsi, @bitCast(@as(u64, @intFromPtr(t))));
+        try a.movRegImm64(.rdx, @bitCast(seed_plan.bits));
+        // `seed_fn` is installed once at VM init and never reassigned — safe to
+        // read at compile time and bake.
+        try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(ctx.seed_fn))));
+        try a.callReg(.rax);
+        try a.pop(.rdx);
+        try a.pop(.rsi);
+        try a.pop(.rdi);
+        // Tri-state result, fail closed: SEED_OK runs the body, SEED_HASH_DECLINE
+        // takes the hash exit, and EVERYTHING else (SEED_CAPACITY_DECLINE or a
+        // value outside the grammar) takes the capacity exit — whose consumer
+        // moves to the next candidate, which is sound for any unexpected value.
+        try a.cmpRegImm32(.rax, @intCast(trace.NativeSeedCtx.SEED_OK));
+        try a.jcc(.e, seed_ok);
+        try a.cmpRegImm32(.rax, @intCast(trace.NativeSeedCtx.SEED_HASH_DECLINE));
+        try a.jcc(.e, hash_l);
+        try a.jmp(cap_l);
+        a.bind(seed_ok);
+        seed_hash_exit = hash_l;
+        seed_capacity_exit = cap_l;
+    }
 
     // [RV-1] Hoisted type guards (all first → no home is live if one fails), then the
     // hoisted slot loads. A guard failure here returns 0 without touching regs[].
@@ -5552,6 +5626,32 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     // ledger entry — never a chain source, no cap needed.
     try emitLedgerAppend(a, t.id, .prologue_fail);
     try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
+
+    // SEED DECLINE exits (doc 22 §B.2): the entry seed prologue's callout declined
+    // before the body ran — cloned from `prologue_fail` above (same pre-commit
+    // shape: `completed = rbx` preserves a fused predecessor's cumulative progress,
+    // no guard identity so `exit_instr = -1`, reason stamped BEFORE the ledger
+    // append so `emitLedgerAppend`'s memory reads see it, terminal so always the
+    // LAST ledger entry — never a chain source, no cap needed). Two distinct
+    // reasons because the consumers differ: a hash decline reruns THIS entry on
+    // tier-1a (slab already holds the VM-seeding-equivalent state, including the
+    // 0-bits cell slot); a capacity decline moves to the next candidate (nothing
+    // was written). Present iff the seed prologue is (same `plan.nonEmpty()` gate).
+    if (seed_hash_exit) |hash_l| {
+        a.bind(hash_l);
+        try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), -1);
+        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(irinterp.ExitReason.seed_hash_decline));
+        try emitLedgerAppend(a, t.id, .seed_hash_decline);
+        try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
+
+        a.bind(seed_capacity_exit.?);
+        try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
+        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), -1);
+        try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_reason"), @intFromEnum(irinterp.ExitReason.seed_capacity_decline));
+        try emitLedgerAppend(a, t.id, .seed_capacity_decline);
+        try emitReturn(a, frame, callee[0..callee_len], shared_exit, t.id, null);
+    }
 
     // B-3a: all silent epilogues live out of line in this same allocation. Their
     // metadata cells are null and no patch targets them yet, so they are unreachable

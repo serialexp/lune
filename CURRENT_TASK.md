@@ -16,6 +16,55 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-20 (LATEST-74) — **Doc 22 Phase B-i (inert seed substrate) + B-ii (prologue seeding + the DIRECT-entry decline flip) LANDED. Seeded traces (InputSeed-carrying, e.g. nbody advance:34's `local sqrt = math.sqrt` upvalue) now run NATIVE on direct entry. Fused entries stay gated until B-iv.**
+
+- B-i (inert, committed f037529): `NativeSeedCtx` (trace.zig:1524; SEED_OK=1
+  / SEED_HASH_DECLINE=2 / SEED_CAPACITY_DECLINE=3; fields vm/closure/base/
+  reg_capacity/proto/call_seq/seed_fn) heap-allocated by `Vm.initBare`
+  [recorded deviation: not owned inline by TraceState — stable address is
+  what matters for imm64 baking; `proto: ?*const anyopaque = null` until
+  B-iii needs it]; per-episode refresh in `prepareNativeEpisode`
+  (interp.zig:1047); `SeedPlan` derived at compile; `compileSeeded`/
+  `compileInto(…, seed_ctx)` plumbing; exit reasons + ledger kinds
+  `seed_hash_decline`/`seed_capacity_decline` (irinterp.zig).
+- B-ii (the flip): nativegen `lower()` emits a prologue at body_entry iff
+  `plan.nonEmpty()`: push rdi/rsi/rdx → imm64 ctx/t/plan.bits → callReg rax
+  → pops → fail-closed tri-state (`cmp SEED_OK; je body; cmp
+  SEED_HASH_DECLINE; je hash_exit; jmp cap_exit` — ANY garbage return =
+  capacity). [Recorded deviation: plan crosses the ABI as `plan_bits: u64`
+  BY VALUE — CompiledTrace is returned by value so `&ct.seed_plan` can't be
+  baked; t/ctx are stable.] Decline exits: completed=rbx(=0), exit_instr=-1,
+  reason stored BEFORE emitLedgerAppend, then emitReturn. `nativeSeedFn`
+  (interp.zig:996): active-seeds-only capacity check; hash_cell resolution
+  writes the cell ptr (0-bits slot on miss → hash-decline). Dispatcher
+  (enterSelectedTrace): native entries pass the NARROW regs;
+  `seed_capacity_decline` → no-strike `.next_candidate`;
+  `seed_hash_decline` → VM `seedTraceInputs` + tier-1a rerun feeding the
+  FULL ordinary grammar with ran_native=false (byte-identical to the
+  pre-flip H1 route). Fused declines statically impossible until B-iv →
+  loud `replayLedger` panic; both kinds inert for region work (0) and
+  rowPatchKind (null). `compileImpl` fails closed on non-empty plan + null
+  ctx.
+- Tests (nativegen_carriedheap_test.zig §B-ii): SEED_OK — seed_fn called
+  exactly once, plan_bits==ct.seed_plan.bits, native bit-matches the
+  tier-1a oracle on all semantic slots (H1 bounded loop: guard_table → href
+  STATIC→seeded slot → guard_hash count==1 → hload int); SEED_HASH_DECLINE
+  and SEED_CAPACITY_DECLINE — terminal before the body: completed==0,
+  exit_instr==maxInt(u32), ledger_len==1 with the right kind, ALL lanes
+  byte-untouched; fail-closed pin: seed_fn returning 77 routes to the
+  capacity exit. B-i plan-inspection pins updated to `compileSeeded` with a
+  dummy ctx (compile() now fails closed on seeded plans).
+- Gotcha pinned in tests: irinterp `href` stores nil and `hload` resolves
+  via `tbl.get` from operands — the tier-1a oracle NEVER reads the seeded
+  slab slot, so the SEED_OK comparison excludes the scratch slot itself.
+- Gate battery green: `zig build test` (949), `-Djit-debug=true`, six-hash
+  × both tiers, repros 109/109/18135, `just bench` 28/28 cross=ok. Board:
+  field_hash 1.7×, nsieve 1.2×✓, sieve_int 1.2×✓ — no regressions; nbody
+  still 38.9× as expected (advance:132 bridge needs B-iii/B-iv arming).
+- NEXT: B-iii driveChain tier-1a seeding (§B.3) → B-iv stubEnterable +
+  ~15-site audit (§B.5, replaces the fused-decline panic) → B-v §B.6 tests
+  + A/B measurement (nbody advance:132 native, link arms > 0) → Phase C.
+
 ## Status 2026-08-20 (LATEST-72) — **Arc 2 grounded + design written (doc 22, `docs/design/22-pall-shape-nest-coverage.md`): the LATEST-71 "root-recording LINNER linkage" framing was WRONG — LuaJIT also LINNER-aborts a root at an interpreted inner loop; the side-trace tree ALREADY EXISTS on nbody and three general backend gaps keep it from running.**
 
 - Evidence (nbody, --jit-debug + --dump-native + --dump-traces at 3bcc337):

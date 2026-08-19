@@ -848,7 +848,7 @@ test "nativegen A-v: composite bridge prefix emits but unarmed exit takes ordina
 
     var arena = McodeArena.init(gpa);
     defer arena.deinit();
-    var ct = compileInto(gpa, &arena, &t) orelse return error.NativeBailedUnexpectedly;
+    var ct = compileInto(gpa, &arena, &t, null) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     const shared_exit = arena.trampoline_exit.?;
     try testing.expectEqual(shared_exit, ct.slots[7]); // A-v publishes no bridge arm.

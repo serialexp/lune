@@ -96,7 +96,7 @@ pub fn expectMatchFrameless(t: *const Trace, regs_init: []const Value) !void {
     // holds an arena-slot page — defer LIFO runs ct.deinit first).
     var arena = McodeArena.init(gpa);
     defer arena.deinit();
-    var ct = compileInto(gpa, &arena, t) orelse return error.NativeBailedUnexpectedly;
+    var ct = compileInto(gpa, &arena, t, null) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     try testing.expect(ct.trampoline_entry != null); // really the frameless path
 

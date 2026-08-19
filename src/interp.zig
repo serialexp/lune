@@ -996,8 +996,11 @@ pub const Vm = struct {
     fn nativeSeedFn(
         ctx: *const trace.NativeSeedCtx,
         ct: *const trace.Trace,
-        plan: *const nativegen.SeedPlan,
+        plan_bits: u64,
     ) callconv(.c) u64 {
+        // The plan arrives by value (see `NativeSeedCtx.seed_fn`): reconstruct the
+        // bitmap wrapper locally.
+        const plan = nativegen.SeedPlan{ .bits = plan_bits };
         const self: *Vm = @ptrCast(@alignCast(ctx.vm));
         const closure: *const function.Closure = @ptrCast(@alignCast(ctx.closure));
         const proto: *const Proto = @ptrCast(@alignCast(ctx.proto.?));
@@ -2171,18 +2174,39 @@ pub const Vm = struct {
         wctx: *TrialWalkCtx,
     ) EntryDirective {
         var pc = pc_in;
+        // Doc 22 §B.2: resolve the native page BEFORE any VM-side seeding, so the
+        // two seeding paths never both run (the dedup half of B-ii). A page whose
+        // seed plan is non-empty seeds ITSELF in its entry prologue (via the
+        // baked `NativeSeedCtx`), so a native entry passes the NARROW `regs` —
+        // pointer-identical to the widened window (`frameWindow` slices the same
+        // slab base; native code addresses slots by offset from the base pointers
+        // and never reads the slice length). VM-side seeding remains for every
+        // non-native run: exec-log, tier-1a (no page / hash-decline rerun).
+        // Hoisting the lazy `nativeFor` compile above `seedTraceInputs`/
+        // `tryArmSiblingHandoff` can complete a compile one entry earlier than
+        // before — sound (arming choices steer tiers, never output) and verified
+        // by the 8-mode gate.
+        const native_page: ?*const nativegen.CompiledTrace =
+            if (self.trace.config.native_codegen and !self.trace.config.record_exec_log)
+                self.trace.nativeFor(ct)
+            else
+                null;
         // Cluster sub-lever 1: a trace that reaches a callee
         // through an upvalue/global carries synthetic entry
         // inputs. Seed each into the dead slab region above the
         // anchor window and widen the executor window to cover
         // them; an input-free trace reuses the narrow `regs`. A
         // capacity overflow declines the entry (run tier-0).
-        // `native_eligible` stays true unless a `hash_cell` seed
-        // can't resolve this entry (H1) — then native declines and
-        // tier-1a owns the entry (byte-identical, see
-        // `seedTraceInputs`).
+        // `native_eligible` is the H1 hash_cell out-flag; with the
+        // native path now seeding itself it only ever accompanies a
+        // run that is ALREADY tier-1a, so its value is no longer
+        // consulted (the prologue's SEED_HASH_DECLINE is the native
+        // twin of the downgrade it used to signal).
         var native_eligible = true;
-        const trace_regs = self.seedTraceInputs(ct, base, closure, proto, regs, &native_eligible) orelse return .next_candidate;
+        var trace_regs = if (native_page != null)
+            regs
+        else
+            self.seedTraceInputs(ct, base, closure, proto, regs, &native_eligible) orelse return .next_candidate;
         if (self.trace.valuesScratch(ct.instrs.len)) |buf| {
             self.trace.entries +%= 1;
             // JIT coverage time attribution (gated): open the
@@ -2236,35 +2260,35 @@ pub const Vm = struct {
             // the deterministic dispatch actually runs, never a
             // hit-count guess made at receipt time.
             self.trace.tryArmSiblingHandoff(ct, safe_to_arm);
-            const result = if (self.trace.config.record_exec_log) blk: {
+            var result = if (self.trace.config.record_exec_log) blk: {
                 const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, trace_regs, buf);
                 const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, trace_regs, buf);
                 break :blk irinterp.executeTraced(rec, ct, trace_regs, buf);
-            } else if (self.trace.config.native_codegen) blk: {
-                if (native_eligible) {
-                    if (self.trace.nativeFor(ct)) |nt| {
-                        ran_native = true;
-                        self.trace.native_entries +%= 1;
-                        ran_native_link_mode = self.trace.hasNativeLoopDoneLink(ct, proto);
-                        // 2.3c-2d (D2a): capture the per-transition
-                        // ledger, preserving the materialization mode
-                        // (linked → `runLinkedLoopDoneCapturing`,
-                        // ordinary → `runCapturingLedger`). Pre-2c-E
-                        // `ct` never fuses forward, so this yields the
-                        // SAME scalar `result` as the old non-capturing
-                        // calls and the scalar/M1 consumer below reads
-                        // only those fields — byte-identical; the
-                        // `ledger_scratch` fill is inert until D2b
-                        // activates the `ledger_len > 1` replay.
-                        self.trace.prepareNativeEntry(); // B-3a direct-entry sweep hook
-                        break :blk if (ran_native_link_mode)
-                            nt.runLinkedLoopDoneCapturing(trace_regs, &self.trace.ledger_scratch, self.trace.silentStaging())
-                        else
-                            nt.runCapturingLedger(trace_regs, &self.trace.ledger_scratch, self.trace.silentStaging());
-                    }
+            } else blk: {
+                // Doc 22 §B.2: `native_page` was resolved above (before VM-side
+                // seeding); non-null implies native_codegen && !record_exec_log.
+                if (native_page) |nt| {
+                    ran_native = true;
+                    self.trace.native_entries +%= 1;
+                    ran_native_link_mode = self.trace.hasNativeLoopDoneLink(ct, proto);
+                    // 2.3c-2d (D2a): capture the per-transition
+                    // ledger, preserving the materialization mode
+                    // (linked → `runLinkedLoopDoneCapturing`,
+                    // ordinary → `runCapturingLedger`). Pre-2c-E
+                    // `ct` never fuses forward, so this yields the
+                    // SAME scalar `result` as the old non-capturing
+                    // calls and the scalar/M1 consumer below reads
+                    // only those fields — byte-identical; the
+                    // `ledger_scratch` fill is inert until D2b
+                    // activates the `ledger_len > 1` replay.
+                    self.trace.prepareNativeEntry(); // B-3a direct-entry sweep hook
+                    break :blk if (ran_native_link_mode)
+                        nt.runLinkedLoopDoneCapturing(trace_regs, &self.trace.ledger_scratch, self.trace.silentStaging())
+                    else
+                        nt.runCapturingLedger(trace_regs, &self.trace.ledger_scratch, self.trace.silentStaging());
                 }
                 break :blk irinterp.execute(ct, trace_regs, buf);
-            } else irinterp.execute(ct, trace_regs, buf);
+            };
             if (ran_native) {
                 if (self.trace.driveDispatcherSilentResult(ct, result, proto, regs, safe_to_arm)) |chain| {
                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
@@ -2275,6 +2299,38 @@ pub const Vm = struct {
                     }
                     return .{ .resume_tier0 = pc };
                 }
+            }
+            // Doc 22 §B.2: seed-decline dispatch. A seeded page's entry prologue
+            // declined BEFORE its body ran (nothing committed, regs untouched at
+            // this anchor). Neither decline charges a strike or feeds the receipt
+            // funnel — the decline is an entry-condition mismatch, not a guard
+            // failure. Direct entries only until B-iv: every arm/link site today
+            // requires `inputs.len == 0`, so no fused span can reach a seeded
+            // page's prologue (a fused decline row panics in `replayLedger`), and
+            // a direct decline is always a scalar `ledger_len == 1` result the
+            // silent drain above returned null for.
+            if (ran_native and result.exit_reason == .seed_capacity_decline) {
+                // The native twin of `seedTraceInputs` returning null (the seed
+                // slots don't fit the register slab): the candidate itself is
+                // unusable at this depth — same directive as the VM-side wall.
+                self.trace.dbg("seed-capacity-decline: trace={d} anchor={d}", .{ ct.id, ct.anchor.pc });
+                return .next_candidate;
+            }
+            if (ran_native and result.exit_reason == .seed_hash_decline) {
+                // The native twin of the pre-B-ii `native_eligible = false`
+                // downgrade (H1): a hash_cell seed failed validation, so THIS
+                // entry runs on tier-1a. The prologue's seeding twin already
+                // wrote the slab (including the 0-bits cell slot); the VM-side
+                // rerun below re-derives the identical state and widens the
+                // window for tier-1a's synthetic slots. The tier-1a result then
+                // feeds the FULL ordinary consumer grammar below with
+                // `ran_native = false` — byte-identical to the old route (the
+                // oracle side-exits at the same `guard_table`/`guard_hash`).
+                self.trace.dbg("seed-hash-decline: trace={d} anchor={d} -> tier-1a rerun", .{ ct.id, ct.anchor.pc });
+                trace_regs = self.seedTraceInputs(ct, base, closure, proto, regs, &native_eligible) orelse return .next_candidate;
+                result = irinterp.execute(ct, trace_regs, buf);
+                ran_native = false;
+                ran_native_link_mode = false;
             }
             // B-2b: `tryArmSiblingHandoff` is entry-sited above,
             // before lazy native compilation. This post-receipt

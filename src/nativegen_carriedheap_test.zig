@@ -19,6 +19,7 @@ const arr = @import("array.zig");
 const string = @import("string.zig");
 const Value = value.Value;
 const Trace = trace.Trace;
+const RegWindow = @import("regwindow.zig").RegWindow;
 const testing = std.testing;
 const irinterp = @import("irinterp.zig");
 const I = trace.IrInstr;
@@ -371,6 +372,19 @@ test "nativegen(doc22 A): array op rooted at a carried-heap slot bails (fail-clo
 // Doc 22 §A.1b/§B.4 (Phase B-i): the page-owned SeedPlan.
 // ---------------------------------------------------------------------------
 
+/// B-ii made `compileImpl` fail-closed: a non-empty plan with no seed ctx bails.
+/// The plan-inspection pins below never RUN their pages, so a stub ctx whose
+/// `seed_fn` unconditionally reports success is enough to let the compile
+/// proceed (the prologue bakes `&dummy_seed_ctx`, which is file-static and
+/// outlives the page).
+fn dummySeedFn(ctx: *const trace.NativeSeedCtx, t: *const Trace, plan_bits: u64) callconv(.c) u64 {
+    _ = ctx;
+    _ = t;
+    _ = plan_bits;
+    return trace.NativeSeedCtx.SEED_OK;
+}
+var dummy_seed_ctx = trace.NativeSeedCtx{ .seed_fn = &dummySeedFn };
+
 test "nativegen(doc22 B-i): dynamic-rooted href DEACTIVATES its hash_cell seed; upvalue/global stay active" {
     if (comptime !is_x64_linux) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -406,7 +420,7 @@ test "nativegen(doc22 B-i): dynamic-rooted href DEACTIVATES its hash_cell seed; 
         .{ .kind = .upvalue, .source = 0, .slot = 30 },
     };
     const tr_mixed = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins_mixed };
-    var ct_mixed = compile(gpa, &tr_mixed) orelse return error.NativeBailedUnexpectedly;
+    var ct_mixed = nativegen.compileSeeded(gpa, &tr_mixed, &dummy_seed_ctx) orelse return error.NativeBailedUnexpectedly;
     defer ct_mixed.deinit();
     try testing.expect(!ct_mixed.seed_plan.isActive(0));
     try testing.expect(ct_mixed.seed_plan.isActive(1));
@@ -443,7 +457,7 @@ test "nativegen(doc22 B-i): static-rooted href keeps its hash_cell seed ACTIVE" 
         .{ .kind = .hash_cell, .source = 0, .slot = 3, .table_reg = 0, .expected_count = 0 },
     };
     const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins };
-    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    var ct = nativegen.compileSeeded(gpa, &tr, &dummy_seed_ctx) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     try testing.expect(ct.seed_plan.isActive(0));
     try testing.expect(ct.seed_plan.nonEmpty());
@@ -471,4 +485,218 @@ test "nativegen(doc22 B-i): more inputs than the plan can name bails the compile
     for (&ins) |*seed| seed.* = .{ .kind = .upvalue, .source = 0, .slot = 30 };
     const tr = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins };
     try testing.expect(compile(gpa, &tr) == null);
+}
+
+// ---------------------------------------------------------------------------
+// Doc 22 §B.2 (Phase B-ii): the seeded entry prologue + decline exits.
+// ---------------------------------------------------------------------------
+
+/// Instrumented seed twin: records the call, optionally writes the seeded slab
+/// slot through test-global lane pointers (the callout receives only ctx/t/
+/// plan_bits — production reaches the slab via `ctx.vm`, the test via these),
+/// and returns whatever the test staged. File-static so `&env_seed_ctx` bakes
+/// as a stable imm64 in the prologue.
+const SeedEnv = struct {
+    tags: ?[*]u8 = null,
+    pays: ?[*]u64 = null,
+    slot: usize = 0,
+    cell_bits: u64 = 0,
+    ret: u64 = trace.NativeSeedCtx.SEED_OK,
+    calls: usize = 0,
+    last_plan_bits: u64 = 0,
+};
+var seed_env: SeedEnv = .{};
+
+fn envSeedFn(ctx: *const trace.NativeSeedCtx, t: *const Trace, plan_bits: u64) callconv(.c) u64 {
+    _ = ctx;
+    _ = t;
+    seed_env.calls += 1;
+    seed_env.last_plan_bits = plan_bits;
+    if (seed_env.ret == trace.NativeSeedCtx.SEED_OK) {
+        seed_env.tags.?[seed_env.slot] = @intFromEnum(value.Tag.int);
+        seed_env.pays.?[seed_env.slot] = seed_env.cell_bits;
+    }
+    return seed_env.ret;
+}
+var env_seed_ctx = trace.NativeSeedCtx{ .seed_fn = &envSeedFn };
+
+/// The canonical seeded RUN shape: a bounded H1 accumulation loop whose href
+/// (idx 11, aux=4) roots statically at slot 0, so the page reads seeded slab
+/// slot 4. Slots: 0=table, 1=i, 2=limit, 3=acc, 4=seeded cell (dead scratch).
+const SEEDED_RUN_LEN = 20;
+fn seededRunIr(out: *[SEEDED_RUN_LEN]I) void {
+    out.* = .{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table (static root)
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .konst, .aux = 0 }, // 2: key
+        .{ .op = .slot_load, .aux = 1 }, // 3: i
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .slot_load, .aux = 2 }, // 5: limit
+        .{ .op = .guard_int, .a = 5 }, // 6
+        .{ .op = .lt, .a = 3, .b = 5 }, // 7: i < limit
+        .{ .op = .guard_true, .a = 7 }, // 8
+        .{ .op = .konst, .aux = 1 }, // 9: 1
+        .{ .op = .add, .a = 3, .b = 9, .ty = .int }, // 10: i + 1
+        .{ .op = .href, .a = 0, .b = 2, .aux = 4 }, // 11: STATIC → seeded slot 4
+        .{ .op = .guard_hash, .a = 11, .aux = 1 }, // 12: count == 1
+        .{ .op = .hload, .a = 11, .ty = .int }, // 13: field
+        .{ .op = .slot_load, .aux = 3 }, // 14: acc
+        .{ .op = .guard_int, .a = 14 }, // 15
+        .{ .op = .add, .a = 14, .b = 13, .ty = .int }, // 16: acc + field
+        .{ .op = .phi, .b = 10, .aux = 1 }, // i carry
+        .{ .op = .phi, .b = 16, .aux = 3 }, // acc carry
+        .{ .op = .loop }, // 19
+    };
+}
+
+test "nativegen(doc22 B-ii): SEED_OK — prologue calls seed_fn once with the plan bits; seeded page matches the oracle" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    const kt = try table.Table.create(gpa);
+    defer kt.destroy(gpa);
+    try kt.set(gpa, Value.int(99), Value.int(7));
+
+    var consts = [_]Value{ Value.int(99), Value.int(1) };
+    var full: [SEEDED_RUN_LEN]I = undefined;
+    seededRunIr(&full);
+    var es = [_]u16{};
+    var ins = [_]trace.InputSeed{
+        .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 0, .expected_count = 1 },
+    };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins };
+    var ct = nativegen.compileSeeded(gpa, &tr, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    try testing.expect(ct.seed_plan.isActive(0));
+
+    // Oracle (tier-1a): resolves the field from the href operands via `Table.get`
+    // and never reads the seeded scratch slot — its slot 4 stays the initial value.
+    const regs_init = [_]Value{ Value.heap(&kt.header), Value.int(0), Value.int(4), Value.int(0), Value.int(0) };
+    const iregs = try gpa.dupe(Value, &regs_init);
+    defer gpa.free(iregs);
+    const ivalues = try gpa.alloc(Value, full.len);
+    defer gpa.free(ivalues);
+    const iresult = irinterp.executeValues(&tr, iregs, ivalues);
+    try testing.expectEqual(@as(usize, 4), iresult.completed); // sanity: the loop really runs
+
+    // Native: lanes we own, so the seed stub can write slab slot 4 with the true
+    // cell pointer (the test twin of `nativeSeedFn`'s hash_cell resolution).
+    const tags = try gpa.alloc(u8, regs_init.len);
+    defer gpa.free(tags);
+    const pays = try gpa.alloc(u64, regs_init.len);
+    defer gpa.free(pays);
+    for (regs_init, 0..) |v, i| {
+        tags[i] = @intFromEnum(v.tag);
+        pays[i] = v.payload.bits;
+    }
+    const cell = kt.fieldPtr(Value.int(99)).?;
+    seed_env = .{ .tags = tags.ptr, .pays = pays.ptr, .slot = 4, .cell_bits = @intFromPtr(cell) };
+    const nresult = ct.run(RegWindow.of(tags, pays));
+
+    try testing.expectEqual(@as(usize, 1), seed_env.calls); // exactly one entry callout
+    try testing.expectEqual(ct.seed_plan.bits, seed_env.last_plan_bits); // baked by value
+    try testing.expectEqual(iresult.completed, nresult.completed);
+    // Slots 0..3 must match the oracle bit-for-bit. Slot 4 is the seeded scratch:
+    // native holds the raw cell pointer, the oracle its untouched initial — excluded.
+    for (0..4) |i| {
+        try testing.expectEqual(@intFromEnum(iregs[i].tag), tags[i]);
+        try testing.expectEqual(iregs[i].payload.bits, pays[i]);
+    }
+}
+
+test "nativegen(doc22 B-ii): SEED_HASH_DECLINE — terminal before the body, regs untouched" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    const kt = try table.Table.create(gpa);
+    defer kt.destroy(gpa);
+    try kt.set(gpa, Value.int(99), Value.int(7));
+
+    var consts = [_]Value{ Value.int(99), Value.int(1) };
+    var full: [SEEDED_RUN_LEN]I = undefined;
+    seededRunIr(&full);
+    var es = [_]u16{};
+    var ins = [_]trace.InputSeed{
+        .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 0, .expected_count = 1 },
+    };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins };
+    var ct = nativegen.compileSeeded(gpa, &tr, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+
+    const regs_init = [_]Value{ Value.heap(&kt.header), Value.int(0), Value.int(4), Value.int(0), Value.int(0) };
+    const tags = try gpa.alloc(u8, regs_init.len);
+    defer gpa.free(tags);
+    const pays = try gpa.alloc(u64, regs_init.len);
+    defer gpa.free(pays);
+    for (regs_init, 0..) |v, i| {
+        tags[i] = @intFromEnum(v.tag);
+        pays[i] = v.payload.bits;
+    }
+    seed_env = .{ .ret = trace.NativeSeedCtx.SEED_HASH_DECLINE };
+    var ledger: [irinterp.LEDGER_CAP]irinterp.LedgerEntry = undefined;
+    const r = ct.runCapturingLedger(RegWindow.of(tags, pays), &ledger, .{});
+
+    try testing.expectEqual(@as(usize, 1), seed_env.calls);
+    try testing.expectEqual(@as(usize, 0), r.completed); // zero local progress
+    try testing.expectEqual(irinterp.ExitReason.seed_hash_decline, r.exit_reason);
+    try testing.expectEqual(std.math.maxInt(u32), r.exit_instr); // like prologue_fail
+    try testing.expectEqual(@as(u32, 1), r.ledger_len); // one terminal row
+    try testing.expectEqual(irinterp.LedgerKind.seed_hash_decline, ledger[0].kind);
+    try testing.expectEqual(@as(usize, 0), ledger[0].cum);
+    // The body never ran: every lane bit is exactly the entry state.
+    for (regs_init, 0..) |v, i| {
+        try testing.expectEqual(@intFromEnum(v.tag), tags[i]);
+        try testing.expectEqual(v.payload.bits, pays[i]);
+    }
+}
+
+test "nativegen(doc22 B-ii): SEED_CAPACITY_DECLINE — and any out-of-grammar return fails closed to it" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    const kt = try table.Table.create(gpa);
+    defer kt.destroy(gpa);
+    try kt.set(gpa, Value.int(99), Value.int(7));
+
+    var consts = [_]Value{ Value.int(99), Value.int(1) };
+    var full: [SEEDED_RUN_LEN]I = undefined;
+    seededRunIr(&full);
+    var es = [_]u16{};
+    var ins = [_]trace.InputSeed{
+        .{ .kind = .hash_cell, .source = 0, .slot = 4, .table_reg = 0, .expected_count = 1 },
+    };
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{}, .inputs = &ins };
+    var ct = nativegen.compileSeeded(gpa, &tr, &env_seed_ctx) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+
+    const regs_init = [_]Value{ Value.heap(&kt.header), Value.int(0), Value.int(4), Value.int(0), Value.int(0) };
+    const tags = try gpa.alloc(u8, regs_init.len);
+    defer gpa.free(tags);
+    const pays = try gpa.alloc(u64, regs_init.len);
+    defer gpa.free(pays);
+
+    // (a) the declared capacity decline.
+    for (regs_init, 0..) |v, i| {
+        tags[i] = @intFromEnum(v.tag);
+        pays[i] = v.payload.bits;
+    }
+    seed_env = .{ .ret = trace.NativeSeedCtx.SEED_CAPACITY_DECLINE };
+    var ledger: [irinterp.LEDGER_CAP]irinterp.LedgerEntry = undefined;
+    const r = ct.runCapturingLedger(RegWindow.of(tags, pays), &ledger, .{});
+    try testing.expectEqual(@as(usize, 0), r.completed);
+    try testing.expectEqual(irinterp.ExitReason.seed_capacity_decline, r.exit_reason);
+    try testing.expectEqual(std.math.maxInt(u32), r.exit_instr);
+    try testing.expectEqual(@as(u32, 1), r.ledger_len);
+    try testing.expectEqual(irinterp.LedgerKind.seed_capacity_decline, ledger[0].kind);
+    for (regs_init, 0..) |v, i| {
+        try testing.expectEqual(@intFromEnum(v.tag), tags[i]);
+        try testing.expectEqual(v.payload.bits, pays[i]);
+    }
+
+    // (b) fail-closed: a return outside {OK, HASH, CAPACITY} routes to the
+    // capacity exit (whose consumer — next-candidate — is sound for garbage).
+    seed_env = .{ .ret = 77 };
+    const rg = ct.runCapturingLedger(RegWindow.of(tags, pays), &ledger, .{});
+    try testing.expectEqual(irinterp.ExitReason.seed_capacity_decline, rg.exit_reason);
+    try testing.expectEqual(@as(usize, 0), rg.completed);
 }

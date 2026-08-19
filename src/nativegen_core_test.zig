@@ -114,7 +114,7 @@ test "nativegen B-3a: link and linked-loop-done exits contain inert NOP windows"
     var link_proto = bytecode.Proto{ .code = &link_code, .name = "b3-link", .id = 501 };
     var link_instrs = [_]I{.{ .op = .link, .aux = 0 }};
     var link_trace = Trace{ .id = 501, .anchor = .{ .proto = &link_proto, .pc = 0 }, .instrs = &link_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
-    var link_ct = compileInto(gpa, &arena, &link_trace) orelse return error.NativeBailedUnexpectedly;
+    var link_ct = compileInto(gpa, &arena, &link_trace, null) orelse return error.NativeBailedUnexpectedly;
     defer link_ct.deinit();
     var saw_link = false;
     for (link_ct.exit_patches) |p| if (p.kind == .link_terminal) {
@@ -143,7 +143,7 @@ test "nativegen B-3a: link and linked-loop-done exits contain inert NOP windows"
         .{ .op = .loop },
     };
     var loop_trace = Trace{ .id = 502, .anchor = .{ .proto = &loop_proto, .pc = 1 }, .instrs = &loop_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
-    var loop_ct = compileInto(gpa, &arena, &loop_trace) orelse return error.NativeBailedUnexpectedly;
+    var loop_ct = compileInto(gpa, &arena, &loop_trace, null) orelse return error.NativeBailedUnexpectedly;
     defer loop_ct.deinit();
     var saw_loopdone = false;
     for (loop_ct.exit_patches) |p| if (p.kind == .loop_done_linked) {
@@ -157,7 +157,7 @@ test "nativegen B-3a: link and linked-loop-done exits contain inert NOP windows"
     var deopt_proto = bytecode.Proto{ .code = &deopt_code, .name = "b3-deopt", .id = 503 };
     loop_instrs[5].aux = 1;
     var deopt_trace = Trace{ .id = 503, .anchor = .{ .proto = &deopt_proto, .pc = 0 }, .instrs = &loop_instrs, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
-    var deopt_ct = compileInto(gpa, &arena, &deopt_trace) orelse return error.NativeBailedUnexpectedly;
+    var deopt_ct = compileInto(gpa, &arena, &deopt_trace, null) orelse return error.NativeBailedUnexpectedly;
     defer deopt_ct.deinit();
     var saw_deopt = false;
     for (deopt_ct.exit_patches) |p| if (p.kind == .deopt) {
