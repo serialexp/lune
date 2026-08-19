@@ -179,6 +179,148 @@ test "tryArmSiblingHandoff publishes complete Part-S bookkeeping" {
     try testing.expectEqual(@as(u64, 1), state.sibling_handoff_arms);
 }
 
+// ---------------------------------------------------------------------------
+// Doc 22 §B.3 / §B.6 (Phase B-iii): driveChain's TIER-1A walk seeds a seeded
+// successor through the episode ctx's seeding twin before `irinterp.execute`.
+// The chained hash-drift pin: a hash seed that fails validation
+// (SEED_HASH_DECLINE) still executes on tier-1a — tier-1a re-derives hash
+// cells from `href` operands and side-exits at the same guard — while a
+// capacity decline (SEED_CAPACITY_DECLINE), or a missing ctx/twin (hand-built
+// TraceStates), declines the candidate exactly like the pre-B-iii skip.
+// ---------------------------------------------------------------------------
+
+/// Test double for the tier-1a seeding twin (`interp.nativeSeedTier1aFn`).
+/// Mirrors the production aliasing: the twin writes the seeded slot into the
+/// SAME backing lanes the chain's `RegWindow` views (here: the `TestRegs`
+/// arrays smuggled through `ctx.vm`), then answers the scripted disposition.
+/// Slot 2 is the synthetic input slot above the 2-register frame; the seeded
+/// value (int 2) is chosen so the chained loop's result is only reachable
+/// through the seed — proving the write happened before execution.
+const SeedStub = struct {
+    var calls: usize = 0;
+    var rc: u64 = trace.NativeSeedCtx.SEED_HASH_DECLINE;
+    fn seed(ctx: *const trace.NativeSeedCtx, t: *const Trace) u64 {
+        _ = t;
+        const tr: *TestRegs = @ptrCast(@alignCast(ctx.vm));
+        const v = Value.int(2);
+        tr.tags[2] = @intFromEnum(v.tag);
+        tr.pays[2] = v.payload.bits;
+        calls += 1;
+        return rc;
+    }
+};
+
+test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on tier-1a; capacity decline and missing ctx fail closed" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity(); // stack/hand-owned traces
+    SeedStub.calls = 0;
+    SeedStub.rc = trace.NativeSeedCtx.SEED_HASH_DECLINE;
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
+
+    // Trace A at PC 10: the trace whose guard "fails" (faked by calling
+    // driveChain directly) — the ordinary_header same-anchor walk shape.
+    var entry_a = [_]u16{0};
+    const instrs_a = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0: r0
+        .{ .op = .guard_int, .a = 0, .aux = 20 }, // %1: the "failing" guard
+        .{ .op = .loop }, // %2
+    };
+    const trace_a = try gpa.create(Trace);
+    defer gpa.destroy(trace_a);
+    trace_a.* = .{
+        .anchor = .{ .proto = &proto, .pc = 10 },
+        .instrs = @constCast(&instrs_a),
+        .consts = &.{},
+        .entry_slots = &entry_a,
+        .entry_guards = &.{},
+    };
+
+    // Trace B: a SEEDED same-anchor sibling — the counting loop's increment is
+    // the synthetic slot 2 (r0 += r2 while r0+r2 < r1), so the loop only
+    // produces r0 == 2 / completed == 1 if the twin's seed write landed.
+    var entry_b = [_]u16{ 0, 1, 2 };
+    const instrs_b = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0: r0 counter
+        .{ .op = .slot_load, .aux = 1 }, // %1: r1 limit
+        .{ .op = .slot_load, .aux = 2 }, // %2: the SEEDED synthetic slot
+        .{ .op = .guard_int, .a = 0, .aux = 10 }, // %3
+        .{ .op = .guard_int, .a = 1, .aux = 10 }, // %4
+        .{ .op = .guard_int, .a = 2, .aux = 10 }, // %5
+        .{ .op = .add, .a = 0, .b = 2 }, // %6: r0 + seed
+        .{ .op = .lt, .a = 6, .b = 1 }, // %7: (r0+seed) < limit
+        .{ .op = .guard_true, .a = 7, .aux = 10 }, // %8
+        .{ .op = .phi, .a = 0, .b = 6, .aux = 0, .ty = .int }, // %9: r0 ← r0+seed
+        .{ .op = .loop }, // %10
+    };
+    var inputs_b = [_]trace.InputSeed{
+        .{ .kind = .hash_cell, .source = 0, .slot = 2, .table_reg = 0, .expected_count = 1 },
+    };
+    const trace_b = try gpa.create(Trace);
+    defer gpa.destroy(trace_b);
+    trace_b.* = .{
+        .anchor = .{ .proto = &proto, .pc = 10 }, // same anchor as A
+        .instrs = @constCast(&instrs_b),
+        .consts = &.{},
+        .entry_slots = &entry_b,
+        .entry_guards = &.{},
+        .inputs = &inputs_b,
+    };
+
+    try state.cache.append(gpa, trace_a);
+    try state.cache.append(gpa, trace_b);
+
+    // --- 1. Fail closed: no ctx installed (hand-built TraceState) → the walk
+    // must skip the seeded candidate WITHOUT consulting any twin, exactly the
+    // pre-B-iii `inputs.len != 0` skip.
+    var regs = [_]Value{ Value.int(0), Value.int(4) };
+    var tr_regs = TestRegs{ .regs = &regs };
+    {
+        const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false);
+        try testing.expect(chained == null);
+        try testing.expectEqual(@as(usize, 0), SeedStub.calls);
+    }
+
+    // Install the episode ctx (heap-allocated: TraceState.deinit owns it).
+    const ctx = try gpa.create(trace.NativeSeedCtx);
+    ctx.* = .{
+        .vm = @ptrCast(&tr_regs), // the twin's write target (production: the VM slab)
+        .base = 0,
+        .reg_capacity = 64,
+        .proto = @ptrCast(&proto), // freshness stamp asserted by seedForTier1a
+        .seed_fn = undefined, // C-ABI prologue twin — never called on the tier-1a walk
+        .seed_tier1a_fn = &SeedStub.seed,
+    };
+    state.native_seed_ctx = ctx;
+
+    // --- 2. THE hash-drift pin: the twin seeds slot 2 then reports
+    // SEED_HASH_DECLINE — driveChain must STILL run the successor on tier-1a.
+    // r0=0, r1=4, seed=2: iter 1 commits r0=2 (2<4); iter 2 computes 4<4 →
+    // guard_true fails → completed=1. Both values prove the seed flowed in.
+    {
+        regs = .{ Value.int(0), Value.int(4) };
+        const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false);
+        tr_regs.commit();
+        try testing.expectEqual(@as(usize, 1), SeedStub.calls);
+        try testing.expect(chained != null);
+        try testing.expectEqual(@as(usize, 1), chained.?.completed);
+        try testing.expect(chained.?.resume_pc == null);
+        try testing.expectEqual(@as(i64, 2), regs[0].asInt());
+    }
+
+    // --- 3. Capacity decline: the twin is consulted but the candidate is
+    // declined (unenterable child) — no execution, no other candidate → null.
+    {
+        SeedStub.rc = trace.NativeSeedCtx.SEED_CAPACITY_DECLINE;
+        regs = .{ Value.int(0), Value.int(4) };
+        const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false);
+        try testing.expectEqual(@as(usize, 2), SeedStub.calls);
+        try testing.expect(chained == null);
+    }
+}
+
 test "in-place re-arm releases the displaced sibling latch (sibling -> ordinary -> sibling -> disarm)" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);

@@ -1555,6 +1555,16 @@ pub const NativeSeedCtx = struct {
     /// committed traces are heap-allocated and immutable, the ctx is heap-allocated
     /// by design. (Recorded deviation from doc 22 §B.1's `*const SeedPlan` sketch.)
     seed_fn: *const fn (ctx: *const NativeSeedCtx, t: *const Trace, plan_bits: u64) callconv(.c) u64,
+    /// The tier-1a seeding twin (interp.zig `nativeSeedTier1aFn`; doc 22 §B.3),
+    /// called from `driveChain`'s chain seams (`seedForTier1a`) before each
+    /// `irinterp.execute` of a seeded successor. Unlike the C-ABI plan twin it
+    /// resolves the FULL input set — tier-1a's `slot_load`s read every synthetic
+    /// slot; seed plans are a native-page concept (carried-heap rewrites) that
+    /// never deactivates tier-1a's needs — and it is a plain Zig fn pointer (the
+    /// callers are chain seams, not JIT-emitted code, so nothing is baked).
+    /// Same tri-state result grammar. Optional so hand-built test ctxs that only
+    /// exercise the C-ABI prologue keep compiling; consumers fail closed.
+    seed_tier1a_fn: ?*const fn (ctx: *const NativeSeedCtx, t: *const Trace) u64 = null,
 };
 
 /// A completed, cached trace: the recorded IR plus the entry/exit snapshots that
@@ -5056,6 +5066,35 @@ pub const TraceState = struct {
         self.gateAnchor(anchor);
     }
 
+    /// Doc 22 §B.3 (Phase B-iii): seed a tier-1a chain successor's inputs
+    /// through the episode ctx before `irinterp.execute`. Returns true when the
+    /// successor may run on tier-1a for this entry:
+    /// - SEED_OK and SEED_HASH_DECLINE → run. A failed hash cell only means the
+    ///   seeded fast pointer is unusable; tier-1a re-derives cells from `href`
+    ///   operands and side-exits at the same `guard_table`/`guard_hash` — this
+    ///   is exactly the dispatcher's old `native_eligible=false` downgrade.
+    /// - SEED_CAPACITY_DECLINE → decline, same directive as the VM-side wall
+    ///   (`seedTraceInputs` returning null).
+    /// - No ctx / no twin installed (hand-built test TraceStates) → decline,
+    ///   fail closed — byte-identical to the pre-B-iii skip.
+    ///
+    /// Seeding re-runs before EVERY execute of a seeded successor (burst
+    /// re-entries included): per-entry re-resolution is the dispatcher's
+    /// contract ("re-resolved and re-seeded on *every* entry"), and a burst
+    /// hop is one more entry of the same region within the same frame. `proto`
+    /// is the caller's frame proto, asserted against the ctx's freshness stamp
+    /// — every chain seam runs inside an episode `prepareNativeEpisode` just
+    /// stamped, so a mismatch is a wiring bug, not a runtime condition.
+    fn seedForTier1a(self: *TraceState, t: *const Trace, proto: *const Proto) bool {
+        if (t.inputs.len == 0) return true;
+        const ctx = self.native_seed_ctx orelse return false;
+        const f = ctx.seed_tier1a_fn orelse return false;
+        std.debug.assert(ctx.proto == @as(*const anyopaque, @ptrCast(proto)));
+        const rc = f(ctx, t);
+        self.dbg("chain-seed: trace={d} inputs={d} rc={d}", .{ t.id, t.inputs.len, rc });
+        return rc != NativeSeedCtx.SEED_CAPACITY_DECLINE;
+    }
+
     /// Exit-PC chaining (step 3): after trace `failed` side-exited with
     /// `exit_instr`, look for a trace at the guard's bytecode PC and try to
     /// execute it. Returns the number of committed iterations if a side trace
@@ -5156,16 +5195,24 @@ pub const TraceState = struct {
                 visited[nvisited] = sct;
                 nvisited += 1;
             }
-            // A candidate with synthetic upvalue/global inputs needs the dispatch
-            // loop's per-entry seeding (no `*Vm` here), so it cannot be entered
-            // through the chain path. Skip it — it still runs via the seeded
-            // same-anchor walk.
-            if (sct.inputs.len != 0) continue;
             const is_link = sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link;
             // Loop-done chains (ir and native) only follow `.link` continuations;
             // an ordinary side trace at the post-loop PC is not a valid hand-off.
             if (loop_done_values != null and !is_link) continue;
             if (tier == .native_only and !is_link) continue;
+            // A candidate with synthetic inputs needs per-entry seeding. B-iii
+            // (doc 22 §B.3): the TIER-1A walk seeds it right here via the episode
+            // ctx's seeding twin — hash-decline included (tier-1a re-derives hash
+            // cells from `href` operands and side-exits at the same guard); only
+            // a capacity decline (or a missing ctx, fail closed) skips it. The
+            // NATIVE walk still requires an input-free candidate until B-iv
+            // (stubEnterable + the fused seed-decline directives) — it still runs
+            // via the dispatcher's own seeded entry. Ordered AFTER the shape
+            // filters so a filtered-out candidate is never spuriously seeded.
+            if (sct.inputs.len != 0) {
+                if (tier == .native_only) continue;
+                if (!self.seedForTier1a(sct, proto)) continue;
+            }
 
             // Once a productive loop-done exit has committed, the ordinary loop-
             // header deopt path is no longer valid: tier-0 must resume at the PC
@@ -7045,7 +7092,15 @@ pub const TraceState = struct {
                 } else {
                     inner = self.findLoopTrace(proto, inner_pc) orelse break;
                 }
-                if (inner.inputs.len != 0) break;
+                // B-iii (doc 22 §B.3): a seeded inner is enterable on tier-1a
+                // after per-entry seeding through the episode ctx (capacity
+                // decline / missing ctx → end the burst, as an unenterable
+                // child). The NATIVE burst stays input-free until B-iv. A fused
+                // result never reaches the seeding call: fusion is native-only.
+                if (inner.inputs.len != 0) {
+                    if (tier == .native_only) break;
+                    if (!self.seedForTier1a(inner, proto)) break;
+                }
                 if (tier == .native_only) self.native_link_follow_count +|= 1;
                 self.link_follow_count +|= 1;
 
@@ -7340,6 +7395,12 @@ pub const TraceState = struct {
                 // Tier-1a never fuses (no slots), so `execute` is always the
                 // continuation's OWN single-exit result — replay the scalar terminal
                 // exactly as before (no ledger to consume).
+                // B-iii (doc 22 §B.3): a seeded driver (admitted by the side-walk
+                // seeding) is RE-seeded before every re-execution — per-entry
+                // re-resolution is the dispatcher's contract, and each hop is one
+                // more entry. A capacity decline mid-burst ends the burst, as an
+                // unenterable driver.
+                if (current_link.inputs.len != 0 and !self.seedForTier1a(current_link, proto)) break;
                 const cbuf = self.valuesScratch(current_link.instrs.len) catch break;
                 const cresult = irinterp.execute(current_link, regs, cbuf);
                 if (cresult.exit_instr == current_link.instrs.len - 1) {

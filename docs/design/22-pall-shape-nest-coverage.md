@@ -1,6 +1,6 @@
 # Pall-shape nest coverage — heap φ writeback, seeded-trace seams, inner-root owners
 
-Status: partial — Phase A + Phase B substrate/flip (B-i, B-ii) landed (2026-08-20), B-iii–B-v + Phases C–D outstanding
+Status: partial — Phase A + Phase B substrate/flip/chain-seams (B-i, B-ii, B-iii) landed (2026-08-20), B-iv–B-v + Phases C–D outstanding
 Owner: Claude (campaign arc 2; Bart 2026-08-20 mandate: every benchmark ≤1.2× LuaJIT)
 Last updated: 2026-08-20
 
@@ -58,18 +58,32 @@ inside them is checked.
   both declines terminal + regs byte-untouched, fail-closed routing) in
   `nativegen_carriedheap_test.zig`; six-hash gate + 3 repros + 28/28 bench
   cross=ok on the flip.
+- [x] **Phase B-iii — tier-1a chain seeding (§B.3).** driveChain's three
+  tier-1a chain seams (side-walk, driveBurstCore link-follow, burst
+  re-entry) seed a seeded successor via the episode ctx before EVERY
+  `irinterp.execute` (per-entry re-resolution, burst hops included), through
+  a dedicated non-C-ABI twin (`NativeSeedCtx.seed_tier1a_fn` →
+  interp.zig `nativeSeedTier1aFn`, delegating to `seedTraceInputs` for
+  byte-identical resolution — the C-ABI plan twin can't serve here: tier-1a
+  needs the FULL input set, plans only carry the ACTIVE bitmap). Disposition
+  per §B.3: SEED_OK **and** SEED_HASH_DECLINE run tier-1a (`href` re-derives
+  cells and side-exits at the same guard — the dispatcher's old
+  `native_eligible=false` downgrade); SEED_CAPACITY_DECLINE declines the
+  candidate; missing ctx/twin fails closed to the pre-B-iii skip. The NATIVE
+  walk still requires input-free candidates until B-iv. Landed 2026-08-20
+  with the §B.6 chained hash-drift pin (twin-stub driveChain test: hash
+  decline chains with the seeded value observable in the result; capacity
+  decline and missing ctx skip) in `trace_chain_test.zig`.
 
 ### Outstanding
 
-- [ ] **Phase B-iii — tier-1a chain seeding (§B.3).** driveChain's
-  link-follow and side-walk seed successors via the episode ctx before
-  `irinterp.execute`, with the §B.4 chained hash-drift pin.
 - [ ] **Phase B-iv — `stubEnterable` + the ~15-site gate audit (§B.5).**
   One shared predicate replaces every `inputs.len != 0` hard-decline;
   replaces the B-ii `replayLedger` fused-decline panic with the §B.2 fused
   directive (drain silent prefix, then tier-1a retry from the decline row).
 - [ ] **Phase B-v — §B.6 tests + Phase-B measurement.** Remaining §B.6
-  matrix (chained hash-drift, redundant-seed, fused-decline) + A/B vs
+  matrix (redundant-seed, fused-decline; chained hash-drift landed with
+  B-iii) + A/B vs
   `just shadow` baseline; check nbody advance:132 bridge records/compiles/
   runs natively and link arms > 0.
 - [ ] **Phase C — canonical owner election + gate reopening.** Elect the

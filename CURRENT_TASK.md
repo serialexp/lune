@@ -16,6 +16,51 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-20 (LATEST-75) — **Doc 22 Phase B-iii (tier-1a chain seeding, §B.3) LANDED: driveChain's chain seams now seed InputSeed-carrying successors and run them on tier-1a. The NATIVE walk stays input-free-gated until B-iv.**
+
+- The twin: `NativeSeedCtx.seed_tier1a_fn` (trace.zig, optional field after
+  `seed_fn`; plain Zig fn ptr — chain seams aren't JIT code, nothing baked)
+  → interp.zig `nativeSeedTier1aFn`, installed at Vm.initBare beside the
+  C-ABI twin. It delegates to `seedTraceInputs(ct, ctx.base, closure, proto,
+  RegWindow.empty, &native_eligible)` — byte-identical resolution+validation
+  to a dispatcher entry, FULL input set (the C-ABI plan twin can't serve:
+  `SeedPlan.bits` carries only ACTIVE seeds, tier-1a slot_loads read every
+  synthetic slot). Mapping: null window → SEED_CAPACITY_DECLINE;
+  `native_eligible=false` → SEED_HASH_DECLINE (the 0-bits slot IS written,
+  like the dispatcher); else SEED_OK. Returned widened window discarded —
+  chain seams execute with the caller's window; synthetic slots live in dead
+  scratch above the frame the capacity check bounded, RegWindow accessors
+  are unbounded pointer offsets into the same slab.
+- The gate: `TraceState.seedForTier1a(t, proto)` (trace.zig:5088) —
+  inputs-free short-circuits true; missing ctx/twin fails CLOSED (pre-B-iii
+  skip; hand-built test TraceStates); asserts `ctx.proto == proto`
+  (freshness — every seam runs right after `prepareNativeEpisode`); returns
+  `rc != SEED_CAPACITY_DECLINE` (hash-decline RUNS: tier-1a `href`
+  re-derives cells from operands and side-exits at the same guard — the old
+  dispatcher `native_eligible=false` downgrade).
+- Three seams converted from hard `inputs.len != 0` skips (tier-split: the
+  NATIVE walk still requires input-free until B-iv stubEnterable):
+  driveChain side-walk (:5212, ordered AFTER the shape filters so a
+  filtered-out candidate is never spuriously seeded), driveBurstCore
+  link-follow inner gate, and the burst re-entry before every tier-1a
+  `irinterp.execute` of `current_link` — per-entry re-resolution is the
+  contract; a burst hop is one more entry (seeds are loop-invariant only
+  over the trace's own region).
+- §B.6 chained hash-drift pin (trace_chain_test.zig): stub twin smuggled
+  via `ctx.vm` writes the seeded slot into the SAME lanes the chain window
+  views, then scripts the disposition. (1) no ctx → fail closed, twin never
+  consulted; (2) SEED_HASH_DECLINE → chains, completed=1, r0=2 — both only
+  reachable through the seeded increment, proving the write precedes
+  execute; (3) SEED_CAPACITY_DECLINE → declined, null.
+- Gate battery green: `zig build test`, `-Djit-debug=true`, six-hash × both
+  tiers, repros 109/109/18135, `just bench` 28/28 cross=ok. Board unchanged
+  (expected — seeded successors still can't ARM native links until B-iv;
+  nbody 39.9× jit).
+- NEXT: B-iv stubEnterable + ~15-site audit (§B.5; replaces the B-ii
+  replayLedger fused-decline panic with the §B.2 fused directive) → B-v
+  §B.6 remainder (redundant-seed, fused-decline) + A/B measurement (nbody
+  advance:132 native, link arms > 0) → Phase C.
+
 ## Status 2026-08-20 (LATEST-74) — **Doc 22 Phase B-i (inert seed substrate) + B-ii (prologue seeding + the DIRECT-entry decline flip) LANDED. Seeded traces (InputSeed-carrying, e.g. nbody advance:34's `local sqrt = math.sqrt` upvalue) now run NATIVE on direct entry. Fused entries stay gated until B-iv.**
 
 - B-i (inert, committed f037529): `NativeSeedCtx` (trace.zig:1524; SEED_OK=1

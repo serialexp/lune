@@ -838,7 +838,7 @@ pub const Vm = struct {
         // (the free) lives in `TraceState.deinit`.
         const seed_ctx = try gpa.create(trace.NativeSeedCtx);
         errdefer gpa.destroy(seed_ctx);
-        seed_ctx.* = .{ .seed_fn = &nativeSeedFn };
+        seed_ctx.* = .{ .seed_fn = &nativeSeedFn, .seed_tier1a_fn = &nativeSeedTier1aFn };
         var vm = Vm{
             .gpa = gpa,
             .heap = gc.Heap.init(gpa),
@@ -1037,6 +1037,38 @@ pub const Vm = struct {
             self.regSet(ctx.base + seed.slot, v);
         }
         return if (ok) trace.NativeSeedCtx.SEED_OK else trace.NativeSeedCtx.SEED_HASH_DECLINE;
+    }
+
+    /// Doc 22 §B.3: the tier-1a seeding twin, installed into
+    /// `NativeSeedCtx.seed_tier1a_fn` at VM init and called from `driveChain`'s
+    /// chain seams (trace.zig `seedForTier1a`) before each `irinterp.execute`
+    /// of a seeded successor. Unlike the C-ABI plan twin (`nativeSeedFn`) it
+    /// resolves the FULL input set — tier-1a's `slot_load`s read every
+    /// synthetic slot; a seed plan is a native-page concept (carried-heap
+    /// rewrites) that never deactivates tier-1a's needs — so it delegates to
+    /// `seedTraceInputs` itself, guaranteeing byte-identical resolution +
+    /// validation to a dispatcher entry, and maps the (window, native_eligible)
+    /// result onto the ctx tri-state:
+    /// - null window → SEED_CAPACITY_DECLINE (nothing written),
+    /// - hash-cell validation failure → SEED_HASH_DECLINE (the 0-bits slot IS
+    ///   written, exactly like the dispatcher — tier-1a's `href` re-derives the
+    ///   cell and side-exits at the same guard, so it remains runnable),
+    /// - else SEED_OK.
+    /// The returned (widened) window is discarded: chain seams execute with the
+    /// caller's window, whose lane pointers view the same slab — the synthetic
+    /// slots sit in dead scratch above the frame that the capacity check just
+    /// bounded, and `RegWindow` accessors are unbounded pointer offsets.
+    fn nativeSeedTier1aFn(ctx: *const trace.NativeSeedCtx, ct: *const trace.Trace) u64 {
+        const self: *Vm = @ptrCast(@alignCast(ctx.vm));
+        const closure: *const function.Closure = @ptrCast(@alignCast(ctx.closure));
+        const proto: *const Proto = @ptrCast(@alignCast(ctx.proto.?));
+        var native_eligible = true;
+        _ = self.seedTraceInputs(ct, ctx.base, closure, proto, RegWindow.empty, &native_eligible) orelse
+            return trace.NativeSeedCtx.SEED_CAPACITY_DECLINE;
+        return if (native_eligible)
+            trace.NativeSeedCtx.SEED_OK
+        else
+            trace.NativeSeedCtx.SEED_HASH_DECLINE;
     }
 
     /// Doc 22 §B.1: publish the current activation into the per-VM seeding ctx
