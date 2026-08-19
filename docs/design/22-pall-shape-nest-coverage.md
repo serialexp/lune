@@ -1,6 +1,6 @@
 # Pall-shape nest coverage — heap φ writeback, seeded-trace seams, inner-root owners
 
-Status: partial — Phase A + Phase B substrate/flip/chain-seams (B-i, B-ii, B-iii) landed (2026-08-20), B-iv–B-v + Phases C–D outstanding
+Status: partial — Phase A + Phase B through the gate audit (B-i…B-iv) landed (2026-08-20), B-v + Phases C–D outstanding
 Owner: Claude (campaign arc 2; Bart 2026-08-20 mandate: every benchmark ≤1.2× LuaJIT)
 Last updated: 2026-08-20
 
@@ -74,13 +74,43 @@ inside them is checked.
   with the §B.6 chained hash-drift pin (twin-stub driveChain test: hash
   decline chains with the seeded value observable in the result; capacity
   decline and missing ctx skip) in `trace_chain_test.zig`.
+- [x] **Phase B-iv — `stubEnterable` + the ~15-site gate audit (§B.5).**
+  Landed 2026-08-20 in three steps: **B-iv.1** (34ebb88) the inert
+  substrate — `seed_prologue` recorded on `CompiledTrace` plus the shared
+  `stubEnterable(t, entry_kind, proto)` predicate (compiled page, requested
+  entry stub present, `seed_plan.nonEmpty() == seed_prologue` invariant
+  panic, unseeded → always enterable, seeded → fail-closed episode
+  freshness: live `native_seed_ctx`, ctx.proto match, anchor.proto match,
+  `region_context.call_seq == ctx.call_seq`; hash/capacity are NOT
+  enterability — a decline leaves the stub enterable). **B-iv.2** (62312df)
+  the decline directives — interp ledger gates + the §B.2 fused-decline
+  replay arms (drain the silent prefix, resume at the decliner's coherent
+  anchor, no receipt/strike/side-exit/chain-source; codex-approved deviation
+  in thread 01a01ae1: fused declines do NOT rerun the decliner tier-1a
+  in-drain). **B-iv.3** (0adc9ef) THE flip — every `inputs.len != 0`
+  hard-decline at the chain/link/arm/replay seams (findLinkTrace,
+  findLoopTrace, isInnerLoopRoot, resolveLoopDoneCont,
+  computeNativeLoopDoneLink, promotedEdgeFromLink, armLinkTerminal,
+  armLoopDoneLinkTo, armNativeLink `.sibling_handoff`,
+  validateRegionBridge, the driveChain walk seams) replaced with
+  `stubEnterable`. Two recorded deviations, both widening-preserving:
+  (1) the replayLedger fused-successor asserts are **conditional on
+  `succ.inputs.len != 0`** — an unconditional `stubEnterable` would have
+  NARROWED the pre-B-iv zero-input shape-only contract (and broken the
+  deliberately-uncompilable synthetic fixtures); the seed-freshness proof
+  only exists for seeded rows (kind-carrying ledgers are native-only, so
+  a seeded fused row implies a same-frame self-seed under the live
+  episode ctx). (2) `validateRegionBridge` declines a non-enterable
+  seeded child **transiently** (null, no `invalidateRegion` tombstone) —
+  ctx staleness is per-episode, not structural. Regression pins: seeded
+  selection + `.sibling_handoff` no-ctx/stale/fresh ladder
+  (`trace_chain_test.zig`), both widened asserts' positive seeded paths
+  byte-identical to their zero-input twins (`trace_replay_test.zig`),
+  transient-decline + positive seeded-enterable region legs
+  (`trace_region_test.zig`).
 
 ### Outstanding
 
-- [ ] **Phase B-iv — `stubEnterable` + the ~15-site gate audit (§B.5).**
-  One shared predicate replaces every `inputs.len != 0` hard-decline;
-  replaces the B-ii `replayLedger` fused-decline panic with the §B.2 fused
-  directive (drain silent prefix, then tier-1a retry from the decline row).
 - [ ] **Phase B-v — §B.6 tests + Phase-B measurement.** Remaining §B.6
   matrix (redundant-seed, fused-decline; chained hash-drift landed with
   B-iii) + A/B vs
