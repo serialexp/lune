@@ -5095,6 +5095,69 @@ pub const TraceState = struct {
         return rc != NativeSeedCtx.SEED_CAPACITY_DECLINE;
     }
 
+    /// Doc 22 §B.4/§B.5: which secondary entry stub an arm/link site wants to
+    /// target. Both stubs `jmp body_entry`, which owns the seed prologue — so a
+    /// seeded page seeds on EVERY entry kind and `stubEnterable` is
+    /// kind-uniform apart from which stub must exist.
+    pub const StubEntryKind = enum { ordinary, linked };
+
+    /// Doc 22 §B.4: THE gate every arm/link site consults instead of the B-i..iii
+    /// scalar `inputs.len == 0` filters. Answers "may native execution enter this
+    /// trace's page through `entry_kind` right now?" — replacing the blanket
+    /// "seeded children are unlinkable" rule with "seeded children are linkable
+    /// when their seed context is fresh."
+    ///
+    /// Fail-closed contract (codex-confirmed): operational sites get `false` on
+    /// stale/missing context and fall back to their pre-B-iv disposition; the
+    /// only panic is the §B.4 plan⟺prologue invariant, which two independent
+    /// facts witness (`seed_plan` from `compileImpl`'s planning pass,
+    /// `seed_prologue` recorded at emission).
+    ///
+    /// Freshness for a seeded page = the episode's `NativeSeedCtx` stamp still
+    /// names the live frame: same proto on both the ctx and the trace anchor,
+    /// and the ctx's activation token matches `region_context.call_seq` (which
+    /// `setRegionContext` refreshes unconditionally at every frame transition,
+    /// so it IS the live frame's token at any dispatcher/chain seam). Every
+    /// seeded-entry-capable seam must have run `prepareNativeEpisode` before
+    /// evaluating this predicate — that is what stamps the ctx.
+    ///
+    /// Never compiles: callers that may need lazy compilation run `nativeFor`
+    /// first; a not-yet-compiled page is simply not enterable yet.
+    pub fn stubEnterable(
+        self: *const TraceState,
+        t: *const Trace,
+        entry_kind: StubEntryKind,
+        proto: *const Proto,
+    ) bool {
+        const c = switch (t.native) {
+            .compiled => |*cc| cc,
+            else => return false,
+        };
+        const entry: ?usize = switch (entry_kind) {
+            .ordinary => c.ordinary_entry,
+            .linked => c.linked_entry,
+        };
+        if (entry == null) return false;
+        // §B.4 invariant, release-asserted: the plan (source of truth for "this
+        // page seeds at entry") and the emitted prologue must agree. A mismatch
+        // means compileImpl planned one thing and lower emitted another —
+        // continuing would either skip required seeding or run an un-seedable
+        // prologue, both memory-unsafe.
+        if (c.seed_plan.nonEmpty() != c.seed_prologue) @panic(
+            "stubEnterable: seed plan/prologue mismatch (doc 22 §B.4)",
+        );
+        // Unseeded page: enterable unconditionally (the pre-B-iv world). No
+        // episode context needed — hand-built test pages stay armable.
+        if (!c.seed_plan.nonEmpty()) return true;
+        // Seeded page: fail-closed freshness.
+        const ctx = self.native_seed_ctx orelse return false;
+        const ctx_proto = ctx.proto orelse return false;
+        if (ctx_proto != @as(*const anyopaque, @ptrCast(proto))) return false;
+        if (t.anchor.proto != proto) return false;
+        const rctx = self.region_context orelse return false;
+        return ctx.call_seq == rctx.call_seq;
+    }
+
     /// Exit-PC chaining (step 3): after trace `failed` side-exited with
     /// `exit_instr`, look for a trace at the guard's bytecode PC and try to
     /// execute it. Returns the number of committed iterations if a side trace

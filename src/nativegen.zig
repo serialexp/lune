@@ -935,9 +935,13 @@ pub const CompiledTrace = struct {
     /// Doc 22 §B.4: which of the trace's `inputs` this page consumes at entry
     /// (see `SeedPlan`). Set by `compileImpl` for every page; "this page seeds
     /// at entry" is `seed_plan.nonEmpty()`, never raw `inputs.len`. The Phase-B
-    /// invariant (release-asserted once the prologue lands in B-ii):
-    /// `seed_plan.nonEmpty() == prologue-present`.
+    /// invariant `seed_plan.nonEmpty() == seed_prologue` is release-asserted by
+    /// `trace.TraceState.stubEnterable` at every arm/link gate (B-iv).
     seed_plan: SeedPlan = .{},
+    /// Doc 22 §B.4: whether the emitted body actually carries the seed prologue,
+    /// recorded at emission time (see `EntryStubs.seed_prologue`). Independent
+    /// witness for the `seed_plan.nonEmpty() ⟺ prologue-present` invariant.
+    seed_prologue: bool = false,
 
     pub const EntryFn = fn ([*]u8, [*]u64, *NativeResult) callconv(.c) void;
     /// The shared frameless trampoline's C-ABI type: SoA lanes + result out-param,
@@ -1345,6 +1349,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, see
         .exit_patches = exit_patches,
         .metadata_cells = metadata_cells,
         .seed_plan = seed_plan,
+        .seed_prologue = entry_stubs.seed_prologue,
     };
 }
 
@@ -4464,6 +4469,11 @@ pub fn compositeBridgeEmitsSlot(t: *const Trace, exit_instr: usize, slot: u16) b
 const EntryStubs = struct {
     linked_entry: ?usize = null,
     ordinary_entry: ?usize = null,
+    /// Doc 22 §B.4: whether `lower` actually emitted the seed prologue at
+    /// `body_entry`. Recorded from emission itself (`seed_hash_exit != null`),
+    /// NOT recomputed from the plan, so `stubEnterable`'s release-assert
+    /// `seed_plan.nonEmpty() == seed_prologue` checks two independent facts.
+    seed_prologue: bool = false,
 };
 
 const PatchEmission = struct {
@@ -5683,6 +5693,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
     // only on the frameless production path; self-framed test pages never chain, so
     // their `linked_entry` stays `null`. INERT until 2.3b-1 arms a slot to it.
     var stubs = EntryStubs{};
+    // §B.4 record: the prologue was emitted iff its decline labels exist. Both
+    // secondary entries below `jmp body_entry`, so a seeded page seeds on EVERY
+    // entry kind — this bit is entry-kind-independent by construction.
+    stubs.seed_prologue = seed_hash_exit != null;
     if (shared_exit != null) {
         const linked_entry = try a.label();
         a.bind(linked_entry);

@@ -384,3 +384,117 @@ test "in-place re-arm releases the displaced sibling latch (sibling -> ordinary 
     try testing.expectEqual(@as(u32, 0), parent.sibling_arms);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
 }
+
+// ---------------------------------------------------------------------------
+// Doc 22 §B.4 (Phase B-iv.1): `stubEnterable` — THE gate every arm/link site
+// consults instead of scalar `inputs.len == 0` filters. Pins the full decision
+// table: page/entry presence, the unseeded unconditional-true arm (hand-built
+// test pages stay armable with no episode ctx), and the seeded fail-closed
+// freshness ladder (ctx present → ctx.proto matches → anchor.proto matches →
+// region_context present → call_seq tokens agree).
+// ---------------------------------------------------------------------------
+
+fn stubEnterableDummySeed(
+    ctx: *const trace.NativeSeedCtx,
+    t: *const Trace,
+    plan_bits: u64,
+) callconv(.c) u64 {
+    _ = ctx;
+    _ = t;
+    _ = plan_bits;
+    return trace.NativeSeedCtx.SEED_OK;
+}
+
+test "B-iv.1 stubEnterable (doc 22 §B.4): entry presence, unseeded pass, seeded freshness ladder" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    const proto = Proto{
+        .code = &.{Instr.op0(.ret)},
+        .name = "stub-enterable",
+        .num_registers = 1,
+    };
+    const other_proto = Proto{
+        .code = &.{Instr.op0(.ret)},
+        .name = "stub-enterable-other",
+        .num_registers = 1,
+    };
+
+    // (1) Not compiled → false for both kinds (never compiles lazily).
+    var uncompiled: Trace = .{
+        .id = 60,
+        .anchor = .{ .proto = &proto, .pc = 1 },
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    try testing.expect(!state.stubEnterable(&uncompiled, .ordinary, &proto));
+    try testing.expect(!state.stubEnterable(&uncompiled, .linked, &proto));
+
+    // (2) Compiled, only the ordinary entry present: kind-selective. Unseeded
+    // plan (default) → ordinary passes with NO episode ctx; linked has no stub.
+    var ordinary_only: Trace = .{
+        .id = 61,
+        .anchor = .{ .proto = &proto, .pc = 1 },
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .gpa = gpa, .ordinary_entry = 0xCAFE } },
+    };
+    try testing.expect(state.stubEnterable(&ordinary_only, .ordinary, &proto));
+    try testing.expect(!state.stubEnterable(&ordinary_only, .linked, &proto));
+
+    // (3) Seeded page (plan non-empty + prologue recorded, the §B.4 invariant
+    // holding): fail-closed freshness ladder.
+    var seeded: Trace = .{
+        .id = 62,
+        .anchor = .{ .proto = &proto, .pc = 1 },
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{
+            .page = undefined,
+            .gpa = gpa,
+            .linked_entry = 0xBEEF,
+            .ordinary_entry = 0xCAFE,
+            .seed_plan = .{ .bits = 1 },
+            .seed_prologue = true,
+        } },
+    };
+    // (3a) No episode ctx at all → false.
+    try testing.expect(!state.stubEnterable(&seeded, .ordinary, &proto));
+
+    const ctx = try gpa.create(trace.NativeSeedCtx);
+    ctx.* = .{ .seed_fn = stubEnterableDummySeed };
+    state.native_seed_ctx = ctx; // state.deinit() destroys it
+
+    // (3b) Ctx present but never stamped (proto == null) → false.
+    try testing.expect(!state.stubEnterable(&seeded, .ordinary, &proto));
+
+    // (3c) Ctx stamped for a DIFFERENT frame proto → false.
+    ctx.proto = @ptrCast(&other_proto);
+    ctx.call_seq = 7;
+    state.region_context = .{ .depth = 0, .call_seq = 7 };
+    try testing.expect(!state.stubEnterable(&seeded, .ordinary, &proto));
+
+    // (3d) Ctx matches the live proto but the trace is anchored elsewhere → false.
+    try testing.expect(!state.stubEnterable(&seeded, .ordinary, &other_proto));
+
+    // (3e) Fully fresh: ctx.proto == proto == anchor.proto, call_seq tokens
+    // agree → true, for BOTH entry kinds (the prologue is entry-kind-uniform).
+    ctx.proto = @ptrCast(&proto);
+    try testing.expect(state.stubEnterable(&seeded, .ordinary, &proto));
+    try testing.expect(state.stubEnterable(&seeded, .linked, &proto));
+
+    // (3f) Frame token drift (new activation since the episode was stamped) → false.
+    state.region_context = .{ .depth = 0, .call_seq = 8 };
+    try testing.expect(!state.stubEnterable(&seeded, .ordinary, &proto));
+
+    // (3g) No region context at all (no frame transition observed yet) → false.
+    state.region_context = null;
+    try testing.expect(!state.stubEnterable(&seeded, .ordinary, &proto));
+}
