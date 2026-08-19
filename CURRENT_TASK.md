@@ -16,6 +16,34 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-20 (LATEST-76) — **Doc 22 Phase B COMPLETE (B-iv gate flip + B-v test battery + measurement): seeded traces now enter native at EVERY seam, and nbody drops 40.4× → 21.9× LuaJIT (180.5 → 99.4 ms, −45%).**
+
+- B-iv.1/2/3 (34ebb88, 62312df, 0adc9ef): `stubEnterable` replaced every
+  `inputs.len != 0` hard-decline at the ~15 chain/link/arm/replay seams;
+  fused declines drain through the two new ledger kinds. Deviations recorded
+  in doc 22 (conditional fused-successor asserts; transient
+  validateRegionBridge decline).
+- B-v (d2a51c6): full §B.6 matrix — 3 e2e tests w/ inspect witnesses
+  (seeds_at_entry invariant `seed_plan.nonEmpty() == seed_prologue` per
+  compiled trace; hash-drift decline fires in production `nativeSeedFn`),
+  redundant-seed run test (plan-inactive slab slot bit-for-bit unwritten) +
+  compileImpl release-assert, fused terminal-decline placement pin.
+  **Grant semantics pinned:** `.loop_done_linked` grants
+  `linked_completed += 1` per row (one committed outer iteration); the
+  ledger `cum` feeds only region accounting; a terminal seed-decline returns
+  the accumulated grant (completed==1 in the 3-row pin), resume at the
+  decliner's own anchor. Diagnostic `seed_hash_declines` /
+  `seed_capacity_declines` counters at all five decline drain seams.
+- Measurement (A/B vs `just shadow` at a468fa2, strings-verified baseline):
+  advance:132 records, 3/3 traces compile native, runs fused via loopdone
+  links (79,975 fused follows; arms native=1 loopdone=1). nbody 40.4× →
+  21.9×; pi_leibniz −13%; scimark-sor −6%; rest of 28-board noise, 28/28
+  cross=ok, no regressions. Remaining nbody gap is coverage elsewhere:
+  advance:4 (8.8% run, 0% traced), main:211 (13.3%), tier-0 no-trace 22.4%
+  of run + seam 9.0% — Phase C (owner election) + later arcs.
+- NEXT: doc 22 Phase C — canonical owner election by physical region
+  membership + C.2 gates_cleared latch; then Phase D full-board measurement.
+
 ## Status 2026-08-20 (LATEST-75) — **Doc 22 Phase B-iii (tier-1a chain seeding, §B.3) LANDED: driveChain's chain seams now seed InputSeed-carrying successors and run them on tier-1a. The NATIVE walk stays input-free-gated until B-iv.**
 
 - The twin: `NativeSeedCtx.seed_tier1a_fn` (trace.zig, optional field after

@@ -1,6 +1,6 @@
 # Pall-shape nest coverage — heap φ writeback, seeded-trace seams, inner-root owners
 
-Status: partial — Phase A + Phase B through the gate audit (B-i…B-iv) landed (2026-08-20), B-v + Phases C–D outstanding
+Status: partial — Phases A + B complete (B-i…B-v landed + measured 2026-08-20), Phases C–D outstanding
 Owner: Claude (campaign arc 2; Bart 2026-08-20 mandate: every benchmark ≤1.2× LuaJIT)
 Last updated: 2026-08-20
 
@@ -109,13 +109,36 @@ inside them is checked.
   transient-decline + positive seeded-enterable region legs
   (`trace_region_test.zig`).
 
+- [x] **Phase B-v — §B.6 tests + Phase-B measurement.** Landed 2026-08-20
+  (d2a51c6). All eight §B.6 rows covered: structural upvalue-seeded chain +
+  ten-leg-nest-with-upvalue-builtin + hash-drift-decline e2e tests
+  (`interp_native_test.zig`, with `assertSeededChainExercised` /
+  `assertHashDriftDeclined` inspect witnesses — the §B.4 seeds_at_entry
+  invariant `seed_plan.nonEmpty() == seed_prologue` is asserted per compiled
+  trace); redundant-seed deactivation as a *run* test (stale hash seed
+  excluded by the plan never blocks entry, its slab slot stays bit-for-bit
+  unwritten; `nativegen_carriedheap_test.zig`) plus a `compileImpl`
+  release-assert that no emitted body instruction reads a plan-inactive
+  seed's slot; and the fused terminal-decline *placement pin*
+  (`trace_replay_test.zig`): a 3-row `[loop_done_linked, link_terminal,
+  seed_hash_decline]` ledger returns completed == 1 — the predecessor's
+  per-row grant (`.loop_done_linked` grants `linked_completed += 1`, one
+  committed outer iteration; the ledger `cum` feeds only region accounting)
+  is preserved past the decline, resume at the decliner's own anchor.
+  Diagnostic `seed_hash_declines`/`seed_capacity_declines` counters wired at
+  all five decline drain seams (interp direct capacity+hash handlers,
+  replayLedger silent M1 + dispatcher-grammar terminal arms, driveChain
+  hop-0); no tiering path reads them. **Measurement (A/B vs `just shadow`
+  baseline at a468fa2, nm/strings-verified):** nbody advance:132 records,
+  all 3 traces compile native, and it runs fused via loopdone links (79,975
+  fused follows; link arms native=1 loopdone=1) — **nbody 180.5 → 99.4 ms
+  (40.4× → 21.9× LuaJIT, −45%)**; pi_leibniz 12.9 → 11.2 ms (−13%),
+  scimark-sor 80.0 → 75.4 ms (−6%); the rest of the 28-program board within
+  noise, cross=ok throughout, no regressions. Gate battery green (962 tests,
+  jit-debug build, six-hash gate both modes, repros 109/109/18135).
+
 ### Outstanding
 
-- [ ] **Phase B-v — §B.6 tests + Phase-B measurement.** Remaining §B.6
-  matrix (redundant-seed, fused-decline; chained hash-drift landed with
-  B-iii) + A/B vs
-  `just shadow` baseline; check nbody advance:132 bridge records/compiles/
-  runs natively and link arms > 0.
 - [ ] **Phase C — canonical owner election + gate reopening.** Elect the
   unique inner-root-shaped member of a closed cycle as the *canonical
   accounting owner* (not a proven entry point — the region must accept
