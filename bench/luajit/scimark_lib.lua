@@ -16,6 +16,58 @@ local pi, clock = math.pi, os.clock
 
 local benchmarks = {}
 
+-- ### lune-local edit 2 of 2 (2026-08-26): a result checksum.
+--
+-- Upstream's kernels return a flop count that the wrappers discard, so these
+-- four benches printed NOTHING. That made their frozen-output digest sha256("")
+-- and made `bench/run.py`'s cross-tier check compare "" == "" == "" while
+-- reporting `cross=ok` — on precisely the float/array workloads lune's JIT
+-- leans on hardest. `benchmarks.checksum()` closes that: each kernel records
+-- its result state here, and the wrapper prints a fold of it after the run.
+--
+-- WHY AN INTEGER FOLD AND NOT `string.format("%.17g", ...)`: lune's
+-- `string.format` cannot currently render more significant digits than a
+-- double's shortest round-trip form — it zero-pads instead, so `%.17g` of 1/3
+-- gives `0.3333333333333333` where C and LuaJIT give `0.33333333333333331`
+-- (see TODO.md). Any high-precision float print would therefore differ between
+-- the engines for formatting reasons alone, masking or faking a real numeric
+-- difference. The fold below touches no float formatting at all:
+--   * `x % 1` is exact;
+--   * scaling by 2^52 is exact (power of two), and the product is < 2^52, so
+--     `floor` recovers EVERY fraction bit — the fold is 1-ulp sensitive;
+--   * every intermediate stays under 2^53, so it is exact both in LuaJIT's
+--     doubles and in Lua 5.4's integers, and `%d` renders it identically.
+local ck_state = nil
+
+local function ck_fold(acc, x)
+  local ip = x - (x % 1)
+  local fb = floor((x % 1) * 2^52)
+  acc = (acc * 1000003 + ip) % 2147483647
+  acc = (acc * 1000003 + fb) % 2147483647
+  return acc
+end
+
+-- Folds whatever the most recently constructed kernel left behind. Reads the
+-- state THROUGH the stored container rather than over pre-resolved rows: LU's
+-- `lu_factor` pivots by swapping row references (`a[j], a[jp] = a[jp], a[j]`),
+-- so a row list captured at construction time would checksum the wrong rows.
+function benchmarks.checksum()
+  local s = ck_state
+  if not s then return "checksum: no kernel constructed" end
+  local acc = 0
+  if s.vec then
+    local v = s.vec
+    for i = 1, s.n do acc = ck_fold(acc, v[i]) end
+  else
+    local m = s.mat
+    for y = 1, s.n do
+      local row = m[y]
+      for x = 1, s.n do acc = ck_fold(acc, row[x]) end
+    end
+  end
+  return string.format("%s checksum: %d", s.name, acc)
+end
+
 ------------------------------------------------------------------------------
 -- This is a Lagged Fibonacci Pseudo-random Number Generator with
 -- j, k, M = 5, 17, 31. Pretty weak, but same as C/Java SciMark.
@@ -23,7 +75,28 @@ local benchmarks = {}
 
 local rand, rand_init
 
-if jit and jit.status and jit.status() then
+-- ### lune-local edit 1 of 2 (2026-08-26). Upstream reads:
+--       if jit and jit.status and jit.status() then
+-- The two branches below are NOT equivalent generators. They agree on their
+-- first value and then diverge (verified: element 2 differs by 1, and the
+-- sequences drift apart from there). Upstream never noticed because nothing
+-- compares the two engines' numeric output — the four scimark benches print
+-- nothing at all.
+--
+-- lune's bench suite DOES compare them: `bench/run.py` asserts lune's stdout
+-- equals LuaJIT's for every `luajit=compatible` program. With the branch live,
+-- LuaJIT takes the `bit` path and lune the portable one, so the engines run
+-- these kernels on DIFFERENT INPUT DATA and byte-parity is not merely absent
+-- but unreachable. Forcing the portable branch makes all four kernels agree
+-- with LuaJIT bit-for-bit.
+--
+-- This is free: `rand` is called only by `random_vector`/`random_matrix` at
+-- kernel-construction time, never inside a timed loop, for FFT/SOR/SPARSE/LU.
+-- Measured on LuaJIT at bench sizes: sor -0.8%, lu -1.8% (i.e. noise). Only
+-- `benchmarks.MC` calls `rand` in its hot loop, and MC is not one of our benches.
+-- The `bit` branch is kept intact rather than deleted so the diff against
+-- upstream stays one line.
+if false and jit and jit.status and jit.status() then
   -- LJ2 has bit operations and zero-based arrays (internally).
   local bit = require("bit")
   local band, sar = bit.band, bit.arshift
@@ -137,6 +210,7 @@ function benchmarks.FFT(n)
     os.exit(1)
   end
   local v = random_vector(n*2)
+  ck_state = { name = "FFT", vec = v, n = n*2 } -- lune-local
   return function(cycles)
     local norm = 1.0 / n
     for p=1,cycles do
@@ -168,6 +242,7 @@ end
 
 function benchmarks.SOR(n)
   local mat = random_matrix(n, n)
+  ck_state = { name = "SOR", mat = mat, n = n } -- lune-local
   return function(cycles)
     sor_run(mat, n, n, cycles, 1.25)
     return (n-1)*(n-1)*cycles*6
@@ -217,6 +292,7 @@ function benchmarks.SPARSE(n, nz)
   local vx = random_vector(n)
   local val = random_vector(anz)
   local vy, col, row = {}, {}, {}
+  ck_state = { name = "SPARSE", vec = vy, n = n } -- lune-local
   row[1] = 1
   for r=1,n do
     local step = floor(r/nr)
@@ -283,6 +359,10 @@ function benchmarks.LU(n)
   local mat = random_matrix(n, n)
   local tmp = matrix_alloc(n, n)
   local pivot = {}
+  -- lune-local. `tmp` is the FACTORED copy, and `lu_factor` pivots by swapping
+  -- row references inside it — which is exactly why `checksum()` re-reads the
+  -- rows through `mat` rather than caching them here.
+  ck_state = { name = "LU", mat = tmp, n = n }
   return function(cycles)
     for i=1,cycles do
       matrix_copy(tmp, mat, n, n)

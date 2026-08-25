@@ -2,6 +2,119 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Pre-existing, MEMORY-SAFETY CLASS (found 2026-08-26): two tier-1a `driveChain` paths read uninitialized state — Debug-only panics, silent UB in ReleaseFast
+
+Found by running `tools/hashgate.py --lune <Debug binary>`. **The suite had never
+been run against a Debug build**, so every `std.debug.assert` and every
+`@enumFromInt` safety check in the corpus was going unexercised. Two of 84
+configurations abort; the other 82 are byte-identical to the ReleaseFast refs.
+
+**Verified pre-existing.** Both reproduce on a `just shadow` build of `70c5bd2`
+(before this session's five commits) with the original vendored bench files,
+`nm`-verified to lack any post-session symbol. Not introduced by the Phase C
+unwind, not by the bench checksums.
+
+Reproduce (Debug build, i.e. plain `zig build`), from `bench/luajit/`:
+
+```
+lune --trace nsieve-bit.lua 6
+    → value.zig:172 asHeap: assert(self.tag == .heap_ref) fails
+      irinterp.zig:278 flushNumericForLoopDone: values[ar.a].asHeap()
+      trace.zig:5015   driveChain (.ir, .ir_numeric_for_done)
+      interp.zig:2685  enterSelectedTrace
+
+lune --trace scimark-sparse.lua 3000
+    → regwindow.zig:52 get: @enumFromInt(self.tags[slot]) — invalid enum value
+      irinterp.zig:328 execute
+      trace.zig:5018   driveChain (.ir, .ir_numeric_for_done)
+      interp.zig:2685  enterSelectedTrace
+```
+
+Same neighbourhood in both: `driveChain` on the **tier-1a** tier with
+`.ir_numeric_for_done` materialization, entered from `enterSelectedTrace`. One
+reads a `values[]` scratch slot the trace never wrote; the other reads a
+`RegWindow` tag slot that was never initialized.
+
+**Why this is worse than a Debug-only nuisance.** In ReleaseFast the `asHeap`
+assert is compiled out, so `flushNumericForLoopDone` takes whatever bits are in
+that slot, reinterprets them as a heap pointer, and does
+`Table.fromHeader(...).array.setInLane(...)` — a **write through an
+unvalidated pointer**. It currently produces correct output on this corpus,
+which means the garbage happens to be benign here, not that the path is sound.
+That is exactly the failure mode that stays quiet until it doesn't.
+
+Both are on `--trace`, which is one of the eight modes the determinism claim
+covers, so this is not an off-path curiosity.
+
+**Not investigated further** — found while closing the frozen-gate coverage hole
+and deliberately left for its own change rather than folded in (Rule #10).
+First questions for whoever picks it up: is the `values[]`/`RegWindow` scratch
+supposed to be fully populated at the point `driveChain` hands it to
+`flushNumericForLoopDone` / `execute`, or is the flush walking store
+instructions past the live prefix of a trace that side-exited early?
+
+**Process fix worth making at the same time:** add a Debug leg to the gate, or at
+minimum a documented `hashgate --lune zig-out/bin/lune` run after a plain
+`zig build`. Two real bugs were sitting in the corpus purely because the gate
+only ever saw ReleaseFast.
+
+## Pre-existing (found 2026-08-26): `string.format` cannot render more digits than a double's shortest round-trip form
+
+Found while closing the frozen-gate coverage hole; **not** caused by it. lune's
+`string.format` honours the *width* of a float conversion but not its
+*precision* beyond the shortest round-trippable digit string — it emits that
+prefix and then zero-pads, so the digits past it are wrong rather than merely
+truncated.
+
+| expression | lune | LuaJIT / C |
+|---|---|---|
+| `%.17g` of `1/3` | `0.3333333333333333` | `0.33333333333333331` |
+| `%.20g` of `1/3` | `0.3333333333333333` | `0.33333333333333331483` |
+| `%.30f` of `1/3` | `0.333333333333333300000000000000` | `0.333333333333333314829616256247` |
+| `%.25f` of `0.1` | `0.1000000000000000000000000` | `0.1000000000000000055511151` |
+| `%.17e` of `1/3` | `3.33333333333333300e-01` | `3.33333333333333315e-01` |
+
+Affects `%f`/`%F`/`%e`/`%E`/`%g`/`%G` whenever the requested precision exceeds
+the shortest round-trip length. Defaults (`%g` → 6, `%f` → 6) are unaffected,
+which is why nothing noticed: `%.17g`-style calls are rare outside numeric
+debugging and cross-implementation comparison.
+
+**Root cause is not in our code.** `src/stdlib/string.zig`'s `renderG` /
+`renderEng` / the `%f` arm all delegate to `std.fmt.float.render`, and the
+pinned toolchain's implementation is Ryu **shortest** (`lib/std/fmt/float.zig`,
+"Step 4: Find the shortest decimal representation…"), then rounds/pads to the
+requested precision. It structurally cannot produce a double's exact decimal
+expansion, and the stdlib offers no fixed-precision alternative.
+
+**Fixing it means implementing exact fixed-precision decimal conversion
+ourselves** — big-integer or an exact-fixed Ryu/Grisu path — plus a differential
+test against C `printf` across the hard cases. Self-contained but not small.
+Per Rule Z-2 it belongs behind the `src/stdlib/string.zig` wrapper, not
+scattered.
+
+Bart's call (2026-08-26): record it, don't fix it now. Consequence to know: the
+benchmark result checksums (`bench/luajit/scimark_lib.lua`, `array3d.lua`) are
+exact **integer folds** specifically to route around this — a `%.17g` checksum
+would differ between lune and LuaJIT for formatting reasons alone, which would
+either mask a real numeric divergence or manufacture a fake one. If this ever
+gets fixed, those folds could be simplified.
+
+If it is picked up, `docs/lua-stdlib-inventory.csv:42` should probably move
+`string.format` from `implemented` to `partial` (Rule Z-5) — deliberately left
+alone for now, since this change touched no stdlib code.
+
+## Weak-but-nonzero bench output coverage (noted 2026-08-26)
+
+The empty-stdout hole is closed, but the *next* weakest link is worth naming.
+Eight `bench/stdlib/` programs collapse an entire run into a single accumulator
+line — `scalar.lua:36`, `tbl_ops.lua:32`, `str_gsub.lua:32`,
+`str_find_match.lua:33`, `str_manip.lua:40`, `lua54.lua:35` print one
+`acc=<int>`; `str_gmatch.lua:34` and `str_format.lua:31` are only slightly
+richer. A single summed integer will catch a gross error but can absorb
+compensating ones, and it pins nothing about intermediate state. Not urgent —
+these are genuinely non-empty and do constrain output — but if a subtle
+string/table bug ever slips past the suite, this is the first place to look.
+
 ## DEFERRED (Aug 2026): further decomposition of trace.zig / interp.zig
 
 The test-suite extraction (LATEST-67) took the four biggest files down a lot,
@@ -173,10 +286,14 @@ knocking any of these down unlocks the listed benches as new corpus members:
   every child (lune all tiers + LuaJIT) with `cwd` set to the bench's own
   directory (`run_once`/`time_best` gained a `cwd=` param), mirroring LuaJIT's
   `run.sh` `cd $BENCH_DIR`, so `package.path`'s `./?.lua` resolves the shared
-  `scimark_lib.lua` (vendored verbatim, no `@bench` header). Unlocked the four
-  `scimark-{fft,lu,sor,sparse}` kernels (corpus 10→14). They are pure-timing benches
-  (the kernels return a discarded flop count → empty stdout → empty==empty parity)
-  and sit 35–76× off LuaJIT — the float/array throughput the JIT is still a no-op on.
+  `scimark_lib.lua` (no `@bench` header). Unlocked the four
+  `scimark-{fft,lu,sor,sparse}` kernels (corpus 10→14). They sit 35–76× off
+  LuaJIT — the float/array throughput the JIT is still a no-op on. They were
+  vendored as pure-timing benches (discarded flop count → empty stdout →
+  empty==empty parity); **that stopped being true on 2026-08-26**, when all
+  five silent benches gained result checksums and `scimark_lib.lua`'s RNG
+  branch was forced portable — see `bench/README.md` and the note in
+  `tools/hashgate.py`.
 - **Binary / Latin-1 output** (`io.write` of non-UTF-8 bytes) or non-UTF-8 source:
   `life` (Latin-1 source string), `mandelbrot`/`fannkuch` (binary PBM output +
   a perm-printing branch divergence). Needs care re: the UTF-8 source/output policy.

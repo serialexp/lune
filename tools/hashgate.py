@@ -30,19 +30,26 @@ nanoseconds, JIT receipts) that are legitimately run-to-run variable.
 program whose own output is not reproducible, so an unstable program is caught
 when the reference is made rather than as a mystery gate failure later.
 
-KNOWN COVERAGE HOLE. Five benchmarks — array3d and the four scimark kernels —
-are pure-timing programs that print nothing (scimark-fft's header says so
-outright: "the kernel returns a flop count that the wrapper discards: stdout is
-empty"). Their digest is therefore sha256("") and pins only the exit code.
-`bench/run.py`'s cross-tier check has the same blind spot for them: it is
-comparing "" == "" == "" and reporting `cross=ok`. Since three of those five
-(fft, lu, sor) are the float/array kernels the JIT's region machinery leans on
-hardest, this is where the suite's correctness claim is weakest. The gate prints
-its own empty-output count on every run so the number is never mistaken for
-coverage it does not have. Closing it means giving the kernels a deterministic
-result checksum, which touches files vendored verbatim from LuaJIT and would
-have to keep byte-parity with LuaJIT's own run — a deliberate decision, not a
-drive-by.
+COVERAGE HOLE, CLOSED 2026-08-26 — kept on file because of what was under it.
+Five benchmarks (array3d and the four scimark kernels) used to print nothing, so
+their digest was sha256("") and pinned only an exit code, and `bench/run.py`'s
+cross-tier check was comparing "" == "" == "" while reporting `cross=ok` — on
+the float/array kernels the JIT leans on hardest. All five now print an exact
+integer checksum of their result state.
+
+Closing it exposed a second defect the first had been hiding. `scimark_lib.lua`
+selects its RNG with `if jit and jit.status and jit.status()`, and the two
+branches are NOT equivalent generators — they agree on their first value and
+then diverge. LuaJIT took one branch and lune the other, so the four scimark
+kernels had been running on DIFFERENT INPUT DATA in the two engines, and their
+`luajit=compatible` claim was not merely vacuous but unreachable. Nothing caught
+it precisely because the programs printed nothing. The lib now forces the
+portable branch (free: `rand` is setup-only for these kernels), and all four
+verifiably match LuaJIT bit-for-bit.
+
+`report_coverage` below stays. It is no longer describing a known defect — it is
+a live tripwire, so that a benchmark added later with no output cannot silently
+recreate this.
 
 Assumes lune is built:  zig build -Doptimize=ReleaseFast  (or pass --lune).
 """

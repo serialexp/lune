@@ -119,11 +119,47 @@ and the four `scimark-*` kernels (`fft`, `lu`, `sor`, `sparse`).
 with its working directory set to the bench's own directory, mirroring upstream
 LuaJIT's `run.sh` (`cd $BENCH_DIR`). The default `package.path` (`"./?.lua;..."`)
 then finds `./scimark_lib.lua`. The bench path itself is passed absolute, so the
-cwd only affects `require`. The kernels return a flop count that the wrappers
-discard, so their **stdout is empty** — they are pure-timing benches (empty ==
-empty trivially satisfies `luajit=compatible` parity). They are the float- and
-array-heavy numeric throughput workload where lune's tracing JIT is still a no-op
-(`jit ms ≈ t0 ms`, tens of × off LuaJIT), i.e. the headline optimization targets.
+cwd only affects `require`. They are the float- and array-heavy numeric
+throughput workload where lune's tracing JIT is still a no-op (`jit ms ≈ t0 ms`,
+tens of × off LuaJIT), i.e. the headline optimization targets.
+
+The kernels return a flop count the wrappers discard, so upstream these print
+nothing. Until 2026-08-26 lune vendored them that way, which made their frozen
+digest `sha256("")` and made the cross-tier check compare `"" == "" == ""` while
+reporting `cross=ok`. Each wrapper now ends in `print(lib.checksum())` — an exact
+integer fold of the kernel's result state (the transformed vector, the relaxed or
+factored matrix, the product vector). It is an integer fold rather than a
+formatted float because lune's `string.format` cannot yet render more
+significant digits than a double's shortest round-trip form (see `TODO.md`), so
+a `%.17g` print would differ from LuaJIT's for formatting reasons alone.
+
+Two consequences worth knowing:
+
+* **`scimark_lib.lua` is no longer byte-verbatim upstream.** It selects its RNG
+  with `if jit and jit.status and jit.status()`, and the two branches are *not*
+  equivalent generators — LuaJIT and lune took different ones and so ran these
+  kernels on different input data, making byte-parity unreachable rather than
+  merely absent. The lib now forces the portable branch. This costs nothing
+  (`rand` is setup-only for these four kernels; measured −0.8% sor, −1.8% lu on
+  LuaJIT) and all four now match LuaJIT bit-for-bit. Both lune-local edits are
+  marked as such in the file.
+* **`array3d`'s row moved a lot** when its checksum landed — its fold walks all
+  512,000 elements and does not tier up (49.8 ms under both tier-0 and
+  `--jit-native`). Measured:
+
+  | array3d | lune t0 | lune jit | LuaJIT | jit/lj |
+  |---|---|---|---|---|
+  | before | 172.1 | 177.9 | 1.9 | 95.8x |
+  | after  | 226.1 | 225.6 | 8.3 | 27.1x |
+
+  The ratio moved in the *flattering* direction, which is the counter-intuitive
+  part: the fold costs LuaJIT +6.5 ms against a 1.9 ms baseline (+348%) but lune
+  only +48 ms (+27%), so array3d dropped from the worst row on the board to a
+  middling one. Both engines run the identical added work, so 27.1x is a true
+  measurement — of a different mixture (~21% of the row is now checksum). Read
+  the step at 2026-08-26 as a change of workload, not as an optimization, and
+  don't compare the ratio across it. Pre-change baselines are in
+  `bench/results/` up to `20260825-181602`.
 
 Not yet runnable (tracked in `TODO.md`), by blocking gap: coroutines
 (chameneos, coroutine-ring); binary/Latin-1 output (life, mandelbrot,

@@ -1,6 +1,30 @@
 -- @bench args="80" luajit=compatible name=array3d
--- Vendored verbatim from LuaJIT/bench/array3d.lua (Computer Language
--- Benchmarks Game port). Only this header is lune-added.
+-- From LuaJIT/bench/array3d.lua (Computer Language Benchmarks Game port).
+-- lune-added: this header and the trailing checksum block. The body is upstream.
+--
+-- WHY THE CHECKSUM. Upstream prints nothing, so this bench's frozen-output
+-- digest was sha256("") and `bench/run.py`'s cross-tier check was comparing
+-- "" == "" == "" while reporting `cross=ok`. The lone `assert` below pins
+-- exactly one element out of dim^3.
+--
+-- COST, deliberately accepted (Bart, 2026-08-26): the fold walks all 512,000
+-- elements, and it does not tier up — measured 49.8 ms under both tier-0 and
+-- --jit-native. Measured effect on this row:
+--
+--            lune t0   lune jit   LuaJIT   jit/lj
+--   before     172.1      177.9      1.9    95.8x
+--   after      226.1      225.6      8.3    27.1x
+--
+-- Note the ratio MOVED A LOT, and in the flattering direction: the fold costs
+-- LuaJIT +6.5 ms against a 1.9 ms baseline (+348%) but lune only +48 ms (+27%),
+-- so array3d went from the worst row on the board to a middling one. Both
+-- engines run the identical added work, so 27.1x is a true measurement — it is
+-- just a measurement of a different mixture (~21% of the row is now checksum).
+-- Read it that way; don't read the step at 2026-08-26 as an optimization.
+-- Pre-change baselines are in bench/results/ up to 20260825-181602.
+--
+-- The alternative on the table was a strided sample at negligible cost,
+-- rejected in favour of catching a single wrong element anywhere in the array.
 
 local function array_set(self, x, y, z, p)
   assert(x >= 0 and x < self.nx, "x outside PA")
@@ -59,4 +83,34 @@ for x,y,z in arr:points() do
   arr:set(x, y, z, x*x)
 end
 assert(arr.image[dim^3-1] == (dim-1)^2)
+
+-- lune-added result checksum. Exact integer fold, no float formatting: lune's
+-- string.format cannot render more significant digits than a double's shortest
+-- round-trip form (see TODO.md), so a "%.17g" print would differ from LuaJIT's
+-- for formatting reasons alone. `x % 1` is exact, scaling by 2^52 is exact, and
+-- every intermediate stays under 2^53 — so this is 1-ulp sensitive and renders
+-- identically under LuaJIT's doubles and Lua 5.4's integers.
+--
+-- The nil arm is load-bearing, not defensive: `array_points` starts its control
+-- variable at 0 and pre-increments, so it never emits (0,0,0) and image[0] is
+-- permanently unset (verified: 26 of 27 populated at dim=3). Folding a sentinel
+-- and printing the populated count pins that hole rather than skipping past it,
+-- so a change in the iterator's coverage shows up here.
+local floor = math.floor
+local acc, populated = 0, 0
+local image = arr.image
+for i = 0, dim^3 - 1 do
+  local x = image[i]
+  if x == nil then
+    acc = (acc * 1000003 + 1) % 2147483647
+  else
+    populated = populated + 1
+    local ip = x - (x % 1)
+    local fb = floor((x % 1) * 2^52)
+    acc = (acc * 1000003 + ip) % 2147483647
+    acc = (acc * 1000003 + fb) % 2147483647
+  end
+end
+print(string.format("array3d checksum: %d  populated: %d/%d  max_voltage: %d",
+                    acc, populated, dim^3, arr.max_voltage))
 
