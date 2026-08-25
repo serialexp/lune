@@ -1199,26 +1199,28 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, see
     // definitional: `lower` emits the prologue iff `seed_plan.nonEmpty()`, and this
     // bail guarantees the ctx it bakes exists.
     if (seed_plan.nonEmpty() and seed_ctx == null) return null;
-    // B-v (doc 22 §A.1b + §B.6 redundant-seed row): release-assert the
-    // inactive-slot contract. The seeding helper skips a plan-inactive seed,
-    // so its slab slot stays UNWRITTEN at entry — the emitted body must
-    // therefore never read it. `.hash_cell` is the only deactivatable kind
-    // and its slot is only ever consumed through `href.aux` (`seedHashCell`
-    // stamps aux, never a `slot_load`); a non-dynamic-rooted href naming the
-    // slot would have activated the plan bit in `computeSeedPlan`. Any body
-    // read of an inactive slot is a computeSeedPlan/lowering disagreement:
-    // panic loudly rather than emit a page that reads entry garbage.
-    for (t.inputs, 0..) |seed, i| {
-        if (seed_plan.isActive(i)) continue;
-        for (t.instrs) |ins| {
-            const reads_slot = switch (ins.op) {
-                .slot_load => ins.aux >= 0 and @as(u32, @intCast(ins.aux)) == seed.slot,
-                .href => ins.aux >= 0 and @as(u32, @intCast(ins.aux)) == seed.slot and
-                    !isDynTableRoot(kinds, alloc.slots, alloc.slot_id_of_ref, ins.a),
-                else => false,
-            };
-            if (reads_slot)
-                @panic("compileImpl: emitted body reads an inactive seed's slab slot");
+    // B-v (doc 22 §A.1b + §B.6 redundant-seed row): the inactive-slot contract.
+    // The seeding helper skips a plan-inactive seed, so its slab slot stays
+    // UNWRITTEN at entry — the emitted body must never read it.
+    //
+    // This was a release `@panic` scanning every instr for an `href` OR a
+    // `slot_load` naming the slot. The `href` half was unsatisfiable: it is the
+    // exact negation of `computeSeedPlan`'s activation clause (same pure
+    // predicate, same `kinds`/`slots`/`slot_id_of_ref`/`t.instrs`, nothing
+    // mutated in between), evaluated inside `if (isActive) continue` — a literal
+    // contradiction. It could never fire.
+    //
+    // The `slot_load` half rests on a real and separate fact, so it is kept as a
+    // debug assert: `.hash_cell` is the only deactivatable kind, and a hash
+    // cell's slot is consumed solely through `href.aux` — `recInputGet` is the
+    // only site that emits a seed `slot_load` (and the only one that appends to
+    // `entry_slots`), while `seedHashCell` stamps aux and emits none. Checking
+    // `entry_slots` instead of every instr also makes it O(inputs x entry_slots).
+    if (std.debug.runtime_safety) {
+        for (t.inputs, 0..) |seed, i| {
+            if (seed_plan.isActive(i)) continue;
+            std.debug.assert(seed.kind == .hash_cell);
+            for (t.entry_slots) |es| std.debug.assert(es != seed.slot);
         }
     }
 
@@ -1361,6 +1363,18 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, see
     // increment arms a slot to them.
     std.debug.assert((arena != null) == (linked_entry != null));
     std.debug.assert((linked_entry != null) == (ordinary_entry != null));
+    // Doc 22 §B.4: the plan (source of truth for "this page seeds at entry") and
+    // the emitted prologue must agree. This used to be release-asserted over in
+    // `stubEnterable`, described there as witnessed by "two independent facts".
+    // They are not independent: `seed_hash_exit` is assigned only inside
+    // `if (seed_plan.nonEmpty())`, and `stubs.seed_prologue = seed_hash_exit
+    // != null` on the single path through `lower` — one fact routed through two
+    // fields. As a result that check was a tautology on every real page and
+    // could only ever fire on a hand-built test fixture, while costing a branch
+    // in a predicate consulted at every arm attempt. Asserted HERE instead,
+    // which is where a future conditional-emission path in `lower` would
+    // actually break it.
+    std.debug.assert(seed_plan.nonEmpty() == entry_stubs.seed_prologue);
     return .{
         .page = page,
         .trampoline_entry = tramp_entry,
@@ -2193,24 +2207,28 @@ fn opMayExitInBody(
 // callout MUST add a row (the exhaustive switch enforces it at compile time);
 // claiming `false` for a helper that allocates would be a soundness bug.
 
-/// Every runtime helper a native body can call mid-iteration.
+/// Every runtime helper a native body can call MID-ITERATION. The enum exists
+/// solely to feed `calloutMayGc`, i.e. to answer "can a heap φ be invalidated
+/// across this call site", so membership is exactly "reachable from
+/// `bodyCalloutOf`" — a variant no mapping ever returns is dead weight that
+/// makes the GC audit look broader than it is.
+///
+/// Deliberately EXCLUDED, and why it needs no row: `NativeSeedCtx.seed_fn`
+/// (doc 22 §B.2), the entry-prologue seeding callout that resolves
+/// upvalue/global/hash-cell inputs into the trace's slab slots. It runs ONCE at
+/// entry, before any heap φ is live, so it is outside this enum's question by
+/// construction — not merely a `can_gc = false` answer to it. (For the record
+/// it also allocates nothing: resolution and validation only — upvalue reads,
+/// global-table lookups, hash-chain walks.)
 const BodyCallout = enum {
     /// `resolveHashCell`: pure hash-chain walk over an existing table — reads
     /// the key, hashes, follows cells; allocates nothing.
     resolve_hash_cell,
-    /// `NativeSeedCtx.seed_fn` (doc 22 §B.2): the entry-prologue seeding
-    /// callout — resolves upvalue/global/hash-cell inputs into the trace's
-    /// slab slots before the first iteration. Resolution + validation only
-    /// (upvalue reads, global-table lookups, hash-chain walks); allocates
-    /// nothing. Never returned by `bodyCalloutOf` — it runs once at entry,
-    /// before any heap φ is live, not mid-iteration.
-    seed_trace_inputs,
 };
 
 fn calloutMayGc(c: BodyCallout) bool {
     return switch (c) {
         .resolve_hash_cell => false,
-        .seed_trace_inputs => false,
     };
 }
 

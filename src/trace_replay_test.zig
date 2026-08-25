@@ -393,6 +393,170 @@ test "replayLedger dispatcher grammar: [I.loop_done_linked, C.seed_hash_decline]
     try testing.expectEqual(@as(u64, 0), state.native_link_exits);
 }
 
+test "B-iii: a tier-1a seed decline ends the burst chargeless (no strike on the burst seed)" {
+    // The DRIVER-level half of the same contract the directive test below pins.
+    // `replayLedger` is the native leg's decline path; the tier-1a leg declines
+    // at `driveBurstCore`'s call-A seeding seam instead, and that seam used a
+    // bare `break` — which falls into the zero-progress tail's
+    // `onSideExit(seed, 0)` and strikes the burst SEED.
+    //
+    // Two things wrong with that, both invisible to the stdout oracle:
+    //   1. It contradicts B-iv.2's "a decline gets no receipt, no strike" — the
+    //      inner never ran, so nothing about `S` was disproved.
+    //   2. It is a native-vs-tier-1a DIVERGENCE in the penalty map. The native
+    //      twin returns chargeless for the identical event, so the
+    //      `record_execute` and `record_execute_native` legs made different
+    //      tiering decisions from the same input — exactly what the tail's own
+    //      "Mode-invariant: ... no mode records a different penalty here"
+    //      comment claims cannot happen.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    // `code[1]` is the `for_loop`; the inner root is anchored at pc 7.
+    const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
+
+    // The burst seed: an UNSEEDED continuation, so nothing about `S` itself can
+    // decline. Any strike observed therefore came from the inner's decline.
+    const seed_instrs = [_]IrInstr{
+        .{ .op = .link, .aux = 7 },
+    };
+    var seed_trace: Trace = .{
+        .id = 231,
+        .anchor = .{ .proto = &proto, .pc = 2 },
+        .instrs = @constCast(&seed_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    // The inner root the `.link` names — SEEDED, so call A must seed it before
+    // entry. `native_seed_ctx` is left null, so `seedForTier1a` fails closed.
+    const inner_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .a = 0, .aux = 2 },
+        .{ .op = .loop },
+    };
+    var inner: Trace = .{
+        .id = 232,
+        .anchor = .{ .proto = &proto, .pc = 7 },
+        .instrs = @constCast(&inner_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    inner.inputs = @constCast(&[_]trace.InputSeed{undefined});
+    try state.cache.append(gpa, &seed_trace);
+    try state.cache.append(gpa, &inner);
+    try testing.expect(state.native_seed_ctx == null);
+
+    var regs = [_]Value{Value.int(0)};
+    var tr_regs = TestRegs{ .regs = &regs };
+    // `.ir` tier never dereferences the compiled-trace argument, and
+    // `sresult_fused = false` means `sresult` is dropped on the floor
+    // (fusion is native-only).
+    const unused_ct: *const nativegen.CompiledTrace = undefined;
+    const r = state.runLinkedBurst(
+        &seed_trace,
+        undefined,
+        false,
+        unused_ct,
+        .ir,
+        .ordinary_header,
+        &proto,
+        tr_regs.view(),
+        false,
+    );
+
+    // Zero progress (the inner never entered), resuming coherently at the
+    // inner-root PC the `.link` names — same as the pre-fix `break` produced.
+    try testing.expectEqual(@as(usize, 0), r.completed);
+    try testing.expectEqual(@as(?u32, 7), r.resume_pc);
+    // The whole point: NO strike anywhere. Pre-fix this was one strike on the
+    // seed's anchor at pc 2.
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 2 }));
+    try testing.expectEqual(@as(usize, 0), state.penalty.count());
+}
+
+test "replayLedger terminal seed-decline: a CONTINUATION decline is a chargeless directive, not .break_burst" {
+    // The directive-level twin of the dispatcher-grammar test above. That one
+    // goes through `driveDispatcherLedger`, which happens to reach the SAME
+    // observable end state via `.break_burst` + the hop-0 tail, so it cannot
+    // distinguish the two directives. This one asserts the directive itself.
+    //
+    // Why it matters: `.break_burst` is the zero-progress GUARD signal, and
+    // three of its five consumers end in `onSideExit(seed, 0)` — a strike on
+    // the burst SEED. When the seed IS the decliner (as in the single-hop
+    // dispatcher shape above) that strike is merely misattributed-but-local;
+    // in a `C1 → I → C2` span the decliner is C2 and the seed is C1, so an
+    // innocent trace takes it. A decline is an entry-condition mismatch, not a
+    // guard failure: B-iv.2's contract is "no receipt, no strike".
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    const proto = Proto{ .code = &.{ Instr.op0(.ret), Instr.op0(.for_loop) }, .name = "t", .num_registers = 1 };
+
+    const inner_instrs = [_]IrInstr{
+        .{ .op = .guard_true, .a = 0, .aux = 2 }, // loop-done guard, post-loop pc 2
+        .{ .op = .loop },
+    };
+    var inner: Trace = .{
+        .id = 221,
+        .anchor = .{ .proto = &proto, .pc = 5 },
+        .instrs = @constCast(&inner_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    const cont_instrs = [_]IrInstr{
+        .{ .op = .link, .aux = 5 },
+    };
+    var cont: Trace = .{
+        .id = 222,
+        .anchor = .{ .proto = &proto, .pc = 2 },
+        .instrs = @constCast(&cont_instrs),
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+    };
+    try state.cache.append(gpa, &inner);
+    try state.cache.append(gpa, &cont);
+
+    // One committed enclosing iteration, then the fused continuation's seeded
+    // entry declined pre-commit (cum unchanged → local == 0, `ends_link`).
+    const entries = [_]irinterp.LedgerEntry{
+        .{ .cum = 1, .id = 221, .exit = 0, .reason = .normal, .kind = .loop_done_linked, .outcome = .normal },
+        .{ .cum = 1, .id = 222, .exit = std.math.maxInt(u32), .reason = .seed_hash_decline, .kind = .seed_hash_decline, .outcome = .normal },
+    };
+    var linked_completed: usize = 0;
+    var resume_pc: u32 = 999;
+    var hops: usize = 0;
+    const dir = state.replayLedger(
+        &entries,
+        &inner,
+        5,
+        &proto,
+        &linked_completed,
+        &resume_pc,
+        &hops,
+        8,
+        .dispatcher_root,
+        false,
+        null,
+    );
+
+    // The directive itself: a terminal result, NOT `.break_burst`.
+    const result = switch (dir) {
+        .return_result => |r| r,
+        else => return error.TestUnexpectedResult,
+    };
+    // The committed loop-done survives, coherent at the decliner's own anchor.
+    try testing.expectEqual(@as(usize, 1), result.completed);
+    try testing.expectEqual(cont.anchor.pc, result.resume_pc);
+    try testing.expectEqual(@as(usize, 0), state.penalty.count());
+}
+
 test "replayLedger terminal seed-decline: [C.link_terminal, I.seed_hash_decline] resumes at the decliner's own anchor" {
     // Doc 22 §B.2 (B-iv.2): a hop-0 fused span — C reached its `.link` terminal
     // (fused into the inner root), and the SEEDED inner's entry declined

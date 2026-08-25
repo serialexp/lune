@@ -990,9 +990,11 @@ pub const Vm = struct {
     ///   fit, `SEED_HASH_DECLINE` if a hash_cell seed failed validation (the
     ///   0-bits slot is still written, exactly like the original, so tier-1a
     ///   sees the same slab state), else `SEED_OK`.
-    /// - HelperCaps: `.seed_trace_inputs`, can_gc = false — resolution +
-    ///   validation only (upvalue reads, global lookups, hash-chain walks);
-    ///   allocates nothing.
+    /// - Allocation-free and GC-safe: resolution + validation only (upvalue
+    ///   reads, global lookups, hash-chain walks). Deliberately NOT a
+    ///   `nativegen.BodyCallout` row — that enum answers "can a heap φ die
+    ///   across this MID-ITERATION call site", and this runs once at entry
+    ///   before any φ is live. See the `BodyCallout` header.
     fn nativeSeedFn(
         ctx: *const trace.NativeSeedCtx,
         ct: *const trace.Trace,
@@ -2708,15 +2710,21 @@ pub const Vm = struct {
                 // makes progress (no spin).
                 //
                 // `regs` (the live tier-0 register file) is
-                // passed, not a trace-local `trace_regs`,
-                // and that is intentional: driveChain only
-                // ever enters zero-input traces (findLinkTrace
-                // requires `t.inputs.len == 0`; loop/link
-                // roots read state from the coherent register
-                // file at their anchor). There is no input
-                // remapping to thread, so the live regs are
-                // exactly the coherent state each entered
-                // trace expects.
+                // passed, not a trace-local `trace_regs`, and
+                // that is intentional. NOT because the entered
+                // traces are input-free — since B-iii/B-iv
+                // (doc 22 §B.3/§B.5) `findLinkTrace` admits
+                // SEEDED continuations, so `t.inputs.len` is
+                // routinely nonzero. The reason is that a
+                // trace's `inputs` are non-register state
+                // (upvalues, globals, hash cells) resolved
+                // through the seed path into its own slab —
+                // never a remapping OF registers. Loop/link
+                // roots still read their register state
+                // directly from the coherent file at their
+                // anchor, so there is nothing to thread and
+                // the live regs remain exactly what each
+                // entered trace expects.
                 if (self.trace.isSourceBranchGuardExit(final, result.exit_instr, proto)) {
                     if (ran_native) {
                         if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm)) |chain| {

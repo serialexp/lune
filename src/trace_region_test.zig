@@ -738,8 +738,10 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     try testing.expectEqualSlices(u16, &.{ 0, 1, 2 }, def.bridges[0].required_slots);
     try testing.expectEqualSlices(u16, &.{ 1, 2 }, def.bridges[0].invariant_slots);
 
-    const decision = state.validateRegionBridge(rid, &cont, 3) orelse
-        return error.TestUnexpectedResult;
+    const decision = switch (state.validateRegionBridge(rid, &cont, 3)) {
+        .ok => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
     try testing.expect(decision.child == &skip); // member filter defeats higher-hit sibling
     try testing.expect(def.armable);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
@@ -761,7 +763,9 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     // Rejection A: S still contains live-through r2, but neither E nor the
     // (deliberately damaged) invariant proof contains it.
     def.bridges[0].invariant_slots[1] = 99;
-    try testing.expect(state.validateRegionBridge(rid, &cont, 3) == null);
+    // Structural disproof: tombstones the region, distinct from the transient
+    // decline exercised below (the verdict now says which happened).
+    try testing.expect(state.validateRegionBridge(rid, &cont, 3) == .invalidated);
     try testing.expect(!def.armable);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
     try testing.expectEqual(@as(usize, 0), parent_slots[3]);
@@ -775,10 +779,67 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     def.armable = true;
     def.bridges[0].invariant_slots[1] = 2;
     skip.inputs = @constCast(&[_]InputSeed{undefined});
-    try testing.expect(state.validateRegionBridge(rid, &cont, 3) == null);
+    try testing.expect(state.validateRegionBridge(rid, &cont, 3) == .child_not_enterable);
     try testing.expect(def.armable); // transient decline — NOT invalidated
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
     try testing.expectEqual(@as(usize, 0), parent_slots[3]);
+
+    // The decline is TRANSIENT but DURABLE-for-this-activation, and those are
+    // not the same thing. Transient means "don't tombstone"; durable means
+    // "don't re-run the pipeline until something that could change the answer
+    // changes". Only the first was implemented: the caller memoized the
+    // already-ARMED case alone, so a bridge child that is never dispatcher-
+    // selected — and a bridge child frequently isn't, that non-selection being
+    // the whole reason the bridge exists — re-ran `classifyExit` + the def and
+    // profit probes + the structural proof on EVERY terminal composite deopt,
+    // forever. `validateRegionBridge` alone measured 2.4% of nsieve N=5.
+    //
+    // Drive it through `drainPendingBridgeArm`, the production entry point, so
+    // the memo is observed where it actually has to hold.
+    state.config.min_useful = 3;
+    const akey: trace.RegionKey = .{ .region_id = rid, .activation = 7 };
+    try state.region_profit.put(gpa, akey, .{
+        .root_frame_depth = 0,
+        .root_call_seq = akey.activation,
+        .useful_window_seen = true, // past the profitability gate
+    });
+    state.region_context = .{ .depth = 0, .call_seq = akey.activation };
+    try testing.expect(cont.isBridgeCandidate(3));
+
+    state.pending_bridge_arm = .{ .trace_id = cont.id, .exit_instr = 3 };
+    state.drainPendingBridgeArm(true);
+    try testing.expectEqual(@as(u64, 1), state.native_region_bridge_arm_attempts);
+    // Nothing armed, nothing tombstoned — the decline itself is unchanged.
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    try testing.expect(def.armable);
+
+    // Second identical deopt: the memo must absorb it. Pre-fix this was 2.
+    state.pending_bridge_arm = .{ .trace_id = cont.id, .exit_instr = 3 };
+    state.drainPendingBridgeArm(true);
+    try testing.expectEqual(@as(u64, 1), state.native_region_bridge_arm_attempts);
+
+    // ...but the memo must not WEDGE the arm. Each of the two facts it is keyed
+    // on re-opens it independently. (a) a discovery rebuild — the bridges or
+    // membership it was proven against may have changed:
+    state.region_defs_gen +%= 1;
+    state.pending_bridge_arm = .{ .trace_id = cont.id, .exit_instr = 3 };
+    state.drainPendingBridgeArm(true);
+    try testing.expectEqual(@as(u64, 2), state.native_region_bridge_arm_attempts);
+
+    // (b) a new activation — which is what a stale episode ctx needs in order
+    // to become fresh, and also the natural bound on a child whose
+    // `.unattempted → .compiled` transition bumps no generation at all.
+    const akey2: trace.RegionKey = .{ .region_id = rid, .activation = 8 };
+    try state.region_profit.put(gpa, akey2, .{
+        .root_frame_depth = 0,
+        .root_call_seq = akey2.activation,
+        .useful_window_seen = true,
+    });
+    _ = state.region_profit.remove(akey);
+    state.region_context = .{ .depth = 0, .call_seq = akey2.activation };
+    state.pending_bridge_arm = .{ .trace_id = cont.id, .exit_instr = 3 };
+    state.drainPendingBridgeArm(true);
+    try testing.expectEqual(@as(u64, 3), state.native_region_bridge_arm_attempts);
 
     // ...and the positive flip: give the seeded child a stub-enterable page
     // (compiled ordinary entry, §B.4 plan⟺prologue agreeing) under a FRESH
@@ -797,8 +858,10 @@ test "A-vii-b discovered bridge descriptor validates inertly and rejects incompl
     seed_ctx.proto = @ptrCast(&proto);
     seed_ctx.call_seq = 7;
     state.region_context = .{ .depth = 0, .call_seq = 7 };
-    const seeded_decision = state.validateRegionBridge(rid, &cont, 3) orelse
-        return error.TestUnexpectedResult;
+    const seeded_decision = switch (state.validateRegionBridge(rid, &cont, 3)) {
+        .ok => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
     try testing.expect(seeded_decision.child == &skip);
     try testing.expect(def.armable);
 }

@@ -1004,6 +1004,20 @@ pub const Trace = struct {
     /// priority that does not thrash on alternating types.
     hit_count: u64 = 0,
 
+    /// B-iv.3 backoff: the exit whose composite-bridge arm pipeline last ran in
+    /// full and declined because the child's page was not stub-enterable.
+    /// `maybeArmCompositeExit` short-circuits on a hit, so a durably
+    /// non-enterable child costs ONE full pipeline run per
+    /// (activation x `region_defs_gen`) instead of one per terminal composite
+    /// deopt. Purely an accelerator: it can only skip work that would have
+    /// declined identically, never change an arm decision that would otherwise
+    /// have been made. `maxInt` = no memo. Runtime-only — not serialized.
+    bridge_decline_exit: u32 = std.math.maxInt(u32),
+    /// `region_defs_gen` the memo was stamped under; 0 = never stamped.
+    bridge_decline_gen: u32 = 0,
+    /// `region_context.call_seq` the memo was stamped under.
+    bridge_decline_seq: u64 = 0,
+
     /// Exit provenance (doc 17, A-i / 9-B): the guest-logical identity of each
     /// side-exit / `.link` terminal, keyed by *committed* instruction index, sorted
     /// by index (alloc-once at commit — guards are a minority of instrs). Empty for
@@ -1725,6 +1739,18 @@ pub const TraceState = struct {
     /// (measured 5.7% of nsieve-bit wall). Set at every invalidating event;
     /// cleared by a drain pass that ends with nothing transiently deferred.
     provenance_arms_pending: bool = false,
+    /// B-2b episode gate. `provenance_edges` is GLOBAL across protos, but the
+    /// drain always runs inside ONE frame's episode, and a seeded child anchored
+    /// in a different proto is not enterable under it. Such an edge is neither
+    /// armable now nor permanently declined, so folding it into
+    /// `provenance_arms_pending` (retried at every safe point) latched that flag
+    /// permanently and defeated the gate it exists to keep shut. Tracked
+    /// separately and re-opened ONLY when the live episode identity changes.
+    provenance_arms_episode_pending: bool = false,
+    /// The `liveEpisodeProto()` the last drain pass ran under. `null` (no fresh
+    /// episode) is a distinct value from every proto pointer, so the pass-level
+    /// staleness seam re-opens correctly too.
+    provenance_drain_episode: ?*const anyopaque = null,
     /// Trace-cache mutation generation: bumped on every `cache` append/remove/clear.
     /// Keys the per-trace `anchor_pop_*` memo so hot-path anchor-population queries
     /// (`anchorPopulation`) are one compare in steady state instead of an O(cache)
@@ -1972,6 +1998,14 @@ pub const TraceState = struct {
     /// "the region-profit gate qualified a region and the arm actually happened"
     /// signal for the A-vii-d differential tests.
     native_region_bridge_arms: u64 = 0,
+    /// How many times `tryArmRegionBridge` ran its pipeline — i.e. got PAST
+    /// `maybeArmCompositeExit`'s memo gates and paid for `classifyExit` + the
+    /// def/profit probes + `validateRegionBridge` (which alone measured 2.4% of
+    /// nsieve N=5). The ratio against `native_region_bridge_arms` is the memo's
+    /// hit rate: a durably non-enterable child should show ONE attempt per
+    /// activation, not one per composite deopt. Diagnostics only — never read by
+    /// a decision, so it cannot perturb the byte-identical stream.
+    native_region_bridge_arm_attempts: u64 = 0,
     /// A-vii-d: count of `.region_bridge` ledger rows DRAINED by `replayLedger` —
     /// i.e. the arm above actually took effect and a native run fused through the
     /// composite bridge stub into the cross-anchor successor. Distinct from the arm
@@ -3419,6 +3453,28 @@ pub const TraceState = struct {
         bridge: *const RegionBridgeDef,
     };
 
+    /// Why a bridge validation ended, which the old `?RegionBridgeDecision` could
+    /// not express: a null conflated "structurally disproved, region tombstoned,
+    /// never ask again" with "proof held, the child's page just is not enterable
+    /// from here". The caller needs them apart — the first is self-limiting
+    /// because the tombstone stops the next attempt, the second is not, and the
+    /// full arm pipeline was re-running on every terminal composite deopt
+    /// forever against a child that could not become enterable within the
+    /// activation.
+    pub const RegionBridgeVerdict = union(enum) {
+        /// Proof held; arm this child through this bridge.
+        ok: RegionBridgeDecision,
+        /// Structural disproof. The region has been tombstoned by this call.
+        invalidated,
+        /// The proof held; the child's page is not enterable. Nothing was
+        /// tombstoned, and the region stays intact. Durable for this activation
+        /// (see `stubEnterability`: a bridge child that is not
+        /// dispatcher-selected may never compile, and a foreign-proto child
+        /// never becomes enterable from here), so the caller memoizes rather
+        /// than retrying every composite deopt.
+        child_not_enterable,
+    };
+
     fn traceInRegion(self: *const TraceState, trace_id: u32, id: RegionId) bool {
         for (self.dest_entry_regions.get(trace_id) orelse &.{}) |candidate| {
             if (candidate == id) return true;
@@ -3465,33 +3521,33 @@ pub const TraceState = struct {
         id: RegionId,
         parent: *const Trace,
         exit_instr: u32,
-    ) ?RegionBridgeDecision {
-        const def = self.region_defs.getPtr(id) orelse return null;
-        if (!def.armable) return null;
+    ) RegionBridgeVerdict {
+        const def = self.region_defs.getPtr(id) orelse return .invalidated;
+        if (!def.armable) return .invalidated;
         const edge = self.edge_cache.get(.{
             .trace_id = parent.id,
             .exit_instr = exit_instr,
         }) orelse {
             self.invalidateRegion(id);
-            return null;
+            return .invalidated;
         };
         var bridge: ?*const RegionBridgeDef = null;
         for (def.bridges) |*candidate| {
             if (candidate.edge.eql(edge)) {
                 if (bridge != null) {
                     self.invalidateRegion(id);
-                    return null;
+                    return .invalidated;
                 }
                 bridge = candidate;
             }
         }
         const b = bridge orelse {
             self.invalidateRegion(id);
-            return null;
+            return .invalidated;
         };
         const child = self.resolveRegionBridgeChild(id, b) orelse {
             self.invalidateRegion(id);
-            return null;
+            return .invalidated;
         };
 
         for (b.required_slots) |slot| {
@@ -3499,22 +3555,21 @@ pub const TraceState = struct {
                 !slotInSortedSet(b.invariant_slots, slot))
             {
                 self.invalidateRegion(id);
-                return null;
+                return .invalidated;
             }
         }
         // B-iv.3 (doc 22 §B.5): a seeded child is bridgeable when its page is
-        // stub-enterable (compiled + `ordinary_entry` + fresh episode ctx).
-        // Enterability is TRANSIENT (fail-closed on a not-yet-compiled page or
-        // a stale ctx), unlike every structural disproof above — so decline the
-        // arm WITHOUT tombstoning the region; a later validation under a fresh
-        // episode may succeed. (Pre-B-iv a seeded child was structurally
-        // barred, which is what justified the invalidate.)
+        // stub-enterable (compiled + `ordinary_entry` + fresh episode ctx). NOT
+        // a structural disproof — the region stays intact and is NOT tombstoned,
+        // unlike every check above, because a later validation under a fresh
+        // episode may succeed. (Pre-B-iv a seeded child was structurally barred,
+        // which is what justified the invalidate.)
         if (child.inputs.len != 0 and
-            !self.stubEnterable(child, .ordinary, child.anchor.proto))
+            self.stubEnterability(child, .ordinary, child.anchor.proto) != .ok)
         {
-            return null;
+            return .child_not_enterable;
         }
-        return .{ .child = child, .bridge = b };
+        return .{ .ok = .{ .child = child, .bridge = b } };
     }
 
     /// A-vii-d (doc 17 §A-vii.2): the region-bridge arm site. Called from
@@ -3535,15 +3590,19 @@ pub const TraceState = struct {
     /// silently (not a member exit); ambiguity tombstones every candidate, same
     /// verdict `chooseSource` renders. Steps 2–3 delegate the structural proof to
     /// `validateRegionBridge` (unique registered edge, membership-proven child,
-    /// S⊆E∪invariants, zero-input child — each failure tombstones + disarms) and
-    /// then publish through `armNativeLink(.region_bridge)`.
+    /// S⊆E∪invariants) and then publish through `armNativeLink(.region_bridge)`.
     ///
-    /// The compiled-child/`ordinary_entry` pre-checks exist because
-    /// `armNativeLink`'s `.region_bridge` arm treats a missing re-guarding entry
-    /// as a wiring bug (release-`@panic`): at THIS call site an uncompiled or
-    /// entry-less child is ordinary ineligibility (its compile may simply be
-    /// pending), so decline silently and keep the panic as a backstop.
+    /// Two failure classes, deliberately different (B-iv.3): a STRUCTURAL
+    /// disproof tombstones the region and disarms, which is self-limiting
+    /// because the tombstone stops the next attempt. A child whose page is not
+    /// stub-enterable is NOT a disproof — the region stays intact — so it is
+    /// memoized per (activation, `region_defs_gen`) instead, or the pipeline
+    /// would re-run on every terminal composite deopt forever. `armNativeLink`'s
+    /// release-`@panic` on a missing re-guarding entry stays as the backstop it
+    /// was always described as; `validateRegionBridge` now answers that question
+    /// itself, so the arm site no longer repeats the check.
     fn tryArmRegionBridge(self: *TraceState, failed: *Trace, exit_instr: u32) void {
+        self.native_region_bridge_arm_attempts +|= 1;
         // Step 1 — unique live region for {failed, exit_instr}.
         const candidates = self.classifyExit(.{ .trace_id = failed.id, .exit_instr = exit_instr });
         if (candidates.len == 0) {
@@ -3581,20 +3640,44 @@ pub const TraceState = struct {
             return;
         }
         // Steps 2–3 — structural proof, then publish.
-        const decision = self.validateRegionBridge(id, failed, exit_instr) orelse {
-            self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (structural proof failed, region invalidated)", .{ failed.id, exit_instr, @intFromEnum(id) });
-            return;
-        };
-        const child = decision.child;
-        const child_c = switch (child.native) {
-            .compiled => |*cc| cc,
-            else => {
-                self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (child id={d} not compiled)", .{ failed.id, exit_instr, @intFromEnum(id), child.id });
+        const decision = switch (self.validateRegionBridge(id, failed, exit_instr)) {
+            .ok => |d| d,
+            .invalidated => {
+                self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (structural proof failed, region invalidated)", .{ failed.id, exit_instr, @intFromEnum(id) });
+                return;
+            },
+            .child_not_enterable => {
+                // Region intact — nothing was tombstoned, so nothing stops the
+                // next composite deopt from re-running this whole pipeline
+                // (classifyExit + def/profit probes + the structural proof, of
+                // which validateRegionBridge alone measured 2.4% of nsieve N=5).
+                // The decline is durable for this activation, so memoize it.
+                // Stamped ONLY here: the earlier gates (no candidate, ambiguous,
+                // not armable, no useful window yet) must NOT be memoized —
+                // `useful_window_seen` latches WITHIN an activation, so caching
+                // that decline would delay a legitimate arm by a whole activation.
+                failed.bridge_decline_exit = exit_instr;
+                failed.bridge_decline_gen = self.region_defs_gen;
+                failed.bridge_decline_seq = ctx.call_seq;
+                self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (child not stub-enterable — region intact, memoized for this activation)", .{ failed.id, exit_instr, @intFromEnum(id) });
                 return;
             },
         };
-        if (child_c.ordinary_entry == null) {
-            self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (child id={d} has no ordinary_entry)", .{ failed.id, exit_instr, @intFromEnum(id), child.id });
+        const child = decision.child;
+        // The other half of the same durable decline: an unseeded child whose
+        // page is not ready. `validateRegionBridge` scopes its enterability
+        // clause to seeded children, so this is where a not-yet-compiled or
+        // entry-less ordinary child lands. It used to return silently, which is
+        // what let the pipeline re-run on every composite deopt — a bridge child
+        // is frequently never dispatcher-selected (that non-selection is the
+        // reason the bridge exists), so it can stay uncompiled for the life of
+        // the program. Memoize it exactly like the seeded case; the activation
+        // key means a later compile is still picked up on the next activation.
+        if (self.stubEnterability(child, .ordinary, child.anchor.proto) != .ok) {
+            failed.bridge_decline_exit = exit_instr;
+            failed.bridge_decline_gen = self.region_defs_gen;
+            failed.bridge_decline_seq = ctx.call_seq;
+            self.dbg("bridge-arm: decline t={d} ei={d} rid={d} (child id={d} page not enterable — memoized for this activation)", .{ failed.id, exit_instr, @intFromEnum(id), child.id });
             return;
         }
         const armed = self.armNativeLink(failed, exit_instr, child, .region_bridge) catch false;
@@ -3640,6 +3723,20 @@ pub const TraceState = struct {
             if (l.parent == t and l.slot_index == exit_instr and l.kind == .region_bridge and
                 l.armed_gen == self.region_defs_gen) return;
         }
+        // The negative twin of the skip above: this exit ran the full pipeline
+        // and declined because the child's page was not stub-enterable, which is
+        // durable for the activation. Strictly more conservative than the
+        // positive memo — that one re-validates on `region_defs_gen` alone,
+        // while this also requires the same activation, so it re-checks more
+        // often. `region_defs_gen` covers rebuilds of bridges/membership;
+        // `call_seq` covers the activation, hence the live episode identity;
+        // and a child's `.unattempted -> .compiled` transition (which bumps no
+        // generation) is retried at the next activation, a natural bound.
+        if (t.bridge_decline_exit == exit_instr and t.bridge_decline_gen == self.region_defs_gen) {
+            if (self.region_context) |rctx| {
+                if (t.bridge_decline_seq == rctx.call_seq) return;
+            }
+        }
         self.tryArmRegionBridge(t, exit_instr);
     }
 
@@ -3668,8 +3765,15 @@ pub const TraceState = struct {
         // that ends with nothing transiently deferred settles the cache; any
         // publication-invalidating event (new edge, disarm, retire, re-arm
         // displacement) re-opens it.
-        if (!self.provenance_arms_pending) return;
+        // The episode half re-opens on a change of live episode identity only —
+        // never merely because time passed, which is what made the old single
+        // flag latch forever.
+        if (!self.provenance_arms_pending) {
+            if (!self.provenance_arms_episode_pending) return;
+            if (self.liveEpisodeProto() == self.provenance_drain_episode) return;
+        }
         var deferred = false;
+        var episode_deferred = false;
         var i = self.provenance_edges.items.len;
         while (i > 0) {
             i -= 1;
@@ -3736,6 +3840,30 @@ pub const TraceState = struct {
                 }
             }
             if (already_armed) continue;
+            // Classify the child's enterability BEFORE attempting to publish, so
+            // the two reasons an arm can fail are not both charged to the
+            // transient flag. `armNativeLink` gates on the same predicate, so a
+            // decline here is exactly the publish that would have failed.
+            switch (self.stubEnterability(child, .ordinary, child.anchor.proto)) {
+                .ok => {},
+                // Permanent for this compilation. (`.unsupported` was already
+                // deleted by the `nativeFor` probe above, so this is a page
+                // without an `ordinary_entry`.) Decline; do NOT defer — a
+                // recompile or retire re-opens the drain through the
+                // invalidating-event hooks, never by rescanning.
+                .no_compilation, .not_compiled => {
+                    self.dbg("provenance-drain: t={d} ei={d} decline: child t={d} not stub-enterable (permanent for this compilation)", .{ edge.parent_id, edge.exit_instr, edge.child_id });
+                    continue;
+                },
+                // The child's page needs a different live episode. Not armable
+                // now, not permanently declined — skip it, and re-open only when
+                // the episode identity actually changes.
+                .no_episode => {
+                    episode_deferred = true;
+                    self.dbg("provenance-drain: t={d} ei={d} defer: child t={d} needs another episode", .{ edge.parent_id, edge.exit_instr, edge.child_id });
+                    continue;
+                },
+            }
             // A failed publish (OOM in the registry append) is transient.
             if (!self.publishSiblingArm(parent, edge.exit_instr, child)) deferred = true;
         }
@@ -3743,6 +3871,8 @@ pub const TraceState = struct {
         // for its current compiled parent; permanent declines re-open via the
         // invalidating events above (retire/recompile), never by rescanning.
         self.provenance_arms_pending = deferred;
+        self.provenance_arms_episode_pending = episode_deferred;
+        self.provenance_drain_episode = self.liveEpisodeProto();
     }
 
     /// Capture complete-ledger verdicts before replay can defer/disarm the
@@ -4547,10 +4677,7 @@ pub const TraceState = struct {
     /// when their seed context is fresh."
     ///
     /// Fail-closed contract (codex-confirmed): operational sites get `false` on
-    /// stale/missing context and fall back to their pre-B-iv disposition; the
-    /// only panic is the §B.4 plan⟺prologue invariant, which two independent
-    /// facts witness (`seed_plan` from `compileImpl`'s planning pass,
-    /// `seed_prologue` recorded at emission).
+    /// stale/missing context and fall back to their pre-B-iv disposition.
     ///
     /// Freshness for a seeded page = the episode's `NativeSeedCtx` stamp still
     /// names the live frame: same proto on both the ctx and the trace anchor,
@@ -4568,33 +4695,73 @@ pub const TraceState = struct {
         entry_kind: StubEntryKind,
         proto: *const Proto,
     ) bool {
+        return self.stubEnterability(t, entry_kind, proto) == .ok;
+    }
+
+    /// WHY a page is not enterable, which the `stubEnterable` bool discards.
+    ///
+    /// Callers that merely gate an action can use the bool. Callers that must
+    /// decide whether to RETRY need the distinction, because `stubEnterable`
+    /// conflates two very different falsehoods: "this will never be true for
+    /// this compilation" and "this is not true under the episode that happens
+    /// to be live right now". Treating the second as the first drops work;
+    /// treating the first as the second retries forever. Both mistakes were
+    /// live in the tree (`drainProvenanceArms` latched its gate permanently,
+    /// `tryArmRegionBridge` re-ran an unbounded pipeline), and both are fixed
+    /// by consulting this instead.
+    pub const StubEnterability = enum {
+        ok,
+        /// Structural for this trace's CURRENT native state: `.unsupported`, or
+        /// compiled without the requested entry stub. Only a recompile or a
+        /// retirement can change it — re-checking under a different episode
+        /// cannot.
+        no_compilation,
+        /// Not compiled YET. Lazy compilation may still produce a page, but
+        /// this predicate never compiles one (callers that want that run
+        /// `nativeFor` first).
+        not_compiled,
+        /// A seeded page whose seed context does not name the live frame. Says
+        /// nothing about the page itself — re-check under the right episode.
+        no_episode,
+    };
+
+    /// The proto a seeded page must be anchored in to be enterable right now,
+    /// or null when there is no fresh episode at all — no ctx, no region
+    /// context, or a ctx whose activation token does not match the live frame's,
+    /// in which case NO seeded page is enterable regardless of its proto. Note
+    /// the `call_seq` clause is pass-level, not per-edge: when it fails, it
+    /// fails for everything.
+    fn liveEpisodeProto(self: *const TraceState) ?*const anyopaque {
+        const ctx = self.native_seed_ctx orelse return null;
+        const rctx = self.region_context orelse return null;
+        if (ctx.call_seq != rctx.call_seq) return null;
+        return ctx.proto;
+    }
+
+    pub fn stubEnterability(
+        self: *const TraceState,
+        t: *const Trace,
+        entry_kind: StubEntryKind,
+        proto: *const Proto,
+    ) StubEnterability {
         const c = switch (t.native) {
             .compiled => |*cc| cc,
-            else => return false,
+            .unattempted => return .not_compiled,
+            .unsupported => return .no_compilation,
         };
         const entry: ?usize = switch (entry_kind) {
             .ordinary => c.ordinary_entry,
             .linked => c.linked_entry,
         };
-        if (entry == null) return false;
-        // §B.4 invariant, release-asserted: the plan (source of truth for "this
-        // page seeds at entry") and the emitted prologue must agree. A mismatch
-        // means compileImpl planned one thing and lower emitted another —
-        // continuing would either skip required seeding or run an un-seedable
-        // prologue, both memory-unsafe.
-        if (c.seed_plan.nonEmpty() != c.seed_prologue) @panic(
-            "stubEnterable: seed plan/prologue mismatch (doc 22 §B.4)",
-        );
+        if (entry == null) return .no_compilation;
         // Unseeded page: enterable unconditionally (the pre-B-iv world). No
         // episode context needed — hand-built test pages stay armable.
-        if (!c.seed_plan.nonEmpty()) return true;
+        if (!c.seed_plan.nonEmpty()) return .ok;
         // Seeded page: fail-closed freshness.
-        const ctx = self.native_seed_ctx orelse return false;
-        const ctx_proto = ctx.proto orelse return false;
-        if (ctx_proto != @as(*const anyopaque, @ptrCast(proto))) return false;
-        if (t.anchor.proto != proto) return false;
-        const rctx = self.region_context orelse return false;
-        return ctx.call_seq == rctx.call_seq;
+        if (t.anchor.proto != proto) return .no_compilation;
+        const live = self.liveEpisodeProto() orelse return .no_episode;
+        if (live != @as(*const anyopaque, @ptrCast(proto))) return .no_episode;
+        return .ok;
     }
 
     /// Exit-PC chaining (step 3): after trace `failed` side-exited with
@@ -6609,9 +6776,37 @@ pub const TraceState = struct {
                     }
                     if (ends_link) {
                         // Seed continuation decline (local == 0): nothing
-                        // committed here → break the burst, mirroring the
-                        // continuation prologue-fail.
-                        return .break_burst;
+                        // committed here.
+                        //
+                        // TERMINAL, deliberately NOT `.break_burst`. A decline is
+                        // an entry-condition mismatch, not a guard failure, and
+                        // B-iv.2's contract is "no receipt, no strike".
+                        // `.break_burst` is the zero-progress GUARD signal: three
+                        // of its five consumers end in `onSideExit(seed, 0)`,
+                        // which charges the BURST SEED — frequently not this
+                        // decliner. In a `C1 → I → C2` sibling-continuation span
+                        // the decliner is C2 while `seed` is C1 (or the
+                        // dispatcher's entry trace), so the strike landed on an
+                        // innocent trace and pushed it toward blacklisting. Every
+                        // other seed decline in this function already returns
+                        // chargeless; this arm was the odd one out.
+                        //
+                        // Resuming at the owner's anchor is sound for the same
+                        // reason the linked-inner arm below gives: the decline
+                        // fires BEFORE the body commits (release-asserted
+                        // `local == 0` above), so regs are untouched and coherent
+                        // at the entry point, which is the anchor. Where a
+                        // `loop_done_linked` row already published `resume_pc`,
+                        // the fused-successor validation has proven it equals the
+                        // successor's anchor, so this is the same value it
+                        // already held — the assert is a grammar-drift tripwire,
+                        // not a behaviour change.
+                        if (resume_pc.* != owner.anchor.pc and cursor.link_pc == owner.anchor.pc)
+                            @panic("replayLedger: continuation seed-decline resume mismatches the decliner's anchor");
+                        return .{ .return_result = .{
+                            .completed = linked_completed.*,
+                            .resume_pc = owner.anchor.pc,
+                        } };
                     }
                     if (!ends_loop)
                         @panic("replayLedger: seed-decline owner is neither continuation nor inner root");
@@ -6775,7 +6970,22 @@ pub const TraceState = struct {
                 // fused result never reaches the seeding call: fusion is
                 // native-only.
                 if (inner.inputs.len != 0 and tier != .native_only) {
-                    if (!self.seedForTier1a(inner, proto)) break;
+                    // A seed decline ends the burst CHARGELESS. `break` here fell
+                    // into the zero-progress tail's `onSideExit(seed, 0)`, which
+                    // strikes the burst SEED for a decline by the INNER. Live on
+                    // hop 0 specifically (later hops carry `linked_completed >= 1`
+                    // from the roll-up, so the tail's `linked_completed > 0` guard
+                    // already returned neutral) — and hop 0 is the common case: a
+                    // burst whose inner cannot be seeded declines on its FIRST
+                    // hop, every time, so the seed took a strike per attempt.
+                    // The native twin of this site returns penalty-neutral, so
+                    // this also made tier-1a and native record DIFFERENT penalties
+                    // from the same decline event — a real cross-mode divergence
+                    // in tiering decisions, against the tail's own stated
+                    // "Mode-invariant: ... no mode records a different penalty
+                    // here". `resume_pc` already names the coherent resume target.
+                    if (!self.seedForTier1a(inner, proto))
+                        return .{ .completed = linked_completed, .resume_pc = resume_pc };
                 }
                 if (tier == .native_only) self.native_link_follow_count +|= 1;
                 self.link_follow_count +|= 1;
@@ -7102,7 +7312,19 @@ pub const TraceState = struct {
                 // re-resolution is the dispatcher's contract, and each hop is one
                 // more entry. A capacity decline mid-burst ends the burst, as an
                 // unenterable driver.
-                if (current_link.inputs.len != 0 and !self.seedForTier1a(current_link, proto)) break;
+                // Penalty-neutral, like the native twin's `.return_result` decline
+                // and like call A's above. NOT a behaviour fix here, deliberately
+                // stated: the `break` this replaces was ALREADY neutral, but only
+                // by a non-local accident. Reaching call B on tier-1a requires
+                // call A's loop-done roll-up (`start_at_continuation` is set at
+                // four sites, all `.native_only`), so `linked_completed >= 1` here
+                // and the zero-progress tail's `onSideExit(seed, 0)` was
+                // unreachable via its `linked_completed > 0` guard. Returning
+                // directly makes the chargelessness a property of THIS site
+                // instead of an invariant two hundred lines away that a future
+                // `start_at_continuation` on the IR tier would silently break.
+                if (current_link.inputs.len != 0 and !self.seedForTier1a(current_link, proto))
+                    return .{ .completed = linked_completed, .resume_pc = resume_pc };
                 const cbuf = self.valuesScratch(current_link.instrs.len) catch break;
                 const cresult = irinterp.execute(current_link, regs, cbuf);
                 if (cresult.exit_instr == current_link.instrs.len - 1) {
@@ -13399,6 +13621,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
     try w.writeAll("  event counters:\n");
     try w.print("    trace entries:        {d} (native bodies: {d})\n", .{ ts.entries, ts.native_entries });
     try w.print("    link arms:            native={d} source={d} loopdone={d} bridge={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms, ts.native_region_bridge_arms });
+    try w.print("    bridge arm attempts:  {d} (pipeline runs; vs {d} arms)\n", .{ ts.native_region_bridge_arm_attempts, ts.native_region_bridge_arms });
     try w.print("    link fused:           source={d} loopdone={d} bridge={d}\n", .{ ts.native_source_link_fused, ts.native_loopdone_link_fused, ts.native_region_bridge_fused });
     try w.print("    link disarms:         {d} (peak simultaneous arms: {d})\n", .{ ts.native_link_disarms, ts.native_link_peak });
     try w.print("    native link exits:    {d} (follows={d})\n", .{ ts.native_link_exits, ts.native_link_follow_count });

@@ -16,6 +16,102 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-25 (LATEST-81) — **the two follow-up commits from the Phase C unwind: three salvaged provenance wins, then three behaviour bugs + dead code. Board neutral; two of the three bugs turn out to be latent, not hot — recorded below because the original estimates said otherwise.**
+
+**Commit d0d844e — salvaged provenance wins (perf).** Three mechanical
+improvements found inside the Phase C diff that were never region policy, so
+they survive the revert independently. Profiled at that revision rather than
+inherited on faith: on scimark-lu `memcpyFast` was 4.04% with 3.94% reached
+through `captureNativeCallProvenance`. (1) caller-owned capture storage kills a
+776-byte aggregate-return memcpy on every native entry; (2)
+`provenanceEdgeVerdict` replaces an O(rows²) ledger-tail rescan with a single
+backward suffix-cum-max walk; (3) an `armed_links.items.len == 0` bypass — the
+conservative form, chosen over Phase C's maintained `armed_sibling_total`
+counter because it cannot under-count and skip a live edge.
+
+**Commit — three behaviour bugs + dead code (correctness).**
+
+1. **A seeded decline struck the wrong trace.** `replayLedger`'s terminal
+   seed-decline routed the `ends_link` case to `.break_burst`, whose consumers
+   end in `onSideExit(seed, 0)` — a zero-progress strike on the burst SEED,
+   which in a `C1 → I → C2` span is not the decliner. Same bug at
+   `driveBurstCore`'s tier-1a call-A seeding seam, where a bare `break` fell
+   into the same tail. Both now return penalty-neutral.
+   **This one is a determinism improvement, not just a cleanup:** the NATIVE
+   twin of the call-A site already returned chargeless, so `record_execute` and
+   `record_execute_native` were recording *different penalties from the same
+   decline event* and could make different tiering decisions. The tail's own
+   comment claims "Mode-invariant: … no mode records a different penalty here";
+   it wasn't true. Invisible to the stdout oracle, which is why it survived.
+   Scope, measured rather than assumed: live on hop 0 only (later hops carry
+   `linked_completed >= 1`, so the tail already returned neutral) — but hop 0 is
+   the common case, since a burst whose inner can't be seeded declines on its
+   first hop every time. The tier-1a **call-B** seam got the same treatment and
+   is explicitly documented as hardening, NOT a fix: `start_at_continuation` is
+   set at four sites, all `.native_only`, so `linked_completed >= 1` was
+   guaranteed there and the old `break` was already neutral by a non-local
+   accident.
+2. **The provenance drain could never settle.** `drainProvenanceArms` charged a
+   failed `publishSiblingArm` to one "transient, retry later" flag. Since
+   B-iv.3 that failure includes a seeded child whose anchor proto isn't the live
+   episode's — and `provenance_edges` is global across protos, so one long-lived
+   cross-proto edge re-latched the flag on every pass and the gate could never
+   close. The gate exists because the scan it guards was 5.7% of nsieve-bit
+   wall. Fixed by splitting `stubEnterable` into a three-state
+   `stubEnterability` (`.ok` / permanent / `.no_episode`) and giving the
+   episode case its own flag, stamped with the episode identity it is waiting
+   past — so the edge is deferred, not silently dropped.
+3. **`validateRegionBridge`'s transient decline had no memo and no bound.** The
+   caller memoized only the already-armed case, so a durably non-enterable child
+   re-ran the whole arm pipeline on every terminal composite deopt, forever.
+   Now memoized on `(exit, defs_gen, call_seq)`, which re-opens on a discovery
+   rebuild or a new activation. `validateRegionBridge` also returns a
+   three-way verdict so "structurally disproved, region tombstoned" stops being
+   spelled the same as "proof held, page not enterable".
+
+**Honest measurement — two of these are latent, not hot.** The A/B vs d0d844e
+is neutral across all seven hot programs (−1.6% … +0.8%, i.e. noise), and a
+suite-wide sweep with the bug-3 memo compiled out shows the memo **never fires
+on any of the 28 benchmarks** (identical attempt counts everywhere; only
+nsieve/nsieve-bit/sieve_int run the bridge pipeline at all, at 32/32/28 attempts
+total). The original report's "2.4% of nsieve N=5" was the cost of
+`validateRegionBridge` *when the pipeline runs*, and the pipeline runs a few
+dozen times per program — not per composite deopt as implied. Bugs 2 and 3 are
+therefore fixes to unbounded-work paths that this suite does not exercise; they
+are worth having because the bound is what stops a future workload from falling
+off a cliff, but they bought nothing measurable here and should not be cited as
+if they did. Bug 1 is a correctness/determinism fix with no perf claim.
+
+**Dead code deleted** (each verified unreachable, not merely unused): the
+release `@panic` in `nativegen.zig` whose condition was the exact negation of
+`computeSeedPlan`'s activation condition over the same pure predicate and args
+(unsatisfiable — replaced with a real `runtime_safety` assert over
+`entry_slots`, plus a `seed_plan.nonEmpty() == seed_prologue` assert at the
+`CompiledTrace` construction site); `stubEnterable`'s "two independent
+witnesses" panic (one fact, not two); the `.seed_trace_inputs` `BodyCallout`
+row (never returned by `bodyCalloutOf`, so `calloutMayGc` never consulted it —
+the audit moved into the enum's header as an explicit exclusion). Stale
+comments fixed: `interp.zig`'s claim that `driveChain` only enters zero-input
+traces (false since B-iii/B-iv — `findLinkTrace` admits seeded continuations;
+the `regs` argument is still right, for a different reason, now stated), and
+`validateRegionBridge`'s "region invalidated" on a path that invalidated
+nothing.
+
+**Tests.** Four new pins, each **mutation-tested** (revert the fix → that test
+and only that test fails): a directive-level `replayLedger` assertion (the
+existing dispatcher-level test reaches the same end state via `.break_burst` +
+the tail, so it structurally cannot see the directive); a `runLinkedBurst`
+driver-level test that observes the tier-1a charge; a foreign-episode drain
+test asserting the general flag settles while the episode flag defers, then
+that the deferred edge arms when the episode changes; and a
+`native_region_bridge_arm_attempts` counter proving one pipeline run instead of
+two, re-opening on both `defs_gen` and activation. Coverage gap stated rather
+than papered over: the tier-1a call-B seam has no test, because on `.ir` it is
+unreachable with `linked_completed == 0` — see the fix's own comment.
+
+**Gate.** `just test` + `-Djit-debug=true` green; `tools/hashgate.py` 84/84;
+`just bench` 28/28 `cross=ok`, LuaJIT parity ok throughout.
+
 ## Status 2026-08-25 (LATEST-80) — **doc 22 Phase C REVERTED in full (Bart's call). The region data model is extracted into leaf modules; the board is back at post-B. C.5b dropped too — its justification did not survive re-measurement.**
 
 Bart's mandate: "keep the extraction, remove the graduation, remove everything
@@ -82,18 +178,7 @@ fft −3.3%, spectral −0.2%).
 + `phaseC-tracked.patch` + the untracked modules + the commit-4 bug design).
 Nothing was lost; it is simply not in the tree.
 
-**Still open from this arc (deliberately separate commits):**
-- Three general provenance wins found inside the Phase C diff that were never
-  region policy: `provenanceEdgeVerdict` O(rows²)→O(rows) suffix cum-maximum
-  (2.3% of fft SELF), caller-owned capture storage (kills a 776-byte
-  aggregate-return memcpy), and the `armed_sibling_total` O(1) bypass.
-- Three behaviour bugs + dead code in *committed* code, designed in detail and
-  archived: the seeded-continuation decline striking the wrong trace via
-  `.break_burst` (plus the same bug in the two tier-1a seeding sites — a real
-  native-vs-tier-1a penalty-map divergence); `drainProvenanceArms` latching
-  `provenance_arms_pending` forever; `validateRegionBridge`'s unmemoized
-  unbounded transient decline. Bugs 2 and 3 share a root cause —
-  `stubEnterable` conflates permanent and transient falsity.
+**Follow-ups from this arc landed as their own commits — see LATEST-81.**
 
 **Also landed just before this:** `tools/hashgate.py` + `bench/refs/` — the
 "six-hash gate" cited by ~15 commit messages only ever existed in `/tmp` and

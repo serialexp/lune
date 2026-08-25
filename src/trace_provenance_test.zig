@@ -1054,3 +1054,116 @@ test "provenanceEdgeVerdict: the backward suffix-max walk agrees with the forwar
     try testing.expectEqual(@as(?trace.ProvenanceAction, null), verdict(&.{}, 0, edge));
     try testing.expectEqual(@as(?trace.ProvenanceAction, null), verdict(&[_]irinterp.LedgerEntry{row.at(P, 1)}, 0, edge));
 }
+
+fn foreignEpisodeDummySeed(
+    ctx: *const trace.NativeSeedCtx,
+    t: *const Trace,
+    plan_bits: u64,
+) callconv(.c) u64 {
+    _ = ctx;
+    _ = t;
+    _ = plan_bits;
+    return trace.NativeSeedCtx.SEED_OK;
+}
+
+test "B-2b: a seeded child needing another episode defers WITHOUT latching the drain forever" {
+    // The drain runs at every dispatcher safe point and its edge×armed_links
+    // scan was 5.7% of nsieve-bit wall as an unconditional per-walk sweep — so
+    // the whole point of `provenance_arms_pending` is that a settled pass turns
+    // the sweep OFF until something publication-invalidating happens.
+    //
+    // B-iv.3 quietly broke that. It made `stubEnterable` (hence
+    // `publishSiblingArm`) return false for a seeded child whose anchor proto
+    // isn't the live episode's — and the drain charged that to its single
+    // "transient, retry later" flag. But `provenance_edges` is GLOBAL across
+    // protos, so any long-lived edge into another proto re-latched the flag on
+    // every pass and the gate could never close again. The scan the gate exists
+    // to prevent then ran forever.
+    //
+    // The fix splits the two reasons apart: permanent-for-this-compilation
+    // declines without deferring, and a foreign episode defers on a SECOND flag
+    // that re-opens on a change of live episode identity rather than merely
+    // because a pass happened.
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    defer state.cache.clearRetainingCapacity();
+
+    // Two protos: the live episode runs `a`, the parent/child pair lives in `b`.
+    const proto_a = Proto{ .code = &.{Instr.op0(.ret)}, .id = 1, .name = "episode-a", .num_registers = 1 };
+    const proto_b = Proto{ .code = &.{Instr.op0(.ret)}, .id = 2, .name = "edge-b", .num_registers = 1 };
+
+    var parent_instrs = [_]IrInstr{ .{ .op = .guard_true, .aux = 1 }, .{ .op = .loop } };
+    const slots = try gpa.alloc(usize, parent_instrs.len);
+    defer gpa.free(slots);
+    @memset(slots, 0);
+    var parent: Trace = .{
+        .id = 81,
+        .anchor = .{ .proto = &proto_b, .pc = 4 },
+        .instrs = &parent_instrs,
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{ .page = undefined, .slots = slots, .gpa = gpa } },
+        .sibling_watch_exit = 0,
+        .sibling_watch_count = 4,
+    };
+    // SEEDED child with a complete, otherwise-enterable page — the only thing
+    // wrong with it is which episode is live.
+    var child: Trace = .{
+        .id = 82,
+        .anchor = parent.anchor,
+        .instrs = &.{},
+        .consts = &.{},
+        .entry_slots = &.{},
+        .entry_guards = &.{},
+        .native = .{ .compiled = .{
+            .page = undefined,
+            .gpa = gpa,
+            .ordinary_entry = 0xB2B2,
+            .seed_plan = .{ .bits = 1 },
+            .seed_prologue = true,
+        } },
+    };
+    child.inputs = @constCast(&[_]trace.InputSeed{undefined});
+    try state.cache.append(gpa, &parent);
+    try state.cache.append(gpa, &child);
+    try state.provenance_edges.append(gpa, .{ .parent_id = parent.id, .exit_instr = 0, .child_id = child.id });
+
+    // Live episode = proto_a, so the child's proto_b page is not enterable.
+    const seed_ctx = try gpa.create(trace.NativeSeedCtx);
+    seed_ctx.* = .{ .seed_fn = foreignEpisodeDummySeed };
+    state.native_seed_ctx = seed_ctx; // state.deinit() destroys it
+    seed_ctx.proto = @ptrCast(&proto_a);
+    seed_ctx.call_seq = 5;
+    state.region_context = .{ .depth = 0, .call_seq = 5 };
+    try testing.expect(state.stubEnterability(&child, .ordinary, child.anchor.proto) == .no_episode);
+
+    state.provenance_arms_pending = true;
+    state.drainProvenanceArms(true);
+    // Nothing armed — that part is unchanged and correct.
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+    // The general flag SETTLES. Pre-fix it stayed true here, forever.
+    try testing.expect(!state.provenance_arms_pending);
+    // The deferral is recorded on the episode-scoped flag instead, stamped with
+    // the episode it was waiting past — so coverage is deferred, not dropped.
+    try testing.expect(state.provenance_arms_episode_pending);
+    // ...and while that episode is still live, further passes are free: the
+    // gate short-circuits on identity, not on "a pass happened".
+    state.drainProvenanceArms(true);
+    try testing.expect(state.provenance_arms_episode_pending);
+    try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
+
+    // The coverage half: when the episode really does change to the child's
+    // proto, the deferred edge arms. Without the episode stamp this edge would
+    // have been silently dropped rather than merely postponed.
+    seed_ctx.proto = @ptrCast(&proto_b);
+    state.drainProvenanceArms(true);
+    try testing.expectEqual(@as(usize, 1), state.armed_links.items.len);
+    try testing.expectEqual(ArmKind.sibling_handoff, state.armed_links.items[0].kind);
+    try testing.expectEqual(@as(u64, 1), state.sibling_handoff_arms);
+    try testing.expectEqual(@as(usize, 0xB2B2), slots[0]);
+    // Both flags settled: nothing is deferred any more.
+    try testing.expect(!state.provenance_arms_pending);
+    try testing.expect(!state.provenance_arms_episode_pending);
+}
