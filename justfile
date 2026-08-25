@@ -34,6 +34,14 @@ check-version:
 bench *args: release
     python3 bench/run.py {{args}}
 
+# Frozen-output gate: every benchmark's stdout must match the digests committed
+# in bench/refs/. This is the half `bench/run.py` cannot do — it proves the tiers
+# agree with each OTHER, which a change that moves all three identically still
+# passes. Builds ReleaseFast first because the refs were generated that way.
+# Regenerate deliberately (and say why in the commit): just hashgate --generate
+hashgate *args: release
+    python3 tools/hashgate.py {{args}}
+
 # Copy this tree to DEST for an A/B shadow build (baseline binaries), stripping
 # .zig-cache/zig-out so the shadow build can never reuse THIS tree's artifacts.
 # A copied cache once made the "pre" baseline a post-source binary and burned an
