@@ -86,6 +86,36 @@ just an instrument that tells us where general speed is missing; fix the general
 gap it reveals, not the instrument's reading. When in doubt, prefer the more
 general mechanism that still helps the benchmark at hand.
 
+### Rule Z-7: If the foundation is wrong, fix the foundation now — do not spend a week polishing around a known structural change.
+
+Incremental work is valuable only when the current architecture is sound and the
+increments move directly toward the intended design. Once profiling, code reading,
+or an accepted design establishes that the broader structure is built on sand,
+**stop splitting hairs inside that structure and make the larger architectural
+change immediately.** Do not stack increasingly elaborate caches, predicates,
+special cases, or temporary optimisations onto machinery we already know must be
+replaced. Do not defer the structural fix merely because a narrower patch is easier
+to land or measure.
+
+Concretely:
+- Before starting another local optimisation, ask whether it survives the known
+  end-state architecture. If not, do not build it.
+- Treat repeated failure of local fixes as evidence to move up a level, not as an
+  invitation to invent one more local fix.
+- Prefer a few days replacing an unsound boundary, ownership model, data layout, or
+  subsystem split over a week tuning symptoms around it.
+- When a larger change is already known to be necessary, design and implement that
+  change now, with tests and measurements at its real boundaries. Incremental
+  landing may still be used to keep the tree green, but the increments must be
+  slices of the final architecture — never disposable scaffolding or detours.
+- Performance work still starts with profiling (below), but once the profile points
+  to a structural bottleneck, fix the structure rather than repeatedly shaving its
+  call sites.
+
+The threshold is knowledge, not discomfort: do not invoke “architecture” to skip
+ordinary focused work, but do not demand another round of proof after the structural
+cause and required direction are already established.
+
 ## Build
 
 Use the `just` recipes (`justfile`) as the canonical entry points — they wrap
