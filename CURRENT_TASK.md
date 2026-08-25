@@ -16,6 +16,95 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-25 (LATEST-80) — **doc 22 Phase C REVERTED in full (Bart's call). The region data model is extracted into leaf modules; the board is back at post-B. C.5b dropped too — its justification did not survive re-measurement.**
+
+Bart's mandate: "keep the extraction, remove the graduation, remove everything
+that is a liability rather than an asset."
+
+**Why Phase C went.** C.1's owner election made nest regions armable that were
+owner-ambiguous before — which is what it was for, but armable ⇒ `openRegion`
+per activation ⇒ a per-activation open→account→close lifecycle post-B never
+paid for. nbody went from 84.7% of cycles on native trace code to **0.1%**
+(199,844 of 199,921 loop entries "tier-0, has-trace"). Nine successive
+mechanisms (C.4, C.5, C.5a/b, C.5c1–c5) were built to claw it back and the
+final state was still lu +16.8% / spectral +13.5% / grid +4.6% / nbody ~+3%.
+**lu began the cascade at +16.6% and ended at +16.8%.** Rule Z-7's exact
+pattern. Full board + reasoning recorded in doc 22 §"Phase C" (kept as a
+negative result, with a banner so nobody mistakes it for current design).
+
+The deeper diagnosis (the other agent's, and it is right): graduation/leases
+are not a Pall mechanism. Trace trees, side traces, hot-exit counters, loop
+recording, snapshots and direct linking are LuaJIT. Persistent `RegionDef`s,
+per-receipt source/destination classification, `RegionAccum` windows, dormancy,
+memos, graduation and leases are ours. LuaJIT does not run
+classify→choose→lookup→classify→update per successful receipt — it patches the
+exit and stops thinking. We copied the trace shape, not the steady-state cost
+model, then built a cache hierarchy over the cost model we should not have had.
+
+**What landed (this commit).**
+- `src/trace_types.zig` (326 lines) — trace-graph identities, moved verbatim
+  with their doc comments: `CallEdge`/`GuardRole`/`GuardProvenance`/
+  `ExitProvenance`/`StructuralEdgeId`/`AnchorKey`/`MAX_INLINE_DEPTH` + the
+  field-wise order/hash helpers. Leaf module: `std` + `bytecode.Proto` only.
+- `src/trace_region.zig` (388 lines) — the region DATA MODEL, moved verbatim:
+  `RegionId`/`Key`/`Accum`/`Destination`/`Context`/`Classifier`/`BridgeDef`/
+  `Def`/`InternMap`, the observer caches, the set builders.
+- `trace.zig` 14,147 → 13,520 lines, with a re-export block so every existing
+  `trace.X` spelling still resolves. Behaviour-free by construction.
+
+**Scope correction worth knowing.** "Keep the extraction" could not mean the
+working tree's 2,839-line module. That module had no `*TraceState` parameter
+*because Phase C restructured the interaction into classify/decide/apply* —
+the decoupling was itself a Phase C artifact. At post-B the region policy
+methods reach straight into `penalty`, `gate`, `promoted_sets`, `gateAnchor`,
+`condemnProvenanceEdgesAt`, `disarmAllLinks`: the region layer IS the tiering
+policy layer and there is no seam to cut along without changing behaviour. So
+the state-free data model came out (a pure move, checkable) and the ~25 policy
+methods stayed on `TraceState`, which is where they honestly belong today.
+
+**C.5b dropped as well.** Its recorded justification was "sor 8,006 mprotects
+→ 0, 0.085s → 0.070s". Re-measured against post-B: **6 mprotect calls across
+the entire 28-program suite**, and best-of-9 wall-clock is noise (sor +1.2%,
+lu −1.4%, nbody +1.2%, fft −2.9%, spectral +0.1%). The 8,006 was an artifact
+of Phase C's own arm/disarm churn. It is 141 lines of memfd/dual-map plus a
+rarely-exercised SELinux/seccomp fallback, and it defeats W^X by keeping a
+permanently-RW alias of executable memory — not worth carrying for 6 syscalls.
+Archived; re-appliable in one command if exit-branch patching ever makes patch
+frequency real.
+
+**Gate.** `just test` + `-Djit-debug=true` green; `tools/hashgate.py` 84/84
+digests match the post-B references; `just bench` 28/28 `cross=ok`, LuaJIT
+parity ok throughout; best-of-9 A/B vs a verified `just shadow` post-B binary
+neutral-to-better on all five hot programs (sor +0.3%, lu −1.3%, nbody −1.6%,
+fft −3.3%, spectral −0.2%).
+
+**Everything Phase C is archived** at `~/lune-phasec-archive/` (full tree copy
++ `phaseC-tracked.patch` + the untracked modules + the commit-4 bug design).
+Nothing was lost; it is simply not in the tree.
+
+**Still open from this arc (deliberately separate commits):**
+- Three general provenance wins found inside the Phase C diff that were never
+  region policy: `provenanceEdgeVerdict` O(rows²)→O(rows) suffix cum-maximum
+  (2.3% of fft SELF), caller-owned capture storage (kills a 776-byte
+  aggregate-return memcpy), and the `armed_sibling_total` O(1) bypass.
+- Three behaviour bugs + dead code in *committed* code, designed in detail and
+  archived: the seeded-continuation decline striking the wrong trace via
+  `.break_burst` (plus the same bug in the two tier-1a seeding sites — a real
+  native-vs-tier-1a penalty-map divergence); `drainProvenanceArms` latching
+  `provenance_arms_pending` forever; `validateRegionBridge`'s unmemoized
+  unbounded transient decline. Bugs 2 and 3 share a root cause —
+  `stubEnterable` conflates permanent and transient falsity.
+
+**Also landed just before this:** `tools/hashgate.py` + `bench/refs/` — the
+"six-hash gate" cited by ~15 commit messages only ever existed in `/tmp` and
+was lost to a disk cleanup. Rebuilt in-repo, 28 programs × 3 modes. It exposed
+a real hole: array3d and the four scimark kernels print **nothing**, so their
+digest is sha256("") and `bench/run.py`'s `cross=ok` is comparing "" == "" ==
+"" for them. Three of those five (fft, lu, sor) are the float kernels the JIT
+leans on hardest. Closing it means giving the kernels a deterministic checksum,
+which touches LuaJIT-vendored files and must keep byte-parity with LuaJIT's own
+run — flagged to Bart, not done drive-by.
+
 ## Status 2026-08-20 (LATEST-76) — **Doc 22 Phase B COMPLETE (B-iv gate flip + B-v test battery + measurement): seeded traces now enter native at EVERY seam, and nbody drops 40.4× → 21.9× LuaJIT (180.5 → 99.4 ms, −45%).**
 
 - B-iv.1/2/3 (34ebb88, 62312df, 0adc9ef): `stubEnterable` replaced every

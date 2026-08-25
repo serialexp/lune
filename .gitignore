@@ -5,3 +5,6 @@ zig-out/
 # viz (Phase 7 visualiser) — Bun + Vite + SolidJS
 viz/node_modules/
 viz/dist/
+
+# Python bytecode from bench/tools scripts
+__pycache__/
