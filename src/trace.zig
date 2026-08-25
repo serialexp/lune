@@ -1546,7 +1546,7 @@ pub const ProvenanceEdge = struct {
     strikes: u8 = 0,
 };
 
-const ProvenanceAction = enum { strike, reset };
+pub const ProvenanceAction = enum { strike, reset };
 
 pub const ProvenanceVerdict = struct {
     parent_id: u32,
@@ -3754,52 +3754,93 @@ pub const TraceState = struct {
         out: []ProvenanceVerdict,
     ) usize {
         if (!provenance_arming_enabled or self.provenance_edges.items.len == 0) return 0;
+        // O(1) necessary precondition. Every edge below must clear
+        // `hasArmedSiblingHandoff` — an ARMED handoff — so with an empty arm
+        // registry no edge can produce a verdict and the whole per-native-call
+        // scan (two `traceById` probes + a latch probe + a ledger walk, per
+        // edge) is dead work. This is the steady state of any program whose
+        // provenance edges outlive their arms: on scimark-lu essentially every
+        // native entry reaches here with nothing armed.
+        //
+        // Deliberately keyed on the registry being EMPTY rather than on a
+        // maintained count of `.sibling_handoff` records: emptiness is read
+        // straight off the structure that already exists, so it cannot drift
+        // out of sync with it. A maintained counter would be a new invariant
+        // to keep exact across all four arm-removal paths, and if it ever
+        // under-counted this early-out would silently skip LIVE edges.
+        // Conservative in the safe direction: a non-empty registry holding no
+        // sibling handoffs merely takes the slow path, as it does today.
+        if (self.armed_links.items.len == 0) return 0;
         var n: usize = 0;
         for (self.provenance_edges.items) |edge| {
             const parent = self.traceById(edge.parent_id) orelse continue;
             const child = self.traceById(edge.child_id) orelse continue;
             if (!self.hasArmedSiblingHandoff(parent, edge.exit_instr, child)) continue;
-            var saw_strike = false;
-            var saw_productive = false;
-            var k: usize = 0;
-            while (k + 1 < entries.len) : (k += 1) {
+            const action = provenanceEdgeVerdict(entries, initial_cum, edge) orelse continue;
+            if (n == out.len)
+                @panic("captureProvenanceVerdicts: verdict capacity exceeded");
+            out[n] = .{
+                .parent_id = edge.parent_id,
+                .exit_instr = edge.exit_instr,
+                .child_id = edge.child_id,
+                .action = action,
+            };
+            n += 1;
+        }
+        return n;
+    }
+
+    /// The per-edge ledger walk of `captureProvenanceVerdicts`, split out so it
+    /// can be pinned directly against hand-built ledgers without standing up
+    /// armed physical links. Returns the edge's action, or null when the ledger
+    /// holds no evidence either way.
+    ///
+    /// The straightforward form re-scanned the ledger tail once per matched row,
+    /// which is O(rows²) per edge — a measured 2.3% of scimark-fft SELF time.
+    /// This walks `k` BACKWARD maintaining the suffix cum-maximum instead, which
+    /// is the same verdict by the following equivalence:
+    ///
+    ///   * the forward loop's final `progressed` is exactly
+    ///     `local != 0 or max(cum over entries[k+1..]) > e.cum`;
+    ///   * its strike arm could only fire for a row that never progressed — the
+    ///     evolving `!progressed` qualifier was vacuously true throughout — so
+    ///     the tail scan for a same-cum parent return (child row intervening,
+    ///     hence `j >= k + 2`) is only needed in that no-progress case;
+    ///   * verdicts accumulate order-independently and one productive row
+    ///     decides the whole edge (`.reset` outranks `.strike`), so returning
+    ///     at the first productive row is equivalent to scanning them all.
+    pub fn provenanceEdgeVerdict(
+        entries: []const irinterp.LedgerEntry,
+        initial_cum: usize,
+        edge: ProvenanceEdge,
+    ) ?ProvenanceAction {
+        if (entries.len < 2) return null;
+        var saw_strike = false;
+        var suffix_max: usize = entries[entries.len - 1].cum;
+        var k: usize = entries.len - 1;
+        while (k > 0) {
+            k -= 1;
+            // Invariant: `suffix_max` is the maximum cum over `entries[k+1..]`.
+            row: {
                 const e = entries[k];
                 if (e.id != edge.parent_id or e.exit != edge.exit_instr or
                     e.kind != .deopt or e.reason != .normal or e.outcome != .normal or
                     entries[k + 1].id != edge.child_id)
-                    continue;
+                    break :row;
                 const prior_cum: usize = if (k == 0) initial_cum else entries[k - 1].cum;
                 const local = e.cum - prior_cum;
-                var progressed = local != 0;
-                var returned_without_progress = false;
-                var j = k + 1;
+                if (local != 0 or suffix_max > e.cum) return .reset;
+                var j = k + 2;
                 while (j < entries.len) : (j += 1) {
-                    if (entries[j].cum > e.cum) progressed = true;
-                    // At least the child row must intervene before a return to P.
-                    if (j >= k + 2 and entries[j].id == edge.parent_id and
-                        entries[j].cum == e.cum and !progressed)
-                    {
-                        returned_without_progress = true;
+                    if (entries[j].id == edge.parent_id and entries[j].cum == e.cum) {
+                        saw_strike = true;
+                        break;
                     }
                 }
-                if (progressed) {
-                    saw_productive = true;
-                } else if (local == 0 and returned_without_progress) {
-                    saw_strike = true;
-                }
             }
-            const verdict = if (saw_productive)
-                ProvenanceVerdict{ .parent_id = edge.parent_id, .exit_instr = edge.exit_instr, .child_id = edge.child_id, .action = .reset }
-            else if (saw_strike)
-                ProvenanceVerdict{ .parent_id = edge.parent_id, .exit_instr = edge.exit_instr, .child_id = edge.child_id, .action = .strike }
-            else
-                continue;
-            if (n == out.len)
-                @panic("captureProvenanceVerdicts: verdict capacity exceeded");
-            out[n] = verdict;
-            n += 1;
+            suffix_max = @max(suffix_max, entries[k].cum);
         }
-        return n;
+        return if (saw_strike) .strike else null;
     }
 
     /// Apply captured verdicts only after replay and deferred global disarms.
@@ -4762,10 +4803,12 @@ pub const TraceState = struct {
                 // The ≤2 scalar compatibility seam is still a complete native
                 // call. Capture its ordinary ledger before any steering and settle
                 // before `runLinkedBurst` can re-enter native code.
-                const provenance = self.captureNativeCallProvenance(
+                var provenance: NativeCallProvenance = .{};
+                self.captureNativeCallProvenance(
                     .drive_chain_seed,
                     sresult,
                     self.ledger_scratch[0..sresult.ledger_len],
+                    &provenance,
                 );
                 self.settleNativeCallProvenance(&provenance, safe_to_arm);
                 // B-iv.2 (doc 22 §B.2, codex Q2): a hop-0 SCALAR seed decline —
@@ -4910,10 +4953,12 @@ pub const TraceState = struct {
             safe_to_arm,
             regs,
         ) orelse return null;
-        const provenance = self.captureNativeCallProvenance(
+        var provenance: NativeCallProvenance = .{};
+        self.captureNativeCallProvenance(
             .drive_chain_seed,
             result,
             self.ledger_scratch[0..result.ledger_len],
+            &provenance,
         );
         if (materialization == .ordinary_header) self.prime_side_chain_follows +|= 1;
         self.settleNativeCallProvenance(&provenance, safe_to_arm);
@@ -5537,7 +5582,7 @@ pub const TraceState = struct {
         return n;
     }
 
-    const NativeCallProvenance = struct {
+    pub const NativeCallProvenance = struct {
         verdicts: [PROVENANCE_VERDICT_CAP]ProvenanceVerdict = undefined,
         len: usize = 0,
     };
@@ -5554,19 +5599,24 @@ pub const TraceState = struct {
     /// for a silent call it runs after `driveSilentBurst` has staged the prefix
     /// and suffix evidence. The matching settle runs exactly once after deferred
     /// disarms and before any replay directive can re-enter native code.
+    /// Fills CALLER-OWNED storage rather than returning the aggregate by value.
+    /// `verdicts` is capacity-sized, so an aggregate return lowers to a full
+    /// memcpy of the array on every native entry — including the overwhelmingly
+    /// common case that captures nothing. Measured on scimark-lu at this
+    /// revision: `memcpyFast` was 4.04% of the run, 3.94% of it reached through
+    /// this function. The out-param is the whole fix; the body is unchanged.
     pub fn captureNativeCallProvenance(
         self: *TraceState,
         origin: NativeCallOrigin,
         result: irinterp.ExecResult,
         entries: []const irinterp.LedgerEntry,
-    ) NativeCallProvenance {
+        captured: *NativeCallProvenance,
+    ) void {
         _ = origin; // Required at each call site so origin coverage cannot hide.
-        var captured = NativeCallProvenance{};
         captured.len = if (result.silent_active != 0)
             self.captureSilentSuffixProvenance(result, &captured.verdicts)
         else
             self.captureProvenanceVerdicts(entries, 0, &captured.verdicts);
-        return captured;
     }
 
     pub fn settleNativeCallProvenance(
@@ -6760,7 +6810,8 @@ pub const TraceState = struct {
                         regs,
                     );
                     const call_a_entries = self.ledger_scratch[0..iresult.ledger_len];
-                    const provenance = self.captureNativeCallProvenance(.inner_call, iresult, call_a_entries);
+                    var provenance: NativeCallProvenance = .{};
+                    self.captureNativeCallProvenance(.inner_call, iresult, call_a_entries, &provenance);
                     if (silent_directive) |call_a_directive| {
                         self.settleNativeCallProvenance(&provenance, safe_to_arm);
                         switch (call_a_directive) {
@@ -7000,7 +7051,8 @@ pub const TraceState = struct {
                     const entries = self.ledger_scratch[0..cresult.ledger_len];
                     // Ordinary capture happens before replay; silent capture happens
                     // after the drain has staged its prefix/suffix evidence.
-                    const provenance = self.captureNativeCallProvenance(.continuation_call, cresult, entries);
+                    var provenance: NativeCallProvenance = .{};
+                    self.captureNativeCallProvenance(.continuation_call, cresult, entries, &provenance);
                     const call_b_directive = silent_directive orelse self.replayLedger(
                         entries,
                         current_link,
@@ -7175,11 +7227,12 @@ pub const TraceState = struct {
         // B-2b: capture registry-recognized edge service over the COMPLETE ledger
         // before replay can request a deferred physical disarm. Apply only after
         // replay returns, per §B.6.
-        const provenance = self.captureNativeCallProvenance(.dispatcher_root, .{
+        var provenance: NativeCallProvenance = .{};
+        self.captureNativeCallProvenance(.dispatcher_root, .{
             .completed = entries[entries.len - 1].cum,
             .exit_instr = entries[entries.len - 1].exit,
             .ledger_len = entries.len,
-        }, entries);
+        }, entries, &provenance);
         const dispatcher_directive = self.replayLedger(entries, seed, inner_pc, proto, &linked_completed, &resume_pc, &hops, max_hops, .dispatcher_root, safe_to_arm, regs);
         // A-vii-d.1: drain the pending bridge-arm request AFTER the walk,
         // BEFORE acting on the directive (review blocker 5).
@@ -7311,19 +7364,23 @@ pub const TraceState = struct {
             // its ≤2 scalar seam — and left THIS origin, the one it names, with no
             // settle at all.)
             if (result.ledger_len <= 1) {
-                const provenance = self.captureNativeCallProvenance(
+                var provenance: NativeCallProvenance = .{};
+                self.captureNativeCallProvenance(
                     .dispatcher_root,
                     result,
                     self.ledger_scratch[0..result.ledger_len],
+                    &provenance,
                 );
                 self.settleNativeCallProvenance(&provenance, safe_to_arm);
             }
             return null;
         };
-        const provenance = self.captureNativeCallProvenance(
+        var provenance: NativeCallProvenance = .{};
+        self.captureNativeCallProvenance(
             .dispatcher_root,
             result,
             self.ledger_scratch[0..result.ledger_len],
+            &provenance,
         );
         self.settleNativeCallProvenance(&provenance, safe_to_arm);
         return self.finishDispatcherDirective(
@@ -7411,11 +7468,12 @@ pub const TraceState = struct {
             seed.anchor.pc;
         var resume_pc: u32 = seed_inner_pc;
         var hops: usize = 0;
-        const provenance = self.captureNativeCallProvenance(.drive_chain_seed, .{
+        var provenance: NativeCallProvenance = .{};
+        self.captureNativeCallProvenance(.drive_chain_seed, .{
             .completed = entries[entries.len - 1].cum,
             .exit_instr = entries[entries.len - 1].exit,
             .ledger_len = entries.len,
-        }, entries);
+        }, entries, &provenance);
         const seed_directive = self.replayLedger(entries, seed, seed_inner_pc, proto, &linked_completed, &resume_pc, &hops, max_hops, .continuation_call, safe_to_arm, regs);
         // A-vii-d.1: drain the pending bridge-arm request AFTER the walk,
         // BEFORE acting on the directive (review blocker 5).

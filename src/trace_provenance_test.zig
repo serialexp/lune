@@ -368,42 +368,46 @@ test "B-2b complete-ledger cycle strikes retire at three, while prologue-fail is
     };
     for (native_origins) |native_origin| {
         state.provenance_edges.items[0].strikes = 2;
-        const ordinary_productive = state.captureNativeCallProvenance(native_origin, .{
+        var ordinary_productive: trace.TraceState.NativeCallProvenance = .{};
+        state.captureNativeCallProvenance(native_origin, .{
             .completed = 1,
             .exit_instr = 0,
             .ledger_len = origin_productive.len,
-        }, &origin_productive);
+        }, &origin_productive, &ordinary_productive);
         state.settleNativeCallProvenance(&ordinary_productive, false);
         const ordinary_reset_strikes = state.provenance_edges.items[0].strikes;
         try testing.expectEqual(@as(u8, 0), ordinary_reset_strikes);
 
         state.provenance_edges.items[0].strikes = 2;
         state.stageSilentSiblingProvenance(silent_edge, 1, true, false);
-        const silent_productive = state.captureNativeCallProvenance(native_origin, .{
+        var silent_productive: trace.TraceState.NativeCallProvenance = .{};
+        state.captureNativeCallProvenance(native_origin, .{
             .completed = 1,
             .exit_instr = 0,
             .silent_active = 1,
-        }, &.{});
+        }, &.{}, &silent_productive);
         state.settleNativeCallProvenance(&silent_productive, false);
         try testing.expectEqual(ordinary_reset_strikes, state.provenance_edges.items[0].strikes);
 
         state.provenance_edges.items[0].strikes = 0;
-        const ordinary_zero = state.captureNativeCallProvenance(native_origin, .{
+        var ordinary_zero: trace.TraceState.NativeCallProvenance = .{};
+        state.captureNativeCallProvenance(native_origin, .{
             .completed = 0,
             .exit_instr = 0,
             .ledger_len = origin_zero.len,
-        }, &origin_zero);
+        }, &origin_zero, &ordinary_zero);
         state.settleNativeCallProvenance(&ordinary_zero, false);
         const ordinary_strike_count = state.provenance_edges.items[0].strikes;
         try testing.expectEqual(@as(u8, 1), ordinary_strike_count);
 
         state.provenance_edges.items[0].strikes = 0;
         state.stageSilentSiblingProvenance(silent_edge, 1, false, true);
-        const silent_zero = state.captureNativeCallProvenance(native_origin, .{
+        var silent_zero: trace.TraceState.NativeCallProvenance = .{};
+        state.captureNativeCallProvenance(native_origin, .{
             .completed = 0,
             .exit_instr = 0,
             .silent_active = 1,
-        }, &.{});
+        }, &.{}, &silent_zero);
         state.settleNativeCallProvenance(&silent_zero, false);
         try testing.expectEqual(ordinary_strike_count, state.provenance_edges.items[0].strikes);
     }
@@ -999,4 +1003,54 @@ test "A-viii (doc 17 §A8 step 8): one disarm tears down the whole OUTER cycle �
     for (cont_slots) |s| try testing.expectEqual(SHARED_EXIT, s);
     try testing.expectEqual(@as(usize, 0), state.armed_links.items.len);
     try testing.expectEqual(@as(u64, 4), state.native_link_disarms);
+}
+
+test "provenanceEdgeVerdict: the backward suffix-max walk agrees with the forward form" {
+    // `provenanceEdgeVerdict` replaced a forward scan that re-walked the ledger
+    // tail once per matched row (O(rows^2) per edge, 2.3% of scimark-fft SELF)
+    // with a single backward walk carrying the suffix cum-maximum. These pin the
+    // three claims that make the two forms equivalent, plus the two null cases.
+    const P: u32 = 7; // parent trace id
+    const C: u32 = 9; // child trace id
+    const edge = trace.ProvenanceEdge{ .parent_id = P, .exit_instr = 0, .child_id = C };
+
+    const row = struct {
+        fn at(id: u32, cum: usize) irinterp.LedgerEntry {
+            return .{ .cum = cum, .id = id, .exit = 0, .reason = .normal, .kind = .deopt, .outcome = .normal };
+        }
+    };
+    const verdict = trace.TraceState.provenanceEdgeVerdict;
+
+    // (1) Local progress on the matched row itself: cum advanced past prior_cum.
+    const local_progress = [_]irinterp.LedgerEntry{ row.at(P, 1), row.at(C, 1) };
+    try testing.expectEqual(trace.ProvenanceAction.reset, verdict(&local_progress, 0, edge).?);
+
+    // (2) Progress that only appears LATER in the ledger — the suffix maximum,
+    // which is the whole reason the walk runs backward.
+    const later_progress = [_]irinterp.LedgerEntry{ row.at(P, 1), row.at(C, 1), row.at(P, 5) };
+    try testing.expectEqual(trace.ProvenanceAction.reset, verdict(&later_progress, 1, edge).?);
+
+    // (3) A completed zero-progress revolution: child intervenes, then control
+    // returns to the parent at the same cum. This is the strike.
+    const zero_cycle = [_]irinterp.LedgerEntry{ row.at(P, 1), row.at(C, 1), row.at(P, 1) };
+    try testing.expectEqual(trace.ProvenanceAction.strike, verdict(&zero_cycle, 1, edge).?);
+
+    // (4) `.reset` outranks `.strike` regardless of order, so a productive row
+    // decides the edge even when a zero-progress revolution precedes it. This is
+    // what licenses returning at the first productive row instead of scanning on.
+    const strike_then_reset = [_]irinterp.LedgerEntry{
+        row.at(P, 1), row.at(C, 1), row.at(P, 1), row.at(C, 1), row.at(P, 4),
+    };
+    try testing.expectEqual(trace.ProvenanceAction.reset, verdict(&strike_then_reset, 1, edge).?);
+
+    // (5) No evidence either way: zero progress, but control never returns to the
+    // parent, so the revolution never completed.
+    const no_return = [_]irinterp.LedgerEntry{ row.at(P, 1), row.at(C, 1), row.at(C, 1) };
+    try testing.expectEqual(@as(?trace.ProvenanceAction, null), verdict(&no_return, 1, edge));
+
+    // (6) No row matches the edge at all, and the degenerate short ledgers.
+    const unrelated = [_]irinterp.LedgerEntry{ row.at(C, 1), row.at(P, 1) };
+    try testing.expectEqual(@as(?trace.ProvenanceAction, null), verdict(&unrelated, 1, edge));
+    try testing.expectEqual(@as(?trace.ProvenanceAction, null), verdict(&.{}, 0, edge));
+    try testing.expectEqual(@as(?trace.ProvenanceAction, null), verdict(&[_]irinterp.LedgerEntry{row.at(P, 1)}, 0, edge));
 }
