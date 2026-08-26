@@ -25,13 +25,17 @@ local benchmarks = {}
 -- leans on hardest. `benchmarks.checksum()` closes that: each kernel records
 -- its result state here, and the wrapper prints a fold of it after the run.
 --
--- WHY AN INTEGER FOLD AND NOT `string.format("%.17g", ...)`: lune's
--- `string.format` cannot currently render more significant digits than a
--- double's shortest round-trip form — it zero-pads instead, so `%.17g` of 1/3
--- gives `0.3333333333333333` where C and LuaJIT give `0.33333333333333331`
--- (see TODO.md). Any high-precision float print would therefore differ between
--- the engines for formatting reasons alone, masking or faking a real numeric
--- difference. The fold below touches no float formatting at all:
+-- WHY AN INTEGER FOLD AND NOT `string.format("%.17g", ...)`: when this was
+-- written lune's `string.format` could not render a double's exact decimal
+-- expansion (`%.17g` of 1/3 gave `0.3333333333333333` where C gives
+-- `0.33333333333333331`), so a high-precision float print would have differed
+-- between the engines for formatting reasons alone — masking or faking a real
+-- numeric difference. That is fixed (`src/stdlib/decimal.zig` converts
+-- exactly, verified byte-identical to glibc over 1.08M formats), so a `%.17g`
+-- checksum would now agree. The fold is kept anyway, because it depends on no
+-- formatting behaviour whatsoever: it compares the NUMBERS, so a future
+-- rendering change cannot quietly weaken this oracle.
+-- The fold below touches no float formatting at all:
 --   * `x % 1` is exact;
 --   * scaling by 2^52 is exact (power of two), and the product is < 2^52, so
 --     `floor` recovers EVERY fraction bit — the fold is 1-ulp sensitive;

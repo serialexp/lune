@@ -73,8 +73,12 @@ metadata comment line anywhere in the file:
 Conventions, so a program is both a perf probe and a parity check:
 
 - Wrap the function(s) under test in a loop sized by `arg[1]`.
-- Accumulate an **integer** checksum (float checksums diverge across engines for
-  non-obvious reasons); print a tiny, deterministic summary line.
+- Accumulate an **integer** checksum; print a tiny, deterministic summary line.
+  Not superstition — `print(x)` on a float is **not** LuaJIT-comparable, because
+  lune renders the shortest round-tripping decimal by design where Lua uses
+  `%.14g`: `print(1/3)` is `0.3333333333333333` here and `0.33333333333333`
+  there. `string.format("%.6f", x)` *is* comparable (exact since
+  `src/stdlib/decimal.zig`); bare `tostring`/`print` of a float is not.
 - Use only the LuaJIT-available surface for `luajit=compatible`. LuaJIT 2.1 is
   Lua 5.1 + selected 5.2/5.3 bits; it does **not** have `math.type`,
   `math.maxinteger`, `table.pack`, `table.unpack`, or `rawlen`. Lune's Lua 5.4
@@ -129,9 +133,12 @@ digest `sha256("")` and made the cross-tier check compare `"" == "" == ""` while
 reporting `cross=ok`. Each wrapper now ends in `print(lib.checksum())` — an exact
 integer fold of the kernel's result state (the transformed vector, the relaxed or
 factored matrix, the product vector). It is an integer fold rather than a
-formatted float because lune's `string.format` cannot yet render more
-significant digits than a double's shortest round-trip form (see `TODO.md`), so
-a `%.17g` print would differ from LuaJIT's for formatting reasons alone.
+formatted float: when it was written lune's `string.format` could not render a
+double's exact decimal expansion, so a `%.17g` print would have differed from
+LuaJIT's for formatting reasons alone. That is since fixed
+(`src/stdlib/decimal.zig`), but the fold stays — it depends on no formatting
+behaviour at all, so it compares the numbers themselves and cannot be quietly
+weakened by a future rendering change.
 
 Two consequences worth knowing:
 

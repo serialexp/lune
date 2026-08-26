@@ -84,10 +84,14 @@ for x,y,z in arr:points() do
 end
 assert(arr.image[dim^3-1] == (dim-1)^2)
 
--- lune-added result checksum. Exact integer fold, no float formatting: lune's
--- string.format cannot render more significant digits than a double's shortest
--- round-trip form (see TODO.md), so a "%.17g" print would differ from LuaJIT's
--- for formatting reasons alone. `x % 1` is exact, scaling by 2^52 is exact, and
+-- lune-added result checksum. Exact integer fold, no float formatting. When
+-- this was written lune's string.format could not render a double's exact
+-- decimal expansion, so a "%.17g" print would have differed from LuaJIT's for
+-- formatting reasons alone; that is fixed (src/stdlib/decimal.zig) and a
+-- formatted checksum would now agree. The fold is kept because it depends on
+-- no formatting behaviour at all — it compares the NUMBERS, so it cannot be
+-- silently weakened by a future rendering change.
+-- `x % 1` is exact, scaling by 2^52 is exact, and
 -- every intermediate stays under 2^53 — so this is 1-ulp sensitive and renders
 -- identically under LuaJIT's doubles and Lua 5.4's integers.
 --

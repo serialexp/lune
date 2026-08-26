@@ -29,6 +29,7 @@ const interp = @import("../interp.zig");
 const string_mod = @import("../string.zig");
 const table_mod = @import("../table.zig");
 const pattern = @import("pattern.zig");
+const decimal = @import("decimal.zig");
 const unicode_case = @import("../gen/unicode_case.zig");
 
 const Value = value.Value;
@@ -511,57 +512,16 @@ fn signPrefix(neg: bool, spec: FormatSpec) []const u8 {
 
 // --- C-`printf` float bodies (magnitude only; sign/width applied later) --------
 //
-// Zig's `std.fmt.float.render` is the digit engine, but its surface differs from
-// C in two ways lune must paper over for LuaJIT/printf parity: the scientific
-// exponent is bare (`e2`, not `e+02`), and there is no `%g`-style significant-
-// digit mode. These helpers bridge both.
+// The digit engine is `decimal.zig`, which converts the double EXACTLY (see its
+// header for why `std.fmt.float.render` cannot be used here: it is Ryu-shortest,
+// so it double-rounds and breaks ties the wrong way). These helpers add the
+// pieces C has and the engine deliberately leaves to the caller: `%g`'s
+// significant-digit form and its trailing-zero stripping.
 
-/// `%e`/`%E` magnitude: Zig scientific digits with the exponent normalised to a
-/// sign and at least two digits (`1.5e2` → `1.500000e+02`). `frac` is the number
-/// of fractional digits; `exp_char` is 'e' or 'E'. Writes into `dst`.
-fn renderEng(dst: []u8, mag: f64, frac: usize, exp_char: u8) ![]const u8 {
-    var tmp: [512]u8 = undefined;
-    const sci = std.fmt.float.render(&tmp, mag, .{ .mode = .scientific, .precision = frac }) catch
-        return error.TypeError;
-    const ei = std.mem.indexOfScalar(u8, sci, 'e') orelse return error.TypeError;
-    const mant = sci[0..ei];
-    var raw = sci[ei + 1 ..]; // Zig emits an optional '-' then unpadded digits
-    var neg = false;
-    if (raw.len > 0 and raw[0] == '-') {
-        neg = true;
-        raw = raw[1..];
-    } else if (raw.len > 0 and raw[0] == '+') {
-        raw = raw[1..];
-    }
-    var w: usize = 0;
-    @memcpy(dst[w..][0..mant.len], mant);
-    w += mant.len;
-    dst[w] = exp_char;
-    w += 1;
-    dst[w] = if (neg) '-' else '+';
-    w += 1;
-    var pad: usize = if (raw.len < 2) 2 - raw.len else 0; // C: ≥2 exponent digits
-    while (pad > 0) : (pad -= 1) {
-        dst[w] = '0';
-        w += 1;
-    }
-    @memcpy(dst[w..][0..raw.len], raw);
-    w += raw.len;
-    return dst[0..w];
-}
-
-/// The decimal exponent `%e` with `sig` significant digits would use, for `%g`'s
-/// representation choice. Returns 0 on any render hiccup (only reached for finite
-/// magnitudes, where render does not fail).
-fn floatExp(mag: f64, sig: usize) i32 {
-    var tmp: [512]u8 = undefined;
-    const sci = std.fmt.float.render(&tmp, mag, .{
-        .mode = .scientific,
-        .precision = if (sig > 0) sig - 1 else 0,
-    }) catch return 0;
-    const ei = std.mem.indexOfScalar(u8, sci, 'e') orelse return 0;
-    return std.fmt.parseInt(i32, sci[ei + 1 ..], 10) catch 0;
-}
+/// Magnitude-body scratch. A `%f` body is at most 309 integer digits (1e308)
+/// plus the requested precision; a double's expansion terminates by 1074
+/// fractional digits, so nothing past that can be anything but zeros.
+const float_body_max = 1400;
 
 /// Copy `s` into `dst`, stripping trailing fractional zeros (and a then-trailing
 /// '.') while preserving any exponent suffix — C `%g` without the `#` flag.
@@ -585,15 +545,14 @@ fn stripZeros(dst: []u8, s: []const u8) []const u8 {
 /// defaulted/clamped to ≥1 by the caller), pick `%e` when the decimal exponent X
 /// is `< -4` or `>= P`, else `%f`, then strip trailing zeros unless `hash`.
 fn renderG(dst: []u8, mag: f64, p: usize, exp_char: u8, hash: bool) ![]const u8 {
-    const X = floatExp(mag, p);
-    var buf: [512]u8 = undefined;
+    const X = decimal.decimalExponent(mag, p);
+    var buf: [float_body_max]u8 = undefined;
     var body: []const u8 = undefined;
     if (X >= -4 and X < @as(i32, @intCast(p))) {
         const frac: usize = @intCast(@as(i32, @intCast(p)) - 1 - X); // ≥0 since X<P
-        body = std.fmt.float.render(&buf, mag, .{ .mode = .decimal, .precision = frac }) catch
-            return error.TypeError;
+        body = decimal.fixed(&buf, mag, frac) catch return error.TypeError;
     } else {
-        body = try renderEng(&buf, mag, p - 1, exp_char);
+        body = decimal.scientific(&buf, mag, p - 1, exp_char) catch return error.TypeError;
     }
     if (hash) {
         @memcpy(dst[0..body.len], body);
@@ -717,7 +676,7 @@ fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
                 const neg = std.math.signbit(f) and !std.math.isNan(f);
                 const mag = if (neg) -f else f;
                 const upper = spec.conv == 'F' or spec.conv == 'E' or spec.conv == 'G';
-                var rbuf: [512]u8 = undefined;
+                var rbuf: [float_body_max]u8 = undefined;
                 var body: []const u8 = undefined;
                 // C renders inf/nan as letters (no digits); the `0` flag is
                 // ignored for them (space-pad only).
@@ -730,11 +689,10 @@ fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
                     body = if (upper) "INF" else "inf";
                     fspec.zero = false;
                 } else switch (spec.conv) {
-                    'f', 'F' => body = std.fmt.float.render(&rbuf, mag, .{
-                        .mode = .decimal,
-                        .precision = spec.precision orelse 6,
-                    }) catch return error.TypeError,
-                    'e', 'E' => body = try renderEng(&rbuf, mag, spec.precision orelse 6, if (upper) 'E' else 'e'),
+                    'f', 'F' => body = decimal.fixed(&rbuf, mag, spec.precision orelse 6) catch
+                        return error.TypeError,
+                    'e', 'E' => body = decimal.scientific(&rbuf, mag, spec.precision orelse 6, if (upper) 'E' else 'e') catch
+                        return error.TypeError,
                     else => { // 'g'/'G': C significant-digit form, default precision 6, min 1
                         const p = blk: {
                             const pp = spec.precision orelse 6;

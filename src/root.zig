@@ -53,6 +53,8 @@ pub const stdlib_base = @import("stdlib/base.zig");
 pub const stdlib_basic = @import("stdlib/basic.zig");
 pub const stdlib_string = @import("stdlib/string.zig");
 pub const stdlib_pattern = @import("stdlib/pattern.zig");
+/// Exact binary64 → decimal conversion backing `string.format`'s `%f`/`%e`/`%g`.
+pub const stdlib_decimal = @import("stdlib/decimal.zig");
 
 /// Phase 5 — hot-path detection + trace recorder (records IR; tier-0 executes).
 pub const trace = @import("trace.zig");
