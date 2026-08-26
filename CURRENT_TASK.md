@@ -16,6 +16,83 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-26 (LATEST-82) — **the two `driveChain` panics were ONE bug: a use-after-free of the tier-1a executor scratch. Fixed with a segmented scratch stack; the gate gains a safety-checked leg. Board neutral except where trace entries dominate.**
+
+**Root cause, proven not inferred.** `TraceState.values_scratch` was one flat
+growable `ArrayListUnmanaged(Value)`, but trace execution nests:
+`enterSelectedTrace` holds a frame across `driveChain` (it IS the
+`.ir_numeric_for_done` payload) while the candidate walk takes one of its own. A
+candidate longer than the entering trace `resize`d the buffer, it moved, and the
+dispatcher's slice dangled. Instrumented both reproducers and caught the move
+directly — nsieve-bit `38 → 59` slots, `ptr …d0f0 → …6b70`; scimark-sparse
+`44 → 57`, `…e010 → …7950`. One fault, both symptoms: the flush reads the freed
+block, so `values[ar.a].asHeap()` trips the tag assert on one program and
+`regs.set(p.aux, values[p.b])` writes a garbage tag byte that the next
+`regs.get` decodes as an invalid enum on the other. Pre-reserving so the buffer
+cannot move makes both panics vanish and both programs agree with tier-0 and
+LuaJIT — causal chain closed end to end.
+
+**Two corrections to LATEST-81's TODO entry.** The hypothesis there ("the flush
+walks store instructions past the live prefix") is wrong: the flush is correct,
+its memory is gone. And it is not Debug-only UB — **the buffer moves in
+ReleaseFast too**. Release printed the right answer only because the process
+allocator neither scrubs a freed block nor had reused it yet. Stale-correct
+bytes, not benign garbage.
+
+**Fix (Bart's pick of three).** A segmented scratch stack: `values_chunks` +
+`valuesMark`/`valuesPush`/`valuesRelease`. Chunks are independent allocations so
+growth never moves a live frame; frames release LIFO, which is what makes a
+chunk at or above the cursor provably dead and therefore safe to reallocate when
+an oversized frame needs it. A frame larger than a chunk gets its own chunk, so
+nothing straddles and no invariant depends on `config.maxrecord`. Same
+discipline `interp.zig`'s register stack and `boundary_scratch` already document.
+
+**A design bug of my own, found by profiling and worth recording.** The mark
+first stored the free *slice*. That is wrong at the base: the first mark of a
+session predates chunk 0, so releasing to it left `values_free` empty even
+though chunk 0 was allocated and idle — every push then missed the fast path,
+the cold chunk-acquiring path ran once per trace entry, and the stack
+ping-ponged between two chunks forever. Cost 0.65% of scimark-fft, visible only
+because `valuesPushNewChunk` showed up in an instruction-event profile where it
+had no business being. The mark stores an offset now; a test pins 64 base-state
+mark/push/release cycles to exactly one chunk and one address.
+
+**Measured (instructions retired, not wall-clock — wall noise here is ±2%).**
+The discipline costs ~10–55 instructions per trace entry:
+
+| program (`--jit-native`) | entries | Δ instructions |
+|---|---|---|
+| nsieve | 825 | +0.002% |
+| nsieve-bit | — | +0.001% |
+| scimark-sparse | — | +0.007% |
+| nbody | 1.0M | +0.021% |
+| scimark-sor | 3.5k | +0.161% |
+| scimark-fft | 1.0M | +0.434% |
+| scimark-lu | 2.5M | +0.589% |
+
+Sanity check that the number means what it says: tier-0, which never touches the
+scratch, is **0.000%**, and tier-1a fft — which touches it hardest — is +0.102%,
+i.e. *less* than native fft. That inversion is the whole reason the follow-up in
+TODO.md is "stop pushing a frame the native path never uses" rather than "make
+the stack cheaper."
+
+**Gate.** `just test` + `-Djit-debug=true` green. `just hashgate` 84/84 on BOTH
+legs — the second one new: `--also-lune` runs the identical corpus under a
+safety-checked Debug build, since the gate had only ever seen ReleaseFast and
+that is precisely why these two bugs survived. Proven load-bearing: with the fix
+reverted the release leg passes 6/6 on the affected programs while the Debug leg
+reports the abort. `just bench` 28/28 `cross=ok`, LuaJIT parity throughout.
+
+**Tests, mutation-verified.** Three new pins in `trace_chain_test.zig` (nested
+oversized push, base-state cycle reuse, and the real `driveChain
+.ir_numeric_for_done` shape with a candidate longer than the caller's frame).
+Reverting `valuesPush` to HEAD's exact body fails **exactly** those three and
+nothing else — which is also the honest answer to "why did no existing test
+catch this." Worth noting separately: an *exact-fit* realloc mutation (rather
+than HEAD's geometric `ArrayList` growth) additionally breaks six pre-existing
+`interp_semantics`/`interp_tier1a` tests, so the same defect was one allocation
+policy away from firing much more widely than the two programs that showed it.
+
 ## Status 2026-08-25 (LATEST-81) — **the two follow-up commits from the Phase C unwind: three salvaged provenance wins, then three behaviour bugs + dead code. Board neutral; two of the three bugs turn out to be latent, not hot — recorded below because the original estimates said otherwise.**
 
 **Commit d0d844e — salvaged provenance wins (perf).** Three mechanical

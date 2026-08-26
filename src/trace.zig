@@ -2109,10 +2109,43 @@ pub const TraceState = struct {
     /// The in-progress recording (at most one at a time in Phase 5a).
     rec: Recorder = .{},
     /// Reusable SSA-value scratch for the tier-1a executor (`irinterp.execute`),
-    /// indexed by `Ref`. Grown to the longest trace executed and reused across
-    /// every entry — never allocated per-iteration or per-entry. Not a GC root
-    /// (the executor runs no safepoint; see `irinterp.zig`).
-    values_scratch: std.ArrayListUnmanaged(Value) = .empty,
+    /// indexed by `Ref`. Reused across every entry — never allocated
+    /// per-iteration or per-entry. Not a GC root (the executor runs no
+    /// safepoint; see `irinterp.zig`).
+    ///
+    /// **Segmented, because trace execution NESTS and the frames must not move.**
+    /// The dispatcher takes a frame for the trace it enters and keeps it live
+    /// across `driveChain` (it is the `.ir_numeric_for_done` payload); the
+    /// candidate walk takes a frame per candidate; `runLinkedBurst` takes one
+    /// per hop. A single flat growable buffer cannot serve that shape: growing
+    /// it to fit an inner frame reallocates, and every outer frame's slice
+    /// becomes a dangling pointer into freed memory. That was a real
+    /// use-after-free — `--trace bench/luajit/nsieve-bit.lua 6` (38-instr entry,
+    /// 59-instr candidate) and `--trace bench/luajit/scimark-sparse.lua 3000`
+    /// (44 → 57) both moved the buffer, in ReleaseFast as well as Debug, and
+    /// `flushNumericForLoopDone` then read the freed block. Release only printed
+    /// the right answer because the process allocator neither scrubs a freed
+    /// block nor had reused it yet.
+    ///
+    /// So the backing is a list of independently-allocated chunks: appending a
+    /// chunk moves the list of *slices*, never the `Value`s a live frame points
+    /// at. Frames are carved bump-style within a chunk and released in LIFO
+    /// order via `valuesMark`/`valuesRelease` — which is what makes a chunk at
+    /// or above `values_cur` provably dead and therefore safe to reallocate when
+    /// an oversized frame needs it. Each chunk holds at least
+    /// `values_chunk_slots`, and a frame larger than that simply gets a chunk of
+    /// its own, so no frame ever straddles a chunk boundary and no invariant
+    /// depends on `config.maxrecord`.
+    values_chunks: std.ArrayListUnmanaged([]Value) = .empty,
+    /// Index into `values_chunks` of the chunk currently being carved from.
+    values_cur: u32 = 0,
+    /// The un-carved tail of `values_chunks[values_cur]` — everything in that
+    /// chunk after the deepest live frame. Kept as a slice rather than an offset
+    /// so the push fast path is one length compare and a subslice: this runs on
+    /// every trace entry, and chasing `values_cur → chunks.items.ptr → chunk →
+    /// len` instead measured +1.3–2.2% on nsieve and scimark-fft. Empty before
+    /// the first chunk exists, which the fast path's length check rejects.
+    values_free: []Value = &.{},
     /// 2.3c-2b (doc 17): scratch for ONE native continuation call's decoded
     /// per-transition ledger. `runLinkedBurst` fills it via
     /// `CompiledTrace.runCapturingLedger` and immediately replays it in
@@ -2594,7 +2627,8 @@ pub const TraceState = struct {
         self.gate.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
         self.guard_failures.deinit(self.gpa);
-        self.values_scratch.deinit(self.gpa);
+        for (self.values_chunks.items) |c| self.gpa.free(c);
+        self.values_chunks.deinit(self.gpa);
         for (self.exec_logs.items) |*l| l.deinit(self.gpa);
         self.exec_logs.deinit(self.gpa);
         self.abort_log.deinit(self.gpa);
@@ -2941,13 +2975,95 @@ pub const TraceState = struct {
         return null;
     }
 
-    /// A reusable scratch slice of at least `n` `Value`s for the executor. Grows
-    /// the backing buffer to the high-water mark and reuses it; never shrinks.
-    pub fn valuesScratch(self: *TraceState, n: usize) ![]Value {
-        if (self.values_scratch.items.len < n) {
-            try self.values_scratch.resize(self.gpa, n);
+    /// A frame of the executor value scratch: where `valuesRelease` must rewind
+    /// to. Take it BEFORE the matching `valuesPush`, release it after the last
+    /// read of the pushed slice — the release ends the frame's lifetime, so a
+    /// `defer` must sit in a scope that outlives every use of the buffer, not in
+    /// the block that happens to acquire it.
+    /// A mark records the chunk and the OFFSET INTO IT, not the free slice
+    /// itself. Storing the slice looks cheaper and is wrong at the base: the
+    /// first mark of a session is taken before any chunk exists, so its free
+    /// slice is empty, and releasing to it left `values_free` empty even though
+    /// chunk 0 was by then allocated and idle. Every subsequent push then missed
+    /// the fast path and took the chunk-acquiring one — the cold path ran once
+    /// per trace entry (0.65% of scimark-fft, ~45M instructions) and the stack
+    /// ping-ponged between two chunks forever. An offset reconstructs correctly
+    /// from a base mark, because offset 0 of chunk 0 is the whole chunk.
+    pub const ValuesMark = struct { cur: u32, used: u32 };
+
+    /// Slots per scratch chunk (64 KiB at 16 B/`Value`). A frame bigger than
+    /// this gets its own exactly-sized chunk, so this is a packing knob only —
+    /// no correctness invariant rests on it, and in particular it need not track
+    /// `config.maxrecord`.
+    const values_chunk_slots: usize = 4096;
+
+    pub fn valuesMark(self: *const TraceState) ValuesMark {
+        return .{ .cur = self.values_cur, .used = self.valuesUsed() };
+    }
+
+    /// Rewind to `mark`, ending the lifetime of every frame pushed after it.
+    /// `cur` has to travel with the offset: a push that spilled into a later
+    /// chunk must hand that chunk back, or each release would strand one.
+    pub fn valuesRelease(self: *TraceState, mark: ValuesMark) void {
+        self.values_cur = mark.cur;
+        self.values_free = if (mark.cur < self.values_chunks.items.len)
+            self.values_chunks.items[mark.cur][mark.used..]
+        else
+            &.{};
+    }
+
+    /// How far into the current chunk the deepest live frame reaches. Derived
+    /// from `values_free` rather than stored, so the push fast path writes one
+    /// field instead of two.
+    fn valuesUsed(self: *const TraceState) u32 {
+        if (self.values_cur >= self.values_chunks.items.len) return 0;
+        return @intCast(self.values_chunks.items[self.values_cur].len - self.values_free.len);
+    }
+
+    /// Carve a fresh `n`-slot frame for `irinterp.execute`'s `values`. The
+    /// returned slice stays valid until the matching `valuesRelease`, INCLUDING
+    /// across nested pushes — that stability is the whole point of the segmented
+    /// backing (see `values_chunks`). Contents are undefined; the executor
+    /// writes every `Ref` it reads.
+    pub inline fn valuesPush(self: *TraceState, n: usize) ![]Value {
+        // Fits in what is left of the chunk we are already carving from. Also
+        // the `n == 0` case (a trace with no instructions), which takes nothing.
+        // Split hot/cold: this arm is taken on essentially every trace entry and
+        // wants to inline into the dispatcher, while the chunk-acquiring arm
+        // below runs a handful of times per process and carries the fallible
+        // allocation. Folding them into one body left the whole thing outlined
+        // and cost ~1% of scimark-fft in call overhead on the native path — the
+        // path that does not even use the buffer.
+        if (self.values_free.len >= n) {
+            const out = self.values_free[0..n];
+            self.values_free = self.values_free[n..];
+            return out;
         }
-        return self.values_scratch.items[0..n];
+        return self.valuesPushNewChunk(n);
+    }
+
+    fn valuesPushNewChunk(self: *TraceState, n: usize) ![]Value {
+        @branchHint(.cold);
+        // Take the NEXT chunk whole rather than straddling. By the
+        // LIFO discipline every chunk from here up holds no live frame, so an
+        // undersized one may be freed and replaced outright. Nothing below
+        // mutates `values_cur`/`values_free` until all fallible work has
+        // succeeded, so a failed push leaves the stack exactly as it found it
+        // (the callers absorb the error by declining the entry).
+        const next: u32 = if (self.values_chunks.items.len == 0) 0 else self.values_cur + 1;
+        if (next == self.values_chunks.items.len) {
+            const c = try self.gpa.alloc(Value, @max(n, values_chunk_slots));
+            errdefer self.gpa.free(c);
+            try self.values_chunks.append(self.gpa, c);
+        } else if (self.values_chunks.items[next].len < n) {
+            const c = try self.gpa.alloc(Value, n);
+            self.gpa.free(self.values_chunks.items[next]);
+            self.values_chunks.items[next] = c;
+        }
+        self.values_cur = next;
+        const chunk = self.values_chunks.items[next];
+        self.values_free = chunk[n..];
+        return chunk[0..n];
     }
 
     /// Account for a trace entry that side-exited after committing `completed`
@@ -4864,6 +4980,18 @@ pub const TraceState = struct {
                 visited[nvisited] = sct;
                 nvisited += 1;
             }
+            // One scratch frame per candidate, released before the next candidate
+            // is tried. Scoped to the whole iteration (not to the `else` arm that
+            // pushes) because `runLinkedBurst` runs under it and pushes its own
+            // frames on top; the release must outlive that nest.
+            //
+            // Comptime-elided on the native tier, which touches the executor
+            // scratch nowhere: neither this walk's `sbuf` nor `runLinkedBurst`'s
+            // `ibuf`/`cbuf` exists outside a `tier == .ir` arm. With the release
+            // gone the mark is dead and folds away with it — worth the two words
+            // of noise here because `driveChain` runs ~1M times on scimark-fft.
+            const cand_mark = self.valuesMark();
+            defer if (tier == .ir) self.valuesRelease(cand_mark);
             const is_link = sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link;
             // Loop-done chains (ir and native) only follow `.link` continuations;
             // an ordinary side trace at the post-loop PC is not a valid hand-off.
@@ -5010,7 +5138,7 @@ pub const TraceState = struct {
                     return .{ .completed = 0, .resume_pc = walk_pc };
                 }
             } else {
-                const sbuf = self.valuesScratch(sct.instrs.len) catch continue;
+                const sbuf = self.valuesPush(sct.instrs.len) catch continue;
                 if (loop_done_values) |vals| {
                     if (!irinterp.flushNumericForLoopDone(failed, regs, vals, exit_instr)) return null;
                     flushed_resume_pc = walk_pc;
@@ -6921,6 +7049,15 @@ pub const TraceState = struct {
         // it only means the observation/safepoint blackout can span 9 native inner
         // loops rather than 8 (a heuristic maximum, not a correctness contract).
         hop: while (hops < max_hops) : (hops += 1) {
+            // Every executor frame this hop pushes (call A's inner, call B's
+            // continuation) is released together at the hop boundary, so a burst
+            // that runs its full budget uses two frames, not two per hop. The
+            // mark is hop-scoped rather than per-push because call A's `ibuf`
+            // stays live until the loop-done flush far below it. Comptime-elided
+            // on the native tier for the reason given at `driveChain`'s mark:
+            // both push sites here are inside `tier == .ir` arms.
+            const hop_mark = self.valuesMark();
+            defer if (tier == .ir) self.valuesRelease(hop_mark);
             const link_term = current_link.instrs[current_link.instrs.len - 1];
             const inner_pc: u32 = @intCast(link_term.aux);
             // Call A — resolve and run this hop's inner root, classify its exit,
@@ -7091,7 +7228,7 @@ pub const TraceState = struct {
                     // (normally empty) verdict before later steering can re-enter.
                     self.settleNativeCallProvenance(&provenance, safe_to_arm);
                 } else {
-                    ibuf = self.valuesScratch(inner.instrs.len) catch break;
+                    ibuf = self.valuesPush(inner.instrs.len) catch break;
                     iresult = irinterp.execute(inner, regs, ibuf);
                 }
                 // B-iv.2 (doc 22 §B.2, codex Q2): a scalar seed decline at call A —
@@ -7325,7 +7462,7 @@ pub const TraceState = struct {
                 // `start_at_continuation` on the IR tier would silently break.
                 if (current_link.inputs.len != 0 and !self.seedForTier1a(current_link, proto))
                     return .{ .completed = linked_completed, .resume_pc = resume_pc };
-                const cbuf = self.valuesScratch(current_link.instrs.len) catch break;
+                const cbuf = self.valuesPush(current_link.instrs.len) catch break;
                 const cresult = irinterp.execute(current_link, regs, cbuf);
                 if (cresult.exit_instr == current_link.instrs.len - 1) {
                     _ = self.accountRegionProfit(

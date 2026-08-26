@@ -2,61 +2,63 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
-## Pre-existing, MEMORY-SAFETY CLASS (found 2026-08-26): two tier-1a `driveChain` paths read uninitialized state — Debug-only panics, silent UB in ReleaseFast
+## FIXED 2026-08-26 — the two `driveChain` panics were ONE bug: a use-after-free of the tier-1a executor scratch
 
-Found by running `tools/hashgate.py --lune <Debug binary>`. **The suite had never
-been run against a Debug build**, so every `std.debug.assert` and every
-`@enumFromInt` safety check in the corpus was going unexercised. Two of 84
-configurations abort; the other 82 are byte-identical to the ReleaseFast refs.
+Kept on file because the diagnosis corrected two things the original report got
+wrong, and because the follow-up below came out of it.
 
-**Verified pre-existing.** Both reproduce on a `just shadow` build of `70c5bd2`
-(before this session's five commits) with the original vendored bench files,
-`nm`-verified to lack any post-session symbol. Not introduced by the Phase C
-unwind, not by the bench checksums.
+**What it actually was.** `TraceState.values_scratch` was a single flat
+`ArrayListUnmanaged(Value)` grown with `resize`, but trace execution nests:
+`enterSelectedTrace` takes a frame for the trace it enters and keeps it live
+across `driveChain` (it is the `.ir_numeric_for_done` payload), and the
+candidate walk takes a frame of its own. A candidate longer than the entering
+trace reallocated the buffer and the dispatcher's slice became a dangling
+pointer. `flushNumericForLoopDone` then read the freed block, which produced
+*both* reported symptoms from one fault: `values[ar.a].asHeap()` tripping the
+tag assert (nsieve-bit, 38-instr entry vs 59-instr candidate), and
+`regs.set(p.aux, values[p.b])` writing a garbage tag byte that the next
+`regs.get` decoded as an invalid enum (scimark-sparse, 44 vs 57).
 
-Reproduce (Debug build, i.e. plain `zig build`), from `bench/luajit/`:
+**Both original hypotheses were wrong.** It was not "the flush walks store
+instructions past the live prefix" — the flush is correct, its memory is gone.
+And it was not Debug-only UB: the buffer moves in ReleaseFast too (measured).
+Release printed the right answer purely because the process allocator neither
+scrubs a freed block nor had reused it — stale-but-correct bytes, not benign
+garbage.
 
-```
-lune --trace nsieve-bit.lua 6
-    → value.zig:172 asHeap: assert(self.tag == .heap_ref) fails
-      irinterp.zig:278 flushNumericForLoopDone: values[ar.a].asHeap()
-      trace.zig:5015   driveChain (.ir, .ir_numeric_for_done)
-      interp.zig:2685  enterSelectedTrace
+**Fix:** the scratch is now a segmented stack (`values_chunks` + `valuesMark` /
+`valuesPush` / `valuesRelease`). Chunks are independent allocations, so growth
+never moves a live frame; frames are released LIFO, which is what makes a chunk
+at or above the cursor provably dead and safe to reallocate. Mirrors the
+discipline `interp.zig`'s register stack and `boundary_scratch` already use.
 
-lune --trace scimark-sparse.lua 3000
-    → regwindow.zig:52 get: @enumFromInt(self.tags[slot]) — invalid enum value
-      irinterp.zig:328 execute
-      trace.zig:5018   driveChain (.ir, .ir_numeric_for_done)
-      interp.zig:2685  enterSelectedTrace
-```
+**Audited alongside:** `values_scratch` was the only function in the tree
+handing out a slice into a growable `ArrayList` (`grep 'return self\..*\.items'`).
+`ledger_scratch` is a fixed-size array and every consumer re-derives its slice
+after each capture; the register lanes and `boundary_scratch` are fixed and
+documented as never reallocated.
 
-Same neighbourhood in both: `driveChain` on the **tier-1a** tier with
-`.ir_numeric_for_done` materialization, entered from `enterSelectedTrace`. One
-reads a `values[]` scratch slot the trace never wrote; the other reads a
-`RegWindow` tag slot that was never initialized.
+**Process fix, done:** `just hashgate` now has a second leg (`--also-lune`)
+running the same 84 configurations under a safety-checked Debug build. The gate
+had only ever seen ReleaseFast, which is exactly why two real bugs sat in the
+corpus. Demonstrated load-bearing: with the fix reverted, the release leg passes
+6/6 on the affected programs and the Debug leg reports the abort.
 
-**Why this is worse than a Debug-only nuisance.** In ReleaseFast the `asHeap`
-assert is compiled out, so `flushNumericForLoopDone` takes whatever bits are in
-that slot, reinterprets them as a heap pointer, and does
-`Table.fromHeader(...).array.setInLane(...)` — a **write through an
-unvalidated pointer**. It currently produces correct output on this corpus,
-which means the garbage happens to be benign here, not that the path is sound.
-That is exactly the failure mode that stays quiet until it doesn't.
+### Follow-up (general, not scheduled): the native path pushes a scratch frame it never uses
 
-Both are on `--trace`, which is one of the eight modes the determinism claim
-covers, so this is not an off-path curiosity.
-
-**Not investigated further** — found while closing the frozen-gate coverage hole
-and deliberately left for its own change rather than folded in (Rule #10).
-First questions for whoever picks it up: is the `values[]`/`RegWindow` scratch
-supposed to be fully populated at the point `driveChain` hands it to
-`flushNumericForLoopDone` / `execute`, or is the flush walking store
-instructions past the live prefix of a trace that side-exited early?
-
-**Process fix worth making at the same time:** add a Debug leg to the gate, or at
-minimum a documented `hashgate --lune zig-out/bin/lune` run after a plain
-`zig build`. Two real bugs were sitting in the corpus purely because the gate
-only ever saw ReleaseFast.
+`enterSelectedTrace` pushes an executor value frame unconditionally, but on a
+successful native entry `buf` is used by nothing — the tier-1a executor, the
+exec-log path, and the `.ir_numeric_for_done` chain are all off that road. So
+every native trace entry pays a push and a release for a buffer it does not
+touch. Measured cost of the mark/push/release discipline is ~10–55 instructions
+per trace entry: nothing on most programs (nsieve +0.002%, nsieve-bit +0.001%,
+scimark-sparse +0.007%, nbody +0.021%) but visible where entries dominate
+(scimark-fft `--jit-native` +0.43% at 1.0M entries, scimark-lu +0.59% at 2.5M).
+Making the push lazy would take that to ~zero for native-heavy programs and is a
+general win, but it restructures the hottest dispatch path for performance on
+top of a correctness change, so it was deliberately left out. Note the cost is
+*inversely* related to how much the scratch is used — tier-0 is 0.000% and
+tier-1a fft is +0.10% — which is what makes the native path the obvious target.
 
 ## DECIDED, kept on file (2026-08-26): `tostring`/`print` of a float uses shortest-round-trip where Lua uses `%.14g`
 

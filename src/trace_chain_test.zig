@@ -632,3 +632,203 @@ test "B-iv.3 (doc 22 §B.5): armNativeLink .sibling_handoff arms a seeded child 
     try testing.expect(state.armed_links.items[0].child == &child);
     try testing.expectEqual(@as(usize, 0xCAFE), parent_slots[0]);
 }
+
+// ---------------------------------------------------------------------------
+// Executor value-scratch frame stability.
+//
+// The tier-1a executor's `values` array is carved from a per-VM scratch stack
+// (`TraceState.values_chunks`). Trace execution nests — the dispatcher holds a
+// frame for the trace it entered while `driveChain` runs a candidate under it,
+// and `runLinkedBurst` runs hops under that — so an inner push MUST NOT move the
+// memory an outer frame points at.
+//
+// It used to. The scratch was one flat `ArrayListUnmanaged(Value)` grown with
+// `resize`, and a candidate longer than the entering trace reallocated it: the
+// dispatcher's slice, handed down as `driveChain`'s `.ir_numeric_for_done`
+// payload, became a dangling pointer, and `flushNumericForLoopDone` read the
+// freed block. Live on two corpus programs (`--trace nsieve-bit.lua 6`, 38-instr
+// entry vs 59-instr candidate; `--trace scimark-sparse.lua 3000`, 44 vs 57), in
+// ReleaseFast as well as Debug.
+// ---------------------------------------------------------------------------
+
+fn slicesOverlap(a: []const Value, b: []const Value) bool {
+    const a0 = @intFromPtr(a.ptr);
+    const b0 = @intFromPtr(b.ptr);
+    return a0 < b0 + b.len * @sizeOf(Value) and b0 < a0 + a.len * @sizeOf(Value);
+}
+
+test "valuesPush: a nested oversized frame leaves the frame below it intact" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    const outer_mark = state.valuesMark();
+    defer state.valuesRelease(outer_mark);
+
+    // The dispatcher's frame for the trace it entered.
+    const outer = try state.valuesPush(38);
+    for (outer, 0..) |*v, i| v.* = Value.int(@intCast(1000 + i));
+
+    // A nested frame that cannot fit beside it — the shape that used to
+    // reallocate a flat buffer out from under `outer`. Deliberately larger than
+    // one chunk so the "grow the backing" path is the one under test, not just
+    // "carve further along the same chunk".
+    const inner_mark = state.valuesMark();
+    const inner = try state.valuesPush(9000);
+    for (inner) |*v| v.* = Value.int(-1);
+
+    try testing.expect(!slicesOverlap(outer, inner));
+    for (outer, 0..) |v, i| try testing.expectEqual(@as(i64, @intCast(1000 + i)), v.asInt());
+
+    // Releasing the nested frame leaves the outer one addressable and unchanged.
+    state.valuesRelease(inner_mark);
+    for (outer, 0..) |v, i| try testing.expectEqual(@as(i64, @intCast(1000 + i)), v.asInt());
+
+    // ...and the released space is handed straight back out rather than growing
+    // the stack again (a burst re-pushes a frame per hop).
+    const chunks_before = state.values_chunks.items.len;
+    const reused = try state.valuesPush(9000);
+    try testing.expectEqual(inner.ptr, reused.ptr);
+    try testing.expectEqual(chunks_before, state.values_chunks.items.len);
+    try testing.expect(!slicesOverlap(outer, reused));
+}
+
+test "valuesPush: repeated mark/push/release from the base state reuses one chunk" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    // The dispatcher's shape: mark, push the entering trace's frame, release,
+    // once per trace entry, always from an empty stack. Every cycle after the
+    // first must be a pure fast-path carve out of the chunk already allocated.
+    // Getting this wrong is not a correctness bug — it is a silent perf cliff,
+    // and it cost ~1% of scimark-fft before the mark stored an offset instead
+    // of the free slice (the base mark's slice predates chunk 0, so releasing
+    // to it left the fast path permanently unreachable).
+    var seen: ?[*]Value = null;
+    for (0..64) |i| {
+        const mark = state.valuesMark();
+        const buf = try state.valuesPush(60);
+        if (i == 0) seen = buf.ptr else try testing.expectEqual(seen.?, buf.ptr);
+        state.valuesRelease(mark);
+    }
+    try testing.expectEqual(@as(usize, 1), state.values_chunks.items.len);
+}
+
+test "valuesPush: sibling frames that fit share a chunk and stay disjoint" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    const mark = state.valuesMark();
+    defer state.valuesRelease(mark);
+
+    const a = try state.valuesPush(38);
+    const b = try state.valuesPush(59);
+    const c = try state.valuesPush(44);
+    try testing.expectEqual(@as(usize, 1), state.values_chunks.items.len);
+    try testing.expect(!slicesOverlap(a, b));
+    try testing.expect(!slicesOverlap(b, c));
+    try testing.expect(!slicesOverlap(a, c));
+
+    // A zero-length frame is legal (a trace with no instructions) and consumes
+    // nothing, so it can never push a sibling into a fresh chunk.
+    const free_before = state.values_free;
+    const empty = try state.valuesPush(0);
+    try testing.expectEqual(@as(usize, 0), empty.len);
+    try testing.expectEqual(free_before.len, state.values_free.len);
+    try testing.expectEqual(free_before.ptr, state.values_free.ptr);
+}
+
+test "driveChain ir_numeric_for_done: a longer candidate cannot invalidate the caller's values" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    // Bytecode: pc 0 is the `for_loop` that owns the loop-done guard, so the
+    // guard's recorded `aux` (its post-increment exit PC) is 1 — which is also
+    // where the `.link` continuation is anchored. `flushNumericForLoopDone`
+    // validates exactly this shape before it commits anything.
+    const code = [_]Instr{
+        .{ .op = .for_loop, .a = 0, .b = 0, .c = 0 },
+        .{ .op = .ret, .a = 0, .b = 0, .c = 0 },
+    };
+    const proto = Proto{ .code = @constCast(&code), .name = "t", .num_registers = 4 };
+
+    // The trace that side-exited: anchored away from the exit PC so the walk
+    // looks at pc 1, with a loop-done `guard_true` at index 1 and a φ that
+    // writes back to r2. That φ writeback is the observable: it reads
+    // `values[0]` out of the caller-owned frame, which is precisely the slice
+    // the old flat scratch used to free.
+    var entry_f = [_]u16{0};
+    const instrs_f = [_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0
+        .{ .op = .guard_true, .a = 0, .aux = 1 }, // %1: loop-done guard, exit pc 1
+        .{ .op = .phi, .a = 0, .b = 0, .aux = 2, .ty = .int }, // %2: r2 ← %0
+        .{ .op = .loop }, // %3
+    };
+    var failed = Trace{
+        .anchor = .{ .proto = &proto, .pc = 10 },
+        .instrs = @constCast(&instrs_f),
+        .consts = &.{},
+        .entry_slots = &entry_f,
+        .entry_guards = &.{},
+    };
+
+    // The continuation at pc 1: `.link`-terminated (the only shape a loop-done
+    // chain will follow) and far longer than `failed`, so serving it forces the
+    // scratch to grow. Its first guard fails immediately, so nothing downstream
+    // of the flush runs and the drive returns the flushed resume PC.
+    var entry_c = [_]u16{1};
+    var instrs_c: [200]IrInstr = undefined;
+    instrs_c[0] = .{ .op = .slot_load, .aux = 1 }; // %0: r1, which holds nil
+    instrs_c[1] = .{ .op = .guard_int, .a = 0, .aux = 1 }; // %1: fails at once
+    for (instrs_c[2 .. instrs_c.len - 1]) |*p| p.* = .{ .op = .loop }; // never reached
+    instrs_c[instrs_c.len - 1] = .{ .op = .link, .aux = 1 };
+    var cont = Trace{
+        .anchor = .{ .proto = &proto, .pc = 1 },
+        .instrs = &instrs_c,
+        .consts = &.{},
+        .entry_slots = &entry_c,
+        .entry_guards = &.{},
+    };
+    try testing.expect(cont.instrs.len > failed.instrs.len);
+
+    try state.cache.append(gpa, &failed);
+    try state.cache.append(gpa, &cont);
+
+    // The caller's frame, exactly as `enterSelectedTrace` takes it: sized for
+    // the trace that ran, and still live while the chain drive runs beneath it.
+    const mark = state.valuesMark();
+    defer state.valuesRelease(mark);
+    const vals = try state.valuesPush(failed.instrs.len);
+    const sentinel: i64 = 0x5EED_5EED;
+    for (vals) |*v| v.* = Value.int(sentinel);
+
+    var regs = [_]Value{ Value.int(0), Value.nil(), Value.int(0), Value.int(0) };
+    var tr_regs = TestRegs{ .regs = &regs };
+    const chained = state.driveChain(
+        &failed,
+        .{ .completed = 0, .exit_instr = 1 },
+        &proto,
+        tr_regs.view(),
+        .ir,
+        .{ .ir_numeric_for_done = vals },
+        &.{},
+        false,
+    );
+
+    // The flush ran (that is what a non-null result with the continuation's PC
+    // means) and wrote `values[0]` into r2. Read the raw lanes rather than
+    // decoding a `Value`: when this regression is live the slot holds freed
+    // memory, and asserting on a decoded tag would panic instead of failing.
+    try testing.expect(chained != null);
+    try testing.expectEqual(@as(?u32, 1), chained.?.resume_pc);
+    try testing.expectEqual(@intFromEnum(value.Tag.int), tr_regs.tags[2]);
+    try testing.expectEqual(@as(u64, @bitCast(sentinel)), tr_regs.pays[2]);
+
+    // And the caller's frame is still its own memory afterwards.
+    for (vals) |v| try testing.expectEqual(sentinel, v.asInt());
+
+    state.cache.clearRetainingCapacity();
+}

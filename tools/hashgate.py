@@ -14,6 +14,7 @@ This script is that half.
     tools/hashgate.py                  # gate: re-run and diff vs the refs
     tools/hashgate.py --generate       # regenerate refs from the current binary
     tools/hashgate.py --filter nbody   # subset, same name matching as run.py
+    tools/hashgate.py --also-lune B    # gate binary B against the same refs too
 
 Refs live in `bench/refs/output-hashes.tsv`, one row per (program, mode):
 
@@ -51,7 +52,21 @@ verifiably match LuaJIT bit-for-bit.
 a live tripwire, so that a benchmark added later with no output cannot silently
 recreate this.
 
+WHY `--also-lune` EXISTS (added 2026-08-26). The gate had only ever run a
+ReleaseFast binary, where `std.debug.assert` and the `@enumFromInt` safety check
+compile to nothing. Every such check in all 84 configurations was therefore going
+unexercised, and two real memory-safety bugs sat in the corpus undetected: a
+use-after-free of the tier-1a executor's value scratch, reached from `driveChain`
+by `--trace nsieve-bit.lua 6` and `--trace scimark-sparse.lua 3000`, which
+ReleaseFast survived only because the freed block still held its old contents.
+Passing a safety-checked build via `--also-lune` runs the identical corpus with
+those checks live and gates it against the SAME refs — the two binaries must
+agree, which is the determinism claim applied across optimization modes. Digests
+are always generated from `--lune` (the release binary the refs describe); the
+extra binaries are verified against them, never used to write them.
+
 Assumes lune is built:  zig build -Doptimize=ReleaseFast  (or pass --lune).
+`just hashgate` builds and passes both legs.
 """
 
 import argparse
@@ -118,36 +133,21 @@ def write_refs(path, rows, lune):
             fh.write(f"{name}\t{mode}\t{argv}\t{rc}\t{digest}\n")
 
 
-def main():
-    ap = argparse.ArgumentParser(description="lune frozen-output gate")
-    ap.add_argument("--generate", action="store_true",
-                    help="regenerate the reference digests instead of gating")
-    ap.add_argument("--filter", default="", help="only programs whose name contains this")
-    ap.add_argument("--refs", default=DEFAULT_REFS)
-    ap.add_argument("--lune", default=os.environ.get("LUNE", DEFAULT_LUNE))
-    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) // 2),
-                    help="parallel program runs (timing is never measured here)")
-    args = ap.parse_args()
+def observe(lune, benches, jobs_n, reps):
+    """Run every (program, mode) under one binary.
 
-    if not os.path.exists(args.lune):
-        sys.exit(f"lune binary not found at {args.lune}\n"
-                 f"  build it: zig build -Doptimize=ReleaseFast")
-
-    benches = BR.discover(args.filter, 1.0)
-    if not benches:
-        sys.exit("no @bench programs found")
-
+    Returns (observed, unstable, errored). `unstable` is only ever populated
+    when reps > 1 — a program whose own output varies run to run cannot be a
+    reference, and is worth catching there rather than as a mystery mismatch.
+    """
     jobs = [(b, mode, flags) for b in benches for mode, flags in BR.TIERS.items()]
-    reps = 2 if args.generate else 1
 
     def work(job):
         b, mode, flags = job
-        results = [run_digest(args.lune, b, flags) for _ in range(reps)]
-        return job, results
+        return job, [run_digest(lune, b, flags) for _ in range(reps)]
 
-    observed = {}
-    unstable, errored = [], []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+    observed, unstable, errored = {}, [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs_n) as pool:
         for (b, mode, _), results in pool.map(work, jobs):
             rc, digest, err = results[0]
             if rc != 0:
@@ -155,6 +155,67 @@ def main():
             if any((r[0], r[1]) != (rc, digest) for r in results[1:]):
                 unstable.append((b.name, mode))
             observed[(b.name, mode)] = (" ".join(b.argv), rc, digest)
+    return observed, unstable, errored
+
+
+def gate(observed, refs, label, allow_missing):
+    """Diff one binary's observations against the refs. Returns (ok, checked)."""
+    mismatched, missing, extra = [], [], []
+    for key, (argv, rc, digest) in sorted(observed.items()):
+        if key not in refs:
+            extra.append(key)
+            continue
+        ref_argv, ref_rc, ref_digest = refs[key]
+        if (argv, rc, digest) != (ref_argv, ref_rc, ref_digest):
+            mismatched.append((key, (ref_argv, ref_rc, ref_digest), (argv, rc, digest)))
+    if not allow_missing:
+        missing = [k for k in refs if k not in observed]
+
+    for (name, mode), want, got in mismatched:
+        print(f"MISMATCH {name} [{mode}] ({label})")
+        print(f"    ref  argv={want[0]!r} rc={want[1]} {want[2]}")
+        print(f"    got  argv={got[0]!r} rc={got[1]} {got[2]}")
+    for name, mode in sorted(extra):
+        print(f"NO REF   {name} [{mode}] — new program? re-run with --generate")
+    for name, mode in sorted(missing):
+        print(f"MISSING  {name} [{mode}] — program disappeared from the corpus")
+
+    checked = len(observed) - len(extra)
+    if mismatched or extra or missing:
+        print(f"\nhashgate FAILED ({label}): {len(mismatched)} mismatched, "
+              f"{len(extra)} unreferenced, {len(missing)} missing "
+              f"({checked} checked)")
+        return False, checked
+    return True, checked
+
+
+def main():
+    ap = argparse.ArgumentParser(description="lune frozen-output gate")
+    ap.add_argument("--generate", action="store_true",
+                    help="regenerate the reference digests instead of gating")
+    ap.add_argument("--filter", default="", help="only programs whose name contains this")
+    ap.add_argument("--refs", default=DEFAULT_REFS)
+    ap.add_argument("--lune", default=os.environ.get("LUNE", DEFAULT_LUNE))
+    ap.add_argument("--also-lune", action="append", default=[], metavar="BIN",
+                    help="additional binary to gate against the same refs "
+                         "(repeatable; use it for a safety-checked Debug build)")
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) // 2),
+                    help="parallel program runs (timing is never measured here)")
+    args = ap.parse_args()
+
+    # Absolute, because every child runs with cwd set to its own bench directory.
+    lune = os.path.abspath(args.lune)
+    also = [os.path.abspath(p) for p in args.also_lune]
+    for path in [lune, *also]:
+        if not os.path.exists(path):
+            sys.exit(f"lune binary not found at {path}\n"
+                     f"  build it: zig build -Doptimize=ReleaseFast")
+
+    benches = BR.discover(args.filter, 1.0)
+    if not benches:
+        sys.exit("no @bench programs found")
+
+    observed, unstable, errored = observe(lune, benches, args.jobs, 2 if args.generate else 1)
 
     if errored:
         print("programs exiting non-zero (recorded, but check these are intentional):")
@@ -170,43 +231,42 @@ def main():
     if args.generate:
         rows = [(name, mode, *observed[(name, mode)])
                 for name, mode in sorted(observed, key=lambda k: (k[0], k[1]))]
-        write_refs(args.refs, rows, args.lune)
+        write_refs(args.refs, rows, lune)
         print(f"wrote {len(rows)} digests to {os.path.relpath(args.refs, ROOT)}")
-        return 0
+        # Fall through: an `--also-lune` binary is verified against the refs we
+        # just wrote, so generating and cross-checking is one command.
+        if not also:
+            return 0
 
     refs = read_refs(args.refs)
     if not refs:
         sys.exit(f"no references at {args.refs} — generate them first:\n"
                  f"  tools/hashgate.py --generate")
 
-    mismatched, missing, extra = [], [], []
-    for key, (argv, rc, digest) in sorted(observed.items()):
-        if key not in refs:
-            extra.append(key)
-            continue
-        ref_argv, ref_rc, ref_digest = refs[key]
-        if (argv, rc, digest) != (ref_argv, ref_rc, ref_digest):
-            mismatched.append((key, (ref_argv, ref_rc, ref_digest), (argv, rc, digest)))
-    if not args.filter:
-        missing = [k for k in refs if k not in observed]
+    ok = True
+    if not args.generate:
+        ok, checked = gate(observed, refs, os.path.relpath(lune, ROOT), bool(args.filter))
+        if ok:
+            print(f"hashgate ok: {checked} digests match "
+                  f"({len(benches)} programs x {len(BR.TIERS)} modes) "
+                  f"[{os.path.relpath(lune, ROOT)}]")
 
-    for (name, mode), want, got in mismatched:
-        print(f"MISMATCH {name} [{mode}]")
-        print(f"    ref  argv={want[0]!r} rc={want[1]} {want[2]}")
-        print(f"    got  argv={got[0]!r} rc={got[1]} {got[2]}")
-    for name, mode in sorted(extra):
-        print(f"NO REF   {name} [{mode}] — new program? re-run with --generate")
-    for name, mode in sorted(missing):
-        print(f"MISSING  {name} [{mode}] — program disappeared from the corpus")
+    for path in also:
+        label = os.path.relpath(path, ROOT)
+        obs, _, errs = observe(path, benches, args.jobs, 1)
+        # A safety-checked build ABORTING is the whole point of this leg, and it
+        # shows up as a non-zero rc against a ref that expects 0 — so surface the
+        # panic text rather than leaving a bare digest mismatch to interpret.
+        for name, mode, rc, err in sorted(errs):
+            if refs.get((name, mode), (None, 0, None))[1] != rc:
+                print(f"ABORT    {name} [{mode}] ({label}) rc={rc}  {err}")
+        leg_ok, checked = gate(obs, refs, label, bool(args.filter))
+        ok = ok and leg_ok
+        if leg_ok:
+            print(f"hashgate ok: {checked} digests match [{label}]")
 
-    checked = len(observed) - len(extra)
-    if mismatched or extra or missing:
-        print(f"\nhashgate FAILED: {len(mismatched)} mismatched, "
-              f"{len(extra)} unreferenced, {len(missing)} missing "
-              f"({checked} checked)")
+    if not ok:
         return 1
-    print(f"hashgate ok: {checked} digests match "
-          f"({len(benches)} programs x {len(BR.TIERS)} modes)")
     report_coverage(observed)
     return 0
 

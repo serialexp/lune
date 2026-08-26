@@ -38,9 +38,18 @@ bench *args: release
 # in bench/refs/. This is the half `bench/run.py` cannot do — it proves the tiers
 # agree with each OTHER, which a change that moves all three identically still
 # passes. Builds ReleaseFast first because the refs were generated that way.
+#
+# TWO LEGS. The corpus is run under the ReleaseFast binary the refs describe AND
+# under a safety-checked Debug build (installed to its own prefix, since both
+# would otherwise be zig-out/bin/lune). The Debug leg is not redundant: it is the
+# only thing that exercises `std.debug.assert` and the `@enumFromInt` safety
+# check across all 84 configurations, and it is what finally caught two
+# memory-safety bugs that ReleaseFast had been sailing through. Both legs gate
+# against the same refs — they must agree.
 # Regenerate deliberately (and say why in the commit): just hashgate --generate
 hashgate *args: release
-    python3 tools/hashgate.py {{args}}
+    zig build --prefix zig-out-debug
+    python3 tools/hashgate.py --also-lune zig-out-debug/bin/lune {{args}}
 
 # Copy this tree to DEST for an A/B shadow build (baseline binaries), stripping
 # .zig-cache/zig-out so the shadow build can never reuse THIS tree's artifacts.

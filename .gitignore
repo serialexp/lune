@@ -1,6 +1,9 @@
 # Zig build artifacts
 .zig-cache/
 zig-out/
+# `just hashgate`'s safety-checked leg installs here so the Debug and
+# ReleaseFast binaries can coexist (both would otherwise be zig-out/bin/lune).
+zig-out-debug/
 
 # viz (Phase 7 visualiser) — Bun + Vite + SolidJS
 viz/node_modules/

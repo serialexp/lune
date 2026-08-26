@@ -2241,7 +2241,18 @@ pub const Vm = struct {
             regs
         else
             self.seedTraceInputs(ct, base, closure, proto, regs, &native_eligible) orelse return .next_candidate;
-        if (self.trace.valuesScratch(ct.instrs.len)) |buf| {
+        // The entering trace's executor frame. It must stay valid for the whole
+        // block — `driveChain` is handed this exact slice as the
+        // `.ir_numeric_for_done` payload and pushes frames of its own on top —
+        // so the release is scoped to the block, not to the `execute` call.
+        // The `defer` sits INSIDE the block on purpose: only that arm pushed, so
+        // only that arm owes a release, and keeping it out of function scope
+        // keeps the release off the return paths that precede the push. (Not
+        // cosmetic — at function scope it cost ~50 instructions per trace entry,
+        // 0.86% of scimark-fft, which runs a million of them.)
+        const values_mark = self.trace.valuesMark();
+        if (self.trace.valuesPush(ct.instrs.len)) |buf| {
+            defer self.trace.valuesRelease(values_mark);
             self.trace.entries +%= 1;
             // JIT coverage time attribution (gated): open the
             // trace-exec region. `last_hop_tsc` marks the first
