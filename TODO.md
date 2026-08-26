@@ -44,21 +44,21 @@ had only ever seen ReleaseFast, which is exactly why two real bugs sat in the
 corpus. Demonstrated load-bearing: with the fix reverted, the release leg passes
 6/6 on the affected programs and the Debug leg reports the abort.
 
-### Follow-up (general, not scheduled): the native path pushes a scratch frame it never uses
+### Follow-up DONE (2026-08-27): the native path no longer pushes a scratch frame it never uses
 
-`enterSelectedTrace` pushes an executor value frame unconditionally, but on a
-successful native entry `buf` is used by nothing — the tier-1a executor, the
-exec-log path, and the `.ir_numeric_for_done` chain are all off that road. So
-every native trace entry pays a push and a release for a buffer it does not
-touch. Measured cost of the mark/push/release discipline is ~10–55 instructions
-per trace entry: nothing on most programs (nsieve +0.002%, nsieve-bit +0.001%,
-scimark-sparse +0.007%, nbody +0.021%) but visible where entries dominate
-(scimark-fft `--jit-native` +0.43% at 1.0M entries, scimark-lu +0.59% at 2.5M).
-Making the push lazy would take that to ~zero for native-heavy programs and is a
-general win, but it restructures the hottest dispatch path for performance on
-top of a correctness change, so it was deliberately left out. Note the cost is
-*inversely* related to how much the scratch is used — tier-0 is 0.000% and
-tier-1a fft is +0.10% — which is what makes the native path the obvious target.
+`enterSelectedTrace` used to push the executor value frame unconditionally, but
+on a successful native entry `buf` was used by nothing — the tier-1a executor,
+the exec-log path, and the `.ir_numeric_for_done` chain are all off that road,
+so native paid the most for the discipline while using it least (inverse to
+actual use: tier-0 0.000%, tier-1a fft +0.10%, native fft +0.43%). Now the push
+happens only when `native_page == null` (which also covers exec-log — it forces
+the page null), the release is deferred on a `buf_live` flag, and the one
+native road back onto the executor — the seed-hash-decline downgrade — re-pushes
+at its tier-1a rerun site. Measured by instruction count (3 reps, medians):
+scimark-fft `--jit-native` −0.523%, scimark-lu −0.433%, tier-1a fft and tier-0
+unchanged, nsieve −0.002%. The decline-site re-push is pinned by the B-v
+decline-determinism e2e test (mutation-verified: dropping the re-push crashes
+exactly the two hash-drift tests on the executor's entry assert).
 
 ## DECIDED, kept on file (2026-08-26): `tostring`/`print` of a float uses shortest-round-trip where Lua uses `%.14g`
 

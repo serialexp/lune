@@ -16,6 +16,36 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-27 (LATEST-83) — **the native path's dead executor-frame push is now lazy: LATEST-82's residual cost repaid with interest (fft-native −0.52%, lu-native −0.43% by instruction count).**
+
+The LATEST-82 follow-up, done. `enterSelectedTrace` pushed the tier-1a executor
+frame unconditionally, but every `buf` consumer (executor, exec-log,
+`.ir_numeric_for_done`) is off the successful-native road — native paid the most
+while using it least. Now: push only when `native_page == null` (covers exec-log,
+which forces the page null); release deferred on a `buf_live` flag; the one
+native road back to the executor — the seed-hash-decline tier-1a rerun — takes a
+fresh mark and re-pushes at its own site (fresh is correct: the burst machinery's
+pushes above it are all released by then).
+
+**Measured (3 reps, medians, `perf stat -e instructions:u`; base = 31ff9db built
+in a `just shadow` copy with `src/interp.zig` restored from HEAD, grep-verified):**
+fft-native −0.523% (spread 0.02/0.06%), lu-native −0.433% (0.38/0.20%), fft
+tier-1a −0.088% (within its 0.26–0.28% spread → unchanged), tier-0 +0.000%,
+nsieve-native −0.002%. Better than LATEST-82's +0.43/+0.59 cost because the lazy
+path also skips the mark, not just push/release.
+
+**Verified beyond the gates:** outputs byte-identical old-vs-new across t0 /
+`--trace` / `--jit-native` on fft, lu, nsieve (scimark run from `bench/luajit/`
+cwd — the first equivalence sweep silently compared module-not-found error text,
+caught by ~650k-instruction counts where billions were expected); `--jit-stats`
+byte-identical (same JIT behaviour). The decline-site re-push is exercised by the
+B-v decline-determinism e2e test and is load-bearing: mutating the re-push away
+crashes exactly the two hash-drift tests on the executor entry assert.
+
+Gates: `just test` + `-Djit-debug=true` OK, `just hashgate` 84/84 on both legs,
+`just bench` 28/28 cross=ok (board 20260827-082328-31ff9db.tsv; lua54's
+`luajit=skip` is its permanent state, not a regression).
+
 ## Status 2026-08-26 (LATEST-82) — **the two `driveChain` panics were ONE bug: a use-after-free of the tier-1a executor scratch. Fixed with a segmented scratch stack; the gate gains a safety-checked leg. Board neutral except where trace entries dominate.**
 
 **Root cause, proven not inferred.** `TraceState.values_scratch` was one flat

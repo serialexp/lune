@@ -2241,18 +2241,37 @@ pub const Vm = struct {
             regs
         else
             self.seedTraceInputs(ct, base, closure, proto, regs, &native_eligible) orelse return .next_candidate;
-        // The entering trace's executor frame. It must stay valid for the whole
-        // block — `driveChain` is handed this exact slice as the
-        // `.ir_numeric_for_done` payload and pushes frames of its own on top —
-        // so the release is scoped to the block, not to the `execute` call.
-        // The `defer` sits INSIDE the block on purpose: only that arm pushed, so
-        // only that arm owes a release, and keeping it out of function scope
-        // keeps the release off the return paths that precede the push. (Not
-        // cosmetic — at function scope it cost ~50 instructions per trace entry,
-        // 0.86% of scimark-fft, which runs a million of them.)
-        const values_mark = self.trace.valuesMark();
-        if (self.trace.valuesPush(ct.instrs.len)) |buf| {
-            defer self.trace.valuesRelease(values_mark);
+        // The entering trace's executor frame — pushed ONLY when the tier-1a
+        // executor can actually run, i.e. no native page resolved
+        // (`native_page == null` also covers exec-log, which forces the page
+        // null above). A successful native entry touches the scratch nowhere:
+        // not the executor, not the exec-log path, not the
+        // `.ir_numeric_for_done` chain — every `buf` consumer below sits on a
+        // road native cannot reach. Yet the unconditional push made the native
+        // path pay the most for the discipline while using it least (+0.43%
+        // scimark-fft, +0.59% scimark-lu by instruction count, at 1.0M/2.5M
+        // entries). The one native road BACK onto the executor — the
+        // seed-hash-decline downgrade — re-pushes at its rerun site below.
+        //
+        // The frame must stay valid for the whole block: `driveChain` is
+        // handed this exact slice as the `.ir_numeric_for_done` payload and
+        // pushes frames of its own on top, so the release is deferred on
+        // `buf_live` rather than scoped to the `execute` call. The flag (not
+        // the block structure, as before) is now what keeps the release off
+        // the paths that never pushed — including every native return.
+        // `values_mark` is taken only alongside a push; it is `undefined`
+        // otherwise and the flag guard is what makes that sound.
+        var values_mark: trace.TraceState.ValuesMark = undefined;
+        var buf: []Value = &.{};
+        var buf_live = false;
+        if (native_page == null) {
+            values_mark = self.trace.valuesMark();
+            buf = self.trace.valuesPush(ct.instrs.len) catch
+                return .next_candidate; // OOM: skip this trace, try next
+            buf_live = true;
+        }
+        {
+            defer if (buf_live) self.trace.valuesRelease(values_mark);
             self.trace.entries +%= 1;
             // JIT coverage time attribution (gated): open the
             // trace-exec region. `last_hop_tsc` marks the first
@@ -2383,6 +2402,17 @@ pub const Vm = struct {
                 self.trace.dbg("seed-hash-decline: trace={d} anchor={d} -> tier-1a rerun", .{ ct.id, ct.anchor.pc });
                 self.trace.seed_hash_declines +|= 1;
                 trace_regs = self.seedTraceInputs(ct, base, closure, proto, regs, &native_eligible) orelse return .next_candidate;
+                // The downgrade is the one native road back onto the tier-1a
+                // executor, and native entries skip the entry push above — so
+                // take the frame here. The mark is fresh, not the entry's:
+                // `values_mark` is `undefined` on this path, and retaking it is
+                // also correct in itself (everything the native run's burst
+                // machinery pushed above was released before we got here, so
+                // the stack is back at its entry state).
+                values_mark = self.trace.valuesMark();
+                buf = self.trace.valuesPush(ct.instrs.len) catch
+                    return .next_candidate; // OOM: same skip as the entry push
+                buf_live = true;
                 result = irinterp.execute(ct, trace_regs, buf);
                 ran_native = false;
                 ran_native_link_mode = false;
@@ -2828,7 +2858,7 @@ pub const Vm = struct {
                     return .{ .resume_tier0 = pc };
                 }
             }
-        } else |_| {} // OOM: skip this trace, try next
+        }
         return .next_candidate;
     }
 
