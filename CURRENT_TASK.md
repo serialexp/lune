@@ -4702,4 +4702,15 @@ materialization, S3 prologue-fail split, slot-identity collision decision).
 master is well ahead of origin/master; do NOT push without Bart's say-so.
 
 ## Untracked files that belong to OTHER agents — do NOT stage
-`CURRENT_TASK_E3.md`, `bench/results/*.tsv`, and similar.
+`CURRENT_TASK_E3.md` and similar scratch files.
+
+**`bench/results/*.tsv` is NOT in that category** (corrected 2026-08-26). This
+note used to list it, which read as "never commit these" and was wrong:
+`bench/README.md` is explicit that the snapshots ARE committed — they are the
+suite's history, and `latest.tsv` is the only git-ignored one. What the note
+meant was "not *yet*": don't sweep up a board another agent is mid-run on.
+
+So the rule is per-file, not per-glob — stage the snapshots YOUR session
+produced (match the timestamp to your own `just bench` runs) and leave the rest.
+That distinction had not been drawn since 2026-08-14, which is how 23 boards
+piled up untracked; they need an owner to claim them or a deliberate sweep.
