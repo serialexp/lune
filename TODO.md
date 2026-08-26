@@ -58,13 +58,60 @@ minimum a documented `hashgate --lune zig-out/bin/lune` run after a plain
 `zig build`. Two real bugs were sitting in the corpus purely because the gate
 only ever saw ReleaseFast.
 
-## Pre-existing (found 2026-08-26): `string.format` cannot render more digits than a double's shortest round-trip form
+## Pre-existing (found 2026-08-26): `string.format` rounds floats from the shortest repr, and rounds ties the wrong way
 
-Found while closing the frozen-gate coverage hole; **not** caused by it. lune's
-`string.format` honours the *width* of a float conversion but not its
-*precision* beyond the shortest round-trippable digit string — it emits that
-prefix and then zero-pads, so the digits past it are wrong rather than merely
-truncated.
+> **CORRECTION (2026-08-26, same day).** This entry originally said the bug only
+> bites when the requested precision exceeds the shortest round-trip length, and
+> that "defaults (`%g` → 6, `%f` → 6) are unaffected". **That is wrong**, and it
+> is wrong in the dangerous direction — it invites the conclusion that a
+> "reasonable" precision like 2 or 6 decimals is safe. Measured against LuaJIT
+> over 1.2M formats: `%.2f` diverges on **3.8%** of values overall, and on
+> **5.0%** of thousandths (`i/1000`) and **18.0%** of `i*0.005`. `%.6f` diverged
+> once in 1.2M. **Low precision is the dangerous case, not high.** The original
+> high-precision table is kept below as one *symptom*; the two real causes are
+> stated first.
+
+Found while closing the frozen-gate coverage hole; **not** caused by it.
+
+**Two independent defects, both in one 25-line function** — `round()` in the
+pinned toolchain's `lib/std/fmt/float.zig:137`, which every lune float
+conversion reaches via `std.fmt.float.render` (`src/stdlib/string.zig:733`
+for `%f`, `renderEng` for `%e`, `renderG` for `%g`):
+
+1. **Double rounding.** `round()` takes `f.mantissa` — the *Ryu shortest*
+   decimal produced by Step 4 of the algorithm — and rounds *that*, never the
+   exact binary value. C rounds the exact value. So `2.675` (whose double is
+   exactly `2.674999999999999822...`) renders as `2.68` in lune and `2.67` in
+   C: lune sees the shortest form "2.675" and rounds it up.
+2. **Wrong tie-break.** The test is `if (output % 10 >= 5)` — round-half-away-
+   from-zero. C/IEEE use round-half-to-**even**. So `%.0f` of `2.5` is `3` in
+   lune and `2` in C, and `%.2f` of `0.125` (exactly representable, a true tie)
+   is `0.13` vs `0.12`. Note this one is *not* a consequence of (1) and would
+   survive a fix that only made the input exact.
+
+Both are structural: `round()` discards digits with repeated `/10` without
+tracking whether what it dropped was nonzero, so it cannot implement half-even
+correctly even in principle from the input it is given.
+
+Measured divergence vs LuaJIT, 200k values x 6 generators (`/tmp` sweep,
+reproduce with `%.Nf` over `i/1000`, `i*0.005`, `sqrt(i)`, `i/7`, `i/97`, `1/i`):
+
+| generator | `%.0f` | `%.1f` | `%.2f` | `%.6f` |
+|---|---|---|---|---|
+| `i/1000`  | 0.050% | 0.500% | **5.000%** | 0.000% |
+| `i*0.005` | 0.250% | 1.569% | **18.032%** | 0.000% |
+| `1/i`     | 0.001% | 0.001% | 0.001% | 0.001% |
+| `i/7`, `i/97`, `sqrt(i)` | 0.000% | 0.000% | 0.000% | 0.000% |
+
+Read the shape, not just the peak: divergence is **concentrated exactly on
+human-decimal quantities** and is ~zero on irrational-ish ones. Values that are
+"nice" in decimal are the ones that land on rounding boundaries — and they are
+also the entire population of things real code calls `%.2f` on (money,
+percentages, measurements). This is not a tail case; it is the main case for
+that conversion.
+
+The high-precision symptom, from the original entry — same root cause (1),
+just visible without needing a boundary:
 
 | expression | lune | LuaJIT / C |
 |---|---|---|
@@ -74,23 +121,29 @@ truncated.
 | `%.25f` of `0.1` | `0.1000000000000000000000000` | `0.1000000000000000055511151` |
 | `%.17e` of `1/3` | `3.33333333333333300e-01` | `3.33333333333333315e-01` |
 
-Affects `%f`/`%F`/`%e`/`%E`/`%g`/`%G` whenever the requested precision exceeds
-the shortest round-trip length. Defaults (`%g` → 6, `%f` → 6) are unaffected,
-which is why nothing noticed: `%.17g`-style calls are rare outside numeric
-debugging and cross-implementation comparison.
+Affects `%f`/`%F`/`%e`/`%E`/`%g`/`%G` at **every** precision.
 
-**Root cause is not in our code.** `src/stdlib/string.zig`'s `renderG` /
-`renderEng` / the `%f` arm all delegate to `std.fmt.float.render`, and the
-pinned toolchain's implementation is Ryu **shortest** (`lib/std/fmt/float.zig`,
-"Step 4: Find the shortest decimal representation…"), then rounds/pads to the
-requested precision. It structurally cannot produce a double's exact decimal
-expansion, and the stdlib offers no fixed-precision alternative.
+**What is NOT affected — checked, because it is the invariant that matters.**
+This is a *Lua-fidelity* bug, not a determinism bug. The renderer is a pure
+deterministic function of the double's bits and every tier calls the same one,
+so the 8-mode byte-identity claim is untouched: the 1.2M-format sweep above
+hashes identically under t0, `--trace`, and `--jit-native`. Nothing here can
+make a trace disagree with the interpreter. It makes *lune* disagree with *C*.
+
+**Root cause is not in our code**, but it is ours to fix — the pinned
+toolchain's renderer is Ryu **shortest** (`lib/std/fmt/float.zig`, "Step 4:
+Find the shortest decimal representation…") and the stdlib offers no
+fixed-precision alternative, so we cannot get exact behaviour by calling it
+differently.
 
 **Fixing it means implementing exact fixed-precision decimal conversion
-ourselves** — big-integer or an exact-fixed Ryu/Grisu path — plus a differential
-test against C `printf` across the hard cases. Self-contained but not small.
-Per Rule Z-2 it belongs behind the `src/stdlib/string.zig` wrapper, not
-scattered.
+ourselves** — big-integer or an exact-fixed Ryu/Grisu path, with half-even
+ties — plus a differential test against C `printf` across the hard cases
+(`2.675`, `1.005`, `0.15`, `0.125`, `5e-7`, `%.0f` of `0.5`/`1.5`/`2.5`).
+Self-contained but not small. Per Rule Z-2 it belongs behind the
+`src/stdlib/string.zig` wrapper, not scattered. Defect (2) — the `>= 5`
+tie-break — is *much* cheaper than (1) and could land alone, but note it only
+fixes exactly-representable ties; the `2.675` class needs (1).
 
 Bart's call (2026-08-26): record it, don't fix it now. Consequence to know: the
 benchmark result checksums (`bench/luajit/scimark_lib.lua`, `array3d.lua`) are
@@ -102,6 +155,33 @@ gets fixed, those folds could be simplified.
 If it is picked up, `docs/lua-stdlib-inventory.csv:42` should probably move
 `string.format` from `implemented` to `partial` (Rule Z-5) — deliberately left
 alone for now, since this change touched no stdlib code.
+
+## QUESTION FOR BART (found 2026-08-26): `tostring`/`print` of a float uses shortest-round-trip, Lua uses `%.14g`
+
+Separate from the `string.format` bug above and possibly *deliberate* — flagged
+rather than filed as a defect, since lune is Lua-**shaped**, not Lua-compatible,
+and no design doc records a decision either way.
+
+| expression | lune | Lua 5.4 / LuaJIT |
+|---|---|---|
+| `print(1/3)` | `0.3333333333333333` | `0.33333333333333` |
+| `print(0.1+0.2)` | `0.30000000000000004` | `0.3` |
+| `print(5e-7)` | `0.0000005` | `5e-07` |
+| `print(1e100)` | `1` + 100 zeros | `1e+100` |
+| `print(2^53)` | `9007199254740992` | `9.007199254741e+15` |
+
+Reference Lua renders with `LUAI_NUMFFORMAT` = `"%.14g"`: 14 significant digits
+and a switch to exponent form outside a magnitude band. lune renders the
+shortest string that round-trips, always in positional form.
+
+Arguments both ways, so this is a call not a bug report: shortest-round-trip is
+lossless and is what JS/Python/Rust do, and `%.14g` silently hides the
+`0.1+0.2` result — but `print(1e100)` emitting 101 characters is bad, and the
+divergence means **no benchmark can ever `print` a bare float and claim
+`luajit=compatible`**. That constraint is currently absorbed by the bench
+convention "accumulate an *integer* checksum" (`bench/README.md`) — which reads
+as folklore ("float checksums diverge for non-obvious reasons") when in fact
+this is the reason. If the shortest form is deliberate, that line should say so.
 
 ## Weak-but-nonzero bench output coverage (noted 2026-08-26)
 
