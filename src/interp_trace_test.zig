@@ -491,9 +491,11 @@ test "doc 24 c4: gc_stress forces allocating traces back to tier-0 with identica
     vm.trace.config.enabled = true;
     vm.trace.config.execute = true;
     vm.trace.config.optimize = true;
-    // Tier-1a config, deliberately: the body's `%` has no native lowering, and
-    // under `native_codegen` the safety net would decline entry ENTIRELY
-    // (skip, never tier-1a) — masking the very guard_gc bounce this test pins.
+    // Tier-1a config, deliberately: this pins the TIER-1A guard_gc bounce
+    // lane. (Historically also forced — pre-doc-25 the body's `%` had no
+    // native lowering and `native_codegen`'s safety net would have declined
+    // entry entirely; mod now lowers, but the tier-1a lane still deserves
+    // its own pin, so the config stays.)
     vm.trace.config.hotloop = 4;
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
@@ -632,10 +634,73 @@ test "doc 24 c4: threshold bouncing across real GC cycles — heap schedule and 
     try testing.expectEqual(t0_next_gc, vm.heap.next_gc);
     try testing.expectEqual(t0_next_id, vm.heap.next_obj_id);
     // Sanity: the trace really RAN (mod-free body, so nothing declines it) —
-    // natively where the platform supports it. NB: a `%` anywhere in the loop
-    // would flip `native_codegen`'s safety net to "decline entirely" (mod has
-    // no lowering yet, TODO item 3) and silently turn this into a tier-0-only
-    // comparison; that vacuous variant was caught during authoring.
+    // natively where the platform supports it. NB: when this was authored a
+    // `%` anywhere in the loop flipped `native_codegen`'s safety net to
+    // "decline entirely" (mod then had no lowering) and silently turned this
+    // into a tier-0-only comparison; doc 25 has since lowered mod/idiv, but
+    // the mod-free body stays — the entries asserts are the real guard.
+    try testing.expect(vm.trace.entries > 0);
+    if (@import("nativegen.zig").is_x64_linux)
+        try testing.expect(vm.trace.native_entries > 0);
+}
+
+test "doc 25: a % / // loop runs NATIVELY end-to-end — mod no longer poisons native entry" {
+    // The inversion of the arc-B vacuity trap: before doc 25, ONE `%` in a
+    // trace made the native safety net decline it entirely (no lowering →
+    // never tier-1a either), which is exactly what held scalar at tier-0.
+    // This loop carries int `%`, int `//`, AND a mixed int%float (the kernel
+    // callout lane) in one body and must (a) match tier-0 output and (b)
+    // actually ENTER natively on x64 — `native_entries > 0` is the payoff
+    // assertion, not a formality.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local u = 0
+        \\local f = 0.0
+        \\for i = 1, 2000 do
+        \\  u = u + i % 10 + i // 7
+        \\  f = f + i % 2.5
+        \\end
+        \\print(u)
+        \\print(f)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var t0_out: [64]u8 = undefined;
+    var t0_len: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        t0_len = sink.buffered().len;
+        @memcpy(t0_out[0..t0_len], sink.buffered());
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(t0_out[0..t0_len], sink.buffered());
     try testing.expect(vm.trace.entries > 0);
     if (@import("nativegen.zig").is_x64_linux)
         try testing.expect(vm.trace.native_entries > 0);

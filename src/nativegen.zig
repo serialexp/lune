@@ -2268,8 +2268,37 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (!isNumKind(kinds[ins.a]) or !isNumKind(kinds[ins.b])) return false;
                 kinds[i] = .float;
             },
-            // Everything else (idiv/mod/guard_number/float-neg) is deferred —
-            // bail to tier-1a. (shl/shr, guard_float, guard_builtin and fsqrt are handled
+            // mod/idiv (doc 25): the recorder stamps `.int` iff both operands
+            // are int (`arithResultType`), `.float` otherwise. EXHAUSTIVE ty
+            // switch (codex): a malformed/deserialized `.boolean`/`.nil` stamp
+            // fails closed rather than riding the add/sub/mul arm's implicit
+            // else-is-int. Explicit operand bounds: `assertWellFormed` is
+            // debug-only and this is the release-mode fail-closed gate.
+            //   - int lane  → inline cqo/idiv + floor adjust (`emitIntDivMod`);
+            //     exits on a zero divisor (tier-0 re-raises DivisionByZero),
+            //     materializes the defined (minInt, -1) result inline.
+            //   - float lane → body callout to the shared fmath kernel
+            //     (`fmodRuntime`/`floordivRuntime`), total, no exit. A genuine
+            //     float result requires ≥1 float operand — the oracle computes
+            //     int%int as an INTEGER, so a `.float` stamp on two int
+            //     operands is malformed and bails (the add/sub/mul rationale).
+            .mod, .idiv => {
+                if (ins.a >= i or ins.b >= i) return false;
+                switch (ins.ty) {
+                    .int => {
+                        if (kinds[ins.a] != .int or kinds[ins.b] != .int) return false;
+                        kinds[i] = .int;
+                    },
+                    .float => {
+                        if (!isNumKind(kinds[ins.a]) or !isNumKind(kinds[ins.b])) return false;
+                        if (kinds[ins.a] != .float and kinds[ins.b] != .float) return false;
+                        kinds[i] = .float;
+                    },
+                    else => return false,
+                }
+            },
+            // Everything else (guard_number/float-neg) is deferred — bail to
+            // tier-1a. (shl/shr, guard_float, guard_builtin and fsqrt are handled
             // above.)
             else => return false,
         }
@@ -2369,6 +2398,10 @@ fn opMayExitInBody(
         .schar1,
         .srep2,
         => true,
+        // Doc 25: only the INT lane exits (a zero divisor side-exits so
+        // tier-0 raises DivisionByZero; the (minInt, -1) pair is computed
+        // inline, NO exit). The float lane's fmath kernel is total.
+        .mod, .idiv => ins.ty == .int,
         // A VALUE_LANE aload tag-checks TAG_HEAP and side-exits on mismatch;
         // scalar-lane aloads are exit-free (guard_present/guard_bounds dominate).
         .aload => ins.aux == VALUE_LANE,
@@ -2420,6 +2453,13 @@ const BodyCallout = enum {
     /// `fmath.powRuntime`: the shared `^` kernel — pure (f64, f64) → f64;
     /// allocates nothing.
     fpow,
+    /// `fmath.fmodRuntime` (doc 25): the shared float-`%` kernel
+    /// (`x - floor(x/y)*y`) — pure (f64, f64) → f64, total (y == 0 → NaN);
+    /// allocates nothing.
+    fmod,
+    /// `fmath.floordivRuntime` (doc 25): the shared float-`//` kernel
+    /// (`floor(x/y)`) — pure (f64, f64) → f64, total; allocates nothing.
+    ffloordiv,
     /// `stralloc.tostrIntRuntime` (doc 24): renders + interns an int's decimal
     /// string. **may_allocate = true** (at most ONE `Heap.link` per call — the
     /// D5 audit rule; an intern hit links zero), **may_collect = false**
@@ -2456,7 +2496,7 @@ const BodyCallout = enum {
 fn calloutMayCollect(c: BodyCallout) bool {
     return switch (c) {
         .resolve_hash_cell => false,
-        .fsin, .fcos, .fpow => false,
+        .fsin, .fcos, .fpow, .fmod, .ffloordiv => false,
         .tostr_int, .tostr_num => false,
         .ssub, .srev, .schar1, .srep2 => false,
     };
@@ -2476,6 +2516,10 @@ fn bodyCalloutOf(
         .fsin => .fsin,
         .fcos => .fcos,
         .pow => .fpow,
+        // doc 25: ONLY the float lane is a callout; the int lane lowers to
+        // inline cqo/idiv (`emitIntDivMod`) with no callout save area.
+        .mod => if (ins.ty == .float) .fmod else null,
+        .idiv => if (ins.ty == .float) .ffloordiv else null,
         .tostr_int => .tostr_int,
         .tostr_num => .tostr_num,
         .ssub => .ssub,
@@ -2630,6 +2674,15 @@ pub const Alloc = struct {
     callout_save_base: u32 = 0, // first spill-slot index of save area
     callout_save_count: u32 = 0, // number of 8-byte slots reserved
 
+    // --- rdx park slot for the inline int mod/idiv lowering (doc 25 D1) ---
+    // `idiv` clobbers rdx:rax unconditionally and rdx carries the live
+    // `*NativeResult` all body long, so `emitIntDivMod` parks rdx here for
+    // the duration of the instruction. An allocator-OWNED unique spill slot
+    // (codex medium): consumed from `spill_count` wholly outside the callout
+    // save region — never its alignment-padding slot — so it can't alias a
+    // spilled operand or the callout's own saved rdx. Addressed `div_save*8`.
+    div_save: ?u32 = null,
+
     pub fn deinit(self: *Alloc, gpa: std.mem.Allocator) void {
         gpa.free(self.loc);
         gpa.free(self.last_use);
@@ -2694,6 +2747,10 @@ fn isTransient(op: trace.IrOp) bool {
         // fsin/fcos/pow materialize their `fmath` kernel callout's result
         // likewise.
         .fsqrt, .fsin, .fcos, .pow => true,
+        // doc 25: int mod/idiv materialize the floor-adjusted idiv result in
+        // a GP home; the float lane its fmath kernel callout result in a
+        // float home.
+        .mod, .idiv => true,
         // doc 24: tostr_* materialize the interned `*GcHeader` in a GP home;
         // slen the cp_len int. The snew class (c3) likewise materializes its
         // fresh-or-interned `*GcHeader` result in a GP home.
@@ -2722,7 +2779,7 @@ fn isCommutative(op: trace.IrOp) bool {
 /// The operand refs an instruction reads (matching `proveKinds`/`lower` exactly).
 fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
     return switch (ins.op) {
-        .add, .sub, .mul, .div, .pow, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
+        .add, .sub, .mul, .div, .idiv, .mod, .pow, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
         .neg, .bnot, .guard_int, .guard_true, .guard_false => .{ .a = true, .b = false },
         // int_of_float reads its sole float operand (a); alen its sole table
         // operand (a).
@@ -3595,6 +3652,19 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         }
     }
 
+    // --- rdx park slot for inline int mod/idiv (doc 25 D1) ---
+    // Reserved AFTER the callout region so it can never alias it (codex
+    // medium). One slot serves every int mod/idiv in the body — the park is
+    // strictly instruction-local, never live across two of them.
+    var div_save: ?u32 = null;
+    for (t.instrs) |ins| {
+        if ((ins.op == .mod or ins.op == .idiv) and ins.ty == .int) {
+            div_save = spill_count;
+            spill_count += 1;
+            break;
+        }
+    }
+
     return .{
         .loc = loc,
         .last_use = last_use,
@@ -3604,6 +3674,7 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         .used_callee_saved = used_callee,
         .callout_save_base = callout_save_base,
         .callout_save_count = callout_save_count,
+        .div_save = div_save,
     };
 }
 
@@ -4588,7 +4659,7 @@ fn emitCalloutRestore(a: *x64.Assembler, alloc: *const Alloc) !void {
 }
 
 /// Emit the mid-body callout for a float-kernel producer (`fsin`/`fcos`
-/// unary, `pow` binary — doc 23 D4). The native body calls THE SAME noinline
+/// unary; `pow` and doc 25's float `mod`/`idiv` binary — doc 23 D4). The native body calls THE SAME noinline
 /// `fmath` kernel tier-0 and tier-1a execute — never an inline SSE
 /// re-derivation — so cross-tier bit-identity holds by construction (there is
 /// exactly one compiled body of each kernel in the process). SysV float call:
@@ -4606,11 +4677,13 @@ fn emitFloatCallout(
     try emitCalloutSave(a, alloc);
 
     // arg0: the proven-numeric operand into xmm0 (== XMM_SCRATCH0); a proven
-    // int promotes via the shared cvtsi2sd discipline. `pow` (the two-arg
-    // kernel) additionally stages its exponent into xmm1 — staging order is
-    // safe because operand homes are never the scratch XMMs.
+    // int promotes via the shared cvtsi2sd discipline. The two-arg kernels
+    // (`pow`, and doc 25's float mod/idiv) additionally stage their second
+    // operand into xmm1 — staging order is safe because operand homes are
+    // never the scratch XMMs.
+    const is_binary = ins.op == .pow or ins.op == .mod or ins.op == .idiv;
     try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.a), kinds[ins.a]);
-    if (ins.op == .pow)
+    if (is_binary)
         try floatOperandToXmm(a, XMM_SCRATCH1, placeOfRef(alloc, ins.b), kinds[ins.b]);
 
     // Call the fmath kernel via an absolute address in rax. Same alignment
@@ -4620,6 +4693,8 @@ fn emitFloatCallout(
         .fsin => @intFromPtr(&fmath.sinRuntime),
         .fcos => @intFromPtr(&fmath.cosRuntime),
         .pow => @intFromPtr(&fmath.powRuntime),
+        .mod => @intFromPtr(&fmath.fmodRuntime),
+        .idiv => @intFromPtr(&fmath.floordivRuntime),
         else => unreachable,
     };
     try a.subRegImm32(.rsp, 8);
@@ -4634,6 +4709,74 @@ fn emitFloatCallout(
         .mem => |d| try a.movsdMemReg(.rsp, d, XMM_SCRATCH0),
         .reg => unreachable, // a float result never homes in a GP register
     }
+}
+
+/// doc 25 D1: inline int `%` / `//`. `cqo`/`idiv` + the floor adjustment
+/// reproduce `@mod`/`@divFloor` exactly for every non-special pair; the two
+/// specials are handled without ever reaching the (trapping) hardware
+/// instruction: a ZERO divisor side-exits at this instruction (tier-0
+/// re-raises `DivisionByZero` from the same exit snapshot tier-1a errors
+/// at), and `(minInt, -1)` materializes the oracle's DEFINED value inline
+/// (`mod` → 0, `idiv` → minInt) and CONTINUES — tier-1a doesn't exit there,
+/// so native must not either (codex blocker, doc 25). `idiv` clobbers
+/// rdx:rax, and rdx carries the live `*NativeResult`, so rdx is parked in
+/// the allocator-owned `div_save` frame slot for the duration; rax/rcx are
+/// body scratch. The result canonically ends in rax on every path.
+fn emitIntDivMod(
+    a: *x64.Assembler,
+    alloc: *const Alloc,
+    ins: trace.IrInstr,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
+    const save_disp: i32 = @as(i32, @intCast(alloc.div_save.?)) * 8;
+    // Park rdx. The mov leaves rdx itself intact, so the zero-divisor exit
+    // below still runs with a valid *NativeResult in rdx.
+    try a.movMemReg(.rsp, save_disp, .rdx);
+    try placeToReg(a, .rax, placeOfRef(alloc, ins.a)); // dividend
+    try placeToReg(a, .rcx, placeOfRef(alloc, ins.b)); // divisor
+    try a.cmpRegImm32(.rcx, 0);
+    try jccNativeExit(a, exit_labels, i, .e); // y == 0 → tier-0 raises
+    // (minInt, -1) probe. rdx is clobbered from here on — no exit until it
+    // is restored at the end.
+    const go = try a.label();
+    const done = try a.label();
+    try a.movRegImm64(.rdx, @bitCast(@as(u64, 0x8000_0000_0000_0000)));
+    try a.xorRegReg(.rdx, .rax); // 0 iff dividend == minInt
+    try a.jcc(.ne, go);
+    try a.cmpRegImm32(.rcx, -1);
+    try a.jcc(.ne, go);
+    // The pair: mod → 0; idiv → minInt (rax already holds the dividend).
+    if (ins.op == .mod) try a.xorRegReg(.rax, .rax);
+    try a.jmp(done);
+    a.bind(go);
+    try a.cqo();
+    try a.idivReg(.rcx); // rax = trunc quotient, rdx = trunc remainder
+    // Floor adjust: rem != 0 and sign(rem) != sign(divisor).
+    if (ins.op == .mod) {
+        // Result = remainder (+ divisor when adjusting), canonicalized into
+        // rax; the truncated quotient is dead → xor scratch.
+        const move = try a.label();
+        try a.cmpRegImm32(.rdx, 0);
+        try a.jcc(.e, move);
+        try a.movRegReg(.rax, .rdx);
+        try a.xorRegReg(.rax, .rcx);
+        try a.jcc(.ns, move); // same signs → no adjust
+        try a.addRegReg(.rdx, .rcx); // rem += divisor
+        a.bind(move);
+        try a.movRegReg(.rax, .rdx);
+    } else {
+        // Result = quotient (already rax); the remainder is dead after the
+        // sign test → clobber it.
+        try a.cmpRegImm32(.rdx, 0);
+        try a.jcc(.e, done);
+        try a.xorRegReg(.rdx, .rcx);
+        try a.jcc(.ns, done); // same signs → no adjust
+        try a.subRegImm32(.rax, 1); // quot -= 1
+    }
+    a.bind(done);
+    try regToPlace(a, placeOfRef(alloc, i), .rax); // home is never rax/rcx/rdx
+    try a.movRegMem(.rdx, .rsp, save_disp); // unpark
 }
 
 /// Emit the mid-body callout for an allocating interned-string producer
@@ -5447,6 +5590,13 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // tier runs the one compiled body and bit-identity holds by
             // construction. No side-exit (total functions of proven numerics).
             .fsin, .fcos, .pow => try emitFloatCallout(a, alloc, kinds, ins, i),
+            // Doc 25: int lane → inline cqo/idiv + floor adjust (side-exit
+            // only on a zero divisor); float lane → the shared fmath kernel
+            // callout (total, no exit).
+            .mod, .idiv => if (ins.ty == .int)
+                try emitIntDivMod(a, alloc, ins, i, exit_labels)
+            else
+                try emitFloatCallout(a, alloc, kinds, ins, i),
             // Doc 24 D5: allocating interned-string producers — mid-body
             // callouts into the shared `stralloc` bodies. Side-exit on OOM.
             .tostr_int, .tostr_num => try emitTostrCallout(a, alloc, kinds, heap.?, ins, i, exit_labels),

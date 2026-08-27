@@ -1689,3 +1689,356 @@ test "doc 24 c4: OOM injection — the same fail point produces identical comple
         try testing.expectEqual(iheap.object_count - iobjs, nheap.object_count - nobjs);
     }
 }
+
+// ---------------------------------------------------------------------------
+// doc 25: mod/idiv native lowering
+// ---------------------------------------------------------------------------
+
+/// regs: r0=i, r1=a, r2=b, r3=accm, r4=accq. Three iterations of
+/// `accm += a % b; accq += a // b` — both ops on the SAME operand pair, so
+/// the sign matrix exercises the floor adjustment of each independently.
+fn intDivModTrace() [23]I {
+    return .{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .guard_int, .a = 0 }, // 1
+        .{ .op = .konst, .aux = 0 }, // 2: limit 3
+        .{ .op = .lt, .a = 0, .b = 2 }, // 3
+        .{ .op = .guard_true, .a = 3 }, // 4
+        .{ .op = .slot_load, .aux = 1 }, // 5: a
+        .{ .op = .guard_int, .a = 5 }, // 6
+        .{ .op = .slot_load, .aux = 2 }, // 7: b
+        .{ .op = .guard_int, .a = 7 }, // 8
+        .{ .op = .slot_load, .aux = 3 }, // 9: accm
+        .{ .op = .guard_int, .a = 9 }, // 10
+        .{ .op = .slot_load, .aux = 4 }, // 11: accq
+        .{ .op = .guard_int, .a = 11 }, // 12
+        .{ .op = .mod, .a = 5, .b = 7, .ty = .int }, // 13: a % b
+        .{ .op = .idiv, .a = 5, .b = 7, .ty = .int }, // 14: a // b
+        .{ .op = .add, .a = 9, .b = 13 }, // 15
+        .{ .op = .add, .a = 11, .b = 14 }, // 16
+        .{ .op = .konst, .aux = 1 }, // 17: 1
+        .{ .op = .add, .a = 0, .b = 17 }, // 18
+        .{ .op = .phi, .b = 15, .aux = 3 },
+        .{ .op = .phi, .b = 16, .aux = 4 },
+        .{ .op = .phi, .b = 18, .aux = 0 },
+        .{ .op = .loop }, // 22
+    };
+}
+
+test "doc 25: int % and // over the full sign matrix — floor semantics, tier parity (the adjust bug farm)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    var consts = [_]Value{ Value.int(3), Value.int(1) };
+    var instrs = intDivModTrace();
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    // The four sign quadrants: truncating hardware vs Lua's floored results
+    // differ in THREE of them — any adjust slip shows up as a regs mismatch.
+    try expectMatch(&t, &.{ Value.int(0), Value.int(7), Value.int(3), Value.int(0), Value.int(0) });
+    try expectMatch(&t, &.{ Value.int(0), Value.int(7), Value.int(-3), Value.int(0), Value.int(0) });
+    try expectMatch(&t, &.{ Value.int(0), Value.int(-7), Value.int(3), Value.int(0), Value.int(0) });
+    try expectMatch(&t, &.{ Value.int(0), Value.int(-7), Value.int(-3), Value.int(0), Value.int(0) });
+    // Exact division (rem == 0) must NOT adjust, either sign.
+    try expectMatch(&t, &.{ Value.int(0), Value.int(6), Value.int(-3), Value.int(0), Value.int(0) });
+    try expectMatch(&t, &.{ Value.int(0), Value.int(-6), Value.int(3), Value.int(0), Value.int(0) });
+    // minInt with an ordinary divisor (hardware-safe, floor still negative).
+    const min = std.math.minInt(i64);
+    try expectMatch(&t, &.{ Value.int(0), Value.int(min), Value.int(3), Value.int(0), Value.int(0) });
+    try expectMatch(&t, &.{ Value.int(0), Value.int(min), Value.int(-3), Value.int(0), Value.int(0) });
+
+    // Absolute pin for one floored quadrant (belt over the parity braces):
+    // 7 % -3 == -2 and 7 // -3 == -3 per iteration; ×3 iterations.
+    const gpa = testing.allocator;
+    var iregs = [_]Value{ Value.int(0), Value.int(7), Value.int(-3), Value.int(0), Value.int(0) };
+    const values = try gpa.alloc(Value, t.instrs.len);
+    defer gpa.free(values);
+    const iresult = irinterp.executeValues(&t, &iregs, values);
+    try testing.expectEqual(@as(usize, 3), iresult.completed);
+    try testing.expectEqual(Value.int(-6), iregs[3]);
+    try testing.expectEqual(Value.int(-9), iregs[4]);
+}
+
+test "doc 25: (minInt, -1) is computed INLINE — native continues, no exit (codex blocker inversion)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var consts = [_]Value{ Value.int(1), Value.int(1) }; // ONE iteration
+    var instrs = intDivModTrace();
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    const min = std.math.minInt(i64);
+    const regs_init = [_]Value{ Value.int(0), Value.int(min), Value.int(-1), Value.int(0), Value.int(0) };
+
+    // Oracle: the pair is a DEFINED value (mod → 0, idiv → minInt) and the
+    // iteration COMPLETES — the exit is the ordinary loop-condition guard on
+    // the next header evaluation, not the divide.
+    var iregs = regs_init;
+    const values = try gpa.alloc(Value, t.instrs.len);
+    defer gpa.free(values);
+    const iresult = irinterp.executeValues(&t, &iregs, values);
+    try testing.expectEqual(@as(usize, 1), iresult.completed);
+    try testing.expectEqual(@as(u32, 4), iresult.exit_instr); // guard_true, NOT the mod/idiv
+    try testing.expectEqual(Value.int(0), iregs[3]); // minInt % -1
+    try testing.expectEqual(Value.int(min), iregs[4]); // minInt // -1 (wraps)
+
+    // Native: identical — completed, exit instr, and both special results.
+    var ct = nativegen.compile(gpa, &t) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    var nregs = regs_init;
+    const nresult = try util.runNative(ct, &nregs);
+    try testing.expectEqual(@as(usize, 1), nresult.completed);
+    try testing.expectEqual(@as(u32, 4), nresult.exit_instr);
+    try util.expectRegsEqual(&iregs, &nregs);
+}
+
+/// regs: r0=i, r1=b (counts down THROUGH zero), r2=acc. `acc += 7 <op> b`,
+/// `b -= 1` — the divisor hits 0 mid-run and the divide must side-exit AT
+/// ITS OWN instruction (10) so tier-0 re-raises DivisionByZero from the same
+/// snapshot tier-1a errors at.
+fn divByZeroTrace(op: trace.IrOp) [19]I {
+    return .{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .guard_int, .a = 0 }, // 1
+        .{ .op = .konst, .aux = 0 }, // 2: limit 10
+        .{ .op = .lt, .a = 0, .b = 2 }, // 3
+        .{ .op = .guard_true, .a = 3 }, // 4
+        .{ .op = .slot_load, .aux = 1 }, // 5: b
+        .{ .op = .guard_int, .a = 5 }, // 6
+        .{ .op = .slot_load, .aux = 2 }, // 7: acc
+        .{ .op = .guard_int, .a = 7 }, // 8
+        .{ .op = .konst, .aux = 1 }, // 9: dividend 7
+        .{ .op = op, .a = 9, .b = 5, .ty = .int }, // 10: 7 <op> b
+        .{ .op = .add, .a = 7, .b = 10 }, // 11
+        .{ .op = .konst, .aux = 2 }, // 12: 1
+        .{ .op = .sub, .a = 5, .b = 12 }, // 13: b - 1
+        .{ .op = .add, .a = 0, .b = 12 }, // 14: i + 1
+        .{ .op = .phi, .b = 11, .aux = 2 },
+        .{ .op = .phi, .b = 13, .aux = 1 },
+        .{ .op = .phi, .b = 14, .aux = 0 },
+        .{ .op = .loop }, // 18
+    };
+}
+
+test "doc 25: divisor reaches 0 mid-run — % and // side-exit at their own instruction, tier parity" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var consts = [_]Value{ Value.int(10), Value.int(7), Value.int(1) };
+    inline for (.{ trace.IrOp.mod, trace.IrOp.idiv }) |op| {
+        var instrs = divByZeroTrace(op);
+        var es = [_]u16{};
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+        // b = 3, 2, 1 commit; the 4th iteration divides by 0 → exit at 10.
+        const regs_init = [_]Value{ Value.int(0), Value.int(3), Value.int(0) };
+
+        var iregs = regs_init;
+        const values = try gpa.alloc(Value, t.instrs.len);
+        defer gpa.free(values);
+        const iresult = irinterp.executeValues(&t, &iregs, values);
+        try testing.expectEqual(@as(usize, 3), iresult.completed);
+        try testing.expectEqual(@as(u32, 10), iresult.exit_instr);
+
+        var ct = nativegen.compile(gpa, &t) orelse return error.NativeBailedUnexpectedly;
+        defer ct.deinit();
+        var nregs = regs_init;
+        const nresult = try util.runNative(ct, &nregs);
+        try testing.expectEqual(@as(usize, 3), nresult.completed);
+        try testing.expectEqual(@as(u32, 10), nresult.exit_instr);
+        try util.expectRegsEqual(&iregs, &nregs);
+    }
+}
+
+test "doc 25: float % and // — kernel-callout parity incl. y == 0 → NaN CONTINUING natively" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // regs: r0=i, r1=fa (float), r2=fb (float), r3=facc (float).
+    // facc += (fa % fb) + (fa // fb); fa += 0.5 — both float-lane ops in one
+    // body, results accumulated so every iteration's bits matter.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .guard_int, .a = 0 }, // 1
+        .{ .op = .konst, .aux = 0 }, // 2: limit 4
+        .{ .op = .lt, .a = 0, .b = 2 }, // 3
+        .{ .op = .guard_true, .a = 3 }, // 4
+        .{ .op = .slot_load, .aux = 1 }, // 5: fa
+        .{ .op = .guard_float, .a = 5 }, // 6
+        .{ .op = .slot_load, .aux = 2 }, // 7: fb
+        .{ .op = .guard_float, .a = 7 }, // 8
+        .{ .op = .slot_load, .aux = 3 }, // 9: facc
+        .{ .op = .guard_float, .a = 9 }, // 10
+        .{ .op = .mod, .a = 5, .b = 7, .ty = .float }, // 11: fa % fb
+        .{ .op = .idiv, .a = 5, .b = 7, .ty = .float }, // 12: fa // fb
+        .{ .op = .add, .a = 11, .b = 12, .ty = .float }, // 13
+        .{ .op = .add, .a = 9, .b = 13, .ty = .float }, // 14
+        .{ .op = .konst, .aux = 1 }, // 15: 0.5
+        .{ .op = .add, .a = 5, .b = 15, .ty = .float }, // 16: fa + 0.5
+        .{ .op = .konst, .aux = 2 }, // 17: 1
+        .{ .op = .add, .a = 0, .b = 17 }, // 18: i + 1
+        .{ .op = .phi, .b = 14, .aux = 3 },
+        .{ .op = .phi, .b = 16, .aux = 1 },
+        .{ .op = .phi, .b = 18, .aux = 0 },
+        .{ .op = .loop }, // 22
+    };
+    var consts = [_]Value{ Value.int(4), Value.float(0.5), Value.int(1) };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    try expectMatch(&t, &.{ Value.int(0), Value.float(7.5), Value.float(2.0), Value.float(0.0) });
+    try expectMatch(&t, &.{ Value.int(0), Value.float(-7.5), Value.float(2.0), Value.float(0.0) });
+    try expectMatch(&t, &.{ Value.int(0), Value.float(7.5), Value.float(-2.0), Value.float(0.0) });
+    // y == 0: NaN through IEEE in the shared kernel — the loop RUNS TO ITS
+    // LIMIT natively (completed == 4, no divide exit), facc NaN in both tiers.
+    try expectMatch(&t, &.{ Value.int(0), Value.float(7.5), Value.float(0.0), Value.float(0.0) });
+    // ±inf operands.
+    try expectMatch(&t, &.{ Value.int(0), Value.float(std.math.inf(f64)), Value.float(2.0), Value.float(0.0) });
+}
+
+test "doc 25: mixed int/float promotion — int operand cvtsi2sd's into the kernel exactly as the oracle" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // regs: r0=i (int, ALSO the mod dividend), r1=fb (float), r2=facc.
+    // facc += i % fb — `arithResultType` stamps .float (one float operand);
+    // the int side must promote via cvtsi2sd == toFloat == @floatFromInt.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .guard_int, .a = 0 }, // 1
+        .{ .op = .konst, .aux = 0 }, // 2: limit 5
+        .{ .op = .lt, .a = 0, .b = 2 }, // 3
+        .{ .op = .guard_true, .a = 3 }, // 4
+        .{ .op = .slot_load, .aux = 1 }, // 5: fb
+        .{ .op = .guard_float, .a = 5 }, // 6
+        .{ .op = .slot_load, .aux = 2 }, // 7: facc
+        .{ .op = .guard_float, .a = 7 }, // 8
+        .{ .op = .mod, .a = 0, .b = 5, .ty = .float }, // 9: i % fb (mixed)
+        .{ .op = .idiv, .a = 0, .b = 5, .ty = .float }, // 10: i // fb (mixed)
+        .{ .op = .add, .a = 9, .b = 10, .ty = .float }, // 11
+        .{ .op = .add, .a = 7, .b = 11, .ty = .float }, // 12
+        .{ .op = .konst, .aux = 1 }, // 13: 1
+        .{ .op = .add, .a = 0, .b = 13 }, // 14: i + 1
+        .{ .op = .phi, .b = 12, .aux = 2 },
+        .{ .op = .phi, .b = 14, .aux = 0 },
+        .{ .op = .loop }, // 17
+    };
+    var consts = [_]Value{ Value.int(5), Value.int(1) };
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+    try expectMatch(&t, &.{ Value.int(0), Value.float(2.5), Value.float(0.0) });
+    try expectMatch(&t, &.{ Value.int(0), Value.float(-2.5), Value.float(0.0) });
+}
+
+test "doc 25: malformed ty stamps fail closed — .boolean stamp, and .float on two int operands" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // (a) A .boolean-stamped mod must NOT ride an implicit else-is-int arm.
+    {
+        var instrs = intDivModTrace();
+        instrs[13].ty = .boolean;
+        var consts = [_]Value{ Value.int(3), Value.int(1) };
+        var es = [_]u16{};
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+        try expectBail(&t);
+    }
+    // (b) A .float-stamped idiv on two PROVEN-INT operands is malformed (the
+    // oracle computes int//int as an integer) → bail, never a divsd lowering.
+    {
+        var instrs = intDivModTrace();
+        instrs[14].ty = .float;
+        var consts = [_]Value{ Value.int(3), Value.int(1) };
+        var es = [_]u16{};
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+        try expectBail(&t);
+    }
+}
+
+test "doc 25: int divide + float-kernel callout + spill pressure — div_save owns a unique slot past the callout area" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // Slots: r0=i, r1..r12=int accs (carried), r13=a, r14=b (invariant int),
+    // r15=facc (carried float), r16=fb (invariant float), r17=limit. 18 slots
+    // >> 9 GP homes, so int homes spill; the body holds an int `//` + `%`
+    // pair (div_save round-trips) AND a float `%` (full callout save/restore)
+    // in the same iteration — the codex non-overlap proof: a div_save aliasing
+    // a spilled operand or the callout region would corrupt this loop.
+    const N = 12;
+    var ins: std.ArrayListUnmanaged(I) = .empty;
+    defer ins.deinit(gpa);
+
+    const r_i: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .slot_load, .aux = 0 });
+    try ins.append(gpa, .{ .op = .guard_int, .a = r_i });
+    const r_lim: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .slot_load, .aux = 17 });
+    try ins.append(gpa, .{ .op = .guard_int, .a = r_lim });
+    const r_lt: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .lt, .a = r_i, .b = r_lim });
+    try ins.append(gpa, .{ .op = .guard_true, .a = r_lt });
+    const r_a: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .slot_load, .aux = 13 });
+    try ins.append(gpa, .{ .op = .guard_int, .a = r_a });
+    const r_b: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .slot_load, .aux = 14 });
+    try ins.append(gpa, .{ .op = .guard_int, .a = r_b });
+    const r_facc: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .slot_load, .aux = 15 });
+    try ins.append(gpa, .{ .op = .guard_float, .a = r_facc });
+    const r_fb: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .slot_load, .aux = 16 });
+    try ins.append(gpa, .{ .op = .guard_float, .a = r_fb });
+
+    var accrefs: [N]u16 = undefined;
+    for (0..N) |k| {
+        const r: u16 = @intCast(ins.items.len);
+        try ins.append(gpa, .{ .op = .slot_load, .aux = @intCast(1 + k) });
+        try ins.append(gpa, .{ .op = .guard_int, .a = r });
+        accrefs[k] = r;
+    }
+    const r_q: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .idiv, .a = r_a, .b = r_b, .ty = .int });
+    const r_m: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .mod, .a = r_a, .b = r_b, .ty = .int });
+    var newrefs: [N]u16 = undefined;
+    for (0..N) |k| {
+        const r: u16 = @intCast(ins.items.len);
+        try ins.append(gpa, .{ .op = .add, .a = accrefs[k], .b = if (k % 2 == 0) r_q else r_m });
+        newrefs[k] = r;
+    }
+    const r_fm: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .mod, .a = r_facc, .b = r_fb, .ty = .float });
+    const r_one: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .konst, .aux = 0 });
+    const r_inc: u16 = @intCast(ins.items.len);
+    try ins.append(gpa, .{ .op = .add, .a = r_i, .b = r_one });
+    for (0..N) |k| try ins.append(gpa, .{ .op = .phi, .b = newrefs[k], .aux = @intCast(1 + k) });
+    try ins.append(gpa, .{ .op = .phi, .b = r_fm, .aux = 15 });
+    try ins.append(gpa, .{ .op = .phi, .b = r_inc, .aux = 0 });
+    try ins.append(gpa, .{ .op = .loop });
+
+    var consts = [_]Value{Value.int(1)};
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = ins.items, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    // Structural proof: div_save exists, is a real spill slot, and sits
+    // wholly PAST the callout save region (never its padding slot).
+    {
+        const kinds = try gpa.alloc(Kind, ins.items.len);
+        defer gpa.free(kinds);
+        const slot_of = try gpa.alloc(i32, ins.items.len);
+        defer gpa.free(slot_of);
+        try testing.expect(proveKinds(gpa, &t, kinds, slot_of));
+        var al = analyze(gpa, &t, kinds, slot_of) orelse return error.AnalyzeBailed;
+        defer al.deinit(gpa);
+        const ds = al.div_save orelse return error.DivSaveMissing;
+        try testing.expect(al.callout_save_count != 0); // the float mod IS a callout
+        try testing.expect(ds > al.callout_save_base + al.callout_save_count); // past area + padding
+        try testing.expect(ds < al.spill_count); // inside the frame
+    }
+
+    // Behavioural proof: full tier parity. a=17, b=5 → q=3, m=2 per iter.
+    var regs: [18]Value = undefined;
+    for (&regs) |*v| v.* = Value.int(0);
+    regs[13] = Value.int(17);
+    regs[14] = Value.int(5);
+    regs[15] = Value.float(123.456);
+    regs[16] = Value.float(7.25);
+    regs[17] = Value.int(5);
+    try expectMatch(&t, &regs);
+    // Negative operand pressure leg: floored adjusts live in the same body.
+    regs[13] = Value.int(-17);
+    try expectMatch(&t, &regs);
+}

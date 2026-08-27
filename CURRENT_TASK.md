@@ -21,7 +21,78 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
-## Status 2026-08-28 (LATEST-89) — **arc B COMPLETE (c4): adversarial matrix + §T-A.2 acceptance green, board 28/28, doc 24 → landed. Next lever: mod/idiv native lowering (TODO item 3 — currently blocks scalar/e2e traces from native entirely via the safety net).**
+## Status 2026-08-28 (LATEST-90) — **mod/idiv NATIVE LOWERING LANDED (doc 25): scalar 4.3× → 0.9× LuaJIT (−87.6% instructions). `%` no longer poisons native entry anywhere. Pre-existing `minInt % -1` SIGFPE found and fixed in the oracle.**
+
+Bart asked whether the doc-24 v2 escalation overrides mod/idiv work — it
+doesn't (v2 is recorder/exit protocol; mod/idiv already record + run tier-1a,
+only the nativegen lowering was missing) — and said "lets do those first".
+Full campaign loop: doc 25 written → codex-reviewed → implemented → gates.
+
+- **Codex review verdict on the design**: sound except ONE BLOCKER —
+  `(minInt, -1)` must NOT side-exit (tier-1a computes the defined value —
+  `mod` 0 / `idiv` minInt — and CONTINUES; a native exit would diverge via
+  the deopt ledger + iteration replay of earlier heap stores). Fixed: the
+  pair is detected (it #DE-traps in hardware) and its result materialized
+  INLINE, no exit. Two mediums also folded in: exhaustive `ty` switch in the
+  proveKinds arm (the add/sub/mul arm's `else` treats a malformed
+  `.boolean`/`.nil` stamp as int — don't copy) + `a<i`/`b<i` bounds; and
+  `div_save` as an allocator-OWNED unique spill slot outside the callout
+  region (never its padding slot).
+- **Int lane** (`ty == .int`, both operands proven int): inline
+  `cqo`/`idiv` + floor adjustment in `emitIntDivMod` (~16 instrs). rdx (the
+  live `*NativeResult`) parks in `Alloc.div_save` for the duration; rax/rcx
+  scratch; result canonically in rax. ONE side-exit: zero divisor → tier-0
+  re-raises DivisionByZero from the instruction-`i` snapshot (same point
+  tier-1a errors). Rejected: the generalized callout (full GP+XMM sweep,
+  ~40 moves — LuaJIT's `lj_vm_modi` is a minimal-clobber asm helper, NOT a
+  SysV call, so "Pall calls out" licenses nothing heavy).
+- **Float lane** (`ty == .float`, ≥1 proven float operand): body callout to
+  NEW shared kernels `fmath.fmodRuntime` (`x - floor(x/y)*y`) and
+  `fmath.floordivRuntime` (`floor(x/y)`), strict FP, noinline, callconv(.c)
+  — and `arith.mod`/`arith.floorDiv` float paths REFACTORED to call them, so
+  all three tiers share one compiled body (the powRuntime discipline. Total
+  functions: y==0 → NaN/inf through IEEE, NO exit). `emitFloatCallout`
+  binary-staging extended (pow → pow|mod|idiv), BodyCallout rows
+  fmod/ffloordiv.
+- **x64.zig**: `cqo` (REX.W 99), `idivReg` (REX.W F7 /7), `Cond.ns` (0x9);
+  golden-byte tests incl. the REX.B lane.
+- **PRE-EXISTING BUG FOUND (Rule #0.5)**: `arith.mod`'s comment claimed
+  "@mod is floored; minInt % -1 == 0 (no overflow)" — FALSE. `@mod` lowers
+  to hardware idiv → `minInt % -1` SIGFPE'd tier-0 lune (CLI-reproduced).
+  Exposed by the doc-25 pair test exercising the tier-1a oracle. Fix:
+  `y == -1 → 0` special case (mathematically x % -1 == 0 for EVERY x under
+  floored mod; Lua 5.4's luaV_mod does the same). Pinned in arith tests
+  (`7 % -1`, `minInt % -1`). `floorDiv` already had its pair special case.
+- **Tests**: sign-matrix parity (4 quadrants + exact-division no-adjust +
+  minInt with ordinary divisors + absolute pin −6/−9 for 7,−3×3 iters);
+  (minInt,−1) native-CONTINUES leg (completed 1, exit at the loop guard,
+  results 0/minInt, regs parity); divisor-hits-0 mid-run side-exit parity
+  at the op's own instruction (both ops, `inline for`); float lane parity
+  incl. y==0→NaN CONTINUING natively and ±inf; mixed int%float promotion;
+  malformed-ty fail-closed (boolean stamp; float stamp on two int operands);
+  combined int-div + float-callout + 18-slot spill pressure with structural
+  asserts (`div_save` exists, > callout base+count → past the padding slot,
+  < spill_count); VM e2e: `u = u + i % 10 + i // 7; f = f + i % 2.5` under
+  FULL native config → output == tier-0 truth AND `native_entries > 0` (the
+  arc-B vacuity trap inverted into the payoff assertion).
+- **Gates**: full suite both legs (incl. -Djit-debug) green; hashgate 84/84;
+  `just bench` 28/28 cross=ok all-luajit-ok ×2 runs. **scalar jit 5.8–6.0ms
+  vs LuaJIT 6.4–6.5ms = 0.9× — first sub-1.0× row of the campaign** (was
+  4.3×; −87.6% instructions, 633.7M → 78.7M). Instruction A/B vs a 9ce7344
+  shadow (nm-verified, rc-checked, 3 reps): partialsums jit +0.0001%, nsieve
+  jit +0.001%, tbl_ops jit −0.03%, t0 drifts ≤ +0.24% (recompiled-unit
+  codegen jitter + the tier-0 y==−1 compare; recursive-fib's +0.24% has no
+  mod at all — pure jitter). **Wall-clock boards were taken under load ~20
+  (parallel agents) and swung ±70% on unchanged-instruction rows — the
+  instruction A/B is the authoritative regression record.** Stale
+  "mod blocks native" comments updated in interp_trace_test /
+  keyframeser_resume_test / doc 24 notes / TODO item 3.
+- **Remaining named frontiers**: upper/lower recording (v2, `*Vm` effect
+  channel, codex #10) — now THE str_manip blocker (5.3×); nbody/spectral/
+  fft per the campaign map. array3d 25–29× (heap-valued hash field loads +
+  generic-for) unchanged.
+
+## Status 2026-08-28 (LATEST-89, superseded by 90) — **arc B COMPLETE (c4): adversarial matrix + §T-A.2 acceptance green, board 28/28, doc 24 → landed. Next lever: mod/idiv native lowering (TODO item 3 — currently blocks scalar/e2e traces from native entirely via the safety net).**
 
 **c4 (this commit)** — the D9.2/D9.3 gates for the whole arc, plus docs:
 

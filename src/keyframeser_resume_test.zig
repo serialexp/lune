@@ -680,9 +680,11 @@ test "doc 24 c4 (arc-B acceptance): allocating snew/tostr loop — cross-tier fi
     // one missing on-trace intern anywhere diverges the bytes. A pairs()
     // fold over string keys interned AFTER the hot loop makes id-order
     // divergence show in stdout too (hash iteration order is keyed on ids).
-    // The hot loop is deliberately MOD-FREE: `%` has no native lowering yet
-    // and `native_codegen`'s safety net would otherwise decline entry
-    // entirely, quietly reducing this to a tier-0-vs-tier-0 comparison.
+    // The hot loop is MOD-FREE. That was load-bearing when authored (pre-
+    // doc-25, `%` had no native lowering and the safety net would have
+    // declined entry entirely, quietly reducing this to tier-0-vs-tier-0);
+    // mod now lowers, but the shape stays so the pinned byte-stream and its
+    // production-verified native-entry profile don't churn.
     const gpa = testing.allocator;
     const source =
         \\local sub = string.sub

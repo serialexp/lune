@@ -715,16 +715,15 @@ docs/design/05-native-codegen.md §Out of scope):
    generic-`for` watermark** — needs a compiler-emitted watermark, no bench
    coverage yet.
 2. **Float / mixed / heap traces** — xmm registers, tag dispatch, libm `call`-outs.
-3. **Deferred ops** — `idiv`/`mod` (floored-div/mod correction), logical `not`.
-   (`shl`/`shr` LANDED June 2026 — branch-bracketed `cl`-shift in
-   `nativegen.emitShift`; `div` and `pow` have since landed too — float divsd
-   and the pow callout.) **`mod` is now the scalar-native frontier
-   (2026-08-27, doc 24 c2):** scalar.lua's loop records END-TO-END (zero
-   aborts — tostr_int/slen/guard_gc landed) and runs tier-1a at ~849 c/it
-   (vs ~1480 tier-0), but `proveKinds` bails the whole trace on its one `mod`
-   (`i % 10`), so `--jit-native` gates the anchor back to tier-0. One int-mod
-   lowering (idiv + floored-remainder sign fix, both-int operands only)
-   unblocks native scalar; general win for every `%`-using program (Z-6).
+3. **Deferred ops** — logical `not`. (`shl`/`shr` LANDED June 2026 —
+   branch-bracketed `cl`-shift in `nativegen.emitShift`; `div` and `pow`
+   landed after — float divsd and the pow callout. ~~`idiv`/`mod`~~ **LANDED
+   2026-08-28, doc 25:** int lane inline cqo/idiv + floor adjust with a
+   zero-divisor side-exit and inline (minInt, -1) materialization; float lane
+   via shared `fmath.fmodRuntime`/`floordivRuntime` kernel callouts. scalar
+   went 4.3× → **0.9× LuaJIT** (−87.6% instructions); en route the oracle's
+   `minInt % -1` was found to SIGFPE in every tier and fixed in `arith.mod`
+   with a `y == -1` special case.)
 4. ~~**Linear-scan register allocation**~~ — **DONE (cut 2).** Loop-carried &
    invariant slots get register/spill homes loaded once; transients get registers
    via forward linear scan; `regs[]` written only on side-exit (single snapshot).

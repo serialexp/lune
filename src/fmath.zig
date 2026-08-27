@@ -26,6 +26,24 @@ pub noinline fn powRuntime(x: f64, y: f64) callconv(.c) f64 {
     return std.math.pow(f64, x, y);
 }
 
+/// Float `%` kernel (doc 25 D2) — Lua's floored float modulo,
+/// `x - floor(x/y) * y`, the single body all tiers execute (tier-0 and
+/// tier-1a reach it through `arith.mod`'s float path; the native JIT calls it
+/// directly as a two-arg body callout). Total: `y == 0` yields NaN through
+/// IEEE — no error, no side-exit.
+pub noinline fn fmodRuntime(x: f64, y: f64) callconv(.c) f64 {
+    @setFloatMode(.strict);
+    return x - @floor(x / y) * y;
+}
+
+/// Float `//` kernel (doc 25 D2) — `floor(x / y)`, the single body all tiers
+/// execute (through `arith.floorDiv`'s float path / the native callout).
+/// Total: IEEE inf/NaN fall out identically everywhere.
+pub noinline fn floordivRuntime(x: f64, y: f64) callconv(.c) f64 {
+    @setFloatMode(.strict);
+    return @floor(x / y);
+}
+
 /// `math.sin` kernel — the single body all tiers execute.
 pub noinline fn sinRuntime(x: f64) callconv(.c) f64 {
     return @sin(x);

@@ -522,7 +522,8 @@ hit it.
 
 **The native safety net makes VM-level JIT tests silently vacuous — assert
 `entries`.** With `native_codegen` on, a trace containing any op with no
-native lowering (`mod`, currently) is declined *entirely* by the trial walk
+native lowering (`mod`, at the time — since lowered by doc 25) is declined
+*entirely* by the trial walk
 — it does not fall back to tier-1a, so a test can pass with the JIT never
 entering. Every VM-level test in this arc now either uses a mod-free source
 (and asserts `native_entries > 0` on x64) or deliberately configures

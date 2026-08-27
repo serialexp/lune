@@ -71,6 +71,7 @@ pub const Cond = enum(u8) {
     be = 0x6, // CF=1 or ZF=1   — unsigned ≤  (below-or-equal)
     a = 0x7, // CF=0 and ZF=0  — unsigned >  (above)
     s = 0x8, // SF=1            — sign (negative); used by the shift count-sign test
+    ns = 0x9, // SF=0           — no-sign (non-negative); the mod/idiv floor-adjust skip (doc 25)
     p = 0xA, // PF=1            — parity (unordered, after ucomisd compare)
     np = 0xB, // PF=0           — no-parity (ordered)
     l = 0xC, // SF≠OF          — signed <
@@ -546,6 +547,22 @@ pub const Assembler = struct {
         try self.rex(true, false, false, reg.hi());
         try self.b(0xF7);
         try self.modrmReg(3, reg.lo());
+    }
+    /// `cqo` — REX.W 99. Sign-extends rax into rdx:rax (the idiv dividend
+    /// setup). Clobbers rdx: the int mod/idiv lowering (doc 25 D1) parks the
+    /// live `*NativeResult` in the `div_save` frame slot around it.
+    pub fn cqo(self: *Assembler) !void {
+        try self.rex(true, false, false, false);
+        try self.b(0x99);
+    }
+    /// `idiv reg` (64-bit) — REX.W F7 /7. Signed divide of rdx:rax by `reg`;
+    /// TRUNCATED quotient → rax, TRUNCATED remainder → rdx. #DE-traps on a
+    /// zero divisor and on minInt/-1 — the lowering guards both before ever
+    /// reaching this instruction (doc 25 D1).
+    pub fn idivReg(self: *Assembler, reg: Reg) !void {
+        try self.rex(true, false, false, reg.hi());
+        try self.b(0xF7);
+        try self.modrmReg(7, reg.lo());
     }
     /// `shl reg, cl` — REX.W D3 /4. Variable left shift by the low 6 bits of cl
     /// (hardware masks the count to 0..63). The native shift lowering (`emitShift`)
@@ -1464,6 +1481,24 @@ test "enc: imul / neg / not / inc" {
     try expectEnc(&.{ 0x48, 0xFF, 0xC3 }, struct { // inc rbx
         fn f(a: *Assembler) !void {
             try a.incReg(.rbx);
+        }
+    }.f);
+}
+
+test "enc: cqo / idiv (doc 25)" {
+    try expectEnc(&.{ 0x48, 0x99 }, struct { // cqo
+        fn f(a: *Assembler) !void {
+            try a.cqo();
+        }
+    }.f);
+    try expectEnc(&.{ 0x48, 0xF7, 0xF9 }, struct { // idiv rcx
+        fn f(a: *Assembler) !void {
+            try a.idivReg(.rcx);
+        }
+    }.f);
+    try expectEnc(&.{ 0x49, 0xF7, 0xFB }, struct { // idiv r11 (REX.B lane)
+        fn f(a: *Assembler) !void {
+            try a.idivReg(.r11);
         }
     }.f);
 }

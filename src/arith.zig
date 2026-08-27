@@ -115,7 +115,9 @@ pub fn floorDiv(a: Value, b: Value) Error!Value {
         if (x == std.math.minInt(i64) and y == -1) return Value.int(x);
         return Value.int(@divFloor(x, y));
     }
-    return Value.float(@floor(a.toFloat() / b.toFloat()));
+    // Through the ONE noinline kernel so tier-0, tier-1a, and the native
+    // JIT's float callout are bit-identical by construction (doc 25 D2).
+    return Value.float(fmath.floordivRuntime(a.toFloat(), b.toFloat()));
 }
 
 /// `a % b` — floored modulo (result takes the sign of `b`), Lua-style. Integer
@@ -126,13 +128,18 @@ pub fn mod(a: Value, b: Value) Error!Value {
     if (bothInt(a, b)) {
         const y = b.asInt();
         if (y == 0) return Error.DivisionByZero;
-        // @mod is floored modulo in Zig; minInt % -1 == 0 (no overflow).
+        // `x % -1 == 0` for EVERY x under floored modulo — and the previous
+        // `@mod` claim ("minInt % -1 == 0, no overflow") was FALSE: @mod
+        // lowers to hardware idiv, which #DE-traps on (minInt, -1). Found by
+        // the doc-25 native-lowering pair test; `minInt % -1` crashed tier-0
+        // with SIGFPE until this special case (Lua 5.4 handles it the same
+        // way in luaV_mod).
+        if (y == -1) return Value.int(0);
         return Value.int(@mod(a.asInt(), y));
     }
-    const x = a.toFloat();
-    const y = b.toFloat();
-    // Lua float modulo: a - floor(a/b)*b.
-    return Value.float(x - @floor(x / y) * y);
+    // Lua float modulo, `a - floor(a/b)*b` — through the ONE noinline kernel
+    // so all three tiers share a single compiled body (doc 25 D2).
+    return Value.float(fmath.fmodRuntime(a.toFloat(), b.toFloat()));
 }
 
 /// `a ^ b` — exponentiation, **always float** (Lua-shaped). `2 ^ 2` is `4.0`.
@@ -374,6 +381,10 @@ test "mod: floored modulo takes divisor sign" {
     try expectEqual(@as(i64, 2), (try mod(Value.int(-7), Value.int(3))).asInt());
     try expectEqual(@as(i64, -2), (try mod(Value.int(7), Value.int(-3))).asInt());
     try expectError(Error.DivisionByZero, mod(Value.int(1), Value.int(0)));
+    // x % -1 == 0 for every x — including minInt, which SIGFPE'd through
+    // @mod/idiv before the -1 special case (doc 25 pre-existing-bug find).
+    try expectEqual(@as(i64, 0), (try mod(Value.int(7), Value.int(-1))).asInt());
+    try expectEqual(@as(i64, 0), (try mod(Value.int(std.math.minInt(i64)), Value.int(-1))).asInt());
 }
 
 test "mod: float modulo follows Lua a - floor(a/b)*b" {
