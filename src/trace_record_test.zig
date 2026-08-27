@@ -1275,7 +1275,7 @@ test "len opcode: #t on a bitmap-lane table records guard_table + alen" {
     try testing.expectEqual(@as(Ref, 2), try state.refOf(0));
 }
 
-test "len opcode: alen abort matrix — in-band lane, hash border, pending store, metatable" {
+test "len opcode: alen abort matrix — in-band lane, hash border, metatable" {
     const gpa = testing.allocator;
 
     // Boolean lane: presence is in-band, the fast case can't certify the border.
@@ -1313,28 +1313,6 @@ test "len opcode: alen abort matrix — in-band lane, hash border, pending store
         try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
     }
 
-    // Pending sunk store (codex #4): `#t` after an RMW astore would read the
-    // pre-flush border on-trace — abort while pending_stores is non-empty.
-    {
-        const t = try table_mod.Table.create(gpa);
-        defer t.destroy(gpa);
-        var i: i64 = 1;
-        while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i));
-        var state = TraceState.init(gpa);
-        defer state.deinit();
-        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
-        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
-        var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.int(9) };
-        // A read arms deferral, then the RMW store sinks into pending_stores.
-        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
-        state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0, Value.nil());
-        try testing.expect(state.isRecording());
-        try testing.expect(state.rec.pending_stores.items.len == 1);
-        state.recordInstr(.{ .op = .len, .a = 0, .b = 1 }, winRO(&regs), &proto, 0, Value.nil());
-        try testing.expect(!state.isRecording());
-        try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
-    }
-
     // Metatable: `__len` could fire — abort .has_metatable.
     {
         const t = try table_mod.Table.create(gpa);
@@ -1352,6 +1330,74 @@ test "len opcode: alen abort matrix — in-band lane, hash border, pending store
         state.recordInstr(.{ .op = .len, .a = 0, .b = 1 }, winRO(&regs), &proto, 0, Value.nil());
         try testing.expect(!state.isRecording());
         try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
+    }
+}
+
+test "alen records past a pending sunk store (doc 24 D7 refinement)" {
+    // The arc-A conservative abort is gone: sunk stores are in-bounds only
+    // (asize invariant), never clear presence, and alen is itself a
+    // side-exiting op below which the stores flush — so the stale pre-store
+    // read either matches tier-0's answer (asize-only) or side-exits cleanly.
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i));
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.int(9) };
+    // A read arms deferral, then the RMW store sinks into pending_stores.
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0, Value.nil());
+    try testing.expect(state.isRecording());
+    try testing.expect(state.rec.pending_stores.items.len == 1);
+    state.recordInstr(.{ .op = .len, .a = 0, .b = 1 }, winRO(&regs), &proto, 0, Value.nil());
+    try testing.expect(state.isRecording()); // records now — no abort
+    const ops = state.rec.instrs.items;
+    // The alen sits in the stream; the sunk astore is still pending (flushes
+    // at commit, below it).
+    try testing.expectEqual(IrOp.alen, ops[ops.len - 1].op);
+    try testing.expectEqual(@as(usize, 1), state.rec.pending_stores.items.len);
+}
+
+test "recBMType: int folds 'integer', float folds 'float', table folds nil" {
+    const gpa = testing.allocator;
+    // Pre-intern the two result strings the way steady-state tier-0 would have.
+    var h = try FoldHarness.init(gpa, .mtype, &.{});
+    defer h.deinit(gpa);
+    _ = try h.heap.internValue("integer");
+    _ = try h.heap.internValue("float");
+    try h.start(gpa);
+
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+
+    const Case = struct { arg: Value, want_nil: bool, want: []const u8 };
+    const cases = [_]Case{
+        .{ .arg = Value.int(7), .want_nil = false, .want = "integer" },
+        .{ .arg = Value.float(0.5), .want_nil = false, .want = "float" },
+        .{ .arg = Value.heap(&t.header), .want_nil = true, .want = "" },
+    };
+    for (cases) |c| {
+        var st = TraceState.init(gpa);
+        defer st.deinit();
+        st.rec_heap = &h.heap;
+        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+        try st.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ Value.heap(&h.nat.header), c.arg, Value.nil() };
+        const before = h.heap.strtab_count;
+        st.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &proto, 0, Value.nil());
+        try testing.expect(st.isRecording());
+        try testing.expectEqual(before, h.heap.strtab_count); // no allocation
+        const dest = st.konstValueOf(try st.refOf(0)).?;
+        if (c.want_nil) {
+            try testing.expect(dest.isNil());
+        } else {
+            const s = @import("string.zig").String.fromHeader(dest.asHeap());
+            try testing.expectEqualStrings(c.want, s.bytes());
+        }
     }
 }
 

@@ -13235,6 +13235,56 @@ pub const TraceState = struct {
             .rawset => return self.recBRawset(instr, regs),
             .sin => return self.recFloatUnary(instr, regs, .sin, .fsin),
             .cos => return self.recFloatUnary(instr, regs, .cos, .fcos),
+            .mtype => return self.recBMType(instr, regs),
+        }
+    }
+
+    /// `math.type(v)` — konst fold under the same pins as `type()` (doc 24
+    /// ride-along): a numeric argument's `guardNum` pin decides
+    /// "integer"/"float" (the pin is exactly the query!), a pinned
+    /// table/native/closure folds `nil` (Value.nil needs no interning), and
+    /// the pin-less observations (string/nil/bool non-konst) abort as in
+    /// `recBType`. Never allocates: string results via `foldInternedStr`.
+    fn recBMType(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b != 1) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        try self.guardBuiltinCallee(instr.a, .mtype);
+        const arg_slot: u16 = @intCast(@as(usize, instr.a) + 1);
+        const argv = regs.get(arg_slot);
+        const arg_ref = try self.refOf(arg_slot);
+        if (self.konstValueOf(arg_ref) == null) {
+            if (argv.isNumber()) {
+                try self.guardNum(arg_ref, argv, .operand_type, .a1);
+            } else if (argv.isHeap()) switch (argv.heapType()) {
+                .table => {
+                    const tbl = table_mod.Table.fromHeader(argv.asHeap());
+                    if (tbl.metatable != null) return self.abort(.has_metatable);
+                    self.stampProv(try self.emit(.{ .op = .guard_table, .a = arg_ref }), .operand_type, .a1, .neutral);
+                },
+                .native => {
+                    const nat = function.Native.fromHeader(argv.asHeap());
+                    const tag = nat.recorded orelse return self.abort(.bad_type);
+                    try self.guardBuiltinCallee(arg_slot, tag);
+                },
+                .function => {
+                    const cl = function.Closure.fromHeader(argv.asHeap());
+                    if (!self.rec.guarded_refs.contains(arg_ref)) {
+                        try self.rec.guarded_refs.put(self.gpa, arg_ref, {});
+                        self.stampProv(try self.emit(.{ .op = .guard_func, .a = arg_ref, .aux = @bitCast(cl.proto.id) }), .callee_identity, .a1, .neutral);
+                    }
+                },
+                else => return self.abort(.bad_type),
+            } else return self.abort(.bad_type);
+        }
+        if (!self.isRecording()) return;
+        if (argv.isInt()) {
+            const r = (try self.foldInternedStr("integer")) orelse return self.abort(.bad_type);
+            self.setReg(instr.a, r);
+        } else if (argv.isFloat()) {
+            const r = (try self.foldInternedStr("float")) orelse return self.abort(.bad_type);
+            self.setReg(instr.a, r);
+        } else {
+            self.setReg(instr.a, try self.konst(Value.nil()));
         }
     }
 
@@ -13511,12 +13561,25 @@ pub const TraceState = struct {
     /// `.value`/`.boolean`/grid lanes abort (their presence is in-band, so the
     /// fast case can't certify the border without reading elements).
     ///
-    /// Sunk-store hazard (codex #4): pending RMW stores flush only at commit,
-    /// below every guard — an `alen` recorded after one would read the
-    /// pre-store border on-trace. Conservative arc-A rule: ANY pending store
-    /// (any table) aborts; per-table refinement waits for a consumer.
+    /// Sunk-store interaction (arc-A codex #4, REFINED in doc 24 D7): pending
+    /// RMW stores flush at commit, below every guard, so on-trace `alen` reads
+    /// the pre-store table state mid-iteration. That is sound WITHOUT an abort
+    /// because sunk stores cannot change the guarded fast-case answer:
+    ///   - only in-bounds stores sink (appends are never deferred — they change
+    ///     `len` and abort/`astore_append` inline), so `asize` is invariant;
+    ///   - stores never clear presence (nil hole-punch aborts), so
+    ///     `present(asize-1)` can only go false→true; the trace's alen check
+    ///     reading the stale FALSE side-exits — and since `alen` is a
+    ///     side-exiting op, the sunk stores are un-executed at that exit and
+    ///     tier-0's replay applies them exactly once (the doc-08 argument);
+    ///   - when the check passes on the pre-store state, the result depends
+    ///     only on `asize` — identical pre- and post-store;
+    ///   - a sunk `hstore` implies a non-empty hash on ITS table; if that is
+    ///     this table, the record-time `hash.count()` check below aborts, and
+    ///     a different table cannot alias this one's header fields.
+    /// So: no pending-store abort. Gate: the rawset-then-`#t` differential in
+    /// trace_record_test.zig plus scalar's end-to-end run (doc 24 D7).
     fn recAlenShape(self: *TraceState, dst: u16, tab_slot: u16, tab_od: OperandDesig, regs: RegWindow) !void {
-        if (self.rec.pending_stores.items.len > 0) return self.abort(.bad_type);
         const vtab = regs.get(tab_slot);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());

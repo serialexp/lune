@@ -295,7 +295,7 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "rawlen", .func = &bRawLen, .recorded = .rawlen },
     .{ .name = "setmetatable", .func = &bSetMetatable },
     .{ .name = "getmetatable", .func = &bGetMetatable },
-    .{ .name = "math.type", .func = &mType, .module = "math", .field = "type" },
+    .{ .name = "math.type", .func = &mType, .module = "math", .field = "type", .recorded = .mtype },
     .{ .name = "os.difftime", .func = &osDiffTime, .module = "os", .field = "difftime" },
 };
 

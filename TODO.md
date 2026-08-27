@@ -2,18 +2,16 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
-## `math.type` fold arm (noted 2026-08-27, doc 23 follow-up)
+## `table.pack`/`table.unpack` recording (noted 2026-08-27, ex-`math.type` entry)
 
-`bench/stdlib/lua54.lua`'s loop aborts `host_barrier` at its FIRST call —
-`mtype(i)` (`math.type`) — before ever reaching the now-recordable `rawlen(t)`,
-so the whole loop stays tier-0. `math.type` folds exactly like `type()` (konst
-`"integer"`/`"float"`/nil under the existing `guardNum` pins; same
-`internedLookup`-only discipline), so it's a small arc-A-shaped arm: append a
-`RecordedBuiltin.math_type` ordinal (11), tag the registry row, clone
-`recBType`'s structure with the int/float split. Not landed now because the
-reviewed doc 23 arm list is fixed and the same loop also needs `pack`/`unpack`
-(allocating — arc B) before it traces end-to-end; do it together with the next
-breadth batch.
+The `math.type` fold arm from this entry LANDED with arc B c1 (doc 24;
+`RecordedBuiltin.mtype = 11`, `recBMType` cloning `recBType`'s pin structure).
+What remains of the original observation: `bench/stdlib/lua54.lua`'s loop now
+records past all three `mtype` sites and aborts `host_barrier` at
+`pack(i, i+1, i+2)` — `table.pack` allocates a fresh table (TNEW-class), which
+is beyond even doc 24 v1's string-scalar scope. Revisit when on-trace *table*
+allocation gets its arc (doc 24 D2's id-stream lemma applies unchanged; the
+budget-guard protocol was designed to cover it).
 
 ## FIXED 2026-08-26 — the two `driveChain` panics were ONE bug: a use-after-free of the tier-1a executor scratch
 

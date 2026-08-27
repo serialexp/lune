@@ -21,6 +21,56 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-27 (LATEST-86, IN FLIGHT) — **arc B designed + codex-reviewed: doc 24 "deterministic on-trace allocation", v1 pivoted to the allocation-budget entry guard. Implementation NOT started.**
+
+Design record (full detail in docs/design/24-deterministic-on-trace-allocation.md
++ its codex ledger; constraint inventory citations in the doc):
+
+- **The two constraints:** `next_obj_id` is a byte-compared cross-tier keyframe
+  field (total allocation count observable, garbage included), and `pairs`
+  order keys on object id → id divergence = stdout divergence. So JIT modes
+  must reproduce tier-0's allocation event stream EXACTLY — Pall's sink/elide
+  licence is exactly what we cannot take.
+- **What makes it work:** intern hits consume no id/memory (idempotent across
+  non-collecting windows); collection only at the single tier-0 prologue site;
+  non-moving GC. D2 lemma: within a non-collecting window the id stream is a
+  pure function of the intern-call sequence → partial-iteration deopt replay
+  is id-neutral (first run's misses become the replay's hits).
+- **v1 protocol (codex #11):** `guard_gc` ENTRY guard per allocating body:
+  `!gc_stress ∧ object_count + A < next_gc` (A = static alloc bound). Passing
+  makes a mid-burst collection arithmetically impossible in every mode →
+  loop-header re-entry stays sound untouched; failing exits pre-effect and
+  tier-0 runs the boundary iterations. No continuation exits in v1 (that
+  design is recorded as D3v2 with its codex-enumerated obligations #3/5/6/7).
+- **Key review outcomes:** gc_stress legs never enter allocating traces
+  (codex #1); observation blackout while suspension armed (codex #2);
+  per-op IR nodes NOT an sbuiltin catch-all (codex #4: IrInstr can't encode
+  variadic operands; ssub carries its 3rd ref in aux); full-write-set
+  loop-close flush so post-burst regs ≡ tier-0 regs (codex #6 — physical
+  root set, not liveness); CSE only for tostr_int/num (codex #8 — snew-class
+  repeat calls are fallible); callout tagged-result error protocol with
+  no-link-before-fallible-step proofs (codex #9); upper/lower OUT of v1
+  (codex #10 — VM effect state); format chain demoted to next arc.
+- **Planned wire ops (append-only, count 60→):** tostr_int=60, tostr_num=61,
+  slen=62, guard_string=63, guard_gc=64 (aux=A), ssub=65, srev=66, schar1=67,
+  srep2=68. RecordedBuiltin 11+: len=11, sub=12, reverse=13, char=14, rep=15,
+  mtype=16 (lua54 fold-only ride-along).
+
+**Implementation order (arc B commits):**
+1. D7 first: alen pending-store flush refinement (scalar can't reach tostring
+   without it) + rawset-then-len differential test.
+2. mtype fold arm (trivial, clears the lua54 TODO entry).
+3. tostr_int/tostr_num + slen/guard_string + guard_gc + .alloc optimizer kind
+   + full-write-set flush + callout error protocol → scalar end-to-end.
+   THE acceptance gate: §T-A.2-style cross-tier snapshot byte identity on an
+   allocating loop + next_obj_id equality + pairs-order program in the matrix.
+4. snew class (ssub/srev/schar1/srep2) → str_manip (minus upper/lower).
+5. D9 adversarial matrix (codex #14 list), gates, board, commit.
+
+Profile artifacts: scalar = 37.7% dispatch + foldable builtins, tostring the
+one allocating call; str_format is only 8.6% dispatch (decimal core 40% —
+separate arc); str_manip 22.9% dispatch + ~46% transform bodies.
+
 ## Status 2026-08-27 (LATEST-85) — **doc 23 arc A landed: builtin recording breadth (non-allocating). partialsums 6.9× → 2.0× LuaJIT (−79.3% instructions, 100% native iterations); `#t`/rawget/rawset/type/select/tonumber/rawequal loops now record. `pow` and int→float promotion turned out to be the hidden headline blockers.**
 
 **What landed (doc 23, arc A — everything that records without guest-heap

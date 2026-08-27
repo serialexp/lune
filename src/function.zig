@@ -202,6 +202,11 @@ pub const RecordedBuiltin = enum(u8) {
     sin = 9,
     /// `math.cos(x)` — `fcos`, ditto `cosRuntime`.
     cos = 10,
+    // -- arc B of doc 23/24. Same append-only discipline.
+    /// `math.type(x)` — folds to a konst "integer"/"float"/nil under the same
+    /// type pins as `type()` (doc 24 D4 ride-along; lands first, so it takes
+    /// ordinal 11 — the doc's provisional 16 is superseded, append-only wins).
+    mtype = 11,
 };
 
 /// Which **nondeterministic input** a native represents, if any. A native with a
