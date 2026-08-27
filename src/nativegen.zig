@@ -517,6 +517,9 @@ const PROTO_ID_OFF: i32 = @offsetOf(bytecode.Proto, "id");
 /// The pure-builtin `guard_builtin` checks a snapshot callee value is a native of this
 /// type before reading its `pure` tag.
 const NATIVE_TYPE: u8 = @intFromEnum(object.ObjectType.native);
+/// doc 24 c3: the header-type byte a `guard_string`-pinned slot's prologue check
+/// compares against (the snew ops' string operands).
+const STRING_TYPE: u8 = @intFromEnum(object.ObjectType.string);
 /// Offset of `Native.recorded` (a `?RecordedBuiltin` — an `enum(u8)` optional, 2 bytes laid
 /// out `[payload, has_value]`) from a `*GcHeader`. `guard_builtin` proves the callee is
 /// the recorded builtin with two byte compares: `[native + recorded]` (the payload
@@ -1189,7 +1192,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, see
     if (heap == null) {
         for (t.instrs) |ins| {
             switch (ins.op) {
-                .guard_gc, .tostr_int, .tostr_num => return null,
+                .guard_gc, .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2 => return null,
                 else => {},
             }
         }
@@ -1458,6 +1461,23 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
     const pure_guarded = gpa.alloc(bool, n) catch return false;
     defer gpa.free(pure_guarded);
     @memset(pure_guarded, false);
+    // Parallel to `table_guarded`, but for `guard_string` (doc 24 c3): a slot_load
+    // it covers is an OBSERVED string input → classified `.heap` (an invariant raw
+    // `*GcHeader`), with the type pinned once in the prologue (TAG_HEAP tag-lane
+    // check + `header.type == string`) exactly as guard_table pins a table. The
+    // slot is read-only in the trace (a carried string bails in classification),
+    // so one prologue check covers the whole native run.
+    const string_guarded = gpa.alloc(bool, n) catch return false;
+    defer gpa.free(string_guarded);
+    @memset(string_guarded, false);
+    // Per-value string PROVENANCE (doc 24 c3): true iff the ref is statically a
+    // string — a `tostr_*`/snew producer result or a string-guarded slot_load.
+    // This is what `slen` and the snew string operands (`ssub.a`, `srev.a`,
+    // `srep2.a`) require; kind `.heap` alone is NOT enough (a carried-heap slot's
+    // `.heap` is a table).
+    const is_string = gpa.alloc(bool, n) catch return false;
+    defer gpa.free(is_string);
+    @memset(is_string, false);
     // Per-aref: has a `guard_bounds` on this aref been proven before we reach a
     // `guard_present`/`aload`? [I4 / review] `present` is non-null only when
     // `len > 0`, which a passing `guard_bounds` (idx0 <u len) implies — so the
@@ -1562,6 +1582,15 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (t.instrs[r].op != .slot_load) return false;
                 pure_guarded[r] = true;
             },
+            // guard_string (doc 24 c3): on a slot_load it pins the observed-string
+            // input for the prologue (marked here); on anything else Pass B decides
+            // — a guard on a proven-string producer discharges to nothing, any
+            // other operand bails.
+            .guard_string => {
+                const r = ins.a;
+                if (r >= i) return false; // not linear SSA → malformed
+                if (t.instrs[r].op == .slot_load) string_guarded[r] = true;
+            },
             else => {},
         }
     }
@@ -1584,6 +1613,12 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     kinds[i] = .func; // guard_func-covered → invariant callee closure
                 } else if (pure_guarded[i]) {
                     kinds[i] = .native; // guard_builtin-covered → invariant callee native
+                } else if (string_guarded[i]) {
+                    // guard_string-covered → invariant string pointer (doc 24 c3).
+                    // Same `.heap` home/flush class as a producer result; the
+                    // prologue pins TAG_HEAP + `header.type == string` once.
+                    kinds[i] = .heap;
+                    is_string[i] = true;
                 } else {
                     return false; // unguarded → cannot prove a kind
                 }
@@ -1755,11 +1790,13 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .int) return false;
                 kinds[i] = .heap;
+                is_string[i] = true;
             },
             .tostr_num => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .float) return false;
                 kinds[i] = .heap;
+                is_string[i] = true;
             },
             // `#s` of a proven string: one 8-byte load of the cached `cp_len`
             // field. The operand must be a proven string producer's result
@@ -1767,21 +1804,61 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             // pinned slot is NOT yet native (guard_string bails below, c3).
             .slen => {
                 if (ins.a >= i) return false;
-                if (kinds[ins.a] != .heap) return false;
-                // Doc 24 c2 scope: only the proven-string producers reach
-                // `.heap` upstream of a `slen` today (`tostr_*`); a carried-heap
-                // slot's `.heap` is a TABLE (guard_table-covered) and its `#`
-                // records as `alen`, never `slen`. When c3 admits observed
-                // strings natively (guard_string), this arm stays correct: the
-                // guard proves stringness before the load.
-                const prod = t.instrs[ins.a].op;
-                if (prod != .tostr_int and prod != .tostr_num) return false;
+                // The operand must be statically a STRING (`is_string`): a
+                // producer result (`tostr_*`/snew) or a guard_string-pinned
+                // slot. Kind `.heap` alone is not enough — a carried-heap
+                // slot's `.heap` is a TABLE (its `#` records as `alen`).
+                if (!is_string[ins.a]) return false;
                 kinds[i] = .int;
             },
-            // Doc 24 c2 scope: `guard_string` (an observed-string pin) is not
-            // lowered natively yet — a trace using it runs tier-1a. c3 lands it
-            // together with the snew-class ops that need it.
-            .guard_string => return false,
+            // guard_string (doc 24 c3): on a string-guarded slot_load (set
+            // `.heap` + is_string above) it is the prologue type pin — lowers
+            // to nothing in the body, like guard_table. On a proven-string
+            // producer result it is statically redundant (the recorder never
+            // emits that, but tolerate it). Anything else can't be discharged.
+            .guard_string => {
+                if (ins.a >= i) return false;
+                if (!is_string[ins.a]) return false;
+                kinds[i] = .none;
+            },
+            // --- snew class (doc 24 D4/c3): allocating string→string producers,
+            // mid-body callouts into the shared `stralloc` shims. Each returns a
+            // fresh-or-interned `*GcHeader` (kind `.heap`) or null — OOM *or* a
+            // tier-0 raise (bad codepoint / negative count), both collapsing to
+            // one clean side-exit (no `Heap.link` precedes the fallible step;
+            // stralloc.zig's audit) — so each may exit in the body.
+            .ssub => {
+                // a = string, b = start (int), aux = end (int ref — the one
+                // three-operand op; assertWellFormed pins 0 ≤ aux < i).
+                if (ins.a >= i or ins.b >= i) return false;
+                if (ins.aux < 0 or ins.aux >= i) return false;
+                if (!is_string[ins.a]) return false;
+                if (kinds[ins.b] != .int) return false;
+                if (kinds[@intCast(ins.aux)] != .int) return false;
+                kinds[i] = .heap;
+                is_string[i] = true;
+            },
+            .srev => {
+                if (ins.a >= i) return false;
+                if (!is_string[ins.a]) return false;
+                kinds[i] = .heap;
+                is_string[i] = true;
+            },
+            .schar1 => {
+                // a = the codepoint int (validated at runtime by the shared
+                // core; an invalid one returns null → side-exit).
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .int) return false;
+                kinds[i] = .heap;
+                is_string[i] = true;
+            },
+            .srep2 => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (!is_string[ins.a]) return false;
+                if (kinds[ins.b] != .int) return false;
+                kinds[i] = .heap;
+                is_string[i] = true;
+            },
             // Doc 24 D3: the allocation-budget entry guard. Value-less; lowered
             // to two loads of the baked heap counters + the gc_stress byte test.
             // `compileImpl` guaranteed `heap != null` for any trace containing it.
@@ -2281,11 +2358,16 @@ fn opMayExitInBody(
         .guard_gcol,
         .guard_gpresent,
         .alen,
-        // Doc 24: the budget guard exits when headroom is gone; the tostr
-        // callouts exit on OOM (null return).
+        // Doc 24: the budget guard exits when headroom is gone; the tostr and
+        // snew callouts exit on a null return (OOM, or — snew — the collapsed
+        // tier-0 raise: invalid codepoint / negative count).
         .guard_gc,
         .tostr_int,
         .tostr_num,
+        .ssub,
+        .srev,
+        .schar1,
+        .srep2,
         => true,
         // A VALUE_LANE aload tag-checks TAG_HEAP and side-exits on mismatch;
         // scalar-lane aloads are exit-free (guard_present/guard_bounds dominate).
@@ -2347,6 +2429,21 @@ const BodyCallout = enum {
     /// `stralloc.tostrNumRuntime`: likewise for a float. Same
     /// may_allocate/may_collect split as `tostr_int`.
     tostr_num,
+    /// `stralloc.ssubRuntime` (doc 24 c3): codepoint-range substring via the
+    /// shared `subCore`. **may_allocate = true** (host scratch first, then at
+    /// most ONE `Heap.link` at the final intern — the D5 audit rule; an intern
+    /// hit links zero), **may_collect = false** (single collect site: tier-0's
+    /// dispatch prologue).
+    ssub,
+    /// `stralloc.srevRuntime`: codepoint reversal via `reverseCore`. Same
+    /// may_allocate/may_collect split as `ssub`.
+    srev,
+    /// `stralloc.schar1Runtime`: one-codepoint `string.char` via `char1Core`.
+    /// Same split; an invalid codepoint returns null BEFORE any link.
+    schar1,
+    /// `stralloc.srep2Runtime`: separator-less `string.rep` via `rep2Core`.
+    /// Same split; a negative/zero count resolves inside the core.
+    srep2,
 };
 
 /// The doc-22 capability, renamed for the doc-24 may_allocate/may_collect
@@ -2361,6 +2458,7 @@ fn calloutMayCollect(c: BodyCallout) bool {
         .resolve_hash_cell => false,
         .fsin, .fcos, .fpow => false,
         .tostr_int, .tostr_num => false,
+        .ssub, .srev, .schar1, .srep2 => false,
     };
 }
 
@@ -2380,6 +2478,10 @@ fn bodyCalloutOf(
         .pow => .fpow,
         .tostr_int => .tostr_int,
         .tostr_num => .tostr_num,
+        .ssub => .ssub,
+        .srev => .srev,
+        .schar1 => .schar1,
+        .srep2 => .srep2,
         else => null,
     };
 }
@@ -2485,6 +2587,12 @@ const SlotInfo = struct {
     /// runtime stride and no traced store grows it (the recorder aborts a grow).
     grid_elem: i32 = -1,
     grid_stride: i32 = -1,
+    /// doc 24 c3: an invariant `.heap` slot pinned by a covering `guard_string`
+    /// (an observed-string input to the snew ops / `slen`). The prologue verifies
+    /// `header.type == string` once — the slot is read-only in the trace (a
+    /// carried string bails in classification), so the pin holds for the whole
+    /// native run. `false` for every other slot.
+    is_string: bool = false,
     /// win 2: the store_ref transient was allocated *into* home, so the op updates the
     /// home in place and the back-edge shuffle move for this slot self-elides. Only set
     /// for `carried` slots passing the safety predicate (see `analyzeInner`).
@@ -2587,8 +2695,9 @@ fn isTransient(op: trace.IrOp) bool {
         // likewise.
         .fsqrt, .fsin, .fcos, .pow => true,
         // doc 24: tostr_* materialize the interned `*GcHeader` in a GP home;
-        // slen the cp_len int.
-        .tostr_int, .tostr_num, .slen => true,
+        // slen the cp_len int. The snew class (c3) likewise materializes its
+        // fresh-or-interned `*GcHeader` result in a GP home.
+        .tostr_int, .tostr_num, .slen, .ssub, .srev, .schar1, .srep2 => true,
         // href materializes the seeded cell pointer in a register (like aref); hload
         // materializes the decoded scalar field value. hstore/guard_hash are effects.
         .href, .hload => true,
@@ -2633,6 +2742,15 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
         // (a). guard_gc reads NOTHING (`a` unused, aux = the bound A).
         .tostr_int, .tostr_num, .slen => .{ .a = true, .b = false },
         .guard_gc => .{ .a = false, .b = false },
+        // doc 24 c3 (snew): ssub reads string (a) + start (b) — its END index
+        // ref rides in `aux`, which this two-operand shape cannot express;
+        // `analyzeInner` extends the aux ref's liveness explicitly (the
+        // dyn-href precedent). srep2 reads string (a) + count (b); srev reads
+        // its string (a), schar1 its codepoint (a). guard_string reads the
+        // string it type-pins (a) — hoisted to the prologue for a slot_load,
+        // statically discharged on a producer, but liveness must still hold.
+        .ssub, .srep2 => .{ .a = true, .b = true },
+        .srev, .schar1, .guard_string => .{ .a = true, .b = false },
         // guard_fits reads the value it range-checks (a); guard_append reads the aref
         // token (a) and reaches len/cap/hash through aref.a — no second operand.
         .guard_fits, .guard_append => .{ .a = true, .b = false },
@@ -2926,6 +3044,25 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         // proveKinds only set .native via a guard_builtin, so one always exists.
         if (!found) return error.Bail;
     }
+    // A `.heap` INVARIANT slot (doc 24 c3) can only arise via a covering
+    // `guard_string` (proveKinds' sole path to an invariant `.heap` slot_load);
+    // tag it so the prologue emits the once-per-entry `header.type == string`
+    // check. Defensive: bail rather than miscompile if no guard is found — an
+    // unpinned invariant heap slot would let a table payload flow into the snew
+    // callouts as a `*String`.
+    for (slots.items) |*s| {
+        if (s.class != .invariant or s.kind != .heap) continue;
+        const lr: u16 = @intCast(s.load_ref);
+        var found = false;
+        for (t.instrs) |g| {
+            if (g.op == .guard_string and g.a == lr) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.Bail;
+        s.is_string = true;
+    }
 
     // --- liveness: last_use, single backward pass; carried/write store_refs live to the marker ---
     const last_use = try gpa.alloc(u32, n);
@@ -2966,6 +3103,14 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             if (isDynTableRoot(kinds, slots.items, slot_id_of_ref, href_ins.a)) {
                 if (last_use[href_ins.a] < i) last_use[href_ins.a] = @intCast(i);
             }
+        }
+        // ssub (doc 24 c3) reads a THIRD operand — the end-index ref in `aux`
+        // (the one three-operand op) — which `operandReads`' two-field shape
+        // cannot express. Extend its liveness here, exactly as the dyn-href
+        // root above, so the end index survives to the callout's rcx staging.
+        if (ins.op == .ssub) {
+            const ar: usize = @intCast(ins.aux);
+            if (last_use[ar] < i) last_use[ar] = @intCast(i);
         }
     }
 
@@ -4544,6 +4689,77 @@ fn emitTostrCallout(
     try regToPlace(a, placeOfRef(alloc, i), .rcx);
 }
 
+/// Emit the mid-body callout for a snew-class producer (`ssub`/`srev`/
+/// `schar1`/`srep2` — doc 24 D4/c3). Same shape as `emitTostrCallout`: save,
+/// SysV args (rdi = the baked `*Heap`, then the op's operands), call the
+/// shared noinline `stralloc` shim — which calls THE SAME core tier-0 runs —
+/// through an absolute pointer, stash the result across the restore, then
+/// test-and-exit. A null return collapses BOTH D5 failure arms (OOM, or the
+/// tier-0 raise: invalid codepoint / negative count) with a CLEAN id stream
+/// (no `Heap.link` preceded the fallible step — stralloc.zig's audit): the
+/// ordinary deopt exit resumes tier-0 at the header and the replay re-raises
+/// the identical error (or re-hits the OOM) at the same logical point. On
+/// success the fresh-or-interned `*GcHeader` (kind `.heap`) lands in the op's
+/// home.
+///
+/// Operand staging is hazard-free in any order: homes are r8–r11 / rbp /
+/// r12–r15 / rsp-relative spills — never rsi/rdx/rcx (reserved) — and the
+/// save wrote rdi/rsi/rdx to the frame already. rcx doubles as ssub's fourth
+/// arg AND the post-call result stash; the call consumes the arg before the
+/// stash is written, so there is no conflict.
+fn emitSnewCallout(
+    a: *x64.Assembler,
+    alloc: *const Alloc,
+    heap: *gc.Heap,
+    ins: trace.IrInstr,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
+    try emitCalloutSave(a, alloc);
+
+    // arg1 (rsi): the string `*GcHeader` (ssub/srev/srep2) or the codepoint
+    // int (schar1) — `ins.a` in every shape.
+    try placeToReg(a, .rsi, placeOfRef(alloc, ins.a));
+    switch (ins.op) {
+        // ssub(heap, s, i, j): start in rdx, end in rcx (the aux ref — the one
+        // three-operand op; analyzeInner extended its liveness to here).
+        .ssub => {
+            try placeToReg(a, .rdx, placeOfRef(alloc, ins.b));
+            try placeToReg(a, .rcx, placeOfRef(alloc, @intCast(ins.aux)));
+        },
+        // srep2(heap, s, n): count in rdx.
+        .srep2 => try placeToReg(a, .rdx, placeOfRef(alloc, ins.b)),
+        .srev, .schar1 => {},
+        else => unreachable,
+    }
+    // arg0: the Heap, baked absolute (stable for the VM's lifetime).
+    try a.movRegImm64(.rdi, @bitCast(@as(u64, @intFromPtr(heap))));
+
+    // Call the stralloc shim via an absolute address in rax. Same alignment
+    // dance as emitHrefCallout (body runs with rsp % 16 == 8).
+    const body: usize = switch (ins.op) {
+        .ssub => @intFromPtr(&stralloc.ssubRuntime),
+        .srev => @intFromPtr(&stralloc.srevRuntime),
+        .schar1 => @intFromPtr(&stralloc.schar1Runtime),
+        .srep2 => @intFromPtr(&stralloc.srep2Runtime),
+        else => unreachable,
+    };
+    try a.subRegImm32(.rsp, 8);
+    try a.movRegImm64(.rax, @bitCast(body));
+    try a.callReg(.rax);
+    try a.addRegImm32(.rsp, 8);
+
+    // rax = the result *GcHeader, or 0 (OOM / tier-0-raise, collapsed). The
+    // result check must come AFTER the restore (the deopt flush relies on
+    // slot homes being correct), so stash it in rcx — scratch, never a home,
+    // untouched by the restore.
+    try a.movRegReg(.rcx, .rax);
+    try emitCalloutRestore(a, alloc);
+    try a.cmpRegImm32(.rcx, 0);
+    try jccNativeExit(a, exit_labels, i, .e); // 0 → side-exit, tier-0 replays
+    try regToPlace(a, placeOfRef(alloc, i), .rcx);
+}
+
 /// Emit the per-iteration hash-cell resolution call-out for a `.heap`-rooted href.
 /// The sequence saves all live caller-saved homes (rdi/rsi SoA bases + GP + XMM)
 /// into the pre-reserved frame area, sets up SysV ABI arguments, calls
@@ -5024,6 +5240,21 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         try a.jcc(.ne, prologue_fail);
     }
 
+    // [guard_string prologue — doc 24 c3] For each string-pinned slot (a
+    // `guard_string`-covered invariant `.heap` slot_load, tagged `is_string` by
+    // analyzeInner) the pointer is now in its home; the [RV-1] tag-lane check
+    // above proved TAG_HEAP, so this pins the object's TYPE — byte-identical to
+    // irinterp's `guard_string` arm — once per entry (the slot is read-only in
+    // the trace, so it cannot change within a native run). A miss returns 0
+    // (regs[] untouched), side-exiting to tier-0 which re-observes and aborts
+    // or re-guards.
+    for (alloc.slots) |s| {
+        if (s.class == .write_only or !s.is_string) continue;
+        const preg = try refHomeBaseReg(a, s, .rax);
+        try a.cmpByteMemImm(preg, HEADER_TYPE_OFF, STRING_TYPE);
+        try a.jcc(.ne, prologue_fail);
+    }
+
     // [Phase 2] Materialize the invariant array bases ONCE, now that each `.ptr` slot
     // is proven a table of the recorded lane. `data`/`present` pointers and `len` are
     // fixed for the whole native run (B5), so they live in dedicated registers and the
@@ -5074,7 +5305,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // guard_grid/guard_stride (doc 14): the grid structural guards, hoisted to
             // the prologue grid-elem/stride checks (invariant within a native run) —
             // nothing here, exactly like guard_table/guard_lane.
-            .slot_load, .guard_int, .guard_float, .guard_lane, .guard_func, .guard_builtin, .guard_grid, .guard_stride => {},
+            // guard_string (doc 24 c3) joins the hoisted/redundant no-ops: on a
+            // slot_load it is the prologue `header.type == string` pin; on a
+            // proven-string producer it is statically discharged — both emit
+            // nothing here.
+            .slot_load, .guard_int, .guard_float, .guard_lane, .guard_func, .guard_builtin, .guard_grid, .guard_stride, .guard_string => {},
             // guard_table: hoisted no-op for invariant `.ptr` operands (prologue
             // checks). For per-iteration roots — a `.heap`-kind VALUE_LANE aload
             // result, or a carried-heap slot whose home the back-edge φ shuffle
@@ -5215,6 +5450,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // Doc 24 D5: allocating interned-string producers — mid-body
             // callouts into the shared `stralloc` bodies. Side-exit on OOM.
             .tostr_int, .tostr_num => try emitTostrCallout(a, alloc, kinds, heap.?, ins, i, exit_labels),
+            // Doc 24 D4/c3: the snew class — mid-body callouts into the shared
+            // `stralloc` shims (which run THE SAME cores as tier-0). Side-exit
+            // on null (OOM or the collapsed tier-0 raise).
+            .ssub, .srev, .schar1, .srep2 => try emitSnewCallout(a, alloc, heap.?, ins, i, exit_labels),
             // Doc 24 D4: `#s` of a proven string — one load of the cached
             // `cp_len` (a usize field; every real string's count fits i63).
             .slen => {

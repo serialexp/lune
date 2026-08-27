@@ -341,6 +341,105 @@ test "doc 24 c2: an allocating tostring loop records, commits guard_gc with the 
     try testing.expect(found);
 }
 
+test "doc 24 c3: a snew-class string loop records, commits, and runs end-to-end with native JIT" {
+    // The str_manip core shape end-to-end at the VM level: sub + reverse on an
+    // observed base string, char + rep on computed scalars — the whole snew
+    // class in one hot loop. Must RECORD (pre-c3 every string builtin aborted),
+    // commit with the right `alloc_bound`, and produce byte-identical output
+    // under the full pipeline (record -> tropt -> tier-1a/native execute).
+    // `native_codegen` is ON so the production compile decision runs — though
+    // THIS trace's `i % 10` keeps it on tier-1a (mod has no native lowering
+    // yet; TODO.md item 3). Native snew execution is proven at the
+    // nativegen_lowering_test level on mod-free traces.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local sub = string.sub
+        \\local rev = string.reverse
+        \\local char = string.char
+        \\local rep = string.rep
+        \\local base = "héllo wörld héllo wörld"
+        \\local u = 0
+        \\-- NB: `rev(sub(...))` would put the inner call in last-arg position,
+        \\-- which compiles to a MULTRET call (b/c = all_results) — a recording
+        \\-- frontier that aborts .cross_frame (see TODO.md). The intermediate
+        \\-- local keeps every call in the pinned-arity shape; rev's argument is
+        \\-- then a PROVEN ssub result (no guard_string on it).
+        \\for i = 1, 200 do
+        \\  local t = sub(base, i % 10 + 1, i % 10 + 4)
+        \\  u = u + #rev(t)
+        \\  u = u + #rep(char(64 + i % 26 + 1), i % 5)
+        \\end
+        \\print(u)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    // Tier-0 truth first: the same source with tracing off.
+    var truth: [64]u8 = undefined;
+    var truth_len: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        truth_len = sink.buffered().len;
+        @memcpy(truth[0..truth_len], sink.buffered());
+        try testing.expect(truth_len > 0);
+    }
+
+    // Traced + native: byte-identical output, and the committed trace carries
+    // the snew ops with alloc_bound == 4 (ssub, srev, schar1, srep2).
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = true;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(truth[0..truth_len], sink.buffered());
+
+    var found = false;
+    for (vm.trace.cache.items) |t| {
+        if (t.alloc_bound == 0) continue;
+        found = true;
+        try testing.expectEqual(@as(u32, 4), t.alloc_bound);
+        var has = [_]bool{ false, false, false, false };
+        var n_guard_gc: usize = 0;
+        for (t.instrs) |ins| {
+            switch (ins.op) {
+                .ssub => has[0] = true,
+                .srev => has[1] = true,
+                .schar1 => has[2] = true,
+                .srep2 => has[3] = true,
+                .guard_gc => {
+                    n_guard_gc += 1;
+                    try testing.expectEqual(@as(i32, 4), ins.aux);
+                },
+                else => {},
+            }
+        }
+        for (has) |h| try testing.expect(h);
+        try testing.expectEqual(@as(usize, 1), n_guard_gc);
+    }
+    try testing.expect(found);
+}
+
 test "chunk rooting: a host-compiled retained chunk survives GC before it runs" {
     // docs/design/03 §"Chunk-constant rooting" — the regression. A host compiles chunk
     // B (whose distinctive literal is a `load_const`), retains it, runs chunk A (which
@@ -1217,6 +1316,76 @@ test "konst interning lets CSE collapse a repeated subexpression end-to-end" {
     // The two `i * 7` subexpressions are now identical (same slot_load ref + same
     // interned konst ref), so CSE collapses them to a single `mul`. Before konst
     // interning, CSE could not fire here and both muls survived.
+    var muls: usize = 0;
+    for (t.instrs) |ins| {
+        if (ins.op == .mul) muls += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), muls);
+}
+
+test "doc 24 c3: identical ssubs are NEVER CSE'd, and compaction remaps ssub.aux (the three-operand op)" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+
+    // Two IDENTICAL sub calls per iteration (same string, same konst bounds),
+    // preceded by the proven CSE vehicle (`i * 7 + i * 7` — the second mul
+    // collapses, see the konst-interning test above), so compaction SHIFTS
+    // every later ref — the ssubs' aux (the end-index ref, invisible to the
+    // two-operand remap path) must be explicitly remapped or it would dangle.
+    const source =
+        \\local sub = string.sub
+        \\local base = "abcdefgh"
+        \\local acc = 0
+        \\for i = 1, 50 do
+        \\  acc = acc + i * 7 + i * 7
+        \\  local x = sub(base, 2, 5)
+        \\  local y = sub(base, 2, 5)
+        \\  acc = acc + #x + #y
+        \\end
+        \\print(acc)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = false; // inspect the committed, optimized trace
+    vm.trace.config.optimize = true;
+    vm.trace.config.hotloop = 4;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    // 14 x (1+..+50) + 50 x (4 + 4) = 17850 + 400.
+    try testing.expectEqualStrings("18250\n", sink.buffered());
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    const t = vm.trace.cache.items[0];
+    // The `.alloc` class is codex #8: a repeat is a FALLIBLE op tier-0
+    // performs (host scratch precedes the intern), so identical ssubs must
+    // BOTH survive — CSE'ing one away would drop an allocation the id-stream
+    // bound accounts for. And each aux must still resolve to the konst 5 end
+    // bound after DCE shifted the ref space.
+    var n_ssub: usize = 0;
+    for (t.instrs) |ins| {
+        if (ins.op != .ssub) continue;
+        n_ssub += 1;
+        const jref = t.instrs[@intCast(ins.aux)];
+        try testing.expectEqual(trace.IrOp.konst, jref.op);
+        try testing.expectEqual(Value.int(5).payload.bits, t.consts[@intCast(jref.aux)].payload.bits);
+    }
+    try testing.expectEqual(@as(usize, 2), n_ssub);
+    try testing.expectEqual(@as(u32, 2), t.alloc_bound);
+    // The second `i * 7` was CSE'd — proof that compaction actually ran and
+    // the aux checks above exercised a genuinely REMAPPED ref space.
     var muls: usize = 0;
     for (t.instrs) |ins| {
         if (ins.op == .mul) muls += 1;

@@ -173,6 +173,12 @@ fn kindOf(op: IrOp) OpKind {
         // implemented in this first cut — a root-class CSE needs its own
         // dead-second-instance story; the demand table has no repeat calls.
         .tostr_int, .tostr_num => .alloc,
+        // The snew class (doc 24 c3): same `.alloc` discipline; additionally
+        // NEVER CSE'd (codex #8 — host scratch precedes the intern, so a
+        // repeat is a fallible operation tier-0 performs; `.alloc` ops are
+        // canonical-to-themselves already, so no extra work). ssub's third
+        // operand rides `aux` as a ref — every operand walk below handles it.
+        .ssub, .srev, .schar1, .srep2 => .alloc,
         // `slen` is a pure leaf producer over an interned string (allocates
         // nothing): ordinary `.unary` — CSE'd, DCE'd if dead, hoisted iff its
         // operand is invariant. Deliberately never constant-folded (the fold
@@ -430,7 +436,11 @@ pub fn optimize(
                 .unary, .cvt, .guard, .aload => live[canon[ins.a]] = true,
                 // `.alloc` reads its single guarded operand `a`. `.gcguard`
                 // reads nothing (`a` unused).
-                .alloc => live[canon[ins.a]] = true,
+                .alloc => {
+                    live[canon[ins.a]] = true;
+                    if (ins.op == .ssub or ins.op == .srep2) live[canon[ins.b]] = true;
+                    if (ins.op == .ssub) live[canon[@intCast(ins.aux)]] = true;
+                },
                 .gcguard => {},
                 // `aref` (table+index) and `astore` (aref+value) both keep two
                 // operands alive.
@@ -615,7 +625,11 @@ pub fn optimize(
                 out.b = new_index[canon[ins.b]];
             },
             .unary, .cvt, .guard, .aload => out.a = new_index[canon[ins.a]],
-            .alloc => out.a = new_index[canon[ins.a]],
+            .alloc => {
+                out.a = new_index[canon[ins.a]];
+                if (ins.op == .ssub or ins.op == .srep2) out.b = new_index[canon[ins.b]];
+                if (ins.op == .ssub) out.aux = @intCast(new_index[canon[@intCast(ins.aux)]]);
+            },
             .gcguard => {}, // operand-free; aux (the bound A) rides verbatim
             .aref, .astore => {
                 out.a = new_index[canon[ins.a]];

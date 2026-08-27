@@ -1254,6 +1254,174 @@ test "len opcode: #s of an OBSERVED string records guard_string + slen (doc 24 c
     for (ops) |ins| try testing.expect(ins.op != .guard_gc);
 }
 
+test "recBSSub: sub(s, lo, hi) records guard_string + guard_ints + guard_gc + ssub (doc 24 c3)" {
+    const gpa = testing.allocator;
+    var h = try FoldHarness.init(gpa, .sub, &.{});
+    defer h.deinit(gpa);
+    const s = try h.heap.intern("abcdefgh");
+    try h.start(gpa);
+    const objs_before = h.heap.strtab_count;
+    // call sub(s, 2, 5): callee at r0, args r1..r3, one result.
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.heap(&s.header), Value.int(2), Value.int(5), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(Instr.opABC(.call, 0, 3, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    const ops = h.state.rec.instrs.items;
+    // callee slot_load, guard_builtin, s slot_load, guard_string, lo slot_load,
+    // guard_int, hi slot_load, guard_int, guard_gc (lazy, before the first
+    // `.alloc`), ssub.
+    try testing.expectEqual(@as(usize, 10), ops.len);
+    try testing.expectEqual(IrOp.slot_load, ops[0].op);
+    try testing.expectEqual(IrOp.guard_builtin, ops[1].op);
+    try testing.expectEqual(@as(i32, @intFromEnum(function.RecordedBuiltin.sub)), ops[1].aux);
+    try testing.expectEqual(IrOp.slot_load, ops[2].op);
+    try testing.expectEqual(IrOp.guard_string, ops[3].op);
+    try testing.expectEqual(@as(Ref, 2), ops[3].a);
+    try testing.expectEqual(IrOp.guard_int, ops[5].op);
+    try testing.expectEqual(IrOp.guard_int, ops[7].op);
+    try testing.expectEqual(IrOp.guard_gc, ops[8].op);
+    try testing.expectEqual(IrOp.ssub, ops[9].op);
+    // The one three-operand op (codex #4): string in a, start in b, end in aux.
+    try testing.expectEqual(@as(Ref, 2), ops[9].a);
+    try testing.expectEqual(@as(Ref, 4), ops[9].b);
+    try testing.expectEqual(@as(i32, 6), ops[9].aux);
+    try testing.expectEqual(trace.ObsType.heap, ops[9].ty);
+    try testing.expectEqual(@as(u32, 1), h.state.rec.alloc_count);
+    // Recording emitted IR only — no guest allocation.
+    try testing.expectEqual(objs_before, h.heap.strtab_count);
+    try testing.expectEqual(@as(Ref, 9), try h.state.refOf(0));
+
+    // 2-arg shape sub(s, 2): the default end records as a konst(-1) — the same
+    // value tier-0 defaults to — so both shapes share one op.
+    var h2 = try FoldHarness.init(gpa, .sub, &.{});
+    defer h2.deinit(gpa);
+    const s2 = try h2.heap.intern("abcdefgh");
+    try h2.start(gpa);
+    var regs2 = [_]Value{ Value.heap(&h2.nat.header), Value.heap(&s2.header), Value.int(2), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h2.state.recordInstr(Instr.opABC(.call, 0, 2, 1), winRO(&regs2), &h2.proto, 0, Value.nil());
+    try testing.expect(h2.state.isRecording());
+    const ops2 = h2.state.rec.instrs.items;
+    // ..., konst(-1)@6, guard_gc@7, ssub@8 (aux = the konst ref).
+    try testing.expectEqual(@as(usize, 9), ops2.len);
+    try testing.expectEqual(IrOp.konst, ops2[6].op);
+    try testing.expectEqual(Value.int(-1), h2.state.rec.consts.items[@intCast(ops2[6].aux)]);
+    try testing.expectEqual(IrOp.guard_gc, ops2[7].op);
+    try testing.expectEqual(IrOp.ssub, ops2[8].op);
+    try testing.expectEqual(@as(i32, 6), ops2[8].aux);
+}
+
+test "recBSRev: reverse(s) records guard_string + srev; its result is PROVEN for #" {
+    const gpa = testing.allocator;
+    var h = try FoldHarness.init(gpa, .reverse, &.{});
+    defer h.deinit(gpa);
+    const s = try h.heap.intern("héllo"); // 6 bytes, 5 cps
+    const rev = try h.heap.intern("olléh"); // what tier-0 materialized for the dest
+    try h.start(gpa);
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.heap(&s.header), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    const ops = h.state.rec.instrs.items;
+    // callee slot_load, guard_builtin, s slot_load, guard_string, guard_gc, srev.
+    try testing.expectEqual(@as(usize, 6), ops.len);
+    try testing.expectEqual(IrOp.guard_string, ops[3].op);
+    try testing.expectEqual(IrOp.guard_gc, ops[4].op);
+    try testing.expectEqual(IrOp.srev, ops[5].op);
+    try testing.expectEqual(@as(Ref, 2), ops[5].a);
+    try testing.expectEqual(trace.ObsType.heap, ops[5].ty);
+
+    // `#` of the srev result: the producer PROVES stringness (isProvenStringRef
+    // covers the whole snew class) — slen with no second guard_string.
+    regs[0] = Value.heap(&rev.header); // tier-0 has executed the call by now
+    h.state.recordInstr(Instr.opABC(.len, 2, 0, 0), winRO(&regs), &h.proto, 1, Value.nil());
+    try testing.expect(h.state.isRecording());
+    const ops_after = h.state.rec.instrs.items;
+    try testing.expectEqual(IrOp.slen, ops_after[ops_after.len - 1].op);
+    try testing.expectEqual(@as(Ref, 5), ops_after[ops_after.len - 1].a);
+    var n_gs: usize = 0;
+    for (ops_after) |ins| {
+        if (ins.op == .guard_string) n_gs += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n_gs); // only the observed-input pin
+}
+
+test "recBSChar1/recBSRep2: char(c) and rep(s, n) record; both are one guard_gc (doc 24 c3)" {
+    const gpa = testing.allocator;
+    // char(c): guard_int on the codepoint, then schar1 (range failure is a
+    // side-exit at run time, not a record-time concern).
+    var h = try FoldHarness.init(gpa, .char, &.{});
+    defer h.deinit(gpa);
+    try h.start(gpa);
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.int(65), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    const ops = h.state.rec.instrs.items;
+    // callee slot_load, guard_builtin, c slot_load, guard_int, guard_gc, schar1.
+    try testing.expectEqual(@as(usize, 6), ops.len);
+    try testing.expectEqual(IrOp.guard_int, ops[3].op);
+    try testing.expectEqual(IrOp.guard_gc, ops[4].op);
+    try testing.expectEqual(IrOp.schar1, ops[5].op);
+    try testing.expectEqual(@as(Ref, 2), ops[5].a);
+
+    // rep(s, n): guard_string + guard_int, then srep2 — and the SECOND alloc op
+    // in a trace shares the one guard_gc (the bound counts both).
+    var h2 = try FoldHarness.init(gpa, .rep, &.{});
+    defer h2.deinit(gpa);
+    const s = try h2.heap.intern("ab");
+    try h2.start(gpa);
+    var regs2 = [_]Value{ Value.heap(&h2.nat.header), Value.heap(&s.header), Value.int(3), Value.heap(&h2.nat.header), Value.heap(&s.header), Value.int(2), Value.nil(), Value.nil() };
+    h2.state.recordInstr(Instr.opABC(.call, 0, 2, 1), winRO(&regs2), &h2.proto, 0, Value.nil());
+    try testing.expect(h2.state.isRecording());
+    const ops2 = h2.state.rec.instrs.items;
+    // callee, guard_builtin, s, guard_string, n, guard_int, guard_gc, srep2.
+    try testing.expectEqual(@as(usize, 8), ops2.len);
+    try testing.expectEqual(IrOp.guard_gc, ops2[6].op);
+    try testing.expectEqual(IrOp.srep2, ops2[7].op);
+    try testing.expectEqual(@as(Ref, 2), ops2[7].a);
+    try testing.expectEqual(@as(Ref, 4), ops2[7].b);
+    // Second rep call at a fresh callee/arg base: no second guard_gc, bound = 2.
+    h2.state.recordInstr(Instr.opABC(.call, 3, 2, 1), winRO(&regs2), &h2.proto, 1, Value.nil());
+    try testing.expect(h2.state.isRecording());
+    try testing.expectEqual(@as(u32, 2), h2.state.rec.alloc_count);
+    var n_gc: usize = 0;
+    for (h2.state.rec.instrs.items) |ins| {
+        if (ins.op == .guard_gc) n_gc += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n_gc);
+}
+
+test "snew abort matrix: variadic char, 3-arg rep, non-string s, float count (doc 24 c3)" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    const Case = struct { tag: function.RecordedBuiltin, args: [3]Value, b: u16, why: AbortReason };
+    var heap = @import("gc.zig").Heap.init(gpa);
+    defer heap.deinit();
+    const s = try heap.intern("ab");
+    const cases = [_]Case{
+        // char(a, b): the variadic shape — IrInstr carries no operand vector
+        // (codex #4), so only 1-arg records.
+        .{ .tag = .char, .args = .{ Value.int(65), Value.int(66), Value.nil() }, .b = 2, .why = .cross_frame },
+        // rep(s, n, sep): the separator shape stays tier-0 (pinned arity).
+        .{ .tag = .rep, .args = .{ Value.heap(&s.header), Value.int(2), Value.heap(&s.header) }, .b = 3, .why = .cross_frame },
+        // sub(t, 1, 2): non-string subject — tier-0 owns coercions + raising.
+        .{ .tag = .sub, .args = .{ Value.heap(&t.header), Value.int(1), Value.int(2) }, .b = 3, .why = .bad_type },
+        // rep(s, 1.5): float count — tier-0 owns the integral-float coercion.
+        .{ .tag = .rep, .args = .{ Value.heap(&s.header), Value.float(1.5), Value.nil() }, .b = 2, .why = .bad_type },
+        // reverse(42): non-string subject.
+        .{ .tag = .reverse, .args = .{ Value.int(42), Value.nil(), Value.nil() }, .b = 1, .why = .bad_type },
+    };
+    for (cases) |c| {
+        var h = try FoldHarness.init(gpa, c.tag, &.{});
+        defer h.deinit(gpa);
+        try h.start(gpa);
+        var regs = [_]Value{ Value.heap(&h.nat.header), c.args[0], c.args[1], c.args[2], Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+        h.state.recordInstr(Instr.opABC(.call, 0, c.b, 1), winRO(&regs), &h.proto, 0, Value.nil());
+        try testing.expect(!h.state.isRecording());
+        try testing.expectEqual(c.why, h.state.rec.abort_reason.?);
+        // An aborted snew record leaves no allocation accounting behind.
+        try testing.expectEqual(@as(u32, 0), h.state.rec.alloc_count);
+    }
+}
+
 test "recBRawget: int key reuses the array-get shape under guard_builtin" {
     const gpa = testing.allocator;
     const t = try table_mod.Table.create(gpa);

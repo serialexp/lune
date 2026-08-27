@@ -139,13 +139,24 @@ fn detectDeadCarries(
             .guard_func,
             .hload, .guard_hash,
             .guard_builtin, .fsqrt, .fsin, .fcos,
-            .tostr_int, .tostr_num, .slen, .guard_string,
+            .tostr_int, .tostr_num, .slen, .guard_string, .srev, .schar1,
             // Grid-cell ops reading only `a` (doc 14): the cell load and the
             // structural guards that reach the table/cell through the address chain.
             .gload, .guard_grid, .guard_stride, .guard_gpresent,
             .alen,
             => {
                 uses[ins.a] += 1;
+            },
+            // srep2 reads a+b; ssub additionally carries its END ref in `aux`
+            // (doc 24 codex #4 — the one three-operand op).
+            .srep2 => {
+                uses[ins.a] += 1;
+                uses[ins.b] += 1;
+            },
+            .ssub => {
+                uses[ins.a] += 1;
+                uses[ins.b] += 1;
+                uses[@intCast(ins.aux)] += 1;
             },
             // Grid-cell address producers + store + the column guard read both operands
             // (table+row, garow+col, gcell+value, gcell+col).
@@ -263,10 +274,12 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             .guard_func,
             .hload, .guard_hash,
             .guard_builtin, .fsqrt, .fsin, .fcos,
-            .tostr_int, .tostr_num, .slen, .guard_string,
+            .tostr_int, .tostr_num, .slen, .guard_string, .srev, .schar1,
             .gload, .guard_grid, .guard_stride, .guard_gpresent,
             .alen,
             => ins.a == idx,
+            .srep2 => ins.a == idx or ins.b == idx,
+            .ssub => ins.a == idx or ins.b == idx or @as(trace.Ref, @intCast(ins.aux)) == idx,
             .aref, .astore, .astore_append, .href, .hstore,
             .garow, .gcell, .gstore, .guard_gcol => ins.a == idx or ins.b == idx,
             .phi => (ins.aux == trace.PHI_INTERNAL and ins.a == idx) or ins.b == idx,

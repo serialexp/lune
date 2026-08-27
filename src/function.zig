@@ -207,6 +207,21 @@ pub const RecordedBuiltin = enum(u8) {
     /// type pins as `type()` (doc 24 D4 ride-along; lands first, so it takes
     /// ordinal 11 — the doc's provisional 16 is superseded, append-only wins).
     mtype = 11,
+    /// `string.len(s)` — `slen` on a proven/guarded string ref (≡ `#s`, code
+    /// points). Non-allocating.
+    len = 12,
+    /// `string.sub(s, i[, j])` — `ssub`, the snew class (doc 24 D4). Character
+    /// positions with Lua's clamping rules; a missing `j` records as a konst −1.
+    sub = 13,
+    /// `string.reverse(s)` — `srev` (snew class).
+    reverse = 14,
+    /// `string.char(c)` — `schar1`: the ONE-argument fast shape only (an
+    /// `IrInstr` can't carry a variadic operand vector — codex #4); more args
+    /// abort. Out-of-range `c` side-exits (tier-0 replays and raises).
+    char = 15,
+    /// `string.rep(s, n)` — `srep2`: the TWO-argument shape only; a separator
+    /// argument aborts (codex #4 pinned arity).
+    rep = 16,
 };
 
 /// Which **nondeterministic input** a native represents, if any. A native with a

@@ -84,6 +84,10 @@ export const IR_OP_NAMES = [
   "slen", // 62  #s of a proven string: cached cp_len (code points)
   "guard_string", // 63  value is a heap string
   "guard_gc", // 64  allocation-budget entry guard (aux = bound A)
+  "ssub", // 65  string.sub(s, i, j) — third operand rides aux as a ref
+  "srev", // 66  string.reverse(s)
+  "schar1", // 67  1-arg string.char(c)
+  "srep2", // 68  2-arg string.rep(s, n)
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -155,6 +159,8 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "tostr_num",
   "slen",
   "guard_string",
+  "srev",
+  "schar1",
   // Single-operand grid ops (doc 14): the cell load + three structural guards
   // render `%a`. garow/gcell/gstore/guard_gcol are two-operand (guard_gcol carries
   // the column ref in `%b`) and use the default `%a, %b`.

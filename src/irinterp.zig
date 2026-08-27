@@ -878,6 +878,71 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     if (record) rec.exit(i, .guard, v);
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
+                // Doc 24 c3: the snew class — allocating string transforms,
+                // each through the ONE stralloc shim over the shared
+                // `stdlib/string.zig` core tier-0 wraps. Operand types are
+                // producer-proven or guard-pinned; any mismatch (or a null
+                // return: OOM / out-of-range char, both link-free) is a
+                // defensive side-exit and tier-0 replays the iteration.
+                .ssub => {
+                    const sv = values[ins.a];
+                    const iv = values[ins.b];
+                    const jv = values[@intCast(ins.aux)];
+                    if (sv.isHeap() and sv.heapType() == .string and iv.isInt() and jv.isInt()) {
+                        if (ctx.heap) |heap| {
+                            if (stralloc.ssubRuntime(heap, sv.asHeap(), iv.asInt(), jv.asInt())) |h| {
+                                values[i] = Value.heap(h);
+                                if (record) rec.value(i, values[i]);
+                                continue;
+                            }
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, sv);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                .srev => {
+                    const sv = values[ins.a];
+                    if (sv.isHeap() and sv.heapType() == .string) {
+                        if (ctx.heap) |heap| {
+                            if (stralloc.srevRuntime(heap, sv.asHeap())) |h| {
+                                values[i] = Value.heap(h);
+                                if (record) rec.value(i, values[i]);
+                                continue;
+                            }
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, sv);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                .schar1 => {
+                    const cv = values[ins.a];
+                    if (cv.isInt()) {
+                        if (ctx.heap) |heap| {
+                            if (stralloc.schar1Runtime(heap, cv.asInt())) |h| {
+                                values[i] = Value.heap(h);
+                                if (record) rec.value(i, values[i]);
+                                continue;
+                            }
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, cv);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                .srep2 => {
+                    const sv = values[ins.a];
+                    const nv = values[ins.b];
+                    if (sv.isHeap() and sv.heapType() == .string and nv.isInt()) {
+                        if (ctx.heap) |heap| {
+                            if (stralloc.srep2Runtime(heap, sv.asHeap(), nv.asInt())) |h| {
+                                values[i] = Value.heap(h);
+                                if (record) rec.value(i, values[i]);
+                                continue;
+                            }
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, sv);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
                 // Doc 24 D4: the observed value is a heap string (the string
                 // analogue of `guard_table`'s type half).
                 .guard_string => {

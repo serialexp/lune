@@ -21,7 +21,64 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
-## Status 2026-08-27 (LATEST-87, IN FLIGHT) — **arc B c1+c2 LANDED: scalar's `#tostring(i)` loop records END-TO-END (zero aborts) and runs tier-1a (~849 c/it vs ~1480 tier-0; wall 0.29→0.20 s at N=1M). Native is blocked ONLY by the deferred `mod` lowering (TODO item 3). c3 (snew class) + c4 (adversarial matrix/board) remain.**
+## Status 2026-08-27 (LATEST-88, IN FLIGHT) — **arc B c3 LANDED: the snew class (ssub/srev/schar1/srep2 + guard_string native) records, optimizes, and runs NATIVELY end-to-end. str_manip's abort frontier moved from `sub` (first builtin) to `upper` (out of v1 by design, codex #10). c4 (adversarial matrix/board/docs) remains.**
+
+**c3 (this commit)** — everything from recorder to native codegen for the four
+allocating string→string producers (doc 24 D4), plus native `guard_string`:
+
+- **Recorder** (trace.zig): `isProvenStringRef` (tostr/snew results),
+  `stringArgRef`/`intArgRef` (the `!?Ref` null-=-aborted convention; konst
+  passes, proven passes, observed → guard_string/guard_int pin, else
+  `.bad_type`), five arms recBSLen/SSub/SRev/SChar1/SRep2 dispatched from the
+  registry tags (string.zig rows len/sub/reverse/char/rep → `.recorded`).
+  **Arity pins are `instr.b == nargs`** (NOT nargs+1 — b IS the arg count;
+  caught by the shape tests, worth remembering). 2-arg sub records its default
+  end as `konst(-1)` (shared op, codex #4: end rides `aux` — the ONE
+  three-operand op). 1-arg char only (variadic aborts), 2-arg rep only
+  (separator aborts), both `.cross_frame`.
+- **Cores are shared** (stdlib/string.zig pub subCore/reverseCore/char1Core/
+  rep2Core; stralloc.zig C-ABI shims call the SAME functions tier-0's natives
+  wrap) → tier-identical bytes AND allocation counts by construction. A shim's
+  null return collapses BOTH D5 failure arms (OOM and the tier-0 raise —
+  invalid codepoint / negative... n<=0 is NOT an error, rep2Core interns "")
+  into one clean side-exit; no `Heap.link` precedes the fallible step.
+- **nativegen**: `string_guarded`/`is_string` provenance in proveKinds (a
+  guard_string-covered slot_load classifies `.heap` invariant + `is_string`;
+  slen generalized from tostr-only to `is_string`; guard_string discharges to
+  `.none`); SlotInfo.is_string + a new prologue loop pinning
+  `header.type == string` once per entry (STRING_TYPE const); analyzeInner
+  bails an invariant `.heap` slot with NO covering guard_string (fail closed);
+  **ssub.aux liveness is an explicit `last_use` extension** (operandReads'
+  two-field shape can't express a third operand — the dyn-href precedent);
+  BodyCallout rows ×4 (may_allocate, NOT may_collect); `emitSnewCallout`
+  modeled on emitTostrCallout (rdi=baked heap, rsi=a, rdx=b, rcx=aux-for-ssub;
+  rcx arg/result-stash dual use is safe — the call consumes the arg);
+  compileImpl heap-null bail extended to the snew ops.
+- **tropt/troptdiag/traceser/viz**: `.alloc` kind (never CSE'd/DCE'd/hoisted
+  — codex #8: a repeat is a fallible op tier-0 performed), multi-operand
+  liveness+compaction remap incl. ssub.aux; wire pins 65–68 (count 69).
+- **Tests**: recorder shapes + abort matrix (trace_record_test); native tier
+  parity incl. UTF-8 cp semantics on multibyte windows, n<=0 empty repeat,
+  invalid-codepoint mid-run side-exit (completed/exit_instr/heap-delta all
+  equal), guard_string prologue-fail legs (table → STRING_TYPE check, int →
+  tag lane, regs untouched both ways), no-heap compile decline
+  (nativegen_lowering_test); e2e VM-level snew loop (alloc_bound=4, one
+  guard_gc aux=4, output == tier-0 truth) and the no-CSE + ssub.aux-remap
+  pin through real tropt compaction (interp_trace_test).
+- **Frontier notes**: nested last-arg calls (`rev(sub(...))`) compile to
+  MULTRET and abort `.cross_frame` — new TODO entry with the fix shape
+  (resolve `reg_top`-derived nargs like tier-0 does; general win for any
+  `f(g(x))`). str_manip v1 recording now aborts at `upper`
+  (`mapCaseUnicode` touches VM effect state — out of v1, codex #10). Konst
+  heap-string operands still decline native (konst arm accepts heap consts
+  only as href keys) — c4 note. Carried string slots (`s = sub(s, ...)`)
+  bail in classification (lk==.heap falls to the scalar-only arm) — fine,
+  read-only subjects are the bench shape.
+- **Gates run**: both full test legs (incl. -Djit-debug=true), hashgate
+  84/84, str_manip byte-identical t0/--trace/--jit-native/LuaJIT
+  (acc=20207538 at N=100k).
+
+## Status 2026-08-27 (LATEST-87, superseded by 88) — **arc B c1+c2 LANDED: scalar's `#tostring(i)` loop records END-TO-END (zero aborts) and runs tier-1a (~849 c/it vs ~1480 tier-0; wall 0.29→0.20 s at N=1M). Native is blocked ONLY by the deferred `mod` lowering (TODO item 3). c3 (snew class) + c4 (adversarial matrix/board) remain.**
 
 **c1 (495f1e5):** mtype fold arm (RecordedBuiltin mtype=11) + alen sunk-store
 refinement (D7). lua54's abort frontier moved pc 21 → 65 (`table.pack`, out of

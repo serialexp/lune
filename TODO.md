@@ -2,6 +2,24 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Nested last-arg builtin calls compile to MULTRET and abort recording (noted 2026-08-27, doc 24 c3)
+
+`rev(sub(base, 2, 5))` — an inner call in the outer call's LAST argument
+position — compiles to the multret shape (inner `c = all_results`, outer
+`b = all_results`), and every recorded-builtin arm pins exact arity
+(`instr.b`/`instr.c` literals), so recording aborts `.cross_frame` at the call.
+The same expression through an intermediate local (`local t = sub(...); rev(t)`)
+records fine, and a nested call in NON-last position (`rep(char(x), n)`) also
+records fine — only the last-arg statically-1-result case is lost. Fix shape:
+when `instr.b == all_results` the actual argument count is
+`reg_top - (base + a + 1)` (exactly how tier-0 resolves `nargs`); the recorder
+could resolve it the same way and re-enter the pinned-arity path when the
+dynamic count matches, plus accept inner `c = all_results` when the consumer
+takes exactly one value. General win: any composed builtin expression
+(`f(g(x))`) benefits, not one bench. None of str_manip's v1-recordable ops hit
+this today (its only nestings are `lower(upper(a))` — out of v1 anyway — and
+`rep(char(...), 4, "-")` — 3-arg rep, its own frontier), so it stayed a note.
+
 ## `table.pack`/`table.unpack` recording (noted 2026-08-27, ex-`math.type` entry)
 
 The `math.type` fold arm from this entry LANDED with arc B c1 (doc 24;

@@ -504,6 +504,38 @@ pub const IrOp = enum(u8) {
     /// same loop again). Produces no value; never DCE'd/deduped/hoisted.
     /// Wire ordinal 64.
     guard_gc,
+    /// The snew class (doc 24 D4, c3): allocating string TRANSFORMS. Each is a
+    /// callout to the ONE heap-only core in `stdlib/string.zig`
+    /// (`subCore`/`reverseCore`/`char1Core`/`rep2Core`) that tier-0's natives
+    /// wrap — bytes, interned object, and allocation count are tier-identical
+    /// by construction. All are `.alloc` roots (never DCE'd/hoisted/reordered)
+    /// and — unlike `tostr_*` — NEVER CSE'd (codex #8: they allocate host
+    /// scratch before interning; eliding a repeat would remove a fallible
+    /// operation tier-0 performs). On OOM no `Heap.link` happened (scratch
+    /// fails first; intern is transactional): side-exit, tier-0 replays.
+    ///
+    /// `ssub`: `string.sub(s, i, j)` — `a` = proven-string ref, `b` = start
+    /// (proven-int) ref, and **`aux` = the end (proven-int) ref** — the third
+    /// operand rides `aux` as a Ref (codex #4: `IrInstr` has no third operand
+    /// field; `assertWellFormed` pins it). A 2-arg `sub` records `aux` as a
+    /// konst −1 (the tier-0 default). Clamping semantics — never errors.
+    /// `ty = .heap`. Wire ordinal 65.
+    ssub,
+    /// `srev`: `string.reverse(s)` — `a` = proven-string ref, `ty = .heap`.
+    /// Wire ordinal 66.
+    srev,
+    /// `schar1`: 1-argument `string.char(c)` — `a` = proven-int ref,
+    /// `ty = .heap`. The variadic shape stays a recording abort (no operand
+    /// vector encoding). An out-of-range `c` (tier-0 would raise) side-exits
+    /// with no allocation; tier-0's replay raises the located error.
+    /// Wire ordinal 67.
+    schar1,
+    /// `srep2`: 2-argument `string.rep(s, n)` — `a` = proven-string ref,
+    /// `b` = proven-int count ref, `ty = .heap`. The separator shape aborts
+    /// (pinned arity, codex #4). `n <= 0` interns the empty string; a
+    /// pathological `n` OOMs in scratch (before any link) and side-exits.
+    /// Wire ordinal 68.
+    srep2,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -11693,7 +11725,17 @@ pub const TraceState = struct {
                 .fsin, .fcos => std.debug.assert(ins.a < i),
                 // Doc 24 D4: `tostr_*` read their guarded numeric operand,
                 // `slen`/`guard_string` their string operand — all prior nodes.
-                .tostr_int, .tostr_num, .slen, .guard_string => std.debug.assert(ins.a < i),
+                .tostr_int, .tostr_num, .slen, .guard_string, .srev, .schar1 => std.debug.assert(ins.a < i),
+                .srep2 => {
+                    std.debug.assert(ins.a < i);
+                    std.debug.assert(ins.b < i);
+                },
+                // ssub's third operand rides `aux` as a Ref (doc 24 codex #4).
+                .ssub => {
+                    std.debug.assert(ins.a < i);
+                    std.debug.assert(ins.b < i);
+                    std.debug.assert(ins.aux >= 0 and ins.aux < i);
+                },
                 // `guard_gc` (doc 24 D3): operand-free; `aux` is the allocation
                 // bound `A` — a positive count stamped by `commit()`.
                 .guard_gc => std.debug.assert(ins.aux > 0),
@@ -11876,8 +11918,7 @@ pub const TraceState = struct {
                         const s = string_mod.String.fromHeader(kv.asHeap());
                         self.setReg(instr.a, try self.konst(Value.int(@intCast(s.cp_len))));
                     } else {
-                        const producer = self.rec.instrs.items[@intCast(rstr)].op;
-                        const proven = producer == .tostr_int or producer == .tostr_num;
+                        const proven = self.isProvenStringRef(rstr);
                         // Emitted raw; tropt's guard dedup (GuardKey) drops an
                         // exact duplicate — same discipline as `guard_table`.
                         if (!proven)
@@ -13376,6 +13417,11 @@ pub const TraceState = struct {
             .sin => return self.recFloatUnary(instr, regs, .sin, .fsin),
             .cos => return self.recFloatUnary(instr, regs, .cos, .fcos),
             .mtype => return self.recBMType(instr, regs),
+            .len => return self.recBSLen(instr, regs),
+            .sub => return self.recBSSub(instr, regs),
+            .reverse => return self.recBSRev(instr, regs),
+            .char => return self.recBSChar1(instr, regs),
+            .rep => return self.recBSRep2(instr, regs),
         }
     }
 
@@ -13542,6 +13588,135 @@ pub const TraceState = struct {
         const op: IrOp = if (argv.isInt()) .tostr_int else .tostr_num;
         const r = try self.emitAlloc(.{ .op = op, .a = arg_ref, .ty = .heap });
         self.setReg(instr.a, r);
+    }
+
+    /// Is `r`'s producer an op whose result is a PROVEN string (needs no
+    /// `guard_string`)? The tostr/snew producers stamp `ty = .heap` with
+    /// string-typed results by construction.
+    fn isProvenStringRef(self: *const TraceState, r: Ref) bool {
+        return switch (self.rec.instrs.items[@intCast(r)].op) {
+            .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2 => true,
+            else => false,
+        };
+    }
+
+    /// Resolve a builtin STRING argument (doc 24 c3): a konst interned string
+    /// or a proven producer passes ref-through; an observed string gets a
+    /// `guard_string` pin; anything else aborts (tier-0 owns coercions and
+    /// error raising). Returns the operand ref.
+    /// Null = the recording was aborted (`abort` flags it; the caller must
+    /// return without emitting) — the house `!?Ref` convention: `abort()`
+    /// itself is not an error, allocator failures still propagate as errors.
+    fn stringArgRef(self: *TraceState, arg_slot: u16, regs: RegWindow, operand: OperandDesig) !?Ref {
+        const r = try self.refOf(arg_slot);
+        if (self.konstValueOf(r)) |kv| {
+            if (!kv.isHeap() or kv.heapType() != .string) {
+                self.abort(.bad_type);
+                return null;
+            }
+            return r;
+        }
+        if (self.isProvenStringRef(r)) return r;
+        const v = regs.get(arg_slot);
+        if (!v.isHeap() or v.heapType() != .string) {
+            self.abort(.bad_type);
+            return null;
+        }
+        // tropt's GuardKey dedup drops an exact duplicate pin.
+        self.stampProv(try self.emit(.{ .op = .guard_string, .a = r }), .operand_type, operand, .neutral);
+        return r;
+    }
+
+    /// Resolve a builtin INT argument: konst int passes through; an observed
+    /// int gets a `guard_int` pin; float/other aborts (tier-0 owns the
+    /// integral-float coercion these builtins perform — recording it would
+    /// need an `int_of_float` shape no string bench exercises).
+    /// Null = aborted (see `stringArgRef`).
+    fn intArgRef(self: *TraceState, arg_slot: u16, regs: RegWindow, operand: OperandDesig) !?Ref {
+        const r = try self.refOf(arg_slot);
+        if (self.konstValueOf(r)) |kv| {
+            if (!kv.isInt()) {
+                self.abort(.bad_type);
+                return null;
+            }
+            return r;
+        }
+        if (!regs.get(arg_slot).isInt()) {
+            self.abort(.bad_type);
+            return null;
+        }
+        try self.guard(r, .guard_int, .operand_type, operand);
+        return r;
+    }
+
+    /// `string.len(s)` — non-allocating: the `#s` shape under `guard_builtin`.
+    /// Konst string folds to a `cp_len` konst (code points — NOT `rawlen`'s
+    /// byte length); otherwise `slen` on the proven/guarded ref.
+    fn recBSLen(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b != 1) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        try self.guardBuiltinCallee(instr.a, .len);
+        const arg_slot: u16 = @intCast(@as(usize, instr.a) + 1);
+        const r = try self.refOf(arg_slot);
+        if (self.konstValueOf(r)) |kv| {
+            if (!kv.isHeap() or kv.heapType() != .string) return self.abort(.bad_type);
+            const str = string_mod.String.fromHeader(kv.asHeap());
+            self.setReg(instr.a, try self.konst(Value.int(@intCast(str.cp_len))));
+            return;
+        }
+        const sref = (try self.stringArgRef(arg_slot, regs, .a1)) orelse return;
+        self.setReg(instr.a, try self.emit(.{ .op = .slen, .a = sref, .ty = .int }));
+    }
+
+    /// `string.sub(s, i[, j])` → `ssub` (snew class). The 2-arg shape records
+    /// its default `j = -1` as a konst — same value tier-0 defaults to — so
+    /// both shapes share one op. The third operand rides `aux` as a ref
+    /// (codex #4); clamping semantics mean the op itself never errors.
+    fn recBSSub(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b != 2 and instr.b != 3) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        try self.guardBuiltinCallee(instr.a, .sub);
+        const base: usize = instr.a;
+        const sref = (try self.stringArgRef(@intCast(base + 1), regs, .a1)) orelse return;
+        const iref = (try self.intArgRef(@intCast(base + 2), regs, .a2)) orelse return;
+        const jref: Ref = if (instr.b == 3)
+            (try self.intArgRef(@intCast(base + 3), regs, .a3)) orelse return
+        else
+            try self.konst(Value.int(-1));
+        const r = try self.emitAlloc(.{ .op = .ssub, .a = sref, .b = iref, .aux = @intCast(jref), .ty = .heap });
+        self.setReg(instr.a, r);
+    }
+
+    /// `string.reverse(s)` → `srev` (snew class).
+    fn recBSRev(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b != 1) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        try self.guardBuiltinCallee(instr.a, .reverse);
+        const sref = (try self.stringArgRef(@intCast(@as(usize, instr.a) + 1), regs, .a1)) orelse return;
+        self.setReg(instr.a, try self.emitAlloc(.{ .op = .srev, .a = sref, .ty = .heap }));
+    }
+
+    /// 1-argument `string.char(c)` → `schar1`. The variadic shape aborts
+    /// (`IrInstr` carries no operand vector — codex #4). Range failure is a
+    /// side-exit at run time, not a record-time concern.
+    fn recBSChar1(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b != 1) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        try self.guardBuiltinCallee(instr.a, .char);
+        const cref = (try self.intArgRef(@intCast(@as(usize, instr.a) + 1), regs, .a1)) orelse return;
+        self.setReg(instr.a, try self.emitAlloc(.{ .op = .schar1, .a = cref, .ty = .heap }));
+    }
+
+    /// 2-argument `string.rep(s, n)` → `srep2`. A separator argument aborts
+    /// (pinned arity, codex #4) — tier-0 owns the 3-arg shape.
+    fn recBSRep2(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b != 2) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        try self.guardBuiltinCallee(instr.a, .rep);
+        const base: usize = instr.a;
+        const sref = (try self.stringArgRef(@intCast(base + 1), regs, .a1)) orelse return;
+        const nref = (try self.intArgRef(@intCast(base + 2), regs, .a2)) orelse return;
+        self.setReg(instr.a, try self.emitAlloc(.{ .op = .srep2, .a = sref, .b = nref, .ty = .heap }));
     }
 
     /// `tonumber(v[, base])` — konst arguments fold at record time through
@@ -14313,7 +14488,17 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .alen,
         .fsin,
         .fcos,
+        .tostr_int,
+        .tostr_num,
+        .slen,
+        .guard_string,
+        .srev,
+        .schar1,
         => try w.print("%{d}", .{ins.a}),
+        // guard_gc's aux is the allocation bound, not an operand.
+        .guard_gc => try w.print("A={d}", .{ins.aux}),
+        // ssub's third operand rides aux as a ref (codex #4).
+        .ssub => try w.print("%{d}  %{d}  %{d}", .{ ins.a, ins.b, ins.aux }),
         // `guard_builtin` reads the callee `%a` and tags the builtin in `aux`.
         .guard_builtin => try w.print("%{d}  [{s}]", .{ ins.a, @tagName(@as(function.RecordedBuiltin, @enumFromInt(ins.aux))) }),
         .loop, .preheader => {},

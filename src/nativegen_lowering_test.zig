@@ -1255,3 +1255,256 @@ test "doc 24 c2: tostr_num renders floats through the one shared renderer (tier 
     try util.expectRegsEqual(&iregs, &nregs);
     try testing.expectEqual(iheap.object_count, nheap.object_count);
 }
+
+// --- doc 24 c3: the snew class (ssub/srev/schar1/srep2 + guard_string) ------
+
+/// The c3 flagship shape: `acc = acc + #reverse(sub(s, i, i+2)); i += 1;
+/// while i < limit`. regs: r0=i, r1=limit, r2=acc, r3=s (an invariant OBSERVED
+/// string → guard_string, prologue-pinned natively). Exercises the one
+/// three-operand op (`ssub`, end index in aux), proven-string chaining
+/// (srev.a and slen.a are producer results — no further guards), and the
+/// budget bound A=2.
+fn snewSubRevTrace(consts: []Value) Trace {
+    const instrs = struct {
+        var arr = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: i
+            .{ .op = .slot_load, .aux = 1 }, // 1: limit
+            .{ .op = .guard_int, .a = 0 }, // 2
+            .{ .op = .guard_int, .a = 1 }, // 3
+            .{ .op = .lt, .a = 0, .b = 1 }, // 4
+            .{ .op = .guard_true, .a = 4 }, // 5
+            .{ .op = .slot_load, .aux = 3 }, // 6: s
+            .{ .op = .guard_string, .a = 6 }, // 7
+            .{ .op = .konst, .aux = 0 }, // 8: 2
+            .{ .op = .add, .a = 0, .b = 8 }, // 9: i + 2
+            .{ .op = .guard_gc, .aux = 2 }, // 10: budget, A = 2
+            .{ .op = .ssub, .a = 6, .b = 0, .aux = 9, .ty = .heap }, // 11: sub(s, i, i+2)
+            .{ .op = .srev, .a = 11, .ty = .heap }, // 12: reverse(...)
+            .{ .op = .slen, .a = 12, .ty = .int }, // 13
+            .{ .op = .slot_load, .aux = 2 }, // 14: acc
+            .{ .op = .guard_int, .a = 14 }, // 15
+            .{ .op = .add, .a = 14, .b = 13 }, // 16
+            .{ .op = .konst, .aux = 1 }, // 17: 1
+            .{ .op = .add, .a = 0, .b = 17 }, // 18: i + 1
+            .{ .op = .phi, .b = 16, .aux = 2 },
+            .{ .op = .phi, .b = 18, .aux = 0 },
+            .{ .op = .loop },
+        };
+    };
+    const es = struct {
+        var arr = [_]u16{};
+    };
+    return Trace{ .anchor = undefined, .instrs = &instrs.arr, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
+}
+
+test "doc 24 c3: ssub + srev chain on a guard_string-pinned slot — tier parity, UTF-8 cp semantics, same allocation count" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var consts = [_]Value{ Value.int(2), Value.int(1) };
+    const t = snewSubRevTrace(&consts);
+
+    // Oracle heap owns the subject string; the ssub window slides across a
+    // MULTIBYTE region ("héllo": h é l l o), so a byte-indexed sub would
+    // diverge from the shared cp-indexed core immediately.
+    var iheap = gc.Heap.init(gpa);
+    defer iheap.deinit();
+    const isubj = try iheap.intern("héllo");
+    // i = 1..6 commit (exit at 7 > limit... limit=7 → i<7, commits i=1..6):
+    // windows hél/éll/llo/lo/o/"" — every sub result is 3,3,3,2,1,0 cps and
+    // srev preserves cp count, so acc = 12.
+    const regs_init_i = [_]Value{ Value.int(1), Value.int(7), Value.int(0), Value.heap(&isubj.header) };
+    const iobjs_before = iheap.object_count;
+    var iregs = regs_init_i;
+    const values = try gpa.alloc(Value, t.instrs.len);
+    defer gpa.free(values);
+    const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &t, &iregs, values);
+    try testing.expectEqual(@as(usize, 6), iresult.completed);
+    try testing.expectEqual(Value.int(12).payload.bits, iregs[2].payload.bits);
+    // The reversed multibyte window is a REAL cp reversal, not a byte reversal
+    // (byte-reversed "hél" would be invalid UTF-8).
+    try testing.expect(iheap.internedLookup("léh") != null);
+    try testing.expect(iheap.internedLookup("olléh") == null); // never a full reverse
+    const iallocs = iheap.object_count - iobjs_before;
+
+    // Native: fresh heap + its own copy of the subject, same trace.
+    var nheap = gc.Heap.init(gpa);
+    defer nheap.deinit();
+    const nsubj = try nheap.intern("héllo");
+    const regs_init_n = [_]Value{ Value.int(1), Value.int(7), Value.int(0), Value.heap(&nsubj.header) };
+    const nobjs_before = nheap.object_count;
+    var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    var nregs = regs_init_n;
+    const nresult = try util.runNative(ct, &nregs);
+    try testing.expectEqual(iresult.completed, nresult.completed);
+    // Scalar registers match bit-for-bit; the two heap registers hold each
+    // heap's own subject (pointers differ by construction), so compare the
+    // scalars and the subject identity separately.
+    try testing.expectEqual(iregs[0].payload.bits, nregs[0].payload.bits);
+    try testing.expectEqual(iregs[2].payload.bits, nregs[2].payload.bits);
+    try testing.expectEqual(@intFromPtr(&nsubj.header), nregs[3].payload.bits);
+    // Same allocation count — the doc 24 D2 id-stream claim for the snew class.
+    try testing.expectEqual(iallocs, nheap.object_count - nobjs_before);
+    try testing.expect(nheap.internedLookup("léh") != null);
+
+    // Re-running against the SAME heap re-interns nothing (pure cores + intern
+    // hits): committed count identical, object_count unchanged.
+    const objs_mid = nheap.object_count;
+    var rregs = regs_init_n;
+    const rresult = try util.runNative(ct, &rregs);
+    try testing.expectEqual(iresult.completed, rresult.completed);
+    try testing.expectEqual(objs_mid, nheap.object_count);
+}
+
+test "doc 24 c3: guard_string prologue pin — a non-string entry fails the prologue with regs untouched" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var consts = [_]Value{ Value.int(2), Value.int(1) };
+    const t = snewSubRevTrace(&consts);
+
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    var ct = nativegen.compileWithHeap(gpa, &t, &heap) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+
+    // (a) A TABLE in the string slot: TAG_HEAP passes the tag lane, the new
+    // `header.type == string` prologue check catches it — completed 0,
+    // prologue_fail, nothing allocated, registers untouched.
+    {
+        const tbl = try table.Table.create(gpa);
+        defer tbl.destroy(gpa);
+        const regs_init = [_]Value{ Value.int(1), Value.int(7), Value.int(0), Value.heap(&tbl.header) };
+        const objs_before = heap.object_count;
+        var nregs = regs_init;
+        const nresult = try util.runNative(ct, &nregs);
+        try testing.expectEqual(@as(usize, 0), nresult.completed);
+        try testing.expectEqual(irinterp.ExitReason.prologue_fail, nresult.exit_reason);
+        try testing.expectEqual(objs_before, heap.object_count);
+        try util.expectRegsEqual(&regs_init, &nregs);
+        // The tier-1a oracle side-exits at the guard_string body instr instead
+        // (it has no hoisted prologue) — same net effect: zero commits, zero
+        // allocations, regs untouched.
+        var iregs = regs_init;
+        const values = try gpa.alloc(Value, t.instrs.len);
+        defer gpa.free(values);
+        const iresult = irinterp.executeValuesCtx(.{ .heap = &heap }, &t, &iregs, values);
+        try testing.expectEqual(@as(usize, 0), iresult.completed);
+        try testing.expectEqual(@as(u32, 7), iresult.exit_instr);
+        try testing.expectEqual(objs_before, heap.object_count);
+        try util.expectRegsEqual(&regs_init, &iregs);
+    }
+
+    // (b) An INT in the string slot: the [RV-1] TAG_HEAP tag-lane check
+    // catches it even earlier — same contract.
+    {
+        const regs_init = [_]Value{ Value.int(1), Value.int(7), Value.int(0), Value.int(42) };
+        var nregs = regs_init;
+        const nresult = try util.runNative(ct, &nregs);
+        try testing.expectEqual(@as(usize, 0), nresult.completed);
+        try testing.expectEqual(irinterp.ExitReason.prologue_fail, nresult.exit_reason);
+        try util.expectRegsEqual(&regs_init, &nregs);
+    }
+
+    // (c) Fail closed with NO heap: the compiler declines any snew trace.
+    {
+        var arena = McodeArena.init(gpa);
+        defer arena.deinit();
+        try testing.expect(compileInto(gpa, &arena, &t, null, null) == null);
+    }
+}
+
+test "doc 24 c3: schar1 + srep2 — tier parity incl. the n<=0 empty repeat and the invalid-codepoint side-exit" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // acc = acc + #rep(char(base + i), i); i += 1; while i < limit.
+    // regs: r0=i, r1=limit, r2=acc. consts: [base, 1].
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: i
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_int, .a = 0 }, // 2
+        .{ .op = .guard_int, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .konst, .aux = 0 }, // 6: base
+        .{ .op = .add, .a = 0, .b = 6 }, // 7: base + i
+        .{ .op = .guard_gc, .aux = 2 }, // 8: budget, A = 2
+        .{ .op = .schar1, .a = 7, .ty = .heap }, // 9: char(base+i)
+        .{ .op = .srep2, .a = 9, .b = 0, .ty = .heap }, // 10: rep(c, i)
+        .{ .op = .slen, .a = 10, .ty = .int }, // 11
+        .{ .op = .slot_load, .aux = 2 }, // 12: acc
+        .{ .op = .guard_int, .a = 12 }, // 13
+        .{ .op = .add, .a = 12, .b = 11 }, // 14
+        .{ .op = .konst, .aux = 1 }, // 15: 1
+        .{ .op = .add, .a = 0, .b = 15 }, // 16: i + 1
+        .{ .op = .phi, .b = 14, .aux = 2 },
+        .{ .op = .phi, .b = 16, .aux = 0 },
+        .{ .op = .loop },
+    };
+    var es = [_]u16{};
+
+    // (a) Multibyte happy path from a NEGATIVE i: base 233 → char(233+i) is a
+    // 2-byte 1-cp "é"-neighbourhood codepoint; i = -2, -1, 0 exercise
+    // rep2Core's n<=0 → "" arm (slen 0), then i = 1..4 accumulate i cps each
+    // (cp-len, not byte-len). acc = 1+2+3+4 = 10.
+    {
+        var consts = [_]Value{ Value.int(233), Value.int(1) };
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+        const regs_init = [_]Value{ Value.int(-2), Value.int(5), Value.int(0) };
+
+        var iheap = gc.Heap.init(gpa);
+        defer iheap.deinit();
+        const iobjs_before = iheap.object_count;
+        var iregs = regs_init;
+        const values = try gpa.alloc(Value, t.instrs.len);
+        defer gpa.free(values);
+        const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &t, &iregs, values);
+        try testing.expectEqual(@as(usize, 7), iresult.completed);
+        try testing.expectEqual(Value.int(10).payload.bits, iregs[2].payload.bits);
+        try testing.expect(iheap.internedLookup("") != null); // the n<=0 arm ran
+
+        var nheap = gc.Heap.init(gpa);
+        defer nheap.deinit();
+        const nobjs_before = nheap.object_count;
+        var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+        defer ct.deinit();
+        var nregs = regs_init;
+        const nresult = try util.runNative(ct, &nregs);
+        try testing.expectEqual(iresult.completed, nresult.completed);
+        try util.expectRegsEqual(&iregs, &nregs);
+        try testing.expectEqual(iheap.object_count - iobjs_before, nheap.object_count - nobjs_before);
+    }
+
+    // (b) Invalid codepoint mid-run: base just below the Unicode ceiling, so
+    // char(base+i) is valid for i=1,2 (0x10FFFF is the last valid codepoint)
+    // and OUT OF RANGE at i=3. Both tiers
+    // commit exactly 2 iterations and side-exit at the schar1 (the collapsed
+    // D5 vm_error arm: null → clean exit; tier-0 replay re-raises), with
+    // byte-identical registers and allocation counts.
+    {
+        var consts = [_]Value{ Value.int(0x10FFFF - 2), Value.int(1) };
+        const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+        const regs_init = [_]Value{ Value.int(1), Value.int(100), Value.int(0) };
+
+        var iheap = gc.Heap.init(gpa);
+        defer iheap.deinit();
+        const iobjs_before = iheap.object_count;
+        var iregs = regs_init;
+        const values = try gpa.alloc(Value, t.instrs.len);
+        defer gpa.free(values);
+        const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &t, &iregs, values);
+        try testing.expectEqual(@as(usize, 2), iresult.completed);
+        try testing.expectEqual(@as(u32, 9), iresult.exit_instr);
+
+        var nheap = gc.Heap.init(gpa);
+        defer nheap.deinit();
+        const nobjs_before = nheap.object_count;
+        var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+        defer ct.deinit();
+        var nregs = regs_init;
+        const nresult = try util.runNative(ct, &nregs);
+        try testing.expectEqual(iresult.completed, nresult.completed);
+        try testing.expectEqual(iresult.exit_instr, nresult.exit_instr);
+        try util.expectRegsEqual(&iregs, &nregs);
+        try testing.expectEqual(iheap.object_count - iobjs_before, nheap.object_count - nobjs_before);
+    }
+}

@@ -30,6 +30,7 @@ const string_mod = @import("../string.zig");
 const table_mod = @import("../table.zig");
 const pattern = @import("pattern.zig");
 const decimal = @import("decimal.zig");
+const gc = @import("../gc.zig");
 const unicode_case = @import("../gen/unicode_case.zig");
 
 const Value = value.Value;
@@ -161,11 +162,88 @@ fn decodeAt(s: []const u8, off: usize) struct { cp: u21, len: usize } {
 /// surrogate halves (`utf8Encode` errors on the latter two) with the located
 /// `bad argument #argn ... (value out of range)`.
 fn appendCodepoint(vm: *Vm, argn: usize, code: i64, buf: *std.ArrayList(u8)) anyerror!void {
-    if (code < 0 or code > 0x10FFFF) return vm.badArgReason(argn, "value out of range");
     var tmp: [4]u8 = undefined;
-    const n = std.unicode.utf8Encode(@intCast(code), &tmp) catch
+    const n = encodeCodepoint(code, &tmp) orelse
         return vm.badArgReason(argn, "value out of range");
     try buf.appendSlice(vm.gpa, tmp[0..n]);
+}
+
+// ---------------------------------------------------------------------------
+// snew-class heap-only cores (doc 24 D5 — arc B c3)
+//
+// ONE transform body per allocating string builtin, shared by every tier:
+// the tier-0 natives below wrap these (argument parsing + error location stay
+// in the wrappers), and the JIT callouts (`src/stralloc.zig`) call the SAME
+// functions through C-ABI shims — so the produced bytes, the interned object,
+// and the allocation count are identical across tiers by construction.
+//
+// Audit rule (doc 24 D5): each core performs at most ONE `Heap.link` (the
+// single `intern`; an intern hit performs zero), and no `link` precedes a
+// fallible step (scratch allocation happens BEFORE the intern; `Heap.intern`
+// itself is transactional). Scratch comes from `heap.gpa` — the same gpa the
+// tier-0 wrappers use (`Vm.initBare` feeds both from one allocator).
+// ---------------------------------------------------------------------------
+
+/// `string.sub` core: character-position substring with Lua's negative-index
+/// and clamping rules (never errors). Interns a subslice directly — no scratch.
+pub fn subCore(heap: *gc.Heap, s: *const String, i_arg: i64, j_arg: i64) std.mem.Allocator.Error!*String {
+    const clen = s.cpLen();
+    var i = posRelat(i_arg, clen);
+    var j = posRelat(j_arg, clen);
+    if (i < 1) i = 1;
+    if (j > @as(i64, @intCast(clen))) j = @intCast(clen);
+    if (i > j) return heap.intern(""); // empty
+    const bytes = s.bytes();
+    const start = charByteOffset(bytes, @intCast(i));
+    const end = charByteOffset(bytes, @intCast(j + 1));
+    return heap.intern(bytes[start..end]);
+}
+
+/// `string.reverse` core: characters reversed, each UTF-8 sequence moved as a
+/// unit. Scratch resize is the only fallible step and precedes the intern.
+pub fn reverseCore(heap: *gc.Heap, bytes: []const u8) std.mem.Allocator.Error!*String {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(heap.gpa);
+    try buf.resize(heap.gpa, bytes.len);
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = @min(std.unicode.utf8ByteSequenceLength(bytes[off]) catch 1, bytes.len - off);
+        const dst = bytes.len - off - n; // mirror this char's bytes (in order)
+        @memcpy(buf.items[dst .. dst + n], bytes[off .. off + n]);
+        off += n;
+    }
+    return heap.intern(buf.items);
+}
+
+/// Encode one code point to UTF-8, or null when out of range (negative,
+/// `> 0x10FFFF`, or a surrogate half). The ONE validation+encode body behind
+/// both tier-0 `string.char` (via `appendCodepoint`) and the JIT's
+/// `char1Core` — keep them in lockstep by construction.
+fn encodeCodepoint(code: i64, out: *[4]u8) ?usize {
+    if (code < 0 or code > 0x10FFFF) return null;
+    return std.unicode.utf8Encode(@intCast(code), out) catch null;
+}
+
+/// 1-argument `string.char` core. `error.OutOfRange` means tier-0 would raise
+/// `bad argument` for this value — the JIT side-exits (no link happened) and
+/// tier-0's replay raises the located error itself.
+pub fn char1Core(heap: *gc.Heap, code: i64) (error{OutOfRange} || std.mem.Allocator.Error)!*String {
+    var tmp: [4]u8 = undefined;
+    const n = encodeCodepoint(code, &tmp) orelse return error.OutOfRange;
+    return heap.intern(tmp[0..n]);
+}
+
+/// 2-argument `string.rep` core (no separator). `n <= 0` → the empty string.
+/// Scratch growth is fallible and precedes the intern; a pathological `n`
+/// OOMs here, side-exits, and tier-0's replay re-raises the same OOM.
+pub fn rep2Core(heap: *gc.Heap, bytes: []const u8, n: i64) std.mem.Allocator.Error!*String {
+    if (n <= 0) return heap.intern("");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(heap.gpa);
+    const count: usize = @intCast(n);
+    var k: usize = 0;
+    while (k < count) : (k += 1) try buf.appendSlice(heap.gpa, bytes);
+    return heap.intern(buf.items);
 }
 
 // ---------------------------------------------------------------------------
@@ -186,18 +264,10 @@ fn sLen(ctx: *anyopaque, args: []const Value) anyerror!Value {
 fn sSub(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const s = try strObjArg(vm, args, 0);
-    const clen = s.cpLen();
-
-    var i = posRelat(try optIntArg(vm, args, 1, 1), clen);
-    var j = posRelat(try optIntArg(vm, args, 2, -1), clen);
-    if (i < 1) i = 1;
-    if (j > @as(i64, @intCast(clen))) j = @intCast(clen);
-    if (i > j) return vm.heap.internValue(""); // empty
-
-    const bytes = s.bytes();
-    const start = charByteOffset(bytes, @intCast(i));
-    const end = charByteOffset(bytes, @intCast(j + 1));
-    return vm.heap.internValue(bytes[start..end]);
+    const i = try optIntArg(vm, args, 1, 1);
+    const j = try optIntArg(vm, args, 2, -1);
+    const r = try subCore(vm.heap, s, i, j);
+    return Value.heap(&r.header);
 }
 
 /// `string.reverse(s)` — characters reversed (S-B): each UTF-8 sequence is moved
@@ -205,19 +275,8 @@ fn sSub(ctx: *anyopaque, args: []const Value) anyerror!Value {
 fn sReverse(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const s = try strObjArg(vm, args, 0);
-    const bytes = s.bytes();
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(vm.gpa);
-    try buf.resize(vm.gpa, bytes.len);
-
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = @min(std.unicode.utf8ByteSequenceLength(bytes[off]) catch 1, bytes.len - off);
-        const dst = bytes.len - off - n; // mirror this char's bytes (in order)
-        @memcpy(buf.items[dst .. dst + n], bytes[off .. off + n]);
-        off += n;
-    }
-    return vm.heap.internValue(buf.items);
+    const r = try reverseCore(vm.heap, s.bytes());
+    return Value.heap(&r.header);
 }
 
 /// `string.upper(s)` — Unicode simple (1:1) uppercase (default, locale-independent).
@@ -284,6 +343,10 @@ fn sRep(ctx: *anyopaque, args: []const Value) anyerror!Value {
         (interp.strBytes(args[2]) orelse return vm.badArg(3, "string", args[2]))
     else
         "";
+    if (sep.len == 0) { // the recordable 2-arg shape shares the ONE core
+        const r = try rep2Core(vm.heap, s, n);
+        return Value.heap(&r.header);
+    }
     if (n <= 0) return vm.heap.internValue("");
 
     var buf: std.ArrayList(u8) = .empty;
@@ -1233,13 +1296,13 @@ fn sDecode(ctx: *anyopaque, args: []const Value) anyerror!Value {
 // ---------------------------------------------------------------------------
 
 pub const natives = [_]function.BaseNative{
-    .{ .name = "string.len", .func = &sLen, .module = "string", .field = "len" },
-    .{ .name = "string.sub", .func = &sSub, .module = "string", .field = "sub" },
-    .{ .name = "string.reverse", .func = &sReverse, .module = "string", .field = "reverse" },
+    .{ .name = "string.len", .func = &sLen, .module = "string", .field = "len", .recorded = .len },
+    .{ .name = "string.sub", .func = &sSub, .module = "string", .field = "sub", .recorded = .sub },
+    .{ .name = "string.reverse", .func = &sReverse, .module = "string", .field = "reverse", .recorded = .reverse },
     .{ .name = "string.upper", .func = &sUpper, .module = "string", .field = "upper" },
     .{ .name = "string.lower", .func = &sLower, .module = "string", .field = "lower" },
-    .{ .name = "string.rep", .func = &sRep, .module = "string", .field = "rep" },
-    .{ .name = "string.char", .func = &sChar, .module = "string", .field = "char" },
+    .{ .name = "string.rep", .func = &sRep, .module = "string", .field = "rep", .recorded = .rep },
+    .{ .name = "string.char", .func = &sChar, .module = "string", .field = "char", .recorded = .char },
     // S-B (design doc 06): `string.codepoint` (scalar values at character
     // positions) replaces the byte-returning `string.byte`; `string.codes` is the
     // `(index, codepoint)` iterator. Raw bytes now come from `s:encode()`.
