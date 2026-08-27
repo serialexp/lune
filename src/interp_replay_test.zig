@@ -91,7 +91,7 @@ fn replayProbe(gpa: std.mem.Allocator, source: [:0]const u8, stop_after: u64) !R
     vm.out = &sink;
     vm.suspend_ctl = .{ .after_safepoints = stop_after };
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -136,7 +136,7 @@ fn recordSafepointLines(gpa: std.mem.Allocator, source: [:0]const u8) ![]u32 {
     vm.source = source;
     vm.record_safepoint_lines = true;
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -252,7 +252,7 @@ test "replay: backtraceFrames reports a deepest-first chain at a suspend inside 
     // Suspend the first time we are at least 3 frames deep (main → outer → inner).
     vm.suspend_ctl = .{ .min_depth = 3, .after_safepoints = 0 };
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -293,7 +293,7 @@ test "top-level re-entry on a suspended (dirty) VM fails closed (doc 17 H-3 / 9-
     vm.out = &sink;
     vm.suspend_ctl = .{ .min_depth = 3, .after_safepoints = 0 };
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -339,7 +339,7 @@ test "H-3: a clean fresh top-level epoch clears region_profit wholesale" {
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 

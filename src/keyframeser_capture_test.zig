@@ -164,7 +164,7 @@ fn withSnapshot(source: [:0]const u8, check: *const fn (file: schema.SnapshotFil
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);

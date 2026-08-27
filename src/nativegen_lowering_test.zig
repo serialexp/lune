@@ -848,7 +848,7 @@ test "nativegen A-v: composite bridge prefix emits but unarmed exit takes ordina
 
     var arena = McodeArena.init(gpa);
     defer arena.deinit();
-    var ct = compileInto(gpa, &arena, &t, null) orelse return error.NativeBailedUnexpectedly;
+    var ct = compileInto(gpa, &arena, &t, null, null) orelse return error.NativeBailedUnexpectedly;
     defer ct.deinit();
     const shared_exit = arena.trampoline_exit.?;
     try testing.expectEqual(shared_exit, ct.slots[7]); // A-v publishes no bridge arm.
@@ -1037,4 +1037,221 @@ test "exec memory: a loop with a backward jump runs natively" {
     try testing.expectEqual(@as(i64, 0), f(0));
     try testing.expectEqual(@as(i64, 15), f(5)); // 5+4+3+2+1
     try testing.expectEqual(@as(i64, 55), f(10));
+}
+
+// --- doc 24 c2: allocating traces (tostr_int/tostr_num + slen + guard_gc) ---
+
+const gc = @import("gc.zig");
+const string_mod = @import("string.zig");
+
+/// The doc 24 c2 shape: `acc = acc + #tostring(i); i += 1; while i < limit`.
+/// regs: r0=i, r1=limit, r2=acc. `guard_gc` carries the trace's alloc bound
+/// (A=1) and sits, per the lazy-placement rule, immediately before the first
+/// `.alloc` op.
+fn tostrLenTrace(consts: []Value) Trace {
+    const instrs = struct {
+        var arr = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: i
+            .{ .op = .slot_load, .aux = 1 }, // 1: limit
+            .{ .op = .guard_int, .a = 0 }, // 2
+            .{ .op = .guard_int, .a = 1 }, // 3
+            .{ .op = .lt, .a = 0, .b = 1 }, // 4: i < limit
+            .{ .op = .guard_true, .a = 4 }, // 5
+            .{ .op = .guard_gc, .aux = 1 }, // 6: budget guard, A = 1
+            .{ .op = .tostr_int, .a = 0, .ty = .heap }, // 7: tostring(i)
+            .{ .op = .slen, .a = 7, .ty = .int }, // 8: #tostring(i)
+            .{ .op = .slot_load, .aux = 2 }, // 9: acc
+            .{ .op = .guard_int, .a = 9 }, // 10
+            .{ .op = .add, .a = 9, .b = 8 }, // 11: acc + len
+            .{ .op = .konst, .aux = 0 }, // 12: 1
+            .{ .op = .add, .a = 0, .b = 12 }, // 13: i + 1
+            .{ .op = .phi, .b = 11, .aux = 2 },
+            .{ .op = .phi, .b = 13, .aux = 0 },
+            .{ .op = .loop },
+        };
+    };
+    const es = struct {
+        var arr = [_]u16{};
+    };
+    return Trace{ .anchor = undefined, .instrs = &instrs.arr, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
+}
+
+test "doc 24 c2: tostr_int + slen + guard_gc — tier-1a and native match, same allocation count" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var consts = [_]Value{Value.int(1)};
+    const t = tostrLenTrace(&consts);
+    // i = 1..12 commit (exit when i == 13): acc = 9×1 + 3×2 = 15. Crosses the
+    // 1-digit → 2-digit rendering boundary, so slen isn't constant.
+    const regs_init = [_]Value{ Value.int(1), Value.int(13), Value.int(0) };
+
+    // Oracle: tier-1a with its own heap.
+    var iheap = gc.Heap.init(gpa);
+    defer iheap.deinit();
+    const iobjs_before = iheap.object_count;
+    var iregs = regs_init;
+    const values = try gpa.alloc(Value, t.instrs.len);
+    defer gpa.free(values);
+    const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &t, &iregs, values);
+    try testing.expectEqual(@as(usize, 12), iresult.completed);
+    try testing.expectEqual(Value.int(13).payload.bits, iregs[0].payload.bits);
+    try testing.expectEqual(Value.int(15).payload.bits, iregs[2].payload.bits);
+    // Twelve fresh interned strings ("1".."12"), each exactly once.
+    try testing.expectEqual(iobjs_before + 12, iheap.object_count);
+    try testing.expect(iheap.internedLookup("12") != null);
+
+    // Native: fresh heap, same trace, byte-identical registers AND the same
+    // allocation count — the doc 24 D2 id-stream claim at this trace's scale.
+    var nheap = gc.Heap.init(gpa);
+    defer nheap.deinit();
+    const nobjs_before = nheap.object_count;
+    var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    var nregs_arr = regs_init;
+    const nregs: []Value = &nregs_arr;
+    const nresult = try util.runNative(ct, nregs);
+    try testing.expectEqual(iresult.completed, nresult.completed);
+    try util.expectRegsEqual(&iregs, nregs);
+    try testing.expectEqual(iheap.object_count - iobjs_before, nheap.object_count - nobjs_before);
+    try testing.expect(nheap.internedLookup("12") != null);
+
+    // Re-running against the SAME heap re-interns nothing (intern hits), and
+    // the committed count is identical — rendering is pure.
+    const objs_mid = nheap.object_count;
+    var rregs_arr = regs_init;
+    const rresult = try util.runNative(ct, &rregs_arr);
+    try testing.expectEqual(iresult.completed, rresult.completed);
+    try testing.expectEqual(objs_mid, nheap.object_count);
+}
+
+test "doc 24 c2: guard_gc declines at the header — budget exceeded, gc_stress, and no-heap all exit with ZERO allocations" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var consts = [_]Value{Value.int(1)};
+    const t = tostrLenTrace(&consts);
+    const regs_init = [_]Value{ Value.int(1), Value.int(13), Value.int(0) };
+
+    // (a) Budget exceeded: object_count + A >= next_gc fails the guard on
+    // entry — completed == 0, exit at the guard_gc instr, nothing interned,
+    // registers untouched.
+    {
+        var heap = gc.Heap.init(gpa);
+        defer heap.deinit();
+        heap.next_gc = heap.object_count; // saturate the budget
+        const objs_before = heap.object_count;
+        const strs_before = heap.strtab_count;
+
+        var iregs = regs_init;
+        const values = try gpa.alloc(Value, t.instrs.len);
+        defer gpa.free(values);
+        const iresult = irinterp.executeValuesCtx(.{ .heap = &heap }, &t, &iregs, values);
+        try testing.expectEqual(@as(usize, 0), iresult.completed);
+        try testing.expectEqual(@as(u32, 6), iresult.exit_instr);
+        try testing.expectEqual(objs_before, heap.object_count);
+        try testing.expectEqual(strs_before, heap.strtab_count);
+        try util.expectRegsEqual(&regs_init, &iregs);
+
+        var ct = nativegen.compileWithHeap(gpa, &t, &heap) orelse return error.NativeBailedUnexpectedly;
+        defer ct.deinit();
+        var nregs = regs_init;
+        const nresult = try util.runNative(ct, &nregs);
+        try testing.expectEqual(@as(usize, 0), nresult.completed);
+        try testing.expectEqual(@as(u32, 6), nresult.exit_instr);
+        try testing.expectEqual(objs_before, heap.object_count);
+        try util.expectRegsEqual(&regs_init, &nregs);
+    }
+
+    // (b) gc_stress: the budget arithmetic passes but the stress conjunct
+    // fails — every entry must fall back to tier-0 (which owns per-safepoint
+    // collection under stress).
+    {
+        var heap = gc.Heap.init(gpa);
+        defer heap.deinit();
+        heap.gc_stress = true;
+        const objs_before = heap.object_count;
+
+        var iregs = regs_init;
+        const values = try gpa.alloc(Value, t.instrs.len);
+        defer gpa.free(values);
+        const iresult = irinterp.executeValuesCtx(.{ .heap = &heap }, &t, &iregs, values);
+        try testing.expectEqual(@as(usize, 0), iresult.completed);
+        try testing.expectEqual(@as(u32, 6), iresult.exit_instr);
+        try testing.expectEqual(objs_before, heap.object_count);
+
+        var ct = nativegen.compileWithHeap(gpa, &t, &heap) orelse return error.NativeBailedUnexpectedly;
+        defer ct.deinit();
+        var nregs = regs_init;
+        const nresult = try util.runNative(ct, &nregs);
+        try testing.expectEqual(@as(usize, 0), nresult.completed);
+        try testing.expectEqual(@as(u32, 6), nresult.exit_instr);
+        try testing.expectEqual(objs_before, heap.object_count);
+    }
+
+    // (c) Fail closed with NO heap: tier-1a's guard_gc arm side-exits (bare
+    // harness), and the native compiler declines the trace outright.
+    {
+        var iregs = regs_init;
+        const values = try gpa.alloc(Value, t.instrs.len);
+        defer gpa.free(values);
+        const iresult = irinterp.executeValues(&t, &iregs, values);
+        try testing.expectEqual(@as(usize, 0), iresult.completed);
+        try testing.expectEqual(@as(u32, 6), iresult.exit_instr);
+
+        var arena = McodeArena.init(gpa);
+        defer arena.deinit();
+        try testing.expect(compileInto(gpa, &arena, &t, null, null) == null);
+    }
+}
+
+test "doc 24 c2: tostr_num renders floats through the one shared renderer (tier parity)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    // acc = acc + #tostring(f); f += 0.5; while f < limit. regs: r0=f, r1=limit, r2=acc.
+    var instrs = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: f
+        .{ .op = .slot_load, .aux = 1 }, // 1: limit
+        .{ .op = .guard_float, .a = 0 }, // 2
+        .{ .op = .guard_float, .a = 1 }, // 3
+        .{ .op = .lt, .a = 0, .b = 1 }, // 4
+        .{ .op = .guard_true, .a = 4 }, // 5
+        .{ .op = .guard_gc, .aux = 1 }, // 6
+        .{ .op = .tostr_num, .a = 0, .ty = .heap }, // 7
+        .{ .op = .slen, .a = 7, .ty = .int }, // 8
+        .{ .op = .slot_load, .aux = 2 }, // 9: acc
+        .{ .op = .guard_int, .a = 9 }, // 10
+        .{ .op = .add, .a = 9, .b = 8 }, // 11
+        .{ .op = .konst, .aux = 0 }, // 12: 0.5
+        .{ .op = .add, .a = 0, .b = 12, .ty = .float }, // 13: f + 0.5
+        .{ .op = .phi, .b = 11, .aux = 2 },
+        .{ .op = .phi, .b = 13, .aux = 0 },
+        .{ .op = .loop },
+    };
+    var consts = [_]Value{Value.float(0.5)};
+    var es = [_]u16{};
+    const t = Trace{ .anchor = undefined, .instrs = &instrs, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+    // f = 1.0, 1.5, 2.0, 2.5 commit (exit at 3.0): io.writeValue renders
+    // shortest-round-trip ("1", "1.5", "2", "2.5") → 1+3+1+3 = 8. Pins that
+    // tostr_num goes through the ONE shared renderer — the same lengths tier-0's
+    // bToString produces, so a renderer swap that breaks parity trips this.
+    const regs_init = [_]Value{ Value.float(1.0), Value.float(3.0), Value.int(0) };
+
+    var iheap = gc.Heap.init(gpa);
+    defer iheap.deinit();
+    var iregs = regs_init;
+    const values = try gpa.alloc(Value, t.instrs.len);
+    defer gpa.free(values);
+    const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &t, &iregs, values);
+    try testing.expectEqual(@as(usize, 4), iresult.completed);
+    try testing.expectEqual(Value.int(8).payload.bits, iregs[2].payload.bits);
+    try testing.expect(iheap.internedLookup("1.5") != null);
+
+    var nheap = gc.Heap.init(gpa);
+    defer nheap.deinit();
+    var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    var nregs = regs_init;
+    const nresult = try util.runNative(ct, &nregs);
+    try testing.expectEqual(iresult.completed, nresult.completed);
+    try util.expectRegsEqual(&iregs, &nregs);
+    try testing.expectEqual(iheap.object_count, nheap.object_count);
 }

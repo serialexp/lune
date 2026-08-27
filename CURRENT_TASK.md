@@ -21,7 +21,61 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
-## Status 2026-08-27 (LATEST-86, IN FLIGHT) — **arc B designed + codex-reviewed: doc 24 "deterministic on-trace allocation", v1 pivoted to the allocation-budget entry guard. Implementation NOT started.**
+## Status 2026-08-27 (LATEST-87, IN FLIGHT) — **arc B c1+c2 LANDED: scalar's `#tostring(i)` loop records END-TO-END (zero aborts) and runs tier-1a (~849 c/it vs ~1480 tier-0; wall 0.29→0.20 s at N=1M). Native is blocked ONLY by the deferred `mod` lowering (TODO item 3). c3 (snew class) + c4 (adversarial matrix/board) remain.**
+
+**c1 (495f1e5):** mtype fold arm (RecordedBuiltin mtype=11) + alen sunk-store
+refinement (D7). lua54's abort frontier moved pc 21 → 65 (`table.pack`, out of
+v1 scope — TODO entry). **c2 (this commit):** the whole D3/D4/D5 scalar slice —
+see the commit message for the mechanism inventory. Highlights and the
+implementation decisions that now bind (recorded as doc-24 implementation notes
+to write in c4):
+
+- **Wire ops as built (count 60→65):** tostr_int=60, tostr_num=61, slen=62,
+  guard_string=63, guard_gc=64 (aux=A). c3 plan: ssub=65, srev=66, schar1=67,
+  srep2=68; RecordedBuiltin len=12, sub=13, reverse=14, char=15, rep=16
+  (mtype took 11 in c1 — supersedes the LATEST-86 numbering sketch).
+- **guard_gc is placed LAZILY before the trace's first `.alloc` op** (not
+  physical index 0): preceding effects are already header-replay-idempotent
+  under C1, and a failing guard_gc ⇒ zero allocations this iteration ⇒ clean
+  D2 replay. Avoids renumbering every existing trace shape.
+- **Exit-PC exclusion is STRUCTURAL:** guard_gc is simply not in
+  `guardExitPc`/`isSideExitGuardOp`, so hot-guard counters, side-trace
+  recording, and exit chaining all ignore it with zero surgery.
+- **tropt got two new OpKinds:** `.alloc` (tostr — effectful value-producing
+  roots, never DCE/hoist/fold/CSE; CSE-for-tostr admitted by codex #8 but
+  deferred) and `.gcguard` (guard_gc's `a` is UNUSED — classifying it `.guard`
+  would misread instr 0 as its operand).
+- **`Vm.heap` is now a stable `*gc.Heap`** (gpa.create in initBare): native
+  pages bake `&heap.gc_stress`/`object_count`/`next_gc` and pass the heap to
+  the `stralloc` callouts as imm64s. The by-value Vm may move (the
+  NativeSeedCtx precedent), so the heap HAD to leave it. ~94 mechanical
+  `&vm.heap`→`vm.heap` sites; `TraceState.exec_heap` is the once-set mutable
+  channel (vs `rec_heap`, still refreshed per recordInstr).
+- **Blackout (codex #2) = two candidate-loop skips:** trial walk declines
+  `alloc_bound > 0` traces while `suspend_ctl != null or
+  record_safepoint_lines`; driveChain reuses the already-threaded
+  `safe_to_arm` (identical condition). Armed-slot fusion needs no extra gate —
+  `disarmAllLinks` already fires on unsafe.
+- **guard_string native lowering deferred to c3** (proveKinds bails; the
+  scalar slice never needs it — tostr results are producer-proven).
+- **Gates run:** `zig build test` + `-Djit-debug=true` (1006/1006); hashgate
+  84/84; scalar t0/--trace/--jit-native/LuaJIT all byte-identical
+  (acc=2188895 / 22888896 at N=1M); `--dump-aborts`: NO aborts; recorder-shape
+  + tier-1a/native differential tests incl. same-allocation-count (D2),
+  guard_gc decline legs (budget/gc_stress/no-heap), and the tostr_num
+  shared-renderer pin ("1"/"1.5" shortest-round-trip).
+- **Found & fixed en route:** H-2 clearCache test used `#tostring(i)` as its
+  abort-log seed — now records, so the seed moved to `tostring(t)` (table,
+  still aborts); five `const gc` locals in irinterp shadowed the new gc
+  import (renamed `gcell`); float `lt`+`add` hand-built traces need `.ty =
+  .float` stamped (recorder always stamps; tests didn't).
+- **`--jit-native` scalar is unchanged vs pre-arc-B** (tier-0 owned it then
+  via the recording abort, owns it now via the native-unsupported gate on
+  `mod`). The tier-1a win is real and the native win is one small general
+  lowering away (int `mod`: idiv + floored-sign fix — TODO item 3, priority
+  note added).
+
+## Status 2026-08-27 (LATEST-86, superseded by 87) — **arc B designed + codex-reviewed: doc 24 "deterministic on-trace allocation", v1 pivoted to the allocation-budget entry guard.**
 
 Design record (full detail in docs/design/24-deterministic-on-trace-allocation.md
 + its codex ledger; constraint inventory citations in the doc):

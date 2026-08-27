@@ -253,7 +253,7 @@ fn runOuterCycle(gpa: std.mem.Allocator, window_open: bool) !OuterCycleRun {
     vm.trace.config.hotguard = 3; // close the cross-anchor cycle inside a short run
     vm.record_safepoint_lines = window_open;
 
-    var chunk = try compiler.compile(gpa, &vm.heap, aviii_outer_cycle_source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, aviii_outer_cycle_source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -441,7 +441,7 @@ test "A-viii (doc 17 §A8 step 8): opening the window MID-EPOCH over a live arme
     const native = try vm.heap.newNative(aviiiProbe, "aviii_probe");
     try vm.globals.set(gpa, try vm.heap.internValue("aviii_probe"), Value.heap(&native.header));
 
-    var chunk = try compiler.compile(gpa, &vm.heap, aviii_mid_epoch_source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, aviii_mid_epoch_source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -585,7 +585,7 @@ test "doc 20 §T (Phase 1 e2e): a qualified hot loop actually installs and binds
         vm.trace.config.optimize = true;
         vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
         vm.trace.config.hotloop = 4;
-        var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
         defer chunk.deinit();
         try testing.expect(!diags.hasErrors());
         _ = try vm.run(chunk.proto);
@@ -616,7 +616,7 @@ test "doc 20 §T (Phase 1 e2e): a qualified hot loop actually installs and binds
         defer vm.deinit();
         var sink = io.Writer.fixed(&out_t0);
         vm.out = &sink;
-        var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
         defer chunk.deinit();
         try testing.expect(!diags.hasErrors());
         _ = try vm.run(chunk.proto);
@@ -718,7 +718,7 @@ test "doc 20 Phase 3: jloop prologue strike exhaustion unpatches same-turn" {
     vm.trace.config.native_codegen = true;
     vm.trace.config.hotloop = 4;
     vm.trace.config.patch_strikes = 1;
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);

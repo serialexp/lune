@@ -84,7 +84,7 @@ test "describeFault: arithmetic on a nil value names the op, type, line, and spa
     defer tree.deinit();
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
-    var chunk = try compiler.compile(testing.allocator, &vm.heap, src, tree.root, &diags);
+    var chunk = try compiler.compile(testing.allocator, vm.heap, src, tree.root, &diags);
     defer chunk.deinit();
 
     try testing.expectError(Error.TypeError, vm.run(chunk.proto));
@@ -112,7 +112,7 @@ test "describeFault: calling a nil value names the call and the type" {
     defer tree.deinit();
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
-    var chunk = try compiler.compile(testing.allocator, &vm.heap, src, tree.root, &diags);
+    var chunk = try compiler.compile(testing.allocator, vm.heap, src, tree.root, &diags);
     defer chunk.deinit();
 
     try testing.expectError(Error.TypeError, vm.run(chunk.proto));
@@ -142,7 +142,7 @@ test "describeFault: a nested fault yields a deepest-first backtrace (leaf + cal
     defer tree.deinit();
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
-    var chunk = try compiler.compile(testing.allocator, &vm.heap, src, tree.root, &diags);
+    var chunk = try compiler.compile(testing.allocator, vm.heap, src, tree.root, &diags);
     defer chunk.deinit();
 
     try testing.expectError(Error.TypeError, vm.run(chunk.proto));

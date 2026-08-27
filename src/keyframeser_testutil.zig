@@ -87,7 +87,7 @@ pub fn referenceRun(gpa: std.mem.Allocator, source: [:0]const u8) !RefRun {
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 

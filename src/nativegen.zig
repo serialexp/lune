@@ -24,6 +24,9 @@ const value = @import("value.zig");
 const table = @import("table.zig");
 const arr = @import("array.zig");
 const fmath = @import("fmath.zig");
+const gc = @import("gc.zig");
+const stralloc = @import("stralloc.zig");
+const string_mod = @import("string.zig");
 const Value = value.Value;
 const RegWindow = @import("regwindow.zig").RegWindow;
 const Trace = trace.Trace;
@@ -1145,14 +1148,22 @@ pub const NativeState = union(enum) {
 /// back to the tier-1a IR-interpreter. Success transfers ownership of an executable
 /// page to the returned `CompiledTrace` (free it with `deinit`).
 pub fn compile(gpa: std.mem.Allocator, t: *const Trace) ?CompiledTrace {
-    return compileImpl(gpa, t, null, null);
+    return compileImpl(gpa, t, null, null, null);
+}
+
+/// Test entry point for ALLOCATING traces (doc 24): like `compile` but with the
+/// heap whose counters/`gc_stress` the `guard_gc` lowering and the `tostr_*`
+/// callouts bake as absolute addresses. Without one, an allocating trace bails
+/// (fail closed) — see `compileImpl`.
+pub fn compileWithHeap(gpa: std.mem.Allocator, t: *const Trace, heap: *gc.Heap) ?CompiledTrace {
+    return compileImpl(gpa, t, null, null, heap);
 }
 
 /// Test entry point for SEEDED traces (doc 22 §B.2): like `compile` but with a
 /// seeding ctx to bake into the entry prologue. A trace whose seed plan is
 /// non-empty cannot compile without one (fail closed, §B.4).
 pub fn compileSeeded(gpa: std.mem.Allocator, t: *const Trace, seed_ctx: *const trace.NativeSeedCtx) ?CompiledTrace {
-    return compileImpl(gpa, t, null, seed_ctx);
+    return compileImpl(gpa, t, null, seed_ctx, null);
 }
 
 /// Production entry point: compile `t` and co-locate its code in the shared `arena`
@@ -1160,16 +1171,29 @@ pub fn compileSeeded(gpa: std.mem.Allocator, t: *const Trace, seed_ctx: *const t
 /// lives (an arena slot vs a standalone `mmap`). `seed_ctx` is the per-VM seeding
 /// context (doc 22 §B.1) a seeded trace's entry prologue bakes; nullable because
 /// hand-built test TraceStates carry none — a seeded trace then bails to tier-1a.
-pub fn compileInto(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, seed_ctx: ?*const trace.NativeSeedCtx) ?CompiledTrace {
-    return compileImpl(gpa, t, arena, seed_ctx);
+pub fn compileInto(gpa: std.mem.Allocator, arena: *McodeArena, t: *const Trace, seed_ctx: ?*const trace.NativeSeedCtx, heap: ?*gc.Heap) ?CompiledTrace {
+    return compileImpl(gpa, t, arena, seed_ctx, heap);
 }
 
 /// Shared compile body. `arena == null` maps a standalone owned page (test path);
 /// non-null co-locates the code as an arena slot (production path).
-fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, seed_ctx: ?*const trace.NativeSeedCtx) ?CompiledTrace {
+fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, seed_ctx: ?*const trace.NativeSeedCtx, heap: ?*gc.Heap) ?CompiledTrace {
     if (comptime !is_x64_linux) return null;
 
     const n = t.instrs.len;
+    // Doc 24 D5 fail-closed: an allocating body (`guard_gc` / `tostr_*`) bakes
+    // the heap's counter and `gc_stress` addresses (and hands the heap to the
+    // interning callouts) — without a heap it cannot be lowered soundly, so it
+    // bails to tier-1a rather than compile a body that could never re-check
+    // the budget. (Hand-built test TraceStates pass none unless they mean to.)
+    if (heap == null) {
+        for (t.instrs) |ins| {
+            switch (ins.op) {
+                .guard_gc, .tostr_int, .tostr_num => return null,
+                else => {},
+            }
+        }
+    }
     // A well-formed native-able trace is non-empty and ends in a terminal `loop`
     // or `link`. Re-checked here because `assertWellFormed` is gone in release
     // builds (never trust the IR).
@@ -1270,7 +1294,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, see
 
     var asm_buf = x64.Assembler.init(gpa);
     defer asm_buf.deinit();
-    const entry_stubs = lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit, slots, metadata_cells, patch_emissions, seed_ctx, seed_plan) catch {
+    const entry_stubs = lower(gpa, t, kinds, &alloc, &asm_buf, shared_exit, slots, metadata_cells, patch_emissions, seed_ctx, seed_plan, heap) catch {
         if (metadata_cells.len > 0) gpa.free(metadata_cells);
         if (slots.len > 0) gpa.free(slots);
         return null;
@@ -1720,6 +1744,50 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .float and kinds[ins.a] != .int) return false;
                 kinds[i] = .float;
+            },
+            // Doc 24 D4/D5: allocating interned-string producers. The operand is
+            // the guard-pinned scalar; the result is a raw `*GcHeader` (an
+            // interned String) — kind `.heap`, the same class as a carried-heap
+            // value or a VALUE_LANE aload result, so the existing homes/flush
+            // (TAG_HEAP re-box) apply. Lowered as a mid-body callout into the
+            // shared `stralloc` body; side-exits on OOM (null return).
+            .tostr_int => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .int) return false;
+                kinds[i] = .heap;
+            },
+            .tostr_num => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .float) return false;
+                kinds[i] = .heap;
+            },
+            // `#s` of a proven string: one 8-byte load of the cached `cp_len`
+            // field. The operand must be a proven string producer's result
+            // (`tostr_*` — kind `.heap` via the arms above); a `guard_string`-
+            // pinned slot is NOT yet native (guard_string bails below, c3).
+            .slen => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .heap) return false;
+                // Doc 24 c2 scope: only the proven-string producers reach
+                // `.heap` upstream of a `slen` today (`tostr_*`); a carried-heap
+                // slot's `.heap` is a TABLE (guard_table-covered) and its `#`
+                // records as `alen`, never `slen`. When c3 admits observed
+                // strings natively (guard_string), this arm stays correct: the
+                // guard proves stringness before the load.
+                const prod = t.instrs[ins.a].op;
+                if (prod != .tostr_int and prod != .tostr_num) return false;
+                kinds[i] = .int;
+            },
+            // Doc 24 c2 scope: `guard_string` (an observed-string pin) is not
+            // lowered natively yet — a trace using it runs tier-1a. c3 lands it
+            // together with the snew-class ops that need it.
+            .guard_string => return false,
+            // Doc 24 D3: the allocation-budget entry guard. Value-less; lowered
+            // to two loads of the baked heap counters + the gc_stress byte test.
+            // `compileImpl` guaranteed `heap != null` for any trace containing it.
+            .guard_gc => {
+                if (ins.aux <= 0) return false; // bound A is stamped positive
+                kinds[i] = .none;
             },
             // --- hash-part field path (H1) --------------------------------------
             // href: a value-cell pointer (`*Value`) for a constant string key into
@@ -2213,6 +2281,11 @@ fn opMayExitInBody(
         .guard_gcol,
         .guard_gpresent,
         .alen,
+        // Doc 24: the budget guard exits when headroom is gone; the tostr
+        // callouts exit on OOM (null return).
+        .guard_gc,
+        .tostr_int,
+        .tostr_num,
         => true,
         // A VALUE_LANE aload tag-checks TAG_HEAP and side-exits on mismatch;
         // scalar-lane aloads are exit-free (guard_present/guard_bounds dominate).
@@ -2227,17 +2300,22 @@ fn opMayExitInBody(
     };
 }
 
-// doc 22 §A.2 (HelperCaps): a heap φ keeps a raw `*GcHeader` in a register or
-// spill cell across the whole body with no GC root. That is sound only while
-// nothing in the body can trigger a collection — so every runtime helper the
-// body may call out to is enumerated here with an explicit can-GC capability,
-// and heap-φ admission refuses the trace if any callout could allocate. A new
-// callout MUST add a row (the exhaustive switch enforces it at compile time);
-// claiming `false` for a helper that allocates would be a soundness bug.
+// doc 22 §A.2 (HelperCaps), doc 24 D5 (the may_allocate/may_collect split): a
+// heap φ keeps a raw `*GcHeader` in a register or spill cell across the whole
+// body with no GC root. That is sound only while nothing in the body can
+// trigger a COLLECTION — so every runtime helper the body may call out to is
+// enumerated here with an explicit may-collect capability, and heap-φ
+// admission refuses the trace if any callout could collect. Mere ALLOCATION
+// (`tostr_*`) does not invalidate a φ-carried pointer: the GC is non-moving
+// and allocation never collects in place (the single collect site is tier-0's
+// dispatch prologue); its determinism cost is accounted by the `guard_gc`
+// budget instead. A new callout MUST add a row (the exhaustive switch enforces
+// it at compile time); claiming may_collect=false for a helper that can reach
+// `Vm.collect` would be a soundness bug.
 
 /// Every runtime helper a native body can call MID-ITERATION. The enum exists
-/// solely to feed `calloutMayGc`, i.e. to answer "can a heap φ be invalidated
-/// across this call site", so membership is exactly "reachable from
+/// solely to feed `calloutMayCollect`, i.e. to answer "can a heap φ be
+/// invalidated across this call site", so membership is exactly "reachable from
 /// `bodyCalloutOf`" — a variant no mapping ever returns is dead weight that
 /// makes the GC audit look broader than it is.
 ///
@@ -2260,12 +2338,29 @@ const BodyCallout = enum {
     /// `fmath.powRuntime`: the shared `^` kernel — pure (f64, f64) → f64;
     /// allocates nothing.
     fpow,
+    /// `stralloc.tostrIntRuntime` (doc 24): renders + interns an int's decimal
+    /// string. **may_allocate = true** (at most ONE `Heap.link` per call — the
+    /// D5 audit rule; an intern hit links zero), **may_collect = false**
+    /// (allocation never collects in place — the ONLY collect site is the
+    /// tier-0 dispatch prologue).
+    tostr_int,
+    /// `stralloc.tostrNumRuntime`: likewise for a float. Same
+    /// may_allocate/may_collect split as `tostr_int`.
+    tostr_num,
 };
 
-fn calloutMayGc(c: BodyCallout) bool {
+/// The doc-22 capability, renamed for the doc-24 may_allocate/may_collect
+/// split: can this callout trigger a COLLECTION mid-body? That is the only
+/// capability heap-φ admission cares about — the GC is non-moving and
+/// allocation never collects in place (single collect site: tier-0's dispatch
+/// prologue), so a callout that merely ALLOCATES (`tostr_*`) leaves every
+/// φ-carried raw `*GcHeader` valid. Allocation capability is documented
+/// per-row above and accounted by the `guard_gc` budget instead.
+fn calloutMayCollect(c: BodyCallout) bool {
     return switch (c) {
         .resolve_hash_cell => false,
         .fsin, .fcos, .fpow => false,
+        .tostr_int, .tostr_num => false,
     };
 }
 
@@ -2283,6 +2378,8 @@ fn bodyCalloutOf(
         .fsin => .fsin,
         .fcos => .fcos,
         .pow => .fpow,
+        .tostr_int => .tostr_int,
+        .tostr_num => .tostr_num,
         else => null,
     };
 }
@@ -2489,6 +2586,9 @@ fn isTransient(op: trace.IrOp) bool {
         // fsin/fcos/pow materialize their `fmath` kernel callout's result
         // likewise.
         .fsqrt, .fsin, .fcos, .pow => true,
+        // doc 24: tostr_* materialize the interned `*GcHeader` in a GP home;
+        // slen the cp_len int.
+        .tostr_int, .tostr_num, .slen => true,
         // href materializes the seeded cell pointer in a register (like aref); hload
         // materializes the decoded scalar field value. hstore/guard_hash are effects.
         .href, .hload => true,
@@ -2529,6 +2629,10 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
         // guard_builtin reads the callee-snapshot native it identity-checks (a);
         // fsqrt/fsin/fcos read their sole float operand (a).
         .guard_builtin, .fsqrt, .fsin, .fcos => .{ .a = true, .b = false },
+        // doc 24: tostr_* read their guard-pinned scalar (a); slen its string
+        // (a). guard_gc reads NOTHING (`a` unused, aux = the bound A).
+        .tostr_int, .tostr_num, .slen => .{ .a = true, .b = false },
+        .guard_gc => .{ .a = false, .b = false },
         // guard_fits reads the value it range-checks (a); guard_append reads the aref
         // token (a) and reaches len/cap/hash through aref.a — no second operand.
         .guard_fits, .guard_append => .{ .a = true, .b = false },
@@ -2721,7 +2825,7 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         if (has_heap_phi) {
             for (0..n) |ci| {
                 if (bodyCalloutOf(t, kinds, slots.items, slot_id_of_ref, ci)) |c| {
-                    if (calloutMayGc(c)) return error.Bail;
+                    if (calloutMayCollect(c)) return error.Bail;
                 }
             }
         }
@@ -4387,6 +4491,59 @@ fn emitFloatCallout(
     }
 }
 
+/// Emit the mid-body callout for an allocating interned-string producer
+/// (`tostr_int`/`tostr_num` — doc 24 D5). Same shape as `emitHrefCallout`:
+/// save, SysV args (rdi = the baked `*Heap`; the guarded scalar in rsi for the
+/// int body, xmm0 for the float body), call the shared noinline `stralloc`
+/// body through an absolute pointer, stash the result across the restore, then
+/// test-and-exit. A null return is OOM with a CLEAN id stream (no `Heap.link`
+/// preceded the fallible step — stralloc.zig's audit): the ordinary deopt exit
+/// resumes tier-0 at the header and the replay re-raises the same OOM at the
+/// same logical point. On success the `*GcHeader` (kind `.heap`) lands in the
+/// op's home; the restore leaves rcx/rax/xmm0 untouched so it rides through.
+fn emitTostrCallout(
+    a: *x64.Assembler,
+    alloc: *const Alloc,
+    kinds: []const Kind,
+    heap: *gc.Heap,
+    ins: trace.IrInstr,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
+    try emitCalloutSave(a, alloc);
+
+    // Stage the operand BEFORE overwriting rdi (a `.mem` home reads via rsp,
+    // untouched by the save; a `.reg` home is r8–r11, also untouched).
+    if (ins.op == .tostr_int) {
+        try placeToReg(a, .rsi, placeOfRef(alloc, ins.a));
+    } else {
+        try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.a), kinds[ins.a]);
+    }
+    // arg0: the Heap, baked absolute (stable for the VM's lifetime).
+    try a.movRegImm64(.rdi, @bitCast(@as(u64, @intFromPtr(heap))));
+
+    // Call the stralloc body via an absolute address in rax. Same alignment
+    // dance as emitHrefCallout (body runs with rsp % 16 == 8).
+    const body: usize = switch (ins.op) {
+        .tostr_int => @intFromPtr(&stralloc.tostrIntRuntime),
+        .tostr_num => @intFromPtr(&stralloc.tostrNumRuntime),
+        else => unreachable,
+    };
+    try a.subRegImm32(.rsp, 8);
+    try a.movRegImm64(.rax, @bitCast(body));
+    try a.callReg(.rax);
+    try a.addRegImm32(.rsp, 8);
+
+    // rax = the interned *GcHeader, or 0 on OOM. The result check must come
+    // AFTER the restore (the deopt flush relies on slot homes being correct),
+    // so stash it in rcx — scratch, never a home, untouched by the restore.
+    try a.movRegReg(.rcx, .rax);
+    try emitCalloutRestore(a, alloc);
+    try a.cmpRegImm32(.rcx, 0);
+    try jccNativeExit(a, exit_labels, i, .e); // 0 → OOM → side-exit
+    try regToPlace(a, placeOfRef(alloc, i), .rcx);
+}
+
 /// Emit the per-iteration hash-cell resolution call-out for a `.heap`-rooted href.
 /// The sequence saves all live caller-saved homes (rdi/rsi SoA bases + GP + XMM)
 /// into the pre-reserved frame area, sets up SysV ABI arguments, calls
@@ -4631,7 +4788,7 @@ const PatchEmission = struct {
 /// committed counter, rax/rcx = scratch. Loop-carried/invariant slots live in registers
 /// across iterations (loaded + type-guarded once in the prologue); `regs[]` is written
 /// only on a side-exit (the single snapshot) or for write-only slots at the back-edge.
-fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, metadata_cells: []usize, patch_emissions: []?PatchEmission, seed_ctx: ?*const trace.NativeSeedCtx, seed_plan: SeedPlan) !EntryStubs {
+fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, a: *x64.Assembler, shared_exit: ?usize, slots: []usize, metadata_cells: []usize, patch_emissions: []?PatchEmission, seed_ctx: ?*const trace.NativeSeedCtx, seed_plan: SeedPlan, heap: ?*gc.Heap) !EntryStubs {
     const exit_labels = try gpa.alloc(?x64.Label, t.instrs.len);
     defer gpa.free(exit_labels);
     @memset(exit_labels, null);
@@ -5055,6 +5212,38 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // tier runs the one compiled body and bit-identity holds by
             // construction. No side-exit (total functions of proven numerics).
             .fsin, .fcos, .pow => try emitFloatCallout(a, alloc, kinds, ins, i),
+            // Doc 24 D5: allocating interned-string producers — mid-body
+            // callouts into the shared `stralloc` bodies. Side-exit on OOM.
+            .tostr_int, .tostr_num => try emitTostrCallout(a, alloc, kinds, heap.?, ins, i, exit_labels),
+            // Doc 24 D4: `#s` of a proven string — one load of the cached
+            // `cp_len` (a usize field; every real string's count fits i63).
+            .slen => {
+                const sreg = try refBaseReg(a, alloc, ins.a, .rcx);
+                try a.movRegMem(.rax, sreg, @offsetOf(string_mod.String, "cp_len"));
+                try regToPlace(a, placeOfRef(alloc, i), .rax);
+            },
+            // Doc 24 D3: the allocation-budget entry guard —
+            //   passes ⇔ !gc_stress ∧ object_count + A < next_gc.
+            // The heap's field addresses are baked absolute (the Heap lives at
+            // a stable address for the VM's lifetime; compileImpl bailed
+            // without one). Value-less; an ordinary deopt exit on failure —
+            // deliberately NOT chainable/hot-guard-counted (no exit PC).
+            .guard_gc => {
+                const h = heap.?;
+                // gc_stress: a 1-byte bool (0/1). Non-zero → exit.
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.gc_stress))));
+                try a.cmpByteMemImm(.rax, 0, 0);
+                try jccNativeExit(a, exit_labels, i, .ne);
+                // rcx = object_count + A (A is a stamped-positive i32; the sum
+                // cannot wrap u64 for any real heap).
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.object_count))));
+                try a.movRegMem(.rcx, .rax, 0);
+                try a.addRegImm32(.rcx, @intCast(ins.aux));
+                // rcx >= next_gc (unsigned) → exit.
+                try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&h.next_gc))));
+                try a.cmpRegMem(.rcx, .rax, 0);
+                try jccNativeExit(a, exit_labels, i, .ae);
+            },
             // --- hash-part field path (H1) --------------------------------------
             // href: load the loop-invariant value-cell pointer (`*Value`) from its
             // seeded slab slot `[rsi + aux*8]` into the href token's home. The cell was

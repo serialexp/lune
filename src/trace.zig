@@ -436,9 +436,11 @@ pub const IrOp = enum(u8) {
     /// `guardExitPc`/`isSideExitGuardOp`. The general border search (trailing
     /// holes, hash borders, grids, in-band `.value`/`.boolean` lanes) stays
     /// tier-0 behind the side-exit. Alias discipline is `aload`-like — never
-    /// CSE'd/hoisted across stores — and the recorder refuses to emit it while
-    /// RMW stores are sunk (`pending_stores` non-empty), so it can never read a
-    /// pre-flush border. Appended last (wire ordinal 57).
+    /// CSE'd/hoisted across stores. Pending SUNK stores are fine to record past
+    /// (doc 24 D7): sunk stores are in-bounds-only (`asize` invariant), presence
+    /// only goes false→true, and `alen` side-exits with the stores un-executed —
+    /// so a pre-flush read either matches the post-flush border or exits cleanly.
+    /// Appended last (wire ordinal 57).
     alen,
     /// `a`=float operand ref → `sin(a)` (`.float`). A leaf pure producer like
     /// `fsqrt` — hoistable iff invariant, CSE'd, DCE'd if dead, deliberately
@@ -451,6 +453,57 @@ pub const IrOp = enum(u8) {
     /// `a`=float operand ref → `cos(a)` (`.float`). Exactly `fsin`'s contract
     /// with `fmath.cosRuntime`. Wire ordinal 59.
     fcos,
+
+    // ---- deterministic on-trace allocation (doc 24, arc B) --------------------
+    //
+    // The first ops that ALLOCATE on trace: interned-string producers. Allocation
+    // events are effects on the serialized id stream (`next_obj_id` is a
+    // byte-compared keyframe field), so `.alloc`-kind ops are never DCE'd, never
+    // hoisted, and never reordered across each other or across `guard_gc` — see
+    // doc 24 D2/D4 and `tropt.kindOf`. Every allocating body is protected by ONE
+    // `guard_gc` entry guard emitted before its first `.alloc` op.
+    //
+    /// `a`=proven-int operand ref → the interned decimal rendering of the int
+    /// (`ty = .heap`, an interned `String`). All tiers run the ONE
+    /// `stralloc.tostrIntRuntime` body (`io.writeValue` render + `Heap.intern`)
+    /// — the exact pair tier-0's `bToString` composes — so the result is
+    /// byte-identical everywhere by construction. `__tostring` is statically
+    /// impossible (non-heap values carry no metatable). Fallible: on OOM the
+    /// helper performed NO `Heap.link` (intern is transactional), the trace
+    /// side-exits at the header, and tier-0's replay re-raises the same OOM at
+    /// the same logical point (doc 24 D5). Wire ordinal 60.
+    tostr_int,
+    /// `a`=proven-float operand ref → the interned rendering of the float.
+    /// Exactly `tostr_int`'s contract over `Value.float`. Wire ordinal 61.
+    tostr_num,
+    /// `a`=proven-string ref → `#s` (`.int`): the string's cached `cp_len`
+    /// (code points, NOT bytes — the `#s` semantic, distinct from `rawlen`).
+    /// A pure leaf producer (allocates nothing): CSE/DCE fine, deliberately
+    /// never constant-folded (its operand is never a konst in an honest trace —
+    /// the recorder folds `#` of a konst string directly). Wire ordinal 62.
+    slen,
+    /// `a`=value ref → the value is a heap string. Pins an *observed* string
+    /// operand (a loaded slot) where the producer doesn't already prove it
+    /// (`tostr_*`/future snew-class results are proven by construction and skip
+    /// this). Produces no value; never DCE'd. Classified `.guard`; carries no
+    /// `aux` (NOT exit-PC-chaining — like `guard_table`). Wire ordinal 63.
+    guard_string,
+    /// The doc 24 D3 allocation-budget entry guard; `aux` = the trace's static
+    /// allocation bound `A` (each `.alloc` op performs at most one `Heap.link` —
+    /// the D5 audit rule). Passes ⇔ `!gc_stress ∧ object_count + A < next_gc`
+    /// (saturating): passing makes a mid-burst collection arithmetically
+    /// impossible in every mode, so loop-header re-entry deopt stays sound and
+    /// the tier-0 id stream is reproduced exactly (D2). Failing exits at the
+    /// coherent loop header with ZERO allocations performed this iteration.
+    /// Emitted ONCE per allocating body, before its first `.alloc` op; `aux` is
+    /// stamped by `commit()`. Deliberately NOT in `guardExitPc` /
+    /// `isSideExitGuardOp` (`aux` is a bound, not a PC): every exit-PC-keyed
+    /// consumer — side-trace hotguard counting, exit chaining, Option-A
+    /// headroom — therefore ignores it, which is exactly the doc 24 D3 chaining
+    /// discipline (a side trace anchored at a budget failure would just be the
+    /// same loop again). Produces no value; never DCE'd/deduped/hoisted.
+    /// Wire ordinal 64.
+    guard_gc,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -1032,6 +1085,15 @@ pub const Trace = struct {
     /// return the most-successful trace first — a stable frequency-based
     /// priority that does not thrash on alternating types.
     hit_count: u64 = 0,
+    /// Doc 24 D3: the trace's static allocation bound `A` — the number of
+    /// `.alloc`-kind ops the recorded body contains (0 = non-allocating, the
+    /// arc-A status quo). Mirrors the entry `guard_gc`'s `aux` (stamped from the
+    /// same counter at commit, so it stays an upper bound even if the optimizer
+    /// CSEs an `.alloc` away). Read by the observation blackout: while
+    /// suspension/keyframe observation is armed, the dispatcher and the chain
+    /// walk decline to enter any trace with `alloc_bound > 0` (doc 24 D3,
+    /// codex #2). Runtime-only — not serialized (recomputable from the IR).
+    alloc_bound: u32 = 0,
 
     /// B-iv.3 backoff: the exit whose composite-bridge arm pipeline last ran in
     /// full and declined because the child's page was not stub-enterable.
@@ -1683,6 +1745,15 @@ pub const TraceState = struct {
     /// harnesses that build a `TraceState` without a VM; fold arms then abort
     /// `.bad_type` and every other recorder path is unaffected.
     rec_heap: ?*const gc.Heap = null,
+    /// MUTABLE execution-heap channel (doc 24 D5): the heap the tier-1a
+    /// executor's `.alloc` arms and tier-1b's baked callouts/`guard_gc`
+    /// allocate against. Unlike `rec_heap` (refreshed defensively per
+    /// `recordInstr`), this may be stored once: `Vm.heap` is itself
+    /// heap-allocated with a stable address for exactly this purpose (see the
+    /// `Vm.heap` field doc). Set by `Vm.initBare`; null in bare test harnesses,
+    /// where allocating traces fail closed (tier-1a side-exits the `.alloc`
+    /// arm, `compileInto` declines the page).
+    exec_heap: ?*gc.Heap = null,
     /// Shared machine-code arena — all tier-1b native traces are co-located slices of
     /// this (P-D of the exit-branch-patching port, doc 17). Replaces the old one-
     /// `mmap`-per-trace model so a future increment can link trace→trace with a bare
@@ -5030,6 +5101,15 @@ pub const TraceState = struct {
             // of noise here because `driveChain` runs ~1M times on scimark-fft.
             const cand_mark = self.valuesMark();
             defer if (tier == .ir) self.valuesRelease(cand_mark);
+            // Doc 24 D8 observation blackout: while a suspend/keyframe window is
+            // armed (`!safe_to_arm` — the identical condition the link-arm
+            // machinery blacks out on), never chain into an ALLOCATING
+            // candidate. A mid-burst suspension after its `guard_gc` passed
+            // would capture a heap whose `next_obj_id` tier-0 only reaches
+            // after the full burst — the keyframe byte-identity (§T-A.2)
+            // demands allocation counts observed only at tier-0 boundaries.
+            // Non-allocating candidates chain as before.
+            if (!safe_to_arm and sct.alloc_bound > 0) continue;
             const is_link = sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link;
             // Loop-done chains (ir and native) only follow `.link` continuations;
             // an ordinary side trace at the post-loop PC is not a valid hand-off.
@@ -5181,7 +5261,7 @@ pub const TraceState = struct {
                     if (!irinterp.flushNumericForLoopDone(failed, regs, vals, exit_instr)) return null;
                     flushed_resume_pc = walk_pc;
                 }
-                sresult = irinterp.execute(sct, regs, sbuf);
+                sresult = irinterp.executeCtx(.{ .heap = self.exec_heap }, sct, regs, sbuf);
             }
 
             // --- linked burst: the continuation ran to its `.link` terminator, so
@@ -7267,7 +7347,7 @@ pub const TraceState = struct {
                     self.settleNativeCallProvenance(&provenance, safe_to_arm);
                 } else {
                     ibuf = self.valuesPush(inner.instrs.len) catch break;
-                    iresult = irinterp.execute(inner, regs, ibuf);
+                    iresult = irinterp.executeCtx(.{ .heap = self.exec_heap }, inner, regs, ibuf);
                 }
                 // B-iv.2 (doc 22 §B.2, codex Q2): a scalar seed decline at call A —
                 // the inner's direct entry (or the carried fused hop's linked
@@ -7501,7 +7581,7 @@ pub const TraceState = struct {
                 if (current_link.inputs.len != 0 and !self.seedForTier1a(current_link, proto))
                     return .{ .completed = linked_completed, .resume_pc = resume_pc };
                 const cbuf = self.valuesPush(current_link.instrs.len) catch break;
-                const cresult = irinterp.execute(current_link, regs, cbuf);
+                const cresult = irinterp.executeCtx(.{ .heap = self.exec_heap }, current_link, regs, cbuf);
                 if (cresult.exit_instr == current_link.instrs.len - 1) {
                     _ = self.accountRegionProfit(
                         .{ .trace_id = current_link.id, .exit_instr = cresult.exit_instr },
@@ -10920,7 +11000,7 @@ pub const TraceState = struct {
             .compiled => return &t.native.compiled,
             .unsupported => return null,
             .unattempted => {
-                if (nativegen.compileInto(self.gpa, &self.mcode_arena, t, self.native_seed_ctx)) |ct| {
+                if (nativegen.compileInto(self.gpa, &self.mcode_arena, t, self.native_seed_ctx, self.exec_heap)) |ct| {
                     t.native = .{ .compiled = ct };
                     return &t.native.compiled;
                 }
@@ -11280,6 +11360,15 @@ pub const TraceState = struct {
     /// first; an optimizer OOM falls back to caching the *unoptimized* trace
     /// (correct, just slower) rather than failing the commit.
     fn commit(self: *TraceState) !void {
+        // Doc 24 D3: stamp the allocation bound `A` into the entry `guard_gc`'s
+        // `aux` (emitted with a placeholder by `emitAlloc`). Stamped on the
+        // RECORDED stream, before `tropt.optimize` — the optimizer may CSE an
+        // `.alloc` op away (tostr repeats), which only makes the stamped bound a
+        // conservative upper bound: a stricter guard is always sound.
+        if (self.rec.guard_gc_ref) |gr| {
+            std.debug.assert(self.rec.alloc_count > 0);
+            self.rec.instrs.items[@intCast(gr)].aux = @intCast(self.rec.alloc_count);
+        }
         // The loop-carried writebacks, as slot-bound φ nodes (one per register the
         // trace defined, minus *dead temporaries*), spliced in just before the
         // terminal `loop`. A slot at/above `locals_watermark` is a compiler
@@ -11328,7 +11417,20 @@ pub const TraceState = struct {
             // would make the `.loop` flush `regs.set` past the executor's real
             // `[0, anchor_num_registers)` window — a silent OOB slab write.
             if (slot >= self.rec.anchor_num_registers) continue;
-            if (slot >= self.rec.locals_watermark and !self.readSlot(@intCast(slot))) continue;
+            // Doc 24 D3 full-write-set flush rule (codex #6): an ALLOCATING
+            // trace flushes EVERY anchor-frame slot the body writes — including
+            // dead expression temporaries the watermark filter would drop. The
+            // collector roots every physical register below `stack_top`, not the
+            // live set; a dead temp holding a per-iteration heap ref (a `tostr_*`
+            // result) left at its *pre-burst* value would diverge the sweep's
+            // root set from tier-0-only's (which holds the LAST iteration's
+            // value there) → divergent de-intern sets → divergent ids. Flushing
+            // the full written span makes post-burst regs equal tier-0's after
+            // the same iterations exactly. Non-allocating traces keep the
+            // watermark filter (arc-A shapes byte-identical: their traceable
+            // loops cannot produce per-iteration heap temps).
+            if (self.rec.alloc_count == 0 and
+                slot >= self.rec.locals_watermark and !self.readSlot(@intCast(slot))) continue;
             try self.rec.instrs.append(self.gpa, .{
                 .op = .phi,
                 .a = 0,
@@ -11495,6 +11597,7 @@ pub const TraceState = struct {
             .exit_prov_complete = exit_prov_complete,
             .rec_path = rec_path_owned,
             .rec_path_complete = rec_path_complete,
+            .alloc_bound = self.rec.alloc_count,
         };
         // §T.9: memoize the pure `isCompositeBridgeCandidate` oracle over this trace's
         // instruction indices. Must run AFTER `t.*` is populated — the oracle reads the
@@ -11588,6 +11691,12 @@ pub const TraceState = struct {
                 .alen => std.debug.assert(ins.a < i),
                 // `fsin`/`fcos` read their sole float operand `a` (a prior node).
                 .fsin, .fcos => std.debug.assert(ins.a < i),
+                // Doc 24 D4: `tostr_*` read their guarded numeric operand,
+                // `slen`/`guard_string` their string operand — all prior nodes.
+                .tostr_int, .tostr_num, .slen, .guard_string => std.debug.assert(ins.a < i),
+                // `guard_gc` (doc 24 D3): operand-free; `aux` is the allocation
+                // bound `A` — a positive count stamped by `commit()`.
+                .guard_gc => std.debug.assert(ins.aux > 0),
                 // `guard_builtin` reads the callee ref `a`; `fsqrt` reads its float
                 // operand `a` — both prior nodes.
                 .guard_builtin, .fsqrt => std.debug.assert(ins.a < i),
@@ -11748,21 +11857,34 @@ pub const TraceState = struct {
             // path (Phase B; in-bounds dense narrow-lane slot only); a constant
             // STRING key takes the hash-field path (doc 11, `obj.field`); anything
             // else aborts cleanly. The key type is observed at record time.
-            // `#R[b]` (doc 23 D3): a table records through the guarded `alen`
-            // producer; a konst string folds to its `cp_len` (code points — the
-            // `#s` semantic, deliberately distinct from `rawlen`'s bytes). A
-            // non-konst string stays unrecorded (`nyi_opcode`, as before — the
-            // guard vocabulary has no string pin).
+            // `#R[b]` (doc 23 D3 / doc 24 D4): a table records through the
+            // guarded `alen` producer; a konst string folds to its `cp_len`
+            // (code points — the `#s` semantic, deliberately distinct from
+            // `rawlen`'s bytes). A NON-konst string records through the pure
+            // `slen` producer: when its producing op already proves stringness
+            // (`tostr_*` — proven by construction), `slen` rides bare; an
+            // *observed* string (a loaded slot / hash load) pins first with
+            // `guard_string`.
             .len => {
                 const v = regs.get(instr.b);
                 if (v.isHeap() and v.heapType() == .table) {
                     try self.recAlenShape(instr.a, instr.b, .b, regs);
                 } else if (v.isHeap() and v.heapType() == .string) {
                     const rstr = try self.refOf(instr.b);
-                    const kv = self.konstValueOf(rstr) orelse return self.abort(.nyi_opcode);
-                    if (!kv.isHeap() or kv.heapType() != .string) return self.abort(.nyi_opcode);
-                    const s = string_mod.String.fromHeader(kv.asHeap());
-                    self.setReg(instr.a, try self.konst(Value.int(@intCast(s.cp_len))));
+                    if (self.konstValueOf(rstr)) |kv| {
+                        if (!kv.isHeap() or kv.heapType() != .string) return self.abort(.nyi_opcode);
+                        const s = string_mod.String.fromHeader(kv.asHeap());
+                        self.setReg(instr.a, try self.konst(Value.int(@intCast(s.cp_len))));
+                    } else {
+                        const producer = self.rec.instrs.items[@intCast(rstr)].op;
+                        const proven = producer == .tostr_int or producer == .tostr_num;
+                        // Emitted raw; tropt's guard dedup (GuardKey) drops an
+                        // exact duplicate — same discipline as `guard_table`.
+                        if (!proven)
+                            self.stampProv(try self.emit(.{ .op = .guard_string, .a = rstr }), .operand_type, .b, .neutral);
+                        const r = try self.emit(.{ .op = .slen, .a = rstr, .ty = .int });
+                        self.setReg(instr.a, r);
+                    }
                 } else return self.abort(.nyi_opcode);
             },
 
@@ -11844,6 +11966,24 @@ pub const TraceState = struct {
         // length skew never outlives the failed recording.
         try self.rec.exit_prov.append(self.gpa, null);
         return ref;
+    }
+
+    /// Emit an `.alloc`-kind op (doc 24 D4): ensures the body's single
+    /// `guard_gc` entry guard exists — emitted lazily immediately before the
+    /// FIRST `.alloc` op, which places it before *every* `.alloc` op. That is
+    /// the only ordering the D3 soundness argument needs: any effects that
+    /// precede it in the body (inline `astore`s) are already required to be
+    /// header-replay-idempotent by the C1 discipline (every later guard can
+    /// fail below them today), and a failing `guard_gc` means ZERO allocations
+    /// were performed this iteration, so the D2 corollary's clean-replay
+    /// premise holds at its exit. The guard's `aux` (the bound `A`) is a
+    /// placeholder until `commit()` stamps the final `alloc_count`.
+    fn emitAlloc(self: *TraceState, ins: IrInstr) !Ref {
+        if (self.rec.guard_gc_ref == null) {
+            self.rec.guard_gc_ref = try self.emit(.{ .op = .guard_gc });
+        }
+        self.rec.alloc_count += 1;
+        return self.emit(ins);
     }
 
     /// Intern a constant into the trace's pool and emit a `konst` for it. A
@@ -13362,29 +13502,46 @@ pub const TraceState = struct {
         self.setReg(instr.a, kref);
     }
 
-    /// `tostring(v)` — arc A records the **konst-argument fold only** (doc 23:
-    /// the allocating `tostr_int` path for non-konst arguments is arc B). Only
-    /// non-heap konsts fold: numbers/bools/nil can never carry a metatable
-    /// (`Vm.metatableOf` returns null for every non-heap value), so the
-    /// `__tostring` metacall tier-0's `bToString` probes first is statically
-    /// impossible and the scalar rendering is the whole story. A konst *string*
-    /// does NOT fold: strings share the mutable built-in string metatable, so a
-    /// runtime `__tostring` could appear with no guard to catch it.
-    /// The rendering goes through `io.writeValue` — the exact renderer
-    /// `bToString` uses — into a bounded stack buffer, then a read-only lookup.
+    /// `tostring(v)` — two recorded shapes:
+    ///
+    /// **Konst fold (arc A / doc 23).** Only non-heap konsts fold:
+    /// numbers/bools/nil can never carry a metatable (`Vm.metatableOf` returns
+    /// null for every non-heap value), so the `__tostring` metacall tier-0's
+    /// `bToString` probes first is statically impossible and the scalar
+    /// rendering is the whole story. A konst *string* does NOT fold: strings
+    /// share the mutable built-in string metatable, so a runtime `__tostring`
+    /// could appear with no guard to catch it. The rendering goes through
+    /// `io.writeValue` — the exact renderer `bToString` uses — into a bounded
+    /// stack buffer, then a read-only lookup.
+    ///
+    /// **Allocating producer (arc B / doc 24).** A non-konst observed
+    /// int/float pins with `guardNum` (int-vs-float — the pin selects the op)
+    /// and records `tostr_int`/`tostr_num` through `emitAlloc` (which arms the
+    /// body's `guard_gc` budget guard). The `__tostring` impossibility argument
+    /// is the same (the guard proves non-heap). Everything else (observed
+    /// strings/bools/nil/heap) stays a tier-0 barrier.
     fn recBTostring(self: *TraceState, instr: Instr, regs: RegWindow) !void {
         if (instr.b != 1) return self.abort(.cross_frame);
         if (instr.c != 1) return self.abort(.cross_frame);
-        const arg_ref = try self.refOf(@intCast(@as(usize, instr.a) + 1));
-        const kv = self.konstValueOf(arg_ref) orelse return self.abort(.bad_type);
-        if (kv.isHeap()) return self.abort(.bad_type);
+        const arg_slot: u16 = @intCast(@as(usize, instr.a) + 1);
+        const arg_ref = try self.refOf(arg_slot);
+        if (self.konstValueOf(arg_ref)) |kv| {
+            if (kv.isHeap()) return self.abort(.bad_type);
+            try self.guardBuiltinCallee(instr.a, .tostring);
+            var buf: [128]u8 = undefined;
+            var w = io.Writer.fixed(&buf);
+            io.writeValue(&w, kv) catch unreachable; // scalars render in <32 bytes
+            const kref = (try self.foldInternedStr(w.buffered())) orelse return self.abort(.bad_type);
+            self.setReg(instr.a, kref);
+            return;
+        }
+        const argv = regs.get(arg_slot);
+        if (!argv.isNumber()) return self.abort(.bad_type);
         try self.guardBuiltinCallee(instr.a, .tostring);
-        var buf: [128]u8 = undefined;
-        var w = io.Writer.fixed(&buf);
-        io.writeValue(&w, kv) catch unreachable; // scalars render in <32 bytes
-        const kref = (try self.foldInternedStr(w.buffered())) orelse return self.abort(.bad_type);
-        self.setReg(instr.a, kref);
-        _ = regs;
+        try self.guardNum(arg_ref, argv, .operand_type, .a1);
+        const op: IrOp = if (argv.isInt()) .tostr_int else .tostr_num;
+        const r = try self.emitAlloc(.{ .op = op, .a = arg_ref, .ty = .heap });
+        self.setReg(instr.a, r);
     }
 
     /// `tonumber(v[, base])` — konst arguments fold at record time through
@@ -14008,6 +14165,22 @@ pub const Recorder = struct {
     /// by `maxrecord`; native register pressure spills or rejects the completed trace.
     pending_stores: std.ArrayListUnmanaged(PendingStore) = .empty,
 
+    // --- deterministic on-trace allocation (doc 24 D3/D4) -------------------
+    /// Count of `.alloc`-kind ops emitted so far — the allocation bound `A`.
+    /// `commit()` stamps it into the entry `guard_gc`'s `aux` and the committed
+    /// `Trace.alloc_bound`. Each `.alloc` op's helper performs at most one
+    /// `Heap.link` (the D5 audit rule), so `A` bounds the burst's worst-case
+    /// id consumption per iteration.
+    alloc_count: u32 = 0,
+    /// Emission ref of the single entry `guard_gc`, emitted by `emitAlloc`
+    /// immediately before the FIRST `.alloc` op (which places it before every
+    /// `.alloc` op — the only ordering the D3 argument needs: effects that
+    /// precede it are already header-replay-idempotent under the C1 discipline,
+    /// and a failing `guard_gc` means zero allocations were performed this
+    /// iteration, so the D2 clean-replay premise holds). Null for a
+    /// non-allocating recording (no `guard_gc` at all — arc-A traces unchanged).
+    guard_gc_ref: ?Ref = null,
+
     // --- cross-frame tracing (inlined Lua calls) ---------------------------
     /// The anchor (outermost) frame's register count. The grown `reg_map` may be
     /// wider (it reserves space for inlined callee frames), so the executor's real
@@ -14082,6 +14255,8 @@ pub const Recorder = struct {
         self.input_dedup.clearRetainingCapacity();
         self.hash_cell_dedup.clearRetainingCapacity();
         self.pending_stores.clearRetainingCapacity();
+        self.alloc_count = 0;
+        self.guard_gc_ref = null;
         // Size the register map for the anchor frame **plus** reserved windows for
         // inlined callee frames (cross-frame tracing). The executor only ever
         // touches `[0, anchor_num_registers)`; the tail is scratch the recorder

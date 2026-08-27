@@ -95,7 +95,7 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
         var buf: [512]u8 = undefined;
         var sink = io.Writer.fixed(&buf);
         vm.out = &sink;
-        var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
         defer chunk.deinit();
         try testing.expect(!diags.hasErrors());
 
@@ -127,7 +127,7 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
     var buf2: [512]u8 = undefined;
     var sink2 = io.Writer.fixed(&buf2);
     vm2.out = &sink2;
-    var chunk2 = try lune_compiler.compile(gpa, &vm2.heap, source, tree.root, &diags);
+    var chunk2 = try lune_compiler.compile(gpa, vm2.heap, source, tree.root, &diags);
     defer chunk2.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -218,7 +218,7 @@ fn captureNativeF2cCut(gpa: std.mem.Allocator, source: [:0]const u8, native: boo
         .after_committed_effects = 1,
     };
 
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     try testing.expect((try vm.start(chunk.proto)) == .suspended);
@@ -303,7 +303,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     cut_vm.trace.config.coverage = true;
     cut_vm.trace.config.hotloop = 4;
     cut_vm.suspend_ctl = .{ .min_depth = 2, .after_committed_effects = 1 };
-    var chunk = try lune_compiler.compile(gpa, &cut_vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, cut_vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     try testing.expect((try cut_vm.start(chunk.proto)) == .suspended);
@@ -319,7 +319,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
         gpa.destroy(resumed);
     }
     try testing.expectEqual(@as(usize, 0), resumed.trace.cache.items.len);
-    const replay_log = try effectser.decodeFile(gpa, &resumed.heap, cut_effects);
+    const replay_log = try effectser.decodeFile(gpa, resumed.heap, cut_effects);
     defer gpa.free(replay_log);
     try resumed.effect_log.appendSlice(gpa, replay_log);
     resumed.effect_mode = .record;
@@ -346,7 +346,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     ref_vm.effect_mode = .record;
     var ref_clock = TestClock{ .next = 1000 };
     ref_vm.clock_source = ref_clock.source();
-    var ref_chunk = try lune_compiler.compile(gpa, &ref_vm.heap, source, tree.root, &diags);
+    var ref_chunk = try lune_compiler.compile(gpa, ref_vm.heap, source, tree.root, &diags);
     defer ref_chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try ref_vm.run(ref_chunk.proto);

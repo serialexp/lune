@@ -53,6 +53,9 @@ const table = @import("table.zig");
 const function = @import("function.zig");
 const arr = @import("array.zig");
 const fmath = @import("fmath.zig");
+const gc = @import("gc.zig");
+const stralloc = @import("stralloc.zig");
+const string_mod = @import("string.zig");
 const Value = value.Value;
 const Trace = trace.Trace;
 
@@ -291,11 +294,11 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
                 // committed, so no linked loop-done flush can currently contain a
                 // `gstore`. Keep the commit path functional for the future recorder
                 // work that makes fused grid stores linkable.
-                const gc = t.instrs[p.a];
-                const ga = t.instrs[gc.a];
+                const gcell = t.instrs[p.a];
+                const ga = t.instrs[gcell.a];
                 const tbl = table.Table.fromHeader(values[ga.a].asHeap());
                 const row: usize = @intCast(values[ga.b].asInt() - 1);
-                const col: usize = @intCast(values[gc.b].asInt() - 1);
+                const col: usize = @intCast(values[gcell.b].asInt() - 1);
                 tbl.array.gridSet(row, col, values[p.b]);
             },
             .phi, .loop, .link => break,
@@ -326,7 +329,29 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
 ///     longer matches the observed types) — the caller uses this for the
 ///     re-entry penalty.
 pub fn execute(t: *const Trace, regs: RegWindow, values: []Value) ExecResult {
-    return executeImpl(false, {}, t, regs, values);
+    return executeImpl(false, {}, .{}, t, regs, values);
+}
+
+/// Doc 24 D5: the executor's VM-side context — what the allocating `.alloc` op
+/// arms and the `guard_gc` budget guard need from the host. Injected per call
+/// (Rule Z-4: no global heap); the bare default (`.{}`) means "no VM attached"
+/// and every allocating arm then fails CLOSED (side-exit) — a hand-built test
+/// trace without a heap can never allocate.
+pub const ExecCtx = struct {
+    heap: ?*gc.Heap = null,
+};
+
+/// `execute` with a VM context attached (doc 24): required for traces that
+/// contain `.alloc` ops / `guard_gc` — the arms read `ctx.heap` for the
+/// budget predicate and the interning bodies. The production dispatcher and
+/// the chain driver pass the real heap; `execute` above is the bare twin.
+pub fn executeCtx(ctx: ExecCtx, t: *const Trace, regs: RegWindow, values: []Value) ExecResult {
+    return executeImpl(false, {}, ctx, t, regs, values);
+}
+
+/// Instrumented twin of `executeCtx` (see `executeTraced`).
+pub fn executeTracedCtx(ctx: ExecCtx, rec: *execlog.ExecLogRecorder, t: *const Trace, regs: RegWindow, values: []Value) ExecResult {
+    return executeImpl(true, rec, ctx, t, regs, values);
 }
 
 /// Instrumented twin of `execute`: identical semantics, but drives `rec`
@@ -335,7 +360,7 @@ pub fn execute(t: *const Trace, regs: RegWindow, values: []Value) ExecResult {
 /// at the trace's log); this calls `begin`/`end` around the run. Used only on the
 /// instrumented (viz/CLI) path — `execute` above is the untouched JIT fast path.
 pub fn executeTraced(rec: *execlog.ExecLogRecorder, t: *const Trace, regs: RegWindow, values: []Value) ExecResult {
-    return executeImpl(true, rec, t, regs, values);
+    return executeImpl(true, rec, .{}, t, regs, values);
 }
 
 /// Test-only adapters: run `execute`/`executeTraced` over a flat `[]Value` register
@@ -352,6 +377,21 @@ pub fn executeValues(t: *const Trace, regs: []Value, values: []Value) ExecResult
         pbuf[i] = v.payload.bits;
     }
     const r = execute(t, RegWindow.of(tbuf[0..regs.len], pbuf[0..regs.len]), values);
+    for (regs, 0..) |*v, i| v.* = .{ .tag = @enumFromInt(tbuf[i]), .payload = .{ .bits = pbuf[i] } };
+    return r;
+}
+
+/// `executeValues` with a VM context (doc 24) — for tests exercising the
+/// allocating arms / `guard_gc` over a flat register file.
+pub fn executeValuesCtx(ctx: ExecCtx, t: *const Trace, regs: []Value, values: []Value) ExecResult {
+    var tbuf: [256]u8 = undefined;
+    var pbuf: [256]u64 = undefined;
+    std.debug.assert(regs.len <= tbuf.len);
+    for (regs, 0..) |v, i| {
+        tbuf[i] = @intFromEnum(v.tag);
+        pbuf[i] = v.payload.bits;
+    }
+    const r = executeCtx(ctx, t, RegWindow.of(tbuf[0..regs.len], pbuf[0..regs.len]), values);
     for (regs, 0..) |*v, i| v.* = .{ .tag = @enumFromInt(tbuf[i]), .payload = .{ .bits = pbuf[i] } };
     return r;
 }
@@ -375,7 +415,7 @@ pub fn executeTracedValues(rec: *execlog.ExecLogRecorder, t: *const Trace, regs:
 /// With `record == true`, `rec` observes every value, guard outcome, commit, and the
 /// terminal side-exit. Recording is observation-only: `regs`/`completed` are
 /// byte-identical to the uninstrumented run (the parity canary test asserts this).
-fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWindow, values: []Value) ExecResult {
+fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trace, regs: RegWindow, values: []Value) ExecResult {
     std.debug.assert(values.len >= t.instrs.len);
     if (record) rec.begin();
     var completed: usize = 0;
@@ -593,11 +633,11 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 // The decoded cell's type is fixed by `grid_elem` (int or float), so
                 // unlike `hload` no tag recheck is needed.
                 .gload => {
-                    const gc = t.instrs[ins.a];
-                    const ga = t.instrs[gc.a];
+                    const gcell = t.instrs[ins.a];
+                    const ga = t.instrs[gcell.a];
                     const tbl = table.Table.fromHeader(values[ga.a].asHeap());
                     const row: usize = @intCast(values[ga.b].asInt() - 1);
-                    const col: usize = @intCast(values[gc.b].asInt() - 1);
+                    const col: usize = @intCast(values[gcell.b].asInt() - 1);
                     values[i] = tbl.array.gridGet(row, col);
                     if (record) rec.value(i, values[i]);
                 },
@@ -607,11 +647,11 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 // the value fits `grid_elem` (no widen), so this neither reshapes nor
                 // allocates. `b` is the value. Produces no value (store nil).
                 .gstore => {
-                    const gc = t.instrs[ins.a];
-                    const ga = t.instrs[gc.a];
+                    const gcell = t.instrs[ins.a];
+                    const ga = t.instrs[gcell.a];
                     const tbl = table.Table.fromHeader(values[ga.a].asHeap());
                     const row: usize = @intCast(values[ga.b].asInt() - 1);
-                    const col: usize = @intCast(values[gc.b].asInt() - 1);
+                    const col: usize = @intCast(values[gcell.b].asInt() - 1);
                     tbl.array.gridSet(row, col, values[ins.b]);
                     values[i] = Value.nil();
                     if (record) rec.value(i, values[i]);
@@ -773,6 +813,82 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                     if (record) rec.exit(i, .guard, v);
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
+                // Doc 24 D3: the allocation-budget entry guard. Passes ⇔
+                // `!gc_stress ∧ object_count + A < next_gc` (saturating) — then
+                // even the worst case (every call this iteration misses) cannot
+                // make a collection due mid-burst, so the D2 id-stream argument
+                // holds and loop-header re-entry stays sound. Fails CLOSED with
+                // no heap attached (bare test harness): an allocating body
+                // never runs detached from a VM. Logs the boolean predicate as
+                // its guard value (codex #13 — it has no SSA operand).
+                .guard_gc => {
+                    const a_bound: usize = @intCast(ins.aux);
+                    const pass = if (ctx.heap) |heap|
+                        !heap.gc_stress and (heap.object_count +| a_bound) < heap.next_gc
+                    else
+                        false;
+                    if (pass) {
+                        if (record) rec.guardPass(i, Value.boolean(true));
+                    } else {
+                        if (record) rec.exit(i, .guard, Value.boolean(false));
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
+                // Doc 24 D4/D5: allocating interned-string producers. The ONE
+                // shared `stralloc` body (render via `io.writeValue` + intern)
+                // every tier runs — tier-0's `bToString` composes the same two
+                // primitives, so the result is byte-identical by construction.
+                // A null return is OOM with a clean id stream (no `link`
+                // preceded the fallible step — see stralloc.zig): side-exit at
+                // the header and let tier-0's replay re-raise the same OOM at
+                // the same logical point. Defensive type side-exit like
+                // `.fsqrt` (a dominating `guard_int`/`guard_float` pinned the
+                // operand). No-heap (bare harness) fails closed the same way.
+                .tostr_int, .tostr_num => {
+                    const v = values[ins.a];
+                    const type_ok = if (ins.op == .tostr_int) v.isInt() else v.isFloat();
+                    if (type_ok) {
+                        if (ctx.heap) |heap| {
+                            const hdr = if (ins.op == .tostr_int)
+                                stralloc.tostrIntRuntime(heap, v.asInt())
+                            else
+                                stralloc.tostrNumRuntime(heap, v.asFloat());
+                            if (hdr) |h| {
+                                values[i] = Value.heap(h);
+                                if (record) rec.value(i, values[i]);
+                                continue;
+                            }
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, v);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                // Doc 24 D4: `#s` of a proven string — the cached code-point
+                // count (`cp_len`, the `#s` semantic; NOT bytes). Pure leaf
+                // producer; defensive non-string side-exit (the producer or a
+                // dominating `guard_string` proves the operand).
+                .slen => {
+                    const v = values[ins.a];
+                    if (v.isHeap() and v.heapType() == .string) {
+                        const s = string_mod.String.fromHeader(v.asHeap());
+                        values[i] = Value.int(@intCast(s.cp_len));
+                        if (record) rec.value(i, values[i]);
+                        continue;
+                    }
+                    if (record) rec.exit(i, .guard, v);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                // Doc 24 D4: the observed value is a heap string (the string
+                // analogue of `guard_table`'s type half).
+                .guard_string => {
+                    const v = values[ins.a];
+                    if (v.isHeap() and v.heapType() == .string) {
+                        if (record) rec.guardPass(i, v);
+                    } else {
+                        if (record) rec.exit(i, .guard, v);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
                 // The table's array lane still equals the recorded lane (a
                 // monotonic widen would have moved it past `aux`).
                 .guard_lane => {
@@ -886,10 +1002,10 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 // The column lands inside the row: `1 <= col <= stride`. Walk
                 // `gcell.a` → garow → table for the stride, `gcell.b` for the column.
                 .guard_gcol => {
-                    const gc = t.instrs[ins.a];
-                    const ga = t.instrs[gc.a];
+                    const gcell = t.instrs[ins.a];
+                    const ga = t.instrs[gcell.a];
                     const tbl = table.Table.fromHeader(values[ga.a].asHeap());
-                    const col = values[gc.b].asInt();
+                    const col = values[gcell.b].asInt();
                     if (col >= 1 and col <= @as(i64, @intCast(tbl.array.stride))) {
                         if (record) rec.guardPass(i, values[ga.a]);
                     } else {
@@ -901,11 +1017,11 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 // native int path cannot represent — the grid analogue of
                 // `guard_present`).
                 .guard_gpresent => {
-                    const gc = t.instrs[ins.a];
-                    const ga = t.instrs[gc.a];
+                    const gcell = t.instrs[ins.a];
+                    const ga = t.instrs[gcell.a];
                     const tbl = table.Table.fromHeader(values[ga.a].asHeap());
                     const row: usize = @intCast(values[ga.b].asInt() - 1);
-                    const col: usize = @intCast(values[gc.b].asInt() - 1);
+                    const col: usize = @intCast(values[gcell.b].asInt() - 1);
                     if (!tbl.array.gridGet(row, col).isNil()) {
                         if (record) rec.guardPass(i, values[ga.a]);
                     } else {

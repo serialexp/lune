@@ -74,7 +74,7 @@ test "S-C: unicode_version survives a snapshot cut with no double-consume" {
         var buf: [512]u8 = undefined;
         var sink = io.Writer.fixed(&buf);
         vm.out = &sink;
-        var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
         defer chunk.deinit();
         try testing.expect(!diags.hasErrors());
         vm.effect_mode = .record;
@@ -97,7 +97,7 @@ test "S-C: unicode_version survives a snapshot cut with no double-consume" {
     var buf2: [512]u8 = undefined;
     var sink2 = io.Writer.fixed(&buf2);
     vm2.out = &sink2;
-    var chunk2 = try lune_compiler.compile(gpa, &vm2.heap, source, tree.root, &diags);
+    var chunk2 = try lune_compiler.compile(gpa, vm2.heap, source, tree.root, &diags);
     defer chunk2.deinit();
     try testing.expect(!diags.hasErrors());
 

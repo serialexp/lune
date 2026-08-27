@@ -413,7 +413,7 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
 
     // --- compile --- (pass the builtin globals so the unknown-global lint
     // doesn't flag `print`/`clock`).
-    var chunk = lune.compiler.compileWithOptions(gpa, &vm.heap, source, tree.root, &diags, .{
+    var chunk = lune.compiler.compileWithOptions(gpa, vm.heap, source, tree.root, &diags, .{
         .known_globals = &lune.interp.builtin_global_names,
     }) catch |err| {
         reportDiagnostics(name, &diags);

@@ -590,7 +590,7 @@ test "executor: integer //-by-zero inside a hot loop side-exits; tier-0 re-raise
         vm.trace.config.enabled = mode != .off;
         vm.trace.config.execute = mode == .record_execute;
         vm.trace.config.hotloop = 4;
-        var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
         defer chunk.deinit();
         try testing.expect(!diags.hasErrors());
         try testing.expectError(Error.DivisionByZero, vm.run(chunk.proto));
@@ -700,7 +700,7 @@ test "executor: a thrashing anchor that later stabilizes recovers from the gate"
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     _ = try vm.run(chunk.proto);
 

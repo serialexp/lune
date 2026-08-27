@@ -77,6 +77,13 @@ export const IR_OP_NAMES = [
   "alen", // 57  `#t` fast-case border: max(asize-1, 0), side-exits otherwise
   "fsin", // 58  math.sin via the shared noinline fmath kernel (never folded)
   "fcos", // 59  math.cos via the shared noinline fmath kernel (never folded)
+  // Deterministic on-trace allocation (doc 24, arc B); appended at the enum end
+  // so wire ordinals 0..59 are undisturbed.
+  "tostr_int", // 60  interned decimal rendering of a proven int (allocating)
+  "tostr_num", // 61  interned rendering of a proven float (allocating)
+  "slen", // 62  #s of a proven string: cached cp_len (code points)
+  "guard_string", // 63  value is a heap string
+  "guard_gc", // 64  allocation-budget entry guard (aux = bound A)
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -110,7 +117,13 @@ export type ValueTagName = (typeof VALUE_TAG_NAMES)[number];
 
 /** Opcodes that take no operand columns (the loop back-edge terminator and the
  * preheader region boundary — both pure structural markers). */
-export const NO_OPERAND_OPS: ReadonlySet<IrOpName> = new Set(["loop", "preheader", "link"]);
+export const NO_OPERAND_OPS: ReadonlySet<IrOpName> = new Set([
+  "loop",
+  "preheader",
+  "link",
+  // guard_gc is operand-free: aux carries the allocation bound A (doc 24).
+  "guard_gc",
+]);
 
 /** Unary ops + guards: render a single operand `%a`. (`aref` is two-operand and
  * falls through to the default `%a, %b` rendering.) */
@@ -138,6 +151,10 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "fsin",
   "fcos",
   "alen",
+  "tostr_int",
+  "tostr_num",
+  "slen",
+  "guard_string",
   // Single-operand grid ops (doc 14): the cell load + three structural guards
   // render `%a`. garow/gcell/gstore/guard_gcol are two-operand (guard_gcol carries
   // the column ref in `%b`) and use the default `%a, %b`.

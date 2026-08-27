@@ -502,7 +502,7 @@ fn runCoverageForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, si
     vm.trace.config.hotloop = 4;
     vm.out = sink;
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     errdefer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -659,7 +659,7 @@ test "coherent-state chaining (doc 16, Phase 2): nsieve prime path chains, not t
         native_vm.trace.config.optimize = true;
         native_vm.trace.config.native_codegen = true;
         native_vm.out = &native;
-        var chunk = try compiler.compile(gpa, &native_vm.heap, source, tree.root, &diags);
+        var chunk = try compiler.compile(gpa, native_vm.heap, source, tree.root, &diags);
         defer chunk.deinit();
         try testing.expect(!diags.hasErrors());
         _ = try native_vm.run(chunk.proto);

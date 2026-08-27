@@ -68,7 +68,7 @@ fn expectRoundTrip(source: [:0]const u8) !void {
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -239,7 +239,7 @@ test "restore reanimates a live load closure that runs with the same result (L-2
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -290,7 +290,7 @@ test "restore rebuilds globals, ids, and a reachable value graph" {
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     _ = try vm.run(chunk.proto);
 
@@ -372,7 +372,7 @@ test "H-2: next_obj_id survives pre-cut garbage (restored verbatim, not reconstr
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -426,19 +426,19 @@ test "chunk rooting: retained-chunk constants survive a snapshot straddle iff th
 
     var tm = try lune_parser.parse(gpa, main_src, &diags);
     defer tm.deinit();
-    var cm = try lune_compiler.compile(gpa, &vm.heap, main_src, tm.root, &diags);
+    var cm = try lune_compiler.compile(gpa, vm.heap, main_src, tm.root, &diags);
     defer cm.deinit();
     var tx = try lune_parser.parse(gpa, sx, &diags);
     defer tx.deinit();
-    var cx = try lune_compiler.compile(gpa, &vm.heap, sx, tx.root, &diags);
+    var cx = try lune_compiler.compile(gpa, vm.heap, sx, tx.root, &diags);
     defer cx.deinit();
     var ty = try lune_parser.parse(gpa, sy, &diags);
     defer ty.deinit();
-    var cy = try lune_compiler.compile(gpa, &vm.heap, sy, ty.root, &diags);
+    var cy = try lune_compiler.compile(gpa, vm.heap, sy, ty.root, &diags);
     defer cy.deinit();
     var tz = try lune_parser.parse(gpa, sz, &diags);
     defer tz.deinit();
-    var cz = try lune_compiler.compile(gpa, &vm.heap, sz, tz.root, &diags);
+    var cz = try lune_compiler.compile(gpa, vm.heap, sz, tz.root, &diags);
     defer cz.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -461,11 +461,11 @@ test "chunk rooting: retained-chunk constants survive a snapshot straddle iff th
         }
         var d2 = Diagnostics.init(gpa);
         defer d2.deinit();
-        var rx = try lune_compiler.compile(gpa, &vm2.heap, sx, tx.root, &d2);
+        var rx = try lune_compiler.compile(gpa, vm2.heap, sx, tx.root, &d2);
         defer rx.deinit();
-        var ry = try lune_compiler.compile(gpa, &vm2.heap, sy, ty.root, &d2);
+        var ry = try lune_compiler.compile(gpa, vm2.heap, sy, ty.root, &d2);
         defer ry.deinit();
-        var rz = try lune_compiler.compile(gpa, &vm2.heap, sz, tz.root, &d2);
+        var rz = try lune_compiler.compile(gpa, vm2.heap, sz, tz.root, &d2);
         defer rz.deinit();
         try testing.expect(!d2.hasErrors());
         try vm2.retainChunk(rx.proto);
@@ -487,11 +487,11 @@ test "chunk rooting: retained-chunk constants survive a snapshot straddle iff th
         }
         var d3 = Diagnostics.init(gpa);
         defer d3.deinit();
-        var rx = try lune_compiler.compile(gpa, &vm3.heap, sx, tx.root, &d3);
+        var rx = try lune_compiler.compile(gpa, vm3.heap, sx, tx.root, &d3);
         defer rx.deinit();
-        var ry = try lune_compiler.compile(gpa, &vm3.heap, sy, ty.root, &d3);
+        var ry = try lune_compiler.compile(gpa, vm3.heap, sy, ty.root, &d3);
         defer ry.deinit();
-        var rz = try lune_compiler.compile(gpa, &vm3.heap, sz, tz.root, &d3);
+        var rz = try lune_compiler.compile(gpa, vm3.heap, sz, tz.root, &d3);
         defer rz.deinit();
         try testing.expect(!d3.hasErrors());
         try vm3.retainChunk(rz.proto); // reversed
@@ -544,7 +544,7 @@ test "H-2/G-2: snapshot bytes are identical whether or not the JIT recorded (tra
             var sink_buf: [64]u8 = undefined;
             var sink = io.Writer.fixed(&sink_buf);
             vm.out = &sink;
-            var chunk = try lune_compiler.compile(a, &vm.heap, src, tree.root, &diags);
+            var chunk = try lune_compiler.compile(a, vm.heap, src, tree.root, &diags);
             defer chunk.deinit();
             try testing.expect(!diags.hasErrors());
             _ = try vm.run(chunk.proto);
@@ -596,7 +596,7 @@ test "restore reanimates the package/require module system (searchers rebind, ca
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -668,7 +668,7 @@ test "doc 19 §R2: v8 schema boundary — version rejection + missing loaded lit
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -754,7 +754,7 @@ test "doc 19 §T3: restored load-driven program resumes with the JIT and traces 
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -825,7 +825,7 @@ test "metatable edge to the id-0 object survives round-trip (1-based encoding)" 
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     _ = try vm.run(chunk.proto);
 
@@ -879,7 +879,7 @@ test "restore preserves a multi-result native's projection and multi fn" {
     var vm = try Vm.init(gpa);
     defer vm.deinit();
 
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     _ = try vm.run(chunk.proto);
 

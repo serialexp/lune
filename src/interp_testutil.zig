@@ -103,7 +103,7 @@ pub fn runCapturedTuned(
     vm.trace.config.coverage = opts.coverage;
     if (opts.hotguard) |hg| vm.trace.config.hotguard = hg;
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -148,7 +148,7 @@ pub fn compileRun(gpa: std.mem.Allocator, vm: *Vm, source: [:0]const u8) !void {
     var tree = try parser.parse(gpa, source, &diags);
     defer tree.deinit();
     try testing.expect(!diags.hasErrors());
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -185,7 +185,7 @@ pub fn runExecForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, si
     vm.trace.config.hotloop = 4;
     vm.out = sink;
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     errdefer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -221,7 +221,7 @@ pub fn runNativeForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, 
     vm.trace.config.hotloop = 4;
     vm.out = sink;
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     errdefer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);

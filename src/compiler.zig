@@ -1593,7 +1593,7 @@ fn run(src: [:0]const u8) !RunResult {
 
     var vm = try interp.Vm.init(testing.allocator);
     errdefer vm.deinit();
-    var chunk = try compile(testing.allocator, &vm.heap, src, tree.root, &diags);
+    var chunk = try compile(testing.allocator, vm.heap, src, tree.root, &diags);
     errdefer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -1821,7 +1821,7 @@ fn expectCompileError(src: [:0]const u8) !void {
     defer tree.deinit();
     var vm = try interp.Vm.init(testing.allocator);
     defer vm.deinit();
-    try testing.expectError(Error.CompileError, compile(testing.allocator, &vm.heap, src, tree.root, &diags));
+    try testing.expectError(Error.CompileError, compile(testing.allocator, vm.heap, src, tree.root, &diags));
     try testing.expect(diags.hasErrors());
 }
 
@@ -2030,7 +2030,7 @@ test "unsupported construct produces a diagnostic, not a crash" {
 
     var vm = try interp.Vm.init(testing.allocator);
     defer vm.deinit();
-    try testing.expectError(Error.CompileError, compile(testing.allocator, &vm.heap, src, tree.root, &diags));
+    try testing.expectError(Error.CompileError, compile(testing.allocator, vm.heap, src, tree.root, &diags));
     try testing.expect(diags.hasErrors());
 }
 
@@ -2046,7 +2046,7 @@ test "per-instruction spans: parallel to code and map to source lines" {
     defer tree.deinit();
     var vm = try interp.Vm.init(testing.allocator);
     defer vm.deinit();
-    var chunk = try compile(testing.allocator, &vm.heap, src, tree.root, &diags);
+    var chunk = try compile(testing.allocator, vm.heap, src, tree.root, &diags);
     defer chunk.deinit();
 
     const proto = chunk.proto;
@@ -2079,7 +2079,7 @@ fn checkGlobals(
 
     var vm = try interp.Vm.init(testing.allocator);
     defer vm.deinit();
-    var chunk = try compileWithOptions(testing.allocator, &vm.heap, src, tree.root, &diags, .{
+    var chunk = try compileWithOptions(testing.allocator, vm.heap, src, tree.root, &diags, .{
         .known_globals = known,
     });
     defer chunk.deinit();

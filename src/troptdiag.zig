@@ -139,6 +139,7 @@ fn detectDeadCarries(
             .guard_func,
             .hload, .guard_hash,
             .guard_builtin, .fsqrt, .fsin, .fcos,
+            .tostr_int, .tostr_num, .slen, .guard_string,
             // Grid-cell ops reading only `a` (doc 14): the cell load and the
             // structural guards that reach the table/cell through the address chain.
             .gload, .guard_grid, .guard_stride, .guard_gpresent,
@@ -158,8 +159,9 @@ fn detectDeadCarries(
                 if (ins.aux == trace.PHI_INTERNAL) uses[ins.a] += 1; // internal phi uses its init
             },
             // `.link` (doc 15) carries no operand refs (`aux` is the inner anchor pc),
-            // so like `.loop`/`.preheader` it contributes no uses.
-            .slot_load, .konst, .loop, .preheader, .link => {},
+            // so like `.loop`/`.preheader` it contributes no uses. `guard_gc`
+            // (doc 24) is likewise operand-free (`aux` = the bound A).
+            .slot_load, .konst, .loop, .preheader, .link, .guard_gc => {},
         }
     }
 
@@ -261,6 +263,7 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             .guard_func,
             .hload, .guard_hash,
             .guard_builtin, .fsqrt, .fsin, .fcos,
+            .tostr_int, .tostr_num, .slen, .guard_string,
             .gload, .guard_grid, .guard_stride, .guard_gpresent,
             .alen,
             => ins.a == idx,
@@ -268,7 +271,8 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             .garow, .gcell, .gstore, .guard_gcol => ins.a == idx or ins.b == idx,
             .phi => (ins.aux == trace.PHI_INTERNAL and ins.a == idx) or ins.b == idx,
             // `.link` (doc 15) consumes no refs (`aux` is the inner anchor pc).
-            .slot_load, .konst, .loop, .preheader, .link => false,
+            // `guard_gc` (doc 24) is operand-free: `a` unused, `aux` = bound A.
+            .slot_load, .konst, .loop, .preheader, .link, .guard_gc => false,
         };
         if (consumes) {
             found_consumer = true;

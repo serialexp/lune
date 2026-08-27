@@ -162,7 +162,7 @@ fn effectRun(gpa: std.mem.Allocator, source: [:0]const u8, mode: EffectMode, pre
     if (seed) |s| vm.random_seed_source = s.source();
     if (preload.len > 0) try vm.effect_log.appendSlice(gpa, preload);
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -1012,7 +1012,7 @@ test "A-vi: committed effect sequence is mode-independent across all four commit
         var out_buf: [256]u8 = undefined;
         var sink = io.Writer.fixed(&out_buf);
         vm.out = &sink;
-        const log = try effectser.decodeFile(gpa, &vm.heap, log_bytes);
+        const log = try effectser.decodeFile(gpa, vm.heap, log_bytes);
         defer gpa.free(log);
         try vm.effect_log.appendSlice(gpa, log);
         vm.effect_mode = .replay;
@@ -1121,7 +1121,7 @@ test "L-3: record→serialize→replay reproduces output with the FS detached" {
         defer vm.deinit();
         var sink = io.Writer.fixed(&rep_out_buf);
         vm.out = &sink;
-        const log = try effectser.decodeFile(gpa, &vm.heap, log_bytes);
+        const log = try effectser.decodeFile(gpa, vm.heap, log_bytes);
         defer gpa.free(log);
         try vm.effect_log.appendSlice(gpa, log);
         vm.effect_mode = .replay;

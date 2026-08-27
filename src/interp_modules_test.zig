@@ -209,7 +209,7 @@ test "P3: record→serialize→replay reproduces a require program with the FS d
         defer vm.deinit();
         var sink = io.Writer.fixed(&rep_out_buf);
         vm.out = &sink;
-        const log = try effectser.decodeFile(gpa, &vm.heap, log_bytes);
+        const log = try effectser.decodeFile(gpa, vm.heap, log_bytes);
         defer gpa.free(log);
         try vm.effect_log.appendSlice(gpa, log);
         vm.effect_mode = .replay; // NO fs_source — content must come from the log

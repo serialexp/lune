@@ -516,7 +516,7 @@ fn recompileLoadedChunks(vm: *Vm, root: *const Proto, loaded: []const schema.Loa
             return error.LoadedChunkRecompileFailed;
         }
 
-        var chunk = compiler.compileWithOptions(vm.gpa, &vm.heap, owned, tree.root, &diags, .{
+        var chunk = compiler.compileWithOptions(vm.gpa, vm.heap, owned, tree.root, &diags, .{
             .known_globals = &interp.builtin_global_names,
             .id_base = vm.next_proto_id,
             .vararg_root = true,

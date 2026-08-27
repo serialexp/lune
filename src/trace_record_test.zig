@@ -1151,6 +1151,109 @@ test "recBTostring: konst int folds via the shared renderer; konst string aborts
     try testing.expectEqual(AbortReason.bad_type, h2.state.rec.abort_reason.?);
 }
 
+test "recBTostring: scalar non-konst records guard_gc + tostr_int/tostr_num (doc 24 c2)" {
+    const gpa = testing.allocator;
+    // Int argument: the arg's slot_load resolves FIRST (refOf before the callee
+    // guard), then the callee pin, the type guard, and the lazily-placed
+    // guard_gc immediately before the trace's first `.alloc` op.
+    var h = try FoldHarness.init(gpa, .tostring, &.{});
+    defer h.deinit(gpa);
+    try h.start(gpa);
+    const objs_before = h.heap.strtab_count;
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.int(7), Value.heap(&h.nat.header), Value.int(9), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    const ops = h.state.rec.instrs.items;
+    try testing.expectEqual(@as(usize, 6), ops.len);
+    try testing.expectEqual(IrOp.slot_load, ops[0].op); // arg (slot 1)
+    try testing.expectEqual(IrOp.slot_load, ops[1].op); // callee (slot 0)
+    try testing.expectEqual(IrOp.guard_builtin, ops[2].op);
+    try testing.expectEqual(@as(i32, @intFromEnum(function.RecordedBuiltin.tostring)), ops[2].aux);
+    try testing.expectEqual(IrOp.guard_int, ops[3].op);
+    try testing.expectEqual(IrOp.guard_gc, ops[4].op);
+    try testing.expectEqual(IrOp.tostr_int, ops[5].op);
+    try testing.expectEqual(@as(trace.Ref, 0), ops[5].a); // the arg slot_load
+    try testing.expectEqual(trace.ObsType.heap, ops[5].ty);
+    // The recorder bookkeeping behind commit-time stamping.
+    try testing.expectEqual(@as(u32, 1), h.state.rec.alloc_count);
+    try testing.expectEqual(@as(?trace.Ref, 4), h.state.rec.guard_gc_ref);
+    // Recording emitted IR only — no guest allocation (arc-A invariant holds
+    // for the RECORDER even in arc B; allocation happens at EXECUTION).
+    try testing.expectEqual(objs_before, h.heap.strtab_count);
+    // The dest reg now maps to the tostr result.
+    try testing.expectEqual(@as(trace.Ref, 5), try h.state.refOf(0));
+
+    // A SECOND allocating call in the same recording (fresh callee/arg slots so
+    // the first call's dest remap does not shadow the callee): guard_gc is
+    // emitted once per trace, but the bound counts every `.alloc` op.
+    h.state.recordInstr(Instr.opABC(.call, 2, 1, 1), winRO(&regs), &h.proto, 1, Value.nil());
+    try testing.expect(h.state.isRecording());
+    try testing.expectEqual(@as(u32, 2), h.state.rec.alloc_count);
+    var n_guard_gc: usize = 0;
+    for (h.state.rec.instrs.items) |ins| {
+        if (ins.op == .guard_gc) n_guard_gc += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n_guard_gc);
+
+    // Float argument: guard_float + tostr_num.
+    var h2 = try FoldHarness.init(gpa, .tostring, &.{});
+    defer h2.deinit(gpa);
+    try h2.start(gpa);
+    var regs2 = [_]Value{ Value.heap(&h2.nat.header), Value.float(0.5), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h2.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs2), &h2.proto, 0, Value.nil());
+    try testing.expect(h2.state.isRecording());
+    const ops2 = h2.state.rec.instrs.items;
+    try testing.expectEqual(@as(usize, 6), ops2.len);
+    try testing.expectEqual(IrOp.guard_float, ops2[3].op);
+    try testing.expectEqual(IrOp.guard_gc, ops2[4].op);
+    try testing.expectEqual(IrOp.tostr_num, ops2[5].op);
+}
+
+test "len opcode: #tostring(i) is a PROVEN string — slen with no guard_string (doc 24 c2)" {
+    const gpa = testing.allocator;
+    var h = try FoldHarness.init(gpa, .tostring, &.{});
+    defer h.deinit(gpa);
+    const s7 = try h.heap.intern("7"); // what tier-0 materialized for the dest reg
+    try h.start(gpa);
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.int(7), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    // Tier-0 has executed the call by the time `.len` records: reg 0 holds the
+    // rendered string. The recorder's reg map holds the tostr ref for it.
+    regs[0] = Value.heap(&s7.header);
+    h.state.recordInstr(Instr.opABC(.len, 3, 0, 0), winRO(&regs), &h.proto, 1, Value.nil());
+    try testing.expect(h.state.isRecording());
+    const ops = h.state.rec.instrs.items;
+    // ...guard_gc(4), tostr_int(5), slen(6) — and NO guard_string anywhere: the
+    // producer proves the type.
+    try testing.expectEqual(@as(usize, 7), ops.len);
+    try testing.expectEqual(IrOp.slen, ops[6].op);
+    try testing.expectEqual(@as(trace.Ref, 5), ops[6].a);
+    try testing.expectEqual(trace.ObsType.int, ops[6].ty);
+    for (ops) |ins| try testing.expect(ins.op != .guard_string);
+}
+
+test "len opcode: #s of an OBSERVED string records guard_string + slen (doc 24 c2)" {
+    const gpa = testing.allocator;
+    var h = try FoldHarness.init(gpa, .tostring, &.{});
+    defer h.deinit(gpa);
+    const s = try h.heap.intern("héllo"); // 6 bytes, 5 code points — slen is cp_len
+    try h.start(gpa);
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.heap(&s.header), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(Instr.opABC(.len, 2, 1, 0), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    const ops = h.state.rec.instrs.items;
+    try testing.expectEqual(@as(usize, 3), ops.len);
+    try testing.expectEqual(IrOp.slot_load, ops[0].op);
+    try testing.expectEqual(IrOp.guard_string, ops[1].op);
+    try testing.expectEqual(@as(trace.Ref, 0), ops[1].a);
+    try testing.expectEqual(IrOp.slen, ops[2].op);
+    try testing.expectEqual(@as(trace.Ref, 0), ops[2].a);
+    // An observed `#s` allocates nothing: no guard_gc, alloc bound stays 0.
+    try testing.expectEqual(@as(u32, 0), h.state.rec.alloc_count);
+    for (ops) |ins| try testing.expect(ins.op != .guard_gc);
+}
+
 test "recBRawget: int key reuses the array-get shape under guard_builtin" {
     const gpa = testing.allocator;
     const t = try table_mod.Table.create(gpa);

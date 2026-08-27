@@ -78,7 +78,7 @@ fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, r
     var buf: [512]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -352,7 +352,7 @@ test "§R3: capture→restore→resume with tracing+opt+native — restored narr
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -430,7 +430,7 @@ test "§R3: failing-allocator restore during the bulk lane repack leaks nothing"
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -518,7 +518,7 @@ test "A-iii: recursive live frames re-key deterministically across keyframe rest
     var sink_buf: [128]u8 = undefined;
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -632,7 +632,7 @@ fn jitFinalSnapshot(gpa: std.mem.Allocator, source: [:0]const u8, ref: RefRun) !
     var buf: [512]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -684,7 +684,7 @@ test "doc 21 §T-A.3: result span preserved; dead-slot-only garbage excluded fro
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -733,7 +733,7 @@ test "doc 21 §T-A.4: all_results finish — dynamic span past the static window
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -775,7 +775,7 @@ test "doc 21 §T-A.5: a depth-0 callValue invalidates the final cut (B-1 shape)"
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -806,7 +806,7 @@ test "doc 21 §T-A.6: pcall/xpcall unwind then finish — the cut reflects the f
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);

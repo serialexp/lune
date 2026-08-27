@@ -240,7 +240,7 @@ test "A-iv pcall unwind drops region_profit for the destroyed activation" {
     defer tree.deinit();
     var vm = try Vm.init(testing.allocator);
     defer vm.deinit();
-    var chunk = try compiler.compile(testing.allocator, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(testing.allocator, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     const failing = try vm.run(chunk.proto);

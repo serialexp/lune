@@ -75,7 +75,7 @@ fn runForTrace(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, enabled: b
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     errdefer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -148,7 +148,7 @@ test "H-2 part 3: a trace const does not survive a top-level epoch boundary (cro
             vm.out = &sink1;
             var t1 = try parser.parse(a, src1, &diags);
             defer t1.deinit();
-            var c1 = try compiler.compile(a, &vm.heap, src1, t1.root, &diags);
+            var c1 = try compiler.compile(a, vm.heap, src1, t1.root, &diags);
             defer c1.deinit();
             try testing.expect(!diags.hasErrors());
             _ = try vm.run(c1.proto);
@@ -159,7 +159,7 @@ test "H-2 part 3: a trace const does not survive a top-level epoch boundary (cro
             vm.out = &sink2;
             var t2 = try parser.parse(a, src2, &diags);
             defer t2.deinit();
-            var c2 = try compiler.compile(a, &vm.heap, src2, t2.root, &diags);
+            var c2 = try compiler.compile(a, vm.heap, src2, t2.root, &diags);
             defer c2.deinit();
             try testing.expect(!diags.hasErrors());
             _ = try vm.run(c2.proto);
@@ -188,12 +188,16 @@ test "H-2 part 3: clearCache retires every trace + resets all derived tiering/di
     const gpa = testing.allocator;
     const parser = @import("parser.zig");
     const diag = @import("diag.zig");
+    // NB: the abort-log seed loop must stay UNRECORDABLE. `#tostring(i)` served
+    // until doc 24 c2 made scalar tostring record end-to-end; `tostring(t)` of a
+    // table still aborts at `recBTostring` (`.bad_type` — non-scalar argument),
+    // which is what populates `abort_log` below.
     const source =
         \\local t = { k = 1 }
         \\local s = 0
         \\for i = 1, 200 do s = s + t.k end
         \\local u = 0
-        \\for i = 1, 200 do u = u + #tostring(i) end
+        \\for i = 1, 200 do u = u + #tostring(t) end
         \\print(s + u)
     ;
     var diags = diag.Diagnostics.init(gpa);
@@ -212,7 +216,7 @@ test "H-2 part 3: clearCache retires every trace + resets all derived tiering/di
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -272,7 +276,7 @@ test "H-2 part 3: the JIT still records fresh traces in a second epoch after the
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try compiler.compile(gpa, &vm.heap, src, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, src, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -281,6 +285,60 @@ test "H-2 part 3: the JIT still records fresh traces in a second epoch after the
     _ = try vm.run(chunk.proto); // epoch 2 — beginTopLevelEpoch cleared the cache first
     // A fresh trace was recorded in epoch 2 (not left wedged by the reset).
     try testing.expect(vm.trace.cache.items.len >= 1);
+}
+
+test "doc 24 c2: an allocating tostring loop records, commits guard_gc with the stamped bound, and runs end-to-end" {
+    // The scalar shape (`u = u + #tostring(i)`) end-to-end at the VM level: the
+    // loop must RECORD (pre-doc-24 it aborted at the builtin call), the
+    // committed trace must carry `alloc_bound == 1` with a guard_gc whose aux
+    // was stamped from the recorder's `.alloc` count, and the traced run's
+    // output must be byte-identical to the arithmetic truth.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local u = 0
+        \\for i = 1, 200 do u = u + #tostring(i) end
+        \\print(u)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    // 9×1 + 90×2 + 101×3 = 492 — and the loop ran hot, so most iterations
+    // committed on-trace with on-trace interning.
+    try testing.expectEqualStrings("492\n", sink.buffered());
+
+    // The committed trace: exactly one `.alloc` op per iteration → bound 1,
+    // stamped into the guard_gc's aux at commit.
+    var found = false;
+    for (vm.trace.cache.items) |t| {
+        if (t.alloc_bound == 0) continue;
+        found = true;
+        try testing.expectEqual(@as(u32, 1), t.alloc_bound);
+        var n_guard_gc: usize = 0;
+        for (t.instrs) |ins| {
+            if (ins.op == .guard_gc) {
+                n_guard_gc += 1;
+                try testing.expectEqual(@as(i32, 1), ins.aux);
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), n_guard_gc);
+    }
+    try testing.expect(found);
 }
 
 test "chunk rooting: a host-compiled retained chunk survives GC before it runs" {
@@ -307,11 +365,11 @@ test "chunk rooting: a host-compiled retained chunk survives GC before it runs" 
     // Compile B first (interns "compdeferlit"), then A. Neither is run yet.
     var tb = try parser.parse(gpa, src_b, &diags);
     defer tb.deinit();
-    var cb = try compiler.compile(gpa, &vm.heap, src_b, tb.root, &diags);
+    var cb = try compiler.compile(gpa, vm.heap, src_b, tb.root, &diags);
     defer cb.deinit();
     var ta = try parser.parse(gpa, src_a, &diags);
     defer ta.deinit();
-    var ca = try compiler.compile(gpa, &vm.heap, src_a, ta.root, &diags);
+    var ca = try compiler.compile(gpa, vm.heap, src_a, ta.root, &diags);
     defer ca.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -352,11 +410,11 @@ test "chunk rooting: releaseChunk unroots a retained chunk's constants" {
 
     var tb = try parser.parse(gpa, src_b, &diags);
     defer tb.deinit();
-    var cb = try compiler.compile(gpa, &vm.heap, src_b, tb.root, &diags);
+    var cb = try compiler.compile(gpa, vm.heap, src_b, tb.root, &diags);
     defer cb.deinit();
     var tc = try parser.parse(gpa, src_c, &diags);
     defer tc.deinit();
-    var cc = try compiler.compile(gpa, &vm.heap, src_c, tc.root, &diags);
+    var cc = try compiler.compile(gpa, vm.heap, src_c, tc.root, &diags);
     defer cc.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -387,15 +445,15 @@ test "chunk rooting: releaseChunk preserves survivor order (orderedRemove, not s
     const sz: [:0]const u8 = "print(\"olz\")\n";
     var tx = try parser.parse(gpa, sx, &diags);
     defer tx.deinit();
-    var cx = try compiler.compile(gpa, &vm.heap, sx, tx.root, &diags);
+    var cx = try compiler.compile(gpa, vm.heap, sx, tx.root, &diags);
     defer cx.deinit();
     var ty = try parser.parse(gpa, sy, &diags);
     defer ty.deinit();
-    var cy = try compiler.compile(gpa, &vm.heap, sy, ty.root, &diags);
+    var cy = try compiler.compile(gpa, vm.heap, sy, ty.root, &diags);
     defer cy.deinit();
     var tz = try parser.parse(gpa, sz, &diags);
     defer tz.deinit();
-    var cz = try compiler.compile(gpa, &vm.heap, sz, tz.root, &diags);
+    var cz = try compiler.compile(gpa, vm.heap, sz, tz.root, &diags);
     defer cz.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -443,11 +501,11 @@ test "chunk rooting: retained-chunk output is byte-identical across all 10 modes
 
             var tbb = try parser.parse(a, sb, &diags);
             defer tbb.deinit();
-            var cbb = try compiler.compile(a, &vm.heap, sb, tbb.root, &diags);
+            var cbb = try compiler.compile(a, vm.heap, sb, tbb.root, &diags);
             defer cbb.deinit();
             var taa = try parser.parse(a, sa, &diags);
             defer taa.deinit();
-            var caa = try compiler.compile(a, &vm.heap, sa, taa.root, &diags);
+            var caa = try compiler.compile(a, vm.heap, sa, taa.root, &diags);
             defer caa.deinit();
             try testing.expect(!diags.hasErrors());
 
@@ -623,7 +681,7 @@ test "doc 19: a static trace inlines a loaded callee (flipped recCall gate)" {
     var buf: [256]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -652,7 +710,7 @@ fn runForExecLog(vm: *Vm, gpa: std.mem.Allocator, source: [:0]const u8, sink: *i
     vm.trace.config.record_exec_log = record;
     vm.trace.config.hotloop = 4; // record short test loops
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     errdefer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -854,7 +912,7 @@ test "side traces: type-changing loop records a second trace at the same anchor"
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     _ = try vm.run(chunk.proto);
 
@@ -905,7 +963,7 @@ test "side traces: without side traces the anchor blacklists; with them it stays
         var buf: [64]u8 = undefined;
         var sink = io.Writer.fixed(&buf);
         vm.out = &sink;
-        var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
         defer chunk.deinit();
         _ = try vm.run(chunk.proto);
 
@@ -940,7 +998,7 @@ test "side traces: without side traces the anchor blacklists; with them it stays
         var buf: [64]u8 = undefined;
         var sink = io.Writer.fixed(&buf);
         vm.out = &sink;
-        var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
         defer chunk.deinit();
         _ = try vm.run(chunk.proto);
 
@@ -1149,7 +1207,7 @@ test "konst interning lets CSE collapse a repeated subexpression end-to-end" {
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit(); // keep the proto alive: the trace's anchor points into it
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);

@@ -523,8 +523,14 @@ const MetamethodNames = struct {
 pub const Vm = struct {
     gpa: std.mem.Allocator,
     /// The object heap (strings, tables, closures, …). Owns every heap value a
-    /// running program produces; freed wholesale by `deinit`.
-    heap: gc.Heap,
+    /// running program produces; freed wholesale by `deinit`. **Heap-allocated
+    /// with a stable address** (doc 24 D3/D5): `Vm` is a by-value struct that
+    /// may move, but tier-1b native pages bake `&heap.gc_stress` /
+    /// `&heap.object_count` / `&heap.next_gc` (the `guard_gc` budget guard) and
+    /// the `*Heap` itself (the `tostr_*` callout arg) as imm64s — the same
+    /// stability contract as `NativeSeedCtx`. Created by `initBare`; owned
+    /// here (`deinit` destroys it).
+    heap: *gc.Heap,
     /// The global environment: a table keyed by interned name strings. Free
     /// (non-local) names read and write here; the base library installs here.
     globals: *table.Table,
@@ -839,9 +845,15 @@ pub const Vm = struct {
         const seed_ctx = try gpa.create(trace.NativeSeedCtx);
         errdefer gpa.destroy(seed_ctx);
         seed_ctx.* = .{ .seed_fn = &nativeSeedFn, .seed_tier1a_fn = &nativeSeedTier1aFn };
+        // Stable-address heap (see the `heap` field doc): native pages bake
+        // pointers to its collection counters, so it cannot live inside the
+        // movable `Vm` by value.
+        const heap = try gpa.create(gc.Heap);
+        errdefer gpa.destroy(heap);
+        heap.* = gc.Heap.init(gpa);
         var vm = Vm{
             .gpa = gpa,
-            .heap = gc.Heap.init(gpa),
+            .heap = heap,
             .globals = undefined,
             .tags = tags,
             .payloads = payloads,
@@ -849,6 +861,11 @@ pub const Vm = struct {
             .trace = trace.TraceState.init(gpa),
         };
         vm.trace.native_seed_ctx = seed_ctx;
+        // Doc 24 D5: the stable mutable heap channel for allocating traces
+        // (tier-1a `.alloc` arms + tier-1b baked callouts). Safe to store once
+        // because `heap` is a stable gpa allocation, unlike `&vm.heap`-style
+        // interior pointers into the movable Vm.
+        vm.trace.exec_heap = heap;
         return vm;
     }
 
@@ -869,6 +886,7 @@ pub const Vm = struct {
         // those and must have released them before its own `Chunk.deinit`).
         self.retained_chunks.deinit(self.gpa);
         self.heap.deinit();
+        self.gpa.destroy(self.heap);
         self.gpa.free(self.tags);
         self.gpa.free(self.payloads);
         self.gpa.free(self.boundary_scratch);
@@ -1822,7 +1840,7 @@ pub const Vm = struct {
         self.heap.beginCollect() catch return;
         // The root set is defined once in `forEachRootHeader`; marking is just
         // "call `markHeader` on each root".
-        self.forEachRootHeader(.gc, null, &self.heap, gc.Heap.markHeader);
+        self.forEachRootHeader(.gc, null, self.heap, gc.Heap.markHeader);
         self.heap.traceAll();
         self.heap.sweep();
     }
@@ -2162,7 +2180,7 @@ pub const Vm = struct {
             // Refresh the recorder's read-only heap channel (doc 23 D2) — the
             // same supply-per-call pattern as `resolved`, so the recorder never
             // holds a `*Heap` it wasn't just handed by its driver.
-            self.trace.rec_heap = &self.heap;
+            self.trace.rec_heap = self.heap;
             self.trace.recordInstr(mi, regs, proto, @intCast(pc.*), resolved);
         }
         return i.op;
@@ -2329,9 +2347,9 @@ pub const Vm = struct {
             // hit-count guess made at receipt time.
             self.trace.tryArmSiblingHandoff(ct, safe_to_arm);
             var result = if (self.trace.config.record_exec_log) blk: {
-                const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.execute(ct, trace_regs, buf);
-                const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.execute(ct, trace_regs, buf);
-                break :blk irinterp.executeTraced(rec, ct, trace_regs, buf);
+                const tid = self.trace.traceIndex(ct) orelse break :blk irinterp.executeCtx(.{ .heap = self.heap }, ct, trace_regs, buf);
+                const rec = self.trace.execRecorderFor(tid) orelse break :blk irinterp.executeCtx(.{ .heap = self.heap }, ct, trace_regs, buf);
+                break :blk irinterp.executeTracedCtx(.{ .heap = self.heap }, rec, ct, trace_regs, buf);
             } else blk: {
                 // Doc 22 §B.2: `native_page` was resolved above (before VM-side
                 // seeding); non-null implies native_codegen && !record_exec_log.
@@ -2355,7 +2373,7 @@ pub const Vm = struct {
                     else
                         nt.runCapturingLedger(trace_regs, &self.trace.ledger_scratch, self.trace.silentStaging());
                 }
-                break :blk irinterp.execute(ct, trace_regs, buf);
+                break :blk irinterp.executeCtx(.{ .heap = self.heap }, ct, trace_regs, buf);
             };
             if (ran_native) {
                 if (self.trace.driveDispatcherSilentResult(ct, result, proto, regs, safe_to_arm)) |chain| {
@@ -2417,7 +2435,7 @@ pub const Vm = struct {
                 buf = self.trace.valuesPush(ct.instrs.len) catch
                     return .next_candidate; // OOM: same skip as the entry push
                 buf_live = true;
-                result = irinterp.execute(ct, trace_regs, buf);
+                result = irinterp.executeCtx(.{ .heap = self.heap }, ct, trace_regs, buf);
                 ran_native = false;
                 ran_native_link_mode = false;
             }
@@ -3914,7 +3932,20 @@ pub const Vm = struct {
                             // mismatch.  Branch-direction guards (guard_true/false)
                             // aren't fingerprinted — they depend on computed values.
                             if (!ct.matchesFingerprint(regs)) continue;
+                            // Doc 24 D8 observation blackout: while a suspend
+                            // cut or safepoint-line recording is armed, decline
+                            // to enter any ALLOCATING trace (`alloc_bound > 0`)
+                            // — a mid-burst observation would see a heap
+                            // `next_obj_id` tier-0 only reaches after the whole
+                            // burst, breaking §T-A.2 keyframe byte-identity.
+                            // Identical condition to `safe_to_arm` below;
+                            // tier-0 owns allocating loops for the window's
+                            // duration. Ordered after the fingerprint so a
+                            // blacked-out candidate still counts as matched
+                            // (no spurious side-trace pressure).
                             any_fingerprint_matched = true;
+                            if (ct.alloc_bound > 0 and
+                                (self.suspend_ctl != null or self.record_safepoint_lines)) continue;
                             // Native safety net: under `--jit-native`, a trace that
                             // records but can't compile to native (unsupported op /
                             // type) would otherwise run on the tier-1a IR-interpreter,

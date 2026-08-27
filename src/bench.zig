@@ -88,7 +88,7 @@ fn timeRun(gpa: std.mem.Allocator, io: std.Io, source: [:0]const u8, enabled: bo
         var sink = lune.io.Writer.fixed(&sink_buf);
         vm.out = &sink;
 
-        var chunk = try lune.compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+        var chunk = try lune.compiler.compile(gpa, vm.heap, source, tree.root, &diags);
         defer chunk.deinit();
 
         const start = std.Io.Timestamp.now(io, .awake);
@@ -117,7 +117,7 @@ fn traceInstrCount(gpa: std.mem.Allocator, source: [:0]const u8, optimize: bool)
     var sink = lune.io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune.compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune.compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     _ = try vm.run(chunk.proto);
 

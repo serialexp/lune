@@ -65,7 +65,7 @@ fn makeB3LinkTrace(
         .entry_slots = entry_slots,
         .entry_guards = entry_guards,
     };
-    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null) orelse
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
     try state.cache.append(gpa, t);
@@ -104,7 +104,7 @@ fn makeB3GuardTrace(
         .entry_slots = entry_slots,
         .entry_guards = entry_guards,
     };
-    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null) orelse
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
     try state.cache.append(gpa, t);
@@ -143,7 +143,7 @@ fn makeB3LoopDoneTrace(
         .entry_slots = entry_slots,
         .entry_guards = entry_guards,
     };
-    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null) orelse
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
     try state.cache.append(gpa, t);
@@ -196,7 +196,7 @@ fn makeB3BridgeTrace(
         .entry_guards = entry_guards,
         .exit_prov = exit_prov,
     };
-    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null) orelse
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
     try state.cache.append(gpa, t);
@@ -239,7 +239,7 @@ fn makeB3BridgeSuccessorTrace(
         .entry_slots = entry_slots,
         .entry_guards = entry_guards,
     };
-    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null) orelse
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
     try state.cache.append(gpa, t);
@@ -279,7 +279,7 @@ fn makeB3M1RampTrace(
         .entry_slots = entry_slots,
         .entry_guards = entry_guards,
     };
-    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null) orelse
+    t.native = .{ .compiled = nativegen.compileInto(gpa, &state.mcode_arena, t, null, null) orelse
         return error.NativeBailedUnexpectedly };
     errdefer t.native.deinit();
     try state.cache.append(gpa, t);

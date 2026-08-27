@@ -78,7 +78,7 @@ fn recordRun(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Writer) ![]
     vm.trace.config.enabled = true;
     vm.trace.config.hotloop = 4;
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -110,7 +110,7 @@ fn snapshotRun(gpa: std.mem.Allocator, source: [:0]const u8) ![]u8 {
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 

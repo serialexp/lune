@@ -108,7 +108,7 @@ pub fn compileToClosure(vm: *Vm, src_bytes: []const u8, chunk_name: []const u8, 
     // --- compile --- (pass builtin globals so the unknown-global lint doesn't
     // flag `print`/`clock`; offset proto ids so every loaded proto is globally
     // unique for snapshot serialization). Warnings are discarded for loaded code.
-    var chunk = compiler.compileWithOptions(vm.gpa, &vm.heap, owned, tree.root, &diags, .{
+    var chunk = compiler.compileWithOptions(vm.gpa, vm.heap, owned, tree.root, &diags, .{
         .known_globals = &interp.builtin_global_names,
         .id_base = vm.next_proto_id,
         // Lua loaded chunks are vararg: `load("return ...")(1, 2)` yields 1, 2.

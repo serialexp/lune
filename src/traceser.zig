@@ -131,7 +131,7 @@ fn withRecordedVm(source: [:0]const u8, check: *const fn (vm: *Vm) anyerror!void
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, &vm.heap, source, tree.root, &diags);
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     _ = try vm.run(chunk.proto);
 
@@ -374,9 +374,16 @@ test "wire enum ordinals are a pinned contract (mirrored by viz/src/enums.ts)" {
     try testing.expectEqual(@as(u8, 57), @intFromEnum(IrOp.alen));
     try testing.expectEqual(@as(u8, 58), @intFromEnum(IrOp.fsin));
     try testing.expectEqual(@as(u8, 59), @intFromEnum(IrOp.fcos));
+    // Deterministic on-trace allocation (doc 24, arc B), appended after `fcos`
+    // so wire ordinals 0..59 are undisturbed.
+    try testing.expectEqual(@as(u8, 60), @intFromEnum(IrOp.tostr_int));
+    try testing.expectEqual(@as(u8, 61), @intFromEnum(IrOp.tostr_num));
+    try testing.expectEqual(@as(u8, 62), @intFromEnum(IrOp.slen));
+    try testing.expectEqual(@as(u8, 63), @intFromEnum(IrOp.guard_string));
+    try testing.expectEqual(@as(u8, 64), @intFromEnum(IrOp.guard_gc));
     // Exhaustiveness: if a member is added/removed, this count changes and forces
     // both this test and enums.ts to be revisited.
-    try testing.expectEqual(@as(usize, 60), @typeInfo(IrOp).@"enum".field_names.len);
+    try testing.expectEqual(@as(usize, 65), @typeInfo(IrOp).@"enum".field_names.len);
 
     const ObsType = trace.ObsType;
     try testing.expectEqual(@as(u8, 0), @intFromEnum(ObsType.unknown));

@@ -75,7 +75,7 @@ pub const Optimized = struct {
     }
 };
 
-const OpKind = enum { konst, slot_load, binary, unary, cvt, guard, aref, aload, astore, loop, phi, preheader };
+const OpKind = enum { konst, slot_load, binary, unary, cvt, guard, aref, aload, astore, loop, phi, preheader, alloc, gcguard };
 
 fn kindOf(op: IrOp) OpKind {
     return switch (op) {
@@ -161,6 +161,34 @@ fn kindOf(op: IrOp) OpKind {
         // freshly-recorded trace (the recorder emits none); the LICM pass below
         // *synthesizes* it during compaction. Mapped for switch-exhaustiveness.
         .preheader => .preheader,
+        // Doc 24 D4: allocating interned-string producers. `.alloc` is a
+        // side-effecting VALUE-PRODUCING root class: allocation events are
+        // effects on the serialized id stream (`next_obj_id` is byte-compared),
+        // so a dead `tostr_*` is still executed (never DCE'd — tier-0 executes
+        // its call unconditionally), never hoisted (the first-burst-after-
+        // restore argument is unproven, D2), never folded, never reordered
+        // across `guard_gc` or each other (allocation order IS the id stream).
+        // CSE of a repeated `tostr_*` is id-neutral (the repeat is a guaranteed
+        // intern hit) and admitted by doc 24 D4/codex #8, but deliberately NOT
+        // implemented in this first cut — a root-class CSE needs its own
+        // dead-second-instance story; the demand table has no repeat calls.
+        .tostr_int, .tostr_num => .alloc,
+        // `slen` is a pure leaf producer over an interned string (allocates
+        // nothing): ordinary `.unary` — CSE'd, DCE'd if dead, hoisted iff its
+        // operand is invariant. Deliberately never constant-folded (the fold
+        // arm skips it): its operand is never a konst in an honest trace (the
+        // recorder folds `#` of a konst string at record time).
+        .slen => .unary,
+        // `guard_string`: the string-type pin — an ordinary side-effecting
+        // guard root, deduped by (op, operand ref) like `guard_table`.
+        .guard_string => .guard,
+        // `guard_gc` (doc 24 D3): the allocation-budget entry guard. Its OWN
+        // kind, NOT `.guard`: it is operand-free (`a` is unused — the `.guard`
+        // machinery would misread instr 0 as its operand), never deduped (one
+        // per body, placed by the recorder), never folded, never hoisted (it
+        // must re-check the live heap counters EVERY iteration — a preheader
+        // placement would leave iterations 2..n unprotected).
+        .guard_gc => .gcguard,
     };
 }
 
@@ -304,7 +332,7 @@ pub fn optimize(
                 // `@sqrt` at compile time — that avoids any fold-vs-runtime sign/NaN
                 // divergence, exactly like `int_of_float`. It still CSEs below. (And
                 // `evalUnary` is `unreachable` for it — it never folds a constant.)
-                if (ins.op != .fsqrt and ins.op != .fsin and ins.op != .fcos) {
+                if (ins.op != .fsqrt and ins.op != .fsin and ins.op != .fcos and ins.op != .slen) {
                     if (const_val[a2]) |va| {
                         if (irinterp.evalUnary(ins.op, va)) |res| {
                             const aux: i32 = @intCast(out_consts.items.len);
@@ -347,6 +375,10 @@ pub fn optimize(
             // property holds for free. `astore` is effectful: never folded, never
             // CSE'd, kept as a root by the liveness pass below (I1).
             .aref, .aload, .astore => {},
+            // `.alloc` ops are effectful roots: canonical to themselves, never
+            // folded, never CSE'd (see kindOf). `.gcguard` likewise — and its
+            // `a` is NOT an operand, so it must not touch the guard tables.
+            .alloc, .gcguard => {},
             .loop => {},
             // φ is a loop-carried root: canonical to itself, never folded/CSE'd.
             .phi => {},
@@ -370,7 +402,7 @@ pub fn optimize(
         // it is the loop carry / the deopt writeback, never dead.
         // `.cvt` (int_of_float) is a side-effecting root: it can side-exit, so it must
         // never be DCE'd even if its value looked dead — exactly like a kept guard.
-        if ((k == .guard and !dead[i]) or k == .astore or k == .phi or k == .cvt) live[i] = true;
+        if ((k == .guard and !dead[i]) or k == .astore or k == .phi or k == .cvt or k == .alloc or k == .gcguard) live[i] = true;
         // A φ's back-edge update `b` may be a FORWARD ref (`b > i`) —
         // `assertWellFormed` permits it (only φ.b may point past its own index),
         // and an internal SR φ's `update = add(φ, Δ)` necessarily does. The single
@@ -396,6 +428,10 @@ pub fn optimize(
                     live[canon[ins.b]] = true;
                 },
                 .unary, .cvt, .guard, .aload => live[canon[ins.a]] = true,
+                // `.alloc` reads its single guarded operand `a`. `.gcguard`
+                // reads nothing (`a` unused).
+                .alloc => live[canon[ins.a]] = true,
+                .gcguard => {},
                 // `aref` (table+index) and `astore` (aref+value) both keep two
                 // operands alive.
                 .aref, .astore => {
@@ -485,8 +521,10 @@ pub fn optimize(
                 inv[i] = inv[canon[ins.a]];
                 hoist[i] = inv[i];
             },
-            // Guards, memory ops, the loop terminator, φ: not invariant-hoistable.
-            .guard, .aref, .aload, .astore, .loop, .phi, .preheader => {},
+            // Guards, memory ops, the loop terminator, φ, `.alloc` (id-stream
+            // effects) and `.gcguard` (must re-check per iteration): not
+            // invariant-hoistable.
+            .guard, .aref, .aload, .astore, .loop, .phi, .preheader, .alloc, .gcguard => {},
         }
     }
 
@@ -577,6 +615,8 @@ pub fn optimize(
                 out.b = new_index[canon[ins.b]];
             },
             .unary, .cvt, .guard, .aload => out.a = new_index[canon[ins.a]],
+            .alloc => out.a = new_index[canon[ins.a]],
+            .gcguard => {}, // operand-free; aux (the bound A) rides verbatim
             .aref, .astore => {
                 out.a = new_index[canon[ins.a]];
                 out.b = new_index[canon[ins.b]];

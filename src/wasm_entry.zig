@@ -442,7 +442,7 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
     if (eff_bytes.len > 0) {
         // String results (getenv/argv) are re-interned into `vm.heap`; the
         // effect-log GC root keeps them alive while the cursor feeds them back.
-        const effects = try lune.effectser.decodeFile(gpa, &vm.heap, eff_bytes);
+        const effects = try lune.effectser.decodeFile(gpa, vm.heap, eff_bytes);
         defer gpa.free(effects);
         try vm.effect_log.appendSlice(gpa, effects);
     }
@@ -451,7 +451,7 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
     // instruction is one safepoint — matching `Result.safepoint_count`.
     vm.suspend_ctl = .{ .after_safepoints = @min(@as(u64, stop_after), safepoint_cap) };
 
-    var chunk = lune.compiler.compileWithOptions(gpa, &vm.heap, src0, tree.root, &diags, .{
+    var chunk = lune.compiler.compileWithOptions(gpa, vm.heap, src0, tree.root, &diags, .{
         .known_globals = &lune.interp.builtin_global_names,
     }) catch {
         res.status = 1;
@@ -599,7 +599,7 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
 
     // --- compile --- (pass builtin globals so the unknown-global lint doesn't
     // flag `print`/`clock`).
-    var chunk = lune.compiler.compileWithOptions(gpa, &vm.heap, src0, tree.root, &diags, .{
+    var chunk = lune.compiler.compileWithOptions(gpa, vm.heap, src0, tree.root, &diags, .{
         .known_globals = &lune.interp.builtin_global_names,
     }) catch {
         res.status = 1;
