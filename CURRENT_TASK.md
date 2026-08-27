@@ -10,7 +10,8 @@ str_format 18.5× host_barrier call) — **CORRECTED 2026-08-27 (LATEST-84): the
 dominant cause of scalar's and str_format's gap was NOT ffrecord but the string
 interner (82–89% of runtime); fixed, scalar 4.0×/str_format 3.2×. ffrecord
 remains the lever for what's left of them (both now tier-0-bound on dispatch +
-builtin calls) and for partialsums**; (2) **[REFRAMED, see LATEST-72]**
+builtin calls) and for partialsums** — **arc A landed 2026-08-27 (LATEST-85):
+partialsums 2.0×; scalar/str_* remainder is arc B (allocating builtins)**; (2) **[REFRAMED, see LATEST-72]**
 Pall-shape nest coverage — NOT "root-recording linkage" (the `.root` LINNER
 abort is Pall-faithful, lj_record.c 605–700); the real gaps are backend:
 heap φ writeback + seeded-trace seams + inner-root owner election (nbody
@@ -19,6 +20,66 @@ heap φ writeback + seeded-trace seams + inner-root owner election (nbody
 hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
+
+## Status 2026-08-27 (LATEST-85) — **doc 23 arc A landed: builtin recording breadth (non-allocating). partialsums 6.9× → 2.0× LuaJIT (−79.3% instructions, 100% native iterations); `#t`/rawget/rawset/type/select/tonumber/rawequal loops now record. `pow` and int→float promotion turned out to be the hidden headline blockers.**
+
+**What landed (doc 23, arc A — everything that records without guest-heap
+allocation).** RecordedBuiltin ordinals 1–10 (append-only wire enum in
+`guard_builtin` aux): fold arms `type`/`select('#')`/`tonumber`(konst)/
+`rawequal`/`tostring`(konst)/`rawlen`(konst string) — read-only
+`internedLookup`, abort on miss, NEVER intern (the no-allocation invariant,
+pinned by strtab_count tests); index-shape extraction (Get/SetFrame +
+OperandDesig .a1/.a2/.a3) shared by the opcode arms and call-shaped
+`rawget`/`rawset` (statement-tolerant c∈{0,1}); `alen` (IrOp 57) for `#t` +
+observed-table `rawlen` — fast-case border max(asize−1,0) under
+`Lane.scalarPresenceLane()` (grid EXCLUDED: its bitmap is per-cell, `#t` is row
+count — a comptime assert in the native lowering pins the lane range), guarded
+producer, `.aload` alias discipline, aborts on pending sunk stores;
+`fsin`/`fcos` (IrOp 58/59) through ONE `noinline` `fmath.sinRuntime`/
+`cosRuntime` kernel every tier calls — cross-tier bit-identity by construction,
+never constant-folded, no side-exit.
+
+**The two blockers the design missed (both general, both landed):**
+1. **Int args.** D4 scoped sin/cos/sqrt float-only ("tier-0 owns promotion") —
+   but partialsums' `k` is an INTEGER (Lua 5.4 for-loop), so `sin(k)` aborted
+   and the headline loop never recorded. Fix: pin the observed type
+   (`guard_int`/`guard_float`) and promote int operands the way float binops
+   already do (`@floatFromInt` ≡ `cvtsi2sd` in `floatOperandToXmm`). No new IR
+   op; lifts `fsqrt` too.
+2. **`pow`.** With recording fixed the trace still ran 0% — nativegen deferred
+   `.pow`, the whole trace declined to tier-1a, and the gate correctly retired
+   it (tier-1a ≈ tier-0 here; `--jit-debug` receipt: "native unsupported in
+   proveKinds"). `pow` became the second user of the generalized body-callout:
+   `arith.pow` → shared `noinline` `fmath.powRuntime` (software `std.math.pow`,
+   strict FP), native calls the same kernel (xmm0/xmm1 → xmm0, mayGc=false).
+   The callout save-area predicate is now `bodyCalloutOf(...) != null` — the
+   SAME mapping the lowering and heap-φ GC audit dispatch on, so a new callout
+   can never silently miss its save area. Save/restore extracted into shared
+   `emitCalloutSave`/`emitCalloutRestore` (rax/rcx/xmm0/xmm1 deliberately
+   untouched — results ride through the restore).
+
+**Measured.** partialsums: 100% native iterations, 278 c/it vs 5340 tier-0,
+wall 245→63.5 ms, instructions 4.469B→0.926B (**−79.3%**), board 6.9× → 2.0×
+LuaJIT. rawget/rawset hot loop ~50 c/it native vs 6672 t0; `#t`/rawlen loop
+14.1 c/it vs 10697. Instruction A/B vs HEAD shadow (`just shadow`, baseline
+verified by nm): lua54 +0.0002%, nsieve +0.003%, str_find_match +0.2% — the
+board's lua54 +7%/nsieve −19% wall deltas were noise, not code. Gates: full
+suite + `-Djit-debug` leg green; hashgate 84/84 on BOTH legs (Debug jit-debug +
+ReleaseFast); `just bench` 28/28 cross=ok, luajit ok; partialsums byte-identical
+across t0/tier-1a/native AND vs LuaJIT.
+
+**Post-arc abort inventory (`--dump-aborts` sweep — what's left, per row):**
+scalar `bad_type` pc 67 (`tostring(i)` — arc B, stated up front, did not move:
+28.5 ms t0-bound); lua54 `host_barrier` (`math.type` — TODO.md fold-arm note);
+str_* `host_barrier` (string library — arc B); str_gmatch also `nyi_opcode len`
+(non-konst string `#s` = cp_len needs a string guard — deliberately excluded,
+codex #7: `#s` is code points, `rawlen` is bytes, never share an emission);
+tbl_ops `new_table` nyi; binary-trees `cross_frame` (campaign item 3);
+array3d/euler14 `get_index`/`for_prep` nyi (campaign item 4).
+
+**Next:** arc B (deterministic on-trace allocation: `tostring(i)`, string
+library — own design doc + codex review) or campaign item 2 (nbody heap-φ
+writeback). Both need Bart's pick of worst general gap after this board.
 
 ## Status 2026-08-27 (LATEST-84) — **scalar's 41× and str_format's 20.5× were ONE bug: the string interner. Replaced the std hash map with an lj_str.c-shape chained stringtable. scalar 4.0×, str_format 3.2×, board median 5.6× → 5.3×.**
 

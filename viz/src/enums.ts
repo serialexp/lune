@@ -56,7 +56,7 @@ export const IR_OP_NAMES = [
   "hload", // 42
   "hstore", // 43
   "guard_hash", // 44
-  "guard_pure", // 45
+  "guard_builtin", // 45
   "fsqrt", // 46
   "sar", // 47  (~>> arithmetic right shift; appended at the enum end)
   // Flattened-grid cell access (doc 14, Phase 8); appended at the enum end so
@@ -72,6 +72,11 @@ export const IR_OP_NAMES = [
   // Nested-loop trace linking (doc 15, Phase 2); appended at the enum end so wire
   // ordinals 0..55 are undisturbed.
   "link", // 56  terminal hand-off to an inner root trace (aux = inner anchor pc)
+  // Builtin recording breadth (doc 23, arc A); appended at the enum end so wire
+  // ordinals 0..56 are undisturbed.
+  "alen", // 57  `#t` fast-case border: max(asize-1, 0), side-exits otherwise
+  "fsin", // 58  math.sin via the shared noinline fmath kernel (never folded)
+  "fcos", // 59  math.cos via the shared noinline fmath kernel (never folded)
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -128,8 +133,11 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "guard_append",
   "hload",
   "guard_hash",
-  "guard_pure",
+  "guard_builtin",
   "fsqrt",
+  "fsin",
+  "fcos",
+  "alen",
   // Single-operand grid ops (doc 14): the cell load + three structural guards
   // render `%a`. garow/gcell/gstore/guard_gcol are two-operand (guard_gcol carries
   // the column ref in `%b`) and use the default `%a, %b`.

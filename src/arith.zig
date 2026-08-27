@@ -29,6 +29,7 @@
 //! state — which is why their shape is pinned with tests now.
 
 const std = @import("std");
+const fmath = @import("fmath.zig");
 const value = @import("value.zig");
 const string = @import("string.zig");
 const Value = value.Value;
@@ -135,10 +136,13 @@ pub fn mod(a: Value, b: Value) Error!Value {
 }
 
 /// `a ^ b` — exponentiation, **always float** (Lua-shaped). `2 ^ 2` is `4.0`.
+/// Evaluates through the ONE noinline `fmath.powRuntime` body so tier-0, the
+/// tier-1a evaluator/const-folder, and the native JIT's `.pow` callout are
+/// bit-identical by construction (doc 23 D4).
 pub fn pow(a: Value, b: Value) Error!Value {
     @setFloatMode(.strict);
     try requireNumbers(a, b);
-    return Value.float(std.math.pow(f64, a.toFloat(), b.toFloat()));
+    return Value.float(fmath.powRuntime(a.toFloat(), b.toFloat()));
 }
 
 // ---- bitwise ----
@@ -258,6 +262,43 @@ pub fn le(a: Value, b: Value) Error!bool {
 /// across the int/float boundary by exact value.
 pub fn eq(a: Value, b: Value) bool {
     return a.eql(b);
+}
+
+/// The `tonumber(v[, base])` conversion core — the ONE implementation shared by
+/// the stdlib native (`stdlib/basic.zig` `bToNumber`) and the trace recorder's
+/// konst fold (doc 23 D2), so the two can never disagree. Pure and total: any
+/// unconvertible input yields `nil`, never an error, and nothing is allocated
+/// (results are ints/floats/nil; a string input is only *read*). `base_arg`
+/// mirrors the native's argument handling exactly: `null` means the 1-arg form;
+/// a non-number base falls through to the 1-arg auto path (matching the
+/// native's `args[1].isNumber()` gate); a numeric base outside 2..36 → nil.
+pub fn toNumber(v: Value, base_arg: ?Value) Value {
+    // Explicit base form: string interpreted as an integer in that base.
+    if (base_arg) |bv| if (bv.isNumber()) {
+        const base_i = bv.toFloat();
+        if (base_i < 2 or base_i > 36) return Value.nil();
+        const base: u8 = @intFromFloat(base_i);
+        const s = strBytes(v) orelse return Value.nil();
+        const t = std.mem.trim(u8, s, " \t\n\r");
+        if (t.len == 0) return Value.nil();
+        const parsed = std.fmt.parseInt(i64, t, base) catch return Value.nil();
+        return Value.int(parsed);
+    };
+
+    switch (v.tag) {
+        .int, .float => return v,
+        else => {},
+    }
+    const s = strBytes(v) orelse return Value.nil();
+    const t = std.mem.trim(u8, s, " \t\n\r");
+    if (t.len == 0) return Value.nil();
+    if (std.fmt.parseInt(i64, t, 0)) |iv| {
+        return Value.int(iv);
+    } else |_| {}
+    if (std.fmt.parseFloat(f64, t)) |fv| {
+        return Value.float(fv);
+    } else |_| {}
+    return Value.nil();
 }
 
 // ---------------------------------------------------------------------------

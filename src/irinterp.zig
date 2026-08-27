@@ -52,6 +52,7 @@ const execlog = @import("execlog.zig");
 const table = @import("table.zig");
 const function = @import("function.zig");
 const arr = @import("array.zig");
+const fmath = @import("fmath.zig");
 const Value = value.Value;
 const Trace = trace.Trace;
 
@@ -503,6 +504,27 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
 
+                // ---- `#t` fast-case border (doc 23 D3) ----
+                // Produce `max(asize−1, 0)` when the exact fast case holds (hash
+                // empty ∧ presence-bitmap lane ∧ (asize ≤ 1 ∨ present(asize−1))) —
+                // the premises under which `Table.length()` returns exactly this
+                // value with no trim loop or hash search — else side-exit to
+                // tier-0, which owns the general border search (holes, hash
+                // borders, grids, in-band lanes).
+                .alen => {
+                    const tbl = table.Table.fromHeader(values[ins.a].asHeap());
+                    const ap = &tbl.array;
+                    const fast = tbl.hash.count() == 0 and ap.lane.scalarPresenceLane() and
+                        (ap.asize <= 1 or ap.isPresent(ap.asize - 1));
+                    if (fast) {
+                        values[i] = Value.int(if (ap.asize == 0) 0 else @intCast(ap.asize - 1));
+                        if (record) rec.value(i, values[i]);
+                    } else {
+                        if (record) rec.exit(i, .guard, values[ins.a]);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
+
                 // ---- lane-aware packed-array read path (Phase B) ----
                 //
                 // `aref` carries no usable Value — it only pairs (table, index)
@@ -704,12 +726,12 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 // The seeded callee is still exactly this pure builtin. A reassigned
                 // `sqrt` upvalue (now a non-native, or a native with a different/no
                 // `pure` tag) side-exits to tier-0 on the SAME iteration as native —
-                // `aux` is the `PureBuiltin` ordinal, the value must be a `.native`
+                // `aux` is the `RecordedBuiltin` ordinal, the value must be a `.native`
                 // carrying that tag. Identity is the enum, never a pointer (doc 02).
-                .guard_pure => {
+                .guard_builtin => {
                     const v = values[ins.a];
                     const ok = v.isHeap() and v.heapType() == .native and
-                        function.Native.fromHeader(v.asHeap()).pure == @as(function.PureBuiltin, @enumFromInt(ins.aux));
+                        function.Native.fromHeader(v.asHeap()).recorded == @as(function.RecordedBuiltin, @enumFromInt(ins.aux));
                     if (ok) {
                         if (record) rec.guardPass(i, v);
                     } else {
@@ -724,8 +746,27 @@ fn executeImpl(comptime record: bool, rec: anytype, t: *const Trace, regs: RegWi
                 // side-exited otherwise). `sqrt(-0.0)=-0.0`, `sqrt(<0)=qNaN`.
                 .fsqrt => {
                     const v = values[ins.a];
-                    if (v.isFloat()) {
-                        values[i] = Value.float(@sqrt(v.asFloat()));
+                    if (v.isFloat() or v.isInt()) {
+                        // Int operand: the same round-to-nearest promotion the
+                        // float binops use (`@floatFromInt` ≡ native `cvtsi2sd`).
+                        const x = if (v.isFloat()) v.asFloat() else @as(f64, @floatFromInt(v.asInt()));
+                        values[i] = Value.float(@sqrt(x));
+                        if (record) rec.value(i, values[i]);
+                        continue;
+                    }
+                    if (record) rec.exit(i, .guard, v);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                // Leaf pure producers: `math.sin`/`math.cos` of the
+                // `guard_float`-pinned operand. Every tier evaluates through the
+                // ONE noinline `fmath` kernel, so cross-tier bit-identity holds
+                // by construction (doc 23 D4). Same defensive non-float
+                // side-exit shape as `.fsqrt`.
+                .fsin, .fcos => {
+                    const v = values[ins.a];
+                    if (v.isFloat() or v.isInt()) {
+                        const x = if (v.isFloat()) v.asFloat() else @as(f64, @floatFromInt(v.asInt()));
+                        values[i] = Value.float(if (ins.op == .fsin) fmath.sinRuntime(x) else fmath.cosRuntime(x));
                         if (record) rec.value(i, values[i]);
                         continue;
                     }

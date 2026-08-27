@@ -154,24 +154,54 @@ pub const NativeFn = *const fn (ctx: *anyopaque, args: []const Value) anyerror!V
 /// mirroring Lua's stack), so it must not be made to copy.
 pub const NativeMultiFn = *const fn (ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize;
 
-/// Which **pure deterministic builtin** a native is, if any — the JIT's stable,
-/// replay-safe identity for a native it is allowed to inline into a trace as a
-/// dedicated leaf IR op (e.g. `math.sqrt` → `fsqrt` → one `sqrtsd`). Null ⇒ the
-/// native is opaque to the recorder (a `recCall` to it aborts with `.host_barrier`).
+/// Which **recordable builtin** a native is, if any — the JIT's stable,
+/// replay-safe identity for a native whose calls the trace recorder knows how
+/// to record (doc 23): as a fold-to-constant, a reuse of existing IR shapes,
+/// or a dedicated leaf op / runtime callout (e.g. `math.sqrt` → `fsqrt` → one
+/// `sqrtsd`). Null ⇒ the native is opaque to the recorder (a `recCall` to it
+/// aborts with `.host_barrier`). NOTE: "recordable" is *not* "pure" — `rawset`
+/// mutates its table; what every member shares is being **deterministic core**
+/// (no host effects, no nondeterministic inputs) so a trace may model it.
 ///
 /// It is an **enum, never a pointer**: the trace bakes in "callee is this builtin"
-/// and a `guard_pure` op (present in both the tier-1a oracle and native code)
+/// and a `guard_builtin` op (present in both the tier-1a oracle and native code)
 /// side-exits to tier-0 when the seeded callee no longer carries this tag. Because
-/// the keyframe restorer rebinds natives by registry name, `pure` rides the
+/// the keyframe restorer rebinds natives by registry name, `recorded` rides the
 /// registry (set from `interp.base_natives` at install and restore, like `effect`/
 /// `multi`) and is replay-stable by construction — no pointer is ever serialized.
-/// The ordinals are a stable wire enum (carried in `fsqrt`/`guard_pure` IR `aux`),
+/// The ordinals are a stable wire enum (carried in `fsqrt`/`guard_builtin` IR `aux`),
 /// so existing values must never be renumbered; append new builtins at the end.
-pub const PureBuiltin = enum(u8) {
+pub const RecordedBuiltin = enum(u8) {
     /// `math.sqrt(x)` — IEEE correctly-rounded square root. `@sqrt(f64)` (tier-0 /
     /// oracle) and native `sqrtsd` agree bit-for-bit under the default MXCSR
     /// (round-to-nearest-even; lune never calls `fesetround`).
     sqrt = 0,
+    // -- arc A of doc 23 (builtin recording breadth). Ordinals appended, never
+    // renumbered. A member existing here does NOT mean every call shape records:
+    // each recorder arm (trace.zig `recBuiltin`) owns its observed-shape abort
+    // matrix, and a registry row only gets its `.recorded` tag once its arm is
+    // implemented.
+    /// `type(v)` — folds to a konst type-name string under a type guard.
+    type = 1,
+    /// `tostring(v)` — arc A records the konst-argument fold only (the
+    /// allocating `tostr_int` path is arc B).
+    tostring = 2,
+    /// `tonumber(v[, base])` — konst fold / observed-number pass-through.
+    tonumber = 3,
+    /// `select('#', …)` — konst `'#'` selector folds to the fixed arg count.
+    select = 4,
+    /// `rawequal(a, b)` — NaN-safe fold subset (konst×konst, non-float same-ref).
+    rawequal = 5,
+    /// `rawget(t, k)` — reuses the array/hash get shapes (metatable-free tables).
+    rawget = 6,
+    /// `rawset(t, k, v)` — reuses the array/hash set shapes.
+    rawset = 7,
+    /// `rawlen(v)` — table → `alen`; konst string → byte-length fold.
+    rawlen = 8,
+    /// `math.sin(x)` — `fsin`, a body callout to the one shared `sinRuntime`.
+    sin = 9,
+    /// `math.cos(x)` — `fcos`, ditto `cosRuntime`.
+    cos = 10,
 };
 
 /// Which **nondeterministic input** a native represents, if any. A native with a
@@ -232,10 +262,10 @@ pub const Native = struct {
     /// primary-value projection). Set from the registry like `effect`. A native is
     /// never both an effect and multi-result (effects log a single value).
     multi: ?NativeMultiFn = null,
-    /// Non-null ⇒ this native is a pure deterministic builtin the JIT may inline
-    /// into a trace as a dedicated leaf op (see `PureBuiltin`). Set from the
-    /// registry like `effect`/`multi`, so install and replay can never disagree.
-    pure: ?PureBuiltin = null,
+    /// Non-null ⇒ this native is a deterministic builtin the trace recorder
+    /// knows how to record (see `RecordedBuiltin`). Set from the registry like
+    /// `effect`/`multi`, so install and replay can never disagree.
+    recorded: ?RecordedBuiltin = null,
 
     pub fn create(
         gpa: std.mem.Allocator,
@@ -280,8 +310,8 @@ pub const BaseNative = struct {
     /// is the single-result *primary projection* the VM uses for 0/1 wanted
     /// results, and this is used when ≥2 are wanted.
     multi: ?NativeMultiFn = null,
-    /// Non-null ⇒ a pure deterministic builtin the JIT may inline (see `PureBuiltin`).
-    pure: ?PureBuiltin = null,
+    /// Non-null ⇒ a deterministic builtin the recorder can record (see `RecordedBuiltin`).
+    recorded: ?RecordedBuiltin = null,
     /// If set, install into this module table (a global table) rather than as a
     /// top-level global. The unknown-global lint then knows `module` (not `name`).
     module: ?[]const u8 = null,

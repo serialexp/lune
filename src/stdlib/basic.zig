@@ -27,6 +27,7 @@
 //! Lua "shift down" that never clobbers an unread source.
 
 const std = @import("std");
+const arith = @import("../arith.zig");
 const value = @import("../value.zig");
 const function = @import("../function.zig");
 const interp = @import("../interp.zig");
@@ -79,36 +80,11 @@ fn bToString(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// `tonumber(v [, base])`. Numbers pass through. A string is trimmed and parsed:
 /// with an explicit `base` as an integer in that base; otherwise auto (int first —
 /// honoring a `0x` prefix — then float). Anything unparseable / non-numeric → nil.
+/// The conversion itself lives in `arith.toNumber` — the ONE core shared with the
+/// trace recorder's konst fold (doc 23 D2), so the two can never disagree.
 fn bToNumber(_: *anyopaque, args: []const Value) anyerror!Value {
     if (args.len == 0) return Value.nil();
-    const v = args[0];
-
-    // Explicit base form: `tonumber(s, base)` — string interpreted as an integer.
-    if (args.len >= 2 and args[1].isNumber()) {
-        const base_i = args[1].toFloat();
-        if (base_i < 2 or base_i > 36) return Value.nil();
-        const base: u8 = @intFromFloat(base_i);
-        const s = interp.strBytes(v) orelse return Value.nil();
-        const t = std.mem.trim(u8, s, " \t\n\r");
-        if (t.len == 0) return Value.nil();
-        const parsed = std.fmt.parseInt(i64, t, base) catch return Value.nil();
-        return Value.int(parsed);
-    }
-
-    switch (v.tag) {
-        .int, .float => return v,
-        else => {},
-    }
-    const s = interp.strBytes(v) orelse return Value.nil();
-    const t = std.mem.trim(u8, s, " \t\n\r");
-    if (t.len == 0) return Value.nil();
-    if (std.fmt.parseInt(i64, t, 0)) |iv| {
-        return Value.int(iv);
-    } else |_| {}
-    if (std.fmt.parseFloat(f64, t)) |fv| {
-        return Value.float(fv);
-    } else |_| {}
-    return Value.nil();
+    return arith.toNumber(args[0], if (args.len >= 2) args[1] else null);
 }
 
 // ---------------------------------------------------------------------------
@@ -306,14 +282,17 @@ fn osDiffTime(_: *anyopaque, args: []const Value) anyerror!Value {
 // ---------------------------------------------------------------------------
 
 pub const natives = [_]function.BaseNative{
-    .{ .name = "type", .func = &bType },
-    .{ .name = "tostring", .func = &bToString },
-    .{ .name = "tonumber", .func = &bToNumber },
-    .{ .name = "select", .func = &bSelect1, .multi = &bSelectN },
-    .{ .name = "rawequal", .func = &bRawEqual },
-    .{ .name = "rawget", .func = &bRawGet },
-    .{ .name = "rawset", .func = &bRawSet },
-    .{ .name = "rawlen", .func = &bRawLen },
+    // `.recorded` tags land together with their recorder arms (doc 23 D1):
+    // a tag makes `recCall` dispatch to `trace.recBuiltin`, whose arm owns the
+    // observed-shape abort matrix for that builtin.
+    .{ .name = "type", .func = &bType, .recorded = .type },
+    .{ .name = "tostring", .func = &bToString, .recorded = .tostring },
+    .{ .name = "tonumber", .func = &bToNumber, .recorded = .tonumber },
+    .{ .name = "select", .func = &bSelect1, .multi = &bSelectN, .recorded = .select },
+    .{ .name = "rawequal", .func = &bRawEqual, .recorded = .rawequal },
+    .{ .name = "rawget", .func = &bRawGet, .recorded = .rawget },
+    .{ .name = "rawset", .func = &bRawSet, .recorded = .rawset },
+    .{ .name = "rawlen", .func = &bRawLen, .recorded = .rawlen },
     .{ .name = "setmetatable", .func = &bSetMetatable },
     .{ .name = "getmetatable", .func = &bGetMetatable },
     .{ .name = "math.type", .func = &mType, .module = "math", .field = "type" },

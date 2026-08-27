@@ -667,11 +667,11 @@ pub fn restoreSnapshot(
                 const n = try function.Native.create(gpa, entry.func, entry.name);
                 n.effect = entry.effect; // an effect native stays an effect on replay
                 n.multi = entry.multi; // …and keeps its multi-result projection
-                n.pure = entry.pure; // …and its JIT-inlinable pure-builtin tag
+                n.recorded = entry.recorded; // …and its JIT-inlinable pure-builtin tag
                 // `pure ⇒ !effect` (doc 17, H-4 / 9-A(i)). The static `base_natives`
                 // registry is comptime-proven in `interp.zig`; this guards a
                 // caller-supplied `NativeRegistry` on the restore path.
-                std.debug.assert(!(n.pure != null and n.effect != null));
+                std.debug.assert(!(n.recorded != null and n.effect != null));
                 vm.heap.linkRestored(&n.header, o.id);
                 break :blk &n.header;
             },

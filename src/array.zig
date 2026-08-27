@@ -114,6 +114,20 @@ pub const Lane = enum(u8) {
         };
     }
 
+    /// The `alen` fast-case lanes (doc 23 D3): fixed-width scalar lanes whose
+    /// per-*slot* presence bitmap makes `present(asize−1)` a direct bit probe.
+    /// Deliberately NOT `usesPresenceBitmap`: `.grid` also keeps a bitmap, but
+    /// per-*cell* — and a grid's `#t` is its row count, a different formula —
+    /// so it must side-exit, not fast-path. Exactly the contiguous ordinals
+    /// `i8..u8`; nativegen's `alen` lowering pins that shape with a comptime
+    /// assert so an enum reorder is a compile error, never a miscompile.
+    pub fn scalarPresenceLane(self: Lane) bool {
+        return switch (self) {
+            .i8, .i16, .i32, .i64, .f64, .u8 => true,
+            .value, .boolean, .grid => false,
+        };
+    }
+
     /// True for the fixed-width integer **store-shape** lanes (`i8…i64`, plus the
     /// unsigned-byte `u8`). These share a single native store shape — a
     /// width-truncating data write plus a presence-bit set (`encode`) — so the JIT
@@ -633,7 +647,9 @@ pub const ArrayPart = extern struct {
         if (on) map[i >> 3] |= mask else map[i >> 3] &= ~mask;
     }
 
-    fn isPresent(self: *const ArrayPart, idx: usize) bool {
+    /// Public read-only: the `alen` fast case (trace recorder, tier-1a) probes
+    /// `present(asize−1)` through this; the write side stays file-private.
+    pub fn isPresent(self: *const ArrayPart, idx: usize) bool {
         if (self.present) |p| return getBit(p, idx);
         return false; // narrow lane with no allocation ⇒ no live slots
     }

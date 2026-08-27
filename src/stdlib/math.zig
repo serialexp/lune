@@ -34,6 +34,7 @@
 const std = @import("std");
 const value = @import("../value.zig");
 const function = @import("../function.zig");
+const fmath = @import("../fmath.zig");
 
 const Value = value.Value;
 
@@ -110,14 +111,18 @@ fn mLog(_: *anyopaque, args: []const Value) anyerror!Value {
     return Value.float(@log(x));
 }
 
-/// `math.sin(x)` — sine of x in radians (always float).
+/// `math.sin(x)` — sine of x in radians (always float). Routes through the
+/// shared `fmath.sinRuntime` kernel (doc 23 D4) so tier-0, tier-1a, and the
+/// native callout all execute the SAME compiled body — bit-identity across
+/// tiers by construction.
 fn mSin(_: *anyopaque, args: []const Value) anyerror!Value {
-    return Value.float(@sin((try numArg(args, 0)).toFloat()));
+    return Value.float(fmath.sinRuntime((try numArg(args, 0)).toFloat()));
 }
 
-/// `math.cos(x)` — cosine of x in radians (always float).
+/// `math.cos(x)` — cosine of x in radians (always float). Shared-kernel
+/// routing, exactly as `mSin`.
 fn mCos(_: *anyopaque, args: []const Value) anyerror!Value {
-    return Value.float(@cos((try numArg(args, 0)).toFloat()));
+    return Value.float(fmath.cosRuntime((try numArg(args, 0)).toFloat()));
 }
 
 /// `math.tan(x)` — tangent of x in radians (always float).
@@ -257,11 +262,11 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "math.abs", .func = &mAbs, .module = "math", .field = "abs" },
     .{ .name = "math.ceil", .func = &mCeil, .module = "math", .field = "ceil" },
     .{ .name = "math.floor", .func = &mFloor, .module = "math", .field = "floor" },
-    .{ .name = "math.sqrt", .func = &mSqrt, .module = "math", .field = "sqrt", .pure = .sqrt },
+    .{ .name = "math.sqrt", .func = &mSqrt, .module = "math", .field = "sqrt", .recorded = .sqrt },
     .{ .name = "math.exp", .func = &mExp, .module = "math", .field = "exp" },
     .{ .name = "math.log", .func = &mLog, .module = "math", .field = "log" },
-    .{ .name = "math.sin", .func = &mSin, .module = "math", .field = "sin" },
-    .{ .name = "math.cos", .func = &mCos, .module = "math", .field = "cos" },
+    .{ .name = "math.sin", .func = &mSin, .module = "math", .field = "sin", .recorded = .sin },
+    .{ .name = "math.cos", .func = &mCos, .module = "math", .field = "cos", .recorded = .cos },
     .{ .name = "math.tan", .func = &mTan, .module = "math", .field = "tan" },
     .{ .name = "math.asin", .func = &mAsin, .module = "math", .field = "asin" },
     .{ .name = "math.acos", .func = &mAcos, .module = "math", .field = "acos" },

@@ -323,8 +323,8 @@ test "hash field: a table that grows between trace entries re-resolves the cell 
     );
 }
 
-// --- pure-builtin tracing (math.sqrt → guard_pure/fsqrt, 8-mode parity) -------
-// `sqrt(x)` on a float in a hot loop records a trace (guard_pure pins the callee
+// --- pure-builtin tracing (math.sqrt → guard_builtin/fsqrt, 8-mode parity) -------
+// `sqrt(x)` on a float in a hot loop records a trace (guard_builtin pins the callee
 // identity, fsqrt computes @sqrt) instead of aborting `.host_barrier` (doc 12).
 // In F0 native declines any trace carrying the two new ops: the tier-1a oracle
 // runs them under the record-execute / record-execute-noopt modes, while the
@@ -335,7 +335,7 @@ test "hash field: a table that grows between trace entries re-resolves the cell 
 
 test "pure-builtin: a sqrt float-reduction loop is byte-identical across all 8 modes" {
     // The nbody-shaped inner-loop call: `sqrt` reaches the loop as a loop-invariant
-    // upvalue (`local sqrt = math.sqrt`), guard_pure re-proves its identity, and
+    // upvalue (`local sqrt = math.sqrt`), guard_builtin re-proves its identity, and
     // fsqrt computes the result from the guarded-float argument every iteration.
     try expectProgram(
         \\local sqrt = math.sqrt
@@ -348,11 +348,11 @@ test "pure-builtin: a sqrt float-reduction loop is byte-identical across all 8 m
     );
 }
 
-test "pure-builtin: a rebound sqrt upvalue deopts via guard_pure and replays byte-identically" {
-    // guard_pure's load-bearing proof. The first `run()` records a trace pinning the
+test "pure-builtin: a rebound sqrt upvalue deopts via guard_builtin and replays byte-identically" {
+    // guard_builtin's load-bearing proof. The first `run()` records a trace pinning the
     // `sqrt` builtin. Reassigning the captured upvalue to an ordinary Lua function
     // means the second `run()` re-resolves the seeded callee to a non-pure value on
-    // entry; guard_pure must fail closed and side-exit to tier-0, which really calls
+    // entry; guard_builtin must fail closed and side-exit to tier-0, which really calls
     // the new `sqrt`. Byte-identical across all 8 modes + keyframe restore proves the
     // per-entry callee re-resolve + identity guard keeps the inlined builtin sound
     // when the loop-invariant cell changes between entries.

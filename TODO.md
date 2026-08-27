@@ -2,6 +2,19 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## `math.type` fold arm (noted 2026-08-27, doc 23 follow-up)
+
+`bench/stdlib/lua54.lua`'s loop aborts `host_barrier` at its FIRST call —
+`mtype(i)` (`math.type`) — before ever reaching the now-recordable `rawlen(t)`,
+so the whole loop stays tier-0. `math.type` folds exactly like `type()` (konst
+`"integer"`/`"float"`/nil under the existing `guardNum` pins; same
+`internedLookup`-only discipline), so it's a small arc-A-shaped arm: append a
+`RecordedBuiltin.math_type` ordinal (11), tag the registry row, clone
+`recBType`'s structure with the int/float split. Not landed now because the
+reviewed doc 23 arm list is fixed and the same loop also needs `pack`/`unpack`
+(allocating — arc B) before it traces end-to-end; do it together with the next
+breadth batch.
+
 ## FIXED 2026-08-26 — the two `driveChain` panics were ONE bug: a use-after-free of the tier-1a executor scratch
 
 Kept on file because the diagnosis corrected two things the original report got

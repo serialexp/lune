@@ -108,13 +108,16 @@ fn kindOf(op: IrOp) OpKind {
         // guards. A side-effecting root, deduped by (op, href ref, count-aux); reads
         // the `href` (`a`). Never hoisted above the `hstore` it protects.
         .guard_hash => .guard,
-        // Pure-builtin inlining (doc 12). `guard_pure` is the callee-identity guard
+        // Pure-builtin inlining (doc 12). `guard_builtin` is the callee-identity guard
         // (side-effecting root, deduped by (op, callee ref); the `aux` is the
-        // `PureBuiltin` ordinal, folded into the GuardKey via `guardKeyAux`). `fsqrt`
+        // `RecordedBuiltin` ordinal, folded into the GuardKey via `guardKeyAux`). `fsqrt`
         // is a pure unary producer — hoistable iff its operand is invariant, DCE'd
         // if dead — but deliberately NEVER constant-folded (the fold arm skips it).
-        .guard_pure => .guard,
-        .fsqrt => .unary,
+        .guard_builtin => .guard,
+        // `fsin`/`fcos` share `fsqrt`'s contract exactly (leaf pure float
+        // producers, never constant-folded — the `.unary` fold arm skips all
+        // three).
+        .fsqrt, .fsin, .fcos => .unary,
         // Packed-array address + load: memory ops, conservatively canonical to
         // themselves (never folded, never CSE'd) so a later store can't be
         // reordered past them. DCE'd if not reachable from a live root.
@@ -129,6 +132,13 @@ fn kindOf(op: IrOp) OpKind {
         // Grid-cell load (doc 14, Phase 8): the hash/array-load analogue. Reads the
         // `gcell` address (`a`).
         .gload => .aload,
+        // `alen` (doc 23 D3): a guarded producer reading the table's border state.
+        // Classified `.aload` — the conservative "load with table-alias effects":
+        // never folded/CSE'd/hoisted across the store class (`astore`/
+        // `astore_append`/`hstore`/`gstore` all mutate what it reads), DCE'd only
+        // when dead (a dead border read's side-exit protects nothing — deopt
+        // replay recomputes `#t` in tier-0). Reads the table value (`a`).
+        .alen => .aload,
         // `astore_append` is the grow analogue of `astore`: an effectful, never-DCE'd
         // alias/CSE barrier. Same `.astore` kind (reads `a`=aref + `b`=value).
         // `hstore` is the hash-field store — same effectful never-DCE'd treatment.
@@ -200,7 +210,7 @@ fn guardKeyAux(op: IrOp, aux: i32) i32 {
         // `guard_hash` stashes the recorded hash population in `aux` — genuine
         // semantic identity (two guards expecting different counts differ), so it
         // joins the lane/proto auxes in the dedup key rather than the PC-bearing ones.
-        // `guard_pure` stashes the `PureBuiltin` ordinal in `aux` — semantic identity
+        // `guard_builtin` stashes the `RecordedBuiltin` ordinal in `aux` — semantic identity
         // (a guard for `sqrt` differs from one for a future `floor`), so it joins the
         // dedup-key auxes rather than the PC-bearing ones.
         // `guard_grid` stashes the grid element-lane ordinal and `guard_stride` the
@@ -208,7 +218,7 @@ fn guardKeyAux(op: IrOp, aux: i32) i32 {
         // lane differs from one expecting i8; a stride-200 guard differs from
         // stride-100), so they join the lane/proto auxes in the dedup key.
         // `guard_gcol`/`guard_gpresent` carry no aux (fall through to 0).
-        .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_pure, .guard_grid, .guard_stride => aux,
+        .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride => aux,
         else => 0,
     };
 }
@@ -294,7 +304,7 @@ pub fn optimize(
                 // `@sqrt` at compile time — that avoids any fold-vs-runtime sign/NaN
                 // divergence, exactly like `int_of_float`. It still CSEs below. (And
                 // `evalUnary` is `unreachable` for it — it never folds a constant.)
-                if (ins.op != .fsqrt) {
+                if (ins.op != .fsqrt and ins.op != .fsin and ins.op != .fcos) {
                     if (const_val[a2]) |va| {
                         if (irinterp.evalUnary(ins.op, va)) |res| {
                             const aux: i32 = @intCast(out_consts.items.len);

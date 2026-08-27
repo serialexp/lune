@@ -23,6 +23,7 @@ const irinterp = @import("irinterp.zig");
 const value = @import("value.zig");
 const table = @import("table.zig");
 const arr = @import("array.zig");
+const fmath = @import("fmath.zig");
 const Value = value.Value;
 const RegWindow = @import("regwindow.zig").RegWindow;
 const Trace = trace.Trace;
@@ -510,24 +511,24 @@ const CLOSURE_PROTO_OFF: i32 = @offsetOf(function.Closure, "proto");
 /// the recorded id against `[closure.proto + PROTO_ID_OFF]`.
 const PROTO_ID_OFF: i32 = @offsetOf(bytecode.Proto, "id");
 /// `ObjectType.native` ordinal — the byte at `GcHeader.type` for a host native.
-/// The pure-builtin `guard_pure` checks a snapshot callee value is a native of this
+/// The pure-builtin `guard_builtin` checks a snapshot callee value is a native of this
 /// type before reading its `pure` tag.
 const NATIVE_TYPE: u8 = @intFromEnum(object.ObjectType.native);
-/// Offset of `Native.pure` (a `?PureBuiltin` — an `enum(u8)` optional, 2 bytes laid
-/// out `[payload, has_value]`) from a `*GcHeader`. `guard_pure` proves the callee is
-/// the recorded pure builtin with two byte compares: `[native + pure]` (the payload
-/// ordinal) == the recorded `PureBuiltin` tag, AND `[native + pure + 1]` (the
+/// Offset of `Native.recorded` (a `?RecordedBuiltin` — an `enum(u8)` optional, 2 bytes laid
+/// out `[payload, has_value]`) from a `*GcHeader`. `guard_builtin` proves the callee is
+/// the recorded builtin with two byte compares: `[native + recorded]` (the payload
+/// ordinal) == the recorded `RecordedBuiltin` tag, AND `[native + recorded + 1]` (the
 /// non-null flag) == 1. Two byte compares sidestep needing a 16-bit-immediate
 /// compare encoder and don't depend on the optional's internal byte order beyond the
 /// verified `[payload, flag]` layout.
-const NATIVE_PURE_OFF: i32 = @offsetOf(function.Native, "pure");
+const NATIVE_RECORDED_OFF: i32 = @offsetOf(function.Native, "recorded");
 comptime {
-    // Pin the `?PureBuiltin` size the `guard_pure` prologue depends on (Z-1: a
+    // Pin the `?RecordedBuiltin` size the `guard_builtin` prologue depends on (Z-1: a
     // toolchain bump that changes optional layout must fail the build loudly, not
     // silently miscompile the two-byte identity check). The `[payload, has_value]`
     // byte *order* can't be asserted at comptime (an optional has no well-defined
     // comptime layout to deref) — it's pinned by the runtime test below instead.
-    std.debug.assert(@sizeOf(?function.PureBuiltin) == 2);
+    std.debug.assert(@sizeOf(?function.RecordedBuiltin) == 2);
 }
 /// Packed-lane ordinals the native array path can lower. The bool lane (B2/B3,
 /// the nsieve sieve) is bit-packed; the int lanes (B4) are byte-packed and
@@ -1426,10 +1427,10 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
     const func_guarded = gpa.alloc(bool, n) catch return false;
     defer gpa.free(func_guarded);
     @memset(func_guarded, false);
-    // Parallel to `func_guarded`, but for `guard_pure` (the pure-builtin identity
+    // Parallel to `func_guarded`, but for `guard_builtin` (the pure-builtin identity
     // guard): a slot_load it covers is the callee-snapshot value → classified
     // `.native` (invariant native pointer, identity-checked once in the prologue
-    // against the recorded `PureBuiltin` tag).
+    // against the recorded `RecordedBuiltin` tag).
     const pure_guarded = gpa.alloc(bool, n) catch return false;
     defer gpa.free(pure_guarded);
     @memset(pure_guarded, false);
@@ -1528,12 +1529,12 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (t.instrs[r].op != .slot_load) return false;
                 func_guarded[r] = true;
             },
-            .guard_pure => {
+            .guard_builtin => {
                 const r = ins.a;
                 if (r >= i) return false; // not linear SSA → malformed
                 // A pure guard only ever covers the callee-snapshot slot_load (the
                 // recorder emits it on a fresh seeded upvalue/global input); the native
-                // path hoists it to a prologue native/`PureBuiltin`-tag check.
+                // path hoists it to a prologue native/`RecordedBuiltin`-tag check.
                 if (t.instrs[r].op != .slot_load) return false;
                 pure_guarded[r] = true;
             },
@@ -1558,7 +1559,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 } else if (func_guarded[i]) {
                     kinds[i] = .func; // guard_func-covered → invariant callee closure
                 } else if (pure_guarded[i]) {
-                    kinds[i] = .native; // guard_pure-covered → invariant callee native
+                    kinds[i] = .native; // guard_builtin-covered → invariant callee native
                 } else {
                     return false; // unguarded → cannot prove a kind
                 }
@@ -1633,6 +1634,18 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[ins.a] != .float) return false;
                 kinds[i] = .int;
             },
+            // alen (doc 23 D3): the `#t` fast-case border. The operand is a
+            // loop-invariant table home (`.ptr`, guard_table-covered slot_load) or
+            // a per-iteration element table (`.heap`, .value-lane aload). The
+            // lowered body re-verifies the whole fast case with memory-operand
+            // compares (mirroring guard_append) and side-exits on any miss, so no
+            // analysis-time table state is baked into the code. Result: the
+            // border, an int.
+            .alen => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .ptr and kinds[ins.a] != .heap) return false;
+                kinds[i] = .int;
+            },
             .eq, .ne, .lt, .le => {
                 // Two int operands → int compare (existing path). Two float operands →
                 // float compare (F2, ucomisd). A MIXED int/float compare bails: the
@@ -1686,23 +1699,26 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[ins.a] != .func) return false;
                 kinds[i] = .none;
             },
-            // guard_pure (the pure-builtin identity guard): covers the callee-snapshot
+            // guard_builtin (the pure-builtin identity guard): covers the callee-snapshot
             // slot_load (proven `.native`). Pinned to a prologue identity check (native
-            // type + recorded `PureBuiltin` tag); lowers to nothing in the body, like
+            // type + recorded `RecordedBuiltin` tag); lowers to nothing in the body, like
             // guard_func. The callee is a once-seeded loop-invariant upvalue/global, so
             // one prologue check covers the whole native run.
-            .guard_pure => {
+            .guard_builtin => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .native) return false;
                 kinds[i] = .none;
             },
             // fsqrt: a leaf float producer computing `@sqrt` of its operand (the same
             // IEEE correctly-rounded sqrt as native `sqrtsd` under the default MXCSR).
-            // The operand must be a proven float (its dominating `guard_float` pinned
-            // the kind); the result is a float. Lowers to a single `sqrtsd`.
-            .fsqrt => {
+            // The operand is a proven float, OR a proven int promoted by the same
+            // operand-level `cvtsi2sd` the float binops use (`floatOperandToXmm`);
+            // the result is a float. fsqrt lowers to a single `sqrtsd`; fsin/fcos
+            // lower to a mid-body callout into the shared noinline `fmath` kernel
+            // (doc 23 D4) — there is no bit-identical SSE instruction for them.
+            .fsqrt, .fsin, .fcos => {
                 if (ins.a >= i) return false;
-                if (kinds[ins.a] != .float) return false;
+                if (kinds[ins.a] != .float and kinds[ins.a] != .int) return false;
                 kinds[i] = .float;
             },
             // --- hash-part field path (H1) --------------------------------------
@@ -2096,8 +2112,19 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     kinds[i] = .none;
                 }
             },
-            // Everything else (idiv/mod/pow/guard_number/float-neg) is deferred —
-            // bail to tier-1a. (shl/shr, guard_float, guard_pure and fsqrt are handled
+            // pow: always a float producer (Lua `^`), evaluated by a two-arg
+            // body callout into the shared `fmath.powRuntime` kernel — the same
+            // body `arith.pow` runs in tier-0/tier-1a, so bit-identity holds by
+            // construction. Operands are any proven numeric (an int promotes
+            // via the shared `cvtsi2sd` discipline at the callout).
+            .pow => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (ins.ty != .float) return false; // the oracle always boxes float
+                if (!isNumKind(kinds[ins.a]) or !isNumKind(kinds[ins.b])) return false;
+                kinds[i] = .float;
+            },
+            // Everything else (idiv/mod/guard_number/float-neg) is deferred —
+            // bail to tier-1a. (shl/shr, guard_float, guard_builtin and fsqrt are handled
             // above.)
             else => return false,
         }
@@ -2185,6 +2212,7 @@ fn opMayExitInBody(
         .hload,
         .guard_gcol,
         .guard_gpresent,
+        .alen,
         => true,
         // A VALUE_LANE aload tag-checks TAG_HEAP and side-exits on mismatch;
         // scalar-lane aloads are exit-free (guard_present/guard_bounds dominate).
@@ -2224,11 +2252,20 @@ const BodyCallout = enum {
     /// `resolveHashCell`: pure hash-chain walk over an existing table — reads
     /// the key, hashes, follows cells; allocates nothing.
     resolve_hash_cell,
+    /// `fmath.sinRuntime`: the shared noinline `math.sin` kernel (doc 23 D4) —
+    /// a pure f64 → f64 function; allocates nothing.
+    fsin,
+    /// `fmath.cosRuntime`: likewise for `math.cos`.
+    fcos,
+    /// `fmath.powRuntime`: the shared `^` kernel — pure (f64, f64) → f64;
+    /// allocates nothing.
+    fpow,
 };
 
 fn calloutMayGc(c: BodyCallout) bool {
     return switch (c) {
         .resolve_hash_cell => false,
+        .fsin, .fcos, .fpow => false,
     };
 }
 
@@ -2243,6 +2280,9 @@ fn bodyCalloutOf(
     const ins = t.instrs[idx];
     return switch (ins.op) {
         .href => if (isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a)) .resolve_hash_cell else null,
+        .fsin => .fsin,
+        .fcos => .fcos,
+        .pow => .fpow,
         else => null,
     };
 }
@@ -2334,10 +2374,10 @@ const SlotInfo = struct {
     /// (closure type + this id). Unused (0) for non-`.func` slots.
     func_id: u32 = 0,
     /// For a `.native` (pure-builtin callee snapshot) invariant slot: the recorded
-    /// `PureBuiltin` ordinal its covering `guard_pure` pins, checked once in the
+    /// `RecordedBuiltin` ordinal its covering `guard_builtin` pins, checked once in the
     /// prologue (native type + this tag's payload byte + the non-null flag). `-1` for
     /// non-`.native` slots.
-    pure_tag: i32 = -1,
+    recorded_tag: i32 = -1,
     /// For a `.ptr` table accessed as a GRID (doc 14): the `grid_elem` lane ordinal
     /// (an int lane) its covering `guard_grid` pins and the `stride` its
     /// `guard_stride` pins, both checked once in the prologue (`array.grid_elem ==
@@ -2442,10 +2482,13 @@ fn isTransient(op: trace.IrOp) bool {
         .konst, .add, .sub, .mul, .div, .band, .bor, .bxor, .shl, .shr, .sar, .neg, .bnot, .eq, .ne, .lt, .le => true,
         // aref materializes idx0 in a register; aload materializes the decoded bool.
         .aref, .aload => true,
-        // int_of_float materializes the converted int limit in a register.
-        .int_of_float => true,
-        // fsqrt materializes the `@sqrt` result in a float home (XMM/spill).
-        .fsqrt => true,
+        // int_of_float materializes the converted int limit in a register; alen
+        // the border int.
+        .int_of_float, .alen => true,
+        // fsqrt materializes the `@sqrt` result in a float home (XMM/spill);
+        // fsin/fcos/pow materialize their `fmath` kernel callout's result
+        // likewise.
+        .fsqrt, .fsin, .fcos, .pow => true,
         // href materializes the seeded cell pointer in a register (like aref); hload
         // materializes the decoded scalar field value. hstore/guard_hash are effects.
         .href, .hload => true,
@@ -2470,10 +2513,11 @@ fn isCommutative(op: trace.IrOp) bool {
 /// The operand refs an instruction reads (matching `proveKinds`/`lower` exactly).
 fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
     return switch (ins.op) {
-        .add, .sub, .mul, .div, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
+        .add, .sub, .mul, .div, .pow, .band, .bor, .bxor, .shl, .shr, .sar, .eq, .ne, .lt, .le => .{ .a = true, .b = true },
         .neg, .bnot, .guard_int, .guard_true, .guard_false => .{ .a = true, .b = false },
-        // int_of_float reads its sole float operand (a).
-        .int_of_float => .{ .a = true, .b = false },
+        // int_of_float reads its sole float operand (a); alen its sole table
+        // operand (a).
+        .int_of_float, .alen => .{ .a = true, .b = false },
         // aref reads table (a, an invariant home) + index (b). aload/guards reach the
         // table through aref.a, so they read only the aref token (a). astore reads
         // the aref token (a) plus the value to write (b). astore_append is the grow
@@ -2482,9 +2526,9 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
         .aload, .guard_bounds, .guard_present, .guard_table, .guard_lane => .{ .a = true, .b = false },
         // guard_func reads the callee-snapshot value it identity-checks (a).
         .guard_func => .{ .a = true, .b = false },
-        // guard_pure reads the callee-snapshot native it identity-checks (a); fsqrt
-        // reads its sole float operand (a).
-        .guard_pure, .fsqrt => .{ .a = true, .b = false },
+        // guard_builtin reads the callee-snapshot native it identity-checks (a);
+        // fsqrt/fsin/fcos read their sole float operand (a).
+        .guard_builtin, .fsqrt, .fsin, .fcos => .{ .a = true, .b = false },
         // guard_fits reads the value it range-checks (a); guard_append reads the aref
         // token (a) and reaches len/cap/hash through aref.a — no second operand.
         .guard_fits, .guard_append => .{ .a = true, .b = false },
@@ -2755,27 +2799,27 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         if (!found) return error.Bail;
     }
     // A `.native` (pure-builtin callee snapshot) invariant slot carries the recorded
-    // `PureBuiltin` ordinal from its covering `guard_pure`, checked once in the
+    // `RecordedBuiltin` ordinal from its covering `guard_builtin`, checked once in the
     // prologue (the upvalue/global cell is re-resolved + re-seeded each entry, so it
-    // cannot change within a native run). Locate the guard_pure and stash its tag.
+    // cannot change within a native run). Locate the guard_builtin and stash its tag.
     for (slots.items) |*s| {
         if (s.kind != .native) continue;
         const lr: u16 = @intCast(s.load_ref);
         var found = false;
         for (t.instrs) |g| {
-            if (g.op == .guard_pure and g.a == lr) {
-                if (found and g.aux != s.pure_tag) {
-                    // Two guard_pures on one snapshot with *different* recorded tags:
+            if (g.op == .guard_builtin and g.a == lr) {
+                if (found and g.aux != s.recorded_tag) {
+                    // Two guard_builtins on one snapshot with *different* recorded tags:
                     // the prologue checks one, but the oracle re-checks each and would
                     // side-exit on the second — a divergence. The recorder never emits
                     // this (one seeded callee → one tag), so it can only arise malformed.
                     return error.Bail;
                 }
-                s.pure_tag = g.aux;
+                s.recorded_tag = g.aux;
                 found = true;
             }
         }
-        // proveKinds only set .native via a guard_pure, so one always exists.
+        // proveKinds only set .native via a guard_builtin, so one always exists.
         if (!found) return error.Bail;
     }
 
@@ -3261,17 +3305,19 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         }
     }
 
-    // --- callout save area (Phase 2, dynamically-rooted href) ---
-    // If any href in this trace operates on a per-iteration table (a `.heap`-kind
-    // aload result OR a carried-heap slot — hash-cell resolution via
-    // `resolveHashCell`), the callout clobbers all SysV caller-saved registers.
-    // Reserve frame slots to save/restore live homes.
+    // --- callout save area (any BodyCallout in the body) ---
+    // If any instruction in this trace lowers to a mid-body callout (a
+    // dynamically-rooted href's `resolveHashCell`, an fsin/fcos `fmath` kernel
+    // call, …), the callout clobbers all SysV caller-saved registers. Reserve
+    // frame slots to save/restore live homes. The predicate is `bodyCalloutOf`
+    // itself — the SAME mapping the lowering and the heap-φ GC audit dispatch
+    // on — so a new callout can never silently miss its save area.
     var callout_save_base: u32 = 0;
     var callout_save_count: u32 = 0;
     {
         var needs_callout = false;
-        for (t.instrs) |ins| {
-            if (ins.op == .href and isDynTableRoot(kinds, slots.items, slot_id_of_ref, ins.a)) {
+        for (t.instrs, 0..) |_, ci| {
+            if (bodyCalloutOf(t, kinds, slots.items, slot_id_of_ref, ci) != null) {
                 needs_callout = true;
                 break;
             }
@@ -4223,6 +4269,124 @@ pub fn isCompositeBridgeCandidate(t: *const Trace, instr_idx: usize) bool {
     return false;
 }
 
+/// The caller-saved GPRs every body callout must preserve (rax/rcx are the
+/// JIT's scratch pair and deliberately excluded — a callout result rides
+/// through the restore in one of them).
+const CALLOUT_SAVED_GP = [_]Reg{ .r8, .r9, .r10, .r11 };
+
+/// Save every SysV caller-saved home the JIT body may keep live across a
+/// mid-body callout — rdi/rsi (SoA bases), rdx (*NativeResult), r8–r11, and
+/// all allocatable XMMs (xmm2–xmm15) — into the pre-reserved
+/// `callout_save_base` frame area. Shared by every `BodyCallout` lowering
+/// (doc 23 D4 generalized this out of the href callout); paired with
+/// `emitCalloutRestore`.
+fn emitCalloutSave(a: *x64.Assembler, alloc: *const Alloc) !void {
+    std.debug.assert(alloc.callout_save_count != 0); // save area must be reserved
+    var off: u32 = alloc.callout_save_base;
+    // rdi (tags base), rsi (payloads base), rdx (*NativeResult).
+    try a.movMemReg(.rsp, @intCast(off * 8), .rdi);
+    off += 1;
+    try a.movMemReg(.rsp, @intCast(off * 8), .rsi);
+    off += 1;
+    try a.movMemReg(.rsp, @intCast(off * 8), .rdx);
+    off += 1;
+    // ALL caller-saved GP registers (r8–r11), not just homes — transients in
+    // these registers may be live across the callout.
+    for (CALLOUT_SAVED_GP) |r| {
+        try a.movMemReg(.rsp, @intCast(off * 8), r);
+        off += 1;
+    }
+    // ALL allocatable XMMs (xmm2–xmm15): same reasoning — a transient float
+    // live across the callout would be clobbered.
+    for (XMM_ALLOC_ORDER) |r| {
+        try a.movsdMemReg(.rsp, @intCast(off * 8), r);
+        off += 1;
+    }
+    // Sanity: we used exactly the reserved number of slots.
+    std.debug.assert(off == alloc.callout_save_base + alloc.callout_save_count);
+}
+
+/// Restore everything `emitCalloutSave` saved, in reverse order. Deliberately
+/// never touches rax/rcx (GP scratch) or xmm0/xmm1 (float scratch): a callout
+/// stashes its result there so it survives the restore. Restore must happen
+/// BEFORE any result check that can side-exit — the deopt flush at
+/// `jccNativeExit` relies on slot homes being correct.
+fn emitCalloutRestore(a: *x64.Assembler, alloc: *const Alloc) !void {
+    var off: u32 = alloc.callout_save_base + alloc.callout_save_count;
+    {
+        var ri: usize = XMM_ALLOC_ORDER.len;
+        while (ri > 0) {
+            ri -= 1;
+            off -= 1;
+            try a.movsdRegMem(XMM_ALLOC_ORDER[ri], .rsp, @intCast(off * 8));
+        }
+    }
+    {
+        var ri: usize = CALLOUT_SAVED_GP.len;
+        while (ri > 0) {
+            ri -= 1;
+            off -= 1;
+            try a.movRegMem(CALLOUT_SAVED_GP[ri], .rsp, @intCast(off * 8));
+        }
+    }
+    off -= 1;
+    try a.movRegMem(.rdx, .rsp, @intCast(off * 8));
+    off -= 1;
+    try a.movRegMem(.rsi, .rsp, @intCast(off * 8));
+    off -= 1;
+    try a.movRegMem(.rdi, .rsp, @intCast(off * 8));
+    std.debug.assert(off == alloc.callout_save_base);
+}
+
+/// Emit the mid-body callout for a float-kernel producer (`fsin`/`fcos`
+/// unary, `pow` binary — doc 23 D4). The native body calls THE SAME noinline
+/// `fmath` kernel tier-0 and tier-1a execute — never an inline SSE
+/// re-derivation — so cross-tier bit-identity holds by construction (there is
+/// exactly one compiled body of each kernel in the process). SysV float call:
+/// operands in xmm0(/xmm1), result in xmm0; the restore only touches xmm2–xmm15 /
+/// r8–r11 / rdi/rsi/rdx, so the result rides through it in xmm0. No side-exit:
+/// the operand is a proven numeric (dominating `guard_float`/`guard_int`) and
+/// the kernel is total (NaN in → NaN out).
+fn emitFloatCallout(
+    a: *x64.Assembler,
+    alloc: *const Alloc,
+    kinds: []const Kind,
+    ins: trace.IrInstr,
+    i: usize,
+) !void {
+    try emitCalloutSave(a, alloc);
+
+    // arg0: the proven-numeric operand into xmm0 (== XMM_SCRATCH0); a proven
+    // int promotes via the shared cvtsi2sd discipline. `pow` (the two-arg
+    // kernel) additionally stages its exponent into xmm1 — staging order is
+    // safe because operand homes are never the scratch XMMs.
+    try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.a), kinds[ins.a]);
+    if (ins.op == .pow)
+        try floatOperandToXmm(a, XMM_SCRATCH1, placeOfRef(alloc, ins.b), kinds[ins.b]);
+
+    // Call the fmath kernel via an absolute address in rax. Same alignment
+    // dance as emitHrefCallout: the body runs with rsp % 16 == 8, SysV wants
+    // rsp % 16 == 0 at the call.
+    const kernel: usize = switch (ins.op) {
+        .fsin => @intFromPtr(&fmath.sinRuntime),
+        .fcos => @intFromPtr(&fmath.cosRuntime),
+        .pow => @intFromPtr(&fmath.powRuntime),
+        else => unreachable,
+    };
+    try a.subRegImm32(.rsp, 8);
+    try a.movRegImm64(.rax, @bitCast(kernel));
+    try a.callReg(.rax);
+    try a.addRegImm32(.rsp, 8);
+
+    // Result is in xmm0; restore (which leaves xmm0 alone), then home it.
+    try emitCalloutRestore(a, alloc);
+    switch (placeOfRef(alloc, i)) {
+        .xmm => |x| if (x != XMM_SCRATCH0) try a.movsdRegReg(x, XMM_SCRATCH0),
+        .mem => |d| try a.movsdMemReg(.rsp, d, XMM_SCRATCH0),
+        .reg => unreachable, // a float result never homes in a GP register
+    }
+}
+
 /// Emit the per-iteration hash-cell resolution call-out for a `.heap`-rooted href.
 /// The sequence saves all live caller-saved homes (rdi/rsi SoA bases + GP + XMM)
 /// into the pre-reserved frame area, sets up SysV ABI arguments, calls
@@ -4238,35 +4402,11 @@ fn emitHrefCallout(
     exit_labels: []?x64.Label,
 ) !void {
     _ = kinds;
-    const CALLER_SAVED_GP = [_]Reg{ .r8, .r9, .r10, .r11 };
-    var off: u32 = alloc.callout_save_base;
 
-    // 1. Save rdi (tags base), rsi (payloads base), and rdx (*NativeResult).
-    try a.movMemReg(.rsp, @intCast(off * 8), .rdi);
-    off += 1;
-    try a.movMemReg(.rsp, @intCast(off * 8), .rsi);
-    off += 1;
-    try a.movMemReg(.rsp, @intCast(off * 8), .rdx);
-    off += 1;
+    // 1. Save all caller-saved homes into the reserved frame area.
+    try emitCalloutSave(a, alloc);
 
-    // 2. Save ALL caller-saved GP registers (r8–r11), not just homes —
-    //    transients in these registers may be live across the callout.
-    for (CALLER_SAVED_GP) |r| {
-        try a.movMemReg(.rsp, @intCast(off * 8), r);
-        off += 1;
-    }
-
-    // 3. Save ALL allocatable XMMs (xmm2–xmm15): same reasoning —
-    //    a transient float live across the callout would be clobbered.
-    for (XMM_ALLOC_ORDER) |r| {
-        try a.movsdMemReg(.rsp, @intCast(off * 8), r);
-        off += 1;
-    }
-
-    // Sanity: we used exactly the reserved number of slots.
-    std.debug.assert(off == alloc.callout_save_base + alloc.callout_save_count);
-
-    // 4. Set up SysV ABI arguments:
+    // 2. Set up SysV ABI arguments:
     //    rdi = *GcHeader (from the aload's home — the .heap table pointer)
     //    rsi = key tag bits (compile-time constant from the trace's const pool)
     //    rdx = key payload bits (compile-time constant)
@@ -4287,7 +4427,7 @@ fn emitHrefCallout(
     try a.movRegImm64(.rsi, @bitCast(key_tag));
     try a.movRegImm64(.rdx, @bitCast(key_payload));
 
-    // 5. Call resolveHashCell via an absolute address in rax.
+    // 3. Call resolveHashCell via an absolute address in rax.
     // The JIT body runs with rsp % 16 == 8 (return-address push from the
     // C-ABI entry call). SysV requires rsp % 16 == 0 at a `call` site, so
     // bump the stack by 8 to fix alignment, then undo after the call.
@@ -4296,56 +4436,20 @@ fn emitHrefCallout(
     try a.callReg(.rax);
     try a.addRegImm32(.rsp, 8);
 
-    // rax now holds the cell pointer (or 0 on miss).
-    // Move it out of the way before restoring — store in the href's home.
-    // But first: check for 0 (cell not found → side-exit) BEFORE restore,
-    // because the side-exit path doesn't need restored registers (it re-enters
-    // the interpreter which reloads everything from scratch). Actually — the
-    // deopt exit path at jccNativeExit relies on slot homes being correct for
-    // the flush. So we must restore THEN check.
-    //
-    // Strategy: stash rax in rcx (scratch, not a home, not clobbered by restore),
-    // restore everything, then test rcx.
+    // rax now holds the cell pointer (or 0 on miss). The result check must
+    // come AFTER the restore (the deopt flush at jccNativeExit relies on slot
+    // homes being correct), so stash rax in rcx — scratch, not a home, and
+    // emitCalloutRestore never touches it — then restore, then test rcx.
     try a.movRegReg(.rcx, .rax);
 
-    // 6. Restore in reverse order.
-    off = alloc.callout_save_base + alloc.callout_save_count;
+    // 5. Restore everything saved in step 1 (rcx/xmm0 untouched).
+    try emitCalloutRestore(a, alloc);
 
-    // Restore ALL allocatable XMMs (reverse order of save).
-    {
-        var ri: usize = XMM_ALLOC_ORDER.len;
-        while (ri > 0) {
-            ri -= 1;
-            off -= 1;
-            try a.movsdRegMem(XMM_ALLOC_ORDER[ri], .rsp, @intCast(off * 8));
-        }
-    }
-
-    // Restore ALL caller-saved GP registers (reverse order).
-    {
-        var ri: usize = CALLER_SAVED_GP.len;
-        while (ri > 0) {
-            ri -= 1;
-            off -= 1;
-            try a.movRegMem(CALLER_SAVED_GP[ri], .rsp, @intCast(off * 8));
-        }
-    }
-
-    // Restore rdx, rsi, rdi (reverse of save order).
-    off -= 1;
-    try a.movRegMem(.rdx, .rsp, @intCast(off * 8));
-    off -= 1;
-    try a.movRegMem(.rsi, .rsp, @intCast(off * 8));
-    off -= 1;
-    try a.movRegMem(.rdi, .rsp, @intCast(off * 8));
-
-    std.debug.assert(off == alloc.callout_save_base);
-
-    // 7. Check the result (stashed in rcx). 0 = cell not found → side-exit.
+    // 6. Check the result (stashed in rcx). 0 = cell not found → side-exit.
     try a.cmpRegImm32(.rcx, 0);
     try jccNativeExit(a, exit_labels, i, .e); // ZF=1 → rcx==0 → miss
 
-    // 8. Store the cell pointer (in rcx) into the href's home.
+    // 7. Store the cell pointer (in rcx) into the href's home.
     try regToPlace(a, placeOfRef(alloc, i), .rcx);
 }
 
@@ -4740,15 +4844,15 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         try a.jcc(.ne, prologue_fail);
     }
 
-    // [guard_pure prologue] For each `.native` slot the callee pointer is now in its
-    // home; verify it is a host native carrying exactly the recorded `PureBuiltin` tag
+    // [guard_builtin prologue] For each `.native` slot the callee pointer is now in its
+    // home; verify it is a host native carrying exactly the recorded `RecordedBuiltin` tag
     // — the pure-builtin identity guard, checked once here (the upvalue/global cell is
     // re-resolved + re-seeded each entry, so it cannot change within a native run; a
     // `set_upval`/`set_global` in the traced region aborts recording). A miss returns 0
     // (regs[] untouched), side-exiting to tier-0 which really pushes the call frame and
-    // re-runs the iteration. Byte-identical to irinterp's `guard_pure` arm: heap +
-    // type==native + `native.pure == @enumFromInt(tag)`. The `pure` field is a 2-byte
-    // `?PureBuiltin` laid out `[payload, has_value]`, so the non-null check is the flag
+    // re-runs the iteration. Byte-identical to irinterp's `guard_builtin` arm: heap +
+    // type==native + `native.recorded == @enumFromInt(tag)`. The `recorded` field is a 2-byte
+    // `?RecordedBuiltin` laid out `[payload, has_value]`, so the non-null check is the flag
     // byte == 1 and the identity check is the payload byte == tag.
     for (alloc.slots) |s| {
         if (s.class == .write_only or s.kind != .native) continue;
@@ -4756,10 +4860,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         // header.type == native (the payload is a TAG_HEAP `*GcHeader`).
         try a.cmpByteMemImm(preg, HEADER_TYPE_OFF, NATIVE_TYPE);
         try a.jcc(.ne, prologue_fail);
-        // pure non-null (flag byte == 1) AND payload ordinal == recorded tag.
-        try a.cmpByteMemImm(preg, NATIVE_PURE_OFF + 1, 1);
+        // `recorded` non-null (flag byte == 1) AND payload ordinal == recorded tag.
+        try a.cmpByteMemImm(preg, NATIVE_RECORDED_OFF + 1, 1);
         try a.jcc(.ne, prologue_fail);
-        try a.cmpByteMemImm(preg, NATIVE_PURE_OFF, @intCast(s.pure_tag));
+        try a.cmpByteMemImm(preg, NATIVE_RECORDED_OFF, @intCast(s.recorded_tag));
         try a.jcc(.ne, prologue_fail);
     }
 
@@ -4808,12 +4912,12 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // recheck happens at entry in `seedTraceInputs` (a failed cell resolve
             // routes the entry to tier-1a, never native) and per-iteration in the
             // `hload` tag-check, so in the native body it emits nothing.
-            // guard_pure joins the hoisted no-ops: the native-identity check is in the
+            // guard_builtin joins the hoisted no-ops: the native-identity check is in the
             // prologue (loop-invariant callee snapshot), so nothing here.
             // guard_grid/guard_stride (doc 14): the grid structural guards, hoisted to
             // the prologue grid-elem/stride checks (invariant within a native run) —
             // nothing here, exactly like guard_table/guard_lane.
-            .slot_load, .guard_int, .guard_float, .guard_lane, .guard_func, .guard_pure, .guard_grid, .guard_stride => {},
+            .slot_load, .guard_int, .guard_float, .guard_lane, .guard_func, .guard_builtin, .guard_grid, .guard_stride => {},
             // guard_table: hoisted no-op for invariant `.ptr` operands (prologue
             // checks). For per-iteration roots — a `.heap`-kind VALUE_LANE aload
             // result, or a carried-heap slot whose home the back-edge φ shuffle
@@ -4935,9 +5039,10 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // SSE instruction reproduces the tier-1a oracle's `Value.float(@sqrt(arg))`
             // exactly. The operand is a proven float; stage it into a scratch XMM, sqrt
             // in place, then move to the float home (xmm or spill). No side-exit: a stale
-            // callee is caught by the hoisted `guard_pure`, not here.
+            // callee is caught by the hoisted `guard_builtin`, not here.
             .fsqrt => {
-                try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.a), .float); // proveKinds pinned .float
+                // proveKinds pinned .float or .int; an int operand promotes here.
+                try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.a), kinds[ins.a]);
                 try a.sqrtsdRegReg(XMM_SCRATCH0, XMM_SCRATCH0);
                 switch (placeOfRef(alloc, i)) {
                     .xmm => |x| if (x != XMM_SCRATCH0) try a.movsdRegReg(x, XMM_SCRATCH0),
@@ -4945,6 +5050,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                     .reg => unreachable, // a float result never homes in a GP register
                 }
             },
+            // fsin/fcos/pow: a mid-body callout into THE shared noinline `fmath`
+            // kernel (doc 23 D4) — never an inline SSE re-derivation, so every
+            // tier runs the one compiled body and bit-identity holds by
+            // construction. No side-exit (total functions of proven numerics).
+            .fsin, .fcos, .pow => try emitFloatCallout(a, alloc, kinds, ins, i),
             // --- hash-part field path (H1) --------------------------------------
             // href: load the loop-invariant value-cell pointer (`*Value`) from its
             // seeded slab slot `[rsi + aux*8]` into the href token's home. The cell was
@@ -5213,6 +5323,46 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try jccNativeExit(a, exit_labels, i, .ae); // idx0 (==asize) >=u cap → would realloc
                 try a.cmpDwordMemImm(tbreg, ArrLayout.hash_size, 0);
                 try jccNativeExit(a, exit_labels, i, .ne); // hash non-empty → migrate possible
+            },
+            // alen (doc 23 D3): the `#t` fast-case border, `max(asize−1, 0)`.
+            // Re-verifies the same premises tier-1a checks — hash empty,
+            // presence-bitmap lane, (asize ≤ 1 ∨ present(asize−1)) — with
+            // memory-operand compares mirroring guard_append, side-exiting to
+            // tier-0 (which owns the general border search) on any miss. The
+            // bitmap-lane test is a single unsigned range compare: the bitmap
+            // lanes are exactly the contiguous ordinals `i8..u8` (pinned by a
+            // comptime assert against `Lane.usesPresenceBitmap` below).
+            .alen => {
+                comptime {
+                    for (@typeInfo(arr.Lane).@"enum".field_values) |fv| {
+                        const l: arr.Lane = @enumFromInt(fv);
+                        const in_range = fv >= @intFromEnum(arr.Lane.i8) and fv <= @intFromEnum(arr.Lane.u8);
+                        std.debug.assert(l.scalarPresenceLane() == in_range);
+                    }
+                }
+                const tbreg = try refBaseReg(a, alloc, ins.a, .rax); // table ptr
+                try a.cmpDwordMemImm(tbreg, ArrLayout.hash_size, 0);
+                try jccNativeExit(a, exit_labels, i, .ne); // hash non-empty → general border
+                try a.cmpByteMemImm(tbreg, ArrLayout.array_base + ArrLayout.lane, @intFromEnum(arr.Lane.i8));
+                try jccNativeExit(a, exit_labels, i, .b); // below i8 → .value/.boolean (in-band)
+                try a.cmpByteMemImm(tbreg, ArrLayout.array_base + ArrLayout.lane, @intFromEnum(arr.Lane.u8));
+                try jccNativeExit(a, exit_labels, i, .a); // above u8 → grid
+                try a.movRegMem(.rcx, tbreg, ArrLayout.array_base + ArrLayout.asize); // rcx = asize
+                const skip_presence = try a.label();
+                try a.cmpRegImm32(.rcx, 1);
+                try a.jcc(.be, skip_presence); // asize ≤ 1 → border 0, nothing to probe
+                try a.movRegMem(.rax, tbreg, ArrLayout.array_base + ArrLayout.present);
+                try a.cmpRegImm32(.rax, 0);
+                try jccNativeExit(a, exit_labels, i, .e); // no bitmap allocated → side-exit
+                try a.subRegImm32(.rcx, 1); // rcx = asize − 1 (the border candidate)
+                try a.btMemReg(.rax, 0, .rcx); // CF = present(asize−1)
+                try jccNativeExit(a, exit_labels, i, .ae); // bit clear → trailing hole → tier-0
+                const done = try a.label();
+                try a.jmp(done);
+                a.bind(skip_presence);
+                try a.xorRegReg(.rcx, .rcx); // asize ≤ 1 → border 0
+                a.bind(done);
+                try regToPlace(a, placeOfRef(alloc, i), .rcx);
             },
             // astore_append (B5-grow): commit one boolean to `data[asize]` and bump asize.
             // guard_append proved `idx0 == asize < cap` and an empty hash, so this is the

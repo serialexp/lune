@@ -353,7 +353,7 @@ test "wire enum ordinals are a pinned contract (mirrored by viz/src/enums.ts)" {
     try testing.expectEqual(@as(u8, 42), @intFromEnum(IrOp.hload));
     try testing.expectEqual(@as(u8, 43), @intFromEnum(IrOp.hstore));
     try testing.expectEqual(@as(u8, 44), @intFromEnum(IrOp.guard_hash));
-    try testing.expectEqual(@as(u8, 45), @intFromEnum(IrOp.guard_pure));
+    try testing.expectEqual(@as(u8, 45), @intFromEnum(IrOp.guard_builtin));
     try testing.expectEqual(@as(u8, 46), @intFromEnum(IrOp.fsqrt));
     try testing.expectEqual(@as(u8, 47), @intFromEnum(IrOp.sar));
     // Flattened-grid cell access (doc 14, Phase 8), appended after `sar` so wire
@@ -369,9 +369,14 @@ test "wire enum ordinals are a pinned contract (mirrored by viz/src/enums.ts)" {
     // Nested-loop trace linking (doc 15, Phase 2), appended after `guard_gpresent`
     // so wire ordinals 0..55 are undisturbed.
     try testing.expectEqual(@as(u8, 56), @intFromEnum(IrOp.link));
+    // Builtin recording breadth (doc 23, arc A), appended after `link` so wire
+    // ordinals 0..56 are undisturbed.
+    try testing.expectEqual(@as(u8, 57), @intFromEnum(IrOp.alen));
+    try testing.expectEqual(@as(u8, 58), @intFromEnum(IrOp.fsin));
+    try testing.expectEqual(@as(u8, 59), @intFromEnum(IrOp.fcos));
     // Exhaustiveness: if a member is added/removed, this count changes and forces
     // both this test and enums.ts to be revisited.
-    try testing.expectEqual(@as(usize, 57), @typeInfo(IrOp).@"enum".field_names.len);
+    try testing.expectEqual(@as(usize, 60), @typeInfo(IrOp).@"enum".field_names.len);
 
     const ObsType = trace.ObsType;
     try testing.expectEqual(@as(u8, 0), @intFromEnum(ObsType.unknown));

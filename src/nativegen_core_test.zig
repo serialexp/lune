@@ -169,15 +169,15 @@ test "nativegen B-3a: link and linked-loop-done exits contain inert NOP windows"
     try testing.expect(saw_deopt);
 }
 
-test "nativegen: ?PureBuiltin is laid out [payload, has_value] (guard_pure prologue contract)" {
-    // The native `guard_pure` prologue reads the callee's `pure` field with two byte
+test "nativegen: ?RecordedBuiltin is laid out [payload, has_value] (guard_builtin prologue contract)" {
+    // The native `guard_builtin` prologue reads the callee's `pure` field with two byte
     // compares relative to NATIVE_PURE_OFF: the payload ordinal at +0 and the non-null
     // flag at +1. Pin that `[payload, has_value]` order here so a toolchain change to
     // the optional-enum layout fails this test instead of silently miscompiling the
     // identity guard (the size is comptime-asserted next to the constant above).
-    var p: ?function.PureBuiltin = .sqrt;
+    var p: ?function.RecordedBuiltin = .sqrt;
     const bytes = std.mem.asBytes(&p);
-    try std.testing.expectEqual(@as(u8, @intFromEnum(function.PureBuiltin.sqrt)), bytes[0]); // payload at +0
+    try std.testing.expectEqual(@as(u8, @intFromEnum(function.RecordedBuiltin.sqrt)), bytes[0]); // payload at +0
     try std.testing.expectEqual(@as(u8, 1), bytes[1]); // has_value flag at +1
     p = null;
     try std.testing.expectEqual(@as(u8, 0), bytes[1]); // flag clears on null

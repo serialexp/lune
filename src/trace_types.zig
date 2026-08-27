@@ -71,7 +71,8 @@ pub const GuardRole = enum(u8) {
     row_bounds, // grid row in [1,rows] (guard_bounds on garow)
     col_bounds, // grid column resolution / in [1,stride] (guard_gcol)
     callee_identity, // closure identity (call / get_upval / get_global — guard_func)
-    callee_pure, // pure-builtin identity (guard_pure)
+    callee_pure, // pure-builtin identity (guard_builtin)
+    border, // `#t` fast-case border computable (alen's own producer-exit)
 };
 
 /// Static register designator for the guarded operand (H-1c). Covers `a`/`b`/`c`,
@@ -80,7 +81,7 @@ pub const GuardRole = enum(u8) {
 /// guards with no register operand (bounds/present/loop_done). Re-recording-stable:
 /// it tracks the *source* register, not the normalized IR operand (the `recCompare`
 /// gt/ge swap happens after emission, so `operand` still names the source reg).
-pub const OperandDesig = enum(u8) { none, a, b, c, a1, a2, aux, loaded };
+pub const OperandDesig = enum(u8) { none, a, b, c, a1, a2, aux, loaded, a3 };
 
 /// The guest-static identity of a materialized guard exit (H-1c: `occurrence`
 /// dropped — unrolled physical copies deliberately share one tag, which is correct

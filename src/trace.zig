@@ -41,6 +41,8 @@ const Instr = bytecode.Instr;
 const OpCode = bytecode.OpCode;
 const table_mod = @import("table.zig");
 const arr = @import("array.zig");
+const string_mod = @import("string.zig");
+const gc = @import("gc.zig");
 
 // ---------------------------------------------------------------------------
 // Trace IR
@@ -300,13 +302,13 @@ pub const IrOp = enum(u8) {
 
     // ---- pure-builtin inlining (doc 12) ---------------------------------------
     //
-    // A `recCall` to a native flagged `PureBuiltin` (e.g. `math.sqrt`) is inlined
+    // A `recCall` to a native flagged `RecordedBuiltin` (e.g. `math.sqrt`) is inlined
     // as a dedicated leaf producer instead of aborting `.host_barrier`. The trace
-    // bakes in "callee is this builtin"; `guard_pure` re-proves that identity, and
+    // bakes in "callee is this builtin"; `guard_builtin` re-proves that identity, and
     // the producer (`fsqrt`) computes the result directly from its float operand.
     //
     /// `a` = the callee value ref (a once-seeded loop-invariant upvalue/global),
-    /// `aux` = `@intFromEnum(PureBuiltin)`. Side-exits to tier-0 unless the runtime
+    /// `aux` = `@intFromEnum(RecordedBuiltin)`. Side-exits to tier-0 unless the runtime
     /// callee is still a `.native` carrying exactly this `pure` tag — so a reassigned
     /// `sqrt` upvalue deopts on the same iteration in both the oracle and native.
     /// The callee is a once-seeded synthetic input, so the value is loop-invariant
@@ -314,7 +316,7 @@ pub const IrOp = enum(u8) {
     /// does NOT hoist guards (re-checking an invariant value each iteration is cheap
     /// — see `tropt`'s LICM note), so today it re-checks per iteration. Produces no
     /// value; never DCE'd. Classified `.guard`.
-    guard_pure,
+    guard_builtin,
     /// `a` = the float argument ref → the pure-builtin result. v1 is `sqrt` only:
     /// the oracle computes `Value.float(@sqrt(arg))` and native lowers to a single
     /// `sqrtsd` (both IEEE correctly-rounded, bit-identical under the default MXCSR).
@@ -422,6 +424,33 @@ pub const IrOp = enum(u8) {
     /// `driveChain`; Phase 4 lowers it to a native-to-native chain. Appended last
     /// so every prior op's wire ordinal stays stable.
     link,
+
+    // ---- builtin recording breadth (doc 23, arc A) ----------------------------
+    /// `a`=table value ref → the table's `#t` border via the exact fast case
+    /// (doc 23 D3): produces `max(asize − 1, 0)` (`.int`), side-exiting unless
+    /// *hash.count == 0 ∧ the array lane keeps a presence bitmap ∧ (asize ≤ 1 ∨
+    /// present(asize−1))* — under exactly those premises `Table.length()` returns
+    /// `asize − 1` with no trim/hash search (key 0 never participates, doc 18),
+    /// so the fast case is exact, not approximate. A **guarded producer** like
+    /// `int_of_float`: it stamps its exit PC in `aux` (see `emit`) and appears in
+    /// `guardExitPc`/`isSideExitGuardOp`. The general border search (trailing
+    /// holes, hash borders, grids, in-band `.value`/`.boolean` lanes) stays
+    /// tier-0 behind the side-exit. Alias discipline is `aload`-like — never
+    /// CSE'd/hoisted across stores — and the recorder refuses to emit it while
+    /// RMW stores are sunk (`pending_stores` non-empty), so it can never read a
+    /// pre-flush border. Appended last (wire ordinal 57).
+    alen,
+    /// `a`=float operand ref → `sin(a)` (`.float`). A leaf pure producer like
+    /// `fsqrt` — hoistable iff invariant, CSE'd, DCE'd if dead, deliberately
+    /// NEVER constant-folded (no compile-time transcendental: fold-vs-runtime
+    /// last-ulp divergence is exactly what the shared kernel exists to kill).
+    /// All tiers evaluate it through the ONE `fmath.sinRuntime` body — tier-1a
+    /// calls it, native calls out to the same pointer (doc 23 D4) — so the op
+    /// is bit-identical everywhere by construction. Wire ordinal 58.
+    fsin,
+    /// `a`=float operand ref → `cos(a)` (`.float`). Exactly `fsin`'s contract
+    /// with `fmath.cosRuntime`. Wire ordinal 59.
+    fcos,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -454,7 +483,7 @@ pub const IrInstr = struct {
 /// callers treat 0 as "no usable PC" since no loop-body guard sits at PC 0.
 pub fn guardExitPc(ins: IrInstr) ?u32 {
     return switch (ins.op) {
-        .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float => @intCast(ins.aux),
+        .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .alen => @intCast(ins.aux),
         else => null,
     };
 }
@@ -465,7 +494,7 @@ pub fn guardExitPc(ins: IrInstr) ?u32 {
 /// is side-trace evidence, not thrash.
 pub fn isSideExitGuardOp(op: IrOp) bool {
     return switch (op) {
-        .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .guard_func, .guard_hash, .guard_pure, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent => true,
+        .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .guard_table, .guard_lane, .guard_bounds, .guard_present, .guard_fits, .guard_append, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_gcol, .guard_gpresent, .alen => true,
         else => false,
     };
 }
@@ -1645,6 +1674,15 @@ pub inline fn cycleDelta(now: u64, prev: u64) u64 {
 pub const TraceState = struct {
     gpa: std.mem.Allocator,
     config: TraceConfig = .{},
+    /// Read-only heap channel for the builtin fold arms (doc 23 D2): the
+    /// dispatch loop refreshes this right before every `recordInstr` call
+    /// (interp.zig), the same supply-what-the-recorder-can't-reach pattern as
+    /// the `resolved` parameter — never a stored self-pointer trusted across
+    /// calls. Folds use it for `internedLookup` ONLY (the arc-A invariant:
+    /// recording never creates a guest heap object). Null in bare test
+    /// harnesses that build a `TraceState` without a VM; fold arms then abort
+    /// `.bad_type` and every other recorder path is unaffected.
+    rec_heap: ?*const gc.Heap = null,
     /// Shared machine-code arena — all tier-1b native traces are co-located slices of
     /// this (P-D of the exit-branch-patching port, doc 17). Replaces the old one-
     /// `mmap`-per-trace model so a future increment can link trace→trace with a bare
@@ -11546,9 +11584,13 @@ pub const TraceState = struct {
                 },
                 // `int_of_float` reads its sole float operand `a` (a prior node).
                 .int_of_float => std.debug.assert(ins.a < i),
-                // `guard_pure` reads the callee ref `a`; `fsqrt` reads its float
+                // `alen` reads its sole table operand `a` (a prior node).
+                .alen => std.debug.assert(ins.a < i),
+                // `fsin`/`fcos` read their sole float operand `a` (a prior node).
+                .fsin, .fcos => std.debug.assert(ins.a < i),
+                // `guard_builtin` reads the callee ref `a`; `fsqrt` reads its float
                 // operand `a` — both prior nodes.
-                .guard_pure, .fsqrt => std.debug.assert(ins.a < i),
+                .guard_builtin, .fsqrt => std.debug.assert(ins.a < i),
                 // `aref` pairs (table, index) into an address descriptor;
                 // `astore`/`astore_append` read the `aref` (`a`) and the value (`b`).
                 // `href` (table, key konst) and `hstore` (href, value) mirror them.
@@ -11706,6 +11748,24 @@ pub const TraceState = struct {
             // path (Phase B; in-bounds dense narrow-lane slot only); a constant
             // STRING key takes the hash-field path (doc 11, `obj.field`); anything
             // else aborts cleanly. The key type is observed at record time.
+            // `#R[b]` (doc 23 D3): a table records through the guarded `alen`
+            // producer; a konst string folds to its `cp_len` (code points — the
+            // `#s` semantic, deliberately distinct from `rawlen`'s bytes). A
+            // non-konst string stays unrecorded (`nyi_opcode`, as before — the
+            // guard vocabulary has no string pin).
+            .len => {
+                const v = regs.get(instr.b);
+                if (v.isHeap() and v.heapType() == .table) {
+                    try self.recAlenShape(instr.a, instr.b, .b, regs);
+                } else if (v.isHeap() and v.heapType() == .string) {
+                    const rstr = try self.refOf(instr.b);
+                    const kv = self.konstValueOf(rstr) orelse return self.abort(.nyi_opcode);
+                    if (!kv.isHeap() or kv.heapType() != .string) return self.abort(.nyi_opcode);
+                    const s = string_mod.String.fromHeader(kv.asHeap());
+                    self.setReg(instr.a, try self.konst(Value.int(@intCast(s.cp_len))));
+                } else return self.abort(.nyi_opcode);
+            },
+
             // NUMBER covers the integral-float key (`v[j]` with `j` from float
             // division) — `recArrayGet` narrows it via `keyRefNarrowed` or aborts
             // `.bad_type` for a fractional float, same net abort as before.
@@ -11765,10 +11825,11 @@ pub const TraceState = struct {
     pub fn emit(self: *TraceState, ins: IrInstr) !Ref {
         var ins_mut = ins;
         switch (ins_mut.op) {
-            // `int_of_float` is value-producing but also side-exits, so it stamps
-            // its PC for exit-PC chaining like the type guards (its `aux` is unused
-            // for anything else — the result kind is `.int`, the operand is `a`).
-            .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float => {
+            // `int_of_float` and `alen` are value-producing but also side-exit, so
+            // they stamp their PC for exit-PC chaining like the type guards (their
+            // `aux` is unused for anything else — the result kind is `.int`, the
+            // operand is `a`).
+            .guard_int, .guard_float, .guard_number, .guard_true, .guard_false, .int_of_float, .alen => {
                 ins_mut.aux = @intCast(self.rec.cur_pc);
             },
             else => {},
@@ -11995,6 +12056,36 @@ pub const TraceState = struct {
         self.setReg(instr.a, r);
     }
 
+    // --- index-recording shapes (doc 23 D3) --------------------------------
+    //
+    // The `get_index`/`set_index` opcode arms and the call-shaped `rawget`/
+    // `rawset` builtins record the SAME guarded access — on a metatable-free
+    // table (which every shape re-proves with `guard_table` after aborting
+    // `.has_metatable` at record time) raw and non-raw access are one
+    // operation. So the cores are shape functions over an explicit slot frame:
+    // which guest register plays table/key/value/dest, plus how each guard's
+    // operand is designated in exit provenance (`.b`/`.c` for the opcodes,
+    // `.a1`/`.a2`/`.a3` — call args — for the builtins).
+
+    /// Slot frame for the read shapes: `dst` receives the loaded value.
+    const GetFrame = struct {
+        dst: u16,
+        tab: u16,
+        key: u16,
+        tab_od: OperandDesig,
+        key_od: OperandDesig,
+    };
+
+    /// Slot frame for the write shapes: `val` is the stored value's register.
+    const SetFrame = struct {
+        tab: u16,
+        key: u16,
+        val: u16,
+        tab_od: OperandDesig,
+        key_od: OperandDesig,
+        val_od: OperandDesig,
+    };
+
     /// Record `t[k]` (`get_index`, `dst=a b=table c=key`) as an array read.
     ///
     /// **Narrow lanes** (i8–i64/f64/u8/boolean): emits `guard_table` + `guard_lane`
@@ -12015,8 +12106,12 @@ pub const TraceState = struct {
     ///     `.nyi_opcode` (different guard/native path needed);
     ///   * element table has a metatable → `.has_metatable`.
     fn recArrayGet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
-        const vtab = regs.get(instr.b);
-        const vkey = regs.get(instr.c);
+        return self.arrayGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = instr.c, .tab_od = .b, .key_od = .c });
+    }
+
+    fn arrayGetShape(self: *TraceState, regs: RegWindow, f: GetFrame) !void {
+        const vtab = regs.get(f.tab);
+        const vkey = regs.get(f.key);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const idx = keyIndexOf(vkey) orelse return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
@@ -12039,11 +12134,11 @@ pub const TraceState = struct {
             if (elem_tbl.metatable != null) return self.abort(.has_metatable);
 
             const lane_ord: i32 = @intFromEnum(lane); // 0 for .value
-            const rtab = try self.refOf(instr.b);
-            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .b, .neutral);
-            self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .b, .neutral);
-            const rkey = try self.keyRefNarrowed(instr.c, .c, vkey);
-            if (try self.forwardPendingArrayLoad(instr.a, rtab, rkey, idx)) return;
+            const rtab = try self.refOf(f.tab);
+            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
+            self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, f.tab_od, .neutral);
+            const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
+            if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx)) return;
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
             self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
             // No guard_present: the `.value` lane has no presence bitmap — nil is
@@ -12058,21 +12153,21 @@ pub const TraceState = struct {
             // guard analogous to guard_int/guard_float for scalar loads — it side-exits
             // when the element's type changes between iterations. (tier-1a path.)
             self.stampProv(try self.emit(.{ .op = .guard_table, .a = rload }), .element_type, .loaded, .neutral);
-            self.setReg(instr.a, rload);
+            self.setReg(f.dst, rload);
             return;
         }
 
         const lane_ord: i32 = @intFromEnum(lane);
-        const rtab = try self.refOf(instr.b);
-        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .b, .neutral);
-        self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .b, .neutral);
-        const rkey = try self.keyRefNarrowed(instr.c, .c, vkey);
-        if (try self.forwardPendingArrayLoad(instr.a, rtab, rkey, idx)) return;
+        const rtab = try self.refOf(f.tab);
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, f.tab_od, .neutral);
+        const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
+        if (try self.forwardPendingArrayLoad(f.dst, rtab, rkey, idx)) return;
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
         self.stampProv(try self.emit(.{ .op = .guard_present, .a = ref }), .present, .none, .neutral);
         const rload = try self.emit(.{ .op = .aload, .a = ref, .aux = lane_ord, .ty = obsTypeOf(loaded) });
-        self.setReg(instr.a, rload);
+        self.setReg(f.dst, rload);
     }
 
     /// Resolve an array load against the recorder's deferred-store buffer using
@@ -12227,6 +12322,10 @@ pub const TraceState = struct {
     ///     control channels with one obviously-sound rule. nsieve's sieve-clearing
     ///     loop is a pure write of `false` (no `aload`), so the rule costs it nothing.
     fn recArraySet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        return self.arraySetShape(regs, .{ .tab = instr.a, .key = instr.b, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c });
+    }
+
+    fn arraySetShape(self: *TraceState, regs: RegWindow, f: SetFrame) !void {
         // NB (Gap C): unlike the single-store original, a store arriving while other
         // stores are already deferred is NOT blanket-aborted here. An in-bounds RMW
         // store appends to `pending_stores` (the in-bounds path below); an *append*
@@ -12234,9 +12333,9 @@ pub const TraceState = struct {
         // The pending-store checks live at those two sites, not at the top,
         // because we cannot tell append-vs-in-bounds until we know `idx`/`len` below.
         // See `docs/design/08-multi-store-sinking.md`.
-        const vtab = regs.get(instr.a);
-        const vkey = regs.get(instr.b);
-        const vval = regs.get(instr.c);
+        const vtab = regs.get(f.tab);
+        const vkey = regs.get(f.key);
+        const vval = regs.get(f.val);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const idx = keyIndexOf(vkey) orelse return self.abort(.bad_type);
         if (vval.isNil()) return self.abort(.bad_type); // hole-punch — out of scope
@@ -12275,12 +12374,12 @@ pub const TraceState = struct {
             // covers "append after a sunk store" — an append changes `len` and is
             // never deferred; `docs/design/08-multi-store-sinking.md` §soundness.)
             if (self.traceHasHeapLoad()) return self.abort(.bad_type);
-            const rval = try self.refOf(instr.c);
+            const rval = try self.refOf(f.val);
             const lane_ord: i32 = @intFromEnum(lane);
-            const rtab = try self.refOf(instr.a);
-            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .a, .neutral);
-            self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .a, .neutral);
-            const rkey = try self.keyRefNarrowed(instr.b, .b, vkey);
+            const rtab = try self.refOf(f.tab);
+            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
+            self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, f.tab_od, .neutral);
+            const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
             // guard_append: hash-empty + `idx==asize` + `asize<cap`. The grow analogue
             // of guard_bounds — side-exits to tier-0 (which reallocs/migrates) when
@@ -12288,7 +12387,7 @@ pub const TraceState = struct {
             self.stampProv(try self.emit(.{ .op = .guard_append, .a = ref }), .append_precond, .none, .neutral);
             // guard_fits: the value still fits the narrow lane (the oracle re-checks a
             // free-variable store; native bool already proves `.bool`). Same as astore.
-            self.stampProv(try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord }), .value_fits, .c, .neutral);
+            self.stampProv(try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord }), .value_fits, f.val_od, .neutral);
             _ = try self.emit(.{ .op = .astore_append, .a = ref, .b = rval, .aux = lane_ord });
             return;
         }
@@ -12313,13 +12412,13 @@ pub const TraceState = struct {
         // because it changes shape. A pure-write store (no prior `aload`) is
         // deopt-idempotent and emits inline as before.
         const defer_store = self.traceHasHeapLoad();
-        const rval = try self.refOf(instr.c);
+        const rval = try self.refOf(f.val);
 
         const lane_ord: i32 = @intFromEnum(lane);
-        const rtab = try self.refOf(instr.a);
-        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .a, .neutral);
-        self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, .a, .neutral);
-        const rkey = try self.keyRefNarrowed(instr.b, .b, vkey);
+        const rtab = try self.refOf(f.tab);
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_lane, .a = rtab, .aux = lane_ord }), .container_lane, f.tab_od, .neutral);
+        const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
         // Guard at runtime that the value still fits the recorded narrow lane: a
@@ -12334,7 +12433,7 @@ pub const TraceState = struct {
         // above, so `lane` here is always narrow.) For the bool lane native lowers
         // this to nothing — the value is already proven `.bool` at analysis time —
         // but the oracle, which runs the raw trace, still needs the runtime check.
-        self.stampProv(try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord }), .value_fits, .c, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord }), .value_fits, f.val_od, .neutral);
         // No `guard_present`: `astore` *creates* presence (the slot is in-bounds by
         // `guard_bounds`; storing a non-nil value sets the presence bit). The store
         // is effectful and not register-defining, so nothing is `setReg`'d.
@@ -12557,8 +12656,12 @@ pub const TraceState = struct {
     ///     proven NO falls through to the heap read, and only the ambiguous
     ///     same-key/different-table-ref case aborts fail-closed.
     fn recHashGet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
-        const vtab = regs.get(instr.b);
-        const vkey = regs.get(instr.c);
+        return self.hashGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = instr.c, .tab_od = .b, .key_od = .c });
+    }
+
+    fn hashGetShape(self: *TraceState, regs: RegWindow, f: GetFrame) !void {
+        const vtab = regs.get(f.tab);
+        const vkey = regs.get(f.key);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         if (tbl.metatable != null) return self.abort(.has_metatable);
@@ -12578,17 +12681,17 @@ pub const TraceState = struct {
         // `load_const`), so its ref is provably the constant — no runtime key-
         // identity guard is needed and the cell is pinnable. A computed key reaches
         // here as a `slot_load`/arith ref and aborts (v1 scope).
-        const rkey = try self.refOf(instr.c);
+        const rkey = try self.refOf(f.key);
         if (self.rec.instrs.items[@intCast(rkey)].op != .konst) return self.abort(.bad_type);
 
-        const rtab = try self.refOf(instr.b);
+        const rtab = try self.refOf(f.tab);
         // Resolve against the deferred-store buffer BEFORE emitting the load chain
         // (doc 08 §2026-08-20): a MUST-alias forwards the pending value (the store
         // side already emitted `guard_table`/`href`/`guard_hash`/`guardNum` on this
         // same table ref + key konst, so no chain is re-emitted here), NO keeps
         // scanning / falls through to the heap read, MAY aborts fail-closed.
-        if (self.forwardPendingHashLoad(instr.a, rtab, rkey)) return;
-        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .b, .neutral);
+        if (self.forwardPendingHashLoad(f.dst, rtab, rkey)) return;
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
         // Seed the loop-invariant cell pointer for native (H1); `href.aux` carries
         // the synthetic slab slot, or `-1` to mark "not seeded → native declines".
         // The tier-1a oracle ignores `aux`, so a `null` seed leaves H0 untouched.
@@ -12598,13 +12701,13 @@ pub const TraceState = struct {
         // Fused native producer-exit (A-i.3): native `href` side-exits at the address
         // node on cell-resolution failure (`nativegen.zig`), no `guard_*` — same guest
         // hash access as `guard_hash`, so it shares `(hash_struct, b)`.
-        self.stampProv(ref, .hash_struct, .b, .neutral);
-        self.stampProv(try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(count) }), .hash_struct, .b, .neutral);
+        self.stampProv(ref, .hash_struct, f.tab_od, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(count) }), .hash_struct, f.tab_od, .neutral);
         const rload = try self.emit(.{ .op = .hload, .a = ref, .ty = obsTypeOf(fv) });
         // Fused native producer-exit (A-i.3): native `hload` side-exits at the load on
         // a field-type change, no `guard_*` node — same site as the consumer guardNum.
         self.stampProv(rload, .field_type, .loaded, .neutral);
-        self.setReg(instr.a, rload);
+        self.setReg(f.dst, rload);
         // Decompose the tagged-cell load into a typed load + the existing consumer
         // type-guard (mirrors `slot_load` + `guardNum`): native lowers `hload` to a
         // tag-check + payload load of the guarded kind. The oracle returns the whole
@@ -12627,9 +12730,13 @@ pub const TraceState = struct {
     ///   * computed (non-`konst`) key → `.bad_type`;
     ///   * recorder allocation failure → `.alloc` (ordinary recording abort).
     fn recHashSet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
-        const vtab = regs.get(instr.a);
-        const vkey = regs.get(instr.b);
-        const vval = regs.get(instr.c);
+        return self.hashSetShape(regs, .{ .tab = instr.a, .key = instr.b, .val = instr.c, .tab_od = .a, .key_od = .b, .val_od = .c });
+    }
+
+    fn hashSetShape(self: *TraceState, regs: RegWindow, f: SetFrame) !void {
+        const vtab = regs.get(f.tab);
+        const vkey = regs.get(f.key);
+        const vval = regs.get(f.val);
         if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
         if (vval.isNil()) return self.abort(.bad_type); // delete — out of scope
         // Scalar-value restriction, the store mirror of `recHashGet`'s read rule: the
@@ -12641,14 +12748,14 @@ pub const TraceState = struct {
         const tbl = table_mod.Table.fromHeader(vtab.asHeap());
         if (tbl.metatable != null) return self.abort(.has_metatable);
         _ = tbl.fieldPtr(vkey) orelse return self.abort(.bad_type); // absent = insert
-        const rkey = try self.refOf(instr.b);
+        const rkey = try self.refOf(f.key);
         if (self.rec.instrs.items[@intCast(rkey)].op != .konst) return self.abort(.bad_type);
 
         // C1 / store-sinking, identical to `recArraySet`: a write following any heap
         // read is a read-modify-write that must be deferred below every guard so a
         // side-exit leaves it un-executed and deopt-replay applies it exactly once.
         const defer_store = self.traceHasHeapLoad();
-        const rval = try self.refOf(instr.c);
+        const rval = try self.refOf(f.val);
         // Pin the **store value's** type (int/float). A hash cell holds a full tagged
         // `Value` with no lane to constrain it, so this guard is the analogue of the
         // array path's `guard_fits`: it is the sole guarantee the field stays scalar
@@ -12660,17 +12767,17 @@ pub const TraceState = struct {
         // guards (truthiness `guard_true`/`guard_false` are emitted raw, never
         // registered), so a prior guard on this ref is necessarily a matching
         // `guard_int`/`guard_float`.
-        try self.guardNum(rval, vval, .value_type, .c);
-        const rtab = try self.refOf(instr.a);
-        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, .a, .neutral);
+        try self.guardNum(rval, vval, .value_type, f.val_od);
+        const rtab = try self.refOf(f.tab);
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, f.tab_od, .neutral);
         // Seed the cell pointer for native (H1) — see `recHashGet`. An RMW's read and
         // write `href`s dedup onto the same slot via `seedHashCell`.
         const count: u32 = @intCast(tbl.hash.count());
         const seed_slot = try self.seedHashCell(rtab, rkey, count);
         const ref = try self.emit(.{ .op = .href, .a = rtab, .b = rkey, .aux = if (seed_slot) |s| @as(i32, s) else -1 });
         // Fused native producer-exit (A-i.3): native `href` cell-resolution failure.
-        self.stampProv(ref, .hash_struct, .a, .neutral);
-        self.stampProv(try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(count) }), .hash_struct, .a, .neutral);
+        self.stampProv(ref, .hash_struct, f.tab_od, .neutral);
+        self.stampProv(try self.emit(.{ .op = .guard_hash, .a = ref, .aux = @intCast(count) }), .hash_struct, f.tab_od, .neutral);
         // `hstore` is effectful (overwrites the present cell in place) and defines no
         // register. A present-key overwrite never grows the map, so `guard_hash`
         // (population) stays sufficient. The store value's type is pinned by the
@@ -12690,11 +12797,22 @@ pub const TraceState = struct {
     /// `eq`/`ne`. First cut: numeric operands only (the common loop-condition
     /// case); other types abort.
     fn recEq(self: *TraceState, op: IrOp, instr: Instr, regs: RegWindow) !void {
+        const rb = try self.refOf(instr.b);
+        const rc = try self.refOf(instr.c);
+        // Konst×konst folds to a bool konst with zero runtime work — `Value.eql`
+        // at record time is exact for every type (interned strings compare by
+        // identity). This is what makes the `type(x) == "number"` idiom (doc 23)
+        // collapse entirely: both sides are konsts (the `type` fold and the proto
+        // constant), so the comparison — and via the branch guard on a constant,
+        // the whole test — vanishes from the trace body.
+        if (self.konstValueOf(rb)) |kb| if (self.konstValueOf(rc)) |kc| {
+            const equal = kb.eql(kc);
+            self.setReg(instr.a, try self.konst(Value.boolean(if (op == .eq) equal else !equal)));
+            return;
+        };
         const vb = regs.get(instr.b);
         const vc = regs.get(instr.c);
         if (!vb.isNumber() or !vc.isNumber()) return self.abort(.bad_type);
-        const rb = try self.refOf(instr.b);
-        const rc = try self.refOf(instr.c);
         try self.guardNum(rb, vb, .operand_type, .b);
         try self.guardNum(rc, vc, .operand_type, .c);
         const r = try self.emit(.{ .op = op, .a = rb, .b = rc, .ty = .boolean });
@@ -13019,14 +13137,13 @@ pub const TraceState = struct {
         if (!callee.isHeap()) return self.abort(.cross_frame);
         switch (callee.heapType()) {
             // A host call crosses the embedding boundary — heap effects we can't
-            // model on the trace — UNLESS the native is a pure deterministic builtin
-            // the JIT may inline as a dedicated leaf op (e.g. `math.sqrt`). Anything
-            // else stays the host barrier.
+            // model on the trace — UNLESS the native carries a `RecordedBuiltin`
+            // tag, i.e. the recorder knows how to record its calls (doc 23:
+            // fold-to-konst, reuse of the index shapes, or a leaf op/callout).
+            // Anything untagged stays the host barrier.
             .native => {
                 const nat = function.Native.fromHeader(callee.asHeap());
-                if (nat.pure) |pb| switch (pb) {
-                    .sqrt => return self.recPureSqrt(instr, regs),
-                };
+                if (nat.recorded) |rb| return self.recBuiltin(rb, instr, regs);
                 return self.abort(.host_barrier);
             },
             .function => {},
@@ -13093,37 +13210,379 @@ pub const TraceState = struct {
         self.rec.base_off = callee_base_off;
     }
 
-    /// Inline a `math.sqrt(x)` call (callee flagged `PureBuiltin.sqrt`, doc 12) as a
+    /// Dispatch a `.call` whose callee is a `RecordedBuiltin`-tagged native to
+    /// its per-builtin recorder arm (doc 23 D1 — lune's `recff_idmap`). The
+    /// common preamble here rejects dynamic windows once; each arm owns its own
+    /// arity (`instr.b`), result-count (`instr.c`), and observed-shape abort
+    /// matrix. Arms whose recorder has not landed yet abort `.host_barrier`,
+    /// byte-identical to the untagged path — a registry row only gains its
+    /// `.recorded` tag together with its arm, so those prongs are unreachable
+    /// until then and exist to keep the switch exhaustive as the enum grows.
+    fn recBuiltin(self: *TraceState, rb: function.RecordedBuiltin, instr: Instr, regs: RegWindow) !void {
+        // Dynamic argument or result windows (`reg_top`-driven multret) have no
+        // compile-time-fixed slot count to model — same rule as closure calls.
+        if (instr.b == bytecode.all_results) return self.abort(.cross_frame);
+        if (instr.c == bytecode.all_results) return self.abort(.cross_frame);
+        switch (rb) {
+            .sqrt => return self.recPureSqrt(instr, regs),
+            .type => return self.recBType(instr, regs),
+            .tostring => return self.recBTostring(instr, regs),
+            .tonumber => return self.recBTonumber(instr, regs),
+            .select => return self.recBSelect(instr),
+            .rawequal => return self.recBRawequal(instr, regs),
+            .rawlen => return self.recBRawlen(instr, regs),
+            .rawget => return self.recBRawget(instr, regs),
+            .rawset => return self.recBRawset(instr, regs),
+            .sin => return self.recFloatUnary(instr, regs, .sin, .fsin),
+            .cos => return self.recFloatUnary(instr, regs, .cos, .fcos),
+        }
+    }
+
+    // --- doc 23 D2: fold-to-konst builtin arms -----------------------------
+    //
+    // Shared discipline: the recorder runs BEFORE tier-0 executes the call, so a
+    // fold may never allocate a guest heap object — interned-string results go
+    // through `foldInternedStr` (read-only lookup, abort on miss; in steady state
+    // the hot-count threshold guarantees prior tier-0 iterations interned them).
+    // Guards follow the house rules: numeric pins via the *registered* `guardNum`
+    // (`guarded_refs` holds only numeric guards), heap-shape pins (`guard_table`,
+    // `guard_func`) emitted raw and deduped by CSE, builtin identity via
+    // `guardBuiltinCallee` (disjoint use of the registered set — a native-valued
+    // ref never carries a numeric guard).
+
+    /// The `Value` behind `ref` iff `ref` is a trace konst (else null). The
+    /// fold arms use this to recognize compile-time-constant arguments, whose
+    /// identity needs no runtime guard (konst refs are literals by construction).
+    pub fn konstValueOf(self: *const TraceState, ref: Ref) ?Value {
+        const ins = self.rec.instrs.items[@intCast(ref)];
+        if (ins.op != .konst) return null;
+        return self.rec.consts.items[@intCast(ins.aux)];
+    }
+
+    /// Fold an interned-string result: konst ref for `bytes`'s already-interned
+    /// string, or null when it is not interned yet or no heap channel exists
+    /// (bare test harness) — callers abort `.bad_type` and recording retries
+    /// later, by which time tier-0 has interned the value. NEVER interns.
+    fn foldInternedStr(self: *TraceState, bytes: []const u8) !?Ref {
+        const heap = self.rec_heap orelse return null;
+        const s = heap.internedLookup(bytes) orelse return null;
+        return try self.konst(Value.heap(&s.header));
+    }
+
+    /// `type(v)` — the result is a constant type-name string once the argument's
+    /// runtime type is pinned (doc 23 D2 table). Number/table/recorded-native/
+    /// closure observations pin with existing guards; string/nil/bool have no
+    /// guard vocabulary and abort (tier-0 owns them until a consumer justifies
+    /// new guards). The pins are deliberately *stronger* than `type()` needs
+    /// (`guardNum` pins int-vs-float; `guard_table` also demands no metatable;
+    /// `guard_func` pins the exact proto) — a drifting argument deopts and
+    /// re-records, which is conservative, never wrong.
+    fn recBType(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b != 1) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        try self.guardBuiltinCallee(instr.a, .type);
+        const arg_slot: u16 = @intCast(@as(usize, instr.a) + 1);
+        const argv = regs.get(arg_slot);
+        const arg_ref = try self.refOf(arg_slot);
+        if (self.konstValueOf(arg_ref) == null) {
+            if (argv.isNumber()) {
+                try self.guardNum(arg_ref, argv, .operand_type, .a1);
+            } else if (argv.isHeap()) switch (argv.heapType()) {
+                .table => {
+                    const tbl = table_mod.Table.fromHeader(argv.asHeap());
+                    if (tbl.metatable != null) return self.abort(.has_metatable);
+                    self.stampProv(try self.emit(.{ .op = .guard_table, .a = arg_ref }), .operand_type, .a1, .neutral);
+                },
+                .native => {
+                    const nat = function.Native.fromHeader(argv.asHeap());
+                    const tag = nat.recorded orelse return self.abort(.bad_type);
+                    try self.guardBuiltinCallee(arg_slot, tag);
+                },
+                .function => {
+                    const cl = function.Closure.fromHeader(argv.asHeap());
+                    if (!self.rec.guarded_refs.contains(arg_ref)) {
+                        try self.rec.guarded_refs.put(self.gpa, arg_ref, {});
+                        self.stampProv(try self.emit(.{ .op = .guard_func, .a = arg_ref, .aux = @bitCast(cl.proto.id) }), .callee_identity, .a1, .neutral);
+                    }
+                },
+                else => return self.abort(.bad_type),
+            } else return self.abort(.bad_type);
+        }
+        const kref = (try self.foldInternedStr(argv.typeName())) orelse return self.abort(.bad_type);
+        self.setReg(instr.a, kref);
+    }
+
+    /// `tostring(v)` — arc A records the **konst-argument fold only** (doc 23:
+    /// the allocating `tostr_int` path for non-konst arguments is arc B). Only
+    /// non-heap konsts fold: numbers/bools/nil can never carry a metatable
+    /// (`Vm.metatableOf` returns null for every non-heap value), so the
+    /// `__tostring` metacall tier-0's `bToString` probes first is statically
+    /// impossible and the scalar rendering is the whole story. A konst *string*
+    /// does NOT fold: strings share the mutable built-in string metatable, so a
+    /// runtime `__tostring` could appear with no guard to catch it.
+    /// The rendering goes through `io.writeValue` — the exact renderer
+    /// `bToString` uses — into a bounded stack buffer, then a read-only lookup.
+    fn recBTostring(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b != 1) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        const arg_ref = try self.refOf(@intCast(@as(usize, instr.a) + 1));
+        const kv = self.konstValueOf(arg_ref) orelse return self.abort(.bad_type);
+        if (kv.isHeap()) return self.abort(.bad_type);
+        try self.guardBuiltinCallee(instr.a, .tostring);
+        var buf: [128]u8 = undefined;
+        var w = io.Writer.fixed(&buf);
+        io.writeValue(&w, kv) catch unreachable; // scalars render in <32 bytes
+        const kref = (try self.foldInternedStr(w.buffered())) orelse return self.abort(.bad_type);
+        self.setReg(instr.a, kref);
+        _ = regs;
+    }
+
+    /// `tonumber(v[, base])` — konst arguments fold at record time through
+    /// `arith.toNumber`, the ONE conversion core shared with tier-0's
+    /// `bToNumber` (so the fold and the builtin can never disagree); the result
+    /// is an int/float/nil konst, never an interned string. A non-konst
+    /// observed-*number* 1-arg call is the identity: pin with `guardNum` and
+    /// pass the ref through. Everything else (non-konst strings — a guarded
+    /// runtime parse — and dynamic bases) aborts; tier-0 owns it.
+    fn recBTonumber(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.c != 1) return self.abort(.cross_frame);
+        if (instr.b < 1 or instr.b > 2) return self.abort(.cross_frame);
+        const arg_ref = try self.refOf(@intCast(@as(usize, instr.a) + 1));
+        const kv = self.konstValueOf(arg_ref);
+        if (instr.b == 2) {
+            const base_ref = try self.refOf(@intCast(@as(usize, instr.a) + 2));
+            const kb = self.konstValueOf(base_ref) orelse return self.abort(.bad_type);
+            const ka = kv orelse return self.abort(.bad_type);
+            try self.guardBuiltinCallee(instr.a, .tonumber);
+            self.setReg(instr.a, try self.konst(arith.toNumber(ka, kb)));
+            return;
+        }
+        if (kv) |ka| {
+            try self.guardBuiltinCallee(instr.a, .tonumber);
+            self.setReg(instr.a, try self.konst(arith.toNumber(ka, null)));
+            return;
+        }
+        const argv = regs.get(@intCast(@as(usize, instr.a) + 1));
+        if (!argv.isNumber()) return self.abort(.bad_type);
+        try self.guardBuiltinCallee(instr.a, .tonumber);
+        try self.guardNum(arg_ref, argv, .operand_type, .a1);
+        self.setReg(instr.a, arg_ref);
+    }
+
+    /// `select('#', a…)` — only the konst-`'#'` selector records: the arg count
+    /// is compile-time fixed (`instr.b − 1`; `instr.b` excludes the callee), so
+    /// the result is a constant with no runtime guard beyond the callee
+    /// identity — konst args need no re-proving. The numeric form (a slot
+    /// shuffle, multi-result) is a non-goal; vararg callers can't trace anyway
+    /// (`is_vararg` aborts in `recCall`).
+    fn recBSelect(self: *TraceState, instr: Instr) !void {
+        if (instr.c != 1) return self.abort(.cross_frame);
+        if (instr.b < 1) return self.abort(.cross_frame);
+        const sel_ref = try self.refOf(@intCast(@as(usize, instr.a) + 1));
+        const sel = self.konstValueOf(sel_ref) orelse return self.abort(.bad_type);
+        if (!sel.isHeap() or sel.heapType() != .string) return self.abort(.bad_type);
+        const bytes = string_mod.String.fromHeader(sel.asHeap()).bytes();
+        if (bytes.len != 1 or bytes[0] != '#') return self.abort(.bad_type);
+        try self.guardBuiltinCallee(instr.a, .select);
+        self.setReg(instr.a, try self.konst(Value.int(@as(i64, instr.b) - 1)));
+    }
+
+    /// `rawequal(a, b)` — the NaN-safe fold subset (doc 23 D2, codex catch #6:
+    /// `Value.eql` is false for NaN==NaN, so same-ref must NOT blindly fold
+    /// true). Konst×konst folds exactly; a same-ref pair folds true only once
+    /// the ref is *pinned non-float* — observed table → raw `guard_table`,
+    /// observed int → registered `guardNum` (pins int) — because a float (or
+    /// unguarded) same-ref could be NaN on a later entry. Everything else
+    /// aborts; a general value-compare op has no consumer yet.
+    fn recBRawequal(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b != 2) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        const ra = try self.refOf(@intCast(@as(usize, instr.a) + 1));
+        const rb2 = try self.refOf(@intCast(@as(usize, instr.a) + 2));
+        const ka = self.konstValueOf(ra);
+        const kb = self.konstValueOf(rb2);
+        if (ka != null and kb != null) {
+            try self.guardBuiltinCallee(instr.a, .rawequal);
+            self.setReg(instr.a, try self.konst(Value.boolean(ka.?.eql(kb.?))));
+            return;
+        }
+        if (ra != rb2) return self.abort(.bad_type);
+        const argv = regs.get(@intCast(@as(usize, instr.a) + 1));
+        if (argv.isInt()) {
+            try self.guardBuiltinCallee(instr.a, .rawequal);
+            try self.guardNum(ra, argv, .operand_type, .a1);
+        } else if (argv.isHeap() and argv.heapType() == .table) {
+            const tbl = table_mod.Table.fromHeader(argv.asHeap());
+            if (tbl.metatable != null) return self.abort(.has_metatable);
+            try self.guardBuiltinCallee(instr.a, .rawequal);
+            self.stampProv(try self.emit(.{ .op = .guard_table, .a = ra }), .operand_type, .a1, .neutral);
+        } else {
+            return self.abort(.bad_type); // float same-ref: NaN ~= NaN
+        }
+        self.setReg(instr.a, try self.konst(Value.boolean(true)));
+    }
+
+    /// `rawlen(v)` — arc A folds the konst-string case to its **byte** length
+    /// (`bRawLen` returns `String.len`; `#s` is `cp_len`, a different quantity
+    /// — codex catch #7, the two must never share an emission), and records an
+    /// observed table through the same guarded `alen` shape as `#t` (`bRawLen`
+    /// on a table is `Table.length()`, the identical border — and `rawget`-
+    /// style raw-vs-plain is moot since the shape aborts on any metatable).
+    fn recBRawlen(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b != 1) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        const arg_slot: u16 = @intCast(@as(usize, instr.a) + 1);
+        const argv = regs.get(arg_slot);
+        if (argv.isHeap() and argv.heapType() == .table) {
+            try self.guardBuiltinCallee(instr.a, .rawlen);
+            return self.recAlenShape(instr.a, arg_slot, .a1, regs);
+        }
+        const arg_ref = try self.refOf(arg_slot);
+        const kv = self.konstValueOf(arg_ref) orelse return self.abort(.bad_type);
+        if (!kv.isHeap() or kv.heapType() != .string) return self.abort(.bad_type);
+        try self.guardBuiltinCallee(instr.a, .rawlen);
+        const len = string_mod.String.fromHeader(kv.asHeap()).len;
+        self.setReg(instr.a, try self.konst(Value.int(@intCast(len))));
+    }
+
+    /// `rawget(t, k)` — records through the extracted index shapes (doc 23 D3).
+    /// On a metatable-free table raw and non-raw access are the same operation,
+    /// and the shapes abort `.has_metatable` at record time with `guard_table`
+    /// re-proving absence at runtime — so the reuse is sound rather than
+    /// assumed. Numeric key → array-get shape; string key → hash-get shape
+    /// (konst-key-only, enforced inside). Grid-lane tables abort `.bad_type`:
+    /// tier-0's raw access deflates grids, and a trace must not bake a
+    /// deflation (`guard_lane` deopts if a table becomes a grid between
+    /// entries). Provenance designates the call args (`.a1` table, `.a2` key).
+    fn recBRawget(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b != 2) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        const tab_slot: u16 = @intCast(@as(usize, instr.a) + 1);
+        const key_slot: u16 = @intCast(@as(usize, instr.a) + 2);
+        const vtab = regs.get(tab_slot);
+        if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
+        if (table_mod.Table.fromHeader(vtab.asHeap()).array.lane == .grid) return self.abort(.bad_type);
+        try self.guardBuiltinCallee(instr.a, .rawget);
+        const vkey = regs.get(key_slot);
+        if (vkey.isNumber())
+            try self.arrayGetShape(regs, .{ .dst = instr.a, .tab = tab_slot, .key = key_slot, .tab_od = .a1, .key_od = .a2 })
+        else if (isStringKey(vkey))
+            try self.hashGetShape(regs, .{ .dst = instr.a, .tab = tab_slot, .key = key_slot, .tab_od = .a1, .key_od = .a2 })
+        else
+            return self.abort(.bad_type);
+    }
+
+    /// `rawset(t, k, v)` — the write mirror of `recBRawget`, through the same
+    /// extracted shapes with the store-sinking discipline unchanged (a sunk
+    /// store commits below every guard exactly as for `set_index`). A nil/NaN
+    /// key falls out naturally: nil is neither number nor string key (abort),
+    /// NaN fails `keyIndexOf` inside the array shape — tier-0 owns the error.
+    /// The statement-tolerant arm (doc 23 D1): `c ∈ {0,1}` — a statement call
+    /// (`rawset(t, k, v)` discarding the result, the common form, compiled
+    /// with `c == 0`) records the store alone; a value call (`c == 1`) also
+    /// defines the dest register with the table ref (tier-0 `bRawSet` returns
+    /// `args[0]`).
+    fn recBRawset(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b != 3) return self.abort(.cross_frame);
+        if (instr.c > 1) return self.abort(.cross_frame);
+        const tab_slot: u16 = @intCast(@as(usize, instr.a) + 1);
+        const key_slot: u16 = @intCast(@as(usize, instr.a) + 2);
+        const val_slot: u16 = @intCast(@as(usize, instr.a) + 3);
+        const vtab = regs.get(tab_slot);
+        if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
+        if (table_mod.Table.fromHeader(vtab.asHeap()).array.lane == .grid) return self.abort(.bad_type);
+        try self.guardBuiltinCallee(instr.a, .rawset);
+        const vkey = regs.get(key_slot);
+        if (vkey.isNumber())
+            try self.arraySetShape(regs, .{ .tab = tab_slot, .key = key_slot, .val = val_slot, .tab_od = .a1, .key_od = .a2, .val_od = .a3 })
+        else if (isStringKey(vkey))
+            try self.hashSetShape(regs, .{ .tab = tab_slot, .key = key_slot, .val = val_slot, .tab_od = .a1, .key_od = .a2, .val_od = .a3 })
+        else
+            return self.abort(.bad_type);
+        if (!self.isRecording()) return; // the shape aborted
+        if (instr.c == 1) self.setReg(instr.a, try self.refOf(tab_slot));
+    }
+
+    /// Record `#t` / `rawlen(t)` as the guarded `alen` producer (doc 23 D3):
+    /// `guard_table(t)` then `alen(t)`, whose own runtime check side-exits
+    /// unless the exact fast case holds (hash empty ∧ bitmap lane ∧ (asize ≤ 1 ∨
+    /// present(asize−1))). The record-time observation must already satisfy the
+    /// fast case — an already-failing shape would be an instant turnstile — and
+    /// `.value`/`.boolean`/grid lanes abort (their presence is in-band, so the
+    /// fast case can't certify the border without reading elements).
+    ///
+    /// Sunk-store hazard (codex #4): pending RMW stores flush only at commit,
+    /// below every guard — an `alen` recorded after one would read the
+    /// pre-store border on-trace. Conservative arc-A rule: ANY pending store
+    /// (any table) aborts; per-table refinement waits for a consumer.
+    fn recAlenShape(self: *TraceState, dst: u16, tab_slot: u16, tab_od: OperandDesig, regs: RegWindow) !void {
+        if (self.rec.pending_stores.items.len > 0) return self.abort(.bad_type);
+        const vtab = regs.get(tab_slot);
+        if (!vtab.isHeap() or vtab.heapType() != .table) return self.abort(.bad_type);
+        const tbl = table_mod.Table.fromHeader(vtab.asHeap());
+        if (tbl.metatable != null) return self.abort(.has_metatable);
+        if (tbl.hash.count() != 0) return self.abort(.bad_type);
+        if (!tbl.array.lane.scalarPresenceLane()) return self.abort(.bad_type);
+        const asize = tbl.array.asize;
+        if (asize > 1 and !tbl.array.isPresent(asize - 1)) return self.abort(.bad_type);
+        const rtab = try self.refOf(tab_slot);
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = rtab }), .container_type, tab_od, .neutral);
+        const r = try self.emit(.{ .op = .alen, .a = rtab, .ty = .int });
+        self.stampProv(r, .border, tab_od, .neutral);
+        self.setReg(dst, r);
+    }
+
+    /// Emit `guard_builtin(callee, rb)` unless this callee ref already carries
+    /// one — re-proving, in both tiers, that the seeded callee is still this
+    /// exact builtin. The callee ref is the seeded loop-invariant input (so the
+    /// guard checks the same value `seedTraceInputs` re-resolves). Deduped
+    /// against `guarded_refs` — one SSA value, one identity check (a native
+    /// callee never carries a numeric type guard, so reusing the set is sound).
+    /// `aux` carries the `RecordedBuiltin` ordinal, not a PC.
+    fn guardBuiltinCallee(self: *TraceState, callee_slot: u16, rb: function.RecordedBuiltin) !void {
+        const callee_ref = try self.refOf(callee_slot);
+        if (!self.rec.guarded_refs.contains(callee_ref)) {
+            try self.rec.guarded_refs.put(self.gpa, callee_ref, {});
+            self.stampProv(try self.emit(.{ .op = .guard_builtin, .a = callee_ref, .aux = @intFromEnum(rb) }), .callee_pure, .a, .neutral);
+        }
+    }
+
+    /// Inline a `math.sqrt(x)` call (callee flagged `RecordedBuiltin.sqrt`, doc 12) as a
     /// leaf `fsqrt` producer instead of aborting `.host_barrier`. Emits, in order:
-    /// `guard_pure(callee)` (re-prove the seeded callee is still this exact builtin —
+    /// `guard_builtin(callee)` (re-prove the seeded callee is still this exact builtin —
     /// deduped like a type guard, LICM-hoistable since the callee is a once-seeded
-    /// loop invariant), `guard_float(arg)` (pin the float operand), then
+    /// loop invariant), a type guard pinning the numeric operand, then
     /// `fsqrt(arg)` whose result lands directly in the call's destination register.
     /// NO frame push / NO `recReturn`: `fsqrt` is a leaf producer — the single value
     /// the call site wants is `instr.a` itself, with no callee window to model.
     fn recPureSqrt(self: *TraceState, instr: Instr, regs: RegWindow) !void {
-        // One fixed arg, one fixed result. Dynamic windows (`all_results`) and any
-        // other arity have no leaf shape — abort, tier-0 owns the call.
+        return self.recFloatUnary(instr, regs, .sqrt, .fsqrt);
+    }
+
+    /// The shared float-leaf shape (doc 23 D4): `f(x)` with one fixed numeric
+    /// arg and one result inlines as `guard_builtin(callee)` + a type guard on
+    /// the arg + a leaf float-producer op (`fsqrt`/`fsin`/`fcos`) whose result
+    /// lands in the call's destination. One fixed arg, one fixed result — any
+    /// other arity has no leaf shape, abort, tier-0 owns the call.
+    ///
+    /// Numeric args only: the observed type (int or float) is pinned by
+    /// `guard_int`/`guard_float`, and an int operand is promoted by the SAME
+    /// operand-level discipline the float binary ops already use — tier-1a
+    /// `@floatFromInt`, native `cvtsi2sd` in `floatOperandToXmm`, both
+    /// round-to-nearest and bit-identical (partialsums' `sin(k)`/`sqrt(k)`
+    /// with an integer loop var is exactly this shape; doc 23 D4 note).
+    /// Anything non-numeric aborts `.bad_type`.
+    fn recFloatUnary(self: *TraceState, instr: Instr, regs: RegWindow, rb: function.RecordedBuiltin, op: IrOp) !void {
         if (instr.b != 1) return self.abort(.cross_frame);
         if (instr.c != 1) return self.abort(.cross_frame);
-        // v1 is float-only: a non-float arg (int included) aborts so tier-0 owns the
-        // int→float promotion. The observed-float arg is pinned by `guard_float`.
         const arg = regs.get(@intCast(@as(usize, instr.a) + 1));
-        if (!arg.isFloat()) return self.abort(.bad_type);
+        if (!arg.isFloat() and !arg.isInt()) return self.abort(.bad_type);
 
-        // `guard_pure` re-proves the callee identity. The callee ref is the seeded
-        // loop-invariant input (so the guard checks the same value `seedTraceInputs`
-        // re-resolves). Deduped against `guarded_refs` — one SSA value, one identity
-        // check (a native callee never carries a numeric type guard, so reusing the
-        // set is sound). `aux` carries the `PureBuiltin` ordinal, not a PC.
-        const callee_ref = try self.refOf(instr.a);
-        if (!self.rec.guarded_refs.contains(callee_ref)) {
-            try self.rec.guarded_refs.put(self.gpa, callee_ref, {});
-            self.stampProv(try self.emit(.{ .op = .guard_pure, .a = callee_ref, .aux = @intFromEnum(function.PureBuiltin.sqrt) }), .callee_pure, .a, .neutral);
-        }
+        try self.guardBuiltinCallee(instr.a, rb);
         const arg_ref = try self.refOf(@intCast(@as(usize, instr.a) + 1));
-        try self.guard(arg_ref, .guard_float, .operand_type, .a1);
-        const r = try self.emit(.{ .op = .fsqrt, .a = arg_ref, .ty = .float });
+        const g: IrOp = if (arg.isFloat()) .guard_float else .guard_int;
+        try self.guard(arg_ref, g, .operand_type, .a1);
+        const r = try self.emit(.{ .op = op, .a = arg_ref, .ty = .float });
         self.setReg(instr.a, r);
     }
 
@@ -13613,9 +14072,12 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .int_of_float,
         .guard_func,
         .fsqrt,
+        .alen,
+        .fsin,
+        .fcos,
         => try w.print("%{d}", .{ins.a}),
-        // `guard_pure` reads the callee `%a` and tags the builtin in `aux`.
-        .guard_pure => try w.print("%{d}  [{s}]", .{ ins.a, @tagName(@as(function.PureBuiltin, @enumFromInt(ins.aux))) }),
+        // `guard_builtin` reads the callee `%a` and tags the builtin in `aux`.
+        .guard_builtin => try w.print("%{d}  [{s}]", .{ ins.a, @tagName(@as(function.RecordedBuiltin, @enumFromInt(ins.aux))) }),
         .loop, .preheader => {},
         // `.link` (doc 15): terminal hand-off; `aux` is the inner root's anchor pc.
         .link => try w.print("-> {d}", .{ins.aux}),

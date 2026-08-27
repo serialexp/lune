@@ -249,7 +249,7 @@ comptime {
     // carry the fields even without an install slot) — this catches it at compile
     // time, not one install-site assert `manual`/restore/package paths would bypass.
     for (base_natives) |bn| {
-        if (bn.pure != null and bn.effect != null)
+        if (bn.recorded != null and bn.effect != null)
             @compileError("builtin '" ++ bn.name ++ "' sets both `pure` and `effect`; pure ⇒ !effect must hold (doc 17 H-4)");
     }
 }
@@ -1156,7 +1156,7 @@ pub const Vm = struct {
         const native = try self.heap.newNative(bn.func, bn.name);
         native.effect = bn.effect; // null for pure host calls (e.g. print)
         native.multi = bn.multi; // null unless the native can return ≥2 results
-        native.pure = bn.pure; // null unless a JIT-inlinable pure builtin (e.g. sqrt)
+        native.recorded = bn.recorded; // null unless a JIT-inlinable pure builtin (e.g. sqrt)
         if (bn.module) |mod| {
             const tbl = try self.getOrCreateModuleTable(mod);
             const fkey = try self.heap.internValue(bn.field.?);
@@ -2159,6 +2159,10 @@ pub const Vm = struct {
                 .get_global => self.globals.get(proto.constants[mi.b]),
                 else => Value.nil(),
             };
+            // Refresh the recorder's read-only heap channel (doc 23 D2) — the
+            // same supply-per-call pattern as `resolved`, so the recorder never
+            // holds a `*Heap` it wasn't just handed by its driver.
+            self.trace.rec_heap = &self.heap;
             self.trace.recordInstr(mi, regs, proto, @intCast(pc.*), resolved);
         }
         return i.op;

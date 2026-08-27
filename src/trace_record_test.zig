@@ -733,7 +733,7 @@ test "recArraySet virtual store buffer grows past the legacy four-store cap" {
     try testing.expectEqual(@as(usize, store_count), state.rec.pending_stores.items.len);
 }
 
-// --- pure-builtin tracing (math.sqrt → guard_pure/fsqrt, doc 12) --------------
+// --- pure-builtin tracing (math.sqrt → guard_builtin/fsqrt, doc 12) --------------
 
 /// A do-nothing `NativeFn` body for recorder unit tests: the recorder never
 /// *calls* the native (it inlines `fsqrt` directly), it only reads the heap
@@ -744,11 +744,11 @@ fn sqrtStub(ctx: *anyopaque, args: []const Value) anyerror!Value {
     return Value.nil();
 }
 
-test "recPureSqrt: sqrt(float) records guard_pure, guard_float, fsqrt" {
+test "recPureSqrt: sqrt(float) records guard_builtin, guard_float, fsqrt" {
     const gpa = testing.allocator;
     const nat = try function.Native.create(gpa, &sqrtStub, "math.sqrt");
     defer nat.destroy(gpa);
-    nat.pure = .sqrt;
+    nat.recorded = .sqrt;
 
     var state = TraceState.init(gpa);
     defer state.deinit();
@@ -761,12 +761,12 @@ test "recPureSqrt: sqrt(float) records guard_pure, guard_float, fsqrt" {
 
     try testing.expect(state.isRecording()); // a clean record — no abort
     const ops = state.rec.instrs.items;
-    // slot_load(callee), guard_pure, slot_load(arg), guard_float, fsqrt.
+    // slot_load(callee), guard_builtin, slot_load(arg), guard_float, fsqrt.
     try testing.expectEqual(@as(usize, 5), ops.len);
     try testing.expectEqual(IrOp.slot_load, ops[0].op);
-    try testing.expectEqual(IrOp.guard_pure, ops[1].op);
+    try testing.expectEqual(IrOp.guard_builtin, ops[1].op);
     try testing.expectEqual(@as(Ref, 0), ops[1].a); // guards the seeded callee ref
-    try testing.expectEqual(@as(i32, @intFromEnum(function.PureBuiltin.sqrt)), ops[1].aux);
+    try testing.expectEqual(@as(i32, @intFromEnum(function.RecordedBuiltin.sqrt)), ops[1].aux);
     try testing.expectEqual(IrOp.slot_load, ops[2].op);
     try testing.expectEqual(IrOp.guard_float, ops[3].op);
     try testing.expectEqual(@as(Ref, 2), ops[3].a); // guards the arg ref
@@ -781,7 +781,7 @@ test "recPureSqrt aborts: bad arity, non-float arg, and a non-pure native" {
     const gpa = testing.allocator;
     const sq = try function.Native.create(gpa, &sqrtStub, "math.sqrt");
     defer sq.destroy(gpa);
-    sq.pure = .sqrt;
+    sq.recorded = .sqrt;
     const plain = try function.Native.create(gpa, &sqrtStub, "print");
     defer plain.destroy(gpa); // pure == null
 
@@ -791,8 +791,9 @@ test "recPureSqrt aborts: bad arity, non-float arg, and a non-pure native" {
         .{ .callee = sq, .arg = Value.float(2.0), .b = 2, .c = 1, .why = .cross_frame },
         // x, y = sqrt(a): two results → no leaf shape.
         .{ .callee = sq, .arg = Value.float(2.0), .b = 1, .c = 2, .why = .cross_frame },
-        // sqrt(int): v1 is float-only; tier-0 owns the int→float promotion.
-        .{ .callee = sq, .arg = Value.int(4), .b = 1, .c = 1, .why = .bad_type },
+        // sqrt(nil): non-numeric arg — no leaf shape (an INT arg records:
+        // it promotes via the shared guard_int + cvtsi2sd discipline).
+        .{ .callee = sq, .arg = Value.nil(), .b = 1, .c = 1, .why = .bad_type },
         // print(x): a native with no `pure` tag stays the host barrier.
         .{ .callee = plain, .arg = Value.float(2.0), .b = 1, .c = 1, .why = .host_barrier },
     };
@@ -806,6 +807,616 @@ test "recPureSqrt aborts: bad arity, non-float arg, and a non-pure native" {
         try testing.expect(!state.isRecording());
         try testing.expectEqual(c.why, state.rec.abort_reason.?);
     }
+}
+
+test "recFloatUnary: sin/cos(float) record guard_builtin, guard_float, fsin/fcos" {
+    const gpa = testing.allocator;
+    const Case = struct { name: [:0]const u8, tag: function.RecordedBuiltin, op: IrOp };
+    const cases = [_]Case{
+        .{ .name = "math.sin", .tag = .sin, .op = .fsin },
+        .{ .name = "math.cos", .tag = .cos, .op = .fcos },
+    };
+    for (cases) |c| {
+        const nat = try function.Native.create(gpa, &sqrtStub, c.name);
+        defer nat.destroy(gpa);
+        nat.recorded = c.tag;
+
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+        // r0 = callee (+ result dest), r1 = arg (a float). `call r0, 1, 1`.
+        var regs = [_]Value{ Value.heap(&nat.header), Value.float(0.5), Value.nil() };
+        state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &proto, 0, Value.nil());
+
+        try testing.expect(state.isRecording()); // a clean record — no abort
+        const ops = state.rec.instrs.items;
+        // Same 5-op shape as fsqrt: slot_load(callee), guard_builtin,
+        // slot_load(arg), guard_float, fsin/fcos.
+        try testing.expectEqual(@as(usize, 5), ops.len);
+        try testing.expectEqual(IrOp.slot_load, ops[0].op);
+        try testing.expectEqual(IrOp.guard_builtin, ops[1].op);
+        try testing.expectEqual(@as(i32, @intFromEnum(c.tag)), ops[1].aux);
+        try testing.expectEqual(IrOp.guard_float, ops[3].op);
+        try testing.expectEqual(c.op, ops[4].op);
+        try testing.expectEqual(@as(Ref, 2), ops[4].a); // reads the arg ref
+        try testing.expectEqual(ObsType.float, ops[4].ty);
+        // The call's destination register holds the result (ref 4).
+        try testing.expectEqual(@as(Ref, 4), try state.refOf(0));
+    }
+}
+
+test "recFloatUnary: sin(int) records guard_int and promotes" {
+    const gpa = testing.allocator;
+    const nat = try function.Native.create(gpa, &sqrtStub, "math.sin");
+    defer nat.destroy(gpa);
+    nat.recorded = .sin;
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+
+    // sin(k) with an INT k — the partialsums shape (doc 23 D4 note): the
+    // observed int is pinned by guard_int and promoted inside the op.
+    var regs = [_]Value{ Value.heap(&nat.header), Value.int(3), Value.nil() };
+    state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &proto, 0, Value.nil());
+
+    try testing.expect(state.isRecording());
+    const ops = state.rec.instrs.items;
+    try testing.expectEqual(@as(usize, 5), ops.len);
+    try testing.expectEqual(IrOp.guard_int, ops[3].op); // int pin, not guard_float
+    try testing.expectEqual(IrOp.fsin, ops[4].op);
+    try testing.expectEqual(ObsType.float, ops[4].ty); // result is still a float
+}
+
+test "recFloatUnary aborts: sin(nil) bad_type, sin(a, b) cross_frame" {
+    const gpa = testing.allocator;
+    const nat = try function.Native.create(gpa, &sqrtStub, "math.sin");
+    defer nat.destroy(gpa);
+    nat.recorded = .sin;
+
+    const Case = struct { arg: Value, b: u16, c: u16, why: AbortReason };
+    const cases = [_]Case{
+        // sin(nil): non-numeric arg — no leaf shape.
+        .{ .arg = Value.nil(), .b = 1, .c = 1, .why = .bad_type },
+        // sin(a, b): two args → no leaf shape.
+        .{ .arg = Value.float(0.5), .b = 2, .c = 1, .why = .cross_frame },
+        // x, y = sin(a): two results → no leaf shape.
+        .{ .arg = Value.float(0.5), .b = 1, .c = 2, .why = .cross_frame },
+    };
+    for (cases) |c| {
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ Value.heap(&nat.header), c.arg, Value.nil() };
+        state.recordInstr(Instr.opABC(.call, 0, c.b, c.c), winRO(&regs), &proto, 0, Value.nil());
+        try testing.expect(!state.isRecording());
+        try testing.expectEqual(c.why, state.rec.abort_reason.?);
+    }
+}
+
+// --- doc 23 arc A: fold-to-konst builtin arms ------------------------------
+
+const gc = @import("gc.zig");
+
+/// Harness for the fold arms: a heap (for `internedLookup`), a builtin native
+/// carrying `tag`, and a recording state whose `rec_heap` channel is wired the
+/// way the dispatch loop wires it. `constants` become the proto's constant
+/// pool (for `load_const`-seeded konst arguments).
+const FoldHarness = struct {
+    heap: gc.Heap,
+    nat: *function.Native,
+    state: TraceState,
+    proto: Proto,
+
+    fn init(gpa: std.mem.Allocator, tag: function.RecordedBuiltin, constants: []const Value) !FoldHarness {
+        var h = FoldHarness{
+            .heap = gc.Heap.init(gpa),
+            .nat = try function.Native.create(gpa, &sqrtStub, "b"),
+            .state = TraceState.init(gpa),
+            .proto = Proto{ .code = &.{}, .name = "t", .num_registers = 8, .constants = constants },
+        };
+        h.nat.recorded = tag;
+        return h;
+    }
+
+    fn start(self: *FoldHarness, gpa: std.mem.Allocator) !void {
+        try self.state.rec.reset(gpa, .{ .proto = &self.proto, .pc = 0 }, self.proto.num_registers);
+        self.state.rec_heap = &self.heap;
+    }
+
+    fn deinit(self: *FoldHarness, gpa: std.mem.Allocator) void {
+        self.state.deinit();
+        self.nat.destroy(gpa);
+        self.heap.deinit();
+    }
+};
+
+test "recBType: type(int) folds to the interned 'number' konst under guard_int" {
+    const gpa = testing.allocator;
+    var h = try FoldHarness.init(gpa, .type, &.{});
+    defer h.deinit(gpa);
+    const number_s = try h.heap.intern("number");
+    try h.start(gpa);
+
+    const objs_before = h.heap.strtab_count;
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.int(7), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &h.proto, 0, Value.nil());
+
+    try testing.expect(h.state.isRecording());
+    // slot_load(callee), guard_builtin(type), slot_load(arg), guard_int, konst.
+    const ops = h.state.rec.instrs.items;
+    try testing.expectEqual(@as(usize, 5), ops.len);
+    try testing.expectEqual(IrOp.guard_builtin, ops[1].op);
+    try testing.expectEqual(@as(i32, @intFromEnum(function.RecordedBuiltin.type)), ops[1].aux);
+    try testing.expectEqual(IrOp.guard_int, ops[3].op);
+    try testing.expectEqual(IrOp.konst, ops[4].op);
+    // The dest holds the interned "number" string konst — the exact object.
+    const dest = h.state.konstValueOf(try h.state.refOf(0)).?;
+    try testing.expectEqual(@intFromPtr(&number_s.header), @intFromPtr(dest.asHeap()));
+    // The arc-A invariant: recording created NO guest heap object.
+    try testing.expectEqual(objs_before, h.heap.strtab_count);
+}
+
+test "recBType: lookup miss aborts .bad_type and allocates nothing (the arc-A invariant)" {
+    const gpa = testing.allocator;
+    var h = try FoldHarness.init(gpa, .type, &.{});
+    defer h.deinit(gpa);
+    // "number" is deliberately NOT interned: the fold must abort, never intern.
+    try h.start(gpa);
+    const objs_before = h.heap.strtab_count;
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.int(7), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(!h.state.isRecording());
+    try testing.expectEqual(AbortReason.bad_type, h.state.rec.abort_reason.?);
+    try testing.expectEqual(objs_before, h.heap.strtab_count);
+}
+
+test "recBType: metatable'd table aborts; plain table folds 'table' under guard_table" {
+    const gpa = testing.allocator;
+    var h = try FoldHarness.init(gpa, .type, &.{});
+    defer h.deinit(gpa);
+    _ = try h.heap.intern("table");
+
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    const mt = try table_mod.Table.create(gpa);
+    defer mt.destroy(gpa);
+
+    // Plain table: records guard_table + konst("table").
+    try h.start(gpa);
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.heap(&t.header), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    const ops = h.state.rec.instrs.items;
+    try testing.expectEqual(IrOp.guard_table, ops[3].op);
+
+    // Metatable'd table: no guard can express "table WITH metatable" — abort.
+    t.metatable = mt;
+    var h2 = try FoldHarness.init(gpa, .type, &.{});
+    defer h2.deinit(gpa);
+    _ = try h2.heap.intern("table");
+    try h2.start(gpa);
+    var regs2 = [_]Value{ Value.heap(&h2.nat.header), Value.heap(&t.header), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h2.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs2), &h2.proto, 0, Value.nil());
+    try testing.expect(!h2.state.isRecording());
+    try testing.expectEqual(AbortReason.has_metatable, h2.state.rec.abort_reason.?);
+}
+
+test "recBSelect: konst '#' selector folds to the fixed arg count; non-konst aborts" {
+    const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    const hash_s = try heap.intern("#");
+    const consts = [_]Value{Value.heap(&hash_s.header)};
+
+    var h = try FoldHarness.init(gpa, .select, &consts);
+    defer h.deinit(gpa);
+    try h.start(gpa);
+    // r1 = konst "#" (load_const), then select('#', a, b, c): call r0, 4, 1.
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.heap(&hash_s.header), Value.int(10), Value.int(20), Value.int(30), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(.{ .op = .load_const, .a = 1, .b = 0 }, winRO(&regs), &h.proto, 0, Value.nil());
+    h.state.recordInstr(Instr.opABC(.call, 0, 4, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    const dest = h.state.konstValueOf(try h.state.refOf(0)).?;
+    try testing.expectEqual(@as(i64, 3), dest.asInt());
+
+    // Non-konst selector (a live register holding "#"): abort — the identity
+    // would need a runtime guard the vocabulary doesn't have.
+    var h2 = try FoldHarness.init(gpa, .select, &consts);
+    defer h2.deinit(gpa);
+    try h2.start(gpa);
+    var regs2 = [_]Value{ Value.heap(&h2.nat.header), Value.heap(&hash_s.header), Value.int(10), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h2.state.recordInstr(Instr.opABC(.call, 0, 2, 1), winRO(&regs2), &h2.proto, 0, Value.nil());
+    try testing.expect(!h2.state.isRecording());
+    try testing.expectEqual(AbortReason.bad_type, h2.state.rec.abort_reason.?);
+}
+
+test "recBTonumber: konst string folds via arith.toNumber; observed number passes through" {
+    const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    const hex = try heap.intern("0x1F");
+    const consts = [_]Value{Value.heap(&hex.header)};
+
+    // Konst fold: tonumber("0x1F") → konst int 31 (no interning — result is an int).
+    var h = try FoldHarness.init(gpa, .tonumber, &consts);
+    defer h.deinit(gpa);
+    try h.start(gpa);
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.heap(&hex.header), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(.{ .op = .load_const, .a = 1, .b = 0 }, winRO(&regs), &h.proto, 0, Value.nil());
+    h.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    try testing.expectEqual(@as(i64, 31), h.state.konstValueOf(try h.state.refOf(0)).?.asInt());
+
+    // Pass-through: tonumber(x) on an observed int is the identity under guard_int.
+    var h2 = try FoldHarness.init(gpa, .tonumber, &.{});
+    defer h2.deinit(gpa);
+    try h2.start(gpa);
+    var regs2 = [_]Value{ Value.heap(&h2.nat.header), Value.int(9), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h2.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs2), &h2.proto, 0, Value.nil());
+    try testing.expect(h2.state.isRecording());
+    const ops = h2.state.rec.instrs.items;
+    try testing.expectEqual(IrOp.guard_int, ops[ops.len - 1].op); // arg pin; dest = arg ref
+    const arg_ref = try h2.state.refOf(1);
+    try testing.expectEqual(arg_ref, try h2.state.refOf(0));
+}
+
+test "recBRawequal: NaN pin — float same-ref aborts; table same-ref folds true; konsts fold" {
+    const gpa = testing.allocator;
+
+    // Same-ref float: rawequal(x, x) with x float must NOT fold (0/0 ~= 0/0).
+    var h = try FoldHarness.init(gpa, .rawequal, &.{});
+    defer h.deinit(gpa);
+    try h.start(gpa);
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.float(1.5), Value.float(1.5), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    // Seed slots 1 and 2 from the same source slot so both hold the same ref.
+    h.state.recordInstr(.{ .op = .move, .a = 2, .b = 1 }, winRO(&regs), &h.proto, 0, Value.nil());
+    h.state.recordInstr(Instr.opABC(.call, 0, 2, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(!h.state.isRecording());
+    try testing.expectEqual(AbortReason.bad_type, h.state.rec.abort_reason.?);
+
+    // Same-ref table folds true under guard_table.
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var h2 = try FoldHarness.init(gpa, .rawequal, &.{});
+    defer h2.deinit(gpa);
+    try h2.start(gpa);
+    var regs2 = [_]Value{ Value.heap(&h2.nat.header), Value.heap(&t.header), Value.heap(&t.header), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h2.state.recordInstr(.{ .op = .move, .a = 2, .b = 1 }, winRO(&regs2), &h2.proto, 0, Value.nil());
+    h2.state.recordInstr(Instr.opABC(.call, 0, 2, 1), winRO(&regs2), &h2.proto, 0, Value.nil());
+    try testing.expect(h2.state.isRecording());
+    try testing.expect(h2.state.konstValueOf(try h2.state.refOf(0)).?.asBool());
+
+    // Konst×konst folds exactly (ints via load_int).
+    var h3 = try FoldHarness.init(gpa, .rawequal, &.{});
+    defer h3.deinit(gpa);
+    try h3.start(gpa);
+    var regs3 = [_]Value{ Value.heap(&h3.nat.header), Value.int(5), Value.int(6), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h3.state.recordInstr(.{ .op = .load_int, .a = 1, .aux = 5 }, winRO(&regs3), &h3.proto, 0, Value.nil());
+    h3.state.recordInstr(.{ .op = .load_int, .a = 2, .aux = 6 }, winRO(&regs3), &h3.proto, 0, Value.nil());
+    h3.state.recordInstr(Instr.opABC(.call, 0, 2, 1), winRO(&regs3), &h3.proto, 0, Value.nil());
+    try testing.expect(h3.state.isRecording());
+    try testing.expect(!h3.state.konstValueOf(try h3.state.refOf(0)).?.asBool());
+}
+
+test "recBRawlen: konst string folds to BYTE length (vs #s cp_len — UTF-8 differential)" {
+    const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    const s = try heap.intern("héllo"); // 6 bytes, 5 code points
+    const consts = [_]Value{Value.heap(&s.header)};
+
+    var h = try FoldHarness.init(gpa, .rawlen, &consts);
+    defer h.deinit(gpa);
+    try h.start(gpa);
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.heap(&s.header), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(.{ .op = .load_const, .a = 1, .b = 0 }, winRO(&regs), &h.proto, 0, Value.nil());
+    h.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    // rawlen = String.len = 6 BYTES. (#s is cp_len = 5 — a different quantity;
+    // the two must never share an emission. Codex catch #7.)
+    try testing.expectEqual(@as(i64, 6), h.state.konstValueOf(try h.state.refOf(0)).?.asInt());
+}
+
+test "recBTostring: konst int folds via the shared renderer; konst string aborts (mutable string metatable)" {
+    const gpa = testing.allocator;
+    var h = try FoldHarness.init(gpa, .tostring, &.{});
+    defer h.deinit(gpa);
+    const s42 = try h.heap.intern("42");
+    try h.start(gpa);
+    const objs_before = h.heap.strtab_count;
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.int(42), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(.{ .op = .load_int, .a = 1, .aux = 42 }, winRO(&regs), &h.proto, 0, Value.nil());
+    h.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    const dest = h.state.konstValueOf(try h.state.refOf(0)).?;
+    try testing.expectEqual(@intFromPtr(&s42.header), @intFromPtr(dest.asHeap()));
+    try testing.expectEqual(objs_before, h.heap.strtab_count); // no allocation
+
+    // A konst STRING argument does not fold: the shared string metatable is
+    // mutable at runtime, so a `__tostring` could appear with no guard for it.
+    const hs = try h.heap.intern("x");
+    const consts = [_]Value{Value.heap(&hs.header)};
+    var h2 = try FoldHarness.init(gpa, .tostring, &consts);
+    defer h2.deinit(gpa);
+    try h2.start(gpa);
+    var regs2 = [_]Value{ Value.heap(&h2.nat.header), Value.heap(&hs.header), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h2.state.recordInstr(.{ .op = .load_const, .a = 1, .b = 0 }, winRO(&regs2), &h2.proto, 0, Value.nil());
+    h2.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs2), &h2.proto, 0, Value.nil());
+    try testing.expect(!h2.state.isRecording());
+    try testing.expectEqual(AbortReason.bad_type, h2.state.rec.abort_reason.?);
+}
+
+test "recBRawget: int key reuses the array-get shape under guard_builtin" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i * 10));
+
+    var h = try FoldHarness.init(gpa, .rawget, &.{});
+    defer h.deinit(gpa);
+    try h.start(gpa);
+    // rawget(t, 3): callee r0, table r1, key r2 → call r0, 2, 1.
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.heap(&t.header), Value.int(3), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(Instr.opABC(.call, 0, 2, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    const ops = h.state.rec.instrs.items;
+    // slot_load(callee), guard_builtin, then the get_index sequence verbatim:
+    // slot_load(tab), guard_table, guard_lane, slot_load(key), guard_int,
+    // aref, guard_bounds, guard_present, aload.
+    try testing.expectEqual(IrOp.guard_builtin, ops[1].op);
+    try testing.expectEqual(@as(i32, @intFromEnum(function.RecordedBuiltin.rawget)), ops[1].aux);
+    var found: [4]bool = @splat(false);
+    for (ops) |ins| switch (ins.op) {
+        .guard_table => found[0] = true,
+        .aref => found[1] = true,
+        .guard_present => found[2] = true,
+        .aload => found[3] = true,
+        else => {},
+    };
+    for (found) |g| try testing.expect(g);
+    // The dest register holds the aload result.
+    try testing.expectEqual(IrOp.aload, ops[@intCast(try h.state.refOf(0))].op);
+}
+
+test "recBRawset: int key reuses the array-set shape; dest is the table ref" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i * 10));
+
+    var h = try FoldHarness.init(gpa, .rawset, &.{});
+    defer h.deinit(gpa);
+    try h.start(gpa);
+    // rawset(t, 3, 99): callee r0, args r1..r3 → call r0, 3, 1.
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.heap(&t.header), Value.int(3), Value.int(99), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(Instr.opABC(.call, 0, 3, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    const ops = h.state.rec.instrs.items;
+    try testing.expectEqual(IrOp.guard_builtin, ops[1].op);
+    // In-bounds pure-write store (no prior load) emits astore inline.
+    var saw_store = false;
+    for (ops) |ins| {
+        if (ins.op == .astore) saw_store = true;
+    }
+    try testing.expect(saw_store);
+    // rawset returns the table: the dest ref is the table's slot_load.
+    const dest_ref = try h.state.refOf(0);
+    try testing.expectEqual(dest_ref, try h.state.refOf(1));
+}
+
+test "recBRawset: statement form (c == 0, the common case) records the store, defines no dest" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i * 10));
+
+    var h = try FoldHarness.init(gpa, .rawset, &.{});
+    defer h.deinit(gpa);
+    try h.start(gpa);
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.heap(&t.header), Value.int(3), Value.int(99), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(Instr.opABC(.call, 0, 3, 0), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    var saw_store = false;
+    for (h.state.rec.instrs.items) |ins| {
+        if (ins.op == .astore) saw_store = true;
+    }
+    try testing.expect(saw_store);
+    // No result: slot 0 keeps its callee ref (the slot_load at 0), not the table.
+    try testing.expectEqual(@as(Ref, 0), try h.state.refOf(0));
+}
+
+test "recBRawget: wrong arity and non-table abort without recording garbage" {
+    const gpa = testing.allocator;
+    const Case = struct { b: u16, arg1: Value, why: AbortReason };
+    const cases = [_]Case{
+        .{ .b = 1, .arg1 = Value.int(1), .why = .cross_frame }, // rawget(t) — one arg
+        .{ .b = 2, .arg1 = Value.int(1), .why = .bad_type }, // rawget(1, k) — non-table
+    };
+    for (cases) |c| {
+        var h = try FoldHarness.init(gpa, .rawget, &.{});
+        defer h.deinit(gpa);
+        try h.start(gpa);
+        var regs = [_]Value{ Value.heap(&h.nat.header), c.arg1, Value.int(1), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+        h.state.recordInstr(Instr.opABC(.call, 0, c.b, 1), winRO(&regs), &h.proto, 0, Value.nil());
+        try testing.expect(!h.state.isRecording());
+        try testing.expectEqual(c.why, h.state.rec.abort_reason.?);
+    }
+}
+
+test "len opcode: #t on a bitmap-lane table records guard_table + alen" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i * 10));
+    try testing.expect(t.array.lane.scalarPresenceLane());
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.nil() };
+    state.recordInstr(.{ .op = .len, .a = 0, .b = 1 }, winRO(&regs), &proto, 0, Value.nil());
+    try testing.expect(state.isRecording());
+    const ops = state.rec.instrs.items;
+    // slot_load(table), guard_table, alen.
+    try testing.expectEqual(@as(usize, 3), ops.len);
+    try testing.expectEqual(IrOp.guard_table, ops[1].op);
+    try testing.expectEqual(IrOp.alen, ops[2].op);
+    try testing.expectEqual(ObsType.int, ops[2].ty);
+    try testing.expectEqual(@as(Ref, 2), try state.refOf(0));
+}
+
+test "len opcode: alen abort matrix — in-band lane, hash border, pending store, metatable" {
+    const gpa = testing.allocator;
+
+    // Boolean lane: presence is in-band, the fast case can't certify the border.
+    {
+        const t = try table_mod.Table.create(gpa);
+        defer t.destroy(gpa);
+        var i: i64 = 1;
+        while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.boolean(true));
+        try testing.expectEqual(arr.Lane.boolean, t.array.lane);
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.nil() };
+        state.recordInstr(.{ .op = .len, .a = 0, .b = 1 }, winRO(&regs), &proto, 0, Value.nil());
+        try testing.expect(!state.isRecording());
+        try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
+    }
+
+    // Non-empty hash part: the border may continue past the array — abort.
+    {
+        const t = try table_mod.Table.create(gpa);
+        defer t.destroy(gpa);
+        var i: i64 = 1;
+        while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i));
+        try t.set(gpa, Value.int(1000), Value.int(1)); // hash-part key
+        try testing.expect(t.hash.count() != 0);
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.nil() };
+        state.recordInstr(.{ .op = .len, .a = 0, .b = 1 }, winRO(&regs), &proto, 0, Value.nil());
+        try testing.expect(!state.isRecording());
+        try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
+    }
+
+    // Pending sunk store (codex #4): `#t` after an RMW astore would read the
+    // pre-flush border on-trace — abort while pending_stores is non-empty.
+    {
+        const t = try table_mod.Table.create(gpa);
+        defer t.destroy(gpa);
+        var i: i64 = 1;
+        while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i));
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(3), Value.int(9) };
+        // A read arms deferral, then the RMW store sinks into pending_stores.
+        state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
+        state.recordInstr(Instr.opABC(.set_index, 1, 2, 3), winRO(&regs), &proto, 0, Value.nil());
+        try testing.expect(state.isRecording());
+        try testing.expect(state.rec.pending_stores.items.len == 1);
+        state.recordInstr(.{ .op = .len, .a = 0, .b = 1 }, winRO(&regs), &proto, 0, Value.nil());
+        try testing.expect(!state.isRecording());
+        try testing.expectEqual(AbortReason.bad_type, state.rec.abort_reason.?);
+    }
+
+    // Metatable: `__len` could fire — abort .has_metatable.
+    {
+        const t = try table_mod.Table.create(gpa);
+        defer t.destroy(gpa);
+        const mt = try table_mod.Table.create(gpa);
+        defer mt.destroy(gpa);
+        var i: i64 = 1;
+        while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i));
+        t.metatable = mt;
+        var state = TraceState.init(gpa);
+        defer state.deinit();
+        const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+        try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+        var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.nil() };
+        state.recordInstr(.{ .op = .len, .a = 0, .b = 1 }, winRO(&regs), &proto, 0, Value.nil());
+        try testing.expect(!state.isRecording());
+        try testing.expectEqual(AbortReason.has_metatable, state.rec.abort_reason.?);
+    }
+}
+
+test "recBRawlen: observed table records guard_builtin + guard_table + alen" {
+    const gpa = testing.allocator;
+    const t = try table_mod.Table.create(gpa);
+    defer t.destroy(gpa);
+    var i: i64 = 1;
+    while (i <= 8) : (i += 1) try t.set(gpa, Value.int(i), Value.int(i));
+
+    var h = try FoldHarness.init(gpa, .rawlen, &.{});
+    defer h.deinit(gpa);
+    try h.start(gpa);
+    var regs = [_]Value{ Value.heap(&h.nat.header), Value.heap(&t.header), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil(), Value.nil() };
+    h.state.recordInstr(Instr.opABC(.call, 0, 1, 1), winRO(&regs), &h.proto, 0, Value.nil());
+    try testing.expect(h.state.isRecording());
+    const ops = h.state.rec.instrs.items;
+    // slot_load(callee), guard_builtin, slot_load(tab), guard_table, alen.
+    try testing.expectEqual(@as(usize, 5), ops.len);
+    try testing.expectEqual(IrOp.guard_builtin, ops[1].op);
+    try testing.expectEqual(IrOp.alen, ops[4].op);
+    try testing.expectEqual(@as(Ref, 4), try h.state.refOf(0));
+}
+
+test "alen fast case is exactly Table.length() under its premises (differential)" {
+    const gpa = testing.allocator;
+    // Shapes: dense int (i8), wide int (i64), f64, u8, singleton, and post-append.
+    const Fill = struct { count: i64, mul: i64, float: bool };
+    const shapes = [_]Fill{
+        .{ .count = 1, .mul = 1, .float = false },
+        .{ .count = 8, .mul = 10, .float = false },
+        .{ .count = 100, .mul = 100000, .float = false }, // i64-ish lane
+        .{ .count = 33, .mul = 1, .float = true }, // f64 lane
+    };
+    for (shapes) |sh| {
+        const t = try table_mod.Table.create(gpa);
+        defer t.destroy(gpa);
+        var i: i64 = 1;
+        while (i <= sh.count) : (i += 1) {
+            const v = if (sh.float) Value.float(@as(f64, @floatFromInt(i)) * 1.5) else Value.int(i * sh.mul);
+            try t.set(gpa, Value.int(i), v);
+        }
+        // Premises of the fast case must hold for the shape to be comparable.
+        if (t.hash.count() != 0 or !t.array.lane.scalarPresenceLane()) continue;
+        const asize = t.array.asize;
+        if (asize > 1 and !t.array.isPresent(asize - 1)) continue;
+        const fast: i64 = if (asize == 0) 0 else @intCast(asize - 1);
+        try testing.expectEqual(t.length(), fast);
+    }
+}
+
+test "recEq: konst×konst folds to a bool konst (the type(x)=='number' collapse)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 4 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    var regs = [_]Value{ Value.nil(), Value.int(5), Value.int(5), Value.nil() };
+    state.recordInstr(.{ .op = .load_int, .a = 1, .aux = 5 }, winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(.{ .op = .load_int, .a = 2, .aux = 5 }, winRO(&regs), &proto, 0, Value.nil());
+    state.recordInstr(Instr.opABC(.eq, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
+    try testing.expect(state.isRecording());
+    // No guards, no eq op — just the two konst loads and the folded bool.
+    try testing.expect(state.konstValueOf(try state.refOf(0)).?.asBool());
+    for (state.rec.instrs.items) |ins| try testing.expect(ins.op == .konst);
 }
 
 test "per-guard PC recording: guard_int aux carries the bytecode PC" {
