@@ -105,6 +105,23 @@ compensating ones, and it pins nothing about intermediate state. Not urgent —
 these are genuinely non-empty and do constrain output — but if a subtle
 string/table bug ever slips past the suite, this is the first place to look.
 
+**Sweep result (2026-08-27), decided with Bart: accepted as-is.** A full
+suite sweep (all 28 benches × 3 tiers × LuaJIT, plus a halved-workload
+sensitivity probe) found no silent failures: every error class exits nonzero
+and `run.py` catches it, no stderr channels, refs ↔ discovery in lockstep, no
+orphaned benches, LuaJIT parity real everywhere. The one structural note:
+**scimark-lu and scimark-sparse checksums are cycle-count-insensitive** — LU
+re-factors a fresh copy each cycle and SPARSE overwrites `vy` each cycle, so
+the final state (fully folded) witnesses the last cycle only, and the ×cycles
+repetition is semantically dead. This is upstream scimark's own shape (Pall's
+suite discards even the flop counts) and is NOT a correctness hole — output
+equivalence is the contract, and work an engine can legally skip is not owed.
+It only matters if an engine ever grows cross-iteration store sinking / dead-
+loop elision strong enough to elide the repetition, which neither lune nor
+LuaJIT (15 years in) has; and doing so would announce itself as an absurd
+step-change in exactly these two board rows. If that day comes, the fix is a
+one-element-per-cycle fold into the checksum (~0.1% SPARSE, ~0.002% LU).
+
 ## DEFERRED (Aug 2026): further decomposition of trace.zig / interp.zig
 
 The test-suite extraction (LATEST-67) took the four biggest files down a lot,

@@ -41,6 +41,17 @@ local benchmarks = {}
 --     `floor` recovers EVERY fraction bit — the fold is 1-ulp sensitive;
 --   * every intermediate stays under 2^53, so it is exact both in LuaJIT's
 --     doubles and in Lua 5.4's integers, and `%d` renders it identically.
+-- KNOWN LIMIT (2026-08-27, deliberate): for LU and SPARSE the checksum is
+-- cycle-count-insensitive — LU re-factors a fresh copy of the same matrix
+-- each cycle and SPARSE overwrites `vy` each cycle, so the folded final state
+-- witnesses the LAST cycle's arithmetic only and the ×cycles repetition is
+-- semantically dead (FFT and SOR accumulate across cycles and are fully
+-- sensitive). That is upstream scimark's own shape, it is not a correctness
+-- hole (output equivalence is the contract), and it only becomes a benchmark-
+-- validity problem if an engine ever learns to elide the dead repetition —
+-- which would show up as an absurd step-change in these two board rows long
+-- before it fooled anyone. Details + the fix-if-ever-needed in TODO.md
+-- ("Weak-but-nonzero bench output coverage").
 local ck_state = nil
 
 local function ck_fold(acc, x)
