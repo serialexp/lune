@@ -582,7 +582,7 @@ pub fn restoreSnapshot(
 
     // A bare VM is the contract: an empty heap means restored ids and interned
     // bytes cannot collide with pre-seeded state.
-    if (vm.heap.object_count != 0 or vm.heap.next_obj_id != 0 or vm.heap.interned.count() != 0)
+    if (vm.heap.object_count != 0 or vm.heap.next_obj_id != 0 or vm.heap.strtab_count != 0)
         return error.HeapNotEmpty;
 
     var idmap = IdMap.init(gpa);
@@ -640,13 +640,11 @@ pub fn restoreSnapshot(
                 errdefer s.destroy(gpa);
                 // A valid snapshot interns one String per byte-sequence, so these
                 // bytes must be unseen. A corrupt snapshot with two strings sharing
-                // bytes (different ids) would overwrite the first mapping here and
-                // leave both objects linked — silently breaking the interning
-                // invariant. Reject it instead.
-                const gop = try vm.heap.interned.getOrPut(gpa, s.bytes());
-                // `errdefer s.destroy` above frees `s` on this error return.
-                if (gop.found_existing) return error.DuplicateInternedString;
-                gop.value_ptr.* = s;
+                // bytes (different ids) would leave two objects claiming the same
+                // interned identity — silently breaking the pointer-equality
+                // invariant. `internRestoredUnique` rejects that (and is failure-
+                // atomic; the `errdefer s.destroy` above frees `s` on the way out).
+                try vm.heap.internRestoredUnique(s);
                 vm.heap.linkRestored(&s.header, o.id);
                 break :blk &s.header;
             },

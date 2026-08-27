@@ -33,6 +33,18 @@ pub const String = extern struct {
     /// O(1). For all-ASCII content `cp_len == len`. Not serialized: restore goes
     /// through `create`, which recomputes it (no keyframe/schema change).
     cp_len: usize,
+    /// Intern-chain link: the next string in this string's `Heap.strtab` bucket
+    /// (lj_str.c shape — the interning table is a power-of-2 array of chain heads
+    /// threaded through the strings themselves, so interning allocates nothing
+    /// beyond the string). Owned entirely by `gc.zig`: set on intern, rebuilt
+    /// from scratch on every sweep, meaningless in between collections only to
+    /// the extent gc.zig says so.
+    ///
+    /// This is a WEAK edge, not a GC child: `blacken`/snapshot traversal must
+    /// never follow it (a string has no children), and table membership must
+    /// never keep a string alive — the sweep rebuild drops dead strings from the
+    /// chains by construction. Not serialized (runtime-private index state).
+    next_intern: ?*String,
     // `len` raw bytes follow here, inline, in the same allocation.
 
     /// The string's bytes (a view into this same allocation; valid as long as the
@@ -64,14 +76,25 @@ pub const String = extern struct {
     /// only — it does **not** intern or GC-link the object; the heap does that
     /// (`gc.zig`). Callers should go through `Heap.intern`, not here.
     pub fn create(gpa: std.mem.Allocator, content: []const u8) std.mem.Allocator.Error!*String {
-        const total = @sizeOf(String) + content.len;
+        return createWithHash(gpa, content, std.hash.Wyhash.hash(0, content));
+    }
+
+    /// `create` with the content hash already computed. For `Heap.intern`, which
+    /// has just hashed `content` to probe the intern table — the miss path must
+    /// not pay the hash twice. `hash` MUST be `Wyhash.hash(0, content)`; every
+    /// other caller goes through `create`, which guarantees it.
+    pub fn createWithHash(gpa: std.mem.Allocator, content: []const u8, hash: u64) std.mem.Allocator.Error!*String {
+        // Checked size: a hostile/huge length must fail as OOM, not wrap the
+        // allocation size (lune's counterpart of LuaJIT's LJ_MAX_STR guard).
+        const total = std.math.add(usize, @sizeOf(String), content.len) catch return error.OutOfMemory;
         const raw = try gpa.alignedAlloc(u8, std.mem.Alignment.of(String), total);
         const self: *String = @ptrCast(raw.ptr);
         self.* = .{
             .header = GcHeader.init(.string),
-            .hash = std.hash.Wyhash.hash(0, content),
+            .hash = hash,
             .len = content.len,
             .cp_len = countCodepoints(content),
+            .next_intern = null,
         };
         @memcpy(raw[@sizeOf(String) .. @sizeOf(String) + content.len], content);
         return self;

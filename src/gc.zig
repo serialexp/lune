@@ -85,10 +85,31 @@ pub const Heap = struct {
     /// observable rendering (`io.writeValue`) and, later, keyframe heap graphs —
     /// addresses are deliberately never observed (docs/design/02-determinism.md).
     next_obj_id: u32 = 0,
-    /// Interning table: content bytes → the unique `String`. Keys are the
-    /// interned strings' own bytes (stable for the object's lifetime). A swept
-    /// string is removed here so interning stays collectible.
-    interned: std.StringHashMapUnmanaged(*String) = .empty,
+    /// Interning table (lj_str.c shape): a power-of-2 array of bucket heads,
+    /// chained through `String.next_intern` — the unique object for given bytes
+    /// is found by stored hash + length + byte compare down one short chain.
+    ///
+    /// WHY NOT A `std.StringHashMapUnmanaged` (which this replaced, 2026-08-27):
+    /// the sweep de-interns every dead string, and under an open-addressing map
+    /// each remove leaves a tombstone that only a rehash reclaims — the stdlib's
+    /// own doc comment warns that this exact long-lived insert/delete pattern
+    /// degrades into "excessive probing". Measured: 82–89% of scalar's and
+    /// str_format's TOTAL runtime was `internValue` probe loops (12,896 ns/op in
+    /// an isolated churn harness vs 124 without removes). Chains threaded through
+    /// the strings themselves have no tombstones BY CONSTRUCTION — the sweep
+    /// rebuilds the chains from the survivors — and intern allocates nothing
+    /// beyond the string. Empty until the first intern (`Heap.init` stays
+    /// infallible); geometry is runtime-private (nothing iterates it, snapshots
+    /// serialize strings by bytes+id), so chain order and bucket count are
+    /// unobservable and the determinism story rests on the fixed-seed hash only.
+    ///
+    /// Trust model (explicit decision): no hash-flood hardening. LuaJIT's
+    /// SECURITY_STRHASH secondary hash needs a random seed; lune runs trusted
+    /// programs, and a recorded-then-replayed seed is the future path if that
+    /// ever changes.
+    strtab: []?*String = &.{},
+    /// Live entries in `strtab` (== interned strings on the object list).
+    strtab_count: usize = 0,
     /// Mark-phase worklist: the *gray* set (objects marked but whose children are
     /// not yet scanned). Pre-sized before each cycle so marking cannot allocate.
     /// Capacity is retained across cycles.
@@ -116,7 +137,9 @@ pub const Heap = struct {
         self.objects = null;
         self.object_count = 0;
         self.gray.deinit(self.gpa);
-        self.interned.deinit(self.gpa);
+        if (self.strtab.len != 0) self.gpa.free(self.strtab);
+        self.strtab = &.{};
+        self.strtab_count = 0;
     }
 
     fn link(self: *Heap, h: *GcHeader) void {
@@ -383,16 +406,108 @@ pub const Heap = struct {
         for (grids.items) |t| try self.deflateGridImpl(t, &cursor);
     }
 
+    /// Minimum bucket count. Power of two; also the lazy first allocation, so a
+    /// program that interns at all pays for 512 slots (4 KiB) once.
+    const strtab_min_size: usize = 512;
+
+    /// Look up `content` in the intern chains: the unique live `String`, or null.
+    /// A hit costs one hash + on average ≤1 chain hop (grow keeps load ≤ ~100%).
+    fn strtabLookup(self: *const Heap, content: []const u8, hash: u64) ?*String {
+        if (self.strtab.len == 0) return null;
+        var s = self.strtab[hash & (self.strtab.len - 1)];
+        while (s) |cur| : (s = cur.next_intern) {
+            if (cur.hash == hash and cur.len == content.len and std.mem.eql(u8, cur.bytes(), content))
+                return cur;
+        }
+        return null;
+    }
+
+    /// Push `s` at its bucket's head. Infallible; the caller has ensured capacity.
+    fn strtabInsert(self: *Heap, s: *String) void {
+        std.debug.assert(self.strtab.len != 0);
+        const idx = s.hash & (self.strtab.len - 1);
+        s.next_intern = self.strtab[idx];
+        self.strtab[idx] = s;
+        self.strtab_count += 1;
+    }
+
+    /// Make room for one more entry: lazy-allocate the minimum table, or grow ×2
+    /// when the load would pass 100% (LuaJIT's policy — average chain length
+    /// stays ~1). Growing rebuilds the chains by stored hash. The ONLY fallible
+    /// step of an intern miss besides the string allocation itself; on error
+    /// nothing has been mutated.
+    fn strtabEnsureCapacity(self: *Heap) std.mem.Allocator.Error!void {
+        if (self.strtab.len == 0) {
+            const nt = try self.gpa.alloc(?*String, strtab_min_size);
+            @memset(nt, null);
+            self.strtab = nt;
+            return;
+        }
+        if (self.strtab_count + 1 <= self.strtab.len) return;
+        // Cap: past 2^31 buckets just tolerate higher load (as LuaJIT does at
+        // LJ_MAX_STRTAB) rather than overflowing the shift.
+        if (self.strtab.len >= (@as(usize, 1) << 31)) return;
+        try self.strtabRebuild(self.strtab.len * 2);
+    }
+
+    /// Allocate a `new_len`-bucket table, re-chain every live string into it by
+    /// stored hash, and free the old table. `new_len` must be a power of two.
+    /// Transactional: on allocation failure the old table is untouched.
+    fn strtabRebuild(self: *Heap, new_len: usize) std.mem.Allocator.Error!void {
+        const nt = try self.gpa.alloc(?*String, new_len);
+        @memset(nt, null);
+        const mask = new_len - 1;
+        for (self.strtab) |head| {
+            var s = head;
+            while (s) |cur| {
+                const next = cur.next_intern; // save before overwriting the link
+                const idx = cur.hash & mask;
+                cur.next_intern = nt[idx];
+                nt[idx] = cur;
+                s = next;
+            }
+        }
+        self.gpa.free(self.strtab);
+        self.strtab = nt;
+    }
+
     /// Intern `content`: return the existing object for these bytes, or allocate,
     /// register, and return a new one. The returned string's bytes are a copy —
     /// `content` need not outlive the call.
+    ///
+    /// The miss path is transactional (codex review, 2026-08-27): every fallible
+    /// step — the string allocation and any table growth — happens before any
+    /// heap mutation, so an OOM can never leave a half-interned string or a
+    /// consumed object id behind.
     pub fn intern(self: *Heap, content: []const u8) std.mem.Allocator.Error!*String {
-        if (self.interned.get(content)) |existing| return existing;
-        const s = try String.create(self.gpa, content);
-        errdefer s.destroy(self.gpa); // map.put may fail before we link it
-        try self.interned.put(self.gpa, s.bytes(), s);
+        const h = std.hash.Wyhash.hash(0, content);
+        if (self.strtabLookup(content, h)) |existing| return existing;
+        const s = try String.createWithHash(self.gpa, content, h);
+        errdefer s.destroy(self.gpa);
+        try self.strtabEnsureCapacity();
+        // Infallible from here.
+        self.strtabInsert(s);
         self.link(&s.header);
         return s;
+    }
+
+    /// The interned `String` for `content`, or null if these bytes are not
+    /// currently interned. Read-only probe (tests, diagnostics) — program code
+    /// wants `intern`, which creates on miss.
+    pub fn internedLookup(self: *const Heap, content: []const u8) ?*String {
+        return self.strtabLookup(content, std.hash.Wyhash.hash(0, content));
+    }
+
+    /// Restore-only (keyframeser pass 1a): register an already-created `String`
+    /// in the intern chains, REJECTING duplicate bytes — a valid snapshot interns
+    /// one object per byte-sequence, and silently keeping two would break the
+    /// interning invariant (pointer equality). Does NOT GC-link or stamp an id;
+    /// the restorer does that with the snapshot's own id. Failure-atomic: on any
+    /// error the table is unchanged and `s` is untouched (the caller owns it).
+    pub fn internRestoredUnique(self: *Heap, s: *String) error{ OutOfMemory, DuplicateInternedString }!void {
+        if (self.strtabLookup(s.bytes(), s.hash) != null) return error.DuplicateInternedString;
+        try self.strtabEnsureCapacity();
+        self.strtabInsert(s);
     }
 
     /// Convenience: intern `content` and wrap it as a `Value`.
@@ -549,29 +664,63 @@ pub const Heap = struct {
     }
 
     /// Sweep: free every white (unreachable, unpinned) object and reset survivors
-    /// to white for the next cycle. Freed strings are de-interned first. Updates
-    /// `object_count` and the next trigger from the surviving population.
+    /// to white for the next cycle. Updates `object_count` and the next trigger
+    /// from the surviving population.
+    ///
+    /// The intern chains are REBUILT from the survivors during this same walk
+    /// (codex review, 2026-08-27) rather than unlinking each dead string from its
+    /// bucket: per-dead unlinking walks the chain to find a predecessor, which in
+    /// a bucket with k interleaved live/dead strings is O(k²) across the sweep —
+    /// the rebuild is O(buckets + objects), on top of a walk we are already
+    /// doing. Mid-walk the chains are transiently inconsistent (cleared, then
+    /// refilled survivor by survivor); that is fine because a sweep is atomic
+    /// with respect to interning — nothing can call `intern` until it returns.
+    /// Infallible by contract (`beginCollect` is a collection's only fallible
+    /// step): the rebuild reuses the existing bucket array, and the optional
+    /// shrink below treats OOM as "keep the current table".
     pub fn sweep(self: *Heap) void {
+        @memset(self.strtab, null);
+        var live_str: usize = 0;
         var slot: *?*GcHeader = &self.objects;
         var live: usize = 0;
         while (slot.*) |h| {
             if (h.color == .white and !h.flags.pinned) {
                 // Unreachable: unlink (leaving `slot` pointing at the successor)
-                // and free. De-intern strings so the table holds no dangling key.
+                // and free. Dead strings simply never re-enter the chains.
                 slot.* = h.next;
-                if (h.type == .string) {
-                    _ = self.interned.remove(String.fromHeader(h).bytes());
-                }
                 destroyObject(self.gpa, h);
             } else {
                 // Survivor (reachable, or pinned): reset to white and advance.
                 h.color = .white;
                 live += 1;
+                if (h.type == .string) {
+                    self.strtabInsert(String.fromHeader(h));
+                    live_str += 1;
+                }
                 slot = &h.next;
             }
         }
+        // `strtabInsert` recounted the survivors; overwrite rather than trusting
+        // the pre-sweep figure.
+        self.strtab_count = live_str;
         self.object_count = live;
         self.next_gc = @max(initial_gc_threshold, live * heap_growth);
+        self.strtabMaybeShrink();
+    }
+
+    /// Optional post-sweep maintenance: halve the bucket array when live entries
+    /// fall below a quarter of it (hysteresis against grow's 100%-load trigger:
+    /// a shrink needs the population to halve twice, a re-grow needs it to double
+    /// twice — sawtooth populations near a boundary do not thrash). One halving
+    /// per sweep. OOM keeps the current (larger) table — geometry is runtime-
+    /// private, so this costs memory, never correctness or determinism of output.
+    fn strtabMaybeShrink(self: *Heap) void {
+        if (self.strtab.len <= strtab_min_size) return;
+        if (self.strtab_count >= self.strtab.len / 4) return;
+        const new_len = @max(strtab_min_size, self.strtab.len / 2);
+        // strtabRebuild re-chains without touching strtab_count, which the sweep
+        // walk above has just recounted.
+        self.strtabRebuild(new_len) catch return;
     }
 };
 
@@ -752,6 +901,142 @@ test "collecting with no roots frees everything" {
     try collectWithRoots(&heap, &.{});
     try testing.expectEqual(@as(usize, 0), heap.object_count);
     try testing.expectEqual(@as(?*GcHeader, null), heap.objects);
+}
+
+/// Test-only chain integrity: every chained string sits in the bucket its hash
+/// names, the chain population equals `strtab_count`, and every member is on
+/// the GC object list. A dangling or misplaced link fails loudly here instead
+/// of as a later use-after-free.
+fn strtabCheckIntegrity(heap: *Heap) !void {
+    var chained: usize = 0;
+    for (heap.strtab, 0..) |head, idx| {
+        var s = head;
+        while (s) |cur| : (s = cur.next_intern) {
+            try testing.expectEqual(idx, cur.hash & (heap.strtab.len - 1));
+            chained += 1;
+            var on_list = false;
+            var it = heap.objects;
+            while (it) |h| : (it = h.next) {
+                if (h == &cur.header) {
+                    on_list = true;
+                    break;
+                }
+            }
+            try testing.expect(on_list);
+        }
+    }
+    try testing.expectEqual(heap.strtab_count, chained);
+}
+
+test "strtab: same-bucket collisions — dedupe holds, sweep keeps only the live interleaving" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+    _ = try heap.intern("prime the table"); // allocate the min-size strtab
+
+    // Find four distinct strings that share one bucket at the minimum size.
+    const mask = heap.strtab.len - 1;
+    var found: [4]*String = undefined;
+    var nfound: usize = 0;
+    var i: usize = 0;
+    const want_bucket = std.hash.Wyhash.hash(0, "c0") & mask;
+    var namebuf: [16]u8 = undefined;
+    while (nfound < 4) : (i += 1) {
+        const name = std.fmt.bufPrint(&namebuf, "c{d}", .{i}) catch unreachable;
+        if (std.hash.Wyhash.hash(0, name) & mask != want_bucket) continue;
+        found[nfound] = try heap.intern(name);
+        nfound += 1;
+    }
+    // All four are distinct objects in ONE chain, and re-interning dedupes.
+    try testing.expectEqual(found[0], try heap.intern(found[0].bytes()));
+    try testing.expectEqual(found[3], try heap.intern(found[3].bytes()));
+    try strtabCheckIntegrity(&heap);
+
+    // Kill 1 and 3, keep 0 and 2 — the interleaving the per-dead-unlink design
+    // handled worst. The rebuild sweep must keep exactly the survivors.
+    try collectWithRoots(&heap, &.{ &found[0].header, &found[2].header });
+    try testing.expectEqual(@as(?*String, found[0]), heap.internedLookup(found[0].bytes()));
+    try testing.expectEqual(@as(?*String, found[2]), heap.internedLookup(found[2].bytes()));
+    try testing.expectEqual(@as(usize, 2), heap.strtab_count);
+    try strtabCheckIntegrity(&heap);
+}
+
+test "strtab: grows past the minimum and every string stays reachable at the same pointer" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    var ptrs: [1500]*String = undefined;
+    var namebuf: [16]u8 = undefined;
+    for (0..ptrs.len) |i| {
+        const name = std.fmt.bufPrint(&namebuf, "g{d}", .{i}) catch unreachable;
+        ptrs[i] = try heap.intern(name);
+    }
+    try testing.expect(heap.strtab.len > strtab_min_for_test); // grew (512 → 1024 → 2048)
+    for (0..ptrs.len) |i| {
+        const name = std.fmt.bufPrint(&namebuf, "g{d}", .{i}) catch unreachable;
+        try testing.expectEqual(@as(?*String, ptrs[i]), heap.internedLookup(name));
+    }
+    try strtabCheckIntegrity(&heap);
+}
+
+const strtab_min_for_test = Heap.strtab_min_size;
+
+test "strtab: mass death shrinks the table back to minimum without losing survivors" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    var namebuf: [16]u8 = undefined;
+    var keep: [10]*String = undefined;
+    for (0..3000) |i| {
+        const name = std.fmt.bufPrint(&namebuf, "s{d}", .{i}) catch unreachable;
+        const s = try heap.intern(name);
+        if (i < keep.len) keep[i] = s;
+    }
+    try testing.expect(heap.strtab.len >= 4096);
+
+    // Each sweep halves at most once (hysteresis): 4096 → 2048 → 1024 → 512.
+    var roots: [10]*GcHeader = undefined;
+    for (keep, 0..) |s, i| roots[i] = &s.header;
+    for (0..4) |_| try collectWithRoots(&heap, &roots);
+    try testing.expectEqual(strtab_min_for_test, heap.strtab.len);
+    try testing.expectEqual(keep.len, heap.strtab_count);
+    for (keep) |s| try testing.expectEqual(@as(?*String, s), heap.internedLookup(s.bytes()));
+    try strtabCheckIntegrity(&heap);
+
+    // A dead string's bytes re-intern as a NEW object (fresh id above the old range).
+    const reborn = try heap.intern("s2999");
+    try testing.expect(reborn.header.id >= 3000);
+}
+
+test "strtab: interning distinguishes embedded-NUL strings and handles the empty string" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    const a = try heap.intern("a\x00b");
+    const b = try heap.intern("a\x00c");
+    try testing.expect(a != b);
+    try testing.expectEqual(a, try heap.intern("a\x00b"));
+    const empty = try heap.intern("");
+    try testing.expectEqual(empty, try heap.intern(""));
+    try testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "strtab: churn — unique interns across repeated stress sweeps stay correct" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    const pinned = try heap.intern("pinned survivor");
+    var namebuf: [24]u8 = undefined;
+    for (0..2000) |i| {
+        const name = std.fmt.bufPrint(&namebuf, "churn{d}", .{i}) catch unreachable;
+        _ = try heap.intern(name);
+        if (i % 100 == 99) {
+            try collectWithRoots(&heap, &.{&pinned.header});
+            try testing.expectEqual(@as(?*String, pinned), heap.internedLookup("pinned survivor"));
+        }
+    }
+    try collectWithRoots(&heap, &.{&pinned.header});
+    try testing.expectEqual(@as(usize, 1), heap.strtab_count);
+    try strtabCheckIntegrity(&heap);
 }
 
 test "a second cycle is stable (survivors reset to white)" {

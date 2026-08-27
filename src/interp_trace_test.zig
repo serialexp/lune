@@ -362,11 +362,11 @@ test "chunk rooting: releaseChunk unroots a retained chunk's constants" {
 
     try vm.retainChunk(cb.proto);
     _ = try vm.run(cc.proto); // stress GC — "releaselit" rooted by the retain
-    try testing.expect(vm.heap.interned.get("releaselit") != null);
+    try testing.expect(vm.heap.internedLookup("releaselit") != null);
 
     vm.releaseChunk(cb.proto);
     _ = try vm.run(cc.proto); // stress GC — now unrooted
-    try testing.expect(vm.heap.interned.get("releaselit") == null);
+    try testing.expect(vm.heap.internedLookup("releaselit") == null);
 }
 
 test "chunk rooting: releaseChunk preserves survivor order (orderedRemove, not swapRemove)" {

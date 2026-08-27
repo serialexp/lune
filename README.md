@@ -29,13 +29,13 @@ Ongoing campaign: every benchmark ≤1.2× LuaJIT. Current board (2026-08-27,
 rev `31ff9db`, 27 LuaJIT-comparable programs, best-of-5 wall clock; absolute
 times are machine-specific — compare ratios):
 
-- **Median: 5.6× LuaJIT.** Range 1.0× to 41×.
-- At or near parity already: `sieve_int` 1.03×, `nsieve` 1.06×,
-  `str_gsub` 1.45×, `field_hash` 1.67×.
-- The long tail (`scalar` 41×, `spectral-norm` 31×, `array3d` 27×,
-  `nbody` 22×) maps to known JIT-coverage gaps — builtin recording breadth,
-  nest coverage, return tracing — tracked in `CURRENT_TASK.md`, not to
-  codegen quality on covered code.
+- **Median: 5.3× LuaJIT.** Range 1.1× to 29×.
+- At or near parity already: `sieve_int` 1.12×, `nsieve` ~1.1×,
+  `str_gsub` 1.4×, `field_hash` ~1.6×.
+- The long tail (`spectral-norm` 29×, `array3d` 28×, `nbody` 22×,
+  `recursive-fib` 20×) maps to known JIT-coverage gaps — nest coverage,
+  builtin recording breadth, return tracing — tracked in `CURRENT_TASK.md`,
+  not to codegen quality on covered code.
 
 Every row is also a correctness check: all three tiers must agree
 byte-for-byte with each other and (where claimed) with LuaJIT on the same

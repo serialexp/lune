@@ -6,7 +6,11 @@ to Bart; this file + the design docs are the record.
 
 Campaign map (from --dump-aborts across the board, 2026-08-20): (1) builtin
 recording breadth — ffrecord beyond math.sqrt (scalar 37.6×, partialsums 6.9×,
-str_format 18.5× host_barrier call); (2) **[REFRAMED, see LATEST-72]**
+str_format 18.5× host_barrier call) — **CORRECTED 2026-08-27 (LATEST-84): the
+dominant cause of scalar's and str_format's gap was NOT ffrecord but the string
+interner (82–89% of runtime); fixed, scalar 4.0×/str_format 3.2×. ffrecord
+remains the lever for what's left of them (both now tier-0-bound on dispatch +
+builtin calls) and for partialsums**; (2) **[REFRAMED, see LATEST-72]**
 Pall-shape nest coverage — NOT "root-recording linkage" (the `.root` LINNER
 abort is Pall-faithful, lj_record.c 605–700); the real gaps are backend:
 heap φ writeback + seeded-trace seams + inner-root owner election (nbody
@@ -15,6 +19,62 @@ heap φ writeback + seeded-trace seams + inner-root owner election (nbody
 hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
+
+## Status 2026-08-27 (LATEST-84) — **scalar's 41× and str_format's 20.5× were ONE bug: the string interner. Replaced the std hash map with an lj_str.c-shape chained stringtable. scalar 4.0×, str_format 3.2×, board median 5.6× → 5.3×.**
+
+**Profile first, again.** Bart picked scalar (the worst row); the campaign map
+said "ffrecord breadth". `perf` said otherwise: **89.4% of scalar's and 82.2%
+of str_format's TOTAL runtime — both tiers — was `gc.Heap.internValue`.** The
+map's attribution was wrong; corrected in the header above.
+
+**Root cause.** `interned: std.StringHashMapUnmanaged(*String)` + GC sweep
+`remove()` per dead string. Open addressing turns every remove into a
+tombstone, and only a rehash reclaims them — the pinned stdlib's own doc
+comment names this exact insert/delete pattern as the degradation case. Free
+slots monotonically become tombstones, so every intern MISS (every new
+`tostring(i)` / `string.format` result) probes enormous clusters. Isolated
+harness (same map, intern-shaped churn): 124 ns/op without removes, **12,896**
+with, 41 with rehash-after-sweep. In-tree probe (one rehash line in sweep):
+scalar 251→25ms, str_format 563→95ms. Scaling is linear-with-huge-constant,
+NOT quadratic (periodic grows bound it) — my first prediction was wrong,
+measured before claiming.
+
+**Fix (Bart's call: no band-aid, structural).** lj_str.c's shape:
+`Heap.strtab` = power-of-2 bucket array chained through a new
+`String.next_intern` field (weak edge — never traversed by blacken/snapshot).
+Intern = stored-hash + len + memcmp down a ~1-length chain; miss allocates the
+string (hash threaded via `createWithHash`, no double hash) and pushes at the
+head — transactional, every fallible step before any mutation (codex).
+Grow ×2 at 100% load. **Sweep REBUILDS the chains from survivors during the
+existing walk** (codex's catch: per-dead unlink is O(k²) on an interleaved
+live/dead bucket; the rebuild is O(buckets+objects) and rides the walk we
+already do). Shrink = optional post-sweep maintenance, halve below 25%,
+OOM keeps the current table — `beginCollect` stays a collection's only
+fallible step. Lazy first allocation keeps `Heap.init` infallible.
+No hash-flood hardening (explicit trust-model decision, recorded at the field;
+recorded-seed is the future path). keyframeser restore: `internRestoredUnique`
+preserves the DuplicateInternedString rejection exactly (test at
+keyframeser_restore_test.zig:1234 still green untouched).
+
+**Measured (instruction counts, ±0.01% across reps, vs a HEAD shadow):**
+scalar t0 6.249B→0.617B (**10.1×**), str_format t0 13.92B→2.20B (**6.3×**),
+fft-jit −0.03%, binary-trees t0 ±0.00005%, nsieve-jit −0.02% — zero cost where
+strings don't churn. Board (quiet, 20260827-163810): scalar 41.0×→**4.0×**,
+str_format 20.5×→**3.2×**, median 5.6×→**5.3×**, 28/28 cross=ok, luajit all ok.
+(The 163235 board same rev is noisy — its LuaJIT column moved too; kept as
+history, read 163810.) A wall-clock "fft +6%" scare was ambient load —
+instruction counts killed it.
+
+**Post-fix scalar profile:** 44.5% dispatch, 12.4% lenValue, 10.1% bType —
+tier-0-bound on the untraceable builtin loop, which is the queued ffrecord arc
+(campaign item 1): the loop still aborts `host_barrier` at its first `type()`
+call. New worst rows: spectral-norm 29.4× (nyi_opcode for_prep/get_index —
+different lever), array3d 28.1×, nbody 22.1×.
+
+Gates: `just test` + `-Djit-debug=true` OK, hashgate 84/84 both legs, bench
+28/28. New tests: bucket-collision interleaved live/dead sweep, grow-past-min
+pointer stability, mass-death shrink to min, churn stress, embedded-NUL/empty,
+chain-integrity checker.
 
 ## Status 2026-08-27 (LATEST-83) — **the native path's dead executor-frame push is now lazy: LATEST-82's residual cost repaid with interest (fft-native −0.52%, lu-native −0.43% by instruction count).**
 
