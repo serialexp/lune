@@ -347,10 +347,12 @@ test "doc 24 c3: a snew-class string loop records, commits, and runs end-to-end 
     // class in one hot loop. Must RECORD (pre-c3 every string builtin aborted),
     // commit with the right `alloc_bound`, and produce byte-identical output
     // under the full pipeline (record -> tropt -> tier-1a/native execute).
-    // `native_codegen` is ON so the production compile decision runs — though
-    // THIS trace's `i % 10` keeps it on tier-1a (mod has no native lowering
-    // yet; TODO.md item 3). Native snew execution is proven at the
-    // nativegen_lowering_test level on mod-free traces.
+    // Tier-1a config, deliberately: THIS trace's `i % 10` has no native
+    // lowering yet (TODO.md item 3), and under `native_codegen` the safety
+    // net would decline entry ENTIRELY (skip, never tier-1a) — the loop
+    // would run tier-0 and the "executes end-to-end" claim would be vacuous.
+    // Native snew execution end-to-end is proven by the mod-free threshold-
+    // bouncing test (c4) and at the nativegen_lowering_test level.
     const gpa = testing.allocator;
     const parser = @import("parser.zig");
     const diag = @import("diag.zig");
@@ -403,7 +405,6 @@ test "doc 24 c3: a snew-class string loop records, commits, and runs end-to-end 
     vm.trace.config.enabled = true;
     vm.trace.config.execute = true;
     vm.trace.config.optimize = true;
-    vm.trace.config.native_codegen = true;
     vm.trace.config.hotloop = 4;
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
@@ -413,6 +414,9 @@ test "doc 24 c3: a snew-class string loop records, commits, and runs end-to-end 
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
     try testing.expectEqualStrings(truth[0..truth_len], sink.buffered());
+    // The committed allocating trace really EXECUTED (tier-1a) — not just
+    // recorded; entries==0 here would mean a vacuous tier-0-only comparison.
+    try testing.expect(vm.trace.entries > 0);
 
     var found = false;
     for (vm.trace.cache.items) |t| {
@@ -438,6 +442,203 @@ test "doc 24 c3: a snew-class string loop records, commits, and runs end-to-end 
         try testing.expectEqual(@as(usize, 1), n_guard_gc);
     }
     try testing.expect(found);
+}
+
+test "doc 24 c4: gc_stress forces allocating traces back to tier-0 with identical output" {
+    // Codex #1/#14: under `gc_stress` tier-0 collects at every safepoint; a
+    // native burst would skip those collections, so the `!gc_stress` entry
+    // conjunct must bounce EVERY entry of an allocating trace and the whole
+    // loop runs tier-0-pure — with byte-identical output.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local sub = string.sub
+        \\local rev = string.reverse
+        \\local base = "abcdefghijklmnop"
+        \\local u = 0
+        \\for i = 1, 200 do
+        \\  local t = sub(base, i % 8 + 1, i % 8 + 4)
+        \\  u = u + #rev(t) + #tostring(i)
+        \\end
+        \\print(u)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    // Tier-0 truth WITHOUT stress (stress never changes output, only pacing).
+    var truth: [64]u8 = undefined;
+    var truth_len: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        truth_len = sink.buffered().len;
+        @memcpy(truth[0..truth_len], sink.buffered());
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.heap.gc_stress = true;
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    // Tier-1a config, deliberately: the body's `%` has no native lowering, and
+    // under `native_codegen` the safety net would decline entry ENTIRELY
+    // (skip, never tier-1a) — masking the very guard_gc bounce this test pins.
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(truth[0..truth_len], sink.buffered());
+    // The dispatcher DID keep trying the trace — each entry bounced at the
+    // guard_gc header with zero allocations until the low-yield gate parked
+    // the anchor; tier-0 (collecting at every safepoint) did all the work.
+    try testing.expect(vm.trace.entries > 0);
+}
+
+test "doc 24 c4: observation blackout — an armed safepoint recorder keeps allocating traces OUT of the executors" {
+    // Codex #2: with `record_safepoint_lines` armed (keyframe/suspend
+    // observation), replay must see every tier-0 safepoint line — a native or
+    // tier-1a burst of an allocating trace would swallow them. The c2 trial-
+    // walk + driveChain skips must therefore decline entry entirely: the
+    // allocating trace still RECORDS and COMMITS (recording is entry-neutral),
+    // but `vm.trace.entries` stays 0 and the output is tier-0's.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local rep = string.rep
+        \\local char = string.char
+        \\local u = 0
+        \\for i = 1, 200 do
+        \\  u = u + #rep(char(65 + i % 26), i % 5)
+        \\end
+        \\print(u)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.record_safepoint_lines = true;
+    vm.source = source;
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    // Tier-1a config, deliberately: with `native_codegen` on, this mod-laden
+    // body would be declined by the native safety net regardless of the
+    // blackout, making the `entries == 0` assertion below vacuous. Under
+    // tier-1a config the ONLY thing keeping the trace out is the blackout
+    // (the gc_stress test above proves this config otherwise enters).
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings("400\n", sink.buffered()); // 40 x (0+1+2+3+4)
+
+    // The allocating trace committed…
+    var committed_alloc = false;
+    for (vm.trace.cache.items) |t| {
+        if (t.alloc_bound > 0) committed_alloc = true;
+    }
+    try testing.expect(committed_alloc);
+    // …but was never ENTERED (the blackout skip fires before the entry
+    // counter bump; this program has no other hot trace to muddy the count).
+    try testing.expectEqual(@as(u64, 0), vm.trace.entries);
+}
+
+test "doc 24 c4: threshold bouncing across real GC cycles — heap schedule and output identical across modes" {
+    // The "guard_gc failing after many committed bursts" leg at VM scale: an
+    // unbounded fresh-string loop (`tostring(i)` for 4000 distinct i) crosses
+    // `next_gc` repeatedly. Tier-0 collects at its dispatch safepoints; the
+    // traced run's guard_gc must bounce each crossing back to tier-0 so the
+    // COLLECTION SCHEDULE is reproduced exactly — asserted via output byte-
+    // identity AND final `object_count`/`next_gc`/`next_obj_id` equality.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local rev = string.reverse
+        \\local u = 0
+        \\for i = 1, 4000 do
+        \\  local s = tostring(i)
+        \\  local dead = rev(s)
+        \\  u = u + #dead
+        \\end
+        \\print(u)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var t0_out: [64]u8 = undefined;
+    var t0_len: usize = 0;
+    var t0_objs: usize = 0;
+    var t0_next_gc: usize = 0;
+    var t0_next_id: u64 = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        t0_len = sink.buffered().len;
+        @memcpy(t0_out[0..t0_len], sink.buffered());
+        t0_objs = vm.heap.object_count;
+        t0_next_gc = vm.heap.next_gc;
+        t0_next_id = vm.heap.next_obj_id;
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(t0_out[0..t0_len], sink.buffered());
+    try testing.expectEqual(t0_objs, vm.heap.object_count);
+    try testing.expectEqual(t0_next_gc, vm.heap.next_gc);
+    try testing.expectEqual(t0_next_id, vm.heap.next_obj_id);
+    // Sanity: the trace really RAN (mod-free body, so nothing declines it) —
+    // natively where the platform supports it. NB: a `%` anywhere in the loop
+    // would flip `native_codegen`'s safety net to "decline entirely" (mod has
+    // no lowering yet, TODO item 3) and silently turn this into a tier-0-only
+    // comparison; that vacuous variant was caught during authoring.
+    try testing.expect(vm.trace.entries > 0);
+    if (@import("nativegen.zig").is_x64_linux)
+        try testing.expect(vm.trace.native_entries > 0);
 }
 
 test "chunk rooting: a host-compiled retained chunk survives GC before it runs" {

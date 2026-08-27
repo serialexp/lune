@@ -21,7 +21,58 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
-## Status 2026-08-27 (LATEST-88, IN FLIGHT) — **arc B c3 LANDED: the snew class (ssub/srev/schar1/srep2 + guard_string native) records, optimizes, and runs NATIVELY end-to-end. str_manip's abort frontier moved from `sub` (first builtin) to `upper` (out of v1 by design, codex #10). c4 (adversarial matrix/board/docs) remains.**
+## Status 2026-08-28 (LATEST-89) — **arc B COMPLETE (c4): adversarial matrix + §T-A.2 acceptance green, board 28/28, doc 24 → landed. Next lever: mod/idiv native lowering (TODO item 3 — currently blocks scalar/e2e traces from native entirely via the safety net).**
+
+**c4 (this commit)** — the D9.2/D9.3 gates for the whole arc, plus docs:
+
+- **D9.2 adversarial matrix** (nativegen_lowering_test + interp_trace_test):
+  two-allocs-per-iteration headroom boundary (guard_gc declines entry when
+  only ONE would fit; minimal headroom exhausts identically across tiers);
+  intern-hit loop parked just below `next_gc` completes natively with
+  `object_count` unchanged; OOM injection via `std.testing.FailingAllocator`
+  (verified in pinned-toolchain source: `fail_index` is STICKY — allocation N
+  and all later ones fail) at fail points {3,5,8,13,21} → tier-equal
+  completed/exit_instr/regs/heap-deltas (the D2 id-stream proof); `gc_stress`
+  bounces allocating traces to tier-0 with identical output (`entries > 0` —
+  they enter, guard_gc exits them); observation blackout keeps allocating
+  traces OUT of the executors (`entries == 0` is the load-bearing assert; the
+  gc_stress twin proves the same config otherwise enters); threshold bouncing
+  across REAL GC cycles — mod-free source, `object_count`/`next_gc`/
+  `next_obj_id` all equal vs tier-0, `native_entries > 0` on x64.
+- **D9.3 acceptance** (keyframeser_resume_test): allocating snew/tostr loop →
+  cross-tier final snapshots **byte-identical** (`expectEqualSlices` on the
+  encoded files), `keyframe.next_obj_id` decoded and asserted equal
+  explicitly (> 1000), pairs-order-sensitive fold over 26 string keys pinned.
+  CLI-verified production shape: 16 native entries, 77.5% traced iterations.
+- **Chain/link budget re-check**: needed NO bespoke test — `guard_gc` is a
+  body op, so every entry path (fresh / `tryChainExit` / armed native link)
+  re-executes it by construction. Recorded in doc 24 implementation notes.
+- **D9.4 board**: `just bench` 28/28 cross=ok all-luajit-ok
+  (results/20260828-000644-4c34598.tsv); hashgate 84/84. Instruction A/B vs
+  c2 shadow (just shadow + git-show restore + nm-verified, medians of 3):
+  str_gsub +0.00%, scalar +0.00%, **str_manip +0.16%** (~0.9M instr) —
+  bounded recording overhead (c3 records through sub/reverse/len before the
+  `upper` abort where c2 aborted at the first `sub`); wall unchanged; pays
+  off when upper/lower land (v2). **A/B lesson: the first measurement run
+  was BOGUS — zsh doesn't word-split unquoted `$var`, so every leg was
+  measuring startup+FileNotFound (~410k instr) and "+0.00%" was vacuously
+  reproducible. Check `rc` and sanity-check magnitudes (str_manip is ~572M
+  instr) before believing any perf-stat delta.**
+- **Docs**: doc 24 status → landed + "Implementation notes" section (lazy
+  guard_gc placement; chain re-check by construction; null-collapse; stable
+  `Vm.heap` pointer; string provenance passes + prologue pin; ssub.aux
+  liveness; b==nargs arity pins; MULTRET frontier; the native-safety-net
+  vacuity trap → **every VM-level JIT test must assert `entries`**).
+  Inventory (Z-5): no rows change — len/sub/reverse/char/rep were
+  `implemented` before c3 and recording state is not an inventory column.
+- **Arc B summary** (c1 495f1e5 → c2 0d2c3ed → c3 4c34598 → c4): allocating
+  builtins record and run natively under full determinism — budget entry
+  guard, shared cores for byte-and-id-identical allocation, blackout for
+  replay. scalar 4.3× / str_manip 5.6× vs LuaJIT remain: scalar is blocked
+  from native by `mod` (safety net declines the whole trace — no lowering),
+  str_manip by `upper` (v2). Both frontiers are named, neither is allocation.
+
+## Status 2026-08-27 (LATEST-88, superseded by 89) — **arc B c3 LANDED: the snew class (ssub/srev/schar1/srep2 + guard_string native) records, optimizes, and runs NATIVELY end-to-end. str_manip's abort frontier moved from `sub` (first builtin) to `upper` (out of v1 by design, codex #10). c4 (adversarial matrix/board/docs) remains.**
 
 **c3 (this commit)** — everything from recorder to native codegen for the four
 allocating string→string producers (doc 24 D4), plus native `guard_string`:

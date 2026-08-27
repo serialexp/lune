@@ -1508,3 +1508,184 @@ test "doc 24 c3: schar1 + srep2 — tier parity incl. the n<=0 empty repeat and 
         try testing.expectEqual(iheap.object_count - iobjs_before, nheap.object_count - nobjs_before);
     }
 }
+
+// --- doc 24 c4: adversarial matrix (D9.2) -----------------------------------
+
+/// The two-allocs-per-iteration vehicle for the c4 budget legs:
+/// `acc = acc + #rep(char(base + i), i); i += 1; while i < limit` — schar1 +
+/// srep2, A = 2. regs: r0=i, r1=limit, r2=acc. consts: [base, 1].
+fn charRepTrace(consts: []Value) Trace {
+    const instrs = struct {
+        var arr = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: i
+            .{ .op = .slot_load, .aux = 1 }, // 1: limit
+            .{ .op = .guard_int, .a = 0 }, // 2
+            .{ .op = .guard_int, .a = 1 }, // 3
+            .{ .op = .lt, .a = 0, .b = 1 }, // 4
+            .{ .op = .guard_true, .a = 4 }, // 5
+            .{ .op = .konst, .aux = 0 }, // 6: base
+            .{ .op = .add, .a = 0, .b = 6 }, // 7: base + i
+            .{ .op = .guard_gc, .aux = 2 }, // 8: budget, A = 2
+            .{ .op = .schar1, .a = 7, .ty = .heap }, // 9
+            .{ .op = .srep2, .a = 9, .b = 0, .ty = .heap }, // 10
+            .{ .op = .slen, .a = 10, .ty = .int }, // 11
+            .{ .op = .slot_load, .aux = 2 }, // 12: acc
+            .{ .op = .guard_int, .a = 12 }, // 13
+            .{ .op = .add, .a = 12, .b = 11 }, // 14
+            .{ .op = .konst, .aux = 1 }, // 15: 1
+            .{ .op = .add, .a = 0, .b = 15 }, // 16: i + 1
+            .{ .op = .phi, .b = 14, .aux = 2 },
+            .{ .op = .phi, .b = 16, .aux = 0 },
+            .{ .op = .loop },
+        };
+    };
+    const es = struct {
+        var arr = [_]u16{};
+    };
+    return Trace{ .anchor = undefined, .instrs = &instrs.arr, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
+}
+
+test "doc 24 c4: two allocs per iteration — the bound declines entry even when ONE would fit; minimal headroom exhausts identically across tiers" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var consts = [_]Value{ Value.int(65), Value.int(1) };
+    const t = charRepTrace(&consts);
+    const regs_init = [_]Value{ Value.int(1), Value.int(30), Value.int(0) };
+
+    // (a) Exactly one object of headroom: A = 2, so the predicate
+    // `object_count + 2 < next_gc` fails and the guard exits with ZERO
+    // allocations — even though the first of the two would have fit. That is
+    // the design: the bound is conservative per-iteration headroom, never a
+    // partial-iteration allowance (a partial burst would need mid-iteration
+    // continuation, doc 24 D3v2).
+    {
+        var iheap = gc.Heap.init(gpa);
+        defer iheap.deinit();
+        iheap.next_gc = iheap.object_count + 2;
+        const iobjs = iheap.object_count;
+        var iregs = regs_init;
+        const values = try gpa.alloc(Value, t.instrs.len);
+        defer gpa.free(values);
+        const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &t, &iregs, values);
+        try testing.expectEqual(@as(usize, 0), iresult.completed);
+        try testing.expectEqual(@as(u32, 8), iresult.exit_instr);
+        try testing.expectEqual(iobjs, iheap.object_count);
+        try util.expectRegsEqual(&regs_init, &iregs);
+
+        var nheap = gc.Heap.init(gpa);
+        defer nheap.deinit();
+        nheap.next_gc = nheap.object_count + 2;
+        const nobjs = nheap.object_count;
+        var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+        defer ct.deinit();
+        var nregs = regs_init;
+        const nresult = try util.runNative(ct, &nregs);
+        try testing.expectEqual(@as(usize, 0), nresult.completed);
+        try testing.expectEqual(@as(u32, 8), nresult.exit_instr);
+        try testing.expectEqual(nobjs, nheap.object_count);
+        try util.expectRegsEqual(&regs_init, &nregs);
+    }
+
+    // (b) A few objects of headroom: the loop allocates fresh strings each
+    // iteration (char is a rotating singleton set, but rep(c, i) grows with i),
+    // so `object_count` climbs until the guard re-check fails MID-RUN — the
+    // "threshold crossing with the budget guard bouncing entry" leg at unit
+    // scale. Both tiers must stop at the same iteration with the same heap
+    // delta and byte-identical registers.
+    {
+        var iheap = gc.Heap.init(gpa);
+        defer iheap.deinit();
+        iheap.next_gc = iheap.object_count + 9;
+        const iobjs = iheap.object_count;
+        var iregs = regs_init;
+        const values = try gpa.alloc(Value, t.instrs.len);
+        defer gpa.free(values);
+        const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &t, &iregs, values);
+        try testing.expect(iresult.completed >= 1);
+        try testing.expect(iresult.completed < 29); // it must NOT finish
+        try testing.expectEqual(@as(u32, 8), iresult.exit_instr); // stopped at the budget
+
+        var nheap = gc.Heap.init(gpa);
+        defer nheap.deinit();
+        nheap.next_gc = nheap.object_count + 9;
+        const nobjs = nheap.object_count;
+        var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+        defer ct.deinit();
+        var nregs = regs_init;
+        const nresult = try util.runNative(ct, &nregs);
+        try testing.expectEqual(iresult.completed, nresult.completed);
+        try testing.expectEqual(iresult.exit_instr, nresult.exit_instr);
+        try util.expectRegsEqual(&iregs, &nregs);
+        try testing.expectEqual(iheap.object_count - iobjs, nheap.object_count - nobjs);
+    }
+}
+
+test "doc 24 c4: an intern-hit loop parked just below next_gc completes natively (the parked case is correct)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var consts = [_]Value{ Value.int(65), Value.int(1) };
+    const t = charRepTrace(&consts);
+    const regs_init = [_]Value{ Value.int(1), Value.int(30), Value.int(0) };
+
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    var ct = nativegen.compileWithHeap(gpa, &t, &heap) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+
+    // Warm run: intern every string the loop produces (ample budget).
+    var wregs = regs_init;
+    const wresult = try util.runNative(ct, &wregs);
+    try testing.expectEqual(@as(usize, 29), wresult.completed);
+
+    // Parked run: every allocation is now an intern HIT (zero links), so
+    // `object_count` never moves and the guard passes forever at a fixed
+    // one-object headroom — the loop must complete natively, never bouncing.
+    heap.next_gc = heap.object_count + 3; // A=2 → headroom of exactly one
+    const objs_before = heap.object_count;
+    var pregs = regs_init;
+    const presult = try util.runNative(ct, &pregs);
+    try testing.expectEqual(@as(usize, 29), presult.completed);
+    try testing.expectEqual(objs_before, heap.object_count);
+    try util.expectRegsEqual(&wregs, &pregs);
+}
+
+test "doc 24 c4: OOM injection — the same fail point produces identical completed/exit/heap across tiers (D2 id-stream)" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var consts = [_]Value{ Value.int(65), Value.int(1) };
+    const t = charRepTrace(&consts);
+    const regs_init = [_]Value{ Value.int(1), Value.int(30), Value.int(0) };
+
+    // Both tiers run the SAME shared cores against the heap's gpa, so the
+    // heap-allocation SEQUENCE is identical (D2) and a failing allocator with
+    // the same fail_index must produce the same observable outcome: a clean
+    // side-exit at the failing snew op (null return — no partial link), the
+    // same committed count, the same heap delta, byte-identical registers.
+    // Sweep several fail points to land the failure in scratch growth, string
+    // creation, and strtab paths alike.
+    const fail_points = [_]usize{ 3, 5, 8, 13, 21 };
+    for (fail_points) |fp| {
+        var ifail = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fp });
+        var iheap = gc.Heap.init(ifail.allocator());
+        defer iheap.deinit();
+        const iobjs = iheap.object_count;
+        var iregs = regs_init;
+        const values = try gpa.alloc(Value, t.instrs.len);
+        defer gpa.free(values);
+        const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &t, &iregs, values);
+        try testing.expect(iresult.completed < 29); // the OOM stopped it early
+
+        var nfail = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fp });
+        var nheap = gc.Heap.init(nfail.allocator());
+        defer nheap.deinit();
+        const nobjs = nheap.object_count;
+        var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+        defer ct.deinit();
+        var nregs = regs_init;
+        const nresult = try util.runNative(ct, &nregs);
+        try testing.expectEqual(iresult.completed, nresult.completed);
+        try testing.expectEqual(iresult.exit_instr, nresult.exit_instr);
+        try util.expectRegsEqual(&iregs, &nregs);
+        try testing.expectEqual(iheap.object_count - iobjs, nheap.object_count - nobjs);
+    }
+}

@@ -670,6 +670,59 @@ test "doc 21 §T-A.2: cross-tier final snapshots byte-identical (the minimized H
     try testing.expectEqualSlices(u8, ref.final_snap, snap);
 }
 
+test "doc 24 c4 (arc-B acceptance): allocating snew/tostr loop — cross-tier final snapshots byte-identical, next_obj_id explicit, pairs order pinned" {
+    // THE arc-B acceptance gate (doc 24 D9.3): a hot loop that allocates
+    // on-trace every iteration (tostr_int + srev + ssub, incl. a WRITTEN-BUT-
+    // DEAD heap temp per iteration — the codex #6 stale-slot channel), run
+    // tier-0 vs full-JIT, and the FINAL SNAPSHOTS must byte-compare. The
+    // snapshot walk covers the live object graph, ids, and `next_obj_id` —
+    // the total-allocation count is observable state (D2), so one extra or
+    // one missing on-trace intern anywhere diverges the bytes. A pairs()
+    // fold over string keys interned AFTER the hot loop makes id-order
+    // divergence show in stdout too (hash iteration order is keyed on ids).
+    // The hot loop is deliberately MOD-FREE: `%` has no native lowering yet
+    // and `native_codegen`'s safety net would otherwise decline entry
+    // entirely, quietly reducing this to a tier-0-vs-tier-0 comparison.
+    const gpa = testing.allocator;
+    const source =
+        \\local sub = string.sub
+        \\local rev = string.reverse
+        \\local base = "The quick brown Fox jumps over the lazy Dog"
+        \\local u = 0
+        \\local w = 1
+        \\for i = 1, 500 do
+        \\  local s = tostring(i)
+        \\  local dead = rev(s)
+        \\  local t = sub(base, w, w + 5)
+        \\  u = u + #dead + #t
+        \\  w = w + 1
+        \\  if w > 30 then w = 1 end
+        \\end
+        \\local tbl = {}
+        \\for i = 1, 26 do tbl[string.char(64 + i)] = i end
+        \\local ks = 0
+        \\for k, v in pairs(tbl) do ks = (ks * 31 + v + #k) % 1000003 end
+        \\print(u, ks)
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+    const snap = try jitFinalSnapshot(gpa, source, ref);
+    defer gpa.free(snap);
+    try testing.expectEqualSlices(u8, ref.final_snap, snap);
+
+    // `next_obj_id` equality asserted EXPLICITLY (D9.3), not only via the
+    // byte-compare above: decode both keyframes and compare the field.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ref_file = try schema.SnapshotFile.decode(arena.allocator(), ref.final_snap);
+    const jit_file = try schema.SnapshotFile.decode(arena.allocator(), snap);
+    try testing.expectEqual(ref_file.keyframe.next_obj_id, jit_file.keyframe.next_obj_id);
+    // Sanity: the run really allocated thousands of ids (500 fresh tostrings
+    // + reversals + windows) — a near-zero id count would mean the loop
+    // didn't do what this gate thinks it does.
+    try testing.expect(ref_file.keyframe.next_obj_id > 1000);
+}
+
 test "doc 21 §T-A.3: result span preserved; dead-slot-only garbage excluded from the snapshot walk" {
     const gpa = testing.allocator;
     // `hidden`'s only reference is a dead local at the final state — semantic

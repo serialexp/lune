@@ -1,10 +1,13 @@
 # lune — deterministic on-trace allocation (builtin recording breadth, arc B)
 
-Status: **design revised after codex review (2026-08-27) — v1 pivoted to the
-allocation-budget entry guard (codex #11); continuation exits recorded as the
-v2 escalation. Implementing.**
+Status: **landed** (arc B, commits c1 `495f1e5` → c2 `0d2c3ed` → c3 `4c34598`
+→ c4, 2026-08-28). v1 scope only: budget entry guard, `tostr_*` + `snew` class
+(`ssub`/`srev`/`schar1`/`srep2`), `alen` flush. D3v2 continuation exits, the
+format chain, and `upper`/`lower` remain future arcs. Implementation notes at
+the end of this doc record where the build deviated from or sharpened the
+design.
 Owner: Bart
-Last updated: 2026-08-27
+Last updated: 2026-08-28
 
 Prerequisite reading: `23-builtin-recording-breadth.md` (arc A, and the arc-B
 commitment this doc discharges), `02-determinism.md` (the mode matrix),
@@ -449,3 +452,91 @@ touch VM effect state → excluded from v1. #11 budget-guard baseline →
 ADOPTED as v1; continuation design demoted to D3v2. #14 adversarial gates →
 D9.2. Minors: #12 `aux` overload → `aux` = `A` only. #13 exec-log shape →
 predicate-as-guard-value, pinned in D6.
+
+## Implementation notes (landed, 2026-08-28)
+
+What the build fixed in place or sharpened relative to the design above. Each
+is the record of a decision, not a proposal.
+
+**`guard_gc` is placed lazily, once, before the first `.alloc` op.** The
+recorder does not emit it at the trace header; `emitAlloc` inserts it
+immediately before the first allocating op and subsequent `.alloc` ops only
+bump `alloc_bound` (`aux` = A). Consequence: a trace whose allocating region
+is preceded by pure prefix work still exits *at the loop header* on guard
+failure — the guard is a body op with no allocations before it, so the
+zero-allocations-on-failing-entry invariant (D3) holds with no exit-PC
+bookkeeping.
+
+**Chain/link entry re-check holds by construction — no bespoke mechanism.**
+D9.2's "entry via side-trace chain and armed native link re-checking the
+budget guard" needed no dedicated code path: `guard_gc` is a body op, so
+*every* way of entering the body (fresh entry, `tryChainExit`, armed native
+link) executes it before the first allocation. The structural exclusions that
+*were* needed: the trial walk skips allocating traces under observation
+blackout (`suspend_ctl != null` or `record_safepoint_lines`, interp.zig), and
+`driveChain` refuses to arm an allocating side trace under the same blackout
+(trace.zig). Both are entry-side, both tested (D9.2 blackout leg,
+`entries == 0` asserted as load-bearing).
+
+**The D5 tagged result collapsed to a null.** All five runtime shims
+(`tostrInt/NumRuntime`, `ssub/srev/schar1/srep2Runtime`) return
+`?*object.String`; null means *either* OOM *or* a condition tier-0 would
+raise (invalid codepoint in `char`). Both take the same clean side-exit and
+tier-0 re-executes to produce the real outcome. Note `rep(s, n)` with
+`n <= 0` is NOT an error: `rep2Core` interns `""` and the trace continues.
+No `Heap.link` happens before any fallible step in any shim (codex #9 pin,
+unit-tested).
+
+**`Vm.heap` became a stable pointer** so baked `*Heap` immediates in native
+code survive VM moves. Callouts bake the heap pointer as an imm64 `rdi`.
+
+**String provenance in nativegen is two passes + a prologue pin.** Pass A
+collects `guard_string`-covered slot loads (`string_guarded[]`); pass B
+propagates provenance (`is_string[]`: `tostr_*`/`snew` results and guarded
+slot loads). An invariant heap slot used as a string must have a covering
+`guard_string` or compilation bails; the check is discharged to a one-time
+prologue `header.type == STRING_TYPE` test per entry. Konst *heap-string*
+operands decline native (konst arm accepts heap consts only as href keys);
+carried (loop-variant) string slots bail to the scalar-only arm. Both are
+declines, not miscompiles — tier-1a runs those traces.
+
+**`ssub` is the one three-operand op (codex #4) and it costs liveness
+bookkeeping.** `operandReads`' two-field shape cannot express `aux`, so
+`analyzeInner` extends `last_use` for `ssub.aux` explicitly (same precedent
+as dyn-href). Compaction remaps `aux` like any ref; a dedicated test pins
+CSE-shift + aux-remap together. `snew`-class ops are never CSE'd (codex #8)
+— also pinned by test (two identical `ssub`s stay two).
+
+**Recorder arity pins are `b == nargs`, not nargs+1.** The `.call` opcode
+carries `nargs = instr.b` directly (interp.zig `.call` handler). All five
+c3 arms were initially pinned one high and recorded nothing; the fix and the
+convention are worth remembering — check the `.call` handler, not intuition,
+when pinning shapes.
+
+**MULTRET is the recording frontier for nested builtin calls.** An inner
+call in the *last* argument position (`rev(sub(...))`) compiles to multret
+(b/c = all_results) and every recorded-builtin arm aborts `.cross_frame`.
+Non-last-position nesting records fine. Fix shape recorded in TODO.md
+(resolve nargs from `reg_top`, as tier-0 does); str_manip's v1 loop does not
+hit it.
+
+**The native safety net makes VM-level JIT tests silently vacuous — assert
+`entries`.** With `native_codegen` on, a trace containing any op with no
+native lowering (`mod`, currently) is declined *entirely* by the trial walk
+— it does not fall back to tier-1a, so a test can pass with the JIT never
+entering. Every VM-level test in this arc now either uses a mod-free source
+(and asserts `native_entries > 0` on x64) or deliberately configures
+tier-1a-only with a comment, and asserts `vm.trace.entries > 0` (or
+`== 0` where the blackout makes that the point). Treat a JIT test without an
+entries assertion as untested.
+
+**D9.4 outcomes.** hashgate 84/84 both legs; `just bench` 28/28 cross=ok,
+all-luajit-ok; str_manip records through `sub`/`reverse`/`len` and now
+aborts `host_barrier` at `upper` (the designed v1 frontier; wall unchanged).
+Instruction A/B vs the c2 shadow (medians of 3): str_gsub +0.00%, scalar
++0.00%, str_manip **+0.16%** (~0.9M instructions) — bounded recording
+overhead from recording further before the `upper` abort; it becomes payoff
+when `upper`/`lower` land (v2). §T-A.2 acceptance: allocating snew/tostr
+loop, cross-tier final snapshots byte-identical, `keyframe.next_obj_id`
+asserted equal explicitly, pairs-order fold pinned; production leg verified
+16 native entries / 77.5% traced iterations.
