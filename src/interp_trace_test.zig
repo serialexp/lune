@@ -706,6 +706,84 @@ test "doc 25: a % / // loop runs NATIVELY end-to-end — mod no longer poisons n
         try testing.expect(vm.trace.native_entries > 0);
 }
 
+test "doc 26 D1a: an error unwinding mid-recording aborts the recording (.raised) — no Franken-path commit" {
+    // The pre-existing c3-class hazard: `schar1` records under `guard_int`
+    // (3000000000 IS an int), then tier-0's `string.char` RAISES `bad
+    // argument` — while the recording is active, under an ENCLOSING pcall.
+    // Pre-D1a `rec.active` survived the unwind: the recorder would splice the
+    // pcall continuation's instructions onto the partial iteration, and a
+    // later reach of the anchor could commit the Franken-path. `execWith`'s
+    // errdefer now kills the recording at the innermost unwind (.raised).
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local char = string.char
+        \\local function worker(raise)
+        \\  -- acc must be a LOCAL: an upvalue write is a set_upval nyi abort,
+        \\  -- which would kill the recording before the raise ever happens.
+        \\  local acc = 0
+        \\  for i = 1, 400 do
+        \\    -- hotloop=4 arms after 3 back-edges: iteration 4 is the recorded
+        \\    -- one (verified by bisection — thresholds 3 and 5 both put the
+        \\    -- raise OUTSIDE the recording and the .raised assert below fails
+        \\    -- loudly, so a future tiering shift cannot silently devacuate
+        \\    -- this test). Every i >= 4 is out of range, so the recorded
+        \\    -- iteration raises mid-recording under the enclosing pcall.
+        \\    local cp = 65
+        \\    if raise and i >= 4 then cp = 3000000000 end
+        \\    local s = char(cp)
+        \\    acc = acc + #s
+        \\  end
+        \\  return acc
+        \\end
+        \\local ok = pcall(worker, true)
+        \\local n = worker(false)
+        \\print(ok, n)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = false; // recording in isolation — commits stay inert
+    vm.trace.config.optimize = false;
+    vm.trace.config.hotloop = 4;
+    vm.trace.config.record_aborts = true;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    // The raise was caught (ok=false) and the clean leg ran to completion.
+    try testing.expectEqualStrings("false\t400\n", sink.buffered());
+    // The poisoned recording died with the NEW reason, at the char call.
+    var raised_rows: usize = 0;
+    for (vm.trace.abort_log.items) |r| {
+        if (r.reason == .raised) {
+            raised_rows += 1;
+            try testing.expectEqual(bytecode.OpCode.call, r.op);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), raised_rows);
+    // No recording is live at the end, and every committed trace is a clean
+    // full-iteration recording from the clean leg (anchored at the loop
+    // header, containing schar1 — never a partial/spliced body).
+    try testing.expect(!vm.trace.isRecording());
+    try testing.expect(vm.trace.cache.items.len >= 1);
+    for (vm.trace.cache.items) |t| {
+        var has_schar1 = false;
+        for (t.instrs) |ins| {
+            if (ins.op == .schar1) has_schar1 = true;
+        }
+        try testing.expect(has_schar1);
+    }
+}
+
 test "chunk rooting: a host-compiled retained chunk survives GC before it runs" {
     // docs/design/03 §"Chunk-constant rooting" — the regression. A host compiles chunk
     // B (whose distinctive literal is a `load_const`), retains it, runs chunk A (which

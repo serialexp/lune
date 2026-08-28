@@ -1362,6 +1362,16 @@ pub const AbortReason = enum {
     /// recorder's grown `reg_map` window. Abort rather than panic on an OOB slab
     /// read; tier-0 owns the loop. (Deep/unbounded recursion is Phase 3.)
     too_deep,
+    /// An error unwound through the dispatch loop while this recording was
+    /// active (doc 26 D1a). The raise itself is not part of the recorded IR, so
+    /// letting the recording survive the unwind would stitch post-catch
+    /// instructions (an enclosing `pcall`'s continuation) onto the partial
+    /// iteration — a Franken-path that could commit if control re-reached the
+    /// anchor. Reachable today via `schar1` (records under `guard_int`, then
+    /// tier-0's `string.char` raises on an out-of-range value under an
+    /// enclosing pcall); `Vm.execWith`'s errdefer kills the recording at the
+    /// innermost unwind instead.
+    raised,
 };
 
 /// One aggregated abort, accumulated in `TraceState.abort_log` when
@@ -11066,6 +11076,18 @@ pub const TraceState = struct {
     /// gates on this).
     pub fn isRecording(self: *const TraceState) bool {
         return self.rec.active;
+    }
+
+    /// Doc 26 D1a: kill an active recording because an error is unwinding
+    /// through the dispatch loop. Called from `Vm.execWith`'s errdefer — the
+    /// raise is not part of the recorded IR, so a surviving recording would
+    /// stitch an enclosing pcall's post-catch continuation onto the partial
+    /// iteration and could commit a Franken-path trace at the next anchor
+    /// reach. Guarded (no-op when idle) so nested `execWith` unwind levels
+    /// stay idempotent: the innermost aborts, outer levels see an inactive
+    /// recording.
+    pub fn abortRaised(self: *TraceState) void {
+        if (self.rec.active) self.abort(.raised);
     }
 
     /// Is this anchor currently gated off tier-1? True while a cooldown window is

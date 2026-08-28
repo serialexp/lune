@@ -2017,6 +2017,13 @@ pub const Vm = struct {
     /// `switch_mode` re-entry so a mode flip mid-nested-run resumes the same bound.
     fn execWith(self: *Vm, stop_depth: u32) Error!ExecOutcome {
         errdefer self.trace.clearPendingExitAnchor();
+        // Doc 26 D1a: an error unwinding through the dispatch loop kills any
+        // active recording — the raise is invisible to the recorded IR, so a
+        // surviving recording would splice an enclosing pcall's continuation
+        // onto the partial iteration. Guarded no-op when idle; suspension is a
+        // normal return (`.suspended`), so suspend/resume recordings are
+        // untouched.
+        errdefer self.trace.abortRaised();
         while (true) {
             const step = if (self.runFastPath())
                 try self.execImpl(.fast, stop_depth)
