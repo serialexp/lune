@@ -21,6 +21,50 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-28 (LATEST-97) — **MATCHER + TONUMBER CONSTANT FACTORS (doc 29 A1–A4 + B(a)) LANDED. str_gsub 60.5 → 53.3 ms = 1.2× LJ (AT CAMPAIGN TARGET); find_match 2.4× → 2.2×; instr −17%/−12%/−8% on gsub/find/gmatch, format+scalar exactly flat. Doc 30 (pattern/tonumber recording) at v3, awaiting Bart's go-ahead.**
+
+Bart approved levers 1+2+3 ("Ok, lets try to do 1, 2 and 3"). Lever 2
+(matcher) + lever 3's grammar-(a) phase are this arc; lever 1 is doc 30,
+design-complete (two codex rounds, v3) but NOT implemented — its status line
+requires Bart's explicit go-ahead.
+
+1. **A1 — table-driven `matchClass`** (`pattern.zig`): comptime
+   `char_bits[256]` + `class_map[32]` built by evaluating the OLD predicates
+   at comptime (so parity is by construction), LuaJIT's `(cl&0xc0)==0x40` +
+   case-bit trick. Pinned by a full 256×256 cross-product test against an
+   independent verbatim copy of the old switch (`refMatchClass`).
+2. **A2/A3 — cheap hot-path widths**: 1-byte literal compare in
+   `singleMatch`; `seqLen` ASCII fast path; `matchWidth` literal width is
+   `ep−p` with the malformed-pattern carve-out (`ep−p==1 && pat[p]>=0x80`
+   keeps `seqLen` — preserves the lone-`\xC3` defensive contract, codex M3).
+3. **A4 — `countRun`**: `maxExpand`'s per-char item re-dispatch hoisted into
+   one switch + per-kind counting loops ('.', class via table, bracket,
+   literal stride; escaped-literal fallback when class map is 0 — `%z+` etc,
+   codex M2). Old-loop parity test across 14 pattern kinds × every start
+   offset.
+4. **B(a) — `fastDecInt`** (`arith.zig`): strict-subset fast path in
+   `toNumber`'s string arm (optional sign + 1..19 pure digits, i64 range,
+   sign-asymmetric min); EVERYTHING else falls through to the untouched
+   std.fmt pipeline, so routing/tags are preserved by construction (codex
+   Blocker #1 redesign). Subset property pinned directed + pseudo-exhaustive
+   (all strings len 1–4 over a 14-char alphabet) + end-to-end tag matrix.
+5. **Gates**: `zig build test` green, `-Djit-debug` leg green, hashgate
+   84/84, full board 28/28 cross=ok. Shadow instruction A/B (nm-verified
+   baseline): gsub −16.9%, find_match −12.2%, gmatch −7.6%, format −0.00%,
+   scalar +0.00%. Honest misses: gmatch only −4% wall (bracket class still
+   linear-scans; dominant cost is tier-0 dispatch = doc 30's lever), gsub
+   −11% wall vs predicted −20-25% (still reached 1.2×). A5 skip-scan
+   deferred until after doc 30. Landed-results section in doc 29.
+
+**OPEN DECISIONS for Bart** (Rule #17): (i) doc 29 §B2 tonumber grammar —
+(a) freeze today's std.fmt-artifact grammar (fast path already landed, valid
+under any choice) / (b) Lua 5.4 grammar / (c) LuaJIT grammar. Today lune
+accepts `"1_000"`→1000, `"0o17"`, `"0b101"`, `"inf"` — none Lua-legal.
+(ii) doc 30 v3 go-ahead (ops 72–79: sfindp/smatch/sgmatch/scap_*/str2num_*/
+sgm_setpos + guard_sid; kills the host_barrier on find/match/gmatch/tonumber;
+gsub+format stay barriers in v1). (iii) doc 28 §5 L3 sparse intern hash
+(still open from LATEST-96).
+
 ## Status 2026-08-28 (LATEST-96) — **STRING OP-CORE ARC (doc 28) LANDED, c1–c3b: exact per-string ASCII bit + seam fast paths + known-fact interning. str_manip 23.9 → 18.8 ms (5.0× → 4.0×), find_match −9.7%, gsub −5.3%. L3 (sparse hash) awaits Bart's call.**
 
 Bart: "Lets do the strings first. Everyone will run into those at some point."

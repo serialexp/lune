@@ -75,26 +75,78 @@ pub const MatchState = struct {
     }
 
     // -- character classes --------------------------------------------------
+    //
+    // Doc 29 A1: the two-table design from LuaJIT (`lib_string.c:210-228`,
+    // `lj_char.c`). `char_bits` is built AT COMPTIME by evaluating the same
+    // predicates the old switch-based `matchClass` used, so the table is
+    // definitionally equal to the previous semantics; the exhaustive 256×256
+    // parity test below pins it against an independent reference copy.
+
+    /// Primitive class bits. Composites: alpha = upper|lower, alnum =
+    /// alpha|digit, graph = alnum|punct (punct is "printable, non-space,
+    /// non-alnum", so the union is exactly "printable, non-space").
+    const bits_cntrl: u8 = 0x01;
+    const bits_space: u8 = 0x02;
+    const bits_punct: u8 = 0x04;
+    const bits_digit: u8 = 0x08;
+    const bits_xdigit: u8 = 0x10;
+    const bits_upper: u8 = 0x20;
+    const bits_lower: u8 = 0x40;
+    const bits_alpha: u8 = bits_upper | bits_lower;
+    const bits_alnum: u8 = bits_alpha | bits_digit;
+    const bits_graph: u8 = bits_alnum | bits_punct;
+
+    /// Per-byte class bits. Bytes ≥ 0x80 carry no bits — lune's classes are
+    /// ASCII-only (the S-D rule); complements of high bytes are handled by
+    /// the callers' `< 0x80` guards (and `%f`'s deliberate lack of one).
+    const char_bits: [256]u8 = blk: {
+        var t: [256]u8 = @splat(0);
+        for (0..0x80) |i| {
+            const c: u8 = @intCast(i);
+            var b: u8 = 0;
+            if (std.ascii.isControl(c)) b |= bits_cntrl;
+            if (std.ascii.isWhitespace(c)) b |= bits_space;
+            if ((c > 0x20 and c < 0x7f) and !std.ascii.isAlphanumeric(c)) b |= bits_punct;
+            if (std.ascii.isDigit(c)) b |= bits_digit;
+            if (std.ascii.isHex(c)) b |= bits_xdigit;
+            if (std.ascii.isUpper(c)) b |= bits_upper;
+            if (std.ascii.isLower(c)) b |= bits_lower;
+            t[i] = b;
+        }
+        break :blk t;
+    };
+
+    /// `cl & 0x1f` → bit mask for the 10 class letters (case-folded by
+    /// construction: 'a' and 'A' share an index). 0 = not a class letter.
+    const class_map: [32]u8 = blk: {
+        var m: [32]u8 = @splat(0);
+        m['a' & 0x1f] = bits_alpha;
+        m['c' & 0x1f] = bits_cntrl;
+        m['d' & 0x1f] = bits_digit;
+        m['g' & 0x1f] = bits_graph;
+        m['l' & 0x1f] = bits_lower;
+        m['p' & 0x1f] = bits_punct;
+        m['s' & 0x1f] = bits_space;
+        m['u' & 0x1f] = bits_upper;
+        m['w' & 0x1f] = bits_alnum;
+        m['x' & 0x1f] = bits_xdigit;
+        break :blk m;
+    };
 
     /// `match_class(c, cl)` — does byte `c` belong to class letter `cl`? A
     /// non-class letter matches itself (so `%z` is a literal `z`, per 5.4). An
     /// upper-case class letter is the complement of its lower-case form.
+    /// One table load + two masks, no branch on the class letter (doc 29 A1).
     fn matchClass(c: u8, cl: u8) bool {
-        const lower = std.ascii.toLower(cl);
-        const res = switch (lower) {
-            'a' => std.ascii.isAlphabetic(c),
-            'c' => std.ascii.isControl(c),
-            'd' => std.ascii.isDigit(c),
-            'g' => c > 0x20 and c < 0x7f, // graph: printable, non-space
-            'l' => std.ascii.isLower(c),
-            'p' => (c > 0x20 and c < 0x7f) and !std.ascii.isAlphanumeric(c), // punct
-            's' => std.ascii.isWhitespace(c),
-            'u' => std.ascii.isUpper(c),
-            'w' => std.ascii.isAlphanumeric(c),
-            'x' => std.ascii.isHex(c),
-            else => return cl == c, // not a class letter → literal
-        };
-        return if (std.ascii.isUpper(cl)) !res else res;
+        if ((cl & 0xc0) == 0x40) { // an ASCII letter, either case
+            const t = class_map[cl & 0x1f];
+            if (t != 0) {
+                const res = (char_bits[c] & t) != 0;
+                // bit 0x20 set = lowercase letter = positive class.
+                return if ((cl & 0x20) != 0) res else !res;
+            }
+        }
+        return cl == c; // not a class letter → literal
     }
 
     /// `classend(p)` — offset of the pattern item *after* the one at `p`.
@@ -168,7 +220,9 @@ pub const MatchState = struct {
     /// the `string.zig` outer scans (`find`/`gmatch`/`gsub`) step by it too.
     pub fn seqLen(self: *const MatchState, s: usize) usize {
         if (s >= self.src.len) return 0;
-        const n: usize = std.unicode.utf8ByteSequenceLength(self.src[s]) catch 1;
+        const b = self.src[s];
+        if (b < 0x80) return 1; // doc 29 A3: ASCII fast path
+        const n: usize = std.unicode.utf8ByteSequenceLength(b) catch 1;
         return @min(n, self.src.len - s);
     }
 
@@ -187,7 +241,11 @@ pub const MatchState = struct {
             '.' => true,
             l_esc => c < 0x80 and matchClass(c, self.pat[p + 1]),
             '[' => c < 0x80 and self.matchBracket(c, p, ep - 1),
-            else => self.litEq(s, p, ep),
+            // Doc 29 A2: a 1-byte literal item is a single compare (the
+            // overwhelmingly common case); multibyte items keep the slice
+            // compare. Identical semantics — litEq on a 1-byte item is
+            // exactly this compare.
+            else => if (ep - p == 1) c == self.pat[p] else self.litEq(s, p, ep),
         };
     }
 
@@ -203,12 +261,22 @@ pub const MatchState = struct {
     }
 
     /// Byte width consumed by a *successful* `singleMatch` of the item at `p`
-    /// starting at `s`. `.`/literal consume the whole code point; a class/bracket
-    /// consume exactly one byte (the `singleMatch` guard proved it ASCII).
-    fn matchWidth(self: *const MatchState, s: usize, p: usize) usize {
+    /// starting at `s`. `.` consumes the whole subject code point; a class/
+    /// bracket consume exactly one byte (the `singleMatch` guard proved it
+    /// ASCII); a *valid* literal item consumes its own byte length (doc 29 A3
+    /// — byte-equality of valid UTF-8 proves equal encoded width, so no
+    /// re-decode). Carve-out (doc 29 review M3): a malformed 1-byte item with
+    /// a high lead byte (`classEnd`'s degraded-tail case) keeps the subject-
+    /// width `seqLen` so the defensive boundary-alignment contract holds.
+    fn matchWidth(self: *const MatchState, s: usize, p: usize, ep: usize) usize {
         return switch (self.pat[p]) {
             l_esc, '[' => 1,
-            else => self.seqLen(s), // '.' or a literal item
+            '.' => self.seqLen(s),
+            else => blk: {
+                const w = ep - p;
+                if (w == 1 and self.pat[p] >= 0x80) break :blk self.seqLen(s);
+                break :blk w;
+            },
         };
     }
 
@@ -279,12 +347,68 @@ pub const MatchState = struct {
         return null; // unbalanced
     }
 
+    /// Doc 29 A4: the greedy counting loop with the item-kind switch hoisted
+    /// OUT of the per-byte loop (LuaJIT's `max_expand` calls `singlematch`
+    /// per iteration and relies on the C compiler to specialize; this makes
+    /// the specialization explicit). Returns the furthest boundary `cur ≥ s0`
+    /// such that every item repetition in `[s0, cur)` matches — exactly the
+    /// old `while (singleMatch) cur += matchWidth` outcome, pinned per-kind
+    /// by directed tests.
+    fn countRun(self: *const MatchState, s0: usize, p: usize, ep: usize) usize {
+        const src = self.src;
+        var cur = s0;
+        switch (self.pat[p]) {
+            // Every code point matches '.', and `src` is valid UTF-8 at the
+            // matcher boundary (S-B), so the run ends exactly at src.len.
+            '.' => return src.len,
+            l_esc => {
+                const cl = self.pat[p + 1];
+                if ((cl & 0xc0) == 0x40 and class_map[cl & 0x1f] != 0) {
+                    const t = class_map[cl & 0x1f];
+                    const positive = (cl & 0x20) != 0;
+                    // A class item matches exactly one ASCII byte (the
+                    // load-bearing `< 0x80` guard) — width is constant 1.
+                    while (cur < src.len and src[cur] < 0x80 and
+                        ((char_bits[src[cur]] & t) != 0) == positive) cur += 1;
+                } else {
+                    // Review M2: an escaped LITERAL item (`%z+`, `%%+`,
+                    // `%q*` — matchClass's fallthrough): repeated 1-byte
+                    // equality. A `cl >= 0x80` never matches (the old
+                    // `< 0x80` guard), which this compare reproduces.
+                    while (cur < src.len and src[cur] < 0x80 and src[cur] == cl) cur += 1;
+                }
+                return cur;
+            },
+            '[' => {
+                while (cur < src.len and src[cur] < 0x80 and
+                    self.matchBracket(src[cur], p, ep - 1)) cur += 1;
+                return cur;
+            },
+            else => {
+                const w = ep - p;
+                if (w == 1 and self.pat[p] >= 0x80) {
+                    // Malformed 1-byte high item (review M3): keep the old
+                    // byte-test + subject-width advance exactly.
+                    while (self.singleMatch(cur, p, ep)) cur += self.matchWidth(cur, p, ep);
+                    return cur;
+                }
+                if (w == 1) {
+                    const b = self.pat[p];
+                    while (cur < src.len and src[cur] == b) cur += 1;
+                    return cur;
+                }
+                const item = self.pat[p..ep];
+                while (src.len - cur >= item.len and
+                    std.mem.eql(u8, src[cur .. cur + item.len], item)) cur += item.len;
+                return cur;
+            },
+        }
+    }
+
     fn maxExpand(self: *MatchState, s: usize, p: usize, ep: usize) Error!?usize {
-        // Greedily consume matching code points (S-D: step by code-point width,
-        // not by byte). `cur` lands on the furthest code-point boundary that still
-        // matches the single item.
-        var cur = s;
-        while (self.singleMatch(cur, p, ep)) cur += self.matchWidth(cur, p);
+        // Greedily consume matching code points (S-D: the run counter steps by
+        // item width — doc 29 A4 hoists the item-kind dispatch out of the loop).
+        var cur = self.countRun(s, p, ep);
         // Greedy: try the longest run first, backing off ONE code point at a time.
         // Stepping `cur` back to the previous boundary is an O(1) backward scan
         // over continuation bytes (valid because `src` is valid UTF-8) — so no
@@ -302,7 +426,7 @@ pub const MatchState = struct {
         while (true) {
             if (try self.match(s, ep + 1)) |r| return r;
             if (self.singleMatch(s, p, ep)) {
-                s += self.matchWidth(s, p); // one more repetition, by code point
+                s += self.matchWidth(s, p, ep); // one more repetition, by code point
             } else {
                 return null;
             }
@@ -381,7 +505,7 @@ pub const MatchState = struct {
             // subject advances by the matched item's code-point width, not 1 byte.)
             const ep = try self.classEnd(p);
             const m = self.singleMatch(s, p, ep);
-            const w = if (m) self.matchWidth(s, p) else 0;
+            const w = if (m) self.matchWidth(s, p, ep) else 0;
             const q: u8 = if (ep < pat.len) pat[ep] else 0;
             switch (q) {
                 '?' => {
@@ -604,6 +728,101 @@ test "S-D: %f frontier classifies a multibyte char by its (non-ASCII) bytes" {
     try testing.expectEqual(@as(?[2]usize, null), try firstMatch("ab", "a%f[%A]"));
     // Symmetric: a frontier INTO ASCII-alpha fires at the boundary after the 'é'.
     try testing.expectEqual(@as(?[2]usize, .{ 2, 3 }), try firstMatch("éb", "%f[%a]%a"));
+}
+
+// ---------------------------------------------------------------------------
+// Doc 29 A-series pins.
+// ---------------------------------------------------------------------------
+
+/// Independent reference copy of the pre-doc-29 switch-based `matchClass` —
+/// deliberately NOT derived from the table or its generator (review M4: a
+/// table checked against its own source is tautological).
+fn refMatchClass(c: u8, cl: u8) bool {
+    const lower = std.ascii.toLower(cl);
+    const res = switch (lower) {
+        'a' => std.ascii.isAlphabetic(c),
+        'c' => std.ascii.isControl(c),
+        'd' => std.ascii.isDigit(c),
+        'g' => c > 0x20 and c < 0x7f,
+        'l' => std.ascii.isLower(c),
+        'p' => (c > 0x20 and c < 0x7f) and !std.ascii.isAlphanumeric(c),
+        's' => std.ascii.isWhitespace(c),
+        'u' => std.ascii.isUpper(c),
+        'w' => std.ascii.isAlphanumeric(c),
+        'x' => std.ascii.isHex(c),
+        else => return cl == c,
+    };
+    return if (std.ascii.isUpper(cl)) !res else res;
+}
+
+test "doc 29 A1: matchClass table parity — full 256x256 cross-product" {
+    var c: usize = 0;
+    while (c < 256) : (c += 1) {
+        var cl: usize = 0;
+        while (cl < 256) : (cl += 1) {
+            const want = refMatchClass(@intCast(c), @intCast(cl));
+            const got = MatchState.matchClass(@intCast(c), @intCast(cl));
+            if (want != got) {
+                std.debug.print("matchClass parity fail: c=0x{x} cl=0x{x} want={} got={}\n", .{ c, cl, want, got });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+    // Explicit pins (review M4): %s on VT/FF, %c on DEL, high bytes bitless.
+    try testing.expect(MatchState.matchClass(0x0B, 's'));
+    try testing.expect(MatchState.matchClass(0x0C, 's'));
+    try testing.expect(MatchState.matchClass(0x7F, 'c'));
+    try testing.expect(!MatchState.matchClass(0xC3, 'a'));
+    try testing.expect(MatchState.matchClass(0xC3, 'A')); // complement of a bitless byte
+}
+
+/// Reference counting loop — the pre-doc-29 `maxExpand` head, verbatim.
+fn refCountRun(ms: *const MatchState, s0: usize, p: usize, ep: usize) usize {
+    var cur = s0;
+    while (ms.singleMatch(cur, p, ep)) cur += ms.matchWidth(cur, p, ep);
+    return cur;
+}
+
+test "doc 29 A4: countRun equals the old loop for every item kind" {
+    // (subject, pattern, item offset) triples; classEnd(p) supplies ep.
+    const cases = [_]struct { src: []const u8, pat: []const u8 }{
+        .{ .src = "aaabé cd", .pat = "a" }, // 1-byte literal
+        .{ .src = "ééxé", .pat = "é" }, // multibyte literal
+        .{ .src = "abé12 x", .pat = "." }, // dot: whole subject
+        .{ .src = "123abc", .pat = "%d" }, // class positive
+        .{ .src = "abc123", .pat = "%D" }, // class complement
+        .{ .src = "é123", .pat = "%D" }, // complement at a multibyte boundary
+        .{ .src = "zzzab", .pat = "%z" }, // escaped literal (not a class, 5.4)
+        .{ .src = "%%%a", .pat = "%%" }, // escaped '%'
+        .{ .src = "qqqx", .pat = "%q" }, // escaped plain letter
+        .{ .src = "abc,def", .pat = "[^,]" }, // bracket complement
+        .{ .src = "a-b-c", .pat = "[a-c-]" }, // bracket with range + literal '-'
+        .{ .src = "", .pat = "%d" }, // empty subject
+        .{ .src = "ééé", .pat = "%A" }, // complement class over pure multibyte (never matches: <0x80 guard)
+        .{ .src = "é", .pat = "\xC3" }, // malformed 1-byte high item (M3 carve-out)
+    };
+    for (cases) |tc| {
+        var ms = MatchState.init(tc.src, tc.pat);
+        ms.reset();
+        const ep = try ms.classEnd(0);
+        // From offset 0 and from every code-point boundary.
+        var s: usize = 0;
+        while (true) {
+            try testing.expectEqual(refCountRun(&ms, s, 0, ep), ms.countRun(s, 0, ep));
+            if (s >= tc.src.len) break;
+            s += ms.seqLen(s);
+        }
+    }
+}
+
+test "doc 29 A4: escaped-literal quantifiers behave as before" {
+    // %z is a literal 'z' per 5.4 (the class was dropped) — quantified.
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 3 }), try firstMatch("zzzab", "%z+"));
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 0 }), try firstMatch("abc", "%z*"));
+    // %% quantified: a run of literal percent signs.
+    try testing.expectEqual(@as(?[2]usize, .{ 1, 3 }), try firstMatch("a%%b", "%%+"));
+    // %q (escaped plain letter) quantified.
+    try testing.expectEqual(@as(?[2]usize, .{ 0, 2 }), try firstMatch("qqx", "%q+"));
 }
 
 test "S-D: classEnd is total on a truncated multibyte pattern tail" {

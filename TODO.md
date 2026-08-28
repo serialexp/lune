@@ -88,6 +88,17 @@ the table from the list above: **interning cost** (L3 sparse hash — Bart
 decision pending, doc 28 §5), **rep3 recording**, **tier-0 side-exit
 fraction**, and the **decimal renderer** for str_format (doc 28 §7 non-goals).
 
+**UPDATE (2026-08-28, doc 29 matcher/tonumber arc landed, LATEST-97):** the
+matcher constant factor is DONE (table-driven matchClass, cheap widths,
+countRun; str_gsub 53.3 ms = **1.2× LJ, at campaign target**; find_match
+2.2×). Deferred from doc 29: **A5 first-item skip-scan** (land after doc 30,
+measured in the recorded-callout world), **matchBracket bitset precompute**
+(gmatch's `[^,]+` still linear-scans per byte — revisit only with a profile
+showing bracket heat after doc 30). Open Bart decisions: **doc 29 §B2
+tonumber grammar** (a/b/c — today lune accepts `"1_000"`/`"0o17"`/`"0b101"`/
+`"inf"`, all std.fmt artifacts, none Lua-legal) and **doc 30 v3 go-ahead**
+(pattern/tonumber recording — kills the string benches' host_barrier).
+
 ## `table.pack`/`table.unpack` recording (noted 2026-08-27, ex-`math.type` entry)
 
 The `math.type` fold arm from this entry LANDED with arc B c1 (doc 24;

@@ -1,0 +1,7 @@
+# lune bench suite  rev=aeedf4c  stamp=20260828-211900  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	lune_t0_ms	lune_jit_ms	luajit_ms	lune_t0_execns	lune_jit_execns	lune_t0_maxrss_kb	lune_jit_maxrss_kb	luajit_maxrss_kb
+str_find_match	100000	-	ok	ok	28.759	28.808	13.070	28613502	29288343	2412	2604	2368
+str_format	200000	-	ok	ok	101.555	100.542	28.285	104452422	99983098	2796	2988	2392
+str_gmatch	80000	-	ok	ok	56.513	58.657	25.194	59008297	57625083	2604	2796	2420
+str_gsub	80000	-	ok	ok	53.172	53.667	44.734	53411873	55088389	2412	2604	2336
+str_manip	100000	-	ok	ok	20.084	18.725	4.400	19173984	18400728	2412	2988	2388
