@@ -56,6 +56,7 @@ const fmath = @import("fmath.zig");
 const gc = @import("gc.zig");
 const stralloc = @import("stralloc.zig");
 const string_mod = @import("string.zig");
+const string_std = @import("stdlib/string.zig");
 const Value = value.Value;
 const Trace = trace.Trace;
 
@@ -938,6 +939,48 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                                 if (record) rec.value(i, values[i]);
                                 continue;
                             }
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, sv);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                // Doc 26 D2: the case-mapping pair — heap-only by the
+                // committed-trace pin invariant (D1); the session's Unicode
+                // version was pinned before this trace could commit, so the
+                // shared caseCore needs no VM. Null (scratch OOM, no link
+                // performed) is a defensive side-exit; tier-0 replays.
+                .supper, .slower => {
+                    const sv = values[ins.a];
+                    if (sv.isHeap() and sv.heapType() == .string) {
+                        if (ctx.heap) |heap| {
+                            const h = if (ins.op == .supper)
+                                stralloc.supperRuntime(heap, sv.asHeap())
+                            else
+                                stralloc.slowerRuntime(heap, sv.asHeap());
+                            if (h) |hdr| {
+                                values[i] = Value.heap(hdr);
+                                if (record) rec.value(i, values[i]);
+                                continue;
+                            }
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, sv);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                // Doc 26 D3: single-result codepoint — pure, non-allocating;
+                // the shared codepointCore owns the wrap/clamp semantics. An
+                // empty range (core → null) side-exits and tier-0's replay
+                // produces the nil itself.
+                .scp => {
+                    const sv = values[ins.a];
+                    const iv = values[ins.b];
+                    const jv = values[@intCast(ins.aux)];
+                    if (sv.isHeap() and sv.heapType() == .string and iv.isInt() and jv.isInt()) {
+                        const str = string_mod.String.fromHeader(sv.asHeap());
+                        if (string_std.codepointCore(str, iv.asInt(), jv.asInt())) |cp| {
+                            values[i] = Value.int(cp);
+                            if (record) rec.value(i, values[i]);
+                            continue;
                         }
                     }
                     if (record) rec.exit(i, .guard, sv);

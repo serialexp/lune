@@ -222,6 +222,18 @@ pub const RecordedBuiltin = enum(u8) {
     /// `string.rep(s, n)` — `srep2`: the TWO-argument shape only; a separator
     /// argument aborts (codex #4 pinned arity).
     rep = 16,
+    // -- doc 26: the rest of the non-pattern string surface.
+    /// `string.upper(s)` — `supper` (snew class): full Unicode simple case
+    /// mapping via the ONE shared `caseCore`. Heap-only on trace: the session's
+    /// Unicode-version pin is a committed-trace invariant (doc 26 D1), so the
+    /// kernel never touches effect state.
+    upper = 17,
+    /// `string.lower(s)` — `slower`, ditto.
+    lower = 18,
+    /// `string.codepoint(s [, i [, j]])` — `scp`: the SINGLE-result shape only
+    /// (`instr.c == 1`; multi-result calls stay a barrier). Pure and
+    /// non-allocating; an empty range side-exits (tier-0 renders nil).
+    codepoint = 19,
 };
 
 /// Which **nondeterministic input** a native represents, if any. A native with a

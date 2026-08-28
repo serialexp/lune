@@ -5,7 +5,7 @@
 // cross-language decode test can assert on it directly.
 
 import type { TraceFileOutput, TraceOutput, ConstValueOutput } from "./gen/generated";
-import { irOpName, obsTypeName, NO_OPERAND_OPS, UNARY_OR_GUARD_OPS } from "./enums";
+import { irOpName, obsTypeName, NO_OPERAND_OPS, UNARY_OR_GUARD_OPS, TERNARY_AUX_OPS } from "./enums";
 
 /** The decoded `ConstValue.body` `{ type, value }` envelope, straight from the
  * generated decoder — a discriminated union keyed on `type`. */
@@ -56,6 +56,8 @@ function operandsOf(opName: string, a: number, b: number, aux: number): string {
   }
   if (NO_OPERAND_OPS.has(opName as never)) return "";
   if (UNARY_OR_GUARD_OPS.has(opName as never)) return `%${a}`;
+  // ssub/scp: the third operand rides aux as a ref (doc 24 codex #4 / doc 26).
+  if (TERNARY_AUX_OPS.has(opName as never)) return `%${a}  %${b}  %${aux}`;
   return `%${a}  %${b}`;
 }
 

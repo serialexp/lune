@@ -1192,7 +1192,7 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, see
     if (heap == null) {
         for (t.instrs) |ins| {
             switch (ins.op) {
-                .guard_gc, .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2 => return null,
+                .guard_gc, .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower => return null,
                 else => {},
             }
         }
@@ -1786,15 +1786,22 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             // value or a VALUE_LANE aload result, so the existing homes/flush
             // (TAG_HEAP re-box) apply. Lowered as a mid-body callout into the
             // shared `stralloc` body; side-exits on OOM (null return).
+            //
+            // Doc 26 (review M5): every allocating string producer also
+            // fail-closes on a malformed result-`ty` stamp (`ins.ty` must be
+            // `.heap` — that stamp is what the optimizer/liveness trusted; a
+            // disagreeing instruction is corrupt IR, so refuse to compile it).
             .tostr_int => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .int) return false;
+                if (ins.ty != .heap) return false;
                 kinds[i] = .heap;
                 is_string[i] = true;
             },
             .tostr_num => {
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .float) return false;
+                if (ins.ty != .heap) return false;
                 kinds[i] = .heap;
                 is_string[i] = true;
             },
@@ -1828,19 +1835,32 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             // one clean side-exit (no `Heap.link` precedes the fallible step;
             // stralloc.zig's audit) — so each may exit in the body.
             .ssub => {
-                // a = string, b = start (int), aux = end (int ref — the one
+                // a = string, b = start (int), aux = end (int ref — a
                 // three-operand op; assertWellFormed pins 0 ≤ aux < i).
                 if (ins.a >= i or ins.b >= i) return false;
                 if (ins.aux < 0 or ins.aux >= i) return false;
                 if (!is_string[ins.a]) return false;
                 if (kinds[ins.b] != .int) return false;
                 if (kinds[@intCast(ins.aux)] != .int) return false;
+                if (ins.ty != .heap) return false;
                 kinds[i] = .heap;
                 is_string[i] = true;
             },
             .srev => {
                 if (ins.a >= i) return false;
                 if (!is_string[ins.a]) return false;
+                if (ins.ty != .heap) return false;
+                kinds[i] = .heap;
+                is_string[i] = true;
+            },
+            // Doc 26 D4: string.upper/lower — string→string case producers via
+            // the shared Unicode `caseCore` (the FULL core, not an ASCII
+            // special case — Z-6). Same shape as srev: one string operand,
+            // fresh-or-interned `*GcHeader` result, null → side-exit (OOM).
+            .supper, .slower => {
+                if (ins.a >= i) return false;
+                if (!is_string[ins.a]) return false;
+                if (ins.ty != .heap) return false;
                 kinds[i] = .heap;
                 is_string[i] = true;
             },
@@ -1849,6 +1869,7 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 // core; an invalid one returns null → side-exit).
                 if (ins.a >= i) return false;
                 if (kinds[ins.a] != .int) return false;
+                if (ins.ty != .heap) return false;
                 kinds[i] = .heap;
                 is_string[i] = true;
             },
@@ -1856,8 +1877,24 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (ins.a >= i or ins.b >= i) return false;
                 if (!is_string[ins.a]) return false;
                 if (kinds[ins.b] != .int) return false;
+                if (ins.ty != .heap) return false;
                 kinds[i] = .heap;
                 is_string[i] = true;
+            },
+            // Doc 26 D3/D4: string.codepoint — the NON-allocating string
+            // reader (`.pure3`; no guard_gc bound, no heap needed). a =
+            // string, b = i (int), aux = j (int ref, ssub's encoding). Result
+            // is a plain int: the scalar codepoint, or the −1 sentinel the
+            // callout turns into a side-exit (empty range → tier-0 replays to
+            // nil). Bounds precede EVERY kinds[]/is_string[] access.
+            .scp => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (ins.aux < 0 or ins.aux >= i) return false;
+                if (!is_string[ins.a]) return false;
+                if (kinds[ins.b] != .int) return false;
+                if (kinds[@intCast(ins.aux)] != .int) return false;
+                if (ins.ty != .int) return false;
+                kinds[i] = .int;
             },
             // Doc 24 D3: the allocation-budget entry guard. Value-less; lowered
             // to two loads of the baked heap counters + the gc_stress byte test.
@@ -2397,6 +2434,11 @@ fn opMayExitInBody(
         .srev,
         .schar1,
         .srep2,
+        // Doc 26: the case producers exit on a null return (OOM); scp exits
+        // on the −1 sentinel (empty range — tier-0 replays to nil).
+        .supper,
+        .slower,
+        .scp,
         => true,
         // Doc 25: only the INT lane exits (a zero divisor side-exits so
         // tier-0 raises DivisionByZero; the (minInt, -1) pair is computed
@@ -2484,6 +2526,19 @@ const BodyCallout = enum {
     /// `stralloc.srep2Runtime`: separator-less `string.rep` via `rep2Core`.
     /// Same split; a negative/zero count resolves inside the core.
     srep2,
+    /// `stralloc.supperRuntime` (doc 26): full-Unicode `string.upper` via the
+    /// shared `caseCore`. **may_allocate = true** (host scratch first, then at
+    /// most ONE `Heap.link` at the final intern — the D5 audit rule; an intern
+    /// hit links zero), **may_collect = false** (single collect site: tier-0's
+    /// dispatch prologue).
+    supper,
+    /// `stralloc.slowerRuntime`: likewise for `string.lower`. Same split.
+    slower,
+    /// `stralloc.scpRuntime` (doc 26): `string.codepoint` single-result read
+    /// via the shared `codepointCore` — a pure (s, i, j) → i64 reader.
+    /// Allocates NOTHING (the one non-allocating stralloc shim); −1 sentinel
+    /// for the empty range (never a real codepoint — scalars are 0…0x10FFFF).
+    scp,
 };
 
 /// The doc-22 capability, renamed for the doc-24 may_allocate/may_collect
@@ -2499,6 +2554,7 @@ fn calloutMayCollect(c: BodyCallout) bool {
         .fsin, .fcos, .fpow, .fmod, .ffloordiv => false,
         .tostr_int, .tostr_num => false,
         .ssub, .srev, .schar1, .srep2 => false,
+        .supper, .slower, .scp => false,
     };
 }
 
@@ -2525,6 +2581,9 @@ fn bodyCalloutOf(
         .ssub => .ssub,
         .srev => .srev,
         .schar1 => .schar1,
+        .supper => .supper,
+        .slower => .slower,
+        .scp => .scp,
         .srep2 => .srep2,
         else => null,
     };
@@ -2755,6 +2814,9 @@ fn isTransient(op: trace.IrOp) bool {
         // slen the cp_len int. The snew class (c3) likewise materializes its
         // fresh-or-interned `*GcHeader` result in a GP home.
         .tostr_int, .tostr_num, .slen, .ssub, .srev, .schar1, .srep2 => true,
+        // doc 26: the case producers materialize their `*GcHeader` in a GP
+        // home like the snew class; scp its scalar codepoint int.
+        .supper, .slower, .scp => true,
         // href materializes the seeded cell pointer in a register (like aref); hload
         // materializes the decoded scalar field value. hstore/guard_hash are effects.
         .href, .hload => true,
@@ -2806,8 +2868,11 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
         // its string (a), schar1 its codepoint (a). guard_string reads the
         // string it type-pins (a) — hoisted to the prologue for a slot_load,
         // statically discharged on a producer, but liveness must still hold.
-        .ssub, .srep2 => .{ .a = true, .b = true },
-        .srev, .schar1, .guard_string => .{ .a = true, .b = false },
+        // doc 26: scp reads string (a) + start index (b) — its END index ref
+        // rides `aux` (the ssub encoding), extended in `analyzeInner` exactly
+        // like ssub's. supper/slower read only their string (a), like srev.
+        .ssub, .srep2, .scp => .{ .a = true, .b = true },
+        .srev, .schar1, .guard_string, .supper, .slower => .{ .a = true, .b = false },
         // guard_fits reads the value it range-checks (a); guard_append reads the aref
         // token (a) and reaches len/cap/hash through aref.a — no second operand.
         .guard_fits, .guard_append => .{ .a = true, .b = false },
@@ -3161,11 +3226,12 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                 if (last_use[href_ins.a] < i) last_use[href_ins.a] = @intCast(i);
             }
         }
-        // ssub (doc 24 c3) reads a THIRD operand — the end-index ref in `aux`
-        // (the one three-operand op) — which `operandReads`' two-field shape
+        // ssub (doc 24 c3) and scp (doc 26) read a THIRD operand — the
+        // end-index ref in `aux` — which `operandReads`' two-field shape
         // cannot express. Extend its liveness here, exactly as the dyn-href
-        // root above, so the end index survives to the callout's rcx staging.
-        if (ins.op == .ssub) {
+        // root above, so the end index survives to the callout's staging
+        // (ssub → rcx, scp → rdx).
+        if (ins.op == .ssub or ins.op == .scp) {
             const ar: usize = @intCast(ins.aux);
             if (last_use[ar] < i) last_use[ar] = @intCast(i);
         }
@@ -4833,7 +4899,9 @@ fn emitTostrCallout(
 }
 
 /// Emit the mid-body callout for a snew-class producer (`ssub`/`srev`/
-/// `schar1`/`srep2` — doc 24 D4/c3). Same shape as `emitTostrCallout`: save,
+/// `schar1`/`srep2` — doc 24 D4/c3 — and, doc 26, the case producers
+/// `supper`/`slower`, which ride srev's exact arg shape). Same shape as
+/// `emitTostrCallout`: save,
 /// SysV args (rdi = the baked `*Heap`, then the op's operands), call the
 /// shared noinline `stralloc` shim — which calls THE SAME core tier-0 runs —
 /// through an absolute pointer, stash the result across the restore, then
@@ -4872,7 +4940,7 @@ fn emitSnewCallout(
         },
         // srep2(heap, s, n): count in rdx.
         .srep2 => try placeToReg(a, .rdx, placeOfRef(alloc, ins.b)),
-        .srev, .schar1 => {},
+        .srev, .schar1, .supper, .slower => {},
         else => unreachable,
     }
     // arg0: the Heap, baked absolute (stable for the VM's lifetime).
@@ -4885,6 +4953,8 @@ fn emitSnewCallout(
         .srev => @intFromPtr(&stralloc.srevRuntime),
         .schar1 => @intFromPtr(&stralloc.schar1Runtime),
         .srep2 => @intFromPtr(&stralloc.srep2Runtime),
+        .supper => @intFromPtr(&stralloc.supperRuntime),
+        .slower => @intFromPtr(&stralloc.slowerRuntime),
         else => unreachable,
     };
     try a.subRegImm32(.rsp, 8);
@@ -4900,6 +4970,53 @@ fn emitSnewCallout(
     try emitCalloutRestore(a, alloc);
     try a.cmpRegImm32(.rcx, 0);
     try jccNativeExit(a, exit_labels, i, .e); // 0 → side-exit, tier-0 replays
+    try regToPlace(a, placeOfRef(alloc, i), .rcx);
+}
+
+/// Emit the mid-body callout for `scp` (`string.codepoint`, single result —
+/// doc 26 D4). A SEPARATE emitter, not a mode flag on `emitSnewCallout`,
+/// because the shape differs on every axis that matters: no heap argument
+/// (`scpRuntime` is the one non-allocating stralloc shim — args (s, i, j) in
+/// rdi/rsi/rdx), an int result rather than a `*GcHeader`, and the failure
+/// sentinel is −1 rather than null — compared FULL-WIDTH signed (`cmp r64,
+/// imm32` sign-extends, so this is a 64-bit compare; a real codepoint is
+/// 0…0x10FFFF and can never alias it). −1 (empty range) side-exits and tier-0
+/// replays the call to its nil result — through whatever continuation follows
+/// (nil-consuming or raising), which native never needs to know.
+///
+/// Operand staging is hazard-free: homes are r8–r11 / rbp / r12–r15 /
+/// rsp-relative spills — never rdi/rsi/rdx — and `emitCalloutSave` wrote
+/// rdi/rsi (the SoA bases) to the frame already, so loading the three arg
+/// registers in any order clobbers no unread source.
+fn emitScpCallout(
+    a: *x64.Assembler,
+    alloc: *const Alloc,
+    ins: trace.IrInstr,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
+    try emitCalloutSave(a, alloc);
+
+    // scpRuntime(s, i, j): the string `*GcHeader` in rdi, start index in rsi,
+    // end index in rdx (the aux ref — analyzeInner extended its liveness).
+    try placeToReg(a, .rdi, placeOfRef(alloc, ins.a));
+    try placeToReg(a, .rsi, placeOfRef(alloc, ins.b));
+    try placeToReg(a, .rdx, placeOfRef(alloc, @intCast(ins.aux)));
+
+    // Call the shim via an absolute address in rax. Same alignment dance as
+    // emitHrefCallout (body runs with rsp % 16 == 8).
+    try a.subRegImm32(.rsp, 8);
+    try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&stralloc.scpRuntime))));
+    try a.callReg(.rax);
+    try a.addRegImm32(.rsp, 8);
+
+    // rax = the codepoint, or −1 (empty range). The result check must come
+    // AFTER the restore (the deopt flush relies on slot homes being correct),
+    // so stash it in rcx — scratch, never a home, untouched by the restore.
+    try a.movRegReg(.rcx, .rax);
+    try emitCalloutRestore(a, alloc);
+    try a.cmpRegImm32(.rcx, -1);
+    try jccNativeExit(a, exit_labels, i, .e); // −1 → side-exit, tier-0 replays to nil
     try regToPlace(a, placeOfRef(alloc, i), .rcx);
 }
 
@@ -5603,7 +5720,11 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // Doc 24 D4/c3: the snew class — mid-body callouts into the shared
             // `stralloc` shims (which run THE SAME cores as tier-0). Side-exit
             // on null (OOM or the collapsed tier-0 raise).
-            .ssub, .srev, .schar1, .srep2 => try emitSnewCallout(a, alloc, heap.?, ins, i, exit_labels),
+            .ssub, .srev, .schar1, .srep2, .supper, .slower => try emitSnewCallout(a, alloc, heap.?, ins, i, exit_labels),
+            // Doc 26 D3/D4: string.codepoint — the non-allocating string
+            // reader. No heap arg; −1 sentinel → side-exit (tier-0 replays
+            // the call to its nil result).
+            .scp => try emitScpCallout(a, alloc, ins, i, exit_labels),
             // Doc 24 D4: `#s` of a proven string — one load of the cached
             // `cp_len` (a usize field; every real string's count fits i63).
             .slen => {

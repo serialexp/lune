@@ -140,6 +140,7 @@ fn detectDeadCarries(
             .hload, .guard_hash,
             .guard_builtin, .fsqrt, .fsin, .fcos,
             .tostr_int, .tostr_num, .slen, .guard_string, .srev, .schar1,
+            .supper, .slower,
             // Grid-cell ops reading only `a` (doc 14): the cell load and the
             // structural guards that reach the table/cell through the address chain.
             .gload, .guard_grid, .guard_stride, .guard_gpresent,
@@ -153,7 +154,8 @@ fn detectDeadCarries(
                 uses[ins.a] += 1;
                 uses[ins.b] += 1;
             },
-            .ssub => {
+            // scp shares ssub's three-operand encoding (doc 26 D3).
+            .ssub, .scp => {
                 uses[ins.a] += 1;
                 uses[ins.b] += 1;
                 uses[@intCast(ins.aux)] += 1;
@@ -275,11 +277,13 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             .hload, .guard_hash,
             .guard_builtin, .fsqrt, .fsin, .fcos,
             .tostr_int, .tostr_num, .slen, .guard_string, .srev, .schar1,
+            .supper, .slower,
             .gload, .guard_grid, .guard_stride, .guard_gpresent,
             .alen,
             => ins.a == idx,
             .srep2 => ins.a == idx or ins.b == idx,
-            .ssub => ins.a == idx or ins.b == idx or @as(trace.Ref, @intCast(ins.aux)) == idx,
+            // scp shares ssub's three-operand encoding (doc 26 D3).
+            .ssub, .scp => ins.a == idx or ins.b == idx or @as(trace.Ref, @intCast(ins.aux)) == idx,
             .aref, .astore, .astore_append, .href, .hstore,
             .garow, .gcell, .gstore, .guard_gcol => ins.a == idx or ins.b == idx,
             .phi => (ins.aux == trace.PHI_INTERNAL and ins.a == idx) or ins.b == idx,

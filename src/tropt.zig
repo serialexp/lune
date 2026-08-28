@@ -75,7 +75,7 @@ pub const Optimized = struct {
     }
 };
 
-const OpKind = enum { konst, slot_load, binary, unary, cvt, guard, aref, aload, astore, loop, phi, preheader, alloc, gcguard };
+const OpKind = enum { konst, slot_load, binary, unary, cvt, guard, aref, aload, astore, loop, phi, preheader, alloc, gcguard, pure3 };
 
 fn kindOf(op: IrOp) OpKind {
     return switch (op) {
@@ -179,6 +179,20 @@ fn kindOf(op: IrOp) OpKind {
         // canonical-to-themselves already, so no extra work). ssub's third
         // operand rides `aux` as a ref — every operand walk below handles it.
         .ssub, .srev, .schar1, .srep2 => .alloc,
+        // Doc 26 D2: the case-mapping pair joins the snew `.alloc` discipline
+        // wholesale (never DCE'd/CSE'd/hoisted/reordered; scratch precedes the
+        // intern, so a repeat is a fallible operation — codex #8's rule).
+        .supper, .slower => .alloc,
+        // Doc 26 D3: `scp` is the one PURE THREE-operand producer (`aux` rides
+        // the end ref, the ssub encoding) — its own kind rather than `.binary`
+        // plus scattered op-keyed exceptions (review M4: liveness, LICM and
+        // the preheader cone walk only a/b for `.binary`; a missed `aux` is a
+        // silent wrong-ref). The `.pure3` contract, each property pinned by a
+        // test: all three operands covered in liveness + compaction; CSE and
+        // LICM deliberately EXCLUDED in v1 (CSE would be sound — CseKey covers
+        // `aux` — but a root-class admission needs its own story; fail
+        // closed); DCE admitted (pure).
+        .scp => .pure3,
         // `slen` is a pure leaf producer over an interned string (allocates
         // nothing): ordinary `.unary` — CSE'd, DCE'd if dead, hoisted iff its
         // operand is invariant. Deliberately never constant-folded (the fold
@@ -385,6 +399,9 @@ pub fn optimize(
             // folded, never CSE'd (see kindOf). `.gcguard` likewise — and its
             // `a` is NOT an operand, so it must not touch the guard tables.
             .alloc, .gcguard => {},
+            // `.pure3` (scp): canonical to itself; CSE deliberately excluded
+            // (kindOf's contract note) and no fold arm exists for it.
+            .pure3 => {},
             .loop => {},
             // φ is a loop-carried root: canonical to itself, never folded/CSE'd.
             .phi => {},
@@ -447,6 +464,13 @@ pub fn optimize(
                 .aref, .astore => {
                     live[canon[ins.a]] = true;
                     live[canon[ins.b]] = true;
+                },
+                // `.pure3` (scp): ALL THREE operands stay alive — `aux` is the
+                // end ref (the reason this kind exists; review M4).
+                .pure3 => {
+                    live[canon[ins.a]] = true;
+                    live[canon[ins.b]] = true;
+                    live[canon[@intCast(ins.aux)]] = true;
                 },
                 // φ always keeps its back-edge update `b` alive. The init `a` is a
                 // real ref only for an *internal* φ (the preheader value); a
@@ -532,9 +556,10 @@ pub fn optimize(
                 hoist[i] = inv[i];
             },
             // Guards, memory ops, the loop terminator, φ, `.alloc` (id-stream
-            // effects) and `.gcguard` (must re-check per iteration): not
+            // effects), `.gcguard` (must re-check per iteration), and `.pure3`
+            // (scp — LICM deliberately excluded in v1, doc 26 D3): not
             // invariant-hoistable.
-            .guard, .aref, .aload, .astore, .loop, .phi, .preheader, .alloc, .gcguard => {},
+            .guard, .aref, .aload, .astore, .loop, .phi, .preheader, .alloc, .gcguard, .pure3 => {},
         }
     }
 
@@ -629,6 +654,13 @@ pub fn optimize(
                 out.a = new_index[canon[ins.a]];
                 if (ins.op == .ssub or ins.op == .srep2) out.b = new_index[canon[ins.b]];
                 if (ins.op == .ssub) out.aux = @intCast(new_index[canon[@intCast(ins.aux)]]);
+            },
+            // `.pure3` (scp): remap all three — a missed `aux` here is a wild
+            // ref after compaction (review M4's exact hazard).
+            .pure3 => {
+                out.a = new_index[canon[ins.a]];
+                out.b = new_index[canon[ins.b]];
+                out.aux = @intCast(new_index[canon[@intCast(ins.aux)]]);
             },
             .gcguard => {}, // operand-free; aux (the bound A) rides verbatim
             .aref, .astore => {

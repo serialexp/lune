@@ -100,7 +100,7 @@ test "driveChain ordinary_header: chains to a same-anchor sibling" {
     // Fake a guard failure in Trace A at instr index 1 (the guard_int), and
     // exclude A (the dispatcher's `visited` set) so the driver walks to B.
     var tr_regs = TestRegs{ .regs = &regs };
-    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false);
+    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false, false);
     tr_regs.commit(); // the chained side trace mutated the window — reflect it back
     try testing.expect(chained != null);
     try testing.expectEqual(@as(usize, 3), chained.?.completed); // Trace B ran 3 iters
@@ -278,7 +278,7 @@ test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on
     var regs = [_]Value{ Value.int(0), Value.int(4) };
     var tr_regs = TestRegs{ .regs = &regs };
     {
-        const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false);
+        const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false, false);
         try testing.expect(chained == null);
         try testing.expectEqual(@as(usize, 0), SeedStub.calls);
     }
@@ -301,7 +301,7 @@ test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on
     // guard_true fails → completed=1. Both values prove the seed flowed in.
     {
         regs = .{ Value.int(0), Value.int(4) };
-        const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false);
+        const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false, false);
         tr_regs.commit();
         try testing.expectEqual(@as(usize, 1), SeedStub.calls);
         try testing.expect(chained != null);
@@ -315,7 +315,7 @@ test "B-iii chained hash-drift (doc 22 §B.6): SEED_HASH_DECLINE still chains on
     {
         SeedStub.rc = trace.NativeSeedCtx.SEED_CAPACITY_DECLINE;
         regs = .{ Value.int(0), Value.int(4) };
-        const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false);
+        const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false, false);
         try testing.expectEqual(@as(usize, 2), SeedStub.calls);
         try testing.expect(chained == null);
     }
@@ -815,6 +815,7 @@ test "driveChain ir_numeric_for_done: a longer candidate cannot invalidate the c
         .ir,
         .{ .ir_numeric_for_done = vals },
         &.{},
+        false,
         false,
     );
 

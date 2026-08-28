@@ -2042,3 +2042,239 @@ test "doc 25: int divide + float-kernel callout + spill pressure — div_save ow
     regs[13] = Value.int(-17);
     try expectMatch(&t, &regs);
 }
+
+// --- doc 26: string.upper/lower (supper/slower) + string.codepoint (scp) ----
+
+/// The doc-26 case-producer shape: `u = upper(s); l = lower(u);
+/// acc = acc + #u + #l; i += 1; while i < limit`. regs: r0=i, r1=limit,
+/// r2=acc, r3=s (observed string → guard_string, prologue-pinned natively).
+/// Exercises the FULL Unicode cores (Z-6 — never an ASCII special case),
+/// proven-string chaining (slower.a and both slen.a are producer results),
+/// and the budget bound A=2 (one link per case producer).
+fn caseUpperLowerTrace(consts: []Value) Trace {
+    const instrs = struct {
+        var arr = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: i
+            .{ .op = .slot_load, .aux = 1 }, // 1: limit
+            .{ .op = .guard_int, .a = 0 }, // 2
+            .{ .op = .guard_int, .a = 1 }, // 3
+            .{ .op = .lt, .a = 0, .b = 1 }, // 4
+            .{ .op = .guard_true, .a = 4 }, // 5
+            .{ .op = .slot_load, .aux = 3 }, // 6: s
+            .{ .op = .guard_string, .a = 6 }, // 7
+            .{ .op = .guard_gc, .aux = 2 }, // 8: budget, A = 2
+            .{ .op = .supper, .a = 6, .ty = .heap }, // 9: upper(s)
+            .{ .op = .slower, .a = 9, .ty = .heap }, // 10: lower(upper(s)) — proven chain
+            .{ .op = .slen, .a = 9, .ty = .int }, // 11: #u
+            .{ .op = .slen, .a = 10, .ty = .int }, // 12: #l
+            .{ .op = .slot_load, .aux = 2 }, // 13: acc
+            .{ .op = .guard_int, .a = 13 }, // 14
+            .{ .op = .add, .a = 13, .b = 11 }, // 15
+            .{ .op = .add, .a = 15, .b = 12 }, // 16
+            .{ .op = .konst, .aux = 0 }, // 17: 1
+            .{ .op = .add, .a = 0, .b = 17 }, // 18: i + 1
+            .{ .op = .phi, .b = 16, .aux = 2 },
+            .{ .op = .phi, .b = 18, .aux = 0 },
+            .{ .op = .loop },
+        };
+    };
+    const es = struct {
+        var arr = [_]u16{};
+    };
+    return Trace{ .anchor = undefined, .instrs = &instrs.arr, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
+}
+
+test "doc 26: supper + slower on a guard_string-pinned slot — tier parity, full Unicode mapping, same allocation count" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var consts = [_]Value{Value.int(1)};
+    const t = caseUpperLowerTrace(&consts);
+
+    // A mixed-case, mixed-width subject: ASCII + Latin-1 supplement + Greek.
+    // Both directions of the Unicode table are exercised in ONE body (upper
+    // then lower), and the cp count (9) differs from the byte count (13), so
+    // a byte-level shortcut would diverge from the shared cores immediately.
+    const subject = "héLlo Αβγ"; // 9 cps
+    var iheap = gc.Heap.init(gpa);
+    defer iheap.deinit();
+    const isubj = try iheap.intern(subject);
+    // i = 1..4 commit; acc = 4 iterations x (9 + 9) = 72.
+    const regs_init_i = [_]Value{ Value.int(1), Value.int(5), Value.int(0), Value.heap(&isubj.header) };
+    const iobjs_before = iheap.object_count;
+    var iregs = regs_init_i;
+    const values = try gpa.alloc(Value, t.instrs.len);
+    defer gpa.free(values);
+    const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &t, &iregs, values);
+    try testing.expectEqual(@as(usize, 4), iresult.completed);
+    try testing.expectEqual(Value.int(72).payload.bits, iregs[2].payload.bits);
+    // The REAL Unicode mappings ran: é→É and Α→Α / β→Β / γ→Γ (Greek), then
+    // the round-trip all-lower form — never an ASCII-only mapping.
+    try testing.expect(iheap.internedLookup("HÉLLO ΑΒΓ") != null);
+    try testing.expect(iheap.internedLookup("héllo αβγ") != null);
+    const iallocs = iheap.object_count - iobjs_before;
+    try testing.expect(iallocs > 0);
+
+    // Native: fresh heap + its own copy of the subject, same trace.
+    var nheap = gc.Heap.init(gpa);
+    defer nheap.deinit();
+    const nsubj = try nheap.intern(subject);
+    const regs_init_n = [_]Value{ Value.int(1), Value.int(5), Value.int(0), Value.heap(&nsubj.header) };
+    const nobjs_before = nheap.object_count;
+    var ct = nativegen.compileWithHeap(gpa, &t, &nheap) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    var nregs = regs_init_n;
+    const nresult = try util.runNative(ct, &nregs);
+    try testing.expectEqual(iresult.completed, nresult.completed);
+    try testing.expectEqual(iregs[0].payload.bits, nregs[0].payload.bits);
+    try testing.expectEqual(iregs[2].payload.bits, nregs[2].payload.bits);
+    try testing.expectEqual(@intFromPtr(&nsubj.header), nregs[3].payload.bits);
+    // Same allocation count — the doc 24 D2 id-stream claim, now for the case
+    // producers.
+    try testing.expectEqual(iallocs, nheap.object_count - nobjs_before);
+    try testing.expect(nheap.internedLookup("HÉLLO ΑΒΓ") != null);
+    try testing.expect(nheap.internedLookup("héllo αβγ") != null);
+
+    // Re-running against the SAME heap re-interns nothing (pure cores +
+    // intern hits): committed count identical, object_count unchanged.
+    const objs_mid = nheap.object_count;
+    var rregs = regs_init_n;
+    const rresult = try util.runNative(ct, &rregs);
+    try testing.expectEqual(iresult.completed, rresult.completed);
+    try testing.expectEqual(objs_mid, nheap.object_count);
+
+    // Fail closed with NO heap: the case producers allocate, so the compiler
+    // declines the trace without one (the doc-24 D5 posture).
+    {
+        var arena = McodeArena.init(gpa);
+        defer arena.deinit();
+        try testing.expect(compileInto(gpa, &arena, &t, null, null) == null);
+    }
+}
+
+/// The doc-26 scp shape: `acc = acc + codepoint(s, i, i); i += 1; while
+/// i < limit` — the single-codepoint sliding read. regs: r0=i, r1=limit,
+/// r2=acc, r3=s. The 2-arg source form makes b and aux the SAME ref (j
+/// defaults to runtime i — recBSCodepoint shares the ref), which this trace
+/// mirrors: instr 9's b == aux == 0.
+fn scpSlideTrace(consts: []Value) Trace {
+    const instrs = struct {
+        var arr = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: i
+            .{ .op = .slot_load, .aux = 1 }, // 1: limit
+            .{ .op = .guard_int, .a = 0 }, // 2
+            .{ .op = .guard_int, .a = 1 }, // 3
+            .{ .op = .lt, .a = 0, .b = 1 }, // 4
+            .{ .op = .guard_true, .a = 4 }, // 5
+            .{ .op = .slot_load, .aux = 3 }, // 6: s
+            .{ .op = .guard_string, .a = 6 }, // 7
+            .{ .op = .slot_load, .aux = 2 }, // 8: acc
+            .{ .op = .scp, .a = 6, .b = 0, .aux = 0, .ty = .int }, // 9: codepoint(s, i, i) — b == aux
+            .{ .op = .guard_int, .a = 8 }, // 10
+            .{ .op = .add, .a = 8, .b = 9 }, // 11
+            .{ .op = .konst, .aux = 0 }, // 12: 1
+            .{ .op = .add, .a = 0, .b = 12 }, // 13: i + 1
+            .{ .op = .phi, .b = 11, .aux = 2 },
+            .{ .op = .phi, .b = 13, .aux = 0 },
+            .{ .op = .loop },
+        };
+    };
+    const es = struct {
+        var arr = [_]u16{};
+    };
+    return Trace{ .anchor = undefined, .instrs = &instrs.arr, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
+}
+
+test "doc 26: scp — tier parity, U+0000 as a REAL result, empty-range side-exit, zero allocations, and no heap required" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var consts = [_]Value{Value.int(1)};
+    const t = scpSlideTrace(&consts);
+
+    // Subject "a\x00é": U+0000 is a real, in-range scalar whose scp result (0)
+    // must flow as an ordinary int — only the −1 sentinel may exit (minor
+    // review note 2: full 64-bit signed compare, no result aliasing). The
+    // trailing é keeps the read cp-indexed (2 bytes, 1 cp).
+    const subject = "a\x00é";
+    var iheap = gc.Heap.init(gpa);
+    defer iheap.deinit();
+    const isubj = try iheap.intern(subject);
+    // limit = 100 forces the EXIT to come from scp itself: i = 1..3 commit
+    // (97 + 0 + 233), i = 4 is past cp_len → codepointCore → null → −1 →
+    // side-exit at instr 9 in both tiers. acc = 330.
+    const regs_init_i = [_]Value{ Value.int(1), Value.int(100), Value.int(0), Value.heap(&isubj.header) };
+    const iobjs_before = iheap.object_count;
+    var iregs = regs_init_i;
+    const values = try gpa.alloc(Value, t.instrs.len);
+    defer gpa.free(values);
+    const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &t, &iregs, values);
+    try testing.expectEqual(@as(usize, 3), iresult.completed);
+    try testing.expectEqual(@as(u32, 9), iresult.exit_instr);
+    try testing.expectEqual(Value.int(330).payload.bits, iregs[2].payload.bits);
+    // The one non-allocating stralloc shim: NOTHING was interned or linked.
+    try testing.expectEqual(iobjs_before, iheap.object_count);
+
+    // Native — WITHOUT a heap: scp is non-allocating, so unlike every other
+    // stralloc op the trace must compile with heap == null (nothing to bake).
+    var ct = nativegen.compile(gpa, &t) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    // The native subject must be the SAME interned string as the oracle's —
+    // scp reads through the pointer, no heap identity involved.
+    var nregs = regs_init_i;
+    const nresult = try util.runNative(ct, &nregs);
+    try testing.expectEqual(iresult.completed, nresult.completed);
+    try testing.expectEqual(iresult.exit_instr, nresult.exit_instr);
+    try util.expectRegsEqual(&iregs, &nregs);
+    try testing.expectEqual(iobjs_before, iheap.object_count);
+}
+
+test "doc 26 (review M5): malformed result-ty stamps fail closed — new ops AND the retrofitted snew arms" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+
+    // (a) supper stamped .int instead of .heap: refuse to compile.
+    {
+        var consts = [_]Value{Value.int(1)};
+        const t = caseUpperLowerTrace(&consts);
+        const saved = t.instrs[9].ty;
+        t.instrs[9].ty = .int;
+        defer t.instrs[9].ty = saved;
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+    }
+    // (b) scp stamped .heap instead of .int: refuse to compile.
+    {
+        var consts = [_]Value{Value.int(1)};
+        const t = scpSlideTrace(&consts);
+        const saved = t.instrs[9].ty;
+        t.instrs[9].ty = .heap;
+        defer t.instrs[9].ty = saved;
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+    }
+    // (c) The RETROFIT is live on the pre-existing arms too: an ssub stamped
+    // .int (instr 11 of the c3 flagship trace) now also refuses — before doc
+    // 26 this compiled on the stamp's word alone.
+    {
+        var consts = [_]Value{ Value.int(2), Value.int(1) };
+        const t = snewSubRevTrace(&consts);
+        const saved = t.instrs[11].ty;
+        t.instrs[11].ty = .int;
+        defer t.instrs[11].ty = saved;
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+    }
+    // (d) Control: the same three traces with honest stamps all compile (the
+    // checks above failed for the STAMP, not for some unrelated reason).
+    {
+        var consts_c = [_]Value{Value.int(1)};
+        const tc = caseUpperLowerTrace(&consts_c);
+        var c1 = nativegen.compileWithHeap(gpa, &tc, &heap) orelse return error.NativeBailedUnexpectedly;
+        c1.deinit();
+        const ts = scpSlideTrace(&consts_c);
+        var c2 = nativegen.compileWithHeap(gpa, &ts, &heap) orelse return error.NativeBailedUnexpectedly;
+        c2.deinit();
+        var consts_s = [_]Value{ Value.int(2), Value.int(1) };
+        const tv = snewSubRevTrace(&consts_s);
+        var c3 = nativegen.compileWithHeap(gpa, &tv, &heap) orelse return error.NativeBailedUnexpectedly;
+        c3.deinit();
+    }
+}

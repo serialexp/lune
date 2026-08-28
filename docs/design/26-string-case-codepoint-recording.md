@@ -1,7 +1,12 @@
 # lune — finishing the non-pattern string recording surface: upper/lower + codepoint
 
-Status: **codex-reviewed (no blockers; 8 majors, 5 minors — all folded in
-below), ready to implement.**
+Status: **LANDED (2026-08-28; c1 = 3d0b946 D1a fix, c2 = the three ops
+end-to-end). See "Landed results" at the bottom — all gates green; str_manip
+itself did NOT move because its hot path spells `lower(upper(a))`, which
+aborts at the pre-existing MULTRET nested-call frontier (TODO.md #1, now the
+bench's sole blocker — the intermediate-local form of the same core records
+with zero aborts).**
+Codex review: no blockers; 8 majors, 5 minors — all folded in below.
 Codex verdict: D1 is viable for the current VM lifecycle — "I did not find a
 current internal restore, suspend, replay, deopt, or patched-link path that
 falsifies the pin at execution" — but the proof as first drafted was
@@ -429,3 +434,49 @@ rendering, troptdiag walks). Minors: #m1 arity wording split (b vs c). #m2
 sentinel: 64-bit signed compare + U+0000 test. #m3 codepointCore owns the
 range logic. #m4 stralloc module-doc scope amendment. #m5 pin-before-
 scratch-OOM ordering recorded in the proof.
+
+## Landed results (2026-08-28)
+
+Implementation matched this doc; deltas from the plan, findings, and the
+gate record:
+
+- **Everything specified landed as specified**: `supper`/`slower` (snew
+  `.alloc` class via `emitSnewCallout`, srev arg shape), `scp` (`.pure3`,
+  separate `emitScpCallout`, args (s,i,j) in rdi/rsi/rdx, no heap arg, −1
+  sentinel via full-width `cmp r64, imm32` sign-extension), wire ordinals
+  69/70/71, `requires_unicode_pin` stamping + entry/`driveChain` asserts,
+  the M5 result-`ty` retrofit on ALL existing snew/tostr arms, tier-1a arms,
+  and the D6 sweep (traceser count 69→72, viz `TERNARY_AUX_OPS` — which also
+  fixed ssub's aux never rendering in the web disasm).
+- **One integration point the doc's sweep missed, caught by the else-arm
+  audit**: `isProvenStringRef` (trace.zig) — without `supper`/`slower` rows a
+  nested producer chain (`lower(upper(x))`, once it can record) would emit a
+  redundant-but-sound `guard_string` on the inner result. Added; every other
+  else-armed IrOp switch verified correct-by-exclusion (notably `emit`'s
+  PC-stamping must NOT touch scp — aux is a ref, review M7 — and
+  `guardExitPc` stays null for all three).
+- **Tests**: 12 new (5 recorder/e2e in interp_trace_test, incl. the flagship
+  native run under effect-recording with exactly ONE `.unicode_version`
+  entry + replay leg; 3 hand-built native in nativegen_lowering_test, incl.
+  U+0000-vs-sentinel, heap-less scp compilation, and the M5 malformed-stamp
+  matrix with its control leg) + the D1a test from c1. All D8 rows covered.
+- **Gates**: full suite green both legs (normal + `-Djit-debug`); hashgate
+  84/84; `just bench` 28/28 cross=ok ×2, board stable; instruction A/B vs a
+  3d0b946 `just shadow` baseline (nm-verified: 0 new symbols in base, 2 in
+  c2): scalar +0.0006%, nsieve −0.0004%, fft −0.05%, str_manip −0.56% — no
+  regressions.
+- **The honest str_manip outcome**: 5.1–5.3× LuaJIT, unchanged. The bench's
+  core is `lower(upper(a))` — the inner call sits in last-arg position,
+  compiles to MULTRET, and recording aborts `.cross_frame` at the call
+  (`--dump-aborts`: 1 site, anchor `run`). The A/B probe proves the arc's
+  machinery works and the abort merely moved to the pre-existing frontier:
+  the same core through an intermediate local records with ZERO aborts.
+  TODO.md #1 (nested last-arg builtin calls) is now str_manip's sole
+  blocker and the next general gap; `sub`/`reverse`/`len`/2-arg `codepoint`
+  all record today, and `rep(char(..), 4, "-")` hides behind a 1-in-64
+  branch (side-exit, fine).
+- **Flagged, not fixed (Rule #0.5 / Non-goals)**: the `nextLoggedEffect`
+  pre-validation cursor advance now has a full TODO.md entry — after an
+  (uncatchable) `UnicodeVersionMismatch`, a host that re-runs the
+  faulted-but-live VM silently pins the MISMATCHED table via
+  `versionAlreadyConsumed`. Fix choice is Bart's call.

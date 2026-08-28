@@ -536,6 +536,23 @@ pub const IrOp = enum(u8) {
     /// pathological `n` OOMs in scratch (before any link) and side-exits.
     /// Wire ordinal 68.
     srep2,
+    /// `supper`: `string.upper(s)` (doc 26) — `a` = proven-string ref,
+    /// `ty = .heap`. Snew class: full Unicode simple case mapping through the
+    /// ONE shared `caseCore`, heap-only on trace (the Unicode-version pin is a
+    /// committed-trace invariant, doc 26 D1 — a trace containing this op sets
+    /// `Trace.requires_unicode_pin`). Scratch OOM → null → side-exit before
+    /// any link. Wire ordinal 69.
+    supper,
+    /// `slower`: `string.lower(s)`, ditto `supper`. Wire ordinal 70.
+    slower,
+    /// `scp`: single-result `string.codepoint(s, i, j)` (doc 26 D3) —
+    /// `a` = proven-string ref, `b` = start ref, `aux` = end ref (the ssub
+    /// three-operand encoding; **`aux` is an operand ref, NEVER a PC** — this
+    /// op must stay out of `guardExitPc`-class accessors), `ty = .int`. PURE
+    /// and non-allocating (kind `.pure3`): full `posRelat` wrap + clamp via
+    /// the shared `codepointCore`; an empty range side-exits (tier-0 replays
+    /// to nil). Wire ordinal 71.
+    scp,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -1126,6 +1143,15 @@ pub const Trace = struct {
     /// walk decline to enter any trace with `alloc_bound > 0` (doc 24 D3,
     /// codex #2). Runtime-only — not serialized (recomputable from the IR).
     alloc_bound: u32 = 0,
+
+    /// Doc 26 D1: the IR contains `supper`/`slower`, whose heap-only kernels
+    /// are sound ONLY because the session's Unicode-version pin
+    /// (`Vm.unicode_version_pinned`) was committed before this trace could
+    /// commit and is monotone for the VM's lifetime. Debug asserts check the
+    /// pin at commit, at trace entry, and at link ARMING (a patched
+    /// native→native transfer has no vm in reach; by monotonicity a pin that
+    /// held at arm time holds forever after). Runtime-only, recomputable.
+    requires_unicode_pin: bool = false,
 
     /// B-iv.3 backoff: the exit whose composite-bridge arm pipeline last ran in
     /// full and declined because the child's page was not stub-enterable.
@@ -5073,6 +5099,12 @@ pub const TraceState = struct {
         // tier-1a never arms. Threaded from the dispatcher's Vm flags because those
         // live on `*Vm`, not visible here.
         safe_to_arm: bool,
+        // Doc 26 D1 tripwire: the caller's `Vm.unicode_version_pinned`,
+        // threaded like `safe_to_arm` because `*Vm` is not visible here. A
+        // chain can enter a `requires_unicode_pin` CHILD whose parent needed
+        // no pin, bypassing `enterSelectedTrace`'s assert — this closes that
+        // coverage gap. Debug-only consumption (a std.debug.assert).
+        unicode_pinned: bool,
     ) ?ChainResult {
         const exit_instr = result.exit_instr;
         if (exit_instr == std.math.maxInt(u32)) return null;
@@ -5152,6 +5184,8 @@ pub const TraceState = struct {
             // demands allocation counts observed only at tier-0 boundaries.
             // Non-allocating candidates chain as before.
             if (!safe_to_arm and sct.alloc_bound > 0) continue;
+            // Doc 26 D1 tripwire, chain half: see `enterSelectedTrace`.
+            if (sct.requires_unicode_pin) std.debug.assert(unicode_pinned);
             const is_link = sct.instrs.len != 0 and sct.instrs[sct.instrs.len - 1].op == .link;
             // Loop-done chains (ir and native) only follow `.link` continuations;
             // an ordinary side trace at the post-loop PC is not a valid hand-off.
@@ -11634,6 +11668,15 @@ pub const TraceState = struct {
 
         const t = try self.gpa.create(Trace);
         errdefer self.gpa.destroy(t);
+        // Doc 26 D1: does the committed IR carry a case-mapping op? (`.alloc`
+        // ops are never DCE'd, so post-optimizer presence ≡ recorded.) The
+        // commit itself is the first checkpoint of the pin invariant: the
+        // recorder only reaches these ops by mirroring a successful tier-0
+        // upper/lower, which pinned the session's Unicode version.
+        var requires_unicode_pin = false;
+        for (fields.instrs) |ins| {
+            if (ins.op == .supper or ins.op == .slower) requires_unicode_pin = true;
+        }
         // Stable id (P-B): assigned once, never reused. A bump before a failed
         // `cache.append` leaves a harmless gap in the id space (ids need only be
         // unique, not contiguous).
@@ -11652,6 +11695,7 @@ pub const TraceState = struct {
             .rec_path = rec_path_owned,
             .rec_path_complete = rec_path_complete,
             .alloc_bound = self.rec.alloc_count,
+            .requires_unicode_pin = requires_unicode_pin,
         };
         // §T.9: memoize the pure `isCompositeBridgeCandidate` oracle over this trace's
         // instruction indices. Must run AFTER `t.*` is populated — the oracle reads the
@@ -11747,13 +11791,15 @@ pub const TraceState = struct {
                 .fsin, .fcos => std.debug.assert(ins.a < i),
                 // Doc 24 D4: `tostr_*` read their guarded numeric operand,
                 // `slen`/`guard_string` their string operand — all prior nodes.
-                .tostr_int, .tostr_num, .slen, .guard_string, .srev, .schar1 => std.debug.assert(ins.a < i),
+                // Doc 26: `supper`/`slower` read their string operand like `srev`.
+                .tostr_int, .tostr_num, .slen, .guard_string, .srev, .schar1, .supper, .slower => std.debug.assert(ins.a < i),
                 .srep2 => {
                     std.debug.assert(ins.a < i);
                     std.debug.assert(ins.b < i);
                 },
-                // ssub's third operand rides `aux` as a Ref (doc 24 codex #4).
-                .ssub => {
+                // ssub's third operand rides `aux` as a Ref (doc 24 codex #4);
+                // `scp` shares the three-operand encoding (doc 26 D3).
+                .ssub, .scp => {
                     std.debug.assert(ins.a < i);
                     std.debug.assert(ins.b < i);
                     std.debug.assert(ins.aux >= 0 and ins.aux < i);
@@ -13444,6 +13490,9 @@ pub const TraceState = struct {
             .reverse => return self.recBSRev(instr, regs),
             .char => return self.recBSChar1(instr, regs),
             .rep => return self.recBSRep2(instr, regs),
+            .upper => return self.recBSCase(instr, regs, .upper, .supper),
+            .lower => return self.recBSCase(instr, regs, .lower, .slower),
+            .codepoint => return self.recBSCodepoint(instr, regs),
         }
     }
 
@@ -13617,7 +13666,7 @@ pub const TraceState = struct {
     /// string-typed results by construction.
     fn isProvenStringRef(self: *const TraceState, r: Ref) bool {
         return switch (self.rec.instrs.items[@intCast(r)].op) {
-            .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2 => true,
+            .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower => true,
             else => false,
         };
     }
@@ -13739,6 +13788,47 @@ pub const TraceState = struct {
         const sref = (try self.stringArgRef(@intCast(base + 1), regs, .a1)) orelse return;
         const nref = (try self.intArgRef(@intCast(base + 2), regs, .a2)) orelse return;
         self.setReg(instr.a, try self.emitAlloc(.{ .op = .srep2, .a = sref, .b = nref, .ty = .heap }));
+    }
+
+    /// `string.upper(s)` / `string.lower(s)` → `supper`/`slower` (doc 26 D2,
+    /// snew class — one arm, two ops). The recording is only reachable because
+    /// tier-0 is executing the very call being mirrored, which commits the
+    /// session's Unicode-version pin (or raises — D1a then kills this
+    /// recording), so the on-trace op is heap-only. No konst fold: a fold
+    /// would intern a derived string into the konst pool at record time; the
+    /// konst ref passes through and the op's repeat is an intern hit.
+    fn recBSCase(self: *TraceState, instr: Instr, regs: RegWindow, rb: function.RecordedBuiltin, op: IrOp) !void {
+        if (instr.b != 1) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        try self.guardBuiltinCallee(instr.a, rb);
+        const sref = (try self.stringArgRef(@intCast(@as(usize, instr.a) + 1), regs, .a1)) orelse return;
+        self.setReg(instr.a, try self.emitAlloc(.{ .op = op, .a = sref, .ty = .heap }));
+    }
+
+    /// Single-result `string.codepoint(s [, i [, j]])` → `scp` (doc 26 D3).
+    /// Pure, non-allocating (plain `emit`, NOT `emitAlloc` — bound A must not
+    /// inflate). Arity pins: 1–3 arguments, exactly one wanted result (the
+    /// `nwanted >= 2` multi path stays a barrier — `recBuiltin`'s preamble
+    /// already rejected `all_results`, this rejects fixed multi shapes).
+    /// Defaults record the SAME refs tier-0 derives: 1-arg → both konst 1;
+    /// 2-arg → `aux` IS the i ref (j defaults to the runtime i). Indices are
+    /// int-only (tier-0's integral-float coercion stays tier-0-owned — the
+    /// ssub precedent). An empty range side-exits at run time.
+    fn recBSCodepoint(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b < 1 or instr.b > 3) return self.abort(.cross_frame);
+        if (instr.c != 1) return self.abort(.cross_frame);
+        try self.guardBuiltinCallee(instr.a, .codepoint);
+        const base: usize = instr.a;
+        const sref = (try self.stringArgRef(@intCast(base + 1), regs, .a1)) orelse return;
+        const iref: Ref = if (instr.b >= 2)
+            (try self.intArgRef(@intCast(base + 2), regs, .a2)) orelse return
+        else
+            try self.konst(Value.int(1));
+        const jref: Ref = if (instr.b == 3)
+            (try self.intArgRef(@intCast(base + 3), regs, .a3)) orelse return
+        else
+            iref; // j defaults to the RUNTIME i — the same ref, not a konst
+        self.setReg(instr.a, try self.emit(.{ .op = .scp, .a = sref, .b = iref, .aux = @intCast(jref), .ty = .int }));
     }
 
     /// `tonumber(v[, base])` — konst arguments fold at record time through
@@ -14516,11 +14606,14 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .guard_string,
         .srev,
         .schar1,
+        .supper,
+        .slower,
         => try w.print("%{d}", .{ins.a}),
         // guard_gc's aux is the allocation bound, not an operand.
         .guard_gc => try w.print("A={d}", .{ins.aux}),
-        // ssub's third operand rides aux as a ref (codex #4).
-        .ssub => try w.print("%{d}  %{d}  %{d}", .{ ins.a, ins.b, ins.aux }),
+        // ssub's third operand rides aux as a ref (codex #4); scp shares the
+        // encoding (doc 26 D3).
+        .ssub, .scp => try w.print("%{d}  %{d}  %{d}", .{ ins.a, ins.b, ins.aux }),
         // `guard_builtin` reads the callee `%a` and tags the builtin in `aux`.
         .guard_builtin => try w.print("%{d}  [{s}]", .{ ins.a, @tagName(@as(function.RecordedBuiltin, @enumFromInt(ins.aux))) }),
         .loop, .preheader => {},

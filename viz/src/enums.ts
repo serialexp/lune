@@ -88,6 +88,9 @@ export const IR_OP_NAMES = [
   "srev", // 66  string.reverse(s)
   "schar1", // 67  1-arg string.char(c)
   "srep2", // 68  2-arg string.rep(s, n)
+  "supper", // 69  string.upper(s) — full Unicode simple case map (allocating)
+  "slower", // 70  string.lower(s) — ditto
+  "scp", // 71  single-result string.codepoint(s, i, j) — third operand rides aux as a ref
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -161,6 +164,8 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "guard_string",
   "srev",
   "schar1",
+  "supper",
+  "slower",
   // Single-operand grid ops (doc 14): the cell load + three structural guards
   // render `%a`. garow/gcell/gstore/guard_gcol are two-operand (guard_gcol carries
   // the column ref in `%b`) and use the default `%a, %b`.
@@ -169,6 +174,11 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "guard_stride",
   "guard_gpresent",
 ]);
+
+/** Three-operand ops whose third operand rides `aux` as a ref (mirrors
+ * `writeIrInstr`'s `%a  %b  %aux` arm): `ssub` (doc 24 codex #4) and `scp`
+ * (doc 26 D3). */
+export const TERNARY_AUX_OPS: ReadonlySet<IrOpName> = new Set(["ssub", "scp"]);
 
 /** Map a raw wire ordinal to a name, falling back to `op:N` if out of range. */
 export function irOpName(op: number): string {

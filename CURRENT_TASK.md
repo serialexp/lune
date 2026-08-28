@@ -21,7 +21,61 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
-## Status 2026-08-28 (LATEST-90) — **mod/idiv NATIVE LOWERING LANDED (doc 25): scalar 4.3× → 0.9× LuaJIT (−87.6% instructions). `%` no longer poisons native entry anywhere. Pre-existing `minInt % -1` SIGFPE found and fixed in the oracle.**
+## Status 2026-08-28 (LATEST-91) — **doc 26 LANDED: upper/lower/codepoint record + run natively (supper/slower/scp, ordinals 69/70/71). str_manip UNCHANGED (5.1×) — its `lower(upper(a))` spelling aborts at the pre-existing MULTRET nested-call frontier (TODO.md #1), which is now its SOLE blocker and the next general lever.**
+
+Bart's go-ahead: "proceed with upper/lower please". Full loop ran: doc 26
+written → codex-reviewed (no blockers, 8 majors folded in) → c1 (D1a,
+3d0b946) → c2 (this commit) → gates.
+
+- **c1 (already committed, 3d0b946)**: D1a — errors unwinding mid-recording
+  now abort it (`errdefer self.trace.abortRaised()` in `execWith`, new
+  `AbortReason.raised`). Pre-existing Franken-path hazard, reachable TODAY
+  via schar1-under-pcall; bisection-pinned test.
+- **c2 (this commit)**: the three ops end-to-end.
+  - `supper`/`slower` = snew `.alloc` class (emitAlloc → guard_gc bound;
+    `emitSnewCallout` srev arg shape; shared `caseCore` — the FULL Unicode
+    core, heap-only per the D1 pin-monotonicity invariant: any committed
+    trace containing them implies a tier-0 upper/lower already pinned the
+    version in the same VM, `requires_unicode_pin` bit + entry/driveChain
+    asserts enforce it).
+  - `scp` = new `.pure3` OpKind (all-3-operand liveness/compaction, CSE+LICM
+    fail-closed v1, DCE admitted); plain `emit` (never inflates A); separate
+    `emitScpCallout` — (s,i,j) in rdi/rsi/rdx, NO heap arg, −1 sentinel
+    full-width signed compare (U+0000 is a real result); empty range →
+    side-exit, tier-0 replays to nil through any continuation.
+  - M5 retrofit: result-`ty` fail-closed checks added to ALL existing
+    snew/tostr proveKinds arms (a malformed ssub stamp used to compile).
+  - Else-arm audit found ONE miss beyond the doc's sweep: `isProvenStringRef`
+    gained supper/slower. `emit` PC-stamping correctly excludes scp (aux is
+    a REF — M7); `guardExitPc` null for all three.
+- **Tests**: +12 (flagship native e2e under effect-record: ONE
+  `.unicode_version` entry for 400 case calls + replay leg byte-identical;
+  scp arg-shape matrix incl. b==aux ref sharing; empty-range deopt-STATE
+  parity (object_count/next_obj_id) through nil-consuming AND raising
+  continuations; `.pure3` contract pins (dead scp DCE'd, identical scps
+  never CSE'd, compaction remaps aux, alloc_bound 0, no pin required);
+  recorder fail-closed matrix (float index / multi-result / non-string
+  raise); hand-built native parity (full Unicode both directions, U+0000,
+  heap-less scp compile, M5 malformed-stamp matrix + control).
+- **Gates**: suite green both legs (+ `-Djit-debug`); hashgate 84/84; bench
+  28/28 cross=ok ×2 stable; instruction A/B vs 3d0b946 shadow (nm-verified
+  baseline): scalar +0.0006%, nsieve −0.0004%, fft −0.05%, str_manip −0.56%.
+- **The honest outcome + next lever**: str_manip did not move. Probe:
+  the bench's `lower(upper(a))` puts the inner call in last-arg position →
+  MULTRET → `.cross_frame` abort at the call; the SAME core via an
+  intermediate local records with ZERO aborts. So doc 26's machinery works
+  and the abort moved onto TODO.md #1 (nested last-arg builtin calls, fix
+  shape already sketched there) — a general recorder gap that benefits every
+  composed builtin expression (Z-6). That is the natural next arc for the
+  string family; `rep(char(..),4,"-")` (3-arg rep) hides behind a 1/64
+  branch and can stay a side-exit.
+- **Flagged for Bart (Rule #0.5, not fixed)**: TODO.md — `nextLoggedEffect`
+  advances the cursor BEFORE validation; after an uncatchable
+  `UnicodeVersionMismatch`, a host re-running the faulted-but-live VM pins
+  the MISMATCHED table silently via `versionAlreadyConsumed`. Fix is a
+  design choice (peek/commit split vs validated-flag).
+
+## Status 2026-08-28 (LATEST-90, superseded by 91) — **mod/idiv NATIVE LOWERING LANDED (doc 25): scalar 4.3× → 0.9× LuaJIT (−87.6% instructions). `%` no longer poisons native entry anywhere. Pre-existing `minInt % -1` SIGFPE found and fixed in the oracle.**
 
 Bart asked whether the doc-24 v2 escalation overrides mod/idiv work — it
 doesn't (v2 is recorder/exit protocol; mod/idiv already record + run tier-1a,

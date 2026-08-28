@@ -2011,7 +2011,7 @@ test "driveChain ordinary_header: chains at the anchor, not a guard's lane ordin
     // Exclude A (the dispatcher's `visited` set). The driver walks A's anchor
     // (pc 10), finds no other sibling there, and must NOT reach the decoy at pc 2.
     var tr_regs = TestRegs{ .regs = &regs };
-    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false);
+    const chained = state.driveChain(trace_a, .{ .completed = 0, .exit_instr = 1 }, &proto, tr_regs.view(), .ir, .ordinary_header, &.{trace_a}, false, false);
     tr_regs.commit(); // commit so a (buggy) decoy mutation would surface — keeps the test's teeth
     try testing.expect(chained == null);
     try testing.expectEqual(@as(i64, 0), regs[0].asInt()); // r0 untouched — no decoy ran

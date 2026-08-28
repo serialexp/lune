@@ -784,6 +784,551 @@ test "doc 26 D1a: an error unwinding mid-recording aborts the recording (.raised
     }
 }
 
+test "doc 26: upper/lower/codepoint loop runs NATIVELY end-to-end — pin invariant, budget, one unicode_version effect, replay parity" {
+    // The arc's flagship: the three doc-26 ops in one hot loop, executed
+    // through the full pipeline (record → tropt → native), under effect
+    // RECORDING — proving (a) byte parity with tier-0, (b) the D1 pin
+    // invariant end-to-end (`unicode_version_pinned` true, the committed
+    // trace stamped `requires_unicode_pin`, native really entered), (c) the
+    // budget counts supper+slower but NOT scp (A = 2), and (d) the entire
+    // traced run pins the Unicode version exactly ONCE — then a replay of
+    // that one-entry log (re-recording from scratch, cache cleared by the
+    // epoch) reproduces the output byte-identically.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local upper = string.upper
+        \\local lower = string.lower
+        \\local cp = string.codepoint
+        \\local base = "héLlo Αβγ"
+        \\local acc = 0
+        \\for i = 1, 200 do
+        \\  local u = upper(base)
+        \\  local l = lower(u)
+        \\  acc = acc + #u + #l + cp(l, 3)
+        \\end
+        \\print(acc)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var t0_out: [64]u8 = undefined;
+    var t0_len: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        t0_len = sink.buffered().len;
+        @memcpy(t0_out[0..t0_len], sink.buffered());
+        try testing.expect(t0_len > 0);
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+    vm.trace.config.hotloop = 4;
+    vm.effect_mode = .record;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(t0_out[0..t0_len], sink.buffered());
+    try testing.expect(vm.trace.entries > 0);
+    if (@import("nativegen.zig").is_x64_linux)
+        try testing.expect(vm.trace.native_entries > 0);
+
+    // D1 end-to-end: the tier-0 upper that necessarily preceded any trace
+    // commit pinned the version — ONCE, for 400 case calls + all trace
+    // entries (recording shadows execution; executors never re-pin).
+    try testing.expect(vm.unicode_version_pinned);
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+    try testing.expectEqual(interp.EffectKind.unicode_version, vm.effect_log.items[0].kind);
+
+    // The committed trace: all three ops present, `requires_unicode_pin`
+    // stamped (M3), and the guard_gc bound counts EXACTLY the two case
+    // producers — scp must not inflate A (D3).
+    var found = false;
+    for (vm.trace.cache.items) |t| {
+        var has_supper = false;
+        var has_slower = false;
+        var has_scp = false;
+        var n_guard_gc: usize = 0;
+        for (t.instrs) |ins| {
+            switch (ins.op) {
+                .supper => has_supper = true,
+                .slower => has_slower = true,
+                .scp => has_scp = true,
+                .guard_gc => {
+                    n_guard_gc += 1;
+                    try testing.expectEqual(@as(i32, 2), ins.aux);
+                },
+                else => {},
+            }
+        }
+        if (!(has_supper and has_slower and has_scp)) continue;
+        found = true;
+        try testing.expect(t.requires_unicode_pin);
+        try testing.expectEqual(@as(u32, 2), t.alloc_bound);
+        try testing.expectEqual(@as(usize, 1), n_guard_gc);
+    }
+    try testing.expect(found);
+
+    // Replay the one-entry log: fresh epoch (cache cleared, pin reset by the
+    // mode flip below), traces re-record DURING replay, the pin re-commits
+    // from the log — output byte-identical, no new log entry.
+    vm.effect_mode = .replay;
+    vm.effect_cursor = 0;
+    vm.unicode_version_pinned = false;
+    var rep_buf: [64]u8 = undefined;
+    var rep_sink = io.Writer.fixed(&rep_buf);
+    vm.out = &rep_sink;
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(t0_out[0..t0_len], rep_sink.buffered());
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+    try testing.expectEqual(@as(usize, 1), vm.effect_cursor);
+    try testing.expect(vm.unicode_version_pinned);
+}
+
+test "doc 26: scp argument-shape matrix — 1/2/3-arg + negative wrap record with the right operand refs, tier parity" {
+    // The recorder's three source arities in one loop: 1-arg (both indices
+    // default to konst 1, b == aux), 2-arg with a RUNTIME index (j defaults
+    // to i — recBSCodepoint shares the ref, b == aux, non-konst), 2-arg
+    // negative konst (wrap is codepointCore's job, recorded as a plain ref),
+    // and 3-arg with distinct konsts (b != aux). Byte parity proves the
+    // recorded refs resolve to tier-0's exact semantics.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local cp = string.codepoint
+        \\local s = "héllo wörld"
+        \\local acc = 0
+        \\for i = 1, 100 do
+        \\  acc = acc + cp(s)
+        \\  acc = acc + cp(s, i % 8 + 1)
+        \\  acc = acc + cp(s, -3)
+        \\  acc = acc + cp(s, 2, 4)
+        \\end
+        \\print(acc)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var t0_out: [64]u8 = undefined;
+    var t0_len: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        t0_len = sink.buffered().len;
+        @memcpy(t0_out[0..t0_len], sink.buffered());
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(t0_out[0..t0_len], sink.buffered());
+    try testing.expect(vm.trace.entries > 0);
+
+    // Find the committed loop trace and pin the four operand shapes.
+    var found = false;
+    for (vm.trace.cache.items) |t| {
+        var n_scp: usize = 0;
+        var shared_konst_one = false; // 1-arg: b == aux → konst 1
+        var shared_runtime = false; // 2-arg runtime i: b == aux, NOT a konst
+        var distinct = false; // 3-arg: b != aux
+        for (t.instrs) |ins| {
+            if (ins.op != .scp) continue;
+            n_scp += 1;
+            if (ins.b == @as(u16, @intCast(ins.aux))) {
+                const opnd = t.instrs[ins.b];
+                if (opnd.op == .konst) {
+                    if (t.consts[@intCast(opnd.aux)].payload.bits == Value.int(1).payload.bits)
+                        shared_konst_one = true;
+                } else {
+                    shared_runtime = true;
+                }
+            } else {
+                distinct = true;
+            }
+        }
+        if (n_scp == 0) continue;
+        found = true;
+        try testing.expectEqual(@as(usize, 4), n_scp);
+        try testing.expect(shared_konst_one);
+        try testing.expect(shared_runtime);
+        try testing.expect(distinct);
+        // A read-only op class: nothing here allocates, so no budget guard.
+        try testing.expectEqual(@as(u32, 0), t.alloc_bound);
+        try testing.expect(!t.requires_unicode_pin);
+    }
+    try testing.expect(found);
+}
+
+test "doc 26: empty-range scp side-exits with deopt-STATE parity — nil-consuming and raising continuations" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    // (a) Nil-consuming continuation, with an ALLOCATION earlier in the same
+    // iteration (review M6): when i walks past #s the trace side-exits at the
+    // scp; tier-0 replays the PARTIAL iteration — re-running the `sub` as an
+    // intern hit — and takes the else branch. Output AND the final heap
+    // schedule must match tier-0 exactly (the id-stream claim).
+    {
+        const source =
+            \\local cp = string.codepoint
+            \\local sub = string.sub
+            \\local s = "héllo"
+            \\local acc = 0
+            \\for i = 1, 12 do
+            \\  local t = sub(s, 1, 2)
+            \\  local c = cp(s, i)
+            \\  if c then acc = acc + c + #t else acc = acc + 1 end
+            \\end
+            \\print(acc)
+        ;
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+
+        var t0_out: [64]u8 = undefined;
+        var t0_len: usize = 0;
+        var t0_objs: usize = 0;
+        var t0_next_id: u64 = 0;
+        {
+            var vm = try Vm.init(gpa);
+            defer vm.deinit();
+            var buf: [64]u8 = undefined;
+            var sink = io.Writer.fixed(&buf);
+            vm.out = &sink;
+            var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+            defer chunk.deinit();
+            try testing.expect(!diags.hasErrors());
+            _ = try vm.run(chunk.proto);
+            t0_len = sink.buffered().len;
+            @memcpy(t0_out[0..t0_len], sink.buffered());
+            t0_objs = vm.heap.object_count;
+            t0_next_id = vm.heap.next_obj_id;
+        }
+
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.trace.config.enabled = true;
+        vm.trace.config.execute = true;
+        vm.trace.config.optimize = true;
+        vm.trace.config.hotloop = 4;
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        try testing.expectEqualStrings(t0_out[0..t0_len], sink.buffered());
+        try testing.expectEqual(t0_objs, vm.heap.object_count);
+        try testing.expectEqual(t0_next_id, vm.heap.next_obj_id);
+        try testing.expect(vm.trace.entries > 0);
+    }
+
+    // (b) RAISING continuation: `acc + nil` after the nil-producing call. The
+    // traced run must raise the SAME error tier-0 raises (side-exit → tier-0
+    // replay → arith raise), with nothing printed in either mode.
+    {
+        const source =
+            \\local cp = string.codepoint
+            \\local s = "héllo"
+            \\local acc = 0
+            \\for i = 1, 12 do
+            \\  acc = acc + cp(s, i)
+            \\end
+            \\print(acc)
+        ;
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+
+        var t0_err: ?anyerror = null;
+        {
+            var vm = try Vm.init(gpa);
+            defer vm.deinit();
+            var buf: [64]u8 = undefined;
+            var sink = io.Writer.fixed(&buf);
+            vm.out = &sink;
+            var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+            defer chunk.deinit();
+            try testing.expect(!diags.hasErrors());
+            _ = vm.run(chunk.proto) catch |e| {
+                t0_err = e;
+            };
+            try testing.expect(t0_err != null);
+            try testing.expectEqual(@as(usize, 0), sink.buffered().len);
+        }
+
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.trace.config.enabled = true;
+        vm.trace.config.execute = true;
+        vm.trace.config.optimize = true;
+        vm.trace.config.hotloop = 4;
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        var traced_err: ?anyerror = null;
+        _ = vm.run(chunk.proto) catch |e| {
+            traced_err = e;
+        };
+        try testing.expectEqual(t0_err, traced_err);
+        try testing.expectEqual(@as(usize, 0), sink.buffered().len);
+        // The raise came through the traced path, not a tier-0-only run.
+        try testing.expect(vm.trace.entries > 0);
+    }
+}
+
+test "doc 26: `.pure3` contract — dead scp DCE'd, identical scps never CSE'd, compaction remaps scp.aux, budget untouched" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+
+    // The ssub-test vehicle, retargeted at `.pure3`: the CSE'd second mul
+    // SHIFTS the ref space (so the aux assertions below exercise a genuinely
+    // remapped stream); the two identical LIVE scps must both survive (CSE is
+    // deliberately fail-closed for `.pure3` in v1 even though the key covers
+    // aux — review M4); the UNUSED third scp is dead and DCE (admitted) must
+    // remove it.
+    const source =
+        \\local cp = string.codepoint
+        \\local base = "abcdefgh"
+        \\local acc = 0
+        \\for i = 1, 50 do
+        \\  acc = acc + i * 7 + i * 7
+        \\  local x = cp(base, 2, 5)
+        \\  local y = cp(base, 2, 5)
+        \\  local dead = cp(base, 1, 1)
+        \\  acc = acc + x + y
+        \\end
+        \\print(acc)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = false; // inspect the committed, optimized trace
+    vm.trace.config.optimize = true;
+    vm.trace.config.hotloop = 4;
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    // 14 x (1+..+50) + 50 x (98 + 98) = 17850 + 9800.
+    try testing.expectEqualStrings("27650\n", sink.buffered());
+
+    try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
+    const t = vm.trace.cache.items[0];
+    var n_scp: usize = 0;
+    var n_guard_gc: usize = 0;
+    var muls: usize = 0;
+    for (t.instrs) |ins| {
+        switch (ins.op) {
+            .scp => {
+                n_scp += 1;
+                // Every surviving scp is a LIVE cp(base, 2, 5): its aux (the
+                // end-index ref) must resolve to konst 5 through the
+                // compacted ref space. The dead cp(base, 1, 1)'s konst-1 aux
+                // never appears — if the dead scp survived DCE, this
+                // expectation fails on its aux.
+                const jref = t.instrs[@intCast(ins.aux)];
+                try testing.expectEqual(trace.IrOp.konst, jref.op);
+                try testing.expectEqual(Value.int(5).payload.bits, t.consts[@intCast(jref.aux)].payload.bits);
+            },
+            .guard_gc => n_guard_gc += 1,
+            .mul => muls += 1,
+            else => {},
+        }
+    }
+    // Both identical live scps survive; the dead one is gone.
+    try testing.expectEqual(@as(usize, 2), n_scp);
+    // CSE really ran (the second `i * 7` merged) — the refs genuinely shifted.
+    try testing.expectEqual(@as(usize, 1), muls);
+    // scp never inflates the budget: a case-op-free scp trace has NO
+    // allocation bound and NO guard_gc at all — and needs no pin.
+    try testing.expectEqual(@as(u32, 0), t.alloc_bound);
+    try testing.expectEqual(@as(usize, 0), n_guard_gc);
+    try testing.expect(!t.requires_unicode_pin);
+}
+
+test "doc 26: recorder fail-closed matrix — float index, multi-result codepoint, non-string arg" {
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+
+    // (a) A FLOAT index: tier-0's optIntArg coerces 2.0 → 2, but the recorder
+    // is int-only (the coercion stays tier-0-owned) — the recording aborts
+    // and NO trace with an scp is ever cached. Tier-0 semantics (the coerced
+    // read) are preserved bit-for-bit.
+    // (b) Multi-result: `local a, b = cp(s, 1, 2)` wants TWO results — that
+    // routes to the multi native (a host barrier), never to recBSCodepoint's
+    // single-result shape.
+    const source =
+        \\local cp = string.codepoint
+        \\local s = "héllo"
+        \\local acc = 0
+        \\for i = 1, 60 do
+        \\  acc = acc + cp(s, 2.0)
+        \\end
+        \\local m = 0
+        \\for i = 1, 60 do
+        \\  local a, b = cp(s, 1, 2)
+        \\  m = m + a + b
+        \\end
+        \\print(acc, m)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var t0_out: [64]u8 = undefined;
+    var t0_len: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        t0_len = sink.buffered().len;
+        @memcpy(t0_out[0..t0_len], sink.buffered());
+    }
+
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.trace.config.enabled = true;
+        vm.trace.config.execute = true;
+        vm.trace.config.optimize = true;
+        vm.trace.config.hotloop = 4;
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        try testing.expectEqualStrings(t0_out[0..t0_len], sink.buffered());
+        // Fail closed: whatever committed (or nothing did), no scp anywhere.
+        for (vm.trace.cache.items) |t| {
+            for (t.instrs) |ins| try testing.expect(ins.op != .scp);
+        }
+        try testing.expect(!vm.trace.isRecording());
+    }
+
+    // (c) A NON-STRING argument raises in tier-0 (lune never coerces case
+    // ops); mid-loop that raise unwinds through an armed recording (D1a
+    // territory) — the traced run must raise the identical error with the
+    // identical partial output, and cache no supper.
+    {
+        const source_c =
+            \\local upper = string.upper
+            \\local acc = 0
+            \\for i = 1, 60 do
+            \\  local arg = "x"
+            \\  if i >= 30 then arg = true end
+            \\  acc = acc + #upper(arg)
+            \\end
+            \\print(acc)
+        ;
+        var diags_c = diag.Diagnostics.init(gpa);
+        defer diags_c.deinit();
+        var tree_c = try parser.parse(gpa, source_c, &diags_c);
+        defer tree_c.deinit();
+
+        var t0_err: ?anyerror = null;
+        {
+            var vm = try Vm.init(gpa);
+            defer vm.deinit();
+            var buf: [64]u8 = undefined;
+            var sink = io.Writer.fixed(&buf);
+            vm.out = &sink;
+            var chunk = try compiler.compile(gpa, vm.heap, source_c, tree_c.root, &diags_c);
+            defer chunk.deinit();
+            try testing.expect(!diags_c.hasErrors());
+            _ = vm.run(chunk.proto) catch |e| {
+                t0_err = e;
+            };
+            try testing.expect(t0_err != null);
+        }
+
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.trace.config.enabled = true;
+        vm.trace.config.execute = true;
+        vm.trace.config.optimize = true;
+        vm.trace.config.hotloop = 4;
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source_c, tree_c.root, &diags_c);
+        defer chunk.deinit();
+        try testing.expect(!diags_c.hasErrors());
+        var traced_err: ?anyerror = null;
+        _ = vm.run(chunk.proto) catch |e| {
+            traced_err = e;
+        };
+        try testing.expectEqual(t0_err, traced_err);
+        try testing.expect(!vm.trace.isRecording());
+    }
+}
+
 test "chunk rooting: a host-compiled retained chunk survives GC before it runs" {
     // docs/design/03 §"Chunk-constant rooting" — the regression. A host compiles chunk
     // B (whose distinctive literal is a `load_const`), retains it, runs chunk A (which

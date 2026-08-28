@@ -289,19 +289,24 @@ fn sLower(ctx: *anyopaque, args: []const Value) anyerror!Value {
     return mapCaseUnicode(ctx, args, .lower);
 }
 
-/// Simple case mapping over code points (S-C, design doc 06). ASCII (`< 0x80`) is
-/// a branch-free fast path; above it the vendored `unicode_case` table maps one
-/// code point to one (count-preserving — simple mapping never changes the code-
-/// point count). The active Unicode version is pinned as a session effect
-/// (`vm.noteUnicodeVersion`) so the result stays byte-identical on replay even as
-/// the table churns. Output is valid UTF-8 by construction (every emitted scalar
-/// is re-encoded), so `internValue` needs no re-validation.
-fn mapCaseUnicode(ctx: *anyopaque, args: []const Value, comptime kind: enum { upper, lower }) anyerror!Value {
-    const vm = vmOf(ctx);
-    const s = try strArg(vm, args, 0);
-    try interp.noteUnicodeVersion(vm);
+/// The case-mapping direction, shared by `caseCore` and its tier-0 wrapper
+/// (a NAMED type so both signatures denote the same comptime enum).
+pub const CaseKind = enum { upper, lower };
+
+/// Simple case-mapping core (S-C, design doc 06) — the ONE compiled body every
+/// tier shares (doc 26 D2): tier-0 wraps it below, the JIT calls it through
+/// `stralloc.supperRuntime`/`slowerRuntime`. ASCII (`< 0x80`) is a branch-free
+/// fast path; above it the vendored `unicode_case` table maps one code point to
+/// one (count-preserving — simple mapping never changes the code-point count).
+/// Output is valid UTF-8 by construction (every emitted scalar is re-encoded),
+/// so `intern` needs no re-validation. Audit (doc 24 D5): scratch growth is the
+/// only fallible step and precedes the single `intern` — **≤ 1 `Heap.link` per
+/// call** (an intern hit links zero). Deliberately heap-only: the session's
+/// Unicode-version pin is NOT this core's business — tier-0's wrapper performs
+/// it, and a committed trace implies it already happened (doc 26 D1).
+pub fn caseCore(heap: *gc.Heap, s: []const u8, comptime kind: CaseKind) std.mem.Allocator.Error!*String {
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(vm.gpa);
+    defer buf.deinit(heap.gpa);
     var off: usize = 0;
     while (off < s.len) {
         const b = s[off];
@@ -310,7 +315,7 @@ fn mapCaseUnicode(ctx: *anyopaque, args: []const Value, comptime kind: enum { up
                 .upper => std.ascii.toUpper(b),
                 .lower => std.ascii.toLower(b),
             };
-            try buf.append(vm.gpa, c);
+            try buf.append(heap.gpa, c);
             off += 1;
             continue;
         }
@@ -321,16 +326,28 @@ fn mapCaseUnicode(ctx: *anyopaque, args: []const Value, comptime kind: enum { up
         };
         var enc: [4]u8 = undefined;
         if (std.unicode.utf8Encode(mapped, &enc)) |n| {
-            try buf.appendSlice(vm.gpa, enc[0..n]);
+            try buf.appendSlice(heap.gpa, enc[0..n]);
         } else |_| {
             // The table only ever maps to assigned, non-surrogate scalars, so this
             // is unreachable in practice; on the impossible chance, keep the input
             // sequence verbatim rather than corrupting the string.
-            try buf.appendSlice(vm.gpa, s[off .. off + d.len]);
+            try buf.appendSlice(heap.gpa, s[off .. off + d.len]);
         }
         off += d.len;
     }
-    return vm.heap.internValue(buf.items);
+    return heap.intern(buf.items);
+}
+
+/// Tier-0 `string.upper`/`string.lower`: pin the Unicode version as a session
+/// effect (`vm.noteUnicodeVersion` — so the result stays byte-identical on
+/// replay even as the table churns; the pin is committed BEFORE the core can
+/// OOM in scratch, part of the doc 26 D1 proof), then run the shared core.
+fn mapCaseUnicode(ctx: *anyopaque, args: []const Value, comptime kind: CaseKind) anyerror!Value {
+    const vm = vmOf(ctx);
+    const s = try strArg(vm, args, 0);
+    try interp.noteUnicodeVersion(vm);
+    const r = try caseCore(vm.heap, s, kind);
+    return Value.heap(&r.header);
 }
 
 /// `string.rep(s, n [, sep])` — `s` repeated `n` times, joined by `sep`
@@ -396,18 +413,38 @@ fn charRange(vm: *Vm, args: []const Value, clen: usize) anyerror!struct { lo: us
     return .{ .lo = @intCast(i), .hi = @intCast(j) };
 }
 
+/// Single-result `string.codepoint` core (doc 26 D3) — the ONE body owning the
+/// full range logic (`posRelat` wrap, clamping, empty check) and the decode,
+/// shared by tier-0's `sCodepoint1` below and the JIT's `stralloc.scpRuntime`.
+/// `i`/`j` are the raw (possibly negative) character positions AFTER any tier-0
+/// argument defaulting/coercion. Returns the scalar at the clamped `lo`, or
+/// null when the range is empty (`lo > hi` — tier-0 renders that as nil; the
+/// JIT side-exits). Pure and non-allocating.
+pub fn codepointCore(s: *const String, i_arg: i64, j_arg: i64) ?i64 {
+    const clen = s.cpLen();
+    var i = posRelat(i_arg, clen);
+    var j = posRelat(j_arg, clen);
+    if (i < 1) i = 1;
+    if (j > @as(i64, @intCast(clen))) j = @intCast(clen);
+    if (i > j) return null; // empty range
+    const bytes = s.bytes();
+    const d = decodeAt(bytes, charByteOffset(bytes, @intCast(i)));
+    return @intCast(d.cp);
+}
+
 /// `string.codepoint(s [, i [, j]])` — the Unicode scalar values of the
 /// characters `s[i..j]`, one integer per result (a `multi` native). Replaces
 /// Lua's byte-returning `string.byte` (raw bytes now come from `s:encode()`).
-/// `i` defaults to 1, `j` to `i`; positions are **character** indices.
+/// `i` defaults to 1, `j` to `i`; positions are **character** indices. The
+/// single-result path (0/1 wanted results) parses/coerces arguments and
+/// delegates the semantics to `codepointCore`.
 fn sCodepoint1(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const s = try strObjArg(vm, args, 0);
-    const r = try charRange(vm, args, s.cpLen());
-    if (r.lo > r.hi) return Value.nil();
-    const bytes = s.bytes();
-    const d = decodeAt(bytes, charByteOffset(bytes, r.lo));
-    return Value.int(@intCast(d.cp));
+    const i_raw = try optIntArg(vm, args, 1, 1);
+    const j_raw = try optIntArg(vm, args, 2, i_raw);
+    const cp = codepointCore(s, i_raw, j_raw) orelse return Value.nil();
+    return Value.int(cp);
 }
 
 fn sCodepointN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
@@ -1299,14 +1336,14 @@ pub const natives = [_]function.BaseNative{
     .{ .name = "string.len", .func = &sLen, .module = "string", .field = "len", .recorded = .len },
     .{ .name = "string.sub", .func = &sSub, .module = "string", .field = "sub", .recorded = .sub },
     .{ .name = "string.reverse", .func = &sReverse, .module = "string", .field = "reverse", .recorded = .reverse },
-    .{ .name = "string.upper", .func = &sUpper, .module = "string", .field = "upper" },
-    .{ .name = "string.lower", .func = &sLower, .module = "string", .field = "lower" },
+    .{ .name = "string.upper", .func = &sUpper, .module = "string", .field = "upper", .recorded = .upper },
+    .{ .name = "string.lower", .func = &sLower, .module = "string", .field = "lower", .recorded = .lower },
     .{ .name = "string.rep", .func = &sRep, .module = "string", .field = "rep", .recorded = .rep },
     .{ .name = "string.char", .func = &sChar, .module = "string", .field = "char", .recorded = .char },
     // S-B (design doc 06): `string.codepoint` (scalar values at character
     // positions) replaces the byte-returning `string.byte`; `string.codes` is the
     // `(index, codepoint)` iterator. Raw bytes now come from `s:encode()`.
-    .{ .name = "string.codepoint", .func = &sCodepoint1, .multi = &sCodepointN, .module = "string", .field = "codepoint" },
+    .{ .name = "string.codepoint", .func = &sCodepoint1, .multi = &sCodepointN, .module = "string", .field = "codepoint", .recorded = .codepoint },
     .{ .name = "string.codes", .func = &sCodes1, .multi = &sCodesN, .module = "string", .field = "codes" },
     .{ .name = "string.format", .func = &sFormat, .module = "string", .field = "format" },
     // The text↔bytes boundary (design doc 06, S-A). `encode` is a `string` field

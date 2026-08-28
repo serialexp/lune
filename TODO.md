@@ -20,6 +20,17 @@ takes exactly one value. General win: any composed builtin expression
 this today (its only nestings are `lower(upper(a))` — out of v1 anyway — and
 `rep(char(...), 4, "-")` — 3-arg rep, its own frontier), so it stayed a note.
 
+**UPDATE (2026-08-28, doc 26 landed):** this is now THE str_manip blocker.
+upper/lower/codepoint all record (supper/slower/scp, native-lowered), and the
+A/B probe confirms the prediction: the intermediate-local form of the
+str_manip core (`local u = upper(base); lower(u)`) records with ZERO aborts,
+while the bench's actual `lower(upper(a))` still aborts `.cross_frame` at the
+nested call — the abort moved from "case ops unsupported" to exactly this
+frontier. Every other op in str_manip's hot path (`sub`, `reverse`, `len`,
+2-arg `codepoint`) now records, so lifting this one shape should let the whole
+loop trace (`rep(char(..), 4, "-")` sits behind a 1-in-64 branch and can stay
+a side-exit).
+
 ## `table.pack`/`table.unpack` recording (noted 2026-08-27, ex-`math.type` entry)
 
 The `math.type` fold arm from this entry LANDED with arc B c1 (doc 24;
@@ -1246,6 +1257,26 @@ change too:
 
 Nothing gates `zig build wasm` in `just test`, so it rotted silently. Fix +
 consider adding the wasm build to CI/justfile as a compile-only gate.
+
+## Pre-existing: `nextLoggedEffect` advances the cursor before validation — a wrong-version pin becomes "already consumed" on retry (found 2026-08-27, doc 26 D1 grounding)
+
+`nextLoggedEffect` (interp.zig:4845) bumps `effect_cursor` BEFORE the caller
+validates the entry. For `noteUnicodeVersion` (:4901) that ordering makes the
+mismatch path self-erasing: on `UnicodeVersionMismatch` the wrong-version
+`.unicode_version` entry is already BEHIND the cursor and
+`unicode_version_pinned` stays false — so if the same VM's `upper`/`lower` is
+reached again, `versionAlreadyConsumed` (:4879) scans the consumed prefix,
+finds the (wrong-version, never-validated) entry, and pins **silently with the
+mismatched table** — the exact divergence the error exists to prevent. The
+mismatch is deliberately uncatchable in-language, so reaching a second case op
+requires a host that re-runs a faulted-but-live VM — i.e. this composes with
+the "faulted-but-live VM can be re-run" entry below into a silent-divergence
+path, and the same pre-validation cursor advance is a latent trap for any
+future effect whose consumer validates-then-fails. Fix shapes: validate before
+advancing (peek/commit split), or record "consumed AND validated" instead of
+inferring validation from cursor position. Flagged for Bart, not fixed in the
+doc-26 arc (Rule #0.5 — it predates the arc and the fix choice is a design
+call).
 
 ## Pre-existing: faulted-but-live VM can be re-run without resetting depth/stack_top (found 2026-07-17, doc-17 F-7 grounding)
 

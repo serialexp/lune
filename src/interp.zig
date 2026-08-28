@@ -2237,6 +2237,13 @@ pub const Vm = struct {
         wctx: *TrialWalkCtx,
     ) EntryDirective {
         var pc = pc_in;
+        // Doc 26 D1 tripwire: a trace carrying `supper`/`slower` can only have
+        // committed after a successful tier-0 upper/lower pinned the session's
+        // Unicode version, and the pin is monotone for this VM's lifetime — so
+        // it MUST hold at every entry. (Patched native→native transfers have
+        // no vm in reach; a pin that holds when their link is armed holds
+        // forever after, so entry + arm coverage is complete.) Free in release.
+        if (ct.requires_unicode_pin) std.debug.assert(self.unicode_version_pinned);
         // Doc 22 §B.2: resolve the native page BEFORE any VM-side seeding, so the
         // two seeding paths never both run (the dedup half of B-ii). A page whose
         // seed plan is non-empty seeds ITSELF in its entry prologue (via the
@@ -2746,13 +2753,13 @@ pub const Vm = struct {
                 // for a bounded burst, and tells us where
                 // tier-0 should resume when it yields.
                 if (ran_native and ran_native_link_mode) {
-                    if (self.trace.driveChain(final, result, proto, trace_regs, .native_only, .native_numeric_for_done, &.{}, safe_to_arm)) |chain| {
+                    if (self.trace.driveChain(final, result, proto, trace_regs, .native_only, .native_numeric_for_done, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                         for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                         return .{ .resume_tier0 = pc };
                     }
                 } else if (!ran_native) {
-                    if (self.trace.driveChain(final, result, proto, trace_regs, .ir, .{ .ir_numeric_for_done = buf }, &.{}, safe_to_arm)) |chain| {
+                    if (self.trace.driveChain(final, result, proto, trace_regs, .ir, .{ .ir_numeric_for_done = buf }, &.{}, safe_to_arm, self.unicode_version_pinned)) |chain| {
                         if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                         for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                         return .{ .resume_tier0 = pc };
@@ -2797,13 +2804,13 @@ pub const Vm = struct {
                 // entered trace expects.
                 if (self.trace.isSourceBranchGuardExit(final, result.exit_instr, proto)) {
                     if (ran_native) {
-                        if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm)) |chain| {
+                        if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                             for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                             return .{ .resume_tier0 = pc };
                         }
                     } else {
-                        if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl[0..nexcl], safe_to_arm)) |chain| {
+                        if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
                             if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                             for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                             return .{ .resume_tier0 = pc };
@@ -2875,13 +2882,13 @@ pub const Vm = struct {
             // into two literal-tier calls (as the branch-guard site
             // above does) rather than a runtime tier value.
             if (ran_native) {
-                if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm)) |chain| {
+                if (self.trace.driveChain(final, result, proto, regs, .native_only, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                     for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                     return .{ .resume_tier0 = pc };
                 }
             } else {
-                if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl[0..nexcl], safe_to_arm)) |chain| {
+                if (self.trace.driveChain(final, result, proto, regs, .ir, .ordinary_header, excl[0..nexcl], safe_to_arm, self.unicode_version_pinned)) |chain| {
                     if (chain.resume_pc) |resume_pc| pc = @intCast(resume_pc);
                     for (wctx.dead[0..wctx.ndead.*]) |dt| self.trace.removeTrace(dt);
                     return .{ .resume_tier0 = pc };

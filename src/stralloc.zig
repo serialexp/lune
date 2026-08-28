@@ -1,6 +1,6 @@
-//! Shared allocating string-producer bodies (doc 24 D5 — arc B).
+//! Shared string JIT runtime shims (doc 24 D5 — arc B; doc 26).
 //!
-//! ONE `noinline` routine per `.alloc` IR op, used by every JIT tier: the
+//! ONE `noinline` routine per string IR op, used by every JIT tier: the
 //! tier-1a IR arms (`irinterp.zig`) call them as Zig functions, and the native
 //! body callouts (`nativegen.zig`) call the SAME routines through raw pointers
 //! with SysV argument passing. Tier-0's `bToString` (`stdlib/basic.zig`) is the
@@ -8,6 +8,12 @@
 //! (the one renderer) followed by `Heap.intern` (the one interning path) — so
 //! the produced bytes and the interned object are identical across tiers by
 //! construction.
+//!
+//! Two classes live here (doc 26 review m4 — the audit rules below scope to
+//! the first): the allocating `.alloc`-op producers (`tostr_*`, the snew
+//! class, `supper`/`slower`), and ONE non-allocating reader — `scpRuntime` —
+//! which shares the shim discipline (same shared-core identity, same
+//! C-ABI/side-exit protocol) but performs no allocation and never links.
 //!
 //! **Callout audit rule (doc 24 D5):** every routine here performs **at most
 //! one `Heap.link`** per call — an intern *hit* performs zero (`Heap.intern`
@@ -100,4 +106,30 @@ pub noinline fn srep2Runtime(heap: *gc.Heap, s: *object.GcHeader, n: i64) callco
     const str = string_mod.String.fromHeader(s);
     const r = string_std.rep2Core(heap, str.bytes(), n) catch return null;
     return &r.header;
+}
+
+/// `supper` body: `string.upper(s)` via the shared `caseCore` (doc 26 D2).
+/// Deliberately heap-only — the Unicode-version pin is a committed-trace
+/// invariant (doc 26 D1), never re-derived on trace.
+pub noinline fn supperRuntime(heap: *gc.Heap, s: *object.GcHeader) callconv(.c) ?*object.GcHeader {
+    const str = string_mod.String.fromHeader(s);
+    const r = string_std.caseCore(heap, str.bytes(), .upper) catch return null;
+    return &r.header;
+}
+
+/// `slower` body: `string.lower(s)`, ditto.
+pub noinline fn slowerRuntime(heap: *gc.Heap, s: *object.GcHeader) callconv(.c) ?*object.GcHeader {
+    const str = string_mod.String.fromHeader(s);
+    const r = string_std.caseCore(heap, str.bytes(), .lower) catch return null;
+    return &r.header;
+}
+
+/// `scp` body: single-result `string.codepoint(s, i, j)` via the shared
+/// `codepointCore` (doc 26 D3) — the non-allocating reader. Returns the scalar
+/// (0…0x10FFFF; U+0000 is a REAL result) or **−1** as the empty-range sentinel
+/// (unreachable as a scalar) — the trace side-exits and tier-0's replay
+/// produces the nil itself. No heap argument, no link, no error path.
+pub noinline fn scpRuntime(s: *object.GcHeader, i: i64, j: i64) callconv(.c) i64 {
+    const str = string_mod.String.fromHeader(s);
+    return string_std.codepointCore(str, i, j) orelse -1;
 }
