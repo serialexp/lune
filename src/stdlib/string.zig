@@ -125,10 +125,10 @@ fn strObjArg(vm: *Vm, args: []const Value, i: usize) anyerror!*const String {
 /// starts a code point). Branch-light; used for code-point-aware field widths in
 /// `string.format` so `%Ns`/`%Nc` align by character, consistent with `#s`.
 ///
-/// This byte-slice form (and `charByteOffset`/`byteToChar` below) stays as the
-/// general implementation AND the reference the doc-28 tests compare the
-/// `*String` fast forms against. New code at a core boundary wants the
-/// `*String` forms — they consult the cached `cp_len` instead of scanning.
+/// This byte-slice form (and `charByteOffset` below) stays as the general
+/// implementation AND the reference the doc-28 tests compare the `*String`
+/// fast forms against. New code at a core boundary wants the `*String` forms —
+/// they consult the cached `cp_len` instead of scanning.
 fn cpCount(s: []const u8) usize {
     var n: usize = 0;
     for (s) |b| {
@@ -791,16 +791,20 @@ fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
                 else => break :flags,
             }
         }
-        // width
+        // width (checked accumulate, doc 28 c2: an absurd digit run must reject
+        // as a bad format — the old `w * 10 + d` overflowed usize, a safe-build
+        // panic / ReleaseFast silent wrap on `%99999...9d`)
         while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {
-            spec.width = spec.width * 10 + (fmt[i] - '0');
+            const w10 = std.math.mul(usize, spec.width, 10) catch return error.TypeError;
+            spec.width = std.math.add(usize, w10, fmt[i] - '0') catch return error.TypeError;
         }
-        // precision
+        // precision (same checked accumulate)
         if (i < fmt.len and fmt[i] == '.') {
             i += 1;
             var p: usize = 0;
             while (i < fmt.len and fmt[i] >= '0' and fmt[i] <= '9') : (i += 1) {
-                p = p * 10 + (fmt[i] - '0');
+                const p10 = std.math.mul(usize, p, 10) catch return error.TypeError;
+                p = std.math.add(usize, p10, fmt[i] - '0') catch return error.TypeError;
             }
             spec.precision = p;
         }
@@ -856,7 +860,7 @@ fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
                 const ln = std.unicode.utf8Encode(@intCast(n), &tmp) catch return error.TypeError;
                 // Route through emitString so the width pads by one **character**
                 // (code point), not by the UTF-8 byte length of the encoding.
-                try emitString(&out, gpa, tmp[0..ln], .{ .minus = spec.minus, .width = spec.width });
+                try emitString(&out, gpa, tmp[0..ln], 1, .{ .minus = spec.minus, .width = spec.width });
             },
             'f', 'F', 'e', 'E', 'g', 'G' => {
                 if (!arg.isNumber()) return error.TypeError;
@@ -892,16 +896,26 @@ fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
                 try emitNumeric(&out, gpa, signPrefix(neg, spec), body, fspec);
             },
             's' => {
-                // S-B: `%.Ns` precision counts **code points**, not bytes. For
-                // ASCII (incl. coerced numbers) this equals `min(N, len)`.
-                if (interp.strBytes(arg)) |full| {
-                    const body = if (spec.precision) |p| full[0..charByteOffset(full, p + 1)] else full;
-                    try emitString(&out, gpa, body, spec);
+                // S-B: `%.Ns` precision counts **code points**, not bytes.
+                // doc 28 c2: the string arg is taken as its OBJECT — the kept
+                // character count is known from the cached `cp_len` (clamped
+                // precision via `charPrefixEndS`, which also kills the old
+                // `p + 1` overflow on a huge precision), so emitString never
+                // rescans. A coerced number is ASCII by construction (digits,
+                // sign, '.', 'e', inf/nan) — chars ARE bytes there.
+                if (strObjOf(arg)) |sobj| {
+                    const full = sobj.bytes();
+                    if (spec.precision) |p| {
+                        const kept = @min(p, sobj.cpLen());
+                        try emitString(&out, gpa, full[0..charPrefixEndS(sobj, p)], kept, spec);
+                    } else {
+                        try emitString(&out, gpa, full, sobj.cpLen(), spec);
+                    }
                 } else if (arg.isNumber()) {
                     var sbuf: [64]u8 = undefined;
                     const full = try interp.coerceConcat(arg, &sbuf);
-                    const body = if (spec.precision) |p| full[0..charByteOffset(full, p + 1)] else full;
-                    try emitString(&out, gpa, body, spec);
+                    const body = if (spec.precision) |p| full[0..@min(p, full.len)] else full;
+                    try emitString(&out, gpa, body, body.len, spec);
                 } else {
                     try formatNonStr(&out, gpa, arg, spec);
                 }
@@ -927,12 +941,16 @@ fn sFormat(ctx: *anyopaque, args: []const Value) anyerror!Value {
 }
 
 /// Emit a string field with width + `-` justification (the `0` flag is ignored
-/// for `%s`, matching C/Lua).
-fn emitString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, body: []const u8, spec: FormatSpec) !void {
-    // S-B: the field width is a **code-point** count (consistent with `#s`), so a
-    // multibyte body pads by characters, not bytes.
-    const width_units = cpCount(body);
-    const pad: usize = if (spec.width > width_units) spec.width - width_units else 0;
+/// for `%s`, matching C/Lua). S-B: the field width is a **code-point** count
+/// (consistent with `#s`), so a multibyte body pads by characters, not bytes.
+/// `body_cp` is that character count, supplied by the CALLER (doc 28 c2): every
+/// call site already knows it — the cached `cp_len`, a clamped precision, one
+/// for `%c`, or `body.len` for an ASCII-by-construction coercion — so the old
+/// per-field O(len) `cpCount` rescan is gone. Asserted against the rescan in
+/// safe builds.
+fn emitString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, body: []const u8, body_cp: usize, spec: FormatSpec) !void {
+    std.debug.assert(body_cp == cpCount(body));
+    const pad: usize = if (spec.width > body_cp) spec.width - body_cp else 0;
     if (spec.minus) {
         try out.appendSlice(gpa, body);
         try appendN(out, gpa, ' ', pad);
@@ -950,7 +968,7 @@ fn formatNonStr(out: *std.ArrayList(u8), gpa: std.mem.Allocator, v: Value, spec:
         else => return error.TypeError,
     };
     const trimmed = if (spec.precision) |p| body[0..@min(p, body.len)] else body;
-    try emitString(out, gpa, trimmed, spec);
+    try emitString(out, gpa, trimmed, trimmed.len, spec); // ASCII bodies: chars == bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -969,27 +987,27 @@ const ResultBuf = [pattern.max_captures + 2]Value;
 /// Resolve Lua's `init` argument (a 1-based **character** index, S-D) to a 0-based
 /// **byte** offset into `s`, or `null` if it lands past the end (→ no match).
 /// Negative counts back from the end in characters; `0`/positive are 1-based; the
-/// result lands on a code-point boundary (`charByteOffset`). `pos == clen + 1`
-/// (one past the last char) maps to `s.len` — the empty-match-at-end position.
-fn resolveInit(init_raw: i64, s: []const u8) ?usize {
-    const clen = cpCount(s);
+/// result lands on a code-point boundary. `pos == cp_len + 1` (one past the last
+/// char) maps to `s.len` — the empty-match-at-end position. Takes the `*String`
+/// (doc 28 c2): the character length is the cached `cp_len` (this was an O(len)
+/// `cpCount` scan per find/match call) and an ASCII subject converts by identity.
+fn resolveInit(init_raw: i64, s: *const String) ?usize {
+    const clen = s.cpLen();
     var pos = posRelat(init_raw, clen); // 1-based char position (may be 0)
     if (pos < 1) pos = 1;
     if (pos > @as(i64, @intCast(clen)) + 1) return null; // start past end+1
-    return charByteOffset(s, @intCast(pos));
-}
-
-/// Convert a 0-based byte offset on a code-point boundary in `s` to a 1-based
-/// **character** index (S-D boundary translation). `off == s.len` → `cpCount + 1`.
-fn byteToChar(s: []const u8, off: usize) usize {
-    return cpCount(s[0..off]) + 1;
+    return charByteOffsetS(s, @intCast(pos));
 }
 
 /// Convert capture `i` of a completed match to a `Value`, mirroring
 /// `push_onecapture`: index `i >= level` is only valid at `i == 0` (the whole
 /// match, taken from `whole`); a position capture becomes a 1-based integer; a
-/// string capture is interned.
-fn captureValue(vm: *Vm, ms: *const pattern.MatchState, i: usize, whole: ?[2]usize) anyerror!Value {
+/// string capture is interned. `subj` is the subject `String` OBJECT whose bytes
+/// `ms.src` views (doc 28 c2): a position capture's byte→char conversion was an
+/// O(prefix) `cpCount` scan per capture; with the object it reads the cached
+/// ASCII bit and collapses to `+1` on the common all-ASCII subject.
+fn captureValue(vm: *Vm, ms: *const pattern.MatchState, subj: *const String, i: usize, whole: ?[2]usize) anyerror!Value {
+    std.debug.assert(ms.src.ptr == subj.bytes().ptr and ms.src.len == subj.len);
     if (i >= ms.level) {
         if (i == 0) {
             const w = whole orelse return error.InvalidCapture;
@@ -999,7 +1017,7 @@ fn captureValue(vm: *Vm, ms: *const pattern.MatchState, i: usize, whole: ?[2]usi
     }
     const cap = ms.captures[i];
     if (cap.len == pattern.cap_unfinished) return error.MalformedPattern;
-    if (cap.len == pattern.cap_position) return Value.int(@intCast(byteToChar(ms.src, cap.init)));
+    if (cap.len == pattern.cap_position) return Value.int(@intCast(byteToCharS(subj, cap.init)));
     const l: usize = @intCast(cap.len);
     return vm.heap.internValue(ms.src[cap.init .. cap.init + l]);
 }
@@ -1011,10 +1029,10 @@ fn numCaptures(ms: *const pattern.MatchState, whole: ?[2]usize) usize {
 }
 
 /// Write every capture value into `buf`, returning the count.
-fn writeCaptures(vm: *Vm, ms: *const pattern.MatchState, whole: ?[2]usize, buf: []Value) anyerror!usize {
+fn writeCaptures(vm: *Vm, ms: *const pattern.MatchState, subj: *const String, whole: ?[2]usize, buf: []Value) anyerror!usize {
     const n = numCaptures(ms, whole);
     var i: usize = 0;
-    while (i < n) : (i += 1) buf[i] = try captureValue(vm, ms, i, whole);
+    while (i < n) : (i += 1) buf[i] = try captureValue(vm, ms, subj, i, whole);
     return n;
 }
 
@@ -1024,9 +1042,10 @@ fn writeCaptures(vm: *Vm, ms: *const pattern.MatchState, whole: ?[2]usize, buf: 
 /// and returns the count: `(start, end, captures...)` on a match, or a single
 /// `nil` on no match.
 fn findCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
-    const s = try strArg(vm, args, 0);
+    const sobj = try strObjArg(vm, args, 0);
+    const s = sobj.bytes();
     const pat = try strArg(vm, args, 1);
-    const st = resolveInit(try optIntArg(vm, args, 2, 1), s) orelse {
+    const st = resolveInit(try optIntArg(vm, args, 2, 1), sobj) orelse {
         buf[0] = Value.nil();
         return 1;
     };
@@ -1036,15 +1055,15 @@ fn findCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
         // Plain substring search (empty needle matches at `st`). Byte offsets are
         // converted to 1-based character indices at the seam (S-D).
         if (pat.len == 0) {
-            buf[0] = Value.int(@intCast(byteToChar(s, st)));
-            buf[1] = Value.int(@intCast(byteToChar(s, st) - 1));
+            buf[0] = Value.int(@intCast(byteToCharS(sobj, st)));
+            buf[1] = Value.int(@intCast(byteToCharS(sobj, st) - 1));
             return 2;
         }
         if (st <= s.len) {
             // A plain substring of valid UTF-8 lands on a code-point boundary.
             if (std.mem.indexOfPos(u8, s, st, pat)) |q| {
-                buf[0] = Value.int(@intCast(byteToChar(s, q)));
-                buf[1] = Value.int(@intCast(cpCount(s[0 .. q + pat.len])));
+                buf[0] = Value.int(@intCast(byteToCharS(sobj, q)));
+                buf[1] = Value.int(@intCast(cpCountPrefixS(sobj, q + pat.len)));
                 return 2;
             }
         }
@@ -1060,9 +1079,9 @@ fn findCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     while (true) {
         ms.reset();
         if (try ms.match(sp, pp)) |e| {
-            buf[0] = Value.int(@intCast(byteToChar(s, sp)));
-            buf[1] = Value.int(@intCast(cpCount(s[0..e])));
-            const nc = try writeCaptures(vm, &ms, null, buf[2..]);
+            buf[0] = Value.int(@intCast(byteToCharS(sobj, sp)));
+            buf[1] = Value.int(@intCast(cpCountPrefixS(sobj, e)));
+            const nc = try writeCaptures(vm, &ms, sobj, null, buf[2..]);
             return 2 + nc;
         }
         if (sp >= s.len or anchor) break;
@@ -1089,9 +1108,10 @@ fn sFindN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 /// Core of `string.match(s, pat [, init])`: the captures (or the whole match if
 /// the pattern has none), or a single `nil`.
 fn matchCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
-    const s = try strArg(vm, args, 0);
+    const sobj = try strObjArg(vm, args, 0);
+    const s = sobj.bytes();
     const pat = try strArg(vm, args, 1);
-    const st = resolveInit(try optIntArg(vm, args, 2, 1), s) orelse {
+    const st = resolveInit(try optIntArg(vm, args, 2, 1), sobj) orelse {
         buf[0] = Value.nil();
         return 1;
     };
@@ -1104,7 +1124,7 @@ fn matchCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     while (true) {
         ms.reset();
         if (try ms.match(sp, pp)) |e| {
-            return try writeCaptures(vm, &ms, .{ sp, e }, buf);
+            return try writeCaptures(vm, &ms, sobj, .{ sp, e }, buf);
         }
         if (sp >= s.len or anchor) break;
         sp += ms.seqLen(sp);
@@ -1159,7 +1179,10 @@ fn sGmatch1(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// empty match), and return the captures; 0 results when exhausted.
 fn gmatchAuxCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     const st = try tableArg(vm, args, 0);
-    const s = interp.strBytes(st.getInt(1)) orelse return error.TypeError;
+    // Recover the subject as its `String` OBJECT (doc 28 c2), not a degraded
+    // byte slice — capture conversion downstream wants the cached ASCII bit.
+    const sobj = strObjOf(st.getInt(1)) orelse return error.TypeError;
+    const s = sobj.bytes();
     const pat = interp.strBytes(st.getInt(2)) orelse return error.TypeError;
     const pos_v = st.getInt(3);
     var src: usize = if (pos_v.isInt() and pos_v.asInt() >= 0) @intCast(pos_v.asInt()) else 0;
@@ -1172,7 +1195,7 @@ fn gmatchAuxCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
             // (S-D); `@max(…, 1)` guarantees termination at end-of-string.
             const newpos = if (e == src) e + @max(ms.seqLen(e), 1) else e;
             try st.set(vm.gpa, Value.int(3), Value.int(@intCast(newpos)));
-            return try writeCaptures(vm, &ms, .{ src, e }, buf);
+            return try writeCaptures(vm, &ms, sobj, .{ src, e }, buf);
         }
     }
     return 0; // exhausted
@@ -1204,7 +1227,7 @@ fn appendValueText(vm: *Vm, out: *std.ArrayList(u8), v: Value) anyerror!void {
 
 /// `add_s`: expand a string/number replacement, resolving `%0` (whole match),
 /// `%1`–`%9` (captures), and `%%`/`%x` (literal).
-fn addReplString(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState, repl: []const u8, s_off: usize, e_off: usize) anyerror!void {
+fn addReplString(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState, subj: *const String, repl: []const u8, s_off: usize, e_off: usize) anyerror!void {
     var i: usize = 0;
     while (i < repl.len) : (i += 1) {
         const c = repl[i];
@@ -1220,7 +1243,7 @@ fn addReplString(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState
         } else if (d == '0') {
             try out.appendSlice(vm.gpa, ms.src[s_off..e_off]); // whole match
         } else {
-            const v = try captureValue(vm, ms, d - '1', .{ s_off, e_off });
+            const v = try captureValue(vm, ms, subj, d - '1', .{ s_off, e_off });
             try appendValueText(vm, out, v);
         }
     }
@@ -1228,8 +1251,8 @@ fn addReplString(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState
 
 /// `add_value` for a table replacement: look up `repl[firstCapture]`; a
 /// nil/false result keeps the original text.
-fn addReplTable(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState, repl: *Table, s_off: usize, e_off: usize) anyerror!void {
-    const key = try captureValue(vm, ms, 0, .{ s_off, e_off });
+fn addReplTable(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState, subj: *const String, repl: *Table, s_off: usize, e_off: usize) anyerror!void {
+    const key = try captureValue(vm, ms, subj, 0, .{ s_off, e_off });
     const v = repl.get(key);
     if (!v.isTruthy()) {
         try out.appendSlice(vm.gpa, ms.src[s_off..e_off]); // keep original
@@ -1252,11 +1275,11 @@ fn addReplTable(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState,
 /// a collection triggered inside `repl` cannot sweep them. The result is captured
 /// before `callValue` shrinks `stack_top`; everything after is pure native code
 /// (no collection), so `rv` stays valid until appended.
-fn addReplFunction(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState, repl: Value, s_off: usize, e_off: usize) anyerror!void {
+fn addReplFunction(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchState, subj: *const String, repl: Value, s_off: usize, e_off: usize) anyerror!void {
     const ncap: usize = if (ms.level > 0) ms.level else 1;
     var caps: [pattern.max_captures]Value = undefined;
     var k: usize = 0;
-    while (k < ncap) : (k += 1) caps[k] = try captureValue(vm, ms, k, .{ s_off, e_off });
+    while (k < ncap) : (k += 1) caps[k] = try captureValue(vm, ms, subj, k, .{ s_off, e_off });
     var r: [1]Value = .{Value.nil()};
     const n = try vm.callValue(repl, caps[0..ncap], r[0..1]);
     const rv = if (n >= 1) r[0] else Value.nil();
@@ -1274,7 +1297,8 @@ fn addReplFunction(vm: *Vm, out: *std.ArrayList(u8), ms: *const pattern.MatchSta
 /// Core of `string.gsub(s, pat, repl [, n])` → `(result, count)`. `repl` may be a
 /// string/number, a table, or a function (called per match via `Vm.callValue`).
 fn gsubCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
-    const s = try strArg(vm, args, 0);
+    const sobj = try strObjArg(vm, args, 0);
+    const s = sobj.bytes();
     const pat = try strArg(vm, args, 1);
     if (args.len < 3) return vm.badArg(3, "string/function/table", null);
     const repl = args[2];
@@ -1314,11 +1338,11 @@ fn gsubCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
         if (e_opt) |e| {
             count += 1;
             if (repl_table) |t| {
-                try addReplTable(vm, &out, &ms, t, src, e);
+                try addReplTable(vm, &out, &ms, sobj, t, src, e);
             } else if (repl_fn) |f| {
-                try addReplFunction(vm, &out, &ms, f, src, e);
+                try addReplFunction(vm, &out, &ms, sobj, f, src, e);
             } else if (repl_str) |r| {
-                try addReplString(vm, &out, &ms, r, src, e);
+                try addReplString(vm, &out, &ms, sobj, r, src, e);
             } else {
                 // numeric replacement: coerce to its text, no captures.
                 try appendValueText(vm, &out, repl);
