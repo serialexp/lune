@@ -2917,3 +2917,103 @@ test "doc 30 c4b: carried-string slot — native compiles, runs, flushes TAG_HEA
         try testing.expect(compileInto(gpa, &arena, &tb, null, &nheap) == null);
     }
 }
+
+const stralloc = @import("stralloc.zig");
+
+test "doc 30 c5 (m02): post-sgmatch projection OOM — the deferred sgm_setpos left the cursor un-advanced, so replay yields the SAME token" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    // Reference geometry for "ab cd ef" %a+ (byte spans and cursor):
+    //   token 1 "ab" span (0,2), pos after commit 2
+    //   token 2 "cd" span (3,2), pos after commit 5
+    //   token 3 "ef" span (6,2), pos after commit 8
+    const subject = "ab cd ef";
+    const patsrc = "%a+";
+    const pos_after = [_]i64{ 0, 2, 5, 8 };
+    const spans = [_][2]u64{ .{ 0, 2 }, .{ 3, 2 }, .{ 6, 2 } };
+
+    // Self-calibrate the sweep: count allocations through setup and through a
+    // clean full run, then sweep EVERY fail index in the run's own range —
+    // this provably covers the per-iteration scap_str interns regardless of
+    // how many allocations setup or the allocator internals cost. The
+    // decisive legs are those where the OOM lands in a scap_str intern AFTER
+    // >= 1 committed iteration (exit at instr 5 of gmatchStepTrace); require
+    // at least one so the test cannot silently degrade into setup-only OOMs.
+    var setup_allocs: usize = 0;
+    var run_allocs_end: usize = 0;
+    {
+        var count = std.testing.FailingAllocator.init(gpa, .{});
+        var cheap = gc.Heap.init(count.allocator());
+        defer cheap.deinit();
+        const cs = try cheap.intern(subject);
+        const cp = try cheap.intern(patsrc);
+        const cst = try gmatchStateTable(&cheap, &cs.header, &cp.header, 0);
+        var cconsts = [_]Value{ Value.int(1), Value.heap(&cp.header) };
+        const tc = gmatchStepTrace(&cconsts);
+        setup_allocs = count.alloc_index;
+        var cregs = [_]Value{ Value.heap(&cst.header), Value.int(0) };
+        const cvalues = try gpa.alloc(Value, tc.instrs.len);
+        defer gpa.free(cvalues);
+        _ = irinterp.executeValuesCtx(.{ .heap = &cheap }, &tc, &cregs, cvalues);
+        run_allocs_end = count.alloc_index;
+    }
+    try testing.expect(run_allocs_end > setup_allocs); // the run does intern
+
+    var decisive: usize = 0;
+    var fp: usize = setup_allocs;
+    while (fp < run_allocs_end) : (fp += 1) {
+        var ifail = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fp });
+        var iheap = gc.Heap.init(ifail.allocator());
+        defer iheap.deinit();
+        const isubj = iheap.intern(subject) catch continue; // setup OOM: not a decisive leg
+        const ipat = iheap.intern(patsrc) catch continue;
+        const istate = gmatchStateTable(&iheap, &isubj.header, &ipat.header, 0) catch continue;
+        var iconsts = [_]Value{ Value.int(1), Value.heap(&ipat.header) };
+        const ti = gmatchStepTrace(&iconsts);
+        var iregs = [_]Value{ Value.heap(&istate.header), Value.int(0) };
+        const values = try gpa.alloc(Value, ti.instrs.len);
+        defer gpa.free(values);
+        const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &ti, &iregs, values);
+
+        // Native leg with the SAME fail point: identical observable outcome
+        // (D2 id-stream — both tiers run the same shared cores in the same
+        // order against the heap's gpa).
+        var nfail = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fp });
+        var nheap = gc.Heap.init(nfail.allocator());
+        defer nheap.deinit();
+        const nsubj = nheap.intern(subject) catch continue;
+        const npat = nheap.intern(patsrc) catch continue;
+        const nstate = gmatchStateTable(&nheap, &nsubj.header, &npat.header, 0) catch continue;
+        var nconsts = [_]Value{ Value.int(1), Value.heap(&npat.header) };
+        const tn = gmatchStepTrace(&nconsts);
+        var ct = nativegen.compileWithHeap(gpa, &tn, &nheap) orelse return error.NativeBailedUnexpectedly;
+        defer ct.deinit();
+        var nregs = [_]Value{ Value.heap(&nstate.header), Value.int(0) };
+        const nresult = try util.runNative(ct, &nregs);
+        try testing.expectEqual(iresult.completed, nresult.completed);
+        try testing.expectEqual(iresult.exit_instr, nresult.exit_instr);
+        try testing.expectEqual(iregs[1].payload.bits, nregs[1].payload.bits);
+        try testing.expectEqual(istate.inLaneValueIntCell(3).?, nstate.inLaneValueIntCell(3).?);
+
+        if (iresult.exit_instr != 5 or iresult.completed == 0 or iresult.completed >= 3) continue;
+        decisive += 1;
+        const k = iresult.completed;
+
+        // The DECISIVE m02 claims, on both heaps:
+        // (1) the failing iteration's deferred sgm_setpos did NOT commit —
+        //     the cursor still holds iteration k's value;
+        // (2) re-running the gmatch step (the pure, non-allocating shim —
+        //     exactly what tier-0's replay does through the iterator) yields
+        //     token k+1 AGAIN: the same span the failed scap_str was
+        //     projecting. No token is lost, none is skipped.
+        try testing.expectEqual(pos_after[k], istate.inLaneValueIntCell(3).?);
+        try testing.expectEqual(@as(i64, 0), stralloc.sgmatchRuntime(&iheap, &istate.header, &ipat.header));
+        try testing.expectEqual(spans[k][0], iheap.match_scratch.words[2 * gc.MatchScratch.slot_whole]);
+        try testing.expectEqual(spans[k][1], iheap.match_scratch.words[2 * gc.MatchScratch.slot_whole + 1]);
+        try testing.expectEqual(@as(i64, 0), stralloc.sgmatchRuntime(&nheap, &nstate.header, &npat.header));
+        try testing.expectEqual(spans[k][0], nheap.match_scratch.words[2 * gc.MatchScratch.slot_whole]);
+        try testing.expectEqual(spans[k][1], nheap.match_scratch.words[2 * gc.MatchScratch.slot_whole + 1]);
+    }
+    try testing.expect(decisive >= 1);
+}

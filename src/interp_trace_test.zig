@@ -3481,3 +3481,197 @@ test "hash alias e2e: store-VALUE type drift is caught before the forwarded read
         "4640\n80\n",
     );
 }
+
+test "doc 30 c5: the pattern/str2num loop runs NATIVELY end-to-end — find/match x2/tonumber + gmatch for-in, record/replay parity" {
+    // The arc's flagship: the four recorded shapes in bench form (hoisted
+    // builtins, TWO match calls in one body — interleaved projections against
+    // different subjects — and tonumber over a match projection), plus the
+    // composite gmatch for-in, through the full pipeline (record → tropt →
+    // native) under effect RECORDING. Proves (a) byte parity with tier-0,
+    // (b) native really entered, (c) the committed traces carry the doc 30
+    // ops (sfindp, two smatch in ONE trace, str2num_i, and the sgmatch/
+    // sgm_setpos composite with its guard_table state pin), (d) pattern
+    // callouts log NO effects (pure by construction), and (e) a replay-mode
+    // rerun re-records from scratch and reproduces the output byte-identically.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local find, match, gmatch = string.find, string.match, string.gmatch
+        \\local text = "key=value; name=lune; year=2026; lang=zig"
+        \\local acc = 0
+        \\for i = 1, 100 do
+        \\  local s, e = find(text, "year", 1, true)
+        \\  acc = acc + s + e
+        \\  local k, v = match(text, "(%w+)=(%w+)")
+        \\  acc = acc + #k + #v
+        \\  local d = match("item-00420-x", "%d+")
+        \\  acc = acc + tonumber(d)
+        \\end
+        \\for w in gmatch(text, "%a+") do
+        \\  acc = acc + #w
+        \\end
+        \\print(acc)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var t0_out: [64]u8 = undefined;
+    var t0_len: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        t0_len = sink.buffered().len;
+        @memcpy(t0_out[0..t0_len], sink.buffered());
+        try testing.expect(t0_len > 0);
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+    vm.trace.config.hotloop = 4;
+    vm.effect_mode = .record;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(t0_out[0..t0_len], sink.buffered());
+    try testing.expect(vm.trace.entries > 0);
+    if (@import("nativegen.zig").is_x64_linux)
+        try testing.expect(vm.trace.native_entries > 0);
+    // Pattern callouts are PURE: nothing may enter the effect log.
+    try testing.expectEqual(@as(usize, 0), vm.effect_log.items.len);
+
+    // Structural: one committed trace carries the numeric-for body's ops —
+    // sfindp (plain find, konst-folded end index), TWO smatch (interleaved
+    // projections, different subjects), scap_str captures, and str2num_i
+    // (tonumber over the %d+ projection). A separate trace carries the
+    // gmatch composite: sgmatch + deferred sgm_setpos + scap_str.
+    var found_body = false;
+    var found_gm = false;
+    for (vm.trace.cache.items) |t| {
+        var n_smatch: usize = 0;
+        var has_sfindp = false;
+        var has_str2num = false;
+        var has_scap_str = false;
+        var has_sgmatch = false;
+        var has_setpos = false;
+        for (t.instrs) |ins| switch (ins.op) {
+            .smatch => n_smatch += 1,
+            .sfindp => has_sfindp = true,
+            .str2num_i => has_str2num = true,
+            .scap_str => has_scap_str = true,
+            .sgmatch => has_sgmatch = true,
+            .sgm_setpos => has_setpos = true,
+            else => {},
+        };
+        if (has_sfindp and n_smatch == 2 and has_str2num and has_scap_str) found_body = true;
+        if (has_sgmatch and has_setpos and has_scap_str) found_gm = true;
+    }
+    try testing.expect(found_body);
+    try testing.expect(found_gm);
+
+    // Replay leg: mode flip, cursor reset — traces re-record during replay,
+    // output byte-identical, the log stays empty (nothing to consume: the
+    // whole program is deterministic pure compute).
+    vm.effect_mode = .replay;
+    vm.effect_cursor = 0;
+    var rep_buf: [64]u8 = undefined;
+    var rep_sink = io.Writer.fixed(&rep_buf);
+    vm.out = &rep_sink;
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(t0_out[0..t0_len], rep_sink.buffered());
+    try testing.expectEqual(@as(usize, 0), vm.effect_log.items.len);
+}
+
+test "doc 30 c5: guard_sid identity pin — a pattern rebound between loop runs side-exits and re-records with the new census" {
+    // §9 identity-guard shape: the pattern reaches the loop as a non-konst
+    // local (a function parameter), so the arm pins it by IDENTITY
+    // (guard_string + guard_sid vs the konst pool). A second run of the same
+    // loop with a DIFFERENT pattern must fail the pin — never reuse the old
+    // census — and produce tier-0-identical output; the machinery then
+    // re-records against the new pattern.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local match = string.match
+        \\local text = "abc 12345 def"
+        \\local function scan(pat)
+        \\  local acc = 0
+        \\  for i = 1, 50 do
+        \\    local m = match(text, pat)
+        \\    acc = acc + #m
+        \\  end
+        \\  return acc
+        \\end
+        \\print(scan("%a+") + scan("%d+") + scan("%a+ %d+"))
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var t0_out: [64]u8 = undefined;
+    var t0_len: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        t0_len = sink.buffered().len;
+        @memcpy(t0_out[0..t0_len], sink.buffered());
+        try testing.expect(t0_len > 0);
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+    vm.trace.config.hotloop = 4;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(t0_out[0..t0_len], sink.buffered());
+    try testing.expect(vm.trace.entries > 0);
+
+    // The identity pin must be present in a committed trace, and its aux is
+    // a konst-pool id whose const IS the pinned pattern string.
+    var found_sid = false;
+    for (vm.trace.cache.items) |t| {
+        for (t.instrs) |ins| {
+            if (ins.op != .guard_sid) continue;
+            found_sid = true;
+            try testing.expect(ins.aux >= 0 and ins.aux < t.consts.len);
+            const kv = t.consts[@intCast(ins.aux)];
+            try testing.expect(kv.isHeap() and kv.heapType() == .string);
+        }
+    }
+    try testing.expect(found_sid);
+}
