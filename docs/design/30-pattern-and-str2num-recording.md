@@ -476,3 +476,84 @@ fresh heap/TraceState on restore), census is pattern-only, subject
 replacement mid-loop is sound (both tiers read current state), dead-alloc
 native homing works once classification is fixed (`nativegen.zig:3189/3520`),
 the exact gmatch progress rule (`string.zig:1221`).
+
+## 11. Landed results (2026-08-29)
+
+Landed as c4 (`d32103b`: recorder arms + `recTForLoop`), c4b (`b008140`:
+carried-string slot classification — gmatch's for-in goes native
+end-to-end, 2995 bytes, `completed=7..20`/entry), the §8 audit fixes
+(`c28202a`), and c5 (test matrix + two general fixes, this commit).
+
+**Abort profile, before → after** (`--dump-aborts`, ReleaseFast,
+baseline `1755f0c`):
+
+| bench | before | after |
+|---|---|---|
+| str_find_match | `host_barrier` ×6 | **no recording aborts** |
+| str_gmatch | ctor `host_barrier` ×6 + body `host_barrier` ×6 | ctor ×6 (by design, §7) + `bad_type` ×1 (nil-ctrl first iteration — abort-don't-commit, §6) |
+| str_gsub | `host_barrier` ×6 | unchanged (kept, §7) |
+| str_format | `host_barrier` ×6 | unchanged (kept, §7) |
+
+**Board** (interleaved A/B vs nm-verified `1755f0c` shadow binary):
+
+- **str_find_match 32.4 → 20.1 ms jit — the ≤20 target is met** (1.5×
+  vs LJ 13.2). The last ~10 ms (30.4 → 20.2) came not from a doc-30 op
+  but from a general recorder gap the bench exposed: `recBranch` emitted
+  `guard_true` on a konst/proven-string operand (`if match(s,"^key")`
+  anchored tests), and that guard's ref bailed `proveKinds`. The fold —
+  statically-decided branches emit no guard (only nil/false are falsy; a
+  string ref is never either; a konst matching the observed truthiness is
+  a tautology) — helps every tier and loses no region identity (an
+  undivergeable branch has no other CFG edge).
+- **str_gmatch 57 ms, flat vs the ≤45 target — and the evidence says
+  coverage was never the residue.** LuaJIT runs this bench in ~25 ms
+  **with `-joff`**: gmatch iteration is NYI in LuaJIT's recorder too, so
+  its number is pure interpreter + matcher + intern constant factors.
+  Our native gmatch loop executes ≈ at tier-0 speed because the
+  per-token callout (matcher + `scap_str` intern) dominates the loop
+  body in both tiers. Per §10's contingency the residue routes to the
+  constant-factor levers (doc 28 §5 L3 intern hash, doc 29), not to more
+  recording breadth. No heuristic tuning was done to force more native
+  iterations (Z-6): the region window gates instances at `work=7 <
+  min_useful=8` (each instance yields 8 tokens, iteration 1 lost to the
+  nil-ctrl prologue), and that observation is recorded in TODO.md as a
+  gate-design question, not patched around.
+- gsub/format flat, as predicted (§10 — their levers are other arcs).
+- Whole-board A/B: every other row ≤ noise except **lua54 t0 +11%**,
+  proven layout-only by `perf stat`: instructions +0.3%, cycles +11%,
+  L1-icache misses 7× (356K vs 51K) — the ~230 KB of new
+  recorder/nativegen code shifted tier-0 dispatch alignment. Recorded in
+  TODO.md as a binary-layout sensitivity, not chased here.
+
+**General mechanisms this arc added beyond the §4–§6 inventory** (each
+earned by a bench but general per Z-6):
+
+- `recTForLoop` (trace.zig): generic-for back-edge recording, continue
+  direction — v1 pinned by observed-type guard (the pin doubles as the
+  loop-done check), nil → `.bad_type` abort (§6's abort-don't-commit),
+  plus the **old-ctrl pin**: the loop-entry `move` materializes an
+  unguarded `slot_load` of the previous control value which would bail
+  `proveKinds`; nil ctrl aborts, string/number/table ctrl guards by
+  observed type, bool/exotic records unpinned (tier-1a still beats
+  never-tracing).
+- **Carried-string slot classification** (nativegen.zig): `lk==.heap ∧
+  sk==.heap` slots admit native homing iff the load is pinned by
+  `guard_string` (entry: prologue keeps TAG_HEAP + `header.type ==
+  string`) and the writeback is an `isStringProducerOp` (a deliberate
+  fail-closed subset of `proveKinds`' string producers). Home = GP reg
+  or spill of `*GcHeader`, TAG_HEAP flush.
+- **Statically-decided branch fold** (trace.zig `recBranch`): see above.
+- **`tfor_loop` entry patching**: `patchedEntryOp` admits `.tfor_loop →
+  .jloop`; the interp's `.jloop` orig-arm replays the canonical
+  tfor_loop semantics before entering the trace.
+- **`loopDoneSnapshotSupported`** (irinterp.zig, §8 audit): the
+  loop-done fast-flush and nativegen's linked-branch emission both
+  pre-scan the post-guard sunk-store range; a deferred `sgm_setpos`
+  makes the loop-done snapshot unsound (it must not run on the done
+  path) → decline to ordinary deopt replay, sound by §6's
+  replay-idempotence.
+
+**Verdict.** find_match target met; gmatch residue reclassified from
+"coverage" to "constant factors" with the `-joff` evidence — which makes
+the doc 28 §5 L3 sparse intern hash decision (open with Bart) the next
+lever on that bench, alongside doc 29's remaining matcher items.

@@ -2,6 +2,46 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## Doc 30 arc observations (noted 2026-08-29, c5)
+
+Four items surfaced while landing pattern/str2num recording; none belongs
+to that arc, all recorded here so they aren't lost:
+
+- **Region-window gate vs designed loop-done exits.** str_gmatch's native
+  gmatch loop exits by DESIGN when the subject is exhausted (`sgmatch`
+  status exit after 7 completed iterations — 8 tokens per instance, with
+  iteration 1 lost to the nil-ctrl prologue re-entry fail). That lands at
+  `work=7 < min_useful=8` (config default), so `flushRegionWindow`
+  penalizes the entry and `gateAnchor` blocks re-entry for a 256-window —
+  about half the instances run tier-0 even though a perfectly good native
+  trace exists. Deliberately NOT tuned per Z-6 (dropping min_useful to 7
+  would be bench-shaped). The general question: should a loop-done /
+  status exit (a designed completion, distinguishable from a guard
+  failure) count as thrash at all? Compare LuaJIT, which has no such
+  penalty for a trace that exits through its natural loop exit. Candidate
+  shape: classify exits (completion vs guard-fail) in the region-window
+  accounting instead of raw `work` counts.
+- **value16 full-Value shuttle slots for generic-for breadth.** The
+  carried-string classification (doc 30 c4b) covers string control
+  variables; `pairs`/`ipairs` iterators carry arbitrary key types, which
+  today can't home natively (no tagged full-Value slot representation in
+  the native frame). A 16-byte tagged shuttle slot kind would generalize
+  `recTForLoop` coverage to any iterator whose ctrl type varies —
+  the next breadth lever for generic-for once a bench demands it.
+- **`get_index` module-table indexing NYI blocks inline `string.find`
+  shapes.** `local find = string.find` records fine (slot_load + guard);
+  writing `string.find(...)` inline at the call site needs a heap-valued
+  hash field load of the `string` module table (`get_index` on a
+  function value), which is the campaign-map item (4) gap. Noted so the
+  overlap is visible when that arc starts.
+- **lua54 t0 is layout-sensitive (~±11%).** The doc-30 A/B showed lua54
+  t0 27.6 → 30.8 ms with instructions +0.3% but L1-icache misses 7×
+  (perf stat, both binaries): ~230 KB of new recorder/nativegen code
+  shifted tier-0 dispatch alignment. No semantic change. If tier-0
+  dispatch perf becomes an arc (campaign map item: threaded dispatch),
+  hot/cold function splitting or explicit dispatch-loop alignment is the
+  general fix; until then expect this row to wobble across rebuilds.
+
 ## ~~Nested last-arg builtin calls compile to MULTRET and abort recording~~ RESOLVED 2026-08-28 (doc 27, "multinest")
 
 **Landed exactly along the sketched fix shape, generalized** (doc

@@ -21,7 +21,41 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
-## Status 2026-08-29 (LATEST-98) — **DOC 30 ARC IN FLIGHT: Bart approved ("less barriers is good, we want everything traced"). c1 LANDED (625ec2b); c2–c5 remain. Grammar decision RESOLVED (superset criterion; trim fix 1755f0c). L3 answered ("wyhash is good, the lever is O(1) sampling") — still awaiting Bart's yes/no.**
+## Status 2026-08-29 (LATEST-99) — **DOC 30 ARC LANDED (c1–c5): find/match/gmatch-iteration/tonumber(string) record as guarded callouts. str_find_match 32.4 → 20.1 ms (2.4× → 1.5× LJ, ≤20 target MET, zero recording aborts). str_gmatch flat at 57 — residue PROVEN constant-factor, not coverage (LJ runs it in ~25 ms with `-joff`; gmatch is NYI in LJ's recorder too). L3 intern-hash yes/no still open with Bart — now the identified next lever on gmatch.**
+
+Commits: 625ec2b (c1 cores/scratch/shims), c2+c3 (IR ops 72–80 + tier-1a +
+nativegen lowering), d32103b (c4 recorder arms + `recTForLoop` generic-for
+back-edge), b008140 (c4b carried-string slot classification — the gmatch
+for-in loop goes native end-to-end, 2995 bytes, completed=7..20/entry),
+c28202a (§8 audit: `loopDoneSnapshotSupported` decline for deferred
+`sgm_setpos` + tier-1a pin test), c5 (adversarial matrix + two general
+recorder fixes). Full landed-results table in doc 30 §11 — including the
+before/after `--dump-aborts` profile (find_match: host_barrier×6 → NONE;
+gmatch body barrier → gone, ctor barrier stays by design §7).
+
+**c5's two general fixes** (each surfaced by the board, both general per
+Z-6): (1) `recBranch` statically-decided fold — konst-with-matching-
+truthiness or proven-string-truthy branches emit NO guard (a string is
+never nil/false; tautological guards were bailing `proveKinds` on
+`if match(s,"^key")` shapes; worth 30.4 → 20.2 on find_match); (2)
+`tfor_loop → .jloop` entry patching (patchedEntryOp + interp orig-arm
+replaying canonical tfor semantics), so generic-for anchors can enter
+native without waiting for the back edge.
+
+**A/B (whole board, nm-verified 1755f0c shadow):** all rows ≤ noise
+except find_match −31% and lua54 t0 +11% — the latter proven layout-only
+by `perf stat` (instructions +0.3%, icache misses 7×; ~230 KB of new code
+shifted tier-0 dispatch alignment; TODO.md note, not chased).
+
+**Known residue / observations (TODO.md):** gmatch instances complete 7
+native iterations (8 tokens, iter 1 lost to the nil-ctrl prologue) =
+`work=7 < min_useful=8` → region-window gates ~half the entries; NOT
+tuned (Z-6) — recorded as a gate-design question (designed exhaustion
+exits vs thrash). `get_index` module-table indexing is NYI and blocks
+inline `string.find` shapes. value16 full-Value shuttle slots would
+generalize generic-for breadth (pairs/ipairs next).
+
+## Status 2026-08-29 (LATEST-98, superseded) — **DOC 30 ARC IN FLIGHT: Bart approved ("less barriers is good, we want everything traced"). c1 LANDED (625ec2b); c2–c5 remain. Grammar decision RESOLVED (superset criterion; trim fix 1755f0c). L3 answered ("wyhash is good, the lever is O(1) sampling") — still awaiting Bart's yes/no.**
 
 Bart's three answers (2026-08-29): (1) tonumber must accept a superset of
 Lua 5.4 + LuaJIT — verified with a 77-case three-engine probe; ONE gap
