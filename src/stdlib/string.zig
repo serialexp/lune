@@ -1112,21 +1112,14 @@ fn findCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
         return 1;
     }
 
+    // Doc 30 P3: the shared locate core — the same loop the recorder's
+    // outcome computation and the native `smatch` shim run.
     var ms = pattern.MatchState.init(s, pat);
-    var pp: usize = 0;
-    const anchor = pat.len > 0 and pat[0] == '^';
-    if (anchor) pp = 1;
-    var sp = st;
-    while (true) {
-        ms.reset();
-        if (try ms.match(sp, pp)) |e| {
-            buf[0] = Value.int(@intCast(byteToCharS(sobj, sp)));
-            buf[1] = Value.int(@intCast(cpCountPrefixS(sobj, e)));
-            const nc = try writeCaptures(vm, &ms, sobj, null, buf[2..]);
-            return 2 + nc;
-        }
-        if (sp >= s.len or anchor) break;
-        sp += ms.seqLen(sp);
+    if (try pattern.locateMatch(&ms, st, true)) |span| {
+        buf[0] = Value.int(@intCast(byteToCharS(sobj, span.start)));
+        buf[1] = Value.int(@intCast(cpCountPrefixS(sobj, span.end)));
+        const nc = try writeCaptures(vm, &ms, sobj, null, buf[2..]);
+        return 2 + nc;
     }
     buf[0] = Value.nil();
     return 1;
@@ -1157,18 +1150,10 @@ fn matchCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
         return 1;
     };
 
+    // Doc 30 P3: the shared locate core.
     var ms = pattern.MatchState.init(s, pat);
-    var pp: usize = 0;
-    const anchor = pat.len > 0 and pat[0] == '^';
-    if (anchor) pp = 1;
-    var sp = st;
-    while (true) {
-        ms.reset();
-        if (try ms.match(sp, pp)) |e| {
-            return try writeCaptures(vm, &ms, sobj, .{ sp, e }, buf);
-        }
-        if (sp >= s.len or anchor) break;
-        sp += ms.seqLen(sp);
+    if (try pattern.locateMatch(&ms, st, true)) |span| {
+        return try writeCaptures(vm, &ms, sobj, .{ span.start, span.end }, buf);
     }
     buf[0] = Value.nil();
     return 1;
@@ -1226,18 +1211,17 @@ fn gmatchAuxCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     const s = sobj.bytes();
     const pat = interp.strBytes(st.getInt(2)) orelse return error.TypeError;
     const pos_v = st.getInt(3);
-    var src: usize = if (pos_v.isInt() and pos_v.asInt() >= 0) @intCast(pos_v.asInt()) else 0;
+    const src: usize = if (pos_v.isInt() and pos_v.asInt() >= 0) @intCast(pos_v.asInt()) else 0;
 
+    // Doc 30 P3: the shared locate core, gmatch flavor (no anchor consumption
+    // — a leading '^' stays a literal item, exactly as this always ran).
     var ms = pattern.MatchState.init(s, pat);
-    while (src <= s.len) : (src += @max(ms.seqLen(src), 1)) {
-        ms.reset();
-        if (try ms.match(src, 0)) |e| {
-            // Ensure progress on an empty match by stepping a whole code point
-            // (S-D); `@max(…, 1)` guarantees termination at end-of-string.
-            const newpos = if (e == src) e + @max(ms.seqLen(e), 1) else e;
-            try st.set(vm.gpa, Value.int(3), Value.int(@intCast(newpos)));
-            return try writeCaptures(vm, &ms, sobj, .{ src, e }, buf);
-        }
+    if (try pattern.locateMatch(&ms, src, false)) |span| {
+        // Ensure progress on an empty match by stepping a whole code point
+        // (S-D); `@max(…, 1)` guarantees termination at end-of-string.
+        const newpos = if (span.end == span.start) span.end + @max(ms.seqLen(span.end), 1) else span.end;
+        try st.set(vm.gpa, Value.int(3), Value.int(@intCast(newpos)));
+        return try writeCaptures(vm, &ms, sobj, .{ span.start, span.end }, buf);
     }
     return 0; // exhausted
 }
@@ -1252,6 +1236,148 @@ fn sGmatchAuxN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usiz
     var buf: ResultBuf = undefined;
     const n = try gmatchAuxCore(vmOf(ctx), args, &buf);
     return copyOut(buf[0..n], out);
+}
+
+// -- doc 30: the pattern-callout cores (heap-only; no *Vm) ------------------
+//
+// One core per JIT op, shared with the C-ABI shims in `stralloc.zig` and
+// (at record time) the trace recorder's outcome computation. All of them are
+// allocation-free except `scapStrCore` (≤1 `Heap.link` via `intern`). Errors
+// never cross the ABI: every `pattern.Error` and every protocol failure is a
+// distinct negative status (doc 30 M03) — the trace side-exits and tier-0's
+// replay of the iteration raises or branches exactly as the program dictates.
+
+comptime {
+    // The scratch geometry in gc.zig hardcodes 32 (gc deliberately does not
+    // import stdlib); pin the cross-module agreement here.
+    std.debug.assert(gc.MatchScratch.n_slots == 3 + pattern.max_captures + 1);
+    std.debug.assert(gc.MatchScratch.slot_next_pos == 3 + pattern.max_captures);
+}
+
+/// Doc 30 M03: the negative status channel. `>= 1` is `sfindp`'s matched
+/// char index; `0` is the match ops' OK; everything below is a side-exit.
+pub const MatchStatus = struct {
+    pub const ok: i64 = 0;
+    pub const no_match: i64 = -1;
+    pub const malformed: i64 = -2;
+    pub const invalid_capture: i64 = -3;
+    pub const too_many_captures: i64 = -4;
+    pub const too_complex: i64 = -5;
+    /// sgmatch: `state[2]` is not the record-time pattern (identity check).
+    pub const pattern_mismatch: i64 = -6;
+    /// sgmatch: `state[3]` is not an in-lane `.value` int cell (B03), or the
+    /// `sgm_setpos` re-verification failed.
+    pub const bad_layout: i64 = -7;
+    /// A runtime type the tier-0 wrapper would raise on (non-string subject
+    /// or pattern, non-table state).
+    pub const bad_type: i64 = -8;
+    /// `resolveInit` → null (init past end+1): tier-0 returns nil.
+    pub const bad_init: i64 = -9;
+};
+
+fn matchStatusOf(e: pattern.Error) i64 {
+    return switch (e) {
+        error.MalformedPattern => MatchStatus.malformed,
+        error.InvalidCapture => MatchStatus.invalid_capture,
+        error.TooManyCaptures => MatchStatus.too_many_captures,
+        error.PatternTooComplex => MatchStatus.too_complex,
+    };
+}
+
+/// Write a completed match into the heap's match scratch (doc 30 §3 layout).
+/// `char_ends` selects the find-flavor `slot_start`/`slot_end` character
+/// indices (an O(prefix) count on a non-ASCII subject — gmatch's tier-0
+/// never computes them, so its flavor skips them and those slots stay stale).
+fn fillMatchScratch(heap: *gc.Heap, ms: *const pattern.MatchState, sobj: *const String, span: pattern.Span, char_ends: bool) i64 {
+    const sc = &heap.match_scratch;
+    sc.subj = @intFromPtr(sobj);
+    if (char_ends) {
+        sc.words[2 * gc.MatchScratch.slot_start] = byteToCharS(sobj, span.start);
+        sc.words[2 * gc.MatchScratch.slot_end] = cpCountPrefixS(sobj, span.end);
+    }
+    sc.words[2 * gc.MatchScratch.slot_whole] = span.start;
+    sc.words[2 * gc.MatchScratch.slot_whole + 1] = span.end - span.start;
+    var i: usize = 0;
+    while (i < ms.level) : (i += 1) {
+        const cap = ms.captures[i];
+        const w = 2 * (gc.MatchScratch.slot_cap0 + i);
+        if (cap.len == pattern.cap_unfinished) return MatchStatus.malformed;
+        if (cap.len == pattern.cap_position) {
+            // Int slot: the 1-based char position (`push_onecapture`).
+            sc.words[w] = byteToCharS(sobj, cap.init);
+            sc.words[w + 1] = 0;
+        } else {
+            // Span slot: (byte_init, byte_len) into `subj`.
+            sc.words[w] = cap.init;
+            sc.words[w + 1] = @intCast(cap.len);
+        }
+    }
+    return MatchStatus.ok;
+}
+
+/// Doc 30 `smatch` core (find/match flavor): locate from `init_raw` honoring
+/// a leading '^', fill scratch. Allocation-free; status result.
+pub fn smatchCore(heap: *gc.Heap, sobj: *const String, init_raw: i64, pat: []const u8) i64 {
+    const st = resolveInit(init_raw, sobj) orelse return MatchStatus.bad_init;
+    var ms = pattern.MatchState.init(sobj.bytes(), pat);
+    const span = (pattern.locateMatch(&ms, st, true) catch |e| return matchStatusOf(e)) orelse
+        return MatchStatus.no_match;
+    return fillMatchScratch(heap, &ms, sobj, span, true);
+}
+
+/// Doc 30 `sfindp` core: plain-substring find (find's no-specials bypass).
+/// Returns the 1-based char index of the match start (>= 1) or a negative
+/// status; the end index is recorder arithmetic (`start + cpLen(pat) - 1`,
+/// konst-folded — the empty pattern's `(st, st-1)` shape falls out of the
+/// same formula with `cpLen == 0`). Heap-free: no scratch, no allocation.
+pub fn sfindPlainCore(sobj: *const String, init_raw: i64, pat: []const u8) i64 {
+    const st = resolveInit(init_raw, sobj) orelse return MatchStatus.bad_init;
+    const s = sobj.bytes();
+    if (pat.len == 0) return @intCast(byteToCharS(sobj, st));
+    if (st <= s.len) {
+        // A plain substring of valid UTF-8 lands on a code-point boundary.
+        if (std.mem.indexOfPos(u8, s, st, pat)) |q| return @intCast(byteToCharS(sobj, q));
+    }
+    return MatchStatus.no_match;
+}
+
+/// Doc 30 `sgmatch` core (§6): one composite iterator step. READ-ONLY on the
+/// state (round-2 B01 — the pos advance is `sgm_setpos`'s deferred store):
+/// verifies the pattern identity against the record-time expectation
+/// (round-2 B02) and the B03 slot-3 layout, then locates from the stored pos
+/// and fills scratch including `slot_next_pos` (the empty-match bump rule,
+/// verbatim from `gmatchAuxCore`).
+pub fn sgmatchCore(heap: *gc.Heap, state: *Table, expected_pat: *const String) i64 {
+    const sobj = strObjOf(state.getInt(1)) orelse return MatchStatus.bad_type;
+    const pv = state.getInt(2);
+    if (!pv.isHeap() or pv.asHeap() != &expected_pat.header) return MatchStatus.pattern_mismatch;
+    const pos = state.inLaneValueIntCell(3) orelse return MatchStatus.bad_layout;
+    // Tier-0 clamps a negative pos to 0; that shape is only reachable by a
+    // user poking a hand-built state, so fail closed instead of mirroring.
+    if (pos < 0) return MatchStatus.bad_layout;
+    const s = sobj.bytes();
+    const upos: usize = @intCast(pos);
+    var ms = pattern.MatchState.init(s, expected_pat.bytes());
+    const span = (pattern.locateMatch(&ms, upos, false) catch |e| return matchStatusOf(e)) orelse
+        return MatchStatus.no_match; // exhausted → the for-in loop's end
+    const newpos = if (span.end == span.start) span.end + @max(ms.seqLen(span.end), 1) else span.end;
+    const rc = fillMatchScratch(heap, &ms, sobj, span, false);
+    if (rc != MatchStatus.ok) return rc;
+    heap.match_scratch.words[2 * gc.MatchScratch.slot_next_pos] = newpos;
+    return MatchStatus.ok;
+}
+
+/// Doc 30 `scap_str` core: intern the byte span in scratch slot `slot`.
+/// ≤1 `Heap.link` (intern hit: 0, miss: 1); null = OOM — the snew side-exit
+/// protocol (no link preceded the failure; the id stream stays clean).
+pub fn scapStrCore(heap: *gc.Heap, slot: usize) ?*String {
+    std.debug.assert(slot < gc.MatchScratch.n_slots);
+    const sc = &heap.match_scratch;
+    const sobj: *const String = @ptrFromInt(sc.subj);
+    const init: usize = @intCast(sc.words[2 * slot]);
+    const len: usize = @intCast(sc.words[2 * slot + 1]);
+    const b = sobj.bytes();
+    return heap.intern(b[init .. init + len]) catch null;
 }
 
 // -- gsub -------------------------------------------------------------------
@@ -2053,4 +2179,209 @@ test "string.decode: round-trips encode, validates, and is catchably fallible" {
 
     // Non-table argument → bad argument (also LuaError).
     try testing.expectError(error.LuaError, sDecode(@ptrCast(&vm), &.{Value.int(5)}));
+}
+
+// ---------------------------------------------------------------------------
+// Doc 30 c1 — the pattern-callout cores, exercised directly (no VM, no IR).
+// ---------------------------------------------------------------------------
+
+const t30 = std.testing;
+
+test "doc 30: smatchCore fills scratch — spans, char indices, captures" {
+    var heap = gc.Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const subj = try heap.intern("key=val x=1");
+    const st = string_mod.String; // brevity
+    _ = st;
+
+    // Two span captures.
+    try t30.expectEqual(MatchStatus.ok, smatchCore(&heap, subj, 1, "(%a+)=(%a+)"));
+    const sc = &heap.match_scratch;
+    try t30.expectEqual(@intFromPtr(subj), sc.subj);
+    try t30.expectEqual(@as(u64, 1), sc.words[2 * gc.MatchScratch.slot_start]); // char 1
+    try t30.expectEqual(@as(u64, 7), sc.words[2 * gc.MatchScratch.slot_end]); // "key=val"
+    try t30.expectEqual(@as(u64, 0), sc.words[2 * gc.MatchScratch.slot_whole]);
+    try t30.expectEqual(@as(u64, 7), sc.words[2 * gc.MatchScratch.slot_whole + 1]);
+    // capture 0 = "key" (0,3), capture 1 = "val" (4,3)
+    try t30.expectEqual(@as(u64, 0), sc.words[2 * (gc.MatchScratch.slot_cap0 + 0)]);
+    try t30.expectEqual(@as(u64, 3), sc.words[2 * (gc.MatchScratch.slot_cap0 + 0) + 1]);
+    try t30.expectEqual(@as(u64, 4), sc.words[2 * (gc.MatchScratch.slot_cap0 + 1)]);
+    try t30.expectEqual(@as(u64, 3), sc.words[2 * (gc.MatchScratch.slot_cap0 + 1) + 1]);
+
+    // init continues the search (1-based char): from char 5, match "x=1".
+    try t30.expectEqual(MatchStatus.ok, smatchCore(&heap, subj, 5, "(%a+)=(%d+)"));
+    try t30.expectEqual(@as(u64, 9), sc.words[2 * gc.MatchScratch.slot_start]);
+
+    // Position capture -> int slot (1-based char position).
+    try t30.expectEqual(MatchStatus.ok, smatchCore(&heap, subj, 1, "e()y"));
+    try t30.expectEqual(@as(u64, 3), sc.words[2 * (gc.MatchScratch.slot_cap0 + 0)]);
+
+    // Statuses: no match / bad init / malformed at runtime (census-bypassed).
+    try t30.expectEqual(MatchStatus.no_match, smatchCore(&heap, subj, 1, "%d%d"));
+    try t30.expectEqual(MatchStatus.bad_init, smatchCore(&heap, subj, 99, "%a"));
+    try t30.expectEqual(MatchStatus.malformed, smatchCore(&heap, subj, 1, "%"));
+    try t30.expectEqual(MatchStatus.malformed, smatchCore(&heap, subj, 1, "[ab"));
+}
+
+test "doc 30: smatchCore char indices on a multibyte subject" {
+    var heap = gc.Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const subj = try heap.intern("ré=sumé"); // chars: r é = s u m é
+    // '.' steps a whole code point (S-D); %a is ASCII-only and would NOT
+    // match 'é'. The capture "ré" is 3 BYTES but chars 1..2.
+    try t30.expectEqual(MatchStatus.ok, smatchCore(&heap, subj, 1, "(r.)="));
+    const sc = &heap.match_scratch;
+    // Whole match "ré=" -> start char 1, end char 3; capture span is bytes.
+    try t30.expectEqual(@as(u64, 1), sc.words[2 * gc.MatchScratch.slot_start]);
+    try t30.expectEqual(@as(u64, 3), sc.words[2 * gc.MatchScratch.slot_end]);
+    try t30.expectEqual(@as(u64, 0), sc.words[2 * (gc.MatchScratch.slot_cap0 + 0)]);
+    try t30.expectEqual(@as(u64, 3), sc.words[2 * (gc.MatchScratch.slot_cap0 + 0) + 1]); // "ré" = 3 bytes
+}
+
+test "doc 30: scapStrCore interns the span (identity with the intern table)" {
+    var heap = gc.Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const subj = try heap.intern("key=val");
+    try t30.expectEqual(MatchStatus.ok, smatchCore(&heap, subj, 1, "(%a+)=(%a+)"));
+    const c0 = scapStrCore(&heap, gc.MatchScratch.slot_cap0 + 0).?;
+    const c1 = scapStrCore(&heap, gc.MatchScratch.slot_cap0 + 1).?;
+    const whole = scapStrCore(&heap, gc.MatchScratch.slot_whole).?;
+    // Interning: the projections ARE the canonical objects for those bytes.
+    try t30.expectEqual(try heap.intern("key"), c0);
+    try t30.expectEqual(try heap.intern("val"), c1);
+    try t30.expectEqual(try heap.intern("key=val"), whole);
+}
+
+test "doc 30: sfindPlainCore start index and statuses" {
+    var heap = gc.Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const subj = try heap.intern("hello world");
+    try t30.expectEqual(@as(i64, 7), sfindPlainCore(subj, 1, "world"));
+    try t30.expectEqual(@as(i64, 7), sfindPlainCore(subj, 7, "world"));
+    try t30.expectEqual(MatchStatus.no_match, sfindPlainCore(subj, 8, "world"));
+    try t30.expectEqual(MatchStatus.no_match, sfindPlainCore(subj, 1, "zzz"));
+    try t30.expectEqual(MatchStatus.bad_init, sfindPlainCore(subj, 13, "w"));
+    // Empty pattern: matched at init (end = start-1 falls out of recorder
+    // arithmetic with cpLen == 0).
+    try t30.expectEqual(@as(i64, 3), sfindPlainCore(subj, 3, ""));
+    try t30.expectEqual(@as(i64, 12), sfindPlainCore(subj, 12, "")); // end+1 position
+    // Multibyte: char indices, not bytes.
+    const msubj = try heap.intern("ré=s");
+    try t30.expectEqual(@as(i64, 3), sfindPlainCore(msubj, 1, "=s"));
+}
+
+/// Build the compiler-shaped gmatch state `{ [1]=subj, [2]=pat, [3]=pos }`.
+fn makeGmatchState(heap: *gc.Heap, subj: *String, pat: *String, pos: i64) !*Table {
+    const t = try heap.newTable();
+    try t.set(std.testing.allocator, Value.int(1), Value.heap(@constCast(&subj.header)));
+    try t.set(std.testing.allocator, Value.int(2), Value.heap(@constCast(&pat.header)));
+    try t.set(std.testing.allocator, Value.int(3), Value.int(pos));
+    return t;
+}
+
+test "doc 30: sgmatchCore — read-only step, next_pos, exhaustion, statuses" {
+    var heap = gc.Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const subj = try heap.intern("aa,b,,cc");
+    const pat = try heap.intern("[^,]+");
+    const state = try makeGmatchState(&heap, subj, pat, 0);
+    const sc = &heap.match_scratch;
+
+    // Step 1: "aa" at (0,2), next_pos 2; the state's pos is NOT advanced.
+    try t30.expectEqual(MatchStatus.ok, sgmatchCore(&heap, state, pat));
+    try t30.expectEqual(@as(u64, 0), sc.words[2 * gc.MatchScratch.slot_whole]);
+    try t30.expectEqual(@as(u64, 2), sc.words[2 * gc.MatchScratch.slot_whole + 1]);
+    try t30.expectEqual(@as(u64, 2), sc.words[2 * gc.MatchScratch.slot_next_pos]);
+    try t30.expectEqual(@as(i64, 0), state.inLaneValueIntCell(3).?); // READ-ONLY (round-2 B01)
+
+    // Re-running without advancing yields the SAME token (replay idempotence).
+    try t30.expectEqual(MatchStatus.ok, sgmatchCore(&heap, state, pat));
+    try t30.expectEqual(@as(u64, 0), sc.words[2 * gc.MatchScratch.slot_whole]);
+
+    // Advance via the deferred-store helper (what sgm_setpos lowers to).
+    try t30.expect(state.setInLaneValueInt(3, @intCast(sc.words[2 * gc.MatchScratch.slot_next_pos])));
+    try t30.expectEqual(MatchStatus.ok, sgmatchCore(&heap, state, pat));
+    try t30.expectEqual(@as(u64, 3), sc.words[2 * gc.MatchScratch.slot_whole]); // "b"
+    try t30.expectEqual(@as(u64, 1), sc.words[2 * gc.MatchScratch.slot_whole + 1]);
+
+    // Exhaustion: pos at end and no token left -> no_match (for-in loop end).
+    try t30.expect(state.setInLaneValueInt(3, 8));
+    try t30.expectEqual(MatchStatus.no_match, sgmatchCore(&heap, state, pat));
+    // pos past the end (empty-match bump at EOS shape).
+    try t30.expect(state.setInLaneValueInt(3, 9));
+    try t30.expectEqual(MatchStatus.no_match, sgmatchCore(&heap, state, pat));
+
+    // Pattern-identity mismatch (poked state[2], round-2 B02).
+    const other = try heap.intern("%d+");
+    try t30.expect(state.setInLaneValueInt(3, 0));
+    try t30.expectEqual(MatchStatus.pattern_mismatch, sgmatchCore(&heap, state, other));
+
+    // Non-string subject (poked state[1]).
+    const bad = try heap.newTable();
+    try bad.set(std.testing.allocator, Value.int(1), Value.int(7));
+    try bad.set(std.testing.allocator, Value.int(2), Value.heap(@constCast(&pat.header)));
+    try bad.set(std.testing.allocator, Value.int(3), Value.int(0));
+    try t30.expectEqual(MatchStatus.bad_type, sgmatchCore(&heap, bad, pat));
+}
+
+test "doc 30: sgmatchCore B03 layout checks — hash-resident / non-int / missing [3]" {
+    var heap = gc.Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const subj = try heap.intern("x y");
+    const pat = try heap.intern("%a+");
+
+    // [3] holds a float -> bad_layout.
+    const t_f = try heap.newTable();
+    try t_f.set(std.testing.allocator, Value.int(1), Value.heap(@constCast(&subj.header)));
+    try t_f.set(std.testing.allocator, Value.int(2), Value.heap(@constCast(&pat.header)));
+    try t_f.set(std.testing.allocator, Value.int(3), Value.float(0.0));
+    try t30.expectEqual(MatchStatus.bad_layout, sgmatchCore(&heap, t_f, pat));
+
+    // [3] missing entirely -> bad_layout.
+    const t_m = try heap.newTable();
+    try t_m.set(std.testing.allocator, Value.int(1), Value.heap(@constCast(&subj.header)));
+    try t_m.set(std.testing.allocator, Value.int(2), Value.heap(@constCast(&pat.header)));
+    try t30.expectEqual(MatchStatus.bad_layout, sgmatchCore(&heap, t_m, pat));
+
+    // Negative pos (user poke; tier-0 would clamp — we fail closed).
+    const t_n = try makeGmatchState(&heap, @constCast(subj), @constCast(pat), -1);
+    try t30.expectEqual(MatchStatus.bad_layout, sgmatchCore(&heap, t_n, pat));
+}
+
+test "doc 30: sgmatchCore empty-match bump (progress rule, S-D step)" {
+    var heap = gc.Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const subj = try heap.intern("aé");
+    const pat = try heap.intern("x*"); // empty match everywhere
+    const state = try makeGmatchState(&heap, subj, pat, 0);
+    const sc = &heap.match_scratch;
+    // Empty match at 0 -> bump by 1 (ASCII 'a').
+    try t30.expectEqual(MatchStatus.ok, sgmatchCore(&heap, state, pat));
+    try t30.expectEqual(@as(u64, 1), sc.words[2 * gc.MatchScratch.slot_next_pos]);
+    // Empty match at 1 -> bump by the whole code point 'é' (2 bytes).
+    try t30.expect(state.setInLaneValueInt(3, 1));
+    try t30.expectEqual(MatchStatus.ok, sgmatchCore(&heap, state, pat));
+    try t30.expectEqual(@as(u64, 3), sc.words[2 * gc.MatchScratch.slot_next_pos]);
+    // Empty match at end-of-string -> bump to len+1 (the exhaustion cursor).
+    try t30.expect(state.setInLaneValueInt(3, 3));
+    try t30.expectEqual(MatchStatus.ok, sgmatchCore(&heap, state, pat));
+    try t30.expectEqual(@as(u64, 4), sc.words[2 * gc.MatchScratch.slot_next_pos]);
+    try t30.expect(state.setInLaneValueInt(3, 4));
+    try t30.expectEqual(MatchStatus.no_match, sgmatchCore(&heap, state, pat));
+}
+
+test "doc 30: table B03 helpers — inLaneValueIntCell / setInLaneValueInt" {
+    var heap = gc.Heap.init(std.testing.allocator);
+    defer heap.deinit();
+    const s = try heap.intern("s");
+    const t = try makeGmatchState(&heap, s, s, 7);
+    try t30.expectEqual(@as(i64, 7), t.inLaneValueIntCell(3).?);
+    try t30.expect(t.setInLaneValueInt(3, 42));
+    try t30.expectEqual(@as(i64, 42), t.inLaneValueIntCell(3).?);
+    try t30.expectEqual(Value.int(42), t.getInt(3)); // visible through the normal read path
+    // Out-of-extent key and non-int cell refuse.
+    try t30.expect(t.inLaneValueIntCell(99) == null);
+    try t30.expect(!t.setInLaneValueInt(99, 1));
+    try t30.expect(t.inLaneValueIntCell(1) == null); // holds a string
+    try t30.expect(!t.setInLaneValueInt(1, 1));
 }

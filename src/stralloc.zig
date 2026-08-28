@@ -133,3 +133,80 @@ pub noinline fn scpRuntime(s: *object.GcHeader, i: i64, j: i64) callconv(.c) i64
     const str = string_mod.String.fromHeader(s);
     return string_std.codepointCore(str, i, j) orelse -1;
 }
+
+// ---------------------------------------------------------------------------
+// Doc 30: the pattern-callout shims. Same shim discipline as above; the match
+// ops are allocation-free (they only write the heap's `match_scratch`),
+// `scapStrRuntime` is the ONE allocating projection (≤1 link, null = OOM —
+// the snew protocol), and every matcher/protocol failure crosses the ABI as
+// a distinct negative status (doc 30 M03), never a Zig error.
+// ---------------------------------------------------------------------------
+
+const table_mod = @import("table.zig");
+const arith = @import("arith.zig");
+
+/// `smatch` body (find/match flavor): locate + scratch fill. Status result:
+/// 0 = matched (projections may read scratch), negative = side-exit.
+pub noinline fn smatchRuntime(heap: *gc.Heap, s: *object.GcHeader, init_raw: i64, pat: *object.GcHeader) callconv(.c) i64 {
+    return string_std.smatchCore(
+        heap,
+        string_mod.String.fromHeader(s),
+        init_raw,
+        string_mod.String.fromHeader(pat).bytes(),
+    );
+}
+
+/// `sfindp` body: plain-substring find. `>= 1` = matched 1-based char index
+/// (the end index is recorder arithmetic), negative = side-exit. Heap-free.
+pub noinline fn sfindpRuntime(s: *object.GcHeader, init_raw: i64, pat: *object.GcHeader) callconv(.c) i64 {
+    return string_std.sfindPlainCore(
+        string_mod.String.fromHeader(s),
+        init_raw,
+        string_mod.String.fromHeader(pat).bytes(),
+    );
+}
+
+/// `sgmatch` body (doc 30 §6): one composite gmatch-iterator step. READ-ONLY
+/// on the state; the pos advance is `sgm_setpos`. `expected_pat` is the
+/// record-time pattern (resolved from the konst pool by the emitter) — the
+/// shim's identity check replaces `guard_sid` here (round-2 B02).
+pub noinline fn sgmatchRuntime(heap: *gc.Heap, state: *object.GcHeader, expected_pat: *object.GcHeader) callconv(.c) i64 {
+    const v = Value.heap(state);
+    if (v.heapType() != .table) return string_std.MatchStatus.bad_type;
+    return string_std.sgmatchCore(
+        heap,
+        table_mod.Table.fromHeader(state),
+        string_mod.String.fromHeader(expected_pat),
+    );
+}
+
+/// `scap_str` body: intern the span in scratch slot `slot`. Null = OOM.
+pub noinline fn scapStrRuntime(heap: *gc.Heap, slot: i64) callconv(.c) ?*object.GcHeader {
+    const r = string_std.scapStrCore(heap, @intCast(slot)) orelse return null;
+    return &r.header;
+}
+
+/// `sgm_setpos` body: commit the gmatch cursor into the state's slot 3 —
+/// the deferred store, sunk below every guard (doc 30 §6). Re-verifies the
+/// B03 cell shape; 0 = written, negative = side-exit (nothing written).
+pub noinline fn sgmSetposRuntime(state: *object.GcHeader, pos: i64) callconv(.c) i64 {
+    const t = table_mod.Table.fromHeader(state);
+    return if (t.setInLaneValueInt(3, pos)) string_std.MatchStatus.ok else string_std.MatchStatus.bad_layout;
+}
+
+/// The `str2num_*` two-register result (SysV: rax = status, rdx = value).
+/// status 0 = int (value: i64 bits), 1 = float (value: f64 bits), −1 = not a
+/// number (tier-0's replay produces the nil / raises itself).
+pub const Str2NumResult = extern struct { status: i64, value: u64 };
+
+/// `str2num_i` / `str2num_f` body: the ONE `arith.toNumber` core on a string
+/// operand — tier-0, the recorder's konst fold, and the trace can never
+/// disagree (doc 30 §4). Heap-free, pure.
+pub noinline fn str2numRuntime(s: *object.GcHeader) callconv(.c) Str2NumResult {
+    const v = arith.toNumber(Value.heap(s), null);
+    return switch (v.tag) {
+        .int => .{ .status = 0, .value = @bitCast(v.asInt()) },
+        .float => .{ .status = 1, .value = @bitCast(v.asFloat()) },
+        else => .{ .status = -1, .value = 0 },
+    };
+}

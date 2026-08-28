@@ -156,6 +156,38 @@ pub const Table = struct {
         return self.hash.get(Value.int(i)) orelse Value.nil();
     }
 
+    /// Doc 30 B03: `t[k]` iff it is an existing **in-lane `.value` array cell
+    /// holding an int** — the ONE table shape `sgm_setpos` may later overwrite
+    /// with no possibility of allocation, lane widening, or array/hash
+    /// migration (the `.value` lane fits every Value; the cell exists, so no
+    /// append/resize; not a grid). Any other shape → null, and the gmatch
+    /// callout returns a layout status so the call stays on tier-0
+    /// (fail-closed). The compiler-built gmatch state `{s, pat, 0}` is always
+    /// this shape: heterogeneous contents keep the array part in `.value`.
+    pub fn inLaneValueIntCell(self: *const Table, k: i64) ?i64 {
+        const a = &self.array;
+        if (a.lane != .value) return null; // narrow lanes, grids: fail-closed
+        if (!arr.ArrayPart.inArray(k, a.asize)) return null;
+        const v = a.get(@intCast(k));
+        return if (v.isInt()) v.asInt() else null;
+    }
+
+    /// Doc 30: overwrite such a cell with an int. Re-verifies the shape and
+    /// returns false (nothing written) if it no longer holds — the native
+    /// lowering treats that as a side-exit rather than risking a write into a
+    /// migrated layout. Allocation-free by construction; an int-over-int
+    /// `.value`-lane store needs no GC barrier (no heap pointer involved).
+    pub fn setInLaneValueInt(self: *Table, k: i64, x: i64) bool {
+        const a = &self.array;
+        if (a.lane != .value) return false;
+        if (!arr.ArrayPart.inArray(k, a.asize)) return false;
+        const vals: [*]Value = @ptrCast(@alignCast(a.data.?));
+        const i: usize = @intCast(k);
+        if (!vals[i].isInt()) return false;
+        vals[i] = Value.int(x);
+        return true;
+    }
+
     /// `row_view[key]` read — forward an inner index of a grid row into the flat
     /// cell buffer. `rv` must be a `row_view`. A non-integer or out-of-stride key
     /// reads `nil`: a grid row holds only its numeric cells (no hash part, no

@@ -543,6 +543,127 @@ pub fn hasSpecials(pat: []const u8) bool {
 }
 
 // ---------------------------------------------------------------------------
+// Doc 30 P3: the ONE pure locate step, shared by the tier-0 wrappers
+// (`string.zig` find/match/gmatch), the recorder's record-time outcome
+// computation, and the native callout shims. No `*Vm`, no `Value`, no
+// interning — the matcher allocates nothing.
+// ---------------------------------------------------------------------------
+
+/// A located match: `[start, end)` byte offsets into `ms.src`. The completed
+/// `MatchState` (captures) travels alongside — the caller owns `ms`.
+pub const Span = struct {
+    start: usize,
+    end: usize,
+};
+
+/// The anchored-scan loop of `find`/`match`/`gmatch`: try `ms.match` at
+/// `from`, then at each successive code-point boundary, until a match or
+/// end-of-subject. `consume_anchor` is the find/match flavor — a leading `^`
+/// pins the single attempt at `from` (gmatch passes false: its `^` is an
+/// ordinary literal item, exactly as tier-0's `gmatchAuxCore` always ran it).
+/// On success `ms` holds the winning attempt's captures. `from > src.len`
+/// (a gmatch cursor past the end) locates nothing.
+pub fn locateMatch(ms: *MatchState, from: usize, consume_anchor: bool) Error!?Span {
+    if (from > ms.src.len) return null;
+    var pp: usize = 0;
+    var anchor = false;
+    if (consume_anchor and ms.pat.len > 0 and ms.pat[0] == '^') {
+        anchor = true;
+        pp = 1;
+    }
+    var sp = from;
+    while (true) {
+        ms.reset();
+        if (try ms.match(sp, pp)) |e| return .{ .start = sp, .end = e };
+        if (sp >= ms.src.len or anchor) break;
+        sp += ms.seqLen(sp); // S-D: advance the scan by a whole code point
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Doc 30 P1: the static pattern census.
+// ---------------------------------------------------------------------------
+
+/// What kind of value capture `k` produces (`push_onecapture`'s split).
+pub const CapKind = enum(u8) {
+    /// `(...)` — a byte span, interned to a string.
+    span,
+    /// `()` — a 1-based character position, an integer.
+    position,
+};
+
+/// The statically-known shape of a pattern: everything the trace recorder
+/// needs to fix a match op's projection list at record time (doc 30 P1).
+pub const Census = struct {
+    /// Total captures a successful match produces (Lua patterns have no
+    /// alternation and no quantifiable groups, so every syntactic capture
+    /// opens on ANY successful full-pattern match — `ms.level == ncap`).
+    ncap: u8 = 0,
+    kinds: [max_captures]CapKind = @splat(.span),
+    /// Leading `^` (meaningful to find/match, where the caller consumes it).
+    anchored: bool = false,
+    /// `hasSpecials(pat)` — false selects find's plain-substring bypass.
+    specials: bool = false,
+};
+
+/// Walk `pat` with the SAME item stepping the matcher uses (`classEnd`) and
+/// return its census, or null when the pattern cannot be statically
+/// validated: trailing `%`, unbalanced `[`/captures, `%b` missing its two
+/// chars, `%f` without a class, more than `max_captures`. Null means the
+/// recorder aborts and the call stays tier-0 (fail-closed). Runtime-only
+/// errors — back-reference validity, `PatternTooComplex` depth — remain the
+/// callout shim's negative-status channel (doc 30 M03).
+pub fn census(pat: []const u8) ?Census {
+    var out = Census{ .specials = hasSpecials(pat) };
+    const ms = MatchState.init(&.{}, pat); // classEnd reads only `pat`
+    var p: usize = 0;
+    if (pat.len > 0 and pat[0] == '^') {
+        out.anchored = true;
+        p = 1;
+    }
+    var depth: usize = 0;
+    while (p < pat.len) {
+        switch (pat[p]) {
+            '(' => {
+                if (out.ncap >= max_captures) return null;
+                if (p + 1 < pat.len and pat[p + 1] == ')') {
+                    out.kinds[out.ncap] = .position;
+                    p += 2;
+                } else {
+                    out.kinds[out.ncap] = .span;
+                    depth += 1;
+                    p += 1;
+                }
+                out.ncap += 1;
+            },
+            ')' => {
+                if (depth == 0) return null; // close with nothing open
+                depth -= 1;
+                p += 1;
+            },
+            l_esc => {
+                if (p + 1 >= pat.len) return null; // ends with '%'
+                switch (pat[p + 1]) {
+                    'b' => {
+                        if (p + 4 > pat.len) return null; // %b needs two chars
+                        p += 4;
+                    },
+                    'f' => {
+                        if (p + 2 >= pat.len or pat[p + 2] != '[') return null;
+                        p = ms.classEnd(p + 2) catch return null;
+                    },
+                    else => p += 2, // class letter, escaped literal, or %1-%9
+                }
+            },
+            else => p = ms.classEnd(p) catch return null,
+        }
+    }
+    if (depth != 0) return null; // unfinished capture
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Tests — pure, on raw byte slices (no Vm).
 // ---------------------------------------------------------------------------
 
@@ -550,22 +671,12 @@ const testing = std.testing;
 
 /// Find the first match of `pat` in `src` scanning from offset 0 (honoring a
 /// leading `^` anchor). Returns `(start, end)` 0-based offsets, or null.
+/// Since doc 30 this rides the shared `locateMatch` core, so every test below
+/// exercises the same loop the wrappers, the recorder, and the shims run.
 fn firstMatch(src: []const u8, pat: []const u8) !?[2]usize {
     var ms = MatchState.init(src, pat);
-    var pp: usize = 0;
-    var anchor = false;
-    if (pat.len > 0 and pat[0] == '^') {
-        anchor = true;
-        pp = 1;
-    }
-    var s: usize = 0;
-    while (true) {
-        ms.reset();
-        if (try ms.match(s, pp)) |e| return [2]usize{ s, e };
-        if (s >= src.len or anchor) break;
-        s += ms.seqLen(s); // S-D: advance the scan by a whole code point
-    }
-    return null;
+    const span = (try locateMatch(&ms, 0, true)) orelse return null;
+    return [2]usize{ span.start, span.end };
 }
 
 test "literal and dot match" {
@@ -837,4 +948,117 @@ test "S-D: classEnd is total on a truncated multibyte pattern tail" {
     ms.reset();
     const r = try ms.match(0, 0); // must not panic / read OOB
     if (r) |e| try testing.expect(e == 0 or e == 2); // boundary-aligned if it matched
+}
+
+// ---------------------------------------------------------------------------
+// Doc 30 c1 — locateMatch and census.
+// ---------------------------------------------------------------------------
+
+test "doc 30: locateMatch honors from and the gmatch (non-consuming) flavor" {
+    // Continue-from-position: the second "ab" is found when from skips the first.
+    var ms = MatchState.init("ab ab", "ab");
+    const s1 = (try locateMatch(&ms, 0, true)).?;
+    try testing.expectEqual(Span{ .start = 0, .end = 2 }, s1);
+    const s2 = (try locateMatch(&ms, 1, true)).?;
+    try testing.expectEqual(Span{ .start = 3, .end = 5 }, s2);
+    // from past the end (a gmatch cursor after an empty-match bump at EOS).
+    try testing.expectEqual(@as(?Span, null), try locateMatch(&ms, 6, false));
+    // from == src.len: the empty pattern still matches at end-of-string.
+    var ms2 = MatchState.init("ab", "");
+    const s3 = (try locateMatch(&ms2, 2, false)).?;
+    try testing.expectEqual(Span{ .start = 2, .end = 2 }, s3);
+    // gmatch flavor: '^' is a literal item, not an anchor.
+    var ms3 = MatchState.init("x^y", "^y");
+    const s4 = (try locateMatch(&ms3, 0, false)).?;
+    try testing.expectEqual(Span{ .start = 1, .end = 3 }, s4);
+    // find/match flavor: same pattern anchors and fails off-position.
+    var ms4 = MatchState.init("x^y", "^y");
+    try testing.expectEqual(@as(?Span, null), try locateMatch(&ms4, 0, true));
+}
+
+test "doc 30: census counts and kinds agree with the matcher on a corpus" {
+    // For every pattern that census accepts and that matches the subject, the
+    // completed MatchState must agree: level == ncap, and each capture's
+    // position-ness matches kinds[k].
+    const cases = [_]struct { src: []const u8, pat: []const u8 }{
+        .{ .src = "abc123", .pat = "%d+" },
+        .{ .src = "key=val", .pat = "(%a+)=(%a+)" },
+        .{ .src = "abc", .pat = "()" },
+        .{ .src = "abc", .pat = "a()c?b?()" },
+        .{ .src = "aXb", .pat = "((a)X)" },
+        .{ .src = "(x)", .pat = "%((%a)%)" },
+        .{ .src = "do end", .pat = "%bde" },
+        .{ .src = " word", .pat = "%f[%a]%a+" },
+        .{ .src = "a,b,,c", .pat = "[^,]+" },
+        .{ .src = "x]y", .pat = "[]x]+" },
+        .{ .src = "resumé!", .pat = "é" },
+        .{ .src = "resumé!", .pat = "(é)!" },
+        .{ .src = "abcabc", .pat = "^a(b)c" },
+        .{ .src = "%d", .pat = "%%d" },
+        .{ .src = "1;2", .pat = "(%d)();" },
+    };
+    for (cases) |tc| {
+        const c = census(tc.pat) orelse {
+            std.debug.print("census rejected valid pattern [{s}]\n", .{tc.pat});
+            return error.TestUnexpectedResult;
+        };
+        var ms = MatchState.init(tc.src, tc.pat);
+        const span = (try locateMatch(&ms, 0, true)) orelse {
+            std.debug.print("corpus pattern [{s}] failed to match [{s}]\n", .{ tc.pat, tc.src });
+            return error.TestUnexpectedResult;
+        };
+        _ = span;
+        try testing.expectEqual(@as(usize, c.ncap), ms.level);
+        var k: usize = 0;
+        while (k < ms.level) : (k += 1) {
+            const is_pos = ms.captures[k].len == cap_position;
+            try testing.expectEqual(c.kinds[k] == .position, is_pos);
+        }
+    }
+}
+
+test "doc 30: census anchored/specials flags" {
+    try testing.expect(census("^%d+").?.anchored);
+    try testing.expect(!census("%d+").?.anchored);
+    try testing.expect(census("%d+").?.specials);
+    try testing.expect(!census("abc").?.specials);
+    try testing.expectEqual(@as(u8, 0), census("abc").?.ncap);
+}
+
+test "doc 30: census rejects what it cannot statically validate" {
+    // Malformed / unpinnable shapes -> null (recorder aborts, stays tier-0).
+    const rejects = [_][]const u8{
+        "%", // trailing escape
+        "(", // unfinished capture
+        "(()", // nested unfinished
+        ")", // close with nothing open
+        "[abc", // unbalanced set
+        "[^", // unbalanced complement set
+        "%b", // %b missing both chars
+        "%bx", // %b missing one char
+        "%f", // %f missing class
+        "%fx", // %f not followed by a set
+        "(%a", // unfinished with content
+    };
+    for (rejects) |pat| {
+        if (census(pat) != null) {
+            std.debug.print("census accepted malformed [{s}]\n", .{pat});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // And the matcher agrees these are errors (or unreachable-at-close):
+    // firstMatch on a few of them must error, never succeed silently.
+    try testing.expectError(error.MalformedPattern, firstMatch("abc", "%"));
+    try testing.expectError(error.MalformedPattern, firstMatch("abc", "[abc"));
+}
+
+test "doc 30: census capture-count cap" {
+    // 33 captures: one over max_captures -> null.
+    var buf: [33 * 2]u8 = undefined;
+    for (0..33) |i| {
+        buf[2 * i] = '(';
+        buf[2 * i + 1] = ')';
+    }
+    try testing.expect(census(buf[0 .. 32 * 2]) != null);
+    try testing.expect(census(&buf) == null);
 }

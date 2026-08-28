@@ -71,6 +71,40 @@ pub const reserved_grid_id_base: u32 = 0x8000_0000;
 const initial_gc_threshold: usize = 1024;
 const heap_growth: usize = 2;
 
+/// Doc 30: the JIT pattern-match scratch — plain per-VM memory the match
+/// callouts (`smatch`/`sgmatch` in stralloc.zig) write and the projection ops
+/// (`scap_int`/`scap_str`) read within a single trace iteration. NOT a heap
+/// object and NOT VM state: invisible to GC roots, serialization, and
+/// snapshots. A side-exit mid-projection replays the whole iteration in
+/// tier-0, which never reads scratch, so stale contents are unobservable
+/// (doc 30 §3). Native code reaches the slots via absolute addresses baked
+/// off the VM-lifetime-stable `*Heap` (the `guard_gc` counter-load
+/// discipline), hence the `extern` layout.
+///
+/// Layout: `words[2k, 2k+1]` is slot `k`. Int slots (start/end char index,
+/// position captures, `next_pos`) use word `2k` only; span slots (whole
+/// match, string captures) are `(byte_init, byte_len)` into the subject
+/// recorded in `subj`. Slot indices are fixed by doc 30 §3: 0 = start char,
+/// 1 = end char, 2 = whole-match span, 3.. = captures in capture order,
+/// `slot_next_pos` = the gmatch cursor.
+pub const MatchScratch = extern struct {
+    /// `*const String` of the subject the last match op ran on (`scap_str`
+    /// interns spans out of its bytes). Raw address, valid only within the
+    /// trace iteration that wrote it.
+    subj: usize = 0,
+    words: [2 * n_slots]u64 = @splat(0),
+
+    /// 3 fixed + max captures + next_pos. The 32 must equal
+    /// `pattern.max_captures` — cross-checked by a comptime assert in
+    /// `stdlib/string.zig` (gc.zig deliberately does not import stdlib).
+    pub const n_slots = 3 + 32 + 1;
+    pub const slot_start = 0;
+    pub const slot_end = 1;
+    pub const slot_whole = 2;
+    pub const slot_cap0 = 3;
+    pub const slot_next_pos = 3 + 32;
+};
+
 pub const Heap = struct {
     gpa: std.mem.Allocator,
     /// Intrusive singly-linked list of every live object (newest first). This is
@@ -120,6 +154,11 @@ pub const Heap = struct {
     /// collector runs at *every* safepoint. Surfaces use-after-free and missing
     /// roots immediately (a wrongly-freed live object breaks the very next op).
     gc_stress: bool = false,
+    /// Doc 30: the pattern-match callout scratch (see `MatchScratch`). Plain
+    /// memory — the collector, the serializer, and the snapshot machinery all
+    /// ignore it by construction (nothing walks `Heap` fields; strings are
+    /// reached via `objects`/`strtab`, and this holds no `Value`s).
+    match_scratch: MatchScratch = .{},
 
     pub fn init(gpa: std.mem.Allocator) Heap {
         return .{ .gpa = gpa };
