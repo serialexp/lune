@@ -14351,11 +14351,25 @@ const AffineIntKey = struct { base: Ref, offset: i64 };
 /// 256 covers every realistic leaf body the compiler emits.
 const MAX_CALLEE_REGS = 256;
 
-/// Maximum number of synthetic entry inputs (upvalue/global snapshots, cluster
-/// sub-lever 1) a single trace may carry. Each is one slab slot the dispatch loop
-/// re-seeds + widens the executor window by; 8 covers every realistic hot loop
-/// (a handful of upvalue/global callees). A trace wanting more aborts cleanly.
-const MAX_TRACE_INPUTS = 8;
+/// Maximum number of synthetic entry inputs (upvalue/global/hash-cell
+/// snapshots) a single trace may carry. Each is one slab slot the dispatch loop
+/// re-seeds + widens the executor window by; a trace wanting more aborts
+/// cleanly (`.too_deep`), and the widened window is still capacity-checked
+/// dynamically at every entry (`seedTraceInputs` declines on overflow), so this
+/// constant is pure policy — a backstop against a pathological loop growing the
+/// entry snapshot without bound — not a layout invariant.
+///
+/// Measured 2026-08-28 (input-cap sweep, CURRENT_TASK LATEST-94): the machinery
+/// is free at every width tried. Synthetic N-upvalue-callee loops at N =
+/// 2..64, steady-state AND entry-heavy shapes, show a flat jit cost curve
+/// (~45× over tier-0 throughout), and the direct control — the same N callees
+/// as anchor-frame locals (zero inputs) vs upvalues (N inputs) — is identical
+/// within noise at N = 8/16/32/64. The old value (8) was set on the guess "a
+/// handful of callees covers every realistic loop"; str_manip's main path
+/// already needs 7, and one more cached builtin in any user loop would have
+/// silently killed its trace. 64 keeps the backstop role (maxrecord bounds the
+/// IR anyway — each input costs ≥2 ops) without realistically binding.
+const MAX_TRACE_INPUTS = 64;
 
 /// One saved caller context for an inlined `.call`, popped at the matching
 /// `.ret`. `base_off` is the caller frame's absolute slot offset (relative to the

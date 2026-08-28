@@ -1740,6 +1740,77 @@ test "doc 27: deopt through the pair — side exits replay the whole iteration, 
     );
 }
 
+// ---------------------------------------------------------------------------
+// MAX_TRACE_INPUTS (trace.zig) — the synthetic-entry-input budget for
+// upvalue/global/hash_cell snapshots. Measured free through N=64 (flat jit
+// cost, upvalue-vs-anchor-local control identical within noise; see
+// CURRENT_TASK LATEST-94), so the constant is 64: a pure-policy backstop, not
+// a tuning knob. These two tests pin both sides of the boundary.
+// ---------------------------------------------------------------------------
+
+test "input cap: 12 distinct upvalue inputs record — the old cap of 8 silently killed this shape" {
+    // Before the 8→64 raise, the 9th `get_upval` at the anchor aborted
+    // `.too_deep` and this loop fell back to tier-0 forever with byte-perfect
+    // output — exactly the silent regression `expectRecordedProgram` exists to
+    // catch. 12 * (50*51/2) + (1+..+12) * 50 = 19200.
+    try expectRecordedProgram(
+        \\local f1 = function(x) return x + 1 end
+        \\local f2 = function(x) return x + 2 end
+        \\local f3 = function(x) return x + 3 end
+        \\local f4 = function(x) return x + 4 end
+        \\local f5 = function(x) return x + 5 end
+        \\local f6 = function(x) return x + 6 end
+        \\local f7 = function(x) return x + 7 end
+        \\local f8 = function(x) return x + 8 end
+        \\local f9 = function(x) return x + 9 end
+        \\local f10 = function(x) return x + 10 end
+        \\local f11 = function(x) return x + 11 end
+        \\local f12 = function(x) return x + 12 end
+        \\local function run()
+        \\  local acc = 0
+        \\  for i = 1, 50 do
+        \\    acc = acc + f1(i) + f2(i) + f3(i) + f4(i) + f5(i) + f6(i)
+        \\    acc = acc + f7(i) + f8(i) + f9(i) + f10(i) + f11(i) + f12(i)
+        \\  end
+        \\  return acc
+        \\end
+        \\print(run())
+    ,
+        "19200\n",
+    );
+}
+
+test "input cap: 70 distinct upvalue inputs exceed the cap of 64 — fail-closed with parity, zero entries" {
+    // The over-budget side: input #65 must abort `.too_deep` cleanly (never a
+    // partial trace or wrong values), so the loop runs tier-0 with identical
+    // output and NOTHING commits. 70 callees are comptime-generated.
+    // 70 * (60*61/2) + (1+..+70) * 60 = 277200.
+    const source: [:0]const u8 = comptime blk: {
+        var s: [:0]const u8 = "";
+        for (1..71) |k| {
+            s = s ++ std.fmt.comptimePrint("local f{d} = function(x) return x + {d} end\n", .{ k, k });
+        }
+        s = s ++ "local function run()\n  local acc = 0\n  for i = 1, 60 do\n    acc = acc";
+        for (1..71) |k| {
+            s = s ++ std.fmt.comptimePrint(" + f{d}(i)", .{k});
+        }
+        s = s ++ "\n  end\n  return acc\nend\nprint(run())";
+        break :blk s;
+    };
+    try expectProgram(source, "277200\n");
+    // Dedicated record-attempt leg: recording runs (hotloop=4), every attempt
+    // aborts at the 65th input, and no trace is ever entered.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try util.runExecForTrace(&vm, gpa, source, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("277200\n", sink.buffered());
+    try testing.expect(vm.trace.entries == 0);
+}
+
 test "chunk rooting: a host-compiled retained chunk survives GC before it runs" {
     // docs/design/03 §"Chunk-constant rooting" — the regression. A host compiles chunk
     // B (whose distinctive literal is a `load_const`), retains it, runs chunk A (which

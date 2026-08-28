@@ -21,7 +21,70 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
-## Status 2026-08-28 (LATEST-93) — **MULTINEST LANDED (doc 27): dynamic-multret pairs record via a one-instruction recorder shadow — `f(g(x))` at any depth, closure composition included, recorder-only, board flat, str_manip's blocker moved to the `MAX_TRACE_INPUTS=8` cap.**
+## Status 2026-08-28 (LATEST-94) — **INPUT-CAP ARC LANDED: `MAX_TRACE_INPUTS` raised 8→64 after an empirical sweep found NO breaking point — the input machinery is free through N=64. Bonus finding: LATEST-93's "str_manip blocked by the cap" diagnosis was WRONG (main trace commits at cap 8; corrected in TODO.md + doc 27 §11).**
+
+Bart: "lets do that nest limit, we need to see where higher than 8 breaks."
+Answer, measured: **it doesn't** — at least not through 64.
+
+**What `MAX_TRACE_INPUTS` actually is (trace.zig):** the budget for synthetic
+entry inputs — upvalue/global/hash_cell snapshots a trace needs seeded per
+entry. `recInputGet` (~14239) aborts `.too_deep` past it; the hash_cell
+seeder (~12882) declines native. Slots allocate from `next_input_slot =
+num_registers` upward into dead slab scratch; `seedTraceInputs` (interp.zig
+~959) re-resolves each per entry (upvalGet/globals.get + regSet), capacity-
+checked DYNAMICALLY (declines entry on overflow), and `entry_guards`
+excludes input slots from the fingerprint. So the constant is pure policy —
+not a layout invariant, not a fixed array bound.
+
+**The sweep (ReleaseFast, best-of-5/7 wall):** generated N-upvalue-callee
+loops (`local fK = function(x) return x + K end` ×N, hot loop summing
+`f1(i)+..+fN(i)` inside `run()`) in two shapes — steady-state (one long
+loop) and entry-heavy (many short re-entries, stressing per-entry seeding) —
+at N = 2, 4, 8, 12, 16, 24, 32, 48, 64 with the cap lifted to 128. Result:
+jit cost FLAT (~1.1 ms, ~45× vs tier-0's linear growth) at every N in both
+shapes. Control: identical programs with the callees as ANCHOR-LOCALS
+(zero synthetic inputs) vs upvalues at N=8/16/32/64 — deltas ±0.05–0.17 ms,
+inside noise. Conclusion: seeding cost is per-entry and tiny; the guard cost
+is `guard_func` per input, which the trace amortizes. No cliff exists to
+tune around; 64 is a backstop against degenerate anchors (maxrecord bounds
+IR growth anyway — each input costs ≥2 ops).
+
+**The wrong diagnosis, falsified:** flipping the cap back to 8 shows
+str_manip's main-path 74-op trace COMMITTING (ssub→supper→slower→srev→slen→
+scp×2; 7 inputs: sub/base/upper/lower/reverse/len/byte; 8593 bytes native;
+the 1/64 branch folds to `guard_false`). The 518 `too_deep` hits in
+LATEST-93 were that branch's SIDE-traces, which additionally read `char`/
+`rep` (inputs #8/#9); at cap ≥16 they die at 3-arg `rep` instead
+(`recBSRep2` is 2-arg — rep3 frontier). Bench ~5.0× at ANY cap. str_manip's
+real remainder (perf rollup): tier-0 exec 21.5%, caseCore ~17.3% (full-
+Unicode machinery on ASCII data), memcpy 13.1%, wyhash 10.4% (interning),
+subCore 8.9%, reverseCore 7.5%, codepointCore 5.1%, decodeAt 4.1% — op-core
+cost, not coverage. TODO.md entry rewritten; doc 27 §11 got a correction
+block.
+
+**Landed:** `MAX_TRACE_INPUTS = 64` with a measurement-bearing comment
+(trace.zig). Two tests (interp_trace_test.zig, "input cap" prefix): 12
+distinct upvalue callees RECORD via `expectRecordedProgram` (the shape the
+old cap silently killed → "19200\n"), and 70 callees (comptime-generated
+source) fail CLOSED — 10-leg parity + a dedicated leg pinning
+`entries == 0` ("277200\n"). Gotcha rediscovered: CLI-default hotloop means
+50-iteration probes never record — the 70-input CLI probe needed 500 iters
+to show the `.too_deep` abort (3 hits, get_upval, ir_len 580); the test
+harness's hotloop=4 needs only ~5.
+
+**Gates:** suite green (`just test`), hashgate 84/84, full board
+(20260828-171400) vs the committed cap-8 baseline (20260828-163336): flat
+within noise (uniform +2–4% t0 drift = today's machine, not the change);
+str_manip 23.9 ms / 5.0× unchanged as predicted. The only >5% movers —
+recursive-fib −33%, scimark-fft −36% — are the two rows LATEST-93 already
+flagged as contention-inflated in the baseline (their LuaJIT columns were
+21.4/25.1 ms there vs 7.2/16.4 today); both are back at historical norms.
+
+**Next-arc candidates for Bart:** str_manip op cores (ASCII fast path in
+caseCore/decodeAt, interning cost), rep3 recording, or board-worst rotation
+(array3d ~29×, spectral-norm ~30×).
+
+## Status 2026-08-28 (LATEST-93) — **MULTINEST LANDED (doc 27): dynamic-multret pairs record via a one-instruction recorder shadow — `f(g(x))` at any depth, closure composition included, recorder-only, board flat, ~~str_manip's blocker moved to the `MAX_TRACE_INPUTS=8` cap~~ (WRONG — corrected in LATEST-94 above).**
 
 Bart chose multinest ("lets go for multinest — does that mean two nested
 things or arbitrarily nested?" → arbitrarily: the mechanism is per-call-site,

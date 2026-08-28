@@ -438,3 +438,14 @@ to reach that cap. Recorded in TODO.md as str_manip's new sole blocker with
 the measurement caveats (input cost is per-trace-entry). The composition
 cliff this doc targeted is closed for the language as a whole — any
 `f(g(x))`, any depth, closures included.
+
+> **CORRECTION (2026-08-28, input-cap arc).** The "new sole blocker" claim in
+> the paragraph above was WRONG. str_manip's main path reads only SEVEN
+> upvalues, and its 74-op trace was committing at cap 8 all along — the 518
+> `too_deep` hits were the rare 1/64-branch's *side-traces* (which
+> additionally read `char`/`rep`), and at any cap ≥16 those same side-traces
+> die at 3-arg `rep` instead (rep3 frontier). The bench is unchanged at any
+> cap value; its remaining time is op-core cost (caseCore/memcpy/wyhash/
+> subCore…), not coverage. `MAX_TRACE_INPUTS` was still raised 8→64 after an
+> empirical sweep showed the input machinery is free through N=64 — see
+> TODO.md's corrected entry and CURRENT_TASK LATEST-94.

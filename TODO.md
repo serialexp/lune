@@ -16,9 +16,10 @@ producers and vararg spreads stay fail-closed barriers. `lower(upper(a))` and
 every probed composed form record with zero aborts and run natively.
 
 **str_manip outcome (honest):** the MULTRET abort is gone but the bench moved
-only 5.2×→5.0× — the SAME loop is now gated by the next frontier, the
-`MAX_TRACE_INPUTS = 8` cap (see the new entry below). Original note kept for
-history:
+only 5.2×→5.0× — because the main path's 74-op trace now COMMITS and the
+remaining time is op-core cost, not coverage (see the corrected
+`MAX_TRACE_INPUTS` entry below — the cap was never the main-path blocker).
+Original note kept for history:
 
 ## Original MULTRET note (noted 2026-08-27, doc 24 c3) — historical
 
@@ -48,24 +49,37 @@ frontier. Every other op in str_manip's hot path (`sub`, `reverse`, `len`,
 2-arg `codepoint`) now records, so lifting this one shape should let the whole
 loop trace (`rep(char(..), 4, "-")` sits behind a 1-in-64 branch and can stay
 a side-exit). *(Post-landing correction: "should let the whole loop trace" was
-half-right — the nested calls record, but the loop then dies at the
-`MAX_TRACE_INPUTS` cap below, so the bench barely moved.)*
+RIGHT — the main path's 74-op trace commits (needing 7 inputs, under the
+then-cap of 8). The bench barely moved because the remaining time is op-core
+cost, not trace coverage — see the corrected entry below.)*
 
-## str_manip's NEW sole blocker: `MAX_TRACE_INPUTS = 8` upvalue/global snapshot cap (noted 2026-08-28, doc 27 landed)
+## ~~str_manip's NEW sole blocker: `MAX_TRACE_INPUTS = 8` cap~~ WRONG DIAGNOSIS — cap raised 8→64 anyway (2026-08-28, input-cap arc)
 
-With multinest landed, `--dump-aborts` on str_manip shows exactly ONE abort
-site left: `too_deep` at a `get_upval` in `run` (518 hits, ir_len 57) —
-`recInputGet`'s `input_seeds.items.len >= MAX_TRACE_INPUTS` cap (trace.zig
-~14239; the constant is 8 at ~14358). str_manip's hot loop reads more than 8
-distinct upvalues (`upper`, `lower`, `sub`, `reverse`, `len`, `codepoint`,
-`rep`, `char`, `acc`-adjacent…), each costing one synthetic entry input +
-`guard_func`. Before doc 27 the recording died at the nested call long before
-reaching 8 inputs, so the cap never showed. Next lever for str_manip (5.0×):
-either measure a raised cap (each input widens the executor window the
-dispatch loop re-seeds per entry — cost is per-trace-entry, so profile before
-raising blindly) or dedup/restructure how builtin-callee upvalue reads consume
-the input budget. General-language question, not a bench hack: ANY loop
-calling >8 distinct cached-in-locals functions hits this wall (Z-6).
+**The original claim below was falsified by the input-cap arc.** str_manip's
+main path needs only SEVEN inputs (`sub`, `base`, `upper`, `lower`, `reverse`,
+`len`, `byte`) and its 74-op trace was committing AT cap 8 all along (8593
+bytes native; the 1/64 `rep(char(..))` branch folds to a `guard_false`). The
+518 `too_deep` hits were that rare branch's SIDE-TRACES, which additionally
+read `char`/`rep` (inputs #8/#9); at cap ≥16 those same side-traces die at the
+3-arg `rep` instead (`recBSRep2` is 2-arg only — the rep3 frontier). Bench
+unchanged (~5.0×) at ANY cap value.
+
+**What the arc landed:** empirical sweep of N-upvalue-callee loops (steady +
+entry-heavy shapes, N=2..64) shows flat jit cost at every N, and an
+upvalue-vs-anchor-local control is identical within noise — the input
+machinery (synthetic seeds + per-entry re-resolve in `seedTraceInputs`) is
+FREE through 64. `MAX_TRACE_INPUTS` is now 64: a pure-policy backstop against
+degenerate anchors, dynamically capacity-checked, not a layout invariant. Any
+loop calling ≤64 distinct cached-in-locals functions now records (Z-6 general
+win); tests pin both sides of the boundary.
+
+**str_manip's ACTUAL remaining gap (perf, ReleaseFast, cap irrelevant):**
+tier-0 exec 21.5% (1/64-branch side exits + entries), memcpy 13.1%, caseCore
+~17.3% (full-Unicode machinery running on ASCII data), wyhash 10.4% (result
+interning), subCore 8.9%, reverseCore 7.5%, codepointCore 5.1%, decodeAt 4.1%
+(full UTF-8 decode on ASCII). Levers, all general: ASCII fast paths in the op
+cores, interning cost, 3-arg `rep` recording (rep3), tier-0 side-exit
+fraction.
 
 ## `table.pack`/`table.unpack` recording (noted 2026-08-27, ex-`math.type` entry)
 
