@@ -104,7 +104,7 @@ pub noinline fn schar1Runtime(heap: *gc.Heap, code: i64) callconv(.c) ?*object.G
 /// `srep2` body: 2-argument `string.rep(s, n)`.
 pub noinline fn srep2Runtime(heap: *gc.Heap, s: *object.GcHeader, n: i64) callconv(.c) ?*object.GcHeader {
     const str = string_mod.String.fromHeader(s);
-    const r = string_std.rep2Core(heap, str.bytes(), n) catch return null;
+    const r = string_std.rep2Core(heap, str, n) catch return null;
     return &r.header;
 }
 

@@ -255,17 +255,23 @@ pub fn subCore(heap: *gc.Heap, s: *const String, i_arg: i64, j_arg: i64) std.mem
     var j = posRelat(j_arg, clen);
     if (i < 1) i = 1;
     if (j > @as(i64, @intCast(clen))) j = @intCast(clen);
-    if (i > j) return heap.intern(""); // empty
+    if (i > j) return heap.internKnown("", .{ .cp_len = 0, .ascii = true }); // empty
     const bytes = s.bytes();
+    // doc 28 §6: the slice's character count is `j - i + 1` by DEFINITION of a
+    // character-position substring — known for both paths, no recount on miss.
+    const known_cp: usize = @intCast(j - i + 1);
     if (isAscii(s)) {
         // doc 28 L1: chars ARE bytes — the two boundary scans collapse to a
         // direct slice (1-based inclusive [i, j] → bytes [i-1, j)). `i >= 1`
-        // and `j <= clen == len` hold from the clamps above.
-        return heap.intern(bytes[@intCast(i - 1)..@intCast(j)]);
+        // and `j <= clen == len` hold from the clamps above. A slice of an
+        // ASCII string is ASCII.
+        return heap.internKnown(bytes[@intCast(i - 1)..@intCast(j)], .{ .cp_len = known_cp, .ascii = true });
     }
     const start = charByteOffset(bytes, @intCast(i));
     const end = charByteOffset(bytes, @intCast(j + 1));
-    return heap.intern(bytes[start..end]);
+    // ASCII bit of a general substring is NOT inferable (a slice of a multibyte
+    // string may be pure ASCII) — left null, derived by the scan.
+    return heap.internKnown(bytes[start..end], .{ .cp_len = known_cp });
 }
 
 /// `string.reverse` core: characters reversed, each UTF-8 sequence moved as a
@@ -277,14 +283,23 @@ pub fn reverseCore(heap: *gc.Heap, s: *const String) std.mem.Allocator.Error!*St
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(heap.gpa);
     try buf.resize(heap.gpa, bytes.len);
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = @min(std.unicode.utf8ByteSequenceLength(bytes[off]) catch 1, bytes.len - off);
-        const dst = bytes.len - off - n; // mirror this char's bytes (in order)
-        @memcpy(buf.items[dst .. dst + n], bytes[off .. off + n]);
-        off += n;
+    if (isAscii(s)) {
+        // doc 28 §4 L2: every char is one byte — a plain byte reverse, no
+        // per-character sequence-length decode.
+        for (bytes, 0..) |b, k| buf.items[bytes.len - 1 - k] = b;
+    } else {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = @min(std.unicode.utf8ByteSequenceLength(bytes[off]) catch 1, bytes.len - off);
+            const dst = bytes.len - off - n; // mirror this char's bytes (in order)
+            @memcpy(buf.items[dst .. dst + n], bytes[off .. off + n]);
+            off += n;
+        }
     }
-    return heap.intern(buf.items);
+    // doc 28 §6: a reversal is a byte permutation, and BOTH caches are pure
+    // per-byte properties — count of non-continuation bytes and absence of
+    // bytes ≥ 0x80 are preserved for ANY input bytes. Exact, not just valid-UTF-8.
+    return heap.internKnown(buf.items, .{ .cp_len = s.cpLen(), .ascii = s.isAscii() });
 }
 
 /// Encode one code point to UTF-8, or null when out of range (negative,
@@ -302,20 +317,27 @@ fn encodeCodepoint(code: i64, out: *[4]u8) ?usize {
 pub fn char1Core(heap: *gc.Heap, code: i64) (error{OutOfRange} || std.mem.Allocator.Error)!*String {
     var tmp: [4]u8 = undefined;
     const n = encodeCodepoint(code, &tmp) orelse return error.OutOfRange;
-    return heap.intern(tmp[0..n]);
+    // doc 28 §6: one scalar in, one character out; ASCII iff the scalar is.
+    return heap.internKnown(tmp[0..n], .{ .cp_len = 1, .ascii = code < 0x80 });
 }
 
 /// 2-argument `string.rep` core (no separator). `n <= 0` → the empty string.
 /// Scratch growth is fallible and precedes the intern; a pathological `n`
 /// OOMs here, side-exits, and tier-0's replay re-raises the same OOM.
-pub fn rep2Core(heap: *gc.Heap, bytes: []const u8, n: i64) std.mem.Allocator.Error!*String {
-    if (n <= 0) return heap.intern("");
+/// Takes the `*String` (doc 28 §6): repetition multiplies the character count
+/// exactly and preserves the ASCII bit — both are per-byte properties, so this
+/// holds for ANY bytes, not just valid UTF-8.
+pub fn rep2Core(heap: *gc.Heap, str: *const String, n: i64) std.mem.Allocator.Error!*String {
+    if (n <= 0) return heap.internKnown("", .{ .cp_len = 0, .ascii = true });
+    const bytes = str.bytes();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(heap.gpa);
     const count: usize = @intCast(n);
     var k: usize = 0;
     while (k < count) : (k += 1) try buf.appendSlice(heap.gpa, bytes);
-    return heap.intern(buf.items);
+    // Checked multiply: overflow → null (recount), NEVER a wrapped claim.
+    const known_cp: ?usize = std.math.mul(usize, str.cpLen(), count) catch null;
+    return heap.internKnown(buf.items, .{ .cp_len = known_cp, .ascii = str.isAscii() });
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +402,18 @@ pub fn caseCore(heap: *gc.Heap, str: *const String, comptime kind: CaseKind) std
     const s = str.bytes();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(heap.gpa);
+    if (isAscii(str)) {
+        // doc 28 §4 L2: ASCII maps byte-for-byte — ONE resize (the per-char
+        // append/grow discipline of the general loop was ~15% of str_manip)
+        // and a straight byte map the compiler can vectorize. Result: same
+        // length, same character count, still ASCII.
+        try buf.resize(heap.gpa, s.len);
+        for (s, buf.items) |b, *d| d.* = switch (kind) {
+            .upper => std.ascii.toUpper(b),
+            .lower => std.ascii.toLower(b),
+        };
+        return heap.internKnown(buf.items, .{ .cp_len = str.cpLen(), .ascii = true });
+    }
     var off: usize = 0;
     while (off < s.len) {
         const b = s[off];
@@ -408,7 +442,13 @@ pub fn caseCore(heap: *gc.Heap, str: *const String, comptime kind: CaseKind) std
         }
         off += d.len;
     }
-    return heap.intern(buf.items);
+    // doc 28 §6: simple 1:1 mapping is count-preserving (documented contract
+    // above; holds for the verbatim fallback too), so the count carries over.
+    // The ASCII bit does NOT (simple case mapping can cross the boundary —
+    // U+212A KELVIN SIGN lowers to plain 'k') — left null, derived by scan.
+    // Reachable inputs are valid UTF-8 (S-B: effect-log-parked invalid bytes
+    // are never program-visible), which the count-preservation relies on.
+    return heap.internKnown(buf.items, .{ .cp_len = str.cpLen() });
 }
 
 /// Tier-0 `string.upper`/`string.lower`: pin the Unicode version as a session
@@ -429,14 +469,15 @@ fn mapCaseUnicode(ctx: *anyopaque, args: []const Value, comptime kind: CaseKind)
 /// (default ""). `n <= 0` → empty string.
 fn sRep(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
-    const s = try strArg(vm, args, 0);
+    const sobj = try strObjArg(vm, args, 0);
+    const s = sobj.bytes();
     const n = try optIntArg(vm, args, 1, 0);
     const sep: []const u8 = if (args.len >= 3 and !args[2].isNil())
         (interp.strBytes(args[2]) orelse return vm.badArg(3, "string", args[2]))
     else
         "";
     if (sep.len == 0) { // the recordable 2-arg shape shares the ONE core
-        const r = try rep2Core(vm.heap, s, n);
+        const r = try rep2Core(vm.heap, sobj, n);
         return Value.heap(&r.header);
     }
     if (n <= 0) return vm.heap.internValue("");
@@ -1550,6 +1591,55 @@ test "doc 28 L1: sub/codepoint fast paths — ASCII answers equal the general pa
     try testing.expectEqualStrings("ell", (try subCore(vm.heap, a, 2, 4)).bytes());
     try testing.expectEqual(@as(?i64, 'o'), codepointCore(a, -1, -1));
     try testing.expectEqual(@as(?i64, null), codepointCore(a, 6, 6));
+}
+
+test "doc 28 c3b: known-facts producers — caches correct on both block and general paths (asserts armed)" {
+    // Every core below now CLAIMS character facts at intern time; in this safe
+    // build a wrong claim traps (createWithHashKnown / hit-path asserts), so
+    // merely running these vectors is the contract check. Assert the caches
+    // and dedup identity on top.
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    const heap = vm.heap;
+
+    // rep2Core, multibyte source: cp multiplies exactly, bit stays clear.
+    const r1 = try rep2Core(heap, try heap.intern("héé"), 3);
+    try testing.expectEqual(@as(usize, 9), r1.cpLen());
+    try testing.expect(!r1.isAscii());
+    try testing.expectEqualStrings("hééhééhéé", r1.bytes());
+    // ASCII source: bit stays set; dedup against a plain intern of same bytes.
+    const r2 = try rep2Core(heap, try heap.intern("ab"), 2);
+    try testing.expect(r2.isAscii());
+    try testing.expectEqual(r2, try heap.intern("abab"));
+    // n <= 0 → the known-empty.
+    try testing.expectEqual(@as(usize, 0), (try rep2Core(heap, try heap.intern("x"), 0)).cpLen());
+
+    // caseCore ASCII block path (resize-once map) vs general path result caches.
+    const lo_ascii = try caseCore(heap, try heap.intern("MiXed ascii!"), .lower);
+    try testing.expectEqualStrings("mixed ascii!", lo_ascii.bytes());
+    try testing.expect(lo_ascii.isAscii());
+    const up_gen = try caseCore(heap, try heap.intern("héLLo"), .upper); // general path
+    try testing.expectEqualStrings("HÉLLO", up_gen.bytes());
+    try testing.expectEqual(@as(usize, 5), up_gen.cpLen()); // count-preserving claim held
+    try testing.expect(!up_gen.isAscii()); // derived by scan (claim was null)
+    // Case-crossing mapping: KELVIN SIGN (U+212A, 3 bytes) lowers to ASCII 'k' —
+    // the reason the general path must NOT claim the bit; the scan sets it.
+    const kelvin = try caseCore(heap, try heap.intern("\u{212A}"), .lower);
+    try testing.expectEqualStrings("k", kelvin.bytes());
+    try testing.expect(kelvin.isAscii());
+
+    // reverseCore: both paths, permutation-preserved caches, char1Core facts.
+    const v1 = try reverseCore(heap, try heap.intern("abc")); // block path
+    try testing.expectEqualStrings("cba", v1.bytes());
+    try testing.expect(v1.isAscii());
+    const v2 = try reverseCore(heap, try heap.intern("ab😀cd")); // general
+    try testing.expectEqualStrings("dc😀ba", v2.bytes());
+    try testing.expectEqual(@as(usize, 5), v2.cpLen());
+    try testing.expect(!v2.isAscii());
+    try testing.expect((try char1Core(heap, 'x')).isAscii());
+    const w = try char1Core(heap, 0x1F600);
+    try testing.expectEqual(@as(usize, 1), w.cpLen());
+    try testing.expect(!w.isAscii());
 }
 
 test "string.len / sub with negative & clamped indices" {
