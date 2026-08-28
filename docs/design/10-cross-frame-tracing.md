@@ -49,6 +49,9 @@ they land; move whole sections to "done" once everything inside them is checked.
 - [x] **Depth + capacity guards.** New `AbortReason.too_deep`; `.call` aborts
   beyond `MAX_INLINE_DEPTH` and when `base_off + callee.num_registers` would
   overflow `reg_map`. The anchor-frame `.ret`/`.halt` still abort `.cross_frame`.
+  *(2026-08-28: the single tag was split so abort tables name which limit fired —
+  `.too_deep` now means only the `MAX_INLINE_DEPTH` case; the `reg_map` overflow
+  is `.frame_bounds`, and the synthetic-input budget is `.input_cap`.)*
 - [x] **Clean aborts on out-of-scope shapes (confirmed at depth).** Native callee
   → `host_barrier`; `__call`/metamethod, vararg callee, dynamic multret
   (`all_results`), and same-proto recursion → `cross_frame`/`too_deep`. Tests:

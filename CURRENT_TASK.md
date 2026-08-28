@@ -21,6 +21,32 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-28 (LATEST-95) — **diagnosability follow-ups to LATEST-94 (Bart-requested): every dump now names the input budget, and the overloaded `.too_deep` abort tag is split.**
+
+Bart: "add that number somewhere in the trace debug — then next time we'll
+know it is 7 and not hitting that cap", then "that seems like a healthy
+change if we notice it now" on the abort-tag split. Both misdiagnosis
+ingredients from LATEST-94 are now closed:
+
+1. **`inputs=N/cap` in the dumps** (commit 087f451): `--dump-traces` trace
+   headers and both `--dump-native` per-trace lines (compiled AND
+   unsupported/tier-1a) render the committed trace's synthetic-input count
+   against `MAX_TRACE_INPUTS` (now `pub` for the dumps only). str_manip
+   shows `inputs=7/64` on its main trace. Tests pin `inputs=0/` (unit,
+   cap-agnostic) and `inputs=2/` (two-upvalue anchor, integration).
+2. **`.too_deep` split three ways** (this commit): the single tag covered
+   THREE unrelated limits, which is why we had to guess. Now: `.too_deep` =
+   only `MAX_INLINE_DEPTH` call nesting; `.frame_bounds` = `reg_map`
+   reservation overflow (recCall callee window, recReturn dynamic writes);
+   `.input_cap` = the input budget + the u16 slot-index wrap guard. No
+   behavior change — same aborts, honest labels. `--dump-aborts` on the
+   70-input probe now reads `input_cap @ get_upval`. The 70-input test
+   asserts the reason (`record_aborts=true` leg: some `.input_cap`, zero
+   `.too_deep`); doc 10's checklist got a split note.
+
+Gates: suite green, hashgate 84/84 (both changes are flag-gated stderr
+diagnostics only).
+
 ## Status 2026-08-28 (LATEST-94) — **INPUT-CAP ARC LANDED: `MAX_TRACE_INPUTS` raised 8→64 after an empirical sweep found NO breaking point — the input machinery is free through N=64. Bonus finding: LATEST-93's "str_manip blocked by the cap" diagnosis was WRONG (main trace commits at cap 8; corrected in TODO.md + doc 27 §11).**
 
 Bart: "lets do that nest limit, we need to see where higher than 8 breaks."

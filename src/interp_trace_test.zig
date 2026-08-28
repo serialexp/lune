@@ -1750,7 +1750,8 @@ test "doc 27: deopt through the pair — side exits replay the whole iteration, 
 
 test "input cap: 12 distinct upvalue inputs record — the old cap of 8 silently killed this shape" {
     // Before the 8→64 raise, the 9th `get_upval` at the anchor aborted
-    // `.too_deep` and this loop fell back to tier-0 forever with byte-perfect
+    // `.input_cap` (then still tagged `.too_deep`) and this loop fell back to
+    // tier-0 forever with byte-perfect
     // output — exactly the silent regression `expectRecordedProgram` exists to
     // catch. 12 * (50*51/2) + (1+..+12) * 50 = 19200.
     try expectRecordedProgram(
@@ -1781,7 +1782,7 @@ test "input cap: 12 distinct upvalue inputs record — the old cap of 8 silently
 }
 
 test "input cap: 70 distinct upvalue inputs exceed the cap of 64 — fail-closed with parity, zero entries" {
-    // The over-budget side: input #65 must abort `.too_deep` cleanly (never a
+    // The over-budget side: input #65 must abort `.input_cap` cleanly (never a
     // partial trace or wrong values), so the loop runs tier-0 with identical
     // output and NOTHING commits. 70 callees are comptime-generated.
     // 70 * (60*61/2) + (1+..+70) * 60 = 277200.
@@ -1799,16 +1800,25 @@ test "input cap: 70 distinct upvalue inputs exceed the cap of 64 — fail-closed
     };
     try expectProgram(source, "277200\n");
     // Dedicated record-attempt leg: recording runs (hotloop=4), every attempt
-    // aborts at the 65th input, and no trace is ever entered.
+    // aborts at the 65th input, and no trace is ever entered. The abort table
+    // must NAME the limit — `.input_cap`, not the once-overloaded `.too_deep`
+    // that forced the LATEST-94 guesswork.
     const gpa = testing.allocator;
     var vm = try Vm.init(gpa);
     defer vm.deinit();
+    vm.trace.config.record_aborts = true;
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     var chunk = try util.runExecForTrace(&vm, gpa, source, &sink);
     defer chunk.deinit();
     try testing.expectEqualStrings("277200\n", sink.buffered());
     try testing.expect(vm.trace.entries == 0);
+    var saw_input_cap = false;
+    for (vm.trace.abort_log.items) |r| {
+        try testing.expect(r.reason != .too_deep); // nothing here nests deeply
+        if (r.reason == .input_cap) saw_input_cap = true;
+    }
+    try testing.expect(saw_input_cap);
 }
 
 test "input cap: writeTrace header reports the synthetic-input count against the budget" {

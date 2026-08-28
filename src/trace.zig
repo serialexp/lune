@@ -1384,10 +1384,24 @@ pub const AbortReason = enum {
     has_metatable,
     /// Allocation failed while building the trace.
     alloc,
-    /// Cross-frame inlining exceeded `max_inline_depth`, or would overflow the
-    /// recorder's grown `reg_map` window. Abort rather than panic on an OOB slab
-    /// read; tier-0 owns the loop. (Deep/unbounded recursion is Phase 3.)
+    /// Cross-frame inlining exceeded `MAX_INLINE_DEPTH`. (Deep/unbounded
+    /// recursion is Phase 3.) Exactly the call-nesting meaning the name says —
+    /// the reservation-overflow and input-budget conditions that used to share
+    /// this tag have their own reasons below (`frame_bounds`, `input_cap`), so
+    /// an abort table names WHICH limit fired (the LATEST-94 misdiagnosis came
+    /// from having to guess).
     too_deep,
+    /// An inlined callee window (`recCall`) or a dynamic return write
+    /// (`recReturn`, multret shapes) would overflow the recorder's grown
+    /// `reg_map` reservation. Abort rather than panic on an OOB slab access;
+    /// tier-0 owns the loop.
+    frame_bounds,
+    /// The synthetic entry-input machinery refused: the trace already carries
+    /// `MAX_TRACE_INPUTS` upvalue/global/hash-cell snapshots (a pure-policy
+    /// backstop — see the constant's comment), or the synthetic slot index
+    /// would wrap its `u16`. The trace's actual usage is visible as
+    /// `inputs=N/cap` in `--dump-traces`/`--dump-native`.
+    input_cap,
     /// An error unwound through the dispatch loop while this recording was
     /// active (doc 26 D1a). The raise itself is not part of the recorded IR, so
     /// letting the recording survive the unwind would stitch post-catch
@@ -13449,7 +13463,7 @@ pub const TraceState = struct {
         // *caller* proto (the frame the `.call` executes in).
         const callee_base_off: u32 = self.rec.base_off + proto.num_registers;
         if (@as(usize, callee_base_off) + cp.num_registers > self.rec.reg_map.len)
-            return self.abort(.too_deep);
+            return self.abort(.frame_bounds);
 
         // (1) guard_func: pin the runtime callee to this proto's stable id. `aux`
         // carries `Proto.id` (a `u32`, NOT a pointer — pointers change across a
@@ -14189,7 +14203,7 @@ pub const TraceState = struct {
         // does the same into slab scratch); bound them against the reg_map
         // reservation like `recCall` bounds callee windows.
         if (@as(usize, fr.base_off) + fr.ret_dest + want > self.rec.reg_map.len)
-            return self.abort(.too_deep);
+            return self.abort(.frame_bounds);
         var k: u32 = 0;
         while (k < want) : (k += 1) {
             // `base_off` is still the callee window here, so `refOf` reads the
@@ -14236,7 +14250,7 @@ pub const TraceState = struct {
         // limit is the executor window the dispatch loop must widen (checked against
         // `regCapacity` at entry); this cap bounds it cheaply and keeps a
         // pathological loop from growing the entry snapshot without bound.
-        if (self.rec.input_seeds.items.len >= MAX_TRACE_INPUTS) return self.abort(.too_deep);
+        if (self.rec.input_seeds.items.len >= MAX_TRACE_INPUTS) return self.abort(.input_cap);
 
         // Defensive: the synthetic slot counter is a `u16` seeded at
         // `anchor_num_registers`. A function with a near-`u16`-max register window
@@ -14246,7 +14260,7 @@ pub const TraceState = struct {
         // catch — and `seedTraceInputs` would then clobber a live caller register.
         // Abort rather than wrap. (MAX_TRACE_INPUTS already bounds the count; this
         // bounds the *index*.)
-        if (self.rec.next_input_slot == std.math.maxInt(u16)) return self.abort(.too_deep);
+        if (self.rec.next_input_slot == std.math.maxInt(u16)) return self.abort(.input_cap);
 
         const slot = self.rec.next_input_slot;
         self.rec.next_input_slot += 1;
@@ -14354,7 +14368,7 @@ const MAX_CALLEE_REGS = 256;
 /// Maximum number of synthetic entry inputs (upvalue/global/hash-cell
 /// snapshots) a single trace may carry. Each is one slab slot the dispatch loop
 /// re-seeds + widens the executor window by; a trace wanting more aborts
-/// cleanly (`.too_deep`), and the widened window is still capacity-checked
+/// cleanly (`.input_cap`), and the widened window is still capacity-checked
 /// dynamically at every entry (`seedTraceInputs` declines on overflow), so this
 /// constant is pure policy — a backstop against a pathological loop growing the
 /// entry snapshot without bound — not a layout invariant.
@@ -14758,8 +14772,10 @@ pub fn writeTrace(w: *io.Writer, t: *const Trace) io.Writer.Error!void {
     // Synthetic entry inputs (upvalue/global/hash-cell snapshots) against the
     // MAX_TRACE_INPUTS policy cap — so a dump answers "how close is this trace
     // to the input budget?" at a glance instead of leaving it to be guessed
-    // from `.too_deep` abort rows (which once misdiagnosed str_manip as
-    // cap-blocked when its main trace used 7 of 8; CURRENT_TASK LATEST-94).
+    // from abort rows (which once misdiagnosed str_manip as cap-blocked when
+    // its main trace used 7 of 8, back when the then-`.too_deep` tag — now
+    // split into `.input_cap`/`.frame_bounds`/`.too_deep` — hid which limit
+    // fired; CURRENT_TASK LATEST-94).
     try w.print("]  inputs={d}/{d}\n", .{ t.inputs.len, MAX_TRACE_INPUTS });
     for (t.instrs, 0..) |ins, i| {
         try w.print("  %{d:0>3}  ", .{i});
