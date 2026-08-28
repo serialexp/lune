@@ -633,6 +633,11 @@ pub fn restoreSnapshot(
         if (idmap.contains(o.id)) return error.DuplicateId;
         const header: *GcHeader = switch (o.body) {
             .HeapString => |hs| blk: {
+                // NB: deliberately NO UTF-8 validation — a legitimate snapshot
+                // can carry raw non-UTF-8 bytes (a recorded invalid host input
+                // parked by the effect log under validate-after-log). `create`
+                // recomputes `cp_len` and the exact `str_ascii` bit from the
+                // bytes, so the doc-28 ASCII fast paths stay sound regardless.
                 // Re-intern: allocate the bytes and register them so later program
                 // interning of the same bytes resolves to this object, and sweep
                 // can de-intern it. NOT `heap.intern` — that auto-links a counter id.

@@ -21,8 +21,12 @@ const GcHeader = object.GcHeader;
 pub const String = extern struct {
     header: GcHeader,
     /// Content hash (Wyhash, seed 0 — matches the interning map's `StringContext`
-    /// so a lookup-by-bytes and the stored hash agree). Cached for fast table-key
-    /// hashing.
+    /// so a lookup-by-bytes and the stored hash agree). Consumed ONLY by the
+    /// intern table (`Heap.strtab*`) — table keys hash heap values by stable
+    /// `GcHeader.id` (`table.ValueContext`), NOT by this field, and observable
+    /// iteration order is canonically sorted (doc 02), so this hash function is
+    /// free to change without touching any observable behaviour. Not serialized:
+    /// restore recomputes it through `create`.
     hash: u64,
     /// Byte length of the inline payload.
     len: usize,
@@ -59,17 +63,28 @@ pub const String = extern struct {
         return self.cp_len;
     }
 
-    /// Count Unicode code points in valid UTF-8 `content`: every byte that is not
-    /// a continuation byte (`0b10xxxxxx`) starts a new code point. Total and
-    /// branch-light; for valid UTF-8 it equals `std.unicode.utf8CountCodepoints`
-    /// without the error path. (Post-S-B every string is valid UTF-8 by
-    /// construction; for stray non-UTF-8 bytes this is merely defined, not used.)
-    fn countCodepoints(content: []const u8) usize {
+    /// EXACT pure-ASCII proof (cached `GcFlags.str_ascii`, one fused scan at
+    /// construction): every payload byte is < 0x80, so char index == byte index
+    /// at every seam. Deliberately NOT `cp_len == len` — that equivalence needs
+    /// valid UTF-8, and the effect log parks raw non-UTF-8 host bytes as
+    /// interned strings by design (validate-after-log). Doc 28 §2. O(1).
+    pub fn isAscii(self: *const String) bool {
+        return self.header.flags.str_ascii;
+    }
+
+    /// One fused scan: code-point count (every byte that is not a continuation
+    /// byte `0b10xxxxxx` starts a code point — equals
+    /// `std.unicode.utf8CountCodepoints` for valid UTF-8, merely defined for
+    /// stray non-UTF-8 bytes) AND the exact all-ASCII bit.
+    const Counted = struct { cp_len: usize, ascii: bool };
+    fn countCodepoints(content: []const u8) Counted {
         var n: usize = 0;
+        var ascii = true;
         for (content) |b| {
             if (b & 0xC0 != 0x80) n += 1;
+            if (b >= 0x80) ascii = false;
         }
-        return n;
+        return .{ .cp_len = n, .ascii = ascii };
     }
 
     /// Allocate a `String` owning a copy of `content`. This is the raw allocation
@@ -84,16 +99,26 @@ pub const String = extern struct {
     /// not pay the hash twice. `hash` MUST be `Wyhash.hash(0, content)`; every
     /// other caller goes through `create`, which guarantees it.
     pub fn createWithHash(gpa: std.mem.Allocator, content: []const u8, hash: u64) std.mem.Allocator.Error!*String {
+        // NB: no valid-UTF-8 assert here, deliberately — program-visible strings
+        // ARE valid by construction (S-B: validated literals/decode/host seams),
+        // but the effect log parks raw non-UTF-8 host input as interned strings
+        // (validate-after-log, so a recorded bad input replays byte-identically)
+        // and those bytes legitimately pass through here on record, replay, and
+        // restore. The ASCII fast paths therefore rest on the EXACT `str_ascii`
+        // bit below, never on UTF-8 validity.
         // Checked size: a hostile/huge length must fail as OOM, not wrap the
         // allocation size (lune's counterpart of LuaJIT's LJ_MAX_STR guard).
         const total = std.math.add(usize, @sizeOf(String), content.len) catch return error.OutOfMemory;
         const raw = try gpa.alignedAlloc(u8, std.mem.Alignment.of(String), total);
         const self: *String = @ptrCast(raw.ptr);
+        const counted = countCodepoints(content);
+        var header = GcHeader.init(.string);
+        header.flags.str_ascii = counted.ascii;
         self.* = .{
-            .header = GcHeader.init(.string),
+            .header = header,
             .hash = hash,
             .len = content.len,
-            .cp_len = countCodepoints(content),
+            .cp_len = counted.cp_len,
             .next_intern = null,
         };
         @memcpy(raw[@sizeOf(String) .. @sizeOf(String) + content.len], content);
@@ -163,4 +188,33 @@ test "cp_len counts code points, not bytes (S-B)" {
     defer c.destroy(testing.allocator);
     try testing.expectEqual(@as(usize, 6), c.len);
     try testing.expectEqual(@as(usize, 3), c.cpLen());
+}
+
+test "str_ascii is EXACT: set for ASCII, clear for multibyte AND for bytes that counterfeit cp_len == len (doc 28 §2)" {
+    const a = try String.create(testing.allocator, "hello");
+    defer a.destroy(testing.allocator);
+    try testing.expect(a.isAscii());
+
+    const e = try String.create(testing.allocator, "");
+    defer e.destroy(testing.allocator);
+    try testing.expect(e.isAscii()); // vacuously ASCII
+
+    const b = try String.create(testing.allocator, "héllo");
+    defer b.destroy(testing.allocator);
+    try testing.expect(!b.isAscii());
+
+    // All-0xFF: every byte is a non-continuation byte, so cp_len == len even
+    // though nothing here is ASCII — exactly the counterfeit the fused-scan
+    // bit exists to defeat. (Such bytes are constructible on purpose: the
+    // effect log parks raw non-UTF-8 host input as interned strings.)
+    const f = try String.create(testing.allocator, "\xFF\xFF\xFF");
+    defer f.destroy(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), f.cpLen());
+    try testing.expect(!f.isAscii());
+
+    // A stray continuation byte drops cp_len below len — also not ASCII.
+    const g = try String.create(testing.allocator, "a\x80b");
+    defer g.destroy(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), g.cpLen());
+    try testing.expect(!g.isAscii());
 }

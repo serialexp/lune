@@ -90,7 +90,7 @@ pub noinline fn ssubRuntime(heap: *gc.Heap, s: *object.GcHeader, i: i64, j: i64)
 /// `srev` body: `string.reverse(s)`, characters mirrored as UTF-8 units.
 pub noinline fn srevRuntime(heap: *gc.Heap, s: *object.GcHeader) callconv(.c) ?*object.GcHeader {
     const str = string_mod.String.fromHeader(s);
-    const r = string_std.reverseCore(heap, str.bytes()) catch return null;
+    const r = string_std.reverseCore(heap, str) catch return null;
     return &r.header;
 }
 
@@ -113,14 +113,14 @@ pub noinline fn srep2Runtime(heap: *gc.Heap, s: *object.GcHeader, n: i64) callco
 /// invariant (doc 26 D1), never re-derived on trace.
 pub noinline fn supperRuntime(heap: *gc.Heap, s: *object.GcHeader) callconv(.c) ?*object.GcHeader {
     const str = string_mod.String.fromHeader(s);
-    const r = string_std.caseCore(heap, str.bytes(), .upper) catch return null;
+    const r = string_std.caseCore(heap, str, .upper) catch return null;
     return &r.header;
 }
 
 /// `slower` body: `string.lower(s)`, ditto.
 pub noinline fn slowerRuntime(heap: *gc.Heap, s: *object.GcHeader) callconv(.c) ?*object.GcHeader {
     const str = string_mod.String.fromHeader(s);
-    const r = string_std.caseCore(heap, str.bytes(), .lower) catch return null;
+    const r = string_std.caseCore(heap, str, .lower) catch return null;
     return &r.header;
 }
 

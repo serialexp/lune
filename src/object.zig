@@ -43,7 +43,16 @@ pub const GcFlags = packed struct(u8) {
     pinned: bool = false,
     /// Reserved for a future generational write-barrier (`remembered`).
     remembered: bool = false,
-    _reserved: u6 = 0,
+    /// Meaningful for `.string` objects only: every payload byte is < 0x80.
+    /// Computed EXACTLY at construction (`String.createWithHash`, one fused
+    /// scan with the code-point count) — true ⟹ char index == byte index for
+    /// every seam, valid for ANY bytes (the effect log deliberately parks raw
+    /// non-UTF-8 host input as interned strings — validate-after-log — so this
+    /// bit must not be derived from `cp_len == len`, which malformed bytes can
+    /// counterfeit). Doc 28 §2; not serialized (restore recomputes via
+    /// `String.create`).
+    str_ascii: bool = false,
+    _reserved: u5 = 0,
 };
 
 /// The common header at the start of *every* heap object. Concrete object

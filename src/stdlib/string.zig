@@ -124,12 +124,72 @@ fn strObjArg(vm: *Vm, args: []const Value, i: usize) anyerror!*const String {
 /// Count Unicode code points in valid UTF-8 `s` (every non-continuation byte
 /// starts a code point). Branch-light; used for code-point-aware field widths in
 /// `string.format` so `%Ns`/`%Nc` align by character, consistent with `#s`.
+///
+/// This byte-slice form (and `charByteOffset`/`byteToChar` below) stays as the
+/// general implementation AND the reference the doc-28 tests compare the
+/// `*String` fast forms against. New code at a core boundary wants the
+/// `*String` forms — they consult the cached `cp_len` instead of scanning.
 fn cpCount(s: []const u8) usize {
     var n: usize = 0;
     for (s) |b| {
         if (b & 0xC0 != 0x80) n += 1;
     }
     return n;
+}
+
+// ---------------------------------------------------------------------------
+// doc 28 L1 — String-aware seam helpers.
+//
+// A `*String` caches `cp_len` and the EXACT all-ASCII bit (`String.isAscii`,
+// one fused construction-time scan; sound for any bytes — see doc 28 §2 on why
+// `cp_len == len` is NOT the predicate). For an ASCII string every char↔byte
+// conversion is the identity. These helpers are the one place that fact is
+// applied; the byte-slice forms above remain the general path (and the tests'
+// reference implementations).
+// ---------------------------------------------------------------------------
+
+/// Pure-ASCII proof — the cached exact bit.
+inline fn isAscii(s: *const String) bool {
+    return s.isAscii();
+}
+
+/// `charByteOffset` on a `*String`: 1-based character `ci` → 0-based byte
+/// offset. ASCII: the identity `ci - 1`, clamped exactly like the scan
+/// (`ci <= 1` → 0; `ci == cp_len + 1` → len; beyond → len).
+fn charByteOffsetS(s: *const String, ci: usize) usize {
+    if (isAscii(s)) return @min(ci -| 1, s.len);
+    return charByteOffset(s.bytes(), ci);
+}
+
+/// `byteToChar` on a `*String`: 0-based byte boundary → 1-based char index.
+fn byteToCharS(s: *const String, off: usize) usize {
+    std.debug.assert(off <= s.len);
+    if (isAscii(s)) return off + 1;
+    return cpCount(s.bytes()[0..off]) + 1;
+}
+
+/// `cpCount` of the prefix `s.bytes()[0..end]` on a `*String`.
+fn cpCountPrefixS(s: *const String, end: usize) usize {
+    std.debug.assert(end <= s.len);
+    if (isAscii(s)) return end;
+    return cpCount(s.bytes()[0..end]);
+}
+
+/// Byte end of "at most `count` characters" of `s` — the `%.Ns` precision
+/// seam. `count` is clamped to `cp_len` BEFORE any arithmetic, so a huge
+/// parsed precision cannot overflow `count + 1`.
+fn charPrefixEndS(s: *const String, count: usize) usize {
+    const n = @min(count, s.cp_len);
+    if (isAscii(s)) return n;
+    return charByteOffset(s.bytes(), n + 1);
+}
+
+/// The `*const String` behind a string `Value`, or null. The object form of
+/// `interp.strBytes` — seam consumers want the object (cached `cp_len`), not
+/// the degraded byte slice.
+fn strObjOf(v: Value) ?*const String {
+    if (!v.isHeap() or v.heapType() != .string) return null;
+    return String.fromHeader(v.asHeap());
 }
 
 /// Byte offset at which the 1-based character `ci` starts in `s`. `ci` may be
@@ -147,10 +207,13 @@ fn charByteOffset(s: []const u8, ci: usize) usize {
     return off;
 }
 
+/// A decoded code point: the scalar and its UTF-8 sequence length.
+const Decoded = struct { cp: u21, len: usize };
+
 /// Decode the code point starting at byte `off` in valid UTF-8 `s`, returning the
 /// scalar value and the byte length of its sequence. Total (U+FFFD / 1-byte step
 /// on malformed input, which does not occur for a valid string).
-fn decodeAt(s: []const u8, off: usize) struct { cp: u21, len: usize } {
+fn decodeAt(s: []const u8, off: usize) Decoded {
     const n = std.unicode.utf8ByteSequenceLength(s[off]) catch 1;
     const end = @min(off + n, s.len);
     const cp = std.unicode.utf8Decode(s[off..end]) catch 0xFFFD;
@@ -194,6 +257,12 @@ pub fn subCore(heap: *gc.Heap, s: *const String, i_arg: i64, j_arg: i64) std.mem
     if (j > @as(i64, @intCast(clen))) j = @intCast(clen);
     if (i > j) return heap.intern(""); // empty
     const bytes = s.bytes();
+    if (isAscii(s)) {
+        // doc 28 L1: chars ARE bytes — the two boundary scans collapse to a
+        // direct slice (1-based inclusive [i, j] → bytes [i-1, j)). `i >= 1`
+        // and `j <= clen == len` hold from the clamps above.
+        return heap.intern(bytes[@intCast(i - 1)..@intCast(j)]);
+    }
     const start = charByteOffset(bytes, @intCast(i));
     const end = charByteOffset(bytes, @intCast(j + 1));
     return heap.intern(bytes[start..end]);
@@ -201,7 +270,10 @@ pub fn subCore(heap: *gc.Heap, s: *const String, i_arg: i64, j_arg: i64) std.mem
 
 /// `string.reverse` core: characters reversed, each UTF-8 sequence moved as a
 /// unit. Scratch resize is the only fallible step and precedes the intern.
-pub fn reverseCore(heap: *gc.Heap, bytes: []const u8) std.mem.Allocator.Error!*String {
+/// Takes the `*String` (doc 28 L1) so the ASCII block path (c3b) can prove
+/// itself from `cp_len`.
+pub fn reverseCore(heap: *gc.Heap, s: *const String) std.mem.Allocator.Error!*String {
+    const bytes = s.bytes();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(heap.gpa);
     try buf.resize(heap.gpa, bytes.len);
@@ -275,7 +347,7 @@ fn sSub(ctx: *anyopaque, args: []const Value) anyerror!Value {
 fn sReverse(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm = vmOf(ctx);
     const s = try strObjArg(vm, args, 0);
-    const r = try reverseCore(vm.heap, s.bytes());
+    const r = try reverseCore(vm.heap, s);
     return Value.heap(&r.header);
 }
 
@@ -304,7 +376,8 @@ pub const CaseKind = enum { upper, lower };
 /// call** (an intern hit links zero). Deliberately heap-only: the session's
 /// Unicode-version pin is NOT this core's business — tier-0's wrapper performs
 /// it, and a committed trace implies it already happened (doc 26 D1).
-pub fn caseCore(heap: *gc.Heap, s: []const u8, comptime kind: CaseKind) std.mem.Allocator.Error!*String {
+pub fn caseCore(heap: *gc.Heap, str: *const String, comptime kind: CaseKind) std.mem.Allocator.Error!*String {
+    const s = str.bytes();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(heap.gpa);
     var off: usize = 0;
@@ -344,7 +417,9 @@ pub fn caseCore(heap: *gc.Heap, s: []const u8, comptime kind: CaseKind) std.mem.
 /// OOM in scratch, part of the doc 26 D1 proof), then run the shared core.
 fn mapCaseUnicode(ctx: *anyopaque, args: []const Value, comptime kind: CaseKind) anyerror!Value {
     const vm = vmOf(ctx);
-    const s = try strArg(vm, args, 0);
+    const s = try strObjArg(vm, args, 0);
+    // The version pin runs for ASCII inputs too (doc 28 §4) — it is a session
+    // effect; forking it on the data would fork replay.
     try interp.noteUnicodeVersion(vm);
     const r = try caseCore(vm.heap, s, kind);
     return Value.heap(&r.header);
@@ -428,6 +503,8 @@ pub fn codepointCore(s: *const String, i_arg: i64, j_arg: i64) ?i64 {
     if (j > @as(i64, @intCast(clen))) j = @intCast(clen);
     if (i > j) return null; // empty range
     const bytes = s.bytes();
+    // doc 28 L1: for ASCII the byte at `i - 1` IS the code point.
+    if (isAscii(s)) return bytes[@intCast(i - 1)];
     const d = decodeAt(bytes, charByteOffset(bytes, @intCast(i)));
     return @intCast(d.cp);
 }
@@ -453,9 +530,15 @@ fn sCodepointN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usiz
     const r = try charRange(vm, args, s.cpLen());
     if (r.lo > r.hi) return 0;
     const bytes = s.bytes();
-    var off = charByteOffset(bytes, r.lo);
     const count = r.hi - r.lo + 1;
     var k: usize = 0;
+    if (isAscii(s)) {
+        // doc 28 L1: bytes are the code points; no decode loop.
+        while (k < count and k < out.len and r.lo - 1 + k < bytes.len) : (k += 1)
+            out[k] = Value.int(bytes[r.lo - 1 + k]);
+        return k;
+    }
+    var off = charByteOffset(bytes, r.lo);
     while (k < count and k < out.len and off < bytes.len) : (k += 1) {
         const d = decodeAt(bytes, off);
         out[k] = Value.int(@intCast(d.cp));
@@ -500,14 +583,19 @@ fn sCodes1(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// step is O(1)).
 fn codesAuxCore(vm: *Vm, args: []const Value, out: *[2]Value) anyerror!usize {
     const st = try tableArg(vm, args, 0);
-    const s = interp.strBytes(st.getInt(1)) orelse return error.TypeError;
+    // The OBJECT, not the degraded bytes (doc 28 L1): `isAscii` skips the decode.
+    const sobj = strObjOf(st.getInt(1)) orelse return error.TypeError;
+    const s = sobj.bytes();
     const pos_v = st.getInt(2);
     var pos: usize = if (pos_v.isInt() and pos_v.asInt() >= 0) @intCast(pos_v.asInt()) else 0;
     const emitted_v = st.getInt(3);
     const emitted: i64 = if (emitted_v.isInt()) emitted_v.asInt() else 0;
     if (pos >= s.len) return 0; // exhausted
 
-    const d = decodeAt(s, pos);
+    const d: Decoded = if (isAscii(sobj))
+        .{ .cp = s[pos], .len = 1 }
+    else
+        decodeAt(s, pos);
     pos += d.len;
     try st.set(vm.gpa, Value.int(2), Value.int(@intCast(pos)));
     try st.set(vm.gpa, Value.int(3), Value.int(emitted + 1));
@@ -1375,6 +1463,69 @@ fn sv(vm: *Vm, s: []const u8) !Value {
 }
 fn bytesOf(v: Value) []const u8 {
     return interp.strBytes(v).?;
+}
+
+test "doc 28 L1: String-aware seam helpers agree with the byte-scan references on every boundary" {
+    // The byte-slice forms (`charByteOffset`, `cpCount`, `byteToChar`) are the
+    // reference implementations; the `*String` fast forms must agree with them
+    // at EVERY boundary for both an ASCII subject (fast path taken) and a
+    // multibyte subject (general path — trivially equal, pinned anyway so a
+    // future edit can't fork them).
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    const subjects = [_][]const u8{ "", "a", "hello", "héllo", "😀", "ab😀cd" };
+    for (subjects) |bytes| {
+        const s = try vm.heap.intern(bytes);
+        // charByteOffsetS across ci = 0 .. cp_len + 2 (incl. one-past-end and beyond).
+        var ci: usize = 0;
+        while (ci <= s.cpLen() + 2) : (ci += 1)
+            try testing.expectEqual(charByteOffset(bytes, ci), charByteOffsetS(s, ci));
+        // byteToCharS / cpCountPrefixS at every code-point boundary incl. len.
+        var off: usize = 0;
+        while (true) {
+            try testing.expectEqual(cpCount(bytes[0..off]) + 1, byteToCharS(s, off));
+            try testing.expectEqual(cpCount(bytes[0..off]), cpCountPrefixS(s, off));
+            if (off >= bytes.len) break;
+            off += decodeAt(bytes, off).len;
+        }
+        // charPrefixEndS: "at most count chars" for count = 0 .. cp_len + 1,
+        // plus the huge-count clamp that motivates it (no overflow).
+        var count: usize = 0;
+        while (count <= s.cpLen() + 1) : (count += 1)
+            try testing.expectEqual(charByteOffset(bytes, @min(count, s.cpLen()) + 1), charPrefixEndS(s, count));
+        try testing.expectEqual(bytes.len, charPrefixEndS(s, std.math.maxInt(usize)));
+    }
+}
+
+test "doc 28 L1: sub/codepoint fast paths — ASCII answers equal the general path's on shared vectors" {
+    // Same call shapes on an ASCII subject and on a multibyte subject whose
+    // FIRST five characters coincide ("héllo" vs "hello" differ at char 2) —
+    // pinning that clamping/negative-index behaviour did not fork.
+    var vm = try Vm.init(testing.allocator);
+    defer vm.deinit();
+    const a = try vm.heap.intern("hello"); // ASCII: fast paths taken
+    const u = try vm.heap.intern("h\xC3\xA9llo"); // "héllo": general path
+    const shapes = [_][2]i64{
+        .{ 1, -1 }, .{ 2, 4 },   .{ -3, -1 }, .{ -100, 100 },
+        .{ 4, 2 },  .{ 5, 5 },   .{ 6, 6 },   .{ 0, 3 },
+        .{ -5, 1 }, .{ 1, 100 },
+    };
+    for (shapes) |sh| {
+        // sub: character-count parity (bytes differ at the é, counts must not).
+        const ra = try subCore(vm.heap, a, sh[0], sh[1]);
+        const ru = try subCore(vm.heap, u, sh[0], sh[1]);
+        try testing.expectEqual(ru.cpLen(), ra.cpLen());
+        // codepoint: present/absent parity, and equality wherever the chars agree.
+        const ca = codepointCore(a, sh[0], sh[1]);
+        const cu = codepointCore(u, sh[0], sh[1]);
+        try testing.expectEqual(cu == null, ca == null);
+        if (ca != null and cu != null and cu.? != 0xE9)
+            try testing.expectEqual(cu.?, ca.?);
+    }
+    // Direct fast-path values.
+    try testing.expectEqualStrings("ell", (try subCore(vm.heap, a, 2, 4)).bytes());
+    try testing.expectEqual(@as(?i64, 'o'), codepointCore(a, -1, -1));
+    try testing.expectEqual(@as(?i64, null), codepointCore(a, 6, 6));
 }
 
 test "string.len / sub with negative & clamped indices" {

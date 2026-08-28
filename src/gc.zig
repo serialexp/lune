@@ -480,6 +480,12 @@ pub const Heap = struct {
     /// heap mutation, so an OOM can never leave a half-interned string or a
     /// consumed object id behind.
     pub fn intern(self: *Heap, content: []const u8) std.mem.Allocator.Error!*String {
+        // Program-visible strings are valid UTF-8 by construction (S-B), but
+        // this entry ALSO accepts raw non-UTF-8 host bytes on purpose — the
+        // effect log parks invalid host input as interned strings so a recorded
+        // failure replays byte-identically (validate-after-log). String-side
+        // character caches (`cp_len`, the exact `str_ascii` bit) are computed
+        // from the bytes and stay well-defined either way (doc 28 §2).
         const h = std.hash.Wyhash.hash(0, content);
         if (self.strtabLookup(content, h)) |existing| return existing;
         const s = try String.createWithHash(self.gpa, content, h);
