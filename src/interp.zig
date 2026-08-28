@@ -3360,6 +3360,14 @@ pub const Vm = struct {
                         .jmp_if_false => if (!regs.get(a).isTruthy()) {
                             pc = applyJump(pc, instr.aux);
                         },
+                        // Generic-for test+continue (doc 30 c5): first loop var
+                        // non-nil → publish it as ctrl and take the back-edge;
+                        // nil → fall through (loop done). Byte-identical to the
+                        // canonical `.tfor_loop` arm.
+                        .tfor_loop => if (!regs.get(a + 3).isNil()) {
+                            regs.set(a + 2, regs.get(a + 3));
+                            pc = applyJump(pc, instr.aux);
+                        },
                         else => unreachable, // install accepts only compiler loop closers
                     }
                     // A repeat condition that is true exits the loop. `while`'s

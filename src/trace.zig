@@ -10794,12 +10794,15 @@ pub const TraceState = struct {
 
     /// The image opcode corresponding to a canonical loop-closing instruction.
     /// Numeric `for` uses `.jfor_loop`; compiler-emitted `while` and `repeat`
-    /// close with `.jmp` and `.jmp_if_false` respectively and share `.jloop`.
-    /// Other jump variants are not loop closers emitted by the compiler.
+    /// close with `.jmp` and `.jmp_if_false` respectively, and generic-for
+    /// closes with `.tfor_loop` (recordable since doc 30 c4) — all three share
+    /// `.jloop`, whose arm re-executes the ORIGINAL opcode's semantics from
+    /// `patch.orig` and enters only on a taken back-edge. Other jump variants
+    /// are not loop closers emitted by the compiler.
     fn patchedEntryOp(op: OpCode) ?OpCode {
         return switch (op) {
             .for_loop => .jfor_loop,
-            .jmp, .jmp_if_false => .jloop,
+            .jmp, .jmp_if_false, .tfor_loop => .jloop,
             else => null,
         };
     }
@@ -13231,6 +13234,23 @@ pub const TraceState = struct {
     fn recBranch(self: *TraceState, instr: Instr, regs: RegWindow) !void {
         const ra = try self.refOf(instr.a);
         const truthy = regs.get(instr.a).isTruthy();
+        // Fold statically-decided branches (doc 30 c5): a konst's truthiness is
+        // fixed forever, and a proven-string producer result (`scap_str`,
+        // `tostr_*`, the snew class) is ALWAYS truthy — only nil/false are
+        // falsy in Lua, and a reachable string ref is never either. The guard
+        // would be a tautology on the recorded direction, so emit nothing:
+        // every tier wins (tier-1a skips a per-iteration re-check; native's
+        // proveKinds rightly refuses to model heap truthiness, so an emitted
+        // guard would bail the whole trace — the `if match(s, "^key")`
+        // anchored-test shape). No region/polarity identity is lost either: a
+        // branch that cannot diverge has no other CFG edge for a side trace.
+        if (self.konstValueOf(ra)) |kv| {
+            if (kv.isTruthy() == truthy) return;
+            // A konst contradicting the observation is impossible (the konst IS
+            // the observed value); fall through and emit the guard fail-closed.
+        } else if (truthy and self.isProvenStringRef(ra)) {
+            return;
+        }
         const op: IrOp = if (truthy) .guard_true else .guard_false;
         const gref = try self.emit(.{ .op = op, .a = ra });
         // Branch polarity IS part of the identity (A-i.3, round-1 BLOCKER 1): the
