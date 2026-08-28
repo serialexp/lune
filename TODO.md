@@ -1258,27 +1258,34 @@ change too:
 Nothing gates `zig build wasm` in `just test`, so it rotted silently. Fix +
 consider adding the wasm build to CI/justfile as a compile-only gate.
 
-## Pre-existing: `nextLoggedEffect` advances the cursor before validation — a wrong-version pin becomes "already consumed" on retry (found 2026-08-27, doc 26 D1 grounding)
+## ~~Pre-existing: `nextLoggedEffect` advances the cursor before validation~~ FIXED 2026-08-28 (Bart chose validate-before-advance)
 
-`nextLoggedEffect` (interp.zig:4845) bumps `effect_cursor` BEFORE the caller
-validates the entry. For `noteUnicodeVersion` (:4901) that ordering makes the
-mismatch path self-erasing: on `UnicodeVersionMismatch` the wrong-version
-`.unicode_version` entry is already BEHIND the cursor and
-`unicode_version_pinned` stays false — so if the same VM's `upper`/`lower` is
-reached again, `versionAlreadyConsumed` (:4879) scans the consumed prefix,
-finds the (wrong-version, never-validated) entry, and pins **silently with the
-mismatched table** — the exact divergence the error exists to prevent. The
-mismatch is deliberately uncatchable in-language, so reaching a second case op
-requires a host that re-runs a faulted-but-live VM — i.e. this composes with
-the "faulted-but-live VM can be re-run" entry below into a silent-divergence
-path, and the same pre-validation cursor advance is a latent trap for any
-future effect whose consumer validates-then-fails. Fix shapes: validate before
-advancing (peek/commit split), or record "consumed AND validated" instead of
-inferring validation from cursor position. Flagged for Bart, not fixed in the
-doc-26 arc (Rule #0.5 — it predates the arc and the fix choice is a design
-call).
+Was: `nextLoggedEffect` bumped `effect_cursor` BEFORE the caller validated the
+entry, making `noteUnicodeVersion`'s mismatch path self-erasing — the
+wrong-version entry landed BEHIND the cursor, so a later `noteUnicodeVersion`
+on the same VM took the `versionAlreadyConsumed` prefix scan and silently
+pinned the MISMATCHED table. Fixed with the peek/commit split: the cursor now
+advances only on acceptance (`nextLoggedEffect` kind-checks before advancing;
+`noteUnicodeVersion` peeks via the new `peekLoggedEffect`, validates the
+version, and consumes only on success) — cursor position is now a truthful
+"consumed successfully" record, which is the documented contract on both
+functions. Regression tests: the self-erasing retry (direct
+`noteUnicodeVersion` re-raise), the kind-diverged cursor hold, and cursor/pin
+asserts on the corrupt-float leg. Found while testing: a top-level re-`run` of
+the faulted VM was ALREADY refused by `beginTopLevelEpoch`
+(`DirtyTopLevelEntry`) — see the amendment on the faulted-but-live entry
+below; the seam this fix closes is host-driven calls / resumed sessions.
 
 ## Pre-existing: faulted-but-live VM can be re-run without resetting depth/stack_top (found 2026-07-17, doc-17 F-7 grounding)
+
+**AMENDMENT 2026-08-28:** partially stale. `beginTopLevelEpoch`
+(interp.zig:1278) now fail-closes on `depth != 0` with `DirtyTopLevelEntry`,
+so a host calling `run` again on a faulted-but-live VM IS refused (verified by
+the doc-26 cursor-fix regression test, which had to route its retry through
+`noteUnicodeVersion` directly because the re-`run` path is shut). What remains
+of this entry: entry points that do NOT pass through `beginTopLevelEpoch`
+(host-driven `callValue`-style invocation) still land on the raised
+depth/stack_top, and depth/stack_top are still never reset after a fault.
 
 Non-catchable / uncaught errors deliberately leave `vm.frames`/`vm.depth`/`stack_top`
 raised so `describeFault` can read the live top frame (`interp.zig:1215-1223`,

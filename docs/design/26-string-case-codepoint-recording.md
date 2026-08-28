@@ -410,7 +410,8 @@ honestly (the 1/64 `rep(char(...), 4, "-")` branch stays a side-exit — the
   test story).
 - ASCII-specialized case ops (Z-6: the ASCII fast path lives inside the one
   shared core).
-- The `nextLoggedEffect`-cursor pcall-retry oddity (TODO.md, Bart's call).
+- ~~The `nextLoggedEffect`-cursor pcall-retry oddity (TODO.md, Bart's
+  call)~~ — Bart called it: fixed post-landing (see "Landed results").
 - Record-mode snapshot-resume effect re-logging (pre-existing TODO).
 - Pattern engine, `string.format` chain (own arcs).
 - Trace serialization/deserialization (if it ever lands, D1's invariant is
@@ -475,8 +476,14 @@ gate record:
   blocker and the next general gap; `sub`/`reverse`/`len`/2-arg `codepoint`
   all record today, and `rep(char(..), 4, "-")` hides behind a 1-in-64
   branch (side-exit, fine).
-- **Flagged, not fixed (Rule #0.5 / Non-goals)**: the `nextLoggedEffect`
-  pre-validation cursor advance now has a full TODO.md entry — after an
-  (uncatchable) `UnicodeVersionMismatch`, a host that re-runs the
-  faulted-but-live VM silently pins the MISMATCHED table via
-  `versionAlreadyConsumed`. Fix choice is Bart's call.
+- **Flagged, then fixed (2026-08-28, follow-up commit)**: the
+  `nextLoggedEffect` pre-validation cursor advance. Bart chose
+  validate-before-advance: the cursor now moves only on acceptance
+  (kind-check before advance; `noteUnicodeVersion` peeks via the new
+  `peekLoggedEffect`, validates the version, consumes on success), so a
+  rejected wrong-version entry stays in front of the cursor and every retry
+  re-raises instead of silently pinning the mismatched table. Found while
+  testing: `beginTopLevelEpoch` already refuses a top-level re-`run` of a
+  faulted VM (`DirtyTopLevelEntry`), so the closed seam is host-driven
+  calls / resumed sessions; the faulted-but-live TODO entry was amended
+  accordingly.

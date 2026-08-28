@@ -906,6 +906,65 @@ test "S-C: a unicode_version log entry with a non-int (float) result is rejected
     try testing.expectError(error.UnicodeVersionMismatch, compileRun(gpa, &vm,
         \\print(pcall(string.lower, "X"))
     ));
+    // Validate-before-advance: the rejected (unreadable-version) entry was NOT
+    // consumed and no pin happened.
+    try testing.expectEqual(@as(usize, 0), vm.effect_cursor);
+    try testing.expect(!vm.unicode_version_pinned);
+}
+
+test "S-C: a wrong-version pin is not self-erasing — the rejected entry stays at the cursor and a retry re-raises" {
+    // The doc-26 TODO regression. `nextLoggedEffect` used to advance the
+    // cursor BEFORE validation, so after a (fatal, uncatchable)
+    // `UnicodeVersionMismatch` the wrong-version entry sat BEHIND the cursor
+    // with `unicode_version_pinned` still false; a host re-running the
+    // faulted-but-live VM then hit `versionAlreadyConsumed`'s prefix scan and
+    // SILENTLY pinned the mismatched table — the exact divergence the error
+    // exists to prevent. Under validate-before-advance the entry stays in
+    // front of the cursor, so the retry re-validates and re-raises, forever.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.effect_mode = .replay;
+    try vm.effect_log.append(gpa, .{ .kind = .unicode_version, .result = Value.int(0xDEAD) });
+    const src =
+        \\print(pcall(string.upper, "x"))
+    ;
+    try testing.expectError(error.UnicodeVersionMismatch, compileRun(gpa, &vm, src));
+    try testing.expectEqual(@as(usize, 0), vm.effect_cursor);
+    try testing.expect(!vm.unicode_version_pinned);
+    // The composed-bug leg. NB (found writing this test): a top-level re-`run`
+    // of the faulted VM is ALREADY refused fail-closed by beginTopLevelEpoch
+    // (`DirtyTopLevelEntry`, depth != 0) — that road to the silent pin is
+    // shut. The seam that remains is any later `noteUnicodeVersion` on the
+    // same VM (a host driving calls directly, or a resumed session): pre-fix
+    // it found the wrong-version entry BEHIND the cursor, took the
+    // `versionAlreadyConsumed` path, and silently pinned the mismatched
+    // table; now it re-validates the un-consumed entry and re-raises.
+    try testing.expectError(error.UnicodeVersionMismatch, noteUnicodeVersion(&vm));
+    try testing.expectEqual(@as(usize, 0), vm.effect_cursor);
+    try testing.expect(!vm.unicode_version_pinned);
+}
+
+test "replay: a kind-diverged log entry is not consumed — the cursor stays put on EffectKindMismatch" {
+    // The same cursor-truthfulness contract at the generic `nextLoggedEffect`
+    // level: the log's next entry is a .unicode_version but the program's next
+    // effect is a clock read. The divergence raises, and the unconsumed entry
+    // stays in front of the cursor rather than being silently skipped.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [128]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    vm.out = &sink;
+    vm.effect_mode = .replay;
+    try vm.effect_log.append(gpa, .{ .kind = .unicode_version, .result = Value.int(1) });
+    try testing.expectError(error.EffectKindMismatch, compileRun(gpa, &vm,
+        \\print(os.clock())
+    ));
+    try testing.expectEqual(@as(usize, 0), vm.effect_cursor);
 }
 
 test "S-D: pattern matching over multibyte text is byte-identical across all modes" {

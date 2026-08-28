@@ -21,7 +21,32 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
-## Status 2026-08-28 (LATEST-91) — **doc 26 LANDED: upper/lower/codepoint record + run natively (supper/slower/scp, ordinals 69/70/71). str_manip UNCHANGED (5.1×) — its `lower(upper(a))` spelling aborts at the pre-existing MULTRET nested-call frontier (TODO.md #1), which is now its SOLE blocker and the next general lever.**
+## Status 2026-08-28 (LATEST-92) — **effect-cursor bug FIXED (Bart: validate-before-advance) before starting multinest. `nextLoggedEffect` now kind-checks before advancing; `noteUnicodeVersion` peeks (`peekLoggedEffect`), validates, consumes only on success — a rejected wrong-version entry stays in front of the cursor, every retry re-raises, no silent mismatched-table pin.**
+
+Bart: "tempted to go towards multinest, but I don't want to leave the
+pre-existing bug in if I can help it" → fix first, then the MULTRET
+nested-call arc (TODO.md #1).
+
+- Cursor position is now a truthful "consumed successfully" record — the
+  contract `versionAlreadyConsumed`'s prefix scan silently depended on; it is
+  now documented on `nextLoggedEffect`/`peekLoggedEffect`.
+- Regression tests (interp_effects_test): self-erasing retry (direct
+  `noteUnicodeVersion` after the fault re-raises, cursor 0, pin false ×2);
+  kind-diverged entry not consumed on `EffectKindMismatch`; cursor/pin
+  asserts added to the corrupt-float leg.
+- Found while testing: `beginTopLevelEpoch` ALREADY refuses re-`run` of a
+  faulted VM (`DirtyTopLevelEntry`, depth != 0) — the 2026-07-17
+  faulted-but-live TODO entry was stale on that point and is amended (what
+  remains: non-`run` entry points + depth/stack_top never reset). The seam
+  this fix actually closes is host-driven calls / resumed sessions.
+- Gates: full suite green; hashgate 84/84 (replay path untouched by the 3
+  bench modes, but cheap insurance).
+- **Next: multinest** — TODO.md #1, nested last-arg builtin calls (MULTRET
+  → `.cross_frame`), now str_manip's sole blocker; fix shape sketched there
+  (resolve `nargs` from `reg_top` exactly as tier-0 does; accept inner
+  `c = all_results` when the consumer takes one value).
+
+## Status 2026-08-28 (LATEST-91, superseded by 92) — **doc 26 LANDED: upper/lower/codepoint record + run natively (supper/slower/scp, ordinals 69/70/71). str_manip UNCHANGED (5.1×) — its `lower(upper(a))` spelling aborts at the pre-existing MULTRET nested-call frontier (TODO.md #1), which is now its SOLE blocker and the next general lever.**
 
 Bart's go-ahead: "proceed with upper/lower please". Full loop ran: doc 26
 written → codex-reviewed (no blockers, 8 majors folded in) → c1 (D1a,

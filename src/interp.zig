@@ -4842,10 +4842,28 @@ fn logEffect(self: *Vm, kind: EffectKind, result: Value) Error!void {
 /// hasn't outgrown or diverged from the recording. Shared by `performEffect` and
 /// the seed path so both enforce the same `EffectLogExhausted`/`EffectKindMismatch`
 /// guarantees.
+///
+/// The cursor advances ONLY on acceptance — a rejected entry (wrong kind) stays
+/// IN FRONT of the cursor. Cursor position is thereby a truthful record of
+/// "entries consumed successfully", which `versionAlreadyConsumed`'s prefix scan
+/// depends on: were a failed entry left behind the cursor, a later retry (a host
+/// re-running a faulted-but-live VM, or a snapshot-resume) would mistake it for
+/// a validated pin. Consumers whose validation goes BEYOND the kind (the Unicode
+/// version check) must follow the same rule: peek via `peekLoggedEffect`,
+/// validate, and only then advance.
 fn nextLoggedEffect(self: *Vm, kind: EffectKind) Error!Value {
+    const v = try peekLoggedEffect(self, kind);
+    self.effect_cursor += 1;
+    return v;
+}
+
+/// The non-consuming half of `nextLoggedEffect`: bounds- and kind-check the
+/// entry at the cursor and return its result WITHOUT advancing. For consumers
+/// that must validate the value itself before committing the consume
+/// (`noteUnicodeVersion`) — see the cursor-truthfulness contract above.
+fn peekLoggedEffect(self: *Vm, kind: EffectKind) Error!Value {
     if (self.effect_cursor >= self.effect_log.items.len) return Error.EffectLogExhausted;
     const e = self.effect_log.items[self.effect_cursor];
-    self.effect_cursor += 1;
     if (e.kind != kind) return Error.EffectKindMismatch;
     return e.result;
 }
@@ -4910,7 +4928,14 @@ pub fn noteUnicodeVersion(self: *Vm) Error!void {
             if (versionAlreadyConsumed(self)) {
                 committed = false;
             } else {
-                const v = try nextLoggedEffect(self, .unicode_version);
+                // Peek, validate, THEN consume (the cursor-truthfulness contract
+                // on `nextLoggedEffect`): on a mismatch the wrong-version entry
+                // must stay IN FRONT of the cursor, so any later retry — a host
+                // re-running this faulted-but-live VM, or a resumed session —
+                // re-validates and re-raises instead of finding the entry behind
+                // the cursor via `versionAlreadyConsumed` and silently pinning
+                // the MISMATCHED table.
+                const v = try peekLoggedEffect(self, .unicode_version);
                 // The shared scalar shape-gate (effectser.checkResultShape) accepts
                 // *either* int or float, so a corrupt log could park a float here;
                 // `asInt()` asserts int. Treat a non-int version as a mismatch (a log
@@ -4918,6 +4943,7 @@ pub fn noteUnicodeVersion(self: *Vm) Error!void {
                 // version) rather than asserting on hostile bytes.
                 if (v.tag != .int or v.asInt() != @as(i64, unicode_case.unicode_version_packed))
                     return Error.UnicodeVersionMismatch;
+                self.effect_cursor += 1; // accepted — consume
             }
         },
     }
