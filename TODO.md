@@ -81,6 +81,13 @@ interning), subCore 8.9%, reverseCore 7.5%, codepointCore 5.1%, decodeAt 4.1%
 cores, interning cost, 3-arg `rep` recording (rep3), tier-0 side-exit
 fraction.
 
+**UPDATE (2026-08-28, doc 28 string arc landed, LATEST-96):** the "ASCII fast
+paths in the op cores" lever is DONE (exact `str_ascii` bit + seam helpers +
+block paths + known-fact interning; str_manip 23.9 → 18.8 ms, 4.0×). Still on
+the table from the list above: **interning cost** (L3 sparse hash — Bart
+decision pending, doc 28 §5), **rep3 recording**, **tier-0 side-exit
+fraction**, and the **decimal renderer** for str_format (doc 28 §7 non-goals).
+
 ## `table.pack`/`table.unpack` recording (noted 2026-08-27, ex-`math.type` entry)
 
 The `math.type` fold arm from this entry LANDED with arc B c1 (doc 24;

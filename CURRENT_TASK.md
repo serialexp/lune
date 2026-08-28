@@ -21,6 +21,57 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-28 (LATEST-96) — **STRING OP-CORE ARC (doc 28) LANDED, c1–c3b: exact per-string ASCII bit + seam fast paths + known-fact interning. str_manip 23.9 → 18.8 ms (5.0× → 4.0×), find_match −9.7%, gsub −5.3%. L3 (sparse hash) awaits Bart's call.**
+
+Bart: "Lets do the strings first. Everyone will run into those at some point."
+Four commits: 6194693 (c1), 511033a (c2), 435f383 (c3a), 37591cf (c3b).
+
+1. **c1 — exact `GcFlags.str_ascii` bit + L1 seam helpers.** One fused
+   construction scan; sound for ANY bytes (the effect log parks raw
+   non-UTF-8 host input as interned strings — validate-after-log — so
+   `cp_len == len` can be counterfeited and must NOT be the predicate;
+   the codex review's "assert valid UTF-8 in createWithHash" must-fix was
+   itself wrong, discovered by 6 failing S-B tests; recorded in doc 28 §2).
+   `charByteOffsetS`/`byteToCharS`/`cpCountPrefixS`/`charPrefixEndS`/
+   `strObjOf` + sub/codepoint/codes ASCII fast paths.
+2. **c2 — pattern/format seams consume the caches.** `resolveInit` was an
+   O(len) `cpCount` per find/match CALL → cached `cp_len`; result seams
+   and position captures O(1) on ASCII subjects (threading: writeCaptures/
+   captureValue take the subject `*String`, gmatchAuxCore recovers it from
+   state[1], gsub threads it to addRepl*). `emitString` takes caller-known
+   character counts; width/precision parse is checked (huge digit runs
+   reject instead of overflowing usize — pre-existing wrap fixed).
+3. **c3a — ONE `internImpl` + `Heap.internKnown(content, String.Known)`.**
+   Producer-known facts skip the miss-path scan halves; asserted against
+   the scan on miss AND against the existing object's caches on hit.
+   `Known = {cp_len: ?usize, ascii: ?bool}` — the reviewed `known_cp`-only
+   signature predates the §2 exact bit (a count can't produce the bit);
+   reconciliation recorded in doc 28 §6.
+4. **c3b — L2 block paths + §6 known-fact sites.** caseCore ASCII =
+   resize-once byte map (append/grow discipline was ~15% of str_manip);
+   reverseCore ASCII = plain byte reverse; subCore j−i+1, caseCore
+   count-preserving claim (ASCII bit only on the block path — U+212A
+   KELVIN → 'k' crosses the boundary, pinned by test), reverseCore
+   permutation-exact both caches, rep2Core checked cp×n (`*String`
+   signature, sRep + srep2Runtime updated), char1Core {1, code<0x80}.
+
+**Board (20260828-191940 vs 20260828-171400):** str_manip −21%,
+find_match −9.7% (prediction 32–33 landed at 32.4), gsub −5.3%, gmatch
+flat as predicted. **str_format +4%: A/B'd + bisected (doc 28 §11)** —
+~1% is the fused scan (the exact bit's principled price), ~3% is LLVM
+inline/layout churn in decimal/sFormat code the slices never touched
+(perf-diff attribution swings in untouched fns; forced-inline internImpl
+tried and reverted). Not chased per Z-6; the decimal arc (§7 non-goal,
+~45% of str_format) owns that cluster. Gates: suite green (1070),
+hashgate 84/84, board 28/28 cross=ok, no non-string mover beyond noise.
+
+**OPEN — L3 decision for Bart (doc 28 §5 is the decision text):** swap
+`String.hash` wyhash → LuaJIT-style sparse sampled hash (4 u32 loads,
+O(1) in length) + deterministic chain-length-triggered dense rehash in
+the same change. Determinism-clean (hash feeds ONLY the intern table;
+table keys hash by `GcHeader.id`; iteration order canonically sorted).
+Biggest single remaining string lever (wyhash 11.3% of str_manip).
+
 ## Status 2026-08-28 (LATEST-95) — **diagnosability follow-ups to LATEST-94 (Bart-requested): every dump now names the input budget, and the overloaded `.too_deep` abort tag is split.**
 
 Bart: "add that number somewhere in the trace debug — then next time we'll

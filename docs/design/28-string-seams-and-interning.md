@@ -336,3 +336,40 @@ path. Pins:
   the rest.
 * Non-string rows: strictly unchanged (interning call sites keep
   behaviour; nothing else is shared).
+
+## 11. Measured results
+
+c1–c3b landed; full board 20260828-191940 vs pre-arc baseline
+20260828-171400 (quiet machine, ReleaseFast, reps=5).
+
+| bench          | jit before | jit after | Δ      | ratio      | vs prediction |
+|----------------|-----------:|----------:|-------:|------------|---------------|
+| str_manip      | 23.9 ms    | 18.8 ms   | −21%   | 5.0× → 4.0× | just above the 16–18 band — the band assumed L3 crumbs too |
+| str_find_match | 35.9 ms    | 32.4 ms   | −9.7%  | 2.7× → 2.4× | **landed** (32–33) |
+| str_gsub       | 63.8 ms    | 60.5 ms   | −5.3%  | 1.4×       | unpredicted bonus (position captures + known-fact sites) |
+| str_gmatch     | 61.4 ms    | 61.2 ms   | −0.4%  | 2.4×       | landed (≤5%: per-capture interning dominates — L3/dispatch territory) |
+| str_format     | 99.2 ms    | ~104 ms   | **+4%**| 3.4× → 3.6× | see below |
+| non-string rows| —          | —         | ±noise | —          | landed (28/28 cross=ok, no mover >±5% jit) |
+
+**The str_format +4% was A/B'd and bisected, not shrugged off** (shadow
+builds per slice, `perf stat -r 5` instruction counts): baseline 2211M
+insns → c1 2244M → c2 2254M → c3a 2263M → c3b 2316M. Two components:
+
+1. **Principled (~1%, c1):** the fused construction scan (+1 cmp/branch
+   per byte on every intern miss) — the price of the exact `str_ascii`
+   bit, paid by every unique string built. It buys str_manip's −21% and
+   the seam O(1)s everywhere.
+2. **Codegen churn (~3%, spread, biggest at c3b):** the c3b slice touches
+   only cores this bench never calls (`sub`/`rep`/`reverse`/`case`), yet
+   attribution swung in untouched functions (`exactDigits` +4pp,
+   `execImpl` −6.6pp, memcpy↔memmove ICF renaming in `perf diff`) —
+   LLVM inline/layout luck in the decimal+sFormat hot cluster. Forcing
+   `internImpl` inline was tried and did NOT recover it (reverted).
+   Chasing per-bench inline boundaries is exactly what Z-6 forbids; the
+   decimal renderer arc (§7) rewrites this hot cluster anyway and owns
+   str_format's real gap (~45% of its profile).
+
+L3 (sparse intern hash, §5) remains a separate decision for Bart — it is
+the biggest single remaining lever on every string-producing bench
+(wyhash is 11.3% of str_manip; LuaJIT's `hash_sparse` is 4 sampled u32
+loads, O(1) in the length).
