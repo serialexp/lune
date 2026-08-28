@@ -21,6 +21,53 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-29 (LATEST-98) — **DOC 30 ARC IN FLIGHT: Bart approved ("less barriers is good, we want everything traced"). c1 LANDED (625ec2b); c2–c5 remain. Grammar decision RESOLVED (superset criterion; trim fix 1755f0c). L3 answered ("wyhash is good, the lever is O(1) sampling") — still awaiting Bart's yes/no.**
+
+Bart's three answers (2026-08-29): (1) tonumber must accept a superset of
+Lua 5.4 + LuaJIT — verified with a 77-case three-engine probe; ONE gap
+(\v/\f trim) found and fixed (1755f0c); grammar (a) frozen, B3 scanner dead.
+(2) Doc 30 GO. (3) asked whether the intern hash is "shitty" — answered: it
+is wyhash (top-tier); the lever is byte COUNT (O(len) vs LuaJIT's O(1)
+4-word sampling = doc 28 §5 L3, determinism-clean, ~-11% str_manip) — his
+yes/no on L3 still open.
+
+**Doc 30 c1 landed (625ec2b), tree green both legs + hashgate 84/84:**
+- pattern.zig: `locateMatch` (the ONE anchored-scan loop; wrappers + tests
+  refactored onto it), `census` (static capture count/kinds/anchored/
+  specials walk on classEnd stepping; null = fail-closed), `Span`, `CapKind`.
+- gc.zig: `Heap.match_scratch` (`MatchScratch`, extern; slot pairs; header
+  `subj` ptr; `n_slots = 3 + 32 + 1`, `slot_next_pos` fixed; non-root,
+  non-serialized).
+- stdlib/string.zig: `MatchStatus` (negative-status ABI, M03), `smatchCore`,
+  `sfindPlainCore`, `sgmatchCore` (read-only, identity + B03 checks),
+  `scapStrCore`, `fillMatchScratch`; comptime slot-geometry assert.
+- table.zig: `inLaneValueIntCell`/`setInLaneValueInt` (the B03 shape).
+- stralloc.zig: shims `smatchRuntime`, `sfindpRuntime`, `sgmatchRuntime`,
+  `scapStrRuntime`, `sgmSetposRuntime` (defensive re-verify, status i64),
+  `str2numRuntime` (`Str2NumResult extern {status, value}`).
+
+**c2 next (task #56)**: IR ops appended after `scp` (71): `sfindp` 72
+(a=s, b=init, aux=pat ref — scp's ternary encoding, `.pure3`), `smatch` 73
+(same operands, `.scratch3`), `sgmatch` 74 (a=state, aux=pat KONST ID
+immediate, `.scratch1k`), `scap_int` 75 (a=match ref, b=slot imm, `.proj`),
+`scap_str` 76 (ditto, ty .heap, `.alloc_proj`), `str2num_i` 77 / `str2num_f`
+78 (unary a=s), `sgm_setpos` 79 (a=state, b=pos ref; deferred store),
+`guard_sid` 80 (a=string ref, aux=konst id; joins guardKeyAux; NOT in
+guardExitPc/isSideExitGuardOp — pinned). Sweep per doc 30 §8: trace.zig enum
++ doc comments + assertWellFormed + writeIrInstr; traceser ordinal pins;
+viz/src/enums.ts (+TERNARY_AUX_OPS for sfindp/smatch); tropt kindOf + FOUR
+new kinds through every switch (canonicalization ~:402, liveness ~:468,
+LICM ~:560, remap ~:658, guardKeyAux :256, alloc-root :420) each pinned;
+troptdiag operand walks (:157/:285 pattern); irinterp arms (executor has
+heap; call the stralloc shims). c3: nativegen (proveKinds; BodyCallout rows;
+emitters — smatch/sgmatch callout + status cmp; scap_int baked load;
+scap_str snew protocol; str2num rax/rdx; sgm_setpos callout status-checked;
+guard_sid ptr cmp vs compile-time konst; heap-null bail list +=
+smatch/sgmatch/scap_int/scap_str). c4: recorder arms (RecordedBuiltin
+find=20/match=21/gmatch_iter=22; recBTonumber string arm; census pin P1/P2;
+B02 all-captures; M04 nil-pad; one-pending-sgm_setpos pin; doc 27 D1
+stances). c5: §9 adversarial matrix + gates + board + docs.
+
 ## Status 2026-08-28 (LATEST-97) — **MATCHER + TONUMBER CONSTANT FACTORS (doc 29 A1–A4 + B(a)) LANDED. str_gsub 60.5 → 53.3 ms = 1.2× LJ (AT CAMPAIGN TARGET); find_match 2.4× → 2.2×; instr −17%/−12%/−8% on gsub/find/gmatch, format+scalar exactly flat. Doc 30 (pattern/tonumber recording) at v3, awaiting Bart's go-ahead.**
 
 Bart approved levers 1+2+3 ("Ok, lets try to do 1, 2 and 3"). Lever 2
