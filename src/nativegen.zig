@@ -1193,6 +1193,11 @@ fn compileImpl(gpa: std.mem.Allocator, t: *const Trace, arena: ?*McodeArena, see
         for (t.instrs) |ins| {
             switch (ins.op) {
                 .guard_gc, .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower => return null,
+                // Doc 30: the match/scratch class bakes `heap.match_scratch`
+                // addresses (scap_int) or passes the heap to the shims
+                // (smatch/sgmatch/scap_str). sfindp, str2num_* and sgm_setpos
+                // are heap-free by design and deliberately absent.
+                .smatch, .sgmatch, .scap_int, .scap_str => return null,
                 else => {},
             }
         }
@@ -1629,11 +1634,21 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                     .int => .int,
                     .boolean => .bool,
                     .float => .float, // Phase D: a float constant materializes via movq
-                    // H1: a heap const is admissible ONLY as an href key (the interned
-                    // field-name string). It carries no native value — href reads the
-                    // seeded cell, not the key — so accept it as `.none` and let `lower`
-                    // emit nothing. Any other heap-const use stays unmarked → bails.
-                    .heap_ref => if (href_key[i]) .none else return false,
+                    // H1: a heap const serving as an href key (the interned
+                    // field-name string) carries no native value — href reads the
+                    // seeded cell, not the key — so accept it as `.none` and let
+                    // `lower` emit nothing. Doc 30: any OTHER string konst is a
+                    // first-class `.heap` value (the pattern operand of
+                    // sfindp/smatch) — `payload.bits` IS the stable `*GcHeader`
+                    // pointer (non-moving GC, consts rooted by the trace), so the
+                    // existing raw-bits materialization emits it verbatim. A konst
+                    // that is BOTH an href key and a value operand stays `.none`
+                    // and the value use bails — fail closed. Non-string heap
+                    // konsts stay unmarked → bail.
+                    .heap_ref => if (href_key[i]) .none else if (t.consts[@intCast(ins.aux)].heapType() == .string) blk: {
+                        is_string[i] = true;
+                        break :blk .heap;
+                    } else return false,
                     else => return false, // nil → bail
                 };
             },
@@ -1895,6 +1910,96 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[@intCast(ins.aux)] != .int) return false;
                 if (ins.ty != .int) return false;
                 kinds[i] = .int;
+            },
+            // --- doc 30: the pattern/str2num callout class -----------------
+            // sfindp (plain find, heap-free) and smatch (matcher + scratch
+            // fill) share ssub/scp's ternary encoding: a = string, b = init
+            // (int), aux = pattern (a PROVEN-string ref — konst-pinned or
+            // guard_sid-pinned). Result kind .int: sfindp's 1-based char
+            // index (≥1; ≤0 → side-exit) / smatch's status (0; else exit).
+            .sfindp, .smatch => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (ins.aux < 0 or ins.aux >= i) return false;
+                if (!is_string[ins.a]) return false;
+                if (kinds[ins.b] != .int) return false;
+                if (!is_string[@intCast(ins.aux)]) return false;
+                if (ins.ty != .int) return false;
+                kinds[i] = .int;
+            },
+            // sgmatch: one composite gmatch-iterator step. a = the state
+            // table (an invariant `.ptr` root or a per-iteration `.heap`
+            // value — the shim re-checks the type and fails closed either
+            // way), aux = the expected-pattern KONST-POOL id (an immediate,
+            // resolved at emission to a baked `*GcHeader`). Status result.
+            .sgmatch => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .ptr and kinds[ins.a] != .heap) return false;
+                if (ins.aux < 0 or ins.aux >= t.consts.len) return false;
+                const pk = t.consts[@intCast(ins.aux)];
+                if (pk.tag != .heap_ref or pk.heapType() != .string) return false;
+                if (ins.ty != .int) return false;
+                kinds[i] = .int;
+            },
+            // scap_int / scap_str: scratch-slot projections off a match token
+            // (a = the smatch/sgmatch status result, kind .int — kept only
+            // for SSA ordering; the lowering reads the BAKED scratch address,
+            // never the operand home). b = the slot immediate (bounds pinned
+            // by assertWellFormed; re-checked — never trust the IR).
+            .scap_int => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .int) return false;
+                if (ins.b >= gc.MatchScratch.n_slots) return false;
+                if (ins.ty != .int) return false;
+                kinds[i] = .int;
+            },
+            .scap_str => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .int) return false;
+                if (ins.b >= gc.MatchScratch.n_slots) return false;
+                if (ins.ty != .heap) return false;
+                kinds[i] = .heap;
+                is_string[i] = true;
+            },
+            // str2num_i/_f: `tonumber` on a heap operand via the ONE
+            // arith.toNumber core. `.heap` (not is_string) deliberately: the
+            // hot shape is `tonumber(t[i])` — a VALUE_LANE aload result with
+            // no static string proof — and the core TYPE-CHECKS internally
+            // (a non-string heap value → nil → status −1 → side-exit), so
+            // admitting any proven-heap operand is sound. The recorder baked
+            // the OBSERVED kind; a runtime kind mismatch likewise side-exits.
+            .str2num_i => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .heap) return false;
+                if (ins.ty != .int) return false;
+                kinds[i] = .int;
+            },
+            .str2num_f => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .heap) return false;
+                if (ins.ty != .float) return false;
+                kinds[i] = .float;
+            },
+            // sgm_setpos: the deferred gmatch-cursor commit — value-less
+            // effect, sunk below every guard by construction (doc 30 §6).
+            // a = the state table, b = the new pos (int).
+            .sgm_setpos => {
+                if (ins.a >= i or ins.b >= i) return false;
+                if (kinds[ins.a] != .ptr and kinds[ins.a] != .heap) return false;
+                if (kinds[ins.b] != .int) return false;
+                kinds[i] = .none;
+            },
+            // guard_sid: interned-identity pin against a konst-pool string
+            // (doc 30 §2a) — the body-guard analogue of guard_string that
+            // ALSO proves the exact string, so it upgrades `is_string` on
+            // its operand (the dominating proof smatch/sfindp aux needs).
+            .guard_sid => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .heap) return false;
+                if (ins.aux < 0 or ins.aux >= t.consts.len) return false;
+                const sk = t.consts[@intCast(ins.aux)];
+                if (sk.tag != .heap_ref or sk.heapType() != .string) return false;
+                is_string[ins.a] = true;
+                kinds[i] = .none;
             },
             // Doc 24 D3: the allocation-budget entry guard. Value-less; lowered
             // to two loads of the baked heap counters + the gc_stress byte test.
@@ -2439,6 +2544,19 @@ fn opMayExitInBody(
         .supper,
         .slower,
         .scp,
+        // Doc 30: the match callouts exit on a negative status (sfindp also
+        // on 0 — matched index is ≥ 1); scap_str on null (OOM); str2num_* on
+        // a kind mismatch / non-number; sgm_setpos on bad_layout; guard_sid
+        // is a body identity guard. scap_int is the one exit-FREE member
+        // (a baked scratch load) and is deliberately absent.
+        .sfindp,
+        .smatch,
+        .sgmatch,
+        .scap_str,
+        .str2num_i,
+        .str2num_f,
+        .sgm_setpos,
+        .guard_sid,
         => true,
         // Doc 25: only the INT lane exits (a zero divisor side-exits so
         // tier-0 raises DivisionByZero; the (minInt, -1) pair is computed
@@ -2539,6 +2657,30 @@ const BodyCallout = enum {
     /// Allocates NOTHING (the one non-allocating stralloc shim); −1 sentinel
     /// for the empty range (never a real codepoint — scalars are 0…0x10FFFF).
     scp,
+    /// `stralloc.sfindpRuntime` (doc 30): plain-substring find — a pure
+    /// (s, init, pat) → i64 reader. Allocates nothing, heap-free.
+    sfindp,
+    /// `stralloc.smatchRuntime` (doc 30): locate + scratch fill for
+    /// find/match. Writes only the heap's `match_scratch` (host scratch,
+    /// never GC state) — **may_allocate = false, may_collect = false**.
+    smatch,
+    /// `stralloc.sgmatchRuntime` (doc 30 §6): one composite gmatch-iterator
+    /// step — READ-ONLY on the state table plus a `match_scratch` fill.
+    /// Same non-allocating profile as `smatch`.
+    sgmatch,
+    /// `stralloc.scapStrRuntime` (doc 30): interns the span in a scratch
+    /// slot. **may_allocate = true** (at most ONE `Heap.link` — the D5 audit
+    /// rule; an intern hit links zero), **may_collect = false** (single
+    /// collect site: tier-0's dispatch prologue).
+    scap_str,
+    /// `stralloc.str2numRuntime` (doc 30): `tonumber` on a string via the
+    /// ONE `arith.toNumber` core — pure `*String` → {status, bits};
+    /// allocates nothing.
+    str2num,
+    /// `stralloc.sgmSetposRuntime` (doc 30 §6): the deferred gmatch-cursor
+    /// commit — one in-lane int-over-int cell write (no GC barrier needed);
+    /// allocates nothing.
+    sgm_setpos,
 };
 
 /// The doc-22 capability, renamed for the doc-24 may_allocate/may_collect
@@ -2555,6 +2697,10 @@ fn calloutMayCollect(c: BodyCallout) bool {
         .tostr_int, .tostr_num => false,
         .ssub, .srev, .schar1, .srep2 => false,
         .supper, .slower, .scp => false,
+        // Doc 30: the matchers/projection/parse/commit shims never reach
+        // `Vm.collect` — scapStr's intern merely ALLOCATES (≤1 link, budgeted
+        // by guard_gc); the rest touch only host scratch / one table cell.
+        .sfindp, .smatch, .sgmatch, .scap_str, .str2num, .sgm_setpos => false,
     };
 }
 
@@ -2585,6 +2731,14 @@ fn bodyCalloutOf(
         .slower => .slower,
         .scp => .scp,
         .srep2 => .srep2,
+        // Doc 30. scap_int is NOT here: it lowers to a baked absolute load,
+        // no call, so it needs no save area and invalidates nothing.
+        .sfindp => .sfindp,
+        .smatch => .smatch,
+        .sgmatch => .sgmatch,
+        .scap_str => .scap_str,
+        .str2num_i, .str2num_f => .str2num,
+        .sgm_setpos => .sgm_setpos,
         else => null,
     };
 }
@@ -2817,6 +2971,10 @@ fn isTransient(op: trace.IrOp) bool {
         // doc 26: the case producers materialize their `*GcHeader` in a GP
         // home like the snew class; scp its scalar codepoint int.
         .supper, .slower, .scp => true,
+        // doc 30: the match/parse class materialize their status / index /
+        // scratch word / `*GcHeader` / parsed number in a home. sgm_setpos
+        // and guard_sid are value-less effects/guards — NOT here.
+        .sfindp, .smatch, .sgmatch, .scap_int, .scap_str, .str2num_i, .str2num_f => true,
         // href materializes the seeded cell pointer in a register (like aref); hload
         // materializes the decoded scalar field value. hstore/guard_hash are effects.
         .href, .hload => true,
@@ -2873,6 +3031,17 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
         // like ssub's. supper/slower read only their string (a), like srev.
         .ssub, .srep2, .scp => .{ .a = true, .b = true },
         .srev, .schar1, .guard_string, .supper, .slower => .{ .a = true, .b = false },
+        // doc 30: sfindp/smatch read string (a) + init (b) — their pattern
+        // ref rides `aux` (the ssub encoding), extended in `analyzeInner`.
+        // sgm_setpos stages state (a) + pos (b) into arg registers. sgmatch,
+        // str2num_* and guard_sid read their sole ref (a) — sgmatch's aux is
+        // a konst-pool IMMEDIATE, baked at emission, never a ref. The scap
+        // projections read NEITHER operand: the lowering reads the BAKED
+        // `match_scratch` address (a is only the SSA-ordering token, b the
+        // slot immediate) — the href precedent.
+        .sfindp, .smatch, .sgm_setpos => .{ .a = true, .b = true },
+        .sgmatch, .str2num_i, .str2num_f, .guard_sid => .{ .a = true, .b = false },
+        .scap_int, .scap_str => .{ .a = false, .b = false },
         // guard_fits reads the value it range-checks (a); guard_append reads the aref
         // token (a) and reaches len/cap/hash through aref.a — no second operand.
         .guard_fits, .guard_append => .{ .a = true, .b = false },
@@ -3231,7 +3400,9 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         // cannot express. Extend its liveness here, exactly as the dyn-href
         // root above, so the end index survives to the callout's staging
         // (ssub → rcx, scp → rdx).
-        if (ins.op == .ssub or ins.op == .scp) {
+        if (ins.op == .ssub or ins.op == .scp or ins.op == .sfindp or ins.op == .smatch) {
+            // Doc 30: sfindp/smatch join the ternary club — their PATTERN
+            // ref rides `aux` and must survive to the callout staging.
             const ar: usize = @intCast(ins.aux);
             if (last_use[ar] < i) last_use[ar] = @intCast(i);
         }
@@ -5020,6 +5191,199 @@ fn emitScpCallout(
     try regToPlace(a, placeOfRef(alloc, i), .rcx);
 }
 
+/// Emit the mid-body callout for a doc 30 match op (`sfindp`/`smatch`/
+/// `sgmatch`) — the status-result class. One emitter for the three because
+/// they share the whole protocol and differ only in arg staging and the
+/// success predicate: save, SysV args, call the shared noinline `stralloc`
+/// shim (the SAME core every tier runs — P3), stash the i64 result across the
+/// restore in rcx (scratch, never a home), then test-and-exit:
+///
+/// - `sfindp(s, init, pat)` — heap-FREE. Success is a 1-based char index
+///   ≥ 1; every failure status is negative and 0 is never returned, so
+///   `result ≤ 0 → exit` (full-width signed — `cmp r64, imm32`).
+/// - `smatch(heap, s, init, pat)` — fills `heap.match_scratch`. Success is
+///   exactly 0 (`≠ 0 → exit`; positives are never returned).
+/// - `sgmatch(heap, state, expected_pat)` — one composite gmatch-iterator
+///   step, read-only on the state. `expected_pat` is the record-time pattern
+///   konst (`t.consts[aux]`), resolved HERE at emission to a baked
+///   `*GcHeader` (stable: non-moving GC, consts rooted by the trace) — the
+///   shim's identity check replaces `guard_sid` on this path (round-2 B02).
+///   Success is exactly 0; a no-match end-of-iteration is a negative status
+///   → side-exit, and tier-0's replay produces the loop-ending nil itself.
+///
+/// Every negative status (doc 30 M03: no_match, malformed, …, bad_init)
+/// side-exits with a CLEAN id stream — none of the three shims links — and
+/// tier-0 replays the iteration, re-raising any matcher error itself at the
+/// same logical point.
+///
+/// Operand staging is hazard-free in any order: homes are r8–r11 / rbp /
+/// r12–r15 / rsp-relative spills — never the arg registers — and the save
+/// wrote rdi/rsi/rdx to the frame already. rcx doubles as smatch's fourth
+/// arg AND the result stash (the ssub precedent): the call consumes the arg
+/// before the stash is written.
+fn emitMatchCallout(
+    a: *x64.Assembler,
+    alloc: *const Alloc,
+    t: *const Trace,
+    heap: ?*gc.Heap,
+    ins: trace.IrInstr,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
+    try emitCalloutSave(a, alloc);
+
+    switch (ins.op) {
+        // sfindpRuntime(s, init, pat): heap-free three-arg shape.
+        .sfindp => {
+            try placeToReg(a, .rdi, placeOfRef(alloc, ins.a));
+            try placeToReg(a, .rsi, placeOfRef(alloc, ins.b));
+            try placeToReg(a, .rdx, placeOfRef(alloc, @intCast(ins.aux)));
+        },
+        // smatchRuntime(heap, s, init, pat): heap first, pattern in rcx.
+        .smatch => {
+            try placeToReg(a, .rsi, placeOfRef(alloc, ins.a));
+            try placeToReg(a, .rdx, placeOfRef(alloc, ins.b));
+            try placeToReg(a, .rcx, placeOfRef(alloc, @intCast(ins.aux)));
+            try a.movRegImm64(.rdi, @bitCast(@as(u64, @intFromPtr(heap.?))));
+        },
+        // sgmatchRuntime(heap, state, expected_pat): the pattern is baked.
+        .sgmatch => {
+            try placeToReg(a, .rsi, placeOfRef(alloc, ins.a));
+            const pat = t.consts[@intCast(ins.aux)].asHeap();
+            try a.movRegImm64(.rdx, @bitCast(@as(u64, @intFromPtr(pat))));
+            try a.movRegImm64(.rdi, @bitCast(@as(u64, @intFromPtr(heap.?))));
+        },
+        else => unreachable,
+    }
+
+    const body: usize = switch (ins.op) {
+        .sfindp => @intFromPtr(&stralloc.sfindpRuntime),
+        .smatch => @intFromPtr(&stralloc.smatchRuntime),
+        .sgmatch => @intFromPtr(&stralloc.sgmatchRuntime),
+        else => unreachable,
+    };
+    try a.subRegImm32(.rsp, 8);
+    try a.movRegImm64(.rax, @bitCast(body));
+    try a.callReg(.rax);
+    try a.addRegImm32(.rsp, 8);
+
+    // The result check must come AFTER the restore (the deopt flush relies on
+    // slot homes being correct), so stash the status in rcx.
+    try a.movRegReg(.rcx, .rax);
+    try emitCalloutRestore(a, alloc);
+    try a.cmpRegImm32(.rcx, 0);
+    if (ins.op == .sfindp)
+        try jccNativeExit(a, exit_labels, i, .le) // ≤ 0 → side-exit
+    else
+        try jccNativeExit(a, exit_labels, i, .ne); // ≠ 0 → side-exit
+    try regToPlace(a, placeOfRef(alloc, i), .rcx);
+}
+
+/// Emit the mid-body callout for `scap_str` (doc 30): intern the span in
+/// scratch slot `ins.b`. The snew protocol verbatim — save, args (rdi = the
+/// baked `*Heap`, rsi = the slot IMMEDIATE), call `scapStrRuntime`, stash the
+/// `*GcHeader` across the restore, null → side-exit (OOM; no `Heap.link`
+/// preceded the failure, so the id stream is clean and tier-0 re-hits the
+/// same OOM on replay). Emitted even when the capture is dead (B02: `.alloc`
+/// ops execute for id-stream fidelity — tropt never DCEs it).
+fn emitScapStrCallout(
+    a: *x64.Assembler,
+    alloc: *const Alloc,
+    heap: *gc.Heap,
+    ins: trace.IrInstr,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
+    try emitCalloutSave(a, alloc);
+
+    try a.movRegImm64(.rsi, @as(i64, ins.b));
+    try a.movRegImm64(.rdi, @bitCast(@as(u64, @intFromPtr(heap))));
+
+    try a.subRegImm32(.rsp, 8);
+    try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&stralloc.scapStrRuntime))));
+    try a.callReg(.rax);
+    try a.addRegImm32(.rsp, 8);
+
+    try a.movRegReg(.rcx, .rax);
+    try emitCalloutRestore(a, alloc);
+    try a.cmpRegImm32(.rcx, 0);
+    try jccNativeExit(a, exit_labels, i, .e); // null → side-exit (OOM)
+    try regToPlace(a, placeOfRef(alloc, i), .rcx);
+}
+
+/// Emit the mid-body callout for `str2num_i`/`str2num_f` (doc 30): the ONE
+/// `arith.toNumber` core on a proven-string operand. `str2numRuntime` returns
+/// the two-eightbyte `Str2NumResult` in rax (status) : rdx (raw value bits) —
+/// SysV small-struct return. Both must survive the restore, and the restore
+/// overwrites rdx (the parked `*NativeResult`), so the stash is: status →
+/// rcx, value bits → rax (neither is touched by the restore). The recorder
+/// baked the OBSERVED kind into the op — status ≠ expected (wrong kind, or
+/// −1 = not a number) side-exits, and tier-0's replay produces the other
+/// kind / the nil / the raise itself. Heap-free, pure, no id-stream impact.
+fn emitStr2NumCallout(
+    a: *x64.Assembler,
+    alloc: *const Alloc,
+    ins: trace.IrInstr,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
+    try emitCalloutSave(a, alloc);
+
+    try placeToReg(a, .rdi, placeOfRef(alloc, ins.a));
+
+    try a.subRegImm32(.rsp, 8);
+    try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&stralloc.str2numRuntime))));
+    try a.callReg(.rax);
+    try a.addRegImm32(.rsp, 8);
+
+    try a.movRegReg(.rcx, .rax); // status
+    try a.movRegReg(.rax, .rdx); // raw value bits
+    try emitCalloutRestore(a, alloc);
+    const expected: i32 = if (ins.op == .str2num_i) 0 else 1;
+    try a.cmpRegImm32(.rcx, expected);
+    try jccNativeExit(a, exit_labels, i, .ne); // kind mismatch / non-number → exit
+    // Home the value: int → GP/spill via the shared path; float → the raw
+    // f64 bits movq into the XMM home (or a raw 8-byte spill store — bits
+    // are bits). A float result never homes in a GP register.
+    if (ins.op == .str2num_i) {
+        try regToPlace(a, placeOfRef(alloc, i), .rax);
+    } else switch (placeOfRef(alloc, i)) {
+        .xmm => |x| try a.movqXmmReg(x, .rax),
+        .mem => |d| try a.movMemReg(.rsp, d, .rax),
+        .reg => unreachable,
+    }
+}
+
+/// Emit the mid-body callout for `sgm_setpos` (doc 30 §6): commit the gmatch
+/// cursor into the state's slot 3 — the deferred store, sunk below every
+/// guard, so reaching it means the iteration is committed. `sgmSetposRuntime`
+/// re-verifies the B03 cell shape (in-lane `.value` int cell) and writes an
+/// int over an int — no GC barrier, no allocation. 0 = written; a negative
+/// status (bad_layout — the shape raced away) side-exits with NOTHING
+/// written, and tier-0 replays the whole iteration. Value-less: no home.
+fn emitSgmSetposCallout(
+    a: *x64.Assembler,
+    alloc: *const Alloc,
+    ins: trace.IrInstr,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
+    try emitCalloutSave(a, alloc);
+
+    try placeToReg(a, .rdi, placeOfRef(alloc, ins.a));
+    try placeToReg(a, .rsi, placeOfRef(alloc, ins.b));
+
+    try a.subRegImm32(.rsp, 8);
+    try a.movRegImm64(.rax, @bitCast(@as(u64, @intFromPtr(&stralloc.sgmSetposRuntime))));
+    try a.callReg(.rax);
+    try a.addRegImm32(.rsp, 8);
+
+    try a.movRegReg(.rcx, .rax);
+    try emitCalloutRestore(a, alloc);
+    try a.cmpRegImm32(.rcx, 0);
+    try jccNativeExit(a, exit_labels, i, .ne); // bad_layout → side-exit
+}
+
 /// Emit the per-iteration hash-cell resolution call-out for a `.heap`-rooted href.
 /// The sequence saves all live caller-saved homes (rdi/rsi SoA bases + GP + XMM)
 /// into the pre-reserved frame area, sets up SysV ABI arguments, calls
@@ -5725,6 +6089,38 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // reader. No heap arg; −1 sentinel → side-exit (tier-0 replays
             // the call to its nil result).
             .scp => try emitScpCallout(a, alloc, ins, i, exit_labels),
+            // --- doc 30: the pattern/str2num callout class -------------------
+            // (compileImpl bailed heapless traces containing the heap-needing
+            // members, so `heap.?` cannot trip for smatch/sgmatch/scap_*.)
+            .sfindp, .smatch, .sgmatch => try emitMatchCallout(a, alloc, t, heap, ins, i, exit_labels),
+            .scap_str => try emitScapStrCallout(a, alloc, heap.?, ins, i, exit_labels),
+            .str2num_i, .str2num_f => try emitStr2NumCallout(a, alloc, ins, i, exit_labels),
+            .sgm_setpos => try emitSgmSetposCallout(a, alloc, ins, i, exit_labels),
+            // scap_int: ONE baked absolute load of the int cell (word 2b) in
+            // the heap's `match_scratch` — the guard_gc counter-load
+            // discipline (the Heap lives at a stable address for the VM's
+            // lifetime; compileImpl bailed without one). No call, no save
+            // area, no exit — the dominating smatch/sgmatch status check
+            // already proved the scratch is this iteration's fill.
+            .scap_int => {
+                const h = heap.?;
+                const addr = @intFromPtr(&h.match_scratch.words[2 * @as(usize, ins.b)]);
+                try a.movRegImm64(.rax, @bitCast(@as(u64, addr)));
+                try a.movRegMem(.rax, .rax, 0);
+                try regToPlace(a, placeOfRef(alloc, i), .rax);
+            },
+            // guard_sid (doc 30 §2a): interned-identity pin — equal bytes ⇔
+            // same object within a heap, so one raw pointer compare against
+            // the baked konst-pool string (stable: non-moving GC, consts
+            // rooted by the trace) proves the operand IS the record-time
+            // pattern. Mismatch → ordinary side-exit.
+            .guard_sid => {
+                try placeToReg(a, .rax, placeOfRef(alloc, ins.a));
+                const expected = t.consts[@intCast(ins.aux)].asHeap();
+                try a.movRegImm64(.rcx, @bitCast(@as(u64, @intFromPtr(expected))));
+                try a.cmpRegReg(.rax, .rcx);
+                try jccNativeExit(a, exit_labels, i, .ne);
+            },
             // Doc 24 D4: `#s` of a proven string — one load of the cached
             // `cp_len` (a usize field; every real string's count fits i63).
             .slen => {

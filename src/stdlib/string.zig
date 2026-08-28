@@ -1373,10 +1373,20 @@ pub fn sgmatchCore(heap: *gc.Heap, state: *Table, expected_pat: *const String) i
 pub fn scapStrCore(heap: *gc.Heap, slot: usize) ?*String {
     std.debug.assert(slot < gc.MatchScratch.n_slots);
     const sc = &heap.match_scratch;
+    // Defense in depth (doc 30 c3): a legitimately recorded trace's scap
+    // always follows a status-checked smatch/sgmatch in the SAME iteration,
+    // so the scratch is this fill's. But "never trust the IR" — a hand-built
+    // or corrupted trace could project from virgin scratch (subj == 0) or a
+    // slot the latest fill didn't touch (a stale span against a shorter
+    // subject). Both collapse to the null side-exit arm: no link happened,
+    // the id stream is clean, tier-0 replays the iteration and produces the
+    // real value (or raise) itself.
+    if (sc.subj == 0) return null;
     const sobj: *const String = @ptrFromInt(sc.subj);
     const init: usize = @intCast(sc.words[2 * slot]);
     const len: usize = @intCast(sc.words[2 * slot + 1]);
     const b = sobj.bytes();
+    if (init > b.len or len > b.len - init) return null;
     return heap.intern(b[init .. init + len]) catch null;
 }
 

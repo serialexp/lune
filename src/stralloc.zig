@@ -190,6 +190,11 @@ pub noinline fn scapStrRuntime(heap: *gc.Heap, slot: i64) callconv(.c) ?*object.
 /// the deferred store, sunk below every guard (doc 30 §6). Re-verifies the
 /// B03 cell shape; 0 = written, negative = side-exit (nothing written).
 pub noinline fn sgmSetposRuntime(state: *object.GcHeader, pos: i64) callconv(.c) i64 {
+    // Type-check INSIDE the shim (doc 30 c3): the native path proves only
+    // `.heap`/`.ptr` on the state operand, so `Table.fromHeader` on a
+    // non-table would be UB — fail closed with bad_type instead (nothing
+    // written; tier-0 replays).
+    if (Value.heap(state).heapType() != .table) return string_std.MatchStatus.bad_type;
     const t = table_mod.Table.fromHeader(state);
     return if (t.setInLaneValueInt(3, pos)) string_std.MatchStatus.ok else string_std.MatchStatus.bad_layout;
 }

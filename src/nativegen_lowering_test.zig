@@ -2278,3 +2278,490 @@ test "doc 26 (review M5): malformed result-ty stamps fail closed — new ops AND
         c3.deinit();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Doc 30 c3 — the pattern/str2num callout class, native lowering.
+// ---------------------------------------------------------------------------
+
+/// The doc-30 smatch flagship: `st, en = locate(s, "%d+", pos); acc += st;
+/// pos = en + 1` — find/match's guarded-callout shape with both char-index
+/// projections live. regs: r0=pos, r1=acc, r2=s. The pattern is a HEAP KONST
+/// (instr 6) — the first native trace to materialize a string konst as a
+/// first-class `.heap` value (baked pointer bits).
+fn smatchSlideTrace(consts: []Value) Trace {
+    const instrs = struct {
+        var arr = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: pos
+            .{ .op = .slot_load, .aux = 1 }, // 1: acc
+            .{ .op = .guard_int, .a = 0 }, // 2
+            .{ .op = .guard_int, .a = 1 }, // 3
+            .{ .op = .slot_load, .aux = 2 }, // 4: s
+            .{ .op = .guard_string, .a = 4 }, // 5
+            .{ .op = .konst, .aux = 1 }, // 6: the pattern (heap konst)
+            .{ .op = .smatch, .a = 4, .b = 0, .aux = 6, .ty = .int }, // 7: status; no_match → exit
+            .{ .op = .scap_int, .a = 7, .b = 0, .ty = .int }, // 8: slot_start (1-based char)
+            .{ .op = .scap_int, .a = 7, .b = 1, .ty = .int }, // 9: slot_end
+            .{ .op = .add, .a = 1, .b = 8 }, // 10: acc + start
+            .{ .op = .konst, .aux = 0 }, // 11: 1
+            .{ .op = .add, .a = 9, .b = 11 }, // 12: end + 1
+            .{ .op = .phi, .b = 10, .aux = 1 },
+            .{ .op = .phi, .b = 12, .aux = 0 },
+            .{ .op = .loop },
+        };
+    };
+    const es = struct {
+        var arr = [_]u16{};
+    };
+    return Trace{ .anchor = undefined, .instrs = &instrs.arr, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
+}
+
+test "doc 30 c3: smatch + scap_int — tier parity, char-index projections, no_match exit, zero allocations" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    // "a1b22c333" with %d+: matches at char spans (2,2), (4,5), (7,9); the
+    // 4th probe (pos=10, one past the end) is no_match → side-exit at the
+    // smatch. acc = 2+4+7 = 13; pos ends at 10.
+    const subject = "a1b22c333";
+    const patsrc = "%d+";
+
+    var iheap = gc.Heap.init(gpa);
+    defer iheap.deinit();
+    const isubj = try iheap.intern(subject);
+    const ipat = try iheap.intern(patsrc);
+    var iconsts = [_]Value{ Value.int(1), Value.heap(&ipat.header) };
+    const ti = smatchSlideTrace(&iconsts);
+    const regs_init_i = [_]Value{ Value.int(1), Value.int(0), Value.heap(&isubj.header) };
+    const iobjs_before = iheap.object_count;
+    var iregs = regs_init_i;
+    const values = try gpa.alloc(Value, ti.instrs.len);
+    defer gpa.free(values);
+    const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &ti, &iregs, values);
+    try testing.expectEqual(@as(usize, 3), iresult.completed);
+    try testing.expectEqual(@as(u32, 7), iresult.exit_instr);
+    try testing.expectEqual(Value.int(13).payload.bits, iregs[1].payload.bits);
+    try testing.expectEqual(Value.int(10).payload.bits, iregs[0].payload.bits);
+    // The matcher + int projections allocate NOTHING.
+    try testing.expectEqual(iobjs_before, iheap.object_count);
+
+    // Native: fresh heap, own interned copies, same instrs.
+    var nheap = gc.Heap.init(gpa);
+    defer nheap.deinit();
+    const nsubj = try nheap.intern(subject);
+    const npat = try nheap.intern(patsrc);
+    var nconsts = [_]Value{ Value.int(1), Value.heap(&npat.header) };
+    const tn = smatchSlideTrace(&nconsts);
+    const nobjs_before = nheap.object_count;
+    var ct = nativegen.compileWithHeap(gpa, &tn, &nheap) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    var nregs = [_]Value{ Value.int(1), Value.int(0), Value.heap(&nsubj.header) };
+    const nresult = try util.runNative(ct, &nregs);
+    try testing.expectEqual(iresult.completed, nresult.completed);
+    try testing.expectEqual(iresult.exit_instr, nresult.exit_instr);
+    try testing.expectEqual(iregs[0].payload.bits, nregs[0].payload.bits);
+    try testing.expectEqual(iregs[1].payload.bits, nregs[1].payload.bits);
+    try testing.expectEqual(nobjs_before, nheap.object_count);
+
+    // Fail closed with NO heap: smatch bakes/fills `match_scratch`, so the
+    // compiler declines the trace without one (unlike sfindp below).
+    {
+        var arena = McodeArena.init(gpa);
+        defer arena.deinit();
+        try testing.expect(compileInto(gpa, &arena, &tn, null, null) == null);
+    }
+}
+
+/// The doc-30 sfindp shape: `idx = plainfind(s, "ab", pos); acc += idx;
+/// pos = idx + 1` — heap-free, like scp.
+fn sfindpSlideTrace(consts: []Value) Trace {
+    const instrs = struct {
+        var arr = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: pos
+            .{ .op = .slot_load, .aux = 1 }, // 1: acc
+            .{ .op = .guard_int, .a = 0 }, // 2
+            .{ .op = .guard_int, .a = 1 }, // 3
+            .{ .op = .slot_load, .aux = 2 }, // 4: s
+            .{ .op = .guard_string, .a = 4 }, // 5
+            .{ .op = .konst, .aux = 1 }, // 6: the needle (heap konst)
+            .{ .op = .sfindp, .a = 4, .b = 0, .aux = 6, .ty = .int }, // 7: idx ≥ 1; ≤ 0 → exit
+            .{ .op = .add, .a = 1, .b = 7 }, // 8: acc + idx
+            .{ .op = .konst, .aux = 0 }, // 9: 1
+            .{ .op = .add, .a = 7, .b = 9 }, // 10: idx + 1
+            .{ .op = .phi, .b = 8, .aux = 1 },
+            .{ .op = .phi, .b = 10, .aux = 0 },
+            .{ .op = .loop },
+        };
+    };
+    const es = struct {
+        var arr = [_]u16{};
+    };
+    return Trace{ .anchor = undefined, .instrs = &instrs.arr, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
+}
+
+test "doc 30 c3: sfindp — tier parity, heap-FREE compile, no_match exit" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    // "xabyabzab" needles at char indices 2, 5, 8; the 4th probe (pos=9)
+    // finds nothing → no_match (negative) → side-exit. acc = 15, pos = 9.
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    const subj = try heap.intern("xabyabzab");
+    const pat = try heap.intern("ab");
+    var consts = [_]Value{ Value.int(1), Value.heap(&pat.header) };
+    const t = sfindpSlideTrace(&consts);
+    const regs_init = [_]Value{ Value.int(1), Value.int(0), Value.heap(&subj.header) };
+    const objs_before = heap.object_count;
+
+    var iregs = regs_init;
+    const values = try gpa.alloc(Value, t.instrs.len);
+    defer gpa.free(values);
+    const iresult = irinterp.executeValuesCtx(.{ .heap = null }, &t, &iregs, values);
+    try testing.expectEqual(@as(usize, 3), iresult.completed);
+    try testing.expectEqual(@as(u32, 7), iresult.exit_instr);
+    try testing.expectEqual(Value.int(15).payload.bits, iregs[1].payload.bits);
+    try testing.expectEqual(Value.int(9).payload.bits, iregs[0].payload.bits);
+
+    // Native WITHOUT a heap: sfindp is the heap-free member of the class (the
+    // scp precedent) — the trace must compile with heap == null; the string
+    // konst is a baked pointer, no heap involved.
+    var ct = nativegen.compile(gpa, &t) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    var nregs = regs_init;
+    const nresult = try util.runNative(ct, &nregs);
+    try testing.expectEqual(iresult.completed, nresult.completed);
+    try testing.expectEqual(iresult.exit_instr, nresult.exit_instr);
+    try util.expectRegsEqual(&iregs, &nregs);
+    try testing.expectEqual(objs_before, heap.object_count);
+}
+
+/// Build a gmatch iterator state table (the c1 layout: [1]=subject,
+/// [2]=pattern, [3]=byte pos — an in-lane `.value` int cell).
+fn gmatchStateTable(heap: *gc.Heap, subj: *object.GcHeader, pat: *object.GcHeader, pos: i64) !*table.Table {
+    const t = try heap.newTable();
+    try t.set(testing.allocator, Value.int(1), Value.heap(subj));
+    try t.set(testing.allocator, Value.int(2), Value.heap(pat));
+    try t.set(testing.allocator, Value.int(3), Value.int(pos));
+    return t;
+}
+
+/// The doc-30 gmatch composite: `w = step(state); acc += next_pos;
+/// commit(state, next_pos)` — sgmatch + scap_str (the produced match string,
+/// slot_whole) + scap_int (next_pos) + the DEFERRED sgm_setpos below every
+/// guard. regs: r0=state, r1=acc. The expected pattern is consts[1], named by
+/// sgmatch's aux as a konst-pool ID (an immediate, baked at emission).
+fn gmatchStepTrace(consts: []Value) Trace {
+    const instrs = struct {
+        var arr = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: state
+            .{ .op = .guard_table, .a = 0 }, // 1: invariant table pin → .ptr
+            .{ .op = .slot_load, .aux = 1 }, // 2: acc
+            .{ .op = .guard_int, .a = 2 }, // 3
+            .{ .op = .sgmatch, .a = 0, .aux = 1, .ty = .int }, // 4: status; exhausted → exit
+            .{ .op = .scap_str, .a = 4, .b = 2, .ty = .heap }, // 5: the whole-match string (slot_whole)
+            .{ .op = .scap_int, .a = 4, .b = 35, .ty = .int }, // 6: next_pos (slot 35)
+            .{ .op = .sgm_setpos, .a = 0, .b = 6 }, // 7: the deferred cursor commit
+            .{ .op = .add, .a = 2, .b = 6 }, // 8: acc + next_pos
+            .{ .op = .phi, .b = 8, .aux = 1 },
+            .{ .op = .loop },
+        };
+    };
+    const es = struct {
+        var arr = [_]u16{};
+    };
+    return Trace{ .anchor = undefined, .instrs = &instrs.arr, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
+}
+
+test "doc 30 c3: sgmatch + scap_str + sgm_setpos — tier parity, cursor commit, allocation parity, exhaustion exit" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    // "ab cd ef" with %a+: three steps ("ab" np=2, "cd" np=5, "ef" np=8),
+    // then exhaustion → side-exit at the sgmatch. acc = 2+5+8 = 15; the
+    // state's pos cell ends at 8 (committed by the LAST completed
+    // iteration's sgm_setpos — the failing step commits nothing).
+    const subject = "ab cd ef";
+    const patsrc = "%a+";
+
+    var iheap = gc.Heap.init(gpa);
+    defer iheap.deinit();
+    const isubj = try iheap.intern(subject);
+    const ipat = try iheap.intern(patsrc);
+    const istate = try gmatchStateTable(&iheap, &isubj.header, &ipat.header, 0);
+    var iconsts = [_]Value{ Value.int(1), Value.heap(&ipat.header) };
+    const ti = gmatchStepTrace(&iconsts);
+    const iobjs_before = iheap.object_count;
+    var iregs = [_]Value{ Value.heap(&istate.header), Value.int(0) };
+    const values = try gpa.alloc(Value, ti.instrs.len);
+    defer gpa.free(values);
+    const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &ti, &iregs, values);
+    try testing.expectEqual(@as(usize, 3), iresult.completed);
+    try testing.expectEqual(@as(u32, 4), iresult.exit_instr);
+    try testing.expectEqual(Value.int(15).payload.bits, iregs[1].payload.bits);
+    try testing.expectEqual(@as(i64, 8), istate.inLaneValueIntCell(3).?);
+    const iallocs = iheap.object_count - iobjs_before;
+    // The three whole-match strings were interned (B02: scap_str executes).
+    try testing.expect(iheap.internedLookup("cd") != null);
+    try testing.expect(iallocs > 0);
+
+    // Native: fresh heap, own state.
+    var nheap = gc.Heap.init(gpa);
+    defer nheap.deinit();
+    const nsubj = try nheap.intern(subject);
+    const npat = try nheap.intern(patsrc);
+    const nstate = try gmatchStateTable(&nheap, &nsubj.header, &npat.header, 0);
+    var nconsts = [_]Value{ Value.int(1), Value.heap(&npat.header) };
+    const tn = gmatchStepTrace(&nconsts);
+    const nobjs_before = nheap.object_count;
+    var ct = nativegen.compileWithHeap(gpa, &tn, &nheap) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    var nregs = [_]Value{ Value.heap(&nstate.header), Value.int(0) };
+    const nresult = try util.runNative(ct, &nregs);
+    try testing.expectEqual(iresult.completed, nresult.completed);
+    try testing.expectEqual(iresult.exit_instr, nresult.exit_instr);
+    try testing.expectEqual(iregs[1].payload.bits, nregs[1].payload.bits);
+    try testing.expectEqual(@as(i64, 8), nstate.inLaneValueIntCell(3).?);
+    // Same allocation count — the D2 id-stream claim for the gmatch step.
+    try testing.expectEqual(iallocs, nheap.object_count - nobjs_before);
+    try testing.expect(nheap.internedLookup("cd") != null);
+}
+
+/// The doc-30 guard_sid shape: a counted loop whose body identity-pins a
+/// string slot against a konst-pool string. regs: r0=i, r1=limit, r2=s.
+fn guardSidTrace(consts: []Value) Trace {
+    const instrs = struct {
+        var arr = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: i
+            .{ .op = .slot_load, .aux = 1 }, // 1: limit
+            .{ .op = .guard_int, .a = 0 }, // 2
+            .{ .op = .guard_int, .a = 1 }, // 3
+            .{ .op = .lt, .a = 0, .b = 1 }, // 4
+            .{ .op = .guard_true, .a = 4 }, // 5
+            .{ .op = .slot_load, .aux = 2 }, // 6: s
+            .{ .op = .guard_string, .a = 6 }, // 7: prologue TYPE pin
+            .{ .op = .guard_sid, .a = 6, .aux = 1 }, // 8: body IDENTITY pin
+            .{ .op = .konst, .aux = 0 }, // 9: 1
+            .{ .op = .add, .a = 0, .b = 9 }, // 10
+            .{ .op = .phi, .b = 10, .aux = 0 },
+            .{ .op = .loop },
+        };
+    };
+    const es = struct {
+        var arr = [_]u16{};
+    };
+    return Trace{ .anchor = undefined, .instrs = &instrs.arr, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
+}
+
+test "doc 30 c3: guard_sid — identity pass loops, identity mismatch exits at the guard, tier parity" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    const expected = try heap.intern("%d+");
+    const other = try heap.intern("%a+"); // same TYPE, different identity
+    var consts = [_]Value{ Value.int(1), Value.heap(&expected.header) };
+    const t = guardSidTrace(&consts);
+    const values = try gpa.alloc(Value, t.instrs.len);
+    defer gpa.free(values);
+
+    // Heap-free like sfindp: the pin is a baked pointer compare.
+    var ct = nativegen.compile(gpa, &t) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+
+    // (a) Identity HOLDS: the loop runs to its counter exit (guard_true).
+    {
+        const regs_init = [_]Value{ Value.int(1), Value.int(4), Value.heap(&expected.header) };
+        var iregs = regs_init;
+        const iresult = irinterp.executeValuesCtx(.{ .heap = null }, &t, &iregs, values);
+        try testing.expectEqual(@as(usize, 3), iresult.completed);
+        try testing.expectEqual(@as(u32, 5), iresult.exit_instr);
+        var nregs = regs_init;
+        const nresult = try util.runNative(ct, &nregs);
+        try testing.expectEqual(iresult.completed, nresult.completed);
+        try testing.expectEqual(iresult.exit_instr, nresult.exit_instr);
+        try util.expectRegsEqual(&iregs, &nregs);
+    }
+    // (b) Identity BROKEN (a different interned string — the type pin still
+    // passes): exit at the guard_sid, zero committed, both tiers.
+    {
+        const regs_init = [_]Value{ Value.int(1), Value.int(4), Value.heap(&other.header) };
+        var iregs = regs_init;
+        const iresult = irinterp.executeValuesCtx(.{ .heap = null }, &t, &iregs, values);
+        try testing.expectEqual(@as(usize, 0), iresult.completed);
+        try testing.expectEqual(@as(u32, 8), iresult.exit_instr);
+        var nregs = regs_init;
+        const nresult = try util.runNative(ct, &nregs);
+        try testing.expectEqual(iresult.completed, nresult.completed);
+        try testing.expectEqual(iresult.exit_instr, nresult.exit_instr);
+        try util.expectRegsEqual(&iregs, &nregs);
+    }
+}
+
+/// The doc-30 str2num shape: a counted loop parsing a string slot each
+/// iteration. regs: r0=i, r1=limit, r2=s, r3=acc. `int_kind` picks the
+/// baked observed kind (str2num_i + int acc vs str2num_f + float acc).
+fn str2numTrace(consts: []Value, comptime int_kind: bool) Trace {
+    const instrs = struct {
+        var arr_i = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: i
+            .{ .op = .slot_load, .aux = 1 }, // 1: limit
+            .{ .op = .guard_int, .a = 0 }, // 2
+            .{ .op = .guard_int, .a = 1 }, // 3
+            .{ .op = .lt, .a = 0, .b = 1 }, // 4
+            .{ .op = .guard_true, .a = 4 }, // 5
+            .{ .op = .slot_load, .aux = 2 }, // 6: s
+            .{ .op = .guard_string, .a = 6 }, // 7
+            .{ .op = .slot_load, .aux = 3 }, // 8: acc
+            .{ .op = .guard_int, .a = 8 }, // 9
+            .{ .op = .str2num_i, .a = 6, .ty = .int }, // 10: parse; kind mismatch → exit
+            .{ .op = .add, .a = 8, .b = 10 }, // 11
+            .{ .op = .konst, .aux = 0 }, // 12: 1
+            .{ .op = .add, .a = 0, .b = 12 }, // 13
+            .{ .op = .phi, .b = 11, .aux = 3 },
+            .{ .op = .phi, .b = 13, .aux = 0 },
+            .{ .op = .loop },
+        };
+        var arr_f = [_]I{
+            .{ .op = .slot_load, .aux = 0 },
+            .{ .op = .slot_load, .aux = 1 },
+            .{ .op = .guard_int, .a = 0 },
+            .{ .op = .guard_int, .a = 1 },
+            .{ .op = .lt, .a = 0, .b = 1 },
+            .{ .op = .guard_true, .a = 4 },
+            .{ .op = .slot_load, .aux = 2 },
+            .{ .op = .guard_string, .a = 6 },
+            .{ .op = .slot_load, .aux = 3 }, // 8: acc (float)
+            .{ .op = .guard_float, .a = 8 },
+            .{ .op = .str2num_f, .a = 6, .ty = .float }, // 10
+            .{ .op = .add, .a = 8, .b = 10, .ty = .float }, // 11
+            .{ .op = .konst, .aux = 0 },
+            .{ .op = .add, .a = 0, .b = 12 },
+            .{ .op = .phi, .b = 11, .aux = 3 },
+            .{ .op = .phi, .b = 13, .aux = 0 },
+            .{ .op = .loop },
+        };
+    };
+    const es = struct {
+        var arr = [_]u16{};
+    };
+    return Trace{ .anchor = undefined, .instrs = if (int_kind) &instrs.arr_i else &instrs.arr_f, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
+}
+
+test "doc 30 c3: str2num_i/_f — tier parity, heap-free, and the kind-mismatch / non-number exits" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    const s_int = try heap.intern("42");
+    const s_float = try heap.intern("4.5");
+    const s_junk = try heap.intern("zz");
+    var consts = [_]Value{Value.int(1)};
+
+    const t_i = str2numTrace(&consts, true);
+    const t_f = str2numTrace(&consts, false);
+    const values = try gpa.alloc(Value, t_i.instrs.len);
+    defer gpa.free(values);
+
+    // Heap-free: the ONE arith.toNumber core allocates nothing.
+    var ct_i = nativegen.compile(gpa, &t_i) orelse return error.NativeBailedUnexpectedly;
+    defer ct_i.deinit();
+    var ct_f = nativegen.compile(gpa, &t_f) orelse return error.NativeBailedUnexpectedly;
+    defer ct_f.deinit();
+
+    const Case = struct { s: Value, int_kind: bool, completed: usize, exit: u32, acc: Value };
+    const cases = [_]Case{
+        // Observed kind holds: 3 iterations, counter exit (guard_true, instr 5).
+        .{ .s = Value.heap(&s_int.header), .int_kind = true, .completed = 3, .exit = 5, .acc = Value.int(126) },
+        .{ .s = Value.heap(&s_float.header), .int_kind = false, .completed = 3, .exit = 5, .acc = Value.float(13.5) },
+        // Kind mismatch (a float parse under an int stamp, and vice versa):
+        // exit at the parse (instr 10), zero committed, acc untouched.
+        .{ .s = Value.heap(&s_float.header), .int_kind = true, .completed = 0, .exit = 10, .acc = Value.int(0) },
+        .{ .s = Value.heap(&s_int.header), .int_kind = false, .completed = 0, .exit = 10, .acc = Value.float(0.0) },
+        // Not a number at all: same exit, both stamps.
+        .{ .s = Value.heap(&s_junk.header), .int_kind = true, .completed = 0, .exit = 10, .acc = Value.int(0) },
+        .{ .s = Value.heap(&s_junk.header), .int_kind = false, .completed = 0, .exit = 10, .acc = Value.float(0.0) },
+    };
+    for (cases) |c| {
+        const t = if (c.int_kind) t_i else t_f;
+        const regs_init = [_]Value{ Value.int(1), Value.int(4), c.s, c.acc };
+        var iregs = regs_init;
+        const iresult = irinterp.executeValuesCtx(.{ .heap = null }, &t, &iregs, values);
+        try testing.expectEqual(c.completed, iresult.completed);
+        try testing.expectEqual(c.exit, iresult.exit_instr);
+        var nregs = regs_init;
+        const nresult = try util.runNative(if (c.int_kind) ct_i else ct_f, &nregs);
+        try testing.expectEqual(iresult.completed, nresult.completed);
+        try testing.expectEqual(iresult.exit_instr, nresult.exit_instr);
+        try util.expectRegsEqual(&iregs, &nregs);
+    }
+    // The successful int case really summed: 3 x 42 on top of 0.
+    {
+        const regs_init = [_]Value{ Value.int(1), Value.int(4), Value.heap(&s_int.header), Value.int(0) };
+        var nregs = regs_init;
+        _ = try util.runNative(ct_i, &nregs);
+        try testing.expectEqual(Value.int(126).payload.bits, nregs[3].payload.bits);
+        try testing.expectEqual(Value.int(4).payload.bits, nregs[0].payload.bits);
+    }
+}
+
+test "doc 30 c3: malformed stamps and layouts fail closed — the never-trust-the-IR matrix" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var heap = gc.Heap.init(gpa);
+    defer heap.deinit();
+    const pat = try heap.intern("%d+");
+
+    // (a) smatch stamped .heap: refuse.
+    {
+        var consts = [_]Value{ Value.int(1), Value.heap(&pat.header) };
+        const t = smatchSlideTrace(&consts);
+        const saved = t.instrs[7].ty;
+        t.instrs[7].ty = .heap;
+        defer t.instrs[7].ty = saved;
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+    }
+    // (b) scap_int slot out of bounds: refuse.
+    {
+        var consts = [_]Value{ Value.int(1), Value.heap(&pat.header) };
+        const t = smatchSlideTrace(&consts);
+        const saved = t.instrs[8].b;
+        t.instrs[8].b = @intCast(gc.MatchScratch.n_slots);
+        defer t.instrs[8].b = saved;
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+    }
+    // (c) sgmatch whose aux names an INT konst (not a string): refuse.
+    {
+        var consts = [_]Value{ Value.int(1), Value.int(7) };
+        const t = gmatchStepTrace(&consts);
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+    }
+    // (d) guard_sid whose aux names an INT konst: refuse.
+    {
+        var consts = [_]Value{ Value.int(1), Value.int(7) };
+        const t = guardSidTrace(&consts);
+        try testing.expect(nativegen.compile(gpa, &t) == null);
+    }
+    // (e) smatch whose pattern ref is a dominating INT (no string proof —
+    // the is_string gate, not the bounds gate): refuse.
+    {
+        var consts = [_]Value{ Value.int(1), Value.heap(&pat.header) };
+        const t = smatchSlideTrace(&consts);
+        const saved = t.instrs[7].aux;
+        t.instrs[7].aux = 0; // the pos slot_load — kind .int, never a string
+        defer t.instrs[7].aux = saved;
+        try testing.expect(nativegen.compileWithHeap(gpa, &t, &heap) == null);
+    }
+    // (f) Control: the honest traces all compile (the refusals above were for
+    // the STAMP, not some unrelated reason).
+    {
+        var consts = [_]Value{ Value.int(1), Value.heap(&pat.header) };
+        const t1 = smatchSlideTrace(&consts);
+        var c1 = nativegen.compileWithHeap(gpa, &t1, &heap) orelse return error.NativeBailedUnexpectedly;
+        c1.deinit();
+        const t2 = guardSidTrace(&consts);
+        var c2 = nativegen.compile(gpa, &t2) orelse return error.NativeBailedUnexpectedly;
+        c2.deinit();
+    }
+}
