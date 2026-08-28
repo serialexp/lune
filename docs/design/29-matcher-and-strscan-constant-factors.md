@@ -1,9 +1,10 @@
 # 29 — matcher & string→number constant factors (Pall-core parity)
 
-Status: **DRAFT — codex-reviewed (ledger at bottom, all findings folded in);
-pending Bart's grammar decision (§B2).**
+Status: **LANDED (A1–A4 + B(a), 2026-08-28; results section below). Grammar
+decision RESOLVED 2026-08-29 (§B2): superset criterion, trim-set fix landed,
+(b)/(c) scanner dead. A5 deferred until after doc 30.**
 Owner: Bart
-Last updated: 2026-08-28
+Last updated: 2026-08-29
 
 Prerequisite reading: doc 28 §11 (why the op-core arc could not close the string
 gap), `~/Projects/LuaJIT/src/lib_string.c:152-512` (the matcher),
@@ -197,6 +198,26 @@ Options:
 The parser's literal grammar (`parser.zig:677-730`, same std.fmt calls) is a
 **separate language-design surface and out of scope** — noted in TODO.md;
 whatever is chosen here does not silently change source-literal syntax.
+
+**RESOLVED 2026-08-29 — Bart's criterion: superset, never less.** "Does it
+accept everything that LuaJIT accepts? Does it accept everything that Lua 5.4
+accepts? If so, I really do not care if we accept more, as long as we do not
+accept less." Verified empirically with a 77-case probe run identically on
+`lua5.4`, `~/Projects/LuaJIT/src/luajit`, and lune (whitespace variants, hex
+ints/floats incl. `0x8.`/`0x.8`, `5.`/`.5`/`5.e2`, inf/nan family incl.
+`infinity`, big-digit strings, junk near-misses, `0B101`/`-0b101`,
+`LL`/`ULL`/`i` suffixes — neither engine accepts suffixes). Result: the ONE
+acceptance gap was the trim set — lune trimmed `" \t\n\r"` where both engines
+skip C `isspace` (adds `\v`/`\f`); `"\v10"`, `"\f10"`, `"10\v"`,
+`" \v\f 10 \f\v "` were rejected by lune and accepted by both. **Fixed**: the
+`tonumber_trim` constant (arith.zig) is now the 6-byte C-isspace set, used by
+both the auto and explicit-base forms; pinned in the routing-matrix test.
+After the fix lune's acceptance is a strict superset of BOTH engines on the
+full matrix (the extras being std.fmt's `_`/`0o` and `inf` vs 5.4 — grammar
+(a) frozen per the criterion; `0b` is legal LuaJIT too). Known
+value-semantics forks, accepted: hex-int overflow → float like LuaJIT (Lua
+5.4 wraps mod 2⁶⁴); `"-0"` → int 0 like 5.4 (LuaJIT has no ints, gives
+−0.0). No full scanner needed; B3's (b)/(c) branch is dead.
 
 ### B3. The implementation (shaped by review Blocker #1)
 

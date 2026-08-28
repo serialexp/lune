@@ -279,6 +279,13 @@ pub fn eq(a: Value, b: Value) bool {
 /// mirrors the native's argument handling exactly: `null` means the 1-arg form;
 /// a non-number base falls through to the 1-arg auto path (matching the
 /// native's `args[1].isNumber()` gate); a numeric base outside 2..36 → nil.
+/// The whitespace set `tonumber` trims before parsing: C `isspace`, which is
+/// what both Lua 5.4 (`l_str2int`/`l_str2d` skip `lisspace`) and LuaJIT
+/// (`lj_strscan` skips `LJ_CHAR_SPACE`) use. Verified empirically 2026-08-29:
+/// with only " \t\n\r" lune rejected "\x0B10"/"\x0C10" that both engines
+/// accept — the one acceptance gap on the 77-case three-engine probe matrix.
+const tonumber_trim = " \t\n\r\x0B\x0C"; // space \t \n \r \v \f
+
 pub fn toNumber(v: Value, base_arg: ?Value) Value {
     // Explicit base form: string interpreted as an integer in that base.
     if (base_arg) |bv| if (bv.isNumber()) {
@@ -286,7 +293,7 @@ pub fn toNumber(v: Value, base_arg: ?Value) Value {
         if (base_i < 2 or base_i > 36) return Value.nil();
         const base: u8 = @intFromFloat(base_i);
         const s = strBytes(v) orelse return Value.nil();
-        const t = std.mem.trim(u8, s, " \t\n\r");
+        const t = std.mem.trim(u8, s, tonumber_trim);
         if (t.len == 0) return Value.nil();
         const parsed = std.fmt.parseInt(i64, t, base) catch return Value.nil();
         return Value.int(parsed);
@@ -297,7 +304,7 @@ pub fn toNumber(v: Value, base_arg: ?Value) Value {
         else => {},
     }
     const s = strBytes(v) orelse return Value.nil();
-    const t = std.mem.trim(u8, s, " \t\n\r");
+    const t = std.mem.trim(u8, s, tonumber_trim);
     if (t.len == 0) return Value.nil();
     if (fastDecInt(t)) |iv| return Value.int(iv); // doc 29 B(a): the common shape
     if (std.fmt.parseInt(i64, t, 0)) |iv| {
@@ -584,6 +591,12 @@ test "doc 29 B(a): toNumber end-to-end routing unchanged on the matrix" {
     const cases = [_]struct { s: []const u8, want: Exp }{
         .{ .s = "42", .want = .{ .int = 42 } },
         .{ .s = " 42 ", .want = .{ .int = 42 } }, // trim (via caller) — tested below raw
+        // C-isspace trim parity with Lua 5.4 + LuaJIT (2026-08-29 probe):
+        // \v and \f trim like space/tab; both engines accept all four shapes.
+        .{ .s = "\x0B10", .want = .{ .int = 10 } },
+        .{ .s = "\x0C10", .want = .{ .int = 10 } },
+        .{ .s = "10\x0B", .want = .{ .int = 10 } },
+        .{ .s = " \x0B\x0C 10 \x0C\x0B ", .want = .{ .int = 10 } },
         .{ .s = "00420", .want = .{ .int = 420 } },
         .{ .s = "1_000", .want = .{ .int = 1000 } }, // std.fmt artifact, grammar (a) freezes it
         .{ .s = "0o17", .want = .{ .int = 15 } },
@@ -603,7 +616,7 @@ test "doc 29 B(a): toNumber end-to-end routing unchanged on the matrix" {
     for (cases) |tc| {
         // Reproduce toNumber's string arm on raw bytes (strBytes needs a heap
         // Value; the arm's logic below the strBytes call is what we pin).
-        const t = std.mem.trim(u8, tc.s, " \t\n\r");
+        const t = std.mem.trim(u8, tc.s, tonumber_trim);
         const got: Exp = blk: {
             if (t.len == 0) break :blk .nil;
             if (fastDecInt(t)) |iv| break :blk .{ .int = iv };
