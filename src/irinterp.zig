@@ -967,6 +967,137 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     if (record) rec.exit(i, .guard, sv);
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
+                // ---- doc 30: pattern-engine + str2num callouts ----
+                // Every arm calls the SAME stralloc shim the native emitter
+                // will (P3: one core); a negative status / null / missing
+                // heap context side-exits (tier-0 replays the iteration).
+                .sfindp => {
+                    const sv = values[ins.a];
+                    const iv = values[ins.b];
+                    const pv = values[@intCast(ins.aux)];
+                    if (sv.isHeap() and sv.heapType() == .string and iv.isInt() and
+                        pv.isHeap() and pv.heapType() == .string)
+                    {
+                        const r = stralloc.sfindpRuntime(sv.asHeap(), iv.asInt(), pv.asHeap());
+                        if (r >= 1) {
+                            values[i] = Value.int(r);
+                            if (record) rec.value(i, values[i]);
+                            continue;
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, sv);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                .smatch => {
+                    const sv = values[ins.a];
+                    const iv = values[ins.b];
+                    const pv = values[@intCast(ins.aux)];
+                    if (sv.isHeap() and sv.heapType() == .string and iv.isInt() and
+                        pv.isHeap() and pv.heapType() == .string)
+                    {
+                        if (ctx.heap) |heap| {
+                            const st = stralloc.smatchRuntime(heap, sv.asHeap(), iv.asInt(), pv.asHeap());
+                            if (st == 0) {
+                                // The status is the op's SSA value; it is never
+                                // guest-visible (only projections are).
+                                values[i] = Value.int(st);
+                                if (record) rec.value(i, values[i]);
+                                continue;
+                            }
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, sv);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                .sgmatch => {
+                    const stv = values[ins.a];
+                    const expected = t.consts[@intCast(ins.aux)];
+                    if (stv.isHeap() and stv.heapType() == .table and
+                        expected.isHeap() and expected.heapType() == .string)
+                    {
+                        if (ctx.heap) |heap| {
+                            const st = stralloc.sgmatchRuntime(heap, stv.asHeap(), expected.asHeap());
+                            if (st == 0) {
+                                values[i] = Value.int(st);
+                                if (record) rec.value(i, values[i]);
+                                continue;
+                            }
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, stv);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                .scap_int => {
+                    // Direct scratch read (the native lowering is a baked
+                    // absolute load); no heap context → bail like any other
+                    // scratch-touching op (doc 30 M05).
+                    if (ctx.heap) |heap| {
+                        const w = heap.match_scratch.words[2 * @as(usize, ins.b)];
+                        values[i] = Value.int(@bitCast(w));
+                        if (record) rec.value(i, values[i]);
+                        continue;
+                    }
+                    if (record) rec.exit(i, .guard, values[ins.a]);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                .scap_str => {
+                    if (ctx.heap) |heap| {
+                        if (stralloc.scapStrRuntime(heap, @as(i64, ins.b))) |hdr| {
+                            values[i] = Value.heap(hdr);
+                            if (record) rec.value(i, values[i]);
+                            continue;
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, values[ins.a]);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                .str2num_i, .str2num_f => {
+                    const sv = values[ins.a];
+                    if (sv.isHeap() and sv.heapType() == .string) {
+                        const r = stralloc.str2numRuntime(sv.asHeap());
+                        if (ins.op == .str2num_i and r.status == 0) {
+                            values[i] = Value.int(@bitCast(r.value));
+                            if (record) rec.value(i, values[i]);
+                            continue;
+                        }
+                        if (ins.op == .str2num_f and r.status == 1) {
+                            values[i] = Value.float(@bitCast(r.value));
+                            if (record) rec.value(i, values[i]);
+                            continue;
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, sv);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                .sgm_setpos => {
+                    // The deferred gmatch-cursor commit (doc 30 §6): sits below
+                    // every guard, so reaching it means the iteration completed.
+                    // Produces no value; nil keeps the SSA slot defined.
+                    const stv = values[ins.a];
+                    const npv = values[ins.b];
+                    if (stv.isHeap() and stv.heapType() == .table and npv.isInt()) {
+                        if (stralloc.sgmSetposRuntime(stv.asHeap(), npv.asInt()) == 0) {
+                            values[i] = Value.nil();
+                            if (record) rec.value(i, values[i]);
+                            continue;
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, stv);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
+                .guard_sid => {
+                    // Interned-identity pin (doc 30 §2a): equal bytes ⇔ same
+                    // object within a heap, so identity is a pointer compare
+                    // against the konst-pool string.
+                    const v = values[ins.a];
+                    const expected = t.consts[@intCast(ins.aux)];
+                    if (v.isHeap() and expected.isHeap() and v.asHeap() == expected.asHeap()) {
+                        if (record) rec.guardPass(i, v);
+                    } else {
+                        if (record) rec.exit(i, .guard, v);
+                        break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                    }
+                },
                 // Doc 26 D3: single-result codepoint — pure, non-allocating;
                 // the shared codepointCore owns the wrap/clamp semantics. An
                 // empty range (core → null) side-exits and tier-0's replay

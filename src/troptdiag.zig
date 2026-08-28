@@ -154,11 +154,22 @@ fn detectDeadCarries(
                 uses[ins.a] += 1;
                 uses[ins.b] += 1;
             },
-            // scp shares ssub's three-operand encoding (doc 26 D3).
-            .ssub, .scp => {
+            // scp shares ssub's three-operand encoding (doc 26 D3), as do
+            // doc 30's sfindp/smatch (subject, init, pattern-in-aux).
+            .ssub, .scp, .sfindp, .smatch => {
                 uses[ins.a] += 1;
                 uses[ins.b] += 1;
                 uses[@intCast(ins.aux)] += 1;
+            },
+            // Doc 30 one-ref ops: sgmatch (aux = konst id imm), the scratch
+            // projections (b = slot imm), str2num, guard_sid (aux = konst id).
+            .sgmatch, .scap_int, .scap_str, .str2num_i, .str2num_f, .guard_sid => {
+                uses[ins.a] += 1;
+            },
+            // Doc 30 sgm_setpos: state + new-pos.
+            .sgm_setpos => {
+                uses[ins.a] += 1;
+                uses[ins.b] += 1;
             },
             // Grid-cell address producers + store + the column guard read both operands
             // (table+row, garow+col, gcell+value, gcell+col).
@@ -282,8 +293,12 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             .alen,
             => ins.a == idx,
             .srep2 => ins.a == idx or ins.b == idx,
-            // scp shares ssub's three-operand encoding (doc 26 D3).
-            .ssub, .scp => ins.a == idx or ins.b == idx or @as(trace.Ref, @intCast(ins.aux)) == idx,
+            // scp shares ssub's three-operand encoding (doc 26 D3); doc 30's
+            // sfindp/smatch ditto.
+            .ssub, .scp, .sfindp, .smatch => ins.a == idx or ins.b == idx or @as(trace.Ref, @intCast(ins.aux)) == idx,
+            // Doc 30 one-ref ops (aux/b are immediates, never refs).
+            .sgmatch, .scap_int, .scap_str, .str2num_i, .str2num_f, .guard_sid => ins.a == idx,
+            .sgm_setpos => ins.a == idx or ins.b == idx,
             .aref, .astore, .astore_append, .href, .hstore,
             .garow, .gcell, .gstore, .guard_gcol => ins.a == idx or ins.b == idx,
             .phi => (ins.aux == trace.PHI_INTERNAL and ins.a == idx) or ins.b == idx,

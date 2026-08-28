@@ -91,6 +91,15 @@ export const IR_OP_NAMES = [
   "supper", // 69  string.upper(s) — full Unicode simple case map (allocating)
   "slower", // 70  string.lower(s) — ditto
   "scp", // 71  single-result string.codepoint(s, i, j) — third operand rides aux as a ref
+  "sfindp", // 72  plain string.find bypass — a=s, b=init, aux=pattern ref; result = 1-based char index
+  "smatch", // 73  pattern locate + scratch fill (find/match) — a=s, b=init, aux=pattern ref; result = status
+  "sgmatch", // 74  composite gmatch-iterator step — a=state, aux=expected-pattern konst id (imm)
+  "scap_int", // 75  scratch int projection — a=match ref, b=slot (imm)
+  "scap_str", // 76  scratch span intern — a=match ref, b=slot (imm); allocating
+  "str2num_i", // 77  tonumber(string), int direction — a=s
+  "str2num_f", // 78  tonumber(string), float direction — a=s
+  "sgm_setpos", // 79  deferred gmatch cursor commit — a=state, b=new pos
+  "guard_sid", // 80  interned-identity pin — a=string ref, aux=expected konst id (imm)
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -178,7 +187,7 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
 /** Three-operand ops whose third operand rides `aux` as a ref (mirrors
  * `writeIrInstr`'s `%a  %b  %aux` arm): `ssub` (doc 24 codex #4) and `scp`
  * (doc 26 D3). */
-export const TERNARY_AUX_OPS: ReadonlySet<IrOpName> = new Set(["ssub", "scp"]);
+export const TERNARY_AUX_OPS: ReadonlySet<IrOpName> = new Set(["ssub", "scp", "sfindp", "smatch"]);
 
 /** Map a raw wire ordinal to a name, falling back to `op:N` if out of range. */
 export function irOpName(op: number): string {

@@ -553,6 +553,82 @@ pub const IrOp = enum(u8) {
     /// the shared `codepointCore`; an empty range side-exits (tier-0 replays
     /// to nil). Wire ordinal 71.
     scp,
+
+    // ---- doc 30: pattern-engine + string→number callouts ----
+    //
+    // The match ops write the per-VM `Heap.match_scratch`; the projection ops
+    // read it. Every failure crosses the shim ABI as a negative status
+    // (`stdlib/string.zig` `MatchStatus`, doc 30 M03) and side-exits as an
+    // ORDINARY unchainable header-replay exit — none of these ops join
+    // `guardExitPc`/`isSideExitGuardOp` (their `aux` is an operand or an
+    // immediate, NEVER a PC — doc 30 M02, pinned by the accessor tests).
+
+    /// `sfindp`: plain-substring `string.find` (the no-specials bypass) —
+    /// `a` = proven-string subject, `b` = init ref, `aux` = pattern ref (the
+    /// scp/ssub ternary encoding). `ty = .int`: the matched 1-based char
+    /// index (>= 1); negative → side-exit. The END index is recorder
+    /// arithmetic (`start + cpLen(pat) − 1`, konst-folded), not a result.
+    /// PURE (`.pure3`), heap-free, no scratch. Wire ordinal 72.
+    sfindp,
+    /// `smatch`: pattern locate + scratch fill (find/match flavor) —
+    /// `a` = proven-string subject, `b` = init ref, `aux` = pattern ref.
+    /// `ty = .int`: the status channel (0 = matched, projections may read
+    /// scratch; negative → side-exit). Side-effecting producer
+    /// (`.scratch3`): never DCE'd/CSE'd/hoisted/folded/reordered — the
+    /// scratch write is the projections' data source. Wire ordinal 73.
+    smatch,
+    /// `sgmatch` (doc 30 §6): ONE composite gmatch-iterator step —
+    /// `a` = state-table ref, `b` unused, `aux` = **konst-pool id of the
+    /// record-time pattern** (an IMMEDIATE, never walked as a ref —
+    /// `.scratch1k`). The shim verifies the pattern identity and the B03
+    /// slot-3 layout, then locates from the stored pos READ-ONLY (the pos
+    /// advance is `sgm_setpos`) and fills scratch incl. `slot_next_pos`.
+    /// `ty = .int` status. Wire ordinal 74.
+    sgmatch,
+    /// `scap_int`: non-allocating scratch projection — `a` = the match op's
+    /// ref (data dependence), `b` = SLOT IMMEDIATE (never remapped).
+    /// `ty = .int`. Native lowering is a direct load from a baked absolute
+    /// scratch address; no call, no exit path; requires the heap context
+    /// (doc 30 M05). Kind `.proj`: DCE'd when unused, never CSE'd/hoisted.
+    /// Wire ordinal 75.
+    scap_int,
+    /// `scap_str`: allocating scratch projection — `a` = match ref, `b` =
+    /// slot immediate, `ty = .heap`: interns the span (≤1 link; null=OOM →
+    /// side-exit, the snew protocol). Kind `.alloc_proj` (round-2 M02): an
+    /// alloc ROOT (a dead one is still executed — the id stream is the
+    /// observable, doc 24:140) with `.proj` operand shape. Emitted for
+    /// EVERY string capture tier-0 materializes, in capture order,
+    /// regardless of the caller's result window (doc 30 B02).
+    /// Wire ordinal 76.
+    scap_str,
+    /// `str2num_i`: `tonumber(string)`, int direction — `a` = proven-string
+    /// ref, `ty = .int`. The shim returns `{status, value}` (rax:rdx); a
+    /// status ≠ int (nil or float) side-exits (kind honesty). Unary pure
+    /// producer: DCE admitted (removing a dead parse removes only its
+    /// kind-honesty exit — sound), CSE/LICM excluded fail-closed.
+    /// Wire ordinal 77.
+    str2num_i,
+    /// `str2num_f`: ditto, float direction. `ty = .float`. Wire ordinal 78.
+    str2num_f,
+    /// `sgm_setpos` (doc 30 §6): the gmatch cursor commit — `a` = state ref,
+    /// `b` = new-pos ref. A DEFERRED STORE on the docs-07/08 sinking
+    /// discipline: sunk below every guard of the iteration, just before
+    /// `.loop`, so any exit replays tier-0 against the UN-advanced pos and
+    /// reproduces the same token (round-2 B01). Writes the int payload into
+    /// the B03-verified `.value`-lane array cell; the shim re-verifies and a
+    /// layout change side-exits (defensive; unreachable under the recorder's
+    /// pins). Never DCE'd, never reordered. Wire ordinal 79.
+    sgm_setpos,
+    /// `guard_sid` (doc 30 §2a): the interned-identity pin for an OBSERVED
+    /// (non-konst) find/match pattern — `a` = string ref (a dominating
+    /// string proof is required — `guard_string` or a proven producer),
+    /// `aux` = **konst-pool id** of the expected string (never a raw
+    /// pointer; the native emitter resolves the konst to its address at
+    /// compile time). Equal bytes ⇔ same object within a heap, so identity
+    /// is a pointer compare. `aux` IS semantic identity → joins
+    /// `guardKeyAux` (round-2 M01). NOT in `guardExitPc` /
+    /// `isSideExitGuardOp` (aux is a konst id, not a PC). Wire ordinal 80.
+    guard_sid,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -11816,11 +11892,36 @@ pub const TraceState = struct {
                     std.debug.assert(ins.b < i);
                 },
                 // ssub's third operand rides `aux` as a Ref (doc 24 codex #4);
-                // `scp` shares the three-operand encoding (doc 26 D3).
-                .ssub, .scp => {
+                // `scp` shares the three-operand encoding (doc 26 D3), as do
+                // doc 30's `sfindp`/`smatch` (subject, init, pattern-in-aux).
+                .ssub, .scp, .sfindp, .smatch => {
                     std.debug.assert(ins.a < i);
                     std.debug.assert(ins.b < i);
                     std.debug.assert(ins.aux >= 0 and ins.aux < i);
+                },
+                // Doc 30 `sgmatch`: `a` = state ref; `aux` = konst-pool id
+                // (an immediate, bounds-checked against the pool).
+                .sgmatch => {
+                    std.debug.assert(ins.a < i);
+                    std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len);
+                },
+                // Doc 30 projections: `a` = the match op ref; `b` = slot
+                // immediate within the scratch geometry (never a ref).
+                .scap_int, .scap_str => {
+                    std.debug.assert(ins.a < i);
+                    std.debug.assert(@as(usize, ins.b) < gc.MatchScratch.n_slots);
+                },
+                // Doc 30 str2num: unary on a proven-string ref.
+                .str2num_i, .str2num_f => std.debug.assert(ins.a < i),
+                // Doc 30 sgm_setpos: state ref + new-pos ref, both prior.
+                .sgm_setpos => {
+                    std.debug.assert(ins.a < i);
+                    std.debug.assert(ins.b < i);
+                },
+                // Doc 30 guard_sid: string ref + konst-pool id immediate.
+                .guard_sid => {
+                    std.debug.assert(ins.a < i);
+                    std.debug.assert(ins.aux >= 0 and @as(usize, @intCast(ins.aux)) < consts_len);
                 },
                 // `guard_gc` (doc 24 D3): operand-free; `aux` is the allocation
                 // bound `A` — a positive count stamped by `commit()`.
@@ -14741,8 +14842,16 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         // guard_gc's aux is the allocation bound, not an operand.
         .guard_gc => try w.print("A={d}", .{ins.aux}),
         // ssub's third operand rides aux as a ref (codex #4); scp shares the
-        // encoding (doc 26 D3).
-        .ssub, .scp => try w.print("%{d}  %{d}  %{d}", .{ ins.a, ins.b, ins.aux }),
+        // encoding (doc 26 D3), as do doc 30's sfindp/smatch.
+        .ssub, .scp, .sfindp, .smatch => try w.print("%{d}  %{d}  %{d}", .{ ins.a, ins.b, ins.aux }),
+        // Doc 30: sgmatch reads the state `%a` and pins the pattern konst id.
+        .sgmatch => try w.print("%{d}  pat=k{d}", .{ ins.a, ins.aux }),
+        // Projections: match ref + slot immediate.
+        .scap_int, .scap_str => try w.print("%{d}  [{d}]", .{ ins.a, ins.b }),
+        .str2num_i, .str2num_f => try w.print("%{d}", .{ins.a}),
+        .sgm_setpos => try w.print("%{d}  pos=%{d}", .{ ins.a, ins.b }),
+        // guard_sid: operand + the expected string's konst id.
+        .guard_sid => try w.print("%{d}  sid=k{d}", .{ ins.a, ins.aux }),
         // `guard_builtin` reads the callee `%a` and tags the builtin in `aux`.
         .guard_builtin => try w.print("%{d}  [{s}]", .{ ins.a, @tagName(@as(function.RecordedBuiltin, @enumFromInt(ins.aux))) }),
         .loop, .preheader => {},

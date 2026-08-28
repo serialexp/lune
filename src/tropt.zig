@@ -75,7 +75,7 @@ pub const Optimized = struct {
     }
 };
 
-const OpKind = enum { konst, slot_load, binary, unary, cvt, guard, aref, aload, astore, loop, phi, preheader, alloc, gcguard, pure3 };
+const OpKind = enum { konst, slot_load, binary, unary, cvt, guard, aref, aload, astore, loop, phi, preheader, alloc, gcguard, pure3, scratch3, scratch1k, proj, alloc_proj, parse, setpos };
 
 fn kindOf(op: IrOp) OpKind {
     return switch (op) {
@@ -209,6 +209,27 @@ fn kindOf(op: IrOp) OpKind {
         // must re-check the live heap counters EVERY iteration — a preheader
         // placement would leave iterations 2..n unprotected).
         .guard_gc => .gcguard,
+        // Doc 30: the pattern/str2num callout ops. Policies (each pinned by a
+        // test; op doc comments in trace.zig carry the full contracts):
+        // sfindp is scp-shaped pure3. smatch is a side-effecting scratch
+        // producer with three ref operands; sgmatch the same policy with an
+        // honest one-ref-plus-konst-id-immediate shape (round-2 B02 — not a
+        // three-ref lie). scap_int is a DCE-able projection (a=ref, b=slot
+        // imm); scap_str is BOTH an alloc root and proj-shaped (round-2 M02's
+        // dedicated kind). str2num_* is a unary pure producer that may
+        // side-exit: DCE admitted (dropping a dead parse drops only its
+        // kind-honesty exit — sound), CSE/LICM excluded fail-closed.
+        // sgm_setpos is the deferred gmatch-cursor store: an ordered,
+        // never-DCE'd effect root. guard_sid rides the guard machinery
+        // (dedup key includes its konst-id aux via guardKeyAux).
+        .sfindp => .pure3,
+        .smatch => .scratch3,
+        .sgmatch => .scratch1k,
+        .scap_int => .proj,
+        .scap_str => .alloc_proj,
+        .str2num_i, .str2num_f => .parse,
+        .sgm_setpos => .setpos,
+        .guard_sid => .guard,
     };
 }
 
@@ -266,7 +287,10 @@ fn guardKeyAux(op: IrOp, aux: i32) i32 {
         // lane differs from one expecting i8; a stride-200 guard differs from
         // stride-100), so they join the lane/proto auxes in the dedup key.
         // `guard_gcol`/`guard_gpresent` carry no aux (fall through to 0).
-        .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride => aux,
+        // `guard_sid` stashes the expected string's konst-pool id — semantic
+        // identity (two pins expecting DIFFERENT strings must never be
+        // deduplicated: doc 30 round-2 M01), so it joins the dedup-key auxes.
+        .guard_lane, .guard_fits, .guard_func, .guard_hash, .guard_builtin, .guard_grid, .guard_stride, .guard_sid => aux,
         else => 0,
     };
 }
@@ -402,6 +426,11 @@ pub fn optimize(
             // `.pure3` (scp): canonical to itself; CSE deliberately excluded
             // (kindOf's contract note) and no fold arm exists for it.
             .pure3 => {},
+            // Doc 30 kinds: ALL canonical to themselves — no fold, no CSE.
+            // The scratch producers and setpos are effect-ordered; the
+            // projections' identity IS their (match ref, slot); a repeated
+            // str2num CSE would need a root-class story (fail closed).
+            .scratch3, .scratch1k, .proj, .alloc_proj, .parse, .setpos => {},
             .loop => {},
             // φ is a loop-carried root: canonical to itself, never folded/CSE'd.
             .phi => {},
@@ -426,6 +455,12 @@ pub fn optimize(
         // `.cvt` (int_of_float) is a side-effecting root: it can side-exit, so it must
         // never be DCE'd even if its value looked dead — exactly like a kept guard.
         if ((k == .guard and !dead[i]) or k == .astore or k == .phi or k == .cvt or k == .alloc or k == .gcguard) live[i] = true;
+        // Doc 30 roots: the scratch producers (the projections' data source,
+        // and their status side-exit), scap_str (an ALLOC root — a dead
+        // capture is still executed, the id stream is the observable, B02),
+        // and sgm_setpos (the deferred store). scap_int and str2num_* are
+        // deliberately NOT roots: DCE admitted (kindOf's contract).
+        if (k == .scratch3 or k == .scratch1k or k == .alloc_proj or k == .setpos) live[i] = true;
         // A φ's back-edge update `b` may be a FORWARD ref (`b > i`) —
         // `assertWellFormed` permits it (only φ.b may point past its own index),
         // and an internal SR φ's `update = add(φ, Δ)` necessarily does. The single
@@ -471,6 +506,22 @@ pub fn optimize(
                     live[canon[ins.a]] = true;
                     live[canon[ins.b]] = true;
                     live[canon[@intCast(ins.aux)]] = true;
+                },
+                // Doc 30: `smatch` has three ref operands (subject, init,
+                // pattern-in-aux — the scp encoding).
+                .scratch3 => {
+                    live[canon[ins.a]] = true;
+                    live[canon[ins.b]] = true;
+                    live[canon[@intCast(ins.aux)]] = true;
+                },
+                // `sgmatch`: ONE ref (`a` = state); `aux` is a konst-pool id
+                // IMMEDIATE — never treated as a ref (round-2 B02).
+                // Projections and str2num read `a` only (`b`/slot is imm).
+                .scratch1k, .proj, .alloc_proj, .parse => live[canon[ins.a]] = true,
+                // `sgm_setpos` keeps both the state ref and the pos ref alive.
+                .setpos => {
+                    live[canon[ins.a]] = true;
+                    live[canon[ins.b]] = true;
                 },
                 // φ always keeps its back-edge update `b` alive. The init `a` is a
                 // real ref only for an *internal* φ (the preheader value); a
@@ -560,6 +611,9 @@ pub fn optimize(
             // (scp — LICM deliberately excluded in v1, doc 26 D3): not
             // invariant-hoistable.
             .guard, .aref, .aload, .astore, .loop, .phi, .preheader, .alloc, .gcguard, .pure3 => {},
+            // Doc 30: all excluded from LICM/hoisting fail-closed (scratch
+            // effect order; alloc id stream; per-iteration status exits).
+            .scratch3, .scratch1k, .proj, .alloc_proj, .parse, .setpos => {},
         }
     }
 
@@ -661,6 +715,20 @@ pub fn optimize(
                 out.a = new_index[canon[ins.a]];
                 out.b = new_index[canon[ins.b]];
                 out.aux = @intCast(new_index[canon[@intCast(ins.aux)]]);
+            },
+            // Doc 30 `smatch`: the scp remap shape (all three are refs).
+            .scratch3 => {
+                out.a = new_index[canon[ins.a]];
+                out.b = new_index[canon[ins.b]];
+                out.aux = @intCast(new_index[canon[@intCast(ins.aux)]]);
+            },
+            // `sgmatch`/projections/str2num: remap `a` ONLY — `aux` (konst
+            // id) and `b` (slot immediate) ride verbatim; remapping either
+            // would corrupt them into wild refs (round-2 B02/M02).
+            .scratch1k, .proj, .alloc_proj, .parse => out.a = new_index[canon[ins.a]],
+            .setpos => {
+                out.a = new_index[canon[ins.a]];
+                out.b = new_index[canon[ins.b]];
             },
             .gcguard => {}, // operand-free; aux (the bound A) rides verbatim
             .aref, .astore => {
@@ -1143,4 +1211,88 @@ test "tropt E1: hoisting preserves behaviour (optimized ≡ unoptimized over a b
     try testing.expectEqual(@as(i64, 60), regs_u[2].asInt());
     try testing.expectEqual(@as(i64, 0), regs_u[3].asInt());
     for (regs_u, regs_o) |u, o| try testing.expect(u.eql(o));
+}
+
+// ---------------------------------------------------------------------------
+// Doc 30 c2 — kind-policy pins for the pattern/str2num callout ops.
+// ---------------------------------------------------------------------------
+
+test "doc 30: smatch/scap_str/setpos are roots; unused scap_int and str2num are DCE'd" {
+    const gpa = testing.allocator;
+    const instrs = trace.withPhis(&[_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0 subject (loop-carried)
+        .{ .op = .konst, .aux = 0 }, // %1 init
+        .{ .op = .konst, .aux = 1 }, // %2 pattern
+        .{ .op = .smatch, .a = 0, .b = 1, .aux = 2, .ty = .int }, // %3 root
+        .{ .op = .scap_int, .a = 3, .b = 0, .ty = .int }, // %4 UNUSED -> DCE
+        .{ .op = .scap_str, .a = 3, .b = 4, .ty = .heap }, // %5 unused but ALLOC root -> kept (B02)
+        .{ .op = .str2num_i, .a = 5, .ty = .int }, // %6 UNUSED parse -> DCE (named stance)
+        .{ .op = .loop }, // %7
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
+    const consts = [_]Value{ Value.int(1), Value.int(2) };
+    var opt = try optimize(gpa, &instrs, &consts);
+    defer freeOpt(gpa, &opt);
+
+    try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .smatch));
+    try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .scap_str));
+    try testing.expectEqual(@as(usize, 0), countOp(opt.instrs, .scap_int));
+    try testing.expectEqual(@as(usize, 0), countOp(opt.instrs, .str2num_i));
+    // smatch's three operands survived with it (the .scratch3 liveness walk).
+    try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .konst));
+}
+
+test "doc 30: sgmatch chain is kept; its aux rides verbatim as a konst id through compaction" {
+    const gpa = testing.allocator;
+    const instrs = trace.withPhis(&[_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0 state
+        .{ .op = .konst, .aux = 0 }, // %1 DEAD konst -> DCE'd (shifts indices)
+        .{ .op = .sgmatch, .a = 0, .aux = 1, .ty = .int }, // %2 aux = konst-pool id 1 (IMMEDIATE)
+        .{ .op = .scap_int, .a = 2, .b = 35, .ty = .int }, // %3 next_pos (used by setpos -> kept)
+        .{ .op = .sgm_setpos, .a = 0, .b = 3 }, // %4 the deferred store root
+        .{ .op = .loop }, // %5
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
+    const consts = [_]Value{ Value.int(99), Value.int(42) };
+    var opt = try optimize(gpa, &instrs, &consts);
+    defer freeOpt(gpa, &opt);
+
+    try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .sgmatch));
+    try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .scap_int));
+    try testing.expectEqual(@as(usize, 1), countOp(opt.instrs, .sgm_setpos));
+    try testing.expectEqual(@as(usize, 0), countOp(opt.instrs, .konst)); // dead konst dropped...
+    for (opt.instrs) |ins| {
+        // ...but the POOL is preserved (tropt never compacts consts), so the
+        // sgmatch aux still names pool id 1. Had the remap treated aux as a
+        // ref, the dead %1 would have corrupted it (round-2 B02's hazard).
+        if (ins.op == .sgmatch) try testing.expectEqual(@as(i32, 1), ins.aux);
+        // The slot immediate likewise rides verbatim (never a ref).
+        if (ins.op == .scap_int) try testing.expectEqual(@as(Ref, 35), ins.b);
+    }
+    try testing.expectEqual(@as(usize, 2), opt.consts.len);
+}
+
+test "doc 30: guard_sid dedup keys on its konst id — same id dropped, different ids both kept" {
+    const gpa = testing.allocator;
+    const instrs = trace.withPhis(&[_]IrInstr{
+        .{ .op = .slot_load, .aux = 0 }, // %0 the observed pattern string
+        .{ .op = .guard_sid, .a = 0, .aux = 0 }, // %1
+        .{ .op = .guard_sid, .a = 0, .aux = 0 }, // %2 exact duplicate -> dropped
+        .{ .op = .guard_sid, .a = 0, .aux = 1 }, // %3 DIFFERENT expected string -> kept (round-2 M01)
+        .{ .op = .loop }, // %4
+    }, &[_]SlotStore{.{ .slot = 0, .ref = 0 }});
+    const consts = [_]Value{ Value.int(7), Value.int(8) };
+    var opt = try optimize(gpa, &instrs, &consts);
+    defer freeOpt(gpa, &opt);
+    try testing.expectEqual(@as(usize, 2), countOp(opt.instrs, .guard_sid));
+}
+
+test "doc 30: exit provenance — no callout op carries a PC or joins the side-exit guard set" {
+    const ops = [_]IrOp{ .sfindp, .smatch, .sgmatch, .scap_int, .scap_str, .str2num_i, .str2num_f, .sgm_setpos, .guard_sid };
+    for (ops) |op| {
+        // aux holds an operand ref / konst id / slot — NEVER a PC (doc 30
+        // M02): the exit-PC accessors must refuse, and none of these are
+        // hotguard / side-trace predicates.
+        try testing.expectEqual(@as(?u32, null), trace.guardExitPc(.{ .op = op, .a = 0, .aux = 5 }));
+        try testing.expectEqual(@as(?u32, null), trace.guardSourcePc(.{ .op = op, .a = 0, .aux = 5 }));
+        try testing.expect(!trace.isSideExitGuardOp(op));
+    }
 }
