@@ -2765,3 +2765,155 @@ test "doc 30 c3: malformed stamps and layouts fail closed — the never-trust-th
         c2.deinit();
     }
 }
+
+/// [doc 30 c4b] The RECORDED gmatch for-in shape: the loop variable `w` is a
+/// carried STRING slot — guard_string-pinned at the load, consumed by `slen`,
+/// then overwritten each iteration by the fresh `scap_str` whole-match. The
+/// c4b classification arm admits it: the hoisted guard_string covers the
+/// ENTRY value (iteration 1), `isStringProducerOp` proves iterations 2+, and
+/// every flush re-boxes TAG_HEAP. regs: r0=state, r1=w (carried), r2=acc.
+fn carriedStringTrace(consts: []Value) Trace {
+    const instrs = struct {
+        var arr = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: state
+            .{ .op = .guard_table, .a = 0 }, // 1: invariant .ptr pin
+            .{ .op = .slot_load, .aux = 1 }, // 2: w — the carried string
+            .{ .op = .guard_string, .a = 2 }, // 3: entry pin (hoisted)
+            .{ .op = .slen, .a = 2, .ty = .int }, // 4: #w
+            .{ .op = .slot_load, .aux = 2 }, // 5: acc
+            .{ .op = .guard_int, .a = 5 }, // 6
+            .{ .op = .add, .a = 5, .b = 4 }, // 7: acc + #w
+            .{ .op = .sgmatch, .a = 0, .aux = 1, .ty = .int }, // 8: next token; exhaustion → exit
+            .{ .op = .scap_str, .a = 8, .b = 2, .ty = .heap }, // 9: whole match — the writeback producer
+            .{ .op = .scap_int, .a = 8, .b = 35, .ty = .int }, // 10: next_pos
+            .{ .op = .sgm_setpos, .a = 0, .b = 10 }, // 11: deferred cursor commit
+            .{ .op = .phi, .b = 9, .aux = 1 }, // w ← scap_str
+            .{ .op = .phi, .b = 7, .aux = 2 }, // acc
+            .{ .op = .loop },
+        };
+    };
+    const es = struct {
+        var arr = [_]u16{};
+    };
+    return Trace{ .anchor = undefined, .instrs = &instrs.arr, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
+}
+
+/// Same shape, but the φ writeback for `w` is the string-guarded slot_load
+/// itself (`w ← w`) — kind `.heap`, yet NOT a static string PRODUCER. The
+/// c4b arm must refuse it: only producer results are strings by construction
+/// on iterations 2+ (a guard proves the value it guarded, not a writeback).
+fn carriedStringBadWritebackTrace(consts: []Value) Trace {
+    const instrs = struct {
+        var arr = [_]I{
+            .{ .op = .slot_load, .aux = 0 }, // 0: state
+            .{ .op = .guard_table, .a = 0 }, // 1
+            .{ .op = .slot_load, .aux = 1 }, // 2: w
+            .{ .op = .guard_string, .a = 2 }, // 3
+            .{ .op = .slen, .a = 2, .ty = .int }, // 4
+            .{ .op = .slot_load, .aux = 2 }, // 5: acc
+            .{ .op = .guard_int, .a = 5 }, // 6
+            .{ .op = .add, .a = 5, .b = 4 }, // 7
+            .{ .op = .sgmatch, .a = 0, .aux = 1, .ty = .int }, // 8
+            .{ .op = .scap_str, .a = 8, .b = 2, .ty = .heap }, // 9 (produced, unused by the φ)
+            .{ .op = .scap_int, .a = 8, .b = 35, .ty = .int }, // 10
+            .{ .op = .sgm_setpos, .a = 0, .b = 10 }, // 11
+            .{ .op = .phi, .b = 2, .aux = 1 }, // w ← w: NOT a producer
+            .{ .op = .phi, .b = 7, .aux = 2 },
+            .{ .op = .loop },
+        };
+    };
+    const es = struct {
+        var arr = [_]u16{};
+    };
+    return Trace{ .anchor = undefined, .instrs = &instrs.arr, .consts = consts, .entry_slots = &es.arr, .entry_guards = &.{} };
+}
+
+test "doc 30 c4b: carried-string slot — native compiles, runs, flushes TAG_HEAP; prologue pins the entry; non-producer writeback fails closed" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    // "ab cd ef" with %a+ and w0 = "xx": three completed iterations
+    // (slen(w0)=2 + slen("ab")=2 + slen("cd")=2 → acc=6), then iteration 4
+    // consumes "ef" via slen but exits at the exhausted sgmatch BEFORE its φ
+    // — flushed state is the LAST COMMITTED iteration's: acc=6, w="ef"
+    // (iteration 3's scap_str), pos cell = 8.
+    const subject = "ab cd ef";
+    const patsrc = "%a+";
+
+    // Tier-1a oracle.
+    var iheap = gc.Heap.init(gpa);
+    defer iheap.deinit();
+    const isubj = try iheap.intern(subject);
+    const ipat = try iheap.intern(patsrc);
+    const iw0 = try iheap.intern("xx");
+    const istate = try gmatchStateTable(&iheap, &isubj.header, &ipat.header, 0);
+    var iconsts = [_]Value{ Value.int(1), Value.heap(&ipat.header) };
+    const ti = carriedStringTrace(&iconsts);
+    const iobjs_before = iheap.object_count;
+    var iregs = [_]Value{ Value.heap(&istate.header), Value.heap(&iw0.header), Value.int(0) };
+    const values = try gpa.alloc(Value, ti.instrs.len);
+    defer gpa.free(values);
+    const iresult = irinterp.executeValuesCtx(.{ .heap = &iheap }, &ti, &iregs, values);
+    try testing.expectEqual(@as(usize, 3), iresult.completed);
+    try testing.expectEqual(@as(u32, 8), iresult.exit_instr);
+    try testing.expectEqual(Value.int(6).payload.bits, iregs[2].payload.bits);
+    try testing.expect(iregs[1].isHeap() and iregs[1].heapType() == .string);
+    try testing.expectEqual(@intFromPtr(&iheap.internedLookup("ef").?.header), @intFromPtr(iregs[1].asHeap()));
+    try testing.expectEqual(@as(i64, 8), istate.inLaneValueIntCell(3).?);
+    const iallocs = iheap.object_count - iobjs_before;
+
+    // Native leg — fresh heap, same shape; assert full parity plus the
+    // TAG_HEAP flush of the carried string.
+    var nheap = gc.Heap.init(gpa);
+    defer nheap.deinit();
+    const nsubj = try nheap.intern(subject);
+    const npat = try nheap.intern(patsrc);
+    const nw0 = try nheap.intern("xx");
+    const nstate = try gmatchStateTable(&nheap, &nsubj.header, &npat.header, 0);
+    var nconsts = [_]Value{ Value.int(1), Value.heap(&npat.header) };
+    const tn = carriedStringTrace(&nconsts);
+    const nobjs_before = nheap.object_count;
+    var ct = nativegen.compileWithHeap(gpa, &tn, &nheap) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    var nregs = [_]Value{ Value.heap(&nstate.header), Value.heap(&nw0.header), Value.int(0) };
+    const nresult = try util.runNative(ct, &nregs);
+    try testing.expectEqual(iresult.completed, nresult.completed);
+    try testing.expectEqual(iresult.exit_instr, nresult.exit_instr);
+    try testing.expectEqual(iregs[2].payload.bits, nregs[2].payload.bits);
+    try testing.expect(nregs[1].isHeap() and nregs[1].heapType() == .string);
+    try testing.expectEqual(@intFromPtr(&nheap.internedLookup("ef").?.header), @intFromPtr(nregs[1].asHeap()));
+    try testing.expectEqual(@as(i64, 8), nstate.inLaneValueIntCell(3).?);
+    try testing.expectEqual(iallocs, nheap.object_count - nobjs_before);
+
+    // Prologue pins the ENTRY value: an INT in the w slot fails the [RV-1]
+    // TAG_HEAP tag lane; a TABLE passes the tag but fails the is_string
+    // `header.type == string` pin. Both: completed 0, regs untouched.
+    {
+        const regs_init = [_]Value{ Value.heap(&nstate.header), Value.int(42), Value.int(0) };
+        var xregs = regs_init;
+        const xresult = try util.runNative(ct, &xregs);
+        try testing.expectEqual(@as(usize, 0), xresult.completed);
+        try testing.expectEqual(irinterp.ExitReason.prologue_fail, xresult.exit_reason);
+        try util.expectRegsEqual(&regs_init, &xregs);
+    }
+    {
+        const tbl = try table.Table.create(gpa);
+        defer tbl.destroy(gpa);
+        const regs_init = [_]Value{ Value.heap(&nstate.header), Value.heap(&tbl.header), Value.int(0) };
+        var xregs = regs_init;
+        const xresult = try util.runNative(ct, &xregs);
+        try testing.expectEqual(@as(usize, 0), xresult.completed);
+        try testing.expectEqual(irinterp.ExitReason.prologue_fail, xresult.exit_reason);
+        try util.expectRegsEqual(&regs_init, &xregs);
+    }
+
+    // Fail closed: a `.heap` φ writeback that is NOT a static string producer
+    // (`w ← w`, a guard-covered slot_load) is refused by the c4b arm.
+    {
+        var bconsts = [_]Value{ Value.int(1), Value.heap(&npat.header) };
+        const tb = carriedStringBadWritebackTrace(&bconsts);
+        var arena = McodeArena.init(gpa);
+        defer arena.deinit();
+        try testing.expect(compileInto(gpa, &arena, &tb, null, &nheap) == null);
+    }
+}

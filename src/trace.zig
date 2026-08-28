@@ -13262,6 +13262,43 @@ pub const TraceState = struct {
         const a = instr.a;
         const v1 = regs.get(a + 3);
         if (v1.isNil()) return self.abort(.bad_type); // end direction
+        // Pin the OLD ctrl (`a+2`) by observed type. The test block's
+        // `move base+5 ← base+2` already materialized an UNGUARDED slot_load
+        // of it (the arg-window copy the iterator may ignore), and an
+        // unguarded slot_load has no provable kind — proveKinds would refuse
+        // the whole trace for native. Unlike the v1 pin below this guard has
+        // no loop semantics (any ctrl continues the loop); it exists purely so
+        // the shuttle has a kind, so the policy differs at the edges:
+        //   * nil → abort. Only reachable when recording starts at a loop
+        //     instance's FIRST iteration (ctrl still the initial nil); the
+        //     back-edge hotcount discipline starts recordings via the back
+        //     edge (iteration ≥ 2), so this is a rare race, and a retry lands
+        //     on a pinnable iteration — better than committing a trace that
+        //     can never leave tier-1a.
+        //   * bool / exotic heap → record UNPINNED. No guard op can pin them
+        //     (no non-nil guard exists), the trace stays sound (native
+        //     declines it; tier-1a executes it), and aborting forever would
+        //     be strictly worse than tier-1a.
+        const vc = regs.get(a + 2);
+        if (vc.isNil()) return self.abort(.bad_type);
+        const rc = try self.refOf(a + 2);
+        if (self.konstValueOf(rc) == null and !self.isProvenStringRef(rc)) {
+            if (vc.isNumber()) {
+                try self.guardNum(rc, vc, .operand_type, .a);
+            } else if (vc.isHeap()) {
+                switch (vc.heapType()) {
+                    .string => self.stampProv(try self.emit(.{ .op = .guard_string, .a = rc }), .operand_type, .a, .neutral),
+                    .table => {
+                        const ctbl = table_mod.Table.fromHeader(vc.asHeap());
+                        if (ctbl.metatable == null)
+                            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rc }), .operand_type, .a, .neutral);
+                        // metatable-bearing ctrl: leave unpinned (tier-1a).
+                    },
+                    else => {}, // exotic heap ctrl: leave unpinned (tier-1a).
+                }
+            }
+            // bool ctrl: leave unpinned (tier-1a).
+        }
         const r1 = try self.refOf(a + 3);
         if (self.konstValueOf(r1) == null and !self.isProvenStringRef(r1)) {
             if (v1.isNumber()) {

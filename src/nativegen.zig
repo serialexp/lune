@@ -3072,6 +3072,23 @@ fn locEql(x: Loc, y: Loc) bool {
 /// Ops whose result can be computed *into* a destination home in place (win 2). A
 /// compare result is Bool, never carried (type-stability bails), and konst has no
 /// operand to anchor the home — so only arithmetic/bitwise + unary qualify.
+/// [doc 30 c4b] Ops whose result is BY CONSTRUCTION an interned `*String` —
+/// the `is_string[i] = true` PRODUCER arms of proveKinds Pass B (tostr/snew/
+/// case/scap_str classes; NOT the guard-derived sources: a string-guarded
+/// slot_load or string konst proves only its own value, not a writeback).
+/// Used by the carried-string classification arm: a slot may carry a `.heap`
+/// value across iterations only when the φ writeback is one of these. Keep
+/// this list a SUBSET of proveKinds' producer set — a missing op merely bails
+/// a compilable trace (fail closed); an op here that proveKinds does not
+/// treat as a string would be type confusion in the body's static string
+/// facts (`slen`, snew operands).
+fn isStringProducerOp(op: trace.IrOp) bool {
+    return switch (op) {
+        .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower, .scap_str => true,
+        else => false,
+    };
+}
+
 fn isCoalescibleOp(op: trace.IrOp) bool {
     return switch (op) {
         .add, .sub, .mul, .band, .bor, .bxor, .neg, .bnot => true,
@@ -3171,12 +3188,47 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                 // entry tag-check and every flush use TAG_HEAP. Structural bails below
                 // refuse anything this cut cannot check per-iteration (array/grid roots).
                 s.kind = .heap;
+            } else if (lk == .heap and sk == .heap) {
+                // [doc 30 c4b] Carried STRING: a `guard_string`-covered slot whose φ
+                // writeback is a STATIC string producer — the gmatch for-in's loop
+                // variable, where each iteration's `w` is the fresh `scap_str`
+                // result. Soundness is split across the iterations exactly like
+                // carried-heap tables, but with a STRONGER entry pin and a STRONGER
+                // writeback proof, because the body's string facts (`slen`, snew
+                // operands) are static — there are no per-iteration dynamic guards
+                // to fall back on:
+                //   * iteration 1 (the entry value): `is_string` makes the prologue
+                //     keep the FULL guard_string pin — the [RV-1] TAG_HEAP tag-lane
+                //     check plus `header.type == string`;
+                //   * iterations 2+ (the carried value): the writeback must be a
+                //     producer whose result is a `*String` by construction
+                //     (`isStringProducerOp`), so string-ness holds with no check.
+                // The home is a GP register/spill holding the current `*GcHeader`,
+                // refreshed by the back-edge φ shuffle; every flush uses TAG_HEAP
+                // (heap boxing is type-agnostic — the type lives in the header).
+                // The [doc 22 §A.2] GC-admission sweep below already covers this
+                // slot (keyed on kind `.heap`, any class), and the structural bails
+                // refuse any table-shaped op rooted at it. An unpinned `.heap` load
+                // or a non-producer writeback (e.g. a `.ptr` table masquerading
+                // through kind `.heap`) fails closed.
+                const lref: u16 = @intCast(s.load_ref);
+                var pinned = false;
+                for (t.instrs) |g| {
+                    if (g.op == .guard_string and g.a == lref) {
+                        pinned = true;
+                        break;
+                    }
+                }
+                if (!pinned) return error.Bail;
+                if (!isStringProducerOp(t.instrs[@intCast(s.store_ref)].op)) return error.Bail;
+                s.kind = .heap;
+                s.is_string = true;
             } else {
                 // [RV-4 / review P0] The *load* class fixes the prologue tag-check and the
-                // home's register class. Outside the carried-heap case above, a `.ptr`
-                // load carried would skip the table/lane checks and reinterpret an
-                // int/float payload as a `*GcHeader` → type confusion; only a boxable
-                // scalar may be carried.
+                // home's register class. Outside the carried-heap and carried-string
+                // cases above, a `.ptr` load carried would skip the table/lane checks
+                // and reinterpret an int/float payload as a `*GcHeader` → type
+                // confusion; only a boxable scalar may be carried.
                 if (lk != .int and lk != .float) return error.Bail;
                 // [RV-3] type-stability: the store class must match the load class. A slot
                 // loaded int but stored float (or vice versa) would pass our once-hoisted
@@ -3340,7 +3392,9 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
     // tag it so the prologue emits the once-per-entry `header.type == string`
     // check. Defensive: bail rather than miscompile if no guard is found — an
     // unpinned invariant heap slot would let a table payload flow into the snew
-    // callouts as a `*String`.
+    // callouts as a `*String`. (A CARRIED `.heap` string slot got the same
+    // `is_string` tag — plus the writeback-producer proof — in the doc 30 c4b
+    // classification arm above; this block is the invariant half only.)
     for (slots.items) |*s| {
         if (s.class != .invariant or s.kind != .heap) continue;
         const lr: u16 = @intCast(s.load_ref);
@@ -5864,12 +5918,15 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
         try a.jcc(.ne, prologue_fail);
     }
 
-    // [guard_string prologue — doc 24 c3] For each string-pinned slot (a
-    // `guard_string`-covered invariant `.heap` slot_load, tagged `is_string` by
-    // analyzeInner) the pointer is now in its home; the [RV-1] tag-lane check
-    // above proved TAG_HEAP, so this pins the object's TYPE — byte-identical to
-    // irinterp's `guard_string` arm — once per entry (the slot is read-only in
-    // the trace, so it cannot change within a native run). A miss returns 0
+    // [guard_string prologue — doc 24 c3 + doc 30 c4b] For each string-pinned
+    // slot (a `guard_string`-covered `.heap` slot_load, tagged `is_string` by
+    // analyzeInner — invariant OR carried) the pointer is now in its home; the
+    // [RV-1] tag-lane check above proved TAG_HEAP, so this pins the object's
+    // TYPE — byte-identical to irinterp's `guard_string` arm — once per entry.
+    // For an INVARIANT slot that covers the whole run (read-only). For a
+    // CARRIED slot it covers iteration 1 only, and iterations 2+ hold a
+    // static string-producer result (the c4b classification proof), so
+    // string-ness still holds with no per-iteration check. A miss returns 0
     // (regs[] untouched), side-exiting to tier-0 which re-observes and aborts
     // or re-guards.
     for (alloc.slots) |s| {
