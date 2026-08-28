@@ -5591,6 +5591,12 @@ fn emitLinkedLoopDoneSnapshot(
             .hstore => try emitHStore(a, kinds, alloc, p),
             .gstore => try emitGStore(a, t, alloc, p),
             .phi, .loop, .link => break,
+            // Defensive belt: the linked branch is only emitted when
+            // `irinterp.loopDoneSnapshotSupported` accepted the range, so a
+            // `sgm_setpos` here means the gate and this walk drifted apart —
+            // fail the compile rather than emit a snapshot that silently
+            // skips a store (the un-advanced gmatch cursor would re-yield).
+            .sgm_setpos => return error.UnsupportedLoopDoneStore,
             else => {},
         }
     }
@@ -6818,8 +6824,17 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             a.bind(l);
             try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(ei));
             if (isNumericForLoopDoneGuard(t, ei)) {
-                try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
-                try a.jcc(.ne, try nativeLinkedLoopDoneLabel(a, linked_loop_done_labels, ei));
+                // [doc 30 §6 named coupling] Only emit the linked branch when the
+                // snapshot walk can commit EVERY sunk store below the guard — a
+                // range containing `sgm_setpos` (which the walk's closed inventory
+                // does not commit) must never take the linked path. With the branch
+                // unemitted this guard is mode-0-always: ordinary deopt, tier-0
+                // replays the final iteration (replay-idempotent, sound). Tier-1a
+                // declines through the same predicate in flushNumericForLoopDone.
+                if (irinterp.loopDoneSnapshotSupported(t, ei)) {
+                    try a.cmpQwordMemImm8(.rdx, @offsetOf(NativeResult, "linked_loop_done"), 0);
+                    try a.jcc(.ne, try nativeLinkedLoopDoneLabel(a, linked_loop_done_labels, ei));
+                }
                 // mode 0 (ordinary loop-done deopt): bypass slot[ei] → `shared_exit`.
                 if (shared_exit) |se| {
                     try a.movRegImm64(.rax, @bitCast(@as(u64, se)));

@@ -778,3 +778,37 @@ test "executor: a hot numeric-for sum runs via the IR-interpreter (back-edges co
     const t = vm.trace.cache.items[0];
     try testing.expectEqual(vm.trace.config.hotloop, vm.trace.backEdgeCount(t.anchor));
 }
+
+test "doc 30 c5: loopDoneSnapshotSupported — a sunk sgm_setpos below the loop-done guard declines the linked continuation" {
+    const I = trace.IrInstr;
+    // Sunk-store range [guard+1 .. phi): astore + sgm_setpos. The cursor
+    // commit is NOT in the commit walks' closed store inventory, so the
+    // range must decline (both tiers then take ordinary deopt: tier-0
+    // replays the final iteration against the un-advanced cursor —
+    // replay-idempotent, sound).
+    var with_setpos = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0
+        .{ .op = .guard_true, .a = 0 }, // 1: the loop-done guard (position only)
+        .{ .op = .astore, .a = 0, .b = 0 }, // 2
+        .{ .op = .sgm_setpos, .a = 0, .b = 0 }, // 3: the gmatch cursor commit
+        .{ .op = .phi, .b = 0, .aux = 0 }, // 4
+        .{ .op = .loop }, // 5
+    };
+    var t = trace.Trace{ .anchor = undefined, .instrs = &with_setpos, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try std.testing.expect(!irinterp.loopDoneSnapshotSupported(&t, 1));
+    // The scan stops at the φ block: a sgm_setpos BEFORE the guard (not in
+    // the sunk range) does not decline — only the post-guard range counts.
+    try std.testing.expect(irinterp.loopDoneSnapshotSupported(&t, 3));
+
+    // Control: the same shape with only closed-inventory stores is supported.
+    var plain = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_true, .a = 0 },
+        .{ .op = .astore, .a = 0, .b = 0 },
+        .{ .op = .hstore, .a = 0, .b = 0 },
+        .{ .op = .phi, .b = 0, .aux = 0 },
+        .{ .op = .loop },
+    };
+    t = trace.Trace{ .anchor = undefined, .instrs = &plain, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    try std.testing.expect(irinterp.loopDoneSnapshotSupported(&t, 1));
+}

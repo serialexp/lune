@@ -2573,8 +2573,16 @@ pub const TraceState = struct {
     /// this is consulted only when the watch MOVES and again at arm time, both cold.
     /// A memo here would buy nothing and cost a build/free/serialize lifecycle.
     ///
-    /// The store ops are exactly `tropt.kindOf`'s `.astore` class. Guards (which
+    /// The store ops here are `tropt.kindOf`'s `.astore` class. `sgm_setpos`
+    /// (kind `.setpos`, doc 30) is a store too, but it is NEVER emitted inline —
+    /// it only enters the IR through the pending-store sink, below every guard —
+    /// so no exit can precede one and the scan need not name it. That safety
+    /// lives in `commit`'s sinking discipline, not here: if `sgm_setpos` ever
+    /// gains an inline emission path it must join this list. Guards (which
     /// side-exit but mutate nothing) and `int_of_float` are deliberately fine.
+    /// The doc-24 allocating producers (`tostr_*`, snew, `scap_str`) also fall
+    /// through: they only intern (grow the heap), never mutate guest-visible
+    /// state, so re-running the iteration re-interns identically (D2 id-stream).
     fn exitIsPreEffect(t: *const Trace, exit_instr: u32) bool {
         const n = @min(@as(usize, exit_instr), t.instrs.len);
         for (t.instrs[0..n]) |ins| switch (ins.op) {

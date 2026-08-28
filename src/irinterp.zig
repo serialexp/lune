@@ -261,6 +261,32 @@ pub const LedgerEntry = struct {
     outcome: LedgerOutcome = .normal,
 };
 
+/// [doc 30 §6 named coupling] Can the loop-done commit walks handle every sunk
+/// store below this guard? The two walks — the tier-1a flush below and
+/// nativegen's `emitLinkedLoopDoneSnapshot` — enumerate a CLOSED store
+/// inventory (`astore`/`hstore`/`gstore`); `sgm_setpos` (the gmatch cursor
+/// commit) rides the same pending-store sinking and so lands in exactly this
+/// range, but neither walk commits it. Skipping it silently would leave the
+/// gmatch cursor un-advanced while the continuation runs the POST-loop code —
+/// the last token would be re-yielded. So a range containing one must DECLINE
+/// the linked continuation: ordinary deopt replays the final iteration in
+/// tier-0 against the un-advanced cursor, which is replay-idempotent by
+/// construction (the doc 30 §6 sinking argument) and therefore always sound,
+/// merely slower. Shared by tier-1a (the flush pre-scan) and native (the
+/// linked-branch emission gate), so both tiers decline identically. Keep the
+/// inventory here in lockstep with BOTH walks' arms.
+pub fn loopDoneSnapshotSupported(t: *const Trace, exit_instr: usize) bool {
+    var si = exit_instr + 1;
+    while (si < t.instrs.len) : (si += 1) {
+        switch (t.instrs[si].op) {
+            .sgm_setpos => return false,
+            .phi, .loop, .link => return true,
+            else => {},
+        }
+    }
+    return true;
+}
+
 /// Commit the final numeric-`for` iteration at a loop-done side exit so a linked
 /// continuation can start at the post-loop PC without tier-0 replaying that
 /// iteration. This is deliberately not part of ordinary `execute`: normal deopt
@@ -273,6 +299,7 @@ pub fn flushNumericForLoopDone(t: *const Trace, regs: RegWindow, values: []Value
     if (exit_pc == 0 or exit_pc > t.anchor.proto.code.len) return false;
     const for_ins = t.anchor.proto.code[trace.guardSourcePc(guard).?];
     if (for_ins.op != .for_loop) return false;
+    if (!loopDoneSnapshotSupported(t, exit_instr)) return false;
 
     var si: usize = @intCast(exit_instr + 1);
     while (si < t.instrs.len) : (si += 1) {
