@@ -234,6 +234,18 @@ pub const RecordedBuiltin = enum(u8) {
     /// (`instr.c == 1`; multi-result calls stay a barrier). Pure and
     /// non-allocating; an empty range side-exits (tier-0 renders nil).
     codepoint = 19,
+    // -- doc 30: the pattern engine + string→number.
+    /// `string.find(s, pat [, init [, plain]])` — plain/no-specials → `sfindp`
+    /// + konst-folded end; else `smatch` + scratch projections. Matched
+    /// direction only in v1; the pattern must pin (konst or `guard_sid`).
+    find = 20,
+    /// `string.match(s, pat [, init])` — `smatch` + whole-match/capture
+    /// projections, same pinning and direction rules as `find`.
+    match = 21,
+    /// `@gmatch_iter(state)` — `sgmatch`, the composite iterator step (doc 30
+    /// §6): shim-verified pattern identity + B03 state layout, deferred
+    /// `sgm_setpos` cursor commit.
+    gmatch_iter = 22,
 };
 
 /// Which **nondeterministic input** a native represents, if any. A native with a

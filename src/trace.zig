@@ -43,6 +43,10 @@ const table_mod = @import("table.zig");
 const arr = @import("array.zig");
 const string_mod = @import("string.zig");
 const gc = @import("gc.zig");
+// Doc 30 c4: the recorder's P2/P3 surface — the SAME pure cores tier-0 and
+// the shims run (census, locate, init resolution), never a re-derivation.
+const string_stdlib = @import("stdlib/string.zig");
+const pattern_mod = @import("stdlib/pattern.zig");
 
 // ---------------------------------------------------------------------------
 // Trace IR
@@ -8450,10 +8454,13 @@ pub const TraceState = struct {
     /// a branch guard is a prime-side-trace candidate. Shared by the counter, the
     /// arm gate, and the chain gate so all three agree on "what is a prime-side exit".
     ///
-    /// Only numeric `for_loop` needs excluding: generic-for (`tfor_loop`) is
-    /// unrecordable (the recorder aborts on it), so a loop-done guard for a
-    /// generic-for never reaches a trace and can't reach this discriminator — there
-    /// is no false-negative where a real branch guard is mistaken for a loop-done one.
+    /// Only numeric `for_loop` needs excluding: generic-for (`tfor_loop`) IS
+    /// recordable (doc 30 c4, `recTForLoop`), but its loop-done pin is a *type*
+    /// guard on the first loop variable (`guard_num`/`guard_string`/`guard_table`
+    /// — nil ends the loop, so the non-nil type pin doubles as the loop-done
+    /// check), never a `guard_true`/`guard_false`. The op check above therefore
+    /// already excludes it — there is no false-negative where a real branch
+    /// guard is mistaken for a generic-for loop-done one.
     pub fn isSourceBranchGuardExit(self: *const TraceState, failed: *const Trace, exit_instr: u32, proto: *const Proto) bool {
         _ = self;
         if (exit_instr == std.math.maxInt(u32)) return false;
@@ -12062,6 +12069,9 @@ pub const TraceState = struct {
             .jmp => {}, // straight-line trace: control flow is implicit.
             .jmp_if_false, .jmp_if_true => try self.recBranch(instr, regs),
             .for_loop => try self.recForLoop(instr, regs, pc),
+            // Doc 30 c4: the generic-for back-edge — mirrors the CONTINUE
+            // direction (first loop var non-nil → publish it as ctrl).
+            .tfor_loop => try self.recTForLoop(instr, regs),
             // Nested-loop trace linking (doc 15, Phase 2). A continuation recording
             // re-reaching an inner numeric-`for`'s `for_prep` whose loop header
             // already has a root trace records `for_prep`'s pre-decrement and closes
@@ -12559,7 +12569,18 @@ pub const TraceState = struct {
         while (n > 0) {
             n -= 1;
             const ps = self.rec.pending_stores.items[n];
-            if (ps.op != .astore) continue; // a present hash overwrite cannot change an array slot
+            switch (ps.op) {
+                .astore => {},
+                // A present hash overwrite cannot change an array slot.
+                .hstore => continue,
+                // Doc 30: a pending `sgm_setpos` DOES write an array cell
+                // (the gmatch state's slot 3) — fail closed on any store op
+                // this classifier wasn't written for.
+                else => {
+                    self.abort(.bad_type);
+                    return true;
+                },
+            }
             const addr = self.rec.instrs.items[ps.aref];
             std.debug.assert(addr.op == .aref);
             if (addr.a != rtab) {
@@ -13217,6 +13238,47 @@ pub const TraceState = struct {
     /// `for_loop` (numeric-for back-edge): record the increment and the
     /// loop-continuation guard, mirroring the opcode. The actual back-edge / close
     /// is handled by `onBackEdge`.
+    /// Generic-for back-edge (doc 30 c4): `tfor_loop base, target` — tier-0
+    /// continues iff the first loop variable (`base+3`) is non-nil, publishing
+    /// it as the next control (`base+2`). The recorder mirrors the CONTINUE
+    /// direction only: the observed v1 is pinned non-nil by its type guard
+    /// (number → `guardNum`, string → `guard_string`, table → `guard_table`;
+    /// a konst or proven string producer — e.g. the composite gmatch step's
+    /// `scap_str` — is nil-free statically and needs no pin), and the ctrl
+    /// slot inherits v1's ref (a pure ref move, like `.move`). An observed
+    /// nil (the loop's end) aborts: leaving the loop is not loop-body code —
+    /// the numeric `for_loop`'s exit-direction rule. At run time a
+    /// nil-producing iteration side-exits at the pin (or earlier, at the
+    /// composite step's negative status) and tier-0 replays the call,
+    /// produces the nil, and ends the loop itself. A BOOLEAN v1 aborts
+    /// fail-closed: `false` is non-nil (the loop continues) but no guard op
+    /// expresses "non-nil" without also pinning truthiness. No
+    /// `locals_watermark` here: generic-for keeps the maxInt sentinel (the
+    /// loop variables live below the call window and stay in the snapshot).
+    fn recTForLoop(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        // Same cross-proto pc hazard as `recForLoop`: never process a
+        // back-edge inside an inlined callee.
+        if (self.rec.inline_depth > 0) return self.abort(.cross_frame);
+        const a = instr.a;
+        const v1 = regs.get(a + 3);
+        if (v1.isNil()) return self.abort(.bad_type); // end direction
+        const r1 = try self.refOf(a + 3);
+        if (self.konstValueOf(r1) == null and !self.isProvenStringRef(r1)) {
+            if (v1.isNumber()) {
+                try self.guardNum(r1, v1, .operand_type, .a);
+            } else if (v1.isHeap()) switch (v1.heapType()) {
+                .string => self.stampProv(try self.emit(.{ .op = .guard_string, .a = r1 }), .operand_type, .a, .neutral),
+                .table => {
+                    const tbl = table_mod.Table.fromHeader(v1.asHeap());
+                    if (tbl.metatable != null) return self.abort(.has_metatable);
+                    self.stampProv(try self.emit(.{ .op = .guard_table, .a = r1 }), .operand_type, .a, .neutral);
+                },
+                else => return self.abort(.bad_type),
+            } else return self.abort(.bad_type);
+        }
+        self.setReg(a + 2, r1); // publish ctrl = v1
+    }
+
     fn recForLoop(self: *TraceState, instr: Instr, regs: RegWindow, pc: u32) !void {
         // Cross-frame tracing (Phase 0): never process a `for_loop` inside an
         // inlined callee. The `target == anchor.pc` watermark test below compares
@@ -13641,7 +13703,9 @@ pub const TraceState = struct {
         }
         if (was_dynamic_c) {
             switch (rb) {
-                .codepoint, .select => return self.abort(.cross_frame),
+                // Doc 30 §5: find/match/gmatch_iter join the D1 EXCLUDED list
+                // in v1 — the producer shadow would need the census count.
+                .codepoint, .select, .find, .match, .gmatch_iter => return self.abort(.cross_frame),
                 else => {},
             }
             eff.c = 1;
@@ -13667,6 +13731,9 @@ pub const TraceState = struct {
             .upper => try self.recBSCase(eff, regs, .upper, .supper),
             .lower => try self.recBSCase(eff, regs, .lower, .slower),
             .codepoint => try self.recBSCodepoint(eff, regs),
+            .find => try self.recBSFind(eff, regs),
+            .match => try self.recBSMatch(eff, regs),
+            .gmatch_iter => try self.recBSGmatchIter(eff, regs),
         }
         // D1 publish — only a LIVE recording may leave a shadow (an aborting arm
         // set `rec.active = false`; §3a truthfulness: set only by a successfully
@@ -13846,6 +13913,8 @@ pub const TraceState = struct {
     fn isProvenStringRef(self: *const TraceState, r: Ref) bool {
         return switch (self.rec.instrs.items[@intCast(r)].op) {
             .tostr_int, .tostr_num, .ssub, .srev, .schar1, .srep2, .supper, .slower => true,
+            // Doc 30: an interned capture span is a string by construction.
+            .scap_str => true,
             else => false,
         };
     }
@@ -14010,6 +14079,217 @@ pub const TraceState = struct {
         self.setReg(instr.a, try self.emit(.{ .op = .scp, .a = sref, .b = iref, .aux = @intCast(jref), .ty = .int }));
     }
 
+    // --- doc 30: the pattern-engine arms -----------------------------------
+
+    const PatternPin = struct { ref: Ref, str: *const string_mod.String };
+
+    /// P1: pin the pattern argument. A konst interned string passes ref-
+    /// through (bytes from the pool value); an observed runtime string gets
+    /// the interned-identity pin — `guard_string` for the dominating type
+    /// proof (unless the producer already proves it) plus `guard_sid` against
+    /// the pattern's konst-pool entry (§2a: equal bytes ⇔ same object within
+    /// a heap, so identity pins content — a cached-in-a-local pattern records
+    /// as well as a literal). Anything else aborts; tier-0 owns coercions.
+    /// Null = aborted (the `stringArgRef` convention).
+    fn patternArgPin(self: *TraceState, arg_slot: u16, regs: RegWindow, operand: OperandDesig) !?PatternPin {
+        const r = try self.refOf(arg_slot);
+        if (self.konstValueOf(r)) |kv| {
+            if (!kv.isHeap() or kv.heapType() != .string) {
+                self.abort(.bad_type);
+                return null;
+            }
+            return .{ .ref = r, .str = string_mod.String.fromHeader(kv.asHeap()) };
+        }
+        const v = regs.get(arg_slot);
+        if (!v.isHeap() or v.heapType() != .string) {
+            self.abort(.bad_type);
+            return null;
+        }
+        if (!self.isProvenStringRef(r))
+            self.stampProv(try self.emit(.{ .op = .guard_string, .a = r }), .operand_type, operand, .neutral);
+        // Rooting: `konst` interns the pattern Value into the trace pool
+        // (an explicit GC root); the guard carries the POOL ID, never a
+        // pointer — tier-1a resolves via `t.consts`, native bakes at compile
+        // time (§2a).
+        const pk = try self.konst(v);
+        const pool_id = self.rec.instrs.items[@intCast(pk)].aux;
+        self.stampProv(try self.emit(.{ .op = .guard_sid, .a = r, .aux = pool_id }), .operand_type, operand, .neutral);
+        return .{ .ref = r, .str = string_mod.String.fromHeader(v.asHeap()) };
+    }
+
+    /// Project a completed match's result window out of the scratch (doc 30
+    /// §3): `first_slot` is the caller's first result register offset within
+    /// the window this helper owns (find offsets captures by 2). Emits one
+    /// `scap_str` per STRING capture in capture order REGARDLESS of the
+    /// wanted count (B02 — tier-0 materializes every capture before the
+    /// result window truncates, so the id stream must too); position
+    /// captures are non-allocating and emitted only when register-wanted.
+    /// Nil-pads wanted results beyond the produced span (M04).
+    fn projectCaptures(self: *TraceState, m: Ref, base: usize, first: usize, census: pattern_mod.Census, nwanted: usize) !void {
+        var k: usize = 0;
+        while (k < census.ncap) : (k += 1) {
+            const slot = gc.MatchScratch.slot_cap0 + k;
+            const wanted = (first + k) < nwanted;
+            if (census.kinds[k] == .span) {
+                const r = try self.emitAlloc(.{ .op = .scap_str, .a = m, .b = @intCast(slot), .ty = .heap });
+                if (wanted) self.setReg(@intCast(base + first + k), r);
+            } else if (wanted) {
+                self.setReg(@intCast(base + first + k), try self.emit(.{ .op = .scap_int, .a = m, .b = @intCast(slot), .ty = .int }));
+            }
+        }
+        var w: usize = first + census.ncap;
+        while (w < nwanted) : (w += 1)
+            self.setReg(@intCast(base + w), try self.konst(Value.nil()));
+    }
+
+    /// `string.find(s, pat [, init [, plain]])` (doc 30 §5). Plain flag must
+    /// be konst (its truthiness picks the shape at record time). Plain or
+    /// no-specials → `sfindp` with the end index as recorder arithmetic
+    /// (`start + cpLen(pat) − 1`, konst-folded from the pinned pattern — the
+    /// empty pattern's `(st, st−1)` falls out with `cpLen == 0`); else
+    /// `smatch` + scratch projections. v1 records the MATCHED direction only
+    /// (P2): the arm runs the same core tier-0 is about to and aborts on
+    /// no-match/raise.
+    fn recBSFind(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b < 2 or instr.b > 4) return self.abort(.cross_frame);
+        if (instr.c < 1) return self.abort(.cross_frame);
+        try self.guardBuiltinCallee(instr.a, .find);
+        const base: usize = instr.a;
+        const sref = (try self.stringArgRef(@intCast(base + 1), regs, .a1)) orelse return;
+        const sobj: *const string_mod.String = string_mod.String.fromHeader(regs.get(@intCast(base + 1)).asHeap());
+        var plain = false;
+        if (instr.b == 4) {
+            const pref = try self.refOf(@intCast(base + 4));
+            const pkv = self.konstValueOf(pref) orelse return self.abort(.bad_type);
+            plain = pkv.isTruthy();
+        }
+        const init_ref: Ref = if (instr.b >= 3)
+            (try self.intArgRef(@intCast(base + 3), regs, .a3)) orelse return
+        else
+            try self.konst(Value.int(1));
+        const init_v: i64 = if (instr.b >= 3) regs.get(@intCast(base + 3)).asInt() else 1;
+        const pat = (try self.patternArgPin(@intCast(base + 2), regs, .a2)) orelse return;
+        const pat_bytes = pat.str.bytes();
+
+        if (plain or !pattern_mod.hasSpecials(pat_bytes)) {
+            // P2 via the same heap-free core the shim runs.
+            if (string_stdlib.sfindPlainCore(sobj, init_v, pat_bytes) < 1) return self.abort(.bad_type);
+            const r_start = try self.emit(.{ .op = .sfindp, .a = sref, .b = init_ref, .aux = @intCast(pat.ref), .ty = .int });
+            self.setReg(instr.a, r_start);
+            if (instr.c >= 2) {
+                const cp_minus1: i64 = @as(i64, @intCast(pat.str.cpLen())) - 1;
+                const kref = try self.konst(Value.int(cp_minus1));
+                self.setReg(@intCast(base + 1), try self.emit(.{ .op = .add, .a = r_start, .b = kref, .ty = .int }));
+            }
+            var w: usize = 2;
+            while (w < instr.c) : (w += 1) // M04: plain find has no captures
+                self.setReg(@intCast(base + w), try self.konst(Value.nil()));
+            return;
+        }
+        const census = pattern_mod.census(pat_bytes) orelse return self.abort(.bad_type);
+        const st = string_stdlib.resolveInit(init_v, sobj) orelse return self.abort(.bad_type);
+        var ms = pattern_mod.MatchState.init(sobj.bytes(), pat_bytes);
+        _ = (pattern_mod.locateMatch(&ms, st, true) catch null) orelse return self.abort(.bad_type);
+        const m = try self.emit(.{ .op = .smatch, .a = sref, .b = init_ref, .aux = @intCast(pat.ref), .ty = .int });
+        self.setReg(instr.a, try self.emit(.{ .op = .scap_int, .a = m, .b = @intCast(gc.MatchScratch.slot_start), .ty = .int }));
+        if (instr.c >= 2)
+            self.setReg(@intCast(base + 1), try self.emit(.{ .op = .scap_int, .a = m, .b = @intCast(gc.MatchScratch.slot_end), .ty = .int }));
+        try self.projectCaptures(m, base, 2, census, instr.c);
+    }
+
+    /// `string.match(s, pat [, init])` (doc 30 §5): always the `smatch` shape.
+    /// `ncap == 0` → the whole match interned from `slot_whole`; else the
+    /// capture window per B02/M04. Matched direction only (P2).
+    fn recBSMatch(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b < 2 or instr.b > 3) return self.abort(.cross_frame);
+        if (instr.c < 1) return self.abort(.cross_frame);
+        try self.guardBuiltinCallee(instr.a, .match);
+        const base: usize = instr.a;
+        const sref = (try self.stringArgRef(@intCast(base + 1), regs, .a1)) orelse return;
+        const sobj: *const string_mod.String = string_mod.String.fromHeader(regs.get(@intCast(base + 1)).asHeap());
+        const init_ref: Ref = if (instr.b >= 3)
+            (try self.intArgRef(@intCast(base + 3), regs, .a3)) orelse return
+        else
+            try self.konst(Value.int(1));
+        const init_v: i64 = if (instr.b >= 3) regs.get(@intCast(base + 3)).asInt() else 1;
+        const pat = (try self.patternArgPin(@intCast(base + 2), regs, .a2)) orelse return;
+        const pat_bytes = pat.str.bytes();
+        const census = pattern_mod.census(pat_bytes) orelse return self.abort(.bad_type);
+        const st = string_stdlib.resolveInit(init_v, sobj) orelse return self.abort(.bad_type);
+        var ms = pattern_mod.MatchState.init(sobj.bytes(), pat_bytes);
+        _ = (pattern_mod.locateMatch(&ms, st, true) catch null) orelse return self.abort(.bad_type);
+        const m = try self.emit(.{ .op = .smatch, .a = sref, .b = init_ref, .aux = @intCast(pat.ref), .ty = .int });
+        if (census.ncap == 0) {
+            self.setReg(instr.a, try self.emitAlloc(.{ .op = .scap_str, .a = m, .b = @intCast(gc.MatchScratch.slot_whole), .ty = .heap }));
+            var w: usize = 1;
+            while (w < instr.c) : (w += 1)
+                self.setReg(@intCast(base + w), try self.konst(Value.nil()));
+        } else {
+            try self.projectCaptures(m, base, 0, census, instr.c);
+        }
+    }
+
+    /// `@gmatch_iter(state)` → the composite `sgmatch` step (doc 30 §6). The
+    /// state is guarded a table; the pattern lives in `state[2]` where no SSA
+    /// ref exists, so the pin is NOT `guard_sid` — the expected pattern's
+    /// konst-pool id rides `sgmatch.aux` and the SHIM compares identity per
+    /// execution. The census only fixes the projection list, a syntactic
+    /// property of the pattern alone; subject/pos are read by the shim at run
+    /// time (a non-string subject / broken B03 layout → negative status →
+    /// side-exit). The cursor advance is a DEFERRED `sgm_setpos` through the
+    /// docs-07/08 pending-store discipline: any exit in the iteration replays
+    /// tier-0 against the UN-advanced pos and reproduces the same token.
+    /// v1 records the matched direction only; exhaustion aborts (the for-in
+    /// end is one side-exit per gmatch() call at run time).
+    fn recBSGmatchIter(self: *TraceState, instr: Instr, regs: RegWindow) !void {
+        if (instr.b < 1 or instr.b > 2) return self.abort(.cross_frame);
+        if (instr.c < 1) return self.abort(.cross_frame);
+        try self.guardBuiltinCallee(instr.a, .gmatch_iter);
+        const base: usize = instr.a;
+        const state_slot: u16 = @intCast(base + 1);
+        const stv = regs.get(state_slot);
+        if (!stv.isHeap() or stv.heapType() != .table) return self.abort(.bad_type);
+        const st_tbl = table_mod.Table.fromHeader(stv.asHeap());
+        if (st_tbl.metatable != null) return self.abort(.has_metatable);
+        const state_ref = try self.refOf(state_slot);
+        // Fail-closed corner (§6): a SECOND composite step against the same
+        // state ref in one iteration would read a stale pos under the
+        // deferred store. The for-in shape (one aux call per iteration) never
+        // trips this.
+        for (self.rec.pending_stores.items) |ps| {
+            if (ps.op == .sgm_setpos and ps.aref == state_ref) return self.abort(.bad_type);
+        }
+        // Record-time state reads: census inputs only — every runtime
+        // assumption is shim-verified per execution or guarded.
+        const subj_v = st_tbl.getInt(1);
+        if (!subj_v.isHeap() or subj_v.heapType() != .string) return self.abort(.bad_type);
+        const sobj = string_mod.String.fromHeader(subj_v.asHeap());
+        const pat_v = st_tbl.getInt(2);
+        if (!pat_v.isHeap() or pat_v.heapType() != .string) return self.abort(.bad_type);
+        const pat_bytes = string_mod.String.fromHeader(pat_v.asHeap()).bytes();
+        const pos = st_tbl.inLaneValueIntCell(3) orelse return self.abort(.bad_type); // B03
+        if (pos < 0) return self.abort(.bad_type);
+        const census = pattern_mod.census(pat_bytes) orelse return self.abort(.bad_type);
+        // P2, gmatch flavor: continue from the stored pos, no anchor
+        // consumption — exactly `gmatchAuxCore`'s locate.
+        var ms = pattern_mod.MatchState.init(sobj.bytes(), pat_bytes);
+        _ = (pattern_mod.locateMatch(&ms, @intCast(pos), false) catch null) orelse return self.abort(.bad_type);
+        self.stampProv(try self.emit(.{ .op = .guard_table, .a = state_ref }), .operand_type, .a1, .neutral);
+        const pk = try self.konst(pat_v);
+        const pool_id = self.rec.instrs.items[@intCast(pk)].aux;
+        const m = try self.emit(.{ .op = .sgmatch, .a = state_ref, .aux = pool_id, .ty = .int });
+        if (census.ncap == 0) {
+            self.setReg(instr.a, try self.emitAlloc(.{ .op = .scap_str, .a = m, .b = @intCast(gc.MatchScratch.slot_whole), .ty = .heap }));
+            var w: usize = 1;
+            while (w < instr.c) : (w += 1)
+                self.setReg(@intCast(base + w), try self.konst(Value.nil()));
+        } else {
+            try self.projectCaptures(m, base, 0, census, instr.c);
+        }
+        const np = try self.emit(.{ .op = .scap_int, .a = m, .b = @intCast(gc.MatchScratch.slot_next_pos), .ty = .int });
+        try self.rec.pending_stores.append(self.gpa, .{ .op = .sgm_setpos, .aref = state_ref, .value = np, .lane_ord = 0 });
+    }
+
     /// `tonumber(v[, base])` — konst arguments fold at record time through
     /// `arith.toNumber`, the ONE conversion core shared with tier-0's
     /// `bToNumber` (so the fold and the builtin can never disagree); the result
@@ -14036,10 +14316,32 @@ pub const TraceState = struct {
             return;
         }
         const argv = regs.get(@intCast(@as(usize, instr.a) + 1));
-        if (!argv.isNumber()) return self.abort(.bad_type);
-        try self.guardBuiltinCallee(instr.a, .tonumber);
-        try self.guardNum(arg_ref, argv, .operand_type, .a1);
-        self.setReg(instr.a, arg_ref);
+        if (argv.isNumber()) {
+            try self.guardBuiltinCallee(instr.a, .tonumber);
+            try self.guardNum(arg_ref, argv, .operand_type, .a1);
+            self.setReg(instr.a, arg_ref);
+            return;
+        }
+        // Doc 30: the observed-STRING 1-arg call — a guarded runtime parse
+        // through the ONE `arith.toNumber` core (`str2numRuntime` calls the
+        // same function, so the recorder's observation, tier-0, and the
+        // trace can never disagree). The observed outcome bakes the op's
+        // kind (P2); a later kind flip or non-number side-exits at run time.
+        // The nil direction stays tier-0 in v1.
+        if (argv.isHeap() and argv.heapType() == .string) {
+            try self.guardBuiltinCallee(instr.a, .tonumber);
+            const sref = (try self.stringArgRef(@intCast(@as(usize, instr.a) + 1), regs, .a1)) orelse return;
+            const outcome = arith.toNumber(argv, null);
+            if (outcome.isInt()) {
+                self.setReg(instr.a, try self.emit(.{ .op = .str2num_i, .a = sref, .ty = .int }));
+            } else if (outcome.isFloat()) {
+                self.setReg(instr.a, try self.emit(.{ .op = .str2num_f, .a = sref, .ty = .float }));
+            } else {
+                return self.abort(.bad_type);
+            }
+            return;
+        }
+        return self.abort(.bad_type);
     }
 
     /// `select('#', a…)` — only the konst-`'#'` selector records: the arg count

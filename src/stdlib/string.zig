@@ -1032,7 +1032,7 @@ const ResultBuf = [pattern.max_captures + 2]Value;
 /// char) maps to `s.len` — the empty-match-at-end position. Takes the `*String`
 /// (doc 28 c2): the character length is the cached `cp_len` (this was an O(len)
 /// `cpCount` scan per find/match call) and an ASCII subject converts by identity.
-fn resolveInit(init_raw: i64, s: *const String) ?usize {
+pub fn resolveInit(init_raw: i64, s: *const String) ?usize {
     const clen = s.cpLen();
     var pos = posRelat(init_raw, clen); // 1-based char position (may be 0)
     if (pos < 1) pos = 1;
@@ -1640,12 +1640,12 @@ pub const natives = [_]function.BaseNative{
     // module field (byte arrays have no metatable, so it stays a free function).
     .{ .name = "string.encode", .func = &sEncode, .module = "string", .field = "encode" },
     .{ .name = "string.decode", .func = &sDecode, .module = "string", .field = "decode" },
-    .{ .name = "string.find", .func = &sFind1, .multi = &sFindN, .module = "string", .field = "find" },
-    .{ .name = "string.match", .func = &sMatch1, .multi = &sMatchN, .module = "string", .field = "match" },
+    .{ .name = "string.find", .func = &sFind1, .multi = &sFindN, .module = "string", .field = "find", .recorded = .find },
+    .{ .name = "string.match", .func = &sMatch1, .multi = &sMatchN, .module = "string", .field = "match", .recorded = .match },
     .{ .name = "string.gmatch", .func = &sGmatch1, .multi = &sGmatchN, .module = "string", .field = "gmatch" },
     .{ .name = "string.gsub", .func = &sGsub1, .multi = &sGsubN, .module = "string", .field = "gsub" },
     // Hidden iterator `gmatch` returns; a bare global like `@ipairs_iter`.
-    .{ .name = gmatch_iter_name, .func = &sGmatchAux1, .multi = &sGmatchAuxN },
+    .{ .name = gmatch_iter_name, .func = &sGmatchAux1, .multi = &sGmatchAuxN, .recorded = .gmatch_iter },
     // Hidden iterator `s:codes()` returns (S-B); same hidden-global pattern.
     .{ .name = codes_iter_name, .func = &sCodesAux1, .multi = &sCodesAuxN },
 };
