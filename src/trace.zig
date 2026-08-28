@@ -11361,6 +11361,10 @@ pub const TraceState = struct {
         self.rec.abort_reason = reason;
         if (self.config.record_aborts) self.logAbort(reason);
         self.rec.active = false;
+        // Doc 27 §3a defense-in-depth: a dead recording must not leave a multret
+        // shadow behind (`reset` is the soundness boundary; this narrows the
+        // window further so no code path can observe a shadow past the abort).
+        self.rec.multret_top = null;
         // Drop hot-exit provenance with the recording: an abort must never leave
         // `side_src` around to latch a parent exit DONE for a LATER, unrelated
         // commit (Pall retries the exit; `gateAnchor` below is our `penalty_pc`).
@@ -11898,6 +11902,13 @@ pub const TraceState = struct {
     }
 
     fn recordOne(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, pc: u32, resolved: Value) error{OutOfMemory}!void {
+        // Doc 27: the multret shadow is visible to exactly one instruction — the
+        // designated consumer immediately after its producer, mirroring tier-0's
+        // `reg_top_pending` scope. Stash and clear before dispatch; only the
+        // consumer arms (`recCall`/`recBuiltin`/`recReturn`) receive the stash,
+        // and only producer arms re-set the field (on success).
+        const multret = self.rec.multret_top;
+        self.rec.multret_top = null;
         switch (instr.op) {
             // loads & moves — define the destination, no guards.
             .load_nil => self.setReg(instr.a, try self.konst(Value.nil())),
@@ -11947,10 +11958,12 @@ pub const TraceState = struct {
 
             // Cross-frame tracing: inline a Lua callee's body straight into the
             // trace (LuaJIT-style `lj_record_call`/`lj_record_ret`). A host
-            // (`native`) call stays a trace barrier; anything we can't inline
-            // (dynamic multret, vararg, `__call`, too deep) aborts cleanly and
-            // tier-0 owns the loop.
-            .call => try self.recCall(instr, regs, proto),
+            // (`native`) call stays a trace barrier unless it carries a
+            // `RecordedBuiltin` tag; anything we can't inline (vararg, `__call`,
+            // too deep) aborts cleanly and tier-0 owns the loop. Dynamic multret
+            // windows resolve against the one-instruction `multret` shadow
+            // (doc 27) instead of aborting.
+            .call => try self.recCall(instr, regs, proto, multret),
             .ret => if (self.rec.inline_depth == 0)
                 // A `.ret` in the anchor frame closes the traced function itself —
                 // the loop's back-edge always closes the trace first, so this is
@@ -11958,7 +11971,7 @@ pub const TraceState = struct {
                 // caller we never inlined.
                 self.abort(.cross_frame)
             else
-                try self.recReturn(instr),
+                try self.recReturn(instr, multret),
             // `.halt` ends the top-level chunk; never a return from an inlined
             // callee. Always a barrier.
             .halt => self.abort(.cross_frame),
@@ -13378,10 +13391,14 @@ pub const TraceState = struct {
     ///
     /// Aborts cleanly (tier-0 owns the loop) on every shape we don't inline:
     /// a host (`native`) callee is a trace barrier; a non-callable / `__call`
-    /// metamethod, a vararg callee, dynamic multret (`all_results` arg or result
-    /// window — no compile-time-fixed slots to seed/map), and exceeding
-    /// `MAX_INLINE_DEPTH` or the `reg_map` reservation all abort.
-    fn recCall(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto) !void {
+    /// metamethod, a vararg callee, and exceeding `MAX_INLINE_DEPTH` or the
+    /// `reg_map` reservation all abort. Dynamic multret windows (doc 27) no
+    /// longer abort per se: an `all_results` ARGUMENT window resolves its fixed
+    /// count against the recorder's multret shadow (`multret`, set by the
+    /// immediately-preceding recorded producer — fails closed on `null`), and an
+    /// `all_results` RESULT window stores the sentinel in `ret_count` verbatim,
+    /// resolved by `recReturn` once the callee's `ret` fixes `produced`.
+    fn recCall(self: *TraceState, instr: Instr, regs: RegWindow, proto: *const Proto, multret: ?u32) !void {
         const callee = regs.get(instr.a);
         if (!callee.isHeap()) return self.abort(.cross_frame);
         switch (callee.heapType()) {
@@ -13392,7 +13409,7 @@ pub const TraceState = struct {
             // Anything untagged stays the host barrier.
             .native => {
                 const nat = function.Native.fromHeader(callee.asHeap());
-                if (nat.recorded) |rb| return self.recBuiltin(rb, instr, regs);
+                if (nat.recorded) |rb| return self.recBuiltin(rb, instr, regs, multret);
                 return self.abort(.host_barrier);
             },
             .function => {},
@@ -13400,11 +13417,21 @@ pub const TraceState = struct {
             // metamethod, is not a plain Lua-closure call. Not inlined.
             else => return self.abort(.cross_frame),
         }
-        // Dynamic argument or result windows (`reg_top`-driven multret) have no
-        // compile-time-fixed slot count to seed (args) or map (results). Abort;
-        // fixed multret broadening is Phase 2.
-        if (instr.b == bytecode.all_results) return self.abort(.cross_frame);
-        if (instr.c == bytecode.all_results) return self.abort(.cross_frame);
+        // Doc 27 D3: a dynamic argument window resolves against the multret
+        // shadow — `top - (a + 1)`, the same arithmetic tier-0 runs against
+        // `reg_top` (`interp.zig` `.call`), in recorder frame-space (producer and
+        // consumer always share a frame, so `base` never enters). All arithmetic
+        // in u32 and fail-closed below the `all_results` sentinel (§3a). A
+        // dynamic RESULT window needs nothing here: `ret_count = instr.c` stores
+        // the sentinel verbatim and `recReturn` resolves it (D4).
+        const nargs: u32 = if (instr.b == bytecode.all_results) blk: {
+            const top = multret orelse return self.abort(.cross_frame);
+            const first_arg = @as(u32, instr.a) + 1;
+            if (top < first_arg) return self.abort(.cross_frame);
+            const n = top - first_arg;
+            if (n >= bytecode.all_results) return self.abort(.cross_frame);
+            break :blk n;
+        } else instr.b;
 
         const cl = function.Closure.fromHeader(callee.asHeap());
         const cp = cl.proto;
@@ -13434,8 +13461,8 @@ pub const TraceState = struct {
         // an arg was actually passed) take the caller arg's SSA ref; everything else
         // is `nil`, matching tier-0's nil-fill of an unset register. After this no
         // callee slot is `.undef`, so `refOf` never emits a `slot_load` on a callee
-        // index (which would be an out-of-window trace input).
-        const nargs: u16 = instr.b;
+        // index (which would be an out-of-window trace input). `nargs` was resolved
+        // above (fixed, or doc 27's shadow resolution of `all_results`).
         var i: u16 = 0;
         while (i < cp.num_registers) : (i += 1) {
             const seed: Ref = if (i < cp.num_params and i < nargs)
@@ -13467,33 +13494,70 @@ pub const TraceState = struct {
     /// byte-identical to the untagged path — a registry row only gains its
     /// `.recorded` tag together with its arm, so those prongs are unreachable
     /// until then and exist to keep the switch exhaustive as the enum grows.
-    fn recBuiltin(self: *TraceState, rb: function.RecordedBuiltin, instr: Instr, regs: RegWindow) !void {
-        // Dynamic argument or result windows (`reg_top`-driven multret) have no
-        // compile-time-fixed slot count to model — same rule as closure calls.
-        if (instr.b == bytecode.all_results) return self.abort(.cross_frame);
-        if (instr.c == bytecode.all_results) return self.abort(.cross_frame);
-        switch (rb) {
-            .sqrt => return self.recPureSqrt(instr, regs),
-            .type => return self.recBType(instr, regs),
-            .tostring => return self.recBTostring(instr, regs),
-            .tonumber => return self.recBTonumber(instr, regs),
-            .select => return self.recBSelect(instr),
-            .rawequal => return self.recBRawequal(instr, regs),
-            .rawlen => return self.recBRawlen(instr, regs),
-            .rawget => return self.recBRawget(instr, regs),
-            .rawset => return self.recBRawset(instr, regs),
-            .sin => return self.recFloatUnary(instr, regs, .sin, .fsin),
-            .cos => return self.recFloatUnary(instr, regs, .cos, .fcos),
-            .mtype => return self.recBMType(instr, regs),
-            .len => return self.recBSLen(instr, regs),
-            .sub => return self.recBSSub(instr, regs),
-            .reverse => return self.recBSRev(instr, regs),
-            .char => return self.recBSChar1(instr, regs),
-            .rep => return self.recBSRep2(instr, regs),
-            .upper => return self.recBSCase(instr, regs, .upper, .supper),
-            .lower => return self.recBSCase(instr, regs, .lower, .slower),
-            .codepoint => return self.recBSCodepoint(instr, regs),
+    fn recBuiltin(self: *TraceState, rb: function.RecordedBuiltin, instr: Instr, regs: RegWindow, multret: ?u32) !void {
+        // Doc 27: dynamic multret windows resolve here instead of aborting.
+        //
+        // Consumer half (D2, `b == all_results`): the actual argument count is
+        // `top - (a + 1)` against the multret shadow — the identical arithmetic
+        // tier-0 runs against `reg_top`, in recorder frame-space. Fails closed on
+        // a `null` shadow (vararg spreads, recordings starting at a consumer) and
+        // on any count not representable below the sentinel (§3a, u32 math).
+        //
+        // Producer half (D1, `c == all_results`): only structurally single-result
+        // builtins qualify — tier-0's `all` path calls `nat.func` and
+        // `stampSingleResult` (exactly one value) for every recorded builtin
+        // WITHOUT a `.multi` projection. `codepoint`/`select` have one (can
+        // produce ≠1 values) and stay barriers. The arm itself records under an
+        // effective `c = 1` (the exact mirror of `stampSingleResult`'s one-value
+        // write); the shadow publishes after the arm succeeds.
+        //
+        // Both flags are captured BEFORE the effective-instr rewrite (§3b): the
+        // middle call of `f(g(h()))` is consumer AND producer at once, and the
+        // rewrite destroys both sentinels.
+        const was_dynamic_c = instr.c == bytecode.all_results;
+        var eff = instr;
+        if (instr.b == bytecode.all_results) {
+            const top = multret orelse return self.abort(.cross_frame);
+            const first_arg = @as(u32, instr.a) + 1;
+            if (top < first_arg) return self.abort(.cross_frame);
+            const nargs = top - first_arg;
+            if (nargs >= bytecode.all_results) return self.abort(.cross_frame);
+            eff.b = @intCast(nargs);
         }
+        if (was_dynamic_c) {
+            switch (rb) {
+                .codepoint, .select => return self.abort(.cross_frame),
+                else => {},
+            }
+            eff.c = 1;
+        }
+        switch (rb) {
+            .sqrt => try self.recPureSqrt(eff, regs),
+            .type => try self.recBType(eff, regs),
+            .tostring => try self.recBTostring(eff, regs),
+            .tonumber => try self.recBTonumber(eff, regs),
+            .select => try self.recBSelect(eff),
+            .rawequal => try self.recBRawequal(eff, regs),
+            .rawlen => try self.recBRawlen(eff, regs),
+            .rawget => try self.recBRawget(eff, regs),
+            .rawset => try self.recBRawset(eff, regs),
+            .sin => try self.recFloatUnary(eff, regs, .sin, .fsin),
+            .cos => try self.recFloatUnary(eff, regs, .cos, .fcos),
+            .mtype => try self.recBMType(eff, regs),
+            .len => try self.recBSLen(eff, regs),
+            .sub => try self.recBSSub(eff, regs),
+            .reverse => try self.recBSRev(eff, regs),
+            .char => try self.recBSChar1(eff, regs),
+            .rep => try self.recBSRep2(eff, regs),
+            .upper => try self.recBSCase(eff, regs, .upper, .supper),
+            .lower => try self.recBSCase(eff, regs, .lower, .slower),
+            .codepoint => try self.recBSCodepoint(eff, regs),
+        }
+        // D1 publish — only a LIVE recording may leave a shadow (an aborting arm
+        // set `rec.active = false`; §3a truthfulness: set only by a successfully
+        // recorded producer).
+        if (was_dynamic_c and self.rec.active)
+            self.rec.multret_top = @as(u32, eff.a) + 1;
     }
 
     /// `math.type(v)` — konst fold under the same pins as `type()` (doc 24
@@ -14100,15 +14164,33 @@ pub const TraceState = struct {
     /// restores `base_off`. The result writes use *absolute* `reg_map` indices (the
     /// caller region is disjoint from and below the callee source region, so a
     /// single forward pass can read source then write dest without a buffer).
-    fn recReturn(self: *TraceState, instr: Instr) !void {
+    fn recReturn(self: *TraceState, instr: Instr, multret: ?u32) !void {
         const d = self.rec.inline_depth - 1;
         const fr = self.rec.frames[d];
-        // Dynamic result count — no fixed window to map. Abort (Phase 2 broadens
-        // fixed multret; dynamic stays a barrier).
-        if (instr.b == bytecode.all_results) return self.abort(.cross_frame);
-        const produced: u16 = instr.b;
-        const want: u16 = fr.ret_count;
-        var k: u16 = 0;
+        // Doc 27 D5: `ret a, all_results` (`return prefix..., g(...)`) resolves
+        // its produced count from the multret shadow in CALLEE frame-space —
+        // `top - a` counts the fixed prefix slots plus everything the trailing
+        // producer left, exactly tier-0's `reg_top`-based resolution. Fails
+        // closed on a `null` shadow and on the sentinel bound (§3a, u32 math).
+        const produced: u32 = if (instr.b == bytecode.all_results) blk: {
+            const top = multret orelse return self.abort(.cross_frame);
+            if (top < instr.a) return self.abort(.cross_frame);
+            const n = top - instr.a;
+            if (n >= bytecode.all_results) return self.abort(.cross_frame);
+            break :blk n;
+        } else instr.b;
+        // Doc 27 D4: a caller that wanted a dynamic window (`call … c =
+        // all_results`) takes exactly `produced` values — no nil-fill, tier-0's
+        // `wants_all` arm — and re-exports the shadow for ITS caller's next
+        // instruction, in caller frame-space (after `base_off` is restored).
+        const wants_all = fr.ret_count == bytecode.all_results;
+        const want: u32 = if (wants_all) produced else fr.ret_count;
+        // The dynamic shapes can write above the caller's fixed window (tier-0
+        // does the same into slab scratch); bound them against the reg_map
+        // reservation like `recCall` bounds callee windows.
+        if (@as(usize, fr.base_off) + fr.ret_dest + want > self.rec.reg_map.len)
+            return self.abort(.too_deep);
+        var k: u32 = 0;
         while (k < want) : (k += 1) {
             // `base_off` is still the callee window here, so `refOf` reads the
             // callee's result slots `instr.a + k`.
@@ -14120,6 +14202,7 @@ pub const TraceState = struct {
         }
         self.rec.base_off = fr.base_off;
         self.rec.inline_depth = d;
+        if (wants_all) self.rec.multret_top = @as(u32, fr.ret_dest) + produced;
     }
 
     /// Cluster sub-lever 1 — record a `get_upval`/`get_global` as a synthetic entry
@@ -14488,6 +14571,20 @@ pub const Recorder = struct {
     /// Number of inlined calls currently open (frame-stack depth). 0 at the anchor
     /// frame; a `.call` beyond `MAX_INLINE_DEPTH` aborts `.too_deep`.
     inline_depth: u8 = 0,
+    /// Doc 27: frame-relative one-past-the-end of the values the immediately-
+    /// preceding recorded instruction produced under `c == all_results` — the
+    /// recorder's shadow of tier-0's `reg_top`/`reg_top_pending` handshake.
+    /// Set only by a successfully recorded producer; valid for exactly one
+    /// instruction (`recordOne` stashes and clears it before dispatch, mirroring
+    /// tier-0's `reg_top_pending` scope); expressed in the frame-space of the
+    /// instruction that will consume it. `null` = no pending producer — every
+    /// `all_results` consumer fails closed on it. `u32`, not `u16`: a valid
+    /// one-past top can be 65,536 (the slab size), and a resolved count must be
+    /// checked below the `all_results` sentinel before it becomes a fixed arity
+    /// (doc 27 §3a). Cleared on `reset` (the soundness boundary — a `maxrecord`
+    /// abort fires before the `recordOne` stash, so a stale shadow could
+    /// otherwise leak into the NEXT recording) and on `abort` (defense-in-depth).
+    multret_top: ?u32 = null,
 
     // --- cluster sub-lever 1: upvalue/global-reached callee snapshots ---------
     /// Synthetic entry inputs accumulated this recording: each loop-invariant
@@ -14564,6 +14661,7 @@ pub const Recorder = struct {
         self.anchor_num_registers = num_registers;
         self.base_off = 0;
         self.inline_depth = 0;
+        self.multret_top = null; // doc 27 §3a: never inherit a stale shadow
         self.next_input_slot = num_registers;
         self.active = true;
     }

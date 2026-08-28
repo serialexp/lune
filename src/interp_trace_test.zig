@@ -1329,6 +1329,417 @@ test "doc 26: recorder fail-closed matrix — float index, multi-result codepoin
     }
 }
 
+// ---------------------------------------------------------------------------
+// Doc 27 — MULTRET nested-call recording ("multinest"). The compiler encodes
+// `f(g(x))` as an adjacent dynamic-multret pair (inner call `c=all_results`
+// producer, outer call `b=all_results` consumer) and `return f(...)` as the
+// `ret b=all_results` sibling; the recorder resolves both against its
+// one-instruction multret shadow instead of aborting `.cross_frame`.
+// ---------------------------------------------------------------------------
+
+/// Doc 27 harness: full 10-leg parity via `expectProgram`, PLUS one dedicated
+/// non-stress record+execute leg asserting the loop actually committed and
+/// entered a trace. The arc's regression risk is a silent fallback to tier-0
+/// (recording aborts, output stays right) — parity alone cannot see it, so
+/// every shape that must RECORD pins `entries > 0` here.
+fn expectRecordedProgram(source: [:0]const u8, expected: []const u8) !void {
+    try expectProgram(source, expected);
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try util.runExecForTrace(&vm, gpa, source, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings(expected, sink.buffered());
+    try testing.expect(vm.trace.entries > 0);
+}
+
+test "doc 27: nested lower(upper(s)) records, runs NATIVELY, chains provenance, and replays byte-identically" {
+    // The arc's flagship: the exact shape that aborted `.cross_frame` before
+    // doc 27 — a composed builtin call in last-arg position — through the full
+    // pipeline (record → tropt → native) under effect RECORDING. Asserts
+    // (a) byte parity with tier-0, (b) a real native entry, (c) the committed
+    // trace contains `slower` consuming `supper`'s ref DIRECTLY with no
+    // intervening `guard_string` (the doc-26 `isProvenStringRef` chain finally
+    // firing on the nested form), (d) the D1 unicode pin invariant holds with
+    // exactly ONE logged effect, and (e) a replay of that log reproduces the
+    // output byte-identically.
+    const gpa = testing.allocator;
+    const parser = @import("parser.zig");
+    const diag = @import("diag.zig");
+    const source =
+        \\local upper = string.upper
+        \\local lower = string.lower
+        \\local base = "héLlo Αβγ"
+        \\local acc = 0
+        \\for i = 1, 200 do
+        \\  acc = acc + #lower(upper(base)) + i
+        \\end
+        \\print(acc)
+    ;
+    var diags = diag.Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+
+    var t0_out: [64]u8 = undefined;
+    var t0_len: usize = 0;
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        t0_len = sink.buffered().len;
+        @memcpy(t0_out[0..t0_len], sink.buffered());
+        try testing.expectEqualStrings("21900\n", t0_out[0..t0_len]);
+    }
+
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    vm.trace.config.enabled = true;
+    vm.trace.config.execute = true;
+    vm.trace.config.optimize = true;
+    vm.trace.config.native_codegen = @import("nativegen.zig").is_x64_linux;
+    vm.trace.config.hotloop = 4;
+    vm.effect_mode = .record;
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(t0_out[0..t0_len], sink.buffered());
+    try testing.expect(vm.trace.entries > 0);
+    if (@import("nativegen.zig").is_x64_linux)
+        try testing.expect(vm.trace.native_entries > 0);
+    try testing.expect(vm.unicode_version_pinned);
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+    try testing.expectEqual(interp.EffectKind.unicode_version, vm.effect_log.items[0].kind);
+
+    // Committed-trace shape: `slower` consumes `supper`'s ref directly, and no
+    // `guard_string` re-checks the proven producer result in between.
+    var found = false;
+    for (vm.trace.cache.items) |t| {
+        var supper_ref: ?i64 = null;
+        var chained = false;
+        for (t.instrs, 0..) |ins, idx| {
+            switch (ins.op) {
+                .supper => supper_ref = @intCast(idx),
+                .slower => if (supper_ref != null and ins.a == supper_ref.?) {
+                    chained = true;
+                },
+                .guard_string => if (supper_ref != null) {
+                    try testing.expect(ins.a != supper_ref.?);
+                },
+                else => {},
+            }
+        }
+        if (supper_ref != null) {
+            found = true;
+            try testing.expect(chained);
+        }
+    }
+    try testing.expect(found);
+
+    // Replay the one-entry log: fresh epoch, traces re-record during replay,
+    // output byte-identical, exactly the one logged effect consumed.
+    vm.effect_mode = .replay;
+    vm.effect_cursor = 0;
+    vm.unicode_version_pinned = false;
+    var rep_buf: [64]u8 = undefined;
+    var rep_sink = io.Writer.fixed(&rep_buf);
+    vm.out = &rep_sink;
+    _ = try vm.run(chunk.proto);
+    try testing.expectEqualStrings(t0_out[0..t0_len], rep_sink.buffered());
+    try testing.expectEqual(@as(usize, 1), vm.effect_cursor);
+}
+
+test "doc 27: depth-3 builtin chain u(l(u(s))) records — no depth anywhere in the mechanism" {
+    // The middle call is consumer AND producer at once (§3b: both sentinel
+    // flags must be captured before the effective-instr rewrite).
+    try expectRecordedProgram(
+        \\local u = string.upper
+        \\local l = string.lower
+        \\local base = "héLlo Αβγ"
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + #u(l(u(base))) + i end
+        \\print(acc)
+    ,
+        "5950\n",
+    );
+}
+
+test "doc 27: mixed args — trailing producer after a fixed prefix resolves the full arity" {
+    // `sub(base, 2, len(up(base)))`: the inner producer sits at `a_outer+3`,
+    // so the consumer must resolve nargs = 3, not the depth-1 single-arg case.
+    // A wrong resolution either aborts (entries == 0, caught by the harness)
+    // or mis-slices (output diverges).
+    try expectRecordedProgram(
+        \\local sub = string.sub
+        \\local len = string.len
+        \\local up = string.upper
+        \\local base = "héLlo Αβγ"
+        \\local acc = 0
+        \\for i = 1, 100 do
+        \\  local piece = sub(base, 2, len(up(base)))
+        \\  acc = acc + #piece + i
+        \\end
+        \\print(acc)
+    ,
+        "5850\n",
+    );
+}
+
+test "doc 27: closure consumer — an inlined Lua callee takes a builtin producer's dynamic window (D3)" {
+    try expectRecordedProgram(
+        \\local up = string.upper
+        \\local function count(s) return #s + 1 end
+        \\local base = "héLlo Αβγ"
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + count(up(base)) + i end
+        \\print(acc)
+    ,
+        "6050\n",
+    );
+}
+
+test "doc 27: closure producer — an inlined callee's fixed ret feeds a builtin's dynamic window (D4)" {
+    try expectRecordedProgram(
+        \\local up = string.upper
+        \\local function id(x) return x end
+        \\local base = "héLlo Αβγ"
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + #up(id(base)) + i end
+        \\print(acc)
+    ,
+        "5950\n",
+    );
+}
+
+test "doc 27: D1+D2+D4+D5 composed — up(ap(low, base)) chains the shadow across a frame boundary" {
+    // Inside `ap`, `return f(x)` is a builtin producer (D1) into a `ret
+    // b=all_results` consumer (D5); the caller wanted a dynamic window, so
+    // `recReturn` re-exports the shadow in caller frame-space (D4) for the
+    // outer `up` consumer (D2). The builtin callee arrives as a PARAM (an
+    // upvalue read inside an inlined callee would hit the pre-existing U0
+    // barrier and mask the multret path).
+    try expectRecordedProgram(
+        \\local up = string.upper
+        \\local low = string.lower
+        \\local function ap(f, x) return f(x) end
+        \\local base = "héLlo Αβγ"
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + #up(ap(low, base)) + i end
+        \\print(acc)
+    ,
+        "5950\n",
+    );
+}
+
+test "doc 27: return prefixes — `return prefix, g()` counts prefix + produced (zero/one/multi legs)" {
+    // codex #7: exactly where an off-by-prefix or D4 frame-space error changes
+    // VALUES silently. `two` = prefix + builtin producer (produced 2 into
+    // want 2); `pz` = prefix + zero-returning closure (produced 1, want 2 →
+    // nil-fill pinned by the `d == nil` branch); `pm` = prefix + two-value
+    // closure (produced 3 into want 3). All callees are param-clean (no
+    // upvalue reads inside inlined callees — U0 would mask the shapes).
+    try expectRecordedProgram(
+        \\local up = string.upper
+        \\local base = "héLlo Αβγ"
+        \\local function two(f, x) return #x, f(x) end
+        \\local function zero() end
+        \\local function pz(z, x) return #x, z() end
+        \\local function multi() return 10, 20 end
+        \\local function pm(m, x) return #x, m() end
+        \\local acc = 0
+        \\for i = 1, 100 do
+        \\  local a, b = two(up, base)
+        \\  acc = acc + a + #b
+        \\  local c, d = pz(zero, base)
+        \\  acc = acc + c + (d == nil and 5 or 0)
+        \\  local e, f, g = pm(multi, base)
+        \\  acc = acc + e + f + g
+        \\end
+        \\print(acc)
+    ,
+        "7100\n",
+    );
+}
+
+test "doc 27: method-call consumer — obj:m(prefix, g()) stays byte-identical in every leg" {
+    // codex #8: `compileMethodArgs` puts the implicit `self` before the dynamic
+    // tail. The method lookup itself is not yet recordable (`get_index` NYI
+    // aborts the recording), so this is a parity pin on the compiled multret
+    // shape, not a recording assertion — when method calls become recordable,
+    // wrap this in `expectRecordedProgram` to inherit the stronger check.
+    try expectProgram(
+        \\local len = string.len
+        \\local obj = {}
+        \\function obj.m(self, p, q) return p + q end
+        \\local base = "héLlo Αβγ"
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + obj:m(2, len(base)) end
+        \\print(acc)
+    ,
+        "1100\n",
+    );
+}
+
+test "doc 27: select('#', g()) — the resolved arity IS the folded result (off-by-one is a wrong value)" {
+    // codex #9: the effective `b` is semantically load-bearing. `select('#',
+    // up(base))` resolves b = 2 and folds konst 1; any resolution error
+    // changes the printed sum, not just trace shape.
+    try expectRecordedProgram(
+        \\local up = string.upper
+        \\local base = "héLlo Αβγ"
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + select('#', up(base)) + i end
+        \\print(acc)
+    ,
+        "5150\n",
+    );
+}
+
+test "doc 27: rawset as producer — effective c=1 defines the result slot before the shadow publishes" {
+    // codex #10: rawset's arm result write is conditional on `c == 1`; under
+    // producer `c = all_results` the rewrite must still define slot `a` (the
+    // consumer reads it as its argument). `rawget(t, 1)` pins the store
+    // actually landed each iteration.
+    try expectRecordedProgram(
+        \\local t = {0}
+        \\local acc = 0
+        \\for i = 1, 100 do
+        \\  acc = acc + select('#', rawset(t, 1, i)) + rawget(t, 1)
+        \\end
+        \\print(acc)
+    ,
+        "5150\n",
+    );
+}
+
+test "doc 27: zero-produced — f(g()) with a void closure resolves nargs = 0 and keeps recording" {
+    try expectRecordedProgram(
+        \\local function seven() return 7 end
+        \\local function zero() end
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + seven(zero()) + i end
+        \\print(acc)
+    ,
+        "5750\n",
+    );
+}
+
+test "doc 27: fail-closed — multi-result codepoint producer and vararg spread abort with parity" {
+    // (a) `cp(s, 1, 3)` can produce ≠1 values: excluded from the D1 whitelist,
+    // recording aborts `.cross_frame` (verified via --dump-aborts), output
+    // identical in every leg.
+    try expectProgram(
+        \\local cp = string.codepoint
+        \\local base = "héLlo Αβγ"
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + (type(cp(base, 1, 3)) == "number" and 1 or 0) + i end
+        \\print(acc)
+    ,
+        "5150\n",
+    );
+    // (b) `f(...)` — a vararg spread producer never sets the shadow (the
+    // vararg callee aborts recording first); parity across all legs.
+    try expectProgram(
+        \\local function fix(a, b, c) return (a or 0) + (b or 0) + (c or 0) end
+        \\local function sp(...) return fix(...) end
+        \\local acc = 0
+        \\for i = 1, 100 do acc = acc + sp(1, 2, i) end
+        \\print(acc)
+    ,
+        "5350\n",
+    );
+}
+
+test "doc 27 §3a: the multret shadow never survives reset or an abort" {
+    // Lifetime regression (codex MUST-FIX): a `maxrecord` abort fires in
+    // `recordInstr` BEFORE `recordOne`'s stash-and-clear, so without explicit
+    // clearing a stale shadow could leak into the NEXT recording and bake a
+    // garbage count. Two legs:
+    //
+    // (1) reset is the soundness boundary: a planted shadow is gone after
+    //     `Recorder.reset`.
+    // (2) a real recording killed by `maxrecord` (which repeatedly aborts
+    //     mid-body across the run, wherever the budget lands — including
+    //     between a producer and its consumer) leaves no shadow behind, and
+    //     the program's output is unperturbed.
+    const gpa = testing.allocator;
+    {
+        const parser = @import("parser.zig");
+        const diag = @import("diag.zig");
+        var diags = diag.Diagnostics.init(gpa);
+        defer diags.deinit();
+        const source = "print(1)";
+        var tree = try parser.parse(gpa, source, &diags);
+        defer tree.deinit();
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        defer chunk.deinit();
+        try testing.expect(!diags.hasErrors());
+        _ = try vm.run(chunk.proto);
+        vm.trace.rec.multret_top = 7; // plant a stale shadow
+        try vm.trace.rec.reset(gpa, .{ .proto = chunk.proto, .pc = 0 }, 4);
+        try testing.expectEqual(@as(?u32, null), vm.trace.rec.multret_top);
+    }
+    {
+        var vm = try Vm.init(gpa);
+        defer vm.deinit();
+        vm.trace.config.enabled = true;
+        vm.trace.config.execute = true;
+        vm.trace.config.hotloop = 4;
+        vm.trace.config.maxrecord = 8; // kill every recording almost immediately
+        var buf: [64]u8 = undefined;
+        var sink = io.Writer.fixed(&buf);
+        vm.out = &sink;
+        try util.compileRun(gpa, &vm,
+            \\local up = string.upper
+            \\local low = string.lower
+            \\local base = "héLlo Αβγ"
+            \\local acc = 0
+            \\for i = 1, 100 do acc = acc + #low(up(base)) + i end
+            \\print(acc)
+        );
+        try testing.expectEqualStrings("5950\n", sink.buffered());
+        try testing.expectEqual(@as(?u32, null), vm.trace.rec.multret_top);
+    }
+}
+
+test "doc 27: deopt through the pair — side exits replay the whole iteration, reg_top set by tier-0 itself" {
+    // §5: no exit ever resumes tier-0 between producer and consumer — the
+    // deopt iteration re-runs from the loop header, re-executing the producer
+    // in tier-0 (which sets `reg_top`) before the consumer needs it. The
+    // `i % 30` branch guard fails three times mid-run; every leg must print
+    // the same bytes.
+    try expectRecordedProgram(
+        \\local up = string.upper
+        \\local low = string.lower
+        \\local s = "héLlo Αβγ"
+        \\local acc = 0
+        \\for i = 1, 100 do
+        \\  acc = acc + #low(up(s))
+        \\  if i % 30 == 0 then acc = acc + 1000 end
+        \\end
+        \\print(acc)
+    ,
+        "3900\n",
+    );
+}
+
 test "chunk rooting: a host-compiled retained chunk survives GC before it runs" {
     // docs/design/03 §"Chunk-constant rooting" — the regression. A host compiles chunk
     // B (whose distinctive literal is a `load_const`), retains it, runs chunk A (which

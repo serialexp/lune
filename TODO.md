@@ -2,7 +2,25 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
-## Nested last-arg builtin calls compile to MULTRET and abort recording (noted 2026-08-27, doc 24 c3)
+## ~~Nested last-arg builtin calls compile to MULTRET and abort recording~~ RESOLVED 2026-08-28 (doc 27, "multinest")
+
+**Landed exactly along the sketched fix shape, generalized** (doc
+27-multret-nested-call-recording.md): the recorder keeps a one-instruction
+`multret_top` shadow of tier-0's `reg_top`/`reg_top_pending` handshake and
+resolves BOTH pair halves against it — consumers (`call b=all_results`, `ret
+b=all_results`) compute the fixed count with tier-0's own arithmetic; producers
+(single-result builtin arms under `c=all_results`, and inlined-closure `ret`s
+into a dynamic caller window) publish it. Arbitrary nesting and closure
+composition fall out (no depth anywhere in the mechanism); `codepoint`/`select`
+producers and vararg spreads stay fail-closed barriers. `lower(upper(a))` and
+every probed composed form record with zero aborts and run natively.
+
+**str_manip outcome (honest):** the MULTRET abort is gone but the bench moved
+only 5.2×→5.0× — the SAME loop is now gated by the next frontier, the
+`MAX_TRACE_INPUTS = 8` cap (see the new entry below). Original note kept for
+history:
+
+## Original MULTRET note (noted 2026-08-27, doc 24 c3) — historical
 
 `rev(sub(base, 2, 5))` — an inner call in the outer call's LAST argument
 position — compiles to the multret shape (inner `c = all_results`, outer
@@ -29,7 +47,25 @@ nested call — the abort moved from "case ops unsupported" to exactly this
 frontier. Every other op in str_manip's hot path (`sub`, `reverse`, `len`,
 2-arg `codepoint`) now records, so lifting this one shape should let the whole
 loop trace (`rep(char(..), 4, "-")` sits behind a 1-in-64 branch and can stay
-a side-exit).
+a side-exit). *(Post-landing correction: "should let the whole loop trace" was
+half-right — the nested calls record, but the loop then dies at the
+`MAX_TRACE_INPUTS` cap below, so the bench barely moved.)*
+
+## str_manip's NEW sole blocker: `MAX_TRACE_INPUTS = 8` upvalue/global snapshot cap (noted 2026-08-28, doc 27 landed)
+
+With multinest landed, `--dump-aborts` on str_manip shows exactly ONE abort
+site left: `too_deep` at a `get_upval` in `run` (518 hits, ir_len 57) —
+`recInputGet`'s `input_seeds.items.len >= MAX_TRACE_INPUTS` cap (trace.zig
+~14239; the constant is 8 at ~14358). str_manip's hot loop reads more than 8
+distinct upvalues (`upper`, `lower`, `sub`, `reverse`, `len`, `codepoint`,
+`rep`, `char`, `acc`-adjacent…), each costing one synthetic entry input +
+`guard_func`. Before doc 27 the recording died at the nested call long before
+reaching 8 inputs, so the cap never showed. Next lever for str_manip (5.0×):
+either measure a raised cap (each input widens the executor window the
+dispatch loop re-seeds per entry — cost is per-trace-entry, so profile before
+raising blindly) or dedup/restructure how builtin-callee upvalue reads consume
+the input budget. General-language question, not a bench hack: ANY loop
+calling >8 distinct cached-in-locals functions hits this wall (Z-6).
 
 ## `table.pack`/`table.unpack` recording (noted 2026-08-27, ex-`math.type` entry)
 

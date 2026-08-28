@@ -21,6 +21,66 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-28 (LATEST-93) — **MULTINEST LANDED (doc 27): dynamic-multret pairs record via a one-instruction recorder shadow — `f(g(x))` at any depth, closure composition included, recorder-only, board flat, str_manip's blocker moved to the `MAX_TRACE_INPUTS=8` cap.**
+
+Bart chose multinest ("lets go for multinest — does that mean two nested
+things or arbitrarily nested?" → arbitrarily: the mechanism is per-call-site,
+depth never appears). Full loop ran: grounding (tier-0 `reg_top` resolution,
+mirror-before-execute ordering, LuaJIT `BC_CALLM` reading `L->top`, compiler
+pair-adjacency, anchor-replay deopt) → doc 27 → codex review (approved; 2
+MUST-FIX folded in: shadow lifetime across `maxrecord` aborts/reset, u32
+width + sentinel-collision checks; plus the §3b dual-role stash and a §5
+rewrite — recordings only ever start at coherent anchors, never bare guard
+exit pcs) → implement → 14 tests → gates.
+
+**Mechanism (trace.zig, recorder-only — no new IR ops, no tier-1a/nativegen/
+tier-0 changes):** `Recorder.multret_top: ?u32` shadows tier-0's
+`reg_top`/`reg_top_pending` handshake; `recordOne` stashes+clears it per
+instruction (scope = exactly the designated consumer); cleared in `reset`
+(soundness boundary) and `abort` (defense-in-depth). D1: single-result
+builtin arms accept `c=all_results` via whitelist (`codepoint`/`select`
+excluded — `.multi` projections), record under effective `c=1`, publish
+shadow post-arm (gated on `rec.active`). D2/D3: `call b=all_results`
+(builtin + closure) resolves `nargs = top-(a+1)` — tier-0's own arithmetic,
+frame-relative so `base` never enters; fail-closed on null shadow and on
+counts ≥ the sentinel. D4: closure `call c=all_results` stores the sentinel
+in `ret_count` verbatim; `recReturn` maps exactly `produced` (no nil-fill)
+and re-exports the shadow in caller frame-space. D5: `ret b=all_results`
+resolves `produced = top - a` (counts fixed prefixes: `return x, g()`).
+recReturn also gained a reg_map bounds check (`.too_deep`) for the dynamic
+shapes. §5 invariant (why no LuaJIT-style `needsnap` needed): deopt is
+anchor-replay — tier-0 redoes the whole iteration, re-executing the producer
+itself, and no resumption pc can split the compiler-adjacent pair.
+
+**Tests:** 14 "doc 27" tests in interp_trace_test.zig via new
+`expectRecordedProgram` (10-leg parity + a dedicated `entries>0` leg —
+parity alone can't see silent-abort regressions): flagship native
+`lower(upper(s))` with supper→slower provenance chain + effect record/replay,
+depth-3 (dual-role middle call), mixed args (nargs=3), closure consumer,
+closure producer, D1+D2+D4+D5 chain `up(ap(low, base))`, return prefixes
+(zero/one/multi legs), method-call parity (lookup is NYI `get_index` —
+comment says to upgrade when recordable), `select('#', g())` (resolution
+off-by-one = wrong VALUE), rawset-as-producer, zero-produced `f(g())`,
+fail-closed (cp multi-producer, vararg spread), §3a lifetime pair (reset
+clears a planted shadow; `maxrecord=8` run leaves null shadow + parity),
+deopt-through-pair (3 mid-run side exits, byte-identical). Gotcha for future
+tests: closure legs must be PARAM-clean — an upvalue/global read inside an
+inlined callee hits the pre-existing U0 barrier and masks the multret path.
+
+**Gates:** suite green (19 matching tests pass), hashgate 84/84, board
+28/28 cross=ok vs HEAD shadow baseline (/tmp/lune-base-multinest, sources
+restored via `git show HEAD:`): flat within noise (recursive-fib/scimark-fft
+looked inflated but LuaJIT's own column moved too — re-runs confirmed
+contention). Board tsv 20260828-163336 committed.
+
+**str_manip (honest):** MULTRET abort GONE (zero cross_frame), 5.2×→5.0× —
+the same loop now dies at `recInputGet`'s `MAX_TRACE_INPUTS=8` cap
+(`too_deep` @ `get_upval`, 518 hits): >8 distinct cached-builtin upvalues,
+each one synthetic entry input + guard_func. New TODO.md entry with the
+lever analysis (input cost is per-trace-entry — profile before raising the
+cap; general-language wall, any loop calling >8 cached functions). That cap
+is the natural NEXT arc candidate.
+
 ## Status 2026-08-28 (LATEST-92) — **effect-cursor bug FIXED (Bart: validate-before-advance) before starting multinest. `nextLoggedEffect` now kind-checks before advancing; `noteUnicodeVersion` peeks (`peekLoggedEffect`), validates, consumes only on success — a rejected wrong-version entry stays in front of the cursor, every retry re-raises, no silent mismatched-table pin.**
 
 Bart: "tempted to go towards multinest, but I don't want to leave the
