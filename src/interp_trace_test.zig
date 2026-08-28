@@ -1811,6 +1811,31 @@ test "input cap: 70 distinct upvalue inputs exceed the cap of 64 — fail-closed
     try testing.expect(vm.trace.entries == 0);
 }
 
+test "input cap: writeTrace header reports the synthetic-input count against the budget" {
+    // `--dump-traces` renders `inputs=N/cap` on every trace header so a dump
+    // answers "how close to the input budget?" directly — the LATEST-94
+    // misdiagnosis (str_manip read as cap-blocked while its main trace used
+    // 7 of 8) happened because nothing printed this number. Two upvalues read
+    // at the anchor (`up`, `base`) must show as exactly 2.
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var chunk = try runForTrace(&vm, gpa,
+        \\local up = string.upper
+        \\local base = "abc"
+        \\local function run()
+        \\  local acc = 0
+        \\  for i = 1, 50 do acc = acc + #up(base) end
+        \\  return acc
+        \\end
+        \\print(run())
+    , true);
+    defer chunk.deinit();
+    var buf: [16384]u8 = undefined;
+    const text = try dumpTrace(&buf, &vm);
+    try testing.expect(std.mem.indexOf(u8, text, "  inputs=2/") != null);
+}
+
 test "chunk rooting: a host-compiled retained chunk survives GC before it runs" {
     // docs/design/03 §"Chunk-constant rooting" — the regression. A host compiles chunk
     // B (whose distinctive literal is a `load_const`), retains it, runs chunk A (which

@@ -14369,7 +14369,10 @@ const MAX_CALLEE_REGS = 256;
 /// already needs 7, and one more cached builtin in any user loop would have
 /// silently killed its trace. 64 keeps the backstop role (maxrecord bounds the
 /// IR anyway — each input costs ≥2 ops) without realistically binding.
-const MAX_TRACE_INPUTS = 64;
+///
+/// `pub` for the diagnostic dumps only (`writeTrace`, `dumpNative` in main.zig
+/// render `inputs=N/{this}`); nothing outside this file may make policy off it.
+pub const MAX_TRACE_INPUTS = 64;
 
 /// One saved caller context for an inlined `.call`, popped at the matching
 /// `.ret`. `base_off` is the caller frame's absolute slot offset (relative to the
@@ -14752,7 +14755,12 @@ pub fn writeTrace(w: *io.Writer, t: *const Trace) io.Writer.Error!void {
         if (i != 0) try w.writeAll(" ");
         try w.print("r{d}", .{s});
     }
-    try w.writeAll("]\n");
+    // Synthetic entry inputs (upvalue/global/hash-cell snapshots) against the
+    // MAX_TRACE_INPUTS policy cap — so a dump answers "how close is this trace
+    // to the input budget?" at a glance instead of leaving it to be guessed
+    // from `.too_deep` abort rows (which once misdiagnosed str_manip as
+    // cap-blocked when its main trace used 7 of 8; CURRENT_TASK LATEST-94).
+    try w.print("]  inputs={d}/{d}\n", .{ t.inputs.len, MAX_TRACE_INPUTS });
     for (t.instrs, 0..) |ins, i| {
         try w.print("  %{d:0>3}  ", .{i});
         try writeIrInstr(w, ins);

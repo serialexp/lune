@@ -739,7 +739,9 @@ fn dumpNative(vm: *lune.interp.Vm) void {
     for (items, 0..) |t, i| {
         if (vm.trace.nativeFor(t)) |ct| {
             const code = ct.page.code;
-            w.print("trace #{d}: compiled, {d} bytes of x86-64\n", .{ i, code.len }) catch {};
+            w.print("trace #{d}: compiled, {d} bytes of x86-64, inputs={d}/{d}\n", .{
+                i, code.len, t.inputs.len, lune.trace.MAX_TRACE_INPUTS,
+            }) catch {};
             var off: usize = 0;
             while (off < code.len) : (off += 16) {
                 w.print("  {x:0>4}: ", .{off}) catch {};
@@ -748,7 +750,9 @@ fn dumpNative(vm: *lune.interp.Vm) void {
                 w.print("\n", .{}) catch {};
             }
         } else {
-            w.print("trace #{d}: unsupported — runs on the tier-1a interpreter\n", .{i}) catch {};
+            w.print("trace #{d}: unsupported — runs on the tier-1a interpreter, inputs={d}/{d}\n", .{
+                i, t.inputs.len, lune.trace.MAX_TRACE_INPUTS,
+            }) catch {};
         }
     }
     w.flush() catch {};

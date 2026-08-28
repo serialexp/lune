@@ -75,7 +75,9 @@ test "writeTrace renders a hand-built counting-loop trace" {
     const text = w.buffered();
 
     try testing.expect(std.mem.indexOf(u8, text, "trace main:5") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "entry=[r0 r1]") != null);
+    // Header carries the synthetic-input count against the policy cap
+    // (cap-agnostic prefix match so a future cap change doesn't break here).
+    try testing.expect(std.mem.indexOf(u8, text, "entry=[r0 r1]  inputs=0/") != null);
     try testing.expect(std.mem.indexOf(u8, text, "slot_load") != null);
     try testing.expect(std.mem.indexOf(u8, text, "guard_int") != null);
     try testing.expect(std.mem.indexOf(u8, text, "add") != null);
