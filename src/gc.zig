@@ -480,6 +480,26 @@ pub const Heap = struct {
     /// heap mutation, so an OOM can never leave a half-interned string or a
     /// consumed object id behind.
     pub fn intern(self: *Heap, content: []const u8) std.mem.Allocator.Error!*String {
+        return self.internImpl(content, .{});
+    }
+
+    /// `intern` with producer-`Known` character facts (doc 28 §6): a caller
+    /// that can PROVE the result's code-point count and/or ASCII bit (a
+    /// substring's count is `j - i + 1` by definition; a repetition or
+    /// permutation preserves the source's bit) passes them and the miss path
+    /// skips that half of the construction scan. Wrong claims trap in safe
+    /// builds — on the miss path (construction asserts against the fused scan)
+    /// AND on the hit path below, so a bad producer cannot hide behind bytes
+    /// that happen to be interned already.
+    pub fn internKnown(self: *Heap, content: []const u8, known: String.Known) std.mem.Allocator.Error!*String {
+        return self.internImpl(content, known);
+    }
+
+    /// The ONE intern body (doc 28 §6 [MF]: centralized so the doc-24 D5
+    /// transactional shape — every fallible step before any heap mutation,
+    /// at most one `Heap.link` — cannot fork between the plain and known-facts
+    /// entries).
+    fn internImpl(self: *Heap, content: []const u8, known: String.Known) std.mem.Allocator.Error!*String {
         // Program-visible strings are valid UTF-8 by construction (S-B), but
         // this entry ALSO accepts raw non-UTF-8 host bytes on purpose — the
         // effect log parks invalid host input as interned strings so a recorded
@@ -487,8 +507,13 @@ pub const Heap = struct {
         // character caches (`cp_len`, the exact `str_ascii` bit) are computed
         // from the bytes and stay well-defined either way (doc 28 §2).
         const h = std.hash.Wyhash.hash(0, content);
-        if (self.strtabLookup(content, h)) |existing| return existing;
-        const s = try String.createWithHash(self.gpa, content, h);
+        if (self.strtabLookup(content, h)) |existing| {
+            // Hit-path contract check (doc 28 §6 [MF]).
+            if (known.cp_len) |n| std.debug.assert(n == existing.cp_len);
+            if (known.ascii) |a| std.debug.assert(a == existing.isAscii());
+            return existing;
+        }
+        const s = try String.createWithHashKnown(self.gpa, content, h, known);
         errdefer s.destroy(self.gpa);
         try self.strtabEnsureCapacity();
         // Infallible from here.
@@ -763,6 +788,44 @@ test "interning returns the same object for identical bytes" {
     try testing.expectEqualStrings("hello", a.bytes());
     // Two interns of "hello" allocated only one object; plus "world".
     try testing.expectEqual(@as(usize, 2), heap.object_count);
+}
+
+test "doc 28 c3a: internKnown — same object as plain intern on hit AND miss, correct caches, link audit" {
+    var heap = Heap.init(testing.allocator);
+    defer heap.deinit();
+
+    // MISS with full known facts: links exactly once (object count AND the
+    // monotonic id counter advance by one), caches are right.
+    const a = try heap.internKnown("hello", .{ .cp_len = 5, .ascii = true });
+    try testing.expectEqual(@as(usize, 1), heap.object_count);
+    try testing.expectEqual(@as(u32, 1), heap.next_obj_id);
+    try testing.expectEqual(@as(usize, 5), a.cpLen());
+    try testing.expect(a.isAscii());
+
+    // HIT with known facts: same pointer, zero new links (the hit-path assert
+    // ran against the existing object's caches).
+    const b = try heap.internKnown("hello", .{ .cp_len = 5, .ascii = true });
+    try testing.expectEqual(a, b);
+    try testing.expectEqual(@as(usize, 1), heap.object_count);
+    try testing.expectEqual(@as(u32, 1), heap.next_obj_id);
+
+    // HIT from the PLAIN entry over a known-interned string, and vice versa —
+    // the two entries dedupe against each other (one internImpl body).
+    const c = try heap.intern("hello");
+    try testing.expectEqual(a, c);
+    const d = try heap.internKnown("world", .{}); // no facts: full scan path
+    const e = try heap.intern("world");
+    try testing.expectEqual(d, e);
+    try testing.expectEqual(@as(usize, 2), heap.object_count);
+
+    // Partial knowledge: count known, ASCII derived by scan (and conversely) —
+    // a multibyte miss gets the exact bit even when only the count is claimed.
+    const f = try heap.internKnown("héllo", .{ .cp_len = 5 });
+    try testing.expectEqual(@as(usize, 5), f.cpLen());
+    try testing.expect(!f.isAscii());
+    const g = try heap.internKnown("abc", .{ .ascii = true });
+    try testing.expectEqual(@as(usize, 3), g.cpLen());
+    try testing.expect(g.isAscii());
 }
 
 test "interned string equality is pointer identity through Value.eql" {

@@ -72,6 +72,19 @@ pub const String = extern struct {
         return self.header.flags.str_ascii;
     }
 
+    /// Producer-known character facts about a string's bytes (doc 28 §6): what
+    /// a construction site can prove WITHOUT scanning — e.g. a substring's
+    /// character count is `j - i + 1` by definition, a repetition/permutation
+    /// preserves the source's ASCII bit. Either field may be null (unknown →
+    /// derived by the fused scan). A wrong claim traps in safe builds — the
+    /// construction path asserts every resolved fact against the scan, so a
+    /// bad producer cannot mint a string with lying caches.
+    ///
+    /// NB: the §6 review-era shape was `known_cp: ?usize` alone; the exact
+    /// `str_ascii` bit (§2, discovered in c1) cannot be inferred from a count,
+    /// so the channel carries both facts independently.
+    pub const Known = struct { cp_len: ?usize = null, ascii: ?bool = null };
+
     /// One fused scan: code-point count (every byte that is not a continuation
     /// byte `0b10xxxxxx` starts a code point — equals
     /// `std.unicode.utf8CountCodepoints` for valid UTF-8, merely defined for
@@ -99,6 +112,14 @@ pub const String = extern struct {
     /// not pay the hash twice. `hash` MUST be `Wyhash.hash(0, content)`; every
     /// other caller goes through `create`, which guarantees it.
     pub fn createWithHash(gpa: std.mem.Allocator, content: []const u8, hash: u64) std.mem.Allocator.Error!*String {
+        return createWithHashKnown(gpa, content, hash, .{});
+    }
+
+    /// `createWithHash` with producer-`Known` character facts (doc 28 §6): each
+    /// known fact skips its half of the construction scan; each is asserted
+    /// against the scan in safe builds (a wrong claim is a producer bug, never
+    /// a silently-lying cache). Callers go through `Heap.internKnown`.
+    pub fn createWithHashKnown(gpa: std.mem.Allocator, content: []const u8, hash: u64, known: Known) std.mem.Allocator.Error!*String {
         // NB: no valid-UTF-8 assert here, deliberately — program-visible strings
         // ARE valid by construction (S-B: validated literals/decode/host seams),
         // but the effect log parks raw non-UTF-8 host input as interned strings
@@ -111,7 +132,16 @@ pub const String = extern struct {
         const total = std.math.add(usize, @sizeOf(String), content.len) catch return error.OutOfMemory;
         const raw = try gpa.alignedAlloc(u8, std.mem.Alignment.of(String), total);
         const self: *String = @ptrCast(raw.ptr);
-        const counted = countCodepoints(content);
+        const counted: Counted = if (known.cp_len != null and known.ascii != null)
+            .{ .cp_len = known.cp_len.?, .ascii = known.ascii.? }
+        else blk: {
+            const scanned = countCodepoints(content);
+            break :blk .{
+                .cp_len = known.cp_len orelse scanned.cp_len,
+                .ascii = known.ascii orelse scanned.ascii,
+            };
+        };
+        std.debug.assert(std.meta.eql(counted, countCodepoints(content)));
         var header = GcHeader.init(.string);
         header.flags.str_ascii = counted.ascii;
         self.* = .{

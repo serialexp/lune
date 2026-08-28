@@ -230,16 +230,27 @@ standalone yes/no with this section as the decision text.
 centralized path** so the doc-24 D5 transactional shape can't fork:
 
 ```zig
-fn internImpl(self: *Heap, content: []const u8, known_cp: ?usize) !*String
-// intern()        -> internImpl(content, null)
-// internKnownCp() -> internImpl(content, n)
+// AS LANDED (c3a) — the review-era signature was `known_cp: ?usize` alone,
+// which predates §2's exact `str_ascii` bit: a count cannot produce the bit,
+// so the channel carries BOTH facts, each independently optional (a producer
+// that knows only one still skips that half of the fused scan).
+pub const String.Known = struct { cp_len: ?usize = null, ascii: ?bool = null };
+fn internImpl(self: *Heap, content: []const u8, known: String.Known) !*String
+// intern()       -> internImpl(content, .{})
+// internKnown()  -> internImpl(content, known)   (doc draft name: internKnownCp)
 ```
 
 Miss sequence unchanged and single: hash+lookup → allocate unlinked (with
-the known count) → ensure table capacity → insert → the ONE `Heap.link`.
-**[MF] The safety-build assert (`known_cp == countCodepoints(content)`)
+the known facts) → ensure table capacity → insert → the ONE `Heap.link`.
+**[MF] The safety-build assert (each known fact vs `countCodepoints(content)`)
 runs on the HIT path too** — a wrong count must not hide behind existing
 bytes.
+
+Ascii-bit provenance at the §6 sites: a slice of an ASCII string, a
+repetition, and a permutation all *preserve* the source's bit; a general
+(non-ASCII-source) substring or a case-mapped result does NOT (Unicode
+simple case mapping can cross the ASCII boundary, e.g. U+212A KELVIN SIGN
+→ `k`), so those sites pass `ascii = null` and the scan derives it.
 
 **[MF] Known sites are broader than ASCII** (the review's correction —
 these hold for ALL valid inputs, not just ASCII):
