@@ -208,6 +208,8 @@ def main():
     ap.add_argument("--luajit", default=os.environ.get("LUAJIT", DEFAULT_LUAJIT))
     ap.add_argument("--no-luajit", action="store_true", help="skip LuaJIT comparison")
     ap.add_argument("--no-save", action="store_true", help="do not write a results TSV")
+    ap.add_argument("--no-jit-stats", action="store_true",
+                    help="skip the per-bench --jit-stats run behind the res%% column")
     args = ap.parse_args()
 
     if not os.path.exists(args.lune):
@@ -226,6 +228,7 @@ def main():
     print(f"reps  = {args.reps}   scale = {args.scale}\n")
     hdr = (f"{'program':<16} {'cross':<7} {'luajit':<7} "
            f"{'t0 ms':>9} {'jit ms':>9} {'lj ms':>9} {'jit/lj':>7} {'t0/lj':>7} "
+           f"{'res%':>6} "
            f"{'t0 MB':>7} {'jit MB':>7} {'lj MB':>7}")
     print(hdr)
     print("-" * len(hdr))
@@ -246,7 +249,7 @@ def main():
             print(f"{b.name:<16} ERROR in {rc_bad[0]}: {rc_bad[1]}")
             rows.append(dict(name=b.name, cross="ERR", luajit="-", t0="", jit="", lj="",
                              argv=" ".join(b.argv), execns_t0="", execns_jit="",
-                             mem_t0="", mem_jit="", mem_lj=""))
+                             mem_t0="", mem_jit="", mem_lj="", res=""))
             continue
         cross_ok = outs["t0"] == outs["trace"] == outs["jit"]
 
@@ -278,13 +281,30 @@ def main():
         if b.luajit == "compatible" and have_lj:
             mem_lj = mem_best([args.luajit, b.lj_path(), *b.argv], args.mem_reps, cwd=bench_dir)
 
+        # --- native residency (doc 31 D3): one dedicated --jit-stats run, never
+        # timed. "res%" is the share of run TSC cycles spent executing native
+        # trace code ("ran as a trace: X% of run"). A flat bench sitting at a
+        # few % residency despite committed traces is the first suspect for a
+        # gating/coverage pathology — this puts that signal on the board
+        # artifact itself instead of behind a manual profiling session.
+        res_pct = None
+        if not args.no_jit_stats:
+            _, _, stats_err, _ = run_once(
+                [args.lune, "--trace", "--jit-native", "--jit-stats", b.path, *b.argv],
+                cwd=bench_dir)
+            m = re.search(r"ran as a trace:\s+([\d.]+)% of run", stats_err)
+            if m:
+                res_pct = float(m.group(1))
+
         jit_lj = f"{jit_ms / lj_ms:.1f}x" if lj_ms else "-"
         t0_lj = f"{t0_ms / lj_ms:.1f}x" if lj_ms else "-"
         cross_s = "ok" if cross_ok else "MISMATCH"
         mb = lambda kb: f"{kb / 1024:.1f}" if kb is not None else "-"
+        res_s = f"{res_pct:.1f}" if res_pct is not None else "-"
         print(f"{b.name:<16} {cross_s:<7} {lj_status:<7} "
               f"{t0_ms:>9.1f} {jit_ms:>9.1f} "
               f"{(f'{lj_ms:.1f}' if lj_ms else '-'):>9} {jit_lj:>7} {t0_lj:>7} "
+              f"{res_s:>6} "
               f"{mb(mem_t0):>7} {mb(mem_jit):>7} {mb(mem_lj):>7}")
 
         rows.append(dict(
@@ -295,6 +315,7 @@ def main():
             execns_t0=(execns_t0 or ""), execns_jit=(execns_jit or ""),
             mem_t0=mem_t0, mem_jit=mem_jit,
             mem_lj=(mem_lj if mem_lj is not None else ""),
+            res=(f"{res_pct:.1f}" if res_pct is not None else ""),
         ))
 
     # --- history TSV ---
@@ -305,7 +326,8 @@ def main():
         path = os.path.join(ROOT, "bench", "results", f"{stamp}-{rev}.tsv")
         cols = ["program", "args", "luajit_mode", "cross", "luajit_match",
                 "lune_t0_ms", "lune_jit_ms", "luajit_ms", "lune_t0_execns", "lune_jit_execns",
-                "lune_t0_maxrss_kb", "lune_jit_maxrss_kb", "luajit_maxrss_kb"]
+                "lune_t0_maxrss_kb", "lune_jit_maxrss_kb", "luajit_maxrss_kb",
+                "lune_jit_res_pct"]
         with open(path, "w") as fh:
             fh.write(f"# lune bench suite  rev={rev}  stamp={stamp}  reps={args.reps}  scale={args.scale}\n")
             fh.write("\t".join(cols) + "\n")
@@ -313,7 +335,7 @@ def main():
                 fh.write("\t".join(str(x) for x in [
                     r["name"], r["argv"], "-", r["cross"], r["luajit"],
                     r["t0"], r["jit"], r["lj"], r["execns_t0"], r["execns_jit"],
-                    r["mem_t0"], r["mem_jit"], r["mem_lj"],
+                    r["mem_t0"], r["mem_jit"], r["mem_lj"], r["res"],
                 ]) + "\n")
         # latest.tsv mirror for easy diffing
         latest = os.path.join(ROOT, "bench", "results", "latest.tsv")
