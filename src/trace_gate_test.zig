@@ -109,7 +109,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
 
     // Pre-seed a penalty AND an active gate on the owner: the full window must clear BOTH.
     try state.penalty.put(gpa, owner, 3);
-    state.gateAnchor(owner);
+    state.gateAnchor(owner, .legacy_thrash);
     try testing.expect(state.isGated(owner));
 
     // (2) The eighth traversal completes exactly one N window: one useful flush,
@@ -694,4 +694,185 @@ test "A-iv region_profit: same-activation owner collision flushes old before rep
     try testing.expect(state.region_profit.contains(.{ .region_id = r2, .activation = 77 }));
     try testing.expectEqual(@as(u64, 1), state.region_profit_flushes);
     try testing.expectEqual(@as(u64, 3), state.region_profit_flushed_work);
+}
+
+// ---------------------------------------------------------------------------
+// Doc 31 — record vs dispatch gate split (D1) + clear-on-productive (D2).
+// The unit half of the §6 matrix; the e2e ratchet regression lives in
+// interp_native_test.zig, the entry-patch interactions in
+// trace_entrypatch_test.zig.
+// ---------------------------------------------------------------------------
+
+test "doc 31 D2: any productive receipt clears the strike; only consecutive zeros gate" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil) };
+    const proto = Proto{ .code = &code, .name = "t", .num_registers = 1 };
+    var t: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+    const key = t.anchor;
+
+    // The str_gmatch ratchet shape: productive receipts BELOW min_useful
+    // (7-token instances) with an isolated designed-exit zero (exhaustion,
+    // guard_gc admission) per instance. Under the old `completed >=
+    // min_useful` clear the zeros ratcheted the penalty monotonically —
+    // the productive receipts could never un-earn them (measured: 2.6%
+    // native residency on a healthy trace). Now each productive receipt
+    // resets the strike, so this alternation runs forever without gating.
+    var i: u32 = 0;
+    while (i < state.config.max_penalty * 4) : (i += 1) {
+        state.onSideExit(&t, state.config.min_useful - 1); // productive, below min_useful
+        state.onSideExit(&t, 0); // designed-exit zero
+        try testing.expect(!state.isGated(key));
+        try testing.expect((state.penalty.get(key) orelse 0) <= 1);
+    }
+    try testing.expectEqual(@as(usize, 0), state.gate.count());
+
+    // Turnstile preserved: consecutive zeros with NO productive receipt in
+    // between (gc_stress-shaped anchors, corrupted iterator state) still
+    // reach max_penalty and gate exactly as before.
+    var j: u32 = 0;
+    while (j < state.config.max_penalty) : (j += 1) state.onSideExit(&t, 0);
+    try testing.expect(state.isGated(key));
+
+    // The clear is dispatch-only: pre-seed a record gate, then a single
+    // productive receipt (even completed=1) clears penalty AND the dispatch
+    // gate but never the record gate — productive dispatch is not evidence
+    // about recording.
+    state.gateRecordAnchor(key, .record_abort);
+    state.onSideExit(&t, 1);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(key));
+    try testing.expect(!state.isGated(key));
+    try testing.expectEqual(@as(usize, 0), state.gate.count());
+    try testing.expect(state.record_gate.contains(key));
+}
+
+test "doc 31 D1: record and dispatch gates escalate and expire independently" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = [_]Instr{ Instr.op0(.load_nil), Instr.op0(.load_nil) };
+    const proto = Proto{ .code = &code, .name = "t", .num_registers = 1 };
+    const key: AnchorKey = .{ .proto = &proto, .pc = 0 };
+
+    // One record strike: recording is barred through the cooldown; dispatch
+    // never is.
+    state.gateRecordAnchor(key, .record_abort);
+    try testing.expect(state.isRecordGated(key));
+    try testing.expect(!state.isGated(key));
+    try testing.expect(state.recordingBarred(key));
+
+    // Cooldown elapses: recording eligible again, but the map entry remains
+    // (the onBackEdge retry probe depends on `contains`).
+    state.tick = state.record_gate.get(key).?.retry_at;
+    try testing.expect(!state.isRecordGated(key));
+    try testing.expect(!state.recordingBarred(key));
+    try testing.expect(state.record_gate.contains(key));
+
+    // Record-map permanence (max_strikes) bars recording forever but never
+    // dispatch: the committed traces keep running.
+    var i: u32 = 0;
+    while (i < state.config.max_strikes) : (i += 1) state.gateRecordAnchor(key, .record_abort);
+    state.tick = std.math.maxInt(u64); // no cooldown can save it
+    try testing.expect(state.isRecordGated(key));
+    try testing.expect(!state.isGated(key));
+    try testing.expect(state.recordingBarred(key));
+
+    // Dispatch-map permanence bars BOTH (recordingBarred consults both
+    // maps), and `gateNativeUnsupported` still writes the dispatch map —
+    // the tier-1a-slower protection is intact.
+    const key2: AnchorKey = .{ .proto = &proto, .pc = 1 };
+    state.gateNativeUnsupported(key2);
+    try testing.expect(state.gate.contains(key2));
+    var k: u32 = 0;
+    while (k < state.config.max_strikes) : (k += 1) state.gateAnchor(key2, .native_unsupported);
+    try testing.expect(state.isGated(key2));
+    try testing.expect(state.recordingBarred(key2));
+    try testing.expect(!state.isRecordGated(key2)); // record map untouched
+}
+
+test "doc 31: an aborted root recording retries after the record cooldown despite a stale hot counter" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    state.config.hotloop = 3;
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
+    const key: AnchorKey = .{ .proto = &proto, .pc = 7 };
+
+    // Warm to hot: the third back-edge arms (the one-shot `== hotloop`
+    // crossing).
+    state.onBackEdge(&proto, 7, RegWindow.empty);
+    state.onBackEdge(&proto, 7, RegWindow.empty);
+    state.onBackEdge(&proto, 7, RegWindow.empty);
+    try testing.expect(state.isRecording());
+
+    // Simulate the abort's observable effect: the recording dies and the
+    // anchor is record-gated (`abort()` → `gateRecordAnchor(.record_abort)`).
+    state.rec.active = false;
+    state.gateRecordAnchor(key, .record_abort);
+
+    // While the record cooldown runs, back-edges do NOT re-arm...
+    state.onBackEdge(&proto, 7, RegWindow.empty);
+    try testing.expect(!state.isRecording());
+
+    // ...but once it elapses, the `contains` probe grants the one retry even
+    // though the warming counter (now 5) is far past the `== hotloop`
+    // crossing. Without record_gate in that probe an aborted ROOT recording
+    // could never retry (doc 31 §3, review B3).
+    state.tick = state.record_gate.get(key).?.retry_at;
+    state.onBackEdge(&proto, 7, RegWindow.empty);
+    try testing.expect(state.isRecording());
+    try testing.expectEqual(@as(u32, 7), state.rec.anchor.pc);
+}
+
+test "doc 31: a pending continuation/replay-side request gated after creation is declined at start" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 2 };
+    const key: AnchorKey = .{ .proto = &proto, .pc = 4 };
+
+    // Continuation request created, then the anchor is gated before tier-0
+    // reaches it: the request is consumed but no recording starts (doc 31
+    // §3, review B3 — final eligibility check at `rec.reset` time).
+    state.pending_exit_anchor = key;
+    state.gateAnchor(key, .legacy_thrash);
+    state.maybeStartContinuation(&proto, 4);
+    try testing.expect(!state.isRecording());
+    try testing.expectEqual(@as(?AnchorKey, null), state.pending_exit_anchor);
+
+    // Same for the replay-side path, with a RECORD gate this time — both
+    // maps bar recording starts.
+    _ = state.gate.remove(key);
+    state.pending_replay_anchor = key;
+    state.gateRecordAnchor(key, .record_abort);
+    state.maybeStartReplaySide(&proto, 4);
+    try testing.expect(!state.isRecording());
+    try testing.expectEqual(@as(?AnchorKey, null), state.pending_replay_anchor);
+
+    // Control: with both gates clear the same request DOES start a recording
+    // — the decline above was the gate, not the plumbing.
+    _ = state.record_gate.remove(key);
+    state.pending_exit_anchor = key;
+    state.maybeStartContinuation(&proto, 4);
+    try testing.expect(state.isRecording());
+}
+
+test "doc 31 D1: clearCache drops the record gate (epoch boundary, leak-checked)" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    const proto = Proto{ .code = &.{}, .name = "t" };
+    state.gateRecordAnchor(.{ .proto = &proto, .pc = 0 }, .record_abort);
+    state.gateRecordAnchor(.{ .proto = &proto, .pc = 1 }, .commit_failure);
+    try testing.expectEqual(@as(usize, 2), state.record_gate.count());
+    state.clearCache();
+    try testing.expectEqual(@as(usize, 0), state.record_gate.count());
+    // `deinit` under std.testing.allocator leak-checks the map allocation
+    // itself (doc 31 §6 test 9).
 }

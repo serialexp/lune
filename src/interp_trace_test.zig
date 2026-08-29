@@ -2815,9 +2815,11 @@ test "recorder: a non-recursive fixed-arity leaf call is inlined into one trace"
     // recursive Lua leaf is inlined into the trace (guard_func + seeded callee
     // slots + return mapping) rather than aborting, so the loop records exactly
     // one trace, the recording closes cleanly, and the anchor is *not*
-    // blacklisted (an aborted anchor would have been gated — `gate.count() >= 1`).
+    // blacklisted (an aborted anchor would have been record-gated — doc 31:
+    // aborts land in `record_gate`, so both maps must stay empty here).
     try testing.expectEqual(@as(usize, 1), vm.trace.cache.items.len);
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.record_gate.count());
     try testing.expect(!vm.trace.isRecording());
 }
 
@@ -2836,7 +2838,7 @@ test "recorder: a vararg call in the loop body still aborts cleanly" {
     // A vararg callee has no compile-time-fixed register window to seed, so the
     // recorder must still abort (cross_frame) — no trace cached, recording done.
     try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
 
@@ -2927,7 +2929,7 @@ test "recorder: a set_upval in the loop body aborts cleanly" {
     defer chunk.deinit();
 
     try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
 
@@ -2946,7 +2948,7 @@ test "recorder: a set_global in the loop body aborts cleanly" {
     defer chunk.deinit();
 
     try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
 
@@ -3050,7 +3052,7 @@ test "recorder: maxrecord bounds trace length (overlong traces abort)" {
     defer chunk.deinit();
 
     try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
 
@@ -3152,7 +3154,7 @@ test "recorder (hash field): an absent constant-key access aborts (no trace)" {
     defer chunk.deinit();
 
     try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
 
@@ -3172,7 +3174,7 @@ test "recorder (hash field): a metatable-bearing table aborts (.has_metatable)" 
     defer chunk.deinit();
 
     try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
 
@@ -3192,7 +3194,7 @@ test "recorder (hash field): a heap-valued (string) field aborts (scalar-only re
     defer chunk.deinit();
 
     try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
 
@@ -3213,7 +3215,7 @@ test "recorder (hash field): a computed (non-konst) key aborts (const-key rule)"
     defer chunk.deinit();
 
     try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
 
@@ -3342,7 +3344,7 @@ test "recorder (hash alias): same key through two table refs classifies MAY and 
     defer chunk.deinit();
 
     try testing.expectEqual(@as(usize, 0), vm.trace.cache.items.len);
-    try testing.expect(vm.trace.gate.count() >= 1);
+    try testing.expect(vm.trace.record_gate.count() >= 1); // doc 31: aborts gate RECORDING
     try testing.expect(!vm.trace.isRecording());
 }
 

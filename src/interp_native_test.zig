@@ -626,12 +626,18 @@ test "executor: a variable that flips int->float mid-loop deopts to tier-0 and s
     try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
 }
 
-test "executor: a branchy low-yield loop blacklists the thrashing anchor yet prints correctly" {
-    // The trace records one parity of `if i % 2 == 0`; the opposite parity fails
-    // its branch guard after ~1 committed iteration *every* entry. `completed > 0`
-    // looks productive but never reaches `min_useful`, so the penalty accrues and
-    // the anchor blacklists — the case both plan reviewers flagged. Output stays
-    // exact (100 evens × 1 + 100 odds × 2 == 300).
+test "executor: a branchy low-yield loop stays UNGATED under clear-on-productive yet prints correctly" {
+    // Doc 31 D2 inverts this test's original expectation, deliberately. The trace
+    // records one parity of `if i % 2 == 0`; the opposite parity fails its branch
+    // guard after ~1 committed iteration *every* entry. Under the old
+    // `completed >= min_useful` clear this ratcheted the penalty and blacklisted
+    // the anchor; under clear-on-productive every `completed=1` receipt resets the
+    // strike, so the anchor NEVER gates — the "accepted give" of doc 31 §4 (the
+    // same rule that fixes the str_gmatch ratchet, where fixed-length productive
+    // instances below min_useful were being gated into 3% native residency).
+    // Escalation path, if a bench ever demonstrates this shape's cost: a
+    // deterministic saturating work-credit score — not a return to the ratchet.
+    // Output stays exact (100 evens × 1 + 100 odds × 2 == 300).
     const source =
         \\local s = 0
         \\for i = 1, 200 do
@@ -649,14 +655,12 @@ test "executor: a branchy low-yield loop blacklists the thrashing anchor yet pri
     var chunk = try runExecForTrace(&vm, gpa, source, &sink);
     defer chunk.deinit();
     try testing.expectEqualStrings("300\n", sink.buffered());
-    try testing.expect(vm.trace.gate.count() >= 1);
-    // The blacklist must GATE ENTRY, not merely be set: once the anchor maxes out
-    // its penalty (≤ ~max_penalty productive-but-low-yield entries), the dispatch
-    // loop stops entering the cached trace and tier-0 owns the remaining ~180
-    // iterations. Without the entry-gate this loop entered the trace ~100 times
-    // (once per even iteration) and ran *slower* than tier-0. Bound it well under
-    // that to prove re-entry actually halts.
-    try testing.expect(vm.trace.entries < 30);
+    // Pin the new steady state: no gate, no residual penalty, and dispatch keeps
+    // re-entering the cached trace once per even iteration (~98 entries at
+    // n=200 after warmup) instead of being ratcheted out.
+    try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.penalty.count());
+    try testing.expect(vm.trace.entries > 80);
 }
 
 test "executor: a thrashing anchor that later stabilizes recovers from the gate" {
@@ -1288,4 +1292,39 @@ test "B-v (doc 22 §B.6): decline determinism — a hash-cell seed invalidated b
         \\end
         \\print(acc)
     , "240\n", .{ .hotguard = 3, .inspect = &assertHashDriftDeclined });
+}
+
+test "executor: doc 31 ratchet regression — fixed short gmatch instances never gate the anchor" {
+    // The str_gmatch pathology (doc 31 §1): each for-in instance yields a
+    // FIXED token count below min_useful (5 here < 8), ending in a designed
+    // exhaustion exit (a completed=0 receipt). Under the pre-doc-31 clear
+    // threshold those zeros ratcheted the penalty to a gate the productive
+    // receipts could never un-earn (2.6% native residency on a healthy trace
+    // at bench scale); under clear-on-productive the anchor stays ungated
+    // across arbitrarily many instances, receipts keep flowing, and output
+    // is byte-identical to tier-0.
+    const source =
+        \\local n = 0
+        \\for j = 1, 300 do
+        \\  for w in string.gmatch("a b c d e", "%a") do n = n + 1 end
+        \\end
+        \\print(n)
+    ;
+    try expectTier0Equiv(source);
+
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try runExecForTrace(&vm, gpa, source, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings("1500\n", sink.buffered());
+    // Probe (2026-08-29): gate=0 record_gate=1 entries=300 penalty=0 cache=1.
+    // The one record_gate entry is the OUTER j-loop's recording abort (its
+    // body contains the untraceable generic-for header) — correctly a record
+    // gate now, leaving the gmatch anchor's dispatch untouched.
+    try testing.expectEqual(@as(usize, 0), vm.trace.gate.count());
+    try testing.expectEqual(@as(usize, 0), vm.trace.penalty.count());
+    try testing.expect(vm.trace.entries > 100);
 }

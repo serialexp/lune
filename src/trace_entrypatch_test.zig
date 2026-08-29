@@ -267,13 +267,93 @@ test "doc 20 triggers: anchor gate and side-arm want both mark the patch pending
     try testing.expect(state.entry_patches.items[0].tombstone);
     try testing.expectEqual(@as(?u16, null), t.entry_slot);
 
-    // Side-arm trigger: `wants_side_trace` crossing hotguard marks pending.
+    // Doc 31 D1: while the anchor is still (dispatch-)gated from the trigger
+    // above, want PRODUCTION is barred — crossing hotguard must NOT create a
+    // want (it would unpatch the entry on every qualifying exit forever).
     try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
     var i: u32 = 0;
     while (i < state.config.hotguard) : (i += 1) state.countGuardFailure(anchor, 4);
+    try testing.expect(state.wants_side_trace == null);
+
+    // Side-arm trigger: with the gate cleared, `wants_side_trace` crossing
+    // hotguard marks pending. (The counter kept saturating while barred, so
+    // one more failure is enough — doc 31 §3: hotness is not lost.)
+    _ = state.gate.remove(anchor);
+    state.countGuardFailure(anchor, 4);
     try testing.expect(state.wants_side_trace != null);
     const p = state.entry_patches.items[t.entry_slot.?];
     try testing.expect(p.pending_unpatch);
     state.drainEntryPatchWork();
     try testing.expectEqual(OpCode.for_loop, state.codeFor(&proto)[5].op);
+}
+
+test "doc 31 D1: a record gate leaves the entry patch live and blocks want production" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = entryPatchTestCode();
+    const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
+    const anchor = AnchorKey{ .proto = &proto, .pc = 2 };
+    const t = try entryPatchTestTrace(gpa, 1, &proto, 2);
+    try state.cache.append(gpa, t);
+    try testing.expectEqual(TraceState.InstallResult.installed, state.installEntryPatch(t));
+
+    // Recording failures land in `record_gate`: dispatch stays open
+    // (`isGated` false) and the healthy trace's entry patch is NOT marked
+    // pending — a record gate never unpatches (doc 31 §3).
+    state.gateRecordAnchor(anchor, .record_abort);
+    try testing.expect(state.isRecordGated(anchor));
+    try testing.expect(!state.isGated(anchor));
+    try testing.expect(state.recordingBarred(anchor));
+    try testing.expect(!state.entry_patches.items[0].pending_unpatch);
+
+    // Want PRODUCTION is barred while record-gated (review B3): crossing
+    // hotguard neither creates a want nor unpatches the entry — without
+    // this, every qualifying hot exit would re-unpatch the healthy trace
+    // for as long as the record gate stands.
+    var i: u32 = 0;
+    while (i < state.config.hotguard) : (i += 1) state.countGuardFailure(anchor, 4);
+    try testing.expect(state.wants_side_trace == null);
+    try testing.expect(!state.entry_patches.items[0].pending_unpatch);
+
+    // After the record cooldown elapses, the saturated counter re-creates
+    // the want on the next failure — hotness was never lost.
+    state.tick = state.record_gate.get(anchor).?.retry_at;
+    state.countGuardFailure(anchor, 4);
+    try testing.expect(state.wants_side_trace != null);
+
+    // Record-abandonment survives trace retirement (the penalty_pc analog):
+    // the record gate is keyed on the anchor, not the trace.
+    state.removeTrace(t);
+    try testing.expect(state.record_gate.contains(anchor));
+}
+
+test "doc 31 D1 amendment: record-gated anchor arms GATE_SKIP only when no trace exists" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = entryPatchTestCode();
+    const proto = Proto{ .code = &code, .id = 7, .name = "t", .num_registers = 8 };
+    var code2 = entryPatchTestCode();
+    const proto2 = Proto{ .code = &code2, .id = 8, .name = "u", .num_registers = 8 };
+
+    // Record-gated, NO committed trace: the slow path can do nothing here
+    // (recording barred, nothing to enter) — the skip must arm, else every
+    // back-edge of an abort-blacklisted hot loop pays full `onBackEdge`
+    // bookkeeping forever (measured on the first post-split board: tbl_ops
+    // +40%, euler14-bit +55%, nsieve-bit-fp +57% jit-vs-t0 drag).
+    state.gateRecordAnchor(.{ .proto = &proto, .pc = 2 }, .record_abort);
+    state.afterBackEdge(&proto, 2);
+    try testing.expect(state.skipBackEdge(&proto, 2));
+
+    // Record-gated WITH a committed trace (separate proto so the hot-count
+    // slots cannot collide): the slow path is exactly what enters the trace —
+    // must NOT skip (dispatch starvation, review B3).
+    const t = try entryPatchTestTrace(gpa, 1, &proto2, 2);
+    try state.cache.append(gpa, t);
+    state.gateRecordAnchor(t.anchor, .record_abort);
+    state.afterBackEdge(&proto2, 2);
+    try testing.expect(!state.skipBackEdge(&proto2, 2));
 }
