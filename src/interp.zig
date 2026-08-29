@@ -3119,7 +3119,19 @@ pub const Vm = struct {
                 },
                 // `#t` honours `__len` for tables; strings/raw-length fall through.
                 .len => {
-                    regs.set(a, try self.lenValue(regs.get(instr.b)));
+                    // Inline string fast path: `#s` is a cached-field read
+                    // (`cp_len`, S-B) and strings can't carry `__len`, so the
+                    // outlined `lenValue` call — whose error-union struct
+                    // return alone measured ~86 cycles/op via a store-forward
+                    // stall (str_gmatch profile, 2026-08-29: 20% of the bench)
+                    // — is pure overhead here. Tables (metamethod dispatch),
+                    // row views, and error cases keep the slow path.
+                    const v = regs.get(instr.b);
+                    if (v.isHeap() and v.heapType() == .string) {
+                        regs.setInt(a, @intCast(string.String.fromHeader(v.asHeap()).cpLen()));
+                    } else {
+                        regs.set(a, try self.lenValue(v));
+                    }
                     continue :sw (try self.nextOp(mode, frame, closure, proto, code, regs, &pc, &cur_pc, &instr, &a) orelse return .suspended);
                 },
 
