@@ -1205,12 +1205,25 @@ fn sGmatch1(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// empty match), and return the captures; 0 results when exhausted.
 fn gmatchAuxCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
     const st = try tableArg(vm, args, 0);
+    // B03-shape fast path (the tier-0 twin of the JIT callout's layout
+    // check, doc 30 §6): the compiler-built state `{[1]=s,[2]=pat,[3]=pos}`
+    // is an in-lane `.value` array covering keys 1..3, and the cursor
+    // read→match→write round-trip is this iterator's loop-carried chain —
+    // resolve the three slots directly and write the cursor back
+    // allocation-free, skipping three generic `getInt` calls and the
+    // generic `Table.set` (normalizeKey/NaN/widen/migrate) per token.
+    // Semantics are identical by construction: for an in-array key `getInt`
+    // IS the lane read (never the hash), `inLaneValueAt(3)` non-null
+    // implies keys 1..2 are in-array too (asize > 3), and any layout the
+    // lane can't answer for — user-built state, hash-resident keys,
+    // narrowed lane, grid — falls back to the generic reads/write.
+    const in_lane = st.inLaneValueAt(3);
     // Recover the subject as its `String` OBJECT (doc 28 c2), not a degraded
     // byte slice — capture conversion downstream wants the cached ASCII bit.
-    const sobj = strObjOf(st.getInt(1)) orelse return error.TypeError;
+    const sobj = strObjOf(if (in_lane != null) st.inLaneValueAt(1).? else st.getInt(1)) orelse return error.TypeError;
     const s = sobj.bytes();
-    const pat = interp.strBytes(st.getInt(2)) orelse return error.TypeError;
-    const pos_v = st.getInt(3);
+    const pat = interp.strBytes(if (in_lane != null) st.inLaneValueAt(2).? else st.getInt(2)) orelse return error.TypeError;
+    const pos_v = in_lane orelse st.getInt(3);
     const src: usize = if (pos_v.isInt() and pos_v.asInt() >= 0) @intCast(pos_v.asInt()) else 0;
 
     // Doc 30 P3: the shared locate core, gmatch flavor (no anchor consumption
@@ -1220,7 +1233,10 @@ fn gmatchAuxCore(vm: *Vm, args: []const Value, buf: *ResultBuf) anyerror!usize {
         // Ensure progress on an empty match by stepping a whole code point
         // (S-D); `@max(…, 1)` guarantees termination at end-of-string.
         const newpos = if (span.end == span.start) span.end + @max(ms.seqLen(span.end), 1) else span.end;
-        try st.set(vm.gpa, Value.int(3), Value.int(@intCast(newpos)));
+        // In-lane cursor write; the generic set covers a non-int cell (a
+        // user overwrote `state[3]`) and the no-fast-path layouts.
+        if (in_lane == null or !st.setInLaneValueInt(3, @intCast(newpos)))
+            try st.set(vm.gpa, Value.int(3), Value.int(@intCast(newpos)));
         return try writeCaptures(vm, &ms, sobj, .{ span.start, span.end }, buf);
     }
     return 0; // exhausted

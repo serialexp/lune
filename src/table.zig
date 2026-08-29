@@ -177,6 +177,21 @@ pub const Table = struct {
     /// lowering treats that as a side-exit rather than risking a write into a
     /// migrated layout. Allocation-free by construction; an int-over-int
     /// `.value`-lane store needs no GC barrier (no heap pointer involved).
+    /// `t[k]` iff the key is an existing in-lane `.value` array cell — the
+    /// direct slot read for a shape-verified table (the gmatch-state fast
+    /// path's read twin of `setInLaneValueInt` below). For an in-array key
+    /// this is exactly what `getInt` returns (the array read never consults
+    /// the hash part), minus the grid branch, the hash fallback, and the
+    /// call. `null` when the array part can't answer for this key (narrow
+    /// lane, grid, out of range) — caller falls back to `getInt`.
+    pub fn inLaneValueAt(self: *const Table, k: i64) ?Value {
+        const a = &self.array;
+        if (a.lane != .value) return null;
+        if (!arr.ArrayPart.inArray(k, a.asize)) return null;
+        const vals: [*]const Value = @ptrCast(@alignCast(a.data.?));
+        return vals[@intCast(k)];
+    }
+
     pub fn setInLaneValueInt(self: *Table, k: i64, x: i64) bool {
         const a = &self.array;
         if (a.lane != .value) return false;
