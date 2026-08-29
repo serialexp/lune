@@ -21,7 +21,68 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
-## Status 2026-08-29 (LATEST-99) — **DOC 30 ARC LANDED (c1–c5): find/match/gmatch-iteration/tonumber(string) record as guarded callouts. str_find_match 32.4 → 20.1 ms (2.4× → 1.5× LJ, ≤20 target MET, zero recording aborts). str_gmatch flat at 57 — residue PROVEN constant-factor, not coverage (LJ runs it in ~25 ms with `-joff`; gmatch is NYI in LJ's recorder too). L3 intern-hash yes/no still open with Bart — now the identified next lever on gmatch.**
+## Status 2026-08-29 (LATEST-100) — **DOC 31 ARC LANDED: the gate is split (dispatch `gate` vs new `record_gate`) and `accountLegacyThrash` clears on ANY productive receipt. str_gmatch native residency 3.3% → 75% (gmatch anchor, by iterations), wall 52.6 → 49.4 ms. Board carries a new `res%` column (native residency by TSC cycles, from a dedicated `--jit-stats` run) — the D3 "stop circling this" fix, with the standing `--jit-stats`-before-verdict rule now in the project CLAUDE.md.**
+
+Pre-arc, two small general levers landed the same day (Bart: "Inline len
+seems straightforward", "after that lets look at gmatchAuxCore and the
+region gate exit classification"): 122b186 inline string-`#` in tier-0
+dispatch (instructions −2.8% on str benches but cycles −0.9% — the ILP
+trap: at IPC 4.3 a 20%-of-cycle-samples symbol was NOT 20% removable;
+instruction-count A/B is the honest metric, noted in the commit), and
+a818c79 B03-shape fast path in the tier-0 gmatch iterator (`inLaneValueAt`
+read twin; −6.5% instr, str_gmatch 56.2 → 52.6 ms). Also measured on
+Bart's demand: the gmatch cost split is matcher ~41% / gmatchAuxCore ~23%
+/ intern ~2% — which KILLED the L3-for-gmatch justification (L3 remains
+relevant only for str_manip-shaped workloads; the open L3 yes/no is now
+deprioritized).
+
+The pathology (doc 31 §1, found while chasing "gmatchAuxCore + the region
+gate"): a HEALTHY committed gmatch trace (completed=7 × 2647 receipts) ran
+at 3.3% native residency because (1) designed-exit zeros (sgmatch
+exhaustion, guard_gc admission) struck the legacy penalty, (2) the clear
+threshold `completed >= min_useful=8` was unreachable for 7-token
+instances so the penalty ratcheted monotonically, and (3) failed
+side-recordings of the unrecordable generic-for done-direction gated the
+ROOT anchor's DISPATCH (LuaJIT's penalty_pc only ever suppresses
+re-recording). Codex BLOCKED the first design ((1)+(3) exit
+classification): sgmatch's executors collapse non-OK statuses into one
+exit_instr, guard_gc must keep striking, and the v1 split leaked in three
+want/pending paths. Bart switched to (1)+(2) — the reviewer's
+recommendation — via AskUserQuestion.
+
+Landed (doc 31 §9 has the full table): D1 gate split with all three B3
+leak fixes (want production gated in noteTakenExit/countGuardFailure/
+countFingerprintMiss; final `recordingBarred` at maybeStartContinuation/
+maybeStartReplaySide; onBackEdge retry probe consults both maps), D2
+clear-on-productive (accepted give: 1-productive/1-zero alternation never
+gates; escalation path = deterministic work-credit score, NOT an IR-op
+list), D3 GateReason dbg tags + board res% + CLAUDE.md rule. Tests: 7 new
+(5 unit trace_gate_test, 1 entrypatch, 1 e2e ratchet regression) + the
+old "branchy low-yield blacklists" test DELIBERATELY inverted (it pinned
+the ratchet; probe gate=0 penalty=0 entries=98 — §4's accepted give,
+now pinned as such). Both legs + jit-debug green, hashgate 84/84.
+
+**Measured vs predicted:** residency 75% vs >80% predicted; wall 49.4 vs
+44–48 predicted. The residual is the per-instance ENTRY SEAM, not gating:
+2 of 8 iterations/instance run tier-0 (~541 c/it) before native entry
+catches (6 × ~265 c/it) — recorded in TODO.md as the follow-up lever
+(first-header-reach entry patching, doc-30 `.jloop` territory).
+
+**First board was NOT neutral → D1 amendment (doc 31 §9a).** Benches
+whose hot loops abort recording and never trace regressed 40–57% in jit
+mode (tbl_ops/euler14-bit/nsieve-bit-fp/sparse, all res% 0.0): the
+GATE_SKIP pre-filter armed on `isGated` (dispatch) only, so abort-
+blacklisted anchors — now living solely in `record_gate` — paid full
+`onBackEdge` bookkeeping on every back-edge forever. Amendment:
+`afterBackEdge` arms the skip when dispatch-gated OR (record-gated AND
+no trace); record-gated WITH a trace still never skips (B3 starvation).
+Pin test in trace_entrypatch_test.zig. Final board (§9b): str_manip −37%,
+scalar −11%, gmatch −9%, find_match −6%; everything else ≤ noise
+(repack + str_format cleared by same-conditions A/B — str_format is
+instruction-identical, +2.8% cycles pure layout). Board-positive, no
+above-noise regression.
+
+## Status 2026-08-29 (LATEST-99, superseded) — **DOC 30 ARC LANDED (c1–c5): find/match/gmatch-iteration/tonumber(string) record as guarded callouts. str_find_match 32.4 → 20.1 ms (2.4× → 1.5× LJ, ≤20 target MET, zero recording aborts). str_gmatch flat at 57 — residue PROVEN constant-factor, not coverage (LJ runs it in ~25 ms with `-joff`; gmatch is NYI in LJ's recorder too). L3 intern-hash yes/no still open with Bart — now the identified next lever on gmatch.**
 
 Commits: 625ec2b (c1 cores/scratch/shims), c2+c3 (IR ops 72–80 + tier-1a +
 nativegen lowering), d32103b (c4 recorder arms + `recTForLoop` generic-for

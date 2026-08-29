@@ -7,20 +7,29 @@ Deferred items noted in passing (Rule #10) so they don't get lost.
 Four items surfaced while landing pattern/str2num recording; none belongs
 to that arc, all recorded here so they aren't lost:
 
-- **Region-window gate vs designed loop-done exits.** str_gmatch's native
-  gmatch loop exits by DESIGN when the subject is exhausted (`sgmatch`
-  status exit after 7 completed iterations — 8 tokens per instance, with
-  iteration 1 lost to the nil-ctrl prologue re-entry fail). That lands at
-  `work=7 < min_useful=8` (config default), so `flushRegionWindow`
-  penalizes the entry and `gateAnchor` blocks re-entry for a 256-window —
-  about half the instances run tier-0 even though a perfectly good native
-  trace exists. Deliberately NOT tuned per Z-6 (dropping min_useful to 7
-  would be bench-shaped). The general question: should a loop-done /
-  status exit (a designed completion, distinguishable from a guard
-  failure) count as thrash at all? Compare LuaJIT, which has no such
-  penalty for a trace that exits through its natural loop exit. Candidate
-  shape: classify exits (completion vs guard-fail) in the region-window
-  accounting instead of raw `work` counts.
+- ~~**Region-window gate vs designed loop-done exits.**~~ **RESOLVED
+  2026-08-29 by doc 31** (the mechanism turned out to be the LEGACY
+  thrash machine + `abortRecording` gating dispatch, not
+  `flushRegionWindow`): the gate split into dispatch vs record maps, and
+  `accountLegacyThrash` now clears on ANY productive receipt instead of
+  `completed >= min_useful` — the exit-classification idea below was
+  reviewed (codex, BLOCKED) and shelved: `sgmatch`'s executors collapse
+  all non-OK statuses into one exit_instr, and `guard_gc` must keep
+  striking. str_gmatch residency 3.3% → 75%, wall 52.6 → 49.4 ms. The
+  region-window remainder strike (`0 < work < min_useful` in
+  `flushRegionWindow`) has the same conceptual issue but was NOT the
+  mechanism here; doc 31 §4 leaves it untouched pending its own
+  evidence.
+- **gmatch/for-in entry seam: 2 of 8 iterations per instance run tier-0**
+  (doc 31 §9, 2026-08-29). After doc 31 the remaining str_gmatch gap to
+  the `--jit-stats` ideal is not gating: per instance the for-in loop
+  runs 2 header iterations tier-0 (~541 c/it) before native entry
+  catches (6 native at ~265 c/it) — ~40% of the loop's cycles at bench
+  scale. The tfor `.jloop` entry patch (doc 30) covers the back-edge
+  path; getting entry onto the FIRST header reach of a fresh instance
+  (patched header dispatch, LuaJIT-style `JLOOP` at the header) is the
+  follow-up lever. General: any short-instance iterator loop pays this
+  seam, not just gmatch.
 - **value16 full-Value shuttle slots for generic-for breadth.** The
   carried-string classification (doc 30 c4b) covers string control
   variables; `pairs`/`ipairs` iterators carry arbitrary key types, which

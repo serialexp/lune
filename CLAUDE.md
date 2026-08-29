@@ -223,6 +223,17 @@ perf report -i /tmp/p.data --stdio --no-children | grep -vE '^\s*#' | awk '
 END{printf "native [JIT]: %.1f%%\ntier-0 Vm.exec: %.1f%%\nTable.get/set: %.1f%%\nhashing: %.1f%%\n",jit,exec,tbl,hsh}'
 ```
 
+**Standing rule (doc 31 D3, str_gmatch 2026-08): a bench that stays flat after a
+coverage lever gets a `--jit-stats` run BEFORE any verdict.** `./zig-out/bin/lune
+--trace --jit-native --jit-stats <bench>` prints the native-vs-tier-0 split by
+iterations AND TSC cycles, per-anchor. "fallback despite a trace" above a few %
+is the first suspect — str_gmatch sat at 3.3% native residency on a *healthy
+committed trace* for a whole arc because gating starved dispatch, and we
+"measured" native≈tier-0 on that starved run. The board now carries a `res%`
+column (from the same output) so a flat row at low residency is visible without
+a profiling session; native-vs-tier-0 per-iter cycle claims are citable only
+from `--jit-stats`, never from a perf profile alone.
+
 Two gotchas that bit us, so read percentages carefully:
 - **Percentages are relative to a shrinking denominator.** A *working* JIT makes
   `Table.get` look like a *bigger* fraction (19% with JIT vs 8.5% pure-tier-0) only
