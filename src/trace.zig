@@ -742,7 +742,6 @@ pub const programPointsEqual = trace_region.programPointsEqual;
 pub const appendUniqueSlot = trace_region.appendUniqueSlot;
 pub const programPointLess = trace_region.programPointLess;
 
-
 /// Remap the recorder's dense, emission-indexed exit-provenance table (A-i.1) into
 /// the committed trace's compact, sorted `[]ExitProvEntry`, keyed by committed
 /// instruction index. `old_to_new` is `tropt`'s compaction map (emission index →
@@ -951,7 +950,6 @@ pub const ExitMaterialization = union(enum) {
     native_numeric_for_done,
 };
 
-
 /// Doc 20 (patched trace entry): one registry slot binding a `.jfor_loop` or
 /// `.jloop`
 /// patched into a per-VM code image to its qualified root trace. Slots are
@@ -1025,6 +1023,18 @@ pub const Gate = struct {
     window: u32,
     /// How many times this anchor has been gated; `>= max_strikes` ⇒ permanent.
     strikes: u32,
+};
+
+/// Doc 31 D3: why an anchor was gated — carried in the jit-debug receipt line
+/// (`gate[dispatch:legacy_thrash]` vs `gate[record:record_abort]`) so a
+/// receipts log self-explains which machine gated. The first three are
+/// dispatch-gate sources, the last two record-gate sources (doc 31 §3).
+pub const GateReason = enum {
+    legacy_thrash,
+    region_decay,
+    native_unsupported,
+    record_abort,
+    commit_failure,
 };
 
 /// Identifies a guard-failure site: the trace anchor and the bytecode PC of the
@@ -2073,9 +2083,18 @@ pub const TraceState = struct {
     /// good. A loop that was only *temporarily* unstable (type-unstable early,
     /// then settled) recovers; see `isGated` / `gateAnchor`.
     gate: std.AutoHashMapUnmanaged(AnchorKey, Gate) = .empty,
-    /// Re-entry penalty per anchor: a low-yield trace entry bumps it, a useful one
-    /// clears it; at `config.max_penalty` the anchor is gated off with a doubling
-    /// cooldown (`onSideExit` → `gateAnchor`).
+    /// Doc 31 D1: anchors currently held off *recording* (never dispatch) with
+    /// the same doubling cooldown. Set on recording aborts and commit
+    /// failures — LuaJIT's `penalty_pc` analog: a failed recording backs off
+    /// RE-RECORDING at its start anchor; a committed trace at the same anchor
+    /// keeps dispatching. Recording eligibility consults BOTH maps
+    /// (`recordingBarred`); dispatch consults only `gate`. At `max_strikes`
+    /// the anchor is permanently record-blacklisted (survives trace
+    /// retirement — accepted `penalty_pc` blacklist semantics, doc 31 §3).
+    record_gate: std.AutoHashMapUnmanaged(AnchorKey, Gate) = .empty,
+    /// Re-entry penalty per anchor: a low-yield trace entry bumps it, a
+    /// productive one clears it (doc 31 D2); at `config.max_penalty` the anchor
+    /// is gated off with a doubling cooldown (`onSideExit` → `gateAnchor`).
     penalty: std.AutoHashMapUnmanaged(AnchorKey, u32) = .empty,
     /// Pure ephemeral structural-edge cache (doc 17 §A3.3 / §A8-ii, A-ii.2):
     /// `{Trace.id, exit_instr} → StructuralEdgeId`. Rebuilt WHOLESALE from the current
@@ -2904,6 +2923,7 @@ pub const TraceState = struct {
         self.dbg_silent_suffix_rows.deinit(self.gpa);
         self.counters.deinit(self.gpa);
         self.gate.deinit(self.gpa);
+        self.record_gate.deinit(self.gpa);
         self.penalty.deinit(self.gpa);
         self.guard_failures.deinit(self.gpa);
         for (self.values_chunks.items) |c| self.gpa.free(c);
@@ -3438,11 +3458,6 @@ pub const TraceState = struct {
     /// below and nothing else.
     inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize, exit_instr: u32) void {
         const key = t.anchor;
-        if (completed >= self.config.min_useful) {
-            _ = self.penalty.remove(key);
-            _ = self.gate.remove(key);
-            return;
-        }
         // Pall's model (hotexit arc): a PRODUCTIVE segment is never a strike,
         // however short. LuaJIT has no `min_useful` analog at all — a trace that
         // commits 2 iterations and exits is fine; its hot exit just spawns a side
@@ -3455,12 +3470,32 @@ pub const TraceState = struct {
         // every receipt struck, the anchor gated within 8 entries, and a gated
         // anchor gets no dispatch, so exit hotness never accrued (N=3: 38 traced
         // vs 140k interpreted iterations, 88% of the run tier-0 WITH a trace).
+        //
+        // Doc 31 D2 (clear-on-productive): the CLEAR threshold, too, was
+        // non-Pall — clearing only at `completed >= min_useful` let isolated
+        // zero-progress receipts at *designed* exits ratchet the penalty
+        // monotonically on loops whose instances physically yield fewer than
+        // `min_useful` iterations (str_gmatch: 7 tokens/instance, exhaustion
+        // and guard_gc zeros ratcheted to a gate the productive receipts
+        // could never un-earn — 2.6% native residency on a healthy trace).
+        // ANY productive receipt now clears the penalty and the dispatch
+        // gate. Every real turnstile still gates: pathological anchors
+        // (gc_stress admission failure, corrupted iterator state, type-flip
+        // loops) produce CONSECUTIVE zeros with no productive receipt in
+        // between, and reach `max_penalty` exactly as before. Never clears
+        // `record_gate` — productive dispatch is not evidence about
+        // recording (doc 31 §4).
+        //
         // What remains below is the zero-progress half only: an entry that
         // commits NOTHING is pure turnstile cost (our exits re-enter the runtime;
         // LuaJIT's are patched branches), so repeated zero-yield entries still
         // gate — with Option-A headroom for shape-guard exits so the side-trace
         // machinery wins the race while capacity remains.
-        if (completed > 0) return;
+        if (completed > 0) {
+            _ = self.penalty.remove(key);
+            _ = self.gate.remove(key);
+            return;
+        }
         const gop = self.penalty.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
@@ -3478,7 +3513,7 @@ pub const TraceState = struct {
             self.config.max_penalty;
         if (gop.value_ptr.* >= limit) {
             self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d} -> gate", .{ key.pc, completed, gop.value_ptr.* });
-            self.gateAnchor(key);
+            self.gateAnchor(key, .legacy_thrash);
         } else {
             self.dbg("legacy-strike: anchor pc={d} completed={d} penalty={d}/{d}", .{ key.pc, completed, gop.value_ptr.*, limit });
         }
@@ -3586,7 +3621,7 @@ pub const TraceState = struct {
         gop.value_ptr.* +|= 1;
         if (gop.value_ptr.* >= self.config.max_penalty) {
             self.dbg("disarm-reason: window gate-strike owner pc={d} work={d}", .{ owner.pc, work });
-            self.gateAnchor(owner);
+            self.gateAnchor(owner, .region_decay);
             // B-2b / §B.6: only this explicit region-owner condemnation event
             // deletes logical provenance. Ordinary temporary gates preserve it.
             self.condemnProvenanceEdgesAt(owner);
@@ -5027,7 +5062,7 @@ pub const TraceState = struct {
     /// back-edge `tick`. The `isGated` guard avoids re-escalating an active gate.
     pub fn gateNativeUnsupported(self: *TraceState, anchor: AnchorKey) void {
         if (self.isGated(anchor)) return;
-        self.gateAnchor(anchor);
+        self.gateAnchor(anchor, .native_unsupported);
     }
 
     /// Doc 22 §B.3 (Phase B-iii): seed a tier-1a chain successor's inputs
@@ -8248,7 +8283,7 @@ pub const TraceState = struct {
         const key = AnchorKey{ .proto = proto, .pc = exit_pc };
         // Don't fight the normal machinery: a trace already cached here, or a gated
         // anchor (a prior continuation aborted → back off), is left alone.
-        if (self.hasTrace(key) or self.isGated(key)) return;
+        if (self.hasTrace(key) or self.recordingBarred(key)) return;
         self.pending_exit_anchor = key;
     }
 
@@ -8280,6 +8315,9 @@ pub const TraceState = struct {
         if (self.rec.active) return; // never clobber an in-flight recording
         if (key.proto != proto or key.pc != cur_pc) return;
         self.pending_exit_anchor = null;
+        // Doc 31 D1 (review B3): final eligibility check at the actual start —
+        // the request may have been gated between creation and activation.
+        if (self.recordingBarred(key)) return;
         self.rec.reset(self.gpa, key, proto.num_registers) catch return;
         // Mark this recording a continuation so `recForPrepLink` may close it with a
         // `.link` at the inner `for_prep` (a root recording, armed via `arm`, leaves
@@ -8303,6 +8341,9 @@ pub const TraceState = struct {
         const src = self.pending_replay_src;
         self.pending_replay_anchor = null;
         self.pending_replay_src = null;
+        // Doc 31 D1 (review B3): final eligibility check at the actual start —
+        // the request may have been gated between creation and activation.
+        if (self.recordingBarred(key)) return;
         self.rec.reset(self.gpa, key, proto.num_registers) catch return;
         self.rec.kind = .side;
         self.rec.side_src = src;
@@ -8384,6 +8425,13 @@ pub const TraceState = struct {
         // to ever tier up the skip path. A zero-trip guard's alternate path
         // is NEW code (skip the loop body), i.e. generic side-trace
         // territory, not a branch alternation between existing siblings.
+        // Doc 31 D1 (review B3): want PRODUCTION is gated, not just
+        // consumption — creating a want also unpatches the anchor's entry
+        // (`markEntryPatchesAt` below), so with a standing record gate every
+        // qualifying hot exit would re-unpatch a healthy trace forever. The
+        // exit counter above keeps saturating, so the first exit after the
+        // cooldown re-creates the want without losing hotness.
+        if (self.recordingBarred(t.anchor)) return;
         const branch = self.isSourceBranchGuardExit(t, exit_instr, proto) and blk: {
             const src_pc = guardSourcePc(t.instrs[exit_instr]) orelse break :blk false;
             if (src_pc >= proto.code.len) break :blk false;
@@ -8427,7 +8475,9 @@ pub const TraceState = struct {
         const gop = self.guard_failures.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
-        if (gop.value_ptr.* >= self.config.hotguard and self.wants_side_trace == null) {
+        if (gop.value_ptr.* >= self.config.hotguard and self.wants_side_trace == null and
+            !self.recordingBarred(anchor)) // doc 31 D1: gated want production
+        {
             self.wants_side_trace = anchor;
             self.markEntryPatchesAt(anchor); // doc 20: side-arm needs virgin onBackEdge
         }
@@ -8448,7 +8498,9 @@ pub const TraceState = struct {
         const gop = self.guard_failures.getOrPut(self.gpa, key) catch return;
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* +|= 1;
-        if (gop.value_ptr.* >= self.config.hotguard and self.wants_side_trace == null) {
+        if (gop.value_ptr.* >= self.config.hotguard and self.wants_side_trace == null and
+            !self.recordingBarred(anchor)) // doc 31 D1: gated want production
+        {
             self.wants_side_trace = anchor;
             self.markEntryPatchesAt(anchor); // doc 20: side-arm needs virgin onBackEdge
         }
@@ -11068,6 +11120,7 @@ pub const TraceState = struct {
         self.counters.clearRetainingCapacity();
         @memset(&self.hotcount, 0);
         self.gate.clearRetainingCapacity();
+        self.record_gate.clearRetainingCapacity();
         self.penalty.clearRetainingCapacity();
         self.guard_failures.clearRetainingCapacity();
         self.wants_side_trace = null;
@@ -11243,15 +11296,31 @@ pub const TraceState = struct {
         return self.tick < g.retry_at;
     }
 
-    /// Install or escalate the gate on `anchor`: start (or double) the cooldown
-    /// window and bump the strike count. The next eligibility is `retry_at` =
-    /// current global `tick` + window; the window then doubles (capped at
-    /// `backoff_max`) so a repeatedly-failing anchor is retried exponentially
-    /// less often, and after `max_strikes` it is abandoned for good. Deterministic
-    /// — keyed only on the monotonic back-edge tick, which keeps advancing even
-    /// while the hot-count pre-filter is skipping this anchor's back-edges.
-    pub fn gateAnchor(self: *TraceState, anchor: AnchorKey) void {
-        const gop = self.gate.getOrPut(self.gpa, anchor) catch return;
+    /// Doc 31 D1: is `anchor` currently held off *recording* by the record
+    /// gate? Same cooldown/permanence arithmetic as `isGated`, separate
+    /// history — a record-gated anchor's committed traces keep dispatching.
+    pub fn isRecordGated(self: *const TraceState, anchor: AnchorKey) bool {
+        const g = self.record_gate.get(anchor) orelse return false;
+        if (g.strikes >= self.config.max_strikes) return true;
+        return self.tick < g.retry_at;
+    }
+
+    /// Doc 31 D1: recording eligibility consults BOTH gates — a
+    /// dispatch-gated anchor also declines new recordings (preserving the
+    /// old duplicate-suppression), and a record-gated anchor backs off
+    /// re-recording without touching dispatch.
+    pub fn recordingBarred(self: *const TraceState, anchor: AnchorKey) bool {
+        return self.isGated(anchor) or self.isRecordGated(anchor);
+    }
+
+    /// Shared escalation arithmetic for both gate maps: start (or double) the
+    /// cooldown window and bump the strike count. The next eligibility is
+    /// `retry_at` = current global `tick` + window; the window then doubles
+    /// (capped at `backoff_max`), and after `max_strikes` the anchor is
+    /// abandoned for good. Deterministic — keyed only on the monotonic
+    /// back-edge tick. Returns null on OOM (gate simply not escalated).
+    fn bumpGateEntry(self: *TraceState, map: *std.AutoHashMapUnmanaged(AnchorKey, Gate), anchor: AnchorKey) ?*Gate {
+        const gop = map.getOrPut(self.gpa, anchor) catch return null;
         if (!gop.found_existing) {
             gop.value_ptr.* = .{ .retry_at = 0, .window = self.config.backoff_base, .strikes = 0 };
         }
@@ -11259,11 +11328,30 @@ pub const TraceState = struct {
         g.strikes +|= 1;
         g.retry_at = self.tick +| g.window;
         g.window = @min(g.window *| 2, self.config.backoff_max);
-        // Doc 20 unpatch trigger: a gated anchor must not keep a patched
-        // entry — mark pending; the caller-owned safe-point drain restores
-        // same-turn and warming re-decides after the cooldown.
+        return g;
+    }
+
+    /// Install or escalate the DISPATCH gate on `anchor` (doc 31 D1): its
+    /// cached traces are not entered until the cooldown elapses. Sources:
+    /// legacy thrash, region decay, native-unsupported — never recording
+    /// failures (those go to `gateRecordAnchor`).
+    pub fn gateAnchor(self: *TraceState, anchor: AnchorKey, reason: GateReason) void {
+        const g = self.bumpGateEntry(&self.gate, anchor) orelse return;
+        // Doc 20 unpatch trigger: a dispatch-gated anchor must not keep a
+        // patched entry — mark pending; the caller-owned safe-point drain
+        // restores same-turn and warming re-decides after the cooldown. A
+        // RECORD gate deliberately never unpatches (doc 31 §3).
         self.markEntryPatchesAt(anchor);
-        self.dbg("gate: anchor pc={d} strikes={d} window={d} retry_at={d} tick={d}", .{ anchor.pc, g.strikes, g.window, g.retry_at, self.tick });
+        self.dbg("gate[dispatch:{s}]: anchor pc={d} strikes={d} window={d} retry_at={d} tick={d}", .{ @tagName(reason), anchor.pc, g.strikes, g.window, g.retry_at, self.tick });
+    }
+
+    /// Install or escalate the RECORD gate on `anchor` (doc 31 D1): no new
+    /// recording starts here until the cooldown elapses; committed traces
+    /// keep dispatching and their entry patches stay live. Sources:
+    /// recording aborts and commit failures (LuaJIT `penalty_pc` analog).
+    pub fn gateRecordAnchor(self: *TraceState, anchor: AnchorKey, reason: GateReason) void {
+        const g = self.bumpGateEntry(&self.record_gate, anchor) orelse return;
+        self.dbg("gate[record:{s}]: anchor pc={d} strikes={d} window={d} retry_at={d} tick={d}", .{ @tagName(reason), anchor.pc, g.strikes, g.window, g.retry_at, self.tick });
     }
 
     /// Back-edge count recorded for an anchor (0 if never seen). A loop is "hot"
@@ -11301,8 +11389,18 @@ pub const TraceState = struct {
     /// back-edges skips the hashmap bookkeeping entirely. `tick` keeps advancing
     /// across the skip, so the gate's cooldown still elapses on schedule and the
     /// anchor is reconsidered when the window expires.
+    ///
+    /// Doc 31 D1 amendment (measured on the first post-split board): a RECORD-gated
+    /// anchor with NO committed trace must also arm the skip — the slow path can
+    /// do nothing there (no trace to enter, recording barred), and without the
+    /// skip every abort-blacklisted hot loop pays full `onBackEdge` bookkeeping on
+    /// every back-edge forever (tbl_ops +40%, euler14-bit +55%, nsieve-bit-fp
+    /// +57% jit-vs-t0 drag; pre-split these anchors were dispatch-gated and
+    /// skipped). A record-gated anchor WITH a trace must NOT skip: the slow path
+    /// is exactly what enters its trace (the review-B3 starvation concern).
     pub fn afterBackEdge(self: *TraceState, proto: *const Proto, pc: u32) void {
-        if (self.isGated(.{ .proto = proto, .pc = pc })) {
+        const key: AnchorKey = .{ .proto = proto, .pc = pc };
+        if (self.isGated(key) or (self.isRecordGated(key) and !self.hasTrace(key))) {
             self.hotcount[hotIndex(proto, pc)] = GATE_SKIP;
         }
     }
@@ -11352,7 +11450,7 @@ pub const TraceState = struct {
         self.wants_side_trace = null;
         self.side_want_src = null;
         const key = AnchorKey{ .proto = proto, .pc = resume_pc };
-        if (self.isRecording() or self.pending_replay_anchor != null or self.isGated(key))
+        if (self.isRecording() or self.pending_replay_anchor != null or self.recordingBarred(key))
             return false;
         self.dbg("side-want-at-resume: arming replay-side recording at pc={d}", .{resume_pc});
         self.pending_replay_anchor = key;
@@ -11400,7 +11498,7 @@ pub const TraceState = struct {
         // below.
         if (self.wants_side_trace) |wanted| {
             if (wanted.proto == proto and wanted.pc == target_pc) {
-                if (!self.isGated(key)) {
+                if (!self.recordingBarred(key)) {
                     self.arm(proto, target_pc);
                     // Hotexit provenance rides into the recording so the commit
                     // can DONE-latch the parent exit (`arm` may decline — OOM —
@@ -11440,13 +11538,18 @@ pub const TraceState = struct {
         // (or that has exhausted `max_strikes`) is skipped by `isGated`. (The
         // `!hasTrace` arm guard is now redundant — we returned above for traced
         // anchors — so only `isGated` remains.)
-        if (!self.isGated(key)) {
-            // A gate entry that is no longer `isGated` means its `tick` cooldown has
-            // just elapsed → take the one retry now. Arming starts a recording, so
-            // the next back-edges are consumed by recording rather than re-arming;
-            // we never loop re-arming. A fresh (un-gated) anchor arms on the exact
-            // back-edge it first crosses `hotloop`.
-            const arm_now = if (self.gate.contains(key))
+        if (!self.recordingBarred(key)) {
+            // A gate entry (either map, doc 31 D1) that is no longer barring
+            // means its `tick` cooldown has just elapsed → take the one retry
+            // now. Arming starts a recording, so the next back-edges are
+            // consumed by recording rather than re-arming; we never loop
+            // re-arming. A fresh (un-gated) anchor arms on the exact back-edge
+            // it first crosses `hotloop`. The probe must consult BOTH maps:
+            // recording aborts now live in `record_gate`, and without the
+            // second `contains` an aborted root recording — whose warming
+            // counter is already past the one-shot `== hotloop` crossing —
+            // would never retry (doc 31 §3, review B3).
+            const arm_now = if (self.gate.contains(key) or self.record_gate.contains(key))
                 true // cooldown elapsed → one retry
             else
                 count == self.config.hotloop; // first time crossing hot
@@ -11477,7 +11580,7 @@ pub const TraceState = struct {
         // `side_src` around to latch a parent exit DONE for a LATER, unrelated
         // commit (Pall retries the exit; `gateAnchor` below is our `penalty_pc`).
         self.rec.side_src = null;
-        self.gateAnchor(self.rec.anchor);
+        self.gateRecordAnchor(self.rec.anchor, .record_abort);
     }
 
     /// Append-or-bump the abort diagnostic log (`--dump-aborts`). Deduped by
@@ -11516,7 +11619,7 @@ pub const TraceState = struct {
                 @errorName(err),
                 self.rec.instrs.items.len,
             });
-            self.gateAnchor(self.rec.anchor);
+            self.gateRecordAnchor(self.rec.anchor, .commit_failure);
         };
         self.rec.active = false;
         // A successful `commit` consumed `side_src` (DONE latch); a failed one
@@ -14824,7 +14927,6 @@ const PendingStore = struct {
 
 const AliasClass = enum { must, no, may };
 const AffineIntKey = struct { base: Ref, offset: i64 };
-
 
 /// Per-inlined-frame register reservation in the recorder's grown `reg_map`. The
 /// map is sized `anchor.num_registers + MAX_INLINE_DEPTH × MAX_CALLEE_REGS`; a
