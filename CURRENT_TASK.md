@@ -21,6 +21,109 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-30 (LATEST-101) — **DOC 32 ARC (B2, `.value`-lane scalar access) IMPLEMENTED, NOT COMMITTED — awaiting Bart's scoping call. Coverage claim MET (spectral-norm `get_index nyi_opcode` aborts GONE, iteration coverage 54.7% → 99.5%); speed claim MISSED (−4.2%, not the predicted ~5×) because the payoff is blocked by a NEW distinct bug, B2b. Benchmarking MOVED to the Gothab remote profile pool (`gt profile`) — the desktop board is unusable.**
+
+### What landed in the tree (uncommitted)
+
+Recorder (`trace.zig`): `arrayGetShape` admits `.value` elements that are int or
+float (heap tables keep the existing array-of-structs path); `arraySetShape` admits
+int/float stores. The `.value` write emits `guardNum` on the STORED value instead of
+`guard_fits` — `laneFits(.value, _)` is unconditionally true, so `guard_fits` is
+vacuous there and pins nothing. That was the codex review's BLOCKER; it also carries
+the forwarded read, since `forwardPendingArrayLoad` returns before any load guard is
+emitted. No `guard_present`: the `.value` lane has no bitmap and an in-band nil is
+caught by the type guard.
+
+Native (`nativegen.zig`): `proveKinds` accepts VALUE_LANE `aload` at `.int`/`.float`
+and a new VALUE_LANE `astore` arm; `.aload` tag-checks inline (`cmpByteMemImm` +
+`jccNativeExit`, no `guard_*` node — the recorder's trailing guard is statically
+discharged by `proveKinds` and emits nothing); `emitAStore` writes tag byte + payload
+with NO presence `bts`. Hoisted-base pass no longer sets `need_present` for VALUE_LANE
+(a `.value` array's `present` pointer is null).
+
+**Pre-existing bug fixed on the way (Rule #0.5):** the EXISTING `.value` heap `aload`
+computed its element address as `mov rax, idx; shl rax,4; add rax, datareg`, but
+`arrayFieldReg(..., .rax)` RETURNS `.rax` when `data` was not hoisted (`pickRegFrom`
+can fail) — so under register pressure it emitted `add rax, rax` and computed garbage.
+Reordered to park the index in scratch `rcx` first.
+
+Tests: 3 recorder IR-shape tests + 3 native read + 3 native write (incl. deopt-replay
+idempotence), 3 e2e in `interp_lanes_test.zig` behind a local `expectRecordedProgram`
+(10-leg parity PLUS `entries > 0`, because parity alone cannot see a silent return to
+aborting), and a restore round-trip in `keyframeser_restore_test.zig`. That last one
+uses a deliberately HETEROGENEOUS array: `optimalLane` repacks a homogeneous `.value`
+array back to a narrow lane on restore, so an all-int test would have silently stopped
+testing `.value` at the boundary. Stale prose in `keyframeser.zig` ("a restored sieve
+is untraceable — the recorder aborts on `.value`") corrected in the same change.
+
+Gates: `zig build test` and `zig build test -Djit-debug=true` both green;
+`tools/hashgate.py` 84/84 on ReleaseFast AND the Debug leg, no ref regeneration.
+
+### The board is now remote — and the old one was garbage
+
+The first board was taken on the desktop and DISCARDED: every row regressed +11% to
++46% INCLUDING the pure tier-0 column, which no JIT change can affect. Cause: a game
+at 790% CPU, load average 12.9–17.3. Nothing was concluded from it.
+
+`gt profile` now runs the suite on the Gothab isolated autoscale pool
+(`.gothab/profiles.yml` + `.gothab/workflows/profile-bench.yml`, plus
+`bench/run.py --json` and `tools/bench_profile.py`). Notes worth keeping:
+
+  * the pinned Zig `-dev` tarball is GC'd from ziglang.org; the workflow walks the
+    official community-mirror list at a PINNED sha256, verified bit-identical to the
+    known-good local toolchain and agreed on by two independent mirrors;
+  * `gt profile` ships committed-but-unpushed + staged + unstaged as ONE diff vs
+    `origin/master`, so an arc is benchmarkable before it is pushed — but **untracked
+    files are NOT in that diff**, they must be `git add`ed first;
+  * the contract is correctness-only for now (cross-tier mismatches, LuaJIT diffs,
+    run errors, discovery count). Timing thresholds wait until the pool's noise band
+    is established, per Gothab's own guidance.
+
+Three full runs: baseline (this arc reverted via `just shadow` + `git show HEAD:`,
+harness kept), B2, and B2 AGAIN — the third to measure per-row noise on identical
+code directly rather than infer it.
+
+  * max per-row |Δ| on identical code: **1.3%**
+  * total `jit` wall: 4276.8 → 4281.9 ms (**+0.12%**, flat)
+  * spectral-norm: 89.6 → 85.8 ms (**−4.2%**), residency 10.3% → 11.4%
+
+Two rows came in above the noise band and were INVESTIGATED, not tuned around:
+`str_find_match` +3.3% and `scimark-lu` +2.0%. Both have IDENTICAL trace structure
+between the builds (str_find_match 1 entry / 1 native body; scimark-lu 99000 entries /
+99000 bodies / 13 aborts), neither touches a `.value` lane, and a `--dump-native` diff
+on str_find_match shows an identical 585-line instruction stream differing ONLY in
+embedded addresses. The residual is binary code LAYOUT (editing nativegen/trace moved
+functions, changing I-cache and branch-predictor alignment) and it cancels across the
+suite. Recorded in TODO.md so the next arc does not re-investigate it.
+
+### Why the speed prediction missed: B2b (NEW, out of scope, filed in TODO.md)
+
+The prediction assumed coverage was the only thing between `Av` and its trace. With
+the trace now recordable, **89.3% of the run is "tier-0, has-trace"** — a committed
+20×-faster trace that dispatch declines to enter:
+
+```
+Av:9    traced-it 118622  interp-it 681378  trc%it 14.8%  run% 89.3%
+                                     native 22.2 c/it  tier-0 434.3 c/it
+Atv:9   traced-it 791942  interp-it   8058  trc%it 99.0%
+```
+
+`Av` is called alternately over `u` (`.value`) and `v` (`.f64`) — ONE anchor, TWO
+lanes. The prologue refuses entry for the wrong lane (`exit_instr == maxInt(u32)`,
+`completed == 0`, nothing executed), `accountLegacyThrash` scores that refusal as a
+thrash STRIKE, and ~60 consecutive refusals per call drive
+`gate[dispatch:legacy_thrash]` with escalating 256→4096-tick cooldowns that block the
+good calls too. `Atv` (monomorphic) sits at 99.0%. Two defects: an entry refusal is
+not thrash (nothing ran), and the anchor never records a second trace for the second
+shape (LuaJIT's answer is another root/side trace, not a penalty). Adjacent to B3
+(`laneConsistent`: one array lane per whole trace).
+
+### Open with Bart
+
+Nothing committed, nothing pushed (~37 unpushed commits). The scoping choice is his:
+land B2 alone and take B2b as its own arc, or extend this arc into B2b's
+entry-refusal accounting so the board shows what B2 is actually worth.
+
 ## Status 2026-08-29 (LATEST-100) — **DOC 31 ARC LANDED: the gate is split (dispatch `gate` vs new `record_gate`) and `accountLegacyThrash` clears on ANY productive receipt. str_gmatch native residency 3.3% → 75% (gmatch anchor, by iterations), wall 52.6 → 49.4 ms. Board carries a new `res%` column (native residency by TSC cycles, from a dedicated `--jit-stats` run) — the D3 "stop circling this" fix, with the standing `--jit-stats`-before-verdict rule now in the project CLAUDE.md.**
 
 Pre-arc, two small general levers landed the same day (Bart: "Inline len

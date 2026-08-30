@@ -1425,3 +1425,57 @@ between 0753b7d (July 15) and 9ee7d4b (Aug 12) cost nsieve ~40ms — plausibly t
 A-vii-c gate-consumption flip or config changes, but unmeasured. Out of scope for
 the A-vii-e arc (its baseline was the pre-flip tree by design); worth a bisect
 before trusting "nsieve is at its historical best".
+## B2b: a lane-polymorphic anchor gets thrash-gated on prologue refusals (2026-08-30)
+
+Found while measuring doc 32. `Av` in spectral-norm is called alternately over `u`
+(`.value`) and `v` (`.f64`) — ONE anchor, TWO array lanes. The committed trace is
+compiled for one lane; when the other array arrives the native prologue REFUSES entry
+(`exit_instr == maxInt(u32)`, `completed == 0`, zero iterations executed).
+`accountLegacyThrash` (trace.zig ~3459) scores that refusal as a thrash strike, so ~60
+consecutive refusals per call drive `gate[dispatch:legacy_thrash]` at pc=9 with
+escalating 256→4096-tick cooldowns — which also block the calls that WOULD have entered.
+
+Measured cost: `Av:9` runs native for 14.8% of its iterations at 22.2 c/it while 89.3%
+of the whole run sits in tier-0 at 434.3 c/it on a healthy trace. `Atv:9` (monomorphic,
+always `.f64`) sits at 99.0%. This is why doc 32's coverage fix bought only −4.2% on
+spectral-norm instead of the predicted ~5x.
+
+Two separable defects:
+  1. an entry refusal is not thrash — NOTHING executed, so pricing it as turnstile cost
+     is a category error. Gate on `completed > 0` (or exclude the
+     `exit_instr == maxInt(u32)` prologue-refusal case) before counting a strike.
+  2. the anchor never records a SECOND trace for the second lane shape. LuaJIT's answer
+     to a polymorphic loop is another root/side trace, not a penalty. Adjacent to B3
+     (`nativegen.zig laneConsistent` — one array lane per whole trace, a single `?i32`
+     with no keying by table/ref/slot), which is the wall right behind it.
+
+Deferred out of the doc 32 arc deliberately: it is a dispatch/gating bug, not a
+`.value`-lane recording bug, and it needs its own design + review.
+
+## Doc 32 scope cuts, deliberately deferred (2026-08-30)
+
+  * `.value` `astore_append` — the append gate excludes `.value`, so growing a mixed
+    array still falls to the bounds check. Reads/writes at existing indices are covered.
+  * string and bool `.value` elements — admission is int/float only, mirroring
+    `hashGetShape`, because only those have a strict type guard (`guard_int`/
+    `guard_float`) to pin the element type.
+  * heap-valued `.value` STORES (the read side already handles element tables).
+  * zombie-trace cache-slot cost: if a `.value` array later narrows at a rehash, the
+    `.value`-recorded trace stays in the cache occupying a slot until pressure clears
+    it. `laneWidenedPast` correctly does not evict it (the guard is not permanently
+    unsatisfiable), so this is a cost to record, not a bug to fix.
+
+## Benchmark boards must come from `gt profile`, not the desktop (2026-08-30)
+
+The development desktop cannot produce a trustworthy board: a background game at 790%
+CPU (load average 12.9-17.3) once produced a uniform +11%..+46% "regression" across
+EVERY row including the pure tier-0 column, which no JIT change can affect. Use
+`gt profile` (`.gothab/workflows/profile-bench.yml`) — an isolated 2-vCPU pool where
+measured per-row run-to-run noise on identical code is 1.3%.
+
+Two things to remember when reading those boards:
+  * absolute ms are NOT comparable to anything in `bench/results/` or the design docs —
+    that pool is much narrower than the desktop. Only same-pool A/B deltas mean anything.
+  * a +-2..3% single-row move with UNCHANGED trace structure is binary code layout, not
+    behaviour. Diff `--dump-native` (it will differ only in embedded addresses) rather
+    than re-timing. Confirmed this way for `str_find_match` and `scimark-lu` in doc 32.
