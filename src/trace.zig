@@ -12593,18 +12593,23 @@ pub const TraceState = struct {
     /// on the table ref, `guard_int` on the key, then `aref` + `guard_bounds` +
     /// `guard_present` + `aload`. The result is a scalar value.
     ///
-    /// **`.value` lane — table elements** (the array-of-structs pattern): emits the
+    /// **`.value` lane** (the type-erased lane holding full 16-byte Values): emits the
     /// same prefix but omits `guard_present` (`.value` lane has no presence bitmap —
-    /// nil is in-band) and appends `guard_table` on the *loaded value*, verifying
-    /// the element is a table with no metatable. The result is a heap table ref
-    /// that subsequent `recHashGet`/`recHashSet` calls chain from (e.g. `bodies[i].x`).
-    /// Native declines these traces (`laneKind(.value) → null`); tier-1a executes them.
+    /// nil is in-band) and appends a type guard on the *loaded value*. Two element
+    /// shapes are recordable:
+    ///   * a **table** with no metatable — the array-of-structs pattern
+    ///     (`bodies[i].x`), pinned by `guard_table` on the load. The result is a heap
+    ///     table ref subsequent `recHashGet`/`recHashSet` calls chain from.
+    ///   * an **int or float** — the mixed/erased numeric array (doc 32), pinned by
+    ///     `guard_int`/`guard_float`. Arises whenever an int-lane array takes a float
+    ///     store (or vice versa): `widenFor` has no cross-family rung, so the array
+    ///     erases to `.value` permanently.
     ///
     /// Aborts (leaving tier-0 untouched) when:
     ///   * non-table container or non-int key → `.bad_type`;
     ///   * out-of-bounds or hole at record time → `.bad_type`;
-    ///   * `.value`-lane with a non-table element (function, string, scalar) →
-    ///     `.nyi_opcode` (different guard/native path needed);
+    ///   * `.value`-lane with a bool, string, or function element → `.nyi_opcode`
+    ///     (no strict type guard pins those — doc 32 §3);
     ///   * element table has a metatable → `.has_metatable`.
     fn recArrayGet(self: *TraceState, instr: Instr, regs: RegWindow) !void {
         return self.arrayGetShape(regs, .{ .dst = instr.a, .tab = instr.b, .key = instr.c, .tab_od = .b, .key_od = .c });
@@ -12627,12 +12632,27 @@ pub const TraceState = struct {
 
         if (lane == .value) {
             // The `.value` lane stores full 16-byte Values (tag+payload, nil in-band).
-            // Accept only when the loaded element is a **table** — the array-of-structs
-            // pattern (`bodies[i].x`). Other heap types (functions, strings) and scalars
-            // in a `.value` lane stay nyi — they'd need a different guard + native path.
-            if (!loaded.isHeap() or loaded.heapType() != .table) return self.abort(.nyi_opcode);
-            const elem_tbl = table_mod.Table.fromHeader(loaded.asHeap());
-            if (elem_tbl.metatable != null) return self.abort(.has_metatable);
+            // Two element shapes are recordable, distinguished only by the *trailing*
+            // type guard on the loaded ref — the address/bounds prefix is identical:
+            //
+            //   * a **table** with no metatable — the array-of-structs pattern
+            //     (`bodies[i].x`), guarded by `guard_table` on the load;
+            //   * an **int or float** — the mixed/erased numeric array (doc 32),
+            //     guarded by `guard_int`/`guard_float` on the load.
+            //
+            // Everything else (bool, string, function) stays nyi: neither has a
+            // *strict* type guard that pins the element so a later iteration changing
+            // it side-exits — `guard_true` would wave a truthy heap value through, and
+            // a string element would additionally need `guard_string` plumbing. This
+            // is the same int/float restriction `hashGetShape` applies to hash fields,
+            // for the same reason.
+            const elem_is_table = loaded.isHeap() and loaded.heapType() == .table;
+            const elem_is_num = loaded.isInt() or loaded.isFloat();
+            if (!elem_is_table and !elem_is_num) return self.abort(.nyi_opcode);
+            if (elem_is_table) {
+                const elem_tbl = table_mod.Table.fromHeader(loaded.asHeap());
+                if (elem_tbl.metatable != null) return self.abort(.has_metatable);
+            }
 
             const lane_ord: i32 = @intFromEnum(lane); // 0 for .value
             const rtab = try self.refOf(f.tab);
@@ -12643,17 +12663,22 @@ pub const TraceState = struct {
             const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
             self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
             // No guard_present: the `.value` lane has no presence bitmap — nil is
-            // encoded in-band (tag == .nil). A nil element fails the guard_table
-            // below (nil is not a heap_ref) and side-exits to tier-0. Correct.
+            // encoded in-band (tag == .nil). A nil element fails the trailing type
+            // guard below (nil is neither a heap_ref nor a number) and side-exits to
+            // tier-0. Correct for both element shapes.
             const rload = try self.emit(.{ .op = .aload, .a = ref, .aux = lane_ord, .ty = obsTypeOf(loaded) });
-            // Fused native producer-exit (A-i.3): native `.value` `aload` side-exits at
-            // the load when the loaded tag is non-heap (`nativegen.zig`), with no
-            // `guard_*` node — so the exit identity rides the `aload` itself.
+            // Fused native producer-exit (A-i.3): the native `.value` `aload` tag-checks
+            // the loaded element against the tag its recorded `ty` implies and side-exits
+            // there, with no `guard_*` node — so the exit identity rides the `aload`
+            // itself. The recorder still emits the guard below for the tier-1a oracle;
+            // native discharges it statically (proven kind) and emits nothing.
             self.stampProv(rload, .element_type, .loaded, .neutral);
-            // Guard the loaded value is a table with no metatable. This is the type
-            // guard analogous to guard_int/guard_float for scalar loads — it side-exits
-            // when the element's type changes between iterations. (tier-1a path.)
-            self.stampProv(try self.emit(.{ .op = .guard_table, .a = rload }), .element_type, .loaded, .neutral);
+            // Pin the element's type so a later iteration changing it side-exits.
+            if (elem_is_table) {
+                self.stampProv(try self.emit(.{ .op = .guard_table, .a = rload }), .element_type, .loaded, .neutral);
+            } else {
+                try self.guardNum(rload, loaded, .element_type, .loaded);
+            }
             self.setReg(f.dst, rload);
             return;
         }
@@ -12814,8 +12839,14 @@ pub const TraceState = struct {
     ///   * non-table container or non-integral key → `.bad_type` (hash-part /
     ///     metatable territory, out of scope; an integral-FLOAT key narrows via
     ///     `keyRefNarrowed`, mirroring tier-0's `normalizeKey`);
-    ///   * `.value`-lane array → `.nyi_opcode` (unpacked 16-B path is deferred —
-    ///     and a heap value would need a write barrier the native ABI lacks);
+    ///   * `.value`-lane array with a non-numeric value → `.nyi_opcode`. An int or
+    ///     float IS recordable there (doc 32): every value fits the type-erased lane,
+    ///     so no widen can be forced, and `guardNum` on the stored value replaces the
+    ///     vacuous `guard_fits` as the type pin. A heap value stays out — it would be
+    ///     the one shape needing a real write barrier under a future
+    ///     generational/incremental collector. A `.value`-lane *append* is also still
+    ///     out of scope: the append branch admits only bool/int lanes, so a `.value`
+    ///     append falls through to the bounds check and aborts `.bad_type`;
     ///   * out-of-bounds (`k>len` would *grow*, `k<1` is the hash part) → `.bad_type`;
     ///   * `nil` value → `.bad_type` (a hole-punch / delete, not a normal store; B3
     ///     models presence-creating writes only — keeps `astore creates presence`);
@@ -12857,7 +12888,14 @@ pub const TraceState = struct {
         // Abort the whole trace to tier-0, which does full `__newindex` dispatch.
         if (tbl.metatable != null) return self.abort(.has_metatable);
         const lane = tbl.array.lane;
-        if (lane == .value) return self.abort(.nyi_opcode); // unpacked path deferred
+        // `.value`-lane store (doc 32): the type-erased lane holds full 16-byte
+        // Values, so *any* value fits and no widen can ever be forced. Admitted for
+        // **int/float** values only — the same restriction `hashSetShape` applies,
+        // and for the same reason: those are the values with a strict type guard
+        // (`guard_int`/`guard_float`) that keeps the cell scalar on-trace. A heap
+        // value would additionally be the one shape needing a real write barrier
+        // under any future generational/incremental collector.
+        if (lane == .value and !(vval.isInt() or vval.isFloat())) return self.abort(.nyi_opcode);
 
         // Grow (append) store: `t[asize] = v` extends the dense run by one (doc 18
         // D2.3: under identity mapping the contiguous successor key IS `asize`).
@@ -12933,21 +12971,42 @@ pub const TraceState = struct {
         const rkey = try self.keyRefNarrowed(f.key, f.key_od, vkey);
         const ref = try self.emit(.{ .op = .aref, .a = rtab, .b = rkey, .aux = lane_ord });
         self.stampProv(try self.emit(.{ .op = .guard_bounds, .a = ref }), .bounds, .none, .neutral);
-        // Guard at runtime that the value still fits the recorded narrow lane: a
-        // later iteration storing an out-of-lane value (an out-of-range/non-int int
-        // into an int lane, a non-bool into the bool lane, a non-float into f64)
-        // would force tier-0 to WIDEN the lane (alloc + relayout), which the native
-        // store can't do mid-run and which would trip the tier-1a oracle's in-place
+        // Pin the stored value's type. Which guard does that depends on the lane, and
+        // exactly one of the two is emitted:
+        //
+        // **Narrow lane → `guard_fits`.** The value must still fit the recorded lane:
+        // a later iteration storing an out-of-lane value (an out-of-range/non-int int
+        // into an int lane, a non-bool into the bool lane, a non-float into f64) would
+        // force tier-0 to WIDEN the lane (alloc + relayout), which the native store
+        // can't do mid-run and which would trip the tier-1a oracle's in-place
         // `setInLane` encode (`assert(fits(val))`) — so `guard_fits` side-exits
-        // instead and lets tier-0 re-run + widen. Every narrow lane needs this: the
-        // `astore` value can be a free variable (a loop-carried slot), not just a
-        // constant, so the recorder cannot assume it stays in-lane. (`.value` aborts
-        // above, so `lane` here is always narrow.) For the bool lane native lowers
-        // this to nothing — the value is already proven `.bool` at analysis time —
-        // but the oracle, which runs the raw trace, still needs the runtime check.
-        self.stampProv(try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord }), .value_fits, f.val_od, .neutral);
-        // No `guard_present`: `astore` *creates* presence (the slot is in-bounds by
-        // `guard_bounds`; storing a non-nil value sets the presence bit). The store
+        // instead and lets tier-0 re-run + widen. The `astore` value can be a free
+        // variable (a loop-carried slot), not just a constant, so the recorder cannot
+        // assume it stays in-lane. For the bool lane native lowers this to nothing —
+        // the value is already proven `.bool` at analysis time — but the oracle, which
+        // runs the raw trace, still needs the runtime check. Fit implies type here
+        // (`laneFits(.i32, v)` requires `v.isInt()`), so this doubles as the type pin.
+        //
+        // **`.value` lane → `guardNum` (doc 32).** `laneFits(.value, _)` is
+        // unconditionally true, so `guard_fits` would degenerate to a no-op that pins
+        // NOTHING — tropt would fold it as always-pass, and the oracle's `fits` assert
+        // passes for any value. Recording observed an int/float once; that does not
+        // make the producing ref numeric on a later iteration. Without an explicit
+        // pin, tier-1a would store a drifted bool/heap into the cell while native had
+        // assumed a numeric kind — an oracle divergence. This is the same guard, for
+        // the same reason, that `hashSetShape` emits on a hash-cell store: neither
+        // site has a lane to constrain the value. It also carries the *forwarded*
+        // read: `forwardPendingArrayLoad` returns before any load guard is emitted, so
+        // a forwarded `.value` load inherits its type pin entirely from here.
+        if (lane == .value) {
+            try self.guardNum(rval, vval, .value_type, f.val_od);
+        } else {
+            self.stampProv(try self.emit(.{ .op = .guard_fits, .a = rval, .aux = lane_ord }), .value_fits, f.val_od, .neutral);
+        }
+        // No `guard_present`: on a narrow lane `astore` *creates* presence (the slot
+        // is in-bounds by `guard_bounds`; storing a non-nil value sets the presence
+        // bit), and the `.value` lane has no presence bitmap at all — nil is in-band,
+        // and the store writes a non-nil value by the `isNil` abort above. The store
         // is effectful and not register-defining, so nothing is `setReg`'d.
         if (defer_store) {
             // Read-modify-write: stash the store; `commit()` flushes it (and any

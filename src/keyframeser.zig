@@ -729,9 +729,13 @@ pub fn restoreSnapshot(
                 // Bulk lane rebuild (doc 18 D5): the appends above leave the part
                 // `.value`/unfrozen even for a homogeneous narrow run — a leading
                 // nil (e.g. the slot-0 hole) defeats append's eager first-value
-                // lane commit. Left that way, a restored sieve is untraceable
-                // (the recorder aborts on `.value`) and a restored deflated grid
-                // can never re-inflate (inflation requires packed numeric rows).
+                // lane commit. Left that way, a restored sieve loses its narrow
+                // lane's density and per-element codegen (doc 32 made `.value`
+                // int/float scalars recordable, so it is no longer *untraceable*
+                // — but a `.value` element still costs a tag check per access
+                // and a whole 16-byte cell per slot), and a restored deflated
+                // grid can never re-inflate (inflation requires packed numeric
+                // rows).
                 // Recompute the optimal lane over the present values exactly as
                 // rehash's one-shot commit does: narrow → repack + freeze
                 // (monotonic from here); `.value` → stay unfrozen so a later

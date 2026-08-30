@@ -736,3 +736,85 @@ test "doc 20 Phase 3: jloop prologue strike exhaustion unpatches same-turn" {
     }
     try testing.expect(saw_exhausted_while);
 }
+
+// ---------------------------------------------------------------------------
+// doc 32: `.value`-lane SCALAR access (int/float elements)
+// ---------------------------------------------------------------------------
+
+/// Doc 32 harness: the full 10-leg parity matrix via `expectProgram`, PLUS one
+/// dedicated record+execute leg that pins the loop actually committed a trace.
+///
+/// The regression risk this arc carries is precisely a *silent* return to the
+/// old behaviour: if `arrayGetShape`/`arraySetShape` went back to aborting on
+/// `.value` elements, every program below would still print the right answer
+/// (tier-0 handles them fine) and parity alone would stay green. `entries > 0`
+/// is what makes the coverage claim testable rather than assumed.
+fn expectRecordedProgram(source: [:0]const u8, expected: []const u8) !void {
+    try expectProgram(source, expected);
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try util.runExecForTrace(&vm, gpa, source, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings(expected, sink.buffered());
+    try testing.expect(vm.trace.entries > 0);
+}
+
+test "doc 32: a read loop over an int/float-mixed array records and stays byte-identical" {
+    // `a` is built as a pure int array (the `.i32`-ish narrow lane), then one
+    // float store erases it to `.value` — `array.zig widenFor` has no int->f64
+    // rung, and cannot grow one without destroying lune's observable int/float
+    // distinction. Before doc 32 the read loop then aborted `.nyi_opcode` on
+    // every element and the whole loop fell back to tier-0 for the run.
+    //
+    // The sum mixes an int accumulator path with the one float element, so a
+    // codegen bug that loaded the float's payload as an int (or vice versa)
+    // changes the printed value rather than merely running slower.
+    try expectRecordedProgram(
+        \\local a = {}
+        \\for i = 1, 200 do a[i] = i end
+        \\a[7] = 0.5
+        \\local s = 0.0
+        \\for i = 1, 200 do s = s + a[i] end
+        \\print(s)
+    , "20093.5\n");
+}
+
+test "doc 32: a read-modify-write loop over a `.value` array records both directions" {
+    // Exercises the *store* half against the same array the load half reads:
+    // `a[i] = a[i] + 1` is an `aload` feeding an `astore` on a `.value` lane.
+    // The stored value alternates int (for the 99 int elements) and float (for
+    // the one seeded float), so the `astore` must write the correct tag byte
+    // per iteration rather than assuming the lane's element kind is uniform.
+    // A stale tag would make the next read reinterpret the payload and skew
+    // the total.
+    try expectRecordedProgram(
+        \\local a = {}
+        \\for i = 1, 100 do a[i] = i end
+        \\a[3] = 1.5
+        \\for r = 1, 20 do
+        \\  for i = 1, 100 do a[i] = a[i] + 1 end
+        \\end
+        \\local s = 0.0
+        \\for i = 1, 100 do s = s + a[i] end
+        \\print(s)
+    , "7048.5\n");
+}
+
+test "doc 32: the spectral-norm shape — int-initialised array later written as float" {
+    // The exact shape that motivated the arc, minimised. `u` is initialised
+    // with integer 1s and subsequently only ever holds floats; the array is
+    // `.value` from the first float store onward and `narrow => frozen` means
+    // it can never re-narrow. Every later loop touching `u` therefore depends
+    // on `.value` scalar access being recordable.
+    try expectRecordedProgram(
+        \\local u = {}
+        \\for i = 1, 100 do u[i] = 1 end
+        \\for i = 1, 100 do u[i] = u[i] * 1.0 + 0.5 end
+        \\local s = 0.0
+        \\for i = 1, 100 do s = s + u[i] end
+        \\print(s)
+    , "150\n");
+}

@@ -2112,11 +2112,22 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[ins.a] != .aref) return false;
                 if (!bounds_ok[ins.a]) return false; // [I4] bounds must dominate
                 if (ins.aux == VALUE_LANE) {
-                    // Phase 2: .value-lane aload produces a per-iteration heap
-                    // pointer (a *GcHeader for a table). Only the .heap ty is
-                    // accepted — scalar .value-lane elements still bail.
-                    if (ins.ty != .heap) return false;
-                    kinds[i] = .heap;
+                    // The .value lane holds full 16-byte tagged Values, so the
+                    // element's kind comes from the recorded `ty`, not from the lane.
+                    // Three shapes lower (the tag check is FUSED into the load — see
+                    // the codegen arm and `opMayExitInBody`):
+                    //   .heap  → a per-iteration *GcHeader for a table (Phase 2,
+                    //            array-of-structs `bodies[i].x`);
+                    //   .int   → TAG_INT payload into a GP register (doc 32);
+                    //   .float → TAG_FLOAT payload into an XMM register (doc 32).
+                    // Anything else (bool/string/unknown) still bails; the recorder
+                    // does not emit those shapes, so this is defence in depth.
+                    kinds[i] = switch (ins.ty) {
+                        .heap => .heap,
+                        .int => .int,
+                        .float => .float,
+                        else => return false,
+                    };
                 } else {
                     const lk = laneKind(ins.aux) orelse return false;
                     if (!laneConsistent(&trace_lane, ins.aux)) return false;
@@ -2168,7 +2179,23 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
             .astore => {
                 if (ins.a >= i or ins.b >= i) return false;
                 if (kinds[ins.a] != .aref) return false;
-                const lk = laneKind(ins.aux) orelse return false; // .value → tier-1a
+                if (ins.aux == VALUE_LANE) {
+                    // doc 32: a `.value`-lane store writes a full tagged Value — tag
+                    // byte + 8-byte payload, and NO presence bit (the lane has no
+                    // bitmap; nil is in-band). Every value fits a type-erased lane, so
+                    // unlike the narrow int lanes there is nothing to range-check and
+                    // `fits_ok` is deliberately NOT required — the recorder emits
+                    // `guardNum` instead of the vacuous `guard_fits`, and that guard is
+                    // what proves the kind below. Only int/float are lowered; a heap
+                    // value is the one shape that would need a real write barrier under
+                    // a future generational/incremental collector.
+                    if (!laneConsistent(&trace_lane, ins.aux)) return false;
+                    if (!bounds_ok[ins.a]) return false; // [I1/P1] bounds must dominate
+                    if (kinds[ins.b] != .int and kinds[ins.b] != .float) return false;
+                    kinds[i] = .none;
+                    continue;
+                }
+                const lk = laneKind(ins.aux) orelse return false;
                 if (!laneConsistent(&trace_lane, ins.aux)) return false;
                 if (!bounds_ok[ins.a]) return false; // [I1/P1] bounds must dominate
                 switch (lk) {
@@ -3594,11 +3621,13 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
         for (t.instrs) |ins| {
             var sid_signed: i32 = -1;
             var is_bool = false;
+            var is_value = false;
             switch (ins.op) {
                 .guard_bounds, .guard_present, .aload, .astore, .astore_append => {
                     const aref_ins = t.instrs[@intCast(ins.a)];
                     sid_signed = slot_id_of_ref[aref_ins.a];
                     is_bool = aref_ins.aux == BOOL_LANE;
+                    is_value = aref_ins.aux == VALUE_LANE;
                 },
                 .gload, .gstore, .guard_gpresent => {
                     const gcell_ins = t.instrs[@intCast(ins.a)];
@@ -3619,7 +3648,11 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                 .aload => need_data[sid] = true,
                 .astore, .astore_append => {
                     need_data[sid] = true;
-                    if (!is_bool) need_present[sid] = true;
+                    // The bool lane carries presence in-band (one byte per slot) and the
+                    // `.value` lane has no presence bitmap at all (`present` is null, nil
+                    // is an in-band tag) — reserving a base register for either would be a
+                    // wasted home, and for `.value` a load through a null pointer.
+                    if (!is_bool and !is_value) need_present[sid] = true;
                 },
                 // Grid cells (doc 14) are int-lane only in this cut: a load needs the
                 // data base; a store needs data + the presence bitmap; a presence guard
@@ -5522,8 +5555,45 @@ fn emitHStore(a: *x64.Assembler, kinds: []const Kind, alloc: *const Alloc, ins: 
     }
 }
 
-fn emitAStore(a: *x64.Assembler, t: *const Trace, alloc: *const Alloc, ins: trace.IrInstr) !void {
+fn emitAStore(a: *x64.Assembler, t: *const Trace, kinds: []const Kind, alloc: *const Alloc, ins: trace.IrInstr) !void {
     const aref_ins = t.instrs[ins.a];
+    if (ins.aux == VALUE_LANE) {
+        // doc 32: `.value`-lane store — write a full tagged Value (tag byte + 8-byte
+        // payload) and **no presence bit**; the lane has no bitmap (nil is in-band,
+        // and the recorder aborts a nil store). Every value fits a type-erased lane,
+        // so unlike the narrow lanes there is no width/range concern: the tag is what
+        // preserves integer-vs-float identity, exactly as `emitHStore` does for a hash
+        // cell. The seven padding bytes are left untouched — nothing observes them
+        // (equality compares semantic fields; keyframe capture goes through
+        // `array.get`), and tier-0's `encode` does not define them either.
+        //
+        // Address in rcx, computed index-first for the same reason as the VALUE_LANE
+        // aload: `arrayFieldReg(…, .rax)` may return `.rax`, so the data base must be
+        // fetched only after the index is already parked in scratch rcx.
+        if (kinds[ins.b] == .float) {
+            // Stage the value into XMM_SCRATCH0 before touching rax/rcx.
+            try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
+            const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+            try a.movRegReg(.rcx, ireg);
+            try a.shlRegImm8(.rcx, 4);
+            const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+            try a.addRegReg(.rcx, datareg); // rcx = &data[idx0] (Value*)
+            try a.movByteMemImm(.rcx, VALUE_TAG_OFF, TAG_FLOAT);
+            try a.movsdMemReg(.rcx, VALUE_PAYLOAD_OFF, XMM_SCRATCH0);
+        } else {
+            const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
+            try a.movRegReg(.rcx, ireg);
+            try a.shlRegImm8(.rcx, 4);
+            const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+            try a.addRegReg(.rcx, datareg); // rcx = &data[idx0] (Value*)
+            // Load the value into rax only now — the data base is already consumed,
+            // and rcx (the address) is scratch so no value home can alias it.
+            try placeToReg(a, .rax, placeOfRef(alloc, ins.b));
+            try a.movByteMemImm(.rcx, VALUE_TAG_OFF, TAG_INT);
+            try a.storeMemReg(.rcx, 8, VALUE_PAYLOAD_OFF, .rax);
+        }
+        return;
+    }
     if (ins.aux == F64_LANE) {
         try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.b), .float);
         const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
@@ -5587,7 +5657,7 @@ fn emitLinkedLoopDoneSnapshot(
     while (si < t.instrs.len) : (si += 1) {
         const p = t.instrs[si];
         switch (p.op) {
-            .astore => try emitAStore(a, t, alloc, p),
+            .astore => try emitAStore(a, t, kinds, alloc, p),
             .hstore => try emitHStore(a, kinds, alloc, p),
             .gstore => try emitGStore(a, t, alloc, p),
             .phi, .loop, .link => break,
@@ -6338,25 +6408,65 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             .aload => {
                 const aref_ins = t.instrs[ins.a];
                 if (ins.aux == VALUE_LANE) {
-                    // Phase 2: .value-lane aload — load a 16-byte Value element,
-                    // verify it's a heap ref, and extract the *GcHeader payload.
+                    // .value-lane aload — load a 16-byte tagged Value element, verify
+                    // its tag matches the one recorded, and extract the payload.
                     //
                     // data + idx0*16: SIB can't scale by 16, so shl idx0 by 4 then
                     // add data. The element is a full Value: [tag(1) pad(7) payload(8)].
-                    // We check tag == TAG_HEAP then load the payload (a *GcHeader).
-                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                    //
+                    // The tag check is a FUSED producer-exit: there is no separate
+                    // `guard_*` node, the exit identity rides the aload itself
+                    // (`opMayExitInBody` reports every VALUE_LANE aload as exiting).
+                    // The recorder still emits a `guard_table`/`guard_int`/`guard_float`
+                    // after the load for the tier-1a oracle; `proveKinds` discharges it
+                    // statically against the kind proven here, so it emits nothing.
+                    //
+                    // Three element shapes (doc 32): a table pointer (Phase 2,
+                    // array-of-structs), an int, or a float. A hole reads back as an
+                    // in-band nil `Value`, whose tag matches none of the three — so the
+                    // absent `guard_present` (the .value lane has no presence bitmap)
+                    // costs nothing: the tag check IS the presence check.
+                    const want_tag: u8 = switch (kinds[i]) {
+                        .heap => TAG_HEAP,
+                        .int => TAG_INT,
+                        .float => TAG_FLOAT,
+                        else => unreachable, // proveKinds admitted only these three
+                    };
+                    // Address in rcx, NOT rax. `arrayFieldReg(…, .rax)` returns `.rax`
+                    // itself whenever `data` was not hoisted into a register home
+                    // (register pressure — `pickRegFrom` can fail), so the older
+                    // "shl rax; add rax, datareg" sequence degenerated to
+                    // `add rax, rax` and computed a garbage address. Consume the index
+                    // into scratch rcx FIRST, then fetch the data base, then add: rcx
+                    // is never a home (`BASE_HOME_ORDER` starts at r15) so nothing can
+                    // alias it, and `arrayFieldReg`'s fallback only writes rax.
                     const ireg = try refBaseReg(a, alloc, ins.a, .rcx);
-                    // rax = idx0; can't use ireg directly — it might be the aref's
-                    // home that we must not clobber (rcx is scratch).
-                    try a.movRegReg(.rax, ireg);
-                    try a.shlRegImm8(.rax, 4); // rax = idx0 * 16
-                    try a.addRegReg(.rax, datareg); // rax = &data[idx0] (Value*)
-                    // Tag check: byte [rax + TAG_OFF] == TAG_HEAP
-                    try a.cmpByteMemImm(.rax, VALUE_TAG_OFF, TAG_HEAP);
-                    try jccNativeExit(a, exit_labels, i, .ne); // not heap → side-exit
-                    // Load *GcHeader from payload
-                    try a.movRegMem(.rax, .rax, VALUE_PAYLOAD_OFF);
-                    try regToPlace(a, placeOfRef(alloc, i), .rax);
+                    try a.movRegReg(.rcx, ireg); // rcx = idx0
+                    try a.shlRegImm8(.rcx, 4); // rcx = idx0 * 16
+                    const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
+                    try a.addRegReg(.rcx, datareg); // rcx = &data[idx0] (Value*)
+                    try a.cmpByteMemImm(.rcx, VALUE_TAG_OFF, want_tag);
+                    try jccNativeExit(a, exit_labels, i, .ne); // type changed → side-exit
+                    if (kinds[i] == .float) {
+                        // The payload is the raw 8-byte double — `movsd` it into the
+                        // aload's float home (xmm or spill cell). Byte-identical to
+                        // tier-0's `decode`, which returns the stored Value verbatim;
+                        // no FP rounding in a load, so 8-mode parity is inherited and
+                        // NaN payloads survive.
+                        switch (placeOfRef(alloc, i)) {
+                            .xmm => |x| try a.movsdRegMem(x, .rcx, VALUE_PAYLOAD_OFF),
+                            .mem => |d| {
+                                try a.movsdRegMem(XMM_SCRATCH0, .rcx, VALUE_PAYLOAD_OFF);
+                                try a.movsdMemReg(.rsp, d, XMM_SCRATCH0);
+                            },
+                            .reg => unreachable, // a float never homes in a GP register
+                        }
+                    } else {
+                        // .heap → the *GcHeader; .int → the i64. Same 8-byte payload
+                        // load either way.
+                        try a.movRegMem(.rax, .rcx, VALUE_PAYLOAD_OFF);
+                        try regToPlace(a, placeOfRef(alloc, i), .rax);
+                    }
                 } else {
                     // Scalar lanes: data base from hoisted home (or per-iter load).
                     const datareg = try arrayFieldReg(a, alloc, aref_ins.a, .data, .rax);
@@ -6455,7 +6565,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // astore: write the value into the slot the aref addresses.
             // `idx0` (from the aref) is shared with the dominating guard_bounds [I3].
             .astore => {
-                try emitAStore(a, t, alloc, ins);
+                try emitAStore(a, t, kinds, alloc, ins);
             },
             // guard_append (B5-grow): the append precondition, the grow analogue of
             // guard_bounds. Three memory-relative checks, no extra register beyond the

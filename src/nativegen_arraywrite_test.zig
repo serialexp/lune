@@ -521,3 +521,190 @@ test "nativegen: int-lane astore deopt-replay leaves a deterministic heap (idemp
 
     try expectTablesEqual(t_replay, t_once, K);
 }
+
+// ---------------------------------------------------------------------------
+// doc 32: `.value`-lane SCALAR writes.
+//
+// The `.value` lane holds full 16-byte tagged Values, so the store writes a tag
+// byte plus an 8-byte payload and — unlike every narrow lane — NO presence bit
+// (the lane has no bitmap; nil is in-band). Every value fits a type-erased lane,
+// so there is no `guard_fits`: the recorder pins the stored value with a real
+// `guard_int`/`guard_float` instead, and that is what proves the kind here.
+// ---------------------------------------------------------------------------
+
+/// A heterogeneous `.value`-lane table: slot 1 holds a second table (that is what
+/// forces the lane and stops `optimalLane` ever re-narrowing it), slots 2..K hold
+/// `seed(i)`.
+fn buildValueTable(
+    gpa: std.mem.Allocator,
+    anchor: *table.Table,
+    K: i64,
+    comptime seed: fn (i64) Value,
+) !*table.Table {
+    const t = try table.Table.create(gpa);
+    errdefer t.destroy(gpa);
+    try t.set(gpa, Value.int(1), Value.heap(&anchor.header));
+    var i: i64 = 2;
+    while (i <= K) : (i += 1) try t.set(gpa, Value.int(i), seed(i));
+    try testing.expectEqual(arr.Lane.value, t.array.lane);
+    return t;
+}
+
+fn seedInt(i: i64) Value {
+    return Value.int(i);
+}
+fn seedFloat(i: i64) Value {
+    return Value.float(@as(f64, @floatFromInt(i)));
+}
+
+test "nativegen(doc 32): .value-lane int astore fill matches the interpreter" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const K: i64 = 40;
+    const lane: i32 = nativegen.VALUE_LANE;
+    var consts = [_]Value{ Value.int(-77), Value.int(1) };
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .guard_lane, .a = 0, .aux = lane },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_int, .a = 3 },
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane },
+        .{ .op = .guard_bounds, .a = 5 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .guard_int, .a = 7 },
+        .{ .op = .astore, .a = 5, .b = 7, .aux = lane },
+        .{ .op = .konst, .aux = 1 },
+        .{ .op = .add, .a = 3, .b = 10, .ty = .int },
+        .{ .op = .phi, .b = 11, .aux = 1 },
+        .{ .op = .loop },
+    };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    const anchor = try table.Table.create(gpa);
+    defer anchor.destroy(gpa);
+    const t_native = try buildValueTable(gpa, anchor, K, seedInt);
+    defer t_native.destroy(gpa);
+    var r_native = [_]Value{ Value.heap(&t_native.header), Value.int(2) };
+    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    _ = try runNative(ct, &r_native);
+
+    const t_oracle = try buildValueTable(gpa, anchor, K, seedInt);
+    defer t_oracle.destroy(gpa);
+    var r_oracle = [_]Value{ Value.heap(&t_oracle.header), Value.int(2) };
+    const vals = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(vals);
+    _ = irinterp.executeValues(&tr, &r_oracle, vals);
+
+    try expectTablesEqual(t_native, t_oracle, K);
+    // The lane must be untouched: a `.value` store never widens or narrows.
+    try testing.expectEqual(arr.Lane.value, t_native.array.lane);
+    // Key 1 (the anchor table) is below the fill's start and must be intact — the
+    // store writes a tag byte plus a payload and touches nothing else.
+    try testing.expect(t_native.getInt(1).isHeap());
+    // And the written cells really are INTS, not floats with a reused payload.
+    try testing.expect(t_native.getInt(6).isInt());
+    try testing.expectEqual(@as(i64, -77), t_native.getInt(6).asInt());
+}
+
+test "nativegen(doc 32): .value-lane float astore fill matches the interpreter" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const K: i64 = 40;
+    const lane: i32 = nativegen.VALUE_LANE;
+    var consts = [_]Value{ Value.float(-2.75), Value.int(1) };
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .guard_lane, .a = 0, .aux = lane },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_int, .a = 3 },
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane },
+        .{ .op = .guard_bounds, .a = 5 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .guard_float, .a = 7 },
+        .{ .op = .astore, .a = 5, .b = 7, .aux = lane },
+        .{ .op = .konst, .aux = 1 },
+        .{ .op = .add, .a = 3, .b = 10, .ty = .int },
+        .{ .op = .phi, .b = 11, .aux = 1 },
+        .{ .op = .loop },
+    };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    // Seed with INTS and overwrite with FLOATS: the store must flip the tag, which is
+    // exactly the integer-vs-float identity the explicit tag write preserves. (In a
+    // narrow lane this would force a widen; in `.value` it is an ordinary store.)
+    const anchor = try table.Table.create(gpa);
+    defer anchor.destroy(gpa);
+    const t_native = try buildValueTable(gpa, anchor, K, seedInt);
+    defer t_native.destroy(gpa);
+    var r_native = [_]Value{ Value.heap(&t_native.header), Value.int(2) };
+    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    _ = try runNative(ct, &r_native);
+
+    const t_oracle = try buildValueTable(gpa, anchor, K, seedInt);
+    defer t_oracle.destroy(gpa);
+    var r_oracle = [_]Value{ Value.heap(&t_oracle.header), Value.int(2) };
+    const vals = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(vals);
+    _ = irinterp.executeValues(&tr, &r_oracle, vals);
+
+    try expectTablesEqual(t_native, t_oracle, K);
+    try testing.expect(t_native.getInt(6).isFloat());
+    try testing.expectEqual(@as(f64, -2.75), t_native.getInt(6).asFloat());
+    try testing.expect(t_native.getInt(1).isHeap()); // the anchor survived
+}
+
+test "nativegen(doc 32): .value-lane astore deopt-replay leaves a deterministic heap" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    // The C1 oracle, on the `.value` lane: a native pass followed by a full tier-0
+    // re-run over the SAME heap must equal a single clean run on a distinct table.
+    const gpa = testing.allocator;
+    const K: i64 = 40;
+    const lane: i32 = nativegen.VALUE_LANE;
+    var consts = [_]Value{ Value.float(9.5), Value.int(1) };
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .guard_lane, .a = 0, .aux = lane },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_int, .a = 3 },
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane },
+        .{ .op = .guard_bounds, .a = 5 },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .guard_float, .a = 7 },
+        .{ .op = .astore, .a = 5, .b = 7, .aux = lane },
+        .{ .op = .konst, .aux = 1 },
+        .{ .op = .add, .a = 3, .b = 10, .ty = .int },
+        .{ .op = .phi, .b = 11, .aux = 1 },
+        .{ .op = .loop },
+    };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    const anchor = try table.Table.create(gpa);
+    defer anchor.destroy(gpa);
+    const t_replay = try buildValueTable(gpa, anchor, K, seedFloat);
+    defer t_replay.destroy(gpa);
+    var r_native = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
+    var ct = compile(gpa, &tr) orelse return error.NativeBailedUnexpectedly;
+    defer ct.deinit();
+    _ = try runNative(ct, &r_native);
+    var r_replay = [_]Value{ Value.heap(&t_replay.header), Value.int(2) };
+    const vals = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(vals);
+    _ = irinterp.executeValues(&tr, &r_replay, vals);
+
+    const t_once = try buildValueTable(gpa, anchor, K, seedFloat);
+    defer t_once.destroy(gpa);
+    var r_once = [_]Value{ Value.heap(&t_once.header), Value.int(2) };
+    const vals2 = try gpa.alloc(Value, tr.instrs.len);
+    defer gpa.free(vals2);
+    _ = irinterp.executeValues(&tr, &r_once, vals2);
+
+    try expectTablesEqual(t_replay, t_once, K);
+}

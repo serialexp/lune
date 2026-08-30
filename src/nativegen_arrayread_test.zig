@@ -771,3 +771,159 @@ test "nativegen: guard_present/aload without a dominating guard_bounds bails" {
     const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
     try expectBail(&tr);
 }
+
+// ---------------------------------------------------------------------------
+// doc 32: `.value`-lane SCALAR element access — reads and writes.
+//
+// The `.value` lane is where an array lands once it holds more than one narrow
+// type (e.g. an int-lane array that takes a float store: `widenFor` has no
+// cross-family rung, so it erases to `.value` permanently). These traces prove
+// the fused tag-check-and-side-exit `aload` and the tag+payload `astore`.
+// ---------------------------------------------------------------------------
+
+/// A heterogeneous `.value`-lane table: slot 1 holds `anchor` (a table — that is
+/// what forces the lane and keeps `optimalLane` from ever re-narrowing it), slots
+/// 2..N hold `f(i)`. Mirrors the real erased-array shape.
+fn buildValueScalarTable(
+    gpa: std.mem.Allocator,
+    anchor: *table.Table,
+    n: usize,
+    comptime f: fn (usize) Value,
+) !*table.Table {
+    const t = try table.Table.create(gpa);
+    errdefer t.destroy(gpa);
+    try t.set(gpa, Value.int(1), Value.heap(&anchor.header));
+    var i: usize = 2;
+    while (i <= n) : (i += 1) try t.set(gpa, Value.int(@intCast(i)), f(i));
+    try testing.expectEqual(arr.Lane.value, t.array.lane);
+    return t;
+}
+
+fn intElem(i: usize) Value {
+    return Value.int(@intCast(i * 3));
+}
+fn floatElem(i: usize) Value {
+    return Value.float(@as(f64, @floatFromInt(i)) * 1.25);
+}
+
+test "nativegen(doc 32): .value-lane int-element read scan matches the interpreter" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const anchor = try table.Table.create(gpa);
+    defer anchor.destroy(gpa);
+    const t = try buildValueScalarTable(gpa, anchor, 40, intElem);
+    defer t.destroy(gpa);
+
+    const lane: i32 = VALUE_LANE;
+    var consts = [_]Value{Value.int(1)};
+    // r0=table, r1=index, r2=acc. `acc = acc + t[index]` over the .value lane.
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .aload, .a = 5, .aux = lane, .ty = .int }, // 7: TAG_INT fused exit
+        .{ .op = .guard_int, .a = 7 }, // 8: redundant on native, real on tier-1a
+        .{ .op = .slot_load, .aux = 2 }, // 9: acc
+        .{ .op = .guard_int, .a = 9 }, // 10
+        .{ .op = .add, .a = 9, .b = 7, .ty = .int }, // 11
+        .{ .op = .konst, .aux = 0 }, // 12: 1
+        .{ .op = .add, .a = 3, .b = 12, .ty = .int }, // 13
+        .{ .op = .phi, .b = 13, .aux = 1 },
+        .{ .op = .phi, .b = 11, .aux = 2 },
+        .{ .op = .loop },
+    };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    // Start at 2 (slot 1 holds the anchor TABLE): a clean run to the end, then a
+    // guard_bounds exit.
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(2), Value.int(0) });
+    // Start mid-run — a shorter prefix, same exit.
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(25), Value.int(0) });
+    // Start AT the table element: the fused TAG_INT check fails on iteration 0, so
+    // `completed == 0` and the registers are untouched. This is the shape that used
+    // to need a `guard_present` — the tag check subsumes it.
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(1), Value.int(0) });
+    // Start past the dense run: guard_bounds exits first.
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(99), Value.int(0) });
+}
+
+test "nativegen(doc 32): .value-lane float-element read reduction matches the oracle" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const anchor = try table.Table.create(gpa);
+    defer anchor.destroy(gpa);
+    const t = try buildValueScalarTable(gpa, anchor, 40, floatElem);
+    defer t.destroy(gpa);
+
+    const lane: i32 = VALUE_LANE;
+    var consts = [_]Value{ Value.int(1), Value.float(0.0) };
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 }, // 0: table
+        .{ .op = .guard_table, .a = 0 }, // 1
+        .{ .op = .guard_lane, .a = 0, .aux = lane }, // 2
+        .{ .op = .slot_load, .aux = 1 }, // 3: index
+        .{ .op = .guard_int, .a = 3 }, // 4
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane }, // 5
+        .{ .op = .guard_bounds, .a = 5 }, // 6
+        .{ .op = .aload, .a = 5, .aux = lane, .ty = .float }, // 7: TAG_FLOAT + movsd
+        .{ .op = .guard_float, .a = 7 }, // 8
+        .{ .op = .slot_load, .aux = 2 }, // 9: acc (float)
+        .{ .op = .guard_float, .a = 9 }, // 10
+        .{ .op = .add, .a = 9, .b = 7, .ty = .float }, // 11
+        .{ .op = .konst, .aux = 0 }, // 12: 1
+        .{ .op = .add, .a = 3, .b = 12, .ty = .int }, // 13
+        .{ .op = .phi, .b = 13, .aux = 1 },
+        .{ .op = .phi, .b = 11, .aux = 2 },
+        .{ .op = .loop },
+    };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(2), Value.float(0.0) });
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(30), Value.float(0.0) });
+    // Tag mismatch on iteration 0 (slot 1 is a table, not a float).
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(1), Value.float(0.0) });
+}
+
+test "nativegen(doc 32): .value-lane int element read as a FLOAT tag-exits every iteration" {
+    if (comptime !is_x64_linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const anchor = try table.Table.create(gpa);
+    defer anchor.destroy(gpa);
+    // Elements are INTs, but the trace was recorded expecting floats — the element
+    // type drifted between recording and this entry. The fused TAG_FLOAT check must
+    // side-exit immediately rather than reinterpret the int payload as a double.
+    const t = try buildValueScalarTable(gpa, anchor, 12, intElem);
+    defer t.destroy(gpa);
+
+    const lane: i32 = VALUE_LANE;
+    var consts = [_]Value{Value.int(1)};
+    var full = [_]I{
+        .{ .op = .slot_load, .aux = 0 },
+        .{ .op = .guard_table, .a = 0 },
+        .{ .op = .guard_lane, .a = 0, .aux = lane },
+        .{ .op = .slot_load, .aux = 1 },
+        .{ .op = .guard_int, .a = 3 },
+        .{ .op = .aref, .a = 0, .b = 3, .aux = lane },
+        .{ .op = .guard_bounds, .a = 5 },
+        .{ .op = .aload, .a = 5, .aux = lane, .ty = .float },
+        .{ .op = .guard_float, .a = 7 },
+        .{ .op = .slot_load, .aux = 2 },
+        .{ .op = .guard_float, .a = 9 },
+        .{ .op = .add, .a = 9, .b = 7, .ty = .float },
+        .{ .op = .konst, .aux = 0 },
+        .{ .op = .add, .a = 3, .b = 12, .ty = .int },
+        .{ .op = .phi, .b = 13, .aux = 1 },
+        .{ .op = .phi, .b = 11, .aux = 2 },
+        .{ .op = .loop },
+    };
+    var es = [_]u16{};
+    const tr = Trace{ .anchor = undefined, .instrs = &full, .consts = &consts, .entry_slots = &es, .entry_guards = &.{} };
+    // Oracle and native must agree that nothing completes and nothing is written.
+    try expectMatch(&tr, &.{ Value.heap(&t.header), Value.int(2), Value.float(0.0) });
+}

@@ -285,7 +285,7 @@ test "recArrayGet records a .value-lane table element (array-of-structs)" {
     try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.value)), aload_ins.aux);
 }
 
-test "recArrayGet aborts on a .value-lane non-table element — nyi scope cut" {
+test "recArrayGet aborts on a .value-lane bool element — nyi scope cut" {
     const gpa = testing.allocator;
     // Force .value lane by storing a table then a boolean at different indices.
     const inner = try table_mod.Table.create(gpa);
@@ -300,11 +300,126 @@ test "recArrayGet aborts on a .value-lane non-table element — nyi scope cut" {
     var state = TraceState.init(gpa);
     defer state.deinit();
     try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
-    // Access index 2 (the boolean) — non-table element in .value lane → nyi_opcode.
+    // Access index 2 (the boolean) — a bool has no *strict* type guard (`guard_true`
+    // would wave a truthy heap value through), so it stays out of doc 32's admission.
     var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(2) };
     state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
     try testing.expect(!state.isRecording());
     try testing.expectEqual(AbortReason.nyi_opcode, state.rec.abort_reason.?);
+}
+
+/// Build a heterogeneous `.value`-lane table: index 1 holds `inner` (a table, which
+/// is what forces the lane), index 2 holds `scalar`. Mirrors the real shape doc 32
+/// targets — an array whose elements are not one uniform narrow type.
+fn valueLaneWith(gpa: std.mem.Allocator, inner: *table_mod.Table, scalar: Value) !*table_mod.Table {
+    const t = try table_mod.Table.create(gpa);
+    errdefer t.destroy(gpa);
+    try t.set(gpa, Value.int(1), Value.heap(&inner.header)); // → .value lane
+    try t.set(gpa, Value.int(2), scalar); // stays .value (can't narrow)
+    try testing.expectEqual(arr.Lane.value, t.array.lane);
+    return t;
+}
+
+test "recArrayGet: doc 32 — a .value-lane int element records with guard_int and no guard_present" {
+    const gpa = testing.allocator;
+    const inner = try table_mod.Table.create(gpa);
+    defer inner.destroy(gpa);
+    const t = try valueLaneWith(gpa, inner, Value.int(42));
+    defer t.destroy(gpa);
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(2) };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
+
+    try testing.expect(state.isRecording());
+    try testing.expectEqual(@as(?AbortReason, null), state.rec.abort_reason);
+    const ops = state.rec.instrs.items;
+    // slot_load(table), guard_table, guard_lane(.value), slot_load(key),
+    // guard_int(key), aref, guard_bounds, aload(ty=.int), guard_int(loaded).
+    // NO guard_present: the `.value` lane has no presence bitmap — a hole reads back
+    // as an in-band nil, which the trailing guard_int rejects.
+    try testing.expectEqual(@as(usize, 9), ops.len);
+    try testing.expectEqual(IrOp.slot_load, ops[0].op);
+    try testing.expectEqual(IrOp.guard_table, ops[1].op);
+    try testing.expectEqual(IrOp.guard_lane, ops[2].op);
+    try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.value)), ops[2].aux);
+    try testing.expectEqual(IrOp.slot_load, ops[3].op);
+    try testing.expectEqual(IrOp.guard_int, ops[4].op); // the KEY guard
+    try testing.expectEqual(IrOp.aref, ops[5].op);
+    try testing.expectEqual(IrOp.guard_bounds, ops[6].op);
+    try testing.expectEqual(IrOp.aload, ops[7].op);
+    try testing.expectEqual(ObsType.int, ops[7].ty);
+    try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.value)), ops[7].aux);
+    try testing.expectEqual(IrOp.guard_int, ops[8].op); // the ELEMENT guard
+    try testing.expectEqual(@as(Ref, 7), ops[8].a); // …on the aload, not the key
+    for (ops) |o| try testing.expect(o.op != .guard_present);
+}
+
+test "recArrayGet: doc 32 — a .value-lane float element records with guard_float" {
+    const gpa = testing.allocator;
+    const inner = try table_mod.Table.create(gpa);
+    defer inner.destroy(gpa);
+    const t = try valueLaneWith(gpa, inner, Value.float(2.5));
+    defer t.destroy(gpa);
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    var regs = [_]Value{ Value.nil(), Value.heap(&t.header), Value.int(2) };
+    state.recordInstr(Instr.opABC(.get_index, 0, 1, 2), winRO(&regs), &proto, 0, Value.nil());
+
+    try testing.expect(state.isRecording());
+    const ops = state.rec.instrs.items;
+    try testing.expectEqual(@as(usize, 9), ops.len);
+    try testing.expectEqual(IrOp.aload, ops[7].op);
+    try testing.expectEqual(ObsType.float, ops[7].ty);
+    // The element guard follows the OBSERVED type — a float element pins guard_float,
+    // so a later iteration handing back an int side-exits rather than silently
+    // changing the value's subtype.
+    try testing.expectEqual(IrOp.guard_float, ops[8].op);
+    try testing.expectEqual(@as(Ref, 7), ops[8].a);
+    for (ops) |o| try testing.expect(o.op != .guard_present);
+}
+
+test "recArraySet: doc 32 — a .value-lane numeric store pins the value with guardNum, not guard_fits" {
+    const gpa = testing.allocator;
+    const inner = try table_mod.Table.create(gpa);
+    defer inner.destroy(gpa);
+    const t = try valueLaneWith(gpa, inner, Value.int(42));
+    defer t.destroy(gpa);
+
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+    const proto = Proto{ .code = &.{}, .name = "t", .num_registers = 3 };
+    try state.rec.reset(gpa, .{ .proto = &proto, .pc = 0 }, proto.num_registers);
+    // r0 = value (7), r1 = table, r2 = key (2) ; `set_index r1, r2, r0` → t[2] = 7
+    var regs = [_]Value{ Value.int(7), Value.heap(&t.header), Value.int(2) };
+    state.recordInstr(Instr.opABC(.set_index, 1, 2, 0), winRO(&regs), &proto, 0, Value.nil());
+
+    try testing.expect(state.isRecording());
+    try testing.expectEqual(@as(?AbortReason, null), state.rec.abort_reason);
+    const ops = state.rec.instrs.items;
+    // slot_load(val), slot_load(tab), guard_table, guard_lane(.value), slot_load(key),
+    // guard_int(key), aref, guard_bounds, guard_int(val), astore.
+    try testing.expectEqual(@as(usize, 10), ops.len);
+    try testing.expectEqual(IrOp.guard_lane, ops[3].op);
+    try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.value)), ops[3].aux);
+    try testing.expectEqual(IrOp.aref, ops[6].op);
+    try testing.expectEqual(IrOp.guard_bounds, ops[7].op);
+    // THE point of the test: the store's type pin is a guard on the VALUE ref (the
+    // slot_load at 0), not a guard_fits. `laneFits(.value, _)` is unconditionally
+    // true, so guard_fits would pin nothing and a drifted non-numeric value would
+    // reach the oracle's setInLane. (Review finding 1 on doc 32.)
+    try testing.expectEqual(IrOp.guard_int, ops[8].op);
+    try testing.expectEqual(@as(Ref, 0), ops[8].a);
+    try testing.expectEqual(IrOp.astore, ops[9].op);
+    try testing.expectEqual(@as(i32, @intFromEnum(arr.Lane.value)), ops[9].aux);
+    for (ops) |o| try testing.expect(o.op != .guard_fits);
+    for (ops) |o| try testing.expect(o.op != .guard_present);
 }
 
 test "abort log records (anchor, reason, opcode) and dedups recurrences" {
@@ -495,7 +610,7 @@ test "recArraySet: a bool-lane append (t[asize]=true) records the guarded grow s
     try testing.expectEqual(len_before, t.array.asize);
 }
 
-test "recArraySet aborts: non-table, non-int key, OOB, out-of-lane value, .value lane" {
+test "recArraySet aborts: non-table, non-int key, OOB, out-of-lane value, non-numeric .value store" {
     const gpa = testing.allocator;
     const t = try table_mod.Table.create(gpa);
     defer t.destroy(gpa);
@@ -523,8 +638,12 @@ test "recArraySet aborts: non-table, non-int key, OOB, out-of-lane value, .value
         .{ .tab = Value.heap(&t.header), .key = Value.int(3), .val = Value.int(5), .why = .bad_type },
         // nil value — a hole-punch / delete, out of B3 scope.
         .{ .tab = Value.heap(&t.header), .key = Value.int(3), .val = Value.nil(), .why = .bad_type },
-        // .value-lane array — deferred scope cut.
-        .{ .tab = Value.heap(&tv.header), .key = Value.int(1), .val = Value.int(20), .why = .nyi_opcode },
+        // .value-lane array with a NON-numeric value — still a scope cut (doc 32 §6):
+        // a heap value is the one shape that would need a real write barrier under a
+        // future generational/incremental collector. An int or a float DOES record
+        // here now; that is pinned by the positive test below.
+        .{ .tab = Value.heap(&tv.header), .key = Value.int(1), .val = Value.heap(&t.header), .why = .nyi_opcode },
+        .{ .tab = Value.heap(&tv.header), .key = Value.int(1), .val = Value.boolean(true), .why = .nyi_opcode },
     };
     for (cases) |c| {
         var state = TraceState.init(gpa);

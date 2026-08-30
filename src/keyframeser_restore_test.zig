@@ -1271,3 +1271,81 @@ test "restore surfaces specific errors for malformed snapshots" {
         .loaded_chunks = &.{},
     } }, &rootp, error.NextObjIdBelowObjects);
 }
+
+test "doc 32: a heterogeneous `.value` array survives round-trip and still records post-restore" {
+    // Doc 32's snapshot constraint, pinned. `keyframeser.zig` repacks a
+    // `.value` array back down to a narrow lane on restore when its elements
+    // are homogeneous, so a test that seeded an all-int array would silently
+    // stop testing `.value` the moment it crossed the boundary. `a` is
+    // deliberately HETEROGENEOUS (199 ints and one float), which is exactly
+    // the case the repack must decline — so the restored VM really is reading
+    // a `.value` lane.
+    //
+    // Pins (a) resumed output == uninterrupted tier-0 output, and (b) the
+    // restored VM commits a trace at all. (b) matters because restore builds a
+    // fresh VM with an empty trace cache: nothing carries over, so the loop
+    // has to re-record from scratch against the restored array. If `.value`
+    // scalar reads regressed to `.nyi_opcode`, (a) would still pass and only
+    // (b) would catch it.
+    const gpa = testing.allocator;
+    const source =
+        \\local a = {}
+        \\for i = 1, 200 do a[i] = i end
+        \\a[7] = 0.5
+        \\local s = 0.0
+        \\for r = 1, 40 do
+        \\  for i = 1, 200 do s = s + a[i] end
+        \\end
+        \\print(s)
+    ;
+    const ref = try referenceRun(gpa, source);
+    defer ref.deinit(gpa);
+
+    var diags = Diagnostics.init(gpa);
+    defer diags.deinit();
+    var tree = try lune_parser.parse(gpa, source, &diags);
+    defer tree.deinit();
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    vm.out = &sink;
+    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    defer chunk.deinit();
+    try testing.expect(!diags.hasErrors());
+
+    // Cut a quarter of the way in: the array is fully built and already
+    // erased to `.value`, and the accumulation loop is mid-flight.
+    vm.suspend_ctl = .{ .min_depth = 0, .after_safepoints = ref.total_safepoints / 4 };
+    try testing.expect((try vm.start(chunk.proto)) == .suspended);
+    const out_before = try gpa.dupe(u8, sink.buffered());
+    defer gpa.free(out_before);
+    const mid = try encodeSnapshot(gpa, &vm);
+    defer gpa.free(mid);
+
+    const vm_r = try restore(gpa, mid, chunk.proto, NativeRegistry.base());
+    defer {
+        vm_r.deinit();
+        gpa.destroy(vm_r);
+    }
+
+    const native = @import("nativegen.zig").is_x64_linux;
+    vm_r.trace.config.enabled = true;
+    vm_r.trace.config.execute = true;
+    vm_r.trace.config.optimize = true;
+    vm_r.trace.config.native_codegen = native;
+    vm_r.trace.config.hotloop = 4;
+
+    var buf_r: [64]u8 = undefined;
+    var sink_r = io.Writer.fixed(&buf_r);
+    vm_r.out = &sink_r;
+    vm_r.suspend_ctl = null;
+    try testing.expect((try vm_r.exec()) == .finished);
+
+    var combined: [128]u8 = undefined;
+    @memcpy(combined[0..out_before.len], out_before);
+    @memcpy(combined[out_before.len..][0..sink_r.buffered().len], sink_r.buffered());
+    try testing.expectEqualStrings(ref.full_out, combined[0 .. out_before.len + sink_r.buffered().len]);
+
+    try testing.expect(vm_r.trace.entries > 0);
+}
