@@ -1,0 +1,7 @@
+version: 1
+default: bench-suite
+
+profiles:
+  bench-suite:
+    workflow: .gothab/workflows/profile-bench.yml
+    job: profile

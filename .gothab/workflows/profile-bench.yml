@@ -1,0 +1,139 @@
+name: lune benchmark suite
+
+# The benchmark board is only meaningful on a quiet machine of a stable
+# hardware class. A developer desktop is neither: a background game once
+# produced a uniform +11%..+46% "regression" across every row of the board,
+# including the pure tier-0 column that the change under test could not
+# possibly affect. This workflow moves the board onto the operator-designated
+# default autoscale pool so successive runs are comparable to each other.
+#
+# Dispatch it with `gt profile` from a lune checkout. The CLI ships the local
+# working tree (committed-but-unpushed + staged + unstaged) as one unified diff
+# on top of the pushed base, so an arc can be benchmarked before it is pushed —
+# which is the normal case here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: best-of-N timing reps
+        default: "5"
+      scale:
+        description: scale factor on each program's first integer argument
+        default: "1.0"
+      filter:
+        description: only run programs whose name contains this
+        default: ""
+
+env:
+  # Pinned by .zig-version. ziglang.org garbage-collects old -dev builds, so we
+  # fetch from the community mirror list at a pinned digest rather than trusting
+  # whichever mirror answers first. The digest was verified to be bit-identical
+  # to the known-good toolchain on the maintainer's machine, and two independent
+  # mirrors agreed on it.
+  ZIG_VERSION: 0.17.0-dev.813+2153f8143
+  ZIG_SHA256: b0d46ffc4587b9e8dd0b524ee5bc4da1e67f28bba55e7c534cec64af2f2d7a74
+  # The parity columns only mean anything if LuaJIT is the same build the
+  # campaign has been measuring against all along.
+  LUAJIT_REPO: https://github.com/serialexp/luajit.git
+  LUAJIT_REV: a86046b1
+  TOOLS: /home/runner/lune-ci-tools
+
+jobs:
+  profile:
+    name: bench suite on the default pool
+    # Deliberately no runs-on: profile jobs use the operator-designated default
+    # autoscale pool, so successive runs share a hardware class.
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Record the hardware class
+        # Timings only compare across runs on comparable hardware, so make the
+        # pool's identity part of the run's own log.
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          echo "cores: $(nproc)"
+          free -m | head -2
+
+      - name: Verify the toolchain pin matches .zig-version
+        run: |
+          set -eu
+          pinned=$(tr -d '[:space:]' < .zig-version)
+          if [ "$pinned" != "$ZIG_VERSION" ]; then
+            echo "::error::.zig-version says '$pinned' but this workflow pins '$ZIG_VERSION'"
+            echo "Update ZIG_VERSION *and* ZIG_SHA256 together."
+            exit 1
+          fi
+
+      - name: Install Zig
+        run: |
+          set -eu
+          mkdir -p "$TOOLS"
+          tarball="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL -o /tmp/mirrors.txt https://ziglang.org/download/community-mirrors.txt
+          ok=
+          while read -r mirror; do
+            [ -n "$mirror" ] || continue
+            echo "trying $mirror"
+            if curl -fsSL --max-time 180 -o /tmp/zig.tar.xz "$mirror/$tarball"; then
+              if echo "$ZIG_SHA256  /tmp/zig.tar.xz" | sha256sum -c -; then
+                ok=1
+                break
+              fi
+              echo "digest mismatch from $mirror - discarding"
+              rm -f /tmp/zig.tar.xz
+            fi
+          done < /tmp/mirrors.txt
+          if [ -z "$ok" ]; then
+            echo "::error::no mirror served $tarball at the pinned digest"
+            exit 1
+          fi
+          mkdir -p "$TOOLS/zig"
+          tar -xJf /tmp/zig.tar.xz -C "$TOOLS/zig" --strip-components=1
+          "$TOOLS/zig/zig" version
+          test "$("$TOOLS/zig/zig" version)" = "$ZIG_VERSION"
+          echo "$TOOLS/zig" >> "$GITHUB_PATH"
+
+      - name: Build LuaJIT
+        run: |
+          set -eu
+          git clone --filter=blob:none "$LUAJIT_REPO" "$TOOLS/luajit"
+          git -C "$TOOLS/luajit" checkout "$LUAJIT_REV"
+          make -C "$TOOLS/luajit" -j"$(nproc)"
+          "$TOOLS/luajit/src/luajit" -v
+
+      - name: Build lune (ReleaseFast)
+        # Never benchmark a Debug binary: it is roughly 20x slow. This is the
+        # only build step, and nothing after it may re-run `zig build` without
+        # the optimize flag.
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Frozen-output gate
+        # A board is meaningless if the programs stopped producing the right
+        # answers, so gate on byte-identical output before spending time on
+        # timing runs.
+        run: python3 tools/hashgate.py
+
+      - name: Run the benchmark suite
+        env:
+          LUAJIT: /home/runner/lune-ci-tools/luajit/src/luajit
+        run: |
+          set -eu
+          python3 bench/run.py \
+            --reps "${{ inputs.reps }}" \
+            --scale "${{ inputs.scale }}" \
+            --filter "${{ inputs.filter }}" \
+            --no-save \
+            --json bench-rows.json
+          python3 tools/bench_profile.py bench-rows.json profile.json
+
+      - uses: actions/profile@v1
+        with:
+          path: profile.json
+          name: bench-suite
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-rows
+          path: bench-rows.json

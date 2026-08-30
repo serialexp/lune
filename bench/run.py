@@ -37,12 +37,14 @@ Usage:
     python3 bench/run.py --scale 0.1     # scale first integer arg (quick run)
     python3 bench/run.py --no-luajit     # skip LuaJIT entirely
     python3 bench/run.py --no-save       # don't write a results TSV
+    python3 bench/run.py --json out.json # also emit the rows as JSON
 
 Assumes lune is built ReleaseFast:  zig build -Doptimize=ReleaseFast
 """
 
 import argparse
 import glob
+import json
 import os
 import re
 import subprocess
@@ -210,6 +212,8 @@ def main():
     ap.add_argument("--no-save", action="store_true", help="do not write a results TSV")
     ap.add_argument("--no-jit-stats", action="store_true",
                     help="skip the per-bench --jit-stats run behind the res%% column")
+    ap.add_argument("--json", default="", metavar="PATH",
+                    help="also write the rows as JSON (machine-readable twin of the TSV)")
     args = ap.parse_args()
 
     if not os.path.exists(args.lune):
@@ -342,6 +346,26 @@ def main():
         with open(path) as src, open(latest, "w") as dst:
             dst.write(src.read())
         print(f"\nwrote {os.path.relpath(path, ROOT)}  (+ bench/results/latest.tsv)")
+
+    # --- machine-readable twin of the TSV ---
+    #
+    # Same rows, same units, no interpretation: consumers (e.g. the gothab
+    # profile report emitted by tools/bench_profile.py) do their own mapping
+    # rather than this runner growing knowledge of any one consumer's schema.
+    if args.json:
+        blob = {
+            "rev": git_rev(),
+            "reps": args.reps,
+            "mem_reps": args.mem_reps,
+            "scale": args.scale,
+            "filter": args.filter,
+            "have_luajit": have_lj,
+            "rows": rows,
+        }
+        with open(args.json, "w") as fh:
+            json.dump(blob, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        print(f"wrote {args.json}")
 
     # exit non-zero if any correctness check failed (usable as a gate)
     bad = [r for r in rows if r["cross"] not in ("ok",) or r["luajit"] in ("DIFF", "ERR")]
