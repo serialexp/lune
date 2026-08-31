@@ -1,5 +1,5 @@
-# lune bench suite  rev=27a55d2  stamp=20260713-120124  reps=5  scale=1.0
-program	args	luajit_mode	cross	luajit_match	lune_t0_ms	lune_jit_ms	luajit_ms	lune_t0_execns	lune_jit_execns
+# mahina bench suite  rev=27a55d2  stamp=20260713-120124  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	mahina_t0_ms	mahina_jit_ms	luajit_ms	mahina_t0_execns	mahina_jit_execns
 nsieve-bit-fp	6	-	ok	ok	272.513	276.100	16.019	271457431	276114315
 nsieve-bit	6	-	ok	ok	126.528	51.044	6.077	135271390	50933268
 nsieve	7	-	ok	ok	145.225	95.698	11.233	154867888	89693379

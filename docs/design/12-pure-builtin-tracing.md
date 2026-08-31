@@ -1,4 +1,4 @@
-# lune — tracing pure builtins (`math.sqrt` → native `sqrtsd`)
+# mahina — tracing pure builtins (`math.sqrt` → native `sqrtsd`)
 
 Status: **complete (v1) — F0 (recorder + tier-1a oracle) and F1 (native `sqrtsd`)
 both landed.** Byte-identical across all 8 determinism modes + keyframe replay; the
@@ -85,7 +85,7 @@ tiers when the callee is no longer the `sqrt` builtin.
 **MXCSR** (round-to-nearest-even), they agree **bit-for-bit**, including the edge
 cases: `sqrt(-0.0) = -0.0`, `sqrt(x<0) = qNaN`, `sqrt(+inf) = +inf`.
 
-**lune never calls `fesetround`** and never mutates MXCSR. This is the invariant
+**mahina never calls `fesetround`** and never mutates MXCSR. This is the invariant
 the bit-equality rests on; it is recorded here so a future SSE-rounding feature
 can't silently break replay. `fsqrt` is also deliberately **left unfoldable** in
 `tropt` (like `int_of_float`) — we never compute `@sqrt` at compile time, removing

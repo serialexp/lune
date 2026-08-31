@@ -1,8 +1,8 @@
-//! lune CLI — run a lune program through the tier-0 interpreter.
+//! mahina CLI — run a mahina program through the tier-0 interpreter.
 //!
 //! Usage:
-//!   lune [options] <script.lua>   run a script file
-//!   lune [options] -e <chunk>     run a chunk given inline on the command line
+//!   mahina [options] <script.lua>   run a script file
+//!   mahina [options] -e <chunk>     run a chunk given inline on the command line
 //!
 //! The driver walks the same path the test suite exercises —
 //! parse → compile → tier-0 interpret — and just wires it to argv and the
@@ -22,16 +22,16 @@
 //! program's output — only whether, and how, hot loops are traced.
 
 const std = @import("std");
-const lune = @import("lune");
+const mahina = @import("mahina");
 
-const Diagnostics = lune.diag.Diagnostics;
+const Diagnostics = mahina.diag.Diagnostics;
 
 const usage =
-    \\lune — a Lua-shaped language (tier-0 interpreter)
+    \\mahina — a Lua-shaped language (tier-0 interpreter)
     \\
     \\usage:
-    \\  lune [options] <script.lua>   run a script file
-    \\  lune [options] -e <chunk>     run a chunk given inline
+    \\  mahina [options] <script.lua>   run a script file
+    \\  mahina [options] -e <chunk>     run a chunk given inline
     \\
     \\options:
     \\  --trace              enable the tracing JIT: detect hot loops, record them
@@ -178,12 +178,12 @@ pub fn main(init: std.process.Init) u8 {
     // allocator (Rule Z-4: account at the boundary). The tracker must be declared
     // here — stable address for the vtable handle, and alive past `runSource` so
     // the deferred report sees final counts.
-    var mem_tracker = lune.mem.TrackingAllocator.init(init.gpa);
+    var mem_tracker = mahina.mem.TrackingAllocator.init(init.gpa);
     var mem_stats = false;
     defer if (mem_stats) {
         const s = mem_tracker.stats;
-        lune.io.eprint(
-            "lune: mem stats\n" ++
+        mahina.io.eprint(
+            "mahina: mem stats\n" ++
                 "  peak bytes:        {d}\n" ++
                 "  total bytes:       {d}\n" ++
                 "  alloc calls:       {d}\n" ++
@@ -202,7 +202,7 @@ pub fn main(init: std.process.Init) u8 {
     var topts: TraceOpts = .{};
     const first = while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            lune.io.print("{s}", .{usage});
+            mahina.io.print("{s}", .{usage});
             return 0;
         } else if (std.mem.eql(u8, arg, "--trace")) {
             topts.enabled = true;
@@ -232,8 +232,8 @@ pub fn main(init: std.process.Init) u8 {
             topts.dump_aborts = true;
         } else if (std.mem.eql(u8, arg, "--jit-debug")) {
             topts.jit_debug = true;
-            if (!lune.jitdbg.enabled) {
-                lune.io.eprint("lune: warning: --jit-debug has no effect in this binary; rebuild with `zig build -Djit-debug=true`\n", .{});
+            if (!mahina.jitdbg.enabled) {
+                mahina.io.eprint("mahina: warning: --jit-debug has no effect in this binary; rebuild with `zig build -Djit-debug=true`\n", .{});
             }
         } else if (std.mem.eql(u8, arg, "--jit-coverage")) {
             topts.enabled = true;
@@ -248,44 +248,44 @@ pub fn main(init: std.process.Init) u8 {
         } else if (std.mem.eql(u8, arg, "--trace-hotguard")) {
             topts.enabled = true;
             const val = it.next() orelse {
-                lune.io.eprint("lune: error: --trace-hotguard requires a numeric argument\n", .{});
+                mahina.io.eprint("mahina: error: --trace-hotguard requires a numeric argument\n", .{});
                 return 2;
             };
             topts.hotguard = std.fmt.parseUnsigned(u32, val, 10) catch {
-                lune.io.eprint("lune: error: --trace-hotguard requires a numeric argument, got '{s}'\n", .{val});
+                mahina.io.eprint("mahina: error: --trace-hotguard requires a numeric argument, got '{s}'\n", .{val});
                 return 2;
             };
         } else if (std.mem.eql(u8, arg, "--trace-silent-budget")) {
             topts.enabled = true;
             const val = it.next() orelse {
-                lune.io.eprint("lune: error: --trace-silent-budget requires a numeric argument\n", .{});
+                mahina.io.eprint("mahina: error: --trace-silent-budget requires a numeric argument\n", .{});
                 return 2;
             };
             topts.silent_budget = std.fmt.parseUnsigned(usize, val, 10) catch {
-                lune.io.eprint("lune: error: --trace-silent-budget requires a numeric argument, got '{s}'\n", .{val});
+                mahina.io.eprint("mahina: error: --trace-silent-budget requires a numeric argument, got '{s}'\n", .{val});
                 return 2;
             };
         } else if (std.mem.eql(u8, arg, "--emit-traces")) {
             topts.enabled = true;
             topts.emit_path = it.next() orelse {
-                lune.io.eprint("lune: error: --emit-traces requires a <file> argument\n", .{});
+                mahina.io.eprint("mahina: error: --emit-traces requires a <file> argument\n", .{});
                 return 2;
             };
         } else if (std.mem.eql(u8, arg, "--emit-keyframe")) {
             topts.keyframe_path = it.next() orelse {
-                lune.io.eprint("lune: error: --emit-keyframe requires a <file> argument\n", .{});
+                mahina.io.eprint("mahina: error: --emit-keyframe requires a <file> argument\n", .{});
                 return 2;
             };
         } else if (std.mem.eql(u8, arg, "--emit-effects")) {
             topts.effects_path = it.next() orelse {
-                lune.io.eprint("lune: error: --emit-effects requires a <file> argument\n", .{});
+                mahina.io.eprint("mahina: error: --emit-effects requires a <file> argument\n", .{});
                 return 2;
             };
         } else if (std.mem.eql(u8, arg, "--emit-coverage")) {
             topts.enabled = true;
             topts.coverage = true;
             topts.coverage_path = it.next() orelse {
-                lune.io.eprint("lune: error: --emit-coverage requires a <file> argument\n", .{});
+                mahina.io.eprint("mahina: error: --emit-coverage requires a <file> argument\n", .{});
                 return 2;
             };
         } else if (std.mem.eql(u8, arg, "--mem-stats")) {
@@ -294,7 +294,7 @@ pub fn main(init: std.process.Init) u8 {
             topts.time = true;
         } else break arg;
     } else {
-        lune.io.eprint("{s}", .{usage});
+        mahina.io.eprint("{s}", .{usage});
         return 2;
     };
 
@@ -305,7 +305,7 @@ pub fn main(init: std.process.Init) u8 {
     if (std.mem.eql(u8, first, "-e")) {
         // argv strings are already NUL-terminated, so this is a `[:0]const u8`.
         const chunk = it.next() orelse {
-            lune.io.eprint("lune: error: -e requires a chunk argument\n", .{});
+            mahina.io.eprint("mahina: error: -e requires a chunk argument\n", .{});
             return 2;
         };
         // Program argv for `-e`: argv(0) = "-e", then any trailing user args.
@@ -317,8 +317,8 @@ pub fn main(init: std.process.Init) u8 {
     }
 
     // Otherwise the first non-option argument is a script path.
-    const source = lune.io.readFileZ(gpa, init.io, first) catch |err| {
-        lune.io.eprint("lune: error: cannot read '{s}': {s}\n", .{ first, @errorName(err) });
+    const source = mahina.io.readFileZ(gpa, init.io, first) catch |err| {
+        mahina.io.eprint("mahina: error: cannot read '{s}': {s}\n", .{ first, @errorName(err) });
         return 1;
     };
     defer gpa.free(source);
@@ -333,14 +333,14 @@ pub fn main(init: std.process.Init) u8 {
 /// Parse, compile, and run one source chunk. Returns the process exit code.
 /// `name` labels the chunk in diagnostics (a file path or a synthetic name).
 /// `topts` controls the tracing-JIT recorder (off by default).
-fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [:0]const u8, topts: TraceOpts, env_map: *std.process.Environ.Map, argv: []const []const u8) u8 {
+fn runSource(gpa: std.mem.Allocator, io: mahina.io.Io, name: []const u8, source: [:0]const u8, topts: TraceOpts, env_map: *std.process.Environ.Map, argv: []const []const u8) u8 {
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
 
     // --- parse ---
-    var tree = lune.parser.parse(gpa, source, &diags) catch |err| {
+    var tree = mahina.parser.parse(gpa, source, &diags) catch |err| {
         reportDiagnostics(name, &diags);
-        lune.io.eprint("lune: error: parse failed: {s}\n", .{@errorName(err)});
+        mahina.io.eprint("mahina: error: parse failed: {s}\n", .{@errorName(err)});
         return 1;
     };
     defer tree.deinit();
@@ -351,8 +351,8 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
 
     // The VM owns the heap that string constants are interned into, so it must
     // outlive the chunk. Bring it up before compiling.
-    var vm = lune.interp.Vm.init(gpa) catch |err| {
-        lune.io.eprint("lune: error: vm init failed: {s}\n", .{@errorName(err)});
+    var vm = mahina.interp.Vm.init(gpa) catch |err| {
+        mahina.io.eprint("mahina: error: vm init failed: {s}\n", .{@errorName(err)});
         return 1;
     };
     defer vm.deinit();
@@ -401,10 +401,10 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
         if (vm.pending_error) |ev| {
             var fault_arena = std.heap.ArenaAllocator.init(gpa);
             defer fault_arena.deinit();
-            const msg = lune.interp.Vm.renderErrorValue(ev, fault_arena.allocator()) catch @errorName(err);
-            lune.io.eprint("lune: error: {s}\n", .{msg});
+            const msg = mahina.interp.Vm.renderErrorValue(ev, fault_arena.allocator()) catch @errorName(err);
+            mahina.io.eprint("mahina: error: {s}\n", .{msg});
         } else {
-            lune.io.eprint("lune: error: populating arg table failed: {s}\n", .{@errorName(err)});
+            mahina.io.eprint("mahina: error: populating arg table failed: {s}\n", .{@errorName(err)});
         }
         return 1;
     };
@@ -413,11 +413,11 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
 
     // --- compile --- (pass the builtin globals so the unknown-global lint
     // doesn't flag `print`/`clock`).
-    var chunk = lune.compiler.compileWithOptions(gpa, vm.heap, source, tree.root, &diags, .{
-        .known_globals = &lune.interp.builtin_global_names,
+    var chunk = mahina.compiler.compileWithOptions(gpa, vm.heap, source, tree.root, &diags, .{
+        .known_globals = &mahina.interp.builtin_global_names,
     }) catch |err| {
         reportDiagnostics(name, &diags);
-        lune.io.eprint("lune: error: compile failed: {s}\n", .{@errorName(err)});
+        mahina.io.eprint("mahina: error: compile failed: {s}\n", .{@errorName(err)});
         return 1;
     };
     defer chunk.deinit();
@@ -451,18 +451,18 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
             // `chunk:line:` prefix — print it verbatim, Lua-style. The type-name
             // faults are not self-located and get the " at chunk:line" suffix.
             if (fault.self_located)
-                lune.io.eprint("lune: runtime error: {s}\n", .{fault.message})
+                mahina.io.eprint("mahina: runtime error: {s}\n", .{fault.message})
             else
-                lune.io.eprint("lune: runtime error: {s} at {s}:{d}\n", .{ fault.message, name, fault.line });
+                mahina.io.eprint("mahina: runtime error: {s} at {s}:{d}\n", .{ fault.message, name, fault.line });
             // A traceback only adds signal when control crossed a call boundary.
             if (fault.frames.len > 1) {
-                lune.io.eprint("stack traceback:\n", .{});
+                mahina.io.eprint("stack traceback:\n", .{});
                 for (fault.frames) |f| {
-                    lune.io.eprint("    {s}:{d}\n", .{ f.name, f.line });
+                    mahina.io.eprint("    {s}:{d}\n", .{ f.name, f.line });
                 }
             }
         } else |_| {
-            lune.io.eprint("lune: runtime error: {s}\n", .{@errorName(err)});
+            mahina.io.eprint("mahina: runtime error: {s}\n", .{@errorName(err)});
         }
         return 1;
     };
@@ -471,7 +471,7 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // Deliberately free of coverage accounting so the number is a clean measure of
     // the run (add --jit-coverage explicitly to also get the split).
     if (topts.time) {
-        lune.io.eprint("lune: executed in {d} ns ({d:.3} ms)\n", .{ exec_ns, @as(f64, @floatFromInt(exec_ns)) / 1e6 });
+        mahina.io.eprint("mahina: executed in {d} ns ({d:.3} ms)\n", .{ exec_ns, @as(f64, @floatFromInt(exec_ns)) / 1e6 });
     }
 
     // --- JIT coverage output --- to stderr. `--jit-stats` prints the full block
@@ -479,12 +479,12 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // prints just the one-line summary, unless --jit-stats already covers it. The
     // chunk is still alive, so every anchor's `proto.name` is valid.
     if (topts.jit_stats) {
-        const w = lune.io.stderrWriter();
-        lune.trace.writeJitStats(w, &vm.trace, true) catch {};
+        const w = mahina.io.stderrWriter();
+        mahina.trace.writeJitStats(w, &vm.trace, true) catch {};
         w.flush() catch {};
     } else if (topts.jit_coverage) {
-        const w = lune.io.stderrWriter();
-        lune.trace.writeJitStats(w, &vm.trace, false) catch {};
+        const w = mahina.io.stderrWriter();
+        mahina.trace.writeJitStats(w, &vm.trace, false) catch {};
         w.flush() catch {};
     }
 
@@ -513,7 +513,7 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // alive, so every trace's `anchor.proto` (and its `id`) is valid.
     if (topts.emit_path) |path| {
         emitTraces(gpa, io, path, &vm) catch |err| {
-            lune.io.eprint("lune: error: --emit-traces '{s}': {s}\n", .{ path, @errorName(err) });
+            mahina.io.eprint("mahina: error: --emit-traces '{s}': {s}\n", .{ path, @errorName(err) });
             return 1;
         };
     }
@@ -523,7 +523,7 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // is valid. Independent of tracing.
     if (topts.keyframe_path) |path| {
         emitKeyframe(gpa, io, path, &vm) catch |err| {
-            lune.io.eprint("lune: error: --emit-keyframe '{s}': {s}\n", .{ path, @errorName(err) });
+            mahina.io.eprint("mahina: error: --emit-keyframe '{s}': {s}\n", .{ path, @errorName(err) });
             return 1;
         };
     }
@@ -532,7 +532,7 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // `record` mode, so `effect_log` holds every nondeterministic input in order.
     if (topts.effects_path) |path| {
         emitEffects(gpa, io, path, &vm) catch |err| {
-            lune.io.eprint("lune: error: --emit-effects '{s}': {s}\n", .{ path, @errorName(err) });
+            mahina.io.eprint("mahina: error: --emit-effects '{s}': {s}\n", .{ path, @errorName(err) });
             return 1;
         };
     }
@@ -541,7 +541,7 @@ fn runSource(gpa: std.mem.Allocator, io: lune.io.Io, name: []const u8, source: [
     // with `config.coverage` on, so the aggregate/per-anchor accounting is live.
     if (topts.coverage_path) |path| {
         emitCoverage(gpa, io, path, &vm) catch |err| {
-            lune.io.eprint("lune: error: --emit-coverage '{s}': {s}\n", .{ path, @errorName(err) });
+            mahina.io.eprint("mahina: error: --emit-coverage '{s}': {s}\n", .{ path, @errorName(err) });
             return 1;
         };
     }
@@ -606,7 +606,7 @@ fn hostArg(ctx: *anyopaque, i: i64) ?[]const u8 {
 /// owner, never two live buffers.
 const FsCtx = struct {
     gpa: std.mem.Allocator,
-    io: lune.io.Io,
+    io: mahina.io.Io,
     last: ?[]u8 = null,
 
     fn read(ctx: *anyopaque, path: []const u8) ?[]const u8 {
@@ -619,7 +619,7 @@ const FsCtx = struct {
             self.io,
             path,
             self.gpa,
-            lune.io.Io.Limit.limited(lune.io.max_source_bytes),
+            mahina.io.Io.Limit.limited(mahina.io.max_source_bytes),
         ) catch return null; // missing/unreadable/too-large → Lua's `cannot open`
         self.last = bytes;
         return bytes;
@@ -632,64 +632,64 @@ const FsCtx = struct {
 };
 
 /// Serialize a whole-VM keyframe snapshot to `path` (binschema wire format).
-fn emitKeyframe(gpa: std.mem.Allocator, io: lune.io.Io, path: []const u8, vm: *lune.interp.Vm) !void {
-    const bytes = try lune.keyframeser.encodeSnapshot(gpa, vm);
+fn emitKeyframe(gpa: std.mem.Allocator, io: mahina.io.Io, path: []const u8, vm: *mahina.interp.Vm) !void {
+    const bytes = try mahina.keyframeser.encodeSnapshot(gpa, vm);
     defer gpa.free(bytes);
-    try lune.io.writeFile(io, path, bytes);
-    lune.io.eprint("lune: wrote keyframe snapshot, {d} bytes → {s}\n", .{ bytes.len, path });
+    try mahina.io.writeFile(io, path, bytes);
+    mahina.io.eprint("mahina: wrote keyframe snapshot, {d} bytes → {s}\n", .{ bytes.len, path });
 }
 
 /// Serialize the recorded nondeterministic-input effect log to `path` (binschema
 /// wire format). Mirrors `emitKeyframe`; the VM must have run in `record` mode.
-fn emitEffects(gpa: std.mem.Allocator, io: lune.io.Io, path: []const u8, vm: *lune.interp.Vm) !void {
-    const bytes = try lune.effectser.encodeFile(gpa, vm.effect_log.items);
+fn emitEffects(gpa: std.mem.Allocator, io: mahina.io.Io, path: []const u8, vm: *mahina.interp.Vm) !void {
+    const bytes = try mahina.effectser.encodeFile(gpa, vm.effect_log.items);
     defer gpa.free(bytes);
-    try lune.io.writeFile(io, path, bytes);
-    lune.io.eprint("lune: wrote effect log, {d} effect(s), {d} bytes → {s}\n", .{ vm.effect_log.items.len, bytes.len, path });
+    try mahina.io.writeFile(io, path, bytes);
+    mahina.io.eprint("mahina: wrote effect log, {d} effect(s), {d} bytes → {s}\n", .{ vm.effect_log.items.len, bytes.len, path });
 }
 
 /// Serialize the JIT execution-coverage artifact to `path` (binschema wire format).
 /// Mirrors `emitTraces`; the VM must have run with `config.coverage` on (implied by
 /// `--emit-coverage`), else the aggregates/anchors are all zero.
-fn emitCoverage(gpa: std.mem.Allocator, io: lune.io.Io, path: []const u8, vm: *lune.interp.Vm) !void {
-    const bytes = try lune.coverageser.encodeState(gpa, &vm.trace);
+fn emitCoverage(gpa: std.mem.Allocator, io: mahina.io.Io, path: []const u8, vm: *mahina.interp.Vm) !void {
+    const bytes = try mahina.coverageser.encodeState(gpa, &vm.trace);
     defer gpa.free(bytes);
-    try lune.io.writeFile(io, path, bytes);
-    lune.io.eprint("lune: wrote JIT coverage, {d} anchor(s), {d} bytes → {s}\n", .{ vm.trace.coverage.count(), bytes.len, path });
+    try mahina.io.writeFile(io, path, bytes);
+    mahina.io.eprint("mahina: wrote JIT coverage, {d} anchor(s), {d} bytes → {s}\n", .{ vm.trace.coverage.count(), bytes.len, path });
 }
 
 /// Serialize the recorded trace cache to `path` (binschema wire format).
-fn emitTraces(gpa: std.mem.Allocator, io: lune.io.Io, path: []const u8, vm: *lune.interp.Vm) !void {
-    const bytes = try lune.traceser.encodeFile(gpa, vm.trace.cache.items);
+fn emitTraces(gpa: std.mem.Allocator, io: mahina.io.Io, path: []const u8, vm: *mahina.interp.Vm) !void {
+    const bytes = try mahina.traceser.encodeFile(gpa, vm.trace.cache.items);
     defer gpa.free(bytes);
-    try lune.io.writeFile(io, path, bytes);
-    lune.io.eprint("lune: wrote {d} trace(s), {d} bytes → {s}\n", .{ vm.trace.cache.items.len, bytes.len, path });
+    try mahina.io.writeFile(io, path, bytes);
+    mahina.io.eprint("mahina: wrote {d} trace(s), {d} bytes → {s}\n", .{ vm.trace.cache.items.len, bytes.len, path });
 }
 
 /// Disassemble every cached trace to stderr (for `--dump-traces`).
 /// Dump the recording abort log (`--dump-aborts`) to stderr: one aggregated row
 /// per `(anchor, reason, opcode)`, sorted by recurrence count. A program that
 /// stays on tier-0 names exactly which loop blocks tiering and why.
-fn dumpAborts(vm: *lune.interp.Vm) void {
-    const w = lune.io.stderrWriter();
+fn dumpAborts(vm: *mahina.interp.Vm) void {
+    const w = mahina.io.stderrWriter();
     const rows = vm.trace.abort_log.items;
     if (rows.len == 0) {
-        w.print("lune: no recording aborts\n", .{}) catch {};
+        w.print("mahina: no recording aborts\n", .{}) catch {};
     } else {
-        w.print("lune: {d} distinct recording-abort site(s)\n", .{rows.len}) catch {};
-        lune.trace.writeAborts(w, rows) catch {};
+        w.print("mahina: {d} distinct recording-abort site(s)\n", .{rows.len}) catch {};
+        mahina.trace.writeAborts(w, rows) catch {};
     }
     w.flush() catch {};
 }
 
-fn dumpTraces(vm: *lune.interp.Vm) void {
-    const w = lune.io.stderrWriter();
+fn dumpTraces(vm: *mahina.interp.Vm) void {
+    const w = mahina.io.stderrWriter();
     if (vm.trace.cache.items.len == 0) {
-        w.print("lune: no traces recorded\n", .{}) catch {};
+        w.print("mahina: no traces recorded\n", .{}) catch {};
     } else {
-        w.print("lune: {d} trace(s) recorded\n", .{vm.trace.cache.items.len}) catch {};
+        w.print("mahina: {d} trace(s) recorded\n", .{vm.trace.cache.items.len}) catch {};
         for (vm.trace.cache.items) |t| {
-            lune.trace.writeTrace(w, t) catch {};
+            mahina.trace.writeTrace(w, t) catch {};
         }
     }
     w.flush() catch {};
@@ -697,29 +697,29 @@ fn dumpTraces(vm: *lune.interp.Vm) void {
 
 /// Run the trace-opportunity detector on every cached trace and print findings to
 /// stderr (for `--trace-opportunities`).
-fn dumpOpportunities(vm: *lune.interp.Vm) void {
+fn dumpOpportunities(vm: *mahina.interp.Vm) void {
     const gpa = vm.gpa;
-    const w = lune.io.stderrWriter();
+    const w = mahina.io.stderrWriter();
     if (vm.trace.cache.items.len == 0) {
-        w.print("lune: (no traces — cannot run opportunity detector)\n", .{}) catch {};
+        w.print("mahina: (no traces — cannot run opportunity detector)\n", .{}) catch {};
         w.flush() catch {};
         return;
     }
 
     var total: usize = 0;
     for (vm.trace.cache.items) |t| {
-        const findings = lune.troptdiag.analyze(gpa, t) catch {
-            w.print("lune: error: opportunity analysis OOM\n", .{}) catch {};
+        const findings = mahina.troptdiag.analyze(gpa, t) catch {
+            w.print("mahina: error: opportunity analysis OOM\n", .{}) catch {};
             w.flush() catch {};
             return;
         };
-        defer lune.troptdiag.deinitFindings(gpa, findings);
+        defer mahina.troptdiag.deinitFindings(gpa, findings);
 
         w.print("trace {s}:{d}  waste opportunities:\n", .{ t.anchor.proto.name, t.anchor.pc }) catch {};
-        lune.troptdiag.writeFindings(w, t, findings) catch {};
+        mahina.troptdiag.writeFindings(w, t, findings) catch {};
         total += findings.len;
     }
-    w.print("lune: {d} waste signature(s) across {d} trace(s)\n", .{ total, vm.trace.cache.items.len }) catch {};
+    w.print("mahina: {d} waste signature(s) across {d} trace(s)\n", .{ total, vm.trace.cache.items.len }) catch {};
     w.flush() catch {};
 }
 
@@ -727,20 +727,20 @@ fn dumpOpportunities(vm: *lune.interp.Vm) void {
 /// `--dump-native`). Resolves each trace's `NativeState` (compiling any not yet
 /// attempted), then hexdumps the emitted machine code or reports that the trace
 /// fell outside the proven int/bool subset and runs on tier-1a.
-fn dumpNative(vm: *lune.interp.Vm) void {
-    const w = lune.io.stderrWriter();
+fn dumpNative(vm: *mahina.interp.Vm) void {
+    const w = mahina.io.stderrWriter();
     const items = vm.trace.cache.items;
     if (items.len == 0) {
-        w.print("lune: no traces recorded\n", .{}) catch {};
+        w.print("mahina: no traces recorded\n", .{}) catch {};
         w.flush() catch {};
         return;
     }
-    w.print("lune: native codegen for {d} trace(s)\n", .{items.len}) catch {};
+    w.print("mahina: native codegen for {d} trace(s)\n", .{items.len}) catch {};
     for (items, 0..) |t, i| {
         if (vm.trace.nativeFor(t)) |ct| {
             const code = ct.page.code;
             w.print("trace #{d}: compiled, {d} bytes of x86-64, inputs={d}/{d}\n", .{
-                i, code.len, t.inputs.len, lune.trace.MAX_TRACE_INPUTS,
+                i, code.len, t.inputs.len, mahina.trace.MAX_TRACE_INPUTS,
             }) catch {};
             var off: usize = 0;
             while (off < code.len) : (off += 16) {
@@ -751,7 +751,7 @@ fn dumpNative(vm: *lune.interp.Vm) void {
             }
         } else {
             w.print("trace #{d}: unsupported — runs on the tier-1a interpreter, inputs={d}/{d}\n", .{
-                i, t.inputs.len, lune.trace.MAX_TRACE_INPUTS,
+                i, t.inputs.len, mahina.trace.MAX_TRACE_INPUTS,
             }) catch {};
         }
     }
@@ -762,7 +762,7 @@ fn dumpNative(vm: *lune.interp.Vm) void {
 /// source line. v1 messages are static strings (see diag.zig).
 fn reportDiagnostics(name: []const u8, diags: *const Diagnostics) void {
     for (diags.list.items) |d| {
-        lune.io.eprint("{s}:{d}: {s}: {s}\n", .{
+        mahina.io.eprint("{s}:{d}: {s}: {s}\n", .{
             name,
             d.line,
             @tagName(d.severity),
@@ -775,5 +775,5 @@ test "cli smoke" {
     // Keep the CLI module's test target non-empty so `zig build test` covers it.
     // The end-to-end run path is covered by the interp/compiler test suites,
     // which exercise parse → compile → run against an in-memory output sink.
-    try std.testing.expectEqual(@as(u64, 5), lune.dispatch.run(5));
+    try std.testing.expectEqual(@as(u64, 5), mahina.dispatch.run(5));
 }

@@ -1,6 +1,6 @@
 -- @bench args="7" luajit=compatible name=nsieve
 -- Vendored verbatim from LuaJIT/bench/nsieve.lua (Computer Language
--- Benchmarks Game port). Only this header is lune-added.
+-- Benchmarks Game port). Only this header is mahina-added.
 
 local function nsieve(p, m)
   for i=2,m do p[i] = true end

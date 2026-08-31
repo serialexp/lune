@@ -1,4 +1,4 @@
-# lune — task runner. Thin wrappers over `zig build`; see CLAUDE.md for the
+# mahina — task runner. Thin wrappers over `zig build`; see CLAUDE.md for the
 # rules these encode. Run `just` with no args to list recipes.
 
 _default:
@@ -13,7 +13,7 @@ release:
     zig build -Doptimize=ReleaseFast
 
 # Run the unit-test gate. Depends on `build` so it also refreshes
-# zig-out/bin/lune (Debug) — otherwise a test-only run leaves the installed CLI
+# zig-out/bin/mahina (Debug) — otherwise a test-only run leaves the installed CLI
 # stale and you debug a binary that predates your changes (costs a few seconds,
 # saves a debugging detour).
 test: build
@@ -23,7 +23,7 @@ test: build
 run *args:
     zig build run -- {{args}}
 
-# NB: leaves zig-out/bin/lune as DEBUG — re-run `just release`/`just bench`
+# NB: leaves zig-out/bin/mahina as DEBUG — re-run `just release`/`just bench`
 # before timing anything afterward.
 # Hard-fail on Zig toolchain drift (CI).
 check-version:
@@ -41,7 +41,7 @@ bench *args: release
 #
 # TWO LEGS. The corpus is run under the ReleaseFast binary the refs describe AND
 # under a safety-checked Debug build (installed to its own prefix, since both
-# would otherwise be zig-out/bin/lune). The Debug leg is not redundant: it is the
+# would otherwise be zig-out/bin/mahina). The Debug leg is not redundant: it is the
 # only thing that exercises `std.debug.assert` and the `@enumFromInt` safety
 # check across all 84 configurations, and it is what finally caught two
 # memory-safety bugs that ReleaseFast had been sailing through. Both legs gate
@@ -49,14 +49,14 @@ bench *args: release
 # Regenerate deliberately (and say why in the commit): just hashgate --generate
 hashgate *args: release
     zig build --prefix zig-out-debug
-    python3 tools/hashgate.py --also-lune zig-out-debug/bin/lune {{args}}
+    python3 tools/hashgate.py --also-mahina zig-out-debug/bin/mahina {{args}}
 
 # Copy this tree to DEST for an A/B shadow build (baseline binaries), stripping
 # .zig-cache/zig-out so the shadow build can never reuse THIS tree's artifacts.
 # A copied cache once made the "pre" baseline a post-source binary and burned an
 # hour on a phantom regression (CURRENT_TASK LATEST-69). After this, restore the
 # baseline sources in DEST (`git show HEAD:<file> > <file>`), build there, and
-# verify the binary is really the baseline: `nm DEST/zig-out/bin/lune | grep
+# verify the binary is really the baseline: `nm DEST/zig-out/bin/mahina | grep
 # <new-symbol>` must come up empty.
 shadow dest:
     rm -rf {{dest}}

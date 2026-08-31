@@ -465,7 +465,7 @@ const Compiler = struct {
     }
 
     /// Emit a warning for every global *read* of a name that is never assigned
-    /// anywhere in the chunk and isn't a host builtin. In lune (Lua/Luau
+    /// anywhere in the chunk and isn't a host builtin. In mahina (Lua/Luau
     /// semantics) such a name is a `nil`-valued global, so it compiles fine and
     /// only errors at runtime when used — most often it's a typo for a local.
     /// This is a warning, not an error: a global may legitimately be defined by
@@ -1477,7 +1477,7 @@ const Compiler = struct {
     /// a newline it is dropped (Lua 5.4 §3.1: a `\r\n`/`\n\r`/`\r`/`\n` immediately
     /// after the opening bracket is not part of the string). The returned slice
     /// borrows `self.source`, which is fine — `stringConstant` interns (copies) it
-    /// immediately. UTF-8 validated like every lune string literal.
+    /// immediately. UTF-8 validated like every mahina string literal.
     fn decodeLongString(self: *Compiler, raw: []const u8, span: ast.Span) Error![]const u8 {
         std.debug.assert(raw[0] == '[');
         var level: usize = 0;

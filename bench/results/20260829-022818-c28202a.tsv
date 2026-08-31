@@ -1,5 +1,5 @@
-# lune bench suite  rev=c28202a  stamp=20260829-022818  reps=5  scale=1.0
-program	args	luajit_mode	cross	luajit_match	lune_t0_ms	lune_jit_ms	luajit_ms	lune_t0_execns	lune_jit_execns	lune_t0_maxrss_kb	lune_jit_maxrss_kb	luajit_maxrss_kb
+# mahina bench suite  rev=c28202a  stamp=20260829-022818  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	mahina_t0_ms	mahina_jit_ms	luajit_ms	mahina_t0_execns	mahina_jit_execns	mahina_t0_maxrss_kb	mahina_jit_maxrss_kb	luajit_maxrss_kb
 field_hash	20000000	-	ok	ok	936.162	13.083	8.035	936013875	12600270	1788	2784	2524
 grid_matmul	200	-	ok	ok	253.897	37.182	7.038	286967997	37442755	2312	6832	3524
 grid_matmul_f64	200	-	ok	ok	257.954	29.169	7.072	262558328	28984723	5384	6064	3520

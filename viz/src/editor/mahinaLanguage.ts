@@ -1,9 +1,9 @@
-// The lune editor mode: syntax highlighting keyed to the *real* lexer
+// The mahina editor mode: syntax highlighting keyed to the *real* lexer
 // (src/lexer.zig) and token set (src/token.zig), not a borrowed Lua grammar.
 //
-// Why our own mode and not @codemirror/legacy-modes/mode/lua: lune is
+// Why our own mode and not @codemirror/legacy-modes/mode/lua: mahina is
 // "Lua-shaped but not Lua." Today the keyword set happens to match classic Lua,
-// but lune supports `--[[ ]]` block *comments* while it has NO `[[ ]]` long
+// but mahina supports `--[[ ]]` block *comments* while it has NO `[[ ]]` long
 // *string* literals (deferred in the lexer), so a stock Lua grammar would
 // mis-highlight `[[ … ]]` as a string. Keeping the keyword + builtin lists here,
 // derived from the Zig source, makes this the single seam where the highlighter
@@ -23,7 +23,7 @@ const KEYWORDS = new Set([
  *  custom-vocabulary extension point: add a native here when it lands. */
 const BUILTINS = new Set(["print", "clock"]);
 
-interface LuneState {
+interface MahinaState {
   /** True when a `--[[ … ]]` block comment is still open across line breaks. */
   inBlockComment: boolean;
 }
@@ -43,8 +43,8 @@ function consumeString(stream: { eol(): boolean; next(): string | void }, quote:
   }
 }
 
-const luneParser: StreamParser<LuneState> = {
-  name: "lune",
+const mahinaParser: StreamParser<MahinaState> = {
+  name: "mahina",
   startState: () => ({ inBlockComment: false }),
   token(stream, state) {
     // Continuation of a multi-line block comment.
@@ -114,14 +114,14 @@ const luneParser: StreamParser<LuneState> = {
   },
 };
 
-/** The lune language extension (highlighting only; the linter is separate). */
-export function luneLanguage(): Extension {
-  return StreamLanguage.define(luneParser);
+/** The mahina language extension (highlighting only; the linter is separate). */
+export function mahinaLanguage(): Extension {
+  return StreamLanguage.define(mahinaParser);
 }
 
 /** A dark highlight style matching the viz UI palette. StreamLanguage maps the
  *  legacy token names above to these tags ("builtin" → standard(variableName)). */
-export const luneHighlighting: Extension = syntaxHighlighting(
+export const mahinaHighlighting: Extension = syntaxHighlighting(
   HighlightStyle.define([
     { tag: t.keyword, color: "#c678dd" },
     { tag: t.comment, color: "#7f848e", fontStyle: "italic" },

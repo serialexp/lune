@@ -1,11 +1,11 @@
-// Cross-language fixture test: a .lunetrace encoded by the Zig VM
-// (lune --emit-traces) must decode in TypeScript to the same structure.
+// Cross-language fixture test: a .mahinatrace encoded by the Zig VM
+// (mahina --emit-traces) must decode in TypeScript to the same structure.
 // This is the Zig-encode ↔ TS-decode proof for the binschema wire format.
 //
-// The fixture is committed (viz/fixtures/counting-loop.lunetrace); regenerate it
+// The fixture is committed (viz/fixtures/counting-loop.mahinatrace); regenerate it
 // with:
-//   zig build && ./zig-out/bin/lune --emit-traces \
-//       viz/fixtures/counting-loop.lunetrace viz/fixtures/counting-loop.lua
+//   zig build && ./zig-out/bin/mahina --emit-traces \
+//       viz/fixtures/counting-loop.mahinatrace viz/fixtures/counting-loop.lua
 
 import { test, expect } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -14,7 +14,7 @@ import { decodeTraceFile } from "../src/decode";
 import { traceToView, traceToText } from "../src/disasm";
 import { irOpName } from "../src/enums";
 
-const fixturePath = fileURLToPath(new URL("../fixtures/counting-loop.lunetrace", import.meta.url));
+const fixturePath = fileURLToPath(new URL("../fixtures/counting-loop.mahinatrace", import.meta.url));
 const bytes = new Uint8Array(readFileSync(fixturePath));
 
 test("decodes the fixture header + trace count", () => {

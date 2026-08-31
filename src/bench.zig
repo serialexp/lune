@@ -19,9 +19,9 @@
 //! the optimizer is proven by the test suite, not here.
 
 const std = @import("std");
-const lune = @import("lune");
+const mahina = @import("mahina");
 
-const Vm = lune.interp.Vm;
+const Vm = mahina.interp.Vm;
 
 const Bench = struct { name: []const u8, source: [:0]const u8 };
 
@@ -73,9 +73,9 @@ fn timeRun(gpa: std.mem.Allocator, io: std.Io, source: [:0]const u8, enabled: bo
     var best: u64 = std.math.maxInt(u64);
     var r: usize = 0;
     while (r < reps) : (r += 1) {
-        var diags = lune.diag.Diagnostics.init(gpa);
+        var diags = mahina.diag.Diagnostics.init(gpa);
         defer diags.deinit();
-        var tree = try lune.parser.parse(gpa, source, &diags);
+        var tree = try mahina.parser.parse(gpa, source, &diags);
         defer tree.deinit();
 
         var vm = try Vm.init(gpa);
@@ -85,10 +85,10 @@ fn timeRun(gpa: std.mem.Allocator, io: std.Io, source: [:0]const u8, enabled: bo
         vm.trace.config.optimize = optimize;
         vm.trace.config.native_codegen = native;
         var sink_buf: [64]u8 = undefined;
-        var sink = lune.io.Writer.fixed(&sink_buf);
+        var sink = mahina.io.Writer.fixed(&sink_buf);
         vm.out = &sink;
 
-        var chunk = try lune.compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        var chunk = try mahina.compiler.compile(gpa, vm.heap, source, tree.root, &diags);
         defer chunk.deinit();
 
         const start = std.Io.Timestamp.now(io, .awake);
@@ -103,9 +103,9 @@ fn timeRun(gpa: std.mem.Allocator, io: std.Io, source: [:0]const u8, enabled: bo
 /// Instruction count of the first cached trace after one record+execute run with
 /// the optimizer in the requested state (0 if no trace was recorded).
 fn traceInstrCount(gpa: std.mem.Allocator, source: [:0]const u8, optimize: bool) !usize {
-    var diags = lune.diag.Diagnostics.init(gpa);
+    var diags = mahina.diag.Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune.parser.parse(gpa, source, &diags);
+    var tree = try mahina.parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     var vm = try Vm.init(gpa);
@@ -114,10 +114,10 @@ fn traceInstrCount(gpa: std.mem.Allocator, source: [:0]const u8, optimize: bool)
     vm.trace.config.execute = true;
     vm.trace.config.optimize = optimize;
     var sink_buf: [64]u8 = undefined;
-    var sink = lune.io.Writer.fixed(&sink_buf);
+    var sink = mahina.io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune.compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina.compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     _ = try vm.run(chunk.proto);
 
@@ -133,8 +133,8 @@ pub fn main(init: std.process.Init) u8 {
     const gpa = init.gpa;
     const io = init.io;
 
-    lune.io.print(
-        \\lune trace-optimizer benchmark (best of {d} runs; Vm.run only)
+    mahina.io.print(
+        \\mahina trace-optimizer benchmark (best of {d} runs; Vm.run only)
         \\
         \\{s: <30} {s: >8} {s: >8} {s: >10} {s: >10} {s: >10} {s: >10}
         \\
@@ -149,12 +149,12 @@ pub fn main(init: std.process.Init) u8 {
         // Native vs tier-1a speedup (∞-guarded; tier-1b that fell back to 1a ≈ 1.0×).
         const speedup: f64 = if (t1b == 0) 0 else @as(f64, @floatFromInt(t1a)) / @as(f64, @floatFromInt(t1b));
 
-        lune.io.print("{s: <30} {d: >8} {d: >8} {d: >10.3} {d: >10.3} {d: >10.3} {d: >9.2}x\n", .{
+        mahina.io.print("{s: <30} {d: >8} {d: >8} {d: >10.3} {d: >10.3} {d: >10.3} {d: >9.2}x\n", .{
             bch.name, raw, opt, ms(t0), ms(t1a), ms(t1b), speedup,
         });
     }
 
-    lune.io.print(
+    mahina.io.print(
         \\
         \\ir(raw)/ir(opt): IR instructions per traced loop body before/after the
         \\optimizer (lower = fewer dispatches/iteration). 1a-opt = tier-1a executor
@@ -166,6 +166,6 @@ pub fn main(init: std.process.Init) u8 {
 }
 
 fn fail(e: anyerror) u8 {
-    lune.io.eprint("bench: error: {s}\n", .{@errorName(e)});
+    mahina.io.eprint("bench: error: {s}\n", .{@errorName(e)});
     return 1;
 }

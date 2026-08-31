@@ -162,7 +162,7 @@ test "determinism: two independent runs agree on output, traces, and snapshots" 
         \\config = {}
         \\config.width = 64
         \\config.height = 48
-        \\config.name = "lune"
+        \\config.name = "mahina"
         \\alpha = 1
         \\beta = 2
         \\gamma = 3
@@ -276,7 +276,7 @@ test "determinism: two independent runs agree on output, traces, and snapshots" 
         \\end
         \\total = total + #log
         \\print(total)
-        \\print(("lune"):upper())
+        \\print(("mahina"):upper())
         ,
         // _G (the global environment self-reference): write and read globals
         // through `_G` in a hot loop, then chase the self-edge (`_G._G._G…`). The

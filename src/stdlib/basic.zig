@@ -1,4 +1,4 @@
-//! lune stdlib — the basic-library scalar helpers `type`, `tostring`,
+//! mahina stdlib — the basic-library scalar helpers `type`, `tostring`,
 //! `tonumber`, `select`, `rawequal`/`rawget`/`rawset`/`rawlen`, plus the
 //! string-returning `math.type` and the pure `os.difftime`.
 //!

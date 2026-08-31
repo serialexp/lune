@@ -1,4 +1,4 @@
-# lune — Native Codegen (tier 1b)
+# mahina — Native Codegen (tier 1b)
 
 Status: Phase 8 **cut 3** implemented — a hand-rolled x86-64 encoder + a
 prove-typed-or-bail integer/boolean trace compiler with **register allocation +
@@ -212,7 +212,7 @@ results that change each iteration, so they **stay in the body**.
 
 ### Why one snapshot is valid at every guard
 
-LuaJIT snapshots before *every* guard because it mutates in place. Lune doesn't need
+LuaJIT snapshots before *every* guard because it mutates in place. Mahina doesn't need
 to: `irinterp.zig` writes `regs[]` **only at the `loop` commit**, and on *any*
 mid-iteration guard fail returns with `regs[]` untouched since the iteration began
 (tier-0 re-runs the **pure, side-effect-free** partial iteration from `anchor.pc`).
@@ -540,7 +540,7 @@ compiles to one 443-byte native function. Output is bit-identical across all fou
 **and to LuaJIT** (`leibniz(2e6) == 3.141592153589724`, `0x1.921fb11284dfap+1`). Timings
 (best-of-3, N=50 M): tier-0 **3.06 s**, tier-1a **3.36 s**, **tier-1b 0.39 s** (≈7.8× over
 tier-0), LuaJIT **0.03 s**. The LuaJIT gap is wider than on the int loops — it hoists the
-loop-invariant reciprocal and strength-reduces the `2k+1`, neither of which lune's
+loop-invariant reciprocal and strength-reduces the `2k+1`, neither of which mahina's
 single-block trace does yet.
 
 > **Deferred (still bail to tier-1a):** `pow` (libm), `mod`/`idiv` on floats

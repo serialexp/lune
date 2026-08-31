@@ -1,4 +1,4 @@
-# lune — multi-store sinking (FFT butterfly) — Design
+# mahina — multi-store sinking (FFT butterfly) — Design
 
 Status: complete — implemented (2026-06-22), extended 2026-08-16 (array-load
 forwarding, `0e311f9`) and 2026-08-20 (hash-load classification, §below; codex

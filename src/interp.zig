@@ -98,7 +98,7 @@ pub const Error = error{
     FsUnavailable,
     /// Allocation failure (register stack, future heap).
     OutOfMemory,
-    /// A lune program raised a VALUE via `error(obj)`/`assert` (or a runtime fault
+    /// A mahina program raised a VALUE via `error(obj)`/`assert` (or a runtime fault
     /// re-raised through a protected boundary). The value itself rides
     /// `Vm.pending_error`; this Zig tag is only the unwinding signal. Caught by
     /// `pcall`/`xpcall`, which read+clear `pending_error`.
@@ -234,7 +234,7 @@ pub const ModuleConst = function.ModuleConst;
 /// `base_constants`).
 /// The value of the bare global `_VERSION`. A fixed, deterministic string (it is
 /// observable program output, so it must never derive from a runtime/host source).
-pub const lune_version = "lune 0.0.0";
+pub const mahina_version = "mahina 0.0.0";
 
 pub const base_natives = core_natives ++ stdmath.natives ++ stdtable.natives ++
     stdbase.natives ++ stdbasic.natives ++ stdstring.natives ++ stderrors.natives ++
@@ -261,7 +261,7 @@ const core_natives = [_]BaseNative{
     // `warn` is a pure host output to stderr (no effect, like `print`); the `@on`/
     // `@off` control state lives in `Vm.warn_enabled`.
     .{ .name = "warn", .func = &nativeWarn },
-    // `os.clock` (float seconds) + `os.nsclock` (int nanoseconds, a lune extension)
+    // `os.clock` (float seconds) + `os.nsclock` (int nanoseconds, a mahina extension)
     // share the `.clock` effect. `.name` stays bare (`clock`/`nsclock`) — the
     // serialized keyframe identity; `.module`/`.field` only drive table install,
     // exactly as `math.random` did. This drops the flat `clock` global and makes
@@ -501,7 +501,7 @@ const MetamethodNames = struct {
     bnot: Value = Value.nil(),
     shl: Value = Value.nil(),
     shr: Value = Value.nil(),
-    /// `"__sar"` — `a ~>> b` (arithmetic right shift; lune extension).
+    /// `"__sar"` — `a ~>> b` (arithmetic right shift; mahina extension).
     sar: Value = Value.nil(),
     // -- chunk 2b: other operators --
     /// `"__concat"` — `a .. b` when an operand is not a string/number.
@@ -1149,7 +1149,7 @@ pub const Vm = struct {
         // `_VERSION` — a bare global string (Lua seeds its own value here). A
         // normal interned heap string in `globals`, so it serializes/restores
         // through the keyframe path with no special-casing.
-        try self.globals.set(self.gpa, try self.heap.internValue("_VERSION"), try self.heap.internValue(lune_version));
+        try self.globals.set(self.gpa, try self.heap.internValue("_VERSION"), try self.heap.internValue(mahina_version));
         // `_G` — the global environment exposed as a global referencing *itself*
         // (Lua's reflective handle: `_G[name]`, `_G.x = v`, `pairs(_G)`). The
         // globals table is an ordinary heap table (id 0), so this is just one more
@@ -1662,12 +1662,12 @@ pub const Vm = struct {
             self.trace.setRegionContext(new_depth, self.frames[new_depth - 1].call_seq);
     }
 
-    /// Call a lune callable from native (host) code, run it to completion, write up
+    /// Call a mahina callable from native (host) code, run it to completion, write up
     /// to `results_out.len` results into `results_out`, and return the count
     /// actually written. `callee` must be a closure or native `Value` (else
     /// `TypeError`). This is the keystone reentrancy primitive: a native that holds
     /// `*Vm` via its ctx (`pcall`/`xpcall`, the `table.sort` comparator, `gsub`
-    /// function-replacement) drives a lune function and gets its results back.
+    /// function-replacement) drives a mahina function and gets its results back.
     ///
     /// It runs a **depth-bounded** nested dispatch (`execWith(entry_depth + 1)`)
     /// that returns the instant the nested top frame returns. It mutates only
@@ -4308,7 +4308,7 @@ pub const Vm = struct {
     /// `a == b` with `__eq` fallback. Raw/primitive equality (`arith.eq`, which
     /// includes table identity) wins first. `__eq` is consulted **only** when
     /// both operands are tables and raw-unequal (Lua restricts it to same-type
-    /// table/userdata pairs; lune has only tables). The handler result is taken
+    /// table/userdata pairs; mahina has only tables). The handler result is taken
     /// for truthiness.
     fn valuesEqual(self: *Vm, a: Value, b: Value) Error!bool {
         if (arith.eq(a, b)) return true;
@@ -4787,7 +4787,7 @@ fn firstNonNumber(x: Value, y: Value) Value {
 }
 
 /// The operand a bitwise op couldn't use: the first that is not an integer. A
-/// float counts as non-integer here — lune's bitwise ops require integer operands
+/// float counts as non-integer here — mahina's bitwise ops require integer operands
 /// and (deliberately) do not coerce even integral-valued floats.
 fn firstNonInteger(x: Value, y: Value) Value {
     return if (!x.isInt()) x else y;
@@ -4801,7 +4801,7 @@ fn bitwiseFaultMessage(arena: std.mem.Allocator, bad: Value) std.mem.Allocator.E
     return std.fmt.allocPrint(arena, "attempt to perform bitwise operation on a {s} value", .{bad.typeName()});
 }
 
-/// For a concatenation fault, the operand lune's `concat` couldn't coerce —
+/// For a concatenation fault, the operand mahina's `concat` couldn't coerce —
 /// anything that is neither a number nor a string.
 fn firstNonConcatable(x: Value, y: Value) Value {
     return if (!concatable(x)) x else y;
@@ -5018,7 +5018,7 @@ fn nativeClock(ctx: *anyopaque, args: []const Value) anyerror!Value {
     return Value.float(@as(f64, @floatFromInt(src.nowNs(src.ctx))) / 1e9);
 }
 
-/// `os.nsclock()` — a lune extension (no Lua equivalent): the same host monotonic
+/// `os.nsclock()` — a mahina extension (no Lua equivalent): the same host monotonic
 /// clock as `os.clock`, but returned as **integer nanoseconds** for high-resolution
 /// timing. Shares `EffectKind.clock`; the recorded result is the int ns. Mixing
 /// `os.clock` (float) and `os.nsclock` (int) in one run interleaves float/int
@@ -5078,7 +5078,7 @@ fn randIntArg(vm: *Vm, args: []const Value, i: usize) Error!i64 {
 ///     integer (all 64 bits);
 ///   - two args `m,n` → integer in `[m,n]` inclusive (`m > n` is "interval is
 ///     empty", a bad-argument error).
-/// lune is Lua-*shaped*, not stream-compatible: the distribution matches PUC's
+/// mahina is Lua-*shaped*, not stream-compatible: the distribution matches PUC's
 /// (uniform via `projectU64`) but the byte sequence does not (different engine).
 fn nativeRandom(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm: *Vm = @ptrCast(@alignCast(ctx));
@@ -5124,7 +5124,7 @@ fn nativeRandom(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// draws one fresh seed from the host entropy source through the `.random_seed`
 /// record/replay boundary (`obtainRandomSeed`) — exactly like `random()`'s lazy
 /// seed, so the entropy form is recorded and replayed for free, and is
-/// `RandomUnavailable` when no source is injected. lune's Xoshiro256 takes a single
+/// `RandomUnavailable` when no source is injected. mahina's Xoshiro256 takes a single
 /// `u64` seed (not PUC's two words), so this returns the one seed actually used.
 fn nativeRandomseed(ctx: *anyopaque, args: []const Value) anyerror!Value {
     const vm: *Vm = @ptrCast(@alignCast(ctx));
@@ -5202,7 +5202,7 @@ fn nativePrint(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// beginning with `@` is a control message — recognized even while warnings are
 /// off, so `@on` can re-enable: `@off` stops emission, `@on` restarts, any other
 /// `@…` is ignored. Otherwise, when enabled, the string arguments are concatenated
-/// and emitted as one line, prefixed `lune warning: `, to stderr (`Vm.err`, or the
+/// and emitted as one line, prefixed `mahina warning: `, to stderr (`Vm.err`, or the
 /// process stderr). Pure output, NOT a recorded effect (like `print`): the call is
 /// a trace barrier and is never replayed, so it carries no `EffectKind`.
 fn nativeWarn(ctx: *anyopaque, args: []const Value) anyerror!Value {
@@ -5242,10 +5242,10 @@ fn nativeWarn(ctx: *anyopaque, args: []const Value) anyerror!Value {
     return Value.nil();
 }
 
-/// Write one assembled `lune warning: <args…>\n` line. Split out so `nativeWarn`
+/// Write one assembled `mahina warning: <args…>\n` line. Split out so `nativeWarn`
 /// can treat the whole emission as a single best-effort unit (`catch {}`).
 fn emitWarning(w: *io.Writer, args: []const Value) !void {
-    try w.writeAll("lune warning: ");
+    try w.writeAll("mahina warning: ");
     for (args) |a| try w.writeAll(strBytes(a).?);
     try w.writeAll("\n");
 }

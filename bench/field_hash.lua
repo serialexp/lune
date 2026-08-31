@@ -12,10 +12,10 @@
 -- it isolates the hash-field path with nothing else to abort on.
 --
 -- Run head-to-head:
---   lune                 bench/field_hash.lua 20000000   # tier-0 (bytecode interp)
---   lune --trace         bench/field_hash.lua 20000000   # tier-1a (IR interp)
---   lune --jit-native    bench/field_hash.lua 20000000   # tier-1b (native x64)
---   lune --dump-native   bench/field_hash.lua 20000000   # confirm the trace compiles
+--   mahina                 bench/field_hash.lua 20000000   # tier-0 (bytecode interp)
+--   mahina --trace         bench/field_hash.lua 20000000   # tier-1a (IR interp)
+--   mahina --jit-native    bench/field_hash.lua 20000000   # tier-1b (native x64)
+--   mahina --dump-native   bench/field_hash.lua 20000000   # confirm the trace compiles
 --   luajit               bench/field_hash.lua 20000000   # reference
 -- Output is byte-identical across all four (and to LuaJIT).
 --

@@ -62,13 +62,13 @@ number the interpreter itself is about to consume, and CALLM collapses into
 the fixed-arity CALL path. `BC_RETM` does the same for returns. The resolved
 count is baked into the trace. (This citation establishes the live-top
 *resolution mechanism* only; the invariance argument that makes baking the
-count sound is lune's own, in §6.)
+count sound is mahina's own, in §6.)
 
-lune's dispatch has the same window — the mirror records each instruction
+mahina's dispatch has the same window — the mirror records each instruction
 *before* tier-0 executes it (`interp.zig` ~2172), so at the consumer,
 `vm.reg_top`/`reg_top_pending` are live. But we do **not** need the VM
 channel at all: unlike LuaJIT (whose recorder tolerates producers it models
-loosely), every lune producer that can precede a recordable consumer was
+loosely), every mahina producer that can precede a recordable consumer was
 *itself just recorded* — the recorder already knows exactly how many values
 it produced and where. A recorder-local shadow of the producer/consumer
 handshake is therefore complete, needs no new `*Vm` plumbing, and keeps the
@@ -248,7 +248,7 @@ pending producer at a time ("only the tail position is variadic" —
 The hazard to rule out: a guard emitted while recording the consumer fails at
 runtime, tier-0 resumes at the consumer's pc, re-executes
 `call b=all_results`, and reads a `vm.reg_top` nothing set → garbage nargs.
-LuaJIT needs `J->needsnap` machinery for exactly this class. **lune needs
+LuaJIT needs `J->needsnap` machinery for exactly this class. **mahina needs
 nothing**, for two independent structural reasons:
 
 1. **Coherent-anchor resumption.** Every trace-execution return supplies

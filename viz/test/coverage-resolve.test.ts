@@ -8,7 +8,7 @@
 import { test, expect } from "bun:test";
 import { resolveCoverageLines, aggregateCoverage, timeSplitOf } from "../src/store";
 import type { CoverageAnchorOutput, CoverageFileOutput } from "../src/decode";
-import type { ProtoDisasm } from "../src/wasm/lune";
+import type { ProtoDisasm } from "../src/wasm/mahina";
 
 /** A CoverageAnchor with sane defaults; override what a test cares about. */
 function anchor(o: Partial<CoverageAnchorOutput> & { proto_id: number; pc: number }): CoverageAnchorOutput {

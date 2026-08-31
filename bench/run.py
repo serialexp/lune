@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""lune benchmark-suite runner.
+"""mahina benchmark-suite runner.
 
 Discovers every `bench/**/*.lua` program carrying a `-- @bench` metadata line,
-runs it across lune's execution tiers (tier-0 bytecode, tier-1a IR-interp,
+runs it across mahina's execution tiers (tier-0 bytecode, tier-1a IR-interp,
 tier-1b native) and — where the program stays inside LuaJIT's stdlib surface —
 against LuaJIT, and reports two things at once:
 
-  * correctness — do all of lune's tiers agree byte-for-byte (the determinism
-    property), and does lune match LuaJIT where parity is claimed; and
+  * correctness — do all of mahina's tiers agree byte-for-byte (the determinism
+    property), and does mahina match LuaJIT where parity is claimed; and
   * how far behind LuaJIT we are — best-of-N wall-clock per engine plus the
-    lune/LuaJIT slowdown ratio, and peak memory (kernel max RSS) per engine
+    mahina/LuaJIT slowdown ratio, and peak memory (kernel max RSS) per engine
     from dedicated non-timed runs.
 
 Each run also appends a row-per-program TSV under bench/results/ (timestamped +
@@ -21,13 +21,13 @@ Metadata line (anywhere in the file):
     -- @bench args="poison"   luajit=skip      name=repack
 
   args=       literal argv passed to the program (space-split; may be empty)
-  luajit=     compatible → diff lune vs LuaJIT and time both;
-              skip       → lune-only (5.4 surface LuaJIT lacks); cross-tier only
+  luajit=     compatible → diff mahina vs LuaJIT and time both;
+              skip       → mahina-only (5.4 surface LuaJIT lacks); cross-tier only
   luajit_src= optional alternate source (path relative to this file) that LuaJIT
-              runs instead of this file, for when the lune file uses 5.4 syntax
+              runs instead of this file, for when the mahina file uses 5.4 syntax
               LuaJIT can't parse (e.g. native bitwise operators) but a
               semantically-equivalent LuaJIT-idiomatic source (the bit.* original)
-              gives byte-identical output. lune always runs this file.
+              gives byte-identical output. mahina always runs this file.
   name=       optional display name (defaults to the path stem)
 
 Usage:
@@ -39,7 +39,7 @@ Usage:
     python3 bench/run.py --no-save       # don't write a results TSV
     python3 bench/run.py --json out.json # also emit the rows as JSON
 
-Assumes lune is built ReleaseFast:  zig build -Doptimize=ReleaseFast
+Assumes mahina is built ReleaseFast:  zig build -Doptimize=ReleaseFast
 """
 
 import argparse
@@ -53,14 +53,14 @@ import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_LUNE = os.path.join(ROOT, "zig-out", "bin", "lune")
+DEFAULT_MAHINA = os.path.join(ROOT, "zig-out", "bin", "mahina")
 DEFAULT_LUAJIT = os.path.expanduser("~/Projects/LuaJIT/src/luajit")
 
 META_RE = re.compile(r"@bench\b(.*)$", re.MULTILINE)
 KV_RE = re.compile(r'(\w+)\s*=\s*(?:"([^"]*)"|(\S+))')
 EXECNS_RE = re.compile(r"executed in (\d+) ns")
 
-# Lune tiers, as (label, extra-flags-before-the-script).
+# Mahina tiers, as (label, extra-flags-before-the-script).
 TIERS = {
     "t0": [],                 # tier-0 bytecode interpreter (no JIT)
     "trace": ["--trace"],     # tier-1a IR-interpreter
@@ -75,9 +75,9 @@ class Bench:
         self.argv = argv          # list[str]
         self.luajit = luajit      # "compatible" | "skip"
         # Optional alternate source run on LuaJIT instead of `path`. Used when the
-        # lune file uses 5.4 syntax LuaJIT (5.1) can't parse — e.g. native bitwise
+        # mahina file uses 5.4 syntax LuaJIT (5.1) can't parse — e.g. native bitwise
         # operators — but a semantically-equivalent LuaJIT-idiomatic source (the
-        # `bit.*` original) produces byte-identical output. lune still runs `path`.
+        # `bit.*` original) produces byte-identical output. mahina still runs `path`.
         self.luajit_src = luajit_src
 
     def lj_path(self):
@@ -123,7 +123,7 @@ def scale_argv(argv, scale):
 
 
 def run_once(cmd, want_time=False, cwd=None):
-    """Run a command, returning (rc, stdout, exec_ns|None). exec_ns is lune's
+    """Run a command, returning (rc, stdout, exec_ns|None). exec_ns is mahina's
     execute-only nanoseconds parsed from --time stderr, when want_time. `cwd` runs
     the child from that directory (so a bench's `require("x")` resolves `./x.lua`,
     like LuaJIT's run.sh which cd's into the bench dir); the bench path is
@@ -154,7 +154,7 @@ TIME_BIN = "/usr/bin/time"  # GNU time; `%M` = child peak RSS in KB
 
 def mem_best(cmd, reps, cwd=None):
     """Best-of-N (min) peak RSS in KB via a GNU `/usr/bin/time -f %M` trampoline
-    — engine-agnostic, so lune and LuaJIT are measured identically. These are
+    — engine-agnostic, so mahina and LuaJIT are measured identically. These are
     dedicated runs, deliberately separate from the timing reps: memory numbers
     never come from a timed process and vice versa.
 
@@ -200,13 +200,13 @@ def git_rev():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="lune benchmark-suite runner")
+    ap = argparse.ArgumentParser(description="mahina benchmark-suite runner")
     ap.add_argument("--filter", default="", help="only run programs whose name contains this")
     ap.add_argument("--reps", type=int, default=5, help="best-of-N timing reps (default 5)")
     ap.add_argument("--mem-reps", type=int, default=3,
                     help="best-of-N dedicated memory (max-RSS) reps (default 3)")
     ap.add_argument("--scale", type=float, default=1.0, help="scale first integer arg")
-    ap.add_argument("--lune", default=os.environ.get("LUNE", DEFAULT_LUNE))
+    ap.add_argument("--mahina", default=os.environ.get("MAHINA", DEFAULT_MAHINA))
     ap.add_argument("--luajit", default=os.environ.get("LUAJIT", DEFAULT_LUAJIT))
     ap.add_argument("--no-luajit", action="store_true", help="skip LuaJIT comparison")
     ap.add_argument("--no-save", action="store_true", help="do not write a results TSV")
@@ -216,8 +216,8 @@ def main():
                     help="also write the rows as JSON (machine-readable twin of the TSV)")
     args = ap.parse_args()
 
-    if not os.path.exists(args.lune):
-        sys.exit(f"lune binary not found at {args.lune}\n  build it: zig build -Doptimize=ReleaseFast")
+    if not os.path.exists(args.mahina):
+        sys.exit(f"mahina binary not found at {args.mahina}\n  build it: zig build -Doptimize=ReleaseFast")
     have_lj = (not args.no_luajit) and os.path.exists(args.luajit)
     if not args.no_luajit and not have_lj:
         print(f"note: LuaJIT not found at {args.luajit} — parity columns skipped\n", file=sys.stderr)
@@ -227,7 +227,7 @@ def main():
         sys.exit("no @bench programs found")
 
     rows = []
-    print(f"lune  = {args.lune}")
+    print(f"mahina  = {args.mahina}")
     print(f"luajit= {args.luajit if have_lj else '(disabled)'}")
     print(f"reps  = {args.reps}   scale = {args.scale}\n")
     hdr = (f"{'program':<16} {'cross':<7} {'luajit':<7} "
@@ -245,7 +245,7 @@ def main():
         outs = {}
         rc_bad = None
         for tier, flags in TIERS.items():
-            rc, out, err, _ = run_once([args.lune, *flags, b.path, *b.argv], cwd=bench_dir)
+            rc, out, err, _ = run_once([args.mahina, *flags, b.path, *b.argv], cwd=bench_dir)
             outs[tier] = out
             if rc != 0 and rc_bad is None:
                 rc_bad = (tier, short(err or out))
@@ -268,19 +268,19 @@ def main():
         elif b.luajit == "compatible" and not have_lj:
             lj_status = "n/a"
 
-        # --- timing: best-of-N wall per engine + lune exec-only ns ---
-        t0_ms = time_best([args.lune, b.path, *b.argv], args.reps, cwd=bench_dir)
-        jit_ms = time_best([args.lune, "--jit-native", b.path, *b.argv], args.reps, cwd=bench_dir)
+        # --- timing: best-of-N wall per engine + mahina exec-only ns ---
+        t0_ms = time_best([args.mahina, b.path, *b.argv], args.reps, cwd=bench_dir)
+        jit_ms = time_best([args.mahina, "--jit-native", b.path, *b.argv], args.reps, cwd=bench_dir)
         lj_ms = None
         if b.luajit == "compatible" and have_lj:
             lj_ms = time_best([args.luajit, b.lj_path(), *b.argv], args.reps, cwd=bench_dir)
-        # secondary: lune execute-only ns (parsed from --time)
-        _, _, _, execns_t0 = run_once([args.lune, "--time", b.path, *b.argv], want_time=True, cwd=bench_dir)
-        _, _, _, execns_jit = run_once([args.lune, "--time", "--jit-native", b.path, *b.argv], want_time=True, cwd=bench_dir)
+        # secondary: mahina execute-only ns (parsed from --time)
+        _, _, _, execns_t0 = run_once([args.mahina, "--time", b.path, *b.argv], want_time=True, cwd=bench_dir)
+        _, _, _, execns_jit = run_once([args.mahina, "--time", "--jit-native", b.path, *b.argv], want_time=True, cwd=bench_dir)
 
         # --- memory: dedicated (non-timed) runs, kernel max RSS per engine ---
-        mem_t0 = mem_best([args.lune, b.path, *b.argv], args.mem_reps, cwd=bench_dir)
-        mem_jit = mem_best([args.lune, "--jit-native", b.path, *b.argv], args.mem_reps, cwd=bench_dir)
+        mem_t0 = mem_best([args.mahina, b.path, *b.argv], args.mem_reps, cwd=bench_dir)
+        mem_jit = mem_best([args.mahina, "--jit-native", b.path, *b.argv], args.mem_reps, cwd=bench_dir)
         mem_lj = None
         if b.luajit == "compatible" and have_lj:
             mem_lj = mem_best([args.luajit, b.lj_path(), *b.argv], args.mem_reps, cwd=bench_dir)
@@ -294,7 +294,7 @@ def main():
         res_pct = None
         if not args.no_jit_stats:
             _, _, stats_err, _ = run_once(
-                [args.lune, "--trace", "--jit-native", "--jit-stats", b.path, *b.argv],
+                [args.mahina, "--trace", "--jit-native", "--jit-stats", b.path, *b.argv],
                 cwd=bench_dir)
             m = re.search(r"ran as a trace:\s+([\d.]+)% of run", stats_err)
             if m:
@@ -329,11 +329,11 @@ def main():
         stamp = time.strftime("%Y%m%d-%H%M%S")
         path = os.path.join(ROOT, "bench", "results", f"{stamp}-{rev}.tsv")
         cols = ["program", "args", "luajit_mode", "cross", "luajit_match",
-                "lune_t0_ms", "lune_jit_ms", "luajit_ms", "lune_t0_execns", "lune_jit_execns",
-                "lune_t0_maxrss_kb", "lune_jit_maxrss_kb", "luajit_maxrss_kb",
-                "lune_jit_res_pct"]
+                "mahina_t0_ms", "mahina_jit_ms", "luajit_ms", "mahina_t0_execns", "mahina_jit_execns",
+                "mahina_t0_maxrss_kb", "mahina_jit_maxrss_kb", "luajit_maxrss_kb",
+                "mahina_jit_res_pct"]
         with open(path, "w") as fh:
-            fh.write(f"# lune bench suite  rev={rev}  stamp={stamp}  reps={args.reps}  scale={args.scale}\n")
+            fh.write(f"# mahina bench suite  rev={rev}  stamp={stamp}  reps={args.reps}  scale={args.scale}\n")
             fh.write("\t".join(cols) + "\n")
             for r in rows:
                 fh.write("\t".join(str(x) for x in [

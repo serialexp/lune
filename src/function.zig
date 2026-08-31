@@ -174,7 +174,7 @@ pub const NativeMultiFn = *const fn (ctx: *anyopaque, args: []const Value, out: 
 pub const RecordedBuiltin = enum(u8) {
     /// `math.sqrt(x)` — IEEE correctly-rounded square root. `@sqrt(f64)` (tier-0 /
     /// oracle) and native `sqrtsd` agree bit-for-bit under the default MXCSR
-    /// (round-to-nearest-even; lune never calls `fesetround`).
+    /// (round-to-nearest-even; mahina never calls `fesetround`).
     sqrt = 0,
     // -- arc A of doc 23 (builtin recording breadth). Ordinals appended, never
     // renumbered. A member existing here does NOT mean every call shape records:

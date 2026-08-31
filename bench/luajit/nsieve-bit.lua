@@ -2,12 +2,12 @@
 -- Adapted from LuaJIT/bench/nsieve-bit.lua (Computer Language Benchmarks Game
 -- port). The upstream packs the sieve into 32-bit words with LuaJIT's BitOp
 -- library (`band`/`bxor`/`rshift`/`rol`, int32 semantics). Here the sieve is
--- repacked into native 64-bit words using lune's native bitwise operators. The
+-- repacked into native 64-bit words using mahina's native bitwise operators. The
 -- output is a count of primes, which is independent of word size, so it is
 -- byte-identical to the upstream `bit.*` version (which LuaJIT runs via
 -- `luajit_src`). Two differences from a literal port: shift counts are masked
--- explicitly (`& 63`) because lune does not mask them the way BitOp does, and the
--- workload uses `1 << k` instead of `2^k` to stay in the integer domain (lune's
+-- explicitly (`& 63`) because mahina does not mask them the way BitOp does, and the
+-- workload uses `1 << k` instead of `2^k` to stay in the integer domain (mahina's
 -- bitwise ops are strict integer-only — they do not coerce floats).
 
 local function nsieve(p, m)

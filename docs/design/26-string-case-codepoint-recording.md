@@ -1,4 +1,4 @@
-# lune — finishing the non-pattern string recording surface: upper/lower + codepoint
+# mahina — finishing the non-pattern string recording surface: upper/lower + codepoint
 
 Status: **LANDED (2026-08-28; c1 = 3d0b946 D1a fix, c2 = the three ops
 end-to-end). See "Landed results" at the bottom — all gates green; str_manip
@@ -26,7 +26,7 @@ strings, Unicode simple case mapping).
 Upstream reference: `~/Projects/LuaJIT/src/lib_string.c:111-112` —
 `LJLIB_REC(string_op IRCALL_lj_buf_putstr_lower/upper)`: Pall records
 `upper`/`lower` as a **callout to a C helper** per call (BUFHDR + putstr +
-BUFSTR), exactly the shared-kernel-callout shape lune's snew class already
+BUFSTR), exactly the shared-kernel-callout shape mahina's snew class already
 adapted to the intern-everything model. `lj_ffrecord.c:808`
 (`recff_string_range`, `rd->data == 0`) is `string.byte` with the same
 start/end defaulting our `charRange` has. Nothing here is novel machinery —

@@ -3,7 +3,7 @@
 -- an INTEGER limit `m` instead of `(2^(N-i))*10000`.
 --
 -- Why the variant exists: canonical nsieve derives its limit from `2^x`, a float
--- `pow`, so the numeric-for loop variable and limit are floats. lune's tier-1b
+-- `pow`, so the numeric-for loop variable and limit are floats. mahina's tier-1b
 -- backend is int/bool-only (no XMM/float support — a deferred phase), so the hot
 -- loops bail to tier-1a on `guard_float` and never JIT, *regardless* of the
 -- array path being fully supported. With an integer `m`, the loop variables stay
@@ -11,10 +11,10 @@
 -- inner loops compile to native x86-64 against the bool-lane packed array.
 --
 -- Run head-to-head:
---   lune                 bench/sieve_int.lua 4000000   # tier-0 (bytecode interp)
---   lune --trace         bench/sieve_int.lua 4000000   # tier-1a (IR interp)
---   lune --jit-native    bench/sieve_int.lua 4000000   # tier-1b (native x64)
---   lune --dump-native   bench/sieve_int.lua 4000000   # confirm both traces compile
+--   mahina                 bench/sieve_int.lua 4000000   # tier-0 (bytecode interp)
+--   mahina --trace         bench/sieve_int.lua 4000000   # tier-1a (IR interp)
+--   mahina --jit-native    bench/sieve_int.lua 4000000   # tier-1b (native x64)
+--   mahina --dump-native   bench/sieve_int.lua 4000000   # confirm both traces compile
 --   luajit               bench/sieve_int.lua 4000000   # reference
 -- Output is byte-identical across all four (and to LuaJIT).
 --

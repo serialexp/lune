@@ -1,6 +1,6 @@
 -- @bench args="200" luajit=compatible name=spectral-norm
 -- Vendored verbatim from LuaJIT/bench/spectral-norm.lua (Computer Language
--- Benchmarks Game port). Only this header is lune-added.
+-- Benchmarks Game port). Only this header is mahina-added.
 
 local function A(i, j)
   local ij = i+j-1

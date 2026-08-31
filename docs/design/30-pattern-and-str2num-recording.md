@@ -22,7 +22,7 @@ gsub 1, format 1), and the board shows jit≈t0 on all four. The single abort
 site is `trace.zig:13427` — `Native.recorded == null`. Tier-0 dispatch is
 ~25-30% of find_match/gmatch (~6.4 ms and ~18 ms). LuaJIT cannot trace these
 (`recff_string_find` → NYI on any real pattern, `lj_ffrecord.c:997`) — its
-recorder and matcher never meet. **lune's can**: the recorder observes
+recorder and matcher never meet. **mahina's can**: the recorder observes
 runtime values and the konst pool, and the matcher is a pure function in
 `pattern.zig`. Recording pattern calls is a beyond-Pall move that is
 nevertheless pure doc-23/24 discipline — no new determinism surface (Z-6:
@@ -53,7 +53,7 @@ the trace. (Review m01: a pattern cached in a local outside the loop is a
 `slot_load`, NOT a konst — the identity guard covers exactly that shape, so
 real-world coverage does not silently narrow to literals.)
 
-**2a — the interned-identity guard (`guard_sid`, find/match only).** lune
+**2a — the interned-identity guard (`guard_sid`, find/match only).** mahina
 interns every string: equal bytes ⇔ same `*String` within a heap. Pinning an
 observed pattern is therefore a pointer compare of the ref's runtime value
 against the record-time pointer. Encoding: `a` = ref, `aux` = **konst-pool

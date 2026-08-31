@@ -1,6 +1,6 @@
-// SolidJS <-> CodeMirror 6 bridge for the in-browser lune editor. Highlights via
-// the lune mode (luneLanguage) and validates live against the real compiler
-// (luneLinter -> store.checkSource -> wasm `check`). Two-way bound to the store's
+// SolidJS <-> CodeMirror 6 bridge for the in-browser mahina editor. Highlights via
+// the mahina mode (mahinaLanguage) and validates live against the real compiler
+// (mahinaLinter -> store.checkSource -> wasm `check`). Two-way bound to the store's
 // `source` with a guard so the view<->store sync never loops.
 
 import { onMount, onCleanup, createEffect } from "solid-js";
@@ -10,14 +10,14 @@ import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirro
 import { indentOnInput, bracketMatching } from "@codemirror/language";
 import { lintGutter, lintKeymap } from "@codemirror/lint";
 import { state, setSource, checkSource, coverageByLine, type CoverageClass } from "../store";
-import { luneLanguage, luneHighlighting } from "./luneLanguage";
-import { luneLinter, byteToUtf16 } from "./luneLinter";
+import { mahinaLanguage, mahinaHighlighting } from "./mahinaLanguage";
+import { mahinaLinter, byteToUtf16 } from "./mahinaLinter";
 
 // Runtime-error squiggle — a channel separate from the compile linter. Compile
-// diagnostics (`luneLinter` → wasm `check`) fire as you type; a *runtime* error
+// diagnostics (`mahinaLinter` → wasm `check`) fire as you type; a *runtime* error
 // is only known after a Run, so it lives in its own decoration field rather than
 // the lint state (the two would otherwise overwrite each other). The mark gets a
-// `title` attribute for a native hover tooltip carrying the lune message.
+// `title` attribute for a native hover tooltip carrying the mahina message.
 const setRuntimeError = StateEffect.define<{ from: number; to: number; message: string } | null>();
 
 const runtimeErrorField = StateField.define<DecorationSet>({
@@ -102,8 +102,8 @@ const coverageField = StateField.define<DecorationSet>({
 });
 
 /** Editor chrome theme matching the dark viz palette. Token colors live in the
- *  HighlightStyle (luneHighlighting); this is gutter/cursor/selection only. */
-const luneTheme = EditorView.theme(
+ *  HighlightStyle (mahinaHighlighting); this is gutter/cursor/selection only. */
+const mahinaTheme = EditorView.theme(
   {
     "&": { fontSize: "13px", backgroundColor: "transparent", color: "#abb2bf" },
     ".cm-content": { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", caretColor: "#528bff" },
@@ -117,7 +117,7 @@ const luneTheme = EditorView.theme(
   { dark: true },
 );
 
-export default function LuneEditor() {
+export default function MahinaEditor() {
   let host!: HTMLDivElement;
   let view: EditorView | undefined;
 
@@ -135,14 +135,14 @@ export default function LuneEditor() {
           indentOnInput(),
           bracketMatching(),
           keymap.of([...defaultKeymap, ...historyKeymap, ...lintKeymap, indentWithTab]),
-          luneLanguage(),
-          luneHighlighting,
-          luneLinter(checkSource),
+          mahinaLanguage(),
+          mahinaHighlighting,
+          mahinaLinter(checkSource),
           runtimeErrorField,
           replayLineField,
           coverageField,
           lintGutter(),
-          luneTheme,
+          mahinaTheme,
           EditorView.updateListener.of((u) => {
             if (!u.docChanged) return;
             const text = u.state.doc.toString();
@@ -165,7 +165,7 @@ export default function LuneEditor() {
 
   // Mirror the last run's located runtime error into the editor as a squiggle.
   // Reactive on both `runErrorSpan` (the byte span) and `runError` (the message
-  // shown in the tooltip). lune spans are UTF-8 byte offsets → map to UTF-16.
+  // shown in the tooltip). mahina spans are UTF-8 byte offsets → map to UTF-16.
   createEffect(() => {
     const span = state.runErrorSpan;
     const message = state.runError ?? "runtime error";

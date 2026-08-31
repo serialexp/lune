@@ -1,6 +1,6 @@
-// Main-thread client for the lune Web Worker (`lune.worker.ts`). The store talks
+// Main-thread client for the mahina Web Worker (`mahina.worker.ts`). The store talks
 // to the VM exclusively through this async surface, so no WASM call ever blocks
-// the UI thread. It mirrors the synchronous `LuneModule` API — `runSource`,
+// the UI thread. It mirrors the synchronous `MahinaModule` API — `runSource`,
 // `check`, `replay` — but every method returns a Promise settled when the worker
 // posts back its response.
 //
@@ -8,7 +8,7 @@
 // bun test suite imports `store.ts` (which imports this) and must not touch
 // `Worker`. Only a real run in the browser stands the worker up.
 
-import type { LuneRunResult, LuneReplayResult, LuneDiagnostic } from "./lune";
+import type { MahinaRunResult, MahinaReplayResult, MahinaDiagnostic } from "./mahina";
 
 interface Pending {
   resolve: (value: unknown) => void;
@@ -19,23 +19,23 @@ type WorkerRes =
   | { id: number; ok: true; result: unknown }
   | { id: number; ok: false; error: string };
 
-class LuneWorkerClient {
+class MahinaWorkerClient {
   #worker: Worker | null = null;
   #pending = new Map<number, Pending>();
   #nextId = 1;
   #initId: number | null = null;
 
   /** Resolve the wasm URL the way the old in-store loader did
-   *  (`${BASE_URL}lune.wasm`), so dev and built bases both work. */
+   *  (`${BASE_URL}mahina.wasm`), so dev and built bases both work. */
   #wasmUrl(): string {
     const base = import.meta.env?.BASE_URL ?? "./";
-    return `${base}lune.wasm`;
+    return `${base}mahina.wasm`;
   }
 
   /** Spawn the worker (once) and kick off instantiation. Idempotent. */
   #ensureWorker(): Worker {
     if (this.#worker !== null) return this.#worker;
-    const w = new Worker(new URL("./lune.worker.ts", import.meta.url), { type: "module" });
+    const w = new Worker(new URL("./mahina.worker.ts", import.meta.url), { type: "module" });
     w.onmessage = (ev: MessageEvent<WorkerRes>) => {
       const { id } = ev.data;
       const p = this.#pending.get(id);
@@ -47,7 +47,7 @@ class LuneWorkerClient {
     w.onerror = (ev) => {
       // A worker-level failure (e.g. module load error) can't be tied to one
       // request — reject every in-flight call so callers don't hang.
-      const err = new Error(ev.message || "lune worker error");
+      const err = new Error(ev.message || "mahina worker error");
       for (const [, p] of this.#pending) p.reject(err);
       this.#pending.clear();
     };
@@ -72,24 +72,24 @@ class LuneWorkerClient {
     });
   }
 
-  runSource(src: string, argv: string[] = []): Promise<LuneRunResult> {
-    return this.#call<LuneRunResult>({ method: "run", src, argv });
+  runSource(src: string, argv: string[] = []): Promise<MahinaRunResult> {
+    return this.#call<MahinaRunResult>({ method: "run", src, argv });
   }
 
-  check(src: string): Promise<LuneDiagnostic[]> {
-    return this.#call<LuneDiagnostic[]>({ method: "check", src });
+  check(src: string): Promise<MahinaDiagnostic[]> {
+    return this.#call<MahinaDiagnostic[]>({ method: "check", src });
   }
 
-  replay(src: string, effects: Uint8Array, stopAfter: number): Promise<LuneReplayResult> {
+  replay(src: string, effects: Uint8Array, stopAfter: number): Promise<MahinaReplayResult> {
     // The effects blob is owned by the store (frozen for the whole replay
     // session), so DON'T transfer it — the worker gets a structured-clone copy.
-    return this.#call<LuneReplayResult>({ method: "replay", src, effects, stopAfter });
+    return this.#call<MahinaReplayResult>({ method: "replay", src, effects, stopAfter });
   }
 }
 
-/** Lazily-constructed singleton, mirroring the old `lune()` helper. */
-let client: LuneWorkerClient | null = null;
-export function luneWorker(): LuneWorkerClient {
-  if (client === null) client = new LuneWorkerClient();
+/** Lazily-constructed singleton, mirroring the old `mahina()` helper. */
+let client: MahinaWorkerClient | null = null;
+export function mahinaWorker(): MahinaWorkerClient {
+  if (client === null) client = new MahinaWorkerClient();
   return client;
 }

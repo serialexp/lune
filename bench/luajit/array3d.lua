@@ -1,6 +1,6 @@
 -- @bench args="80" luajit=compatible name=array3d
 -- From LuaJIT/bench/array3d.lua (Computer Language Benchmarks Game port).
--- lune-added: this header and the trailing checksum block. The body is upstream.
+-- mahina-added: this header and the trailing checksum block. The body is upstream.
 --
 -- WHY THE CHECKSUM. Upstream prints nothing, so this bench's frozen-output
 -- digest was sha256("") and `bench/run.py`'s cross-tier check was comparing
@@ -11,12 +11,12 @@
 -- elements, and it does not tier up — measured 49.8 ms under both tier-0 and
 -- --jit-native. Measured effect on this row:
 --
---            lune t0   lune jit   LuaJIT   jit/lj
+--            mahina t0   mahina jit   LuaJIT   jit/lj
 --   before     172.1      177.9      1.9    95.8x
 --   after      226.1      225.6      8.3    27.1x
 --
 -- Note the ratio MOVED A LOT, and in the flattering direction: the fold costs
--- LuaJIT +6.5 ms against a 1.9 ms baseline (+348%) but lune only +48 ms (+27%),
+-- LuaJIT +6.5 ms against a 1.9 ms baseline (+348%) but mahina only +48 ms (+27%),
 -- so array3d went from the worst row on the board to a middling one. Both
 -- engines run the identical added work, so 27.1x is a true measurement — it is
 -- just a measurement of a different mixture (~21% of the row is now checksum).
@@ -84,8 +84,8 @@ for x,y,z in arr:points() do
 end
 assert(arr.image[dim^3-1] == (dim-1)^2)
 
--- lune-added result checksum. Exact integer fold, no float formatting. When
--- this was written lune's string.format could not render a double's exact
+-- mahina-added result checksum. Exact integer fold, no float formatting. When
+-- this was written mahina's string.format could not render a double's exact
 -- decimal expansion, so a "%.17g" print would have differed from LuaJIT's for
 -- formatting reasons alone; that is fixed (src/stdlib/decimal.zig) and a
 -- formatted checksum would now agree. The fold is kept because it depends on

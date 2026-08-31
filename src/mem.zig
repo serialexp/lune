@@ -1,7 +1,7 @@
 //! Memory accounting and allocation discipline.
 //!
 //! Allocation is the runtime's main enemy (cache footprint, GPU bandwidth), so
-//! lune treats memory as something to *measure*, not guess at. The discipline:
+//! mahina treats memory as something to *measure*, not guess at. The discipline:
 //!
 //!   1. **Inject allocators.** Every subsystem takes an `std.mem.Allocator`;
 //!      nothing reaches for a global heap. (The lone deliberate exception is the

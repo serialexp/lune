@@ -1,6 +1,6 @@
-# lune — project instructions
+# mahina — project instructions
 
-lune is a Lua-shaped (not Lua-compatible), dynamically-typed language with a
+mahina is a Lua-shaped (not Lua-compatible), dynamically-typed language with a
 tracing JIT and a time-travel trace visualiser, written in Zig. Start with
 `docs/design/00-architecture.md`; the companion docs (`01`–`04`) own the trace
 lifecycle, determinism, GC/memory, and the snapshot/replay schema.
@@ -68,7 +68,7 @@ omits; `excluded` = won't implement, determinism-hostile or out of scope), and
 `n/a` for excluded rows). Whenever you add, finish, rename, namespace, or drop a
 stdlib function, update its row in the **same change** — flip `status`, move the
 `tier`, or add the row — so the inventory never drifts from the tree (global
-Rule #3 spirit). It's the at-a-glance "what's left to replicate" for lune.
+Rule #3 spirit). It's the at-a-glance "what's left to replicate" for mahina.
 
 ### Rule Z-6: We are building a LANGUAGE, not a benchmark-optimiser. NEVER optimise for a single benchmark!!!
 
@@ -123,7 +123,7 @@ the `zig build` invocations and, for benchmarks, guarantee the right binary.
 
 - `just build` — build the CLI. (`zig build`)
 - `just test` — run all unit tests, the gate. Depends on `build`, so it also
-  refreshes `zig-out/bin/lune` (Debug) — no more debugging a stale CLI after a
+  refreshes `zig-out/bin/mahina` (Debug) — no more debugging a stale CLI after a
   test-only run. (`zig build && zig build test`)
 - `just run -- <script> [args]` — run the CLI. (`zig build run`)
 - `just release` — build the optimized CLI (`zig build -Doptimize=ReleaseFast`).
@@ -133,7 +133,7 @@ the `zig build` invocations and, for benchmarks, guarantee the right binary.
   `bench/README.md`. ALWAYS benchmark via this recipe, never a bare
   `python3 bench/run.py` against whatever happens to be in `zig-out/`.
 - `just check-version` — hard-fail on toolchain drift (CI). NB: this rebuilds
-  `zig-out/bin/lune` as **Debug**; re-run `just release`/`just bench` before
+  `zig-out/bin/mahina` as **Debug**; re-run `just release`/`just bench` before
   timing anything afterward (a plain `zig build`, `zig build test`, or this
   recipe leaves a Debug binary that benchmarks ~20× slow).
 - `just shadow <dest>` — make an A/B shadow copy of the tree for baseline
@@ -157,7 +157,7 @@ throwaway scaffolding.
 
 ## LuaJIT is dedication, not magic — and not a talent ceiling
 
-When lune is N× slower than LuaJIT, that gap is **not** innate genius and it is
+When mahina is N× slower than LuaJIT, that gap is **not** innate genius and it is
 **not** a wall. Mike Pall isn't superhuman; he spent ~15 years relentlessly
 optimizing one thing and hand-writing assembly. Any dedicated engineer could
 build something like it given that commitment. Two consequences, and you must
@@ -183,7 +183,7 @@ the same single-minded optimization problem Pall ground on solo — so matching
 him is the floor we owe to the fact that we can read his source, and beating
 him is the upside that parallelism buys. Replicate first; the gravy comes after.
 
-**The one legitimate asterisk: determinism and full session replay.** lune
+**The one legitimate asterisk: determinism and full session replay.** mahina
 carries weight LuaJIT doesn't — byte-identical 8-mode equivalence and
 time-travel replay. So the *only* defensible reason a Pall technique can't be
 lifted verbatim is that doing so would break determinism or replay (smuggling a
@@ -208,7 +208,7 @@ How to actually find the bottleneck (this is the recipe, reuse it):
 ```sh
 zig build -Doptimize=ReleaseFast
 NS=~/Projects/LuaJIT/bench/nsieve.lua
-perf record -g -o /tmp/p.data -- ./zig-out/bin/lune --trace --jit-native $NS 9 >/dev/null 2>&1
+perf record -g -o /tmp/p.data -- ./zig-out/bin/mahina --trace --jit-native $NS 9 >/dev/null 2>&1
 perf report -i /tmp/p.data --stdio --no-children | grep -vE '^\s*#' | head -25
 ```
 
@@ -224,7 +224,7 @@ END{printf "native [JIT]: %.1f%%\ntier-0 Vm.exec: %.1f%%\nTable.get/set: %.1f%%\
 ```
 
 **Standing rule (doc 31 D3, str_gmatch 2026-08): a bench that stays flat after a
-coverage lever gets a `--jit-stats` run BEFORE any verdict.** `./zig-out/bin/lune
+coverage lever gets a `--jit-stats` run BEFORE any verdict.** `./zig-out/bin/mahina
 --trace --jit-native --jit-stats <bench>` prints the native-vs-tier-0 split by
 iterations AND TSC cycles, per-anchor. "fallback despite a trace" above a few %
 is the first suspect — str_gmatch sat at 3.3% native residency on a *healthy
@@ -238,7 +238,7 @@ Two gotchas that bit us, so read percentages carefully:
 - **Percentages are relative to a shrinking denominator.** A *working* JIT makes
   `Table.get` look like a *bigger* fraction (19% with JIT vs 8.5% pure-tier-0) only
   because the JIT removed `Vm.exec` time from under it. Always cross-check against a
-  pure tier-0 run (`./zig-out/bin/lune $NS 9`, no `--trace`) before concluding a
+  pure tier-0 run (`./zig-out/bin/mahina $NS 9`, no `--trace`) before concluding a
   symbol "got worse."
 - **Isolate a suspected loop instead of arguing about it.** Extract the loop into a
   standalone script with the same call shape and time it + `--dump-native` it.

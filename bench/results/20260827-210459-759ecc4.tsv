@@ -1,3 +1,3 @@
-# lune bench suite  rev=759ecc4  stamp=20260827-210459  reps=7  scale=1.0
-program	args	luajit_mode	cross	luajit_match	lune_t0_ms	lune_jit_ms	luajit_ms	lune_t0_execns	lune_jit_execns	lune_t0_maxrss_kb	lune_jit_maxrss_kb	luajit_maxrss_kb
+# mahina bench suite  rev=759ecc4  stamp=20260827-210459  reps=7  scale=1.0
+program	args	luajit_mode	cross	luajit_match	mahina_t0_ms	mahina_jit_ms	luajit_ms	mahina_t0_execns	mahina_jit_execns	mahina_t0_maxrss_kb	mahina_jit_maxrss_kb	luajit_maxrss_kb
 str_find_match	100000	-	ok	ok	38.326	38.593	13.333	37867219	38121178	2244	2388	2320

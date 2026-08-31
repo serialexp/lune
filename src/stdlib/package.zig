@@ -1,7 +1,7 @@
-//! lune stdlib — the module system: `require` + the `package` table.
+//! mahina stdlib — the module system: `require` + the `package` table.
 //!
 //! `require(name)` is the single Lua-usability unlock that lets one script pull in
-//! another. lune builds it out of pieces that already exist, inventing **no new
+//! another. mahina builds it out of pieces that already exist, inventing **no new
 //! host seam and no new effect kind**:
 //!
 //!   * `package.path` templating — pure string substitution (`?` → the dotted
@@ -91,7 +91,7 @@ fn requirePackageSubTable(vm: *Vm, field: []const u8, field_name: []const u8) an
 /// probing each candidate via the `file_read` effect. Returns the first readable
 /// path as `out[0]` (count 1); on no match returns `(nil, "\n\tno file '<cand>'"…)`
 /// (count 2). `sep` (default `"."`) is the substring of `name` replaced by `rep`
-/// (default `"/"`, the lune path separator) before the `?` substitution.
+/// (default `"/"`, the mahina path separator) before the `?` substitution.
 ///
 /// Reads every argument before writing `out`, then accumulates into a `gpa` buffer
 /// that is interned (copied) before the first `out` write — so no `out`/arg alias.

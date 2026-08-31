@@ -15,16 +15,16 @@
 -- (`base + (i*stride + j)` at the cell lane) behind a `guard_grid`, which is where
 -- the locality win is finally cashed. This bench is the before/after yardstick.
 --
--- INTEGER cells on purpose: lune's tier-1b backend is int/bool-only today (no XMM
+-- INTEGER cells on purpose: mahina's tier-1b backend is int/bool-only today (no XMM
 -- float store/load), so an int grid is what the native path can lower first
 -- (Phase 8 "int lanes first"). A float matmul would bail on the cell lane until a
 -- later phase, masking the grid win.
 --
 -- Run head-to-head:
---   lune                 bench/grid_matmul.lua 200   # tier-0 (bytecode interp)
---   lune --jit-native    bench/grid_matmul.lua 200   # tier-1b (native x64)
---   lune --dump-aborts   bench/grid_matmul.lua 200   # see get_index2/set_index2 aborts
---   luajit               bench/grid_matmul.lua 200   # reference
+--   mahina                 bench/grid_matmul.lua 200   # tier-0 (bytecode interp)
+--   mahina --jit-native    bench/grid_matmul.lua 200   # tier-1b (native x64)
+--   mahina --dump-aborts   bench/grid_matmul.lua 200   # see get_index2/set_index2 aborts
+--   luajit                 bench/grid_matmul.lua 200   # reference
 -- Output is byte-identical across all of them (and to LuaJIT).
 --
 -- @bench args="200" luajit=compatible name=grid_matmul

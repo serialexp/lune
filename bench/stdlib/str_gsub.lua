@@ -3,12 +3,12 @@
 -- Exercises both supported replacement kinds: a literal string replacement (with
 -- the match count) and a table replacement keyed on the first capture (words not
 -- in the map are kept verbatim). Function replacement is intentionally absent —
--- lune defers it (needs call-into-VM-from-native). Integer checksum over result
+-- mahina defers it (needs call-into-VM-from-native). Integer checksum over result
 -- lengths and counts keeps output byte-identical to LuaJIT.
 --
---   lune              bench/stdlib/str_gsub.lua 80000   # tier-0
---   lune --jit-native bench/stdlib/str_gsub.lua 80000   # tier-1b
---   luajit            bench/stdlib/str_gsub.lua 80000   # reference
+--   mahina              bench/stdlib/str_gsub.lua 80000   # tier-0
+--   mahina --jit-native bench/stdlib/str_gsub.lua 80000   # tier-1b
+--   luajit              bench/stdlib/str_gsub.lua 80000   # reference
 --
 -- @bench args="80000" luajit=compatible
 

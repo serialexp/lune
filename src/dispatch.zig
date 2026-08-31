@@ -1,6 +1,6 @@
 //! Phase 0 smoke test: prove guaranteed tail calls.
 //!
-//! lune's tier-0 interpreter will use threaded dispatch — each bytecode handler
+//! mahina's tier-0 interpreter will use threaded dispatch — each bytecode handler
 //! does its work and then *tail-calls* the next handler, so an entire program
 //! runs as one long chain of tail calls with no interpreter stack growth. That
 //! design only holds if `@call(.always_tail, ...)` actually elides the caller's

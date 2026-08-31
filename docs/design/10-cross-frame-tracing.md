@@ -1,4 +1,4 @@
-# lune — cross-frame tracing (inline Lua calls into a trace) — Design
+# mahina — cross-frame tracing (inline Lua calls into a trace) — Design
 
 Status: partial — Phase 0 (leaf-call inlining) + cluster Sub-lever 1 **U0**
 (callee-via-upvalue/global recording) + **U1** (native `guard_func` lowering — the
@@ -150,10 +150,10 @@ inlining the called body straight into the trace (LuaJIT's
 `CLAUDE.md` predicted: making already-traced code faster cannot touch a loop that
 never tiers up.
 
-### Why this is far simpler in lune than in LuaJIT
+### Why this is far simpler in mahina than in LuaJIT
 
 LuaJIT needs multi-frame snapshots (`snapshot_framelinks`) because a side-exit can
-land mid-inlined-call and stay off-trace. **lune does not**, for two structural
+land mid-inlined-call and stay off-trace. **mahina does not**, for two structural
 reasons:
 
 1. **The recorder already follows tier-0 across the frame boundary.**
@@ -303,7 +303,7 @@ bounded recursion + exit chaining.
 ## References
 
 - LuaJIT: `lj_record.c` (`lj_record_call`/`lj_record_ret`), `lj_snap.c`
-  (`snapshot_framelinks` — the machinery lune avoids), `recunroll` (Phase 3
+  (`snapshot_framelinks` — the machinery mahina avoids), `recunroll` (Phase 3
   recursion bound).
 - `src/trace.zig` (`recCall`/`recReturn`, S1–S3, `assertWellFormed`; Sub-lever 1:
   `recInputGet`, `InputSeed`, `Trace.inputs`), `src/interp.zig` (Sub-lever 1:

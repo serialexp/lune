@@ -1,4 +1,4 @@
-//! lune — the library root module.
+//! mahina — the library root module.
 //!
 //! Public surface of the VM core. Phase 0 is scaffolding only: this exposes a
 //! version string and the threaded-dispatch smoke test. Real subsystems (value

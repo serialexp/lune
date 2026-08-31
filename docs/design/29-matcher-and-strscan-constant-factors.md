@@ -53,14 +53,14 @@ Replace with Pall's two-table design (`lib_string.c:210-228`, `lj_char.c:24`):
   UPPER|LOWER` (+1 spare). Composites: ALPHA=UPPER|LOWER, ALNUM=ALPHA|DIGIT,
   GRAPH=ALNUM|PUNCT. **Built by evaluating the CURRENT `matchClass` predicates
   at comptime**, not transcribed from LuaJIT — the table is definitionally
-  equal to today's semantics (bytes ≥ 0x80 get 0: lune classes are ASCII-only
+  equal to today's semantics (bytes ≥ 0x80 get 0: mahina classes are ASCII-only
   by the S-D rule, unlike LuaJIT's IDENT bit).
 - `class_map: [32]u8` — maps `cl & 0x1f` → bit mask for the 10 class letters.
 - `matchClass(c, cl)`: `if ((cl & 0xc0) == 0x40)` (ASCII letter either case) →
   `t = class_map[cl & 0x1f]`; if `t != 0` → `res = char_bits[c] & t != 0`,
   return `if (cl & 0x20 != 0) res else !res` (lowercase = positive class).
   Else / `t == 0` → literal `cl == c`. One load + two masks, no branch on the
-  class letter. lune has no `%z` (dropped per 5.4) — `'z'` maps to 0 → literal,
+  class letter. mahina has no `%z` (dropped per 5.4) — `'z'` maps to 0 → literal,
   same as today.
 
 **Pin** (review M4): the full cross-product — every `c: 0..255` × every
@@ -173,7 +173,7 @@ filtering, `charToDigit`, checked mul/add — plus a failed full parse before
 What the current path ACCEPTS, verified against the pinned toolchain
 (`fmt.zig:306-316` doc + tests, `fmt/parse_float/parse.zig:143` underscores):
 
-| input | lune today | Lua 5.4 | LuaJIT |
+| input | mahina today | Lua 5.4 | LuaJIT |
 |---|---|---|---|
 | `"1_000"` | 1000 | nil | nil |
 | `"0o17"` | 15 | nil | nil |
@@ -203,16 +203,16 @@ whatever is chosen here does not silently change source-literal syntax.
 accept everything that LuaJIT accepts? Does it accept everything that Lua 5.4
 accepts? If so, I really do not care if we accept more, as long as we do not
 accept less." Verified empirically with a 77-case probe run identically on
-`lua5.4`, `~/Projects/LuaJIT/src/luajit`, and lune (whitespace variants, hex
+`lua5.4`, `~/Projects/LuaJIT/src/luajit`, and mahina (whitespace variants, hex
 ints/floats incl. `0x8.`/`0x.8`, `5.`/`.5`/`5.e2`, inf/nan family incl.
 `infinity`, big-digit strings, junk near-misses, `0B101`/`-0b101`,
 `LL`/`ULL`/`i` suffixes — neither engine accepts suffixes). Result: the ONE
-acceptance gap was the trim set — lune trimmed `" \t\n\r"` where both engines
+acceptance gap was the trim set — mahina trimmed `" \t\n\r"` where both engines
 skip C `isspace` (adds `\v`/`\f`); `"\v10"`, `"\f10"`, `"10\v"`,
-`" \v\f 10 \f\v "` were rejected by lune and accepted by both. **Fixed**: the
+`" \v\f 10 \f\v "` were rejected by mahina and accepted by both. **Fixed**: the
 `tonumber_trim` constant (arith.zig) is now the 6-byte C-isspace set, used by
 both the auto and explicit-base forms; pinned in the routing-matrix test.
-After the fix lune's acceptance is a strict superset of BOTH engines on the
+After the fix mahina's acceptance is a strict superset of BOTH engines on the
 full matrix (the extras being std.fmt's `_`/`0o` and `inf` vs 5.4 — grammar
 (a) frozen per the criterion; `0b` is legal LuaJIT too). Known
 value-semantics forks, accepted: hex-int overflow → float like LuaJIT (Lua
@@ -339,7 +339,7 @@ actually live in.
   revisit only with a profile showing bracket-scan heat).
 - Parser literal grammar (separate surface, TODO.md).
 - `string.format`/decimal renderer (own arc, doc 28 §7).
-- NUL-sentinel string representation (LuaJIT's matcher trick; lune keeps
+- NUL-sentinel string representation (LuaJIT's matcher trick; mahina keeps
   explicit bounds — the A-series removes the cost where it was measurable).
 - A full `strscan_dec` port (std.fmt float-conversion independence): only if
   a profile ever shows float-parse heat; grammar (b)/(c)'s scanner is built

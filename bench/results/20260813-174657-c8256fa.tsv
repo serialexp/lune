@@ -1,5 +1,5 @@
-# lune bench suite  rev=c8256fa  stamp=20260813-174657  reps=5  scale=1.0
-program	args	luajit_mode	cross	luajit_match	lune_t0_ms	lune_jit_ms	luajit_ms	lune_t0_execns	lune_jit_execns
+# mahina bench suite  rev=c8256fa  stamp=20260813-174657  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	mahina_t0_ms	mahina_jit_ms	luajit_ms	mahina_t0_execns	mahina_jit_execns
 field_hash	20000000	-	ok	ok	1032.326	14.127	8.578	1051023326	16379580
 grid_matmul	200	-	ok	ok	288.283	44.090	8.159	291265828	44143584
 grid_matmul_f64	200	-	ok	ok	289.896	36.764	7.811	306182964	39297710

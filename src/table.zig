@@ -1,4 +1,4 @@
-//! Tables — lune's one structured data type (the basis for arrays, maps, and,
+//! Tables — mahina's one structured data type (the basis for arrays, maps, and,
 //! once shapes land in Phase 9, objects/structs).
 //!
 //! Classic Lua split storage: a contiguous **array part** for a dense run of
@@ -49,7 +49,7 @@ pub const Table = struct {
     /// (`gc.blacken` marks it) and a keyframe edge (`keyframeser` persists its
     /// id). `Table.get`/`set` ignore it entirely — they are the raw accessors.
     metatable: ?*Table = null,
-    /// Amortised rehash trigger. lune's hash part (`std.HashMapUnmanaged`)
+    /// Amortised rehash trigger. mahina's hash part (`std.HashMapUnmanaged`)
     /// self-grows, so we can't use Lua's "hash full" hook to drive a rehash —
     /// instead we recompute the array/hash split when the hash-part population
     /// crosses this threshold, doubling it each time (`rehash`). This keeps the

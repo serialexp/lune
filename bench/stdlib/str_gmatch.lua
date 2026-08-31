@@ -1,13 +1,13 @@
 -- string.gmatch throughput + LuaJIT parity probe.
 --
 -- Tokenises a CSV string with a complement-class pattern in a generic-for loop.
--- NB: lune's gmatch returns an (iter, state, control) triple rather than Lua's
+-- NB: mahina's gmatch returns an (iter, state, control) triple rather than Lua's
 -- lone closure, but driven by `for ... in` the *visible output* (the tokens) is
 -- identical to LuaJIT — which this probe asserts. Integer checksum + last token.
 --
---   lune              bench/stdlib/str_gmatch.lua 80000   # tier-0
---   lune --jit-native bench/stdlib/str_gmatch.lua 80000   # tier-1b
---   luajit            bench/stdlib/str_gmatch.lua 80000   # reference
+--   mahina              bench/stdlib/str_gmatch.lua 80000   # tier-0
+--   mahina --jit-native bench/stdlib/str_gmatch.lua 80000   # tier-1b
+--   luajit              bench/stdlib/str_gmatch.lua 80000   # reference
 --
 -- @bench args="80000" luajit=compatible
 

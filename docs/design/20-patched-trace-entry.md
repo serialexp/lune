@@ -1,4 +1,4 @@
-# lune — Patched trace entry (the `BC_JFORL` analogue) — Design
+# mahina — Patched trace entry (the `BC_JFORL` analogue) — Design
 
 Status: design APPROVED (codex gpt-5.6-sol round 8, 2026-08-14 — §R8 MINOR
 §T10-wording fold applied); Phase 0a landed (`d4fd70f`), Phase 0b landed
@@ -195,7 +195,7 @@ gate anywhere** because it pays that cascade zero times per entry:
 the trace is the interpreter's ordinary opcode dispatch. To be precise (§R1
 finding 10): LuaJIT still executes the loop increment/test and the JIT
 dispatch on every entry — patching eliminates repeated **discovery/selection**,
-not all entry work. That is also exactly what it eliminates for us; lune's
+not all entry work. That is also exactly what it eliminates for us; mahina's
 per-entry seeding/observation/ledger work remains and is specified below.
 
 Bart's ruling: options A (drop the constant) and B (conditional bypass) are
@@ -215,7 +215,7 @@ discovery-free entry, whatever its trip distribution; fft is the instrument.
   flush; asserts the patch references the trace it unbinds.
 - **Thrash brake**: penalty cache + blacklisting (lj_trace.c:377–403).
 
-**Divergence we get for free:** no `JFORI` analogue needed. lune's `for_prep`
+**Divergence we get for free:** no `JFORI` analogue needed. mahina's `for_prep`
 jumps forward *to* `for_loop`, whose back-edge to the body start runs on
 every iteration **including the first** — one patch point covers trip-1
 instances (exactly fft's late stages).

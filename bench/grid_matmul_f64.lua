@@ -10,17 +10,17 @@
 -- is the yardstick for the **f64 cell** extension (XMM `movsd` cell load/store
 -- behind the same grid guards). A double grid that records but bails native runs
 -- on the tier-1a oracle (≈ tier-0); a fully-lowered one cashes the locality win
--- in XMM. Output is byte-identical across lune tier-0 / `--jit-native` / LuaJIT
--- (strict IEEE-754, round-to-nearest — lune never changes MXCSR).
+-- in XMM. Output is byte-identical across mahina tier-0 / `--jit-native` / LuaJIT
+-- (strict IEEE-754, round-to-nearest — mahina never changes MXCSR).
 --
 -- Rows are made dense f64 arrays (`r[j] = 0.0`) *before* the first fused store so
 -- the inflation scan unifies the cell lane to f64 (homogeneous-numeric, doc 14).
 --
 -- Run head-to-head:
---   lune                 bench/grid_matmul_f64.lua 200   # tier-0
---   lune --jit-native    bench/grid_matmul_f64.lua 200   # tier-1b (native x64, XMM cells)
---   lune --dump-aborts   bench/grid_matmul_f64.lua 200   # confirm no get_index2/set_index2 aborts
---   luajit               bench/grid_matmul_f64.lua 200   # reference
+--   mahina                 bench/grid_matmul_f64.lua 200   # tier-0
+--   mahina --jit-native    bench/grid_matmul_f64.lua 200   # tier-1b (native x64, XMM cells)
+--   mahina --dump-aborts   bench/grid_matmul_f64.lua 200   # confirm no get_index2/set_index2 aborts
+--   luajit                 bench/grid_matmul_f64.lua 200   # reference
 --
 -- @bench args="200" luajit=compatible name=grid_matmul_f64
 

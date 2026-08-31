@@ -144,7 +144,7 @@ countRun; str_gsub 53.3 ms = **1.2× LJ, at campaign target**; find_match
 measured in the recorded-callout world), **matchBracket bitset precompute**
 (gmatch's `[^,]+` still linear-scans per byte — revisit only with a profile
 showing bracket heat after doc 30). Open Bart decisions: **doc 29 §B2
-tonumber grammar** (a/b/c — today lune accepts `"1_000"`/`"0o17"`/`"0b101"`/
+tonumber grammar** (a/b/c — today mahina accepts `"1_000"`/`"0o17"`/`"0b101"`/
 `"inf"`, all std.fmt artifacts, none Lua-legal) and **doc 30 v3 go-ahead**
 (pattern/tonumber recording — kills the string benches' host_barrier).
 
@@ -195,7 +195,7 @@ handing out a slice into a growable `ArrayList` (`grep 'return self\..*\.items'`
 after each capture; the register lanes and `boundary_scratch` are fixed and
 documented as never reallocated.
 
-**Process fix, done:** `just hashgate` now has a second leg (`--also-lune`)
+**Process fix, done:** `just hashgate` now has a second leg (`--also-mahina`)
 running the same 84 configurations under a safety-checked Debug build. The gate
 had only ever seen ReleaseFast, which is exactly why two real bugs sat in the
 corpus. Demonstrated load-bearing: with the fix reverted, the release leg passes
@@ -226,12 +226,12 @@ otherwise read as superstition. Not a defect and not scheduled work.
 
 Note this is deliberately NOT the same choice as `string.format`, which was
 moved to exact C semantics the same day (`src/stdlib/decimal.zig`): `%.2f` of
-`2.675` is `2.67` here, as in C. So `print(x)` speaks lune's own
+`2.675` is `2.67` here, as in C. So `print(x)` speaks mahina's own
 lossless-presentation dialect while `string.format` speaks C. The two disagree
 about what a double "is" — `print(2.675)` says `2.675`, `%.20f` says
 `2.67499999999999982236` — and that seam is intentional.
 
-| expression | lune | Lua 5.4 / LuaJIT |
+| expression | mahina | Lua 5.4 / LuaJIT |
 |---|---|---|
 | `print(1/3)` | `0.3333333333333333` | `0.33333333333333` |
 | `print(0.1+0.2)` | `0.30000000000000004` | `0.3` |
@@ -240,7 +240,7 @@ about what a double "is" — `print(2.675)` says `2.675`, `%.20f` says
 | `print(2^53)` | `9007199254740992` | `9.007199254741e+15` |
 
 Reference Lua renders with `LUAI_NUMFFORMAT` = `"%.14g"`: 14 significant digits
-and a switch to exponent form outside a magnitude band. lune renders the
+and a switch to exponent form outside a magnitude band. mahina renders the
 shortest string that round-trips, always in positional form.
 
 Shortest-round-trip is lossless and is what JS/Python/Rust do; `%.14g` silently
@@ -274,7 +274,7 @@ repetition is semantically dead. This is upstream scimark's own shape (Pall's
 suite discards even the flop counts) and is NOT a correctness hole — output
 equivalence is the contract, and work an engine can legally skip is not owed.
 It only matters if an engine ever grows cross-iteration store sinking / dead-
-loop elision strong enough to elide the repetition, which neither lune nor
+loop elision strong enough to elide the repetition, which neither mahina nor
 LuaJIT (15 years in) has; and doing so would announce itself as an absurd
 step-change in exactly these two board rows. If that day comes, the fix is a
 one-element-per-cycle fold into the checksum (~0.1% SPARSE, ~0.002% LU).
@@ -424,11 +424,11 @@ knocking any of these down unlocks the listed benches as new corpus members:
 
 - **`coroutine` library** (none yet): unlocks `chameneos`, `coroutine-ring`.
   Largest lift; intersects determinism (coroutine resume order must be replayable).
-- **LuaJIT `bit.*` library** — RESOLVED, not added (June 2026). lune already has
+- **LuaJIT `bit.*` library** — RESOLVED, not added (June 2026). mahina already has
   native 64-bit bitwise *operators* (`&` `|` `~` `<<` `>>`, wired by the metamethod
   arc). Bart's call: do **not** add a `bit` module — its int32-normalization would
   bolt a 32-bit-semantics island onto a 64-bit language, which Lua 5.4 itself
-  rejected in favour of native operators. lune also stays strict integer-only
+  rejected in favour of native operators. mahina also stays strict integer-only
   (unlike 5.4 it does not coerce integral floats in bitwise ops; the error message
   was fixed to the Lua-shaped "number has no integer representation" / "attempt to
   perform bitwise operation on a <type> value"). `euler14-bit` and `nsieve-bit` are
@@ -438,7 +438,7 @@ knocking any of these down unlocks the listed benches as new corpus members:
   byte-identical. `mandelbrot-bit`/`md5` remain blocked on binary output / non-ASCII
   escapes, independent of bitwise support.
 - **Leveled long-bracket strings `[[…]]` / `[=[…]=]`** — DONE (June 2026, lexer +
-  compiler, 8-mode tested). This was a genuine Lua 5.4 conformance gap (lune
+  compiler, 8-mode tested). This was a genuine Lua 5.4 conformance gap (mahina
   previously lacked long strings entirely, even `[[…]]`). It did **not** unlock the
   dynamic-codegen ports as hoped: `fasta`/`pidigits-nogmp`/`revcomp`/`meteor` each
   pile on further LuaJIT-isms — the `jit.*` module, `loadstring` with a *numeric*
@@ -447,7 +447,7 @@ knocking any of these down unlocks the listed benches as new corpus members:
   `load(string)`) was deliberately **not** added — it unlocks nothing measurable on
   its own and is a 5.1-ism; reconsider alongside the broader compat-alias question.
 - **`require`-from-cwd in `bench/run.py`** — DONE (June 2026). `run.py` now runs
-  every child (lune all tiers + LuaJIT) with `cwd` set to the bench's own
+  every child (mahina all tiers + LuaJIT) with `cwd` set to the bench's own
   directory (`run_once`/`time_best` gained a `cwd=` param), mirroring LuaJIT's
   `run.sh` `cd $BENCH_DIR`, so `package.path`'s `./?.lua` resolves the shared
   `scimark_lib.lua` (no `@bench` header). Unlocked the four
@@ -462,7 +462,7 @@ knocking any of these down unlocks the listed benches as new corpus members:
   `life` (Latin-1 source string), `mandelbrot`/`fannkuch` (binary PBM output +
   a perm-printing branch divergence). Needs care re: the UTF-8 source/output policy.
 - **Missing functions**: `k-nucleotide`, `sum-file` (io.read/io.lines shapes).
-- **Deep non-tail recursion** overflows lune's call stack at LuaJIT's N:
+- **Deep non-tail recursion** overflows mahina's call stack at LuaJIT's N:
   `recursive-ack` (Ack(3,6) overflows; matches only at small N). Needs a growable
   / deeper VM call stack.
 - Excluded: programs that print their own `os.clock` timing (`series`) — stdout is
@@ -474,11 +474,11 @@ string.codepoint`, but `string.codepoint` is a Lua 5.3+ function LuaJIT (5.1) la
 so on LuaJIT `byte` is nil and line 28 errors `attempt to call upvalue 'byte'`. The
 harness has always shown this as `luajit=ERR` (independent of the new per-bench cwd —
 it errors identically from the repo root). The names don't line up across engines:
-lune has only `string.codepoint` (S-B removed `string.byte` for code-point semantics),
+mahina has only `string.codepoint` (S-B removed `string.byte` for code-point semantics),
 LuaJIT 5.1 has only `string.byte`. The bench's own comment notes the base string is
-all-ASCII, so a lune code point equals a LuaJIT byte — so parity is achievable two
+all-ASCII, so a mahina code point equals a LuaJIT byte — so parity is achievable two
 ways: (a) flip the bench to `luajit=skip` (simplest, loses the parity check), or (b)
-use the `luajit_src=` mechanism (the `_ref/` file calls `string.byte`, the lune file
+use the `luajit_src=` mechanism (the `_ref/` file calls `string.byte`, the mahina file
 calls `string.codepoint`), the same shape as the `euler14-bit`/`nsieve-bit` split. Out
 of scope for the scimark commit; left for a separate bench-fix pass so it isn't bundled
 with unrelated corpus work.
@@ -606,9 +606,9 @@ The full runtime-compile arc is in (`src/stdlib/load.zig`):
 
 Deferred:
 - **Reader-function `chunk`** — only the string form is accepted today.
-- **`mode` arg (`"t"`/`"b"`)** — lune has no binary bytecode; `string.dump` is
+- **`mode` arg (`"t"`/`"b"`)** — mahina has no binary bytecode; `string.dump` is
   excluded, so only text loading exists. The arg is simply ignored/unsupported.
-- **`env` arg** — lune has no `_ENV` upvalue, so no per-chunk environment.
+- **`env` arg** — mahina has no `_ENV` upvalue, so no per-chunk environment.
 - **Per-chunk arena reclamation** — `load` in a loop accumulates `LoadedChunk`s
   until VM teardown (correct, leak-free per `testing.allocator`, but unbounded
   within a run). GC-integrated chunk lifetime is a later optimization.
@@ -646,7 +646,7 @@ section). Fix alongside that.
 
 **Deferred / known cosmetics:**
 - Traceback lines render a named function's name as *both* chunk and function
-  (`foo:5: in function 'foo'`) because lune conflates per-function `proto.name`
+  (`foo:5: in function 'foo'`) because mahina conflates per-function `proto.name`
   with the chunk name (consistent with existing `chunk:line:` error messages).
   Cosmetic; not worth a per-function chunk/name split yet.
 - The rest of `debug.*` (`getinfo`/`sethook`/`getlocal`/…) stays unimplemented —
@@ -700,7 +700,7 @@ On wasm32 `usize` is **32-bit**, so the 64-bit golden-ratio constant in
 `hotIndex` overflows at compile time (and `@intFromPtr(proto)` is 32-bit too).
 The line is unchanged at HEAD — this is a latent breakage from an earlier
 trace/hotcount change, not the metatable work. Consequence: the committed
-`zig-out/bin/lune.wasm` is **stale**, so `viz/test/diff.test.ts`'s cross-engine
+`zig-out/bin/mahina.wasm` is **stale**, so `viz/test/diff.test.ts`'s cross-engine
 byte-identity check cannot be rebuilt/rerun and its pass/fail reflects an old
 artifact (on top of the separate known `arg`-table divergence below). **Fix:**
 make `hotIndex` width-correct on wasm32 — hash in `u64` explicitly
@@ -738,7 +738,7 @@ Implemented: `abs ceil floor sqrt exp log sin cos tan asin acos atan deg rad
 fmod modf max min tointeger ult` + constants `pi huge maxinteger mininteger`.
 `math.modf` landed on the new native multi-return ABI
 (`function.NativeMultiFn` + multret-in-last-position for `local`/assignment).
-Still deferred, each blocked on a capability lune doesn't have yet:
+Still deferred, each blocked on a capability mahina doesn't have yet:
 
 > **Update:** *dynamic* multret (the `all_results = 0xFFFF` sentinel) has since
 > landed too — `print(f())`, `print(0, f())`, `return f()`, method-call last-arg
@@ -771,11 +771,11 @@ Still deferred, each blocked on a capability lune doesn't have yet:
    **LANDED (June 2026): base-host tier closed.** `os.clock` now returns
    Lua-faithful **float seconds** (`nativeClock`, namespaced under `os`; the
    recorded `.clock` effect now carries the float — the serializer round-trips
-   float scalars); the flat `clock` global is gone. Added the lune extension
+   float scalars); the flat `clock` global is gone. Added the mahina extension
    `os.nsclock()` → raw **integer nanoseconds** (shares the `.clock` effect).
    `warn(...)` (Lua 5.4) landed as pure stderr output (`Vm.err`, NOT a recorded
    effect, like `print`): all args must be strings, concatenated to one
-   `lune warning: …` line; a single `@`-prefixed piece is a control message
+   `mahina warning: …` line; a single `@`-prefixed piece is a control message
    (`@off`/`@on` toggle `Vm.warn_enabled`, recognized even while off; unknown `@…`
    ignored). `warn_enabled` is per-session, not serialized.
 
@@ -998,10 +998,10 @@ regression (predates Gap A). Noted so it isn't re-discovered as a bug.
 
 ## Benchmark north-star: run a real LuaJIT bench (`~/Projects/LuaJIT/bench/`)
 
-Goal (Bart): pick a real LuaJIT benchmark to *work toward* end-to-end on lune, even
+Goal (Bart): pick a real LuaJIT benchmark to *work toward* end-to-end on mahina, even
 if unrunnable today — it defines the feature roadmap. None of the bench/ programs
 run verbatim: they all need `tonumber`, `io.write`, `string.format`, `unpack`,
-generic-`for`/`pairs`, `repeat/until`, `math.*`. lune now has most of these
+generic-`for`/`pairs`, `repeat/until`, `math.*`. mahina now has most of these
 (`math.*`, `table.*` incl. `unpack`, `tonumber`/`string.format`/`io.write`,
 generic-`for` + `pairs`/`ipairs`/`next`, `repeat/until`, and bare varargs `...` —
 see below). Remaining vararg work: named `...rest` (`#rest`/`rest[i]`), keyframe
@@ -1054,7 +1054,7 @@ keyframe persistence (frame schema + version bump + suspend-in-vararg F2c), and 
 `{...}`/`{f()}` table-spread follow-up (also fixes the latent `{f()}` bug).
 
 **Recommended target: `nsieve.lua`** — integer + boolean + tables, numeric-`for` hot
-loops; closest to lune's int/bool tier-1b strength and drives the natural next
+loops; closest to mahina's int/bool tier-1b strength and drives the natural next
 expansion (heap/table ops in native codegen). Incremental roadmap:
   1. ~~derived `guard_int`~~ — DONE (#1 above; unlocks pure-int derived loops).
   2. ~~**Minimal host stdlib** for the harness~~ — **DONE.** `tonumber`,
@@ -1071,7 +1071,7 @@ expansion (heap/table ops in native codegen). Incremental roadmap:
      interpret.**
   2b. ~~**Table array-part rehash** (Lua `computesizes`)~~ — **DONE.** Profiling found
      nsieve's keys lived entirely in the **hash part** (it sets `t[2..m]`, never
-     `t[1]`, and lune only grew the array on a contiguous `len+1` append) — the cause
+     `t[1]`, and mahina only grew the array on a contiguous `len+1` append) — the cause
      of *both* the ~6× memory and the fact that a tier-1b array fast path could never
      fire. `Table.set` now runs Lua's histogram-driven rehash (`src/table.zig`:
      `rehash`/`computeArraySize`/`countKey`, density gate `na <= nh*3`), migrating
@@ -1275,13 +1275,13 @@ trace code. Parity tests in interp.zig ("strings: …").
 > there; this section is retained as the original scratch/survey for context.
 
 Mike Pall is formalizing a "Lua-shaped, not Lua-compatible" syntax-extension set
-for LuaJIT 3.0 — the same thesis as lune. Source of truth is the evolving spec in
+for LuaJIT 3.0 — the same thesis as mahina. Source of truth is the evolving spec in
 the **first comment** of LuaJIT/LuaJIT#1475 (full per-operator semantics), with the
 backport scope/checklist in #1476 and the instrumentation-ABI call in #1457. Policy
 Bart set: **match LuaJIT's exact semantics unless we have a specific reason not to;
 where semantics must diverge, keep the *syntax* aligned.**
 
-Precedence foundation is already aligned: lune's Pratt binding powers
+Precedence foundation is already aligned: mahina's Pratt binding powers
 (`infixBp`, src/parser.zig:485-512) match Mike's published precedence table for
 every shared operator, including the bitwise ordering (`&` > binary-`~` > `|`,
 between shifts and comparison). New operators have well-defined slots: `?.` at
@@ -1291,11 +1291,11 @@ index/call level, `??` at `or` level, `?:` just below `or` (right-assoc).
 
 | # | Operator(s) | Decision |
 |---|-------------|----------|
-| 1 | `//` by zero (& general error policy) | **Fail loud / throw.** Syntax matches LuaJIT, semantics diverge (no `inf`/`nan` result). Fail-loud is lune philosophy; it is *not* a JIT tax — a throw is deterministic control flow (replay-safe), and on a guarded-upstream hot path the cost is one predictable branch the optimizer can eliminate as a redundant guard. What hurts a trace is the exceptional path being *taken*, not its existence. |
-| 2 | `& \| ~ << >> ~>>` (bitwise) | Keep **syntax** aligned; **64-bit native** semantics — deliberate divergence from LuaJIT's 32-bit `bit.*` (lune has no `bit` library; native i64 ops, see "stdlib `math`"/bitwise notes above). |
-| 3 | `~>>` arithmetic right shift + `~>>=` | **Add** — completes the operator set. Currently lune has `>>` (logical) but no `~>>`; add the token (`~>>`), AST op (e.g. `sar`), and compound form. |
+| 1 | `//` by zero (& general error policy) | **Fail loud / throw.** Syntax matches LuaJIT, semantics diverge (no `inf`/`nan` result). Fail-loud is mahina philosophy; it is *not* a JIT tax — a throw is deterministic control flow (replay-safe), and on a guarded-upstream hot path the cost is one predictable branch the optimizer can eliminate as a redundant guard. What hurts a trace is the exceptional path being *taken*, not its existence. |
+| 2 | `& \| ~ << >> ~>>` (bitwise) | Keep **syntax** aligned; **64-bit native** semantics — deliberate divergence from LuaJIT's 32-bit `bit.*` (mahina has no `bit` library; native i64 ops, see "stdlib `math`"/bitwise notes above). |
+| 3 | `~>>` arithmetic right shift + `~>>=` | **Add** — completes the operator set. Currently mahina has `>>` (logical) but no `~>>`; add the token (`~>>`), AST op (e.g. `sar`), and compound form. |
 | 4 | `! && \|\| !=` (customary operators) | **Add** as pure aliases for `not`/`and`/`or`/`~=`. Two-ways-to-write is acceptable here (Bart writes `&&`). Identical semantics. |
-| 5 | `??` (nil-coalescing) | **Add.** Checks **pure nil only** (the only nil lune has — no NULL cdata). Eval `a` once, short-circuit `b`. |
+| 5 | `??` (nil-coalescing) | **Add.** Checks **pure nil only** (the only nil mahina has — no NULL cdata). Eval `a` once, short-circuit `b`. |
 
 ### Still on the table (not yet decided) — exact semantics to match when we do
 
@@ -1313,7 +1313,7 @@ index/call level, `??` at `or` level, `?:` just below `or` (right-assoc).
 - **`??=`** — short-circuits `b`.
 - **`continue`** — landmine is `repeat…until` where `continue` jumps into a local's
   scope referenced by `until`. Mike rejects continue-into-scope; he can afford the
-  analysis (3.0 parser is SSA). lune is tree-walk+JIT → needs its own equivalent
+  analysis (3.0 parser is SSA). mahina is tree-walk+JIT → needs its own equivalent
   check, not a verbatim lift.
 - **Underscores in number literals** — `1_000_000`. Lexer-only.
 
@@ -1338,7 +1338,7 @@ Repro (crashes at HEAD d4d82d9 too — NOT introduced by 2c-E; tier-0 and
 `--jit-native` both print 2552):
 
 ```lua
--- /tmp/probe1.lua ; ./zig-out/bin/lune --trace /tmp/probe1.lua
+-- /tmp/probe1.lua ; ./zig-out/bin/mahina --trace /tmp/probe1.lua
 local s = 0
 local m = 30
 for i = 1, 300 do

@@ -230,7 +230,7 @@ export class ConstNilDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A heap string constant: the raw bytes (lune strings are byte strings, not necessarily UTF-8).
+ * A heap string constant: the raw bytes (mahina strings are byte strings, not necessarily UTF-8).
  */
 export interface ConstStringInput {
   /**
@@ -241,7 +241,7 @@ export interface ConstStringInput {
 }
 
 /**
- * A heap string constant: the raw bytes (lune strings are byte strings, not necessarily UTF-8).
+ * A heap string constant: the raw bytes (mahina strings are byte strings, not necessarily UTF-8).
  */
 export interface ConstStringOutput {
   /**
@@ -306,7 +306,7 @@ export class ConstStringDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A trace constant. `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4). A heap_ref const is always a string (tables/closures are never compile-time constants).
+ * A trace constant. `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4). A heap_ref const is always a string (tables/closures are never compile-time constants).
  */
 export interface ConstValueInput {
   /**
@@ -332,7 +332,7 @@ export interface ConstValueInput {
 }
 
 /**
- * A trace constant. `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4). A heap_ref const is always a string (tables/closures are never compile-time constants).
+ * A trace constant. `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4). A heap_ref const is always a string (tables/closures are never compile-time constants).
  */
 export interface ConstValueOutput {
   /**
@@ -1091,7 +1091,7 @@ export class HeapRefDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+ * A live runtime Value on the wire (src/value.zig). `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
  */
 export interface SnapValueInput {
   /**
@@ -1117,7 +1117,7 @@ export interface SnapValueInput {
 }
 
 /**
- * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+ * A live runtime Value on the wire (src/value.zig). `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
  */
 export interface SnapValueOutput {
   /**
@@ -1292,11 +1292,11 @@ export class SnapValueDecoder extends SeekableBitStreamDecoder {
  */
 export interface TableEntryInput {
   /**
-   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
    */
   key: SnapValueInput;
   /**
-   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
    */
   val: SnapValueInput;
 }
@@ -1306,11 +1306,11 @@ export interface TableEntryInput {
  */
 export interface TableEntryOutput {
   /**
-   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
    */
   key: SnapValueOutput;
   /**
-   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
    */
   val: SnapValueOutput;
 }
@@ -1439,7 +1439,7 @@ export class TableEntryDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * A heap string object's raw bytes (lune strings are byte strings, not necessarily UTF-8). Interned at restore.
+ * A heap string object's raw bytes (mahina strings are byte strings, not necessarily UTF-8). Interned at restore.
  */
 export interface HeapStringInput {
   /**
@@ -1450,7 +1450,7 @@ export interface HeapStringInput {
 }
 
 /**
- * A heap string object's raw bytes (lune strings are byte strings, not necessarily UTF-8). Interned at restore.
+ * A heap string object's raw bytes (mahina strings are byte strings, not necessarily UTF-8). Interned at restore.
  */
 export interface HeapStringOutput {
   /**
@@ -1873,7 +1873,7 @@ export interface HeapUpvalueInput {
    */
   closed: number;
   /**
-   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
    */
   value: SnapValueInput;
 }
@@ -1888,7 +1888,7 @@ export interface HeapUpvalueOutput {
    */
   closed: number;
   /**
-   * A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
+   * A live runtime Value on the wire (src/value.zig). `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).
    */
   value: SnapValueOutput;
 }
@@ -3366,7 +3366,7 @@ export class EffectResultDecoder extends SeekableBitStreamDecoder {
 }
 
 /**
- * One recorded nondeterministic INPUT: the host effect that produced it and the Value it returned. `kind` mirrors lune's interp.EffectKind enum (clock=0, random_seed=1, getenv=2, argc=3, argv=4). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars (clock/argc/random_seed) plus inline string bytes (getenv/argv), never a heap_ref.
+ * One recorded nondeterministic INPUT: the host effect that produced it and the Value it returned. `kind` mirrors mahina's interp.EffectKind enum (clock=0, random_seed=1, getenv=2, argc=3, argv=4). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars (clock/argc/random_seed) plus inline string bytes (getenv/argv), never a heap_ref.
  */
 export interface EffectInput {
   /**
@@ -3381,7 +3381,7 @@ export interface EffectInput {
 }
 
 /**
- * One recorded nondeterministic INPUT: the host effect that produced it and the Value it returned. `kind` mirrors lune's interp.EffectKind enum (clock=0, random_seed=1, getenv=2, argc=3, argv=4). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars (clock/argc/random_seed) plus inline string bytes (getenv/argv), never a heap_ref.
+ * One recorded nondeterministic INPUT: the host effect that produced it and the Value it returned. `kind` mirrors mahina's interp.EffectKind enum (clock=0, random_seed=1, getenv=2, argc=3, argv=4). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars (clock/argc/random_seed) plus inline string bytes (getenv/argv), never a heap_ref.
  */
 export interface EffectOutput {
   /**

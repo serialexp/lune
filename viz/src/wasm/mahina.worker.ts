@@ -1,15 +1,15 @@
-// Web Worker host for the in-browser lune VM. The WASM module runs the script
+// Web Worker host for the in-browser mahina VM. The WASM module runs the script
 // synchronously (it blocks whatever thread it's on), so the main thread must not
 // be it — this worker owns the single module instance and answers run/check/
 // replay requests over `postMessage`, keeping the SolidJS UI responsive during a
 // run, a linter `check`, or a replay scrub.
 //
-// The wire protocol is a tiny request/response RPC (see `lune-client.ts` for the
+// The wire protocol is a tiny request/response RPC (see `mahina-client.ts` for the
 // caller side). All artifacts already cross the structured-clone boundary
-// cleanly: `readBuf` (`lune.ts`) copies every blob out of linear memory, and the
+// cleanly: `readBuf` (`mahina.ts`) copies every blob out of linear memory, and the
 // result structs are plain data (strings, numbers, typed arrays, plain objects).
 
-import { loadLune, type LuneModule, type LuneRunResult, type LuneReplayResult } from "./lune";
+import { loadMahina, type MahinaModule, type MahinaRunResult, type MahinaReplayResult } from "./mahina";
 
 /** Request from the client. `init` must arrive (once) before any call; it carries
  *  the wasm URL to instantiate from. Each call carries a unique `id` the client
@@ -26,17 +26,17 @@ type Res =
 
 // The single module instance, lazily created by the first `init`. Subsequent
 // `init`s are idempotent (the client only sends one, but be defensive).
-let modPromise: Promise<LuneModule> | null = null;
+let modPromise: Promise<MahinaModule> | null = null;
 
-function ensureModule(url: string): Promise<LuneModule> {
-  if (modPromise === null) modPromise = loadLune(url);
+function ensureModule(url: string): Promise<MahinaModule> {
+  if (modPromise === null) modPromise = loadMahina(url);
   return modPromise;
 }
 
 /** Collect the transferable `ArrayBuffer`s of a run result so structured clone
  *  moves (not copies) the artifact bytes back to the main thread. They're
  *  throwaway copies in the worker, so transferring ownership is safe. */
-function runTransferables(r: LuneRunResult): Transferable[] {
+function runTransferables(r: MahinaRunResult): Transferable[] {
   return [
     r.keyframe.buffer,
     r.effects.buffer,
@@ -47,7 +47,7 @@ function runTransferables(r: LuneRunResult): Transferable[] {
   ] as Transferable[];
 }
 
-function replayTransferables(r: LuneReplayResult): Transferable[] {
+function replayTransferables(r: MahinaReplayResult): Transferable[] {
   return [r.keyframe.buffer] as Transferable[];
 }
 
@@ -59,7 +59,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       post({ id: req.id, ok: true, result: null });
       return;
     }
-    if (modPromise === null) throw new Error("lune worker: request before init");
+    if (modPromise === null) throw new Error("mahina worker: request before init");
     const mod = await modPromise;
     switch (req.method) {
       case "run": {

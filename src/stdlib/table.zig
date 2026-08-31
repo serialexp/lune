@@ -1,6 +1,6 @@
-//! lune stdlib — the `table` library.
+//! mahina stdlib — the `table` library.
 //!
-//! Sequence/array helpers over lune's `Table` (tier `core` in
+//! Sequence/array helpers over mahina's `Table` (tier `core` in
 //! `docs/lua-stdlib-inventory.csv`). **Unlike `stdlib/math.zig`, these natives
 //! need the VM**: they allocate (shift/append via `Table.set`, `vm.gpa`), intern
 //! strings (`vm.heap.internValue` for `concat`), and create tables
@@ -25,7 +25,7 @@
 //! under an inconsistent comparator (we do not emulate Lua's "invalid order
 //! function" detection; `docs/design/02-determinism.md` requires reproducibility,
 //! not Lua's exact ordering of equal elements). The default comparator is
-//! `arith.lt` — matching lune's `<` operator exactly (numeric-only today; sorting
+//! `arith.lt` — matching mahina's `<` operator exactly (numeric-only today; sorting
 //! non-numbers without a `comp` raises `TypeError`, the same gap `<` has). A
 //! custom comparator re-enters the VM via `Vm.callValue`; a comparator that errors
 //! propagates out (catchable by an enclosing `pcall`). GC discipline: elements are
@@ -257,7 +257,7 @@ fn tUnpackN(ctx: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 // ---------------------------------------------------------------------------
 
 /// `a < b` under the active comparator: the user closure (truthiness of its first
-/// result) when `comp` is non-null, else lune's numeric `<` (`arith.lt`).
+/// result) when `comp` is non-null, else mahina's numeric `<` (`arith.lt`).
 fn sortLess(vm: *Vm, comp: ?Value, a: Value, b: Value) anyerror!bool {
     if (comp) |c| {
         var r: [1]Value = .{Value.nil()};

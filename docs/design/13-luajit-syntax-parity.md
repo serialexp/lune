@@ -1,10 +1,10 @@
-# lune — LuaJIT 3.0 Syntax-Extension Parity
+# mahina — LuaJIT 3.0 Syntax-Extension Parity
 
 Status: partial — Phases 1–5 landed; only the error-policy doc-link cross-reference outstanding
 Owner: Bart
 Last updated: 2026-06-26
 
-> Scope of *this* doc: the syntax extensions lune has **decided to adopt**, with
+> Scope of *this* doc: the syntax extensions mahina has **decided to adopt**, with
 > the exact semantics to match (or the exact reason we diverge). Undecided and
 > still-moving LuaJIT proposals are listed under "Parked" so they aren't lost,
 > but they are explicitly out of this doc's contract until promoted.
@@ -85,7 +85,7 @@ whole phases to "Done" once everything inside is checked.
 ## Why this exists
 
 Mike Pall is, as of June 2026, formalizing a "Lua-shaped, not Lua-compatible"
-syntax-extension set for **LuaJIT 3.0** — the same positioning lune was built on.
+syntax-extension set for **LuaJIT 3.0** — the same positioning mahina was built on.
 The canonical spec is the evolving **first comment of LuaJIT/LuaJIT#1475** (full
 per-operator semantics); the backport scope/checklist is **#1476**; an adjacent
 instrumentation-ABI call is **#1457**.
@@ -98,7 +98,7 @@ knowingly fork.
 
 ## What's already aligned (no work)
 
-lune's operator **precedence already matches** Mike's published table for every
+mahina's operator **precedence already matches** Mike's published table for every
 shared operator. The Pratt binding powers live in `infixBp`
 (`src/parser.zig:485-512`); the bitwise ordering in particular is identical —
 `&` binds tighter than binary `~` (xor) tighter than `|`, all sitting between the
@@ -114,7 +114,7 @@ unambiguous slots —
 
 The existing bitwise tokens (`& | ~ << >>`), `//`, `~=`, and the full arithmetic
 set are already lexed, parsed, and evaluated (`src/token.zig`, `src/ast.zig`,
-`src/interp.zig`). lune runs on native **i64/f64** with real integers — there is
+`src/interp.zig`). mahina runs on native **i64/f64** with real integers — there is
 no `bit.*` library and none is planned.
 
 ## Decisions (the contract)
@@ -122,10 +122,10 @@ no `bit.*` library and none is planned.
 ### 1. `//` by zero — fail loud (deliberate divergence)
 
 LuaJIT: plain-number `7 // 0` returns `+inf`/`-inf`/`nan` and **never throws**
-(Mike: a compiler wants to avoid "may return or may throw" operations). lune:
+(Mike: a compiler wants to avoid "may return or may throw" operations). mahina:
 **throws.** Syntax identical, semantics diverge.
 
-This is lune philosophy (fail loudly on unexpected conditions), and it is *not* a
+This is mahina philosophy (fail loudly on unexpected conditions), and it is *not* a
 JIT tax:
 
 - A throw is **deterministic control flow** (same operands → same throw), so it is
@@ -140,20 +140,20 @@ JIT tax:
   abort / side-exit storm / blacklist) — not its mere existence. "Handle it so you
   never hit that path" is exactly the condition under which the throw is free.
 
-The general rule this instances: **lune fails loud; LuaJIT's no-throw arithmetic
+The general rule this instances: **mahina fails loud; LuaJIT's no-throw arithmetic
 bias is not adopted.** Record the canonical statement in the error-taxonomy doc.
 
 ### 2. Bitwise `& | ~ << >> ~>>` — syntax aligned, 64-bit semantics (divergence)
 
 LuaJIT's bit operators are `bit.*` semantics: **32-bit** on plain numbers (64-bit
-only for cdata). lune has **native 64-bit** operators and no `bit` library. We
+only for cdata). mahina has **native 64-bit** operators and no `bit` library. We
 keep the operator *syntax* identical but the *width* diverges: `~x`, `>>`, `<<`,
 and `~>>` produce different values than LuaJIT for the same source. This was
-already lune's design before #1475; #1475 just confirms the syntax to match.
+already mahina's design before #1475; #1475 just confirms the syntax to match.
 
 ### 3. `~>>` arithmetic right shift (+ `~>>=`) — add
 
-Completes the shift set. lune today has `>>` (logical, zero-fill) but no
+Completes the shift set. mahina today has `>>` (logical, zero-fill) but no
 arithmetic (sign-extending) shift. Add token `~>>`, AST op (`sar`/`ashr`), tier-0
 eval, native lowering, and the `~>>=` compound form. Mike's symbol choice rationale
 (`>>>` reads as *logical* in JS, so `~>>` was the next-best for arithmetic) — we
@@ -177,7 +177,7 @@ Two-ways-to-write is accepted here (Bart writes `&&`). No AST or eval change.
 
 `a ?? b` returns `b` **iff `a` is nil**, else `a`. Evaluate `a` once;
 short-circuit `b` (not evaluated when `a` is non-nil — matters for side effects).
-**Pure-nil check only** — lune has no NULL cdata pointer, so the only nil is nil;
+**Pure-nil check only** — mahina has no NULL cdata pointer, so the only nil is nil;
 do not generalize to falsiness (that's the `a or b` pitfall this operator exists
 to avoid). Precedence: `or` level, left-assoc.
 
@@ -199,7 +199,7 @@ promoted, so the survey work isn't repeated.
   compound ops), single-eval of the target prefix.
 - **`continue`** — landmine: `repeat…until` where `continue` jumps into a local's
   scope referenced by the `until` expression. Mike rejects continue-into-scope; he
-  affords the analysis because the 3.0 parser is SSA. lune is tree-walk + JIT, so
+  affords the analysis because the 3.0 parser is SSA. mahina is tree-walk + JIT, so
   this needs its own equivalent scope check, not a verbatim lift.
 - **Underscores in number literals** — `1_000_000`. Lexer-only; trivial.
 
@@ -217,7 +217,7 @@ promoted, so the survey work isn't repeated.
 - **#1457 instrumentation ABI** — Mike proposes near-zero-overhead VM
   instrumentation (machine-code addr → trace number, per-trace details, frame
   walking) so external profilers stop disassembling the VM. That is the
-  introspection surface lune's trace visualiser / time-travel replay already owns
+  introspection surface mahina's trace visualiser / time-travel replay already owns
   natively. Worth lurking as a gap-check on what a tracing JIT "should" expose; no
   action.
 
@@ -232,7 +232,7 @@ so it gets the most test surface.
 
 ## Open questions for review
 
-- [ ] Where does the canonical "lune fails loud, no silent inf/nan" statement
+- [ ] Where does the canonical "mahina fails loud, no silent inf/nan" statement
       live — `02-determinism.md`, a new error-taxonomy doc, or here? (Decision 1
       references it; pick one home.)
 - [x] AST op name for arithmetic shift: **resolved to `sar`** (matches the x86

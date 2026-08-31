@@ -21,6 +21,57 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-08-31 (LATEST-102) — **PROJECT RENAMED: lune -> mahina.** Not a
+campaign arc; a name collision. Gates green, one real bug caught by the rename.
+
+`lune` collides with [lune-org/lune](https://github.com/lune-org/lune), an
+established standalone Luau runtime (~935 stars, Rust, MPL-2.0). Same language
+family, same shape of tool — unworkable. **mahina** is Hawaiian for *moon*,
+continuing the Lua (Portuguese) / Luau / Lune (French) habit. Checked free on
+crates.io, npm, and exact-name GitHub repos before picking. (`aeon` was
+considered and rejected: five separate languages already use it.)
+
+Mechanical sweep via `tools/rename_project.py` (dry-run by default, Rule #6):
+2031 occurrences across 291 files, three case forms, longest-first. A survey of
+every `\w*lune\w*` in the tree first confirmed **no English word contains "lune"
+as a substring** — every hit was the project — so a blanket substring replace was
+safe with no word-boundary logic. The five owned file extensions fell out for
+free (`.lune`/`.lunetrace`/`.lunesnap`/`.luneeff`/`.lunecov` ->
+`.mahina`/`.mahinatrace`/...), plus 7 `git mv`s on viz/ files.
+
+**`build.zig.zon` fingerprint.** The low half is a checksum of `.name`, so the
+rename invalidated it. `zig build` refuses the stale value and prints the correct
+one: `0xc428eee2feabed4a` -> `0xd9a5db7eaf66e979`. Comment at the field corrected
+— it previously claimed the fingerprint is "generated once and never changed",
+which is false under a rename.
+
+**The one real bug the rename exposed.** `bench/stdlib/str_find_match.lua` had the
+project name inside its *corpus string* (`"key=value; name=lune; ..."`), not just
+in a comment. `lune`(4) -> `mahina`(6) lengthened the corpus, which shifted the
+offsets returned by the plain `find(text, "year")`, which moved `acc` — and so
+moved all three frozen digests. Caught by `tools/hashgate.py`, which is exactly
+what it is for.
+
+Analysis: `acc` depends on that token **only through its byte length** (the two
+other matches are anchored before it or on a separate constant string). So the
+fix is a *length-preserving* neutral token — `name=moon` — which restores the
+frozen digests byte-for-byte AND removes the project-name coupling permanently.
+No ref regeneration. A comment at the site now records why the token is 4 bytes.
+
+Gate battery, all green:
+- `zig build test`, `zig build test -Djit-debug=true`, `just check-version`
+- `just release` + `tools/hashgate.py` -> **84/84, refs file diff is the two
+  header comment lines only** (verified with `git diff`)
+- `str_find_match` agrees across five engines: t0 / `--trace` / `--jit-native` /
+  LuaJIT / lua5.4, all `acc=47800000`
+- `npx tsc --noEmit` in `viz/` clean (the 7 renamed TS/TSX files typecheck)
+- 9 aligned usage-comment blocks re-padded (`luajit` was hand-aligned against the
+  old 4-letter name). Comment-only; the dry run caught and spared one prose line
+  a naive regex would have mangled.
+
+**Not done, needs Bart:** the gothab remote is still `serialexp/lune`, and the
+working directory is still `~/Projects/lune`. Both are outside the tree.
+
 ## Status 2026-08-30 (LATEST-101) — **DOC 32 ARC (B2, `.value`-lane scalar access) IMPLEMENTED, NOT COMMITTED — awaiting Bart's scoping call. Coverage claim MET (spectral-norm `get_index nyi_opcode` aborts GONE, iteration coverage 54.7% → 99.5%); speed claim MISSED (−4.2%, not the predicted ~5×) because the payoff is blocked by a NEW distinct bug, B2b. Benchmarking MOVED to the Gothab remote profile pool (`gt profile`) — the desktop board is unusable.**
 
 ### What landed in the tree (uncommitted)
@@ -303,7 +354,7 @@ requires Bart's explicit go-ahead.
 
 **OPEN DECISIONS for Bart** (Rule #17): (i) doc 29 §B2 tonumber grammar —
 (a) freeze today's std.fmt-artifact grammar (fast path already landed, valid
-under any choice) / (b) Lua 5.4 grammar / (c) LuaJIT grammar. Today lune
+under any choice) / (b) Lua 5.4 grammar / (c) LuaJIT grammar. Today mahina
 accepts `"1_000"`→1000, `"0o17"`, `"0b101"`, `"inf"` — none Lua-legal.
 (ii) doc 30 v3 go-ahead (ops 72–79: sfindp/smatch/sgmatch/scap_*/str2num_*/
 sgm_setpos + guard_sid; kills the host_barrier on find/match/gmatch/tonumber;
@@ -497,7 +548,7 @@ tests: closure legs must be PARAM-clean — an upvalue/global read inside an
 inlined callee hits the pre-existing U0 barrier and masks the multret path.
 
 **Gates:** suite green (19 matching tests pass), hashgate 84/84, board
-28/28 cross=ok vs HEAD shadow baseline (/tmp/lune-base-multinest, sources
+28/28 cross=ok vs HEAD shadow baseline (/tmp/mahina-base-multinest, sources
 restored via `git show HEAD:`): flat within noise (recursive-fib/scimark-fft
 looked inflated but LuaJIT's own column moved too — re-runs confirmed
 contention). Board tsv 20260828-163336 committed.
@@ -626,7 +677,7 @@ Full campaign loop: doc 25 written → codex-reviewed → implemented → gates.
   golden-byte tests incl. the REX.B lane.
 - **PRE-EXISTING BUG FOUND (Rule #0.5)**: `arith.mod`'s comment claimed
   "@mod is floored; minInt % -1 == 0 (no overflow)" — FALSE. `@mod` lowers
-  to hardware idiv → `minInt % -1` SIGFPE'd tier-0 lune (CLI-reproduced).
+  to hardware idiv → `minInt % -1` SIGFPE'd tier-0 mahina (CLI-reproduced).
   Exposed by the doc-25 pair test exercising the tier-1a oracle. Fix:
   `y == -1 → 0` special case (mathematically x % -1 == 0 for EVERY x under
   floored mod; Lua 5.4's luaV_mod does the same). Pinned in arith tests
@@ -1079,7 +1130,7 @@ TODO.md is "stop pushing a frame the native path never uses" rather than "make
 the stack cheaper."
 
 **Gate.** `just test` + `-Djit-debug=true` green. `just hashgate` 84/84 on BOTH
-legs — the second one new: `--also-lune` runs the identical corpus under a
+legs — the second one new: `--also-mahina` runs the identical corpus under a
 safety-checked Debug build, since the gate had only ever seen ReleaseFast and
 that is precisely why these two bugs survived. Proven load-bearing: with the fix
 reverted the release leg passes 6/6 on the affected programs while the Debug leg
@@ -1253,7 +1304,7 @@ parity ok throughout; best-of-9 A/B vs a verified `just shadow` post-B binary
 neutral-to-better on all five hot programs (sor +0.3%, lu −1.3%, nbody −1.6%,
 fft −3.3%, spectral −0.2%).
 
-**Everything Phase C is archived** at `~/lune-phasec-archive/` (full tree copy
+**Everything Phase C is archived** at `~/mahina-phasec-archive/` (full tree copy
 + `phaseC-tracked.patch` + the untracked modules + the commit-4 bug design).
 Nothing was lost; it is simply not in the tree.
 
@@ -1671,7 +1722,7 @@ code, clustered in trailing regions behind each file's own banner comments.
   dead-slot exit-snapshot fix — (a) stop liveness-pruning written slots from
   exit snapshots, (b) mask dead slots at capture, (c) relax §R3 to logical
   comparison.
-- Shadow tree `/tmp/lune-preflip` removed after the A/B. Bench TSVs remain
+- Shadow tree `/tmp/mahina-preflip` removed after the A/B. Bench TSVs remain
   untracked per standing rule.
 
 ## Status 2026-08-15 (LATEST-65) — **Doc 20 Phase 1 (THE flip) LANDED; Phase 2 (§P measurement) next. Pre-existing §R3 keyframeser red diagnosed (H-5(i)), NOT a doc-20 regression.**
@@ -2312,12 +2363,12 @@ round 6; interleaved min-of-11 ReleaseFast A/B neutral.
 
 **Two measurement traps that cost real time this session — read before timing
 anything.** (a) `just test` and `zig build test` leave a **Debug**
-`zig-out/bin/lune`; a binary copied after them times ~3× slow and produces
+`zig-out/bin/mahina`; a binary copied after them times ~3× slow and produces
 garbage A/Bs (this fooled me twice — the tell was `-Djit-debug` telemetry being
 byte-identical, i.e. no tiering change could explain the delta). Always re-run
 `just release` before copying. (b) A single wall-clock board row can be an
 outlier: `pi_leibniz` read 39.3 ms on one board and 12.8 ms on the next while
-`lune_jit_execns` stayed at 38.8 M — identical work. Cross-check the exec-ns
+`mahina_jit_execns` stayed at 38.8 M — identical work. Cross-check the exec-ns
 column before believing a wall delta.
 
 Open next: **B-3c** budget tune (534 of 12,824 bursts exhaust `silent_budget =
@@ -2453,7 +2504,7 @@ Full narrative + the five landing deltas are in doc 17 §B.7; short form:
 4. **build.zig: `-Dtest-filter=<substr>`** wired into both test steps
    (verified against the pinned stdlib `Build.TestOptions.filters`).
 
-### Measured (interleaved min-of-21, vs B-1 binary /tmp/lune-B1)
+### Measured (interleaved min-of-21, vs B-1 binary /tmp/mahina-B1)
 
 nsieve 9: 109→86ms (−21%); nsieve 7 −18%; nsieve 3 −19%; sieve_int −20%;
 walks at N=9: 330,206 → 53,746 (53,625 at LEDGER_CAP — the full native cycle
@@ -2533,7 +2584,7 @@ together, never by cyc/walk alone.
 
 `zig build test` + `-Djit-debug=true` both OK; all SEVEN output hashes OK
 (incl. nsieve-bit 6 = 49601107e4d95035 — NB run `bench/luajit/nsieve-bit.lua`,
-the 5.4-syntax lune copy, not the LuaJIT-tree file which needs `bit`);
+the 5.4-syntax mahina copy, not the LuaJIT-tree file which needs `bit`);
 aviii/aviii-which → 109, floatlink → 18135.
 
 ### Next (agreed with Bart)
@@ -2604,7 +2655,7 @@ Tests green both builds; seven output-identity hashes byte-identical; A-viii
 
 ### Why (Bart: "the most correct change — start with what Pall does")
 
-The N-sweep showed lune's small-N nsieve gap is not process startup (0.34ms vs
+The N-sweep showed mahina's small-N nsieve gap is not process startup (0.34ms vs
 LuaJIT 0.30ms empty script) but the scan loop never tiering up below N≈7: at
 N=3 its receipts are all `completed=1..5` (prime-gap segments, below
 `min_useful=8`), every one struck, the anchor gated within 8 receipts, and a
@@ -2648,7 +2699,7 @@ invention.
 7. Four tests re-pinned from "short productive segment strikes" to the Pall
    semantics (null penalty).
 
-### Measurements (min-of-21 vs /tmp/lune-optA = prior commit, /tmp/lune-hotexit3)
+### Measurements (min-of-21 vs /tmp/mahina-optA = prior commit, /tmp/mahina-hotexit3)
 
 nsieve 3 −17.5%, nsieve 7 −4.4%, nsieve 9 −0.6%, nsieve 10 −1.9%; sieve_int/
 pi_leibniz/grid_matmul/nbody flat (±2%). N-sweep ratios vs LuaJIT: N=1 2.3×,
@@ -2697,7 +2748,7 @@ pi_leibniz unchanged (±2%).
 
 ---
 
-## Status 2026-08-13 (LATEST-43) — **Option A: guard-failure-aware gating. nsieve −48%, sieve_int −32%; nsieve now at/below LuaJIT wall-clock on this box (nsieve 9: lune 136ms vs LuaJIT 144ms; nsieve 10: 266ms vs 427ms; sieve_int parity 63ms vs 62ms). All green, all six hashes identical.**
+## Status 2026-08-13 (LATEST-43) — **Option A: guard-failure-aware gating. nsieve −48%, sieve_int −32%; nsieve now at/below LuaJIT wall-clock on this box (nsieve 9: mahina 136ms vs LuaJIT 144ms; nsieve 10: 266ms vs 427ms; sieve_int parity 63ms vs 62ms). All green, all six hashes identical.**
 
 ### The problem (diagnosed last arc)
 
@@ -2741,7 +2792,7 @@ trace recorded and completes the whole init loop natively; third size selects
 it after ONE strike. `--jit-stats` nsieve 9: anchor nsieve:4 went 3.9% → 53.9%
 traced-time, its run share 37.8% → 6.1%; whole-run traced time 69.1%.
 
-### Measurements (min-of-21 vs /tmp/lune-memo1 = prior commit, /tmp/lune-optA)
+### Measurements (min-of-21 vs /tmp/mahina-memo1 = prior commit, /tmp/mahina-optA)
 
 nsieve 9 −47.8% (259.8→135.7ms), nsieve 10 −47.1% (503.0→266.2ms), sieve_int
 −31.8% (92.3→62.9ms), pi_leibniz +0.3%, grid_matmul −1.7%, nbody +2.7% (noise;
@@ -2804,7 +2855,7 @@ back ON. Full story in the `sibling_handoff_arming_enabled` doc comment.
    invalidated in `freeObserverFast` (every `region_profit` mutation funnels
    there) + the qualification flip + `region_defs_gen`.
 
-### Measurements (min-of-21, vs /tmp/lune-memo1 pre-S baseline, noisy box)
+### Measurements (min-of-21, vs /tmp/mahina-memo1 pre-S baseline, noisy box)
 
 nsieve 9 −14…−23%, nsieve 10 −14…−26%, sieve_int −23…−42%, pi_leibniz ~0.
 Profile after: `accountRegionProfit` 0%, `replayLedger` self ~13%, tier-0
@@ -3061,7 +3112,7 @@ in src/trace.zig, all general mechanisms (Z-6) — full record in doc 17 §A8-v:
    fused receipt, and each re-open freed + reallocated the observer bitset and
    killed `ObserverHot` (9.6% of wall). Coverage converted only after this fix.
 
-**Measured** (interleaved A/B vs /tmp/lune-fast2 = 182cb87+49f3984): nsieve N=9
+**Measured** (interleaved A/B vs /tmp/mahina-fast2 = 182cb87+49f3984): nsieve N=9
 0.32 → 0.30–0.31s raw; full suite nsieve −19.6% (103.2 → 83.0ms), sieve_int
 −25.9% (41.1 → 30.5ms), all else within ±3.3%. Six-workload output hashes ≡
 frozen controls. New permanent dbg probes: gateAnchor, legacy-strike,
@@ -3322,7 +3373,7 @@ Full narrative in doc 17 §A8-iii item 5. The short version:
    differs) — with matching args all six workloads are byte-identical.
 4. **Final numbers (before → after+e.1):** nsieve N=9 436→396 ms (−9%),
    N=7 105→99 ms (−6%); `just bench --filter nsieve --reps 7` jit
-   101.0→102.9 ms (noise); full suite: no lune-side flags (str_manip
+   101.0→102.9 ms (noise); full suite: no mahina-side flags (str_manip
    luajit=ERR is the LuaJIT binary failing that bench, unrelated). Gates:
    `just test` (836) + `-Djit-debug=true` green. Doc 17 §A8 step 7 TICKED;
    status header updated.
@@ -3742,7 +3793,7 @@ for the real gate). `observeRegionProgramPoint(proto_id, pc, depth, call_seq)` r
 behind an `if regionProfitCount() != 0` guard (no per-op call/alloc on the common path; account fns return
 `void` + `getOrPut … catch return null`, so no OOM propagates into execution). Activation-scoped cleanup
 drops entries at EVERY frame-destroy site — normal pop ×2 (`dropRegionActivation`) and pcall/xpcall unwind ×3
-(`dropRegionActivationsFromDepth`, before the depth restore); lune has **no coroutines**, so that set is
+(`dropRegionActivationsFromDepth`, before the depth restore); mahina has **no coroutines**, so that set is
 complete. `region_profit` is transient (NOT serialized; keyframe schema stays v5) and reset at restore +
 every `beginTopLevelEpoch` (`clearCache → resetRegionProfit`). §A5 cardinality (≤1 accumulator per
 `(activation, owner-anchor)`) is release-`@panic`-enforced and unreachable by construction.
@@ -3750,8 +3801,8 @@ every `beginTopLevelEpoch` (`clearCache → resetRegionProfit`). §A5 cardinalit
 **Reverse-setup workflow (per Bart):** Codex designed + implemented; Claude + antigravity reviewed. The codex
 MCP run overran the 30-min idle timeout (A-iv is large) and the client aborted mid-run, but the detached
 subprocess left a compiling, green tree; after it went quiet I reviewed the dirty tree cold. **antigravity
-returned BLOCKER (2 findings), both adjudicated N/A against lune's actual code/design:** (F4) tail-call frame
-reuse — lune has no Lua-level TAILCALL opcode, every call/return is balanced through push/drop, so no orphan;
+returned BLOCKER (2 findings), both adjudicated N/A against mahina's actual code/design:** (F4) tail-call frame
+reuse — mahina has no Lua-level TAILCALL opcode, every call/return is balanced through push/drop, so no orphan;
 (F5) release `@panic` in `openRegion` — §A5 *mandates* a release-enforced invariant (same as A-iii's
 `call_seq` exhaustion panic), and it's unreachable by construction, so downgrading to `std.debug.assert` would
 violate the design. Claude verdict = APPROVE.
@@ -4343,7 +4394,7 @@ predates and exceeds doc 17. That's why it's escalated rather than ground into a
   - **G-4 (codex STILL-BLOCKER for cuts)** — a native F2c cut selected by safepoint count is
     tier-dependent (native runs fewer dispatch safepoints → `suspend_ctl` cuts at a different logical
     point → different-length effect-log prefix).
-  - **G-5 (Antigravity)** — cross-stack coroutine re-key collision: grounded **N/A** (lune has ONE
+  - **G-5 (Antigravity)** — cross-stack coroutine re-key collision: grounded **N/A** (mahina has ONE
     physical stack; keyframeser has no multi-stack path). Invariant pinned for a future coroutine
     feature.
 - **Round-8 design pass WRITTEN** (doc 17 §Part A — round-8 design), grounded (`guardExitPc` gap +
@@ -4397,9 +4448,9 @@ blockers, iterate to round 9.
 - **Round-6 REVIEW DONE (codex gpt-5.6-sol + Antigravity) = reshaping insight SURVIVES / BLOCKER.**
   - codex (read the tree): **"a v4→v5 schema bump is not inherently required"** → **E-5 deviation
     VINDICATED, keyframe stays v4.** Marks E-3/E-4/E-6 RESOLVED.
-  - Antigravity: UNSOUND, but its sharpest counterexamples are **defused by lune facts codex
-    verified** — address-dependent `pairs()` (lune iteration keyed on monotonic `GcHeader.id`,
-    address-independent), side-exit callee-frame reconstruction (lune resumes at loop header, no
+  - Antigravity: UNSOUND, but its sharpest counterexamples are **defused by mahina facts codex
+    verified** — address-dependent `pairs()` (mahina iteration keyed on monotonic `GcHeader.id`,
+    address-independent), side-exit callee-frame reconstruction (mahina resumes at loop header, no
     rebuild), `__gc` finalizers (finalizer-free GC), background compilation (synchronous). Recorded
     as "we checked, doesn't apply" notes that strengthen the doc.
   - **Surviving round-7 blockers (F-n), the work is restore-path precision:**
@@ -4623,7 +4674,7 @@ The B-3 emission fork is a genuine architecture decision (Rule #17) — surface 
 **What happened since LATEST-2:**
 - **Trace-selection investigation DONE → arming/patching confirmed LuaJIT-faithful.** doc 15
   + recorder (`recForPrepLink` LINNER) + `luajit -jdump=t` on the same nsieve (3 self-loop
-  roots + 8 side traces patched into roots) all show lune fragments IDENTICALLY to LuaJIT.
+  roots + 8 side traces patched into roots) all show mahina fragments IDENTICALLY to LuaJIT.
   "Fix trace selection / record as one trace" is RULED OUT (both tried-and-rejected it).
 - **Gate strategy DECIDED = B (region-level accounting), Bart's call.** Reasoned on merits
   (B measures the right unit / correct regardless of transition cost / retains cold-region
@@ -4694,7 +4745,7 @@ two `#### Review outcome` subsections). Summary of where it stands:
 
 ### Trace-selection investigation (Bart asked "investigate trace selection first") — DONE, verdict below
 
-**Verdict: lune's SKIP/CONT/INNER fragmentation is DELIBERATE and byte-for-byte
+**Verdict: mahina's SKIP/CONT/INNER fragmentation is DELIBERATE and byte-for-byte
 LuaJIT-faithful. Antigravity's "record as one trace" reframe is a DEAD END that
 *diverges* from LuaJIT, not converges.** Three independent sources agree:
 - **doc 15 (`15-nested-loop-linking.md`):** the one-trace approach "was implemented and
@@ -4707,13 +4758,13 @@ LuaJIT-faithful. Antigravity's "record as one trace" reframe is a DEAD END that
   is LuaJIT's `rec_loop_jit → LJ_TRERR_LINNER` verbatim.
 - **LuaJIT itself (`luajit -jdump=t` on the SAME nsieve, /tmp/ljd.txt):** 11 traces = **3
   self-loop roots** (line 3 init, line 7 inner, line 5 outer-skip) + **8 side traces each
-  patched into a root** (`stop -> 1/3/6`). This maps 1:1 onto lune: lune nsieve:24 = LJ
+  patched into a root** (`stop -> 1/3/6`). This maps 1:1 onto mahina: mahina nsieve:24 = LJ
   trace 3 (inner root), nsieve:14 = LJ trace 6 (outer-skip root), nsieve:29→link 24 = LJ
   trace 4 (side 3/3 line 8, `stop -> 3`). **LuaJIT fragments IDENTICALLY.**
 
-The ONLY structural difference LuaJIT→lune: LuaJIT's `stop -> 3` = the side trace's exit
+The ONLY structural difference LuaJIT→mahina: LuaJIT's `stop -> 3` = the side trace's exit
 is **patched** (rel32 jump straight into root 3's mcode, zero interpreter re-entry).
-lune's `.link` goes through per-transition Zig re-entry (~600ns/hop) — which the A/B
+mahina's `.link` goes through per-transition Zig re-entry (~600ns/hop) — which the A/B
 experiment already fingered as the wall-clock cost. **That gap IS exit-branch patching =
 Increment 3.** So the investigation *confirms* the arming/patching direction and closes
 off the "fix trace selection" alternative.
@@ -4722,7 +4773,7 @@ off the "fix trace selection" alternative.
 1. **Direction:** stay on the *arming/patching* approach (Increment 3, now confirmed as
    the LuaJIT-faithful path) — the reviews' blockers define the real work, NOT a trace-
    selection rewrite. Antigravity's "record as one trace" reframe is **ruled out** by the
-   investigation above (it's the exact thing lune + LuaJIT both tried-and-rejected).
+   investigation above (it's the exact thing mahina + LuaJIT both tried-and-rejected).
 2. **If arming:** which gate strategy — (a) per-segment accounting + measure (partial
    win; entry still gated), (b) region-level accounting (P-EBP-2 redesign), or (c)
    Antigravity's "exempt armed edges from the deopt penalty" (cleanest; still
@@ -4804,7 +4855,7 @@ implement.
 
 **Where we are.** 2c-E splits into E1/E2/E3 per two codex `gpt-5.6-sol` rulings (thread
 `019f5f48-98ba-73b3-90c8-89ded74aae92`; the rulings are in the session transcript
-`~/.claude/projects/-home-bart-Projects-lune/9a281686-...jsonl` lines 21264 + 21272, already
+`~/.claude/projects/-home-bart-Projects-mahina/9a281686-...jsonl` lines 21264 + 21272, already
 fully distilled below — do NOT re-read the transcript).
 
 - **E1 — DONE, commit `d4d82d9`** ("feat(jit): 2c-E1 — model deep fused receipts,

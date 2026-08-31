@@ -765,7 +765,7 @@ fn expectRecordedProgram(source: [:0]const u8, expected: []const u8) !void {
 test "doc 32: a read loop over an int/float-mixed array records and stays byte-identical" {
     // `a` is built as a pure int array (the `.i32`-ish narrow lane), then one
     // float store erases it to `.value` — `array.zig widenFor` has no int->f64
-    // rung, and cannot grow one without destroying lune's observable int/float
+    // rung, and cannot grow one without destroying mahina's observable int/float
     // distinction. Before doc 32 the read loop then aborted `.nyi_opcode` on
     // every element and the whole loop fell back to tier-0 for the run.
     //

@@ -4,7 +4,7 @@
 //!
 //! Motivation: a table whose array part holds only small integers or booleans
 //! pays a full 16-byte `Value` per slot in the naive representation, even though
-//! the live data is one bit (a boolean) or two bytes (an int ≤ 65 535). lune
+//! the live data is one bit (a boolean) or two bytes (an int ≤ 65 535). mahina
 //! instead stores the array part in the **narrowest lane** the data fits — a
 //! single type marker plus packed elements — and falls back to full `Value`s only
 //! when the contents are heterogeneous or heap-bearing. nsieve's sieve array is

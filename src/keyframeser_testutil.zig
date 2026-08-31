@@ -24,8 +24,8 @@ const Proto = bytecode.Proto;
 const Vm = interp.Vm;
 pub const schema = @import("gen/trace_schema.zig");
 const testing = std.testing;
-const lune_parser = @import("parser.zig");
-const lune_compiler = @import("compiler.zig");
+const mahina_parser = @import("parser.zig");
+const mahina_compiler = @import("compiler.zig");
 const Diagnostics = @import("diag.zig").Diagnostics;
 const io = @import("io.zig");
 
@@ -78,7 +78,7 @@ pub const RefRun = struct {
 pub fn referenceRun(gpa: std.mem.Allocator, source: [:0]const u8) !RefRun {
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     var vm = try Vm.init(gpa);
@@ -87,7 +87,7 @@ pub fn referenceRun(gpa: std.mem.Allocator, source: [:0]const u8) !RefRun {
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 

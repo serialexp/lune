@@ -11,13 +11,13 @@ Usage:
 
 Units are restricted by the V1 schema to ms, s, bytes, 1/s, percent, count and
 cores, so ratios are expressed as percentages: `spectral-norm.jit_vs_lj = 500`
-means lune's native tier took 5.0x LuaJIT's wall-clock on that program.
+means mahina's native tier took 5.0x LuaJIT's wall-clock on that program.
 
 ## What the contract does and does not assert
 
 The contract carries *correctness* invariants only:
 
-  * every program's three lune tiers (tier-0, tier-1a, tier-1b) must agree
+  * every program's three mahina tiers (tier-0, tier-1a, tier-1b) must agree
     byte-for-byte — that is the determinism property, not a speed target;
   * every program claiming LuaJIT parity must match LuaJIT byte-for-byte;
   * no program may fail to run; and
@@ -124,7 +124,7 @@ def build(blob):
         "schema_version": 1,
         "profile": "bench-suite",
         "workload": {
-            "name": "lune-bench-suite",
+            "name": "mahina-bench-suite",
             "parameters": {
                 "rev": blob["rev"],
                 "reps": blob["reps"],

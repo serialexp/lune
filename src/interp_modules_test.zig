@@ -186,7 +186,7 @@ test "P3: record→serialize→replay reproduces a require program with the FS d
     } };
     const driver: [:0]const u8 =
         \\local g = require("greeter")
-        \\print(g.hi("lune"))
+        \\print(g.hi("mahina"))
     ;
 
     var rec_out_buf: [64]u8 = undefined;
@@ -196,7 +196,7 @@ test "P3: record→serialize→replay reproduces a require program with the FS d
         defer vm.deinit();
         var sink = io.Writer.fixed(&rec_out_buf);
         try requireRun(gpa, &vm, &ffs, &sink, driver);
-        try testing.expectEqualStrings("hi lune\n", sink.buffered());
+        try testing.expectEqualStrings("hi mahina\n", sink.buffered());
         // One file_read (the path searcher found "./greeter.lua" on the first probe).
         try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
         log_bytes = try effectser.encodeFile(gpa, vm.effect_log.items);
@@ -214,9 +214,9 @@ test "P3: record→serialize→replay reproduces a require program with the FS d
         try vm.effect_log.appendSlice(gpa, log);
         vm.effect_mode = .replay; // NO fs_source — content must come from the log
         try compileRun(gpa, &vm, driver);
-        try testing.expectEqualStrings("hi lune\n", sink.buffered());
+        try testing.expectEqualStrings("hi mahina\n", sink.buffered());
     }
-    try testing.expectEqualStrings(rec_out_buf[0.."hi lune\n".len], rep_out_buf[0.."hi lune\n".len]);
+    try testing.expectEqualStrings(rec_out_buf[0.."hi mahina\n".len], rep_out_buf[0.."hi mahina\n".len]);
 }
 
 test "P3: a user-replaced searcher (a Lua closure) is honoured" {

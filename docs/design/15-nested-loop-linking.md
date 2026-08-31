@@ -24,7 +24,7 @@ land; move whole sections to Done once everything inside is checked.
 ### Done
 
 - [x] **Phase 0 — Design doc.** This doc: LuaJIT model verified against
-  `~/Projects/LuaJIT/src/lj_record.c`, lune mapping, proof obligations P1/P2/P4.
+  `~/Projects/LuaJIT/src/lj_record.c`, mahina mapping, proof obligations P1/P2/P4.
 - [x] **Foundational (pre-existing, kept).** The `for_prep` LINNER abort already
   matches LuaJIT's root-trace-hits-inner-loop behaviour and is retained, not
   removed (see §The mechanism, step 1).
@@ -147,13 +147,13 @@ re-reaches the inner (now compiled) loop header, LuaJIT does
 is a native trace tree: inner-root ⇄ outer-continuation, ping-ponging in native
 code, with tier-0 never re-entered.
 
-lune's current `for_prep` abort already **is** the LINNER step, so the
+mahina's current `for_prep` abort already **is** the LINNER step, so the
 foundation is correct. What is missing is exactly what `trace.zig` flags as
 deferred at the `AnchorKey` definition: *"Loop headers are the only root-trace
 anchors in Phase 5a (hot side exits seed side traces later)."* This doc builds
 that "later".
 
-## The mechanism (lune mapping)
+## The mechanism (mahina mapping)
 
 1. **Inner loop traces as root.** Unchanged. The inner numeric-`for` anchors at
    its header pc and compiles. An outer-loop recording that reaches the inner
@@ -175,7 +175,7 @@ that "later".
    why both, and why `init` and not `init − step`) — guards `init`/`limit`/`step`
    are numbers and the first iteration is in-bounds, then **stops**, emitting a new
    `.link` terminator that names the inner root trace — instead of recording the
-   inner `for_loop` (which would unroll). The `.link` is the lune equivalent of
+   inner `for_loop` (which would unroll). The `.link` is the mahina equivalent of
    `LJ_TRLINK_ROOT`.
 
 4. **Linked execution (Phase 3 tier-1a, Phase 4 native).** On the inner root's

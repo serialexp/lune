@@ -1,4 +1,4 @@
-# lune — Snapshot & Replay Schema
+# mahina — Snapshot & Replay Schema
 
 Status: partial — trace artifact + keyframe capture/restore/resume (F2a+F2b+F2c) + effect log (F2d: clock, F2e: random seed) + in-browser replay-to-k driver (Phase 7 v8) landed; keyframe now **v9** (v5 = H-2 `next_obj_id`; v7 = doc 18 slot-0 array part; v8 = doc 19 loaded-chunk constants in the `.snapshot` walk + zero-allocation recompile check; v9 = doc 21 canonical final-state capture — dead slots outside the top-level result span nil'd in walk + stack); guard-snapshots outstanding
 Owner: Bart
@@ -20,12 +20,12 @@ schema follows; this is that schema's home.
       defined declaratively in **`schema/trace.json`** (binschema); the Zig
       encoder/decoder is **generated** from it by binschema's Zig backend
       (`tools/regen-trace-schema.sh`) and **vendored** under `src/gen/` — committed
-      output, so lune builds with no dependency on the binschema repo.
+      output, so mahina builds with no dependency on the binschema repo.
       `src/traceser.zig` maps a `trace.Trace` onto the schema structs and writes a
       `TraceFile { version, traces[] }`; the CLI's `--emit-traces <file>` drops it
       after a run. Schema shape: `Trace { anchor_proto_id, anchor_pc, instrs[],
       consts[], entry_slots[], exit_stores[] }`; `ConstValue` is a discriminated
-      union tagged on lune's `Value.Tag` (nil/boolean/int/float + a `ConstString`
+      union tagged on mahina's `Value.Tag` (nil/boolean/int/float + a `ConstString`
       variant for the only heap const a trace can hold). **Decisions made here:**
       (a) the in-memory `*const Proto` anchor pointer is replaced by a stable,
       compile-time **`Proto.id`** — a pointer is meaningless on disk, and the
@@ -37,7 +37,7 @@ schema follows; this is that schema's home.
       hand-built edge corpus (`INT64_MIN/MAX`, i32-aux extremes, FP specials,
       NUL-bearing strings). **Landed in Phase 7:** the generated **TypeScript
       decoder** (vendored under `viz/src/gen/`, same regen script) + a binschema
-      **cross-language fixture** (`viz/fixtures/counting-loop.lunetrace`,
+      **cross-language fixture** (`viz/fixtures/counting-loop.mahinatrace`,
       Zig-encoded, decoded + asserted by `viz` `bun test`). **Deferred → later:**
       reload-into-VM (id→`*Proto` rebind
       + proto-hash validation, string interning, live `Value` reconstruction).
@@ -251,7 +251,7 @@ schema follows; this is that schema's home.
       (`safepoint_lines[k-1]` = the source line of the instruction pending at
       safepoint *k*), recorded only under a gated `Vm.record_safepoint_lines`
       flag so tier-0 pays nothing by default. To show step *k*, the wasm export
-      `lune_replay(src, effects, k)` re-compiles, sets `effect_mode = .replay`
+      `mahina_replay(src, effects, k)` re-compiles, sets `effect_mode = .replay`
       with the decoded effect blob, runs a **pure tier-0** pass (trace disabled,
       so each loop iteration is its own safepoint) with
       `suspend_ctl.after_safepoints = k`, and on suspend returns the keyframe
@@ -340,7 +340,7 @@ schema follows; this is that schema's home.
 - [ ] **File layout.** Chunked / mmap-friendly with a seek index; string / value
       interning; trace header (hash seed, FP mode, env snapshot, schema version).
 - [~] **binschema schema + generated codec.** Done for the **trace artifact**:
-      `schema/trace.json` (in the lune repo) + **generated, vendored** codecs for
+      `schema/trace.json` (in the mahina repo) + **generated, vendored** codecs for
       **both** targets — Zig encoder/decoder under `src/gen/` and the TS decoder
       under `viz/src/gen/`, emitted from the one schema by
       `tools/regen-trace-schema.sh`. Cross-language agreement is proven by a

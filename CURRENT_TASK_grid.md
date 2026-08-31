@@ -80,7 +80,7 @@ matrices that inflate to grids and are read/written via fused `get_index2`/
   (A, B, C), confirming the fused-store inflation path fires.
 - `--dump-aborts` confirms the hot loops abort on `get_index2`/`set_index2`
   (`nyi_opcode`) — the exact opcodes Phase 8 must record.
-- Output byte-identical across lune tier-0, `--jit-native`, and LuaJIT (checksum
+- Output byte-identical across mahina tier-0, `--jit-native`, and LuaJIT (checksum
   19602000000 at N=200).
 - **Baseline (`just bench --filter grid_matmul`, N=200, ReleaseFast, 5 reps):**
   `t0 = 304 ms`, `jit = 318 ms`, `luajit = 7.5 ms` → **~41× slower than LuaJIT,

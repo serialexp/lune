@@ -2,7 +2,7 @@
 -- SciMark FFT kernel (from LuaJIT/bench/scimark-fft.lua). Requires the shared
 -- scimark_lib.lua from the same directory — the runner runs each bench with cwd
 -- set to its directory, so package.path's "./?.lua" resolves it. A float/array-
--- heavy numeric throughput target, the workload lune's tracing JIT does not yet
+-- heavy numeric throughput target, the workload mahina's tracing JIT does not yet
 -- accelerate.
 --
 -- The upstream one-liner discards the kernel's flop count and prints nothing, so
@@ -12,7 +12,7 @@
 -- than a formatted float.
 --
 -- Byte-parity with LuaJIT depends on scimark_lib.lua's forced portable RNG (see
--- its "lune-local edit 1 of 2"). It ALSO depends on lune and LuaJIT's libm
+-- its "mahina-local edit 1 of 2"). It ALSO depends on mahina and LuaJIT's libm
 -- agreeing on the `sin` values fft_transform feeds in: verified bit-identical at
 -- this pinned size (n=1024), but that is an empirical result, not a guarantee —
 -- re-verify against LuaJIT if the transform size ever changes.

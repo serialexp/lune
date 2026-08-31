@@ -1,9 +1,13 @@
-# lune
+# mahina
 
 A Lua-shaped (not Lua-compatible), dynamically-typed language with a tracing
 JIT and time-travel replay, written in Zig.
 
-Working codename — rename at will.
+*Mahina* is Hawaiian for **moon** — continuing the family habit, since *Lua* is
+Portuguese for moon and *Luau* followed it. Previously called **lune** (French,
+same word), renamed because [lune-org/lune](https://github.com/lune-org/lune) is
+an established standalone Luau runtime and two moon-named runtimes for two
+Lua-family languages is one too many.
 
 ## What it is
 

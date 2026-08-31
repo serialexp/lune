@@ -1,4 +1,4 @@
-//! lune stdlib — protected calls and error raising: `pcall`, `xpcall`, `error`,
+//! mahina stdlib — protected calls and error raising: `pcall`, `xpcall`, `error`,
 //! `assert`. Top-level globals (Lua's "basic" library, not a namespace).
 //!
 //! These are the first consumers of the reentrancy + error-value machinery in

@@ -1,6 +1,6 @@
 // Keyframe-snapshot → human-readable view, for the step-debugger's state panels.
 //
-// A replay step (`lune_replay`) returns a whole-VM keyframe blob: the reachable
+// A replay step (`mahina_replay`) returns a whole-VM keyframe blob: the reachable
 // heap graph (id-keyed objects), the live register window, and the active frames
 // (src/keyframeser.zig). This module decodes that blob with the generated
 // `SnapshotFileDecoder` and projects out the two things the UI shows directly —

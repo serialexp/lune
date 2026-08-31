@@ -4,7 +4,7 @@
 //! diagnostics). Literal *values* are not stored here — they are derived from
 //! the source slice when the parser needs them. The one lexical decision baked
 //! into the tag is **int vs float** (`int_literal` / `float_literal`), because
-//! lune has first-class `i64` and `f64` (see Phase 1) and the distinction is
+//! mahina has first-class `i64` and `f64` (see Phase 1) and the distinction is
 //! purely syntactic (presence of `.` or an exponent).
 
 const std = @import("std");

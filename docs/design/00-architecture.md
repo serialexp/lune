@@ -1,10 +1,10 @@
-# lune — Architecture
+# mahina — Architecture
 
 Status: partial — Phases 0–7 landed (Phase 7 through the JIT-trace iteration animation: in-browser deterministic replay + timing + env/args effects + trace-execution animation); Phases 8–9 outstanding
 Owner: Bart
 Last updated: 2026-06-15
 
-> Working codename **lune** (Lua means "moon" in Portuguese; *lune* is French
+> Working codename **mahina** (Lua means "moon" in Portuguese; *mahina* is French
 > for moon). Not Lua, doesn't aim to be — see Goals. Rename at will.
 
 ## Implementation status
@@ -137,7 +137,7 @@ _(nothing yet — design only)_
       committed trace cache now serializes to a versioned, on-disk wire format.
       The format is defined declaratively in `schema/trace.json` (binschema); the
       Zig encoder/decoder is **generated** from it (`tools/regen-trace-schema.sh`)
-      and **vendored** under `src/gen/` — so lune builds with no dependency on the
+      and **vendored** under `src/gen/` — so mahina builds with no dependency on the
       binschema repo (the generated runtime is committed). `src/traceser.zig` maps
       a `trace.Trace` onto the schema structs; `--emit-traces <file>` drops the
       cache after a run. The in-memory `*const Proto` anchor pointer is replaced by
@@ -147,7 +147,7 @@ _(nothing yet — design only)_
       hand-built edge corpus (`INT64_MIN/MAX`, FP specials, NUL-bearing strings).
       **Landed in Phase 7 (the visualiser hosts them):** the **TypeScript
       decoder** (generated + vendored under `viz/src/gen/`) and the binschema
-      **cross-language fixture** (`viz/fixtures/counting-loop.lunetrace`, decoded
+      **cross-language fixture** (`viz/fixtures/counting-loop.mahinatrace`, decoded
       + asserted by `bun test`). **Deferred → later:** reload-into-VM (id→`*Proto` rebind + proto-hash
       validation), and the richer recording header / effect log / keyframes (the
       rest of `04-snapshot-replay-schema.md`, gated on the host-effect boundary).
@@ -224,13 +224,13 @@ _(nothing yet — design only)_
       recordings, not "complete history" by default. **Milestone: the feature
       this project is for.**
       **Landed (v1 — static trace inspector, `viz/`):** Bun + Vite + SolidJS app
-      that loads a `.lunetrace` and renders each trace's IR exactly as
+      that loads a `.mahinatrace` and renders each trace's IR exactly as
       `--dump-traces` does (header, numbered instrs, consts pool, exit stores),
       driven by the **generated** TS decoder vendored under `viz/src/gen/` (one
       schema → both Zig and TS codecs via `tools/regen-trace-schema.sh`). The
       `IrOp`/`ObsType`/`Tag` wire ordinals are pinned by a guard test in
       `src/traceser.zig` and mirrored in `viz/src/enums.ts`. A committed
-      cross-language fixture (`viz/fixtures/counting-loop.lunetrace`, Zig-encoded)
+      cross-language fixture (`viz/fixtures/counting-loop.mahinatrace`, Zig-encoded)
       is decoded + asserted by `bun test`, proving Zig-encode ↔ TS-decode agree.
       `?src=<url>` deep-links a trace. **v2 begun — the determinism bedrock:**
       time-stepping needs deterministic record-and-replay (restore a keyframe,
@@ -279,7 +279,7 @@ _(nothing yet — design only)_
       F2c+F2d together: restore a mid-run keyframe of a clock()-using program **and**
       replay its effect log from the cut cursor → identical forward output, even
       though a fresh record run differs (the captured nondeterminism). `--emit-effects`
-      writes the log. **F2-recap → Phase 7 v3 (run lune *in the browser*):** the VM
+      writes the log. **F2-recap → Phase 7 v3 (run mahina *in the browser*):** the VM
       core compiles to **wasm32-freestanding** (`src/wasm_entry.zig`, `zig build
       wasm`) and runs **in the page** — the viz app now authors, executes, *and*
       inspects in one place ("Run (wasm)"). wasm forced a clean determinism seam:
@@ -298,10 +298,10 @@ _(nothing yet — design only)_
       across wasm and x86-64 (incl. basic float ops); a `clock()` program's
       divergence appears only in the effect log, labelled expected (doc 02
       §cross-engine differential validation). **Phase 7 v4 (in-browser editor):**
-      the authoring textarea became a CodeMirror 6 editor with lune syntax
+      the authoring textarea became a CodeMirror 6 editor with mahina syntax
       highlighting (a small mode keyed to the real lexer/token set, not a borrowed
       Lua grammar) and **live validation**: as you type, the editor runs the source
-      through a compile-only wasm entry (`lune_check` — parse + compile, no
+      through a compile-only wasm entry (`mahina_check` — parse + compile, no
       execution, so an infinite loop can't hang the tab) and underlines errors with
       the *same diagnostics the native compiler emits*. Validation against the real
       frontend can't drift from the language. The compiler also gained a Luau-style
@@ -344,7 +344,7 @@ _(nothing yet — design only)_
       VM-execute-only). (2) A user-facing step debugger built on a **stateless
       "replay to k"** model: the initial run records the effect log once and
       reports a total safepoint count plus a per-safepoint source-line index; to
-      show the program at step *k* the viz calls `lune_replay(src, effects, k)`,
+      show the program at step *k* the viz calls `mahina_replay(src, effects, k)`,
       which re-compiles, replays the recorded effects with
       `suspend_ctl.after_safepoints = k` (a separate *pure tier-0* pass so every
       loop iteration is its own step), and snapshots the keyframe + stdout-so-far
@@ -481,9 +481,9 @@ retrofitting it later means redoing the hardest part of the system.
   guards, side exits, snapshots, trace linking.
 - First-class observability: a time-travel debugger fed by the same recorder
   the optimizer uses.
-- **A first-class embedding API.** lune is meant to be embedded in a host (the
+- **A first-class embedding API.** mahina is meant to be embedded in a host (the
   motivating case: a Rust app whose data lives in Rust, scripting its tools /
-  UI / game logic in lune). A clean C-ABI surface the host binds to; the host
+  UI / game logic in mahina). A clean C-ABI surface the host binds to; the host
   registers functions and data, marshals values, and leases buffers. This host
   boundary doubles as the controlled effect boundary the replay model needs
   (§Embedding API).
@@ -698,7 +698,7 @@ architectural commitments:
 
 ## Embedding API
 
-lune is an embeddable VM; the host (motivating case: a Rust app) drives it. This
+mahina is an embeddable VM; the host (motivating case: a Rust app) drives it. This
 boundary is load-bearing for three things at once — usability, determinism, and
 safety — so it is designed, not incidental. Full design in a later doc; the
 commitments:
@@ -727,23 +727,23 @@ records** — a tag plus a variant payload — which is exactly a *discriminated
 union*, binschema's core feature. Bit-level fields, computed lengths, and
 cross-language conformance testing come along for free.
 
-Bring-up plan (don't block lune on tooling) — **updated now that binschema has a
+Bring-up plan (don't block mahina on tooling) — **updated now that binschema has a
 Zig backend** (it did not when this section was first written, which is why it
 once planned a hand-written Zig writer; that's superseded):
 
 - **Schema is the source of truth** for the wire format — versioned, documented.
-  Lives in the lune repo at `schema/trace.json` (revisit moving it into the
+  Lives in the mahina repo at `schema/trace.json` (revisit moving it into the
   canonical `binschema` dir if other projects ever need it).
 - **Zig encoder/decoder: generated** from the schema by binschema's Zig backend
   (`tools/regen-trace-schema.sh`) and **vendored** under `src/gen/` — committed,
-  so the build needs no binschema checkout. lune never hand-writes encode/decode;
+  so the build needs no binschema checkout. mahina never hand-writes encode/decode;
   it only *maps* `trace.Trace` ↔ the generated structs (`src/traceser.zig`).
 - **TypeScript decoder: generated** from the same schema and **vendored** under
   `viz/src/gen/` (the same `tools/regen-trace-schema.sh` emits both Zig and TS
   from `schema/trace.json`) — **landed in Phase 7** with the visualiser. The TS
   decoder and Zig encoder are validated against each other via a committed
-  cross-language fixture: `viz/fixtures/counting-loop.lunetrace` is Zig-encoded by
-  `lune --emit-traces`, then decoded and asserted by `viz` `bun test` (including a
+  cross-language fixture: `viz/fixtures/counting-loop.mahinatrace` is Zig-encoded by
+  `mahina --emit-traces`, then decoded and asserted by `viz` `bun test` (including a
   `traceToText` rendering that matches `--dump-traces`), keeping the schema the
   single source of truth.
 

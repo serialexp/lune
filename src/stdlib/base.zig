@@ -1,4 +1,4 @@
-//! lune stdlib — the basic-library iterators `pairs`, `ipairs`, `next`.
+//! mahina stdlib — the basic-library iterators `pairs`, `ipairs`, `next`.
 //!
 //! These are top-level globals (Lua's "basic" library, not the `table`
 //! namespace). Like `stdlib/table.zig` they take the `*Vm` (heap, globals,
@@ -43,7 +43,7 @@ const Value = value.Value;
 const Table = table_mod.Table;
 const Vm = interp.Vm;
 
-/// Name of the hidden numeric iterator `ipairs` hands back. Not a valid lune
+/// Name of the hidden numeric iterator `ipairs` hands back. Not a valid mahina
 /// identifier, so user code can never name it, yet it installs as a normal global
 /// native (GC root + keyframe-restorable by name).
 const ipairs_iter_name = "@ipairs_iter";

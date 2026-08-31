@@ -104,7 +104,7 @@ function withArg(path: string, extra: TableEntryInput[] = []): Uint8Array {
 }
 
 test("arg[0] (script path) is cancelled — two paths compare equal", () => {
-  expect(keyframeSansArg(withArg("/tmp/aaa/p.lune"))).toBe(keyframeSansArg(withArg("/tmp/zzz/other.lune")));
+  expect(keyframeSansArg(withArg("/tmp/aaa/p.mahina"))).toBe(keyframeSansArg(withArg("/tmp/zzz/other.mahina")));
 });
 
 test("arg[1..] is preserved — a real divergence there still surfaces", () => {

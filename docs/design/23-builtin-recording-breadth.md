@@ -1,4 +1,4 @@
-# lune — builtin recording breadth, arc A: the non-allocating subset
+# mahina — builtin recording breadth, arc A: the non-allocating subset
 
 Status: **landed (2026-08-27).** Implementation notes are inline at the
 points where the landed code deviates from the draft (result-arity abort
@@ -52,14 +52,14 @@ architecture (Z-6):
    aborting). Not this arc; own lever.
 
 Callee identity: LuaJIT guards `callee == <function object>` (GC-pointer
-konst, `rec_call_specialize`). lune's determinism-preserving equivalent exists
+konst, `rec_call_specialize`). mahina's determinism-preserving equivalent exists
 — `guard_pure` re-proving a registry-riding enum ordinal (doc 12); no pointer
 baked or serialized.
 
 ## Goals (arc A)
 
 - The dispatch skeleton: `recCall`'s native arm dispatches per-builtin over the
-  (renamed) stable builtin enum — lune's `recff_idmap`.
+  (renamed) stable builtin enum — mahina's `recff_idmap`.
 - Class 1: `type`, `select('#')`, `tonumber`(konst / observed-number),
   `rawequal` (NaN-safe subset), `tostring`(konst, lookup-only),
   `rawlen`(konst string).

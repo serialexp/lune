@@ -1,4 +1,4 @@
-//! lune stdlib — the Lua pattern-matching engine (pure, host-free).
+//! mahina stdlib — the Lua pattern-matching engine (pure, host-free).
 //!
 //! A faithful port of LuaJIT's `lib_string.c` matcher (`match`, `classend`,
 //! `singlematch`, `matchbracketclass`, `match_class`, `matchbalance`,
@@ -16,7 +16,7 @@
 //! is automatic — a deterministic function of its byte inputs, no host effects.
 //!
 //! Char classes are C-locale ASCII (`%a %d %s %w %l %u %p %c %x %g` and their
-//! upper-case complements), matching lune's fixed locale; the `%z` legacy class
+//! upper-case complements), matching mahina's fixed locale; the `%z` legacy class
 //! is dropped per Lua 5.4 (so `%z` is a literal `z`).
 
 const std = @import("std");
@@ -96,7 +96,7 @@ pub const MatchState = struct {
     const bits_alnum: u8 = bits_alpha | bits_digit;
     const bits_graph: u8 = bits_alnum | bits_punct;
 
-    /// Per-byte class bits. Bytes ≥ 0x80 carry no bits — lune's classes are
+    /// Per-byte class bits. Bytes ≥ 0x80 carry no bits — mahina's classes are
     /// ASCII-only (the S-D rule); complements of high bytes are handled by
     /// the callers' `< 0x80` guards (and `%f`'s deliberate lack of one).
     const char_bits: [256]u8 = blk: {
@@ -827,7 +827,7 @@ test "S-D: %f frontier classifies a multibyte char by its (non-ASCII) bytes" {
     // set WITHOUT the `singleMatch` `< 0x80` guard — deliberately: it is
     // zero-width (consumes nothing, so it can never split a code point) and is a
     // byte-for-byte port of Lua 5.4's frontier (`prev = src[s-1]`, `cur = src[s]`).
-    // Under lune's ASCII-only classes a multibyte char is NOT an ASCII letter, so
+    // Under mahina's ASCII-only classes a multibyte char is NOT an ASCII letter, so
     // every one of its bytes reads as `%A` (non-alpha). The frontier therefore
     // fires entering a multibyte char from an ASCII letter — consistent with the
     // documented "classes stay ASCII" rule, not a leak of the guard. Pinned so the
@@ -937,7 +937,7 @@ test "doc 29 A4: escaped-literal quantifiers behave as before" {
 }
 
 test "S-D: classEnd is total on a truncated multibyte pattern tail" {
-    // Defensive: the matcher accepts arbitrary []const u8, but every *real* lune
+    // Defensive: the matcher accepts arbitrary []const u8, but every *real* mahina
     // string (subject AND pattern) is valid UTF-8 (the S-B invariant), so a
     // pattern with a lone lead byte 0xC3 is unreachable in practice. We only
     // require totality here: classEnd must not read past pat.len and match must

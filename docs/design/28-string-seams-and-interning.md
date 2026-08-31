@@ -27,7 +27,7 @@ work, i.e. interning tax, not scan work.)
 Two general costs dominate everything that isn't the pattern engine, the
 decimal renderer, or tier-0 dispatch:
 
-**(a) Seam scans that re-derive what the String already caches.** lune
+**(a) Seam scans that re-derive what the String already caches.** mahina
 strings are code-point-native (S-B): `#s`, `sub`, `codepoint`, `find`
 indices are all character-based. The seams between character positions and
 byte offsets (`cpCount`, `charByteOffset`, `byteToChar`, `resolveInit`,
@@ -47,7 +47,7 @@ the hit path. LuaJIT pays the same *structure* but its default hash
 (`lj_str.c hash_sparse`) is **O(1)**: four sampled unaligned u32 reads
 (first 4 bytes, last 4, midpoint, quarter-point) mixed with `len`, with an
 opt-in linear `hash_dense` only when a chain turns pathological
-(LUAJIT_SECURITY_STRHASH). lune's is O(len) always.
+(LUAJIT_SECURITY_STRHASH). mahina's is O(len) always.
 
 Not this arc (each its own frontier, recorded in §7): the pattern engine
 internals (already a faithful byte-based lj port), the exact decimal
@@ -71,7 +71,7 @@ UTF-8 (`countCodepoints` counts non-continuation bytes, so all-`0xFF`
 counterfeits it), and proposed enforcing valid UTF-8 as a construction
 invariant (restore validation + constructor assert). **Implementing that
 enforcement failed the effect suite and exposed the real architecture**:
-lune's *validate-after-log* seams (`performEffect`, `obtainFileRead`)
+mahina's *validate-after-log* seams (`performEffect`, `obtainFileRead`)
 deliberately intern raw non-UTF-8 host bytes BEFORE validating — the
 invalid string is parked in the effect log so a recorded bad `getenv`/
 `argv`/`loadfile` replays byte-identically, and it legitimately flows

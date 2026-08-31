@@ -4,11 +4,11 @@
 -- loop: %d %x %o %g, signed/space/zero/left flags, a fixed-precision float, a
 -- padded string, %c, and the %% literal. Output is an integer length checksum
 -- plus the final formatted line, so it is deterministic and byte-identical to
--- LuaJIT (and across all of lune's tiers).
+-- LuaJIT (and across all of mahina's tiers).
 --
---   lune              bench/stdlib/str_format.lua 200000   # tier-0
---   lune --jit-native bench/stdlib/str_format.lua 200000   # tier-1b
---   luajit            bench/stdlib/str_format.lua 200000   # reference
+--   mahina              bench/stdlib/str_format.lua 200000   # tier-0
+--   mahina --jit-native bench/stdlib/str_format.lua 200000   # tier-1b
+--   luajit              bench/stdlib/str_format.lua 200000   # reference
 --
 -- @bench args="200000" luajit=compatible
 

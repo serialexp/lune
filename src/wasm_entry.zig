@@ -1,14 +1,14 @@
-//! lune — wasm32-freestanding browser entry.
+//! mahina — wasm32-freestanding browser entry.
 //!
 //! A thin C-ABI surface over the library `run` path so the VM can execute a
-//! lune source chunk *in the browser*, with no host I/O. It mirrors
+//! mahina source chunk *in the browser*, with no host I/O. It mirrors
 //! `main.zig`'s `runSource` minus everything host-bound: there is no file read,
 //! no stdout fd, no process exit — the program's `print` output is captured into
 //! an in-memory `io.Writer.fixed` sink, and the run's artifacts (keyframe
 //! snapshot, effect log, trace cache) are returned as owned byte buffers that
 //! JS copies out of linear memory.
 //!
-//! Why this exists: wasm is the platform that *cannot* cheat on lune's own
+//! Why this exists: wasm is the platform that *cannot* cheat on mahina's own
 //! determinism rules — there is no clock syscall here, so `clock()` is forced to
 //! flow through the injected `ClockSource` (backed by a JS `host_now_ns` import),
 //! exactly as `docs/design/02-determinism.md` intends. Two different engines
@@ -17,14 +17,14 @@
 //!
 //! ABI (all integers little-endian u32 unless noted; wasm32 ⇒ pointer == u32):
 //!   import  env.host_now_ns() i64          — monotonic-ish ns from the host (JS)
-//!   export  lune_alloc(len) -> ptr         — allocate `len` bytes in linear mem
-//!   export  lune_free(ptr, len)            — free a prior `lune_alloc`
-//!   export  lune_run(src_ptr, src_len) -> *Result
-//!   export  lune_free_result(*Result)      — free a Result and all its buffers
-//!   export  lune_check(src_ptr, src_len) -> *CheckResult
-//!   export  lune_free_check_result(*CheckResult)
-//!   export  lune_replay(src_ptr, src_len, eff_ptr, eff_len, stop_after) -> *ReplayResult
-//!   export  lune_free_replay_result(*ReplayResult)
+//!   export  mahina_alloc(len) -> ptr         — allocate `len` bytes in linear mem
+//!   export  mahina_free(ptr, len)            — free a prior `mahina_alloc`
+//!   export  mahina_run(src_ptr, src_len) -> *Result
+//!   export  mahina_free_result(*Result)      — free a Result and all its buffers
+//!   export  mahina_check(src_ptr, src_len) -> *CheckResult
+//!   export  mahina_free_check_result(*CheckResult)
+//!   export  mahina_replay(src_ptr, src_len, eff_ptr, eff_len, stop_after) -> *ReplayResult
+//!   export  mahina_free_replay_result(*ReplayResult)
 //!
 //! Result layout (extern struct, read by JS via DataView):
 //!   u32 status        0 = ok, 1 = error (see `diag` for the message)
@@ -56,13 +56,13 @@
 //!   `end` are byte offsets [start,end) into the source the editor passed in.
 //!
 //! Each non-empty buffer is an independent `wasm_allocator` allocation; the
-//! Result/CheckResult struct is one too. `lune_free_result` /
-//! `lune_free_check_result` free them all.
+//! Result/CheckResult struct is one too. `mahina_free_result` /
+//! `mahina_free_check_result` free them all.
 
 const std = @import("std");
-const lune = @import("lune");
+const mahina = @import("mahina");
 
-const Diagnostics = lune.diag.Diagnostics;
+const Diagnostics = mahina.diag.Diagnostics;
 
 /// Linear-memory allocator for freestanding wasm (backed by `memory.grow`).
 const gpa = std.heap.wasm_allocator;
@@ -107,7 +107,7 @@ fn nullEnvArgCount(_: *anyopaque) i64 {
 fn nullEnvArg(_: *anyopaque, _: i64) ?[]const u8 {
     return null;
 }
-fn nullHostEnv() lune.interp.HostEnv {
+fn nullHostEnv() mahina.interp.HostEnv {
     return .{
         .ctx = &clock_ctx,
         .getenv = &nullEnvGetenv,
@@ -122,7 +122,7 @@ const Buf = extern struct {
     len: u32 = 0,
 };
 
-/// The fixed result block JS reads after `lune_run`. See the file header.
+/// The fixed result block JS reads after `mahina_run`. See the file header.
 const Result = extern struct {
     status: u32 = 0,
     stdout: Buf = .{},
@@ -186,15 +186,15 @@ const Diag = extern struct {
     msg: Buf = .{},
 };
 
-/// The result of `lune_check`: a flat array of `Diag` (or null when clean). Note
+/// The result of `mahina_check`: a flat array of `Diag` (or null when clean). Note
 /// `diags.len` is the *record count*, not a byte length.
 const CheckResult = extern struct {
     status: u32 = 0,
     diags: Buf = .{},
 };
 
-/// The state at one replay step (see `lune_replay`). All buffers are owned and
-/// freed by `lune_free_replay_result`.
+/// The state at one replay step (see `mahina_replay`). All buffers are owned and
+/// freed by `mahina_free_replay_result`.
 const ReplayResult = extern struct {
     /// 0 = ok (suspended at the step, or finished), 1 = error (`diag` has why).
     status: u32 = 0,
@@ -229,7 +229,7 @@ const ReplayResult = extern struct {
 };
 
 /// Wrap an owned byte slice as a `Buf` (transfers ownership to JS; freed by
-/// `lune_free_result`). An empty slice yields a null `Buf`.
+/// `mahina_free_result`). An empty slice yields a null `Buf`.
 fn bufFromSlice(bytes: []u8) Buf {
     if (bytes.len == 0) return .{};
     return .{ .ptr = @intCast(@intFromPtr(bytes.ptr)), .len = @intCast(bytes.len) };
@@ -255,21 +255,21 @@ fn freeBuf(b: Buf) void {
 ///      ("Stay on Zig's bedrock") holding on the browser target.
 ///   2. *Runtime gate* — a `bun` test calls this with ~2M iterations; completing
 ///      without a stack overflow proves the browser engine honours `return_call`.
-export fn lune_dispatch_smoke(iterations: u32) u32 {
-    return @intCast(lune.dispatch.run(@as(u64, iterations)));
+export fn mahina_dispatch_smoke(iterations: u32) u32 {
+    return @intCast(mahina.dispatch.run(@as(u64, iterations)));
 }
 
 /// Allocate `len` bytes of linear memory for JS to write a source chunk into.
-/// Returns 0 on OOM. Free with `lune_free` (or it is consumed by `lune_run`,
+/// Returns 0 on OOM. Free with `mahina_free` (or it is consumed by `mahina_run`,
 /// which copies the source and frees nothing of the caller's — JS still owns it).
-export fn lune_alloc(len: u32) u32 {
+export fn mahina_alloc(len: u32) u32 {
     if (len == 0) return 0;
     const slice = gpa.alloc(u8, @as(usize, len)) catch return 0;
     return @intCast(@intFromPtr(slice.ptr));
 }
 
-/// Free a buffer obtained from `lune_alloc`.
-export fn lune_free(ptr: u32, len: u32) void {
+/// Free a buffer obtained from `mahina_alloc`.
+export fn mahina_free(ptr: u32, len: u32) void {
     if (ptr == 0 or len == 0) return;
     const p: [*]u8 = @ptrFromInt(@as(usize, ptr));
     gpa.free(p[0..@as(usize, len)]);
@@ -278,8 +278,8 @@ export fn lune_free(ptr: u32, len: u32) void {
 /// Parse, compile, and run a source chunk; return an owned `*Result` (0 on a
 /// catastrophic allocation failure before a Result exists). The source bytes at
 /// `[src_ptr, src_ptr+src_len)` are read but not freed — JS still owns that
-/// buffer and frees it with `lune_free`.
-export fn lune_run(src_ptr: u32, src_len: u32, args_ptr: u32, args_len: u32) ?*Result {
+/// buffer and frees it with `mahina_free`.
+export fn mahina_run(src_ptr: u32, src_len: u32, args_ptr: u32, args_len: u32) ?*Result {
     const res = gpa.create(Result) catch return null;
     res.* = .{};
 
@@ -291,7 +291,7 @@ export fn lune_run(src_ptr: u32, src_len: u32, args_ptr: u32, args_len: u32) ?*R
 
     // The packed argv blob (may be empty). Decoded into a `[][]const u8` inside
     // `run`, which owns the freeing; the blob memory itself is borrowed (freed by
-    // the JS caller after `lune_run` returns), so `populateArgs` must intern (it
+    // the JS caller after `mahina_run` returns), so `populateArgs` must intern (it
     // does) before we return.
     const args_blob: []const u8 = blk: {
         if (args_len == 0) break :blk &[_]u8{};
@@ -313,7 +313,7 @@ export fn lune_run(src_ptr: u32, src_len: u32, args_ptr: u32, args_len: u32) ?*R
 }
 
 /// Free a `Result` and every buffer it owns.
-export fn lune_free_result(res: ?*Result) void {
+export fn mahina_free_result(res: ?*Result) void {
     const r = res orelse return;
     freeBuf(r.stdout);
     freeBuf(r.keyframe);
@@ -333,7 +333,7 @@ export fn lune_free_result(res: ?*Result) void {
 /// so there are no side effects and a user's infinite loop can never hang the
 /// tab. Returns 0 only on a catastrophic allocation failure before a CheckResult
 /// exists. The source bytes are read but not freed (JS still owns them).
-export fn lune_check(src_ptr: u32, src_len: u32) ?*CheckResult {
+export fn mahina_check(src_ptr: u32, src_len: u32) ?*CheckResult {
     const res = gpa.create(CheckResult) catch return null;
     res.* = .{};
 
@@ -352,7 +352,7 @@ export fn lune_check(src_ptr: u32, src_len: u32) ?*CheckResult {
 }
 
 /// Free a `CheckResult`, every `Diag.msg`, and the `Diag` array itself.
-export fn lune_free_check_result(res: ?*CheckResult) void {
+export fn mahina_free_check_result(res: ?*CheckResult) void {
     const r = res orelse return;
     if (r.diags.len != 0) {
         const base: [*]Diag = @ptrFromInt(@as(usize, r.diags.ptr));
@@ -366,14 +366,14 @@ export fn lune_free_check_result(res: ?*CheckResult) void {
 /// Replay `source` forward to instruction-boundary safepoint `stop_after` and
 /// return the VM state there (the stateless "replay to k" the step-debugger UI
 /// drives). The recorded effect log at `[eff_ptr, eff_ptr+eff_len)` (the `effects`
-/// blob from a prior `lune_run`) is fed back in `.replay` mode, so re-running to
+/// blob from a prior `mahina_run`) is fed back in `.replay` mode, so re-running to
 /// the same `stop_after` yields identical state every time. Runs in **pure tier-0**
 /// (no trace execution), matching the `Result.safepoint_count` index, so every
 /// loop iteration is its own step. `stop_after` is clamped to `safepoint_cap`.
 ///
 /// Returns 0 only on a catastrophic allocation failure before a ReplayResult
 /// exists. The source/effect bytes are read but not freed (JS still owns them).
-export fn lune_replay(src_ptr: u32, src_len: u32, eff_ptr: u32, eff_len: u32, stop_after: u32) ?*ReplayResult {
+export fn mahina_replay(src_ptr: u32, src_len: u32, eff_ptr: u32, eff_len: u32, stop_after: u32) ?*ReplayResult {
     const res = gpa.create(ReplayResult) catch return null;
     res.* = .{};
 
@@ -400,7 +400,7 @@ export fn lune_replay(src_ptr: u32, src_len: u32, eff_ptr: u32, eff_len: u32, st
 }
 
 /// Free a `ReplayResult` and every buffer it owns.
-export fn lune_free_replay_result(res: ?*ReplayResult) void {
+export fn mahina_free_replay_result(res: ?*ReplayResult) void {
     const r = res orelse return;
     freeBuf(r.stdout);
     freeBuf(r.keyframe);
@@ -417,7 +417,7 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
 
-    var tree = lune.parser.parse(gpa, src0, &diags) catch {
+    var tree = mahina.parser.parse(gpa, src0, &diags) catch {
         res.status = 1;
         res.diag = bufFromSlice(try renderDiagnostics(&diags));
         return;
@@ -429,11 +429,11 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
         return;
     }
 
-    var vm = try lune.interp.Vm.init(gpa);
+    var vm = try mahina.interp.Vm.init(gpa);
     defer vm.deinit();
 
     var out_buf: [64 * 1024]u8 = undefined;
-    var sink = lune.io.Writer.fixed(&out_buf);
+    var sink = mahina.io.Writer.fixed(&out_buf);
     vm.out = &sink;
 
     // Feed the recorded nondeterministic inputs back, deterministically. No
@@ -442,7 +442,7 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
     if (eff_bytes.len > 0) {
         // String results (getenv/argv) are re-interned into `vm.heap`; the
         // effect-log GC root keeps them alive while the cursor feeds them back.
-        const effects = try lune.effectser.decodeFile(gpa, vm.heap, eff_bytes);
+        const effects = try mahina.effectser.decodeFile(gpa, vm.heap, eff_bytes);
         defer gpa.free(effects);
         try vm.effect_log.appendSlice(gpa, effects);
     }
@@ -451,8 +451,8 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
     // instruction is one safepoint — matching `Result.safepoint_count`.
     vm.suspend_ctl = .{ .after_safepoints = @min(@as(u64, stop_after), safepoint_cap) };
 
-    var chunk = lune.compiler.compileWithOptions(gpa, vm.heap, src0, tree.root, &diags, .{
-        .known_globals = &lune.interp.builtin_global_names,
+    var chunk = mahina.compiler.compileWithOptions(gpa, vm.heap, src0, tree.root, &diags, .{
+        .known_globals = &mahina.interp.builtin_global_names,
     }) catch {
         res.status = 1;
         res.diag = bufFromSlice(try renderDiagnostics(&diags));
@@ -491,7 +491,7 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
             res.pc = @intCast(frame.pc);
             if (frame.pc < proto.spans.len) {
                 const span = proto.spans[frame.pc];
-                res.current_line = lune.compiler.lineFromOffset(src0, span.start);
+                res.current_line = mahina.compiler.lineFromOffset(src0, span.start);
                 res.current_start = span.start;
                 res.current_end = span.end;
             }
@@ -510,7 +510,7 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
 
     // The heap snapshot at this step (mid-run on suspend, final on finish) and the
     // output so far. `encodeSnapshot` is sound mid-execution (proven by F2c).
-    res.keyframe = bufFromSlice(try lune.keyframeser.encodeSnapshot(gpa, &vm));
+    res.keyframe = bufFromSlice(try mahina.keyframeser.encodeSnapshot(gpa, &vm));
     res.stdout = bufFromSlice(try gpa.dupe(u8, sink.buffered()));
     res.status = 0;
 }
@@ -518,7 +518,7 @@ fn replayRun(res: *ReplayResult, source: []const u8, eff_bytes: []const u8, stop
 // --- the run path (mirrors main.zig runSource, host-free) ------------------
 
 /// Decode the packed argv blob the JS host builds (see `runSource` in
-/// `viz/src/wasm/lune.ts`): a little-endian `u32 count`, then `count` records of
+/// `viz/src/wasm/mahina.ts`): a little-endian `u32 count`, then `count` records of
 /// `{ u32 len; u8[len] }`. Returns a gpa-owned slice of borrowed sub-slices that
 /// point into `blob` (no string copies — `populateArgs` interns them). The caller
 /// frees the returned outer slice; `blob` stays owned by the FFI caller. An empty
@@ -553,7 +553,7 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
     defer diags.deinit();
 
     // --- parse ---
-    var tree = lune.parser.parse(gpa, src0, &diags) catch {
+    var tree = mahina.parser.parse(gpa, src0, &diags) catch {
         res.status = 1;
         res.diag = bufFromSlice(try renderDiagnostics(&diags));
         return;
@@ -567,12 +567,12 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
 
     // The VM owns the heap string constants are interned into; bring it up
     // before compiling.
-    var vm = try lune.interp.Vm.init(gpa);
+    var vm = try mahina.interp.Vm.init(gpa);
     defer vm.deinit();
 
     // Capture program output into an in-memory sink — there is no host stdout.
     var out_buf: [64 * 1024]u8 = undefined;
-    var sink = lune.io.Writer.fixed(&out_buf);
+    var sink = mahina.io.Writer.fixed(&out_buf);
     vm.out = &sink;
 
     // Mirror the native `--emit-traces --emit-keyframe --emit-effects` run:
@@ -599,8 +599,8 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
 
     // --- compile --- (pass builtin globals so the unknown-global lint doesn't
     // flag `print`/`clock`).
-    var chunk = lune.compiler.compileWithOptions(gpa, vm.heap, src0, tree.root, &diags, .{
-        .known_globals = &lune.interp.builtin_global_names,
+    var chunk = mahina.compiler.compileWithOptions(gpa, vm.heap, src0, tree.root, &diags, .{
+        .known_globals = &mahina.interp.builtin_global_names,
     }) catch {
         res.status = 1;
         res.diag = bufFromSlice(try renderDiagnostics(&diags));
@@ -635,7 +635,7 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
         res.status = 1;
         // Located, Lua-style message from the un-popped faulting frame. The
         // message is freshly `gpa`-allocated by `describeFault`, so hand its
-        // ownership straight to the Result (freed by `lune_free_result`).
+        // ownership straight to the Result (freed by `mahina_free_result`).
         const fault = try vm.describeFault(src0, err, gpa);
         res.diag = bufFromSlice(@constCast(fault.message));
         res.error_line = fault.line;
@@ -653,11 +653,11 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
 
     // --- collect artifacts (all owned []u8, mirroring the emit* helpers) ---
     res.stdout = bufFromSlice(try gpa.dupe(u8, sink.buffered()));
-    res.keyframe = bufFromSlice(try lune.keyframeser.encodeSnapshot(gpa, &vm));
-    res.effects = bufFromSlice(try lune.effectser.encodeFile(gpa, vm.effect_log.items));
-    res.trace = bufFromSlice(try lune.traceser.encodeFile(gpa, vm.trace.cache.items));
-    res.exec_log = bufFromSlice(try lune.execlogser.encodeFile(gpa, vm.trace.exec_logs.items));
-    res.coverage = bufFromSlice(try lune.coverageser.encodeState(gpa, &vm.trace));
+    res.keyframe = bufFromSlice(try mahina.keyframeser.encodeSnapshot(gpa, &vm));
+    res.effects = bufFromSlice(try mahina.effectser.encodeFile(gpa, vm.effect_log.items));
+    res.trace = bufFromSlice(try mahina.traceser.encodeFile(gpa, vm.trace.cache.items));
+    res.exec_log = bufFromSlice(try mahina.execlogser.encodeFile(gpa, vm.trace.exec_logs.items));
+    res.coverage = bufFromSlice(try mahina.coverageser.encodeState(gpa, &vm.trace));
     res.status = 0;
 
     // Build the step-debugger index from the just-recorded effect log. This is a
@@ -677,7 +677,7 @@ fn run(res: *Result, source: []const u8, args_blob: []const u8) !void {
 }
 
 /// The maximum number of safepoints the replay index records (and the ceiling
-/// `lune_replay` clamps `stop_after` to). Bounds the index blob and the per-step
+/// `mahina_replay` clamps `stop_after` to). Bounds the index blob and the per-step
 /// re-execution cost for a very long (but finite) program: stepping is limited to
 /// the first `safepoint_cap` steps, surfaced via `Result.safepoint_capped` rather
 /// than silently truncated. ~1M steps ⇒ a ~4 MiB line blob, the practical ceiling
@@ -688,18 +688,18 @@ const safepoint_cap: u64 = 1_000_000;
 /// replaying `effects` through a fresh pure-tier-0 VM with the safepoint-line
 /// recorder on. Best-effort — swallows errors (the replay affordance is simply
 /// absent on failure).
-fn buildReplayIndex(res: *Result, proto: *const lune.bytecode.Proto, src0: [:0]const u8, effects: []const lune.interp.Effect) void {
+fn buildReplayIndex(res: *Result, proto: *const mahina.bytecode.Proto, src0: [:0]const u8, effects: []const mahina.interp.Effect) void {
     buildReplayIndexInner(res, proto, src0, effects) catch {};
 }
 
-fn buildReplayIndexInner(res: *Result, proto: *const lune.bytecode.Proto, src0: [:0]const u8, effects: []const lune.interp.Effect) !void {
-    var vm = try lune.interp.Vm.init(gpa);
+fn buildReplayIndexInner(res: *Result, proto: *const mahina.bytecode.Proto, src0: [:0]const u8, effects: []const mahina.interp.Effect) !void {
+    var vm = try mahina.interp.Vm.init(gpa);
     defer vm.deinit();
 
     // stdout is irrelevant to the index; a throwaway sink (same size as the run
     // sink, so an over-printing program fails here identically rather than diverging).
     var out_buf: [64 * 1024]u8 = undefined;
-    var sink = lune.io.Writer.fixed(&out_buf);
+    var sink = mahina.io.Writer.fixed(&out_buf);
     vm.out = &sink;
 
     vm.effect_mode = .replay;
@@ -728,7 +728,7 @@ fn encodeU32Array(values: []const u32) ![]u8 {
 /// Populate `res.disasm` with a static disassembly of the whole proto tree (the
 /// bytecode the step-replay panel renders). Best-effort — swallows errors (the
 /// bytecode view is simply absent on failure; the run already succeeded).
-fn buildDisasm(res: *Result, root: *const lune.bytecode.Proto, src0: [:0]const u8) void {
+fn buildDisasm(res: *Result, root: *const mahina.bytecode.Proto, src0: [:0]const u8) void {
     res.disasm = bufFromSlice(buildDisasmBlob(root, src0) catch return);
 }
 
@@ -744,8 +744,8 @@ fn buildDisasm(res: *Result, root: *const lune.bytecode.Proto, src0: [:0]const u
 ///       u32 text_len, [text_len]u8 text   (rendered via bytecode.writeInstr)
 /// Protos are emitted in pre-order (root first, then children), matching the id
 /// assignment order — but consumers index by `id`, not position.
-fn buildDisasmBlob(root: *const lune.bytecode.Proto, src0: [:0]const u8) ![]u8 {
-    var protos: std.ArrayList(*const lune.bytecode.Proto) = .empty;
+fn buildDisasmBlob(root: *const mahina.bytecode.Proto, src0: [:0]const u8) ![]u8 {
+    var protos: std.ArrayList(*const mahina.bytecode.Proto) = .empty;
     defer protos.deinit(gpa);
     try collectProtos(&protos, root);
 
@@ -762,7 +762,7 @@ fn buildDisasmBlob(root: *const lune.bytecode.Proto, src0: [:0]const u8) ![]u8 {
         try appendU32(&buf, @intCast(proto.code.len));
         for (proto.code, 0..) |instr, i| {
             const line: u32 = if (i < proto.spans.len)
-                lune.compiler.lineFromOffset(src0, proto.spans[i].start)
+                mahina.compiler.lineFromOffset(src0, proto.spans[i].start)
             else
                 0;
             try appendU32(&buf, line);
@@ -770,8 +770,8 @@ fn buildDisasmBlob(root: *const lune.bytecode.Proto, src0: [:0]const u8) ![]u8 {
             // Render this one instruction into a scratch buffer (instructions are
             // short and fixed-width; 128 bytes is comfortably enough).
             var instr_buf: [128]u8 = undefined;
-            var w = lune.io.Writer.fixed(&instr_buf);
-            try lune.bytecode.writeInstr(&w, instr);
+            var w = mahina.io.Writer.fixed(&instr_buf);
+            try mahina.bytecode.writeInstr(&w, instr);
             const text = w.buffered();
             try appendU32(&buf, @intCast(text.len));
             try buf.appendSlice(gpa, text);
@@ -781,7 +781,7 @@ fn buildDisasmBlob(root: *const lune.bytecode.Proto, src0: [:0]const u8) ![]u8 {
 }
 
 /// Pre-order collect a proto and all its nested protos into `out`.
-fn collectProtos(out: *std.ArrayList(*const lune.bytecode.Proto), proto: *const lune.bytecode.Proto) !void {
+fn collectProtos(out: *std.ArrayList(*const mahina.bytecode.Proto), proto: *const mahina.bytecode.Proto) !void {
     try out.append(gpa, proto);
     for (proto.protos) |child| try collectProtos(out, child);
 }
@@ -801,7 +801,7 @@ fn check(res: *CheckResult, source: []const u8) !void {
 
     // Parse. On a hard parse error the tree is unusable, but the diagnostics are
     // already recorded — fall through to emit them.
-    var tree_opt: ?lune.ast.Ast = lune.parser.parse(gpa, src0, &diags) catch null;
+    var tree_opt: ?mahina.ast.Ast = mahina.parser.parse(gpa, src0, &diags) catch null;
     defer if (tree_opt) |*t| t.deinit();
 
     // Only attempt compilation if parsing produced a usable tree with no errors;
@@ -811,16 +811,16 @@ fn check(res: *CheckResult, source: []const u8) !void {
     // unknown-global lint allocates its messages in the chunk arena, and
     // `collectDiags` dupes them out — freeing the chunk first would be a
     // use-after-free.
-    var vm_opt: ?lune.interp.Vm = null;
+    var vm_opt: ?mahina.interp.Vm = null;
     defer if (vm_opt) |*vm| vm.deinit();
-    var chunk_opt: ?lune.compiler.Chunk = null;
+    var chunk_opt: ?mahina.compiler.Chunk = null;
     defer if (chunk_opt) |*c| c.deinit();
 
     if (tree_opt) |tree| {
         if (!diags.hasErrors()) {
-            vm_opt = try lune.interp.Vm.init(gpa);
-            chunk_opt = lune.compiler.compileWithOptions(gpa, &vm_opt.?.heap, src0, tree.root, &diags, .{
-                .known_globals = &lune.interp.builtin_global_names,
+            vm_opt = try mahina.interp.Vm.init(gpa);
+            chunk_opt = mahina.compiler.compileWithOptions(gpa, &vm_opt.?.heap, src0, tree.root, &diags, .{
+                .known_globals = &mahina.interp.builtin_global_names,
             }) catch null;
         }
     }
@@ -875,7 +875,7 @@ fn renderDiagnostics(diags: *const Diagnostics) ![]u8 {
 /// for JS: `u32 frame_count`, then per frame (deepest-first)
 /// `{ u32 line, u32 start, u32 end, u32 name_len, [name_len]u8 name }`. Empty
 /// chain → empty slice (a null `Buf`).
-fn encodeBacktrace(frames: []const lune.interp.FaultFrame) ![]u8 {
+fn encodeBacktrace(frames: []const mahina.interp.FaultFrame) ![]u8 {
     if (frames.len == 0) return &[_]u8{};
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);

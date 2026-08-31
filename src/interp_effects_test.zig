@@ -294,7 +294,7 @@ test "warn: concatenates string args into one stderr line, separate from stdout"
         \\warn("a", "b", "c")
         \\print("x")
     , &ob, &eb);
-    try testing.expectEqualStrings("lune warning: abc\n", r.err);
+    try testing.expectEqualStrings("mahina warning: abc\n", r.err);
     try testing.expectEqualStrings("x\n", r.out);
 }
 
@@ -309,7 +309,7 @@ test "warn: @off suppresses, @on re-enables (control while off is still honoured
         \\warn("three")
     , &ob, &eb);
     // "two" is suppressed; "@on" re-enables even though the system was off.
-    try testing.expectEqualStrings("lune warning: one\nlune warning: three\n", r.err);
+    try testing.expectEqualStrings("mahina warning: one\nmahina warning: three\n", r.err);
 }
 
 test "warn: unknown @control is ignored (system stays on, no line emitted for it)" {
@@ -319,7 +319,7 @@ test "warn: unknown @control is ignored (system stays on, no line emitted for it
         \\warn("@frobnicate")
         \\warn("still on")
     , &ob, &eb);
-    try testing.expectEqualStrings("lune warning: still on\n", r.err);
+    try testing.expectEqualStrings("mahina warning: still on\n", r.err);
 }
 
 test "warn: a leading-@ piece is only a control message when it is the sole arg" {
@@ -329,7 +329,7 @@ test "warn: a leading-@ piece is only a control message when it is the sole arg"
         \\warn("@x", "y")
     , &ob, &eb);
     // Two pieces → not a control message → emitted verbatim (concatenated).
-    try testing.expectEqualStrings("lune warning: @xy\n", r.err);
+    try testing.expectEqualStrings("mahina warning: @xy\n", r.err);
 }
 
 test "warn: non-string and missing arguments are bad-argument errors" {

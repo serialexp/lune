@@ -1,5 +1,5 @@
-# lune frozen benchmark output digests — see tools/hashgate.py
-# generated from zig-out/bin/lune at rev e97f6c0
+# mahina frozen benchmark output digests — see tools/hashgate.py
+# generated from zig-out/bin/mahina at rev e97f6c0
 # name	mode	argv	rc	sha256(stdout)
 array3d	jit	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54
 array3d	t0	80	0	48752ee828b38c1ad373f80e83f62bc9394a1f02665eccff98db8159e39e4d54

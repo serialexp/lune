@@ -1,6 +1,6 @@
 import { For, Show, onMount } from "solid-js";
 import { state, loadBytes, loadFromUrl, runWasm, runBoth, canReplay, openReplay, loadSourceText, setScriptArgs } from "./store";
-import LuneEditor from "./editor/LuneEditor";
+import MahinaEditor from "./editor/MahinaEditor";
 import TraceList from "./components/TraceList";
 import TraceView from "./components/TraceView";
 import ReplayPanel from "./components/ReplayPanel";
@@ -12,11 +12,11 @@ function fmtBytes(n: number): string {
   return `${(n / 1024).toFixed(1)} KiB`;
 }
 
-/** Read a picked/dropped File into the store. `.lunetrace` decodes into the trace
+/** Read a picked/dropped File into the store. `.mahinatrace` decodes into the trace
  *  view; any other extension is treated as source text and loaded into the editor
  *  (drag-drop stays convenient for both). */
 async function ingest(file: File) {
-  if (file.name.endsWith(".lunetrace")) {
+  if (file.name.endsWith(".mahinatrace")) {
     const buf = new Uint8Array(await file.arrayBuffer());
     loadBytes(file.name, buf);
   } else {
@@ -48,15 +48,15 @@ export default function App() {
   return (
     <div class="app" onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
       <header class="topbar">
-        <h1>lune — trace inspector</h1>
+        <h1>mahina — trace inspector</h1>
         <div class="loader">
           <button type="button" onClick={() => inputRef?.click()}>
-            Open .lunetrace…
+            Open .mahinatrace…
           </button>
           <input
             ref={inputRef}
             type="file"
-            accept=".lunetrace,application/octet-stream"
+            accept=".mahinatrace,application/octet-stream"
             style={{ display: "none" }}
             onChange={(e) => {
               const file = e.currentTarget.files?.[0];
@@ -71,9 +71,9 @@ export default function App() {
         </div>
       </header>
 
-      {/* Authoring + in-browser execution (Phase 7 v3): edit a lune program and
+      {/* Authoring + in-browser execution (Phase 7 v3): edit a mahina program and
           run it through the wasm VM. The recorded trace flows into the views
-          below exactly as a loaded .lunetrace would. */}
+          below exactly as a loaded .mahinatrace would. */}
       <section class="editor">
         <div class="editor-head">
           <span class="muted">Author &amp; run in-browser (wasm) <span class="editor-file">· {state.scriptName}</span></span>
@@ -81,7 +81,7 @@ export default function App() {
             <button
               type="button"
               class="secondary"
-              title="Load a local .lua/.lune source file into the editor (e.g. a benchmark like nsieve)"
+              title="Load a local .lua/.mahina source file into the editor (e.g. a benchmark like nsieve)"
               onClick={() => sourceInputRef?.click()}
             >
               Open source…
@@ -89,7 +89,7 @@ export default function App() {
             <input
               ref={sourceInputRef}
               type="file"
-              accept=".lua,.lune,.luau,.txt,text/plain"
+              accept=".lua,.mahina,.luau,.txt,text/plain"
               style={{ display: "none" }}
               onChange={(e) => {
                 const file = e.currentTarget.files?.[0];
@@ -129,7 +129,7 @@ export default function App() {
             </button>
           </div>
         </div>
-        <LuneEditor />
+        <MahinaEditor />
         <Show when={state.replayActive}>
           <ReplayPanel />
         </Show>
@@ -224,7 +224,7 @@ export default function App() {
       >
         <Show
           when={state.traces.length > 0}
-          fallback={<div class="hint">Run a program above, drop a <code>.lunetrace</code> file here, or use “Open”. A program with a hot loop records a trace.</div>}
+          fallback={<div class="hint">Run a program above, drop a <code>.mahinatrace</code> file here, or use “Open”. A program with a hot loop records a trace.</div>}
         >
           <main class="panes">
             <TraceList />

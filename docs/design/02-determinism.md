@@ -1,4 +1,4 @@
-# lune — Determinism & the Host-Effect Boundary
+# mahina — Determinism & the Host-Effect Boundary
 
 Status: partial — host-effect boundary + record/replay (clock F2d, random F2e) + keyframe capture/restore/resume landed; record-once/replay-to-k driver now in the browser (Phase 7 v8); cross-platform-FP guarantee + guard-snapshots outstanding
 Owner: Bart
@@ -328,7 +328,7 @@ that for a time-travel debugger it *is* the architecture.
       first *user-facing* consumer of this spine. The initial run records the
       effect log once; to show the program at step *k* the visualiser re-runs from
       scratch with the suspend control set to the k-th instruction-boundary
-      safepoint (`lune_replay`), restoring nothing — re-execution *is* the
+      safepoint (`mahina_replay`), restoring nothing — re-execution *is* the
       reconstruction, and feeding the recorded effects back makes it reproducible.
       This makes the determinism property directly observable: replay to the same
       *k* yields byte-identical state every scrub, and a `clock()`/`random()`

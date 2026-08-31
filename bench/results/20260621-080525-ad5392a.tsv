@@ -1,5 +1,5 @@
-# lune bench suite  rev=ad5392a  stamp=20260621-080525  reps=5  scale=1.0
-program	args	luajit_mode	cross	luajit_match	lune_t0_ms	lune_jit_ms	luajit_ms	lune_t0_execns	lune_jit_execns
+# mahina bench suite  rev=ad5392a  stamp=20260621-080525  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	mahina_t0_ms	mahina_jit_ms	luajit_ms	mahina_t0_execns	mahina_jit_execns
 pi_leibniz	5000000	-	ok	ok	298.312	40.789	4.221	304029151	40206061
 repack	poison 2000 1000	-	ok	ok	87.253	97.182	5.197	88091125	95690451
 sieve_int	1000000	-	ok	ok	82.950	12.886	4.996	83846912	13851886

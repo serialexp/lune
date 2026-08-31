@@ -1,4 +1,4 @@
-//! lune stdlib — the `string` library (non-pattern subset).
+//! mahina stdlib — the `string` library (non-pattern subset).
 //!
 //! Pure, deterministic byte operations (tier `core`): `len`, `sub`, `byte`,
 //! `char`, `rep`, `reverse`, `upper`, `lower`, and the `printf`-style `format`.
@@ -113,7 +113,7 @@ fn posRelat(pos: i64, len: usize) i64 {
 
 /// Fetch argument `i` (0-based) as a heap `String` object — for code-point-aware
 /// operations that need the cached code-point count and the UTF-8 byte buffer.
-/// (Like `strArg`, lune does not coerce a number here; a non-string raises.)
+/// (Like `strArg`, mahina does not coerce a number here; a non-string raises.)
 fn strObjArg(vm: *Vm, args: []const Value, i: usize) anyerror!*const String {
     if (i >= args.len) return vm.badArg(i + 1, "string", null);
     const v = args[i];
@@ -1588,7 +1588,7 @@ fn copyOut(src: []const Value, out: []Value) usize {
 // ---------------------------------------------------------------------------
 
 /// `string.encode(s)` / `s:encode()` — a string's UTF-8 bytes as a **byte array**
-/// (an ordinary lune array: a table with integer keys `1..#bytes`, each value an
+/// (an ordinary mahina array: a table with integer keys `1..#bytes`, each value an
 /// integer `0..255`). Total: a valid string always has valid UTF-8 bytes, so this
 /// never fails. On all-ASCII content the result array is bit-identical to the
 /// string's bytes (the boundary is the identity function below U+0080).

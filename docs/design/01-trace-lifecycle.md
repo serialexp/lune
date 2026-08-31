@@ -1,4 +1,4 @@
-# lune — Trace Lifecycle
+# mahina — Trace Lifecycle
 
 Status: Phase 5a (recorder) + Phase 6a (IR-interpreter + loop-header deopt) +
 Phase 6b (optimizer) + Phase 7 (trace execution log for the visualiser animation)

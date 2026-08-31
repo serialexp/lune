@@ -6,8 +6,8 @@ import { createStore } from "solid-js/store";
 import { decodeTraceFile, decodeExecLogFile, decodeCoverageFile, type TraceExecLogOutput, type CoverageFileOutput, type CoverageAnchorOutput } from "./decode";
 import { viewsOf, type TraceView } from "./disasm";
 import { flattenExec, type ExecStep } from "./exec";
-import { type LuneRunResult, type LuneReplayResult, type LuneDiagnostic, type BacktraceFrame, type ProtoDisasm } from "./wasm/lune";
-import { luneWorker } from "./wasm/lune-client";
+import { type MahinaRunResult, type MahinaReplayResult, type MahinaDiagnostic, type BacktraceFrame, type ProtoDisasm } from "./wasm/mahina";
+import { mahinaWorker } from "./wasm/mahina-client";
 import { runNative } from "./native";
 import { diffRuns, type DiffReport } from "./diff";
 import { decodeSnapshot, type SnapshotView } from "./snapshot";
@@ -48,7 +48,7 @@ interface VizState {
   runBacktrace: BacktraceFrame[] | null;
   /** The full artifact bundle from the last wasm run (kept for the differential
    *  validator in Commit 3). */
-  lastRun: LuneRunResult | null;
+  lastRun: MahinaRunResult | null;
   /** The last dual-execution diff (wasm vs native), null until "Run both". */
   diff: DiffReport | null;
   /** Execution timing from the last wasm run: `totalMs` is the whole wasm call
@@ -83,7 +83,7 @@ interface VizState {
   /** Slider position: an index into `replayStops`. */
   replayPos: number;
   /** The VM state at the current step (null until a step is fetched). */
-  replayState: LuneReplayResult | null;
+  replayState: MahinaReplayResult | null;
   /** The decoded globals + locals view of `replayState.keyframe`, or null. */
   replayView: SnapshotView | null;
   /** Static disassembly of the captured run's proto tree, indexed by `id` (the
@@ -182,7 +182,7 @@ const [state, setState] = createStore<VizState>({
   selected: -1,
   error: null,
   source: DEFAULT_SOURCE,
-  scriptName: "playground.lune",
+  scriptName: "playground.mahina",
   scriptArgs: "",
   running: false,
   stdout: null,
@@ -219,7 +219,7 @@ export function setSource(src: string): void {
 
 /** Load a local source file's text into the editor (does not run). Sets the
  *  script name (used as `arg[0]` and the loaded-file label). Distinct from
- *  `loadBytes`, which decodes a binary `.lunetrace` artifact into the trace view. */
+ *  `loadBytes`, which decodes a binary `.mahinatrace` artifact into the trace view. */
 export function loadSourceText(name: string, text: string): void {
   setState({ source: text, scriptName: name });
 }
@@ -246,23 +246,23 @@ function wasmArgv(): string[] {
 }
 
 /**
- * Compile-only validation: parse + compile `src` through the in-browser lune
+ * Compile-only validation: parse + compile `src` through the in-browser mahina
  * frontend (the wasm `check` entry — it does NOT run the program) and return its
  * diagnostics. Drives the editor's live linter. A transient wasm error yields no
  * diagnostics rather than spamming squiggles. Wasm access stays funnelled through
  * the store (the editor never touches the module directly — Rule #9).
  */
-export async function checkSource(src: string): Promise<LuneDiagnostic[]> {
+export async function checkSource(src: string): Promise<MahinaDiagnostic[]> {
   try {
-    return await luneWorker().check(src);
+    return await mahinaWorker().check(src);
   } catch {
     return [];
   }
 }
 
 /** Decode a wasm run's recorded trace and push it + stdout into the store. The
- *  trace flows into the existing views exactly as a loaded .lunetrace would. */
-function applyWasmResult(result: LuneRunResult, fileName: string, source: string): void {
+ *  trace flows into the existing views exactly as a loaded .mahinatrace would. */
+function applyWasmResult(result: MahinaRunResult, fileName: string, source: string): void {
   let traces: TraceView[] = [];
   let version: number | null = null;
   if (result.trace.length > 0) {
@@ -374,7 +374,7 @@ export function setReplayPos(pos: number): void {
   const k = stops[clamped];
   void (async () => {
     try {
-      const rs = await luneWorker().replay(state.replaySource, state.replayEffects!, k);
+      const rs = await mahinaWorker().replay(state.replaySource, state.replayEffects!, k);
       setState({ replayPos: clamped, replayState: rs, replayView: decodeSnapshot(rs.keyframe) });
     } catch (e) {
       setState({
@@ -401,7 +401,7 @@ export async function runWasm(): Promise<void> {
   setState({ running: true, runError: null, runErrorSpan: null, runBacktrace: null, diff: null });
   try {
     const src = state.source;
-    const result = await luneWorker().runSource(src, wasmArgv());
+    const result = await mahinaWorker().runSource(src, wasmArgv());
     applyWasmResult(result, "(wasm run)", src);
     // A wasm-only run has no cycle counter — drop any prior native time split so
     // the panel's time column reverts to "run native".
@@ -430,7 +430,7 @@ export async function runBoth(): Promise<void> {
     // arg[1..], which is what the keyframe compare requires (arg[0] is cancelled).
     const userArgs = parseArgsString(state.scriptArgs);
     const [wasm, native] = await Promise.all([
-      luneWorker().runSource(src, wasmArgv()),
+      mahinaWorker().runSource(src, wasmArgv()),
       runNative(src, userArgs),
     ]);
     applyWasmResult(wasm, "(wasm + native diff)", src);
@@ -453,7 +453,7 @@ export async function runBoth(): Promise<void> {
   }
 }
 
-/** Decode a `.lunetrace` buffer and replace the current view. */
+/** Decode a `.mahinatrace` buffer and replace the current view. */
 export function loadBytes(name: string, bytes: Uint8Array): void {
   try {
     const file = decodeTraceFile(bytes);
@@ -464,7 +464,7 @@ export function loadBytes(name: string, bytes: Uint8Array): void {
       traces,
       selected: traces.length > 0 ? 0 : -1,
       error: null,
-      // A loaded .lunetrace carries no coverage — drop any stale run panel.
+      // A loaded .mahinatrace carries no coverage — drop any stale run panel.
       coverage: null,
       nativeCoverage: null,
     });
@@ -480,7 +480,7 @@ export function loadBytes(name: string, bytes: Uint8Array): void {
 }
 
 /**
- * Fetch a `.lunetrace` from a URL and load it. Powers the deep-link affordance
+ * Fetch a `.mahinatrace` from a URL and load it. Powers the deep-link affordance
  * (`?src=<url>`) so a trace can be opened directly without the file picker.
  */
 export async function loadFromUrl(url: string): Promise<void> {

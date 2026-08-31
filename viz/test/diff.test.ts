@@ -12,24 +12,24 @@ import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { instantiateLuneFromBytes, type LuneModule } from "../src/wasm/lune";
+import { instantiateMahinaFromBytes, type MahinaModule } from "../src/wasm/mahina";
 import { diffRuns, type RunArtifacts } from "../src/diff";
 
 const repoBin = (name: string) => fileURLToPath(new URL(`../../zig-out/bin/${name}`, import.meta.url));
-const wasmPath = repoBin("lune.wasm");
-const nativePath = repoBin("lune");
+const wasmPath = repoBin("mahina.wasm");
+const nativePath = repoBin("mahina");
 
-let mod: LuneModule;
+let mod: MahinaModule;
 
 beforeAll(async () => {
-  mod = await instantiateLuneFromBytes(new Uint8Array(readFileSync(wasmPath)));
+  mod = await instantiateMahinaFromBytes(new Uint8Array(readFileSync(wasmPath)));
 });
 
 /** Run a source chunk through the native binary, collecting its artifacts. */
 function runNative(source: string): RunArtifacts {
-  const dir = mkdtempSync(join(tmpdir(), "lune-difftest-"));
+  const dir = mkdtempSync(join(tmpdir(), "mahina-difftest-"));
   try {
-    const src = join(dir, "p.lune");
+    const src = join(dir, "p.mahina");
     const kf = join(dir, "k");
     const ef = join(dir, "e");
     const tr = join(dir, "t");
@@ -66,7 +66,7 @@ const integerCorpus: { name: string; src: string }[] = [
   { name: "hot loop (traced)", src: "local s = 0\nfor i = 1, 2000 do s = s + i end\nprint(s)\n" },
   { name: "table of ints", src: "local t = {a = 1, b = 2, c = 3}\nprint(t.a + t.b + t.c)\n" },
   { name: "nested arithmetic", src: "local x = 7\nlocal y = (x * 3 + 1) % 5\nprint(y)\n" },
-  { name: "string interning", src: 'local a = "lune"\nlocal b = "lune"\nprint(a)\nprint(b)\n' },
+  { name: "string interning", src: 'local a = "mahina"\nlocal b = "mahina"\nprint(a)\nprint(b)\n' },
 ];
 
 for (const { name, src } of integerCorpus) {

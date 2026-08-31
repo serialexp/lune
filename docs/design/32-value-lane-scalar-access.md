@@ -67,7 +67,7 @@ heterogeneously.
 ### Why the "obvious" fix is wrong
 
 Adding an `int → f64` rung to `widenFor` would keep the array narrow.
-It is not available to us: lune distinguishes integers from floats
+It is not available to us: mahina distinguishes integers from floats
 observably (`math.type`, `//`, `%`, `tostring`, `string.format`), so
 re-encoding already-stored integers as doubles changes program output.
 `.value` is the *correct* representation for a mixed array. The bug is
@@ -351,7 +351,7 @@ callee address shifted by 8 bytes), with an identical instruction sequence
 and identical length. Neither benchmark touches a `.value` lane at all.
 
 The residual is therefore **binary code layout** — editing `nativegen.zig`
-and `trace.zig` moved functions in the lune image, changing I-cache and
+and `trace.zig` moved functions in the mahina image, changing I-cache and
 branch-predictor alignment for unrelated code. This is a measurement
 confound, not a behaviour change, and it cancels across the suite (total
 +0.12%). Recorded here so the next arc does not re-investigate it: on this

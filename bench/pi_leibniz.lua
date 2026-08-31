@@ -8,10 +8,10 @@
 --   π/4 = Σ_{k≥0} (-1)^k / (2k+1) = 1 - 1/3 + 1/5 - 1/7 + …
 --
 -- Run head-to-head (output byte-identical across all four, and to LuaJIT):
---   lune                 bench/pi_leibniz.lua 50000000   # tier-0 (bytecode interp)
---   lune --trace         bench/pi_leibniz.lua 50000000   # tier-1a (IR interp)
---   lune --jit-native    bench/pi_leibniz.lua 50000000   # tier-1b (native x64)
---   lune --dump-native   bench/pi_leibniz.lua 50000000   # confirm the loop compiles
+--   mahina                 bench/pi_leibniz.lua 50000000   # tier-0 (bytecode interp)
+--   mahina --trace         bench/pi_leibniz.lua 50000000   # tier-1a (IR interp)
+--   mahina --jit-native    bench/pi_leibniz.lua 50000000   # tier-1b (native x64)
+--   mahina --dump-native   bench/pi_leibniz.lua 50000000   # confirm the loop compiles
 --   luajit               bench/pi_leibniz.lua 50000000   # reference
 --
 -- @bench args="5000000" luajit=compatible

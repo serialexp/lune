@@ -8,7 +8,7 @@
 -- "" == "" == "". The trailing print closes that; the checksum folds the
 -- FACTORED matrix, so it pins the pivoting and the elimination, not just the
 -- input. Byte-parity with LuaJIT depends on scimark_lib.lua's forced portable
--- RNG (see its "lune-local edit 1 of 2").
+-- RNG (see its "mahina-local edit 1 of 2").
 local lib = require("scimark_lib")
 lib.LU(100)(tonumber(arg and arg[1]) or 5000)
 print(lib.checksum())

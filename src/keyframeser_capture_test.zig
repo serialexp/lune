@@ -25,8 +25,8 @@ const Proto = bytecode.Proto;
 const Vm = interp.Vm;
 pub const schema = @import("gen/trace_schema.zig");
 const testing = std.testing;
-const lune_parser = @import("parser.zig");
-const lune_compiler = @import("compiler.zig");
+const mahina_parser = @import("parser.zig");
+const mahina_compiler = @import("compiler.zig");
 const Diagnostics = @import("diag.zig").Diagnostics;
 const io = @import("io.zig");
 
@@ -154,7 +154,7 @@ fn withSnapshot(source: [:0]const u8, check: *const fn (file: schema.SnapshotFil
     const gpa = testing.allocator;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -164,7 +164,7 @@ fn withSnapshot(source: [:0]const u8, check: *const fn (file: schema.SnapshotFil
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -234,7 +234,7 @@ test "VM-driven snapshot captures a complete, non-dangling heap graph" {
             try testing.expect(n_closure >= 1); // g.add
             try testing.expect(n_upvalue >= 1); // captured x (closed)
             try testing.expect(n_native >= 1); // print
-            try testing.expect(n_string >= 3); // "g","add","name","lune","print",...
+            try testing.expect(n_string >= 3); // "g","add","name","mahina","print",...
         }
     };
     try withSnapshot(
@@ -243,7 +243,7 @@ test "VM-driven snapshot captures a complete, non-dangling heap graph" {
         \\g.add = adder(10)
         \\g[1] = 100
         \\g[2] = 200
-        \\g.name = "lune"
+        \\g.name = "mahina"
         \\g.self = g
     , Check.run);
 }

@@ -26,7 +26,7 @@ export type { CoverageFileOutput, CoverageAnchorOutput, JitCountersOutput };
 /** A single decoded const: a discriminated union tagged by `body.type`. */
 export type DecodedConst = TraceOutput["consts"][number];
 
-/** Decode a `.lunetrace` byte buffer into its structural form. */
+/** Decode a `.mahinatrace` byte buffer into its structural form. */
 export function decodeTraceFile(bytes: Uint8Array): TraceFileOutput {
   return new TraceFileDecoder(bytes).decode();
 }

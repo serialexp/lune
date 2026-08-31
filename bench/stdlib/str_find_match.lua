@@ -5,15 +5,20 @@
 -- coerced through tonumber, and an anchored match. Integer checksum keeps output
 -- deterministic and byte-identical to LuaJIT.
 --
---   lune              bench/stdlib/str_find_match.lua 100000   # tier-0
---   lune --jit-native bench/stdlib/str_find_match.lua 100000   # tier-1b
---   luajit            bench/stdlib/str_find_match.lua 100000   # reference
+--   mahina              bench/stdlib/str_find_match.lua 100000   # tier-0
+--   mahina --jit-native bench/stdlib/str_find_match.lua 100000   # tier-1b
+--   luajit              bench/stdlib/str_find_match.lua 100000   # reference
 --
 -- @bench args="100000" luajit=compatible
 
 local find, match = string.find, string.match
 
-local text = "key=value; name=lune; year=2026; lang=zig"
+-- Corpus. Deliberately contains no project name: `acc` below depends on this
+-- string's byte length (the plain `find` for "year" shifts with it), so the
+-- length is frozen into bench/refs/output-hashes.tsv. The lune -> mahina rename
+-- swapped a 4-byte token here for a 6-byte one and silently moved all three
+-- digests; keep this token neutral and 4 bytes.
+local text = "key=value; name=moon; year=2026; lang=zig"
 
 local function run(n)
   local acc = 0

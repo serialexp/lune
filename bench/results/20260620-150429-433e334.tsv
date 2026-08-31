@@ -1,5 +1,5 @@
-# lune bench suite  rev=433e334  stamp=20260620-150429  reps=5  scale=1.0
-program	args	luajit_mode	cross	luajit_match	lune_t0_ms	lune_jit_ms	luajit_ms	lune_t0_execns	lune_jit_execns
+# mahina bench suite  rev=433e334  stamp=20260620-150429  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	mahina_t0_ms	mahina_jit_ms	luajit_ms	mahina_t0_execns	mahina_jit_execns
 str_find_match	100000	-	ok	ok	36.312	36.195	13.236	35656968	37491208
 str_format	200000	-	ok	ok	533.520	527.969	28.758	535305948	545477890
 str_gmatch	80000	-	ok	ok	63.994	63.534	25.292	64003676	65254658

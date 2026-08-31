@@ -1,4 +1,4 @@
-# lune — mod/idiv native lowering (the scalar-native frontier)
+# mahina — mod/idiv native lowering (the scalar-native frontier)
 
 Status: **landed 2026-08-28.** Results: scalar **4.3× → 0.9× LuaJIT** (jit
 instructions 633.7M → 78.7M, −87.6%); the safety net no longer fires on

@@ -1,7 +1,7 @@
 {
   "meta": {
-    "title": "lune trace",
-    "description": "lune tier-1a trace IR wire format (Phase 5b). The on-disk form of a committed, cached Trace (src/trace.zig). Canonical source; the Zig encoder/decoder under src/gen/ is generated from this by tools/regen-trace-schema.sh and vendored. Consumer: the time-travel visualiser (Phase 7).",
+    "title": "mahina trace",
+    "description": "mahina tier-1a trace IR wire format (Phase 5b). The on-disk form of a committed, cached Trace (src/trace.zig). Canonical source; the Zig encoder/decoder under src/gen/ is generated from this by tools/regen-trace-schema.sh and vendored. Consumer: the time-travel visualiser (Phase 7).",
     "version": "0.1"
   },
   "config": { "endianness": "little_endian", "bit_order": "lsb_first" },
@@ -11,12 +11,12 @@
     "ConstBool":   { "sequence": [ { "name": "v", "type": "uint8" } ] },
     "ConstNil":    { "sequence": [ { "name": "pad", "type": "uint8" } ] },
     "ConstString": {
-      "description": "A heap string constant: the raw bytes (lune strings are byte strings, not necessarily UTF-8).",
+      "description": "A heap string constant: the raw bytes (mahina strings are byte strings, not necessarily UTF-8).",
       "sequence": [ { "name": "v", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" } ]
     },
 
     "ConstValue": {
-      "description": "A trace constant. `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4). A heap_ref const is always a string (tables/closures are never compile-time constants).",
+      "description": "A trace constant. `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4). A heap_ref const is always a string (tables/closures are never compile-time constants).",
       "sequence": [
         { "name": "tag", "type": "uint8" },
         {
@@ -71,7 +71,7 @@
     },
 
     "SnapValue": {
-      "description": "A live runtime Value on the wire (src/value.zig). `tag` mirrors lune's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).",
+      "description": "A live runtime Value on the wire (src/value.zig). `tag` mirrors mahina's Value.Tag enum (nil=0, boolean=1, int=2, float=3, heap_ref=4) — the same ordinals as ConstValue. Unlike a trace ConstValue, a heap_ref here may reference ANY heap object (table/closure/string/...), carried as the referenced object's id (HeapRef).",
       "sequence": [
         { "name": "tag", "type": "uint8" },
         {
@@ -98,7 +98,7 @@
     },
 
     "HeapString": {
-      "description": "A heap string object's raw bytes (lune strings are byte strings, not necessarily UTF-8). Interned at restore.",
+      "description": "A heap string object's raw bytes (mahina strings are byte strings, not necessarily UTF-8). Interned at restore.",
       "sequence": [ { "name": "bytes", "type": "bytes", "kind": "length_prefixed", "length_type": "uint32" } ]
     },
 
@@ -223,7 +223,7 @@
     },
 
     "Effect": {
-      "description": "One recorded nondeterministic INPUT: the host effect that produced it and the Value it returned. `kind` mirrors lune's interp.EffectKind enum (clock=0, random_seed=1, getenv=2, argc=3, argv=4). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars (clock/argc/random_seed) plus inline string bytes (getenv/argv), never a heap_ref.",
+      "description": "One recorded nondeterministic INPUT: the host effect that produced it and the Value it returned. `kind` mirrors mahina's interp.EffectKind enum (clock=0, random_seed=1, getenv=2, argc=3, argv=4). The log is consumed in call order on replay; kind + result fully describe each entry (effect args are re-supplied by re-executing the same instruction stream). `result` is an EffectResult — scalars (clock/argc/random_seed) plus inline string bytes (getenv/argv), never a heap_ref.",
       "sequence": [
         { "name": "kind",   "type": "uint8" },
         { "name": "result", "type": "EffectResult" }

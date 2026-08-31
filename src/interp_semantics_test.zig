@@ -709,7 +709,7 @@ test "f64 RMW: a read-modify-write float loop is byte-identical across all modes
     // ("astore after aload"); store-sinking (doc 07) defers the single astore below
     // every loop-exit guard so it lands just before `.loop`.
     //
-    // This is the load-bearing idempotence test. lune's deopt re-runs a whole
+    // This is the load-bearing idempotence test. mahina's deopt re-runs a whole
     // iteration from the loop header: a trace completes N iterations, then on the
     // loop-back guard side-exit tier-0 re-runs iteration N+1 from bytecode. Because
     // the store is sunk *below* that guard, the side-exiting iteration never executed
@@ -1382,7 +1382,7 @@ test "metatable: arithmetic on a table without the metamethod still raises locat
 }
 
 test "bitwise faults report integer-representation / bitwise-operation messages" {
-    // lune is strict integer-only for bitwise: a float operand (even integral)
+    // mahina is strict integer-only for bitwise: a float operand (even integral)
     // gets "number has no integer representation"; a non-number operand gets
     // "attempt to perform bitwise operation on a <type> value" — distinct from
     // the arithmetic message, matching Lua 5.4's split.

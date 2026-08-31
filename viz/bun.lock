@@ -2,7 +2,7 @@
   "lockfileVersion": 1,
   "workspaces": {
     "": {
-      "name": "@aeolun/lune-viz",
+      "name": "@aeolun/mahina-viz",
       "dependencies": {
         "@codemirror/commands": "^6.10.3",
         "@codemirror/language": "^6.12.3",

@@ -10,7 +10,7 @@
 //! through a raw pointer with SysV argument passing (xmm0 in, xmm0 out).
 //!
 //! Determinism note (doc 02): these are pure functions of their argument — no
-//! errno, no global rounding-mode dependence beyond the default MXCSR lune
+//! errno, no global rounding-mode dependence beyond the default MXCSR mahina
 //! never changes — so replay and 8-mode equivalence are safe by the same
 //! argument as `fsqrt`'s.
 

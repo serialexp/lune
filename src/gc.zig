@@ -138,7 +138,7 @@ pub const Heap = struct {
     /// unobservable and the determinism story rests on the fixed-seed hash only.
     ///
     /// Trust model (explicit decision): no hash-flood hardening. LuaJIT's
-    /// SECURITY_STRHASH secondary hash needs a random seed; lune runs trusted
+    /// SECURITY_STRHASH secondary hash needs a random seed; mahina runs trusted
     /// programs, and a recorded-then-replayed seed is the future path if that
     /// ever changes.
     strtab: []?*String = &.{},

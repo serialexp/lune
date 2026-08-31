@@ -30,7 +30,7 @@ pub const String = extern struct {
     hash: u64,
     /// Byte length of the inline payload.
     len: usize,
-    /// Cached count of Unicode code points (S-B, design doc 06). A lune `string`
+    /// Cached count of Unicode code points (S-B, design doc 06). A mahina `string`
     /// is code-point-native (UTF-8 inside), so `#s`/`string.len` must report the
     /// number of characters, not bytes. Strings are immutable and interned, so we
     /// compute this once at construction (`create`) and cache it — `#s` stays
@@ -128,7 +128,7 @@ pub const String = extern struct {
         // restore. The ASCII fast paths therefore rest on the EXACT `str_ascii`
         // bit below, never on UTF-8 validity.
         // Checked size: a hostile/huge length must fail as OOM, not wrap the
-        // allocation size (lune's counterpart of LuaJIT's LJ_MAX_STR guard).
+        // allocation size (mahina's counterpart of LuaJIT's LJ_MAX_STR guard).
         const total = std.math.add(usize, @sizeOf(String), content.len) catch return error.OutOfMemory;
         const raw = try gpa.alignedAlloc(u8, std.mem.Alignment.of(String), total);
         const self: *String = @ptrCast(raw.ptr);

@@ -1,10 +1,10 @@
 -- @bench args="300000" luajit=compatible luajit_src=_ref/euler14-bit.lua name=euler14-bit
 -- Adapted from LuaJIT/bench/euler14-bit.lua (Computer Language Benchmarks Game
 -- port). The upstream uses LuaJIT's BitOp library (`bit.band`/`bor`/`lshift`/…,
--- int32 semantics); here those calls are rewritten to lune's native 64-bit
+-- int32 semantics); here those calls are rewritten to mahina's native 64-bit
 -- bitwise operators. The branchless Collatz step is unchanged in meaning, so the
 -- output is byte-identical to the upstream `bit.*` version (which LuaJIT runs via
--- `luajit_src`). lune's 64-bit ops never truncate; the cached chains land on the
+-- `luajit_src`). mahina's 64-bit ops never truncate; the cached chains land on the
 -- same answer (e.g. N=1e6 → "Found 837799").
 
 local N = tonumber(arg and arg[1]) or 10000000

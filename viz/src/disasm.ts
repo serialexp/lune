@@ -1,7 +1,7 @@
 // Pure rendering of a decoded trace into a structural view-model + text form.
 //
 // This mirrors `src/trace.zig`'s `writeIrInstr` / `writeTrace` so the web view
-// matches `lune --dump-traces`. It is DOM-free and side-effect-free, so the
+// matches `mahina --dump-traces`. It is DOM-free and side-effect-free, so the
 // cross-language decode test can assert on it directly.
 
 import type { TraceFileOutput, TraceOutput, ConstValueOutput } from "./gen/generated";
@@ -127,7 +127,7 @@ export function viewsOf(file: TraceFileOutput): TraceView[] {
 }
 
 /**
- * Reproduce `lune --dump-traces` body text for one trace (header uses the proto
+ * Reproduce `mahina --dump-traces` body text for one trace (header uses the proto
  * *id*, since the artifact has no proto name). Columns match `writeTrace`:
  * `  %NNN  <op padded to 13><operands>`. Loop-carried writebacks now ride the
  * instruction stream as slot-bound `phi` rows (no separate `exit:` line).

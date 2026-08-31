@@ -1,4 +1,4 @@
-// lune_check tests: the compile-only validation entry the in-browser editor's
+// mahina_check tests: the compile-only validation entry the in-browser editor's
 // live linter drives. It parses + compiles WITHOUT running the program and
 // returns structured diagnostics (severity + byte span + line + message), so the
 // editor can draw a squiggle exactly under the offending token.
@@ -8,13 +8,13 @@
 import { test, expect, beforeAll } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { instantiateLuneFromBytes, type LuneModule } from "../src/wasm/lune";
+import { instantiateMahinaFromBytes, type MahinaModule } from "../src/wasm/mahina";
 
-const wasmPath = fileURLToPath(new URL("../../zig-out/bin/lune.wasm", import.meta.url));
+const wasmPath = fileURLToPath(new URL("../../zig-out/bin/mahina.wasm", import.meta.url));
 
-let mod: LuneModule;
+let mod: MahinaModule;
 beforeAll(async () => {
-  mod = await instantiateLuneFromBytes(new Uint8Array(readFileSync(wasmPath)));
+  mod = await instantiateMahinaFromBytes(new Uint8Array(readFileSync(wasmPath)));
 });
 
 test("a valid program checks clean (no diagnostics)", () => {

@@ -1,6 +1,6 @@
 -- @bench args="50000" luajit=compatible name=nbody
 -- Vendored verbatim from LuaJIT/bench/nbody.lua (Computer Language
--- Benchmarks Game port). Only this header is lune-added.
+-- Benchmarks Game port). Only this header is mahina-added.
 
 local sqrt = math.sqrt
 

@@ -329,10 +329,10 @@ pub const IrOp = enum(u8) {
     /// (NOT a constant-folder input — see doc 12 / `tropt`).
     fsqrt,
 
-    // ---- arithmetic right shift (`~>>`, lune syntax extension) ----------------
+    // ---- arithmetic right shift (`~>>`, mahina syntax extension) ----------------
     /// `a` = value ref, `b` = count ref → arithmetic (sign-extending) right shift,
     /// the `~>>` operator. The bitwise-group analogue of `shr`/`shl`: both operands
-    /// guarded `.int` upstream, 64-bit width like the rest of lune's integer
+    /// guarded `.int` upstream, 64-bit width like the rest of mahina's integer
     /// bitwise set, oracle is `arith.sar`. Classified `.binary` (a pure two-int
     /// producer). Appended last so every prior op's wire ordinal stays stable
     /// (the traceser ordinal-pinning convention — NEW ops go at the enum end).
@@ -412,7 +412,7 @@ pub const IrOp = enum(u8) {
     /// the flat index. Produces no value; never DCE'd. Classified `.guard`. Appended last.
     guard_gpresent,
     // ---- nested-loop trace linking (doc 15, Phase 2) --------------------------
-    /// Terminal **link** to an inner root trace — the lune analogue of LuaJIT's
+    /// Terminal **link** to an inner root trace — the mahina analogue of LuaJIT's
     /// `LJ_TRLINK_ROOT`. Emitted *instead of* `.loop` to close a *continuation*
     /// trace (one anchored at a non-header exit pc, recording the outer body) when,
     /// going forward, it re-reaches an inner numeric-`for`'s `for_prep` whose loop
@@ -1617,7 +1617,7 @@ pub const TraceConfig = struct {
     /// temporarily-unstable loop recovers cheaply, a hopeless one is retried
     /// exponentially less often. The window is keyed on the deterministic
     /// per-anchor back-edge counter, never wall-clock or RNG, so the retry
-    /// schedule is reproducible (lune determinism). `backoff_base` is the first
+    /// schedule is reproducible (mahina determinism). `backoff_base` is the first
     /// window; it doubles up to `backoff_max`.
     backoff_base: u32 = 128,
     /// Cap on the doubling cooldown window (back-edges).
@@ -13608,7 +13608,7 @@ pub const TraceState = struct {
     }
 
     /// `for_prep` (numeric-for entry): the nested-loop **trace-link** site (doc 15,
-    /// Phase 2 — the lune analogue of LuaJIT's `rec_loop_jit` / `LJ_TRLINK_ROOT`).
+    /// Phase 2 — the mahina analogue of LuaJIT's `rec_loop_jit` / `LJ_TRLINK_ROOT`).
     ///
     /// A `for_prep` pre-decrements its index (`R[a] = init − step`) and jumps forward
     /// to the matching `for_loop`, whose back-edge target is the loop body start —
@@ -13891,7 +13891,7 @@ pub const TraceState = struct {
     }
 
     /// Dispatch a `.call` whose callee is a `RecordedBuiltin`-tagged native to
-    /// its per-builtin recorder arm (doc 23 D1 — lune's `recff_idmap`). The
+    /// its per-builtin recorder arm (doc 23 D1 — mahina's `recff_idmap`). The
     /// common preamble here rejects dynamic windows once; each arm owns its own
     /// arity (`instr.b`), result-count (`instr.c`), and observed-shape abort
     /// matrix. Arms whose recorder has not landed yet abort `.host_barrier`,
@@ -15513,7 +15513,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         // One-liner for --jit-coverage. `fallback` = the smell: had a trace, ran
         // tier-0. The time fragment is what de-misleads the iteration percentages.
         try w.print(
-            "lune: jit coverage — iters: traced {d:.1}% / fallback {d:.1}%",
+            "mahina: jit coverage — iters: traced {d:.1}% / fallback {d:.1}%",
             .{ pctOf(traced, total), pctOf(covered_interp, total) },
         );
         if (has_time) {
@@ -15527,7 +15527,7 @@ pub fn writeJitStats(w: *io.Writer, ts: *const TraceState, full: bool) io.Writer
         return;
     }
 
-    try w.writeAll("lune: JIT stats\n");
+    try w.writeAll("mahina: JIT stats\n");
     try w.writeAll("  event counters:\n");
     try w.print("    trace entries:        {d} (native bodies: {d})\n", .{ ts.entries, ts.native_entries });
     try w.print("    link arms:            native={d} source={d} loopdone={d} bridge={d}\n", .{ ts.native_link_arms, ts.native_source_link_arms, ts.native_loopdone_link_arms, ts.native_region_bridge_arms });

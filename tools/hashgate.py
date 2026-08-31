@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""lune frozen-output gate — pin every benchmark's stdout to a committed digest.
+"""mahina frozen-output gate — pin every benchmark's stdout to a committed digest.
 
-`bench/run.py` already proves the *cross-tier* half of lune's determinism
+`bench/run.py` already proves the *cross-tier* half of mahina's determinism
 property: for each program, tier-0 / tier-1a / tier-1b stdout must be
 byte-identical (reported as `cross=ok`). That catches a JIT that computes
 something different from the interpreter.
@@ -14,7 +14,7 @@ This script is that half.
     tools/hashgate.py                  # gate: re-run and diff vs the refs
     tools/hashgate.py --generate       # regenerate refs from the current binary
     tools/hashgate.py --filter nbody   # subset, same name matching as run.py
-    tools/hashgate.py --also-lune B    # gate binary B against the same refs too
+    tools/hashgate.py --also-mahina B    # gate binary B against the same refs too
 
 Refs live in `bench/refs/output-hashes.tsv`, one row per (program, mode):
 
@@ -41,7 +41,7 @@ integer checksum of their result state.
 Closing it exposed a second defect the first had been hiding. `scimark_lib.lua`
 selects its RNG with `if jit and jit.status and jit.status()`, and the two
 branches are NOT equivalent generators — they agree on their first value and
-then diverge. LuaJIT took one branch and lune the other, so the four scimark
+then diverge. LuaJIT took one branch and mahina the other, so the four scimark
 kernels had been running on DIFFERENT INPUT DATA in the two engines, and their
 `luajit=compatible` claim was not merely vacuous but unreachable. Nothing caught
 it precisely because the programs printed nothing. The lib now forces the
@@ -52,20 +52,20 @@ verifiably match LuaJIT bit-for-bit.
 a live tripwire, so that a benchmark added later with no output cannot silently
 recreate this.
 
-WHY `--also-lune` EXISTS (added 2026-08-26). The gate had only ever run a
+WHY `--also-mahina` EXISTS (added 2026-08-26). The gate had only ever run a
 ReleaseFast binary, where `std.debug.assert` and the `@enumFromInt` safety check
 compile to nothing. Every such check in all 84 configurations was therefore going
 unexercised, and two real memory-safety bugs sat in the corpus undetected: a
 use-after-free of the tier-1a executor's value scratch, reached from `driveChain`
 by `--trace nsieve-bit.lua 6` and `--trace scimark-sparse.lua 3000`, which
 ReleaseFast survived only because the freed block still held its old contents.
-Passing a safety-checked build via `--also-lune` runs the identical corpus with
+Passing a safety-checked build via `--also-mahina` runs the identical corpus with
 those checks live and gates it against the SAME refs — the two binaries must
 agree, which is the determinism claim applied across optimization modes. Digests
-are always generated from `--lune` (the release binary the refs describe); the
+are always generated from `--mahina` (the release binary the refs describe); the
 extra binaries are verified against them, never used to write them.
 
-Assumes lune is built:  zig build -Doptimize=ReleaseFast  (or pass --lune).
+Assumes mahina is built:  zig build -Doptimize=ReleaseFast  (or pass --mahina).
 `just hashgate` builds and passes both legs.
 """
 
@@ -78,7 +78,7 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_LUNE = os.path.join(ROOT, "zig-out", "bin", "lune")
+DEFAULT_MAHINA = os.path.join(ROOT, "zig-out", "bin", "mahina")
 DEFAULT_REFS = os.path.join(ROOT, "bench", "refs", "output-hashes.tsv")
 
 # sha256 of the empty byte string — the digest of a program that prints nothing.
@@ -97,13 +97,13 @@ def _load_bench_runner():
 BR = _load_bench_runner()
 
 
-def run_digest(lune, bench, flags):
+def run_digest(mahina, bench, flags):
     """Run one (program, mode) and return (rc, sha256-of-stdout).
 
     Runs from the program's own directory so `require("x")` resolves `./x.lua`,
     matching run.py and LuaJIT's run.sh.
     """
-    cmd = [lune, *flags, bench.path, *bench.argv]
+    cmd = [mahina, *flags, bench.path, *bench.argv]
     proc = subprocess.run(cmd, capture_output=True, cwd=os.path.dirname(bench.path))
     return proc.returncode, hashlib.sha256(proc.stdout).hexdigest(), proc.stderr
 
@@ -122,18 +122,18 @@ def read_refs(path):
     return refs
 
 
-def write_refs(path, rows, lune):
+def write_refs(path, rows, mahina):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     rev = BR.git_rev()
     with open(path, "w") as fh:
-        fh.write("# lune frozen benchmark output digests — see tools/hashgate.py\n")
-        fh.write(f"# generated from {os.path.relpath(lune, ROOT)} at rev {rev}\n")
+        fh.write("# mahina frozen benchmark output digests — see tools/hashgate.py\n")
+        fh.write(f"# generated from {os.path.relpath(mahina, ROOT)} at rev {rev}\n")
         fh.write("# name\tmode\targv\trc\tsha256(stdout)\n")
         for name, mode, argv, rc, digest in rows:
             fh.write(f"{name}\t{mode}\t{argv}\t{rc}\t{digest}\n")
 
 
-def observe(lune, benches, jobs_n, reps):
+def observe(mahina, benches, jobs_n, reps):
     """Run every (program, mode) under one binary.
 
     Returns (observed, unstable, errored). `unstable` is only ever populated
@@ -144,7 +144,7 @@ def observe(lune, benches, jobs_n, reps):
 
     def work(job):
         b, mode, flags = job
-        return job, [run_digest(lune, b, flags) for _ in range(reps)]
+        return job, [run_digest(mahina, b, flags) for _ in range(reps)]
 
     observed, unstable, errored = {}, [], []
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs_n) as pool:
@@ -190,13 +190,13 @@ def gate(observed, refs, label, allow_missing):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="lune frozen-output gate")
+    ap = argparse.ArgumentParser(description="mahina frozen-output gate")
     ap.add_argument("--generate", action="store_true",
                     help="regenerate the reference digests instead of gating")
     ap.add_argument("--filter", default="", help="only programs whose name contains this")
     ap.add_argument("--refs", default=DEFAULT_REFS)
-    ap.add_argument("--lune", default=os.environ.get("LUNE", DEFAULT_LUNE))
-    ap.add_argument("--also-lune", action="append", default=[], metavar="BIN",
+    ap.add_argument("--mahina", default=os.environ.get("MAHINA", DEFAULT_MAHINA))
+    ap.add_argument("--also-mahina", action="append", default=[], metavar="BIN",
                     help="additional binary to gate against the same refs "
                          "(repeatable; use it for a safety-checked Debug build)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) // 2),
@@ -204,18 +204,18 @@ def main():
     args = ap.parse_args()
 
     # Absolute, because every child runs with cwd set to its own bench directory.
-    lune = os.path.abspath(args.lune)
-    also = [os.path.abspath(p) for p in args.also_lune]
-    for path in [lune, *also]:
+    mahina = os.path.abspath(args.mahina)
+    also = [os.path.abspath(p) for p in args.also_mahina]
+    for path in [mahina, *also]:
         if not os.path.exists(path):
-            sys.exit(f"lune binary not found at {path}\n"
+            sys.exit(f"mahina binary not found at {path}\n"
                      f"  build it: zig build -Doptimize=ReleaseFast")
 
     benches = BR.discover(args.filter, 1.0)
     if not benches:
         sys.exit("no @bench programs found")
 
-    observed, unstable, errored = observe(lune, benches, args.jobs, 2 if args.generate else 1)
+    observed, unstable, errored = observe(mahina, benches, args.jobs, 2 if args.generate else 1)
 
     if errored:
         print("programs exiting non-zero (recorded, but check these are intentional):")
@@ -231,9 +231,9 @@ def main():
     if args.generate:
         rows = [(name, mode, *observed[(name, mode)])
                 for name, mode in sorted(observed, key=lambda k: (k[0], k[1]))]
-        write_refs(args.refs, rows, lune)
+        write_refs(args.refs, rows, mahina)
         print(f"wrote {len(rows)} digests to {os.path.relpath(args.refs, ROOT)}")
-        # Fall through: an `--also-lune` binary is verified against the refs we
+        # Fall through: an `--also-mahina` binary is verified against the refs we
         # just wrote, so generating and cross-checking is one command.
         if not also:
             return 0
@@ -245,11 +245,11 @@ def main():
 
     ok = True
     if not args.generate:
-        ok, checked = gate(observed, refs, os.path.relpath(lune, ROOT), bool(args.filter))
+        ok, checked = gate(observed, refs, os.path.relpath(mahina, ROOT), bool(args.filter))
         if ok:
             print(f"hashgate ok: {checked} digests match "
                   f"({len(benches)} programs x {len(BR.TIERS)} modes) "
-                  f"[{os.path.relpath(lune, ROOT)}]")
+                  f"[{os.path.relpath(mahina, ROOT)}]")
 
     for path in also:
         label = os.path.relpath(path, ROOT)

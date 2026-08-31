@@ -1,5 +1,5 @@
-# lune bench suite  rev=d74d6bb  stamp=20260622-152943  reps=5  scale=1.0
-program	args	luajit_mode	cross	luajit_match	lune_t0_ms	lune_jit_ms	luajit_ms	lune_t0_execns	lune_jit_execns
+# mahina bench suite  rev=d74d6bb  stamp=20260622-152943  reps=5  scale=1.0
+program	args	luajit_mode	cross	luajit_match	mahina_t0_ms	mahina_jit_ms	luajit_ms	mahina_t0_execns	mahina_jit_execns
 array3d	80	-	ok	ok	255.755	251.603	1.966	251756604	253295238
 binary-trees	12	-	ok	ok	311.680	309.627	40.217	312439063	309074894
 euler14-bit	300000	-	ok	ok	147.806	150.912	5.298	154634024	157536855

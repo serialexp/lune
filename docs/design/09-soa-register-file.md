@@ -1,4 +1,4 @@
-# lune — SoA register file (split the VM value stack) — Design
+# mahina — SoA register file (split the VM value stack) — Design
 
 Status: complete (pending commit approval) — phases 0–2 landed & green: the
 storage flip, the full hot-arm rewrite, and the two-pointer native ABI are in,
@@ -86,7 +86,7 @@ they land; move whole sections to "done" once everything inside them is checked.
 
 ## Why this exists
 
-lune's register file is `Vm.stack: []Value` — a 16-byte tagged `Value` per slot
+mahina's register file is `Vm.stack: []Value` — a 16-byte tagged `Value` per slot
 (`gpa.alloc(Value, stack_slots)`, `interp.zig`). Profiling the tier-0 interpreter on
 the array-arithmetic scimark kernels (pure tier-0, ReleaseFast) showed it is **purely
 instruction-throughput-bound**: 3.82 IPC, 0.00 stalled cycles/insn, 0.03 % L1 misses,

@@ -1,4 +1,4 @@
-// Wire-ordinal → name tables for the raw `uint8` enum fields in a .lunetrace
+// Wire-ordinal → name tables for the raw `uint8` enum fields in a .mahinatrace
 // (`IrInstr.op`, `IrInstr.ty`, `ConstValue.tag`).
 //
 // These mirror, BY POSITION, the Zig enums `trace.IrOp`, `trace.ObsType`, and

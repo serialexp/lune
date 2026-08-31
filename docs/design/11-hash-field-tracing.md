@@ -1,4 +1,4 @@
-# lune — tracing string-keyed (hash-part) table field get/set
+# mahina — tracing string-keyed (hash-part) table field get/set
 
 Status: **complete** — H0 (recorder + tier-1a oracle) and H1 (native lowering, the
 speedup) both landed 2026-06-23, green under `zig build test` and byte-identical

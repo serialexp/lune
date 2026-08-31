@@ -5,14 +5,14 @@
 //! (binschema). `tools/regen-trace-schema.sh` generates the Zig encoder/decoder
 //! from it into `src/gen/trace_schema.zig` (+ the `binschema` runtime under
 //! `src/gen/binschema/`), which we vendor and commit. We never hand-write
-//! encode/decode — this module only *maps* lune's runtime structs to/from the
+//! encode/decode — this module only *maps* mahina's runtime structs to/from the
 //! generated schema structs.
 //!
 //! Direction: this is the *producer* side (VM → bytes). Decoding back into live
 //! VM `Value`s / `*Proto`s (reload-into-VM) is deliberately out of scope — a
 //! serialized anchor is a proto *id*, not a pointer, and the consumer (the
 //! Phase 7 visualiser) reads the structural form, never rebinds a live pointer.
-//! `decode` therefore yields the generated schema structs, not lune types.
+//! `decode` therefore yields the generated schema structs, not mahina types.
 
 const std = @import("std");
 const trace = @import("trace.zig");
@@ -108,8 +108,8 @@ pub fn encodeFile(gpa: std.mem.Allocator, traces: []const *trace.Trace) ![]u8 {
 
 const testing = std.testing;
 const Vm = @import("interp.zig").Vm;
-const lune_parser = @import("parser.zig");
-const lune_compiler = @import("compiler.zig");
+const mahina_parser = @import("parser.zig");
+const mahina_compiler = @import("compiler.zig");
 const Diagnostics = @import("diag.zig").Diagnostics;
 const io = @import("io.zig");
 
@@ -120,7 +120,7 @@ fn withRecordedVm(source: [:0]const u8, check: *const fn (vm: *Vm) anyerror!void
     const gpa = testing.allocator;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     var vm = try Vm.init(gpa);
@@ -131,7 +131,7 @@ fn withRecordedVm(source: [:0]const u8, check: *const fn (vm: *Vm) anyerror!void
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     _ = try vm.run(chunk.proto);
 

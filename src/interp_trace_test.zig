@@ -1272,7 +1272,7 @@ test "doc 26: recorder fail-closed matrix — float index, multi-result codepoin
         try testing.expect(!vm.trace.isRecording());
     }
 
-    // (c) A NON-STRING argument raises in tier-0 (lune never coerces case
+    // (c) A NON-STRING argument raises in tier-0 (mahina never coerces case
     // ops); mid-loop that raise unwinds through an armed recording (D1a
     // territory) — the traced run must raise the identical error with the
     // identical partial output, and cache no supper.
@@ -3500,7 +3500,7 @@ test "doc 30 c5: the pattern/str2num loop runs NATIVELY end-to-end — find/matc
     const diag = @import("diag.zig");
     const source =
         \\local find, match, gmatch = string.find, string.match, string.gmatch
-        \\local text = "key=value; name=lune; year=2026; lang=zig"
+        \\local text = "key=value; name=mahina; year=2026; lang=zig"
         \\local acc = 0
         \\for i = 1, 100 do
         \\  local s, e = find(text, "year", 1, true)

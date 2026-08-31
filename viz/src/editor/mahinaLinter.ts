@@ -1,16 +1,16 @@
-// Live validation glue: a CodeMirror `linter` that calls the lune compiler
+// Live validation glue: a CodeMirror `linter` that calls the mahina compiler
 // (compile-only, via the wasm `check`) and maps its diagnostics to inline
 // squiggles. Two engines, one source of truth — the editor underlines exactly
 // what the real frontend rejects, so it can never drift from the language.
 
 import { linter, type Diagnostic } from "@codemirror/lint";
 import type { Extension } from "@codemirror/state";
-import type { LuneDiagnostic } from "../wasm/lune";
+import type { MahinaDiagnostic } from "../wasm/mahina";
 
 /**
  * Build a byte-offset → UTF-16-code-unit-index map for `src`.
  *
- * lune diagnostics carry UTF-8 *byte* spans (the lexer's native unit), but
+ * mahina diagnostics carry UTF-8 *byte* spans (the lexer's native unit), but
  * CodeMirror document positions are UTF-16 code-unit indices. For ASCII the two
  * coincide; for multibyte text they diverge, so we map explicitly. `map[b]` is
  * the UTF-16 index of the character that byte `b` belongs to; `map[byteLen]` is
@@ -36,10 +36,10 @@ export function byteToUtf16(src: string): number[] {
 
 /**
  * A debounced CodeMirror linter backed by `check` (the wasm compile-only entry,
- * surfaced through the store as `checkSource`). Maps each lune diagnostic's byte
+ * surfaced through the store as `checkSource`). Maps each mahina diagnostic's byte
  * span to a UTF-16 document range, clamped to the document.
  */
-export function luneLinter(check: (src: string) => Promise<LuneDiagnostic[]>): Extension {
+export function mahinaLinter(check: (src: string) => Promise<MahinaDiagnostic[]>): Extension {
   return linter(
     async (view): Promise<Diagnostic[]> => {
       const src = view.state.doc.toString();

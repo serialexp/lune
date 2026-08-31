@@ -174,7 +174,7 @@ inside them is checked.
   hot-exit counters, loop recording, snapshots and direct compiled-trace
   linking. Persistent `RegionDef` objects, source/destination classification on
   every receipt, `RegionAccum` profitability windows, dormancy/observer/memo
-  accounting, graduation and leases are all Lune-specific. LuaJIT does not run
+  accounting, graduation and leases are all Mahina-specific. LuaJIT does not run
   classify→choose→lookup→classify→update per successful receipt; it patches the
   exit and stops thinking. We copied the trace *shape* and not the steady-state
   *cost model*, then spent nine rounds building a cache hierarchy over the cost

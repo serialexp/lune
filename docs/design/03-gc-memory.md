@@ -1,4 +1,4 @@
-# lune — GC, Memory & Buffer Ownership
+# mahina — GC, Memory & Buffer Ownership
 
 Status: partial — GC v1 (Phase 4) + lane-packed array storage landed; generational upgrade, typed-array payload + buffer lease (Phase 9b), and trace rooting outstanding
 Owner: Bart
@@ -181,7 +181,7 @@ The zero-copy path hands the host a **lease**, not a pointer:
 
 - Payload lives **off-heap / non-moving** (so addresses are stable for the GPU).
 - A GC'd header keeps it alive; the lease pins it for the host's borrow window.
-- The lease carries lifetime + mutability; lune may not mutate a buffer the host
+- The lease carries lifetime + mutability; mahina may not mutate a buffer the host
   has leased mutably to the GPU, and the buffer is not freed until the lease ends.
 - No interior pointers into movable GC memory ever cross the boundary.
 

@@ -190,7 +190,7 @@ pub fn mapExecutable(code: []const u8) MapError!ExecPage {
 /// invariant the self-framed prologue guarantees and the hash-cell callout relies on.
 pub const SPILL_MAX: u32 = 512;
 
-/// A shared, contiguous machine-code arena — the lune analogue of LuaJIT's
+/// A shared, contiguous machine-code arena — the mahina analogue of LuaJIT's
 /// `lj_mcode.c` mcode areas. Instead of one `mmap` per compiled trace, every trace's
 /// code lives as a slice of a small chain of large regions. This is prerequisite P-D
 /// of the exit-branch-patching port (doc 17): co-locating all mcode is what will let
@@ -4213,7 +4213,7 @@ fn emitBinAlu(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Plac
     }
 }
 
-/// Lower a Lua/lune shift `dst = pa <shift> pb` (`pb` = the count). Reproduces the
+/// Lower a Lua/mahina shift `dst = pa <shift> pb` (`pb` = the count). Reproduces the
 /// FULL operator semantics the oracle (`arith.shiftLeft`/`shiftRight`/`shiftRightArith`)
 /// computes, making no assumption that the count is masked: a negative count shifts the
 /// other direction, and an out-of-range positive count saturates — to `0` for the
@@ -4337,7 +4337,7 @@ fn emitCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Pla
 /// only for a *signaling* NaN, never a quiet one. The oracle short-circuits
 /// `isNan(x) or isNan(y)`, so a qNaN lhs + sNaN rhs makes native touch the sNaN (setting
 /// MXCSR.IE) where the oracle would not. This never diverges the boolean *result* — and
-/// it is unobservable in lune anyway: FP exceptions are masked (SysV default), there is
+/// it is unobservable in mahina anyway: FP exceptions are masked (SysV default), there is
 /// no MXCSR/feenableexcept seam, and a signaling NaN is unreachable from Lua source
 /// (0.0/0.0 yields a quiet NaN; there is no sNaN literal).
 fn emitFloatCompare(a: *x64.Assembler, op: trace.IrOp, dst: Place, pa: Place, pb: Place) !void {
@@ -6129,7 +6129,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 }
             },
             .shl, .shr, .sar => {
-                // Always int (proveKinds pins both operands int). Full Lua/lune semantics
+                // Always int (proveKinds pins both operands int). Full Lua/mahina semantics
                 // via the branch-bracketed cl shift (emitShift); `.sar` adds the
                 // sign-fill overflow leg.
                 try emitShift(a, ins.op, placeOfRef(alloc, i), placeOfRef(alloc, ins.a), placeOfRef(alloc, ins.b));
@@ -6183,7 +6183,7 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 try regToPlace(a, placeOfRef(alloc, i), .rax);
             },
             // fsqrt: the inlined pure builtin. `@sqrt` ≡ `sqrtsd` bit-for-bit under the
-            // default MXCSR (round-to-nearest-even, which lune never changes) — including
+            // default MXCSR (round-to-nearest-even, which mahina never changes) — including
             // `sqrt(-0.0) = -0.0`, `sqrt(x<0) = qNaN`, `sqrt(+inf) = +inf` — so this one
             // SSE instruction reproduces the tier-1a oracle's `Value.float(@sqrt(arg))`
             // exactly. The operand is a proven float; stage it into a scratch XMM, sqrt

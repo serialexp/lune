@@ -1,10 +1,10 @@
-//! lune stdlib — runtime compilation: `load`, `loadfile`, `dofile`.
+//! mahina stdlib — runtime compilation: `load`, `loadfile`, `dofile`.
 //!
 //! `load(chunk [, chunkname])` compiles a source **string** into a callable
 //! closure at runtime, reusing the very same `parser.parse` →
 //! `compiler.compileWithOptions` → `heap.newClosure` path the CLI uses for the
 //! main chunk (`main.zig`). It is the single biggest Lua-usability unlock left,
-//! and lune already owns the whole compiler.
+//! and mahina already owns the whole compiler.
 //!
 //! `loadfile(path)` / `dofile(path)` (L-3) read the source from a file first,
 //! through the `file_read` record/replay effect (`interp.obtainFileRead`): the file
@@ -28,8 +28,8 @@
 //! on a **syntax error** they return `nil, message` (never raised). A non-string
 //! `chunk`/`path` argument is a hard `bad argument` error (raised), matching Lua.
 //! Deferred: the reader-function form of `chunk`, the `mode` argument (`"t"`/`"b"`
-//! — lune has no binary bytecode and excludes `string.dump`), the `env` argument
-//! (lune has no `_ENV` upvalue), and the no-path `loadfile()`/`dofile()` stdin
+//! — mahina has no binary bytecode and excludes `string.dump`), the `env` argument
+//! (mahina has no `_ENV` upvalue), and the no-path `loadfile()`/`dofile()` stdin
 //! form (the deterministic VM has no stdin).
 
 const std = @import("std");
@@ -152,7 +152,7 @@ pub fn compileToClosure(vm: *Vm, src_bytes: []const u8, chunk_name: []const u8, 
     };
     vm.next_proto_id += chunk.proto_count;
 
-    // The top-level chunk is a vararg function with no upvalues (lune has no
+    // The top-level chunk is a vararg function with no upvalues (mahina has no
     // `_ENV` cell), exactly like the main chunk.
     const closure = try vm.heap.newClosure(chunk.proto, 0);
     out[0] = Value.heap(&closure.header);

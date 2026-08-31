@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate src/gen/unicode_case.zig from a vendored UnicodeData.txt.
 
-S-C (design doc 06): lune's `string.upper`/`string.lower` use SIMPLE (1:1) case
+S-C (design doc 06): mahina's `string.upper`/`string.lower` use SIMPLE (1:1) case
 mapping only — one code point -> one code point, count-preserving. We pull the
 Simple_Uppercase_Mapping (field 12) and Simple_Lowercase_Mapping (field 13) from
 UnicodeData.txt for every assigned code point >= U+0080 (ASCII A-Z/a-z are the

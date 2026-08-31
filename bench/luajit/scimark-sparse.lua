@@ -8,7 +8,7 @@
 -- this bench's frozen digest was sha256("") and its cross-tier check compared
 -- "" == "" == "". The trailing print closes that; the checksum folds the result
 -- vector `vy`, i.e. the product the kernel actually computes. Byte-parity with
--- LuaJIT depends on scimark_lib.lua's forced portable RNG (see its "lune-local
+-- LuaJIT depends on scimark_lib.lua's forced portable RNG (see its "mahina-local
 -- edit 1 of 2").
 local lib = require("scimark_lib")
 lib.SPARSE(1000, 5000)(tonumber(arg and arg[1]) or 150000)

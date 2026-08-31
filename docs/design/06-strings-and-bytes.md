@@ -1,4 +1,4 @@
-# lune — Strings & Bytes (Unicode-native text)
+# mahina — Strings & Bytes (Unicode-native text)
 
 Status: design — not started (this doc is the shape; no code yet)
 Owner: Bart
@@ -7,11 +7,11 @@ Last updated: 2026-06-19
 A language designed in 2026 does not get to say "a string is an array of bytes."
 That was the right call for Lua in 1993 and it is the wrong default now: outside
 the US and western Europe a string that cannot represent every Unicode code point
-is not usable. So lune makes the split that Python 3, Swift, and Rust all made
+is not usable. So mahina makes the split that Python 3, Swift, and Rust all made
 and that Lua (and Go's "unvalidated UTF-8 bytes") did not:
 
 - **A `string` is a sequence of Unicode scalar values (code points).** It is text.
-- **An array of bytes is an array of bytes** — an ordinary lune array of small
+- **An array of bytes is an array of bytes** — an ordinary mahina array of small
   integers. That is the binary type.
 - The boundary between them is **explicit and fallible** (`encode` / `decode`),
   because converting bytes → text is the one operation that can fail.
@@ -104,7 +104,7 @@ depend on a Unicode table, that table is a new determinism input. This doc
 resolves the tension: strings present a **code-point** view over an
 **internally-UTF-8** byte buffer, so identity/hashing/keys stay byte-keyed
 (determinism untouched), while the one genuinely version-dependent operation
-(case mapping) is handled the way lune already handles every nondeterministic
+(case mapping) is handled the way mahina already handles every nondeterministic
 input — by **recording it** (here, the Unicode version) at the session boundary.
 
 ## Goals
@@ -235,7 +235,7 @@ Hence two types — but, crucially, **the wall is invisible for ASCII** (next).
 For pure-ASCII content (every code point `< 0x80`), the code-point sequence, the
 UTF-8 bytes, and the raw byte array are **bit-identical**. `"Hi"` and `{72, 105}`
 are the same two bytes. So at and below 127 the boundary is the **identity
-function**, and lune makes that literal:
+function**, and mahina makes that literal:
 
 - `string.decode(bytes)` on all-ASCII input is a **no-op that cannot fail** —
   it just reinterprets the same bytes as text.
@@ -259,7 +259,7 @@ count regardless).
 
 ### `bytes` — just an integer array
 
-There is **no new `bytes` type.** An array of bytes is an ordinary lune array
+There is **no new `bytes` type.** An array of bytes is an ordinary mahina array
 whose elements are integers `0..255`. This is exactly Bart's framing: stick a
 value `≤ 255` in an array and you have a uint8 array; stick a negative in and it
 widens to a signed lane — "one more blob on the monotonic size increase thing."
@@ -304,7 +304,7 @@ Bart's original question — *"why is `utf8` even a library? it should be the
 default"* — is answered by the model itself: once strings are code-point-native,
 most of Lua's `utf8` library has nothing left to do.
 
-| Lua `utf8.*` | lune equivalent |
+| Lua `utf8.*` | mahina equivalent |
 |---|---|
 | `utf8.len(s)` | `#s` (cached, O(1)) |
 | `utf8.codes(s)` | `s:codes()` — iterator of `(index, code-point)` |
@@ -313,7 +313,7 @@ most of Lua's `utf8` library has nothing left to do.
 | `utf8.offset(s, n)` | *gone* — there is no byte/char-index gap to bridge |
 | `utf8.charpattern` | *gone* — `.` already matches one code point (S-D) |
 
-So lune ships **no `utf8` module**. What used to be that library is now either
+So mahina ships **no `utf8` module**. What used to be that library is now either
 core string behaviour (`#`, `sub`, `char`, `codepoint`, `codes`) or evaporated
 (`offset`, `charpattern`). The inventory CSV's `utf8` rows move from
 `not-started` to a disposition reflecting "absorbed into `string`/excluded as
@@ -338,10 +338,10 @@ non-reproducible across a toolchain bump — unacceptable for replay-forever.
 The version does **not** live in the string. Per-string tagging would force
 interning/`==`/hashing to learn to ignore the tag and would need a "which version
 wins" rule on every `..` — complexity smeared across the hottest, most
-identity-sensitive type. Instead the version lives where lune already puts
+identity-sensitive type. Instead the version lives where mahina already puts
 nondeterministic inputs: **the recorded session.**
 
-- lune's determinism is session-scoped: a snapshot + effect log reproduces one
+- mahina's determinism is session-scoped: a snapshot + effect log reproduces one
   run, and inputs (clock, RNG seed) are recorded and re-fed on replay
   (`02-determinism.md`).
 - A Unicode version is exactly that shape. Record **one active version per

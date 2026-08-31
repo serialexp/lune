@@ -8,14 +8,14 @@ import { join } from "node:path";
 
 // The in-browser VM artifact, built by `zig build wasm` at the repo root. It
 // lives outside viz/ (it is not a source asset), so this plugin bridges it into
-// the app: served at `/lune.wasm` in dev, copied into `dist/` at build time.
-const wasmPath = fileURLToPath(new URL("../zig-out/bin/lune.wasm", import.meta.url));
+// the app: served at `/mahina.wasm` in dev, copied into `dist/` at build time.
+const wasmPath = fileURLToPath(new URL("../zig-out/bin/mahina.wasm", import.meta.url));
 
 // The native CLI, built by `zig build` at the repo root. The differential
 // validator (Phase 7 v3) runs it as a dev-server subprocess to compare its
 // artifacts against the in-browser wasm VM. Dev/CI tool only — not a production
 // feature (there is no production backend).
-const nativeBin = fileURLToPath(new URL("../zig-out/bin/lune", import.meta.url));
+const nativeBin = fileURLToPath(new URL("../zig-out/bin/mahina", import.meta.url));
 
 // Read a small request body to a string (the source chunk).
 function readBody(req: import("node:http").IncomingMessage): Promise<string> {
@@ -39,13 +39,13 @@ function runNative(source: string, args: string[]): {
   trace: string;
   coverage: string;
 } {
-  const dir = mkdtempSync(join(tmpdir(), "lune-diff-"));
+  const dir = mkdtempSync(join(tmpdir(), "mahina-diff-"));
   try {
-    const src = join(dir, "prog.lune");
-    const kf = join(dir, "k.lunesnap");
-    const ef = join(dir, "e.luneeff");
-    const tr = join(dir, "t.lunetrace");
-    const cov = join(dir, "c.lunecov");
+    const src = join(dir, "prog.mahina");
+    const kf = join(dir, "k.mahinasnap");
+    const ef = join(dir, "e.mahinaeff");
+    const tr = join(dir, "t.mahinatrace");
+    const cov = join(dir, "c.mahinacov");
     writeFileSync(src, source);
     const b64 = (p: string): string => {
       try {
@@ -90,19 +90,19 @@ function runNative(source: string, args: string[]): {
   }
 }
 
-function luneWasm(): Plugin {
+function mahinaWasm(): Plugin {
   return {
-    name: "lune-wasm",
+    name: "mahina-wasm",
     configureServer(server) {
       // Dev: serve the freshly-built wasm straight from zig-out (no copy step).
-      server.middlewares.use("/lune.wasm", (_req, res) => {
+      server.middlewares.use("/mahina.wasm", (_req, res) => {
         try {
           const bytes = readFileSync(wasmPath);
           res.setHeader("Content-Type", "application/wasm");
           res.end(bytes);
         } catch {
           res.statusCode = 404;
-          res.end("lune.wasm not found — run `zig build wasm` at the repo root.");
+          res.end("mahina.wasm not found — run `zig build wasm` at the repo root.");
         }
       });
 
@@ -139,20 +139,20 @@ function luneWasm(): Plugin {
       });
     },
     generateBundle() {
-      // Build: emit the wasm as a top-level asset so `./lune.wasm` resolves.
+      // Build: emit the wasm as a top-level asset so `./mahina.wasm` resolves.
       this.emitFile({
         type: "asset",
-        fileName: "lune.wasm",
+        fileName: "mahina.wasm",
         source: readFileSync(wasmPath),
       });
     },
   };
 }
 
-// Static SPA + an in-browser wasm VM. The visualiser decodes `.lunetrace`
-// artifacts and can also author + run lune programs in-browser (Phase 7 v3).
+// Static SPA + an in-browser wasm VM. The visualiser decodes `.mahinatrace`
+// artifacts and can also author + run mahina programs in-browser (Phase 7 v3).
 export default defineConfig({
-  plugins: [solid(), luneWasm()],
+  plugins: [solid(), mahinaWasm()],
   base: "./",
   build: { target: "esnext", outDir: "dist" },
 });

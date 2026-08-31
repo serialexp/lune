@@ -16,17 +16,17 @@ local pi, clock = math.pi, os.clock
 
 local benchmarks = {}
 
--- ### lune-local edit 2 of 2 (2026-08-26): a result checksum.
+-- ### mahina-local edit 2 of 2 (2026-08-26): a result checksum.
 --
 -- Upstream's kernels return a flop count that the wrappers discard, so these
 -- four benches printed NOTHING. That made their frozen-output digest sha256("")
 -- and made `bench/run.py`'s cross-tier check compare "" == "" == "" while
--- reporting `cross=ok` — on precisely the float/array workloads lune's JIT
+-- reporting `cross=ok` — on precisely the float/array workloads mahina's JIT
 -- leans on hardest. `benchmarks.checksum()` closes that: each kernel records
 -- its result state here, and the wrapper prints a fold of it after the run.
 --
 -- WHY AN INTEGER FOLD AND NOT `string.format("%.17g", ...)`: when this was
--- written lune's `string.format` could not render a double's exact decimal
+-- written mahina's `string.format` could not render a double's exact decimal
 -- expansion (`%.17g` of 1/3 gave `0.3333333333333333` where C gives
 -- `0.33333333333333331`), so a high-precision float print would have differed
 -- between the engines for formatting reasons alone — masking or faking a real
@@ -90,7 +90,7 @@ end
 
 local rand, rand_init
 
--- ### lune-local edit 1 of 2 (2026-08-26). Upstream reads:
+-- ### mahina-local edit 1 of 2 (2026-08-26). Upstream reads:
 --       if jit and jit.status and jit.status() then
 -- The two branches below are NOT equivalent generators. They agree on their
 -- first value and then diverge (verified: element 2 differs by 1, and the
@@ -98,9 +98,9 @@ local rand, rand_init
 -- compares the two engines' numeric output — the four scimark benches print
 -- nothing at all.
 --
--- lune's bench suite DOES compare them: `bench/run.py` asserts lune's stdout
+-- mahina's bench suite DOES compare them: `bench/run.py` asserts mahina's stdout
 -- equals LuaJIT's for every `luajit=compatible` program. With the branch live,
--- LuaJIT takes the `bit` path and lune the portable one, so the engines run
+-- LuaJIT takes the `bit` path and mahina the portable one, so the engines run
 -- these kernels on DIFFERENT INPUT DATA and byte-parity is not merely absent
 -- but unreachable. Forcing the portable branch makes all four kernels agree
 -- with LuaJIT bit-for-bit.
@@ -225,7 +225,7 @@ function benchmarks.FFT(n)
     os.exit(1)
   end
   local v = random_vector(n*2)
-  ck_state = { name = "FFT", vec = v, n = n*2 } -- lune-local
+  ck_state = { name = "FFT", vec = v, n = n*2 } -- mahina-local
   return function(cycles)
     local norm = 1.0 / n
     for p=1,cycles do
@@ -257,7 +257,7 @@ end
 
 function benchmarks.SOR(n)
   local mat = random_matrix(n, n)
-  ck_state = { name = "SOR", mat = mat, n = n } -- lune-local
+  ck_state = { name = "SOR", mat = mat, n = n } -- mahina-local
   return function(cycles)
     sor_run(mat, n, n, cycles, 1.25)
     return (n-1)*(n-1)*cycles*6
@@ -307,7 +307,7 @@ function benchmarks.SPARSE(n, nz)
   local vx = random_vector(n)
   local val = random_vector(anz)
   local vy, col, row = {}, {}, {}
-  ck_state = { name = "SPARSE", vec = vy, n = n } -- lune-local
+  ck_state = { name = "SPARSE", vec = vy, n = n } -- mahina-local
   row[1] = 1
   for r=1,n do
     local step = floor(r/nr)
@@ -374,7 +374,7 @@ function benchmarks.LU(n)
   local mat = random_matrix(n, n)
   local tmp = matrix_alloc(n, n)
   local pivot = {}
-  -- lune-local. `tmp` is the FACTORED copy, and `lu_factor` pivots by swapping
+  -- mahina-local. `tmp` is the FACTORED copy, and `lu_factor` pivots by swapping
   -- row references inside it — which is exactly why `checksum()` re-reads the
   -- rows through `mat` rather than caching them here.
   ck_state = { name = "LU", mat = tmp, n = n }

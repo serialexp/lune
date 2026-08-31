@@ -581,7 +581,7 @@ pub const Assembler = struct {
         try self.modrmReg(5, reg.lo());
     }
     /// `sar reg, cl` — REX.W D3 /7. Arithmetic (sign-extending) right shift by
-    /// cl & 63 — the match for lune's `~>>` (`arith.sar`). The native lowering
+    /// cl & 63 — the match for mahina's `~>>` (`arith.sar`). The native lowering
     /// (`emitShift`) brackets it with the same explicit range check as shl/shr.
     pub fn sarRegCl(self: *Assembler, reg: Reg) !void {
         try self.rex(true, false, false, reg.hi());

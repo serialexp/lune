@@ -4,7 +4,7 @@
 //! Mirrors `traceser.zig`: the wire format is defined once, declaratively, in
 //! `schema/trace.json` (binschema); `tools/regen-trace-schema.sh` generates the
 //! Zig codec into `src/gen/trace_schema.zig` (vendored, committed). We never
-//! hand-write encode/decode — this module only *maps* lune's runtime structs
+//! hand-write encode/decode — this module only *maps* mahina's runtime structs
 //! onto the generated schema structs.
 //!
 //! A keyframe is "the whole VM state at a moment": a flat array of every
@@ -18,7 +18,7 @@
 //! back into a live VM (id→pointer rebind, re-interning, Proto/Native rebind,
 //! stack + open-upvalue reconstruction) is deliberately out of scope for F2a —
 //! it is the next increment, F2b (docs/design/04-snapshot-replay-schema.md).
-//! `decode` therefore yields the generated schema structs, not lune types.
+//! `decode` therefore yields the generated schema structs, not mahina types.
 
 const std = @import("std");
 const value = @import("value.zig");

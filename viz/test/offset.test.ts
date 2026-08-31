@@ -1,9 +1,9 @@
 // Unit test for the byte→UTF-16 offset map the editor's linter uses to place
-// squiggles. lune diagnostics are UTF-8 byte spans; CodeMirror positions are
+// squiggles. mahina diagnostics are UTF-8 byte spans; CodeMirror positions are
 // UTF-16 code-unit indices. ASCII is the identity; multibyte text shifts.
 
 import { test, expect } from "bun:test";
-import { byteToUtf16 } from "../src/editor/luneLinter";
+import { byteToUtf16 } from "../src/editor/mahinaLinter";
 
 test("ASCII is the identity map", () => {
   const src = "local x = 1\n";

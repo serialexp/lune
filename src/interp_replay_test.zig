@@ -635,13 +635,13 @@ test "e2e: varargs forwarding through return and nested calls, method spread" {
         \\end
         \\f(1, 2)
         \\f(3, 4, 5)
-        \\local obj = { name = "lune" }
+        \\local obj = { name = "mahina" }
         \\obj.greet = function(self, ...)
         \\  print(self.name, ...)
         \\end
         \\obj:greet("a", "b")
         \\obj:greet()
-    , "1\t2\n3\t4\t5\nlune\ta\tb\nlune\n");
+    , "1\t2\n3\t4\t5\nmahina\ta\tb\nmahina\n");
 }
 
 test "e2e: parenthesized varargs truncate to a single value" {
@@ -663,11 +663,11 @@ test "e2e: parenthesized varargs truncate to a single value" {
 test "e2e: tables and string concat" {
     try expectProgram(
         \\local t = {}
-        \\t.name = "lune"
+        \\t.name = "mahina"
         \\t.answer = 40 + 2
         \\print("hello, " .. t.name)
         \\print("answer=" .. t.answer)
-    , "hello, lune\nanswer=42\n");
+    , "hello, mahina\nanswer=42\n");
 }
 
 test "e2e: basic + string stdlib are byte-identical across all modes" {
@@ -683,7 +683,7 @@ test "e2e: basic + string stdlib are byte-identical across all modes" {
         \\print(string.sub("hello", 2, 4), string.codepoint("A"))
     ,
         "1:ab\n2:abab\n3:ababab\n" ++
-            "string\tinteger\tfloat\tlune 0.0.0\n" ++
+            "string\tinteger\tfloat\tmahina 0.0.0\n" ++
             "3\tb\n" ++
             "ell\t65\n",
     );

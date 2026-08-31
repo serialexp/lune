@@ -1,12 +1,12 @@
 -- Lua 5.4 stdlib surface that LuaJIT 2.1 does NOT provide — so there is no
--- LuaJIT parity to measure (luajit=skip). The runner still checks that lune's
+-- LuaJIT parity to measure (luajit=skip). The runner still checks that mahina's
 -- own tiers (tier-0 / tier-1a / tier-1b) agree byte-for-byte.
 --
 -- Covers: math.type (integer/float subtype), math.maxinteger/mininteger,
 -- rawlen (5.2 surface), table.pack(...).n and table.unpack spread.
 --
---   lune              bench/stdlib/lua54.lua 100000   # tier-0
---   lune --jit-native bench/stdlib/lua54.lua 100000   # tier-1b
+--   mahina              bench/stdlib/lua54.lua 100000   # tier-0
+--   mahina --jit-native bench/stdlib/lua54.lua 100000   # tier-1b
 --
 -- @bench args="100000" luajit=skip
 

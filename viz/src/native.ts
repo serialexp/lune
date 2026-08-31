@@ -1,5 +1,5 @@
 // Client for the dev-server `POST /run` middleware (vite.config.ts), which runs
-// the source through the *native* lune binary and returns its artifacts. Used
+// the source through the *native* mahina binary and returns its artifacts. Used
 // only by the differential validator — the native engine is the second opinion
 // the in-browser wasm VM is checked against. There is no production backend;
 // this works only under `vite dev`.

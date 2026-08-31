@@ -1,6 +1,6 @@
 -- @bench args="6" luajit=compatible name=nsieve-bit-fp
 -- Vendored verbatim from LuaJIT/bench/nsieve-bit-fp.lua (Computer Language
--- Benchmarks Game port). Only this header is lune-added.
+-- Benchmarks Game port). Only this header is mahina-added.
 
 local floor, ceil = math.floor, math.ceil
 

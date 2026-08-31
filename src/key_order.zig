@@ -2,7 +2,7 @@
 //! by snapshot serialization (`keyframeser.sortedHashEntries`) and the
 //! `pairs`/`next` iterator (`stdlib/base.zig`).
 //!
-//! lune's table iteration order must be **deterministic and address-independent**
+//! mahina's table iteration order must be **deterministic and address-independent**
 //! (docs/design/02-determinism.md): two runs that build the same key set in
 //! different insertion orders must iterate identically, and a table restored from
 //! a keyframe (rebuilt by one-by-one re-insertion, so `std.HashMap`'s raw probe

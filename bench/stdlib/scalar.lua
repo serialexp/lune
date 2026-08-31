@@ -5,9 +5,9 @@
 -- keeps output deterministic and byte-identical to LuaJIT. (math.type lives in
 -- lua54.lua — it is Lua 5.4 surface LuaJIT 2.1 lacks.)
 --
---   lune              bench/stdlib/scalar.lua 100000   # tier-0
---   lune --jit-native bench/stdlib/scalar.lua 100000   # tier-1b
---   luajit            bench/stdlib/scalar.lua 100000   # reference
+--   mahina              bench/stdlib/scalar.lua 100000   # tier-0
+--   mahina --jit-native bench/stdlib/scalar.lua 100000   # tier-1b
+--   luajit              bench/stdlib/scalar.lua 100000   # reference
 --
 -- @bench args="100000" luajit=compatible
 

@@ -25,8 +25,8 @@ const Proto = bytecode.Proto;
 const Vm = interp.Vm;
 pub const schema = @import("gen/trace_schema.zig");
 const testing = std.testing;
-const lune_parser = @import("parser.zig");
-const lune_compiler = @import("compiler.zig");
+const mahina_parser = @import("parser.zig");
+const mahina_compiler = @import("compiler.zig");
 const Diagnostics = @import("diag.zig").Diagnostics;
 const io = @import("io.zig");
 
@@ -58,7 +58,7 @@ fn expectRoundTrip(source: [:0]const u8) !void {
     const gpa = testing.allocator;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -68,7 +68,7 @@ fn expectRoundTrip(source: [:0]const u8) !void {
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -99,11 +99,11 @@ test "restore is the exact inverse of capture (byte-identical re-snapshot)" {
         \\g.add = adder(10)
         \\g[1] = 100
         \\g[2] = 200
-        \\g.name = "lune"
+        \\g.name = "mahina"
         \\g.self = g
     );
     try expectRoundTrip(
-        \\config = { width = 640, height = 480, name = "lune" }
+        \\config = { width = 640, height = 480, name = "mahina" }
         \\alpha = "a"; beta = "b"; gamma = "g"
     );
     try expectRoundTrip(
@@ -181,7 +181,7 @@ test "restore is the exact inverse of capture (byte-identical re-snapshot)" {
     // the recompiled proto reuses that restored string rather than minting a new id
     // — the interning invariant (one String per byte-sequence) holds across restore.
     try expectRoundTrip(
-        \\greet = load("return 'hello, lune'")
+        \\greet = load("return 'hello, mahina'")
     );
     // L-2: two loaded chunks, exercising the running `next_proto_id` offset across
     // chunks (chunk 2's ids start past chunk 1's). The second is vararg-bodied and
@@ -218,7 +218,7 @@ test "keyframe: a live grid deflates at capture and round-trips byte-identically
         \\g.grid = { {1,2}, {3,4} }
         \\g.grid[2][2] = 40       -- inflate the inner matrix
         \\g.self = g
-        \\g.name = "lune"
+        \\g.name = "mahina"
     );
 }
 
@@ -229,7 +229,7 @@ test "restore reanimates a live load closure that runs with the same result (L-2
     ;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -239,7 +239,7 @@ test "restore reanimates a live load closure that runs with the same result (L-2
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -276,12 +276,12 @@ test "restore rebuilds globals, ids, and a reachable value graph" {
         \\local function adder(x) return function(y) return x + y end end
         \\g = {}
         \\g.add = adder(10)
-        \\g.name = "lune"
+        \\g.name = "mahina"
         \\g.self = g
     ;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     var vm = try Vm.init(gpa);
@@ -290,7 +290,7 @@ test "restore rebuilds globals, ids, and a reachable value graph" {
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     _ = try vm.run(chunk.proto);
 
@@ -318,7 +318,7 @@ test "restore rebuilds globals, ids, and a reachable value graph" {
     try testing.expect(vm2.heap.next_obj_id >= max_id + 1);
     try testing.expectEqual(decoded.keyframe.globals_id, vm2.globals.header.id);
 
-    // Walk globals → g → name == "lune"; interning an already-present key resolves
+    // Walk globals → g → name == "mahina"; interning an already-present key resolves
     // to the restored object (no new allocation).
     const g_val = vm2.globals.get(try vm2.heap.internValue("g"));
     try testing.expect(g_val.isHeap() and g_val.heapType() == .table);
@@ -326,7 +326,7 @@ test "restore rebuilds globals, ids, and a reachable value graph" {
 
     const name_val = g_tbl.get(try vm2.heap.internValue("name"));
     try testing.expect(name_val.isHeap() and name_val.heapType() == .string);
-    try testing.expectEqualStrings("lune", string.String.fromHeader(name_val.asHeap()).bytes());
+    try testing.expectEqualStrings("mahina", string.String.fromHeader(name_val.asHeap()).bytes());
 
     // g.self is the same restored table object (cycle preserved).
     const self_val = g_tbl.get(try vm2.heap.internValue("self"));
@@ -362,7 +362,7 @@ test "H-2: next_obj_id survives pre-cut garbage (restored verbatim, not reconstr
     ;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     var vm = try Vm.init(gpa);
@@ -372,7 +372,7 @@ test "H-2: next_obj_id survives pre-cut garbage (restored verbatim, not reconstr
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -424,21 +424,21 @@ test "chunk rooting: retained-chunk constants survive a snapshot straddle iff th
     var vm = try Vm.init(gpa);
     defer vm.deinit();
 
-    var tm = try lune_parser.parse(gpa, main_src, &diags);
+    var tm = try mahina_parser.parse(gpa, main_src, &diags);
     defer tm.deinit();
-    var cm = try lune_compiler.compile(gpa, vm.heap, main_src, tm.root, &diags);
+    var cm = try mahina_compiler.compile(gpa, vm.heap, main_src, tm.root, &diags);
     defer cm.deinit();
-    var tx = try lune_parser.parse(gpa, sx, &diags);
+    var tx = try mahina_parser.parse(gpa, sx, &diags);
     defer tx.deinit();
-    var cx = try lune_compiler.compile(gpa, vm.heap, sx, tx.root, &diags);
+    var cx = try mahina_compiler.compile(gpa, vm.heap, sx, tx.root, &diags);
     defer cx.deinit();
-    var ty = try lune_parser.parse(gpa, sy, &diags);
+    var ty = try mahina_parser.parse(gpa, sy, &diags);
     defer ty.deinit();
-    var cy = try lune_compiler.compile(gpa, vm.heap, sy, ty.root, &diags);
+    var cy = try mahina_compiler.compile(gpa, vm.heap, sy, ty.root, &diags);
     defer cy.deinit();
-    var tz = try lune_parser.parse(gpa, sz, &diags);
+    var tz = try mahina_parser.parse(gpa, sz, &diags);
     defer tz.deinit();
-    var cz = try lune_compiler.compile(gpa, vm.heap, sz, tz.root, &diags);
+    var cz = try mahina_compiler.compile(gpa, vm.heap, sz, tz.root, &diags);
     defer cz.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -461,11 +461,11 @@ test "chunk rooting: retained-chunk constants survive a snapshot straddle iff th
         }
         var d2 = Diagnostics.init(gpa);
         defer d2.deinit();
-        var rx = try lune_compiler.compile(gpa, vm2.heap, sx, tx.root, &d2);
+        var rx = try mahina_compiler.compile(gpa, vm2.heap, sx, tx.root, &d2);
         defer rx.deinit();
-        var ry = try lune_compiler.compile(gpa, vm2.heap, sy, ty.root, &d2);
+        var ry = try mahina_compiler.compile(gpa, vm2.heap, sy, ty.root, &d2);
         defer ry.deinit();
-        var rz = try lune_compiler.compile(gpa, vm2.heap, sz, tz.root, &d2);
+        var rz = try mahina_compiler.compile(gpa, vm2.heap, sz, tz.root, &d2);
         defer rz.deinit();
         try testing.expect(!d2.hasErrors());
         try vm2.retainChunk(rx.proto);
@@ -487,11 +487,11 @@ test "chunk rooting: retained-chunk constants survive a snapshot straddle iff th
         }
         var d3 = Diagnostics.init(gpa);
         defer d3.deinit();
-        var rx = try lune_compiler.compile(gpa, vm3.heap, sx, tx.root, &d3);
+        var rx = try mahina_compiler.compile(gpa, vm3.heap, sx, tx.root, &d3);
         defer rx.deinit();
-        var ry = try lune_compiler.compile(gpa, vm3.heap, sy, ty.root, &d3);
+        var ry = try mahina_compiler.compile(gpa, vm3.heap, sy, ty.root, &d3);
         defer ry.deinit();
-        var rz = try lune_compiler.compile(gpa, vm3.heap, sz, tz.root, &d3);
+        var rz = try mahina_compiler.compile(gpa, vm3.heap, sz, tz.root, &d3);
         defer rz.deinit();
         try testing.expect(!d3.hasErrors());
         try vm3.retainChunk(rz.proto); // reversed
@@ -532,7 +532,7 @@ test "H-2/G-2: snapshot bytes are identical whether or not the JIT recorded (tra
         fn snap(a: std.mem.Allocator, src: [:0]const u8, jit: bool, stress: bool) ![]u8 {
             var diags = Diagnostics.init(a);
             defer diags.deinit();
-            var tree = try lune_parser.parse(a, src, &diags);
+            var tree = try mahina_parser.parse(a, src, &diags);
             defer tree.deinit();
             var vm = try Vm.init(a);
             defer vm.deinit();
@@ -544,7 +544,7 @@ test "H-2/G-2: snapshot bytes are identical whether or not the JIT recorded (tra
             var sink_buf: [64]u8 = undefined;
             var sink = io.Writer.fixed(&sink_buf);
             vm.out = &sink;
-            var chunk = try lune_compiler.compile(a, vm.heap, src, tree.root, &diags);
+            var chunk = try mahina_compiler.compile(a, vm.heap, src, tree.root, &diags);
             defer chunk.deinit();
             try testing.expect(!diags.hasErrors());
             _ = try vm.run(chunk.proto);
@@ -587,7 +587,7 @@ test "restore reanimates the package/require module system (searchers rebind, ca
     ;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     var vm = try Vm.init(gpa);
@@ -596,7 +596,7 @@ test "restore reanimates the package/require module system (searchers rebind, ca
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -659,7 +659,7 @@ test "doc 19 §R2: v8 schema boundary — version rejection + missing loaded lit
     ;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     var vm = try Vm.init(gpa);
@@ -668,7 +668,7 @@ test "doc 19 §R2: v8 schema boundary — version rejection + missing loaded lit
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -747,14 +747,14 @@ test "doc 19 §T3: restored load-driven program resumes with the JIT and traces 
 
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -816,7 +816,7 @@ test "metatable edge to the id-0 object survives round-trip (1-based encoding)" 
 
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     var vm = try Vm.init(gpa);
@@ -825,7 +825,7 @@ test "metatable edge to the id-0 object survives round-trip (1-based encoding)" 
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
 
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     _ = try vm.run(chunk.proto);
 
@@ -873,13 +873,13 @@ test "restore preserves a multi-result native's projection and multi fn" {
 
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     var vm = try Vm.init(gpa);
     defer vm.deinit();
 
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     _ = try vm.run(chunk.proto);
 
@@ -1303,14 +1303,14 @@ test "doc 32: a heterogeneous `.value` array survives round-trip and still recor
 
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 

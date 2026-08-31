@@ -25,8 +25,8 @@ const Proto = bytecode.Proto;
 const Vm = interp.Vm;
 pub const schema = @import("gen/trace_schema.zig");
 const testing = std.testing;
-const lune_parser = @import("parser.zig");
-const lune_compiler = @import("compiler.zig");
+const mahina_parser = @import("parser.zig");
+const mahina_compiler = @import("compiler.zig");
 const Diagnostics = @import("diag.zig").Diagnostics;
 const io = @import("io.zig");
 
@@ -64,7 +64,7 @@ test "S-C: unicode_version survives a snapshot cut with no double-consume" {
 
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     // --- Run 1 (record): reference output F + effect log L (a single unicode_version).
@@ -74,7 +74,7 @@ test "S-C: unicode_version survives a snapshot cut with no double-consume" {
         var buf: [512]u8 = undefined;
         var sink = io.Writer.fixed(&buf);
         vm.out = &sink;
-        var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
         defer chunk.deinit();
         try testing.expect(!diags.hasErrors());
         vm.effect_mode = .record;
@@ -97,7 +97,7 @@ test "S-C: unicode_version survives a snapshot cut with no double-consume" {
     var buf2: [512]u8 = undefined;
     var sink2 = io.Writer.fixed(&buf2);
     vm2.out = &sink2;
-    var chunk2 = try lune_compiler.compile(gpa, vm2.heap, source, tree.root, &diags);
+    var chunk2 = try mahina_compiler.compile(gpa, vm2.heap, source, tree.root, &diags);
     defer chunk2.deinit();
     try testing.expect(!diags.hasErrors());
 

@@ -1,9 +1,9 @@
 {
-  "name": "@aeolun/lune-viz",
+  "name": "@aeolun/mahina-viz",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "lune trace inspector — a SolidJS app that reads .lunetrace artifacts (Phase 7 v1).",
+  "description": "mahina trace inspector — a SolidJS app that reads .mahinatrace artifacts (Phase 7 v1).",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

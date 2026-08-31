@@ -1,8 +1,8 @@
-# lune — trace inspector (Phase 7, v1)
+# mahina — trace inspector (Phase 7, v1)
 
-A SolidJS app that loads a `.lunetrace` artifact (emitted by `lune
+A SolidJS app that loads a `.mahinatrace` artifact (emitted by `mahina
 --emit-traces`) and renders its trace IR: per-trace anchor, entry slots, the
-straight-line SSA body (mirroring `lune --dump-traces`), the constant pool, and
+straight-line SSA body (mirroring `mahina --dump-traces`), the constant pool, and
 the loop-carried exit stores.
 
 **Scope (v1):** a *static inspector*. The on-disk artifact contains the committed
@@ -25,14 +25,14 @@ bun run build      # tsc --noEmit && vite build  → dist/
 bun test           # cross-language decode + disasm + store tests
 ```
 
-Load a trace via the “Open .lunetrace…” button, drag-and-drop, or a `?src=<url>`
-deep link (e.g. `…/?src=/my-trace.lunetrace`) that auto-loads on open. Generate
+Load a trace via the “Open .mahinatrace…” button, drag-and-drop, or a `?src=<url>`
+deep link (e.g. `…/?src=/my-trace.mahinatrace`) that auto-loads on open. Generate
 one:
 
 ```sh
 # from the repo root
 zig build
-./zig-out/bin/lune --emit-traces /tmp/out.lunetrace your-hot-loop.lua
+./zig-out/bin/mahina --emit-traces /tmp/out.mahinatrace your-hot-loop.lua
 ```
 
 ## Layout
@@ -47,7 +47,7 @@ zig build
   `writeTrace`).
 - `src/store.ts` — SolidJS store (loaded file, traces, selection).
 - `src/components/` — `TraceList` (left pane), `TraceView` (right pane).
-- `fixtures/` — `counting-loop.lua` + the committed `counting-loop.lunetrace`
+- `fixtures/` — `counting-loop.lua` + the committed `counting-loop.mahinatrace`
   cross-language fixture.
 - `test/` — `bun test` specs.
 

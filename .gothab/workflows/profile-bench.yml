@@ -1,4 +1,4 @@
-name: lune benchmark suite
+name: mahina benchmark suite
 
 # The benchmark board is only meaningful on a quiet machine of a stable
 # hardware class. A developer desktop is neither: a background game once
@@ -7,7 +7,7 @@ name: lune benchmark suite
 # possibly affect. This workflow moves the board onto the operator-designated
 # default autoscale pool so successive runs are comparable to each other.
 #
-# Dispatch it with `gt profile` from a lune checkout. The CLI ships the local
+# Dispatch it with `gt profile` from a mahina checkout. The CLI ships the local
 # working tree (committed-but-unpushed + staged + unstaged) as one unified diff
 # on top of the pushed base, so an arc can be benchmarked before it is pushed —
 # which is the normal case here.
@@ -37,7 +37,7 @@ env:
   # campaign has been measuring against all along.
   LUAJIT_REPO: https://github.com/serialexp/luajit.git
   LUAJIT_REV: a86046b1
-  TOOLS: /home/runner/lune-ci-tools
+  TOOLS: /home/runner/mahina-ci-tools
 
 jobs:
   profile:
@@ -102,7 +102,7 @@ jobs:
           make -C "$TOOLS/luajit" -j"$(nproc)"
           "$TOOLS/luajit/src/luajit" -v
 
-      - name: Build lune (ReleaseFast)
+      - name: Build mahina (ReleaseFast)
         # Never benchmark a Debug binary: it is roughly 20x slow. This is the
         # only build step, and nothing after it may re-run `zig build` without
         # the optimize flag.
@@ -116,7 +116,7 @@ jobs:
 
       - name: Run the benchmark suite
         env:
-          LUAJIT: /home/runner/lune-ci-tools/luajit/src/luajit
+          LUAJIT: /home/runner/mahina-ci-tools/luajit/src/luajit
         run: |
           set -eu
           python3 bench/run.py \

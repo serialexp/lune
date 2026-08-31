@@ -1,4 +1,4 @@
-# lune — Canonical snapshot liveness (the H-5(i) fix) — Design
+# mahina — Canonical snapshot liveness (the H-5(i) fix) — Design
 
 Status: design APPROVED (codex gpt-5.6-sol round 3, 2026-08-15, after REVISE
 rounds folding B-1..B-6 + M-1..M-4); Phase A LANDED — §R3 green with the full

@@ -25,8 +25,8 @@ const Proto = bytecode.Proto;
 const Vm = interp.Vm;
 pub const schema = @import("gen/trace_schema.zig");
 const testing = std.testing;
-const lune_parser = @import("parser.zig");
-const lune_compiler = @import("compiler.zig");
+const mahina_parser = @import("parser.zig");
+const mahina_compiler = @import("compiler.zig");
 const Diagnostics = @import("diag.zig").Diagnostics;
 const io = @import("io.zig");
 
@@ -68,7 +68,7 @@ const SuspendCtl = interp.SuspendCtl;
 fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, ref: RefRun) ![]u8 {
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     // The suspend VM owns the heap the program image's constants are interned
@@ -78,7 +78,7 @@ fn expectResume(gpa: std.mem.Allocator, source: [:0]const u8, ctl: SuspendCtl, r
     var buf: [512]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -345,14 +345,14 @@ test "§R3: capture→restore→resume with tracing+opt+native — restored narr
 
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -423,14 +423,14 @@ test "§R3: failing-allocator restore during the bulk lane repack leaks nothing"
     ;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     var buf: [64]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -510,7 +510,7 @@ test "A-iii: recursive live frames re-key deterministically across keyframe rest
 
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     var vm = try Vm.init(gpa);
@@ -518,7 +518,7 @@ test "A-iii: recursive live frames re-key deterministically across keyframe rest
     var sink_buf: [128]u8 = undefined;
     var sink = io.Writer.fixed(&sink_buf);
     vm.out = &sink;
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -625,14 +625,14 @@ test "F2c: a frame window that doesn't tile from 0 is rejected (FrameWindowMisma
 fn jitFinalSnapshot(gpa: std.mem.Allocator, source: [:0]const u8, ref: RefRun) ![]u8 {
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
     var buf: [512]u8 = undefined;
     var sink = io.Writer.fixed(&buf);
     vm.out = &sink;
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -735,11 +735,11 @@ test "doc 21 §T-A.3: result span preserved; dead-slot-only garbage excluded fro
     ;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -784,11 +784,11 @@ test "doc 21 §T-A.4: all_results finish — dynamic span past the static window
     ;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -826,11 +826,11 @@ test "doc 21 §T-A.5: a depth-0 callValue invalidates the final cut (B-1 shape)"
     ;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);
@@ -857,11 +857,11 @@ test "doc 21 §T-A.6: pcall/xpcall unwind then finish — the cut reflects the f
     ;
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
     var vm = try Vm.init(gpa);
     defer vm.deinit();
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try vm.run(chunk.proto);

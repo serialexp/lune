@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) void {
 
     // The vendored binschema runtime (src/gen/binschema/). The generated trace
     // serializer (src/gen/trace_schema.zig) imports this as the "binschema"
-    // module; the lune module re-exports the import so any src/ file can reach
+    // module; the mahina module re-exports the import so any src/ file can reach
     // it. Regenerate both with tools/regen-trace-schema.sh — never hand-edit.
     const binschema_mod = b.createModule(.{
         .root_source_file = b.path("src/gen/binschema/binschema.zig"),
@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // The library module: the VM core, importable by consumers and by tests.
-    const mod = b.addModule("lune", .{
+    const mod = b.addModule("mahina", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{
@@ -56,13 +56,13 @@ pub fn build(b: *std.Build) void {
 
     // The CLI executable. Thin shell over the library module for now.
     const exe = b.addExecutable(.{
-        .name = "lune",
+        .name = "mahina",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "lune", .module = mod },
+                .{ .name = "mahina", .module = mod },
             },
         }),
     });
@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
-    const run_step = b.step("run", "Run the lune CLI");
+    const run_step = b.step("run", "Run the mahina CLI");
     run_step.dependOn(&run_cmd.step);
 
     // `zig build test` — run unit tests from both the library and the CLI module.
@@ -107,7 +107,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{
-                .{ .name = "lune", .module = mod },
+                .{ .name = "mahina", .module = mod },
             },
         }),
     });
@@ -140,7 +140,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/gen/binschema/binschema.zig"),
         .target = wasm_target,
     });
-    const wasm_lune_mod = b.createModule(.{
+    const wasm_mahina_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = wasm_target,
         .imports = &.{
@@ -149,13 +149,13 @@ pub fn build(b: *std.Build) void {
         },
     });
     const wasm_exe = b.addExecutable(.{
-        .name = "lune",
+        .name = "mahina",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/wasm_entry.zig"),
             .target = wasm_target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "lune", .module = wasm_lune_mod },
+                .{ .name = "mahina", .module = wasm_mahina_mod },
             },
         }),
     });
@@ -167,13 +167,13 @@ pub fn build(b: *std.Build) void {
     wasm_step.dependOn(&install_wasm.step);
 
     // Tail-call capability gate on wasm — note the two halves:
-    //   1. COMPILE-TIME: `wasm_entry.zig` exports `lune_dispatch_smoke`, which
+    //   1. COMPILE-TIME: `wasm_entry.zig` exports `mahina_dispatch_smoke`, which
     //      pulls `dispatch.zig`'s `@call(.always_tail)` into this artifact. That
     //      call is a *guarantee*: if `wasm32 + tail_call` couldn't emit a real
     //      tail call, `zig build wasm` would fail right here. So a green wasm
     //      build already proves the capability survives on the browser target.
     //   2. RUNTIME: a `bun` test (viz/test/) instantiates the module and runs
-    //      `lune_dispatch_smoke(2_000_000)`, proving the engine reuses frames in
+    //      `mahina_dispatch_smoke(2_000_000)`, proving the engine reuses frames in
     //      practice (no stack overflow). We run it under bun rather than a Zig
     //      `addTest` because Zig's test runner needs host I/O to report results,
     //      which `wasm32-freestanding` lacks — there is no in-`zig build` way to
@@ -189,13 +189,13 @@ fn checkZigVersion(enforce: bool) void {
 
     if (enforce) {
         std.debug.panic(
-            "lune pins Zig {s} but the active toolchain is {f}. " ++
+            "mahina pins Zig {s} but the active toolchain is {f}. " ++
                 "Install the pinned `-dev` build (see .zig-version) or drop -Denforce-zig-version.",
             .{ pinned_zig_version, active },
         );
     } else {
         std.log.warn(
-            "lune pins Zig {s} but the active toolchain is {f}; building anyway. " ++
+            "mahina pins Zig {s} but the active toolchain is {f}; building anyway. " ++
                 "Pass -Denforce-zig-version=true to make this fatal.",
             .{ pinned_zig_version, active },
         );

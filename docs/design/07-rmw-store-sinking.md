@@ -1,4 +1,4 @@
-# lune — RMW array stores via store-sinking (relaxing C1)
+# mahina — RMW array stores via store-sinking (relaxing C1)
 
 Status: **implemented** (2026-06-22) — recorder defers/sinks the single RMW
 `astore` below every loop-exit guard; green under `zig build test` and 8-mode
@@ -49,7 +49,7 @@ documented multi-store follow-on (§6).
 
 ## 2. Why C1 exists — the deopt-replay hazard (recap)
 
-lune's deopt is **coarse loop-header re-entry** (`01-trace-lifecycle.md`,
+mahina's deopt is **coarse loop-header re-entry** (`01-trace-lifecycle.md`,
 `irinterp.executeImpl`). A trace runs N *fully completed* iterations natively; on
 any guard/arith side-exit mid-body it returns `completed = N` with the tier-0
 register file **left at the start of the partial iteration N+1** (the φ writebacks
@@ -101,7 +101,7 @@ We sink **only** the `astore` node — not its address (`aref`), not its guards,
 the value computation. Those stay in the body where they are:
 
 - The **`aref`** (`&data[key]`) is computed from the key ref captured at body time
-  (the *pre-increment* loop index). lune's IR is SSA-shaped: the `astore` node
+  (the *pre-increment* loop index). mahina's IR is SSA-shaped: the `astore` node
   references the `aref` node by index, and `recForLoop`'s `setReg(a, rnext)`
   repoints the *slot*, not the already-emitted `aref` node. So the sunk store
   addresses `v[x]` (the current iteration's element), never `v[x+1]`. The XMM

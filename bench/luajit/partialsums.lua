@@ -1,6 +1,6 @@
 -- @bench args="1000000" luajit=compatible name=partialsums
 -- Vendored verbatim from LuaJIT/bench/partialsums.lua (Computer Language
--- Benchmarks Game port). Only this header is lune-added.
+-- Benchmarks Game port). Only this header is mahina-added.
 
 local n = tonumber(arg[1])
 local function pr(fmt, x) io.write(string.format(fmt, x)) end

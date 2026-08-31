@@ -1,4 +1,4 @@
-# lune — deterministic on-trace allocation (builtin recording breadth, arc B)
+# mahina — deterministic on-trace allocation (builtin recording breadth, arc B)
 
 Status: **landed** (arc B, commits c1 `495f1e5` → c2 `0d2c3ed` → c3 `4c34598`
 → c4, 2026-08-28). v1 scope only: budget entry guard, `tostr_*` + `snew` class

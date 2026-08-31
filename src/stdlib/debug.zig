@@ -1,4 +1,4 @@
-//! lune stdlib — the `debug` library (introspection subset).
+//! mahina stdlib — the `debug` library (introspection subset).
 //!
 //! Only `debug.traceback` is implemented: a pure, deterministic formatter over
 //! the live call stack. It walks `Vm.backtraceFrames` (the same deepest-first
@@ -14,7 +14,7 @@
 //!
 //! The rest of `debug.*` (`getinfo`, `sethook`, `getlocal`, …) is intentionally
 //! absent — most is determinism-hostile or needs richer frame introspection than
-//! lune exposes, and `traceback` carries the usability payoff on its own.
+//! mahina exposes, and `traceback` carries the usability payoff on its own.
 
 const std = @import("std");
 const value = @import("../value.zig");
@@ -31,7 +31,7 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
 /// `debug.traceback([message [, level]])` — return a string describing the
 /// current call stack, optionally prefixed by `message`.
 ///
-/// Lua-shaped (no leading `thread` argument — lune exposes no coroutines), and
+/// Lua-shaped (no leading `thread` argument — mahina exposes no coroutines), and
 /// mirroring Lua's `db_traceback` (which calls `lua_tostring`, so it **coerces a
 /// number** message):
 ///   * a string or number `message` is rendered (numbers via `coerceConcat`, the
@@ -44,7 +44,7 @@ inline fn vmOf(ctx: *anyopaque) *Vm {
 ///     (leaf) frame — `level == 1` is the function that called `traceback`. A
 ///     non-integer-representable float `level` is a bad argument, never a trap.
 ///
-/// Each line follows lune's existing `chunk:line:` error convention, using a
+/// Each line follows mahina's existing `chunk:line:` error convention, using a
 /// frame's `proto.name` as its chunk: `<name>:<line>: in main chunk` for the top
 /// chunk (`proto.name == "main"`), else `<name>:<line>: in function '<name>'`.
 fn nTraceback(ctx: *anyopaque, args: []const Value) anyerror!Value {

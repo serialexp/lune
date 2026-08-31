@@ -385,7 +385,7 @@ table.ir tr.ir-exit .op {
 
 /* Runtime-error squiggle in the editor (a channel separate from compile lint).
    Wavy red underline under the faulting span; native title tooltip shows the
-   lune message. */
+   mahina message. */
 .cm-runtime-error {
   text-decoration: underline wavy #f7768e;
   text-decoration-skip-ink: none;

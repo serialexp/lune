@@ -1,6 +1,6 @@
-// Loader + typed surface for the in-browser lune VM (src/wasm_entry.zig, built
+// Loader + typed surface for the in-browser mahina VM (src/wasm_entry.zig, built
 // by `zig build wasm`). This is the one place the app touches the wasm C-ABI;
-// everything above it works in terms of `LuneRunResult` (decoded with the
+// everything above it works in terms of `MahinaRunResult` (decoded with the
 // existing binschema decoders — no new parsing here).
 //
 // The same module runs the script in-browser that the native binary runs on
@@ -8,22 +8,22 @@
 // the two produce byte-identical artifacts for deterministic programs.
 
 /** Raw C-ABI exports of the wasm module. wasm32 ⇒ every pointer is a u32. */
-interface LuneExports {
+interface MahinaExports {
   memory: WebAssembly.Memory;
-  lune_alloc(len: number): number;
-  lune_free(ptr: number, len: number): void;
-  lune_run(srcPtr: number, srcLen: number, argsPtr: number, argsLen: number): number;
-  lune_free_result(resPtr: number): void;
-  lune_check(srcPtr: number, srcLen: number): number;
-  lune_free_check_result(resPtr: number): void;
-  lune_replay(srcPtr: number, srcLen: number, effPtr: number, effLen: number, stopAfter: number): number;
-  lune_free_replay_result(resPtr: number): void;
-  lune_dispatch_smoke(iterations: number): number;
+  mahina_alloc(len: number): number;
+  mahina_free(ptr: number, len: number): void;
+  mahina_run(srcPtr: number, srcLen: number, argsPtr: number, argsLen: number): number;
+  mahina_free_result(resPtr: number): void;
+  mahina_check(srcPtr: number, srcLen: number): number;
+  mahina_free_check_result(resPtr: number): void;
+  mahina_replay(srcPtr: number, srcLen: number, effPtr: number, effLen: number, stopAfter: number): number;
+  mahina_free_replay_result(resPtr: number): void;
+  mahina_dispatch_smoke(iterations: number): number;
 }
 
 /** The artifacts of one in-browser run. Byte buffers are copies out of linear
  *  memory (the wasm-side originals are freed before this returns). */
-export interface LuneRunResult {
+export interface MahinaRunResult {
   /** 0 = ran to completion, 1 = parse/compile/runtime error (see `diagnostics`). */
   status: number;
   /** The program's `print` output (tab/newline formatted), exactly as native. */
@@ -51,7 +51,7 @@ export interface LuneRunResult {
   /** VM-execute-only time in milliseconds (the `vm.run` call alone, measured
    *  inside wasm via the host clock — excludes parse/compile + serialization). */
   execMs: number;
-  /** Total wall-clock for the whole `lune_run` wasm call in milliseconds
+  /** Total wall-clock for the whole `mahina_run` wasm call in milliseconds
    *  (parse + compile + execute + artifact serialization), measured in JS. */
   totalMs: number;
   /** Total instruction-boundary safepoint count of a pure tier-0 replay of this
@@ -83,7 +83,7 @@ export interface LuneRunResult {
 
 /** The disassembly of one function prototype (a node in the proto tree). */
 export interface ProtoDisasm {
-  /** Stable compile-time id; matches `LuneReplayResult.protoId`. */
+  /** Stable compile-time id; matches `MahinaReplayResult.protoId`. */
   id: number;
   /** Debug name (`"main"` for the top-level chunk). */
   name: string;
@@ -103,8 +103,8 @@ export interface DisasmInstr {
   text: string;
 }
 
-/** The VM state at one replay step (see `LuneModule.replay`). */
-export interface LuneReplayResult {
+/** The VM state at one replay step (see `MahinaModule.replay`). */
+export interface MahinaReplayResult {
   /** 0 = ok (suspended at the step, or finished), 1 = error (see `diagnostics`). */
   status: number;
   /** Program output accumulated up to this step. */
@@ -125,7 +125,7 @@ export interface LuneReplayResult {
   /** Deepest-first call chain at this step (empty when finished). */
   backtrace: BacktraceFrame[];
   /** Replay cursor: the `Proto.id` of the innermost live frame (index into
-   *  `LuneRunResult.disasm` by `id`). 0 when finished/unavailable. */
+   *  `MahinaRunResult.disasm` by `id`). 0 when finished/unavailable. */
   protoId: number;
   /** Index of the pending instruction within that proto's `instrs`. 0 when
    *  finished/unavailable. */
@@ -143,9 +143,9 @@ export interface BacktraceFrame {
 }
 
 /** One compile diagnostic from `check` (parse/compile only — no execution). The
- *  `start`/`end` are UTF-8 *byte* offsets into the source (the lune frontend's
+ *  `start`/`end` are UTF-8 *byte* offsets into the source (the mahina frontend's
  *  native unit); callers targeting a UTF-16 editor must convert. */
-export interface LuneDiagnostic {
+export interface MahinaDiagnostic {
   severity: "error" | "warning";
   /** Byte offset of the span start (inclusive). */
   start: number;
@@ -157,20 +157,20 @@ export interface LuneDiagnostic {
 }
 
 /** A ready-to-use VM instance. */
-export interface LuneModule {
+export interface MahinaModule {
   /** Parse, compile, and run a source chunk; returns its artifacts. `argv`, when
    *  given, fills the global `arg` table (`argv[0]` = script name, `argv[1..]` =
    *  user args) exactly as the CLI does — so a script reading `arg[1]` (e.g.
    *  nsieve's workload size) sees it. Omitted/empty ⇒ `arg` stays an empty table. */
-  runSource(src: string, argv?: string[]): LuneRunResult;
+  runSource(src: string, argv?: string[]): MahinaRunResult;
   /** Parse + compile a source chunk and return its diagnostics WITHOUT running
    *  it — the editor's live linter. An empty array means a clean compile. */
-  check(src: string): LuneDiagnostic[];
+  check(src: string): MahinaDiagnostic[];
   /** Replay `src` forward to instruction-boundary safepoint `stopAfter`, feeding
    *  the recorded `effects` blob (from a prior `runSource`) back deterministically,
    *  and return the VM state there. Re-running to the same `stopAfter` yields
    *  identical state every time (the deterministic-replay payoff). */
-  replay(src: string, effects: Uint8Array, stopAfter: number): LuneReplayResult;
+  replay(src: string, effects: Uint8Array, stopAfter: number): MahinaReplayResult;
   /** The guaranteed-tail-call capability gate: run `iterations` `.always_tail`
    *  hops and return the accumulator (== `iterations` iff frames were reused). */
   dispatchSmoke(iterations: number): number;
@@ -203,7 +203,7 @@ const DIAG_BYTES = 4 * 4 + 8;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-/** Pack an argv into the blob `lune_run` decodes (see `parseArgv` in
+/** Pack an argv into the blob `mahina_run` decodes (see `parseArgv` in
  *  wasm_entry.zig): little-endian `u32 count`, then per arg `{ u32 len; utf8 }`.
  *  Empty argv → empty blob (the caller then passes len 0 and the VM leaves `arg`
  *  an empty table). */
@@ -242,7 +242,7 @@ function imports(): WebAssembly.Imports {
 }
 
 /** Read a `{ptr,len}` pair at `off` and copy those bytes out of linear memory.
- *  Always re-reads `memory.buffer`: a prior `lune_run` may have grown (and thus
+ *  Always re-reads `memory.buffer`: a prior `mahina_run` may have grown (and thus
  *  detached) the buffer. */
 function readBuf(memory: WebAssembly.Memory, dv: DataView, off: number): Uint8Array {
   const ptr = dv.getUint32(off, true);
@@ -316,10 +316,10 @@ function decodeDisasm(blob: Uint8Array): ProtoDisasm[] {
   return protos;
 }
 
-function wrap(exports: LuneExports): LuneModule {
-  const runSource = (src: string, argv: string[] = []): LuneRunResult => {
+function wrap(exports: MahinaExports): MahinaModule {
+  const runSource = (src: string, argv: string[] = []): MahinaRunResult => {
     const bytes = encoder.encode(src);
-    const srcPtr = bytes.length === 0 ? 0 : exports.lune_alloc(bytes.length);
+    const srcPtr = bytes.length === 0 ? 0 : exports.mahina_alloc(bytes.length);
     if (bytes.length !== 0) {
       new Uint8Array(exports.memory.buffer, srcPtr, bytes.length).set(bytes);
     }
@@ -327,7 +327,7 @@ function wrap(exports: LuneExports): LuneModule {
     // view, but the bytes are already in place and pointers survive as offsets
     // (same ordering discipline as `replay`'s src-then-effects alloc).
     const argsBlob = encodeArgv(argv);
-    const argsPtr = argsBlob.length === 0 ? 0 : exports.lune_alloc(argsBlob.length);
+    const argsPtr = argsBlob.length === 0 ? 0 : exports.mahina_alloc(argsBlob.length);
     if (argsBlob.length !== 0) {
       new Uint8Array(exports.memory.buffer, argsPtr, argsBlob.length).set(argsBlob);
     }
@@ -335,12 +335,12 @@ function wrap(exports: LuneExports): LuneModule {
     // Total wall-clock brackets the whole wasm call (parse + compile + execute +
     // artifact serialization). The execute-only subset comes back as `exec_ns`.
     const t0 = performance.now();
-    const resPtr = exports.lune_run(srcPtr, bytes.length, argsPtr, argsBlob.length);
+    const resPtr = exports.mahina_run(srcPtr, bytes.length, argsPtr, argsBlob.length);
     const totalMs = performance.now() - t0;
-    if (srcPtr !== 0) exports.lune_free(srcPtr, bytes.length);
-    if (argsPtr !== 0) exports.lune_free(argsPtr, argsBlob.length);
+    if (srcPtr !== 0) exports.mahina_free(srcPtr, bytes.length);
+    if (argsPtr !== 0) exports.mahina_free(argsPtr, argsBlob.length);
     if (resPtr === 0) {
-      throw new Error("lune_run returned null (wasm allocation failure)");
+      throw new Error("mahina_run returned null (wasm allocation failure)");
     }
 
     // Re-acquire the view after the call — memory may have grown.
@@ -363,7 +363,7 @@ function wrap(exports: LuneExports): LuneModule {
     const executionLog = readBuf(exports.memory, dv, 96);
     const coverage = readBuf(exports.memory, dv, 104);
 
-    exports.lune_free_result(resPtr);
+    exports.mahina_free_result(resPtr);
 
     return {
       status,
@@ -387,24 +387,24 @@ function wrap(exports: LuneExports): LuneModule {
     };
   };
 
-  const replay = (src: string, effects: Uint8Array, stopAfter: number): LuneReplayResult => {
+  const replay = (src: string, effects: Uint8Array, stopAfter: number): MahinaReplayResult => {
     const srcBytes = encoder.encode(src);
-    const srcPtr = srcBytes.length === 0 ? 0 : exports.lune_alloc(srcBytes.length);
+    const srcPtr = srcBytes.length === 0 ? 0 : exports.mahina_alloc(srcBytes.length);
     if (srcBytes.length !== 0) {
       new Uint8Array(exports.memory.buffer, srcPtr, srcBytes.length).set(srcBytes);
     }
     // Allocate the effect blob AFTER the source (a grow here detaches the source
     // view, but we've already written it; pointers stay valid as offsets).
-    const effPtr = effects.length === 0 ? 0 : exports.lune_alloc(effects.length);
+    const effPtr = effects.length === 0 ? 0 : exports.mahina_alloc(effects.length);
     if (effects.length !== 0) {
       new Uint8Array(exports.memory.buffer, effPtr, effects.length).set(effects);
     }
 
-    const resPtr = exports.lune_replay(srcPtr, srcBytes.length, effPtr, effects.length, stopAfter);
-    if (srcPtr !== 0) exports.lune_free(srcPtr, srcBytes.length);
-    if (effPtr !== 0) exports.lune_free(effPtr, effects.length);
+    const resPtr = exports.mahina_replay(srcPtr, srcBytes.length, effPtr, effects.length, stopAfter);
+    if (srcPtr !== 0) exports.mahina_free(srcPtr, srcBytes.length);
+    if (effPtr !== 0) exports.mahina_free(effPtr, effects.length);
     if (resPtr === 0) {
-      throw new Error("lune_replay returned null (wasm allocation failure)");
+      throw new Error("mahina_replay returned null (wasm allocation failure)");
     }
 
     const dv = new DataView(exports.memory.buffer, resPtr, REPLAY_RESULT_BYTES);
@@ -421,7 +421,7 @@ function wrap(exports: LuneExports): LuneModule {
     const protoId = dv.getUint32(56, true);
     const pc = dv.getUint32(60, true);
 
-    exports.lune_free_replay_result(resPtr);
+    exports.mahina_free_replay_result(resPtr);
 
     return {
       status,
@@ -439,17 +439,17 @@ function wrap(exports: LuneExports): LuneModule {
     };
   };
 
-  const check = (src: string): LuneDiagnostic[] => {
+  const check = (src: string): MahinaDiagnostic[] => {
     const bytes = encoder.encode(src);
-    const srcPtr = bytes.length === 0 ? 0 : exports.lune_alloc(bytes.length);
+    const srcPtr = bytes.length === 0 ? 0 : exports.mahina_alloc(bytes.length);
     if (bytes.length !== 0) {
       new Uint8Array(exports.memory.buffer, srcPtr, bytes.length).set(bytes);
     }
 
-    const resPtr = exports.lune_check(srcPtr, bytes.length);
-    if (srcPtr !== 0) exports.lune_free(srcPtr, bytes.length);
+    const resPtr = exports.mahina_check(srcPtr, bytes.length);
+    if (srcPtr !== 0) exports.mahina_free(srcPtr, bytes.length);
     if (resPtr === 0) {
-      throw new Error("lune_check returned null (wasm allocation failure)");
+      throw new Error("mahina_check returned null (wasm allocation failure)");
     }
 
     // Re-acquire views after the call — memory may have grown.
@@ -457,7 +457,7 @@ function wrap(exports: LuneExports): LuneModule {
     const diagsPtr = head.getUint32(4, true);
     const count = head.getUint32(8, true);
 
-    const out: LuneDiagnostic[] = [];
+    const out: MahinaDiagnostic[] = [];
     for (let i = 0; i < count; i++) {
       const off = diagsPtr + i * DIAG_BYTES;
       const dv = new DataView(exports.memory.buffer, off, DIAG_BYTES);
@@ -475,7 +475,7 @@ function wrap(exports: LuneExports): LuneModule {
       });
     }
 
-    exports.lune_free_check_result(resPtr);
+    exports.mahina_free_check_result(resPtr);
     return out;
   };
 
@@ -483,28 +483,28 @@ function wrap(exports: LuneExports): LuneModule {
     runSource,
     check,
     replay,
-    dispatchSmoke: (iterations: number) => exports.lune_dispatch_smoke(iterations),
+    dispatchSmoke: (iterations: number) => exports.mahina_dispatch_smoke(iterations),
   };
 }
 
 /** Instantiate from raw module bytes (used by tests, which read the `.wasm`
  *  from disk). */
-export async function instantiateLuneFromBytes(bytes: BufferSource): Promise<LuneModule> {
+export async function instantiateMahinaFromBytes(bytes: BufferSource): Promise<MahinaModule> {
   const { instance } = await WebAssembly.instantiate(bytes, imports());
-  return wrap(instance.exports as unknown as LuneExports);
+  return wrap(instance.exports as unknown as MahinaExports);
 }
 
 /** Fetch and instantiate the module from a URL (used by the browser app). Falls
  *  back to a buffered instantiate when streaming compilation is unavailable
  *  (e.g. a dev server serving the wrong MIME type). */
-export async function loadLune(url: string): Promise<LuneModule> {
+export async function loadMahina(url: string): Promise<MahinaModule> {
   try {
     const { instance } = await WebAssembly.instantiateStreaming(fetch(url), imports());
-    return wrap(instance.exports as unknown as LuneExports);
+    return wrap(instance.exports as unknown as MahinaExports);
   } catch {
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`fetch ${url}: ${resp.status} ${resp.statusText}`);
     const bytes = await resp.arrayBuffer();
-    return instantiateLuneFromBytes(bytes);
+    return instantiateMahinaFromBytes(bytes);
   }
 }

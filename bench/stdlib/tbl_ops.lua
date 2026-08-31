@@ -5,9 +5,9 @@
 -- table.move. Integer checksum keeps output deterministic and byte-identical to
 -- LuaJIT. (table.pack/unpack live in lua54.lua — Lua 5.4 surface LuaJIT lacks.)
 --
---   lune              bench/stdlib/tbl_ops.lua 20000   # tier-0
---   lune --jit-native bench/stdlib/tbl_ops.lua 20000   # tier-1b
---   luajit            bench/stdlib/tbl_ops.lua 20000   # reference
+--   mahina              bench/stdlib/tbl_ops.lua 20000   # tier-0
+--   mahina --jit-native bench/stdlib/tbl_ops.lua 20000   # tier-1b
+--   luajit              bench/stdlib/tbl_ops.lua 20000   # reference
 --
 -- @bench args="20000" luajit=compatible
 

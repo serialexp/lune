@@ -1,6 +1,6 @@
 -- @bench args="12" luajit=compatible name=binary-trees
 -- Vendored verbatim from LuaJIT/bench/binary-trees.lua (Computer Language
--- Benchmarks Game port). Only this header is lune-added.
+-- Benchmarks Game port). Only this header is mahina-added.
 
 local function BottomUpTree(item, depth)
   if depth > 0 then

@@ -7,13 +7,13 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { state, loadBytes, selectTrace, selectedTrace, parseArgsString, loadSourceText, setScriptArgs } from "../src/store";
 
-const fixturePath = fileURLToPath(new URL("../fixtures/counting-loop.lunetrace", import.meta.url));
+const fixturePath = fileURLToPath(new URL("../fixtures/counting-loop.mahinatrace", import.meta.url));
 const bytes = new Uint8Array(readFileSync(fixturePath));
 
 test("loadBytes populates the store and auto-selects the first trace", () => {
-  loadBytes("counting-loop.lunetrace", bytes);
+  loadBytes("counting-loop.mahinatrace", bytes);
   expect(state.error).toBeNull();
-  expect(state.fileName).toBe("counting-loop.lunetrace");
+  expect(state.fileName).toBe("counting-loop.mahinatrace");
   expect(state.version).toBe(2); // v2: loop-carry moved into the instr stream as φ nodes
   expect(state.traces.length).toBe(1);
   expect(state.selected).toBe(0);
@@ -25,14 +25,14 @@ test("loadBytes populates the store and auto-selects the first trace", () => {
 });
 
 test("loadBytes on garbage records an error, not a crash", () => {
-  loadBytes("bogus.lunetrace", new Uint8Array([0xff, 0x00, 0x01]));
+  loadBytes("bogus.mahinatrace", new Uint8Array([0xff, 0x00, 0x01]));
   // Either a clean decode error or zero traces — never a thrown exception.
-  expect(state.fileName).toBe("bogus.lunetrace");
+  expect(state.fileName).toBe("bogus.mahinatrace");
   expect(state.selected === -1 || state.traces.length === 0).toBe(true);
 });
 
 test("selectTrace updates the selection", () => {
-  loadBytes("counting-loop.lunetrace", bytes);
+  loadBytes("counting-loop.mahinatrace", bytes);
   selectTrace(0);
   expect(state.selected).toBe(0);
   expect(selectedTrace()!.anchorProtoId).toBe(0);
@@ -47,9 +47,9 @@ test("parseArgsString splits on whitespace and drops empties", () => {
 });
 
 test("loadSourceText loads text into the editor and sets the script name", () => {
-  loadSourceText("nsieve.lune", "print(arg[1])\n");
+  loadSourceText("nsieve.mahina", "print(arg[1])\n");
   expect(state.source).toBe("print(arg[1])\n");
-  expect(state.scriptName).toBe("nsieve.lune");
+  expect(state.scriptName).toBe("nsieve.mahina");
 });
 
 test("setScriptArgs updates the raw args string", () => {

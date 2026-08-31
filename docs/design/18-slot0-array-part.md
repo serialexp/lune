@@ -59,7 +59,7 @@ inside them is checked.
 
 ## Why this exists
 
-lune's table array part covers logical keys `1..len` (`array.zig:36-38`);
+mahina's table array part covers logical keys `1..len` (`array.zig:36-38`);
 key 0 is hash-resident. Tier-0 handles that fine, but the JIT recorder has
 no hash-integer path: any recording that observes `t[0]` aborts
 `.bad_type` (`trace.zig:11290/11434`), and each abort feeds the trace
@@ -198,7 +198,7 @@ Routing: `Table.set`'s fresh-array arm calls `seedAt` for keys 0 and 1
 ONLY. **All other integer keys route to the hash part and the
 threshold-driven histogram rehash exactly as today** (§R1 finding 10 —
 no "small k" generalization; direct seeding beyond {0,1} would bypass
-the density policy and invent a storage shape neither lune nor LuaJIT
+the density policy and invent a storage shape neither mahina nor LuaJIT
 has). Key 1 keeps today's effective behaviour (first write of a
 sequence goes array-resident with an eagerly-committed lane); key 0
 gains it. The recorder does not need a `seed` IR shape: recording only
@@ -383,9 +383,9 @@ Revisit identity-mapped grids only if 0-indexed grid workloads show up
 
 ## D7 — Rehash / sizing: complete derivation (§R1 findings 4/M1)
 
-The round-1 sketch ("keys 0..2 → bin 0") was wrong for lune: LuaJIT's
+The round-1 sketch ("keys 0..2 → bin 0") was wrong for mahina: LuaJIT's
 `bestasize` may return non-power-of-two sizes (bin 0 → asize 3,
-`lj_tab.c:345-355`) while lune's `computeArraySize` returns powers of
+`lj_tab.c:345-355`) while mahina's `computeArraySize` returns powers of
 two (`table.zig:339-356`) — under that constraint a lone key 1 in bin 0
 would select size 1, which cannot hold physical slot 1. Complete
 replacement derivation:
@@ -413,7 +413,7 @@ replacement derivation:
   keys) is impossible under `bin(k) = ceillog2(k+1)`. Keys in
   deliberately-rejected higher bins stay hash-resident, as today.
 - **Memory honesty (§R2 finding 3).** Keeping power-of-two extents
-  (lune's existing constraint; LuaJIT's `bestasize` allows
+  (mahina's existing constraint; LuaJIT's `bestasize` allows
   non-power-of-two terminal sizes, `lj_tab.c:345-355`) means a dense
   run whose maximum key sits on a power-of-two boundary grows to the
   NEXT power after the +1 shift: the `2..64` shape
@@ -756,7 +756,7 @@ go-ahead pending.**
   sizes), `:294-306` (`countint`), `:308-330` (`countarray`),
   `:345-355` (`bestasize` — non-power-of-two, NOT ported verbatim),
   `:357` (`rehashtab`), `:231` (`lj_tab_resize`).
-- lune: doc 17 §B4.8 + Outstanding B-5 (motivating gap); doc 02
+- mahina: doc 17 §B4.8 + Outstanding B-5 (motivating gap); doc 02
   (iteration order), doc 03 (`1..n` prose), doc 04 + `schema/trace.json`
   (positional array), doc 05 (Phase B `idx0 = k-1`), doc 06 (string
   bytes), doc 14 (grids).

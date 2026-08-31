@@ -155,7 +155,7 @@ pub fn pow(a: Value, b: Value) Error!Value {
 // ---- bitwise ----
 //
 // Bitwise operators act on the 64-bit two's-complement pattern of integer
-// operands. lune requires **integer** operands and — unlike Lua 5.4 —
+// operands. mahina requires **integer** operands and — unlike Lua 5.4 —
 // deliberately does NOT coerce a float, even one with an integral value (e.g.
 // `3.0 & 1` errors). Keeping the numeric tower strict here avoids an implicit
 // float→int convenience; any non-integer operand errors with `TypeError`, which
@@ -236,8 +236,8 @@ fn shiftRightArith(x: i64, n: i64) i64 {
     return @bitCast(ux << @intCast(-n));
 }
 
-/// `a ~>> b` (arithmetic right shift, sign-extending). lune-only operator
-/// (LuaJIT 3.0 syntax); 64-bit width like the rest of lune's bitwise set.
+/// `a ~>> b` (arithmetic right shift, sign-extending). mahina-only operator
+/// (LuaJIT 3.0 syntax); 64-bit width like the rest of mahina's bitwise set.
 pub fn sar(a: Value, b: Value) Error!Value {
     try requireInts(a, b);
     return Value.int(shiftRightArith(a.asInt(), b.asInt()));
@@ -282,7 +282,7 @@ pub fn eq(a: Value, b: Value) bool {
 /// The whitespace set `tonumber` trims before parsing: C `isspace`, which is
 /// what both Lua 5.4 (`l_str2int`/`l_str2d` skip `lisspace`) and LuaJIT
 /// (`lj_strscan` skips `LJ_CHAR_SPACE`) use. Verified empirically 2026-08-29:
-/// with only " \t\n\r" lune rejected "\x0B10"/"\x0C10" that both engines
+/// with only " \t\n\r" mahina rejected "\x0B10"/"\x0C10" that both engines
 /// accept — the one acceptance gap on the 77-case three-engine probe matrix.
 const tonumber_trim = " \t\n\r\x0B\x0C"; // space \t \n \r \v \f
 

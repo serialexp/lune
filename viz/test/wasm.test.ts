@@ -13,7 +13,7 @@
 import { test, expect, beforeAll } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { instantiateLuneFromBytes, type LuneModule } from "../src/wasm/lune";
+import { instantiateMahinaFromBytes, type MahinaModule } from "../src/wasm/mahina";
 import { decodeTraceFile, decodeExecLogFile } from "../src/decode";
 import { ExecEventKind } from "../src/exec";
 import { viewsOf } from "../src/disasm";
@@ -21,13 +21,13 @@ import { decodeSnapshot } from "../src/snapshot";
 import { diffRuns } from "../src/diff";
 import { CoverageFileDecoder } from "../src/gen/generated";
 
-const wasmPath = fileURLToPath(new URL("../../zig-out/bin/lune.wasm", import.meta.url));
+const wasmPath = fileURLToPath(new URL("../../zig-out/bin/mahina.wasm", import.meta.url));
 
-let mod: LuneModule;
+let mod: MahinaModule;
 
 beforeAll(async () => {
   const bytes = new Uint8Array(readFileSync(wasmPath));
-  mod = await instantiateLuneFromBytes(bytes);
+  mod = await instantiateMahinaFromBytes(bytes);
 });
 
 test("tail-call capability gate: 2M .always_tail hops run in O(1) stack", () => {
@@ -46,10 +46,10 @@ test("runSource threads argv into the global arg table (arg[0..])", () => {
   // argv[0] is the script name, argv[1..] the user args — exactly the CLI's
   // `arg` convention. A script (e.g. nsieve) reads its workload from arg[1].
   const src = "print(arg[0])\nprint(arg[1])\nprint(arg[2])\n";
-  const result = mod.runSource(src, ["nsieve.lune", "9", "hello world"]);
+  const result = mod.runSource(src, ["nsieve.mahina", "9", "hello world"]);
   expect(result.status).toBe(0);
   expect(result.diagnostics).toBe("");
-  expect(result.stdout).toBe("nsieve.lune\n9\nhello world\n");
+  expect(result.stdout).toBe("nsieve.mahina\n9\nhello world\n");
 });
 
 test("runSource with no argv leaves arg an empty table (arg[1] == nil)", () => {
@@ -79,7 +79,7 @@ test("runs the nsieve benchmark with a workload arg[1]", () => {
     "local m = (2^N)*1000",
     'io.write(string.format("primes up to %d: %d\\n", m, nsieve(primes, m)))',
   ].join("\n");
-  const result = mod.runSource(nsieve, ["nsieve.lune", "4"]);
+  const result = mod.runSource(nsieve, ["nsieve.mahina", "4"]);
   expect(result.status).toBe(0);
   // N=4 → m = 16000; π(16000) = 1862.
   expect(result.stdout).toBe("primes up to 16000: 1862\n");
@@ -172,7 +172,7 @@ test("a successful run reports execute-only and total timing", () => {
   const result = mod.runSource("local s = 0\nfor i = 1, 1000 do s = s + i end\nprint(s)\n");
   expect(result.status).toBe(0);
   // Both are finite, non-negative wall-clocks. execMs is measured inside wasm
-  // (the vm.run call alone); totalMs in JS around the whole lune_run call.
+  // (the vm.run call alone); totalMs in JS around the whole mahina_run call.
   expect(Number.isFinite(result.execMs)).toBe(true);
   expect(Number.isFinite(result.totalMs)).toBe(true);
   expect(result.execMs).toBeGreaterThanOrEqual(0);

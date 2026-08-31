@@ -1,4 +1,4 @@
-//! lune stdlib — the `math` library.
+//! mahina stdlib — the `math` library.
 //!
 //! Pure, deterministic numeric functions (tier `core` in
 //! `docs/lua-stdlib-inventory.csv`). Every native here is a *pure host call*:
@@ -8,7 +8,7 @@
 //! code out of the interpreter core: `interp.base_natives` simply concatenates
 //! `math.natives` (and `math.constants`) at comptime.
 //!
-//! Number semantics follow Lua 5.4's integer/float subtype model (which lune's
+//! Number semantics follow Lua 5.4's integer/float subtype model (which mahina's
 //! `Value` already mirrors — `int` and `float` are distinct tags, not a float
 //! subtype): `abs`/`max`/`min`/`fmod` preserve the subtype of their result,
 //! `floor`/`ceil` yield integers, and the transcendental functions always yield
@@ -27,7 +27,7 @@
 //! `math.random`/`math.randomseed` are **not** here: they touch VM state (the
 //! PRNG and the `.random_seed` effect log), so they live in `interp.zig` as
 //! Vm-touching natives (`nativeRandom`/`nativeRandomseed`) but are installed into
-//! this `math` table via their registry `.module`/`.field`. lune uses a single
+//! this `math` table via their registry `.module`/`.field`. mahina uses a single
 //! `u64` seed (`std.Random.Xoshiro256`), so the draw is Lua-shaped but not
 //! PUC-stream-compatible.
 
@@ -43,7 +43,7 @@ const Value = value.Value;
 // ---------------------------------------------------------------------------
 
 /// Fetch argument `i` as a number `Value`, or `TypeError` if missing/non-number.
-/// Mirrors Lua's "bad argument" arity/type checks (lune surfaces them as a single
+/// Mirrors Lua's "bad argument" arity/type checks (mahina surfaces them as a single
 /// `TypeError`; `interp.narrowError` maps `error.TypeError` straight across).
 fn numArg(args: []const Value, i: usize) error{TypeError}!Value {
     if (i >= args.len or !args[i].isNumber()) return error.TypeError;

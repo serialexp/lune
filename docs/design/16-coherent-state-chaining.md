@@ -5,7 +5,7 @@ Owner: Bart
 Last updated: 2026-07-11 (accounting regression root-caused + fixed)
 
 The tracing JIT compiles every hot loop in nsieve to native code, yet ~93% of
-cycles still run on the tier-0 interpreter and lune sits ~2× off LuaJIT (N=9:
+cycles still run on the tier-0 interpreter and mahina sits ~2× off LuaJIT (N=9:
 tier-0 0.60s, `--trace --jit-native` 0.23s, LuaJIT 0.12s). The traces are not the
 problem — **the transitions between them are.** After a trace side-exits
 productively, control falls back to tier-0 even when another compiled trace is

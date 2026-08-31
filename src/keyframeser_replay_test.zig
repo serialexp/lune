@@ -25,8 +25,8 @@ const Proto = bytecode.Proto;
 const Vm = interp.Vm;
 pub const schema = @import("gen/trace_schema.zig");
 const testing = std.testing;
-const lune_parser = @import("parser.zig");
-const lune_compiler = @import("compiler.zig");
+const mahina_parser = @import("parser.zig");
+const mahina_compiler = @import("compiler.zig");
 const Diagnostics = @import("diag.zig").Diagnostics;
 const io = @import("io.zig");
 
@@ -85,7 +85,7 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
 
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     // --- Run 1 (record): full uninterrupted run → reference output F + effect log L.
@@ -95,7 +95,7 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
         var buf: [512]u8 = undefined;
         var sink = io.Writer.fixed(&buf);
         vm.out = &sink;
-        var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+        var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
         defer chunk.deinit();
         try testing.expect(!diags.hasErrors());
 
@@ -127,7 +127,7 @@ test "F2d: restore a mid-run keyframe + replay its effect log → identical forw
     var buf2: [512]u8 = undefined;
     var sink2 = io.Writer.fixed(&buf2);
     vm2.out = &sink2;
-    var chunk2 = try lune_compiler.compile(gpa, vm2.heap, source, tree.root, &diags);
+    var chunk2 = try mahina_compiler.compile(gpa, vm2.heap, source, tree.root, &diags);
     defer chunk2.deinit();
     try testing.expect(!diags.hasErrors());
 
@@ -195,7 +195,7 @@ fn captureNativeF2cCut(gpa: std.mem.Allocator, source: [:0]const u8, native: boo
     const effectser = @import("effectser.zig");
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
 
     var vm = try Vm.init(gpa);
@@ -218,7 +218,7 @@ fn captureNativeF2cCut(gpa: std.mem.Allocator, source: [:0]const u8, native: boo
         .after_committed_effects = 1,
     };
 
-    var chunk = try lune_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     try testing.expect((try vm.start(chunk.proto)) == .suspended);
@@ -286,7 +286,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     // reattached explicitly before execution continues.
     var diags = Diagnostics.init(gpa);
     defer diags.deinit();
-    var tree = try lune_parser.parse(gpa, source, &diags);
+    var tree = try mahina_parser.parse(gpa, source, &diags);
     defer tree.deinit();
     var cut_vm = try Vm.init(gpa);
     defer cut_vm.deinit();
@@ -303,7 +303,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     cut_vm.trace.config.coverage = true;
     cut_vm.trace.config.hotloop = 4;
     cut_vm.suspend_ctl = .{ .min_depth = 2, .after_committed_effects = 1 };
-    var chunk = try lune_compiler.compile(gpa, cut_vm.heap, source, tree.root, &diags);
+    var chunk = try mahina_compiler.compile(gpa, cut_vm.heap, source, tree.root, &diags);
     defer chunk.deinit();
     try testing.expect(!diags.hasErrors());
     try testing.expect((try cut_vm.start(chunk.proto)) == .suspended);
@@ -346,7 +346,7 @@ test "A-vi F-5: native post-burst effect cut has full-state identity and resumes
     ref_vm.effect_mode = .record;
     var ref_clock = TestClock{ .next = 1000 };
     ref_vm.clock_source = ref_clock.source();
-    var ref_chunk = try lune_compiler.compile(gpa, ref_vm.heap, source, tree.root, &diags);
+    var ref_chunk = try mahina_compiler.compile(gpa, ref_vm.heap, source, tree.root, &diags);
     defer ref_chunk.deinit();
     try testing.expect(!diags.hasErrors());
     _ = try ref_vm.run(ref_chunk.proto);
