@@ -180,8 +180,10 @@ test "replayLedger M1 sub-case (c): fused [skip.deopt, ramp.prologue_fail] repla
     try testing.expectEqual(@as(?u32, 10), r.resume_pc);
     // onSideExit(skip, 9): 9 >= min_useful(8) → useful entry, hit_count bumped.
     try testing.expectEqual(@as(u64, 1), skip.hit_count);
-    // onSideExit(ramp, 0): low-yield → one penalty on the SHARED outer-header anchor.
-    try testing.expectEqual(@as(u32, 1), state.penalty.get(.{ .proto = &proto, .pc = 10 }).?);
+    // The ramp refused before entering its body: candidate-local evidence only,
+    // so the shared outer-header anchor remains unpenalized.
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(.{ .proto = &proto, .pc = 10 }));
+    try testing.expectEqual(@as(u32, 1), ramp.consec_refusals);
     // The fused M1 recognition fired exactly once; no `.link` marker was replayed.
     try testing.expectEqual(@as(u64, 1), state.native_source_link_fused);
     try testing.expectEqual(@as(u64, 0), state.native_link_exits);
@@ -847,10 +849,10 @@ test "jit coverage: per-hop cycles bill each hop's own anchor, never the entry a
     // Establish the hop boundary; the span up to onSideExit(A) bills anchor A.
     state.last_hop_tsc = readCycles();
     spin(4000);
-    state.onSideExit(trace_a, 5);
+    state.onSideExit(trace_a, 5, .entered);
     // The span between the two commits bills anchor B, not A.
     spin(4000);
-    state.onSideExit(trace_b, 3);
+    state.onSideExit(trace_b, 3, .entered);
 
     const cov_a = state.coverage.get(.{ .proto = &proto, .pc = 10 }).?;
     const cov_b = state.coverage.get(.{ .proto = &proto, .pc = 20 }).?;

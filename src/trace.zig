@@ -681,6 +681,10 @@ pub fn isSideExitGuardOp(op: IrOp) bool {
     };
 }
 
+/// Whether a trace actually entered its body or refused in its hoisted native
+/// prologue. `exit_instr` is overloaded and cannot identify a refusal.
+pub const ChargeKind = enum { entered, entry_refusal };
+
 /// The **source-opcode PC** (guest bytecode index) that OWNS a guard — the single
 /// canonical definition of "which bytecode op does this guard belong to", i.e. the
 /// `source_pc` a future `GuardProvenance` tag keys on (doc 17, H-1b). Distinct in
@@ -1224,6 +1228,9 @@ pub const Trace = struct {
     /// return the most-successful trace first — a stable frequency-based
     /// priority that does not thrash on alternating types.
     hit_count: u64 = 0,
+    /// Consecutive native-prologue refusals for this candidate. Any body entry
+    /// resets the streak; a maxed streak suppresses only this trace.
+    consec_refusals: u32 = 0,
     /// Doc 24 D3: the trace's static allocation bound `A` — the number of
     /// `.alloc`-kind ops the recorded body contains (0 = non-allocating, the
     /// arc-A status quo). Mirrors the entry `guard_gc`'s `aux` (stamped from the
@@ -1581,6 +1588,8 @@ pub const TraceConfig = struct {
     /// `min_useful` iterations) an anchor is gated off so tier-0 owns the loop —
     /// the brake against re-entry thrash on type-unstable / branchy loops.
     max_penalty: u32 = 8,
+    /// Consecutive entry refusals tolerated before suppressing this candidate.
+    max_entry_refusals: u32 = 32,
     /// Part B-2b: complete-ledger zero-progress alternations tolerated before
     /// retiring the logical provenance edge and its disposable physical arm.
     max_edge_strikes: u8 = 3,
@@ -3073,6 +3082,7 @@ pub const TraceState = struct {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
         for (self.cache.items) |t| {
+            if (t.consec_refusals >= self.config.max_entry_refusals) continue;
             if (t.anchor.proto == proto and t.anchor.pc == pc) {
                 if (best == null or t.hit_count > best_hits) {
                     best = t;
@@ -3106,6 +3116,7 @@ pub const TraceState = struct {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
         for (self.cache.items) |t| {
+            if (t.consec_refusals >= self.config.max_entry_refusals) continue;
             if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
             if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .loop) continue;
             if (best == null or t.hit_count > best_hits) {
@@ -3126,6 +3137,7 @@ pub const TraceState = struct {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
         for (self.cache.items) |t| {
+            if (t.consec_refusals >= self.config.max_entry_refusals) continue;
             if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
             if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .link) continue;
             // B-iv.3 (doc 22 §B.5): seeded continuations are selectable — the
@@ -3161,6 +3173,7 @@ pub const TraceState = struct {
         var buf: [8]*Trace = undefined;
         var n: usize = 0;
         for (self.cache.items) |t| {
+            if (t.consec_refusals >= self.config.max_entry_refusals) continue;
             if (t.anchor.proto != proto or t.anchor.pc != post_pc) continue;
             if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .link) continue;
             var pos: usize = n;
@@ -3219,6 +3232,7 @@ pub const TraceState = struct {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
         outer: for (self.cache.items) |t| {
+            if (t.consec_refusals >= self.config.max_entry_refusals) continue;
             if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
             for (visited) |v| {
                 if (v == t) continue :outer;
@@ -3401,9 +3415,16 @@ pub const TraceState = struct {
     ///
     /// This path is null-keyed, so it never consumes and is exactly the pre-flip
     /// per-trace behaviour.
-    pub inline fn onSideExit(self: *TraceState, t: *Trace, completed: usize) void {
+    pub inline fn onSideExit(self: *TraceState, t: *Trace, completed: usize, charge_kind: ChargeKind) void {
         self.accountTraceRun(t, completed);
-        if (self.accountRegionProfit(null, 0, .deferred)) return;
+        if (charge_kind == .entry_refusal) {
+            accountCandidateCharge(t, charge_kind);
+            return;
+        }
+        if (self.accountRegionProfit(null, 0, .deferred)) {
+            accountCandidateCharge(t, charge_kind);
+            return;
+        }
         // Gate-fix arc (2026-08-12): a synthetic steering charge fired while a
         // live QUALIFIED activation's footprint contains `t`'s anchor is an
         // intra-complex transition — the region window/close verdicts own its
@@ -3415,10 +3436,11 @@ pub const TraceState = struct {
         // machine had just qualified). Consumed-as-barren: a sustained streak
         // still strikes (`noteBarrenConsumed`, codex BLOCKER 2).
         if (self.qualifiedActiveMember(t.anchor.proto, t.anchor.pc)) |m| {
+            accountCandidateCharge(t, charge_kind);
             self.noteBarrenConsumed(m.key, m.accum);
             return;
         }
-        self.accountLegacyThrash(t, completed, std.math.maxInt(u32));
+        self.accountLegacyThrash(t, completed, std.math.maxInt(u32), charge_kind);
     }
 
     /// Concrete receipt variant. Selection keeps its historical per-segment
@@ -3432,8 +3454,13 @@ pub const TraceState = struct {
         exit_instr: u32,
         region_work: usize,
         dest: RegionDestination,
+        charge_kind: ChargeKind,
     ) void {
         self.accountTraceRun(t, completed);
+        if (charge_kind == .entry_refusal) {
+            accountCandidateCharge(t, charge_kind);
+            return;
+        }
         const key: ?ExitKey = if (exit_instr < t.instrs.len)
             .{ .trace_id = t.id, .exit_instr = exit_instr }
         else
@@ -3442,8 +3469,11 @@ pub const TraceState = struct {
         // only ever touch the same anchor when this receipt's own region closed and
         // flushed against an owner that happens to be `t.anchor`; applying the
         // receipt-local verdict last keeps the most recent evidence authoritative.
-        if (!self.accountRegionProfit(key, region_work, dest))
-            self.accountLegacyThrash(t, completed, exit_instr);
+        if (!self.accountRegionProfit(key, region_work, dest)) {
+            self.accountLegacyThrash(t, completed, exit_instr, charge_kind);
+        } else {
+            accountCandidateCharge(t, charge_kind);
+        }
     }
 
     /// The pre-A-vii-c per-trace profitability machine, verbatim — applied to every
@@ -3456,7 +3486,9 @@ pub const TraceState = struct {
     /// `exit_instr` is the failing IR exit when the caller knows it (a real
     /// deopt receipt), `maxInt(u32)` otherwise. It feeds the Option-A rule
     /// below and nothing else.
-    inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize, exit_instr: u32) void {
+    inline fn accountLegacyThrash(self: *TraceState, t: *Trace, completed: usize, exit_instr: u32, charge_kind: ChargeKind) void {
+        accountCandidateCharge(t, charge_kind);
+        if (charge_kind == .entry_refusal) return;
         const key = t.anchor;
         // Pall's model (hotexit arc): a PRODUCTIVE segment is never a strike,
         // however short. LuaJIT has no `min_useful` analog at all — a trace that
@@ -3529,9 +3561,20 @@ pub const TraceState = struct {
     /// `exit_instr`: the row's own exit index for `.deopt` rows (Option-A
     /// evidence), `maxInt(u32)` for rows with no failing-guard identity
     /// (loop-done, prologue-fail).
-    inline fn accountLedgerRow(self: *TraceState, t: *Trace, completed: usize, exit_instr: u32, region_consumed: bool) void {
+    inline fn accountLedgerRow(self: *TraceState, t: *Trace, completed: usize, exit_instr: u32, region_consumed: bool, charge_kind: ChargeKind) void {
         self.accountTraceRun(t, completed);
-        if (!region_consumed) self.accountLegacyThrash(t, completed, exit_instr);
+        if (!region_consumed) {
+            self.accountLegacyThrash(t, completed, exit_instr, charge_kind);
+        } else {
+            accountCandidateCharge(t, charge_kind);
+        }
+    }
+
+    inline fn accountCandidateCharge(t: *Trace, charge_kind: ChargeKind) void {
+        switch (charge_kind) {
+            .entered => t.consec_refusals = 0,
+            .entry_refusal => t.consec_refusals +|= 1,
+        }
     }
 
     /// Bulk image of sequential frozen-region ledger rows for one trace. Native
@@ -3550,6 +3593,7 @@ pub const TraceState = struct {
     ) void {
         if (!region_consumed)
             @panic("driveSilentBurst: bulk selection row was not region-consumed");
+        accountCandidateCharge(t, .entered);
         if (self.config.coverage) {
             if (completed > 0) self.noteTraceIters(t.anchor, completed);
             // Iteration totals remain exact. Per-trace TSC attribution cannot be:
@@ -3923,6 +3967,7 @@ pub const TraceState = struct {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
         for (self.cache.items) |t| {
+            if (t.consec_refusals >= self.config.max_entry_refusals) continue;
             if (t.anchor.proto != bridge.successor.proto or t.anchor.pc != bridge.successor.pc)
                 continue;
             if (!self.traceInRegion(t.id, id)) continue;
@@ -5539,14 +5584,14 @@ pub const TraceState = struct {
             // sct=cont). Arm-only; the receipt/steering below is unaffected.
             if (tier == .native_only) self.maybeArmCompositeExit(sct, sresult.exit_instr, safe_to_arm);
             if (flushed_resume_pc) |target_pc| {
-                self.onSideExitReceipt(sct, 0, sresult.exit_instr, 0, .deferred);
+                self.onSideExitReceipt(sct, 0, sresult.exit_instr, 0, .deferred, if (sresult.exit_reason == .prologue_fail) .entry_refusal else .entered);
                 return .{ .completed = 0, .resume_pc = target_pc };
             }
             if (sresult.completed > 0) {
-                self.onSideExitReceipt(sct, sresult.completed, sresult.exit_instr, sresult.completed, .deferred);
+                self.onSideExitReceipt(sct, sresult.completed, sresult.exit_instr, sresult.completed, .deferred, .entered);
                 return .{ .completed = sresult.completed };
             }
-            self.onSideExitReceipt(sct, 0, sresult.exit_instr, 0, .deferred);
+            self.onSideExitReceipt(sct, 0, sresult.exit_instr, 0, .deferred, if (sresult.exit_reason == .prologue_fail) .entry_refusal else .entered);
             // Zero iterations, no flush owed (ordinary path): try the next candidate.
         }
         return null;
@@ -5611,10 +5656,10 @@ pub const TraceState = struct {
                 }, null, snt, .native_only, proto, regs, safe_to_arm);
             },
             .return_result => |cr| cr,
-            .break_burst => blk: {
+            .break_burst => |charge_kind| blk: {
                 if (linked_completed > 0)
                     break :blk .{ .completed = linked_completed, .resume_pc = resume_pc };
-                self.onSideExit(seed, 0);
+                self.onSideExit(seed, 0, charge_kind);
                 break :blk .{ .completed = 0, .resume_pc = resume_pc };
             },
         };
@@ -5663,7 +5708,7 @@ pub const TraceState = struct {
         /// Zero-progress continuation deopt (its own guard, no completion), or the hop
         /// budget is spent after a linked loop-done: break the hop loop and fall to the
         /// penalty-neutral post-loop tail.
-        break_burst,
+        break_burst: ChargeKind,
     };
 
     /// 2.3c-2d: which native-entry site seeded the ledger being replayed. Governs the
@@ -6514,7 +6559,7 @@ pub const TraceState = struct {
                     if (sibling_succ == null) {
                         if (!is_last)
                             @panic("replayLedger: silent M1 terminal ramp deopt is not last");
-                        self.onSideExit(owner, 0);
+                        self.onSideExit(owner, 0, .entered);
                         resume_pc.* = m1.parent.anchor.pc;
                         return .{ .return_result = .{
                             .completed = linked_completed.*,
@@ -6526,7 +6571,7 @@ pub const TraceState = struct {
                     if (!(is_last and ends_link and e.reason == .prologue_fail and
                         e.exit == std.math.maxInt(u32) and e.outcome == .normal and row_local == 0))
                         @panic("replayLedger: silent M1 ramp prologue-fail violates terminal contract");
-                    self.onSideExit(owner, 0);
+                    self.onSideExit(owner, 0, .entry_refusal);
                     resume_pc.* = m1.parent.anchor.pc;
                     return .{ .return_result = .{
                         .completed = linked_completed.*,
@@ -6694,6 +6739,7 @@ pub const TraceState = struct {
                     // (`penalty.get(cont.anchor) == null` after a bridge row) and the
                     // bridged-successor test pins the `.loop`-ending successor shape.
                     self.accountTraceRun(owner, @max(local, 1));
+                    accountCandidateCharge(owner, .entered);
                     self.native_region_bridge_fused +|= 1;
                     applyEdgeCursorTransition(cursor, .region_bridge, owner, succ, edge.succ_anchor_pc, local, resume_pc);
                 },
@@ -6782,7 +6828,7 @@ pub const TraceState = struct {
                         @panic("replayLedger: fused loop-done has no exit PC");
                     // One more enclosing iteration committed natively. Account BEFORE
                     // the re-run bound (Q1/Q2: never early-return mid-ledger).
-                    self.accountLedgerRow(owner, if (local > 0) local else 1, std.math.maxInt(u32), region_consumed);
+                    self.accountLedgerRow(owner, if (local > 0) local else 1, std.math.maxInt(u32), region_consumed, .entered);
                     linked_completed.* += 1;
                     resume_pc.* = post_pc;
                     // A `.inner_call` seed's FIRST entry is its own loop-done — that
@@ -6821,7 +6867,7 @@ pub const TraceState = struct {
                             self.armLoopDoneLinkTo(owner, e.exit, post_pc, arm_target);
                         // The burst may re-run the still-armed continuation. The hop
                         // budget only declines THIS next re-run.
-                        if (hops.* >= max_hops) return .break_burst;
+                        if (hops.* >= max_hops) return .{ .break_burst = .entered };
                         // The directive EXECUTES the run target. Selection already
                         // proved P-G eligibility AND native runnability (§B4.7
                         // BLOCKER: an `.unsupported` candidate never reaches here),
@@ -6848,7 +6894,7 @@ pub const TraceState = struct {
                                 });
                             }
                         }
-                        return .break_burst;
+                        return .{ .break_burst = .entered };
                     }
                     // `I→C` fused (2.3c-2e): the next entry is the continuation reached
                     // via the loop-done→ordinary_entry arm. Validate the successor is a
@@ -6925,6 +6971,7 @@ pub const TraceState = struct {
                             // invisible to profitability. The SIBLING's own rows carry
                             // the work and the verdict.
                             self.accountTraceRun(owner, local);
+                            accountCandidateCharge(owner, .entered);
                             // The successor's `cum` continues the same counter, so the
                             // parent's iterations must leave the delta window here or
                             // the sibling's row re-counts them.
@@ -6957,7 +7004,7 @@ pub const TraceState = struct {
                         if (entries[k + 1].cum != e.cum)
                             @panic("replayLedger: fused M1 ramp committed its own iterations (cum advanced)");
                         self.native_source_link_fused +|= 1;
-                        self.accountLedgerRow(owner, local, e.exit, region_consumed);
+                        self.accountLedgerRow(owner, local, e.exit, region_consumed, .entered);
                         // Sub-case (b): the ramp deopted at an internal guard BEFORE its
                         // `.link` — terminal. Replay the old dispatcher steering
                         // `onSideExit(ramp, 0); resume owner.anchor.pc`. (`succ.cum ==
@@ -6983,7 +7030,7 @@ pub const TraceState = struct {
                             }
                             if (k + 2 != entries.len)
                                 @panic("replayLedger: fused M1 sub-case (b) ramp deopt is not the last entry");
-                            self.onSideExit(succ, 0);
+                            self.onSideExit(succ, 0, .entered);
                             return .{ .return_result = .{
                                 .completed = linked_completed.*,
                                 .resume_pc = owner.anchor.pc,
@@ -7010,7 +7057,7 @@ pub const TraceState = struct {
                                 @panic("replayLedger: fused M1 sub-case (c) entry violates the prologue-fail contract");
                             if (!(succ.instrs.len != 0 and succ.instrs[succ.instrs.len - 1].op == .link))
                                 @panic("replayLedger: fused M1 sub-case (c) ramp does not end in .link");
-                            self.onSideExit(succ, 0);
+                            self.onSideExit(succ, 0, .entry_refusal);
                             return .{ .return_result = .{
                                 .completed = linked_completed.*,
                                 .resume_pc = owner.anchor.pc,
@@ -7103,7 +7150,7 @@ pub const TraceState = struct {
                             @panic("replayLedger: bridged successor deopt on a non-body owner shape");
                         if (resume_pc.* != owner.anchor.pc)
                             @panic("replayLedger: bridged successor deopt resume mismatches its anchor");
-                        self.accountLedgerRow(owner, local, e.exit, region_consumed);
+                        self.accountLedgerRow(owner, local, e.exit, region_consumed, .entered);
                         return .{ .return_result = .{
                             .completed = linked_completed.* + local,
                             .resume_pc = resume_pc.*,
@@ -7112,13 +7159,13 @@ pub const TraceState = struct {
                     if (ends_link) {
                         // (a) continuation own guard — terminal.
                         if (local > 0) {
-                            self.accountLedgerRow(owner, local, e.exit, region_consumed);
+                            self.accountLedgerRow(owner, local, e.exit, region_consumed, .entered);
                             return .{ .return_result = .{
                                 .completed = linked_completed.* + local,
                                 .resume_pc = resume_pc.*,
                             } };
                         }
-                        return .break_burst;
+                        return .{ .break_burst = .entered };
                     }
                     if (!ends_loop)
                         @panic("replayLedger: .deopt owner is neither continuation nor inner root");
@@ -7131,7 +7178,7 @@ pub const TraceState = struct {
                     // whole inner loop).
                     if (isLoopDoneGuardIndex(owner, e.exit))
                         @panic("replayLedger: ordinary-mode inner loop-done in a linked fusion is unmodeled");
-                    self.accountLedgerRow(owner, local, e.exit, region_consumed);
+                    self.accountLedgerRow(owner, local, e.exit, region_consumed, .entered);
                     return .{ .return_result = .{
                         .completed = if (linked_completed.* > 0) linked_completed.* else local,
                         .resume_pc = cursor.link_pc,
@@ -7167,7 +7214,7 @@ pub const TraceState = struct {
                             @panic("replayLedger: bridged successor prologue-fail on a non-body owner shape");
                         if (resume_pc.* != owner.anchor.pc)
                             @panic("replayLedger: bridged successor prologue-fail resume mismatches its anchor");
-                        self.accountLedgerRow(owner, 0, std.math.maxInt(u32), region_consumed);
+                        self.accountLedgerRow(owner, 0, std.math.maxInt(u32), region_consumed, .entry_refusal);
                         return .{ .return_result = .{
                             .completed = linked_completed.*,
                             .resume_pc = resume_pc.*,
@@ -7177,14 +7224,14 @@ pub const TraceState = struct {
                         // Seed continuation prologue-fail (local == 0): nothing committed
                         // here → break the burst (matches old scalar `c_local == 0 →
                         // break_burst`).
-                        return .break_burst;
+                        return .{ .break_burst = .entry_refusal };
                     }
                     if (!ends_loop)
                         @panic("replayLedger: prologue_fail owner is neither continuation nor inner root");
                     // Inner prologue-fail (local == 0): matches the old `fdone == false`
                     // mid-loop path — record the zero-progress side exit and resume
                     // tier-0 at the inner header, carrying any earlier chain progress.
-                    self.accountLedgerRow(owner, 0, std.math.maxInt(u32), region_consumed);
+                    self.accountLedgerRow(owner, 0, std.math.maxInt(u32), region_consumed, .entry_refusal);
                     return .{ .return_result = .{
                         .completed = if (linked_completed.* > 0) linked_completed.* else 0,
                         .resume_pc = cursor.link_pc,
@@ -7367,6 +7414,7 @@ pub const TraceState = struct {
         var resume_pc: u32 = cursor.resume_pc;
         var fused_inner: ?irinterp.ExecResult = fused_inner_in;
         var hops: usize = cursor.hops;
+        var tail_charge_kind: ChargeKind = .entered;
         // 2c-E: a `.run_continuation` handover enters at call B on its FIRST hop
         // iteration (see `BurstCursor.start_at_continuation`). Consumed once.
         var start_call_b = cursor.start_at_continuation;
@@ -7503,7 +7551,10 @@ pub const TraceState = struct {
                                 continue :hop;
                             },
                             .return_result => |cr| return cr,
-                            .break_burst => break :hop,
+                            .break_burst => |charge_kind| {
+                                tail_charge_kind = charge_kind;
+                                break :hop;
+                            },
                         }
                     }
                     // 2c-E (call-A drain): `ledger_len > 1` means the inner FUSED forward
@@ -7551,7 +7602,10 @@ pub const TraceState = struct {
                                 continue :hop;
                             },
                             .return_result => |cr| return cr,
-                            .break_burst => break :hop,
+                            .break_burst => |charge_kind| {
+                                tail_charge_kind = charge_kind;
+                                break :hop;
+                            },
                         }
                     }
                     // The scalar/short-ledger path has no graph replay, but it is
@@ -7582,7 +7636,17 @@ pub const TraceState = struct {
                 {
                     return .{ .completed = linked_completed, .resume_pc = inner_pc };
                 }
-                if (iresult.exit_instr == std.math.maxInt(u32)) break;
+                if (iresult.exit_instr == std.math.maxInt(u32)) {
+                    self.onSideExitReceipt(
+                        inner,
+                        0,
+                        iresult.exit_instr,
+                        0,
+                        .deferred,
+                        if (iresult.exit_reason == .prologue_fail) .entry_refusal else .entered,
+                    );
+                    break;
+                }
                 // `iresult.completed` is the chain-cumulative counter (`rbx`), which a
                 // fused inner INHERITS from its parent — inflated. All inner-recording
                 // accounting must steer on the inner's OWN iteration count, so use
@@ -7609,13 +7673,13 @@ pub const TraceState = struct {
                     proto.code[guardSourcePc(inner_guard).?].op == .for_loop;
                 if (!loop_done) {
                     if (inner_local > 0) {
-                        self.onSideExitReceipt(inner, inner_local, iresult.exit_instr, 0, .deferred);
+                        self.onSideExitReceipt(inner, inner_local, iresult.exit_instr, 0, .deferred, .entered);
                         return .{
                             .completed = if (linked_completed > 0) linked_completed else inner_local,
                             .resume_pc = resume_pc,
                         };
                     }
-                    self.onSideExitReceipt(inner, 0, iresult.exit_instr, 0, .deferred);
+                    self.onSideExitReceipt(inner, 0, iresult.exit_instr, 0, .deferred, .entered);
                     break;
                 }
                 // Native committed the loop-done inside `runLinkedLoopDone`; the
@@ -7634,12 +7698,12 @@ pub const TraceState = struct {
                 // NOT at the inner header — so the inner loop is not re-run.
                 if (current_link.anchor.pc != inner_exit_pc) {
                     const cont = self.findLinkTrace(proto, inner_exit_pc) orelse {
-                        self.onSideExitReceipt(inner, if (inner_local > 0) inner_local else 1, iresult.exit_instr, 1, .deferred);
+                        self.onSideExitReceipt(inner, if (inner_local > 0) inner_local else 1, iresult.exit_instr, 1, .deferred, .entered);
                         return .{ .completed = linked_completed + 1, .resume_pc = inner_exit_pc };
                     };
                     if (tier == .native_only) {
                         snt = self.nativeFor(cont) orelse {
-                            self.onSideExitReceipt(inner, if (inner_local > 0) inner_local else 1, iresult.exit_instr, 1, .deferred);
+                            self.onSideExitReceipt(inner, if (inner_local > 0) inner_local else 1, iresult.exit_instr, 1, .deferred, .entered);
                             return .{ .completed = linked_completed + 1, .resume_pc = inner_exit_pc };
                         };
                     }
@@ -7651,7 +7715,7 @@ pub const TraceState = struct {
                 // exit completes exactly one enclosing-loop iteration — true even
                 // when it reports `completed == 0` (a one-trip inner loop). It is
                 // a successful hand-off, not a low-yield entry to penalize.
-                self.onSideExitReceipt(inner, if (inner_local > 0) inner_local else 1, iresult.exit_instr, 1, .{ .known_trace = current_link.id });
+                self.onSideExitReceipt(inner, if (inner_local > 0) inner_local else 1, iresult.exit_instr, 1, .{ .known_trace = current_link.id }, .entered);
                 linked_completed += 1;
 
                 // 2.3b-1: arm `current_link`'s `.link`-terminal slot → `inner`'s
@@ -7768,7 +7832,10 @@ pub const TraceState = struct {
                         },
                         .return_result => |cr| return cr,
                         // Hop budget / zero-progress deopt → penalty-neutral tail.
-                        .break_burst => break :hop,
+                        .break_burst => |charge_kind| {
+                            tail_charge_kind = charge_kind;
+                            break :hop;
+                        },
                     }
                 }
             } else {
@@ -7808,7 +7875,7 @@ pub const TraceState = struct {
                     continue;
                 }
                 if (cresult.completed > 0) {
-                    self.onSideExitReceipt(current_link, cresult.completed, cresult.exit_instr, cresult.completed, .deferred);
+                    self.onSideExitReceipt(current_link, cresult.completed, cresult.exit_instr, cresult.completed, .deferred, .entered);
                     return .{ .completed = linked_completed + cresult.completed, .resume_pc = resume_pc };
                 }
                 _ = self.accountRegionProfit(
@@ -7844,7 +7911,7 @@ pub const TraceState = struct {
             // tier-1a/native, so no mode records a different penalty here.
             return .{ .completed = linked_completed, .resume_pc = resume_pc };
         }
-        self.onSideExit(seed, 0);
+        self.onSideExit(seed, 0, tail_charge_kind);
         // A burst that committed nothing hasn't advanced `resume_pc` past its
         // initial inner-root PC, so this is the coherent resume target.
         return .{ .completed = 0, .resume_pc = resume_pc };
@@ -8198,10 +8265,10 @@ pub const TraceState = struct {
             .return_result => |cr| return cr,
             // The normal burst tail: penalty-neutral when the span committed,
             // one zero-progress charge on the seed otherwise.
-            .break_burst => {
+            .break_burst => |charge_kind| {
                 if (linked_completed > 0)
                     return .{ .completed = linked_completed, .resume_pc = resume_pc };
-                self.onSideExit(seed, 0);
+                self.onSideExit(seed, 0, charge_kind);
                 return .{ .completed = 0, .resume_pc = resume_pc };
             },
         }

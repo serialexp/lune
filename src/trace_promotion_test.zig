@@ -863,7 +863,8 @@ test "B-3b suffix preserves bridge materialization for child deopt and prologue 
     try testing.expectEqual(child.anchor.pc, prologue_result.resume_pc);
     try testing.expectEqual(child.anchor.pc, resume_pc_value);
     try testing.expectEqual(@as(u32, 1), state.region_profit.get(key).?.barren_run);
-    try testing.expectEqual(@as(u32, 1), state.penalty.get(child.anchor).?);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(child.anchor));
+    try testing.expectEqual(@as(u32, 1), child.consec_refusals);
     try testing.expectEqual(@as(u64, 2), state.silent_suffix_drains);
 }
 

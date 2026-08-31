@@ -818,3 +818,48 @@ test "doc 32: the spectral-norm shape — int-initialised array later written as
         \\print(s)
     , "150\n");
 }
+
+test "doc 33: alternating value and f64 lanes refuse a candidate without gating the anchor" {
+    const source: [:0]const u8 =
+        \\local value_lane = {}
+        \\local f64_lane = {}
+        \\for i = 1, 64 do
+        \\  value_lane[i] = i
+        \\  f64_lane[i] = i * 2.0
+        \\end
+        \\value_lane[1] = 0.5
+        \\local function lane_sum(a)
+        \\  local s = 0.0
+        \\  for i = 1, 64 do s = s + a[i] end
+        \\  return s
+        \\end
+        \\local x, y = 0.0, 0.0
+        \\for r = 1, 48 do
+        \\  x = lane_sum(value_lane)
+        \\  y = lane_sum(f64_lane)
+        \\end
+        \\print(x, y)
+    ;
+    const expected = "2079.5\t4160\n";
+
+    // Full ten-leg byte-equivalence matrix plus the helper's trace-recording
+    // proof, then a native leg where hoisted lane guards can actually refuse.
+    try expectRecordedProgram(source, expected);
+
+    const gpa = testing.allocator;
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var buf: [256]u8 = undefined;
+    var sink = io.Writer.fixed(&buf);
+    var chunk = try util.runNativeForTrace(&vm, gpa, source, &sink);
+    defer chunk.deinit();
+    try testing.expectEqualStrings(expected, sink.buffered());
+
+    var saw_lane_anchor = false;
+    for (vm.trace.cache.items) |t| {
+        if (!std.mem.eql(u8, t.anchor.proto.name, "lane_sum")) continue;
+        saw_lane_anchor = true;
+        try testing.expect(!vm.trace.isGated(t.anchor));
+    }
+    try testing.expect(saw_lane_anchor);
+}

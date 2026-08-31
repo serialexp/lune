@@ -2674,6 +2674,7 @@ pub const Vm = struct {
                     result.exit_instr,
                     if (linked_one_trip or trace.isLoopDoneGuardIndex(final, result.exit_instr)) 1 else local_done,
                     .deferred,
+                    .entered,
                 );
                 // Nested-loop linking (Phase 1): if this is an
                 // inner numeric-`for` running to completion (its
@@ -2836,7 +2837,14 @@ pub const Vm = struct {
             }
             // Zero iterations: apply the penalty, then try
             // the next trace at this anchor.
-            self.trace.onSideExitReceipt(final, 0, result.exit_instr, 0, .deferred);
+            self.trace.onSideExitReceipt(
+                final,
+                0,
+                result.exit_instr,
+                0,
+                .deferred,
+                if (result.exit_reason == .prologue_fail) .entry_refusal else .entered,
+            );
 
             // Widen-eviction: if this trace's array lane guard
             // can never pass again (the live array widened past

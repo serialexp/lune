@@ -53,7 +53,7 @@ test "A-vii-c split: regionless onSideExit keeps the legacy gate; bare accountTr
     // Feed exactly max_penalty low-yield events through both entry points.
     var i: u32 = 0;
     while (i < state.config.max_penalty) : (i += 1) {
-        state.onSideExit(&t_wrap, 0);
+        state.onSideExit(&t_wrap, 0, .entered);
         state.accountTraceRun(&t_bare, 0);
     }
     // The regionless wrapper gates exactly like the pre-flip machine; the bare
@@ -67,7 +67,7 @@ test "A-vii-c split: regionless onSideExit keeps the legacy gate; bare accountTr
 
     // A useful exit bumps hit_count through BOTH entry points, and clears the
     // wrapper anchor's penalty AND gate (legacy recovery semantics).
-    state.onSideExit(&t_wrap, state.config.min_useful);
+    state.onSideExit(&t_wrap, state.config.min_useful, .entered);
     state.accountTraceRun(&t_bare, state.config.min_useful);
     try testing.expectEqual(@as(u64, 1), t_wrap.hit_count);
     try testing.expectEqual(@as(u64, 1), t_bare.hit_count);
@@ -183,25 +183,25 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     // work, so the region window owns the verdict and the member anchor is untouched
     // even though the segment itself was low-yield.
     state.setRegionContext(1, 5);
-    state.onSideExitReceipt(&member, 0, 0, 1, .deferred);
+    state.onSideExitReceipt(&member, 0, 0, 1, .deferred, .entered);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(member.anchor));
     try testing.expectEqual(@as(u64, 1), state.region_profit.get(key).?.outer_traversals);
 
     // (5b) NOT consumed — same classified exit of the same live member, but zero
     // structural work. R2-1 keeps zero-work flushes silent, so if this did not fall
     // through to the legacy machine nothing would ever gate it: it must strike.
-    state.onSideExitReceipt(&member, 0, 0, 0, .deferred);
+    state.onSideExitReceipt(&member, 0, 0, 0, .deferred, .entered);
     try testing.expectEqual(@as(u32, 1), state.penalty.get(member.anchor).?);
 
     // (5c) NOT consumed — nonzero work, but exit 1 is absent from the edge cache,
     // so no accumulator receives it. Also a strike.
-    state.onSideExitReceipt(&member, 0, 1, 4, .deferred);
+    state.onSideExitReceipt(&member, 0, 1, 4, .deferred, .entered);
     try testing.expectEqual(@as(u32, 2), state.penalty.get(member.anchor).?);
 
     // (5d) An unconsumed USEFUL segment still recovers the anchor the legacy way,
     // and the selection half bumps hit_count on every useful receipt regardless of
     // which machine took the profitability verdict.
-    state.onSideExitReceipt(&member, state.config.min_useful, 1, 0, .deferred);
+    state.onSideExitReceipt(&member, state.config.min_useful, 1, 0, .deferred, .entered);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(member.anchor));
     try testing.expectEqual(@as(u64, 1), member.hit_count);
 
@@ -210,7 +210,7 @@ test "A-vii-c gate machine: N=8 windows qualify+clear the owner, sub-N remainder
     // to the legacy machine immediately, without waiting for a physical rebuild.
     state.region_defs.getPtr(rid).?.armable = false;
     state.setRegionContext(1, 5);
-    state.onSideExitReceipt(&member, 0, 0, 1, .deferred);
+    state.onSideExitReceipt(&member, 0, 0, 1, .deferred, .entered);
     try testing.expectEqual(@as(u32, 1), state.penalty.get(member.anchor).?);
 }
 
@@ -247,16 +247,16 @@ test "gate-fix consumption boundary: qualified activations own member barren rec
     state.setRegionContext(1, 7);
     _ = state.accountRegionProfit(.{ .trace_id = 9, .exit_instr = 0 }, 1, .deferred); // open, 1 traversal
     try testing.expect(!state.region_profit.get(key).?.useful_window_seen);
-    state.onSideExitReceipt(&member, 0, 0, 0, .deferred);
+    state.onSideExitReceipt(&member, 0, 0, 0, .deferred, .entered);
     try testing.expectEqual(@as(u32, 1), state.penalty.get(member.anchor).?);
 
     // (a') UNQUALIFIED: a synthetic zero charge on the member anchor strikes too.
-    state.onSideExit(&member, 0);
+    state.onSideExit(&member, 0, .entered);
     try testing.expectEqual(@as(u32, 2), state.penalty.get(member.anchor).?);
 
     // (b) Unclassified NONZERO-work member receipt (exit 1 absent from the edge
     // cache): credited to the LIVE accumulator instead of being dropped + struck.
-    state.onSideExitReceipt(&member, 0, 1, 3, .deferred);
+    state.onSideExitReceipt(&member, 0, 1, 3, .deferred, .entered);
     try testing.expectEqual(@as(u64, 4), state.region_profit.get(key).?.outer_traversals);
     try testing.expectEqual(@as(u32, 2), state.penalty.get(member.anchor).?); // no new strike
 
@@ -271,16 +271,16 @@ test "gate-fix consumption boundary: qualified activations own member barren rec
 
     // (d) QUALIFIED: classified zero-work member receipt is now CONSUMED — an
     // intra-complex transition priced by the window/close verdicts, not legacy.
-    state.onSideExitReceipt(&member, 0, 0, 0, .deferred);
+    state.onSideExitReceipt(&member, 0, 0, 0, .deferred, .entered);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(member.anchor)); // no strike
 
     // (d') QUALIFIED: unclassified zero-work member receipt likewise consumed.
-    state.onSideExitReceipt(&member, 0, 1, 0, .deferred);
+    state.onSideExitReceipt(&member, 0, 1, 0, .deferred, .entered);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(member.anchor));
 
     // (e) QUALIFIED: the synthetic steering charge (`onSideExit(member, 0)`) is
     // region-owned — no legacy strike, no legacy clear.
-    state.onSideExit(&member, 0);
+    state.onSideExit(&member, 0, .entered);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(member.anchor));
 
     // (e') Consumed barren receipts are COUNTED (codex BLOCKER 2): the streak so
@@ -289,17 +289,17 @@ test "gate-fix consumption boundary: qualified activations own member barren rec
     try testing.expectEqual(@as(u32, 3), state.region_profit.get(key).?.barren_run);
     const owner: AnchorKey = .{ .proto = &proto, .pc = 0 };
     var spins: u32 = 0;
-    while (spins < state.config.max_barren_run - 3) : (spins += 1) state.onSideExit(&member, 0);
+    while (spins < state.config.max_barren_run - 3) : (spins += 1) state.onSideExit(&member, 0, .entered);
     try testing.expectEqual(@as(u32, 0), state.region_profit.get(key).?.barren_run);
     try testing.expectEqual(@as(u32, 1), state.penalty.get(owner).?); // one decay strike on the OWNER
     // ...and credited work resets the streak AND (via a full window) the penalty.
-    state.onSideExitReceipt(&member, 0, 1, state.config.min_useful, .deferred);
+    state.onSideExitReceipt(&member, 0, 1, state.config.min_useful, .deferred, .entered);
     try testing.expectEqual(@as(u32, 0), state.region_profit.get(key).?.barren_run);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(owner));
 
     // (f) A trace anchored OUTSIDE the footprint stays legacy-gated even while
     // the qualified activation is live.
-    state.onSideExit(&nonmember, 0);
+    state.onSideExit(&nonmember, 0, .entered);
     try testing.expectEqual(@as(u32, 1), state.penalty.get(nonmember.anchor).?);
 
     // (g) Departure close still prices the remainder against the owner.
@@ -697,6 +697,122 @@ test "A-iv region_profit: same-activation owner collision flushes old before rep
 }
 
 // ---------------------------------------------------------------------------
+// Doc 33 — entry refusal is candidate evidence, not anchor thrash.
+// ---------------------------------------------------------------------------
+
+test "doc 33: entry refusals neither strike nor gate the anchor" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = [_]Instr{Instr.op0(.load_nil)};
+    const proto = Proto{ .code = &code, .name = "refusal", .num_registers = 1 };
+    var t: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+
+    var i: u32 = 0;
+    while (i < state.config.max_entry_refusals) : (i += 1)
+        state.onSideExit(&t, 0, .entry_refusal);
+
+    try testing.expectEqual(state.config.max_entry_refusals, t.consec_refusals);
+    try testing.expectEqual(@as(?u32, null), state.penalty.get(t.anchor));
+    try testing.expect(!state.isGated(t.anchor));
+}
+
+test "doc 33: an entry refusal does not clear an existing strike" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = [_]Instr{Instr.op0(.load_nil)};
+    const proto = Proto{ .code = &code, .name = "no-clear", .num_registers = 1 };
+    var t: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+
+    state.onSideExit(&t, 0, .entered);
+    state.onSideExit(&t, 0, .entered);
+    const before = state.penalty.get(t.anchor).?;
+    state.onSideExit(&t, 0, .entry_refusal);
+
+    try testing.expectEqual(@as(u32, 2), before);
+    try testing.expectEqual(before, state.penalty.get(t.anchor).?);
+    try testing.expectEqual(@as(u32, 1), t.consec_refusals);
+}
+
+test "doc 33: alternating deopts and refusals gate on deopts alone" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = [_]Instr{Instr.op0(.load_nil)};
+    const proto = Proto{ .code = &code, .name = "alternate", .num_registers = 1 };
+    var t: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+
+    var i: u32 = 0;
+    while (i < state.config.max_penalty) : (i += 1) {
+        state.onSideExit(&t, 0, .entered);
+        state.onSideExit(&t, 0, .entry_refusal);
+    }
+
+    try testing.expectEqual(state.config.max_penalty, state.penalty.get(t.anchor).?);
+    try testing.expect(state.isGated(t.anchor));
+}
+
+test "doc 33: max consecutive refusals suppress only that candidate" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = [_]Instr{Instr.op0(.load_nil)};
+    const proto = Proto{ .code = &code, .name = "suppress", .num_registers = 1 };
+    var refused: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .hit_count = 10 };
+    try state.cache.append(gpa, &refused);
+    defer state.cache.clearRetainingCapacity();
+
+    var i: u32 = 0;
+    while (i < state.config.max_entry_refusals) : (i += 1)
+        state.onSideExit(&refused, 0, .entry_refusal);
+
+    try testing.expect(refused.consec_refusals >= state.config.max_entry_refusals);
+    try testing.expectEqual(@as(?*Trace, null), state.findTrace(&proto, 0));
+    try testing.expect(!state.isGated(refused.anchor));
+}
+
+test "doc 33: a body entry resets the refusal streak" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = [_]Instr{Instr.op0(.load_nil)};
+    const proto = Proto{ .code = &code, .name = "reset", .num_registers = 1 };
+    var t: Trace = .{ .id = 1, .anchor = .{ .proto = &proto, .pc = 0 }, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{} };
+
+    var i: u32 = 0;
+    while (i < state.config.max_entry_refusals - 1) : (i += 1)
+        state.onSideExit(&t, 0, .entry_refusal);
+    state.onSideExit(&t, 0, .entered);
+
+    try testing.expectEqual(@as(u32, 0), t.consec_refusals);
+}
+
+test "doc 33: a suppressed candidate does not suppress its sibling" {
+    const gpa = testing.allocator;
+    var state = TraceState.init(gpa);
+    defer state.deinit();
+
+    var code = [_]Instr{Instr.op0(.load_nil)};
+    const proto = Proto{ .code = &code, .name = "siblings", .num_registers = 1 };
+    const anchor: AnchorKey = .{ .proto = &proto, .pc = 0 };
+    var refused: Trace = .{ .id = 1, .anchor = anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .hit_count = 100, .consec_refusals = state.config.max_entry_refusals };
+    var sibling: Trace = .{ .id = 2, .anchor = anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .hit_count = 1 };
+    try state.cache.append(gpa, &refused);
+    try state.cache.append(gpa, &sibling);
+    defer state.cache.clearRetainingCapacity();
+
+    try testing.expectEqual(&sibling, state.findTrace(&proto, 0).?);
+    try testing.expectEqual(&sibling, state.nextTraceExcluding(&proto, 0, &.{}).?);
+    try testing.expect(!state.isGated(anchor));
+}
+
+// ---------------------------------------------------------------------------
 // Doc 31 — record vs dispatch gate split (D1) + clear-on-productive (D2).
 // The unit half of the §6 matrix; the e2e ratchet regression lives in
 // interp_native_test.zig, the entry-patch interactions in
@@ -722,8 +838,8 @@ test "doc 31 D2: any productive receipt clears the strike; only consecutive zero
     // resets the strike, so this alternation runs forever without gating.
     var i: u32 = 0;
     while (i < state.config.max_penalty * 4) : (i += 1) {
-        state.onSideExit(&t, state.config.min_useful - 1); // productive, below min_useful
-        state.onSideExit(&t, 0); // designed-exit zero
+        state.onSideExit(&t, state.config.min_useful - 1, .entered); // productive, below min_useful
+        state.onSideExit(&t, 0, .entered); // designed-exit zero
         try testing.expect(!state.isGated(key));
         try testing.expect((state.penalty.get(key) orelse 0) <= 1);
     }
@@ -733,7 +849,7 @@ test "doc 31 D2: any productive receipt clears the strike; only consecutive zero
     // between (gc_stress-shaped anchors, corrupted iterator state) still
     // reach max_penalty and gate exactly as before.
     var j: u32 = 0;
-    while (j < state.config.max_penalty) : (j += 1) state.onSideExit(&t, 0);
+    while (j < state.config.max_penalty) : (j += 1) state.onSideExit(&t, 0, .entered);
     try testing.expect(state.isGated(key));
 
     // The clear is dispatch-only: pre-seed a record gate, then a single
@@ -741,7 +857,7 @@ test "doc 31 D2: any productive receipt clears the strike; only consecutive zero
     // gate but never the record gate — productive dispatch is not evidence
     // about recording.
     state.gateRecordAnchor(key, .record_abort);
-    state.onSideExit(&t, 1);
+    state.onSideExit(&t, 1, .entered);
     try testing.expectEqual(@as(?u32, null), state.penalty.get(key));
     try testing.expect(!state.isGated(key));
     try testing.expectEqual(@as(usize, 0), state.gate.count());
