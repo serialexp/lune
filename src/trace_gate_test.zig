@@ -756,7 +756,7 @@ test "doc 33: alternating deopts and refusals gate on deopts alone" {
     try testing.expect(state.isGated(t.anchor));
 }
 
-test "doc 33: max consecutive refusals suppress only that candidate" {
+test "doc 33: max consecutive refusals are tracked but do not suppress selection" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
@@ -771,8 +771,10 @@ test "doc 33: max consecutive refusals suppress only that candidate" {
     while (i < state.config.max_entry_refusals) : (i += 1)
         state.onSideExit(&refused, 0, .entry_refusal);
 
+    // The counter saturates but the trace remains selectable — suppression
+    // would deadlock (a skipped trace can never reset its counter).
     try testing.expect(refused.consec_refusals >= state.config.max_entry_refusals);
-    try testing.expectEqual(@as(?*Trace, null), state.findTrace(&proto, 0));
+    try testing.expectEqual(&refused, state.findTrace(&proto, 0).?);
     try testing.expect(!state.isGated(refused.anchor));
 }
 
@@ -793,7 +795,7 @@ test "doc 33: a body entry resets the refusal streak" {
     try testing.expectEqual(@as(u32, 0), t.consec_refusals);
 }
 
-test "doc 33: a suppressed candidate does not suppress its sibling" {
+test "doc 33: a maxed refusal counter does not suppress the candidate from selection" {
     const gpa = testing.allocator;
     var state = TraceState.init(gpa);
     defer state.deinit();
@@ -801,14 +803,18 @@ test "doc 33: a suppressed candidate does not suppress its sibling" {
     var code = [_]Instr{Instr.op0(.load_nil)};
     const proto = Proto{ .code = &code, .name = "siblings", .num_registers = 1 };
     const anchor: AnchorKey = .{ .proto = &proto, .pc = 0 };
+    // A trace with a maxed refusal counter is still selectable — suppression
+    // deadlocks (a skipped trace can never be entered, so the counter can
+    // never reset). The counter is observational, not a gate.
     var refused: Trace = .{ .id = 1, .anchor = anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .hit_count = 100, .consec_refusals = state.config.max_entry_refusals };
     var sibling: Trace = .{ .id = 2, .anchor = anchor, .instrs = &.{}, .consts = &.{}, .entry_slots = &.{}, .entry_guards = &.{}, .hit_count = 1 };
     try state.cache.append(gpa, &refused);
     try state.cache.append(gpa, &sibling);
     defer state.cache.clearRetainingCapacity();
 
-    try testing.expectEqual(&sibling, state.findTrace(&proto, 0).?);
-    try testing.expectEqual(&sibling, state.nextTraceExcluding(&proto, 0, &.{}).?);
+    // findTrace returns the highest-hit candidate; the maxed counter does not
+    // exclude it. Both candidates remain eligible, and the anchor is not gated.
+    try testing.expectEqual(&refused, state.findTrace(&proto, 0).?);
     try testing.expect(!state.isGated(anchor));
 }
 

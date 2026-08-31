@@ -3082,7 +3082,12 @@ pub const TraceState = struct {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
         for (self.cache.items) |t| {
-            if (t.consec_refusals >= self.config.max_entry_refusals) continue;
+            // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
+            // selection. Suppression deadlocks: a skipped trace can never be
+            // entered, so the counter can never reset. The refusal is already
+            // free (no anchor penalty), so the cost of a futile prologue
+            // attempt is one native call + ledger row per dispatch — bounded
+            // by the caller's own iteration count, not by the counter.
             if (t.anchor.proto == proto and t.anchor.pc == pc) {
                 if (best == null or t.hit_count > best_hits) {
                     best = t;
@@ -3116,7 +3121,12 @@ pub const TraceState = struct {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
         for (self.cache.items) |t| {
-            if (t.consec_refusals >= self.config.max_entry_refusals) continue;
+            // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
+            // selection. Suppression deadlocks: a skipped trace can never be
+            // entered, so the counter can never reset. The refusal is already
+            // free (no anchor penalty), so the cost of a futile prologue
+            // attempt is one native call + ledger row per dispatch — bounded
+            // by the caller's own iteration count, not by the counter.
             if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
             if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .loop) continue;
             if (best == null or t.hit_count > best_hits) {
@@ -3137,7 +3147,12 @@ pub const TraceState = struct {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
         for (self.cache.items) |t| {
-            if (t.consec_refusals >= self.config.max_entry_refusals) continue;
+            // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
+            // selection. Suppression deadlocks: a skipped trace can never be
+            // entered, so the counter can never reset. The refusal is already
+            // free (no anchor penalty), so the cost of a futile prologue
+            // attempt is one native call + ledger row per dispatch — bounded
+            // by the caller's own iteration count, not by the counter.
             if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
             if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .link) continue;
             // B-iv.3 (doc 22 §B.5): seeded continuations are selectable — the
@@ -3173,7 +3188,12 @@ pub const TraceState = struct {
         var buf: [8]*Trace = undefined;
         var n: usize = 0;
         for (self.cache.items) |t| {
-            if (t.consec_refusals >= self.config.max_entry_refusals) continue;
+            // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
+            // selection. Suppression deadlocks: a skipped trace can never be
+            // entered, so the counter can never reset. The refusal is already
+            // free (no anchor penalty), so the cost of a futile prologue
+            // attempt is one native call + ledger row per dispatch — bounded
+            // by the caller's own iteration count, not by the counter.
             if (t.anchor.proto != proto or t.anchor.pc != post_pc) continue;
             if (t.instrs.len == 0 or t.instrs[t.instrs.len - 1].op != .link) continue;
             var pos: usize = n;
@@ -3232,7 +3252,12 @@ pub const TraceState = struct {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
         outer: for (self.cache.items) |t| {
-            if (t.consec_refusals >= self.config.max_entry_refusals) continue;
+            // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
+            // selection. Suppression deadlocks: a skipped trace can never be
+            // entered, so the counter can never reset. The refusal is already
+            // free (no anchor penalty), so the cost of a futile prologue
+            // attempt is one native call + ledger row per dispatch — bounded
+            // by the caller's own iteration count, not by the counter.
             if (t.anchor.proto != proto or t.anchor.pc != pc) continue;
             for (visited) |v| {
                 if (v == t) continue :outer;
@@ -3967,7 +3992,12 @@ pub const TraceState = struct {
         var best: ?*Trace = null;
         var best_hits: u64 = 0;
         for (self.cache.items) |t| {
-            if (t.consec_refusals >= self.config.max_entry_refusals) continue;
+            // Doc 33 §3(b): consec_refusals is tracked but does NOT suppress
+            // selection. Suppression deadlocks: a skipped trace can never be
+            // entered, so the counter can never reset. The refusal is already
+            // free (no anchor penalty), so the cost of a futile prologue
+            // attempt is one native call + ledger row per dispatch — bounded
+            // by the caller's own iteration count, not by the counter.
             if (t.anchor.proto != bridge.successor.proto or t.anchor.pc != bridge.successor.pc)
                 continue;
             if (!self.traceInRegion(t.id, id)) continue;
