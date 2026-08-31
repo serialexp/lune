@@ -2,6 +2,21 @@
 
 Deferred items noted in passing (Rule #10) so they don't get lost.
 
+## `require` returns 1 value, Lua 5.4 returns 2
+
+Found while smoke-testing the `.mah`/`.lua` split (2026-08-31). Running the same
+`.lua` file under both:
+
+    mahina entry.lua  ->  lua-module
+    lua5.4 entry.lua  ->  lua-module	./luaonly.lua
+
+Lua 5.4's `require` returns the module **and** the loader data (the resolved
+path); mahina returns only the module. `searchPathCore` already computes and
+returns the path as `out[1]`, so the value exists — it is `require` that drops
+it. Under the extension contract just adopted (`.lua` = a Lua program, must run
+under stock Lua too) this is a real 5.4 incompatibility, not a nicety. Not fixed
+here to stay focused; it needs a check of whether anything depends on the arity.
+
 ## Doc 30 arc observations (noted 2026-08-29, c5)
 
 Four items surfaced while landing pattern/str2num recording; none belongs

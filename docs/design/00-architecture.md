@@ -769,6 +769,36 @@ replay fidelity:
   concurrency) cover lazy sequences, "do/wait/do" sequencing, and cooperative
   tasks — without stackful-coroutine footguns. See Non-goals + `02-determinism.md`.
 
+### Two source extensions, because the divergence is real
+
+The list above is why mahina owns a source extension rather than borrowing
+`.lua`. The extension is a claim about which language the file is written in:
+
+- **`.mah`** — a mahina program. mahina only.
+- **`.lua`** — a Lua program. Runs under `lua`/`luajit` *and* mahina, since Lua
+  is a subset of what mahina accepts.
+
+Note that two of the divergences above are **syntax**, not semantics. A semantic
+divergence means stock Lua runs the file and returns a different answer; a syntax
+addition means stock Lua fails to parse it at line 1. Once shape-freezing or type
+annotations land, calling such a file `.lua` is simply false — hence the split,
+introduced early while nothing needs migrating.
+
+The direction of the subset relation decides everything downstream:
+
+- `package.path` searches `./?.mah;./?/init.mah` before the `.lua` forms, so a
+  mahina module shadows a Lua one of the same name (`stdlib/package.zig`).
+  Consequence, and it is not free: the path searcher records a `file_read` effect
+  per *probe*, so a `.lua` module now costs two recorded misses before its hit.
+  That matches stock Lua, where every `package.path` template is a real `fopen`,
+  and the misses are deterministic and replay identically — but the effect-log
+  length for a `.lua`-module program changed, and `interp_modules_test.zig`
+  pins the new counts deliberately.
+- The LuaJIT parity benchmarks stay `.lua` **by definition** rather than by
+  grandfather clause, and `bench/run.py` refuses a `.mah` file that declares
+  `luajit=compatible`.
+- Any `.lua` file in this repo that stock Lua cannot parse is therefore a bug.
+
 ## Build order (rationale)
 
 Standard order would be interpreter → GC → JIT → … → debugger last. We **flip

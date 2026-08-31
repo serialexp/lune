@@ -49,8 +49,9 @@ const compileRun = util.compileRun;
 // `fs_source` + `file_read` effect (no new seam, no new effect kind): module
 // content is the only nondeterministic input, so `require` programs record/replay
 // byte-identically and snapshot like any other heap state. These tests inject an
-// in-memory `FakeFs` (the default `package.path` resolves to `./?.lua` etc.) and
-// prove: load+cache (read once), preload beats path, dotted-name→path mapping, the
+// in-memory `FakeFs` (the default `package.path` resolves to `./?.mah`, `./?.lua`
+// etc.) and prove: load+cache (read once), preload beats path, dotted-name→path
+// mapping, both source extensions resolving with `.mah` taking precedence, the
 // not-found message, an empty module defaulting to `true`, transitive require,
 // record→replay parity, and a user-replaced searcher closure.
 // ---------------------------------------------------------------------------
@@ -79,11 +80,16 @@ test "P3: require loads, caches, and reads the file exactly once" {
         \\print(a.v, a == b)
     );
     try testing.expectEqualStrings("99\ttrue\n", sink.buffered());
-    // The preload searcher returns a string (no read); the path searcher reads
-    // "./m.lua" once. The second `require` is served from `package.loaded` → still
-    // exactly one `file_read` effect.
-    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
-    try testing.expectEqual(EffectKind.file_read, vm.effect_log.items[0].kind);
+    // The preload searcher returns a string (no read). The path searcher walks
+    // `package.path` in order, and every probe is a recorded `file_read`: two
+    // misses (`./m.mah`, `./m/init.mah`) then the hit on `./m.lua` — three.
+    //
+    // Three, not six, is the actual assertion here: the second `require` is served
+    // from `package.loaded` and re-searches nothing. A caching regression would
+    // double this count rather than change it by one, which is why the number is
+    // still a sharp test of the property the name claims.
+    try testing.expectEqual(@as(usize, 3), vm.effect_log.items.len);
+    for (vm.effect_log.items) |e| try testing.expectEqual(EffectKind.file_read, e.kind);
 }
 
 test "P3: package.preload beats the path searcher and seeds package.loaded" {
@@ -120,6 +126,74 @@ test "P3: a dotted module name maps dots to the path separator" {
     try testing.expectEqualStrings("nested\n", sink.buffered());
 }
 
+test "P3: require resolves a `.mah` module" {
+    const gpa = testing.allocator;
+    var ffs = FakeFs{ .entries = &.{
+        .{ .path = "./m.mah", .content = "return 'from-mah'" },
+    } };
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    try requireRun(gpa, &vm, &ffs, &sink,
+        \\print(require("m"))
+    );
+    try testing.expectEqualStrings("from-mah\n", sink.buffered());
+}
+
+test "P3: `.mah` wins over `.lua` when a module exists as both" {
+    const gpa = testing.allocator;
+    // Same module name available under both extensions. mahina is running, so the
+    // mahina-specific file is the one that should load — a project can shadow a
+    // Lua module with a mahina one without renaming the Lua original away.
+    var ffs = FakeFs{ .entries = &.{
+        .{ .path = "./m.mah", .content = "return 'from-mah'" },
+        .{ .path = "./m.lua", .content = "return 'from-lua'" },
+    } };
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    try requireRun(gpa, &vm, &ffs, &sink,
+        \\print(require("m"))
+    );
+    try testing.expectEqualStrings("from-mah\n", sink.buffered());
+    // The `.lua` candidate is never even read: the search stops at the first hit.
+    try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+}
+
+test "P3: a `.lua` module still resolves when no `.mah` shadows it" {
+    const gpa = testing.allocator;
+    var ffs = FakeFs{ .entries = &.{
+        .{ .path = "./m.lua", .content = "return 'from-lua'" },
+    } };
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    try requireRun(gpa, &vm, &ffs, &sink,
+        \\print(require("m"))
+    );
+    try testing.expectEqualStrings("from-lua\n", sink.buffered());
+}
+
+test "P3: `.mah` and `.lua` init forms both resolve for a dotted name" {
+    const gpa = testing.allocator;
+    var ffs = FakeFs{ .entries = &.{
+        .{ .path = "./pkg/init.mah", .content = "return 'mah-init'" },
+        .{ .path = "./other/init.lua", .content = "return 'lua-init'" },
+    } };
+    var vm = try Vm.init(gpa);
+    defer vm.deinit();
+    var sink_buf: [64]u8 = undefined;
+    var sink = io.Writer.fixed(&sink_buf);
+    try requireRun(gpa, &vm, &ffs, &sink,
+        \\print(require("pkg"))
+        \\print(require("other"))
+    );
+    try testing.expectEqualStrings("mah-init\nlua-init\n", sink.buffered());
+}
+
 test "P3: require of a missing module raises the accumulated not-found message" {
     const gpa = testing.allocator;
     var ffs = FakeFs{ .entries = &.{} }; // empty FS
@@ -132,12 +206,15 @@ test "P3: require of a missing module raises the accumulated not-found message" 
         \\print(ok)
         \\print(e)
     );
-    // Every searcher contributes a line: preload's "no field", then the two path
-    // candidates from the default `package.path`.
+    // Every searcher contributes a line: preload's "no field", then the four path
+    // candidates from the default `package.path` — both `.mah` forms before both
+    // `.lua` forms, which is the search order itself, asserted end-to-end.
     try testing.expectEqualStrings(
         "false\n" ++
             "module 'ghost' not found:\n" ++
             "\tno field package.preload['ghost']\n" ++
+            "\tno file './ghost.mah'\n" ++
+            "\tno file './ghost/init.mah'\n" ++
             "\tno file './ghost.lua'\n" ++
             "\tno file './ghost/init.lua'\n",
         sink.buffered(),
@@ -197,8 +274,13 @@ test "P3: record→serialize→replay reproduces a require program with the FS d
         var sink = io.Writer.fixed(&rec_out_buf);
         try requireRun(gpa, &vm, &ffs, &sink, driver);
         try testing.expectEqualStrings("hi mahina\n", sink.buffered());
-        // One file_read (the path searcher found "./greeter.lua" on the first probe).
-        try testing.expectEqual(@as(usize, 1), vm.effect_log.items.len);
+        // Three file_reads. The path searcher probes `package.path` templates in
+        // order and every probe — hit or miss — is a recorded `file_read`, exactly
+        // as in stock Lua where each template costs a real `fopen`. So a `.lua`
+        // module costs two recorded misses (`./greeter.mah`, `./greeter/init.mah`)
+        // before the hit on `./greeter.lua`. The misses are part of the recording
+        // and must replay identically, which is what this test then proves.
+        try testing.expectEqual(@as(usize, 3), vm.effect_log.items.len);
         log_bytes = try effectser.encodeFile(gpa, vm.effect_log.items);
     }
     defer gpa.free(log_bytes);

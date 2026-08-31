@@ -380,8 +380,21 @@ fn require1(ctx: *anyopaque, args: []const Value) anyerror!Value {
 /// `package.config` — the constant layout string Lua exposes: dir separator, path
 /// separator, the `?` template mark, the `!` exec-dir mark, the `-` ignore mark.
 const config_string = "/\n;\n?\n!\n-\n";
-/// Default `package.path`: current dir `?.lua`, then `?/init.lua`.
-const default_path = "./?.lua;./?/init.lua";
+/// Default `package.path`. Both source extensions are searched, `.mah` first.
+///
+/// The extension is a claim about which *language* the file is written in, and
+/// therefore about who can run it:
+///
+///   * `.mah` — a mahina program. May use anything mahina offers (freezable
+///     shapes, optional type annotations, host-mediated suspension), so stock
+///     Lua cannot necessarily even parse it. mahina only.
+///   * `.lua` — a Lua program. Runs under `lua`/`luajit` *and* mahina, since Lua
+///     is a subset of what mahina accepts. The LuaJIT parity benchmarks are
+///     genuinely this, and stay `.lua` permanently rather than by grandfather.
+///
+/// `.mah` is searched first so a project can shadow a Lua module with a mahina
+/// one: you are running the mahina binary, so the mahina-specific file wins.
+const default_path = "./?.mah;./?/init.mah;./?.lua;./?/init.lua";
 
 /// The two built-in searchers, as `manual` registry entries: present in
 /// `base_natives` for keyframe restore by name, but never installed at a global/

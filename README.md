@@ -27,6 +27,31 @@ Lua-family languages is one too many.
   patching, and cross-frame tracing. The design docs under `docs/design/`
   (start at `00-architecture.md`) document each mechanism.
 
+## Source extensions: `.mah` and `.lua`
+
+The extension states which *language* the file is written in, and therefore who
+can run it. This is a real distinction, not decoration:
+
+| ext | the file is | runs under |
+|---|---|---|
+| `.mah` | a **mahina** program | mahina only |
+| `.lua` | a **Lua** program | `lua`, `luajit`, **and** mahina |
+
+Lua is a subset of what mahina accepts, so mahina runs both and `package.path`
+searches `./?.mah` and `./?/init.mah` before the `.lua` forms — you are running
+the mahina binary, so a mahina-specific module shadows a Lua one of the same
+name. Stock Lua, of course, only reads `.lua`.
+
+The asymmetry is the point. Several planned divergences (freezable shapes,
+optional type annotations) are *syntax*, so a file using them does not merely
+behave differently under `lua` — it fails to parse. Calling such a file `.lua`
+would be false. Equally, the LuaJIT parity benchmarks under `bench/` are
+genuinely Lua programs and stay `.lua` permanently, which is why `bench/run.py`
+rejects a `.mah` file that claims `luajit=compatible`.
+
+Today every program in the tree is still valid Lua, so nothing is `.mah` yet.
+Files move over as they start using mahina-only features.
+
 ## Performance
 
 Ongoing campaign: every benchmark ≤1.2× LuaJIT. Current board (2026-08-27,

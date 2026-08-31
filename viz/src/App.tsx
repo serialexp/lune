@@ -81,7 +81,7 @@ export default function App() {
             <button
               type="button"
               class="secondary"
-              title="Load a local .lua/.mahina source file into the editor (e.g. a benchmark like nsieve)"
+              title="Load a local .mah/.lua source file into the editor (e.g. a benchmark like nsieve)"
               onClick={() => sourceInputRef?.click()}
             >
               Open source…
@@ -89,7 +89,7 @@ export default function App() {
             <input
               ref={sourceInputRef}
               type="file"
-              accept=".lua,.mahina,.luau,.txt,text/plain"
+              accept=".mah,.lua,.luau,.txt,text/plain"
               style={{ display: "none" }}
               onChange={(e) => {
                 const file = e.currentTarget.files?.[0];

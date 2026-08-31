@@ -85,8 +85,15 @@ class Bench:
 
 
 def discover(filter_sub, scale):
+    # Both source extensions are discovered. A `.lua` benchmark is a Lua program
+    # and may therefore claim `luajit=compatible`; a `.mah` benchmark is a mahina
+    # program that stock Lua cannot necessarily parse, so it can never claim
+    # parity — `check_parity_marker` below enforces that rather than trusting it.
+    paths = []
+    for ext in ("mah", "lua"):
+        paths += glob.glob(os.path.join(ROOT, "bench", "**", f"*.{ext}"), recursive=True)
     benches = []
-    for path in sorted(glob.glob(os.path.join(ROOT, "bench", "**", "*.lua"), recursive=True)):
+    for path in sorted(paths):
         with open(path, "r") as fh:
             text = fh.read()
         m = META_RE.search(text)
@@ -104,7 +111,19 @@ def discover(filter_sub, scale):
         lj_src = kv.get("luajit_src")
         if lj_src:
             lj_src = os.path.normpath(os.path.join(os.path.dirname(path), lj_src))
-        benches.append(Bench(path, name, argv, kv.get("luajit", "skip"), lj_src))
+        luajit = kv.get("luajit", "skip")
+        # A `.mah` file is a mahina program by definition, so it cannot be a
+        # LuaJIT parity probe — stock Lua may not even parse it. Catching this
+        # here turns "someone renamed a parity benchmark to .mah" into a loud
+        # discovery-time failure instead of a mysterious cross-engine DIFF.
+        if path.endswith(".mah") and luajit == "compatible":
+            sys.exit(
+                f"{path}: a .mah benchmark cannot declare luajit=compatible.\n"
+                "  .lua = a Lua program (runs under lua/luajit and mahina)\n"
+                "  .mah = a mahina program (mahina only)\n"
+                "  Either rename it to .lua, or drop the parity claim."
+            )
+        benches.append(Bench(path, name, argv, luajit, lj_src))
     return benches
 
 
