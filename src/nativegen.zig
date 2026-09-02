@@ -1545,6 +1545,31 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (r >= i) return false; // not linear SSA → malformed
                 if (t.instrs[r].op == .slot_load) float_guarded[r] = true;
             },
+            // doc 34: guard_fits on a narrow lane implies the scalar type.
+            // `laneFits(.f64, v)` ⟹ `v.isFloat()`; `laneFits(.iN, v)` ⟹
+            // `v.isInt()`. This is load-bearing for `.link` continuation
+            // traces that store a `slot_load` value into a narrow-lane
+            // array — the recorder emits `guard_fits` (not `guard_float`)
+            // for narrow-lane stores, so without this arm the `slot_load`
+            // is unguarded and `proveKinds` rejects the whole trace.
+            .guard_fits => {
+                const r = ins.a;
+                if (r >= i) return false; // not linear SSA → malformed
+                if (t.instrs[r].op == .slot_load) {
+                    const lk = laneKind(ins.aux) orelse continue; // .value → skip (no type implied)
+                    switch (lk) {
+                        .int => {
+                            guarded[r] = true;
+                        },
+                        .float => {
+                            float_guarded[r] = true;
+                        },
+                        // bool: no bool_guarded array exists; Pass B's
+                        // guard_fits arm handles it.
+                        else => {},
+                    }
+                }
+            },
             .guard_table => {
                 const r = ins.a;
                 if (r >= i) return false; // not linear SSA → malformed
@@ -3257,11 +3282,29 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
                 // and reinterpret an int/float payload as a `*GcHeader` → type
                 // confusion; only a boxable scalar may be carried.
                 if (lk != .int and lk != .float) return error.Bail;
-                // [RV-3] type-stability: the store class must match the load class. A slot
-                // loaded int but stored float (or vice versa) would pass our once-hoisted
-                // prologue guard forever while the oracle re-checks every iteration and
-                // deopts — and the home's register class (GP vs XMM) would be wrong. Bail.
-                if (sk != lk) return error.Bail;
+                // [RV-3] type-stability: the store class must match the load class in a
+                // `.loop` trace. A slot loaded int but stored float (or vice versa)
+                // would pass the once-hoisted prologue guard forever while the oracle
+                // re-checks every iteration and deopts — and the home's register class
+                // (GP vs XMM) would be wrong.
+                //
+                // doc 34: `.link` traces are exempt. Their phis write to `regs[]` and
+                // then control transfers to a DIFFERENT trace (the link target) with
+                // its own prologue and guards. The type of the phi writeback is
+                // re-checked by the receiving trace's prologue, so type instability
+                // between load and store is safe — the link trace never loops back
+                // into its own body. The deopt flush re-boxes the value with whatever
+                // tag it actually has, which is correct. The slot's home class follows
+                // the LOAD type (the prologue pin). The `.link` terminal flush
+                // (below) tags the store value with its own kind, not the slot's.
+                if (sk != lk) {
+                    if (t.instrs[n - 1].op == .link and isNumKind(lk) and isNumKind(sk)) {
+                        // Accept: the slot homes as the load class; the φ writeback
+                        // converts at the back-edge.
+                    } else {
+                        return error.Bail;
+                    }
+                }
                 s.kind = lk;
             }
         } else if (loaded) {
@@ -3735,6 +3778,11 @@ fn analyzeInner(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, sl
             // scratch XMM before writing its home, so there is no in-place win to
             // capture. Skip — the back-edge shuffle handles the float carry.
             if (s.kind == .float) continue;
+            // doc 34: a type-unstable carried slot (`.link` exemption) homes as the
+            // load kind, but its phi store_ref may be a different numeric kind.
+            // Coalescing a float-kind store_ref into an int-kind GP home → unreachable
+            // in the float lowering. Skip coalescing entirely for type-unstable slots.
+            if (kinds[@intCast(s.store_ref)] != s.kind) continue;
             const j: usize = @intCast(s.store_ref);
             const def = t.instrs[j];
             if (!isCoalescibleOp(def.op)) continue;
@@ -6874,9 +6922,16 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
                 // back-edge. Flush every slot-bound φ snapshot directly into regs[]
                 // so the linked inner root sees exactly the same entry state as the
                 // tier-1a `.link` arm's `flushPhiWriteback`.
+                //
+                // doc 34: use the STORE value's kind for the tag, not the slot's load
+                // kind. In a `.link` trace, a carried slot may be type-unstable
+                // (loaded float, stored int — e.g. spectral-norm's `a` accumulator
+                // resets to int 0). The receiving trace's prologue re-checks the type,
+                // so flushing with the true store type is correct.
                 for (alloc.slots) |s| {
                     if (s.store_ref < 0) continue;
-                    try flushSlot(a, @as(i32, s.slot), s.kind, placeOfRef(alloc, @intCast(s.store_ref)));
+                    const flush_kind = kinds[@intCast(s.store_ref)];
+                    try flushSlot(a, @as(i32, s.slot), flush_kind, placeOfRef(alloc, @intCast(s.store_ref)));
                 }
                 try a.movMemReg(.rdx, @offsetOf(NativeResult, "completed"), .rbx);
                 try a.movMemImm32(.rdx, @offsetOf(NativeResult, "exit_instr"), @intCast(i));
