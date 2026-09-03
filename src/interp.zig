@@ -987,6 +987,18 @@ pub const Vm = struct {
                     if (cell_bits == 0) native_eligible.* = false;
                     break :blk Value{ .tag = .int, .payload = .{ .bits = cell_bits } };
                 },
+                // Doc 36: resolve a callee's upvalue by reading the callee closure
+                // from its slab slot (already seeded earlier in this loop — ordering
+                // guaranteed by append order) and then resolving its upvalue.
+                // Defensive: the callee slot might hold a non-function between entries
+                // (guard_func fires AFTER seeding). Seed nil and let the guard deopt.
+                .callee_upvalue => blk: {
+                    const callee_val = self.regGet(base + seed.callee_slot);
+                    if (!callee_val.isHeap() or callee_val.heapType() != .function) break :blk Value.nil();
+                    const callee_cl = function.Closure.fromHeader(callee_val.asHeap());
+                    if (seed.source >= callee_cl.upvalues.len) break :blk Value.nil();
+                    break :blk self.upvalGet(callee_cl.upvalues[seed.source]);
+                },
             };
             self.regSet(base + seed.slot, v);
         }
@@ -1052,6 +1064,15 @@ pub const Vm = struct {
                     }
                     if (cell_bits == 0) ok = false;
                     break :blk Value{ .tag = .int, .payload = .{ .bits = cell_bits } };
+                },
+                // Doc 36: same as seedTraceInputs's callee_upvalue arm.
+                // Defensive: seed nil if the callee changed; guard_func deopts.
+                .callee_upvalue => blk: {
+                    const callee_val = self.regGet(ctx.base + seed.callee_slot);
+                    if (!callee_val.isHeap() or callee_val.heapType() != .function) break :blk Value.nil();
+                    const callee_cl = function.Closure.fromHeader(callee_val.asHeap());
+                    if (seed.source >= callee_cl.upvalues.len) break :blk Value.nil();
+                    break :blk self.upvalGet(callee_cl.upvalues[seed.source]);
                 },
             };
             self.regSet(ctx.base + seed.slot, v);

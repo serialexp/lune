@@ -1095,17 +1095,23 @@ pub const EntryGuard = struct { slot: u16, ty: EntryGuardType };
 /// `(table,key)` operands each iteration (so H0's IR and exec-log behaviour are
 /// frozen). Re-resolved every entry via `Table.fieldPtr`, so — like every seed — no
 /// pointer is ever serialized.
-pub const InputKind = enum(u8) { upvalue, global, hash_cell };
+pub const InputKind = enum(u8) { upvalue, global, hash_cell, callee_upvalue };
 
 /// One synthetic entry input the dispatch loop resolves and writes into the slab
 /// before trace entry. For `upvalue`/`global`: `source` is the upvalue index
 /// (`closure.upvalues[source]`) or the global key's constant-pool index
 /// (`proto.constants[source]`); `slot` is the synthetic frame-relative slab slot
 /// (== the seeding `slot_load`'s `aux`), always `>= anchor_num_registers`. For
-/// `hash_cell` (H1): `source` is the **key**'s constant-pool index, `table_reg` is
-/// the anchor slot holding the table value, and `expected_count` is the recorded
-/// `hash.count()` (the `guard_hash` aux) the seed re-checks for native eligibility.
-/// Runtime-only — not serialized (precedent: `entry_guards`).
+/// `callee_upvalue` (doc 36): `source` is the upvalue index in the *inlined
+/// callee's* closure, and `callee_slot` is the anchor-slab slot where that
+/// callee's closure lives at entry time — the seed resolves through
+/// `Closure.fromHeader(regGet(base + callee_slot)).upvalues[source]`. The
+/// callee's own seed (kind=`upvalue` or a regular `slot_load`) is always
+/// earlier in the seed array, so `callee_slot` is populated before this seed
+/// runs. For `hash_cell` (H1): `source` is the **key**'s constant-pool index,
+/// `table_reg` is the anchor slot holding the table value, and `expected_count`
+/// is the recorded `hash.count()` (the `guard_hash` aux) the seed re-checks for
+/// native eligibility. Runtime-only — not serialized (precedent: `entry_guards`).
 pub const InputSeed = struct {
     kind: InputKind,
     source: u32,
@@ -1116,6 +1122,11 @@ pub const InputSeed = struct {
     /// native analogue of the oracle's per-iteration `guard_hash` count check), else
     /// the entry declines native and runs tier-1a (which side-exits at `guard_hash`).
     expected_count: u32 = 0,
+    /// `callee_upvalue` only (doc 36): anchor-slab slot where the inlined callee's
+    /// closure lives at entry time. The callee was already seeded (as an `upvalue`
+    /// or regular `slot_load` input) before this seed, so `regGet(base +
+    /// callee_slot)` is valid by the time this seed runs.
+    callee_slot: u16 = 0,
 };
 
 /// Doc 22 §B.1: the per-VM native seeding context. A seeded trace's entry
@@ -14998,16 +15009,23 @@ pub const TraceState = struct {
     /// or a downstream type guard); a `set_upval`/`set_global` *inside* the traced
     /// region is not in the record switch, so it aborts — the snapshot can never go
     /// stale mid-run.
+    ///
+    /// Doc 36: upvalue reads inside inlined callees (inline_depth > 0) create a
+    /// `callee_upvalue` seed that resolves through the callee's closure at entry.
+    /// The callee's closure is in a slab slot that was itself seeded earlier (as an
+    /// anchor-frame `upvalue`/`global` or regular `slot_load` input), so seed
+    /// ordering is correct by construction. Global reads at inline_depth > 0 still
+    /// abort — globals use proto-specific constant pool indices.
     fn recInputGet(self: *TraceState, comptime kind: InputKind, dest: u16, source: u16, resolved: Value) !void {
-        // U0 seeds only *anchor-frame* reads: the dispatch loop resolves the
-        // snapshot against the anchor frame's closure/proto at entry, so an
-        // upvalue/global read inside an inlined callee (whose indices refer to a
-        // different closure/proto) cannot be seeded — abort, tier-0 owns the loop.
-        // This is also the doc-10 tripwire: the day an inlined callee's *own* body
-        // reads an upvalue, `guard_func` must tighten from `Proto.id` to the
-        // closure's `GcHeader.id` (two closures over one proto stop being
-        // trace-identical once their captured upvalues are read).
-        if (self.rec.inline_depth != 0) return self.abort(.cross_frame);
+        // Doc 36: upvalue reads inside inlined callees resolve through the callee's
+        // closure. Global reads at depth > 0 still abort: the seed uses the
+        // anchor's proto.constants, but the global's constant-pool index refers to
+        // the callee's proto — a different key set.
+        if (self.rec.inline_depth != 0) {
+            if (kind == .global) return self.abort(.cross_frame);
+            // kind == .upvalue at inline_depth > 0 → callee_upvalue seed.
+            return self.recCalleeUpval(dest, source, resolved);
+        }
 
         const key = (@as(u64, @intFromEnum(kind)) << 32) | source;
         if (self.rec.input_dedup.get(key)) |ref| {
@@ -15045,6 +15063,67 @@ pub const TraceState = struct {
             const cl = function.Closure.fromHeader(resolved.asHeap());
             // Operand is the destination register `dest` (H-1c: `(callee_identity, dest)`),
             // which `recInputGet` receives as `instr.a` of the get_upval/get_global.
+            self.stampProv(try self.emit(.{ .op = .guard_func, .a = ref, .aux = @bitCast(cl.proto.id) }), .callee_identity, .a, .neutral);
+        }
+        self.setReg(dest, ref);
+    }
+
+    /// Doc 36: record a `get_upval` inside an inlined callee. The callee's closure
+    /// must be reachable as a `slot_load` in the anchor slab (i.e. the callee was
+    /// loaded from an upvalue/global/local of the anchor frame). If the callee was
+    /// computed on-trace (not a `slot_load`), we abort — on-trace closure creation
+    /// is future work (doc 24).
+    ///
+    /// The seed resolves at entry by reading the callee closure from its slab slot
+    /// and then resolving `closure.upvalues[source]` through `upvalGet`. The
+    /// callee's own seed was appended earlier (when the anchor-frame `get_upval`
+    /// that loaded the callee ran), so seed ordering is correct by construction.
+    fn recCalleeUpval(self: *TraceState, dest: u16, source: u16, resolved: Value) !void {
+        // Find the callee's closure ref. The callee was at register `ret_dest` in
+        // frame `inline_depth - 1` (ret_dest = instr.a of the .call that opened
+        // this inline frame — Lua convention: reg A holds the callee).
+        const d = self.rec.inline_depth - 1;
+        const callee_anchor_reg: usize = @as(usize, self.rec.frames[d].base_off) + self.rec.frames[d].ret_dest;
+        if (callee_anchor_reg >= self.rec.reg_map.len) return self.abort(.cross_frame);
+        const callee_entry = self.rec.reg_map[callee_anchor_reg];
+        if (callee_entry.state == .undef) return self.abort(.cross_frame);
+        const callee_ref = callee_entry.ref;
+
+        // The callee ref must be a `slot_load` — that means the callee's closure
+        // is in a known slab slot at entry time. A computed callee (aload, hload,
+        // etc.) can't be re-resolved at entry, so we abort.
+        const callee_ir = self.rec.instrs.items[callee_ref];
+        if (callee_ir.op != .slot_load) return self.abort(.cross_frame);
+        const callee_slot: u16 = @intCast(callee_ir.aux);
+
+        // Dedup: (callee_upvalue << 32) | (callee_slot << 16) | source.
+        // Two different inlined callees might both read upvalue index 0, so the
+        // key must incorporate which callee.
+        const key = (@as(u64, @intFromEnum(InputKind.callee_upvalue)) << 32) |
+            (@as(u64, callee_slot) << 16) | source;
+        if (self.rec.input_dedup.get(key)) |ref| {
+            self.setReg(dest, ref);
+            return;
+        }
+
+        if (self.rec.input_seeds.items.len >= MAX_TRACE_INPUTS) return self.abort(.input_cap);
+        if (self.rec.next_input_slot == std.math.maxInt(u16)) return self.abort(.input_cap);
+
+        const slot = self.rec.next_input_slot;
+        self.rec.next_input_slot += 1;
+        const ref = try self.emit(.{ .op = .slot_load, .aux = @intCast(slot), .ty = .unknown });
+        try self.rec.entry_slots.append(self.gpa, slot);
+        try self.rec.input_seeds.append(self.gpa, .{
+            .kind = .callee_upvalue,
+            .source = source,
+            .slot = slot,
+            .callee_slot = callee_slot,
+        });
+        try self.rec.input_dedup.put(self.gpa, key, ref);
+
+        // Pin a function callee's identity (same as the anchor-frame path).
+        if (resolved.isHeap() and resolved.heapType() == .function) {
+            const cl = function.Closure.fromHeader(resolved.asHeap());
             self.stampProv(try self.emit(.{ .op = .guard_func, .a = ref, .aux = @bitCast(cl.proto.id) }), .callee_identity, .a, .neutral);
         }
         self.setReg(dest, ref);

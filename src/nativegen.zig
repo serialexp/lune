@@ -2835,7 +2835,7 @@ fn computeSeedPlan(
     var plan = SeedPlan{};
     for (t.inputs, 0..) |seed, i| {
         switch (seed.kind) {
-            .upvalue, .global => plan.activate(i),
+            .upvalue, .global, .callee_upvalue => plan.activate(i),
             .hash_cell => {
                 for (t.instrs) |ins| {
                     if (ins.op != .href) continue;
