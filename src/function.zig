@@ -246,6 +246,13 @@ pub const RecordedBuiltin = enum(u8) {
     /// §6): shim-verified pattern identity + B03 state layout, deferred
     /// `sgm_setpos` cursor commit.
     gmatch_iter = 22,
+    // -- doc 35: pure math rounding builtins (float→int).
+    /// `math.floor(x)` — `ffloor`: Lua 5.4 semantics, returns an integer.
+    /// Integer arguments short-circuit (the recorder emits no op); float
+    /// arguments emit the `ffloor` IR op with `.ty = .int`.
+    floor = 23,
+    /// `math.ceil(x)` — `fceil`: same contract as `floor`, opposite direction.
+    ceil = 24,
 };
 
 /// Which **nondeterministic input** a native represents, if any. A native with a

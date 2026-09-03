@@ -138,7 +138,7 @@ fn detectDeadCarries(
             .int_of_float,
             .guard_func,
             .hload, .guard_hash,
-            .guard_builtin, .fsqrt, .fsin, .fcos,
+            .guard_builtin, .fsqrt, .fsin, .fcos, .ffloor, .fceil,
             .tostr_int, .tostr_num, .slen, .guard_string, .srev, .schar1,
             .supper, .slower,
             // Grid-cell ops reading only `a` (doc 14): the cell load and the
@@ -286,7 +286,7 @@ fn allConsumersInSet(instrs: []const IrInstr, idx: usize, dead_set: *const std.A
             .int_of_float,
             .guard_func,
             .hload, .guard_hash,
-            .guard_builtin, .fsqrt, .fsin, .fcos,
+            .guard_builtin, .fsqrt, .fsin, .fcos, .ffloor, .fceil,
             .tostr_int, .tostr_num, .slen, .guard_string, .srev, .schar1,
             .supper, .slower,
             .gload, .guard_grid, .guard_stride, .guard_gpresent,

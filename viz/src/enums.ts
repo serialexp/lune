@@ -100,6 +100,8 @@ export const IR_OP_NAMES = [
   "str2num_f", // 78  tonumber(string), float direction — a=s
   "sgm_setpos", // 79  deferred gmatch cursor commit — a=state, b=new pos
   "guard_sid", // 80  interned-identity pin — a=string ref, aux=expected konst id (imm)
+  "ffloor", // 81  math.floor — float→int via shared fmath kernel (doc 35)
+  "fceil", // 82  math.ceil — float→int via shared fmath kernel (doc 35)
 ] as const;
 
 export type IrOpName = (typeof IR_OP_NAMES)[number];
@@ -166,6 +168,8 @@ export const UNARY_OR_GUARD_OPS: ReadonlySet<IrOpName> = new Set([
   "fsqrt",
   "fsin",
   "fcos",
+  "ffloor",
+  "fceil",
   "alen",
   "tostr_int",
   "tostr_num",

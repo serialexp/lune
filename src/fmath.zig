@@ -53,3 +53,27 @@ pub noinline fn sinRuntime(x: f64) callconv(.c) f64 {
 pub noinline fn cosRuntime(x: f64) callconv(.c) f64 {
     return @cos(x);
 }
+
+/// `math.floor` kernel (doc 35). Returns the floor as i64, or `minInt(i64)`
+/// as a sentinel on NaN / inf / out-of-range (the caller side-exits on
+/// that sentinel). All three tiers call this body, so bit-identity holds
+/// by construction.
+pub noinline fn floorRuntime(x: f64) callconv(.c) i64 {
+    return floatToInt(@floor(x));
+}
+
+/// `math.ceil` kernel (doc 35). Same contract as `floorRuntime`.
+pub noinline fn ceilRuntime(x: f64) callconv(.c) i64 {
+    return floatToInt(@ceil(x));
+}
+
+/// Shared float→i64 conversion with out-of-range sentinel. Mirrors
+/// `stdlib/math.zig:floatToIntValue` but returns a sentinel instead of
+/// an error, so the native callout can branch on it.
+pub const FLOOR_CEIL_SENTINEL: i64 = std.math.minInt(i64);
+
+fn floatToInt(f: f64) i64 {
+    const two_pow_63 = 9223372036854775808.0; // 2^63, exact in f64
+    if (!std.math.isFinite(f) or f >= two_pow_63 or f < -two_pow_63) return FLOOR_CEIL_SENTINEL;
+    return @intFromFloat(f);
+}

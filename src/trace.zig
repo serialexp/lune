@@ -633,6 +633,17 @@ pub const IrOp = enum(u8) {
     /// `guardKeyAux` (round-2 M01). NOT in `guardExitPc` /
     /// `isSideExitGuardOp` (aux is a konst id, not a PC). Wire ordinal 80.
     guard_sid,
+
+    // -- doc 35: rounding builtins (float→int).
+
+    /// `math.floor(x)`: `@floor` + convert to `i64`. Operand: a proven
+    /// numeric ref (float or int — an int operand is promoted to float).
+    /// Result type: `.int`. Side-exits on out-of-range / NaN / inf (tier-0
+    /// replays and raises TypeError). Wire ordinal 81.
+    ffloor,
+    /// `math.ceil(x)`: `@ceil` + convert to `i64`. Same contract as `ffloor`.
+    /// Wire ordinal 82.
+    fceil,
 };
 
 /// Sentinel `phi.aux` for an *internal* φ (strength-reduction accumulator) that
@@ -12099,8 +12110,8 @@ pub const TraceState = struct {
                 .int_of_float => std.debug.assert(ins.a < i),
                 // `alen` reads its sole table operand `a` (a prior node).
                 .alen => std.debug.assert(ins.a < i),
-                // `fsin`/`fcos` read their sole float operand `a` (a prior node).
-                .fsin, .fcos => std.debug.assert(ins.a < i),
+                // `fsin`/`fcos`/`ffloor`/`fceil` read their sole numeric operand `a` (a prior node).
+                .fsin, .fcos, .ffloor, .fceil => std.debug.assert(ins.a < i),
                 // Doc 24 D4: `tostr_*` read their guarded numeric operand,
                 // `slen`/`guard_string` their string operand — all prior nodes.
                 // Doc 26: `supper`/`slower` read their string operand like `srev`.
@@ -14058,6 +14069,8 @@ pub const TraceState = struct {
             .find => try self.recBSFind(eff, regs),
             .match => try self.recBSMatch(eff, regs),
             .gmatch_iter => try self.recBSGmatchIter(eff, regs),
+            .floor => try self.recFloorCeil(eff, regs, .floor, .ffloor),
+            .ceil => try self.recFloorCeil(eff, regs, .ceil, .fceil),
         }
         // D1 publish — only a LIVE recording may leave a shadow (an aborting arm
         // set `rec.active = false`; §3a truthfulness: set only by a successfully
@@ -14898,6 +14911,35 @@ pub const TraceState = struct {
         self.setReg(instr.a, r);
     }
 
+    /// Record `math.floor(x)` / `math.ceil(x)` (doc 35). Unlike `recFloatUnary`
+    /// (sin/cos/sqrt → float result), these produce an INTEGER result (Lua 5.4
+    /// semantics: `math.floor(2.7) == 2`, an int, not `2.0`).
+    ///
+    /// Integer path: `floor(int) == int` (identity). Emit `guard_int(arg)` and
+    /// reuse the same ref — no `ffloor`/`fceil` emitted.
+    /// Float path: emit `guard_float(arg)` + `ffloor`/`fceil` with `.ty = .int`.
+    /// The IR op side-exits on NaN / inf / out-of-`[-2^63, 2^63)`.
+    fn recFloorCeil(self: *TraceState, instr: Instr, regs: RegWindow, rb: function.RecordedBuiltin, op: IrOp) !void {
+        if (instr.b != 1) return self.abort(.cross_frame); // single-arg only
+        if (instr.c != 1) return self.abort(.cross_frame); // single-result only
+        const arg = regs.get(@intCast(@as(usize, instr.a) + 1));
+        if (!arg.isFloat() and !arg.isInt()) return self.abort(.bad_type);
+
+        try self.guardBuiltinCallee(instr.a, rb);
+        const arg_ref = try self.refOf(@intCast(@as(usize, instr.a) + 1));
+
+        if (arg.isInt()) {
+            // Integer → identity: floor/ceil of an int is itself.
+            try self.guard(arg_ref, .guard_int, .operand_type, .a1);
+            self.setReg(instr.a, arg_ref);
+        } else {
+            // Float → ffloor/fceil producing an integer.
+            try self.guard(arg_ref, .guard_float, .operand_type, .a1);
+            const r = try self.emit(.{ .op = op, .a = arg_ref, .ty = .int });
+            self.setReg(instr.a, r);
+        }
+    }
+
     /// Cross-frame tracing — close an inlined callee (LuaJIT's `lj_record_ret`).
     /// Only reached at `inline_depth > 0` (the anchor-frame `.ret` aborts). Maps the
     /// callee's result slots back into the caller's `ret_dest..` window, nil-padding
@@ -15455,6 +15497,8 @@ pub fn writeIrInstr(w: *io.Writer, ins: IrInstr) io.Writer.Error!void {
         .alen,
         .fsin,
         .fcos,
+        .ffloor,
+        .fceil,
         .tostr_int,
         .tostr_num,
         .slen,

@@ -117,7 +117,7 @@ fn kindOf(op: IrOp) OpKind {
         // `fsin`/`fcos` share `fsqrt`'s contract exactly (leaf pure float
         // producers, never constant-folded — the `.unary` fold arm skips all
         // three).
-        .fsqrt, .fsin, .fcos => .unary,
+        .fsqrt, .fsin, .fcos, .ffloor, .fceil => .unary,
         // Packed-array address + load: memory ops, conservatively canonical to
         // themselves (never folded, never CSE'd) so a later store can't be
         // reordered past them. DCE'd if not reachable from a live root.
@@ -376,7 +376,7 @@ pub fn optimize(
                 // `@sqrt` at compile time — that avoids any fold-vs-runtime sign/NaN
                 // divergence, exactly like `int_of_float`. It still CSEs below. (And
                 // `evalUnary` is `unreachable` for it — it never folds a constant.)
-                if (ins.op != .fsqrt and ins.op != .fsin and ins.op != .fcos and ins.op != .slen) {
+                if (ins.op != .fsqrt and ins.op != .fsin and ins.op != .fcos and ins.op != .ffloor and ins.op != .fceil and ins.op != .slen) {
                     if (const_val[a2]) |va| {
                         if (irinterp.evalUnary(ins.op, va)) |res| {
                             const aux: i32 = @intCast(out_consts.items.len);

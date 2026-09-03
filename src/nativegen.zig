@@ -1820,6 +1820,13 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 if (kinds[ins.a] != .float and kinds[ins.a] != .int) return false;
                 kinds[i] = .float;
             },
+            // Doc 35: `ffloor`/`fceil` — same operand contract as fsin/fcos
+            // (proven numeric), but the RESULT is an integer (Lua 5.4 semantics).
+            .ffloor, .fceil => {
+                if (ins.a >= i) return false;
+                if (kinds[ins.a] != .float and kinds[ins.a] != .int) return false;
+                kinds[i] = .int;
+            },
             // Doc 24 D4/D5: allocating interned-string producers. The operand is
             // the guard-pinned scalar; the result is a raw `*GcHeader` (an
             // interned String) — kind `.heap`, the same class as a carried-heap
@@ -2577,6 +2584,8 @@ fn opMayExitInBody(
         .guard_fits,
         .guard_append,
         .int_of_float,
+        .ffloor,
+        .fceil,
         .hload,
         .guard_gcol,
         .guard_gpresent,
@@ -2662,6 +2671,11 @@ const BodyCallout = enum {
     fsin,
     /// `fmath.cosRuntime`: likewise for `math.cos`.
     fcos,
+    /// `fmath.floorRuntime` (doc 35): `@floor` + convert to i64; returns
+    /// `FLOOR_CEIL_SENTINEL` on out-of-range/NaN/inf. Pure f64 → i64.
+    ffloor,
+    /// `fmath.ceilRuntime` (doc 35): likewise for `math.ceil`.
+    fceil,
     /// `fmath.powRuntime`: the shared `^` kernel — pure (f64, f64) → f64;
     /// allocates nothing.
     fpow,
@@ -2745,7 +2759,7 @@ const BodyCallout = enum {
 fn calloutMayCollect(c: BodyCallout) bool {
     return switch (c) {
         .resolve_hash_cell => false,
-        .fsin, .fcos, .fpow, .fmod, .ffloordiv => false,
+        .fsin, .fcos, .ffloor, .fceil, .fpow, .fmod, .ffloordiv => false,
         .tostr_int, .tostr_num => false,
         .ssub, .srev, .schar1, .srep2 => false,
         .supper, .slower, .scp => false,
@@ -2769,6 +2783,8 @@ fn bodyCalloutOf(
         .href => if (isDynTableRoot(kinds, slots, slot_id_of_ref, ins.a)) .resolve_hash_cell else null,
         .fsin => .fsin,
         .fcos => .fcos,
+        .ffloor => .ffloor,
+        .fceil => .fceil,
         .pow => .fpow,
         // doc 25: ONLY the float lane is a callout; the int lane lowers to
         // inline cqo/idiv (`emitIntDivMod`) with no callout save area.
@@ -3007,7 +3023,7 @@ fn isTransient(op: trace.IrOp) bool {
         .aref, .aload => true,
         // int_of_float materializes the converted int limit in a register; alen
         // the border int.
-        .int_of_float, .alen => true,
+        .int_of_float, .ffloor, .fceil, .alen => true,
         // fsqrt materializes the `@sqrt` result in a float home (XMM/spill);
         // fsin/fcos/pow materialize their `fmath` kernel callout's result
         // likewise.
@@ -3066,7 +3082,7 @@ fn operandReads(ins: trace.IrInstr) struct { a: bool, b: bool } {
         .guard_func => .{ .a = true, .b = false },
         // guard_builtin reads the callee-snapshot native it identity-checks (a);
         // fsqrt/fsin/fcos read their sole float operand (a).
-        .guard_builtin, .fsqrt, .fsin, .fcos => .{ .a = true, .b = false },
+        .guard_builtin, .fsqrt, .fsin, .fcos, .ffloor, .fceil => .{ .a = true, .b = false },
         // doc 24: tostr_* read their guard-pinned scalar (a); slen its string
         // (a). guard_gc reads NOTHING (`a` unused, aux = the bound A).
         .tostr_int, .tostr_num, .slen => .{ .a = true, .b = false },
@@ -5083,6 +5099,51 @@ fn emitFloatCallout(
     }
 }
 
+/// Doc 35: emit the mid-body callout for `ffloor`/`fceil`. Unlike
+/// `emitFloatCallout` (which produces a float in xmm0), these kernels
+/// return an i64 in rax (SysV integer return convention). The caller
+/// then checks for the out-of-range sentinel (`FLOOR_CEIL_SENTINEL =
+/// minInt(i64)`) and side-exits if hit. Result lands in a GP register
+/// home, not an XMM.
+fn emitFloorCeilCallout(
+    a: *x64.Assembler,
+    alloc: *const Alloc,
+    kinds: []const Kind,
+    ins: trace.IrInstr,
+    i: usize,
+    exit_labels: []?x64.Label,
+) !void {
+    try emitCalloutSave(a, alloc);
+
+    // arg0: the proven-numeric operand into xmm0.
+    try floatOperandToXmm(a, XMM_SCRATCH0, placeOfRef(alloc, ins.a), kinds[ins.a]);
+
+    // Call the fmath kernel (f64→i64, result in rax).
+    const kernel: usize = switch (ins.op) {
+        .ffloor => @intFromPtr(&fmath.floorRuntime),
+        .fceil => @intFromPtr(&fmath.ceilRuntime),
+        else => unreachable,
+    };
+    try a.subRegImm32(.rsp, 8);
+    try a.movRegImm64(.rax, @bitCast(kernel));
+    try a.callReg(.rax);
+    try a.addRegImm32(.rsp, 8);
+
+    // Restore callee-saved regs (rax is the return value, not clobbered
+    // by the restore — the restore touches only r8–r11/rdi/rsi/rdx/xmm2+).
+    try emitCalloutRestore(a, alloc);
+
+    // Sentinel check: rax == minInt(i64) → side-exit. Use `movabs rcx, sentinel`
+    // + `cmp rax, rcx` → je exit. rcx is a scratch register.
+    const sentinel: i64 = fmath.FLOOR_CEIL_SENTINEL;
+    try a.movRegImm64(.rcx, @bitCast(sentinel));
+    try a.cmpRegReg(.rax, .rcx);
+    try jccNativeExit(a, exit_labels, i, .e); // equal → out-of-range → side-exit
+
+    // Home the result (an integer) in the allocated GP register or spill.
+    try regToPlace(a, placeOfRef(alloc, i), .rax);
+}
+
 /// doc 25 D1: inline int `%` / `//`. `cqo`/`idiv` + the floor adjustment
 /// reproduce `@mod`/`@divFloor` exactly for every non-special pair; the two
 /// specials are handled without ever reaching the (trapping) hardware
@@ -6252,6 +6313,8 @@ fn lower(gpa: std.mem.Allocator, t: *const Trace, kinds: []const Kind, alloc: *c
             // tier runs the one compiled body and bit-identity holds by
             // construction. No side-exit (total functions of proven numerics).
             .fsin, .fcos, .pow => try emitFloatCallout(a, alloc, kinds, ins, i),
+            // Doc 35: floor/ceil — integer-returning callout with sentinel check.
+            .ffloor, .fceil => try emitFloorCeilCallout(a, alloc, kinds, ins, i, exit_labels),
             // Doc 25: int lane → inline cqo/idiv + floor adjust (side-exit
             // only on a zero divisor); float lane → the shared fmath kernel
             // callout (total, no exit).

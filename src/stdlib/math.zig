@@ -260,8 +260,8 @@ fn mModfN(_: *anyopaque, args: []const Value, out: []Value) anyerror!usize {
 /// `name`, so the names here are the serialized identities and must stay unique.
 pub const natives = [_]function.BaseNative{
     .{ .name = "math.abs", .func = &mAbs, .module = "math", .field = "abs" },
-    .{ .name = "math.ceil", .func = &mCeil, .module = "math", .field = "ceil" },
-    .{ .name = "math.floor", .func = &mFloor, .module = "math", .field = "floor" },
+    .{ .name = "math.ceil", .func = &mCeil, .module = "math", .field = "ceil", .recorded = .ceil },
+    .{ .name = "math.floor", .func = &mFloor, .module = "math", .field = "floor", .recorded = .floor },
     .{ .name = "math.sqrt", .func = &mSqrt, .module = "math", .field = "sqrt", .recorded = .sqrt },
     .{ .name = "math.exp", .func = &mExp, .module = "math", .field = "exp" },
     .{ .name = "math.log", .func = &mLog, .module = "math", .field = "log" },

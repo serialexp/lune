@@ -841,6 +841,24 @@ fn executeImpl(comptime record: bool, rec: anytype, ctx: ExecCtx, t: *const Trac
                     if (record) rec.exit(i, .guard, v);
                     break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
                 },
+                // Doc 35: `math.floor(x)` / `math.ceil(x)` → integer result.
+                // Promote int→float if needed (same as fsin/fcos), apply
+                // @floor/@ceil, convert to i64 via the shared fmath kernel.
+                // Side-exit on out-of-range / NaN / inf (sentinel).
+                .ffloor, .fceil => {
+                    const v = values[ins.a];
+                    if (v.isFloat() or v.isInt()) {
+                        const x = if (v.isFloat()) v.asFloat() else @as(f64, @floatFromInt(v.asInt()));
+                        const r = if (ins.op == .ffloor) fmath.floorRuntime(x) else fmath.ceilRuntime(x);
+                        if (r != fmath.FLOOR_CEIL_SENTINEL) {
+                            values[i] = Value.int(r);
+                            if (record) rec.value(i, values[i]);
+                            continue;
+                        }
+                    }
+                    if (record) rec.exit(i, .guard, v);
+                    break :iter ExecResult{ .completed = completed, .exit_instr = @as(u32, @intCast(i)) };
+                },
                 // Doc 24 D3: the allocation-budget entry guard. Passes ⇔
                 // `!gc_stress ∧ object_count + A < next_gc` (saturating) — then
                 // even the worst case (every call this iteration misses) cannot
