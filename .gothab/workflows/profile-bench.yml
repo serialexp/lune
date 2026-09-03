@@ -97,7 +97,7 @@ jobs:
       - name: Build LuaJIT
         run: |
           set -eu
-          git clone --filter=blob:none "$LUAJIT_REPO" "$TOOLS/luajit"
+          git clone "$LUAJIT_REPO" "$TOOLS/luajit"
           git -C "$TOOLS/luajit" checkout "$LUAJIT_REV"
           make -C "$TOOLS/luajit" -j"$(nproc)"
           "$TOOLS/luajit/src/luajit" -v
