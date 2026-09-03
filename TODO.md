@@ -1488,9 +1488,16 @@ EVERY row including the pure tier-0 column, which no JIT change can affect. Use
 `gt profile` (`.gothab/workflows/profile-bench.yml`) — an isolated 2-vCPU pool where
 measured per-row run-to-run noise on identical code is 1.3%.
 
-Two things to remember when reading those boards:
+Three things to remember when reading those boards:
   * absolute ms are NOT comparable to anything in `bench/results/` or the design docs —
     that pool is much narrower than the desktop. Only same-pool A/B deltas mean anything.
   * a +-2..3% single-row move with UNCHANGED trace structure is binary code layout, not
     behaviour. Diff `--dump-native` (it will differ only in embedded addresses) rather
     than re-timing. Confirmed this way for `str_find_match` and `scimark-lu` in doc 32.
+  * **absolute ms are not comparable across runs either** (discovered 2026-09-03, doc 34
+    board). The autoscale pool picks the cheapest available spot instance type, which can
+    be a different CPU generation: the B2b board ran on a Xeon 6975P-C (Granite Rapids),
+    the doc 34 board on a Xeon Platinum 8375C (Ice Lake) — ~2× absolute difference, same
+    ratios. **Fix (Gothab side):** pin the bench pool's `instance_type_allowlist` to a
+    single instance type or CPU generation. Until then, only jit/lj RATIOS are comparable
+    across runs; absolute wall-clock A/B needs both runs on the same hardware.
