@@ -35,7 +35,7 @@ env:
   ZIG_SHA256: b0d46ffc4587b9e8dd0b524ee5bc4da1e67f28bba55e7c534cec64af2f2d7a74
   # The parity columns only mean anything if LuaJIT is the same build the
   # campaign has been measuring against all along.
-  LUAJIT_REPO: https://github.com/serialexp/luajit.git
+  LUAJIT_REPO: https://gothab.io/serialexp/luajit.git
   LUAJIT_REV: a86046b1
   TOOLS: /home/runner/mahina-ci-tools
 
