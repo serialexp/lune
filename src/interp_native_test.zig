@@ -1492,6 +1492,43 @@ test "doc 40 phase 0: zero-completion while-done on a peeled trace must not chai
     , "186\n", .{ .inspect = &assertPeelCommitted });
 }
 
+/// Doc 40 Phase 1: no cached trace may be a native `.unsupported` verdict.
+/// The self-defeating F1-reverse commits were exactly the traces RV-3 kept
+/// off native; with the commit preflight they must never enter the cache, so
+/// every trace the program DID cache either compiled or was never dispatched
+/// natively. Also demands the cache is non-empty (vacuity guard).
+fn assertNoUnsupportedTraces(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (mode == .off) return;
+    try testing.expect(vm.trace.cache.items.len > 0);
+    for (vm.trace.cache.items) |tr| {
+        try testing.expect(tr.native != .unsupported);
+    }
+}
+
+test "doc 40 phase 1: the reset-to-int glue shape no longer commits self-defeating loop traces" {
+    // The fft_bitreverse reduction: `k = n` stores an int into a slot the
+    // while body floats (`k = k / 2`), so the glue/wrap recordings (prime-side
+    // + continuation channels) close with a float entry fingerprint and an
+    // int back-edge store — DOA as `.loop` traces (they can never take their
+    // own back-edge) and the exact traces RV-3 kept off native. The commit
+    // preflight must refuse them: post-run, NO cached trace carries a native
+    // `.unsupported` verdict, and the ten-leg output oracle holds.
+    try expectProgramTuned(
+        \\local n = 16
+        \\local total = 0
+        \\for outer = 1, 60 do
+        \\  local j = 0
+        \\  for i = 0, 2 * n - 4, 2 do
+        \\    if i < j then total = total + 1 end
+        \\    local k = n
+        \\    while k <= j do j = j - k; k = k / 2 end
+        \\    j = j + k
+        \\  end
+        \\end
+        \\print(total)
+    , "360\n", .{ .inspect = &assertNoUnsupportedTraces });
+}
+
 test "doc 39: a numeric-for anchor with the same transition does not peel" {
     // Same int->float transition, but the anchor is a numeric `for` back-edge,
     // not a plain while — `maybeEnterPeel`'s `isPlainWhileAnchor` gate

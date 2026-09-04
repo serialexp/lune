@@ -1,6 +1,6 @@
 # Float→int φ narrowing via the reverse peel — Design
 
-Status: partial — Phase 0 landed (the peeled while-done hazard was REAL and is fixed); phases 1+ outstanding
+Status: partial — Phases 0–1 landed (while-done hazard fixed; commit preflight refuses self-defeating loops); phases 2+ outstanding
 Owner: mahina JIT campaign (doc 39 follow-up)
 Last updated: 2026-09-05
 
@@ -37,25 +37,29 @@ Every phase lands behind its own `just test` gate.
   (per-VM jitdbg receipts for a single leg). Suite green, hashgate
   84/84.
 
+- [x] **Phase 1 — commit preflight: int↔float kind-coherence refusal.**
+  Landed as `loopCloseSelfDefeating` in `closeTrace`, before
+  `commit()` (codex finding 4). One implementation departure from the
+  plan, discovered the hard way: the store side CANNOT be read from
+  the carried ref's IR `ty` — an unguarded `slot_load` store (exactly
+  the fft `k = n` reset) carries `.ty = .unknown`, so the ty-based
+  sweep never fired (verified by a jit-debug run showing zero
+  refusals with the DOA traces still committing). The store kind is
+  instead read from the LIVE anchor-return registers (`closeTrace`'s
+  previously-reserved `regs` param): recording is concrete execution,
+  so the live value IS what the φ delivers on the recorded path.
+  Entry side mirrors the fingerprint-extraction criteria; the
+  φ-emission slot filter is mirrored (no φ → no contradiction);
+  depth-gated to `inline_depth == 0` (the regs window must be the
+  anchor frame — the glue channels all record at depth 0). Applies to
+  all recording kinds. Verified firing (12 refusals on the repro,
+  both DOA traces gone, 5/5 remaining traces compile native); the
+  ten-leg "doc 40 phase 1" test asserts no cached trace is native
+  `.unsupported` and was verified NON-vacuous (fails with the
+  preflight disabled). Suite green, hashgate 84/84, fft bench
+  neutral (316.7ms / 28.4% residency, inside the noise band).
+
 ### Outstanding
-- [ ] **Phase 1 — commit preflight: int↔float kind-coherence refusal.**
-  In `closeTrace`, before `commit()` mutates anything (codex finding
-  4 — by fingerprint time the stream is already appended/optimized,
-  and a commit error is classified `.commit_failure`): sweep
-  `reg_map[0..anchor_num_registers]` — the same data
-  `maybeEnterPeel` reads — and refuse a would-be `.loop` recording
-  (no `link_target`, not in peel mode) any carried slot of which has
-  numeric `entry_kind` ≠ numeric carried-ref `ty`. Abort
-  `.type_instability`. Scope strictly to proven int↔float pairs
-  (codex finding 6: `EntryGuardType`/the entry-kind lattice cannot
-  express string/bool/nil coherence, and carried table/string slots
-  have legitimate specialized load/store relationships,
-  nativegen.zig:3281/3295). Applies to ALL recording kinds — root,
-  side, continuation — since a self-contradicting `.loop` is DOA
-  regardless of provenance. Measure the removed tier-1a
-  1-iteration segments (codex finding 6: no *chain* coverage is lost
-  — generic wants need `completed == 0`, productive same-anchor
-  chaining needs a branch guard — but the segments themselves go).
 - [ ] **Phase 2 — peel eligibility for the channels that actually
   record the glue shape.** The reset-to-int glue is unreachable by
   `.root` recordings (LLEAVE aborts the exit edge, trace.zig:14341/

@@ -12434,6 +12434,57 @@ pub const TraceState = struct {
         return true;
     }
 
+    /// Doc 40 Phase 1 — commit preflight: would this `.loop` close be
+    /// self-defeating? A trace whose entry fingerprint pins a carried slot to
+    /// one numeric kind while its back-edge φ would store the other can never
+    /// take its own back-edge: every entry runs exactly one iteration, exits
+    /// on the entry guard, and the accounting machinery mistakes it for
+    /// healthy forever (`completed > 0` clears the anchor penalty each entry;
+    /// no want channel fires — the doc 40 "failure loop"). Such a close is
+    /// refused BEFORE `commit` mutates anything (codex finding 4), keeping the
+    /// anchor's accounting live and the producing channel retrying under the
+    /// record gate.
+    ///
+    /// Scope (codex finding 6): proven int↔float contradictions only —
+    /// `guard_number` matches both numeric kinds and non-numeric carried slots
+    /// have legitimate specialized load/store relationships. The ENTRY side
+    /// mirrors the fingerprint-extraction criteria exactly (a guard over a
+    /// `slot_load` of an anchor-window slot — `matchesFingerprint` is what
+    /// makes the contradiction fatal at re-entry); the STORE side reads the
+    /// live anchor-return registers. Commit's φ-emission slot filter is
+    /// mirrored too: a slot that gets no φ is never written at the back-edge,
+    /// so its entry guard cannot be contradicted.
+    fn loopCloseSelfDefeating(self: *const TraceState, regs: RegWindow) bool {
+        // The live-value read below indexes the ANCHOR frame; at inline depth
+        // the window belongs to a callee. Depth-0 covers every channel the
+        // reset-to-int shape records through (glue side / continuation).
+        if (self.rec.inline_depth != 0) return false;
+        const instrs = self.rec.instrs.items;
+        for (instrs, 0..) |ins, i| {
+            const want_int = switch (ins.op) {
+                .guard_int => true,
+                .guard_float => false,
+                else => continue,
+            };
+            const ref: usize = @intCast(ins.a);
+            if (ref >= i or instrs[ref].op != .slot_load) continue;
+            const slot: usize = @intCast(instrs[ref].aux);
+            if (slot >= self.rec.anchor_num_registers) continue;
+            const s = self.rec.reg_map[slot];
+            if (s.state != .def) continue; // read-only slot: no φ, no back-edge write
+            if (self.rec.alloc_count == 0 and
+                slot >= self.rec.locals_watermark and !self.readSlot(@intCast(slot))) continue;
+            // STORE side: the LIVE value at this anchor return. Recording is
+            // concrete execution, so this is exactly what the φ delivers on
+            // the recorded path. (The IR `ty` is useless here: an unguarded
+            // `slot_load` store — the fft `k = n` reset — is `.unknown`.)
+            const v = regs.get(@intCast(slot));
+            if (want_int and v.isFloat()) return true;
+            if (!want_int and v.isInt()) return true;
+        }
+        return false;
+    }
+
     /// Finalise a cleanly-closed recording into a cached `Trace`. A build failure
     /// is treated like an abort (discard + gate-with-backoff) so we never thrash.
     ///
@@ -12445,7 +12496,6 @@ pub const TraceState = struct {
     /// `onBackEdge` then `maybeCloseAtAnchor` before anything records; a
     /// forward-flow arrival calls only `maybeCloseAtAnchor`).
     fn closeTrace(self: *TraceState, regs: RegWindow) void {
-        _ = regs; // reserved: a richer exit snapshot will read live values here.
         if (self.rec.peel) |*p| {
             if (self.rec.instrs.items.len == p.mark_len) return; // same arrival
             if (!self.finishPeel(p)) {
@@ -12454,6 +12504,19 @@ pub const TraceState = struct {
             }
         } else if (self.maybeEnterPeel()) {
             return; // peel entered (keep recording iteration 2) or aborted
+        }
+        // Doc 40 Phase 1: refuse a self-defeating `.loop` close (entry
+        // fingerprint contradicts a carried φ's numeric kind) for EVERY
+        // recording kind — root, side, continuation — the glue channels are
+        // precisely where the reset-to-int shape records (codex finding 1).
+        // Peeled closes are legitimately entry≠steady by design; `.link`
+        // closes carry no back-edge.
+        if (self.rec.peel == null and self.rec.link_target == null and
+            self.loopCloseSelfDefeating(regs))
+        {
+            self.dbg("commit refuse: anchor pc={d} self-defeating loop (entry kind vs phi store kind)", .{self.rec.anchor.pc});
+            self.abort(.type_instability);
+            return;
         }
         self.commit() catch |err| {
             self.dbg("commit failed: anchor pc={d} error={s} ir_len={d}", .{
