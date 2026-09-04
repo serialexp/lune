@@ -21,6 +21,42 @@ hotness (recursive-fib 20.8×, binary-trees 5.5×, cross_frame ret everywhere);
 (4) heap-valued (function/table) hash field loads + generic-for (array3d 90×,
 method calls). Undiagnosed yet: spectral-norm 28.9×, repack 11.0×.
 
+## Status 2026-09-04 (LATEST-104) — doc 39 DESIGN landed: numeric φ widening via type-stabilizing peel
+
+The named-next-technique arc from LATEST-103, design phase complete through
+three codex review rounds (thread 01a06c9e-12c8-7971-99d6-a9dfd83a36aa).
+`docs/design/39-numeric-phi-widening.md` (v3) is the contract; its
+implementation-status checklist is the work plan. The short version:
+
+- **v1 (eager entry coercion — the TODO.md sketch) was REJECTED**: coercing
+  the entry int to float changes observable first-iteration semantics
+  (integer arith wraps vs float rounds, `math.type`, >2^53 compares). LuaJIT
+  gets away with flush-anywhere because 5.1 has no observable int/float;
+  we don't. The determinism asterisk demanded an adaptation, not a skip.
+- **The sound architecture is a type-stabilizing PEEL**, riding the E1/E2
+  machinery that already exists end-to-end: at the first anchor-return of a
+  plain-while root whose carried slot is int-entry/float-body, emit the
+  `preheader` marker inline and keep recording; iteration 1 becomes the
+  run-once region (int semantics, exactly as tier-0 executes), iteration 2
+  records against genuinely-float runtime values (guard_float natural, NO
+  new IR op, demotion sites untouched); carried dataflow crosses via lazily
+  created internal φs (PHI_INTERNAL a=init/b=back-edge — E2's
+  strength-reduction machinery, battle-tested on both tiers).
+- **Minimum-sound-v1 constraints (codex round 2/3)**: peel-generation state
+  shared by both anchor-close paths (else maybeCloseAtAnchor closes before
+  iteration 2 records); entry_kind captured on EVERY numeric proof route and
+  surviving whole-RegSlot writes; peeled traces bypass tropt (link-trace
+  precedent — tropt would drop the marker); slot↔internal-φ association via
+  the slot-bound φ's unused `a` (0 = write-only class); native entry-load /
+  steady-home split in analyze; register-only scope enforced over BOTH
+  passes (no pending stores / gmatch cursor / allocations — the gmatch
+  cursor would double-match, guard_gc would sit skipped); DEOPT flush skip
+  keyed on rbx == entry_rbx (LOCAL completions, chain-safe); first
+  back-edge counts TWO iterations; `Trace.peeled` is semantic and
+  serialized (schema bump + codecs + traceser + viz).
+
+Implementation NOT started. Next: doc 39 checklist Phase 0 onward.
+
 ## Status 2026-09-04 (LATEST-103) — doc 38: while-inner linking + topology arbitration LANDED
 
 The doc 15/16 continuation/link machinery, numeric-for-only until now, extended

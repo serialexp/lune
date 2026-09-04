@@ -1507,13 +1507,18 @@ Three things to remember when reading those boards:
 A while-body root recorded at trip 1-2 pins an int entry load on a carried
 slot that the body floats (`j - k` with float k, `k / 2`) — lk=int/sk=float,
 the nativegen RV-3 analyze bail, so the root never compiles and the anchor
-starves (fft_bitreverse:9 at 0% residency). LuaJIT unifies with CONV int→num
-at record time. The mahina version must keep deopt flushes byte-identical:
-convert the ENTRY value explicitly (new ref), leave pre-φ snapshot refs on
-the original int ref, carry the φ as float. Watch the interaction with the
-deliberate `int_of_float` demotion in mixed compares (the nsieve float-limit
-win) — demote when the int side is the induction variable, widen when the
-int side is the slot that floats.
+starves (fft_bitreverse:9 at 0% residency).
+
+**DESIGN LANDED: docs/design/39-numeric-phi-widening.md** (v3, three codex
+review rounds). NB the approach sketched here originally — eager entry
+coercion ("convert the ENTRY value explicitly, carry the φ as float") — was
+REJECTED in review: it changes observable first-iteration semantics (integer
+arithmetic, math.type, >2^53 compares). The sound design is a
+**type-stabilizing peel**: record iteration 2 behind the existing
+`preheader` marker, carried dataflow via lazy internal φs. The demote-vs-
+widen arbitration resolves itself: on the peel's second iteration the
+runtime values are genuinely float, so `recCompare`/`keyRefNarrowed` stay
+runtime-keyed and unmodified. See the doc's checklist for phases.
 
 ## Type-guard side traces (deferred, 2026-09-04)
 
