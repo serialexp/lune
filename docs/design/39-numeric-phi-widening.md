@@ -6,7 +6,9 @@ implementation revealed" for the premise-gap finding (the fft bitreverse
 shape records float-entry on the current tree, so the peel's organic
 trigger is transition-trip alignment, not the reset-to-int family).
 Owner: Claude (fable), for Bart
-Last updated: 2026-09-04
+Last updated: 2026-09-05 (doc 40 Phase 0 follow-up: the zero-completion
+while-done chain hazard in the landed Phase 3 was real and is fixed —
+see the boxed note under Implementation status)
 
 ## Implementation status
 
@@ -71,6 +73,22 @@ inside them is checked.
   shows the identical diff class), so the delta is host-binary layout
   / environment noise, not a semantic cost. Baseline: `just shadow`
   of aea79c2 sources, verified peel-free behaviorally.
+
+> **Follow-up (2026-09-05, doc 40 Phase 0): a real bug in the Phase 3
+> claim above was found and fixed.** The "deopt flush … SKIPPED at
+> `rbx == entry_rbx`" behaviour was chain-safe for *ordinary* deopts
+> (tier-0 replays from the anchor) but NOT for the doc-38
+> `.while_done` chain: a peeled trace's STEADY-region loop-done guard
+> firing at zero local completions has executed — but never flushed —
+> its run-once iteration, and the chain resumed the post-loop pc on
+> the stale entry boxes (185.5-vs-186 cross-tier divergence,
+> reproduced by the "doc 40 phase 0" matrix test). Fixed by the
+> peel-aware `whileDoneCoherentAtZero` classification gate (dispatcher
+> + a fail-closed twin in `driveChain`). The original doc-39 test
+> matrix missed it because none of its shapes armed a while-done
+> continuation (the kernels sat in called functions, where "cont-arm
+> refuse: no enclosing back-edge" keeps the chain path unreachable).
+> See docs/design/40-reverse-peel.md Phase 0.
 
 ### Outstanding
 

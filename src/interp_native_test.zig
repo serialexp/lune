@@ -1462,6 +1462,36 @@ test "doc 39: the F1 reverse shape (float entry, int store) does not peel" {
     , "0.5\n", .{ .inspect = &assertNoPeel });
 }
 
+test "doc 40 phase 0: zero-completion while-done on a peeled trace must not chain stale state" {
+    // Codex finding 3 on the landed doc-39 code. Instances with n == 30 commit
+    // the peel and drive the while-loopdone continuation machinery hot. The
+    // m == 7 instance passes n == 6: it arrives at trip 5 with x == 4 (int, so
+    // the peeled trace's fingerprint matches), the run-once region executes
+    // iteration 5 (x -> 4.5, i -> 6), and the STEADY region's condition check
+    // `i < n` fails before the first `.loop` — a while-done-classified exit
+    // with zero local completions whose run-once work is real but unflushed.
+    // If the loop-done chain continues at the post-loop PC from the untouched
+    // boxes, the instance contributes the stale 4 instead of 4.5 and the sum
+    // drifts. The inner while must share the OUTER loop's frame — a while
+    // inside a called function can never arm the loop-done continuation
+    // ("cont-arm refuse: no enclosing back-edge"), which would leave this
+    // test green without ever reaching the chain path.
+    try expectProgramTuned(
+        \\local s = 0
+        \\for m = 1, 12 do
+        \\  local bound = (m == 7) and 6 or 30
+        \\  local x = 0
+        \\  local i = 1
+        \\  while i < bound do
+        \\    if i >= 5 then x = x + 0.5 else x = x + 1 end
+        \\    i = i + 1
+        \\  end
+        \\  s = s + x
+        \\end
+        \\print(s)
+    , "186\n", .{ .inspect = &assertPeelCommitted });
+}
+
 test "doc 39: a numeric-for anchor with the same transition does not peel" {
     // Same int->float transition, but the anchor is a numeric `for` back-edge,
     // not a plain while — `maybeEnterPeel`'s `isPlainWhileAnchor` gate

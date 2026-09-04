@@ -1531,3 +1531,16 @@ type-oscillating variables) is sound but needs:
 Deferred because fft_bitreverse's actual problem is branch-shape variance
 from while-inner unrolling, not type oscillation. Come back when a benchmark
 demonstrates genuine type oscillation on a carried slot.
+
+## Debug-build jit-stats shows native execution = 0 cycles on fft (2026-09-05)
+
+A Debug (`just build`) binary running `--trace --jit-native --jit-stats` on
+scimark-fft reports `native execution: 0 (0.0%)` while simultaneously reporting
+789 native link exits and 9 compiled traces; the same tree at ReleaseFast
+reports 15.1% native. nsieve under the SAME Debug binary reports native 35%,
+so it's not a global Debug accounting hole — something about fft's fused
+loopdone chains (`link fused: loopdone=40516`) attributes native cycles to the
+steering seam (or skips the native TSC bracket) only in Debug. Harmless for
+benchmarking (we only trust ReleaseFast numbers) but confusing during
+diagnosis — worth a look at the TSC bracketing in the fused-loopdone dispatch
+path.

@@ -909,6 +909,27 @@ pub fn isWhileLoopDoneGuardIndex(t: *const Trace, idx: usize) bool {
     return whileLoopDonePostPc(t, idx) != null;
 }
 
+/// Doc 40 Phase 0 (codex finding 3): is a while-loop-done exit's "zero
+/// completions ⇒ regs coherent at the post-loop pc" claim actually true for
+/// this trace? For an ordinary trace, always — the condition guard sits at the
+/// trace top, before any of the final pass's body ran (the doc 38 zero-trip
+/// argument). For a PEELED trace (doc 39) the claim breaks in the STEADY
+/// region: the run-once region is a real tier-0 iteration, and a
+/// zero-completion deopt deliberately leaves the carried-slot boxes untouched
+/// — so a steady-region loop-done firing at zero local completions has
+/// *executed* (but never flushed) iteration 1, and the post-loop pc is NOT
+/// coherent. Such an exit must take the ordinary deopt-replay path (tier-0
+/// re-runs from the entry state), never the `.while_done` chain. A
+/// run-once-region loop-done (idx before the marker) stays chain-safe: zero
+/// completions there really is zero iterations.
+pub fn whileDoneCoherentAtZero(t: *const Trace, idx: usize) bool {
+    if (!t.peeled) return true;
+    for (t.instrs[0..@min(idx, t.instrs.len)]) |ins| {
+        if (ins.op == .preheader) return false; // marker precedes the exit → steady region
+    }
+    return true;
+}
+
 /// Doc 38: either loop-done kind — numeric-for OR while. Use at accounting
 /// sites where "the loop ran to completion" matters regardless of loop shape
 /// (hot-exit exclusion, receipt region-work). Kind-specific machinery (the
@@ -5697,7 +5718,16 @@ pub const TraceState = struct {
             // branch's JUMP TARGET (the post-loop pc). Re-derived through the
             // fail-closed classifier — a mis-tagged call (exit isn't actually a
             // while-loop-done) returns null rather than walking a bogus pc.
-            .while_done => whileLoopDonePostPc(failed, exit_instr) orelse return null,
+            // Doc 40 Phase 0: fail-closed twin of the dispatcher's peel-aware
+            // classification gate. A peeled trace's STEADY-region loop-done at
+            // zero local completions owes a replay (its run-once iteration is
+            // real but unflushed); chaining would resume the post-loop pc on
+            // stale boxes. Belt-and-braces for any future `.while_done` caller.
+            .while_done => blk: {
+                const local: usize = if (tier == .native_only) result.local_completed else result.completed;
+                if (local == 0 and !whileDoneCoherentAtZero(failed, exit_instr)) return null;
+                break :blk whileLoopDonePostPc(failed, exit_instr) orelse return null;
+            },
             // Numeric-for loop-done materializations chain to a `.link` continuation
             // living at the guard's *exit* PC (a real post-loop bytecode pc). Resolve
             // it through the op-gated accessor so an array-guard lane ordinal is never

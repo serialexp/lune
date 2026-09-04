@@ -69,6 +69,11 @@ pub fn runCaptured(gpa: std.mem.Allocator, source: [:0]const u8, sink: *io.Write
 pub const CapturedOpts = struct {
     hotguard: ?u32 = null,
     coverage: bool = false,
+    /// Per-VM jitdbg receipts (`src/jitdbg.zig`): only observable in a
+    /// `-Djit-debug=true` build, comptime-inert otherwise. The sanctioned way
+    /// to watch dispatcher/link events for a single harness leg without
+    /// touching the CLI's global flag.
+    debug_log: bool = false,
     inspect: ?*const fn (*Vm, TraceMode) anyerror!void = null,
 };
 
@@ -101,6 +106,7 @@ pub fn runCapturedTuned(
     vm.trace.config.native_codegen = mode == .record_execute_native;
     vm.trace.config.hotloop = 4; // record short test loops
     vm.trace.config.coverage = opts.coverage;
+    vm.trace.config.debug_log = opts.debug_log;
     if (opts.hotguard) |hg| vm.trace.config.hotguard = hg;
 
     var chunk = try compiler.compile(gpa, vm.heap, source, tree.root, &diags);

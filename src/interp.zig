@@ -2713,8 +2713,14 @@ pub const Vm = struct {
                 result.exit_instr < final.instrs.len;
             const numeric_for_done = exit_ok and
                 trace.isLoopDoneGuardIndex(final, result.exit_instr);
+            // Doc 40 Phase 0: the zero-trip coherence claim above is peel-aware —
+            // a PEELED trace's steady-region loop-done at zero local completions
+            // has executed (but never flushed) its run-once iteration, so the
+            // post-loop pc is NOT coherent there; that exit must fall to the
+            // ordinary deopt-replay path below (185.5-vs-186 divergence otherwise).
             const while_done_exit = exit_ok and !numeric_for_done and
-                trace.isWhileLoopDoneGuardIndex(final, result.exit_instr);
+                trace.isWhileLoopDoneGuardIndex(final, result.exit_instr) and
+                (local_done > 0 or trace.whileDoneCoherentAtZero(final, result.exit_instr));
             const any_loop_done = numeric_for_done or while_done_exit;
             const count_exit = exit_ok and
                 (!any_loop_done or
