@@ -1562,11 +1562,34 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                 const r = ins.a;
                 if (r >= i) return false; // not linear SSA → malformed
                 if (t.instrs[r].op == .slot_load) guarded[r] = true;
+                // Doc 40 (reverse peel): a numeric guard on an INTERNAL φ whose
+                // init is a slot_load hoists through the φ onto that slot_load —
+                // the same prologue-tag-check discipline, one step removed. The
+                // shape is the reset-to-int glue (`k = n`): the run-once region
+                // loads `n` with no guard of its own (tier-0's move is untyped),
+                // and the steady body's guard on the φ is the ONLY check between
+                // a differently-typed future entry and the int steady loop.
+                // Hoisting it makes the init a proven entry input (prologue
+                // check + home); the body guard then discharges against the
+                // φ's proven kind exactly like any derived guard, because every
+                // value the φ can carry — init (prologue-checked) and update
+                // (kind-equality-checked below) — is proven. A future entry
+                // whose slot fails the hoisted check takes prologue_fail →
+                // tier-1a, where the φ guard is a real per-iteration check.
+                if (t.instrs[r].op == .phi and t.instrs[r].aux == trace.PHI_INTERNAL) {
+                    const init = t.instrs[r].a;
+                    if (init < r and t.instrs[init].op == .slot_load) guarded[init] = true;
+                }
             },
             .guard_float => {
                 const r = ins.a;
                 if (r >= i) return false; // not linear SSA → malformed
                 if (t.instrs[r].op == .slot_load) float_guarded[r] = true;
+                // Doc 40: the float-direction twin of the guard_int φ-hoist.
+                if (t.instrs[r].op == .phi and t.instrs[r].aux == trace.PHI_INTERNAL) {
+                    const init = t.instrs[r].a;
+                    if (init < r and t.instrs[init].op == .slot_load) float_guarded[init] = true;
+                }
             },
             // doc 34: guard_fits on a narrow lane implies the scalar type.
             // `laneFits(.f64, v)` ⟹ `v.isFloat()`; `laneFits(.iN, v)` ⟹
@@ -2474,8 +2497,25 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
                         .int => .int,
                         .float => .float,
                         .boolean => .bool,
-                        else => return false,
+                        // Doc 40: an unknown-ty internal φ — the recorder stamps
+                        // φ ty from the init ref's ty, and an UNGUARDED slot_load
+                        // init (the reset-to-int `k = n`) carries `.unknown`.
+                        // Take the init's proven kind instead: Pass A hoisted the
+                        // φ's own numeric guard onto that slot_load, so the init
+                        // is prologue-checked; non-numeric stays a bail.
+                        else => switch (kinds[@intCast(ins.a)]) {
+                            .int => .int,
+                            .float => .float,
+                            else => return false,
+                        },
                     };
+                    // Doc 40 Phase 4 structural check (codex finding 5): the
+                    // preheader seed move (`movePlace` init-home → φ-home) has
+                    // no GP↔XMM path, and the φ-guard discharge above relies on
+                    // the init being proven AS the φ's kind. Same-kind seam by
+                    // construction (both peel directions and LICM); a mismatch
+                    // is malformed/deserialized input — fail closed.
+                    if (kinds[@intCast(ins.a)] != kinds[i]) return false;
                 } else {
                     if (ins.aux < 0 or ins.aux > 0xFFFF) return false;
                     kinds[i] = .none;
@@ -2536,11 +2576,16 @@ pub fn proveKinds(gpa: std.mem.Allocator, t: *const Trace, kinds: []Kind, slot_o
     // `analyze` classifies the slot and decides admissibility. An `.aref` is only
     // an addressing token and must never escape into the VM register file. This
     // runs after Pass B so a φ's forward-referencing `b` has its kind assigned.
-    for (t.instrs) |p| {
+    for (t.instrs, 0..) |p, i| {
         if (p.op != .phi) continue;
         if (p.b >= n) return false;
         const k = kinds[p.b];
         if (k != .int and k != .bool and k != .float and k != .ptr and k != .heap) return false;
+        // Doc 40: an internal φ's back-edge update must deliver the φ's own
+        // kind — the other half of the φ-guard discharge (Pass B proved the
+        // init; this proves iterations 2+). `b` is a forward ref, so the check
+        // lives here, after every kind is assigned.
+        if (p.aux == trace.PHI_INTERNAL and k != kinds[i]) return false;
     }
     return true;
 }

@@ -1,6 +1,6 @@
 # Float→int φ narrowing via the reverse peel — Design
 
-Status: partial — Phases 0–1 landed (while-done hazard fixed; commit preflight refuses self-defeating loops); phases 2+ outstanding
+Status: partial — Phases 0–4 + 6 landed (reverse peel commits and compiles native on all channels; provenance-drain permanent-decline bug fixed); Phase 5 deferred pending observation; the persistent-fusion open question is measured as the direct fft blocker and is its own arc
 Owner: mahina JIT campaign (doc 39 follow-up)
 Last updated: 2026-09-05
 
@@ -59,39 +59,96 @@ Every phase lands behind its own `just test` gate.
   preflight disabled). Suite green, hashgate 84/84, fft bench
   neutral (316.7ms / 28.4% residency, inside the noise band).
 
+- [x] **Phase 2 — peel eligibility for the channels that actually
+  record the glue shape.** Landed as planned: `maybeEnterPeel`'s
+  `kind == .root` gate removed — any recording kind closing as
+  `.loop` at its own anchor is eligible (side recordings that link
+  elsewhere never close `.loop` at their anchor, so they stay out
+  structurally via `link_target`; LLEAVE keeps aborting roots on
+  their anchor loop's exit edge, so the glue shape still arrives only
+  via the prime-side and continuation channels). The rotated `:68`
+  anchor stays excluded (`isPlainWhileAnchor` — open question,
+  unchanged). Verified on `/tmp/f1rev.lua`: both formerly-DOA glue
+  traces now peel and commit (12 preflight refusals → 0; all 6
+  traces compile native), and on fft the peeled glue trace at `:55`
+  is minted via the continuation channel.
+- [x] **Phase 3 — bidirectional instability sweep.** Landed, with
+  one departure mirroring Phase 1's lesson: the sweep compares
+  `entry_kind` (guard-proof side) against the **live anchor-return
+  registers** (`regs.get(slot).isInt()/isFloat()`), not the carried
+  ref's IR `ty` — an unguarded `slot_load` store carries
+  `.ty = .unknown` and would blind a ty-based sweep on exactly the
+  fft `k = n` shape. Per-slot direction: one peel may widen one slot
+  and narrow another; the mixed case is pinned by the ten-leg root
+  test (`x` narrows float→int while `u` widens int→float in the same
+  peel). Note the sweep is read-gated by nature: a write-only reset
+  (`x = 8` with no read of `x` on the recorded path) leaves
+  `entry_kind` unstamped and the sweep blind — by design (no guard,
+  no contradiction).
+- [x] **Phase 4 — native reverse-shape support.** Codex finding 7's
+  prediction ("comments/assertions only") was WRONG — real work in
+  `proveKinds`: the reverse peel's internal φ has an unguarded
+  `slot_load` init with `.ty = .unknown`, which the prover could not
+  classify (native bail `.unsupported` on the committed peel).
+  Landed the guard-hoist-through-φ design: (a) a numeric guard on an
+  internal φ whose init is a `slot_load` hoists coverage onto that
+  slot_load (same prologue-tag-check + home discipline, one step
+  removed — the prologue check is slot-driven from `kinds[]` via
+  `analyzeInner`, so classification automatically produces it); (b)
+  an unknown-ty internal φ classifies from its init's proven kind;
+  (c) two structural fail-closed checks — `kinds[phi.a] == kinds[phi]`
+  (init; codex finding 5, `movePlace` has no GP↔XMM path) and
+  `kinds[phi.b] == kinds[phi]` for internal φs (update, checked in
+  the final φ loop since `b` is a forward ref). Soundness: the φ
+  guard discharges as redundant because the init is prologue-checked
+  and the update is kind-equality-checked; an entry failing the
+  hoisted check takes `prologue_fail` → tier-1a, where the φ guard
+  is a real per-iteration check.
+- [x] **Bug found + fixed en route — `drainProvenanceArms` charged a
+  permanent decline to the transient flag.** `armNativeLink` refuses
+  peeled parents/children (the doc-39 v1 fusion exclusion), and
+  `peeled` is immutable on a committed trace — so once the reverse
+  peel gave fft's provenance-edge anchors real peeled children,
+  `publishSiblingArm`'s false return left `provenance_arms_pending`
+  stuck true and the drain re-scanned at EVERY dispatcher safe point
+  forever: +29% fft wall (317.9 → 409.1ms), found via `perf record`
+  (drain at 9.14% of run) after trace sets/IR/entries all diffed
+  clean. Fix: treat the peeled refusal like the unsupported-child
+  case — delete the provenance edge — placed AFTER the drain's
+  `nativeFor` compile-on-demand probe, deliberately: the drain's
+  force-compile is what compiles a provenance child the dispatcher
+  never selects, and the runtime chain (`driveChain` DOES follow
+  peeled traces) needs that page. Delete the arm edge, keep the
+  compilation. Lifting the exclusion later re-creates edges through
+  new commits.
+- [x] **Phase 6 — gates + measurement.** Ten-leg tests landed: the
+  root-channel organic reverse+mixed peel (trace-shape asserted via
+  `assertPeelCommitted`: peel marker + internal φ + steady assoc +
+  `.compiled` on the native leg — made deterministic across all ten
+  legs by the consecutive-reset shape, which commits the peel on the
+  FIRST attempt, and by periodic fingerprints so lazy codegen
+  actually runs); the glue-channel peel-compiles test (fft reduction;
+  mode-gated — glue channels are execution-driven, so `record_only`
+  checks only no-unsupported); Phase 0/1 tests kept. Measurements:
+  suite green + hashgate 84/84; full-board sweep vs the `just
+  shadow` f9ed93a baseline is noise-band everywhere (scimark-sparse
+  +2.8% interleaved has byte-identical per-anchor iteration counts —
+  binary-layout noise on a 99.9%-tier-0 bench); fft 314.7 → 309.9ms
+  (and the drain fix recovered the mid-arc 398.6ms regression).
+  Final fft `--jit-stats`: 27.9% of run as trace (36.0% of loop
+  time); bitreverse anchors now HAVE committed peeled traces (`:9`
+  82 traced iters, `:55` 369) but dispatch stays gated by
+  `gate[dispatch:low_trip_while]` (doc-38 while-yield gate, 64-entry
+  probes) and the fusion exclusion — the residency win is parked
+  behind the open question below.
+
 ### Outstanding
-- [ ] **Phase 2 — peel eligibility for the channels that actually
-  record the glue shape.** The reset-to-int glue is unreachable by
-  `.root` recordings (LLEAVE aborts the exit edge, trace.zig:14341/
-  14367; the cond-false glue is deliberately side-route-only,
-  comment at trace.zig:14355). Empirically (jit-debug, 2026-09-05):
-  the fft/repro DOA traces come from the **prime-side** channel
-  (`want PRIME side` off the body root's while-condition exit) and
-  the **continuation** channel (`cont-arm` at the rotated PC). Extend
-  `maybeEnterPeel` eligibility from `kind == .root` to recordings of
-  any kind that are closing as `.loop` at their own anchor, keeping
-  the rest of the gate (plain-while anchor OR the glue anchor shape,
-  no pending stores/allocs/inline depth — re-derive the exact set
-  during implementation). This lifts doc 39's "Defer —
-  side/continuation recordings" bullet for the glue-loop case only;
-  side recordings that link elsewhere stay out.
-- [ ] **Phase 3 — bidirectional instability sweep.** Generalize the
-  sweep (trace.zig:12341–12349) to both numeric directions; it then
-  serves both consumers: peel-eligible recordings enter the peel,
-  ineligible ones fall through to Phase 1's refusal. Per-slot
-  direction — one peel may widen one slot and narrow another; tests
-  pin the mixed case.
-- [ ] **Phase 4 — native reverse-shape tests (test-FIRST, then fix
-  what fails).** Codex finding 7: the doc-39 Phase-3 machinery is
-  already substantially bidirectional (entry homes allocate by entry
-  kind incl. XMM/TAG_FLOAT, nativegen.zig:3657/6096; steady homes by
-  φ kind, :3691; RV-3 already accepts both numeric mismatches for
-  peeled traces, :3336; both deopt flushes use `steady_kind`,
-  :7297/:7419; the `entry_rbx` zero-flush skip is kind-independent,
-  :7280). Expected deltas: comments/assertions only. Add the
-  structural assertion `kinds[phi.a] == kinds[phi]` (codex finding 5
-  — `movePlace` treats GP↔XMM as unreachable, nativegen.zig:4616).
 - [ ] **Phase 5 — retry lifecycle (only if observation demands it).**
+  Phase 6 observation: NOT demanded so far — on the repro, fft, and
+  both ten-leg tests the peel commits organically (record-gate
+  doubling cooldown + hotcount countdown do make retry timing a
+  lottery for test shapes, which is why the tests use consecutive
+  resets that commit on the first attempt). Left open, not started.
   Codex finding 2 corrects the starvation model: warming aborts
   already retry via the record gate's doubling cooldown
   (trace.zig:12139/12165), and a saturated hot-exit counter re-arms
@@ -120,9 +177,13 @@ Every phase lands behind its own `just test` gate.
   vs a `just shadow` baseline.
 - [ ] **Open question — persistent fusion for peeled traces.** The
   doc-39 v1 fusion exclusion caps the win at these anchors (runtime
-  `driveChain` still follows, but exit-branch fusion refuses). If
-  Phase 6 measures the refusals dominating, lifting the exclusion
-  (making the +1 seam adjustment chain-aware) becomes its own arc.
+  `driveChain` still follows, but exit-branch fusion refuses). Phase
+  6 MEASURED this as the direct blocker: the drain bug above was the
+  exclusion refusing permanently at exactly the fft anchors, and the
+  final `--jit-stats` shows the committed peeled bitreverse traces
+  barely dispatched (see Phase 6 bullet — also gated by
+  `low_trip_while`). Lifting the exclusion (making the +1 seam
+  adjustment chain-aware) is its own arc.
 - [ ] **Defer — multi-peel (Pall's `instunroll`).** Budgeted
   re-peeling when iteration 2 also mismatches. v1: exactly one peel;
   the organic channel retry (Phase 5 observation) is expected to

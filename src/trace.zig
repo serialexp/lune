@@ -4692,6 +4692,26 @@ pub const TraceState = struct {
                 _ = self.provenance_edges.swapRemove(i);
                 continue;
             }
+            // Doc 40: the doc-39 v1 fusion exclusion (no arm into or out of a
+            // PEELED trace — `armNativeLink`) is PERMANENT for these traces:
+            // `peeled` is immutable on a committed trace, so the publish below
+            // would refuse on every rescan. Charging that refusal to the
+            // transient flag left the drain pending forever — re-scanned at
+            // every dispatcher safe point, ~9% of scimark-fft wall once the
+            // reverse peel gave these anchors real (peeled) children. Delete
+            // the edge exactly like the unsupported-child case: it can never
+            // arm while either trace lives, and lifting the exclusion (the
+            // doc-40 open question) re-creates edges through new commits.
+            // AFTER the `nativeFor` probe, deliberately: the drain's
+            // compile-on-demand is what compiles a provenance child the
+            // dispatcher never selects, and the runtime chain (`driveChain`
+            // DOES follow peeled traces) needs that page — delete the arm
+            // edge, keep the compilation.
+            if (parent.peeled or child.peeled) {
+                self.dbg("provenance-drain: t={d} ei={d} decline: peeled fusion exclusion (edge deleted)", .{ edge.parent_id, edge.exit_instr });
+                _ = self.provenance_edges.swapRemove(i);
+                continue;
+            }
             var already_armed = false;
             for (self.armed_links.items) |link| {
                 if (link.kind == .sibling_handoff and link.parent == parent and
@@ -12349,17 +12369,29 @@ pub const TraceState = struct {
     /// entered (marker emitted, recording continues into iteration 2), or a
     /// mid-entry OOM aborted the recording.
     ///
-    /// Eligibility (codex round-2 minimum-sound-v1): initial plain-while
-    /// `.root` recordings only, anchor frame closed (no inlining / multret
-    /// shadow open), register-only iteration 1 (no pending stores, no
-    /// allocations, whitelist-pure IR). The instability sweep covers the
-    /// anchor window `[0, anchor_num_registers)` only: a `.def` slot whose
-    /// proven entry kind is int but whose carried ref is float is exactly the
-    /// RV-3-bailing int-entry/float-body shape (fft_bitreverse's `k`).
-    fn maybeEnterPeel(self: *TraceState) bool {
+    /// Eligibility (doc 40 Phase 2 lifts the doc-39 `.root`-only gate): any
+    /// recording kind closing as `.loop` at its own plain-while anchor — the
+    /// reset-to-int glue records exclusively through the side / continuation
+    /// channels (LLEAVE aborts a root on its anchor loop's own exit edge), so
+    /// a `.root`-only peel fires on neither fft DOA shape. Side recordings
+    /// that link elsewhere stay out (`link_target` below). The rest of the
+    /// gate is unchanged: anchor frame closed (no inlining / multret shadow
+    /// open), register-only iteration 1 (no pending stores, no allocations,
+    /// whitelist-pure IR).
+    ///
+    /// The instability sweep (doc 40 Phase 3, bidirectional) covers the
+    /// anchor window `[0, anchor_num_registers)` only, per-slot: a `.def`
+    /// slot whose proven entry kind contradicts the numeric kind its carried
+    /// value actually delivers at this anchor return. int-entry/float-carry
+    /// is doc 39's RV-3-bailing forward shape; float-entry/int-carry is the
+    /// F1-reverse reset-to-int shape (fft_bitreverse's `k = n`). The carried
+    /// side reads the LIVE anchor-return register, not the ref's IR `ty` —
+    /// an unguarded `slot_load` carries `.ty = .unknown` (exactly the `k = n`
+    /// store), while recording is concrete execution, so the live value IS
+    /// what the back-edge φ would deliver.
+    fn maybeEnterPeel(self: *TraceState, regs: RegWindow) bool {
         if (!self.config.peel) return false;
         const rec = &self.rec;
-        if (rec.kind != .root) return false;
         if (rec.link_target != null) return false;
         if (rec.inline_depth != 0) return false;
         if (rec.multret_top != null) return false;
@@ -12367,14 +12399,19 @@ pub const TraceState = struct {
         if (rec.guard_gc_ref != null or rec.alloc_count != 0) return false;
         if (!isPlainWhileAnchor(rec.anchor.proto, rec.anchor.pc)) return false;
         // Instability sweep before the (linear) purity scan: the sweep is the
-        // rarer pass condition, so most closes stop here.
+        // rarer pass condition, so most closes stop here. Bidirectional
+        // (doc 40 Phase 3), per-slot — one recording may widen one slot and
+        // narrow another; any single mismatch makes the close unstable.
         var unstable = false;
-        for (rec.reg_map[0..rec.anchor_num_registers]) |s| {
-            if (s.state != .def or s.entry_kind != .int) continue;
-            if (rec.instrs.items[@intCast(s.ref)].ty == .float) {
-                unstable = true;
-                break;
-            }
+        for (rec.reg_map[0..rec.anchor_num_registers], 0..) |s, slot| {
+            if (s.state != .def or s.entry_kind == .none) continue;
+            const v = regs.get(@intCast(slot));
+            unstable = switch (s.entry_kind) {
+                .int => v.isFloat(),
+                .float => v.isInt(),
+                .none => unreachable,
+            };
+            if (unstable) break;
         }
         if (!unstable) return false;
         for (rec.instrs.items) |ins| {
@@ -12502,7 +12539,7 @@ pub const TraceState = struct {
                 self.abort(.type_instability);
                 return;
             }
-        } else if (self.maybeEnterPeel()) {
+        } else if (self.maybeEnterPeel(regs)) {
             return; // peel entered (keep recording iteration 2) or aborted
         }
         // Doc 40 Phase 1: refuse a self-defeating `.loop` close (entry

@@ -1445,21 +1445,39 @@ test "doc 39: run-once region keeps exact int semantics above 2^53" {
     , "12\n", .{ .inspect = &assertPeelCommitted });
 }
 
-test "doc 39: the F1 reverse shape (float entry, int store) does not peel" {
-    // At the recording trip (i == 5) the carried `x` enters FLOAT and the body
-    // stores an int konst — the narrowing direction doc 39 explicitly defers.
-    // The instability sweep requires an int entry, so the peel must decline;
-    // the trace commits unpeeled (RV-3 keeps it off native) and the matrix
-    // holds output parity.
+test "doc 40: the F1 reverse shape (float entry, int store) peels organically at a root anchor" {
+    // Doc 39 pinned this shape as "does not peel" (the sweep was int-entry
+    // only); doc 40's bidirectional sweep lifts that defer. With hotloop = 4
+    // the root records at trip 5 — the FIRST of five consecutive reset trips
+    // (i % 10 >= 5), where the carried `x` enters FLOAT (the div run floated
+    // it), is READ (`t = t + x + u`, so the entry is guard_float-proven — a
+    // write-only reset leaves `entry_kind` unstamped and the sweep blind, by
+    // design), and is stored an int konst: the recording enters the REVERSE
+    // peel, and trip 6 is another reset, so `finishPeel`'s type re-check
+    // passes and the peel COMMITS on the first attempt — deterministically,
+    // in every leg including record-only (no retry needed). The same peel is
+    // also the doc-40 MIXED case: `u` (int on every div trip, floated by the
+    // reset arm's `u * 1.5`) WIDENS in the very recording where `x` narrows
+    // — one peel, both directions, per-slot. Every slot's arrival state is
+    // periodic (t starts float; u re-enters int after each div run), so the
+    // entry fingerprint matches every later reset-window arrival and the
+    // lazy native codegen actually runs — an accumulator that is int only on
+    // the first arrival would commit a one-shot trace that never re-enters
+    // and never compiles. The matrix asserts the peel committed (and
+    // lowered, on the native leg) plus output parity.
     try expectProgramTuned(
         \\local x = 8
+        \\local t = 0.5
+        \\local u = 3
         \\local i = 1
-        \\while i < 40 do
-        \\  if i % 5 == 0 then x = 8 else x = x / 2 end
+        \\while i < 400 do
+        \\  if i % 10 >= 5 then t = t + x + u; x = 8; u = u * 1.5 else x = x / 2; u = 3 end
         \\  i = i + 1
         \\end
         \\print(x)
-    , "0.5\n", .{ .inspect = &assertNoPeel });
+        \\print(t)
+        \\print(u)
+    , "8\n2873.25\n22.78125\n", .{ .inspect = &assertPeelCommitted });
 }
 
 test "doc 40 phase 0: zero-completion while-done on a peeled trace must not chain stale state" {
@@ -1527,6 +1545,46 @@ test "doc 40 phase 1: the reset-to-int glue shape no longer commits self-defeati
         \\end
         \\print(total)
     , "360\n", .{ .inspect = &assertNoUnsupportedTraces });
+}
+
+/// Doc 40 phases 2-4 combined witness: the glue-channel recording actually
+/// PEELED (committed with marker + internal φ + steady association, lowered
+/// on the native leg) and nothing else in the cache regressed to
+/// `.unsupported`. The peel witness applies to the EXECUTING modes only: the
+/// glue channels (hot-exit wants, continuation arming) are driven by trace
+/// execution, so a record-only VM never arms the glue recording at all.
+fn assertGluePeelCompiled(vm: *Vm, mode: TraceMode) anyerror!void {
+    if (mode == .off) return;
+    try assertNoUnsupportedTraces(vm, mode);
+    if (mode == .record_only) return;
+    try assertPeelCommitted(vm, mode);
+}
+
+test "doc 40 phases 2-4: the reset-to-int glue peels through the side channel and compiles" {
+    // The same fft_bitreverse reduction as the phase 1 test, but now the
+    // refusal is only the fallback: the glue recording (a `.side` /
+    // `.continuation` recording closing as `.loop` at the plain-while anchor)
+    // is peel-ELIGIBLE (Phase 2), the bidirectional sweep detects the
+    // float-entry/int-store slot `k` (Phase 3), and the committed peel
+    // lowers to native — `proveKinds` hoists the steady body's `guard_int`
+    // on the internal φ through to its unguarded `slot_load` init, the
+    // reset-to-int `k = n` (Phase 4). The run-once region swallows the float
+    // `k`; the steady loop carries the int; every value the φ delivers is
+    // proven (init by the hoisted prologue check, update by kind equality).
+    try expectProgramTuned(
+        \\local n = 16
+        \\local total = 0
+        \\for outer = 1, 60 do
+        \\  local j = 0
+        \\  for i = 0, 2 * n - 4, 2 do
+        \\    if i < j then total = total + 1 end
+        \\    local k = n
+        \\    while k <= j do j = j - k; k = k / 2 end
+        \\    j = j + k
+        \\  end
+        \\end
+        \\print(total)
+    , "360\n", .{ .inspect = &assertGluePeelCompiled });
 }
 
 test "doc 39: a numeric-for anchor with the same transition does not peel" {
